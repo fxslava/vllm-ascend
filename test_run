@@ -530,3 +530,206 @@ a60133706@node2225:~/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/build/csrc-tes
 [----------] Global test environment tear-down
 [==========] 52 tests from 3 test suites ran. (3960 ms total)
 [  PASSED  ] 52 tests.
+a60133706@node2225:~/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/build/csrc-tests$ ./test_paged_attention_310p
+[ascend-test] vllm-ascend bare-metal kernel tests (no Python, no torch)
+[ascend-test] aclnn operator inventory
+[ascend-test]   aclnnRmsNorm                 found
+[ascend-test]   aclnnSwiGlu                  found
+[ascend-test]   aclnnApplyRotaryPosEmbV2     found
+[ascend-test]   aclnnApplyRotaryPosEmb       found
+[ascend-test]   aclnnScatterPaKvCache        found
+[ascend-test]   aclnnIncreFlashAttentionV4   found
+[ascend-test]   aclnnRotaryMul               MISSING
+[ascend-test]   aclnnReshapeAndCache         MISSING
+[ascend-test]   aclnnPagedAttention          MISSING
+[==========] Running 27 tests from 5 test suites.
+[----------] Global test environment set-up.
+[ascend-test] device 0 ready, soc='Ascend310P3'
+[----------] 3 tests from PagedKvLayout
+[ RUN      ] PagedKvLayout.MatchesGetKvCacheShapeOn310P
+[       OK ] PagedKvLayout.MatchesGetKvCacheShapeOn310P (0 ms)
+[ RUN      ] PagedKvLayout.OffsetsAreUniqueAndInBounds
+[       OK ] PagedKvLayout.OffsetsAreUniqueAndInBounds (21 ms)
+[ RUN      ] PagedKvLayout.ReshapeAndCacheRoundTripsThroughTheReference
+[       OK ] PagedKvLayout.ReshapeAndCacheRoundTripsThroughTheReference (3 ms)
+[----------] 3 tests from PagedKvLayout (25 ms total)
+
+[----------] 2 tests from PagedAttentionReference
+[ RUN      ] PagedAttentionReference.SingleTokenContextReturnsThatValue
+[       OK ] PagedAttentionReference.SingleTokenContextReturnsThatValue (0 ms)
+[ RUN      ] PagedAttentionReference.IdenticalKeysGiveTheMeanOfTheValues
+[       OK ] PagedAttentionReference.IdenticalKeysGiveTheMeanOfTheValues (0 ms)
+[----------] 2 tests from PagedAttentionReference (0 ms total)
+
+[----------] 1 test from PagedAttentionShapes
+[ RUN      ] PagedAttentionShapes.BlockSizesRespectThe310PProduct
+[       OK ] PagedAttentionShapes.BlockSizesRespectThe310PProduct (0 ms)
+[----------] 1 test from PagedAttentionShapes (0 ms total)
+
+[----------] 7 tests from Qwen35/ReshapeAndCache310PTest
+[ RUN      ] Qwen35/ReshapeAndCache310PTest.WritesTheSameBytesAsTheHostScatter/seq1_h28_kv4_d128_b64_ctx64
+unknown file: Failure
+C++ exception with description "/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/common/aclnn_runtime.hpp:201: aclnnScatterPaKvCacheGetWorkspaceSize failed with status 161001
+  CANN: [PID: 4155222] 2026-09-03-14:18:58.858.403 AclNN_Parameter_Error(EZ1001): Get regInfo failed, The binary_info_config.json of socVersion [ascend310p] does not support opType [ScatterPaKvCache].
+        TraceBack (most recent call last):
+        Check nnopExecutor != nullptr failed
+" thrown in the test body.
+
+[  FAILED  ] Qwen35/ReshapeAndCache310PTest.WritesTheSameBytesAsTheHostScatter/seq1_h28_kv4_d128_b64_ctx64, where GetParam() = 56-byte object <E8-55 4F-BD AA-AA 00-00 01-00 00-00 00-00 00-00 1C-00 00-00 00-00 00-00 04-00 00-00 00-00 00-00 80-00 00-00 00-00 00-00 40-00 00-00 00-00 00-00 40-00 00-00 00-00 00-00> (367 ms)
+[ RUN      ] Qwen35/ReshapeAndCache310PTest.WritesTheSameBytesAsTheHostScatter/seq4_h28_kv4_d128_b64_ctx200
+unknown file: Failure
+C++ exception with description "/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/common/aclnn_runtime.hpp:201: aclnnScatterPaKvCacheGetWorkspaceSize failed with status 161001
+  CANN: [PID: 4155222] 2026-09-03-14:18:58.885.831 AclNN_Parameter_Error(EZ1001): Get regInfo failed, The binary_info_config.json of socVersion [ascend310p] does not support opType [ScatterPaKvCache].
+        TraceBack (most recent call last):
+        Check nnopExecutor != nullptr failed
+" thrown in the test body.
+
+[  FAILED  ] Qwen35/ReshapeAndCache310PTest.WritesTheSameBytesAsTheHostScatter/seq4_h28_kv4_d128_b64_ctx200, where GetParam() = 56-byte object <08-56 4F-BD AA-AA 00-00 04-00 00-00 00-00 00-00 1C-00 00-00 00-00 00-00 04-00 00-00 00-00 00-00 80-00 00-00 00-00 00-00 40-00 00-00 00-00 00-00 C8-00 00-00 00-00 00-00> (21 ms)
+[ RUN      ] Qwen35/ReshapeAndCache310PTest.WritesTheSameBytesAsTheHostScatter/seq4_h32_kv8_d128_b64_ctx512
+unknown file: Failure
+C++ exception with description "/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/common/aclnn_runtime.hpp:201: aclnnScatterPaKvCacheGetWorkspaceSize failed with status 161001
+  CANN: [PID: 4155222] 2026-09-03-14:18:58.981.041 AclNN_Parameter_Error(EZ1001): Get regInfo failed, The binary_info_config.json of socVersion [ascend310p] does not support opType [ScatterPaKvCache].
+        TraceBack (most recent call last):
+        Check nnopExecutor != nullptr failed
+" thrown in the test body.
+
+[  FAILED  ] Qwen35/ReshapeAndCache310PTest.WritesTheSameBytesAsTheHostScatter/seq4_h32_kv8_d128_b64_ctx512, where GetParam() = 56-byte object <28-56 4F-BD AA-AA 00-00 04-00 00-00 00-00 00-00 20-00 00-00 00-00 00-00 08-00 00-00 00-00 00-00 80-00 00-00 00-00 00-00 40-00 00-00 00-00 00-00 00-02 00-00 00-00 00-00> (94 ms)
+[ RUN      ] Qwen35/ReshapeAndCache310PTest.WritesTheSameBytesAsTheHostScatter/seq2_h32_kv8_d128_b128_ctx512
+unknown file: Failure
+C++ exception with description "/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/common/aclnn_runtime.hpp:201: aclnnScatterPaKvCacheGetWorkspaceSize failed with status 161001
+  CANN: [PID: 4155222] 2026-09-03-14:18:59.040.813 AclNN_Parameter_Error(EZ1001): Get regInfo failed, The binary_info_config.json of socVersion [ascend310p] does not support opType [ScatterPaKvCache].
+        TraceBack (most recent call last):
+        Check nnopExecutor != nullptr failed
+" thrown in the test body.
+
+[  FAILED  ] Qwen35/ReshapeAndCache310PTest.WritesTheSameBytesAsTheHostScatter/seq2_h32_kv8_d128_b128_ctx512, where GetParam() = 56-byte object <48-56 4F-BD AA-AA 00-00 02-00 00-00 00-00 00-00 20-00 00-00 00-00 00-00 08-00 00-00 00-00 00-00 80-00 00-00 00-00 00-00 80-00 00-00 00-00 00-00 00-02 00-00 00-00 00-00> (59 ms)
+[ RUN      ] Qwen35/ReshapeAndCache310PTest.WritesTheSameBytesAsTheHostScatter/seq8_h16_kv2_d64_b64_ctx63
+unknown file: Failure
+C++ exception with description "/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/common/aclnn_runtime.hpp:201: aclnnScatterPaKvCacheGetWorkspaceSize failed with status 161001
+  CANN: [PID: 4155222] 2026-09-03-14:18:59.045.998 AclNN_Parameter_Error(EZ1001): Get regInfo failed, The binary_info_config.json of socVersion [ascend310p] does not support opType [ScatterPaKvCache].
+        TraceBack (most recent call last):
+        Check nnopExecutor != nullptr failed
+" thrown in the test body.
+
+[  FAILED  ] Qwen35/ReshapeAndCache310PTest.WritesTheSameBytesAsTheHostScatter/seq8_h16_kv2_d64_b64_ctx63, where GetParam() = 56-byte object <68-56 4F-BD AA-AA 00-00 08-00 00-00 00-00 00-00 10-00 00-00 00-00 00-00 02-00 00-00 00-00 00-00 40-00 00-00 00-00 00-00 40-00 00-00 00-00 00-00 3F-00 00-00 00-00 00-00> (5 ms)
+[ RUN      ] Qwen35/ReshapeAndCache310PTest.WritesTheSameBytesAsTheHostScatter/seq2_h16_kv2_d64_b128_ctx300
+unknown file: Failure
+C++ exception with description "/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/common/aclnn_runtime.hpp:201: aclnnScatterPaKvCacheGetWorkspaceSize failed with status 161001
+  CANN: [PID: 4155222] 2026-09-03-14:18:59.053.343 AclNN_Parameter_Error(EZ1001): Get regInfo failed, The binary_info_config.json of socVersion [ascend310p] does not support opType [ScatterPaKvCache].
+        TraceBack (most recent call last):
+        Check nnopExecutor != nullptr failed
+" thrown in the test body.
+
+[  FAILED  ] Qwen35/ReshapeAndCache310PTest.WritesTheSameBytesAsTheHostScatter/seq2_h16_kv2_d64_b128_ctx300, where GetParam() = 56-byte object <88-56 4F-BD AA-AA 00-00 02-00 00-00 00-00 00-00 10-00 00-00 00-00 00-00 02-00 00-00 00-00 00-00 40-00 00-00 00-00 00-00 80-00 00-00 00-00 00-00 2C-01 00-00 00-00 00-00> (7 ms)
+[ RUN      ] Qwen35/ReshapeAndCache310PTest.WritesTheSameBytesAsTheHostScatter/seq3_h8_kv8_d128_b64_ctx128
+unknown file: Failure
+C++ exception with description "/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/common/aclnn_runtime.hpp:201: aclnnScatterPaKvCacheGetWorkspaceSize failed with status 161001
+  CANN: [PID: 4155222] 2026-09-03-14:18:59.072.282 AclNN_Parameter_Error(EZ1001): Get regInfo failed, The binary_info_config.json of socVersion [ascend310p] does not support opType [ScatterPaKvCache].
+        TraceBack (most recent call last):
+        Check nnopExecutor != nullptr failed
+" thrown in the test body.
+
+[  FAILED  ] Qwen35/ReshapeAndCache310PTest.WritesTheSameBytesAsTheHostScatter/seq3_h8_kv8_d128_b64_ctx128, where GetParam() = 56-byte object <A8-56 4F-BD AA-AA 00-00 03-00 00-00 00-00 00-00 08-00 00-00 00-00 00-00 08-00 00-00 00-00 00-00 80-00 00-00 00-00 00-00 40-00 00-00 00-00 00-00 80-00 00-00 00-00 00-00> (18 ms)
+[----------] 7 tests from Qwen35/ReshapeAndCache310PTest (575 ms total)
+
+[----------] 14 tests from Qwen35/PagedAttention310PTest
+[ RUN      ] Qwen35/PagedAttention310PTest.MatchesCpuReference/seq1_h28_kv4_d128_b64_ctx64
+/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/kernels/test_paged_attention_310p.cpp:420: Skipped
+aclnnPagedAttention is not provided by CANN 9.1.0; torch_npu._npu_paged_attention is backed by ATB (libatb.so). See csrc/tests/common/aclnn_ops.hpp for the verified aclnnIncreFlashAttentionV4 prototype and what it would take.
+
+[  SKIPPED ] Qwen35/PagedAttention310PTest.MatchesCpuReference/seq1_h28_kv4_d128_b64_ctx64 (0 ms)
+[ RUN      ] Qwen35/PagedAttention310PTest.MatchesCpuReference/seq4_h28_kv4_d128_b64_ctx200
+/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/kernels/test_paged_attention_310p.cpp:420: Skipped
+aclnnPagedAttention is not provided by CANN 9.1.0; torch_npu._npu_paged_attention is backed by ATB (libatb.so). See csrc/tests/common/aclnn_ops.hpp for the verified aclnnIncreFlashAttentionV4 prototype and what it would take.
+
+[  SKIPPED ] Qwen35/PagedAttention310PTest.MatchesCpuReference/seq4_h28_kv4_d128_b64_ctx200 (0 ms)
+[ RUN      ] Qwen35/PagedAttention310PTest.MatchesCpuReference/seq4_h32_kv8_d128_b64_ctx512
+/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/kernels/test_paged_attention_310p.cpp:420: Skipped
+aclnnPagedAttention is not provided by CANN 9.1.0; torch_npu._npu_paged_attention is backed by ATB (libatb.so). See csrc/tests/common/aclnn_ops.hpp for the verified aclnnIncreFlashAttentionV4 prototype and what it would take.
+
+[  SKIPPED ] Qwen35/PagedAttention310PTest.MatchesCpuReference/seq4_h32_kv8_d128_b64_ctx512 (0 ms)
+[ RUN      ] Qwen35/PagedAttention310PTest.MatchesCpuReference/seq2_h32_kv8_d128_b128_ctx512
+/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/kernels/test_paged_attention_310p.cpp:420: Skipped
+aclnnPagedAttention is not provided by CANN 9.1.0; torch_npu._npu_paged_attention is backed by ATB (libatb.so). See csrc/tests/common/aclnn_ops.hpp for the verified aclnnIncreFlashAttentionV4 prototype and what it would take.
+
+[  SKIPPED ] Qwen35/PagedAttention310PTest.MatchesCpuReference/seq2_h32_kv8_d128_b128_ctx512 (0 ms)
+[ RUN      ] Qwen35/PagedAttention310PTest.MatchesCpuReference/seq8_h16_kv2_d64_b64_ctx63
+/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/kernels/test_paged_attention_310p.cpp:420: Skipped
+aclnnPagedAttention is not provided by CANN 9.1.0; torch_npu._npu_paged_attention is backed by ATB (libatb.so). See csrc/tests/common/aclnn_ops.hpp for the verified aclnnIncreFlashAttentionV4 prototype and what it would take.
+
+[  SKIPPED ] Qwen35/PagedAttention310PTest.MatchesCpuReference/seq8_h16_kv2_d64_b64_ctx63 (0 ms)
+[ RUN      ] Qwen35/PagedAttention310PTest.MatchesCpuReference/seq2_h16_kv2_d64_b128_ctx300
+/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/kernels/test_paged_attention_310p.cpp:420: Skipped
+aclnnPagedAttention is not provided by CANN 9.1.0; torch_npu._npu_paged_attention is backed by ATB (libatb.so). See csrc/tests/common/aclnn_ops.hpp for the verified aclnnIncreFlashAttentionV4 prototype and what it would take.
+
+[  SKIPPED ] Qwen35/PagedAttention310PTest.MatchesCpuReference/seq2_h16_kv2_d64_b128_ctx300 (0 ms)
+[ RUN      ] Qwen35/PagedAttention310PTest.MatchesCpuReference/seq3_h8_kv8_d128_b64_ctx128
+/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/kernels/test_paged_attention_310p.cpp:420: Skipped
+aclnnPagedAttention is not provided by CANN 9.1.0; torch_npu._npu_paged_attention is backed by ATB (libatb.so). See csrc/tests/common/aclnn_ops.hpp for the verified aclnnIncreFlashAttentionV4 prototype and what it would take.
+
+[  SKIPPED ] Qwen35/PagedAttention310PTest.MatchesCpuReference/seq3_h8_kv8_d128_b64_ctx128 (0 ms)
+[ RUN      ] Qwen35/PagedAttention310PTest.AttendsOnlyWithinTheContextLength/seq1_h28_kv4_d128_b64_ctx64
+/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/kernels/test_paged_attention_310p.cpp:437: Skipped
+aclnnPagedAttention is not provided by CANN 9.1.0; torch_npu._npu_paged_attention is backed by ATB (libatb.so). See csrc/tests/common/aclnn_ops.hpp for the verified aclnnIncreFlashAttentionV4 prototype and what it would take.
+
+[  SKIPPED ] Qwen35/PagedAttention310PTest.AttendsOnlyWithinTheContextLength/seq1_h28_kv4_d128_b64_ctx64 (0 ms)
+[ RUN      ] Qwen35/PagedAttention310PTest.AttendsOnlyWithinTheContextLength/seq4_h28_kv4_d128_b64_ctx200
+/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/kernels/test_paged_attention_310p.cpp:437: Skipped
+aclnnPagedAttention is not provided by CANN 9.1.0; torch_npu._npu_paged_attention is backed by ATB (libatb.so). See csrc/tests/common/aclnn_ops.hpp for the verified aclnnIncreFlashAttentionV4 prototype and what it would take.
+
+[  SKIPPED ] Qwen35/PagedAttention310PTest.AttendsOnlyWithinTheContextLength/seq4_h28_kv4_d128_b64_ctx200 (0 ms)
+[ RUN      ] Qwen35/PagedAttention310PTest.AttendsOnlyWithinTheContextLength/seq4_h32_kv8_d128_b64_ctx512
+/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/kernels/test_paged_attention_310p.cpp:437: Skipped
+aclnnPagedAttention is not provided by CANN 9.1.0; torch_npu._npu_paged_attention is backed by ATB (libatb.so). See csrc/tests/common/aclnn_ops.hpp for the verified aclnnIncreFlashAttentionV4 prototype and what it would take.
+
+[  SKIPPED ] Qwen35/PagedAttention310PTest.AttendsOnlyWithinTheContextLength/seq4_h32_kv8_d128_b64_ctx512 (0 ms)
+[ RUN      ] Qwen35/PagedAttention310PTest.AttendsOnlyWithinTheContextLength/seq2_h32_kv8_d128_b128_ctx512
+/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/kernels/test_paged_attention_310p.cpp:437: Skipped
+aclnnPagedAttention is not provided by CANN 9.1.0; torch_npu._npu_paged_attention is backed by ATB (libatb.so). See csrc/tests/common/aclnn_ops.hpp for the verified aclnnIncreFlashAttentionV4 prototype and what it would take.
+
+[  SKIPPED ] Qwen35/PagedAttention310PTest.AttendsOnlyWithinTheContextLength/seq2_h32_kv8_d128_b128_ctx512 (0 ms)
+[ RUN      ] Qwen35/PagedAttention310PTest.AttendsOnlyWithinTheContextLength/seq8_h16_kv2_d64_b64_ctx63
+/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/kernels/test_paged_attention_310p.cpp:437: Skipped
+aclnnPagedAttention is not provided by CANN 9.1.0; torch_npu._npu_paged_attention is backed by ATB (libatb.so). See csrc/tests/common/aclnn_ops.hpp for the verified aclnnIncreFlashAttentionV4 prototype and what it would take.
+
+[  SKIPPED ] Qwen35/PagedAttention310PTest.AttendsOnlyWithinTheContextLength/seq8_h16_kv2_d64_b64_ctx63 (0 ms)
+[ RUN      ] Qwen35/PagedAttention310PTest.AttendsOnlyWithinTheContextLength/seq2_h16_kv2_d64_b128_ctx300
+/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/kernels/test_paged_attention_310p.cpp:437: Skipped
+aclnnPagedAttention is not provided by CANN 9.1.0; torch_npu._npu_paged_attention is backed by ATB (libatb.so). See csrc/tests/common/aclnn_ops.hpp for the verified aclnnIncreFlashAttentionV4 prototype and what it would take.
+
+[  SKIPPED ] Qwen35/PagedAttention310PTest.AttendsOnlyWithinTheContextLength/seq2_h16_kv2_d64_b128_ctx300 (0 ms)
+[ RUN      ] Qwen35/PagedAttention310PTest.AttendsOnlyWithinTheContextLength/seq3_h8_kv8_d128_b64_ctx128
+/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/kernels/test_paged_attention_310p.cpp:437: Skipped
+aclnnPagedAttention is not provided by CANN 9.1.0; torch_npu._npu_paged_attention is backed by ATB (libatb.so). See csrc/tests/common/aclnn_ops.hpp for the verified aclnnIncreFlashAttentionV4 prototype and what it would take.
+
+[  SKIPPED ] Qwen35/PagedAttention310PTest.AttendsOnlyWithinTheContextLength/seq3_h8_kv8_d128_b64_ctx128 (0 ms)
+[----------] 14 tests from Qwen35/PagedAttention310PTest (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 27 tests from 5 test suites ran. (2672 ms total)
+[  PASSED  ] 6 tests.
+[  SKIPPED ] 14 tests, listed below:
+[  SKIPPED ] Qwen35/PagedAttention310PTest.MatchesCpuReference/seq1_h28_kv4_d128_b64_ctx64
+[  SKIPPED ] Qwen35/PagedAttention310PTest.MatchesCpuReference/seq4_h28_kv4_d128_b64_ctx200
+[  SKIPPED ] Qwen35/PagedAttention310PTest.MatchesCpuReference/seq4_h32_kv8_d128_b64_ctx512
+[  SKIPPED ] Qwen35/PagedAttention310PTest.MatchesCpuReference/seq2_h32_kv8_d128_b128_ctx512
+[  SKIPPED ] Qwen35/PagedAttention310PTest.MatchesCpuReference/seq8_h16_kv2_d64_b64_ctx63
+[  SKIPPED ] Qwen35/PagedAttention310PTest.MatchesCpuReference/seq2_h16_kv2_d64_b128_ctx300
+[  SKIPPED ] Qwen35/PagedAttention310PTest.MatchesCpuReference/seq3_h8_kv8_d128_b64_ctx128
+[  SKIPPED ] Qwen35/PagedAttention310PTest.AttendsOnlyWithinTheContextLength/seq1_h28_kv4_d128_b64_ctx64
+[  SKIPPED ] Qwen35/PagedAttention310PTest.AttendsOnlyWithinTheContextLength/seq4_h28_kv4_d128_b64_ctx200
+[  SKIPPED ] Qwen35/PagedAttention310PTest.AttendsOnlyWithinTheContextLength/seq4_h32_kv8_d128_b64_ctx512
+[  SKIPPED ] Qwen35/PagedAttention310PTest.AttendsOnlyWithinTheContextLength/seq2_h32_kv8_d128_b128_ctx512
+[  SKIPPED ] Qwen35/PagedAttention310PTest.AttendsOnlyWithinTheContextLength/seq8_h16_kv2_d64_b64_ctx63
+[  SKIPPED ] Qwen35/PagedAttention310PTest.AttendsOnlyWithinTheContextLength/seq2_h16_kv2_d64_b128_ctx300
+[  SKIPPED ] Qwen35/PagedAttention310PTest.AttendsOnlyWithinTheContextLength/seq3_h8_kv8_d128_b64_ctx128
+[  FAILED  ] 7 tests, listed below:
+[  FAILED  ] Qwen35/ReshapeAndCache310PTest.WritesTheSameBytesAsTheHostScatter/seq1_h28_kv4_d128_b64_ctx64, where GetParam() = 56-byte object <E8-55 4F-BD AA-AA 00-00 01-00 00-00 00-00 00-00 1C-00 00-00 00-00 00-00 04-00 00-00 00-00 00-00 80-00 00-00 00-00 00-00 40-00 00-00 00-00 00-00 40-00 00-00 00-00 00-00>
+[  FAILED  ] Qwen35/ReshapeAndCache310PTest.WritesTheSameBytesAsTheHostScatter/seq4_h28_kv4_d128_b64_ctx200, where GetParam() = 56-byte object <08-56 4F-BD AA-AA 00-00 04-00 00-00 00-00 00-00 1C-00 00-00 00-00 00-00 04-00 00-00 00-00 00-00 80-00 00-00 00-00 00-00 40-00 00-00 00-00 00-00 C8-00 00-00 00-00 00-00>
+[  FAILED  ] Qwen35/ReshapeAndCache310PTest.WritesTheSameBytesAsTheHostScatter/seq4_h32_kv8_d128_b64_ctx512, where GetParam() = 56-byte object <28-56 4F-BD AA-AA 00-00 04-00 00-00 00-00 00-00 20-00 00-00 00-00 00-00 08-00 00-00 00-00 00-00 80-00 00-00 00-00 00-00 40-00 00-00 00-00 00-00 00-02 00-00 00-00 00-00>
+[  FAILED  ] Qwen35/ReshapeAndCache310PTest.WritesTheSameBytesAsTheHostScatter/seq2_h32_kv8_d128_b128_ctx512, where GetParam() = 56-byte object <48-56 4F-BD AA-AA 00-00 02-00 00-00 00-00 00-00 20-00 00-00 00-00 00-00 08-00 00-00 00-00 00-00 80-00 00-00 00-00 00-00 80-00 00-00 00-00 00-00 00-02 00-00 00-00 00-00>
+[  FAILED  ] Qwen35/ReshapeAndCache310PTest.WritesTheSameBytesAsTheHostScatter/seq8_h16_kv2_d64_b64_ctx63, where GetParam() = 56-byte object <68-56 4F-BD AA-AA 00-00 08-00 00-00 00-00 00-00 10-00 00-00 00-00 00-00 02-00 00-00 00-00 00-00 40-00 00-00 00-00 00-00 40-00 00-00 00-00 00-00 3F-00 00-00 00-00 00-00>
+[  FAILED  ] Qwen35/ReshapeAndCache310PTest.WritesTheSameBytesAsTheHostScatter/seq2_h16_kv2_d64_b128_ctx300, where GetParam() = 56-byte object <88-56 4F-BD AA-AA 00-00 02-00 00-00 00-00 00-00 10-00 00-00 00-00 00-00 02-00 00-00 00-00 00-00 40-00 00-00 00-00 00-00 80-00 00-00 00-00 00-00 2C-01 00-00 00-00 00-00>
+[  FAILED  ] Qwen35/ReshapeAndCache310PTest.WritesTheSameBytesAsTheHostScatter/seq3_h8_kv8_d128_b64_ctx128, where GetParam() = 56-byte object <A8-56 4F-BD AA-AA 00-00 03-00 00-00 00-00 00-00 08-00 00-00 00-00 00-00 08-00 00-00 00-00 00-00 80-00 00-00 00-00 00-00 40-00 00-00 00-00 00-00 80-00 00-00 00-00 00-00>
+
+ 7 FAILED TESTS
