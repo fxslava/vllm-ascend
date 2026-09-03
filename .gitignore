@@ -241,3 +241,10 @@ csrc/third_party/
 
 # local build cache
 .vllm_ascend/
+
+# Visual Studio local artifacts
+.vs/
+out/
+
+# Release packages
+*.tar.gz
