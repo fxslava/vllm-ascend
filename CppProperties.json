@@ -1,0 +1,20 @@
+{
+  "configurations": [
+    {
+      "name": "AArch64-CANN-IntelliSense",
+      "includePath": [
+        "${workspaceRoot}/csrc/tests/common",
+        "${workspaceRoot}/csrc/tests/kernels",
+        "${workspaceRoot}/cann_aarch64/include",
+        "${workspaceRoot}/cann_aarch64/include/aclnnop",
+        "${workspaceRoot}/build/csrc-tests/_deps/googletest-src/googletest/include"
+      ],
+      "defines": [
+        "__aarch64__",
+        "SOC_VERSION=\"ascend310p3\""
+      ],
+      "compilerSwitches": "-std=c++17",
+      "intelliSenseMode": "windows-gcc-arm64"
+    }
+  ]
+}
