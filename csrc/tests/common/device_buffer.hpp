@@ -22,6 +22,14 @@
 // so the allocation is padded up to a 32-byte multiple. Without the padding the
 // tail burst reads or writes past the end of the allocation, which shows up as
 // an intermittent EXCEPTION rather than a deterministic failure.
+//
+// Allocate() takes an optional stronger alignment. The correctness tests use
+// the 32-byte default; the benchmarks ask for 512 so that a measurement is not
+// silently penalised by a buffer that straddles a cache line or an HBM burst.
+// aclrtMalloc already returns pointers aligned far past 32 bytes in practice,
+// but the documented guarantee stops there, so a stronger request
+// over-allocates by one alignment and offsets into the block rather than
+// trusting the allocator.
 
 #pragma once
 
@@ -41,6 +49,11 @@ namespace test {
 // Burst size of the MTE2/MTE3 units on DaVinci v200.
 constexpr size_t kDeviceAlignBytes = 32;
 
+// Alignment the benchmarks request. 512 bytes is a whole L2 line on v200 and a
+// whole HBM burst, so a timed buffer never starts mid-line; see the note at the
+// top of this file for why it is requested rather than assumed.
+constexpr size_t kBenchmarkAlignBytes = 512;
+
 constexpr size_t AlignUp(size_t value, size_t alignment) {
   return ((value + alignment - 1) / alignment) * alignment;
 }
@@ -49,13 +62,20 @@ class DeviceBuffer {
  public:
   DeviceBuffer() = default;
 
-  explicit DeviceBuffer(size_t size_bytes) { Allocate(size_bytes); }
+  explicit DeviceBuffer(size_t size_bytes, size_t alignment = kDeviceAlignBytes) {
+    Allocate(size_bytes, alignment);
+  }
 
   DeviceBuffer(const DeviceBuffer&) = delete;
   DeviceBuffer& operator=(const DeviceBuffer&) = delete;
 
   DeviceBuffer(DeviceBuffer&& other) noexcept
-      : data_(other.data_), size_bytes_(other.size_bytes_), capacity_bytes_(other.capacity_bytes_) {
+      : base_(other.base_),
+        data_(other.data_),
+        size_bytes_(other.size_bytes_),
+        capacity_bytes_(other.capacity_bytes_),
+        alignment_(other.alignment_) {
+    other.base_ = nullptr;
     other.data_ = nullptr;
     other.size_bytes_ = 0;
     other.capacity_bytes_ = 0;
@@ -64,9 +84,12 @@ class DeviceBuffer {
   DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
     if (this != &other) {
       Release();
+      base_ = other.base_;
       data_ = other.data_;
       size_bytes_ = other.size_bytes_;
       capacity_bytes_ = other.capacity_bytes_;
+      alignment_ = other.alignment_;
+      other.base_ = nullptr;
       other.data_ = nullptr;
       other.size_bytes_ = 0;
       other.capacity_bytes_ = 0;
@@ -76,28 +99,37 @@ class DeviceBuffer {
 
   ~DeviceBuffer() { Release(); }
 
-  void Allocate(size_t size_bytes) {
+  void Allocate(size_t size_bytes, size_t alignment = kDeviceAlignBytes) {
     Release();
     if (size_bytes == 0) {
       return;
     }
+    alignment_ = (alignment < kDeviceAlignBytes) ? kDeviceAlignBytes : alignment;
     size_bytes_ = size_bytes;
-    capacity_bytes_ = AlignUp(size_bytes, kDeviceAlignBytes);
-    ACL_CHECK(aclrtMalloc(&data_, capacity_bytes_, ACL_MEM_MALLOC_HUGE_FIRST));
+    capacity_bytes_ = AlignUp(size_bytes, alignment_);
+
+    // Only the stronger-than-default request pays for the slack, so the
+    // correctness tests allocate exactly what they did before.
+    const size_t request =
+        capacity_bytes_ + ((alignment_ > kDeviceAlignBytes) ? alignment_ : 0);
+    ACL_CHECK(aclrtMalloc(&base_, request, ACL_MEM_MALLOC_HUGE_FIRST));
+    data_ = reinterpret_cast<void*>(AlignUp(reinterpret_cast<uintptr_t>(base_), alignment_));
+
     // aclrtMalloc aligns well past 32 bytes in practice; the check documents
     // the contract the kernels rely on and fails loudly if it ever changes.
-    if ((reinterpret_cast<uintptr_t>(data_) % kDeviceAlignBytes) != 0) {
-      throw AclError("aclrtMalloc returned a pointer that is not 32-byte aligned", __FILE__, __LINE__, -1);
+    if ((reinterpret_cast<uintptr_t>(data_) % alignment_) != 0) {
+      throw AclError("device allocation could not be aligned as requested", __FILE__, __LINE__, -1);
     }
     // Zero the padding so a tail burst never reads uninitialised device memory.
     ACL_CHECK(aclrtMemset(data_, capacity_bytes_, 0, capacity_bytes_));
   }
 
   void Release() {
-    if (data_ != nullptr) {
-      ACL_CHECK_NOTHROW(aclrtFree(data_));
-      data_ = nullptr;
+    if (base_ != nullptr) {
+      ACL_CHECK_NOTHROW(aclrtFree(base_));
+      base_ = nullptr;
     }
+    data_ = nullptr;
     size_bytes_ = 0;
     capacity_bytes_ = 0;
   }
@@ -117,8 +149,8 @@ class DeviceBuffer {
   }
 
   template <typename T>
-  static DeviceBuffer FromHost(const std::vector<T>& host) {
-    DeviceBuffer buffer(host.size() * sizeof(T));
+  static DeviceBuffer FromHost(const std::vector<T>& host, size_t alignment = kDeviceAlignBytes) {
+    DeviceBuffer buffer(host.size() * sizeof(T), alignment);
     if (!host.empty()) {
       buffer.CopyFromHost(host.data(), host.size() * sizeof(T));
     }
@@ -126,8 +158,8 @@ class DeviceBuffer {
   }
 
   template <typename T>
-  static DeviceBuffer Empty(size_t element_count) {
-    return DeviceBuffer(element_count * sizeof(T));
+  static DeviceBuffer Empty(size_t element_count, size_t alignment = kDeviceAlignBytes) {
+    return DeviceBuffer(element_count * sizeof(T), alignment);
   }
 
   template <typename T>
@@ -142,12 +174,15 @@ class DeviceBuffer {
   void* get() const { return data_; }
   size_t size_bytes() const { return size_bytes_; }
   size_t capacity_bytes() const { return capacity_bytes_; }
+  size_t alignment() const { return alignment_; }
   bool empty() const { return data_ == nullptr; }
 
  private:
-  void* data_ = nullptr;
+  void* base_ = nullptr;       // pointer aclrtFree must be given
+  void* data_ = nullptr;       // base_, advanced to the requested alignment
   size_t size_bytes_ = 0;      // logical size requested by the caller
-  size_t capacity_bytes_ = 0;  // size actually allocated, padded to 32 bytes
+  size_t capacity_bytes_ = 0;  // usable size from data_, padded to alignment_
+  size_t alignment_ = kDeviceAlignBytes;
 };
 
 }  // namespace test
