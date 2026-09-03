@@ -1,0 +1,236 @@
+# -----------------------------------------------------------------------------
+# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# -----------------------------------------------------------------------------
+#
+# Standalone GTest suite for the kernels a Qwen3.5 forward pass needs on an
+# Ascend 310P3, driven straight through the CANN runtime.
+#
+# This project is deliberately NOT included from the repository root
+# CMakeLists.txt: that one requires Torch 2.10.0 and pybind11, and the whole
+# point here is to build without Python, PyTorch or torch_npu. Configure it on
+# its own:
+#
+#   cmake -S csrc/tests -B build/csrc-tests -DCMAKE_BUILD_TYPE=Release
+#
+# -----------------------------------------------------------------------------
+
+cmake_minimum_required(VERSION 3.16)
+
+project(vllm_ascend_kernel_tests LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
+endif()
+
+# The suite targets one part. The value is not passed to a kernel compiler here
+# (no Ascend C sources are built), but it is checked at runtime against
+# aclrtGetSocName so a run on the wrong part skips rather than reporting
+# meaningless numbers.
+set(SOC_VERSION "Ascend310P3" CACHE STRING "Ascend SoC the tests target")
+
+option(VLLM_ASCEND_TESTS_FETCH_GTEST "Download googletest with FetchContent" ON)
+option(VLLM_ASCEND_TESTS_WERROR "Treat compiler warnings as errors" OFF)
+
+# -----------------------------------------------------------------------------
+# CANN toolkit
+# -----------------------------------------------------------------------------
+
+if(NOT DEFINED ASCEND_HOME_PATH OR ASCEND_HOME_PATH STREQUAL "")
+  if(DEFINED ENV{ASCEND_HOME_PATH})
+    set(ASCEND_HOME_PATH $ENV{ASCEND_HOME_PATH})
+  elseif(DEFINED ENV{ASCEND_TOOLKIT_HOME})
+    set(ASCEND_HOME_PATH $ENV{ASCEND_TOOLKIT_HOME})
+  else()
+    set(ASCEND_HOME_PATH "/usr/local/Ascend/ascend-toolkit/latest")
+  endif()
+endif()
+set(ASCEND_HOME_PATH ${ASCEND_HOME_PATH} CACHE PATH "CANN toolkit install root" FORCE)
+
+if(NOT EXISTS "${ASCEND_HOME_PATH}/include/acl/acl.h")
+  message(FATAL_ERROR
+    "CANN not found at ASCEND_HOME_PATH=${ASCEND_HOME_PATH}\n"
+    "Source the toolkit environment first:\n"
+    "  source /usr/local/Ascend/ascend-toolkit/set_env.sh\n"
+    "or configure with -DASCEND_HOME_PATH=/path/to/ascend-toolkit/latest")
+endif()
+
+message(STATUS "vllm-ascend tests: CANN at ${ASCEND_HOME_PATH}")
+message(STATUS "vllm-ascend tests: target SoC ${SOC_VERSION}")
+
+find_package(Threads REQUIRED)
+
+set(ASCEND_LIB_DIRS
+  "${ASCEND_HOME_PATH}/lib64"
+  "${ASCEND_HOME_PATH}/runtime/lib64"
+  "${ASCEND_HOME_PATH}/acllib/lib64")
+
+# ascendcl is the only hard link-time dependency: aclInit, aclrtMalloc, the
+# stream API. Everything in the aclnn op-api is resolved with dlopen/dlsym at
+# runtime (see common/aclnn_runtime.cpp), which keeps a CANN release that
+# renamed an operator from breaking the whole binary.
+find_library(ASCEND_CL_LIBRARY NAMES ascendcl PATHS ${ASCEND_LIB_DIRS} NO_DEFAULT_PATH)
+if(NOT ASCEND_CL_LIBRARY)
+  message(FATAL_ERROR "libascendcl.so not found under ${ASCEND_LIB_DIRS}")
+endif()
+
+# Linked when present so the loader has them resolved up front, and so a broken
+# CANN install fails at configure time rather than inside a test. Neither is
+# required to build.
+find_library(ASCEND_OP_COMPILER_LIBRARY NAMES acl_op_compiler PATHS ${ASCEND_LIB_DIRS} NO_DEFAULT_PATH)
+find_library(ASCEND_NNOPBASE_LIBRARY NAMES nnopbase PATHS ${ASCEND_LIB_DIRS} NO_DEFAULT_PATH)
+find_library(ASCEND_OPAPI_LIBRARY NAMES opapi PATHS ${ASCEND_LIB_DIRS} NO_DEFAULT_PATH)
+
+set(VLLM_ASCEND_TEST_CANN_LIBS ${ASCEND_CL_LIBRARY})
+foreach(optional_lib
+        ASCEND_OP_COMPILER_LIBRARY
+        ASCEND_NNOPBASE_LIBRARY
+        ASCEND_OPAPI_LIBRARY)
+  if(${optional_lib})
+    list(APPEND VLLM_ASCEND_TEST_CANN_LIBS ${${optional_lib}})
+    message(STATUS "vllm-ascend tests: linking ${${optional_lib}}")
+  else()
+    message(STATUS "vllm-ascend tests: ${optional_lib} not found, resolving those symbols at runtime")
+  endif()
+endforeach()
+
+# The repository root CMakeLists.txt skips vllm_ascend_kernels entirely on
+# ascend310p ("Hardware ${SOC_VERSION} detected: skip vllm_ascend_kernels
+# compile"), and the four kernels under test come from the CANN op-api rather
+# than from csrc. The lookup stays so a 910-series build, or a future 310P
+# kernel library, is picked up without editing this file.
+find_library(VLLM_ASCEND_KERNELS_LIBRARY
+  NAMES vllm_ascend_kernels
+  HINTS
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../build"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../out"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../vllm_ascend"
+  NO_DEFAULT_PATH)
+if(VLLM_ASCEND_KERNELS_LIBRARY)
+  list(APPEND VLLM_ASCEND_TEST_CANN_LIBS ${VLLM_ASCEND_KERNELS_LIBRARY})
+  message(STATUS "vllm-ascend tests: linking ${VLLM_ASCEND_KERNELS_LIBRARY}")
+else()
+  message(STATUS "vllm-ascend tests: vllm_ascend_kernels not found (expected on ascend310p)")
+endif()
+
+# -----------------------------------------------------------------------------
+# googletest
+# -----------------------------------------------------------------------------
+
+if(VLLM_ASCEND_TESTS_FETCH_GTEST)
+  include(FetchContent)
+  # An offline 310P host can point FETCHCONTENT_SOURCE_DIR_GOOGLETEST at an
+  # unpacked tarball, or configure with -DVLLM_ASCEND_TESTS_FETCH_GTEST=OFF to
+  # use a system install instead.
+  FetchContent_Declare(
+    googletest
+    GIT_REPOSITORY https://github.com/google/googletest.git
+    GIT_TAG        v1.14.0
+    GIT_SHALLOW    TRUE)
+  set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+  set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+  FetchContent_MakeAvailable(googletest)
+  set(VLLM_ASCEND_TEST_GTEST_TARGET gtest)
+else()
+  find_package(GTest REQUIRED)
+  set(VLLM_ASCEND_TEST_GTEST_TARGET GTest::gtest)
+endif()
+
+# Provides gtest_discover_tests.
+include(GoogleTest)
+
+# -----------------------------------------------------------------------------
+# Shared test infrastructure
+# -----------------------------------------------------------------------------
+
+add_library(vllm_ascend_test_common STATIC
+  common/test_harness.cpp
+  common/aclnn_runtime.cpp
+  common/aclnn_ops.cpp
+  common/cpu_reference.cpp)
+
+target_include_directories(vllm_ascend_test_common
+  PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/common"
+    "${ASCEND_HOME_PATH}/include")
+
+target_link_directories(vllm_ascend_test_common PUBLIC ${ASCEND_LIB_DIRS})
+
+target_link_libraries(vllm_ascend_test_common
+  PUBLIC
+    ${VLLM_ASCEND_TEST_CANN_LIBS}
+    ${VLLM_ASCEND_TEST_GTEST_TARGET}
+    ${CMAKE_DL_LIBS}
+    Threads::Threads)
+
+target_compile_definitions(vllm_ascend_test_common PUBLIC ASCEND_PLATFORM_310P)
+
+target_compile_options(vllm_ascend_test_common PUBLIC -Wall -Wextra)
+if(VLLM_ASCEND_TESTS_WERROR)
+  target_compile_options(vllm_ascend_test_common PUBLIC -Werror)
+endif()
+
+# -----------------------------------------------------------------------------
+# Test binaries
+# -----------------------------------------------------------------------------
+
+enable_testing()
+
+set(VLLM_ASCEND_KERNEL_TESTS
+  test_rmsnorm_310p
+  test_rotary_embedding_310p
+  test_activation_swiglu_310p
+  test_paged_attention_310p)
+
+# Discovery runs the binary, which needs libopapi.so and friends on the loader
+# path even though they are opened lazily.
+set(VLLM_ASCEND_TEST_LIBRARY_PATH "${ASCEND_HOME_PATH}/lib64:$ENV{LD_LIBRARY_PATH}")
+
+foreach(test_name ${VLLM_ASCEND_KERNEL_TESTS})
+  add_executable(${test_name}
+    "kernels/${test_name}.cpp"
+    common/main.cpp)
+
+  target_link_libraries(${test_name} PRIVATE vllm_ascend_test_common)
+
+  # $ORIGIN keeps a copied-out build tree working; the CANN lib dir covers the
+  # normal in-place run.
+  set_target_properties(${test_name} PROPERTIES
+    BUILD_RPATH "${ASCEND_HOME_PATH}/lib64"
+    INSTALL_RPATH "$ORIGIN:${ASCEND_HOME_PATH}/lib64")
+
+  if(COMMAND gtest_discover_tests AND NOT CMAKE_VERSION VERSION_LESS "3.18")
+    # PRE_TEST defers enumeration to `ctest` time. The default POST_BUILD mode
+    # runs the binary during the build, which fails on a build host that has the
+    # CANN headers but no driver.
+    gtest_discover_tests(${test_name}
+      DISCOVERY_MODE PRE_TEST
+      DISCOVERY_TIMEOUT 120
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${VLLM_ASCEND_TEST_LIBRARY_PATH};ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
+        TIMEOUT 900)
+  else()
+    add_test(NAME ${test_name} COMMAND ${test_name})
+    set_tests_properties(${test_name} PROPERTIES
+      ENVIRONMENT "LD_LIBRARY_PATH=${VLLM_ASCEND_TEST_LIBRARY_PATH};ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
+      TIMEOUT 900)
+  endif()
+endforeach()
+
+message(STATUS "vllm-ascend tests: configured ${VLLM_ASCEND_KERNEL_TESTS}")
