@@ -1,0 +1,31 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "docker-cann-aarch64",
+      "displayName": "WSL/Docker: CANN 9.1.0 (AArch64 Cross)",
+      "description": "Cross-compile for Ascend 310P3 inside CANN Docker container",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/csrc-tests-aarch64",
+      "cmakeExecutable": "/usr/bin/cmake",
+      "wslDistribution": "Ubuntu-22.04",
+      "environment": {
+        "ASCEND_TOOLKIT_HOME": "/usr/local/Ascend/ascend-toolkit/latest",
+        "SOC_VERSION": "ascend310p3"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "/vllm-workspace/vllm-ascend/cmake/aarch64-toolchain.cmake",
+        "CMAKE_SKIP_BUILD_RPATH": "ON",
+        "SOC_VERSION": "ascend310p3",
+        "FETCHCONTENT_SOURCE_DIR_GOOGLETEST": "/vllm-workspace/vllm-ascend/build/csrc-tests/_deps/googletest-src"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "docker-cann-aarch64",
+      "configurePreset": "docker-cann-aarch64"
+    }
+  ]
+}
