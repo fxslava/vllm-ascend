@@ -1,8 +1,16 @@
-# Bare-metal kernel tests and benchmarks (Ascend 310P3)
+# Bare-metal kernel tests and benchmarks (Ascend 310P3, CUDA)
 
 A standalone suite for the five operator families a **Qwen3.5** forward pass
 needs, driven straight through the CANN runtime. No Python, no PyTorch, no
 `torch_npu`, no Torch C++ ABI.
+
+There are two device backends. The default is Ascend 310P3 through CANN. The
+other, selected with `-DENABLE_CUDA=ON`, runs hand-written CUDA C kernels on an
+NVIDIA GPU so the suite can be developed and run on a host PC with no Ascend
+hardware attached - see [CUDA backend](#cuda-backend). Both share the CPU
+references, the fp16 conversion, the deterministic data generator, the tolerance
+machinery and the Qwen3.5 shape tables; only the device runtime and the kernels
+differ.
 
 | Kernel | Test binary | Benchmark binary | Stands in for |
 | --- | --- | --- | --- |
@@ -35,7 +43,7 @@ csrc/tests/
 │   ├── aclnn_runtime.hpp / .cpp         dlopen/dlsym loader, aclTensor RAII, two-phase launch
 │   ├── bench_main.cpp                   entry point for the bench_* binaries
 │   ├── benchmark.hpp / .cpp             plan-once launch, event timing, statistics, reporting
-│   ├── cpu_reference.hpp / .cpp         naive fp32 references for all five kernels
+│   ├── cpu_reference.hpp / .cpp         naive fp32 references, shared by BOTH backends
 │   ├── device_buffer.hpp                RAII device allocation, 32-byte default, 512 for benchmarks
 │   ├── device_tensor.hpp                device buffer + aclTensor descriptor, with host conversions
 │   ├── fp16.hpp                         IEEE-754 binary16 conversion, round-to-nearest-even
@@ -43,13 +51,25 @@ csrc/tests/
 │   ├── qwen_shapes.hpp                  Qwen3.5 shapes and the 310P alignment rules
 │   ├── random_data.hpp                  deterministic, platform-independent test data
 │   ├── tensor_compare.hpp               allclose with a diagnostic report
-│   └── test_harness.hpp / .cpp          AscendTestEnvironment: aclInit, device, context, stream
+│   ├── test_harness.hpp / .cpp          AscendTestEnvironment: aclInit, device, context, stream
+│   │
+│   ├── cuda_check.hpp                   CUDA_CHECK / ASSERT_CUDA_OK, the acl_check.hpp counterpart
+│   ├── cuda_runtime.hpp / .cu           CUDADeviceBuffer, CUDADevice, CUDATestEnvironment
+│   ├── cuda_device_tensor.hpp           typed device buffers with the fp16 round trip
+│   └── cuda_main.cpp                    entry point for the CUDA test_* binaries
 └── kernels/
     ├── test_matmul_310p.cpp             bench_matmul_310p.cpp
     ├── test_rmsnorm_310p.cpp            bench_rmsnorm_310p.cpp
     ├── test_rotary_embedding_310p.cpp   bench_rotary_embedding_310p.cpp
     ├── test_activation_swiglu_310p.cpp  bench_activation_swiglu_310p.cpp
-    └── test_paged_attention_310p.cpp    bench_paged_attention_310p.cpp
+    ├── test_paged_attention_310p.cpp    bench_paged_attention_310p.cpp
+    └── cuda/
+        ├── cuda_kernels.hpp             host-callable launchers, the nvcc/host-compiler seam
+        ├── cuda_block_reduce.cuh        __shfl_xor_sync warp and block reductions
+        ├── rmsnorm_kernel.cu            test_rmsnorm.cpp
+        ├── rotary_kernel.cu             test_rotary_embedding.cpp
+        ├── swiglu_kernel.cu             test_activation_swiglu.cpp
+        └── paged_attention_kernel.cu    test_paged_attention.cpp
 ```
 
 Each test file has two layers. Tests named `*Reference` and `*Shapes` are
@@ -60,6 +80,8 @@ skip with an explanatory message when one is not attached.
 ---
 
 ## Prerequisites
+
+Everything from here to [CUDA backend](#cuda-backend) is the Ascend 310P3 path.
 
 - CANN toolkit (headers at `$ASCEND_HOME_PATH/include/acl/acl.h`)
 - CMake >= 3.16 (3.18+ enables per-test `ctest` granularity)
@@ -229,6 +251,138 @@ See [COVERAGE.md](COVERAGE.md) for what this does and does not close.
 
 ---
 
+## CUDA backend
+
+`-DENABLE_CUDA=ON` swaps the device layer for native CUDA C. It exists so the
+kernels a Qwen3.5 decode step needs can be developed, run and debugged on a host
+PC, without an Ascend 310P3 in the loop.
+
+What it is not: a port of the plugin, and not a second implementation anyone
+ships. It is a second *device* for the same tests, so a change to the CPU
+references or the test logic is exercised somewhere before it reaches hardware.
+
+| Kernel | Test binary | Notes |
+| --- | --- | --- |
+| RMSNorm | `test_rmsnorm` | `__shfl_xor_sync` block reduction, fp32 accumulate |
+| Rotary embedding | `test_rotary_embedding` | "half" (neox / rotate_half) layout only, head dims 64 and 128 |
+| SiluAndMul (SwiGLU) | `test_activation_swiglu` | vectorised `half2`, scalar fallback for an odd width |
+| Paged attention + KV cache | `test_paged_attention` | dense 4-D cache, decode scatter and `paged_attention_decode_v1` |
+
+MatMul has no CUDA counterpart: a hand-written GEMM would be measuring the
+kernel this suite wrote rather than anything the plugin does, and the credible
+alternatives all mean linking cuBLAS or Cutlass, which the no-dependency rule
+rules out.
+
+### Dependencies
+
+The CUDA Runtime API (`<cuda_runtime.h>`, `<cuda_fp16.h>`) and `cudart`. No
+PyTorch, no Torch-CUDA headers, no Cutlass, no cuBLAS, no Python bindings. Every
+kernel is written out by hand in `kernels/cuda/`.
+
+### Prerequisites
+
+- CUDA toolkit 11.0 or newer, with `nvcc` on `PATH`
+- CMake >= 3.18
+- An NVIDIA GPU for the parity tests; the host-only tests need none
+
+### Configure and build
+
+```bash
+cmake -S csrc/tests -B build/csrc-tests-cuda -DENABLE_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+```
+
+```bash
+cmake --build build/csrc-tests-cuda -j
+```
+
+The default architecture list is `75;80;86;89;90`, plus `120` when the toolkit
+is 12.8 or newer. Building six architectures is slow and rarely what you want
+while iterating, so pass the one you have:
+
+```bash
+cmake -S csrc/tests -B build/csrc-tests-cuda -DENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89
+```
+
+On Windows, CUDA's MSBuild integration is only installed for Visual Studio
+versions the CUDA installer recognises. If configuring reports `No CUDA toolset
+found`, use Ninja from a developer command prompt instead, which drives `nvcc`
+directly and needs no integration:
+
+```bash
+cmake -G Ninja -S csrc/tests -B build/csrc-tests-cuda -DENABLE_CUDA=ON
+```
+
+An Ascend build directory next to this one is reused for googletest rather than
+downloading a second copy; `-DFETCHCONTENT_SOURCE_DIR_GOOGLETEST` and
+`-DVLLM_ASCEND_TESTS_FETCH_GTEST=OFF` work exactly as they do for CANN.
+
+### Run
+
+```bash
+ctest --test-dir build/csrc-tests-cuda --output-on-failure
+```
+
+```bash
+./build/csrc-tests-cuda/test_paged_attention --gtest_filter='*seq4_h32_kv8*'
+```
+
+```bash
+CUDA_TEST_DEVICE_ID=1 ./build/csrc-tests-cuda/test_rmsnorm
+```
+
+`-DVLLM_ASCEND_TESTS_BUILD_BENCHMARKS=ON` is accepted and ignored: the `bench_*`
+binaries drive aclnn operators through `common/benchmark.cpp` and have no CUDA
+counterpart yet.
+
+### What the kernels commit to
+
+Each one reproduces the arithmetic in `common/cpu_reference.cpp` operation for
+operation, not just to within a tolerance:
+
+- **RMSNorm** multiplies in the reference's order, `(x * rstd) * gamma`, and
+  computes `1 / sqrtf(...)` rather than `rsqrtf`, whose approximation is visible
+  at the `rstd` around 1e3 that a near-zero row produces.
+- **SwiGLU** evaluates `v / (1 + expf(-v))`, not `v * sigmoid(v)`, and uses the
+  accurate `expf` rather than `__expf`: the saturation case drives the gate to
+  +/-30, where the fast intrinsic is not accurate enough.
+- **Rotary** reads both halves of the cos/sin row separately even though
+  `GatherFullCosSin` duplicates them, so the kernel touches exactly the elements
+  the reference touches.
+- **Paged attention decode** keeps the reference's phase order and its
+  `weight = score * (1/denominator)` factorisation, and accumulates over
+  positions in ascending order for each output element.
+
+What is left is reduction association - a tree on the device against a
+sequential loop on the host - which is fp32 noise well under the fp16 rounding
+of the output. Every comparison uses the same tolerances as the Ascend suite.
+
+### Differences from the Ascend backend
+
+- **The KV cache is the dense 4-D GPU layout**
+  `[num_blocks, num_kv_heads, block_size, head_dim]`, not the 310P 5-D fractal
+  NZ shape. `reference::PagedKvLayout::kind` selects between them, so
+  `ReshapeAndCache` and `PagedAttentionDecode` are still one implementation
+  checked by both backends.
+- **Rotary covers the "half" layout only.** The interleave layout is exercised
+  in the host-only reference tests but has no CUDA kernel.
+- **`paged_attention_decode_v1` holds the whole score row in shared memory**,
+  the same constraint vLLM's own v1 kernel has. The launcher checks the
+  requirement against the device limit and throws a named error rather than
+  failing the launch with a bare invalid-value status.
+- **The 310P alignment rules do not apply** - the 32-byte SwiGLU gate, the
+  fractal width, the 64/128 block sizes. The shape tables still drive both
+  backends so the coverage matches, and the tests that assert those rules stay
+  on the Ascend side where they mean something.
+
+`test_paged_attention` is worth calling out: the decode half of
+`test_paged_attention_310p` is permanently skipped, because CANN 9.1.0 exposes
+no aclnn paged attention and `torch_npu._npu_paged_attention` is an ATB C++
+object API the aclnn path cannot drive. Until that changes, the CUDA backend is
+the only place in the suite where `reference::PagedAttentionDecode` is checked
+against a real kernel.
+
+---
+
 ## First run on a new CANN release
 
 The suite resolves every aclnn operator with `dlopen`/`dlsym` rather than
@@ -346,6 +500,8 @@ Not covered: the quantised (W8A8 / int8 KV cache) paths, chunked prefill and the
 splitfuse attention variants, multi-device or graph-capture execution, and
 performance regression *thresholds* - the benchmarks report numbers and check
 that the operator still produces its output, but nothing fails on a slowdown.
+On the CUDA backend, additionally: MatMul, the interleave rotary layout, and the
+benchmarks.
 The five kernels here are the fp16 decode path only, which is what the brief
 scoped. [COVERAGE.md](COVERAGE.md) has the full gap list.
 
@@ -364,3 +520,17 @@ To add a benchmark for it, write `kernels/bench_<name>_310p.cpp` defining
 `VLLM_ASCEND_KERNEL_BENCHMARKS`. Allocate everything in `BuildSuite`, hand
 `PlanAclnn` the same arguments `RunAclnn` would take, and give the case a
 checksum.
+
+For the CUDA backend:
+
+1. Reuse the reference from step 2 - do not write a second one. If the kernel
+   needs a different memory layout, add it as a variant behind the existing
+   struct the way `PagedKvCacheLayout` does, so both backends stay checked
+   against one implementation.
+2. Declare a launcher in `kernels/cuda/cuda_kernels.hpp`, passing fp16 buffers
+   as `uint16_t*`. That header is the seam between the host compiler and nvcc,
+   so it must name no CUDA language extension and no `__half`.
+3. Write `kernels/cuda/<name>_kernel.cu` and add it to
+   `vllm_ascend_cuda_kernels` in `CMakeLists.txt`.
+4. Add `kernels/cuda/test_<name>.cpp` and append the binary name to
+   `VLLM_ASCEND_CUDA_KERNEL_TESTS`.

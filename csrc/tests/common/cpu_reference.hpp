@@ -121,15 +121,33 @@ void ApplyRotaryPosEmb(const std::vector<float>& x, const std::vector<float>& co
 // where hidden = num_kv_heads * head_size. The trailing 16 is the fp16
 // fractal width the v200 cube unit consumes, which is why head_size * num_kv_heads
 // must be a multiple of 16 on this part.
+//
+// The CUDA backend has no fractal constraint and stores the cache in the
+// standard GPU shape instead, so the layout is a field rather than baked into
+// the offset function. Everything downstream - ReshapeAndCache,
+// PagedAttentionDecode - is shared between the two, which is the point: the
+// same reference checks both kernels.
+enum class PagedKvCacheLayout {
+  // [num_blocks, hidden / 16, block_size, 16], Ascend 310P.
+  kFractalNz310P,
+  // [num_blocks, num_kv_heads, block_size, head_size], CUDA.
+  kDense4D,
+};
+
 struct PagedKvLayout {
   int64_t num_blocks = 0;
   int64_t block_size = 0;
   int64_t num_kv_heads = 0;
   int64_t head_size = 0;
+  PagedKvCacheLayout kind = PagedKvCacheLayout::kFractalNz310P;
 
   int64_t hidden() const { return num_kv_heads * head_size; }
   int64_t fractal_rows() const { return hidden() / 16; }
   size_t ElementCount() const {
+    if (kind == PagedKvCacheLayout::kDense4D) {
+      return static_cast<size_t>(num_blocks) * static_cast<size_t>(num_kv_heads) *
+             static_cast<size_t>(block_size) * static_cast<size_t>(head_size);
+    }
     return static_cast<size_t>(num_blocks) * static_cast<size_t>(fractal_rows()) *
            static_cast<size_t>(block_size) * 16u;
   }
@@ -139,6 +157,15 @@ struct PagedKvLayout {
 // 5-D NZ cache described above.
 size_t NzCacheOffset(const PagedKvLayout& layout, int64_t block_id, int64_t block_offset, int64_t kv_head,
                      int64_t dim);
+
+// The same, for [num_blocks, num_kv_heads, block_size, head_size].
+size_t Dense4DCacheOffset(const PagedKvLayout& layout, int64_t block_id, int64_t block_offset,
+                          int64_t kv_head, int64_t dim);
+
+// Dispatches on layout.kind. This is what ReshapeAndCache and
+// PagedAttentionDecode call, so a test only has to set the field.
+size_t CacheOffset(const PagedKvLayout& layout, int64_t block_id, int64_t block_offset, int64_t kv_head,
+                   int64_t dim);
 
 // Host-side model of torch_npu._npu_reshape_and_cache.
 // key / value    [num_tokens, num_kv_heads, head_size]

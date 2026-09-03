@@ -198,6 +198,24 @@ size_t NzCacheOffset(const PagedKvLayout& layout, int64_t block_id, int64_t bloc
          static_cast<size_t>(fractal_column);
 }
 
+size_t Dense4DCacheOffset(const PagedKvLayout& layout, int64_t block_id, int64_t block_offset,
+                          int64_t kv_head, int64_t dim) {
+  return ((static_cast<size_t>(block_id) * static_cast<size_t>(layout.num_kv_heads) +
+           static_cast<size_t>(kv_head)) *
+              static_cast<size_t>(layout.block_size) +
+          static_cast<size_t>(block_offset)) *
+             static_cast<size_t>(layout.head_size) +
+         static_cast<size_t>(dim);
+}
+
+size_t CacheOffset(const PagedKvLayout& layout, int64_t block_id, int64_t block_offset, int64_t kv_head,
+                   int64_t dim) {
+  if (layout.kind == PagedKvCacheLayout::kDense4D) {
+    return Dense4DCacheOffset(layout, block_id, block_offset, kv_head, dim);
+  }
+  return NzCacheOffset(layout, block_id, block_offset, kv_head, dim);
+}
+
 void ReshapeAndCache(const std::vector<float>& key, const std::vector<float>& value,
                      const std::vector<int32_t>& slot_mapping, const PagedKvLayout& layout,
                      std::vector<float>* key_cache, std::vector<float>* value_cache) {
@@ -217,7 +235,7 @@ void ReshapeAndCache(const std::vector<float>& key, const std::vector<float>& va
     for (int64_t head = 0; head < layout.num_kv_heads; ++head) {
       for (int64_t dim = 0; dim < layout.head_size; ++dim) {
         const size_t source = static_cast<size_t>((token * layout.num_kv_heads + head) * layout.head_size + dim);
-        const size_t destination = NzCacheOffset(layout, block_id, block_offset, head, dim);
+        const size_t destination = CacheOffset(layout, block_id, block_offset, head, dim);
         (*key_cache)[destination] = key[source];
         (*value_cache)[destination] = value[source];
       }
@@ -258,7 +276,7 @@ void PagedAttentionDecode(const std::vector<float>& query, const std::vector<flo
 
         float dot = 0.0f;
         for (int64_t dim = 0; dim < shape.head_size; ++dim) {
-          const size_t key_index = NzCacheOffset(layout, physical_block, block_offset, kv_head, dim);
+          const size_t key_index = CacheOffset(layout, physical_block, block_offset, kv_head, dim);
           dot += query[query_base + static_cast<size_t>(dim)] * key_cache[key_index];
         }
         const float score = dot * shape.scale;
@@ -284,7 +302,7 @@ void PagedAttentionDecode(const std::vector<float>& query, const std::vector<flo
         const int64_t physical_block = block_table[table_row + static_cast<size_t>(logical_block)];
 
         for (int64_t dim = 0; dim < shape.head_size; ++dim) {
-          const size_t value_index = NzCacheOffset(layout, physical_block, block_offset, kv_head, dim);
+          const size_t value_index = CacheOffset(layout, physical_block, block_offset, kv_head, dim);
           (*out)[query_base + static_cast<size_t>(dim)] += weight * value_cache[value_index];
         }
       }
