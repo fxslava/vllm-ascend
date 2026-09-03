@@ -32,6 +32,10 @@ __pycache__/
 # C extensions
 *.so
 
+# aarch64 CANN toolkit extracted for cross compilation (see
+# cmake/aarch64-toolchain.cmake); multi-GB, reproducible from the arm64 image.
+/cann_aarch64/
+
 # Distribution / packaging
 .Python
 build/
