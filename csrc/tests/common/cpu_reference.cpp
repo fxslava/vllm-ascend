@@ -24,6 +24,26 @@ namespace vllm_ascend {
 namespace test {
 namespace reference {
 
+void MatmulTransposedB(const std::vector<float>& a, const std::vector<float>& b_t, int64_t m, int64_t k,
+                       int64_t n, std::vector<float>* out) {
+  assert(a.size() == static_cast<size_t>(m * k));
+  assert(b_t.size() == static_cast<size_t>(n * k));
+
+  out->assign(static_cast<size_t>(m * n), 0.0f);
+
+  for (int64_t i = 0; i < m; ++i) {
+    const size_t a_row = static_cast<size_t>(i * k);
+    for (int64_t j = 0; j < n; ++j) {
+      const size_t b_row = static_cast<size_t>(j * k);
+      float sum = 0.0f;
+      for (int64_t p = 0; p < k; ++p) {
+        sum += a[a_row + static_cast<size_t>(p)] * b_t[b_row + static_cast<size_t>(p)];
+      }
+      (*out)[static_cast<size_t>(i * n + j)] = sum;
+    }
+  }
+}
+
 void RmsNorm(const std::vector<float>& x, const std::vector<float>& gamma, int64_t num_tokens, int64_t hidden,
              float epsilon, std::vector<float>* y, std::vector<float>* rstd) {
   assert(x.size() == static_cast<size_t>(num_tokens * hidden));

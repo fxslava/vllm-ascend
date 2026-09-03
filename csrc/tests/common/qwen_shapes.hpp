@@ -56,6 +56,21 @@ inline bool IsValid310PBlockSize(int64_t block_size, int64_t head_size) {
   return block_size * head_size <= kAttentionBlockSizeLimit;
 }
 
+// --- Linear projections (MatMul, cube unit) ---------------------------------
+
+// Decode generates one token at a time, so the projections run with M = 1: a
+// GEMV, latency-bound and the shape that dominates decode. Prefill batches many
+// tokens into the same weights; those M values are deliberately not covered
+// here (see the note in test_matmul_310p.cpp).
+constexpr int64_t kDecodeTokenCount = 1;
+
+// K = in_features. Qwen3.5 hidden sizes that feed a projection.
+inline std::vector<int64_t> LinearInputSizes() { return {2048, 4096}; }
+
+// N = out_features. 2048 / 4096 cover the attention projections (QKV, o_proj)
+// where out == hidden; 11008 is an MLP gate_up / down width.
+inline std::vector<int64_t> LinearOutputSizes() { return {2048, 4096, 11008}; }
+
 // --- RMSNorm ----------------------------------------------------------------
 
 // Hidden sizes spanning the Qwen3.5 range, from the small dense models up to

@@ -26,6 +26,7 @@
 // To re-verify on another toolkit:
 //
 //   INC=$ASCEND_HOME_PATH/include/aclnnop
+//   grep -rA4 'aclnnMatmulGetWorkspaceSize('               $INC/aclnn_matmul.h
 //   grep -rA8 'aclnnRmsNormGetWorkspaceSize('              $INC/aclnn_rms_norm.h
 //   grep -rA8 'aclnnSwiGluGetWorkspaceSize('               $INC/level2/aclnn_swi_glu.h
 //   grep -rA6 'aclnnApplyRotaryPosEmbV2GetWorkspaceSize('  $INC/aclnn_apply_rotary_pos_emb_v2.h
@@ -67,6 +68,36 @@ namespace ops {
 // suffixes across CANN releases; the candidate list keeps that churn out of the
 // test bodies. When none resolve, the returned op reports every name tried.
 AclnnOp ResolveFirstAvailable(std::initializer_list<const char*> candidate_names);
+
+// ---------------------------------------------------------------------------
+// MatMul (Cube core)
+// ---------------------------------------------------------------------------
+// mirrors: torch.nn.functional.linear, i.e. every QKV / o_proj / gate_up / down
+//          projection in the Qwen3.5 forward pass. On 310P these run on the
+//          v200 cube unit, which none of the other four suites touch: RMSNorm,
+//          SwiGLU and RoPE are all vector-unit work.
+//
+//   out = self @ mat2      self [M, K], mat2 [K, N], out [M, N]
+//
+// A Linear layer stores its weight as [out_features, in_features] = [N, K] and
+// computes x @ W^T, so the test hands `mat2` a [K, N] *view* with strides
+// {1, K} over [N, K] storage rather than materialising a transpose. See
+// DeviceTensor::HalfTransposed2D.
+//
+// VERIFIED against CANN 9.1.0
+// $ASCEND_HOME_PATH/include/aclnnop/aclnn_matmul.h
+//   aclnnStatus aclnnMatmulGetWorkspaceSize(
+//       const aclTensor* self, const aclTensor* mat2, aclTensor* out, int8_t cubeMathType,
+//       uint64_t* workspaceSize, aclOpExecutor** executor);
+using MatmulWorkspaceFn = int (*)(const aclTensor* self, const aclTensor* mat2, aclTensor* out,
+                                  int8_t cube_math_type, uint64_t* workspace_size, aclOpExecutor** executor);
+inline const char* kMatmul = "aclnnMatmul";
+
+// cubeMathType is an int8 enum. Documented in the aclnn_mv.h comment block:
+//   0 KEEP_DTYPE, 1 ALLOW_FP32_DOWN_PRECISION, 2 USE_FP16, 3 USE_HF32
+// The inputs here are already fp16, so KEEP_DTYPE leaves the cube unit in fp16
+// and the comparison measures the kernel rather than a precision policy.
+inline constexpr int8_t kCubeMathTypeKeepDtype = 0;
 
 // ---------------------------------------------------------------------------
 // RMSNorm

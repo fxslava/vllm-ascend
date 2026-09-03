@@ -23,6 +23,7 @@
 
 #pragma once
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <utility>
@@ -59,6 +60,14 @@ class DeviceTensor {
                            aclFormat format = ACL_FORMAT_ND);
   static DeviceTensor HalfEmpty(const std::vector<int64_t>& dims, aclFormat format = ACL_FORMAT_ND);
   std::vector<float> ToFloatFromHalf() const;
+
+  // A [k, n] tensor whose storage is [n, k] row-major, described with strides
+  // {1, k} instead of being copied. This is the weight layout a Linear layer
+  // already holds ([out_features, in_features]), so a matmul test can pass a
+  // transposed B the same way the plugin does, without a host-side transpose.
+  //
+  // `values` is the [n, k] buffer, n * k elements.
+  static DeviceTensor HalfTransposed2D(int64_t n, int64_t k, const std::vector<float>& values);
 
   // --- fp32 -----------------------------------------------------------------
 
@@ -108,6 +117,27 @@ inline DeviceTensor DeviceTensor::Half(const std::vector<int64_t>& dims, const s
 
 inline DeviceTensor DeviceTensor::HalfEmpty(const std::vector<int64_t>& dims, aclFormat format) {
   return DeviceTensor(dims, ACL_FLOAT16, format, sizeof(uint16_t), nullptr);
+}
+
+inline DeviceTensor DeviceTensor::HalfTransposed2D(int64_t n, int64_t k, const std::vector<float>& values) {
+  const size_t count = static_cast<size_t>(n) * static_cast<size_t>(k);
+  assert(values.size() == count);
+
+  std::vector<uint16_t> bits(values.size());
+  for (size_t i = 0; i < values.size(); ++i) {
+    bits[i] = FloatToHalfBits(values[i]);
+  }
+
+  DeviceTensor tensor;
+  // dims_ is the logical view the operator sees; the allocation is the same
+  // n * k elements either way.
+  tensor.dims_ = {k, n};
+  tensor.element_count_ = count;
+  tensor.buffer_.Allocate(count * sizeof(uint16_t));
+  tensor.buffer_.CopyFromHost(bits.data(), bits.size() * sizeof(uint16_t));
+  tensor.tensor_ = AclnnTensor(/*dims=*/{k, n}, /*strides=*/{1, k}, /*offset=*/0, ACL_FLOAT16, ACL_FORMAT_ND,
+                               /*storage_dims=*/{n, k}, tensor.buffer_.get());
+  return tensor;
 }
 
 inline std::vector<float> DeviceTensor::ToFloatFromHalf() const {
