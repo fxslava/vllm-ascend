@@ -469,6 +469,7 @@ else()
     kernels/cuda/rmsnorm_kernel.cu
     kernels/cuda/rotary_kernel.cu
     kernels/cuda/swiglu_kernel.cu
+    kernels/cuda/elementwise_kernel.cu
     kernels/cuda/paged_attention_kernel.cu)
 
   target_include_directories(vllm_ascend_cuda_kernels
@@ -515,11 +516,21 @@ else()
     test_rmsnorm
     test_rotary_embedding
     test_activation_swiglu
-    test_paged_attention)
+    test_paged_attention
+    test_qwen_layer_golden)
 
   foreach(test_name ${VLLM_ASCEND_CUDA_KERNEL_TESTS})
     add_executable(${test_name} "kernels/cuda/${test_name}.cpp" common/cuda_main.cpp)
     target_link_libraries(${test_name} PRIVATE vllm_ascend_test_common)
+
+    if(test_name STREQUAL "test_qwen_layer_golden")
+      # Absolute source path, so the dump is found regardless of the working
+      # directory. QWEN_GOLDEN_LAYER3_DIR overrides it at run time. The dumps
+      # are Git LFS objects: without `git lfs pull` the test skips rather than
+      # failing, see the loader in test_qwen_layer_golden.cpp.
+      target_compile_definitions(${test_name} PRIVATE
+        VLLM_ASCEND_GOLDEN_LAYER3_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data/golden_layer3")
+    endif()
 
     list(APPEND VLLM_ASCEND_TEST_BINARY_FILES "$<TARGET_FILE:${test_name}>")
 

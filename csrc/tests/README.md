@@ -69,8 +69,10 @@ csrc/tests/
         ├── rmsnorm_kernel.cu            test_rmsnorm.cpp
         ├── rotary_kernel.cu             test_rotary_embedding.cpp
         ├── swiglu_kernel.cu             test_activation_swiglu.cpp
+        ├── elementwise_kernel.cu        sigmoid output gate and residual add
         ├── paged_attention_kernel.cu    test_paged_attention.cpp
-        └── test_matmul.cpp              cuBLAS; the one operator with no kernel of its own
+        ├── test_matmul.cpp              cuBLAS; the one operator with no kernel of its own
+        └── test_qwen_layer_golden.cpp   whole-layer parity against a PyTorch dump
 ```
 
 Each test file has two layers. Tests named `*Reference` and `*Shapes` are
@@ -269,6 +271,31 @@ references or the test logic is exercised somewhere before it reaches hardware.
 | SiluAndMul (SwiGLU) | `test_activation_swiglu` | vectorised `half2`, scalar fallback for an odd width |
 | Paged attention + KV cache | `test_paged_attention` | dense 4-D cache, decode scatter and `paged_attention_decode_v1` |
 | MatMul | `test_matmul` | cuBLAS `cublasGemmEx`, fp16 storage with fp32 accumulate, `CUBLAS_OP_T` weights |
+| Whole layer (Qwen3.5 layer 3) | `test_qwen_layer_golden` | end to end against a PyTorch dump, seven per-stage taps plus the final output |
+
+### Golden layer dumps
+
+`test_qwen_layer_golden` is the only test here that is not self-contained: it
+replays one decoder layer - RMSNorm, QKV and gate projections, partial RoPE, the
+paged KV write and decode, the attention output gate, the out projection, two
+residual adds and the SwiGLU MLP - against activations dumped from PyTorch by
+`scripts/dump_qwen35_layer3.py`.
+
+The dumps live in `csrc/tests/data/golden_layer3` and are **Git LFS** objects,
+so a fresh clone needs:
+
+```bash
+git lfs install && git lfs pull
+```
+
+Without them the test skips with the reason rather than failing. To regenerate
+them - after a kernel change that legitimately moves the numbers, or to get a
+position and context length that exercise RoPE and the softmax (see the note at
+the top of the test):
+
+```bash
+python scripts/dump_qwen35_layer3.py --pos 1024 --ctx-len 128
+```
 
 MatMul is the one operator here with no kernel of its own. A hand-written GEMM
 would be measuring the kernel this suite just wrote rather than anything a

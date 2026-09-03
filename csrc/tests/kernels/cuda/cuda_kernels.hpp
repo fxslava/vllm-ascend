@@ -84,6 +84,31 @@ void LaunchSwiGluHalf(const uint16_t* x, uint16_t* out, int64_t num_tokens, int6
                       cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
+// Attention output gate
+// ---------------------------------------------------------------------------
+// x    [count]  fp16   attention context, before the out projection
+// gate [count]  fp16   the gate projection's output, same shape as x
+// out  [count]  fp16   = x * sigmoid(gate)
+//
+// This is the `attn_output_gate` a Qwen3-Next-style block applies to the
+// attention context before o_proj: a separate projection off the same
+// normalised hidden state produces `gate`, and the context is modulated by its
+// sigmoid. sigmoid is evaluated in fp32; `out` may alias `x`.
+void LaunchSigmoidGateHalf(const uint16_t* x, const uint16_t* gate, uint16_t* out, int64_t count,
+                           cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
+// Residual add
+// ---------------------------------------------------------------------------
+// x     [count]  fp16, updated in place: x += delta
+// delta [count]  fp16
+//
+// The add is done in fp32 and rounded once, so a residual stream that has
+// grown past the fp16 range of its increment still accumulates the way the
+// reference does.
+void LaunchResidualAddHalf(uint16_t* x, const uint16_t* delta, int64_t count, cudaStream_t stream);
+
+// ---------------------------------------------------------------------------
 // Paged KV cache, dense 4-D layout
 // ---------------------------------------------------------------------------
 // The CUDA backend stores the cache as
