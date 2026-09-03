@@ -17,9 +17,17 @@ Configure it as its own project.
 
 ## Hard constraints
 
-- **Never install, update or download packages.** No `apt-get`, `pip`, `conda`,
-  `yum`, no `docker pull`. The container and host are read-only environments.
-- **Never modify the container or host environment.**
+- **Never install, update or download packages** for the *native* x86_64 build
+  workflow below. No `apt-get`, `pip`, `conda`, `yum`, no `docker pull`.
+  Treat the container and host as read-only by default.
+- **Never modify the container or host environment** without explicit,
+  per-task approval from the user.
+- **Exception, granted 2026-09-03:** the aarch64 cross-compilation setup in
+  [Cross-compiling for aarch64](#cross-compiling-for-aarch64) was explicitly
+  authorised and has already been performed. It installed the cross toolchain
+  into the running container and pulled the arm64 CANN image. That work is
+  done; do not redo it, and do not read it as blanket permission to install
+  anything else.
 - **If a dependency, compiler tool, library or operator symbol is missing:
   STOP.** Do not look for substitutes, do not rename symbols, do not vendor a
   replacement. Report the exact missing component plus the error log and hand
@@ -42,7 +50,19 @@ will work elsewhere.
 | Repo path in WSL | `/mnt/c/vllm-ascend` |
 | Repo path in container | `/vllm-workspace/vllm-ascend` |
 | CANN in container | `/usr/local/Ascend/cann-9.1.0` |
-| Toolchain in container | cmake 3.22.1, g++ 11.4.0 |
+| Toolchain in container | cmake 3.22.1, g++ 11.4.0, ninja 1.10.1 |
+| Cross toolchain in container | `aarch64-linux-gnu-g++` 11.4.0 (installed 2026-09-03) |
+| aarch64 CANN copy | `/vllm-workspace/vllm-ascend/cann_aarch64`, 1.6 GB, gitignored |
+| `file` inside the container | **not installed** — run `file` from WSL against `/mnt/c/...` |
+
+There are **two** containers running this image. Select by mount source, not by
+name: only the one bound `/mnt/c/vllm-ascend -> /vllm-workspace/vllm-ascend` is
+this repo. The other maps `C:\Users\Admin\Documents\vllm-ascend` to the same
+container path and will silently build the wrong tree.
+
+```bash
+wsl -d Ubuntu-22.04 -u root -- docker ps -q --filter volume=/vllm-workspace/vllm-ascend
+```
 
 Every command below is run from Windows as:
 
@@ -271,6 +291,81 @@ Taken from the plugin source, and several differ from GPU defaults:
 - Rotary embedding supports head dims 64 and 128 only.
 - Device allocations are padded to 32 bytes for MTE2/MTE3 burst safety.
 
+## Cross-compiling for aarch64
+
+The 310P3 host CPU is aarch64; the development container is x86_64. Cross
+builds use `cmake/aarch64-toolchain.cmake` plus a second, aarch64 copy of the
+CANN toolkit at `cann_aarch64/` (gitignored).
+
+### Where the aarch64 toolkit came from
+
+The tag `cann:9.1.0-310p-ubuntu22.04-arm64` **does not exist** in the registry.
+`9.1.0-310p-ubuntu22.04-py3.10` is a multi-arch manifest list carrying both
+architectures, so the arm64 build is pulled **by digest**. Pulling
+`--platform linux/arm64` by *tag* would repoint the local tag at arm64 and
+disturb the running x86_64 containers; pulling by digest does not.
+
+```bash
+wsl -d Ubuntu-22.04 -u root -- docker pull swr.cn-south-1.myhuaweicloud.com/ascendhub/cann@sha256:4bb08628cbefdfb465ff8aa826517a012665a3d73a4c633812e9c81b3fdf460e
+```
+
+`build/cross-smoke/extract_cann.sh` does the extraction (`docker create` +
+`docker cp` of `latest/aarch64-linux/.`; no qemu needed, since nothing arm64 is
+executed). It takes ~6 min for 1.6 GB over drvfs. Re-run only if
+`cann_aarch64/` is lost.
+
+### Building
+
+```bash
+wsl -d Ubuntu-22.04 -u root -- docker exec <cid> bash -c 'cd /vllm-workspace/vllm-ascend && cmake -S csrc/tests -B build/csrc-tests-aarch64 -G Ninja -DCMAKE_TOOLCHAIN_FILE=/vllm-workspace/vllm-ascend/cmake/aarch64-toolchain.cmake -DSOC_VERSION=ascend310p3 && cmake --build build/csrc-tests-aarch64'
+```
+
+The toolchain forces `ASCEND_HOME_PATH` to `cann_aarch64`, so the CANN lookup
+at the top of `csrc/tests/CMakeLists.txt` resolves to the aarch64 tree with no
+edits. A cross build of the suite additionally needs googletest cross-compiled:
+pass `-DFETCHCONTENT_SOURCE_DIR_GOOGLETEST=<path>` to reuse the existing source
+tree rather than fetching.
+
+### Three things that break a naive toolchain file
+
+- **`try_compile` runs its probe.** Cross builds cannot execute the result, so
+  the toolchain sets `CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY`.
+- **Driver symbols are not in the toolkit.** `libascendcl.so` →
+  `libruntime.so`/`libascend_dump.so` → `drvHdc*`, `hal*`, which live in the
+  *driver*, not the toolkit. CANN ships link-time stubs at
+  `cann_aarch64/devlib/linux/aarch64/`; without that on `-Wl,-rpath-link` the
+  link dies on `undefined reference to drvHdcGetCapacity`. The stubs are
+  link-time only and must never shadow the real driver at runtime.
+- **Host libraries can satisfy `find_library`.** `CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY`
+  keeps the x86_64 toolkit under `/usr/local/Ascend` from being picked up.
+
+### Smoke test
+
+`build/cross-smoke/` is a minimal binary that links `libascendcl.so` and
+references real symbols, so the link genuinely resolves.
+
+```bash
+wsl -d Ubuntu-22.04 -u root -- docker exec <cid> bash -c 'cd /vllm-workspace/vllm-ascend && cmake -S build/cross-smoke -B build/cross-smoke-build -G Ninja -DCMAKE_TOOLCHAIN_FILE=/vllm-workspace/vllm-ascend/cmake/aarch64-toolchain.cmake -DSOC_VERSION=ascend310p3 && cmake --build build/cross-smoke-build'
+wsl -d Ubuntu-22.04 -u root -- file /mnt/c/vllm-ascend/build/cross-smoke-build/cann_aarch64_smoke
+```
+
+Expected: `ELF 64-bit LSB pie executable, ARM aarch64`. Run `file` from WSL —
+it is not installed in the container.
+
+### Known wart: RUNPATH
+
+Linking a library by absolute path makes CMake record a build-tree RPATH, so
+cross-built binaries carry `RUNPATH=/vllm-workspace/vllm-ascend/cann_aarch64/lib64`
+— a build-host path that does not exist on the device. Harmless (the loader
+falls through to `LD_LIBRARY_PATH` from `set_env.sh`), but strip it for
+deployable artifacts with `-DCMAKE_SKIP_BUILD_RPATH=ON` (verified: removes
+RUNPATH, keeps `NEEDED libascendcl.so`).
+
+### Not yet done
+
+Nothing has been **run** on aarch64. These binaries have only been built and
+inspected; no 310P3 device execution has been attempted from here.
+
 ## Verification checklist
 
 - [ ] Configure prints the three CANN libs and the expected `vllm_ascend_kernels not found` line.
@@ -278,3 +373,4 @@ Taken from the plugin source, and several differ from GPU defaults:
 - [ ] Four binaries exist in `build/csrc-tests/`.
 - [ ] Host-only run reports 17 passed, 0 failed, 0 skipped.
 - [ ] Operator inventory matches the status table above; any new `MISSING` entry is a stop condition.
+- [ ] For cross builds: `file` reports `ELF 64-bit LSB ... ARM aarch64` and `readelf -dW` shows `NEEDED libascendcl.so`.
