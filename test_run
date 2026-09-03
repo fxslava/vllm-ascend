@@ -1,0 +1,532 @@
+a60133706@node2225:~/Ascend/Projects/vllm-ascend-0.1.0-310p-tests$ cmake --build build/csrc-tests -j$(nproc)
+[  4%] Building CXX object _deps/googletest-build/googletest/CMakeFiles/gtest.dir/src/gtest-all.cc.o
+[  9%] Linking CXX static library ../../../lib/libgtest.a
+[  9%] Built target gtest
+[ 19%] Building CXX object _deps/googletest-build/googletest/CMakeFiles/gtest_main.dir/src/gtest_main.cc.o
+[ 23%] Building CXX object CMakeFiles/vllm_ascend_test_common.dir/common/aclnn_runtime.cpp.o
+[ 28%] Building CXX object CMakeFiles/vllm_ascend_test_common.dir/common/aclnn_ops.cpp.o
+[ 33%] Building CXX object CMakeFiles/vllm_ascend_test_common.dir/common/cpu_reference.cpp.o
+[ 33%] Building CXX object CMakeFiles/vllm_ascend_test_common.dir/common/test_harness.cpp.o
+[ 38%] Linking CXX static library ../../../lib/libgtest_main.a
+[ 38%] Built target gtest_main
+[ 42%] Linking CXX static library libvllm_ascend_test_common.a
+[ 42%] Built target vllm_ascend_test_common
+[ 52%] Building CXX object CMakeFiles/test_rmsnorm_310p.dir/kernels/test_rmsnorm_310p.cpp.o
+[ 52%] Building CXX object CMakeFiles/test_rotary_embedding_310p.dir/kernels/test_rotary_embedding_310p.cpp.o
+[ 61%] Building CXX object CMakeFiles/test_activation_swiglu_310p.dir/kernels/test_activation_swiglu_310p.cpp.o
+[ 80%] Building CXX object CMakeFiles/test_activation_swiglu_310p.dir/common/main.cpp.o
+[ 80%] Building CXX object CMakeFiles/test_paged_attention_310p.dir/kernels/test_paged_attention_310p.cpp.o
+[ 80%] Building CXX object CMakeFiles/test_paged_attention_310p.dir/common/main.cpp.o
+[ 80%] Building CXX object CMakeFiles/test_rotary_embedding_310p.dir/common/main.cpp.o
+[ 80%] Building CXX object CMakeFiles/test_rmsnorm_310p.dir/common/main.cpp.o
+[ 85%] Linking CXX executable test_activation_swiglu_310p
+[ 90%] Linking CXX executable test_rotary_embedding_310p
+[ 95%] Linking CXX executable test_rmsnorm_310p
+[ 95%] Built target test_rotary_embedding_310p
+[ 95%] Built target test_activation_swiglu_310p
+[ 95%] Built target test_rmsnorm_310p
+[100%] Linking CXX executable test_paged_attention_310p
+[100%] Built target test_paged_attention_310p
+a60133706@node2225:~/Ascend/Projects/vllm-ascend-0.1.0-310p-tests$ cd build/csrc-tests
+a60133706@node2225:~/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/build/csrc-tests$ ./test_rmsnorm_310p
+[ascend-test] vllm-ascend bare-metal kernel tests (no Python, no torch)
+[ascend-test] aclnn operator inventory
+[ascend-test]   aclnnRmsNorm                 found
+[ascend-test]   aclnnSwiGlu                  found
+[ascend-test]   aclnnApplyRotaryPosEmbV2     found
+[ascend-test]   aclnnApplyRotaryPosEmb       found
+[ascend-test]   aclnnScatterPaKvCache        found
+[ascend-test]   aclnnIncreFlashAttentionV4   found
+[ascend-test]   aclnnRotaryMul               MISSING
+[ascend-test]   aclnnReshapeAndCache         MISSING
+[ascend-test]   aclnnPagedAttention          MISSING
+[==========] Running 51 tests from 3 test suites.
+[----------] Global test environment set-up.
+[ascend-test] device 0 ready, soc='Ascend310P3'
+[----------] 2 tests from RmsNormReference
+[ RUN      ] RmsNormReference.NormalisesAConstantRowToOne
+[       OK ] RmsNormReference.NormalisesAConstantRowToOne (0 ms)
+[ RUN      ] RmsNormReference.AppliesGammaPerChannel
+[       OK ] RmsNormReference.AppliesGammaPerChannel (0 ms)
+[----------] 2 tests from RmsNormReference (0 ms total)
+
+[----------] 1 test from RmsNormShapes
+[ RUN      ] RmsNormShapes.QwenHiddenSizesAreBurstAligned
+[       OK ] RmsNormShapes.QwenHiddenSizesAreBurstAligned (0 ms)
+[----------] 1 test from RmsNormShapes (0 ms total)
+
+[----------] 48 tests from Qwen35/RmsNorm310PTest
+[ RUN      ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens1_hidden1536
+[       OK ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens1_hidden1536 (450 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens1_hidden2048
+[       OK ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens1_hidden2048 (1 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens1_hidden4096
+[       OK ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens1_hidden4096 (1 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens1_hidden8192
+[       OK ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens1_hidden8192 (1 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens7_hidden1536
+/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/kernels/test_rmsnorm_310p.cpp:159: Failure
+Value of: vllm_ascend_report.passed
+  Actual: false
+Expected: true
+NPU result does not match the CPU reference:
+  elements        : 7
+  mismatches      : 2
+  non-finite      : 0
+  tolerance       : atol=1.000000e-03 rtol=1.000000e-03
+                    (atol=rtol=1e-3, matching tests/ut; ~1 fp16 ULP near unit scale)
+  max |abs error| : 9.983675e-01 at index 5
+  max |rel error| : 1.000000e+00 at index 4
+  first mismatch  : index 4 npu=0.000000e+00 reference=9.670526e-01
+
+[  FAILED  ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens7_hidden1536, where GetParam() = (7, 1536) (1 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens7_hidden2048
+[       OK ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens7_hidden2048 (2 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens7_hidden4096
+[       OK ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens7_hidden4096 (3 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens7_hidden8192
+[       OK ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens7_hidden8192 (5 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens32_hidden1536
+[       OK ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens32_hidden1536 (4 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens32_hidden2048
+[       OK ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens32_hidden2048 (7 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens32_hidden4096
+[       OK ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens32_hidden4096 (9 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens32_hidden8192
+[       OK ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens32_hidden8192 (17 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens128_hidden1536
+[       OK ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens128_hidden1536 (12 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens128_hidden2048
+[       OK ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens128_hidden2048 (16 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens128_hidden4096
+[       OK ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens128_hidden4096 (34 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens128_hidden8192
+[       OK ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens128_hidden8192 (64 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens1_hidden1536
+[       OK ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens1_hidden1536 (2 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens1_hidden2048
+[       OK ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens1_hidden2048 (2 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens1_hidden4096
+[       OK ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens1_hidden4096 (2 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens1_hidden8192
+[       OK ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens1_hidden8192 (2 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens7_hidden1536
+[       OK ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens7_hidden1536 (2 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens7_hidden2048
+[       OK ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens7_hidden2048 (3 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens7_hidden4096
+[       OK ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens7_hidden4096 (4 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens7_hidden8192
+[       OK ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens7_hidden8192 (6 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens32_hidden1536
+[       OK ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens32_hidden1536 (5 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens32_hidden2048
+[       OK ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens32_hidden2048 (6 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens32_hidden4096
+[       OK ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens32_hidden4096 (10 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens32_hidden8192
+[       OK ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens32_hidden8192 (18 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens128_hidden1536
+[       OK ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens128_hidden1536 (14 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens128_hidden2048
+[       OK ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens128_hidden2048 (18 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens128_hidden4096
+[       OK ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens128_hidden4096 (39 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens128_hidden8192
+[       OK ] Qwen35/RmsNorm310PTest.IsInvariantToRowScaling/tokens128_hidden8192 (71 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens1_hidden1536
+[       OK ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens1_hidden1536 (1 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens1_hidden2048
+[       OK ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens1_hidden2048 (1 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens1_hidden4096
+[       OK ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens1_hidden4096 (1 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens1_hidden8192
+[       OK ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens1_hidden8192 (1 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens7_hidden1536
+[       OK ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens7_hidden1536 (1 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens7_hidden2048
+[       OK ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens7_hidden2048 (1 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens7_hidden4096
+[       OK ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens7_hidden4096 (1 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens7_hidden8192
+[       OK ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens7_hidden8192 (2 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens32_hidden1536
+[       OK ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens32_hidden1536 (2 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens32_hidden2048
+[       OK ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens32_hidden2048 (2 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens32_hidden4096
+[       OK ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens32_hidden4096 (3 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens32_hidden8192
+[       OK ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens32_hidden8192 (5 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens128_hidden1536
+[       OK ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens128_hidden1536 (4 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens128_hidden2048
+[       OK ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens128_hidden2048 (5 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens128_hidden4096
+[       OK ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens128_hidden4096 (10 ms)
+[ RUN      ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens128_hidden8192
+[       OK ] Qwen35/RmsNorm310PTest.HandlesNearZeroRowsWithoutBlowingUp/tokens128_hidden8192 (20 ms)
+[----------] 48 tests from Qwen35/RmsNorm310PTest (916 ms total)
+
+[----------] Global test environment tear-down
+[==========] 51 tests from 3 test suites ran. (3747 ms total)
+[  PASSED  ] 50 tests.
+[  FAILED  ] 1 test, listed below:
+[  FAILED  ] Qwen35/RmsNorm310PTest.MatchesCpuReference/tokens7_hidden1536, where GetParam() = (7, 1536)
+
+ 1 FAILED TEST
+a60133706@node2225:~/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/build/csrc-tests$ ./test_rotary_embedding_310p
+[ascend-test] vllm-ascend bare-metal kernel tests (no Python, no torch)
+[ascend-test] aclnn operator inventory
+[ascend-test]   aclnnRmsNorm                 found
+[ascend-test]   aclnnSwiGlu                  found
+[ascend-test]   aclnnApplyRotaryPosEmbV2     found
+[ascend-test]   aclnnApplyRotaryPosEmb       found
+[ascend-test]   aclnnScatterPaKvCache        found
+[ascend-test]   aclnnIncreFlashAttentionV4   found
+[ascend-test]   aclnnRotaryMul               MISSING
+[ascend-test]   aclnnReshapeAndCache         MISSING
+[ascend-test]   aclnnPagedAttention          MISSING
+[==========] Running 31 tests from 3 test suites.
+[----------] Global test environment set-up.
+[ascend-test] device 0 ready, soc='Ascend310P3'
+[----------] 3 tests from RotaryReference
+[ RUN      ] RotaryReference.PositionZeroIsTheIdentity
+[       OK ] RotaryReference.PositionZeroIsTheIdentity (0 ms)
+[ RUN      ] RotaryReference.PreservesPairNorms
+[       OK ] RotaryReference.PreservesPairNorms (11 ms)
+[ RUN      ] RotaryReference.HalfAndInterleaveDisagree
+[       OK ] RotaryReference.HalfAndInterleaveDisagree (0 ms)
+[----------] 3 tests from RotaryReference (11 ms total)
+
+[----------] 1 test from RotaryShapes
+[ RUN      ] RotaryShapes.OnlyHeadDims64And128AreSupportedOn310P
+[       OK ] RotaryShapes.OnlyHeadDims64And128AreSupportedOn310P (0 ms)
+[----------] 1 test from RotaryShapes (0 ms total)
+
+[----------] 27 tests from Qwen35/RotaryEmbedding310PTest
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.MatchesCpuReference/tokens1_d128_q28_kv4_half_theta10000
+[       OK ] Qwen35/RotaryEmbedding310PTest.MatchesCpuReference/tokens1_d128_q28_kv4_half_theta10000 (389 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.MatchesCpuReference/tokens16_d128_q28_kv4_half_theta10000
+[       OK ] Qwen35/RotaryEmbedding310PTest.MatchesCpuReference/tokens16_d128_q28_kv4_half_theta10000 (30 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.MatchesCpuReference/tokens128_d128_q28_kv4_half_theta1000000
+[       OK ] Qwen35/RotaryEmbedding310PTest.MatchesCpuReference/tokens128_d128_q28_kv4_half_theta1000000 (57 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.MatchesCpuReference/tokens16_d128_q32_kv8_half_theta10000
+[       OK ] Qwen35/RotaryEmbedding310PTest.MatchesCpuReference/tokens16_d128_q32_kv8_half_theta10000 (29 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.MatchesCpuReference/tokens16_d128_q32_kv8_interleave_theta10000
+/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/kernels/test_rotary_embedding_310p.cpp:282: Failure
+Value of: vllm_ascend_report.passed
+  Actual: false
+Expected: true
+NPU result does not match the CPU reference:
+  elements        : 65536
+  mismatches      : 64629
+  non-finite      : 0
+  tolerance       : atol=1.000000e-03 rtol=1.000000e-03
+                    (atol=rtol=1e-3, matching tests/ut; ~1 fp16 ULP near unit scale)
+  max |abs error| : 5.411621e+00 at index 59278
+  max |rel error| : 1.311062e+04 at index 15904
+  first mismatch  : index 0 npu=4.565430e-01 reference=1.291016e+00
+
+/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/kernels/test_rotary_embedding_310p.cpp:283: Failure
+Value of: vllm_ascend_report.passed
+  Actual: false
+Expected: true
+NPU result does not match the CPU reference:
+  elements        : 16384
+  mismatches      : 16156
+  non-finite      : 0
+  tolerance       : atol=1.000000e-03 rtol=1.000000e-03
+                    (atol=rtol=1e-3, matching tests/ut; ~1 fp16 ULP near unit scale)
+  max |abs error| : 5.486328e+00 at index 11811
+  max |rel error| : 3.954310e+04 at index 267
+  first mismatch  : index 0 npu=1.055664e+00 reference=3.125000e-01
+
+[  FAILED  ] Qwen35/RotaryEmbedding310PTest.MatchesCpuReference/tokens16_d128_q32_kv8_interleave_theta10000, where GetParam() = 48-byte object <10-00 00-00 00-00 00-00 80-00 00-00 00-00 00-00 20-00 00-00 00-00 00-00 08-00 00-00 00-00 00-00 01-00 00-00 00-00 00-00 00-00 00-00 00-88 C3-40> (30 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.MatchesCpuReference/tokens128_d128_q32_kv8_interleave_theta1000000
+/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/kernels/test_rotary_embedding_310p.cpp:282: Failure
+Value of: vllm_ascend_report.passed
+  Actual: false
+Expected: true
+NPU result does not match the CPU reference:
+  elements        : 524288
+  mismatches      : 487697
+  non-finite      : 0
+  tolerance       : atol=1.000000e-03 rtol=1.000000e-03
+                    (atol=rtol=1e-3, matching tests/ut; ~1 fp16 ULP near unit scale)
+  max |abs error| : 6.388672e+00 at index 419647
+  max |rel error| : 2.881513e+05 at index 320703
+  first mismatch  : index 0 npu=4.565430e-01 reference=1.291016e+00
+
+/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/kernels/test_rotary_embedding_310p.cpp:283: Failure
+Value of: vllm_ascend_report.passed
+  Actual: false
+Expected: true
+NPU result does not match the CPU reference:
+  elements        : 131072
+  mismatches      : 121879
+  non-finite      : 0
+  tolerance       : atol=1.000000e-03 rtol=1.000000e-03
+                    (atol=rtol=1e-3, matching tests/ut; ~1 fp16 ULP near unit scale)
+  max |abs error| : 5.296875e+00 at index 89529
+  max |rel error| : 3.193778e+05 at index 81157
+  first mismatch  : index 0 npu=-4.265137e-01 reference=-1.477539e+00
+
+[  FAILED  ] Qwen35/RotaryEmbedding310PTest.MatchesCpuReference/tokens128_d128_q32_kv8_interleave_theta1000000, where GetParam() = 48-byte object <80-00 00-00 00-00 00-00 80-00 00-00 00-00 00-00 20-00 00-00 00-00 00-00 08-00 00-00 00-00 00-00 01-00 00-00 00-00 00-00 00-00 00-00 80-84 2E-41> (65 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.MatchesCpuReference/tokens1_d64_q16_kv2_half_theta10000
+[       OK ] Qwen35/RotaryEmbedding310PTest.MatchesCpuReference/tokens1_d64_q16_kv2_half_theta10000 (12 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.MatchesCpuReference/tokens32_d64_q16_kv2_half_theta10000
+[       OK ] Qwen35/RotaryEmbedding310PTest.MatchesCpuReference/tokens32_d64_q16_kv2_half_theta10000 (14 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.MatchesCpuReference/tokens32_d64_q16_kv2_interleave_theta10000
+/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/kernels/test_rotary_embedding_310p.cpp:282: Failure
+Value of: vllm_ascend_report.passed
+  Actual: false
+Expected: true
+NPU result does not match the CPU reference:
+  elements        : 32768
+  mismatches      : 32498
+  non-finite      : 0
+  tolerance       : atol=1.000000e-03 rtol=1.000000e-03
+                    (atol=rtol=1e-3, matching tests/ut; ~1 fp16 ULP near unit scale)
+  max |abs error| : 5.646484e+00 at index 11366
+  max |rel error| : 2.361124e+04 at index 12100
+  first mismatch  : index 0 npu=-1.633789e+00 reference=1.291016e+00
+
+/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/kernels/test_rotary_embedding_310p.cpp:283: Failure
+Value of: vllm_ascend_report.passed
+  Actual: false
+Expected: true
+NPU result does not match the CPU reference:
+  elements        : 4096
+  mismatches      : 4059
+  non-finite      : 0
+  tolerance       : atol=1.000000e-03 rtol=1.000000e-03
+                    (atol=rtol=1e-3, matching tests/ut; ~1 fp16 ULP near unit scale)
+  max |abs error| : 4.927734e+00 at index 4035
+  max |rel error| : 6.174599e+03 at index 3758
+  first mismatch  : index 0 npu=-3.166504e-01 reference=6.123047e-01
+
+[  FAILED  ] Qwen35/RotaryEmbedding310PTest.MatchesCpuReference/tokens32_d64_q16_kv2_interleave_theta10000, where GetParam() = 48-byte object <20-00 00-00 00-00 00-00 40-00 00-00 00-00 00-00 10-00 00-00 00-00 00-00 02-00 00-00 00-00 00-00 01-00 00-00 00-00 00-00 00-00 00-00 00-88 C3-40> (15 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.PositionZeroLeavesTheInputUnchanged/tokens1_d128_q28_kv4_half_theta10000
+[       OK ] Qwen35/RotaryEmbedding310PTest.PositionZeroLeavesTheInputUnchanged/tokens1_d128_q28_kv4_half_theta10000 (24 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.PositionZeroLeavesTheInputUnchanged/tokens16_d128_q28_kv4_half_theta10000
+[       OK ] Qwen35/RotaryEmbedding310PTest.PositionZeroLeavesTheInputUnchanged/tokens16_d128_q28_kv4_half_theta10000 (27 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.PositionZeroLeavesTheInputUnchanged/tokens128_d128_q28_kv4_half_theta1000000
+[       OK ] Qwen35/RotaryEmbedding310PTest.PositionZeroLeavesTheInputUnchanged/tokens128_d128_q28_kv4_half_theta1000000 (49 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.PositionZeroLeavesTheInputUnchanged/tokens16_d128_q32_kv8_half_theta10000
+[       OK ] Qwen35/RotaryEmbedding310PTest.PositionZeroLeavesTheInputUnchanged/tokens16_d128_q32_kv8_half_theta10000 (28 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.PositionZeroLeavesTheInputUnchanged/tokens16_d128_q32_kv8_interleave_theta10000
+[       OK ] Qwen35/RotaryEmbedding310PTest.PositionZeroLeavesTheInputUnchanged/tokens16_d128_q32_kv8_interleave_theta10000 (28 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.PositionZeroLeavesTheInputUnchanged/tokens128_d128_q32_kv8_interleave_theta1000000
+[       OK ] Qwen35/RotaryEmbedding310PTest.PositionZeroLeavesTheInputUnchanged/tokens128_d128_q32_kv8_interleave_theta1000000 (54 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.PositionZeroLeavesTheInputUnchanged/tokens1_d64_q16_kv2_half_theta10000
+[       OK ] Qwen35/RotaryEmbedding310PTest.PositionZeroLeavesTheInputUnchanged/tokens1_d64_q16_kv2_half_theta10000 (12 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.PositionZeroLeavesTheInputUnchanged/tokens32_d64_q16_kv2_half_theta10000
+[       OK ] Qwen35/RotaryEmbedding310PTest.PositionZeroLeavesTheInputUnchanged/tokens32_d64_q16_kv2_half_theta10000 (14 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.PositionZeroLeavesTheInputUnchanged/tokens32_d64_q16_kv2_interleave_theta10000
+[       OK ] Qwen35/RotaryEmbedding310PTest.PositionZeroLeavesTheInputUnchanged/tokens32_d64_q16_kv2_interleave_theta10000 (14 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.PreservesPairNormsOnDevice/tokens1_d128_q28_kv4_half_theta10000
+[       OK ] Qwen35/RotaryEmbedding310PTest.PreservesPairNormsOnDevice/tokens1_d128_q28_kv4_half_theta10000 (24 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.PreservesPairNormsOnDevice/tokens16_d128_q28_kv4_half_theta10000
+[       OK ] Qwen35/RotaryEmbedding310PTest.PreservesPairNormsOnDevice/tokens16_d128_q28_kv4_half_theta10000 (27 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.PreservesPairNormsOnDevice/tokens128_d128_q28_kv4_half_theta1000000
+[       OK ] Qwen35/RotaryEmbedding310PTest.PreservesPairNormsOnDevice/tokens128_d128_q28_kv4_half_theta1000000 (51 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.PreservesPairNormsOnDevice/tokens16_d128_q32_kv8_half_theta10000
+[       OK ] Qwen35/RotaryEmbedding310PTest.PreservesPairNormsOnDevice/tokens16_d128_q32_kv8_half_theta10000 (29 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.PreservesPairNormsOnDevice/tokens16_d128_q32_kv8_interleave_theta10000
+/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/kernels/test_rotary_embedding_310p.cpp:350: Failure
+Value of: vllm_ascend_report.passed
+  Actual: false
+Expected: true
+NPU result does not match the CPU reference:
+  elements        : 32768
+  mismatches      : 28500
+  non-finite      : 0
+  tolerance       : atol=5.000000e-03 rtol=5.000000e-03
+                    (pair norm through two fp16 roundings plus a square root)
+  max |abs error| : 3.517375e+00 at index 16223
+  max |rel error| : 1.059095e+02 at index 10120
+  first mismatch  : index 0 npu=1.920337e-01 reference=5.250039e-01
+
+[  FAILED  ] Qwen35/RotaryEmbedding310PTest.PreservesPairNormsOnDevice/tokens16_d128_q32_kv8_interleave_theta10000, where GetParam() = 48-byte object <10-00 00-00 00-00 00-00 80-00 00-00 00-00 00-00 20-00 00-00 00-00 00-00 08-00 00-00 00-00 00-00 01-00 00-00 00-00 00-00 00-00 00-00 00-88 C3-40> (28 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.PreservesPairNormsOnDevice/tokens128_d128_q32_kv8_interleave_theta1000000
+/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/kernels/test_rotary_embedding_310p.cpp:350: Failure
+Value of: vllm_ascend_report.passed
+  Actual: false
+Expected: true
+NPU result does not match the CPU reference:
+  elements        : 262144
+  mismatches      : 193760
+  non-finite      : 0
+  tolerance       : atol=5.000000e-03 rtol=5.000000e-03
+                    (pair norm through two fp16 roundings plus a square root)
+  max |abs error| : 4.048453e+00 at index 211935
+  max |rel error| : 2.442916e+02 at index 48024
+  first mismatch  : index 0 npu=1.920337e-01 reference=5.250039e-01
+
+[  FAILED  ] Qwen35/RotaryEmbedding310PTest.PreservesPairNormsOnDevice/tokens128_d128_q32_kv8_interleave_theta1000000, where GetParam() = 48-byte object <80-00 00-00 00-00 00-00 80-00 00-00 00-00 00-00 20-00 00-00 00-00 00-00 08-00 00-00 00-00 00-00 01-00 00-00 00-00 00-00 00-00 00-00 80-84 2E-41> (58 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.PreservesPairNormsOnDevice/tokens1_d64_q16_kv2_half_theta10000
+[       OK ] Qwen35/RotaryEmbedding310PTest.PreservesPairNormsOnDevice/tokens1_d64_q16_kv2_half_theta10000 (12 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.PreservesPairNormsOnDevice/tokens32_d64_q16_kv2_half_theta10000
+[       OK ] Qwen35/RotaryEmbedding310PTest.PreservesPairNormsOnDevice/tokens32_d64_q16_kv2_half_theta10000 (14 ms)
+[ RUN      ] Qwen35/RotaryEmbedding310PTest.PreservesPairNormsOnDevice/tokens32_d64_q16_kv2_interleave_theta10000
+/home/a60133706/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/csrc/tests/kernels/test_rotary_embedding_310p.cpp:350: Failure
+Value of: vllm_ascend_report.passed
+  Actual: false
+Expected: true
+NPU result does not match the CPU reference:
+  elements        : 16384
+  mismatches      : 14984
+  non-finite      : 0
+  tolerance       : atol=5.000000e-03 rtol=5.000000e-03
+                    (pair norm through two fp16 roundings plus a square root)
+  max |abs error| : 3.083221e+00 at index 13799
+  max |rel error| : 1.091920e+02 at index 14546
+  first mismatch  : index 0 npu=1.888851e+00 reference=5.250039e-01
+
+[  FAILED  ] Qwen35/RotaryEmbedding310PTest.PreservesPairNormsOnDevice/tokens32_d64_q16_kv2_interleave_theta10000, where GetParam() = 48-byte object <20-00 00-00 00-00 00-00 40-00 00-00 00-00 00-00 10-00 00-00 00-00 00-00 02-00 00-00 00-00 00-00 01-00 00-00 00-00 00-00 00-00 00-00 00-88 C3-40> (14 ms)
+[----------] 27 tests from Qwen35/RotaryEmbedding310PTest (1161 ms total)
+
+[----------] Global test environment tear-down
+[==========] 31 tests from 3 test suites ran. (3799 ms total)
+[  PASSED  ] 25 tests.
+[  FAILED  ] 6 tests, listed below:
+[  FAILED  ] Qwen35/RotaryEmbedding310PTest.MatchesCpuReference/tokens16_d128_q32_kv8_interleave_theta10000, where GetParam() = 48-byte object <10-00 00-00 00-00 00-00 80-00 00-00 00-00 00-00 20-00 00-00 00-00 00-00 08-00 00-00 00-00 00-00 01-00 00-00 00-00 00-00 00-00 00-00 00-88 C3-40>
+[  FAILED  ] Qwen35/RotaryEmbedding310PTest.MatchesCpuReference/tokens128_d128_q32_kv8_interleave_theta1000000, where GetParam() = 48-byte object <80-00 00-00 00-00 00-00 80-00 00-00 00-00 00-00 20-00 00-00 00-00 00-00 08-00 00-00 00-00 00-00 01-00 00-00 00-00 00-00 00-00 00-00 80-84 2E-41>
+[  FAILED  ] Qwen35/RotaryEmbedding310PTest.MatchesCpuReference/tokens32_d64_q16_kv2_interleave_theta10000, where GetParam() = 48-byte object <20-00 00-00 00-00 00-00 40-00 00-00 00-00 00-00 10-00 00-00 00-00 00-00 02-00 00-00 00-00 00-00 01-00 00-00 00-00 00-00 00-00 00-00 00-88 C3-40>
+[  FAILED  ] Qwen35/RotaryEmbedding310PTest.PreservesPairNormsOnDevice/tokens16_d128_q32_kv8_interleave_theta10000, where GetParam() = 48-byte object <10-00 00-00 00-00 00-00 80-00 00-00 00-00 00-00 20-00 00-00 00-00 00-00 08-00 00-00 00-00 00-00 01-00 00-00 00-00 00-00 00-00 00-00 00-88 C3-40>
+[  FAILED  ] Qwen35/RotaryEmbedding310PTest.PreservesPairNormsOnDevice/tokens128_d128_q32_kv8_interleave_theta1000000, where GetParam() = 48-byte object <80-00 00-00 00-00 00-00 80-00 00-00 00-00 00-00 20-00 00-00 00-00 00-00 08-00 00-00 00-00 00-00 01-00 00-00 00-00 00-00 00-00 00-00 80-84 2E-41>
+[  FAILED  ] Qwen35/RotaryEmbedding310PTest.PreservesPairNormsOnDevice/tokens32_d64_q16_kv2_interleave_theta10000, where GetParam() = 48-byte object <20-00 00-00 00-00 00-00 40-00 00-00 00-00 00-00 10-00 00-00 00-00 00-00 02-00 00-00 00-00 00-00 01-00 00-00 00-00 00-00 00-00 00-00 00-88 C3-40>
+
+ 6 FAILED TESTS
+a60133706@node2225:~/Ascend/Projects/vllm-ascend-0.1.0-310p-tests/build/csrc-tests$ ./test_activation_swiglu_310p
+[ascend-test] vllm-ascend bare-metal kernel tests (no Python, no torch)
+[ascend-test] aclnn operator inventory
+[ascend-test]   aclnnRmsNorm                 found
+[ascend-test]   aclnnSwiGlu                  found
+[ascend-test]   aclnnApplyRotaryPosEmbV2     found
+[ascend-test]   aclnnApplyRotaryPosEmb       found
+[ascend-test]   aclnnScatterPaKvCache        found
+[ascend-test]   aclnnIncreFlashAttentionV4   found
+[ascend-test]   aclnnRotaryMul               MISSING
+[ascend-test]   aclnnReshapeAndCache         MISSING
+[ascend-test]   aclnnPagedAttention          MISSING
+[==========] Running 52 tests from 3 test suites.
+[----------] Global test environment set-up.
+[ascend-test] device 0 ready, soc='Ascend310P3'
+[----------] 2 tests from SwiGluReference
+[ RUN      ] SwiGluReference.MatchesClosedFormAtKnownPoints
+[       OK ] SwiGluReference.MatchesClosedFormAtKnownPoints (0 ms)
+[ RUN      ] SwiGluReference.GateOfOneLeavesTheUpProjectionScaledBySilu
+[       OK ] SwiGluReference.GateOfOneLeavesTheUpProjectionScaledBySilu (0 ms)
+[----------] 2 tests from SwiGluReference (0 ms total)
+
+[----------] 2 tests from SwiGluShapes
+[ RUN      ] SwiGluShapes.QwenIntermediateSizesSatisfyThe310PGate
+[       OK ] SwiGluShapes.QwenIntermediateSizesSatisfyThe310PGate (0 ms)
+[ RUN      ] SwiGluShapes.OddLastDimensionWouldTakeTheEagerFallback
+[       OK ] SwiGluShapes.OddLastDimensionWouldTakeTheEagerFallback (0 ms)
+[----------] 2 tests from SwiGluShapes (0 ms total)
+
+[----------] 48 tests from Qwen35/SwiGlu310PTest
+[ RUN      ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens1_intermediate4096
+[       OK ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens1_intermediate4096 (357 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens1_intermediate8960
+[       OK ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens1_intermediate8960 (2 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens1_intermediate11008
+[       OK ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens1_intermediate11008 (2 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens1_intermediate14336
+[       OK ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens1_intermediate14336 (2 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens7_intermediate4096
+[       OK ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens7_intermediate4096 (4 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens7_intermediate8960
+[       OK ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens7_intermediate8960 (8 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens7_intermediate11008
+[       OK ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens7_intermediate11008 (9 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens7_intermediate14336
+[       OK ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens7_intermediate14336 (12 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens32_intermediate4096
+[       OK ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens32_intermediate4096 (15 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens32_intermediate8960
+[       OK ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens32_intermediate8960 (33 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens32_intermediate11008
+[       OK ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens32_intermediate11008 (39 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens32_intermediate14336
+[       OK ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens32_intermediate14336 (51 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens128_intermediate4096
+[       OK ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens128_intermediate4096 (58 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens128_intermediate8960
+[       OK ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens128_intermediate8960 (129 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens128_intermediate11008
+[       OK ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens128_intermediate11008 (155 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens128_intermediate14336
+[       OK ] Qwen35/SwiGlu310PTest.MatchesCpuReference/tokens128_intermediate14336 (206 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens1_intermediate4096
+[       OK ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens1_intermediate4096 (1 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens1_intermediate8960
+[       OK ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens1_intermediate8960 (1 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens1_intermediate11008
+[       OK ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens1_intermediate11008 (1 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens1_intermediate14336
+[       OK ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens1_intermediate14336 (1 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens7_intermediate4096
+[       OK ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens7_intermediate4096 (2 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens7_intermediate8960
+[       OK ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens7_intermediate8960 (4 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens7_intermediate11008
+[       OK ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens7_intermediate11008 (4 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens7_intermediate14336
+[       OK ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens7_intermediate14336 (6 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens32_intermediate4096
+[       OK ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens32_intermediate4096 (7 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens32_intermediate8960
+[       OK ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens32_intermediate8960 (15 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens32_intermediate11008
+[       OK ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens32_intermediate11008 (18 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens32_intermediate14336
+[       OK ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens32_intermediate14336 (23 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens128_intermediate4096
+[       OK ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens128_intermediate4096 (26 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens128_intermediate8960
+[       OK ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens128_intermediate8960 (59 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens128_intermediate11008
+[       OK ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens128_intermediate11008 (74 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens128_intermediate14336
+[       OK ] Qwen35/SwiGlu310PTest.SplitsTheInputAtTheHalfwayPoint/tokens128_intermediate14336 (93 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens1_intermediate4096
+[       OK ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens1_intermediate4096 (1 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens1_intermediate8960
+[       OK ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens1_intermediate8960 (1 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens1_intermediate11008
+[       OK ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens1_intermediate11008 (1 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens1_intermediate14336
+[       OK ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens1_intermediate14336 (1 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens7_intermediate4096
+[       OK ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens7_intermediate4096 (1 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens7_intermediate8960
+[       OK ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens7_intermediate8960 (2 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens7_intermediate11008
+[       OK ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens7_intermediate11008 (2 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens7_intermediate14336
+[       OK ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens7_intermediate14336 (3 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens32_intermediate4096
+[       OK ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens32_intermediate4096 (4 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens32_intermediate8960
+[       OK ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens32_intermediate8960 (7 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens32_intermediate11008
+[       OK ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens32_intermediate11008 (9 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens32_intermediate14336
+[       OK ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens32_intermediate14336 (11 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens128_intermediate4096
+[       OK ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens128_intermediate4096 (13 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens128_intermediate8960
+[       OK ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens128_intermediate8960 (27 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens128_intermediate11008
+[       OK ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens128_intermediate11008 (34 ms)
+[ RUN      ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens128_intermediate14336
+[       OK ] Qwen35/SwiGlu310PTest.SaturatesRatherThanOverflowsOnLargeGates/tokens128_intermediate14336 (44 ms)
+[----------] 48 tests from Qwen35/SwiGlu310PTest (1601 ms total)
+
+[----------] Global test environment tear-down
+[==========] 52 tests from 3 test suites ran. (3960 ms total)
+[  PASSED  ] 52 tests.
