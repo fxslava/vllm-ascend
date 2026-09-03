@@ -37,6 +37,24 @@ namespace test {
 namespace reference {
 
 // ---------------------------------------------------------------------------
+// MatMul (linear projection)
+// ---------------------------------------------------------------------------
+// a     [m, k]
+// b_t   [n, k]   weight in Linear layout: row n holds output channel n
+// out   [m, n]   out[i][j] = sum_k a[i][k] * b_t[j][k]
+//
+// b_t is indexed as the transpose so the reference consumes exactly the buffer
+// the device test uploads, with no separate host transpose to get wrong.
+//
+// The dot product accumulates in float, matching the fp32 accumulator in the
+// v200 cube unit. Note that this fixes a summation order: over k=2048..4096 the
+// hardware tiles and accumulates in a different order, so the two agree to
+// within fp32 reassociation error, not bit-exactly. That error is far below the
+// fp16 rounding of the output and is not what the tolerance is protecting.
+void MatmulTransposedB(const std::vector<float>& a, const std::vector<float>& b_t, int64_t m, int64_t k,
+                       int64_t n, std::vector<float>* out);
+
+// ---------------------------------------------------------------------------
 // RMSNorm
 // ---------------------------------------------------------------------------
 // x     [num_tokens, hidden]

@@ -90,23 +90,30 @@ if(NOT ASCEND_CL_LIBRARY)
   message(FATAL_ERROR "libascendcl.so not found under ${ASCEND_LIB_DIRS}")
 endif()
 
-# Linked when present so the loader has them resolved up front, and so a broken
-# CANN install fails at configure time rather than inside a test. Neither is
-# required to build.
+# Probed but NOT linked. These are still looked up so that a broken or partial
+# CANN install is reported at configure time rather than from inside a test, but
+# nothing here calls into them directly: libopapi.so (and the constructors it
+# re-exports from libnnopbase.so) is opened with dlopen/dlsym at runtime by
+# common/aclnn_runtime.cpp, and libacl_op_compiler.so is only needed by the
+# graph-compile path this suite does not use.
+#
+# Keeping them off the link line means the binaries carry one CANN DT_NEEDED
+# entry instead of four, so a CANN release that drops or renames one of these
+# libraries no longer stops the suite from loading at all.
 find_library(ASCEND_OP_COMPILER_LIBRARY NAMES acl_op_compiler PATHS ${ASCEND_LIB_DIRS} NO_DEFAULT_PATH)
 find_library(ASCEND_NNOPBASE_LIBRARY NAMES nnopbase PATHS ${ASCEND_LIB_DIRS} NO_DEFAULT_PATH)
 find_library(ASCEND_OPAPI_LIBRARY NAMES opapi PATHS ${ASCEND_LIB_DIRS} NO_DEFAULT_PATH)
 
+# ascendcl is the one hard link-time dependency; see the comment above it.
 set(VLLM_ASCEND_TEST_CANN_LIBS ${ASCEND_CL_LIBRARY})
-foreach(optional_lib
+foreach(runtime_lib
         ASCEND_OP_COMPILER_LIBRARY
         ASCEND_NNOPBASE_LIBRARY
         ASCEND_OPAPI_LIBRARY)
-  if(${optional_lib})
-    list(APPEND VLLM_ASCEND_TEST_CANN_LIBS ${${optional_lib}})
-    message(STATUS "vllm-ascend tests: linking ${${optional_lib}}")
+  if(${runtime_lib})
+    message(STATUS "vllm-ascend tests: found ${${runtime_lib}} (resolved at runtime, not linked)")
   else()
-    message(STATUS "vllm-ascend tests: ${optional_lib} not found, resolving those symbols at runtime")
+    message(STATUS "vllm-ascend tests: ${runtime_lib} not found, resolving those symbols at runtime")
   endif()
 endforeach()
 
@@ -186,6 +193,15 @@ if(VLLM_ASCEND_TESTS_WERROR)
   target_compile_options(vllm_ascend_test_common PUBLIC -Werror)
 endif()
 
+# Size: emit every function and variable into its own section so the linker can
+# drop the ones no test reaches. The suite statically links googletest, which is
+# the bulk of each binary and most of which any single test file never calls.
+# --as-needed additionally drops DT_NEEDED entries for libraries that end up
+# contributing no referenced symbol, which matters here because the aclnn
+# operators are resolved with dlopen rather than linked.
+target_compile_options(vllm_ascend_test_common PUBLIC -ffunction-sections -fdata-sections)
+target_link_options(vllm_ascend_test_common PUBLIC -Wl,--gc-sections -Wl,--as-needed)
+
 # -----------------------------------------------------------------------------
 # Test binaries
 # -----------------------------------------------------------------------------
@@ -193,6 +209,7 @@ endif()
 enable_testing()
 
 set(VLLM_ASCEND_KERNEL_TESTS
+  test_matmul_310p
   test_rmsnorm_310p
   test_rotary_embedding_310p
   test_activation_swiglu_310p
