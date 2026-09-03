@@ -49,8 +49,9 @@ namespace {
 
 using reference::RotaryMode;
 
-// BSND is the layout _rope_forward_oot builds before the call.
-char kLayoutBsnd[] = "BSND";
+// _rope_forward_oot builds BSND-shaped tensors before the call. `layout` is an
+// int64 enum in the verified prototype, not a string; see
+// ops::kApplyRotaryPosEmbLayoutBsnd.
 char kRotaryModeHalf[] = "half";
 char kRotaryModeInterleave[] = "interleave";
 
@@ -86,7 +87,8 @@ RotaryResult RunApplyRotaryPosEmbOnDevice(const std::vector<float>& query, const
   DeviceTensor sin_device = DeviceTensor::Half({1, num_tokens, 1, head_dim}, sin_full);
 
   RunAclnn<ops::ApplyRotaryPosEmbWorkspaceFn>(op, stream, query_device.get(), key_device.get(), cos_device.get(),
-                                              sin_device.get(), kLayoutBsnd, RotaryModeString(mode));
+                                              sin_device.get(), ops::kApplyRotaryPosEmbLayoutBsnd,
+                                              RotaryModeString(mode));
 
   RotaryResult result;
   result.query = query_device.ToFloatFromHalf();

@@ -40,8 +40,13 @@ AclnnOp ResolveFirstAvailable(std::initializer_list<const char*> candidate_names
 }
 
 std::vector<OpAvailability> ProbeAllOperators() {
+  // Order: the operators the suite uses, then the three that CANN 9.1.0 does not
+  // provide as aclnn (kept so the inventory documents their absence).
   const char* names[] = {
-      kRmsNorm, kSwiGlu, kApplyRotaryPosEmbV2, kApplyRotaryPosEmb, kRotaryMul, kReshapeAndCache, kPagedAttention,
+      kRmsNorm,          kSwiGlu,          kApplyRotaryPosEmbV2, kApplyRotaryPosEmb,
+      kScatterPaKvCache, kIncreFlashAttentionV4,
+      // ATB-backed / GE-backed, expected MISSING on CANN 9.1.0:
+      kRotaryMul,        kReshapeAndCache, kPagedAttention,
   };
 
   std::vector<OpAvailability> results;
