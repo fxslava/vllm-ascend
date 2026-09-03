@@ -69,7 +69,8 @@ csrc/tests/
         ├── rmsnorm_kernel.cu            test_rmsnorm.cpp
         ├── rotary_kernel.cu             test_rotary_embedding.cpp
         ├── swiglu_kernel.cu             test_activation_swiglu.cpp
-        └── paged_attention_kernel.cu    test_paged_attention.cpp
+        ├── paged_attention_kernel.cu    test_paged_attention.cpp
+        └── test_matmul.cpp              cuBLAS; the one operator with no kernel of its own
 ```
 
 Each test file has two layers. Tests named `*Reference` and `*Shapes` are
@@ -267,17 +268,23 @@ references or the test logic is exercised somewhere before it reaches hardware.
 | Rotary embedding | `test_rotary_embedding` | "half" (neox / rotate_half) layout only, head dims 64 and 128 |
 | SiluAndMul (SwiGLU) | `test_activation_swiglu` | vectorised `half2`, scalar fallback for an odd width |
 | Paged attention + KV cache | `test_paged_attention` | dense 4-D cache, decode scatter and `paged_attention_decode_v1` |
+| MatMul | `test_matmul` | cuBLAS `cublasGemmEx`, fp16 storage with fp32 accumulate, `CUBLAS_OP_T` weights |
 
-MatMul has no CUDA counterpart: a hand-written GEMM would be measuring the
-kernel this suite wrote rather than anything the plugin does, and the credible
-alternatives all mean linking cuBLAS or Cutlass, which the no-dependency rule
-rules out.
+MatMul is the one operator here with no kernel of its own. A hand-written GEMM
+would be measuring the kernel this suite just wrote rather than anything a
+deployment runs, and Cutlass is a dependency the suite does not want; cuBLAS
+ships with the toolkit and is what a CUDA deployment actually calls for a linear
+projection, so it is what the projections are checked against. The wrapper is in
+`common/cuda_runtime.hpp` (`CublasGemmFp16`), which is also where the row-major
+to column-major argument order is written down.
 
 ### Dependencies
 
-The CUDA Runtime API (`<cuda_runtime.h>`, `<cuda_fp16.h>`) and `cudart`. No
-PyTorch, no Torch-CUDA headers, no Cutlass, no cuBLAS, no Python bindings. Every
-kernel is written out by hand in `kernels/cuda/`.
+The CUDA Runtime API (`<cuda_runtime.h>`, `<cuda_fp16.h>`) and `cudart`, plus
+cuBLAS (`<cublas_v2.h>`) for the linear projections. Both ship with the toolkit,
+so there is nothing to install beyond CUDA itself. No PyTorch, no Torch-CUDA
+headers, no Cutlass, no Python bindings. Every kernel other than the GEMM is
+written out by hand in `kernels/cuda/`.
 
 ### Prerequisites
 

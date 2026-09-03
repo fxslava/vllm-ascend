@@ -52,7 +52,7 @@ int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
 
   std::printf("[cuda-test] vllm-ascend bare-metal kernel tests, native CUDA C backend\n");
-  std::printf("[cuda-test] no PyTorch, no torch_npu, no Cutlass: CUDA Runtime API only\n");
+  std::printf("[cuda-test] no PyTorch, no torch_npu, no Cutlass: CUDA Runtime API and cuBLAS only\n");
   std::fflush(stdout);
 
   ::vllm_ascend::test::RegisterCudaTestEnvironment();

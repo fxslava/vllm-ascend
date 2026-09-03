@@ -30,6 +30,11 @@ void ReportIgnoredCudaFailure(const char* expression, const char* file, int line
                FormatCudaError(expression, file, line, status).c_str());
 }
 
+void ReportIgnoredCublasFailure(const char* expression, const char* file, int line, cublasStatus_t status) {
+  std::fprintf(stderr, "[cuda-test] ignoring failure during cleanup: %s\n",
+               FormatCublasError(expression, file, line, status).c_str());
+}
+
 // ---------------------------------------------------------------------------
 // CUDADeviceBuffer
 // ---------------------------------------------------------------------------
@@ -100,6 +105,64 @@ void CUDADeviceBuffer::ZeroAsync(cudaStream_t stream) {
 }
 
 // ---------------------------------------------------------------------------
+// cuBLAS
+// ---------------------------------------------------------------------------
+
+CUDABlasHandle::CUDABlasHandle(cudaStream_t stream) {
+  try {
+    CUBLAS_CHECK(cublasCreate(&handle_));
+    CUBLAS_CHECK(cublasSetStream(handle_, stream));
+  } catch (...) {
+    if (handle_ != nullptr) {
+      CUBLAS_CHECK_NOTHROW(cublasDestroy(handle_));
+      handle_ = nullptr;
+    }
+    throw;
+  }
+}
+
+CUDABlasHandle::~CUDABlasHandle() {
+  if (handle_ != nullptr) {
+    CUBLAS_CHECK_NOTHROW(cublasDestroy(handle_));
+    handle_ = nullptr;
+  }
+}
+
+void CublasGemmFp16(cublasHandle_t handle, bool transpose_a, bool transpose_b, int64_t m, int64_t n,
+                    int64_t k, const uint16_t* a, const uint16_t* b, uint16_t* c, float alpha, float beta) {
+  // The tests are row-major and cuBLAS is column-major. Rather than transposing
+  // any buffer, ask cuBLAS for the transposed product:
+  //
+  //     C^T = op_b(B)^T * op_a(A)^T
+  //
+  // A row-major [r, s] buffer read as column-major is the [s, r] transpose of
+  // itself, so C^T column-major and C row-major are the same bytes in the same
+  // order and nothing has to move. What it costs is that B becomes cuBLAS's
+  // first operand and m and n swap places in the argument list.
+  //
+  // Each operand then needs the flag that turns its column-major reading back
+  // into the factor above, and the leading dimension of the array as stored:
+  //
+  //   stored          column-major reading   want        flag       ld
+  //   B [k, n] row    [n, k]                 op_b(B)^T   OP_N       n
+  //   B [n, k] row    [k, n]                 op_b(B)^T   OP_T       k
+  //   A [m, k] row    [k, m]                 op_a(A)^T   OP_N       k
+  //   A [k, m] row    [m, k]                 op_a(A)^T   OP_T       m
+  const cublasOperation_t b_op = transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N;
+  const cublasOperation_t a_op = transpose_a ? CUBLAS_OP_T : CUBLAS_OP_N;
+  const int ldb = static_cast<int>(transpose_b ? k : n);
+  const int lda = static_cast<int>(transpose_a ? m : k);
+
+  // CUBLAS_COMPUTE_32F with CUDA_R_16F operands is fp16 multiply into an fp32
+  // accumulator, which is what reference::MatmulTransposedB does on the host and
+  // what the v200 cube unit does on the NPU. alpha and beta are floats because
+  // the compute type, not the storage type, decides how they are read.
+  CUBLAS_CHECK(cublasGemmEx(handle, b_op, a_op, static_cast<int>(n), static_cast<int>(m),
+                            static_cast<int>(k), &alpha, b, CUDA_R_16F, ldb, a, CUDA_R_16F, lda, &beta, c,
+                            CUDA_R_16F, static_cast<int>(n), CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+}
+
+// ---------------------------------------------------------------------------
 // CUDADevice
 // ---------------------------------------------------------------------------
 
@@ -153,7 +216,18 @@ CUDADevice::CUDADevice() {
   }
 }
 
+cublasHandle_t CUDADevice::cublas_handle() {
+  if (blas_ == nullptr) {
+    blas_ = std::unique_ptr<CUDABlasHandle>(new CUDABlasHandle(stream_));
+  }
+  return blas_->get();
+}
+
 CUDADevice::~CUDADevice() {
+  // Before the stream: the handle is bound to it, and cublasDestroy on a handle
+  // whose stream has already gone is the same class of teardown error the
+  // synchronise below is guarding against.
+  blas_.reset();
   if (stream_ != nullptr) {
     // Drain before destroying: an in-flight kernel holding a reference to a
     // destroyed stream is the usual source of teardown errors.

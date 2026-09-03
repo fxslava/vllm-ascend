@@ -22,19 +22,24 @@
 // process. The names and the method set deliberately mirror the Ascend ones so
 // a test written against either backend reads the same way.
 //
-// Nothing here depends on PyTorch, torch_npu, Cutlass, cuBLAS or any Python
-// binding: it is the CUDA Runtime API and the C++ standard library only. The
-// header uses <cuda_runtime_api.h> rather than <cuda_runtime.h> so that a .cpp
-// translation unit compiled by the host compiler can include it without nvcc
+// Nothing here depends on PyTorch, torch_npu, Cutlass or any Python binding.
+// The one library beyond the CUDA Runtime API is cuBLAS, and only for the
+// linear projections - see the cuBLAS section below for why that one is not
+// hand-written like the rest. The header uses <cuda_runtime_api.h> rather than
+// <cuda_runtime.h>, and <cublas_v2.h> is a plain C header as well, so a .cpp
+// translation unit compiled by the host compiler can include this without nvcc
 // being involved; the kernels are the only thing that needs nvcc.
 
 #pragma once
 
+#include <cublas_v2.h>
 #include <cuda_runtime_api.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -155,6 +160,137 @@ class CUDADeviceBuffer {
   size_t alignment_ = kCudaDeviceAlignBytes;
 };
 
+// ---------------------------------------------------------------------------
+// cuBLAS
+// ---------------------------------------------------------------------------
+//
+// The one library this backend does not write out by hand. A GEMM worth
+// checking a reference against is a project of its own, and a naive one would
+// only be measuring the kernel this suite just wrote; cuBLAS is what a CUDA
+// deployment actually calls for a linear projection, so it is what the
+// projections are checked against here. Everything in kernels/cuda stays
+// hand-written.
+//
+// cublasStatus_t is a separate error domain from cudaError_t, so it gets its
+// own formatter and exception rather than being squeezed into CudaError.
+// cublasGetStatusName only exists from CUDA 11.4.2, and README.md puts the
+// toolkit floor at 11.0, so the names are spelled out instead.
+
+inline const char* CublasStatusName(cublasStatus_t status) {
+  switch (status) {
+    case CUBLAS_STATUS_SUCCESS:
+      return "CUBLAS_STATUS_SUCCESS";
+    case CUBLAS_STATUS_NOT_INITIALIZED:
+      return "CUBLAS_STATUS_NOT_INITIALIZED";
+    case CUBLAS_STATUS_ALLOC_FAILED:
+      return "CUBLAS_STATUS_ALLOC_FAILED";
+    case CUBLAS_STATUS_INVALID_VALUE:
+      return "CUBLAS_STATUS_INVALID_VALUE";
+    case CUBLAS_STATUS_ARCH_MISMATCH:
+      return "CUBLAS_STATUS_ARCH_MISMATCH";
+    case CUBLAS_STATUS_MAPPING_ERROR:
+      return "CUBLAS_STATUS_MAPPING_ERROR";
+    case CUBLAS_STATUS_EXECUTION_FAILED:
+      return "CUBLAS_STATUS_EXECUTION_FAILED";
+    case CUBLAS_STATUS_INTERNAL_ERROR:
+      return "CUBLAS_STATUS_INTERNAL_ERROR";
+    case CUBLAS_STATUS_NOT_SUPPORTED:
+      return "CUBLAS_STATUS_NOT_SUPPORTED";
+    case CUBLAS_STATUS_LICENSE_ERROR:
+      return "CUBLAS_STATUS_LICENSE_ERROR";
+    default:
+      return "CUBLAS_STATUS_UNKNOWN";
+  }
+}
+
+inline std::string FormatCublasError(const char* expression, const char* file, int line,
+                                     cublasStatus_t status) {
+  std::ostringstream stream;
+  stream << file << ":" << line << ": " << expression << " failed with status " << static_cast<int>(status)
+         << "\n  cuBLAS: " << CublasStatusName(status);
+  return stream.str();
+}
+
+class CublasError : public std::exception {
+ public:
+  CublasError(const char* expression, const char* file, int line, cublasStatus_t status)
+      : message_(FormatCublasError(expression, file, line, status)), status_(status) {}
+
+  const char* what() const noexcept override { return message_.c_str(); }
+  cublasStatus_t status() const { return status_; }
+
+ private:
+  std::string message_;
+  cublasStatus_t status_;
+};
+
+void ReportIgnoredCublasFailure(const char* expression, const char* file, int line, cublasStatus_t status);
+
+#define CUBLAS_CHECK(expression)                                                         \
+  do {                                                                                   \
+    const cublasStatus_t vllm_ascend_cublas_status = (expression);                       \
+    if (vllm_ascend_cublas_status != CUBLAS_STATUS_SUCCESS) {                            \
+      throw ::vllm_ascend::test::CublasError(#expression, __FILE__, __LINE__,            \
+                                             vllm_ascend_cublas_status);                 \
+    }                                                                                    \
+  } while (false)
+
+// Non-throwing variant for destructors and teardown paths, matching
+// CUDA_CHECK_NOTHROW.
+#define CUBLAS_CHECK_NOTHROW(expression)                                                 \
+  do {                                                                                   \
+    const cublasStatus_t vllm_ascend_cublas_status = (expression);                       \
+    if (vllm_ascend_cublas_status != CUBLAS_STATUS_SUCCESS) {                            \
+      ::vllm_ascend::test::ReportIgnoredCublasFailure(#expression, __FILE__, __LINE__,   \
+                                                      vllm_ascend_cublas_status);        \
+    }                                                                                    \
+  } while (false)
+
+// RAII cublasHandle_t, bound to `stream` at construction so every GEMM is
+// ordered against the same stream the rest of the suite uses and a single
+// cudaStreamSynchronize is enough to see the result.
+class CUDABlasHandle {
+ public:
+  explicit CUDABlasHandle(cudaStream_t stream);
+  ~CUDABlasHandle();
+
+  CUDABlasHandle(const CUDABlasHandle&) = delete;
+  CUDABlasHandle& operator=(const CUDABlasHandle&) = delete;
+
+  cublasHandle_t get() const { return handle_; }
+
+ private:
+  cublasHandle_t handle_ = nullptr;
+};
+
+// Row-major fp16 GEMM:
+//     C[m, n] = alpha * op_a(A) * op_b(B) + beta * C
+//
+// Storage is fp16 and the accumulation is fp32, which is both what the CPU
+// reference does and what the v200 cube unit does. The three therefore agree to
+// within the fp16 rounding of the output rather than to within the accumulator
+// width, which is what makes kFp16DefaultTolerance the right bar.
+//
+// The flags describe how an operand is *stored*; the helper never materialises
+// a transpose:
+//   * transpose_b = true  - B is stored [n, k], one output channel per row.
+//     That is the Linear weight layout, [out_features, in_features], and the
+//     case every projection in the model hits. It becomes CUBLAS_OP_T, which is
+//     what torch does rather than transposing the weight.
+//   * transpose_b = false - B is stored [k, n].
+//   * transpose_a = true  - A is stored [k, m]; false - A is stored [m, k].
+//
+// cuBLAS is column-major, so none of these map onto its flags directly. See the
+// definition in cuda_runtime.cu for the identity that gets from one to the
+// other.
+void CublasGemmFp16(cublasHandle_t handle, bool transpose_a, bool transpose_b, int64_t m, int64_t n,
+                    int64_t k, const uint16_t* a, const uint16_t* b, uint16_t* c, float alpha = 1.0f,
+                    float beta = 0.0f);
+
+// ---------------------------------------------------------------------------
+// Device
+// ---------------------------------------------------------------------------
+
 // Device ordinal used by every test. Override with CUDA_TEST_DEVICE_ID.
 int ResolveCudaDeviceId();
 
@@ -177,6 +313,12 @@ class CUDADevice {
   cudaStream_t stream() const { return stream_; }
   int device_id() const { return device_id_; }
 
+  // Shared cuBLAS handle, bound to stream(). Created on first call and
+  // destroyed before the stream it is bound to, so a binary that never runs a
+  // GEMM never pays for it - cuBLAS reserves workspace and loads its kernel
+  // images when the handle is created, not when it is first used.
+  cublasHandle_t cublas_handle();
+
   const std::string& name() const { return name_; }
   int compute_capability_major() const { return compute_capability_major_; }
   int compute_capability_minor() const { return compute_capability_minor_; }
@@ -194,6 +336,7 @@ class CUDADevice {
   int device_id_ = 0;
   bool device_set_ = false;
   cudaStream_t stream_ = nullptr;
+  std::unique_ptr<CUDABlasHandle> blas_;
   std::string name_;
   int compute_capability_major_ = 0;
   int compute_capability_minor_ = 0;

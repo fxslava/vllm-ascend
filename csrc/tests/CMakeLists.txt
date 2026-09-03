@@ -243,9 +243,12 @@ else()
   message(STATUS "vllm-ascend tests: CUDA toolkit ${CUDAToolkit_VERSION} at ${CUDAToolkit_LIBRARY_ROOT}")
   message(STATUS "vllm-ascend tests: CUDA architectures ${CMAKE_CUDA_ARCHITECTURES}")
 
-  # cudart is the whole link-time dependency. No cuBLAS, no cuDNN, no Cutlass:
-  # every kernel in kernels/cuda is written out by hand.
-  set(VLLM_ASCEND_TEST_CUDA_LIBS CUDA::cudart)
+  # cudart plus cuBLAS, both of which ship with the toolkit, so there is still
+  # nothing to install beyond CUDA itself. No cuDNN and no Cutlass: every kernel
+  # in kernels/cuda is written out by hand. cuBLAS is the single exception, and
+  # only for the linear projections - see the cuBLAS section of
+  # common/cuda_runtime.hpp for why that one is not hand-written.
+  set(VLLM_ASCEND_TEST_CUDA_LIBS CUDA::cudart CUDA::cublas)
 endif()
 
 # -----------------------------------------------------------------------------
@@ -508,6 +511,7 @@ else()
   # ---------------------------------------------------------------------------
 
   set(VLLM_ASCEND_CUDA_KERNEL_TESTS
+    test_matmul
     test_rmsnorm
     test_rotary_embedding
     test_activation_swiglu
