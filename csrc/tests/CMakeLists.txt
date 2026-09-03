@@ -47,6 +47,7 @@ set(SOC_VERSION "Ascend310P3" CACHE STRING "Ascend SoC the tests target")
 
 option(VLLM_ASCEND_TESTS_FETCH_GTEST "Download googletest with FetchContent" ON)
 option(VLLM_ASCEND_TESTS_WERROR "Treat compiler warnings as errors" OFF)
+option(VLLM_ASCEND_TESTS_BUILD_BENCHMARKS "Build the bench_* microbenchmark binaries" ON)
 
 # -----------------------------------------------------------------------------
 # CANN toolkit
@@ -170,7 +171,8 @@ add_library(vllm_ascend_test_common STATIC
   common/test_harness.cpp
   common/aclnn_runtime.cpp
   common/aclnn_ops.cpp
-  common/cpu_reference.cpp)
+  common/cpu_reference.cpp
+  common/benchmark.cpp)
 
 target_include_directories(vllm_ascend_test_common
   PUBLIC
@@ -219,20 +221,38 @@ set(VLLM_ASCEND_KERNEL_TESTS
 # path even though they are opened lazily.
 set(VLLM_ASCEND_TEST_LIBRARY_PATH "${ASCEND_HOME_PATH}/lib64:$ENV{LD_LIBRARY_PATH}")
 
-foreach(test_name ${VLLM_ASCEND_KERNEL_TESTS})
-  add_executable(${test_name}
-    "kernels/${test_name}.cpp"
-    common/main.cpp)
+# Every executable this project produces, collected so the strip step in
+# .vscode-build-aarch64.sh can be driven from a generated manifest rather than a
+# hand-maintained list. A stale name in that list is handed to `strip` as a path
+# that either does not exist or is not an ELF file, which is where the "file
+# format not recognized" warnings came from.
+set(VLLM_ASCEND_TEST_BINARY_FILES "")
 
-  target_link_libraries(${test_name} PRIVATE vllm_ascend_test_common)
+# Shared configuration for both the test and the benchmark binaries: they differ
+# only in which main() they link and how ctest is told to run them.
+function(vllm_ascend_add_device_executable target_name source_file entry_point)
+  add_executable(${target_name} "${source_file}" "${entry_point}")
+  target_link_libraries(${target_name} PRIVATE vllm_ascend_test_common)
 
   # $ORIGIN keeps a copied-out build tree working; the CANN lib dir covers the
   # normal in-place run.
-  set_target_properties(${test_name} PROPERTIES
+  set_target_properties(${target_name} PROPERTIES
     BUILD_RPATH "${ASCEND_HOME_PATH}/lib64"
     INSTALL_RPATH "$ORIGIN:${ASCEND_HOME_PATH}/lib64")
 
-  if(COMMAND gtest_discover_tests AND NOT CMAKE_VERSION VERSION_LESS "3.18")
+  set(VLLM_ASCEND_TEST_BINARY_FILES
+    ${VLLM_ASCEND_TEST_BINARY_FILES} "$<TARGET_FILE:${target_name}>" PARENT_SCOPE)
+endfunction()
+
+foreach(test_name ${VLLM_ASCEND_KERNEL_TESTS})
+  vllm_ascend_add_device_executable(${test_name} "kernels/${test_name}.cpp" common/main.cpp)
+
+  # Cross builds get one ctest entry per binary instead of one per GTest case.
+  # Even PRE_TEST discovery has to execute the binary, and an aarch64 binary on
+  # the x86 build host cannot run - `ctest -N` there aborts on the first
+  # discovery attempt and lists nothing at all, benchmarks included. Running
+  # ctest on the 310P itself, where the binaries are native, is unaffected.
+  if(COMMAND gtest_discover_tests AND NOT CMAKE_VERSION VERSION_LESS "3.18" AND NOT CMAKE_CROSSCOMPILING)
     # PRE_TEST defers enumeration to `ctest` time. The default POST_BUILD mode
     # runs the binary during the build, which fails on a build host that has the
     # CANN headers but no driver.
@@ -241,13 +261,72 @@ foreach(test_name ${VLLM_ASCEND_KERNEL_TESTS})
       DISCOVERY_TIMEOUT 120
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${VLLM_ASCEND_TEST_LIBRARY_PATH};ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
+        LABELS "correctness"
         TIMEOUT 900)
   else()
     add_test(NAME ${test_name} COMMAND ${test_name})
     set_tests_properties(${test_name} PROPERTIES
       ENVIRONMENT "LD_LIBRARY_PATH=${VLLM_ASCEND_TEST_LIBRARY_PATH};ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
+      LABELS "correctness"
       TIMEOUT 900)
   endif()
 endforeach()
 
 message(STATUS "vllm-ascend tests: configured ${VLLM_ASCEND_KERNEL_TESTS}")
+
+# -----------------------------------------------------------------------------
+# Benchmark binaries
+# -----------------------------------------------------------------------------
+#
+# Each bench_* binary links common/bench_main.cpp instead of common/main.cpp: no
+# GTest registration, no test environment, just the runtime setup and the
+# suite's own BuildSuite(). They are registered with ctest under the "benchmark"
+# label so the default `ctest` run stays a correctness run:
+#
+#   ctest --test-dir build/csrc-tests -LE benchmark   # tests only
+#   ctest --test-dir build/csrc-tests -L  benchmark   # benchmarks only
+#
+# A benchmark exits 77 when no usable 310P is attached, which SKIP_RETURN_CODE
+# turns into a ctest skip rather than a failure, matching how the correctness
+# suite behaves on a build host.
+
+if(VLLM_ASCEND_TESTS_BUILD_BENCHMARKS)
+  set(VLLM_ASCEND_KERNEL_BENCHMARKS
+    bench_matmul_310p
+    bench_rmsnorm_310p
+    bench_rotary_embedding_310p
+    bench_activation_swiglu_310p
+    bench_paged_attention_310p)
+
+  add_custom_target(benchmarks COMMENT "Building the vllm-ascend 310P microbenchmarks")
+
+  foreach(bench_name ${VLLM_ASCEND_KERNEL_BENCHMARKS})
+    vllm_ascend_add_device_executable(${bench_name} "kernels/${bench_name}.cpp" common/bench_main.cpp)
+    add_dependencies(benchmarks ${bench_name})
+
+    add_test(NAME ${bench_name} COMMAND ${bench_name})
+    set_tests_properties(${bench_name} PROPERTIES
+      ENVIRONMENT "LD_LIBRARY_PATH=${VLLM_ASCEND_TEST_LIBRARY_PATH};ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
+      LABELS "benchmark"
+      SKIP_RETURN_CODE 77
+      # Wall clock, not device time: 1300+ launches per case across every shape
+      # in a suite, and the largest matmul sweep is the slow one.
+      TIMEOUT 1800)
+  endforeach()
+
+  message(STATUS "vllm-ascend tests: configured ${VLLM_ASCEND_KERNEL_BENCHMARKS}")
+endif()
+
+# -----------------------------------------------------------------------------
+# Binary manifest
+# -----------------------------------------------------------------------------
+#
+# One absolute path per line, written at generate time so the genexes above are
+# resolved. Consumed by .vscode-build-aarch64.sh:
+#
+#   xargs -r -a build/csrc-tests-aarch64/test_binaries.txt aarch64-linux-gnu-strip --strip-unneeded
+
+string(ASCII 10 VLLM_ASCEND_NEWLINE)
+file(GENERATE
+  OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/test_binaries.txt"
+  CONTENT "$<JOIN:${VLLM_ASCEND_TEST_BINARY_FILES},${VLLM_ASCEND_NEWLINE}>${VLLM_ASCEND_NEWLINE}")

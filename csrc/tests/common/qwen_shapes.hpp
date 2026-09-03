@@ -64,6 +64,13 @@ inline bool IsValid310PBlockSize(int64_t block_size, int64_t head_size) {
 // here (see the note in test_matmul_310p.cpp).
 constexpr int64_t kDecodeTokenCount = 1;
 
+// Prefill batches many tokens through the same weights, so M > 1 and the cube
+// unit's M tiling is exercised for the first time. The parity tests stay at
+// M = 1 (see the note in test_matmul_310p.cpp); the benchmark covers both,
+// because the arithmetic intensity - and therefore whether the projection is
+// bandwidth- or cube-bound - is entirely a function of M.
+inline std::vector<int64_t> PrefillTokenCounts() { return {32, 128, 512}; }
+
 // K = in_features. Qwen3.5 hidden sizes that feed a projection.
 inline std::vector<int64_t> LinearInputSizes() { return {2048, 4096}; }
 
@@ -80,6 +87,12 @@ inline std::vector<int64_t> RmsNormHiddenSizes() { return {1536, 2048, 4096, 819
 // Token counts covering a single decode step, a ragged prefill chunk, and a
 // full aligned batch.
 inline std::vector<int64_t> TokenCounts() { return {1, 7, 32, 128}; }
+
+// What the benchmarks sweep for the per-token kernels: the parity set plus a
+// batch big enough to saturate the vector unit. At 128 tokens an RMSNorm or a
+// SwiGLU is still short enough that launch overhead is a visible share of the
+// measurement, so a bandwidth figure taken there understates the kernel.
+inline std::vector<int64_t> BenchmarkTokenCounts() { return {1, 7, 32, 128, 512}; }
 
 // Qwen uses 1e-6 for rms_norm_eps; the value matters because it is added under
 // the square root and dominates when a row is near zero.

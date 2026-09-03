@@ -1,20 +1,25 @@
-# Bare-metal kernel tests (Ascend 310P3)
+# Bare-metal kernel tests and benchmarks (Ascend 310P3)
 
-A standalone GTest suite for the four operator families a **Qwen3.5** forward
-pass needs, driven straight through the CANN runtime. No Python, no PyTorch, no
+A standalone suite for the five operator families a **Qwen3.5** forward pass
+needs, driven straight through the CANN runtime. No Python, no PyTorch, no
 `torch_npu`, no Torch C++ ABI.
 
-| Kernel | Test binary | Stands in for |
-| --- | --- | --- |
-| RMSNorm | `test_rmsnorm_310p` | `torch_npu.npu_rms_norm` — `AscendRMSNorm310.forward_oot` |
-| Rotary embedding | `test_rotary_embedding_310p` | `torch_npu.npu_apply_rotary_pos_emb` — `_rope_forward_oot` |
-| SiluAndMul (SwiGLU) | `test_activation_swiglu_310p` | `torch_npu.npu_swiglu` — `AscendSiluAndMul310.forward` |
-| Paged attention + KV cache | `test_paged_attention_310p` | `torch_npu._npu_paged_attention`, `torch_npu._npu_reshape_and_cache` |
+| Kernel | Test binary | Benchmark binary | Stands in for |
+| --- | --- | --- | --- |
+| MatMul (cube unit) | `test_matmul_310p` | `bench_matmul_310p` | `torch.nn.functional.linear` — every QKV / o_proj / gate_up / down projection |
+| RMSNorm | `test_rmsnorm_310p` | `bench_rmsnorm_310p` | `torch_npu.npu_rms_norm` — `AscendRMSNorm310.forward_oot` |
+| Rotary embedding | `test_rotary_embedding_310p` | `bench_rotary_embedding_310p` | `torch_npu.npu_apply_rotary_pos_emb` — `_rope_forward_oot` |
+| SiluAndMul (SwiGLU) | `test_activation_swiglu_310p` | `bench_activation_swiglu_310p` | `torch_npu.npu_swiglu` — `AscendSiluAndMul310.forward` |
+| Paged attention + KV cache | `test_paged_attention_310p` | `bench_paged_attention_310p` | `torch_npu._npu_paged_attention`, `torch_npu._npu_reshape_and_cache` |
 
 The Python unit tests for these paths (`tests/ut/ops/test_layernorm.py`,
 `test_activation.py`, `test_rotary_embedding.py`) mock `torch_npu` out entirely
 and assert only on dispatch. This suite is where the numerics are actually
 checked, against fp32 CPU references, at the shapes Qwen3.5 uses.
+
+[COVERAGE.md](COVERAGE.md) is the side-by-side audit of the two suites: what
+each one covers, where they disagree on how a tensor is verified, and what is
+missing from both.
 
 ---
 
@@ -22,25 +27,29 @@ checked, against fp32 CPU references, at the shapes Qwen3.5 uses.
 
 ```
 csrc/tests/
-├── CMakeLists.txt                     standalone project, not included from the repo root
+├── CMakeLists.txt                       standalone project, not included from the repo root
+├── COVERAGE.md                          C++ vs Python coverage and parity audit
 ├── common/
-│   ├── acl_check.hpp                  ACL_CHECK / ASSERT_ACL_OK, with aclGetRecentErrMsg attached
-│   ├── aclnn_ops.hpp / .cpp           the version-sensitive aclnn prototypes — read this first
-│   ├── aclnn_runtime.hpp / .cpp       dlopen/dlsym loader, aclTensor RAII, two-phase launch
-│   ├── cpu_reference.hpp / .cpp       naive fp32 references for all four kernels
-│   ├── device_buffer.hpp              32-byte aligned RAII device allocation
-│   ├── device_tensor.hpp              device buffer + aclTensor descriptor, with host conversions
-│   ├── fp16.hpp                       IEEE-754 binary16 conversion, round-to-nearest-even
-│   ├── main.cpp                       entry point, prints the operator inventory
-│   ├── qwen_shapes.hpp                Qwen3.5 shapes and the 310P alignment rules
-│   ├── random_data.hpp                deterministic, platform-independent test data
-│   ├── tensor_compare.hpp             allclose with a diagnostic report
-│   └── test_harness.hpp / .cpp        AscendTestEnvironment: aclInit, device, context, stream
+│   ├── acl_check.hpp                    ACL_CHECK / ASSERT_ACL_OK, with aclGetRecentErrMsg attached
+│   ├── aclnn_ops.hpp / .cpp             the version-sensitive aclnn prototypes — read this first
+│   ├── aclnn_runtime.hpp / .cpp         dlopen/dlsym loader, aclTensor RAII, two-phase launch
+│   ├── bench_main.cpp                   entry point for the bench_* binaries
+│   ├── benchmark.hpp / .cpp             plan-once launch, event timing, statistics, reporting
+│   ├── cpu_reference.hpp / .cpp         naive fp32 references for all five kernels
+│   ├── device_buffer.hpp                RAII device allocation, 32-byte default, 512 for benchmarks
+│   ├── device_tensor.hpp                device buffer + aclTensor descriptor, with host conversions
+│   ├── fp16.hpp                         IEEE-754 binary16 conversion, round-to-nearest-even
+│   ├── main.cpp                         entry point for the test_* binaries, prints the inventory
+│   ├── qwen_shapes.hpp                  Qwen3.5 shapes and the 310P alignment rules
+│   ├── random_data.hpp                  deterministic, platform-independent test data
+│   ├── tensor_compare.hpp               allclose with a diagnostic report
+│   └── test_harness.hpp / .cpp          AscendTestEnvironment: aclInit, device, context, stream
 └── kernels/
-    ├── test_rmsnorm_310p.cpp
-    ├── test_rotary_embedding_310p.cpp
-    ├── test_activation_swiglu_310p.cpp
-    └── test_paged_attention_310p.cpp
+    ├── test_matmul_310p.cpp             bench_matmul_310p.cpp
+    ├── test_rmsnorm_310p.cpp            bench_rmsnorm_310p.cpp
+    ├── test_rotary_embedding_310p.cpp   bench_rotary_embedding_310p.cpp
+    ├── test_activation_swiglu_310p.cpp  bench_activation_swiglu_310p.cpp
+    └── test_paged_attention_310p.cpp    bench_paged_attention_310p.cpp
 ```
 
 Each test file has two layers. Tests named `*Reference` and `*Shapes` are
@@ -120,6 +129,106 @@ Useful GTest flags: `--gtest_list_tests`, `--gtest_repeat=10`,
 
 ---
 
+## Benchmarks
+
+The `bench_*` binaries are a separate suite with the same plumbing and a
+different question: not "is the answer right" but "how long does it take". They
+link `common/bench_main.cpp` instead of `common/main.cpp`, so there is no GTest
+in them at all.
+
+```bash
+cmake --build build/csrc-tests --target benchmarks -j "$(nproc)"
+```
+
+```bash
+./build/csrc-tests/bench_matmul_310p
+```
+
+They are registered with ctest under the `benchmark` label, so the default run
+stays a correctness run:
+
+```bash
+ctest --test-dir build/csrc-tests -LE benchmark --output-on-failure
+```
+
+```bash
+ctest --test-dir build/csrc-tests -L benchmark --output-on-failure
+```
+
+A benchmark exits 77 when no usable 310P is attached, which ctest reports as a
+skip rather than a failure. `-DVLLM_ASCEND_TESTS_BUILD_BENCHMARKS=OFF` leaves
+them out of the build entirely.
+
+### What is inside the timed region
+
+- **Nothing is allocated.** Device buffers, `aclTensor` descriptors and the
+  operator workspace are all created during setup. Buffers are requested at
+  512-byte alignment (`kBenchmarkAlignBytes`) rather than the 32-byte test
+  default, so a measurement is never charged for a buffer starting mid-line.
+- **The operator is planned once.** `aclnn` is a two-phase API and the launch
+  entry point normally consumes the executor `GetWorkspaceSize` produced.
+  `aclSetAclOpExecutorRepeatable` opts out of that, so the timed loop calls only
+  the launch function. When a CANN build does not export it, the fallback
+  re-plans inside the loop, which is what `torch_npu` does per call, and every
+  report says which path ran. `ASCEND_BENCH_REPEATABLE=0` forces the fallback so
+  the two can be compared.
+- **Nothing synchronises**, except in `host` mode, which exists precisely to
+  measure host-visible single-call latency.
+- **Warmup runs first** (20 iterations by default) so kernel compilation,
+  workspace first-touch and AI Core clock ramp do not land in sample 0.
+
+### Three timing modes, all reported per shape
+
+| Mode | How | Read it for |
+| --- | --- | --- |
+| `pipelined` | one event pair around a batch of 10 launches, divided by 10 | throughput; TFLOP/s and GB/s are derived from this row |
+| `device` | one event pair around each launch, all recorded back to back, one stream sync afterwards | pure device time per launch |
+| `host` | `steady_clock` around launch + `aclrtSynchronizeStream` | the latency a decode step actually pays, launch overhead included |
+
+Each mode reports min, median, mean, P95, P99 and standard deviation in
+microseconds over 100 iterations. Percentiles are nearest-rank, so at the
+default iteration count P99 is the second-largest sample: read it as a tail
+indicator, not a number to tune against.
+
+Every case also carries a checksum, taken once after warmup and once after the
+last timed iteration. A benchmark whose operator stopped writing its output,
+which is the classic failure of a repeatable-executor path, fails instead of
+reporting an impressively small number.
+
+### Knobs
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `ASCEND_BENCH_WARMUP` | 20 | warmup iterations |
+| `ASCEND_BENCH_ITERS` | 100 | timed iterations per mode |
+| `ASCEND_BENCH_BATCH` | 10 | launches per event pair in `pipelined` |
+| `ASCEND_BENCH_MODES` | all three | comma-separated subset of `pipelined,device,host` |
+| `ASCEND_BENCH_CSV` | unset | write one row per (case, mode) to this path |
+| `ASCEND_BENCH_REPEATABLE` | on | `0` forces the re-plan-per-launch path |
+| `ASCEND_TEST_DEVICE_ID` | 0 | device ordinal, shared with the tests |
+
+```bash
+ASCEND_BENCH_ITERS=500 ASCEND_BENCH_CSV=matmul.csv ./build/csrc-tests/bench_matmul_310p
+```
+
+### Shape coverage
+
+The benchmarks deliberately go past the parity matrix, because the shapes that
+matter for performance are not the ones that matter for correctness:
+
+- MatMul sweeps M in {1, 32, 128, 512}, so both the decode GEMV and the prefill
+  regime are measured, and adds the fused-QKV (N = 6144, 4608) and `down_proj`
+  (K = 11008) widths that the parity suite's cartesian product cannot express.
+- RMSNorm, SwiGLU and RoPE add a 512-token batch, since at 128 tokens launch
+  overhead is still a visible share of a bandwidth figure.
+- The paged suite benchmarks `aclnnScatterPaKvCache` with a shuffled slot
+  mapping. Decode attention is registered as an explicit skip, for the reason in
+  `common/aclnn_ops.hpp`.
+
+See [COVERAGE.md](COVERAGE.md) for what this does and does not close.
+
+---
+
 ## First run on a new CANN release
 
 The suite resolves every aclnn operator with `dlopen`/`dlsym` rather than
@@ -182,13 +291,20 @@ msprof --export=on --output=./prof/rmsnorm
 Then read `./prof/rmsnorm/**/mindstudio_profiler_output/op_summary_*.csv` for
 per-operator duration, and `op_statistic_*.csv` for the aggregate.
 
-Two things to keep in mind when reading the numbers:
+Two things to keep in mind when profiling a **test** binary:
 
 - Every `RunAclnn` call synchronises the stream, so the timings include launch
-  overhead and are not a throughput measurement. Use `--gtest_repeat` to get a
-  stable per-call figure.
+  overhead and are not a throughput measurement.
 - The workspace is allocated and freed per call. In the plugin it comes from the
   caching allocator, so a profile taken here overstates allocation cost.
+
+Neither applies to the `bench_*` binaries, which is what they exist for. Profile
+those instead when the question is cost rather than correctness, and narrow the
+run with `ASCEND_BENCH_MODES=pipelined` so the trace covers one timing strategy:
+
+```bash
+ASCEND_BENCH_MODES=pipelined msprof --application="./build/csrc-tests/bench_rmsnorm_310p" --output=./prof/rmsnorm --aic-metrics=PipeUtilization --ai-core=on
+```
 
 For a memory-access view instead of a pipe-utilisation view:
 
@@ -224,12 +340,14 @@ and several differ from the GPU defaults:
 
 Covered: numerical parity against fp32 CPU references, layout and alignment
 contracts, GQA head mapping, both rotary layouts, block-table paging across
-multiple blocks, and context-length bounds.
+multiple blocks, context-length bounds, and per-shape latency and throughput.
 
 Not covered: the quantised (W8A8 / int8 KV cache) paths, chunked prefill and the
 splitfuse attention variants, multi-device or graph-capture execution, and
-performance regression thresholds. The four kernels here are the fp16 decode
-path only, which is what the brief scoped.
+performance regression *thresholds* - the benchmarks report numbers and check
+that the operator still produces its output, but nothing fails on a slowdown.
+The five kernels here are the fp16 decode path only, which is what the brief
+scoped. [COVERAGE.md](COVERAGE.md) has the full gap list.
 
 ## Adding a kernel
 
@@ -240,3 +358,9 @@ path only, which is what the brief scoped.
 3. Add `kernels/test_<name>_310p.cpp` with host-only reference tests plus the
    device parity tests.
 4. Append the binary name to `VLLM_ASCEND_KERNEL_TESTS` in `CMakeLists.txt`.
+
+To add a benchmark for it, write `kernels/bench_<name>_310p.cpp` defining
+`bench::kSuiteName` and `bench::BuildSuite`, and append the binary name to
+`VLLM_ASCEND_KERNEL_BENCHMARKS`. Allocate everything in `BuildSuite`, hand
+`PlanAclnn` the same arguments `RunAclnn` would take, and give the case a
+checksum.
