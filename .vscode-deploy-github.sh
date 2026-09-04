@@ -10,12 +10,12 @@ TAG="v0.1.0-310p-tests"
 ARCHIVE="ascend310p3-aarch64-csrc-tests.tar.gz"
 
 # Автовыбор: нативный linux gh или windows gh.exe
-if command -v gh >/dev/null 2>&1; then
-  GH_BIN="gh"
-elif command -v gh.exe >/dev/null 2>&1; then
+if command -v gh.exe >/dev/null 2>&1; then
   GH_BIN="gh.exe"
 elif [ -f "/mnt/c/Program Files/GitHub CLI/gh.exe" ]; then
   GH_BIN="/mnt/c/Program Files/GitHub CLI/gh.exe"
+elif command -v gh >/dev/null 2>&1; then
+  GH_BIN="gh"
 else
   echo "Error: gh / gh.exe not found neither in WSL nor in Windows."
   exit 1

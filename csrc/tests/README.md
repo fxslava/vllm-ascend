@@ -43,6 +43,7 @@ csrc/tests/
 │   ├── qwen_shapes.hpp                  Qwen3.5 shapes and the 310P alignment rules
 │   ├── random_data.hpp                  deterministic, platform-independent test data
 │   ├── tensor_compare.hpp               allclose with a diagnostic report
+│   ├── test_benchmark_harness.cpp       device-free tests over the benchmark report arithmetic
 │   └── test_harness.hpp / .cpp          AscendTestEnvironment: aclInit, device, context, stream
 └── kernels/
     ├── test_matmul_310p.cpp             bench_matmul_310p.cpp
@@ -127,6 +128,15 @@ ASCEND_TEST_DEVICE_ID=3 ./build/csrc-tests/test_rmsnorm_310p
 Useful GTest flags: `--gtest_list_tests`, `--gtest_repeat=10`,
 `--gtest_shuffle`, `--gtest_output=xml:results.xml`.
 
+`test_benchmark_harness` is the exception to all of the above: it covers the
+benchmark harness rather than a kernel, needs no device, and passes on the build
+host. It is the fastest check that a change to `common/benchmark.*` or
+`common/device_buffer.hpp` did not move what a report says.
+
+```bash
+./build/csrc-tests/test_benchmark_harness
+```
+
 ---
 
 ## Benchmarks
@@ -175,7 +185,9 @@ them out of the build entirely.
 - **Nothing synchronises**, except in `host` mode, which exists precisely to
   measure host-visible single-call latency.
 - **Warmup runs first** (20 iterations by default) so kernel compilation,
-  workspace first-touch and AI Core clock ramp do not land in sample 0.
+  workspace first-touch and AI Core clock ramp do not land in sample 0, and a
+  hard `aclrtSynchronizeStream` separates it from the timed loop: every warmup
+  launch and every MTE transfer it queued has retired before sample 0 starts.
 
 ### Three timing modes, all reported per shape
 
@@ -195,13 +207,48 @@ last timed iteration. A benchmark whose operator stopped writing its output,
 which is the classic failure of a repeatable-executor path, fails instead of
 reporting an impressively small number.
 
+### Samples that are not durations
+
+The `pipelined` and `device` rows come from `aclrtEventElapsedTime`, which
+reports milliseconds as a `float` and has several ways of returning something
+that is not a duration at all: an event the device has not resolved, an event
+created without a timestamp, a wrapped device counter. Any of those come back
+negative or non-finite, and one of them in a set is enough to drag the mean
+below zero and make the derived TFLOP/s and GB/s meaningless.
+
+So every sample is validated before it is aggregated:
+
+- Events are created with `ACL_EVENT_TIME_LINE | ACL_EVENT_SYNC` where the
+  runtime accepts it, so they carry a timestamp and are host-waitable. The
+  report header names which flag combination the run actually got; a run that
+  fell back to `aclrtCreateEvent` says so, and its device rows are suspect.
+- Both events are resolved, and the whole stream drained, before any elapsed
+  time is queried.
+- A sample that is not positive and finite is dropped, not clamped or replaced.
+  The report lists what was dropped, per case and per mode, under
+  `discarded samples`, and the CSV carries it in a `discarded` column next to
+  `samples`. A median over 40 of 100 samples is a different claim from a median
+  over all 100, so the run says which it is.
+- A mode with **no** usable sample fails its case. A row of zeros reads like a
+  fast kernel, so the suite refuses to print one.
+
+The `host` row is taken from `steady_clock` in the clock's own 64-bit nanosecond
+representation and converted once, in `double`. Nothing on that path narrows:
+microseconds in a 32-bit integer wrap after 2.14 seconds, which is inside the
+range a large prefill matmul reaches.
+
 ### Knobs
+
+Every `ASCEND_BENCH_*` integer is parsed with a range. A value that is not an
+integer, or is outside the range, is reported on stderr and the default is used
+instead -- a typo in `ASCEND_BENCH_WARMUP` no longer silently becomes zero
+warmup.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `ASCEND_BENCH_WARMUP` | 20 | warmup iterations |
-| `ASCEND_BENCH_ITERS` | 100 | timed iterations per mode |
-| `ASCEND_BENCH_BATCH` | 10 | launches per event pair in `pipelined` |
+| `ASCEND_BENCH_WARMUP` | 20 | warmup iterations, 0 to 1000000 |
+| `ASCEND_BENCH_ITERS` | 100 | timed iterations per mode, 1 to 1000000 |
+| `ASCEND_BENCH_BATCH` | 10 | launches per event pair in `pipelined`, 1 to 766: two events bracket a batch, and a deeper one than the stream holds would be split by the runtime's back-pressure rather than measuring a fuller pipeline |
 | `ASCEND_BENCH_MODES` | all three | comma-separated subset of `pipelined,device,host` |
 | `ASCEND_BENCH_CSV` | unset | write one row per (case, mode) to this path |
 | `ASCEND_BENCH_REPEATABLE` | on | `0` forces the re-plan-per-launch path |
