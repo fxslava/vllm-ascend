@@ -27,9 +27,14 @@
 // the 32-byte default; the benchmarks ask for 512 so that a measurement is not
 // silently penalised by a buffer that straddles a cache line or an HBM burst.
 // aclrtMalloc already returns pointers aligned far past 32 bytes in practice,
-// but the documented guarantee stops there, so a stronger request
-// over-allocates by one alignment and offsets into the block rather than
-// trusting the allocator.
+// but the documented guarantee stops there, so every request over-allocates by
+// one alignment and offsets into the block rather than trusting the allocator.
+//
+// The slack has to be unconditional. Making it conditional on a
+// stronger-than-default alignment was a latent overrun: with no slack, a base
+// pointer that needed advancing left fewer than capacity_bytes_ bytes
+// addressable from data_, and the memset, CopyFromHost and Zero below all
+// write the padded capacity rather than the requested size.
 
 #pragma once
 
@@ -105,19 +110,32 @@ class DeviceBuffer {
       return;
     }
     alignment_ = (alignment < kDeviceAlignBytes) ? kDeviceAlignBytes : alignment;
+    // AlignUp and the `% alignment_` check below are a correct pair only for a
+    // power of two, and every burst and line size on this part is one.
+    if ((alignment_ & (alignment_ - 1)) != 0) {
+      throw AclError("device allocation alignment must be a power of two", __FILE__, __LINE__, -1);
+    }
+    // AlignUp wraps rather than saturating, so without this a size near the top
+    // of the address space would quietly produce a tiny allocation.
+    if (size_bytes > SIZE_MAX - 2 * alignment_) {
+      throw AclError("device allocation size overflows when padded to alignment", __FILE__, __LINE__, -1);
+    }
     size_bytes_ = size_bytes;
     capacity_bytes_ = AlignUp(size_bytes, alignment_);
 
-    // Only the stronger-than-default request pays for the slack, so the
-    // correctness tests allocate exactly what they did before.
-    const size_t request =
-        capacity_bytes_ + ((alignment_ > kDeviceAlignBytes) ? alignment_ : 0);
+    // One alignment of slack, always; see the note at the top of this file for
+    // why making it conditional was wrong.
+    const size_t request = capacity_bytes_ + alignment_;
     ACL_CHECK(aclrtMalloc(&base_, request, ACL_MEM_MALLOC_HUGE_FIRST));
-    data_ = reinterpret_cast<void*>(AlignUp(reinterpret_cast<uintptr_t>(base_), alignment_));
 
-    // aclrtMalloc aligns well past 32 bytes in practice; the check documents
-    // the contract the kernels rely on and fails loudly if it ever changes.
-    if ((reinterpret_cast<uintptr_t>(data_) % alignment_) != 0) {
+    const size_t base_address = reinterpret_cast<size_t>(base_);
+    const size_t data_address = AlignUp(base_address, alignment_);
+    data_ = reinterpret_cast<void*>(data_address);
+
+    // The two invariants everything below relies on: data_ is aligned as asked,
+    // and capacity_bytes_ bytes really are addressable from it.
+    if ((data_address % alignment_) != 0 ||
+        (data_address - base_address) + capacity_bytes_ > request) {
       throw AclError("device allocation could not be aligned as requested", __FILE__, __LINE__, -1);
     }
     // Zero the padding so a tail burst never reads uninitialised device memory.
