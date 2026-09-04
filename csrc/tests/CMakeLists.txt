@@ -538,7 +538,8 @@ else()
     test_rotary_embedding
     test_activation_swiglu
     test_paged_attention
-    test_qwen_layer_golden)
+    test_qwen_layer_golden
+    test_qwen_real_inference)
 
   foreach(test_name ${VLLM_ASCEND_CUDA_KERNEL_TESTS})
     add_executable(${test_name} "kernels/cuda/${test_name}.cpp" common/cuda_main.cpp)
@@ -551,6 +552,12 @@ else()
       # failing, see the loader in test_qwen_layer_golden.cpp.
       target_compile_definitions(${test_name} PRIVATE
         VLLM_ASCEND_GOLDEN_LAYER3_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data/golden_layer3")
+    elseif(test_name STREQUAL "test_qwen_real_inference")
+      # Same arrangement for the real-checkpoint dump, overridden at run time
+      # with QWEN_REAL_LAYER3_DIR. Regenerate it with
+      # scripts/dump_qwen35_real_inference.py.
+      target_compile_definitions(${test_name} PRIVATE
+        VLLM_ASCEND_REAL_QWEN_LAYER3_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data/real_qwen_layer3")
     endif()
 
     list(APPEND VLLM_ASCEND_TEST_BINARY_FILES "$<TARGET_FILE:${test_name}>")

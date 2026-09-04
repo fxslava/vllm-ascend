@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstddef>
 #include <iomanip>
+#include <iostream>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -161,6 +162,132 @@ inline ComparisonReport CompareAllClose(const std::vector<float>& actual, const 
     ASSERT_TRUE(vllm_ascend_report.passed)                                                      \
         << "NPU result does not match the CPU reference:"                                       \
         << vllm_ascend_report.Describe(tolerance);                                              \
+  } while (false)
+
+// ---------------------------------------------------------------------------
+// Cosine similarity
+// ---------------------------------------------------------------------------
+//
+// allclose asks whether every element is individually close. Cosine similarity
+// asks whether the two tensors point the same way, which is the question worth
+// asking once a value is a whole layer's output rather than one operator's:
+//
+//   * It is scale-free. A residual stream that has grown to |x| ~ 3.5 makes a
+//     fixed atol=1e-3 a far tighter bar than the same number meant at unit
+//     magnitude, so a purely elementwise gate either passes trivially or fails
+//     for reasons that have nothing to do with the kernel.
+//   * It is one number over the whole tensor, so fp16 noise spread thinly
+//     across 2048 channels does not read as a failure, while a genuine defect -
+//     a transposed weight, a mis-split fused projection, a rotary table at the
+//     wrong base - moves it immediately. 1 - cos is quadratic in the angle, so
+//     a floor of 0.9999 is a bound of about 1.4e-2 on the relative size of the
+//     component pointing the wrong way: tight, not generous.
+//
+// MAE and max |abs error| are reported alongside it because cosine similarity
+// alone cannot see a uniform scale error: a result that is exactly 2x the
+// reference has cosine similarity 1.
+
+struct SimilarityReport {
+  bool passed = true;
+  size_t element_count = 0;
+  size_t non_finite_count = 0;
+  double cosine_similarity = 0.0;
+  double mean_abs_error = 0.0;
+  double max_abs_error = 0.0;
+  size_t max_abs_index = 0;
+  double actual_norm = 0.0;
+  double expected_norm = 0.0;
+
+  std::string Describe(const char* label, double floor) const {
+    std::ostringstream stream;
+    stream << "\n  stage           : " << label;
+    stream << "\n  elements        : " << element_count;
+    stream << "\n  non-finite      : " << non_finite_count;
+    stream << std::fixed << std::setprecision(8);
+    stream << "\n  cosine sim      : " << cosine_similarity << "  (floor " << floor << ")";
+    stream << std::scientific << std::setprecision(6);
+    stream << "\n  MAE             : " << mean_abs_error;
+    stream << "\n  max |abs error| : " << max_abs_error << " at index " << max_abs_index;
+    stream << "\n  norms           : device=" << actual_norm << " reference=" << expected_norm;
+    return stream.str();
+  }
+};
+
+// Accumulation is in double: an fp32 dot product over a few thousand terms
+// loses enough of the tail that the eighth decimal of the result - exactly the
+// digit the 0.9999 gate reads - would be accumulation noise.
+//
+// Two all-zero tensors are defined to have similarity 1, since they agree,
+// while a zero against a non-zero is 0: there the angle really is undefined and
+// the honest report is a failure rather than a division by a guard value.
+inline SimilarityReport CompareCosineSimilarity(const std::vector<float>& actual,
+                                                const std::vector<float>& expected) {
+  SimilarityReport report;
+  report.element_count = expected.size();
+
+  if (actual.size() != expected.size()) {
+    report.passed = false;
+    return report;
+  }
+
+  double dot = 0.0;
+  double actual_square = 0.0;
+  double expected_square = 0.0;
+  double absolute_error_sum = 0.0;
+
+  for (size_t i = 0; i < expected.size(); ++i) {
+    const double a = static_cast<double>(actual[i]);
+    const double e = static_cast<double>(expected[i]);
+
+    if (!std::isfinite(a) || !std::isfinite(e)) {
+      ++report.non_finite_count;
+      report.passed = false;
+      continue;
+    }
+
+    dot += a * e;
+    actual_square += a * a;
+    expected_square += e * e;
+
+    const double abs_error = std::fabs(a - e);
+    absolute_error_sum += abs_error;
+    if (abs_error > report.max_abs_error) {
+      report.max_abs_error = abs_error;
+      report.max_abs_index = i;
+    }
+  }
+
+  report.actual_norm = std::sqrt(actual_square);
+  report.expected_norm = std::sqrt(expected_square);
+  report.mean_abs_error =
+      expected.empty() ? 0.0 : absolute_error_sum / static_cast<double>(expected.size());
+
+  const double denominator = report.actual_norm * report.expected_norm;
+  if (denominator > 0.0) {
+    report.cosine_similarity = dot / denominator;
+  } else {
+    report.cosine_similarity = (report.actual_norm == 0.0 && report.expected_norm == 0.0) ? 1.0 : 0.0;
+  }
+  return report;
+}
+
+// The quality gate a whole-layer parity test wants: same direction to within
+// `floor`, with the metrics reported either way - so a pass is an observation
+// and not just a green tick. A failure gets them from gtest's own message, so
+// the [ METRIC ] line is printed only when there is no failure message for it
+// to duplicate.
+#define EXPECT_TENSORS_COSINE_SIMILAR(actual, expected, floor, label)                           \
+  do {                                                                                          \
+    const ::vllm_ascend::test::SimilarityReport vllm_ascend_similarity =                        \
+        ::vllm_ascend::test::CompareCosineSimilarity((actual), (expected));                     \
+    const bool vllm_ascend_within_floor = vllm_ascend_similarity.passed &&                      \
+                                          vllm_ascend_similarity.cosine_similarity >= (floor);  \
+    EXPECT_TRUE(vllm_ascend_within_floor)                                                       \
+        << "device result diverges from the reference:"                                         \
+        << vllm_ascend_similarity.Describe((label), (floor));                                   \
+    if (vllm_ascend_within_floor) {                                                             \
+      std::cout << "[  METRIC  ]" << vllm_ascend_similarity.Describe((label), (floor)) << "\n"; \
+    }                                                                                           \
   } while (false)
 
 }  // namespace test

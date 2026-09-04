@@ -73,7 +73,8 @@ csrc/tests/
         ├── elementwise_kernel.cu        sigmoid output gate and residual add
         ├── paged_attention_kernel.cu    test_paged_attention.cpp
         ├── test_matmul.cpp              cuBLAS; the one operator with no kernel of its own
-        └── test_qwen_layer_golden.cpp   whole-layer parity against a PyTorch dump
+        ├── test_qwen_layer_golden.cpp   whole-layer parity against a PyTorch dump
+        └── test_qwen_real_inference.cpp the same layer, real weights, cosine-similarity gate
 ```
 
 Each test file has two layers. Tests named `*Reference` and `*Shapes` are
@@ -319,6 +320,7 @@ references or the test logic is exercised somewhere before it reaches hardware.
 | Paged attention + KV cache | `test_paged_attention` | dense 4-D cache, decode scatter and `paged_attention_decode_v1` |
 | MatMul | `test_matmul` | cuBLAS `cublasGemmEx`, fp16 storage with fp32 accumulate, `CUBLAS_OP_T` weights |
 | Whole layer (Qwen3.5 layer 3) | `test_qwen_layer_golden` | end to end against a PyTorch dump, seven per-stage taps plus the final output |
+| Whole layer, real weights | `test_qwen_real_inference` | the real Qwen3.5-2B checkpoint decoding at position 64 over a 65-entry KV cache; ten per-stage taps, gated on cosine similarity |
 
 ### Golden layer dumps
 
@@ -343,6 +345,30 @@ the top of the test):
 ```bash
 python scripts/dump_qwen35_layer3.py --pos 1024 --ctx-len 128
 ```
+
+### Real-weight dumps
+
+`test_qwen_real_inference` runs the same layer graph, but every number in it
+comes from the shipped Qwen3.5-2B checkpoint rather than a generator, and the
+decode step runs at position 64 over a 65-entry KV cache built from a tokenised
+prompt. That closes the two holes the synthetic set has at `pos=0, ctx_len=1`:
+RoPE is no longer the identity, and the softmax is a real distribution over 65
+competing positions rather than a constant 1.0.
+
+Its dumps live in `csrc/tests/data/real_qwen_layer3`, are Git LFS objects on the
+same terms, and record the position and the prompt in `meta.json`. Every stage is
+gated on **cosine similarity >= 0.9999** and reports MAE and max |abs error|
+alongside it - a scale-free metric, because by the end of the layer the residual
+stream is at |x| ~ 3.5 and a fixed `atol` no longer means the same thing it does
+at unit magnitude. Regenerating needs the checkpoint and `transformers`, since
+layers 0..2 are gated-DeltaNet blocks and the only honest way to get layer 3's
+input is to run them:
+
+```bash
+python scripts/dump_qwen35_real_inference.py --model F:/AI/Qwen3.5-2B --pos 128
+```
+
+`--pos` also has to be mirrored in `kDecodePosition` in the test.
 
 MatMul is the one operator here with no kernel of its own. A hand-written GEMM
 would be measuring the kernel this suite just wrote rather than anything a
