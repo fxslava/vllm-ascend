@@ -1,0 +1,66 @@
+{
+  "version": "2.0.0",
+  "inputs": [
+    {
+      "id": "dockerImageTag",
+      "type": "promptString",
+      "description": "Specify the CANN Docker Image for offline build:",
+      "default": "ascendhub/cann:9.1.0-310p"
+    },
+    {
+      "id": "remoteHost",
+      "type": "promptString",
+      "description": "Remote SSH Host (use 127.0.0.1 for local mock):",
+      "default": "127.0.0.1"
+    },
+    {
+      "id": "remotePort",
+      "type": "promptString",
+      "description": "Remote SSH Port (use 2222 for local mock):",
+      "default": "2222"
+    }
+  ],
+  "tasks": [
+    {
+      "label": "Remote: Sync & Build in Offline Docker",
+      "type": "shell",
+      "command": "wsl.exe",
+      "args": [
+        "-d",
+        "Ubuntu-22.04",
+        "--",
+        "bash",
+        "-c",
+        "REMOTE_HOST='${input:remoteHost}' REMOTE_PORT='${input:remotePort}' /mnt/c/vllm-ascend/.vscode-remote-build.sh '${input:dockerImageTag}'"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": ["$gcc"],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "focus": true
+      }
+    },
+    {
+      "label": "Local: Build Tests (Docker)",
+      "type": "shell",
+      "command": "wsl.exe",
+      "args": [
+        "-d",
+        "Ubuntu-22.04",
+        "--",
+        "docker",
+        "exec",
+        "-w",
+        "/vllm-workspace/vllm-ascend",
+        "79972ae0c0df",
+        "/bin/bash",
+        "/vllm-workspace/vllm-ascend/.vscode-build-aarch64.sh"
+      ],
+      "problemMatcher": ["$gcc"]
+    }
+  ]
+}

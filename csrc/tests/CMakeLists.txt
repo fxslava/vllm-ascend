@@ -302,8 +302,11 @@ include(GoogleTest)
 
 enable_testing()
 
-# Every executable this project produces, collected so a strip step can be
-# driven from a generated manifest rather than a hand-maintained list.
+# Every executable this project produces, collected so the strip step in
+# .vscode-build-aarch64.sh can be driven from a generated manifest rather than a
+# hand-maintained list. A stale name in that list is handed to `strip` as a path
+# that either does not exist or is not an ELF file, which is where the "file
+# format not recognized" warnings came from.
 set(VLLM_ASCEND_TEST_BINARY_FILES "")
 
 if(NOT ENABLE_CUDA)
@@ -360,6 +363,15 @@ if(NOT ENABLE_CUDA)
     test_activation_swiglu_310p
     test_paged_attention_310p)
 
+  # Tests over the shared harness rather than over a kernel, built from common/
+  # for that reason. These are the only ones in the suite that pass with no device
+  # attached: what they cover is the arithmetic a benchmark run does around the
+  # launches - sample validation, the ASCEND_BENCH_* parses, the alignment rules -
+  # all of which produced wrong numbers on healthy hardware and so have to be
+  # testable without any.
+  set(VLLM_ASCEND_HARNESS_TESTS
+    test_benchmark_harness)
+
   # Discovery runs the binary, which needs libopapi.so and friends on the loader
   # path even though they are opened lazily.
   set(VLLM_ASCEND_TEST_LIBRARY_PATH "${ASCEND_HOME_PATH}/lib64:$ENV{LD_LIBRARY_PATH}")
@@ -380,19 +392,17 @@ if(NOT ENABLE_CUDA)
       ${VLLM_ASCEND_TEST_BINARY_FILES} "$<TARGET_FILE:${target_name}>" PARENT_SCOPE)
   endfunction()
 
-  foreach(test_name ${VLLM_ASCEND_KERNEL_TESTS})
-    vllm_ascend_add_device_executable(${test_name} "kernels/${test_name}.cpp" common/main.cpp)
-
-    # Cross builds get one ctest entry per binary instead of one per GTest case.
-    # Even PRE_TEST discovery has to execute the binary, and an aarch64 binary on
-    # the x86 build host cannot run - `ctest -N` there aborts on the first
-    # discovery attempt and lists nothing at all, benchmarks included. Running
-    # ctest on the 310P itself, where the binaries are native, is unaffected.
+  # Cross builds get one ctest entry per binary instead of one per GTest case.
+  # Even PRE_TEST discovery has to execute the binary, and an aarch64 binary on
+  # the x86 build host cannot run - `ctest -N` there aborts on the first discovery
+  # attempt and lists nothing at all, benchmarks included. Running ctest on the
+  # 310P itself, where the binaries are native, is unaffected.
+  function(vllm_ascend_register_correctness_test target_name)
     if(COMMAND gtest_discover_tests AND NOT CMAKE_VERSION VERSION_LESS "3.18" AND NOT CMAKE_CROSSCOMPILING)
       # PRE_TEST defers enumeration to `ctest` time. The default POST_BUILD mode
       # runs the binary during the build, which fails on a build host that has the
       # CANN headers but no driver.
-      gtest_discover_tests(${test_name}
+      gtest_discover_tests(${target_name}
         DISCOVERY_MODE PRE_TEST
         DISCOVERY_TIMEOUT 120
         PROPERTIES
@@ -400,15 +410,26 @@ if(NOT ENABLE_CUDA)
           LABELS "correctness"
           TIMEOUT 900)
     else()
-      add_test(NAME ${test_name} COMMAND ${test_name})
-      set_tests_properties(${test_name} PROPERTIES
+      add_test(NAME ${target_name} COMMAND ${target_name})
+      set_tests_properties(${target_name} PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${VLLM_ASCEND_TEST_LIBRARY_PATH};ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
         LABELS "correctness"
         TIMEOUT 900)
     endif()
+  endfunction()
+
+  foreach(test_name ${VLLM_ASCEND_KERNEL_TESTS})
+    vllm_ascend_add_device_executable(${test_name} "kernels/${test_name}.cpp" common/main.cpp)
+    vllm_ascend_register_correctness_test(${test_name})
+  endforeach()
+
+  foreach(test_name ${VLLM_ASCEND_HARNESS_TESTS})
+    vllm_ascend_add_device_executable(${test_name} "common/${test_name}.cpp" common/main.cpp)
+    vllm_ascend_register_correctness_test(${test_name})
   endforeach()
 
   message(STATUS "vllm-ascend tests: configured ${VLLM_ASCEND_KERNEL_TESTS}")
+  message(STATUS "vllm-ascend tests: configured ${VLLM_ASCEND_HARNESS_TESTS}")
 
   # ---------------------------------------------------------------------------
   # Benchmark binaries

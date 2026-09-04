@@ -50,6 +50,17 @@
 // samples. Percentiles are nearest-rank, so at the default of 100 iterations
 // P99 is the second-largest sample and is dominated by whatever the OS did that
 // millisecond; read it as a tail indicator, not as a number to tune against.
+//
+// Every figure is a double from end to end. The device modes get theirs from
+// aclrtEventElapsedTime, which reports milliseconds as a float and has three
+// ways of handing back something that is not a duration at all: an event the
+// device has not finished with, an event created without a timestamp, and a
+// wrapped device counter. Any of those produce a negative or non-finite value,
+// and one of them in a sample set drags the mean under zero and turns the
+// derived TFLOP/s and GB/s into nonsense. So a sample is validated before it is
+// aggregated, a rejected one is counted and reported rather than silently
+// replaced, and a mode whose samples are all rejected fails its case instead of
+// printing zeros that look like measurements.
 
 #pragma once
 
@@ -107,8 +118,23 @@ struct BenchmarkOptions {
 // Statistics
 // ---------------------------------------------------------------------------
 
+// One mode's raw samples, plus the number the timing loop could not obtain a
+// usable duration for at all. Those never reach the vector, so they have to be
+// carried alongside it to be reported.
+struct LatencySamples {
+  std::vector<double> microseconds;
+  size_t rejected = 0;
+};
+
 struct LatencyStatistics {
+  // Samples the statistics below were computed from: the ones that survived
+  // validation, not the ones that were requested.
   size_t sample_count = 0;
+  // Samples thrown away because they were not a usable duration - non-finite,
+  // negative, or zero - plus the ones the runtime refused to report at all.
+  // Non-zero means the numbers next to it are drawn from a short run, and a
+  // run with a lot of these is measuring the driver rather than the kernel.
+  size_t discarded_count = 0;
   double min_us = 0.0;
   double median_us = 0.0;
   double mean_us = 0.0;
@@ -117,9 +143,19 @@ struct LatencyStatistics {
   double max_us = 0.0;
   double stddev_us = 0.0;
 
-  // Takes the samples by value and sorts them in place.
+  // Takes the samples by value, drops the ones that are not a usable duration
+  // into discarded_count, and sorts the rest in place. Everything is
+  // accumulated in double; there is no narrowing anywhere on this path.
+  //
+  // sample_count == 0 on return means nothing usable was measured. Callers must
+  // treat that as a failure rather than as a row of zeros: see BenchmarkRunner.
   static LatencyStatistics From(std::vector<double> samples_us);
 };
+
+// How the device-event timings were obtained, for the report header. An event
+// without a timestamp cannot be handed to aclrtEventElapsedTime and is the
+// first thing to suspect when the device modes disagree with the host mode.
+const char* EventTimingSourceLabel();
 
 // ---------------------------------------------------------------------------
 // Plan-once operator launch
@@ -162,6 +198,10 @@ class PlannedOp {
 
  private:
   void DestroyExecutor();
+  // Frees an executor that no launch consumed and that nothing else owns: the
+  // one a re-plan built for a launch that then failed. A no-op when the CANN
+  // build does not export aclDestroyAclOpExecutor.
+  static void DestroyOrphanedExecutor(aclOpExecutor* executor);
 
   std::string op_name_;
   void* launch_fn_ = nullptr;
@@ -275,14 +315,22 @@ class BenchmarkRunner {
   void RecordFailure(const std::string& case_name, const std::string& reason);
 
  private:
-  std::vector<double> TimePipelined(const BenchmarkCase& benchmark_case);
-  std::vector<double> TimeDeviceEvents(const BenchmarkCase& benchmark_case);
-  std::vector<double> TimeHostWallClock(const BenchmarkCase& benchmark_case);
+  LatencySamples TimePipelined(const BenchmarkCase& benchmark_case);
+  LatencySamples TimeDeviceEvents(const BenchmarkCase& benchmark_case);
+  LatencySamples TimeHostWallClock(const BenchmarkCase& benchmark_case);
 
-  // Drains the stream when `enqueued` has grown past what one stream should
-  // hold, and resets it. Called only at sample boundaries, never inside a
-  // batch, so no sample is ever split by a synchronisation.
-  void DrainIfQueueIsDeep(int* enqueued);
+  // Warms the case up and puts a hard barrier between the warmup and the first
+  // timed sample, so nothing the warmup queued - launches included, but MTE
+  // transfers especially - is still retiring when timing starts.
+  void WarmUp(const BenchmarkCase& benchmark_case);
+
+  // Drains the stream when the `about_to_enqueue` tasks the caller is next
+  // going to submit would take it past what one stream should hold, and resets
+  // the count. Called only at sample boundaries, never inside a batch, so no
+  // sample is ever split by a synchronisation. Taking the pending count rather
+  // than only the running one is what keeps a large ASCEND_BENCH_BATCH from
+  // overrunning the queue in a single sample.
+  void DrainIfQueueIsDeep(int* enqueued, int about_to_enqueue);
 
   // Run() wraps this so that a failure drains the stream before unwinding.
   void RunOrThrow(const BenchmarkCase& benchmark_case);
