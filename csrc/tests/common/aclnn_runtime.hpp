@@ -57,17 +57,41 @@ namespace vllm_ascend {
 namespace test {
 
 // Process-wide handle to libopapi.so and the constructor/destructor entry
-// points it re-exports from libnnopbase.so.
+// points it re-exports from libnnopbase.so, plus any custom operator packages
+// installed alongside it.
+//
+// The custom packages matter because half the point of this suite on a 950PR is
+// to exercise kernels that live in csrc/, and those are not in libopapi.so at
+// all: the CANN op build installs them as libcust_opapi.so under a vendor
+// directory. The search order below is copied from
+// csrc/aclnn_torch_adapter/op_api_common.h :: GetOpApiFuncAddr, so a symbol
+// resolves here to the same implementation torch_npu would have called -
+// ASCEND_CUSTOM_OPP_PATH first, then the vendors named by load_priority in
+// $ASCEND_OPP_PATH/vendors/config.ini, then stock CANN.
+//
+// That precedence applies to every operator, not only the custom ones: a vendor
+// package that overrides aclnnRmsNorm would be picked up here exactly as it
+// would be in the plugin. That is deliberate - the alternative is a suite that
+// tests an implementation the runtime would never call.
 class OpApiLibrary {
  public:
   static OpApiLibrary& Instance();
 
+  // True when stock libopapi.so opened. A tree with only a custom package and
+  // no CANN op-api is not a configuration this suite supports, so `loaded()`
+  // does not consider the custom handles.
   bool loaded() const { return handle_ != nullptr; }
   const std::string& load_error() const { return load_error_; }
 
+  // Custom operator packages that opened, in search order. Empty on a stock
+  // CANN install, which is the normal case and not an error.
+  const std::vector<std::string>& custom_library_paths() const { return custom_paths_; }
+
   // Returns nullptr when the symbol is absent; callers decide whether that is
-  // a skip or a failure.
-  void* Resolve(const char* symbol) const;
+  // a skip or a failure. When `source` is non-null it receives the path of the
+  // library the symbol came from, which is what tells a reader whether a pass
+  // exercised the custom kernel or the stock one.
+  void* Resolve(const char* symbol, std::string* source = nullptr) const;
 
   aclTensor* CreateTensor(const std::vector<int64_t>& view_dims, const std::vector<int64_t>& strides,
                           int64_t offset, aclDataType dtype, aclFormat format,
@@ -76,6 +100,11 @@ class OpApiLibrary {
 
   aclIntArray* CreateIntArray(const int64_t* values, uint64_t size) const;
   void DestroyIntArray(const aclIntArray* array) const;
+
+  // `value` points at one element of `dtype`. aclCreateScalar copies it, so the
+  // pointer does not have to outlive the call.
+  aclScalar* CreateScalar(void* value, aclDataType dtype) const;
+  void DestroyScalar(const aclScalar* scalar) const;
 
   aclTensorList* CreateTensorList(const aclTensor* const* tensors, uint64_t size) const;
   void DestroyTensorList(const aclTensorList* list) const;
@@ -86,6 +115,8 @@ class OpApiLibrary {
   void* handle_ = nullptr;
   std::string load_error_;
   std::string library_path_;
+  std::vector<void*> custom_handles_;
+  std::vector<std::string> custom_paths_;
 };
 
 // Row-major contiguous strides, in elements, for the given shape.
@@ -140,6 +171,27 @@ class AclnnIntArray {
   aclIntArray* array_ = nullptr;
 };
 
+// RAII aclScalar. Needed by the operators that take a host-side scalar next to
+// their tensors - aclnnInplaceAdd's `alpha`, for one - which is otherwise the
+// only argument in this suite with no wrapper.
+class AclnnScalar {
+ public:
+  // Only the float form, because it is the only one the suite passes. Add an
+  // overload rather than a template when a second type is needed, so the
+  // aclDataType stays paired with the C++ type instead of being deduced.
+  explicit AclnnScalar(float value);
+  ~AclnnScalar();
+
+  AclnnScalar(const AclnnScalar&) = delete;
+  AclnnScalar& operator=(const AclnnScalar&) = delete;
+
+  aclScalar* get() const { return scalar_; }
+  operator aclScalar*() const { return scalar_; }
+
+ private:
+  aclScalar* scalar_ = nullptr;
+};
+
 class AclnnTensorList {
  public:
   explicit AclnnTensorList(const std::vector<const aclTensor*>& tensors);
@@ -163,6 +215,14 @@ class AclnnOp {
   bool available() const { return get_workspace_size_ != nullptr && launch_ != nullptr; }
   const std::string& name() const { return name_; }
 
+  // Path of the library the operator resolved from - stock libopapi.so, or a
+  // custom package's libcust_opapi.so. Empty when it did not resolve.
+  const std::string& source() const { return source_; }
+
+  // True when the operator came from a custom operator package rather than from
+  // CANN, i.e. it is one of the kernels built out of csrc/.
+  bool is_custom() const { return source_.find("libcust_opapi.so") != std::string::npos; }
+
   // Human-readable explanation of why available() is false.
   std::string unavailable_reason() const;
 
@@ -171,6 +231,7 @@ class AclnnOp {
 
  private:
   std::string name_;
+  std::string source_;
   void* get_workspace_size_ = nullptr;
   void* launch_ = nullptr;
 };

@@ -1,8 +1,13 @@
-# Bare-metal kernel tests and benchmarks (Ascend 310P3)
+# Bare-metal kernel tests and benchmarks (Ascend 310P3 and 950PR)
 
 A standalone suite for the five operator families a **Qwen3.5** forward pass
 needs, driven straight through the CANN runtime. No Python, no PyTorch, no
 `torch_npu`, no Torch C++ ABI.
+
+Ascend 310P3 is the default target and is what everything up to
+[Ascend 950PR](#ascend-950pr) describes. That section covers the opt-in 950PR
+leg, which adds four operator tests and an end-to-end Qwen3.5 layer parity test
+against a PyTorch dump.
 
 | Kernel | Test binary | Benchmark binary | Stands in for |
 | --- | --- | --- | --- |
@@ -32,25 +37,38 @@ csrc/tests/
 ├── common/
 │   ├── acl_check.hpp                    ACL_CHECK / ASSERT_ACL_OK, with aclGetRecentErrMsg attached
 │   ├── aclnn_ops.hpp / .cpp             the version-sensitive aclnn prototypes — read this first
+│   ├── aclnn_ops_950pr.hpp / .cpp       the 950PR operator audit and its extra prototypes
 │   ├── aclnn_runtime.hpp / .cpp         dlopen/dlsym loader, aclTensor RAII, two-phase launch
+│   ├── ascend950_shapes.hpp             Qwen3.5-2B layer 3 and the arch35 platform rules
 │   ├── bench_main.cpp                   entry point for the bench_* binaries
 │   ├── benchmark.hpp / .cpp             plan-once launch, event timing, statistics, reporting
 │   ├── cpu_reference.hpp / .cpp         naive fp32 references for all five kernels
 │   ├── device_buffer.hpp                RAII device allocation, 32-byte default, 512 for benchmarks
 │   ├── device_tensor.hpp                device buffer + aclTensor descriptor, with host conversions
 │   ├── fp16.hpp                         IEEE-754 binary16 conversion, round-to-nearest-even
+│   ├── golden_layer3.hpp / .cpp         LFS-aware loader for the layer-3 dump
 │   ├── main.cpp                         entry point for the test_* binaries, prints the inventory
+│   ├── main_950pr.cpp                   ditto, printing the 950PR pipeline inventory
+│   ├── partial_rotary_950pr.hpp / .cpp  partial RoPE: custom operator, else packed stock operator
 │   ├── qwen_shapes.hpp                  Qwen3.5 shapes and the 310P alignment rules
 │   ├── random_data.hpp                  deterministic, platform-independent test data
 │   ├── tensor_compare.hpp               allclose with a diagnostic report
 │   ├── test_benchmark_harness.cpp       device-free tests over the benchmark report arithmetic
 │   └── test_harness.hpp / .cpp          AscendTestEnvironment: aclInit, device, context, stream
+├── data/
+│   └── golden_layer3/*.bin              Git LFS: weights, taps and output of one Qwen3.5 layer
 └── kernels/
     ├── test_matmul_310p.cpp             bench_matmul_310p.cpp
     ├── test_rmsnorm_310p.cpp            bench_rmsnorm_310p.cpp
     ├── test_rotary_embedding_310p.cpp   bench_rotary_embedding_310p.cpp
     ├── test_activation_swiglu_310p.cpp  bench_activation_swiglu_310p.cpp
-    └── test_paged_attention_310p.cpp    bench_paged_attention_310p.cpp
+    ├── test_paged_attention_310p.cpp    bench_paged_attention_310p.cpp
+    └── ascend/                          built only with -DENABLE_ASCEND_950PR=ON
+        ├── test_matmul_950pr.cpp
+        ├── test_rmsnorm_950pr.cpp
+        ├── test_rotary_embedding_950pr.cpp
+        ├── test_activation_swiglu_950pr.cpp
+        └── test_qwen_layer_golden_950pr.cpp
 ```
 
 Each test file has two layers. Tests named `*Reference` and `*Shapes` are
@@ -382,6 +400,96 @@ and several differ from the GPU defaults:
   `self.rotary_dim in (64, 128)` gate in the 310P rotary module.
 - **Allocations are padded to 32 bytes.** MTE2/MTE3 move 32-byte bursts, so an
   unpadded tail lets the last burst run past the end of the buffer.
+
+---
+
+## Ascend 950PR
+
+A second, opt-in leg of the same suite targets the **Ascend 950PR** (A5, DaVinci
+arch35). It shares the CPU references, the fp16 conversion, the deterministic
+data generator and the tolerance machinery with the 310P leg; what differs is
+the part, the operators, and one shape the 310P cannot run at all.
+
+```bash
+cmake -S csrc/tests -B build/csrc-tests-950pr -G Ninja \
+      -DENABLE_ASCEND_950PR=ON -DSOC_VERSION=Ascend950PR_9599
+```
+
+The option is **OFF by default and purely additive**: it adds five binaries and
+one static library and changes nothing about the 310P targets, which are still
+built, still registered with `ctest` under the same names, and still gate on
+`REQUIRE_ASCEND_310P` at run time. A tree with the option on produces one set of
+binaries per part, and each set skips on the other part's hardware.
+
+| Binary | Stage | Operator |
+| --- | --- | --- |
+| `test_matmul_950pr` | 2, 6, 8 — every linear projection | `aclnnMatmul` (cube) |
+| `test_rmsnorm_950pr` | 1, 7 | `aclnnRmsNorm` |
+| `test_rotary_embedding_950pr` | 3, 4 — **partial** RoPE | `aclnnInplacePartialRotaryMul`, else packed `aclnnApplyRotaryPosEmbV2` |
+| `test_activation_swiglu_950pr` | 8 | `aclnnSwiGlu` |
+| `test_qwen_layer_golden_950pr` | 1–9 end to end | all of the above plus `aclnnScatterPaKvCache`, `aclnnFusedInferAttentionScoreV2`, `aclnnSigmoid`, `aclnnMul`, `aclnnInplaceAdd` |
+
+`common/aclnn_ops_950pr.hpp` carries the operator audit: which stage runs on a
+stock CANN operator, which on a kernel built out of `csrc/`, and the CANN header
+each prototype was verified against.
+
+### Partial rotary is the interesting stage
+
+Qwen3.5 sets `partial_rotary_factor` 0.25 against `head_dim` 256, so channels
+`[0, 64)` of every head rotate and `[64, 256)` must come out bit-identical. The
+310P cannot run that shape at all (`AscendMRotaryEmbedding310` gates on
+`rotary_dim in (64, 128)`), and `aclnnApplyRotaryPosEmbV2` cannot express it
+either — it rotates the whole trailing dimension.
+
+`common/partial_rotary_950pr.hpp` resolves that at run time, preferring
+`aclnnInplacePartialRotaryMul` — the vllm-ascend custom operator from
+`csrc/attention/inplace_partial_rotary_mul`, which has an `ascend950` AICore
+config — and falling back to packing the rotary slice of every head into a
+contiguous buffer, rotating that with the stock operator, and unpacking. Every
+rotary test records which path ran, because the two are different claims about
+the same hardware.
+
+The custom operator is **not part of CANN**: it only resolves once the
+vllm-ascend custom op package is installed, and it lives in `libcust_opapi.so`
+under `$ASCEND_CUSTOM_OPP_PATH` or an `$ASCEND_OPP_PATH/vendors` entry rather
+than in `libopapi.so`. `common/aclnn_runtime.cpp` searches those first, in the
+same order `csrc/aclnn_torch_adapter/op_api_common.h` does, so a symbol resolves
+here to the implementation `torch_npu` would have called.
+
+### Golden layer-3 parity
+
+`test_qwen_layer_golden_950pr` runs a whole Qwen3.5 decoder layer on the NPU and
+compares seven intermediate taps plus the final output against
+`csrc/tests/data/golden_layer3`, produced by `scripts/dump_qwen35_layer3.py`.
+The dump is tracked with Git LFS; a tree where it was never fetched gets a skip
+naming `git lfs pull` rather than a size mismatch. `QWEN_GOLDEN_LAYER3_DIR`
+overrides the baked-in location.
+
+That binary also carries **13 host-only tests that need no NPU at all**: the
+same nine stages run again in float on the host, rounding to fp16 at every stage
+boundary the way the dumper does, plus the loader's failure modes. They check
+that the dump is internally consistent, that the loader reads it correctly and
+that the CPU references agree with PyTorch — on a build machine.
+
+```bash
+./test_qwen_layer_golden_950pr --gtest_filter='QwenLayer3DumpTest.*:QwenLayer3Loader.*'
+```
+
+### What the shipped dump does not test
+
+It is `pos=0`, `ctx_len=1`. At position 0 the rotary tables are `cos=1, sin=0`,
+so RoPE is the identity. With one context position the softmax is exactly 1.0,
+so the attention context is just V and **the layer output does not depend on Q,
+K or RoPE**. The taps are what catch a bug in those stages, which is why they
+exist; `Stage5DecodeAttentionContextIsTheCachedValue` turns the softmax identity
+into a direct check on the paged KV write, the block table and the GQA mapping.
+
+`--pos N` regenerates a set where the rotary stages carry weight. `--ctx-len M`
+for `M > 1` does **not** work: the dumper generates the prior context but never
+writes it out, so the test has no way to reconstruct it. Teaching the dumper to
+write `k_past` / `v_past` is a prerequisite for any multi-position dump.
+
+---
 
 ## Scope
 

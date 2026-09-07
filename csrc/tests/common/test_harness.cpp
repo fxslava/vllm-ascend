@@ -22,6 +22,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "ascend950_shapes.hpp"
+
 namespace vllm_ascend {
 namespace test {
 
@@ -153,6 +155,15 @@ bool AscendTestEnvironment::is_310p() const {
     return true;
   }
   return soc_name_.find("310P") != std::string::npos || soc_name_.find("310p") != std::string::npos;
+}
+
+bool AscendTestEnvironment::is_950pr() const {
+  // The platform_config SoC_version for every 950PR bin starts "Ascend950PR"
+  // (Ascend950PR_9599, _9589, _957b, ...). Ascend950DT shares the family but
+  // not the part, so a prefix match rather than a "950" substring.
+  //
+  // An empty name is rejected: see the note on the declaration.
+  return ::vllm_ascend::test::shapes950::IsAscend950PrSocName(soc_name_);
 }
 
 void RegisterAscendTestEnvironment() {

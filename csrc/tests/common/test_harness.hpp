@@ -90,6 +90,18 @@ class AscendTestEnvironment : public ::testing::Environment {
   // constraint) gate on this rather than on a build-time define.
   bool is_310p() const;
 
+  // True when the attached device reports an Ascend 950PR part, i.e. a SoC name
+  // beginning "Ascend950PR" - the platform_config files name one bin each
+  // (Ascend950PR_9599 and friends) and the tests must accept all of them.
+  //
+  // Unlike is_310p(), an unknown SoC name is NOT accepted here. is_310p()
+  // returns true for an empty name because that suite predates any second
+  // part and refusing would have made a CANN build without aclrtGetSocName
+  // skip everything; this one runs alongside the 310P binaries in the same
+  // build tree, so "we could not tell" has to mean "not this part" or a 310P
+  // host would silently run 950PR-shaped work.
+  bool is_950pr() const;
+
  private:
   AscendTestEnvironment() = default;
 
@@ -115,6 +127,16 @@ void RegisterAscendTestEnvironment();
     REQUIRE_ASCEND_DEVICE();                                                               \
     if (!::vllm_ascend::test::AscendTestEnvironment::Instance().is_310p()) {               \
       GTEST_SKIP() << "Test targets Ascend 310P; attached device reports '"                \
+                   << ::vllm_ascend::test::AscendTestEnvironment::Instance().soc_name()    \
+                   << "'";                                                                 \
+    }                                                                                      \
+  } while (false)
+
+#define REQUIRE_ASCEND_950PR()                                                             \
+  do {                                                                                     \
+    REQUIRE_ASCEND_DEVICE();                                                               \
+    if (!::vllm_ascend::test::AscendTestEnvironment::Instance().is_950pr()) {              \
+      GTEST_SKIP() << "Test targets Ascend 950PR; attached device reports '"               \
                    << ::vllm_ascend::test::AscendTestEnvironment::Instance().soc_name()    \
                    << "'";                                                                 \
     }                                                                                      \
