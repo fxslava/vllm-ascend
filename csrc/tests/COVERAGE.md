@@ -268,3 +268,56 @@ computes the right answer*. Neither substitutes for the other.
    kernel fails loudly rather than silently.
 6. **Partial `rotary_dim`.** A device case with `rotary_dim < head_dim`,
    checking the pass-through tail is untouched.
+
+---
+
+## 7. The Ascend 950PR leg
+
+`-DENABLE_ASCEND_950PR=ON` adds a second set of binaries targeting the A5 part
+(`csrc/tests/kernels/ascend/`). It is a different part, not a second opinion on
+the same one, so it does not close a 310P gap — but two of the items above are
+covered *there* for the first time, and the reason each was open on the 310P is
+worth recording next to the reason it is not here.
+
+| Gap above | 310P status | 950PR status |
+| --- | --- | --- |
+| 1. Decode attention | skipped: `PagedAttention` is an ATB C++ object API, not aclnn | wired to `aclnnFusedInferAttentionScoreV2`, TND layout with a block table, copied from `AscendAttentionBackendImpl._get_fia_params` |
+| 6. Partial `rotary_dim` | impossible: the 310P rotary operator takes head dims 64 and 128 only, and `AscendMRotaryEmbedding310` gates on it | the whole point of `test_rotary_embedding_950pr`: `head_dim` 256 with `rotary_dim` 64 and 128, asserting the pass-through tail is **bit**-identical |
+
+What the 950PR leg adds that has no 310P counterpart at all:
+
+- **End-to-end layer parity.** `test_qwen_layer_golden_950pr` runs nine stages of
+  a real Qwen3.5 decoder layer and checks seven intermediate taps plus the final
+  output against a PyTorch dump. Every other test in either suite checks one
+  operator in isolation; this is the only one that checks they compose.
+- **Host-only end-to-end coverage.** The same nine stages run again in float on
+  the host and are checked against the same taps, so the dump, the loader and
+  the CPU references are all verified on a machine with no NPU. This is the only
+  part of the golden test that can run off-device, and it is what tells you
+  whether to suspect the kernel or the reference when the device comparison
+  fails.
+- **A check on the KV write and the block table.** At `ctx_len=1` the softmax is
+  exactly 1.0, so the attention context must equal the cached V for each query
+  head's kv head. `Stage5DecodeAttentionContextIsTheCachedValue` asserts that,
+  which is the only direct test of paged-cache indexing anywhere in either
+  suite.
+- **Custom operator resolution.** `common/aclnn_runtime.cpp` now searches
+  `libcust_opapi.so` under `$ASCEND_CUSTOM_OPP_PATH` and the
+  `$ASCEND_OPP_PATH/vendors` entries before `libopapi.so`, in the same order
+  `csrc/aclnn_torch_adapter/op_api_common.h` does. Without it none of the
+  kernels built out of `csrc/` could be reached from this suite at all.
+
+What is **not** covered on the 950PR leg:
+
+- No benchmarks. There is no `bench_*_950pr` counterpart; the arch35 cube/vector
+  split (`cube_vector_combine=split`) makes the 310P benchmark shapes a poor
+  guide, and nothing here has been timed on the part.
+- `M > 1` projections, as on the 310P. Worse here: arch35 runs cube and vector
+  on separate cores, so the M tiling and the cube/vector handover are
+  950PR-specific behaviour a single-row GEMV cannot reach.
+- bf16, which this part supports natively (`support_bf16=1` in its platform
+  config) and every test here ignores in favour of fp16.
+- The multi-position dump. `scripts/dump_qwen35_layer3.py --ctx-len M` for
+  `M > 1` generates prior KV context but never writes it out, so the golden test
+  cannot reconstruct it. Fixing the dumper is a prerequisite for a decode over
+  more than one position.

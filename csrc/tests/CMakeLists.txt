@@ -49,6 +49,23 @@ option(VLLM_ASCEND_TESTS_FETCH_GTEST "Download googletest with FetchContent" ON)
 option(VLLM_ASCEND_TESTS_WERROR "Treat compiler warnings as errors" OFF)
 option(VLLM_ASCEND_TESTS_BUILD_BENCHMARKS "Build the bench_* microbenchmark binaries" ON)
 
+# The Ascend 950PR (A5, DaVinci arch35) leg of the suite: the four operator
+# tests under kernels/ascend/ plus the end-to-end Qwen3.5 layer-3 parity test.
+#
+# OFF by default, and additive when ON: it adds targets and one static library
+# and changes nothing about the 310P ones. The 310P binaries are still built,
+# still registered with ctest under the same names, and still gate on
+# REQUIRE_ASCEND_310P at run time, so a build with both options on produces one
+# set of binaries per part and each set skips on the other part's hardware.
+#
+#   cmake -S csrc/tests -B build/csrc-tests-950pr -G Ninja \
+#         -DENABLE_ASCEND_950PR=ON -DSOC_VERSION=Ascend950PR_9599
+#
+# It is also orthogonal to the CUDA backend: nothing below is reachable when
+# that path is configured, because the whole block sits under the CANN branch of
+# this file and every source it adds includes acl.h.
+option(ENABLE_ASCEND_950PR "Build tests for Ascend 950PR target" OFF)
+
 # -----------------------------------------------------------------------------
 # CANN toolkit
 # -----------------------------------------------------------------------------
@@ -291,6 +308,85 @@ endforeach()
 
 message(STATUS "vllm-ascend tests: configured ${VLLM_ASCEND_KERNEL_TESTS}")
 message(STATUS "vllm-ascend tests: configured ${VLLM_ASCEND_HARNESS_TESTS}")
+
+# -----------------------------------------------------------------------------
+# Ascend 950PR test binaries
+# -----------------------------------------------------------------------------
+#
+# Four operator tests plus the layer-3 golden parity test, each linking
+# common/main_950pr.cpp instead of common/main.cpp so the inventory they print
+# is the 950PR pipeline rather than the 310P one.
+
+if(ENABLE_ASCEND_950PR)
+  # SOC_VERSION is checked at run time against aclrtGetSocName, so leaving it at
+  # the 310P default with this option on would produce binaries that skip
+  # everything on the part they were built for. Warn rather than override: the
+  # caller may be cross-building for a bin this file does not know about.
+  if(NOT SOC_VERSION MATCHES "^Ascend950PR")
+    message(WARNING
+      "ENABLE_ASCEND_950PR is ON but SOC_VERSION is '${SOC_VERSION}'.\n"
+      "The 950PR tests gate on aclrtGetSocName() reporting an Ascend950PR bin "
+      "(Ascend950PR_9599 and friends) and will skip on anything else.\n"
+      "Configure with -DSOC_VERSION=Ascend950PR_9599 to make the intent explicit.")
+  endif()
+
+  # The dump the golden test reads. Baked in so an in-tree run needs no
+  # environment at all; QWEN_GOLDEN_LAYER3_DIR overrides it at run time, which
+  # is how a regenerated dump is pointed at. The files are tracked with Git LFS
+  # and the loader recognises an unfetched pointer and skips with `git lfs pull`
+  # rather than failing on a size mismatch - see common/golden_layer3.cpp.
+  set(VLLM_ASCEND_GOLDEN_LAYER3_DIR "${CMAKE_CURRENT_SOURCE_DIR}/data/golden_layer3")
+  if(NOT EXISTS "${VLLM_ASCEND_GOLDEN_LAYER3_DIR}/golden_output.bin")
+    message(WARNING
+      "golden dump not found at ${VLLM_ASCEND_GOLDEN_LAYER3_DIR}.\n"
+      "test_qwen_layer_golden_950pr will skip. Run `git lfs pull`, or regenerate "
+      "with `python scripts/dump_qwen35_layer3.py`.")
+  endif()
+
+  # Sources that only the 950PR binaries need. Kept out of
+  # vllm_ascend_test_common so the 310P and benchmark binaries do not grow a
+  # golden-dump path define and three objects they never call.
+  add_library(vllm_ascend_test_common_950pr STATIC
+    common/aclnn_ops_950pr.cpp
+    common/golden_layer3.cpp
+    common/partial_rotary_950pr.cpp)
+
+  target_link_libraries(vllm_ascend_test_common_950pr PUBLIC vllm_ascend_test_common)
+
+  target_compile_definitions(vllm_ascend_test_common_950pr
+    PUBLIC VLLM_ASCEND_GOLDEN_LAYER3_DIR="${VLLM_ASCEND_GOLDEN_LAYER3_DIR}")
+
+  # libcust_opapi.so, where the kernels built out of csrc/ live, is opened with
+  # dlopen at run time by common/aclnn_runtime.cpp - it is found through
+  # ASCEND_CUSTOM_OPP_PATH or the vendors config, not through a link line, so
+  # there is deliberately nothing to link here. The lookup below only reports
+  # whether one is visible at configure time, so a run that skips the custom
+  # rotary path says so before the build rather than after it.
+  if(DEFINED ENV{ASCEND_CUSTOM_OPP_PATH} AND NOT "$ENV{ASCEND_CUSTOM_OPP_PATH}" STREQUAL "")
+    message(STATUS "vllm-ascend tests: ASCEND_CUSTOM_OPP_PATH=$ENV{ASCEND_CUSTOM_OPP_PATH}")
+  elseif(EXISTS "${ASCEND_HOME_PATH}/opp/vendors/config.ini")
+    message(STATUS "vllm-ascend tests: custom op vendors at ${ASCEND_HOME_PATH}/opp/vendors")
+  else()
+    message(STATUS
+      "vllm-ascend tests: no custom operator package visible; aclnnInplacePartialRotaryMul "
+      "will not resolve and the rotary stages take the packed aclnnApplyRotaryPosEmbV2 fallback")
+  endif()
+
+  set(VLLM_ASCEND_950PR_TESTS
+    test_matmul_950pr
+    test_rmsnorm_950pr
+    test_rotary_embedding_950pr
+    test_activation_swiglu_950pr
+    test_qwen_layer_golden_950pr)
+
+  foreach(test_name ${VLLM_ASCEND_950PR_TESTS})
+    vllm_ascend_add_device_executable(${test_name} "kernels/ascend/${test_name}.cpp" common/main_950pr.cpp)
+    target_link_libraries(${test_name} PRIVATE vllm_ascend_test_common_950pr)
+    vllm_ascend_register_correctness_test(${test_name})
+  endforeach()
+
+  message(STATUS "vllm-ascend tests: configured ${VLLM_ASCEND_950PR_TESTS}")
+endif()
 
 # -----------------------------------------------------------------------------
 # Benchmark binaries
