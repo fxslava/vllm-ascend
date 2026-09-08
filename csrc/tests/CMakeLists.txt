@@ -49,6 +49,18 @@ option(VLLM_ASCEND_TESTS_FETCH_GTEST "Download googletest with FetchContent" ON)
 option(VLLM_ASCEND_TESTS_WERROR "Treat compiler warnings as errors" OFF)
 option(VLLM_ASCEND_TESTS_BUILD_BENCHMARKS "Build the bench_* microbenchmark binaries" ON)
 
+# Host-only mode: build just the targets that need neither the CANN headers
+# nor libascendcl.so. Today that is test_turbo_quant_fidelity, whose whole
+# pipeline is the CPU reference in reference/turbo_quant_cpu.h, so the 4-bit
+# KV cache can be measured on a build machine, a simulator or in CI with no
+# NPU and no toolkit installed at all.
+#
+#   cmake -S csrc/tests -B build/csrc-tests-host -DVLLM_ASCEND_TESTS_HOST_ONLY=ON
+#
+# The host-only targets are built in the normal configuration too; this
+# option only removes everything else.
+option(VLLM_ASCEND_TESTS_HOST_ONLY "Build only the targets that need no CANN toolkit" OFF)
+
 # The Ascend 950PR (A5, DaVinci arch35) leg of the suite: the four operator
 # tests under kernels/ascend/ plus the end-to-end Qwen3.5 layer-3 parity test.
 #
@@ -69,6 +81,14 @@ option(ENABLE_ASCEND_950PR "Build tests for Ascend 950PR target" OFF)
 # -----------------------------------------------------------------------------
 # CANN toolkit
 # -----------------------------------------------------------------------------
+
+find_package(Threads REQUIRED)
+
+if(VLLM_ASCEND_TESTS_HOST_ONLY)
+  message(STATUS "vllm-ascend tests: host-only build, skipping CANN discovery")
+endif()
+
+if(NOT VLLM_ASCEND_TESTS_HOST_ONLY)
 
 if(NOT DEFINED ASCEND_HOME_PATH OR ASCEND_HOME_PATH STREQUAL "")
   if(DEFINED ENV{ASCEND_HOME_PATH})
@@ -91,8 +111,6 @@ endif()
 
 message(STATUS "vllm-ascend tests: CANN at ${ASCEND_HOME_PATH}")
 message(STATUS "vllm-ascend tests: target SoC ${SOC_VERSION}")
-
-find_package(Threads REQUIRED)
 
 set(ASCEND_LIB_DIRS
   "${ASCEND_HOME_PATH}/lib64"
@@ -154,6 +172,8 @@ else()
   message(STATUS "vllm-ascend tests: vllm_ascend_kernels not found (expected on ascend310p)")
 endif()
 
+endif()  # NOT VLLM_ASCEND_TESTS_HOST_ONLY
+
 # -----------------------------------------------------------------------------
 # googletest
 # -----------------------------------------------------------------------------
@@ -179,6 +199,76 @@ endif()
 
 # Provides gtest_discover_tests.
 include(GoogleTest)
+
+if(VLLM_ASCEND_TESTS_FETCH_GTEST)
+  set(VLLM_ASCEND_TEST_GTEST_MAIN_TARGET gtest_main)
+else()
+  set(VLLM_ASCEND_TEST_GTEST_MAIN_TARGET GTest::gtest_main)
+endif()
+
+enable_testing()
+
+# -----------------------------------------------------------------------------
+# Host-only targets
+# -----------------------------------------------------------------------------
+#
+# Sources that touch neither acl.h nor any CANN library, collected into their own
+# library so the binaries built from them carry no DT_NEEDED entry for
+# libascendcl.so and link on a machine with no toolkit. common/cpu_reference.cpp
+# and common/golden_layer3.cpp are already pure host code; keeping them out of
+# vllm_ascend_test_common here rather than reusing that target is what makes the
+# independence real instead of accidental.
+
+# The dump the golden tests read. Defined before the 950PR block because the
+# host-only fidelity report needs it too; QWEN_GOLDEN_LAYER3_DIR overrides it at
+# run time. The files are tracked with Git LFS and the loader recognises an
+# unfetched pointer and skips - see common/golden_layer3.cpp.
+set(VLLM_ASCEND_GOLDEN_LAYER3_DIR "${CMAKE_CURRENT_SOURCE_DIR}/data/golden_layer3")
+
+add_library(vllm_ascend_test_host STATIC
+  common/cpu_reference.cpp
+  common/golden_layer3.cpp)
+
+target_include_directories(vllm_ascend_test_host
+  PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/common"
+    "${CMAKE_CURRENT_SOURCE_DIR}/reference")
+
+target_compile_definitions(vllm_ascend_test_host
+  PUBLIC VLLM_ASCEND_GOLDEN_LAYER3_DIR="${VLLM_ASCEND_GOLDEN_LAYER3_DIR}")
+
+target_link_libraries(vllm_ascend_test_host
+  PUBLIC
+    ${VLLM_ASCEND_TEST_GTEST_TARGET}
+    Threads::Threads)
+
+target_compile_options(vllm_ascend_test_host PUBLIC -Wall -Wextra)
+if(VLLM_ASCEND_TESTS_WERROR)
+  target_compile_options(vllm_ascend_test_host PUBLIC -Werror)
+endif()
+
+# Analytical fidelity report for the TurboQuant 4-bit KV cache. It links
+# gtest_main rather than common/main.cpp: that main initialises the ACL runtime,
+# which is exactly the dependency this target must not have.
+add_executable(test_turbo_quant_fidelity kernels/ascend/test_turbo_quant_fidelity.cpp)
+target_link_libraries(test_turbo_quant_fidelity
+  PRIVATE vllm_ascend_test_host ${VLLM_ASCEND_TEST_GTEST_MAIN_TARGET})
+
+add_test(NAME test_turbo_quant_fidelity COMMAND test_turbo_quant_fidelity)
+set_tests_properties(test_turbo_quant_fidelity PROPERTIES
+  LABELS "correctness;host"
+  TIMEOUT 300)
+
+if(NOT EXISTS "${VLLM_ASCEND_GOLDEN_LAYER3_DIR}/golden_output.bin")
+  message(WARNING
+    "golden dump not found at ${VLLM_ASCEND_GOLDEN_LAYER3_DIR}.\n"
+    "The golden case of test_turbo_quant_fidelity will skip. Run `git lfs pull`, "
+    "or regenerate with `python scripts/dump_qwen35_layer3.py`.")
+endif()
+
+message(STATUS "vllm-ascend tests: configured test_turbo_quant_fidelity (host-only, no CANN runtime)")
+
+if(NOT VLLM_ASCEND_TESTS_HOST_ONLY)
 
 # -----------------------------------------------------------------------------
 # Shared test infrastructure
@@ -330,18 +420,10 @@ if(ENABLE_ASCEND_950PR)
       "Configure with -DSOC_VERSION=Ascend950PR_9599 to make the intent explicit.")
   endif()
 
-  # The dump the golden test reads. Baked in so an in-tree run needs no
-  # environment at all; QWEN_GOLDEN_LAYER3_DIR overrides it at run time, which
-  # is how a regenerated dump is pointed at. The files are tracked with Git LFS
-  # and the loader recognises an unfetched pointer and skips with `git lfs pull`
-  # rather than failing on a size mismatch - see common/golden_layer3.cpp.
-  set(VLLM_ASCEND_GOLDEN_LAYER3_DIR "${CMAKE_CURRENT_SOURCE_DIR}/data/golden_layer3")
-  if(NOT EXISTS "${VLLM_ASCEND_GOLDEN_LAYER3_DIR}/golden_output.bin")
-    message(WARNING
-      "golden dump not found at ${VLLM_ASCEND_GOLDEN_LAYER3_DIR}.\n"
-      "test_qwen_layer_golden_950pr will skip. Run `git lfs pull`, or regenerate "
-      "with `python scripts/dump_qwen35_layer3.py`.")
-  endif()
+  # VLLM_ASCEND_GOLDEN_LAYER3_DIR is set once above, next to the host-only
+  # targets, because the fidelity report reads the same dump. It is baked in so
+  # an in-tree run needs no environment at all; QWEN_GOLDEN_LAYER3_DIR overrides
+  # it at run time. The warning for a missing dump is emitted there.
 
   # Sources that only the 950PR binaries need. Kept out of
   # vllm_ascend_test_common so the 310P and benchmark binaries do not grow a
@@ -430,6 +512,10 @@ if(VLLM_ASCEND_TESTS_BUILD_BENCHMARKS)
 
   message(STATUS "vllm-ascend tests: configured ${VLLM_ASCEND_KERNEL_BENCHMARKS}")
 endif()
+
+endif()  # NOT VLLM_ASCEND_TESTS_HOST_ONLY
+
+list(APPEND VLLM_ASCEND_TEST_BINARY_FILES "$<TARGET_FILE:test_turbo_quant_fidelity>")
 
 # -----------------------------------------------------------------------------
 # Binary manifest

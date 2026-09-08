@@ -51,6 +51,9 @@
 #include "moe/dequant_situ_quant/dequant_situ_quant_torch_adpt.h"
 #include "moe/situ_mx_quant/situ_mx_quant_torch_adpt.h"
 #include "attention/mla_prolog_v3/mla_prolog_v3_torch_adpt.h"
+#ifdef VLLM_ENABLE_TURBOQUANT
+#include "attention/turboquant/turboquant_torch_adpt.h"
+#endif
 #include <c10/core/Device.h>
 #include <c10/core/Scalar.h>
 #include <c10/util/Exception.h>
@@ -3140,5 +3143,41 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     );
     ops.impl("npu_sparse_attention_score", torch::kPrivateUse1,
              &vllm_ascend::npu_sparse_attention_score);
+}
+#endif
+
+#ifdef VLLM_ENABLE_TURBOQUANT
+// TurboQuant 4-bit KV cache.  Registered as a library fragment so the ops exist
+// on every SOC that can build the kernels (910B and 950PR) rather than being
+// duplicated inside the per-platform TORCH_LIBRARY blocks above.
+TORCH_LIBRARY_FRAGMENT_EXPAND(CONCAT(_C, _ascend), ops)
+{
+    ops.def(
+        "npu_turboquant_reshape_and_cache(Tensor key, "
+        "                                 Tensor value, "
+        "                                 Tensor! key_cache, "
+        "                                 Tensor! value_cache, "
+        "                                 Tensor! key_scale, "
+        "                                 Tensor! value_scale, "
+        "                                 Tensor slot_mapping, "
+        "                                 Tensor pi_signs) -> ()");
+    ops.impl("npu_turboquant_reshape_and_cache", torch::kPrivateUse1,
+             &vllm_ascend::npu_turboquant_reshape_and_cache);
+
+    ops.def(
+        "npu_turboquant_paged_attention(Tensor query, "
+        "                               Tensor key_cache, "
+        "                               Tensor value_cache, "
+        "                               Tensor key_scale, "
+        "                               Tensor value_scale, "
+        "                               Tensor block_tables, "
+        "                               Tensor context_lens, "
+        "                               Tensor pi_signs, "
+        "                               int num_kv_heads, "
+        "                               int num_heads, "
+        "                               float scale_value, "
+        "                               Tensor! out) -> ()");
+    ops.impl("npu_turboquant_paged_attention", torch::kPrivateUse1,
+             &vllm_ascend::npu_turboquant_paged_attention);
 }
 #endif
