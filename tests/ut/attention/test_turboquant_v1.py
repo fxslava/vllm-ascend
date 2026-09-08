@@ -22,6 +22,7 @@ operators are called with pure-runtime signatures, and nothing rewrites a
 projection weight.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -51,6 +52,23 @@ INT8_BIAS = 128.0
 TURBOQUANT_EPS = 1e-20
 
 CPU = torch.device("cpu")
+
+# An arbitrary workspace size for the mocked operator to report. The real number
+# depends on the device's vector core count, which is exactly why the backend
+# asks the operator for it instead of computing it here.
+WORKSPACE_FLOATS = 4096
+
+
+def _ops_mock(workspace_floats: int = WORKSPACE_FLOATS) -> MagicMock:
+    """A stand-in for ``torch.ops._C_ascend``.
+
+    ``npu_turboquant_workspace_size`` has to answer with a real integer: the
+    backend sizes its persistent buffer from it, so a bare MagicMock would fail
+    the ``int()`` rather than exercise the path under test.
+    """
+    ops = MagicMock()
+    ops.npu_turboquant_workspace_size.return_value = workspace_floats
+    return ops
 
 # The first eight channels of the shared LCG sign vector. Hard-coded so this
 # test and csrc/tests/reference/turbo_quant_cpu.h pin the same constant from
@@ -218,6 +236,8 @@ class TestPureRuntimeContract(TestBase):
         impl.value_cache = None
         impl.scale_cache = None
         impl._pi_signs = None
+        impl.decode_workspace = None
+        impl._workspace_floats = {}
         return impl
 
     def test_reshape_and_cache_passes_activations_through_unrotated(self):
@@ -259,20 +279,160 @@ class TestPureRuntimeContract(TestBase):
             seq_lens=torch.ones(num_tokens, dtype=torch.int64),
         )
 
-        ops = MagicMock()
+        ops = _ops_mock()
         with patch.object(torch.ops, "_C_ascend", ops, create=True):
             impl.forward_paged_attention(query, metadata, output)
 
         ops.npu_turboquant_paged_attention.assert_called_once()
         args = ops.npu_turboquant_paged_attention.call_args.args
         # query, k_cache, v_cache, scale_cache, block_tables, context_lens,
-        # pi_signs, codec_tables, num_kv_heads, num_heads, scale, out.
-        self.assertEqual(len(args), 12)
+        # pi_signs, codec_tables, workspace, num_kv_heads, num_heads, scale, out.
+        self.assertEqual(len(args), 13)
         torch.testing.assert_close(args[0], query)
         torch.testing.assert_close(args[7], turboquant_codec_tables(HEAD_SIZE, TURBOQUANT_TILE_ROWS, CPU))
-        self.assertEqual(args[8], impl.num_kv_heads)
-        self.assertEqual(args[9], impl.num_heads)
+        self.assertEqual(args[9], impl.num_kv_heads)
+        self.assertEqual(args[10], impl.num_heads)
         self.assertFalse(any(isinstance(a, bool) for a in args))
+
+    def test_paged_attention_is_handed_a_preallocated_workspace(self):
+        """The operator never allocates its own reduction scratch."""
+        impl = self._make_impl()
+        num_tokens = 2
+        impl.key_cache = torch.zeros(1, 128, 2, HEAD_SIZE // TURBOQUANT_PACK_FACTOR, dtype=torch.int8)
+        impl.value_cache = impl.key_cache
+        impl.scale_cache = torch.zeros(1, 128, turboquant_scale_slot(2))
+        query = torch.randn(num_tokens, impl.num_heads, HEAD_SIZE)
+        output = torch.zeros(num_tokens, impl.num_heads, HEAD_SIZE)
+        metadata = MagicMock(
+            block_tables=torch.zeros(num_tokens, 1, dtype=torch.int64),
+            seq_lens=torch.ones(num_tokens, dtype=torch.int64),
+        )
+
+        ops = _ops_mock(workspace_floats=WORKSPACE_FLOATS)
+        with patch.object(torch.ops, "_C_ascend", ops, create=True):
+            impl.forward_paged_attention(query, metadata, output)
+
+        workspace = ops.npu_turboquant_paged_attention.call_args.args[8]
+        self.assertIs(workspace, impl.decode_workspace)
+        self.assertEqual(workspace.dtype, torch.float32)
+        self.assertEqual(workspace.numel(), WORKSPACE_FLOATS)
+        # Sized from the operator's own arithmetic, not a copy of it here.
+        ops.npu_turboquant_workspace_size.assert_called_once_with(
+            num_tokens, impl.num_heads, impl.head_size, 1
+        )
+
+
+class TestDecodeWorkspace(TestBase):
+    """The persistent reduction buffer.
+
+    Decode must not allocate: an allocation is host latency on the critical path
+    and, under graph capture, an address the replay has no reason to still own.
+    The buffer is therefore grown to a high-water mark and then reused.
+    """
+
+    def _make_impl(self) -> AscendTurboQuantAttentionBackendImpl:
+        impl = AscendTurboQuantAttentionBackendImpl.__new__(AscendTurboQuantAttentionBackendImpl)
+        impl.head_size = HEAD_SIZE
+        impl.num_heads = 8
+        impl.decode_workspace = None
+        impl._workspace_floats = {}
+        return impl
+
+    def test_second_decode_of_the_same_shape_allocates_nothing(self):
+        impl = self._make_impl()
+        ops = _ops_mock()
+        with patch.object(torch.ops, "_C_ascend", ops, create=True):
+            first = impl._decode_workspace(2, 1, CPU)
+            second = impl._decode_workspace(2, 1, CPU)
+
+        self.assertIs(first, second)
+        # The size is memoised per shape, so the steady-state step costs a dict
+        # lookup rather than an operator dispatch.
+        ops.npu_turboquant_workspace_size.assert_called_once()
+
+    def test_a_narrower_decode_reuses_the_high_water_buffer(self):
+        impl = self._make_impl()
+        ops = _ops_mock()
+        ops.npu_turboquant_workspace_size.side_effect = [WORKSPACE_FLOATS, WORKSPACE_FLOATS // 4]
+        with patch.object(torch.ops, "_C_ascend", ops, create=True):
+            wide = impl._decode_workspace(8, 4, CPU)
+            narrow = impl._decode_workspace(2, 1, CPU)
+
+        self.assertIs(wide, narrow)
+        self.assertEqual(narrow.numel(), WORKSPACE_FLOATS)
+
+    def test_a_wider_decode_grows_the_buffer(self):
+        impl = self._make_impl()
+        ops = _ops_mock()
+        ops.npu_turboquant_workspace_size.side_effect = [WORKSPACE_FLOATS, WORKSPACE_FLOATS * 2]
+        with patch.object(torch.ops, "_C_ascend", ops, create=True):
+            narrow = impl._decode_workspace(2, 1, CPU)
+            wide = impl._decode_workspace(8, 4, CPU)
+
+        self.assertIsNot(narrow, wide)
+        self.assertEqual(wide.numel(), WORKSPACE_FLOATS * 2)
+        self.assertIs(wide, impl.decode_workspace)
+
+    def test_a_smaller_batch_that_needs_more_still_grows_the_buffer(self):
+        """The buffer tracks the requirement, not the batch size.
+
+        A decode too small to fill the cores is split further along the
+        sequence, so num_splits rises as num_tokens falls and the scratch a
+        1-token step needs can exceed what a 3-token step needs. Sizing off
+        "the widest batch seen" would under-allocate exactly there.
+        """
+        impl = self._make_impl()
+        ops = _ops_mock()
+        ops.npu_turboquant_workspace_size.side_effect = [WORKSPACE_FLOATS, WORKSPACE_FLOATS * 2]
+        with patch.object(torch.ops, "_C_ascend", ops, create=True):
+            big_batch = impl._decode_workspace(3, 8, CPU)
+            small_batch = impl._decode_workspace(1, 8, CPU)
+
+        self.assertIsNot(big_batch, small_batch)
+        self.assertEqual(small_batch.numel(), WORKSPACE_FLOATS * 2)
+
+    def test_the_size_memo_is_bounded(self):
+        """An uncaptured run drifts through shapes; the memo must not grow forever."""
+        impl = self._make_impl()
+        impl._workspace_floats = {(0, i): 1 for i in range(tq_module._WORKSPACE_MEMO_LIMIT)}
+        ops = _ops_mock()
+        with patch.object(torch.ops, "_C_ascend", ops, create=True):
+            impl._decode_workspace(2, 1, CPU)
+
+        self.assertEqual(len(impl._workspace_floats), 1)
+        self.assertEqual(impl._workspace_floats[(2, 1)], WORKSPACE_FLOATS)
+
+    def test_growth_during_a_capture_is_refused(self):
+        """A buffer swapped mid-capture would be replayed as a dangling pointer."""
+        impl = self._make_impl()
+        ops = _ops_mock()
+        ops.npu_turboquant_workspace_size.side_effect = [WORKSPACE_FLOATS, WORKSPACE_FLOATS * 2]
+        with patch.object(torch.ops, "_C_ascend", ops, create=True):
+            impl._decode_workspace(2, 1, CPU)
+            with patch.object(tq_module, "_EXTRA_CTX", SimpleNamespace(capturing=True)):
+                with self.assertRaisesRegex(RuntimeError, "during a graph capture"):
+                    impl._decode_workspace(8, 4, CPU)
+
+    def test_a_capture_that_needs_no_growth_is_allowed(self):
+        impl = self._make_impl()
+        ops = _ops_mock()
+        with patch.object(torch.ops, "_C_ascend", ops, create=True):
+            warmed = impl._decode_workspace(2, 1, CPU)
+            with patch.object(tq_module, "_EXTRA_CTX", SimpleNamespace(capturing=True)):
+                captured = impl._decode_workspace(2, 1, CPU)
+
+        self.assertIs(warmed, captured)
+
+    def test_a_missing_forward_context_does_not_read_as_a_capture(self):
+        """Outside a forward context there is no capture to protect against."""
+
+        class _NoContext:
+            @property
+            def capturing(self):
+                raise AssertionError("no forward context")
+
+        with patch.object(tq_module, "_EXTRA_CTX", _NoContext()):
+            self.assertFalse(tq_module._is_capturing())
 
 
 class TestNumericalEdgeCases(TestBase):
@@ -593,6 +753,22 @@ class TestBackendContract(TestBase):
         tq_module.activate_turboquant_backend(layer)
         self.assertIs(layer.impl.__class__, AscendTurboQuantAttentionBackendImpl)
         self.assertEqual(layer.kv_cache_torch_dtype, torch.int8)
+        # A swapped-in impl starts with no scratch of its own: whatever the
+        # previous class left behind was sized for a different cache layout.
+        self.assertIsNone(layer.impl.decode_workspace)
+        self.assertEqual(layer.impl._workspace_floats, {})
+
+    def test_loading_primes_the_device_registry(self):
+        """The driver query happens at load time, never on a decode step."""
+        impl = AscendTurboQuantAttentionBackendImpl.__new__(AscendTurboQuantAttentionBackendImpl)
+        ops = _ops_mock()
+        with (
+            patch.object(torch.ops, "_C_ascend", ops, create=True),
+            patch.object(tq_module.AscendAttentionBackendImpl, "process_weights_after_loading"),
+        ):
+            impl.process_weights_after_loading(torch.float16)
+
+        ops.npu_turboquant_vector_core_num.assert_called_once_with()
 
     def test_scale_cache_is_indexed_by_token_and_burst_aligned(self):
         # Indexing by token rather than by head is what lets the kernel scatter a
