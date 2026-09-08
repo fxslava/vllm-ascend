@@ -54,7 +54,9 @@ csrc/tests/
 │   ├── random_data.hpp                  deterministic, platform-independent test data
 │   ├── tensor_compare.hpp               allclose with a diagnostic report
 │   ├── test_benchmark_harness.cpp       device-free tests over the benchmark report arithmetic
-│   └── test_harness.hpp / .cpp          AscendTestEnvironment: aclInit, device, context, stream
+│   ├── test_harness.hpp / .cpp          AscendTestEnvironment: aclInit, device, context, stream
+│   └── turboquant_launch.hpp / .cpp     torch-free binding for the TurboQuant kernels: the two
+│                                        _impl prototypes, the codec table image, the grid maths
 ├── data/
 │   └── golden_layer3/*.bin              Git LFS: weights, taps and output of one Qwen3.5 layer
 └── kernels/
@@ -68,7 +70,11 @@ csrc/tests/
         ├── test_rmsnorm_950pr.cpp
         ├── test_rotary_embedding_950pr.cpp
         ├── test_activation_swiglu_950pr.cpp
-        └── test_qwen_layer_golden_950pr.cpp
+        ├── test_qwen_layer_golden_950pr.cpp
+        ├── test_turbo_quant_fidelity.cpp        host-only, no CANN runtime at all
+        ├── test_turboquant_kernels_950pr.cpp    the TurboQuant kernels vs the CPU reference
+        ├── test_turboquant_npu_simulator.cpp    one decode pass, quantised vs exact
+        └── turboquant/CMakeLists.txt            ascendc_library() for the TurboQuant kernels
 ```
 
 Each test file has two layers. Tests named `*Reference` and `*Shapes` are
@@ -428,10 +434,66 @@ binaries per part, and each set skips on the other part's hardware.
 | `test_rotary_embedding_950pr` | 3, 4 — **partial** RoPE | `aclnnInplacePartialRotaryMul`, else packed `aclnnApplyRotaryPosEmbV2` |
 | `test_activation_swiglu_950pr` | 8 | `aclnnSwiGlu` |
 | `test_qwen_layer_golden_950pr` | 1–9 end to end | all of the above plus `aclnnScatterPaKvCache`, `aclnnFusedInferAttentionScoreV2`, `aclnnSigmoid`, `aclnnMul`, `aclnnInplaceAdd` |
+| `test_turboquant_kernels_950pr` | 5 — decode, 4-bit KV cache | the TurboQuant kernels out of `csrc/attention/turboquant`, not an aclnn operator |
+| `test_turboquant_npu_simulator` | 5 — one decode pass end to end | ditto, with `aclnnFusedInferAttentionScoreV2` as an optional unquantised control |
 
 `common/aclnn_ops_950pr.hpp` carries the operator audit: which stage runs on a
 stock CANN operator, which on a kernel built out of `csrc/`, and the CANN header
 each prototype was verified against.
+
+### The TurboQuant leg, and running it on the simulator
+
+The last two binaries in that table are unlike everything else in this suite:
+they drive kernels that are **compiled here**, from
+`csrc/attention/turboquant/turboquant_kernels.cpp` - the same source the wheel
+builds, not a copy - rather than calling an operator CANN already shipped. That
+makes them the only part of the project that needs the Ascend C kernel
+toolchain (`ccec` / `bisheng` and `tools/tikcpp/ascendc_kernel_cmake`), which is
+why they sit behind their own option:
+
+```bash
+-DVLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS=OFF   # default ON
+```
+
+Because the kernels are built rather than loaded, they can also be *run* with no
+950PR attached, on the CANN camodel:
+
+```bash
+cmake -S csrc/tests -B build/csrc-tests-950pr-sim -G "Unix Makefiles" \
+      -DENABLE_ASCEND_950PR=ON -DSOC_VERSION=Ascend950PR_9599 -DRUN_MODE=sim
+cmake --build build/csrc-tests-950pr-sim -j
+
+export LD_LIBRARY_PATH=$ASCEND_HOME_PATH/tools/simulator/Ascend950PR_9599/lib:$LD_LIBRARY_PATH
+./build/csrc-tests-950pr-sim/test_turboquant_npu_simulator
+```
+
+`RUN_MODE=sim` links `libruntime_camodel.so` in place of `libruntime.so`; the
+`LD_LIBRARY_PATH` above is what makes the loader pick it up at run time, and
+`aclrtGetSocName()` then reports a real `Ascend950PR_*` bin, so the tests run
+rather than skip. Three things are worth knowing before you try it:
+
+- **It is cycle-level slow.** One decode pass is two to four *minutes*. That is
+  the whole reason `test_turboquant_npu_simulator` runs a single decode step at
+  the smallest shape that still exercises the tiling, the paging and the GQA
+  mapping, instead of a sweep. ctest gets a 5400 s timeout for these two in
+  `sim` mode.
+- **Use the Makefiles generator, or expect a bare Python `KeyError`.**
+  `ascendc_library()` configures four nested ExternalProjects with the outer
+  project's generator, and with Ninja the object path CANN 9.1.0's
+  `extract_host_stub.py` looks up in `compile_commands.json` differs from the
+  one it is handed by a `/./`. The sub-builds are pinned to `Unix Makefiles`
+  for that reason - see `kernels/ascend/turboquant/CMakeLists.txt`.
+- **`aclnnFusedInferAttentionScore` V1 to V4 do not exist on an Ascend950.** The
+  simulator test uses it as an unquantised fp16 control and reports the refusal
+  rather than failing; the exact fp32 host path is what its assertions compare
+  against. `common/aclnn_ops_950pr.hpp` records the measurement.
+
+The same binaries run unchanged on silicon: configure without `RUN_MODE=sim`
+(or with `-DRUN_MODE=npu`) and they link the real runtime.
+
+`test_turbo_quant_fidelity` needs none of this. It is host-only, links neither
+`libascendcl.so` nor a kernel, and reports the codec's fidelity on the Qwen3.5
+layer-3 dump from the CPU reference alone - see `-DVLLM_ASCEND_TESTS_HOST_ONLY=ON`.
 
 ### Partial rotary is the interesting stage
 
@@ -497,12 +559,16 @@ Covered: numerical parity against fp32 CPU references, layout and alignment
 contracts, GQA head mapping, both rotary layouts, block-table paging across
 multiple blocks, context-length bounds, and per-shape latency and throughput.
 
-Not covered: the quantised (W8A8 / int8 KV cache) paths, chunked prefill and the
-splitfuse attention variants, multi-device or graph-capture execution, and
-performance regression *thresholds* - the benchmarks report numbers and check
-that the operator still produces its output, but nothing fails on a slowdown.
-The five kernels here are the fp16 decode path only, which is what the brief
-scoped. [COVERAGE.md](COVERAGE.md) has the full gap list.
+Also covered, since the TurboQuant leg landed: the 4-bit rotated KV cache - its
+write path and its split/combine decode, byte for byte against the CPU
+reference, plus the fidelity of the scheme itself against exact fp32 attention.
+
+Not covered: the W8A8 and int8 KV cache paths, chunked prefill and the splitfuse
+attention variants, multi-device or graph-capture execution, and performance
+regression *thresholds* - the benchmarks report numbers and check that the
+operator still produces its output, but nothing fails on a slowdown. Everything
+outside the TurboQuant binaries is the fp16 decode path only, which is what the
+brief scoped. [COVERAGE.md](COVERAGE.md) has the full gap list.
 
 ## Adding a kernel
 

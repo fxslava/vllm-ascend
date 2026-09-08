@@ -153,6 +153,27 @@ inline constexpr int64_t kRotaryModeInterleaveHalf = 3;
 // key and value arrive as aclTensorList with one entry, which is how the
 // single-cache case is expressed; the list exists for the multi-layer form.
 //
+// MEASURED, 2026-09-08, CANN 9.1.0 on an Ascend950PR camodel: this operator
+// does not run on this part at all. The planning call returns 361001 with
+//
+//   AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore
+//   versions V1 to V4 are no longer supported on Ascend950.
+//
+// so the whole V1..V4 family is withdrawn on Ascend950, not just this argument
+// list. That settles - negatively - the open question this file used to record
+// about whether the DecodeOnly argument order was right: it cannot be checked
+// against the operator, because there is no operator to check it against. The
+// paged decode on a 950PR has to come from somewhere else, and the two
+// candidates in this tree are the TurboQuant kernels under
+// csrc/attention/turboquant (which is what
+// kernels/ascend/test_turboquant_npu_simulator.cpp drives) and whichever V5+
+// interface CANN offers in place of these.
+//
+// Tests that call it therefore have to tolerate its absence rather than
+// requiring it: test_turboquant_npu_simulator.cpp uses it as an optional
+// unquantised control and reports the failure instead of failing, and
+// test_qwen_layer_golden_950pr.cpp will skip its stage 5 on this part.
+//
 // VERIFIED against CANN 9.1.0
 // $ASCEND_HOME_PATH/include/aclnnop/aclnn_fused_infer_attention_score_v2.h
 //   aclnnStatus aclnnFusedInferAttentionScoreV2GetWorkspaceSize(

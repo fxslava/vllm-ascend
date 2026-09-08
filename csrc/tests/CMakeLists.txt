@@ -78,6 +78,33 @@ option(VLLM_ASCEND_TESTS_HOST_ONLY "Build only the targets that need no CANN too
 # this file and every source it adds includes acl.h.
 option(ENABLE_ASCEND_950PR "Build tests for Ascend 950PR target" OFF)
 
+# The TurboQuant 4-bit KV cache: the Ascend C kernels themselves, plus the two
+# tests that drive them. Unlike everything else in this file, this compiles
+# device code - it needs the Ascend C kernel toolchain (ccec / bisheng and
+# tools/tikcpp/ascendc_kernel_cmake), not just the CANN headers and
+# libascendcl.so. Turn it off to build the rest of the 950PR leg on a machine
+# that has the toolkit but not the kernel compiler.
+#
+# Sub-option of ENABLE_ASCEND_950PR: nothing below is reachable without it.
+option(VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS
+       "Compile the TurboQuant Ascend C kernels and build the tests that drive them" ON)
+
+# How the Ascend C kernels are built and where they run.
+#
+#   npu   real silicon, linked against libruntime.so                (default)
+#   sim   the CANN camodel, linked against libruntime_camodel.so out of
+#         $ASCEND_HOME_PATH/tools/simulator/${SOC_VERSION}/lib
+#
+# The simulator is the only way to execute an arch35 kernel without a 950PR
+# attached, and it is slow enough - cycle-level - that the tests written for it
+# run a single decode pass rather than a sweep. See
+# kernels/ascend/test_turboquant_npu_simulator.cpp.
+#
+# The name and the values are CANN's, not this project's: ascendc_library()
+# reads ${RUN_MODE} directly.
+set(RUN_MODE "npu" CACHE STRING "Ascend C run mode: npu (silicon) or sim (CANN camodel)")
+set_property(CACHE RUN_MODE PROPERTY STRINGS npu sim)
+
 # -----------------------------------------------------------------------------
 # CANN toolkit
 # -----------------------------------------------------------------------------
@@ -365,7 +392,19 @@ endfunction()
 # the x86 build host cannot run - `ctest -N` there aborts on the first discovery
 # attempt and lists nothing at all, benchmarks included. Running ctest on the
 # 310P itself, where the binaries are native, is unaffected.
+#
+# The optional second argument is the per-test timeout in seconds; it defaults to
+# 900, which is generous for a kernel launch on silicon and nowhere near enough
+# for one under the camodel simulator, where a single decode pass is minutes.
+# Both registration paths below need it, which is why it is a parameter rather
+# than a set_tests_properties() call afterwards: gtest_discover_tests names its
+# tests at ctest time, so there is nothing to set properties on here.
 function(vllm_ascend_register_correctness_test target_name)
+  if(ARGC GREATER 1)
+    set(test_timeout ${ARGV1})
+  else()
+    set(test_timeout 900)
+  endif()
   if(COMMAND gtest_discover_tests AND NOT CMAKE_VERSION VERSION_LESS "3.18" AND NOT CMAKE_CROSSCOMPILING)
     # PRE_TEST defers enumeration to `ctest` time. The default POST_BUILD mode
     # runs the binary during the build, which fails on a build host that has the
@@ -376,13 +415,13 @@ function(vllm_ascend_register_correctness_test target_name)
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${VLLM_ASCEND_TEST_LIBRARY_PATH};ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
         LABELS "correctness"
-        TIMEOUT 900)
+        TIMEOUT ${test_timeout})
   else()
     add_test(NAME ${target_name} COMMAND ${target_name})
     set_tests_properties(${target_name} PROPERTIES
       ENVIRONMENT "LD_LIBRARY_PATH=${VLLM_ASCEND_TEST_LIBRARY_PATH};ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
       LABELS "correctness"
-      TIMEOUT 900)
+      TIMEOUT ${test_timeout})
   endif()
 endfunction()
 
@@ -468,6 +507,98 @@ if(ENABLE_ASCEND_950PR)
   endforeach()
 
   message(STATUS "vllm-ascend tests: configured ${VLLM_ASCEND_950PR_TESTS}")
+
+  # ---------------------------------------------------------------------------
+  # TurboQuant 4-bit KV cache
+  # ---------------------------------------------------------------------------
+  #
+  # The only part of this suite that compiles device code. Everything else calls
+  # operators that CANN already built; these two tests drive kernels built here,
+  # from csrc/attention/turboquant/turboquant_kernels.cpp - the same source the
+  # wheel compiles, not a copy.
+
+  if(VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS)
+    # The kernels carry an AICore config for arch32 (910B) and arch35 (950PR)
+    # and nothing else; the repository root CMakeLists.txt gates them the same
+    # way. Building them for a 310P would fail inside ccec rather than here, so
+    # the gate is explicit and says which parts are supported.
+    if(SOC_VERSION MATCHES "^Ascend950|^Ascend910B|^Ascend910_9")
+      set(VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE
+          "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/turboquant_kernels.cpp")
+
+      if(NOT EXISTS "${VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE}")
+        message(FATAL_ERROR "TurboQuant kernel source not found at ${VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE}")
+      endif()
+
+      set(VLLM_ASCEND_SIMULATOR_LIB_DIR "${ASCEND_HOME_PATH}/tools/simulator/${SOC_VERSION}/lib")
+      if(RUN_MODE STREQUAL "sim")
+        if(NOT EXISTS "${VLLM_ASCEND_SIMULATOR_LIB_DIR}/libruntime_camodel.so")
+          message(FATAL_ERROR
+            "RUN_MODE=sim needs the camodel for ${SOC_VERSION}, and "
+            "${VLLM_ASCEND_SIMULATOR_LIB_DIR}/libruntime_camodel.so does not exist.\n"
+            "Check SOC_VERSION against the directory names under ${ASCEND_HOME_PATH}/tools/simulator, "
+            "or configure with -DRUN_MODE=npu.")
+        endif()
+        message(STATUS "vllm-ascend tests: TurboQuant simulator libs at ${VLLM_ASCEND_SIMULATOR_LIB_DIR}")
+      endif()
+
+      # Defines the vllm_ascend_turboquant target. Kept in a subdirectory so
+      # ascendc.cmake's side effects stay out of this scope; see the note there.
+      add_subdirectory(kernels/ascend/turboquant)
+
+      # The Torch-free binding: the two _impl prototypes, the codec table
+      # builder and the grid arithmetic that turboquant_torch_adpt.h would have
+      # done with ATen. Carries the reference/ include directory because the Pi
+      # diagonal comes from the CPU reference rather than from a second
+      # generator.
+      add_library(vllm_ascend_test_turboquant STATIC common/turboquant_launch.cpp)
+
+      target_include_directories(vllm_ascend_test_turboquant
+        PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/reference")
+
+      target_link_libraries(vllm_ascend_test_turboquant
+        PUBLIC vllm_ascend_test_common_950pr vllm_ascend_turboquant)
+
+      set(VLLM_ASCEND_TURBOQUANT_TESTS
+        test_turboquant_kernels_950pr
+        test_turboquant_npu_simulator)
+
+      foreach(test_name ${VLLM_ASCEND_TURBOQUANT_TESTS})
+        vllm_ascend_add_device_executable(${test_name} "kernels/ascend/${test_name}.cpp" common/main_950pr.cpp)
+        target_link_libraries(${test_name} PRIVATE vllm_ascend_test_turboquant)
+
+        # The camodel replaces libruntime.so, so its directory has to be ahead of
+        # the toolkit's on the loader path at run time as well as at link time.
+        if(RUN_MODE STREQUAL "sim")
+          set_target_properties(${test_name} PROPERTIES
+            BUILD_RPATH "${VLLM_ASCEND_SIMULATOR_LIB_DIR};${ASCEND_HOME_PATH}/lib64"
+            INSTALL_RPATH "$ORIGIN:${VLLM_ASCEND_SIMULATOR_LIB_DIR}:${ASCEND_HOME_PATH}/lib64")
+        endif()
+
+        vllm_ascend_register_correctness_test(${test_name})
+      endforeach()
+
+      if(RUN_MODE STREQUAL "sim")
+        # A camodel decode pass is minutes, not milliseconds, and the default
+        # 900 s that vllm_ascend_register_correctness_test sets is optimistic
+        # for a cold simulator on a loaded build host.
+        foreach(test_name ${VLLM_ASCEND_TURBOQUANT_TESTS})
+          if(TEST ${test_name})
+            set_tests_properties(${test_name} PROPERTIES
+              TIMEOUT 5400
+              ENVIRONMENT
+                "LD_LIBRARY_PATH=${VLLM_ASCEND_SIMULATOR_LIB_DIR}:${VLLM_ASCEND_TEST_LIBRARY_PATH};ASCEND_HOME_PATH=${ASCEND_HOME_PATH}")
+          endif()
+        endforeach()
+      endif()
+
+      message(STATUS "vllm-ascend tests: configured ${VLLM_ASCEND_TURBOQUANT_TESTS}")
+    else()
+      message(STATUS
+        "vllm-ascend tests: SOC_VERSION '${SOC_VERSION}' has no TurboQuant AICore config "
+        "(arch32 and arch35 only); skipping the TurboQuant kernels and their tests")
+    endif()
+  endif()
 endif()
 
 # -----------------------------------------------------------------------------

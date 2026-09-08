@@ -49,9 +49,11 @@ namespace turboquant_adpt {
 // Bounds the flash-decoding workspace; beyond this the reduce stage costs more
 // than the extra parallelism buys.
 constexpr int64_t kMaxSequenceSplits = 8;
-// fp32 words appended to every partial accumulator: the running max, the
-// running sum, and padding out to a 32B block.
-constexpr int64_t kPartialTail = 8;
+// fp32 words appended to every partial accumulator: one 32B block holding the
+// running max and a second holding the running sum. They are separate blocks
+// because a vector operand's base must be 32-byte aligned, so the two values
+// cannot share one; see kPartialTail in turboquant_kernels.cpp.
+constexpr int64_t kPartialTail = 16;
 // fp32 lanes in one 32B burst.
 constexpr int64_t kFp32PerBlock = 8;
 // Rows of a paged block the decode kernel processes per tile; must match

@@ -67,6 +67,7 @@ namespace {
 using vllm_ascend::turboquant::kBrcbDstLanes;
 using vllm_ascend::turboquant::kFp32PerBlock;
 using vllm_ascend::turboquant::kFp32PerRepeat;
+using vllm_ascend::turboquant::kGatherSrcBase;
 using vllm_ascend::turboquant::TurboQuantCodec4;
 
 // Rows of the paged KV block processed per inner iteration.  Sized so that the
@@ -76,9 +77,24 @@ using vllm_ascend::turboquant::TurboQuantCodec4;
 constexpr uint32_t kTileRows = 16;
 // Softmax running maximum before any block has been seen.
 constexpr float kNegInf = -1.0e30f;
-// fp32 words of workspace per (token, head, split) partial: acc plus one padded
-// block holding the running max and the running sum.
-constexpr uint32_t kPartialTail = kFp32PerBlock;
+// fp32 words of workspace per (token, head, split) partial: the accumulator,
+// then one 32B block holding the running max and a second holding the running
+// sum.
+//
+// Two blocks, not one. The max and the sum are single values and would fit in
+// lanes 0 and 1 of a single block, but every vector instruction's operand base
+// must be 32-byte aligned, and a LocalTensor view at lane 1 is not - the part
+// raises vec_err_instr_misalign and the online softmax then reduces whatever
+// the misaligned load returned. The second block costs 32 bytes per partial and
+// makes every operand aligned by construction.
+//
+// Mirrored by turboquant_adpt::kPartialTail in turboquant_torch_adpt.h and by
+// turboquant_host::kPartialTail in csrc/tests/common/turboquant_launch.hpp,
+// both of which size the workspace the host allocates.
+constexpr uint32_t kPartialTail = 2u * kFp32PerBlock;
+// Lane offsets within that tail.
+constexpr uint32_t kPartialMaxLane = 0;
+constexpr uint32_t kPartialSumLane = kFp32PerBlock;
 // Depth of the ring that carries a token's cache address from the copy-in stage
 // to the copy-out stage.  Four, not two: at steady state the prefetch for i + 1
 // and the flush for i - 1 are in flight together, and those two indices share a
@@ -280,7 +296,7 @@ private:
         AscendC::LocalTensor<uint32_t> gatherIdx = scaleIdxBuf_.Get<int32_t>().ReinterpretCast<uint32_t>();
         AscendC::Duplicate(scales, 0.0f, scaleSlot_);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Gather(scales, steps, gatherIdx, vllm_ascend::turboquant::UbByteAddr(steps), 2 * numKvHeads_);
+        AscendC::Gather(scales, steps, gatherIdx, kGatherSrcBase, 2 * numKvHeads_);
         AscendC::PipeBarrier<PIPE_V>();
 
         inQueue_.FreeTensor(in);
@@ -395,7 +411,9 @@ public:
         pipe_->InitBuffer(accBuf_, 3 * headSize_ * sizeof(float));
         pipe_->InitBuffer(rowBuf_, 6 * kTileRows * sizeof(float));
         pipe_->InitBuffer(brcbBuf_, 2 * kBrcbDstLanes * sizeof(float) + kTileRows * kFp32PerBlock * sizeof(float));
-        pipe_->InitBuffer(stateBuf_, 4 * kFp32PerBlock * sizeof(float));
+        // Five 32B blocks, one scalar each: every vector operand below is a
+        // whole block, never a lane inside one.
+        pipe_->InitBuffer(stateBuf_, 5 * kFp32PerBlock * sizeof(float));
         pipe_->InitBuffer(signBuf_, headSize_ * sizeof(float));
         pipe_->InitBuffer(scaleIdxBuf_, 2 * kTileRows * sizeof(int32_t));
 
@@ -430,19 +448,21 @@ private:
 
     __aicore__ inline void ComputeSplit(uint32_t token, uint32_t head, uint32_t split)
     {
+        // The first two blocks are laid out exactly as the workspace tail, so
+        // the partial goes out with one DataCopy; the other three are scratch.
         AscendC::LocalTensor<float> state = stateBuf_.Get<float>();
-        AscendC::LocalTensor<float> runMax = state;
-        AscendC::LocalTensor<float> runSum = state[1];
-        AscendC::LocalTensor<float> newMax = state[kFp32PerBlock];
-        AscendC::LocalTensor<float> alpha = state[2 * kFp32PerBlock];
-        AscendC::LocalTensor<float> tileMax = state[3 * kFp32PerBlock];
+        AscendC::LocalTensor<float> runMax = state[kPartialMaxLane];
+        AscendC::LocalTensor<float> runSum = state[kPartialSumLane];
+        AscendC::LocalTensor<float> newMax = state[2 * kFp32PerBlock];
+        AscendC::LocalTensor<float> alpha = state[3 * kFp32PerBlock];
+        AscendC::LocalTensor<float> tileMax = state[4 * kFp32PerBlock];
 
         AscendC::LocalTensor<float> acc = accBuf_.Get<float>();
         AscendC::LocalTensor<float> qRot = acc[headSize_];
         AscendC::LocalTensor<float> tmp = acc[2 * headSize_];
 
         AscendC::Duplicate(acc, 0.0f, headSize_);
-        AscendC::Duplicate(state, 0.0f, 4 * kFp32PerBlock);
+        AscendC::Duplicate(state, 0.0f, 5 * kFp32PerBlock);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Duplicate(runMax, kNegInf, 1);
         AscendC::PipeBarrier<PIPE_V>();
@@ -494,7 +514,7 @@ private:
         const uint64_t offset = PartialOffset(token, head, split);
         AscendC::PipeBarrier<PIPE_ALL>();
         AscendC::DataCopy(workspaceGm_[offset], acc, headSize_);
-        AscendC::DataCopy(workspaceGm_[offset + headSize_], state, kFp32PerBlock);
+        AscendC::DataCopy(workspaceGm_[offset + headSize_], state, kPartialTail);
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 
@@ -591,7 +611,7 @@ private:
 
         // Pick this task's K and V scale lanes out of the packed slots.
         AscendC::LocalTensor<uint32_t> idx = scaleIdxBuf_.Get<int32_t>().ReinterpretCast<uint32_t>();
-        const uint32_t scaleBase = vllm_ascend::turboquant::UbByteAddr(scaleTile);
+        constexpr uint32_t scaleBase = kGatherSrcBase;
         AscendC::Gather(kScale, scaleTile, idx, scaleBase, kTileRows);
         AscendC::Gather(vScale, scaleTile, idx[kTileRows], scaleBase, kTileRows);
         AscendC::PipeBarrier<PIPE_V>();
@@ -755,8 +775,8 @@ public:
 
         pipe_->InitBuffer(outQueue_, 1, headSize_ * sizeof(scalar_t));
         pipe_->InitBuffer(accBuf_, 3 * headSize_ * sizeof(float));
-        pipe_->InitBuffer(stateBuf_, 4 * kFp32PerBlock * sizeof(float));
-        pipe_->InitBuffer(partialBuf_, kFp32PerBlock * sizeof(float));
+        pipe_->InitBuffer(stateBuf_, 5 * kFp32PerBlock * sizeof(float));
+        pipe_->InitBuffer(partialBuf_, kPartialTail * sizeof(float));
         pipe_->InitBuffer(brcbBuf_, 4 * kBrcbDstLanes * sizeof(float));
         pipe_->InitBuffer(signBuf_, headSize_ * sizeof(float));
 
@@ -796,11 +816,11 @@ private:
         AscendC::LocalTensor<float> tmp = acc[2 * headSize_];
 
         AscendC::LocalTensor<float> state = stateBuf_.Get<float>();
-        AscendC::LocalTensor<float> runMax = state;
-        AscendC::LocalTensor<float> runSum = state[1];
-        AscendC::LocalTensor<float> newMax = state[kFp32PerBlock];
-        AscendC::LocalTensor<float> alpha = state[2 * kFp32PerBlock];
-        AscendC::LocalTensor<float> beta = state[3 * kFp32PerBlock];
+        AscendC::LocalTensor<float> runMax = state[kPartialMaxLane];
+        AscendC::LocalTensor<float> runSum = state[kPartialSumLane];
+        AscendC::LocalTensor<float> newMax = state[2 * kFp32PerBlock];
+        AscendC::LocalTensor<float> alpha = state[3 * kFp32PerBlock];
+        AscendC::LocalTensor<float> beta = state[4 * kFp32PerBlock];
 
         AscendC::LocalTensor<float> brcb = brcbBuf_.Get<float>();
         AscendC::LocalTensor<float> bAlpha = brcb;
@@ -809,32 +829,49 @@ private:
         AscendC::LocalTensor<float> invSum = brcb[3 * kBrcbDstLanes];
 
         AscendC::LocalTensor<float> partState = partialBuf_.Get<float>();
+        AscendC::LocalTensor<float> partMax = partState[kPartialMaxLane];
+        AscendC::LocalTensor<float> partSum = partState[kPartialSumLane];
 
         AscendC::Duplicate(acc, 0.0f, headSize_);
-        AscendC::Duplicate(state, 0.0f, 4 * kFp32PerBlock);
+        AscendC::Duplicate(state, 0.0f, 5 * kFp32PerBlock);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Duplicate(runMax, kNegInf, 1);
         AscendC::PipeBarrier<PIPE_V>();
 
         for (uint32_t split = 0; split < numSplits_; ++split) {
             const uint64_t offset = PartialOffset(token, head, split);
+            // Write-after-read, and it has to be an all-pipe barrier.
+            //
+            // partAcc and partState are plain TBuf views rather than queue
+            // tensors, so nothing else orders this iteration's MTE2 fill of them
+            // against the previous iteration's vector reads. The PipeBarrier<V>
+            // pairs inside the loop body order the vector pipe against itself
+            // and say nothing about MTE2, so without this the copy for split
+            // i + 1 can land while the reduction for split i is still reading -
+            // and only ever on a part whose DMA runs far enough ahead, which is
+            // why this reduced correctly on arch32 and produced a plausible but
+            // wrong answer on arch35.
+            //
+            // Only reachable with numSplits > 1; a single-split decode has one
+            // iteration and no previous reader.
+            AscendC::PipeBarrier<PIPE_ALL>();
             AscendC::DataCopy(partAcc, workspaceGm_[offset], headSize_);
-            AscendC::DataCopy(partState, workspaceGm_[offset + headSize_], kFp32PerBlock);
+            AscendC::DataCopy(partState, workspaceGm_[offset + headSize_], kPartialTail);
             AscendC::PipeBarrier<PIPE_ALL>();
 
-            AscendC::Max(newMax, runMax, partState, 1);
+            AscendC::Max(newMax, runMax, partMax, 1);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Sub(alpha, runMax, newMax, 1);
-            AscendC::Sub(beta, partState, newMax, 1);
+            AscendC::Sub(beta, partMax, newMax, 1);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Exp(alpha, alpha, 1);
             AscendC::Exp(beta, beta, 1);
             AscendC::PipeBarrier<PIPE_V>();
 
             AscendC::Mul(runSum, runSum, alpha, 1);
-            AscendC::Mul(partState[1], partState[1], beta, 1);
+            AscendC::Mul(partSum, partSum, beta, 1);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Add(runSum, runSum, partState[1], 1);
+            AscendC::Add(runSum, runSum, partSum, 1);
             AscendC::PipeBarrier<PIPE_V>();
 
             BroadcastScalar(bAlpha, alpha);
@@ -895,12 +932,29 @@ private:
 
 }  // namespace
 
+/*
+ * Kernel entry points take GM_ADDR, not `__gm__ void *`.
+ *
+ * The CANN kernel-launch code generator parses these signatures out of the
+ * preprocessed object and only recognises a parameter as global memory when the
+ * declaration begins with the cce_global attribute that GM_ADDR carries.  A
+ * `__gm__ void *` parameter falls through that check, is misclassified as a
+ * tiling struct, and the generated launcher calls the kernel with the argument
+ * dereferenced -- which fails to compile with "no matching function for call to
+ * <kernel>_origin" long after the kernel itself has built cleanly.  It is not a
+ * style preference: on CANN 9.1.0 (arch35 / Ascend 950PR) the library does not
+ * link without it.
+ *
+ * Nothing on the host side changes.  The generated aclrtlaunch_* wrapper still
+ * declares these parameters as `void *`, so the <<<>>> call sites below keep
+ * passing plain `void *`, and GM_ADDR converts to the `__gm__ void *` the Init()
+ * methods take.
+ */
 #define TURBOQUANT_RESHAPE_AND_CACHE_DECLARE(TYPE)                                                                   \
     extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_##TYPE(                                       \
-        __gm__ void *key, __gm__ void *value, __gm__ void *keyCache, __gm__ void *valueCache,                       \
-        __gm__ void *scaleCache, __gm__ void *slotMapping, __gm__ void *piSigns, __gm__ void *tables,                \
-        uint32_t numTokens, uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize, uint32_t tokensPerCore,      \
-        float invSqrtLen)                                                                                            \
+        GM_ADDR key, GM_ADDR value, GM_ADDR keyCache, GM_ADDR valueCache, GM_ADDR scaleCache, GM_ADDR slotMapping,   \
+        GM_ADDR piSigns, GM_ADDR tables, uint32_t numTokens, uint32_t numKvHeads, uint32_t headSize,                 \
+        uint32_t blockSize, uint32_t tokensPerCore, float invSqrtLen)                                                \
     {                                                                                                                \
         AscendC::TPipe pipe;                                                                                         \
         TurboQuantReshapeAndCache<TYPE> op(&pipe);                                                                   \
@@ -911,11 +965,10 @@ private:
 
 #define TURBOQUANT_PAGED_ATTENTION_SPLIT_DECLARE(TYPE)                                                               \
     extern "C" __global__ __aicore__ void turboquant_paged_attention_split_##TYPE(                                   \
-        __gm__ void *query, __gm__ void *keyCache, __gm__ void *valueCache, __gm__ void *scaleCache,                \
-        __gm__ void *blockTables, __gm__ void *contextLens, __gm__ void *piSigns, __gm__ void *tables,               \
-        __gm__ void *workspace, uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize,       \
-        uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t tasksPerCore, float scale,        \
-        float invSqrtLen)                                                                                            \
+        GM_ADDR query, GM_ADDR keyCache, GM_ADDR valueCache, GM_ADDR scaleCache, GM_ADDR blockTables,                \
+        GM_ADDR contextLens, GM_ADDR piSigns, GM_ADDR tables, GM_ADDR workspace, uint32_t numTokens,                 \
+        uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,     \
+        uint32_t numSplits, uint32_t tasksPerCore, float scale, float invSqrtLen)                                    \
     {                                                                                                                \
         AscendC::TPipe pipe;                                                                                         \
         TurboQuantPagedAttentionSplit<TYPE> op(&pipe);                                                               \
@@ -927,8 +980,8 @@ private:
 
 #define TURBOQUANT_PAGED_ATTENTION_COMBINE_DECLARE(TYPE)                                                             \
     extern "C" __global__ __aicore__ void turboquant_paged_attention_combine_##TYPE(                                 \
-        __gm__ void *workspace, __gm__ void *piSigns, __gm__ void *tables, __gm__ void *output, uint32_t numTokens,  \
-        uint32_t numHeads, uint32_t headSize, uint32_t numSplits, uint32_t tasksPerCore, float invSqrtLen)           \
+        GM_ADDR workspace, GM_ADDR piSigns, GM_ADDR tables, GM_ADDR output, uint32_t numTokens, uint32_t numHeads,   \
+        uint32_t headSize, uint32_t numSplits, uint32_t tasksPerCore, float invSqrtLen)                              \
     {                                                                                                                \
         AscendC::TPipe pipe;                                                                                         \
         TurboQuantPagedAttentionCombine<TYPE> op(&pipe);                                                             \
