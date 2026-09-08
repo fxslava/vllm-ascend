@@ -120,19 +120,20 @@ void RunTurboQuantDecode(const std::vector<float>& query, const std::vector<floa
   const std::vector<int8_t> signs = tq::cpu_pi_sign_vector(d);
   const int num_blocks = (context_len + block_size - 1) / block_size;
   const size_t packed_stride = static_cast<size_t>(d / tq::kPackFactor);
+  const size_t slot_floats = tq::cpu_scale_slot_floats(num_kv_heads);
 
   std::vector<int8_t> key_cache(static_cast<size_t>(num_blocks) * block_size * num_kv_heads * packed_stride, 0);
   std::vector<int8_t> value_cache(key_cache.size(), 0);
-  std::vector<float> key_scale(static_cast<size_t>(num_blocks) * num_kv_heads * block_size, 0.0f);
-  std::vector<float> value_scale(key_scale.size(), 0.0f);
+  // One scale plane, indexed by token: K lanes then V lanes, burst-padded.
+  std::vector<float> scale_plane(static_cast<size_t>(num_blocks) * block_size * slot_floats, 0.0f);
 
   for (int pos = 0; pos < context_len; ++pos) {
     for (int kv_head = 0; kv_head < num_kv_heads; ++kv_head) {
       const size_t base = (static_cast<size_t>(pos) * num_kv_heads + kv_head) * d;
-      tq::cpu_reshape_and_cache_one(key.data() + base, d, signs.data(), pos, block_size, num_kv_heads, kv_head,
-                                    key_cache.data(), key_scale.data());
-      tq::cpu_reshape_and_cache_one(value.data() + base, d, signs.data(), pos, block_size, num_kv_heads, kv_head,
-                                    value_cache.data(), value_scale.data());
+      tq::cpu_reshape_and_cache_one(key.data() + base, d, signs.data(), pos, num_kv_heads, kv_head, kv_head,
+                                    key_cache.data(), scale_plane.data());
+      tq::cpu_reshape_and_cache_one(value.data() + base, d, signs.data(), pos, num_kv_heads, kv_head,
+                                    num_kv_heads + kv_head, value_cache.data(), scale_plane.data());
     }
   }
 
@@ -142,9 +143,9 @@ void RunTurboQuantDecode(const std::vector<float>& query, const std::vector<floa
   }
 
   out->assign(static_cast<size_t>(num_heads) * d, 0.0f);
-  tq::cpu_paged_attention_turboquant(query.data(), key_cache.data(), value_cache.data(), key_scale.data(),
-                                     value_scale.data(), block_table.data(), context_len, num_heads, num_kv_heads, d,
-                                     block_size, scale, signs.data(), out->data());
+  tq::cpu_paged_attention_turboquant(query.data(), key_cache.data(), value_cache.data(), scale_plane.data(),
+                                     block_table.data(), context_len, num_heads, num_kv_heads, d, block_size, scale,
+                                     signs.data(), out->data());
 }
 
 // Stages 6 to 9 of the layer, taking an attention context and producing the
@@ -567,20 +568,24 @@ TEST(TurboQuantPoison, ApplyPiIgnoresSurroundingMemory) {
 // -----------------------------------------------------------------------------
 //
 // The reference above is a plain loop, so it cannot fail a poisoning test for
-// an interesting reason. The kernel is not a plain loop: it carves swap_,
-// scratch_ and three Gather tables out of one UB pool sized for a full
-// batchRows, builds the tables once with ArithProgression and Cast, and then
-// runs each call over only the live prefix. The offsets are what decide whether
-// the uninitialised padding is ever touched.
+// an interesting reason. The kernel is not a plain loop: it carves swap_ and
+// scratch_ out of one UB pool sized for a full batchRows, copies in three
+// Gather tables built for that same batchRows, and then runs each call over
+// only the live prefix. The offsets are what decide whether the uninitialised
+// padding is ever touched.
 //
 // The two routines below reproduce that data flow exactly - same table
 // formulae, same oversized buffers, same live prefix - so the poison sits where
 // it sits in UB. An off-by-one in expandOffset_, a Gather issued over batchLen_
 // instead of n, or a nibble split keyed on the wrong parity all surface here as
 // a poisoned value in the output.
+//
+// The tables are built here from the same formulae the host mirror uses
+// (vllm_ascend/attention/turboquant_v1.py::turboquant_codec_tables), so this
+// doubles as a check that the image the host ships is the one the codec wants.
 
-// expandOffset_[p] = 4 * (p >> 1), built the way BuildTables() builds it:
-// an arithmetic progression, halved, floored, scaled to bytes.
+// expandOffset_[p] = 4 * (p >> 1): an arithmetic progression, halved, floored,
+// and scaled to bytes -- the formula the host bakes into the table image.
 std::vector<int32_t> BuildExpandOffsets(size_t batch_len) {
   std::vector<int32_t> table(batch_len);
   for (size_t p = 0; p < batch_len; ++p) {
