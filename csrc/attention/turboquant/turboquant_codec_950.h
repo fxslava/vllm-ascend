@@ -75,10 +75,32 @@ constexpr uint32_t kFp32PerRepeat = 64;
 constexpr uint32_t kBrcbSrcLanes = kFp32PerBlock;
 constexpr uint32_t kBrcbDstLanes = kFp32PerBlock * kFp32PerBlock;
 
-__aicore__ inline uint32_t UbByteAddr(const AscendC::LocalTensor<float> &tensor)
-{
-    return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(tensor.GetPhyAddr()));
-}
+/*
+ * `srcBaseAddr` for every AscendC::Gather in this file and in
+ * turboquant_kernels.cpp.
+ *
+ * Gather's fourth argument is a byte offset *within* srcLocal - it names where
+ * in the source tensor the offset table starts counting from - and NOT the UB
+ * address of srcLocal. Every offset table here already indexes from the start
+ * of its source tensor, so the correct value is zero.
+ *
+ * This was a helper that returned srcLocal->GetPhyAddr(), and the effect was
+ * that the tensor's own UB offset got added twice: the gather then read from
+ * 2 * base + offset, which lands in whichever buffer happens to sit there.
+ * It only produced correct results when the source was the very first UB
+ * allocation, where the address is zero and the double-count is invisible -
+ * which is why it survived code review and why it reproduces in a unit probe
+ * only once a second buffer is allocated ahead of the source. Measured on both
+ * the Ascend910B1 and the Ascend950PR_9599 camodel, so it is not arch-specific.
+ *
+ * Symptom, if it comes back: ApplyPi's stride-1/2/4 stages and the codec's
+ * nibble split silently return the contents of an unrelated buffer, the packed
+ * cache fills with the -128 that an all-zero nibble pair encodes, and the
+ * decode output is uncorrelated with the reference.
+ * TurboQuantKernels.ReshapeAndCacheMatchesTheCpuReference is the test that
+ * catches it.
+ */
+constexpr uint32_t kGatherSrcBase = 0;
 
 /*
  * b-bit TurboQuant codec.  Only b == 4 is instantiated; the template keeps the
@@ -283,8 +305,8 @@ public:
         RoundToLevels(scratch_, n);
 
         // Deinterleave even/odd channels with two Gathers, then build the byte.
-        AscendC::Gather(swap_, scratch_, evenOffset_, UbByteAddr(scratch_), packed);
-        AscendC::Gather(swap_[packed], scratch_, oddOffset_, UbByteAddr(scratch_), packed);
+        AscendC::Gather(swap_, scratch_, evenOffset_, kGatherSrcBase, packed);
+        AscendC::Gather(swap_[packed], scratch_, oddOffset_, kGatherSrcBase, packed);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Muls(swap_[packed], swap_[packed], kPackHigh, packed);
         AscendC::PipeBarrier<PIPE_V>();
@@ -325,7 +347,7 @@ public:
         AscendC::PipeBarrier<PIPE_V>();
 
         // swap_[p] = byte[p >> 1] for every output channel p.
-        AscendC::Gather(swap_, scratch_, expandOffset_, UbByteAddr(scratch_), n);
+        AscendC::Gather(swap_, scratch_, expandOffset_, kGatherSrcBase, n);
         AscendC::PipeBarrier<PIPE_V>();
 
         // high = floor(byte / 16); low = byte - 16 * high.
@@ -372,7 +394,7 @@ private:
     __aicore__ inline void ShuffleStage(AscendC::LocalTensor<float> &x, AscendC::LocalTensor<float> &tmp, int stage,
                                         uint32_t n)
     {
-        AscendC::Gather(swap_, x, xorOffset_[stage], UbByteAddr(x), n);
+        AscendC::Gather(swap_, x, xorOffset_[stage], kGatherSrcBase, n);
         AscendC::Mul(tmp, x, sign_[stage], n);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Add(x, swap_, tmp, n);
