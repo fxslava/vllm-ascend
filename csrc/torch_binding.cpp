@@ -3157,10 +3157,10 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(CONCAT(_C, _ascend), ops)
         "                                 Tensor value, "
         "                                 Tensor! key_cache, "
         "                                 Tensor! value_cache, "
-        "                                 Tensor! key_scale, "
-        "                                 Tensor! value_scale, "
+        "                                 Tensor! scale_cache, "
         "                                 Tensor slot_mapping, "
-        "                                 Tensor pi_signs) -> ()");
+        "                                 Tensor pi_signs, "
+        "                                 Tensor codec_tables) -> ()");
     ops.impl("npu_turboquant_reshape_and_cache", torch::kPrivateUse1,
              &vllm_ascend::npu_turboquant_reshape_and_cache);
 
@@ -3168,11 +3168,11 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_turboquant_paged_attention(Tensor query, "
         "                               Tensor key_cache, "
         "                               Tensor value_cache, "
-        "                               Tensor key_scale, "
-        "                               Tensor value_scale, "
+        "                               Tensor scale_cache, "
         "                               Tensor block_tables, "
         "                               Tensor context_lens, "
         "                               Tensor pi_signs, "
+        "                               Tensor codec_tables, "
         "                               int num_kv_heads, "
         "                               int num_heads, "
         "                               float scale_value, "

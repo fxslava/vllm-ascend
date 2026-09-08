@@ -177,23 +177,34 @@ inline void cpu_dequantize_4bit_batch(const int8_t* packed, int rows, int d, flo
   }
 }
 
-// One (token, kv head) write into the paged cache: rotate, quantise, scatter.
+// fp32 lanes one token occupies in the scale plane: K then V for every kv head,
+// padded to a whole 32-byte burst.  The padding is what lets the kernel scatter
+// a token's scales with one aligned DataCopy instead of 2 * num_kv_heads
+// four-byte writes.  Mirrors ScaleSlotFloats() in turboquant_kernels.cpp.
+inline size_t cpu_scale_slot_floats(int num_kv_heads) {
+  constexpr size_t kBurstFloats = 8;
+  const size_t lanes = 2u * static_cast<size_t>(num_kv_heads);
+  return ((lanes + kBurstFloats - 1) / kBurstFloats) * kBurstFloats;
+}
+
+// One (token, kv head, K-or-V) write into the paged cache: rotate, quantise,
+// scatter.
 //
 //   vec         [d]      raw activation (post-RoPE K, or raw projection V)
 //   cache       flat int8 [num_blocks, block_size, num_kv_heads, d / 2]
-//   scale_plane flat f32  [num_blocks, num_kv_heads, block_size]
-inline void cpu_reshape_and_cache_one(const float* vec, int d, const int8_t* sign_vec, int slot, int block_size,
-                                      int num_kv_heads, int kv_head, int8_t* cache, float* scale_plane) {
+//   scale_plane flat f32  [num_blocks, block_size, scale_slot]
+//   scale_lane  kv_head for a key, num_kv_heads + kv_head for a value
+//
+// `slot` is already the flat (block, offset) row index, which is exactly how the
+// kernel treats it: the cache is contiguous over blocks and block offsets.
+inline void cpu_reshape_and_cache_one(const float* vec, int d, const int8_t* sign_vec, int slot, int num_kv_heads,
+                                      int kv_head, int scale_lane, int8_t* cache, float* scale_plane) {
   std::vector<float> rotated(vec, vec + d);
   cpu_apply_pi(rotated.data(), d, sign_vec);
 
-  const int block = slot / block_size;
-  const int offset = slot % block_size;
   const size_t packed_stride = static_cast<size_t>(d / kPackFactor);
-  const size_t cache_off =
-      ((static_cast<size_t>(block) * block_size + offset) * num_kv_heads + kv_head) * packed_stride;
-  const size_t scale_off =
-      (static_cast<size_t>(block) * num_kv_heads + kv_head) * block_size + offset;
+  const size_t cache_off = (static_cast<size_t>(slot) * num_kv_heads + kv_head) * packed_stride;
+  const size_t scale_off = static_cast<size_t>(slot) * cpu_scale_slot_floats(num_kv_heads) + scale_lane;
 
   cpu_quantize_4bit(rotated.data(), d, cache + cache_off, scale_plane + scale_off);
 }
@@ -205,14 +216,16 @@ inline void cpu_reshape_and_cache_one(const float* vec, int d, const int8_t* sig
 //
 //   query        [num_heads, d]        post-RoPE, unrotated
 //   key/value    flat int8 caches as written by cpu_reshape_and_cache_one
+//   scale_plane  flat f32 [num_blocks, block_size, scale_slot]
 //   block_table  [max_blocks_per_seq]  physical block ids
 //   out          [num_heads, d]
 inline void cpu_paged_attention_turboquant(const float* query, const int8_t* key_cache, const int8_t* value_cache,
-                                           const float* key_scale, const float* value_scale, const int32_t* block_table,
-                                           int context_len, int num_heads, int num_kv_heads, int d, int block_size,
-                                           float scale, const int8_t* sign_vec, float* out) {
+                                           const float* scale_plane, const int32_t* block_table, int context_len,
+                                           int num_heads, int num_kv_heads, int d, int block_size, float scale,
+                                           const int8_t* sign_vec, float* out) {
   const int group = num_heads / num_kv_heads;
   const size_t packed_stride = static_cast<size_t>(d / kPackFactor);
+  const size_t slot_floats = cpu_scale_slot_floats(num_kv_heads);
   std::vector<float> q_rot(static_cast<size_t>(d));
   std::vector<float> k_levels(static_cast<size_t>(d));
   std::vector<float> v_levels(static_cast<size_t>(d));
@@ -232,17 +245,16 @@ inline void cpu_paged_attention_turboquant(const float* query, const int8_t* key
     for (int i = 0; i < context_len; ++i) {
       const int block = block_table[i / block_size];
       const int offset = i % block_size;
-      const size_t cache_off =
-          ((static_cast<size_t>(block) * block_size + offset) * num_kv_heads + kv_head) * packed_stride;
-      const size_t scale_off =
-          (static_cast<size_t>(block) * num_kv_heads + kv_head) * block_size + offset;
+      const size_t row = static_cast<size_t>(block) * block_size + offset;
+      const size_t cache_off = (row * num_kv_heads + kv_head) * packed_stride;
+      const size_t scale_off = row * slot_floats + static_cast<size_t>(kv_head);
 
       cpu_dequantize_4bit(key_cache + cache_off, d, 1.0f, k_levels.data());
       float dot = 0.0f;
       for (int c = 0; c < d; ++c) {
         dot += q_rot[static_cast<size_t>(c)] * k_levels[static_cast<size_t>(c)];
       }
-      scores[static_cast<size_t>(i)] = dot * key_scale[scale_off] * scale;
+      scores[static_cast<size_t>(i)] = dot * scale_plane[scale_off] * scale;
       running_max = std::max(running_max, scores[static_cast<size_t>(i)]);
     }
 
@@ -257,13 +269,12 @@ inline void cpu_paged_attention_turboquant(const float* query, const int8_t* key
     for (int i = 0; i < context_len; ++i) {
       const int block = block_table[i / block_size];
       const int offset = i % block_size;
-      const size_t cache_off =
-          ((static_cast<size_t>(block) * block_size + offset) * num_kv_heads + kv_head) * packed_stride;
-      const size_t scale_off =
-          (static_cast<size_t>(block) * num_kv_heads + kv_head) * block_size + offset;
+      const size_t row = static_cast<size_t>(block) * block_size + offset;
+      const size_t cache_off = (row * num_kv_heads + kv_head) * packed_stride;
+      const size_t scale_off = row * slot_floats + static_cast<size_t>(num_kv_heads + kv_head);
 
       cpu_dequantize_4bit(value_cache + cache_off, d, 1.0f, v_levels.data());
-      const float weight = scores[static_cast<size_t>(i)] * value_scale[scale_off];
+      const float weight = scores[static_cast<size_t>(i)] * scale_plane[scale_off];
       for (int c = 0; c < d; ++c) {
         acc[static_cast<size_t>(c)] += weight * v_levels[static_cast<size_t>(c)];
       }

@@ -19,15 +19,27 @@
  *
  * Layouts are plain contiguous ND -- no FRACTAL_NZ, no 5D views:
  *
- *   key / value        [num_tokens, num_kv_heads, head_size]      fp16 | bf16
- *   key/value cache    [num_blocks, block_size, num_kv_heads, head_size / 2]  int8
- *   key/value scale    [num_blocks, num_kv_heads, block_size]     fp32
- *   query              [num_tokens, num_heads, head_size]         fp16 | bf16
- *   output             [num_tokens, num_heads, head_size]         fp16 | bf16
+ *   key / value      [num_tokens, num_kv_heads, head_size]                   fp16 | bf16
+ *   key/value cache  [num_blocks, block_size, num_kv_heads, head_size / 2]   int8
+ *   scale cache      [num_blocks, block_size, scale_slot]                    fp32
+ *   query / output   [num_tokens, num_heads, head_size]                      fp16 | bf16
  *
- * The scale planes are a separate allocation because the packed cache shape is
- * fixed by the backend contract at (2, num_blocks, block_size, num_kv_heads,
- * head_size / 2); at head_size 128 they add 6% on top of the 4-bit payload.
+ * where scale_slot = round_up(2 * num_kv_heads, 8).  One token's K scales for
+ * every kv head are followed by its V scales, and the slot is padded to a whole
+ * 32-byte burst.  That geometry is what makes every DMA in this file aligned:
+ *
+ *   - a token's packed bytes for all kv heads are contiguous and
+ *     num_kv_heads * (head_size / 2) is a multiple of 32, so the scatter is one
+ *     aligned DataCopy rather than one DataCopyPad per head;
+ *   - a token's whole scale slot is one aligned DataCopy of scale_slot floats,
+ *     replacing the 2 * num_kv_heads four-byte writes the previous layout did.
+ *     Those sub-line writes were both a DMA-transaction disaster and a hazard,
+ *     since two cores could land in the same 32-byte line of the scale plane.
+ *
+ * Nothing here uses DataCopyPad: every global address touched is 32-byte
+ * aligned and every transfer length is a multiple of 32 bytes.  The cost is the
+ * padding in scale_slot, which is 25% on top of the payload at num_kv_heads = 2
+ * and 12.5% from num_kv_heads = 4 upward.
  *
  * Rotation is purely an activation-time transform.  Model weights are never
  * touched: K, V and Q arrive exactly as the projections and RoPE produced them,
@@ -35,6 +47,14 @@
  * once more to the accumulated output.  Because Pi is a symmetric involution
  * that single routine covers both directions, and RoPE stays correct because it
  * has already been applied by the time anything is rotated.
+ *
+ * The decode path is two kernels, not one.  Flash-decoding needs every split of
+ * a (token, head) to be finished before the reduction reads them, and there is
+ * no in-kernel barrier that reliably provides that across an arbitrary grid --
+ * SyncAll only helps when every block is co-resident, which the host does not
+ * guarantee, and a grid that exceeds the physical core count deadlocks on it.
+ * The split and the combine are therefore separate launches ordered by the NPU
+ * stream, which is the only ordering guarantee that always holds.
  */
 
 #include "kernel_operator.h"
@@ -59,10 +79,28 @@ constexpr float kNegInf = -1.0e30f;
 // fp32 words of workspace per (token, head, split) partial: acc plus one padded
 // block holding the running max and the running sum.
 constexpr uint32_t kPartialTail = kFp32PerBlock;
+// Depth of the ring that carries a token's cache address from the copy-in stage
+// to the copy-out stage.  Four, not two: at steady state the prefetch for i + 1
+// and the flush for i - 1 are in flight together, and those two indices share a
+// parity.
+constexpr uint32_t kSlotRing = 4;
 
 __aicore__ inline uint32_t CeilDiv(uint32_t a, uint32_t b)
 {
     return (a + b - 1) / b;
+}
+
+__aicore__ inline uint32_t RoundUp(uint32_t value, uint32_t multiple)
+{
+    return CeilDiv(value, multiple) * multiple;
+}
+
+// fp32 words a single token occupies in the scale plane: K then V for every kv
+// head, padded to a whole 32-byte burst.  Mirrored by the host in
+// turboquant_torch_adpt.h and by vllm_ascend/attention/turboquant_v1.py.
+__aicore__ inline uint32_t ScaleSlotFloats(uint32_t numKvHeads)
+{
+    return RoundUp(2u * numKvHeads, kFp32PerBlock);
 }
 
 // dst[i] = src[i] - scalarBlock[i % 8], for a 32B block whose lanes are equal.
@@ -94,10 +132,15 @@ __aicore__ inline void BroadcastScalar(const AscendC::LocalTensor<float> &dst, c
 /*
  * npu_turboquant_reshape_and_cache
  *
- * One AIV core owns a contiguous run of tokens.  For each (token, kv head) the
- * key and value vectors are lifted to fp32, rotated by Pi in UB, quantised to
- * 4 bits and scattered straight into the ND paged cache -- there is no
- * intermediate staging buffer in global memory.
+ * One AIV core owns a contiguous run of tokens and processes a whole token --
+ * every kv head, key and value -- per pipeline stage, which is what lets the
+ * scatter be three aligned DataCopy bursts instead of a per-head trickle.
+ *
+ * The loop is a three-stage software pipeline.  Issuing CopyIn(i + 1) before
+ * Compute(i) is the whole point: DeQue inside Compute waits on the MTE2 flag,
+ * so a CopyIn issued after it can never overlap with the vector work, and the
+ * depth-2 queues were doing nothing. In steady state MTE2 for token i + 1, VEC
+ * for token i and MTE3 for token i - 1 are all in flight.
  */
 template <typename scalar_t>
 class TurboQuantReshapeAndCache {
@@ -105,8 +148,8 @@ public:
     __aicore__ inline explicit TurboQuantReshapeAndCache(AscendC::TPipe *pipe) : pipe_(pipe) {}
 
     __aicore__ inline void Init(__gm__ void *key, __gm__ void *value, __gm__ void *keyCache, __gm__ void *valueCache,
-                                __gm__ void *keyScale, __gm__ void *valueScale, __gm__ void *slotMapping,
-                                __gm__ void *piSigns, uint32_t numTokens, uint32_t numKvHeads, uint32_t headSize,
+                                __gm__ void *scaleCache, __gm__ void *slotMapping, __gm__ void *piSigns,
+                                __gm__ void *tables, uint32_t numTokens, uint32_t numKvHeads, uint32_t headSize,
                                 uint32_t blockSize, uint32_t tokensPerCore, float invSqrtLen)
     {
         numTokens_ = numTokens;
@@ -115,28 +158,42 @@ public:
         blockSize_ = blockSize;
         tokensPerCore_ = tokensPerCore;
         packedBytes_ = headSize / TurboQuantCodec4::kPackFactor;
+        headPlane_ = numKvHeads_ * headSize_;
+        packedPlane_ = numKvHeads_ * packedBytes_;
+        scaleSlot_ = ScaleSlotFloats(numKvHeads_);
 
         keyGm_.SetGlobalBuffer(reinterpret_cast<__gm__ scalar_t *>(key));
         valueGm_.SetGlobalBuffer(reinterpret_cast<__gm__ scalar_t *>(value));
         keyCacheGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(keyCache));
         valueCacheGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(valueCache));
-        keyScaleGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(keyScale));
-        valueScaleGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(valueScale));
+        scaleCacheGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(scaleCache));
         slotGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(slotMapping), numTokens);
         piSignsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(piSigns), headSize);
+        tablesGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(tables));
 
-        // Double-buffered so the next (token, head) pair streams in while the
-        // current one is being rotated and packed.
-        pipe_->InitBuffer(inQueue_, 2, 2 * headSize_ * sizeof(scalar_t));
-        pipe_->InitBuffer(outPacked_, 2, 2 * packedBytes_ * sizeof(int8_t));
-        pipe_->InitBuffer(outScale_, 2, 2 * kFp32PerBlock * sizeof(float));
+        // Two tokens in flight on each side of the compute stage.
+        pipe_->InitBuffer(inQueue_, 2, 2 * headPlane_ * sizeof(scalar_t));
+        pipe_->InitBuffer(outPacked_, 2, 2 * packedPlane_ * sizeof(int8_t));
+        pipe_->InitBuffer(outScale_, 2, scaleSlot_ * sizeof(float));
         pipe_->InitBuffer(workBuf_, 2 * headSize_ * sizeof(float));
         pipe_->InitBuffer(signBuf_, headSize_ * sizeof(float));
+        // One 32B-aligned landing slot per scale: Quantize4Bit broadcasts its
+        // result with Brcb, which needs an aligned base and eight readable
+        // lanes, so the steps cannot be written straight into the packed slot.
+        pipe_->InitBuffer(stepBuf_, 2 * numKvHeads_ * kFp32PerBlock * sizeof(float));
+        pipe_->InitBuffer(scaleIdxBuf_, 2 * numKvHeads_ * sizeof(int32_t));
 
-        codec_.Init(pipe_, headSize_, 1, invSqrtLen);
+        codec_.Init(pipe_, headSize_, 1, invSqrtLen, tablesGm_);
 
         AscendC::LocalTensor<float> signs = signBuf_.Get<float>();
         AscendC::DataCopy(signs, piSignsGm_, headSize_);
+
+        // Compaction table for the stride-8 step slots. One instruction, once,
+        // outside every loop -- not the per-launch table build this file used to
+        // do inside the codec.
+        AscendC::LocalTensor<int32_t> gatherIdx = scaleIdxBuf_.Get<int32_t>();
+        AscendC::ArithProgression(gatherIdx, 0, static_cast<int32_t>(kFp32PerBlock * sizeof(float)),
+                                  static_cast<int32_t>(2 * numKvHeads_));
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 
@@ -147,80 +204,108 @@ public:
         if (end > numTokens_) {
             end = numTokens_;
         }
-        for (uint32_t token = start; token < end; ++token) {
-            // Addressing only: a slot id per token, never a per-element read.
-            const int32_t slot = slotGm_.GetValue(token);
-            if (slot < 0) {
-                continue;
+        if (start >= end) {
+            return;
+        }
+        const uint32_t total = end - start;
+
+        // Prologue.
+        CopyIn(start, 0);
+        // Steady state: prefetch i + 1, compute i, flush i - 1.
+        for (uint32_t i = 0; i < total; ++i) {
+            if (i + 1 < total) {
+                CopyIn(start + i + 1, i + 1);
             }
-            const uint32_t slotId = static_cast<uint32_t>(slot);
-            const uint32_t blockIdx = slotId / blockSize_;
-            const uint32_t blockOff = slotId % blockSize_;
-            for (uint32_t head = 0; head < numKvHeads_; ++head) {
-                CopyIn(token, head);
-                Compute();
-                CopyOut(blockIdx, blockOff, head);
+            Compute();
+            if (i > 0) {
+                CopyOut(i - 1);
             }
         }
+        // Epilogue.
+        CopyOut(total - 1);
     }
 
 private:
-    __aicore__ inline void CopyIn(uint32_t token, uint32_t head)
+    __aicore__ inline void CopyIn(uint32_t token, uint32_t step)
     {
+        // Addressing only: one slot id per token, never a per-element read.
+        const int32_t slot = slotGm_.GetValue(token);
+        const uint32_t ring = step % kSlotRing;
+        if (slot < 0) {
+            // A padded token still travels the pipeline so the stage count stays
+            // regular; only its flush is suppressed.
+            slotValid_[ring] = false;
+            cacheOffset_[ring] = 0;
+            scaleOffset_[ring] = 0;
+        } else {
+            // The cache is [num_blocks, block_size, ...] and contiguous, so the
+            // slot id is already the flat (block, offset) row index.
+            const uint64_t row = static_cast<uint64_t>(slot);
+            slotValid_[ring] = true;
+            cacheOffset_[ring] = row * packedPlane_;
+            scaleOffset_[ring] = row * scaleSlot_;
+        }
+
         AscendC::LocalTensor<scalar_t> in = inQueue_.template AllocTensor<scalar_t>();
-        const uint64_t offset = (static_cast<uint64_t>(token) * numKvHeads_ + head) * headSize_;
-        AscendC::DataCopy(in, keyGm_[offset], headSize_);
-        AscendC::DataCopy(in[headSize_], valueGm_[offset], headSize_);
+        const uint64_t offset = static_cast<uint64_t>(token) * headPlane_;
+        AscendC::DataCopy(in, keyGm_[offset], headPlane_);
+        AscendC::DataCopy(in[headPlane_], valueGm_[offset], headPlane_);
         inQueue_.EnQue(in);
     }
 
     __aicore__ inline void Compute()
     {
         AscendC::LocalTensor<scalar_t> in = inQueue_.template DeQue<scalar_t>();
+        AscendC::LocalTensor<int8_t> packed = outPacked_.template AllocTensor<int8_t>();
+        AscendC::LocalTensor<float> scales = outScale_.template AllocTensor<float>();
+
         AscendC::LocalTensor<float> work = workBuf_.Get<float>();
         AscendC::LocalTensor<float> signs = signBuf_.Get<float>();
-        AscendC::LocalTensor<int8_t> packed = outPacked_.template AllocTensor<int8_t>();
-        AscendC::LocalTensor<float> steps = outScale_.template AllocTensor<float>();
-
+        AscendC::LocalTensor<float> steps = stepBuf_.Get<float>();
         AscendC::LocalTensor<float> vec = work;
         AscendC::LocalTensor<float> tmp = work[headSize_];
 
-        // k~ = Pi k, then quantise.  The key arrives post-RoPE and unmodified.
-        AscendC::Cast(vec, in, AscendC::RoundMode::CAST_NONE, headSize_);
-        AscendC::PipeBarrier<PIPE_V>();
-        codec_.ApplyPi(vec, tmp, signs, static_cast<int>(headSize_));
-        codec_.Quantize4Bit(packed, vec, steps, static_cast<int>(headSize_));
+        // K then V, every kv head: k~ = Pi k and v~ = Pi v, then quantise.
+        // The key arrives post-RoPE and the value straight off its projection.
+        for (uint32_t plane = 0; plane < 2 * numKvHeads_; ++plane) {
+            AscendC::Cast(vec, in[plane * headSize_], AscendC::RoundMode::CAST_NONE, headSize_);
+            AscendC::PipeBarrier<PIPE_V>();
+            codec_.ApplyPi(vec, tmp, signs, static_cast<int>(headSize_));
+            codec_.Quantize4Bit(packed[plane * packedBytes_], vec, steps[plane * kFp32PerBlock],
+                                static_cast<int>(headSize_));
+        }
 
-        // v~ = Pi v, from the raw value projection.
-        AscendC::Cast(vec, in[headSize_], AscendC::RoundMode::CAST_NONE, headSize_);
+        // Compact the stride-8 step slots into the contiguous scale slot, and
+        // zero the burst padding so the cache never holds stale UB content.
+        AscendC::LocalTensor<uint32_t> gatherIdx = scaleIdxBuf_.Get<int32_t>().ReinterpretCast<uint32_t>();
+        AscendC::Duplicate(scales, 0.0f, scaleSlot_);
         AscendC::PipeBarrier<PIPE_V>();
-        codec_.ApplyPi(vec, tmp, signs, static_cast<int>(headSize_));
-        codec_.Quantize4Bit(packed[packedBytes_], vec, steps[kFp32PerBlock], static_cast<int>(headSize_));
+        AscendC::Gather(scales, steps, gatherIdx, vllm_ascend::turboquant::UbByteAddr(steps), 2 * numKvHeads_);
+        AscendC::PipeBarrier<PIPE_V>();
 
         inQueue_.FreeTensor(in);
         outPacked_.EnQue(packed);
-        outScale_.EnQue(steps);
+        outScale_.EnQue(scales);
     }
 
-    __aicore__ inline void CopyOut(uint32_t blockIdx, uint32_t blockOff, uint32_t head)
+    __aicore__ inline void CopyOut(uint32_t step)
     {
         AscendC::LocalTensor<int8_t> packed = outPacked_.template DeQue<int8_t>();
-        AscendC::LocalTensor<float> steps = outScale_.template DeQue<float>();
+        AscendC::LocalTensor<float> scales = outScale_.template DeQue<float>();
 
-        const uint64_t cacheOff =
-            ((static_cast<uint64_t>(blockIdx) * blockSize_ + blockOff) * numKvHeads_ + head) * packedBytes_;
-        const uint64_t scaleOff = (static_cast<uint64_t>(blockIdx) * numKvHeads_ + head) * blockSize_ + blockOff;
-
-        const AscendC::DataCopyExtParams payload{1, packedBytes_ * static_cast<uint32_t>(sizeof(int8_t)), 0, 0, 0};
-        const AscendC::DataCopyExtParams scalar{1, static_cast<uint32_t>(sizeof(float)), 0, 0, 0};
-
-        AscendC::DataCopyPad(keyCacheGm_[cacheOff], packed, payload);
-        AscendC::DataCopyPad(valueCacheGm_[cacheOff], packed[packedBytes_], payload);
-        AscendC::DataCopyPad(keyScaleGm_[scaleOff], steps, scalar);
-        AscendC::DataCopyPad(valueScaleGm_[scaleOff], steps[kFp32PerBlock], scalar);
+        const uint32_t ring = step % kSlotRing;
+        if (slotValid_[ring]) {
+            // Three aligned bursts: K bytes, V bytes, and the whole scale slot.
+            // packedPlane_ and scaleSlot_ * 4 are both multiples of 32, and both
+            // base offsets are whole multiples of those, so none of these three
+            // transfers touches an unaligned global address.
+            AscendC::DataCopy(keyCacheGm_[cacheOffset_[ring]], packed, packedPlane_);
+            AscendC::DataCopy(valueCacheGm_[cacheOffset_[ring]], packed[packedPlane_], packedPlane_);
+            AscendC::DataCopy(scaleCacheGm_[scaleOffset_[ring]], scales, scaleSlot_);
+        }
 
         outPacked_.FreeTensor(packed);
-        outScale_.FreeTensor(steps);
+        outScale_.FreeTensor(scales);
     }
 
     AscendC::TPipe *pipe_;
@@ -230,43 +315,50 @@ private:
     AscendC::TQue<AscendC::QuePosition::VECOUT, 2> outScale_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> workBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> signBuf_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> stepBuf_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> scaleIdxBuf_;
     AscendC::GlobalTensor<scalar_t> keyGm_;
     AscendC::GlobalTensor<scalar_t> valueGm_;
     AscendC::GlobalTensor<int8_t> keyCacheGm_;
     AscendC::GlobalTensor<int8_t> valueCacheGm_;
-    AscendC::GlobalTensor<float> keyScaleGm_;
-    AscendC::GlobalTensor<float> valueScaleGm_;
+    AscendC::GlobalTensor<float> scaleCacheGm_;
     AscendC::GlobalTensor<int32_t> slotGm_;
     AscendC::GlobalTensor<float> piSignsGm_;
+    AscendC::GlobalTensor<int32_t> tablesGm_;
+    uint64_t cacheOffset_[kSlotRing] = {0, 0, 0, 0};
+    uint64_t scaleOffset_[kSlotRing] = {0, 0, 0, 0};
+    bool slotValid_[kSlotRing] = {false, false, false, false};
     uint32_t numTokens_ = 0;
     uint32_t numKvHeads_ = 0;
     uint32_t headSize_ = 0;
     uint32_t blockSize_ = 0;
     uint32_t tokensPerCore_ = 0;
     uint32_t packedBytes_ = 0;
+    uint32_t headPlane_ = 0;
+    uint32_t packedPlane_ = 0;
+    uint32_t scaleSlot_ = 0;
 };
 
 /*
- * npu_turboquant_paged_attention
+ * npu_turboquant_paged_attention, stage one.
  *
- * Flash-decoding shape: stage one splits the *sequence blocks* of every
- * (token, head) across AIV cores -- so a batch of one still fills the device --
- * and each core runs an online softmax over its slice, dequantising K and V on
- * the fly in UB behind a double-buffered VECIN queue.  A cross-core barrier
- * then hands the partial (max, sum, accumulator) triples to stage two, which
- * rescales them, normalises, and undoes the rotation once per output vector.
+ * The sequence blocks of every (token, head) are split across AIV cores, so a
+ * batch of one still fills the device.  Each core runs an online softmax over
+ * its slice, dequantising K and V on the fly in UB behind a double-buffered
+ * VECIN queue, and writes an un-normalised (max, sum, accumulator) triple to
+ * the workspace.  Nothing is reduced here: the reduction is a separate launch.
  */
 template <typename scalar_t>
-class TurboQuantPagedAttention {
+class TurboQuantPagedAttentionSplit {
 public:
-    __aicore__ inline explicit TurboQuantPagedAttention(AscendC::TPipe *pipe) : pipe_(pipe) {}
+    __aicore__ inline explicit TurboQuantPagedAttentionSplit(AscendC::TPipe *pipe) : pipe_(pipe) {}
 
     __aicore__ inline void Init(__gm__ void *query, __gm__ void *keyCache, __gm__ void *valueCache,
-                                __gm__ void *keyScale, __gm__ void *valueScale, __gm__ void *blockTables,
-                                __gm__ void *contextLens, __gm__ void *piSigns, __gm__ void *workspace,
-                                __gm__ void *output, uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads,
-                                uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits,
-                                float scale, float invSqrtLen)
+                                __gm__ void *scaleCache, __gm__ void *blockTables, __gm__ void *contextLens,
+                                __gm__ void *piSigns, __gm__ void *tables, __gm__ void *workspace,
+                                uint32_t numTokens, uint32_t numHeads,
+                                uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,
+                                uint32_t numSplits, float scale, float invSqrtLen)
     {
         numTokens_ = numTokens;
         numHeads_ = numHeads;
@@ -278,69 +370,55 @@ public:
         scale_ = scale;
         headsPerKv_ = numHeads / numKvHeads;
         packedBytes_ = headSize / TurboQuantCodec4::kPackFactor;
+        packedPlane_ = numKvHeads_ * packedBytes_;
+        scaleSlot_ = ScaleSlotFloats(numKvHeads_);
         partialStride_ = headSize + kPartialTail;
 
         queryGm_.SetGlobalBuffer(reinterpret_cast<__gm__ scalar_t *>(query));
         keyCacheGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(keyCache));
         valueCacheGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(valueCache));
-        keyScaleGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(keyScale));
-        valueScaleGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(valueScale));
+        scaleCacheGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(scaleCache));
         blockTableGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(blockTables));
         contextLenGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(contextLens), numTokens);
         piSignsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(piSigns), headSize);
+        tablesGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(tables));
         workspaceGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(workspace));
-        outputGm_.SetGlobalBuffer(reinterpret_cast<__gm__ scalar_t *>(output));
 
         const uint32_t tileElems = kTileRows * headSize_;
         pipe_->InitBuffer(kvQueue_, 2, 2 * kTileRows * packedBytes_ * sizeof(int8_t));
-        pipe_->InitBuffer(scaleQueue_, 2, 2 * kTileRows * sizeof(float));
+        pipe_->InitBuffer(scaleQueue_, 2, kTileRows * scaleSlot_ * sizeof(float));
         pipe_->InitBuffer(qInQueue_, 1, headSize_ * sizeof(scalar_t));
-        pipe_->InitBuffer(outQueue_, 1, headSize_ * sizeof(scalar_t));
 
         pipe_->InitBuffer(kvFloatBuf_, 2 * tileElems * sizeof(float));
         pipe_->InitBuffer(qTileBuf_, tileElems * sizeof(float));
         pipe_->InitBuffer(prodBuf_, tileElems * sizeof(float));
         pipe_->InitBuffer(accBuf_, 3 * headSize_ * sizeof(float));
-        pipe_->InitBuffer(rowBuf_, 4 * kTileRows * sizeof(float));
-        pipe_->InitBuffer(brcbBuf_, 3 * kBrcbDstLanes * sizeof(float) + kTileRows * kFp32PerBlock * sizeof(float));
+        pipe_->InitBuffer(rowBuf_, 6 * kTileRows * sizeof(float));
+        pipe_->InitBuffer(brcbBuf_, 2 * kBrcbDstLanes * sizeof(float) + kTileRows * kFp32PerBlock * sizeof(float));
         pipe_->InitBuffer(stateBuf_, 4 * kFp32PerBlock * sizeof(float));
         pipe_->InitBuffer(signBuf_, headSize_ * sizeof(float));
+        pipe_->InitBuffer(scaleIdxBuf_, 2 * kTileRows * sizeof(int32_t));
 
-        codec_.Init(pipe_, headSize_, kTileRows, invSqrtLen);
+        codec_.Init(pipe_, headSize_, kTileRows, invSqrtLen, tablesGm_);
 
         AscendC::LocalTensor<float> signs = signBuf_.Get<float>();
         AscendC::DataCopy(signs, piSignsGm_, headSize_);
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 
-    __aicore__ inline void Process(uint32_t splitTasksPerCore, uint32_t reduceTasksPerCore)
+    __aicore__ inline void Process(uint32_t tasksPerCore)
     {
-        const uint32_t core = static_cast<uint32_t>(AscendC::GetBlockIdx());
-
-        const uint32_t splitTasks = numTokens_ * numHeads_ * numSplits_;
-        uint32_t start = core * splitTasksPerCore;
-        uint32_t end = start + splitTasksPerCore;
-        if (end > splitTasks) {
-            end = splitTasks;
+        const uint32_t tasks = numTokens_ * numHeads_ * numSplits_;
+        uint32_t start = static_cast<uint32_t>(AscendC::GetBlockIdx()) * tasksPerCore;
+        uint32_t end = start + tasksPerCore;
+        if (end > tasks) {
+            end = tasks;
         }
         for (uint32_t task = start; task < end; ++task) {
             const uint32_t split = task % numSplits_;
             const uint32_t head = (task / numSplits_) % numHeads_;
             const uint32_t token = task / (numSplits_ * numHeads_);
             ComputeSplit(token, head, split);
-        }
-
-        AscendC::PipeBarrier<PIPE_ALL>();
-        AscendC::SyncAll();
-
-        const uint32_t reduceTasks = numTokens_ * numHeads_;
-        start = core * reduceTasksPerCore;
-        end = start + reduceTasksPerCore;
-        if (end > reduceTasks) {
-            end = reduceTasks;
-        }
-        for (uint32_t task = start; task < end; ++task) {
-            Combine(task / numHeads_, task % numHeads_);
         }
     }
 
@@ -350,12 +428,11 @@ private:
         return ((static_cast<uint64_t>(token) * numHeads_ + head) * numSplits_ + split) * partialStride_;
     }
 
-    // Stage one: online softmax over this core's slice of the sequence blocks.
     __aicore__ inline void ComputeSplit(uint32_t token, uint32_t head, uint32_t split)
     {
         AscendC::LocalTensor<float> state = stateBuf_.Get<float>();
-        AscendC::LocalTensor<float> runMax = state;                    // [0]
-        AscendC::LocalTensor<float> runSum = state[1];                 // [1]
+        AscendC::LocalTensor<float> runMax = state;
+        AscendC::LocalTensor<float> runSum = state[1];
         AscendC::LocalTensor<float> newMax = state[kFp32PerBlock];
         AscendC::LocalTensor<float> alpha = state[2 * kFp32PerBlock];
         AscendC::LocalTensor<float> tileMax = state[3 * kFp32PerBlock];
@@ -380,11 +457,12 @@ private:
         }
 
         if (blockStart < blockEnd) {
-            LoadQuery(token, head, qRot, tmp);
             const uint32_t kvHead = head / headsPerKv_;
+            PrepareTask(token, head, kvHead, qRot, tmp);
             for (uint32_t block = blockStart; block < blockEnd; ++block) {
                 // Addressing only: one physical block id per paged block.
-                const int32_t physical = blockTableGm_.GetValue(static_cast<uint64_t>(token) * maxBlocksPerSeq_ + block);
+                const int32_t physical =
+                    blockTableGm_.GetValue(static_cast<uint64_t>(token) * maxBlocksPerSeq_ + block);
                 if (physical < 0) {
                     continue;
                 }
@@ -393,12 +471,21 @@ private:
                 if (consumed + rows > static_cast<uint32_t>(contextLen)) {
                     rows = static_cast<uint32_t>(contextLen) - consumed;
                 }
+
+                // Same prefetch discipline as the write path: the next tile's
+                // MTE2 is issued before the current tile's vector work, so the
+                // depth-2 queue actually overlaps. The pipeline drains at each
+                // block boundary, which is one tile in blockSize / kTileRows.
+                CopyInTile(static_cast<uint32_t>(physical), kvHead, 0);
                 for (uint32_t base = 0; base < rows; base += kTileRows) {
+                    const uint32_t next = base + kTileRows;
+                    if (next < rows) {
+                        CopyInTile(static_cast<uint32_t>(physical), kvHead, next);
+                    }
                     uint32_t valid = rows - base;
                     if (valid > kTileRows) {
                         valid = kTileRows;
                     }
-                    CopyInTile(static_cast<uint32_t>(physical), kvHead, base);
                     AccumulateTile(valid, acc, runMax, runSum, newMax, alpha, tileMax);
                 }
             }
@@ -411,8 +498,12 @@ private:
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 
-    __aicore__ inline void LoadQuery(uint32_t token, uint32_t head, const AscendC::LocalTensor<float> &qRot,
-                                     const AscendC::LocalTensor<float> &tmp)
+    // Per-task setup: rotate the query once, tile it, and build the two scale
+    // gather tables. kvHead is fixed for the task, so these are two instructions
+    // per task rather than per tile.
+    __aicore__ inline void PrepareTask(uint32_t token, uint32_t head, uint32_t kvHead,
+                                       const AscendC::LocalTensor<float> &qRot,
+                                       const AscendC::LocalTensor<float> &tmp)
     {
         AscendC::LocalTensor<scalar_t> q = qInQueue_.template AllocTensor<scalar_t>();
         AscendC::DataCopy(q, queryGm_[(static_cast<uint64_t>(token) * numHeads_ + head) * headSize_], headSize_);
@@ -422,19 +513,25 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
         qInQueue_.FreeTensor(q);
 
-        // q~ = Pi q, once per (token, head, split).  Everything downstream --
-        // scores and the value accumulator -- then lives in the rotated basis.
+        // q~ = Pi q. Everything downstream -- scores and the value accumulator --
+        // then lives in the rotated basis.
         AscendC::LocalTensor<float> signs = signBuf_.Get<float>();
         AscendC::LocalTensor<float> qRotRef = qRot;
         AscendC::LocalTensor<float> tmpRef = tmp;
         codec_.ApplyPi(qRotRef, tmpRef, signs, static_cast<int>(headSize_));
 
-        // Tile the rotated query so the score product is one Mul per tile.
         AscendC::LocalTensor<float> qTile = qTileBuf_.Get<float>();
         for (uint32_t row = 0; row < kTileRows; ++row) {
             AscendC::DataCopy(qTile[row * headSize_], qRot, headSize_);
         }
-        AscendC::PipeBarrier<PIPE_V>();
+
+        const int32_t slotBytes = static_cast<int32_t>(scaleSlot_ * sizeof(float));
+        AscendC::LocalTensor<int32_t> idx = scaleIdxBuf_.Get<int32_t>();
+        AscendC::ArithProgression(idx, static_cast<int32_t>(kvHead * sizeof(float)), slotBytes,
+                                  static_cast<int32_t>(kTileRows));
+        AscendC::ArithProgression(idx[kTileRows], static_cast<int32_t>((numKvHeads_ + kvHead) * sizeof(float)),
+                                  slotBytes, static_cast<int32_t>(kTileRows));
+        AscendC::PipeBarrier<PIPE_ALL>();
     }
 
     __aicore__ inline void CopyInTile(uint32_t physical, uint32_t kvHead, uint32_t rowBase)
@@ -442,19 +539,23 @@ private:
         AscendC::LocalTensor<int8_t> kv = kvQueue_.template AllocTensor<int8_t>();
         AscendC::LocalTensor<float> scales = scaleQueue_.template AllocTensor<float>();
 
-        const uint64_t cacheOff =
-            ((static_cast<uint64_t>(physical) * blockSize_ + rowBase) * numKvHeads_ + kvHead) * packedBytes_;
-        const uint64_t scaleOff = (static_cast<uint64_t>(physical) * numKvHeads_ + kvHead) * blockSize_ + rowBase;
+        const uint64_t row = static_cast<uint64_t>(physical) * blockSize_ + rowBase;
+        const uint64_t cacheOff = row * packedPlane_ + static_cast<uint64_t>(kvHead) * packedBytes_;
+        const uint64_t scaleOff = row * scaleSlot_;
 
-        // One row of the tile per block; consecutive rows are num_kv_heads apart.
-        const AscendC::DataCopyExtParams rowsParams{static_cast<uint16_t>(kTileRows), packedBytes_,
-                                                    (numKvHeads_ - 1) * packedBytes_, 0, 0};
-        const AscendC::DataCopyPadExtParams<int8_t> pad{false, 0, 0, 0};
-        AscendC::DataCopyPad(kv, keyCacheGm_[cacheOff], rowsParams, pad);
-        AscendC::DataCopyPad(kv[kTileRows * packedBytes_], valueCacheGm_[cacheOff], rowsParams, pad);
+        // One tile row per burst; consecutive rows are packedPlane_ apart. Every
+        // length and stride here is a whole number of 32B blocks -- packedBytes_
+        // is head_size / 2 and head_size is a power of two >= 64 -- so this is
+        // plain DataCopy with no unaligned global address in sight.
+        const AscendC::DataCopyParams rowsParams{static_cast<uint16_t>(kTileRows),
+                                                 static_cast<uint16_t>(packedBytes_ / 32),
+                                                 static_cast<uint16_t>((packedPlane_ - packedBytes_) / 32), 0};
+        AscendC::DataCopy(kv, keyCacheGm_[cacheOff], rowsParams);
+        AscendC::DataCopy(kv[kTileRows * packedBytes_], valueCacheGm_[cacheOff], rowsParams);
 
-        AscendC::DataCopy(scales, keyScaleGm_[scaleOff], kTileRows);
-        AscendC::DataCopy(scales[kTileRows], valueScaleGm_[scaleOff], kTileRows);
+        // The whole scale slot for kTileRows tokens, contiguous and aligned; the
+        // two lanes this task needs are picked out with a Gather in Accumulate.
+        AscendC::DataCopy(scales, scaleCacheGm_[scaleOff], kTileRows * scaleSlot_);
 
         kvQueue_.EnQue(kv);
         scaleQueue_.EnQue(scales);
@@ -468,7 +569,7 @@ private:
                                           const AscendC::LocalTensor<float> &tileMax)
     {
         AscendC::LocalTensor<int8_t> kv = kvQueue_.template DeQue<int8_t>();
-        AscendC::LocalTensor<float> scales = scaleQueue_.template DeQue<float>();
+        AscendC::LocalTensor<float> scaleTile = scaleQueue_.template DeQue<float>();
 
         AscendC::LocalTensor<float> kf = kvFloatBuf_.Get<float>();
         AscendC::LocalTensor<float> vf = kf[kTileRows * headSize_];
@@ -480,18 +581,27 @@ private:
         AscendC::LocalTensor<float> part = rows[kTileRows];
         AscendC::LocalTensor<float> probs = rows[2 * kTileRows];
         AscendC::LocalTensor<float> reduceWork = rows[3 * kTileRows];
+        AscendC::LocalTensor<float> kScale = rows[4 * kTileRows];
+        AscendC::LocalTensor<float> vScale = rows[5 * kTileRows];
 
         AscendC::LocalTensor<float> brcb = brcbBuf_.Get<float>();
         AscendC::LocalTensor<float> bMax = brcb;
         AscendC::LocalTensor<float> bAlpha = brcb[kBrcbDstLanes];
-        AscendC::LocalTensor<float> probBlocks = brcb[3 * kBrcbDstLanes];
+        AscendC::LocalTensor<float> probBlocks = brcb[2 * kBrcbDstLanes];
+
+        // Pick this task's K and V scale lanes out of the packed slots.
+        AscendC::LocalTensor<uint32_t> idx = scaleIdxBuf_.Get<int32_t>().ReinterpretCast<uint32_t>();
+        const uint32_t scaleBase = vllm_ascend::turboquant::UbByteAddr(scaleTile);
+        AscendC::Gather(kScale, scaleTile, idx, scaleBase, kTileRows);
+        AscendC::Gather(vScale, scaleTile, idx[kTileRows], scaleBase, kTileRows);
+        AscendC::PipeBarrier<PIPE_V>();
 
         // Scores: dot(q_rot, k_levels) per row, then the per-row step.
         codec_.Dequantize4Bit(kf, kv, static_cast<int>(kTileRows), static_cast<int>(headSize_));
         AscendC::Mul(prod, kf, qTile, kTileRows * headSize_);
         AscendC::PipeBarrier<PIPE_V>();
         RowSums(scores, part, prod);
-        AscendC::Mul(scores, scores, scales, kTileRows);
+        AscendC::Mul(scores, scores, kScale, kTileRows);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Muls(scores, scores, scale_, kTileRows);
         AscendC::PipeBarrier<PIPE_V>();
@@ -531,7 +641,7 @@ private:
 
         // Value accumulation: fold the per-row step into the probabilities so
         // the scale never has to be broadcast across head_size.
-        AscendC::Mul(probs, probs, scales[kTileRows], kTileRows);
+        AscendC::Mul(probs, probs, vScale, kTileRows);
         AscendC::PipeBarrier<PIPE_V>();
         codec_.Dequantize4Bit(vf, kv[kTileRows * packedBytes_], static_cast<int>(kTileRows),
                               static_cast<int>(headSize_));
@@ -558,7 +668,7 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
 
         kvQueue_.FreeTensor(kv);
-        scaleQueue_.FreeTensor(scales);
+        scaleQueue_.FreeTensor(scaleTile);
     }
 
     // Row-wise sum of a [kTileRows, head_size] tile; one WholeReduceSum per
@@ -578,7 +688,107 @@ private:
         }
     }
 
-    // Stage two: merge the per-split partials, normalise, undo the rotation.
+    AscendC::TPipe *pipe_;
+    TurboQuantCodec4 codec_;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 2> kvQueue_;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 2> scaleQueue_;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> qInQueue_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> kvFloatBuf_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> qTileBuf_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> prodBuf_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> accBuf_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> rowBuf_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> brcbBuf_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> stateBuf_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> signBuf_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> scaleIdxBuf_;
+    AscendC::GlobalTensor<scalar_t> queryGm_;
+    AscendC::GlobalTensor<int8_t> keyCacheGm_;
+    AscendC::GlobalTensor<int8_t> valueCacheGm_;
+    AscendC::GlobalTensor<float> scaleCacheGm_;
+    AscendC::GlobalTensor<int32_t> blockTableGm_;
+    AscendC::GlobalTensor<int32_t> contextLenGm_;
+    AscendC::GlobalTensor<float> piSignsGm_;
+    AscendC::GlobalTensor<int32_t> tablesGm_;
+    AscendC::GlobalTensor<float> workspaceGm_;
+    uint32_t numTokens_ = 0;
+    uint32_t numHeads_ = 0;
+    uint32_t numKvHeads_ = 0;
+    uint32_t headSize_ = 0;
+    uint32_t blockSize_ = 0;
+    uint32_t maxBlocksPerSeq_ = 0;
+    uint32_t numSplits_ = 1;
+    uint32_t headsPerKv_ = 1;
+    uint32_t packedBytes_ = 0;
+    uint32_t packedPlane_ = 0;
+    uint32_t scaleSlot_ = 0;
+    uint32_t partialStride_ = 0;
+    float scale_ = 1.0f;
+};
+
+/*
+ * npu_turboquant_paged_attention, stage two.
+ *
+ * A separate launch, so the stream guarantees every partial is committed before
+ * any of it is read. Merges the per-split (max, sum, accumulator) triples,
+ * normalises, and applies Pi once to take the result out of the rotated basis.
+ */
+template <typename scalar_t>
+class TurboQuantPagedAttentionCombine {
+public:
+    __aicore__ inline explicit TurboQuantPagedAttentionCombine(AscendC::TPipe *pipe) : pipe_(pipe) {}
+
+    __aicore__ inline void Init(__gm__ void *workspace, __gm__ void *piSigns, __gm__ void *tables,
+                                __gm__ void *output, uint32_t numTokens, uint32_t numHeads, uint32_t headSize,
+                                uint32_t numSplits, float invSqrtLen)
+    {
+        numTokens_ = numTokens;
+        numHeads_ = numHeads;
+        headSize_ = headSize;
+        numSplits_ = numSplits;
+        partialStride_ = headSize + kPartialTail;
+
+        workspaceGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(workspace));
+        piSignsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(piSigns), headSize);
+        tablesGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(tables));
+        outputGm_.SetGlobalBuffer(reinterpret_cast<__gm__ scalar_t *>(output));
+
+        pipe_->InitBuffer(outQueue_, 1, headSize_ * sizeof(scalar_t));
+        pipe_->InitBuffer(accBuf_, 3 * headSize_ * sizeof(float));
+        pipe_->InitBuffer(stateBuf_, 4 * kFp32PerBlock * sizeof(float));
+        pipe_->InitBuffer(partialBuf_, kFp32PerBlock * sizeof(float));
+        pipe_->InitBuffer(brcbBuf_, 4 * kBrcbDstLanes * sizeof(float));
+        pipe_->InitBuffer(signBuf_, headSize_ * sizeof(float));
+
+        // Shares the split stage's table image, so the op carries one tables
+        // tensor rather than two. Only the FWHT tables are read here; the batch
+        // shuffle tables are along for the ride.
+        codec_.Init(pipe_, headSize_, kTileRows, invSqrtLen, tablesGm_);
+
+        AscendC::LocalTensor<float> signs = signBuf_.Get<float>();
+        AscendC::DataCopy(signs, piSignsGm_, headSize_);
+        AscendC::PipeBarrier<PIPE_ALL>();
+    }
+
+    __aicore__ inline void Process(uint32_t tasksPerCore)
+    {
+        const uint32_t tasks = numTokens_ * numHeads_;
+        uint32_t start = static_cast<uint32_t>(AscendC::GetBlockIdx()) * tasksPerCore;
+        uint32_t end = start + tasksPerCore;
+        if (end > tasks) {
+            end = tasks;
+        }
+        for (uint32_t task = start; task < end; ++task) {
+            Combine(task / numHeads_, task % numHeads_);
+        }
+    }
+
+private:
+    __aicore__ inline uint64_t PartialOffset(uint32_t token, uint32_t head, uint32_t split) const
+    {
+        return ((static_cast<uint64_t>(token) * numHeads_ + head) * numSplits_ + split) * partialStride_;
+    }
+
     __aicore__ inline void Combine(uint32_t token, uint32_t head)
     {
         AscendC::LocalTensor<float> acc = accBuf_.Get<float>();
@@ -596,11 +806,9 @@ private:
         AscendC::LocalTensor<float> bAlpha = brcb;
         AscendC::LocalTensor<float> bBeta = brcb[kBrcbDstLanes];
         AscendC::LocalTensor<float> bSum = brcb[2 * kBrcbDstLanes];
-        // The probability-broadcast region is idle in the reduce stage, so it
-        // doubles as scratch for the reciprocal of the softmax denominator.
         AscendC::LocalTensor<float> invSum = brcb[3 * kBrcbDstLanes];
 
-        AscendC::LocalTensor<float> partState = rowBuf_.Get<float>();
+        AscendC::LocalTensor<float> partState = partialBuf_.Get<float>();
 
         AscendC::Duplicate(acc, 0.0f, headSize_);
         AscendC::Duplicate(state, 0.0f, 4 * kFp32PerBlock);
@@ -650,10 +858,8 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
         TurboQuantCodec4::BroadcastMul(acc, acc, invSum, headSize_);
 
-        // The accumulator is still in the rotated basis: sum_i p_i (Pi v_i) is
-        // Pi (sum_i p_i v_i), so one inverse rotation per output vector suffices.
-        // Out = Pi Out~.  Pi is an involution, so the same transform that put
-        // K, V and Q into the rotated basis takes the accumulator back out.
+        // Out = Pi Out~. The accumulator is still in the rotated basis, and Pi
+        // is an involution, so the same transform takes it back out.
         AscendC::LocalTensor<float> signs = signBuf_.Get<float>();
         AscendC::LocalTensor<float> accRef = acc;
         AscendC::LocalTensor<float> tmpRef = tmp;
@@ -670,119 +876,126 @@ private:
 
     AscendC::TPipe *pipe_;
     TurboQuantCodec4 codec_;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 2> kvQueue_;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 2> scaleQueue_;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> qInQueue_;
     AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueue_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> kvFloatBuf_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> qTileBuf_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> prodBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> accBuf_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> rowBuf_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> brcbBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> stateBuf_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> partialBuf_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> brcbBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> signBuf_;
-    AscendC::GlobalTensor<scalar_t> queryGm_;
-    AscendC::GlobalTensor<int8_t> keyCacheGm_;
-    AscendC::GlobalTensor<int8_t> valueCacheGm_;
-    AscendC::GlobalTensor<float> keyScaleGm_;
-    AscendC::GlobalTensor<float> valueScaleGm_;
-    AscendC::GlobalTensor<int32_t> blockTableGm_;
-    AscendC::GlobalTensor<int32_t> contextLenGm_;
-    AscendC::GlobalTensor<float> piSignsGm_;
     AscendC::GlobalTensor<float> workspaceGm_;
+    AscendC::GlobalTensor<float> piSignsGm_;
+    AscendC::GlobalTensor<int32_t> tablesGm_;
     AscendC::GlobalTensor<scalar_t> outputGm_;
     uint32_t numTokens_ = 0;
     uint32_t numHeads_ = 0;
-    uint32_t numKvHeads_ = 0;
     uint32_t headSize_ = 0;
-    uint32_t blockSize_ = 0;
-    uint32_t maxBlocksPerSeq_ = 0;
     uint32_t numSplits_ = 1;
-    uint32_t headsPerKv_ = 1;
-    uint32_t packedBytes_ = 0;
     uint32_t partialStride_ = 0;
-    float scale_ = 1.0f;
 };
 
 }  // namespace
 
-#define TURBOQUANT_RESHAPE_AND_CACHE_DECLARE(TYPE)                                                                    \
-    extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_##TYPE(                                        \
-        __gm__ void *key, __gm__ void *value, __gm__ void *keyCache, __gm__ void *valueCache, __gm__ void *keyScale,  \
-        __gm__ void *valueScale, __gm__ void *slotMapping, __gm__ void *piSigns, uint32_t numTokens,                  \
-        uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize, uint32_t tokensPerCore, float invSqrtLen)         \
-    {                                                                                                                 \
-        AscendC::TPipe pipe;                                                                                          \
-        TurboQuantReshapeAndCache<TYPE> op(&pipe);                                                                    \
-        op.Init(key, value, keyCache, valueCache, keyScale, valueScale, slotMapping, piSigns, numTokens, numKvHeads,   \
-                headSize, blockSize, tokensPerCore, invSqrtLen);                                                      \
-        op.Process();                                                                                                 \
+#define TURBOQUANT_RESHAPE_AND_CACHE_DECLARE(TYPE)                                                                   \
+    extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_##TYPE(                                       \
+        __gm__ void *key, __gm__ void *value, __gm__ void *keyCache, __gm__ void *valueCache,                       \
+        __gm__ void *scaleCache, __gm__ void *slotMapping, __gm__ void *piSigns, __gm__ void *tables,                \
+        uint32_t numTokens, uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize, uint32_t tokensPerCore,      \
+        float invSqrtLen)                                                                                            \
+    {                                                                                                                \
+        AscendC::TPipe pipe;                                                                                         \
+        TurboQuantReshapeAndCache<TYPE> op(&pipe);                                                                   \
+        op.Init(key, value, keyCache, valueCache, scaleCache, slotMapping, piSigns, tables, numTokens, numKvHeads,   \
+                headSize, blockSize, tokensPerCore, invSqrtLen);                                                     \
+        op.Process();                                                                                                \
     }
 
-#define TURBOQUANT_PAGED_ATTENTION_DECLARE(TYPE)                                                                      \
-    extern "C" __global__ __aicore__ void turboquant_paged_attention_##TYPE(                                          \
-        __gm__ void *query, __gm__ void *keyCache, __gm__ void *valueCache, __gm__ void *keyScale,                    \
-        __gm__ void *valueScale, __gm__ void *blockTables, __gm__ void *contextLens, __gm__ void *piSigns,            \
-        __gm__ void *workspace, __gm__ void *output, uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads,      \
-        uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits,                          \
-        uint32_t splitTasksPerCore, uint32_t reduceTasksPerCore, float scale, float invSqrtLen)                       \
-    {                                                                                                                 \
-        AscendC::TPipe pipe;                                                                                          \
-        TurboQuantPagedAttention<TYPE> op(&pipe);                                                                     \
-        op.Init(query, keyCache, valueCache, keyScale, valueScale, blockTables, contextLens, piSigns, workspace,      \
-                output, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, scale,      \
-                invSqrtLen);                                                                                          \
-        op.Process(splitTasksPerCore, reduceTasksPerCore);                                                            \
+#define TURBOQUANT_PAGED_ATTENTION_SPLIT_DECLARE(TYPE)                                                               \
+    extern "C" __global__ __aicore__ void turboquant_paged_attention_split_##TYPE(                                   \
+        __gm__ void *query, __gm__ void *keyCache, __gm__ void *valueCache, __gm__ void *scaleCache,                \
+        __gm__ void *blockTables, __gm__ void *contextLens, __gm__ void *piSigns, __gm__ void *tables,               \
+        __gm__ void *workspace, uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize,       \
+        uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t tasksPerCore, float scale,        \
+        float invSqrtLen)                                                                                            \
+    {                                                                                                                \
+        AscendC::TPipe pipe;                                                                                         \
+        TurboQuantPagedAttentionSplit<TYPE> op(&pipe);                                                               \
+        op.Init(query, keyCache, valueCache, scaleCache, blockTables, contextLens, piSigns, tables, workspace,       \
+                numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, scale,             \
+                invSqrtLen);                                                                                         \
+        op.Process(tasksPerCore);                                                                                    \
+    }
+
+#define TURBOQUANT_PAGED_ATTENTION_COMBINE_DECLARE(TYPE)                                                             \
+    extern "C" __global__ __aicore__ void turboquant_paged_attention_combine_##TYPE(                                 \
+        __gm__ void *workspace, __gm__ void *piSigns, __gm__ void *tables, __gm__ void *output, uint32_t numTokens,  \
+        uint32_t numHeads, uint32_t headSize, uint32_t numSplits, uint32_t tasksPerCore, float invSqrtLen)           \
+    {                                                                                                                \
+        AscendC::TPipe pipe;                                                                                         \
+        TurboQuantPagedAttentionCombine<TYPE> op(&pipe);                                                             \
+        op.Init(workspace, piSigns, tables, output, numTokens, numHeads, headSize, numSplits, invSqrtLen);           \
+        op.Process(tasksPerCore);                                                                                    \
     }
 
 TURBOQUANT_RESHAPE_AND_CACHE_DECLARE(half)
-TURBOQUANT_PAGED_ATTENTION_DECLARE(half)
+TURBOQUANT_PAGED_ATTENTION_SPLIT_DECLARE(half)
+TURBOQUANT_PAGED_ATTENTION_COMBINE_DECLARE(half)
 #if !defined(__CCE_AICORE__) || (__CCE_AICORE__ >= 220)
 TURBOQUANT_RESHAPE_AND_CACHE_DECLARE(bfloat16_t)
-TURBOQUANT_PAGED_ATTENTION_DECLARE(bfloat16_t)
+TURBOQUANT_PAGED_ATTENTION_SPLIT_DECLARE(bfloat16_t)
+TURBOQUANT_PAGED_ATTENTION_COMBINE_DECLARE(bfloat16_t)
 #endif
 
 namespace vllm_ascend {
 
 void turboquant_reshape_and_cache_impl(AscendType type, void *stream, uint32_t blockDim, void *key, void *value,
-                                       void *keyCache, void *valueCache, void *keyScale, void *valueScale,
-                                       void *slotMapping, void *piSigns, uint32_t numTokens, uint32_t numKvHeads,
-                                       uint32_t headSize, uint32_t blockSize, uint32_t tokensPerCore, float invSqrtLen)
+                                       void *keyCache, void *valueCache, void *scaleCache, void *slotMapping,
+                                       void *piSigns, void *tables, uint32_t numTokens, uint32_t numKvHeads,
+                                       uint32_t headSize, uint32_t blockSize, uint32_t tokensPerCore,
+                                       float invSqrtLen)
 {
     if (type == AscendType::FP16) {
-        turboquant_reshape_and_cache_half<<<blockDim, nullptr, stream>>>(key, value, keyCache, valueCache, keyScale,
-                                                                         valueScale, slotMapping, piSigns, numTokens,
-                                                                         numKvHeads, headSize, blockSize,
-                                                                         tokensPerCore, invSqrtLen);
+        turboquant_reshape_and_cache_half<<<blockDim, nullptr, stream>>>(
+            key, value, keyCache, valueCache, scaleCache, slotMapping, piSigns, tables, numTokens, numKvHeads,
+            headSize, blockSize, tokensPerCore, invSqrtLen);
 #if !defined(__CCE_AICORE__) || (__CCE_AICORE__ >= 220)
     } else if (type == AscendType::BF16) {
         turboquant_reshape_and_cache_bfloat16_t<<<blockDim, nullptr, stream>>>(
-            key, value, keyCache, valueCache, keyScale, valueScale, slotMapping, piSigns, numTokens, numKvHeads,
+            key, value, keyCache, valueCache, scaleCache, slotMapping, piSigns, tables, numTokens, numKvHeads,
             headSize, blockSize, tokensPerCore, invSqrtLen);
 #endif
     }
 }
 
-void turboquant_paged_attention_impl(AscendType type, void *stream, uint32_t blockDim, void *query, void *keyCache,
-                                     void *valueCache, void *keyScale, void *valueScale, void *blockTables,
-                                     void *contextLens, void *piSigns, void *workspace, void *output,
-                                     uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize,
-                                     uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits,
-                                     uint32_t splitTasksPerCore, uint32_t reduceTasksPerCore, float scale,
-                                     float invSqrtLen)
+/*
+ * Two launches on one stream. The split kernel must be globally complete before
+ * the combine kernel reads the workspace, and stream order is the only barrier
+ * that holds for an arbitrary grid.
+ */
+void turboquant_paged_attention_impl(AscendType type, void *stream, uint32_t splitBlockDim, uint32_t combineBlockDim,
+                                     void *query, void *keyCache, void *valueCache, void *scaleCache,
+                                     void *blockTables, void *contextLens, void *piSigns, void *tables,
+                                     void *workspace, void *output, uint32_t numTokens, uint32_t numHeads,
+                                     uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,
+                                     uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t splitTasksPerCore,
+                                     uint32_t combineTasksPerCore, float scale, float invSqrtLen)
 {
     if (type == AscendType::FP16) {
-        turboquant_paged_attention_half<<<blockDim, nullptr, stream>>>(
-            query, keyCache, valueCache, keyScale, valueScale, blockTables, contextLens, piSigns, workspace, output,
-            numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, splitTasksPerCore,
-            reduceTasksPerCore, scale, invSqrtLen);
+        turboquant_paged_attention_split_half<<<splitBlockDim, nullptr, stream>>>(
+            query, keyCache, valueCache, scaleCache, blockTables, contextLens, piSigns, tables, workspace, numTokens,
+            numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, splitTasksPerCore, scale,
+            invSqrtLen);
+        turboquant_paged_attention_combine_half<<<combineBlockDim, nullptr, stream>>>(
+            workspace, piSigns, tables, output, numTokens, numHeads, headSize, numSplits, combineTasksPerCore,
+            invSqrtLen);
 #if !defined(__CCE_AICORE__) || (__CCE_AICORE__ >= 220)
     } else if (type == AscendType::BF16) {
-        turboquant_paged_attention_bfloat16_t<<<blockDim, nullptr, stream>>>(
-            query, keyCache, valueCache, keyScale, valueScale, blockTables, contextLens, piSigns, workspace, output,
-            numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, splitTasksPerCore,
-            reduceTasksPerCore, scale, invSqrtLen);
+        turboquant_paged_attention_split_bfloat16_t<<<splitBlockDim, nullptr, stream>>>(
+            query, keyCache, valueCache, scaleCache, blockTables, contextLens, piSigns, tables, workspace, numTokens,
+            numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, splitTasksPerCore, scale,
+            invSqrtLen);
+        turboquant_paged_attention_combine_bfloat16_t<<<combineBlockDim, nullptr, stream>>>(
+            workspace, piSigns, tables, output, numTokens, numHeads, headSize, numSplits, combineTasksPerCore,
+            invSqrtLen);
 #endif
     }
 }

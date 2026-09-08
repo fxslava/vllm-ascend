@@ -44,9 +44,16 @@
  *
  * Everything below stays in the Vector pipeline.  There is no per-element
  * GetValue/SetValue in this header: the sign patterns, shuffle tables and the
- * nibble split are built with ArithProgression / Cast / Gather, and the
- * per-vector scale is broadcast with Brcb rather than read into a scalar
- * register.
+ * nibble split are Gather-driven, and the per-vector absmax is broadcast with
+ * Brcb rather than read into a scalar register.
+ *
+ * The constant tables are *not* generated here.  They are a pure function of
+ * (head_size, batch_rows), so the host builds them once at engine start and
+ * Init() pulls the finished image into UB with a single aligned DataCopy.
+ * Generating them per launch cost roughly forty dependent vector instructions
+ * plus their pipe barriers on the critical path of every decode step.
+ * ConstTableWords() is the layout contract; the host mirror lives in
+ * vllm_ascend/attention/turboquant_v1.py::turboquant_codec_tables.
  */
 
 #ifndef VLLM_ASCEND_ATTENTION_TURBOQUANT_CODEC_950_H
@@ -91,58 +98,81 @@ public:
     static constexpr float kInt8Bias = 128.0f;
     // Guards the reciprocal of an all-zero vector; far below fp16 denormals.
     static constexpr float kEps = 1e-20f;
+    // Strides 1, 2 and 4 all live inside a single 32B block.
+    static constexpr int kEarlyStages = 3;
+
+    /*
+     * Constant-table layout, in 4-byte words.  The host writes this exact image;
+     * Init() copies it in one burst and never rewrites a word of it.
+     *
+     *   [0 .. 6*len)            sign_[s] then xorOffset_[s], per stage
+     *   [6*len .. 7*len)        evenOffset_ then oddOffset_, len/2 words each
+     *   [7*len .. 7*len+B)      expandOffset_
+     *   [7*len+B .. 7*len+2B)   oddSelect_            (B = len * batchRows)
+     *
+     * sign_ and oddSelect_ are fp32 bit patterns; the offset tables are uint32
+     * byte offsets for Gather.  Every entry is four bytes wide, so one int32
+     * DataCopy moves the lot and the device needs no cast and no arithmetic.
+     */
+    __aicore__ static inline uint32_t ConstTableWords(uint32_t vecLen, uint32_t batchRows)
+    {
+        return 7u * vecLen + 2u * vecLen * batchRows;
+    }
+
+    // Scratch, deliberately uninitialised: swap_, scratch_, reduceWork_, broadcast_.
+    __aicore__ static inline uint32_t WorkBufferWords(uint32_t vecLen, uint32_t batchRows)
+    {
+        return 2u * vecLen * batchRows + vecLen + kBrcbDstLanes + kFp32PerBlock;
+    }
 
     /*
      * vecLen      head_size, a power of two in [64, 256].
-     * batchRows   how many vectors Dequantize4Bit may expand in one call; sizes
-     *             the shuffle tables used by the batched path.
+     * batchRows   how many vectors Dequantize4Bit may expand in one call; must
+     *             match the batchRows the host built `tablesGm` for.
      * invSqrtLen  1 / sqrt(vecLen), passed in so the kernel needs no scalar sqrt.
+     * tablesGm    ConstTableWords(vecLen, batchRows) int32 words.
      */
-    __aicore__ inline void Init(AscendC::TPipe *pipe, uint32_t vecLen, uint32_t batchRows, float invSqrtLen)
+    __aicore__ inline void Init(AscendC::TPipe *pipe, uint32_t vecLen, uint32_t batchRows, float invSqrtLen,
+                                const AscendC::GlobalTensor<int32_t> &tablesGm)
     {
         len_ = vecLen;
         batchLen_ = vecLen * batchRows;
         invSqrtLen_ = invSqrtLen;
         const uint32_t packed = len_ / kPackFactor;
+        const uint32_t constWords = ConstTableWords(vecLen, batchRows);
 
-        pipe->InitBuffer(constBuf_, ConstBufferBytes(vecLen, batchRows));
-        AscendC::LocalTensor<float> pool = constBuf_.Get<float>();
+        pipe->InitBuffer(constBuf_, constWords * sizeof(int32_t));
+        pipe->InitBuffer(workBuf_, WorkBufferWords(vecLen, batchRows) * sizeof(float));
 
+        AscendC::LocalTensor<int32_t> pool = constBuf_.Get<int32_t>();
+        AscendC::DataCopy(pool, tablesGm, constWords);
+        AscendC::PipeBarrier<PIPE_ALL>();
+
+        AscendC::LocalTensor<float> poolF = pool.template ReinterpretCast<float>();
         uint32_t off = 0;
         for (int stage = 0; stage < kEarlyStages; ++stage) {
-            sign_[stage] = pool[off];
+            sign_[stage] = poolF[off];
             off += len_;
-            xorOffset_[stage] = pool[off];
+            xorOffset_[stage] = pool[off].template ReinterpretCast<uint32_t>();
             off += len_;
         }
-        evenOffset_ = pool[off];
+        evenOffset_ = pool[off].template ReinterpretCast<uint32_t>();
         off += packed;
-        oddOffset_ = pool[off];
+        oddOffset_ = pool[off].template ReinterpretCast<uint32_t>();
         off += packed;
-        expandOffset_ = pool[off];
+        expandOffset_ = pool[off].template ReinterpretCast<uint32_t>();
         off += batchLen_;
-        oddSelect_ = pool[off];
+        oddSelect_ = poolF[off];
+
+        AscendC::LocalTensor<float> work = workBuf_.Get<float>();
+        off = 0;
+        swap_ = work[off];
         off += batchLen_;
-        swap_ = pool[off];
+        scratch_ = work[off];
         off += batchLen_;
-        scratch_ = pool[off];
-        off += batchLen_;
-        reduceWork_ = pool[off];
+        reduceWork_ = work[off];
         off += len_;
-        broadcast_ = pool[off];
-
-        BuildTables();
-    }
-
-    __aicore__ static inline uint32_t ConstBufferBytes(uint32_t vecLen, uint32_t batchRows)
-    {
-        const uint32_t batchLen = vecLen * batchRows;
-        const uint32_t elems = kEarlyStages * 2 * vecLen     // sign_ + xorOffset_
-                               + 2 * (vecLen / kPackFactor)  // evenOffset_ + oddOffset_
-                               + 4 * batchLen                // expandOffset_, oddSelect_, swap_, scratch_
-                               + vecLen                      // reduceWork_
-                               + kBrcbDstLanes + kFp32PerBlock;  // broadcast_
-        return elems * static_cast<uint32_t>(sizeof(float));
+        broadcast_ = work[off];
     }
 
     /*
@@ -253,8 +283,8 @@ public:
         RoundToLevels(scratch_, n);
 
         // Deinterleave even/odd channels with two Gathers, then build the byte.
-        AscendC::Gather(swap_, scratch_, evenOffset_.ReinterpretCast<uint32_t>(), UbByteAddr(scratch_), packed);
-        AscendC::Gather(swap_[packed], scratch_, oddOffset_.ReinterpretCast<uint32_t>(), UbByteAddr(scratch_), packed);
+        AscendC::Gather(swap_, scratch_, evenOffset_, UbByteAddr(scratch_), packed);
+        AscendC::Gather(swap_[packed], scratch_, oddOffset_, UbByteAddr(scratch_), packed);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Muls(swap_[packed], swap_[packed], kPackHigh, packed);
         AscendC::PipeBarrier<PIPE_V>();
@@ -295,7 +325,7 @@ public:
         AscendC::PipeBarrier<PIPE_V>();
 
         // swap_[p] = byte[p >> 1] for every output channel p.
-        AscendC::Gather(swap_, scratch_, expandOffset_.ReinterpretCast<uint32_t>(), UbByteAddr(scratch_), n);
+        AscendC::Gather(swap_, scratch_, expandOffset_, UbByteAddr(scratch_), n);
         AscendC::PipeBarrier<PIPE_V>();
 
         // high = floor(byte / 16); low = byte - 16 * high.
@@ -339,13 +369,10 @@ public:
     }
 
 private:
-    // Strides 1, 2 and 4 all live inside a single 32B block.
-    static constexpr int kEarlyStages = 3;
-
     __aicore__ inline void ShuffleStage(AscendC::LocalTensor<float> &x, AscendC::LocalTensor<float> &tmp, int stage,
                                         uint32_t n)
     {
-        AscendC::Gather(swap_, x, xorOffset_[stage].ReinterpretCast<uint32_t>(), UbByteAddr(x), n);
+        AscendC::Gather(swap_, x, xorOffset_[stage], UbByteAddr(x), n);
         AscendC::Mul(tmp, x, sign_[stage], n);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Add(x, swap_, tmp, n);
@@ -404,93 +431,13 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    /*
-     * Build every constant table with vector instructions only.
-     *
-     *   sign_[s][p]      = 1 - 2 * ((p / s) & 1)
-     *   xorOffset_[s][p] = 4 * (p ^ s) = 4 * (p + s * sign_[s][p])
-     *   evenOffset_[c]   = 8 * c;  oddOffset_[c] = 8 * c + 4
-     *   expandOffset_[p] = 4 * (p >> 1)
-     *   oddSelect_[p]    = p & 1
-     */
-    __aicore__ inline void BuildTables()
-    {
-        AscendC::ArithProgression(scratch_, 0.0f, 1.0f, static_cast<int32_t>(batchLen_));
-        AscendC::PipeBarrier<PIPE_V>();
-
-        for (int stage = 0; stage < kEarlyStages; ++stage) {
-            const float stride = static_cast<float>(1u << stage);
-            // parity = floor(p / s) - 2 * floor(p / 2s)
-            AscendC::Muls(swap_, scratch_, 1.0f / stride, len_);
-            AscendC::PipeBarrier<PIPE_V>();
-            FloorInPlace(swap_, len_);
-            AscendC::Muls(sign_[stage], swap_, 0.5f, len_);
-            AscendC::PipeBarrier<PIPE_V>();
-            FloorInPlace(sign_[stage], len_);
-            AscendC::Muls(sign_[stage], sign_[stage], -2.0f, len_);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Add(sign_[stage], sign_[stage], swap_, len_);
-            AscendC::PipeBarrier<PIPE_V>();
-            // sign = 1 - 2 * parity
-            AscendC::Muls(sign_[stage], sign_[stage], -2.0f, len_);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Adds(sign_[stage], sign_[stage], 1.0f, len_);
-            AscendC::PipeBarrier<PIPE_V>();
-
-            AscendC::Muls(xorOffset_[stage], sign_[stage], stride, len_);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Add(xorOffset_[stage], xorOffset_[stage], scratch_, len_);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Muls(xorOffset_[stage], xorOffset_[stage], static_cast<float>(sizeof(float)), len_);
-            AscendC::PipeBarrier<PIPE_V>();
-            ToByteOffsets(xorOffset_[stage], len_);
-
-            if (stage == 0) {
-                // The stride-1 parity doubles as the nibble selector.
-                AscendC::Muls(oddSelect_, sign_[stage], -0.5f, len_);
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Adds(oddSelect_, oddSelect_, 0.5f, len_);
-                AscendC::PipeBarrier<PIPE_V>();
-                for (uint32_t row = len_; row < batchLen_; row += len_) {
-                    AscendC::DataCopy(oddSelect_[row], oddSelect_, len_);
-                }
-                AscendC::PipeBarrier<PIPE_V>();
-            }
-        }
-
-        const uint32_t packed = len_ / kPackFactor;
-        const float pairBytes = static_cast<float>(kPackFactor * sizeof(float));
-        AscendC::ArithProgression(evenOffset_, 0.0f, pairBytes, static_cast<int32_t>(packed));
-        AscendC::PipeBarrier<PIPE_V>();
-        ToByteOffsets(evenOffset_, packed);
-        AscendC::ArithProgression(oddOffset_, static_cast<float>(sizeof(float)), pairBytes,
-                                  static_cast<int32_t>(packed));
-        AscendC::PipeBarrier<PIPE_V>();
-        ToByteOffsets(oddOffset_, packed);
-
-        AscendC::Muls(expandOffset_, scratch_, 1.0f / static_cast<float>(kPackFactor), batchLen_);
-        AscendC::PipeBarrier<PIPE_V>();
-        FloorInPlace(expandOffset_, batchLen_);
-        AscendC::Muls(expandOffset_, expandOffset_, static_cast<float>(sizeof(float)), batchLen_);
-        AscendC::PipeBarrier<PIPE_V>();
-        ToByteOffsets(expandOffset_, batchLen_);
-    }
-
-    // Gather consumes uint32 byte offsets.  The tables are built in fp32 -- every
-    // value they hold is exactly representable -- and converted in place.
-    __aicore__ static inline void ToByteOffsets(const AscendC::LocalTensor<float> &table, uint32_t count)
-    {
-        AscendC::LocalTensor<int32_t> intView = table.ReinterpretCast<int32_t>();
-        AscendC::Cast(intView, table, AscendC::RoundMode::CAST_RINT, count);
-        AscendC::PipeBarrier<PIPE_V>();
-    }
-
     AscendC::TBuf<AscendC::QuePosition::VECCALC> constBuf_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> workBuf_;
     AscendC::LocalTensor<float> sign_[kEarlyStages];
-    AscendC::LocalTensor<float> xorOffset_[kEarlyStages];
-    AscendC::LocalTensor<float> evenOffset_;
-    AscendC::LocalTensor<float> oddOffset_;
-    AscendC::LocalTensor<float> expandOffset_;
+    AscendC::LocalTensor<uint32_t> xorOffset_[kEarlyStages];
+    AscendC::LocalTensor<uint32_t> evenOffset_;
+    AscendC::LocalTensor<uint32_t> oddOffset_;
+    AscendC::LocalTensor<uint32_t> expandOffset_;
     AscendC::LocalTensor<float> oddSelect_;
     AscendC::LocalTensor<float> swap_;
     AscendC::LocalTensor<float> scratch_;

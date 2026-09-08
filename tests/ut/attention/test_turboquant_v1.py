@@ -31,10 +31,13 @@ from vllm_ascend.attention import turboquant_v1 as tq_module
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.turboquant_v1 import (
     TURBOQUANT_PACK_FACTOR,
+    TURBOQUANT_TILE_ROWS,
     AscendTurboQuantAttentionBackend,
     AscendTurboQuantAttentionBackendImpl,
     apply_pi,
+    turboquant_codec_tables,
     turboquant_pi_signs,
+    turboquant_scale_slot,
     walsh_hadamard,
 )
 
@@ -213,8 +216,7 @@ class TestPureRuntimeContract(TestBase):
         impl.is_kv_producer = False
         impl.key_cache = None
         impl.value_cache = None
-        impl.key_scale_cache = None
-        impl.value_scale_cache = None
+        impl.scale_cache = None
         impl._pi_signs = None
         return impl
 
@@ -234,21 +236,22 @@ class TestPureRuntimeContract(TestBase):
 
         ops.npu_turboquant_reshape_and_cache.assert_called_once()
         args = ops.npu_turboquant_reshape_and_cache.call_args.args
-        # key, value, k_cache, v_cache, k_scale, v_scale, slots, pi_signs -- and
-        # no trailing rotation flag.
+        # key, value, k_cache, v_cache, scale_cache, slots, pi_signs,
+        # codec_tables -- and no rotation flag anywhere.
         self.assertEqual(len(args), 8)
         torch.testing.assert_close(args[0], key)
         torch.testing.assert_close(args[1], value)
-        self.assertEqual(args[6].dtype, torch.int32)
-        torch.testing.assert_close(args[7], turboquant_pi_signs(HEAD_SIZE, CPU))
+        self.assertEqual(args[5].dtype, torch.int32)
+        torch.testing.assert_close(args[6], turboquant_pi_signs(HEAD_SIZE, CPU))
+        # The codec tables are host-built, not regenerated per launch.
+        torch.testing.assert_close(args[7], turboquant_codec_tables(HEAD_SIZE, 1, CPU))
 
     def test_paged_attention_passes_post_rope_query_and_no_flag(self):
         impl = self._make_impl()
         num_tokens = 2
         impl.key_cache = torch.zeros(1, 128, 2, HEAD_SIZE // TURBOQUANT_PACK_FACTOR, dtype=torch.int8)
         impl.value_cache = impl.key_cache
-        impl.key_scale_cache = torch.zeros(1, 2, 128)
-        impl.value_scale_cache = impl.key_scale_cache
+        impl.scale_cache = torch.zeros(1, 128, turboquant_scale_slot(2))
         query = torch.randn(num_tokens, impl.num_heads, HEAD_SIZE)
         output = torch.zeros(num_tokens, impl.num_heads, HEAD_SIZE)
         metadata = MagicMock(
@@ -262,10 +265,11 @@ class TestPureRuntimeContract(TestBase):
 
         ops.npu_turboquant_paged_attention.assert_called_once()
         args = ops.npu_turboquant_paged_attention.call_args.args
-        # query, k_cache, v_cache, k_scale, v_scale, block_tables, context_lens,
-        # pi_signs, num_kv_heads, num_heads, scale, out.
+        # query, k_cache, v_cache, scale_cache, block_tables, context_lens,
+        # pi_signs, codec_tables, num_kv_heads, num_heads, scale, out.
         self.assertEqual(len(args), 12)
         torch.testing.assert_close(args[0], query)
+        torch.testing.assert_close(args[7], turboquant_codec_tables(HEAD_SIZE, TURBOQUANT_TILE_ROWS, CPU))
         self.assertEqual(args[8], impl.num_kv_heads)
         self.assertEqual(args[9], impl.num_heads)
         self.assertFalse(any(isinstance(a, bool) for a in args))
@@ -506,6 +510,72 @@ class TestBufferPoisoning(TestBase):
             self.assertAlmostEqual(steps[row].item(), amplitude / ZERO_POINT, delta=amplitude * 1e-9)
 
 
+class TestCodecTables(TestBase):
+    """The codec's constant tables are built here and copied into UB verbatim.
+
+    Nothing on the device regenerates or even touches them, so the image this
+    produces *is* the contract; every field is checked against the formula the
+    kernel assumes.
+    """
+
+    def _split(self, head_size: int, batch_rows: int):
+        tables = turboquant_codec_tables(head_size, batch_rows, CPU)
+        batch = head_size * batch_rows
+        cursor = 0
+        signs, xor_offsets = [], []
+        for _ in range(3):
+            signs.append(tables[cursor : cursor + head_size].view(torch.float32))
+            cursor += head_size
+            xor_offsets.append(tables[cursor : cursor + head_size])
+            cursor += head_size
+        half = head_size // TURBOQUANT_PACK_FACTOR
+        even = tables[cursor : cursor + half]
+        cursor += half
+        odd = tables[cursor : cursor + half]
+        cursor += half
+        expand = tables[cursor : cursor + batch]
+        cursor += batch
+        odd_select = tables[cursor : cursor + batch].view(torch.float32)
+        return signs, xor_offsets, even, odd, expand, odd_select
+
+    def test_image_length_matches_the_kernel_contract(self):
+        for head_size in (64, 128, 256):
+            for batch_rows in (1, TURBOQUANT_TILE_ROWS):
+                tables = turboquant_codec_tables(head_size, batch_rows, CPU)
+                self.assertEqual(tables.dtype, torch.int32)
+                self.assertTrue(tables.is_contiguous())
+                self.assertEqual(tables.numel(), 7 * head_size + 2 * head_size * batch_rows)
+                # One DataCopy moves the image, so it must be a whole burst.
+                self.assertEqual(tables.numel() % 8, 0)
+
+    def test_sign_and_xor_tables_encode_the_butterfly(self):
+        head_size = 128
+        signs, xor_offsets, _, _, _, _ = self._split(head_size, 1)
+        channels = torch.arange(head_size)
+        for stage in range(3):
+            stride = 1 << stage
+            expected_sign = (1 - 2 * ((channels // stride) & 1)).to(torch.float32)
+            torch.testing.assert_close(signs[stage], expected_sign, atol=0, rtol=0)
+            # Gather consumes byte offsets, so p ^ stride scaled by sizeof(float).
+            torch.testing.assert_close(xor_offsets[stage], (4 * (channels ^ stride)).to(torch.int32), atol=0, rtol=0)
+
+    def test_nibble_tables_deinterleave_and_expand(self):
+        head_size, batch_rows = 128, TURBOQUANT_TILE_ROWS
+        _, _, even, odd, expand, odd_select = self._split(head_size, batch_rows)
+        pairs = torch.arange(head_size // TURBOQUANT_PACK_FACTOR)
+        torch.testing.assert_close(even, (8 * pairs).to(torch.int32), atol=0, rtol=0)
+        torch.testing.assert_close(odd, (8 * pairs + 4).to(torch.int32), atol=0, rtol=0)
+
+        batch = torch.arange(head_size * batch_rows)
+        torch.testing.assert_close(expand, (4 * (batch // 2)).to(torch.int32), atol=0, rtol=0)
+        torch.testing.assert_close(odd_select, (batch % 2).to(torch.float32), atol=0, rtol=0)
+
+    def test_tables_are_cached_per_shape(self):
+        first = turboquant_codec_tables(128, 1, CPU)
+        self.assertIs(turboquant_codec_tables(128, 1, CPU), first)
+        self.assertIsNot(turboquant_codec_tables(128, TURBOQUANT_TILE_ROWS, CPU), first)
+
+
 class TestBackendContract(TestBase):
     def test_kv_cache_shape_is_packed_nd(self):
         shape = AscendTurboQuantAttentionBackend.get_kv_cache_shape(7, 128, 2, HEAD_SIZE)
@@ -524,14 +594,23 @@ class TestBackendContract(TestBase):
         self.assertIs(layer.impl.__class__, AscendTurboQuantAttentionBackendImpl)
         self.assertEqual(layer.kv_cache_torch_dtype, torch.int8)
 
-    def test_scale_cache_shape_follows_the_packed_cache(self):
+    def test_scale_cache_is_indexed_by_token_and_burst_aligned(self):
+        # Indexing by token rather than by head is what lets the kernel scatter a
+        # token's scales in one aligned burst; the slot is padded to 8 fp32 so
+        # every write lands on a 32-byte boundary.
         impl = AscendTurboQuantAttentionBackendImpl.__new__(AscendTurboQuantAttentionBackendImpl)
-        impl.key_scale_cache = None
-        impl.value_scale_cache = None
+        impl.scale_cache = None
         cache = torch.zeros(3, 128, 2, HEAD_SIZE // TURBOQUANT_PACK_FACTOR, dtype=torch.int8)
-        impl._ensure_scale_caches((cache, cache))
-        self.assertEqual(tuple(impl.key_scale_cache.shape), (3, 2, 128))
-        self.assertEqual(impl.key_scale_cache.dtype, torch.float32)
+        impl._ensure_scale_cache((cache, cache))
+        self.assertEqual(tuple(impl.scale_cache.shape), (3, 128, 8))
+        self.assertEqual(impl.scale_cache.dtype, torch.float32)
+
+    def test_scale_slot_is_a_whole_burst(self):
+        for num_kv_heads, expected in ((1, 8), (2, 8), (4, 8), (5, 16), (8, 16)):
+            slot = turboquant_scale_slot(num_kv_heads)
+            self.assertEqual(slot, expected, f"num_kv_heads={num_kv_heads}")
+            self.assertGreaterEqual(slot, 2 * num_kv_heads)
+            self.assertEqual(slot % 8, 0)
 
     def test_unsupported_states_are_rejected(self):
         impl = AscendTurboQuantAttentionBackendImpl.__new__(AscendTurboQuantAttentionBackendImpl)

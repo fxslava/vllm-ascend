@@ -56,7 +56,16 @@ TURBOQUANT_PI_SEED = 0x5F3759DF
 # Two 4-bit codes per byte.
 TURBOQUANT_PACK_FACTOR = 2
 
+# fp32 lanes in one 32-byte burst.
+TURBOQUANT_BURST_FLOATS = 8
+
+# Rows of a paged block the decode kernel handles per tile.  Must match
+# kTileRows in csrc/attention/turboquant/turboquant_kernels.cpp: the codec's
+# shuffle tables are sized for that batch, and the kernel asserts the length.
+TURBOQUANT_TILE_ROWS = 16
+
 _PI_SIGN_CACHE: dict[tuple[int, str], torch.Tensor] = {}
+_CODEC_TABLE_CACHE: dict[tuple[int, int, str], torch.Tensor] = {}
 
 
 def turboquant_pi_signs(head_size: int, device: torch.device) -> torch.Tensor:
@@ -112,6 +121,71 @@ def apply_pi(x: torch.Tensor, pi_signs: torch.Tensor) -> torch.Tensor:
     return walsh_hadamard(x * pi_signs, dim=-1) * pi_signs
 
 
+def turboquant_scale_slot(num_kv_heads: int) -> int:
+    """fp32 lanes one token occupies in the scale plane.
+
+    A token's K scales for every kv head are followed by its V scales, padded to
+    a whole 32-byte burst.  That padding is what lets the kernel scatter a
+    token's scales with one aligned ``DataCopy`` instead of ``2 * num_kv_heads``
+    four-byte writes, which were both a DMA-transaction disaster and a hazard --
+    two cores could land in the same 32-byte line.  It costs 25% on top of the
+    payload at ``num_kv_heads == 2`` and 12.5% from 4 upward.
+    """
+    lanes = 2 * num_kv_heads
+    return -(-lanes // TURBOQUANT_BURST_FLOATS) * TURBOQUANT_BURST_FLOATS
+
+
+def turboquant_codec_tables(head_size: int, batch_rows: int, device: torch.device) -> torch.Tensor:
+    """Build the codec's constant-table image.
+
+    The sign patterns, XOR shuffle offsets and nibble split tables are a pure
+    function of ``(head_size, batch_rows)``.  They used to be regenerated inside
+    the kernel on every launch -- roughly forty dependent vector instructions and
+    their pipe barriers on the critical path of each decode step.  The host
+    builds them once here and the kernel pulls the finished image into UB with a
+    single aligned ``DataCopy``.
+
+    Layout, in 4-byte words, mirroring ``TurboQuantCodec<4>::ConstTableWords``:
+
+        [0, 6D)         sign_[s] then xorOffset_[s], for strides 1, 2, 4
+        [6D, 7D)        evenOffset_ then oddOffset_, D/2 words each
+        [7D, 7D + B)    expandOffset_
+        [7D + B, +B)    oddSelect_                      (B = D * batch_rows)
+
+    ``sign_`` and ``oddSelect_`` are fp32 bit patterns, the rest uint32 byte
+    offsets for Gather; everything is four bytes wide so one int32 copy moves
+    the lot and the device needs no cast.
+    """
+    key = (head_size, batch_rows, str(device))
+    cached = _CODEC_TABLE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    word = 4  # bytes per Gather offset unit
+    channels = torch.arange(head_size, dtype=torch.int64)
+    parts: list[torch.Tensor] = []
+    for stage in range(3):
+        stride = 1 << stage
+        sign = (1 - 2 * ((channels // stride) & 1)).to(torch.float32)
+        parts.append(sign.view(torch.int32))
+        parts.append((word * (channels ^ stride)).to(torch.int32))
+
+    pairs = torch.arange(head_size // TURBOQUANT_PACK_FACTOR, dtype=torch.int64)
+    parts.append((word * TURBOQUANT_PACK_FACTOR * pairs).to(torch.int32))
+    parts.append((word * TURBOQUANT_PACK_FACTOR * pairs + word).to(torch.int32))
+
+    batch = torch.arange(head_size * batch_rows, dtype=torch.int64)
+    parts.append((word * (batch // TURBOQUANT_PACK_FACTOR)).to(torch.int32))
+    parts.append((batch % TURBOQUANT_PACK_FACTOR).to(torch.float32).view(torch.int32))
+
+    tables = torch.cat(parts).contiguous().to(device)
+    expected = 7 * head_size + 2 * head_size * batch_rows
+    if tables.numel() != expected:
+        raise RuntimeError(f"codec table image is {tables.numel()} words, expected {expected}")
+    _CODEC_TABLE_CACHE[key] = tables
+    return tables
+
+
 class AscendTurboQuantAttentionBackend(AscendAttentionBackend):
     """Backend descriptor for the 4-bit TurboQuant KV cache."""
 
@@ -160,8 +234,7 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.key_scale_cache: torch.Tensor | None = None
-        self.value_scale_cache: torch.Tensor | None = None
+        self.scale_cache: torch.Tensor | None = None
         self._pi_signs: torch.Tensor | None = None
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
@@ -175,21 +248,23 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             self._pi_signs = turboquant_pi_signs(self.head_size, device)
         return self._pi_signs
 
-    def _ensure_scale_caches(self, kv_cache: tuple[torch.Tensor, ...]) -> None:
-        """Allocate the fp32 scale planes that accompany the packed cache.
+    def codec_tables(self, device: torch.device, batch_rows: int) -> torch.Tensor:
+        return turboquant_codec_tables(self.head_size, batch_rows, device)
+
+    def _ensure_scale_cache(self, kv_cache: tuple[torch.Tensor, ...]) -> None:
+        """Allocate the fp32 scale plane that accompanies the packed cache.
 
         The packed cache shape is fixed by ``get_kv_cache_shape`` and has no room
-        for a per-vector scale, so the scales live in a side allocation of
-        ``(num_blocks, num_kv_heads, block_size)`` -- 6% on top of the payload at
-        head_size 128.
+        for a per-vector scale, so the scales live in a side allocation shaped
+        ``(num_blocks, block_size, scale_slot)``.  Indexing by token rather than
+        by head is what makes the kernel's scatter a single aligned burst; see
+        :func:`turboquant_scale_slot` for what the padding costs.
         """
-        if self.key_scale_cache is not None:
+        if self.scale_cache is not None:
             return
         num_blocks, block_size, num_kv_heads, _ = kv_cache[0].shape
-        shape = (num_blocks, num_kv_heads, block_size)
-        options = {"dtype": torch.float32, "device": kv_cache[0].device}
-        self.key_scale_cache = torch.zeros(shape, **options)
-        self.value_scale_cache = torch.zeros(shape, **options)
+        shape = (num_blocks, block_size, turboquant_scale_slot(num_kv_heads))
+        self.scale_cache = torch.zeros(shape, dtype=torch.float32, device=kv_cache[0].device)
 
     def reshape_and_cache(
         self,
@@ -212,7 +287,7 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
                 attn_metadata.reshape_cache_event.record()
             return query, key, value, output
 
-        self._ensure_scale_caches(kv_cache)
+        self._ensure_scale_cache(kv_cache)
         num_actual_tokens = attn_metadata.num_actual_tokens
         encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
         slots = attn_metadata.slot_mapping if encoder_decoder else attn_metadata.slot_mapping[:num_actual_tokens]
@@ -224,10 +299,10 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             value if encoder_decoder else value[:num_actual_tokens],
             self.key_cache,
             self.value_cache,
-            self.key_scale_cache,
-            self.value_scale_cache,
+            self.scale_cache,
             slots.to(torch.int32),
             self.pi_signs(key.device),
+            self.codec_tables(key.device, 1),
         )
         notify_kv_cache_written()
         return query, key, value, output
@@ -242,15 +317,19 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         num_tokens = query.shape[0]
         # Post-RoPE query.  The kernel rotates it, runs softmax and the value
         # accumulation in the rotated basis, and applies Pi once more on output.
+        # Two kernels behind one op: the split stage writes per-sequence-split
+        # partials, the combine stage reduces them. They are separate launches
+        # ordered by the stream because no in-kernel barrier orders an arbitrary
+        # grid; see npu_turboquant_paged_attention in the adapter header.
         torch.ops._C_ascend.npu_turboquant_paged_attention(
             query[:num_tokens],
             self.key_cache,
             self.value_cache,
-            self.key_scale_cache,
-            self.value_scale_cache,
+            self.scale_cache,
             attn_metadata.block_tables.to(torch.int32),
             attn_metadata.seq_lens.to(torch.int32),
             self.pi_signs(query.device),
+            self.codec_tables(query.device, TURBOQUANT_TILE_ROWS),
             self.num_kv_heads,
             self.num_heads,
             self.scale,
@@ -352,6 +431,5 @@ def activate_turboquant_backend(layer: torch.nn.Module) -> None:
     impl = getattr(layer, "impl", None)
     if impl is not None:
         impl.__class__ = AscendTurboQuantAttentionBackendImpl
-        impl.key_scale_cache = None
-        impl.value_scale_cache = None
+        impl.scale_cache = None
         impl._pi_signs = None
