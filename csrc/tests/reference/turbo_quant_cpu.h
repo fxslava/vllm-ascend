@@ -111,6 +111,17 @@ inline void cpu_apply_pi(float* vec, int d, const int8_t* sign_vec) {
 //   vec     [d]     input, rotated
 //   packed  [d / 2] output, low nibble = channel 2c, high nibble = 2c + 1
 //   scale           output, absmax / 7.5
+//
+// Reads exactly vec[0, d) and writes exactly packed[0, d/2) plus one float, so
+// a poisoned destination or poisoned padding beyond d/2 cannot influence the
+// result and must survive the call untouched.
+//
+// Two edges are worth knowing. The kEps floor keeps an all-zero vector from
+// dividing by zero, but the mid-rise grid has no exact zero: rint(7.5) is
+// round-half-to-even, so every channel lands on level 8 and reconstructs to
+// 0.5 * step, which for an all-zero input is ~1e-21 rather than a bit-exact
+// 0.0. And the byte is deliberately built so the extremes are reachable without
+// overflow: levels (15, 15) give 255 - 128 = +127 and (0, 0) give -128.
 inline void cpu_quantize_4bit(const float* vec, int d, int8_t* packed, float* scale) {
   float absmax = 0.0f;
   for (int i = 0; i < d; ++i) {
@@ -136,6 +147,10 @@ inline void cpu_quantize_4bit(const float* vec, int d, int8_t* packed, float* sc
 // centred levels (q - 7.5), which is what the kernel keeps in UB: it folds the
 // per-vector scale into the score row (for K) and into the softmax
 // probabilities (for V) rather than broadcasting it over head_size.
+//
+// Reads exactly packed[0, d/2) and writes exactly out[0, d).  Nothing outside
+// those two ranges is touched, which is what lets the caller hand it a slice of
+// a larger, poisoned buffer.
 inline void cpu_dequantize_4bit(const int8_t* packed, int d, float scale, float* out) {
   for (int p = 0; p < d; ++p) {
     const float byte = static_cast<float>(packed[p / kPackFactor]) + kInt8Bias;
@@ -143,6 +158,22 @@ inline void cpu_dequantize_4bit(const int8_t* packed, int d, float scale, float*
     const float low = byte - kPackHigh * high;
     const float level = (p % kPackFactor == 0) ? low : high;
     out[p] = (level - kZeroPoint) * scale;
+  }
+}
+
+// Batched expansion, mirroring TurboQuantCodec<4>::Dequantize4Bit(dst, src,
+// rows, len).  The kernel sizes its shuffle tables and its swap/scratch buffers
+// for a full `batchRows`, but a call with rows < batchRows must confine itself
+// to the live prefix: it reads packed[0, rows * d / 2) and writes
+// out[0, rows * d), and everything past those bounds -- the padding the kernel
+// leaves uninitialised -- must neither be read nor written.
+//
+// `scale` is applied uniformly; pass 1.0f for centred levels.
+inline void cpu_dequantize_4bit_batch(const int8_t* packed, int rows, int d, float scale, float* out) {
+  const size_t packed_stride = static_cast<size_t>(d / kPackFactor);
+  for (int row = 0; row < rows; ++row) {
+    cpu_dequantize_4bit(packed + static_cast<size_t>(row) * packed_stride, d, scale,
+                        out + static_cast<size_t>(row) * d);
   }
 }
 
