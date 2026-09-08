@@ -1,0 +1,287 @@
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// Host reference for the TurboQuant 4-bit KV cache, matching the layout and the
+// arithmetic of csrc/attention/turboquant/turboquant_codec_950.h element for
+// element.  Nothing here touches ACL or allocates device memory: the whole
+// pipeline runs on the CPU so its fidelity can be measured on a build machine,
+// a simulator, or anywhere else with no NPU attached.
+//
+// The transform is
+//
+//     Pi x = D (H (D x)),   D = diag(+-1),   H = normalised Walsh-Hadamard
+//
+// which is symmetric and an involution (Pi^T == Pi, Pi^2 == I), so cpu_apply_pi
+// is both the rotation and the un-rotation.  Rotation is applied to activations
+// only; no weight is ever rewritten.
+//
+// Storage per vector of D channels:
+//
+//     packed[c] = int8((q[2c] + 16 * q[2c + 1]) - 128),   c in [0, D/2)
+//     scale     = absmax(Pi x) / 7.5
+//     q         = clamp(round(Pi_x / scale + 7.5), 0, 15)
+//
+// The -128 bias is undone numerically on the way back, so nothing here depends
+// on the int8 bit pattern.
+
+#ifndef VLLM_ASCEND_TESTS_REFERENCE_TURBO_QUANT_CPU_H
+#define VLLM_ASCEND_TESTS_REFERENCE_TURBO_QUANT_CPU_H
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <limits>
+#include <vector>
+
+namespace vllm_ascend {
+namespace test {
+namespace turboquant_ref {
+
+// Mirrors TurboQuantCodec<4>.
+constexpr int kBits = 4;
+constexpr int kLevels = 1 << kBits;                 // 16
+constexpr int kPackFactor = 8 / kBits;              // 2 codes per byte
+constexpr float kLevelMax = kLevels - 1;            // 15
+constexpr float kZeroPoint = kLevelMax * 0.5f;      // 7.5, mid-rise grid
+constexpr float kPackHigh = kLevels;                // 16
+constexpr float kInt8Bias = 128.0f;
+constexpr float kEps = 1e-20f;
+
+// The +-1 diagonal the Python side derives from TURBOQUANT_PI_SEED. Reproduced
+// here with an explicit LCG so the C++ and Python halves agree byte for byte
+// without either depending on the other's RNG.
+constexpr uint32_t kPiSeed = 0x5F3759DFu;
+
+inline std::vector<int8_t> cpu_pi_sign_vector(int d) {
+  std::vector<int8_t> signs(static_cast<size_t>(d));
+  uint32_t state = kPiSeed + static_cast<uint32_t>(d);
+  for (int i = 0; i < d; ++i) {
+    state = state * 1664525u + 1013904223u;
+    signs[static_cast<size_t>(i)] = ((state >> 16) & 1u) ? 1 : -1;
+  }
+  return signs;
+}
+
+// In-place normalised fast Walsh-Hadamard transform of vec[0, d).
+// H is symmetric and orthonormal, so applying it twice is the identity.
+inline void cpu_fwht(float* vec, int d) {
+  for (int stride = 1; stride < d; stride <<= 1) {
+    for (int base = 0; base < d; base += 2 * stride) {
+      for (int j = 0; j < stride; ++j) {
+        const float top = vec[base + j];
+        const float bottom = vec[base + j + stride];
+        vec[base + j] = top + bottom;
+        vec[base + j + stride] = top - bottom;
+      }
+    }
+  }
+  const float norm = 1.0f / std::sqrt(static_cast<float>(d));
+  for (int i = 0; i < d; ++i) {
+    vec[i] *= norm;
+  }
+}
+
+// In-place Pi x = D (H (D x)).  Its own inverse: call it again to undo it.
+inline void cpu_apply_pi(float* vec, int d, const int8_t* sign_vec) {
+  for (int i = 0; i < d; ++i) {
+    vec[i] *= static_cast<float>(sign_vec[i]);
+  }
+  cpu_fwht(vec, d);
+  for (int i = 0; i < d; ++i) {
+    vec[i] *= static_cast<float>(sign_vec[i]);
+  }
+}
+
+// Quantise one already-rotated vector to 4 bits.
+//   vec     [d]     input, rotated
+//   packed  [d / 2] output, low nibble = channel 2c, high nibble = 2c + 1
+//   scale           output, absmax / 7.5
+inline void cpu_quantize_4bit(const float* vec, int d, int8_t* packed, float* scale) {
+  float absmax = 0.0f;
+  for (int i = 0; i < d; ++i) {
+    absmax = std::max(absmax, std::fabs(vec[i]));
+  }
+  absmax += kEps;
+  const float step = absmax / kZeroPoint;
+  const float inv_step = kZeroPoint / absmax;
+
+  for (int c = 0; c < d / kPackFactor; ++c) {
+    float codes[kPackFactor];
+    for (int k = 0; k < kPackFactor; ++k) {
+      const float level = std::rint(vec[c * kPackFactor + k] * inv_step + kZeroPoint);
+      codes[k] = std::min(kLevelMax, std::max(0.0f, level));
+    }
+    const float byte = codes[0] + kPackHigh * codes[1] - kInt8Bias;
+    packed[c] = static_cast<int8_t>(std::lrint(byte));
+  }
+  *scale = step;
+}
+
+// Expand d/2 packed bytes back into d channels.  Passing scale = 1 yields the
+// centred levels (q - 7.5), which is what the kernel keeps in UB: it folds the
+// per-vector scale into the score row (for K) and into the softmax
+// probabilities (for V) rather than broadcasting it over head_size.
+inline void cpu_dequantize_4bit(const int8_t* packed, int d, float scale, float* out) {
+  for (int p = 0; p < d; ++p) {
+    const float byte = static_cast<float>(packed[p / kPackFactor]) + kInt8Bias;
+    const float high = std::floor(byte / kPackHigh);
+    const float low = byte - kPackHigh * high;
+    const float level = (p % kPackFactor == 0) ? low : high;
+    out[p] = (level - kZeroPoint) * scale;
+  }
+}
+
+// One (token, kv head) write into the paged cache: rotate, quantise, scatter.
+//
+//   vec         [d]      raw activation (post-RoPE K, or raw projection V)
+//   cache       flat int8 [num_blocks, block_size, num_kv_heads, d / 2]
+//   scale_plane flat f32  [num_blocks, num_kv_heads, block_size]
+inline void cpu_reshape_and_cache_one(const float* vec, int d, const int8_t* sign_vec, int slot, int block_size,
+                                      int num_kv_heads, int kv_head, int8_t* cache, float* scale_plane) {
+  std::vector<float> rotated(vec, vec + d);
+  cpu_apply_pi(rotated.data(), d, sign_vec);
+
+  const int block = slot / block_size;
+  const int offset = slot % block_size;
+  const size_t packed_stride = static_cast<size_t>(d / kPackFactor);
+  const size_t cache_off =
+      ((static_cast<size_t>(block) * block_size + offset) * num_kv_heads + kv_head) * packed_stride;
+  const size_t scale_off =
+      (static_cast<size_t>(block) * num_kv_heads + kv_head) * block_size + offset;
+
+  cpu_quantize_4bit(rotated.data(), d, cache + cache_off, scale_plane + scale_off);
+}
+
+// Reference paged decode for one query token, executed entirely in the rotated
+// basis and un-rotated once at the end:
+//
+//     Out = Pi (sum_i alpha_i (Pi v_i))  ==  sum_i alpha_i v_i
+//
+//   query        [num_heads, d]        post-RoPE, unrotated
+//   key/value    flat int8 caches as written by cpu_reshape_and_cache_one
+//   block_table  [max_blocks_per_seq]  physical block ids
+//   out          [num_heads, d]
+inline void cpu_paged_attention_turboquant(const float* query, const int8_t* key_cache, const int8_t* value_cache,
+                                           const float* key_scale, const float* value_scale, const int32_t* block_table,
+                                           int context_len, int num_heads, int num_kv_heads, int d, int block_size,
+                                           float scale, const int8_t* sign_vec, float* out) {
+  const int group = num_heads / num_kv_heads;
+  const size_t packed_stride = static_cast<size_t>(d / kPackFactor);
+  std::vector<float> q_rot(static_cast<size_t>(d));
+  std::vector<float> k_levels(static_cast<size_t>(d));
+  std::vector<float> v_levels(static_cast<size_t>(d));
+  std::vector<float> scores(static_cast<size_t>(std::max(context_len, 0)));
+  std::vector<float> acc(static_cast<size_t>(d));
+
+  for (int head = 0; head < num_heads; ++head) {
+    const int kv_head = head / group;
+
+    // q~ = Pi q, once per head.
+    std::copy(query + static_cast<size_t>(head) * d, query + static_cast<size_t>(head + 1) * d, q_rot.begin());
+    cpu_apply_pi(q_rot.data(), d, sign_vec);
+
+    // Scores in the rotated basis.  The per-vector step multiplies the whole
+    // row, exactly as the kernel folds it.
+    float running_max = -std::numeric_limits<float>::infinity();
+    for (int i = 0; i < context_len; ++i) {
+      const int block = block_table[i / block_size];
+      const int offset = i % block_size;
+      const size_t cache_off =
+          ((static_cast<size_t>(block) * block_size + offset) * num_kv_heads + kv_head) * packed_stride;
+      const size_t scale_off =
+          (static_cast<size_t>(block) * num_kv_heads + kv_head) * block_size + offset;
+
+      cpu_dequantize_4bit(key_cache + cache_off, d, 1.0f, k_levels.data());
+      float dot = 0.0f;
+      for (int c = 0; c < d; ++c) {
+        dot += q_rot[static_cast<size_t>(c)] * k_levels[static_cast<size_t>(c)];
+      }
+      scores[static_cast<size_t>(i)] = dot * key_scale[scale_off] * scale;
+      running_max = std::max(running_max, scores[static_cast<size_t>(i)]);
+    }
+
+    float denom = 0.0f;
+    for (int i = 0; i < context_len; ++i) {
+      scores[static_cast<size_t>(i)] = std::exp(scores[static_cast<size_t>(i)] - running_max);
+      denom += scores[static_cast<size_t>(i)];
+    }
+
+    // Value accumulation, still rotated.
+    std::fill(acc.begin(), acc.end(), 0.0f);
+    for (int i = 0; i < context_len; ++i) {
+      const int block = block_table[i / block_size];
+      const int offset = i % block_size;
+      const size_t cache_off =
+          ((static_cast<size_t>(block) * block_size + offset) * num_kv_heads + kv_head) * packed_stride;
+      const size_t scale_off =
+          (static_cast<size_t>(block) * num_kv_heads + kv_head) * block_size + offset;
+
+      cpu_dequantize_4bit(value_cache + cache_off, d, 1.0f, v_levels.data());
+      const float weight = scores[static_cast<size_t>(i)] * value_scale[scale_off];
+      for (int c = 0; c < d; ++c) {
+        acc[static_cast<size_t>(c)] += weight * v_levels[static_cast<size_t>(c)];
+      }
+    }
+
+    const float inv_denom = 1.0f / (denom + kEps);
+    for (int c = 0; c < d; ++c) {
+      acc[static_cast<size_t>(c)] *= inv_denom;
+    }
+
+    // Out = Pi Out~.
+    cpu_apply_pi(acc.data(), d, sign_vec);
+    std::copy(acc.begin(), acc.end(), out + static_cast<size_t>(head) * d);
+  }
+}
+
+// --- fidelity metrics -------------------------------------------------------
+
+struct FidelityMetrics {
+  double cosine_similarity = 0.0;
+  double snr_db = 0.0;
+  double relative_l2 = 0.0;
+};
+
+inline FidelityMetrics cpu_fidelity(const std::vector<float>& actual, const std::vector<float>& expected) {
+  FidelityMetrics m;
+  const size_t n = std::min(actual.size(), expected.size());
+  double dot = 0.0;
+  double norm_a = 0.0;
+  double norm_e = 0.0;
+  double noise = 0.0;
+  for (size_t i = 0; i < n; ++i) {
+    const double a = actual[i];
+    const double e = expected[i];
+    dot += a * e;
+    norm_a += a * a;
+    norm_e += e * e;
+    noise += (a - e) * (a - e);
+  }
+  const double denom = std::sqrt(norm_a) * std::sqrt(norm_e);
+  m.cosine_similarity = denom > 0.0 ? dot / denom : 0.0;
+  m.relative_l2 = norm_e > 0.0 ? std::sqrt(noise / norm_e) : 0.0;
+  // 10 * log10 of a power ratio; the signal and noise are already energies.
+  m.snr_db = noise > 0.0 ? 10.0 * std::log10(norm_e / noise) : std::numeric_limits<double>::infinity();
+  return m;
+}
+
+}  // namespace turboquant_ref
+}  // namespace test
+}  // namespace vllm_ascend
+
+#endif  // VLLM_ASCEND_TESTS_REFERENCE_TURBO_QUANT_CPU_H

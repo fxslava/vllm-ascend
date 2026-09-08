@@ -79,6 +79,20 @@ else()
     )
 endif()
 
+# TurboQuant 4-bit KV cache kernels.  They live in their own AscendC library
+# because vllm_ascend_kernels is skipped on 950; these sources build for both
+# arch32 (910B) and arch35 (950PR) and are gated off only where they cannot run.
+if(SOC_VERSION MATCHES "ascend910b.*|ascend910_93|ascend950")
+    set(VLLM_ASCEND_BUILD_TURBOQUANT ON)
+    message(STATUS "Hardware ${SOC_VERSION} detected: building TurboQuant KV cache kernels")
+    ascendc_library(vllm_ascend_turboquant SHARED
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/turboquant_kernels.cpp
+    )
+else()
+    set(VLLM_ASCEND_BUILD_TURBOQUANT OFF)
+    message(STATUS "Hardware ${SOC_VERSION} detected: skip TurboQuant KV cache kernels")
+endif()
+
 message("TORCH_NPU_PATH is ${TORCH_NPU_PATH}")
 
 if(SOC_VERSION MATCHES "ascend310p.*")
@@ -156,6 +170,10 @@ if(SOC_VERSION MATCHES "ascend310p.*")
     target_compile_definitions(vllm_ascend_C PRIVATE -DASCEND_PLATFORM_310P)
 endif()
 
+if(VLLM_ASCEND_BUILD_TURBOQUANT)
+    target_compile_definitions(vllm_ascend_C PRIVATE -DVLLM_ENABLE_TURBOQUANT)
+endif()
+
 if(NOT (SOC_VERSION MATCHES "ascend310p.*|ascend950"))
     target_compile_definitions(vllm_ascend_C PRIVATE -DVLLM_ENABLE_ATB_AND_DIRECT_KERNELS)
 endif()
@@ -195,10 +213,18 @@ else()
   )
 endif()
 
+if(VLLM_ASCEND_BUILD_TURBOQUANT)
+  target_link_libraries(vllm_ascend_C PUBLIC vllm_ascend_turboquant)
+endif()
+
 target_link_options(vllm_ascend_C PRIVATE "-Wl,-rpath,$ORIGIN:$ORIGIN/lib:$ORIGIN/_cann_ops_custom/vendors/custom_transformer/op_api/lib")
 
 if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
   install(TARGETS vllm_ascend_C DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
 else()
   install(TARGETS vllm_ascend_C vllm_ascend_kernels DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
+endif()
+
+if(VLLM_ASCEND_BUILD_TURBOQUANT)
+  install(TARGETS vllm_ascend_turboquant DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
 endif()
