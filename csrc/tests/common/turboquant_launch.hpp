@@ -177,6 +177,10 @@ ReshapeAndCacheGrid PlanReshapeAndCache(int64_t num_tokens, int64_t aiv_num);
 // used. The split stage has num_splits times as many tasks as the combine
 // stage, and sizing them separately keeps the combine launch from spawning
 // cores with nothing to do.
+//
+// Mirrors turboquant_adpt::PagedAttentionPlan and PlanPagedAttention(), which
+// is the single place the production path derives all of this - the operator
+// and the host that pre-allocates the workspace both read it from there.
 struct PagedAttentionGrid {
   uint32_t split_block_dim = 0;
   uint32_t combine_block_dim = 0;

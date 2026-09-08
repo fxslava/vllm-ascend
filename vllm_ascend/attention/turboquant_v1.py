@@ -40,6 +40,7 @@ import torch_npu
 from vllm.logger import logger
 from vllm.v1.attention.backend import AttentionLayer, AttentionType  # type: ignore
 
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionBackendImpl,
@@ -66,6 +67,25 @@ TURBOQUANT_TILE_ROWS = 16
 
 _PI_SIGN_CACHE: dict[tuple[int, str], torch.Tensor] = {}
 _CODEC_TABLE_CACHE: dict[tuple[int, int, str], torch.Tensor] = {}
+
+# Distinct decode shapes whose workspace size is remembered before the memo is
+# dropped; see AscendTurboQuantAttentionBackendImpl._decode_workspace.
+_WORKSPACE_MEMO_LIMIT = 1024
+
+
+def _is_capturing() -> bool:
+    """Whether an ACL graph capture is in progress.
+
+    Reading the flag needs a live forward context, and the answer is only ever
+    used to refuse an allocation that would be unsafe *inside* a capture. Where
+    there is no forward context at all there is no capture either, so a missing
+    one is answered rather than raised -- that keeps a diagnostic from turning
+    into the failure it exists to describe.
+    """
+    try:
+        return bool(_EXTRA_CTX.capturing)
+    except (AssertionError, AttributeError, RuntimeError):
+        return False
 
 
 def turboquant_pi_signs(head_size: int, device: torch.device) -> torch.Tensor:
@@ -236,11 +256,20 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         super().__init__(*args, **kwargs)
         self.scale_cache: torch.Tensor | None = None
         self._pi_signs: torch.Tensor | None = None
+        # Scratch for the decode split/combine reduction, grown to a high-water
+        # mark and then reused forever; see _decode_workspace.
+        self.decode_workspace: torch.Tensor | None = None
+        self._workspace_floats: dict[tuple[int, int], int] = {}
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
         # Nothing is folded into the weights: q_proj, k_proj, v_proj and o_proj
         # stay exactly as loaded, which is what keeps RoPE correct.
         super().process_weights_after_loading(act_dtype)
+        # Prime the C++ device registry while we are still loading. The vector
+        # core count is what sizes both kernels' grids, and the driver query
+        # behind it is only ever paid on this first call -- here, rather than on
+        # a decode step or, worse, inside a graph capture.
+        torch.ops._C_ascend.npu_turboquant_vector_core_num()
         logger.info_once("[vllm-ascend/turboquant] 4-bit KV cache active; Pi is applied at runtime in the kernel")
 
     def pi_signs(self, device: torch.device) -> torch.Tensor:
@@ -307,6 +336,67 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         notify_kv_cache_written()
         return query, key, value, output
 
+    def _decode_workspace(self, num_tokens: int, max_blocks_per_seq: int, device: torch.device) -> torch.Tensor:
+        """Return scratch for the decode split/combine stages.
+
+        The split stage writes one partial per (token, head, sequence split) and
+        the combine stage reduces them.  That buffer used to be an ``at::empty``
+        inside the operator, which put an allocation on every decode step and
+        left the operator uncapturable: a graph replays the addresses it was
+        captured with, and a fresh allocation each step is a different address.
+
+        So the buffer lives here instead, is grown only when a decode needs more
+        than any seen before, and is otherwise handed to the kernel unchanged.
+        Steady-state decode allocates nothing.  "More" is deliberately not "a
+        bigger batch": a batch small enough to leave cores idle is split further
+        along the sequence, so the peak requirement can sit at a *small* decode.
+
+        The size comes from the operator's own arithmetic rather than a copy of
+        it -- the split count depends on the device's vector core count, which
+        only the C++ side knows -- and is memoised per shape so the hot path
+        costs a dict lookup rather than an operator dispatch.
+        """
+        key = (num_tokens, max_blocks_per_seq)
+        needed = self._workspace_floats.get(key)
+        if needed is None:
+            if len(self._workspace_floats) >= _WORKSPACE_MEMO_LIMIT:
+                # A memo, not a table. Captured runs reuse a handful of shapes
+                # forever, but an uncaptured one drifts through new
+                # max_blocks_per_seq as sequences grow, and a dict that only
+                # ever grows is a slow leak. Dropping it costs one operator
+                # dispatch per shape afterwards.
+                self._workspace_floats.clear()
+            needed = int(
+                torch.ops._C_ascend.npu_turboquant_workspace_size(
+                    num_tokens, self.num_heads, self.head_size, max_blocks_per_seq
+                )
+            )
+            self._workspace_floats[key] = needed
+
+        workspace = self.decode_workspace
+        if workspace is not None and workspace.numel() >= needed:
+            return workspace
+
+        if _is_capturing():
+            # Replacing the buffer mid-capture would bake a pointer into the
+            # graph that nothing owns by the time it replays.  What keeps this
+            # from firing is that vLLM warms every capture size up with
+            # capturing unset before it captures that size, so the buffer has
+            # already grown by the time the capture runs.  Note it is the warmup
+            # and not the capture order that saves us: the requirement is not
+            # monotonic in num_tokens -- a small batch leaves cores idle, which
+            # raises num_splits and can need *more* scratch than a large one --
+            # so capturing widest-first would not on its own be enough.
+            raise RuntimeError(
+                "[vllm-ascend/turboquant] the decode workspace would have to grow to "
+                f"{needed} float32 words during a graph capture "
+                f"(num_tokens={num_tokens}, max_blocks_per_seq={max_blocks_per_seq}). "
+                "Run this shape once outside capture so the buffer is sized first."
+            )
+
+        self.decode_workspace = torch.empty(needed, dtype=torch.float32, device=device)
+        return self.decode_workspace
+
     def forward_paged_attention(
         self,
         query: torch.Tensor,
@@ -318,18 +408,21 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         # Post-RoPE query.  The kernel rotates it, runs softmax and the value
         # accumulation in the rotated basis, and applies Pi once more on output.
         # Two kernels behind one op: the split stage writes per-sequence-split
-        # partials, the combine stage reduces them. They are separate launches
-        # ordered by the stream because no in-kernel barrier orders an arbitrary
-        # grid; see npu_turboquant_paged_attention in the adapter header.
+        # partials into the persistent workspace, the combine stage reduces
+        # them. They are separate launches ordered by the stream because no
+        # in-kernel barrier orders an arbitrary grid; see
+        # npu_turboquant_paged_attention in the adapter header.
+        block_tables = attn_metadata.block_tables.to(torch.int32)
         torch.ops._C_ascend.npu_turboquant_paged_attention(
             query[:num_tokens],
             self.key_cache,
             self.value_cache,
             self.scale_cache,
-            attn_metadata.block_tables.to(torch.int32),
+            block_tables,
             attn_metadata.seq_lens.to(torch.int32),
             self.pi_signs(query.device),
             self.codec_tables(query.device, TURBOQUANT_TILE_ROWS),
+            self._decode_workspace(num_tokens, block_tables.shape[1], query.device),
             self.num_kv_heads,
             self.num_heads,
             self.scale,
@@ -433,3 +526,5 @@ def activate_turboquant_backend(layer: torch.nn.Module) -> None:
         impl.__class__ = AscendTurboQuantAttentionBackendImpl
         impl.scale_cache = None
         impl._pi_signs = None
+        impl.decode_workspace = None
+        impl._workspace_floats = {}

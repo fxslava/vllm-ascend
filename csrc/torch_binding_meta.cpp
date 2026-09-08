@@ -1925,9 +1925,11 @@ void npu_turboquant_reshape_and_cache_meta(at::Tensor &, at::Tensor &, at::Tenso
 {
 }
 
+// The workspace is scratch the caller owns, so tracing it needs nothing beyond
+// the argument existing: the operator reads none of it and leaves nothing in it.
 void npu_turboquant_paged_attention_meta(at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &,
-                                         at::Tensor &, at::Tensor &, at::Tensor &, int64_t, int64_t, double,
-                                         at::Tensor &)
+                                         at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, int64_t, int64_t,
+                                         double, at::Tensor &)
 {
 }
 #endif

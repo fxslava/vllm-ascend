@@ -3173,11 +3173,35 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(CONCAT(_C, _ascend), ops)
         "                               Tensor context_lens, "
         "                               Tensor pi_signs, "
         "                               Tensor codec_tables, "
+        "                               Tensor! workspace, "
         "                               int num_kv_heads, "
         "                               int num_heads, "
         "                               float scale_value, "
         "                               Tensor! out) -> ()");
     ops.impl("npu_turboquant_paged_attention", torch::kPrivateUse1,
              &vllm_ascend::npu_turboquant_paged_attention);
+
+    // Host-side helpers, called while the model loads rather than on the decode
+    // path: the first primes the cached device registry, the second sizes the
+    // persistent decode workspace from the same arithmetic the operator uses.
+    // Neither belongs inside a captured graph.
+    //
+    // Registered as catch-all kernels rather than under kPrivateUse1: neither
+    // takes a tensor, so there is no argument for the dispatcher to read a
+    // backend key off, and a PrivateUse1-only kernel would be unreachable.
+    // Both are plain host functions that ask the NPU driver about the calling
+    // thread's device, so having one implementation for every key is also the
+    // honest description.
+    ops.def("npu_turboquant_vector_core_num() -> int");
+    ops.impl("npu_turboquant_vector_core_num",
+             &vllm_ascend::npu_turboquant_vector_core_num);
+
+    ops.def(
+        "npu_turboquant_workspace_size(int num_tokens, "
+        "                              int num_heads, "
+        "                              int head_size, "
+        "                              int max_blocks_per_seq) -> int");
+    ops.impl("npu_turboquant_workspace_size",
+             &vllm_ascend::npu_turboquant_workspace_size);
 }
 #endif

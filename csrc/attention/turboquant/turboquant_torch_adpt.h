@@ -20,12 +20,12 @@
 #include <acl/acl.h>
 #include <torch/library.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
-#include <torch_npu/csrc/framework/OpCommand.h>
 
 #include <algorithm>
 #include <cmath>
 
 #include "../../kernels/types.h"
+#include "../../npu_device_registry.h"
 
 namespace vllm_ascend {
 
@@ -68,13 +68,15 @@ inline AscendType ToAscendType(at::ScalarType scalarType)
     return scalarType == at::ScalarType::BFloat16 ? AscendType::BF16 : AscendType::FP16;
 }
 
+// AI Vector cores on the device this rank is bound to.
+//
+// The count is fetched from the driver once per device and cached; see
+// csrc/npu_device_registry.h. Resolving the device per call rather than
+// assuming 0 is what makes this correct under tensor parallelism, where every
+// rank drives a different NPU.
 inline int64_t VectorCoreNum()
 {
-    int64_t aivNum = 0;
-    TORCH_CHECK(aclGetDeviceCapability(0, ACL_DEVICE_INFO_VECTOR_CORE_NUM, &aivNum) == ACL_SUCCESS,
-                "failed to query ACL_DEVICE_INFO_VECTOR_CORE_NUM");
-    TORCH_CHECK(aivNum > 0, "device reported a non-positive vector core count");
-    return aivNum;
+    return device_registry::VectorCoreNum();
 }
 
 inline int64_t CeilDiv(int64_t a, int64_t b)
@@ -115,7 +117,96 @@ inline void CheckCodecTables(const at::Tensor &tables, int64_t headSize, int64_t
                 batchRows, ", got ", tables.numel());
 }
 
+// fp32 words one flash-decoding partial occupies: the accumulator itself
+// followed by the running max and running sum blocks.
+inline int64_t PartialStride(int64_t headSize)
+{
+    return headSize + kPartialTail;
+}
+
+// Everything about a paged-attention launch that is a pure function of the
+// shapes and the core count: the split count, the workspace it needs, and the
+// two grids.
+//
+// Both stages are planned in one place, so the workspace the host allocates and
+// the workspace the split stage writes cannot drift apart.  Mirrored for the
+// torch-free suite by PlanPagedAttention() in
+// csrc/tests/common/turboquant_launch.cpp.
+struct PagedAttentionPlan {
+    int64_t num_splits = 1;
+    // fp32 words the split stage writes and the combine stage reads:
+    // base_tasks * num_splits * PartialStride(head_size).
+    int64_t workspace_floats = 0;
+    uint32_t split_block_dim = 0;
+    uint32_t combine_block_dim = 0;
+    uint32_t split_tasks_per_core = 0;
+    uint32_t combine_tasks_per_core = 0;
+};
+
+inline PagedAttentionPlan PlanPagedAttention(int64_t numTokens, int64_t numHeads, int64_t headSize,
+                                             int64_t maxBlocksPerSeq, int64_t aivNum)
+{
+    PagedAttentionPlan plan;
+
+    const int64_t base_tasks = numTokens * numHeads;
+    if (base_tasks <= 0) {
+        return plan;
+    }
+
+    // Split the sequence only while there are idle cores to hand the pieces to,
+    // and never past the number of blocks there are to split.
+    int64_t num_splits = CeilDiv(aivNum, base_tasks);
+    num_splits = std::min(num_splits, std::min<int64_t>(kMaxSequenceSplits, std::max<int64_t>(1, maxBlocksPerSeq)));
+    num_splits = std::max<int64_t>(num_splits, 1);
+
+    // Each stage gets its own grid: the split stage has num_splits times as many
+    // tasks as the combine stage, and sizing them separately keeps the combine
+    // launch from spawning cores with nothing to do.
+    const int64_t split_tasks = base_tasks * num_splits;
+    const int64_t split_tasks_per_core = CeilDiv(split_tasks, aivNum);
+    const int64_t combine_tasks_per_core = CeilDiv(base_tasks, aivNum);
+
+    plan.num_splits = num_splits;
+    plan.workspace_floats = split_tasks * PartialStride(headSize);
+    plan.split_block_dim = static_cast<uint32_t>(CeilDiv(split_tasks, split_tasks_per_core));
+    plan.combine_block_dim = static_cast<uint32_t>(CeilDiv(base_tasks, combine_tasks_per_core));
+    plan.split_tasks_per_core = static_cast<uint32_t>(split_tasks_per_core);
+    plan.combine_tasks_per_core = static_cast<uint32_t>(combine_tasks_per_core);
+    return plan;
+}
+
 }  // namespace turboquant_adpt
+
+/*
+ * AI Vector cores on this rank's device, from the cached registry.
+ *
+ * Exposed so the host can prime the registry while the model is still loading:
+ * the first query is the only one that reaches the driver, and paying it at
+ * load time keeps it off the decode path and out of a graph capture.
+ */
+inline int64_t npu_turboquant_vector_core_num()
+{
+    return turboquant_adpt::VectorCoreNum();
+}
+
+/*
+ * fp32 words of workspace npu_turboquant_paged_attention needs for a decode of
+ * this shape.
+ *
+ * The caller owns the buffer.  This exists so the host can allocate it once,
+ * ahead of the hot path, from the same arithmetic the operator itself uses --
+ * rather than the two sides each carrying their own copy of the formula.
+ */
+inline int64_t npu_turboquant_workspace_size(int64_t num_tokens, int64_t num_heads, int64_t head_size,
+                                             int64_t max_blocks_per_seq)
+{
+    namespace adpt = turboquant_adpt;
+    TORCH_CHECK(num_tokens >= 0 && num_heads > 0, "workspace sizing needs num_tokens >= 0 and num_heads > 0, got ",
+                num_tokens, " and ", num_heads);
+    adpt::CheckHeadSize(head_size);
+    return adpt::PlanPagedAttention(num_tokens, num_heads, head_size, max_blocks_per_seq, adpt::VectorCoreNum())
+        .workspace_floats;
+}
 
 /*
  * Rotate, quantise to 4 bits and scatter K/V into the ND paged cache.
@@ -180,44 +271,37 @@ inline void npu_turboquant_reshape_and_cache(at::Tensor &key, at::Tensor &value,
         return;
     }
 
-    const at::ScalarType scalar_type = key.scalar_type();
     const int64_t aiv_num = adpt::VectorCoreNum();
     const int64_t tokens_per_core = adpt::CeilDiv(num_tokens, aiv_num);
     const uint32_t block_dim = static_cast<uint32_t>(adpt::CeilDiv(num_tokens, tokens_per_core));
     const float inv_sqrt_len = 1.0f / std::sqrt(static_cast<float>(head_size));
 
-    void *key_ptr = key.data_ptr();
-    void *value_ptr = value.data_ptr();
-    void *key_cache_ptr = key_cache.data_ptr();
-    void *value_cache_ptr = value_cache.data_ptr();
-    void *scale_cache_ptr = scale_cache.data_ptr();
-    void *slot_ptr = slot_mapping.data_ptr();
-    void *signs_ptr = pi_signs.data_ptr();
-    void *tables_ptr = codec_tables.data_ptr();
+    // Pushed straight onto the current stream rather than through
+    // OpCommand::SetCustomHandler, which would wrap the launch in a std::function
+    // and hand it to torch_npu's task-queue thread -- host work per launch, once
+    // per layer per step, for a kernel that needs none of it.
+    //
+    // getCurrentNPUStream().stream() drains that pending queue before returning
+    // the raw handle, so work pushed here still lands behind whatever this
+    // thread queued earlier. The launch itself is asynchronous: the host does
+    // not wait, and nothing here is a callback the device has to call back into.
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
-
-    at_npu::native::OpCommand cmd;
-    cmd.Name("npu_turboquant_reshape_and_cache");
-    cmd.SetCustomHandler([scalar_type, stream, block_dim, key_ptr, value_ptr, key_cache_ptr, value_cache_ptr,
-                          scale_cache_ptr, slot_ptr, signs_ptr, tables_ptr, num_tokens, num_kv_heads, head_size,
-                          block_size, tokens_per_core, inv_sqrt_len]() -> int {
-        turboquant_reshape_and_cache_impl(
-            turboquant_adpt::ToAscendType(scalar_type), stream, block_dim, key_ptr, value_ptr, key_cache_ptr,
-            value_cache_ptr, scale_cache_ptr, slot_ptr, signs_ptr, tables_ptr, static_cast<uint32_t>(num_tokens),
-            static_cast<uint32_t>(num_kv_heads), static_cast<uint32_t>(head_size), static_cast<uint32_t>(block_size),
-            static_cast<uint32_t>(tokens_per_core), inv_sqrt_len);
-        return 0;
-    });
-    cmd.Run();
+    turboquant_reshape_and_cache_impl(
+        adpt::ToAscendType(key.scalar_type()), stream, block_dim, key.data_ptr(), value.data_ptr(),
+        key_cache.data_ptr(), value_cache.data_ptr(), scale_cache.data_ptr(), slot_mapping.data_ptr(),
+        pi_signs.data_ptr(), codec_tables.data_ptr(), static_cast<uint32_t>(num_tokens),
+        static_cast<uint32_t>(num_kv_heads), static_cast<uint32_t>(head_size), static_cast<uint32_t>(block_size),
+        static_cast<uint32_t>(tokens_per_core), inv_sqrt_len);
 }
 
 /*
  * Paged decode attention over the 4-bit cache.
  *
- *   query        [num_tokens, num_heads, head_size]  fp16 | bf16
- *   block_tables [num_tokens, max_blocks_per_seq]    int32
- *   context_lens [num_tokens]                        int32
- *   out          [num_tokens, num_heads, head_size]  same dtype as query
+ *   query        [num_tokens, num_heads, head_size]         fp16 | bf16
+ *   block_tables [num_tokens, max_blocks_per_seq]           int32
+ *   context_lens [num_tokens]                               int32
+ *   workspace    [>= npu_turboquant_workspace_size(...)]    fp32
+ *   out          [num_tokens, num_heads, head_size]         same dtype as query
  *
  * `query` is the post-RoPE query.  The kernel rotates it once, runs the whole
  * softmax and value accumulation in the rotated basis, and applies Pi to the
@@ -225,17 +309,24 @@ inline void npu_turboquant_reshape_and_cache(at::Tensor &key, at::Tensor &value,
  * un-rotation.
  *
  * This dispatches *two* kernels on the current stream.  The split stage writes
- * one partial per (token, head, sequence split) into a workspace; the combine
+ * one partial per (token, head, sequence split) into `workspace`; the combine
  * stage reduces them.  The two cannot share a launch: an in-kernel barrier only
  * orders blocks that are co-resident, so with a grid larger than the physical
  * core count it either reads partials that were never written or deadlocks.
  * Stream order between two launches is the guarantee that always holds.
+ *
+ * `workspace` is caller-owned scratch, not an output: the split stage writes
+ * every word the combine stage reads, so whatever it arrives holding is
+ * irrelevant and nothing in it is meant to survive the call.  It is an argument
+ * rather than an at::empty here because a decode step must not allocate -- an
+ * allocation is host latency on the critical path, and inside a graph capture
+ * it is a buffer whose address the replay has no reason to reuse.
  */
 inline void npu_turboquant_paged_attention(at::Tensor &query, at::Tensor &key_cache, at::Tensor &value_cache,
                                            at::Tensor &scale_cache, at::Tensor &block_tables,
                                            at::Tensor &context_lens, at::Tensor &pi_signs, at::Tensor &codec_tables,
-                                           int64_t num_kv_heads, int64_t num_heads, double scale_value,
-                                           at::Tensor &out)
+                                           at::Tensor &workspace, int64_t num_kv_heads, int64_t num_heads,
+                                           double scale_value, at::Tensor &out)
 {
     namespace adpt = turboquant_adpt;
 
@@ -284,58 +375,36 @@ inline void npu_turboquant_paged_attention(at::Tensor &query, at::Tensor &key_ca
         return;
     }
 
-    const int64_t aiv_num = adpt::VectorCoreNum();
-    const int64_t base_tasks = num_tokens * num_heads;
-    int64_t num_splits = adpt::CeilDiv(aiv_num, base_tasks);
-    num_splits = std::min(num_splits,
-                          std::min<int64_t>(adpt::kMaxSequenceSplits, std::max<int64_t>(1, max_blocks_per_seq)));
-    num_splits = std::max<int64_t>(num_splits, 1);
+    const adpt::PagedAttentionPlan plan =
+        adpt::PlanPagedAttention(num_tokens, num_heads, head_size, max_blocks_per_seq, adpt::VectorCoreNum());
 
-    const int64_t partial_stride = head_size + adpt::kPartialTail;
-    at::Tensor workspace = at::empty({base_tasks * num_splits * partial_stride}, query.options().dtype(at::kFloat));
+    TORCH_CHECK(workspace.scalar_type() == at::ScalarType::Float, "the decode workspace must be float32, got ",
+                workspace.scalar_type());
+    TORCH_CHECK(workspace.is_contiguous(), "the decode workspace must be contiguous");
+    // Larger than needed is fine and expected -- the host sizes one buffer for
+    // the widest decode it will run and reuses it for narrower ones.  Too small
+    // is not survivable, so it is caught here rather than as a stray
+    // out-of-bounds write from the split stage.
+    TORCH_CHECK(workspace.numel() >= plan.workspace_floats, "the decode workspace holds ", workspace.numel(),
+                " float32 words but this launch needs ", plan.workspace_floats, " (num_tokens ", num_tokens,
+                ", num_heads ", num_heads, ", head_size ", head_size, ", num_splits ", plan.num_splits,
+                "); size it with npu_turboquant_workspace_size");
 
-    // Each stage gets its own grid: the split stage has num_splits times as many
-    // tasks as the combine stage, and sizing them separately keeps the combine
-    // launch from spawning cores with nothing to do.
-    const int64_t split_tasks = base_tasks * num_splits;
-    const int64_t split_tasks_per_core = adpt::CeilDiv(split_tasks, aiv_num);
-    const int64_t combine_tasks_per_core = adpt::CeilDiv(base_tasks, aiv_num);
-    const uint32_t split_block_dim = static_cast<uint32_t>(adpt::CeilDiv(split_tasks, split_tasks_per_core));
-    const uint32_t combine_block_dim = static_cast<uint32_t>(adpt::CeilDiv(base_tasks, combine_tasks_per_core));
     const float inv_sqrt_len = 1.0f / std::sqrt(static_cast<float>(head_size));
     const float scale = static_cast<float>(scale_value);
 
-    const at::ScalarType scalar_type = query.scalar_type();
-    void *query_ptr = query.data_ptr();
-    void *key_cache_ptr = key_cache.data_ptr();
-    void *value_cache_ptr = value_cache.data_ptr();
-    void *scale_cache_ptr = scale_cache.data_ptr();
-    void *block_tables_ptr = block_tables.data_ptr();
-    void *context_lens_ptr = context_lens.data_ptr();
-    void *signs_ptr = pi_signs.data_ptr();
-    void *tables_ptr = codec_tables.data_ptr();
-    void *workspace_ptr = workspace.data_ptr();
-    void *out_ptr = out.data_ptr();
+    // See the reshape-and-cache launch above for why this goes straight onto the
+    // stream. The split-before-combine ordering the two stages depend on is the
+    // stream's, and two launches into the same stream keep it.
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
-
-    at_npu::native::OpCommand cmd;
-    cmd.Name("npu_turboquant_paged_attention");
-    cmd.SetCustomHandler([scalar_type, stream, split_block_dim, combine_block_dim, query_ptr, key_cache_ptr,
-                          value_cache_ptr, scale_cache_ptr, block_tables_ptr, context_lens_ptr, signs_ptr, tables_ptr,
-                          workspace_ptr, out_ptr, num_tokens, num_heads, num_kv_heads, head_size, block_size,
-                          max_blocks_per_seq, num_splits, split_tasks_per_core, combine_tasks_per_core, scale,
-                          inv_sqrt_len]() -> int {
-        turboquant_paged_attention_impl(
-            turboquant_adpt::ToAscendType(scalar_type), stream, split_block_dim, combine_block_dim, query_ptr,
-            key_cache_ptr, value_cache_ptr, scale_cache_ptr, block_tables_ptr, context_lens_ptr, signs_ptr,
-            tables_ptr, workspace_ptr, out_ptr, static_cast<uint32_t>(num_tokens), static_cast<uint32_t>(num_heads),
-            static_cast<uint32_t>(num_kv_heads), static_cast<uint32_t>(head_size), static_cast<uint32_t>(block_size),
-            static_cast<uint32_t>(max_blocks_per_seq), static_cast<uint32_t>(num_splits),
-            static_cast<uint32_t>(split_tasks_per_core), static_cast<uint32_t>(combine_tasks_per_core), scale,
-            inv_sqrt_len);
-        return 0;
-    });
-    cmd.Run();
+    turboquant_paged_attention_impl(
+        adpt::ToAscendType(query.scalar_type()), stream, plan.split_block_dim, plan.combine_block_dim,
+        query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(), scale_cache.data_ptr(),
+        block_tables.data_ptr(), context_lens.data_ptr(), pi_signs.data_ptr(), codec_tables.data_ptr(),
+        workspace.data_ptr(), out.data_ptr(), static_cast<uint32_t>(num_tokens), static_cast<uint32_t>(num_heads),
+        static_cast<uint32_t>(num_kv_heads), static_cast<uint32_t>(head_size), static_cast<uint32_t>(block_size),
+        static_cast<uint32_t>(max_blocks_per_seq), static_cast<uint32_t>(plan.num_splits), plan.split_tasks_per_core,
+        plan.combine_tasks_per_core, scale, inv_sqrt_len);
 }
 
 }  // namespace vllm_ascend
