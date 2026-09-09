@@ -31,8 +31,13 @@
 // Storage per vector of D channels:
 //
 //     packed[c] = int8((q[2c] + 16 * q[2c + 1]) - 128),   c in [0, D/2)
-//     scale     = absmax(Pi x) / 7.5
-//     q         = clamp(round(Pi_x / scale + 7.5), 0, 15)
+//     scale     = ||Pi x||_2 / sqrt(D)
+//     q         = sum_{i=1}^{15} [Pi_x / scale > t_i]
+//
+// reconstructing as scale * c[q] against the 16-level Lloyd-Max table for
+// N(0, 1). The rotation is what makes that the right table: it drives the
+// coordinate distribution to very nearly i.i.d. standard normal, so the codec
+// quantises against the density it actually sees.
 //
 // The -128 bias is undone numerically on the way back, so nothing here depends
 // on the int8 bit pattern.
@@ -57,10 +62,31 @@ constexpr int kBits = 4;
 constexpr int kLevels = 1 << kBits;                 // 16
 constexpr int kPackFactor = 8 / kBits;              // 2 codes per byte
 constexpr float kLevelMax = kLevels - 1;            // 15
-constexpr float kZeroPoint = kLevelMax * 0.5f;      // 7.5, mid-rise grid
+constexpr int kThresholdCount = kLevels - 1;        // 15 decision boundaries
 constexpr float kPackHigh = kLevels;                // 16
 constexpr float kInt8Bias = 128.0f;
 constexpr float kEps = 1e-20f;
+
+// The 16-level Lloyd-Max quantiser for N(0, 1): the fixed point of
+//
+//     t_i = (c_{i-1} + c_i) / 2,     c_i = E[X | t_i < X < t_{i+1}],
+//
+// with distortion E[(X - Q(X))^2] = 0.0095010080 (20.222 dB) against 0.01388
+// for the uniform mid-rise grid it replaced. Byte-identical to
+// TurboQuantCodec<4>::Threshold() and to the centroid table the host writes
+// into the codec's constant-table image, and to LLOYD_MAX_4BIT_{CENTROIDS,
+// THRESHOLDS} in scripts/tq_kv_quant_reference.py, which can re-derive them.
+constexpr float kLloydMaxCentroids[kLevels] = {
+    -2.7325895709951710f, -2.0690172265313920f, -1.6180463860218863f, -1.2562311973471796f,
+    -0.9423404564869651f, -0.6567591185324659f, -0.3880482994902919f, -0.1283950298511473f,
+    0.1283950298511473f,  0.3880482994902919f,  0.6567591185324659f,  0.9423404564869651f,
+    1.2562311973471796f,  1.6180463860218863f,  2.0690172265313920f,  2.7325895709951710f};
+
+constexpr float kLloydMaxThresholds[kThresholdCount] = {
+    -2.4008033987632817f, -1.8435318062766393f, -1.4371387916845330f, -1.0992858269170722f,
+    -0.7995497875097155f, -0.5224037090113789f, -0.2582216646707196f, 0.0f,
+    0.2582216646707196f,  0.5224037090113789f,  0.7995497875097155f,  1.0992858269170722f,
+    1.4371387916845330f,  1.8435318062766393f,  2.4008033987632817f};
 
 // The +-1 diagonal the Python side derives from TURBOQUANT_PI_SEED. Reproduced
 // here with an explicit LCG so the C++ and Python halves agree byte for byte
@@ -107,46 +133,73 @@ inline void cpu_apply_pi(float* vec, int d, const int8_t* sign_vec) {
   }
 }
 
+// The RMS scale the Lloyd-Max table is stated in: ||vec||_2 / sqrt(d).
+//
+// Written as sqrt(sumsq) * (1 / sqrt(d)) rather than as a division, because
+// that is the order the kernel evaluates it in -- it multiplies by the same
+// invSqrtLen the Hadamard normalises with rather than dividing by a scalar it
+// would have to compute.
+inline float cpu_rms_scale(const float* vec, int d) {
+  float sumsq = 0.0f;
+  for (int i = 0; i < d; ++i) {
+    sumsq += vec[i] * vec[i];
+  }
+  return std::sqrt(sumsq) * (1.0f / std::sqrt(static_cast<float>(d))) + kEps;
+}
+
+// Bin index of a normalised coordinate: sum_{i=1}^{15} [u > t_i], the strict
+// comparison the boundaries are defined with. The kernel computes exactly this
+// from the sign bit of t_i - u, so a coordinate sitting on a boundary breaks
+// the tie downwards on both sides.
+inline int cpu_lloyd_max_bin(float u) {
+  int q = 0;
+  for (int i = 0; i < kThresholdCount; ++i) {
+    q += (u > kLloydMaxThresholds[i]) ? 1 : 0;
+  }
+  return q;
+}
+
 // Quantise one already-rotated vector to 4 bits.
 //   vec     [d]     input, rotated
 //   packed  [d / 2] output, low nibble = channel 2c, high nibble = 2c + 1
-//   scale           output, absmax / 7.5
+//   scale           output, ||vec||_2 / sqrt(d)
 //
 // Reads exactly vec[0, d) and writes exactly packed[0, d/2) plus one float, so
 // a poisoned destination or poisoned padding beyond d/2 cannot influence the
 // result and must survive the call untouched.
 //
 // Two edges are worth knowing. The kEps floor keeps an all-zero vector from
-// dividing by zero, but the mid-rise grid has no exact zero: rint(7.5) is
-// round-half-to-even, so every channel lands on level 8 and reconstructs to
-// 0.5 * step, which for an all-zero input is ~1e-21 rather than a bit-exact
-// 0.0. And the byte is deliberately built so the extremes are reachable without
-// overflow: levels (15, 15) give 255 - 128 = +127 and (0, 0) give -128.
+// dividing by zero, but the table has no exact zero: an all-zero input puts
+// every channel in bin 7 and reconstructs to kEps * c[7], about -1.3e-21 rather
+// than a bit-exact 0.0. And the byte is deliberately built so the extremes are
+// reachable without overflow: bins (15, 15) give 255 - 128 = +127 and (0, 0)
+// give -128.
+//
+// Unlike the absmax it replaced, the RMS scale depends on the order the squares
+// are summed, so the kernel's tree reduction and this serial loop can differ in
+// the last bits. Nothing downstream is bit-exact against the device because of
+// it; the kernel tests compare reconstructions within a bounded drift instead.
 inline void cpu_quantize_4bit(const float* vec, int d, int8_t* packed, float* scale) {
-  float absmax = 0.0f;
-  for (int i = 0; i < d; ++i) {
-    absmax = std::max(absmax, std::fabs(vec[i]));
-  }
-  absmax += kEps;
-  const float step = absmax / kZeroPoint;
-  const float inv_step = kZeroPoint / absmax;
+  const float s = cpu_rms_scale(vec, d);
+  const float inv_scale = 1.0f / s;
 
   for (int c = 0; c < d / kPackFactor; ++c) {
     float codes[kPackFactor];
     for (int k = 0; k < kPackFactor; ++k) {
-      const float level = std::rint(vec[c * kPackFactor + k] * inv_step + kZeroPoint);
-      codes[k] = std::min(kLevelMax, std::max(0.0f, level));
+      codes[k] = static_cast<float>(cpu_lloyd_max_bin(vec[c * kPackFactor + k] * inv_scale));
     }
     const float byte = codes[0] + kPackHigh * codes[1] - kInt8Bias;
     packed[c] = static_cast<int8_t>(std::lrint(byte));
   }
-  *scale = step;
+  *scale = s;
 }
 
 // Expand d/2 packed bytes back into d channels.  Passing scale = 1 yields the
-// centred levels (q - 7.5), which is what the kernel keeps in UB: it folds the
+// bare centroids c[q], which is what the kernel keeps in UB: it folds the
 // per-vector scale into the score row (for K) and into the softmax
-// probabilities (for V) rather than broadcasting it over head_size.
+// probabilities (for V) rather than broadcasting it over head_size.  That fold
+// works because the reconstruction is linear in the scale, which scale * c[q]
+// still is.
 //
 // Reads exactly packed[0, d/2) and writes exactly out[0, d).  Nothing outside
 // those two ranges is touched, which is what lets the caller hand it a slice of
@@ -157,7 +210,7 @@ inline void cpu_dequantize_4bit(const int8_t* packed, int d, float scale, float*
     const float high = std::floor(byte / kPackHigh);
     const float low = byte - kPackHigh * high;
     const float level = (p % kPackFactor == 0) ? low : high;
-    out[p] = (level - kZeroPoint) * scale;
+    out[p] = kLloydMaxCentroids[static_cast<int>(level)] * scale;
   }
 }
 
@@ -168,7 +221,7 @@ inline void cpu_dequantize_4bit(const int8_t* packed, int d, float scale, float*
 // out[0, rows * d), and everything past those bounds -- the padding the kernel
 // leaves uninitialised -- must neither be read nor written.
 //
-// `scale` is applied uniformly; pass 1.0f for centred levels.
+// `scale` is applied uniformly; pass 1.0f for the bare centroids.
 inline void cpu_dequantize_4bit_batch(const int8_t* packed, int rows, int d, float scale, float* out) {
   const size_t packed_stride = static_cast<size_t>(d / kPackFactor);
   for (int row = 0; row < rows; ++row) {

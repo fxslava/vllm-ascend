@@ -22,6 +22,7 @@ operators are called with pure-runtime signatures, and nothing rewrites a
 projection weight.
 """
 
+import math
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -41,15 +42,24 @@ from vllm_ascend.attention.turboquant_v1 import (
     turboquant_scale_slot,
     walsh_hadamard,
 )
+from vllm_ascend.attention.turboquant_v1 import (
+    TURBOQUANT_LEVELS,
+    TURBOQUANT_LLOYD_MAX_CENTROIDS,
+    TURBOQUANT_LLOYD_MAX_THRESHOLDS,
+)
 
 HEAD_SIZE = 128
-LEVEL_MAX = 15.0
-ZERO_POINT = 7.5
 PACK_HIGH = 16.0
 INT8_BIAS = 128.0
-# TurboQuantCodec<4>::kEps -- the absmax floor that keeps an all-zero vector
-# from dividing by zero.
+# TurboQuantCodec<4>::kEps -- the scale floor that keeps an all-zero vector from
+# dividing by zero.
 TURBOQUANT_EPS = 1e-20
+
+CENTROIDS = torch.tensor(TURBOQUANT_LLOYD_MAX_CENTROIDS, dtype=torch.float64)
+THRESHOLDS = torch.tensor(TURBOQUANT_LLOYD_MAX_THRESHOLDS, dtype=torch.float64)
+# Bin 7 is where a zero coordinate lands: it clears the seven negative
+# boundaries and fails the one at exactly 0, which the codec compares strictly.
+ZERO_BIN = 7
 
 CPU = torch.device("cpu")
 
@@ -80,23 +90,33 @@ EXPECTED_SIGNS_256 = [-1, 1, -1, -1, -1, -1, 1, 1]
 def _quantize(vec: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Reference for TurboQuantCodec<4>::Quantize4Bit.
 
-    The ``kEps`` floor mirrors the codec's: without it an all-zero vector
-    divides by zero and every level comes back NaN.
+    The scale is the per-vector RMS ``||v||_2 / sqrt(d)``, which is the metric
+    the Lloyd-Max table is stated in, and the bin is the strict
+    ``sum_i [u > t_i]`` the kernel evaluates from a sign bit.  The ``kEps``
+    floor mirrors the codec's: without it an all-zero vector divides by zero and
+    every bin comes back NaN.
     """
-    absmax = vec.abs().amax(dim=-1, keepdim=True) + TURBOQUANT_EPS
-    levels = torch.clamp(torch.round(vec * (ZERO_POINT / absmax) + ZERO_POINT), 0.0, LEVEL_MAX)
-    packed = levels[..., 0::2] + PACK_HIGH * levels[..., 1::2] - INT8_BIAS
-    return packed.round().to(torch.int8), (absmax / ZERO_POINT).squeeze(-1)
+    d = vec.shape[-1]
+    scale = vec.pow(2).sum(dim=-1, keepdim=True).sqrt() / math.sqrt(d) + TURBOQUANT_EPS
+    unit = vec / scale
+    bins = (unit.unsqueeze(-1) > THRESHOLDS.to(unit.dtype)).sum(-1).to(unit.dtype)
+    packed = bins[..., 0::2] + PACK_HIGH * bins[..., 1::2] - INT8_BIAS
+    return packed.round().to(torch.int8), scale.squeeze(-1)
 
 
 def _dequantize_levels(packed: torch.Tensor) -> torch.Tensor:
-    """Reference for TurboQuantCodec<4>::Dequantize4Bit (centred levels)."""
+    """Reference for TurboQuantCodec<4>::Dequantize4Bit (bare centroids)."""
+    return CENTROIDS.to(torch.float64)[_dequantize_bins(packed).to(torch.int64)]
+
+
+def _dequantize_bins(packed: torch.Tensor) -> torch.Tensor:
+    """The bin indices ``Dequantize4Bit`` gathers the centroids with."""
     byte = packed.to(torch.float64) + INT8_BIAS
     expanded = byte.repeat_interleave(TURBOQUANT_PACK_FACTOR, dim=-1)
     high = torch.floor(expanded / PACK_HIGH)
     low = expanded - PACK_HIGH * high
     odd = (torch.arange(expanded.shape[-1]) % 2).to(expanded.dtype)
-    return low + odd * (high - low) - ZERO_POINT
+    return low + odd * (high - low)
 
 
 class TestWalshHadamard(TestBase):
@@ -161,10 +181,11 @@ class TestCodecRoundTrip(TestBase):
         self.signs = turboquant_pi_signs(HEAD_SIZE, CPU).to(torch.float64)
 
     def test_packed_byte_round_trips_exactly(self):
-        levels = torch.randint(0, 16, (64, HEAD_SIZE)).to(torch.float64)
-        packed = (levels[..., 0::2] + PACK_HIGH * levels[..., 1::2] - INT8_BIAS).round().to(torch.int8)
+        bins = torch.randint(0, TURBOQUANT_LEVELS, (64, HEAD_SIZE)).to(torch.float64)
+        packed = (bins[..., 0::2] + PACK_HIGH * bins[..., 1::2] - INT8_BIAS).round().to(torch.int8)
         self.assertEqual(packed.shape[-1], HEAD_SIZE // TURBOQUANT_PACK_FACTOR)
-        torch.testing.assert_close(_dequantize_levels(packed) + ZERO_POINT, levels)
+        torch.testing.assert_close(_dequantize_bins(packed), bins)
+        torch.testing.assert_close(_dequantize_levels(packed), CENTROIDS[bins.to(torch.int64)])
 
     def test_rotation_shrinks_heavy_tailed_error(self):
         torch.manual_seed(0)
@@ -444,17 +465,20 @@ class TestNumericalEdgeCases(TestBase):
             zeros = torch.zeros(head_size, dtype=torch.float64)
             packed, step = _quantize(zeros)
 
-            # absmax + eps keeps the reciprocal finite and the scale positive.
-            self.assertTrue(torch.isfinite(step).all(), f"step not finite at D={head_size}")
+            # The eps floor keeps the reciprocal finite and the scale positive.
+            self.assertTrue(torch.isfinite(step).all(), f"scale not finite at D={head_size}")
             self.assertGreater(step.item(), 0.0)
-            self.assertAlmostEqual(step.item(), TURBOQUANT_EPS / ZERO_POINT, delta=1e-30)
+            self.assertAlmostEqual(step.item(), TURBOQUANT_EPS, delta=1e-30)
 
-            # The mid-rise grid has no exact zero: round-half-to-even sends 7.5
-            # to level 8, so the centred level is +0.5 rather than 0.0. What has
-            # to hold is that the reconstruction is numerically zero.
+            # The Lloyd-Max table has no exact zero either: u = 0 fails the
+            # strict comparison at the boundary t = 0 and clears the seven below
+            # it, so every channel lands on bin 7. What has to hold is that the
+            # reconstruction is numerically zero.
             levels = _dequantize_levels(packed)
             self.assertTrue(torch.isfinite(levels).all())
-            torch.testing.assert_close(levels, torch.full_like(levels, 0.5), atol=0, rtol=0)
+            torch.testing.assert_close(
+                levels, torch.full_like(levels, CENTROIDS[ZERO_BIN].item()), atol=0, rtol=0
+            )
 
             recon = levels * step
             self.assertTrue(torch.isfinite(recon).all())
@@ -467,45 +491,71 @@ class TestNumericalEdgeCases(TestBase):
             vec[0] = magnitude
             packed, step = _quantize(vec)
 
-            # The grid must key on the outlier and must not collapse.
+            # The RMS scale moves by 1/sqrt(d) for a lone outlier rather than
+            # keying on it. That is the deliberate difference from the absmax
+            # codec: absmax sized the grid off this one coordinate and crushed
+            # every other channel, where the RMS scale keeps the bulk resolved
+            # and clips the outlier instead.
             self.assertTrue(torch.isfinite(step).all())
-            self.assertAlmostEqual(step.item(), abs(magnitude) / ZERO_POINT, delta=abs(magnitude) * 1e-9)
+            self.assertAlmostEqual(
+                step.item(), abs(magnitude) / math.sqrt(head_size), delta=abs(magnitude) * 1e-9
+            )
 
             levels = _dequantize_levels(packed)
-            expected_extreme = ZERO_POINT if magnitude > 0 else -ZERO_POINT
-            self.assertAlmostEqual(levels[0].item(), expected_extreme, places=6)
-            torch.testing.assert_close(levels[1:], torch.full_like(levels[1:], 0.5), atol=0, rtol=0)
+            extreme_bin = TURBOQUANT_LEVELS - 1 if magnitude > 0 else 0
+            self.assertAlmostEqual(levels[0].item(), CENTROIDS[extreme_bin].item(), places=6)
+            torch.testing.assert_close(
+                levels[1:], torch.full_like(levels[1:], CENTROIDS[ZERO_BIN].item()), atol=0, rtol=0
+            )
 
-            # Packing an extreme beside a mid level must stay inside int8.
+            # Packing an extreme beside a mid bin must stay inside int8.
             self.assertGreaterEqual(int(packed.min()), -128)
             self.assertLessEqual(int(packed.max()), 127)
 
+            # The outlier is clipped to the outermost centroid, so it returns at
+            # c[15] / sqrt(d) of its magnitude, not at its magnitude.
             recon = (levels * step)[0].item()
-            self.assertAlmostEqual(recon, magnitude, delta=abs(magnitude) * 1e-5)
+            clipped = magnitude * CENTROIDS[TURBOQUANT_LEVELS - 1].item() / math.sqrt(head_size)
+            self.assertAlmostEqual(recon, clipped, delta=abs(clipped) * 1e-5)
+            self.assertLess(abs(recon), abs(magnitude))
 
     def test_clamping_and_saturation_extremes(self):
         # Both nibbles at 15 give byte 255, which the -128 bias maps to +127;
         # both at 0 give -128. Those are the exact int8 endpoints, so a signed
         # overflow or a truncating cast shows up here and nowhere else.
+        #
+        # Reaching those bins takes a *sparse* outlier under an RMS scale. A
+        # vector whose channels all share a magnitude normalises to u = +-1,
+        # nowhere near the +-2.4008 outermost boundary; two live channels among
+        # head_size - 2 zeros normalise to +-sqrt(head_size / 2) and saturate.
         head_size = 64
         amplitude = 3.0
         cases = (
-            ("all +A", amplitude, amplitude, 15, 15, 127),
-            ("all -A", -amplitude, -amplitude, 0, 0, -128),
-            ("alt +-A", amplitude, -amplitude, 15, 0, -113),
-            ("alt -+A", -amplitude, amplitude, 0, 15, 112),
+            ("(+A, +A)", amplitude, amplitude, 15, 15, 127),
+            ("(-A, -A)", -amplitude, -amplitude, 0, 0, -128),
+            ("(+A, -A)", amplitude, -amplitude, 15, 0, -113),
+            ("(-A, +A)", -amplitude, amplitude, 0, 15, 112),
         )
-        channels = torch.arange(head_size)
-        for name, even, odd, want_low, want_high, want_byte in cases:
-            vec = torch.where(channels % 2 == 0, even, odd).to(torch.float64)
-            packed, _ = _quantize(vec)
-            self.assertEqual(packed.unique().tolist(), [want_byte], name)
+        quiet_byte = ZERO_BIN + int(PACK_HIGH) * ZERO_BIN - int(INT8_BIAS)
+        for name, first, second, want_low, want_high, want_byte in cases:
+            vec = torch.zeros(head_size, dtype=torch.float64)
+            vec[0] = first
+            vec[1] = second
+            packed, scale = _quantize(vec)
+
+            # If the sparse outlier stops saturating, the endpoints are untested
+            # rather than merely differently encoded.
+            self.assertGreater(amplitude / scale.item(), THRESHOLDS[-1].item(), name)
+
+            self.assertEqual(int(packed[0]), want_byte, name)
+            self.assertEqual(packed[1:].unique().tolist(), [quiet_byte], name)
             self.assertGreaterEqual(int(packed.min()), -128, name)
             self.assertLessEqual(int(packed.max()), 127, name)
 
-            levels = _dequantize_levels(packed) + ZERO_POINT
-            self.assertEqual(levels[0::2].unique().tolist(), [float(want_low)], name)
-            self.assertEqual(levels[1::2].unique().tolist(), [float(want_high)], name)
+            bins = _dequantize_bins(packed)
+            self.assertEqual(int(bins[0]), want_low, name)
+            self.assertEqual(int(bins[1]), want_high, name)
+            self.assertEqual(bins[2:].unique().tolist(), [float(ZERO_BIN)], name)
 
     def test_every_nibble_pair_round_trips(self):
         # All 256 (low, high) combinations, endpoints included.
@@ -515,9 +565,13 @@ class TestNumericalEdgeCases(TestBase):
         self.assertGreaterEqual(int(packed.min()), -128)
         self.assertLessEqual(int(packed.max()), 127)
 
-        levels = _dequantize_levels(packed) + ZERO_POINT
-        torch.testing.assert_close(levels[:, 0], lows.to(levels.dtype), atol=0, rtol=0)
-        torch.testing.assert_close(levels[:, 1], highs.to(levels.dtype), atol=0, rtol=0)
+        bins = _dequantize_bins(packed)
+        torch.testing.assert_close(bins[:, 0], lows.to(bins.dtype), atol=0, rtol=0)
+        torch.testing.assert_close(bins[:, 1], highs.to(bins.dtype), atol=0, rtol=0)
+
+        levels = _dequantize_levels(packed)
+        torch.testing.assert_close(levels[:, 0], CENTROIDS[lows], atol=0, rtol=0)
+        torch.testing.assert_close(levels[:, 1], CENTROIDS[highs], atol=0, rtol=0)
 
     def test_involution_on_canonical_basis_vectors(self):
         for head_size in (64, 128, 256):
@@ -659,15 +713,16 @@ class TestBufferPoisoning(TestBase):
                 torch.testing.assert_close(rotated, expected, atol=0, rtol=0)
 
     def test_quantize_scale_is_per_row_not_shared(self):
-        # A leaked absmax across rows would show up as a step that is right for
-        # one row and wrong for the others.
+        # A leaked scale across rows would show up as an RMS that is right for
+        # one row and wrong for the others. A constant-magnitude row has
+        # RMS == that magnitude, which is what makes the expectation exact.
         head_size = 64
         amplitudes = (1.0, 16.0, 256.0)
         vectors = torch.stack([torch.full((head_size,), amplitude, dtype=torch.float64) for amplitude in amplitudes])
         _, steps = _quantize(vectors)
         self.assertEqual(tuple(steps.shape), (len(amplitudes),))
         for row, amplitude in enumerate(amplitudes):
-            self.assertAlmostEqual(steps[row].item(), amplitude / ZERO_POINT, delta=amplitude * 1e-9)
+            self.assertAlmostEqual(steps[row].item(), amplitude, delta=amplitude * 1e-9)
 
 
 class TestCodecTables(TestBase):
@@ -696,7 +751,9 @@ class TestCodecTables(TestBase):
         expand = tables[cursor : cursor + batch]
         cursor += batch
         odd_select = tables[cursor : cursor + batch].view(torch.float32)
-        return signs, xor_offsets, even, odd, expand, odd_select
+        cursor += batch
+        centroids = tables[cursor : cursor + TURBOQUANT_LEVELS].view(torch.float32)
+        return signs, xor_offsets, even, odd, expand, odd_select, centroids
 
     def test_image_length_matches_the_kernel_contract(self):
         for head_size in (64, 128, 256):
@@ -704,13 +761,15 @@ class TestCodecTables(TestBase):
                 tables = turboquant_codec_tables(head_size, batch_rows, CPU)
                 self.assertEqual(tables.dtype, torch.int32)
                 self.assertTrue(tables.is_contiguous())
-                self.assertEqual(tables.numel(), 7 * head_size + 2 * head_size * batch_rows)
+                self.assertEqual(
+                    tables.numel(), 7 * head_size + 2 * head_size * batch_rows + TURBOQUANT_LEVELS
+                )
                 # One DataCopy moves the image, so it must be a whole burst.
                 self.assertEqual(tables.numel() % 8, 0)
 
     def test_sign_and_xor_tables_encode_the_butterfly(self):
         head_size = 128
-        signs, xor_offsets, _, _, _, _ = self._split(head_size, 1)
+        signs, xor_offsets, _, _, _, _, _ = self._split(head_size, 1)
         channels = torch.arange(head_size)
         for stage in range(3):
             stride = 1 << stage
@@ -721,7 +780,7 @@ class TestCodecTables(TestBase):
 
     def test_nibble_tables_deinterleave_and_expand(self):
         head_size, batch_rows = 128, TURBOQUANT_TILE_ROWS
-        _, _, even, odd, expand, odd_select = self._split(head_size, batch_rows)
+        _, _, even, odd, expand, odd_select, _ = self._split(head_size, batch_rows)
         pairs = torch.arange(head_size // TURBOQUANT_PACK_FACTOR)
         torch.testing.assert_close(even, (8 * pairs).to(torch.int32), atol=0, rtol=0)
         torch.testing.assert_close(odd, (8 * pairs + 4).to(torch.int32), atol=0, rtol=0)
@@ -729,6 +788,23 @@ class TestCodecTables(TestBase):
         batch = torch.arange(head_size * batch_rows)
         torch.testing.assert_close(expand, (4 * (batch // 2)).to(torch.int32), atol=0, rtol=0)
         torch.testing.assert_close(odd_select, (batch % 2).to(torch.float32), atol=0, rtol=0)
+
+    def test_centroid_table_is_the_lloyd_max_fixed_point(self):
+        # The last 16 words are what Dequantize4Bit gathers with; a table that
+        # is merely close still decodes, it just stops being the quantiser the
+        # thresholds were derived for.
+        _, _, _, _, _, _, centroids = self._split(128, TURBOQUANT_TILE_ROWS)
+        torch.testing.assert_close(
+            centroids, CENTROIDS.to(torch.float32), atol=0, rtol=0
+        )
+        # Strictly increasing, or the threshold scan's bin index would not
+        # select the nearest centroid.
+        self.assertTrue(bool((centroids[1:] > centroids[:-1]).all()))
+        # Symmetric about zero, as the fixed point for a symmetric density is.
+        torch.testing.assert_close(centroids, -centroids.flip(0), atol=0, rtol=1e-7)
+        # Every threshold is exactly the midpoint of the centroids it separates.
+        midpoints = 0.5 * (CENTROIDS[:-1] + CENTROIDS[1:])
+        torch.testing.assert_close(THRESHOLDS, midpoints, atol=1e-7, rtol=0)
 
     def test_tables_are_cached_per_shape(self):
         first = turboquant_codec_tables(128, 1, CPU)

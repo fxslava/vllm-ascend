@@ -283,7 +283,8 @@ TEST(TurboQuantCodecInvariants, NibblePackRoundTripsExactly) {
   tq::cpu_dequantize_4bit(packed.data(), d, 1.0f, out.data());
   int mismatches = 0;
   for (int i = 0; i < d; ++i) {
-    if (out[static_cast<size_t>(i)] + tq::kZeroPoint != levels[static_cast<size_t>(i)]) {
+    const int level = static_cast<int>(levels[static_cast<size_t>(i)]);
+    if (out[static_cast<size_t>(i)] != tq::kLloydMaxCentroids[level]) {
       ++mismatches;
     }
   }
@@ -643,11 +644,16 @@ void TableDrivenDequantize(const int8_t* packed, int rows, int len, int batch_ro
     swap[p] = scratch[source];
   }
 
-  // high = floor(byte / 16); low = byte - 16 * high; select by parity.
+  // high = floor(byte / 16); low = byte - 16 * high; select by parity, then
+  // Gather(dst, centroid_, offsets, base, n) against the 16-entry table. The
+  // offset is the bin index scaled by sizeof(float), exactly as the kernel
+  // builds it, so a table indexed in elements rather than bytes fails here.
   for (size_t p = 0; p < n; ++p) {
     const float high = std::floor(swap[p] / tq::kPackHigh);
     const float low = swap[p] - tq::kPackHigh * high;
-    out[p] = low + odd_select[p] * (high - low) - tq::kZeroPoint;
+    const float bin = low + odd_select[p] * (high - low);
+    const size_t offset = static_cast<size_t>(std::lrint(bin * static_cast<float>(sizeof(float))));
+    out[p] = tq::kLloydMaxCentroids[offset / sizeof(float)];
   }
 }
 
@@ -666,16 +672,29 @@ void TableDrivenQuantize(const float* vec, int len, int batch_rows, int8_t* pack
   PoisonFloats(swap.data(), swap.size(), variant);
   PoisonFloats(scratch.data(), scratch.size(), variant);
 
-  float absmax = 0.0f;
+  float sumsq = 0.0f;
   for (size_t i = 0; i < n; ++i) {
-    absmax = std::max(absmax, std::fabs(vec[i]));
+    sumsq += vec[i] * vec[i];
   }
-  absmax += tq::kEps;
-  const float inv_step = tq::kZeroPoint / absmax;
+  const float rms = std::sqrt(sumsq) * (1.0f / std::sqrt(static_cast<float>(len))) + tq::kEps;
+  // The kernel broadcasts -1/scale and multiplies, so the threshold loop sees
+  // -u rather than u. The negation is exact in IEEE, so this is not an
+  // approximation of what the device does -- it is the same value.
+  const float neg_inv_scale = -1.0f / rms;
 
   for (size_t i = 0; i < n; ++i) {
-    const float level = std::rint(vec[i] * inv_step + tq::kZeroPoint);
-    scratch[i] = std::min(tq::kLevelMax, std::max(0.0f, level));
+    const float neg_u = vec[i] * neg_inv_scale;
+    int32_t bin = 0;
+    for (int t = 0; t < tq::kThresholdCount; ++t) {
+      // b = uint32(t_i - u) >> 31: the fp32 sign bit, which is 1 exactly when
+      // u > t_i. A subtraction cannot round across zero, so this is bit-for-bit
+      // the strict comparison the reference makes.
+      const float diff = neg_u + tq::kLloydMaxThresholds[t];
+      uint32_t bits = 0;
+      std::memcpy(&bits, &diff, sizeof(bits));
+      bin += static_cast<int32_t>(bits >> 31);
+    }
+    scratch[i] = static_cast<float>(bin);
   }
 
   // Gather(swap_, scratch_, evenOffset_, base, packed) and the odd twin.
@@ -687,7 +706,7 @@ void TableDrivenQuantize(const float* vec, int len, int batch_rows, int8_t* pack
     const float byte = swap[c] + tq::kPackHigh * swap[packed_count + c] - tq::kInt8Bias;
     packed[c] = static_cast<int8_t>(std::lrint(byte));
   }
-  *scale = absmax / tq::kZeroPoint;
+  *scale = rms;
 }
 
 TEST(TurboQuantTableDriven, DequantizeMatchesTheReferenceOnPartialBatches) {
@@ -765,19 +784,20 @@ TEST(TurboQuantEdgeCases, AllZeroVectorIsNumericallyStable) {
 
     tq::cpu_quantize_4bit(zeros.data(), d, packed.data(), &step);
 
-    // absmax + kEps keeps the reciprocal finite; the scale stays positive.
-    ASSERT_TRUE(std::isfinite(step)) << "step is not finite for an all-zero vector, d=" << d;
-    ASSERT_GT(step, 0.0f) << "step collapsed to zero, d=" << d;
-    EXPECT_FLOAT_EQ(step, tq::kEps / tq::kZeroPoint);
+    // The kEps floor keeps the reciprocal finite; the scale stays positive.
+    ASSERT_TRUE(std::isfinite(step)) << "scale is not finite for an all-zero vector, d=" << d;
+    ASSERT_GT(step, 0.0f) << "scale collapsed to zero, d=" << d;
+    EXPECT_FLOAT_EQ(step, tq::kEps);
 
-    // The mid-rise grid has no exact zero. rint(7.5) is round-half-to-even, so
-    // every channel lands on level 8 and the centred level is +0.5, not 0.0.
-    // What matters is that the reconstruction is numerically zero.
+    // The Lloyd-Max table has no exact zero either: u = 0 fails every strict
+    // `u > t_i` from the boundary at t = 0 upwards and clears the seven below
+    // it, so every channel lands on bin 7, the negative half of the innermost
+    // pair. What matters is that the reconstruction is numerically zero.
     std::vector<float> levels(static_cast<size_t>(d));
     tq::cpu_dequantize_4bit(packed.data(), d, 1.0f, levels.data());
     for (int i = 0; i < d; ++i) {
       ASSERT_TRUE(std::isfinite(levels[static_cast<size_t>(i)]));
-      EXPECT_FLOAT_EQ(levels[static_cast<size_t>(i)], 0.5f) << "channel " << i;
+      EXPECT_FLOAT_EQ(levels[static_cast<size_t>(i)], tq::kLloydMaxCentroids[7]) << "channel " << i;
     }
 
     std::vector<float> recon(static_cast<size_t>(d));
@@ -787,7 +807,7 @@ TEST(TurboQuantEdgeCases, AllZeroVectorIsNumericallyStable) {
       EXPECT_LT(std::fabs(recon[static_cast<size_t>(i)]), 1e-18f) << "channel " << i;
     }
   }
-  std::printf("[turboquant] all-zero vector: step = kEps/7.5, every level 8, |recon| < 1e-18\n");
+  std::printf("[turboquant] all-zero vector: scale = kEps, every bin 7, |recon| < 1e-18\n");
 }
 
 TEST(TurboQuantEdgeCases, SingleDominantOutlier) {
@@ -801,28 +821,40 @@ TEST(TurboQuantEdgeCases, SingleDominantOutlier) {
     float step = 0.0f;
     tq::cpu_quantize_4bit(vec.data(), d, packed.data(), &step);
 
-    // ReduceMax must find the outlier and nothing else; the grid must not
-    // collapse onto a single level.
-    EXPECT_NEAR(step, std::fabs(magnitude) / tq::kZeroPoint, std::fabs(magnitude) * 1e-6f);
+    // The scale is the RMS, so a lone outlier moves it by 1/sqrt(d) rather than
+    // setting it outright. That is the whole behavioural difference from the
+    // absmax codec and it is deliberate: absmax sized the grid off this one
+    // coordinate and crushed every other channel into the levels either side of
+    // zero, where the RMS scale keeps the bulk resolved and clips the outlier.
+    EXPECT_NEAR(step, std::fabs(magnitude) / std::sqrt(static_cast<float>(d)),
+                std::fabs(magnitude) * 1e-6f);
     ASSERT_TRUE(std::isfinite(step));
 
     std::vector<float> levels(static_cast<size_t>(d));
     tq::cpu_dequantize_4bit(packed.data(), d, 1.0f, levels.data());
-    const float expected_extreme = (magnitude > 0.0f) ? tq::kZeroPoint : -tq::kZeroPoint;
-    EXPECT_FLOAT_EQ(levels[0], expected_extreme) << "the outlier must land on a boundary level";
+    const int extreme_bin = (magnitude > 0.0f) ? tq::kLevels - 1 : 0;
+    EXPECT_FLOAT_EQ(levels[0], tq::kLloydMaxCentroids[extreme_bin])
+        << "the outlier must saturate the table's outermost bin";
     for (int i = 1; i < d; ++i) {
-      EXPECT_FLOAT_EQ(levels[static_cast<size_t>(i)], 0.5f) << "zero channel " << i << " moved off level 8";
+      EXPECT_FLOAT_EQ(levels[static_cast<size_t>(i)], tq::kLloydMaxCentroids[7])
+          << "zero channel " << i << " moved off bin 7";
     }
 
-    // Packing an extreme next to a mid level must stay inside int8.
+    // Packing an extreme next to a mid bin must stay inside int8.
     for (size_t i = 0; i < packed.size(); ++i) {
       ASSERT_GE(static_cast<int>(packed[i]), -128);
       ASSERT_LE(static_cast<int>(packed[i]), 127);
     }
 
+    // The outlier is clipped to the outermost centroid, so it comes back at
+    // c[15] / sqrt(d) of its magnitude rather than at its magnitude. Asserting
+    // the clip explicitly is what stops it being read as a regression.
     std::vector<float> recon(static_cast<size_t>(d));
     tq::cpu_dequantize_4bit(packed.data(), d, step, recon.data());
-    EXPECT_NEAR(recon[0], magnitude, std::fabs(magnitude) * 1e-5f);
+    const float clipped =
+        magnitude * tq::kLloydMaxCentroids[tq::kLevels - 1] / std::sqrt(static_cast<float>(d));
+    EXPECT_NEAR(recon[0], clipped, std::fabs(clipped) * 1e-5f);
+    EXPECT_LT(std::fabs(recon[0]), std::fabs(magnitude)) << "a clipped outlier cannot grow";
   }
 }
 
@@ -830,46 +862,63 @@ TEST(TurboQuantEdgeCases, ClampingAndSaturationExtremes) {
   constexpr int d = 64;
   constexpr float amplitude = 3.0f;
 
+  // Reaching the outermost bins takes a *sparse* outlier now, not a uniform
+  // one. Under an RMS scale a vector whose channels all share a magnitude
+  // normalises to u = +-1, which is nowhere near the +-2.4008 outermost
+  // boundary; two live channels among d - 2 zeros normalise to
+  // +-sqrt(d / 2) = +-5.66 and saturate. That is the construction below, and it
+  // is the only one that still exercises the two int8 endpoints through the
+  // quantiser rather than by writing the byte directly.
   struct Case {
     const char* name;
-    float even;
-    float odd;
+    float first;
+    float second;
     int expected_low;
     int expected_high;
   };
   // Both nibbles at 15 give byte 255, which the -128 bias maps to +127; both at
-  // 0 give -128. Those are exactly the int8 endpoints, so this is where a signed
-  // overflow or a truncated cast would show up.
+  // 0 give -128. Those are exactly the int8 endpoints, so this is where a
+  // signed overflow or a truncated cast would show up.
   const Case cases[] = {
-      {"all +A -> (15, 15) -> +127", amplitude, amplitude, 15, 15},
-      {"all -A -> ( 0,  0) -> -128", -amplitude, -amplitude, 0, 0},
-      {"alt +-A -> (15,  0) -> -113", amplitude, -amplitude, 15, 0},
-      {"alt -+A -> ( 0, 15) -> +112", -amplitude, amplitude, 0, 15},
+      {"(+A, +A) -> (15, 15) -> +127", amplitude, amplitude, 15, 15},
+      {"(-A, -A) -> ( 0,  0) -> -128", -amplitude, -amplitude, 0, 0},
+      {"(+A, -A) -> (15,  0) -> -113", amplitude, -amplitude, 15, 0},
+      {"(-A, +A) -> ( 0, 15) -> +112", -amplitude, amplitude, 0, 15},
   };
 
+  // Every other channel is zero, so it lands in bin 7 and packs to this byte.
+  const int quiet_byte = 7 + 16 * 7 - 128;
+
   for (const Case& c : cases) {
-    std::vector<float> vec(static_cast<size_t>(d));
-    for (int i = 0; i < d; ++i) {
-      vec[static_cast<size_t>(i)] = (i % 2 == 0) ? c.even : c.odd;
-    }
+    std::vector<float> vec(static_cast<size_t>(d), 0.0f);
+    vec[0] = c.first;
+    vec[1] = c.second;
+
     std::vector<int8_t> packed(static_cast<size_t>(d / tq::kPackFactor));
     PoisonInt8(packed.data(), packed.size());
     float step = 0.0f;
     tq::cpu_quantize_4bit(vec.data(), d, packed.data(), &step);
 
+    // The two live channels must actually clear the outermost boundary, or the
+    // case is testing a bin it did not mean to.
+    const float u = amplitude / step;
+    ASSERT_GT(u, tq::kLloydMaxThresholds[tq::kThresholdCount - 1])
+        << c.name << ": the sparse outlier no longer saturates, so the endpoints are untested";
+
     const int expected_byte = c.expected_low + 16 * c.expected_high - 128;
-    for (size_t i = 0; i < packed.size(); ++i) {
-      ASSERT_EQ(static_cast<int>(packed[i]), expected_byte) << c.name << " at byte " << i;
+    ASSERT_EQ(static_cast<int>(packed[0]), expected_byte) << c.name;
+    for (size_t i = 1; i < packed.size(); ++i) {
+      ASSERT_EQ(static_cast<int>(packed[i]), quiet_byte) << c.name << " at quiet byte " << i;
     }
 
     std::vector<float> levels(static_cast<size_t>(d));
     tq::cpu_dequantize_4bit(packed.data(), d, 1.0f, levels.data());
-    for (int i = 0; i < d; ++i) {
-      const int want = (i % 2 == 0) ? c.expected_low : c.expected_high;
-      EXPECT_FLOAT_EQ(levels[static_cast<size_t>(i)] + tq::kZeroPoint, static_cast<float>(want))
-          << c.name << " channel " << i;
+    EXPECT_FLOAT_EQ(levels[0], tq::kLloydMaxCentroids[c.expected_low]) << c.name << " channel 0";
+    EXPECT_FLOAT_EQ(levels[1], tq::kLloydMaxCentroids[c.expected_high]) << c.name << " channel 1";
+    for (int i = 2; i < d; ++i) {
+      EXPECT_FLOAT_EQ(levels[static_cast<size_t>(i)], tq::kLloydMaxCentroids[7]) << c.name << " channel " << i;
     }
-    std::printf("[turboquant] %s  step=%.6f\n", c.name, step);
+    std::printf("[turboquant] %s  scale=%.6f  u=%.3f\n", c.name, step, u);
   }
 }
 
@@ -885,7 +934,7 @@ TEST(TurboQuantEdgeCases, EveryNibblePairRoundTrips) {
       const int8_t packed = static_cast<int8_t>(byte);
       float out[2] = {0.0f, 0.0f};
       tq::cpu_dequantize_4bit(&packed, 2, 1.0f, out);
-      if (static_cast<int>(out[0] + tq::kZeroPoint) != low || static_cast<int>(out[1] + tq::kZeroPoint) != high) {
+      if (out[0] != tq::kLloydMaxCentroids[low] || out[1] != tq::kLloydMaxCentroids[high]) {
         ++mismatches;
       }
     }
@@ -893,9 +942,23 @@ TEST(TurboQuantEdgeCases, EveryNibblePairRoundTrips) {
   EXPECT_EQ(mismatches, 0);
 }
 
+// Largest reconstruction error the table can produce for a coordinate that
+// falls inside it: the greatest distance from any decision boundary to the
+// centroid of the bin it opens or closes. 0.3318, at the outermost interior
+// boundary, where the bins are widest.
+inline float WidestHalfBin() {
+  float widest = 0.0f;
+  for (int i = 0; i < tq::kThresholdCount; ++i) {
+    widest = std::max(widest, tq::kLloydMaxThresholds[i] - tq::kLloydMaxCentroids[i]);
+    widest = std::max(widest, tq::kLloydMaxCentroids[i + 1] - tq::kLloydMaxThresholds[i]);
+  }
+  return widest;
+}
+
 TEST(TurboQuantEdgeCases, PartialBatchesMatchPerRowQuantisation) {
   // A partial batch must produce exactly what quantising each row on its own
   // produces: no cross-row scale, no dependence on how many rows follow.
+  const float kWidestHalfBin = WidestHalfBin();
   for (int d : {64, 128, 256}) {
     for (int batch_rows : {4, 8}) {
       for (int rows : {1, 3}) {
@@ -926,8 +989,16 @@ TEST(TurboQuantEdgeCases, PartialBatchesMatchPerRowQuantisation) {
             const size_t idx = static_cast<size_t>(row) * d + i;
             const float recon = expanded[idx] * scales[static_cast<size_t>(row)];
             const float want = rows_data[idx];
-            // Absmax 4-bit: the worst case is half a step.
-            ASSERT_LE(std::fabs(recon - want), 0.5f * scales[static_cast<size_t>(row)] * 1.001f)
+            // Lloyd-Max 4-bit: inside the table's range the worst case is the
+            // largest distance from a decision boundary to its own centroid,
+            // which is 0.3318 -- not the uniform grid's half step. Outside it
+            // the error is unbounded, so the fixture is checked for clipping
+            // first rather than the bound being loosened to cover it.
+            const float u = want / scales[static_cast<size_t>(row)];
+            ASSERT_LE(std::fabs(u), tq::kLloydMaxThresholds[tq::kThresholdCount - 1])
+                << "this fixture clipped, so the in-range bound below does not apply: d=" << d << " row=" << row
+                << " channel=" << i;
+            ASSERT_LE(std::fabs(recon - want), kWidestHalfBin * scales[static_cast<size_t>(row)] * 1.001f)
                 << "d=" << d << " rows=" << rows << " row=" << row << " channel=" << i;
           }
         }
