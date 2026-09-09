@@ -115,10 +115,15 @@ inline int64_t ScaleSlotFloats(int64_t num_kv_heads) {
   return CeilDiv(2 * num_kv_heads, kFp32PerBlock) * kFp32PerBlock;
 }
 
+// Reconstruction levels of the codec, and so the length of the Lloyd-Max
+// centroid table the image carries. Mirrors turboquant_adpt::kCodecLevels and
+// TurboQuantCodec<4>::kLevels.
+constexpr int64_t kCodecLevels = 16;
+
 // Words in the codec's constant-table image. Mirrors
 // turboquant_adpt::CodecTableWords and TurboQuantCodec<4>::ConstTableWords.
 inline int64_t CodecTableWords(int64_t head_size, int64_t batch_rows) {
-  return 7 * head_size + 2 * head_size * batch_rows;
+  return 7 * head_size + 2 * head_size * batch_rows + kCodecLevels;
 }
 
 // int8 bytes in the packed KV cache, [num_blocks, block_size, num_kv_heads, head_size / 2].
@@ -147,10 +152,11 @@ std::vector<float> PiSigns(int64_t head_size);
 //   [6D, 7D)         evenOffset_ then oddOffset_, D/2 words each
 //   [7D, 7D + B)     expandOffset_
 //   [7D + B, +B)     oddSelect_                       (B = D * batch_rows)
+//   [7D + 2B, +16)   centroid_, the Lloyd-Max reconstruction levels
 //
-// sign_ and oddSelect_ are fp32 bit patterns; the offset tables are uint32 byte
-// offsets for Gather. Everything is four bytes wide, so one int32 DataCopy
-// moves the lot and the device needs no cast and no arithmetic.
+// sign_, oddSelect_ and centroid_ are fp32 bit patterns; the offset tables are
+// uint32 byte offsets for Gather. Everything is four bytes wide, so one int32
+// DataCopy moves the lot and the device needs no cast and no arithmetic.
 //
 // This is the C++ mirror of turboquant_codec_tables() in
 // vllm_ascend/attention/turboquant_v1.py. The kernel treats the image as

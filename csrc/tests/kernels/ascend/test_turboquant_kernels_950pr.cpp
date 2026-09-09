@@ -95,7 +95,11 @@ constexpr int kQueryTokens = 1;  // decode
 constexpr float kAttentionScale = 0.125f;  // 1 / sqrt(64)
 
 // Bounds for the reconstruction comparison; see "ON EXACTNESS" above.
-constexpr double kMaxLevelDrift = 1.0;
+// Bins, not reconstructed values. The device sums the squares for its RMS
+// scale in a tree and the host sums them serially, so the two scales differ in
+// the last bits and a coordinate sitting on a decision boundary can fall either
+// side of it. One bin is what that can cost; two is a real disagreement.
+constexpr int kMaxLevelDrift = 1;
 constexpr double kMaxDifferingChannelFraction = 0.02;
 // The scale is one fp32 division of a reduced absmax. A relative difference
 // larger than this means the reduction itself disagreed, not that rounding did.
@@ -160,22 +164,33 @@ void ReferenceWritePath(const Scenario& s, std::vector<int8_t>* key_cache, std::
   }
 }
 
-// Compares two packed caches by what they reconstruct to rather than by their
+// Compares two packed caches by the bins they select rather than by their
 // bytes. `label` names the plane in the failure message.
 //
+// The comparison is in bin indices, not in reconstructed values: the Lloyd-Max
+// levels are unevenly spaced, so one bin is worth anywhere between 0.257 and
+// 0.664, and a value-space bound tight enough to catch a two-bin slip at the
+// centre of the table would reject a legitimate one-bin tie-break at its edge.
+// The indices are exact, so the bound can be too.
+//
 // Only the rows the scenario actually wrote are examined: everything else in
-// both caches is the zero fill, which reconstructs to the mid-rise level and
-// would drown a real difference in noise.
+// both caches is the zero fill, which quantises to a single bin and would
+// drown a real difference in noise.
 void ExpectPackedCachesAgree(const char* label, const std::vector<int8_t>& actual, const std::vector<int8_t>& expected,
                              const std::vector<int32_t>& slots) {
   ASSERT_EQ(actual.size(), expected.size()) << label << ": cache sizes differ";
   const size_t packed_stride = static_cast<size_t>(kHeadSize / tq::kPackFactor);
 
-  double max_drift = 0.0;
+  int max_drift = 0;
   size_t differing = 0;
   size_t examined = 0;
-  std::vector<float> got(static_cast<size_t>(kHeadSize));
-  std::vector<float> want(static_cast<size_t>(kHeadSize));
+
+  // Bin index of channel c of a packed vector: the low nibble for an even
+  // channel, the high nibble for an odd one, with the -128 store bias undone.
+  const auto bin_of = [](const int8_t* vec, int c) {
+    const int byte = static_cast<int>(vec[c / tq::kPackFactor]) + static_cast<int>(tq::kInt8Bias);
+    return (c % tq::kPackFactor == 0) ? (byte % tq::kLevels) : (byte / tq::kLevels);
+  };
 
   for (const int32_t slot : slots) {
     if (slot < 0) {
@@ -183,15 +198,10 @@ void ExpectPackedCachesAgree(const char* label, const std::vector<int8_t>& actua
     }
     for (int kv_head = 0; kv_head < kNumKvHeads; ++kv_head) {
       const size_t off = (static_cast<size_t>(slot) * kNumKvHeads + kv_head) * packed_stride;
-      // scale 1.0 gives the centred levels (q - 7.5), so a difference of 1.0
-      // here is exactly one 4-bit code.
-      tq::cpu_dequantize_4bit(actual.data() + off, kHeadSize, 1.0f, got.data());
-      tq::cpu_dequantize_4bit(expected.data() + off, kHeadSize, 1.0f, want.data());
       for (int c = 0; c < kHeadSize; ++c) {
-        const double drift = std::fabs(static_cast<double>(got[static_cast<size_t>(c)]) -
-                                       static_cast<double>(want[static_cast<size_t>(c)]));
+        const int drift = std::abs(bin_of(actual.data() + off, c) - bin_of(expected.data() + off, c));
         max_drift = std::max(max_drift, drift);
-        if (drift > 0.0) {
+        if (drift > 0) {
           ++differing;
         }
         ++examined;
@@ -201,11 +211,12 @@ void ExpectPackedCachesAgree(const char* label, const std::vector<int8_t>& actua
 
   ASSERT_GT(examined, 0u) << label << ": the scenario wrote no live rows";
   const double differing_fraction = static_cast<double>(differing) / static_cast<double>(examined);
-  std::printf("  %-12s max level drift %.3f, %zu/%zu channels differ (%.3f%%)\n", label, max_drift, differing,
+  std::printf("  %-12s max bin drift %d, %zu/%zu channels differ (%.3f%%)\n", label, max_drift, differing,
               examined, 100.0 * differing_fraction);
 
-  EXPECT_LE(max_drift, kMaxLevelDrift) << label << ": a channel is off by more than one 4-bit level, which rounding "
-                                                  "at a tie cannot explain";
+  EXPECT_LE(max_drift, kMaxLevelDrift) << label << ": a channel is off by more than one 4-bit bin, which a "
+                                                  "coordinate landing either side of a decision boundary cannot "
+                                                  "explain";
   EXPECT_LE(differing_fraction, kMaxDifferingChannelFraction)
       << label << ": " << differing << " of " << examined << " channels landed on a different level";
 }
@@ -337,8 +348,11 @@ TEST(TurboQuantLaunchContract, CodecTableWordsMatchTheLayoutContract) {
   for (int head_size : {64, 128, 256}) {
     for (int batch_rows : {1, static_cast<int>(tqh::kTileRows)}) {
       const int64_t words = tqh::CodecTableWords(head_size, batch_rows);
-      EXPECT_EQ(words, 7 * head_size + 2 * head_size * batch_rows);
+      EXPECT_EQ(words, 7 * head_size + 2 * head_size * batch_rows + tq::kLevels);
       EXPECT_EQ(static_cast<int64_t>(tqh::CodecTables(head_size, batch_rows).size()), words)
+          << "head_size " << head_size << ", batch_rows " << batch_rows;
+      // Init() moves the image with one DataCopy, so it must be a whole burst.
+      EXPECT_EQ(words % tqh::kFp32PerBlock, 0)
           << "head_size " << head_size << ", batch_rows " << batch_rows;
     }
   }
@@ -383,6 +397,30 @@ TEST(TurboQuantLaunchContract, CodecTablesHaveTheDocumentedLayout) {
     ASSERT_EQ(tables[expand_base + static_cast<size_t>(b)], 4 * (b / 2)) << "batch lane " << b;
     ASSERT_FLOAT_EQ(as_float(tables[select_base + static_cast<size_t>(b)]), static_cast<float>(b % 2))
         << "batch lane " << b;
+  }
+
+  // [7D + 2B, +16): the Lloyd-Max reconstruction levels, which Dequantize4Bit
+  // gathers against with a byte offset of 4 * bin. The section is checked for
+  // the two properties the codec actually relies on -- that it is the table the
+  // host reference quantises with, and that it is strictly increasing, without
+  // which the threshold scan's bin index would not select the nearest centroid.
+  const size_t centroid_base = select_base + static_cast<size_t>(kD) * kRows;
+  ASSERT_EQ(tables.size(), centroid_base + static_cast<size_t>(tq::kLevels));
+  for (int level = 0; level < tq::kLevels; ++level) {
+    ASSERT_FLOAT_EQ(as_float(tables[centroid_base + static_cast<size_t>(level)]), tq::kLloydMaxCentroids[level])
+        << "centroid " << level;
+  }
+  for (int level = 1; level < tq::kLevels; ++level) {
+    ASSERT_LT(tq::kLloydMaxCentroids[level - 1], tq::kLloydMaxCentroids[level]) << "centroid " << level;
+  }
+
+  // The table is the Lloyd-Max fixed point, so every threshold must sit exactly
+  // midway between the centroids it separates. A table edited on one side only
+  // would still be monotone and would still decode; it would just quantise to
+  // something other than the nearest centroid.
+  for (int i = 0; i < tq::kThresholdCount; ++i) {
+    const float midpoint = 0.5f * (tq::kLloydMaxCentroids[i] + tq::kLloydMaxCentroids[i + 1]);
+    ASSERT_NEAR(tq::kLloydMaxThresholds[i], midpoint, 1e-6f) << "threshold " << i;
   }
 }
 

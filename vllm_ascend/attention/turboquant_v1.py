@@ -65,6 +65,45 @@ TURBOQUANT_BURST_FLOATS = 8
 # shuffle tables are sized for that batch, and the kernel asserts the length.
 TURBOQUANT_TILE_ROWS = 16
 
+# Reconstruction levels of the codec, and so the length of the centroid table
+# the constant-table image carries.  Mirrors TurboQuantCodec<4>::kLevels.
+TURBOQUANT_LEVELS = 16
+
+# The 16-level Lloyd-Max quantiser for N(0, 1): the fixed point of
+#
+#     t_i = (c_{i-1} + c_i) / 2,     c_i = E[X | t_i < X < t_{i+1}],
+#
+# solved with the closed-form truncated-Gaussian moments and symmetrised
+# exactly.  Its distortion E[(X - Q(X))^2] is 0.0095010080, i.e. 20.222 dB,
+# against 0.01388 for the uniform mid-rise grid it replaced.
+#
+# The rotation is what earns the table: Pi drives the coordinates of a KV vector
+# to very nearly i.i.d. N(0, 1) -- measured |excess kurtosis| < 0.12 at every
+# full-attention layer of Qwen3.5-2B -- which is precisely the distribution
+# these levels are optimal for.  The matching scale is therefore the RMS
+# ||v||_2 / sqrt(d) rather than an absmax, which sizes its step off a single
+# outlier and leaves the bulk of the coordinates crushed.
+#
+# Byte-identical to TurboQuantCodec<4>::Threshold() and kLloydMaxCentroids in
+# csrc/tests/reference/turbo_quant_cpu.h.  Re-derivable with
+# scripts/tq_kv_quant_reference.py::lloyd_max_gaussian_table().
+TURBOQUANT_LLOYD_MAX_CENTROIDS = (
+    -2.7325895709951710, -2.0690172265313920, -1.6180463860218863, -1.2562311973471796,
+    -0.9423404564869651, -0.6567591185324659, -0.3880482994902919, -0.1283950298511473,
+    0.1283950298511473, 0.3880482994902919, 0.6567591185324659, 0.9423404564869651,
+    1.2562311973471796, 1.6180463860218863, 2.0690172265313920, 2.7325895709951710,
+)
+
+# The 15 interior decision boundaries, t_i = (c_{i-1} + c_i) / 2 exactly.  The
+# device holds these as Adds immediates rather than in UB -- they are the same
+# on every launch, so a UB copy would buy nothing and cost fifteen scalar loads.
+TURBOQUANT_LLOYD_MAX_THRESHOLDS = (
+    -2.4008033987632817, -1.8435318062766393, -1.4371387916845330, -1.0992858269170722,
+    -0.7995497875097155, -0.5224037090113789, -0.2582216646707196, 0.0,
+    0.2582216646707196, 0.5224037090113789, 0.7995497875097155, 1.0992858269170722,
+    1.4371387916845330, 1.8435318062766393, 2.4008033987632817,
+)
+
 _PI_SIGN_CACHE: dict[tuple[int, str], torch.Tensor] = {}
 _CODEC_TABLE_CACHE: dict[tuple[int, int, str], torch.Tensor] = {}
 
@@ -171,10 +210,14 @@ def turboquant_codec_tables(head_size: int, batch_rows: int, device: torch.devic
         [6D, 7D)        evenOffset_ then oddOffset_, D/2 words each
         [7D, 7D + B)    expandOffset_
         [7D + B, +B)    oddSelect_                      (B = D * batch_rows)
+        [7D + 2B, +16) centroid_, the Lloyd-Max reconstruction levels
 
-    ``sign_`` and ``oddSelect_`` are fp32 bit patterns, the rest uint32 byte
-    offsets for Gather; everything is four bytes wide so one int32 copy moves
-    the lot and the device needs no cast.
+    ``sign_``, ``oddSelect_`` and ``centroid_`` are fp32 bit patterns, the rest
+    uint32 byte offsets for Gather; everything is four bytes wide so one int32
+    copy moves the lot and the device needs no cast.  The centroid table is
+    appended rather than prepended so that adding it left every pre-existing
+    offset in the image unchanged; ``head_size`` is a power of two at least 64,
+    so every section boundary is still a whole 32-byte burst.
     """
     key = (head_size, batch_rows, str(device))
     cached = _CODEC_TABLE_CACHE.get(key)
@@ -198,8 +241,11 @@ def turboquant_codec_tables(head_size: int, batch_rows: int, device: torch.devic
     parts.append((word * (batch // TURBOQUANT_PACK_FACTOR)).to(torch.int32))
     parts.append((batch % TURBOQUANT_PACK_FACTOR).to(torch.float32).view(torch.int32))
 
+    centroids = torch.tensor(TURBOQUANT_LLOYD_MAX_CENTROIDS, dtype=torch.float32)
+    parts.append(centroids.view(torch.int32))
+
     tables = torch.cat(parts).contiguous().to(device)
-    expected = 7 * head_size + 2 * head_size * batch_rows
+    expected = 7 * head_size + 2 * head_size * batch_rows + TURBOQUANT_LEVELS
     if tables.numel() != expected:
         raise RuntimeError(f"codec table image is {tables.numel()} words, expected {expected}")
     _CODEC_TABLE_CACHE[key] = tables

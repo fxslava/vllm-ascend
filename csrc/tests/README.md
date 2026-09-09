@@ -560,8 +560,12 @@ contracts, GQA head mapping, both rotary layouts, block-table paging across
 multiple blocks, context-length bounds, and per-shape latency and throughput.
 
 Also covered, since the TurboQuant leg landed: the 4-bit rotated KV cache - its
-write path and its split/combine decode, byte for byte against the CPU
-reference, plus the fidelity of the scheme itself against exact fp32 attention.
+write path and its split/combine decode, bin for bin against the CPU reference,
+plus the fidelity of the scheme itself against exact fp32 attention.  The write
+path is compared in bin indices rather than bytes because the codec's RMS scale
+is a sum the device reduces in a tree and the host sums serially: the two agree
+to within a coordinate landing either side of one decision boundary, and the
+test bounds exactly that.
 
 Not covered: the W8A8 and int8 KV cache paths, chunked prefill and the splitfuse
 attention variants, multi-device or graph-capture execution, and performance

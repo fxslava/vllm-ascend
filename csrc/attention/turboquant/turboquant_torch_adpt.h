@@ -60,6 +60,10 @@ constexpr int64_t kFp32PerBlock = 8;
 // kTileRows in turboquant_kernels.cpp, because the codec's shuffle tables are
 // built for that batch size.
 constexpr int64_t kTileRows = 16;
+// Reconstruction levels of the codec, and so the length of the Lloyd-Max
+// centroid table the constant-table image carries; must match
+// TurboQuantCodec<4>::kLevels.
+constexpr int64_t kCodecLevels = 16;
 
 inline AscendType ToAscendType(at::ScalarType scalarType)
 {
@@ -94,10 +98,12 @@ inline int64_t ScaleSlotFloats(int64_t numKvHeads)
 }
 
 // Words in the codec's constant-table image; must equal
-// TurboQuantCodec<4>::ConstTableWords(headSize, batchRows).
+// TurboQuantCodec<4>::ConstTableWords(headSize, batchRows).  The trailing
+// kCodecLevels words are the Lloyd-Max centroid table Dequantize4Bit gathers
+// against.
 inline int64_t CodecTableWords(int64_t headSize, int64_t batchRows)
 {
-    return 7 * headSize + 2 * headSize * batchRows;
+    return 7 * headSize + 2 * headSize * batchRows + kCodecLevels;
 }
 
 inline void CheckHeadSize(int64_t headSize)

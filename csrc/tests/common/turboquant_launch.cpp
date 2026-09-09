@@ -92,6 +92,13 @@ std::vector<int32_t> CodecTables(int64_t head_size, int64_t batch_rows) {
     tables.push_back(FloatBits(static_cast<float>(b % kPackFactor)));
   }
 
+  // The Lloyd-Max reconstruction levels, gathered by Dequantize4Bit. Taken from
+  // the CPU reference rather than restated, so the device and the host cannot
+  // disagree about the table itself -- only about how they index it.
+  for (int level = 0; level < static_cast<int>(kCodecLevels); ++level) {
+    tables.push_back(FloatBits(tq::kLloydMaxCentroids[level]));
+  }
+
   return tables;
 }
 
