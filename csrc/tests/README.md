@@ -34,13 +34,15 @@ missing from both.
 csrc/tests/
 ├── CMakeLists.txt                       standalone project, not included from the repo root
 ├── COVERAGE.md                          C++ vs Python coverage and parity audit
+├── TURBOQUANT_TESTS.md                  review of every TurboQuant suite: purpose, scope, bounds
 ├── common/
 │   ├── acl_check.hpp                    ACL_CHECK / ASSERT_ACL_OK, with aclGetRecentErrMsg attached
 │   ├── aclnn_ops.hpp / .cpp             the version-sensitive aclnn prototypes — read this first
 │   ├── aclnn_ops_950pr.hpp / .cpp       the 950PR operator audit and its extra prototypes
 │   ├── aclnn_runtime.hpp / .cpp         dlopen/dlsym loader, aclTensor RAII, two-phase launch
 │   ├── ascend950_shapes.hpp             Qwen3.5-2B layer 3 and the arch35 platform rules
-│   ├── bench_main.cpp                   entry point for the bench_* binaries
+│   ├── bench_main.cpp                   entry point for the 310P bench_* binaries
+│   ├── bench_main_950pr.cpp             ditto for the 950PR ones; names the part the suite gates on
 │   ├── benchmark.hpp / .cpp             plan-once launch, event timing, statistics, reporting
 │   ├── cpu_reference.hpp / .cpp         naive fp32 references for all five kernels
 │   ├── device_buffer.hpp                RAII device allocation, 32-byte default, 512 for benchmarks
@@ -74,6 +76,8 @@ csrc/tests/
         ├── test_turbo_quant_fidelity.cpp        host-only, no CANN runtime at all
         ├── test_turboquant_kernels_950pr.cpp    the TurboQuant kernels vs the CPU reference
         ├── test_turboquant_npu_simulator.cpp    one decode pass, quantised vs exact
+        ├── test_turboquant_bare_metal_950pr.cpp production shapes, silicon only, camodel refused
+        ├── bench_turboquant_950pr.cpp           the AIV-only decode baseline and its traffic model
         └── turboquant/CMakeLists.txt            ascendc_library() for the TurboQuant kernels
 ```
 
@@ -189,9 +193,18 @@ ctest --test-dir build/csrc-tests -LE benchmark --output-on-failure
 ctest --test-dir build/csrc-tests -L benchmark --output-on-failure
 ```
 
-A benchmark exits 77 when no usable 310P is attached, which ctest reports as a
-skip rather than a failure. `-DVLLM_ASCEND_TESTS_BUILD_BENCHMARKS=OFF` leaves
-them out of the build entirely.
+A benchmark exits 77 when no usable device of the part it targets is attached,
+which ctest reports as a skip rather than a failure.
+`-DVLLM_ASCEND_TESTS_BUILD_BENCHMARKS=OFF` leaves them out of the build
+entirely.
+
+Which part that is comes from the entry point: `common/bench_main.cpp` for the
+five 310P suites, `common/bench_main_950pr.cpp` for `bench_turboquant_950pr`,
+which appears only under `-DENABLE_ASCEND_950PR=ON` alongside the TurboQuant
+kernels. It is the one benchmark in the suite that times kernels built here
+rather than a stock aclnn operator, and the only one that reports an analytic
+traffic model next to the measurement -
+[TURBOQUANT_TESTS.md](TURBOQUANT_TESTS.md) §8 explains why it has to.
 
 ### What is inside the timed region
 
@@ -270,12 +283,13 @@ warmup.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `ASCEND_BENCH_WARMUP` | 20 | warmup iterations, 0 to 1000000 |
+| `ASCEND_BENCH_WARMUP` | 20 | warmup iterations, 0 to 1000000. A case that defines a checksum is floored at 1: the reference checksum is read straight after the warmup, and at 0 it would be taken over the allocation's zero fill and fail the case at the end of the timed loop |
 | `ASCEND_BENCH_ITERS` | 100 | timed iterations per mode, 1 to 1000000 |
 | `ASCEND_BENCH_BATCH` | 10 | launches per event pair in `pipelined`, 1 to 766: two events bracket a batch, and a deeper one than the stream holds would be split by the runtime's back-pressure rather than measuring a fuller pipeline |
 | `ASCEND_BENCH_MODES` | all three | comma-separated subset of `pipelined,device,host` |
 | `ASCEND_BENCH_CSV` | unset | write one row per (case, mode) to this path |
 | `ASCEND_BENCH_REPEATABLE` | on | `0` forces the re-plan-per-launch path |
+| `ASCEND_BENCH_TQ_CONTEXTS` | `512,1024,2048` | `bench_turboquant_950pr` only: the context lengths to sweep |
 | `ASCEND_TEST_DEVICE_ID` | 0 | device ordinal, shared with the tests |
 
 ```bash
@@ -295,8 +309,13 @@ matter for performance are not the ones that matter for correctness:
 - The paged suite benchmarks `aclnnScatterPaKvCache` with a shuffled slot
   mapping. Decode attention is registered as an explicit skip, for the reason in
   `common/aclnn_ops.hpp`.
+- `bench_turboquant_950pr` sweeps context 512 / 1024 / 2048 at Qwen3.5-2B's
+  `head_dim` 256, timing the 4-bit cache write and the AIV-only split/combine
+  decode, with an fp16 decode through `aclnnFusedInferAttentionScoreV2` as the
+  baseline where that operator exists.
 
-See [COVERAGE.md](COVERAGE.md) for what this does and does not close.
+See [COVERAGE.md](COVERAGE.md) for what this does and does not close, and
+[TURBOQUANT_TESTS.md](TURBOQUANT_TESTS.md) for the TurboQuant leg specifically.
 
 ---
 
@@ -436,6 +455,8 @@ binaries per part, and each set skips on the other part's hardware.
 | `test_qwen_layer_golden_950pr` | 1–9 end to end | all of the above plus `aclnnScatterPaKvCache`, `aclnnFusedInferAttentionScoreV2`, `aclnnSigmoid`, `aclnnMul`, `aclnnInplaceAdd` |
 | `test_turboquant_kernels_950pr` | 5 — decode, 4-bit KV cache | the TurboQuant kernels out of `csrc/attention/turboquant`, not an aclnn operator |
 | `test_turboquant_npu_simulator` | 5 — one decode pass end to end | ditto, with `aclnnFusedInferAttentionScoreV2` as an optional unquantised control |
+| `test_turboquant_bare_metal_950pr` | 5 — the same, at Qwen3.5-2B's real shapes | ditto; **silicon only**, skips under the camodel |
+| `bench_turboquant_950pr` | 5 — the AIV-only decode, timed | ditto, with `aclnnFusedInferAttentionScoreV2` as the attempted fp16 baseline |
 
 `common/aclnn_ops_950pr.hpp` carries the operator audit: which stage runs on a
 stock CANN operator, which on a kernel built out of `csrc/`, and the CANN header
@@ -443,7 +464,12 @@ each prototype was verified against.
 
 ### The TurboQuant leg, and running it on the simulator
 
-The last two binaries in that table are unlike everything else in this suite:
+> **[TURBOQUANT_TESTS.md](TURBOQUANT_TESTS.md) is the full review of this leg**:
+> every case in all five TurboQuant binaries, what it validates, what its bound
+> is and where that number came from, plus the coverage gaps. What follows here
+> is the build-and-run summary only.
+
+The last four binaries in that table are unlike everything else in this suite:
 they drive kernels that are **compiled here**, from
 `csrc/attention/turboquant/turboquant_kernels.cpp` - the same source the wheel
 builds, not a copy - rather than calling an operator CANN already shipped. That
@@ -486,10 +512,25 @@ rather than skip. Three things are worth knowing before you try it:
 - **`aclnnFusedInferAttentionScore` V1 to V4 do not exist on an Ascend950.** The
   simulator test uses it as an unquantised fp16 control and reports the refusal
   rather than failing; the exact fp32 host path is what its assertions compare
-  against. `common/aclnn_ops_950pr.hpp` records the measurement.
+  against. `bench_turboquant_950pr` hits the same wall for its fp16 baseline and
+  registers a ctest-visible skip with the reason.
+  `common/aclnn_ops_950pr.hpp` records the measurement.
 
 The same binaries run unchanged on silicon: configure without `RUN_MODE=sim`
 (or with `-DRUN_MODE=npu`) and they link the real runtime.
+
+**Two of them are for silicon specifically.**
+`test_turboquant_bare_metal_950pr` sweeps the shapes Qwen3.5-2B actually decodes
+at - `head_dim` 256, `block_size` 128, context 512 / 1024 / 2048 - which is
+days of camodel time, so it refuses to run there. The SoC name cannot tell the
+camodel from the part, so `REQUIRE_PHYSICAL_ASCEND_950PR` looks for
+`libruntime_camodel.so` in `/proc/self/maps` instead and skips with the path it
+found. `ASCEND_TEST_ALLOW_SIMULATOR=1` overrides that, and
+`ASCEND_TQ_BARE_METAL_CONTEXTS` shrinks the sweep, both for smoke-checking the
+binary rather than for producing results. `bench_turboquant_950pr` is built
+under `RUN_MODE=sim` but disabled in ctest for the same reason;
+`ASCEND_BENCH_TQ_CONTEXTS` and the usual `ASCEND_BENCH_*` knobs make a hand-run
+smoke check tractable.
 
 `test_turbo_quant_fidelity` needs none of this. It is host-only, links neither
 `libascendcl.so` nor a kernel, and reports the codec's fidelity on the Qwen3.5

@@ -377,11 +377,30 @@ function(vllm_ascend_add_device_executable target_name source_file entry_point)
   add_executable(${target_name} "${source_file}" "${entry_point}")
   target_link_libraries(${target_name} PRIVATE vllm_ascend_test_common)
 
-  # $ORIGIN keeps a copied-out build tree working; the CANN lib dir covers the
-  # normal in-place run.
+  # $ORIGIN keeps a copied-out build tree working; the CANN lib dirs cover the
+  # normal in-place run, and ${CMAKE_BINARY_DIR}/lib is where ascendc_library()
+  # leaves libvllm_ascend_turboquant.so.
+  #
+  # BUILD_WITH_INSTALL_RPATH links with the list below verbatim and skips the
+  # build-rpath computation entirely. That is the point of it, not a shortcut:
+  # CANN's tools/tikcpp/ascendc_kernel_cmake adds
+  #
+  #   ${ASCEND_CANN_PACKAGE_PATH}/tools/simulator/${SOC_VERSION}/lib
+  #
+  # as a PUBLIC link directory on every ascendc_library() target, *without ever
+  # looking at RUN_MODE*, and CMake then appends it to the consumer's RUNPATH.
+  # A RUN_MODE=npu binary comes out carrying a camodel directory on its own
+  # loader path - harmless on a machine where it does not exist, and a silent
+  # swap of the simulator runtime for the real one on a machine where it does.
+  # DT_NEEDED never names a camodel library, so nothing but this stops it.
+  # Measured: BUILD_RPATH_USE_LINK_PATH FALSE does *not* suppress it on CMake
+  # 3.22, and this does.
+  #
+  # The sim branch of the TurboQuant block below deliberately puts that same
+  # directory back, first, because there it is the point.
   set_target_properties(${target_name} PROPERTIES
-    BUILD_RPATH "${ASCEND_HOME_PATH}/lib64"
-    INSTALL_RPATH "$ORIGIN:${ASCEND_HOME_PATH}/lib64")
+    BUILD_WITH_INSTALL_RPATH TRUE
+    INSTALL_RPATH "$ORIGIN;${CMAKE_BINARY_DIR}/lib;${ASCEND_LIB_DIRS}")
 
   set(VLLM_ASCEND_TEST_BINARY_FILES
     ${VLLM_ASCEND_TEST_BINARY_FILES} "$<TARGET_FILE:${target_name}>" PARENT_SCOPE)
@@ -399,13 +418,42 @@ endfunction()
 # Both registration paths below need it, which is why it is a parameter rather
 # than a set_tests_properties() call afterwards: gtest_discover_tests names its
 # tests at ctest time, so there is nothing to set properties on here.
+#
+# The optional third argument suppresses GTest discovery and registers the whole
+# binary as one ctest entry, the way a cross build already does. It exists for
+# the TurboQuant binaries, and the reason is not a preference:
+#
+#   PRE_TEST discovery has to *execute* the binary to enumerate its cases, and
+#   those three link libvllm_ascend_turboquant.so. Built with RUN_MODE=npu, that
+#   library's static initialisation aborts on a host with no NPU driver -
+#   measured on CANN 9.2.0-beta.2:
+#
+#     terminate called after throwing an instance of 'std::logic_error'
+#       what(): basic_string::_S_construct null not valid
+#
+#   before main() reaches RUN_ALL_TESTS, so even `--gtest_list_tests` aborts.
+#   ctest reports "Error running test executable / Subprocess aborted" and then
+#   lists *nothing at all* - not the failing binary, not the other forty tests,
+#   because one failed discovery ends the whole enumeration. `ctest -N` on a
+#   build host becomes useless.
+#
+#   It is not this suite's bug: test_matmul_950pr, which links no kernel
+#   library, enumerates fine in the same tree, and the same TurboQuant binaries
+#   enumerate fine under RUN_MODE=sim where the camodel runtime is present. It
+#   is what an npu-mode kernel library does when the driver is absent, and the
+#   cost of tripping over it is out of all proportion to the per-case ctest
+#   granularity it buys.
 function(vllm_ascend_register_correctness_test target_name)
   if(ARGC GREATER 1)
     set(test_timeout ${ARGV1})
   else()
     set(test_timeout 900)
   endif()
-  if(COMMAND gtest_discover_tests AND NOT CMAKE_VERSION VERSION_LESS "3.18" AND NOT CMAKE_CROSSCOMPILING)
+  set(discover_cases TRUE)
+  if(ARGC GREATER 2 AND ARGV2)
+    set(discover_cases FALSE)
+  endif()
+  if(discover_cases AND COMMAND gtest_discover_tests AND NOT CMAKE_VERSION VERSION_LESS "3.18" AND NOT CMAKE_CROSSCOMPILING)
     # PRE_TEST defers enumeration to `ctest` time. The default POST_BUILD mode
     # runs the binary during the build, which fails on a build host that has the
     # CANN headers but no driver.
@@ -559,9 +607,17 @@ if(ENABLE_ASCEND_950PR)
       target_link_libraries(vllm_ascend_test_turboquant
         PUBLIC vllm_ascend_test_common_950pr vllm_ascend_turboquant)
 
+      # test_turboquant_bare_metal_950pr is the only one of the three that
+      # refuses to run under the camodel: it sweeps the shapes Qwen3.5-2B
+      # actually decodes at (head_dim 256, context up to 2048), which a
+      # cycle-level simulator cannot reach in usable time. It is built in every
+      # configuration all the same - a `sim` build produces it and it skips,
+      # naming the camodel library it found - so the binary set does not depend
+      # on RUN_MODE.
       set(VLLM_ASCEND_TURBOQUANT_TESTS
         test_turboquant_kernels_950pr
-        test_turboquant_npu_simulator)
+        test_turboquant_npu_simulator
+        test_turboquant_bare_metal_950pr)
 
       foreach(test_name ${VLLM_ASCEND_TURBOQUANT_TESTS})
         vllm_ascend_add_device_executable(${test_name} "kernels/ascend/${test_name}.cpp" common/main_950pr.cpp)
@@ -569,13 +625,18 @@ if(ENABLE_ASCEND_950PR)
 
         # The camodel replaces libruntime.so, so its directory has to be ahead of
         # the toolkit's on the loader path at run time as well as at link time.
+        # This is the one configuration that wants it there; see the note in
+        # vllm_ascend_add_device_executable for why every other one must not
+        # inherit it from the link line.
         if(RUN_MODE STREQUAL "sim")
           set_target_properties(${test_name} PROPERTIES
-            BUILD_RPATH "${VLLM_ASCEND_SIMULATOR_LIB_DIR};${ASCEND_HOME_PATH}/lib64"
-            INSTALL_RPATH "$ORIGIN:${VLLM_ASCEND_SIMULATOR_LIB_DIR}:${ASCEND_HOME_PATH}/lib64")
+            INSTALL_RPATH
+              "$ORIGIN;${CMAKE_BINARY_DIR}/lib;${VLLM_ASCEND_SIMULATOR_LIB_DIR};${ASCEND_LIB_DIRS}")
         endif()
 
-        vllm_ascend_register_correctness_test(${test_name})
+        # One ctest entry per binary, not per case: see the note on the third
+        # argument at the function definition.
+        vllm_ascend_register_correctness_test(${test_name} 900 TRUE)
       endforeach()
 
       if(RUN_MODE STREQUAL "sim")
@@ -613,9 +674,11 @@ endif()
 #   ctest --test-dir build/csrc-tests -LE benchmark   # tests only
 #   ctest --test-dir build/csrc-tests -L  benchmark   # benchmarks only
 #
-# A benchmark exits 77 when no usable 310P is attached, which SKIP_RETURN_CODE
-# turns into a ctest skip rather than a failure, matching how the correctness
-# suite behaves on a build host.
+# A benchmark exits 77 when no usable device of the part it targets is attached,
+# which SKIP_RETURN_CODE turns into a ctest skip rather than a failure, matching
+# how the correctness suite behaves on a build host. Which part that is comes
+# from the entry point the binary links: common/bench_main.cpp for the 310P
+# suites, common/bench_main_950pr.cpp for the 950PR one below.
 
 if(VLLM_ASCEND_TESTS_BUILD_BENCHMARKS)
   set(VLLM_ASCEND_KERNEL_BENCHMARKS
@@ -642,6 +705,62 @@ if(VLLM_ASCEND_TESTS_BUILD_BENCHMARKS)
   endforeach()
 
   message(STATUS "vllm-ascend tests: configured ${VLLM_ASCEND_KERNEL_BENCHMARKS}")
+
+  # ---------------------------------------------------------------------------
+  # Ascend 950PR benchmarks
+  # ---------------------------------------------------------------------------
+  #
+  # Registered here rather than inside the 950PR block above, because the
+  # `benchmarks` custom target only exists from this point on and
+  # add_dependencies needs it to.
+  #
+  # The link is against vllm_ascend_test_turboquant, so it follows the same
+  # option as the TurboQuant tests: no kernel toolchain, no kernels, no
+  # benchmark. The entry point is common/bench_main_950pr.cpp, which names the
+  # part, so the binary exits 77 on a 310P instead of timing a decode against
+  # hardware it was not written for.
+  if(TARGET vllm_ascend_test_turboquant)
+    set(VLLM_ASCEND_950PR_BENCHMARKS
+      bench_turboquant_950pr)
+
+    foreach(bench_name ${VLLM_ASCEND_950PR_BENCHMARKS})
+      vllm_ascend_add_device_executable(${bench_name} "kernels/ascend/${bench_name}.cpp"
+                                        common/bench_main_950pr.cpp)
+      target_link_libraries(${bench_name} PRIVATE vllm_ascend_test_turboquant)
+      add_dependencies(benchmarks ${bench_name})
+
+      if(RUN_MODE STREQUAL "sim")
+        set_target_properties(${bench_name} PROPERTIES
+          INSTALL_RPATH
+            "$ORIGIN;${CMAKE_BINARY_DIR}/lib;${VLLM_ASCEND_SIMULATOR_LIB_DIR};${ASCEND_LIB_DIRS}")
+      endif()
+
+      add_test(NAME ${bench_name} COMMAND ${bench_name})
+      set_tests_properties(${bench_name} PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${VLLM_ASCEND_TEST_LIBRARY_PATH};ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
+        LABELS "benchmark"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 1800)
+    endforeach()
+
+    if(RUN_MODE STREQUAL "sim")
+      # Under the camodel a single decode launch is minutes, so the default
+      # 1300-odd launches per case are days. The binary still builds and still
+      # runs - ASCEND_BENCH_ITERS and ASCEND_BENCH_TQ_CONTEXTS exist for exactly
+      # that - but ctest is told not to wait for a default-sized run.
+      foreach(bench_name ${VLLM_ASCEND_950PR_BENCHMARKS})
+        set_tests_properties(${bench_name} PROPERTIES
+          DISABLED TRUE
+          ENVIRONMENT
+            "LD_LIBRARY_PATH=${VLLM_ASCEND_SIMULATOR_LIB_DIR}:${VLLM_ASCEND_TEST_LIBRARY_PATH};ASCEND_HOME_PATH=${ASCEND_HOME_PATH}")
+      endforeach()
+      message(STATUS
+        "vllm-ascend tests: ${VLLM_ASCEND_950PR_BENCHMARKS} built but disabled in ctest under RUN_MODE=sim; "
+        "run the binary by hand with ASCEND_BENCH_ITERS and ASCEND_BENCH_TQ_CONTEXTS set small")
+    endif()
+
+    message(STATUS "vllm-ascend tests: configured ${VLLM_ASCEND_950PR_BENCHMARKS}")
+  endif()
 endif()
 
 endif()  # NOT VLLM_ASCEND_TESTS_HOST_ONLY
