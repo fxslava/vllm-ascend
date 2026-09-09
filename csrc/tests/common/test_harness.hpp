@@ -26,6 +26,7 @@
 #include <acl/acl.h>
 #include <gtest/gtest.h>
 
+#include <cstdlib>
 #include <memory>
 #include <string>
 
@@ -113,6 +114,22 @@ class AscendTestEnvironment : public ::testing::Environment {
 // Registers the environment with GTest. Called from main().
 void RegisterAscendTestEnvironment();
 
+// --- silicon versus the camodel ---------------------------------------------
+//
+// The CANN camodel reports a real SoC name, so is_950pr() cannot tell it from a
+// 950PR: that is the point of the simulator and the reason the TurboQuant tests
+// can run at all without the part. A suite that only means something on
+// hardware - because it measures behaviour the simulator models rather than
+// reproduces, or because its shapes would take days cycle-by-cycle - has to ask
+// a different question.
+//
+// SimulatorEvidence() returns the mapped object that gives the camodel away
+// (libruntime_camodel.so, or anything loaded out of tools/simulator/), or an
+// empty string when nothing does. Silicon is the default assumption: a host
+// whose /proc cannot be read reports no evidence rather than skipping.
+bool IsRunningOnSimulator();
+const std::string& SimulatorEvidence();
+
 #define REQUIRE_ASCEND_DEVICE()                                                            \
   do {                                                                                     \
     if (!::vllm_ascend::test::AscendTestEnvironment::Instance().available()) {             \
@@ -139,6 +156,29 @@ void RegisterAscendTestEnvironment();
       GTEST_SKIP() << "Test targets Ascend 950PR; attached device reports '"               \
                    << ::vllm_ascend::test::AscendTestEnvironment::Instance().soc_name()    \
                    << "'";                                                                 \
+    }                                                                                      \
+  } while (false)
+
+// A 950PR, and not the camodel standing in for one. For suites whose shapes are
+// production-sized: the simulator is cycle-level, so a case that is milliseconds
+// on the part is hours there, and a run that started anyway would look like a
+// hang rather than a skip.
+//
+// ASCEND_TEST_ALLOW_SIMULATOR=1 runs them under the camodel regardless. That is
+// for smoke-checking the binary itself, not for producing results; expect the
+// whole suite to take hours, and shrink the sweep with the suite's own shape
+// override first.
+#define REQUIRE_PHYSICAL_ASCEND_950PR()                                                    \
+  do {                                                                                     \
+    REQUIRE_ASCEND_950PR();                                                                \
+    const char* allow_simulator = std::getenv("ASCEND_TEST_ALLOW_SIMULATOR");               \
+    const bool simulator_allowed = allow_simulator != nullptr && allow_simulator[0] == '1'; \
+    if (::vllm_ascend::test::IsRunningOnSimulator() && !simulator_allowed) {               \
+      GTEST_SKIP() << "Test targets a physical Ascend 950PR and this process has the CANN " \
+                      "camodel loaded ("                                                   \
+                   << ::vllm_ascend::test::SimulatorEvidence()                              \
+                   << "). Rebuild with -DRUN_MODE=npu and run on the part, or set "         \
+                      "ASCEND_TEST_ALLOW_SIMULATOR=1 to run it here anyway (hours).";       \
     }                                                                                      \
   } while (false)
 

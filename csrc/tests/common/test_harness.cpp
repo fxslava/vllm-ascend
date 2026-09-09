@@ -21,6 +21,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <string>
 
 #include "ascend950_shapes.hpp"
 
@@ -55,7 +57,47 @@ std::string QuerySocName() {
   return (name != nullptr) ? std::string(name) : std::string();
 }
 
+// The mapped object that shows the CANN camodel is standing in for the runtime,
+// or an empty string when nothing in the address space says so.
+//
+// Detection is by loaded object rather than by SoC name on purpose: under the
+// camodel aclrtGetSocName() reports a real bin - Ascend950PR_9589 and friends -
+// which is exactly what makes the simulator useful and exactly why the name
+// cannot distinguish it from silicon. What does distinguish it is that
+// RUN_MODE=sim links libruntime_camodel.so in place of libruntime.so and the
+// loader picks it up out of $ASCEND_HOME_PATH/tools/simulator/<bin>/lib, so both
+// the library and the directory it came from are visible in the mapping list.
+//
+// A host with no /proc, or one whose maps cannot be read, reports "not a
+// simulator": silicon is the default assumption, and the alternative would be to
+// skip the bare-metal suite on every machine that refuses the read.
+std::string QuerySimulatorEvidence() {
+  std::ifstream maps("/proc/self/maps");
+  if (!maps.is_open()) {
+    return std::string();
+  }
+  std::string line;
+  while (std::getline(maps, line)) {
+    if (line.find("libruntime_camodel") != std::string::npos ||
+        line.find("/tools/simulator/") != std::string::npos) {
+      const size_t path_start = line.find('/');
+      return path_start == std::string::npos ? line : line.substr(path_start);
+    }
+  }
+  return std::string();
+}
+
 }  // namespace
+
+const std::string& SimulatorEvidence() {
+  // Queried once: the mapping list does not change after the runtime is loaded,
+  // and every REQUIRE_PHYSICAL_ASCEND_950PR in a binary would otherwise reread
+  // /proc.
+  static const std::string evidence = QuerySimulatorEvidence();
+  return evidence;
+}
+
+bool IsRunningOnSimulator() { return !SimulatorEvidence().empty(); }
 
 AscendDevice::AscendDevice() {
   device_id_ = ResolveDeviceId();

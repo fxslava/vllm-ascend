@@ -301,6 +301,12 @@ What the 950PR leg adds that has no 310P counterpart at all:
   head's kv head. `Stage5DecodeAttentionContextIsTheCachedValue` asserts that,
   which is the only direct test of paged-cache indexing anywhere in either
   suite.
+- **A 4-bit KV cache, checked bit for bit and timed.** Five binaries cover the
+  TurboQuant path — the codec on the host, the kernels against the CPU
+  reference, one decode pass against exact fp32, the production shapes on
+  silicon, and the AIV-only performance baseline. Nothing on the 310P leg is
+  comparable, and the whole leg is reviewed in
+  [TURBOQUANT_TESTS.md](TURBOQUANT_TESTS.md) rather than summarised here.
 - **Custom operator resolution.** `common/aclnn_runtime.cpp` now searches
   `libcust_opapi.so` under `$ASCEND_CUSTOM_OPP_PATH` and the
   `$ASCEND_OPP_PATH/vendors` entries before `libopapi.so`, in the same order
@@ -309,9 +315,15 @@ What the 950PR leg adds that has no 310P counterpart at all:
 
 What is **not** covered on the 950PR leg:
 
-- No benchmarks. There is no `bench_*_950pr` counterpart; the arch35 cube/vector
-  split (`cube_vector_combine=split`) makes the 310P benchmark shapes a poor
-  guide, and nothing here has been timed on the part.
+- No benchmarks for the four stock-operator stages. `bench_turboquant_950pr` is
+  the only `bench_*_950pr` binary, and it times kernels built out of `csrc/`
+  rather than aclnn operators; matmul, RMSNorm, SwiGLU and rotary have no 950PR
+  counterpart, because the arch35 cube/vector split
+  (`cube_vector_combine=split`) makes the 310P benchmark shapes a poor guide.
+- No timing from silicon at all. Every TurboQuant device case so far has run on
+  the arch35 camodel, whose wall clock measures the simulator.
+  `test_turboquant_bare_metal_950pr` and `bench_turboquant_950pr` are written
+  for the part and skip until one is attached.
 - `M > 1` projections, as on the 310P. Worse here: arch35 runs cube and vector
   on separate cores, so the M tiling and the cube/vector handover are
   950PR-specific behaviour a single-row GEMV cannot reach.

@@ -94,6 +94,11 @@ const char* TimingModeLabel(TimingMode mode);
 struct BenchmarkOptions {
   // Enough to have the runtime compile and cache the kernel, settle the AI Core
   // clock and touch every page of the workspace at least once.
+  //
+  // A case that defines a checksum always gets at least one warmup launch even
+  // at 0, because the reference checksum is read immediately afterwards and a
+  // baseline taken over the allocation's zero fill would fail the case at the
+  // end of the timed loop. See BenchmarkRunner::WarmUp.
   int warmup_iterations = 20;
   int timed_iterations = 100;
   // Launches per event pair in kPipelined. Large enough that the event pair
@@ -246,9 +251,18 @@ struct BenchmarkCase {
   double flops_per_iteration = 0.0;
   double bytes_per_iteration = 0.0;
 
-  // Enqueues exactly one operator launch. Must not allocate, must not
+  // Enqueues the work of exactly one iteration. Must not allocate, must not
   // synchronise, and must not touch host memory.
   std::function<void(aclrtStream)> launch;
+
+  // Tasks `launch` submits to the stream. One for a single operator; the
+  // TurboQuant decode enqueues two, because flash-decoding's split and combine
+  // stages cannot share a launch - see
+  // csrc/attention/turboquant/turboquant_kernels.cpp. The timing loops use this
+  // to decide when the stream is close to full, and a case that undercounts it
+  // overruns the queue and starts measuring the runtime's back-pressure rather
+  // than the kernel.
+  int tasks_per_launch = 1;
 
   // Optional. Reads the output back and reduces it to one number. Called once
   // after warmup and once after the last timed iteration; a change between the
@@ -310,6 +324,12 @@ class BenchmarkRunner {
   bool has_results() const { return !results_.empty(); }
   size_t failure_count() const { return failures_.size(); }
 
+  // Everything Run() has recorded so far, in registration order. A suite that
+  // has something to say the generic table cannot express - a ratio between two
+  // of its own cases, say - reads them back here after its last Run() and
+  // prints its own section; see kernels/ascend/bench_turboquant_950pr.cpp.
+  const std::vector<BenchmarkResult>& results() const { return results_; }
+
   // Records a case that failed to run. The suite keeps going and the report
   // lists it, so one unsupported shape does not cost the whole run.
   void RecordFailure(const std::string& case_name, const std::string& reason);
@@ -355,12 +375,32 @@ class BenchmarkRunner {
 // Entry point
 // ---------------------------------------------------------------------------
 
+// The part a suite's numbers mean anything on. RunBenchmarkSuite reads
+// aclrtGetSocName and skips the whole suite on anything else, so a 950PR
+// benchmark started on a 310P host reports a skip rather than a table of
+// numbers measured on hardware it was not written for.
+//
+// An empty SoC name - a CANN build that does not export aclrtGetSocName - is
+// accepted for kAscend310P and refused for kAscend950PR. That asymmetry is
+// deliberate and is the same one AscendTestEnvironment::is_310p() and
+// is_950pr() carry: the 310P leg predates any second part and refusing would
+// have made it skip everything, while a 950PR suite that cannot tell which part
+// it is on has to assume it is on the other one.
+enum class BenchmarkTargetPart {
+  kAscend310P,
+  kAscend950PR,
+};
+
 // Owns the process: initialises the runtime, creates the dedicated benchmark
 // stream, calls `build` to register and run the cases, then reports.
 //
-// Returns 0 on success, kBenchmarkSkipExitCode when no usable 310P device is
-// attached (wired to ctest's SKIP_RETURN_CODE so a build host reports a skip
-// rather than a failure), and 1 when a case failed.
+// Returns 0 on success, kBenchmarkSkipExitCode when no usable device of the
+// target part is attached (wired to ctest's SKIP_RETURN_CODE so a build host
+// reports a skip rather than a failure), and 1 when a case failed.
+int RunBenchmarkSuite(const char* suite_name, BenchmarkTargetPart part,
+                      const std::function<void(BenchmarkRunner&)>& build);
+
+// The 310P suites, which predate the part parameter and read better without it.
 int RunBenchmarkSuite(const char* suite_name, const std::function<void(BenchmarkRunner&)>& build);
 
 // ctest SKIP_RETURN_CODE; see csrc/tests/CMakeLists.txt.

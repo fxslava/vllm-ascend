@@ -31,6 +31,7 @@
 #include <stdexcept>
 
 #include "aclnn_ops.hpp"
+#include "ascend950_shapes.hpp"
 #include "test_harness.hpp"
 
 namespace vllm_ascend {
@@ -667,11 +668,22 @@ void BenchmarkRunner::WarmUp(const BenchmarkCase& benchmark_case) {
   // Kernel compilation and caching, the driver-side first touch of the
   // workspace, and the AI Core clock ramp all happen here rather than in sample
   // 0. A long warmup is drained on the way so it cannot overrun the queue.
+  const int tasks_per_launch = std::max(1, benchmark_case.tasks_per_launch);
+  // At least one launch, even at ASCEND_BENCH_WARMUP=0. The reference checksum
+  // is read straight after this, and with no launch at all it would be taken
+  // over the allocation's zero fill - so the comparison after the timed loop
+  // would fail every case that has a checksum, reporting "the launches are not
+  // all computing the same thing" when what actually happened is that the
+  // baseline was never computed. Warmup 0 is a legitimate setting (it is how a
+  // camodel run stays finite), so the floor lives here rather than in the
+  // option parse.
+  const int warmup_iterations =
+      benchmark_case.checksum ? std::max(1, options_.warmup_iterations) : options_.warmup_iterations;
   int enqueued = 0;
-  for (int i = 0; i < options_.warmup_iterations; ++i) {
-    DrainIfQueueIsDeep(&enqueued, 1);
+  for (int i = 0; i < warmup_iterations; ++i) {
+    DrainIfQueueIsDeep(&enqueued, tasks_per_launch);
     benchmark_case.launch(stream_);
-    ++enqueued;
+    enqueued += tasks_per_launch;
   }
   // The hard barrier between warmup and timing. Every warmup launch, and every
   // MTE transfer it queued, has retired before the first sample is recorded, so
@@ -688,7 +700,7 @@ LatencySamples BenchmarkRunner::TimePipelined(const BenchmarkCase& benchmark_cas
   // runtime keep the pipeline full. The batch plus both events is what one
   // sample puts on the stream, and the drain is told about all of it up front
   // so a deep batch cannot be split by the runtime's own back-pressure.
-  const int tasks_per_sample = batch + 2;
+  const int tasks_per_sample = batch * std::max(1, benchmark_case.tasks_per_launch) + 2;
   int enqueued = 0;
   for (size_t sample = 0; sample < samples; ++sample) {
     DrainIfQueueIsDeep(&enqueued, tasks_per_sample);
@@ -721,14 +733,15 @@ LatencySamples BenchmarkRunner::TimeDeviceEvents(const BenchmarkCase& benchmark_
 
   // Every event is recorded before anything is read back, so the loop never
   // waits on the host.
-  constexpr int kTasksPerSample = 3;  // the launch, plus both events
+  // Whatever the launch submits, plus both events.
+  const int tasks_per_sample = std::max(1, benchmark_case.tasks_per_launch) + 2;
   int enqueued = 0;
   for (size_t sample = 0; sample < samples; ++sample) {
-    DrainIfQueueIsDeep(&enqueued, kTasksPerSample);
+    DrainIfQueueIsDeep(&enqueued, tasks_per_sample);
     ACL_CHECK(aclrtRecordEvent(events.start(sample), stream_));
     benchmark_case.launch(stream_);
     ACL_CHECK(aclrtRecordEvent(events.stop(sample), stream_));
-    enqueued += kTasksPerSample;
+    enqueued += tasks_per_sample;
   }
   ACL_CHECK(aclrtSynchronizeStream(stream_));
 
@@ -969,9 +982,43 @@ void BenchmarkRunner::Report() const {
 // Entry point
 // ---------------------------------------------------------------------------
 
+namespace {
+
+// Whether `soc` names a device of the target part. The empty-name case differs
+// by part on purpose; see BenchmarkTargetPart.
+bool SocMatchesTargetPart(const std::string& soc, BenchmarkTargetPart part) {
+  switch (part) {
+    case BenchmarkTargetPart::kAscend310P:
+      // Empty means the runtime would not tell us; the correctness suite treats
+      // that the same way rather than refusing to run.
+      return soc.empty() || soc.find("310P") != std::string::npos || soc.find("310p") != std::string::npos;
+    case BenchmarkTargetPart::kAscend950PR:
+      return shapes950::IsAscend950PrSocName(soc);
+  }
+  return false;
+}
+
+const char* TargetPartLabel(BenchmarkTargetPart part) {
+  return part == BenchmarkTargetPart::kAscend310P ? "Ascend 310P" : "Ascend 950PR";
+}
+
+}  // namespace
+
 int RunBenchmarkSuite(const char* suite_name, const std::function<void(BenchmarkRunner&)>& build) {
-  std::printf("[ascend-bench] vllm-ascend 310P kernel microbenchmarks (no Python, no torch)\n");
-  ops::PrintOperatorInventory();
+  return RunBenchmarkSuite(suite_name, BenchmarkTargetPart::kAscend310P, build);
+}
+
+int RunBenchmarkSuite(const char* suite_name, BenchmarkTargetPart part,
+                      const std::function<void(BenchmarkRunner&)>& build) {
+  std::printf("[ascend-bench] vllm-ascend %s kernel microbenchmarks (no Python, no torch)\n",
+              TargetPartLabel(part));
+  // The inventory is the 310P operator audit. A 950PR suite drives kernels built
+  // out of csrc/ rather than stock operators, so printing it there would list a
+  // pipeline none of its cases touch; those suites print whatever availability
+  // note they actually depend on themselves.
+  if (part == BenchmarkTargetPart::kAscend310P) {
+    ops::PrintOperatorInventory();
+  }
   std::fflush(stdout);
 
   std::unique_ptr<AscendDevice> device;
@@ -983,12 +1030,9 @@ int RunBenchmarkSuite(const char* suite_name, const std::function<void(Benchmark
   }
 
   const std::string& soc = device->soc_name();
-  // Empty means the runtime would not tell us; the correctness suite treats
-  // that the same way rather than refusing to run.
-  if (!soc.empty() && soc.find("310P") == std::string::npos && soc.find("310p") == std::string::npos) {
-    std::printf("[ascend-bench] attached device reports soc='%s', these benchmarks target Ascend 310P; "
-                "skipping\n",
-                soc.c_str());
+  if (!SocMatchesTargetPart(soc, part)) {
+    std::printf("[ascend-bench] attached device reports soc='%s', these benchmarks target %s; skipping\n",
+                soc.empty() ? "<unknown>" : soc.c_str(), TargetPartLabel(part));
     return kBenchmarkSkipExitCode;
   }
   std::printf("[ascend-bench] device %d ready, soc='%s'\n", device->device_id(),
