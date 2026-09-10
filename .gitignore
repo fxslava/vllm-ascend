@@ -248,3 +248,11 @@ out/
 
 # Release packages
 *.tar.gz
+
+# Built test bundles exported for retrieval from the Windows host
+/artifacts/
+
+# Output of the KV-quantization ablation driver. Regenerate it with
+# scripts/tq_kv_quant_reference.py rather than committing a results blob that
+# nothing in the tree can tie back to a run.
+/ablation_results.json
