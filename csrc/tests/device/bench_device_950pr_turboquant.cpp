@@ -42,18 +42,25 @@
 //   fp16_decode_s<S>   the same decode with an unquantised fp16 paged KV cache,
 //                      through aclnnFusedInferAttentionScoreV2.
 //
-// THE fp16 LEG IS EXPECTED TO SKIP ON THIS PART, AND THAT IS NOT A GAP IN THE
-// BENCHMARK. Measured on CANN 9.1.0: the planning call returns 361001 with
-// "Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer
-// supported on Ascend950" - the whole V1..V4 family is withdrawn on a 950, and
-// no V5+ replacement is exposed by the release this suite is built against.
-// See common/aclnn_ops_950pr.hpp. The leg is attempted anyway, because it is
-// the right control on any part that has the operator and because a benchmark
-// that silently omits its baseline is worse than one that prints why it has
-// none.
+// THE fp16 LEG RESOLVES V5, AND FALLS BACK TO V2. Measured on CANN 9.1.0, the
+// V2 planning call returns 361001 with "Interface aclnnFusedInferAttentionScore
+// versions V1 to V4 are no longer supported on Ascend950": the whole V1..V4
+// family is withdrawn on this part, and aclnnFusedInferAttentionScoreV5 is what
+// replaces it. The suite resolves V5 first and keeps V2 as the fallback, so the
+// same source works on a CANN release that predates V5 and on a part where V2
+// still exists; the report says which one ran.
 //
-// What carries the fp16 comparison in the meantime is the traffic model printed
-// before the table. That part is not a measurement and does not pretend to be:
+// V5's argument list is V2's plus seven optional inputs and two scalars, all of
+// which a plain fp16 paged decode leaves at their neutral values - see
+// common/aclnn_ops_950pr.hpp for the transcription and
+// shapes950::kFiaQueryQuantModeNone / kFiaPseTypeDefault for the two scalars.
+// It has NOT been planned on hardware: no 950PR has been available, so a
+// non-zero status from the first silicon run is an argument-list bug before it
+// is anything else.
+//
+// What carries the fp16 comparison wherever the operator does not resolve is
+// the traffic model printed before the table. That is not a measurement and
+// does not pretend to be:
 // it is exact arithmetic over the two cache layouts, and it is the quantity the
 // scheme actually buys. A decode step is bandwidth-bound - it streams the whole
 // context and does two vector operations per element it reads - so the ratio of
@@ -404,9 +411,24 @@ struct DecodeScenario {
 
 // --- the fp16 control --------------------------------------------------------
 
+// The fp16 baseline's operator, V5 preferred and V2 as the fallback.
+//
+// V1..V4 are withdrawn on an Ascend950 - the planning call returns 361001 with
+// "Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer
+// supported on Ascend950" - and V5 is what replaces them. The fallback is not
+// decoration: the same source has to keep working on a CANN release that never
+// shipped V5, and on any part where V2 still exists, so the suite resolves
+// whichever is present and labels the result with the one it used. Two
+// different argument lists come out of that, which is why PlanFp16Decode below
+// branches rather than sharing one call.
 const AclnnOp& FusedInferAttentionOp() {
-  static const AclnnOp op(ops950::kFusedInferAttentionScoreV2);
-  return op;
+  static const AclnnOp v5(ops950::kFusedInferAttentionScoreV5);
+  static const AclnnOp v2(ops950::kFusedInferAttentionScoreV2);
+  return v5.available() ? v5 : v2;
+}
+
+bool FusedInferAttentionIsV5() {
+  return FusedInferAttentionOp().name() == ops950::kFusedInferAttentionScoreV5;
 }
 
 // The unquantised leg's own buffers: a full fp16 paged KV cache over the same
@@ -511,8 +533,16 @@ void BuildSuite(BenchmarkRunner& runner) {
               aiv_queried ? " (from aclGetDeviceCapability)" : " (assumed; the runtime declined to answer)");
 
   const AclnnOp& fia = FusedInferAttentionOp();
-  std::printf("[ascend-bench] fp16 control operator %s: %s\n", ops950::kFusedInferAttentionScoreV2,
+  std::printf("[ascend-bench] fp16 baseline operator %s: %s\n", fia.name().c_str(),
               fia.available() ? "resolved" : fia.unavailable_reason().c_str());
+  if (!fia.available()) {
+    std::printf("[ascend-bench]   neither %s nor %s resolved; the fp16 column will be empty and the\n"
+                "[ascend-bench]   comparison falls back to the traffic model below.\n",
+                ops950::kFusedInferAttentionScoreV5, ops950::kFusedInferAttentionScoreV2);
+  } else if (!FusedInferAttentionIsV5()) {
+    std::printf("[ascend-bench]   V5 did not resolve, so this is the V2 fallback. On an Ascend950 the\n"
+                "[ascend-bench]   planning call will refuse it with 361001 and the case will skip.\n");
+  }
   std::fflush(stdout);
 
   // Built alongside the scenarios so the model's partial-traffic term uses the
@@ -599,22 +629,57 @@ void BuildSuite(BenchmarkRunner& runner) {
       AclnnIntArray actual_seq_lengths(std::vector<int64_t>{kQueryTokens});
       AclnnIntArray actual_seq_lengths_kv(std::vector<int64_t>{context_len});
 
-      // The argument list is the one common/aclnn_ops_950pr.hpp records from the
-      // plugin's DecodeOnly branch. Planning is where an Ascend950 refuses the
-      // whole V1..V4 family, so this is the call that throws and the reason the
-      // catch below reports a skip rather than a failure.
-      PlannedOp planned = PlanAclnn<ops950::FusedInferAttentionScoreV2WorkspaceFn>(
-          fia, query_tnd.get(), key_list.get(), value_list.get(), /*pse_shift=*/nullptr, /*atten_mask=*/nullptr,
-          actual_seq_lengths.get(), actual_seq_lengths_kv.get(), /*deq_scale1=*/nullptr, /*quant_scale1=*/nullptr,
-          /*deq_scale2=*/nullptr, /*quant_scale2=*/nullptr, /*quant_offset2=*/nullptr, /*antiquant_scale=*/nullptr,
-          /*antiquant_offset=*/nullptr, block_table_tensor.get(), /*query_padding_size=*/nullptr,
-          /*kv_padding_size=*/nullptr, /*key_antiquant_scale=*/nullptr, /*key_antiquant_offset=*/nullptr,
-          /*value_antiquant_scale=*/nullptr, /*value_antiquant_offset=*/nullptr, /*key_shared_prefix=*/nullptr,
-          /*value_shared_prefix=*/nullptr, /*actual_shared_prefix_len=*/nullptr, kNumHeads,
-          static_cast<double>(kAttentionScale), s950::kFiaUnboundedTokens, s950::kFiaUnboundedTokens,
-          const_cast<char*>(ops950::kFiaLayoutTnd), kNumKvHeads, s950::kFiaSparseModeNone,
-          s950::kFiaInnerPreciseDefault, kBlockSize, /*antiquant_mode=*/0, /*softmax_lse_flag=*/false,
-          /*key_antiquant_mode=*/0, /*value_antiquant_mode=*/0, context_tensor.get(), lse_tensor.get());
+      // Both argument lists are the plugin's DecodeOnly branch as
+      // common/aclnn_ops_950pr.hpp records it, differing only by what V5 added:
+      // seven optional tensors after actualSharedPrefixLen, and queryQuantMode
+      // and pseType after valueAntiquantMode. The geometry is identical either
+      // way and identical to the TurboQuant leg's - head_dim 256, 8 heads over
+      // 2 kv heads, block_size 128, layout TND with a block table, which is
+      // what makes the two legs' numbers comparable at all.
+      //
+      // Planning is where an Ascend950 refuses V1..V4, so this is the call that
+      // throws when only V2 resolved, and the reason the catch below reports a
+      // skip rather than a failure.
+      PlannedOp planned =
+          FusedInferAttentionIsV5()
+              ? PlanAclnn<ops950::FusedInferAttentionScoreV5WorkspaceFn>(
+                    fia, query_tnd.get(), key_list.get(), value_list.get(), /*pse_shift=*/nullptr,
+                    /*atten_mask=*/nullptr, actual_seq_lengths.get(), actual_seq_lengths_kv.get(),
+                    /*deq_scale1=*/nullptr, /*quant_scale1=*/nullptr, /*deq_scale2=*/nullptr,
+                    /*quant_scale2=*/nullptr, /*quant_offset2=*/nullptr, /*antiquant_scale=*/nullptr,
+                    /*antiquant_offset=*/nullptr, block_table_tensor.get(), /*query_padding_size=*/nullptr,
+                    /*kv_padding_size=*/nullptr, /*key_antiquant_scale=*/nullptr,
+                    /*key_antiquant_offset=*/nullptr, /*value_antiquant_scale=*/nullptr,
+                    /*value_antiquant_offset=*/nullptr, /*key_shared_prefix=*/nullptr,
+                    /*value_shared_prefix=*/nullptr, /*actual_shared_prefix_len=*/nullptr,
+                    // The seven V5 additions. An fp16 paged decode wants none of
+                    // them: the RoPE is already folded into the cached K, the
+                    // query is not quantised, there is no attention sink and the
+                    // window is unbounded.
+                    /*query_rope=*/nullptr, /*key_rope=*/nullptr, /*key_rope_antiquant_scale=*/nullptr,
+                    /*dequant_scale_query=*/nullptr, /*learnable_sink=*/nullptr, /*q_start_idx=*/nullptr,
+                    /*kv_start_idx=*/nullptr, kNumHeads, static_cast<double>(kAttentionScale),
+                    s950::kFiaUnboundedTokens, s950::kFiaUnboundedTokens,
+                    const_cast<char*>(ops950::kFiaLayoutTnd), kNumKvHeads, s950::kFiaSparseModeNone,
+                    s950::kFiaInnerPreciseDefault, kBlockSize, /*antiquant_mode=*/0,
+                    /*softmax_lse_flag=*/false, /*key_antiquant_mode=*/0, /*value_antiquant_mode=*/0,
+                    s950::kFiaQueryQuantModeNone, s950::kFiaPseTypeDefault, context_tensor.get(),
+                    lse_tensor.get())
+              : PlanAclnn<ops950::FusedInferAttentionScoreV2WorkspaceFn>(
+                    fia, query_tnd.get(), key_list.get(), value_list.get(), /*pse_shift=*/nullptr,
+                    /*atten_mask=*/nullptr, actual_seq_lengths.get(), actual_seq_lengths_kv.get(),
+                    /*deq_scale1=*/nullptr, /*quant_scale1=*/nullptr, /*deq_scale2=*/nullptr,
+                    /*quant_scale2=*/nullptr, /*quant_offset2=*/nullptr, /*antiquant_scale=*/nullptr,
+                    /*antiquant_offset=*/nullptr, block_table_tensor.get(), /*query_padding_size=*/nullptr,
+                    /*kv_padding_size=*/nullptr, /*key_antiquant_scale=*/nullptr,
+                    /*key_antiquant_offset=*/nullptr, /*value_antiquant_scale=*/nullptr,
+                    /*value_antiquant_offset=*/nullptr, /*key_shared_prefix=*/nullptr,
+                    /*value_shared_prefix=*/nullptr, /*actual_shared_prefix_len=*/nullptr, kNumHeads,
+                    static_cast<double>(kAttentionScale), s950::kFiaUnboundedTokens,
+                    s950::kFiaUnboundedTokens, const_cast<char*>(ops950::kFiaLayoutTnd), kNumKvHeads,
+                    s950::kFiaSparseModeNone, s950::kFiaInnerPreciseDefault, kBlockSize,
+                    /*antiquant_mode=*/0, /*softmax_lse_flag=*/false, /*key_antiquant_mode=*/0,
+                    /*value_antiquant_mode=*/0, context_tensor.get(), lse_tensor.get());
 
       BenchmarkCase fp16_case;
       fp16_case.name = fp16_name;

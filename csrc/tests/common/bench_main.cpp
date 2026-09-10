@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// Entry point shared by every benchmark binary. Each kernels/bench_*.cpp
+// Entry point shared by every benchmark binary. Each device_310p/bench_*.cpp
 // provides the two symbols declared here and nothing else: no GTest, no test
 // registration, and no global constructors that could run before the runtime
 // is up.

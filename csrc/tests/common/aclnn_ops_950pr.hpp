@@ -166,11 +166,11 @@ inline constexpr int64_t kRotaryModeInterleaveHalf = 3;
 // paged decode on a 950PR has to come from somewhere else, and the two
 // candidates in this tree are the TurboQuant kernels under
 // csrc/attention/turboquant (which is what
-// kernels/ascend/test_turboquant_npu_simulator.cpp drives) and whichever V5+
+// sim/test_sim_950pr_turboquant_decode.cpp drives) and whichever V5+
 // interface CANN offers in place of these.
 //
 // Tests that call it therefore have to tolerate its absence rather than
-// requiring it: test_turboquant_npu_simulator.cpp uses it as an optional
+// requiring it: test_sim_950pr_turboquant_decode.cpp uses it as an optional
 // unquantised control and reports the failure instead of failing, and
 // test_qwen_layer_golden_950pr.cpp will skip its stage 5 on this part.
 //
@@ -212,6 +212,84 @@ using FusedInferAttentionScoreV2WorkspaceFn = int (*)(
     int64_t key_antiquant_mode, int64_t value_antiquant_mode, const aclTensor* attention_out,
     const aclTensor* softmax_lse, uint64_t* workspace_size, aclOpExecutor** executor);
 inline const char* kFusedInferAttentionScoreV2 = "aclnnFusedInferAttentionScoreV2";
+
+// V5 - the interface that replaces the withdrawn V1..V4 family on an Ascend950.
+//
+// This is the answer to the open question the V2 note above leaves: the paged
+// decode on a 950PR either comes from the TurboQuant kernels or from here.
+// Callers should prefer it and fall back to V2, which is what
+// device/bench_device_950pr_turboquant.cpp does - the fallback keeps the same
+// source working on a 310P-era CANN and on any part where V2 still exists.
+//
+// It is V2 plus nine parameters, in two groups. Seven optional inputs slot in
+// after actualSharedPrefixLenOptional:
+//
+//   queryRopeOptional, keyRopeOptional        MLA's split RoPE path, where the
+//   keyRopeAntiquantScaleOptional             rotary half of Q and K is a
+//                                             separate tensor from the
+//                                             non-rotary half
+//   dequantScaleQueryOptional                 per-query dequant for a quantised
+//                                             query
+//   learnableSinkOptional                     the learned attention-sink logit
+//                                             some long-context models carry
+//   qStartIdxOptional, kvStartIdxOptional     window offsets, for the sliding
+//                                             window sparse modes
+//
+// and two int64 scalars after valueAntiquantMode: queryQuantMode and pseType.
+// A plain fp16 paged decode wants none of the seven, queryQuantMode 0 and the
+// pseType default; see shapes950::kFiaQueryQuantModeNone and kFiaPseTypeDefault
+// for the values and why they are what they are.
+//
+// VERIFIED against CANN 9.2.0-beta.2
+// $ASCEND_HOME_PATH/include/aclnnop/aclnn_fused_infer_attention_score_v5.h
+//   aclnnStatus aclnnFusedInferAttentionScoreV5GetWorkspaceSize(
+//       const aclTensor *query, const aclTensorList *key, const aclTensorList *value,
+//       const aclTensor *pseShiftOptional, const aclTensor *attenMaskOptional,
+//       const aclIntArray *actualSeqLengthsOptional, const aclIntArray *actualSeqLengthsKvOptional,
+//       const aclTensor *deqScale1Optional, const aclTensor *quantScale1Optional,
+//       const aclTensor *deqScale2Optional, const aclTensor *quantScale2Optional,
+//       const aclTensor *quantOffset2Optional, const aclTensor *antiquantScaleOptional,
+//       const aclTensor *antiquantOffsetOptional, const aclTensor *blockTableOptional,
+//       const aclTensor *queryPaddingSizeOptional, const aclTensor *kvPaddingSizeOptional,
+//       const aclTensor *keyAntiquantScaleOptional, const aclTensor *keyAntiquantOffsetOptional,
+//       const aclTensor *valueAntiquantScaleOptional, const aclTensor *valueAntiquantOffsetOptional,
+//       const aclTensor *keySharedPrefixOptional, const aclTensor *valueSharedPrefixOptional,
+//       const aclIntArray *actualSharedPrefixLenOptional, const aclTensor *queryRopeOptional,
+//       const aclTensor *keyRopeOptional, const aclTensor *keyRopeAntiquantScaleOptional,
+//       const aclTensor *dequantScaleQueryOptional, const aclTensor *learnableSinkOptional,
+//       const aclIntArray *qStartIdxOptional, const aclIntArray *kvStartIdxOptional,
+//       int64_t numHeads, double scaleValue, int64_t preTokens, int64_t nextTokens,
+//       char *inputLayout, int64_t numKeyValueHeads, int64_t sparseMode, int64_t innerPrecise,
+//       int64_t blockSize, int64_t antiquantMode, bool softmaxLseFlag, int64_t keyAntiquantMode,
+//       int64_t valueAntiquantMode, int64_t queryQuantMode, int64_t pseType,
+//       const aclTensor *attentionOut, const aclTensor *softmaxLse,
+//       uint64_t *workspaceSize, aclOpExecutor **executor);
+//
+// NOT YET EXECUTED. This prototype is transcribed from the header, and like
+// every other declaration in this file it is resolved with dlsym rather than
+// linked, so the compiler cannot check it. A mismatch shows up as a non-zero
+// planning status with the CANN diagnostic attached, not as corruption - but it
+// has never been planned on a part, because no 950PR has been available. The
+// first silicon run should treat a non-zero status here as an argument-list bug
+// before suspecting anything else.
+using FusedInferAttentionScoreV5WorkspaceFn = int (*)(
+    const aclTensor* query, const aclTensorList* key, const aclTensorList* value, const aclTensor* pse_shift,
+    const aclTensor* atten_mask, const aclIntArray* actual_seq_lengths, const aclIntArray* actual_seq_lengths_kv,
+    const aclTensor* deq_scale1, const aclTensor* quant_scale1, const aclTensor* deq_scale2,
+    const aclTensor* quant_scale2, const aclTensor* quant_offset2, const aclTensor* antiquant_scale,
+    const aclTensor* antiquant_offset, const aclTensor* block_table, const aclTensor* query_padding_size,
+    const aclTensor* kv_padding_size, const aclTensor* key_antiquant_scale, const aclTensor* key_antiquant_offset,
+    const aclTensor* value_antiquant_scale, const aclTensor* value_antiquant_offset,
+    const aclTensor* key_shared_prefix, const aclTensor* value_shared_prefix,
+    const aclIntArray* actual_shared_prefix_len, const aclTensor* query_rope, const aclTensor* key_rope,
+    const aclTensor* key_rope_antiquant_scale, const aclTensor* dequant_scale_query,
+    const aclTensor* learnable_sink, const aclIntArray* q_start_idx, const aclIntArray* kv_start_idx,
+    int64_t num_heads, double scale_value, int64_t pre_tokens, int64_t next_tokens, char* input_layout,
+    int64_t num_key_value_heads, int64_t sparse_mode, int64_t inner_precise, int64_t block_size,
+    int64_t antiquant_mode, bool softmax_lse_flag, int64_t key_antiquant_mode, int64_t value_antiquant_mode,
+    int64_t query_quant_mode, int64_t pse_type, const aclTensor* attention_out, const aclTensor* softmax_lse,
+    uint64_t* workspace_size, aclOpExecutor** executor);
+inline const char* kFusedInferAttentionScoreV5 = "aclnnFusedInferAttentionScoreV5";
 
 // The layout string the plugin's decode path passes. "TND" means the query is
 // [total_tokens, num_heads, head_size] with the per-sequence split carried by

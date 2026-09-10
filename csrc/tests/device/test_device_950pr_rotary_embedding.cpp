@@ -23,7 +23,7 @@
 //
 //   * The 310P cannot run this shape at all. AscendMRotaryEmbedding310 gates on
 //     rotary_dim in (64, 128) and the operator behind it is limited to those
-//     head dims, which is why csrc/tests/kernels/test_rotary_embedding_310p.cpp
+//     head dims, which is why csrc/tests/device_310p/test_rotary_embedding_310p.cpp
 //     sweeps only 64 and 128 and never a partial case.
 //   * The stock aclnnApplyRotaryPosEmbV2 cannot express a partial rotation
 //     either: it rotates the whole trailing dim. common/partial_rotary_950pr.hpp

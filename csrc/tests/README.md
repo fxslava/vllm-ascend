@@ -4,10 +4,14 @@ A standalone suite for the five operator families a **Qwen3.5** forward pass
 needs, driven straight through the CANN runtime. No Python, no PyTorch, no
 `torch_npu`, no Torch C++ ABI.
 
-Ascend 310P3 is the default target and is what everything up to
-[Ascend 950PR](#ascend-950pr) describes. That section covers the opt-in 950PR
-leg, which adds four operator tests and an end-to-end Qwen3.5 layer parity test
-against a PyTorch dump.
+The suite is split into three **execution tiers** - host, simulator and device -
+plus the Ascend 310P leg, which is a different part rather than a tier. Which of
+them a build produces is decided by `SOC_VERSION` and `RUN_MODE`; see
+[Layout](#layout). A 950PR build contains no 310P target at all.
+
+Ascend 310P3 is the default `SOC_VERSION` and is what everything up to
+[Ascend 950PR](#ascend-950pr) describes.
+[TURBOQUANT_TESTS.md](TURBOQUANT_TESTS.md) reviews the 950PR tiers case by case.
 
 | Kernel | Test binary | Benchmark binary | Stands in for |
 | --- | --- | --- | --- |
@@ -30,61 +34,101 @@ missing from both.
 
 ## Layout
 
+The suite is organised by **where a test can run**. Three tiers, mutually
+exclusive by construction, plus the 310P leg, which is a different part rather
+than a tier.
+
 ```
 csrc/tests/
-├── CMakeLists.txt                       standalone project, not included from the repo root
-├── COVERAGE.md                          C++ vs Python coverage and parity audit
-├── TURBOQUANT_TESTS.md                  review of every TurboQuant suite: purpose, scope, bounds
-├── common/
-│   ├── acl_check.hpp                    ACL_CHECK / ASSERT_ACL_OK, with aclGetRecentErrMsg attached
-│   ├── aclnn_ops.hpp / .cpp             the version-sensitive aclnn prototypes — read this first
-│   ├── aclnn_ops_950pr.hpp / .cpp       the 950PR operator audit and its extra prototypes
-│   ├── aclnn_runtime.hpp / .cpp         dlopen/dlsym loader, aclTensor RAII, two-phase launch
-│   ├── ascend950_shapes.hpp             Qwen3.5-2B layer 3 and the arch35 platform rules
-│   ├── bench_main.cpp                   entry point for the 310P bench_* binaries
-│   ├── bench_main_950pr.cpp             ditto for the 950PR ones; names the part the suite gates on
-│   ├── benchmark.hpp / .cpp             plan-once launch, event timing, statistics, reporting
-│   ├── cpu_reference.hpp / .cpp         naive fp32 references for all five kernels
-│   ├── device_buffer.hpp                RAII device allocation, 32-byte default, 512 for benchmarks
-│   ├── device_tensor.hpp                device buffer + aclTensor descriptor, with host conversions
-│   ├── fp16.hpp                         IEEE-754 binary16 conversion, round-to-nearest-even
-│   ├── golden_layer3.hpp / .cpp         LFS-aware loader for the layer-3 dump
-│   ├── main.cpp                         entry point for the test_* binaries, prints the inventory
-│   ├── main_950pr.cpp                   ditto, printing the 950PR pipeline inventory
-│   ├── partial_rotary_950pr.hpp / .cpp  partial RoPE: custom operator, else packed stock operator
-│   ├── qwen_shapes.hpp                  Qwen3.5 shapes and the 310P alignment rules
-│   ├── random_data.hpp                  deterministic, platform-independent test data
-│   ├── tensor_compare.hpp               allclose with a diagnostic report
-│   ├── test_benchmark_harness.cpp       device-free tests over the benchmark report arithmetic
-│   ├── test_harness.hpp / .cpp          AscendTestEnvironment: aclInit, device, context, stream
-│   └── turboquant_launch.hpp / .cpp     torch-free binding for the TurboQuant kernels: the two
-│                                        _impl prototypes, the codec table image, the grid maths
-├── data/
-│   └── golden_layer3/*.bin              Git LFS: weights, taps and output of one Qwen3.5 layer
-└── kernels/
-    ├── test_matmul_310p.cpp             bench_matmul_310p.cpp
-    ├── test_rmsnorm_310p.cpp            bench_rmsnorm_310p.cpp
-    ├── test_rotary_embedding_310p.cpp   bench_rotary_embedding_310p.cpp
-    ├── test_activation_swiglu_310p.cpp  bench_activation_swiglu_310p.cpp
-    ├── test_paged_attention_310p.cpp    bench_paged_attention_310p.cpp
-    └── ascend/                          built only with -DENABLE_ASCEND_950PR=ON
-        ├── test_matmul_950pr.cpp
-        ├── test_rmsnorm_950pr.cpp
-        ├── test_rotary_embedding_950pr.cpp
-        ├── test_activation_swiglu_950pr.cpp
-        ├── test_qwen_layer_golden_950pr.cpp
-        ├── test_turbo_quant_fidelity.cpp        host-only, no CANN runtime at all
-        ├── test_turboquant_kernels_950pr.cpp    the TurboQuant kernels vs the CPU reference
-        ├── test_turboquant_npu_simulator.cpp    one decode pass, quantised vs exact
-        ├── test_turboquant_bare_metal_950pr.cpp production shapes, silicon only, camodel refused
-        ├── bench_turboquant_950pr.cpp           the AIV-only decode baseline and its traffic model
-        └── turboquant/CMakeLists.txt            ascendc_library() for the TurboQuant kernels
+|-- CMakeLists.txt          tier dispatch, SoC gating, the shared helpers
+|-- COVERAGE.md             C++ vs Python coverage and parity audit
+|-- TURBOQUANT_TESTS.md     the tier map and every TurboQuant case, reviewed
+|
+|-- common/                 shared infrastructure (see the table below)
+|-- reference/              turbo_quant_cpu.h, the CPU oracle
+|-- data/golden_layer3/     Git LFS: weights, taps and output of one Qwen3.5 layer
+|-- turboquant/             ascendc_library() for the Ascend C kernels
+|
+|-- host/                   TIER 1 -- no CANN at all, no NPU, runs anywhere
+|   `-- test_host_turboquant_fidelity.cpp
+|
+|-- sim/                    TIER 2 -- CAModel only; links libruntime_camodel.so
+|   |-- test_sim_950pr_turboquant_kernels.cpp
+|   `-- test_sim_950pr_turboquant_decode.cpp
+|
+|-- device/                 TIER 3 -- physical 950PR silicon; every timing
+|   |-- test_device_950pr_turboquant.cpp          production shapes, camodel refused
+|   |-- test_device_950pr_matmul.cpp
+|   |-- test_device_950pr_rmsnorm.cpp
+|   |-- test_device_950pr_rotary_embedding.cpp
+|   |-- test_device_950pr_activation_swiglu.cpp
+|   |-- test_device_950pr_qwen_layer_golden.cpp
+|   |-- test_device_950pr_benchmark_harness.cpp   needs no device; links acl.h
+|   `-- bench_device_950pr_turboquant.cpp         the AIV-only baseline
+|
+`-- device_310p/            the 310P leg -- NOT configured under a 950PR SoC
+    |-- test_*_310p.cpp
+    `-- bench_*_310p.cpp
 ```
 
-Each test file has two layers. Tests named `*Reference` and `*Shapes` are
-host-only: they check the CPU reference and the layout arithmetic and run
-anywhere, including on a build machine with no NPU. The rest need a device and
-skip with an explanatory message when one is not attached.
+| `common/` | |
+| --- | --- |
+| `acl_check.hpp` | `ACL_CHECK` / `ASSERT_ACL_OK`, with `aclGetRecentErrMsg` attached |
+| `aclnn_ops.hpp` / `.cpp` | the version-sensitive aclnn prototypes -- read this first. Shared by both parts, despite the history |
+| `aclnn_ops_950pr.hpp` / `.cpp` | the 950PR operator audit and its extra prototypes, including FIA V5 |
+| `aclnn_runtime.hpp` / `.cpp` | dlopen/dlsym loader, aclTensor RAII, two-phase launch |
+| `ascend950_shapes.hpp` | Qwen3.5-2B layer 3 and the arch35 platform rules |
+| `bench_main.cpp` / `bench_main_950pr.cpp` | benchmark entry points; the 950PR one names the part and refuses a camodel |
+| `benchmark.hpp` / `.cpp` | plan-once launch, event timing, statistics, reporting |
+| `cpu_reference.hpp` / `.cpp` | naive fp32 references for all five kernels |
+| `device_buffer.hpp` | RAII device allocation, 32-byte default, 512 for benchmarks |
+| `device_tensor.hpp` | device buffer + aclTensor descriptor, with host conversions |
+| `fp16.hpp` | IEEE-754 binary16 conversion, round-to-nearest-even |
+| `golden_layer3.hpp` / `.cpp` | LFS-aware loader for the layer-3 dump |
+| `main.cpp` / `main_950pr.cpp` | test entry points; the 950PR one prints its tier and whether a camodel is loaded |
+| `partial_rotary_950pr.hpp` / `.cpp` | partial RoPE: custom operator, else packed stock operator |
+| `qwen_shapes.hpp` | Qwen3.5 shapes and the 310P alignment rules |
+| `random_data.hpp` | deterministic, platform-independent test data |
+| `tensor_compare.hpp` | allclose with a diagnostic report |
+| `test_harness.hpp` / `.cpp` | `AscendTestEnvironment`, and the camodel detection the device tier gates on |
+| `turboquant_launch.hpp` / `.cpp` | torch-free binding for the TurboQuant kernels: the two `_impl` prototypes, the codec table image, the grid maths |
+
+### Which tiers a configuration builds
+
+`RUN_MODE` selects between the two device-side tiers, and it has to:
+`ascendc_library()` builds one kernel library per `RUN_MODE`, so a tree cannot
+hold both a camodel and a silicon build of it. That is what makes the device
+tier's "no CAModel fallback" structural rather than aspirational.
+
+| Configuration | Tiers |
+| --- | --- |
+| `-DVLLM_ASCEND_TESTS_HOST_ONLY=ON` | `host/` |
+| `-DSOC_VERSION=Ascend950PR_9599` (RUN_MODE defaults to `npu`) | `host/` + `device/` |
+| `-DSOC_VERSION=Ascend950PR_9599 -DRUN_MODE=sim` | `host/` + `sim/` |
+| `-DSOC_VERSION=Ascend310P3` | `host/` + `device_310p/` |
+
+**A 950PR build excludes the 310P targets entirely** -- `device_310p/` is never
+configured, so no `*310*` binary exists in the tree and `ctest -N` has none to
+list. Configure output says so:
+
+```
+-- vllm-ascend tests: tiers -> host=TRUE sim=FALSE device=TRUE device_310p=FALSE
+-- vllm-ascend tests: 310P targets are excluded from this build entirely
+```
+
+Every test carries its tier as a ctest label, so the tiers are selectable
+without knowing the binary names:
+
+```bash
+ctest -L host                 # tier 1
+ctest -L device -LE benchmark # tier 3 correctness
+ctest -L benchmark            # tier 3 timings
+```
+
+Within a device-side binary, tests named `*Reference`, `*Shapes` and
+`*LaunchContract` still run with no NPU attached: they check the CPU reference
+and the layout arithmetic. The rest skip with an explanatory message when no
+device is present.
 
 ---
 
@@ -199,8 +243,8 @@ which ctest reports as a skip rather than a failure.
 entirely.
 
 Which part that is comes from the entry point: `common/bench_main.cpp` for the
-five 310P suites, `common/bench_main_950pr.cpp` for `bench_turboquant_950pr`,
-which appears only under `-DENABLE_ASCEND_950PR=ON` alongside the TurboQuant
+five 310P suites, `common/bench_main_950pr.cpp` for `bench_device_950pr_turboquant`,
+which appears only in a 950PR device-tier build alongside the TurboQuant
 kernels. It is the one benchmark in the suite that times kernels built here
 rather than a stock aclnn operator, and the only one that reports an analytic
 traffic model next to the measurement -
@@ -289,7 +333,7 @@ warmup.
 | `ASCEND_BENCH_MODES` | all three | comma-separated subset of `pipelined,device,host` |
 | `ASCEND_BENCH_CSV` | unset | write one row per (case, mode) to this path |
 | `ASCEND_BENCH_REPEATABLE` | on | `0` forces the re-plan-per-launch path |
-| `ASCEND_BENCH_TQ_CONTEXTS` | `512,1024,2048` | `bench_turboquant_950pr` only: the context lengths to sweep |
+| `ASCEND_BENCH_TQ_CONTEXTS` | `512,1024,2048` | `bench_device_950pr_turboquant` only: the context lengths to sweep |
 | `ASCEND_TEST_DEVICE_ID` | 0 | device ordinal, shared with the tests |
 
 ```bash
@@ -309,7 +353,7 @@ matter for performance are not the ones that matter for correctness:
 - The paged suite benchmarks `aclnnScatterPaKvCache` with a shuffled slot
   mapping. Decode attention is registered as an explicit skip, for the reason in
   `common/aclnn_ops.hpp`.
-- `bench_turboquant_950pr` sweeps context 512 / 1024 / 2048 at Qwen3.5-2B's
+- `bench_device_950pr_turboquant` sweeps context 512 / 1024 / 2048 at Qwen3.5-2B's
   `head_dim` 256, timing the 4-bit cache write and the AIV-only split/combine
   decode, with an fp16 decode through `aclnnFusedInferAttentionScoreV2` as the
   baseline where that operator exists.
@@ -437,26 +481,26 @@ the part, the operators, and one shape the 310P cannot run at all.
 
 ```bash
 cmake -S csrc/tests -B build/csrc-tests-950pr -G Ninja \
-      -DENABLE_ASCEND_950PR=ON -DSOC_VERSION=Ascend950PR_9599
+      -DSOC_VERSION=Ascend950PR_9599
 ```
 
-The option is **OFF by default and purely additive**: it adds five binaries and
-one static library and changes nothing about the 310P targets, which are still
-built, still registered with `ctest` under the same names, and still gate on
-`REQUIRE_ASCEND_310P` at run time. A tree with the option on produces one set of
-binaries per part, and each set skips on the other part's hardware.
+`SOC_VERSION` is the only switch: naming a 950PR bin selects the 950PR tiers and
+**excludes the 310P targets entirely** - they are not configured, not compiled,
+and contribute no target. The old `-DENABLE_ASCEND_950PR=ON` flag is gone, and a
+configure that still passes it with a non-950 `SOC_VERSION` fails with a message
+saying so rather than silently building the wrong leg.
 
 | Binary | Stage | Operator |
 | --- | --- | --- |
-| `test_matmul_950pr` | 2, 6, 8 — every linear projection | `aclnnMatmul` (cube) |
-| `test_rmsnorm_950pr` | 1, 7 | `aclnnRmsNorm` |
-| `test_rotary_embedding_950pr` | 3, 4 — **partial** RoPE | `aclnnInplacePartialRotaryMul`, else packed `aclnnApplyRotaryPosEmbV2` |
-| `test_activation_swiglu_950pr` | 8 | `aclnnSwiGlu` |
-| `test_qwen_layer_golden_950pr` | 1–9 end to end | all of the above plus `aclnnScatterPaKvCache`, `aclnnFusedInferAttentionScoreV2`, `aclnnSigmoid`, `aclnnMul`, `aclnnInplaceAdd` |
-| `test_turboquant_kernels_950pr` | 5 — decode, 4-bit KV cache | the TurboQuant kernels out of `csrc/attention/turboquant`, not an aclnn operator |
-| `test_turboquant_npu_simulator` | 5 — one decode pass end to end | ditto, with `aclnnFusedInferAttentionScoreV2` as an optional unquantised control |
-| `test_turboquant_bare_metal_950pr` | 5 — the same, at Qwen3.5-2B's real shapes | ditto; **silicon only**, skips under the camodel |
-| `bench_turboquant_950pr` | 5 — the AIV-only decode, timed | ditto, with `aclnnFusedInferAttentionScoreV2` as the attempted fp16 baseline |
+| `test_device_950pr_matmul` | 2, 6, 8 — every linear projection | `aclnnMatmul` (cube) |
+| `test_device_950pr_rmsnorm` | 1, 7 | `aclnnRmsNorm` |
+| `test_device_950pr_rotary_embedding` | 3, 4 — **partial** RoPE | `aclnnInplacePartialRotaryMul`, else packed `aclnnApplyRotaryPosEmbV2` |
+| `test_device_950pr_activation_swiglu` | 8 | `aclnnSwiGlu` |
+| `test_device_950pr_qwen_layer_golden` | 1–9 end to end | all of the above plus `aclnnScatterPaKvCache`, `aclnnFusedInferAttentionScoreV2`, `aclnnSigmoid`, `aclnnMul`, `aclnnInplaceAdd` |
+| `test_sim_950pr_turboquant_kernels` | 5 — decode, 4-bit KV cache | the TurboQuant kernels out of `csrc/attention/turboquant`, not an aclnn operator. **Sim tier** |
+| `test_sim_950pr_turboquant_decode` | 5 — one decode pass end to end | ditto, with `aclnnFusedInferAttentionScore*` as an optional unquantised control. **Sim tier** |
+| `test_device_950pr_turboquant` | 5 — the same, at Qwen3.5-2B's real shapes | ditto. **Device tier**: silicon only, refuses a camodel |
+| `bench_device_950pr_turboquant` | 5 — the AIV-only decode, timed | ditto, with `aclnnFusedInferAttentionScoreV5` (V2 fallback) as the fp16 baseline |
 
 `common/aclnn_ops_950pr.hpp` carries the operator audit: which stage runs on a
 stock CANN operator, which on a kernel built out of `csrc/`, and the CANN header
@@ -486,11 +530,11 @@ Because the kernels are built rather than loaded, they can also be *run* with no
 
 ```bash
 cmake -S csrc/tests -B build/csrc-tests-950pr-sim -G "Unix Makefiles" \
-      -DENABLE_ASCEND_950PR=ON -DSOC_VERSION=Ascend950PR_9599 -DRUN_MODE=sim
+      -DSOC_VERSION=Ascend950PR_9599 -DRUN_MODE=sim
 cmake --build build/csrc-tests-950pr-sim -j
 
 export LD_LIBRARY_PATH=$ASCEND_HOME_PATH/tools/simulator/Ascend950PR_9599/lib:$LD_LIBRARY_PATH
-./build/csrc-tests-950pr-sim/test_turboquant_npu_simulator
+./build/csrc-tests-950pr-sim/test_sim_950pr_turboquant_decode
 ```
 
 `RUN_MODE=sim` links `libruntime_camodel.so` in place of `libruntime.so`; the
@@ -499,7 +543,7 @@ export LD_LIBRARY_PATH=$ASCEND_HOME_PATH/tools/simulator/Ascend950PR_9599/lib:$L
 rather than skip. Three things are worth knowing before you try it:
 
 - **It is cycle-level slow.** One decode pass is two to four *minutes*. That is
-  the whole reason `test_turboquant_npu_simulator` runs a single decode step at
+  the whole reason `test_sim_950pr_turboquant_decode` runs a single decode step at
   the smallest shape that still exercises the tiling, the paging and the GQA
   mapping, instead of a sweep. ctest gets a 5400 s timeout for these two in
   `sim` mode.
@@ -512,7 +556,7 @@ rather than skip. Three things are worth knowing before you try it:
 - **`aclnnFusedInferAttentionScore` V1 to V4 do not exist on an Ascend950.** The
   simulator test uses it as an unquantised fp16 control and reports the refusal
   rather than failing; the exact fp32 host path is what its assertions compare
-  against. `bench_turboquant_950pr` hits the same wall for its fp16 baseline and
+  against. `bench_device_950pr_turboquant` hits the same wall for its fp16 baseline and
   registers a ctest-visible skip with the reason.
   `common/aclnn_ops_950pr.hpp` records the measurement.
 
@@ -520,19 +564,19 @@ The same binaries run unchanged on silicon: configure without `RUN_MODE=sim`
 (or with `-DRUN_MODE=npu`) and they link the real runtime.
 
 **Two of them are for silicon specifically.**
-`test_turboquant_bare_metal_950pr` sweeps the shapes Qwen3.5-2B actually decodes
+`test_device_950pr_turboquant` sweeps the shapes Qwen3.5-2B actually decodes
 at - `head_dim` 256, `block_size` 128, context 512 / 1024 / 2048 - which is
 days of camodel time, so it refuses to run there. The SoC name cannot tell the
 camodel from the part, so `REQUIRE_PHYSICAL_ASCEND_950PR` looks for
 `libruntime_camodel.so` in `/proc/self/maps` instead and skips with the path it
 found. `ASCEND_TEST_ALLOW_SIMULATOR=1` overrides that, and
 `ASCEND_TQ_BARE_METAL_CONTEXTS` shrinks the sweep, both for smoke-checking the
-binary rather than for producing results. `bench_turboquant_950pr` is built
+binary rather than for producing results. `bench_device_950pr_turboquant` is built
 under `RUN_MODE=sim` but disabled in ctest for the same reason;
 `ASCEND_BENCH_TQ_CONTEXTS` and the usual `ASCEND_BENCH_*` knobs make a hand-run
 smoke check tractable.
 
-`test_turbo_quant_fidelity` needs none of this. It is host-only, links neither
+`test_host_turboquant_fidelity` needs none of this. It is host-only, links neither
 `libascendcl.so` nor a kernel, and reports the codec's fidelity on the Qwen3.5
 layer-3 dump from the CPU reference alone - see `-DVLLM_ASCEND_TESTS_HOST_ONLY=ON`.
 
@@ -561,7 +605,7 @@ here to the implementation `torch_npu` would have called.
 
 ### Golden layer-3 parity
 
-`test_qwen_layer_golden_950pr` runs a whole Qwen3.5 decoder layer on the NPU and
+`test_device_950pr_qwen_layer_golden` runs a whole Qwen3.5 decoder layer on the NPU and
 compares seven intermediate taps plus the final output against
 `csrc/tests/data/golden_layer3`, produced by `scripts/dump_qwen35_layer3.py`.
 The dump is tracked with Git LFS; a tree where it was never fetched gets a skip
@@ -575,7 +619,7 @@ that the dump is internally consistent, that the loader reads it correctly and
 that the CPU references agree with PyTorch — on a build machine.
 
 ```bash
-./test_qwen_layer_golden_950pr --gtest_filter='QwenLayer3DumpTest.*:QwenLayer3Loader.*'
+./test_device_950pr_qwen_layer_golden --gtest_filter='QwenLayer3DumpTest.*:QwenLayer3Loader.*'
 ```
 
 ### What the shipped dump does not test

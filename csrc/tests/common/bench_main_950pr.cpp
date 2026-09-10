@@ -21,13 +21,22 @@
 // accept before it runs anything. A 950PR suite started on a 310P exits 77 and
 // ctest records a skip, exactly as the 310P suites do on the wrong part.
 
+// It also refuses to measure anything under a camodel. A benchmark is the one
+// kind of binary for which the simulator produces a plausible-looking number
+// that means nothing at all, and the device tier's whole claim is that its
+// timings came from silicon. Exiting 77 - the same skip code as "no device
+// attached" - keeps that claim honest without failing a build.
+
+#include <cstdio>
+
 #include "benchmark.hpp"
+#include "test_harness.hpp"
 
 namespace vllm_ascend {
 namespace test {
 namespace bench {
 
-// Defined by the kernels/ascend/bench_*.cpp this binary links.
+// Defined by the device/bench_*.cpp this binary links.
 extern const char* kSuiteName;
 void BuildSuite(BenchmarkRunner& runner);
 
@@ -36,6 +45,13 @@ void BuildSuite(BenchmarkRunner& runner);
 }  // namespace vllm_ascend
 
 int main() {
+  if (::vllm_ascend::test::IsRunningOnSimulator()) {
+    std::printf("[ascend-bench] CAModel loaded (%s).\n"
+                "[ascend-bench] This is a device-tier benchmark and the simulator's wall clock is not a\n"
+                "[ascend-bench] measurement of the part. Refusing to produce numbers; skipping.\n",
+                ::vllm_ascend::test::SimulatorEvidence().c_str());
+    return ::vllm_ascend::test::bench::kBenchmarkSkipExitCode;
+  }
   return ::vllm_ascend::test::bench::RunBenchmarkSuite(::vllm_ascend::test::bench::kSuiteName,
                                                        ::vllm_ascend::test::bench::BenchmarkTargetPart::kAscend950PR,
                                                        ::vllm_ascend::test::bench::BuildSuite);

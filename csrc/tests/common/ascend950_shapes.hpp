@@ -108,6 +108,23 @@ constexpr int64_t kFiaUnboundedTokens = 2147483647;
 constexpr int64_t kFiaSparseModeNone = 0;
 constexpr int64_t kFiaInnerPreciseDefault = 1;
 
+// The two scalars V5 adds over V2 (ops950::kFusedInferAttentionScoreV5).
+//
+// queryQuantMode 0 is "the query is not quantised", which is the only thing it
+// can be here: the fp16 baseline hands the operator an fp16 query and no
+// dequantScaleQuery.
+constexpr int64_t kFiaQueryQuantModeNone = 0;
+
+// pseType selects how a positional-encoding shift is combined with the scores.
+// This suite passes no pseShift at all, so the value is unused - but the
+// operator still range-checks it, so it cannot be left at an arbitrary number.
+// 1 is torch_npu's default for npu_fused_infer_attention_score's pse_type.
+//
+// UNVERIFIED on hardware, like the whole V5 argument list. If a first silicon
+// run rejects the planning call, this constant and the seven optional tensors
+// V5 added are the two things to vary first.
+constexpr int64_t kFiaPseTypeDefault = 1;
+
 // --- Qwen3.5-2B, layer 3 (the first full_attention block) --------------------
 //
 // Mirrors the constants at the top of scripts/dump_qwen35_layer3.py.

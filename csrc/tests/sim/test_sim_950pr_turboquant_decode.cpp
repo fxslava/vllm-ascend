@@ -137,7 +137,7 @@ constexpr double kMaxKernelRelativeL2 = 5e-3;
 // was dropped": on iid Gaussian channels a bare absmax quantiser scores the
 // same ~18 dB, because what the rotation buys is protection against
 // anisotropic and outlier-heavy channels, and that is measured on real Qwen
-// activations by test_turbo_quant_fidelity.cpp instead. What they do catch is
+// activations by test_host_turboquant_fidelity.cpp instead. What they do catch is
 // an un-rotation that never happened, which sends the output into a different
 // basis entirely.
 constexpr double kMinCosine = 0.97;
