@@ -20,13 +20,13 @@
 // HOW THIS DIFFERS FROM THE OTHER TWO TURBOQUANT DEVICE BINARIES, WHICH IS THE
 // ONLY REASON IT EXISTS.
 //
-//   test_turboquant_kernels_950pr   the launch contract and the kernels at the
+//   test_sim_950pr_turboquant_kernels   the launch contract and the kernels at the
 //                                   smallest shape that still exercises the
 //                                   tiling, the paging and the GQA mapping:
 //                                   head_size 64, block_size 16, context 32.
 //                                   Small because it has to finish under the
 //                                   camodel.
-//   test_turboquant_npu_simulator   one decode pass, quantised against exact
+//   test_sim_950pr_turboquant_decode   one decode pass, quantised against exact
 //                                   fp32, at that same small shape and for the
 //                                   same reason.
 //   this file                       head_size 256, block_size 128, context
@@ -275,7 +275,7 @@ BinAgreement ComparePackedCaches(const std::vector<int8_t>& actual, const std::v
 // --- device driver -----------------------------------------------------------
 
 // Everything one scenario needs on the device. Unlike the small-shape driver in
-// test_turboquant_kernels_950pr.cpp this one takes the fill byte, because the
+// test_sim_950pr_turboquant_kernels.cpp this one takes the fill byte, because the
 // bounds case needs a poisoned cache rather than a zeroed one.
 class DeviceScenario {
  public:

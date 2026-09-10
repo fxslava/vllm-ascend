@@ -1,6 +1,6 @@
 # Validation coverage: C++ kernel suite vs. the Python test suite
 
-Audit of what `csrc/tests/kernels/test_*.cpp` checks against what the Python
+Audit of what the C++ suite checks against what the Python
 suite checks, for the five operator families the Ascend 310P3 fp16 decode path
 uses. Written against the tree at `d6a7d0636`.
 
@@ -17,7 +17,7 @@ handling in the slot mapping.
 
 ## 1. What each suite actually runs
 
-### C++ (`csrc/tests/kernels/`)
+### C++ (`csrc/tests/device_310p/`)
 
 | Operator | Binary | Device parity cases | Host-only cases | Shape matrix |
 | --- | --- | ---: | ---: | --- |
@@ -273,20 +273,21 @@ computes the right answer*. Neither substitutes for the other.
 
 ## 7. The Ascend 950PR leg
 
-`-DENABLE_ASCEND_950PR=ON` adds a second set of binaries targeting the A5 part
-(`csrc/tests/kernels/ascend/`). It is a different part, not a second opinion on
-the same one, so it does not close a 310P gap — but two of the items above are
+`-DSOC_VERSION=Ascend950PR_9599` selects a second set of binaries targeting the
+A5 part, split across the `host/`, `sim/` and `device/` tiers and excluding the
+310P leg entirely. It is a different part, not a second opinion on the same one,
+so it does not close a 310P gap — but two of the items above are
 covered *there* for the first time, and the reason each was open on the 310P is
 worth recording next to the reason it is not here.
 
 | Gap above | 310P status | 950PR status |
 | --- | --- | --- |
 | 1. Decode attention | skipped: `PagedAttention` is an ATB C++ object API, not aclnn | wired to `aclnnFusedInferAttentionScoreV2`, TND layout with a block table, copied from `AscendAttentionBackendImpl._get_fia_params` |
-| 6. Partial `rotary_dim` | impossible: the 310P rotary operator takes head dims 64 and 128 only, and `AscendMRotaryEmbedding310` gates on it | the whole point of `test_rotary_embedding_950pr`: `head_dim` 256 with `rotary_dim` 64 and 128, asserting the pass-through tail is **bit**-identical |
+| 6. Partial `rotary_dim` | impossible: the 310P rotary operator takes head dims 64 and 128 only, and `AscendMRotaryEmbedding310` gates on it | the whole point of `test_device_950pr_rotary_embedding`: `head_dim` 256 with `rotary_dim` 64 and 128, asserting the pass-through tail is **bit**-identical |
 
 What the 950PR leg adds that has no 310P counterpart at all:
 
-- **End-to-end layer parity.** `test_qwen_layer_golden_950pr` runs nine stages of
+- **End-to-end layer parity.** `test_device_950pr_qwen_layer_golden` runs nine stages of
   a real Qwen3.5 decoder layer and checks seven intermediate taps plus the final
   output against a PyTorch dump. Every other test in either suite checks one
   operator in isolation; this is the only one that checks they compose.
@@ -315,14 +316,14 @@ What the 950PR leg adds that has no 310P counterpart at all:
 
 What is **not** covered on the 950PR leg:
 
-- No benchmarks for the four stock-operator stages. `bench_turboquant_950pr` is
-  the only `bench_*_950pr` binary, and it times kernels built out of `csrc/`
+- No benchmarks for the four stock-operator stages. `bench_device_950pr_turboquant` is
+  the only `bench_device_950pr_*` binary, and it times kernels built out of `csrc/`
   rather than aclnn operators; matmul, RMSNorm, SwiGLU and rotary have no 950PR
   counterpart, because the arch35 cube/vector split
   (`cube_vector_combine=split`) makes the 310P benchmark shapes a poor guide.
 - No timing from silicon at all. Every TurboQuant device case so far has run on
   the arch35 camodel, whose wall clock measures the simulator.
-  `test_turboquant_bare_metal_950pr` and `bench_turboquant_950pr` are written
+  `test_device_950pr_turboquant` and `bench_device_950pr_turboquant` are written
   for the part and skip until one is attached.
 - `M > 1` projections, as on the 310P. Worse here: arch35 runs cube and vector
   on separate cores, so the M tiling and the cube/vector handover are

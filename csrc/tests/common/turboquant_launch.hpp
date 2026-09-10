@@ -32,7 +32,7 @@
 //
 // It is a *mirror*, not a copy of a shared source, so the two can drift. Every
 // quantity below names the function in turboquant_torch_adpt.h it mirrors, and
-// TurboQuantLaunchContract in test_turboquant_kernels_950pr.cpp pins the ones
+// TurboQuantLaunchContract in test_sim_950pr_turboquant_kernels.cpp pins the ones
 // that are pure functions of the shapes against the values written here. The
 // codec table image is additionally pinned against the layout contract in
 // TurboQuantCodec<4>::ConstTableWords and against the Python builder

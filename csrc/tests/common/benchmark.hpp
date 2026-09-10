@@ -14,9 +14,14 @@
  * limitations under the License.
  */
 
-// Microbenchmark harness for the Ascend 310P kernels the correctness suite
-// covers. Shares the device, tensor and operator plumbing with the tests; the
-// only thing that differs is what happens around the launch.
+// Microbenchmark harness, shared by the 310P leg and by the 950PR device tier.
+// Shares the device, tensor and operator plumbing with the tests; the only
+// thing that differs is what happens around the launch.
+//
+// Nothing here is reachable from the host or sim tiers, and that is a rule
+// rather than an accident: the host tier links no CANN runtime, and a
+// cycle-level simulator's wall clock is not a measurement of the part. Every
+// timing this project quotes comes from a device-tier binary.
 //
 // What the timed region contains, and what it deliberately does not:
 //
@@ -327,7 +332,7 @@ class BenchmarkRunner {
   // Everything Run() has recorded so far, in registration order. A suite that
   // has something to say the generic table cannot express - a ratio between two
   // of its own cases, say - reads them back here after its last Run() and
-  // prints its own section; see kernels/ascend/bench_turboquant_950pr.cpp.
+  // prints its own section; see device/bench_device_950pr_turboquant.cpp.
   const std::vector<BenchmarkResult>& results() const { return results_; }
 
   // Records a case that failed to run. The suite keeps going and the report

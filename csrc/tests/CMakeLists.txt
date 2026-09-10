@@ -14,8 +14,8 @@
 # limitations under the License.
 # -----------------------------------------------------------------------------
 #
-# Standalone GTest suite for the kernels a Qwen3.5 forward pass needs on an
-# Ascend 310P3, driven straight through the CANN runtime.
+# Standalone GTest suite for the kernels a Qwen3.5 forward pass needs, driven
+# straight through the CANN runtime.
 #
 # This project is deliberately NOT included from the repository root
 # CMakeLists.txt: that one requires Torch 2.10.0 and pybind11, and the whole
@@ -23,6 +23,68 @@
 # its own:
 #
 #   cmake -S csrc/tests -B build/csrc-tests -DCMAKE_BUILD_TYPE=Release
+#
+# -----------------------------------------------------------------------------
+# THREE EXECUTION TIERS, MUTUALLY EXCLUSIVE BY CONSTRUCTION
+# -----------------------------------------------------------------------------
+#
+# A test is defined by where it can run, and the three answers need different
+# link lines, not just different runtime gates. Each tier is a subdirectory with
+# its own CMakeLists.txt, and no binary belongs to two of them:
+#
+#   host/          test_host_*             Pure CPU. Algorithmic verification of
+#                                          the codec - the Lloyd-Max grid, the Pi
+#                                          involution, the packing, the golden
+#                                          reference dumps. Links neither
+#                                          libascendcl.so nor any NPU runtime,
+#                                          and is built in EVERY configuration,
+#                                          including -DVLLM_ASCEND_TESTS_HOST_ONLY=ON
+#                                          on a machine with no toolkit at all.
+#
+#   sim/           test_sim_950pr_*        CAModel only. Functional validation of
+#                                          the Ascend C kernels against the CPU
+#                                          reference, at shapes small enough for
+#                                          a cycle-level simulator to finish.
+#                                          Links libruntime_camodel.so out of
+#                                          $ASCEND_HOME_PATH/tools/simulator, and
+#                                          therefore CANNOT run on silicon.
+#
+#   device/        test_device_950pr_*     Physical 950PR silicon. Production
+#                  bench_device_950pr_*    shapes and every timing measurement.
+#                                          Links the real libruntime.so and
+#                                          libascendcl.so, with no simulator on
+#                                          the link line and none on the RUNPATH,
+#                                          so there is no CAModel fallback to
+#                                          accidentally take.
+#
+# sim/ and device/ are selected by RUN_MODE and are never configured together:
+# ascendc_library() builds one kernel library per RUN_MODE, so a tree cannot hold
+# both a camodel and a silicon build of it. That is what makes the exclusivity
+# structural rather than a naming convention.
+#
+#   -DRUN_MODE=npu   (default)  host/ + device/
+#   -DRUN_MODE=sim              host/ + sim/
+#   -DVLLM_ASCEND_TESTS_HOST_ONLY=ON   host/ alone
+#
+# -----------------------------------------------------------------------------
+# ARCHITECTURE ISOLATION
+# -----------------------------------------------------------------------------
+#
+# SOC_VERSION selects the part, and the two legs are exclusive:
+#
+#   SOC_VERSION=Ascend950PR_*   the three tiers above. device_310p/ is not
+#                               configured, not compiled, and contributes no
+#                               target - a `*310*` binary cannot exist in a
+#                               950PR build tree.
+#   anything else               device_310p/ alone, plus host/. The 950PR tiers
+#                               are not configured.
+#
+# device_310p/ keeps its historical binary names (test_matmul_310p and friends)
+# on purpose: .agents/skills/ascend-310p-csrc-tests/SKILL.md and the shipped
+# dist/ascend310p3-aarch64-tests/run_tests.sh both drive them by name, they
+# already carry their part in the name, and they are unreachable from a 950PR
+# build anyway. The isolation the tiers needed was directory- and
+# configure-level, not a rename.
 #
 # -----------------------------------------------------------------------------
 
@@ -61,31 +123,16 @@ option(VLLM_ASCEND_TESTS_BUILD_BENCHMARKS "Build the bench_* microbenchmark bina
 # option only removes everything else.
 option(VLLM_ASCEND_TESTS_HOST_ONLY "Build only the targets that need no CANN toolkit" OFF)
 
-# The Ascend 950PR (A5, DaVinci arch35) leg of the suite: the four operator
-# tests under kernels/ascend/ plus the end-to-end Qwen3.5 layer-3 parity test.
+# The TurboQuant 4-bit KV cache: the Ascend C kernels themselves, plus the tests
+# and the benchmark that drive them. Unlike everything else in this file, this
+# compiles device code - it needs the Ascend C kernel toolchain (ccec / bisheng
+# and tools/tikcpp/ascendc_kernel_cmake), not just the CANN headers and
+# libascendcl.so. Turn it off to build the rest of a 950PR tier on a machine
+# that has the toolkit but not the kernel compiler; with it OFF the sim tier is
+# empty, because every binary in it drives those kernels.
 #
-# OFF by default, and additive when ON: it adds targets and one static library
-# and changes nothing about the 310P ones. The 310P binaries are still built,
-# still registered with ctest under the same names, and still gate on
-# REQUIRE_ASCEND_310P at run time, so a build with both options on produces one
-# set of binaries per part and each set skips on the other part's hardware.
-#
-#   cmake -S csrc/tests -B build/csrc-tests-950pr -G Ninja \
-#         -DENABLE_ASCEND_950PR=ON -DSOC_VERSION=Ascend950PR_9599
-#
-# It is also orthogonal to the CUDA backend: nothing below is reachable when
-# that path is configured, because the whole block sits under the CANN branch of
-# this file and every source it adds includes acl.h.
-option(ENABLE_ASCEND_950PR "Build tests for Ascend 950PR target" OFF)
-
-# The TurboQuant 4-bit KV cache: the Ascend C kernels themselves, plus the two
-# tests that drive them. Unlike everything else in this file, this compiles
-# device code - it needs the Ascend C kernel toolchain (ccec / bisheng and
-# tools/tikcpp/ascendc_kernel_cmake), not just the CANN headers and
-# libascendcl.so. Turn it off to build the rest of the 950PR leg on a machine
-# that has the toolkit but not the kernel compiler.
-#
-# Sub-option of ENABLE_ASCEND_950PR: nothing below is reachable without it.
+# Reachable only on a 950PR SoC: the kernels carry an AICore config for arch32
+# and arch35 and nothing else.
 option(VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS
        "Compile the TurboQuant Ascend C kernels and build the tests that drive them" ON)
 
@@ -104,6 +151,67 @@ option(VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS
 # reads ${RUN_MODE} directly.
 set(RUN_MODE "npu" CACHE STRING "Ascend C run mode: npu (silicon) or sim (CANN camodel)")
 set_property(CACHE RUN_MODE PROPERTY STRINGS npu sim)
+
+if(NOT RUN_MODE STREQUAL "npu" AND NOT RUN_MODE STREQUAL "sim")
+  message(FATAL_ERROR "RUN_MODE must be 'npu' or 'sim', not '${RUN_MODE}'")
+endif()
+
+# -----------------------------------------------------------------------------
+# Tier resolution
+# -----------------------------------------------------------------------------
+#
+# Decided once, here, so every message below and every subdirectory reads the
+# same answer. See the tier and isolation notes at the top of this file.
+
+string(TOLOWER "${SOC_VERSION}" VLLM_ASCEND_SOC_LOWER)
+if(VLLM_ASCEND_SOC_LOWER MATCHES "^ascend950")
+  set(VLLM_ASCEND_TESTS_SOC_IS_950PR TRUE)
+else()
+  set(VLLM_ASCEND_TESTS_SOC_IS_950PR FALSE)
+endif()
+
+# ENABLE_ASCEND_950PR used to be the way in. SOC_VERSION is now the only one, so
+# a script that still passes the old flag has to be told rather than silently
+# handed a 310P tree it did not ask for.
+if(DEFINED ENABLE_ASCEND_950PR AND ENABLE_ASCEND_950PR AND NOT VLLM_ASCEND_TESTS_SOC_IS_950PR)
+  message(FATAL_ERROR
+    "ENABLE_ASCEND_950PR is set but SOC_VERSION is '${SOC_VERSION}'.\n"
+    "That option is gone: the 950PR tiers are selected by the SoC alone. Configure with\n"
+    "  -DSOC_VERSION=Ascend950PR_9599\n"
+    "and drop -DENABLE_ASCEND_950PR.")
+endif()
+
+# host/ is unconditional. The other three are exclusive.
+set(VLLM_ASCEND_TESTS_TIER_HOST      TRUE)
+set(VLLM_ASCEND_TESTS_TIER_SIM       FALSE)
+set(VLLM_ASCEND_TESTS_TIER_DEVICE    FALSE)
+set(VLLM_ASCEND_TESTS_TIER_DEVICE310 FALSE)
+
+if(NOT VLLM_ASCEND_TESTS_HOST_ONLY)
+  if(VLLM_ASCEND_TESTS_SOC_IS_950PR)
+    if(RUN_MODE STREQUAL "sim")
+      set(VLLM_ASCEND_TESTS_TIER_SIM TRUE)
+    else()
+      set(VLLM_ASCEND_TESTS_TIER_DEVICE TRUE)
+    endif()
+  else()
+    set(VLLM_ASCEND_TESTS_TIER_DEVICE310 TRUE)
+    if(RUN_MODE STREQUAL "sim")
+      message(WARNING
+        "RUN_MODE=sim has no effect on SOC_VERSION '${SOC_VERSION}': the camodel tier exists only "
+        "for the 950PR, whose Ascend C kernels this suite builds itself. The 310P tests call "
+        "operators CANN already shipped and need real hardware.")
+    endif()
+  endif()
+endif()
+
+message(STATUS "vllm-ascend tests: SoC ${SOC_VERSION}, RUN_MODE ${RUN_MODE}")
+message(STATUS "vllm-ascend tests: tiers -> host=${VLLM_ASCEND_TESTS_TIER_HOST} "
+               "sim=${VLLM_ASCEND_TESTS_TIER_SIM} device=${VLLM_ASCEND_TESTS_TIER_DEVICE} "
+               "device_310p=${VLLM_ASCEND_TESTS_TIER_DEVICE310}")
+if(VLLM_ASCEND_TESTS_SOC_IS_950PR)
+  message(STATUS "vllm-ascend tests: 310P targets are excluded from this build entirely")
+endif()
 
 # -----------------------------------------------------------------------------
 # CANN toolkit
@@ -274,32 +382,167 @@ if(VLLM_ASCEND_TESTS_WERROR)
   target_compile_options(vllm_ascend_test_host PUBLIC -Werror)
 endif()
 
-# Analytical fidelity report for the TurboQuant 4-bit KV cache. It links
-# gtest_main rather than common/main.cpp: that main initialises the ACL runtime,
-# which is exactly the dependency this target must not have.
-add_executable(test_turbo_quant_fidelity kernels/ascend/test_turbo_quant_fidelity.cpp)
-target_link_libraries(test_turbo_quant_fidelity
-  PRIVATE vllm_ascend_test_host ${VLLM_ASCEND_TEST_GTEST_MAIN_TARGET})
-
-add_test(NAME test_turbo_quant_fidelity COMMAND test_turbo_quant_fidelity)
-set_tests_properties(test_turbo_quant_fidelity PROPERTIES
-  LABELS "correctness;host"
-  TIMEOUT 300)
-
 if(NOT EXISTS "${VLLM_ASCEND_GOLDEN_LAYER3_DIR}/golden_output.bin")
   message(WARNING
     "golden dump not found at ${VLLM_ASCEND_GOLDEN_LAYER3_DIR}.\n"
-    "The golden case of test_turbo_quant_fidelity will skip. Run `git lfs pull`, "
-    "or regenerate with `python scripts/dump_qwen35_layer3.py`.")
+    "The golden cases of the host tier and of test_device_950pr_qwen_layer_golden will skip. "
+    "Run `git lfs pull`, or regenerate with `python scripts/dump_qwen35_layer3.py`.")
 endif()
 
-message(STATUS "vllm-ascend tests: configured test_turbo_quant_fidelity (host-only, no CANN runtime)")
+# -----------------------------------------------------------------------------
+# Shared helpers
+# -----------------------------------------------------------------------------
+#
+# Defined before any tier subdirectory, because all four call them.
+
+# Every executable this project produces, collected so the strip step in
+# .vscode-build-aarch64.sh can be driven from a generated manifest rather than a
+# hand-maintained list. A stale name in that list is handed to `strip` as a path
+# that either does not exist or is not an ELF file, which is where the "file
+# format not recognized" warnings came from.
+#
+# A GLOBAL property rather than a variable: the tiers are subdirectories now, and
+# a variable set with PARENT_SCOPE from inside one of them would land in that
+# subdirectory's scope and never reach this file.
+set_property(GLOBAL PROPERTY VLLM_ASCEND_TEST_BINARIES "")
+
+function(vllm_ascend_record_binary target_name)
+  set_property(GLOBAL APPEND PROPERTY VLLM_ASCEND_TEST_BINARIES "$<TARGET_FILE:${target_name}>")
+endfunction()
+
+# Discovery runs the binary, which needs libopapi.so and friends on the loader
+# path even though they are opened lazily.
+if(NOT VLLM_ASCEND_TESTS_HOST_ONLY)
+  set(VLLM_ASCEND_TEST_LIBRARY_PATH "${ASCEND_HOME_PATH}/lib64:$ENV{LD_LIBRARY_PATH}")
+endif()
+
+# Shared configuration for both the test and the benchmark binaries: they differ
+# only in which main() they link and how ctest is told to run them.
+function(vllm_ascend_add_device_executable target_name source_file entry_point)
+  add_executable(${target_name} "${source_file}" "${entry_point}")
+  target_link_libraries(${target_name} PRIVATE vllm_ascend_test_common)
+
+  # $ORIGIN keeps a copied-out build tree working; the CANN lib dirs cover the
+  # normal in-place run, and ${CMAKE_BINARY_DIR}/lib is where ascendc_library()
+  # leaves libvllm_ascend_turboquant.so.
+  #
+  # BUILD_WITH_INSTALL_RPATH links with the list below verbatim and skips the
+  # build-rpath computation entirely. That is the point of it, not a shortcut:
+  # CANN's tools/tikcpp/ascendc_kernel_cmake adds
+  #
+  #   ${ASCEND_CANN_PACKAGE_PATH}/tools/simulator/${SOC_VERSION}/lib
+  #
+  # as a PUBLIC link directory on every ascendc_library() target, *without ever
+  # looking at RUN_MODE*, and CMake then appends it to the consumer's RUNPATH.
+  # A device-tier binary would come out carrying a camodel directory on its own
+  # loader path - harmless on a machine where it does not exist, and a silent
+  # swap of the simulator runtime for the real one on a machine where it does.
+  # DT_NEEDED never names a camodel library, so nothing but this stops it, and
+  # the tier's "no CAModel fallback" guarantee rests on it. Measured:
+  # BUILD_RPATH_USE_LINK_PATH FALSE does *not* suppress it on CMake 3.22, and
+  # this does.
+  #
+  # sim/CMakeLists.txt deliberately puts that same directory back, first,
+  # because there it is the point.
+  set_target_properties(${target_name} PROPERTIES
+    BUILD_WITH_INSTALL_RPATH TRUE
+    INSTALL_RPATH "$ORIGIN;${CMAKE_BINARY_DIR}/lib;${ASCEND_LIB_DIRS}")
+
+  vllm_ascend_record_binary(${target_name})
+endfunction()
+
+# Cross builds get one ctest entry per binary instead of one per GTest case.
+# Even PRE_TEST discovery has to execute the binary, and an aarch64 binary on
+# the x86 build host cannot run - `ctest -N` there aborts on the first discovery
+# attempt and lists nothing at all, benchmarks included. Running ctest on the
+# part itself, where the binaries are native, is unaffected.
+#
+# The optional second argument is the per-test timeout in seconds; it defaults to
+# 900, which is generous for a kernel launch on silicon and nowhere near enough
+# for one under the camodel simulator, where a single decode pass is minutes.
+# Both registration paths below need it, which is why it is a parameter rather
+# than a set_tests_properties() call afterwards: gtest_discover_tests names its
+# tests at ctest time, so there is nothing to set properties on here.
+#
+# The optional third argument suppresses GTest discovery and registers the whole
+# binary as one ctest entry, the way a cross build already does. It exists for
+# the binaries that link libvllm_ascend_turboquant.so, and the reason is not a
+# preference:
+#
+#   PRE_TEST discovery has to *execute* the binary to enumerate its cases. Built
+#   for silicon, that library's static initialisation aborts on a host with no
+#   NPU driver - measured on CANN 9.2.0-beta.2:
+#
+#     terminate called after throwing an instance of 'std::logic_error'
+#       what(): basic_string::_S_construct null not valid
+#
+#   before main() reaches RUN_ALL_TESTS, so even `--gtest_list_tests` aborts.
+#   ctest reports "Error running test executable / Subprocess aborted" and then
+#   lists *nothing at all* - not the failing binary, not the other forty tests,
+#   because one failed discovery ends the whole enumeration. `ctest -N` on a
+#   build host becomes useless.
+#
+#   It is not this suite's bug: test_device_950pr_matmul, which links no kernel
+#   library, enumerates fine in the same tree, and the same binaries enumerate
+#   fine in the sim tier where the camodel runtime is present. It is what a
+#   silicon-mode kernel library does when the driver is absent, and the cost of
+#   tripping over it is out of all proportion to the per-case ctest granularity
+#   it buys.
+function(vllm_ascend_register_correctness_test target_name)
+  if(ARGC GREATER 1)
+    set(test_timeout ${ARGV1})
+  else()
+    set(test_timeout 900)
+  endif()
+  set(discover_cases TRUE)
+  if(ARGC GREATER 2 AND ARGV2)
+    set(discover_cases FALSE)
+  endif()
+  if(discover_cases AND COMMAND gtest_discover_tests AND NOT CMAKE_VERSION VERSION_LESS "3.18" AND NOT CMAKE_CROSSCOMPILING)
+    # PRE_TEST defers enumeration to `ctest` time. The default POST_BUILD mode
+    # runs the binary during the build, which fails on a build host that has the
+    # CANN headers but no driver.
+    gtest_discover_tests(${target_name}
+      DISCOVERY_MODE PRE_TEST
+      DISCOVERY_TIMEOUT 120
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${VLLM_ASCEND_TEST_LIBRARY_PATH};ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
+        LABELS "correctness;${VLLM_ASCEND_TEST_TIER_LABEL}"
+        TIMEOUT ${test_timeout})
+  else()
+    add_test(NAME ${target_name} COMMAND ${target_name})
+    set_tests_properties(${target_name} PROPERTIES
+      ENVIRONMENT "LD_LIBRARY_PATH=${VLLM_ASCEND_TEST_LIBRARY_PATH};ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
+      LABELS "correctness;${VLLM_ASCEND_TEST_TIER_LABEL}"
+      TIMEOUT ${test_timeout})
+  endif()
+endfunction()
+
+# -----------------------------------------------------------------------------
+# Tier 1: host
+# -----------------------------------------------------------------------------
+#
+# Unconditional. Nothing in it links a CANN library, so it is the only tier that
+# survives -DVLLM_ASCEND_TESTS_HOST_ONLY=ON, and the only one that builds on a
+# machine with no toolkit installed.
+
+add_subdirectory(host)
 
 if(NOT VLLM_ASCEND_TESTS_HOST_ONLY)
 
 # -----------------------------------------------------------------------------
-# Shared test infrastructure
+# Shared device infrastructure
 # -----------------------------------------------------------------------------
+#
+# The device-side plumbing every non-host tier needs: the runtime lifecycle, the
+# dlopen/dlsym operator loader, the hand-declared aclnn prototypes and the
+# benchmark harness.
+#
+# common/aclnn_ops.{hpp,cpp} is NOT a 310P file despite its history. It is the
+# suite's whole operator prototype table, and the 950PR tests read it too -
+# ops::kMatmul, ops::kRmsNorm, ops::kSwiGlu, ops::kScatterPaKvCache and
+# ops::kApplyRotaryPosEmbV2 are all resolved through it. It stays shared; what
+# the architecture isolation excludes is the 310P *targets*, in device_310p/.
 
 add_library(vllm_ascend_test_common STATIC
   common/test_harness.cpp
@@ -322,8 +565,6 @@ target_link_libraries(vllm_ascend_test_common
     ${CMAKE_DL_LIBS}
     Threads::Threads)
 
-target_compile_definitions(vllm_ascend_test_common PUBLIC ASCEND_PLATFORM_310P)
-
 target_compile_options(vllm_ascend_test_common PUBLIC -Wall -Wextra)
 if(VLLM_ASCEND_TESTS_WERROR)
   target_compile_options(vllm_ascend_test_common PUBLIC -Werror)
@@ -339,182 +580,13 @@ target_compile_options(vllm_ascend_test_common PUBLIC -ffunction-sections -fdata
 target_link_options(vllm_ascend_test_common PUBLIC -Wl,--gc-sections -Wl,--as-needed)
 
 # -----------------------------------------------------------------------------
-# Test binaries
-# -----------------------------------------------------------------------------
-
-enable_testing()
-
-set(VLLM_ASCEND_KERNEL_TESTS
-  test_matmul_310p
-  test_rmsnorm_310p
-  test_rotary_embedding_310p
-  test_activation_swiglu_310p
-  test_paged_attention_310p)
-
-# Tests over the shared harness rather than over a kernel, built from common/
-# for that reason. These are the only ones in the suite that pass with no device
-# attached: what they cover is the arithmetic a benchmark run does around the
-# launches - sample validation, the ASCEND_BENCH_* parses, the alignment rules -
-# all of which produced wrong numbers on healthy hardware and so have to be
-# testable without any.
-set(VLLM_ASCEND_HARNESS_TESTS
-  test_benchmark_harness)
-
-# Discovery runs the binary, which needs libopapi.so and friends on the loader
-# path even though they are opened lazily.
-set(VLLM_ASCEND_TEST_LIBRARY_PATH "${ASCEND_HOME_PATH}/lib64:$ENV{LD_LIBRARY_PATH}")
-
-# Every executable this project produces, collected so the strip step in
-# .vscode-build-aarch64.sh can be driven from a generated manifest rather than a
-# hand-maintained list. A stale name in that list is handed to `strip` as a path
-# that either does not exist or is not an ELF file, which is where the "file
-# format not recognized" warnings came from.
-set(VLLM_ASCEND_TEST_BINARY_FILES "")
-
-# Shared configuration for both the test and the benchmark binaries: they differ
-# only in which main() they link and how ctest is told to run them.
-function(vllm_ascend_add_device_executable target_name source_file entry_point)
-  add_executable(${target_name} "${source_file}" "${entry_point}")
-  target_link_libraries(${target_name} PRIVATE vllm_ascend_test_common)
-
-  # $ORIGIN keeps a copied-out build tree working; the CANN lib dirs cover the
-  # normal in-place run, and ${CMAKE_BINARY_DIR}/lib is where ascendc_library()
-  # leaves libvllm_ascend_turboquant.so.
-  #
-  # BUILD_WITH_INSTALL_RPATH links with the list below verbatim and skips the
-  # build-rpath computation entirely. That is the point of it, not a shortcut:
-  # CANN's tools/tikcpp/ascendc_kernel_cmake adds
-  #
-  #   ${ASCEND_CANN_PACKAGE_PATH}/tools/simulator/${SOC_VERSION}/lib
-  #
-  # as a PUBLIC link directory on every ascendc_library() target, *without ever
-  # looking at RUN_MODE*, and CMake then appends it to the consumer's RUNPATH.
-  # A RUN_MODE=npu binary comes out carrying a camodel directory on its own
-  # loader path - harmless on a machine where it does not exist, and a silent
-  # swap of the simulator runtime for the real one on a machine where it does.
-  # DT_NEEDED never names a camodel library, so nothing but this stops it.
-  # Measured: BUILD_RPATH_USE_LINK_PATH FALSE does *not* suppress it on CMake
-  # 3.22, and this does.
-  #
-  # The sim branch of the TurboQuant block below deliberately puts that same
-  # directory back, first, because there it is the point.
-  set_target_properties(${target_name} PROPERTIES
-    BUILD_WITH_INSTALL_RPATH TRUE
-    INSTALL_RPATH "$ORIGIN;${CMAKE_BINARY_DIR}/lib;${ASCEND_LIB_DIRS}")
-
-  set(VLLM_ASCEND_TEST_BINARY_FILES
-    ${VLLM_ASCEND_TEST_BINARY_FILES} "$<TARGET_FILE:${target_name}>" PARENT_SCOPE)
-endfunction()
-
-# Cross builds get one ctest entry per binary instead of one per GTest case.
-# Even PRE_TEST discovery has to execute the binary, and an aarch64 binary on
-# the x86 build host cannot run - `ctest -N` there aborts on the first discovery
-# attempt and lists nothing at all, benchmarks included. Running ctest on the
-# 310P itself, where the binaries are native, is unaffected.
-#
-# The optional second argument is the per-test timeout in seconds; it defaults to
-# 900, which is generous for a kernel launch on silicon and nowhere near enough
-# for one under the camodel simulator, where a single decode pass is minutes.
-# Both registration paths below need it, which is why it is a parameter rather
-# than a set_tests_properties() call afterwards: gtest_discover_tests names its
-# tests at ctest time, so there is nothing to set properties on here.
-#
-# The optional third argument suppresses GTest discovery and registers the whole
-# binary as one ctest entry, the way a cross build already does. It exists for
-# the TurboQuant binaries, and the reason is not a preference:
-#
-#   PRE_TEST discovery has to *execute* the binary to enumerate its cases, and
-#   those three link libvllm_ascend_turboquant.so. Built with RUN_MODE=npu, that
-#   library's static initialisation aborts on a host with no NPU driver -
-#   measured on CANN 9.2.0-beta.2:
-#
-#     terminate called after throwing an instance of 'std::logic_error'
-#       what(): basic_string::_S_construct null not valid
-#
-#   before main() reaches RUN_ALL_TESTS, so even `--gtest_list_tests` aborts.
-#   ctest reports "Error running test executable / Subprocess aborted" and then
-#   lists *nothing at all* - not the failing binary, not the other forty tests,
-#   because one failed discovery ends the whole enumeration. `ctest -N` on a
-#   build host becomes useless.
-#
-#   It is not this suite's bug: test_matmul_950pr, which links no kernel
-#   library, enumerates fine in the same tree, and the same TurboQuant binaries
-#   enumerate fine under RUN_MODE=sim where the camodel runtime is present. It
-#   is what an npu-mode kernel library does when the driver is absent, and the
-#   cost of tripping over it is out of all proportion to the per-case ctest
-#   granularity it buys.
-function(vllm_ascend_register_correctness_test target_name)
-  if(ARGC GREATER 1)
-    set(test_timeout ${ARGV1})
-  else()
-    set(test_timeout 900)
-  endif()
-  set(discover_cases TRUE)
-  if(ARGC GREATER 2 AND ARGV2)
-    set(discover_cases FALSE)
-  endif()
-  if(discover_cases AND COMMAND gtest_discover_tests AND NOT CMAKE_VERSION VERSION_LESS "3.18" AND NOT CMAKE_CROSSCOMPILING)
-    # PRE_TEST defers enumeration to `ctest` time. The default POST_BUILD mode
-    # runs the binary during the build, which fails on a build host that has the
-    # CANN headers but no driver.
-    gtest_discover_tests(${target_name}
-      DISCOVERY_MODE PRE_TEST
-      DISCOVERY_TIMEOUT 120
-      PROPERTIES
-        ENVIRONMENT "LD_LIBRARY_PATH=${VLLM_ASCEND_TEST_LIBRARY_PATH};ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
-        LABELS "correctness"
-        TIMEOUT ${test_timeout})
-  else()
-    add_test(NAME ${target_name} COMMAND ${target_name})
-    set_tests_properties(${target_name} PROPERTIES
-      ENVIRONMENT "LD_LIBRARY_PATH=${VLLM_ASCEND_TEST_LIBRARY_PATH};ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
-      LABELS "correctness"
-      TIMEOUT ${test_timeout})
-  endif()
-endfunction()
-
-foreach(test_name ${VLLM_ASCEND_KERNEL_TESTS})
-  vllm_ascend_add_device_executable(${test_name} "kernels/${test_name}.cpp" common/main.cpp)
-  vllm_ascend_register_correctness_test(${test_name})
-endforeach()
-
-foreach(test_name ${VLLM_ASCEND_HARNESS_TESTS})
-  vllm_ascend_add_device_executable(${test_name} "common/${test_name}.cpp" common/main.cpp)
-  vllm_ascend_register_correctness_test(${test_name})
-endforeach()
-
-message(STATUS "vllm-ascend tests: configured ${VLLM_ASCEND_KERNEL_TESTS}")
-message(STATUS "vllm-ascend tests: configured ${VLLM_ASCEND_HARNESS_TESTS}")
-
-# -----------------------------------------------------------------------------
-# Ascend 950PR test binaries
+# Shared 950PR infrastructure
 # -----------------------------------------------------------------------------
 #
-# Four operator tests plus the layer-3 golden parity test, each linking
-# common/main_950pr.cpp instead of common/main.cpp so the inventory they print
-# is the 950PR pipeline rather than the 310P one.
+# Built for the sim and device tiers only, so a 310P tree carries neither the
+# 950PR operator audit nor the golden-dump path define.
 
-if(ENABLE_ASCEND_950PR)
-  # SOC_VERSION is checked at run time against aclrtGetSocName, so leaving it at
-  # the 310P default with this option on would produce binaries that skip
-  # everything on the part they were built for. Warn rather than override: the
-  # caller may be cross-building for a bin this file does not know about.
-  if(NOT SOC_VERSION MATCHES "^Ascend950PR")
-    message(WARNING
-      "ENABLE_ASCEND_950PR is ON but SOC_VERSION is '${SOC_VERSION}'.\n"
-      "The 950PR tests gate on aclrtGetSocName() reporting an Ascend950PR bin "
-      "(Ascend950PR_9599 and friends) and will skip on anything else.\n"
-      "Configure with -DSOC_VERSION=Ascend950PR_9599 to make the intent explicit.")
-  endif()
-
-  # VLLM_ASCEND_GOLDEN_LAYER3_DIR is set once above, next to the host-only
-  # targets, because the fidelity report reads the same dump. It is baked in so
-  # an in-tree run needs no environment at all; QWEN_GOLDEN_LAYER3_DIR overrides
-  # it at run time. The warning for a missing dump is emitted there.
-
-  # Sources that only the 950PR binaries need. Kept out of
-  # vllm_ascend_test_common so the 310P and benchmark binaries do not grow a
-  # golden-dump path define and three objects they never call.
+if(VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE)
   add_library(vllm_ascend_test_common_950pr STATIC
     common/aclnn_ops_950pr.cpp
     common/golden_layer3.cpp
@@ -541,231 +613,82 @@ if(ENABLE_ASCEND_950PR)
       "will not resolve and the rotary stages take the packed aclnnApplyRotaryPosEmbV2 fallback")
   endif()
 
-  set(VLLM_ASCEND_950PR_TESTS
-    test_matmul_950pr
-    test_rmsnorm_950pr
-    test_rotary_embedding_950pr
-    test_activation_swiglu_950pr
-    test_qwen_layer_golden_950pr)
-
-  foreach(test_name ${VLLM_ASCEND_950PR_TESTS})
-    vllm_ascend_add_device_executable(${test_name} "kernels/ascend/${test_name}.cpp" common/main_950pr.cpp)
-    target_link_libraries(${test_name} PRIVATE vllm_ascend_test_common_950pr)
-    vllm_ascend_register_correctness_test(${test_name})
-  endforeach()
-
-  message(STATUS "vllm-ascend tests: configured ${VLLM_ASCEND_950PR_TESTS}")
-
   # ---------------------------------------------------------------------------
-  # TurboQuant 4-bit KV cache
+  # The TurboQuant Ascend C kernels
   # ---------------------------------------------------------------------------
   #
   # The only part of this suite that compiles device code. Everything else calls
-  # operators that CANN already built; these two tests drive kernels built here,
-  # from csrc/attention/turboquant/turboquant_kernels.cpp - the same source the
-  # wheel compiles, not a copy.
+  # operators CANN already built; these are built here, from
+  # csrc/attention/turboquant/turboquant_kernels.cpp - the same source the wheel
+  # compiles, not a copy.
+  #
+  # One library per tree, built for whichever RUN_MODE this configuration
+  # selected. That is precisely why sim/ and device/ cannot both be configured:
+  # they would need two different builds of this one target.
+
+  set(VLLM_ASCEND_TESTS_HAVE_TURBOQUANT FALSE)
 
   if(VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS)
-    # The kernels carry an AICore config for arch32 (910B) and arch35 (950PR)
-    # and nothing else; the repository root CMakeLists.txt gates them the same
-    # way. Building them for a 310P would fail inside ccec rather than here, so
-    # the gate is explicit and says which parts are supported.
-    if(SOC_VERSION MATCHES "^Ascend950|^Ascend910B|^Ascend910_9")
-      set(VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE
-          "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/turboquant_kernels.cpp")
+    set(VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/turboquant_kernels.cpp")
 
-      if(NOT EXISTS "${VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE}")
-        message(FATAL_ERROR "TurboQuant kernel source not found at ${VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE}")
-      endif()
-
-      set(VLLM_ASCEND_SIMULATOR_LIB_DIR "${ASCEND_HOME_PATH}/tools/simulator/${SOC_VERSION}/lib")
-      if(RUN_MODE STREQUAL "sim")
-        if(NOT EXISTS "${VLLM_ASCEND_SIMULATOR_LIB_DIR}/libruntime_camodel.so")
-          message(FATAL_ERROR
-            "RUN_MODE=sim needs the camodel for ${SOC_VERSION}, and "
-            "${VLLM_ASCEND_SIMULATOR_LIB_DIR}/libruntime_camodel.so does not exist.\n"
-            "Check SOC_VERSION against the directory names under ${ASCEND_HOME_PATH}/tools/simulator, "
-            "or configure with -DRUN_MODE=npu.")
-        endif()
-        message(STATUS "vllm-ascend tests: TurboQuant simulator libs at ${VLLM_ASCEND_SIMULATOR_LIB_DIR}")
-      endif()
-
-      # Defines the vllm_ascend_turboquant target. Kept in a subdirectory so
-      # ascendc.cmake's side effects stay out of this scope; see the note there.
-      add_subdirectory(kernels/ascend/turboquant)
-
-      # The Torch-free binding: the two _impl prototypes, the codec table
-      # builder and the grid arithmetic that turboquant_torch_adpt.h would have
-      # done with ATen. Carries the reference/ include directory because the Pi
-      # diagonal comes from the CPU reference rather than from a second
-      # generator.
-      add_library(vllm_ascend_test_turboquant STATIC common/turboquant_launch.cpp)
-
-      target_include_directories(vllm_ascend_test_turboquant
-        PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/reference")
-
-      target_link_libraries(vllm_ascend_test_turboquant
-        PUBLIC vllm_ascend_test_common_950pr vllm_ascend_turboquant)
-
-      # test_turboquant_bare_metal_950pr is the only one of the three that
-      # refuses to run under the camodel: it sweeps the shapes Qwen3.5-2B
-      # actually decodes at (head_dim 256, context up to 2048), which a
-      # cycle-level simulator cannot reach in usable time. It is built in every
-      # configuration all the same - a `sim` build produces it and it skips,
-      # naming the camodel library it found - so the binary set does not depend
-      # on RUN_MODE.
-      set(VLLM_ASCEND_TURBOQUANT_TESTS
-        test_turboquant_kernels_950pr
-        test_turboquant_npu_simulator
-        test_turboquant_bare_metal_950pr)
-
-      foreach(test_name ${VLLM_ASCEND_TURBOQUANT_TESTS})
-        vllm_ascend_add_device_executable(${test_name} "kernels/ascend/${test_name}.cpp" common/main_950pr.cpp)
-        target_link_libraries(${test_name} PRIVATE vllm_ascend_test_turboquant)
-
-        # The camodel replaces libruntime.so, so its directory has to be ahead of
-        # the toolkit's on the loader path at run time as well as at link time.
-        # This is the one configuration that wants it there; see the note in
-        # vllm_ascend_add_device_executable for why every other one must not
-        # inherit it from the link line.
-        if(RUN_MODE STREQUAL "sim")
-          set_target_properties(${test_name} PROPERTIES
-            INSTALL_RPATH
-              "$ORIGIN;${CMAKE_BINARY_DIR}/lib;${VLLM_ASCEND_SIMULATOR_LIB_DIR};${ASCEND_LIB_DIRS}")
-        endif()
-
-        # One ctest entry per binary, not per case: see the note on the third
-        # argument at the function definition.
-        vllm_ascend_register_correctness_test(${test_name} 900 TRUE)
-      endforeach()
-
-      if(RUN_MODE STREQUAL "sim")
-        # A camodel decode pass is minutes, not milliseconds, and the default
-        # 900 s that vllm_ascend_register_correctness_test sets is optimistic
-        # for a cold simulator on a loaded build host.
-        foreach(test_name ${VLLM_ASCEND_TURBOQUANT_TESTS})
-          if(TEST ${test_name})
-            set_tests_properties(${test_name} PROPERTIES
-              TIMEOUT 5400
-              ENVIRONMENT
-                "LD_LIBRARY_PATH=${VLLM_ASCEND_SIMULATOR_LIB_DIR}:${VLLM_ASCEND_TEST_LIBRARY_PATH};ASCEND_HOME_PATH=${ASCEND_HOME_PATH}")
-          endif()
-        endforeach()
-      endif()
-
-      message(STATUS "vllm-ascend tests: configured ${VLLM_ASCEND_TURBOQUANT_TESTS}")
-    else()
-      message(STATUS
-        "vllm-ascend tests: SOC_VERSION '${SOC_VERSION}' has no TurboQuant AICore config "
-        "(arch32 and arch35 only); skipping the TurboQuant kernels and their tests")
+    if(NOT EXISTS "${VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE}")
+      message(FATAL_ERROR "TurboQuant kernel source not found at ${VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE}")
     endif()
+
+    set(VLLM_ASCEND_SIMULATOR_LIB_DIR "${ASCEND_HOME_PATH}/tools/simulator/${SOC_VERSION}/lib")
+    if(VLLM_ASCEND_TESTS_TIER_SIM)
+      if(NOT EXISTS "${VLLM_ASCEND_SIMULATOR_LIB_DIR}/libruntime_camodel.so")
+        message(FATAL_ERROR
+          "The sim tier needs the camodel for ${SOC_VERSION}, and "
+          "${VLLM_ASCEND_SIMULATOR_LIB_DIR}/libruntime_camodel.so does not exist.\n"
+          "Check SOC_VERSION against the directory names under ${ASCEND_HOME_PATH}/tools/simulator, "
+          "or configure with -DRUN_MODE=npu to build the device tier instead.")
+      endif()
+      message(STATUS "vllm-ascend tests: camodel libs at ${VLLM_ASCEND_SIMULATOR_LIB_DIR}")
+    endif()
+
+    # Defines the vllm_ascend_turboquant target. Kept in a subdirectory so
+    # ascendc.cmake's side effects stay out of this scope; see the note there.
+    add_subdirectory(turboquant)
+
+    # The Torch-free binding: the two _impl prototypes, the codec table builder
+    # and the grid arithmetic that turboquant_torch_adpt.h would have done with
+    # ATen. Carries the reference/ include directory because the Pi diagonal
+    # comes from the CPU reference rather than from a second generator.
+    add_library(vllm_ascend_test_turboquant STATIC common/turboquant_launch.cpp)
+
+    target_include_directories(vllm_ascend_test_turboquant
+      PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/reference")
+
+    target_link_libraries(vllm_ascend_test_turboquant
+      PUBLIC vllm_ascend_test_common_950pr vllm_ascend_turboquant)
+
+    set(VLLM_ASCEND_TESTS_HAVE_TURBOQUANT TRUE)
+  else()
+    message(STATUS
+      "vllm-ascend tests: VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS=OFF; no Ascend C kernels, "
+      "and every binary that drives them is skipped")
   endif()
 endif()
 
 # -----------------------------------------------------------------------------
-# Benchmark binaries
+# Tiers 2 and 3, and the isolated 310P leg
 # -----------------------------------------------------------------------------
-#
-# Each bench_* binary links common/bench_main.cpp instead of common/main.cpp: no
-# GTest registration, no test environment, just the runtime setup and the
-# suite's own BuildSuite(). They are registered with ctest under the "benchmark"
-# label so the default `ctest` run stays a correctness run:
-#
-#   ctest --test-dir build/csrc-tests -LE benchmark   # tests only
-#   ctest --test-dir build/csrc-tests -L  benchmark   # benchmarks only
-#
-# A benchmark exits 77 when no usable device of the part it targets is attached,
-# which SKIP_RETURN_CODE turns into a ctest skip rather than a failure, matching
-# how the correctness suite behaves on a build host. Which part that is comes
-# from the entry point the binary links: common/bench_main.cpp for the 310P
-# suites, common/bench_main_950pr.cpp for the 950PR one below.
 
-if(VLLM_ASCEND_TESTS_BUILD_BENCHMARKS)
-  set(VLLM_ASCEND_KERNEL_BENCHMARKS
-    bench_matmul_310p
-    bench_rmsnorm_310p
-    bench_rotary_embedding_310p
-    bench_activation_swiglu_310p
-    bench_paged_attention_310p)
+if(VLLM_ASCEND_TESTS_TIER_SIM)
+  add_subdirectory(sim)
+endif()
 
-  add_custom_target(benchmarks COMMENT "Building the vllm-ascend 310P microbenchmarks")
+if(VLLM_ASCEND_TESTS_TIER_DEVICE)
+  add_subdirectory(device)
+endif()
 
-  foreach(bench_name ${VLLM_ASCEND_KERNEL_BENCHMARKS})
-    vllm_ascend_add_device_executable(${bench_name} "kernels/${bench_name}.cpp" common/bench_main.cpp)
-    add_dependencies(benchmarks ${bench_name})
-
-    add_test(NAME ${bench_name} COMMAND ${bench_name})
-    set_tests_properties(${bench_name} PROPERTIES
-      ENVIRONMENT "LD_LIBRARY_PATH=${VLLM_ASCEND_TEST_LIBRARY_PATH};ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
-      LABELS "benchmark"
-      SKIP_RETURN_CODE 77
-      # Wall clock, not device time: 1300+ launches per case across every shape
-      # in a suite, and the largest matmul sweep is the slow one.
-      TIMEOUT 1800)
-  endforeach()
-
-  message(STATUS "vllm-ascend tests: configured ${VLLM_ASCEND_KERNEL_BENCHMARKS}")
-
-  # ---------------------------------------------------------------------------
-  # Ascend 950PR benchmarks
-  # ---------------------------------------------------------------------------
-  #
-  # Registered here rather than inside the 950PR block above, because the
-  # `benchmarks` custom target only exists from this point on and
-  # add_dependencies needs it to.
-  #
-  # The link is against vllm_ascend_test_turboquant, so it follows the same
-  # option as the TurboQuant tests: no kernel toolchain, no kernels, no
-  # benchmark. The entry point is common/bench_main_950pr.cpp, which names the
-  # part, so the binary exits 77 on a 310P instead of timing a decode against
-  # hardware it was not written for.
-  if(TARGET vllm_ascend_test_turboquant)
-    set(VLLM_ASCEND_950PR_BENCHMARKS
-      bench_turboquant_950pr)
-
-    foreach(bench_name ${VLLM_ASCEND_950PR_BENCHMARKS})
-      vllm_ascend_add_device_executable(${bench_name} "kernels/ascend/${bench_name}.cpp"
-                                        common/bench_main_950pr.cpp)
-      target_link_libraries(${bench_name} PRIVATE vllm_ascend_test_turboquant)
-      add_dependencies(benchmarks ${bench_name})
-
-      if(RUN_MODE STREQUAL "sim")
-        set_target_properties(${bench_name} PROPERTIES
-          INSTALL_RPATH
-            "$ORIGIN;${CMAKE_BINARY_DIR}/lib;${VLLM_ASCEND_SIMULATOR_LIB_DIR};${ASCEND_LIB_DIRS}")
-      endif()
-
-      add_test(NAME ${bench_name} COMMAND ${bench_name})
-      set_tests_properties(${bench_name} PROPERTIES
-        ENVIRONMENT "LD_LIBRARY_PATH=${VLLM_ASCEND_TEST_LIBRARY_PATH};ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
-        LABELS "benchmark"
-        SKIP_RETURN_CODE 77
-        TIMEOUT 1800)
-    endforeach()
-
-    if(RUN_MODE STREQUAL "sim")
-      # Under the camodel a single decode launch is minutes, so the default
-      # 1300-odd launches per case are days. The binary still builds and still
-      # runs - ASCEND_BENCH_ITERS and ASCEND_BENCH_TQ_CONTEXTS exist for exactly
-      # that - but ctest is told not to wait for a default-sized run.
-      foreach(bench_name ${VLLM_ASCEND_950PR_BENCHMARKS})
-        set_tests_properties(${bench_name} PROPERTIES
-          DISABLED TRUE
-          ENVIRONMENT
-            "LD_LIBRARY_PATH=${VLLM_ASCEND_SIMULATOR_LIB_DIR}:${VLLM_ASCEND_TEST_LIBRARY_PATH};ASCEND_HOME_PATH=${ASCEND_HOME_PATH}")
-      endforeach()
-      message(STATUS
-        "vllm-ascend tests: ${VLLM_ASCEND_950PR_BENCHMARKS} built but disabled in ctest under RUN_MODE=sim; "
-        "run the binary by hand with ASCEND_BENCH_ITERS and ASCEND_BENCH_TQ_CONTEXTS set small")
-    endif()
-
-    message(STATUS "vllm-ascend tests: configured ${VLLM_ASCEND_950PR_BENCHMARKS}")
-  endif()
+if(VLLM_ASCEND_TESTS_TIER_DEVICE310)
+  add_subdirectory(device_310p)
 endif()
 
 endif()  # NOT VLLM_ASCEND_TESTS_HOST_ONLY
-
-list(APPEND VLLM_ASCEND_TEST_BINARY_FILES "$<TARGET_FILE:test_turbo_quant_fidelity>")
 
 # -----------------------------------------------------------------------------
 # Binary manifest
@@ -776,6 +699,7 @@ list(APPEND VLLM_ASCEND_TEST_BINARY_FILES "$<TARGET_FILE:test_turbo_quant_fideli
 #
 #   xargs -r -a build/csrc-tests-aarch64/test_binaries.txt aarch64-linux-gnu-strip --strip-unneeded
 
+get_property(VLLM_ASCEND_TEST_BINARY_FILES GLOBAL PROPERTY VLLM_ASCEND_TEST_BINARIES)
 string(ASCII 10 VLLM_ASCEND_NEWLINE)
 file(GENERATE
   OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/test_binaries.txt"

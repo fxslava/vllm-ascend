@@ -36,9 +36,9 @@
 // rotated-basis decode. It is not an independent reimplementation and does not
 // pretend to be. What it establishes is that the kernel does on the device what
 // the reference does on the host, which is the property that lets the host-only
-// fidelity report in test_turbo_quant_fidelity.cpp stand in for a hardware run.
+// fidelity report in test_host_turboquant_fidelity.cpp stand in for a hardware run.
 // The fidelity of the codec *itself* against exact attention is measured
-// separately, in test_turboquant_npu_simulator.cpp.
+// separately, in test_sim_950pr_turboquant_decode.cpp.
 //
 // ON EXACTNESS. The reconstruction check is exact-to-one-level rather than
 // byte-identical, even though the measurement is in fact byte-identical: on the
