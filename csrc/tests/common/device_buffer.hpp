@@ -17,24 +17,15 @@
 // RAII wrapper around a device allocation, with the alignment rules the
 // DaVinci v200 (Ascend 310P) data-movement units impose.
 //
-// MTE2 (GM -> UB) and MTE3 (UB -> GM) move data in 32-byte bursts. A kernel
-// whose tail block is not a whole number of bursts still issues a full burst,
-// so the allocation is padded up to a 32-byte multiple. Without the padding the
-// tail burst reads or writes past the end of the allocation, which shows up as
-// an intermittent EXCEPTION rather than a deterministic failure.
+// MTE2 (GM -> UB) and MTE3 (UB -> GM) move data in 32-byte bursts and a kernel
+// whose tail block is short still issues a full burst, so the allocation is
+// padded up to a 32-byte multiple.
 //
-// Allocate() takes an optional stronger alignment. The correctness tests use
-// the 32-byte default; the benchmarks ask for 512 so that a measurement is not
-// silently penalised by a buffer that straddles a cache line or an HBM burst.
-// aclrtMalloc already returns pointers aligned far past 32 bytes in practice,
-// but the documented guarantee stops there, so every request over-allocates by
-// one alignment and offsets into the block rather than trusting the allocator.
-//
-// The slack has to be unconditional. Making it conditional on a
-// stronger-than-default alignment was a latent overrun: with no slack, a base
-// pointer that needed advancing left fewer than capacity_bytes_ bytes
-// addressable from data_, and the memset, CopyFromHost and Zero below all
-// write the padded capacity rather than the requested size.
+// Allocate() takes an optional stronger alignment: the correctness tests use
+// the 32-byte default, the benchmarks ask for 512. Every request over-allocates
+// by one alignment and offsets into the block rather than trusting aclrtMalloc,
+// and the slack is unconditional -- without it a base pointer that needs
+// advancing leaves fewer than capacity_bytes_ bytes addressable from data_.
 
 #pragma once
 

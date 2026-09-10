@@ -14,12 +14,8 @@
  * limitations under the License.
  */
 
-// Pairs a device allocation with the aclTensor descriptor that points at it.
-//
-// The two have to live and die together: an aclTensor whose backing buffer has
-// been freed is the classic way to turn a test failure into an unrelated
-// EXCEPTION further down the run. Bundling them makes the lifetime obvious and
-// keeps the host conversions in one place.
+// Pairs a device allocation with the aclTensor descriptor that points at it,
+// so the two live and die together.
 
 #pragma once
 
@@ -64,10 +60,8 @@ class DeviceTensor {
 
   // A [k, n] tensor whose storage is [n, k] row-major, described with strides
   // {1, k} instead of being copied. This is the weight layout a Linear layer
-  // already holds ([out_features, in_features]), so a matmul test can pass a
-  // transposed B the same way the plugin does, without a host-side transpose.
-  //
-  // `values` is the [n, k] buffer, n * k elements.
+  // already holds, so a matmul test can pass a transposed B the way the plugin
+  // does. `values` is the [n, k] buffer, n * k elements.
   static DeviceTensor HalfTransposed2D(int64_t n, int64_t k, const std::vector<float>& values,
                                        size_t alignment = kDeviceAlignBytes);
 

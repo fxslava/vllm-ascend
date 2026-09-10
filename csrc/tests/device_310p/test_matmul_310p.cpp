@@ -14,35 +14,24 @@
  * limitations under the License.
  */
 
-// MatMul on Ascend 310P, fp16 in / fp16 out, with a transposed B.
-//
-// This is the only suite here that exercises the v200 *cube* unit; RMSNorm,
-// SwiGLU and RoPE are all vector-unit work. Every QKV, o_proj, gate_up and
-// down projection in a Qwen3.5 forward pass is this operator, so it carries
-// more of the decode step's arithmetic than the other three combined.
+// MatMul on Ascend 310P, fp16 in / fp16 out, with a transposed B. The only
+// suite here that exercises the v200 cube unit.
 //
 // Two deliberate choices, both of which the tolerance depends on:
 //
 // 1. B is presented transposed. A Linear layer stores its weight as
 //    [out_features, in_features] = [N, K] and computes x @ W^T. The test
-//    uploads that [N, K] buffer and describes it to the operator as a [K, N]
-//    view with strides {1, K} (DeviceTensor::HalfTransposed2D), which is what
-//    torch_npu does rather than materialising a transpose.
+//    uploads that [N, K] buffer and describes it as a [K, N] view with strides
+//    {1, K} (DeviceTensor::HalfTransposed2D), as torch_npu does.
 //
 // 2. Inputs are scaled so the output lands near unit magnitude. A K=4096 dot
 //    product of N(0,1) terms has magnitude ~sqrt(K)=64, where one fp16 ULP is
-//    0.0625 -- the output rounding alone would then exceed atol=1e-3 and the
-//    test would be measuring fp16 storage, not the kernel. Drawing B with
-//    stddev 1/sqrt(K) (which is also how the weights are actually initialised)
-//    keeps the result near 1.0, where one fp16 ULP is ~9.8e-4 and atol=1e-3 is
-//    a meaningful bar.
+//    0.0625 and the output rounding alone would exceed atol=1e-3. Drawing B
+//    with stddev 1/sqrt(K) keeps the result near 1.0, where one fp16 ULP is
+//    ~9.8e-4.
 //
-// NOT COVERED: M > 1. Decode is M=1, which is what the requirement targets, but
-// a GEMV does not exercise the cube unit's M tiling at all. A prefill-shaped
-// case (M = 32 / 128 against the same weights) is the obvious next addition and
-// would likely need a looser tolerance, since the accumulation depth is
-// unchanged but many more output elements get a chance to sit on a rounding
-// boundary.
+// NOT COVERED: M > 1. Decode is M=1, but a GEMV does not exercise the cube
+// unit's M tiling at all.
 
 #include <gtest/gtest.h>
 

@@ -16,16 +16,10 @@
 
 // SiluAndMul / SwiGLU (aclnnSwiGlu) on the v200 vector unit, fp16 in / fp16 out.
 //
-// Purely elementwise over a 3:1 ratio of traffic - 2 * intermediate read, one
-// intermediate written - with a sigmoid in the middle. Bandwidth-bound, so GB/s
-// is the figure to read; the transcendental is the one thing that could make it
-// compute-bound, and comparing the GB/s here against the RMSNorm suite at the
-// same byte count is how you tell whether it has.
-//
-// Every intermediate size benchmarked satisfies the `x.shape[-1] % 32 == 0`
-// gate in AscendSiluAndMul310.forward, so all of them take the kernel path
-// rather than the eager fallback. Timing a width that fails the gate would
-// measure nothing the plugin ever runs.
+// Purely elementwise over a 3:1 ratio of traffic, so bandwidth-bound and GB/s
+// is the figure to read. Every intermediate size benchmarked satisfies the
+// `x.shape[-1] % 32 == 0` gate in AscendSiluAndMul310.forward, so all of them
+// take the kernel path rather than the eager fallback.
 
 #include <cstdint>
 #include <sstream>

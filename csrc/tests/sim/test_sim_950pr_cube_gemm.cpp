@@ -16,34 +16,20 @@
 
 // The fp8 Cube contract, pinned numerically: the NZ layout the operands must be
 // in, LoadData2DParamsV2's step and stride fields, Mmad's argument order, and
-// Fixpipe's output layout.
+// Fixpipe's output layout. All four are undocumented in the toolkit's public
+// headers; TurboQuantCubeMm is a transcription of CANN's own matmul, and this
+// file is the check that the transcription is right.
 //
-// WHY THIS EXISTS AS ITS OWN BINARY. Every one of those is undocumented in the
-// toolkit's public headers -- LoadData2DParamsV2's fields are passed straight
-// through to load_cbuf_to_ca with no comment, and the NZ layout is only implied
-// by TransND2NZ in the data-copy implementation. The authoritative statement is
-// CANN's own matmul, in
-// .../impl/adv_api/detail/matmul/stage/split/load_to_l0{a,b}/load_to_l0{a,b}_load2dV2.h,
-// and TurboQuantCubeMm is a transcription of it. This file is the check that
-// the transcription is right, and the regression test for it: a CANN upgrade
-// that changes any of the four fails here instead of silently degrading every
-// decode the project ships.
+// It drives TurboQuantCubeMm itself, through turboquant_cube_gemm_probe.
 //
-// It drives TurboQuantCubeMm itself rather than a copy, through
-// turboquant_cube_gemm_probe. What is tested is the code the decode runs.
+// Both B forms are covered:
 //
-// BOTH B FORMS ARE COVERED, because they are two different instruction
-// sequences and only one of them is obvious:
+//   score GEMM    B staged [n, k] loads with ifTranspose FALSE, one LoadData.
+//   context GEMM  B staged [k, n] loads with ifTranspose TRUE and, for an
+//                 8-bit operand, in mStep = 2 chunks. A single call with a
+//                 larger mStep raises mte_instr_addr_misalign.
 //
-//   score GEMM    B staged [n, k] -- the orientation the KV cache already has --
-//                 loads with ifTranspose FALSE, one LoadData.
-//   context GEMM  B staged [k, n] -- the same bytes, read the other way --
-//                 loads with ifTranspose TRUE and, for an 8-bit operand, in
-//                 mStep = 2 chunks. A single call with a larger mStep raises
-//                 mte_instr_addr_misalign; that is measured, not inferred.
-//
-// A camodel pass here is under a minute, against minutes for the whole decode,
-// which is the other reason this is separate.
+// A camodel pass here is under a minute, against minutes for the whole decode.
 
 #include <algorithm>
 #include <cmath>
@@ -64,8 +50,7 @@ namespace {
 namespace tqh = turboquant_host;
 
 // Elements of an fp8 Cube operand in one C0 block. AuxGetC0Size returns
-// B8_C0SIZE = 32 for every 8-bit type on arch35 -- not 64, which is what one
-// LoadData k step was assumed to cover before this test existed.
+// B8_C0SIZE = 32 for every 8-bit type on arch35, not 64.
 constexpr int64_t kC0 = 32;
 
 // The decode's real shapes, so what is pinned is what runs. head_size 256 makes

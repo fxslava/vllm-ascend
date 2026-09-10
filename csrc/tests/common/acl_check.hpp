@@ -15,8 +15,6 @@
  */
 
 // Error-checking helpers for the raw ACL runtime.
-//
-// Two flavours are provided on purpose:
 //   * ACL_CHECK      - throws AclError. Use it inside RAII types and helpers
 //                      where a GTest fatal assertion cannot unwind cleanly.
 //   * ASSERT_ACL_OK  - GTest fatal assertion. Use it directly in test bodies.

@@ -16,10 +16,10 @@
 
 // Process-wide Ascend runtime lifecycle for the bare-metal kernel tests.
 //
-// Ownership model: a single AscendDevice object owns aclInit, the device, the
-// context and the default stream, and tears them down in the reverse order in
-// its destructor. AscendTestEnvironment is the GTest adapter that constructs it
-// once per process. Nothing here touches Python, PyTorch or torch_npu.
+// A single AscendDevice object owns aclInit, the device, the context and the
+// default stream, and tears them down in reverse order in its destructor.
+// AscendTestEnvironment is the GTest adapter that constructs it once per
+// process. Nothing here touches Python, PyTorch or torch_npu.
 
 #pragma once
 
@@ -92,15 +92,12 @@ class AscendTestEnvironment : public ::testing::Environment {
   bool is_310p() const;
 
   // True when the attached device reports an Ascend 950PR part, i.e. a SoC name
-  // beginning "Ascend950PR" - the platform_config files name one bin each
-  // (Ascend950PR_9599 and friends) and the tests must accept all of them.
+  // beginning "Ascend950PR" -- the platform_config files name one bin each and
+  // the tests must accept all of them.
   //
-  // Unlike is_310p(), an unknown SoC name is NOT accepted here. is_310p()
-  // returns true for an empty name because that suite predates any second
-  // part and refusing would have made a CANN build without aclrtGetSocName
-  // skip everything; this one runs alongside the 310P binaries in the same
-  // build tree, so "we could not tell" has to mean "not this part" or a 310P
-  // host would silently run 950PR-shaped work.
+  // Unlike is_310p(), an unknown SoC name is NOT accepted here: this suite runs
+  // alongside the 310P binaries in the same build tree, so "we could not tell"
+  // has to mean "not this part".
   bool is_950pr() const;
 
  private:
@@ -117,16 +114,9 @@ void RegisterAscendTestEnvironment();
 // --- silicon versus the camodel ---------------------------------------------
 //
 // The CANN camodel reports a real SoC name, so is_950pr() cannot tell it from a
-// 950PR: that is the point of the simulator and the reason the TurboQuant tests
-// can run at all without the part. A suite that only means something on
-// hardware - because it measures behaviour the simulator models rather than
-// reproduces, or because its shapes would take days cycle-by-cycle - has to ask
-// a different question.
-//
-// SimulatorEvidence() returns the mapped object that gives the camodel away
-// (libruntime_camodel.so, or anything loaded out of tools/simulator/), or an
-// empty string when nothing does. Silicon is the default assumption: a host
-// whose /proc cannot be read reports no evidence rather than skipping.
+// 950PR. SimulatorEvidence() returns the mapped object that gives the camodel
+// away (libruntime_camodel.so, or anything loaded out of tools/simulator/), or
+// an empty string when nothing does. Silicon is the default assumption.
 bool IsRunningOnSimulator();
 const std::string& SimulatorEvidence();
 
@@ -160,14 +150,10 @@ const std::string& SimulatorEvidence();
   } while (false)
 
 // A 950PR, and not the camodel standing in for one. For suites whose shapes are
-// production-sized: the simulator is cycle-level, so a case that is milliseconds
-// on the part is hours there, and a run that started anyway would look like a
-// hang rather than a skip.
+// production-sized: the simulator is cycle-level, so a case that is
+// milliseconds on the part is hours there.
 //
-// ASCEND_TEST_ALLOW_SIMULATOR=1 runs them under the camodel regardless. That is
-// for smoke-checking the binary itself, not for producing results; expect the
-// whole suite to take hours, and shrink the sweep with the suite's own shape
-// override first.
+// ASCEND_TEST_ALLOW_SIMULATOR=1 runs them under the camodel regardless.
 #define REQUIRE_PHYSICAL_ASCEND_950PR()                                                    \
   do {                                                                                     \
     REQUIRE_ASCEND_950PR();                                                                \
@@ -183,25 +169,17 @@ const std::string& SimulatorEvidence();
   } while (false)
 
 
-// A case that exercises a path known not to work yet.
+// A case that exercises a path known not to work yet, as opposed to one the
+// machine cannot run -- which is what every gate above is for.
 //
-// The distinction this draws is between "the machine cannot run this" -- which
-// is what every gate above is for -- and "this code is wrong and we know it".
-// Both should skip in a default run, but for opposite reasons, and conflating
-// them hides the second: a suite where the broken cases are simply absent looks
-// green, and a suite where they fail looks broken in a way that says nothing
-// about the change under test.
-//
-// So a case gated on this skips with the reason and a pointer, and
-// VLLM_ASCEND_TQ_CUBE_WIP=1 runs it. Delete the gate, do not weaken it, when the
-// path works.
+// A case gated on this skips with the reason and a pointer, and
+// VLLM_ASCEND_TQ_CUBE_WIP=1 runs it. Delete the gate, do not weaken it, when
+// the path works.
 //
 // -DVLLM_ASCEND_TESTS_ENABLE_WIP_CUBE=ON flips the default for a tree dedicated
 // to fixing that path; the environment variable still decides in both
-// directions, so such a tree can be asked for the stable baseline with
-// VLLM_ASCEND_TQ_CUBE_WIP=0 rather than a reconfigure. The same pair gates the
-// Cube legs of bench_device_950pr_turboquant, deliberately: one switch, wherever
-// the work-in-progress path appears.
+// directions. The same pair gates the Cube legs of
+// bench_device_950pr_turboquant.
 #if defined(VLLM_ASCEND_TQ_CUBE_WIP_DEFAULT_ON)
 constexpr bool kCubeWipDefaultOn = true;
 #else

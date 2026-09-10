@@ -14,23 +14,14 @@
  * limitations under the License.
  */
 
-// Torch-free access to the CANN single-operator API (aclnn).
+// Torch-free access to the CANN single-operator API (aclnn), resolved with
+// dlsym rather than linked: the operator set in libopapi.so moves between CANN
+// releases, so a missing operator becomes a GTEST_SKIP naming the symbol rather
+// than a link error for the whole binary. This mirrors what torch_npu itself
+// does in csrc/aclnn_torch_adapter/op_api_common.h.
 //
-// Why dlsym instead of #include <aclnnop/...> plus -lopapi:
-//
-//   * The operator set in libopapi.so moves between CANN releases. Linking
-//     directly turns a missing operator into a link error for the whole binary;
-//     here it becomes a GTEST_SKIP naming the exact symbol, and the other three
-//     kernel suites still run.
-//   * It mirrors what torch_npu itself does. csrc/aclnn_torch_adapter/op_api_common.h
-//     resolves every aclnn entry point through dlopen of libopapi.so plus dlsym;
-//     this file is the same mechanism with the ATen dependencies removed.
-//
-// The cost is that the argument list of each GetWorkspaceSize function is
-// declared by hand in aclnn_ops.hpp rather than checked by the compiler. Every
-// declaration there names the CANN header to verify it against, and a mismatch
-// surfaces as a non-zero status plus the aclGetRecentErrMsg text rather than as
-// silent corruption.
+// The cost is that each GetWorkspaceSize argument list is declared by hand in
+// aclnn_ops.hpp rather than checked by the compiler.
 
 #pragma once
 
@@ -60,19 +51,13 @@ namespace test {
 // points it re-exports from libnnopbase.so, plus any custom operator packages
 // installed alongside it.
 //
-// The custom packages matter because half the point of this suite on a 950PR is
-// to exercise kernels that live in csrc/, and those are not in libopapi.so at
-// all: the CANN op build installs them as libcust_opapi.so under a vendor
-// directory. The search order below is copied from
-// csrc/aclnn_torch_adapter/op_api_common.h :: GetOpApiFuncAddr, so a symbol
-// resolves here to the same implementation torch_npu would have called -
+// The custom packages matter because the kernels in csrc/ are not in
+// libopapi.so at all: the CANN op build installs them as libcust_opapi.so under
+// a vendor directory. The search order is copied from
+// csrc/aclnn_torch_adapter/op_api_common.h :: GetOpApiFuncAddr --
 // ASCEND_CUSTOM_OPP_PATH first, then the vendors named by load_priority in
-// $ASCEND_OPP_PATH/vendors/config.ini, then stock CANN.
-//
-// That precedence applies to every operator, not only the custom ones: a vendor
-// package that overrides aclnnRmsNorm would be picked up here exactly as it
-// would be in the plugin. That is deliberate - the alternative is a suite that
-// tests an implementation the runtime would never call.
+// $ASCEND_OPP_PATH/vendors/config.ini, then stock CANN -- so a symbol resolves
+// here to the same implementation torch_npu would have called.
 class OpApiLibrary {
  public:
   static OpApiLibrary& Instance();

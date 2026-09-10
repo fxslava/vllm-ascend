@@ -22,52 +22,16 @@
  *     packed[c] = int8((q[2c] + 16 * q[2c + 1]) - 128),   c in [0, D/2)
  *     scale     = ||Pi x||_2 / sqrt(D)
  *
- * where q in [0, 15] indexes the 16-level Lloyd-Max quantiser for N(0, 1) and
- * the rotated vector is
+ * where q in [0, 15] indexes the 16-level Lloyd-Max quantiser for N(0, 1),
+ * u = Pi x / scale, q = sum_{i=1}^{15} [u > t_i], and the reconstruction is
+ * scale * c[q].  The rotation is
  *
  *     Pi x = D (H (D x)),    D = diag(+-1),   H = normalised Walsh-Hadamard
  *
- * with u = Pi_x / scale, q = sum_{i=1}^{15} [u > t_i] and the reconstruction
- * scale * c[q].  The rotation makes the coordinates of u very close to i.i.d.
- * N(0, 1) -- measured |excess kurtosis| < 0.12 on real activations at every
- * layer -- which is exactly the distribution the table is optimal for, so the
- * codec quantises against the density it actually sees rather than against a
- * uniform grid sized by the single largest coordinate.  The RMS scale is the
- * matching metric: absmax sizes its step off an outlier and leaves the bulk
- * crushed, and on real activations that inflates the reconstructed norm by up
- * to 2.17x.  A sign flip is applied *before* the Hadamard
- * because a bare Hadamard has adversarial inputs -- a vector aligned with one
- * of its rows concentrates all energy into a single coordinate -- and the
- * random diagonal removes them.  The second flip makes Pi symmetric:
+ * a symmetric orthogonal involution, so one routine both rotates and
+ * un-rotates.  Rotation is applied to activations only; no weight is rewritten.
  *
- *     Pi^T = D^T H^T D^T = D H D = Pi,      Pi^2 = D H D D H D = D H H D = I
- *
- * so Pi is an orthogonal involution and is its own inverse.  One routine both
- * rotates and un-rotates, and because Pi is orthogonal (Pi q) . (Pi k) == q . k,
- * leaving attention scores untouched; only the quantisation error changes.
- *
- * The reconstruction stays *linear in the scale* -- scale * c[q] rather than
- * scale * (q - 7.5) -- which is the property the decode path depends on:
- * Dequantize4Bit still returns scale-free values and the per-vector scale is
- * still folded into the attention score row (for K) or into the softmax
- * probabilities (for V), one Mul over `rows` instead of over `rows * D`.
- *
- * The 4-bit width is deliberate.  Two codes fill exactly one byte, D/2 bytes
- * stay 32-byte aligned for every D >= 64, and the packed layout is the one the
- * INT4 Cube GEMM path already expects.
- *
- * Everything below stays in the Vector pipeline.  There is no per-element
- * GetValue/SetValue in this header: the sign patterns, shuffle tables and the
- * nibble split are Gather-driven, the bin index comes from a sign bit rather
- * than a comparison mask, and the per-vector RMS scale is broadcast with Brcb
- * rather than read into a scalar register.
- *
- * The constant tables are *not* generated here.  They are a pure function of
- * (head_size, batch_rows), so the host builds them once at engine start and
- * Init() pulls the finished image into UB with a single aligned DataCopy.
- * Generating them per launch cost roughly forty dependent vector instructions
- * plus their pipe barriers on the critical path of every decode step.
- * ConstTableWords() is the layout contract; the host mirror lives in
+ * ConstTableWords() is the constant-table layout contract; the host mirror is
  * vllm_ascend/attention/turboquant_v1.py::turboquant_codec_tables.
  */
 
@@ -90,31 +54,9 @@ constexpr uint32_t kFp32PerRepeat = 64;
 constexpr uint32_t kBrcbSrcLanes = kFp32PerBlock;
 constexpr uint32_t kBrcbDstLanes = kFp32PerBlock * kFp32PerBlock;
 
-/*
- * `srcBaseAddr` for every AscendC::Gather in this file and in
- * turboquant_kernels.cpp.
- *
- * Gather's fourth argument is a byte offset *within* srcLocal - it names where
- * in the source tensor the offset table starts counting from - and NOT the UB
- * address of srcLocal. Every offset table here already indexes from the start
- * of its source tensor, so the correct value is zero.
- *
- * This was a helper that returned srcLocal->GetPhyAddr(), and the effect was
- * that the tensor's own UB offset got added twice: the gather then read from
- * 2 * base + offset, which lands in whichever buffer happens to sit there.
- * It only produced correct results when the source was the very first UB
- * allocation, where the address is zero and the double-count is invisible -
- * which is why it survived code review and why it reproduces in a unit probe
- * only once a second buffer is allocated ahead of the source. Measured on both
- * the Ascend910B1 and the Ascend950PR_9599 camodel, so it is not arch-specific.
- *
- * Symptom, if it comes back: ApplyPi's stride-1/2/4 stages and the codec's
- * nibble split silently return the contents of an unrelated buffer, the packed
- * cache fills with the -128 that an all-zero nibble pair encodes, and the
- * decode output is uncorrelated with the reference.
- * TurboQuantKernels.ReshapeAndCacheMatchesTheCpuReference is the test that
- * catches it.
- */
+// Gather's srcBaseAddr is a byte offset *within* srcLocal, not the UB address
+// of srcLocal.  Every offset table here already indexes from the start of its
+// source tensor, so the correct value is zero.
 constexpr uint32_t kGatherSrcBase = 0;
 
 /*
@@ -143,25 +85,7 @@ public:
     // Bit position of the fp32 sign, which is how a comparison is turned into
     // an integer 0/1 without a mask register.
     static constexpr uint32_t kSignBitShift = 31;
-    /*
-     * How many of the fifteen boundary tests Quantize4Bit keeps in flight.
-     *
-     * The tests are mutually independent -- only their sum is ordered -- but
-     * evaluating them one at a time through a single shared scratch buffer makes
-     * each one wait for the last, and every Adds -> ShiftRight -> Add triple
-     * needs a PipeBarrier<PIPE_V> between its halves.  That is a 45-barrier
-     * chain on the critical path of every KV write.  Measured on the 950PR
-     * camodel it cost 4.2x the cycles of the absmax quantiser it replaced for
-     * only 1.9x the instructions, with 3.3x the hazard stalls and -- the giveaway
-     * -- not one vector-issue-queue-full event: the core was starved, never
-     * saturated.
-     *
-     * With kBinLanes buffers the lanes issue back to back and the barriers drop
-     * to (2 + log2(kBinLanes) + 1) per group of kBinLanes boundaries.  Eight
-     * lanes takes the count from 45 to 13 for +7 * vecLen floats of UB, which is
-     * the balance point: sixteen would reach 7 barriers but doubles the buffer
-     * for one more halving.
-     */
+    // Boundary tests Quantize4Bit keeps in flight, one scratch buffer each.
     static constexpr int kBinLanes = 8;
 
     /*
@@ -169,17 +93,10 @@ public:
      *
      *     t_i = (c_{i-1} + c_i) / 2,     c_i = E[X | t_i < X < t_{i+1}],
      *
-     * solved to machine precision with the closed-form truncated-Gaussian
-     * moments rather than from a histogram, and symmetrised exactly.  Its
-     * distortion E[(X - Q(X))^2] is 0.0095010080, i.e. 20.222 dB, against
-     * 0.01388 for the uniform mid-rise grid this replaced.  Re-derivable with
+     * re-derivable with
      * scripts/tq_kv_quant_reference.py::lloyd_max_gaussian_table().
-     *
-     * The centroids live in UB (see ConstTableWords) because Dequantize4Bit
-     * reads them with a Gather.  The thresholds are compile-time constants
-     * because Quantize4Bit consumes them as Adds immediates -- putting them in
-     * UB would cost fifteen scalar loads and their pipeline stalls to buy
-     * nothing, since they are the same on every launch.
+     * The centroids reach UB (see ConstTableWords); the thresholds stay
+     * compile-time constants because Quantize4Bit uses them as Adds immediates.
      */
     __aicore__ static inline float Threshold(int i)
     {
@@ -192,8 +109,8 @@ public:
     }
 
     /*
-     * Constant-table layout, in 4-byte words.  The host writes this exact image;
-     * Init() copies it in one burst and never rewrites a word of it.
+     * Constant-table layout, in 4-byte words.  The host writes this exact image
+     * and Init() copies it in one DataCopy.
      *
      *   [0 .. 6*len)              sign_[s] then xorOffset_[s], per stage
      *   [6*len .. 7*len)          evenOffset_ then oddOffset_, len/2 words each
@@ -202,27 +119,14 @@ public:
      *   [7*len+2B .. +kLevels)    centroid_
      *
      * sign_, oddSelect_ and centroid_ are fp32 bit patterns; the offset tables
-     * are uint32 byte offsets for Gather.  Every entry is four bytes wide, so
-     * one int32 DataCopy moves the lot and the device needs no cast and no
-     * arithmetic.
-     *
-     * The centroid table is appended rather than prepended so that adding it
-     * left every pre-existing offset in the image unchanged.  vecLen is a
-     * power of two >= 64, so every section boundary -- the centroid table's
-     * included -- is a whole 32-byte burst, which is what lets Init() move the
-     * image with a single DataCopy and lets Gather read the centroids from an
-     * aligned base.
+     * are uint32 byte offsets for Gather.  Every entry is four bytes wide.
      */
     __aicore__ static inline uint32_t ConstTableWords(uint32_t vecLen, uint32_t batchRows)
     {
         return 7u * vecLen + 2u * vecLen * batchRows + static_cast<uint32_t>(kLevels);
     }
 
-    // Scratch, deliberately uninitialised: swap_, scratch_, reduceWork_,
-    // broadcast_, and the kBinLanes boundary-test lanes.  Purely internal - the
-    // host builds ConstTableWords and never this - so widening it changes no
-    // contract and needs no mirror.  The lanes are sized off vecLen rather than
-    // batchLen because Quantize4Bit only ever runs one vector at a time.
+    // Scratch, deliberately uninitialised. Purely internal: no host mirror.
     __aicore__ static inline uint32_t WorkBufferWords(uint32_t vecLen, uint32_t batchRows)
     {
         return 2u * vecLen * batchRows + vecLen + kBrcbDstLanes + kFp32PerBlock +
@@ -286,19 +190,9 @@ public:
         }
     }
 
-    /*
-     * In-place normalised fast Walsh-Hadamard transform of x[0, len).
-     *
-     * Stages with stride >= 8 are exactly one Add plus one Sub: the butterfly
-     * is expressed with block strides, so a whole stage is a single strided
-     * instruction pair and the halves ping-pong between x and tmp.
-     *
-     * Stages with stride in {1, 2, 4} straddle the 32B block, so those block
-     * strides are not integral.  They become a register shuffle instead:
-     * Gather materialises x[p ^ stride] in one VGATHER and the butterfly
-     * collapses to  out[p] = x[p ^ s] + sign_s[p] * x[p]  -- two more vector
-     * instructions, still with no scalar memory round-trip.
-     */
+    // In-place normalised fast Walsh-Hadamard transform of x[0, len).
+    // Strides 1, 2 and 4 straddle the 32B block and run as a Gather shuffle
+    // rather than a block-strided Add/Sub pair.
     __aicore__ inline void FastWalshHadamardTransform(AscendC::LocalTensor<float> &x,
                                                       AscendC::LocalTensor<float> &tmp, int len)
     {
@@ -332,15 +226,8 @@ public:
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    /*
-     * In-place Pi x = D (H (D x)).
-     *
-     * Pi is a symmetric orthogonal involution, so this single routine is both
-     * the rotation applied to K, V and Q on the way in and the un-rotation
-     * applied to the attention output on the way out.  There is no separate
-     * inverse to keep in step with it, and no basis the kernel can be left in
-     * by accident.
-     */
+    // In-place Pi x = D (H (D x)).  Pi is a symmetric orthogonal involution, so
+    // this is both the rotation and the un-rotation.
     __aicore__ inline void ApplyPi(AscendC::LocalTensor<float> &x, AscendC::LocalTensor<float> &tmp,
                                    const AscendC::LocalTensor<float> &piSigns, int len)
     {
@@ -358,29 +245,11 @@ public:
      *   dstPacked  [len / 2] int8, low nibble = channel 2c, high nibble = 2c+1
      *   src        [len]     fp32, already rotated
      *   scaleOut   [1]       fp32, ||src||_2 / sqrt(len).  Brcb reads a whole
-     *                        32B block, so the caller must back this with 8
-     *                        readable lanes.
+     *                        32B block, so back this with 8 readable lanes.
      *
-     * The scale never reaches a scalar register: ReduceSum leaves the sum of
-     * squares in UB, Sqrt and the sqrt(len) normalisation are applied to that
-     * single lane, Brcb splays it across a 32B block, and the reciprocal is
-     * applied with a zero-stride Mul.
-     *
-     * The bin index is  q = sum_{i=1}^{15} [u > t_i]  over the fifteen decision
-     * boundaries, evaluated without a mask register: for each threshold,
-     *
-     *     d = t_i - u              one Adds against an immediate
-     *     b = uint32(d) >> 31      the fp32 sign bit, 1 exactly when u > t_i
-     *     q += b                   an int32 accumulate
-     *
-     * Three vector instructions per boundary and no scalar round trip.  The
-     * subtraction is written t_i - u rather than u - t_i so that the sign bit
-     * answers the strict `>` the table's boundaries are defined with; a
-     * coordinate sitting exactly on t_i yields +0.0 and rounds down, which is
-     * the same tie-break the host reference takes.
-     *
-     * u is materialised as its own negation, so the Adds above needs no second
-     * operand negation per boundary.
+     * The bin index is q = sum_{i=1}^{15} [u > t_i].  The difference is taken
+     * as t_i - u so its sign bit answers the strict `>` the table's boundaries
+     * are defined with, which is the tie-break the host reference takes.
      */
     __aicore__ inline void Quantize4Bit(const AscendC::LocalTensor<int8_t> &dstPacked,
                                         const AscendC::LocalTensor<float> &src,
@@ -421,11 +290,6 @@ public:
         AscendC::Duplicate(bins, 0, n);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // sum_i [u > t_i], evaluated kBinLanes boundaries at a time.  Each lane
-        // owns its difference buffer, so a lane's Adds never waits on another
-        // lane's Add to release shared scratch, and the only ordering left is
-        // the one the arithmetic actually requires: write the differences, read
-        // their sign bits, reduce.  See kBinLanes for what the serial form cost.
         for (int base = 0; base < kThresholdCount; base += kBinLanes) {
             const int lanes =
                 (kThresholdCount - base) < kBinLanes ? (kThresholdCount - base) : kBinLanes;
@@ -486,20 +350,9 @@ public:
     /*
      * Expand `rows` packed vectors into Lloyd-Max centroids c[q], fp32.
      *
-     * The per-vector `scale` is deliberately not applied here.  Folding it into
-     * the score vector (for K) or into the softmax probabilities (for V) costs
-     * one Mul over `rows` elements instead of one over `rows * len`, and keeps
-     * the hot loop free of per-element scale broadcasts.  That fold survives
-     * the non-uniform table only because scale * c[q] is still linear in the
-     * scale; a codec whose reconstruction were affine in it would not be
-     * expressible this way, and the decode path would need a broadcast per
-     * element.
-     *
-     * The final step is the codec's only data-dependent Gather -- every other
-     * one in this file indexes a host-built constant table -- and it replaces
-     * the uniform grid's single Adds(-7.5) with Muls, Cast and Gather: two
-     * extra full-length vector instructions on the decode critical path, about
-     * +22% on this routine.
+     * The per-vector `scale` is not applied here: the decode path folds it into
+     * the score vector (K) or the softmax probabilities (V), which is valid
+     * because scale * c[q] is linear in the scale.
      */
     __aicore__ inline void Dequantize4Bit(const AscendC::LocalTensor<float> &dst,
                                           const AscendC::LocalTensor<int8_t> &srcPacked, int rows, int len)
@@ -536,11 +389,8 @@ public:
         AscendC::Add(dst, dst, scratch_, n);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // dst[p] = centroid_[q_p].  Gather counts byte offsets from the start
-        // of centroid_ (see kGatherSrcBase), so the index is scaled by the word
-        // size before it is cast.  swap_ and scratch_ are both spent by here --
-        // swap_ held the packed byte per channel, scratch_ the low nibble --
-        // so the offset table needs no buffer of its own.
+        // Gather counts byte offsets from the start of centroid_, so the index
+        // is scaled by the word size before it is cast.
         AscendC::Muls(scratch_, dst, kCentroidStride, n);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::LocalTensor<int32_t> offsets = swap_.ReinterpretCast<int32_t>();
@@ -581,15 +431,8 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    /*
-     * One butterfly stage for stride >= 8, as a single Add/Sub pair.
-     *
-     * Element j of group i lives at i * 2 * stride + j, so a repeat covers
-     * `stride` lanes and advances 2 * stride lanes -- both whole 32B blocks
-     * once stride >= 8.  A stride wider than one repeat (> 64 lanes) falls back
-     * to a short loop of contiguous Add/Sub: still one instruction pair per
-     * group, still entirely in the vector pipe.
-     */
+    // One butterfly stage for stride >= 8, as a single Add/Sub pair.  A stride
+    // wider than one repeat (> 64 lanes) falls back to a short contiguous loop.
     __aicore__ inline void BlockStage(AscendC::LocalTensor<float> &dst, AscendC::LocalTensor<float> &src,
                                       uint32_t stride, uint32_t n)
     {

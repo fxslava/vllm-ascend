@@ -17,50 +17,34 @@
 // Single-shot functional smoke of the Cube-native multi-mode decode on the
 // arch35 camodel.
 //
-// WHAT THIS IS FOR, AND WHAT IT IS NOT FOR. The camodel simulates the DaVinci
-// pipeline cycle by cycle: a launch that is microseconds on silicon is minutes
-// here. So this file runs each mode EXACTLY ONCE, at the smallest shape that
-// still exercises the thing under test, and asserts nothing about time. Every
-// timing number this project quotes comes from bench_device_950pr_turboquant on
-// physical silicon and from nowhere else. Do not add a loop to this file.
+// The camodel simulates the pipeline cycle by cycle, so this file runs each
+// mode EXACTLY ONCE and asserts nothing about time. Every timing this project
+// quotes comes from bench_device_950pr_turboquant on physical silicon. Do not
+// add a loop to this file.
 //
-// THE SHAPE, AND WHY EACH PART OF IT IS WHAT IT IS:
+// THE SHAPE:
 //
 //   head_size 256     the production head dim, and the one the Cube path is
-//                     sized for. Unlike the AIV suite this cannot drop to 64:
-//                     the score GEMM's reduction length is head_size and the
-//                     Cube's K step is 64, so a smaller head would stop
-//                     exercising the multi-step LoadData the real shape uses.
-//   context 16        S = 16, the brief's smoke shape. One partial tile of the
-//                     64-row Cube tile, so the tail masking in the softmax is
-//                     live -- which is the case a full tile would not reach.
+//                     sized for. It cannot drop to 64: the score GEMM's
+//                     reduction length is head_size and the Cube's K step is
+//                     64, so a smaller head would stop exercising the
+//                     multi-step LoadData.
+//   context 16        one partial tile of the 64-row Cube tile, so the tail
+//                     masking in the softmax is live.
 //   block_size 16     one paged block, read through a non-identity block table.
 //   4 heads / 2 kv    a GQA group of two, so the query heads really are batched
-//                     into the GEMM's M dimension and the head -> kv_head map
-//                     is not the identity.
+//                     into the GEMM's M dimension.
 //
-// WHAT IS ASSERTED. Three things, in increasing strength:
+// WHAT IS ASSERTED, in increasing strength:
 //
-//   dispatch    every mode's write and decode launch returns ACL_SUCCESS and
-//               the stream synchronises. On the camodel a pipeline fault -- a
-//               misaligned vector operand, a bad L0 fractal, a cross-core flag
-//               that never fires -- surfaces here as a non-zero status or a
-//               hang, so this is the instruction-level sanity check the brief
-//               asks for, and it is the *only* thing kv3fp4 and kv4fp8 are held
-//               to.
+//   dispatch    every mode's write and decode launch returns ACL_SUCCESS and the
+//               stream synchronises. This is the only thing kv3fp4 and kv4fp8
+//               are held to.
 //   finite      kv5fp8's output is entirely finite and not identically zero.
-//               A decode that silently produced NaN or an all-zero accumulator
-//               would pass a dispatch check and be useless.
-//   fidelity    kv5fp8's output against an fp32 host reference of the same
-//               attention. The bound here is deliberately loose (see kSmokeCos)
-//               and is NOT the cos > 0.995 gate: at S = 16 the softmax is over
-//               sixteen terms, so a single mis-weighted row moves the output far
-//               more than it would at S = 512, and the gate's own measurement
-//               lives in scripts/tq_multimode_calibration.py where it can afford
-//               the seeds. What this bound catches is a decode that is wrong in
-//               kind -- a transposed operand, a dropped scale, a codebook read
-//               through the wrong index -- not one that is wrong in the third
-//               decimal.
+//   fidelity    kv5fp8's output against an fp32 host reference. The bound is
+//               deliberately loose (see kSmokeCos) and is NOT the cos > 0.995
+//               gate, whose measurement lives in
+//               scripts/tq_multimode_calibration.py.
 
 #include <algorithm>
 #include <cmath>
@@ -95,11 +79,10 @@ constexpr int64_t kNumBlocks = 4;
 constexpr float kInvSqrtHeadSize = 0.0625f;  // 1 / sqrt(256), exact in fp32
 constexpr float kAttentionScale = kInvSqrtHeadSize;
 
-// The loose bound described in the file header. 0.90 is roughly four times the
-// distance from 1.0 that the calibration script's S = 512 measurement shows
-// (0.9954), which leaves room for the short-context effect without leaving room
-// for a structurally wrong decode -- a transposed K operand lands near zero
-// cosine, and a dropped per-vector scale near 0.3.
+// The loose bound described in the file header: roughly four times the distance
+// from 1.0 that the calibration script's S = 512 measurement shows, which
+// leaves room for the short-context effect but not for a structurally wrong
+// decode -- a transposed K operand lands near zero cosine.
 constexpr double kSmokeCos = 0.90;
 
 double Cosine(const std::vector<float>& a, const std::vector<float>& b) {
@@ -178,10 +161,9 @@ ModeRun RunMode(tqm::TurboQuantMode mode, const std::vector<float>& key, const s
   DeviceBuffer pi_signs = DeviceBuffer::FromHost(tqh::PiSigns(kHeadSize));
 
   // Two table images. The rotation one is the shipping 4-bit codec's, because
-  // the write and decode kernels both drive Pi through a TurboQuantCodec4; the
-  // mode one is this rate's. The decode's mode image carries the NZ permutation
-  // (nz_rows = kCubeTileRows) so the unpack writes Cube-ready order, and the
-  // write path's does not, because the encoder produces plain row-major codes.
+  // both kernels drive Pi through a TurboQuantCodec4; the mode one is this
+  // rate's. The decode's mode image carries the NZ permutation
+  // (nz_rows = kCubeTileRows); the write path's does not.
   DeviceBuffer rot_tables = DeviceBuffer::FromHost(tqh::CodecTables(kHeadSize, 1));
   DeviceBuffer write_tables = DeviceBuffer::FromHost(tqh::ModeTables(mode, kHeadSize, 1, /*nz_rows=*/0));
   DeviceBuffer decode_tables =
@@ -238,11 +220,9 @@ ModeRun RunMode(tqm::TurboQuantMode mode, const std::vector<float>& key, const s
 
 TEST(TurboQuantMultiMode, SingleShotDispatchAndFidelity) {
   REQUIRE_ASCEND_950PR();
-  // Opt-in, and the reason is a hang rather than a failure: TurboQuantCubeMm::Init
-  // allocates L0A/L0B/L0C on both halves of the MIX kernel, those pools do not
-  // exist on a vector core, and the split kernel stalls on the nonsense address
-  // that produces. A hang in a default ctest run is worse than a red test --
-  // it burns the whole timeout and reports nothing.
+  // Opt-in, and the reason is a hang rather than a failure:
+  // TurboQuantCubeMm::Init allocates L0A/L0B/L0C on both halves of the MIX
+  // kernel, and those pools do not exist on a vector core.
   REQUIRE_CUBE_WIP_OPT_IN("The Cube-native multi-mode decode",
                           "it dispatches and then stalls in the split kernel on pem_lsu "
                           "'unrecognize ldst addr'.");

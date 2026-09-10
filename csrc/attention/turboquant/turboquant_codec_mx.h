@@ -16,26 +16,10 @@
 
 /*
  * The multi-rate TurboQuant codec: encode at 3, 4 or 5 bits, and expand
- * straight onto the Cube's operand grid.
+ * straight onto the Cube's operand grid.  It does not carry the rotation; a
+ * kernel using it owns a TurboQuantCodec4 for ApplyPi.
  *
- * WHAT THIS ADDS OVER TurboQuantCodec<4> IN turboquant_codec_950.h, which it
- * neither replaces nor disturbs:
- *
- *   * the rate is a template parameter, so one routine covers all three modes;
- *   * the expand produces fp8_e4m3fn (or fp4 e2m1) in UB rather than fp32,
- *     because the Cube consumes those types directly and an fp32 intermediate
- *     would be a full-length buffer the GEMM never reads.
- *
- * It does NOT carry the rotation.  Pi = D H D is rate-independent, its
- * implementation is where four separate device defects were once found, and a
- * second copy of it is the last thing this file should contain.  A kernel that
- * uses this codec owns a TurboQuantCodec4 for ApplyPi and rotates one vector at
- * a time through it -- which is all the rotation is ever asked to do, so that
- * instance is Init'd at batchRows = 1 and costs ~21 KB of UB rather than the
- * ~82 KB a tile-sized one would.
- *
- * THE PACKED LAYOUT IS TWO PLANES, NOT A BIT STREAM.  A code is split into a
- * `low` digit of kLowBits and an `msb` digit of kMsbBits, and the two are
+ * A code splits into a `low` digit of kLowBits and an `msb` digit of kMsbBits,
  * stored in separate byte-aligned planes inside the vector slot:
  *
  *   mode     low plane                 msb plane            slot (d=256)
@@ -43,52 +27,22 @@
  *   kv4fp8   4 bits, 2 digits/byte      --                  128 +  0 = 128 B
  *   kv5fp8   4 bits, 2 digits/byte      1 bit, 8/byte       128 + 32 = 160 B
  *
- * Two properties fall out of that, and both are load-bearing.  First, no code
- * ever straddles a byte, so an unpack never reassembles one from two loads and
- * the slot length is exact rather than rounded up -- a 40-bit-per-8-codes bit
- * stream gives the same 160 bytes but needs a cross-byte shift by a per-lane
- * amount, which the vector core cannot express.  Second, kv5fp8's low plane is
- * laid out exactly as kv4fp8's whole slot, so the two share one packer and one
- * unpacker and differ only in whether the msb plane exists.
+ * No code straddles a byte.  kv5fp8's low plane is laid out exactly as
+ * kv4fp8's whole slot, so the two share one packer and one unpacker.
  *
- * DIGIT EXTRACTION IS ONE ROUTINE AT THREE RADICES.  Pulling digit j out of a
- * byte needs a per-lane variable shift, which the vector core does not have.
- * What it does have is a constant indexed by lane, and the digit index within a
- * byte is periodic in the lane with period `digits per byte` -- 2, 4 or 8, all
- * of which divide the 8 fp32 lanes of a 32-byte block.  So
+ * Digit j of a byte is extracted at any radix by
  *
  *     t   = byte * radix^-(p mod digitsPerByte)      one Mul against a block
  *     t   = floor(t)
  *     h   = floor(t / radix)
  *     dig = t - radix * h                            i.e. t mod radix
  *
- * is seven full-length vector instructions per plane at any radix, with no mask
- * register and no scalar round trip.  ExtractDigit below is that.
+ * ExtractDigit below is that.  Every period divides the 8 fp32 lanes of a
+ * 32-byte block, so the reciprocal and weight tables are a single block applied
+ * with src1BlkStride = src1RepStride = 0.
  *
- * THE PERIODIC TABLES COST ONE 32-BYTE BLOCK EACH, NOT A FULL BUFFER.  Because
- * every period divides 8, the reciprocal and weight tables are a single block
- * applied with src1BlkStride = src1RepStride = 0, which makes the operand
- * repeat as block[i % 8] across the whole vector.  That is exactly the addressing
- * TurboQuantCodec4::BroadcastMul already emits; its doc comment describes the
- * all-lanes-equal case it was written for, but the arithmetic it performs is
- * the general dst[i] = src[i] * block[i % 8], which is what is relied on here.
- * Three full-length tables become 24 words.
- *
- * THE CAST TO THE OPERAND GRID IS CONSTRAINED BY THE CONVERTER.  On arch35 the
- * vector converter admits fp32 -> fp8_e4m3fn under CAST_RINT and
- * fp8_e4m3fn -> fp32 under CAST_NONE, so the fp8 modes expand in one Cast.  fp4
- * has no fp32 leg at all -- the only conversions are bf16 <-> fp4x2_e2m1 -- so
- * kv3fp4 goes fp32 -> bf16 -> fp4x2_e2m1.  bf16's 8 mantissa bits carry every
- * e2m1 value exactly, so the detour costs an instruction and no accuracy.  Read
- * the SupportType lists in
- * .../impl/basic_api/dav_3510/kernel_operator_vec_vconv_impl.h before assuming
- * otherwise.
- *
- * THE GATHER AND THE CAST ARE BOTH EXACT.  Every centroid in
- * TurboQuantModeTraits is a grid point of the mode's operand type by
- * construction (the gain search in scripts/tq_multimode_calibration.py is what
- * arranges that), so the codebook error is entirely in the table and none of it
- * in the expand.
+ * The arch35 vector converter has no fp32 <-> fp4 leg -- only
+ * bf16 <-> fp4x2_e2m1 -- so kv3fp4 expands fp32 -> bf16 -> fp4x2_e2m1.
  */
 
 #ifndef VLLM_ASCEND_ATTENTION_TURBOQUANT_CODEC_MX_H
@@ -144,12 +98,8 @@ constexpr int32_t kMsbPerByte = 8;
  *              are built for exactly this many and are not valid for more.
  *              Encode always runs one vector at a time.
  *
- * The constant-table image is this codec's own -- it deliberately does NOT
- * share TurboQuantCodec<4>::ConstTableWords.  Sharing was the obvious thing and
- * is wrong: that image is pinned by five mirrors (the Python builder, the C++
- * host mirror, the CPU reference and two tests), and widening it to carry a
- * 32-entry codebook and the radix tables would move every offset in it.  A
- * separate image leaves the shipping 4-bit cache bit-identical.
+ * The constant-table image is this codec's own and deliberately does not share
+ * TurboQuantCodec<4>::ConstTableWords, which five mirrors pin.
  *
  *   [0 .. B)             lowOffset_   uint32 byte offsets,  B = vecLen*batchRows
  *   [B .. 2B)            msbOffset_   uint32 byte offsets
@@ -160,10 +110,7 @@ constexpr int32_t kMsbPerByte = 8;
  *   [.. + kLevels)       centroid_    the mode's stored codebook
  *
  * msbOffset_ is allocated even for kv4fp8, which has no msb plane, so the
- * layout is one formula rather than a conditional the host mirror would have to
- * reproduce; B words is a cheap price for that.  vecLen is a power of two >= 64
- * and kLevels is 8, 16 or 32, so every section boundary is a whole 32-byte
- * burst and Init moves the image with one DataCopy.
+ * layout is one formula rather than a conditional.
  */
 template <TurboQuantMode MODE>
 class TurboQuantModeCodec {
@@ -281,11 +228,8 @@ public:
      *   scaleOut   [1]                fp32, ||src||_2 / sqrt(len).  Brcb reads a
      *                                 whole 32B block, so back it with 8 lanes.
      *
-     * The scale never reaches a scalar register, exactly as in
-     * TurboQuantCodec<4>::Quantize4Bit.  The codebook gain is NOT applied here:
-     * it lives in the stored centroids and comes back out of the scale on the
-     * decode side, so the bins are the plain Lloyd-Max bins of N(0,1) and a
-     * host reference can check them without knowing the gain.
+     * The codebook gain is not applied here: it lives in the stored centroids
+     * and comes back out of the scale on the decode side.
      */
     __aicore__ inline void Encode(const AscendC::LocalTensor<int8_t> &dstPacked,
                                   const AscendC::LocalTensor<float> &src,
@@ -370,15 +314,8 @@ public:
      *   dst        [rows * OperandElems(len)] of the mode's operand type
      *   srcPacked  [rows * PackedBytes(len)]  int8
      *
-     * The per-vector scale is deliberately not applied: folding it into the
-     * score row (K) or into the softmax probabilities (V) is one Mul over
-     * `rows` instead of one over `rows * len`, and the fold survives a
-     * non-uniform codebook because s * c[q] is still linear in s.  The codebook
-     * gain rides along in that same fold -- the decode path multiplies by
-     * s / gain -- so it costs nothing here either.
-     *
-     * unpack_tq5_to_fp8() below is this routine at MODE = KV5_FP8, under the
-     * name the pipeline uses.
+     * The per-vector scale is not applied: the decode path folds it, and the
+     * codebook gain, into the score row (K) or the softmax probabilities (V).
      */
     template <typename OperandT>
     __aicore__ inline void Unpack(const AscendC::LocalTensor<OperandT> &dst,
@@ -429,14 +366,8 @@ public:
         CastToOperand(dst, low_, n);
     }
 
-    /*
-     * fp32 -> the mode's Cube operand type.
-     *
-     * Both branches are exact: every centroid is a grid point of the target
-     * type, so CAST_RINT never actually rounds.  The fp4 branch is two casts
-     * because the arch35 converter has no fp32 <-> fp4 leg -- only
-     * bf16 <-> fp4x2_e2m1 -- and bf16 carries every e2m1 value losslessly.
-     */
+    // fp32 -> the mode's Cube operand type.  Both branches are exact.  The fp4
+    // branch is two casts: the arch35 converter has no fp32 <-> fp4 leg.
     template <typename OperandT>
     __aicore__ inline void CastToOperand(const AscendC::LocalTensor<OperandT> &dst,
                                          const AscendC::LocalTensor<float> &src, uint32_t n)
@@ -477,12 +408,8 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    /*
-     * x[p] <- (x[p] / radix^(p mod digitsPerByte)) mod radix.
-     *
-     * Seven instructions, independent of the radix.  The only per-lane quantity
-     * is `recip`, a single 32-byte block whose period divides 8.
-     */
+    // x[p] <- (x[p] / radix^(p mod digitsPerByte)) mod radix.  The only per-lane
+    // quantity is `recip`, a single 32-byte block whose period divides 8.
     __aicore__ inline void ExtractDigit(const AscendC::LocalTensor<float> &x,
                                         const AscendC::LocalTensor<float> &recip, int32_t radix, uint32_t n)
     {
@@ -502,15 +429,9 @@ private:
      *
      *   byte[b] = sum_j digit[b * dpb + j] * radix^j
      *
-     * A run of 2 or 4 lanes is shorter than a 32-byte block, so WholeReduceSum
-     * cannot express its repeat stride and the fold is `dpb` Gathers instead --
-     * exactly the deinterleave TurboQuantCodec<4>::Quantize4Bit does at dpb=2.
      * packOffset_ holds the dpb offset tables end to end, each of len/dpb
-     * entries, which is why it is `len` words for every mode.
-     *
-     * The result is biased by -128 into int8, matching the shipping 4-bit
-     * packer, so a kv5fp8 low plane and a kv4fp8 slot have the same bit pattern
-     * for the same low nibbles.
+     * entries, which is why it is `len` words for every mode.  The result is
+     * biased by -128 into int8, matching the shipping 4-bit packer.
      */
     __aicore__ inline void PackLowPlane(const AscendC::LocalTensor<int8_t> &dst,
                                         const AscendC::LocalTensor<float> &digits, uint32_t n)
@@ -533,14 +454,8 @@ private:
         EmitBytes(dst, bytes);
     }
 
-    /*
-     * Fold eight 1-bit digits into one byte.
-     *
-     * Eight lanes is exactly one 32-byte block, so this one *is* expressible as
-     * a weighted WholeReduceSum: one Mul against msbWeight_ (2^(p mod 8)) and
-     * one reduction whose repeat advances a single block.  Two instructions
-     * against the eight Gathers the low-plane form would need.
-     */
+    // Fold eight 1-bit digits into one byte.  Eight lanes is exactly one 32-byte
+    // block, so this is one Mul against msbWeight_ plus one WholeReduceSum.
     __aicore__ inline void PackMsbPlane(const AscendC::LocalTensor<int8_t> &dst,
                                         const AscendC::LocalTensor<float> &digits, uint32_t n)
     {
@@ -593,14 +508,9 @@ using TurboQuantCodecKv3Fp4 = TurboQuantModeCodec<TurboQuantMode::KV3_FP4>;
 using TurboQuantCodecKv4Fp8 = TurboQuantModeCodec<TurboQuantMode::KV4_FP8>;
 using TurboQuantCodecKv5Fp8 = TurboQuantModeCodec<TurboQuantMode::KV5_FP8>;
 
-/*
- * The named entry point of the kv5fp8 dequantization stage: packed 5-bit
- * indices in `srcPacked` -> fp8_e4m3fn in `dst`, both in local UB memory.
- *
- * A thin name over TurboQuantModeCodec<KV5_FP8>::Unpack rather than a second
- * implementation, so there is exactly one place the 5-bit layout is decoded and
- * the test that pins it pins the code the decode kernel actually runs.
- */
+// The named entry point of the kv5fp8 dequantization stage: packed 5-bit
+// indices in `srcPacked` -> fp8_e4m3fn in `dst`, both in local UB memory.
+// A thin name over TurboQuantModeCodec<KV5_FP8>::Unpack.
 __aicore__ inline void unpack_tq5_to_fp8(TurboQuantCodecKv5Fp8 &codec,
                                          const AscendC::LocalTensor<fp8_e4m3fn_t> &dst,
                                          const AscendC::LocalTensor<int8_t> &srcPacked, int rows, int len)

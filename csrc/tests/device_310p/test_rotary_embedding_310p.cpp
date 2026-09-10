@@ -18,13 +18,11 @@
 //
 // Mirrors vllm_ascend/_310p/ops/rotary_embedding.py :: _rope_forward_oot, which
 // reshapes query and key to BSND [1, num_tokens, num_heads, head_dim] and calls
-// torch_npu.npu_apply_rotary_pos_emb in place with cos/sin already widened to
-// the full rotary dim.
+// torch_npu.npu_apply_rotary_pos_emb in place with cos/sin already widened.
 //
 // Both rotary layouts are covered:
 //   rotary_mode "half"       - neox style, pairs i with i + rotary_dim/2
 //   rotary_mode "interleave" - GPT-J style, pairs 2k with 2k + 1
-// The plugin picks between them with `"half" if is_neox_style else "interleave"`.
 
 #include <gtest/gtest.h>
 

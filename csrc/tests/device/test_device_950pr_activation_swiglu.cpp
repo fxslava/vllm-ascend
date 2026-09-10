@@ -16,23 +16,16 @@
 
 // SwiGLU / SiluAndMul on Ascend 950PR, fp16 in / fp16 out.
 //
-// Stage 8 of the Qwen3.5 decoder layer. The operator splits the last axis in
-// half and returns silu(first) * second, so out.shape[-1] is half the input's:
+// Stage 8 of the Qwen3.5 decoder layer: the operator splits the last axis in
+// half and returns silu(first) * second, with silu(v) = v * sigmoid(v), so
+// out.shape[-1] is half the input's.
 //
-//   silu(v) = v * sigmoid(v)
+// The operator is the stock aclnnSwiGlu; the 950PR custom SwiGLU variants are
+// all quantised or grouped MoE forms.
 //
-// The operator is the stock aclnnSwiGlu. The 950PR custom kernel set has three
-// SwiGLU variants (dequant_swiglu_quant, swiglu_group_quant,
-// grouped_matmul_swiglu_quant) and every one of them is a quantised or grouped
-// MoE form: they take scales and group offsets, and none produces a plain fp16
-// activation. The dense fp16 MLP this layer has is the stock operator's case.
-//
-// One 310P rule that is deliberately NOT carried over: AscendSiluAndMul310
-// gates on x.shape[-1] % 32 == 0 and falls back to eager torch otherwise. That
-// is a v200 vector-unit constraint in vllm_ascend/_310p/ops/activation.py; the
-// generic path has no such gate, so this file does not assert one. What it does
-// assert is the 16-element fp16 burst alignment, which is a property of the MTE
-// pipe and holds on both parts.
+// AscendSiluAndMul310's x.shape[-1] % 32 == 0 gate is a v200 constraint and is
+// deliberately not carried over. What is asserted is the 16-element fp16 burst
+// alignment, which holds on both parts.
 //
 // Seeds, shapes and tolerances match
 // csrc/tests/kernels/cuda/test_activation_swiglu.cpp.

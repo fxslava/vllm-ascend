@@ -15,57 +15,36 @@
  */
 
 // Microbenchmark harness, shared by the 310P leg and by the 950PR device tier.
-// Shares the device, tensor and operator plumbing with the tests; the only
-// thing that differs is what happens around the launch.
 //
-// Nothing here is reachable from the host or sim tiers, and that is a rule
-// rather than an accident: the host tier links no CANN runtime, and a
-// cycle-level simulator's wall clock is not a measurement of the part. Every
-// timing this project quotes comes from a device-tier binary.
+// Nothing here is reachable from the host or sim tiers: the host tier links no
+// CANN runtime, and a cycle-level simulator's wall clock is not a measurement
+// of the part.
 //
-// What the timed region contains, and what it deliberately does not:
+// What the timed region contains, and what it does not:
 //
-//   * No allocation. Every device buffer, every aclTensor descriptor and the
-//     operator workspace are created in the setup phase. DeviceBuffer is asked
-//     for kBenchmarkAlignBytes (512) rather than the 32-byte test default so a
-//     measurement is never charged for a buffer that starts mid-line.
-//   * No host synchronisation, except in kHostWallClock, which exists precisely
-//     to measure host-visible single-iteration latency.
+//   * No allocation. Every device buffer, aclTensor descriptor and operator
+//     workspace is created in the setup phase, at kBenchmarkAlignBytes (512)
+//     rather than the 32-byte test default.
+//   * No host synchronisation, except in kHostWallClock.
 //   * No operator planning, when the CANN build exports
-//     aclSetAclOpExecutorRepeatable. See PlannedOp: the plan is done once in
-//     setup and the timed loop calls only the launch entry point. When the
-//     symbol is absent the fallback re-plans inside the loop, which is what
-//     torch_npu does per call, and every result is labelled with which path ran
-//     so the two are never compared as if they measured the same thing.
+//     aclSetAclOpExecutorRepeatable. When the symbol is absent the fallback
+//     re-plans inside the loop and every result is labelled with which path ran.
 //
 // Three timing modes, all reported:
 //
 //   pipelined  - one event pair around a batch of `pipeline_batch` launches,
-//                divided by the batch size. Nothing serialises the launches, so
-//                this is the throughput number and the one TFLOP/s and GB/s are
-//                derived from.
-//   device     - one event pair around each launch, all recorded back to back
-//                with a single stream synchronisation afterwards. Pure device
-//                time per iteration, including the in-stream event overhead.
-//   host       - std::chrono around launch + aclrtSynchronizeStream. The
-//                host-visible latency of one call, which is what a decode step
-//                actually pays.
+//                divided by the batch size. TFLOP/s and GB/s derive from this.
+//   device     - one event pair around each launch, recorded back to back with
+//                a single stream synchronisation afterwards.
+//   host       - std::chrono around launch + aclrtSynchronizeStream.
 //
 // A run reports min / median / mean / P95 / P99 over `timed_iterations`
 // samples. Percentiles are nearest-rank, so at the default of 100 iterations
-// P99 is the second-largest sample and is dominated by whatever the OS did that
-// millisecond; read it as a tail indicator, not as a number to tune against.
+// P99 is the second-largest sample; read it as a tail indicator.
 //
-// Every figure is a double from end to end. The device modes get theirs from
-// aclrtEventElapsedTime, which reports milliseconds as a float and has three
-// ways of handing back something that is not a duration at all: an event the
-// device has not finished with, an event created without a timestamp, and a
-// wrapped device counter. Any of those produce a negative or non-finite value,
-// and one of them in a sample set drags the mean under zero and turns the
-// derived TFLOP/s and GB/s into nonsense. So a sample is validated before it is
-// aggregated, a rejected one is counted and reported rather than silently
-// replaced, and a mode whose samples are all rejected fails its case instead of
-// printing zeros that look like measurements.
+// Every figure is a double from end to end. A sample is validated before it is
+// aggregated, a rejected one is counted and reported, and a mode whose samples
+// are all rejected fails its case rather than printing zeros.
 
 #pragma once
 
@@ -98,12 +77,9 @@ const char* TimingModeLabel(TimingMode mode);
 
 struct BenchmarkOptions {
   // Enough to have the runtime compile and cache the kernel, settle the AI Core
-  // clock and touch every page of the workspace at least once.
-  //
-  // A case that defines a checksum always gets at least one warmup launch even
-  // at 0, because the reference checksum is read immediately afterwards and a
-  // baseline taken over the allocation's zero fill would fail the case at the
-  // end of the timed loop. See BenchmarkRunner::WarmUp.
+  // clock and touch every page of the workspace. A case that defines a checksum
+  // always gets at least one warmup launch even at 0; see
+  // BenchmarkRunner::WarmUp.
   int warmup_iterations = 20;
   int timed_iterations = 100;
   // Launches per event pair in kPipelined. Large enough that the event pair
@@ -154,11 +130,9 @@ struct LatencyStatistics {
   double stddev_us = 0.0;
 
   // Takes the samples by value, drops the ones that are not a usable duration
-  // into discarded_count, and sorts the rest in place. Everything is
-  // accumulated in double; there is no narrowing anywhere on this path.
-  //
-  // sample_count == 0 on return means nothing usable was measured. Callers must
-  // treat that as a failure rather than as a row of zeros: see BenchmarkRunner.
+  // into discarded_count, and sorts the rest in place. sample_count == 0 on
+  // return means nothing usable was measured, and callers must treat that as a
+  // failure rather than as a row of zeros.
   static LatencyStatistics From(std::vector<double> samples_us);
 };
 
@@ -175,13 +149,10 @@ const char* EventTimingSourceLabel();
 // already happened, so Launch() is as close to just the kernel as the runtime
 // allows.
 //
-// aclnn is a two-phase API: GetWorkspaceSize builds an aclOpExecutor and the
-// launch entry point consumes it. aclSetAclOpExecutorRepeatable, where the CANN
-// build exports it, opts out of that consumption so one executor can be
-// launched repeatedly; the executor then has to be destroyed by hand with
-// aclDestroyAclOpExecutor. Both symbols are resolved with dlsym for the same
-// reason the operators themselves are (see aclnn_runtime.hpp), and their
-// absence degrades to re-planning rather than to a failure.
+// aclnn is a two-phase API and the launch entry point normally consumes the
+// aclOpExecutor. aclSetAclOpExecutorRepeatable, where the CANN build exports
+// it, opts out of that; the executor then has to be destroyed by hand. Both
+// symbols are resolved with dlsym and their absence degrades to re-planning.
 class PlannedOp {
  public:
   // Calls the operator's GetWorkspaceSize with the captured arguments.
@@ -225,10 +196,7 @@ class PlannedOp {
 // Plans `op` with the given arguments, which are everything up to but not
 // including the trailing workspaceSize and executor out-parameters, exactly as
 // RunAclnn takes them. WorkspaceSizeFn is the hand-declared function-pointer
-// type from aclnn_ops.hpp.
-//
-// The arguments are captured by value: they are pointers into buffers the
-// caller keeps alive for the whole benchmark, plus scalars.
+// type from aclnn_ops.hpp. The arguments are captured by value.
 template <typename WorkspaceSizeFn, typename... Args>
 PlannedOp PlanAclnn(const AclnnOp& op, Args... args) {
   if (!op.available()) {
@@ -261,27 +229,20 @@ struct BenchmarkCase {
   std::function<void(aclrtStream)> launch;
 
   // Tasks `launch` submits to the stream. One for a single operator; the
-  // TurboQuant decode enqueues two, because flash-decoding's split and combine
-  // stages cannot share a launch - see
-  // csrc/attention/turboquant/turboquant_kernels.cpp. The timing loops use this
-  // to decide when the stream is close to full, and a case that undercounts it
-  // overruns the queue and starts measuring the runtime's back-pressure rather
-  // than the kernel.
+  // TurboQuant decode enqueues two. The timing loops use this to decide when
+  // the stream is close to full, and a case that undercounts it starts
+  // measuring the runtime's back-pressure rather than the kernel.
   int tasks_per_launch = 1;
 
   // Optional. Reads the output back and reduces it to one number. Called once
   // after warmup and once after the last timed iteration; a change between the
-  // two, or a non-finite value, fails the case. This is what stops a benchmark
-  // from happily timing an operator that stopped writing its output - the
-  // classic failure of a repeatable-executor path.
+  // two, or a non-finite value, fails the case.
   std::function<double()> checksum;
 
   // Relative tolerance for the two checksums. Zero, the default, demands they
-  // be bit-identical, which is the right bar for an operator that recomputes
-  // the same output from the same inputs every launch. An in-place operator
-  // such as rotary embedding consumes its own previous output, so its invariant
-  // (the sum of squares, which a rotation preserves) drifts by the fp16
-  // rounding of every launch and needs room.
+  // be bit-identical. An in-place operator such as rotary embedding consumes
+  // its own previous output, so its invariant drifts by the fp16 rounding of
+  // every launch and needs room.
   double checksum_rtol = 0.0;
 };
 
@@ -351,10 +312,7 @@ class BenchmarkRunner {
 
   // Drains the stream when the `about_to_enqueue` tasks the caller is next
   // going to submit would take it past what one stream should hold, and resets
-  // the count. Called only at sample boundaries, never inside a batch, so no
-  // sample is ever split by a synchronisation. Taking the pending count rather
-  // than only the running one is what keeps a large ASCEND_BENCH_BATCH from
-  // overrunning the queue in a single sample.
+  // the count. Called only at sample boundaries, never inside a batch.
   void DrainIfQueueIsDeep(int* enqueued, int about_to_enqueue);
 
   // Run() wraps this so that a failure drains the stream before unwinding.
@@ -381,16 +339,11 @@ class BenchmarkRunner {
 // ---------------------------------------------------------------------------
 
 // The part a suite's numbers mean anything on. RunBenchmarkSuite reads
-// aclrtGetSocName and skips the whole suite on anything else, so a 950PR
-// benchmark started on a 310P host reports a skip rather than a table of
-// numbers measured on hardware it was not written for.
+// aclrtGetSocName and skips the whole suite on anything else.
 //
-// An empty SoC name - a CANN build that does not export aclrtGetSocName - is
-// accepted for kAscend310P and refused for kAscend950PR. That asymmetry is
-// deliberate and is the same one AscendTestEnvironment::is_310p() and
-// is_950pr() carry: the 310P leg predates any second part and refusing would
-// have made it skip everything, while a 950PR suite that cannot tell which part
-// it is on has to assume it is on the other one.
+// An empty SoC name -- a CANN build that does not export aclrtGetSocName -- is
+// accepted for kAscend310P and refused for kAscend950PR, the same asymmetry
+// AscendTestEnvironment::is_310p() and is_950pr() carry.
 enum class BenchmarkTargetPart {
   kAscend310P,
   kAscend950PR,

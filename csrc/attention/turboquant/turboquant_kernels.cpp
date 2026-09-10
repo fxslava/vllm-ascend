@@ -25,36 +25,16 @@
  *   query / output   [num_tokens, num_heads, head_size]                      fp16 | bf16
  *
  * where scale_slot = round_up(2 * num_kv_heads, 8).  One token's K scales for
- * every kv head are followed by its V scales, and the slot is padded to a whole
- * 32-byte burst.  That geometry is what makes every DMA in this file aligned:
- *
- *   - a token's packed bytes for all kv heads are contiguous and
- *     num_kv_heads * (head_size / 2) is a multiple of 32, so the scatter is one
- *     aligned DataCopy rather than one DataCopyPad per head;
- *   - a token's whole scale slot is one aligned DataCopy of scale_slot floats,
- *     replacing the 2 * num_kv_heads four-byte writes the previous layout did.
- *     Those sub-line writes were both a DMA-transaction disaster and a hazard,
- *     since two cores could land in the same 32-byte line of the scale plane.
- *
+ * every kv head are followed by its V scales, padded to a whole 32-byte burst.
  * Nothing here uses DataCopyPad: every global address touched is 32-byte
- * aligned and every transfer length is a multiple of 32 bytes.  The cost is the
- * padding in scale_slot, which is 25% on top of the payload at num_kv_heads = 2
- * and 12.5% from num_kv_heads = 4 upward.
+ * aligned and every transfer length is a multiple of 32 bytes.
  *
- * Rotation is purely an activation-time transform.  Model weights are never
- * touched: K, V and Q arrive exactly as the projections and RoPE produced them,
- * the kernels apply Pi = D H D in UB, and the decode path applies the same Pi
- * once more to the accumulated output.  Because Pi is a symmetric involution
- * that single routine covers both directions, and RoPE stays correct because it
- * has already been applied by the time anything is rotated.
+ * Rotation is an activation-time transform only; no model weight is rewritten.
  *
- * The decode path is two kernels, not one.  Flash-decoding needs every split of
- * a (token, head) to be finished before the reduction reads them, and there is
- * no in-kernel barrier that reliably provides that across an arbitrary grid --
- * SyncAll only helps when every block is co-resident, which the host does not
- * guarantee, and a grid that exceeds the physical core count deadlocks on it.
- * The split and the combine are therefore separate launches ordered by the NPU
- * stream, which is the only ordering guarantee that always holds.
+ * The decode path is two kernels: flash-decoding needs every split of a
+ * (token, head) finished before the reduction reads them, and SyncAll only
+ * orders co-resident blocks.  The split and the combine are therefore separate
+ * launches ordered by the NPU stream.
  */
 
 #include "kernel_operator.h"
@@ -79,18 +59,11 @@ constexpr uint32_t kTileRows = 16;
 constexpr float kNegInf = -1.0e30f;
 // fp32 words of workspace per (token, head, split) partial: the accumulator,
 // then one 32B block holding the running max and a second holding the running
-// sum.
-//
-// Two blocks, not one. The max and the sum are single values and would fit in
-// lanes 0 and 1 of a single block, but every vector instruction's operand base
-// must be 32-byte aligned, and a LocalTensor view at lane 1 is not - the part
-// raises vec_err_instr_misalign and the online softmax then reduces whatever
-// the misaligned load returned. The second block costs 32 bytes per partial and
-// makes every operand aligned by construction.
+// sum.  Two blocks, because every vector operand base must be 32-byte aligned
+// and a LocalTensor view at lane 1 is not.
 //
 // Mirrored by turboquant_adpt::kPartialTail in turboquant_torch_adpt.h and by
-// turboquant_host::kPartialTail in csrc/tests/common/turboquant_launch.hpp,
-// both of which size the workspace the host allocates.
+// turboquant_host::kPartialTail in csrc/tests/common/turboquant_launch.hpp.
 constexpr uint32_t kPartialTail = 2u * kFp32PerBlock;
 // Lane offsets within that tail.
 constexpr uint32_t kPartialMaxLane = 0;
@@ -149,14 +122,10 @@ __aicore__ inline void BroadcastScalar(const AscendC::LocalTensor<float> &dst, c
  * npu_turboquant_reshape_and_cache
  *
  * One AIV core owns a contiguous run of tokens and processes a whole token --
- * every kv head, key and value -- per pipeline stage, which is what lets the
- * scatter be three aligned DataCopy bursts instead of a per-head trickle.
- *
- * The loop is a three-stage software pipeline.  Issuing CopyIn(i + 1) before
- * Compute(i) is the whole point: DeQue inside Compute waits on the MTE2 flag,
- * so a CopyIn issued after it can never overlap with the vector work, and the
- * depth-2 queues were doing nothing. In steady state MTE2 for token i + 1, VEC
- * for token i and MTE3 for token i - 1 are all in flight.
+ * every kv head, key and value -- per pipeline stage, so the scatter is three
+ * aligned DataCopy bursts.  The loop is a three-stage software pipeline:
+ * CopyIn(i + 1) is issued before Compute(i), because DeQue inside Compute waits
+ * on the MTE2 flag.
  */
 template <typename scalar_t>
 class TurboQuantReshapeAndCache {
@@ -358,11 +327,9 @@ private:
 /*
  * npu_turboquant_paged_attention, stage one.
  *
- * The sequence blocks of every (token, head) are split across AIV cores, so a
- * batch of one still fills the device.  Each core runs an online softmax over
- * its slice, dequantising K and V on the fly in UB behind a double-buffered
- * VECIN queue, and writes an un-normalised (max, sum, accumulator) triple to
- * the workspace.  Nothing is reduced here: the reduction is a separate launch.
+ * The sequence blocks of every (token, head) are split across AIV cores.  Each
+ * core runs an online softmax over its slice, dequantising K and V on the fly,
+ * and writes an un-normalised (max, sum, accumulator) triple to the workspace.
  */
 template <typename scalar_t>
 class TurboQuantPagedAttentionSplit {
@@ -749,9 +716,8 @@ private:
 /*
  * npu_turboquant_paged_attention, stage two.
  *
- * A separate launch, so the stream guarantees every partial is committed before
- * any of it is read. Merges the per-split (max, sum, accumulator) triples,
- * normalises, and applies Pi once to take the result out of the rotated basis.
+ * Merges the per-split (max, sum, accumulator) triples, normalises, and applies
+ * Pi once to take the result out of the rotated basis.
  */
 template <typename scalar_t>
 class TurboQuantPagedAttentionCombine {
@@ -840,20 +806,10 @@ private:
 
         for (uint32_t split = 0; split < numSplits_; ++split) {
             const uint64_t offset = PartialOffset(token, head, split);
-            // Write-after-read, and it has to be an all-pipe barrier.
-            //
-            // partAcc and partState are plain TBuf views rather than queue
-            // tensors, so nothing else orders this iteration's MTE2 fill of them
-            // against the previous iteration's vector reads. The PipeBarrier<V>
-            // pairs inside the loop body order the vector pipe against itself
-            // and say nothing about MTE2, so without this the copy for split
-            // i + 1 can land while the reduction for split i is still reading -
-            // and only ever on a part whose DMA runs far enough ahead, which is
-            // why this reduced correctly on arch32 and produced a plausible but
-            // wrong answer on arch35.
-            //
-            // Only reachable with numSplits > 1; a single-split decode has one
-            // iteration and no previous reader.
+            // Write-after-read, and it has to be an all-pipe barrier: partAcc
+            // and partState are plain TBuf views, so nothing else orders this
+            // iteration's MTE2 fill against the previous iteration's vector
+            // reads.  Only reachable with numSplits > 1.
             AscendC::PipeBarrier<PIPE_ALL>();
             AscendC::DataCopy(partAcc, workspaceGm_[offset], headSize_);
             AscendC::DataCopy(partState, workspaceGm_[offset + headSize_], kPartialTail);
@@ -933,22 +889,12 @@ private:
 }  // namespace
 
 /*
- * Kernel entry points take GM_ADDR, not `__gm__ void *`.
- *
- * The CANN kernel-launch code generator parses these signatures out of the
- * preprocessed object and only recognises a parameter as global memory when the
- * declaration begins with the cce_global attribute that GM_ADDR carries.  A
- * `__gm__ void *` parameter falls through that check, is misclassified as a
- * tiling struct, and the generated launcher calls the kernel with the argument
- * dereferenced -- which fails to compile with "no matching function for call to
- * <kernel>_origin" long after the kernel itself has built cleanly.  It is not a
- * style preference: on CANN 9.1.0 (arch35 / Ascend 950PR) the library does not
- * link without it.
- *
- * Nothing on the host side changes.  The generated aclrtlaunch_* wrapper still
- * declares these parameters as `void *`, so the <<<>>> call sites below keep
- * passing plain `void *`, and GM_ADDR converts to the `__gm__ void *` the Init()
- * methods take.
+ * Kernel entry points take GM_ADDR, not `__gm__ void *`.  The CANN kernel-launch
+ * code generator only recognises a parameter as global memory when the
+ * declaration carries the cce_global attribute GM_ADDR expands to; a
+ * `__gm__ void *` parameter is misclassified as a tiling struct and the
+ * generated launcher fails to compile.  Nothing on the host side changes: the
+ * generated aclrtlaunch_* wrapper still declares these parameters as `void *`.
  */
 #define TURBOQUANT_RESHAPE_AND_CACHE_DECLARE(TYPE)                                                                   \
     extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_##TYPE(                                       \
@@ -1019,11 +965,9 @@ void turboquant_reshape_and_cache_impl(AscendType type, void *stream, uint32_t b
     }
 }
 
-/*
- * Two launches on one stream. The split kernel must be globally complete before
- * the combine kernel reads the workspace, and stream order is the only barrier
- * that holds for an arbitrary grid.
- */
+// Two launches on one stream.  The split kernel must be globally complete
+// before the combine kernel reads the workspace, and stream order is the only
+// barrier that holds for an arbitrary grid.
 void turboquant_paged_attention_impl(AscendType type, void *stream, uint32_t splitBlockDim, uint32_t combineBlockDim,
                                      void *query, void *keyCache, void *valueCache, void *scaleCache,
                                      void *blockTables, void *contextLens, void *piSigns, void *tables,
@@ -1057,13 +1001,9 @@ void turboquant_paged_attention_impl(AscendType type, void *stream, uint32_t spl
 /*
  * The combine stage on its own.
  *
- * turboquant_paged_attention_impl above launches split-then-combine as a pair,
- * which is what the 4-bit AIV path wants.  The Cube path in
- * turboquant_mm_kernels.cpp launches its own split and then needs *this*
- * reduction, unchanged: the partials it writes are in exactly this layout, and
- * the reduction is rate-independent because it reads nothing but the workspace
- * and the rotation tables.  Exposing it separately is what lets there be one
- * combine rather than two.
+ * The Cube path in turboquant_mm_kernels.cpp writes partials in exactly this
+ * layout and needs this reduction unchanged -- it is rate-independent, reading
+ * nothing but the workspace and the rotation tables.
  */
 void turboquant_paged_attention_combine_impl(AscendType type, void *stream, uint32_t blockDim, void *workspace,
                                              void *piSigns, void *tables, void *output, uint32_t numTokens,

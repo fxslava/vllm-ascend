@@ -76,10 +76,8 @@ bool ReadHalfFile(const std::string& path, size_t expected_elements, std::vector
   const std::streamsize expected_bytes = static_cast<std::streamsize>(expected_elements * sizeof(uint16_t));
   if (size_bytes != expected_bytes) {
     // An unfetched LFS pointer is a ~130 byte text file whose first line is
-    // "version https://git-lfs.github.com/spec/v1". Recognising it turns the
-    // most common failure - a clone that never ran `git lfs pull` - into a skip
-    // that names the fix, rather than into a size mismatch the reader has to
-    // decode.
+    // "version https://git-lfs.github.com/spec/v1". Recognising it turns a
+    // clone that never ran `git lfs pull` into a skip that names the fix.
     char head[8] = {0};
     file.read(head, static_cast<std::streamsize>(sizeof(head) - 1));
     if (file.gcount() >= 7 && std::string(head) == "version") {

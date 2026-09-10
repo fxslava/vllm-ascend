@@ -16,40 +16,18 @@
 
 // Signatures of the CANN aclnn operators exercised by this suite.
 //
-// This is the single version-sensitive file in the subproject. Every prototype
-// below is declared by hand because the suite resolves operators with dlsym
-// (see aclnn_runtime.hpp) and therefore gets no compiler check on the argument
-// list.
+// Version-sensitive: the suite resolves operators with dlsym (see
+// aclnn_runtime.hpp), so the compiler checks none of these argument lists.
+// Every prototype marked VERIFIED was read out of the CANN 9.1.0 headers named
+// beside it. A mismatch produces a non-zero status from the planning call, with
+// aclGetRecentErrMsg attached by RunAclnn.
 //
-// Every prototype marked VERIFIED was read out of the CANN 9.1.0 headers in
-// swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-310p-ubuntu22.04-py3.10.
-// To re-verify on another toolkit:
-//
-//   INC=$ASCEND_HOME_PATH/include/aclnnop
-//   grep -rA4 'aclnnMatmulGetWorkspaceSize('               $INC/aclnn_matmul.h
-//   grep -rA8 'aclnnRmsNormGetWorkspaceSize('              $INC/aclnn_rms_norm.h
-//   grep -rA8 'aclnnSwiGluGetWorkspaceSize('               $INC/level2/aclnn_swi_glu.h
-//   grep -rA6 'aclnnApplyRotaryPosEmbV2GetWorkspaceSize('  $INC/aclnn_apply_rotary_pos_emb_v2.h
-//   grep -rA16 'aclnnScatterPaKvCacheGetWorkspaceSize('    $INC/level2/aclnn_scatter_pa_kv_cache.h
-//   grep -rA10 'aclnnIncreFlashAttentionV4GetWorkspaceSize(' $INC/aclnn_incre_flash_attention_v4.h
-//
-// To confirm which library exports a symbol at all:
-//
-//   nm -D --defined-only $ASCEND_HOME_PATH/lib64/libopapi.so | grep -o 'aclnn[A-Za-z0-9_]*'
-//
-// Three operators the plugin uses are NOT aclnn at all on CANN 9.1.0 and are
-// documented as such below: PagedAttention and ReshapeAndCache are ATB
-// operators in /usr/local/Ascend/nnal/atb/.../libatb.so, and RotaryMul is a GE
-// graph op. They are declared here only so the inventory reports their absence
-// and the test skip messages stay accurate.
-//
-// A prototype that does not match produces a non-zero status from the planning
-// call, and RunAclnn attaches aclGetRecentErrMsg to the failure, so a mismatch
-// is reported rather than silently miscomputed.
+// Three operators the plugin uses are not aclnn at all on CANN 9.1.0 and are
+// declared here only so the inventory reports their absence: PagedAttention and
+// ReshapeAndCache are ATB operators, RotaryMul is a GE graph op.
 //
 // The "mirrors" line on each operator records the torch_npu entry point and the
-// vllm-ascend call site the test is standing in for, so the C++ coverage can be
-// traced back to the Python path it replaces.
+// vllm-ascend call site the test stands in for.
 
 #pragma once
 
@@ -175,20 +153,9 @@ inline const char* kRotaryMul = "aclnnRotaryMul";
 // ---------------------------------------------------------------------------
 // KV cache write
 // ---------------------------------------------------------------------------
-// NOT AVAILABLE as aclnn on CANN 9.1.0.
-//
-// torch_npu._npu_reshape_and_cache (which Ascend310PDeviceAdaptor.reshape_and_cache
-// calls) is an ATB operator, not an aclnn one. A full-depth nm -D sweep of
-// /usr/local/Ascend found it only as C++ symbols in
-//   /usr/local/Ascend/nnal/atb/9.1.0/atb/cxx_abi_{0,1}/lib/libatb.so
-//     atb::ReshapeAndCacheOperation
-//     atb::CreateOperation<atb::infer::ReshapeAndCacheParam>
-// plus kernel-side tiling in libatb_mixops.so (ReshapeAndCacheTilingNd /
-// ReshapeAndCacheTilingNz) and infershape stubs in libopsproto.so.
-//
-// ATB is a C++ object API (Operation + VariantPack + Context), not the aclnn
-// two-phase C API, so it cannot be driven through RunAclnn. Reaching it would
-// mean linking libatb.so and writing a second execution path.
+// NOT AVAILABLE as aclnn on CANN 9.1.0. torch_npu._npu_reshape_and_cache is an
+// ATB operator (atb::ReshapeAndCacheOperation in libatb.so), a C++ object API
+// that RunAclnn's two-phase aclnn path cannot drive.
 //
 // Kept so the inventory reports it and the test skip message stays accurate.
 inline const char* kReshapeAndCache = "aclnnReshapeAndCache";
@@ -229,20 +196,10 @@ inline const char* kScatterCacheModeNorm = "Norm";
 // ---------------------------------------------------------------------------
 // Paged attention (decode)
 // ---------------------------------------------------------------------------
-// NOT AVAILABLE as aclnn on CANN 9.1.0.
-//
-// torch_npu._npu_paged_attention (AscendAttentionBackendImpl310.forward_paged_attention)
-// is an ATB operator. A full-depth nm -D sweep of /usr/local/Ascend found it
-// only as C++ symbols in
-//   /usr/local/Ascend/nnal/atb/9.1.0/atb/cxx_abi_{0,1}/lib/libatb.so
-//     atb::PagedAttentionOperation
-//     atb::CreateOperation<atb::infer::PagedAttentionParam>
-// with tiling in libatb_mixops.so (AtbOps::PagedAttentionTilingParams).
-// There is no aclnnPagedAttention in libopapi.so, and no matching header in
-// $ASCEND_HOME_PATH/include/aclnnop/.
-//
-// ATB is a C++ object API (Operation + VariantPack + Context), not the aclnn
-// two-phase C API, so it cannot be driven through RunAclnn.
+// NOT AVAILABLE as aclnn on CANN 9.1.0. torch_npu._npu_paged_attention is an
+// ATB operator (atb::PagedAttentionOperation in libatb.so), a C++ object API
+// that RunAclnn's two-phase aclnn path cannot drive. There is no
+// aclnnPagedAttention in libopapi.so.
 //
 // Kept so the inventory reports it and the test skip message stays accurate.
 inline const char* kPagedAttention = "aclnnPagedAttention";
@@ -266,16 +223,10 @@ inline const char* kPagedAttention = "aclnnPagedAttention";
 //       int64_t numKeyValueHeads, int64_t blockSize, int64_t innerPrecise,
 //       const aclTensor *attentionOut, uint64_t *workspaceSize, aclOpExecutor **executor);
 //
-// Two differences from the ATB operator that make this NOT a drop-in swap for
-// the 310P test, and why the paged-attention suite still skips:
-//   * key/value arrive as aclTensorList, one entry per layer, not as a single
-//     cache tensor.
-//   * the paged KV layout IFA expects alongside `blocktable`/`blockSize` is not
-//     the 310P 5-D NZ shape the plugin allocates. Wiring the existing test to
-//     it would mean guessing that layout, which is exactly what this file is
-//     meant to avoid.
-// The declaration is here, verified, so that work starts from a checked
-// prototype rather than a guess.
+// key/value arrive as aclTensorList, one entry per layer, not as a single cache
+// tensor, and the paged KV layout IFA expects alongside blocktable/blockSize is
+// not the 310P 5-D NZ shape the plugin allocates -- so this is not a drop-in
+// swap for the 310P test and the paged-attention suite still skips.
 using IncreFlashAttentionV4WorkspaceFn = int (*)(
     const aclTensor* query, const aclTensorList* key, const aclTensorList* value, const aclTensor* pse_shift,
     const aclTensor* atten_mask, const aclIntArray* actual_seq_lengths, const aclTensor* dequant_scale1,

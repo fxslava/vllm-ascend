@@ -18,8 +18,7 @@
 //
 // Mirrors vllm_ascend/_310p/ops/layernorm.py :: AscendRMSNorm310.forward_oot,
 // which calls torch_npu.npu_rms_norm(x, weight, eps) and drops the rstd output.
-// The Python unit test (tests/ut/ops/test_layernorm.py) mocks torch_npu out
-// entirely, so this is the first place the numerics are actually checked.
+// The Python unit test mocks torch_npu out entirely.
 
 #include <gtest/gtest.h>
 

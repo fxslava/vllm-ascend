@@ -18,63 +18,34 @@
  * TurboQuantMode: the three storage rates of the Cube-native KV cache, and the
  * layout, codebook and Cube operand type each of them implies.
  *
- * All three share one pipeline and differ only in the parameters this header
- * carries:
- *
- *   AIV   Pi = D H D rotates the vector; the coordinates are binned against a
- *         Lloyd-Max table for N(0,1) at `kBits` bits; the codes are packed.
- *   AIV   the packed codes are expanded through a LUT straight onto the Cube's
- *         operand grid -- fp8_e4m3fn or fp4 e2m1 -- in UB.  There is no fp32
- *         intermediate: the LUT entries *are* operand-typed values.
- *   Cube  two GEMMs with fp32 accumulate, `mad` for the fp8 modes and `mad_mx`
- *         for the fp4 one.
- *   AIV   one un-rotation of the accumulator (Pi^2 = I).
- *
  *   mode     bits  levels  bytes/vec(d=256)  operand grid  Cube instruction
  *   kv3fp4     3       8          96          fp4 e2m1      mad_mx
  *   kv4fp8     4      16         128          fp8 e4m3fn    mad
  *   kv5fp8     5      32         160          fp8 e4m3fn    mad
  *
- * WHICH CUBE INSTRUCTION IS NOT A CHOICE.  On arch35 (dav_3510) MmadCal
- * dispatches to mad_mx for the tuple <float, fp4x2_e2m1_t, fp4x2_e2m1_t> and to
- * plain mad for <float, fp8_e4m3fn_t, fp8_e4m3fn_t>; the microscaled fp8 types
- * (mx_fp8_e4m3_t) are the ones that reach mad_mx on the fp8 side, and this
- * pipeline does not use them, because the per-vector scale it already carries
- * is a better-conditioned scale than a per-32-element e8m0 exponent would be.
- * Read the dispatch in
- * ${ASCEND_HOME_PATH}/.../impl/basic_api/dav_3510/kernel_operator_mm_impl.h.
+ * All three share one pipeline: the AIV rotates with Pi = D H D, bins the
+ * coordinates against a Lloyd-Max table for N(0,1) at kBits, packs, and later
+ * expands through a LUT straight onto the Cube's operand grid; the Cube runs
+ * two GEMMs with fp32 accumulate; the AIV un-rotates the accumulator.
  *
- * MIXED OPERAND TYPES DO NOT EXIST HERE.  fp4x2_e2m1 x fp8_e4m3fn is rejected
- * by that same static_assert -- measured, build/perf/cubeprobe/
- * err_mix_e2m1_e4m3.txt -- so kv3fp4 must put the query and the softmax row on
- * the fp4 grid as well.  That, and not the 3-bit storage, is what dominates its
- * error: isolating the two stages on the calibration fixture gives cos 0.9597
- * for the codec alone against 0.9713 for the fp4 operands alone, and 0.9281
- * together.  kv3fp4 is scaffolded, not recommended.
+ * On arch35 MmadCal dispatches to mad_mx for
+ * <float, fp4x2_e2m1_t, fp4x2_e2m1_t> and to mad for
+ * <float, fp8_e4m3fn_t, fp8_e4m3fn_t>.  Mixed operand types are rejected by a
+ * static_assert, so kv3fp4 must put the query and the softmax row on the fp4
+ * grid as well; kv3fp4 is scaffolded, not recommended.
  *
- * THE GAIN IS NOT A TUNING KNOB, IT IS WHAT MAKES THE LUT EXPRESSIBLE.  A
- * Lloyd-Max codebook is stated on N(0,1) and its centroids are not grid points
- * of e2m1 or e4m3fn.  The stored table is cast(g * c) for a per-mode constant g
- * and the decoder reconstructs (s / g) * lut[q], folding 1/g into the
- * per-vector scale it already multiplies by -- so the gain costs no instruction
- * and no UB.  Without it the 3-bit table loses its innermost pair to zero
- * (0.2451 sits between e2m1's 0 and 0.5), which is two of its eight levels.
+ * The stored table is cast(g * c) for a per-mode gain g, and the decoder
+ * reconstructs (s / g) * lut[q], folding 1/g into the per-vector scale it
+ * already multiplies by.  Without the gain a Lloyd-Max codebook's centroids are
+ * not grid points of e2m1 or e4m3fn.
  *
- * The tables below are generated, not hand-written:
+ * The tables below are generated:
  *
  *     python scripts/tq_multimode_calibration.py --emit-header
  *
- * and that script's --report measures what each of them delivers end to end.
- * kv5fp8 is the primary target because it is the cheapest rate that clears the
- * cos > 0.995 fidelity gate: cos_min 0.99539 over four seeds at d=256, S=512,
- * against 0.98629 for kv4fp8.  4-bit's ceiling is information-theoretic, not an
- * artifact of this codec -- see the ~23.19 dB per-coordinate requirement in
- * scripts/tq_fp8_lut_calibration.py --gate-bound.
- *
  * This header is deliberately free of AscendC types in its layout half, so the
- * host side (turboquant_torch_adpt.h, csrc/tests/common/turboquant_launch.hpp)
- * can include it and size buffers from the same arithmetic the device indexes
- * with, rather than mirroring it.
+ * host side can include it and size buffers from the same arithmetic the device
+ * indexes with.
  */
 
 #ifndef VLLM_ASCEND_ATTENTION_TURBOQUANT_MODE_H
@@ -85,12 +56,9 @@
 namespace vllm_ascend {
 namespace turboquant {
 
-/*
- * The storage rate.  The name is <storage rate><Cube operand type>, which is
- * the pair that fully determines the pipeline: kv5fp8 stores 5 bits and
- * computes in fp8.  The values are stable and are what the host passes across
- * the launch boundary, so do not renumber them.
- */
+// The storage rate.  The name is <storage rate><Cube operand type>: kv5fp8
+// stores 5 bits and computes in fp8.  The values cross the launch boundary, so
+// do not renumber them.
 enum class TurboQuantMode : int32_t {
     // 3-bit storage, 8 centroids, expanded to fp4 e2m1 for Cube mad_mx.
     KV3_FP4 = 3,
@@ -113,18 +81,15 @@ enum class TurboQuantOperand : int32_t {
  * Everything about a mode that is a pure function of the mode itself.
  *
  * Sizes are per vector *slot*: one KV vector of `head_size` coordinates.  The
- * scale plane is not counted here -- it is shared across modes and indexed by
- * token, not by vector, and turboquant_torch_adpt.h owns its geometry.
+ * scale plane is shared across modes and indexed by token, so it is not counted
+ * here; turboquant_torch_adpt.h owns its geometry.
  *
- * kElemsPerGroup / kBytesPerGroup is the packing unit, and it is chosen so the
- * group boundary is also a byte boundary:
+ * kElemsPerGroup / kBytesPerGroup is the packing unit, chosen so the group
+ * boundary is also a byte boundary:
  *
  *   3-bit  8 codes -> 3 bytes   (three bit-planes; 24 bits, no remainder)
  *   4-bit  2 codes -> 1 byte    (two nibbles; the shipping layout)
  *   5-bit  8 codes -> 5 bytes   (five bit-planes; 40 bits, no remainder)
- *
- * A group never straddles a byte, so an unpack never has to reassemble a code
- * from two loads, and the packed slot length is exact rather than rounded up.
  */
 struct TurboQuantModeConfig {
     TurboQuantMode mode;
@@ -154,11 +119,9 @@ struct TurboQuantModeConfig {
         return PackedBytes(head_size) % kBurstBytes == 0;
     }
 
-    // Whether a slot is also a whole number of 64-byte bursts.  It is *not*
-    // required -- 96 and 160 are not -- and the layout does not depend on it:
-    // the packed cache is indexed by token, and a token carries num_kv_heads
-    // slots contiguously, so what has to be 64-byte aligned is
-    // num_kv_heads * PackedBytes, not PackedBytes itself.
+    // Whether a slot is also a whole number of 64-byte bursts.  Not required --
+    // 96 and 160 are not -- because the cache is indexed by token and a token
+    // carries num_kv_heads slots contiguously.
     constexpr bool IsWideBurstAligned(int64_t head_size) const
     {
         return PackedBytes(head_size) % kWideBurstBytes == 0;
@@ -178,10 +141,8 @@ struct TurboQuantModeConfig {
 };
 
 /*
- * Compile-time traits.  The tables are `static constexpr` arrays rather than
- * runtime data because the encoder consumes the thresholds as Adds immediates,
- * exactly as TurboQuantCodec<4>::Threshold does; only the centroids reach UB,
- * because dequantization is a Gather over them.
+ * Compile-time traits.  The tables are `static constexpr` because the encoder
+ * consumes the thresholds as Adds immediates; only the centroids reach UB.
  */
 template <TurboQuantMode MODE>
 struct TurboQuantModeTraits;
@@ -281,15 +242,12 @@ struct TurboQuantModeTraits<TurboQuantMode::KV5_FP8> {
 };
 
 /*
- * The runtime view of a mode, for the host and for the launch boundary, where
- * the mode is a value rather than a template parameter.
+ * The runtime view of a mode, for the host and for the launch boundary.
  *
- * Returns kv5fp8's configuration for any unrecognised value.  A silent default
- * is the right behaviour here and not laziness: this is called from the launch
- * path to size buffers, the enum crosses an ABI, and the alternative -- an
- * assert on the device - would abort a decode step rather than produce a
- * diagnosable wrong answer.  The host validates the mode before it gets here;
- * see TurboQuantModeIsValid.
+ * Returns kv5fp8's configuration for any unrecognised value: this sizes buffers
+ * on the launch path and the enum crosses an ABI, so a device-side assert would
+ * abort a decode step rather than produce a diagnosable answer.  The host
+ * validates with TurboQuantModeIsValid before it gets here.
  */
 constexpr TurboQuantModeConfig TurboQuantModeConfigOf(TurboQuantMode mode)
 {

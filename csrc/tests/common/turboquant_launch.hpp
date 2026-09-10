@@ -17,31 +17,22 @@
 // Torch-free binding for the TurboQuant 4-bit KV-cache kernels.
 //
 // csrc/attention/turboquant/turboquant_torch_adpt.h is the production entry
-// point, and it is unusable from this suite: it includes <ATen/ATen.h>,
-// torch/library.h and torch_npu, which is exactly the dependency the bare-metal
-// tests exist to avoid. What that header actually contributes on top of the
-// kernel launch is arithmetic - the scale-plane geometry, the codec table
-// layout, the grid and the flash-decoding split count - and none of it needs a
-// tensor. This header restates that arithmetic against plain pointers and
-// std::vector so a test can drive
+// point and is unusable from this suite: it includes <ATen/ATen.h>,
+// torch/library.h and torch_npu. What it contributes on top of the kernel
+// launch is arithmetic -- the scale-plane geometry, the codec table layout, the
+// grid and the flash-decoding split count -- and none of it needs a tensor.
+// This header restates that arithmetic against plain pointers so a test can
+// drive
 //
 //     turboquant_reshape_and_cache_impl        (one launch)
 //     turboquant_paged_attention_impl          (split then combine, two launches)
 //
-// with the same shapes the production path would have produced.
+// It is a *mirror*, not a shared source, so the two can drift. Every quantity
+// below names the function in turboquant_torch_adpt.h it mirrors, and
+// TurboQuantLaunchContract in test_sim_950pr_turboquant_kernels.cpp pins them.
 //
-// It is a *mirror*, not a copy of a shared source, so the two can drift. Every
-// quantity below names the function in turboquant_torch_adpt.h it mirrors, and
-// TurboQuantLaunchContract in test_sim_950pr_turboquant_kernels.cpp pins the ones
-// that are pure functions of the shapes against the values written here. The
-// codec table image is additionally pinned against the layout contract in
-// TurboQuantCodec<4>::ConstTableWords and against the Python builder
-// vllm_ascend/attention/turboquant_v1.py::turboquant_codec_tables.
-//
-// The kernels themselves come from libvllm_ascend_turboquant.so, built by
+// The kernels come from libvllm_ascend_turboquant.so, built by
 // ascendc_library() out of the same turboquant_kernels.cpp the wheel builds.
-// The two _impl symbols below are its only C++ entry points; everything else it
-// exports is a generated aclrtlaunch_* wrapper.
 
 #pragma once
 
@@ -56,11 +47,8 @@ namespace vllm_ascend {
 
 // Defined in csrc/attention/turboquant/turboquant_kernels.cpp and exported by
 // libvllm_ascend_turboquant.so. Declared here rather than included because the
-// only header that declares them (turboquant_torch_adpt.h) drags in ATen.
-//
-// A mismatch with the definition is a link error, not silent corruption: these
-// are ordinary C++ symbols with mangled names, unlike the dlsym-resolved aclnn
-// operators in aclnn_ops.hpp.
+// only header that declares them drags in ATen. A mismatch with the definition
+// is a link error, not silent corruption.
 void turboquant_reshape_and_cache_impl(AscendType type, void *stream, uint32_t blockDim, void *key, void *value,
                                        void *keyCache, void *valueCache, void *scaleCache, void *slotMapping,
                                        void *piSigns, void *tables, uint32_t numTokens, uint32_t numKvHeads,
@@ -136,11 +124,9 @@ constexpr int64_t kTileRows = 16;
 // Two 4-bit codes per byte.
 constexpr int64_t kPackFactor = 2;
 
-// Vector core count assumed when the runtime cannot report one. The simulator
-// answers aclGetDeviceCapability for some bins and not others, and a grid is
-// only a work split - a wrong count changes how many blocks are launched, not
-// what the kernels compute - so a test that cannot ask simply says so and uses
-// this. Sized to the smallest 950PR bin so the assumption never over-subscribes.
+// Vector core count assumed when the runtime cannot report one. A grid is only
+// a work split, so a wrong count changes how many blocks are launched and not
+// what the kernels compute. Sized to the smallest 950PR bin.
 constexpr int64_t kFallbackVectorCoreNum = 8;
 
 inline int64_t CeilDiv(int64_t a, int64_t b) { return (a + b - 1) / b; }
@@ -148,11 +134,9 @@ inline int64_t CeilDiv(int64_t a, int64_t b) { return (a + b - 1) / b; }
 // --- layout, mirrored from turboquant_torch_adpt.h --------------------------
 
 // fp32 words one token occupies in the scale plane: K then V for every kv head,
-// padded to a whole 32-byte burst so the scatter never touches an unaligned
-// global address. Mirrors turboquant_adpt::ScaleSlotFloats, ScaleSlotFloats()
-// in turboquant_kernels.cpp, turboquant_scale_slot() on the Python side and
-// cpu_scale_slot_floats() in the CPU reference - five copies of one number,
-// which is why TurboQuantLaunchContract checks it against the reference.
+// padded to a whole 32-byte burst. Mirrors turboquant_adpt::ScaleSlotFloats,
+// ScaleSlotFloats() in turboquant_kernels.cpp, turboquant_scale_slot() on the
+// Python side and cpu_scale_slot_floats() in the CPU reference.
 inline int64_t ScaleSlotFloats(int64_t num_kv_heads) {
   return CeilDiv(2 * num_kv_heads, kFp32PerBlock) * kFp32PerBlock;
 }
@@ -197,13 +181,8 @@ std::vector<float> PiSigns(int64_t head_size);
 //   [7D + 2B, +16)   centroid_, the Lloyd-Max reconstruction levels
 //
 // sign_, oddSelect_ and centroid_ are fp32 bit patterns; the offset tables are
-// uint32 byte offsets for Gather. Everything is four bytes wide, so one int32
-// DataCopy moves the lot and the device needs no cast and no arithmetic.
-//
-// This is the C++ mirror of turboquant_codec_tables() in
-// vllm_ascend/attention/turboquant_v1.py. The kernel treats the image as
-// read-only and never rewrites a word of it, so building it once per test is
-// enough.
+// uint32 byte offsets for Gather. The C++ mirror of turboquant_codec_tables()
+// in vllm_ascend/attention/turboquant_v1.py.
 std::vector<int32_t> CodecTables(int64_t head_size, int64_t batch_rows);
 
 // --- grid arithmetic, mirrored from turboquant_torch_adpt.h -----------------
@@ -223,12 +202,7 @@ ReshapeAndCacheGrid PlanReshapeAndCache(int64_t num_tokens, int64_t aiv_num);
 
 // The two grids and the workspace npu_turboquant_paged_attention would have
 // used. The split stage has num_splits times as many tasks as the combine
-// stage, and sizing them separately keeps the combine launch from spawning
-// cores with nothing to do.
-//
-// Mirrors turboquant_adpt::PagedAttentionPlan and PlanPagedAttention(), which
-// is the single place the production path derives all of this - the operator
-// and the host that pre-allocates the workspace both read it from there.
+// stage. Mirrors turboquant_adpt::PagedAttentionPlan and PlanPagedAttention().
 struct PagedAttentionGrid {
   uint32_t split_block_dim = 0;
   uint32_t combine_block_dim = 0;
@@ -245,11 +219,10 @@ PagedAttentionGrid PlanPagedAttention(int64_t num_tokens, int64_t num_heads, int
 
 // --- multi-mode, Cube-native path -------------------------------------------
 //
-// The layout half of csrc/attention/turboquant/turboquant_mode.h is deliberately
-// free of AscendC types, so this header includes it and sizes buffers from the
-// same arithmetic the device indexes with rather than mirroring it a sixth time.
-// What still has to be mirrored is the table *image*, because the device only
-// reads it and never derives it -- ModeTables below is that mirror, and
+// The layout half of csrc/attention/turboquant/turboquant_mode.h is free of
+// AscendC types, so this header includes it and sizes buffers from the same
+// arithmetic the device indexes with. What still has to be mirrored is the
+// table *image*: ModeTables below is that mirror, and
 // TurboQuantModeCodec<MODE>::ConstTableWords is the contract it writes to.
 
 // Rows of the packed cache one Cube tile covers. Mirrors kCubeTileRows in
@@ -287,11 +260,8 @@ int64_t ModeTableWords(vllm_ascend::turboquant::TurboQuantMode mode, int64_t hea
 //
 // The two offset tables carry the NZ permutation when `nz_rows` is non-zero:
 // output position p is then an NZ position within a band of `batch_rows` rows
-// of an `nz_rows`-row tile, and the table decodes p back to the logical (r, c)
-// whose packed byte it must read. That is what lets the unpack emit Cube-ready
-// order for free; see the header of turboquant_cube_mm.h. Pass nz_rows = 0 for
-// plain row-major output, which is what the encode path and the host reference
-// want.
+// of an `nz_rows`-row tile. Pass nz_rows = 0 for plain row-major output, which
+// is what the encode path and the host reference want.
 std::vector<int32_t> ModeTables(vllm_ascend::turboquant::TurboQuantMode mode, int64_t head_size, int64_t batch_rows,
                                 int64_t nz_rows);
 
@@ -303,12 +273,10 @@ inline int64_t NzOffset(int64_t r, int64_t c, int64_t rows) {
 
 // The grid the Cube decode's split stage launches with.
 //
-// The task is (token, kv_head, split) rather than (token, head, split) -- the
-// query heads of one kv head are batched into the GEMM's M dimension -- so the
-// task count is num_kv_heads times smaller than the AIV path's and the split
-// count has correspondingly more idle cores to absorb. The workspace is the
-// same size either way: it is indexed per head, because the combine stage this
-// shares with the AIV path reads it that way.
+// The task is (token, kv_head, split) rather than (token, head, split), so the
+// task count is num_kv_heads times smaller than the AIV path's. The workspace
+// is the same size either way: it is indexed per head, because the combine
+// stage shared with the AIV path reads it that way.
 struct CubeDecodeGrid {
   uint32_t split_block_dim = 0;
   uint32_t combine_block_dim = 0;

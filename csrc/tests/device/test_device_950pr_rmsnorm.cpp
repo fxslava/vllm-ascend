@@ -17,13 +17,9 @@
 // RMSNorm on Ascend 950PR, fp16 in / fp16 out.
 //
 // Stage 1 and stage 7 of the Qwen3.5 decoder layer. The operator is the stock
-// aclnnRmsNorm - the 950PR custom kernel set in csrc/ adds fused variants
-// (AddRmsNormBias, RmsNormDynamicQuant) but nothing that replaces a plain
-// fp16 RMSNorm, so there is no custom kernel to prefer here.
-//
-// The seeds, shapes and tolerances are the ones the CUDA suite uses
-// (csrc/tests/kernels/cuda/test_rmsnorm.cpp), so a number that differs between
-// the two backends is a backend difference and not a test difference.
+// aclnnRmsNorm; the 950PR custom variants are all fused forms. Seeds, shapes
+// and tolerances are the CUDA suite's
+// (csrc/tests/kernels/cuda/test_rmsnorm.cpp).
 
 #include <gtest/gtest.h>
 

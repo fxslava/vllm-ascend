@@ -17,65 +17,41 @@
 // End-to-end fidelity of the TurboQuant 4-bit KV cache, measured on an Ascend
 // 950PR or on the CANN camodel simulator standing in for one.
 //
-// ONE PASS, ON PURPOSE. The camodel simulates the DaVinci pipeline cycle by
-// cycle; a launch that takes microseconds on silicon takes minutes there. This
-// file therefore runs exactly one decode step - one query token, one context,
-// one write of the cache - and every shape below is the smallest that still
-// exercises the thing it is there to exercise:
+// ONE PASS, ON PURPOSE: the camodel simulates the pipeline cycle by cycle, so a
+// launch that is microseconds on silicon is minutes here. Every shape is the
+// smallest that still exercises the thing it is there to exercise:
 //
-//   head_size 64      the bottom of the supported range and the cheapest
-//                     Walsh-Hadamard; the transform is still four stages deep
-//                     so the block-strided and the Gather-shuffled halves of
-//                     FastWalshHadamardTransform both run
-//   block_size 16     exactly one kTileRows tile, so the decode kernel's
-//                     tiling and its shuffle tables are live
-//   context 32        two blocks, read through a non-identity block table, so
-//                     paging is real and the online softmax has to carry state
-//                     across a block boundary
-//   4 heads / 2 kv    a GQA group of two, so the head -> kv_head mapping is
-//                     not the identity
+//   head_size 64      the bottom of the supported range; the Walsh-Hadamard is
+//                     still four stages deep, so both its block-strided and its
+//                     Gather-shuffled halves run
+//   block_size 16     exactly one kTileRows tile
+//   context 32        two blocks through a non-identity block table, so the
+//                     online softmax carries state across a block boundary
+//   4 heads / 2 kv    a GQA group of two
 //
 // WHAT IS COMPARED. Three outputs of the same decode step:
 //
-//   quantised   the two TurboQuant kernels on the device: the write path packs
-//               K and V to 4 bits through Pi, the split/combine pipeline reads
-//               them back and un-rotates the accumulator.
-//   control     the same attention with an unquantised fp16 KV cache, run on
-//               the device through aclnnFusedInferAttentionScoreV2. This is the
-//               "no quantisation" leg, and it is *attempted*, not required.
+//   quantised   the two TurboQuant kernels on the device.
+//   control     the same attention with an unquantised fp16 KV cache through
+//               aclnnFusedInferAttentionScoreV2. Attempted, not required: on an
+//               Ascend950 the planning call returns 361001 because the V1..V4
+//               family is withdrawn (see aclnn_ops_950pr.hpp).
+//   exact       fp32 attention over the same fp16 inputs, on the host. Always
+//               available, which is why the assertions hang off it.
 //
-//               On an Ascend950 it does not run at all: measured on CANN 9.1.0,
-//               the planning call returns 361001 with "Interface
-//               aclnnFusedInferAttentionScore versions V1 to V4 are no longer
-//               supported on Ascend950" - the whole V1..V4 family is withdrawn
-//               on this part (see aclnn_ops_950pr.hpp). The leg is kept because
-//               it is the right control wherever the operator does exist, and
-//               because a test that silently omits its control is worse than
-//               one that prints why it has none. The metrics and the assertions
-//               below do not depend on it.
-//   exact       fp32 attention over the same fp16 inputs, on the host. This is
-//               the reference the fidelity metrics are quoted against, and it
-//               is always available, which is why the assertions hang off it
-//               rather than off the control.
-//
-// WHAT IS ASSERTED, AND WHY THE TWO BOUNDS ARE SO DIFFERENT.
+// WHAT IS ASSERTED:
 //
 //   quantised vs the CPU TurboQuant reference   -   tight (cos > 0.999)
-//       Both run the identical algorithm, one on the device and one on the
-//       host, so anything beyond fp16 output rounding is a kernel bug. This is
-//       the regression detector.
+//       Both run the identical algorithm, so anything beyond fp16 output
+//       rounding is a kernel bug. This is the regression detector.
 //
-//   quantised vs exact fp32                      -   a floor (SNR >= 12 dB)
-//       This is the *scheme's* error, not the kernel's: 4 bits per channel
-//       cannot represent an fp16 activation, and roughly 18 dB is what the
-//       codec actually achieves at this shape (measured; see kMinSnrDb). The
-//       floor is set well below that because the number legitimately moves with
-//       the data. What it catches is gross breakage - a dropped un-rotation, a
-//       scale read from the wrong lane, a block table ignored - all of which
-//       collapse the cosine similarity rather than nudging the SNR.
+//   quantised vs exact fp32                     -   a floor (SNR >= 12 dB)
+//       The scheme's error, not the kernel's. The floor sits well below what
+//       the codec achieves because the number moves with the data; what it
+//       catches is gross breakage -- a dropped un-rotation, a scale read from
+//       the wrong lane, a block table ignored.
 //
-// Timing is printed and never asserted. Under the camodel the wall clock
-// measures the simulator, not the part.
+// Timing is printed and never asserted.
 
 #include <gtest/gtest.h>
 
@@ -127,19 +103,14 @@ constexpr float kInvSqrtHeadSize = 0.125f;  // the kernels take this rather than
 constexpr double kMinKernelCosine = 0.999;
 constexpr double kMaxKernelRelativeL2 = 5e-3;
 
-// The codec against exact fp32. Measured on the Ascend950PR camodel at this
-// exact shape and seed: cos 0.9893, SNR 16.70 dB, relL2 0.146. The bounds sit
-// well clear of that, for the reason in the header comment - this number moves
-// with the data, and the host pipeline at the same shape but a different seed
-// reads 18.01 dB, which is the width of the variation to expect.
+// The codec against exact fp32. The bounds sit well clear of what this shape
+// measures, because the number moves with the data.
 //
-// Note in particular that these bounds do *not* discriminate "the Pi rotation
-// was dropped": on iid Gaussian channels a bare absmax quantiser scores the
-// same ~18 dB, because what the rotation buys is protection against
-// anisotropic and outlier-heavy channels, and that is measured on real Qwen
-// activations by test_host_turboquant_fidelity.cpp instead. What they do catch is
-// an un-rotation that never happened, which sends the output into a different
-// basis entirely.
+// They do not discriminate "the Pi rotation was dropped": on iid Gaussian
+// channels a bare absmax quantiser scores the same, since what the rotation
+// buys is protection against anisotropic and outlier-heavy channels, which
+// test_host_turboquant_fidelity.cpp measures on real activations instead. What
+// they do catch is an un-rotation that never happened.
 constexpr double kMinCosine = 0.97;
 constexpr double kMinSnrDb = 12.0;
 constexpr double kMaxRelativeL2 = 0.30;
@@ -256,10 +227,9 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
 
   // --- 1. device memory for the quantised path -------------------------------
   //
-  // Everything is plain contiguous ND: no FRACTAL_NZ and no 5-D views. The
-  // packed cache is [num_blocks, block_size, num_kv_heads, head_size / 2] int8
-  // and the scale plane is [num_blocks, block_size, scale_slot] fp32, indexed by
-  // token so a token's scales are one aligned burst.
+  // Plain contiguous ND: the packed cache is
+  // [num_blocks, block_size, num_kv_heads, head_size / 2] int8 and the scale
+  // plane is [num_blocks, block_size, scale_slot] fp32, indexed by token.
 
   DeviceBuffer key_dev = DeviceBuffer::FromHost(FloatToHalf(in.key));
   DeviceBuffer value_dev = DeviceBuffer::FromHost(FloatToHalf(in.value));
@@ -319,8 +289,8 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
   // --- 3. the unquantised control --------------------------------------------
   //
   // Same decode, same paging, fp16 KV cache, through the stock CANN operator the
-  // plugin's DecodeOnly path calls. _get_fia_params flattens the head axes of
-  // the cache before the call, which is what FiaKeyCacheView reproduces.
+  // plugin's DecodeOnly path calls. FiaKeyCacheView reproduces the head-axis
+  // flattening _get_fia_params does before the call.
 
   std::vector<float> control;
   double control_ms = 0.0;
@@ -367,11 +337,9 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
     AclnnIntArray actual_seq_lengths(std::vector<int64_t>{kQueryTokens});
     AclnnIntArray actual_seq_lengths_kv(std::vector<int64_t>{kContextLen});
 
-    // The control is best-effort. Its argument list is copied from the plugin's
-    // DecodeOnly branch but has never been executed on this part (see
-    // aclnn_ops_950pr.hpp), and a camodel run may have no binary kernel for the
-    // operator at all. A failure here is reported and the exact-path comparison
-    // - which is what the assertions use - carries on regardless.
+    // The control is best-effort: its argument list has never been executed on
+    // this part, and a camodel run may have no binary kernel for the operator.
+    // A failure is reported and the exact-path comparison carries on.
     try {
       control_ms = TimeMs([&] {
         RunAclnn<ops950::FusedInferAttentionScoreV2WorkspaceFn>(

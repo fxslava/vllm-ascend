@@ -29,22 +29,13 @@ namespace {
 constexpr size_t kHalfBytes = sizeof(uint16_t);
 
 // "half" is the neox / rotate_half pairing: element k with element
-// k + rotary_dim/2. That is what Qwen3.5 uses, what
-// scripts/dump_qwen35_layer3.py's apply_partial_rope implements, and what the
-// cos/sin tables in the dump are laid out for (each is concat(v, v), so the two
-// paired elements read the same angle by construction).
-//
-// Non-const because the operator takes char*, not const char*.
+// k + rotary_dim/2, which is what Qwen3.5 uses and what the cos/sin tables in
+// the dump are laid out for. Non-const because the operator takes char*.
 char kRotaryModeHalfString[] = "half";
 
 // Copies the [0, rotary_dim) slice of every head out of a
 // [tokens, heads, head_dim] buffer into a contiguous
-// [tokens, heads, rotary_dim] one, or back again.
-//
-// One copy per head. tokens * heads is 8 for the golden layer and at most a few
-// thousand for the unit test sweeps, which is small enough that the launch cost
-// does not matter next to the operator itself - and this is a correctness
-// suite, not a benchmark.
+// [tokens, heads, rotary_dim] one, or back again. One copy per head.
 void CopyRotarySlices(void* strided, void* packed, int64_t tokens, int64_t heads, int64_t head_dim,
                       int64_t rotary_dim, bool pack, aclrtStream stream) {
   auto* strided_bytes = static_cast<uint8_t*>(strided);

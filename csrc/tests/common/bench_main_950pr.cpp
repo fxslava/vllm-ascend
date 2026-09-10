@@ -14,18 +14,14 @@
  * limitations under the License.
  */
 
-// Entry point for the Ascend 950PR benchmark binaries.
-//
-// Identical to common/bench_main.cpp except for the part it names, which
-// decides two things: the banner, and which SoC names RunBenchmarkSuite will
-// accept before it runs anything. A 950PR suite started on a 310P exits 77 and
-// ctest records a skip, exactly as the 310P suites do on the wrong part.
+// Entry point for the Ascend 950PR benchmark binaries. Identical to
+// common/bench_main.cpp except for the part it names, which decides the banner
+// and which SoC names RunBenchmarkSuite accepts. A 950PR suite started on a
+// 310P exits 77 and ctest records a skip.
 
-// It also refuses to measure anything under a camodel. A benchmark is the one
-// kind of binary for which the simulator produces a plausible-looking number
-// that means nothing at all, and the device tier's whole claim is that its
-// timings came from silicon. Exiting 77 - the same skip code as "no device
-// attached" - keeps that claim honest without failing a build.
+// It also refuses to measure anything under a camodel: a simulator produces a
+// plausible-looking number that means nothing. Exiting 77 keeps the device
+// tier's claim that its timings came from silicon.
 
 #include <cstdio>
 

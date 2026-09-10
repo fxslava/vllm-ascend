@@ -26,20 +26,13 @@
 #include <cstdint>
 
 // A per-device cache of the hardware properties a kernel launch needs to size
-// its grid.
+// its grid.  The properties are fixed for the life of the process, and
+// aclGetDeviceCapability enters the CANN driver, so querying once per device
+// and reading a cached word keeps a context switch off the decode path.
 //
-// The properties are fixed for the life of the process -- a device does not
-// grow vector cores -- but the driver calls that report them are not free:
-// aclGetDeviceCapability enters the CANN driver, and doing that on every launch
-// puts a context switch on the decode critical path, once per operator per
-// layer per step.  Querying once per device and reading a cached word instead
-// removes it.
-//
-// Concurrency: the cache is a flat array of atomics indexed by device id, so a
-// hit is one relaxed load and never takes a lock.  Two threads racing on a cold
-// slot both query the driver and both store the same value, which is why no
-// stronger ordering is needed -- the entry is an idempotent scalar, and the
-// only way to observe the race is that the driver was asked twice.
+// The cache is a flat array of atomics indexed by device id: a hit is one
+// relaxed load, and two threads racing on a cold slot both store the same
+// value, so no stronger ordering is needed.
 namespace vllm_ascend {
 namespace device_registry {
 
@@ -50,14 +43,11 @@ constexpr int32_t kMaxDevices = 64;
 
 // The device this thread is currently bound to.
 //
-// c10_npu::GetDevice is torch_npu's wrapper around aclrtGetDevice: it answers
-// from torch's own bookkeeping and lazily initialises the device when the
-// thread has not touched the NPU yet, which a bare aclrtGetDevice would report
-// as an error.  current_device() is the fallback for that case.
-//
-// This is what makes the registry correct under tensor parallelism: every rank
-// runs in its own process bound to its own device, and each resolves its own
-// id rather than assuming 0.
+// c10_npu::GetDevice answers from torch's own bookkeeping and lazily
+// initialises the device when the thread has not touched the NPU yet, which a
+// bare aclrtGetDevice would report as an error; current_device() is the
+// fallback.  Resolving per thread is what makes the registry correct under
+// tensor parallelism.
 inline int32_t CurrentDevice()
 {
     int32_t device_id = 0;
@@ -67,11 +57,9 @@ inline int32_t CurrentDevice()
     return device_id;
 }
 
-// Ask the driver for a device's AI Vector core count.
-//
-// Two spellings of the same question: aclrtGetDeviceInfo is the current one and
-// aclGetDeviceCapability the older one, and which of them answers depends on
-// the CANN version and the SOC.  Mirrors the fallback chain in
+// Ask the driver for a device's AI Vector core count.  Which of
+// aclrtGetDeviceInfo and aclGetDeviceCapability answers depends on the CANN
+// version and the SOC; mirrors the fallback chain in
 // csrc/attention/k2q_csr/k2q_csr_torch_adpt.h.
 inline int64_t QueryVectorCoreNum(int32_t device_id)
 {

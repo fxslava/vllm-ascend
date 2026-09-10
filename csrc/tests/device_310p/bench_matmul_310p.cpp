@@ -17,22 +17,16 @@
 // MatMul (aclnnMatmul) on the v200 cube unit, fp16 in / fp16 out, B presented
 // transposed exactly as test_matmul_310p.cpp does.
 //
-// Two regimes are covered because they are bounded by different things:
+// Two regimes, bounded by different things:
 //
-//   M = 1   decode. A GEMV: every weight element is read once and used once, so
-//           arithmetic intensity is ~1 FLOP per byte and the kernel is bounded
-//           by how fast the weight can be streamed from HBM. The TFLOP/s column
-//           will look poor and the GB/s column is the one that means something.
-//   M > 1   prefill. The same weight serves M rows, so intensity rises with M
-//           and the cube unit starts to be the limit. This is where TFLOP/s is
-//           the number to read.
+//   M = 1   decode. A GEMV: ~1 FLOP per byte, bounded by how fast the weight
+//           streams from HBM, so GB/s is the column that means something.
+//   M > 1   prefill. Intensity rises with M and the cube unit becomes the
+//           limit, so TFLOP/s is the number to read.
 //
-// Both columns are reported for every shape so the crossover is visible rather
-// than assumed.
-//
-// Shape coverage goes beyond the parity suite in two directions: the M sweep
-// above, and the fused-QKV and down_proj widths that the parity suite's
-// cartesian product of hidden sizes cannot express. See kExtraProjectionShapes.
+// Both columns are reported for every shape. Shape coverage goes beyond the
+// parity suite in the M sweep and in the fused-QKV and down_proj widths; see
+// kExtraProjectionShapes.
 
 #include <cmath>
 #include <cstdint>
@@ -78,17 +72,13 @@ struct ProjectionShape {
   int64_t n;
 };
 
-// Two Qwen3.5 projections that the cartesian sweep over LinearInputSizes x
+// Two Qwen3.5 projections the cartesian sweep over LinearInputSizes x
 // LinearOutputSizes cannot reach, because both of its axes are hidden sizes:
 //
-//   fused QKV   K = hidden, N = (num_q_heads + 2 * num_kv_heads) * head_dim,
-//               which is neither a hidden size nor an MLP width. 6144 is the
-//               32h/8kv/d128 split, 4608 is 28h/4kv/d128.
-//   down_proj   K = the MLP intermediate width, so K is 11008 rather than 2048
-//               or 4096. This is the deepest reduction in the whole forward
-//               pass and the only projection whose K exceeds its N.
-//
-// The parity suite covers neither; see csrc/tests/COVERAGE.md.
+//   fused QKV   K = hidden, N = (num_q_heads + 2 * num_kv_heads) * head_dim.
+//               6144 is the 32h/8kv/d128 split, 4608 is 28h/4kv/d128.
+//   down_proj   K = the MLP intermediate width, 11008 -- the only projection
+//               whose K exceeds its N.
 const ProjectionShape kExtraProjectionShapes[] = {
     ProjectionShape{4096, 6144},   // fused QKV, 32 heads / 8 kv / d128
     ProjectionShape{2048, 4608},   // fused QKV, 28 heads / 4 kv / d128

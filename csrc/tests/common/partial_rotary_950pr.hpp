@@ -16,43 +16,27 @@
 
 // Partial rotary position embedding on Ascend 950PR.
 //
-// THE PROBLEM. Qwen3.5 sets partial_rotary_factor to 0.25 with head_dim 256, so
-// a decode step must rotate channels [0, 64) of every head and leave
-// [64, 256) exactly as they were. aclnnApplyRotaryPosEmbV2 cannot express that:
-// it rotates the whole trailing dimension of the tensor it is given, and its
-// cos/sin must be that same width. Handing it the full 256-wide head rotates
-// everything; handing it 64-wide cos/sin against a 256-wide head is a shape
-// error.
+// Qwen3.5 sets partial_rotary_factor to 0.25 with head_dim 256, so a decode
+// step must rotate channels [0, 64) of every head and leave [64, 256) exactly
+// as they were. aclnnApplyRotaryPosEmbV2 cannot express that: it rotates the
+// whole trailing dimension, and its cos/sin must be that same width.
 //
-// TWO WAYS OUT, and this file implements both:
+// Two ways out, both implemented here and chosen between at run time:
 //
 //   1. aclnnInplacePartialRotaryMul, the vllm-ascend custom operator built from
 //      csrc/attention/inplace_partial_rotary_mul. It takes the full head plus a
-//      partial_slice attribute and rotates only the slice, which is exactly the
-//      operation needed. It has an ascend950 AICore config, so it is the
-//      intended kernel for this part. It is NOT part of CANN: it only resolves
-//      once the vllm-ascend custom op package is installed into the OPP.
-//
+//      partial_slice attribute and has an ascend950 AICore config. It is NOT
+//      part of CANN: it only resolves once the vllm-ascend custom op package is
+//      installed into the OPP.
 //   2. Pack the rotary slice of every head into a contiguous
 //      [1, tokens, heads, rotary_dim] buffer, rotate that with the stock
-//      aclnnApplyRotaryPosEmbV2, and unpack it back. Two strided
-//      device-to-device copies per head either side of one operator call.
+//      aclnnApplyRotaryPosEmbV2, and unpack it back.
 //
-// Why not the obvious third option - describe the slice as a strided aclTensor
-// view over the full head and hand that to aclnnApplyRotaryPosEmbV2 in place.
-// It would need no copies, and aclCreateTensor is perfectly happy to build the
-// view. The reason it is not here: queryRef is an in-place output, and an aclnn
-// operator handed a non-contiguous input is free to materialise a contiguous
-// copy of it first, in which case the rotation lands in that temporary and the
-// caller's buffer is silently unchanged. Whether this operator does that is not
-// something the header states, and a silent no-op is the single worst failure
-// mode for a parity test. The pack/unpack path costs 2 * tokens * heads small
-// copies and has no such question hanging over it.
+// A strided aclTensor view over the full head is deliberately not used: queryRef
+// is an in-place output, and an aclnn operator handed a non-contiguous input may
+// materialise a contiguous copy first, leaving the caller's buffer unchanged.
 //
-// The path actually taken is reported back to the caller so a test can print
-// it: on a machine with the custom op package the parity result means something
-// different from the same result on stock CANN, and the reader should be able
-// to tell which they are looking at.
+// The path actually taken is reported back to the caller.
 
 #pragma once
 

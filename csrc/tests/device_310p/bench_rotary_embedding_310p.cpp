@@ -17,20 +17,14 @@
 // Rotary position embedding (aclnnApplyRotaryPosEmbV2) on the v200 vector unit,
 // fp16, BSND layout, in place on query and key.
 //
-// Two things about this operator shape the benchmark:
+// It is in place, so each launch rotates the output of the previous one and the
+// usual bit-identical-output guard cannot be used. What survives repeated
+// rotation is the sum of squares, so that is what the checksum tracks, with
+// room for the fp16 drift of a few hundred launches.
 //
-//   * It is in place. Each launch rotates the output of the previous one, so
-//     the buffers are not restored between iterations. That does not change the
-//     timing - the work is data-independent - but it does mean the usual
-//     "the output must be bit-identical" guard cannot be used. The invariant
-//     that survives repeated rotation is the sum of squares, which a rotation
-//     preserves exactly in exact arithmetic and to within accumulated fp16
-//     rounding here, so that is what the checksum tracks, with room for the
-//     drift of a few hundred launches.
-//   * Both rotary layouts are benchmarked. "half" (neox) reads the two halves
-//     of the head dim, "interleave" (GPT-J) reads adjacent pairs. Same byte
-//     count, different access pattern, and on a unit that moves 32-byte bursts
-//     the two need not cost the same.
+// Both rotary layouts are benchmarked: "half" (neox) reads the two halves of
+// the head dim, "interleave" (GPT-J) reads adjacent pairs. Same byte count,
+// different access pattern.
 //
 // Bandwidth-bound: query and key are each read and written, cos and sin are
 // read once per token and shared across heads.

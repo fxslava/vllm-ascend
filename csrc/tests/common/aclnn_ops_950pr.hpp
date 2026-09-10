@@ -17,12 +17,6 @@
 // Operators the Ascend 950PR (A5) leg of the suite calls, on top of the four
 // already declared in aclnn_ops.hpp.
 //
-// WHERE EACH KERNEL CAME FROM. The task this file serves was to bind the
-// vllm-ascend custom kernels for the 950PR plus the stock CANN operators. The
-// audit that produced the mapping below is recorded here rather than in a
-// commit message, because the interesting result is which of the two each stage
-// ended up on:
-//
 //   stage        operator                            source
 //   ---------------------------------------------------------------------------
 //   RMSNorm      aclnnRmsNorm                        stock CANN
@@ -34,32 +28,15 @@
 //   SwiGLU       aclnnSwiGlu                         stock CANN
 //   gate / adds  aclnnSigmoid, aclnnMul, aclnnInplaceAdd   stock CANN
 //
-// Only the rotary stage needs a custom kernel, and it needs one for a concrete
-// reason: Qwen3.5 rotates channels [0, 64) of a 256-wide head and passes
-// [64, 256) through, and aclnnApplyRotaryPosEmbV2 has no way to express that -
-// it rotates the whole trailing dim of whatever tensor it is handed. See
-// kInplacePartialRotaryMul below for the operator that does, and
-// test_rotary_embedding_950pr.cpp for the fallback that gets the same answer
-// out of the stock operator.
-//
-// AVAILABILITY, MEASURED. Every name below was checked against the aarch64
-// CANN 9.1.0 toolkit that carries the Ascend950PR platform configs, with
-//
-//   nm -D --defined-only $ASCEND_HOME_PATH/lib64/libopapi*.so |
-//     grep -oE 'aclnn[A-Za-z0-9_]*' | sort -u
-//
-// Result: every operator in the table above resolves EXCEPT
-// aclnnInplacePartialRotaryMul, which is not a CANN operator at all - it is
-// built from csrc/attention/inplace_partial_rotary_mul by the vllm-ascend
-// custom op package and only appears once that package is installed into the
-// OPP. A tree with stock CANN and no custom op package therefore takes the
-// fallback path, which is exactly what the fallback is for.
+// Only the rotary stage needs a custom kernel: Qwen3.5 rotates channels [0, 64)
+// of a 256-wide head and aclnnApplyRotaryPosEmbV2 rotates the whole trailing
+// dim. Every name above resolves against stock CANN 9.1.0 EXCEPT
+// aclnnInplacePartialRotaryMul, which only appears once the vllm-ascend custom
+// op package is installed into the OPP.
 //
 // Like aclnn_ops.hpp, this file is version-sensitive: the operators are
 // resolved with dlsym, so the compiler cannot check an argument list. Each
-// declaration names the header it was read from. A mismatch surfaces as a
-// non-zero status from the planning call with aclGetRecentErrMsg attached, not
-// as silent corruption.
+// declaration names the header it was read from.
 
 #pragma once
 
@@ -80,17 +57,15 @@ namespace ops950 {
 // mirrors: torch.ops._C_ascend.inplace_partial_rotary_mul
 //          csrc/torch_binding.cpp :: inplace_partial_rotary_mul_npu
 //
-// Rotates a slice of every head in place and leaves the rest of the head
-// untouched, which is what partial_rotary_factor < 1 means:
+// Rotates a slice of every head in place and leaves the rest untouched:
 //
 //   x[..., s : s + n] = rotate(x[..., s : s + n], cos, sin)
 //   x[..., elsewhere] unchanged
 //
 // x is BSND [batch, seq, num_heads, head_dim]; the torch binding rejects any
-// other rank ("Input tensor x's dim num should be 4"). cos and sin carry the
-// rotary width, not the head width.
+// other rank. cos and sin carry the rotary width, not the head width.
 //
-// The operator definition is
+// From
 // csrc/attention/inplace_partial_rotary_mul/op_host/inplace_partial_rotary_mul_def.cpp:
 //
 //   Input("x")   fp16 | fp32 | bf16          AutoContiguous
@@ -101,24 +76,16 @@ namespace ops950 {
 //   Attr("partial_slice") ListInt, default {0, 0}
 //   AICore config for ascend910b, ascend910_93 and ascend950
 //
-// and the torch binding calls it as
+// The torch binding calls
+// EXEC_NPU_CMD(aclnnInplacePartialRotaryMul, x, r1, r2, mode, partial_slice),
+// which lays arguments out in declaration order and aliases the single output
+// onto the input, so the aclnn argument list is x, cos, sin, mode,
+// partialSlice. mode is from {half:0, interleave:1, quarter:2,
+// interleave-half:3}.
 //
-//   EXEC_NPU_CMD(aclnnInplacePartialRotaryMul, x, r1, r2, mode, partial_slice)
-//
-// where mode is the int from {half:0, interleave:1, quarter:2,
-// interleave-half:3}. EXEC_NPU_CMD lays the arguments out in declaration order
-// - inputs, then outputs, then attributes - and the single output aliases the
-// input, so the aclnn argument list is x, cos, sin, mode, partialSlice.
-//
-// UNVERIFIED, and it cannot be verified from a tree with stock CANN: this
-// prototype is derived from the operator definition and the torch call site,
-// not read out of a generated aclnn_inplace_partial_rotary_mul.h, because that
-// header only exists after the custom op package is built. The two things a
-// hardware run has to settle are the element order of partial_slice (this file
-// assumes {start, length}, matching the {0, 0} default meaning "no slice") and
-// whether the operator tolerates cos/sin narrower than x's head dim. Neither
-// can be guessed safely, which is why the fallback exists and why the rotary
-// test reports which path it took.
+// UNVERIFIED: derived from the operator definition and the torch call site, not
+// read out of a generated header, which only exists once the custom op package
+// is built. partial_slice is assumed to be {start, length}.
 using InplacePartialRotaryMulWorkspaceFn = int (*)(aclTensor* x_ref, const aclTensor* cos, const aclTensor* sin,
                                                    int64_t mode, const aclIntArray* partial_slice,
                                                    uint64_t* workspace_size, aclOpExecutor** executor);
@@ -135,8 +102,7 @@ inline constexpr int64_t kRotaryModeInterleaveHalf = 3;
 // ---------------------------------------------------------------------------
 // mirrors: torch_npu.npu_fused_infer_attention_score
 //          vllm_ascend/attention/attention_v1.py, the DecodeOnly branch of
-//          AscendAttentionBackendImpl._get_fia_params plus the call that
-//          follows it.
+//          AscendAttentionBackendImpl._get_fia_params and the call after it.
 //
 // The plugin's decode recipe, which the golden test reproduces argument for
 // argument:
@@ -150,29 +116,12 @@ inline constexpr int64_t kRotaryModeInterleaveHalf = 3;
 //   actual_seq_lengths_kv context length per sequence
 //   sparse_mode           0
 //
-// key and value arrive as aclTensorList with one entry, which is how the
-// single-cache case is expressed; the list exists for the multi-layer form.
+// key and value arrive as aclTensorList with one entry.
 //
-// MEASURED, 2026-09-08, CANN 9.1.0 on an Ascend950PR camodel: this operator
-// does not run on this part at all. The planning call returns 361001 with
-//
-//   AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore
-//   versions V1 to V4 are no longer supported on Ascend950.
-//
-// so the whole V1..V4 family is withdrawn on Ascend950, not just this argument
-// list. That settles - negatively - the open question this file used to record
-// about whether the DecodeOnly argument order was right: it cannot be checked
-// against the operator, because there is no operator to check it against. The
-// paged decode on a 950PR has to come from somewhere else, and the two
-// candidates in this tree are the TurboQuant kernels under
-// csrc/attention/turboquant (which is what
-// sim/test_sim_950pr_turboquant_decode.cpp drives) and whichever V5+
-// interface CANN offers in place of these.
-//
-// Tests that call it therefore have to tolerate its absence rather than
-// requiring it: test_sim_950pr_turboquant_decode.cpp uses it as an optional
-// unquantised control and reports the failure instead of failing, and
-// test_qwen_layer_golden_950pr.cpp will skip its stage 5 on this part.
+// This operator does not run on an Ascend950: the planning call returns 361001,
+// "Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer
+// supported on Ascend950". Tests that call it tolerate its absence rather than
+// requiring it.
 //
 // VERIFIED against CANN 9.1.0
 // $ASCEND_HOME_PATH/include/aclnnop/aclnn_fused_infer_attention_score_v2.h
@@ -195,8 +144,8 @@ inline constexpr int64_t kRotaryModeInterleaveHalf = 3;
 //       const aclTensor *attentionOut, const aclTensor *softmaxLse,
 //       uint64_t *workspaceSize, aclOpExecutor **executor);
 //
-// Note that softmaxLse is a required output tensor even when softmaxLseFlag is
-// false; the plugin allocates a one-element tensor for it and discards it.
+// softmaxLse is a required output tensor even when softmaxLseFlag is false; the
+// plugin allocates a one-element tensor for it and discards it.
 using FusedInferAttentionScoreV2WorkspaceFn = int (*)(
     const aclTensor* query, const aclTensorList* key, const aclTensorList* value, const aclTensor* pse_shift,
     const aclTensor* atten_mask, const aclIntArray* actual_seq_lengths, const aclIntArray* actual_seq_lengths_kv,
@@ -214,31 +163,22 @@ using FusedInferAttentionScoreV2WorkspaceFn = int (*)(
 inline const char* kFusedInferAttentionScoreV2 = "aclnnFusedInferAttentionScoreV2";
 
 // V5 - the interface that replaces the withdrawn V1..V4 family on an Ascend950.
+// Callers should prefer it and fall back to V2; see
+// device/bench_device_950pr_turboquant.cpp.
 //
-// This is the answer to the open question the V2 note above leaves: the paged
-// decode on a 950PR either comes from the TurboQuant kernels or from here.
-// Callers should prefer it and fall back to V2, which is what
-// device/bench_device_950pr_turboquant.cpp does - the fallback keeps the same
-// source working on a 310P-era CANN and on any part where V2 still exists.
+// It is V2 plus nine parameters. Seven optional inputs slot in after
+// actualSharedPrefixLenOptional:
 //
-// It is V2 plus nine parameters, in two groups. Seven optional inputs slot in
-// after actualSharedPrefixLenOptional:
+//   queryRopeOptional, keyRopeOptional        MLA's split RoPE path
+//   keyRopeAntiquantScaleOptional
+//   dequantScaleQueryOptional                 per-query dequant
+//   learnableSinkOptional                     learned attention-sink logit
+//   qStartIdxOptional, kvStartIdxOptional     sliding-window offsets
 //
-//   queryRopeOptional, keyRopeOptional        MLA's split RoPE path, where the
-//   keyRopeAntiquantScaleOptional             rotary half of Q and K is a
-//                                             separate tensor from the
-//                                             non-rotary half
-//   dequantScaleQueryOptional                 per-query dequant for a quantised
-//                                             query
-//   learnableSinkOptional                     the learned attention-sink logit
-//                                             some long-context models carry
-//   qStartIdxOptional, kvStartIdxOptional     window offsets, for the sliding
-//                                             window sparse modes
-//
-// and two int64 scalars after valueAntiquantMode: queryQuantMode and pseType.
-// A plain fp16 paged decode wants none of the seven, queryQuantMode 0 and the
-// pseType default; see shapes950::kFiaQueryQuantModeNone and kFiaPseTypeDefault
-// for the values and why they are what they are.
+// and two int64 scalars after valueAntiquantMode: queryQuantMode and pseType. A
+// plain fp16 paged decode wants none of the seven, queryQuantMode 0 and the
+// pseType default; see shapes950::kFiaQueryQuantModeNone and
+// kFiaPseTypeDefault.
 //
 // VERIFIED against CANN 9.2.0-beta.2
 // $ASCEND_HOME_PATH/include/aclnnop/aclnn_fused_infer_attention_score_v5.h
@@ -265,13 +205,8 @@ inline const char* kFusedInferAttentionScoreV2 = "aclnnFusedInferAttentionScoreV
 //       const aclTensor *attentionOut, const aclTensor *softmaxLse,
 //       uint64_t *workspaceSize, aclOpExecutor **executor);
 //
-// NOT YET EXECUTED. This prototype is transcribed from the header, and like
-// every other declaration in this file it is resolved with dlsym rather than
-// linked, so the compiler cannot check it. A mismatch shows up as a non-zero
-// planning status with the CANN diagnostic attached, not as corruption - but it
-// has never been planned on a part, because no 950PR has been available. The
-// first silicon run should treat a non-zero status here as an argument-list bug
-// before suspecting anything else.
+// NOT YET EXECUTED on a part. A mismatch shows up as a non-zero planning status
+// with the CANN diagnostic attached.
 using FusedInferAttentionScoreV5WorkspaceFn = int (*)(
     const aclTensor* query, const aclTensorList* key, const aclTensorList* value, const aclTensor* pse_shift,
     const aclTensor* atten_mask, const aclIntArray* actual_seq_lengths, const aclIntArray* actual_seq_lengths_kv,
@@ -301,9 +236,7 @@ inline const char* kFiaLayoutTnd = "TND";
 // Elementwise
 // ---------------------------------------------------------------------------
 // The attention output gate is sigmoid(gate) * context and the two residual
-// connections are x += y. Neither is a fused operator on this part, so the
-// suite calls the three stock elementwise operators the plugin's eager path
-// would produce.
+// connections are x += y. Neither is fused on this part.
 
 // VERIFIED against CANN 9.1.0 $ASCEND_HOME_PATH/include/aclnnop/aclnn_sigmoid.h
 //   aclnnStatus aclnnSigmoidGetWorkspaceSize(const aclTensor* self, aclTensor* out,
