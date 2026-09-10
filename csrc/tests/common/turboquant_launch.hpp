@@ -49,6 +49,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "../../attention/turboquant/turboquant_mode.h"
 #include "../../kernels/types.h"
 
 namespace vllm_ascend {
@@ -73,6 +74,47 @@ void turboquant_paged_attention_impl(AscendType type, void *stream, uint32_t spl
                                      uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,
                                      uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t splitTasksPerCore,
                                      uint32_t combineTasksPerCore, float scale, float invSqrtLen);
+
+void turboquant_paged_attention_combine_impl(AscendType type, void *stream, uint32_t blockDim, void *workspace,
+                                             void *piSigns, void *tables, void *output, uint32_t numTokens,
+                                             uint32_t numHeads, uint32_t headSize, uint32_t numSplits,
+                                             uint32_t tasksPerCore, float invSqrtLen);
+
+// Defined in csrc/attention/turboquant/turboquant_mm_kernels.cpp: the
+// multi-mode, Cube-native path. `mode` is the TurboQuantMode enumerator value
+// (3, 4 or 5); the launcher picks the entry point, because the mode is a
+// template parameter on the device and not a runtime branch.
+void turboquant_mm_reshape_and_cache_impl(int32_t mode, AscendType type, void *stream, uint32_t blockDim, void *key,
+                                          void *value, void *keyCache, void *valueCache, void *scaleCache,
+                                          void *slotMapping, void *piSigns, void *rotTables, void *modeTables,
+                                          uint32_t numTokens, uint32_t numKvHeads, uint32_t headSize,
+                                          uint32_t blockSize, uint32_t tokensPerCore, float invSqrtLen);
+
+void turboquant_mm_decode_split_impl(int32_t mode, AscendType type, void *stream, uint32_t blockDim, void *query,
+                                     void *keyCache, void *valueCache, void *scaleCache, void *blockTables,
+                                     void *contextLens, void *piSigns, void *rotTables, void *modeTables,
+                                     void *workspace, uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads,
+                                     uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,
+                                     uint32_t numSplits, uint32_t tasksPerCore, float scale, float invSqrtLen);
+
+/*
+ * The physical fp16 baseline the benchmark compares kv5fp8 against: the same
+ * Cube decode over an unquantised fp16 paged cache. Split then combine, two
+ * launches on one stream.
+ */
+void turboquant_fp16_decode_impl(AscendType type, void *stream, uint32_t splitBlockDim, uint32_t combineBlockDim,
+                                 void *query, void *keyCache, void *valueCache, void *blockTables,
+                                 void *contextLens, void *workspace, void *output, uint32_t numTokens,
+                                 uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,
+                                 uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t splitTasksPerCore,
+                                 uint32_t combineTasksPerCore, float scale);
+
+// A bare fp8 Cube GEMM whose fractal parameters are arguments, so a test can
+// pin them numerically instead of asserting a guess. See
+// csrc/tests/sim/test_sim_950pr_cube_gemm.cpp.
+void turboquant_cube_gemm_probe_impl(void *stream, void *a, void *b, void *c, uint32_t m, uint32_t k, uint32_t n,
+                                     uint32_t headSize, uint32_t tileRows, uint32_t aElems, uint32_t bElems,
+                                     uint32_t cElems, uint32_t bIsNk);
 
 namespace test {
 namespace turboquant_host {
@@ -200,6 +242,84 @@ struct PagedAttentionGrid {
 
 PagedAttentionGrid PlanPagedAttention(int64_t num_tokens, int64_t num_heads, int64_t head_size,
                                       int64_t max_blocks_per_seq, int64_t aiv_num);
+
+// --- multi-mode, Cube-native path -------------------------------------------
+//
+// The layout half of csrc/attention/turboquant/turboquant_mode.h is deliberately
+// free of AscendC types, so this header includes it and sizes buffers from the
+// same arithmetic the device indexes with rather than mirroring it a sixth time.
+// What still has to be mirrored is the table *image*, because the device only
+// reads it and never derives it -- ModeTables below is that mirror, and
+// TurboQuantModeCodec<MODE>::ConstTableWords is the contract it writes to.
+
+// Rows of the packed cache one Cube tile covers. Mirrors kCubeTileRows in
+// turboquant_mm_kernels.cpp.
+constexpr int64_t kCubeTileRows = 64;
+// Rows the codec expands per Unpack call, and therefore the batch_rows the mode
+// table image must be built for. Mirrors kUnpackRows there.
+constexpr int64_t kUnpackRows = 8;
+// Elements of a Cube operand in one C0 block. Mirrors kOperandC0 there and
+// TurboQuantCubeMm::kOperandC0.
+constexpr int64_t kOperandC0 = 32;
+// The GEMM's M dimension. Mirrors kCubeTileM in turboquant_cube_mm.h.
+constexpr int64_t kCubeTileM = 16;
+
+// Packed bytes for one vector slot at `mode`.
+int64_t ModePackedBytes(vllm_ascend::turboquant::TurboQuantMode mode, int64_t head_size);
+
+// int8 bytes in a packed KV cache at `mode`.
+size_t ModePackedCacheBytes(vllm_ascend::turboquant::TurboQuantMode mode, int64_t num_blocks, int64_t block_size,
+                            int64_t num_kv_heads, int64_t head_size);
+
+// Words in the mode codec's constant-table image. Mirrors
+// TurboQuantModeCodec<MODE>::ConstTableWords(head_size, batch_rows).
+int64_t ModeTableWords(vllm_ascend::turboquant::TurboQuantMode mode, int64_t head_size, int64_t batch_rows);
+
+// The image itself.
+//
+//   [0, B)        lowOffset_   uint32 byte offsets   B = head_size * batch_rows
+//   [B, 2B)       msbOffset_   uint32 byte offsets
+//   [2B, 2B+8)    lowRecip_    fp32 block, radix^-(p mod dpb)
+//   [2B+8, +8)    msbRecip_    fp32 block, 2^-(p mod 8)
+//   [2B+16, +8)   msbWeight_   fp32 block, 2^(p mod 8)
+//   [2B+24, +D)   packOffset_  uint32, the encoder's low-plane gathers
+//   [.., +levels) centroid_    the mode's stored codebook
+//
+// The two offset tables carry the NZ permutation when `nz_rows` is non-zero:
+// output position p is then an NZ position within a band of `batch_rows` rows
+// of an `nz_rows`-row tile, and the table decodes p back to the logical (r, c)
+// whose packed byte it must read. That is what lets the unpack emit Cube-ready
+// order for free; see the header of turboquant_cube_mm.h. Pass nz_rows = 0 for
+// plain row-major output, which is what the encode path and the host reference
+// want.
+std::vector<int32_t> ModeTables(vllm_ascend::turboquant::TurboQuantMode mode, int64_t head_size, int64_t batch_rows,
+                                int64_t nz_rows);
+
+// The NZ position of logical (r, c) in a `rows` x `cols` tile of 1-byte Cube
+// operands. Mirrors TurboQuantCubeMm::NzOffset; a test pins the two.
+inline int64_t NzOffset(int64_t r, int64_t c, int64_t rows) {
+  return (c / kOperandC0) * rows * kOperandC0 + r * kOperandC0 + (c % kOperandC0);
+}
+
+// The grid the Cube decode's split stage launches with.
+//
+// The task is (token, kv_head, split) rather than (token, head, split) -- the
+// query heads of one kv head are batched into the GEMM's M dimension -- so the
+// task count is num_kv_heads times smaller than the AIV path's and the split
+// count has correspondingly more idle cores to absorb. The workspace is the
+// same size either way: it is indexed per head, because the combine stage this
+// shares with the AIV path reads it that way.
+struct CubeDecodeGrid {
+  uint32_t split_block_dim = 0;
+  uint32_t combine_block_dim = 0;
+  uint32_t split_tasks_per_core = 0;
+  uint32_t combine_tasks_per_core = 0;
+  int64_t num_splits = 1;
+  size_t workspace_floats = 0;
+};
+
+CubeDecodeGrid PlanCubeDecode(int64_t num_tokens, int64_t num_heads, int64_t num_kv_heads, int64_t head_size,
+                              int64_t max_blocks_per_seq, int64_t aiv_num);
 
 }  // namespace turboquant_host
 }  // namespace test

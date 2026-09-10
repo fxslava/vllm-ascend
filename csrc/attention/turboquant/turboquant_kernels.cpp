@@ -1053,4 +1053,32 @@ void turboquant_paged_attention_impl(AscendType type, void *stream, uint32_t spl
     }
 }
 
+
+/*
+ * The combine stage on its own.
+ *
+ * turboquant_paged_attention_impl above launches split-then-combine as a pair,
+ * which is what the 4-bit AIV path wants.  The Cube path in
+ * turboquant_mm_kernels.cpp launches its own split and then needs *this*
+ * reduction, unchanged: the partials it writes are in exactly this layout, and
+ * the reduction is rate-independent because it reads nothing but the workspace
+ * and the rotation tables.  Exposing it separately is what lets there be one
+ * combine rather than two.
+ */
+void turboquant_paged_attention_combine_impl(AscendType type, void *stream, uint32_t blockDim, void *workspace,
+                                             void *piSigns, void *tables, void *output, uint32_t numTokens,
+                                             uint32_t numHeads, uint32_t headSize, uint32_t numSplits,
+                                             uint32_t tasksPerCore, float invSqrtLen)
+{
+    if (type == AscendType::FP16) {
+        turboquant_paged_attention_combine_half<<<blockDim, nullptr, stream>>>(
+            workspace, piSigns, tables, output, numTokens, numHeads, headSize, numSplits, tasksPerCore, invSqrtLen);
+#if !defined(__CCE_AICORE__) || (__CCE_AICORE__ >= 220)
+    } else if (type == AscendType::BF16) {
+        turboquant_paged_attention_combine_bfloat16_t<<<blockDim, nullptr, stream>>>(
+            workspace, piSigns, tables, output, numTokens, numHeads, headSize, numSplits, tasksPerCore, invSqrtLen);
+#endif
+    }
+}
+
 }  // namespace vllm_ascend

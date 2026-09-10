@@ -77,5 +77,7 @@ message(STATUS "vllm-ascend tests: TurboQuant kernels RUN_MODE=${RUN_MODE}, SOC_
 
 include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 
+# Unquoted on purpose: VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE is a list of two
+# sources, and quoting it would hand ascendc_library one semicolon-joined path.
 ascendc_library(vllm_ascend_turboquant SHARED
-  "${VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE}")
+  ${VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE})

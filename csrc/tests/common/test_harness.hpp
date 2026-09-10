@@ -182,5 +182,49 @@ const std::string& SimulatorEvidence();
     }                                                                                      \
   } while (false)
 
+
+// A case that exercises a path known not to work yet.
+//
+// The distinction this draws is between "the machine cannot run this" -- which
+// is what every gate above is for -- and "this code is wrong and we know it".
+// Both should skip in a default run, but for opposite reasons, and conflating
+// them hides the second: a suite where the broken cases are simply absent looks
+// green, and a suite where they fail looks broken in a way that says nothing
+// about the change under test.
+//
+// So a case gated on this skips with the reason and a pointer, and
+// VLLM_ASCEND_TQ_CUBE_WIP=1 runs it. Delete the gate, do not weaken it, when the
+// path works.
+//
+// -DVLLM_ASCEND_TESTS_ENABLE_WIP_CUBE=ON flips the default for a tree dedicated
+// to fixing that path; the environment variable still decides in both
+// directions, so such a tree can be asked for the stable baseline with
+// VLLM_ASCEND_TQ_CUBE_WIP=0 rather than a reconfigure. The same pair gates the
+// Cube legs of bench_device_950pr_turboquant, deliberately: one switch, wherever
+// the work-in-progress path appears.
+#if defined(VLLM_ASCEND_TQ_CUBE_WIP_DEFAULT_ON)
+constexpr bool kCubeWipDefaultOn = true;
+#else
+constexpr bool kCubeWipDefaultOn = false;
+#endif
+
+// True when the work-in-progress Cube cases should run.
+inline bool CubeWipOptedIn() {
+  const char* wip = std::getenv("VLLM_ASCEND_TQ_CUBE_WIP");
+  if (wip == nullptr || wip[0] == '\0') {
+    return kCubeWipDefaultOn;
+  }
+  return wip[0] != '0';
+}
+
+#define REQUIRE_CUBE_WIP_OPT_IN(what, why)                                                 \
+  do {                                                                                     \
+    if (!::vllm_ascend::test::CubeWipOptedIn()) {                                          \
+      GTEST_SKIP() << (what) << " is work in progress and does not pass: " << (why)        \
+                   << " Set VLLM_ASCEND_TQ_CUBE_WIP=1 to run it anyway. See "              \
+                      "csrc/tests/TURBOQUANT_TESTS.md section 13.8.";                      \
+    }                                                                                      \
+  } while (false)
+
 }  // namespace test
 }  // namespace vllm_ascend
