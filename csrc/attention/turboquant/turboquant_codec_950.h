@@ -143,6 +143,26 @@ public:
     // Bit position of the fp32 sign, which is how a comparison is turned into
     // an integer 0/1 without a mask register.
     static constexpr uint32_t kSignBitShift = 31;
+    /*
+     * How many of the fifteen boundary tests Quantize4Bit keeps in flight.
+     *
+     * The tests are mutually independent -- only their sum is ordered -- but
+     * evaluating them one at a time through a single shared scratch buffer makes
+     * each one wait for the last, and every Adds -> ShiftRight -> Add triple
+     * needs a PipeBarrier<PIPE_V> between its halves.  That is a 45-barrier
+     * chain on the critical path of every KV write.  Measured on the 950PR
+     * camodel it cost 4.2x the cycles of the absmax quantiser it replaced for
+     * only 1.9x the instructions, with 3.3x the hazard stalls and -- the giveaway
+     * -- not one vector-issue-queue-full event: the core was starved, never
+     * saturated.
+     *
+     * With kBinLanes buffers the lanes issue back to back and the barriers drop
+     * to (2 + log2(kBinLanes) + 1) per group of kBinLanes boundaries.  Eight
+     * lanes takes the count from 45 to 13 for +7 * vecLen floats of UB, which is
+     * the balance point: sixteen would reach 7 barriers but doubles the buffer
+     * for one more halving.
+     */
+    static constexpr int kBinLanes = 8;
 
     /*
      * The 16-level Lloyd-Max quantiser for N(0, 1): the fixed point of
@@ -198,10 +218,15 @@ public:
         return 7u * vecLen + 2u * vecLen * batchRows + static_cast<uint32_t>(kLevels);
     }
 
-    // Scratch, deliberately uninitialised: swap_, scratch_, reduceWork_, broadcast_.
+    // Scratch, deliberately uninitialised: swap_, scratch_, reduceWork_,
+    // broadcast_, and the kBinLanes boundary-test lanes.  Purely internal - the
+    // host builds ConstTableWords and never this - so widening it changes no
+    // contract and needs no mirror.  The lanes are sized off vecLen rather than
+    // batchLen because Quantize4Bit only ever runs one vector at a time.
     __aicore__ static inline uint32_t WorkBufferWords(uint32_t vecLen, uint32_t batchRows)
     {
-        return 2u * vecLen * batchRows + vecLen + kBrcbDstLanes + kFp32PerBlock;
+        return 2u * vecLen * batchRows + vecLen + kBrcbDstLanes + kFp32PerBlock +
+               static_cast<uint32_t>(kBinLanes) * vecLen;
     }
 
     /*
@@ -254,6 +279,11 @@ public:
         reduceWork_ = work[off];
         off += len_;
         broadcast_ = work[off];
+        off += kBrcbDstLanes + kFp32PerBlock;
+        for (int lane = 0; lane < kBinLanes; ++lane) {
+            binLane_[lane] = work[off];
+            off += len_;
+        }
     }
 
     /*
@@ -388,16 +418,44 @@ public:
         // reusing it as the bin accumulator keeps the codec's UB footprint
         // unchanged by the switch to a non-uniform table.
         AscendC::LocalTensor<int32_t> bins = reduceWork_.ReinterpretCast<int32_t>();
-        AscendC::LocalTensor<uint32_t> signBits = swap_.ReinterpretCast<uint32_t>();
-        AscendC::LocalTensor<int32_t> signInts = swap_.ReinterpretCast<int32_t>();
         AscendC::Duplicate(bins, 0, n);
         AscendC::PipeBarrier<PIPE_V>();
-        for (int i = 0; i < kThresholdCount; ++i) {
-            AscendC::Adds(swap_, scratch_, Threshold(i), n);
+
+        // sum_i [u > t_i], evaluated kBinLanes boundaries at a time.  Each lane
+        // owns its difference buffer, so a lane's Adds never waits on another
+        // lane's Add to release shared scratch, and the only ordering left is
+        // the one the arithmetic actually requires: write the differences, read
+        // their sign bits, reduce.  See kBinLanes for what the serial form cost.
+        for (int base = 0; base < kThresholdCount; base += kBinLanes) {
+            const int lanes =
+                (kThresholdCount - base) < kBinLanes ? (kThresholdCount - base) : kBinLanes;
+
+            // t_i - u, written the way round that puts the answer to the strict
+            // comparison in the sign bit.  Independent across lanes.
+            for (int lane = 0; lane < lanes; ++lane) {
+                AscendC::Adds(binLane_[lane], scratch_, Threshold(base + lane), n);
+            }
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::ShiftRight(signBits, signBits, kSignBitShift, static_cast<int32_t>(n));
+
+            // Sign bit -> integer 0/1, in place, still independent across lanes.
+            for (int lane = 0; lane < lanes; ++lane) {
+                AscendC::LocalTensor<uint32_t> bits = binLane_[lane].ReinterpretCast<uint32_t>();
+                AscendC::ShiftRight(bits, bits, kSignBitShift, static_cast<int32_t>(n));
+            }
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Add(bins, bins, signInts, n);
+
+            // Pairwise tree over the lanes: log2(lanes) barriers rather than one
+            // per boundary.  Every Add in a round is independent of the others.
+            for (int span = 1; span < lanes; span <<= 1) {
+                for (int lane = 0; lane + span < lanes; lane += 2 * span) {
+                    AscendC::LocalTensor<int32_t> dst = binLane_[lane].ReinterpretCast<int32_t>();
+                    AscendC::LocalTensor<int32_t> src2 =
+                        binLane_[lane + span].ReinterpretCast<int32_t>();
+                    AscendC::Add(dst, dst, src2, n);
+                }
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+            AscendC::Add(bins, bins, binLane_[0].ReinterpretCast<int32_t>(), n);
             AscendC::PipeBarrier<PIPE_V>();
         }
         // q lands in [0, 15] by construction -- there are fifteen boundaries --
@@ -575,6 +633,7 @@ private:
     AscendC::LocalTensor<float> scratch_;
     AscendC::LocalTensor<float> reduceWork_;
     AscendC::LocalTensor<float> broadcast_;
+    AscendC::LocalTensor<float> binLane_[kBinLanes];
     uint32_t len_ = 0;
     uint32_t batchLen_ = 0;
     float invSqrtLen_ = 1.0f;
