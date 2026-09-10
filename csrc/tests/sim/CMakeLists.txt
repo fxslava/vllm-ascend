@@ -47,8 +47,15 @@ if(NOT VLLM_ASCEND_TESTS_HAVE_TURBOQUANT)
 endif()
 
 set(VLLM_ASCEND_SIM_TESTS
+  # The fp8 Cube fractal contract: NZ layout, LoadData step units, Mmad
+  # argument order, Fixpipe output layout. Seconds, not minutes, and it is what
+  # every other Cube case here depends on being right.
+  test_sim_950pr_cube_gemm
   test_sim_950pr_turboquant_kernels
-  test_sim_950pr_turboquant_decode)
+  test_sim_950pr_turboquant_decode
+  # Single-shot dispatch + fidelity smoke of the Cube-native multi-mode decode.
+  # One pass per mode at S = 16; see the file header for why it must stay one.
+  test_sim_950pr_turboquant_multimode)
 
 foreach(test_name ${VLLM_ASCEND_SIM_TESTS})
   vllm_ascend_add_device_executable(${test_name} "${test_name}.cpp" ../common/main_950pr.cpp)

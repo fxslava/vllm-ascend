@@ -154,6 +154,186 @@ PagedAttentionGrid PlanPagedAttention(int64_t num_tokens, int64_t num_heads, int
   return grid;
 }
 
+// --- multi-mode, Cube-native path -------------------------------------------
+
+namespace {
+
+namespace tqm = vllm_ascend::turboquant;
+
+// Plane geometry, mirroring TurboQuantPlanes in turboquant_codec_mx.h. Kept
+// local because it is device-side packing detail: the mode header exposes only
+// PackedBytes, which is what the rest of the host needs.
+struct ModePlanes {
+  int32_t low_bits;
+  int32_t msb_bits;
+  int32_t low_radix;
+  int32_t low_per_byte;
+};
+
+ModePlanes PlanesOf(tqm::TurboQuantMode mode) {
+  switch (mode) {
+    case tqm::TurboQuantMode::KV3_FP4:
+      return {2, 1, 4, 4};
+    case tqm::TurboQuantMode::KV4_FP8:
+      return {4, 0, 16, 2};
+    default:
+      return {4, 1, 16, 2};
+  }
+}
+
+const float *CentroidsOf(tqm::TurboQuantMode mode) {
+  switch (mode) {
+    case tqm::TurboQuantMode::KV3_FP4:
+      return tqm::TurboQuantModeTraits<tqm::TurboQuantMode::KV3_FP4>::kCentroids;
+    case tqm::TurboQuantMode::KV4_FP8:
+      return tqm::TurboQuantModeTraits<tqm::TurboQuantMode::KV4_FP8>::kCentroids;
+    default:
+      return tqm::TurboQuantModeTraits<tqm::TurboQuantMode::KV5_FP8>::kCentroids;
+  }
+}
+
+int64_t Shift(int32_t digits_per_byte) {
+  int64_t shift = 0;
+  while ((static_cast<int64_t>(1) << shift) < digits_per_byte) {
+    ++shift;
+  }
+  return shift;
+}
+
+}  // namespace
+
+int64_t ModePackedBytes(tqm::TurboQuantMode mode, int64_t head_size) {
+  return tqm::TurboQuantModeConfigOf(mode).PackedBytes(head_size);
+}
+
+size_t ModePackedCacheBytes(tqm::TurboQuantMode mode, int64_t num_blocks, int64_t block_size, int64_t num_kv_heads,
+                            int64_t head_size) {
+  return static_cast<size_t>(num_blocks) * static_cast<size_t>(block_size) * static_cast<size_t>(num_kv_heads) *
+         static_cast<size_t>(ModePackedBytes(mode, head_size));
+}
+
+int64_t ModeTableWords(tqm::TurboQuantMode mode, int64_t head_size, int64_t batch_rows) {
+  const int64_t levels = tqm::TurboQuantModeConfigOf(mode).levels;
+  // 2B + 3 periodic blocks + packOffset_ + centroid_, matching
+  // TurboQuantModeCodec<MODE>::ConstTableWords.
+  return 2 * head_size * batch_rows + 3 * kFp32PerBlock + head_size + levels;
+}
+
+std::vector<int32_t> ModeTables(tqm::TurboQuantMode mode, int64_t head_size, int64_t batch_rows, int64_t nz_rows) {
+  const ModePlanes planes = PlanesOf(mode);
+  const tqm::TurboQuantModeConfig cfg = tqm::TurboQuantModeConfigOf(mode);
+  const int64_t d = head_size;
+  const int64_t batch = d * batch_rows;
+  const int64_t packed_bytes = cfg.PackedBytes(d);
+  const int64_t low_bytes = d / planes.low_per_byte;
+  const int64_t low_shift = Shift(planes.low_per_byte);
+
+  std::vector<int32_t> tables;
+  tables.reserve(static_cast<size_t>(ModeTableWords(mode, d, batch_rows)));
+
+  // lowOffset_ and msbOffset_.
+  //
+  // Output position p is a plain row-major index when nz_rows == 0, and an NZ
+  // position within this batch's band of an nz_rows-row tile otherwise. The
+  // band-local NZ position is
+  //
+  //     p = b * (batch_rows * C0) + r * C0 + w,   c = b * C0 + w
+  //
+  // so decoding p back to (r, c) is the inverse of TurboQuantCubeMm::NzOffset
+  // with `rows` set to batch_rows -- the full tile's row count only shifts the
+  // *destination* base, which the kernel applies with a strided DataCopy, and
+  // never enters this table. nz_rows is therefore only checked for consistency.
+  for (int plane = 0; plane < 2; ++plane) {
+    for (int64_t p = 0; p < batch; ++p) {
+      int64_t r = p / d;
+      int64_t c = p % d;
+      if (nz_rows > 0) {
+        const int64_t band = batch_rows * kOperandC0;
+        const int64_t b = p / band;
+        const int64_t rem = p % band;
+        r = rem / kOperandC0;
+        c = b * kOperandC0 + (rem % kOperandC0);
+      }
+      const int64_t byte = plane == 0 ? r * packed_bytes + (c >> low_shift)
+                                      : r * packed_bytes + low_bytes + (c >> 3);
+      tables.push_back(static_cast<int32_t>(kWord * byte));
+    }
+  }
+
+  // lowRecip_: radix^-(p mod low_per_byte), one 32-byte block.
+  //
+  // The period divides the block's 8 lanes, which is what lets a single block
+  // stand in for a full-length table -- and it survives the NZ permutation
+  // because C0 is a multiple of every period here. See the note in
+  // turboquant_cube_mm.h.
+  for (int64_t lane = 0; lane < kFp32PerBlock; ++lane) {
+    float recip = 1.0f;
+    for (int64_t j = 0; j < lane % planes.low_per_byte; ++j) {
+      recip /= static_cast<float>(planes.low_radix);
+    }
+    tables.push_back(FloatBits(recip));
+  }
+  // msbRecip_: 2^-(p mod 8).
+  for (int64_t lane = 0; lane < kFp32PerBlock; ++lane) {
+    tables.push_back(FloatBits(1.0f / static_cast<float>(static_cast<int64_t>(1) << lane)));
+  }
+  // msbWeight_: 2^(p mod 8), the encoder's bit-plane fold.
+  for (int64_t lane = 0; lane < kFp32PerBlock; ++lane) {
+    tables.push_back(FloatBits(static_cast<float>(static_cast<int64_t>(1) << lane)));
+  }
+
+  // packOffset_: the encoder's low-plane deinterleave, low_per_byte tables of
+  // d / low_per_byte entries laid end to end. Always d words in total, which is
+  // why the image's size does not depend on the radix.
+  for (int64_t j = 0; j < planes.low_per_byte; ++j) {
+    for (int64_t b = 0; b < low_bytes; ++b) {
+      tables.push_back(static_cast<int32_t>(kWord * (b * planes.low_per_byte + j)));
+    }
+  }
+
+  // centroid_, the stored codebook: cast(gain * c), already on the operand grid.
+  const float *centroids = CentroidsOf(mode);
+  for (int64_t level = 0; level < cfg.levels; ++level) {
+    tables.push_back(FloatBits(centroids[level]));
+  }
+
+  return tables;
+}
+
+CubeDecodeGrid PlanCubeDecode(int64_t num_tokens, int64_t num_heads, int64_t num_kv_heads, int64_t head_size,
+                              int64_t max_blocks_per_seq, int64_t aiv_num) {
+  CubeDecodeGrid grid;
+  if (num_tokens <= 0 || num_heads <= 0 || num_kv_heads <= 0) {
+    return grid;
+  }
+
+  // One task per (token, kv_head): the query heads sharing a kv head are batched
+  // into the GEMM's M dimension, so there are num_kv_heads tasks per token and
+  // not num_heads.
+  const int64_t base_tasks = num_tokens * num_kv_heads;
+
+  int64_t num_splits = CeilDiv(aiv_num, base_tasks);
+  num_splits = std::min(num_splits, std::min<int64_t>(kMaxSequenceSplits, std::max<int64_t>(1, max_blocks_per_seq)));
+  num_splits = std::max<int64_t>(num_splits, 1);
+  grid.num_splits = num_splits;
+
+  // The workspace is indexed per *head*, not per task: the combine stage is the
+  // AIV path's and reads (token, head, split).
+  const int64_t partial_stride = head_size + kPartialTail;
+  const int64_t combine_tasks = num_tokens * num_heads;
+  grid.workspace_floats = static_cast<size_t>(combine_tasks * num_splits * partial_stride);
+
+  const int64_t split_tasks = base_tasks * num_splits;
+  const int64_t split_tasks_per_core = CeilDiv(split_tasks, aiv_num);
+  const int64_t combine_tasks_per_core = CeilDiv(combine_tasks, aiv_num);
+
+  grid.split_tasks_per_core = static_cast<uint32_t>(split_tasks_per_core);
+  grid.combine_tasks_per_core = static_cast<uint32_t>(combine_tasks_per_core);
+  grid.split_block_dim = static_cast<uint32_t>(CeilDiv(split_tasks, split_tasks_per_core));
+  grid.combine_block_dim = static_cast<uint32_t>(CeilDiv(combine_tasks, combine_tasks_per_core));
+  return grid;
+}
+
 }  // namespace turboquant_host
 }  // namespace test
 }  // namespace vllm_ascend

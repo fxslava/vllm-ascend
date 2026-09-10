@@ -136,6 +136,38 @@ option(VLLM_ASCEND_TESTS_HOST_ONLY "Build only the targets that need no CANN too
 option(VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS
        "Compile the TurboQuant Ascend C kernels and build the tests that drive them" ON)
 
+# The Cube-native multi-mode decode (turboquant_mm_kernels.cpp) is work in
+# progress and does not pass: the score GEMM's [n, k] B form does not reproduce
+# the host product, and TurboQuantCubeMm::Init allocates L0 on both halves of
+# the MIX kernel, which stalls the split kernel on the camodel.
+# TURBOQUANT_TESTS.md section 13.8 records both in full.
+#
+# It is still COMPILED in every configuration - it has to keep building clean
+# under -Werror while it is being fixed - so what this option changes is only
+# whether the cases that LAUNCH it run by default:
+#
+#   OFF (default)  bench_device_950pr_turboquant runs the verified 4-bit AIV
+#                  path and records a skip for each Cube case; the two sim
+#                  tests that drive the Cube skip through
+#                  REQUIRE_CUBE_WIP_OPT_IN.
+#   ON             those cases run without any environment variable, for a tree
+#                  dedicated to fixing the path.
+#
+# VLLM_ASCEND_TQ_CUBE_WIP overrides this at run time in BOTH directions, so a
+# tree configured with it ON can still be asked for the stable baseline.
+#
+# Delete the option, and the gates it feeds, when the Cube path works.
+option(VLLM_ASCEND_TESTS_ENABLE_WIP_CUBE
+       "Run the work-in-progress Cube decode cases by default (they are compiled either way)" OFF)
+
+if(VLLM_ASCEND_TESTS_ENABLE_WIP_CUBE)
+  add_compile_definitions(VLLM_ASCEND_TQ_CUBE_WIP_DEFAULT_ON)
+  message(WARNING
+    "vllm-ascend tests: VLLM_ASCEND_TESTS_ENABLE_WIP_CUBE=ON - the Cube-native decode cases will run "
+    "by default. That path is known not to pass (TURBOQUANT_TESTS.md section 13.8); expect a stream "
+    "fault rather than a wrong number.")
+endif()
+
 # How the Ascend C kernels are built and where they run.
 #
 #   npu   real silicon, linked against libruntime.so                (default)
@@ -629,12 +661,20 @@ if(VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE)
   set(VLLM_ASCEND_TESTS_HAVE_TURBOQUANT FALSE)
 
   if(VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS)
+    # Two sources, one library. turboquant_kernels.cpp is the AIV-only 4-bit
+    # path; turboquant_mm_kernels.cpp is the multi-mode Cube-native one. They
+    # share a library rather than having one each because the Cube decode reuses
+    # the AIV path's combine kernel, and a <<<>>> call site can only reach a
+    # kernel whose generated launcher is in the same ascendc_library.
     set(VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE
-        "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/turboquant_kernels.cpp")
+        "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/turboquant_kernels.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/turboquant_mm_kernels.cpp")
 
-    if(NOT EXISTS "${VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE}")
-      message(FATAL_ERROR "TurboQuant kernel source not found at ${VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE}")
-    endif()
+    foreach(kernel_source ${VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE})
+      if(NOT EXISTS "${kernel_source}")
+        message(FATAL_ERROR "TurboQuant kernel source not found at ${kernel_source}")
+      endif()
+    endforeach()
 
     set(VLLM_ASCEND_SIMULATOR_LIB_DIR "${ASCEND_HOME_PATH}/tools/simulator/${SOC_VERSION}/lib")
     if(VLLM_ASCEND_TESTS_TIER_SIM)
