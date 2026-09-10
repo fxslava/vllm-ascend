@@ -1,0 +1,84 @@
+o60133706@ubuntu:~/vllm-ascend/build/csrc-tests-npu$ ./bench_turboquant_950pr
+[ascend-bench] vllm-ascend Ascend 950PR kernel microbenchmarks (no Python, no torch)
+[ascend-bench] device 0 ready, soc='Ascend950PR_9589'
+[ascend-bench] TurboQuant AIV-only decode: vector cores = 64 (from aclGetDeviceCapability)
+[ascend-bench] fp16 control operator aclnnFusedInferAttentionScoreV2: resolved
+
+[ascend-bench] KV traffic model (exact byte counts, head_dim=256 heads=8 kv_heads=2 block=128)
+[ascend-bench]   cache footprint for S tokens, and the bytes one decode step streams
+
+       S      fp16 cache      tq4 cache    ratio   fp16 decode read  tq4 decode read    ratio
+  -------------------------------------------------------------------------------------------
+     512       1024.0 KiB       272.0 KiB    3.76x          4104.0 KiB        1228.0 KiB    3.34x
+    1024       2048.0 KiB       544.0 KiB    3.76x          8200.0 KiB        2448.0 KiB    3.35x
+    2048       4096.0 KiB      1088.0 KiB    3.76x         16392.0 KiB        4752.0 KiB    3.45x
+
+[ascend-bench]   the tq4 cache column is 94.1% packed codes and 5.9% scale plane; at kv_heads=2 a token's
+[ascend-bench]   slot is 8 fp32 lanes for 4 live ones, so 50% of that scale plane is burst padding -
+[ascend-bench]   2.9% of the whole 4-bit cache, and the price of every DMA being aligned
+
+[ascend-bench] S=512: blocks_per_seq=4 pool=16 splits=4 grid(write)=64 grid(split)=32 grid(combine)=8
+
+[ascend-bench] S=1024: blocks_per_seq=8 pool=32 splits=8 grid(write)=64 grid(split)=64 grid(combine)=8
+
+[ascend-bench] S=2048: blocks_per_seq=16 pool=64 splits=8 grid(write)=64 grid(split)=64 grid(combine)=8
+
+[ascend-bench] TurboQuant decode summary (AIV only; median of the pipelined mode)
+
+       S        tq4 us  tq4 steps/s    tq4 KV GB/s  tq4 TFLOP/s        fp16 us    speedup
+  ---------------------------------------------------------------------------------------
+     512         43.95        22752           28.6        0.095              -          -
+    1024         48.78        20501           51.4        0.172              -          -
+    2048         78.80        12690           61.8        0.213              -          -
+
+[ascend-bench]   steps/s is one sequence's decode step, not a batch. The KV GB/s column is the
+[ascend-bench]   traffic model's tq4 decode-read bytes over the measured time, so it is what the
+[ascend-bench]   kernel asked the memory system for and not a fill-rate ceiling.
+[ascend-bench]   the fp16 column is empty: see the skip list below and the header of this file.
+[ascend-bench]   The bandwidth comparison to fall back on is the traffic model above, whose
+[ascend-bench]   decode-read ratio is 3.34x at S=512.
+
+[ascend-bench] turboquant_950pr (4-bit rotated KV cache, AIV only, no Cube)
+[ascend-bench]   warmup=20 iterations=100 pipeline_batch=10
+[ascend-bench]   launch path: replan-per-launch (aclSetAclOpExecutorRepeatable / aclDestroyAclOpExecutor not both exported by this CANN build)
+[ascend-bench]   device timing events: ACL_EVENT_TIME_LINE|ACL_EVENT_SYNC (timestamped, host-waitable)
+[ascend-bench]   times are microseconds per operator launch; percentiles are nearest-rank
+
+  case                              mode              min    median      mean       p95       p99    stddev     TFLOP/s      GB/s
+  ---------------------------------------------------------------------------------------------------------------------
+  tq4_write_s512                    pipelined      145.50    145.93    145.94    146.28    146.78      0.27           -       9.1
+  tq4_write_s512                    device         144.62    146.22    146.36    147.49    147.90      1.49           -       9.1
+  tq4_write_s512                    host           153.85    155.71    156.06    159.00    163.87      1.80           -       8.5
+
+  tq4_decode_s512                   pipelined       43.73     43.95     43.98     44.09     44.86      0.19       0.095      28.6
+  tq4_decode_s512                   device          43.59     44.18     44.29     44.56     44.65      1.09       0.095      28.5
+  tq4_decode_s512                   host            53.01     54.10     54.22     56.03     57.25      0.94       0.078      23.2
+
+  tq4_write_s1024                   pipelined      284.55    285.13    285.16    285.59    286.19      0.34           -       9.3
+  tq4_write_s1024                   device         283.57    285.37    285.71    287.34    288.04      2.36           -       9.3
+  tq4_write_s1024                   host           292.79    299.04    298.60    301.51    306.12      2.55           -       8.9
+
+  tq4_decode_s1024                  pipelined       48.51     48.78     48.81     49.04     49.73      0.22       0.172      51.4
+  tq4_decode_s1024                  device          48.43     48.94     49.07     49.41     49.82      1.17       0.171      51.2
+  tq4_decode_s1024                  host            57.28     58.54     58.95     60.97     62.23      1.28       0.143      42.8
+
+  tq4_write_s2048                   pipelined      562.63    563.74    563.75    564.44    564.53      0.43           -       9.4
+  tq4_write_s2048                   device         560.81    563.91    564.22    566.32    568.18      2.65           -       9.4
+  tq4_write_s2048                   host           572.53    575.79    576.43    581.52    582.34      3.02           -       9.2
+
+  tq4_decode_s2048                  pipelined       78.58     78.80     78.84     79.01     79.73      0.19       0.213      61.8
+  tq4_decode_s2048                  device          78.39     79.08     79.16     79.39     79.61      1.14       0.212      61.5
+  tq4_decode_s2048                  host            88.39     89.21     89.39     90.57     93.10      0.88       0.188      54.5
+
+[ascend-bench] skipped:
+  fp16_decode_s512: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:544: aclnnFusedInferAttentionScoreV2GetWorkspaceSize failed with status 361001
+  CANN: [PID: 889182] 2026-09-10-15:26:10.975.791 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
+        Solution: In this scenario, collect the plog when the fault occurs and locate the fault based on the plog.
+
+  fp16_decode_s1024: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:544: aclnnFusedInferAttentionScoreV2GetWorkspaceSize failed with status 361001
+  CANN: [PID: 889182] 2026-09-10-15:26:11.415.168 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
+        Solution: In this scenario, collect the plog when the fault occurs and locate the fault based on the plog.
+
+  fp16_decode_s2048: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:544: aclnnFusedInferAttentionScoreV2GetWorkspaceSize failed with status 361001
+  CANN: [PID: 889182] 2026-09-10-15:26:12.254.224 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
+        Solution: In this scenario, collect the plog when the fault occurs and locate the fault based on the plog.
