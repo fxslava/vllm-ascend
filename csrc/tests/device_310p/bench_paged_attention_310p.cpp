@@ -17,25 +17,16 @@
 // The paged KV path on Ascend 310P: the cache write, benchmarked, and the
 // decode attention, which cannot be.
 //
-// aclnnPagedAttention does not exist on CANN 9.1.0. torch_npu._npu_paged_attention
-// is an ATB operator (atb::PagedAttentionOperation in libatb.so), a C++ object
-// API that the aclnn two-phase launch path here cannot drive, and the aclnn
-// alternative aclnnIncreFlashAttentionV4 expects a different paged KV layout
-// from the 310P 5-D NZ cache. See common/aclnn_ops.hpp. The decode case is
-// therefore registered as a skip with that reason rather than quietly omitted,
-// so the report shows the hole.
+// aclnnPagedAttention does not exist on CANN 9.1.0.
+// torch_npu._npu_paged_attention is an ATB operator, and the aclnn alternative
+// aclnnIncreFlashAttentionV4 expects a different paged KV layout from the 310P
+// 5-D NZ cache. See common/aclnn_ops.hpp. The decode case is registered as a
+// skip with that reason so the report shows the hole.
 //
-// What is benchmarked is aclnnScatterPaKvCache, the aclnn route to
-// torch_npu._npu_reshape_and_cache, which every decode step runs once per layer
-// before attention. It is a pure scatter: each token's key and value are copied
-// into the slot the block table assigned, with no arithmetic at all, so GB/s is
-// the only meaningful figure.
-//
-// The slot mapping is a shuffle rather than a run of consecutive slots. That is
-// the realistic case - a decode batch writes one token per sequence, and those
-// sequences hold unrelated physical blocks - and it is also the expensive one,
-// because consecutive slots would let the kernel coalesce writes that the real
-// workload cannot.
+// What is benchmarked is aclnnScatterPaKvCache, a pure scatter with no
+// arithmetic, so GB/s is the only meaningful figure. The slot mapping is a
+// shuffle rather than a run of consecutive slots, which is both the realistic
+// case and the one the kernel cannot coalesce.
 
 #include <algorithm>
 #include <cstdint>
@@ -187,11 +178,9 @@ void BuildSuite(BenchmarkRunner& runner) {
           benchmark_case.bytes_per_iteration =
               2.0 * 2.0 * 2.0 * static_cast<double>(kv_elements) + 4.0 * static_cast<double>(num_tokens);
           benchmark_case.launch = [&planned](aclrtStream stream) { planned.Launch(stream); };
-          // The scatter is idempotent: the same values go to the same slots
-          // every launch, so the cache must be bit-identical across the run.
-          // The whole cache is summed rather than just the written slots -
-          // DeviceBuffer zeroes on allocation, so the untouched slots contribute
-          // nothing and a stray write outside the slot mapping is caught too.
+          // The scatter is idempotent, so the cache must be bit-identical
+          // across the run. The whole cache is summed rather than just the
+          // written slots, so a stray write outside the mapping is caught too.
           benchmark_case.checksum = [&key_cache_device]() {
             return ChecksumSum(key_cache_device.ToFloatFromHalf());
           };

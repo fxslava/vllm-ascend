@@ -21,8 +21,7 @@
 //     if x.shape[-1] % 32 == 0:  out = torch_npu.npu_swiglu(x)
 //     else:                      out = F.silu(x[..., :h]) * x[..., h:]
 //
-// The 32-element gate is a real 310P constraint rather than a style choice, so
-// it gets its own test alongside the numerical parity checks.
+// The 32-element gate is a real 310P constraint, so it gets its own test.
 
 #include <gtest/gtest.h>
 

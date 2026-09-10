@@ -18,71 +18,34 @@
 // full_attention block) on Ascend 950PR, against the PyTorch dump in
 // csrc/tests/data/golden_layer3.
 //
-// Every other test in this directory checks one operator against a CPU
-// reference. This one checks that the operators compose: it runs a whole layer
-// on the NPU - RMSNorm, four projections, partial RoPE, a paged KV write and
-// decode, the attention output gate, the out projection, two residual adds,
-// SwiGLU and the MLP - and compares seven intermediate taps plus the final
-// output against scripts/dump_qwen35_layer3.py.
+// It runs a whole layer on the NPU -- RMSNorm, four projections, partial RoPE,
+// a paged KV write and decode, the attention output gate, the out projection,
+// two residual adds, SwiGLU and the MLP -- and compares seven intermediate taps
+// plus the final output against scripts/dump_qwen35_layer3.py. The taps work
+// because the dumper rounds to fp16 at every stage boundary exactly as these
+// operators do.
 //
 // It is the Ascend port of csrc/tests/kernels/cuda/test_qwen_layer_golden.cpp
-// and consumes the same dump, unchanged, so a divergence between the two is a
-// backend difference rather than a difference in what is being asked.
+// and consumes the same dump unchanged.
 //
-// Why taps rather than only the final output: a single end-to-end comparison
-// tells you a layer is wrong, not where. The taps localise it to a stage, which
-// is the entire reason for dumping them. They only work because the dumper
-// rounds to fp16 at every stage boundary exactly as these operators do - see
-// the numerics note at the top of that script.
-//
-// -----------------------------------------------------------------------------
-// WHAT THE SHIPPED DUMP DOES AND DOES NOT TEST
-// -----------------------------------------------------------------------------
-//
-// It is pos=0, ctx_len=1 - the decode step the requirement names - and that
-// configuration has two blind spots, the second sharp enough to state plainly:
+// WHAT THE SHIPPED DUMP DOES AND DOES NOT TEST. It is pos=0, ctx_len=1:
 //
 //   1. At position 0 the rotary tables are cos=1 / sin=0, so RoPE is the
-//      identity and tap_rope_q equals the pre-RoPE Q. Stage3LeavesChannels...
-//      below is the one rotary assertion that still bites here, and the real
-//      rotary coverage lives in test_rotary_embedding_950pr.cpp.
+//      identity. The real rotary coverage is in
+//      test_rotary_embedding_950pr.cpp.
+//   2. With a single context position the softmax is exactly 1.0, so the
+//      attention context is just V and the layer output is independent of Q, K
+//      and RoPE. Stage5DecodeAttentionContextIsTheCachedValue turns that into
+//      an assertion against V read out of tap_qkv, which is the only direct
+//      check on the paged KV write and the decode call in the suite.
 //
-//   2. With a single context position the softmax runs over one element and is
-//      therefore exactly 1.0 whatever the score is. The attention context is
-//      then just V, which means THE LAYER OUTPUT IS INDEPENDENT OF Q, K AND
-//      RoPE. The CUDA port confirmed this by regenerating at pos=1024:
-//      cos/sin and tap_rope_q change, golden_output.bin does not, byte for
-//      byte.
-//
-// So at ctx_len=1 a bug in the Q projection, the K projection, RoPE or the KV
-// cache write cannot reach golden_output.bin. This port turns that from a
-// weakness into an assertion: Stage5DecodeAttentionContextIsTheCachedValue
-// checks the attention context against V read out of tap_qkv, which is a
-// property that holds *because* the softmax is 1.0 and which the CUDA version
-// does not check at all. It is the only direct check on the paged KV write and
-// the decode call anywhere in the suite.
-//
-// A CAVEAT ON REGENERATING THE DUMP. `--pos N` works: nothing here depends on
-// the position. `--ctx-len M` for M > 1 does NOT, and the CUDA header's
-// suggestion that it does is wrong: scripts/dump_qwen35_layer3.py generates
-// k_past / v_past for the prior context but never writes them out, so a dump
-// with M > 1 describes an attention over context the test has no way to
-// reconstruct. Anyone extending this to a multi-position context has to teach
-// the dumper to write those two tensors first.
-//
-// -----------------------------------------------------------------------------
-// WHAT HAS AND HAS NOT BEEN RUN
-// -----------------------------------------------------------------------------
+// REGENERATING THE DUMP. `--pos N` works. `--ctx-len M` for M > 1 does not:
+// scripts/dump_qwen35_layer3.py generates k_past / v_past but never writes them
+// out, so a multi-position dump describes an attention the test cannot
+// reconstruct.
 //
 // As committed, this file has been compiled but never executed: no Ascend 950PR
-// device was available. The operator argument lists come from the CANN 9.1.0
-// headers (see aclnn_ops.hpp and aclnn_ops_950pr.hpp, which name the header per
-// operator) and the paged-decode configuration is copied argument for argument
-// from AscendAttentionBackendImpl in vllm_ascend/attention/attention_v1.py, but
-// neither has been confirmed against silicon. Stage 5 is the part to distrust
-// first: it is the only stage whose layout is not a plain 2-D shape, and
-// Stage5DecodeAttentionContextIsTheCachedValue is the assertion that will say
-// so.
+// device was available. Stage 5 is the part to distrust first.
 
 #include <gtest/gtest.h>
 
@@ -278,8 +241,7 @@ Stages RunLayerOnDevice(const GoldenLayer3& golden) {
   // --- 5. paged KV write and decode -------------------------------------------
   // Cache layout is AscendAttentionBackend.get_kv_cache_shape() split into its
   // two halves: [num_blocks, block_size, num_kv_heads, head_size], plain ND.
-  // DeviceBuffer zeroes on allocation, so every position this decode does not
-  // write reads as zero rather than as whatever the allocator handed back.
+  // DeviceBuffer zeroes on allocation.
   DeviceTensor key_cache =
       DeviceTensor::HalfEmpty({s::kNumBlocks, s::kBlockSize, s::kNumKvHeads, s::kHeadDim});
   DeviceTensor value_cache =
@@ -350,9 +312,8 @@ Stages RunLayerOnDevice(const GoldenLayer3& golden) {
 
   // --- 8. SwiGLU MLP ------------------------------------------------------------
   // aclnnSwiGlu splits one [tokens, 2 * intermediate] tensor, so the gate and up
-  // projections write the two halves of a single buffer. That is only valid
-  // because kTokens == 1: with more rows the halves would interleave and each
-  // projection would need its own buffer plus a copy.
+  // projections write the two halves of a single buffer. Valid only because
+  // kTokens == 1.
   static_assert(s::kTokens == 1, "gate/up share one buffer, which only works for a single row");
   // The up half starts at intermediate * 2 bytes into the buffer. 6144 * 2 is a
   // whole number of 32-byte bursts, so the second view is aligned exactly as
@@ -407,22 +368,11 @@ Stages RunLayerOnDevice(const GoldenLayer3& golden) {
 // Host-only: the dump checked against the CPU reference
 // -----------------------------------------------------------------------------
 //
-// The device suite below cannot run anywhere but on a 950PR, which leaves the
-// three things it depends on - the loader, the dump itself and the CPU
-// references the operator tests compare against - completely unexercised
-// everywhere else. That is the wrong way round: those are the parts a build
-// machine *can* check, and a fault in any of them would be diagnosed as a
-// kernel bug on the one machine that can run the rest.
-//
-// So the same nine stages are run again here in float on the host, rounding to
-// fp16 at every stage boundary exactly as scripts/dump_qwen35_layer3.py does,
-// and compared against the same taps. A pass means the dump is internally
-// consistent, the loader reads it correctly, and the CPU references agree with
-// PyTorch - and it means all of that on a machine with no NPU attached.
-//
-// It also fixes the one thing the device suite structurally cannot: when the
-// NPU comparison fails, this tells you whether to suspect the kernel or the
-// reference you are comparing it against.
+// The same nine stages run again in float on the host, rounding to fp16 at
+// every stage boundary exactly as scripts/dump_qwen35_layer3.py does, and
+// compared against the same taps. A pass means the dump is internally
+// consistent, the loader reads it correctly and the CPU references agree with
+// PyTorch -- on a machine with no NPU attached.
 
 std::vector<float> RoundToHalf(const std::vector<float>& values) { return QuantizeToHalf(values); }
 
@@ -469,11 +419,10 @@ Stages RunLayerOnCpu(const GoldenLayer3& golden) {
   cpu.rope_k = RoundToHalf(rope_k);
 
   // --- 5. decode attention ---------------------------------------------------------
-  // kContextLen == 1, so the softmax is over a single score and is exactly 1.0:
-  // the context is V, fetched per query head through the GQA mapping. Writing
-  // it out rather than calling reference::PagedAttentionDecode is deliberate -
-  // that helper models the 310P 5-D NZ cache, which is not the layout this part
-  // uses, and going through it would be testing the wrong thing.
+  // kContextLen == 1, so the softmax is exactly 1.0 and the context is V,
+  // fetched per query head through the GQA mapping. Written out rather than
+  // calling reference::PagedAttentionDecode, which models the 310P 5-D NZ cache
+  // and not the layout this part uses.
   static_assert(s::kContextLen == 1, "the CPU stage-5 model assumes a single context position");
   const int64_t group = s::kNumHeads / s::kNumKvHeads;
   cpu.attn_context.assign(static_cast<size_t>(s::kNumHeads * s::kHeadDim), 0.0f);
@@ -743,11 +692,8 @@ TEST_F(QwenLayer3Golden950PrTest, Stage4PartialRotaryK) {
 
 TEST_F(QwenLayer3Golden950PrTest, Stage3And4LeaveChannelsPastRotaryDimUntouched) {
   // The pass-through half of partial rotary: channels [rotary_dim, head_dim) of
-  // every head must survive bit-exactly. At pos=0 the rotated channels are
-  // unchanged too, so this is the one rotary assertion in this file that still
-  // means something there - it would catch an operator that rotated the whole
-  // 256-wide head, which is exactly what the stock rotary operator does if it
-  // is handed the head instead of the slice.
+  // every head must survive bit-exactly. It would catch an operator that
+  // rotated the whole 256-wide head.
   ASSERT_EQ(stages_.rope_q.size(), stages_.qkv.size() - 2 * static_cast<size_t>(s::kKvDim));
   for (int64_t head = 0; head < s::kNumHeads; ++head) {
     for (int64_t dim = s::kRotaryDim; dim < s::kHeadDim; ++dim) {
@@ -767,18 +713,11 @@ TEST_F(QwenLayer3Golden950PrTest, Stage3And4LeaveChannelsPastRotaryDimUntouched)
 }
 
 TEST_F(QwenLayer3Golden950PrTest, Stage5DecodeAttentionContextIsTheCachedValue) {
-  // The dump has no tap between the decode and the output gate, so without this
-  // the paged KV write and the FIA call would only be covered through
-  // tap_attn_out - and at this configuration they would barely be covered at
-  // all, since a decode that returned garbage in the right shape would still
-  // have to pass through the gate and o_proj before anything noticed.
-  //
-  // At kContextLen == 1 the softmax runs over a single score and is therefore
-  // exactly 1.0 whatever that score is, so the context is just V - fetched from
-  // the paged cache, through the block table, for the kv head each query head
-  // maps to. That makes this an end-to-end check of the cache write, the block
-  // table indexing and the GQA head mapping, none of which anything else here
-  // touches.
+  // At kContextLen == 1 the softmax is exactly 1.0, so the context is just V,
+  // fetched from the paged cache through the block table for the kv head each
+  // query head maps to. That makes this an end-to-end check of the cache write,
+  // the block table indexing and the GQA head mapping, none of which anything
+  // else here touches -- the dump has no tap between the decode and the gate.
   static_assert(s::kContextLen == 1, "this identity only holds for a single context position");
   static_assert(s::kNumHeads % s::kNumKvHeads == 0, "GQA needs a whole number of query heads per kv head");
 

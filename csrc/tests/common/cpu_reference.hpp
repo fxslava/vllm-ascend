@@ -16,15 +16,12 @@
 
 // Naive CPU references for the Qwen3.5 forward-pass kernels.
 //
-// Conventions used throughout:
-//   * Inputs and outputs are std::vector<float>. Callers convert to and from
-//     fp16 at the device boundary, so a reference never sees a half type.
-//   * Arithmetic is float, not double. The DaVinci vector unit accumulates
-//     these reductions in fp32, so matching that keeps the tolerance honest
-//     rather than flattering the kernel with a more accurate reference.
-//   * Nothing here allocates device memory or touches ACL: every function is
-//     callable on a build machine with no NPU attached, and the suite has
-//     self-tests that do exactly that.
+// Conventions:
+//   * Inputs and outputs are std::vector<float>; callers convert to and from
+//     fp16 at the device boundary.
+//   * Arithmetic is float, not double, matching the fp32 accumulation of the
+//     DaVinci vector unit.
+//   * Nothing here allocates device memory or touches ACL.
 
 #pragma once
 
@@ -44,13 +41,9 @@ namespace reference {
 // out   [m, n]   out[i][j] = sum_k a[i][k] * b_t[j][k]
 //
 // b_t is indexed as the transpose so the reference consumes exactly the buffer
-// the device test uploads, with no separate host transpose to get wrong.
-//
-// The dot product accumulates in float, matching the fp32 accumulator in the
-// v200 cube unit. Note that this fixes a summation order: over k=2048..4096 the
-// hardware tiles and accumulates in a different order, so the two agree to
-// within fp32 reassociation error, not bit-exactly. That error is far below the
-// fp16 rounding of the output and is not what the tolerance is protecting.
+// the device test uploads. The dot product accumulates in float and fixes a
+// summation order, so it agrees with the hardware to within fp32 reassociation
+// error rather than bit-exactly.
 void MatmulTransposedB(const std::vector<float>& a, const std::vector<float>& b_t, int64_t m, int64_t k,
                        int64_t n, std::vector<float>* out);
 

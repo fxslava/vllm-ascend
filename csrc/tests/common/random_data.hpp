@@ -14,12 +14,9 @@
  * limitations under the License.
  */
 
-// Deterministic test data.
-//
-// std::mt19937 is specified bit-exactly by the standard, but the distribution
-// classes are not: libstdc++ and libc++ produce different sequences from the
-// same engine. Box-Muller and the uniform mapping are therefore written out
-// here so a failure reproduces identically on every host and in CI.
+// Deterministic test data. std::mt19937 is specified bit-exactly by the
+// standard but the distribution classes are not, so Box-Muller and the uniform
+// mapping are written out here and a failure reproduces on every host.
 
 #pragma once
 

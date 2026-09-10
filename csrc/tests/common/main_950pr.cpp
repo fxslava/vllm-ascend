@@ -15,18 +15,9 @@
  */
 
 // Entry point shared by the Ascend 950PR test binaries of both device-side
-// tiers, sim/ and device/.
-//
-// Same shape as common/main.cpp, but it prints the 950PR pipeline inventory
-// instead of the 310P one. The two differ in which operators they list and in
-// the note about the custom op package, and a binary that printed the wrong one
-// would send a reader looking for the wrong missing symbol.
-//
-// It also states which tier the binary belongs to and whether a camodel is
-// loaded. Those two lines together are the answer to "can I trust a timing from
-// this run" - a sim-tier binary, or any binary with libruntime_camodel.so in
-// its address space, measures the simulator - and printing them costs nothing
-// next to having to work it out from the build directory name afterwards.
+// tiers, sim/ and device/. Same shape as common/main.cpp, but it prints the
+// 950PR pipeline inventory instead of the 310P one, states which tier the
+// binary belongs to, and says whether a camodel is loaded.
 
 #include <gtest/gtest.h>
 

@@ -17,78 +17,38 @@
 // TurboQuant KV cache: the AIV-only 4-bit decode and the Cube-native kv5fp8
 // decode, timed, against a physical fp16 decode of the same shape.
 //
-// WHY "AIV-ONLY" IS THE HEADLINE. Nothing in
-// csrc/attention/turboquant/turboquant_kernels.cpp touches the Cube. The score
-// row is a vector Mul plus a ReduceSum, the value accumulation is a vector FMA,
-// the Walsh-Hadamard is Add/Sub and Gather, the codec is compares and a Gather
-// over a 16-entry table. There is no Matmul object, no LOCAL_L1 copy, no Mmad,
-// and no `[aic]` half of the kernel at all - grep the source for any of them
-// and it comes back empty. So every number this binary reports is what the
-// vector cores alone can do, and it is the baseline any future Cube-assisted
-// INT4 GEMM path has to beat. Measuring it now, before that path exists, is the
-// only way the comparison later means anything.
+// Nothing in csrc/attention/turboquant/turboquant_kernels.cpp touches the Cube,
+// so every number the 4-bit legs report is what the vector cores alone can do.
 //
-// WHAT IS TIMED, PER CONTEXT LENGTH S in {512, 1024, 2048}:
+// What is timed, per context length S in {512, 1024, 2048}:
 //
-//   tq4_write_s<S>     the cache write path: S tokens rotated, quantised to
-//                      4 bits and scattered. One launch. This is prefill-shaped
-//                      - a decode step writes one token - and it is here
-//                      because the cache has to be filled before it can be read
-//                      and the fill is not free.
-//   tq4_decode_s<S>    the decode itself: split then combine, TWO launches on
-//                      one stream (flash-decoding cannot put them in one; see
-//                      the kernel source). The cache is written once during
-//                      setup, so the timed region is the read path only.
-//
+//   tq4_write_s<S>      the cache write path: S tokens rotated, quantised to
+//                       4 bits and scattered. One launch.
+//   tq4_decode_s<S>     the decode: split then combine, two launches on one
+//                       stream. The cache is written once during setup, so the
+//                       timed region is the read path only.
 //   kv5fp8_write_s<S>   the 5-bit cache write: rotate, encode, scatter.
-//   kv5fp8_decode_s<S>  the Cube-native decode: 5-bit non-linear storage
-//                       unpacked to fp8_e4m3fn on the AIV and multiplied on the
-//                       Cube with hardware fp8 `mad`. Split then combine, two
-//                       launches, same as the 4-bit path.
+//   kv5fp8_decode_s<S>  the Cube-native decode: 5-bit storage unpacked to
+//                       fp8_e4m3fn on the AIV and multiplied on the Cube.
 //   fp16_decode_s<S>    the baseline: the same Cube decode over an unquantised
 //                       fp16 paged KV cache.
 //
-// The last three are WORK IN PROGRESS and are OFF by default; see "THE WIP CUBE
-// GATE" below, and TURBOQUANT_TESTS.md section 13.8 for what is wrong with
-// them. A default run of this binary is the verified 4-bit AIV path and nothing
-// else.
+// The last three are WORK IN PROGRESS and are OFF by default; see THE WIP CUBE
+// GATE below and TURBOQUANT_TESTS.md section 13.8. A default run is the
+// verified 4-bit AIV path and nothing else.
 //
-// HOW THE fp16 BASELINE WAS RESOLVED, WHICH IS THE POINT OF THIS FILE'S
-// SECOND HALF. It used to be aclnnFusedInferAttentionScore, and on this part
-// that operator does not exist: measured on CANN 9.1.0, the planning call
-// returns 361001 with "Interface aclnnFusedInferAttentionScore versions V1 to
-// V4 are no longer supported on Ascend950". V5 is exported and is what replaces
-// the family, but it has never been planned on hardware either, so a benchmark
-// resting on it would print an empty column on the first machine that ran it -
-// which is what the previous version of this file did, falling back to an
-// arithmetic traffic model that is not a measurement.
+// The fp16 baseline is turboquant_fp16_decode_split in
+// csrc/attention/turboquant/turboquant_mm_kernels.cpp -- the same Cube decode
+// with the codec removed -- rather than aclnnFusedInferAttentionScore, which
+// does not exist on this part (planning returns 361001). Same task
+// decomposition, GQA batching, tile size, online softmax and split count, so
+// the ratio between the two measures the codec.
 //
-// The baseline is therefore built rather than borrowed:
-// turboquant_fp16_decode_split in csrc/attention/turboquant/turboquant_mm_kernels.cpp
-// is the same Cube decode with the codec removed. Same task decomposition, same
-// GQA batching into the GEMM's M dimension, same 64-row tile, same online
-// softmax, same flash-decoding split count, same partial layout. The only
-// difference is where the Cube's operands come from: the fp16 leg copies them
-// straight out of its cache with the AIC's own MTE2 and the ND->NZ conversion
-// DataCopy does for 2-byte types, while the quantised leg has the AIV unpack
-// them from 5-bit codes first. That makes the ratio between the two a
-// measurement of the codec and not of two people's kernel writing, and it makes
-// the column impossible to leave empty: it depends on no operator that might be
-// withdrawn.
+// The traffic model is also printed. It is exact arithmetic over the two cache
+// layouts, not a measurement.
 //
-// It is a fair baseline and not a weak one - the fp16 leg does no vector work
-// per tile at all, so it starts ahead and the quantised leg has to win the
-// difference back on bandwidth.
-//
-// The traffic model is still printed, and it is still not a measurement: it is
-// exact arithmetic over the two cache layouts and it says what the scheme buys
-// in bytes. It is context for the measured table below it, not a substitute.
-//
-// SHAPES. Qwen3.5-2B's full-attention layer as
-// common/ascend950_shapes.hpp records it: head_dim 256, 8 query heads over 2 kv
-// heads, block_size 128. Head dim 256 is the top of what the codec sizes UB for
-// and the shape the part actually runs, which is the whole reason the 310P
-// suite cannot host this file.
+// SHAPES. Qwen3.5-2B's full-attention layer as common/ascend950_shapes.hpp
+// records it: head_dim 256, 8 query heads over 2 kv heads, block_size 128.
 //
 //   ASCEND_BENCH_TQ_CONTEXTS=512,1024   restricts the sweep. Everything else is
 //                                       the shared ASCEND_BENCH_* set; see
@@ -172,39 +132,21 @@ std::vector<int64_t> ContextLens() {
 
 // --- THE WIP CUBE GATE -------------------------------------------------------
 //
-// The Cube-native legs - kv5fp8_write, kv5fp8_decode and the fp16 baseline -
-// all drive csrc/attention/turboquant/turboquant_mm_kernels.cpp, and that path
-// does not work yet. Two defects are open, both recorded in full in
-// TURBOQUANT_TESTS.md section 13.8:
+// The Cube-native legs all drive
+// csrc/attention/turboquant/turboquant_mm_kernels.cpp, and that path does not
+// work yet. Two defects are open, both recorded in TURBOQUANT_TESTS.md 13.8:
+// the score GEMM's [n, k] B operand does not reproduce the host product, and
+// TurboQuantCubeMm::Init allocates L0A/L0B/L0C on both halves of the MIX
+// kernel, which stalls the AIV half on "pem_lsu: unrecognize ldst addr".
 //
-//   * the score GEMM stages its B operand [n, k], and that form does not
-//     reproduce the host product, so the decode computes a wrong score row;
-//   * TurboQuantCubeMm::Init allocates L0A, L0B and L0C on both halves of the
-//     MIX kernel. Those pools do not exist on a vector core, so the AIV half is
-//     handed addresses that are not addresses. On the camodel the split kernel
-//     stalls on "pem_lsu: unrecognize ldst addr".
+// A launch into a faulting kernel takes the stream down and every case queued
+// behind it, so the gate has to be before the launch rather than a check after
+// it. VLLM_ASCEND_TQ_CUBE_WIP=1 adds the Cube legs back; that is the same
+// variable REQUIRE_CUBE_WIP_OPT_IN uses for the two sim tests, restated here
+// because that header includes gtest and this binary is not a gtest binary.
+// -DVLLM_ASCEND_TESTS_ENABLE_WIP_CUBE=ON flips the default.
 //
-// A benchmark is the wrong place to discover either of them. A launch into a
-// faulting kernel does not come back with a wrong number that a checksum would
-// catch - it takes the stream down, and every case queued behind it on that
-// stream with it, so the cases that already ran are lost too. Inspecting
-// results afterwards is not available; the gate has to be before the launch.
-//
-// So a default run is the verified AIV-only 4-bit path, and nothing else is
-// even constructed. VLLM_ASCEND_TQ_CUBE_WIP=1 adds the Cube legs back. That is
-// deliberately the same environment variable REQUIRE_CUBE_WIP_OPT_IN uses for
-// the two sim tests: one switch turns the work-in-progress path on everywhere
-// it appears, so nobody has to remember a second one. The check is restated
-// here rather than shared with test_harness.hpp's CubeWipOptedIn(), because
-// that header includes gtest and this binary is not a gtest binary; keep the
-// two in step. Configuring with
-// -DVLLM_ASCEND_TESTS_ENABLE_WIP_CUBE=ON flips the default for a build
-// dedicated to that work, and the variable still overrides it in both
-// directions, so such a build can still be asked for the stable baseline.
-//
-// Delete this gate when the path works. Do not weaken it: a benchmark that
-// launches a kernel known to fault produces no number of its own and destroys
-// the ones already taken.
+// Delete this gate when the path works. Do not weaken it.
 #if defined(VLLM_ASCEND_TQ_CUBE_WIP_DEFAULT_ON)
 constexpr bool kCubeWipDefault = true;
 #else
@@ -240,26 +182,16 @@ void PrintCubeWipBanner(bool enabled) {
 
 // --- the traffic model -------------------------------------------------------
 //
-// Exact byte counts, not estimates: every figure below is what the layouts and
-// the kernels' DataCopy calls add up to. Two different questions are answered,
-// and conflating them is the easy mistake:
+// Exact byte counts, not estimates. Two different questions:
 //
-//   footprint   what the KV cache for S tokens occupies in HBM. This is the
-//               capacity win - how much longer a context fits in the same
-//               memory - and it does not depend on how attention reads it.
-//   decode read what one decode step streams. This is the bandwidth win, and it
-//               is larger per byte of cache than the footprint suggests would be
-//               fair, because every query head re-reads its kv head's rows: with
-//               8 heads over 2 kv heads each cached row is read four times.
-//               Whether L2 absorbs some of those re-reads is a hardware
-//               question this model deliberately does not guess at - it counts
-//               what the kernel asks the memory system for, which is the same
-//               convention the fp16 leg is counted under, so the ratio is fair
-//               even where the absolute numbers are pessimistic.
-//
-// The model is printed whether or not the Cube legs run: it is arithmetic over
-// the layouts and needs no launch, and the kv5 rate is a property of the format
-// rather than of the kernel that reads it.
+//   footprint   what the KV cache for S tokens occupies in HBM -- the capacity
+//               win, independent of how attention reads it.
+//   decode read what one decode step streams -- the bandwidth win. Larger per
+//               byte of cache than the footprint suggests, because every query
+//               head re-reads its kv head's rows. Whether L2 absorbs some of
+//               those re-reads is not guessed at: the model counts what the
+//               kernel asks the memory system for, under the same convention
+//               for both legs.
 struct TrafficModel {
   int64_t context_len = 0;
   double fp16_footprint_bytes = 0.0;
@@ -327,10 +259,8 @@ TrafficModel ModelTrafficFor(int64_t context_len, const tqh::PagedAttentionGrid&
 
   // The Cube decode reads each cached row once per *kv* head rather than once
   // per query head, because the query heads of a group are batched into the
-  // GEMM's M dimension. That is a property of the task decomposition and not of
-  // the rate, and it is why the two decode-read columns are not simply
-  // 128:160. The partial traffic is unchanged: partials are indexed per head
-  // either way, because the combine stage is shared with the AIV path.
+  // GEMM's M dimension. Partial traffic is unchanged: partials are indexed per
+  // head either way.
   model.kv5_decode_read_bytes =
       kv * s * 2.0 * kv5_slot + kv * s * scale_slot * kFloatBytes + query_and_output + partials;
 
@@ -338,11 +268,9 @@ TrafficModel ModelTrafficFor(int64_t context_len, const tqh::PagedAttentionGrid&
 }
 
 // Attention FLOPs for one decode step: QK^T and the value accumulation, two
-// operations per element of each. The rotation (D log2 D per head, twice) and
-// the codec are not counted, so this is the same number the fp16 leg does and
-// TFLOP/s is comparable between them. It is *not* the whole instruction count
-// of the TurboQuant kernel, and the gap between them is exactly what the codec
-// costs.
+// operations per element of each. The rotation and the codec are not counted,
+// so this is the same number the fp16 leg does and TFLOP/s is comparable
+// between them.
 double AttentionFlops(int64_t context_len) {
   return 4.0 * static_cast<double>(kNumHeads) * static_cast<double>(context_len) * static_cast<double>(kHeadSize);
 }
@@ -374,11 +302,9 @@ void PrintTrafficModel(const std::vector<TrafficModel>& models) {
                 model.kv5_footprint_bytes / 1024.0, model.kv5_footprint_ratio(),
                 model.kv5_decode_read_bytes / 1024.0, model.kv5_decode_read_ratio());
   }
-  // The padding is not free and the number is easy to get wrong by hand, so it
-  // is derived here from the same ScaleSlotFloats the kernel uses rather than
-  // quoted: a token carries 2 * num_kv_heads live scale lanes in a slot rounded
-  // up to a whole 32-byte burst, and the difference buys every DMA on this path
-  // being an aligned DataCopy instead of a DataCopyPad.
+  // Derived from the same ScaleSlotFloats the kernel uses rather than quoted: a
+  // token carries 2 * num_kv_heads live scale lanes in a slot rounded up to a
+  // whole 32-byte burst.
   const double live_lanes = 2.0 * static_cast<double>(kNumKvHeads);
   const double slot_lanes = static_cast<double>(tqh::ScaleSlotFloats(kNumKvHeads));
   std::printf("\n[ascend-bench]   the tq4 cache column is %.1f%% packed codes and %.1f%% scale plane; at "
@@ -403,12 +329,9 @@ std::string CaseName(const char* prefix, int64_t context_len) {
   return name.str();
 }
 
-// Everything one context length needs on the device. Allocated once in
-// BuildSuite and alive for the whole of that shape's cases, because a benchmark
-// that allocates inside its timed region is measuring aclrtMalloc.
-//
-// Buffers are asked for kBenchmarkAlignBytes rather than the 32-byte test
-// default, so no measurement is charged for a cache that starts mid-line.
+// Everything one context length needs on the device, allocated once in
+// BuildSuite and alive for the whole of that shape's cases. Buffers are asked
+// for kBenchmarkAlignBytes rather than the 32-byte test default.
 struct DecodeScenario {
   explicit DecodeScenario(int64_t context_len) : context_len_(context_len) {
     blocks_per_seq_ = (context_len + kBlockSize - 1) / kBlockSize;
@@ -419,11 +342,8 @@ struct DecodeScenario {
 
     DeterministicRandom rng(0x7451u);
     const size_t kv_elems = static_cast<size_t>(context_len * kNumKvHeads * kHeadSize);
-    // Kept on the host as well as on the device. The inputs the kv5 and fp16
-    // legs share with this one, so all three quantise, cache and read exactly
-    // the same context: handing them these rather than letting each re-draw
-    // from the same seed is what stops the legs from silently diverging if the
-    // draw order here ever changes.
+    // Kept on the host as well as on the device, so the kv5 and fp16 legs
+    // quantise, cache and read exactly the same context.
     key_host_ = rng.NormalHalfExact(kv_elems, 0.0f, 1.0f);
     value_host_ = rng.NormalHalfExact(kv_elems, 0.0f, 1.0f);
     const std::vector<float> query =
@@ -546,9 +466,8 @@ struct DecodeScenario {
 
 // --- the Cube-native kv5fp8 leg ---------------------------------------------
 //
-// Everything the 5-bit Cube decode needs, alongside the 4-bit scenario it
-// borrows its inputs from. WORK IN PROGRESS: nothing constructs this unless
-// CubeWipEnabled() - see THE WIP CUBE GATE above.
+// WORK IN PROGRESS: nothing constructs this unless CubeWipEnabled(); see THE
+// WIP CUBE GATE above.
 struct Kv5Scenario {
   static constexpr tqm::TurboQuantMode kMode = tqm::TurboQuantMode::KV5_FP8;
 
@@ -571,9 +490,7 @@ struct Kv5Scenario {
     // Three table images, and they are not interchangeable. The rotation image
     // is the shipping 4-bit codec's, because both kernels drive Pi through a
     // TurboQuantCodec4; the mode ones are this rate's. The decode image carries
-    // the NZ permutation (nz_rows = kCubeTileRows) so the unpack lands in
-    // Cube-ready order; the write image does not, because the encoder produces
-    // plain row-major codes.
+    // the NZ permutation (nz_rows = kCubeTileRows); the write image does not.
     rot_tables_ = DeviceBuffer::FromHost(tqh::CodecTables(kHeadSize, 1), kBenchmarkAlignBytes);
     write_tables_ =
         DeviceBuffer::FromHost(tqh::ModeTables(kMode, kHeadSize, 1, /*nz_rows=*/0), kBenchmarkAlignBytes);
@@ -640,13 +557,11 @@ struct Kv5Scenario {
 // --- the physical fp16 baseline ----------------------------------------------
 //
 // The same Cube decode over an unquantised fp16 paged cache: no codec, no
-// tables, no scale plane. It shares the shape, the paging and the context with
-// the quantised legs, so what separates it from kv5fp8 is the codec and nothing
-// else.
+// tables, no scale plane, and the same shape, paging and context as the
+// quantised legs.
 //
-// WORK IN PROGRESS for the same reason kv5fp8 is - it is the same kernel with
-// one stage removed - so it sits behind the same gate. It is NOT an independent
-// control that could be trusted while the quantised leg is broken.
+// WORK IN PROGRESS behind the same gate -- it is the same kernel with one stage
+// removed, so it is not an independent control.
 struct Fp16Scenario {
   Fp16Scenario(const DecodeScenario& shared, int64_t context_len)
       : context_len_(context_len), blocks_per_seq_(shared.blocks_per_seq()) {
@@ -884,9 +799,8 @@ void BuildSuite(BenchmarkRunner& runner) {
 
     // --- the work-in-progress Cube legs -------------------------------------
     //
-    // Everything past this point is gated. A skip is recorded for each case so
-    // the absence shows up in the result table as a decision, rather than as
-    // three rows nobody notices are missing.
+    // A skip is recorded for each gated case so the absence shows up in the
+    // result table.
     if (!cube) {
       runner.Skip(CaseName("kv5fp8_write", context_len),
                   "Cube path is work in progress; set VLLM_ASCEND_TQ_CUBE_WIP=1 to run it");
@@ -933,9 +847,8 @@ void BuildSuite(BenchmarkRunner& runner) {
 
     // --- the physical fp16 baseline -----------------------------------------
     //
-    // A failure here is recorded as a failure and not as a skip. The old aclnn
-    // leg could legitimately be absent; this one is a kernel in this binary, so
-    // if it does not run, something is broken rather than missing.
+    // A failure here is a failure and not a skip: this leg is a kernel in this
+    // binary, so if it does not run something is broken rather than missing.
     const std::string fp16_name = CaseName("fp16_decode", context_len);
     try {
       BenchmarkCase fp16_case;

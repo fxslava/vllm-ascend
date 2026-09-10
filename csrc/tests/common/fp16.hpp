@@ -14,13 +14,9 @@
  * limitations under the License.
  */
 
-// Host-side IEEE-754 binary16 <-> binary32 conversion.
-//
-// The bare-metal test suite deliberately avoids <torch/types.h>, ATen and the
-// CANN half type, so the conversion is implemented here with plain bit
-// manipulation. Rounding is round-to-nearest-even, which is what both the
-// DaVinci vector unit and PyTorch use, so a value that round-trips through this
-// header has the exact same bit pattern the NPU would have produced.
+// Host-side IEEE-754 binary16 <-> binary32 conversion, written out here because
+// the suite avoids <torch/types.h>, ATen and the CANN half type. Rounding is
+// round-to-nearest-even, matching both the DaVinci vector unit and PyTorch.
 
 #pragma once
 

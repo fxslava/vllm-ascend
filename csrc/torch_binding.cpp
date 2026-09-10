@@ -2745,16 +2745,9 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(CONCAT(_C, _ascend), ops)
              &vllm_ascend::npu_turboquant_paged_attention);
 
     // Host-side helpers, called while the model loads rather than on the decode
-    // path: the first primes the cached device registry, the second sizes the
-    // persistent decode workspace from the same arithmetic the operator uses.
-    // Neither belongs inside a captured graph.
-    //
-    // Registered as catch-all kernels rather than under kPrivateUse1: neither
-    // takes a tensor, so there is no argument for the dispatcher to read a
-    // backend key off, and a PrivateUse1-only kernel would be unreachable.
-    // Both are plain host functions that ask the NPU driver about the calling
-    // thread's device, so having one implementation for every key is also the
-    // honest description.
+    // path.  Registered as catch-all kernels rather than under kPrivateUse1:
+    // neither takes a tensor, so the dispatcher has no argument to read a
+    // backend key off and a PrivateUse1-only kernel would be unreachable.
     ops.def("npu_turboquant_vector_core_num() -> int");
     ops.impl("npu_turboquant_vector_core_num",
              &vllm_ascend::npu_turboquant_vector_core_num);

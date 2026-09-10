@@ -22,13 +22,11 @@
 //   torch_npu._npu_paged_attention
 //     vllm_ascend/_310p/attention/attention_v1.py :: forward_paged_attention
 //
-// The 310P KV cache is not the [2, num_blocks, block_size, num_kv_heads,
-// head_size] layout the generic Ascend backend uses. get_kv_cache_shape on the
-// 310P backend returns
+// get_kv_cache_shape on the 310P backend returns
 //     (2, num_blocks, num_kv_heads * head_size / 16, block_size, 16)
 // and the runner allocates each half with acl_format=ACL_FORMAT_FRACTAL_NZ. The
 // suite is layered so the layout arithmetic, the cache write and the attention
-// numerics fail independently of one another.
+// numerics fail independently.
 
 #include <gtest/gtest.h>
 
@@ -407,16 +405,11 @@ TEST_P(ReshapeAndCache310PTest, WritesTheSameBytesAsTheHostScatter) {
 class PagedAttention310PTest : public ::testing::TestWithParam<DecodeCase> {};
 
 TEST_P(PagedAttention310PTest, MatchesCpuReference) {
-  // aclnnPagedAttention does not exist on CANN 9.1.0. torch_npu._npu_paged_attention
-  // is an ATB operator (atb::PagedAttentionOperation in libatb.so), which is a
-  // C++ object API the aclnn RunAclnn path cannot drive. The aclnn alternative,
-  // aclnnIncreFlashAttentionV4, is declared and verified in aclnn_ops.hpp but
-  // expects a different paged KV layout from the 310P 5-D NZ cache, so wiring it
-  // here would mean guessing that layout.
-  //
-  // The NZ layout arithmetic and the attention reference this test would compare
-  // against are covered by the host-only PagedKvLayout and PagedAttentionReference
-  // suites above, which do run.
+  // aclnnPagedAttention does not exist on CANN 9.1.0;
+  // torch_npu._npu_paged_attention is an ATB operator RunAclnn cannot drive,
+  // and aclnnIncreFlashAttentionV4 expects a different paged KV layout. The NZ
+  // layout arithmetic and the attention reference are covered by the host-only
+  // suites above.
   GTEST_SKIP() << "aclnnPagedAttention is not provided by CANN 9.1.0; "
                   "torch_npu._npu_paged_attention is backed by ATB (libatb.so). "
                   "See csrc/tests/common/aclnn_ops.hpp for the verified "
@@ -424,16 +417,11 @@ TEST_P(PagedAttention310PTest, MatchesCpuReference) {
 }
 
 TEST_P(PagedAttention310PTest, AttendsOnlyWithinTheContextLength) {
-  // aclnnPagedAttention does not exist on CANN 9.1.0. torch_npu._npu_paged_attention
-  // is an ATB operator (atb::PagedAttentionOperation in libatb.so), which is a
-  // C++ object API the aclnn RunAclnn path cannot drive. The aclnn alternative,
-  // aclnnIncreFlashAttentionV4, is declared and verified in aclnn_ops.hpp but
-  // expects a different paged KV layout from the 310P 5-D NZ cache, so wiring it
-  // here would mean guessing that layout.
-  //
-  // The NZ layout arithmetic and the attention reference this test would compare
-  // against are covered by the host-only PagedKvLayout and PagedAttentionReference
-  // suites above, which do run.
+  // aclnnPagedAttention does not exist on CANN 9.1.0;
+  // torch_npu._npu_paged_attention is an ATB operator RunAclnn cannot drive,
+  // and aclnnIncreFlashAttentionV4 expects a different paged KV layout. The NZ
+  // layout arithmetic and the attention reference are covered by the host-only
+  // suites above.
   GTEST_SKIP() << "aclnnPagedAttention is not provided by CANN 9.1.0; "
                   "torch_npu._npu_paged_attention is backed by ATB (libatb.so). "
                   "See csrc/tests/common/aclnn_ops.hpp for the verified "

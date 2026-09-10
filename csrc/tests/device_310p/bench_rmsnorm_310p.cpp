@@ -16,17 +16,14 @@
 
 // RMSNorm (aclnnRmsNorm) on the v200 vector unit, fp16 in / fp16 out.
 //
-// One pass over the row to accumulate the sum of squares and a second to scale
-// it, so there is no reuse to exploit and the kernel is bandwidth-bound at
-// every shape here. GB/s is therefore the number that means something; the FLOP
-// count is a handful of operations per element and is not reported.
+// One pass to accumulate the sum of squares and a second to scale, with no
+// reuse to exploit, so bandwidth-bound at every shape here and GB/s is the
+// number that means something.
 //
 // The bytes counted are the ones that must cross the HBM boundary: x read once,
-// y written once, gamma read once per row batch (it is small enough to stay
-// resident, so counting it once rather than once per token is the honest lower
-// bound), and the fp32 rstd written once per token. A kernel that fuses the two
-// passes reaches this figure; one that spills the row to GM between them moves
-// twice as much and will show up as roughly half the bandwidth.
+// y written once, gamma read once per row batch, and the fp32 rstd written once
+// per token. A kernel that spills the row to GM between the two passes moves
+// twice as much.
 
 #include <cstdint>
 #include <sstream>

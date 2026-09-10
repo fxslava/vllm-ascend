@@ -17,24 +17,18 @@
 // End-to-end fidelity report for the TurboQuant 4-bit KV cache, run entirely on
 // the host against the Qwen3.5 layer-3 golden dump.
 //
-// This binary links neither libascendcl.so nor anything else from the CANN
-// runtime: the write path, the rotated-basis decode and the un-rotation are all
-// the CPU reference in ../../reference/turbo_quant_cpu.h, which mirrors
-// turboquant_codec_950.h instruction for instruction. That is the point - the
-// codec's accuracy on real activations can be measured on a build machine, in a
-// simulator, or in CI, long before a 950PR is available.
+// This binary links no CANN runtime: the write path, the rotated-basis decode
+// and the un-rotation are all the CPU reference in
+// ../../reference/turbo_quant_cpu.h.
 //
-// Assertion policy: this is an *analytical reporter*. It prints cosine
-// similarity, SNR and relative L2 error and never asserts on any of them, so a
-// change in quantiser behaviour shows up as a number moving rather than as a
-// red build. The only EXPECTs here are on structural invariants that are exact
-// integer or involution identities and cannot drift with the data.
+// Assertion policy: this is an analytical reporter. It prints cosine
+// similarity, SNR and relative L2 error and never asserts on any of them. The
+// only EXPECTs are on structural invariants that are exact integer or
+// involution identities.
 //
-// What the golden dump can and cannot show: it is a single decode step with
-// kContextLen == 1, so the softmax is over one score and the attention context
-// is V. The golden case therefore measures the codec's fidelity on real Qwen
-// activations, but not the online-softmax accumulation. The synthetic case
-// below covers a full 128-position context for that reason, and says so.
+// The golden dump is a single decode step with kContextLen == 1, so it measures
+// the codec on real Qwen activations but not the online-softmax accumulation;
+// the synthetic case below covers a full 128-position context for that.
 
 #include <gtest/gtest.h>
 
@@ -244,11 +238,10 @@ TEST(TurboQuantCodecInvariants, PiPreservesDotProducts) {
   EXPECT_NEAR(rotated, plain, 1e-3 * std::max(1.0, std::fabs(plain)));
 }
 
-// The sign vector is a derived constant shared by three implementations: this
-// header, vllm_ascend/attention/turboquant_v1.py, and whatever writes a cache
-// that another one reads back. Pinning the first few values catches a drift in
-// any of them, which would otherwise show up only as silently wrong dequantised
-// activations.
+// The sign vector is a derived constant shared by this header,
+// vllm_ascend/attention/turboquant_v1.py, and anything that writes a cache
+// another implementation reads back. Pinning the first few values catches a
+// drift in any of them.
 TEST(TurboQuantCodecInvariants, PiSignVectorMatchesThePythonReference) {
   const std::vector<int8_t> d256 = tq::cpu_pi_sign_vector(256);
   const std::vector<int8_t> d128 = tq::cpu_pi_sign_vector(128);
@@ -297,13 +290,9 @@ TEST(TurboQuantCodecInvariants, NibblePackRoundTripsExactly) {
 //
 // The Ascend C codec carves its swap, scratch and shuffle tables out of one UB
 // pool sized for a full `batchRows`, and TPipe hands that pool over
-// uninitialised. A call with rows < batchRows therefore runs with live garbage
-// sitting immediately after its payload, and every gather offset, every mask and
-// every repeat count has to be tight enough that the garbage never reaches an
-// output. These tests reproduce that condition on the host: every buffer is
-// pre-filled with values that are impossible to produce arithmetically, and any
-// leak shows up either as a poisoned bit pattern in the result or as a
-// difference between two runs whose padding was poisoned differently.
+// uninitialised, so a call with rows < batchRows runs with live garbage after
+// its payload. These tests reproduce that on the host: every buffer is
+// pre-filled with values impossible to produce arithmetically.
 
 // Signalling NaN, quiet NaN, and a pattern that is a large finite negative
 // float rather than a NaN, so a leak that survives an isnan() filter is still
@@ -568,22 +557,11 @@ TEST(TurboQuantPoison, ApplyPiIgnoresSurroundingMemory) {
 // Table-driven simulation of the kernel's actual buffer discipline
 // -----------------------------------------------------------------------------
 //
-// The reference above is a plain loop, so it cannot fail a poisoning test for
-// an interesting reason. The kernel is not a plain loop: it carves swap_ and
-// scratch_ out of one UB pool sized for a full batchRows, copies in three
-// Gather tables built for that same batchRows, and then runs each call over
-// only the live prefix. The offsets are what decide whether the uninitialised
-// padding is ever touched.
-//
-// The two routines below reproduce that data flow exactly - same table
-// formulae, same oversized buffers, same live prefix - so the poison sits where
-// it sits in UB. An off-by-one in expandOffset_, a Gather issued over batchLen_
-// instead of n, or a nibble split keyed on the wrong parity all surface here as
-// a poisoned value in the output.
-//
-// The tables are built here from the same formulae the host mirror uses
-// (vllm_ascend/attention/turboquant_v1.py::turboquant_codec_tables), so this
-// doubles as a check that the image the host ships is the one the codec wants.
+// The reference above is a plain loop; the kernel is not. The two routines
+// below reproduce its data flow -- same table formulae, same oversized buffers,
+// same live prefix -- so the poison sits where it sits in UB. The tables are
+// built from the same formulae the host mirror uses
+// (vllm_ascend/attention/turboquant_v1.py::turboquant_codec_tables).
 
 // expandOffset_[p] = 4 * (p >> 1): an arithmetic progression, halved, floored,
 // and scaled to bytes -- the formula the host bakes into the table image.
@@ -822,10 +800,8 @@ TEST(TurboQuantEdgeCases, SingleDominantOutlier) {
     tq::cpu_quantize_4bit(vec.data(), d, packed.data(), &step);
 
     // The scale is the RMS, so a lone outlier moves it by 1/sqrt(d) rather than
-    // setting it outright. That is the whole behavioural difference from the
-    // absmax codec and it is deliberate: absmax sized the grid off this one
-    // coordinate and crushed every other channel into the levels either side of
-    // zero, where the RMS scale keeps the bulk resolved and clips the outlier.
+    // setting it outright -- the behavioural difference from an absmax codec,
+    // which would size the grid off this one coordinate.
     EXPECT_NEAR(step, std::fabs(magnitude) / std::sqrt(static_cast<float>(d)),
                 std::fabs(magnitude) * 1e-6f);
     ASSERT_TRUE(std::isfinite(step));
@@ -862,13 +838,10 @@ TEST(TurboQuantEdgeCases, ClampingAndSaturationExtremes) {
   constexpr int d = 64;
   constexpr float amplitude = 3.0f;
 
-  // Reaching the outermost bins takes a *sparse* outlier now, not a uniform
-  // one. Under an RMS scale a vector whose channels all share a magnitude
-  // normalises to u = +-1, which is nowhere near the +-2.4008 outermost
-  // boundary; two live channels among d - 2 zeros normalise to
-  // +-sqrt(d / 2) = +-5.66 and saturate. That is the construction below, and it
-  // is the only one that still exercises the two int8 endpoints through the
-  // quantiser rather than by writing the byte directly.
+  // Reaching the outermost bins takes a *sparse* outlier under an RMS scale: a
+  // vector whose channels all share a magnitude normalises to u = +-1, nowhere
+  // near the +-2.4008 outermost boundary, while two live channels among d - 2
+  // zeros normalise to +-sqrt(d / 2) = +-5.66 and saturate.
   struct Case {
     const char* name;
     float first;
@@ -991,9 +964,8 @@ TEST(TurboQuantEdgeCases, PartialBatchesMatchPerRowQuantisation) {
             const float want = rows_data[idx];
             // Lloyd-Max 4-bit: inside the table's range the worst case is the
             // largest distance from a decision boundary to its own centroid,
-            // which is 0.3318 -- not the uniform grid's half step. Outside it
-            // the error is unbounded, so the fixture is checked for clipping
-            // first rather than the bound being loosened to cover it.
+            // 0.3318. Outside it the error is unbounded, so the fixture is
+            // checked for clipping first.
             const float u = want / scales[static_cast<size_t>(row)];
             ASSERT_LE(std::fabs(u), tq::kLloydMaxThresholds[tq::kThresholdCount - 1])
                 << "this fixture clipped, so the in-range bound below does not apply: d=" << d << " row=" << row

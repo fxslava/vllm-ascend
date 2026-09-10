@@ -17,10 +17,7 @@
 // Loader for the Qwen3.5 layer-3 golden dump in csrc/tests/data/golden_layer3.
 //
 // Split out of the test that consumes it so the parsing has host-only coverage:
-// nothing here touches ACL or allocates device memory, so the loader tests run
-// on a build machine with no NPU. That matters more than it looks - a loader
-// that silently returns short data turns a parity failure into a mystery, and
-// the LFS case below is the way that actually happens.
+// nothing here touches ACL or allocates device memory.
 //
 // The files are raw little-endian fp16, C-contiguous, no header, written by
 // scripts/dump_qwen35_layer3.py. Linear weights keep the torch
@@ -53,11 +50,9 @@ struct GoldenLayer3 {
 // available, which the loader turns into a skip rather than a crash.
 std::string GoldenLayer3Dir();
 
-// Reads `expected_elements` fp16 values and widens them to float.
-//
-// Returns false and sets `error` rather than throwing, so a missing or
-// unfetched dump becomes a skip with an actionable message instead of a
-// failure. Exposed for the host-only loader tests.
+// Reads `expected_elements` fp16 values and widens them to float. Returns false
+// and sets `error` rather than throwing, so a missing or unfetched dump becomes
+// a skip with an actionable message.
 bool ReadHalfFile(const std::string& path, size_t expected_elements, std::vector<float>* out,
                   std::string* error);
 

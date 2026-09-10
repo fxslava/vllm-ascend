@@ -16,28 +16,21 @@
 
 // Linear projections on Ascend 950PR, through the cube unit.
 //
-// Stages 2, 6 and 8 of the Qwen3.5 decoder layer: Q/K/V, the attention output
-// gate, o_proj, gate_up and down. Every one of them is x @ W^T with W stored in
-// the torch [out_features, in_features] layout, which is exactly the case
+// Stages 2, 6 and 8 of the Qwen3.5 decoder layer. Every one is x @ W^T with W
+// stored in the torch [out_features, in_features] layout, which is what
 // DeviceTensor::HalfTransposed2D describes with strides rather than a host-side
 // transpose.
 //
 // The operator is the stock aclnnMatmul with cubeMathType KEEP_DTYPE, so fp16
-// operands stay fp16 through the cube unit and the comparison measures the
-// kernel rather than a precision policy. The 950PR custom kernel set in csrc/
-// has plenty of matmuls (grouped_matmul_swiglu_quant, mla_prolog_v3,
-// batch_matmul_transpose) but they are all quantised, grouped or fused forms;
-// none of them is a drop-in replacement for a dense fp16 GEMM, so there is no
-// custom kernel to prefer here.
+// operands stay fp16 through the cube unit. The 950PR custom matmuls are all
+// quantised, grouped or fused forms.
 //
 // Seeds, shapes and tolerances match csrc/tests/kernels/cuda/test_matmul.cpp.
 //
-// NOT COVERED: M > 1. Decode is M=1, which is what the parity requirement
-// targets, but a GEMV does not exercise the cube unit's M tiling at all. On
-// this part that gap is wider than on the 310P: arch35 splits cube and vector
-// into separate cores (cube_vector_combine=split in the platform config), so
-// the M tiling and the cube/vector handover are 950PR-specific behaviour that a
-// single-row case cannot reach.
+// NOT COVERED: M > 1. Decode is M=1, but a GEMV does not exercise the cube
+// unit's M tiling, and arch35 splits cube and vector into separate cores
+// (cube_vector_combine=split), so the M tiling and the cube/vector handover are
+// 950PR-specific behaviour a single-row case cannot reach.
 
 #include <gtest/gtest.h>
 

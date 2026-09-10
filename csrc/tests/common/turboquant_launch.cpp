@@ -234,15 +234,12 @@ std::vector<int32_t> ModeTables(tqm::TurboQuantMode mode, int64_t head_size, int
   // lowOffset_ and msbOffset_.
   //
   // Output position p is a plain row-major index when nz_rows == 0, and an NZ
-  // position within this batch's band of an nz_rows-row tile otherwise. The
-  // band-local NZ position is
+  // position within this batch's band of an nz_rows-row tile otherwise:
   //
   //     p = b * (batch_rows * C0) + r * C0 + w,   c = b * C0 + w
   //
   // so decoding p back to (r, c) is the inverse of TurboQuantCubeMm::NzOffset
-  // with `rows` set to batch_rows -- the full tile's row count only shifts the
-  // *destination* base, which the kernel applies with a strided DataCopy, and
-  // never enters this table. nz_rows is therefore only checked for consistency.
+  // with `rows` set to batch_rows. nz_rows is only checked for consistency.
   for (int plane = 0; plane < 2; ++plane) {
     for (int64_t p = 0; p < batch; ++p) {
       int64_t r = p / d;
@@ -260,12 +257,9 @@ std::vector<int32_t> ModeTables(tqm::TurboQuantMode mode, int64_t head_size, int
     }
   }
 
-  // lowRecip_: radix^-(p mod low_per_byte), one 32-byte block.
-  //
-  // The period divides the block's 8 lanes, which is what lets a single block
-  // stand in for a full-length table -- and it survives the NZ permutation
-  // because C0 is a multiple of every period here. See the note in
-  // turboquant_cube_mm.h.
+  // lowRecip_: radix^-(p mod low_per_byte), one 32-byte block. The period
+  // divides the block's 8 lanes and survives the NZ permutation because C0 is a
+  // multiple of every period here.
   for (int64_t lane = 0; lane < kFp32PerBlock; ++lane) {
     float recip = 1.0f;
     for (int64_t j = 0; j < lane % planes.low_per_byte; ++j) {

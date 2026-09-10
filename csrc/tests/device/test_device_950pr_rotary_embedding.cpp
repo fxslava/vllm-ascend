@@ -16,27 +16,21 @@
 
 // Partial rotary position embedding on Ascend 950PR, fp16 in / fp16 out.
 //
-// Stages 3 and 4 of the Qwen3.5 decoder layer, and the one stage where the part
-// actually matters. Qwen3.5 sets partial_rotary_factor 0.25 against head_dim
-// 256, so channels [0, 64) of every head rotate and [64, 256) must come out
-// bit-identical. Two facts follow:
+// Stages 3 and 4 of the Qwen3.5 decoder layer. partial_rotary_factor 0.25
+// against head_dim 256, so channels [0, 64) of every head rotate and [64, 256)
+// must come out bit-identical. Two consequences:
 //
-//   * The 310P cannot run this shape at all. AscendMRotaryEmbedding310 gates on
-//     rotary_dim in (64, 128) and the operator behind it is limited to those
-//     head dims, which is why csrc/tests/device_310p/test_rotary_embedding_310p.cpp
-//     sweeps only 64 and 128 and never a partial case.
-//   * The stock aclnnApplyRotaryPosEmbV2 cannot express a partial rotation
-//     either: it rotates the whole trailing dim. common/partial_rotary_950pr.hpp
-//     documents the two ways round that and picks between them at run time.
+//   * The 310P cannot run this shape: AscendMRotaryEmbedding310 gates on
+//     rotary_dim in (64, 128).
+//   * The stock aclnnApplyRotaryPosEmbV2 cannot express a partial rotation;
+//     common/partial_rotary_950pr.hpp documents the two ways round that and
+//     picks between them at run time.
 //
-// Every device test below prints which of those paths ran, because a pass over
-// aclnnInplacePartialRotaryMul (the vllm-ascend custom operator, present only
-// when the custom op package is installed) and a pass over the packed fallback
-// are different claims about the same hardware.
+// Every device test below prints which path ran.
 //
 // Seeds, shapes and tolerances follow
 // csrc/tests/kernels/cuda/test_rotary_embedding.cpp; the 256/64 cases are new
-// here because no other backend in this repository can run them.
+// here.
 
 #include <gtest/gtest.h>
 

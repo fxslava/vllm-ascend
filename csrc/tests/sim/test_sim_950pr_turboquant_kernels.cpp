@@ -17,43 +17,26 @@
 // The TurboQuant 4-bit KV-cache kernels, driven straight through the CANN
 // runtime and checked against the CPU reference in reference/turbo_quant_cpu.h.
 //
-// Two things are under test and they are quite different in kind:
+// Two things are under test:
 //
-//   * the launch contract - the scale-plane geometry, the codec table image and
-//     the grid arithmetic that turboquant_torch_adpt.h computes on the host.
-//     These are pure functions of the shapes, they are duplicated in five
-//     places (the Ascend C kernel, the torch adapter, the Python backend, the
-//     CPU reference and common/turboquant_launch.hpp), and every one of those
-//     copies can drift independently. The cases below run with no device at all.
+//   * the launch contract -- the scale-plane geometry, the codec table image
+//     and the grid arithmetic. These are pure functions of the shapes,
+//     duplicated in five places that can drift independently, and the cases
+//     below run with no device at all.
 //
-//   * the kernels themselves - the split/combine decode pipeline and the write
-//     path, run on hardware and compared element by element against the CPU
-//     reference. These gate on REQUIRE_ASCEND_950PR.
+//   * the kernels themselves -- the split/combine decode pipeline and the write
+//     path, compared element by element against the CPU reference. These gate
+//     on REQUIRE_ASCEND_950PR.
 //
-// WHY THE CPU REFERENCE IS THE ORACLE. turbo_quant_cpu.h mirrors
-// turboquant_codec_950.h instruction for instruction - the same LCG for the Pi
-// diagonal, the same mid-rise grid, the same -128 byte bias, the same
-// rotated-basis decode. It is not an independent reimplementation and does not
-// pretend to be. What it establishes is that the kernel does on the device what
-// the reference does on the host, which is the property that lets the host-only
-// fidelity report in test_host_turboquant_fidelity.cpp stand in for a hardware run.
-// The fidelity of the codec *itself* against exact attention is measured
-// separately, in test_sim_950pr_turboquant_decode.cpp.
+// turbo_quant_cpu.h mirrors turboquant_codec_950.h instruction for instruction
+// and is not an independent reimplementation. What it establishes is that the
+// kernel does on the device what the reference does on the host.
 //
 // ON EXACTNESS. The reconstruction check is exact-to-one-level rather than
-// byte-identical, even though the measurement is in fact byte-identical: on the
-// Ascend950PR camodel all 4096 channels land on the same 4-bit code as the
-// reference, and the printed drift is 0.000. The butterfly pairing is the same
-// on both sides, so that is what should happen. The tolerance is there because
-// a channel whose rotated value sits exactly on a rounding boundary can be
-// pushed either way by a single ulp of difference in the fp32 accumulation
-// order, and asserting bit-identical packing would make the suite fail on a
-// value nobody chose - most likely on silicon rather than on the simulator. The
-// assertions are therefore: no channel off by more than one level, and the
-// fraction of channels that differ at all is small. Both are real bounds; a
-// genuine bug does not fit through either, as the two defects this file caught
-// on its first run showed - both took the drift straight to 15.000, the full
-// range.
+// byte-identical: a channel whose rotated value sits exactly on a rounding
+// boundary can be pushed either way by one ulp of difference in the fp32
+// accumulation order. The assertions are that no channel is off by more than
+// one level and that the fraction differing at all is small.
 
 #include <gtest/gtest.h>
 
@@ -81,10 +64,8 @@ namespace tq = turboquant_ref;
 namespace tqh = turboquant_host;
 
 // Shapes for the device cases. Deliberately small: this file runs on the
-// camodel simulator as well as on silicon, and every launch there is minutes
-// rather than microseconds. head_size 64 is the bottom of the supported range
-// and the cheapest Walsh-Hadamard; block_size 16 is one kTileRows tile, so the
-// decode kernel's tiling is exercised without a long context.
+// camodel as well as on silicon. head_size 64 is the bottom of the supported
+// range; block_size 16 is one kTileRows tile.
 constexpr int kHeadSize = 64;
 constexpr int kNumKvHeads = 2;
 constexpr int kNumHeads = 4;  // group of 2, so the GQA head->kv_head mapping is live
@@ -94,10 +75,9 @@ constexpr int kContextLen = 32;  // two blocks
 constexpr int kQueryTokens = 1;  // decode
 constexpr float kAttentionScale = 0.125f;  // 1 / sqrt(64)
 
-// Bounds for the reconstruction comparison; see "ON EXACTNESS" above.
-// Bins, not reconstructed values. The device sums the squares for its RMS
-// scale in a tree and the host sums them serially, so the two scales differ in
-// the last bits and a coordinate sitting on a decision boundary can fall either
+// Bounds for the reconstruction comparison, in bins rather than reconstructed
+// values. The device sums the squares for its RMS scale in a tree and the host
+// sums them serially, so a coordinate on a decision boundary can fall either
 // side of it. One bin is what that can cost; two is a real disagreement.
 constexpr int kMaxLevelDrift = 1;
 constexpr double kMaxDifferingChannelFraction = 0.02;
@@ -167,15 +147,12 @@ void ReferenceWritePath(const Scenario& s, std::vector<int8_t>* key_cache, std::
 // Compares two packed caches by the bins they select rather than by their
 // bytes. `label` names the plane in the failure message.
 //
-// The comparison is in bin indices, not in reconstructed values: the Lloyd-Max
-// levels are unevenly spaced, so one bin is worth anywhere between 0.257 and
-// 0.664, and a value-space bound tight enough to catch a two-bin slip at the
-// centre of the table would reject a legitimate one-bin tie-break at its edge.
-// The indices are exact, so the bound can be too.
+// The Lloyd-Max levels are unevenly spaced, so a value-space bound tight enough
+// to catch a two-bin slip at the centre of the table would reject a legitimate
+// one-bin tie-break at its edge. The indices are exact, so the bound can be.
 //
-// Only the rows the scenario actually wrote are examined: everything else in
-// both caches is the zero fill, which quantises to a single bin and would
-// drown a real difference in noise.
+// Only the rows the scenario wrote are examined: everything else is the zero
+// fill, which quantises to a single bin.
 void ExpectPackedCachesAgree(const char* label, const std::vector<int8_t>& actual, const std::vector<int8_t>& expected,
                              const std::vector<int32_t>& slots) {
   ASSERT_EQ(actual.size(), expected.size()) << label << ": cache sizes differ";
@@ -400,10 +377,9 @@ TEST(TurboQuantLaunchContract, CodecTablesHaveTheDocumentedLayout) {
   }
 
   // [7D + 2B, +16): the Lloyd-Max reconstruction levels, which Dequantize4Bit
-  // gathers against with a byte offset of 4 * bin. The section is checked for
-  // the two properties the codec actually relies on -- that it is the table the
-  // host reference quantises with, and that it is strictly increasing, without
-  // which the threshold scan's bin index would not select the nearest centroid.
+  // gathers against with a byte offset of 4 * bin. Checked for the two
+  // properties the codec relies on -- that it is the table the host reference
+  // quantises with, and that it is strictly increasing.
   const size_t centroid_base = select_base + static_cast<size_t>(kD) * kRows;
   ASSERT_EQ(tables.size(), centroid_base + static_cast<size_t>(tq::kLevels));
   for (int level = 0; level < tq::kLevels; ++level) {
@@ -580,11 +556,9 @@ TEST(TurboQuantKernels, PagedAttentionMatchesTheCpuReference) {
               metrics.cosine_similarity, metrics.snr_db, metrics.relative_l2,
               static_cast<long long>(device.aiv_num()), device.aiv_queried() ? "" : ", assumed");
 
-  // The kernel keeps the accumulator in fp32 and rounds once, at the store; the
-  // reference does the same, so the two differ only by the fp16 output
-  // quantisation and by the order the online softmax visits blocks. Both are
-  // bounded, and neither is data dependent, so this is a tight bound rather
-  // than a tuned one.
+  // The kernel keeps the accumulator in fp32 and rounds once, at the store, and
+  // so does the reference, so the two differ only by the fp16 output
+  // quantisation and by the order the online softmax visits blocks.
   EXPECT_GT(metrics.cosine_similarity, 0.9995) << "the decode kernel disagrees with the reference in direction, "
                                                   "which fp16 rounding of the output cannot cause";
   EXPECT_LT(metrics.relative_l2, 5e-3) << "the decode kernel disagrees with the reference in magnitude";

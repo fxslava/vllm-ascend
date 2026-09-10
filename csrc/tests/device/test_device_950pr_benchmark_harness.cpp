@@ -15,20 +15,13 @@
  */
 
 // Regression tests for the parts of the benchmark harness that decide what a
-// timing report says, none of which need a device.
+// timing report says, none of which need a device -- the only test binary in
+// the suite with no REQUIRE_ASCEND_DEVICE in it.
 //
-// This is the only test binary in the suite with no REQUIRE_ASCEND_DEVICE in
-// it, and that is the point: the bugs it covers - a negative event time
-// reaching the statistics, a malformed ASCEND_BENCH_* value silently becoming a
-// plausible one, throughput computed from a latency that cannot be one - all
-// showed up as wrong numbers in a report from a healthy 310P, so they have to
-// be catchable without one.
-//
-// The device-side halves of the same fixes are not reachable from here:
-// aclrtEventElapsedTime validation needs recorded events, and DeviceBuffer's
-// alignment slack needs aclrtMalloc. What is covered below is the arithmetic
-// those two paths hand their results to, plus the pure alignment arithmetic the
-// allocator is built on.
+// Covered: the arithmetic a negative or malformed sample is handed to, the
+// ASCEND_BENCH_* option parse, and the alignment arithmetic DeviceBuffer is
+// built on. Not covered: aclrtEventElapsedTime validation and the allocator
+// itself, which need recorded events and aclrtMalloc.
 
 #include <gtest/gtest.h>
 
@@ -249,11 +242,8 @@ TEST_F(BenchmarkEnvironment, AnAllUnknownModeListFallsBackToPipelined) {
 // ---------------------------------------------------------------------------
 
 TEST(DeviceBufferAlignment, PaddedCapacityFitsInsideTheRequestForAnyBaseAddress) {
-  // The invariant DeviceBuffer::Allocate now checks at runtime, stated over
-  // every base-address residue rather than the one aclrtMalloc happens to
-  // return. The slack used to be added only for a stronger-than-default
-  // alignment, which made this false for the 32-byte case whenever the
-  // allocator handed back a pointer that needed advancing.
+  // The invariant DeviceBuffer::Allocate checks at runtime, stated over every
+  // base-address residue rather than the one aclrtMalloc happens to return.
   for (size_t alignment : {kDeviceAlignBytes, kBenchmarkAlignBytes}) {
     for (size_t size_bytes : {size_t{1}, size_t{31}, size_t{512}, size_t{1536}, size_t{11008 * 2}}) {
       const size_t capacity = AlignUp(size_bytes, alignment);

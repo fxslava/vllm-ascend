@@ -17,72 +17,36 @@
 // The TurboQuant 4-bit KV cache on a PHYSICAL Ascend 950PR: production shapes,
 // driven straight through AscendCL, with the camodel explicitly excluded.
 //
-// HOW THIS DIFFERS FROM THE OTHER TWO TURBOQUANT DEVICE BINARIES, WHICH IS THE
-// ONLY REASON IT EXISTS.
+// The other two TurboQuant device binaries run at the smallest shape that still
+// exercises the tiling, the paging and the GQA mapping, because they have to
+// finish under the camodel. This file runs head_size 256, block_size 128 and
+// context 512 / 1024 / 2048 -- the shapes Qwen3.5-2B actually decodes at -- so
+// every case is a claim about silicon.
 //
-//   test_sim_950pr_turboquant_kernels   the launch contract and the kernels at the
-//                                   smallest shape that still exercises the
-//                                   tiling, the paging and the GQA mapping:
-//                                   head_size 64, block_size 16, context 32.
-//                                   Small because it has to finish under the
-//                                   camodel.
-//   test_sim_950pr_turboquant_decode   one decode pass, quantised against exact
-//                                   fp32, at that same small shape and for the
-//                                   same reason.
-//   this file                       head_size 256, block_size 128, context
-//                                   512 / 1024 / 2048 - the shapes Qwen3.5-2B
-//                                   actually decodes at, which the simulator
-//                                   cannot reach in any usable time. Every case
-//                                   below is a claim about silicon.
+// Under RUN_MODE=sim aclrtGetSocName() reports a genuine 950PR bin, so
+// REQUIRE_ASCEND_950PR would pass and the S=2048 cases would run for days.
+// REQUIRE_PHYSICAL_ASCEND_950PR looks at what is mapped into the process
+// instead. ASCEND_TEST_ALLOW_SIMULATOR=1 overrides it and
+// ASCEND_TQ_BARE_METAL_CONTEXTS shrinks the sweep.
 //
-// WHY THE CAMODEL HAS TO BE EXCLUDED RATHER THAN JUST BEING SLOW. Under
-// RUN_MODE=sim, aclrtGetSocName() reports a genuine Ascend950PR bin, so
-// REQUIRE_ASCEND_950PR passes and the suite would start - and then run for days
-// on the S=2048 cases, looking like a hang rather than a skip.
-// REQUIRE_PHYSICAL_ASCEND_950PR looks at what is mapped into the process instead
-// (libruntime_camodel.so, or anything out of tools/simulator/) and skips with
-// that evidence in the message. ASCEND_TEST_ALLOW_SIMULATOR=1 overrides it for
-// smoke-checking the binary, and ASCEND_TQ_BARE_METAL_CONTEXTS shrinks the sweep
-// so such a run is merely slow rather than pointless.
+// WHAT IT VALIDATES:
 //
-// WHAT IT VALIDATES, AND HOW HARD EACH CLAIM IS.
-//
-//   1. topology            the part answers aclGetDeviceCapability with a
-//                          vector core count, and has the HBM the shapes below
-//                          assume. Reported and loosely asserted; this is the
-//                          case that says "these numbers came from silicon".
-//   2. write path          the packed cache and the scale plane, against
-//                          reference/turbo_quant_cpu.h, at every context in the
-//                          sweep. Compared in bin indices with a one-bin
-//                          tolerance, for the reason the kernels test spells
-//                          out: the device sums the squares of its RMS scale in
-//                          a tree and the host sums them serially, so a
-//                          coordinate sitting on a Lloyd-Max decision boundary
-//                          can legitimately fall either side of it.
-//   3. bit-exactness       byte-for-byte equality of the packed cache on inputs
-//                          constructed so that tie-break cannot happen - the
-//                          Pi-preimage of a +-1 vector, whose rotated
-//                          coordinates are exactly +-1 and whose sum of squares
-//                          is exactly head_size in any summation order. This is
-//                          the strict test the tolerance above has to exist
-//                          without: no tolerance, no drift, no statistics.
-//   4. decode             the split/combine pipeline against the same CPU
-//                          reference, reading back the cache the device itself
-//                          wrote, so a disagreement is the decode and not the
-//                          write.
-//   5. memory layout      the geometry every one of the five copies of it has to
-//                          agree on, plus the alignment claims the kernel source
-//                          makes: that a token's packed bytes across kv heads
-//                          are a whole number of 32-byte bursts, and that a
-//                          token's scale slot is too.
-//   6. bounds             a poisoned cache, a slot mapping that covers part of
-//                          it and marks some tokens -1, and the requirement
-//                          that every byte outside the mapping survives
-//                          untouched. On silicon and at this size this is a real
-//                          test of the scatter's addressing.
-//   7. determinism        eight decode launches from one filled cache, required
-//                          to be bit-identical. The cross-core race this suite
-//                          caught once before was invisible at one launch.
+//   1. topology       the part answers aclGetDeviceCapability with a vector core
+//                     count and has the HBM the shapes assume.
+//   2. write path     the packed cache and the scale plane against
+//                     reference/turbo_quant_cpu.h, compared in bin indices with
+//                     a one-bin tolerance (the device sums its RMS scale in a
+//                     tree and the host serially).
+//   3. bit-exactness  byte-for-byte equality on inputs constructed so tie-break
+//                     cannot happen; see MakePiPreimageContext.
+//   4. decode         the split/combine pipeline against the same CPU
+//                     reference, reading back the cache the device wrote.
+//   5. memory layout  the geometry all five copies of it must agree on, plus
+//                     the 32-byte alignment claims the kernel source makes.
+//   6. bounds         a poisoned cache and a slot mapping with -1 entries: every
+//                     byte outside the mapping must survive untouched.
+//   7. determinism    eight decode launches from one filled cache, required to
+//                     be bit-identical.
 
 #include <gtest/gtest.h>
 
@@ -116,8 +80,6 @@ namespace s950 = shapes950;
 // --- the shape ---------------------------------------------------------------
 //
 // Qwen3.5-2B's full-attention layer, as common/ascend950_shapes.hpp records it.
-// head_dim 256 is the top of the range the codec sizes UB for and the width the
-// 310P cannot run at all.
 
 constexpr int kHeadSize = static_cast<int>(s950::kHeadDim);       // 256
 constexpr int kNumHeads = static_cast<int>(s950::kNumHeads);      // 8
@@ -132,10 +94,9 @@ const int kDefaultContextLens[] = {512, 1024, 2048};
 
 // --- bounds ------------------------------------------------------------------
 //
-// The same two the kernels test uses at the small shape, and for the same
-// reason: see the header comment there. They are not relaxed for the larger
-// shape, because nothing about a longer context makes a bin slip more likely -
-// the quantisation is per vector.
+// The same two the kernels test uses at the small shape, unrelaxed: nothing
+// about a longer context makes a bin slip more likely, since the quantisation
+// is per vector.
 constexpr int kMaxLevelDrift = 1;
 constexpr double kMaxDifferingChannelFraction = 0.02;
 constexpr double kScaleRelativeTolerance = 1e-5;
@@ -370,21 +331,16 @@ class DeviceScenario {
 // A context whose rotated coordinates are exactly +-1.
 //
 // Pi is an involution, so feeding the write path Pi u hands the codec back u.
-// Choosing u in {-1, +1}^D makes every step of what follows exact on both
-// sides, which is what turns a bounded comparison into a byte-for-byte one:
+// Choosing u in {-1, +1}^D makes every step exact on both sides:
 //
-//   * sum of squares is exactly D whatever order it is summed in, so the
-//     device's tree reduction and the host's serial loop cannot disagree and
-//     the scale is exactly 1.0 on both;
-//   * every normalised coordinate is exactly +-1.0, which sits 0.2 away from
-//     the nearest Lloyd-Max decision boundary (0.7995 and 1.0992), so no
-//     tie-break is even in reach;
-//   * Pi u itself is a multiple of 1/8 bounded by sqrt(D), so it survives the
-//     fp16 store the device reads it through without rounding. The test asserts
-//     that rather than trusting it.
+//   * sum of squares is exactly D in any summation order, so the scale is
+//     exactly 1.0 on both;
+//   * every normalised coordinate is exactly +-1.0, 0.2 away from the nearest
+//     Lloyd-Max decision boundary;
+//   * Pi u is a multiple of 1/8 bounded by sqrt(D), so it survives the fp16
+//     store without rounding. The test asserts that rather than trusting it.
 //
-// This only works where 1/sqrt(D) is a power of two - D = 64 and D = 256 - which
-// covers the width this file runs at.
+// Only valid where 1/sqrt(D) is a power of two -- D = 64 and D = 256.
 std::vector<float> PiPreimageOfSignVector(uint32_t seed) {
   const std::vector<int8_t> signs = tq::cpu_pi_sign_vector(kHeadSize);
   DeterministicRandom rng(seed);

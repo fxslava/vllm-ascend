@@ -65,10 +65,8 @@ inline bool IsValid310PBlockSize(int64_t block_size, int64_t head_size) {
 constexpr int64_t kDecodeTokenCount = 1;
 
 // Prefill batches many tokens through the same weights, so M > 1 and the cube
-// unit's M tiling is exercised for the first time. The parity tests stay at
-// M = 1 (see the note in test_matmul_310p.cpp); the benchmark covers both,
-// because the arithmetic intensity - and therefore whether the projection is
-// bandwidth- or cube-bound - is entirely a function of M.
+// unit's M tiling is exercised. The parity tests stay at M = 1; the benchmark
+// covers both.
 inline std::vector<int64_t> PrefillTokenCounts() { return {32, 128, 512}; }
 
 // K = in_features. Qwen3.5 hidden sizes that feed a projection.

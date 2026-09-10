@@ -72,12 +72,9 @@ inline AscendType ToAscendType(at::ScalarType scalarType)
     return scalarType == at::ScalarType::BFloat16 ? AscendType::BF16 : AscendType::FP16;
 }
 
-// AI Vector cores on the device this rank is bound to.
-//
-// The count is fetched from the driver once per device and cached; see
-// csrc/npu_device_registry.h. Resolving the device per call rather than
-// assuming 0 is what makes this correct under tensor parallelism, where every
-// rank drives a different NPU.
+// AI Vector cores on the device this rank is bound to, cached per device; see
+// csrc/npu_device_registry.h.  Resolving the device per call rather than
+// assuming 0 is what makes this correct under tensor parallelism.
 inline int64_t VectorCoreNum()
 {
     return device_registry::VectorCoreNum();
@@ -132,11 +129,7 @@ inline int64_t PartialStride(int64_t headSize)
 
 // Everything about a paged-attention launch that is a pure function of the
 // shapes and the core count: the split count, the workspace it needs, and the
-// two grids.
-//
-// Both stages are planned in one place, so the workspace the host allocates and
-// the workspace the split stage writes cannot drift apart.  Mirrored for the
-// torch-free suite by PlanPagedAttention() in
+// two grids.  Mirrored for the torch-free suite by PlanPagedAttention() in
 // csrc/tests/common/turboquant_launch.cpp.
 struct PagedAttentionPlan {
     int64_t num_splits = 1;
@@ -183,26 +176,17 @@ inline PagedAttentionPlan PlanPagedAttention(int64_t numTokens, int64_t numHeads
 
 }  // namespace turboquant_adpt
 
-/*
- * AI Vector cores on this rank's device, from the cached registry.
- *
- * Exposed so the host can prime the registry while the model is still loading:
- * the first query is the only one that reaches the driver, and paying it at
- * load time keeps it off the decode path and out of a graph capture.
- */
+// AI Vector cores on this rank's device, from the cached registry.  Exposed so
+// the host can prime the registry while the model is still loading and keep the
+// first driver query off the decode path.
 inline int64_t npu_turboquant_vector_core_num()
 {
     return turboquant_adpt::VectorCoreNum();
 }
 
-/*
- * fp32 words of workspace npu_turboquant_paged_attention needs for a decode of
- * this shape.
- *
- * The caller owns the buffer.  This exists so the host can allocate it once,
- * ahead of the hot path, from the same arithmetic the operator itself uses --
- * rather than the two sides each carrying their own copy of the formula.
- */
+// fp32 words of workspace npu_turboquant_paged_attention needs for a decode of
+// this shape.  The caller owns the buffer; this exists so the host can allocate
+// it once from the same arithmetic the operator uses.
 inline int64_t npu_turboquant_workspace_size(int64_t num_tokens, int64_t num_heads, int64_t head_size,
                                              int64_t max_blocks_per_seq)
 {
@@ -224,11 +208,9 @@ inline int64_t npu_turboquant_workspace_size(int64_t num_tokens, int64_t num_hea
  *   pi_signs        [head_size]                                           fp32, +-1
  *   codec_tables    [7 * head_size + 2 * head_size]                       int32
  *
- * `key` is the post-RoPE key and `value` the raw value projection, both exactly
- * as the model produced them: the kernel applies Pi in UB and no weight is ever
- * rewritten, so RoPE stays correct.  `codec_tables` is the shuffle/sign image
- * the codec used to rebuild with vector math on every launch; the host now
- * builds it once and the kernel pulls it in with a single DataCopy.
+ * `key` is the post-RoPE key and `value` the raw value projection.  The kernel
+ * applies Pi in UB and rewrites no weight.  `codec_tables` is the host-built
+ * shuffle/sign image the kernel pulls in with a single DataCopy.
  */
 inline void npu_turboquant_reshape_and_cache(at::Tensor &key, at::Tensor &value, at::Tensor &key_cache,
                                              at::Tensor &value_cache, at::Tensor &scale_cache,
@@ -283,14 +265,10 @@ inline void npu_turboquant_reshape_and_cache(at::Tensor &key, at::Tensor &value,
     const float inv_sqrt_len = 1.0f / std::sqrt(static_cast<float>(head_size));
 
     // Pushed straight onto the current stream rather than through
-    // OpCommand::SetCustomHandler, which would wrap the launch in a std::function
-    // and hand it to torch_npu's task-queue thread -- host work per launch, once
-    // per layer per step, for a kernel that needs none of it.
-    //
-    // getCurrentNPUStream().stream() drains that pending queue before returning
-    // the raw handle, so work pushed here still lands behind whatever this
-    // thread queued earlier. The launch itself is asynchronous: the host does
-    // not wait, and nothing here is a callback the device has to call back into.
+    // OpCommand::SetCustomHandler, which would add host work per launch.
+    // getCurrentNPUStream().stream() drains the pending queue before returning
+    // the raw handle, so this still lands behind whatever the thread queued
+    // earlier.  The launch itself is asynchronous.
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     turboquant_reshape_and_cache_impl(
         adpt::ToAscendType(key.scalar_type()), stream, block_dim, key.data_ptr(), value.data_ptr(),
@@ -309,24 +287,16 @@ inline void npu_turboquant_reshape_and_cache(at::Tensor &key, at::Tensor &value,
  *   workspace    [>= npu_turboquant_workspace_size(...)]    fp32
  *   out          [num_tokens, num_heads, head_size]         same dtype as query
  *
- * `query` is the post-RoPE query.  The kernel rotates it once, runs the whole
- * softmax and value accumulation in the rotated basis, and applies Pi to the
- * accumulator again on the way out -- Pi being an involution, that is the
- * un-rotation.
+ * `query` is the post-RoPE query.  The kernel rotates it once, runs the softmax
+ * and value accumulation in the rotated basis, and applies Pi again on the way
+ * out.
  *
- * This dispatches *two* kernels on the current stream.  The split stage writes
- * one partial per (token, head, sequence split) into `workspace`; the combine
- * stage reduces them.  The two cannot share a launch: an in-kernel barrier only
- * orders blocks that are co-resident, so with a grid larger than the physical
- * core count it either reads partials that were never written or deadlocks.
- * Stream order between two launches is the guarantee that always holds.
+ * This dispatches *two* kernels on the current stream: an in-kernel barrier
+ * only orders co-resident blocks, so stream order between two launches is the
+ * guarantee that always holds.
  *
- * `workspace` is caller-owned scratch, not an output: the split stage writes
- * every word the combine stage reads, so whatever it arrives holding is
- * irrelevant and nothing in it is meant to survive the call.  It is an argument
- * rather than an at::empty here because a decode step must not allocate -- an
- * allocation is host latency on the critical path, and inside a graph capture
- * it is a buffer whose address the replay has no reason to reuse.
+ * `workspace` is caller-owned scratch, not an output.  It is an argument rather
+ * than an at::empty because a decode step must not allocate.
  */
 inline void npu_turboquant_paged_attention(at::Tensor &query, at::Tensor &key_cache, at::Tensor &value_cache,
                                            at::Tensor &scale_cache, at::Tensor &block_tables,

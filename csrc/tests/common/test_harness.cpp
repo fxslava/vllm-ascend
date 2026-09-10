@@ -60,17 +60,12 @@ std::string QuerySocName() {
 // The mapped object that shows the CANN camodel is standing in for the runtime,
 // or an empty string when nothing in the address space says so.
 //
-// Detection is by loaded object rather than by SoC name on purpose: under the
-// camodel aclrtGetSocName() reports a real bin - Ascend950PR_9589 and friends -
-// which is exactly what makes the simulator useful and exactly why the name
-// cannot distinguish it from silicon. What does distinguish it is that
-// RUN_MODE=sim links libruntime_camodel.so in place of libruntime.so and the
-// loader picks it up out of $ASCEND_HOME_PATH/tools/simulator/<bin>/lib, so both
-// the library and the directory it came from are visible in the mapping list.
+// Detection is by loaded object rather than by SoC name: under the camodel
+// aclrtGetSocName() reports a real bin. RUN_MODE=sim links libruntime_camodel.so
+// in place of libruntime.so out of $ASCEND_HOME_PATH/tools/simulator/<bin>/lib.
 //
-// A host with no /proc, or one whose maps cannot be read, reports "not a
-// simulator": silicon is the default assumption, and the alternative would be to
-// skip the bare-metal suite on every machine that refuses the read.
+// A host with no readable /proc reports "not a simulator": silicon is the
+// default assumption.
 std::string QuerySimulatorEvidence() {
   std::ifstream maps("/proc/self/maps");
   if (!maps.is_open()) {
@@ -200,11 +195,9 @@ bool AscendTestEnvironment::is_310p() const {
 }
 
 bool AscendTestEnvironment::is_950pr() const {
-  // The platform_config SoC_version for every 950PR bin starts "Ascend950PR"
-  // (Ascend950PR_9599, _9589, _957b, ...). Ascend950DT shares the family but
-  // not the part, so a prefix match rather than a "950" substring.
-  //
-  // An empty name is rejected: see the note on the declaration.
+  // The platform_config SoC_version for every 950PR bin starts "Ascend950PR".
+  // Ascend950DT shares the family but not the part, so a prefix match rather
+  // than a "950" substring. An empty name is rejected.
   return ::vllm_ascend::test::shapes950::IsAscend950PrSocName(soc_name_);
 }
 

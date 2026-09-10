@@ -16,17 +16,14 @@
 
 // Host reference for the TurboQuant 4-bit KV cache, matching the layout and the
 // arithmetic of csrc/attention/turboquant/turboquant_codec_950.h element for
-// element.  Nothing here touches ACL or allocates device memory: the whole
-// pipeline runs on the CPU so its fidelity can be measured on a build machine,
-// a simulator, or anywhere else with no NPU attached.
+// element. Nothing here touches ACL or allocates device memory.
 //
 // The transform is
 //
 //     Pi x = D (H (D x)),   D = diag(+-1),   H = normalised Walsh-Hadamard
 //
-// which is symmetric and an involution (Pi^T == Pi, Pi^2 == I), so cpu_apply_pi
-// is both the rotation and the un-rotation.  Rotation is applied to activations
-// only; no weight is ever rewritten.
+// which is symmetric and an involution, so cpu_apply_pi is both the rotation
+// and the un-rotation. Rotation is applied to activations only.
 //
 // Storage per vector of D channels:
 //
@@ -35,12 +32,8 @@
 //     q         = sum_{i=1}^{15} [Pi_x / scale > t_i]
 //
 // reconstructing as scale * c[q] against the 16-level Lloyd-Max table for
-// N(0, 1). The rotation is what makes that the right table: it drives the
-// coordinate distribution to very nearly i.i.d. standard normal, so the codec
-// quantises against the density it actually sees.
-//
-// The -128 bias is undone numerically on the way back, so nothing here depends
-// on the int8 bit pattern.
+// N(0, 1). The -128 bias is undone numerically on the way back, so nothing here
+// depends on the int8 bit pattern.
 
 #ifndef VLLM_ASCEND_TESTS_REFERENCE_TURBO_QUANT_CPU_H
 #define VLLM_ASCEND_TESTS_REFERENCE_TURBO_QUANT_CPU_H
@@ -71,11 +64,9 @@ constexpr float kEps = 1e-20f;
 //
 //     t_i = (c_{i-1} + c_i) / 2,     c_i = E[X | t_i < X < t_{i+1}],
 //
-// with distortion E[(X - Q(X))^2] = 0.0095010080 (20.222 dB) against 0.01388
-// for the uniform mid-rise grid it replaced. Byte-identical to
-// TurboQuantCodec<4>::Threshold() and to the centroid table the host writes
-// into the codec's constant-table image, and to LLOYD_MAX_4BIT_{CENTROIDS,
-// THRESHOLDS} in scripts/tq_kv_quant_reference.py, which can re-derive them.
+// byte-identical to TurboQuantCodec<4>::Threshold(), to the centroid table the
+// host writes into the codec's constant-table image, and to
+// LLOYD_MAX_4BIT_{CENTROIDS, THRESHOLDS} in scripts/tq_kv_quant_reference.py.
 constexpr float kLloydMaxCentroids[kLevels] = {
     -2.7325895709951710f, -2.0690172265313920f, -1.6180463860218863f, -1.2562311973471796f,
     -0.9423404564869651f, -0.6567591185324659f, -0.3880482994902919f, -0.1283950298511473f,
@@ -133,12 +124,9 @@ inline void cpu_apply_pi(float* vec, int d, const int8_t* sign_vec) {
   }
 }
 
-// The RMS scale the Lloyd-Max table is stated in: ||vec||_2 / sqrt(d).
-//
-// Written as sqrt(sumsq) * (1 / sqrt(d)) rather than as a division, because
-// that is the order the kernel evaluates it in -- it multiplies by the same
-// invSqrtLen the Hadamard normalises with rather than dividing by a scalar it
-// would have to compute.
+// The RMS scale the Lloyd-Max table is stated in: ||vec||_2 / sqrt(d). Written
+// as sqrt(sumsq) * (1 / sqrt(d)) rather than as a division, because that is the
+// order the kernel evaluates it in.
 inline float cpu_rms_scale(const float* vec, int d) {
   float sumsq = 0.0f;
   for (int i = 0; i < d; ++i) {
@@ -165,20 +153,15 @@ inline int cpu_lloyd_max_bin(float u) {
 //   scale           output, ||vec||_2 / sqrt(d)
 //
 // Reads exactly vec[0, d) and writes exactly packed[0, d/2) plus one float, so
-// a poisoned destination or poisoned padding beyond d/2 cannot influence the
-// result and must survive the call untouched.
+// poisoned padding beyond d/2 must survive the call untouched.
 //
-// Two edges are worth knowing. The kEps floor keeps an all-zero vector from
-// dividing by zero, but the table has no exact zero: an all-zero input puts
-// every channel in bin 7 and reconstructs to kEps * c[7], about -1.3e-21 rather
-// than a bit-exact 0.0. And the byte is deliberately built so the extremes are
-// reachable without overflow: bins (15, 15) give 255 - 128 = +127 and (0, 0)
-// give -128.
+// Two edges: the kEps floor keeps an all-zero vector from dividing by zero, but
+// the table has no exact zero, so an all-zero input reconstructs to
+// kEps * c[7], about -1.3e-21. And the byte is built so bins (15, 15) give
+// 255 - 128 = +127 and (0, 0) give -128.
 //
-// Unlike the absmax it replaced, the RMS scale depends on the order the squares
-// are summed, so the kernel's tree reduction and this serial loop can differ in
-// the last bits. Nothing downstream is bit-exact against the device because of
-// it; the kernel tests compare reconstructions within a bounded drift instead.
+// The RMS scale depends on the order the squares are summed, so the kernel's
+// tree reduction and this serial loop can differ in the last bits.
 inline void cpu_quantize_4bit(const float* vec, int d, int8_t* packed, float* scale) {
   const float s = cpu_rms_scale(vec, d);
   const float inv_scale = 1.0f / s;
@@ -194,16 +177,13 @@ inline void cpu_quantize_4bit(const float* vec, int d, int8_t* packed, float* sc
   *scale = s;
 }
 
-// Expand d/2 packed bytes back into d channels.  Passing scale = 1 yields the
+// Expand d/2 packed bytes back into d channels. Passing scale = 1 yields the
 // bare centroids c[q], which is what the kernel keeps in UB: it folds the
-// per-vector scale into the score row (for K) and into the softmax
-// probabilities (for V) rather than broadcasting it over head_size.  That fold
-// works because the reconstruction is linear in the scale, which scale * c[q]
-// still is.
+// per-vector scale into the score row (K) or the softmax probabilities (V),
+// which works because the reconstruction is linear in the scale.
 //
-// Reads exactly packed[0, d/2) and writes exactly out[0, d).  Nothing outside
-// those two ranges is touched, which is what lets the caller hand it a slice of
-// a larger, poisoned buffer.
+// Reads exactly packed[0, d/2) and writes exactly out[0, d), so the caller can
+// hand it a slice of a larger, poisoned buffer.
 inline void cpu_dequantize_4bit(const int8_t* packed, int d, float scale, float* out) {
   for (int p = 0; p < d; ++p) {
     const float byte = static_cast<float>(packed[p / kPackFactor]) + kInt8Bias;
@@ -215,11 +195,9 @@ inline void cpu_dequantize_4bit(const int8_t* packed, int d, float scale, float*
 }
 
 // Batched expansion, mirroring TurboQuantCodec<4>::Dequantize4Bit(dst, src,
-// rows, len).  The kernel sizes its shuffle tables and its swap/scratch buffers
-// for a full `batchRows`, but a call with rows < batchRows must confine itself
-// to the live prefix: it reads packed[0, rows * d / 2) and writes
-// out[0, rows * d), and everything past those bounds -- the padding the kernel
-// leaves uninitialised -- must neither be read nor written.
+// rows, len). A call with rows < batchRows must confine itself to the live
+// prefix: it reads packed[0, rows * d / 2) and writes out[0, rows * d), and
+// everything past those bounds must be neither read nor written.
 //
 // `scale` is applied uniformly; pass 1.0f for the bare centroids.
 inline void cpu_dequantize_4bit_batch(const int8_t* packed, int rows, int d, float scale, float* out) {

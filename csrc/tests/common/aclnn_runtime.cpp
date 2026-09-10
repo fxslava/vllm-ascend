@@ -54,12 +54,9 @@ std::vector<std::string> OpApiCandidatePaths() {
     const std::string home(ascend_home);
     candidates.push_back(home + "/lib64/libopapi.so");
     candidates.push_back(home + "/lib64/stub/libopapi.so");
-    // Some CANN packages install a multi-architecture root that has no lib64 of
-    // its own, only <arch>-linux/lib64 - the CANN 8.5.0 package this was found
-    // on keeps libascendcl.so and libnnopbase.so under x86_64-linux/lib64 and
-    // has nothing at $ASCEND_HOME_PATH/lib64 at all. On such a tree the two
-    // candidates above cannot resolve. Probing the per-arch subdirectories
-    // costs two failed dlopens on a normal install.
+    // Some CANN packages install a multi-architecture root with no lib64 of its
+    // own, only <arch>-linux/lib64, so the two candidates above cannot resolve.
+    // Probing costs two failed dlopens on a normal install.
     candidates.push_back(home + "/aarch64-linux/lib64/libopapi.so");
     candidates.push_back(home + "/x86_64-linux/lib64/libopapi.so");
   }
@@ -94,8 +91,7 @@ std::vector<std::string> SplitOn(const std::string& text, char separator) {
 //   2. every vendor named by load_priority in $ASCEND_OPP_PATH/vendors/config.ini
 //
 // with "/op_api/lib/libcust_opapi.so" appended to each. A path that does not
-// exist is simply skipped: an install with no custom package is the normal case
-// on stock CANN and must not be reported as an error.
+// exist is skipped: an install with no custom package is the normal case.
 std::vector<std::string> CustomOpApiCandidatePaths() {
   std::vector<std::string> candidates;
 

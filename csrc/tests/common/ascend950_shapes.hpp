@@ -15,18 +15,11 @@
  */
 
 // Shapes and platform rules for the Ascend 950PR (A5, DaVinci arch35) leg of
-// the suite.
-//
-// Kept separate from qwen_shapes.hpp rather than merged into it because almost
-// every rule that file encodes is a 310P (v200) rule that is simply false here:
-// the KV cache is not 5-D NZ, SwiGLU has no 32-element gate, and the rotary
-// operator is not limited to head dims 64 and 128. Sharing the file would mean
-// a reader has to know which constants apply to which part; two files means the
-// include list says it.
+// the suite. Kept separate from qwen_shapes.hpp, whose rules are 310P (v200)
+// rules that do not hold here.
 //
 // The Qwen3.5-2B layer-3 block below mirrors scripts/dump_qwen35_layer3.py,
-// which produced csrc/tests/data/golden_layer3. Change one and the other stops
-// being a reference.
+// which produced csrc/tests/data/golden_layer3.
 
 #pragma once
 
@@ -41,15 +34,10 @@ namespace shapes950 {
 // --- part identification -----------------------------------------------------
 
 // aclrtGetSocName() returns the platform_config SoC_version, e.g.
-// "Ascend950PR_9599" - the ini files under
-// $ASCEND_HOME_PATH/data/platform_config carry one entry per bin, and every
-// 950PR bin shares Short_SoC_version=Ascend950. The tests therefore match on
-// the "Ascend950PR" prefix rather than on any single bin name.
-//
-// Ascend950DT is the other member of the 950 family and is deliberately NOT
-// accepted: it is a different part (its platform_config differs in the core
-// counts and the cube/vector split) and nothing here has been checked against
-// it.
+// "Ascend950PR_9599"; every 950PR bin shares Short_SoC_version=Ascend950, so the
+// tests match on the "Ascend950PR" prefix rather than on a bin name.
+// Ascend950DT is deliberately NOT accepted: different core counts and
+// cube/vector split, and nothing here has been checked against it.
 inline const char* kSocNamePrefix = "Ascend950PR";
 
 inline bool IsAscend950PrSocName(const std::string& soc_name) {
@@ -65,11 +53,9 @@ inline bool IsAscend950PrSocName(const std::string& soc_name) {
 // elements. Every width in the layer below satisfies this.
 constexpr int64_t kFp16ElementsPerBurst = 16;
 
-// InplacePartialRotaryMul's operator prototype states the head-dim ceiling
-// explicitly: "For Ascend 950 AI Processor, D should be less or equal to 1024"
+// InplacePartialRotaryMul's operator prototype states the head-dim ceiling:
+// "For Ascend 950 AI Processor, D should be less or equal to 1024"
 // (csrc/attention/inplace_partial_rotary_mul/op_host/inplace_partial_rotary_mul_proto.cpp).
-// head_dim 256 is well inside it, which is the whole reason a Qwen3.5 256-wide
-// head can use the operator at all - the 310P rotary path is limited to 64/128.
 constexpr int64_t kMaxRotaryHeadDim = 1024;
 
 // Same prototype: "In half, interleave and interleave-half mode, D must be a
@@ -82,8 +68,6 @@ constexpr int64_t kRotaryHalfModeDimMultiple = 2;
 // so each of the key and value caches is a plain ND
 //   [num_blocks, block_size, num_kv_heads, head_size]
 // with no fractal trailing axis. See vllm_ascend/attention/attention_v1.py.
-// That is the layout the golden test builds, and it is why none of the 310P NZ
-// helpers in cpu_reference.hpp are reachable from here.
 constexpr int64_t kKvCacheRank = 4;
 
 // AscendAttentionBackendImpl._get_fia_params reshapes that cache to
@@ -109,20 +93,13 @@ constexpr int64_t kFiaSparseModeNone = 0;
 constexpr int64_t kFiaInnerPreciseDefault = 1;
 
 // The two scalars V5 adds over V2 (ops950::kFusedInferAttentionScoreV5).
-//
-// queryQuantMode 0 is "the query is not quantised", which is the only thing it
-// can be here: the fp16 baseline hands the operator an fp16 query and no
-// dequantScaleQuery.
+// queryQuantMode 0 is "the query is not quantised".
 constexpr int64_t kFiaQueryQuantModeNone = 0;
 
 // pseType selects how a positional-encoding shift is combined with the scores.
-// This suite passes no pseShift at all, so the value is unused - but the
-// operator still range-checks it, so it cannot be left at an arbitrary number.
+// This suite passes no pseShift, but the operator still range-checks the value;
 // 1 is torch_npu's default for npu_fused_infer_attention_score's pse_type.
-//
-// UNVERIFIED on hardware, like the whole V5 argument list. If a first silicon
-// run rejects the planning call, this constant and the seven optional tensors
-// V5 added are the two things to vary first.
+// UNVERIFIED on hardware, like the whole V5 argument list.
 constexpr int64_t kFiaPseTypeDefault = 1;
 
 // --- Qwen3.5-2B, layer 3 (the first full_attention block) --------------------
@@ -160,10 +137,8 @@ constexpr int64_t kMaxBlocksPerSeq = 1;
 
 // --- shape sweeps for the operator unit tests --------------------------------
 //
-// Deliberately the same values the 310P and CUDA suites sweep (see
-// qwen_shapes.hpp), so a divergence between the three backends is a backend
-// difference and not a shape difference. The one addition is the head dim the
-// other two parts cannot run.
+// The same values the 310P and CUDA suites sweep (see qwen_shapes.hpp), plus
+// the head dim the other two parts cannot run.
 
 // Decode is one token at a time; the projections are therefore GEMV-shaped.
 constexpr int64_t kDecodeTokenCount = 1;

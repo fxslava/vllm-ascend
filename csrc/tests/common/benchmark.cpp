@@ -49,11 +49,8 @@ std::string EnvironmentString(const char* name) {
   return (raw != nullptr) ? std::string(raw) : std::string();
 }
 
-// strtol rather than atoi: atoi cannot tell "0" from "banana", and it is
-// undefined on a value too large for int rather than reporting it. Both used to
-// land silently on a plausible-looking configuration - ASCEND_BENCH_WARMUP with
-// a typo in it became zero warmup, which is exactly the setting whose absence
-// the first sample of every case then pays for.
+// strtol rather than atoi: atoi cannot tell "0" from "banana" and is undefined
+// on a value too large for int, so a typo becomes a plausible configuration.
 int EnvironmentInt(const char* name, int fallback, int minimum, int maximum) {
   const std::string raw = EnvironmentString(name);
   if (raw.empty()) {
@@ -97,10 +94,8 @@ using DestroyExecutorFn = int (*)(aclOpExecutor*);
 // $ASCEND_HOME_PATH/include/aclnn/acl_meta.h:76
 //   aclnnStatus aclSetAclOpExecutorRepeatable(aclOpExecutor *executor);
 //   aclnnStatus aclDestroyAclOpExecutor(aclOpExecutor *executor);
-// aclnnStatus is int32_t, so the typedefs above match. Both are exported by
-// libnnopbase.so and reachable through the RTLD_GLOBAL handle on libopapi.so,
-// the same way aclCreateTensor is. Older CANN lines do not have them, which is
-// why PlannedOp has a re-plan fallback at all.
+// Both are exported by libnnopbase.so. Older CANN lines do not have them, which
+// is why PlannedOp has a re-plan fallback.
 struct ExecutorApi {
   SetExecutorRepeatableFn set_repeatable = nullptr;
   DestroyExecutorFn destroy = nullptr;
@@ -164,15 +159,10 @@ struct HugeMemScope {
 // Timing events
 // ---------------------------------------------------------------------------
 
-// How the events the device modes time with were actually created.
-//
 // ACL_EVENT_TIME_LINE is what makes an event carry a device timestamp, and
-// therefore what makes aclrtEventElapsedTime mean anything at all; ACL_EVENT_SYNC
-// additionally makes it host-waitable, which is what lets the readback resolve
-// each event before querying it. Plain aclrtCreateEvent guarantees neither, and
-// asking for the elapsed time between two events that carry no timestamp is
-// undefined - in practice a large negative number, which is the shape the bad
-// latencies in the reports had.
+// therefore what makes aclrtEventElapsedTime mean anything; ACL_EVENT_SYNC
+// additionally makes it host-waitable. Plain aclrtCreateEvent guarantees
+// neither, and the elapsed time between two untimestamped events is undefined.
 enum class EventTimingSource {
   kTimelineAndSync,
   kTimelineOnly,
@@ -263,35 +253,22 @@ class EventPool {
 };
 
 // An Ascend stream holds a bounded number of submitted tasks; past that the
-// runtime either blocks the host or refuses the submission, depending on the
-// CANN release. At the defaults a pipelined run enqueues 100 * (10 + 2) = 1200
-// tasks, which is over the 1024 that releases documenting a limit give, so the
-// timing loops drain at sample boundaries once they get close. Two drains per
-// run at most, and never inside a batch.
+// runtime either blocks the host or refuses the submission. At the defaults a
+// pipelined run enqueues 100 * (10 + 2) = 1200 tasks, over the documented 1024,
+// so the timing loops drain at sample boundaries once they get close.
 constexpr int kMaxInFlightTasks = 768;
 
 // Two events bracket a pipelined batch, so this is the largest batch that can
-// still be submitted without the runtime blocking the host part-way through a
-// sample. A batch past this point does not measure a fuller pipeline, it
-// measures the runtime's back-pressure, so ASCEND_BENCH_BATCH is clamped to it
-// with a warning rather than quietly producing a serialised "pipelined" number.
+// be submitted without the runtime blocking the host part-way through a sample.
+// ASCEND_BENCH_BATCH is clamped to it with a warning.
 constexpr int kMaxPipelineBatch = kMaxInFlightTasks - 2;
 
 // Reads the time between two recorded events, in microseconds.
 //
 // Returns false, without throwing, when the runtime hands back something that
-// cannot be a duration: negative, NaN or infinite. That happens when an event
-// carries no timestamp, when the device counter behind it wrapped, and when the
-// device has not finished with the event yet. One such sample in a set drags
-// the mean below zero and takes the TFLOP/s and GB/s derived from the median
-// with it, so the sample is dropped and counted instead of being aggregated.
-//
-// Both events are resolved first. The timing loops already drain the whole
-// stream before reading anything back, so these return immediately; they are
-// here so that a caller which loses that barrier waits rather than reading a
-// timestamp the device has not written. A TIME_LINE-only event is not
-// guaranteed to be host-waitable, so for that one case the stream barrier is
-// the only guarantee available and is left to do the job.
+// cannot be a duration: negative, NaN or infinite. Both events are resolved
+// first, so a caller that has lost the stream barrier waits rather than reading
+// a timestamp the device has not written.
 bool ReadElapsedMicroseconds(aclrtEvent start, aclrtEvent stop, double* microseconds) {
   if (ResolveEventTimingSource() != EventTimingSource::kTimelineOnly) {
     ACL_CHECK(aclrtSynchronizeEvent(start));
@@ -365,10 +342,9 @@ const char* EventTimingSourceLabel() {
 
 BenchmarkOptions BenchmarkOptions::FromEnvironment() {
   BenchmarkOptions options;
-  // An upper bound on the loop counts as well as a lower one. The event pool a
+  // An upper bound on the loop counts as well as a lower one: the event pool a
   // timed loop builds is two events per iteration, so an ASCEND_BENCH_ITERS
-  // with an extra digit in it used to be reported as a device-side event
-  // allocation failure half an hour into a sweep rather than as the typo it is.
+  // with an extra digit in it is a typo and not a sweep.
   constexpr int kMaxIterationCount = 1000000;
   options.warmup_iterations =
       EnvironmentInt("ASCEND_BENCH_WARMUP", options.warmup_iterations, 0, kMaxIterationCount);
@@ -412,12 +388,9 @@ BenchmarkOptions BenchmarkOptions::FromEnvironment() {
 LatencyStatistics LatencyStatistics::From(std::vector<double> samples_us) {
   LatencyStatistics statistics;
 
-  // The bounds check, before anything is accumulated. A sample that is not a
-  // positive finite duration is not a duration: it is a wrapped or unresolved
-  // device counter, an event with no timestamp, or a host clock that went
-  // backwards. Dropping it here keeps one bad reading from pulling the mean -
-  // and the TFLOP/s and GB/s the report derives from the median - somewhere
-  // impossible, and the count is carried out so the drop is never silent.
+  // A sample that is not a positive finite duration is a wrapped or unresolved
+  // device counter, not a duration. The count is carried out so the drop is
+  // never silent.
   const size_t requested = samples_us.size();
   samples_us.erase(std::remove_if(samples_us.begin(), samples_us.end(),
                                   [](double sample) { return !std::isfinite(sample) || sample <= 0.0; }),
@@ -605,11 +578,9 @@ void PlannedOp::Launch(aclrtStream stream) {
   const bool replanned = (executor == nullptr);
   if (replanned) {
     // Fallback path: the previous launch consumed the executor, so plan again.
-    // The workspace is not reallocated - the arguments are identical, so the
-    // size cannot change, and a runtime that disagrees is a bug worth failing
-    // on. It is the buffer PlannedOp has owned since the constructor either
-    // way, so the pointer the launch below is handed stays valid and stays put
-    // for every iteration of every loop in the run.
+    // The workspace is not reallocated -- the arguments are identical, so the
+    // size cannot change -- and the buffer PlannedOp has owned since the
+    // constructor stays valid and stays put.
     uint64_t workspace_size = 0;
     const int status = planner_(&workspace_size, &executor);
     if (status != 0) {
@@ -669,14 +640,10 @@ void BenchmarkRunner::WarmUp(const BenchmarkCase& benchmark_case) {
   // workspace, and the AI Core clock ramp all happen here rather than in sample
   // 0. A long warmup is drained on the way so it cannot overrun the queue.
   const int tasks_per_launch = std::max(1, benchmark_case.tasks_per_launch);
-  // At least one launch, even at ASCEND_BENCH_WARMUP=0. The reference checksum
-  // is read straight after this, and with no launch at all it would be taken
-  // over the allocation's zero fill - so the comparison after the timed loop
-  // would fail every case that has a checksum, reporting "the launches are not
-  // all computing the same thing" when what actually happened is that the
-  // baseline was never computed. Warmup 0 is a legitimate setting (it is how a
-  // camodel run stays finite), so the floor lives here rather than in the
-  // option parse.
+  // At least one launch, even at ASCEND_BENCH_WARMUP=0: the reference checksum
+  // is read straight after this, and with no launch it would be taken over the
+  // allocation's zero fill. Warmup 0 is legitimate -- it is how a camodel run
+  // stays finite -- so the floor lives here rather than in the option parse.
   const int warmup_iterations =
       benchmark_case.checksum ? std::max(1, options_.warmup_iterations) : options_.warmup_iterations;
   int enqueued = 0;
@@ -764,14 +731,9 @@ LatencySamples BenchmarkRunner::TimeHostWallClock(const BenchmarkCase& benchmark
   result.microseconds.reserve(samples);
 
   // steady_clock rather than high_resolution_clock: on libstdc++ the latter is
-  // an alias for system_clock, which is not monotonic and can step under NTP
-  // mid-run. Both have nanosecond resolution here.
-  //
-  // The difference is taken in the clock's own 64-bit nanosecond representation
-  // and converted once, in double. Nothing on this path narrows: microseconds
-  // in a 32-bit signed integer wrap after 2.14 seconds, which is well inside
-  // the range a slow prefill matmul reaches, and a wrapped sample comes out
-  // negative rather than large.
+  // an alias for system_clock, which is not monotonic. The difference is taken
+  // in the clock's own 64-bit nanosecond representation and converted once, in
+  // double; microseconds in a 32-bit signed integer wrap after 2.14 seconds.
   for (size_t sample = 0; sample < samples; ++sample) {
     const auto started = std::chrono::steady_clock::now();
     benchmark_case.launch(stream_);
