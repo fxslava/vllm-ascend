@@ -308,12 +308,11 @@ bool ModeSelected(const char* name) {
 
 TEST(TurboQuantMultiMode, SingleShotDispatchAndFidelity) {
   REQUIRE_ASCEND_950PR();
-  // Still opt-in, but no longer because it stalls: the L0-on-the-vector-core
-  // allocation that produced `pem_lsu: unrecognize ldst addr` is fixed. What is
-  // open is the score GEMM's [n, k] B operand, which is a wrong number rather
-  // than a dead stream, so the fidelity bound below is the thing at risk.
-  REQUIRE_CUBE_WIP_OPT_IN("The Cube-native multi-mode decode",
-                          "the score GEMM's [n, k] B operand does not reproduce the host product.");
+  // No test-level opt-in any more: kv4fp8 runs by default and asserts its
+  // fidelity bound, because the Cube-native decode is corrected and measured
+  // (cos 0.982351 at S=64; see TURBOQUANT_TESTS.md section 13.8). The gate
+  // moved onto the two rates that are still scaffolded -- see `provisional`
+  // in the table below -- so promoting one rate does not promote the others.
 
   DeterministicRandom rng(0x5A17u);
   const size_t kv_elems = static_cast<size_t>(ContextLen() * kNumKvHeads * kHeadSize);
@@ -341,14 +340,19 @@ TEST(TurboQuantMultiMode, SingleShotDispatchAndFidelity) {
     tqm::TurboQuantMode mode;
     const char* name;
     bool assert_fidelity;
+    // Still behind VLLM_ASCEND_TQ_CUBE_WIP. kv4fp8 is not: it is the rate the
+    // device verification runs, and it is measured rather than scaffolded.
+    // Neither of the others has been re-measured through the corrected
+    // staging, which is the whole reason they stay gated.
+    bool provisional;
   };
-  // The two fp8 rates first: they carry the fidelity assertion, and running
-  // them before the scaffolded fp4 mode means a failure there is reported
-  // before another multi-minute camodel pass has been spent.
+  // kv4fp8 first: it is the one that runs by default and carries the bound, so
+  // a failure there is reported before a multi-minute pass has been spent on a
+  // rate nobody is gating a release on.
   const ModeCase cases[] = {
-      {tqm::TurboQuantMode::KV5_FP8, "kv5fp8", true},
-      {tqm::TurboQuantMode::KV4_FP8, "kv4fp8", true},
-      {tqm::TurboQuantMode::KV3_FP4, "kv3fp4", false},
+      {tqm::TurboQuantMode::KV4_FP8, "kv4fp8", true, false},
+      {tqm::TurboQuantMode::KV5_FP8, "kv5fp8", true, true},
+      {tqm::TurboQuantMode::KV3_FP4, "kv3fp4", false, true},
   };
 
   std::printf("[ multimode ] shape: S=%lld head_size=%lld heads=%lld kv_heads=%lld block=%lld pool=%lld\n",
@@ -359,6 +363,12 @@ TEST(TurboQuantMultiMode, SingleShotDispatchAndFidelity) {
   for (const ModeCase& mode_case : cases) {
     if (!ModeSelected(mode_case.name)) {
       std::printf("[ multimode ] %s: not selected by ASCEND_TQ_SIM_MODES; skipped\n", mode_case.name);
+      continue;
+    }
+    if (mode_case.provisional && !CubeWipOptedIn()) {
+      std::printf("[ multimode ] %s: still provisional, not re-measured through the corrected staging; "
+                  "set VLLM_ASCEND_TQ_CUBE_WIP=1 to run it\n",
+                  mode_case.name);
       continue;
     }
     const tqm::TurboQuantModeConfig cfg = tqm::TurboQuantModeConfigOf(mode_case.mode);
