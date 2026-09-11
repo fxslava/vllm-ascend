@@ -92,6 +92,28 @@ if(VLLM_ASCEND_TESTS_HAVE_TURBOQUANT)
   # One ctest entry per binary; see the note at the function definition.
   vllm_ascend_register_correctness_test(test_device_950pr_turboquant 900 TRUE)
   list(APPEND VLLM_ASCEND_DEVICE_TESTS test_device_950pr_turboquant)
+
+  # The Cube-native decode's fidelity check, on silicon.
+  #
+  # It compiles the SIM tier's source deliberately rather than copying it: the
+  # file drives the multi-rate decode through turboquant_launch and touches
+  # nothing camodel-specific, so the only thing that differs between the two
+  # tiers is which libruntime the link picks up. Keeping one source means the
+  # cos bound the simulator enforces and the one silicon enforces cannot drift
+  # apart, which is the whole value of running it here.
+  #
+  # Shape and rate come from the environment -- ASCEND_TQ_SIM_CONTEXT and
+  # ASCEND_TQ_SIM_MODES -- so one invocation is one context length and one
+  # rate. On the camodel that matters because a pass is minutes; on silicon it
+  # is what lets a single binary cover S=64 and S=512 in separate runs.
+  vllm_ascend_add_device_executable(test_device_950pr_turboquant_multimode
+                                    ../sim/test_sim_950pr_turboquant_multimode.cpp
+                                    ../common/main_950pr.cpp)
+  target_link_libraries(test_device_950pr_turboquant_multimode PRIVATE vllm_ascend_test_turboquant)
+  target_compile_definitions(test_device_950pr_turboquant_multimode
+    PRIVATE VLLM_ASCEND_TEST_TIER="device")
+  vllm_ascend_register_correctness_test(test_device_950pr_turboquant_multimode 900 TRUE)
+  list(APPEND VLLM_ASCEND_DEVICE_TESTS test_device_950pr_turboquant_multimode)
 endif()
 
 message(STATUS "vllm-ascend tests: [device] ${VLLM_ASCEND_DEVICE_TESTS}")
