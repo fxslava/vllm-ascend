@@ -46,6 +46,20 @@
  *                      stages. Same numbers as HybridHiLo or the dual-destination
  *                      mode is not doing what its assert says.
  *
+ * Those four all run at ONE chunk, which is what the default chunk size comes
+ * to at this shape, so none of them exercises the kernel's macro-pipeline. Two
+ * more do:
+ *
+ *   PipelinedFourChunks           four chunks of four vectors, the smallest
+ *                                 count that reaches every slot-reuse edge of
+ *                                 the L1/UB ping-pong.
+ *   LockstepFourChunks            the same four chunks through the loop the
+ *                                 pipeline replaced. One launch per process, so
+ *                                 the two cases' camodel instruction logs are
+ *                                 what the overlap is read from.
+ *   PipelinedMatchesLockstepBitwise
+ *                                 both, in one process, compared bit for bit.
+ *
  * A camodel pass here is well under a minute per case.
  */
 
@@ -77,6 +91,15 @@ constexpr int64_t kNumVectors = 16;
 // The gate this spike has to clear on a normalised transform.
 constexpr double kMaxAbsError = 1e-4;
 
+/*
+ * What the hi/lo split actually measures, against which the pipelined form has
+ * to be no worse: 2^-22, one fp32 ulp at unit scale, which is the floor the
+ * two-Mmad path reached at D = 256 on the camodel. The spike's notes quote it
+ * rounded to 2.38e-7; the measurement is 2.384185791e-7 and a gate written at
+ * the rounded figure fails on the exact one.
+ */
+constexpr double kHiLoFloor = 2.384185791015625e-7;
+
 std::vector<float> GoldenBatch(const std::vector<float>& input, int64_t dim, int64_t num_vectors) {
   std::vector<float> golden = input;
   for (int64_t v = 0; v < num_vectors; ++v) {
@@ -100,7 +123,12 @@ void FillSentinel(DeviceBuffer& buffer, size_t elements) {
   buffer.CopyFromHost(sentinel.data(), sentinel.size() * sizeof(float));
 }
 
-hs::Deviation RunHybrid(const char* name, uint32_t variant, aclrtStream stream) {
+struct HybridRun {
+  hs::Deviation deviation;
+  std::vector<float> output;
+};
+
+HybridRun RunHybridChunked(const char* name, uint32_t variant, int64_t vectors_per_chunk, aclrtStream stream) {
   const std::vector<float> input = hs::SyntheticBatch(kDim, kNumVectors);
   const std::vector<float> golden = GoldenBatch(input, kDim, kNumVectors);
   const std::vector<uint16_t> h16 = hs::Hadamard16Half();
@@ -111,15 +139,19 @@ hs::Deviation RunHybrid(const char* name, uint32_t variant, aclrtStream stream) 
   FillSentinel(out_dev, input.size());
 
   sim_hadamard_hybrid_impl(stream, in_dev.get(), h_dev.get(), out_dev.get(), static_cast<uint32_t>(kDim),
-                           static_cast<uint32_t>(kNumVectors),
-                           static_cast<uint32_t>(hs::HadamardVectorsPerChunk(kDim, kNumVectors)), variant,
+                           static_cast<uint32_t>(kNumVectors), static_cast<uint32_t>(vectors_per_chunk), variant,
                            hs::InvSqrtDim(kDim));
   ACL_CHECK(aclrtSynchronizeStream(stream));
 
-  const std::vector<float> got = out_dev.ToHost<float>();
-  const hs::Deviation d = hs::Compare(got, golden);
-  Report(name, d, got, golden);
-  return d;
+  HybridRun run;
+  run.output = out_dev.ToHost<float>();
+  run.deviation = hs::Compare(run.output, golden);
+  Report(name, run.deviation, run.output, golden);
+  return run;
+}
+
+hs::Deviation RunHybrid(const char* name, uint32_t variant, aclrtStream stream) {
+  return RunHybridChunked(name, variant, hs::HadamardVectorsPerChunk(kDim, kNumVectors), stream).deviation;
 }
 
 // The AIV-only transform. Also the check that the golden reference and the
@@ -197,6 +229,121 @@ TEST(CubeHadamard256, HybridHiLoDualDst) {
   EXPECT_LT(d.max_abs, kMaxAbsError)
       << "Fixpipe's dual-destination mode did not put half the product in each subcore's UB; if the worst lane is at "
       << (kNumVectors / 2) * kDim << " or above, subcore 1 never received its half";
+}
+
+/*
+ * THE PIPELINE SMOKE CASE.
+ *
+ * Everything above runs at one chunk, where the kernel is a prolog and an
+ * epilogue and the two-slot ping-pong never turns over. Four vectors per chunk
+ * gives four chunks, which is the smallest count that reaches every edge: the
+ * AIV's wait on kFlagOperandsFree (chunks 2 and 3), the AIC's wait on
+ * kFlagProductFree (chunks 2 and 3), and the conditioned sets that have to stay
+ * balanced against them on the last two chunks.
+ *
+ * Two things are checked and they fail differently. A deadlock in the handshake
+ * hangs - there is no assertion for it, the case simply never returns, which is
+ * why it is run on its own. A race that does NOT deadlock shows up here as
+ * numbers: a Fixpipe landing in a UB slot whose residual has not finished, or a
+ * stage overwriting an L1 slot the Cube has not read, corrupts whole chunks at
+ * O(1), nowhere near the fp32 floor the transform itself sits at.
+ */
+TEST(CubeHadamard256, PipelinedFourChunks) {
+  REQUIRE_ASCEND_950PR();
+  const hs::Deviation d = RunHybridChunked("pipelined 4 x 4", hs::kHybridHiLo | hs::kHybridDualDst,
+                                           hs::kPipelineVectorsPerChunk, AscendTestEnvironment::Instance().stream())
+                              .deviation;
+  EXPECT_LT(d.max_abs, kMaxAbsError)
+      << "the pipelined kernel does not reproduce the transform over " << (kNumVectors / hs::kPipelineVectorsPerChunk)
+      << " chunks; an error at O(1) on whole chunks is a slot race, not arithmetic";
+  // The chunking changes nothing arithmetically - each vector's transform is
+  // independent of every other - so the hi/lo bound measured at one chunk has
+  // to hold unchanged here. A pipelined kernel that is merely CLOSE has a
+  // partially-overwritten buffer somewhere.
+  EXPECT_LE(d.max_abs, kHiLoFloor) << "the pipelined kernel is above the hi/lo fp32 floor measured at one chunk";
+}
+
+/*
+ * The pipeline with the product landing in ONE subcore's UB.
+ *
+ * Not a second data point on accuracy - the numbers are the same as
+ * PipelinedFourChunks - but the only case that exercises the assumption the
+ * kFlagProductFree edge rests on. Without dualDstCtl, subcore 1 owns no vectors
+ * of the chunk: it returns from the residual immediately and signals that UB is
+ * free while subcore 0 is still mid-butterfly. What holds the Cube back is that
+ * an arch35 AIV -> AIC flag in mode 0x02 is released only once BOTH subcores
+ * have set it. If that reading is wrong, the Fixpipe of chunk k overwrites the
+ * product of chunk k - 2 underneath subcore 0's residual, and the damage is
+ * O(1) on whole chunks rather than at the fp32 floor.
+ *
+ * The device sweep reaches this path - it drives kHybridHiLo without the
+ * dual-destination bit - so it is not a hypothetical shape.
+ */
+TEST(CubeHadamard256, PipelinedFourChunksSingleDst) {
+  REQUIRE_ASCEND_950PR();
+  const hs::Deviation d = RunHybridChunked("pipelined 4 x 4 single-dst", hs::kHybridHiLo,
+                                           hs::kPipelineVectorsPerChunk, AscendTestEnvironment::Instance().stream())
+                              .deviation;
+  EXPECT_LE(d.max_abs, kHiLoFloor)
+      << "the pipelined kernel corrupts chunks when the Fixpipe writes only subcore 0's UB, so the AIV -> AIC flag is "
+         "NOT waiting for both subcores and kFlagProductFree is released by the idle one";
+}
+
+/*
+ * The same four chunks through the lockstep loop, on its own.
+ *
+ * Nothing here that PipelinedMatchesLockstepBitwise does not also check - what
+ * this case is for is the camodel's per-core instruction logs, which accumulate
+ * over every launch a process makes. Reading the lockstep cost out of a case
+ * that launches twice means subtracting one run from another and hoping the
+ * simulator's fixed start-up lands on the right side of the difference; one
+ * launch per process is the measurement, and this is the launch.
+ */
+TEST(CubeHadamard256, LockstepFourChunks) {
+  REQUIRE_ASCEND_950PR();
+  const hs::Deviation d =
+      RunHybridChunked("lockstep 4 x 4", hs::kHybridHiLo | hs::kHybridDualDst | hs::kHybridLockstep,
+                       hs::kPipelineVectorsPerChunk, AscendTestEnvironment::Instance().stream())
+          .deviation;
+  EXPECT_LE(d.max_abs, kHiLoFloor) << "the lockstep baseline itself does not reach the hi/lo floor at four chunks, so "
+                                      "the comparison against the pipelined kernel has no baseline";
+}
+
+/*
+ * The pipeline against the loop it replaced, at the same chunking, same input.
+ *
+ * Bitwise, not approximately: the two paths issue the same Mmads over the same
+ * operands in the same order and differ only in what overlaps what, so any
+ * difference at all is a hazard the pipeline opened rather than a rounding
+ * effect. This is also the case whose two camodel instruction logs are the
+ * overlap measurement - the lockstep run is the AIV-idle-through-Cube baseline.
+ */
+TEST(CubeHadamard256, PipelinedMatchesLockstepBitwise) {
+  REQUIRE_ASCEND_950PR();
+  aclrtStream stream = AscendTestEnvironment::Instance().stream();
+  const uint32_t variant = hs::kHybridHiLo | hs::kHybridDualDst;
+
+  const std::vector<float> lockstep =
+      RunHybridChunked("lockstep 4 x 4", variant | hs::kHybridLockstep, hs::kPipelineVectorsPerChunk, stream).output;
+  const std::vector<float> pipelined = RunHybridChunked("pipelined 4 x 4", variant, hs::kPipelineVectorsPerChunk,
+                                                        stream)
+                                           .output;
+
+  ASSERT_EQ(lockstep.size(), pipelined.size());
+  size_t differing = 0;
+  size_t first_at = 0;
+  for (size_t i = 0; i < lockstep.size(); ++i) {
+    if (lockstep[i] != pipelined[i]) {
+      if (differing == 0) {
+        first_at = i;
+      }
+      ++differing;
+    }
+  }
+  EXPECT_EQ(differing, 0u) << differing << " lanes differ, first at " << first_at << " (chunk "
+                           << first_at / static_cast<size_t>(hs::kPipelineVectorsPerChunk * kDim)
+                           << "): the pipelined kernel and the lockstep kernel issue identical arithmetic, so a "
+                              "difference is a slot hazard";
 }
 
 }  // namespace

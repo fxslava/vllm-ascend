@@ -81,6 +81,12 @@ enum HadamardVariant : uint32_t {
   // kernel ignores it when a chunk holds an odd number of vectors, because the
   // M split would then land inside a vector's tile.
   kHybridDualDst = 0x2u,
+  // The un-pipelined loop: every chunk is a self-contained stage -> Mmad ->
+  // Fixpipe -> residual with one L1 and one UB slot, so the AIV waits out every
+  // Cube stage and the Cube waits out every vector stage. Kept only so the
+  // pipelined default can be measured against it at the SAME chunking; it
+  // computes exactly the same thing, bit for bit.
+  kHybridLockstep = 0x4u,
 };
 
 // fp16 bit patterns for the only two values H_16 contains. Both are exact, so
@@ -143,6 +149,20 @@ inline int64_t HadamardVectorsPerChunk(int64_t dim, int64_t num_vectors) {
   const int64_t chunk = fits < num_vectors ? fits : num_vectors;
   return chunk < 1 ? 1 : chunk;
 }
+
+/*
+ * The smallest chunk that still exercises the macro-pipeline.
+ *
+ * HadamardVectorsPerChunk maximises the chunk, which at D = 256, V = 16 is the
+ * whole batch: one chunk, a prolog and an epilogue and no steady state at all.
+ * A pipelined kernel measured there is the lockstep kernel. Four vectors per
+ * chunk gives four chunks - two prolog/epilogue iterations and two that visit
+ * every slot-reuse edge, including the kFlagOperandsFree and kFlagProductFree
+ * waits, which a three-chunk run would only half reach.
+ *
+ * Still even, so the dual-destination Fixpipe applies and both subcores work.
+ */
+constexpr int64_t kPipelineVectorsPerChunk = 4;
 
 // True when the dual-destination Fixpipe can actually split this shape. An odd
 // chunk - in practice a batch of one - would split a vector's tile between the
