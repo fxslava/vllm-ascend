@@ -17,11 +17,14 @@
 // The TurboQuant 4-bit KV cache on a PHYSICAL Ascend 950PR: production shapes,
 // driven straight through AscendCL, with the camodel explicitly excluded.
 //
-// The other two TurboQuant device binaries run at the smallest shape that still
-// exercises the tiling, the paging and the GQA mapping, because they have to
-// finish under the camodel. This file runs head_size 256, block_size 128 and
-// context 512 / 1024 / 2048 -- the shapes Qwen3.5-2B actually decodes at -- so
-// every case is a claim about silicon.
+// This file runs head_size 256, block_size 128 and context 64 / 512 / 1024 /
+// 2048 -- the shapes Qwen3.5-2B actually decodes at, plus the one the camodel
+// verified the Cube path at -- so every case is a claim about silicon.
+//
+// S=64 is here so the silicon sweep starts at the shape simulation covered.
+// It is also the only entry that is SMALLER than block_size, which makes it the
+// one case in this file where the sequence occupies a partial paged block and
+// the tail masking in the decode is live.
 //
 // Under RUN_MODE=sim aclrtGetSocName() reports a genuine 950PR bin, so
 // REQUIRE_ASCEND_950PR would pass and the S=2048 cases would run for days.
@@ -89,8 +92,11 @@ constexpr int kQueryTokens = 1;                                   // decode
 constexpr float kAttentionScale = s950::kAttentionScale;          // 1 / sqrt(256)
 constexpr float kInvSqrtHeadSize = s950::kAttentionScale;
 
-// The brief's sweep. ASCEND_TQ_BARE_METAL_CONTEXTS overrides it.
-const int kDefaultContextLens[] = {512, 1024, 2048};
+// The brief's sweep, with S=64 prepended: that is the context the Cube-native
+// decode's fidelity was measured at on the camodel (TURBOQUANT_TESTS.md section
+// 13.9), so having it here means silicon and simulation overlap at one shape
+// instead of meeting nowhere. ASCEND_TQ_BARE_METAL_CONTEXTS overrides the list.
+const int kDefaultContextLens[] = {64, 512, 1024, 2048};
 
 // --- bounds ------------------------------------------------------------------
 //

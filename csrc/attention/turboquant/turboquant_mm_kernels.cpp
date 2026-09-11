@@ -70,11 +70,28 @@ namespace {
 // fractal uses, and so it divides block_size (128).
 constexpr uint32_t kCubeTileRows = 64;
 
-// Rows the codec expands in one Unpack call.  Not the same as kCubeTileRows:
-// the codec's work buffers scale with rows * head_size, so 8 rows costs ~42 KB
-// of UB against ~141 KB for 64.  Sub-batches are placed into the tile's NZ
-// buffer by a strided DataCopy, so the same offset table serves every one.
+// Rows the codec expands in one Unpack call, on the CODEBOOK path (kv3fp4,
+// kv5fp8).  Not the same as kCubeTileRows: the codec's work buffers scale with
+// rows * head_size, so 8 rows costs ~42 KB of UB against ~141 KB for 64.
+// Sub-batches are placed into the tile's NZ buffer by a strided DataCopy, so
+// the same offset table serves every one.
 constexpr uint32_t kUnpackRows = 8;
+
+// C0 column-groups of the packed plane the AFFINE path expands per call.
+//
+// The affine unpack is byte-major, not row-major: it walks the packed tile one
+// 32-byte column-group at a time across all kCubeTileRows rows, because that is
+// the run whose expansion is exactly one NZ fractal column of the L1 operand.
+// See UnpackToL1 for why that makes both the GM -> UB read and the UB -> L1
+// write flat, and CopyInTile for the transposed tile load that sets it up.
+//
+// Two groups is 4 KB of packed bytes per call at head_size 256, which the codec
+// carries in two 16 KB fp32 buffers.  Counting the codec's whole footprint --
+// work buffer, constant tables and the unpacked operand -- that is 51.3 KB of UB
+// against the codebook path's 60.4 KB, because the affine mode needs no table
+// image at all; so this is a 9 KB saving and not a spend.  Four groups would
+// halve the call count again and add 32 KB, which was not worth the headroom.
+constexpr uint32_t kUnpackGroups = 2;
 
 // Elements of a Cube operand in one C0 block.
 constexpr uint32_t kOperandC0 = 32;
@@ -478,6 +495,23 @@ public:
         scaleSlot_ = ScaleSlotFloats(numKvHeads_);
         partialStride_ = headSize + kPartialTail;
         operandElems_ = Mm::OperandElems(headSize_);
+        // C0 column-groups in one vector slot's packed plane, and the run one
+        // affine Unpack call consumes.  Computed for every mode and read only by
+        // the affine one, which walks groups where a codebook mode walks rows;
+        // see kUnpackGroups.
+        //
+        // The chunk has to DIVIDE the group count, or the last chunk reads past
+        // the tile.  head_size is a power of two in [64, 256] so packedGroups_
+        // is 1, 2 or 4 and the min alone would do -- the loop is here because
+        // nothing in this file enforces that, and an over-read of the packed
+        // tile is exactly the class of defect that shows up as an inf/nan flood
+        // rather than as a fault.
+        packedGroups_ = packedBytes_ / kOperandC0;
+        unpackGroups_ = packedGroups_ < kUnpackGroups ? packedGroups_ : kUnpackGroups;
+        while (unpackGroups_ > 1 && (packedGroups_ % unpackGroups_) != 0) {
+            --unpackGroups_;
+        }
+        unpackBytes_ = unpackGroups_ * kCubeTileRows * kOperandC0;
 
         queryGm_.SetGlobalBuffer(reinterpret_cast<__gm__ scalar_t *>(query));
         keyCacheGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(keyCache));
@@ -495,8 +529,15 @@ public:
         // The packed tile: kCubeTileRows rows of K and of V for one kv head.
         pipe_->InitBuffer(kvBuf_, 2 * kCubeTileRows * packedBytes_);
         pipe_->InitBuffer(scaleTileBuf_, kCubeTileRows * scaleSlot_ * sizeof(float));
-        // The unpacked sub-batch, in NZ order within its own kUnpackRows band.
-        pipe_->InitBuffer(operandBuf_, kUnpackRows * operandElems_);
+        // The unpacked sub-batch.  The codebook path lands kUnpackRows rows in NZ
+        // order within their own band; the affine path lands one chunk's two
+        // nibble planes end to end, each already a run of whole NZ fractal
+        // columns.
+        if constexpr (Codec::kIsAffine) {
+            pipe_->InitBuffer(operandBuf_, 2 * unpackBytes_);
+        } else {
+            pipe_->InitBuffer(operandBuf_, kUnpackRows * operandElems_);
+        }
         // [kCubeTileM, head_size] fp32 accumulator, plus the query in fp32 and
         // one scratch vector for the rotation.
         pipe_->InitBuffer(accBuf_, kMaxGroupHeads * headSize_ * sizeof(float));
@@ -516,7 +557,11 @@ public:
         pipe_->InitBuffer(scaleIdxBuf_, 2 * kCubeTileRows * sizeof(int32_t));
 
         rotation_.Init(pipe_, headSize_, 1, invSqrtLen, rotTablesGm_);
-        codec_.Init(pipe_, headSize_, kUnpackRows, invSqrtLen, modeTablesGm_);
+        // The affine codec reads headSize * batchRows as the element count one
+        // call produces -- twice the bytes it consumes -- so the chunk size is
+        // expressed in the one unit both paths share.  See TurboQuantModeCodec.
+        codec_.Init(pipe_, headSize_,
+                    Codec::kIsAffine ? (2 * unpackBytes_ / headSize_) : kUnpackRows, invSqrtLen, modeTablesGm_);
 
         AscendC::LocalTensor<float> signs = signBuf_.Get<float>();
         AscendC::DataCopy(signs, piSignsGm_, headSize_);
@@ -771,21 +816,72 @@ private:
         const uint64_t cacheOff = row * packedPlane_ + static_cast<uint64_t>(kvHead) * packedBytes_;
         const uint64_t scaleOff = row * scaleSlot_;
 
-        // One tile row per burst; consecutive rows are packedPlane_ apart.  Every
-        // length and stride is a whole number of 32B blocks.
-        const AscendC::DataCopyParams rowsParams{static_cast<uint16_t>(kCubeTileRows),
-                                                 static_cast<uint16_t>(packedBytes_ / 32),
-                                                 static_cast<uint16_t>((packedPlane_ - packedBytes_) / 32), 0};
-        AscendC::DataCopy(kv, keyCacheGm_[cacheOff], rowsParams);
-        AscendC::DataCopy(kv[kCubeTileRows * packedBytes_], valueCacheGm_[cacheOff], rowsParams);
+        if constexpr (Codec::kIsAffine) {
+            /*
+             * GROUP-MAJOR, not row-major: the tile lands in UB as
+             * [group][row][32] rather than [row][group][32].
+             *
+             * Group g of a slot is packed bytes [32g, 32g+32), which carry
+             * coordinates [32g, 32g+32) in their low nibbles and
+             * [head_size/2 + 32g, +32) in their high ones.  Both of those are
+             * whole C0 columns of the NZ operand, and the NZ position of
+             * (row r, column c) is (c/32) * kCubeTileRows * 32 + r * 32 + c%32 --
+             * so a run of one group across all 64 rows expands, element for
+             * element and in order, onto exactly one NZ fractal column.
+             *
+             * That is the whole trick behind the flat L1 staging: the row/column
+             * interleave the NZ layout needs is done HERE, by an MTE2 read that
+             * was strided anyway, instead of by a vector shuffle downstream.
+             * The cost is packedGroups_ DataCopy descriptors per plane instead
+             * of one, each moving 32B bursts instead of packedBytes_ ones.
+             */
+            const AscendC::DataCopyParams groupParams{static_cast<uint16_t>(kCubeTileRows), 1,
+                                                      static_cast<uint16_t>((packedPlane_ - kOperandC0) / 32), 0};
+            const uint32_t groupElems = kCubeTileRows * kOperandC0;
+            for (uint32_t g = 0; g < packedGroups_; ++g) {
+                AscendC::DataCopy(kv[g * groupElems], keyCacheGm_[cacheOff + g * kOperandC0], groupParams);
+                AscendC::DataCopy(kv[kCubeTileRows * packedBytes_ + g * groupElems],
+                                  valueCacheGm_[cacheOff + g * kOperandC0], groupParams);
+            }
+        } else {
+            // One tile row per burst; consecutive rows are packedPlane_ apart.
+            // Every length and stride is a whole number of 32B blocks.
+            const AscendC::DataCopyParams rowsParams{static_cast<uint16_t>(kCubeTileRows),
+                                                     static_cast<uint16_t>(packedBytes_ / 32),
+                                                     static_cast<uint16_t>((packedPlane_ - packedBytes_) / 32), 0};
+            AscendC::DataCopy(kv, keyCacheGm_[cacheOff], rowsParams);
+            AscendC::DataCopy(kv[kCubeTileRows * packedBytes_], valueCacheGm_[cacheOff], rowsParams);
+        }
         AscendC::DataCopy(scales, scaleCacheGm_[scaleOff], kCubeTileRows * scaleSlot_);
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 
-    // Expand one tile's packed rows onto the operand grid and place them in L1,
-    // kUnpackRows at a time.  The codec's offset tables put a sub-batch's output
-    // in NZ order within its own band, so the placement is c0Blocks contiguous
-    // runs of kUnpackRows * 32 elements at a stride of kCubeTileRows * 32.
+    /*
+     * Expand one tile's packed bytes onto the operand grid and place them in L1.
+     *
+     * AFFINE PATH -- flat.  CopyInTile has already grouped the tile as
+     * [group][row][32], and UnpackAffine's two nibble planes come out as two
+     * contiguous runs, so each chunk is two plain DataCopy calls into L1 at
+     * fixed offsets and NOTHING reshapes anything:
+     *
+     *     low nibbles  of groups [g, g+n)  ->  NZ columns [g, g+n)
+     *     high nibbles of groups [g, g+n)  ->  NZ columns [packedGroups_ + g, +n)
+     *
+     * because coordinate c lands in NZ column c/32, the low plane covers
+     * c < head_size/2 and the high plane the rest.  Two descriptors per chunk,
+     * each a single unbroken burst of unpackBytes_.
+     *
+     * CODEBOOK PATH -- strided.  The codec's offset tables put a sub-batch's
+     * output in NZ order within its own kUnpackRows band, so the placement is
+     * c0Blocks contiguous runs of kUnpackRows * 32 elements at a stride of
+     * kCubeTileRows * 32.
+     *
+     * Both keep the V -> MTE3 handshake before every copy.  The operand is
+     * written by the vector unit and moved by MTE3; PipeBarrier<PIPE_V> orders V
+     * against V only, and without the explicit event the DMA stages zeros and
+     * the Cube multiplies an empty operand without faulting.  See
+     * SyncVectorToMte3.
+     */
     __aicore__ inline void UnpackToL1(const AscendC::LocalTensor<int8_t> &packed,
                                       const AscendC::LocalTensor<OperandT> &l1)
     {
@@ -793,32 +889,42 @@ private:
             return;
         }
         AscendC::LocalTensor<OperandT> operand = operandBuf_.Get<OperandT>();
-        const uint32_t c0Blocks = operandElems_ / kOperandC0;
-        const uint32_t bandElems = kUnpackRows * kOperandC0;
-        const AscendC::DataCopyParams nzParams{
-            static_cast<uint16_t>(c0Blocks), static_cast<uint16_t>(bandElems / 32), 0,
-            static_cast<uint16_t>((kCubeTileRows - kUnpackRows) * kOperandC0 / 32)};
 
-        for (uint32_t sub = 0; sub < kCubeTileRows / kUnpackRows; ++sub) {
-            // Dispatched by mode rather than calling Codec::Unpack directly, so
-            // the rate a tile is being expanded at is named at the call site.
-            // The three routines are one template instantiated three ways --
-            // kv4fp8 is kv5fp8 with the msb plane compiled out -- so this
-            // chooses a name, not an implementation.
-            const AscendC::LocalTensor<int8_t> sub_packed = packed[sub * kUnpackRows * packedBytes_];
-            if constexpr (MODE == TurboQuantMode::KV4_FP8) {
-                vllm_ascend::turboquant::unpack_tq4_to_fp8(codec_, operand, sub_packed,
-                                                           static_cast<int>(kUnpackRows),
-                                                           static_cast<int>(headSize_));
-            } else if constexpr (MODE == TurboQuantMode::KV5_FP8) {
-                vllm_ascend::turboquant::unpack_tq5_to_fp8(codec_, operand, sub_packed,
-                                                           static_cast<int>(kUnpackRows),
-                                                           static_cast<int>(headSize_));
-            } else {
-                codec_.Unpack(operand, sub_packed, static_cast<int>(kUnpackRows), static_cast<int>(headSize_));
+        if constexpr (Codec::kIsAffine) {
+            const uint32_t groupElems = kCubeTileRows * kOperandC0;
+            const AscendC::DataCopyParams flatParams{1, static_cast<uint16_t>(unpackBytes_ / 32), 0, 0};
+            for (uint32_t g = 0; g < packedGroups_; g += unpackGroups_) {
+                vllm_ascend::turboquant::unpack_tq4_to_fp8(codec_, operand, operand[unpackBytes_],
+                                                           packed[g * groupElems], unpackBytes_);
+                SyncVectorToMte3();
+                AscendC::DataCopy(l1[g * groupElems], operand, flatParams);
+                AscendC::DataCopy(l1[(packedGroups_ + g) * groupElems], operand[unpackBytes_], flatParams);
             }
-            SyncVectorToMte3();
-            AscendC::DataCopy(l1[sub * bandElems], operand, nzParams);
+        } else {
+            const uint32_t c0Blocks = operandElems_ / kOperandC0;
+            const uint32_t bandElems = kUnpackRows * kOperandC0;
+            const AscendC::DataCopyParams nzParams{
+                static_cast<uint16_t>(c0Blocks), static_cast<uint16_t>(bandElems / 32), 0,
+                static_cast<uint16_t>((kCubeTileRows - kUnpackRows) * kOperandC0 / 32)};
+
+            for (uint32_t sub = 0; sub < kCubeTileRows / kUnpackRows; ++sub) {
+                // Dispatched by mode rather than calling Codec::Unpack directly,
+                // so the rate a tile is being expanded at is named at the call
+                // site.  Both remaining routines are one template instantiated
+                // twice -- kv3fp4 differs from kv5fp8 only in its radix and its
+                // operand grid -- so this chooses a name, not an implementation.
+                const AscendC::LocalTensor<int8_t> sub_packed = packed[sub * kUnpackRows * packedBytes_];
+                if constexpr (MODE == TurboQuantMode::KV5_FP8) {
+                    vllm_ascend::turboquant::unpack_tq5_to_fp8(codec_, operand, sub_packed,
+                                                               static_cast<int>(kUnpackRows),
+                                                               static_cast<int>(headSize_));
+                } else {
+                    codec_.Unpack(operand, sub_packed, static_cast<int>(kUnpackRows),
+                                  static_cast<int>(headSize_));
+                }
+                SyncVectorToMte3();
+                AscendC::DataCopy(l1[sub * bandElems], operand, nzParams);
+            }
         }
         AscendC::PipeBarrier<PIPE_ALL>();
     }
@@ -1023,6 +1129,11 @@ private:
     uint32_t scaleSlot_ = 0;
     uint32_t partialStride_ = 0;
     uint32_t operandElems_ = 0;
+    // Affine path only: C0 column-groups in one packed slot, how many of them
+    // one Unpack call covers, and the packed bytes that comes to.
+    uint32_t packedGroups_ = 0;
+    uint32_t unpackGroups_ = 0;
+    uint32_t unpackBytes_ = 0;
     float scale_ = 1.0f;
 };
 

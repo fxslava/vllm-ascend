@@ -16,8 +16,16 @@
 """Fidelity calibration for the three TurboQuantMode storage rates.
 
     kv3fp4   8 Lloyd-Max centroids  -> fp4 e2m1 LUT -> Cube mad_mx (FP4 x FP4)
-    kv4fp8  16 Lloyd-Max centroids  -> fp8 e4m3fn LUT -> Cube mad  (FP8 x FP8)
+    kv4fp8  16 uniform levels       -> fp8 e4m3fn    -> Cube mad  (FP8 x FP8)
     kv5fp8  32 Lloyd-Max centroids  -> fp8 e4m3fn LUT -> Cube mad  (FP8 x FP8)
+
+kv4fp8 is AFFINE and the other two are not. Its sixteen levels are the integers
+q - 7.5, every one exact in fp8_e4m3fn, so the stored 4-bit code IS the
+reconstruction level and the quantizer step is carried by the same `gain` field
+the codebook rates use for their grid placement. The device therefore expands it
+with two integer shifts and an Adds instead of a UB Gather through a centroid
+table -- see TurboQuantModeCodec::UnpackAffine -- and the numbers below are what
+that costs: 0.746 dB of codebook SNR, and 0.003 of attention cosine at S = 64.
 
 This is the host-side twin of TurboQuantModeTraits in
 csrc/attention/turboquant/turboquant_mode.h: the centroid tables printed here
@@ -113,7 +121,7 @@ class ModeSpec:
     """One TurboQuantMode: rate, target float grid, and packing geometry."""
 
     def __init__(self, name, bits, cast, grid_max, elems_per_group,
-                 bytes_per_group, cube_op, query_cast):
+                 bytes_per_group, cube_op, query_cast, affine=False):
         self.name = name
         self.bits = bits
         self.levels = 1 << bits
@@ -123,6 +131,9 @@ class ModeSpec:
         self.bytes_per_group = bytes_per_group
         self.cube_op = cube_op
         self.query_cast = query_cast
+        # Uniform levels rather than Lloyd-Max ones, so fit_affine replaces
+        # fit_lut and the device needs no centroid table.
+        self.affine = affine
 
     def packed_bytes(self, d: int = HEAD_DIM) -> int:
         return d * self.bytes_per_group // self.elems_per_group
@@ -133,9 +144,12 @@ MODES = {
     # is three whole 32-byte bursts.
     "kv3fp4": ModeSpec("kv3fp4", 3, to_fp4_e2m1, FP4_MAX, 8, 3,
                        "mad_mx (FP4 x FP4)", to_fp4_e2m1),
-    # 2 codes / byte, the shipping layout: 128 bytes, four bursts.
+    # 2 codes / byte, the shipping layout: 128 bytes, four bursts. The two
+    # nibbles of a byte are coordinates b and b + d/2, not 2b and 2b + 1 -- a
+    # plane split, so the device's expand is contiguous; it does not change any
+    # number this script computes.
     "kv4fp8": ModeSpec("kv4fp8", 4, to_fp8, FP8_MAX, 2, 1,
-                       "mad (FP8 x FP8)", to_fp8),
+                       "mad (FP8 x FP8)", to_fp8, affine=True),
     # 8 codes / 5 bytes: five bit-planes, 160 bytes, five bursts.
     "kv5fp8": ModeSpec("kv5fp8", 5, to_fp8, FP8_MAX, 8, 5,
                        "mad (FP8 x FP8)", to_fp8),
@@ -186,6 +200,68 @@ def fit_lut(spec: ModeSpec, gains=None):
             best = (float(g), stored, d)
     gain, stored, dist = best
     return thr, stored.astype(np.float32), gain, dist
+
+
+def fit_affine(spec: ModeSpec, steps=None):
+    """Place a uniform midrise codebook on the mode's float grid.
+
+    Returns (thresholds, lut, gain, distortion) -- the same tuple as fit_lut, so
+    quantize() and attention_mode() do not care which one produced it.
+
+    The levels are  q - (levels-1)/2  for q in [0, levels), which for 16 levels
+    is +-0.5 .. +-7.5 and is EXACT in fp8_e4m3fn (7.5 = 1.875 * 4, three
+    mantissa bits), so unlike fit_lut there is no cast loss to trade against the
+    gain.  What is searched is the step instead: the stored operand is the bare
+    integer and  gain = 1 / step,  so the decoder's (s / gain) * lut[q] is
+    s * step * (q - bias)  -- the step rides the per-vector scale exactly as the
+    codebook gain does, and costs nothing at run time.
+
+    The thresholds are the midpoints, (i - (bias - 0.5)) * step, which the
+    encoder compares against as immediates.
+    """
+    bias = (spec.levels - 1) / 2.0
+    q = np.arange(spec.levels, dtype=np.float64)
+    stored = spec.cast((q - bias).astype(np.float32)).astype(np.float64)
+    if not np.array_equal(stored, q - bias):
+        raise ValueError("%s: the integer levels are not exact on its operand grid, "
+                         "so it cannot be affine" % spec.name)
+
+    def distortion(step):
+        thr = (np.arange(spec.levels - 1, dtype=np.float64) - (bias - 0.5)) * step
+        return lut_distortion(thr, stored * step)
+
+    if steps is None:
+        # Wide enough to bracket the optimum from both sides at 16 levels
+        # (0.3352) and at any other rate this would be used at.
+        steps = np.linspace(0.02, 1.5, 1481)
+
+    coarse = min((float(step) for step in steps), key=distortion)
+    # Refine, because the emitted thresholds have to be derivable from the
+    # emitted gain to ten decimals -- the device bins against the thresholds and
+    # divides the scale by the gain, and an inconsistent pair is a systematic
+    # bias no test would attribute to this table. D is unimodal in the step, so
+    # a ternary search on the bracket the sweep leaves is enough.
+    span = float(steps[1] - steps[0]) if len(steps) > 1 else 0.01
+    lo, hi = coarse - span, coarse + span
+    for _ in range(200):
+        m1 = lo + (hi - lo) / 3.0
+        m2 = hi - (hi - lo) / 3.0
+        if distortion(m1) < distortion(m2):
+            hi = m2
+        else:
+            lo = m1
+
+    # Round-trip through fp32 in the direction the header stores: kGain is the
+    # fp32 constant, and the thresholds are then (i - bias + 0.5) / kGain.
+    gain = float(np.float32(1.0 / ((lo + hi) / 2.0)))
+    step = 1.0 / gain
+    thr = (np.arange(spec.levels - 1, dtype=np.float64) - (bias - 0.5)) * step
+    return thr, stored.astype(np.float32), gain, distortion(step)
+
+
+def fit_mode(spec: ModeSpec):
+    """fit_affine for an affine rate, fit_lut for a codebook one."""
+    return fit_affine(spec) if spec.affine else fit_lut(spec)
 
 
 # ------------------------------------------------------------------- codec ----
@@ -313,8 +389,9 @@ def emit_header(results):
     """The centroid tables as the C++ header wants them."""
     for name, r in results.items():
         spec = MODES[name]
-        print("// %s: %d levels, gain %.10f, D = %.10f (%.3f dB)"
-              % (name, spec.levels, r["gain"], r["dist"],
+        kind = "uniform, gain = 1 / step" if spec.affine else "Lloyd-Max, gain = grid placement"
+        print("// %s: %d levels %s, gain %.10f, D = %.10f (%.3f dB)"
+              % (name, spec.levels, kind, r["gain"], r["dist"],
                  -10.0 * math.log10(r["dist"])))
         print("static constexpr float k%sCentroids[%d] = {"
               % (name.upper().replace("KV", "Kv"), spec.levels))
@@ -343,7 +420,7 @@ def main():
     signs = pi_signs(HEAD_DIM)
     results = {}
     for name, spec in MODES.items():
-        thr, lut, gain, dist = fit_lut(spec)
+        thr, lut, gain, dist = fit_mode(spec)
         results[name] = dict(thr=thr, lut=lut, gain=gain, dist=dist)
 
     if args.emit_header:
@@ -384,12 +461,17 @@ def main():
         r = results[name]
         _, cen, dist_fp32 = lloyd_max_gaussian(spec.levels)
         grid = "fp4 e2m1" if spec.bits == 3 else "fp8 e4m3fn"
+        if spec.affine:
+            grid += " (affine)"
         print("  %-8s %-22s %8.4f %14.10f %10.7f %8.3f dB"
               % (name, grid, r["gain"], dist_fp32, r["dist"],
                  10.0 * math.log10(r["dist"] / dist_fp32)))
     print()
-    print("  D is E[(X - Q(X))^2] on N(0,1); 'cast cost' is what moving the")
-    print("  Lloyd-Max centroids onto the operand grid costs, gain included.")
+    print("  D is E[(X - Q(X))^2] on N(0,1). The last column is what the mode")
+    print("  gives up against the fp32 Lloyd-Max ideal at the same rate: for a")
+    print("  codebook mode that is the cast onto the operand grid, gain included,")
+    print("  and for an affine one it is the whole cost of uniform levels, since")
+    print("  its levels are exact on the grid and lose nothing to the cast.")
 
     print()
     print("  kv5fp8 codebook (the primary target), 32 levels:")

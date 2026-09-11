@@ -110,8 +110,13 @@ if(VLLM_ASCEND_TESTS_HAVE_TURBOQUANT)
                                     ../sim/test_sim_950pr_turboquant_multimode.cpp
                                     ../common/main_950pr.cpp)
   target_link_libraries(test_device_950pr_turboquant_multimode PRIVATE vllm_ascend_test_turboquant)
+  # VLLM_ASCEND_TEST_TIER_DEVICE, on top of the string label every device target
+  # gets, is what the shared source switches its DEFAULT SWEEP on: one batch and
+  # one context length under the camodel, and batch {1,8} x context
+  # {64,512,1024,2048} at the production head count here. A string literal
+  # cannot be tested with #ifdef, hence the second definition.
   target_compile_definitions(test_device_950pr_turboquant_multimode
-    PRIVATE VLLM_ASCEND_TEST_TIER="device")
+    PRIVATE VLLM_ASCEND_TEST_TIER="device" VLLM_ASCEND_TEST_TIER_DEVICE=1)
   vllm_ascend_register_correctness_test(test_device_950pr_turboquant_multimode 900 TRUE)
   list(APPEND VLLM_ASCEND_DEVICE_TESTS test_device_950pr_turboquant_multimode)
 
