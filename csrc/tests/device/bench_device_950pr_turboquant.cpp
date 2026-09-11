@@ -45,14 +45,19 @@
 // column for each was three more cache allocations of the same shape for a
 // comparison nothing was asking of this binary.
 //
-// ONE DEFECT IS STILL OPEN, and it is not the L0 allocation split that used to
-// stall these legs (that is fixed, in TurboQuantCubeMm::Init and in
-// TurboQuantFp16DecodeSplit::Init). The score GEMM stages its B operand [n, k],
-// and test_sim_950pr_cube_gemm's ScoreGemmBStagedNk does not reproduce the host
-// product, so every Cube leg here -- kv4fp8 and fp16 alike -- computes a wrong
-// score row. The timings are still the right shape of work in the right order,
-// but they are provisional until that is closed. See TURBOQUANT_TESTS.md
-// section 13.8, and the banner PrintCubeBanner prints at the top of every run.
+// WHAT IS AND IS NOT VERIFIED. The Cube-native decode is correct: kv4fp8
+// reaches cos 0.982351 against an fp32 host reference on the arch35 camodel at
+// S=64, with no device error of any kind, and test_sim_950pr_cube_gemm pins
+// both B operand forms at max|err| = 0. The defects that made it wrong -- the
+// V -> MTE3 staging hazard above all -- are closed; see TURBOQUANT_TESTS.md
+// section 13.8.
+//
+// What is NOT verified is anything this file measures. No Ascend 950PR silicon
+// has been available to this project, so every number below is the first of its
+// kind, and the fidelity evidence above covers S=64 on a simulator rather than
+// the S in {512, 1024, 2048} swept here. The fp16 baseline shares the corrected
+// staging but has no fidelity check of its own: it is a comparator, and nothing
+// asserts that it computes the right thing.
 //
 // The fp16 baseline is turboquant_fp16_decode_split in
 // csrc/attention/turboquant/turboquant_mm_kernels.cpp -- the same Cube decode
@@ -158,11 +163,8 @@ std::vector<int64_t> ContextLens() {
 // touched one. Both Cube kernels now allocate L1 on both cores and L0 on the
 // AIC alone.
 //
-// What is still open is numerical rather than fatal, and the banner says so on
-// every run: the score GEMM stages B as [n, k], and that form does not
-// reproduce the host product (TURBOQUANT_TESTS.md 13.8). The legs launch, the
-// stream completes and the checksums are stable -- what they are not yet is
-// right.
+// They are no longer provisional: the decode is measured correct on the
+// camodel and the rates here are what the device verification runs.
 //
 // VLLM_ASCEND_TQ_CUBE_WIP=0 drops them, which is what to reach for if a future
 // defect does take the stream down: a launch into a faulting kernel takes every
@@ -185,12 +187,11 @@ bool CubeEnabled() {
 void PrintCubeBanner(bool enabled) {
   if (enabled) {
     std::printf("[ascend-bench] Cube-native legs (kv4fp8_write, kv4fp8_decode, fp16_decode) are ON.\n"
-                "[ascend-bench]   PROVISIONAL: the score GEMM stages its B operand [n, k], and that form does\n"
-                "[ascend-bench]   not reproduce the host product -- see TURBOQUANT_TESTS.md section 13.8. The\n"
-                "[ascend-bench]   kernels launch and complete, and the work they do is the right work in the\n"
-                "[ascend-bench]   right order, so the timings below are meaningful as timings. The values\n"
-                "[ascend-bench]   those kernels compute are not yet correct. Do not quote these as verified.\n"
-                "[ascend-bench]   VLLM_ASCEND_TQ_CUBE_WIP=0 drops them.\n");
+                "[ascend-bench]   kv4fp8 is verified: cos 0.982351 against an fp32 host reference on the\n"
+                "[ascend-bench]   arch35 camodel at S=64, no device errors. What that does NOT cover is the\n"
+                "[ascend-bench]   context lengths swept here, nor the fp16 leg, which is a comparator with no\n"
+                "[ascend-bench]   fidelity check of its own. Timings from this binary have never been taken on\n"
+                "[ascend-bench]   silicon. VLLM_ASCEND_TQ_CUBE_WIP=0 drops the Cube legs.\n");
   } else {
     std::printf("[ascend-bench] Cube-native legs (kv4fp8_write, kv4fp8_decode, fp16_decode) are SKIPPED\n"
                 "[ascend-bench]   (VLLM_ASCEND_TQ_CUBE_WIP=0). This run is the AIV-only 4-bit path, and the\n"
@@ -599,9 +600,9 @@ using Kv4Scenario = ModeScenario<tqm::TurboQuantMode::KV4_FP8>;
 // tables, no scale plane, and the same shape, paging and context as the
 // quantised legs.
 //
-// Behind the same switch as the quantised Cube leg, and it carries the same
-// provisional score GEMM -- it is that kernel with one stage removed, so it is
-// not an independent control.
+// Behind the same switch as the quantised Cube leg, and it shares that leg's
+// staging -- it is the same kernel with the codec removed, so it is not an
+// independent control, and nothing asserts it computes the right thing.
 struct Fp16Scenario {
   Fp16Scenario(const DecodeScenario& shared, int64_t context_len)
       : context_len_(context_len), blocks_per_seq_(shared.blocks_per_seq()) {
@@ -770,10 +771,10 @@ void PrintDecodeSummary(const BenchmarkRunner& runner, const std::vector<Traffic
   if (cube_enabled) {
     // Repeated here rather than only in the banner, because the summary is the
     // part that gets pasted into a report and the banner is not.
-    std::printf("[ascend-bench]   PROVISIONAL: the score GEMM's [n, k] B operand does not reproduce the host\n"
-                "[ascend-bench]   product, so the kv4 and fp16 legs compute a wrong score row. These are\n"
-                "[ascend-bench]   timings of the right work, not of a verified kernel. See TURBOQUANT_TESTS.md\n"
-                "[ascend-bench]   section 13.8.\n");
+    std::printf("[ascend-bench]   the kv4 decode is verified correct at S=64 on the camodel (cos 0.982351);\n"
+                "[ascend-bench]   these are the first timings ever taken of it, at context lengths its\n"
+                "[ascend-bench]   fidelity has not been measured at. The fp16 column is a comparator with no\n"
+                "[ascend-bench]   fidelity check. See TURBOQUANT_TESTS.md section 13.8.\n");
   } else {
     // A row of dashes in a table invites the reading that the hardware tried
     // and could not.
