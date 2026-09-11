@@ -228,8 +228,9 @@ PagedAttentionGrid PlanPagedAttention(int64_t num_tokens, int64_t num_heads, int
 // Rows of the packed cache one Cube tile covers. Mirrors kCubeTileRows in
 // turboquant_mm_kernels.cpp.
 constexpr int64_t kCubeTileRows = 64;
-// Rows the codec expands per Unpack call, and therefore the batch_rows the mode
-// table image must be built for. Mirrors kUnpackRows there.
+// Rows the codec expands per Unpack call on the codebook path, and therefore
+// the batch_rows the mode table image must be built for. Mirrors kUnpackRows
+// there. The affine path is byte-major and needs no image; see ModeTables.
 constexpr int64_t kUnpackRows = 8;
 // Elements of a Cube operand in one C0 block. Mirrors kOperandC0 there and
 // TurboQuantCubeMm::kOperandC0.
@@ -245,10 +246,13 @@ size_t ModePackedCacheBytes(vllm_ascend::turboquant::TurboQuantMode mode, int64_
                             int64_t num_kv_heads, int64_t head_size);
 
 // Words in the mode codec's constant-table image. Mirrors
-// TurboQuantModeCodec<MODE>::ConstTableWords(head_size, batch_rows).
+// TurboQuantModeCodec<MODE>::ConstTableWords(head_size, batch_rows) for a
+// codebook rate; one 32-byte block for an affine one, which reads no table.
 int64_t ModeTableWords(vllm_ascend::turboquant::TurboQuantMode mode, int64_t head_size, int64_t batch_rows);
 
-// The image itself.
+// The image itself. For an affine rate (kv4fp8) it is a single zero block and
+// nothing below applies: that codec expands with shifts and an Adds, so it has
+// no byte-offset table and no codebook, and batch_rows / nz_rows are ignored.
 //
 //   [0, B)        lowOffset_   uint32 byte offsets   B = head_size * batch_rows
 //   [B, 2B)       msbOffset_   uint32 byte offsets

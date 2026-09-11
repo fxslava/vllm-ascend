@@ -213,15 +213,30 @@ size_t ModePackedCacheBytes(tqm::TurboQuantMode mode, int64_t num_blocks, int64_
 }
 
 int64_t ModeTableWords(tqm::TurboQuantMode mode, int64_t head_size, int64_t batch_rows) {
-  const int64_t levels = tqm::TurboQuantModeConfigOf(mode).levels;
+  const tqm::TurboQuantModeConfig cfg = tqm::TurboQuantModeConfigOf(mode);
+  // An affine rate reads no constant table at all: its expand is shifts and an
+  // Adds, with neither a byte-offset table nor a codebook to address.
+  // TurboQuantModeCodec<MODE>::ConstTableWords is 0 for it and Init allocates
+  // nothing -- but the launch still binds a modeTables pointer, so ModeTables
+  // emits one zero block and this reports that block rather than 0.
+  if (cfg.is_affine) {
+    return kFp32PerBlock;
+  }
   // 2B + 3 periodic blocks + packOffset_ + centroid_, matching
   // TurboQuantModeCodec<MODE>::ConstTableWords.
-  return 2 * head_size * batch_rows + 3 * kFp32PerBlock + head_size + levels;
+  return 2 * head_size * batch_rows + 3 * kFp32PerBlock + head_size + cfg.levels;
 }
 
 std::vector<int32_t> ModeTables(tqm::TurboQuantMode mode, int64_t head_size, int64_t batch_rows, int64_t nz_rows) {
   const ModePlanes planes = PlanesOf(mode);
   const tqm::TurboQuantModeConfig cfg = tqm::TurboQuantModeConfigOf(mode);
+  // The affine rate's image is a placeholder; see ModeTableWords. batch_rows
+  // and nz_rows are meaningless for it -- its expand is byte-major and its
+  // output order is fixed by the packing, not by an offset table -- so callers
+  // may pass whatever they pass for the codebook rates.
+  if (cfg.is_affine) {
+    return std::vector<int32_t>(static_cast<size_t>(kFp32PerBlock), 0);
+  }
   const int64_t d = head_size;
   const int64_t batch = d * batch_rows;
   const int64_t packed_bytes = cfg.PackedBytes(d);

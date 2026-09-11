@@ -571,13 +571,18 @@ The same binaries run unchanged on silicon: configure without `RUN_MODE=sim`
 
 **Two of them are for silicon specifically.**
 `test_device_950pr_turboquant` sweeps the shapes Qwen3.5-2B actually decodes
-at - `head_dim` 256, `block_size` 128, context 512 / 1024 / 2048 - which is
+at - `head_dim` 256, `block_size` 128, context 64 / 512 / 1024 / 2048 - which is
 days of camodel time, so it refuses to run there. The SoC name cannot tell the
 camodel from the part, so `REQUIRE_PHYSICAL_ASCEND_950PR` looks for
 `libruntime_camodel.so` in `/proc/self/maps` instead and skips with the path it
 found. `ASCEND_TEST_ALLOW_SIMULATOR=1` overrides that, and
 `ASCEND_TQ_BARE_METAL_CONTEXTS` shrinks the sweep, both for smoke-checking the
-binary rather than for producing results. `bench_device_950pr_turboquant` is built
+binary rather than for producing results.
+`test_device_950pr_turboquant_multimode` is the Cube-native decode's validation
+matrix on the same part - batch `{1, 8}` by context `{64, 512, 1024, 2048}` at the
+production head count, gated on `cos > 0.90` per shape - and compiles the sim
+tier's source so the two tiers cannot enforce different bounds;
+`ASCEND_TQ_SIM_BATCH` and `ASCEND_TQ_SIM_CONTEXT` narrow either axis. `bench_device_950pr_turboquant` is built
 under `RUN_MODE=sim` but disabled in ctest for the same reason;
 `ASCEND_BENCH_TQ_CONTEXTS` and the usual `ASCEND_BENCH_*` knobs make a hand-run
 smoke check tractable.

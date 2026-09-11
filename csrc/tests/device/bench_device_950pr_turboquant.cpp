@@ -36,9 +36,18 @@
 //
 // All five run by default. The comparison the binary exists to make is the
 // three-way one at a fixed context length: tq4 against kv4fp8 is the Cube
-// against the vector cores with the codec held fixed -- the two store the same
-// nibbles against the same Lloyd-Max thresholds -- and kv4fp8 against fp16 is
-// what the 4-bit cache buys over an unquantised one.
+// against the vector cores, and kv4fp8 against fp16 is what the 4-bit cache buys
+// over an unquantised one.
+//
+// THE CODEC IS NO LONGER HELD FIXED ACROSS tq4 AND kv4fp8, and the first column
+// has to be read with that in mind. Both still store 4 bits per coordinate in a
+// 128-byte slot, so the cache geometry and every DMA volume match -- but tq4
+// stores a Lloyd-Max index and expands it with two UB Gathers, while kv4fp8 now
+// stores a symmetric INT4 level and expands it with integer shifts and an Adds
+// (TURBOQUANT_TESTS.md section 13.9). So the ratio is the Cube path with the new
+// expand against the vector path with the old one, which conflates two changes.
+// Separating them would mean keeping a Lloyd-Max Cube leg alive purely as a
+// benchmark control; that has not been done.
 //
 // kv3fp4 and kv5fp8 are still built and still dispatched by the sim tier; they
 // have no leg here. Neither is on the 4-bit path this binary measures, and a
@@ -59,15 +68,40 @@
 // staging but has no fidelity check of its own: it is a comparator, and nothing
 // asserts that it computes the right thing.
 //
-// The fp16 baseline is turboquant_fp16_decode_split in
-// csrc/attention/turboquant/turboquant_mm_kernels.cpp -- the same Cube decode
-// with the codec removed -- rather than aclnnFusedInferAttentionScore, which
-// does not exist on this part (planning returns 361001). Same task
-// decomposition, GQA batching, tile size, online softmax and split count, so
-// the ratio between the two measures the codec.
+// TWO BASELINES, and they answer different questions.
+//
+//   fp16_decode   turboquant_fp16_decode_split in
+//                 csrc/attention/turboquant/turboquant_mm_kernels.cpp: the same
+//                 Cube decode with the codec removed. Same task decomposition,
+//                 GQA batching, tile size, online softmax and split count, so
+//                 the ratio to it measures the CODEC and nothing else.
+//   fia_decode    the stock CANN operator, aclnnFusedInferAttentionScoreV5 with
+//                 aclnnFusedInferAttentionScoreV2 as a fallback, over the same
+//                 fp16 paged cache. The ratio to it is what a caller would
+//                 actually gain by switching, since this is what they have
+//                 today.
+//
+// The operator leg is BEST-EFFORT and expected to be absent on some builds: V1
+// to V4 are withdrawn on an Ascend950 (planning returns 361001, measured on CANN
+// 9.1.0) and V5's argument list has never been planned on hardware. Whichever
+// way it goes, the outcome is recorded -- a latency if it planned, the operator
+// name and the planning status if it did not -- so the comparison table says why
+// a column is empty instead of omitting it.
 //
 // The traffic model is also printed. It is exact arithmetic over the two cache
 // layouts, not a measurement.
+//
+// OUTPUT. Three things: the generic per-case table and its CSV
+// (ASCEND_BENCH_CSV), this suite's own summary, and a shape-keyed comparison CSV
+// written when ASCEND_BENCH_TQ_COMPARE_CSV names a path -- one row per shape with
+// every leg's latency, the speedups, and the derived rates. That last one is the
+// artifact meant for pasting into a report.
+//
+// BATCH. One decode step per launch, so the B column is 1 throughout. The batch
+// axis is validated rather than timed, by
+// test_device_950pr_turboquant_multimode, which sweeps batch {1, 8}; sweeping it
+// here would multiply four context lengths of KV cache by the batch and is a
+// separate change.
 //
 // SHAPES. Qwen3.5-2B's full-attention layer as common/ascend950_shapes.hpp
 // records it: head_dim 256, 8 query heads over 2 kv heads, block_size 128.
@@ -75,6 +109,10 @@
 //   ASCEND_BENCH_TQ_CONTEXTS=512,1024   restricts the sweep. Everything else is
 //                                       the shared ASCEND_BENCH_* set; see
 //                                       common/benchmark.hpp.
+//   ASCEND_BENCH_TQ_COMPARE_CSV=<path>  writes the shape-keyed comparison CSV.
+//   ASCEND_BENCH_TQ_FIA=0               drops the stock-operator leg, which is
+//                                       the one leg whose argument list has never
+//                                       been launched on a part.
 //   VLLM_ASCEND_TQ_CUBE_WIP=0           drops the Cube legs, leaving the
 //                                       AIV-only 4-bit path.
 
@@ -82,6 +120,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <iterator>
 #include <memory>
 #include <sstream>
@@ -90,6 +129,8 @@
 #include <vector>
 
 #include "acl_check.hpp"
+#include "aclnn_ops_950pr.hpp"
+#include "aclnn_runtime.hpp"
 #include "ascend950_shapes.hpp"
 #include "benchmark.hpp"
 #include "device_buffer.hpp"
@@ -123,8 +164,11 @@ constexpr int64_t kQueryTokens = 1;                  // decode
 constexpr float kAttentionScale = s950::kAttentionScale;
 constexpr float kInvSqrtHeadSize = s950::kAttentionScale;
 
-// Context lengths, in tokens. The brief's sweep.
-const int64_t kDefaultContextLens[] = {512, 1024, 2048};
+// Context lengths, in tokens. The brief's sweep, with S=64 prepended so the
+// timings start at the shape the Cube decode's fidelity was measured at on the
+// camodel (TURBOQUANT_TESTS.md section 13.9) -- otherwise every timed shape is
+// one whose numerics have never been checked anywhere.
+const int64_t kDefaultContextLens[] = {64, 512, 1024, 2048};
 
 // fp16 bytes per element, and the fp32 words in a partial's tail. Named so the
 // traffic arithmetic below reads as arithmetic rather than as constants.
@@ -151,6 +195,22 @@ std::vector<int64_t> ContextLens() {
     return std::vector<int64_t>(std::begin(kDefaultContextLens), std::end(kDefaultContextLens));
   }
   return lens;
+}
+
+/*
+ * The stock-operator leg, on by default and droppable.
+ *
+ * It exists because the aclnn argument list for a paged fp16 decode has never
+ * been planned on this part, let alone launched: V1..V4 are withdrawn on an
+ * Ascend950 and V5's list is transcribed from a header. A refusal at plan time is
+ * harmless -- the leg records a skip and the sweep continues -- but a plan that
+ * succeeds and a launch that faults takes the stream down and every case queued
+ * behind it, which is the same hazard the Cube switch exists for. So it gets the
+ * same treatment: ASCEND_BENCH_TQ_FIA=0 drops it before anything is constructed.
+ */
+bool FiaEnabled() {
+  const char* raw = std::getenv("ASCEND_BENCH_TQ_FIA");
+  return raw == nullptr || *raw == 0 || std::string(raw) != "0";
 }
 
 // --- THE CUBE LEGS -----------------------------------------------------------
@@ -523,8 +583,11 @@ struct ModeScenario {
 
     // Three table images, and they are not interchangeable. The rotation image
     // is the shipping 4-bit codec's, because both kernels drive Pi through a
-    // TurboQuantCodec4; the mode ones are this rate's. The decode image carries
-    // the NZ permutation (nz_rows = kCubeTileRows); the write image does not.
+    // TurboQuantCodec4; the mode ones are this rate's. For a codebook rate the
+    // decode image carries the NZ permutation (nz_rows = kCubeTileRows) and the
+    // write image does not; for an affine rate both are a single zero block,
+    // because that codec reads no table and both arguments are ignored (see
+    // turboquant_host::ModeTables).
     rot_tables_ = DeviceBuffer::FromHost(tqh::CodecTables(kHeadSize, 1), kBenchmarkAlignBytes);
     write_tables_ =
         DeviceBuffer::FromHost(tqh::ModeTables(kMode, kHeadSize, 1, /*nz_rows=*/0), kBenchmarkAlignBytes);
@@ -656,11 +719,128 @@ struct Fp16Scenario {
   std::vector<float> Output() const { return HalfToFloat(out_.ToHost<Half>()); }
   const tqh::CubeDecodeGrid& decode_grid() const { return decode_grid_; }
 
+  // For the stock-operator leg, which reads the same two caches rather than
+  // allocating a third pair: the comparison is of the decode, so both sides have
+  // to see the identical bytes through the identical paging.
+  void* key_cache() const { return key_cache_.get(); }
+  void* value_cache() const { return value_cache_.get(); }
+
  private:
   int64_t context_len_ = 0;
   int64_t blocks_per_seq_ = 0;
   DeviceBuffer key_cache_, value_cache_, workspace_, out_;
   tqh::CubeDecodeGrid decode_grid_;
+};
+
+/*
+ * --- the stock-operator baseline --------------------------------------------
+ *
+ * aclnnFusedInferAttentionScore over the fp16 paged cache Fp16Scenario built,
+ * with the plugin's own decode argument list (the DecodeOnly branch of
+ * AscendAttentionBackendImpl._get_fia_params): layout TND, one entry in the key
+ * and value tensor lists, the block table as a tensor, and the context length as
+ * actualSeqLengthsKv.
+ *
+ * V5 FIRST, V2 AS A FALLBACK. V1 to V4 are withdrawn on an Ascend950 -- planning
+ * returns 361001, measured -- and V5 is what replaces them, but V5's argument
+ * list has never been planned on a part. Trying both and recording what happened
+ * is the only honest arrangement: a build where neither plans still gets a row
+ * in the table, with the operator name and the status in it.
+ *
+ * Planned once at construction rather than per launch. PlanAclnn does the
+ * GetWorkspaceSize call and the workspace allocation up front, so Launch() is as
+ * close to the kernel as the runtime allows -- which is the same treatment every
+ * other leg gets, and without it this column would be measuring the aclnn
+ * planner.
+ *
+ * The member order is load-bearing: the tensor wrappers must outlive the
+ * PlannedOp that captured their handles, and the lists and the output tensor
+ * must be constructed after the tensors and the buffers they point at.
+ */
+struct FiaScenario {
+  FiaScenario(const Fp16Scenario& fp16, const DecodeScenario& shared, int64_t context_len)
+      : out_(DeviceBuffer::Empty<Half>(static_cast<size_t>(kQueryTokens * kNumHeads * kHeadSize),
+                                       kBenchmarkAlignBytes)),
+        // softmaxLse is a required output even with softmaxLseFlag false; the
+        // plugin allocates one element for it and discards it.
+        lse_(DeviceBuffer::Empty<Half>(1, kBenchmarkAlignBytes)),
+        key_flat_(s950::FiaKeyCacheView(shared.num_blocks(), kBlockSize, kNumKvHeads, kHeadSize), ACL_FLOAT16,
+                  fp16.key_cache()),
+        value_flat_(s950::FiaKeyCacheView(shared.num_blocks(), kBlockSize, kNumKvHeads, kHeadSize), ACL_FLOAT16,
+                    fp16.value_cache()),
+        key_list_({key_flat_.get()}),
+        value_list_({value_flat_.get()}),
+        query_tnd_({kQueryTokens, kNumHeads, kHeadSize}, ACL_FLOAT16, shared.query()),
+        block_table_({kQueryTokens, shared.blocks_per_seq()}, ACL_INT32, shared.block_tables()),
+        context_tensor_({kQueryTokens, kNumHeads, kHeadSize}, ACL_FLOAT16, out_.get()),
+        lse_tensor_({1}, ACL_FLOAT16, lse_.get()),
+        actual_seq_lengths_(std::vector<int64_t>{kQueryTokens}),
+        actual_seq_lengths_kv_(std::vector<int64_t>{context_len}) {
+    try {
+      planned_.reset(new PlannedOp(PlanAclnn<ops950::FusedInferAttentionScoreV5WorkspaceFn>(
+          V5(), query_tnd_.get(), key_list_.get(), value_list_.get(), /*pse_shift=*/nullptr,
+          /*atten_mask=*/nullptr, actual_seq_lengths_.get(), actual_seq_lengths_kv_.get(), /*deq_scale1=*/nullptr,
+          /*quant_scale1=*/nullptr, /*deq_scale2=*/nullptr, /*quant_scale2=*/nullptr, /*quant_offset2=*/nullptr,
+          /*antiquant_scale=*/nullptr, /*antiquant_offset=*/nullptr, block_table_.get(),
+          /*query_padding_size=*/nullptr, /*kv_padding_size=*/nullptr, /*key_antiquant_scale=*/nullptr,
+          /*key_antiquant_offset=*/nullptr, /*value_antiquant_scale=*/nullptr, /*value_antiquant_offset=*/nullptr,
+          /*key_shared_prefix=*/nullptr, /*value_shared_prefix=*/nullptr, /*actual_shared_prefix_len=*/nullptr,
+          /*query_rope=*/nullptr, /*key_rope=*/nullptr, /*key_rope_antiquant_scale=*/nullptr,
+          /*dequant_scale_query=*/nullptr, /*learnable_sink=*/nullptr, /*q_start_idx=*/nullptr,
+          /*kv_start_idx=*/nullptr, kNumHeads, static_cast<double>(kAttentionScale), s950::kFiaUnboundedTokens,
+          s950::kFiaUnboundedTokens, const_cast<char*>(ops950::kFiaLayoutTnd), kNumKvHeads,
+          s950::kFiaSparseModeNone, s950::kFiaInnerPreciseDefault, kBlockSize, /*antiquant_mode=*/0,
+          /*softmax_lse_flag=*/false, /*key_antiquant_mode=*/0, /*value_antiquant_mode=*/0,
+          s950::kFiaQueryQuantModeNone, s950::kFiaPseTypeDefault, context_tensor_.get(), lse_tensor_.get())));
+      op_name_ = ops950::kFusedInferAttentionScoreV5;
+      return;
+    } catch (const AclError& error) {
+      note_ = std::string(ops950::kFusedInferAttentionScoreV5) + ": " + error.what();
+    }
+    try {
+      planned_.reset(new PlannedOp(PlanAclnn<ops950::FusedInferAttentionScoreV2WorkspaceFn>(
+          V2(), query_tnd_.get(), key_list_.get(), value_list_.get(), /*pse_shift=*/nullptr,
+          /*atten_mask=*/nullptr, actual_seq_lengths_.get(), actual_seq_lengths_kv_.get(), /*deq_scale1=*/nullptr,
+          /*quant_scale1=*/nullptr, /*deq_scale2=*/nullptr, /*quant_scale2=*/nullptr, /*quant_offset2=*/nullptr,
+          /*antiquant_scale=*/nullptr, /*antiquant_offset=*/nullptr, block_table_.get(),
+          /*query_padding_size=*/nullptr, /*kv_padding_size=*/nullptr, /*key_antiquant_scale=*/nullptr,
+          /*key_antiquant_offset=*/nullptr, /*value_antiquant_scale=*/nullptr, /*value_antiquant_offset=*/nullptr,
+          /*key_shared_prefix=*/nullptr, /*value_shared_prefix=*/nullptr, /*actual_shared_prefix_len=*/nullptr,
+          kNumHeads, static_cast<double>(kAttentionScale), s950::kFiaUnboundedTokens, s950::kFiaUnboundedTokens,
+          const_cast<char*>(ops950::kFiaLayoutTnd), kNumKvHeads, s950::kFiaSparseModeNone,
+          s950::kFiaInnerPreciseDefault, kBlockSize, /*antiquant_mode=*/0, /*softmax_lse_flag=*/false,
+          /*key_antiquant_mode=*/0, /*value_antiquant_mode=*/0, context_tensor_.get(), lse_tensor_.get())));
+      op_name_ = ops950::kFusedInferAttentionScoreV2;
+    } catch (const AclError& error) {
+      note_ += std::string("; ") + ops950::kFusedInferAttentionScoreV2 + ": " + error.what();
+    }
+  }
+
+  bool available() const { return planned_ != nullptr; }
+  const std::string& note() const { return note_; }
+  const std::string& op_name() const { return op_name_; }
+
+  void EnqueueDecode(aclrtStream stream) const { planned_->Launch(stream); }
+  std::vector<float> Output() const { return HalfToFloat(out_.ToHost<Half>()); }
+
+ private:
+  static const AclnnOp& V5() {
+    static const AclnnOp op(ops950::kFusedInferAttentionScoreV5);
+    return op;
+  }
+  static const AclnnOp& V2() {
+    static const AclnnOp op(ops950::kFusedInferAttentionScoreV2);
+    return op;
+  }
+
+  DeviceBuffer out_, lse_;
+  AclnnTensor key_flat_, value_flat_;
+  AclnnTensorList key_list_, value_list_;
+  AclnnTensor query_tnd_, block_table_, context_tensor_, lse_tensor_;
+  AclnnIntArray actual_seq_lengths_, actual_seq_lengths_kv_;
+  std::unique_ptr<PlannedOp> planned_;
+  std::string note_;
+  std::string op_name_;
 };
 
 // --- reporting ---------------------------------------------------------------
@@ -674,115 +854,237 @@ const BenchmarkResult* FindResult(const BenchmarkRunner& runner, const std::stri
   return nullptr;
 }
 
-// The suite's own summary, printed after every case has run and before the
-// generic table. What it adds is the three things the generic table cannot
-// know: decode steps per second, effective KV bandwidth, and the ratio to the
-// fp16 baseline.
-//
-// Two tables. The first is the comparison this binary exists to make -- the AIV
-// 4-bit path, the Cube 4-bit path and the unquantised fp16 Cube path, side by
-// side at the same context length, with the two ratios that read off it. The
-// second is the derived rates for the Cube 4-bit leg, which have no meaning for
-// tq4 (it reads a different number of bytes) and none for fp16 (its bytes are
-// the baseline).
+// One leg's numbers at one shape, or "did not run". Pulling the four figures
+// out of the result table once, into a struct, is what keeps the printing and the
+// CSV from disagreeing about which median they quoted.
+struct LegSample {
+  bool present = false;
+  double median_us = 0.0;
+  double p95_us = 0.0;
+  double gigabytes_per_second = 0.0;
+  double tflops = 0.0;
+};
+
+LegSample SampleFor(const BenchmarkRunner& runner, const char* leg, int64_t context_len) {
+  LegSample sample;
+  const BenchmarkResult* result = FindResult(runner, CaseName(leg, context_len), TimingMode::kPipelined);
+  if (result == nullptr || result->latency.median_us <= 0.0) {
+    return sample;
+  }
+  sample.present = true;
+  sample.median_us = result->latency.median_us;
+  sample.p95_us = result->latency.p95_us;
+  sample.gigabytes_per_second = result->gigabytes_per_second();
+  sample.tflops = result->tflops();
+  return sample;
+}
+
+// numerator / denominator, or 0 when either leg produced no sample. Callers print
+// a dash for 0 rather than a ratio, because a 0.00x would read as a measurement.
+double Speedup(const LegSample& baseline, const LegSample& candidate) {
+  if (!baseline.present || !candidate.present || candidate.median_us <= 0.0) {
+    return 0.0;
+  }
+  return baseline.median_us / candidate.median_us;
+}
+
+void PrintMicroseconds(const LegSample& sample) {
+  if (sample.present) {
+    std::printf("%10.2f ", sample.median_us);
+  } else {
+    std::printf("%10s ", "-");
+  }
+}
+
+void PrintRatio(double ratio, const char* tail) {
+  if (ratio > 0.0) {
+    std::printf("%9.2fx%s", ratio, tail);
+  } else {
+    std::printf("%10s%s", "-", tail);
+  }
+}
+
+/*
+ * The shape-keyed comparison CSV, written when ASCEND_BENCH_TQ_COMPARE_CSV names
+ * a path. One row per shape, every leg in it, so a spreadsheet can plot the
+ * sweep without reshaping anything.
+ *
+ * Separate from the generic ASCEND_BENCH_CSV, which is one row per (case, mode)
+ * and knows nothing about which cases are baselines for which. This one is the
+ * comparison; that one is the raw record.
+ *
+ * An absent leg leaves its fields EMPTY rather than writing 0 -- a zero latency
+ * or a zero speedup in a spreadsheet is indistinguishable from a measurement,
+ * and this is the artifact most likely to be read without its banner.
+ */
+void WriteComparisonCsv(const BenchmarkRunner& runner, const std::vector<TrafficModel>& models,
+                        const std::string& path, const std::string& fia_operator) {
+  std::ofstream csv(path, std::ios::trunc);
+  if (!csv) {
+    std::printf("[ascend-bench] could not open ASCEND_BENCH_TQ_COMPARE_CSV='%s' for writing\n", path.c_str());
+    return;
+  }
+  csv << "batch,context_len,num_heads,head_dim,num_kv_heads,block_size,"
+      << "kv4fp8_us,tq4_us,fp16_us,fia_us,fia_operator,"
+      << "speedup_vs_fp16,speedup_vs_tq4,speedup_vs_fia,"
+      << "kv4fp8_gbps,kv4fp8_tflops,fp16_gbps,fp16_tflops,fia_gbps,fia_tflops,"
+      << "kv4fp8_p95_us,fp16_p95_us,fia_p95_us,kv4fp8_bytes_per_step,fp16_bytes_per_step\n";
+
+  for (const TrafficModel& model : models) {
+    const LegSample kv4 = SampleFor(runner, "kv4fp8_decode", model.context_len);
+    const LegSample tq4 = SampleFor(runner, "tq4_decode", model.context_len);
+    const LegSample fp16 = SampleFor(runner, "fp16_decode", model.context_len);
+    const LegSample fia = SampleFor(runner, "fia_decode", model.context_len);
+
+    csv << kQueryTokens << ',' << model.context_len << ',' << kNumHeads << ',' << kHeadSize << ','
+        << kNumKvHeads << ',' << kBlockSize << ',';
+    const LegSample legs[] = {kv4, tq4, fp16, fia};
+    for (const LegSample& leg : legs) {
+      if (leg.present) {
+        csv << leg.median_us;
+      }
+      csv << ',';
+    }
+    csv << fia_operator << ',';
+    const double ratios[] = {Speedup(fp16, kv4), Speedup(tq4, kv4), Speedup(fia, kv4)};
+    for (const double ratio : ratios) {
+      if (ratio > 0.0) {
+        csv << ratio;
+      }
+      csv << ',';
+    }
+    const LegSample rate_legs[] = {kv4, fp16, fia};
+    for (const LegSample& leg : rate_legs) {
+      if (leg.present) {
+        csv << leg.gigabytes_per_second << ',' << leg.tflops;
+      } else {
+        csv << ',';
+      }
+      csv << ',';
+    }
+    for (const LegSample& leg : rate_legs) {
+      if (leg.present) {
+        csv << leg.p95_us;
+      }
+      csv << ',';
+    }
+    csv << model.kv4_decode_read_bytes << ',' << model.fp16_decode_read_bytes << '\n';
+  }
+  std::printf("[ascend-bench] comparison CSV written to %s\n", path.c_str());
+}
+
+/*
+ * The suite's own summary, printed after every case has run and before the
+ * generic table. What it adds is the three things the generic table cannot know:
+ * which legs are baselines for which, the speedups that follow, and the derived
+ * rates side by side.
+ *
+ * Three tables. The first is the latency comparison the binary exists to make --
+ * the AIV 4-bit path, the Cube 4-bit path, the unquantised fp16 Cube path and the
+ * stock operator, at one shape per row. The second is the speedups read off it.
+ * The third is the derived rates per leg.
+ */
 void PrintDecodeSummary(const BenchmarkRunner& runner, const std::vector<TrafficModel>& models,
-                        bool cube_enabled) {
-  std::printf("\n[ascend-bench] TurboQuant decode summary (median of the pipelined mode)\n\n");
-  std::printf("  %6s  %10s %10s %10s   %9s %9s\n", "S", "tq4 us", "kv4 us", "fp16 us", "kv4:fp16", "kv4:tq4");
-  std::printf("  %s\n", std::string(6 + 2 + 3 * 11 + 2 + 10 + 9, '-').c_str());
+                        bool cube_enabled, const std::string& fia_operator) {
+  std::printf("\n[ascend-bench] TurboQuant decode summary (median of the pipelined mode)\n");
+  std::printf("[ascend-bench] shape: B=%lld H=%lld D=%lld kv_heads=%lld block=%lld\n",
+              static_cast<long long>(kQueryTokens), static_cast<long long>(kNumHeads),
+              static_cast<long long>(kHeadSize), static_cast<long long>(kNumKvHeads),
+              static_cast<long long>(kBlockSize));
+  std::printf("\n  %6s  %10s %10s %10s %10s\n", "S", "kv4 us", "tq4 us", "fp16 us", "fia us");
+  std::printf("  %s\n", std::string(6 + 2 + 4 * 11, '-').c_str());
 
   bool any = false;
   for (const TrafficModel& model : models) {
-    const BenchmarkResult* tq4 =
-        FindResult(runner, CaseName("tq4_decode", model.context_len), TimingMode::kPipelined);
-    const BenchmarkResult* kv4 =
-        FindResult(runner, CaseName("kv4fp8_decode", model.context_len), TimingMode::kPipelined);
-    const BenchmarkResult* fp16 =
-        FindResult(runner, CaseName("fp16_decode", model.context_len), TimingMode::kPipelined);
-    if (tq4 == nullptr && kv4 == nullptr && fp16 == nullptr) {
+    const LegSample kv4 = SampleFor(runner, "kv4fp8_decode", model.context_len);
+    const LegSample tq4 = SampleFor(runner, "tq4_decode", model.context_len);
+    const LegSample fp16 = SampleFor(runner, "fp16_decode", model.context_len);
+    const LegSample fia = SampleFor(runner, "fia_decode", model.context_len);
+    if (!kv4.present && !tq4.present && !fp16.present && !fia.present) {
       continue;
     }
     any = true;
-    const double tq4_us = tq4 != nullptr ? tq4->latency.median_us : 0.0;
-    const double kv4_us = kv4 != nullptr ? kv4->latency.median_us : 0.0;
-    const double fp16_us = fp16 != nullptr ? fp16->latency.median_us : 0.0;
-    // A leg with no sample prints a dash. 0.00 us would read as a measurement,
-    // which is the misreading the note at the foot of this table exists to
-    // stop, and a run with the Cube legs dropped leaves two of these three
-    // columns empty.
-    const double latencies[] = {tq4_us, kv4_us, fp16_us};
     std::printf("  %6lld  ", static_cast<long long>(model.context_len));
-    for (const double us : latencies) {
-      if (us > 0.0) {
-        std::printf("%10.2f ", us);
-      } else {
-        std::printf("%10s ", "-");
-      }
+    const LegSample legs[] = {kv4, tq4, fp16, fia};
+    for (const LegSample& leg : legs) {
+      PrintMicroseconds(leg);
     }
-    std::printf("  ");
-    // Both ratios are kv4 against a denominator: fp16 for what the 4-bit cache
-    // buys, tq4 for what the Cube buys at a fixed rate. A ratio needs both legs
-    // to have produced a sample; a missing one prints a dash rather than an
-    // infinity or a zero that would read as a measurement.
-    const double denominators[] = {fp16_us, tq4_us};
-    for (int column = 0; column < 2; ++column) {
-      const char* tail = column == 1 ? "\n" : " ";
-      if (denominators[column] > 0.0 && kv4_us > 0.0) {
-        std::printf("%8.2fx%s", denominators[column] / kv4_us, tail);
-      } else {
-        std::printf("%9s%s", "-", tail);
-      }
-    }
+    std::printf("\n");
   }
   if (!any) {
     std::printf("  (no decode case produced a pipelined sample)\n");
+    std::fflush(stdout);
+    return;
   }
 
-  // The derived rates for the Cube 4-bit leg. Its GB/s is its own decode-read
-  // model over its own measured time, so it is comparable to nothing else in
-  // the file. The table is suppressed when the leg did not run: a header over
-  // no rows says less than its absence does.
-  bool any_cube = false;
+  // The speedups. Every one is kv4 against a denominator, because kv4 is the
+  // thing being proposed and the other three are what it would replace.
+  std::printf("\n  %6s  %10s %10s %10s\n", "S", "vs fp16", "vs tq4", "vs fia");
+  std::printf("  %s\n", std::string(6 + 2 + 3 * 11, '-').c_str());
   for (const TrafficModel& model : models) {
-    any_cube = any_cube ||
-               FindResult(runner, CaseName("kv4fp8_decode", model.context_len), TimingMode::kPipelined) != nullptr;
+    const LegSample kv4 = SampleFor(runner, "kv4fp8_decode", model.context_len);
+    const LegSample tq4 = SampleFor(runner, "tq4_decode", model.context_len);
+    const LegSample fp16 = SampleFor(runner, "fp16_decode", model.context_len);
+    const LegSample fia = SampleFor(runner, "fia_decode", model.context_len);
+    if (!kv4.present) {
+      continue;
+    }
+    std::printf("  %6lld  ", static_cast<long long>(model.context_len));
+    PrintRatio(Speedup(fp16, kv4), " ");
+    PrintRatio(Speedup(tq4, kv4), " ");
+    PrintRatio(Speedup(fia, kv4), "\n");
   }
-  if (any_cube) {
-    std::printf("\n  %6s  %10s %10s %10s\n", "S", "kv4 step/s", "kv4 GB/s", "kv4 TF/s");
-    std::printf("  %s\n", std::string(6 + 2 + 3 * 10 + 2, '-').c_str());
-    for (const TrafficModel& model : models) {
-      const BenchmarkResult* result =
-          FindResult(runner, CaseName("kv4fp8_decode", model.context_len), TimingMode::kPipelined);
-      if (result == nullptr || result->latency.median_us <= 0.0) {
+
+  // The derived rates, now for every leg that produced a sample rather than for
+  // kv4 alone. Each leg's GB/s is its OWN traffic model over its own measured
+  // time, so the column compares a leg to its own memory demand and not to
+  // another leg's -- a 4-bit cache and an fp16 one do not read the same bytes,
+  // which is the entire point of the change.
+  std::printf("\n  %6s  %-8s %11s %10s %10s\n", "S", "leg", "steps/s", "GB/s", "TFLOP/s");
+  std::printf("  %s\n", std::string(6 + 2 + 9 + 11 + 10 + 10 + 3, '-').c_str());
+  const char* rate_legs[] = {"kv4fp8_decode", "tq4_decode", "fp16_decode", "fia_decode"};
+  const char* rate_labels[] = {"kv4fp8", "tq4", "fp16", "fia"};
+  for (const TrafficModel& model : models) {
+    for (size_t leg = 0; leg < sizeof(rate_legs) / sizeof(rate_legs[0]); ++leg) {
+      const LegSample sample = SampleFor(runner, rate_legs[leg], model.context_len);
+      if (!sample.present) {
         continue;
       }
-      std::printf("  %6lld  %10.0f %10.1f %10.3f\n", static_cast<long long>(model.context_len),
-                  1.0e6 / result->latency.median_us, result->gigabytes_per_second(), result->tflops());
+      std::printf("  %6lld  %-8s %11.0f %10.1f %10.3f\n", static_cast<long long>(model.context_len),
+                  rate_labels[leg], 1.0e6 / sample.median_us, sample.gigabytes_per_second, sample.tflops);
     }
   }
 
-  std::printf("\n[ascend-bench]   steps/s is one sequence's decode step, not a batch. The GB/s column is the\n"
-              "[ascend-bench]   kv4 traffic-model decode-read bytes over the measured time, so it is what the\n"
-              "[ascend-bench]   kernel asked the memory system for and not a fill-rate ceiling. kv4:fp16 is\n"
-              "[ascend-bench]   against the physical fp16 Cube decode in the same binary -- the same kernel\n"
-              "[ascend-bench]   with the codec removed -- and not against an analytic model. kv4:tq4 is the\n"
-              "[ascend-bench]   Cube against the vector cores at one rate: the two store identical nibbles\n"
-              "[ascend-bench]   against identical thresholds, so the codec is held fixed across that ratio.\n");
+  std::printf("\n[ascend-bench]   steps/s is one sequence's decode step, not a batch -- every row is B=1; the\n"
+              "[ascend-bench]   batch axis is validated by test_device_950pr_turboquant_multimode and not timed\n"
+              "[ascend-bench]   here. A GB/s column is that leg's traffic-model decode-read bytes over its own\n"
+              "[ascend-bench]   measured time, so it is what the kernel asked the memory system for and not a\n"
+              "[ascend-bench]   fill-rate ceiling.\n");
+  std::printf("[ascend-bench]   vs fp16 is against the physical fp16 Cube decode in this binary -- the same\n"
+              "[ascend-bench]   kernel with the codec removed -- so it isolates the codec. vs tq4 is the Cube\n"
+              "[ascend-bench]   against the vector cores at 4 bits, and since kv4fp8 became affine INT4 while\n"
+              "[ascend-bench]   tq4 stayed Lloyd-Max that ratio now moves two things at once; see the header.\n"
+              "[ascend-bench]   vs fia is against the stock CANN operator, which is what a caller has today.\n");
   if (cube_enabled) {
     // Repeated here rather than only in the banner, because the summary is the
     // part that gets pasted into a report and the banner is not.
-    std::printf("[ascend-bench]   the kv4 decode is verified correct at S=64 on the camodel (cos 0.982351);\n"
-                "[ascend-bench]   these are the first timings ever taken of it, at context lengths its\n"
-                "[ascend-bench]   fidelity has not been measured at. The fp16 column is a comparator with no\n"
-                "[ascend-bench]   fidelity check. See TURBOQUANT_TESTS.md section 13.8.\n");
+    std::printf("[ascend-bench]   the kv4 decode is verified correct at S=64 on the camodel; these are the\n"
+                "[ascend-bench]   first timings ever taken of it, and at S in {512,1024,2048} its fidelity has\n"
+                "[ascend-bench]   not been measured anywhere. The fp16 column is a comparator with no fidelity\n"
+                "[ascend-bench]   check of its own. See TURBOQUANT_TESTS.md sections 13.8 and 13.9.\n");
   } else {
     // A row of dashes in a table invites the reading that the hardware tried
     // and could not.
-    std::printf("[ascend-bench]   the kv4 and fp16 columns are empty because the Cube legs were dropped\n"
+    std::printf("[ascend-bench]   the kv4, fp16 and fia columns are empty because the Cube legs were dropped\n"
                 "[ascend-bench]   (VLLM_ASCEND_TQ_CUBE_WIP=0), not because they ran and produced nothing. This\n"
                 "[ascend-bench]   is a 4-bit AIV run, and the only comparison in it is the traffic model.\n");
   }
   std::fflush(stdout);
+
+  const char* csv_path = std::getenv("ASCEND_BENCH_TQ_COMPARE_CSV");
+  if (csv_path != nullptr && *csv_path != 0) {
+    WriteComparisonCsv(runner, models, csv_path, fia_operator);
+  }
 }
 
 }  // namespace
@@ -790,6 +1092,7 @@ void PrintDecodeSummary(const BenchmarkRunner& runner, const std::vector<Traffic
 void BuildSuite(BenchmarkRunner& runner) {
   const std::vector<int64_t> context_lens = ContextLens();
   const bool cube = CubeEnabled();
+  const bool fia = cube && FiaEnabled();
 
   bool aiv_queried = false;
   const int64_t aiv_num = tqh::VectorCoreNum(&aiv_queried);
@@ -810,6 +1113,7 @@ void BuildSuite(BenchmarkRunner& runner) {
   std::vector<std::unique_ptr<DecodeScenario>> scenarios;
   std::vector<std::unique_ptr<Kv4Scenario>> kv4_scenarios;
   std::vector<std::unique_ptr<Fp16Scenario>> fp16_scenarios;
+  std::vector<std::unique_ptr<FiaScenario>> fia_scenarios;
   scenarios.reserve(context_lens.size());
   for (const int64_t context_len : context_lens) {
     scenarios.emplace_back(new DecodeScenario(context_len));
@@ -819,6 +1123,24 @@ void BuildSuite(BenchmarkRunner& runner) {
     if (cube) {
       kv4_scenarios.emplace_back(new Kv4Scenario(*scenarios.back(), context_len));
       fp16_scenarios.emplace_back(new Fp16Scenario(*scenarios.back(), context_len));
+      // No allocation of its own beyond one output: it reads the fp16 caches the
+      // line above built. Constructing it plans the operator, which is where a
+      // 361001 refusal surfaces, so the reason is available before any timing.
+      //
+      // An `if`, not an early `continue`: the traffic model is appended after
+      // this block and every later loop indexes `models` by shape, so skipping
+      // the rest of an iteration would leave that vector short and the
+      // registration loop would read past its end.
+      if (fia) {
+        fia_scenarios.emplace_back(new FiaScenario(*fp16_scenarios.back(), *scenarios.back(), context_len));
+        if (fia_scenarios.back()->available()) {
+          std::printf("[ascend-bench] S=%lld: stock operator baseline is %s\n",
+                      static_cast<long long>(context_len), fia_scenarios.back()->op_name().c_str());
+        } else {
+          std::printf("[ascend-bench] S=%lld: no stock operator baseline -- %s\n",
+                      static_cast<long long>(context_len), fia_scenarios.back()->note().c_str());
+        }
+      }
     }
     models.push_back(ModelTrafficFor(context_len, scenarios.back()->decode_grid()));
   }
@@ -899,6 +1221,8 @@ void BuildSuite(BenchmarkRunner& runner) {
       }
       runner.Skip(CaseName("fp16_decode", context_len),
                   "the fp16 baseline is the same Cube kernel with the codec removed, and is dropped with it");
+      runner.Skip(CaseName("fia_decode", context_len),
+                  "the stock-operator baseline reads the fp16 cache the Cube legs build, and is dropped with them");
       continue;
     }
 
@@ -907,12 +1231,14 @@ void BuildSuite(BenchmarkRunner& runner) {
 
     // --- the Cube-native 4-bit cache write ----------------------------------
     //
-    // Same nibbles as tq4_write and a different kernel: this one is
-    // turboquant_mm_reshape_and_cache at MODE = KV4_FP8, which encodes through
-    // the multi-rate codec rather than through TurboQuantCodec<4>. The two
-    // codebooks agree by construction -- TurboQuantModeTraits<KV4_FP8>'s
-    // thresholds are TurboQuantCodec<4>::Threshold -- so the difference the
-    // pair measures is the packer, not the quantiser.
+    // Four bits per coordinate into a 128-byte slot, as tq4_write, and a
+    // different kernel AND a different quantiser: this one is
+    // turboquant_mm_reshape_and_cache at MODE = KV4_FP8, which bins against
+    // uniform thresholds and packs the two nibbles of a byte as coordinates b
+    // and b + d/2. tq4_write bins against Lloyd-Max thresholds and interleaves
+    // 2b with 2b + 1. The cache geometry is identical and the contents are not,
+    // so the pair measures the packer and the quantiser together; see the note
+    // on the codec at the head of this file.
     const std::string kv4_write_name = CaseName("kv4fp8_write", context_len);
     try {
       BenchmarkCase write_case;
@@ -960,9 +1286,47 @@ void BuildSuite(BenchmarkRunner& runner) {
     } catch (const std::exception& error) {
       runner.RecordFailure(fp16_name, error.what());
     }
+
+    // --- the stock-operator baseline ----------------------------------------
+    //
+    // A SKIP and not a failure when the operator did not plan: an Ascend950 with
+    // V1..V4 withdrawn and no V5 is a configuration, not a defect in this
+    // binary, and the reason carries into the report.
+    const std::string fia_name = CaseName("fia_decode", context_len);
+    if (!fia) {
+      runner.Skip(fia_name, "the stock-operator leg was dropped by ASCEND_BENCH_TQ_FIA=0");
+    } else if (!fia_scenarios[index]->available()) {
+      runner.Skip(fia_name, fia_scenarios[index]->note());
+    } else {
+      const FiaScenario& operator_leg = *fia_scenarios[index];
+      try {
+        BenchmarkCase fia_case;
+        fia_case.name = fia_name;
+        fia_case.flops_per_iteration = AttentionFlops(context_len);
+        // The same bytes the fp16 leg reads, because it is the same cache. That
+        // makes the two GB/s figures comparable and both of them a statement
+        // about the traffic model rather than about the operator's internals.
+        fia_case.bytes_per_iteration = model.fp16_decode_read_bytes;
+        fia_case.tasks_per_launch = 1;  // one operator, one task
+        fia_case.launch = [&operator_leg](aclrtStream stream) { operator_leg.EnqueueDecode(stream); };
+        fia_case.checksum = [&operator_leg]() { return ChecksumSum(operator_leg.Output()); };
+        runner.Run(fia_case);
+      } catch (const std::exception& error) {
+        runner.RecordFailure(fia_name, error.what());
+      }
+    }
   }
 
-  PrintDecodeSummary(runner, models, cube);
+  // The operator name the CSV records. Every shape plans the same operator, so
+  // the first scenario that resolved one names it; "none" when none did.
+  std::string fia_operator = "none";
+  for (const std::unique_ptr<FiaScenario>& operator_leg : fia_scenarios) {
+    if (operator_leg->available()) {
+      fia_operator = operator_leg->op_name();
+      break;
+    }
+  }
+  PrintDecodeSummary(runner, models, cube, fia_operator);
 }
 
 }  // namespace bench

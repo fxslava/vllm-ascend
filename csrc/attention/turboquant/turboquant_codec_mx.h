@@ -27,19 +27,39 @@
  *   kv4fp8   4 bits, 2 digits/byte      --                  128 +  0 = 128 B
  *   kv5fp8   4 bits, 2 digits/byte      1 bit, 8/byte       128 + 32 = 160 B
  *
- * No code straddles a byte.  kv5fp8's low plane is laid out exactly as
- * kv4fp8's whole slot, so the two share one packer and one unpacker.
+ * No code straddles a byte.
  *
- * Digit j of a byte is extracted at any radix by
+ * TWO EXPAND PATHS, and which one a mode takes is TurboQuantModeTraits::
+ * kIsAffine.
+ *
+ * kv3fp4 and kv5fp8 store a Lloyd-Max *index*, so the expand is
+ * Unpack(): a UB Gather to bring each channel's byte to its lane, ExtractDigit
+ * to isolate the digit, and a second Gather through the centroid table.  Digit j
+ * of a byte is extracted at any radix by
  *
  *     t   = byte * radix^-(p mod digitsPerByte)      one Mul against a block
  *     t   = floor(t)
  *     h   = floor(t / radix)
  *     dig = t - radix * h                            i.e. t mod radix
  *
- * ExtractDigit below is that.  Every period divides the 8 fp32 lanes of a
- * 32-byte block, so the reciprocal and weight tables are a single block applied
- * with src1BlkStride = src1RepStride = 0.
+ * Every period divides the 8 fp32 lanes of a 32-byte block, so the reciprocal
+ * and weight tables are a single block applied with
+ * src1BlkStride = src1RepStride = 0.
+ *
+ * kv4fp8 is affine: the code IS the level, so there is no table to look up and
+ * UnpackAffine() is two integer shifts and an Adds over a *contiguous* run of
+ * bytes.  That removes both Gathers, and with them the only reason the expand
+ * had to know where a channel lands -- which is what lets the decode stage L1
+ * with flat sequential DataCopy.  For that to work the packing is plane-split
+ * rather than interleaved:
+ *
+ *     byte b  =  q[b]  +  16 * q[b + len/2]      b in [0, len/2)
+ *
+ * so the low nibbles of one slot are the first half of the vector in order and
+ * the high nibbles the second half, both contiguous.  An interleaved
+ * (2b, 2b+1) packing would need a stride-2 scatter to undo, and AscendC has no
+ * element-stride-2 vector move -- blkStride counts 32-byte blocks -- which is
+ * exactly why the old layout needed the Gather.
  *
  * The arch35 vector converter has no fp32 <-> fp4 leg -- only
  * bf16 <-> fp4x2_e2m1 -- so kv3fp4 expands fp32 -> bf16 -> fp4x2_e2m1.
@@ -70,6 +90,8 @@ struct TurboQuantPlanes<TurboQuantMode::KV3_FP4> {
     static constexpr int32_t kLowPerByte = 4;  // 8 / kLowBits
 };
 
+// The affine rate.  kLowPerByte is 2 as for kv5fp8, but the two digits of a
+// byte are coordinates b and b + len/2, not 2b and 2b + 1; see the file header.
 template <>
 struct TurboQuantPlanes<TurboQuantMode::KV4_FP8> {
     static constexpr int32_t kLowBits = 4;
@@ -94,12 +116,17 @@ constexpr int32_t kMsbPerByte = 8;
  * The multi-rate codec.
  *
  * `vecLen`     head_size, a power of two in [64, 256].
- * `batchRows`  vectors Unpack may expand in one call; the low/msb offset tables
- *              are built for exactly this many and are not valid for more.
+ * `batchRows`  for a codebook mode, vectors Unpack may expand in one call: the
+ *              low/msb offset tables are built for exactly this many and are not
+ *              valid for more.  For the affine mode there are no offset tables
+ *              and UnpackAffine is byte-major rather than row-major, so the
+ *              product vecLen * batchRows is read as the number of operand
+ *              *elements* one call produces -- twice the bytes it consumes.
  *              Encode always runs one vector at a time.
  *
  * The constant-table image is this codec's own and deliberately does not share
- * TurboQuantCodec<4>::ConstTableWords, which five mirrors pin.
+ * TurboQuantCodec<4>::ConstTableWords, which five mirrors pin.  A CODEBOOK mode
+ * carries
  *
  *   [0 .. B)             lowOffset_   uint32 byte offsets,  B = vecLen*batchRows
  *   [B .. 2B)            msbOffset_   uint32 byte offsets
@@ -109,8 +136,13 @@ constexpr int32_t kMsbPerByte = 8;
  *   [2B+24 .. +vecLen)   packOffset_  uint32, the encoder's low-plane gathers
  *   [.. + kLevels)       centroid_    the mode's stored codebook
  *
- * msbOffset_ is allocated even for kv4fp8, which has no msb plane, so the
- * layout is one formula rather than a conditional.
+ * msbOffset_ is allocated even for a mode with no msb plane, so the layout is
+ * one formula rather than a conditional.
+ *
+ * The AFFINE mode carries NOTHING: every table above exists to address a byte or
+ * a centroid, and it does neither.  ConstTableWords is 0 and Init allocates no
+ * constant buffer; turboquant_host::ModeTables still emits one zero block for
+ * it, because the launch boundary wants a bindable pointer.
  */
 template <TurboQuantMode MODE>
 class TurboQuantModeCodec {
@@ -124,6 +156,10 @@ public:
     static constexpr bool kHasMsbPlane = Planes::kMsbBits > 0;
     static constexpr bool kIsFp4 = Traits::kOperand == TurboQuantOperand::kFp4E2m1;
     static constexpr int kBinLanes = TurboQuantCodec4::kBinLanes;
+    // Uniform levels, so the stored code is the level: no centroid table, and
+    // the expand is UnpackAffine rather than Unpack.
+    static constexpr bool kIsAffine = Traits::kIsAffine;
+    static constexpr float kAffineBias = Traits::kAffineBias;
 
     __aicore__ static constexpr uint32_t LowPlaneBytes(uint32_t vecLen)
     {
@@ -147,19 +183,39 @@ public:
     }
 
     // Same shape of contract as TurboQuantCodec<4>::ConstTableWords: the host
-    // writes this exact image and the device never rewrites a word of it.
+    // writes this exact image and the device never rewrites a word of it.  Zero
+    // for the affine mode, which reads no constant table at all.
     __aicore__ static inline uint32_t ConstTableWords(uint32_t vecLen, uint32_t batchRows)
     {
-        return 2u * vecLen * batchRows + kPeriodicWords + vecLen + static_cast<uint32_t>(kLevels);
+        if constexpr (kIsAffine) {
+            return 0u;
+        } else {
+            return 2u * vecLen * batchRows + kPeriodicWords + vecLen + static_cast<uint32_t>(kLevels);
+        }
     }
 
-    // Scratch, deliberately uninitialised.  Four full-length buffers carry the
-    // expand; reduceWork_, broadcast_ and the boundary lanes belong to the
-    // encoder and are sized off vecLen because it only ever sees one vector.
+    /*
+     * Scratch, deliberately uninitialised.
+     *
+     * A codebook mode carries four full-length buffers through the expand.  The
+     * affine mode carries two half-length ones -- it works on packed bytes, of
+     * which there are half as many as channels -- which is what pays for the
+     * decode unpacking a whole 64-row tile per call instead of an eight-row
+     * band.
+     *
+     * reduceWork_, broadcast_ and the boundary lanes belong to the encoder and
+     * are sized off vecLen because it only ever sees one vector.  low_ and
+     * scratch_ are the encoder's too on the affine path; the expand there writes
+     * into expand_ and msb_ only.
+     */
     __aicore__ static inline uint32_t WorkBufferWords(uint32_t vecLen, uint32_t batchRows)
     {
-        return 4u * vecLen * batchRows + vecLen + kBrcbDstLanes + kFp32PerBlock +
-               static_cast<uint32_t>(kBinLanes) * vecLen;
+        const uint32_t shared = kBrcbDstLanes + kFp32PerBlock + static_cast<uint32_t>(kBinLanes) * vecLen;
+        if constexpr (kIsAffine) {
+            return vecLen * batchRows + 3u * vecLen + shared;
+        } else {
+            return 4u * vecLen * batchRows + vecLen + shared;
+        }
     }
 
     // Decision boundaries, consumed as Adds immediates.  Reading them from the
@@ -175,41 +231,58 @@ public:
         rows_ = batchRows;
         batchLen_ = vecLen * batchRows;
         invSqrtLen_ = invSqrtLen;
-        const uint32_t constWords = ConstTableWords(vecLen, batchRows);
 
-        pipe->InitBuffer(constBuf_, constWords * sizeof(int32_t));
         pipe->InitBuffer(workBuf_, WorkBufferWords(vecLen, batchRows) * sizeof(float));
 
-        AscendC::LocalTensor<int32_t> pool = constBuf_.Get<int32_t>();
-        AscendC::DataCopy(pool, tablesGm, constWords);
-        AscendC::PipeBarrier<PIPE_ALL>();
+        if constexpr (!kIsAffine) {
+            const uint32_t constWords = ConstTableWords(vecLen, batchRows);
+            pipe->InitBuffer(constBuf_, constWords * sizeof(int32_t));
 
-        AscendC::LocalTensor<float> poolF = pool.template ReinterpretCast<float>();
-        uint32_t off = 0;
-        lowOffset_ = pool[off].template ReinterpretCast<uint32_t>();
-        off += batchLen_;
-        msbOffset_ = pool[off].template ReinterpretCast<uint32_t>();
-        off += batchLen_;
-        lowRecip_ = poolF[off];
-        off += kFp32PerBlock;
-        msbRecip_ = poolF[off];
-        off += kFp32PerBlock;
-        msbWeight_ = poolF[off];
-        off += kFp32PerBlock;
-        packOffset_ = pool[off].template ReinterpretCast<uint32_t>();
-        off += len_;
-        centroid_ = poolF[off];
+            AscendC::LocalTensor<int32_t> pool = constBuf_.Get<int32_t>();
+            AscendC::DataCopy(pool, tablesGm, constWords);
+            AscendC::PipeBarrier<PIPE_ALL>();
+
+            AscendC::LocalTensor<float> poolF = pool.template ReinterpretCast<float>();
+            uint32_t coff = 0;
+            lowOffset_ = pool[coff].template ReinterpretCast<uint32_t>();
+            coff += batchLen_;
+            msbOffset_ = pool[coff].template ReinterpretCast<uint32_t>();
+            coff += batchLen_;
+            lowRecip_ = poolF[coff];
+            coff += kFp32PerBlock;
+            msbRecip_ = poolF[coff];
+            coff += kFp32PerBlock;
+            msbWeight_ = poolF[coff];
+            coff += kFp32PerBlock;
+            packOffset_ = pool[coff].template ReinterpretCast<uint32_t>();
+            coff += len_;
+            centroid_ = poolF[coff];
+        }
 
         AscendC::LocalTensor<float> work = workBuf_.Get<float>();
-        off = 0;
-        expand_ = work[off];
-        off += batchLen_;
-        low_ = work[off];
-        off += batchLen_;
-        msb_ = work[off];
-        off += batchLen_;
-        scratch_ = work[off];
-        off += batchLen_;
+        uint32_t off = 0;
+        if constexpr (kIsAffine) {
+            // batchLen_ is an element count on this path, so the two byte-major
+            // buffers are half of it each; see the class comment.  Every base
+            // stays 32-byte aligned because vecLen is a multiple of 64.
+            expand_ = work[off];
+            off += batchLen_ / 2u;
+            msb_ = work[off];
+            off += batchLen_ / 2u;
+            low_ = work[off];
+            off += len_;
+            scratch_ = work[off];
+            off += len_;
+        } else {
+            expand_ = work[off];
+            off += batchLen_;
+            low_ = work[off];
+            off += batchLen_;
+            msb_ = work[off];
+            off += batchLen_;
+            scratch_ = work[off];
+            off += batchLen_;
+        }
         reduceWork_ = work[off];
         off += len_;
         broadcast_ = work[off];
@@ -229,7 +302,9 @@ public:
      *                                 whole 32B block, so back it with 8 lanes.
      *
      * The codebook gain is not applied here: it lives in the stored centroids
-     * and comes back out of the scale on the decode side.
+     * and comes back out of the scale on the decode side.  On the affine path
+     * there are no stored centroids and the same field is 1 / step, which the
+     * uniform thresholds already carry -- so again nothing is applied here.
      */
     __aicore__ inline void Encode(const AscendC::LocalTensor<int8_t> &dstPacked,
                                   const AscendC::LocalTensor<float> &src,
@@ -302,9 +377,13 @@ public:
             AscendC::PipeBarrier<PIPE_V>();
         }
 
-        PackLowPlane(dstPacked, low_, n);
-        if constexpr (kHasMsbPlane) {
-            PackMsbPlane(dstPacked[LowPlaneBytes(len_)], msb_, n);
+        if constexpr (kIsAffine) {
+            PackAffinePlane(dstPacked, low_, n);
+        } else {
+            PackLowPlane(dstPacked, low_, n);
+            if constexpr (kHasMsbPlane) {
+                PackMsbPlane(dstPacked[LowPlaneBytes(len_)], msb_, n);
+            }
         }
     }
 
@@ -321,6 +400,7 @@ public:
     __aicore__ inline void Unpack(const AscendC::LocalTensor<OperandT> &dst,
                                   const AscendC::LocalTensor<int8_t> &srcPacked, int rows, int len)
     {
+        static_assert(!kIsAffine, "an affine mode expands through UnpackAffine; it has no centroid table");
         const uint32_t n = static_cast<uint32_t>(rows) * static_cast<uint32_t>(len);
         const uint32_t packedBytes =
             static_cast<uint32_t>(rows) * PackedBytes(static_cast<uint32_t>(len));
@@ -366,6 +446,76 @@ public:
         CastToOperand(dst, low_, n);
     }
 
+    /*
+     * The affine expand: `bytes` packed bytes -> 2 * `bytes` operand elements,
+     * with no Gather and no table.
+     *
+     *   dstLow    [bytes] the low nibbles, i.e. coordinates [0, len/2) of each
+     *                     vector the byte run covers
+     *   dstHigh   [bytes] the high nibbles, coordinates [len/2, len)
+     *   srcPacked [bytes] int8, the packer's byte biased by -128
+     *
+     * Three properties make this the whole of milestone 1 and the enabler of
+     * milestone 2:
+     *
+     *   * no centroid Gather.  The code IS the level: dst = q - kAffineBias, an
+     *     Adds, and the quantizer step lives in TurboQuantModeTraits::kGain,
+     *     which the decode already divides the per-vector scale by.
+     *   * no byte-addressing Gather.  Plane-split packing (see the file header)
+     *     makes both nibble planes contiguous runs, so the split is two integer
+     *     shifts over the whole run.
+     *   * the caller chooses where each plane lands.  Nothing here knows about
+     *     rows, tiles or NZ, which is what lets the decode point dstLow and
+     *     dstHigh at two contiguous C0-block runs of an already-NZ L1 image.
+     *
+     * The -128 the packer applied is added back in fp32 before the integer view
+     * is taken; the low nibble is unaffected by it (128 = 8 << 4) but the high
+     * one is not.  The shifts run on a uint32 view because ShiftRight there is
+     * logical, which is what makes (b << 28) >> 28 a 4-bit mask.
+     */
+    template <typename OperandT>
+    __aicore__ inline void UnpackAffine(const AscendC::LocalTensor<OperandT> &dstLow,
+                                        const AscendC::LocalTensor<OperandT> &dstHigh,
+                                        const AscendC::LocalTensor<int8_t> &srcPacked, uint32_t bytes)
+    {
+        static_assert(kIsAffine, "UnpackAffine is only defined for a mode with uniform levels");
+        static_assert(!kHasMsbPlane, "an affine mode stores one plane; there is no msb digit to fold in");
+        static_assert(Planes::kLowPerByte == 2, "the plane split assumes two nibbles per byte");
+
+        // int8 -> fp32 through half, the only route the converter offers.  msb_
+        // is still free here, so it doubles as the half staging buffer.
+        AscendC::LocalTensor<half> halfView = msb_.ReinterpretCast<half>();
+        AscendC::Cast(halfView, srcPacked, AscendC::RoundMode::CAST_NONE, bytes);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Cast(expand_, halfView, AscendC::RoundMode::CAST_NONE, bytes);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Adds(expand_, expand_, kInt8Bias, bytes);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        AscendC::LocalTensor<int32_t> rawI = expand_.ReinterpretCast<int32_t>();
+        AscendC::Cast(rawI, expand_, AscendC::RoundMode::CAST_RINT, bytes);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        AscendC::LocalTensor<uint32_t> rawU = expand_.ReinterpretCast<uint32_t>();
+        AscendC::LocalTensor<uint32_t> hiU = msb_.ReinterpretCast<uint32_t>();
+        AscendC::ShiftRight(hiU, rawU, kNibbleShift, static_cast<int32_t>(bytes));
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::ShiftLeft(rawU, rawU, kNibbleClear, static_cast<int32_t>(bytes));
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::ShiftRight(rawU, rawU, kNibbleClear, static_cast<int32_t>(bytes));
+        AscendC::PipeBarrier<PIPE_V>();
+
+        AscendC::Cast(expand_, rawU.ReinterpretCast<int32_t>(), AscendC::RoundMode::CAST_NONE, bytes);
+        AscendC::Cast(msb_, hiU.ReinterpretCast<int32_t>(), AscendC::RoundMode::CAST_NONE, bytes);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Adds(expand_, expand_, -kAffineBias, bytes);
+        AscendC::Adds(msb_, msb_, -kAffineBias, bytes);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        CastToOperand(dstLow, expand_, bytes);
+        CastToOperand(dstHigh, msb_, bytes);
+    }
+
     // fp32 -> the mode's Cube operand type.  Both branches are exact.  The fp4
     // branch is two casts: the arch35 converter has no fp32 <-> fp4 leg.
     template <typename OperandT>
@@ -395,6 +545,10 @@ private:
     static constexpr float kEps = 1e-20f;
     static constexpr float kCentroidStride = static_cast<float>(sizeof(float));
     static constexpr uint32_t kSignBitShift = 31;
+    // The affine split: >> 4 takes the high nibble, and (x << 28) >> 28 on a
+    // uint32 view takes the low one.
+    static constexpr uint32_t kNibbleShift = static_cast<uint32_t>(Planes::kLowBits);
+    static constexpr uint32_t kNibbleClear = 32u - kNibbleShift;
 
     // floor() via the fp32 <-> int32 converter; the dedicated Floor intrinsic
     // is not available on every supported arch.  Same routine as
@@ -422,6 +576,26 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Add(x, x, scratch_, n);
         AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    /*
+     * The affine packer: fold the vector's two halves into one byte plane.
+     *
+     *     byte[b] = q[b] + kLowRadix * q[b + n/2]
+     *
+     * Entirely contiguous, so there is no packOffset_ Gather here either -- the
+     * interleaved packer below needs one because its digits are kLowPerByte
+     * apart.  This is the layout UnpackAffine undoes.
+     */
+    __aicore__ inline void PackAffinePlane(const AscendC::LocalTensor<int8_t> &dst,
+                                           const AscendC::LocalTensor<float> &digits, uint32_t n)
+    {
+        const uint32_t bytes = n / 2u;
+        AscendC::Muls(scratch_, digits[bytes], static_cast<float>(Planes::kLowRadix), bytes);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Add(expand_, digits, scratch_, bytes);
+        AscendC::PipeBarrier<PIPE_V>();
+        EmitBytes(dst, bytes);
     }
 
     /*
@@ -508,20 +682,26 @@ using TurboQuantCodecKv3Fp4 = TurboQuantModeCodec<TurboQuantMode::KV3_FP4>;
 using TurboQuantCodecKv4Fp8 = TurboQuantModeCodec<TurboQuantMode::KV4_FP8>;
 using TurboQuantCodecKv5Fp8 = TurboQuantModeCodec<TurboQuantMode::KV5_FP8>;
 
-// The named entry point of the kv4fp8 dequantization stage: packed 4-bit
-// indices in `srcPacked` -- two per byte, 128 bytes for a d=256 vector -- to
-// fp8_e4m3fn in `dst`, both in local UB memory.  A thin name over
-// TurboQuantModeCodec<KV4_FP8>::Unpack, which is the same routine kv5fp8 uses
-// with its msb plane compiled out: the nibble split is ExtractDigit at radix
-// 16, and the 16-entry Lloyd-Max table is the final Gather.  The fractal NZ
-// permutation is folded into that same UB Gather stage through lowOffset_,
-// which the host builds with nz_rows set; the unpack therefore emits NZ order
-// directly and the L1 stage is a strided DataCopy rather than a shuffle.
+// The named entry point of the kv4fp8 dequantization stage: packed symmetric
+// INT4 codes in `srcPacked` -- two nibbles per byte, 128 bytes for a d=256
+// vector -- to fp8_e4m3fn, in local UB memory throughout.  A thin name over
+// TurboQuantModeCodec<KV4_FP8>::UnpackAffine.
+//
+// There is NO codebook and NO Gather on this path: the stored nibble is the
+// reconstruction level (q - 7.5, exact in e4m3fn) and the quantizer step is
+// folded into the per-vector scale through TurboQuantModeTraits::kGain.  The
+// byte run is split into its two nibble planes with integer shifts, and because
+// the packing is plane-split the two planes come out as contiguous runs -- so
+// the caller places each with a flat DataCopy and nothing shuffles.
+//
+// `bytes` is a byte count, not a row count: the expand is byte-major and does
+// not need to know how many vectors the run spans.
 __aicore__ inline void unpack_tq4_to_fp8(TurboQuantCodecKv4Fp8 &codec,
-                                         const AscendC::LocalTensor<fp8_e4m3fn_t> &dst,
-                                         const AscendC::LocalTensor<int8_t> &srcPacked, int rows, int len)
+                                         const AscendC::LocalTensor<fp8_e4m3fn_t> &dstLow,
+                                         const AscendC::LocalTensor<fp8_e4m3fn_t> &dstHigh,
+                                         const AscendC::LocalTensor<int8_t> &srcPacked, uint32_t bytes)
 {
-    codec.Unpack(dst, srcPacked, rows, len);
+    codec.UnpackAffine(dstLow, dstHigh, srcPacked, bytes);
 }
 
 // The kv5fp8 twin: packed 5-bit indices -> fp8_e4m3fn.  The low plane is laid

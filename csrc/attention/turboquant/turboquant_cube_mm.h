@@ -29,14 +29,31 @@
  * 16, so the query heads sharing one kv head are batched into M to make a
  * [headsPerKv, D] x [D, rows] GEMM.
  *
- * Operands reach L1 already in NZ -- DataCopy(L1, UB, Nd2NzParams) does not
- * exist for 1-byte operands on arch35 -- so the unpack emits NZ order directly.
- * For C0 = 32 / sizeof(operand) elements,
+ * OPERANDS REACH L1 ALREADY IN NZ, AND THERE IS NO WAY AROUND THAT.  The L1 ->
+ * L0 path is MTE1 load2d, which addresses L1 as an image of 16 x C0 fractals:
+ * LoadData2DParamsV2::srcStride is a *fractal* count, and fractal (m, k) sits at
+ * (k * srcStride + m) * 512 bytes.  A fractal is not contiguous in a row-major
+ * buffer, so a flat ND L1 image cannot be sliced by load2d at any
+ * parameterisation -- CANN's own matmul agrees, converting ND to NZ on the
+ * GM -> L1 copy (CopyND2NZForInt8 in copy_tile_to_cube_common.h) rather than
+ * loading ND from L1.  For C0 = 32 / sizeof(operand) elements,
  *
  *     nz(r, c) = (c / C0) * rows * C0 + r * C0 + (c % C0)
  *
- * and a plain contiguous DataCopy then moves UB -> L1.  NzOffset() below is
- * that formula.
+ * and NzOffset() below is that formula.
+ *
+ * What differs between the modes is WHO applies that permutation, because
+ * DataCopy(L1, UB, Nd2NzParams) does not exist for 1-byte operands on arch35:
+ *
+ *   codebook (kv3fp4, kv5fp8)  the unpack's Gather emits NZ order -- its offset
+ *                              table is arbitrary, so this is free -- and a
+ *                              strided DataCopy places each band.
+ *   affine (kv4fp8)            there is no Gather to ride, so the permutation
+ *                              moves upstream into the GM -> UB tile read,
+ *                              which was strided anyway.  The unpack is then
+ *                              contiguous and the UB -> L1 copy is flat.  See
+ *                              CopyInTile and UnpackToL1 in
+ *                              turboquant_mm_kernels.cpp.
  *
  * The accumulator stays in UB, not in L0C: flash decoding rescales it by
  * exp(m_old - m_new) at every tile and that multiply has no expression on the
@@ -178,10 +195,12 @@ public:
      * K is staged as [n, k], which loads with one LoadData at ifTranspose
      * false.  See LoadBFromNk.
      *
-     * NOT YET VERIFIED, and the only part of this file that is not: this B form
-     * does not reproduce the host product in test_sim_950pr_cube_gemm, so the
-     * defect is confined to LoadBFromNk.  The fix is to stage K transposed and
-     * route through the proven [k, n] form of GemmContext.
+     * VERIFIED: test_sim_950pr_cube_gemm reports max|err| = 0 for this form.
+     * An earlier note here claimed it did not reproduce the host product and
+     * prescribed staging K transposed; that was the all-zero product caused by
+     * the missing V -> MTE3 handshake on the UB -> L1 staging (see
+     * SyncVectorToMte3), which is indistinguishable from a wrong fractal layout
+     * because nothing faults.  Both B forms were correct the whole time.
      */
     __aicore__ inline void GemmScores(const AscendC::LocalTensor<float> &dstUb, uint32_t m, uint32_t k, uint32_t n)
     {

@@ -24,9 +24,22 @@
  *   kv5fp8     5      32         160          fp8 e4m3fn    mad
  *
  * All three share one pipeline: the AIV rotates with Pi = D H D, bins the
- * coordinates against a Lloyd-Max table for N(0,1) at kBits, packs, and later
- * expands through a LUT straight onto the Cube's operand grid; the Cube runs
+ * coordinates against a table of decision boundaries for N(0,1) at kBits,
+ * packs, and later expands straight onto the Cube's operand grid; the Cube runs
  * two GEMMs with fp32 accumulate; the AIV un-rotates the accumulator.
+ *
+ * WHAT SEPARATES kv4fp8 FROM THE OTHER TWO: it is *affine*.  Its 16 levels are
+ * uniform, so the stored 4-bit code is the reconstruction level and not an
+ * index into a table -- the operand is q - kAffineBias, which the decoder
+ * reaches with one Adds.  kv3fp4 and kv5fp8 store a Lloyd-Max index and expand
+ * it through a centroid Gather in UB.
+ *
+ * The affine form costs 0.746 dB of codebook SNR against Lloyd-Max at 16 levels
+ * (D 0.011543 against 0.009720) and the attention cosine barely notices:
+ * 0.9864 against 0.9894 at S = 64 and 0.9863 against 0.9863 at S = 512, both
+ * measured by scripts/tq_multimode_calibration.py.  What it buys is the whole
+ * expand stage -- see TurboQuantModeCodec::UnpackAffine, which has no Gather at
+ * all where the codebook path has two.
  *
  * On arch35 MmadCal dispatches to mad_mx for
  * <float, fp4x2_e2m1_t, fp4x2_e2m1_t> and to mad for
@@ -37,7 +50,10 @@
  * The stored table is cast(g * c) for a per-mode gain g, and the decoder
  * reconstructs (s / g) * lut[q], folding 1/g into the per-vector scale it
  * already multiplies by.  Without the gain a Lloyd-Max codebook's centroids are
- * not grid points of e2m1 or e4m3fn.
+ * not grid points of e2m1 or e4m3fn.  For an affine mode the same field carries
+ * the reciprocal of the quantizer step: the levels are the integers q - bias,
+ * which are exact in e4m3fn for every q, and g = 1 / step is what turns them
+ * back into coordinates.
  *
  * The tables below are generated:
  *
@@ -62,7 +78,8 @@ namespace turboquant {
 enum class TurboQuantMode : int32_t {
     // 3-bit storage, 8 centroids, expanded to fp4 e2m1 for Cube mad_mx.
     KV3_FP4 = 3,
-    // 4-bit storage, 16 centroids, expanded to fp8 e4m3fn for Cube mad.
+    // 4-bit storage, 16 uniform levels, expanded to fp8 e4m3fn for Cube mad.
+    // The only affine rate: the code IS the level, so there is no codebook.
     KV4_FP8 = 4,
     // 5-bit storage, 32 centroids, expanded to fp8 e4m3fn for Cube mad.
     // The primary target: the cheapest rate that clears cos > 0.995.
@@ -101,10 +118,17 @@ struct TurboQuantModeConfig {
     // The packing unit.
     int32_t elems_per_group;
     int32_t bytes_per_group;
-    // cast(g * c) is the stored codebook and (s / g) the effective scale.
+    // cast(g * c) is the stored codebook and (s / g) the effective scale.  For
+    // an affine mode this is 1 / step; see the file header.
     float codebook_gain;
     // What the codebook delivers on N(0,1) after the cast, E[(X - Q(X))^2].
     float distortion;
+    // Whether the levels are uniform, so the code is the level and the expand
+    // needs no centroid table.  True for kv4fp8 only.
+    bool is_affine;
+    // The offset subtracted from a code to reach its level, (levels - 1) / 2 for
+    // a midrise quantizer.  Meaningless when is_affine is false.
+    float affine_bias;
 
     // Packed bytes for one vector of `head_size` coordinates.
     constexpr int64_t PackedBytes(int64_t head_size) const
@@ -158,6 +182,8 @@ struct TurboQuantModeTraits<TurboQuantMode::KV3_FP4> {
     static constexpr int32_t kBytesPerGroup = 3;
     static constexpr float kGain = 2.7881744355f;
     static constexpr float kDistortion = 0.0384442586f;
+    static constexpr bool kIsAffine = false;
+    static constexpr float kAffineBias = 0.0f;
 
     // Every entry is an exact fp4 e2m1 grid point: {0, .5, 1, 1.5, 2, 3, 4, 6}
     // and negatives.  The gain search collapsed the innermost Lloyd-Max pair
@@ -184,22 +210,38 @@ struct TurboQuantModeTraits<TurboQuantMode::KV4_FP8> {
     static constexpr int32_t kLevels = 16;
     static constexpr int32_t kElemsPerGroup = 2;
     static constexpr int32_t kBytesPerGroup = 1;
-    static constexpr float kGain = 2.1609589041f;
-    static constexpr float kDistortion = 0.0097203519f;
+    // 1 / step for the optimal 16-level uniform midrise quantizer of N(0,1):
+    // step = 0.3352006, clipping at +-7.5 step = +-2.514 sigma.  Searched by
+    // scripts/tq_multimode_calibration.py.
+    static constexpr float kGain = 2.9832882881f;
+    static constexpr float kDistortion = 0.0115428844f;
+    static constexpr bool kIsAffine = true;
+    static constexpr float kAffineBias = 7.5f;
 
+    // The levels are the integers q - 7.5, and every one of the sixteen is an
+    // exact fp8_e4m3fn value (7.5 = 1.875 * 4, three mantissa bits), so the
+    // cast onto the operand grid is lossless and the step lives entirely in
+    // kGain.  The table is kept because the host mirror and the distortion
+    // figure are quoted against it; the device does NOT read it -- see
+    // TurboQuantModeCodec::UnpackAffine, where the whole expand is one Adds.
     static constexpr float kCentroids[kLevels] = {
-        -6.0000000000f, -4.5000000000f, -3.5000000000f, -2.7500000000f,
-        -2.0000000000f, -1.3750000000f, -0.8125000000f, -0.2812500000f,
-        +0.2812500000f, +0.8125000000f, +1.3750000000f, +2.0000000000f,
-        +2.7500000000f, +3.5000000000f, +4.5000000000f, +6.0000000000f,
+        -7.5000000000f, -6.5000000000f, -5.5000000000f, -4.5000000000f,
+        -3.5000000000f, -2.5000000000f, -1.5000000000f, -0.5000000000f,
+        +0.5000000000f, +1.5000000000f, +2.5000000000f, +3.5000000000f,
+        +4.5000000000f, +5.5000000000f, +6.5000000000f, +7.5000000000f,
     };
-    // Identical to TurboQuantCodec<4>::Threshold, which is the contract that
-    // lets a cache written by the shipping 4-bit encoder be read by this path.
+    // Uniform boundaries, (i - 7) * step.  NOT the same table as
+    // TurboQuantCodec<4>::Threshold any more: a cache written by the shipping
+    // AIV-only 4-bit encoder is a Lloyd-Max *index* cache and cannot be read by
+    // this path, and vice versa.  The two are separate caches with separate
+    // kernels, so there is nothing to keep compatible -- but the pair
+    // (kThresholds, kCentroids, kGain) has to stay internally consistent, which
+    // is what --emit-header guarantees.
     static constexpr float kThresholds[kLevels - 1] = {
-        -2.4008033988f, -1.8435318063f, -1.4371387917f, -1.0992858269f,
-        -0.7995497875f, -0.5224037090f, -0.2582216647f, +0.0000000000f,
-        +0.2582216647f, +0.5224037090f, +0.7995497875f, +1.0992858269f,
-        +1.4371387917f, +1.8435318063f, +2.4008033988f,
+        -2.3464041433f, -2.0112035514f, -1.6760029595f, -1.3408023676f,
+        -1.0056017757f, -0.6704011838f, -0.3352005919f, +0.0000000000f,
+        +0.3352005919f, +0.6704011838f, +1.0056017757f, +1.3408023676f,
+        +1.6760029595f, +2.0112035514f, +2.3464041433f,
     };
 };
 
@@ -214,6 +256,8 @@ struct TurboQuantModeTraits<TurboQuantMode::KV5_FP8> {
     static constexpr int32_t kBytesPerGroup = 5;
     static constexpr float kGain = 2.2064579256f;
     static constexpr float kDistortion = 0.0028686787f;
+    static constexpr bool kIsAffine = false;
+    static constexpr float kAffineBias = 0.0f;
 
     // Every entry is an exact fp8_e4m3fn value.  The cast costs 0.589 dB of
     // codebook SNR here against 0.099 dB at 16 levels -- a 32-level codebook
@@ -253,12 +297,12 @@ constexpr TurboQuantModeConfig TurboQuantModeConfigOf(TurboQuantMode mode)
 {
     return mode == TurboQuantMode::KV3_FP4
                ? TurboQuantModeConfig{TurboQuantMode::KV3_FP4, TurboQuantOperand::kFp4E2m1, 3, 8, 8, 3,
-                                      2.7881744355f, 0.0384442586f}
+                                      2.7881744355f, 0.0384442586f, false, 0.0f}
            : mode == TurboQuantMode::KV4_FP8
                ? TurboQuantModeConfig{TurboQuantMode::KV4_FP8, TurboQuantOperand::kFp8E4m3fn, 4, 16, 2, 1,
-                                      2.1609589041f, 0.0097203519f}
+                                      2.9832882881f, 0.0115428844f, true, 7.5f}
                : TurboQuantModeConfig{TurboQuantMode::KV5_FP8, TurboQuantOperand::kFp8E4m3fn, 5, 32, 8, 5,
-                                      2.2064579256f, 0.0028686787f};
+                                      2.2064579256f, 0.0028686787f, false, 0.0f};
 }
 
 constexpr bool TurboQuantModeIsValid(int32_t raw)
