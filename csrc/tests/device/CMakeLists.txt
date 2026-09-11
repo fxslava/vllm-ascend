@@ -114,6 +114,22 @@ if(VLLM_ASCEND_TESTS_HAVE_TURBOQUANT)
     PRIVATE VLLM_ASCEND_TEST_TIER="device")
   vllm_ascend_register_correctness_test(test_device_950pr_turboquant_multimode 900 TRUE)
   list(APPEND VLLM_ASCEND_DEVICE_TESTS test_device_950pr_turboquant_multimode)
+
+  # The Cube-Hadamard spike's shape sweep: D in {64, 128, 256, 512} by V in
+  # {1, 8, 16, 32}, three hybrid variants and an AIV-only baseline, all against
+  # the CPU golden. It drives a test-owned kernel (sim/sim_hadamard_hybrid_kernels.cpp,
+  # carried by the same ascendc_library) and touches nothing on the decode path.
+  #
+  # It lives in the device tier because of arithmetic, not preference: the sim
+  # tier's copy of this check runs ONE shape and takes around 40 seconds on the
+  # camodel, and 64 of them is most of a day. See the header of the sim file.
+  vllm_ascend_add_device_executable(test_device_950pr_cube_hadamard
+                                    test_device_950pr_cube_hadamard.cpp
+                                    ../common/main_950pr.cpp)
+  target_link_libraries(test_device_950pr_cube_hadamard PRIVATE vllm_ascend_test_turboquant)
+  target_compile_definitions(test_device_950pr_cube_hadamard PRIVATE VLLM_ASCEND_TEST_TIER="device")
+  vllm_ascend_register_correctness_test(test_device_950pr_cube_hadamard 900 TRUE)
+  list(APPEND VLLM_ASCEND_DEVICE_TESTS test_device_950pr_cube_hadamard)
 endif()
 
 message(STATUS "vllm-ascend tests: [device] ${VLLM_ASCEND_DEVICE_TESTS}")
@@ -149,6 +165,28 @@ if(VLLM_ASCEND_TESTS_BUILD_BENCHMARKS AND VLLM_ASCEND_TESTS_HAVE_TURBOQUANT)
       # Wall clock, not device time: 1300+ launches per case across every shape.
       TIMEOUT 1800)
   endforeach()
+
+  # The Cube-Hadamard sweep. It takes its own entry point rather than
+  # ../common/bench_main_950pr.cpp because it accepts --csv=<path> on the
+  # command line and writes a CSV by default: the sweep is 16 shapes by 4 legs
+  # and is meant to be plotted, not read off a terminal. Everything else about
+  # the run - the SoC check, the camodel refusal, the ASCEND_BENCH_* parses - is
+  # the shared harness.
+  vllm_ascend_add_device_executable(bench_950pr_cube_hadamard
+                                    bench_950pr_cube_hadamard.cpp
+                                    bench_main_950pr_hadamard.cpp)
+  target_link_libraries(bench_950pr_cube_hadamard PRIVATE vllm_ascend_test_turboquant)
+  target_compile_definitions(bench_950pr_cube_hadamard PRIVATE VLLM_ASCEND_TEST_TIER="device")
+  add_dependencies(benchmarks bench_950pr_cube_hadamard)
+  list(APPEND VLLM_ASCEND_DEVICE_BENCHMARKS bench_950pr_cube_hadamard)
+
+  add_test(NAME bench_950pr_cube_hadamard COMMAND bench_950pr_cube_hadamard)
+  set_tests_properties(bench_950pr_cube_hadamard PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=${VLLM_ASCEND_TEST_LIBRARY_PATH};ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
+    LABELS "benchmark;${VLLM_ASCEND_TEST_TIER_LABEL}"
+    SKIP_RETURN_CODE 77
+    # 16 shapes x 4 legs x (warmup + 100 timed iterations), all tiny kernels.
+    TIMEOUT 1800)
 
   message(STATUS "vllm-ascend tests: [device] ${VLLM_ASCEND_DEVICE_BENCHMARKS}")
 endif()
