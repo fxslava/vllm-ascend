@@ -674,7 +674,17 @@ if(VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE)
     # kernel whose generated launcher is in the same ascendc_library.
     set(VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE
         "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/turboquant_kernels.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/turboquant_mm_kernels.cpp")
+        "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/turboquant_mm_kernels.cpp"
+        # Test-owned device code, and the one source in this list the wheel does
+        # not build - the root CMakeLists.txt names only the two above. It is an
+        # exploratory spike (a Cube-factorised Walsh-Hadamard, see its header)
+        # and it rides in this library rather than one of its own because a
+        # <<<>>> call site can only reach a kernel whose generated launcher is
+        # in the same ascendc_library. Nothing in csrc/attention/ includes it.
+        # Driven by sim/test_sim_950pr_cube_hadamard.cpp at one shape and by
+        # device/test_device_950pr_cube_hadamard.cpp over the whole sweep, so it
+        # has to be in the library both tiers link.
+        "${CMAKE_CURRENT_SOURCE_DIR}/sim/sim_hadamard_hybrid_kernels.cpp")
 
     foreach(kernel_source ${VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE})
       if(NOT EXISTS "${kernel_source}")

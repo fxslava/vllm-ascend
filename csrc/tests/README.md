@@ -54,7 +54,9 @@ csrc/tests/
 |
 |-- sim/                    TIER 2 -- CAModel only; links libruntime_camodel.so
 |   |-- test_sim_950pr_turboquant_kernels.cpp
-|   `-- test_sim_950pr_turboquant_decode.cpp
+|   |-- test_sim_950pr_turboquant_decode.cpp
+|   |-- test_sim_950pr_cube_hadamard.cpp          spike: one shape of the sweep below
+|   `-- sim_hadamard_hybrid_kernels.cpp           spike: test-owned Ascend C, not the decode
 |
 |-- device/                 TIER 3 -- physical 950PR silicon; every timing
 |   |-- test_device_950pr_turboquant.cpp          production shapes, camodel refused
@@ -64,6 +66,9 @@ csrc/tests/
 |   |-- test_device_950pr_activation_swiglu.cpp
 |   |-- test_device_950pr_qwen_layer_golden.cpp
 |   |-- test_device_950pr_benchmark_harness.cpp   needs no device; links acl.h
+|   |-- test_device_950pr_cube_hadamard.cpp       spike: D x V sweep against the CPU golden
+|   |-- bench_950pr_cube_hadamard.cpp             spike: the same sweep, timed, --csv=
+|   |-- bench_main_950pr_hadamard.cpp             its entry point; only it takes argv
 |   `-- bench_device_950pr_turboquant.cpp         the AIV-only baseline
 |
 `-- device_310p/            the 310P leg -- NOT configured under a 950PR SoC
@@ -85,6 +90,7 @@ csrc/tests/
 | `device_tensor.hpp` | device buffer + aclTensor descriptor, with host conversions |
 | `fp16.hpp` | IEEE-754 binary16 conversion, round-to-nearest-even |
 | `golden_layer3.hpp` / `.cpp` | LFS-aware loader for the layer-3 dump |
+| `hadamard_spike.hpp` | the Cube-Hadamard spike's constant images, chunk planning and launchers. Exploratory; not on the decode path |
 | `main.cpp` / `main_950pr.cpp` | test entry points; the 950PR one prints its tier and whether a camodel is loaded |
 | `partial_rotary_950pr.hpp` / `.cpp` | partial RoPE: custom operator, else packed stock operator |
 | `qwen_shapes.hpp` | Qwen3.5 shapes and the 310P alignment rules |

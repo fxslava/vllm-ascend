@@ -51,6 +51,10 @@ set(VLLM_ASCEND_SIM_TESTS
   # argument order, Fixpipe output layout. Seconds, not minutes, and it is what
   # every other Cube case here depends on being right.
   test_sim_950pr_cube_gemm
+  # Exploratory spike, isolated from the decode: a D = 256 Walsh-Hadamard whose
+  # lower four butterfly stages are one Cube Mmad. Drives its own kernel source
+  # (sim_hadamard_hybrid_kernels.cpp in this directory), not the decode's.
+  test_sim_950pr_cube_hadamard
   test_sim_950pr_turboquant_kernels
   test_sim_950pr_turboquant_decode
   # Single-shot dispatch + fidelity smoke of the Cube-native multi-mode decode.
