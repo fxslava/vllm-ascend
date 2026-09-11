@@ -156,16 +156,22 @@ option(VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS
 # VLLM_ASCEND_TQ_CUBE_WIP overrides this at run time in BOTH directions, so a
 # tree configured with it ON can still be asked for the stable baseline.
 #
+# SCOPE: the sim tier only. bench_device_950pr_turboquant runs its Cube legs by
+# default and is not affected by this option; VLLM_ASCEND_TQ_CUBE_WIP=0 is what
+# drops them there. The L0 allocation defect that made those legs fault is
+# fixed; what remains open is the score GEMM's operand form, which is a wrong
+# number rather than a dead stream, and the benchmark says so on every run.
+#
 # Delete the option, and the gates it feeds, when the Cube path works.
 option(VLLM_ASCEND_TESTS_ENABLE_WIP_CUBE
-       "Run the work-in-progress Cube decode cases by default (they are compiled either way)" OFF)
+       "Run the work-in-progress Cube sim cases by default (they are compiled either way)" OFF)
 
 if(VLLM_ASCEND_TESTS_ENABLE_WIP_CUBE)
   add_compile_definitions(VLLM_ASCEND_TQ_CUBE_WIP_DEFAULT_ON)
   message(WARNING
-    "vllm-ascend tests: VLLM_ASCEND_TESTS_ENABLE_WIP_CUBE=ON - the Cube-native decode cases will run "
-    "by default. That path is known not to pass (TURBOQUANT_TESTS.md section 13.8); expect a stream "
-    "fault rather than a wrong number.")
+    "vllm-ascend tests: VLLM_ASCEND_TESTS_ENABLE_WIP_CUBE=ON - the Cube-native sim cases will run "
+    "by default. That path does not yet reproduce the host product (TURBOQUANT_TESTS.md section "
+    "13.8); treat what it computes as provisional.")
 endif()
 
 # How the Ascend C kernels are built and where they run.

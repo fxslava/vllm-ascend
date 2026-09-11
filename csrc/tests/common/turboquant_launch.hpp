@@ -86,9 +86,9 @@ void turboquant_mm_decode_split_impl(int32_t mode, AscendType type, void *stream
                                      uint32_t numSplits, uint32_t tasksPerCore, float scale, float invSqrtLen);
 
 /*
- * The physical fp16 baseline the benchmark compares kv5fp8 against: the same
- * Cube decode over an unquantised fp16 paged cache. Split then combine, two
- * launches on one stream.
+ * The physical fp16 baseline the benchmark compares every quantised Cube rate
+ * against -- kv4fp8 and kv5fp8 both: the same Cube decode over an unquantised
+ * fp16 paged cache. Split then combine, two launches on one stream.
  */
 void turboquant_fp16_decode_impl(AscendType type, void *stream, uint32_t splitBlockDim, uint32_t combineBlockDim,
                                  void *query, void *keyCache, void *valueCache, void *blockTables,
@@ -102,7 +102,7 @@ void turboquant_fp16_decode_impl(AscendType type, void *stream, uint32_t splitBl
 // csrc/tests/sim/test_sim_950pr_cube_gemm.cpp.
 void turboquant_cube_gemm_probe_impl(void *stream, void *a, void *b, void *c, uint32_t m, uint32_t k, uint32_t n,
                                      uint32_t headSize, uint32_t tileRows, uint32_t aElems, uint32_t bElems,
-                                     uint32_t cElems, uint32_t bIsNk);
+                                     uint32_t cElems, uint32_t bIsNk, uint32_t variant);
 
 namespace test {
 namespace turboquant_host {

@@ -902,58 +902,85 @@ accumulator was never rotated, so un-rotating it would be wrong.
 | case | what it times | default |
 |---|---|---|
 | `tq4_write_s<S>` / `tq4_decode_s<S>` | the AIV-only 4-bit path, unchanged | **runs** |
-| `kv5fp8_write_s<S>` | the 5-bit cache write: rotate, encode, scatter | skipped (WIP) |
-| `kv5fp8_decode_s<S>` | the Cube-native decode, split then combine | skipped (WIP) |
-| `fp16_decode_s<S>` | the physical fp16 Cube baseline | skipped (WIP) |
+| `kv4fp8_write_s<S>` | the 4-bit cache write through the multi-rate codec | **runs** |
+| `kv4fp8_decode_s<S>` | the Cube-native 4-bit decode, split then combine | **runs** |
+| `fp16_decode_s<S>` | the physical fp16 Cube baseline | **runs** |
 
-**The three Cube legs are gated off by default**, and the default run of this
-binary is the verified 4-bit AIV path alone. The reason is §13.8's fifth defect:
-the split kernel does not return a wrong number that a checksum would catch, it
-faults. A faulting launch takes the stream down and every case queued behind it
-on that stream with it, so the cases that already produced samples are lost too
-- which means the gate cannot be an inspection of the results and has to be
-before the launch. The gate is therefore also *before construction*: a gated run
-never allocates the second and third KV caches either.
+**All four legs run by default.** The gate that used to hold the Cube legs shut
+was §13.8's fifth defect - `TurboQuantCubeMm::Init` allocating L0A/L0B/L0C on
+both halves of the MIX kernel, which faulted the AIV half rather than returning
+a wrong number - and that defect is closed. Both Cube kernels now allocate L1 on
+both cores and L0 under `ASCEND_IS_AIC`; the same split was applied to
+`TurboQuantFp16DecodeSplit::Init`, which had it too and would have taken the
+fp16 baseline down with it.
 
-The switch is one thing in two places:
+What is still open is the score GEMM's operand form, and that is a wrong number
+rather than a dead stream: the launch completes and the checksum is stable, so
+it cannot take the queue down behind it. **The benchmark says so on every run**,
+in the banner and again at the foot of the summary, because the summary is the
+part that gets pasted into a report. Treat every Cube column as provisional
+until §13.8's open defect is closed.
+
+`VLLM_ASCEND_TQ_CUBE_WIP=0` drops the Cube legs, which is what to reach for if a
+future defect does fault: a faulting launch takes the stream down and every case
+queued behind it, so the switch is before the launch, and before *construction*
+too - a dropped run never allocates the second and third KV caches either.
 
 ```bash
-VLLM_ASCEND_TQ_CUBE_WIP=1 ./bench_device_950pr_turboquant   # add the Cube legs
-cmake ... -DVLLM_ASCEND_TESTS_ENABLE_WIP_CUBE=ON            # flip the default
+VLLM_ASCEND_TQ_CUBE_WIP=0 ./bench_device_950pr_turboquant   # AIV-only baseline
 ```
 
-The same environment variable is what `REQUIRE_CUBE_WIP_OPT_IN` reads in
-`test_sim_950pr_cube_gemm` and `test_sim_950pr_turboquant_multimode`, so one
-setting turns the work-in-progress path on everywhere it appears. It overrides
-the CMake default in both directions - `VLLM_ASCEND_TQ_CUBE_WIP=0` gets the
-stable baseline out of a tree configured with the option ON. The Cube sources
-are **compiled in every configuration** regardless; the gate decides what
-launches, not what builds, so the path keeps building clean under `-Werror`
-while it is being fixed.
+`-DVLLM_ASCEND_TESTS_ENABLE_WIP_CUBE=ON` is now **sim-tier only**: it flips the
+default that `REQUIRE_CUBE_WIP_OPT_IN` reads in `test_sim_950pr_cube_gemm` and
+`test_sim_950pr_turboquant_multimode`, and no longer has anything to say about
+this binary. The environment variable is still read by both tiers, so setting it
+explicitly keeps them in step. The Cube sources are **compiled in every
+configuration** regardless; the switch decides what launches, not what builds.
 
-A gated run still prints the traffic model in full, including the kv5 rate:
-that is arithmetic over the layouts and needs no launch. What it cannot print is
-any measured column, and the summary says so in those words rather than leaving
-the reader to interpret a row of dashes.
+**kv3fp4 and kv5fp8 have no leg here.** Both are still built, still dispatched
+and still covered by the sim tier. Neither is on the 4-bit path this binary
+measures, and a column for each was another KV cache of the same shape per
+context length for a comparison nothing was asking of a benchmark whose subject
+is the 4-bit ecosystem. `kv5fp8`'s fidelity - the one that clears cos > 0.995 -
+is measured by `scripts/tq_multimode_calibration.py` and recorded in §13.3, not
+here.
 
-`test_device_950pr_turboquant`, the bare-metal correctness binary, needs no gate
-of its own: it drives `turboquant_kernels.cpp` only and calls nothing in
+`test_device_950pr_turboquant`, the bare-metal correctness binary, needs no
+switch of its own: it drives `turboquant_kernels.cpp` only and calls nothing in
 `turboquant_mm_kernels.cpp`. Keep it that way.
 
-With the gate open the summary prints decode-step latency (µs), steps/s,
-effective KV bandwidth (GB/s) and TFLOP/s for `kv5fp8`, and the speedup of both
-quantised legs against the measured fp16 leg. A failure in the fp16 case is then
-recorded as a **failure** and not a skip: it is a kernel in the same binary, so
-if it does not run, something is broken rather than missing. That is a different
-thing from the gated skip, which is a decision taken before any launch.
+The summary prints two tables. The first is the three-way comparison at a fixed
+context length -
 
-The traffic model is printed either way and is still not a measurement. The kv5
-rate gets its own table rather than three more columns on the 4-bit one, because
+| column | what it is |
+|---|---|
+| `tq4 us` | the AIV-only 4-bit decode |
+| `kv4 us` | the Cube-native 4-bit decode |
+| `fp16 us` | the unquantised fp16 Cube decode |
+| `kv4:fp16` | what the 4-bit cache buys against no quantisation |
+| `kv4:tq4` | what the Cube buys against the vector cores at a fixed rate |
+
+- and the second is the derived rates for the `kv4fp8` leg: steps/s, effective
+KV bandwidth (GB/s) and TFLOP/s. Those have no meaning for `tq4`, which reads a
+different number of bytes, and none for `fp16`, whose bytes are the baseline.
+
+`kv4:tq4` is the ratio the pair exists to produce. `tq4` and `kv4fp8` store
+**identical nibbles against identical thresholds** - `TurboQuantModeTraits<KV4_FP8>`'s
+thresholds *are* `TurboQuantCodec<4>::Threshold` - so the codec is held fixed
+across it and what varies is the Cube against the vector cores. A failure in the
+fp16 case is recorded as a **failure** and not a skip: it is a kernel in the
+same binary, so if it does not run, something is broken rather than missing.
+That is a different thing from the dropped-leg skip, which is a decision taken
+before any launch.
+
+The traffic model is printed either way and is still not a measurement. The kv4
+rate gets its own table rather than two more columns on the 4-bit one, because
 one line of it is easy to misread: the Cube decode reads each cached row once
 per *kv* head rather than once per query head, since the query heads of a group
 are batched into M. That is a property of the task decomposition, not of the
-rate, and it is why the kv5 decode-read column is not the tq4 one scaled by
-128:160.
+rate, and it is why the kv4 decode-read column is not the tq4 one - **the two
+cache footprints are identical**, byte for byte, and only the decode-read column
+separates them.
 
 ### 13.8 What has actually been executed, and what has not
 
@@ -964,17 +991,50 @@ rate, and it is why the kv5 decode-read column is not the tq4 one scaled by
 | `test_sim_950pr_turboquant_multimode` | arch35 camodel, `S=16` | **Run twice.** The first run found the four defects listed below and was aborted by them. The second, with those fixed, dispatches `kv5fp8` (the mode banner prints, so the launch reached the device) and then stalls in the split kernel on `pem_lsu: unrecognize ldst addr` with `ldst_addr: 2` — a load/store to a nonsense address on the cube core. **No mode has completed a pass.** |
 | `bench_device_950pr_turboquant` | — | **Compiled for `RUN_MODE=npu`, never executed.** Its three Cube legs are additionally gated off by default (§13.7), so even the first run on silicon reports the 4-bit path alone until the defects below are closed. No Ascend 950PR silicon has been available to this project at any point; the camodel is explicitly barred from multi-iteration timing. Every number in §13.7's table is therefore a column the binary will fill on the first machine that has the part, and none of them exist yet. |
 
-**The open defect, stated plainly.** The score GEMM's B operand is staged
-`[n, k]` and that path does not reproduce the host product, so the `kv5fp8`
-decode computes a wrong score row. Everything the two GEMM forms share — the NZ
-layout, `Mmad`'s argument order, Fixpipe's parameters, the cross-pipe
-synchronisation — is proven by the case that passes exactly, so what is wrong is
-confined to `LoadBFromNk`. The fix is known and is not a parameter tweak: route
-this GEMM through the proven `[k, n]` form by staging K transposed, which costs
-nothing at run time (the unpack's Gather table is arbitrary) but needs the
-unpack re-tiled from `(8 rows x head_size)` to `(32 rows x 64 channels)` so each
-chunk lands as one contiguous run in the transposed image, plus one offset table
-per channel chunk.
+**CLOSED, and the diagnosis above was wrong.** This section previously said the
+score GEMM's `[n, k]` B operand does not reproduce the host product and
+prescribed staging K transposed with the unpack re-tiled. That is a large
+redesign for a defect that does not exist, and it misdirected a full session of
+work. **Both B forms were always correct.** `test_sim_950pr_cube_gemm` now
+reports `max|err| = 0` for the score GEMM (`[n,k]`, one load) and the context
+GEMM (`[k,n]`, mStep = 2 chunks), plus a repeated-launch case. A sweep of nine
+alternative parameterisations of `LoadBFromKn` produced an all-zero L0B for every
+one of them, and CANN's own `load_to_l0b_load2dV2.h` confirms the shipping
+parameters exactly (`HW_M0 = ALIGN_NUM = BLOCK_CUBE = 16`, and
+`CeilAlign(a,b) = Ceil(a,b)*b`, so `dstAddrStride` is `CeilAlign(n,16)*32`).
+
+**What was actually wrong: no V -> MTE3 synchronisation on any UB -> L1 staging
+copy.** Every Cube operand is produced by vector work -- the codec's unpack, the
+query cast, the softmax's probability row -- and then moved UB -> L1 by
+`DataCopy`, which is MTE3. `PipeBarrier<PIPE_V>` orders V against V and nothing
+else, exactly as `PipeBarrier<PIPE_MTE1>` fails to order MTE1 against M (§13.5).
+Without an explicit `HardEvent::V_MTE3` set/wait the DMA read each buffer before
+the vector writes landed and staged **zeros**, so `Mmad` multiplied an empty
+operand and Fixpiped an all-zero product. Nothing faulted, and an all-zero
+product is indistinguishable from a wrong fractal layout -- which is how this
+section came to blame the wrong thing.
+
+`SyncVectorToMte3()` now guards all four hand-offs: the query in `PrepareTask`,
+each unpacked K **and V** band in `UnpackToL1`, and the probability row in both
+kernels' `Softmax`. The same idiom is in CANN's `matmul_client.h`.
+
+**Result, measured on the arch35 camodel at S = 64, head_dim 256, block 128:**
+
+| metric | before | after |
+|---|---|---|
+| `cos` vs the fp32 host reference | `nan` | **0.982351** |
+| `vec_err_idata_inf_nan` | 310 | **0** |
+| hard faults / `core*.excp_log.dump` | 0 / 0 B | 0 / 0 B |
+
+`scripts/tq_multimode_calibration.py` measures 0.98785 for this rate at S = 512,
+so the device is landing where the host model says it should. The `kv4fp8` leg
+of `test_sim_950pr_turboquant_multimode` passes its `cos > 0.90` structural
+bound.
+
+**Still unmeasured:** S = 512 and S = 2048 on the camodel (multi-tile
+addressing and deep context), `kv5fp8` and `kv3fp4` through the corrected path,
+and every timing number -- no Ascend 950PR silicon has been available to this
+project at any point.
 
 Four device defects were found by the first camodel run of the multi-mode decode
 and fixed, all of the kind the source reads as correct on:
@@ -997,11 +1057,86 @@ and fixed, all of the kind the source reads as correct on:
    the one that produced a plausible partly-zero answer rather than a fault, and
    the one the exact-match test caught.
 
-A fifth is open, and it is the next thing to look at because it blocks the smoke
-test even once the score GEMM is corrected. `TurboQuantCubeMm::Init` runs on both
-halves of the MIX kernel and allocates L0A, L0B and L0C unconditionally; those
-pools do not exist on a vector core, so the tensors it hands back there are
+A fifth was open and is now **fixed**. `TurboQuantCubeMm::Init` ran on both
+halves of the MIX kernel and allocated L0A, L0B and L0C unconditionally; those
+pools do not exist on a vector core, so the tensors it handed back there were
 nonsense addresses, and `ldst_addr: 2` is what one of them looks like when
-something touches it. The allocation needs splitting: L1 (`A1`, `B1`) on both
+something touches it. The allocation is now split: L1 (`A1`, `B1`) on both
 cores, because the AIV stages into it and the AIC reads it, and L0A / L0B / L0C
-on the AIC alone.
+under `ASCEND_IS_AIC`. Nothing on the vector side reads them - `LoadA`,
+`LoadBFrom*` and `Compute` all run under `ASCEND_IS_AIC` at their call sites -
+so the AIV simply does not allocate them.
+
+`TurboQuantFp16DecodeSplit::Init` had the same defect and got the same fix. It
+does not share `TurboQuantCubeMm` - it carries its own L1/L0 set and its own
+`Gemm`, because its operands are `half` and come from the AIC's own MTE2 rather
+than from an unpack - so the two had to be corrected separately. Its `aP1_` is
+the one L1 buffer genuinely written by the vector core, in `Softmax`, which is
+why all three L1 buffers stay allocated on both halves there too.
+
+**A sixth, which the fifth was hiding: the MIX block index.** With the L0 fault
+gone the decode stopped faulting and started *hanging* - one core spinning in a
+flag wait, every other camodel worker parked on `futex_wait`, and
+`core*.excp_log.dump` empty on all of them, because nothing had gone wrong with
+any address.
+
+`AscendC::GetBlockIdx()` does not mean the same thing on the two halves of a MIX
+kernel. From `kernel_operator_sys_var_impl.h` on arch35:
+
+```
+AIV   get_block_idx() * get_subblockdim() + get_subblockid()
+AIC   get_block_idx()
+```
+
+A 950PR reports `num_vec_core=2`, so the AIC of block `c` sees `c` while its own
+two vector subcores see `2c` and `2c + 1`. Both decode kernels opened their task
+loop with
+
+```cpp
+uint32_t start = static_cast<uint32_t>(AscendC::GetBlockIdx()) * tasksPerCore;
+```
+
+so an AIC and the AIVs physically paired with it walked **different task lists,
+of different lengths**. Every `ProcessTile` carries a four-phase handshake, so
+the counts diverged on the first tile: the AIC blocked in
+`CrossCoreWaitFlag(kFlagOperandsReady)` for operands its own AIVs were never
+going to stage, and those AIVs blocked in
+`CrossCoreWaitFlag(kFlagProductReady)` for a product no AIC would compute.
+
+`MixBlockIdx()` - `GetBlockIdx() / GetSubBlockNum()`, which is `c` on the AIC
+(divisor 1) and `c` on both AIVs (divisor 2) - collapses both halves onto the
+block index, which is what the host's grid is expressed in anyway:
+`PlanCubeDecode` sizes `split_block_dim` in tasks per *block*, and `<<<blockDim>>>`
+on a MIX kernel counts AIC blocks. Applied to `TurboQuantCubeDecodeSplit` and
+`TurboQuantFp16DecodeSplit`.
+
+Two things worth not rediscovering. **The flags were never the problem**, though
+they look like it: `CrossCoreSetFlag<0x2, PIPE_MTE3>` appears outside any
+`ASCEND_IS_*` guard in `ProcessTile` and is nonetheless AIV-only, because
+`NotifyEventImpl` self-guards by pipe class - on arch35 `IsSplitVectorPipe` is
+`{PIPE_S, PIPE_V, PIPE_MTE2, PIPE_MTE3}` and `IsSplitCubePipe` is
+`{PIPE_S, PIPE_MTE1, PIPE_MTE2, PIPE_FIX, PIPE_M}`. And **this is why
+`test_sim_950pr_cube_gemm` passes while the decode hung**: the probe is
+single-shot with no block-indexed task loop, so its handshake cannot
+desynchronise. It is also the reason both vector subcores are left running the
+same task rather than half of it each - that is the arrangement the probe
+proves, and the AIV -> AIC flag is satisfied only when every subcore of the pair
+has set it.
+
+**A seventh, in the test rather than the kernel: `block_size` must be a multiple
+of `kCubeTileRows`.** `kCubeTileRows` is 64 and `CopyInTile` issues one
+unconditional 64-row `DataCopy` per tile, so a smaller block size makes every
+tile read past the end of the block it was handed - into the next blocks of the
+pool, and past the end of the cache and scale-plane allocations entirely when
+the block is the last one. That garbage reaches the per-row scale lanes, which
+are multiplied into the score row *before* the invalid columns are masked to
+`-inf`, and the run fills with `vec_err_idata_inf_nan` on the softmax's
+`RV_VMAX`/`VSUB`/`VEXP`. It raises no `ldst_addr`, because the over-read stays
+inside the allocation's page slack - which is exactly what makes it read as a
+numerical defect rather than an addressing one.
+
+`test_sim_950pr_turboquant_multimode` was running `block_size = 16`, inherited
+from the tier's habit of picking the smallest shape that still exercises the
+feature. It is now 128, the production value. At `S <= 128` that costs nothing:
+the tile loop still runs a single 64-row tile, because `rows` is clamped to the
+context length.
