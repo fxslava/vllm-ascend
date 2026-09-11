@@ -93,6 +93,115 @@ constexpr uint32_t kPartialSumLane = kFp32PerBlock;
 
 constexpr float kNegInf = -3.4028235e38f;
 
+/*
+ * The block index an AIC and the AIV subcores paired with it agree on.
+ *
+ * AscendC::GetBlockIdx() does NOT mean the same thing on the two halves of a
+ * MIX kernel.  From kernel_operator_sys_var_impl.h on arch35:
+ *
+ *     AIV   get_block_idx() * get_subblockdim() + get_subblockid()
+ *     AIC   get_block_idx()
+ *
+ * so on a part with subblockdim = 2 -- which is what a 950PR reports, two
+ * vector cores per cube core -- the AIC of block c sees c while its own two
+ * vector subcores see 2c and 2c + 1.
+ *
+ * A task loop keyed directly on GetBlockIdx() therefore puts the two halves of
+ * one MIX block on *different tasks*, and any kernel whose tiles carry a
+ * cross-core handshake deadlocks the moment the two counts diverge: the AIC
+ * blocks in CrossCoreWaitFlag(kFlagOperandsReady) waiting for operands the
+ * AIVs paired with it were never going to stage, and those AIVs block in
+ * CrossCoreWaitFlag(kFlagProductReady) waiting for a product no AIC will
+ * compute.  Nothing faults -- every address involved is valid -- so it presents
+ * as a hang, one core spinning in the flag wait and the rest parked.
+ *
+ * GetSubBlockNum() is subblockdim on the AIV and 1 on the AIC, so this division
+ * collapses both halves onto the block index.  That is the index the host's
+ * grid planning is already expressed in: PlanCubeDecode sizes split_block_dim
+ * in tasks per *block*, and <<<blockDim>>> on a MIX kernel counts AIC blocks.
+ *
+ * Both vector subcores then run the same task.  That is the arrangement
+ * TurboQuantCubeGemmProbe uses and test_sim_950pr_cube_gemm proves out: they
+ * stage identical bytes into the one L1 their AIC reads, and the AIV -> AIC
+ * flag is satisfied when every subcore of the pair has set it -- which is why
+ * both have to run the same number of tiles, not merely overlapping ones.
+ *
+ * NOT for a kernel that is pure vector work.  There the 2N vector subcores are
+ * 2N independent workers and GetBlockIdx() is exactly the right index; see
+ * TurboQuantPlainCombine, which keeps it.
+ */
+__aicore__ inline uint32_t MixBlockIdx()
+{
+    return static_cast<uint32_t>(AscendC::GetBlockIdx() / AscendC::GetSubBlockNum());
+}
+
+/*
+ * The operand-ready signal, vector half -> cube half of a MIX block.
+ *
+ * EVERY vector subcore issues it, and that is not an oversight to be tidied
+ * away: the arch35 AIV -> AIC flag in mode 0x02 is satisfied only once all
+ * subcores of the pair have set it. Gating this to subcore 0 was measured, and
+ * it starves the AIC -- the first tile never completes and the launch hangs
+ * with an empty exception log. CANN's own MIX idiom
+ * (WaitPreTaskEndLooseV3Impl) issues it ungated for the same reason.
+ *
+ * So the two sets against one CrossCoreWaitFlag are balanced, not a surplus.
+ * What was NOT balanced is what happens to the product afterwards; see
+ * ProductIsMine below.
+ */
+__aicore__ inline void SignalOperandsReady()
+{
+    AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(vllm_ascend::turboquant::kFlagOperandsReady);
+}
+
+/*
+ * True on the one vector subcore whose UB the Cube's Fixpipe landed in.
+ *
+ * The accumulator, the score row and the context row live in UB, and UB is
+ * per-subcore -- but the Fixpipe that fills them is issued by the AIC, which
+ * writes into a single subcore's UB and not into both. Every vector subcore of
+ * the pair then believes it holds the product. The one that does not holds
+ * whatever its buffer had before.
+ *
+ * Ungated, both subcores wrote their copy to the same GM address and the last
+ * writer won, which is why the same GEMM alternated exact / all-zero / exact
+ * across launches of one process (test_sim_950pr_cube_gemm's
+ * ContextGemmRepeated). It reads as a layout defect and is not one: the product
+ * in L0C was right every time.
+ *
+ * This gates only what CONSUMES the product. The flag protocol stays ungated --
+ * both subcores must still signal, or the AIC starves.
+ */
+__aicore__ inline bool ProductIsMine()
+{
+    return AscendC::GetSubBlockIdx() == 0;
+}
+
+/*
+ * Vector -> MTE3, before any DMA of a UB buffer the vector unit just wrote.
+ *
+ * Every operand this kernel stages into L1 is produced by vector work -- the
+ * codec's unpack, the query cast, the softmax's probability row -- and then
+ * moved UB -> L1 by DataCopy, which is MTE3. Those are different pipes, and
+ * PipeBarrier<PIPE_V> orders V against V only, exactly as PipeBarrier<PIPE_MTE1>
+ * fails to order MTE1 against M. Without this the DMA reads the buffer before
+ * the vector writes land and stages whatever was there -- zeros on a fresh
+ * buffer -- so the Cube multiplies an empty operand and Fixpipes an all-zero
+ * product. Nothing faults; the symptom is a correct-looking pipeline that
+ * computes nothing.
+ *
+ * Found by accident: a diagnostic dump that happened to put a
+ * PipeBarrier<PIPE_ALL> between the unpack and the copy turned an identically
+ * zero score row into plausible logits. The same idiom is in CANN's own
+ * matmul_client.h.
+ */
+__aicore__ inline void SyncVectorToMte3()
+{
+    const event_t ev = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::V_MTE3));
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(ev);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(ev);
+}
+
 // e4m3fn's largest finite value, and e2m1's.  A query row and a probability row
 // are scaled to the top of the operand grid before the cast so the mantissa is
 // not thrown away against the grid's subnormal floor, and the fp32 multiplier
@@ -417,7 +526,11 @@ public:
     __aicore__ inline void Process(uint32_t tasksPerCore)
     {
         const uint32_t tasks = numTokens_ * numKvHeads_ * numSplits_;
-        uint32_t start = static_cast<uint32_t>(AscendC::GetBlockIdx()) * tasksPerCore;
+        // MixBlockIdx(), not GetBlockIdx(): every tile below carries an
+        // AIC <-> AIV handshake, so the two halves of a MIX block have to walk
+        // the same task list or they deadlock against each other. See
+        // MixBlockIdx.
+        uint32_t start = MixBlockIdx() * tasksPerCore;
         uint32_t end = start + tasksPerCore;
         if (end > tasks) {
             end = tasks;
@@ -493,7 +606,14 @@ private:
         // One partial per query head in the group.  The layout is the shared
         // combine's: [head_size] of accumulator then kPartialTail of state, with
         // the running max at lane 0 and the running sum at lane kFp32PerBlock.
+        // Only the subcore the Fixpipe wrote into holds this task's
+        // accumulator and running state; the other's are whatever its UB had.
+        // Ungated, both wrote to the same workspace offsets and the last writer
+        // won. See ProductIsMine.
+        // ASCEND_IS_AIV expands to constexpr(...), so it cannot be combined
+        // with && -- the two conditions have to nest.
         if ASCEND_IS_AIV {
+          if (ProductIsMine()) {
             AscendC::LocalTensor<float> tail = reduceBuf_.Get<float>();
             AscendC::PipeBarrier<PIPE_ALL>();
             for (uint32_t h = 0; h < groupHeads_; ++h) {
@@ -508,6 +628,7 @@ private:
                 AscendC::DataCopy(workspaceGm_[offset + headSize_], tail, kPartialTail);
                 AscendC::PipeBarrier<PIPE_ALL>();
             }
+          }
         }
     }
 
@@ -550,7 +671,11 @@ private:
             // the factor comes back out of the score row in AccumulateTile.
             AscendC::Abs(tmp, vec, headSize_);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::ReduceMax<float>(reduce, tmp, tmp, headSize_, false);
+            // Work buffer distinct from the source. ReduceMax writes its
+            // intermediates into sharedTmpBuffer while still reading src, so
+            // passing one tensor as both can corrupt the reduction itself --
+            // and this result is qScale_.
+            AscendC::ReduceMax<float>(reduce, tmp, scoreBuf_.Get<float>(), headSize_, false);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Adds(reduce, reduce, TurboQuantCodec4::kEps, 1);
             AscendC::PipeBarrier<PIPE_V>();
@@ -571,6 +696,7 @@ private:
             codec_.CastToOperand(qOperand[h * operandElems_], vec, headSize_);
 
             // NZ: head h occupies lane h of every C0 block.
+            SyncVectorToMte3();
             AscendC::DataCopy(qL1[h * kOperandC0], qOperand[h * operandElems_], nzParams);
         }
         AscendC::PipeBarrier<PIPE_ALL>();
@@ -601,20 +727,26 @@ private:
 
         // K -> operand grid -> L1, then the score GEMM.
         UnpackToL1(kv, mm_.B1());
-        AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(vllm_ascend::turboquant::kFlagOperandsReady);
+        SignalOperandsReady();
         if ASCEND_IS_AIC {
             AscendC::CrossCoreWaitFlag(vllm_ascend::turboquant::kFlagOperandsReady);
             mm_.GemmScores(scores, kMaxGroupHeads, headSize_, kCubeTileRows);
             AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(vllm_ascend::turboquant::kFlagProductReady);
         }
         if ASCEND_IS_AIV {
+            // Both subcores wait -- the flag counts must stay balanced -- but
+            // `scores` is UB the AIC's Fixpipe wrote into one of them, and the
+            // softmax also stages the probability row this tile's context GEMM
+            // reads. See ProductIsMine.
             AscendC::CrossCoreWaitFlag(vllm_ascend::turboquant::kFlagProductReady);
-            Softmax(scores, scaleTile, state, acc, valid);
+            if (ProductIsMine()) {
+                Softmax(scores, scaleTile, state, acc, valid);
+            }
         }
 
         // V -> operand grid -> L1, then the context GEMM.
         UnpackToL1(kv[kCubeTileRows * packedBytes_], mm_.B1());
-        AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(vllm_ascend::turboquant::kFlagOperandsReady);
+        SignalOperandsReady();
         if ASCEND_IS_AIC {
             AscendC::CrossCoreWaitFlag(vllm_ascend::turboquant::kFlagOperandsReady);
             mm_.GemmContext(ctx, kMaxGroupHeads, kCubeTileRows, headSize_);
@@ -622,7 +754,9 @@ private:
         }
         if ASCEND_IS_AIV {
             AscendC::CrossCoreWaitFlag(vllm_ascend::turboquant::kFlagProductReady);
-            Accumulate(acc, ctx, state);
+            if (ProductIsMine()) {
+                Accumulate(acc, ctx, state);
+            }
         }
     }
 
@@ -666,8 +800,24 @@ private:
             static_cast<uint16_t>((kCubeTileRows - kUnpackRows) * kOperandC0 / 32)};
 
         for (uint32_t sub = 0; sub < kCubeTileRows / kUnpackRows; ++sub) {
-            codec_.Unpack(operand, packed[sub * kUnpackRows * packedBytes_], static_cast<int>(kUnpackRows),
-                          static_cast<int>(headSize_));
+            // Dispatched by mode rather than calling Codec::Unpack directly, so
+            // the rate a tile is being expanded at is named at the call site.
+            // The three routines are one template instantiated three ways --
+            // kv4fp8 is kv5fp8 with the msb plane compiled out -- so this
+            // chooses a name, not an implementation.
+            const AscendC::LocalTensor<int8_t> sub_packed = packed[sub * kUnpackRows * packedBytes_];
+            if constexpr (MODE == TurboQuantMode::KV4_FP8) {
+                vllm_ascend::turboquant::unpack_tq4_to_fp8(codec_, operand, sub_packed,
+                                                           static_cast<int>(kUnpackRows),
+                                                           static_cast<int>(headSize_));
+            } else if constexpr (MODE == TurboQuantMode::KV5_FP8) {
+                vllm_ascend::turboquant::unpack_tq5_to_fp8(codec_, operand, sub_packed,
+                                                           static_cast<int>(kUnpackRows),
+                                                           static_cast<int>(headSize_));
+            } else {
+                codec_.Unpack(operand, sub_packed, static_cast<int>(kUnpackRows), static_cast<int>(headSize_));
+            }
+            SyncVectorToMte3();
             AscendC::DataCopy(l1[sub * bandElems], operand, nzParams);
         }
         AscendC::PipeBarrier<PIPE_ALL>();
@@ -692,6 +842,11 @@ private:
         AscendC::LocalTensor<float> reduce = reduceBuf_.Get<float>();
         AscendC::LocalTensor<float> kScale = reduce;
         AscendC::LocalTensor<float> vScale = reduce[kCubeTileRows];
+        // Borrowed, not allocated: growing any buffer here exhausts UB, and
+        // an InitBuffer that fails hands back a base of 0 whose stores
+        // decode as DDR. ctxBuf_ is not written until the context GEMM
+        // Fixpipes into it, which is after every use below.
+        AscendC::LocalTensor<float> reduceWork = ctxBuf_.Get<float>();
         AscendC::LocalTensor<OperandT> probOperand = probOperandBuf_.Get<OperandT>();
 
         // The tile's K and V scales, one lane per row, out of the packed slots.
@@ -716,7 +871,9 @@ private:
                 AscendC::PipeBarrier<PIPE_V>();
             }
 
-            AscendC::ReduceMax<float>(tileMax[h * kFp32PerBlock], row, row, kCubeTileRows, false);
+            // `row` is the score row and is read again by the BroadcastSub
+            // below, so it cannot also be the reduction's scratch.
+            AscendC::ReduceMax<float>(tileMax[h * kFp32PerBlock], row, reduceWork, kCubeTileRows, false);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Max(newMax[h * kFp32PerBlock], runMax[h * kFp32PerBlock], tileMax[h * kFp32PerBlock], 1);
             AscendC::PipeBarrier<PIPE_V>();
@@ -773,6 +930,7 @@ private:
         const AscendC::DataCopyParams pParams{static_cast<uint16_t>(pBlocks), 1, 0,
                                               static_cast<uint16_t>(kMaxGroupHeads - 1)};
         for (uint32_t h = 0; h < groupHeads_; ++h) {
+            SyncVectorToMte3();
             AscendC::DataCopy(pL1[h * kOperandC0], probOperand[h * pElems], pParams);
         }
         AscendC::PipeBarrier<PIPE_ALL>();
@@ -913,12 +1071,20 @@ public:
 
         // L1 for the fp16 operands: query [M, D], probabilities [M, tileRows]
         // and the K/V tile [tileRows, D], all in elements of scalar_t.
+        // L1 on both halves: aP1_ is written by Softmax, which is AIV work.
         pipe_->InitBuffer(aQ1_, kMaxGroupHeads * headSize_ * sizeof(scalar_t));
         pipe_->InitBuffer(aP1_, kMaxGroupHeads * kCubeTileRows * sizeof(scalar_t));
         pipe_->InitBuffer(b1_, kCubeTileRows * headSize_ * sizeof(scalar_t));
-        pipe_->InitBuffer(a2_, kMaxGroupHeads * headSize_ * sizeof(scalar_t));
-        pipe_->InitBuffer(b2_, kCubeTileRows * headSize_ * sizeof(scalar_t));
-        pipe_->InitBuffer(co1_, kMaxGroupHeads * headSize_ * sizeof(float));
+        // L0 on the AIC alone, for the reason spelled out in
+        // TurboQuantCubeMm::Init: a vector core has no L0A, L0B or L0C, and the
+        // tensors an unconditional InitBuffer hands it there fault on first
+        // touch as `ldst_addr: 2`.  Gemm is the only reader and runs under
+        // ASCEND_IS_AIC.
+        if ASCEND_IS_AIC {
+            pipe_->InitBuffer(a2_, kMaxGroupHeads * headSize_ * sizeof(scalar_t));
+            pipe_->InitBuffer(b2_, kCubeTileRows * headSize_ * sizeof(scalar_t));
+            pipe_->InitBuffer(co1_, kMaxGroupHeads * headSize_ * sizeof(float));
+        }
 
         pipe_->InitBuffer(accBuf_, kMaxGroupHeads * headSize_ * sizeof(float));
         pipe_->InitBuffer(scoreBuf_, kMaxGroupHeads * kCubeTileRows * sizeof(float));
@@ -932,7 +1098,11 @@ public:
     __aicore__ inline void Process(uint32_t tasksPerCore)
     {
         const uint32_t tasks = numTokens_ * numKvHeads_ * numSplits_;
-        uint32_t start = static_cast<uint32_t>(AscendC::GetBlockIdx()) * tasksPerCore;
+        // MixBlockIdx(), not GetBlockIdx(): every tile below carries an
+        // AIC <-> AIV handshake, so the two halves of a MIX block have to walk
+        // the same task list or they deadlock against each other. See
+        // MixBlockIdx.
+        uint32_t start = MixBlockIdx() * tasksPerCore;
         uint32_t end = start + tasksPerCore;
         if (end > tasks) {
             end = tasks;
@@ -1011,7 +1181,14 @@ private:
             }
         }
 
+        // Only the subcore the Fixpipe wrote into holds this task's
+        // accumulator and running state; the other's are whatever its UB had.
+        // Ungated, both wrote to the same workspace offsets and the last writer
+        // won. See ProductIsMine.
+        // ASCEND_IS_AIV expands to constexpr(...), so it cannot be combined
+        // with && -- the two conditions have to nest.
         if ASCEND_IS_AIV {
+          if (ProductIsMine()) {
             AscendC::LocalTensor<float> tail = reduceBuf_.Get<float>();
             AscendC::PipeBarrier<PIPE_ALL>();
             for (uint32_t h = 0; h < groupHeads_; ++h) {
@@ -1026,6 +1203,7 @@ private:
                 AscendC::DataCopy(workspaceGm_[offset + headSize_], tail, kPartialTail);
                 AscendC::PipeBarrier<PIPE_ALL>();
             }
+          }
         }
     }
 
@@ -1055,8 +1233,10 @@ private:
         }
         if ASCEND_IS_AIV {
             AscendC::CrossCoreWaitFlag(vllm_ascend::turboquant::kFlagProductReady);
-            Softmax(scores, state, acc, valid);
-            AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(vllm_ascend::turboquant::kFlagOperandsReady);
+            if (ProductIsMine()) {
+                Softmax(scores, state, acc, valid);
+            }
+            SignalOperandsReady();
         }
         if ASCEND_IS_AIC {
             AscendC::CrossCoreWaitFlag(vllm_ascend::turboquant::kFlagOperandsReady);
@@ -1069,8 +1249,10 @@ private:
         }
         if ASCEND_IS_AIV {
             AscendC::CrossCoreWaitFlag(vllm_ascend::turboquant::kFlagProductReady);
-            AscendC::Add(acc, acc, ctx, groupHeads_ * headSize_);
-            AscendC::PipeBarrier<PIPE_V>();
+            if (ProductIsMine()) {
+                AscendC::Add(acc, acc, ctx, groupHeads_ * headSize_);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
         }
     }
 
@@ -1150,6 +1332,8 @@ private:
         AscendC::LocalTensor<float> newMax = state[3 * kMaxGroupHeads * kFp32PerBlock];
         AscendC::LocalTensor<float> alpha = state[4 * kMaxGroupHeads * kFp32PerBlock];
         AscendC::LocalTensor<float> reduce = reduceBuf_.Get<float>();
+        // Borrowed; see the note in the quantised kernel's Softmax.
+        AscendC::LocalTensor<float> reduceWork = ctxBuf_.Get<float>();
         AscendC::LocalTensor<scalar_t> probs = probBuf_.Get<scalar_t>();
 
         for (uint32_t h = 0; h < groupHeads_; ++h) {
@@ -1160,7 +1344,7 @@ private:
                 AscendC::Duplicate(row[valid], kNegInf, kCubeTileRows - valid);
                 AscendC::PipeBarrier<PIPE_V>();
             }
-            AscendC::ReduceMax<float>(tileMax[h * kFp32PerBlock], row, row, kCubeTileRows, false);
+            AscendC::ReduceMax<float>(tileMax[h * kFp32PerBlock], row, reduceWork, kCubeTileRows, false);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Max(newMax[h * kFp32PerBlock], runMax[h * kFp32PerBlock], tileMax[h * kFp32PerBlock], 1);
             AscendC::PipeBarrier<PIPE_V>();
@@ -1192,6 +1376,7 @@ private:
         // P -> L1, ND -> NZ. Unlike the fp8 path this overload exists: the
         // UB-side transform is a strided Adds, which has a half instantiation.
         AscendC::LocalTensor<scalar_t> pL1 = aP1_.template Get<scalar_t>();
+        SyncVectorToMte3();
         AscendC::DataCopy(pL1, probs,
                           AscendC::Nd2NzParams(1, static_cast<uint16_t>(kMaxGroupHeads), kCubeTileRows, 0,
                                                kCubeTileRows, static_cast<uint16_t>(kMaxGroupHeads), 1, 0));
@@ -1413,7 +1598,7 @@ public:
 
     // `bIsNk` selects which of the two B forms is exercised: the score GEMM's
     // ([n, k], one load) or the context GEMM's ([k, n], the chunked one).
-    __aicore__ inline void Run(uint32_t m, uint32_t k, uint32_t n, uint32_t bIsNk)
+    __aicore__ inline void Run(uint32_t m, uint32_t k, uint32_t n, uint32_t bIsNk, uint32_t variant)
     {
         AscendC::LocalTensor<float> out = outBuf_.Get<float>();
         if ASCEND_IS_AIV {
@@ -1424,20 +1609,33 @@ public:
             AscendC::DataCopy(stage, bGm_, bElems_);
             AscendC::PipeBarrier<PIPE_ALL>();
             AscendC::DataCopy(mm_.B1(), stage, bElems_);
-            AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(vllm_ascend::turboquant::kFlagOperandsReady);
+            SignalOperandsReady();
         }
         if ASCEND_IS_AIC {
+            // Variant 10: one wait per vector subcore. Both AIVs of a MIX block
+            // run this kernel and both set kFlagOperandsReady, so if the AIC's
+            // single wait consumes only one notification the surplus carries
+            // into the next launch and satisfies its wait before the operands
+            // are staged -- which would make the first GEMM of a process exact
+            // and every one after it read an unstaged L1.
             AscendC::CrossCoreWaitFlag(vllm_ascend::turboquant::kFlagOperandsReady);
+            if (variant == 10) {
+                AscendC::CrossCoreWaitFlag(vllm_ascend::turboquant::kFlagOperandsReady);
+            }
             if (bIsNk != 0) {
                 mm_.GemmScores(out, m, k, n);
             } else {
-                mm_.GemmContext(out, m, k, n);
+                mm_.GemmContext(out, m, k, n, variant);
             }
             AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(vllm_ascend::turboquant::kFlagProductReady);
         }
         if ASCEND_IS_AIV {
             AscendC::CrossCoreWaitFlag(vllm_ascend::turboquant::kFlagProductReady);
-            AscendC::DataCopy(cGm_, out, cElems_);
+            // Both subcores wait -- the flag counts have to stay balanced --
+            // but only the one the Fixpipe wrote into has the product.
+            if (ProductIsMine()) {
+                AscendC::DataCopy(cGm_, out, cElems_);
+            }
             AscendC::PipeBarrier<PIPE_ALL>();
         }
     }
@@ -1535,12 +1733,12 @@ TURBOQUANT_PLAIN_COMBINE_DECLARE(half)
 // test can sweep them.
 extern "C" __global__ __aicore__ void turboquant_cube_gemm_probe_fp8(
     GM_ADDR a, GM_ADDR b, GM_ADDR c, uint32_t m, uint32_t k, uint32_t n, uint32_t headSize, uint32_t tileRows,
-    uint32_t aElems, uint32_t bElems, uint32_t cElems, uint32_t bIsNk)
+    uint32_t aElems, uint32_t bElems, uint32_t cElems, uint32_t bIsNk, uint32_t variant)
 {
     AscendC::TPipe pipe;
     TurboQuantCubeGemmProbe op(&pipe);
     op.Init(a, b, c, headSize, tileRows, aElems, bElems, cElems);
-    op.Run(m, k, n, bIsNk);
+    op.Run(m, k, n, bIsNk, variant);
 }
 
 namespace vllm_ascend {
@@ -1634,10 +1832,10 @@ void turboquant_fp16_decode_impl(AscendType type, void *stream, uint32_t splitBl
 // the primary path uses -- and the step arguments are what the caller sweeps.
 void turboquant_cube_gemm_probe_impl(void *stream, void *a, void *b, void *c, uint32_t m, uint32_t k, uint32_t n,
                                      uint32_t headSize, uint32_t tileRows, uint32_t aElems, uint32_t bElems,
-                                     uint32_t cElems, uint32_t bIsNk)
+                                     uint32_t cElems, uint32_t bIsNk, uint32_t variant)
 {
     turboquant_cube_gemm_probe_fp8<<<1, nullptr, stream>>>(a, b, c, m, k, n, headSize, tileRows, aElems, bElems,
-                                                           cElems, bIsNk);
+                                                           cElems, bIsNk, variant);
 }
 
 }  // namespace vllm_ascend

@@ -508,9 +508,24 @@ using TurboQuantCodecKv3Fp4 = TurboQuantModeCodec<TurboQuantMode::KV3_FP4>;
 using TurboQuantCodecKv4Fp8 = TurboQuantModeCodec<TurboQuantMode::KV4_FP8>;
 using TurboQuantCodecKv5Fp8 = TurboQuantModeCodec<TurboQuantMode::KV5_FP8>;
 
-// The named entry point of the kv5fp8 dequantization stage: packed 5-bit
-// indices in `srcPacked` -> fp8_e4m3fn in `dst`, both in local UB memory.
-// A thin name over TurboQuantModeCodec<KV5_FP8>::Unpack.
+// The named entry point of the kv4fp8 dequantization stage: packed 4-bit
+// indices in `srcPacked` -- two per byte, 128 bytes for a d=256 vector -- to
+// fp8_e4m3fn in `dst`, both in local UB memory.  A thin name over
+// TurboQuantModeCodec<KV4_FP8>::Unpack, which is the same routine kv5fp8 uses
+// with its msb plane compiled out: the nibble split is ExtractDigit at radix
+// 16, and the 16-entry Lloyd-Max table is the final Gather.  The fractal NZ
+// permutation is folded into that same UB Gather stage through lowOffset_,
+// which the host builds with nz_rows set; the unpack therefore emits NZ order
+// directly and the L1 stage is a strided DataCopy rather than a shuffle.
+__aicore__ inline void unpack_tq4_to_fp8(TurboQuantCodecKv4Fp8 &codec,
+                                         const AscendC::LocalTensor<fp8_e4m3fn_t> &dst,
+                                         const AscendC::LocalTensor<int8_t> &srcPacked, int rows, int len)
+{
+    codec.Unpack(dst, srcPacked, rows, len);
+}
+
+// The kv5fp8 twin: packed 5-bit indices -> fp8_e4m3fn.  The low plane is laid
+// out exactly as kv4fp8's whole slot, so the two share the unpacker.
 __aicore__ inline void unpack_tq5_to_fp8(TurboQuantCodecKv5Fp8 &codec,
                                          const AscendC::LocalTensor<fp8_e4m3fn_t> &dst,
                                          const AscendC::LocalTensor<int8_t> &srcPacked, int rows, int len)

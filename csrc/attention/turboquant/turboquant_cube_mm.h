@@ -88,9 +88,11 @@ struct TurboQuantOperandType<TurboQuantMode::KV5_FP8> {
 };
 
 /*
- * The Cube stage for one mode.  Owns L1, L0A, L0B and L0C; the AIV's unpack
- * buffers belong to the codec, and the two halves meet at StageA/StageB
- * (UB -> L1, an AIV-side MTE3) and at the Fixpipe (L0C -> UB).
+ * The Cube stage for one mode.  Owns L1 on both halves of the MIX kernel and
+ * L0A, L0B and L0C on the AIC alone -- see Init, where that split is not a
+ * micro-optimisation; the AIV's unpack buffers belong to the codec, and the two
+ * halves meet at StageA/StageB (UB -> L1, an AIV-side MTE3) and at the Fixpipe
+ * (L0C -> UB).
  *
  *   maxM   rows of the A operand, i.e. the GQA group padded to kCubeTileM
  *   maxN   columns of the B operand; kTileRows for the score GEMM and head_size
@@ -122,18 +124,32 @@ public:
         const uint32_t qBytes = kCubeTileM * OperandElems(headSize_);
         const uint32_t pBytes = kCubeTileM * OperandElems(tileRows_);
         const uint32_t bBytes = tileRows_ * OperandElems(headSize_);
+        // L1 on both halves of the MIX kernel: the AIV stages into these and
+        // the AIC reads them.
         pipe->InitBuffer(aQ1_, qBytes);
         pipe->InitBuffer(aP1_, pBytes);
         pipe->InitBuffer(b1_, bBytes);
-        pipe->InitBuffer(a2_, qBytes > pBytes ? qBytes : pBytes);
-        // L0B holds the [k, n] form's chunks end to end: ceil(k/16)/2 of them,
-        // each ceil(n/16) * 16 * 32 elements. For the shapes here that is the
-        // same bBytes the tile occupies, but it is written out rather than
-        // assumed because the chunking rounds k up to a multiple of 32.
-        pipe->InitBuffer(b2_, bBytes);
-        // L0C carries [kCubeTileM, headSize] fp32, which also covers
-        // [kCubeTileM, tileRows] since tileRows <= headSize on every shape here.
-        pipe->InitBuffer(co1_, kCubeTileM * headSize_ * sizeof(float));
+
+        // L0 on the AIC alone.  A vector core has no L0A, L0B or L0C, so an
+        // unconditional InitBuffer here hands the AIV tensors whose base is not
+        // an address it can reach; the part reports the first touch as
+        // `pem_lsu: unrecognize ldst addr` with `ldst_addr: 2` and the whole
+        // decode stalls there.  Nothing on the AIV side reads these -- LoadA,
+        // LoadBFrom*, and Compute all run under ASCEND_IS_AIC at their call
+        // sites -- so leaving them unallocated on that core costs nothing.
+        if ASCEND_IS_AIC {
+            pipe->InitBuffer(a2_, qBytes > pBytes ? qBytes : pBytes);
+            // L0B holds the [k, n] form's chunks end to end: ceil(k/16)/2 of
+            // them, each ceil(n/16) * 16 * 32 elements. For the shapes here
+            // that is the same bBytes the tile occupies, but it is written out
+            // rather than assumed because the chunking rounds k up to a
+            // multiple of 32.
+            pipe->InitBuffer(b2_, bBytes);
+            // L0C carries [kCubeTileM, headSize] fp32, which also covers
+            // [kCubeTileM, tileRows] since tileRows <= headSize on every shape
+            // here.
+            pipe->InitBuffer(co1_, kCubeTileM * headSize_ * sizeof(float));
+        }
     }
 
     // AIV side: the three L1 landing buffers, exposed so the caller can place
@@ -178,11 +194,12 @@ public:
     // AIC side, GEMM 2: ctx[m, n] = P[m, k] . V[k, n], fp32 accumulate.  V is
     // staged as [k, n], which for the B operand needs ifTranspose true and, for
     // an 8-bit type, a loop.  See LoadBFromKn.
-    __aicore__ inline void GemmContext(const AscendC::LocalTensor<float> &dstUb, uint32_t m, uint32_t k, uint32_t n)
+    __aicore__ inline void GemmContext(const AscendC::LocalTensor<float> &dstUb, uint32_t m, uint32_t k, uint32_t n,
+                                       uint32_t variant = 0)
     {
         aActive_ = aP1_.template Get<OperandT>();
         LoadA(m, k);
-        LoadBFromKn(k, n);
+        LoadBFromKn(k, n, variant);
         Compute(dstUb, m, k, n);
     }
 
@@ -251,29 +268,81 @@ private:
         AscendC::LoadData(tb2, tb1, p);
     }
 
-    // B is [k, n] in L1. ifTranspose true, and for an 8-bit operand the load
-    // runs in mStep = 2 chunks whose L0B destinations are
-    // ceil(n / 16) * 32 elements apart.
-    __aicore__ inline void LoadBFromKn(uint32_t k, uint32_t n)
+    /*
+     * B is [k, n] in L1, loaded with ifTranspose true and, for an 8-bit
+     * operand, in mStep = 2 chunks.
+     *
+     * `variant` exists so test_sim_950pr_cube_gemm can sweep the parameters
+     * this transcription is uncertain about rather than assert a guess; 0 is
+     * the shipping path and the only one production ever passes. See the
+     * variant table in that test.
+     */
+    __aicore__ inline void LoadBFromKn(uint32_t k, uint32_t n, uint32_t variant = 0)
     {
         AscendC::LocalTensor<OperandT> tb1 = b1_.template Get<OperandT>();
         AscendC::LocalTensor<OperandT> tb2 = b2_.template Get<OperandT>();
         AscendC::LoadData2DParamsV2 p;
         p.kStartPosition = 0;
-        p.kStep = CeilDivU16(n, kC0);
-        p.srcStride = CeilDivU16(k, kFractalRows);
-        p.dstStride = CeilDivU16(n, kFractalRows);
+        p.kStep = (variant == 5) ? CeilDivU16(n, kFractalRows) : CeilDivU16(n, kC0);
+        p.srcStride = (variant == 6) ? CeilDivU16(k, kC0) : CeilDivU16(k, kFractalRows);
+        p.dstStride = (variant == 8) ? CeilDivU16(n, kC0) : CeilDivU16(n, kFractalRows);
         p.ifTranspose = true;
 
         const uint16_t mSteps = CeilDivU16(k, kFractalRows);
-        const uint16_t loops = CeilDivU16(mSteps, kB8MStep);
-        const uint32_t dstStrideElems =
+
+        // Variant 7: no chunking at all -- one call at the full mStep. The b8
+        // restriction this loop exists for may not apply on every CANN.
+        if (variant == 7) {
+            p.mStartPosition = 0;
+            p.mStep = mSteps;
+            AscendC::LoadData(tb2, tb1, p);
+            return;
+        }
+
+        // CANN's dstAddrStride is CeilAlign(madN, ALIGN_NUM) * ONE_BLK_SIZE,
+        // and CeilAlign rounds UP to a multiple, so at n = 256 that is
+        // 256 * 32 = 8192 elements -- exactly one chunk's k-rows x n.
+        uint32_t dstStrideElems =
             static_cast<uint32_t>(CeilDivU16(n, kFractalRows)) * kFractalRows * kC0;
+        if (variant == 1) {
+            dstStrideElems /= kC0;  // the same figure read as 32-byte blocks
+        } else if (variant == 2) {
+            dstStrideElems = static_cast<uint32_t>(CeilDivU16(n, kFractalRows)) * kC0;
+        }
+
+        const uint16_t loops = CeilDivU16(mSteps, kB8MStep);
         p.mStep = kB8MStep;
         uint32_t dstOffset = 0;
+        AscendC::TPipe *pipe = GetTPipePtr();
         for (uint16_t i = 0; i < loops; ++i) {
             p.mStartPosition = static_cast<uint32_t>(kB8MStep) * i;
             AscendC::LoadData(tb2[dstOffset], tb1, p);
+            /*
+             * An MTE1 -> M set/wait after EVERY chunk, and it is not redundant
+             * with the one Compute issues.
+             *
+             * Compute's single set/wait is enough on the first Cube GEMM of a
+             * process and not on the ones after it: with a dirty event state
+             * left by an earlier launch, the Mmad issues against an L0B whose
+             * second chunk LoadData has not finished writing, and reads zeros
+             * there. The failure is total rather than partial -- the whole
+             * product comes back zero -- which is what makes it read as a
+             * layout error rather than a race.
+             *
+             * Measured by test_sim_950pr_cube_gemm's LoadBFromKnVariantSweep:
+             * with this sync the context GEMM is exact at every position in the
+             * launch order; without it, exact only when it runs first. Variant 4
+             * of that sweep is this path without the sync, kept so the pair can
+             * be re-measured.
+             */
+            if (variant != 4) {
+                const event_t ev = static_cast<event_t>(pipe->FetchEventID(AscendC::HardEvent::MTE1_M));
+                AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(ev);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(ev);
+            }
+            if (variant == 3) {
+                AscendC::PipeBarrier<PIPE_MTE1>();
+            }
             dstOffset += dstStrideElems;
         }
     }

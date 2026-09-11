@@ -178,8 +178,9 @@ const std::string& SimulatorEvidence();
 //
 // -DVLLM_ASCEND_TESTS_ENABLE_WIP_CUBE=ON flips the default for a tree dedicated
 // to fixing that path; the environment variable still decides in both
-// directions. The same pair gates the Cube legs of
-// bench_device_950pr_turboquant.
+// directions. bench_device_950pr_turboquant reads the same environment variable
+// but defaults the other way -- its Cube legs are on, and VLLM_ASCEND_TQ_CUBE_WIP=0
+// drops them -- so setting the variable at all keeps the two tiers in step.
 #if defined(VLLM_ASCEND_TQ_CUBE_WIP_DEFAULT_ON)
 constexpr bool kCubeWipDefaultOn = true;
 #else

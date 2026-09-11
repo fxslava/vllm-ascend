@@ -38,18 +38,29 @@
 // WHAT IS ASSERTED, in increasing strength:
 //
 //   dispatch    every mode's write and decode launch returns ACL_SUCCESS and the
-//               stream synchronises. This is the only thing kv3fp4 and kv4fp8
-//               are held to.
-//   finite      kv5fp8's output is entirely finite and not identically zero.
-//   fidelity    kv5fp8's output against an fp32 host reference. The bound is
-//               deliberately loose (see kSmokeCos) and is NOT the cos > 0.995
+//               stream synchronises. This is the only thing kv3fp4 is held to.
+//   finite      every mode's output is entirely finite and not identically zero.
+//   fidelity    kv4fp8's and kv5fp8's output against an fp32 host reference.
+//               Both expand onto the same fp8 e4m3fn operand grid and differ
+//               only in the codebook, so a structural defect in one -- a
+//               transposed K operand, a nibble read from the wrong plane, an NZ
+//               band placed at the wrong stride -- shows up in both. The bound
+//               is deliberately loose (see kSmokeCos) and is NOT the cos > 0.995
 //               gate, whose measurement lives in
-//               scripts/tq_multimode_calibration.py.
+//               scripts/tq_multimode_calibration.py; there kv4fp8 reaches
+//               0.98785 and kv5fp8 0.99613 at S = 512.
+//
+//               kv3fp4 is exempt because its operand grid is fp4 e2m1, which
+//               costs it more than its codebook does: the same script measures
+//               0.92813, and a bound loose enough to admit that would not catch
+//               anything.
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -72,10 +83,59 @@ namespace tqm = vllm_ascend::turboquant;
 constexpr int64_t kHeadSize = 256;
 constexpr int64_t kNumHeads = 4;
 constexpr int64_t kNumKvHeads = 2;
-constexpr int64_t kBlockSize = 16;
-constexpr int64_t kContextLen = 16;
+// 128, the production block size, and NOT the 16 the rest of this tier uses to
+// keep camodel passes short. The Cube decode tiles the packed cache in
+// kCubeTileRows = 64 row blocks and requires that to divide block_size:
+// CopyInTile issues one 64-row DataCopy per tile unconditionally, so at
+// block_size 16 it reads 48 rows past the end of the block it was given -- into
+// the next blocks of the pool, and past the end of the cache and scale-plane
+// allocations entirely when the block is the last one. The garbage that pulls
+// into the per-row scale lanes is multiplied into the score row before the
+// invalid columns are masked, which is where the vec_err_idata_inf_nan flood
+// came from. It is a shape this kernel does not support, not a kernel defect.
+//
+// It costs nothing here: at S <= 128 the tile loop still runs one 64-row tile,
+// because rows is clamped to the context length.
+constexpr int64_t kBlockSize = 128;
+constexpr int64_t kDefaultContextLen = 16;
 constexpr int64_t kQueryTokens = 1;
-constexpr int64_t kNumBlocks = 4;
+constexpr int64_t kMinBlocks = 4;
+
+// The context length this process decodes at, from ASCEND_TQ_SIM_CONTEXT.
+//
+// It is a run-time value and not a constant because the thing this binary is
+// used for varies with it: at the default 16 the decode is a single Cube tile
+// and what is being checked is that the pipeline runs at all, while at 512 or
+// 2048 it is many tiles and what is being checked is multi-tile addressing and
+// deep-context stability. One process, one context length -- the camodel is
+// cycle-level and a sweep inside one process is a sweep of multi-minute passes.
+//
+// Parsed once. Anything unparseable or non-positive falls back to the default
+// rather than running a shape nobody asked for.
+int64_t ContextLen() {
+  static const int64_t value = [] {
+    const char* raw = std::getenv("ASCEND_TQ_SIM_CONTEXT");
+    if (raw == nullptr || *raw == '\0') {
+      return kDefaultContextLen;
+    }
+    const long long parsed = std::strtoll(raw, nullptr, 10);
+    if (parsed <= 0) {
+      std::printf("[ multimode ] ASCEND_TQ_SIM_CONTEXT='%s' did not parse; using %lld\n", raw,
+                  static_cast<long long>(kDefaultContextLen));
+      return kDefaultContextLen;
+    }
+    return static_cast<int64_t>(parsed);
+  }();
+  return value;
+}
+
+int64_t BlocksPerSeq() { return (ContextLen() + kBlockSize - 1) / kBlockSize; }
+
+// The block pool. Deliberately larger than the sequence needs so the block
+// table is a genuine scatter rather than a run of consecutive blocks, which is
+// what makes the paged addressing real -- at the default context that is the
+// original pool of 4 for a 1-block sequence.
+int64_t NumBlocks() { return std::max(kMinBlocks, BlocksPerSeq() * 4); }
 constexpr float kInvSqrtHeadSize = 0.0625f;  // 1 / sqrt(256), exact in fp32
 constexpr float kAttentionScale = kInvSqrtHeadSize;
 
@@ -106,13 +166,14 @@ double Cosine(const std::vector<float>& a, const std::vector<float>& b) {
 // evidence about the pipeline as a whole and not about one stage.
 std::vector<float> HostAttention(const std::vector<float>& query, const std::vector<float>& key,
                                  const std::vector<float>& value) {
+  const int64_t context_len = ContextLen();
   std::vector<float> out(static_cast<size_t>(kNumHeads * kHeadSize), 0.0f);
   const int64_t heads_per_kv = kNumHeads / kNumKvHeads;
   for (int64_t h = 0; h < kNumHeads; ++h) {
     const int64_t kv = h / heads_per_kv;
-    std::vector<double> logits(static_cast<size_t>(kContextLen), 0.0);
+    std::vector<double> logits(static_cast<size_t>(context_len), 0.0);
     double max_logit = -1e30;
-    for (int64_t t = 0; t < kContextLen; ++t) {
+    for (int64_t t = 0; t < context_len; ++t) {
       double dot = 0.0;
       for (int64_t d = 0; d < kHeadSize; ++d) {
         dot += static_cast<double>(query[static_cast<size_t>(h * kHeadSize + d)]) *
@@ -122,11 +183,11 @@ std::vector<float> HostAttention(const std::vector<float>& query, const std::vec
       max_logit = std::max(max_logit, logits[static_cast<size_t>(t)]);
     }
     double denom = 0.0;
-    for (int64_t t = 0; t < kContextLen; ++t) {
+    for (int64_t t = 0; t < context_len; ++t) {
       logits[static_cast<size_t>(t)] = std::exp(logits[static_cast<size_t>(t)] - max_logit);
       denom += logits[static_cast<size_t>(t)];
     }
-    for (int64_t t = 0; t < kContextLen; ++t) {
+    for (int64_t t = 0; t < context_len; ++t) {
       const double w = logits[static_cast<size_t>(t)] / denom;
       for (int64_t d = 0; d < kHeadSize; ++d) {
         out[static_cast<size_t>(h * kHeadSize + d)] += static_cast<float>(
@@ -157,7 +218,7 @@ ModeRun RunMode(tqm::TurboQuantMode mode, const std::vector<float>& key, const s
   DeviceBuffer slots_dev = DeviceBuffer::FromHost(slots);
   DeviceBuffer block_table_dev = DeviceBuffer::FromHost(block_table);
   DeviceBuffer context_dev =
-      DeviceBuffer::FromHost(std::vector<int32_t>{static_cast<int32_t>(kContextLen)});
+      DeviceBuffer::FromHost(std::vector<int32_t>{static_cast<int32_t>(ContextLen())});
   DeviceBuffer pi_signs = DeviceBuffer::FromHost(tqh::PiSigns(kHeadSize));
 
   // Two table images. The rotation one is the shipping 4-bit codec's, because
@@ -170,16 +231,16 @@ ModeRun RunMode(tqm::TurboQuantMode mode, const std::vector<float>& key, const s
       DeviceBuffer::FromHost(tqh::ModeTables(mode, kHeadSize, tqh::kUnpackRows, tqh::kCubeTileRows));
 
   DeviceBuffer key_cache = DeviceBuffer::Empty<int8_t>(
-      tqh::ModePackedCacheBytes(mode, kNumBlocks, kBlockSize, kNumKvHeads, kHeadSize));
+      tqh::ModePackedCacheBytes(mode, NumBlocks(), kBlockSize, kNumKvHeads, kHeadSize));
   DeviceBuffer value_cache = DeviceBuffer::Empty<int8_t>(key_cache.size_bytes());
   DeviceBuffer scale_plane =
-      DeviceBuffer::Empty<float>(tqh::ScalePlaneFloats(kNumBlocks, kBlockSize, kNumKvHeads));
+      DeviceBuffer::Empty<float>(tqh::ScalePlaneFloats(NumBlocks(), kBlockSize, kNumKvHeads));
   DeviceBuffer out = DeviceBuffer::Empty<Half>(static_cast<size_t>(kNumHeads * kHeadSize));
 
   bool queried = false;
   const int64_t aiv_num = tqh::VectorCoreNum(&queried);
-  const tqh::ReshapeAndCacheGrid write_grid = tqh::PlanReshapeAndCache(kContextLen, aiv_num);
-  const int64_t blocks_per_seq = (kContextLen + kBlockSize - 1) / kBlockSize;
+  const tqh::ReshapeAndCacheGrid write_grid = tqh::PlanReshapeAndCache(ContextLen(), aiv_num);
+  const int64_t blocks_per_seq = (ContextLen() + kBlockSize - 1) / kBlockSize;
   const tqh::CubeDecodeGrid decode_grid =
       tqh::PlanCubeDecode(kQueryTokens, kNumHeads, kNumKvHeads, kHeadSize, blocks_per_seq, aiv_num);
   run.num_splits = decode_grid.num_splits;
@@ -189,7 +250,7 @@ ModeRun RunMode(tqm::TurboQuantMode mode, const std::vector<float>& key, const s
   turboquant_mm_reshape_and_cache_impl(
       static_cast<int32_t>(mode), AscendType::FP16, stream, write_grid.block_dim, key_dev.get(), value_dev.get(),
       key_cache.get(), value_cache.get(), scale_plane.get(), slots_dev.get(), pi_signs.get(), rot_tables.get(),
-      write_tables.get(), static_cast<uint32_t>(kContextLen), static_cast<uint32_t>(kNumKvHeads),
+      write_tables.get(), static_cast<uint32_t>(ContextLen()), static_cast<uint32_t>(kNumKvHeads),
       static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kBlockSize), write_grid.tokens_per_core,
       kInvSqrtHeadSize);
   ACL_CHECK(aclrtSynchronizeStream(stream));
@@ -218,29 +279,56 @@ ModeRun RunMode(tqm::TurboQuantMode mode, const std::vector<float>& key, const s
   return run;
 }
 
+// The modes this process runs, from ASCEND_TQ_SIM_MODES as a comma-separated
+// list of the names below; empty or unset runs all three.
+//
+// One mode per process is the useful form when what is being asked is "does
+// this rate fault or hang at this shape", because a camodel pass is minutes and
+// a fault in the first mode costs the others. gtest's own --gtest_filter cannot
+// express it: the three modes are a loop inside one test, not three tests.
+bool ModeSelected(const char* name) {
+  const char* raw = std::getenv("ASCEND_TQ_SIM_MODES");
+  if (raw == nullptr || *raw == '\0') {
+    return true;
+  }
+  const std::string wanted(raw);
+  const std::string needle(name);
+  size_t at = wanted.find(needle);
+  while (at != std::string::npos) {
+    const bool left = at == 0 || wanted[at - 1] == ',';
+    const size_t after = at + needle.size();
+    const bool right = after == wanted.size() || wanted[after] == ',';
+    if (left && right) {
+      return true;
+    }
+    at = wanted.find(needle, at + 1);
+  }
+  return false;
+}
+
 TEST(TurboQuantMultiMode, SingleShotDispatchAndFidelity) {
   REQUIRE_ASCEND_950PR();
-  // Opt-in, and the reason is a hang rather than a failure:
-  // TurboQuantCubeMm::Init allocates L0A/L0B/L0C on both halves of the MIX
-  // kernel, and those pools do not exist on a vector core.
+  // Still opt-in, but no longer because it stalls: the L0-on-the-vector-core
+  // allocation that produced `pem_lsu: unrecognize ldst addr` is fixed. What is
+  // open is the score GEMM's [n, k] B operand, which is a wrong number rather
+  // than a dead stream, so the fidelity bound below is the thing at risk.
   REQUIRE_CUBE_WIP_OPT_IN("The Cube-native multi-mode decode",
-                          "it dispatches and then stalls in the split kernel on pem_lsu "
-                          "'unrecognize ldst addr'.");
+                          "the score GEMM's [n, k] B operand does not reproduce the host product.");
 
   DeterministicRandom rng(0x5A17u);
-  const size_t kv_elems = static_cast<size_t>(kContextLen * kNumKvHeads * kHeadSize);
+  const size_t kv_elems = static_cast<size_t>(ContextLen() * kNumKvHeads * kHeadSize);
   const std::vector<float> key = rng.NormalHalfExact(kv_elems, 0.0f, 1.0f);
   const std::vector<float> value = rng.NormalHalfExact(kv_elems, 0.0f, 1.0f);
   const std::vector<float> query =
       rng.NormalHalfExact(static_cast<size_t>(kNumHeads * kHeadSize), 0.0f, 1.0f);
 
   // A non-identity block table, so paging is real rather than an offset of zero.
-  const std::vector<int32_t> permutation = rng.Permutation(static_cast<int32_t>(kNumBlocks));
-  const int64_t blocks_per_seq = (kContextLen + kBlockSize - 1) / kBlockSize;
+  const std::vector<int32_t> permutation = rng.Permutation(static_cast<int32_t>(NumBlocks()));
+  const int64_t blocks_per_seq = (ContextLen() + kBlockSize - 1) / kBlockSize;
   const std::vector<int32_t> block_table(permutation.begin(),
                                          permutation.begin() + static_cast<size_t>(blocks_per_seq));
-  std::vector<int32_t> slots(static_cast<size_t>(kContextLen));
-  for (int64_t i = 0; i < kContextLen; ++i) {
+  std::vector<int32_t> slots(static_cast<size_t>(ContextLen()));
+  for (int64_t i = 0; i < ContextLen(); ++i) {
     const int32_t block = block_table[static_cast<size_t>(i / kBlockSize)];
     slots[static_cast<size_t>(i)] = block * static_cast<int32_t>(kBlockSize) + static_cast<int32_t>(i % kBlockSize);
   }
@@ -252,18 +340,27 @@ TEST(TurboQuantMultiMode, SingleShotDispatchAndFidelity) {
   struct ModeCase {
     tqm::TurboQuantMode mode;
     const char* name;
-    bool primary;
+    bool assert_fidelity;
   };
-  // kv5fp8 first: it is the one the fidelity assertion is on, and running it
-  // before the scaffolded modes means a failure there is reported before two
-  // more multi-minute camodel passes have been spent.
+  // The two fp8 rates first: they carry the fidelity assertion, and running
+  // them before the scaffolded fp4 mode means a failure there is reported
+  // before another multi-minute camodel pass has been spent.
   const ModeCase cases[] = {
       {tqm::TurboQuantMode::KV5_FP8, "kv5fp8", true},
-      {tqm::TurboQuantMode::KV4_FP8, "kv4fp8", false},
+      {tqm::TurboQuantMode::KV4_FP8, "kv4fp8", true},
       {tqm::TurboQuantMode::KV3_FP4, "kv3fp4", false},
   };
 
+  std::printf("[ multimode ] shape: S=%lld head_size=%lld heads=%lld kv_heads=%lld block=%lld pool=%lld\n",
+              static_cast<long long>(ContextLen()), static_cast<long long>(kHeadSize),
+              static_cast<long long>(kNumHeads), static_cast<long long>(kNumKvHeads),
+              static_cast<long long>(kBlockSize), static_cast<long long>(NumBlocks()));
+
   for (const ModeCase& mode_case : cases) {
+    if (!ModeSelected(mode_case.name)) {
+      std::printf("[ multimode ] %s: not selected by ASCEND_TQ_SIM_MODES; skipped\n", mode_case.name);
+      continue;
+    }
     const tqm::TurboQuantModeConfig cfg = tqm::TurboQuantModeConfigOf(mode_case.mode);
     std::printf("[ multimode ] %s: %d bits, %d levels, %lld packed bytes/vector, %s\n", mode_case.name, cfg.bits,
                 cfg.levels, static_cast<long long>(cfg.PackedBytes(kHeadSize)),
@@ -303,9 +400,9 @@ TEST(TurboQuantMultiMode, SingleShotDispatchAndFidelity) {
     const double cos = Cosine(reference, run.output);
     std::printf("[ multimode ] %s: cos vs fp32 host reference = %.6f\n", mode_case.name, cos);
 
-    if (mode_case.primary) {
+    if (mode_case.assert_fidelity) {
       EXPECT_GT(cos, kSmokeCos)
-          << "kv5fp8 decode does not track the host reference at S=" << kContextLen
+          << mode_case.name << " decode does not track the host reference at S=" << ContextLen()
           << "; this bound is a structural check, not the cos > 0.995 gate -- see the file header";
     }
   }
