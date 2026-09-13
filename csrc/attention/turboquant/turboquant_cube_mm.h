@@ -15,28 +15,10 @@
  */
 
 /*
- * The Cube half of the TurboQuant decode: two GEMMs per K/V tile, with the
- * operand type chosen by the mode.
+ * Cube-side TurboQuant GEMM support for the selected mode.
  *
- * DATA PATH  L1 (ping-pong, kSlots deep) -> L0A/L0B via MTE1 load2d -> L0C via
- *            Mmad -> UB via Fixpipe. This class owns L1 on both halves of the
- *            MIX kernel and L0A/L0B/L0C on the AIC alone; allocating L0 on a
- *            vector core hands it a base it cannot reach.
- *
- * OPERAND    Mmad dispatches on <DstT, Src0T, Src1T>: fp8_e4m3fn -> mad
- *            (kv4fp8, kv5fp8), fp4x2_e2m1 -> mad_mx (kv3fp4), so the
- *            instruction follows from TurboQuantModeTraits<MODE>::kOperand.
- *
- * LAYOUT     Operands reach L1 already in NZ and there is no way around it: the
- *            L1 -> L0 path addresses L1 as 16 x C0 fractals, which a flat ND
- *            image cannot be sliced into at any parameterisation. NzOffset()
- *            below is the permutation. Who applies it differs by mode -- the
- *            codebook path rides the unpack's Gather, the affine path moves it
- *            upstream into the GM -> UB read. See TURBOQUANT_TESTS.md 13.5 for
- *            the load2d fractal contract and 13.9 for the affine staging.
- *
- * The accumulator stays in UB rather than L0C: flash decoding rescales it by
- * exp(m_old - m_new) every tile and that multiply has no expression on the Cube.
+ * This header keeps the operand type, tile sizes, and L1/L0 ownership model
+ * described by the Ascend-C kernel contracts.
  */
 
 #ifndef VLLM_ASCEND_ATTENTION_TURBOQUANT_CUBE_MM_H

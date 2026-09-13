@@ -15,54 +15,10 @@
  */
 
 /*
- * The multi-rate TurboQuant codec: encode at 3, 4 or 5 bits, and expand
- * straight onto the Cube's operand grid.  It does not carry the rotation; a
- * kernel using it owns a TurboQuantCodec4 for ApplyPi.
+ * Multi-rate TurboQuant codec support for the MX packing format.
  *
- * A code splits into a `low` digit of kLowBits and an `msb` digit of kMsbBits,
- * stored in separate byte-aligned planes inside the vector slot:
- *
- *   mode     low plane                 msb plane            slot (d=256)
- *   kv3fp4   2 bits, 4 digits/byte      1 bit, 8/byte       64 + 32 =  96 B
- *   kv4fp8   4 bits, 2 digits/byte      --                  128 +  0 = 128 B
- *   kv5fp8   4 bits, 2 digits/byte      1 bit, 8/byte       128 + 32 = 160 B
- *
- * No code straddles a byte.
- *
- * TWO EXPAND PATHS, and which one a mode takes is TurboQuantModeTraits::
- * kIsAffine.
- *
- * kv3fp4 and kv5fp8 store a Lloyd-Max *index*, so the expand is
- * Unpack(): a UB Gather to bring each channel's byte to its lane, ExtractDigit
- * to isolate the digit, and a second Gather through the centroid table.  Digit j
- * of a byte is extracted at any radix by
- *
- *     t   = byte * radix^-(p mod digitsPerByte)      one Mul against a block
- *     t   = floor(t)
- *     h   = floor(t / radix)
- *     dig = t - radix * h                            i.e. t mod radix
- *
- * Every period divides the 8 fp32 lanes of a 32-byte block, so the reciprocal
- * and weight tables are a single block applied with
- * src1BlkStride = src1RepStride = 0.
- *
- * kv4fp8 is affine: the code IS the level, so there is no table to look up and
- * UnpackAffine() is two integer shifts and an Adds over a *contiguous* run of
- * bytes.  That removes both Gathers, and with them the only reason the expand
- * had to know where a channel lands -- which is what lets the decode stage L1
- * with flat sequential DataCopy.  For that to work the packing is plane-split
- * rather than interleaved:
- *
- *     byte b  =  q[b]  +  16 * q[b + len/2]      b in [0, len/2)
- *
- * so the low nibbles of one slot are the first half of the vector in order and
- * the high nibbles the second half, both contiguous.  An interleaved
- * (2b, 2b+1) packing would need a stride-2 scatter to undo, and AscendC has no
- * element-stride-2 vector move -- blkStride counts 32-byte blocks -- which is
- * exactly why the old layout needed the Gather.
- *
- * The arch35 vector converter has no fp32 <-> fp4 leg -- only
- * bf16 <-> fp4x2_e2m1 -- so kv3fp4 expands fp32 -> bf16 -> fp4x2_e2m1.
+ * The codec expands low-bit packed KV planes to the operand format used by
+ * the Cube-native GEMM kernels and keeps the encode/decode table contract.
  */
 
 #ifndef VLLM_ASCEND_ATTENTION_TURBOQUANT_CODEC_MX_H

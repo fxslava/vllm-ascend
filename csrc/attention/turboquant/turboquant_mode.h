@@ -15,53 +15,10 @@
  */
 
 /*
- * TurboQuantMode: the three storage rates of the Cube-native KV cache, and the
- * layout, codebook and Cube operand type each of them implies.
+ * TurboQuant mode definitions for the three KV-cache storage formats.
  *
- *   mode     bits  levels  bytes/vec(d=256)  operand grid  Cube instruction
- *   kv3fp4     3       8          96          fp4 e2m1      mad_mx
- *   kv4fp8     4      16         128          fp8 e4m3fn    mad
- *   kv5fp8     5      32         160          fp8 e4m3fn    mad
- *
- * All three share one pipeline: the AIV rotates with Pi = D H D, bins the
- * coordinates against a table of decision boundaries for N(0,1) at kBits,
- * packs, and later expands straight onto the Cube's operand grid; the Cube runs
- * two GEMMs with fp32 accumulate; the AIV un-rotates the accumulator.
- *
- * WHAT SEPARATES kv4fp8 FROM THE OTHER TWO: it is *affine*.  Its 16 levels are
- * uniform, so the stored 4-bit code is the reconstruction level and not an
- * index into a table -- the operand is q - kAffineBias, which the decoder
- * reaches with one Adds.  kv3fp4 and kv5fp8 store a Lloyd-Max index and expand
- * it through a centroid Gather in UB.
- *
- * The affine form costs 0.746 dB of codebook SNR against Lloyd-Max at 16 levels
- * (D 0.011543 against 0.009720) and the attention cosine barely notices:
- * 0.9864 against 0.9894 at S = 64 and 0.9863 against 0.9863 at S = 512, both
- * measured by scripts/tq_multimode_calibration.py.  What it buys is the whole
- * expand stage -- see TurboQuantModeCodec::UnpackAffine, which has no Gather at
- * all where the codebook path has two.
- *
- * On arch35 MmadCal dispatches to mad_mx for
- * <float, fp4x2_e2m1_t, fp4x2_e2m1_t> and to mad for
- * <float, fp8_e4m3fn_t, fp8_e4m3fn_t>.  Mixed operand types are rejected by a
- * static_assert, so kv3fp4 must put the query and the softmax row on the fp4
- * grid as well; kv3fp4 is scaffolded, not recommended.
- *
- * The stored table is cast(g * c) for a per-mode gain g, and the decoder
- * reconstructs (s / g) * lut[q], folding 1/g into the per-vector scale it
- * already multiplies by.  Without the gain a Lloyd-Max codebook's centroids are
- * not grid points of e2m1 or e4m3fn.  For an affine mode the same field carries
- * the reciprocal of the quantizer step: the levels are the integers q - bias,
- * which are exact in e4m3fn for every q, and g = 1 / step is what turns them
- * back into coordinates.
- *
- * The tables below are generated:
- *
- *     python scripts/tq_multimode_calibration.py --emit-header
- *
- * This header is deliberately free of AscendC types in its layout half, so the
- * host side can include it and size buffers from the same arithmetic the device
- * indexes with.
+ * The mode enum and traits describe the 3-bit, 4-bit and 5-bit codebook
+ * layouts and the corresponding Cube operand path.
  */
 
 #ifndef VLLM_ASCEND_ATTENTION_TURBOQUANT_MODE_H
