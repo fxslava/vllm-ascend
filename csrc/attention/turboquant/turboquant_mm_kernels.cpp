@@ -15,22 +15,10 @@
  */
 
 /*
- * npu_turboquant_mm_* -- the Cube-native TurboQuant decode for Ascend 950PR.
+ * Cube-native TurboQuant decode kernels for the 950PR path.
  *
- * TOPOLOGY   1 AIC : 2 AIV per MIX block. Both vector subcores run the same
- *            task and stage identical bytes; only subcore 0 consumes the Cube's
- *            product. See TURBOQUANT_TESTS.md 13.14.1-13.14.3.
- *
- * DATA PATH  HBM -> UB -> L1 (ping-pong, kSlots deep) -> L0A/L0B -> L0C -> UB
- *            -> GM.  The AIV owns the query rotation, the K/V unpack onto the
- *            operand grid, the online softmax and the accumulator; the AIC owns
- *            both GEMMs.
- *
- * SCHEDULE   One task is (token, kvHead, split), producing one flash-decoding
- *            partial per query head in the group. Within a task the K/V staging
- *            runs one tile ahead of the GEMMs that consume it: the Cube reads
- *            L1[tile % kSlots] while the AIV fills L1[(tile + 1) % kSlots].
- *            See TURBOQUANT_TESTS.md 13.11.
+ * The file implements the packed-cache reshape and the split decode/partial
+ * combine pipeline used by the AIC/AIV TurboQuant mixer.
  */
 
 #include "kernel_operator.h"
@@ -96,34 +84,20 @@ constexpr uint32_t kPartialSumLane = kFp32PerBlock;
 
 constexpr float kNegInf = -3.4028235e38f;
 
-/*
- * The block index an AIC and its paired AIV subcores agree on.
- *
- * GetBlockIdx() does not mean the same thing on the two halves of a MIX kernel;
- * keying a task loop on it deadlocks any kernel whose tiles carry a cross-core
- * handshake. Not for a pure-vector kernel -- see TurboQuantPlainCombine, which
- * keeps GetBlockIdx(). See TURBOQUANT_TESTS.md 13.14.3.
- */
+// Use the MIX block index consistently across the AIC/AIV pair.
+// Avoid using GetBlockIdx() directly in cross-core handshakes.
 __aicore__ inline uint32_t MixBlockIdx()
 {
     return static_cast<uint32_t>(AscendC::GetBlockIdx() / AscendC::GetSubBlockNum());
 }
 
-/*
- * Operand-ready, vector half -> cube half. Issued by BOTH subcores: a mode 0x02
- * flag is satisfied only once every subcore of the pair has set it, so gating
- * this starves the AIC. See TURBOQUANT_TESTS.md 13.14.2.
- */
+// Cross-core operand-ready signal used by the paired AIC/AIV split.
 __aicore__ inline void SignalOperandsReady()
 {
     AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(vllm_ascend::turboquant::kFlagOperandsReady);
 }
 
-/*
- * The pipelined decode's two AIV -> AIC edges. Both ungated, including
- * SignalProbsReady, whose payload only subcore 0 produces: mode 0x02 holds the
- * AIC until that subcore has signalled too. See TURBOQUANT_TESTS.md 13.14.2.
- */
+// AIV -> AIC edge helpers for the decode pipeline.
 __aicore__ inline void SignalSlotReady(uint32_t slot)
 {
     AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(
@@ -135,21 +109,13 @@ __aicore__ inline void SignalProbsReady()
     AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(vllm_ascend::turboquant::kFlagProbsReady);
 }
 
-/*
- * True on the one vector subcore whose UB the Cube's Fixpipe landed in. Gates
- * what CONSUMES a product; never the flag protocol, which stays ungated.
- * See TURBOQUANT_TESTS.md 13.14.1.
- */
+// Identify the subcore that owns the fixed-product consumer in the mixed kernel.
 __aicore__ inline bool IsPrimarySubcore()
 {
     return AscendC::GetSubBlockIdx() == 0;
 }
 
-/*
- * Vector -> MTE3, before any DMA of a UB buffer the vector unit just wrote.
- * Sets and immediately waits, so it is correct at a blocking call site and wrong
- * inside a software pipeline. See TURBOQUANT_TESTS.md 13.14.4.
- */
+// Vector -> MTE3 synchronization point for a producer buffer that is about to be DMA-consumed.
 __aicore__ inline void SyncVectorToMte3()
 {
     const event_t ev = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::V_MTE3));
@@ -157,9 +123,7 @@ __aicore__ inline void SyncVectorToMte3()
     AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(ev);
 }
 
-// MTE2 -> vector, before reading a UB buffer a GM copy just filled. A
-// PipeBarrier<PIPE_MTE2> would NOT do: it orders MTE2 against MTE2 and says
-// nothing about the vector pipe. See TURBOQUANT_TESTS.md 13.14.4.
+// MTE2 -> vector synchronization point before a GM-filled UB buffer is read by the vector side.
 __aicore__ inline void SyncMte2ToVector()
 {
     const event_t ev = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE2_V));
@@ -167,9 +131,7 @@ __aicore__ inline void SyncMte2ToVector()
     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(ev);
 }
 
-// MTE3 -> vector: the write-after-read edge, for a UB buffer the vector unit is
-// about to overwrite while a DMA may still be draining it. The opposite
-// direction to SyncVectorToMte3, and not covered by it.
+// MTE3 -> vector edge for a write-after-read UB buffer reused by the vector path.
 __aicore__ inline void SyncMte3ToVector()
 {
     const event_t ev = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE3_V));
