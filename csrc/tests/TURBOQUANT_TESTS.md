@@ -1803,3 +1803,92 @@ have passed `cos` as well.
   device tier). Giving each head its own slot in the finished `scoreBuf_` removes
   the hazard at any group width, and lets the whole writeback run on one
   V -> MTE3 edge instead of one per head.
+
+### 13.17 UB placement beats instruction count, and a query buffer that was never allocated
+
+Three changes, aimed at the SCALAR share 13.16 pointed at. The headline result is
+not the one that was aimed for.
+
+| | cos | total tick |
+|---|---|---|
+| after 13.16 | 0.986033 | 66,188 / 66,196 |
+| this pass | 0.986033 | **63,832 / 63,820** |
+
+-3.6%, cumulative -6.9% from 68,580. 32/32 `core*.excp_log.dump` empty, clean
+under `-Werror` in both run modes.
+
+#### `qInQueue_` was declared, used, and never InitBuffer'd
+
+`TurboQuantCubeDecodeSplit` ran its per-head query load through a
+`TQue<VECIN, 1>` that appears nowhere in `Init`'s allocation list. `AllocTensor`
+on an unallocated queue hands back a base of 0, so the load was writing to -- and
+the cast reading from -- **the bottom of UB, aliasing whatever buffer sits
+there**. It produced the right answer because nothing happened to touch that
+region between the copy and the cast.
+
+This is the failure mode of 13.13 reached by a different route, and unlike 13.13
+it raised no exception: `su_ccu_mpu_err` fires when the aliased address is
+*unmapped*, not when it merely belongs to something else. cos was exact
+throughout. **Neither the fidelity gate nor the exception gate can see this
+class of bug** -- only reading the allocation list can.
+
+Replaced with a real `TBuf`, and since the group's heads are consecutive in GM
+the whole group now loads in one burst instead of one per head, with one
+MTE2 -> V edge instead of the (absent) per-head ones.
+
+#### 8 KB at the front of the allocation order cost 8.3%
+
+The first version sized the new buffer for `kMaxGroupHeads` and allocated it
+before `qBuf_`. Identical code, one measurement:
+
+| `qInBuf_` | size | position | tick |
+|---|---|---|---|
+| first attempt | `kMaxGroupHeads * headSize_` (8 KB) | before `qBuf_` | **71,707** |
+| shipped | `groupHeads_ * headSize_` (1 KB) | last | **63,832** |
+
+**7,875 ticks, 12%, from moving one `InitBuffer` call and sizing it for the
+actual group.** Inserting a buffer at the front shifts the base address of every
+buffer after it, and this kernel is sensitive to those addresses far beyond
+anything instruction-level attempted in this session. Anyone adding a UB buffer
+here should append it and size it to the shape actually in use; doing otherwise
+is worth more than every optimisation in 13.12 through 13.16 combined, in the
+wrong direction.
+
+#### The win was PUSHQ, not SCALAR
+
+The pass targeted the SCALAR share. It did not move it:
+
+| AIV subcore 0 | before | after | delta |
+|---|---|---|---|
+| span | 64,512 | 62,799 | -1,713 |
+| SCALAR | 22,776 (35.3%) | 23,059 (**36.7%**) | **+283** |
+| PUSHQ | 3,483 | 1,995 | **-1,488** |
+| RVECST | 11,776 | 11,165 | -611 |
+| instructions | 35,036 | 34,911 | -125 |
+
+SCALAR rose in both absolute and relative terms. The saving is `PUSHQ` -- the
+queue-push unit -- which is what deleting `4 * groupHeads_` `TQue` operations
+should hit, plus vector stores.
+
+**That is twice running that the predicted mechanism was wrong while the change
+still worked** (13.16 predicted `RV_SMEM_BAR`, got SCALAR; this predicted SCALAR,
+got `PUSHQ`). The counter shares are useful for finding *what is large*, and
+unreliable for predicting *what a given edit will move*. Measure the edit; do not
+reason forward from the share.
+
+#### What was not done, and why
+
+- **`qScale_[h] = reduce.GetValue(...)`** stays. Two scalar reads per *task*.
+  Holding the factor in UB instead replaces a `Muls` immediate with a broadcast
+  `Mul` over every score row, per head, **per tile** -- a wash at `S = 64` where
+  there is one tile, and a regression at production context lengths.
+- **Batching `ApplyPi` across heads** stays undone. The rotation is `Init`'d at
+  `batchRows = 1` and its Gather offset tables are sized to that, so batching is
+  surgery on a codec the encode path shares. It is also the only remaining
+  candidate that could plausibly reach 63,000: `RV_VADD` + `RV_VSUB` is ~4.9% of
+  the span. It needs a multi-tile gate first.
+- **Hoisting invariant address arithmetic**, the nominal target of this pass, was
+  dropped after profiling. The PC histogram shows the loop bodies that do that
+  arithmetic running at **0.76-1.03 cycles per instruction**; the expensive PC
+  windows execute 51-128 times at 8-40 cycles each. There is no hot loop to hoist
+  out of, only stalls.

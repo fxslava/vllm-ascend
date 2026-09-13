@@ -513,6 +513,9 @@ public:
         pipe_->InitBuffer(reduceBuf_, 4 * kMaxGroupHeads * kFp32PerBlock * sizeof(float));
         pipe_->InitBuffer(signBuf_, headSize_ * sizeof(float));
         pipe_->InitBuffer(scaleIdxBuf_, 2 * kCubeTileRows * sizeof(int32_t));
+        // Allocated last, and sized for the actual group rather than the widest
+        // one, so every other buffer keeps the base address it had.
+        pipe_->InitBuffer(qInBuf_, groupHeads_ * headSize_ * sizeof(scalar_t));
 
         rotation_.Init(pipe_, headSize_, 1, invSqrtLen, rotTablesGm_);
         // The affine codec reads headSize * batchRows as the element count one
@@ -566,9 +569,9 @@ private:
             AscendC::Duplicate(acc, 0.0f, kMaxGroupHeads * headSize_);
             AscendC::Duplicate(state, 0.0f, 6 * kMaxGroupHeads * kFp32PerBlock);
             AscendC::PipeBarrier<PIPE_V>();
-            for (uint32_t h = 0; h < groupHeads_; ++h) {
-                AscendC::Duplicate(runMax[h * kFp32PerBlock], kNegInf, 1);
-            }
+            // One broadcast over the slice: every read of runMax takes lane 0
+            // of a block, so filling the other seven costs nothing.
+            AscendC::Duplicate(runMax, kNegInf, groupHeads_ * kFp32PerBlock);
             AscendC::PipeBarrier<PIPE_V>();
         }
 
@@ -650,15 +653,21 @@ private:
                            kMaxGroupHeads * operandElems_);
         AscendC::PipeBarrier<PIPE_V>();
 
+        // The group's heads are consecutive in GM, so the whole group lands in
+        // one burst rather than one per head. This used to run through
+        // qInQueue_, which was never InitBuffer'd: AllocTensor handed back a
+        // base of 0 and the load aliased the bottom of UB. Same failure as
+        // TURBOQUANT_TESTS.md 13.13, reached by a different route.
+        AscendC::LocalTensor<scalar_t> qIn = qInBuf_.Get<scalar_t>();
+        AscendC::DataCopy(qIn,
+                          queryGm_[(static_cast<uint64_t>(token) * numHeads_ +
+                                    static_cast<uint64_t>(kvHead) * groupHeads_) * headSize_],
+                          groupHeads_ * headSize_);
+        SyncMte2ToVector();
+
         for (uint32_t h = 0; h < groupHeads_; ++h) {
-            const uint32_t head = kvHead * groupHeads_ + h;
-            AscendC::LocalTensor<scalar_t> q = qInQueue_.template AllocTensor<scalar_t>();
-            AscendC::DataCopy(q, queryGm_[(static_cast<uint64_t>(token) * numHeads_ + head) * headSize_], headSize_);
-            qInQueue_.EnQue(q);
-            q = qInQueue_.template DeQue<scalar_t>();
-            AscendC::Cast(vec, q, AscendC::RoundMode::CAST_NONE, headSize_);
+            AscendC::Cast(vec, qIn[h * headSize_], AscendC::RoundMode::CAST_NONE, headSize_);
             AscendC::PipeBarrier<PIPE_V>();
-            qInQueue_.FreeTensor(q);
 
             // q~ = Pi q.  Everything downstream lives in the rotated basis.
             rotation_.ApplyPi(vec, tmp, signs, static_cast<int>(headSize_));
@@ -1151,9 +1160,9 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
 
         // The running max advances only after alpha has been consumed.
-        for (uint32_t h = 0; h < groupHeads_; ++h) {
-            AscendC::Adds(runMax[h * kFp32PerBlock], newMax[h * kFp32PerBlock], 0.0f, 1);
-        }
+        // Lanes 1..7 of newMax are zero from the state init and nothing reads
+        // them, so the advance is one Adds over the slice.
+        AscendC::Adds(runMax, newMax, 0.0f, groupHeads_ * kFp32PerBlock);
         AscendC::PipeBarrier<PIPE_V>();
     }
 
@@ -1184,7 +1193,7 @@ private:
     TurboQuantCodec4 rotation_;
     Codec codec_;
     Mm mm_;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> qInQueue_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> qInBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> kvBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> scaleTileBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> operandBuf_;
