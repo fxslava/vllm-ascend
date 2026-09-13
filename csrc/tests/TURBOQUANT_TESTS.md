@@ -1737,3 +1737,69 @@ per-task costs (`PrepareTask`, the writeback) are amortised over a single tile,
 inflating their share against a long-context decode. The *ranking* --
 issue/sync >> arithmetic -- is robust; the percentages are shape-specific. The
 silicon `PipeUtilization` run above is how to confirm the first.
+
+### 13.16 Barrier narrowing: it worked, and not for the reason 13.15 gave
+
+Eight of the nine `PipeBarrier<PIPE_ALL>` in `TurboQuantCubeDecodeSplit` were
+replaced with the narrowest correct edge. The ninth is `Init`'s and runs once
+per kernel.
+
+| | cos | total tick |
+|---|---|---|
+| before (`c74fc1221`) | 0.986033 | 68,576 / 68,584 / 68,579 |
+| after | 0.986033 | 66,188 / 66,196 |
+
+Fidelity is bit-identical and all 32 `core*.excp_log.dump` stay empty.
+
+**13.15 predicted the win would show up as a fall in `RV_SMEM_BAR` and `DCCI`,
+and it did not.** Re-profiling `core0.veccore0` across the change:
+
+| | before | after | delta |
+|---|---|---|---|
+| span | 67,199 | 64,512 | **-2,687** |
+| SCALAR | 27,532 | 22,776 | **-4,756** |
+| `ST_XD_XN_IMM` | 12,420 | 10,250 | -2,170 |
+| `RV_SMEM_BAR` | 4,065 | 4,111 | +46 |
+| `DCCI` | 2,818 | 3,318 | +500 |
+| instructions | 35,035 | 35,036 | +1 |
+
+The barrier counters did not move; `DCCI` rose. The whole saving came out of
+SCALAR. **`PipeBarrier<PIPE_ALL>` on this part lowers to scalar pipe-control
+stores, not to the dedicated barrier opcode**, so reading `RV_SMEM_BAR` as "time
+spent in barriers" was wrong. The instruction count is unchanged to within one:
+the same work now issues 2,687 cycles faster, so what was removed was stall, not
+instructions.
+
+This also caps the lever. 13.15 projected 5-12% on the strength of the
+`RV_SMEM_BAR` + `DCCI` share; the measured 3.5% is what was actually there, and
+with eight of nine barriers already gone there is no more of it to take.
+
+**Where the remaining headroom is.** SCALAR is still ~35% of the AIV span, and
+after this pass it is almost entirely `LocalTensor` address arithmetic and DMA
+descriptor construction -- `ST_XD_XN_IMM` 15.9%, `LD_XD_XN_IMM` 3.7%, `MOVK`
+3.4%, `AND` 2.4%. Those are per-tile and per-head loop bodies recomputing
+offsets that are invariant across the loop. Hoisting them is the next lever and
+it is a different kind of change from this one: fewer instructions rather than
+fewer stalls.
+
+#### Three narrowings that were specified wrong, and why
+
+Worth recording because each would have passed a build and two of them would
+have passed `cos` as well.
+
+- **`CopyInTile` -> `PipeBarrier<PIPE_MTE2>`.** The barrier guards a GM -> UB
+  copy whose consumers are *vector* ops. `PipeBarrier<PIPE_MTE2>` orders MTE2
+  against MTE2 and says nothing about the vector pipe, exactly as
+  `PipeBarrier<PIPE_MTE1>` fails to order MTE1 against M. Correct edge is
+  `HardEvent::MTE2_V`.
+- **Deleting `UnpackToL1`'s trailing barrier.** `StageTile` calls it twice on one
+  `operandBuf_`, so the second call's vector expand races the first call's DMA
+  out of that buffer. That is MTE3 -> V; `SyncVectorToMte3` is V -> MTE3, the
+  opposite direction, and does not cover it. Correct edge is
+  `HardEvent::MTE3_V`.
+- **Double-buffering the writeback `tail` by `h & 1`.** Two slots only push the
+  write-after-read out by one iteration. It is safe at `groupHeads_ = 2` (the
+  simulator tier, two iterations, no reuse) and racy at `groupHeads_ = 4` (the
+  device tier). Giving each head its own slot in the finished `scoreBuf_` removes
+  the hazard at any group width, and lets the whole writeback run on one
+  V -> MTE3 edge instead of one per head.

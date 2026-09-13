@@ -157,6 +157,26 @@ __aicore__ inline void SyncVectorToMte3()
     AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(ev);
 }
 
+// MTE2 -> vector, before reading a UB buffer a GM copy just filled. A
+// PipeBarrier<PIPE_MTE2> would NOT do: it orders MTE2 against MTE2 and says
+// nothing about the vector pipe. See TURBOQUANT_TESTS.md 13.14.4.
+__aicore__ inline void SyncMte2ToVector()
+{
+    const event_t ev = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE2_V));
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(ev);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(ev);
+}
+
+// MTE3 -> vector: the write-after-read edge, for a UB buffer the vector unit is
+// about to overwrite while a DMA may still be draining it. The opposite
+// direction to SyncVectorToMte3, and not covered by it.
+__aicore__ inline void SyncMte3ToVector()
+{
+    const event_t ev = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE3_V));
+    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(ev);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(ev);
+}
+
 // e4m3fn's largest finite value, and e2m1's.  A query row and a probability row
 // are scaled to the top of the operand grid before the cast so the mantissa is
 // not thrown away against the grid's subnormal floor, and the fp32 multiplier
@@ -578,30 +598,32 @@ private:
             }
         }
 
-        // One partial per query head in the group.  The layout is the shared
-        // combine's: [head_size] of accumulator then kPartialTail of state, with
-        // the running max at lane 0 and the running sum at lane kFp32PerBlock.
-        // Only the subcore the Fixpipe wrote into holds this task's
-        // accumulator and running state; the other's are whatever its UB had.
-        // Ungated, both wrote to the same workspace offsets and the last writer
-        // won. See IsPrimarySubcore.
-        // ASCEND_IS_AIV expands to constexpr(...), so it cannot be combined
-        // with && -- the two conditions have to nest.
+        // One partial per query head: [head_size] of accumulator then
+        // kPartialTail of state, max at lane 0 and sum at lane kFp32PerBlock.
+        // Gated because only the Fixpipe's subcore holds this task's
+        // accumulator; ASCEND_IS_AIV is a constexpr(...) so the two conditions
+        // have to nest rather than &&. See TURBOQUANT_TESTS.md 13.14.1.
         if ASCEND_IS_AIV {
           if (IsPrimarySubcore()) {
-            AscendC::LocalTensor<float> tail = reduceBuf_.Get<float>();
-            AscendC::PipeBarrier<PIPE_ALL>();
+            // A tail per head, carved out of the finished score buffer. No two
+            // iterations share a landing slot, so the write-after-read the
+            // per-iteration barrier used to cover cannot arise, and the whole
+            // writeback needs one V -> MTE3 edge instead of one per head.
+            AscendC::LocalTensor<float> tails = scoreBuf_.Get<float>();
+            AscendC::PipeBarrier<PIPE_V>();
             for (uint32_t h = 0; h < groupHeads_; ++h) {
-                const uint32_t head = kvHead * groupHeads_ + h;
-                const uint64_t offset = PartialOffset(token, head, split);
+                AscendC::LocalTensor<float> tail = tails[h * kPartialTail];
                 AscendC::Duplicate(tail, 0.0f, kPartialTail);
                 AscendC::PipeBarrier<PIPE_V>();
                 AscendC::Adds(tail[kPartialMaxLane], runMax[h * kFp32PerBlock], 0.0f, 1);
                 AscendC::Adds(tail[kPartialSumLane], runSum[h * kFp32PerBlock], 0.0f, 1);
-                AscendC::PipeBarrier<PIPE_ALL>();
+            }
+            SyncVectorToMte3();
+            for (uint32_t h = 0; h < groupHeads_; ++h) {
+                const uint32_t head = kvHead * groupHeads_ + h;
+                const uint64_t offset = PartialOffset(token, head, split);
                 AscendC::DataCopy(workspaceGm_[offset], acc[h * headSize_], headSize_);
-                AscendC::DataCopy(workspaceGm_[offset + headSize_], tail, kPartialTail);
-                AscendC::PipeBarrier<PIPE_ALL>();
+                AscendC::DataCopy(workspaceGm_[offset + headSize_], tails[h * kPartialTail], kPartialTail);
             }
           }
         }
@@ -662,10 +684,8 @@ private:
             // divided by it, so it never reaches the model.
             BroadcastScalar(reduce[2 * kFp32PerBlock], reduce[kFp32PerBlock]);
             TurboQuantCodec4::BroadcastMul(vec, vec, reduce[2 * kFp32PerBlock], headSize_);
-            // The one scalar read on this path. It is once per head per task
-            // -- not per tile -- and the alternative is broadcasting the factor
-            // across every score row from UB, which is a full-length Mul per
-            // tile against a single Muls immediate here.
+            // Once per head per task, not per tile: the alternative is a
+            // full-length Mul per tile instead of a Muls immediate.
             qScale_[h] = reduce.GetValue(kFp32PerBlock);
 
             codec_.CastToOperand(qOperand[h * operandElems_], vec, headSize_);
@@ -674,7 +694,6 @@ private:
             SyncVectorToMte3();
             AscendC::DataCopy(qL1[h * kOperandC0], qOperand[h * operandElems_], nzParams);
         }
-        AscendC::PipeBarrier<PIPE_ALL>();
 
         // The two scale lanes this task reads out of every token's slot.
         const int32_t slotBytes = static_cast<int32_t>(scaleSlot_ * sizeof(float));
@@ -683,7 +702,7 @@ private:
                                   static_cast<int32_t>(kCubeTileRows));
         AscendC::ArithProgression(idx[kCubeTileRows], static_cast<int32_t>((numKvHeads_ + kvHead) * sizeof(float)),
                                   slotBytes, static_cast<int32_t>(kCubeTileRows));
-        AscendC::PipeBarrier<PIPE_ALL>();
+        AscendC::PipeBarrier<PIPE_V>();
     }
 
     /*
@@ -926,7 +945,7 @@ private:
             AscendC::DataCopy(kv[kCubeTileRows * packedBytes_], valueCacheGm_[cacheOff], rowsParams);
         }
         AscendC::DataCopy(scales, scaleCacheGm_[scaleOff], kCubeTileRows * scaleSlot_);
-        AscendC::PipeBarrier<PIPE_ALL>();
+        SyncMte2ToVector();
     }
 
     /*
@@ -969,11 +988,8 @@ private:
                 static_cast<uint16_t>((kCubeTileRows - kUnpackRows) * kOperandC0 / 32)};
 
             for (uint32_t bandIdx = 0; bandIdx < kCubeTileRows / kUnpackRows; ++bandIdx) {
-                // Dispatched by mode rather than calling Codec::Unpack directly,
-                // so the rate a tile is being expanded at is named at the call
-                // site.  Both remaining routines are one template instantiated
-                // twice -- kv3fp4 differs from kv5fp8 only in its radix and its
-                // unpackedUb grid -- so this chooses a name, not an implementation.
+                // Named per mode at the call site; both are one template
+                // instantiated twice, differing only in radix and operand grid.
                 const AscendC::LocalTensor<int8_t> sub_packed = packed[bandIdx * kUnpackRows * packedBytes_];
                 if constexpr (MODE == TurboQuantMode::KV5_FP8) {
                     vllm_ascend::turboquant::unpack_tq5_to_fp8(codec_, unpackedUb, sub_packed,
@@ -987,7 +1003,9 @@ private:
                 AscendC::DataCopy(l1Dst[bandIdx * bandElems], unpackedUb, nzParams);
             }
         }
-        AscendC::PipeBarrier<PIPE_ALL>();
+        // StageTile calls this twice on one unpackedUb, so the next call's
+        // vector expand would otherwise race this one's DMA out of it.
+        SyncMte3ToVector();
     }
 
     // The online softmax, per query head, over one tile's kCubeTileRows scores.
@@ -1099,7 +1117,7 @@ private:
             SyncVectorToMte3();
             AscendC::DataCopy(pL1[h * kOperandC0], probOperand[h * pElems], pParams);
         }
-        AscendC::PipeBarrier<PIPE_ALL>();
+        SyncMte3ToVector();
     }
 
     /*
