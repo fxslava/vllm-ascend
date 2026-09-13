@@ -104,7 +104,7 @@
  * FixpipeL0cToUB). kVariantDualDst selects it, so the Cube produces the whole
  * chunk once and each subcore finishes its own half with no exchange and no GM
  * round trip. Without the bit the product lands in subcore 0 alone - the
- * behaviour ProductIsMine() in turboquant_mm_kernels.cpp documents - and that
+ * behaviour IsPrimarySubcore() in turboquant_mm_kernels.cpp documents - and that
  * subcore runs the residual for every vector in the chunk.
  *
  * The M split lands at row M/2, which is a vector boundary only when the chunk

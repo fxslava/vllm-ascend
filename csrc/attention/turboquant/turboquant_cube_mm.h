@@ -18,46 +18,25 @@
  * The Cube half of the TurboQuant decode: two GEMMs per K/V tile, with the
  * operand type chosen by the mode.
  *
- * AscendC::Mmad on arch35 dispatches on <DstT, Src0T, Src1T>:
+ * DATA PATH  L1 (ping-pong, kSlots deep) -> L0A/L0B via MTE1 load2d -> L0C via
+ *            Mmad -> UB via Fixpipe. This class owns L1 on both halves of the
+ *            MIX kernel and L0A/L0B/L0C on the AIC alone; allocating L0 on a
+ *            vector core hands it a base it cannot reach.
  *
- *   <float, fp8_e4m3fn_t, fp8_e4m3fn_t>   -> mad       (kv4fp8, kv5fp8)
- *   <float, fp4x2_e2m1_t, fp4x2_e2m1_t>   -> mad_mx    (kv3fp4)
+ * OPERAND    Mmad dispatches on <DstT, Src0T, Src1T>: fp8_e4m3fn -> mad
+ *            (kv4fp8, kv5fp8), fp4x2_e2m1 -> mad_mx (kv3fp4), so the
+ *            instruction follows from TurboQuantModeTraits<MODE>::kOperand.
  *
- * so the instruction follows from TurboQuantModeTraits<MODE>::kOperand.
+ * LAYOUT     Operands reach L1 already in NZ and there is no way around it: the
+ *            L1 -> L0 path addresses L1 as 16 x C0 fractals, which a flat ND
+ *            image cannot be sliced into at any parameterisation. NzOffset()
+ *            below is the permutation. Who applies it differs by mode -- the
+ *            codebook path rides the unpack's Gather, the affine path moves it
+ *            upstream into the GM -> UB read. See TURBOQUANT_TESTS.md 13.5 for
+ *            the load2d fractal contract and 13.9 for the affine staging.
  *
- * The task decomposition is (token, kvHead, split): the Cube's M granularity is
- * 16, so the query heads sharing one kv head are batched into M to make a
- * [headsPerKv, D] x [D, rows] GEMM.
- *
- * OPERANDS REACH L1 ALREADY IN NZ, AND THERE IS NO WAY AROUND THAT.  The L1 ->
- * L0 path is MTE1 load2d, which addresses L1 as an image of 16 x C0 fractals:
- * LoadData2DParamsV2::srcStride is a *fractal* count, and fractal (m, k) sits at
- * (k * srcStride + m) * 512 bytes.  A fractal is not contiguous in a row-major
- * buffer, so a flat ND L1 image cannot be sliced by load2d at any
- * parameterisation -- CANN's own matmul agrees, converting ND to NZ on the
- * GM -> L1 copy (CopyND2NZForInt8 in copy_tile_to_cube_common.h) rather than
- * loading ND from L1.  For C0 = 32 / sizeof(operand) elements,
- *
- *     nz(r, c) = (c / C0) * rows * C0 + r * C0 + (c % C0)
- *
- * and NzOffset() below is that formula.
- *
- * What differs between the modes is WHO applies that permutation, because
- * DataCopy(L1, UB, Nd2NzParams) does not exist for 1-byte operands on arch35:
- *
- *   codebook (kv3fp4, kv5fp8)  the unpack's Gather emits NZ order -- its offset
- *                              table is arbitrary, so this is free -- and a
- *                              strided DataCopy places each band.
- *   affine (kv4fp8)            there is no Gather to ride, so the permutation
- *                              moves upstream into the GM -> UB tile read,
- *                              which was strided anyway.  The unpack is then
- *                              contiguous and the UB -> L1 copy is flat.  See
- *                              CopyInTile and UnpackToL1 in
- *                              turboquant_mm_kernels.cpp.
- *
- * The accumulator stays in UB, not in L0C: flash decoding rescales it by
- * exp(m_old - m_new) at every tile and that multiply has no expression on the
- * Cube, so each tile's PV product is Fixpipe'd to UB.
+ * The accumulator stays in UB rather than L0C: flash decoding rescales it by
+ * exp(m_old - m_new) every tile and that multiply has no expression on the Cube.
  */
 
 #ifndef VLLM_ASCEND_ATTENTION_TURBOQUANT_CUBE_MM_H

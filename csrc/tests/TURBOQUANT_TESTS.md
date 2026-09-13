@@ -1583,3 +1583,71 @@ is the shape where this optimisation should look *best*, not worst -- at one til
 `tile + 1 < numTiles` is false, the prefetch never runs, and the whole ingest sits
 exposed in the prologue on the Cube's critical path. It was measured where it had
 the most to gain.
+
+### 13.14 The four rules the MIX decode cannot be written without
+
+These are the hardware facts the decode kernel is shaped around. They were
+discovered expensively, none of them fault when broken, and until this section
+existed three of the four lived only as comment blocks inside the function
+bodies that obey them. The kernel now carries one-line pointers here instead.
+
+#### 13.14.1 The Fixpipe lands in ONE subcore's UB
+
+`IsPrimarySubcore()` -- `GetSubBlockIdx() == 0`.
+
+The accumulator, the score row and the context row live in UB, and **UB is
+per-subcore**. The Fixpipe that fills them is issued by the AIC, which writes
+into a single subcore's UB and not into both. Every vector subcore of the pair
+then believes it holds the product; the one that does not holds whatever its
+buffer contained before.
+
+Ungated, both subcores wrote their copy to the same GM address and the last
+writer won -- which is why one GEMM alternated exact / all-zero / exact across
+launches of a single process (`test_sim_950pr_cube_gemm`'s
+`ContextGemmRepeated`). It reads as a layout defect and is not one: the product
+in L0C was correct every time.
+
+**The predicate gates only what CONSUMES the product.** The flag protocol stays
+ungated -- see 13.14.2.
+
+#### 13.14.2 Every AIV -> AIC flag must be set by BOTH subcores
+
+An arch35 cross-core flag in mode `0x02` is satisfied only once *all* subcores of
+the pair have set it. Gating a set to subcore 0 starves the AIC: the first tile
+never completes and the launch hangs with an empty exception log. CANN's own MIX
+idiom (`WaitPreTaskEndLooseV3Impl`) issues it ungated for the same reason.
+
+This is why a signal whose payload only subcore 0 produced -- `kFlagProbsReady`
+after the softmax -- is still posted by both. Mode `0x02` holds the AIC until the
+subcore that actually did the MTE3 has signalled, so the other's early set cannot
+release it.
+
+#### 13.14.3 `GetBlockIdx()` means different things on the two halves
+
+```
+AIV   get_block_idx() * get_subblockdim() + get_subblockid()
+AIC   get_block_idx()
+```
+
+At `subblockdim = 2` the AIC of block `c` sees `c` while its own two vector
+subcores see `2c` and `2c + 1`. A task loop keyed on `GetBlockIdx()` puts the two
+halves of one MIX block on *different tasks*, and any kernel whose tiles carry a
+cross-core handshake deadlocks the moment the counts diverge. `MixBlockIdx()` --
+`GetBlockIdx() / GetSubBlockNum()` -- collapses both halves onto the block index.
+Not for a pure-vector kernel, where the 2N subcores are 2N independent workers;
+see `TurboQuantPlainCombine`, which keeps `GetBlockIdx()`. Full post-mortem in
+13.8.
+
+#### 13.14.4 Vector -> MTE3 needs an explicit event
+
+Every operand staged into L1 is produced by vector work and moved by `DataCopy`,
+which is MTE3. `PipeBarrier<PIPE_V>` orders V against V only. Without the
+explicit event the DMA reads the buffer before the vector writes land and stages
+whatever was there -- zeros on a fresh buffer -- so the Cube multiplies an empty
+operand and Fixpipes an all-zero product. Nothing faults.
+
+`SyncVectorToMte3()` sets and immediately waits, which is correct at a call site
+that is about to block anyway and wrong inside a software pipeline, where it
+drains the vector pipe and serialises the stages being overlapped. In a pipelined
+loop the same edge must be carried deferred -- posted after the vector writes,
+waited before the DMA. See 13.13.
