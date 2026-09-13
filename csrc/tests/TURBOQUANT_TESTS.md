@@ -2083,3 +2083,63 @@ spurious cross-vector stage runs at `stride = L`.
 That is a real but modest win against a wide confidence interval, and it does not
 reach the 62,000 target. Recorded rather than built, pending a decision on
 whether a few hundred cycles justifies the change.
+
+### 13.20 A context length that is not a multiple of 8 misaligns the tail mask
+
+Found by a corner-case sweep of the simulator tier at `51469c5d4` (codegen
+identical to `3ee5f7f0d`; the commit between them is comment-only).
+
+| shape | tiles | tail `valid` | cos | excp_log |
+|---|---|---|---|---|
+| S=16 | 1 | 16 | 0.991817 | 32/32 empty |
+| S=64 | 1 | 64 (no mask) | 0.986033 | 32/32 empty |
+| **S=65** | 2 | **1** | 0.988713 | **2/32 non-empty** |
+| S=192 | 2 | 64 | 0.987147 | 32/32 empty |
+
+S=65 run alone on a clean build reproduces it exactly: cos 0.988713, 87,320
+ticks, `core0` and `core1` each 764 B of
+
+```
+vec_err_instr_misalign_t0  RV_VST  Sn[10]=0xc004
+```
+
+Four records per core -- `groupHeads_` heads times the two masking `Duplicate`
+calls.
+
+#### The cause
+
+`SoftmaxStageProbs` masks the invalid tail of a partial tile:
+
+```cpp
+if (valid < kCubeTileRows) {
+    Duplicate(row[valid], kNegInf, kCubeTileRows - valid);   // and later, 0.0f
+}
+```
+
+`row[valid]` is 32-byte aligned only when `valid` is a multiple of 8 floats. At
+S=65 the second tile carries `valid = 1`, so the store base lands 4 bytes past a
+block boundary -- `0xc004` in the dump, which is the signature.
+
+**This is pre-existing.** The masking predates the barrier narrowing, the
+writeback restructure and the query-buffer fix. It has gone unseen because every
+context length this kernel has ever been run at -- 16, 64, 128, 512, 1024, 2048,
+and the production shapes -- leaves `valid` a multiple of 8. It takes a context
+like 65, 100 or 2049 to expose it, and a decode serving arbitrary sequence
+lengths will hit those constantly.
+
+Note what the gates did and did not catch. **cos stayed plausible at 0.988713**,
+so a fidelity-only gate passes this. Only the exception log saw it -- the same
+lesson as 13.13, from the opposite direction: there the fault was loud and the
+numbers were right; here the numbers are right and the fault is quiet but real.
+
+#### The fix, not yet applied
+
+Mask from an aligned base with a lane predicate rather than from `row[valid]`
+directly: take `base = valid & ~(kFp32PerBlock - 1)` and use the mask form of
+`Duplicate`, whose bitmask can exclude the lanes in `[base, valid)` that must
+survive. The naive alternatives are both wrong -- rounding the base down
+overwrites live scores, rounding it up leaves `[valid, alignedUp)` unmasked and
+those lanes feed the row's `ReduceMax`.
+
+Until it is fixed, **the simulator and device sweeps should include at least one
+context that is not a multiple of 8**, or this stays invisible.
