@@ -84,6 +84,32 @@ constexpr uint32_t kPartialSumLane = kFp32PerBlock;
 
 constexpr float kNegInf = -3.4028235e38f;
 
+/*
+ * Bytes of UB padding appended to probOperandBuf_, which is the buffer
+ * immediately before ctxBuf_ in the allocation order.  It moves the context
+ * product, and everything allocated after it, into the other UB bank.
+ *
+ * The arch35 UB is (depth 512, banks 2, bank groups 8, block 32) at strides
+ * (512, 256, 32, 1) -- UB_BANK_STRIDE in
+ * attention/lightning_indexer/op_kernel/lightning_indexer_common.h.  A byte's
+ * bank is bit 8 of its address, so two operands whose bases differ by a
+ * multiple of 512 sit in the same bank for their whole length.
+ *
+ * Every buffer TurboQuantCubeDecodeSplit::Init allocates is a multiple of 512
+ * bytes, so all fourteen of them start at (bank 0, group 0).  The widest binary
+ * op on the tile path -- Accumulate's Add(acc, acc, ctx), two operands of
+ * groupHeads * head_size fp32 -- therefore reads one bank throughout.  An odd
+ * multiple of 256 here splits that pair; every other operand pair in the kernel
+ * keeps the conflict count it already had.
+ *
+ * NOT MEASURED, and 0 by choice.  TURBOQUANT_TESTS.md 13.17 is 7,875 ticks of
+ * evidence that moving UB bases is worth more than any instruction-level edit
+ * on this kernel, in whichever direction it happens to land; 0 reproduces the
+ * allocation that measured 63,832.  Sweep 0 / 256 / 768 on the camodel before
+ * shipping anything else.
+ */
+constexpr uint32_t kUbBankPadBytes = 0;
+
 // Use the MIX block index consistently across the AIC/AIV pair.
 // Avoid using GetBlockIdx() directly in cross-core handshakes.
 __aicore__ inline uint32_t MixBlockIdx()
@@ -433,6 +459,40 @@ public:
         }
         unpackBytes_ = unpackGroups_ * kCubeTileRows * kOperandC0;
 
+        // Every descriptor below is a function of the shape alone, so it is
+        // built once here instead of at each tile, head or task.  The scalar
+        // unit spends a store per field otherwise, and CopyInTile, UnpackToL1,
+        // PrepareTask and SoftmaxStageProbs all run inside the tile loop.
+        if constexpr (Codec::kIsAffine) {
+            // Group-major tile read: one 32-byte column-group per row.
+            tileParams_ = AscendC::DataCopyParams{static_cast<uint16_t>(kCubeTileRows), 1,
+                                                  static_cast<uint16_t>((packedPlane_ - kOperandC0) / 32), 0};
+            // The affine expand lands whole NZ fractal columns, so the L1 write is flat.
+            unpackParams_ = AscendC::DataCopyParams{1, static_cast<uint16_t>(unpackBytes_ / 32), 0, 0};
+        } else {
+            // One tile row per burst; consecutive rows are packedPlane_ apart.
+            tileParams_ = AscendC::DataCopyParams{static_cast<uint16_t>(kCubeTileRows),
+                                                  static_cast<uint16_t>(packedBytes_ / 32),
+                                                  static_cast<uint16_t>((packedPlane_ - packedBytes_) / 32), 0};
+            // c0Blocks runs of one kUnpackRows band, at the tile's kCubeTileRows pitch.
+            unpackParams_ = AscendC::DataCopyParams{
+                static_cast<uint16_t>(operandElems_ / kOperandC0),
+                static_cast<uint16_t>(kUnpackRows * kOperandC0 / 32), 0,
+                static_cast<uint16_t>((kCubeTileRows - kUnpackRows) * kOperandC0 / 32)};
+        }
+        // Head h occupies lane h of every C0 block of the A operand.
+        qNzParams_ = AscendC::DataCopyParams{static_cast<uint16_t>(headSize_ / kOperandC0), 1, 0,
+                                             static_cast<uint16_t>(kMaxGroupHeads - 1)};
+        probNzParams_ =
+            AscendC::DataCopyParams{static_cast<uint16_t>(Mm::OperandElems(kCubeTileRows) / kOperandC0), 1, 0,
+                                    static_cast<uint16_t>(kMaxGroupHeads - 1)};
+        // A repeat advances one row of acc and one 32B block of alpha, which is
+        // exactly the addressing BinaryRepeatParams can express.
+        const uint8_t accRowBlocks = static_cast<uint8_t>(headSize_ / kFp32PerBlock);
+        accRescaleParams_ = AscendC::BinaryRepeatParams{1, 1, 0, accRowBlocks, accRowBlocks, 1};
+        // s / gain and the attention scale, folded once.
+        scoreScale_ = scale_ / TurboQuantModeTraits<MODE>::kGain;
+
         queryGm_.SetGlobalBuffer(reinterpret_cast<__gm__ scalar_t *>(query));
         keyCacheGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(keyCache));
         valueCacheGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(valueCache));
@@ -466,7 +526,9 @@ public:
         // [kCubeTileM, kCubeTileRows] fp32 scores, and the same shape again for
         // the probabilities before they are cast onto the operand grid.
         pipe_->InitBuffer(scoreBuf_, kMaxGroupHeads * kCubeTileRows * sizeof(float));
-        pipe_->InitBuffer(probOperandBuf_, kMaxGroupHeads * Mm::OperandElems(kCubeTileRows));
+        // The bank pad rides on this buffer rather than on one of its own: the
+        // bytes are never addressed, and no allocation before ctxBuf_ moves.
+        pipe_->InitBuffer(probOperandBuf_, kMaxGroupHeads * Mm::OperandElems(kCubeTileRows) + kUbBankPadBytes);
         // [kCubeTileM, head_size] fp32 context product from the Cube.
         pipe_->InitBuffer(ctxBuf_, kMaxGroupHeads * headSize_ * sizeof(float));
         // Per-head softmax state: running max, running sum, tile max, new max,
@@ -528,7 +590,11 @@ private:
         // the cube core issue vector stores into UB it does not own, which the
         // part reports as su_ccu_mpu_err rather than as anything legible.
         if ASCEND_IS_AIV {
-            AscendC::Duplicate(acc, 0.0f, kMaxGroupHeads * headSize_);
+            // groupHeads_, not kMaxGroupHeads: rows past the group are never
+            // read -- the rescale repeats groupHeads_ times, Accumulate adds
+            // groupHeads_ * head_size, and the writeback walks h < groupHeads_.
+            // At the sim shape that is 2 KB of Duplicate per task instead of 16.
+            AscendC::Duplicate(acc, 0.0f, groupHeads_ * headSize_);
             AscendC::Duplicate(state, 0.0f, 6 * kMaxGroupHeads * kFp32PerBlock);
             AscendC::PipeBarrier<PIPE_V>();
             // One broadcast over the slice: every read of runMax takes lane 0
@@ -607,12 +673,11 @@ private:
         AscendC::LocalTensor<float> reduce = reduceBuf_.Get<float>();
         AscendC::LocalTensor<OperandT> qL1 = mm_.A1Query();
 
-        const uint32_t c0Blocks = headSize_ / kOperandC0;
-        const AscendC::DataCopyParams nzParams{static_cast<uint16_t>(c0Blocks), 1, 0,
-                                               static_cast<uint16_t>(kMaxGroupHeads - 1)};
-
+        // groupHeads_, not kMaxGroupHeads: CastToOperand overwrites every byte
+        // of the slots this task copies, and the slots past the group are never
+        // a DataCopy source, so zeroing them changes nothing in L1.
         AscendC::Duplicate(qOperand.template ReinterpretCast<int8_t>(), static_cast<int8_t>(0),
-                           kMaxGroupHeads * operandElems_);
+                           groupHeads_ * operandElems_);
         AscendC::PipeBarrier<PIPE_V>();
 
         // The group's heads are consecutive in GM, so the whole group lands in
@@ -642,7 +707,7 @@ private:
             // Work buffer distinct from the source. ReduceMax writes its
             // intermediates into sharedTmpBuffer while still reading src, so
             // passing one tensor as both can corrupt the reduction itself --
-            // and this result is qScale_.
+            // and this result is qScaleInv_.
             AscendC::ReduceMax<float>(reduce, tmp, scoreBuf_.Get<float>(), headSize_, false);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Adds(reduce, reduce, TurboQuantCodec4::kEps, 1);
@@ -651,19 +716,21 @@ private:
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Div(reduce[kFp32PerBlock], reduce[kFp32PerBlock], reduce, 1);
             AscendC::PipeBarrier<PIPE_V>();
-            // qScale_[h] is the multiplier that was applied; the score row is
-            // divided by it, so it never reaches the model.
+            // The multiplier that was applied; the score row is divided by it,
+            // so it never reaches the model.  Stored already inverted: the
+            // reciprocal is a scalar divide, and SoftmaxStageProbs wants it once
+            // per head per TILE.
             BroadcastScalar(reduce[2 * kFp32PerBlock], reduce[kFp32PerBlock]);
             TurboQuantCodec4::BroadcastMul(vec, vec, reduce[2 * kFp32PerBlock], headSize_);
             // Once per head per task, not per tile: the alternative is a
             // full-length Mul per tile instead of a Muls immediate.
-            qScale_[h] = reduce.GetValue(kFp32PerBlock);
+            qScaleInv_[h] = 1.0f / reduce.GetValue(kFp32PerBlock);
 
             codec_.CastToOperand(qOperand[h * operandElems_], vec, headSize_);
 
             // NZ: head h occupies lane h of every C0 block.
             SyncVectorToMte3();
-            AscendC::DataCopy(qL1[h * kOperandC0], qOperand[h * operandElems_], nzParams);
+            AscendC::DataCopy(qL1[h * kOperandC0], qOperand[h * operandElems_], qNzParams_);
         }
 
         // The two scale lanes this task reads out of every token's slot.
@@ -897,23 +964,18 @@ private:
              * column and the L1 stage needs no reshape. Costs packedGroups_ descriptors per
              * plane instead of one. See TURBOQUANT_TESTS.md 13.9.
              */
-            const AscendC::DataCopyParams groupParams{static_cast<uint16_t>(kCubeTileRows), 1,
-                                                      static_cast<uint16_t>((packedPlane_ - kOperandC0) / 32), 0};
             const uint32_t groupElems = kCubeTileRows * kOperandC0;
             for (uint32_t groupIdx = 0; groupIdx < packedGroups_; ++groupIdx) {
                 AscendC::DataCopy(kv[groupIdx * groupElems],
-                                  keyCacheGm_[cacheOff + groupIdx * kOperandC0], groupParams);
+                                  keyCacheGm_[cacheOff + groupIdx * kOperandC0], tileParams_);
                 AscendC::DataCopy(kv[kCubeTileRows * packedBytes_ + groupIdx * groupElems],
-                                  valueCacheGm_[cacheOff + groupIdx * kOperandC0], groupParams);
+                                  valueCacheGm_[cacheOff + groupIdx * kOperandC0], tileParams_);
             }
         } else {
             // One tile row per burst; consecutive rows are packedPlane_ apart.
             // Every length and stride is a whole number of 32B blocks.
-            const AscendC::DataCopyParams rowsParams{static_cast<uint16_t>(kCubeTileRows),
-                                                     static_cast<uint16_t>(packedBytes_ / 32),
-                                                     static_cast<uint16_t>((packedPlane_ - packedBytes_) / 32), 0};
-            AscendC::DataCopy(kv, keyCacheGm_[cacheOff], rowsParams);
-            AscendC::DataCopy(kv[kCubeTileRows * packedBytes_], valueCacheGm_[cacheOff], rowsParams);
+            AscendC::DataCopy(kv, keyCacheGm_[cacheOff], tileParams_);
+            AscendC::DataCopy(kv[kCubeTileRows * packedBytes_], valueCacheGm_[cacheOff], tileParams_);
         }
         AscendC::DataCopy(scales, scaleCacheGm_[scaleOff], kCubeTileRows * scaleSlot_);
         SyncMte2ToVector();
@@ -942,22 +1004,16 @@ private:
 
         if constexpr (Codec::kIsAffine) {
             const uint32_t groupElems = kCubeTileRows * kOperandC0;
-            const AscendC::DataCopyParams flatParams{1, static_cast<uint16_t>(unpackBytes_ / 32), 0, 0};
             for (uint32_t groupBase = 0; groupBase < packedGroups_; groupBase += unpackGroups_) {
                 vllm_ascend::turboquant::unpack_tq4_to_fp8(codec_, unpackedUb, unpackedUb[unpackBytes_],
                                                            packed[groupBase * groupElems], unpackBytes_);
                 SyncVectorToMte3();
-                AscendC::DataCopy(l1Dst[groupBase * groupElems], unpackedUb, flatParams);
+                AscendC::DataCopy(l1Dst[groupBase * groupElems], unpackedUb, unpackParams_);
                 AscendC::DataCopy(l1Dst[(packedGroups_ + groupBase) * groupElems],
-                                  unpackedUb[unpackBytes_], flatParams);
+                                  unpackedUb[unpackBytes_], unpackParams_);
             }
         } else {
-            const uint32_t c0Blocks = operandElems_ / kOperandC0;
             const uint32_t bandElems = kUnpackRows * kOperandC0;
-            const AscendC::DataCopyParams nzParams{
-                static_cast<uint16_t>(c0Blocks), static_cast<uint16_t>(bandElems / 32), 0,
-                static_cast<uint16_t>((kCubeTileRows - kUnpackRows) * kOperandC0 / 32)};
-
             for (uint32_t bandIdx = 0; bandIdx < kCubeTileRows / kUnpackRows; ++bandIdx) {
                 // Named per mode at the call site; both are one template
                 // instantiated twice, differing only in radix and operand grid.
@@ -971,7 +1027,7 @@ private:
                                   static_cast<int>(headSize_));
                 }
                 SyncVectorToMte3();
-                AscendC::DataCopy(l1Dst[bandIdx * bandElems], unpackedUb, nzParams);
+                AscendC::DataCopy(l1Dst[bandIdx * bandElems], unpackedUb, unpackParams_);
             }
         }
         // StageTile calls this twice on one unpackedUb, so the next call's
@@ -1003,6 +1059,10 @@ private:
         // Fixpipes into it, which is after every use below.
         AscendC::LocalTensor<float> reduceWork = ctxBuf_.Get<float>();
         AscendC::LocalTensor<OperandT> probOperand = probOperandBuf_.Get<OperandT>();
+        // Both scratch views are the same slice on every head; deriving them
+        // once keeps the per-head body to the work that actually varies.
+        AscendC::LocalTensor<float> brcb = reduce[2 * kCubeTileRows];
+        AscendC::LocalTensor<float> part = reduce[3 * kCubeTileRows];
 
         // The tile's K and V scales, one lane per row, out of the packed slots.
         AscendC::LocalTensor<uint32_t> idx = scaleIdxBuf_.Get<int32_t>().ReinterpretCast<uint32_t>();
@@ -1011,7 +1071,7 @@ private:
                         kCubeTileRows);
         AscendC::PipeBarrier<PIPE_V>();
         // s / gain, the codebook gain undone; then the attention scale.
-        AscendC::Muls(kScale, kScale, scale_ / TurboQuantModeTraits<MODE>::kGain, kCubeTileRows);
+        AscendC::Muls(kScale, kScale, scoreScale_, kCubeTileRows);
         AscendC::Muls(vScale, vScale, 1.0f / TurboQuantModeTraits<MODE>::kGain, kCubeTileRows);
         AscendC::PipeBarrier<PIPE_V>();
 
@@ -1019,7 +1079,7 @@ private:
             AscendC::LocalTensor<float> row = scores[h * kCubeTileRows];
             AscendC::Mul(row, row, kScale, kCubeTileRows);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Muls(row, row, 1.0f / qScale_[h], kCubeTileRows);
+            AscendC::Muls(row, row, qScaleInv_[h], kCubeTileRows);
             AscendC::PipeBarrier<PIPE_V>();
             if (valid < kCubeTileRows) {
                 AscendC::Duplicate(row[valid], kNegInf, kCubeTileRows - valid);
@@ -1037,7 +1097,6 @@ private:
             AscendC::Exp(alpha[h * kFp32PerBlock], alpha[h * kFp32PerBlock], 1);
             AscendC::PipeBarrier<PIPE_V>();
 
-            AscendC::LocalTensor<float> brcb = reduce[2 * kCubeTileRows];
             BroadcastScalar(brcb, newMax[h * kFp32PerBlock]);
             BroadcastSub(row, row, brcb, kCubeTileRows);
             AscendC::Exp(row, row, kCubeTileRows);
@@ -1049,7 +1108,6 @@ private:
 
             // The running sum, before the V scale is folded in: the denominator
             // is a sum of probabilities and must not carry the value scale.
-            AscendC::LocalTensor<float> part = reduce[3 * kCubeTileRows];
             AscendC::ReduceSum<float>(part, row, part[kFp32PerBlock], kCubeTileRows);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Mul(runSum[h * kFp32PerBlock], runSum[h * kFp32PerBlock], alpha[h * kFp32PerBlock], 1);
@@ -1081,12 +1139,9 @@ private:
         // have to be interleaved on the way to L1: lane h of C0 block b.
         AscendC::LocalTensor<OperandT> pL1 = mm_.A1Probs();
         const uint32_t pElems = Mm::OperandElems(kCubeTileRows);
-        const uint32_t pBlocks = pElems / kOperandC0;
-        const AscendC::DataCopyParams pParams{static_cast<uint16_t>(pBlocks), 1, 0,
-                                              static_cast<uint16_t>(kMaxGroupHeads - 1)};
         for (uint32_t h = 0; h < groupHeads_; ++h) {
             SyncVectorToMte3();
-            AscendC::DataCopy(pL1[h * kOperandC0], probOperand[h * pElems], pParams);
+            AscendC::DataCopy(pL1[h * kOperandC0], probOperand[h * pElems], probNzParams_);
         }
         SyncMte3ToVector();
     }
@@ -1108,7 +1163,6 @@ private:
         // The accumulator's rescale by alpha, one column chunk at a time: a
         // repeat advances one row of acc and one 32B block of alpha, which is
         // exactly the addressing BinaryRepeatParams can express.
-        const uint8_t rowBlocks = static_cast<uint8_t>(headSize_ / kFp32PerBlock);
         AscendC::LocalTensor<float> alphaBlocks = reduceBuf_.Get<float>()[3 * kCubeTileRows + 2 * kFp32PerBlock];
         for (uint32_t h = 0; h < groupHeads_; ++h) {
             AscendC::Brcb(alphaBlocks[h * kFp32PerBlock], alpha[h * kFp32PerBlock], 1,
@@ -1117,7 +1171,7 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
         for (uint32_t col = 0; col < headSize_; col += kFp32PerRepeat) {
             AscendC::Mul(acc[col], acc[col], alphaBlocks, static_cast<uint64_t>(kFp32PerRepeat),
-                         static_cast<uint8_t>(groupHeads_), {1, 1, 0, rowBlocks, rowBlocks, 1});
+                         static_cast<uint8_t>(groupHeads_), accRescaleParams_);
         }
         AscendC::PipeBarrier<PIPE_V>();
 
@@ -1179,7 +1233,15 @@ private:
     AscendC::GlobalTensor<int32_t> rotTablesGm_;
     AscendC::GlobalTensor<int32_t> modeTablesGm_;
     AscendC::GlobalTensor<float> workspaceGm_;
-    float qScale_[kMaxGroupHeads] = {};
+    // Descriptors and factors built once in Init; see the comment there.
+    AscendC::DataCopyParams tileParams_;
+    AscendC::DataCopyParams unpackParams_;
+    AscendC::DataCopyParams qNzParams_;
+    AscendC::DataCopyParams probNzParams_;
+    AscendC::BinaryRepeatParams accRescaleParams_;
+    float scoreScale_ = 0.0f;
+    // The reciprocal of the query's operand scale, per head of the group.
+    float qScaleInv_[kMaxGroupHeads] = {};
     uint32_t numTokens_ = 0;
     uint32_t numHeads_ = 0;
     uint32_t numKvHeads_ = 0;

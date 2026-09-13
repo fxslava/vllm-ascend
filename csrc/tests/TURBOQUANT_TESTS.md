@@ -2143,3 +2143,158 @@ those lanes feed the row's `ReduceMax`.
 
 Until it is fixed, **the simulator and device sweeps should include at least one
 context that is not a multiple of 8**, or this stays invisible.
+
+### 13.21 The UB bank map, and a descriptor pass that is not measured
+
+Two changes on top of `23fb38218` (codegen identical to `3ee5f7f0d`; the two
+commits between them are comment-only): every shape-invariant `DataCopyParams`
+moved into `Init`, and the two per-task `Duplicate` calls narrowed to the group
+actually in use. Plus an audit of where the kernel's UB buffers land in the bank
+geometry, which is the part worth reading.
+
+**NOT MEASURED.** No camodel pass has been run on it. Everything below that is a
+number is either static arithmetic over the allocation list or a count of edits;
+nothing is a tick. `cos` and the exception logs are likewise unverified.
+
+#### The bank geometry, and where this kernel's buffers sit
+
+The arch35 UB is 256 KB shaped `(depth 512, banks 2, bank_groups 8, block 32)`
+at strides `(512, 256, 32, 1)` -- `UB_BANK_STRIDE` and friends in
+`attention/lightning_indexer/op_kernel/lightning_indexer_common.h`. A byte's
+bank is therefore **bit 8 of its address**: two operands whose bases differ by a
+multiple of 512 read the same bank at every element of the walk.
+
+Every one of the fourteen buffers `TurboQuantCubeDecodeSplit::Init` allocates is
+a whole multiple of 512 bytes at `head_size` 128 and 256 -- every shape either
+tier runs -- so **all fourteen start at (bank 0, bank group 0)**. At `head_size`
+64, `signBuf_` (256 B) is the first that is not, and only the two cold buffers
+after it change bank.
+
+`kv4fp8`, `head_size` 256, `num_kv_heads` 2:
+
+| buffer | offset | size | bank |
+|---|---|---|---|
+| `kvBuf_` | 0 | 16384 | 0 |
+| `scaleTileBuf_` | 16384 | 2048 | 0 |
+| `operandBuf_` | 18432 | 8192 | 0 |
+| `accBuf_` | 26624 | 16384 | 0 |
+| `qBuf_` | 43008 | 2048 | 0 |
+| `qOperandBuf_` | 45056 | 4096 | 0 |
+| `scoreBuf_` | 49152 | 4096 | 0 |
+| `probOperandBuf_` | 53248 | 1024 | 0 |
+| `ctxBuf_` | 54272 | 16384 | 0 |
+| `stateBuf_` | 70656 | 3072 | 0 |
+| `reduceBuf_` | 73728 | 2048 | 0 |
+| `signBuf_` | 75776 | 1024 | 0 |
+| `scaleIdxBuf_` | 76800 | 512 | 0 |
+| `qInBuf_` | 77312 | 1024 at `groupHeads_` 2 | 0 |
+
+The consequence for the hot binary ops:
+
+| op | operand bases | bank |
+|---|---|---|
+| `Accumulate`: `Add(acc, acc, ctx)` | 26624, 54272 | **same, whole length** |
+| `SoftmaxStageProbs`: `Mul(row, row, kScale)` | 49152 + 256h, 73728 | same for even `h` |
+| `SoftmaxRescaleAcc`: `Mul(acc[col], acc, alphaBlocks)` | 26624 + 256c, 74560 | same for odd `c` |
+| softmax `Max` / `Sub` / `Mul` on `stateBuf_` | fields 512 B apart | **always same** |
+
+The `stateBuf_` fields are the worst case in the layout -- the field stride is
+`kMaxGroupHeads * kFp32PerBlock * sizeof(float)`, exactly 512 -- but every op on
+them is one element, so a bank conflict is not what those cost. The one that is
+worth anything is `Add(acc, acc, ctx)`: two source streams of
+`groupHeads_ * head_size` fp32, 2 KB each on the simulator tier and 4 KB on
+silicon, in one bank from end to end.
+
+#### 13.17's regression was not a bank conflict
+
+That pass is sometimes read as having proved bank conflicts dominate here. It
+did not, and the geometry says so directly: the buffer inserted in 13.17 was
+**8192 bytes, which is 16 x 512**. A shift by a multiple of 512 leaves every
+buffer's bank *and* bank group exactly where it was. Whatever cost 7,875 ticks
+there, it was not bank placement -- and that measurement conflated two variables
+anyway, since the same attempt also sized the buffer at `kMaxGroupHeads` instead
+of `groupHeads_`.
+
+So 13.17's finding stands, unchanged and still unexplained: **this kernel is
+extremely sensitive to UB base addresses, by a mechanism not yet identified.**
+That is why the pad below ships at 0.
+
+#### The knob
+
+`kUbBankPadBytes`, at the top of `turboquant_mm_kernels.cpp`, is added to
+`probOperandBuf_` -- the allocation immediately before `ctxBuf_`. At 256 it
+splits `acc` and `ctx` into different banks and leaves every other pair's
+conflict count unchanged: half the `kScale` / `vScale` and rescale pairs swap
+which side conflicts, and the `stateBuf_` fields, 512 apart internally, do not
+move relative to each other at any pad. It rides on an existing buffer rather
+than one of its own so that nothing before `ctxBuf_` shifts.
+
+It is **0**, which is byte-for-byte the allocation that measured 63,832. Sweep
+`0 / 256 / 768` on the camodel before drawing any conclusion; on 13.17's
+evidence the right prior is that it could go either way by 10%.
+
+#### Phase 1: what moved into `Init`
+
+Per tile, at `head_size` 256:
+
+| site | descriptor | was built |
+|---|---|---|
+| `CopyInTile` | tile read params | 1 per tile |
+| `UnpackToL1` | UB to L1 params | 2 per tile, K and V |
+| `SoftmaxStageProbs` | probs to A1 params | 1 per tile |
+| `SoftmaxRescaleAcc` | `BinaryRepeatParams` | 4 per tile, `head_size / 64` |
+
+Eight descriptor constructions per tile, each 4 to 6 immediate field stores, now
+one construction each in `Init`. Per task: the query's NZ descriptor, and
+`scale_ / kGain`, which was an fp32 divide per tile.
+
+`qScale_` became `qScaleInv_`, holding `1 / qScale_[h]` from the moment
+`PrepareTask` computes it. `SoftmaxStageProbs` was doing
+`Muls(row, row, 1.0f / qScale_[h])` once per head **per tile**; the reciprocal is
+now taken once per head per task. Bit-identical -- the same divide on the same
+operand, fewer times -- and worth `(tiles - 1) * groupHeads_` scalar divides,
+which is nothing at S=64 and 31 x `groupHeads_` at S=2048.
+
+#### Phase 1: two `Duplicate` calls sized for the wrong group
+
+Both wrote `kMaxGroupHeads` rows where only `groupHeads_` are ever read. This is
+13.17's own lesson -- size it to the shape actually in use -- applied to the two
+places that still did not:
+
+| call | was | now | saved per task at `groupHeads_` 2 |
+|---|---|---|---|
+| `ComputeSplit`, `Duplicate(acc, 0)` | 16 x 256 fp32, 16384 B | `groupHeads_` x 256 | 14336 B |
+| `PrepareTask`, `Duplicate(qOperand, 0)` | 16 x 256 B, 4096 B | `groupHeads_` x 256 B | 3584 B |
+
+Safe by inspection rather than by measurement, and the argument is worth writing
+down, because "the buffer is sized for 16 heads" is a different question from
+"are rows 2..15 read":
+
+- `acc` rows past the group are touched by nothing. `SoftmaxRescaleAcc`'s `Mul`
+  repeats `groupHeads_` times, `Accumulate`'s `Add` is `groupHeads_ * head_size`
+  long, and the partial writeback walks `h < groupHeads_`.
+- `qOperand` slots past the group are never a `DataCopy` source -- the staging
+  loop is `h < groupHeads_` -- and inside the group `CastToOperand` overwrites
+  all `operandElems_` bytes of the slot before it is read. Those zeros never
+  reached L1, so dropping them cannot change what the Cube sees. The A operand's
+  rows `groupHeads_..15` are stale in L1 either way; that is pre-existing and
+  has nothing to do with this `Duplicate`.
+
+`Duplicate(state, 0)` stays at `6 * kMaxGroupHeads * kFp32PerBlock`: its six
+fields are strided by the padded group width, so there is no contiguous prefix
+to narrow to.
+
+#### What 13.17 predicts about all of this
+
+That the descriptor half will not move the needle. 13.17 profiled the loop
+bodies doing exactly this arithmetic at 0.76-1.03 cycles per instruction,
+concluded there is no hot loop to hoist out of, only stalls, and dropped the
+hoisting work for that reason; it also watched SCALAR *rise* while instruction
+count fell. This is the same target reached by a different route and should be
+expected to behave the same way.
+
+The two `Duplicate` narrowings are a different animal -- 17,920 fewer bytes of
+vector store per task -- and are the part of this section most likely to show up
+in a tick count.
+
+Measure it. Do not reason forward from this section.
