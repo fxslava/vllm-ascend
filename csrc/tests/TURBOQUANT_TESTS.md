@@ -2001,3 +2001,85 @@ Worth stating plainly: the estimate above rests on a v1-to-v8 interpolation from
 a standalone benchmark. The decode's rotation runs inside a task with different
 cache and issue pressure, and the honest confidence interval on "2,000-2,500
 cycles" is wide.
+
+### 13.19 Correction to 13.18: batching cannot move RV_VADD / RV_VSUB
+
+13.18 recommended integrating a batched AIV butterfly and estimated 2,000-2,500
+cycles. Reading the codec closely enough to write the patch turned up two errors
+in that audit. Both point the same way, and the integration was not done.
+
+#### Error 1: `batchRows` does not size the shuffle tables
+
+13.18 claimed `ShuffleStage` "batches by lengthening `xorOffset_` and `sign_` ...
+and `Init` already takes `batchRows` and sizes the tables through
+`ConstTableWords`". It does not. The layout is
+
+```
+ConstTableWords(vecLen, batchRows) = 7*vecLen + 2*vecLen*batchRows + kLevels
+```
+
+and `Init` consumes it as `kEarlyStages * (sign_ len_ + xorOffset_ len_)` --
+**`len_`, fixed, batchRows-independent** -- then `evenOffset_`/`oddOffset_`, then
+`expandOffset_` and `oddSelect_` at `batchLen_` each. The header says so at the
+layout comment: `B = len * batchRows` labels those last two. **The `batchRows`
+term feeds the dequantiser, not the transform.**
+
+So `ShuffleStage(x, tmp, stage, B*L)` reads `sign_[stage]` and `xorOffset_[stage]`
+past their `vecLen` extent, into whatever table follows -- and `xorOffset_` feeds
+a `Gather`, so the over-read becomes wild source offsets rather than merely wrong
+arithmetic. Batching the shuffle stages requires a new table format: the device
+layout, the `CodecTableWords` host mirror in `turboquant_torch_adpt.h`,
+`CheckCodecTables`, the builder that fills the tensor, and every test that
+constructs one.
+
+#### Error 2, and the decisive one: the ALU work does not shrink
+
+The 2,000-2,500 estimate came from reading the standalone benchmark's AIV column
+-- 8 vectors costing 1.139x one vector -- as evidence that per-head calls
+collapse. That extrapolation does not transfer to the decode.
+
+A fast Walsh-Hadamard transform of B vectors of length L is `B * L * log2(L)`
+butterflies. **Batching changes how those are issued, not how many there are.**
+`RV_VADD` and `RV_VSUB` count element-work, so they are invariant under batching:
+
+```
+per task, groupHeads_ = 2, L = 256:
+  2 heads * (3 shuffle adds * 256 + 5 block adds * 128) = 2,816 element-adds
+  measured RV_VADD 1,694 cycles  ->  ~1.66 elements/cycle
+```
+
+Batched, it is the same 2,816 element-adds. What the benchmark's v1 point is
+dominated by is *fixed* cost -- kernel launch, the GM table load into UB, setup
+-- which the decode pays **once per task, not once per head**. The head loop
+never re-pays it, so there is nothing there for batching to amortise.
+
+What batching does save is real but small: one call's worth of instruction issue
+and the ~11 `PipeBarrier<PIPE_V>` a 256-wide `ApplyPi` emits, times
+`groupHeads_ - 1`. At `groupHeads_ = 2` that is on the order of **200-400
+cycles**, not 2,000-2,500.
+
+#### Consequence for the stated gates
+
+A verification criterion of "confirm the cycle drop originates specifically from
+`RV_VADD` and `RV_VSUB`" **cannot be met by AIV batching**, because AIV batching
+does not reduce butterfly element-work. The only transformation that does is
+moving butterflies onto the Cube -- and 13.18's own table shows that losing to
+the AIV baseline at every vector count below 16, while the decode runs 2 or 4.
+
+So at `d256, v = 2..4` there is no available change that reduces the decode's
+Hadamard ALU cycles. The rotation is already at the fast transform's operation
+count, on the right unit for its shape.
+
+#### What is still worth doing
+
+Batching remains worth roughly 200-400 cycles at `groupHeads_ = 2` and more at 4,
+from issue and barrier overhead alone, and it needs no table change **if it is
+restricted to the block stages** (strides >= `kFp32PerBlock`), which use no
+tables: their `2*stride` groups tile each L-length vector exactly, so they batch
+at `n = B*L` unchanged. The shuffle stages stay per-head. The stride loop bound
+still has to test the per-vector length rather than the batched one, or a
+spurious cross-vector stage runs at `stride = L`.
+
+That is a real but modest win against a wide confidence interval, and it does not
+reach the 62,000 target. Recorded rather than built, pending a decision on
+whether a few hundred cycles justifies the change.
