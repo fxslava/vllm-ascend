@@ -15,26 +15,10 @@
  */
 
 /*
- * TurboQuant 4-bit KV-cache operators.
+ * TurboQuant 4-bit KV-cache reshape and decode kernels.
  *
- * Layouts are plain contiguous ND -- no FRACTAL_NZ, no 5D views:
- *
- *   key / value      [num_tokens, num_kv_heads, head_size]                   fp16 | bf16
- *   key/value cache  [num_blocks, block_size, num_kv_heads, head_size / 2]   int8
- *   scale cache      [num_blocks, block_size, scale_slot]                    fp32
- *   query / output   [num_tokens, num_heads, head_size]                      fp16 | bf16
- *
- * where scale_slot = round_up(2 * num_kv_heads, 8).  One token's K scales for
- * every kv head are followed by its V scales, padded to a whole 32-byte burst.
- * Nothing here uses DataCopyPad: every global address touched is 32-byte
- * aligned and every transfer length is a multiple of 32 bytes.
- *
- * Rotation is an activation-time transform only; no model weight is rewritten.
- *
- * The decode path is two kernels: flash-decoding needs every split of a
- * (token, head) finished before the reduction reads them, and SyncAll only
- * orders co-resident blocks.  The split and the combine are therefore separate
- * launches ordered by the NPU stream.
+ * The file implements the packed-cache layout and the split decode/partial
+ * combine path used by the NPU flash-decoding schedule.
  */
 
 #include "kernel_operator.h"
