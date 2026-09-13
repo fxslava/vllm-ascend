@@ -1208,6 +1208,13 @@ same task rather than half of it each - that is the arrangement the probe
 proves, and the AIV -> AIC flag is satisfied only when every subcore of the pair
 has set it.
 
+> `TurboQuantCubeDecodeSplit::ProcessTile` no longer exists: section 13.11
+> replaced it with `PipelineAiv` / `PipelineAic`. Nothing above changes — the
+> per-tile handshake is still what desynchronises if the two halves of a MIX
+> block walk different task lists, and `MixBlockIdx()` is still what stops them.
+> `TurboQuantFp16DecodeSplit::ProcessTile`, the other kernel the fix was applied
+> to, is unchanged.
+
 **A seventh, in the test rather than the kernel: `block_size` must be a multiple
 of `kCubeTileRows`.** `kCubeTileRows` is 64 and `CopyInTile` issues one
 unconditional 64-row `DataCopy` per tile, so a smaller block size makes every
@@ -1371,3 +1378,137 @@ would be far too loose there.
 project at any point. The matrix above is what the first machine with the part
 will execute; what is verified today is the simulator column, at `B=1` and
 `S in {16, 64}`.
+
+### 13.11 The decode's AIV/AIC pipeline is double-buffered
+
+`TurboQuantCubeDecodeSplit` used to run its tiles in lock-step: the Cube sat
+idle through the MTE2 read, the INT4 unpack and the MTE3 staging of every tile,
+twice per tile, because the flag it was waiting on was the one the AIV posted at
+the end of that work. The staging is now a **tile ahead** of the GEMMs that
+consume it, with `L1` operand B partitioned into `kSlots = 2` ping-pong slots of
+K and V each.
+
+**What moved, and what could not.** Flash decoding's online softmax is a
+loop-carried dependency: the probability row of tile `i` comes out of the score
+GEMM of tile `i` and goes straight back in as the A operand of tile `i`'s
+context GEMM, and the running max it advances is what tile `i + 1` rescales
+against. So `Softmax` and `Accumulate` stay on the critical path, and **the Cube
+still stalls on the softmax between its two GEMMs** — closing that gap needs a
+second task in flight, not a deeper buffer. What moved is everything that
+depends only on the block table: `CopyInTile`, both `UnpackToL1` calls, and the
+flat MTE3 into L1. That is the bulk of the AIV's per-tile work.
+
+**The prefetch sits after the softmax, and that position is load-bearing twice
+over.** It has to be after, or `CopyInTile` overwrites `scaleTileBuf_` while
+`Softmax` still needs this tile's K and V scale lanes out of it — a silent wrong
+answer, not a fault, and the reason nothing in UB needed a second slot. It has
+to be before the wait on the context product, or it has no Cube work to overlap.
+
+**Two orderings that used to come free now have flags.** `kFlagProbsReady`
+(AIV → AIC) replaces what the V-unpack's position between the two GEMMs used to
+guarantee; without it the Cube multiplies the *previous* tile's probability row.
+`kFlagSlotFree` (AIC → AIV, one id per slot) is the reverse edge that lock-step
+did not need, because each side's wait for the other was also what kept it off
+the buffer the other was still reading. The full map is in
+`turboquant_cube_mm.h`; it spends seven of the eight ids the four-bit mask
+leaves after CANN's own `SyncAll` takes 11..14.
+
+**Every flag set has exactly one wait**, which is a correctness requirement and
+not tidiness: these are hardware counters the kernel does not clear on exit and a
+decode runs many tasks per core, so a surplus set would satisfy a *later* task's
+wait before its operands were staged. The two conditioned edges —
+`tile + 1 >= kSlots` on the AIV's free-wait and `tile + kSlots < numTiles` on the
+AIC's free-post — are what make the pair balance at every tile count, including
+`numTiles = 1` where neither fires.
+
+Both halves need the tile count up front for those predicates, so both call
+`CountTiles` and step the walk with `NextTile` rather than discovering the end by
+running off it. The enumeration is a pure function of the block table and the
+context length — scalar GM reads either core can make — so the two cannot
+diverge.
+
+**What this is verified against.** The protocol arithmetic (counter balance,
+deadlock-freedom, and that tile `t`'s GEMMs read tile `t`'s operands) and the
+`CountTiles`/`NextTile` equivalence to the old nested loop were both swept in
+host-side models, the latter over ~37k split geometries including block-table
+holes and ragged final blocks. Neither is a substitute for the numeric gate:
+that is `test_sim_950pr_turboquant_multimode` on the CAModel, and the multi-tile
+shapes need `ASCEND_TQ_SIM_CONTEXT=128` or higher, since the simulator default
+of `S = 16` runs a single tile and so exercises the prologue and the epilogue but
+never the steady state.
+
+**Which shapes actually reach the credit edge.** `kFlagSlotFree` is posted only
+when `tile + kSlots < numTiles`, so a task carrying two tiles or fewer never
+exercises the reverse edge at all — and `num_splits` rises with the block count
+in `PlanCubeDecode`, which cancels the growth in context length almost exactly.
+At batch 1 the tiles-per-task figure is **2 for every context length from 128
+through 1024** (identical at `aiv_num` 32, 48 and 64, so this is not a
+platform-count artefact). `S = 128` therefore covers the prologue, one prefetch
+and `kFlagProbsReady`, but leaves the free-credit path — the likeliest place for
+a hang or a leaked counter — untouched. Firing it needs **batch 1 at S >= 1536**,
+or **batch 8 at S >= 512**, which is why the device matrix rather than the
+simulator default is where that edge gets covered.
+
+### 13.12 Pairing the softmax across heads: measured, and rejected
+
+Every dependent pair of vector ops in the online softmax carries a
+`PipeBarrier<PIPE_V>`, and a barrier is a full vector-pipe flush. One head's
+softmax is a chain of 17 of them. The heads of a GQA group are independent, so
+the obvious move is to issue two heads against each flush -- 34 flushes for two
+heads down to 17 -- and the obvious move does not pay.
+
+**It was built and measured.** Single tile (`ASCEND_TQ_SIM_CONTEXT=64`, batch 1,
+`kv4fp8`) on the `Ascend950PR_9599` CAModel:
+
+| | cos vs fp32 host | total tick |
+|---|---|---|
+| per-head (shipping) | 0.986033 | 68584, 68579 |
+| paired, 17 barriers shared | 0.986033 | 69318, 69336 |
+
+so about **+1.1%, in the wrong direction**, against a run-to-run noise floor of
+~18 ticks measured by running one unchanged binary twice. (The tick count is
+NOT deterministic across runs of the same binary -- worth knowing before reading
+any single number here as exact.)
+
+**Why counting barriers was the wrong metric.** Classifying each shared barrier
+by the width of the op it guards:
+
+```
+barriers guarding a 64-element op : 7
+barriers guarding a 1-element op  : 10
+```
+
+Ten of the seventeen guard single-lane work -- `Max`, `Sub`, `Exp`, `Add`,
+`Adds`, `Duplicate` and `Div` at `count = 1`, the running-max and scale
+bookkeeping. A one-element vector op retires almost immediately, so its barrier
+is nearly free and sharing it buys nothing. Against that, pairing costs 22
+scalar branches and about 14 extra `LocalTensor` address computations per pair,
+every one of them real. Only 7 barriers guard 64-element work and only those
+were ever worth amortising.
+
+**What the experiment did establish.** cos came back *bit-identical*, which is
+the point worth keeping: the paired form shared flushes without moving a single
+dependency edge, so it changed no arithmetic. The version of this idea that
+deletes barriers and trusts the hardware scoreboard to cover the hazard is a
+different proposition entirely, and a fidelity shift is exactly how it would
+announce itself.
+
+**If it is revisited**, pair only the seven wide ops and leave the one-element
+chain per-head, and measure at a shape where the softmax runs more than twice --
+`S = 64` is one tile and one head pair, so the per-tile saving is amortised over
+a single invocation while the added scalar cost is paid in full. The patch and
+these numbers are the whole of what was learned; the shipping kernel keeps the
+per-head loop.
+
+**`Div` was kept, and not for want of trying `Rcp`.** There is no vector division
+in this kernel to eliminate. The only `Div` in the softmax is
+`probScale = OperandMax / amax(row)`, a single lane per head per tile, and the
+probabilities are never divided by the running sum here at all -- `runSum` rides
+in the partial's tail lane and the combine stage normalises, so an
+`inv_sum = Rcp(sum)` folded in here would double-normalise. On the one-lane
+`Div` that does exist, `Rcp` trades one instruction for two, on one element, off
+the critical path, and gives up the property that makes the op safe: `Div`
+guarantees `row * probScale <= OperandMax` exactly, where a reciprocal that
+rounds up puts the scaled row over the operand grid ceiling -- 448 for e4m3, 6
+for e2m1 -- and `CastToOperand` saturates. That is the `vec_err_idata_inf_nan`
+flood of section 13.8, bought for nothing.
