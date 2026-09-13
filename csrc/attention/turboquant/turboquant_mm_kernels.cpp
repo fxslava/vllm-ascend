@@ -43,9 +43,14 @@
  * batched into the GEMM's M dimension.  The partials the split writes are still
  * indexed per-head, because that is what the shared combine expects.
  *
- * Per K/V tile the two cores meet four times: AIV stages K, AIC computes
- * scores, AIV runs the online softmax and stages P and V, AIC computes the
- * context, AIV folds it into the accumulator.
+ * Per K/V tile the two cores meet five times: AIV signals that K and V of a
+ * tile are staged, AIC computes scores, AIV runs the online softmax and signals
+ * that the probability row is staged, AIC computes the context, AIV folds it
+ * into the accumulator -- and the AIC signals the tile's L1 slot free.
+ *
+ * The staging is a TILE AHEAD of the GEMMs that consume it: the Cube reads
+ * L1[tile % kSlots] while the AIV fills L1[(tile + 1) % kSlots].  See
+ * PipelineAiv and PipelineAic.
  */
 
 #include "kernel_operator.h"
@@ -57,6 +62,7 @@
 using vllm_ascend::turboquant::kBrcbDstLanes;
 using vllm_ascend::turboquant::kFp32PerBlock;
 using vllm_ascend::turboquant::kFp32PerRepeat;
+using vllm_ascend::turboquant::kSlots;
 using vllm_ascend::turboquant::TurboQuantCodec4;
 using vllm_ascend::turboquant::TurboQuantCubeMm;
 using vllm_ascend::turboquant::TurboQuantMode;
@@ -169,6 +175,28 @@ __aicore__ inline uint32_t MixBlockIdx()
 __aicore__ inline void SignalOperandsReady()
 {
     AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(vllm_ascend::turboquant::kFlagOperandsReady);
+}
+
+/*
+ * The pipelined decode's two AIV -> AIC edges.  Both are ungated for the reason
+ * SignalOperandsReady is, and SignalProbsReady is ungated even though only one
+ * subcore ran the softmax that produced the row it announces.
+ *
+ * That is not a hole.  Mode 0x02 is satisfied only once EVERY subcore of the
+ * pair has set, so the AIC is held until the subcore that actually did the MTE3
+ * has signalled; the other one's early set cannot release it.  It is the same
+ * shape as kFlagProductFree in sim_hadamard_hybrid_kernels.cpp under a
+ * single-destination Fixpipe.
+ */
+__aicore__ inline void SignalSlotReady(uint32_t slot)
+{
+    AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(
+        static_cast<uint16_t>(vllm_ascend::turboquant::kFlagSlotReady + slot));
+}
+
+__aicore__ inline void SignalProbsReady()
+{
+    AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(vllm_ascend::turboquant::kFlagProbsReady);
 }
 
 /*
@@ -624,27 +652,19 @@ private:
         }
 
         if (blockStart < blockEnd) {
+            // Both halves walk the SAME tile enumeration, independently.  It is
+            // a pure function of the block table and the context length, both
+            // of which are scalar GM reads either core can make, so the two
+            // counts cannot diverge -- and they must not: every flag condition
+            // below is a predicate on the tile index and numTiles.
+            const uint32_t ctxLen = static_cast<uint32_t>(contextLen);
+            const uint32_t numTiles = CountTiles(token, ctxLen, blockStart, blockEnd);
             if ASCEND_IS_AIV {
                 PrepareTask(token, kvHead);
+                PipelineAiv(token, ctxLen, blockStart, blockEnd, numTiles, kvHead, acc, state);
             }
-            for (uint32_t block = blockStart; block < blockEnd; ++block) {
-                const int32_t physical =
-                    blockTableGm_.GetValue(static_cast<uint64_t>(token) * maxBlocksPerSeq_ + block);
-                if (physical < 0) {
-                    continue;
-                }
-                uint32_t rows = blockSize_;
-                const uint32_t consumed = block * blockSize_;
-                if (consumed + rows > static_cast<uint32_t>(contextLen)) {
-                    rows = static_cast<uint32_t>(contextLen) - consumed;
-                }
-                for (uint32_t base = 0; base < rows; base += kCubeTileRows) {
-                    uint32_t valid = rows - base;
-                    if (valid > kCubeTileRows) {
-                        valid = kCubeTileRows;
-                    }
-                    ProcessTile(static_cast<uint32_t>(physical), kvHead, base, valid, acc, state);
-                }
+            if ASCEND_IS_AIC {
+                PipelineAic(numTiles);
             }
         }
 
@@ -757,50 +777,240 @@ private:
     }
 
     /*
-     * One K/V tile: two GEMMs on the Cube with the softmax between them.
+     * Where the tile walk has got to.  A tile is (physical block, row offset),
+     * and the walk skips block-table holes and clamps the last block to the
+     * context length -- so it is not an affine function of a tile index and has
+     * to be stepped.
      */
-    __aicore__ inline void ProcessTile(uint32_t physical, uint32_t kvHead, uint32_t rowBase, uint32_t valid,
-                                       const AscendC::LocalTensor<float> &acc,
-                                       const AscendC::LocalTensor<float> &state)
+    struct TileCursor {
+        uint32_t block = 0;     // next block to examine, or the current one
+        uint32_t rows = 0;      // valid rows of the current block
+        uint32_t base = 0;      // row offset of the current tile within it
+        uint32_t physical = 0;  // the current tile's physical block
+        uint32_t valid = 0;     // valid rows of the current tile
+        bool active = false;    // base is part-way through a resolved block
+    };
+
+    // Tiles this split will process.  Cheap -- one scalar block-table read per
+    // block, which the walk makes anyway -- and it is what lets both halves
+    // express every flag condition as arithmetic on a tile index instead of
+    // discovering the end by running off it.
+    __aicore__ inline uint32_t CountTiles(uint32_t token, uint32_t contextLen, uint32_t blockStart,
+                                          uint32_t blockEnd)
+    {
+        uint32_t tiles = 0;
+        for (uint32_t block = blockStart; block < blockEnd; ++block) {
+            const int32_t physical =
+                blockTableGm_.GetValue(static_cast<uint64_t>(token) * maxBlocksPerSeq_ + block);
+            if (physical < 0) {
+                continue;
+            }
+            uint32_t rows = blockSize_;
+            const uint32_t consumed = block * blockSize_;
+            if (consumed + rows > contextLen) {
+                rows = contextLen - consumed;
+            }
+            tiles += CeilDiv(rows, kCubeTileRows);
+        }
+        return tiles;
+    }
+
+    // Advance to the next tile.  False once the split is exhausted; the callers
+    // in this file never see that, because they are bounded by CountTiles.
+    __aicore__ inline bool NextTile(TileCursor &c, uint32_t token, uint32_t contextLen, uint32_t blockEnd)
+    {
+        if (c.active) {
+            c.base += kCubeTileRows;
+            if (c.base < c.rows) {
+                c.valid = c.rows - c.base;
+                if (c.valid > kCubeTileRows) {
+                    c.valid = kCubeTileRows;
+                }
+                return true;
+            }
+            c.active = false;
+            ++c.block;
+        }
+        while (c.block < blockEnd) {
+            const int32_t physical =
+                blockTableGm_.GetValue(static_cast<uint64_t>(token) * maxBlocksPerSeq_ + c.block);
+            if (physical >= 0) {
+                uint32_t rows = blockSize_;
+                const uint32_t consumed = c.block * blockSize_;
+                if (consumed + rows > contextLen) {
+                    rows = contextLen - consumed;
+                }
+                if (rows > 0) {
+                    c.physical = static_cast<uint32_t>(physical);
+                    c.rows = rows;
+                    c.base = 0;
+                    c.valid = rows < kCubeTileRows ? rows : kCubeTileRows;
+                    c.active = true;
+                    return true;
+                }
+            }
+            ++c.block;
+        }
+        return false;
+    }
+
+    // One tile's whole producer side: the packed read, and both operands onto
+    // the grid and into L1[slot].  Every DataCopy into L1 is already guarded by
+    // UnpackToL1's SyncVectorToMte3, and the flag the caller posts after this
+    // is on PIPE_MTE3, so it cannot outrun them.
+    __aicore__ inline void StageTile(const TileCursor &c, uint32_t kvHead, uint32_t slot)
     {
         AscendC::LocalTensor<int8_t> kv = kvBuf_.Get<int8_t>();
+        AscendC::LocalTensor<float> scaleTile = scaleTileBuf_.Get<float>();
+        CopyInTile(kv, scaleTile, c.physical, kvHead, c.base);
+        UnpackToL1(kv, mm_.B1K(slot));
+        UnpackToL1(kv[kCubeTileRows * packedBytes_], mm_.B1V(slot));
+    }
+
+    /*
+     * The vector half, software-pipelined one tile deep.
+     *
+     * WHAT CAN AND CANNOT MOVE OFF THE CRITICAL PATH.  Flash decoding's online
+     * softmax is a loop-carried dependency and stays one: the probability row of
+     * tile i comes out of the score GEMM of tile i and goes straight back in as
+     * the A operand of tile i's context GEMM, and the running max it advances is
+     * what tile i + 1's softmax rescales against.  So Softmax and Accumulate
+     * cannot be hoisted, and the Cube still stalls on the softmax between its
+     * two GEMMs.  Closing THAT gap needs a second task in flight, not a deeper
+     * buffer.
+     *
+     * What CAN move is everything depending only on the block table: the MTE2
+     * read of the packed tile, the nibble unpack onto the operand grid, and the
+     * MTE3 copy into L1.  That is the bulk of the AIV's work per tile and all of
+     * it is hoisted a tile ahead here.  In the lockstep form the Cube sat idle
+     * through all three, twice per tile.
+     *
+     * THE PREFETCH'S POSITION IS THE WHOLE POINT.  It sits after the softmax has
+     * released the Cube onto the context GEMM and before the wait for that
+     * GEMM's product, so it runs against Cube work rather than in front of it.
+     * Moving it earlier would delay the softmax and with it the context GEMM;
+     * moving it later would leave it nothing to overlap.
+     *
+     * It also has to sit there for a plainer reason: CopyInTile overwrites
+     * scaleTileBuf_, and Softmax reads THIS tile's K and V scale lanes out of
+     * it.  A prefetch ahead of the softmax would feed tile i's score row tile
+     * i + 1's scales -- a silent wrong answer, not a fault.  That single
+     * ordering is also why nothing in UB needs a second slot.
+     *
+     * EVERY FLAG SET HAS EXACTLY ONE WAIT.  These are hardware counters the
+     * kernel does not clear on exit, and a decode runs many tasks per core, so a
+     * surplus set is not harmless -- it would satisfy a later task's wait before
+     * its operands were staged.  Over numTiles = n:
+     *
+     *   SlotReady           1 prologue + (n-1) loop   vs  n AIC waits
+     *   SlotFree            max(n-2, 0) AIC sets      vs  max(n-2, 0) AIV waits
+     *   ProbsReady          n sets                    vs  n AIC waits
+     *   Scores/ContextReady n AIC sets each           vs  n AIV waits each
+     *
+     * and they balance per slot as well as in total, because both conditioned
+     * edges -- tile + 1 >= kSlots here, tile + kSlots < numTiles in PipelineAic
+     * -- start at slot 0 and alternate together.  At n = 1 neither fires.
+     */
+    __aicore__ inline void PipelineAiv(uint32_t token, uint32_t contextLen, uint32_t blockStart, uint32_t blockEnd,
+                                       uint32_t numTiles, uint32_t kvHead, const AscendC::LocalTensor<float> &acc,
+                                       const AscendC::LocalTensor<float> &state)
+    {
+        if (numTiles == 0) {
+            return;
+        }
         AscendC::LocalTensor<float> scaleTile = scaleTileBuf_.Get<float>();
         AscendC::LocalTensor<float> scores = scoreBuf_.Get<float>();
         AscendC::LocalTensor<float> ctx = ctxBuf_.Get<float>();
 
-        CopyInTile(kv, scaleTile, physical, kvHead, rowBase);
+        // Two cursors over one enumeration: prod runs a tile ahead of cons.
+        TileCursor prod;
+        TileCursor cons;
+        prod.block = blockStart;
+        cons.block = blockStart;
 
-        // K -> operand grid -> L1, then the score GEMM.
-        UnpackToL1(kv, mm_.B1());
-        SignalOperandsReady();
-        if ASCEND_IS_AIC {
-            AscendC::CrossCoreWaitFlag(vllm_ascend::turboquant::kFlagOperandsReady);
-            mm_.GemmScores(scores, kMaxGroupHeads, headSize_, kCubeTileRows);
-            AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(vllm_ascend::turboquant::kFlagProductReady);
-        }
-        if ASCEND_IS_AIV {
-            // Both subcores wait -- the flag counts must stay balanced -- but
-            // `scores` is UB the AIC's Fixpipe wrote into one of them, and the
+        // Prologue.  Tile 0 has no predecessor to overlap its staging against.
+        NextTile(prod, token, contextLen, blockEnd);
+        StageTile(prod, kvHead, 0);
+        SignalSlotReady(0);
+
+        for (uint32_t tile = 0; tile < numTiles; ++tile) {
+            const uint32_t next = (tile + 1) % kSlots;
+            NextTile(cons, token, contextLen, blockEnd);
+
+            // Both subcores wait -- the counts have to stay balanced -- but
+            // scores is UB the Fixpipe wrote into only one of them, and the
             // softmax also stages the probability row this tile's context GEMM
-            // reads. See ProductIsMine.
-            AscendC::CrossCoreWaitFlag(vllm_ascend::turboquant::kFlagProductReady);
+            // reads.  See ProductIsMine.
+            AscendC::CrossCoreWaitFlag(vllm_ascend::turboquant::kFlagScoresReady);
             if (ProductIsMine()) {
-                Softmax(scores, scaleTile, state, acc, valid);
+                SoftmaxStageProbs(scores, scaleTile, state, cons.valid);
             }
-        }
+            // Posted the moment the probability row is in A1Probs, and BEFORE
+            // the accumulator rescale, which the context GEMM does not depend
+            // on.  Ungated: mode 0x02 needs both subcores, and it is subcore 0's
+            // set -- the one that did the MTE3 -- that actually releases the
+            // Cube.  See SignalProbsReady and SoftmaxRescaleAcc.
+            SignalProbsReady();
+            if (ProductIsMine()) {
+                SoftmaxRescaleAcc(state, acc);
+            }
 
-        // V -> operand grid -> L1, then the context GEMM.
-        UnpackToL1(kv[kCubeTileRows * packedBytes_], mm_.B1());
-        SignalOperandsReady();
-        if ASCEND_IS_AIC {
-            AscendC::CrossCoreWaitFlag(vllm_ascend::turboquant::kFlagOperandsReady);
-            mm_.GemmContext(ctx, kMaxGroupHeads, kCubeTileRows, headSize_);
-            AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(vllm_ascend::turboquant::kFlagProductReady);
-        }
-        if ASCEND_IS_AIV {
-            AscendC::CrossCoreWaitFlag(vllm_ascend::turboquant::kFlagProductReady);
+            if (tile + 1 < numTiles) {
+                if (tile + 1 >= kSlots) {
+                    // L1[next] last held tile - 1.  The Cube has to have drained
+                    // it into L0B before it can be restaged.
+                    AscendC::CrossCoreWaitFlag(
+                        static_cast<uint16_t>(vllm_ascend::turboquant::kFlagSlotFree + next));
+                }
+                NextTile(prod, token, contextLen, blockEnd);
+                StageTile(prod, kvHead, next);
+                SignalSlotReady(next);
+            }
+
+            AscendC::CrossCoreWaitFlag(vllm_ascend::turboquant::kFlagContextReady);
             if (ProductIsMine()) {
                 Accumulate(acc, ctx, state);
+            }
+        }
+    }
+
+    /*
+     * The cube half.  One tile behind the AIV in steady state, which is why its
+     * wait on kFlagSlotReady costs nothing there: the AIV posted that flag while
+     * this core was still running the previous tile's GEMMs.
+     *
+     * The slot is released after the CONTEXT load rather than after the score
+     * load, because one slot carries both K and V.  Releasing on MTE1 rather
+     * than after the Fixpipe still hands the AIV the whole Mmad and Fixpipe of
+     * the context GEMM to restage in -- and in steady state the AIV's free-wait
+     * is already satisfied when it arrives, since the slot it wants was released
+     * a tile earlier.
+     */
+    __aicore__ inline void PipelineAic(uint32_t numTiles)
+    {
+        AscendC::LocalTensor<float> scores = scoreBuf_.Get<float>();
+        AscendC::LocalTensor<float> ctx = ctxBuf_.Get<float>();
+
+        for (uint32_t tile = 0; tile < numTiles; ++tile) {
+            const uint32_t slot = tile % kSlots;
+
+            AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(vllm_ascend::turboquant::kFlagSlotReady + slot));
+            mm_.GemmScores(scores, mm_.B1K(slot), kMaxGroupHeads, headSize_, kCubeTileRows);
+            AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(vllm_ascend::turboquant::kFlagScoresReady);
+
+            // The probability row is the context GEMM's A operand and the AIV
+            // has only just produced it.  In the lockstep loop this ordering
+            // came free from the V staging sitting between the two GEMMs; it
+            // does not any more.  See kFlagProbsReady.
+            AscendC::CrossCoreWaitFlag(vllm_ascend::turboquant::kFlagProbsReady);
+            mm_.GemmContext(ctx, mm_.B1V(slot), kMaxGroupHeads, kCubeTileRows, headSize_);
+            AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(vllm_ascend::turboquant::kFlagContextReady);
+
+            // Conditioned so that every set has exactly one wait: on the last
+            // kSlots tiles no restage of this slot follows.
+            if (tile + kSlots < numTiles) {
+                AscendC::CrossCoreSetFlag<0x2, PIPE_MTE1>(
+                    static_cast<uint16_t>(vllm_ascend::turboquant::kFlagSlotFree + slot));
             }
         }
     }
@@ -933,10 +1143,9 @@ private:
     // The score row arrives as Q_fp8 . K_fp8, so three factors still have to
     // come out of it: the query's operand scale (per head), the per-vector K
     // scale divided by the codebook gain (per column), and the attention scale.
-    __aicore__ inline void Softmax(const AscendC::LocalTensor<float> &scores,
-                                   const AscendC::LocalTensor<float> &scaleTile,
-                                   const AscendC::LocalTensor<float> &state, const AscendC::LocalTensor<float> &acc,
-                                   uint32_t valid)
+    __aicore__ inline void SoftmaxStageProbs(const AscendC::LocalTensor<float> &scores,
+                                             const AscendC::LocalTensor<float> &scaleTile,
+                                             const AscendC::LocalTensor<float> &state, uint32_t valid)
     {
         AscendC::LocalTensor<float> runMax = state;
         AscendC::LocalTensor<float> runSum = state[kMaxGroupHeads * kFp32PerBlock];
@@ -1040,6 +1249,32 @@ private:
             AscendC::DataCopy(pL1[h * kOperandC0], probOperand[h * pElems], pParams);
         }
         AscendC::PipeBarrier<PIPE_ALL>();
+    }
+
+    /*
+     * The rest of the online softmax: rescale the accumulator by alpha and
+     * advance the running max.
+     *
+     * SPLIT OUT OF SoftmaxStageProbs SO THE SIGNAL CAN GO BETWEEN THEM.  The
+     * context GEMM's only dependency on the softmax is the probability row,
+     * which the loop above has just landed in A1Probs; everything here touches
+     * acc and state alone.  Leaving it ahead of kFlagProbsReady held the Cube
+     * through a Brcb loop and a groupHeads_-wide Mul over the whole
+     * [kMaxGroupHeads, head_size] accumulator -- the single largest vector op in
+     * the tile -- for no reason but the order the code happened to be in.
+     *
+     * It is safe to run against the context GEMM: the AIC writes only ctxBuf_
+     * and scoreBuf_ by Fixpipe, neither of which this touches, and the alpha
+     * scratch it borrows out of reduceBuf_ sits above the window Accumulate
+     * uses.  Accumulate still runs behind kFlagContextReady, so the accumulator
+     * is fully rescaled before the tile's context product is folded into it.
+     */
+    __aicore__ inline void SoftmaxRescaleAcc(const AscendC::LocalTensor<float> &state,
+                                             const AscendC::LocalTensor<float> &acc)
+    {
+        AscendC::LocalTensor<float> runMax = state;
+        AscendC::LocalTensor<float> newMax = state[3 * kMaxGroupHeads * kFp32PerBlock];
+        AscendC::LocalTensor<float> alpha = state[4 * kMaxGroupHeads * kFp32PerBlock];
 
         // The accumulator's rescale by alpha, one column chunk at a time: a
         // repeat advances one row of acc and one 32B block of alpha, which is
@@ -1734,9 +1969,9 @@ public:
                 AscendC::CrossCoreWaitFlag(vllm_ascend::turboquant::kFlagOperandsReady);
             }
             if (bIsNk != 0) {
-                mm_.GemmScores(out, m, k, n);
+                mm_.GemmScores(out, mm_.B1(), m, k, n);
             } else {
-                mm_.GemmContext(out, m, k, n, variant);
+                mm_.GemmContext(out, mm_.B1(), m, k, n, variant);
             }
             AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(vllm_ascend::turboquant::kFlagProductReady);
         }
