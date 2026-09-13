@@ -1892,3 +1892,112 @@ reason forward from the share.
   arithmetic running at **0.76-1.03 cycles per instruction**; the expensive PC
   windows execute 51-128 times at 8-40 cycles each. There is no hot loop to hoist
   out of, only stalls.
+
+### 13.18 Batching the rotation: audit, and why the Cube variant is the wrong one
+
+#### What exists
+
+| artefact | what it is |
+|---|---|
+| `csrc/tests/common/hadamard_spike.hpp` | host helpers: `Hadamard16Half`, `EarlyStageTables`, chunk sizing, `HadamardDualDstApplies` |
+| `csrc/tests/sim/sim_hadamard_hybrid_kernels.cpp` | 954 lines. AIV-batched butterfly **and** Cube-factorised variants, double-buffered across kSlots |
+| `csrc/tests/device/bench_950pr_cube_hadamard.cpp` | the silicon benchmark |
+| `hadamard_benchmark_results.csv` | 181 rows of real 950PR device measurements, 100 samples per case |
+| `csrc/attention/turboquant/turboquant_codec_950.h` | the shipping `ApplyPi` / `FastWalshHadamardTransform`, at `batchRows = 1` |
+
+#### The Cube factorisation does not apply at the decode's shape
+
+`d256`, device mode, median us:
+
+| vectors | AIV | single | hilo | dualdst |
+|---|---|---|---|---|
+| v1 | 8.649 | 8.708 | 8.573 | - |
+| v8 | 9.847 | 9.737 | 9.775 | 8.863 |
+| v16 | 12.762 | 9.366 | 9.543 | 9.926 |
+| v32 | 24.501 | 17.182 | 17.471 | 10.645 |
+
+stddev runs 0.68-1.30 across these, so **at v1 every variant is inside one
+standard deviation of the AIV baseline**. The Cube only pulls away at v16 (-27%)
+and v32 (-57%), where its fixed staging cost amortises.
+
+The decode rotates `groupHeads_` query vectors per task -- **2 at the simulator
+tier, 4 at the device tier**. That is below every crossover measured. Offloading
+the rotation to the Cube at this shape buys nothing and adds cross-core
+handshakes.
+
+#### What the same table says about AIV batching
+
+Read the AIV column alone: **8 vectors cost 1.139x what 1 vector costs**. The
+AIV path is fixed-overhead-dominated at low vector counts, so `groupHeads_`
+separate single-vector calls collapse to roughly the cost of one. Interpolating,
+2 vectors are ~1.02x one and 4 are ~1.06x.
+
+Against the decode's measured `RV_VADD` 1,694 + `RV_VSUB` 1,421 = 3,115 cycles of
+butterfly, batching at `groupHeads_ = 2` should return ~1,500 cycles, and the
+per-call overhead it also folds -- the `ShuffleStage` Gathers and Muls, and the
+~11 `PipeBarrier<PIPE_V>` a 256-wide `ApplyPi` issues -- roughly as much again.
+Call it **2,000-2,500 cycles, ~3-4%**, which would put `S = 64` near 61,500 and
+clear 63,000. This is an estimate from a benchmark at a different shape, not a
+measurement of the decode.
+
+#### What the code change actually is
+
+`FastWalshHadamardTransform` is closer to batchable than it looks. Laying B
+vectors of length L contiguously as `[B][L]`:
+
+- **`ShuffleStage`** is a Gather plus two elementwise ops over `n`. The butterfly
+  pairs index `i` with `i XOR s`; because each vector's base is L-aligned and
+  `s < L`, that never leaves the vector. The stage batches by lengthening
+  `xorOffset_` and `sign_` to `B * L` -- and `Init` already takes `batchRows`
+  and sizes the tables through `ConstTableWords(vecLen, batchRows)`.
+- **`BlockStage`** butterflies within `2 * stride`-sized groups, and those groups
+  tile each L-length vector exactly (both powers of two, `stride < L`). It
+  batches at `n = B * L` **with no change at all**.
+- **The one real bug** is the loop bound. `for (stride = kFp32PerBlock; stride <
+  n; stride <<= 1)` with `n = B * L` keeps going past `stride = L`, and a stage
+  at `stride >= L` pairs across vectors. At L=256, B=2 it would run a spurious
+  `stride = 256`. Both that bound and the early-stage `if (stride >= n) return;`
+  must test the *per-vector* length, not the batched one.
+
+So: two loop bounds, a `batchRows` parameter threaded through `ApplyPi`, and
+longer tables. `sim_hadamard_hybrid_kernels.cpp` already runs a batched butterfly
+of this shape on both CAModel and silicon, so this is porting a proven form
+rather than inventing one.
+
+#### The risk is UB placement, not correctness
+
+Batching grows three things: `constBuf_` by `2 * vecLen * (batchRows - 1)` words,
+`workBuf_` by `vecLen * (batchRows - 1)`, and `qBuf_` from `2 * headSize_` floats
+to `2 * groupHeads_ * headSize_` -- about +3 KB at `groupHeads_ = 2`, +9 KB at 4.
+
+13.17 measured an 8 KB buffer allocated at the front of the order costing
+**12%**, which is larger than this optimisation's entire upside. `rotation_.Init`
+sits in the middle of the decode's allocation sequence, so growing it shifts
+every buffer after it.
+
+**Mitigation is known and cheap**: size by `groupHeads_` rather than
+`kMaxGroupHeads`, and append new allocations rather than inserting them. Both are
+the lesson of 13.17 applied directly.
+
+#### Recommendation
+
+Integrate the **AIV-batched** variant; do not pursue the Cube factorisation at
+this shape. Order the work so the dominant risk is measured first:
+
+1. Thread `batchRows` through `ApplyPi` / `FastWalshHadamardTransform`, fixing
+   the two stride bounds. Keep the encode path at `batchRows = 1` via a default,
+   since `TurboQuantCodec4` is shared with `TurboQuantModeReshapeAndCache`.
+2. Grow `qBuf_` and re-`Init` `rotation_` at `groupHeads_`, **appending** the
+   growth.
+3. Gate on exact `cos == 0.986033` -- a stride bound that leaks across vectors
+   changes the rotated basis and shows up there immediately -- plus 32/32 empty
+   exception logs.
+4. Take a UB-placement A/B before believing any tick number, per 13.17, and
+   confirm the win in `RV_VADD` + `RV_VSUB` rather than in total ticks alone.
+   13.16 and 13.17 each moved a different counter than predicted; this one
+   should be checked against the counter it targets.
+
+Worth stating plainly: the estimate above rests on a v1-to-v8 interpolation from
+a standalone benchmark. The decode's rotation runs inside a task with different
+cache and issue pressure, and the honest confidence interval on "2,000-2,500
+cycles" is wide.
