@@ -1651,3 +1651,89 @@ that is about to block anyway and wrong inside a software pipeline, where it
 drains the vector pipe and serialises the stages being overlapped. In a pipelined
 loop the same edge must be carried deferred -- posted after the vector writes,
 waited before the DMA. See 13.13.
+
+### 13.15 Where the 68,576 ticks actually go
+
+Measured, not estimated. The CAModel writes a per-instruction log per core with
+issue-cycle timestamps and a unit class; charging the gap between one
+instruction and the next to the first gives a cycle attribution. Commit
+`c74fc1221`, `S = 64` batch 1 `kv4fp8`, `Ascend950PR_9599`.
+
+| core | span | SCALAR | RVECEX (vec ALU) | MTE2 | MTE3 | CUBE | FIXP |
+|---|---|---|---|---|---|---|---|
+| AIV block 0, subcore 0 | 67,199 | **41.0%** | 12.9% | 2.1% | 0.6% | - | - |
+| AIV block 0, subcore 1 | 66,843 | **39.2%** | 12.2% | 2.0% | 0.5% | - | - |
+| AIC block 0 | 53,521 | **93.6%** | - | 0.0% | - | **0.1%** | 4.7% |
+
+Total kernel 68,576 ticks, so the AIV span *is* the kernel.
+
+**The Cube does 79 cycles of arithmetic.** Seventeen `CUBE` instructions, plus
+21 `MTE1` totalling 18 cycles and 10 Fixpipes totalling 2,537. The two GEMMs are
+262,144 MACs each; at the part's 8-bit rate that is ~64 cycles, so the Cube is
+essentially at theoretical speed and idle for 99.9% of the launch. Its
+53,521-cycle span is 93.6% scalar, of which `ST_XD_XN_IMM` alone is 80.4% --
+descriptor issue and blocking on the AIV.
+
+**Nothing is memory-bound.** MTE2 is 1,436 cycles over 27 instructions and MTE3
+is 420 over 32: the entire ingest DMA is **2.7%** of the AIV span.
+
+**Nothing is vector-ALU-bound either.** `RVECEX` is 12.9%. The affine unpack,
+the FWHT butterflies and the whole softmax live inside that.
+
+**The kernel is instruction-issue and synchronisation bound.** On the AIV,
+SCALAR 41.0% + RVECST 17.6% + FLOWCTRL 7.3% + PUSHQ 5.6% + RVECSU 5.5% is ~77%
+of the span, against ~13% of actual arithmetic. `RV_SMEM_BAR` is 6.0% and `DCCI`
+4.2% on subcore 0 and 9.6% on subcore 1 -- 10-16% in barrier and cache-coherence
+traffic alone.
+
+**This explains 13.12 and 13.13 in one line.** Both targeted a category worth
+under 13% of the profile, and both paid for it in the category worth ~80%. The
+softmax pairing traded pipeline flushes for scalar branches; the sub-chunk
+ingest traded 2.7% of DMA for more loop and descriptor overhead. Neither could
+have won.
+
+**Subcore 1 is not idle, so splitting the softmax across both is near-worthless.**
+`IsPrimarySubcore()` keeps the softmax, the accumulate and the partial writeback
+off subcore 1, which costs it 1,660 instructions out of 35,035 -- and **356
+cycles out of 67,199, 0.5%**. Both subcores pay the same staging and
+synchronisation bill, and that bill is the kernel. The ceiling on perfectly
+parallelising the vector work across the pair is half a percent, against
+breaking the invariant in 13.14.1.
+
+#### Ranking the candidate vectors
+
+| vector | ceiling | risk | verdict |
+|---|---|---|---|
+| Split softmax across 2 AIV | **0.5%** (356 cycles) | high -- breaks 13.14.1; needs dual-destination Fixpipe or a UB hop | reject |
+| Hadamard onto Cube MMAD | **~4.6%** (`RV_VADD` 1,694 + `RV_VSUB` 1,421) | high -- new numerics, more descriptor issue in the dominant cost class, extra handshakes | defer |
+| `PipeUtilization` on silicon | n/a -- a measurement | low | worth one run to confirm the profile transfers, but it is validation, not leverage |
+
+#### Recommendation: cut the barriers, not the arithmetic
+
+Nine `PipeBarrier<PIPE_ALL>` sit in the decode class. Three are inside the
+per-head partial writeback, executed `groupHeads_` times per task; three more
+run per tile (`CopyInTile`, `UnpackToL1` twice) and one per tile in the softmax
+staging. Each drains *every* pipe, and most guard a narrow dependency that a
+targeted barrier or a single event would cover.
+
+Replace each with the narrowest correct edge, starting with the writeback loop.
+Unlike 13.12 this removes work rather than reshuffling it, and unlike 13.13 it
+adds no new state.
+
+**Verification criteria**
+
+- `cos == 0.986033` exactly at `S = 64`. A dropped edge shows up here; this is
+  the check, not a formality.
+- 32/32 `core*.excp_log.dump` at 0 bytes.
+- Total tick **< 65,000** (>5%) to count, two samples per side against the
+  18-tick noise floor.
+- Re-profile `core0.veccore0` and confirm the `RV_SMEM_BAR` + `DCCI` share falls.
+  If ticks drop without that share moving, the win came from somewhere else and
+  the change is not understood.
+
+**Caveats.** This is CAModel data at one tile. The model is cycle-accurate but
+may weigh instruction issue differently from silicon, and at `numTiles = 1` the
+per-task costs (`PrepareTask`, the writeback) are amortised over a single tile,
+inflating their share against a long-context decode. The *ranking* --
+issue/sync >> arithmetic -- is robust; the percentages are shape-specific. The
+silicon `PipeUtilization` run above is how to confirm the first.
