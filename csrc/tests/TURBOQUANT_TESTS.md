@@ -1512,3 +1512,74 @@ guarantees `row * probScale <= OperandMax` exactly, where a reciprocal that
 rounds up puts the scaled row over the operand grid ceiling -- 448 for e4m3, 6
 for e2m1 -- and `CastToOperand` saturates. That is the `vec_err_idata_inf_nan`
 flood of section 13.8, bought for nothing.
+
+### 13.13 Sub-chunk pipelining the ingest: measured, and rejected
+
+The affine ingest is three pipes run one at a time -- the whole tile GM -> UB on
+MTE2, then the INT4 -> FP8 expand on V, then the flat stage into L1 on MTE3 --
+each idle while the other two work. The obvious move is to cut the tile into
+sub-chunks and issue the MTE2 for chunk k+1 ahead of the unpack of chunk k. It
+was built, on `TQue` depth 2 for both the packed input and the two-plane output,
+and it does not pay.
+
+**A sub-chunk had to be a column-group pair, not a row range.** `CopyInTile`
+lands the tile group-major, `[group][row][32]`, precisely so one group's 64-row
+run maps element-for-element onto a single NZ fractal column (section 13.9).
+Slicing by rows cuts across every group, so each sub-chunk would need
+`packedGroups_` descriptors on both the GM read and the L1 write instead of one
+-- the descriptor overhead of section 13.12, reintroduced. Slicing by group
+keeps both ends contiguous and still gives four chunks per tile at the
+production shape: K's two group pairs, then V's.
+
+**`SyncVectorToMte3` cannot appear inside such a loop.** It sets the V -> MTE3
+event and immediately waits on it, draining the vector pipe at the call site; in
+a pipelined loop that serialises the very stages being overlapped. The edge it
+enforces has to become deferred instead -- posted by `EnQue` after the unpack's
+vector writes, waited by `DeQue` before the `DataCopy`. Anyone revisiting this
+should understand that the invariant is the *edge*, not the helper.
+
+**UB was unchanged**, which is worth recording because it is not obvious:
+
+```
+lock-step  kvBuf_ 2*64*128 + operandBuf_ 2*4096        = 24576 B
+pipelined  ingest 2*4096   + operand     2*2*4096      = 24576 B
+```
+
+What the input side gives up by never holding a whole tile, the output side takes
+back by having to keep two nibble planes live per slot.
+
+**It failed the gate on both counts.** Single tile (`ASCEND_TQ_SIM_CONTEXT=64`,
+batch 1, `kv4fp8`):
+
+| | cos | total tick | excp_log |
+|---|---|---|---|
+| lock-step ingest (shipping) | 0.986033 | 68584, 68579 | 32 files, 0 non-empty |
+| sub-chunk pipelined | 0.986033 | 69135 | **32 files, 2 non-empty** |
+
+`core0` and `core1` each dropped 6962 B of `su_ccu_mpu_err_t0`, on both vector
+subcores:
+
+```
+LD_XD_XN dtype:B8, XN:X3=0, ... accessUb:0, accessDdr:1
+```
+
+scalar loads at **base 0, resolving to DDR rather than UB** -- the signature of a
+`TBuf`/`TQue` whose `InitBuffer` did not take, whose base comes back 0 and whose
+accesses then decode as DDR. The byte budget is not the cause; it is identical
+either way. The suspicion is TPipe *resource* exhaustion rather than capacity:
+two more `TQue` objects on top of `qInQueue_` draw queue and event ids from a
+limited per-position pool, and a queue that fails to allocate still answers
+`AllocTensor` with a zero-based tensor.
+
+**Note that gtest passed and cos was bit-identical while this was happening.**
+The numeric path was undisturbed; only the exception logs showed it. That is the
+argument for keeping the `excp_log` check in the gate rather than trusting cos
+alone.
+
+**If it is revisited**: hand-rolled ping-pong on a single `TBuf` with fixed event
+ids, avoiding new queue objects entirely, would test the resource hypothesis. But
+note the tick went the wrong way by ~550 even with the exceptions, and `S = 64`
+is the shape where this optimisation should look *best*, not worst -- at one tile
+`tile + 1 < numTiles` is false, the prefetch never runs, and the whole ingest sits
+exposed in the prologue on the Cube's critical path. It was measured where it had
+the most to gain.
