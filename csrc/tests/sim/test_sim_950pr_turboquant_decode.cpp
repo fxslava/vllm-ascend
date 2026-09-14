@@ -286,7 +286,7 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
     turboquant_paged_attention_impl(
         AscendType::FP16, stream, decode_grid.split_block_dim, decode_grid.combine_block_dim, query_rot_dev.get(),
         key_cache_dev.get(), value_cache_dev.get(), scale_plane_dev.get(), block_table_dev.get(),
-        context_lens_dev.get(), pi_signs_dev.get(), decode_tables_dev.get(), workspace_dev.get(),
+        context_lens_dev.get(), decode_tables_dev.get(), workspace_dev.get(),
         quantised_out_dev.get(), static_cast<uint32_t>(kQueryTokens), static_cast<uint32_t>(kNumHeads),
         static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kBlockSize),
         static_cast<uint32_t>(kBlocksPerSeq), static_cast<uint32_t>(decode_grid.num_splits),
@@ -294,7 +294,10 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
     ACL_CHECK(aclrtSynchronizeStream(stream));
   });
 
-  const std::vector<float> quantised = HalfToFloat(quantised_out_dev.ToHost<Half>());
+  // The combine writes the rotated basis; production's folded W_o is what takes
+  // it out. UnrotateHeads is that fold on the host, so every comparison below
+  // is still between attention contexts in the model's own basis.
+  const std::vector<float> quantised = tqh::UnrotateHeads(HalfToFloat(quantised_out_dev.ToHost<Half>()), kHeadSize);
 
   // --- 3. the unquantised control --------------------------------------------
   //

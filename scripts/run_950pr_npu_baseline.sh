@@ -121,7 +121,10 @@ done
 echo
 echo "===== stage 3: decode latency baseline ====="
 export ASCEND_BENCH_CSV="$OUT/bench.csv"
-ASCEND_BENCH_TQ_CONTEXTS=512,1024,2048 \
+# The binary also carries a 270-shape prefill sweep (TURBOQUANT_TESTS.md 13.23),
+# hours on its own; this stage is the decode baseline, so it is dropped here.
+# Run it separately with ASCEND_BENCH_TQ_PREFILL_COMPARE_CSV set.
+ASCEND_BENCH_TQ_PREFILL=0 ASCEND_BENCH_TQ_CONTEXTS=512,1024,2048 \
   "$DEV/bench_device_950pr_turboquant" > "$OUT/stage3_bench.log" 2>&1
 rc3=$?
 echo "exit $rc3  (77 = no usable 950PR attached)"
@@ -139,7 +142,7 @@ grep -E "^  *[0-9]+ " "$OUT/stage3_bench.log" | tail -20
 echo
 echo "===== stage 4: msprof pipe utilisation ====="
 if command -v msprof >/dev/null 2>&1; then
-  ASCEND_BENCH_TQ_CONTEXTS=512 ASCEND_BENCH_ITERS=20 ASCEND_BENCH_WARMUP=5 \
+  ASCEND_BENCH_TQ_PREFILL=0 ASCEND_BENCH_TQ_CONTEXTS=512 ASCEND_BENCH_ITERS=20 ASCEND_BENCH_WARMUP=5 \
   msprof --application="$DEV/bench_device_950pr_turboquant" \
          --output="$OUT/prof" \
          --ai-core=on \

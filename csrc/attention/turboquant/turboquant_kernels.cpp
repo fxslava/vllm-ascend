@@ -324,8 +324,7 @@ public:
      * `queryRot` is the PRE-ROTATED query, fp32 [num_tokens, num_heads,
      * head_size], produced by npu_turboquant_rotate_q.  This kernel no longer
      * applies Pi to anything: `tables` is here for the codec's dequantiser
-     * alone, and pi_signs has gone with the transform.  The combine kernel still
-     * takes both -- the output's inverse rotation is unchanged.
+     * alone, and pi_signs has gone with the transform.
      */
     __aicore__ inline void Init(__gm__ void *queryRot, __gm__ void *keyCache, __gm__ void *valueCache,
                                 __gm__ void *scaleCache, __gm__ void *blockTables, __gm__ void *contextLens,
@@ -481,8 +480,8 @@ private:
     // What used to sit between the read and the tiling was `q~ = Pi q`. It now
     // happens once per (token, head) in npu_turboquant_rotate_q instead of once
     // per (token, head, split) here; everything downstream -- the scores and the
-    // value accumulator -- still lives in the rotated basis, and the combine
-    // still un-rotates.
+    // value accumulator -- lives in the rotated basis, and so does the output:
+    // the combine no longer un-rotates.
     __aicore__ inline void PrepareTask(uint32_t token, uint32_t head, uint32_t kvHead)
     {
         AscendC::LocalTensor<float> q = qInQueue_.template AllocTensor<float>();
@@ -699,17 +698,26 @@ private:
 /*
  * npu_turboquant_paged_attention, stage two.
  *
- * Merges the per-split (max, sum, accumulator) triples, normalises, and applies
- * Pi once to take the result out of the rotated basis.
+ * Merges the per-split (max, sum, accumulator) triples and normalises. That is
+ * all it does: the result is written in the ROTATED basis,
+ * O~ = softmax(q k^T) V~, and nothing here takes it back out.
+ *
+ * The inverse rotation used to be the last thing this kernel did -- one ApplyPi
+ * per (token, head), with the codec, its constant-table image and a sign buffer
+ * held in UB for nothing else. It now lives in the weights: the host folds Pi
+ * into the output projection, W_o <- W_o (I_H (x) Pi), so the GEMM that
+ * consumes the output un-rotates it for free. A layer whose projection cannot
+ * be folded -- an elementwise output gate sits between the attention and W_o --
+ * is un-rotated by one more device launch, npu_turboquant_rotate_q on this
+ * kernel's output; see vllm_ascend/attention/turboquant_v1.py.
  */
 template <typename scalar_t>
 class TurboQuantPagedAttentionCombine {
 public:
     __aicore__ inline explicit TurboQuantPagedAttentionCombine(AscendC::TPipe *pipe) : pipe_(pipe) {}
 
-    __aicore__ inline void Init(__gm__ void *workspace, __gm__ void *piSigns, __gm__ void *tables,
-                                __gm__ void *output, uint32_t numTokens, uint32_t numHeads, uint32_t headSize,
-                                uint32_t numSplits, float invSqrtLen)
+    __aicore__ inline void Init(__gm__ void *workspace, __gm__ void *output, uint32_t numTokens, uint32_t numHeads,
+                                uint32_t headSize, uint32_t numSplits)
     {
         numTokens_ = numTokens;
         numHeads_ = numHeads;
@@ -718,24 +726,22 @@ public:
         partialStride_ = headSize + kPartialTail;
 
         workspaceGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(workspace));
-        piSignsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(piSigns), headSize);
-        tablesGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(tables));
         outputGm_.SetGlobalBuffer(reinterpret_cast<__gm__ scalar_t *>(output));
 
+        // Everything this kernel holds. Against the kernel that un-rotated, per
+        // block: accBuf_ loses ApplyPi's ping-pong slice (4 * headSize bytes),
+        // signBuf_ goes (4 * headSize), and so does the codec --
+        // ConstTableWords(headSize, kTileRows) words of table image plus
+        // WorkBufferWords(headSize, kTileRows) words of scratch, 82,272 B at
+        // head_size 256. 84,320 B in all at 256 and 42,336 B at 128, pinned by
+        // CombineUbFootprint in csrc/tests/common/turboquant_launch.hpp. The
+        // GM -> UB copies of the table image and the signs leave the launch
+        // prologue with them.
         pipe_->InitBuffer(outQueue_, 1, headSize_ * sizeof(scalar_t));
-        pipe_->InitBuffer(accBuf_, 3 * headSize_ * sizeof(float));
+        pipe_->InitBuffer(accBuf_, 2 * headSize_ * sizeof(float));
         pipe_->InitBuffer(stateBuf_, 5 * kFp32PerBlock * sizeof(float));
         pipe_->InitBuffer(partialBuf_, kPartialTail * sizeof(float));
         pipe_->InitBuffer(brcbBuf_, 4 * kBrcbDstLanes * sizeof(float));
-        pipe_->InitBuffer(signBuf_, headSize_ * sizeof(float));
-
-        // Shares the split stage's table image, so the op carries one tables
-        // tensor rather than two. Only the FWHT tables are read here; the batch
-        // shuffle tables are along for the ride.
-        codec_.Init(pipe_, headSize_, kTileRows, invSqrtLen, tablesGm_);
-
-        AscendC::LocalTensor<float> signs = signBuf_.Get<float>();
-        AscendC::DataCopy(signs, piSignsGm_, headSize_);
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 
@@ -762,7 +768,6 @@ private:
     {
         AscendC::LocalTensor<float> acc = accBuf_.Get<float>();
         AscendC::LocalTensor<float> partAcc = acc[headSize_];
-        AscendC::LocalTensor<float> tmp = acc[2 * headSize_];
 
         AscendC::LocalTensor<float> state = stateBuf_.Get<float>();
         AscendC::LocalTensor<float> runMax = state[kPartialMaxLane];
@@ -834,13 +839,8 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
         TurboQuantCodec4::BroadcastMul(acc, acc, invSum, headSize_);
 
-        // Out = Pi Out~. The accumulator is still in the rotated basis, and Pi
-        // is an involution, so the same transform takes it back out.
-        AscendC::LocalTensor<float> signs = signBuf_.Get<float>();
-        AscendC::LocalTensor<float> accRef = acc;
-        AscendC::LocalTensor<float> tmpRef = tmp;
-        codec_.ApplyPi(accRef, tmpRef, signs, static_cast<int>(headSize_));
-
+        // O~, straight out. The folded output projection is the inverse
+        // rotation now, so there is nothing left to do in this basis.
         AscendC::LocalTensor<scalar_t> out = outQueue_.template AllocTensor<scalar_t>();
         AscendC::Cast(out, acc, AscendC::RoundMode::CAST_RINT, headSize_);
         AscendC::PipeBarrier<PIPE_V>();
@@ -851,16 +851,12 @@ private:
     }
 
     AscendC::TPipe *pipe_;
-    TurboQuantCodec4 codec_;
     AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueue_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> accBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> stateBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> partialBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> brcbBuf_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> signBuf_;
     AscendC::GlobalTensor<float> workspaceGm_;
-    AscendC::GlobalTensor<float> piSignsGm_;
-    AscendC::GlobalTensor<int32_t> tablesGm_;
     AscendC::GlobalTensor<scalar_t> outputGm_;
     uint32_t numTokens_ = 0;
     uint32_t numHeads_ = 0;
@@ -909,12 +905,12 @@ private:
 
 #define TURBOQUANT_PAGED_ATTENTION_COMBINE_DECLARE(TYPE)                                                             \
     extern "C" __global__ __aicore__ void turboquant_paged_attention_combine_##TYPE(                                 \
-        GM_ADDR workspace, GM_ADDR piSigns, GM_ADDR tables, GM_ADDR output, uint32_t numTokens, uint32_t numHeads,   \
-        uint32_t headSize, uint32_t numSplits, uint32_t tasksPerCore, float invSqrtLen)                              \
+        GM_ADDR workspace, GM_ADDR output, uint32_t numTokens, uint32_t numHeads, uint32_t headSize,                 \
+        uint32_t numSplits, uint32_t tasksPerCore)                                                                   \
     {                                                                                                                \
         AscendC::TPipe pipe;                                                                                         \
         TurboQuantPagedAttentionCombine<TYPE> op(&pipe);                                                             \
-        op.Init(workspace, piSigns, tables, output, numTokens, numHeads, headSize, numSplits, invSqrtLen);           \
+        op.Init(workspace, output, numTokens, numHeads, headSize, numSplits);                                        \
         op.Process(tasksPerCore);                                                                                    \
     }
 
@@ -953,23 +949,22 @@ void turboquant_reshape_and_cache_impl(AscendType type, void *stream, uint32_t b
 // barrier that holds for an arbitrary grid.
 void turboquant_paged_attention_impl(AscendType type, void *stream, uint32_t splitBlockDim, uint32_t combineBlockDim,
                                      void *queryRot, void *keyCache, void *valueCache, void *scaleCache,
-                                     void *blockTables, void *contextLens, void *piSigns, void *tables,
-                                     void *workspace, void *output, uint32_t numTokens, uint32_t numHeads,
-                                     uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,
-                                     uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t splitTasksPerCore,
-                                     uint32_t combineTasksPerCore, float scale, float invSqrtLen)
+                                     void *blockTables, void *contextLens, void *tables, void *workspace,
+                                     void *output, uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads,
+                                     uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,
+                                     uint32_t numSplits, uint32_t splitTasksPerCore, uint32_t combineTasksPerCore,
+                                     float scale, float invSqrtLen)
 {
-    // piSigns reaches the combine alone now: the split takes a pre-rotated
-    // query and applies no transform, while the combine still un-rotates the
-    // accumulator it reduces.
+    // Neither launch rotates anything: the split takes a pre-rotated query and
+    // the combine writes the rotated output the folded W_o consumes. `tables`
+    // is the split codec's dequantiser image and nothing else.
     if (type == AscendType::FP16) {
         turboquant_paged_attention_split_half<<<splitBlockDim, nullptr, stream>>>(
             queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, tables, workspace, numTokens,
             numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, splitTasksPerCore, scale,
             invSqrtLen);
         turboquant_paged_attention_combine_half<<<combineBlockDim, nullptr, stream>>>(
-            workspace, piSigns, tables, output, numTokens, numHeads, headSize, numSplits, combineTasksPerCore,
-            invSqrtLen);
+            workspace, output, numTokens, numHeads, headSize, numSplits, combineTasksPerCore);
 #if !defined(__CCE_AICORE__) || (__CCE_AICORE__ >= 220)
     } else if (type == AscendType::BF16) {
         turboquant_paged_attention_split_bfloat16_t<<<splitBlockDim, nullptr, stream>>>(
@@ -977,8 +972,7 @@ void turboquant_paged_attention_impl(AscendType type, void *stream, uint32_t spl
             numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, splitTasksPerCore, scale,
             invSqrtLen);
         turboquant_paged_attention_combine_bfloat16_t<<<combineBlockDim, nullptr, stream>>>(
-            workspace, piSigns, tables, output, numTokens, numHeads, headSize, numSplits, combineTasksPerCore,
-            invSqrtLen);
+            workspace, output, numTokens, numHeads, headSize, numSplits, combineTasksPerCore);
 #endif
     }
 }
@@ -988,21 +982,20 @@ void turboquant_paged_attention_impl(AscendType type, void *stream, uint32_t spl
  * The combine stage on its own.
  *
  * The Cube path in turboquant_mm_kernels.cpp writes partials in exactly this
- * layout and needs this reduction unchanged -- it is rate-independent, reading
- * nothing but the workspace and the rotation tables.
+ * layout and needs this reduction unchanged -- it is rate-independent, and it
+ * reads nothing but the workspace.
  */
 void turboquant_paged_attention_combine_impl(AscendType type, void *stream, uint32_t blockDim, void *workspace,
-                                             void *piSigns, void *tables, void *output, uint32_t numTokens,
-                                             uint32_t numHeads, uint32_t headSize, uint32_t numSplits,
-                                             uint32_t tasksPerCore, float invSqrtLen)
+                                             void *output, uint32_t numTokens, uint32_t numHeads, uint32_t headSize,
+                                             uint32_t numSplits, uint32_t tasksPerCore)
 {
     if (type == AscendType::FP16) {
         turboquant_paged_attention_combine_half<<<blockDim, nullptr, stream>>>(
-            workspace, piSigns, tables, output, numTokens, numHeads, headSize, numSplits, tasksPerCore, invSqrtLen);
+            workspace, output, numTokens, numHeads, headSize, numSplits, tasksPerCore);
 #if !defined(__CCE_AICORE__) || (__CCE_AICORE__ >= 220)
     } else if (type == AscendType::BF16) {
         turboquant_paged_attention_combine_bfloat16_t<<<blockDim, nullptr, stream>>>(
-            workspace, piSigns, tables, output, numTokens, numHeads, headSize, numSplits, tasksPerCore, invSqrtLen);
+            workspace, output, numTokens, numHeads, headSize, numSplits, tasksPerCore);
 #endif
     }
 }

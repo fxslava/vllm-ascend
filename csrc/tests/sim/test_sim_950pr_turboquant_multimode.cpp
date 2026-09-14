@@ -388,14 +388,15 @@ ModeRun RunMode(tqm::TurboQuantMode mode, const Shape& shape, aclrtStream stream
   // The combine is the AIV path's, reused verbatim: the partials above are in
   // its layout. Stream order is the barrier -- an in-kernel one would order
   // only co-resident blocks.
-  turboquant_paged_attention_combine_impl(
-      AscendType::FP16, stream, decode_grid.combine_block_dim, workspace.get(), pi_signs.get(), rot_tables.get(),
-      out.get(), static_cast<uint32_t>(batch), static_cast<uint32_t>(kNumHeads),
-      static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(decode_grid.num_splits),
-      decode_grid.combine_tasks_per_core, kInvSqrtHeadSize);
+  turboquant_paged_attention_combine_impl(AscendType::FP16, stream, decode_grid.combine_block_dim, workspace.get(),
+                                          out.get(), static_cast<uint32_t>(batch), static_cast<uint32_t>(kNumHeads),
+                                          static_cast<uint32_t>(kHeadSize),
+                                          static_cast<uint32_t>(decode_grid.num_splits),
+                                          decode_grid.combine_tasks_per_core);
   ACL_CHECK(aclrtSynchronizeStream(stream));
 
-  run.output = HalfToFloat(out.ToHost<Half>());
+  // Rotated on the device; un-rotated here as the folded W_o would.
+  run.output = tqh::UnrotateHeads(HalfToFloat(out.ToHost<Half>()), kHeadSize);
   run.scale_plane = scale_plane.ToHost<float>();
   return run;
 }

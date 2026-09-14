@@ -18,8 +18,9 @@
 
 These pin down the arithmetic contract the Ascend C kernel has to honour: Pi is
 a symmetric orthogonal involution, the packed byte round-trips exactly, the
-operators are called with pure-runtime signatures, and nothing rewrites a
-projection weight.
+operators are called with pure-runtime signatures, q/k/v are never rewritten,
+and the output projection is the one weight Pi may be folded into -- with the
+decode output left rotated for a folded layer and un-rotated for any other.
 """
 
 import math
@@ -29,19 +30,29 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from tests.ut.base import TestBase
+from vllm_ascend.attention import turboquant_rotation as rotation_module
 from vllm_ascend.attention import turboquant_v1 as tq_module
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.turboquant_rotation import (
+    TURBOQUANT_FOLD_MIN_COSINE,
+    TURBOQUANT_OUTPUT_ROTATION_CONFIG_KEY,
+    TURBOQUANT_PI_SEED,
+    apply_pi,
+    fold_pi_into_output_projection,
+    output_rotation_is_folded,
+    output_rotation_marker,
+    turboquant_pi_signs,
+    validate_output_projection_fold,
+    walsh_hadamard,
+)
 from vllm_ascend.attention.turboquant_v1 import (
     TURBOQUANT_PACK_FACTOR,
     TURBOQUANT_TILE_ROWS,
     AscendTurboQuantAttentionBackend,
     AscendTurboQuantAttentionBackendImpl,
-    apply_pi,
     turboquant_codec_tables,
     turboquant_hadamard16,
-    turboquant_pi_signs,
     turboquant_scale_slot,
-    walsh_hadamard,
 )
 from vllm_ascend.attention.turboquant_v1 import (
     TURBOQUANT_LEVELS,
@@ -79,6 +90,23 @@ def _ops_mock(workspace_floats: int = WORKSPACE_FLOATS) -> MagicMock:
     """
     ops = MagicMock()
     ops.npu_turboquant_workspace_size.return_value = workspace_floats
+    return ops
+
+
+def _numeric_ops(rotated_output: torch.Tensor) -> MagicMock:
+    """Operators that compute: rotate_q is Pi, and the decode writes a known
+    rotated output. What the backend then leaves in ``output`` is the thing under
+    test, not which mocks it happened to call."""
+    ops = _ops_mock()
+
+    def rotate_q(x, signs, tables, h16, out):
+        out.copy_(apply_pi(x.to(torch.float32), signs))
+
+    def paged_attention(*args):
+        args[-1].copy_(rotated_output)
+
+    ops.npu_turboquant_rotate_q.side_effect = rotate_q
+    ops.npu_turboquant_paged_attention.side_effect = paged_attention
     return ops
 
 # The first eight channels of the shared LCG sign vector. Hard-coded so this
@@ -221,26 +249,40 @@ class TestCodecRoundTrip(TestBase):
         # softmax probabilities, never into a per-channel broadcast.
         scores = (apply_pi(q, self.signs) @ _dequantize_levels(k_packed).T) * k_step * scale
         probs = torch.softmax(scores, dim=-1) * v_step
-        # One Pi on the accumulator is the un-rotation; there is no separate
-        # inverse transform anywhere in the pipeline.
-        approx = apply_pi(probs @ _dequantize_levels(v_packed), self.signs)
+        # What the combine writes: the accumulator, still rotated.
+        rotated = probs @ _dequantize_levels(v_packed)
 
+        # Un-rotated on the device, for a layer whose o_proj is not folded.
+        approx = apply_pi(rotated, self.signs)
         cosine = torch.nn.functional.cosine_similarity(approx, exact, dim=-1)
         self.assertGreater(cosine.min().item(), 0.98)
 
+        # Or never un-rotated at all: the folded projection of the rotated output
+        # is the original projection of the exact one.
+        o_proj = torch.randn(3 * HEAD_SIZE, num_heads * HEAD_SIZE, dtype=torch.float64)
+        folded = fold_pi_into_output_projection(o_proj, HEAD_SIZE)
+        projected = torch.nn.functional.cosine_similarity(
+            rotated.reshape(-1) @ folded.T, exact.reshape(-1) @ o_proj.T, dim=0
+        )
+        self.assertGreater(projected.item(), 0.98)
+
 
 class TestPureRuntimeContract(TestBase):
-    """The refactor's invariant: rotation happens in the kernel, never in a
-    weight, and the operators carry no basis-selection flag."""
+    """The invariants: Q, K and V rotate in the kernel and never in a weight, the
+    operators carry no basis-selection flag, and the output projection is the
+    only weight Pi is ever folded into."""
 
-    def test_no_weight_folding_helpers_are_exported(self):
-        for name in (
-            "fold_pi_into_attention_projections",
-            "fold_pi_into_qkv_projection",
-            "fold_pi_into_out_projection",
-            "maybe_trans_nz_with_pi",
-        ):
-            self.assertFalse(hasattr(tq_module, name), f"{name} must not come back: rotation is runtime-only")
+    def test_only_the_output_projection_has_a_fold_helper(self):
+        for module in (tq_module, rotation_module):
+            for name in (
+                "fold_pi_into_attention_projections",
+                "fold_pi_into_qkv_projection",
+                "maybe_trans_nz_with_pi",
+            ):
+                self.assertFalse(
+                    hasattr(module, name), f"{name} must not come back: folding Pi into q/k/v moves RoPE's basis"
+                )
+        self.assertTrue(callable(rotation_module.fold_pi_into_output_projection))
 
     def test_impl_carries_no_rotation_toggle(self):
         self.assertFalse(hasattr(AscendTurboQuantAttentionBackendImpl, "apply_rotation"))
@@ -260,7 +302,22 @@ class TestPureRuntimeContract(TestBase):
         impl._pi_signs = None
         impl.decode_workspace = None
         impl._workspace_floats = {}
+        impl.rotated_query = None
+        impl._hadamard16 = None
+        impl.output_rotation_folded = False
         return impl
+
+    def _decode_fixture(self, impl, num_tokens):
+        impl.key_cache = torch.zeros(1, 128, 2, HEAD_SIZE // TURBOQUANT_PACK_FACTOR, dtype=torch.int8)
+        impl.value_cache = impl.key_cache
+        impl.scale_cache = torch.zeros(1, 128, turboquant_scale_slot(2))
+        query = torch.randn(num_tokens, impl.num_heads, HEAD_SIZE)
+        output = torch.zeros(num_tokens, impl.num_heads, HEAD_SIZE)
+        metadata = MagicMock(
+            block_tables=torch.zeros(num_tokens, 1, dtype=torch.int64),
+            seq_lens=torch.ones(num_tokens, dtype=torch.int64),
+        )
+        return query, output, metadata
 
     def test_reshape_and_cache_passes_activations_through_unrotated(self):
         impl = self._make_impl()
@@ -290,16 +347,9 @@ class TestPureRuntimeContract(TestBase):
 
     def test_paged_attention_rotates_the_query_in_its_own_operator(self):
         impl = self._make_impl()
+        impl.output_rotation_folded = True
         num_tokens = 2
-        impl.key_cache = torch.zeros(1, 128, 2, HEAD_SIZE // TURBOQUANT_PACK_FACTOR, dtype=torch.int8)
-        impl.value_cache = impl.key_cache
-        impl.scale_cache = torch.zeros(1, 128, turboquant_scale_slot(2))
-        query = torch.randn(num_tokens, impl.num_heads, HEAD_SIZE)
-        output = torch.zeros(num_tokens, impl.num_heads, HEAD_SIZE)
-        metadata = MagicMock(
-            block_tables=torch.zeros(num_tokens, 1, dtype=torch.int64),
-            seq_lens=torch.ones(num_tokens, dtype=torch.int64),
-        )
+        query, output, metadata = self._decode_fixture(impl, num_tokens)
 
         ops = _ops_mock()
         with patch.object(torch.ops, "_C_ascend", ops, create=True):
@@ -308,7 +358,7 @@ class TestPureRuntimeContract(TestBase):
         # The rotation is its own launch, and it comes first: the split kernel
         # applies no Walsh-Hadamard transform any more, so a decode that skipped
         # this call would read an unrotated query and produce plausible-looking
-        # nonsense rather than fail.
+        # nonsense rather than fail. With o_proj folded it is the only one.
         ops.npu_turboquant_rotate_q.assert_called_once()
         rot_args = ops.npu_turboquant_rotate_q.call_args.args
         # query, pi_signs, codec_tables, hadamard16, query_rot.
@@ -325,15 +375,52 @@ class TestPureRuntimeContract(TestBase):
         ops.npu_turboquant_paged_attention.assert_called_once()
         args = ops.npu_turboquant_paged_attention.call_args.args
         # query_rot, k_cache, v_cache, scale_cache, block_tables, context_lens,
-        # pi_signs, codec_tables, workspace, num_kv_heads, num_heads, scale, out.
-        self.assertEqual(len(args), 13)
+        # codec_tables, workspace, num_kv_heads, num_heads, scale, out. No
+        # pi_signs: neither kernel rotates, so nothing would read it.
+        self.assertEqual(len(args), 12)
         # The decode reads the rotation's output, not the model's query. Same
         # tensor object, so the two launches cannot disagree about the buffer.
         self.assertIs(args[0], rot_args[4])
-        torch.testing.assert_close(args[7], turboquant_codec_tables(HEAD_SIZE, TURBOQUANT_TILE_ROWS, CPU))
-        self.assertEqual(args[9], impl.num_kv_heads)
-        self.assertEqual(args[10], impl.num_heads)
+        torch.testing.assert_close(args[6], turboquant_codec_tables(HEAD_SIZE, TURBOQUANT_TILE_ROWS, CPU))
+        self.assertEqual(args[8], impl.num_kv_heads)
+        self.assertEqual(args[9], impl.num_heads)
         self.assertFalse(any(isinstance(a, bool) for a in args))
+        self.assertFalse(any(a is turboquant_pi_signs(HEAD_SIZE, CPU) for a in args))
+
+    def test_folded_decode_leaves_the_output_rotated(self):
+        """A folded o_proj un-rotates, so the backend must not."""
+        impl = self._make_impl()
+        impl.output_rotation_folded = True
+        query, output, metadata = self._decode_fixture(impl, 2)
+        rotated = torch.randn_like(output)
+
+        ops = _numeric_ops(rotated)
+        with patch.object(torch.ops, "_C_ascend", ops, create=True):
+            impl.forward_paged_attention(query, metadata, output)
+
+        torch.testing.assert_close(output, rotated)
+        self.assertEqual(ops.npu_turboquant_rotate_q.call_count, 1)
+
+    def test_unfolded_decode_unrotates_its_output_on_the_device(self):
+        """Without a fold the output reaching o_proj has to be O = Pi O~, and the
+        un-rotation is a launch of the same rotation operator, not host code."""
+        impl = self._make_impl()
+        query, output, metadata = self._decode_fixture(impl, 3)
+        rotated = torch.randn_like(output)
+        signs = turboquant_pi_signs(HEAD_SIZE, CPU)
+
+        ops = _numeric_ops(rotated)
+        with patch.object(torch.ops, "_C_ascend", ops, create=True):
+            impl.forward_paged_attention(query, metadata, output)
+
+        torch.testing.assert_close(output, apply_pi(rotated, signs), atol=1e-5, rtol=0)
+        self.assertEqual(ops.npu_turboquant_rotate_q.call_count, 2)
+        first, second = ops.npu_turboquant_rotate_q.call_args_list
+        # The un-rotation lands in the rotated query's own buffer: the split has
+        # consumed it by then, and a second high-water buffer would be a second
+        # thing that can grow during a capture.
+        self.assertIs(second.args[4], first.args[4])
+        self.assertEqual(second.args[4].data_ptr(), impl.rotated_query.data_ptr())
 
     def test_rotated_query_buffer_is_preallocated_and_reused(self):
         """The rotation never allocates on a decode step, for the same reason
@@ -369,21 +456,13 @@ class TestPureRuntimeContract(TestBase):
         """The operator never allocates its own reduction scratch."""
         impl = self._make_impl()
         num_tokens = 2
-        impl.key_cache = torch.zeros(1, 128, 2, HEAD_SIZE // TURBOQUANT_PACK_FACTOR, dtype=torch.int8)
-        impl.value_cache = impl.key_cache
-        impl.scale_cache = torch.zeros(1, 128, turboquant_scale_slot(2))
-        query = torch.randn(num_tokens, impl.num_heads, HEAD_SIZE)
-        output = torch.zeros(num_tokens, impl.num_heads, HEAD_SIZE)
-        metadata = MagicMock(
-            block_tables=torch.zeros(num_tokens, 1, dtype=torch.int64),
-            seq_lens=torch.ones(num_tokens, dtype=torch.int64),
-        )
+        query, output, metadata = self._decode_fixture(impl, num_tokens)
 
         ops = _ops_mock(workspace_floats=WORKSPACE_FLOATS)
         with patch.object(torch.ops, "_C_ascend", ops, create=True):
             impl.forward_paged_attention(query, metadata, output)
 
-        workspace = ops.npu_turboquant_paged_attention.call_args.args[8]
+        workspace = ops.npu_turboquant_paged_attention.call_args.args[7]
         self.assertIs(workspace, impl.decode_workspace)
         self.assertEqual(workspace.dtype, torch.float32)
         self.assertEqual(workspace.numel(), WORKSPACE_FLOATS)
@@ -872,10 +951,18 @@ class TestBackendContract(TestBase):
         self.assertIs(AscendTurboQuantAttentionBackend.get_impl_cls(), AscendTurboQuantAttentionBackendImpl)
         self.assertFalse(AscendTurboQuantAttentionBackend.supports_pcp())
 
-    def test_activation_swaps_the_impl(self):
+    @staticmethod
+    def _layer(hf_config, layer_name="model.layers.3.self_attn.attn"):
         layer = MagicMock()
+        layer.layer_name = layer_name
         layer.impl = MagicMock()
         layer.impl.__class__ = MagicMock
+        layer.impl.head_size = HEAD_SIZE
+        layer.impl.vllm_config = SimpleNamespace(model_config=SimpleNamespace(hf_config=hf_config))
+        return layer
+
+    def test_activation_swaps_the_impl(self):
+        layer = self._layer(SimpleNamespace())
         tq_module.activate_turboquant_backend(layer)
         self.assertIs(layer.impl.__class__, AscendTurboQuantAttentionBackendImpl)
         self.assertEqual(layer.kv_cache_torch_dtype, torch.int8)
@@ -883,6 +970,26 @@ class TestBackendContract(TestBase):
         # previous class left behind was sized for a different cache layout.
         self.assertIsNone(layer.impl.decode_workspace)
         self.assertEqual(layer.impl._workspace_floats, {})
+        # __init__ does not run on a class swap. Every attribute it sets has to
+        # be set here too, or the first decode is an AttributeError.
+        self.assertIsNone(layer.impl.rotated_query)
+        self.assertIsNone(layer.impl._hadamard16)
+        # No marker: the checkpoint's o_proj is as trained, so the decode must
+        # un-rotate its own output.
+        self.assertFalse(layer.impl.output_rotation_folded)
+
+    def test_activation_reads_the_fold_record_per_layer(self):
+        marker = output_rotation_marker(["model.layers.3.self_attn"], HEAD_SIZE)
+        hf_config = SimpleNamespace(**{TURBOQUANT_OUTPUT_ROTATION_CONFIG_KEY: marker})
+
+        folded = self._layer(hf_config)
+        tq_module.activate_turboquant_backend(folded)
+        self.assertTrue(folded.impl.output_rotation_folded)
+
+        # A marked checkpoint that does not name this layer is refused, not run
+        # unfolded: either answer could be the wrong one, and both are silent.
+        with self.assertRaises(ValueError):
+            tq_module.activate_turboquant_backend(self._layer(hf_config, "model.layers.4.self_attn.attn"))
 
     def test_loading_primes_the_device_registry(self):
         """The driver query happens at load time, never on a decode step."""
@@ -914,8 +1021,122 @@ class TestBackendContract(TestBase):
             self.assertGreaterEqual(slot, 2 * num_kv_heads)
             self.assertEqual(slot % 8, 0)
 
+    def _prefill(self, folded: bool):
+        impl = AscendTurboQuantAttentionBackendImpl.__new__(AscendTurboQuantAttentionBackendImpl)
+        impl.head_size = HEAD_SIZE
+        impl.num_heads = 4
+        impl.num_kv_heads = 2
+        impl.scale = HEAD_SIZE**-0.5
+        impl._pi_signs = None
+        impl._hadamard16 = None
+        impl.output_rotation_folded = folded
+        num_tokens = 5
+        query = torch.randn(num_tokens, impl.num_heads, HEAD_SIZE)
+        key = torch.randn(num_tokens, impl.num_kv_heads, HEAD_SIZE)
+        value = torch.randn(num_tokens, impl.num_kv_heads, HEAD_SIZE)
+        output = torch.zeros(num_tokens, impl.num_heads, HEAD_SIZE)
+        metadata = MagicMock(actual_seq_lengths_q=[num_tokens], attn_mask=None)
+
+        ops = _numeric_ops(torch.zeros(0))
+        fia = MagicMock(return_value=(torch.zeros(num_tokens, impl.num_heads, HEAD_SIZE), None))
+        with (
+            patch.object(torch.ops, "_C_ascend", ops, create=True),
+            patch.object(tq_module.torch_npu, "npu_fused_infer_attention_score", fia, create=True),
+        ):
+            impl._forward_prefill_no_cache(query, key, value, metadata, output)
+        return value, ops, fia.call_args.kwargs
+
+    def test_folded_prefill_rotates_value_before_attention(self):
+        """softmax(q k^T) (V Pi) = O Pi, which is what a folded o_proj expects."""
+        value, ops, kwargs = self._prefill(folded=True)
+        ops.npu_turboquant_rotate_q.assert_called_once()
+        torch.testing.assert_close(kwargs["value"], apply_pi(value, turboquant_pi_signs(HEAD_SIZE, CPU)))
+        self.assertEqual(kwargs["value"].dtype, value.dtype)
+
+    def test_unfolded_prefill_is_untouched(self):
+        value, ops, kwargs = self._prefill(folded=False)
+        ops.npu_turboquant_rotate_q.assert_not_called()
+        torch.testing.assert_close(kwargs["value"], value)
+
     def test_unsupported_states_are_rejected(self):
         impl = AscendTurboQuantAttentionBackendImpl.__new__(AscendTurboQuantAttentionBackendImpl)
         metadata = MagicMock(attn_state=AscendAttentionState.ChunkedPrefill)
         with self.assertRaises(NotImplementedError):
             impl.forward_impl(None, None, None, (), metadata, None)
+
+class TestOutputProjectionFold(TestBase):
+    """W_o' = W_o (I_H (x) Pi): the one weight rewrite TurboQuant does."""
+
+    NUM_HEADS = 8
+    HIDDEN = 512
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self.weight = torch.randn(self.HIDDEN, self.NUM_HEADS * HEAD_SIZE, dtype=torch.float64) * 0.02
+        self.pi = apply_pi(torch.eye(HEAD_SIZE, dtype=torch.float64), turboquant_pi_signs(HEAD_SIZE, CPU).double())
+
+    def test_fold_is_the_block_diagonal_right_multiply(self):
+        dense = self.weight @ torch.block_diag(*([self.pi] * self.NUM_HEADS))
+        torch.testing.assert_close(fold_pi_into_output_projection(self.weight, HEAD_SIZE), dense, atol=1e-12, rtol=0)
+
+    def test_folded_projection_of_the_rotated_output_is_the_original_projection(self):
+        signs = turboquant_pi_signs(HEAD_SIZE, CPU).double()
+        rotated = torch.randn(16, self.NUM_HEADS, HEAD_SIZE, dtype=torch.float64)
+        reference = apply_pi(rotated, signs).reshape(16, -1) @ self.weight.T
+        folded = rotated.reshape(16, -1) @ fold_pi_into_output_projection(self.weight, HEAD_SIZE).T
+        torch.testing.assert_close(folded, reference, atol=1e-10, rtol=0)
+
+    def test_fold_commutes_with_tensor_parallel_sharding(self):
+        """RowParallelLinear shards o_proj's input by whole heads, and the fold is
+        block diagonal over heads, so folding before or after the split agrees."""
+        whole = fold_pi_into_output_projection(self.weight, HEAD_SIZE)
+        for tp in (2, 4, 8):
+            shards = [fold_pi_into_output_projection(s, HEAD_SIZE) for s in self.weight.chunk(tp, dim=1)]
+            torch.testing.assert_close(torch.cat(shards, dim=1), whole, atol=0, rtol=0)
+
+    def test_stored_dtypes_clear_the_acceptance_bound(self):
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            stored = self.weight.to(dtype)
+            folded = fold_pi_into_output_projection(stored, HEAD_SIZE)
+            self.assertEqual(folded.dtype, dtype)
+            report = validate_output_projection_fold(stored, folded, HEAD_SIZE, num_samples=128)
+            self.assertTrue(report.passed(), f"{dtype}: cos_min {report.min_cosine}")
+            self.assertGreater(report.min_cosine, TURBOQUANT_FOLD_MIN_COSINE)
+
+    def test_validation_catches_a_wrong_fold(self):
+        wrong = self.weight.flip(dims=(1,))
+        report = validate_output_projection_fold(self.weight, wrong, HEAD_SIZE)
+        self.assertFalse(report.passed())
+
+    def test_an_output_gate_breaks_the_fold(self):
+        """Why the offline tool refuses Qwen3-Next and Qwen3.5: an elementwise gate
+        between attention and o_proj does not commute with Pi."""
+        signs = turboquant_pi_signs(HEAD_SIZE, CPU).double()
+        output = torch.randn(self.NUM_HEADS * HEAD_SIZE, dtype=torch.float64)
+        gate = torch.sigmoid(torch.randn(self.NUM_HEADS * HEAD_SIZE, dtype=torch.float64))
+        rotated = apply_pi(output.view(self.NUM_HEADS, HEAD_SIZE), signs).reshape(-1)
+        reference = (output * gate) @ self.weight.T
+        folded = (rotated * gate) @ fold_pi_into_output_projection(self.weight, HEAD_SIZE).T
+        cosine = torch.nn.functional.cosine_similarity(folded, reference, dim=0)
+        self.assertLess(cosine.item(), TURBOQUANT_FOLD_MIN_COSINE)
+
+    def test_fold_refuses_what_it_cannot_rotate_exactly(self):
+        with self.assertRaises(ValueError):
+            fold_pi_into_output_projection(self.weight.to(torch.int8), HEAD_SIZE)
+        with self.assertRaises(ValueError):
+            fold_pi_into_output_projection(self.weight[:, :-1], HEAD_SIZE)
+        with self.assertRaises(ValueError):
+            fold_pi_into_output_projection(self.weight.view(-1), HEAD_SIZE)
+
+    def test_fold_record_is_checked_against_this_build(self):
+        name = "model.layers.0.self_attn.attn"
+        marker = output_rotation_marker(["model.layers.0.self_attn"], HEAD_SIZE)
+        self.assertEqual(marker["pi_seed"], TURBOQUANT_PI_SEED)
+        self.assertTrue(output_rotation_is_folded(SimpleNamespace(**{TURBOQUANT_OUTPUT_ROTATION_CONFIG_KEY: marker}),
+                                                  name, HEAD_SIZE))
+        self.assertFalse(output_rotation_is_folded(SimpleNamespace(), name, HEAD_SIZE))
+        for field, value in (("pi_seed", TURBOQUANT_PI_SEED + 1), ("head_size", 2 * HEAD_SIZE), ("format_version", 0)):
+            broken = dict(marker, **{field: value})
+            with self.assertRaises(ValueError, msg=field):
+                output_rotation_is_folded(SimpleNamespace(**{TURBOQUANT_OUTPUT_ROTATION_CONFIG_KEY: broken}),
+                                          name, HEAD_SIZE)

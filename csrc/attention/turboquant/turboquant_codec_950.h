@@ -29,7 +29,9 @@
  *     Pi x = D (H (D x)),    D = diag(+-1),   H = normalised Walsh-Hadamard
  *
  * a symmetric orthogonal involution, so one routine both rotates and
- * un-rotates.  Rotation is applied to activations only; no weight is rewritten.
+ * un-rotates.  K, V and Q are rotated as activations; the one weight that is
+ * rewritten is the output projection, into which the host folds the inverse
+ * rotation (W_o <- W_o (I_H (x) Pi)) so the decode's output can stay rotated.
  *
  * ConstTableWords() is the constant-table layout contract; the host mirror is
  * vllm_ascend/attention/turboquant_v1.py::turboquant_codec_tables.

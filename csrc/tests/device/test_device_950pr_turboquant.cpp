@@ -303,20 +303,24 @@ class DeviceScenario {
 
     turboquant_paged_attention_impl(
         AscendType::FP16, stream_, grid.split_block_dim, grid.combine_block_dim, query_rot_.get(), key_cache_.get(),
-        value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(), pi_signs_.get(),
-        decode_tables_.get(), workspace_.get(), out_.get(), static_cast<uint32_t>(kQueryTokens),
-        static_cast<uint32_t>(kNumHeads), static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize),
-        static_cast<uint32_t>(kBlockSize), static_cast<uint32_t>(scenario_.blocks_per_seq),
-        static_cast<uint32_t>(grid.num_splits), grid.split_tasks_per_core, grid.combine_tasks_per_core,
-        kAttentionScale, kInvSqrtHeadSize);
+        value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(), decode_tables_.get(),
+        workspace_.get(), out_.get(), static_cast<uint32_t>(kQueryTokens), static_cast<uint32_t>(kNumHeads),
+        static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kBlockSize),
+        static_cast<uint32_t>(scenario_.blocks_per_seq), static_cast<uint32_t>(grid.num_splits),
+        grid.split_tasks_per_core, grid.combine_tasks_per_core, kAttentionScale, kInvSqrtHeadSize);
     ACL_CHECK(aclrtSynchronizeStream(stream_));
   }
 
   std::vector<int8_t> KeyCache() const { return key_cache_.ToHost<int8_t>(); }
   std::vector<int8_t> ValueCache() const { return value_cache_.ToHost<int8_t>(); }
   std::vector<float> ScalePlane() const { return scale_plane_.ToHost<float>(); }
+  // The kernel's own fp16 bits, still in the rotated basis. What determinism is
+  // judged on: a race shows up in these, and un-rotating first would only
+  // smear it.
   std::vector<Half> RawOutput() const { return out_.ToHost<Half>(); }
-  std::vector<float> Output() const { return HalfToFloat(out_.ToHost<Half>()); }
+  // The attention context W_o sees once Pi is folded into it, so it compares
+  // against the unrotated CPU reference directly.
+  std::vector<float> Output() const { return tqh::UnrotateHeads(HalfToFloat(out_.ToHost<Half>()), kHeadSize); }
 
   int64_t aiv_num() const { return aiv_num_; }
   bool aiv_queried() const { return aiv_queried_; }

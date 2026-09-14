@@ -39,12 +39,11 @@ extern void turboquant_reshape_and_cache_impl(AscendType type, void *stream, uin
 extern void turboquant_paged_attention_impl(AscendType type, void *stream, uint32_t splitBlockDim,
                                             uint32_t combineBlockDim, void *queryRot, void *keyCache,
                                             void *valueCache, void *scaleCache, void *blockTables,
-                                            void *contextLens, void *piSigns,
-                                            void *tables, void *workspace, void *output, uint32_t numTokens,
-                                            uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize,
-                                            uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits,
-                                            uint32_t splitTasksPerCore, uint32_t combineTasksPerCore, float scale,
-                                            float invSqrtLen);
+                                            void *contextLens, void *tables, void *workspace, void *output,
+                                            uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads,
+                                            uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,
+                                            uint32_t numSplits, uint32_t splitTasksPerCore,
+                                            uint32_t combineTasksPerCore, float scale, float invSqrtLen);
 
 extern void turboquant_rotate_q_impl(AscendType type, void *stream, uint32_t blockDim, bool useCube, void *query,
                                      void *piSigns, void *h16, void *rotTables, void *queryRot, uint32_t numVectors,
@@ -288,6 +287,11 @@ inline void npu_turboquant_reshape_and_cache(at::Tensor &key, at::Tensor &value,
 /*
  * Rotate every query vector of a decode step: q~ = Pi q = D (H (D q)).
  *
+ * Pi is an involution, so the same launch also un-rotates: the backend runs it
+ * on the decode's output for a layer whose output projection could not be
+ * folded, and on the prefill's value for a layer whose projection was.
+ * `query` names the first use, not a restriction on what the tensor holds.
+ *
  *   query        [num_tokens, num_heads, head_size]   fp16 | bf16, post-RoPE
  *   pi_signs     [head_size]                          fp32, +-1
  *   codec_tables CodecTableWords(head_size, 1) or more int32
@@ -381,14 +385,18 @@ inline void npu_turboquant_rotate_q(at::Tensor &query, at::Tensor &pi_signs, at:
  *   block_tables [num_tokens, max_blocks_per_seq]           int32
  *   context_lens [num_tokens]                               int32
  *   workspace    [>= npu_turboquant_workspace_size(...)]    fp32
- *   out          [num_tokens, num_heads, head_size]         fp16 | bf16
+ *   out          [num_tokens, num_heads, head_size]         fp16 | bf16, ROTATED
  *
  * `query_rot` is the fp32 output of npu_turboquant_rotate_q, NOT the model's
- * query -- call that operator first.  The split kernel applies no rotation of
- * any kind; it runs the softmax and the value accumulation in the rotated basis
- * and the combine applies Pi again on the way out, which is why `pi_signs` is
- * still an argument.  A caller that passed the unrotated query here would get a
- * plausible-looking wrong answer rather than an error.
+ * query -- call that operator first.  A caller that passed the unrotated query
+ * here would get a plausible-looking wrong answer rather than an error.
+ *
+ * `out` is written in the rotated basis, O~ = softmax(q k^T) V~.  Neither kernel
+ * applies any rotation: the inverse is folded into the output projection's
+ * weights, W_o <- W_o (I_H (x) Pi), so the GEMM downstream is what un-rotates.
+ * There is no pi_signs argument because nothing here reads it.  A caller whose
+ * W_o was not folded has to un-rotate `out` itself (npu_turboquant_rotate_q on
+ * it is exactly Pi) -- skipping that is, again, plausible-looking and wrong.
  *
  * The element type the kernels are instantiated for comes from `out`: it is the
  * only tensor in the call that still carries the model's dtype.
@@ -402,9 +410,9 @@ inline void npu_turboquant_rotate_q(at::Tensor &query, at::Tensor &pi_signs, at:
  */
 inline void npu_turboquant_paged_attention(at::Tensor &query_rot, at::Tensor &key_cache, at::Tensor &value_cache,
                                            at::Tensor &scale_cache, at::Tensor &block_tables,
-                                           at::Tensor &context_lens, at::Tensor &pi_signs, at::Tensor &codec_tables,
-                                           at::Tensor &workspace, int64_t num_kv_heads, int64_t num_heads,
-                                           double scale_value, at::Tensor &out)
+                                           at::Tensor &context_lens, at::Tensor &codec_tables, at::Tensor &workspace,
+                                           int64_t num_kv_heads, int64_t num_heads, double scale_value,
+                                           at::Tensor &out)
 {
     namespace adpt = turboquant_adpt;
 
@@ -423,7 +431,6 @@ inline void npu_turboquant_paged_attention(at::Tensor &query_rot, at::Tensor &ke
     TORCH_CHECK(block_tables.dim() == 2 && block_tables.scalar_type() == at::ScalarType::Int,
                 "block_tables must be an int32 [num_tokens, max_blocks_per_seq] tensor");
     TORCH_CHECK(context_lens.scalar_type() == at::ScalarType::Int, "context_lens must be int32");
-    TORCH_CHECK(pi_signs.scalar_type() == at::ScalarType::Float, "pi_signs must be float32");
     TORCH_CHECK(query_rot.is_contiguous() && out.is_contiguous(), "query_rot and out must be contiguous");
     TORCH_CHECK(key_cache.is_contiguous() && value_cache.is_contiguous() && scale_cache.is_contiguous(),
                 "the kv cache and its scale plane must be contiguous");
@@ -450,7 +457,6 @@ inline void npu_turboquant_paged_attention(at::Tensor &query_rot, at::Tensor &ke
                 scale_cache.size(2));
     TORCH_CHECK(block_tables.size(0) == num_tokens, "block_tables must hold one row per query token");
     TORCH_CHECK(context_lens.numel() == num_tokens, "context_lens must hold one length per query token");
-    TORCH_CHECK(pi_signs.numel() == head_size, "pi_signs must hold one sign per channel");
 
     if (num_tokens == 0) {
         return;
@@ -481,8 +487,8 @@ inline void npu_turboquant_paged_attention(at::Tensor &query_rot, at::Tensor &ke
     turboquant_paged_attention_impl(
         adpt::ToAscendType(out.scalar_type()), stream, plan.split_block_dim, plan.combine_block_dim,
         query_rot.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(), scale_cache.data_ptr(),
-        block_tables.data_ptr(), context_lens.data_ptr(), pi_signs.data_ptr(), codec_tables.data_ptr(),
-        workspace.data_ptr(), out.data_ptr(), static_cast<uint32_t>(num_tokens), static_cast<uint32_t>(num_heads),
+        block_tables.data_ptr(), context_lens.data_ptr(), codec_tables.data_ptr(), workspace.data_ptr(),
+        out.data_ptr(), static_cast<uint32_t>(num_tokens), static_cast<uint32_t>(num_heads),
         static_cast<uint32_t>(num_kv_heads), static_cast<uint32_t>(head_size), static_cast<uint32_t>(block_size),
         static_cast<uint32_t>(max_blocks_per_seq), static_cast<uint32_t>(plan.num_splits), plan.split_tasks_per_core,
         plan.combine_tasks_per_core, scale, inv_sqrt_len);

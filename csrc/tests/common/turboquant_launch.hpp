@@ -57,15 +57,17 @@ void turboquant_reshape_and_cache_impl(AscendType type, void *stream, uint32_t b
                                        float invSqrtLen);
 
 // `queryRot` is the fp32 output of turboquant_rotate_q_impl, not the model's
-// query: neither split kernel rotates any more. `piSigns` is still here because
-// the combine launch inside this function un-rotates the accumulator.
+// query: neither split kernel rotates any more. `output` comes back in the
+// ROTATED basis -- the combine no longer un-rotates, because production folds
+// Pi into the output projection. A test comparing against an unrotated
+// reference applies UnrotateHeads below, which is that fold, on the host.
 void turboquant_paged_attention_impl(AscendType type, void *stream, uint32_t splitBlockDim, uint32_t combineBlockDim,
                                      void *queryRot, void *keyCache, void *valueCache, void *scaleCache,
-                                     void *blockTables, void *contextLens, void *piSigns, void *tables,
-                                     void *workspace, void *output, uint32_t numTokens, uint32_t numHeads,
-                                     uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,
-                                     uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t splitTasksPerCore,
-                                     uint32_t combineTasksPerCore, float scale, float invSqrtLen);
+                                     void *blockTables, void *contextLens, void *tables, void *workspace,
+                                     void *output, uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads,
+                                     uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,
+                                     uint32_t numSplits, uint32_t splitTasksPerCore, uint32_t combineTasksPerCore,
+                                     float scale, float invSqrtLen);
 
 /*
  * Pi q for a whole decode step's worth of query vectors, in one launch.
@@ -82,10 +84,11 @@ void turboquant_rotate_q_impl(AscendType type, void *stream, uint32_t blockDim, 
                               uint32_t headSize, uint32_t vectorsPerBlock, uint32_t vectorsPerChunk,
                               uint32_t variant, float invSqrtLen);
 
+// The reduction alone, shared by the Cube split. Reads the workspace and nothing
+// else, and writes a rotated output exactly as turboquant_paged_attention_impl.
 void turboquant_paged_attention_combine_impl(AscendType type, void *stream, uint32_t blockDim, void *workspace,
-                                             void *piSigns, void *tables, void *output, uint32_t numTokens,
-                                             uint32_t numHeads, uint32_t headSize, uint32_t numSplits,
-                                             uint32_t tasksPerCore, float invSqrtLen);
+                                             void *output, uint32_t numTokens, uint32_t numHeads, uint32_t headSize,
+                                             uint32_t numSplits, uint32_t tasksPerCore);
 
 // Defined in csrc/attention/turboquant/turboquant_mm_kernels.cpp: the
 // multi-mode, Cube-native path. `mode` is the TurboQuantMode enumerator value
@@ -248,6 +251,63 @@ struct PagedAttentionGrid {
 
 PagedAttentionGrid PlanPagedAttention(int64_t num_tokens, int64_t num_heads, int64_t head_size,
                                       int64_t max_blocks_per_seq, int64_t aiv_num);
+
+// --- the output basis ------------------------------------------------------
+
+/*
+ * Take a decode output out of the rotated basis: Pi applied to every
+ * `head_size`-wide row of `rotated`, which is [tokens * heads * head_size].
+ *
+ * This is what the folded output projection does in production -- W_o' = W_o
+ * (I_H (x) Pi), so W_o' O~ = W_o (Pi O~) = W_o O -- restated on the host so a
+ * test can keep comparing attention contexts against an unrotated reference.
+ * Uses the CPU reference's own cpu_apply_pi, so the sign vector cannot drift
+ * from the one the write path rotated with.
+ */
+std::vector<float> UnrotateHeads(std::vector<float> rotated, int64_t head_size);
+
+/*
+ * UB the combine kernel asks InitBuffer for, per block, in bytes. A mirror of
+ * TurboQuantPagedAttentionCombine::Init in turboquant_kernels.cpp, kept with the
+ * footprint of the kernel it replaced so the saving is a number with a test
+ * behind it rather than a claim in a comment.
+ *
+ * `unrotation_*` is what the combine held only to apply Pi on the way out, and
+ * released when that moved into the output projection's weights:
+ *
+ *   codec tables   TurboQuantCodec<4>::ConstTableWords(D, kTileRows) words
+ *   codec scratch  TurboQuantCodec<4>::WorkBufferWords(D, kTileRows) words
+ *   signs          D fp32 words, the Pi diagonal
+ *   ping-pong      D fp32 words, ApplyPi's second vector in accBuf_
+ */
+struct CombineUbFootprint {
+  size_t out_queue = 0;
+  size_t accumulators = 0;
+  size_t state = 0;
+  size_t partial = 0;
+  size_t broadcast = 0;
+  size_t unrotation_codec_tables = 0;
+  size_t unrotation_codec_scratch = 0;
+  size_t unrotation_signs = 0;
+  size_t unrotation_ping_pong = 0;
+
+  size_t Current() const { return out_queue + accumulators + state + partial + broadcast; }
+  size_t Released() const {
+    return unrotation_codec_tables + unrotation_codec_scratch + unrotation_signs + unrotation_ping_pong;
+  }
+  size_t Previous() const { return Current() + Released(); }
+};
+
+// `scalar_bytes` is sizeof the output element: 2 for fp16 and bf16.
+CombineUbFootprint PlanCombineUb(int64_t head_size, int64_t scalar_bytes);
+
+// Words in TurboQuantCodec<4>'s uninitialised scratch buffer. Mirrors
+// TurboQuantCodec<4>::WorkBufferWords; no kernel reads it from the host.
+inline int64_t CodecWorkBufferWords(int64_t head_size, int64_t batch_rows) {
+  constexpr int64_t kBrcbDstLanes = kFp32PerBlock * kFp32PerBlock;
+  constexpr int64_t kBinLanes = 8;
+  return 2 * head_size * batch_rows + head_size + kBrcbDstLanes + kFp32PerBlock + kBinLanes * head_size;
+}
 
 // --- multi-mode, Cube-native path -------------------------------------------
 //

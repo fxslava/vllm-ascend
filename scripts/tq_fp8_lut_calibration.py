@@ -73,7 +73,7 @@ OUTLIER_KAPPA = 4.0
 def pi_signs(d: int) -> np.ndarray:
     """The +-1 diagonal of Pi = D H D, from the LCG both host and device use.
 
-    Mirrors ``turboquant_pi_signs`` in vllm_ascend/attention/turboquant_v1.py
+    Mirrors ``turboquant_pi_signs`` in vllm_ascend/attention/turboquant_rotation.py
     and ``cpu_pi_sign_vector`` in csrc/tests/reference/turbo_quant_cpu.h, so a
     cache written by one side is readable by the other.
     """

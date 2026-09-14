@@ -436,8 +436,9 @@ public:
      * head_size], produced by npu_turboquant_rotate_q.  This kernel applies no
      * Walsh-Hadamard transform of any kind: the rotation it used to run per
      * (token, kv_head, split) now runs once per (token, head) in its own launch.
-     * pi_signs and the rotation tables are gone with it -- the combine still
-     * owns the output's inverse rotation and still reads both.
+     * pi_signs and the rotation tables are gone with it, and the combine no
+     * longer takes them either: the output stays rotated and the folded output
+     * projection un-rotates it.
      */
     __aicore__ inline void Init(__gm__ void *queryRot, __gm__ void *keyCache, __gm__ void *valueCache,
                                 __gm__ void *scaleCache, __gm__ void *blockTables, __gm__ void *contextLens,
@@ -1775,8 +1776,11 @@ private:
 
 /*
  * The fp16 baseline combine: the same flash-decoding reduction the AIV path
- * does, minus the un-rotation.  Separate because this accumulator was never in
- * the rotated basis.  The PipeBarrier<PIPE_ALL> in the per-split loop is there
+ * does. Since the un-rotation left TurboQuantPagedAttentionCombine the two are
+ * the same instruction sequence, differing only in the -inf the running max is
+ * seeded with. It stays a separate kernel because this file is not in the wheel
+ * and the baseline's launch should not move when the shipping one does.  The
+ * PipeBarrier<PIPE_ALL> in the per-split loop is there
  * for the reason recorded in turboquant_kernels.cpp: partAcc is a plain TBuf
  * view, so nothing else orders iteration i+1's MTE2 fill against iteration i's
  * vector reads.

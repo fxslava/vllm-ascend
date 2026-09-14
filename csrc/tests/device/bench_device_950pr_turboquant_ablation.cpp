@@ -40,9 +40,10 @@
 //
 //   * Stage 2 is per TASK, not per tile. The cache is written already rotated,
 //     so the split's only Walsh-Hadamard is the query's -- once per query head
-//     of each kv head -- and its delta should not grow with S. The output's
-//     inverse rotation is in the combine, which the ladder does not time. The
-//     delta also carries the query's amax, scale and fp8 cast.
+//     of each kv head -- and its delta should not grow with S. There is no
+//     output inverse rotation on the device at all any more: it is folded into
+//     W_o, and the combine the ladder does not time only reduces. The delta
+//     also carries the query's amax, scale and fp8 cast.
 //   * Stages 0 to 2 end each tile read or unpack pass with PipeBarrier<PIPE_ALL>
 //     where production has a HardEvent edge, because at those cuts the edge's
 //     wait would have no consumer on its pipe. Stage 1 swaps stage 0's barrier
@@ -450,13 +451,15 @@ class AblationScenario {
 
   // The combine, which the ladder does not time. Reads the partials stage 5
   // left in the workspace, so it is only meaningful straight after that case.
+  // Returned un-rotated, as the folded W_o would see it, so it compares against
+  // Reference() directly.
   std::vector<float> CombineAndReadBack(aclrtStream stream) const {
-    turboquant_paged_attention_combine_impl(
-        AscendType::FP16, stream, decode_grid_.combine_block_dim, workspace_.get(), pi_signs_.get(),
-        rot_tables_.get(), out_.get(), U32(kQueryTokens), U32(kNumHeads), U32(head_size_),
-        U32(decode_grid_.num_splits), decode_grid_.combine_tasks_per_core, attention_scale_);
+    turboquant_paged_attention_combine_impl(AscendType::FP16, stream, decode_grid_.combine_block_dim,
+                                            workspace_.get(), out_.get(), U32(kQueryTokens), U32(kNumHeads),
+                                            U32(head_size_), U32(decode_grid_.num_splits),
+                                            decode_grid_.combine_tasks_per_core);
     ACL_CHECK(aclrtSynchronizeStream(stream));
-    return HalfToFloat(out_.ToHost<Half>());
+    return tqh::UnrotateHeads(HalfToFloat(out_.ToHost<Half>()), head_size_);
   }
 
   std::vector<float> Reference() const {

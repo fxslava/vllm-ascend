@@ -70,7 +70,7 @@ csrc/tests/
 |   |-- test_device_950pr_cube_hadamard.cpp       spike: D x V sweep against the CPU golden
 |   |-- bench_950pr_cube_hadamard.cpp             spike: the same sweep, timed, --csv=
 |   |-- bench_main_950pr_hadamard.cpp             its entry point; only it takes argv
-|   |-- bench_device_950pr_turboquant.cpp         the AIV-only baseline
+|   |-- bench_device_950pr_turboquant.cpp         decode legs, then the prefill sweep against FIA V5
 |   |-- bench_device_950pr_turboquant_ablation.cpp  the kv4fp8 Cube split, cut stage by stage
 |   `-- bench_main_950pr_ablation.cpp             its entry point; takes --stage= and --sync-timeout-ms=
 |
@@ -343,6 +343,11 @@ warmup.
 | `ASCEND_BENCH_CSV` | unset | write one row per (case, mode) to this path |
 | `ASCEND_BENCH_REPEATABLE` | on | `0` forces the re-plan-per-launch path |
 | `ASCEND_BENCH_TQ_CONTEXTS` | `512,1024,2048` | `bench_device_950pr_turboquant` only: the context lengths to sweep |
+| `ASCEND_BENCH_TQ_PREFILL` | on | `bench_device_950pr_turboquant` only: `0` drops the prefill suite |
+| `ASCEND_BENCH_TQ_PREFILL_S` / `_B` / `_D` / `_HQ` / `_HKV` | `512..8192` / `1,2,4` / `128,256` / `32,64,128` / `1,2,8` | the prefill sweep's axes, comma lists; the suite runs their cartesian product |
+| `ASCEND_BENCH_TQ_PREFILL_WARMUP` / `_ITERS` / `_BATCH` | 3 / 10 / 1 | the prefill suite's own budget; the shared `ASCEND_BENCH_WARMUP` / `_ITERS` / `_BATCH` do not apply to it |
+| `ASCEND_BENCH_TQ_PREFILL_LEGS` | all | comma list of `pf_*` legs to run |
+| `ASCEND_BENCH_TQ_PREFILL_CSV` / `_COMPARE_CSV` | unset | the prefill suite's raw (case, mode) CSV, and its one-row-per-shape comparison |
 | `ASCEND_BENCH_TQ_ABLATION_DIMS` | `256,512` | `bench_device_950pr_turboquant_ablation` only: head sizes, powers of two in [64, 512] |
 | `ASCEND_BENCH_TQ_ABLATION_CONTEXTS` | `64,512,1024,2048` | `bench_device_950pr_turboquant_ablation` only: contexts, positive multiples of 8 (TURBOQUANT_TESTS.md 13.20) |
 | `ASCEND_BENCH_TQ_ABLATION_STAGES` | `0,1,2,3,4,5` | `bench_device_950pr_turboquant_ablation` only: stages to run, in order; `--stage=` sets it |
@@ -368,8 +373,11 @@ matter for performance are not the ones that matter for correctness:
   `common/aclnn_ops.hpp`.
 - `bench_device_950pr_turboquant` sweeps context 512 / 1024 / 2048 at Qwen3.5-2B's
   `head_dim` 256, timing the 4-bit cache write and the AIV-only split/combine
-  decode, with an fp16 decode through `aclnnFusedInferAttentionScoreV2` as the
-  baseline where that operator exists.
+  decode, with an fp16 decode through `aclnnFusedInferAttentionScoreV5` (V2 as a
+  fallback) as the baseline where that operator exists. It then runs the prefill
+  sweep -- S 512..8192, B 1/2/4, D 128/256, H_Q 32/64/128, H_KV 1/2/8 -- timing
+  the TurboQuant write, the rotation of V a folded o_proj needs and FIA V5, alone
+  and as pipelines, with the KV-cache compression ratios. TURBOQUANT_TESTS.md 13.23.
 - `bench_device_950pr_turboquant_ablation` times the kv4fp8 Cube split cut at
   each `DecodeAblationStage` -- MTE2 read, unpack, query rotation, L1 staging,
   score GEMM, full pipeline -- over D in {256, 512} and S in {64, 512, 1024,
