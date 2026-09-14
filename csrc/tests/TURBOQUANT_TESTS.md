@@ -64,7 +64,8 @@ csrc/tests/
 │   ├── test_device_950pr_activation_swiglu.cpp
 │   ├── test_device_950pr_qwen_layer_golden.cpp
 │   ├── test_device_950pr_benchmark_harness.cpp
-│   └── bench_device_950pr_turboquant.cpp
+│   ├── bench_device_950pr_turboquant.cpp
+│   └── bench_device_950pr_turboquant_ablation.cpp
 │
 └── device_310p/            the 310P leg — a different part, not a tier
     ├── test_*_310p.cpp
@@ -348,7 +349,7 @@ it is printed and never asserted.
 
 | | |
 | --- | --- |
-| **Binaries** | `test_device_950pr_turboquant`, `test_device_950pr_{matmul,rmsnorm,rotary_embedding,activation_swiglu,qwen_layer_golden}`, `test_device_950pr_benchmark_harness`, `bench_device_950pr_turboquant` |
+| **Binaries** | `test_device_950pr_turboquant`, `test_device_950pr_{matmul,rmsnorm,rotary_embedding,activation_swiglu,qwen_layer_golden}`, `test_device_950pr_benchmark_harness`, `bench_device_950pr_turboquant`, `bench_device_950pr_turboquant_ablation` |
 | **Purpose** | Correctness at the shapes the model actually decodes at, and **every timing number this project quotes**. |
 | **Target hardware** | Physical Ascend 950PR. Real `libruntime.so` and `libascendcl.so`, no camodel on the link line, none on the `RUNPATH`, no fallback. |
 | **Exit criterion** | Every correctness case passes; the benchmarks exit 0 having produced a table, or exit 77 when no 950PR is attached, which ctest records as a skip. A benchmark that fails its checksum is a **correctness** failure wearing a benchmark's clothes — the launches stopped agreeing with each other — and must be treated as one. |
@@ -476,6 +477,90 @@ the codec costs.
 `ASCEND_BENCH_ITERS`, `ASCEND_BENCH_BATCH`, `ASCEND_BENCH_MODES`,
 `ASCEND_BENCH_CSV`, `ASCEND_BENCH_REPEATABLE`), plus `ASCEND_BENCH_TQ_CONTEXTS`
 to restrict the context sweep.
+
+### 7.6 `bench_device_950pr_turboquant_ablation`
+
+**What it answers:** where the kv4fp8 Cube split's latency goes. The split is
+cut at six compile-time stages -- `DecodeAblationStage` in `turboquant_mode.h`, a
+template parameter on `TurboQuantCubeDecodeSplit` tested only under
+`if constexpr`. Each rung runs everything below it plus one piece, and the top
+rung *is* `turboquant_mm_decode_split_kv4fp8_half`, not a copy of it. A rung's
+median minus its neighbour's is that piece's cost in place, including what it
+does to pipe overlap.
+
+| Stage | Adds | Grows with |
+| --- | --- | --- |
+| `stage0_mte2` | `CopyInTile`: packed K/V and scale tile, GM -> UB, `MTE2_V` edge | tiles |
+| `stage1_unpack` | `UnpackAffine` per chunk, one V drain per pass (below) | tiles |
+| `stage2_hadamard` | query GM read, cast, `ApplyPi`, amax and scale, fp8 cast | **tasks, not S** |
+| `stage3_l1_staging` | V -> MTE3 edge and `DataCopy` per chunk, `MTE3_V` per pass, the query's NZ staging | tiles |
+| `stage4_score_gemm` | `PipelineAic`'s score half -- two `LoadData`, `Mmad`, `Fixpipe` -- and the `SlotReady` / `ScoresReady` / `SlotFree` flags | tiles |
+| `stage5_full` | acc/state init, `qScaleInv_`, softmax, `ProbsReady`, context GEMM, `ContextReady`, accumulate, partial writeback | tiles |
+
+**Stage 2 is not a tile-loop FWHT.** The cache is written already rotated, so
+the split's only Walsh-Hadamard is the query's, once per query head of each kv
+head. The output's inverse rotation is in the combine, which the ladder does not
+time.
+
+**Four places the cut kernel differs from the shipping one**, each on purpose:
+
+1. Stages 0–3 contain no Cube instruction, so the AIC half only walks the task
+   list. It is still launched as a MIX block, like `sim_hadamard_aiv`, so the grid
+   and `MixBlockIdx()` mean what they mean in production.
+2. Stages 1–2 end each `UnpackToL1` with a `SyncVectorToMte3()` and no copy.
+   Without it nothing orders the next tile's MTE2 read after this tile's unpack,
+   and both touch `kvBuf_`. Stage 3 swaps that single drain for production's one
+   per chunk plus `SyncMte3ToVector()`, so its delta is the copies and the
+   difference in edges.
+3. `qScaleInv_` -- a scalar UB read per query head -- and the scale-index
+   `ArithProgression` only feed the softmax, so they belong to stage 5.
+4. Every flag set is gated together with the wait that balances it (13.14.2):
+   `SlotReady`, `ScoresReady` and `SlotFree` at stage 4; `ProbsReady` and
+   `ContextReady` at stage 5.
+
+**Checks.** Stages 0–4 run first, against a workspace uploaded as zeros, and a
+case fails if the workspace is not still zero afterwards -- a leaked writeback.
+After stage 5 the combine runs once, untimed, and the output is held to
+cos >= 0.90 against an fp32 host attention. A shape that misses is printed
+UNTRUSTED and the suite exits 1.
+
+**D = 512 is outside what `CheckHeadSize` lets a model reach**, and was asked for
+anyway. By static count the split's UB comes to 234,624 B of the part's
+`ub_size` 253,952 (`Ascend950PR_9599.ini`): 137,728 B of decode buffers, 41,312 B
+of rotation codec, 55,584 B of affine codec. L1 needs 140,288 B of 524,288, L0B
+32,768 of 65,536, L0C 32,768 of 262,144. It fits on paper with 19 KB to spare and
+has never run. The fidelity gate is what decides whether its rows mean anything,
+and every D = 256 shape runs first so a D = 512 fault cannot take those numbers
+with it.
+
+**Output:** the shared per-case table, then a waterfall per shape -- median,
+delta, share of stage 5, P95 -- and a delta-by-context table per head size, where
+stage 2 should read flat.
+
+**Knobs:** the shared `ASCEND_BENCH_*` set, plus `ASCEND_BENCH_TQ_ABLATION_DIMS`
+(powers of two in [64, 512]) and `ASCEND_BENCH_TQ_ABLATION_CONTEXTS` (positive
+multiples of 8, see 13.20). Invalid input falls back to the default sweep, with a
+message.
+
+**Build:** the stage 0–4 entry points exist only under
+`VLLM_ASCEND_TQ_DECODE_ABLATION`, which the wheel's library does not define.
+`csrc/tests/turboquant/CMakeLists.txt` has to set it twice, because
+`ascendc_library` compiles the source twice: `ascendc_compile_definitions` for
+the device precompile, and `ascendc_compile_options(...
+-forward-options-to-host-compiler ...)` for the host stub. With only the first,
+the five kernels and their launchers build and
+`turboquant_mm_decode_ablation_impl` does not, so the benchmark fails to link.
+
+**Status, 2026-09-14: built, never run.** Clean under
+`-DVLLM_ASCEND_TESTS_WERROR=ON` in three configurations on CANN 9.2.0-beta.2 --
+device (`RUN_MODE=npu`, with benchmarks), sim (`RUN_MODE=sim`) and host-only --
+with the five kernels, their launchers and `turboquant_mm_decode_ablation_impl`
+exported. No rung has executed on silicon or the camodel, and the benchmark
+refuses the camodel by construction. The stage 0–4 flag gating has therefore
+never run, and an unbalanced set/wait would first show as a hang on the part. The
+check that would catch it earlier is a sim-tier driver for the five cut kernels at
+a context where one split walks at least three tiles, the smallest shape at which
+`SlotFree` fires.
 
 ---
 

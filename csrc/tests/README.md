@@ -69,7 +69,8 @@ csrc/tests/
 |   |-- test_device_950pr_cube_hadamard.cpp       spike: D x V sweep against the CPU golden
 |   |-- bench_950pr_cube_hadamard.cpp             spike: the same sweep, timed, --csv=
 |   |-- bench_main_950pr_hadamard.cpp             its entry point; only it takes argv
-|   `-- bench_device_950pr_turboquant.cpp         the AIV-only baseline
+|   |-- bench_device_950pr_turboquant.cpp         the AIV-only baseline
+|   `-- bench_device_950pr_turboquant_ablation.cpp  the kv4fp8 Cube split, cut stage by stage
 |
 `-- device_310p/            the 310P leg -- NOT configured under a 950PR SoC
     |-- test_*_310p.cpp
@@ -340,6 +341,8 @@ warmup.
 | `ASCEND_BENCH_CSV` | unset | write one row per (case, mode) to this path |
 | `ASCEND_BENCH_REPEATABLE` | on | `0` forces the re-plan-per-launch path |
 | `ASCEND_BENCH_TQ_CONTEXTS` | `512,1024,2048` | `bench_device_950pr_turboquant` only: the context lengths to sweep |
+| `ASCEND_BENCH_TQ_ABLATION_DIMS` | `256,512` | `bench_device_950pr_turboquant_ablation` only: head sizes, powers of two in [64, 512] |
+| `ASCEND_BENCH_TQ_ABLATION_CONTEXTS` | `64,512,1024,2048` | `bench_device_950pr_turboquant_ablation` only: contexts, positive multiples of 8 (TURBOQUANT_TESTS.md 13.20) |
 | `ASCEND_TEST_DEVICE_ID` | 0 | device ordinal, shared with the tests |
 
 ```bash
@@ -363,6 +366,10 @@ matter for performance are not the ones that matter for correctness:
   `head_dim` 256, timing the 4-bit cache write and the AIV-only split/combine
   decode, with an fp16 decode through `aclnnFusedInferAttentionScoreV2` as the
   baseline where that operator exists.
+- `bench_device_950pr_turboquant_ablation` times the kv4fp8 Cube split cut at
+  each `DecodeAblationStage` -- MTE2 read, unpack, query rotation, L1 staging,
+  score GEMM, full pipeline -- over D in {256, 512} and S in {64, 512, 1024,
+  2048}, and prints a per-stage latency waterfall. See TURBOQUANT_TESTS.md 7.6.
 
 See [COVERAGE.md](COVERAGE.md) for what this does and does not close, and
 [TURBOQUANT_TESTS.md](TURBOQUANT_TESTS.md) for the TurboQuant leg specifically.
@@ -507,6 +514,7 @@ saying so rather than silently building the wrong leg.
 | `test_sim_950pr_turboquant_decode` | 5 — one decode pass end to end | ditto, with `aclnnFusedInferAttentionScore*` as an optional unquantised control. **Sim tier** |
 | `test_device_950pr_turboquant` | 5 — the same, at Qwen3.5-2B's real shapes | ditto. **Device tier**: silicon only, refuses a camodel |
 | `bench_device_950pr_turboquant` | 5 — the AIV-only decode, timed | ditto, with `aclnnFusedInferAttentionScoreV5` (V2 fallback) as the fp16 baseline |
+| `bench_device_950pr_turboquant_ablation` | 5 — the kv4fp8 Cube split, timed stage by stage | the TurboQuant kernels, plus five test-only entry points built under `VLLM_ASCEND_TQ_DECODE_ABLATION` |
 
 `common/aclnn_ops_950pr.hpp` carries the operator audit: which stage runs on a
 stock CANN operator, which on a kernel built out of `csrc/`, and the CANN header

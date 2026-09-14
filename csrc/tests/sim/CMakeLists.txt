@@ -59,7 +59,12 @@ set(VLLM_ASCEND_SIM_TESTS
   test_sim_950pr_turboquant_decode
   # Single-shot dispatch + fidelity smoke of the Cube-native multi-mode decode.
   # One pass per mode at S = 16; see the file header for why it must stay one.
-  test_sim_950pr_turboquant_multimode)
+  test_sim_950pr_turboquant_multimode
+  # Every DecodeAblationStage of the kv4fp8 split in one process, at a shape
+  # whose single split walks four tiles: does a cut kernel exit, and does it
+  # stay off the workspace. The device benchmark that times these refuses the
+  # camodel, so this is the only run they get before silicon.
+  test_sim_950pr_turboquant_ablation)
 
 foreach(test_name ${VLLM_ASCEND_SIM_TESTS})
   vllm_ascend_add_device_executable(${test_name} "${test_name}.cpp" ../common/main_950pr.cpp)

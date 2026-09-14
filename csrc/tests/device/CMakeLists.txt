@@ -151,8 +151,12 @@ message(STATUS "vllm-ascend tests: [device] ${VLLM_ASCEND_DEVICE_TESTS}")
 # turns into a ctest skip rather than a failure.
 
 if(VLLM_ASCEND_TESTS_BUILD_BENCHMARKS AND VLLM_ASCEND_TESTS_HAVE_TURBOQUANT)
+  # bench_device_950pr_turboquant_ablation times the kv4fp8 split cut at each
+  # DecodeAblationStage; its entry points exist only in this tree's kernel
+  # library (see ../turboquant/CMakeLists.txt).
   set(VLLM_ASCEND_DEVICE_BENCHMARKS
-    bench_device_950pr_turboquant)
+    bench_device_950pr_turboquant
+    bench_device_950pr_turboquant_ablation)
 
   add_custom_target(benchmarks COMMENT "Building the vllm-ascend 950PR device benchmarks")
 
