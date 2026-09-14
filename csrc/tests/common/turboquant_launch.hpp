@@ -85,6 +85,18 @@ void turboquant_mm_decode_split_impl(int32_t mode, AscendType type, void *stream
                                      uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,
                                      uint32_t numSplits, uint32_t tasksPerCore, float scale, float invSqrtLen);
 
+// The kv4fp8 split cut at `stage`, a DecodeAblationStage value. Same arguments
+// as turboquant_mm_decode_split_impl less the mode; stage 5 launches the
+// shipping kernel itself. Defined in turboquant_mm_kernels.cpp only when the
+// library is built with VLLM_ASCEND_TQ_DECODE_ABLATION, which csrc/tests does
+// and the wheel does not.
+void turboquant_mm_decode_ablation_impl(int32_t stage, AscendType type, void *stream, uint32_t blockDim, void *query,
+                                        void *keyCache, void *valueCache, void *scaleCache, void *blockTables,
+                                        void *contextLens, void *piSigns, void *rotTables, void *modeTables,
+                                        void *workspace, uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads,
+                                        uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,
+                                        uint32_t numSplits, uint32_t tasksPerCore, float scale, float invSqrtLen);
+
 /*
  * The physical fp16 baseline the benchmark compares every quantised Cube rate
  * against -- kv4fp8 and kv5fp8 both: the same Cube decode over an unquantised

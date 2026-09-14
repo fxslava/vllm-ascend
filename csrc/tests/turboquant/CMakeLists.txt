@@ -81,3 +81,19 @@ include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 # sources, and quoting it would hand ascendc_library one semicolon-joined path.
 ascendc_library(vllm_ascend_turboquant SHARED
   ${VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE})
+
+# The decode ablation ladder's entry points, turboquant_mm_decode_ablation_*.
+# Test-only: the root CMakeLists.txt does not set this, so the wheel's library
+# carries the shipping kernels and nothing else. The shipping split is compiled
+# identically either way -- it is the ladder's top rung, not a copy of it. See
+# DecodeAblationStage in attention/turboquant/turboquant_mode.h.
+#
+# It takes two calls because ascendc_library compiles the source twice.
+# ascendc_compile_definitions reaches the device precompile only -- alone, it
+# builds the five kernels and their launchers but not the host-side
+# turboquant_mm_decode_ablation_impl that calls them, and the benchmark fails to
+# link. The host stub's flags come from host_intf_pub, which only
+# ascendc_compile_options feeds, through -forward-options-to-host-compiler.
+ascendc_compile_definitions(vllm_ascend_turboquant PRIVATE VLLM_ASCEND_TQ_DECODE_ABLATION)
+ascendc_compile_options(vllm_ascend_turboquant PRIVATE
+  -forward-options-to-host-compiler -DVLLM_ASCEND_TQ_DECODE_ABLATION)

@@ -282,6 +282,59 @@ inline const char *TurboQuantModeName(TurboQuantMode mode)
     return "kv5fp8";
 }
 
+/*
+ * Compile-time cut points for the Cube decode's ablation ladder.
+ *
+ * Each stage runs everything the one before it does plus one more piece of the
+ * split kernel, so the latency difference between neighbours is that piece's
+ * cost.  A template parameter on TurboQuantCubeDecodeSplit, never a runtime
+ * argument: a stage below STAGE_5_FULL_PIPELINE compiles the later pieces out,
+ * and STAGE_5_FULL_PIPELINE is the shipping kernel itself.  The values cross
+ * the launch boundary, so do not renumber them.
+ */
+enum class DecodeAblationStage : int32_t {
+    // Packed K/V and scale tiles, GM -> UB through CopyInTile.
+    STAGE_0_MTE2_ONLY = 0,
+    // + the affine unpack onto the fp8 grid, in UB.
+    STAGE_1_UNPACK = 1,
+    // + the query's GM read, cast, Pi rotation and operand cast.  Once per
+    // task, not per tile: the cache is stored rotated, so the split kernel's
+    // only Walsh-Hadamard is the query's.
+    STAGE_2_HADAMARD = 2,
+    // + every V -> MTE3 edge and UB -> L1 copy, K/V tiles and the query.
+    STAGE_3_L1_STAGING = 3,
+    // + MTE1 load, the score Mmad and its Fixpipe, with the AIV/AIC handshake.
+    STAGE_4_SCORE_GEMM = 4,
+    // + online softmax, context GEMM, accumulator and the partial writeback.
+    STAGE_5_FULL_PIPELINE = 5,
+};
+
+constexpr int32_t kDecodeAblationStageCount = 6;
+
+constexpr bool DecodeAblationStageIsValid(int32_t raw)
+{
+    return raw >= 0 && raw < kDecodeAblationStageCount;
+}
+
+inline const char *DecodeAblationStageName(DecodeAblationStage stage)
+{
+    switch (stage) {
+        case DecodeAblationStage::STAGE_0_MTE2_ONLY:
+            return "stage0_mte2";
+        case DecodeAblationStage::STAGE_1_UNPACK:
+            return "stage1_unpack";
+        case DecodeAblationStage::STAGE_2_HADAMARD:
+            return "stage2_hadamard";
+        case DecodeAblationStage::STAGE_3_L1_STAGING:
+            return "stage3_l1_staging";
+        case DecodeAblationStage::STAGE_4_SCORE_GEMM:
+            return "stage4_score_gemm";
+        case DecodeAblationStage::STAGE_5_FULL_PIPELINE:
+            return "stage5_full";
+    }
+    return "stage5_full";
+}
+
 // Bytes one Cube operand element occupies, which is what the unpack writes and
 // the L1 stage moves.  fp4 is half a byte, so the fp4 count is in *pairs*:
 // a d=256 fp4 row is 128 bytes of fp4x2, and the Cube's operand tensor is

@@ -27,6 +27,7 @@
 
 #include "../../kernels/types.h"
 
+using vllm_ascend::turboquant::DecodeAblationStage;
 using vllm_ascend::turboquant::kBrcbDstLanes;
 using vllm_ascend::turboquant::kFp32PerBlock;
 using vllm_ascend::turboquant::kFp32PerRepeat;
@@ -411,12 +412,22 @@ private:
  * rotation and its fp8 cast, the unpack of every K/V tile onto the operand
  * grid, the online softmax and the accumulator; the AIC owns both GEMMs.
  */
-template <TurboQuantMode MODE, typename scalar_t>
+template <TurboQuantMode MODE, typename scalar_t,
+          DecodeAblationStage STAGE = DecodeAblationStage::STAGE_5_FULL_PIPELINE>
 class TurboQuantCubeDecodeSplit {
 public:
     using Codec = TurboQuantModeCodec<MODE>;
     using Mm = TurboQuantCubeMm<MODE>;
     using OperandT = typename Mm::OperandT;
+
+    // Whether this instantiation keeps `stage` of the ablation ladder; see
+    // DecodeAblationStage.  Only ever tested under `if constexpr`, so a cut
+    // piece is not compiled, and at the default every gate holds and the kernel
+    // is the shipping one statement for statement.
+    __aicore__ static constexpr bool Keeps(DecodeAblationStage stage)
+    {
+        return static_cast<int32_t>(STAGE) >= static_cast<int32_t>(stage);
+    }
 
     __aicore__ inline explicit TurboQuantCubeDecodeSplit(AscendC::TPipe *pipe) : pipe_(pipe) {}
 
@@ -589,7 +600,9 @@ private:
         // function on a MIX kernel; leaving the accumulator init unguarded made
         // the cube core issue vector stores into UB it does not own, which the
         // part reports as su_ccu_mpu_err rather than as anything legible.
-        if ASCEND_IS_AIV {
+        // Softmax state, which no ablation cut below stage 5 reads.
+        if constexpr (Keeps(DecodeAblationStage::STAGE_5_FULL_PIPELINE)) {
+          if ASCEND_IS_AIV {
             // groupHeads_, not kMaxGroupHeads: rows past the group are never
             // read -- the rescale repeats groupHeads_ times, Accumulate adds
             // groupHeads_ * head_size, and the writeback walks h < groupHeads_.
@@ -601,6 +614,7 @@ private:
             // of a block, so filling the other seven costs nothing.
             AscendC::Duplicate(runMax, kNegInf, groupHeads_ * kFp32PerBlock);
             AscendC::PipeBarrier<PIPE_V>();
+          }
         }
 
         const int32_t contextLen = contextLenGm_.GetValue(token);
@@ -621,12 +635,23 @@ private:
             const uint32_t ctxLen = static_cast<uint32_t>(contextLen);
             const uint32_t numTiles = CountTiles(token, ctxLen, blockStart, blockEnd);
             if ASCEND_IS_AIV {
-                PrepareTask(token, kvHead);
+                if constexpr (Keeps(DecodeAblationStage::STAGE_2_HADAMARD)) {
+                    PrepareTask(token, kvHead);
+                }
                 PipelineAiv(token, ctxLen, blockStart, blockEnd, numTiles, kvHead, acc, state);
             }
             if ASCEND_IS_AIC {
-                PipelineAic(numTiles);
+                // Below stage 4 the Cube has nothing to multiply, and the AIV's
+                // half of every handshake is compiled out with it.
+                if constexpr (Keeps(DecodeAblationStage::STAGE_4_SCORE_GEMM)) {
+                    PipelineAic(numTiles);
+                }
             }
+        }
+
+        // No ablation cut below stage 5 produced a partial to write.
+        if constexpr (!Keeps(DecodeAblationStage::STAGE_5_FULL_PIPELINE)) {
+            return;
         }
 
         // One partial per query head: [head_size] of accumulator then
@@ -723,14 +748,24 @@ private:
             BroadcastScalar(reduce[2 * kFp32PerBlock], reduce[kFp32PerBlock]);
             TurboQuantCodec4::BroadcastMul(vec, vec, reduce[2 * kFp32PerBlock], headSize_);
             // Once per head per task, not per tile: the alternative is a
-            // full-length Mul per tile instead of a Muls immediate.
-            qScaleInv_[h] = 1.0f / reduce.GetValue(kFp32PerBlock);
+            // full-length Mul per tile instead of a Muls immediate.  A scalar
+            // read of UB that only the softmax consumes.
+            if constexpr (Keeps(DecodeAblationStage::STAGE_5_FULL_PIPELINE)) {
+                qScaleInv_[h] = 1.0f / reduce.GetValue(kFp32PerBlock);
+            }
 
             codec_.CastToOperand(qOperand[h * operandElems_], vec, headSize_);
 
             // NZ: head h occupies lane h of every C0 block.
-            SyncVectorToMte3();
-            AscendC::DataCopy(qL1[h * kOperandC0], qOperand[h * operandElems_], qNzParams_);
+            if constexpr (Keeps(DecodeAblationStage::STAGE_3_L1_STAGING)) {
+                SyncVectorToMte3();
+                AscendC::DataCopy(qL1[h * kOperandC0], qOperand[h * operandElems_], qNzParams_);
+            }
+        }
+
+        // Everything below feeds the softmax alone.
+        if constexpr (!Keeps(DecodeAblationStage::STAGE_5_FULL_PIPELINE)) {
+            return;
         }
 
         // The two scale lanes this task reads out of every token's slot.
@@ -830,6 +865,9 @@ private:
         AscendC::LocalTensor<int8_t> packedTile = kvBuf_.Get<int8_t>();
         AscendC::LocalTensor<float> scaleTile = scaleTileBuf_.Get<float>();
         CopyInTile(packedTile, scaleTile, tile.physical, kvHead, tile.base);
+        if constexpr (!Keeps(DecodeAblationStage::STAGE_1_UNPACK)) {
+            return;
+        }
         UnpackToL1(packedTile, mm_.B1K(l1SlotIdx));
         UnpackToL1(packedTile[kCubeTileRows * packedBytes_], mm_.B1V(l1SlotIdx));
     }
@@ -867,48 +905,66 @@ private:
         stageCursor.block = blockStart;
         consumeCursor.block = blockStart;
 
+        // Below stage 4 every flag is compiled out with the Cube's half, and
+        // this is a plain staging walk over the same enumeration.  Each gate
+        // removes a set together with the wait that balances it.
+
         // Prologue.  Tile 0 has no predecessor to overlap its staging against.
         NextTile(stageCursor, token, contextLen, blockEnd);
         StageTile(stageCursor, kvHead, 0);
-        SignalSlotReady(0);
+        if constexpr (Keeps(DecodeAblationStage::STAGE_4_SCORE_GEMM)) {
+            SignalSlotReady(0);
+        }
 
         for (uint32_t tileIdx = 0; tileIdx < numTiles; ++tileIdx) {
             const uint32_t nextSlotIdx = (tileIdx + 1) % kSlots;
-            NextTile(consumeCursor, token, contextLen, blockEnd);
+            if constexpr (Keeps(DecodeAblationStage::STAGE_5_FULL_PIPELINE)) {
+                NextTile(consumeCursor, token, contextLen, blockEnd);
+            }
 
             // Both subcores wait -- the counts have to stay balanced -- but
             // scores is UB the Fixpipe wrote into only one of them, and the
             // softmax also stages the probability row this tileIdx's context GEMM
             // reads.  See IsPrimarySubcore.
-            AscendC::CrossCoreWaitFlag(vllm_ascend::turboquant::kFlagScoresReady);
-            if (IsPrimarySubcore()) {
-                SoftmaxStageProbs(scores, scaleTile, state, consumeCursor.valid);
+            if constexpr (Keeps(DecodeAblationStage::STAGE_4_SCORE_GEMM)) {
+                AscendC::CrossCoreWaitFlag(vllm_ascend::turboquant::kFlagScoresReady);
             }
-            // Posted the moment the probability row is in A1Probs, and BEFORE
-            // the accumulator rescale, which the context GEMM does not depend
-            // on.  Ungated: mode 0x02 needs both subcores, and it is subcore 0's
-            // set -- the one that did the MTE3 -- that actually releases the
-            // Cube.  See SignalProbsReady and SoftmaxRescaleAcc.
-            SignalProbsReady();
-            if (IsPrimarySubcore()) {
-                SoftmaxRescaleAcc(state, acc);
+            if constexpr (Keeps(DecodeAblationStage::STAGE_5_FULL_PIPELINE)) {
+                if (IsPrimarySubcore()) {
+                    SoftmaxStageProbs(scores, scaleTile, state, consumeCursor.valid);
+                }
+                // Posted the moment the probability row is in A1Probs, and BEFORE
+                // the accumulator rescale, which the context GEMM does not depend
+                // on.  Ungated: mode 0x02 needs both subcores, and it is subcore 0's
+                // set -- the one that did the MTE3 -- that actually releases the
+                // Cube.  See SignalProbsReady and SoftmaxRescaleAcc.
+                SignalProbsReady();
+                if (IsPrimarySubcore()) {
+                    SoftmaxRescaleAcc(state, acc);
+                }
             }
 
             if (tileIdx + 1 < numTiles) {
-                if (tileIdx + 1 >= kSlots) {
-                    // L1[nextSlotIdx] last held tileIdx - 1.  The Cube has to have drained
-                    // it into L0B before it can be restaged.
-                    AscendC::CrossCoreWaitFlag(
-                        static_cast<uint16_t>(vllm_ascend::turboquant::kFlagSlotFree + nextSlotIdx));
+                if constexpr (Keeps(DecodeAblationStage::STAGE_4_SCORE_GEMM)) {
+                    if (tileIdx + 1 >= kSlots) {
+                        // L1[nextSlotIdx] last held tileIdx - 1.  The Cube has to have drained
+                        // it into L0B before it can be restaged.
+                        AscendC::CrossCoreWaitFlag(
+                            static_cast<uint16_t>(vllm_ascend::turboquant::kFlagSlotFree + nextSlotIdx));
+                    }
                 }
                 NextTile(stageCursor, token, contextLen, blockEnd);
                 StageTile(stageCursor, kvHead, nextSlotIdx);
-                SignalSlotReady(nextSlotIdx);
+                if constexpr (Keeps(DecodeAblationStage::STAGE_4_SCORE_GEMM)) {
+                    SignalSlotReady(nextSlotIdx);
+                }
             }
 
-            AscendC::CrossCoreWaitFlag(vllm_ascend::turboquant::kFlagContextReady);
-            if (IsPrimarySubcore()) {
-                Accumulate(acc, ctx, state);
+            if constexpr (Keeps(DecodeAblationStage::STAGE_5_FULL_PIPELINE)) {
+                AscendC::CrossCoreWaitFlag(vllm_ascend::turboquant::kFlagContextReady);
+                if (IsPrimarySubcore()) {
+                    Accumulate(acc, ctx, state);
+                }
             }
         }
     }
@@ -1007,10 +1063,12 @@ private:
             for (uint32_t groupBase = 0; groupBase < packedGroups_; groupBase += unpackGroups_) {
                 vllm_ascend::turboquant::unpack_tq4_to_fp8(codec_, unpackedUb, unpackedUb[unpackBytes_],
                                                            packed[groupBase * groupElems], unpackBytes_);
-                SyncVectorToMte3();
-                AscendC::DataCopy(l1Dst[groupBase * groupElems], unpackedUb, unpackParams_);
-                AscendC::DataCopy(l1Dst[(packedGroups_ + groupBase) * groupElems],
-                                  unpackedUb[unpackBytes_], unpackParams_);
+                if constexpr (Keeps(DecodeAblationStage::STAGE_3_L1_STAGING)) {
+                    SyncVectorToMte3();
+                    AscendC::DataCopy(l1Dst[groupBase * groupElems], unpackedUb, unpackParams_);
+                    AscendC::DataCopy(l1Dst[(packedGroups_ + groupBase) * groupElems],
+                                      unpackedUb[unpackBytes_], unpackParams_);
+                }
             }
         } else {
             const uint32_t bandElems = kUnpackRows * kOperandC0;
@@ -1026,13 +1084,22 @@ private:
                     codec_.Unpack(unpackedUb, sub_packed, static_cast<int>(kUnpackRows),
                                   static_cast<int>(headSize_));
                 }
-                SyncVectorToMte3();
-                AscendC::DataCopy(l1Dst[bandIdx * bandElems], unpackedUb, unpackParams_);
+                if constexpr (Keeps(DecodeAblationStage::STAGE_3_L1_STAGING)) {
+                    SyncVectorToMte3();
+                    AscendC::DataCopy(l1Dst[bandIdx * bandElems], unpackedUb, unpackParams_);
+                }
             }
         }
-        // StageTile calls this twice on one unpackedUb, so the next call's
-        // vector expand would otherwise race this one's DMA out of it.
-        SyncMte3ToVector();
+        if constexpr (Keeps(DecodeAblationStage::STAGE_3_L1_STAGING)) {
+            // StageTile calls this twice on one unpackedUb, so the next call's
+            // vector expand would otherwise race this one's DMA out of it.
+            SyncMte3ToVector();
+        } else {
+            // Cuts 1 and 2 stage nothing, so no copy drains the vector pipe, and
+            // the next tile's MTE2 read would land in the kvBuf_ this pass is
+            // still reading.  One drain per pass; stage 3 and up pay one per chunk.
+            SyncVectorToMte3();
+        }
     }
 
     // The online softmax, per query head, over one tile's kCubeTileRows scores.
@@ -1937,6 +2004,32 @@ TURBOQUANT_MM_DECLARE_MODE(kv3fp4, TurboQuantMode::KV3_FP4)
 TURBOQUANT_MM_DECLARE_MODE(kv4fp8, TurboQuantMode::KV4_FP8)
 TURBOQUANT_MM_DECLARE_MODE(kv5fp8, TurboQuantMode::KV5_FP8)
 
+#ifdef VLLM_ASCEND_TQ_DECODE_ABLATION
+// The kv4fp8 split cut below the full pipeline, one entry point per stage.
+// Stage 5 has none: the ladder's top rung is turboquant_mm_decode_split_kv4fp8_half
+// itself.  csrc/tests defines VLLM_ASCEND_TQ_DECODE_ABLATION; the wheel does not.
+#define TURBOQUANT_MM_DECODE_ABLATION_DECLARE(STAGE_NAME, STAGE)                                                   \
+    extern "C" __global__ __aicore__ void turboquant_mm_decode_ablation_kv4fp8_##STAGE_NAME##_half(                \
+        GM_ADDR query, GM_ADDR keyCache, GM_ADDR valueCache, GM_ADDR scaleCache, GM_ADDR blockTables,                \
+        GM_ADDR contextLens, GM_ADDR piSigns, GM_ADDR rotTables, GM_ADDR modeTables, GM_ADDR workspace,              \
+        uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,           \
+        uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t tasksPerCore, float scale, float invSqrtLen)          \
+    {                                                                                                                \
+        AscendC::TPipe pipe;                                                                                         \
+        TurboQuantCubeDecodeSplit<TurboQuantMode::KV4_FP8, half, STAGE> op(&pipe);                                   \
+        op.Init(query, keyCache, valueCache, scaleCache, blockTables, contextLens, piSigns, rotTables, modeTables,   \
+                workspace, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, scale,  \
+                invSqrtLen);                                                                                         \
+        op.Process(tasksPerCore);                                                                                    \
+    }
+
+TURBOQUANT_MM_DECODE_ABLATION_DECLARE(s0, DecodeAblationStage::STAGE_0_MTE2_ONLY)
+TURBOQUANT_MM_DECODE_ABLATION_DECLARE(s1, DecodeAblationStage::STAGE_1_UNPACK)
+TURBOQUANT_MM_DECODE_ABLATION_DECLARE(s2, DecodeAblationStage::STAGE_2_HADAMARD)
+TURBOQUANT_MM_DECODE_ABLATION_DECLARE(s3, DecodeAblationStage::STAGE_3_L1_STAGING)
+TURBOQUANT_MM_DECODE_ABLATION_DECLARE(s4, DecodeAblationStage::STAGE_4_SCORE_GEMM)
+#endif  // VLLM_ASCEND_TQ_DECODE_ABLATION
+
 // The fp16 baseline entry points.  Only `half` is instantiated: this is a
 // comparator for the fp8 path, which is fp16-only.
 #define TURBOQUANT_FP16_DECODE_SPLIT_DECLARE(TYPE)                                                                   \
@@ -2044,6 +2137,61 @@ void turboquant_mm_decode_split_impl(int32_t mode, AscendType type, void *stream
             break;
     }
 }
+
+#ifdef VLLM_ASCEND_TQ_DECODE_ABLATION
+// The kv4fp8 split cut at `stage`.  The host validates the stage with
+// DecodeAblationStageIsValid; anything else launches the full pipeline, which is
+// the same fallback the mode dispatch above makes.
+void turboquant_mm_decode_ablation_impl(int32_t stage, AscendType type, void *stream, uint32_t blockDim, void *query,
+                                        void *keyCache, void *valueCache, void *scaleCache, void *blockTables,
+                                        void *contextLens, void *piSigns, void *rotTables, void *modeTables,
+                                        void *workspace, uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads,
+                                        uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,
+                                        uint32_t numSplits, uint32_t tasksPerCore, float scale, float invSqrtLen)
+{
+    if (type != AscendType::FP16) {
+        return;
+    }
+    switch (static_cast<turboquant::DecodeAblationStage>(stage)) {
+        case turboquant::DecodeAblationStage::STAGE_0_MTE2_ONLY:
+            turboquant_mm_decode_ablation_kv4fp8_s0_half<<<blockDim, nullptr, stream>>>(
+                query, keyCache, valueCache, scaleCache, blockTables, contextLens, piSigns, rotTables, modeTables,
+                workspace, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,
+                tasksPerCore, scale, invSqrtLen);
+            break;
+        case turboquant::DecodeAblationStage::STAGE_1_UNPACK:
+            turboquant_mm_decode_ablation_kv4fp8_s1_half<<<blockDim, nullptr, stream>>>(
+                query, keyCache, valueCache, scaleCache, blockTables, contextLens, piSigns, rotTables, modeTables,
+                workspace, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,
+                tasksPerCore, scale, invSqrtLen);
+            break;
+        case turboquant::DecodeAblationStage::STAGE_2_HADAMARD:
+            turboquant_mm_decode_ablation_kv4fp8_s2_half<<<blockDim, nullptr, stream>>>(
+                query, keyCache, valueCache, scaleCache, blockTables, contextLens, piSigns, rotTables, modeTables,
+                workspace, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,
+                tasksPerCore, scale, invSqrtLen);
+            break;
+        case turboquant::DecodeAblationStage::STAGE_3_L1_STAGING:
+            turboquant_mm_decode_ablation_kv4fp8_s3_half<<<blockDim, nullptr, stream>>>(
+                query, keyCache, valueCache, scaleCache, blockTables, contextLens, piSigns, rotTables, modeTables,
+                workspace, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,
+                tasksPerCore, scale, invSqrtLen);
+            break;
+        case turboquant::DecodeAblationStage::STAGE_4_SCORE_GEMM:
+            turboquant_mm_decode_ablation_kv4fp8_s4_half<<<blockDim, nullptr, stream>>>(
+                query, keyCache, valueCache, scaleCache, blockTables, contextLens, piSigns, rotTables, modeTables,
+                workspace, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,
+                tasksPerCore, scale, invSqrtLen);
+            break;
+        default:
+            turboquant_mm_decode_split_kv4fp8_half<<<blockDim, nullptr, stream>>>(
+                query, keyCache, valueCache, scaleCache, blockTables, contextLens, piSigns, rotTables, modeTables,
+                workspace, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,
+                tasksPerCore, scale, invSqrtLen);
+            break;
+    }
+}
+#endif  // VLLM_ASCEND_TQ_DECODE_ABLATION
 
 // The physical fp16 baseline: split then combine, two launches on one stream.
 // Same shapes, paging, tile size and split count as the quantised path, so the
