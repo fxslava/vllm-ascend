@@ -490,8 +490,8 @@ does to pipe overlap.
 
 | Stage | Adds | Grows with |
 | --- | --- | --- |
-| `stage0_mte2` | `CopyInTile`: packed K/V and scale tile, GM -> UB, `MTE2_V` edge | tiles |
-| `stage1_unpack` | `UnpackAffine` per chunk, one V drain per pass (below) | tiles |
+| `stage0_mte2` | `CopyInTile`: packed K/V and scale tile, GM -> UB, then `PipeBarrier<PIPE_ALL>` (below) | tiles |
+| `stage1_unpack` | the `MTE2_V` edge, `UnpackAffine` per chunk, `PipeBarrier<PIPE_ALL>` per pass (below) | tiles |
 | `stage2_hadamard` | query GM read, cast, `ApplyPi`, amax and scale, fp8 cast | **tasks, not S** |
 | `stage3_l1_staging` | V -> MTE3 edge and `DataCopy` per chunk, `MTE3_V` per pass, the query's NZ staging | tiles |
 | `stage4_score_gemm` | `PipelineAic`'s score half -- two `LoadData`, `Mmad`, `Fixpipe` -- and the `SlotReady` / `ScoresReady` / `SlotFree` flags | tiles |
@@ -507,22 +507,88 @@ time.
 1. Stages 0–3 contain no Cube instruction, so the AIC half only walks the task
    list. It is still launched as a MIX block, like `sim_hadamard_aiv`, so the grid
    and `MixBlockIdx()` mean what they mean in production.
-2. Stages 1–2 end each `UnpackToL1` with a `SyncVectorToMte3()` and no copy.
-   Without it nothing orders the next tile's MTE2 read after this tile's unpack,
-   and both touch `kvBuf_`. Stage 3 swaps that single drain for production's one
-   per chunk plus `SyncMte3ToVector()`, so its delta is the copies and the
-   difference in edges.
+2. **No cut leaves a HardEvent wait with nothing on its waiting pipe.** Stage 0
+   ends `CopyInTile` with `PipeBarrier<PIPE_ALL>` instead of `SyncMte2ToVector()`,
+   because it has no vector reader. Stages 1–2 end each `UnpackToL1` with the same
+   barrier instead of `SyncVectorToMte3()`, because they issue no MTE3 copy --
+   but something still has to order the next tile's MTE2 read after this tile's
+   unpack, since both touch `kvBuf_`. Stage 1 swaps stage 0's barrier for the
+   edge its unpack consumes; stage 3 swaps stage 2's for production's
+   `SyncVectorToMte3()` per chunk plus `SyncMte3ToVector()`. So stage 3's delta is
+   the copies and the difference in synchronisation.
+
+   The first version used the bare event edges here. They were not what hung --
+   the camodel ran stages 0–2 in 39, 124 and 158 s with every exception dump
+   empty, and in CANN 9.2.0-beta.2 `SetFlagImpl` / `WaitFlagImpl`
+   (`asc/impl/basic_api/kernel_event.h`) issue each side as its own pipe
+   instruction, while `FetchEventID` only picks the first free id and occupies
+   nothing. They were replaced because "every wait has a consumer" is the rule the
+   shipping kernel keeps, and silicon is not the camodel.
 3. `qScaleInv_` -- a scalar UB read per query head -- and the scale-index
    `ArithProgression` only feed the softmax, so they belong to stage 5.
-4. Every flag set is gated together with the wait that balances it (13.14.2):
-   `SlotReady`, `ScoresReady` and `SlotFree` at stage 4; `ProbsReady` and
-   `ContextReady` at stage 5.
+4. Every flag set is gated together with the wait that balances it (13.14.2),
+   **on both halves**: `SlotReady`, `ScoresReady` and `SlotFree` from stage 4;
+   `ProbsReady` and `ContextReady` only at stage 5. The first version got this
+   wrong on the Cube side, and it deadlocked -- see below.
 
-**Checks.** Stages 0–4 run first, against a workspace uploaded as zeros, and a
-case fails if the workspace is not still zero afterwards -- a leaked writeback.
-After stage 5 the combine runs once, untimed, and the output is held to
+#### The stage 4 deadlock
+
+The first version gated the AIV's `SignalProbsReady()` and its `kFlagContextReady`
+wait to stage 5, and gated the call to `PipelineAic` to stage 4 -- but not
+`PipelineAic`'s body. Under a stage 4 cut the Cube therefore still waited
+`kFlagProbsReady` after the first score GEMM, and would then have set a
+`kFlagContextReady` nobody waits for.
+
+It hung on physical 950PR silicon, and it reproduced on the arch35 camodel
+(`test_sim_950pr_turboquant_ablation`, S = 256, one split of four tiles): stages
+0–3 returned in 39 / 124 / 158 / 161 s with empty exception dumps, and stage 4 was
+still running 39 minutes later with every control unit spinning in the same
+instruction:
+
+| core | CCU log, repeating | flag id |
+| --- | --- | --- |
+| `cubecore0` (AIC) | `WAIT_FLAG_DEV pc=0x10d12d9c` | **6**, `kFlagProbsReady` |
+| `veccore0`, `veccore1` | `WAIT_FLAG_DEV pc=0x10d28d48` | **4**, `kFlagScoresReady` |
+
+The AIC posted tile 0's `ScoresReady` and blocked on id 6; both vector subcores
+consumed it, staged tile 1, and blocked on id 4. Every shape deadlocks this way,
+including one tile per task, which is why silicon hung immediately.
+
+**The fix** gates the `kFlagProbsReady` wait, the context GEMM and the
+`kFlagContextReady` set inside `PipelineAic` to stage 5, the mirror of the AIV's
+gates. The audit of every stage after it:
+
+| stage | AIV sets | AIV waits | AIC sets | AIC waits |
+| --- | --- | --- | --- | --- |
+| 0–3 | none | none | none | none |
+| 4 | `SlotReady` x numTiles | `ScoresReady` x numTiles, `SlotFree` x max(numTiles - 2, 0) | `ScoresReady` x numTiles, `SlotFree` x max(numTiles - 2, 0) | `SlotReady` x numTiles |
+| 5 | as 4, plus `ProbsReady` x numTiles | as 4, plus `ContextReady` x numTiles | as 4, plus `ContextReady` x numTiles | as 4, plus `ProbsReady` x numTiles |
+
+Two things the audit brief asked about do not exist in this kernel:
+`ProductIsMine()`, `SignalOperandsReady()`, `kFlagOperandsReady` and
+`kFlagProductReady` belong to the lock-step `TurboQuantFp16DecodeSplit` and the
+GEMM probe, not to `TurboQuantCubeDecodeSplit`, whose Fixpipe consumer is gated
+with `IsPrimarySubcore()` and whose flags are the pipelined map in
+`turboquant_cube_mm.h`. And stage 4's two back-to-back sets on different pipes
+(`ScoresReady` on FIX, then `SlotFree` on MTE1) are safe: `CrossCoreSetFlag`
+issues an `ffts_cross_core_sync` instruction on its own pipe
+(`dav_3510/kernel_operator_sync_impl.h`, `NotifyEventImpl`) rather than loading a
+single pending register. Production has the same adjacency (`ContextReady` then
+`SlotFree`) whenever a task walks three tiles or more.
+
+**Checks.** Every stage runs against a workspace freshly uploaded as zeros, and
+a stage 0–4 case fails if it is not still zero afterwards -- a leaked writeback.
+Straight after stage 5 the combine runs once, untimed, and the output is held to
 cos >= 0.90 against an fp32 host attention. A shape that misses is printed
-UNTRUSTED and the suite exits 1.
+UNTRUSTED and the suite exits 1. Because each check is local to its stage, any
+order `--stage=` names is valid.
+
+**Hang guard.** The shared harness synchronises without a deadline, so each
+stage's first launch is issued by the suite itself and synchronised with
+`aclrtSynchronizeStreamWithTimeout` before the harness sees the case. A miss
+names the stage, prints the waterfall so far, and exits **3** without the shared
+report or any stream teardown -- a deadlocked stream does not come back, and
+destroying it blocks too. `--stage=4` runs one stage in its own process.
 
 **D = 512 is outside what `CheckHeadSize` lets a model reach**, and was asked for
 anyway. By static count the split's UB comes to 234,624 B of the part's
@@ -537,10 +603,15 @@ with it.
 delta, share of stage 5, P95 -- and a delta-by-context table per head size, where
 stage 2 should read flat.
 
-**Knobs:** the shared `ASCEND_BENCH_*` set, plus `ASCEND_BENCH_TQ_ABLATION_DIMS`
-(powers of two in [64, 512]) and `ASCEND_BENCH_TQ_ABLATION_CONTEXTS` (positive
-multiples of 8, see 13.20). Invalid input falls back to the default sweep, with a
-message.
+**Knobs:** `--stage=<list>` (stages 0..5, in order) and
+`--sync-timeout-ms=<ms>` (default 30000; 0 waits forever) on the command line,
+from `device/bench_main_950pr_ablation.cpp`, which rejects a malformed value
+rather than falling back -- `--stage=4x` silently running all six would relaunch
+the stage it meant to isolate. Each flag sets `ASCEND_BENCH_TQ_ABLATION_STAGES` /
+`ASCEND_BENCH_TQ_ABLATION_SYNC_TIMEOUT_MS`. Plus the shared `ASCEND_BENCH_*` set,
+`ASCEND_BENCH_TQ_ABLATION_DIMS` (powers of two in [64, 512]) and
+`ASCEND_BENCH_TQ_ABLATION_CONTEXTS` (positive multiples of 8, see 13.20). An
+invalid environment value falls back to its default, with a message.
 
 **Build:** the stage 0–4 entry points exist only under
 `VLLM_ASCEND_TQ_DECODE_ABLATION`, which the wheel's library does not define.
@@ -551,16 +622,34 @@ the device precompile, and `ascendc_compile_options(...
 the five kernels and their launchers build and
 `turboquant_mm_decode_ablation_impl` does not, so the benchmark fails to link.
 
-**Status, 2026-09-14: built, never run.** Clean under
-`-DVLLM_ASCEND_TESTS_WERROR=ON` in three configurations on CANN 9.2.0-beta.2 --
-device (`RUN_MODE=npu`, with benchmarks), sim (`RUN_MODE=sim`) and host-only --
-with the five kernels, their launchers and `turboquant_mm_decode_ablation_impl`
-exported. No rung has executed on silicon or the camodel, and the benchmark
-refuses the camodel by construction. The stage 0–4 flag gating has therefore
-never run, and an unbalanced set/wait would first show as a hang on the part. The
-check that would catch it earlier is a sim-tier driver for the five cut kernels at
-a context where one split walks at least three tiles, the smallest shape at which
-`SlotFree` fires.
+**Status, 2026-09-14.** Clean under `-DVLLM_ASCEND_TESTS_WERROR=ON` in three
+configurations on CANN 9.2.0-beta.2 -- device (`RUN_MODE=npu`, with benchmarks),
+sim (`RUN_MODE=sim`) and host-only -- with the five kernels, their launchers and
+`turboquant_mm_decode_ablation_impl` exported. The benchmark has not been re-run
+on silicon since the fix; it refuses the camodel by construction.
+
+What has run is `sim/test_sim_950pr_turboquant_ablation` on the arch35 camodel, at
+B = 1, 8 query over 2 kv heads, head_size 256, block 64, S = 256 -- one split
+walking four tiles, the smallest shape at which every flag id fires, both
+`SlotFree` slots included. Each stage checks that it returns inside a watchdog,
+that the workspace still holds its sentinel (stages 0–4) or was fully written
+(stage 5), and that no exception dump holds a byte; the run script repeats the
+dump census after the process exits.
+
+| run | cache | stages, in one process | seconds per stage | workspace | exception dumps after exit | exit |
+| --- | --- | --- | --- | --- | --- | --- |
+| before the fix | written on device | 0, 1, 2, 3, 4 | 39 / 124 / 158 / 161 / **hung** | untouched through 3 | 0 bytes through 3 | killed in stage 4 |
+| A, after the fix | host-filled | 0, 1, 2, 3, 4 | 43 / 143 / 183 / 160 / **197** | untouched, all five | 32 files, 0 bytes | **0** |
+| B, after the fix | written on device, 1,400 s | 4, 5 | 180 / **230** | untouched at 4; every partial written at 5 | 32 files, 0 bytes | **0** |
+
+Stage 4 now returns in 197 s against 161 s for stage 3. Run B's stage 5 is the
+shipping kernel walking four tiles in one task, which makes it **the first time the
+`kFlagSlotFree` path has executed anywhere** -- 13.11 put it out of reach of every
+default shape. Its output is 2048 of 2048 finite at **cos 0.989226** against the
+fp32 host attention. `ASCEND_TQ_ABLATION_HOST_FILL=1`
+fills the packed cache from the host instead of launching the 1,232 s write:
+nothing on the flag protocol reads the values, so it is the right cache for a
+hang check and the wrong one for a cosine.
 
 ---
 
@@ -757,7 +846,10 @@ Environment: WSL Ubuntu 22.04 with CANN 9.2.0-beta.2 native for the camodel work
 and the official `quay.io/ascend/cann:9.1.0-950-ubuntu22.04-py3.10` container
 (Ubuntu 22.04.5, CANN 9.1.0, g++ 11.4, cmake 3.22.1) for the silicon build.
 The camodel reports `soc='Ascend950PR_9589'` with 64 vector cores and 40 GiB HBM.
-**No physical part has been available.**
+**No physical part has been available in this environment.** One silicon result
+exists and was reported from outside it: the first `bench_device_950pr_turboquant_ablation`
+hung on a physical 950PR, which §7.6 traces to stage 4 and fixes. No silicon run
+is recorded in the table below.
 
 **Build**, clean under `-DVLLM_ASCEND_TESTS_WERROR=ON`, in all four
 configurations: host-only, 310P, 950PR device, 950PR sim.
@@ -771,6 +863,8 @@ configurations: host-only, 310P, 950PR device, 950PR sim.
 | `test_device_950pr_turboquant` | camodel, default gate | 7/7 **skip**, each naming the camodel library found in `/proc/self/maps`. The gate works. |
 | `test_device_950pr_turboquant` | camodel, `ASCEND_TEST_ALLOW_SIMULATOR=1 ASCEND_TQ_BARE_METAL_CONTEXTS=16`, determinism case excluded | **6/6 pass.** Write path: max bin drift **0**, 0 of 8192 channels differ, worst scale relative error `2.478e-07`. Bit-exact case: **8192 packed bytes byte-identical** to the CPU reference, scale exactly 1.0. Decode: `cos 1.000000`, `73.97 dB`, `relL2 2.0e-4`. Layout: 32.0 KiB fp16 vs 8.5 KiB 4-bit, **3.76x**, scale plane 5.9%. Bounds: 996 poisoned rows survived, 28 live rows written, 0 live rows left unwritten. |
 | `bench_device_950pr_turboquant` | camodel, `S=16`, one iteration | Traffic model and summary render; the fp16 leg skipped with the `361001` refusal quoted in full. That run predates the V5 migration and was taken before the device tier began refusing to run under a camodel at all. |
+| `test_sim_950pr_turboquant_ablation` | camodel, B=1, 8/2 heads, head_size 256, block 64, S=256 (one split, 4 tiles), `ASCEND_TQ_ABLATION_HOST_FILL=1`, stages 0–4 in one process | **Pass**, exit 0, 726 s. Every stage returned -- 43 / 143 / 183 / 160 / 197 s -- with the workspace sentinel intact after each, and all 32 exception dumps at 0 bytes after exit. Before the §7.6 fix the same shape hung in stage 4, the AIC spinning on flag 6 and both vector subcores on flag 4. |
+| `test_sim_950pr_turboquant_ablation` | camodel, same shape, cache written on device, stages 4 and 5 in one process | **Pass**, exit 0, 1,843 s. Write 1,400 s. Stage 4 180 s with the workspace sentinel intact; stage 5 230 s with every partial written, output 2048/2048 finite, `cos 0.989226` against the fp32 host attention; all 32 exception dumps at 0 bytes after exit. The first execution anywhere of the shipping kernel's `kFlagSlotFree` path. |
 
 **Not executed:** `RepeatedDecodeLaunchesAreBitIdentical` (nine decode passes is
 hours under the camodel); every case at `S = 512 / 1024 / 2048`; and every

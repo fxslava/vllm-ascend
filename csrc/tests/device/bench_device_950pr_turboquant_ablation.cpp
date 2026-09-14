@@ -43,30 +43,49 @@
 //     of each kv head -- and its delta should not grow with S. The output's
 //     inverse rotation is in the combine, which the ladder does not time. The
 //     delta also carries the query's amax, scale and fp8 cast.
-//   * Stages 1 and 2 drain the vector pipe once per unpack pass. With no L1
-//     copy nothing else orders the next tile's MTE2 read after this tile's
-//     unpack, and both touch kvBuf_. Stage 3 replaces that with production's
-//     drain per chunk plus the MTE3 -> V edge, so its delta is the copies and
-//     the difference in edges.
-//   * Stages 0 to 4 write nothing to GM. They run first, against a zeroed
+//   * Stages 0 to 2 end each tile read or unpack pass with PipeBarrier<PIPE_ALL>
+//     where production has a HardEvent edge, because at those cuts the edge's
+//     wait would have no consumer on its pipe. Stage 1 swaps stage 0's barrier
+//     for the MTE2 -> V edge its unpack consumes; stage 3 swaps stage 2's for
+//     production's V -> MTE3 per chunk plus MTE3 -> V. So stage 3's delta is
+//     the copies and the difference in synchronisation, not the copies alone.
+//   * Stages 0 to 4 write nothing to GM. Each runs against a freshly zeroed
 //     workspace, and a case fails if the workspace is not still zero after it:
 //     a leaked writeback would mean the rung is not the cut it claims to be.
 //   * D = 512 is outside what the production adapter accepts (CheckHeadSize in
 //     turboquant_torch_adpt.h caps head_size at 256) and has never run
 //     anywhere. By static count the split's UB buffers come to 234,624 B of the
-//     part's 253,952. So after each shape's ladder the combine runs once,
-//     untimed, and the output is held to a cosine against an fp32 host
+//     part's 253,952. So straight after each shape's stage 5 the combine runs
+//     once, untimed, and the output is held to a cosine against an fp32 host
 //     attention; below kFidelityCos the shape is marked UNTRUSTED and the suite
 //     fails. The timings of a kernel that is aliasing UB are not timings of
 //     this kernel.
 //
-// Knobs, on top of the shared ASCEND_BENCH_* set in common/benchmark.hpp:
+// HANG GUARD. The shared harness synchronises without a deadline, so a cut
+// kernel that deadlocks the part would hang the process with nothing printed.
+// Each stage's first launch is therefore issued here and synchronised with
+// aclrtSynchronizeStreamWithTimeout before the harness sees the case. A stage
+// that misses the deadline is named, the waterfall so far is printed, and the
+// process ends with kHangExitCode without the shared report or any teardown:
+// a deadlocked stream does not come back, and destroying it blocks as well.
 //
-//   ASCEND_BENCH_TQ_ABLATION_DIMS=256         head sizes; powers of two in [64, 512]
-//   ASCEND_BENCH_TQ_ABLATION_CONTEXTS=64,512  contexts; positive multiples of 8,
-//                                             see TURBOQUANT_TESTS.md 13.20
+// Command line, from bench_main_950pr_ablation.cpp:
 //
-// A value that fails validation falls back to the default sweep, loudly.
+//   --stage=4                 run only these stages, in this order; one stage
+//                             per process is the isolation for a suspect stage
+//   --sync-timeout-ms=30000   deadline for each stage's first launch; 0 waits
+//                             forever
+//
+// Environment, on top of the shared ASCEND_BENCH_* set in common/benchmark.hpp.
+// A command-line flag sets the matching variable, so the two cannot disagree:
+//
+//   ASCEND_BENCH_TQ_ABLATION_DIMS=256            head sizes; powers of two in [64, 512]
+//   ASCEND_BENCH_TQ_ABLATION_CONTEXTS=64,512     contexts; positive multiples of 8,
+//                                                see TURBOQUANT_TESTS.md 13.20
+//   ASCEND_BENCH_TQ_ABLATION_STAGES=0,1,2        stages (default 0..5)
+//   ASCEND_BENCH_TQ_ABLATION_SYNC_TIMEOUT_MS=0   first-launch deadline (default 30000)
+//
+// A variable that fails validation falls back to its default, loudly.
 
 #include <algorithm>
 #include <cmath>
@@ -126,6 +145,15 @@ constexpr int64_t kContextMultiple = 8;
 // that aliases UB or mis-stages an operand lands far below it.
 constexpr double kFidelityCos = 0.90;
 
+// A decode split is milliseconds on the part at every shape here, so thirty
+// seconds is a deadlock and not a slow launch.
+constexpr int64_t kDefaultSyncTimeoutMs = 30000;
+// What aclrtSynchronizeStreamWithTimeout takes for "no deadline".
+constexpr int32_t kWaitForever = -1;
+// Distinct from the harness's 0, 1 and 77, so a caller can tell a deadlock from
+// a failed case.
+constexpr int kHangExitCode = 3;
+
 constexpr int64_t kFloatBytes = 4;
 constexpr double kPercent = 100.0;
 
@@ -133,10 +161,10 @@ uint32_t U32(int64_t value) { return static_cast<uint32_t>(value); }
 
 // --- the sweep ----------------------------------------------------------------
 
-// A comma-separated list of positive decimal integers, or false with `values`
-// untouched. A bare strtoll turns a typo into a 0 that some later division
-// trips over; this refuses it instead.
-bool ParsePositiveList(const char* raw, std::vector<int64_t>* values) {
+// A comma-separated list of decimal integers no smaller than `min_value`, or
+// false with `values` untouched. A bare strtoll turns a typo into a 0 that some
+// later division trips over; this refuses it instead.
+bool ParseDecimalList(const char* raw, int64_t min_value, std::vector<int64_t>* values) {
   constexpr size_t kMaxDigits = 9;
   std::vector<int64_t> parsed;
   std::istringstream stream(raw);
@@ -146,7 +174,7 @@ bool ParsePositiveList(const char* raw, std::vector<int64_t>* values) {
       return false;
     }
     const int64_t value = std::strtoll(token.c_str(), nullptr, 10);
-    if (value <= 0) {
+    if (value < min_value) {
       return false;
     }
     parsed.push_back(value);
@@ -167,7 +195,7 @@ std::vector<int64_t> HeadSizes() {
     return defaults;
   }
   std::vector<int64_t> parsed;
-  bool valid = ParsePositiveList(raw, &parsed);
+  bool valid = ParseDecimalList(raw, 1, &parsed);
   for (const int64_t head_size : parsed) {
     valid = valid && IsPowerOfTwo(head_size) && head_size >= kMinHeadSize && head_size <= kMaxHeadSize;
   }
@@ -187,7 +215,7 @@ std::vector<int64_t> ContextLens() {
     return defaults;
   }
   std::vector<int64_t> parsed;
-  bool valid = ParsePositiveList(raw, &parsed);
+  bool valid = ParseDecimalList(raw, 1, &parsed);
   for (const int64_t context_len : parsed) {
     valid = valid && context_len % kContextMultiple == 0;
   }
@@ -201,6 +229,48 @@ std::vector<int64_t> ContextLens() {
 }
 
 tqm::DecodeAblationStage StageAt(int32_t index) { return static_cast<tqm::DecodeAblationStage>(index); }
+
+std::vector<tqm::DecodeAblationStage> Stages() {
+  std::vector<tqm::DecodeAblationStage> stages;
+  const char* raw = std::getenv("ASCEND_BENCH_TQ_ABLATION_STAGES");
+  if (raw != nullptr && *raw != '\0') {
+    std::vector<int64_t> parsed;
+    bool valid = ParseDecimalList(raw, 0, &parsed);
+    for (const int64_t index : parsed) {
+      valid = valid && tqm::DecodeAblationStageIsValid(static_cast<int32_t>(index));
+    }
+    if (valid) {
+      for (const int64_t index : parsed) {
+        stages.push_back(StageAt(static_cast<int32_t>(index)));
+      }
+      return stages;
+    }
+    std::printf("[ascend-bench] ASCEND_BENCH_TQ_ABLATION_STAGES='%s' is not a list of stages 0..%d; running all\n",
+                raw, tqm::kDecodeAblationStageCount - 1);
+  }
+  for (int32_t index = 0; index < tqm::kDecodeAblationStageCount; ++index) {
+    stages.push_back(StageAt(index));
+  }
+  return stages;
+}
+
+// The first-launch deadline in milliseconds, as aclrtSynchronizeStreamWithTimeout
+// takes it: kWaitForever for 0.
+int32_t SyncTimeoutMs() {
+  const char* raw = std::getenv("ASCEND_BENCH_TQ_ABLATION_SYNC_TIMEOUT_MS");
+  int64_t timeout_ms = kDefaultSyncTimeoutMs;
+  if (raw != nullptr && *raw != '\0') {
+    std::vector<int64_t> parsed;
+    if (ParseDecimalList(raw, 0, &parsed) && parsed.size() == 1) {
+      timeout_ms = parsed[0];
+    } else {
+      std::printf("[ascend-bench] ASCEND_BENCH_TQ_ABLATION_SYNC_TIMEOUT_MS='%s' is not one non-negative integer; "
+                  "using %lld\n",
+                  raw, static_cast<long long>(kDefaultSyncTimeoutMs));
+    }
+  }
+  return timeout_ms == 0 ? kWaitForever : static_cast<int32_t>(timeout_ms);
+}
 
 std::string ShapeName(int64_t head_size, int64_t context_len) {
   std::ostringstream name;
@@ -273,8 +343,8 @@ std::vector<float> HostAttention(int64_t head_size, int64_t context_len, double 
 
 // --- one shape ------------------------------------------------------------------
 
-// Everything one (D, S) shape needs, allocated once and alive for its six cases
-// and its fidelity check. The same data layout, table images and grids as
+// Everything one (D, S) shape needs, allocated once and alive for its cases and
+// its fidelity check. The same data layout, table images and grids as
 // ModeScenario in bench_device_950pr_turboquant.cpp, with the head size free.
 class AblationScenario {
  public:
@@ -329,9 +399,7 @@ class AblationScenario {
 
     write_grid_ = tqh::PlanReshapeAndCache(context_len, aiv_num);
     decode_grid_ = tqh::PlanCubeDecode(kQueryTokens, kNumHeads, kNumKvHeads, head_size, blocks_per_seq_, aiv_num);
-    // Uploaded as zeros rather than left to the allocator, because the cuts
-    // below stage 5 are checked against exactly this.
-    workspace_ = DeviceBuffer::FromHost(std::vector<float>(decode_grid_.workspace_floats, 0.0f), kBenchmarkAlignBytes);
+    ResetWorkspace();
   }
 
   // Writes the whole context once, outside any timed region.
@@ -342,6 +410,12 @@ class AblationScenario {
         write_tables_.get(), U32(context_len_), U32(kNumKvHeads), U32(head_size_), U32(kBlockSize),
         write_grid_.tokens_per_core, attention_scale_);
     ACL_CHECK(aclrtSynchronizeStream(stream));
+  }
+
+  // Zeros uploaded rather than left to the allocator, before every stage, so a
+  // cut stage's untouched check does not depend on which stages ran before it.
+  void ResetWorkspace() {
+    workspace_ = DeviceBuffer::FromHost(std::vector<float>(decode_grid_.workspace_floats, 0.0f), kBenchmarkAlignBytes);
   }
 
   void EnqueueSplit(tqm::DecodeAblationStage stage, aclrtStream stream) const {
@@ -415,60 +489,16 @@ struct ShapeVerdict {
   std::string distrust;
 };
 
-void RunShape(BenchmarkRunner& runner, int64_t aiv_num, ShapeVerdict* verdict) {
-  const std::string shape = ShapeName(verdict->head_size, verdict->context_len);
+enum class ShapeOutcome {
+  kCompleted,
+  // A stage missed its first-launch deadline. Nothing more may be launched on
+  // the stream, and nothing may tear it down.
+  kStreamWedged,
+};
 
-  std::unique_ptr<AblationScenario> scenario;
-  try {
-    scenario.reset(new AblationScenario(verdict->head_size, verdict->context_len, aiv_num));
-    scenario->FillCache(runner.stream());
-  } catch (const std::exception& error) {
-    for (int32_t index = 0; index < tqm::kDecodeAblationStageCount; ++index) {
-      runner.RecordFailure(CaseName(shape, StageAt(index)), std::string("setup failed: ") + error.what());
-    }
-    verdict->distrust = "setup failed";
-    return;
-  }
-
-  const tqh::CubeDecodeGrid& grid = scenario->decode_grid();
-  std::printf("\n[ascend-bench] %s: blocks_per_seq=%lld splits=%lld grid(split)=%u tasks/core=%u "
-              "tile read=%.0f B/launch\n",
-              shape.c_str(), static_cast<long long>(scenario->blocks_per_seq()),
-              static_cast<long long>(grid.num_splits), grid.split_block_dim, grid.split_tasks_per_core,
-              scenario->TileReadBytes());
-  std::fflush(stdout);
-
-  const AblationScenario& ready = *scenario;
-  for (int32_t index = 0; index < tqm::kDecodeAblationStageCount; ++index) {
-    const tqm::DecodeAblationStage stage = StageAt(index);
-    const bool writes_workspace = stage == tqm::DecodeAblationStage::STAGE_5_FULL_PIPELINE;
-    const std::string name = CaseName(shape, stage);
-    try {
-      BenchmarkCase ablation_case;
-      ablation_case.name = name;
-      ablation_case.bytes_per_iteration = ready.TileReadBytes();
-      ablation_case.tasks_per_launch = 1;  // the split alone
-      ablation_case.launch = [&ready, stage](aclrtStream stream) { ready.EnqueueSplit(stage, stream); };
-      if (writes_workspace) {
-        // Same partials every launch, so bit-identical.
-        ablation_case.checksum = [&ready]() { return ChecksumSum(ready.Workspace()); };
-      } else {
-        ablation_case.checksum = [&ready]() { return ChecksumSumOfSquares(ready.Workspace()); };
-      }
-      runner.Run(ablation_case);
-
-      // The checksum above only proves the workspace did not change between
-      // two reads; a cut that wrote the same partials every launch passes it.
-      // Zero is the stronger statement, and only a cut below stage 5 owes it.
-      if (!writes_workspace && ChecksumSumOfSquares(ready.Workspace()) != 0.0) {
-        runner.RecordFailure(name, "wrote the workspace: a cut below stage 5 must not reach the partial writeback");
-        verdict->distrust = "an ablation gate leaked the writeback";
-      }
-    } catch (const std::exception& error) {
-      runner.RecordFailure(name, error.what());
-    }
-  }
-
+// Straight after stage 5: the combine, and the cosine against the host.
+void CheckFidelity(BenchmarkRunner& runner, const AblationScenario& ready, const std::string& shape,
+                   ShapeVerdict* verdict) {
   const std::string fidelity_name = shape + "_fidelity";
   try {
     const std::vector<float> output = ready.CombineAndReadBack(runner.stream());
@@ -486,6 +516,84 @@ void RunShape(BenchmarkRunner& runner, int64_t aiv_num, ShapeVerdict* verdict) {
     runner.RecordFailure(fidelity_name, error.what());
     verdict->distrust = std::string("fidelity check failed: ") + error.what();
   }
+}
+
+ShapeOutcome RunShape(BenchmarkRunner& runner, int64_t aiv_num, const std::vector<tqm::DecodeAblationStage>& stages,
+                      int32_t sync_timeout_ms, ShapeVerdict* verdict) {
+  const std::string shape = ShapeName(verdict->head_size, verdict->context_len);
+
+  std::unique_ptr<AblationScenario> scenario;
+  try {
+    scenario.reset(new AblationScenario(verdict->head_size, verdict->context_len, aiv_num));
+    scenario->FillCache(runner.stream());
+  } catch (const std::exception& error) {
+    for (const tqm::DecodeAblationStage stage : stages) {
+      runner.RecordFailure(CaseName(shape, stage), std::string("setup failed: ") + error.what());
+    }
+    verdict->distrust = "setup failed";
+    return ShapeOutcome::kCompleted;
+  }
+
+  const tqh::CubeDecodeGrid& grid = scenario->decode_grid();
+  std::printf("\n[ascend-bench] %s: blocks_per_seq=%lld splits=%lld grid(split)=%u tasks/core=%u "
+              "tile read=%.0f B/launch\n",
+              shape.c_str(), static_cast<long long>(scenario->blocks_per_seq()),
+              static_cast<long long>(grid.num_splits), grid.split_block_dim, grid.split_tasks_per_core,
+              scenario->TileReadBytes());
+  std::fflush(stdout);
+
+  AblationScenario& mutable_scenario = *scenario;
+  const AblationScenario& ready = mutable_scenario;
+  for (const tqm::DecodeAblationStage stage : stages) {
+    const bool writes_workspace = stage == tqm::DecodeAblationStage::STAGE_5_FULL_PIPELINE;
+    const std::string name = CaseName(shape, stage);
+    mutable_scenario.ResetWorkspace();
+
+    // The hang guard; see the file header. One launch, synchronised against a
+    // deadline, before the harness -- whose synchronisations have none -- is
+    // handed the case.
+    std::printf("[ascend-bench] %s: first launch, deadline %d ms\n", name.c_str(), sync_timeout_ms);
+    std::fflush(stdout);
+    ready.EnqueueSplit(stage, runner.stream());
+    const aclError synced = aclrtSynchronizeStreamWithTimeout(runner.stream(), sync_timeout_ms);
+    if (synced != ACL_SUCCESS) {
+      std::ostringstream reason;
+      reason << "the first launch did not synchronise within " << sync_timeout_ms << " ms (aclError " << synced
+             << "); treating the stage as deadlocked";
+      std::printf("\n[ascend-bench] HANG: %s: %s\n", name.c_str(), reason.str().c_str());
+      runner.RecordFailure(name, reason.str());
+      verdict->distrust = name + " deadlocked";
+      return ShapeOutcome::kStreamWedged;
+    }
+
+    try {
+      BenchmarkCase ablation_case;
+      ablation_case.name = name;
+      ablation_case.bytes_per_iteration = ready.TileReadBytes();
+      ablation_case.tasks_per_launch = 1;  // the split alone
+      ablation_case.launch = [&ready, stage](aclrtStream stream) { ready.EnqueueSplit(stage, stream); };
+      if (writes_workspace) {
+        // Same partials every launch, so bit-identical.
+        ablation_case.checksum = [&ready]() { return ChecksumSum(ready.Workspace()); };
+      } else {
+        ablation_case.checksum = [&ready]() { return ChecksumSumOfSquares(ready.Workspace()); };
+      }
+      runner.Run(ablation_case);
+
+      if (writes_workspace) {
+        CheckFidelity(runner, ready, shape, verdict);
+      } else if (ChecksumSumOfSquares(ready.Workspace()) != 0.0) {
+        // The checksum above only proves the workspace did not change between
+        // two reads; a cut that wrote the same partials every launch passes it.
+        // Zero is the stronger statement, and only a cut below stage 5 owes it.
+        runner.RecordFailure(name, "wrote the workspace: a cut below stage 5 must not reach the partial writeback");
+        verdict->distrust = "an ablation gate leaked the writeback";
+      }
+    } catch (const std::exception& error) {
+      runner.RecordFailure(name, error.what());
+    }
+  }
+  return ShapeOutcome::kCompleted;
 }
 
 // --- the waterfall --------------------------------------------------------------
@@ -644,7 +752,8 @@ void PrintWaterfall(const BenchmarkRunner& runner, const std::vector<int64_t>& h
   std::fflush(stdout);
 }
 
-void PrintBanner(const std::vector<int64_t>& head_sizes, const std::vector<int64_t>& context_lens, int64_t aiv_num,
+void PrintBanner(const std::vector<int64_t>& head_sizes, const std::vector<int64_t>& context_lens,
+                 const std::vector<tqm::DecodeAblationStage>& stages, int32_t sync_timeout_ms, int64_t aiv_num,
                  bool aiv_queried) {
   std::printf("[ascend-bench] kv4fp8 decode ablation: vector cores = %lld%s\n", static_cast<long long>(aiv_num),
               aiv_queried ? " (from aclGetDeviceCapability)" : " (assumed; the runtime declined to answer)");
@@ -661,6 +770,15 @@ void PrintBanner(const std::vector<int64_t>& head_sizes, const std::vector<int64
               tqm::DecodeAblationStageName(tqm::DecodeAblationStage::STAGE_4_SCORE_GEMM));
   std::printf("[ascend-bench]   %-18s + online softmax, P.V GEMM, accumulator, GM writeback (the shipping kernel)\n",
               tqm::DecodeAblationStageName(tqm::DecodeAblationStage::STAGE_5_FULL_PIPELINE));
+  std::printf("[ascend-bench] running:");
+  for (const tqm::DecodeAblationStage stage : stages) {
+    std::printf(" %s", tqm::DecodeAblationStageName(stage));
+  }
+  if (sync_timeout_ms == kWaitForever) {
+    std::printf("   first-launch deadline: none\n");
+  } else {
+    std::printf("   first-launch deadline: %d ms\n", sync_timeout_ms);
+  }
   std::printf("[ascend-bench] head sizes:");
   for (const int64_t head_size : head_sizes) {
     std::printf(" %lld%s", static_cast<long long>(head_size), head_size > kAdapterMaxHeadSize ? "*" : "");
@@ -686,10 +804,12 @@ void PrintBanner(const std::vector<int64_t>& head_sizes, const std::vector<int64
 void BuildSuite(BenchmarkRunner& runner) {
   const std::vector<int64_t> head_sizes = HeadSizes();
   const std::vector<int64_t> context_lens = ContextLens();
+  const std::vector<tqm::DecodeAblationStage> stages = Stages();
+  const int32_t sync_timeout_ms = SyncTimeoutMs();
 
   bool aiv_queried = false;
   const int64_t aiv_num = tqh::VectorCoreNum(&aiv_queried);
-  PrintBanner(head_sizes, context_lens, aiv_num, aiv_queried);
+  PrintBanner(head_sizes, context_lens, stages, sync_timeout_ms, aiv_num, aiv_queried);
 
   // Head size is the outer loop so every shape the production adapter accepts
   // is measured before one it does not: a D = 512 launch that faults the part
@@ -700,8 +820,16 @@ void BuildSuite(BenchmarkRunner& runner) {
       ShapeVerdict verdict;
       verdict.head_size = head_size;
       verdict.context_len = context_len;
-      RunShape(runner, aiv_num, &verdict);
+      const ShapeOutcome outcome = RunShape(runner, aiv_num, stages, sync_timeout_ms, &verdict);
       verdicts.push_back(verdict);
+      if (outcome == ShapeOutcome::kStreamWedged) {
+        PrintWaterfall(runner, head_sizes, verdicts);
+        std::printf("[ascend-bench] the stream is wedged: exiting %d without the shared report or teardown, "
+                    "both of which would block on it. Rerun the other stages with --stage=.\n",
+                    kHangExitCode);
+        std::fflush(stdout);
+        std::_Exit(kHangExitCode);
+      }
     }
   }
   PrintWaterfall(runner, head_sizes, verdicts);

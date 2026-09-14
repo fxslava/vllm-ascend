@@ -906,8 +906,9 @@ private:
         consumeCursor.block = blockStart;
 
         // Below stage 4 every flag is compiled out with the Cube's half, and
-        // this is a plain staging walk over the same enumeration.  Each gate
-        // removes a set together with the wait that balances it.
+        // this is a plain staging walk over the same enumeration.  Every gate
+        // here has its mirror in PipelineAic, and the two have to move
+        // together: gating only this side is what deadlocked stage 4 (7.6).
 
         // Prologue.  Tile 0 has no predecessor to overlap its staging against.
         NextTile(stageCursor, token, contextLen, blockEnd);
@@ -986,12 +987,19 @@ private:
             mm_.GemmScores(scores, mm_.B1K(l1SlotIdx), kMaxGroupHeads, headSize_, kCubeTileRows);
             AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(vllm_ascend::turboquant::kFlagScoresReady);
 
-            // The context GEMM's A operand, which the AIV has only just
-            // produced. Lock-step got this ordering free from the V staging
-            // sitting between the two GEMMs; the pipelined form does not.
-            AscendC::CrossCoreWaitFlag(vllm_ascend::turboquant::kFlagProbsReady);
-            mm_.GemmContext(ctx, mm_.B1V(l1SlotIdx), kMaxGroupHeads, kCubeTileRows, headSize_);
-            AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(vllm_ascend::turboquant::kFlagContextReady);
+            // Stage 5's, like the softmax on the other side of both flags: the
+            // AIV posts kFlagProbsReady and waits kFlagContextReady only there.
+            // Leaving this ungated under a stage 4 cut deadlocked the first tile
+            // -- the Cube on id 6, both vector subcores on id 4 -- and would have
+            // leaked a ContextReady set had it not.  TURBOQUANT_TESTS.md 7.6.
+            if constexpr (Keeps(DecodeAblationStage::STAGE_5_FULL_PIPELINE)) {
+                // The context GEMM's A operand, which the AIV has only just
+                // produced. Lock-step got this ordering free from the V staging
+                // sitting between the two GEMMs; the pipelined form does not.
+                AscendC::CrossCoreWaitFlag(vllm_ascend::turboquant::kFlagProbsReady);
+                mm_.GemmContext(ctx, mm_.B1V(l1SlotIdx), kMaxGroupHeads, kCubeTileRows, headSize_);
+                AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(vllm_ascend::turboquant::kFlagContextReady);
+            }
 
             // Conditioned so that every set has exactly one wait: on the last
             // kSlots tiles no restage of this slot follows.
@@ -1034,7 +1042,14 @@ private:
             AscendC::DataCopy(kv[kCubeTileRows * packedBytes_], valueCacheGm_[cacheOff], tileParams_);
         }
         AscendC::DataCopy(scales, scaleCacheGm_[scaleOff], kCubeTileRows * scaleSlot_);
-        SyncMte2ToVector();
+        if constexpr (Keeps(DecodeAblationStage::STAGE_1_UNPACK)) {
+            SyncMte2ToVector();
+        } else {
+            // Cut 0 has no vector reader to consume an MTE2 -> V wait, so it
+            // orders the next tile's read with a barrier rather than leave an
+            // event with nothing on its waiting pipe.
+            AscendC::PipeBarrier<PIPE_ALL>();
+        }
     }
 
     /*
@@ -1095,10 +1110,11 @@ private:
             // vector expand would otherwise race this one's DMA out of it.
             SyncMte3ToVector();
         } else {
-            // Cuts 1 and 2 stage nothing, so no copy drains the vector pipe, and
-            // the next tile's MTE2 read would land in the kvBuf_ this pass is
-            // still reading.  One drain per pass; stage 3 and up pay one per chunk.
-            SyncVectorToMte3();
+            // Cuts 1 and 2 stage nothing, and the next tile's MTE2 read would
+            // otherwise land in the kvBuf_ this pass is still reading.  A
+            // barrier, not SyncVectorToMte3(): with no copy after it, that
+            // edge's wait would sit on an MTE3 pipe with nothing to issue.
+            AscendC::PipeBarrier<PIPE_ALL>();
         }
     }
 
