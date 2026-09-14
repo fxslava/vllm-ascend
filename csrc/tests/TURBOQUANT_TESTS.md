@@ -492,15 +492,21 @@ does to pipe overlap.
 | --- | --- | --- |
 | `stage0_mte2` | `CopyInTile`: packed K/V and scale tile, GM -> UB, then `PipeBarrier<PIPE_ALL>` (below) | tiles |
 | `stage1_unpack` | the `MTE2_V` edge, `UnpackAffine` per chunk, `PipeBarrier<PIPE_ALL>` per pass (below) | tiles |
-| `stage2_hadamard` | query GM read, cast, `ApplyPi`, amax and scale, fp8 cast | **tasks, not S** |
+| `stage2_query_prep` | pre-rotated query GM read, amax and scale, fp8 cast | **tasks, not S** |
 | `stage3_l1_staging` | V -> MTE3 edge and `DataCopy` per chunk, `MTE3_V` per pass, the query's NZ staging | tiles |
 | `stage4_score_gemm` | `PipelineAic`'s score half -- two `LoadData`, `Mmad`, `Fixpipe` -- and the `SlotReady` / `ScoresReady` / `SlotFree` flags | tiles |
 | `stage5_full` | acc/state init, `qScaleInv_`, softmax, `ProbsReady`, context GEMM, `ContextReady`, accumulate, partial writeback | tiles |
 
-**Stage 2 is not a tile-loop FWHT.** The cache is written already rotated, so
-the split's only Walsh-Hadamard is the query's, once per query head of each kv
-head. The output's inverse rotation is in the combine, which the ladder does not
-time.
+**Stage 2 no longer contains a Walsh-Hadamard transform at all.** It used to:
+the cache is written already rotated, so the split's only transform was the
+query's, run once per query head of each kv head *and once per sequence split*.
+That rotation moved out to `npu_turboquant_rotate_q` -- see 13.22 -- and what is
+left in this rung is the query's GM read, its amax and the operand cast. The
+rung keeps its number, which crosses the launch boundary, and the benchmark
+enqueues the rotation once before any stage so no rung's delta carries it.
+
+The output's inverse rotation is in the combine, which the ladder does not time,
+and is unchanged.
 
 **Four places the cut kernel differs from the shipping one**, each on purpose:
 
@@ -2521,3 +2527,133 @@ vector store per task -- and are the part of this section most likely to show up
 in a tick count.
 
 Measure it. Do not reason forward from this section.
+
+### 13.22 The query rotation moved out of both decode splits
+
+`npu_turboquant_rotate_q` applies `Pi q = D (H (D q))` to a whole decode step's
+query in its own launch, and both decode splits -- the AIV
+`TurboQuantPagedAttentionSplit` the wheel ships and the Cube
+`TurboQuantCubeDecodeSplit` -- now read the result. Neither contains a
+Walsh-Hadamard transform of any kind. The cache is still written rotated by
+`reshape_and_cache`, and the output is still un-rotated by the combine; only the
+query's rotation moved.
+
+#### What it removes from the decode
+
+`PrepareTask` used to run, per query head of the GQA group: a sign multiply,
+three `Gather` shuffle stages, `log2(head_size / 8)` block-strided butterflies, a
+normalisation, a second sign multiply, and the roughly eleven
+`PipeBarrier<PIPE_V>` a 256-wide `ApplyPi` emits. It ran **once per task**, and a
+task is `(token, kv_head, split)` -- so the same transform ran `num_splits` times
+over. At the benchmark shape that is 1x at S=64 and **8x at S >= 1024**.
+
+The redundancy is self-limiting and should not be oversold: `num_splits =
+CeilDiv(aivNum, base_tasks)` exceeds 1 only when cores are idle, so the repeated
+work ran on cores with nothing else to do. What the move buys at B=1 is latency
+off every split block's critical path, not throughput.
+
+#### Dispatch
+
+`turboquant::PlanRotateQ` picks the path on the host, and the kernel is told
+which rather than re-deriving it, so the plan that is validated is the plan that
+runs.
+
+| gate | path | why |
+|---|---|---|
+| `N >= 16` and `N % 16 == 0` | Cube | Sylvester factorises `H_D = H_R (x) H_16`, so strides 1, 2, 4 and 8 are one Mmad against a static 16x16 constant at any `D`, and only the `log2(R)` whole-row stages stay on the vector unit |
+| otherwise | AIV | all `log2(D)` stages through `TurboQuantCodec4::ApplyPi` -- the same routine the decode used to call per head |
+
+`N = num_tokens * num_heads`. The gate is exact divisibility rather than a
+threshold because a block share that is not a whole number of tiles would need a
+short final Mmad, and a short Mmad is the one piece of the spike that was never
+run. The planner then guarantees two invariants the Cube kernel relies on and
+does not check: `vectors_per_block` divides `N`, and `vectors_per_chunk` divides
+`vectors_per_block`. The torch operator asserts both.
+
+**Where the Cube path pays, and where it does not.** The device sweep in
+`hadamard_benchmark_results.csv` puts the crossover at 16 vectors per block: at
+`D = 256` the marginal cost per vector is 0.611 us on the vector unit and 0.074
+us on the Cube with `dualDstCtl`, but the Cube's fixed staging only amortises
+from 16 up. A standalone kernel also has a lever the in-decode rotation never
+had -- it can put one vector on each of many blocks -- so for *latency* at small
+`N` the vector path spread wide still wins. 13.18 and 13.19 reached that verdict
+for the in-decode case; it holds here for the same arithmetic. The Cube path is
+in the tree because MLA at `H_KV = 1` and continuous batching at `B = 4..16` put
+`N` well past the gate, which is a throughput regime, not a `B = 1` one.
+
+#### Precision, and why a half query needs one Mmad and not two
+
+`H_16` holds only `+-1`, both exact in fp16, and the sign multiply is by `+-1`.
+So a **half** query is exactly representable in the Cube's operand grid after
+`D x`, and a single Mmad with its fp32 accumulator introduces no error at all.
+A bfloat16 query is not -- its 8-bit exponent reaches values half cannot hold --
+so `PlanRotateQ` sets `kHiLo` for it and the kernel issues two Mmads
+accumulating into one L0C. The host decides; the kernel does not infer it from
+`scalar_t`.
+
+#### What was measured
+
+`test_sim_950pr_turboquant_rotate_q` on the arch35 camodel, `D = 256`,
+`H = 8`, 425 s, exit 0, 32/32 `excp_log` dumps at 0 bytes:
+
+| case | path | shape | result |
+|---|---|---|---|
+| `RotateQPlan.Dispatch` | host only | ten `(N, D, cores)` points | every path, chunk and divisibility invariant as specified |
+| `RotateQVector.SparseBatchIsBitIdentical...` | AIV | `N = 8` | **0 of 2048 elements differ** from `cpu_apply_pi` |
+| `DenseBatches/RotateQCube.MatchesTheReference/0` | Cube | `N = 16`, 1 block x 16, chunk 16 | **0 of 4096 differ**, `max abs err 0.000e+00` |
+| `DenseBatches/RotateQCube.MatchesTheReference/1` | Cube | `N = 64`, 4 blocks x 16, chunk 16 | **0 of 16384 differ** |
+| `RotateQCube.AgreesWithTheVectorPath...` | both | `N = 64` | **0 of 16384 differ** between the two paths |
+
+The vector path being bit-identical was expected: it is the reference's own
+algorithm, on the same fp32 data, in the same order.
+
+**The Cube path being bit-identical was not.** It evaluates four butterfly
+stages as a 16x16 matrix product where the reference evaluates them as four
+passes of pairwise adds, which reassociates sixteen fp32 sums -- the test's
+`kCubeAbsTolerance` of 1e-5 exists for exactly that and was not needed. Treat
+this as a *measurement at these shapes*, not a guarantee: a different head size,
+a bfloat16 query on the `kHiLo` path, or data at a different scale can
+reassociate differently, and the tolerance stays for that reason.
+
+`test_sim_950pr_turboquant_multimode`, kv4fp8, end to end through the decoupled
+decode -- write the cache, rotate, split, combine, compare against fp32 host
+attention:
+
+| shape | `N` | rotation path | result |
+|---|---|---|---|
+| `B=1 S=16`, 4 heads / 2 kv heads | 4 | AIV | **cos 0.991817**, 580 s, 32/32 dumps empty |
+
+#### UB freed in the decode
+
+Static arithmetic over the allocation lists, `head_size` 256:
+
+| kernel | removed | grown | net |
+|---|---|---|---|
+| `TurboQuantCubeDecodeSplit` | `rotation_` (const 9,280 + work 11,552), `signBuf_` 1,024 | `qInBuf_` fp16 -> fp32, +2,048 at `groupHeads_` 4 | **-19,808 B** |
+| `TurboQuantPagedAttentionSplit` | `signBuf_` 1,024, two thirds of `accBuf_` | `qInQueue_` fp16 -> fp32 | **-1,536 B** |
+
+The Cube split's figure is 51,552 - 4,096 = **-47,456 B at `head_size` 512**,
+which takes 7.6's static count from 234,624 B of the part's 253,952 to about
+187,000 and its headroom from 19 KB to about 67 KB. That is the difference
+between "fits on paper" and fits, and it is the argument for revisiting
+`CheckHeadSize`'s 256 cap for MLA -- *after* the `D = 512` fidelity gate has
+actually been run, which 7.6 is explicit it has not.
+
+#### Two things this change did NOT do, deliberately
+
+**It did not keep the allocation lists byte-identical.** 13.17 measured an 8 KB
+buffer inserted at the front of the Cube split's allocation order costing 7,875
+ticks -- 12% -- and 13.21 showed the mechanism is still unidentified. The one
+allocation this refactor grows in that kernel, `qInBuf_`, is the **last** in the
+order, so nothing moves behind it; but removing `signBuf_` shifts the two after
+it, and the AIV split's list moves more than that. Neither kernel's UB placement
+has been A/B'd since. **Do that before believing any tick number from either.**
+
+**It did not price the extra launch.** `tq_rotate_s<S>` in
+`bench_device_950pr_turboquant` is the instrument: one launch, the rotation
+alone, flat in S by construction. Subtracting it from `tq4_decode_s<S>` --
+which now enqueues rotate, split and combine -- is what prices the operator
+invocation the contract costs. It has not been run: this host has no NPU, and
+the ~8.6 us floor in `hadamard_benchmark_results.csv` is a `replan-per-launch`
+harness artefact, not the graph-replay figure a decode step pays. Until that
+number exists, the latency case for the split rests on an estimate.

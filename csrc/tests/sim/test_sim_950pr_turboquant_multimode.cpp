@@ -313,6 +313,8 @@ struct ModeRun {
   std::vector<float> scale_plane;
   int64_t num_splits = 0;
   int64_t packed_bytes = 0;
+  // Which query-rotation path this shape selected, and how it was tiled.
+  vllm_ascend::turboquant::RotateQPlan rotate_plan;
 };
 
 ModeRun RunMode(tqm::TurboQuantMode mode, const Shape& shape, aclrtStream stream) {
@@ -344,6 +346,8 @@ ModeRun RunMode(tqm::TurboQuantMode mode, const Shape& shape, aclrtStream stream
   DeviceBuffer scale_plane =
       DeviceBuffer::Empty<float>(tqh::ScalePlaneFloats(shape.num_blocks, kBlockSize, kNumKvHeads));
   DeviceBuffer out = DeviceBuffer::Empty<Half>(static_cast<size_t>(batch * kNumHeads * kHeadSize));
+  DeviceBuffer h16 = DeviceBuffer::FromHost(tqh::Hadamard16Half());
+  DeviceBuffer query_rot = DeviceBuffer::Empty<float>(static_cast<size_t>(batch * kNumHeads * kHeadSize));
 
   bool queried = false;
   const int64_t aiv_num = tqh::VectorCoreNum(&queried);
@@ -365,10 +369,17 @@ ModeRun RunMode(tqm::TurboQuantMode mode, const Shape& shape, aclrtStream stream
       kInvSqrtHeadSize);
   ACL_CHECK(aclrtSynchronizeStream(stream));
 
+  // Pi q for the whole step, once, before the split reads it. `run.rotate_plan`
+  // records which of the two paths the shape selected so the case can assert on
+  // it rather than infer it.
+  run.rotate_plan = tqh::RotateQuery(stream, AscendType::FP16, query_dev.get(), pi_signs.get(), h16.get(),
+                                     rot_tables.get(), query_rot.get(), batch, kNumHeads, kHeadSize, aiv_num,
+                                     /*input_exact_in_half=*/true);
+
   turboquant_mm_decode_split_impl(
-      static_cast<int32_t>(mode), AscendType::FP16, stream, decode_grid.split_block_dim, query_dev.get(),
+      static_cast<int32_t>(mode), AscendType::FP16, stream, decode_grid.split_block_dim, query_rot.get(),
       key_cache.get(), value_cache.get(), scale_plane.get(), block_table_dev.get(), context_dev.get(),
-      pi_signs.get(), rot_tables.get(), decode_tables.get(), workspace.get(), static_cast<uint32_t>(batch),
+      decode_tables.get(), workspace.get(), static_cast<uint32_t>(batch),
       static_cast<uint32_t>(kNumHeads), static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize),
       static_cast<uint32_t>(kBlockSize), static_cast<uint32_t>(shape.blocks_per_seq),
       static_cast<uint32_t>(decode_grid.num_splits), decode_grid.split_tasks_per_core, kAttentionScale,

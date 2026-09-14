@@ -26,6 +26,7 @@
 
 #include "../../kernels/types.h"
 #include "../../npu_device_registry.h"
+#include "turboquant_rotate_q.h"
 
 namespace vllm_ascend {
 
@@ -36,13 +37,19 @@ extern void turboquant_reshape_and_cache_impl(AscendType type, void *stream, uin
                                               uint32_t tokensPerCore, float invSqrtLen);
 
 extern void turboquant_paged_attention_impl(AscendType type, void *stream, uint32_t splitBlockDim,
-                                            uint32_t combineBlockDim, void *query, void *keyCache, void *valueCache,
-                                            void *scaleCache, void *blockTables, void *contextLens, void *piSigns,
+                                            uint32_t combineBlockDim, void *queryRot, void *keyCache,
+                                            void *valueCache, void *scaleCache, void *blockTables,
+                                            void *contextLens, void *piSigns,
                                             void *tables, void *workspace, void *output, uint32_t numTokens,
                                             uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize,
                                             uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits,
                                             uint32_t splitTasksPerCore, uint32_t combineTasksPerCore, float scale,
                                             float invSqrtLen);
+
+extern void turboquant_rotate_q_impl(AscendType type, void *stream, uint32_t blockDim, bool useCube, void *query,
+                                     void *piSigns, void *h16, void *rotTables, void *queryRot, uint32_t numVectors,
+                                     uint32_t headSize, uint32_t vectorsPerBlock, uint32_t vectorsPerChunk,
+                                     uint32_t variant, float invSqrtLen);
 
 namespace turboquant_adpt {
 
@@ -279,17 +286,112 @@ inline void npu_turboquant_reshape_and_cache(at::Tensor &key, at::Tensor &value,
 }
 
 /*
+ * Rotate every query vector of a decode step: q~ = Pi q = D (H (D q)).
+ *
+ *   query        [num_tokens, num_heads, head_size]   fp16 | bf16, post-RoPE
+ *   pi_signs     [head_size]                          fp32, +-1
+ *   codec_tables CodecTableWords(head_size, 1) or more int32
+ *   hadamard16   [16, 16]                             fp16, FillHadamard16Half
+ *   query_rot    [num_tokens, num_heads, head_size]   fp32, the output
+ *
+ * The output is fp32 rather than the query's own type because both decode
+ * splits consume it in fp32: the Cube split scales it to its operand grid and
+ * casts, and the vector split tiles it straight into its fp32 dot product.
+ * Handing them anything narrower would put a cast back into the decode, which is
+ * the loop this change exists to empty.
+ *
+ * `codec_tables` is checked for at least the batch-rows-1 prefix rather than an
+ * exact length: the vector path's codec reads only the sign and shuffle
+ * sections, which sit at batch-rows-independent offsets, so either of the two
+ * table tensors the caller already owns will do.
+ */
+inline void npu_turboquant_rotate_q(at::Tensor &query, at::Tensor &pi_signs, at::Tensor &codec_tables,
+                                    at::Tensor &hadamard16, at::Tensor &query_rot)
+{
+    namespace adpt = turboquant_adpt;
+    namespace tq = vllm_ascend::turboquant;
+
+    TORCH_CHECK(query.dim() == 3, "query must be [num_tokens, num_heads, head_size]");
+    TORCH_CHECK(query.is_contiguous(), "query must be contiguous");
+    TORCH_CHECK(query.scalar_type() == at::ScalarType::Half || query.scalar_type() == at::ScalarType::BFloat16,
+                "query must be float16 or bfloat16, got ", query.scalar_type());
+    TORCH_CHECK(query_rot.sizes() == query.sizes(), "query_rot must have the same shape as query");
+    TORCH_CHECK(query_rot.scalar_type() == at::ScalarType::Float, "query_rot must be float32, got ",
+                query_rot.scalar_type());
+    TORCH_CHECK(query_rot.is_contiguous(), "query_rot must be contiguous");
+    TORCH_CHECK(pi_signs.scalar_type() == at::ScalarType::Float, "pi_signs must be float32");
+    TORCH_CHECK(hadamard16.scalar_type() == at::ScalarType::Half, "hadamard16 must be float16");
+    TORCH_CHECK(hadamard16.is_contiguous() && hadamard16.numel() == tq::kRotateQH16Elements,
+                "hadamard16 must be a contiguous ", tq::kRotateQH16Elements, "-element tensor, got ",
+                hadamard16.numel());
+    TORCH_CHECK(codec_tables.scalar_type() == at::ScalarType::Int, "codec tables must be int32");
+    TORCH_CHECK(codec_tables.is_contiguous(), "codec tables must be contiguous");
+
+    const int64_t num_tokens = query.size(0);
+    const int64_t num_heads = query.size(1);
+    const int64_t head_size = query.size(2);
+    adpt::CheckHeadSize(head_size);
+    TORCH_CHECK(pi_signs.numel() == head_size, "pi_signs must hold one sign per channel");
+    TORCH_CHECK(codec_tables.numel() >= adpt::CodecTableWords(head_size, 1), "codec tables must hold at least ",
+                adpt::CodecTableWords(head_size, 1), " words for head_size ", head_size, ", got ",
+                codec_tables.numel());
+
+    const int64_t num_vectors = num_tokens * num_heads;
+    if (num_vectors == 0) {
+        return;
+    }
+
+    // MIX blocks, not vector cores: arch35 pairs one cube core with two vector
+    // subcores, and blockDim on a MIX launch counts the pairs.
+    int64_t core_num = adpt::VectorCoreNum() / 2;
+    if (core_num < 1) {
+        core_num = 1;
+    }
+    // Only a half query is exactly representable in half after the sign
+    // multiply, so only a half query may take the single-Mmad Cube path.
+    const bool input_exact_in_half = query.scalar_type() == at::ScalarType::Half;
+    const tq::RotateQPlan plan = tq::PlanRotateQ(num_vectors, head_size, core_num, input_exact_in_half);
+
+    // The two divisibility invariants the Cube kernel relies on and does not
+    // check itself. A violation would silently drop the remainder of a block's
+    // share rather than fault, which is exactly the class of defect that reads
+    // as a numerical bug.
+    if (plan.use_cube) {
+        TORCH_CHECK(plan.vectors_per_block > 0 && num_vectors % plan.vectors_per_block == 0,
+                    "rotate_q plan is inconsistent: vectors_per_block ", plan.vectors_per_block,
+                    " does not divide num_vectors ", num_vectors);
+        TORCH_CHECK(plan.vectors_per_chunk > 0 && plan.vectors_per_block % plan.vectors_per_chunk == 0,
+                    "rotate_q plan is inconsistent: vectors_per_chunk ", plan.vectors_per_chunk,
+                    " does not divide vectors_per_block ", plan.vectors_per_block);
+    }
+
+    const float inv_sqrt_len = 1.0f / std::sqrt(static_cast<float>(head_size));
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    turboquant_rotate_q_impl(adpt::ToAscendType(query.scalar_type()), stream, plan.block_dim, plan.use_cube,
+                             query.data_ptr(), pi_signs.data_ptr(), hadamard16.data_ptr(), codec_tables.data_ptr(),
+                             query_rot.data_ptr(), static_cast<uint32_t>(num_vectors),
+                             static_cast<uint32_t>(head_size), plan.vectors_per_block, plan.vectors_per_chunk,
+                             plan.variant, inv_sqrt_len);
+}
+
+/*
  * Paged decode attention over the 4-bit cache.
  *
- *   query        [num_tokens, num_heads, head_size]         fp16 | bf16
+ *   query_rot    [num_tokens, num_heads, head_size]         fp32
  *   block_tables [num_tokens, max_blocks_per_seq]           int32
  *   context_lens [num_tokens]                               int32
  *   workspace    [>= npu_turboquant_workspace_size(...)]    fp32
- *   out          [num_tokens, num_heads, head_size]         same dtype as query
+ *   out          [num_tokens, num_heads, head_size]         fp16 | bf16
  *
- * `query` is the post-RoPE query.  The kernel rotates it once, runs the softmax
- * and value accumulation in the rotated basis, and applies Pi again on the way
- * out.
+ * `query_rot` is the fp32 output of npu_turboquant_rotate_q, NOT the model's
+ * query -- call that operator first.  The split kernel applies no rotation of
+ * any kind; it runs the softmax and the value accumulation in the rotated basis
+ * and the combine applies Pi again on the way out, which is why `pi_signs` is
+ * still an argument.  A caller that passed the unrotated query here would get a
+ * plausible-looking wrong answer rather than an error.
+ *
+ * The element type the kernels are instantiated for comes from `out`: it is the
+ * only tensor in the call that still carries the model's dtype.
  *
  * This dispatches *two* kernels on the current stream: an in-kernel barrier
  * only orders co-resident blocks, so stream order between two launches is the
@@ -298,7 +400,7 @@ inline void npu_turboquant_reshape_and_cache(at::Tensor &key, at::Tensor &value,
  * `workspace` is caller-owned scratch, not an output.  It is an argument rather
  * than an at::empty because a decode step must not allocate.
  */
-inline void npu_turboquant_paged_attention(at::Tensor &query, at::Tensor &key_cache, at::Tensor &value_cache,
+inline void npu_turboquant_paged_attention(at::Tensor &query_rot, at::Tensor &key_cache, at::Tensor &value_cache,
                                            at::Tensor &scale_cache, at::Tensor &block_tables,
                                            at::Tensor &context_lens, at::Tensor &pi_signs, at::Tensor &codec_tables,
                                            at::Tensor &workspace, int64_t num_kv_heads, int64_t num_heads,
@@ -306,9 +408,12 @@ inline void npu_turboquant_paged_attention(at::Tensor &query, at::Tensor &key_ca
 {
     namespace adpt = turboquant_adpt;
 
-    TORCH_CHECK(query.dim() == 3, "query must be [num_tokens, num_heads, head_size]");
-    TORCH_CHECK(out.sizes() == query.sizes(), "out must have the same shape as query");
-    TORCH_CHECK(out.scalar_type() == query.scalar_type(), "out must have the same dtype as query");
+    TORCH_CHECK(query_rot.dim() == 3, "query_rot must be [num_tokens, num_heads, head_size]");
+    TORCH_CHECK(query_rot.scalar_type() == at::ScalarType::Float, "query_rot must be float32, got ",
+                query_rot.scalar_type());
+    TORCH_CHECK(out.sizes() == query_rot.sizes(), "out must have the same shape as query_rot");
+    TORCH_CHECK(out.scalar_type() == at::ScalarType::Half || out.scalar_type() == at::ScalarType::BFloat16,
+                "out must be float16 or bfloat16, got ", out.scalar_type());
     TORCH_CHECK(key_cache.dim() == 4 && value_cache.dim() == 4,
                 "kv cache must be [num_blocks, block_size, num_kv_heads, head_size / 2]");
     TORCH_CHECK(key_cache.scalar_type() == at::ScalarType::Char && value_cache.scalar_type() == at::ScalarType::Char,
@@ -319,18 +424,18 @@ inline void npu_turboquant_paged_attention(at::Tensor &query, at::Tensor &key_ca
                 "block_tables must be an int32 [num_tokens, max_blocks_per_seq] tensor");
     TORCH_CHECK(context_lens.scalar_type() == at::ScalarType::Int, "context_lens must be int32");
     TORCH_CHECK(pi_signs.scalar_type() == at::ScalarType::Float, "pi_signs must be float32");
-    TORCH_CHECK(query.is_contiguous() && out.is_contiguous(), "query and out must be contiguous");
+    TORCH_CHECK(query_rot.is_contiguous() && out.is_contiguous(), "query_rot and out must be contiguous");
     TORCH_CHECK(key_cache.is_contiguous() && value_cache.is_contiguous() && scale_cache.is_contiguous(),
                 "the kv cache and its scale plane must be contiguous");
 
-    const int64_t num_tokens = query.size(0);
-    const int64_t head_size = query.size(2);
+    const int64_t num_tokens = query_rot.size(0);
+    const int64_t head_size = query_rot.size(2);
     const int64_t block_size = key_cache.size(1);
     const int64_t max_blocks_per_seq = block_tables.size(1);
 
     adpt::CheckHeadSize(head_size);
     adpt::CheckCodecTables(codec_tables, head_size, adpt::kTileRows);
-    TORCH_CHECK(query.size(1) == num_heads, "query head count ", query.size(1), " does not match num_heads ",
+    TORCH_CHECK(query_rot.size(1) == num_heads, "query head count ", query_rot.size(1), " does not match num_heads ",
                 num_heads);
     TORCH_CHECK(num_kv_heads > 0 && num_heads % num_kv_heads == 0, "num_heads ", num_heads,
                 " must be a multiple of num_kv_heads ", num_kv_heads);
@@ -374,8 +479,8 @@ inline void npu_turboquant_paged_attention(at::Tensor &query, at::Tensor &key_ca
     // stream's, and two launches into the same stream keep it.
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     turboquant_paged_attention_impl(
-        adpt::ToAscendType(query.scalar_type()), stream, plan.split_block_dim, plan.combine_block_dim,
-        query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(), scale_cache.data_ptr(),
+        adpt::ToAscendType(out.scalar_type()), stream, plan.split_block_dim, plan.combine_block_dim,
+        query_rot.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(), scale_cache.data_ptr(),
         block_tables.data_ptr(), context_lens.data_ptr(), pi_signs.data_ptr(), codec_tables.data_ptr(),
         workspace.data_ptr(), out.data_ptr(), static_cast<uint32_t>(num_tokens), static_cast<uint32_t>(num_heads),
         static_cast<uint32_t>(num_kv_heads), static_cast<uint32_t>(head_size), static_cast<uint32_t>(block_size),

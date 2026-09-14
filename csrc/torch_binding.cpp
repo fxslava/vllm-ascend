@@ -3164,8 +3164,20 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("npu_turboquant_reshape_and_cache", torch::kPrivateUse1,
              &vllm_ascend::npu_turboquant_reshape_and_cache);
 
+    // Pi q for every query vector of a decode step, once per (token, head).
+    // Must run before npu_turboquant_paged_attention, which takes its output
+    // and applies no rotation of its own.
     ops.def(
-        "npu_turboquant_paged_attention(Tensor query, "
+        "npu_turboquant_rotate_q(Tensor query, "
+        "                        Tensor pi_signs, "
+        "                        Tensor codec_tables, "
+        "                        Tensor hadamard16, "
+        "                        Tensor! query_rot) -> ()");
+    ops.impl("npu_turboquant_rotate_q", torch::kPrivateUse1,
+             &vllm_ascend::npu_turboquant_rotate_q);
+
+    ops.def(
+        "npu_turboquant_paged_attention(Tensor query_rot, "
         "                               Tensor key_cache, "
         "                               Tensor value_cache, "
         "                               Tensor scale_cache, "

@@ -24,9 +24,15 @@
 //
 //   tq4_write_s<S>      the cache write path: S tokens rotated, quantised to
 //                       4 bits and scattered. One launch.
-//   tq4_decode_s<S>     the decode: split then combine, two launches on one
-//                       stream. The cache is written once during setup, so the
-//                       timed region is the read path only.
+//   tq_rotate_s<S>      the query rotation, q~ = Pi q, on its own. ONE launch,
+//                       and the only single-launch decode-side case here. Both
+//                       decode legs enqueue this same rotation ahead of their
+//                       own kernels, so subtracting it is what prices the extra
+//                       operator invocation the pre-rotated Q contract costs.
+//                       Flat in S: it reads the query and nothing paged.
+//   tq4_decode_s<S>     the decode: rotate, split, combine -- three launches on
+//                       one stream. The cache is written once during setup, so
+//                       the timed region is the read path only.
 //   kv4fp8_write_s<S>   the 4-bit cache write through the multi-rate codec.
 //   kv4fp8_decode_s<S>  the Cube-native decode: the same 128-byte slot tq4
 //                       stores, unpacked to fp8_e4m3fn on the AIV and
@@ -458,6 +464,12 @@ struct DecodeScenario {
                                                                static_cast<int32_t>(context_len)),
                                            kBenchmarkAlignBytes);
     pi_signs_ = DeviceBuffer::FromHost(tqh::PiSigns(kHeadSize), kBenchmarkAlignBytes);
+    // The query rotation's constant and its output. One of each, shared by every
+    // quantised leg for the same reason the query itself is: a second copy is a
+    // second chance for the legs to disagree.
+    h16_ = DeviceBuffer::FromHost(tqh::Hadamard16Half(), kBenchmarkAlignBytes);
+    query_rot_ = DeviceBuffer::Empty<float>(static_cast<size_t>(kQueryTokens * kNumHeads * kHeadSize),
+                                            kBenchmarkAlignBytes);
 
     // The write path expands one vector per call and the decode path expands a
     // kTileRows tile; the two table images differ and are not interchangeable.
@@ -491,8 +503,9 @@ struct DecodeScenario {
   // in-kernel barrier cannot order those across an arbitrary grid, so stream
   // order is the barrier.
   void EnqueueDecode(aclrtStream stream) const {
+    EnqueueRotate(stream);
     turboquant_paged_attention_impl(
-        AscendType::FP16, stream, decode_grid_.split_block_dim, decode_grid_.combine_block_dim, query_.get(),
+        AscendType::FP16, stream, decode_grid_.split_block_dim, decode_grid_.combine_block_dim, query_rot_.get(),
         key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
         pi_signs_.get(), decode_tables_.get(), workspace_.get(), out_.get(), static_cast<uint32_t>(kQueryTokens),
         static_cast<uint32_t>(kNumHeads), static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize),
@@ -533,6 +546,23 @@ struct DecodeScenario {
   void* block_tables() const { return block_tables_.get(); }
   void* context_lens() const { return context_lens_.get(); }
   void* pi_signs() const { return pi_signs_.get(); }
+  void* h16() const { return h16_.get(); }
+  void* query_rot() const { return query_rot_.get(); }
+  void* write_tables() const { return write_tables_.get(); }
+  std::vector<float> RotatedQuery() const { return query_rot_.ToHost<float>(); }
+
+  /*
+   * Enqueue Pi q for this step. Every quantised leg calls it at the head of its
+   * own EnqueueDecode, so the rotation is inside the timed region exactly where
+   * it used to be when the split kernel did it -- the accounting across the
+   * refactor is unchanged, and `vs fp16` still compares a rotated decode with an
+   * unrotated one.
+   */
+  vllm_ascend::turboquant::RotateQPlan EnqueueRotate(aclrtStream stream) const {
+    return tqh::RotateQuery(stream, AscendType::FP16, query_.get(), pi_signs_.get(), h16_.get(),
+                            write_tables_.get(), query_rot_.get(), kQueryTokens, kNumHeads, kHeadSize, aiv_num_,
+                            /*input_exact_in_half=*/true);
+  }
 
  private:
   int64_t context_len_ = 0;
@@ -546,6 +576,7 @@ struct DecodeScenario {
   std::vector<float> key_host_, value_host_;
 
   DeviceBuffer key_, value_, query_, slots_, block_tables_, context_lens_, pi_signs_;
+  DeviceBuffer h16_, query_rot_;
   DeviceBuffer write_tables_, decode_tables_;
   DeviceBuffer key_cache_, value_cache_, scale_plane_, workspace_, out_;
   tqh::ReshapeAndCacheGrid write_grid_;
@@ -614,10 +645,11 @@ struct ModeScenario {
   // its layout, so there is no second reduction to keep in step. Stream order
   // is the barrier between the two, for the same reason as in the 4-bit path.
   void EnqueueDecode(const DecodeScenario& shared, aclrtStream stream) const {
+    shared.EnqueueRotate(stream);
     turboquant_mm_decode_split_impl(
-        static_cast<int32_t>(kMode), AscendType::FP16, stream, decode_grid_.split_block_dim, shared.query(),
+        static_cast<int32_t>(kMode), AscendType::FP16, stream, decode_grid_.split_block_dim, shared.query_rot(),
         key_cache_.get(), value_cache_.get(), scale_plane_.get(), shared.block_tables(), shared.context_lens(),
-        shared.pi_signs(), rot_tables_.get(), decode_tables_.get(), workspace_.get(),
+        decode_tables_.get(), workspace_.get(),
         static_cast<uint32_t>(kQueryTokens), static_cast<uint32_t>(kNumHeads), static_cast<uint32_t>(kNumKvHeads),
         static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kBlockSize),
         static_cast<uint32_t>(blocks_per_seq_), static_cast<uint32_t>(decode_grid_.num_splits),
@@ -1194,6 +1226,40 @@ void BuildSuite(BenchmarkRunner& runner) {
       runner.RecordFailure(write_name, error.what());
     }
 
+    // --- the query rotation, on its own -------------------------------------
+    //
+    // ONE launch, and the only case in this file that is one. Both decode legs
+    // below now enqueue this same rotation ahead of their own kernels, so
+    //
+    //     tq_rotate_sS  is  launch + the rotation itself
+    //     tq4_decode_sS  minus  tq_rotate_sS  is what the decode costs without
+    //
+    // and the difference between this and an empty launch is what pricing the
+    // extra operator invocation actually needs. That is the measurement the
+    // decision to make the rotation a separate operator rests on, and nothing
+    // in this repository had produced it before: the standalone Hadamard sweep
+    // in hadamard_benchmark_results.csv records its launch path as
+    // `replan-per-launch`, which is a harness artefact and not the graph-replay
+    // figure a decode step actually pays.
+    //
+    // Flat in S by construction -- the rotation reads the query and nothing
+    // paged -- so a row that grows with the context is a bug in this case and
+    // not a property of the kernel.
+    const std::string rotate_name = CaseName("tq_rotate", context_len);
+    try {
+      BenchmarkCase rotate_case;
+      rotate_case.name = rotate_name;
+      // Read: the fp16 query. Written: its fp32 rotation.
+      rotate_case.bytes_per_iteration =
+          static_cast<double>(kQueryTokens * kNumHeads * kHeadSize) * (sizeof(Half) + kFloatBytes);
+      rotate_case.launch = [&scenario](aclrtStream stream) { scenario.EnqueueRotate(stream); };
+      // Deterministic: the same query through the same transform every launch.
+      rotate_case.checksum = [&scenario]() { return ChecksumSum(scenario.RotatedQuery()); };
+      runner.Run(rotate_case);
+    } catch (const std::exception& error) {
+      runner.RecordFailure(rotate_name, error.what());
+    }
+
     // --- the 4-bit AIV decode -----------------------------------------------
     const std::string decode_name = CaseName("tq4_decode", context_len);
     try {
@@ -1203,7 +1269,7 @@ void BuildSuite(BenchmarkRunner& runner) {
       decode_case.name = decode_name;
       decode_case.flops_per_iteration = AttentionFlops(context_len);
       decode_case.bytes_per_iteration = model.tq4_decode_read_bytes;
-      decode_case.tasks_per_launch = 2;  // split, then combine
+      decode_case.tasks_per_launch = 3;  // rotate, split, then combine
       decode_case.launch = [&scenario](aclrtStream stream) { scenario.EnqueueDecode(stream); };
       decode_case.checksum = [&scenario]() { return ChecksumSum(scenario.Output()); };
       runner.Run(decode_case);
@@ -1261,7 +1327,7 @@ void BuildSuite(BenchmarkRunner& runner) {
       decode_case.name = kv4_decode_name;
       decode_case.flops_per_iteration = AttentionFlops(context_len);
       decode_case.bytes_per_iteration = model.kv4_decode_read_bytes;
-      decode_case.tasks_per_launch = 2;  // split, then combine
+      decode_case.tasks_per_launch = 3;  // rotate, split, then combine
       decode_case.launch = [&kv4, &scenario](aclrtStream stream) { kv4.EnqueueDecode(scenario, stream); };
       decode_case.checksum = [&kv4]() { return ChecksumSum(kv4.Output()); };
       runner.Run(decode_case);

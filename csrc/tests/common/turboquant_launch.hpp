@@ -41,6 +41,7 @@
 #include <vector>
 
 #include "../../attention/turboquant/turboquant_mode.h"
+#include "../../attention/turboquant/turboquant_rotate_q.h"
 #include "../../kernels/types.h"
 
 namespace vllm_ascend {
@@ -55,13 +56,31 @@ void turboquant_reshape_and_cache_impl(AscendType type, void *stream, uint32_t b
                                        uint32_t headSize, uint32_t blockSize, uint32_t tokensPerCore,
                                        float invSqrtLen);
 
+// `queryRot` is the fp32 output of turboquant_rotate_q_impl, not the model's
+// query: neither split kernel rotates any more. `piSigns` is still here because
+// the combine launch inside this function un-rotates the accumulator.
 void turboquant_paged_attention_impl(AscendType type, void *stream, uint32_t splitBlockDim, uint32_t combineBlockDim,
-                                     void *query, void *keyCache, void *valueCache, void *scaleCache,
+                                     void *queryRot, void *keyCache, void *valueCache, void *scaleCache,
                                      void *blockTables, void *contextLens, void *piSigns, void *tables,
                                      void *workspace, void *output, uint32_t numTokens, uint32_t numHeads,
                                      uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,
                                      uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t splitTasksPerCore,
                                      uint32_t combineTasksPerCore, float scale, float invSqrtLen);
+
+/*
+ * Pi q for a whole decode step's worth of query vectors, in one launch.
+ * Defined in csrc/attention/turboquant/turboquant_rotate_q.cpp.
+ *
+ * `useCube` selects the Sylvester-factorised path over the vector-only one; the
+ * host decides with turboquant::PlanRotateQ rather than the kernel, so the plan
+ * that is validated is the plan that runs. `h16` is only read by the Cube path
+ * and `rotTables` only by the vector one, but both are always passed -- a null
+ * for the unused one would be a second thing to keep in sync.
+ */
+void turboquant_rotate_q_impl(AscendType type, void *stream, uint32_t blockDim, bool useCube, void *query,
+                              void *piSigns, void *h16, void *rotTables, void *queryRot, uint32_t numVectors,
+                              uint32_t headSize, uint32_t vectorsPerBlock, uint32_t vectorsPerChunk,
+                              uint32_t variant, float invSqrtLen);
 
 void turboquant_paged_attention_combine_impl(AscendType type, void *stream, uint32_t blockDim, void *workspace,
                                              void *piSigns, void *tables, void *output, uint32_t numTokens,
@@ -78,9 +97,9 @@ void turboquant_mm_reshape_and_cache_impl(int32_t mode, AscendType type, void *s
                                           uint32_t numTokens, uint32_t numKvHeads, uint32_t headSize,
                                           uint32_t blockSize, uint32_t tokensPerCore, float invSqrtLen);
 
-void turboquant_mm_decode_split_impl(int32_t mode, AscendType type, void *stream, uint32_t blockDim, void *query,
+void turboquant_mm_decode_split_impl(int32_t mode, AscendType type, void *stream, uint32_t blockDim, void *queryRot,
                                      void *keyCache, void *valueCache, void *scaleCache, void *blockTables,
-                                     void *contextLens, void *piSigns, void *rotTables, void *modeTables,
+                                     void *contextLens, void *modeTables,
                                      void *workspace, uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads,
                                      uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,
                                      uint32_t numSplits, uint32_t tasksPerCore, float scale, float invSqrtLen);
@@ -90,9 +109,10 @@ void turboquant_mm_decode_split_impl(int32_t mode, AscendType type, void *stream
 // shipping kernel itself. Defined in turboquant_mm_kernels.cpp only when the
 // library is built with VLLM_ASCEND_TQ_DECODE_ABLATION, which csrc/tests does
 // and the wheel does not.
-void turboquant_mm_decode_ablation_impl(int32_t stage, AscendType type, void *stream, uint32_t blockDim, void *query,
+void turboquant_mm_decode_ablation_impl(int32_t stage, AscendType type, void *stream, uint32_t blockDim,
+                                        void *queryRot,
                                         void *keyCache, void *valueCache, void *scaleCache, void *blockTables,
-                                        void *contextLens, void *piSigns, void *rotTables, void *modeTables,
+                                        void *contextLens, void *modeTables,
                                         void *workspace, uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads,
                                         uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,
                                         uint32_t numSplits, uint32_t tasksPerCore, float scale, float invSqrtLen);
@@ -304,6 +324,29 @@ struct CubeDecodeGrid {
 
 CubeDecodeGrid PlanCubeDecode(int64_t num_tokens, int64_t num_heads, int64_t num_kv_heads, int64_t head_size,
                               int64_t max_blocks_per_seq, int64_t aiv_num);
+
+// The 16x16 fp16 Hadamard constant the Cube rotation path multiplies by, as a
+// host image ready for DeviceBuffer::FromHost. One definition, shared with the
+// torch operator through turboquant::FillHadamard16Half.
+std::vector<uint16_t> Hadamard16Half();
+
+/*
+ * Rotate a decode step's whole query into `query_rot`, the way
+ * npu_turboquant_rotate_q does: plan the grid, pick the path, launch once.
+ * Every decode call site in this suite goes through it, so a test cannot
+ * accidentally feed a split kernel an unrotated query -- which would not fault,
+ * and would read as a codec fidelity failure.
+ *
+ * Does NOT synchronise: the rotation and the decode belong on one stream, and
+ * stream order is what sequences them.
+ *
+ * `query` is scalar_t, `query_rot` is fp32 with the same element count. Returns
+ * the plan so a test can assert which path ran.
+ */
+vllm_ascend::turboquant::RotateQPlan RotateQuery(void *stream, AscendType type, void *query, void *pi_signs,
+                                                 void *h16, void *rot_tables, void *query_rot, int64_t num_tokens,
+                                                 int64_t num_heads, int64_t head_size, int64_t aiv_num,
+                                                 bool input_exact_in_half);
 
 }  // namespace turboquant_host
 }  // namespace test

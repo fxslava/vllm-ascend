@@ -253,6 +253,8 @@ class DeviceScenario {
     block_tables_ = DeviceBuffer::FromHost(block_tables);
     context_lens_ = DeviceBuffer::FromHost(std::vector<int32_t>(kQueryTokens, kContextLen));
     out_ = DeviceBuffer::Empty<Half>(static_cast<size_t>(kQueryTokens) * kNumHeads * kHeadSize);
+    h16_ = DeviceBuffer::FromHost(tqh::Hadamard16Half());
+    query_rot_ = DeviceBuffer::Empty<float>(static_cast<size_t>(kQueryTokens) * kNumHeads * kHeadSize);
 
     aiv_num_ = tqh::VectorCoreNum(&aiv_queried_);
   }
@@ -274,8 +276,13 @@ class DeviceScenario {
     // workspace, is a function of the block table this decode reads.
     workspace_ = DeviceBuffer::Empty<float>(grid.workspace_floats);
 
+    // The query rotation is its own launch and must precede the split; the
+    // split kernel applies no transform of its own any more.
+    tqh::RotateQuery(stream_, AscendType::FP16, query_.get(), pi_signs_.get(), h16_.get(), write_tables_.get(),
+                     query_rot_.get(), kQueryTokens, kNumHeads, kHeadSize, aiv_num_, /*input_exact_in_half=*/true);
+
     turboquant_paged_attention_impl(
-        AscendType::FP16, stream_, grid.split_block_dim, grid.combine_block_dim, query_.get(), key_cache_.get(),
+        AscendType::FP16, stream_, grid.split_block_dim, grid.combine_block_dim, query_rot_.get(), key_cache_.get(),
         value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(), pi_signs_.get(),
         decode_tables_.get(), workspace_.get(), out_.get(), static_cast<uint32_t>(kQueryTokens),
         static_cast<uint32_t>(kNumHeads), static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize),
@@ -297,6 +304,7 @@ class DeviceScenario {
 
   aclrtStream stream_;
   DeviceBuffer key_, value_, query_, slots_, pi_signs_;
+  DeviceBuffer h16_, query_rot_;
   DeviceBuffer write_tables_, decode_tables_;
   DeviceBuffer key_cache_, value_cache_, scale_plane_;
   DeviceBuffer block_tables_, context_lens_, workspace_, out_;

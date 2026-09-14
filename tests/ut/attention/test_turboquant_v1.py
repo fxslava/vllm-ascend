@@ -38,6 +38,7 @@ from vllm_ascend.attention.turboquant_v1 import (
     AscendTurboQuantAttentionBackendImpl,
     apply_pi,
     turboquant_codec_tables,
+    turboquant_hadamard16,
     turboquant_pi_signs,
     turboquant_scale_slot,
     walsh_hadamard,
@@ -287,7 +288,7 @@ class TestPureRuntimeContract(TestBase):
         # The codec tables are host-built, not regenerated per launch.
         torch.testing.assert_close(args[7], turboquant_codec_tables(HEAD_SIZE, 1, CPU))
 
-    def test_paged_attention_passes_post_rope_query_and_no_flag(self):
+    def test_paged_attention_rotates_the_query_in_its_own_operator(self):
         impl = self._make_impl()
         num_tokens = 2
         impl.key_cache = torch.zeros(1, 128, 2, HEAD_SIZE // TURBOQUANT_PACK_FACTOR, dtype=torch.int8)
@@ -304,16 +305,65 @@ class TestPureRuntimeContract(TestBase):
         with patch.object(torch.ops, "_C_ascend", ops, create=True):
             impl.forward_paged_attention(query, metadata, output)
 
+        # The rotation is its own launch, and it comes first: the split kernel
+        # applies no Walsh-Hadamard transform any more, so a decode that skipped
+        # this call would read an unrotated query and produce plausible-looking
+        # nonsense rather than fail.
+        ops.npu_turboquant_rotate_q.assert_called_once()
+        rot_args = ops.npu_turboquant_rotate_q.call_args.args
+        # query, pi_signs, codec_tables, hadamard16, query_rot.
+        self.assertEqual(len(rot_args), 5)
+        torch.testing.assert_close(rot_args[0], query)
+        torch.testing.assert_close(rot_args[1], turboquant_pi_signs(HEAD_SIZE, CPU))
+        # batch_rows 1: the rotation expands one vector per call, as the write
+        # path does -- not the decode's kTileRows image.
+        torch.testing.assert_close(rot_args[2], turboquant_codec_tables(HEAD_SIZE, 1, CPU))
+        torch.testing.assert_close(rot_args[3], turboquant_hadamard16(CPU))
+        self.assertEqual(rot_args[4].dtype, torch.float32)
+        self.assertEqual(rot_args[4].shape, (num_tokens, impl.num_heads, HEAD_SIZE))
+
         ops.npu_turboquant_paged_attention.assert_called_once()
         args = ops.npu_turboquant_paged_attention.call_args.args
-        # query, k_cache, v_cache, scale_cache, block_tables, context_lens,
+        # query_rot, k_cache, v_cache, scale_cache, block_tables, context_lens,
         # pi_signs, codec_tables, workspace, num_kv_heads, num_heads, scale, out.
         self.assertEqual(len(args), 13)
-        torch.testing.assert_close(args[0], query)
+        # The decode reads the rotation's output, not the model's query. Same
+        # tensor object, so the two launches cannot disagree about the buffer.
+        self.assertIs(args[0], rot_args[4])
         torch.testing.assert_close(args[7], turboquant_codec_tables(HEAD_SIZE, TURBOQUANT_TILE_ROWS, CPU))
         self.assertEqual(args[9], impl.num_kv_heads)
         self.assertEqual(args[10], impl.num_heads)
         self.assertFalse(any(isinstance(a, bool) for a in args))
+
+    def test_rotated_query_buffer_is_preallocated_and_reused(self):
+        """The rotation never allocates on a decode step, for the same reason
+        the reduction workspace does not: a graph replays captured addresses."""
+        impl = self._make_impl()
+        impl.key_cache = torch.zeros(1, 128, 2, HEAD_SIZE // TURBOQUANT_PACK_FACTOR, dtype=torch.int8)
+        impl.value_cache = impl.key_cache
+        impl.scale_cache = torch.zeros(1, 128, turboquant_scale_slot(2))
+
+        def run(num_tokens):
+            query = torch.randn(num_tokens, impl.num_heads, HEAD_SIZE)
+            output = torch.zeros(num_tokens, impl.num_heads, HEAD_SIZE)
+            metadata = MagicMock(
+                block_tables=torch.zeros(num_tokens, 1, dtype=torch.int64),
+                seq_lens=torch.ones(num_tokens, dtype=torch.int64),
+            )
+            ops = _ops_mock(workspace_floats=WORKSPACE_FLOATS)
+            with patch.object(torch.ops, "_C_ascend", ops, create=True):
+                impl.forward_paged_attention(query, metadata, output)
+            return ops.npu_turboquant_rotate_q.call_args.args[4]
+
+        wide = run(4)
+        self.assertIsNotNone(impl.rotated_query)
+        storage = impl.rotated_query
+        # A narrower step reuses the same allocation rather than making a new
+        # one, and takes a correctly shaped view of its prefix.
+        narrow = run(2)
+        self.assertIs(impl.rotated_query, storage)
+        self.assertEqual(narrow.shape, (2, impl.num_heads, HEAD_SIZE))
+        self.assertEqual(wide.shape, (4, impl.num_heads, HEAD_SIZE))
 
     def test_paged_attention_is_handed_a_preallocated_workspace(self):
         """The operator never allocates its own reduction scratch."""

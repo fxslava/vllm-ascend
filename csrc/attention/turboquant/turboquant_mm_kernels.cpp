@@ -431,9 +431,17 @@ public:
 
     __aicore__ inline explicit TurboQuantCubeDecodeSplit(AscendC::TPipe *pipe) : pipe_(pipe) {}
 
-    __aicore__ inline void Init(__gm__ void *query, __gm__ void *keyCache, __gm__ void *valueCache,
+    /*
+     * `queryRot` is the PRE-ROTATED query, fp32 [num_tokens, num_heads,
+     * head_size], produced by npu_turboquant_rotate_q.  This kernel applies no
+     * Walsh-Hadamard transform of any kind: the rotation it used to run per
+     * (token, kv_head, split) now runs once per (token, head) in its own launch.
+     * pi_signs and the rotation tables are gone with it -- the combine still
+     * owns the output's inverse rotation and still reads both.
+     */
+    __aicore__ inline void Init(__gm__ void *queryRot, __gm__ void *keyCache, __gm__ void *valueCache,
                                 __gm__ void *scaleCache, __gm__ void *blockTables, __gm__ void *contextLens,
-                                __gm__ void *piSigns, __gm__ void *rotTables, __gm__ void *modeTables,
+                                __gm__ void *modeTables,
                                 __gm__ void *workspace, uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads,
                                 uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits,
                                 float scale, float invSqrtLen)
@@ -504,14 +512,12 @@ public:
         // s / gain and the attention scale, folded once.
         scoreScale_ = scale_ / TurboQuantModeTraits<MODE>::kGain;
 
-        queryGm_.SetGlobalBuffer(reinterpret_cast<__gm__ scalar_t *>(query));
+        queryRotGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(queryRot));
         keyCacheGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(keyCache));
         valueCacheGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(valueCache));
         scaleCacheGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(scaleCache));
         blockTableGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(blockTables));
         contextLenGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(contextLens), numTokens);
-        piSignsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(piSigns), headSize);
-        rotTablesGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(rotTables));
         modeTablesGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(modeTables));
         workspaceGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(workspace));
 
@@ -546,21 +552,24 @@ public:
         // alpha, and the probability row's operand scale. One 32B block each.
         pipe_->InitBuffer(stateBuf_, 6 * kMaxGroupHeads * kFp32PerBlock * sizeof(float));
         pipe_->InitBuffer(reduceBuf_, 4 * kMaxGroupHeads * kFp32PerBlock * sizeof(float));
-        pipe_->InitBuffer(signBuf_, headSize_ * sizeof(float));
         pipe_->InitBuffer(scaleIdxBuf_, 2 * kCubeTileRows * sizeof(int32_t));
-        // Allocated last, and sized for the actual group rather than the widest
-        // one, so every other buffer keeps the base address it had.
-        pipe_->InitBuffer(qInBuf_, groupHeads_ * headSize_ * sizeof(scalar_t));
+        // The group's pre-rotated query, fp32, read in one burst.  Allocated
+        // last, and sized for the actual group rather than the widest one, so
+        // every other buffer keeps the base address it had.
+        //
+        // It was groupHeads_ * headSize_ * sizeof(scalar_t) when the rotation
+        // lived here and the kernel read the raw fp16 query; the rotated one
+        // arrives already in fp32, which is the only allocation this refactor
+        // grows.  It is the last buffer in the order, so nothing moves behind
+        // it -- deliberately, given what 13.17 measured about this kernel and UB
+        // base addresses.
+        pipe_->InitBuffer(qInBuf_, groupHeads_ * headSize_ * sizeof(float));
 
-        rotation_.Init(pipe_, headSize_, 1, invSqrtLen, rotTablesGm_);
         // The affine codec reads headSize * batchRows as the element count one
         // call produces -- twice the bytes it consumes -- so the chunk size is
         // expressed in the one unit both paths share.  See TurboQuantModeCodec.
         codec_.Init(pipe_, headSize_,
                     Codec::kIsAffine ? (2 * unpackBytes_ / headSize_) : kUnpackRows, invSqrtLen, modeTablesGm_);
-
-        AscendC::LocalTensor<float> signs = signBuf_.Get<float>();
-        AscendC::DataCopy(signs, piSignsGm_, headSize_);
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 
@@ -635,7 +644,7 @@ private:
             const uint32_t ctxLen = static_cast<uint32_t>(contextLen);
             const uint32_t numTiles = CountTiles(token, ctxLen, blockStart, blockEnd);
             if ASCEND_IS_AIV {
-                if constexpr (Keeps(DecodeAblationStage::STAGE_2_HADAMARD)) {
+                if constexpr (Keeps(DecodeAblationStage::STAGE_2_QUERY_PREP)) {
                     PrepareTask(token, kvHead);
                 }
                 PipelineAiv(token, ctxLen, blockStart, blockEnd, numTiles, kvHead, acc, state);
@@ -685,15 +694,25 @@ private:
         }
     }
 
-    // Once per task: rotate every query head in the group, scale it to the top
-    // of the operand grid, cast, and place it in L1 in NZ order -- eight
-    // 32-byte runs per head at a stride of kCubeTileM * 32 bytes.
+    // Once per task: read every query head of the group -- already rotated --
+    // scale it to the top of the operand grid, cast, and place it in L1 in NZ
+    // order: eight 32-byte runs per head at a stride of kCubeTileM * 32 bytes.
+    //
+    // What used to sit between the read and the scaling was the rotation: a
+    // sign multiply, three Gather shuffles, log2(head_size / 8) block-strided
+    // butterflies, a normalisation and a second sign multiply, plus the eleven
+    // PipeBarrier<PIPE_V> a 256-wide ApplyPi emits -- per head, per split.  All
+    // of it is now npu_turboquant_rotate_q's, once per (token, head).
     __aicore__ inline void PrepareTask(uint32_t token, uint32_t kvHead)
     {
+        // qBuf_'s first head_size floats were the rotation's in-place working
+        // vector and are now spare; `tmp` keeps the offset it had rather than
+        // sliding to the base, so no buffer allocated after qBuf_ moves. That
+        // is deliberate and it costs 1 KB at head_size 256: 13.17 measured this
+        // kernel losing 7,875 ticks to a UB base shift by a mechanism 13.21
+        // could not identify, so the shrink belongs in its own measured pass.
         AscendC::LocalTensor<float> work = qBuf_.Get<float>();
-        AscendC::LocalTensor<float> vec = work;
         AscendC::LocalTensor<float> tmp = work[headSize_];
-        AscendC::LocalTensor<float> signs = signBuf_.Get<float>();
         AscendC::LocalTensor<OperandT> qOperand = qOperandBuf_.Get<OperandT>();
         AscendC::LocalTensor<float> reduce = reduceBuf_.Get<float>();
         AscendC::LocalTensor<OperandT> qL1 = mm_.A1Query();
@@ -710,19 +729,23 @@ private:
         // qInQueue_, which was never InitBuffer'd: AllocTensor handed back a
         // base of 0 and the load aliased the bottom of UB. Same failure as
         // TURBOQUANT_TESTS.md 13.13, reached by a different route.
-        AscendC::LocalTensor<scalar_t> qIn = qInBuf_.Get<scalar_t>();
+        AscendC::LocalTensor<float> qIn = qInBuf_.Get<float>();
         AscendC::DataCopy(qIn,
-                          queryGm_[(static_cast<uint64_t>(token) * numHeads_ +
-                                    static_cast<uint64_t>(kvHead) * groupHeads_) * headSize_],
+                          queryRotGm_[(static_cast<uint64_t>(token) * numHeads_ +
+                                       static_cast<uint64_t>(kvHead) * groupHeads_) * headSize_],
                           groupHeads_ * headSize_);
         SyncMte2ToVector();
 
         for (uint32_t h = 0; h < groupHeads_; ++h) {
-            AscendC::Cast(vec, qIn[h * headSize_], AscendC::RoundMode::CAST_NONE, headSize_);
-            AscendC::PipeBarrier<PIPE_V>();
-
-            // q~ = Pi q.  Everything downstream lives in the rotated basis.
-            rotation_.ApplyPi(vec, tmp, signs, static_cast<int>(headSize_));
+            // q~ = Pi q arrives from GM already rotated, so the head's slice of
+            // the batched read IS the working vector.  It is deliberately not
+            // copied into qBuf_ first: a UB -> UB DataCopy is not issued on
+            // PIPE_V, so the PipeBarrier<PIPE_V> that used to separate the Cast
+            // from the Abs below would not order it -- and the symptom would be
+            // a stale scale factor on some heads, which is a plausible number
+            // rather than a fault.  SyncMte2ToVector above already covers the
+            // one fill this slice has.
+            AscendC::LocalTensor<float> vec = qIn[h * headSize_];
 
             // Scale into the operand grid.  ReduceMax over |q| leaves the amax
             // in UB; the reciprocal is applied without a scalar round trip, and
@@ -1289,7 +1312,9 @@ private:
     }
 
     AscendC::TPipe *pipe_;
-    TurboQuantCodec4 rotation_;
+    // No TurboQuantCodec4 here any more.  It carried the rotation's constant
+    // tables and its scratch -- 20,832 B at head_size 256, 41,312 B at 512 --
+    // and this kernel no longer rotates anything.
     Codec codec_;
     Mm mm_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> qInBuf_;
@@ -1304,16 +1329,14 @@ private:
     AscendC::TBuf<AscendC::QuePosition::VECCALC> ctxBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> stateBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> reduceBuf_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> signBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> scaleIdxBuf_;
-    AscendC::GlobalTensor<scalar_t> queryGm_;
+    // fp32, not scalar_t: the query arrives pre-rotated.
+    AscendC::GlobalTensor<float> queryRotGm_;
     AscendC::GlobalTensor<int8_t> keyCacheGm_;
     AscendC::GlobalTensor<int8_t> valueCacheGm_;
     AscendC::GlobalTensor<float> scaleCacheGm_;
     AscendC::GlobalTensor<int32_t> blockTableGm_;
     AscendC::GlobalTensor<int32_t> contextLenGm_;
-    AscendC::GlobalTensor<float> piSignsGm_;
-    AscendC::GlobalTensor<int32_t> rotTablesGm_;
     AscendC::GlobalTensor<int32_t> modeTablesGm_;
     AscendC::GlobalTensor<float> workspaceGm_;
     // Descriptors and factors built once in Init; see the comment there.
@@ -1999,14 +2022,14 @@ private:
 
 #define TURBOQUANT_MM_DECODE_SPLIT_DECLARE(MODE_NAME, MODE, TYPE)                                                    \
     extern "C" __global__ __aicore__ void turboquant_mm_decode_split_##MODE_NAME##_##TYPE(                           \
-        GM_ADDR query, GM_ADDR keyCache, GM_ADDR valueCache, GM_ADDR scaleCache, GM_ADDR blockTables,                \
-        GM_ADDR contextLens, GM_ADDR piSigns, GM_ADDR rotTables, GM_ADDR modeTables, GM_ADDR workspace,              \
+        GM_ADDR queryRot, GM_ADDR keyCache, GM_ADDR valueCache, GM_ADDR scaleCache, GM_ADDR blockTables,             \
+        GM_ADDR contextLens, GM_ADDR modeTables, GM_ADDR workspace,                                                  \
         uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,           \
         uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t tasksPerCore, float scale, float invSqrtLen)          \
     {                                                                                                                \
         AscendC::TPipe pipe;                                                                                         \
         TurboQuantCubeDecodeSplit<MODE, TYPE> op(&pipe);                                                             \
-        op.Init(query, keyCache, valueCache, scaleCache, blockTables, contextLens, piSigns, rotTables, modeTables,   \
+        op.Init(queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables,                    \
                 workspace, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, scale,  \
                 invSqrtLen);                                                                                         \
         op.Process(tasksPerCore);                                                                                    \
@@ -2026,14 +2049,14 @@ TURBOQUANT_MM_DECLARE_MODE(kv5fp8, TurboQuantMode::KV5_FP8)
 // itself.  csrc/tests defines VLLM_ASCEND_TQ_DECODE_ABLATION; the wheel does not.
 #define TURBOQUANT_MM_DECODE_ABLATION_DECLARE(STAGE_NAME, STAGE)                                                   \
     extern "C" __global__ __aicore__ void turboquant_mm_decode_ablation_kv4fp8_##STAGE_NAME##_half(                \
-        GM_ADDR query, GM_ADDR keyCache, GM_ADDR valueCache, GM_ADDR scaleCache, GM_ADDR blockTables,                \
-        GM_ADDR contextLens, GM_ADDR piSigns, GM_ADDR rotTables, GM_ADDR modeTables, GM_ADDR workspace,              \
+        GM_ADDR queryRot, GM_ADDR keyCache, GM_ADDR valueCache, GM_ADDR scaleCache, GM_ADDR blockTables,             \
+        GM_ADDR contextLens, GM_ADDR modeTables, GM_ADDR workspace,                                                  \
         uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,           \
         uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t tasksPerCore, float scale, float invSqrtLen)          \
     {                                                                                                                \
         AscendC::TPipe pipe;                                                                                         \
         TurboQuantCubeDecodeSplit<TurboQuantMode::KV4_FP8, half, STAGE> op(&pipe);                                   \
-        op.Init(query, keyCache, valueCache, scaleCache, blockTables, contextLens, piSigns, rotTables, modeTables,   \
+        op.Init(queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables,                    \
                 workspace, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, scale,  \
                 invSqrtLen);                                                                                         \
         op.Process(tasksPerCore);                                                                                    \
@@ -2041,7 +2064,7 @@ TURBOQUANT_MM_DECLARE_MODE(kv5fp8, TurboQuantMode::KV5_FP8)
 
 TURBOQUANT_MM_DECODE_ABLATION_DECLARE(s0, DecodeAblationStage::STAGE_0_MTE2_ONLY)
 TURBOQUANT_MM_DECODE_ABLATION_DECLARE(s1, DecodeAblationStage::STAGE_1_UNPACK)
-TURBOQUANT_MM_DECODE_ABLATION_DECLARE(s2, DecodeAblationStage::STAGE_2_HADAMARD)
+TURBOQUANT_MM_DECODE_ABLATION_DECLARE(s2, DecodeAblationStage::STAGE_2_QUERY_PREP)
 TURBOQUANT_MM_DECODE_ABLATION_DECLARE(s3, DecodeAblationStage::STAGE_3_L1_STAGING)
 TURBOQUANT_MM_DECODE_ABLATION_DECLARE(s4, DecodeAblationStage::STAGE_4_SCORE_GEMM)
 #endif  // VLLM_ASCEND_TQ_DECODE_ABLATION
@@ -2122,9 +2145,9 @@ void turboquant_mm_reshape_and_cache_impl(int32_t mode, AscendType type, void *s
 // The split half of the Cube decode.  The combine is a separate launch on the
 // same stream, and it is the AIV-only one in turboquant_kernels.cpp: the
 // partials this writes are in exactly that reduction's layout.
-void turboquant_mm_decode_split_impl(int32_t mode, AscendType type, void *stream, uint32_t blockDim, void *query,
+void turboquant_mm_decode_split_impl(int32_t mode, AscendType type, void *stream, uint32_t blockDim, void *queryRot,
                                      void *keyCache, void *valueCache, void *scaleCache, void *blockTables,
-                                     void *contextLens, void *piSigns, void *rotTables, void *modeTables,
+                                     void *contextLens, void *modeTables,
                                      void *workspace, uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads,
                                      uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,
                                      uint32_t numSplits, uint32_t tasksPerCore, float scale, float invSqrtLen)
@@ -2135,19 +2158,19 @@ void turboquant_mm_decode_split_impl(int32_t mode, AscendType type, void *stream
     switch (static_cast<turboquant::TurboQuantMode>(mode)) {
         case turboquant::TurboQuantMode::KV3_FP4:
             turboquant_mm_decode_split_kv3fp4_half<<<blockDim, nullptr, stream>>>(
-                query, keyCache, valueCache, scaleCache, blockTables, contextLens, piSigns, rotTables, modeTables,
+                queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables,
                 workspace, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,
                 tasksPerCore, scale, invSqrtLen);
             break;
         case turboquant::TurboQuantMode::KV4_FP8:
             turboquant_mm_decode_split_kv4fp8_half<<<blockDim, nullptr, stream>>>(
-                query, keyCache, valueCache, scaleCache, blockTables, contextLens, piSigns, rotTables, modeTables,
+                queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables,
                 workspace, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,
                 tasksPerCore, scale, invSqrtLen);
             break;
         default:
             turboquant_mm_decode_split_kv5fp8_half<<<blockDim, nullptr, stream>>>(
-                query, keyCache, valueCache, scaleCache, blockTables, contextLens, piSigns, rotTables, modeTables,
+                queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables,
                 workspace, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,
                 tasksPerCore, scale, invSqrtLen);
             break;
@@ -2158,9 +2181,10 @@ void turboquant_mm_decode_split_impl(int32_t mode, AscendType type, void *stream
 // The kv4fp8 split cut at `stage`.  The host validates the stage with
 // DecodeAblationStageIsValid; anything else launches the full pipeline, which is
 // the same fallback the mode dispatch above makes.
-void turboquant_mm_decode_ablation_impl(int32_t stage, AscendType type, void *stream, uint32_t blockDim, void *query,
+void turboquant_mm_decode_ablation_impl(int32_t stage, AscendType type, void *stream, uint32_t blockDim,
+                                        void *queryRot,
                                         void *keyCache, void *valueCache, void *scaleCache, void *blockTables,
-                                        void *contextLens, void *piSigns, void *rotTables, void *modeTables,
+                                        void *contextLens, void *modeTables,
                                         void *workspace, uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads,
                                         uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,
                                         uint32_t numSplits, uint32_t tasksPerCore, float scale, float invSqrtLen)
@@ -2171,37 +2195,37 @@ void turboquant_mm_decode_ablation_impl(int32_t stage, AscendType type, void *st
     switch (static_cast<turboquant::DecodeAblationStage>(stage)) {
         case turboquant::DecodeAblationStage::STAGE_0_MTE2_ONLY:
             turboquant_mm_decode_ablation_kv4fp8_s0_half<<<blockDim, nullptr, stream>>>(
-                query, keyCache, valueCache, scaleCache, blockTables, contextLens, piSigns, rotTables, modeTables,
+                queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables,
                 workspace, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,
                 tasksPerCore, scale, invSqrtLen);
             break;
         case turboquant::DecodeAblationStage::STAGE_1_UNPACK:
             turboquant_mm_decode_ablation_kv4fp8_s1_half<<<blockDim, nullptr, stream>>>(
-                query, keyCache, valueCache, scaleCache, blockTables, contextLens, piSigns, rotTables, modeTables,
+                queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables,
                 workspace, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,
                 tasksPerCore, scale, invSqrtLen);
             break;
-        case turboquant::DecodeAblationStage::STAGE_2_HADAMARD:
+        case turboquant::DecodeAblationStage::STAGE_2_QUERY_PREP:
             turboquant_mm_decode_ablation_kv4fp8_s2_half<<<blockDim, nullptr, stream>>>(
-                query, keyCache, valueCache, scaleCache, blockTables, contextLens, piSigns, rotTables, modeTables,
+                queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables,
                 workspace, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,
                 tasksPerCore, scale, invSqrtLen);
             break;
         case turboquant::DecodeAblationStage::STAGE_3_L1_STAGING:
             turboquant_mm_decode_ablation_kv4fp8_s3_half<<<blockDim, nullptr, stream>>>(
-                query, keyCache, valueCache, scaleCache, blockTables, contextLens, piSigns, rotTables, modeTables,
+                queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables,
                 workspace, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,
                 tasksPerCore, scale, invSqrtLen);
             break;
         case turboquant::DecodeAblationStage::STAGE_4_SCORE_GEMM:
             turboquant_mm_decode_ablation_kv4fp8_s4_half<<<blockDim, nullptr, stream>>>(
-                query, keyCache, valueCache, scaleCache, blockTables, contextLens, piSigns, rotTables, modeTables,
+                queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables,
                 workspace, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,
                 tasksPerCore, scale, invSqrtLen);
             break;
         default:
             turboquant_mm_decode_split_kv4fp8_half<<<blockDim, nullptr, stream>>>(
-                query, keyCache, valueCache, scaleCache, blockTables, contextLens, piSigns, rotTables, modeTables,
+                queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables,
                 workspace, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,
                 tasksPerCore, scale, invSqrtLen);
             break;

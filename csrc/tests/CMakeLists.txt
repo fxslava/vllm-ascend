@@ -675,6 +675,11 @@ if(VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE)
     set(VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE
         "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/turboquant_kernels.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/turboquant_mm_kernels.cpp"
+        # The standalone query rotation both decode paths now depend on. In the
+        # wheel it sits beside turboquant_kernels.cpp in the same library, for
+        # the same reason the two above share one: a <<<>>> call site can only
+        # reach a launcher generated into the library it links.
+        "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/turboquant_rotate_q.cpp"
         # Test-owned device code, and the one source in this list the wheel does
         # not build - the root CMakeLists.txt names only the two above. It is an
         # exploratory spike (a Cube-factorised Walsh-Hadamard, see its header)
