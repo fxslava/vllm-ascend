@@ -27,7 +27,7 @@
 //
 //   stage0_mte2         packed K/V and scale tiles, GM -> UB (CopyInTile)
 //   stage1_unpack       + UnpackAffine onto the fp8 grid, in UB
-//   stage2_hadamard     + the query: GM read, cast, Pi rotation, operand cast
+//   stage2_query_prep   + the query: pre-rotated GM read, amax, operand cast
 //   stage3_l1_staging   + every V -> MTE3 edge and UB -> L1 copy
 //   stage4_score_gemm   + MTE1 Load2D, Q . K^T Mmad, Fixpipe to UB, handshake
 //   stage5_full         + online softmax, P . V GEMM, accumulator, GM writeback
@@ -382,6 +382,10 @@ class AblationScenario {
         std::vector<int32_t>(static_cast<size_t>(kQueryTokens), static_cast<int32_t>(context_len)),
         kBenchmarkAlignBytes);
     pi_signs_ = DeviceBuffer::FromHost(tqh::PiSigns(head_size), kBenchmarkAlignBytes);
+    h16_ = DeviceBuffer::FromHost(tqh::Hadamard16Half(), kBenchmarkAlignBytes);
+    query_rot_ = DeviceBuffer::Empty<float>(static_cast<size_t>(kQueryTokens * kNumHeads * head_size),
+                                            kBenchmarkAlignBytes);
+    aiv_num_ = aiv_num;
 
     // The rotation image is the shipping 4-bit codec's; the two mode images are
     // a single zero block each, because the affine codec reads no table.
@@ -418,11 +422,28 @@ class AblationScenario {
     workspace_ = DeviceBuffer::FromHost(std::vector<float>(decode_grid_.workspace_floats, 0.0f), kBenchmarkAlignBytes);
   }
 
+  /*
+   * The query rotation, once, outside every timed rung.
+   *
+   * It is deliberately NOT part of EnqueueSplit: every rung consumes the same
+   * pre-rotated query, so no rung's delta carries any of it and the waterfall
+   * measures only what the split kernel itself does. What used to be stage 2's
+   * bulk is now this call, and pricing it is the rotate benchmark's job.
+   */
+  void RotateQueryOnce(aclrtStream stream) {
+    rotate_plan_ = tqh::RotateQuery(stream, AscendType::FP16, query_.get(), pi_signs_.get(), h16_.get(),
+                                    rot_tables_.get(), query_rot_.get(), kQueryTokens, kNumHeads, head_size_,
+                                    aiv_num_, /*input_exact_in_half=*/true);
+    ACL_CHECK(aclrtSynchronizeStream(stream));
+  }
+
+  const vllm_ascend::turboquant::RotateQPlan& rotate_plan() const { return rotate_plan_; }
+
   void EnqueueSplit(tqm::DecodeAblationStage stage, aclrtStream stream) const {
     turboquant_mm_decode_ablation_impl(
-        static_cast<int32_t>(stage), AscendType::FP16, stream, decode_grid_.split_block_dim, query_.get(),
+        static_cast<int32_t>(stage), AscendType::FP16, stream, decode_grid_.split_block_dim, query_rot_.get(),
         key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
-        pi_signs_.get(), rot_tables_.get(), decode_tables_.get(), workspace_.get(), U32(kQueryTokens),
+        decode_tables_.get(), workspace_.get(), U32(kQueryTokens),
         U32(kNumHeads), U32(kNumKvHeads), U32(head_size_), U32(kBlockSize), U32(blocks_per_seq_),
         U32(decode_grid_.num_splits), decode_grid_.split_tasks_per_core, attention_scale_, attention_scale_);
   }
@@ -473,10 +494,13 @@ class AblationScenario {
   std::vector<float> key_host_, value_host_, query_host_;
 
   DeviceBuffer key_, value_, query_, slots_, block_tables_, context_lens_, pi_signs_;
+  DeviceBuffer h16_, query_rot_;
   DeviceBuffer rot_tables_, write_tables_, decode_tables_;
   DeviceBuffer key_cache_, value_cache_, scale_plane_, workspace_, out_;
   tqh::ReshapeAndCacheGrid write_grid_;
   tqh::CubeDecodeGrid decode_grid_;
+  vllm_ascend::turboquant::RotateQPlan rotate_plan_;
+  int64_t aiv_num_ = 1;
 };
 
 // What the waterfall needs to say about a shape beyond its latencies.
@@ -526,6 +550,9 @@ ShapeOutcome RunShape(BenchmarkRunner& runner, int64_t aiv_num, const std::vecto
   try {
     scenario.reset(new AblationScenario(verdict->head_size, verdict->context_len, aiv_num));
     scenario->FillCache(runner.stream());
+    // Once, before any rung: every stage reads the same rotated query, so the
+    // waterfall's deltas are the split kernel's alone.
+    scenario->RotateQueryOnce(runner.stream());
   } catch (const std::exception& error) {
     for (const tqm::DecodeAblationStage stage : stages) {
       runner.RecordFailure(CaseName(shape, stage), std::string("setup failed: ") + error.what());
@@ -763,7 +790,7 @@ void PrintBanner(const std::vector<int64_t>& head_sizes, const std::vector<int64
   std::printf("[ascend-bench]   %-18s + affine unpack onto the fp8 grid\n",
               tqm::DecodeAblationStageName(tqm::DecodeAblationStage::STAGE_1_UNPACK));
   std::printf("[ascend-bench]   %-18s + query read, Pi rotation, operand cast (per task, not per tile)\n",
-              tqm::DecodeAblationStageName(tqm::DecodeAblationStage::STAGE_2_HADAMARD));
+              tqm::DecodeAblationStageName(tqm::DecodeAblationStage::STAGE_2_QUERY_PREP));
   std::printf("[ascend-bench]   %-18s + V -> MTE3 edges and UB -> L1 copies\n",
               tqm::DecodeAblationStageName(tqm::DecodeAblationStage::STAGE_3_L1_STAGING));
   std::printf("[ascend-bench]   %-18s + Load2D, Q.K^T Mmad, Fixpipe to UB, AIV/AIC handshake\n",

@@ -53,6 +53,7 @@ csrc/tests/
 |   `-- test_host_turboquant_fidelity.cpp
 |
 |-- sim/                    TIER 2 -- CAModel only; links libruntime_camodel.so
+|   |-- test_sim_950pr_turboquant_rotate_q.cpp    the standalone query rotation, both paths
 |   |-- test_sim_950pr_turboquant_kernels.cpp
 |   |-- test_sim_950pr_turboquant_decode.cpp
 |   |-- test_sim_950pr_cube_hadamard.cpp          spike: one shape of the sweep below

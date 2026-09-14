@@ -19,6 +19,7 @@
 #include <acl/acl.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 #include "../reference/turbo_quant_cpu.h"
@@ -341,6 +342,33 @@ CubeDecodeGrid PlanCubeDecode(int64_t num_tokens, int64_t num_heads, int64_t num
   grid.split_block_dim = static_cast<uint32_t>(CeilDiv(split_tasks, split_tasks_per_core));
   grid.combine_block_dim = static_cast<uint32_t>(CeilDiv(combine_tasks, combine_tasks_per_core));
   return grid;
+}
+
+std::vector<uint16_t> Hadamard16Half() {
+  std::vector<uint16_t> h(static_cast<size_t>(vllm_ascend::turboquant::kRotateQH16Elements));
+  vllm_ascend::turboquant::FillHadamard16Half(h.data());
+  return h;
+}
+
+vllm_ascend::turboquant::RotateQPlan RotateQuery(void *stream, AscendType type, void *query, void *pi_signs,
+                                                 void *h16, void *rot_tables, void *query_rot, int64_t num_tokens,
+                                                 int64_t num_heads, int64_t head_size, int64_t aiv_num,
+                                                 bool input_exact_in_half) {
+  // MIX blocks, not vector cores: arch35 pairs one cube core with two vector
+  // subcores, and blockDim on a MIX launch counts the pairs. Mirrors the same
+  // halving in npu_turboquant_rotate_q.
+  int64_t core_num = aiv_num / 2;
+  if (core_num < 1) {
+    core_num = 1;
+  }
+  const int64_t num_vectors = num_tokens * num_heads;
+  const vllm_ascend::turboquant::RotateQPlan plan =
+      vllm_ascend::turboquant::PlanRotateQ(num_vectors, head_size, core_num, input_exact_in_half);
+  const float inv_sqrt_len = 1.0f / std::sqrt(static_cast<float>(head_size));
+  turboquant_rotate_q_impl(type, stream, plan.block_dim, plan.use_cube, query, pi_signs, h16, rot_tables, query_rot,
+                           static_cast<uint32_t>(num_vectors), static_cast<uint32_t>(head_size),
+                           plan.vectors_per_block, plan.vectors_per_chunk, plan.variant, inv_sqrt_len);
+  return plan;
 }
 
 }  // namespace turboquant_host

@@ -461,6 +461,23 @@ TEST(TurboQuantDecodeAblation, CutStagesExitCleanOnTheCamodel) {
 
   const std::vector<float> reference = HostAttention(context_len, query, key, value);
 
+  // The rotation is outside the ladder: every rung consumes the same
+  // pre-rotated query, so no rung's delta carries any part of it. That is the
+  // change this ladder now measures the absence of -- stage 2 used to be the
+  // Pi transform and is now the read and the operand scaling alone.
+  DeviceBuffer h16 = DeviceBuffer::FromHost(tqh::Hadamard16Half());
+  DeviceBuffer query_rot = DeviceBuffer::Empty<float>(static_cast<size_t>(kBatch) * kNumHeads * kHeadSize);
+  watchdog.Arm("the query rotation");
+  const vllm_ascend::turboquant::RotateQPlan rotate_plan =
+      tqh::RotateQuery(stream, AscendType::FP16, query_dev.get(), pi_signs.get(), h16.get(), rot_tables.get(),
+                       query_rot.get(), kBatch, kNumHeads, kHeadSize, aiv_num, /*input_exact_in_half=*/true);
+  ACL_CHECK(aclrtSynchronizeStream(stream));
+  watchdog.Disarm();
+  std::printf("[ ablation ] query rotated once for every stage: %s path, %u blocks x %u vectors, chunk %u\n",
+              rotate_plan.use_cube ? "cube" : "aiv", rotate_plan.block_dim, rotate_plan.vectors_per_block,
+              rotate_plan.vectors_per_chunk);
+  std::fflush(stdout);
+
   for (const tqm::DecodeAblationStage stage : stages) {
     const std::string name = tqm::DecodeAblationStageName(stage);
     const bool full = stage == tqm::DecodeAblationStage::STAGE_5_FULL_PIPELINE;
@@ -475,9 +492,9 @@ TEST(TurboQuantDecodeAblation, CutStagesExitCleanOnTheCamodel) {
     clock = std::chrono::steady_clock::now();
     watchdog.Arm(name);
     turboquant_mm_decode_ablation_impl(
-        static_cast<int32_t>(stage), AscendType::FP16, stream, grid.split_block_dim, query_dev.get(),
+        static_cast<int32_t>(stage), AscendType::FP16, stream, grid.split_block_dim, query_rot.get(),
         key_cache.get(), value_cache.get(), scale_plane.get(), block_table_dev.get(), context_dev.get(),
-        pi_signs.get(), rot_tables.get(), decode_tables.get(), workspace.get(), static_cast<uint32_t>(kBatch),
+        decode_tables.get(), workspace.get(), static_cast<uint32_t>(kBatch),
         static_cast<uint32_t>(kNumHeads), static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize),
         static_cast<uint32_t>(kBlockSize), static_cast<uint32_t>(blocks_per_seq),
         static_cast<uint32_t>(grid.num_splits), grid.split_tasks_per_core, kAttentionScale, kInvSqrtHeadSize);

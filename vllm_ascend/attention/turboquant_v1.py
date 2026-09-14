@@ -106,6 +106,12 @@ TURBOQUANT_LLOYD_MAX_THRESHOLDS = (
 
 _PI_SIGN_CACHE: dict[tuple[int, str], torch.Tensor] = {}
 _CODEC_TABLE_CACHE: dict[tuple[int, int, str], torch.Tensor] = {}
+_HADAMARD16_CACHE: dict[str, torch.Tensor] = {}
+
+# Order of the constant matrix the Cube rotation path multiplies by, and the
+# Cube's fractal quantum. Mirrors kRotateQTile in
+# csrc/attention/turboquant/turboquant_rotate_q.h.
+TURBOQUANT_ROTATE_TILE = 16
 
 # Distinct decode shapes whose workspace size is remembered before the memo is
 # dropped; see AscendTurboQuantAttentionBackendImpl._decode_workspace.
@@ -178,6 +184,35 @@ def apply_pi(x: torch.Tensor, pi_signs: torch.Tensor) -> torch.Tensor:
     Pi is its own inverse, so this is both the rotation and the un-rotation.
     """
     return walsh_hadamard(x * pi_signs, dim=-1) * pi_signs
+
+
+def turboquant_hadamard16(device: torch.device) -> torch.Tensor:
+    """Return the 16x16 fp16 Hadamard constant the Cube rotation path uses.
+
+    ``H[i][j] = (-1) ** popcount(i & j)``: Sylvester's construction, symmetric,
+    holding only +-1 -- both exactly representable in fp16, so the Cube stage of
+    the rotation contributes no arithmetic error of its own.
+
+    Sylvester also factorises the transform. For ``D = 16 R`` the butterfly
+    stages of stride 1, 2, 4 and 8 are exactly a right multiply by this matrix,
+    whatever ``D`` is, so four stages of the query's rotation collapse into a
+    single Mmad and only the ``log2(R)`` whole-row stages above stride 8 stay on
+    the vector unit.  Mirrors ``FillHadamard16Half`` in
+    ``csrc/attention/turboquant/turboquant_rotate_q.h``.
+    """
+    key = str(device)
+    cached = _HADAMARD16_CACHE.get(key)
+    if cached is not None:
+        return cached
+    rows = []
+    for i in range(TURBOQUANT_ROTATE_TILE):
+        rows.append([
+            -1.0 if bin(i & j).count("1") & 1 else 1.0
+            for j in range(TURBOQUANT_ROTATE_TILE)
+        ])
+    matrix = torch.tensor(rows, dtype=torch.float16, device=device)
+    _HADAMARD16_CACHE[key] = matrix
+    return matrix
 
 
 def turboquant_scale_slot(num_kv_heads: int) -> int:
@@ -306,6 +341,11 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         # mark and then reused forever; see _decode_workspace.
         self.decode_workspace: torch.Tensor | None = None
         self._workspace_floats: dict[tuple[int, int], int] = {}
+        # fp32 [num_tokens, num_heads, head_size] landing buffer for the
+        # pre-rotated query, grown to a high-water mark like the workspace above
+        # and for the same reason; see _rotated_query.
+        self.rotated_query: torch.Tensor | None = None
+        self._hadamard16: torch.Tensor | None = None
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
         # Nothing is folded into the weights: q_proj, k_proj, v_proj and o_proj
@@ -316,7 +356,10 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         # behind it is only ever paid on this first call -- here, rather than on
         # a decode step or, worse, inside a graph capture.
         torch.ops._C_ascend.npu_turboquant_vector_core_num()
-        logger.info_once("[vllm-ascend/turboquant] 4-bit KV cache active; Pi is applied at runtime in the kernel")
+        logger.info_once(
+            "[vllm-ascend/turboquant] 4-bit KV cache active; Pi is applied at runtime -- "
+            "to K/V on the write path, and to Q in npu_turboquant_rotate_q before each decode"
+        )
 
     def pi_signs(self, device: torch.device) -> torch.Tensor:
         if self._pi_signs is None:
@@ -325,6 +368,11 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
 
     def codec_tables(self, device: torch.device, batch_rows: int) -> torch.Tensor:
         return turboquant_codec_tables(self.head_size, batch_rows, device)
+
+    def hadamard16(self, device: torch.device) -> torch.Tensor:
+        if self._hadamard16 is None:
+            self._hadamard16 = turboquant_hadamard16(device)
+        return self._hadamard16
 
     def _ensure_scale_cache(self, kv_cache: tuple[torch.Tensor, ...]) -> None:
         """Allocate the fp32 scale plane that accompanies the packed cache.
@@ -443,6 +491,36 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         self.decode_workspace = torch.empty(needed, dtype=torch.float32, device=device)
         return self.decode_workspace
 
+    def _rotated_query(self, num_tokens: int, device: torch.device) -> torch.Tensor:
+        """Return the fp32 buffer ``npu_turboquant_rotate_q`` writes into.
+
+        The rotation used to happen inside the decode split, once per
+        ``(token, kv_head, sequence split)`` and again per query head of the
+        group.  It now happens once per ``(token, head)`` in its own operator,
+        which needs somewhere to put the result.
+
+        Persistent for exactly the reason ``decode_workspace`` is: a graph
+        replays the addresses it was captured with, so a fresh allocation on
+        every decode step would both cost an allocation and make the operator
+        uncapturable.  The requirement is monotonic in ``num_tokens`` -- unlike
+        the workspace's, which is not -- so growing it can only ever happen on
+        the way up.
+        """
+        needed = num_tokens * self.num_heads * self.head_size
+        buffer = self.rotated_query
+        if buffer is not None and buffer.numel() >= needed:
+            return buffer[:needed].view(num_tokens, self.num_heads, self.head_size)
+
+        if _is_capturing():
+            raise RuntimeError(
+                "[vllm-ascend/turboquant] the rotated-query buffer would have to grow to "
+                f"{needed} float32 words during a graph capture (num_tokens={num_tokens}). "
+                "Run this shape once outside capture so the buffer is sized first."
+            )
+
+        self.rotated_query = torch.empty(needed, dtype=torch.float32, device=device)
+        return self.rotated_query.view(num_tokens, self.num_heads, self.head_size)
+
     def forward_paged_attention(
         self,
         query: torch.Tensor,
@@ -451,16 +529,32 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
         num_tokens = query.shape[0]
-        # Post-RoPE query.  The kernel rotates it, runs softmax and the value
-        # accumulation in the rotated basis, and applies Pi once more on output.
-        # Two kernels behind one op: the split stage writes per-sequence-split
-        # partials into the persistent workspace, the combine stage reduces
-        # them. They are separate launches ordered by the stream because no
-        # in-kernel barrier orders an arbitrary grid; see
-        # npu_turboquant_paged_attention in the adapter header.
+        # Post-RoPE query.  Three launches, ordered by the stream.
+        #
+        #   1. rotate_q writes q~ = Pi q, once per (token, head).  It used to
+        #      live inside the split kernel, which ran it once per
+        #      (token, kv_head, sequence split) and again per query head -- so
+        #      at eight sequence splits the same transform ran eight times over.
+        #   2. the split stage runs softmax and the value accumulation in the
+        #      rotated basis and writes per-sequence-split partials into the
+        #      persistent workspace.  It applies no rotation at all now.
+        #   3. the combine stage reduces them and applies Pi once more on the
+        #      output, which is where the un-rotation has always been.
+        #
+        # 2 and 3 are separate launches because no in-kernel barrier orders an
+        # arbitrary grid; 1 is separate for the same reason, and because its
+        # grid is a function of B * H_Q rather than of the paging.
+        rotated_query = self._rotated_query(num_tokens, query.device)
+        torch.ops._C_ascend.npu_turboquant_rotate_q(
+            query[:num_tokens],
+            self.pi_signs(query.device),
+            self.codec_tables(query.device, 1),
+            self.hadamard16(query.device),
+            rotated_query,
+        )
         block_tables = attn_metadata.block_tables.to(torch.int32)
         torch.ops._C_ascend.npu_turboquant_paged_attention(
-            query[:num_tokens],
+            rotated_query,
             self.key_cache,
             self.value_cache,
             self.scale_cache,

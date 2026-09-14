@@ -55,6 +55,11 @@ set(VLLM_ASCEND_SIM_TESTS
   # lower four butterfly stages are one Cube Mmad. Drives its own kernel source
   # (sim_hadamard_hybrid_kernels.cpp in this directory), not the decode's.
   test_sim_950pr_cube_hadamard
+  # The standalone query rotation, both dispatch paths, against the CPU
+  # reference. No decode in it, so it is seconds to a minute -- and it is the
+  # gate on everything below, because the decode kernels no longer contain a
+  # Walsh-Hadamard transform to be wrong.
+  test_sim_950pr_turboquant_rotate_q
   test_sim_950pr_turboquant_kernels
   test_sim_950pr_turboquant_decode
   # Single-shot dispatch + fidelity smoke of the Cube-native multi-mode decode.

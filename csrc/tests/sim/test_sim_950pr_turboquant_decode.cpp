@@ -239,6 +239,11 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
   DeviceBuffer context_lens_dev =
       DeviceBuffer::FromHost(std::vector<int32_t>{static_cast<int32_t>(kContextLen)});
   DeviceBuffer pi_signs_dev = DeviceBuffer::FromHost(tqh::PiSigns(kHeadSize));
+  DeviceBuffer h16_dev = DeviceBuffer::FromHost(tqh::Hadamard16Half());
+  // The rotated query the split kernel now reads instead of rotating for
+  // itself. fp32, same element count as the query.
+  DeviceBuffer query_rot_dev =
+      DeviceBuffer::Empty<float>(static_cast<size_t>(kQueryTokens * kNumHeads * kHeadSize));
 
   // The write path expands one vector per call and the decode path expands a
   // kTileRows tile; their table images differ and are not interchangeable.
@@ -273,8 +278,13 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
   // in-kernel barrier only orders co-resident blocks - so stream order is the
   // barrier, and the single synchronise below covers both.
   const double decode_ms = TimeMs([&] {
+    // Three launches on one stream now: the rotation, then the split, then the
+    // combine. The rotation has to come first and stream order is what says so.
+    tqh::RotateQuery(stream, AscendType::FP16, query_dev.get(), pi_signs_dev.get(), h16_dev.get(),
+                     write_tables_dev.get(), query_rot_dev.get(), kQueryTokens, kNumHeads, kHeadSize, aiv_num,
+                     /*input_exact_in_half=*/true);
     turboquant_paged_attention_impl(
-        AscendType::FP16, stream, decode_grid.split_block_dim, decode_grid.combine_block_dim, query_dev.get(),
+        AscendType::FP16, stream, decode_grid.split_block_dim, decode_grid.combine_block_dim, query_rot_dev.get(),
         key_cache_dev.get(), value_cache_dev.get(), scale_plane_dev.get(), block_table_dev.get(),
         context_lens_dev.get(), pi_signs_dev.get(), decode_tables_dev.get(), workspace_dev.get(),
         quantised_out_dev.get(), static_cast<uint32_t>(kQueryTokens), static_cast<uint32_t>(kNumHeads),

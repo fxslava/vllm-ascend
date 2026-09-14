@@ -85,8 +85,12 @@ endif()
 if(SOC_VERSION MATCHES "ascend910b.*|ascend910_93|ascend950")
     set(VLLM_ASCEND_BUILD_TURBOQUANT ON)
     message(STATUS "Hardware ${SOC_VERSION} detected: building TurboQuant KV cache kernels")
+    # Two sources, one library: a <<<>>> call site can only reach a kernel whose
+    # generated launcher is in the same ascendc_library, and the decode operator
+    # launches both the split/combine kernels and the query rotation.
     ascendc_library(vllm_ascend_turboquant SHARED
         ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/turboquant_kernels.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/turboquant_rotate_q.cpp
     )
 else()
     set(VLLM_ASCEND_BUILD_TURBOQUANT OFF)

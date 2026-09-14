@@ -298,10 +298,17 @@ enum class DecodeAblationStage : int32_t {
     STAGE_0_MTE2_ONLY = 0,
     // + the affine unpack onto the fp8 grid, in UB.
     STAGE_1_UNPACK = 1,
-    // + the query's GM read, cast, Pi rotation and operand cast.  Once per
-    // task, not per tile: the cache is stored rotated, so the split kernel's
-    // only Walsh-Hadamard is the query's.
-    STAGE_2_HADAMARD = 2,
+    // + the query's GM read, its amax and operand scaling, and the operand
+    // cast.  Once per task, not per tile.
+    //
+    // It was STAGE_2_HADAMARD, and the Pi rotation was the bulk of it.  The
+    // rotation now runs in npu_turboquant_rotate_q, once per (token, head)
+    // rather than once per (token, kv_head, split) and head, so what is left in
+    // this rung is the read and the scaling.  The value is unchanged because it
+    // crosses the launch boundary and because keeping it makes the benchmark's
+    // waterfall comparable across the refactor -- which is the point of timing
+    // it at all.
+    STAGE_2_QUERY_PREP = 2,
     // + every V -> MTE3 edge and UB -> L1 copy, K/V tiles and the query.
     STAGE_3_L1_STAGING = 3,
     // + MTE1 load, the score Mmad and its Fixpipe, with the AIV/AIC handshake.
@@ -324,8 +331,8 @@ inline const char *DecodeAblationStageName(DecodeAblationStage stage)
             return "stage0_mte2";
         case DecodeAblationStage::STAGE_1_UNPACK:
             return "stage1_unpack";
-        case DecodeAblationStage::STAGE_2_HADAMARD:
-            return "stage2_hadamard";
+        case DecodeAblationStage::STAGE_2_QUERY_PREP:
+            return "stage2_query_prep";
         case DecodeAblationStage::STAGE_3_L1_STAGING:
             return "stage3_l1_staging";
         case DecodeAblationStage::STAGE_4_SCORE_GEMM:
