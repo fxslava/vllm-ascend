@@ -180,7 +180,8 @@ struct TurboQuantModeTraits<TurboQuantMode::KV4_FP8> {
     // cast onto the operand grid is lossless and the step lives entirely in
     // kGain.  The table is kept because the host mirror and the distortion
     // figure are quoted against it; the device does NOT read it -- see
-    // TurboQuantModeCodec::UnpackAffine, where the whole expand is one Adds.
+    // TurboQuantModeCodec::UnpackAffine, which stores q - 8 as a signed nibble
+    // and reconstructs the level with one Adds.
     static constexpr float kCentroids[kLevels] = {
         -7.5000000000f, -6.5000000000f, -5.5000000000f, -4.5000000000f,
         -3.5000000000f, -2.5000000000f, -1.5000000000f, -0.5000000000f,

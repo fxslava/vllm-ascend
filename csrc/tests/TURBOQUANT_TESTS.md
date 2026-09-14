@@ -947,8 +947,9 @@ each rather than full-length buffers — three tables become 24 words.
 **`kv4fp8` no longer shares that packer.** Its two digits per byte are the
 coordinates `b` and `b + d/2` rather than `2b` and `2b + 1` — a plane split, not
 an interleave — which is what makes both nibble planes contiguous runs and lets
-the expand be two integer shifts over the whole run instead of a lane-indexed
-Gather. §13.10 is the whole of that change.
+the expand be the vector unit's signed-nibble converter plus one `DeInterleave`
+over the whole run instead of a lane-indexed Gather. §13.9 is the whole of that
+change.
 
 ### 13.3 The codebooks, and why there is a gain
 
@@ -1458,10 +1459,12 @@ not downstream:
 
 1. **The packing is plane-split.** Byte `b` of a slot holds coordinates `b` and
    `b + d/2`, not `2b` and `2b + 1`. An interleaved pair needs a stride-2 scatter
-   to separate, and AscendC has no element-stride-2 vector move — `blkStride`
+   to separate, and `DataCopy` has no element-stride-2 move — `blkStride`
    counts 32-byte blocks — which is exactly why the old layout needed a Gather.
-   Split by plane, both nibble planes are contiguous runs and the split is
-   `>> 4` and `(x << 28) >> 28` on a `uint32` view of the run.
+   Split by plane, both nibble planes are contiguous runs. The split was first
+   `>> 4` and `(x << 28) >> 28` on a `uint32` view of the run; it is now the
+   `int4x2` converter plus a vector `DeInterleave` — see the update at the end
+   of this section.
 2. **`CopyInTile` reads the tile group-major.** The tile lands in UB as
    `[group][row][32]` instead of `[row][group][32]`, one `DataCopy` per 32-byte
    column-group across all 64 rows. Group `g` carries coordinates `[32g, 32g+32)`
@@ -1505,6 +1508,47 @@ headroom did not justify.
 **The codebook modes are untouched.** `kv3fp4` and `kv5fp8` keep the interleaved
 packing, the two Gathers and the strided band staging; `CopyInTile` and
 `UnpackToL1` branch on `TurboQuantModeTraits::kIsAffine`.
+
+**Update 2026-09-14 — signed `int4x2` nibbles, and an eight-instruction expand.**
+The ablation ladder put `stage1_unpack` at about 30% of the decode, so the
+shift chain above was replaced. No DMA engine can do this instead: MTE1, MTE2 and
+MTE3 only move bytes, and CANN's 4-bit DMA overloads re-type `fp4x2` as a B8 or
+B16 container. What arch35 does have is on the vector unit:
+
+- `Cast<half, int4b_t>` — a `UNPK4_B8` load plus `vcvt_s42f16`, a **signed**
+  nibble expand — and its inverse `Cast<int4b_t, half>`;
+- a public `DeInterleave` / `Interleave` for half, which is the element-stride-2
+  move the plane split was avoiding.
+
+So a nibble now stores `s = q − 8` in two's complement instead of the unsigned
+`q` under a −128 byte bias, and the expand is `s + 0.5`. The levels are the same
+sixteen, so `kGain`, the scale plane and everything after the unpack are
+unchanged. The packing is still plane-split, so `CopyInTile`'s group-major read
+and `UnpackToL1`'s flat copies are unchanged too.
+
+| | vector instructions per chunk | bytes written per packed byte | UB |
+|---|---|---|---|
+| shift chain (13.9 above) | 13 | 44 | `expand_` + `msb_` |
+| `int4x2` + `DeInterleave` | 8 | 26 | the same two buffers |
+
+The encoder's `PackAffinePlane` is four instructions: `Adds(−8)`, a cast to half,
+`Interleave`, and the cast to `int4b_t`. Pack and unpack go through the same
+converter pair, so which nibble of a byte is lane 0 — the headers do not say —
+cannot disagree between them. No host code reads `kv4fp8` bytes; the `−128`
+references elsewhere in `csrc/tests` are the AIV-only `tq4` cache, which is a
+separate codec and still unsigned.
+
+**A cache written before this change decodes wrong, silently:** the byte layout is
+the same, only the nibble meaning changed. There is no persisted `kv4fp8` cache
+to migrate, but a device run that reuses a pre-change cache image will read
+garbage without faulting.
+
+**A trap found while doing this:** an unsupported AscendC `Cast` pair compiles
+clean and emits no instruction, because `ASCENDC_ASSERT` is empty in a device
+build (`impl/basic_api/kernel_log.h`). Probes for `fp32 ← int4` and
+`fp8 ← half` both compiled. Check a new pair against the tuple table in
+`dav_3510/kernel_operator_vec_vconv_impl.h::CastImpl`, and the object for a
+`CastIntrinsicsImplVF<dst, src>` symbol, never against the compiler alone.
 
 ### 13.10 The device validation matrix
 
