@@ -1,6 +1,4 @@
-previous kv4fp8
-
-o60133706@ubuntu:~/vllm-ascend$ ~/vllm-ascend/build/csrc-tests-npu/device/bench_device_950pr_turboquant
+~/vllm-ascend/build/csrc-tests-npu/device/bench_device_950pr_turboquant
 [ascend-bench] vllm-ascend Ascend 950PR kernel microbenchmarks (no Python, no torch)
 [ascend-bench] device 0 ready, soc='Ascend950PR_9589'
 [ascend-bench] TurboQuant decode: vector cores = 64 (from aclGetDeviceCapability)
@@ -14,18 +12,72 @@ o60133706@ubuntu:~/vllm-ascend$ ~/vllm-ascend/build/csrc-tests-npu/device/bench_
 [ascend-bench]   aclnnFusedInferAttentionScore is not used: V1..V4 are withdrawn on an
 [ascend-bench]   Ascend950 (status 361001) and V5 has never been planned on hardware, so a
 [ascend-bench]   baseline resting on either would print an empty column. See this file's header.
+[ascend-bench] S=64: no stock operator baseline -- aclnnFusedInferAttentionScoreV5: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV5GetWorkspaceSize failed with status 561002
+  CANN: [PID: 1335049] 2026-09-14-15:12:52.070.072 Invalid_Argument(EZ0026): Parameter pse_type of FusedInferAttentionScore has incorrect value 1. Reason: The value of pse_type must be 0.
+        Solution: Check whether the parameter value is correct.
+TraceBack (most recent call last):
+        Failed to execute operator FusedInferAttentionScore_0. Reason: Failed to execute tiling function.
+        Check NnopbaseExecutorDoTiling(executor) failed
+        Check NnopbaseExecutorTilingAndUpdateBinInfo(executor) failed
+        Check NnopbaseExecutorMatchCache(executor) failed
+        Check NnopbaseRunForWorkspace(*executor, workspaceSize) failed
+; aclnnFusedInferAttentionScoreV2: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV2GetWorkspaceSize failed with status 361001
+  CANN: [PID: 1335049] 2026-09-14-15:12:52.070.609 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
+        Solution: In this scenario, collect the plog when the fault occurs and locate the fault based on the plog.
+
+[ascend-bench] S=512: no stock operator baseline -- aclnnFusedInferAttentionScoreV5: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV5GetWorkspaceSize failed with status 561002
+  CANN: [PID: 1335049] 2026-09-14-15:12:52.117.796 Invalid_Argument(EZ0026): Parameter pse_type of FusedInferAttentionScore has incorrect value 1. Reason: The value of pse_type must be 0.
+        Solution: Check whether the parameter value is correct.
+TraceBack (most recent call last):
+        Failed to execute operator FusedInferAttentionScore_0. Reason: Failed to execute tiling function.
+        Check NnopbaseExecutorDoTiling(executor) failed
+        Check NnopbaseExecutorTilingAndUpdateBinInfo(executor) failed
+        Check NnopbaseExecutorMatchCache(executor) failed
+        Check NnopbaseRunForWorkspace(*executor, workspaceSize) failed
+; aclnnFusedInferAttentionScoreV2: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV2GetWorkspaceSize failed with status 361001
+  CANN: [PID: 1335049] 2026-09-14-15:12:52.118.015 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
+        Solution: In this scenario, collect the plog when the fault occurs and locate the fault based on the plog.
+
+[ascend-bench] S=1024: no stock operator baseline -- aclnnFusedInferAttentionScoreV5: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV5GetWorkspaceSize failed with status 561002
+  CANN: [PID: 1335049] 2026-09-14-15:12:52.197.645 Invalid_Argument(EZ0026): Parameter pse_type of FusedInferAttentionScore has incorrect value 1. Reason: The value of pse_type must be 0.
+        Solution: Check whether the parameter value is correct.
+TraceBack (most recent call last):
+        Failed to execute operator FusedInferAttentionScore_0. Reason: Failed to execute tiling function.
+        Check NnopbaseExecutorDoTiling(executor) failed
+        Check NnopbaseExecutorTilingAndUpdateBinInfo(executor) failed
+        Check NnopbaseExecutorMatchCache(executor) failed
+        Check NnopbaseRunForWorkspace(*executor, workspaceSize) failed
+; aclnnFusedInferAttentionScoreV2: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV2GetWorkspaceSize failed with status 361001
+  CANN: [PID: 1335049] 2026-09-14-15:12:52.197.932 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
+        Solution: In this scenario, collect the plog when the fault occurs and locate the fault based on the plog.
+
+[ascend-bench] S=2048: no stock operator baseline -- aclnnFusedInferAttentionScoreV5: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV5GetWorkspaceSize failed with status 561002
+  CANN: [PID: 1335049] 2026-09-14-15:12:52.350.408 Invalid_Argument(EZ0026): Parameter pse_type of FusedInferAttentionScore has incorrect value 1. Reason: The value of pse_type must be 0.
+        Solution: Check whether the parameter value is correct.
+TraceBack (most recent call last):
+        Failed to execute operator FusedInferAttentionScore_0. Reason: Failed to execute tiling function.
+        Check NnopbaseExecutorDoTiling(executor) failed
+        Check NnopbaseExecutorTilingAndUpdateBinInfo(executor) failed
+        Check NnopbaseExecutorMatchCache(executor) failed
+        Check NnopbaseRunForWorkspace(*executor, workspaceSize) failed
+; aclnnFusedInferAttentionScoreV2: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV2GetWorkspaceSize failed with status 361001
+  CANN: [PID: 1335049] 2026-09-14-15:12:52.350.734 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
+        Solution: In this scenario, collect the plog when the fault occurs and locate the fault based on the plog.
+
 
 [ascend-bench] KV traffic model (exact byte counts, head_dim=256 heads=8 kv_heads=2 block=128)
 [ascend-bench]   cache footprint for S tokens, and the bytes one decode step streams
 
        S      fp16 cache      tq4 cache    ratio   fp16 decode read  tq4 decode read    ratio
   -------------------------------------------------------------------------------------------
+      64        128.0 KiB        34.0 KiB    3.76x           520.0 KiB         169.0 KiB    3.08x
      512       1024.0 KiB       272.0 KiB    3.76x          4104.0 KiB        1228.0 KiB    3.34x
     1024       2048.0 KiB       544.0 KiB    3.76x          8200.0 KiB        2448.0 KiB    3.35x
     2048       4096.0 KiB      1088.0 KiB    3.76x         16392.0 KiB        4752.0 KiB    3.45x
 
        S       kv4 cache    ratio  kv4 decode read    ratio
   ---------------------------------------------------------
+      64         34.0 KiB    3.76x          61.0 KiB    8.52x
      512        272.0 KiB    3.76x         364.0 KiB   11.27x
     1024        544.0 KiB    3.76x         720.0 KiB   11.39x
     2048       1088.0 KiB    3.76x        1296.0 KiB   12.65x
@@ -34,6 +86,8 @@ o60133706@ubuntu:~/vllm-ascend$ ~/vllm-ascend/build/csrc-tests-npu/device/bench_
 [ascend-bench]   slot is 8 fp32 lanes for 4 live ones, so 50% of that scale plane is burst padding -
 [ascend-bench]   2.9% of the whole 4-bit cache, and the price of every DMA being aligned
 
+[ascend-bench] S=64: blocks_per_seq=1 pool=4 tq4 splits=1 grid(split)=8 | cube splits=1 grid(split)=2 grid(combine)=8
+
 [ascend-bench] S=512: blocks_per_seq=4 pool=16 tq4 splits=4 grid(split)=32 | cube splits=4 grid(split)=8 grid(combine)=8
 
 [ascend-bench] S=1024: blocks_per_seq=8 pool=32 tq4 splits=8 grid(split)=64 | cube splits=8 grid(split)=16 grid(combine)=8
@@ -41,30 +95,51 @@ o60133706@ubuntu:~/vllm-ascend$ ~/vllm-ascend/build/csrc-tests-npu/device/bench_
 [ascend-bench] S=2048: blocks_per_seq=16 pool=64 tq4 splits=8 grid(split)=64 | cube splits=8 grid(split)=16 grid(combine)=8
 
 [ascend-bench] TurboQuant decode summary (median of the pipelined mode)
+[ascend-bench] shape: B=1 H=8 D=256 kv_heads=2 block=128
 
-       S      tq4 us     kv4 us    fp16 us    kv4:fp16   kv4:tq4
-  --------------------------------------------------------------
-     512       44.00      41.87      15.42       0.37x     1.05x
-    1024       48.82      44.97      18.99       0.42x     1.09x
-    2048       78.78      68.73      26.08       0.38x     1.15x
+       S      kv4 us     tq4 us    fp16 us     fia us
+  ----------------------------------------------------
+      64       21.36      25.22      15.05          -
+     512       29.00      44.05      15.38          -
+    1024       32.19      48.90      19.12          -
+    2048       43.29      78.91      26.29          -
 
-       S  kv4 step/s   kv4 GB/s   kv4 TF/s
-  ----------------------------------------
-     512       23883        8.9      0.100
-    1024       22235       16.4      0.187
-    2048       14549       19.3      0.244
+       S     vs fp16     vs tq4     vs fia
+  -----------------------------------------
+      64       0.70x      1.18x          -
+     512       0.53x      1.52x          -
+    1024       0.59x      1.52x          -
+    2048       0.61x      1.82x          -
 
-[ascend-bench]   steps/s is one sequence's decode step, not a batch. The GB/s column is the
-[ascend-bench]   kv4 traffic-model decode-read bytes over the measured time, so it is what the
-[ascend-bench]   kernel asked the memory system for and not a fill-rate ceiling. kv4:fp16 is
-[ascend-bench]   against the physical fp16 Cube decode in the same binary -- the same kernel
-[ascend-bench]   with the codec removed -- and not against an analytic model. kv4:tq4 is the
-[ascend-bench]   Cube against the vector cores at one rate: the two store identical nibbles
-[ascend-bench]   against identical thresholds, so the codec is held fixed across that ratio.
-[ascend-bench]   the kv4 decode is verified correct at S=64 on the camodel (cos 0.982351);
-[ascend-bench]   these are the first timings ever taken of it, at context lengths its
-[ascend-bench]   fidelity has not been measured at. The fp16 column is a comparator with no
-[ascend-bench]   fidelity check. See TURBOQUANT_TESTS.md section 13.8.
+       S  leg          steps/s       GB/s    TFLOP/s
+  ---------------------------------------------------
+      64  kv4fp8         46815        2.9      0.025
+      64  tq4            39643        6.9      0.021
+      64  fp16           66465       35.4      0.035
+     512  kv4fp8         34480       12.9      0.145
+     512  tq4            22702       28.5      0.095
+     512  fp16           65038      273.3      0.273
+    1024  kv4fp8         31061       22.9      0.261
+    1024  tq4            20449       51.3      0.172
+    1024  fp16           52300      439.2      0.439
+    2048  kv4fp8         23100       30.7      0.388
+    2048  tq4            12672       61.7      0.213
+    2048  fp16           38041      638.5      0.638
+
+[ascend-bench]   steps/s is one sequence's decode step, not a batch -- every row is B=1; the
+[ascend-bench]   batch axis is validated by test_device_950pr_turboquant_multimode and not timed
+[ascend-bench]   here. A GB/s column is that leg's traffic-model decode-read bytes over its own
+[ascend-bench]   measured time, so it is what the kernel asked the memory system for and not a
+[ascend-bench]   fill-rate ceiling.
+[ascend-bench]   vs fp16 is against the physical fp16 Cube decode in this binary -- the same
+[ascend-bench]   kernel with the codec removed -- so it isolates the codec. vs tq4 is the Cube
+[ascend-bench]   against the vector cores at 4 bits, and since kv4fp8 became affine INT4 while
+[ascend-bench]   tq4 stayed Lloyd-Max that ratio now moves two things at once; see the header.
+[ascend-bench]   vs fia is against the stock CANN operator, which is what a caller has today.
+[ascend-bench]   the kv4 decode is verified correct at S=64 on the camodel; these are the
+[ascend-bench]   first timings ever taken of it, and at S in {512,1024,2048} its fidelity has
+[ascend-bench]   not been measured anywhere. The fp16 column is a comparator with no fidelity
+[ascend-bench]   check of its own. See TURBOQUANT_TESTS.md sections 13.8 and 13.9.
 
 [ascend-bench] turboquant_950pr (4-bit rotated KV cache: AIV, Cube, and an fp16 Cube baseline)
 [ascend-bench]   warmup=20 iterations=100 pipeline_batch=10
@@ -74,96 +149,136 @@ o60133706@ubuntu:~/vllm-ascend$ ~/vllm-ascend/build/csrc-tests-npu/device/bench_
 
   case                              mode              min    median      mean       p95       p99    stddev     TFLOP/s      GB/s
   ---------------------------------------------------------------------------------------------------------------------
-  tq4_write_s512                    pipelined       99.02     99.23     99.25     99.38    100.22      0.21           -      13.4
-  tq4_write_s512                    device          98.80     99.43     99.56     99.83     99.90      1.38           -      13.4
-  tq4_write_s512                    host           107.37    108.79    109.41    113.34    116.32      1.92           -      12.2
+  tq4_write_s64                     pipelined       20.29     20.43     20.46     20.58     21.45      0.20           -       8.1
+  tq4_write_s64                     device          20.09     20.62     20.84     20.96     21.10      2.32           -       8.1
+  tq4_write_s64                     host            33.79     36.69     36.93     40.34     44.72      2.07           -       4.5
 
-  tq4_decode_s512                   pipelined       43.70     44.00     44.02     44.23     44.93      0.21       0.095      28.6
-  tq4_decode_s512                   device          43.68     44.24     44.37     44.64     44.90      1.20       0.095      28.4
-  tq4_decode_s512                   host            52.10     53.49     54.18     56.76     57.11      1.52       0.078      23.5
+  tq4_decode_s64                    pipelined       25.09     25.22     25.27     25.32     26.55      0.25       0.021       6.9
+  tq4_decode_s64                    device          25.17     25.46     25.61     25.67     25.76      1.55       0.021       6.8
+  tq4_decode_s64                    host            38.72     39.96     40.14     41.55     44.34      1.45       0.013       4.3
 
-  kv4fp8_write_s512                 pipelined      168.79    169.40    169.36    169.92    170.13      0.45           -       7.8
-  kv4fp8_write_s512                 device         168.75    169.28    169.55    170.26    170.46      1.17           -       7.9
-  kv4fp8_write_s512                 host           178.17    180.06    180.47    182.54    182.75      1.41           -       7.4
+  kv4fp8_write_s64                  pipelined       27.22     27.88     27.82     28.34     28.68      0.46           -       6.0
+  kv4fp8_write_s64                  device          27.24     28.25     28.37     28.82     28.96      2.31           -       5.9
+  kv4fp8_write_s64                  host            36.92     39.40     39.86     40.17     64.89      5.04           -       4.2
 
-  kv4fp8_decode_s512                pipelined       41.64     41.87     41.89     42.04     43.21      0.27       0.100       8.9
-  kv4fp8_decode_s512                device          41.74     41.99     42.13     42.31     42.45      1.16       0.100       8.9
-  kv4fp8_decode_s512                host            52.10     52.90     52.98     53.74     54.21      0.57       0.079       7.0
+  kv4fp8_decode_s64                 pipelined       21.20     21.36     21.39     21.49     22.41      0.21       0.025       2.9
+  kv4fp8_decode_s64                 device          21.26     21.58     21.73     21.70     23.17      1.63       0.024       2.9
+  kv4fp8_decode_s64                 host            32.32     35.10     35.21     35.80     36.08      1.07       0.015       1.8
 
-  fp16_decode_s512                  pipelined       15.23     15.42     15.43     15.58     16.31      0.20       0.272     272.6
-  fp16_decode_s512                  device          15.80     16.86     17.19     18.98     21.56      1.32       0.249     249.2
-  fp16_decode_s512                  host            23.72     24.11     24.49     25.29     28.94      0.95       0.174     174.3
+  fp16_decode_s64                   pipelined       14.82     15.05     15.19     15.99     17.04      0.47       0.035      35.4
+  fp16_decode_s64                   device          16.18     17.60     17.73     19.17     23.76      1.33       0.030      30.3
+  fp16_decode_s64                   host            18.80     22.08     22.35     23.31     24.76      1.74       0.024      24.1
 
-  tq4_write_s1024                   pipelined      188.88    189.13    189.16    189.33    190.22      0.20           -      14.1
-  tq4_write_s1024                   device         188.61    189.34    189.55    189.71    189.96      2.01           -      14.0
-  tq4_write_s1024                   host           197.40    199.09    199.23    201.74    202.36      1.19           -      13.4
+  tq4_write_s512                    pipelined       98.45     98.72     98.74     98.90     99.89      0.21           -      13.5
+  tq4_write_s512                    device          98.30     98.90     99.05     99.30     99.49      1.37           -      13.4
+  tq4_write_s512                    host           107.51    108.46    108.79    110.74    113.09      1.12           -      12.3
 
-  tq4_decode_s1024                  pipelined       48.49     48.82     48.84     49.03     49.91      0.26       0.172      51.3
-  tq4_decode_s1024                  device          48.23     48.98     49.10     49.38     49.62      1.14       0.171      51.2
-  tq4_decode_s1024                  host            57.74     59.62     60.06     62.13     62.71      1.41       0.141      42.0
+  tq4_decode_s512                   pipelined       43.90     44.05     44.08     44.13     45.06      0.18       0.095      28.5
+  tq4_decode_s512                   device          43.79     44.24     44.37     44.55     44.72      1.30       0.095      28.4
+  tq4_decode_s512                   host            53.01     53.65     54.20     56.83     58.56      2.13       0.078      23.4
 
-  kv4fp8_write_s1024                pipelined      329.36    329.96    329.94    330.46    330.51      0.43           -       8.1
-  kv4fp8_write_s1024                device         329.36    330.43    330.42    330.86    331.06      1.32           -       8.0
-  kv4fp8_write_s1024                host           339.44    342.11    342.48    346.95    347.08      2.16           -       7.8
+  kv4fp8_write_s512                 pipelined      163.21    163.95    163.88    164.32    164.68      0.48           -       8.1
+  kv4fp8_write_s512                 device         163.19    163.83    164.11    164.91    164.95      1.60           -       8.1
+  kv4fp8_write_s512                 host           174.37    175.57    175.98    177.87    178.93      2.11           -       7.6
 
-  kv4fp8_decode_s1024               pipelined       44.71     44.97     45.00     45.23     45.85      0.20       0.187      16.4
-  kv4fp8_decode_s1024               device          44.65     45.21     45.33     45.54     45.61      1.28       0.186      16.3
-  kv4fp8_decode_s1024               host            53.84     55.25     55.88     58.45     59.39      1.60       0.152      13.3
+  kv4fp8_decode_s512                pipelined       28.77     29.00     29.03     29.10     30.11      0.21       0.145      12.9
+  kv4fp8_decode_s512                device          28.80     29.20     29.33     29.47     29.61      1.29       0.144      12.8
+  kv4fp8_decode_s512                host            39.81     40.81     41.02     41.90     44.38      1.64       0.103       9.1
 
-  fp16_decode_s1024                 pipelined       18.62     18.99     18.99     19.34     19.55      0.28       0.442     442.1
-  fp16_decode_s1024                 device          18.70     19.36     19.38     19.66     19.84      1.09       0.433     433.8
-  fp16_decode_s1024                 host            26.33     28.01     28.18     30.65     30.81      1.04       0.299     299.8
+  fp16_decode_s512                  pipelined       15.19     15.38     15.49     16.35     17.06      0.38       0.273     273.3
+  fp16_decode_s512                  device          17.09     18.32     18.71     21.23     23.63      1.38       0.229     229.4
+  fp16_decode_s512                  host            24.48     25.06     25.56     26.37     27.10      1.39       0.167     167.7
 
-  tq4_write_s2048                   pipelined      369.45    369.71    369.73    369.90    370.80      0.21           -      14.4
-  tq4_write_s2048                   device         369.02    369.90    370.04    370.64    371.14      1.31           -      14.4
-  tq4_write_s2048                   host           378.73    382.93    383.04    386.62    387.72      2.20           -      13.9
+  tq4_write_s1024                   pipelined      187.85    188.08    188.09    188.25    189.20      0.21           -      14.1
+  tq4_write_s1024                   device         187.81    188.23    188.54    188.68    188.90      2.93           -      14.1
+  tq4_write_s1024                   host           196.84    198.21    198.84    201.94    203.09      1.99           -      13.4
 
-  tq4_decode_s2048                  pipelined       78.49     78.78     78.83     79.07     80.19      0.28       0.213      61.8
-  tq4_decode_s2048                  device          78.48     78.97     79.10     79.37     79.52      1.16       0.212      61.6
-  tq4_decode_s2048                  host            87.43     88.94     89.61     92.56     93.38      1.63       0.189      54.7
+  tq4_decode_s1024                  pipelined       48.75     48.90     48.94     49.09     49.92      0.20       0.172      51.3
+  tq4_decode_s1024                  device          48.67     49.06     49.21     49.46     49.93      1.33       0.171      51.1
+  tq4_decode_s1024                  host            57.95     59.66     59.86     61.66     63.08      1.67       0.141      42.0
 
-  kv4fp8_write_s2048                pipelined      650.55    651.18    651.17    651.68    652.57      0.49           -       8.2
-  kv4fp8_write_s2048                device         650.53    651.66    651.62    652.20    652.30      1.37           -       8.2
-  kv4fp8_write_s2048                host           659.97    663.48    663.68    666.53    668.41      1.80           -       8.0
+  kv4fp8_write_s1024                pipelined      318.59    319.26    319.18    319.66    319.91      0.48           -       8.3
+  kv4fp8_write_s1024                device         318.57    319.03    319.56    320.09    320.31      3.35           -       8.3
+  kv4fp8_write_s1024                host           329.98    333.95    334.10    336.51    337.75      3.06           -       8.0
 
-  kv4fp8_decode_s2048               pipelined       68.50     68.73     68.74     68.87     69.85      0.21       0.244      19.3
-  kv4fp8_decode_s2048               device          68.51     68.96     69.09     69.31     69.42      1.30       0.243      19.2
-  kv4fp8_decode_s2048               host            78.03     79.44     79.78     82.40     83.20      1.22       0.211      16.7
+  kv4fp8_decode_s1024               pipelined       32.07     32.19     32.24     32.36     33.67      0.26       0.261      22.9
+  kv4fp8_decode_s1024               device          31.91     32.41     32.53     32.72     32.88      1.27       0.259      22.7
+  kv4fp8_decode_s1024               host            42.89     44.02     44.59     47.05     48.30      1.68       0.191      16.7
 
-  fp16_decode_s2048                 pipelined       25.73     26.08     26.12     26.51     26.59      0.31       0.643     643.7
-  fp16_decode_s2048                 device          25.80     26.52     26.53     26.85     27.14      1.19       0.633     632.9
-  fp16_decode_s2048                 host            33.97     35.03     35.19     35.48     39.13      1.14       0.479     479.2
-o60133706@ubuntu:~/vllm-ascend$ ~/vllm-ascend/build/csrc-tests-npu/device/test_device_950pr_turboquant_multimode
-[ascend-test] vllm-ascend bare-metal kernel tests, Ascend 950PR (no Python, no torch)
-[ascend-test] tier: device
-[ascend-test] CAModel loaded: no (physical runtime)
-[ascend-test] aclnn operator inventory (Ascend 950PR pipeline)
-[ascend-test]   custom op packages: none found
-[ascend-test]   aclnnRmsNorm                       found   stage 1 and 7 - input and post-attention RMSNorm  [CANN]
-[ascend-test]   aclnnMatmul                        found   stage 2, 6, 8 - every linear projection, cube unit  [CANN]
-[ascend-test]   aclnnInplacePartialRotaryMul       found   stage 3/4 - partial RoPE, vllm-ascend custom op  [CANN]
-[ascend-test]   aclnnApplyRotaryPosEmbV2           found   stage 3/4 - partial RoPE fallback over a packed slice  [CANN]
-[ascend-test]   aclnnScatterPaKvCache              found   stage 5 - paged KV cache write  [CANN]
-[ascend-test]   aclnnFusedInferAttentionScoreV5    found   stage 5 - paged decode attention, the interface an Ascend950 has  [CANN]
-[ascend-test]   aclnnFusedInferAttentionScoreV2    found   stage 5 - withdrawn on Ascend950; expected MISSING there  [CANN]
-[ascend-test]   aclnnSigmoid                       found   stage 6 - attention output gate  [CANN]
-[ascend-test]   aclnnMul                           found   stage 6 - attention output gate  [CANN]
-[ascend-test]   aclnnSwiGlu                        found   stage 8 - SwiGLU activation  [CANN]
-[ascend-test]   aclnnInplaceAdd                    found   stage 6 and 9 - residual adds  [CANN]
-[==========] Running 1 test from 1 test suite.
-[----------] Global test environment set-up.
-[ascend-test] device 0 ready, soc='Ascend950PR_9589'
-[----------] 1 test from TurboQuantMultiMode
-[ RUN      ] TurboQuantMultiMode.SingleShotDispatchAndFidelity
-[ multimode ] shape: S=16 head_size=256 heads=4 kv_heads=2 block=128 pool=4
-[ multimode ] kv4fp8: 4 bits, 16 levels, 128 packed bytes/vector, Cube mad (fp8 e4m3fn)
-[ multimode ] kv4fp8: dispatched, splits=1
-[ multimode ] kv4fp8: cos vs fp32 host reference = 0.992164
-[ multimode ] kv5fp8: still provisional, not re-measured through the corrected staging; set VLLM_ASCEND_TQ_CUBE_WIP=1 to run it
-[ multimode ] kv3fp4: still provisional, not re-measured through the corrected staging; set VLLM_ASCEND_TQ_CUBE_WIP=1 to run it
-[       OK ] TurboQuantMultiMode.SingleShotDispatchAndFidelity (3 ms)
-[----------] 1 test from TurboQuantMultiMode (3 ms total)
+  fp16_decode_s1024                 pipelined       18.87     19.12     19.15     19.32     20.18      0.24       0.439     439.2
+  fp16_decode_s1024                 device          18.88     19.33     19.45     19.69     21.42      1.12       0.434     434.4
+  fp16_decode_s1024                 host            28.18     28.48     28.64     28.88     30.06      1.23       0.295     294.8
 
-[----------] Global test environment tear-down
-[==========] 1 test from 1 test suite ran. (6745 ms total)
-[  PASSED  ] 1 test.
+  tq4_write_s2048                   pipelined      367.15    367.49    367.54    367.72    368.61      0.31           -      14.5
+  tq4_write_s2048                   device         366.98    367.67    367.94    368.50    368.84      1.97           -      14.5
+  tq4_write_s2048                   host           377.15    380.04    380.57    383.75    384.86      2.45           -      14.0
+
+  tq4_decode_s2048                  pipelined       78.66     78.91     78.94     79.10     79.84      0.19       0.213      61.7
+  tq4_decode_s2048                  device          78.54     79.13     79.28     79.57     79.76      1.29       0.212      61.5
+  tq4_decode_s2048                  host            88.28     89.47     89.87     91.78     92.65      1.65       0.188      54.4
+
+  kv4fp8_write_s2048                pipelined      629.21    629.91    629.83    630.28    631.54      0.62           -       8.4
+  kv4fp8_write_s2048                device         629.15    630.29    630.49    630.78    630.85      3.77           -       8.4
+  kv4fp8_write_s2048                host           639.13    642.89    643.32    646.87    649.88      4.61           -       8.3
+
+  kv4fp8_decode_s2048               pipelined       43.14     43.29     43.32     43.39     44.32      0.20       0.388      30.7
+  kv4fp8_decode_s2048               device          43.02     43.51     43.66     43.78     44.04      1.43       0.386      30.5
+  kv4fp8_decode_s2048               host            52.93     53.83     54.10     54.39     58.13      1.80       0.312      24.7
+
+  fp16_decode_s2048                 pipelined       25.93     26.29     26.30     26.55     27.01      0.23       0.638     638.5
+  fp16_decode_s2048                 device          26.03     26.57     26.70     26.91     27.13      1.35       0.632     631.8
+  fp16_decode_s2048                 host            34.77     35.86     36.04     36.62     41.01      1.49       0.468     468.1
+
+[ascend-bench] skipped:
+  fia_decode_s64: aclnnFusedInferAttentionScoreV5: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV5GetWorkspaceSize failed with status 561002
+  CANN: [PID: 1335049] 2026-09-14-15:12:52.070.072 Invalid_Argument(EZ0026): Parameter pse_type of FusedInferAttentionScore has incorrect value 1. Reason: The value of pse_type must be 0.
+        Solution: Check whether the parameter value is correct.
+TraceBack (most recent call last):
+        Failed to execute operator FusedInferAttentionScore_0. Reason: Failed to execute tiling function.
+        Check NnopbaseExecutorDoTiling(executor) failed
+        Check NnopbaseExecutorTilingAndUpdateBinInfo(executor) failed
+        Check NnopbaseExecutorMatchCache(executor) failed
+        Check NnopbaseRunForWorkspace(*executor, workspaceSize) failed
+; aclnnFusedInferAttentionScoreV2: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV2GetWorkspaceSize failed with status 361001
+  CANN: [PID: 1335049] 2026-09-14-15:12:52.070.609 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
+        Solution: In this scenario, collect the plog when the fault occurs and locate the fault based on the plog.
+
+  fia_decode_s512: aclnnFusedInferAttentionScoreV5: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV5GetWorkspaceSize failed with status 561002
+  CANN: [PID: 1335049] 2026-09-14-15:12:52.117.796 Invalid_Argument(EZ0026): Parameter pse_type of FusedInferAttentionScore has incorrect value 1. Reason: The value of pse_type must be 0.
+        Solution: Check whether the parameter value is correct.
+TraceBack (most recent call last):
+        Failed to execute operator FusedInferAttentionScore_0. Reason: Failed to execute tiling function.
+        Check NnopbaseExecutorDoTiling(executor) failed
+        Check NnopbaseExecutorTilingAndUpdateBinInfo(executor) failed
+        Check NnopbaseExecutorMatchCache(executor) failed
+        Check NnopbaseRunForWorkspace(*executor, workspaceSize) failed
+; aclnnFusedInferAttentionScoreV2: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV2GetWorkspaceSize failed with status 361001
+  CANN: [PID: 1335049] 2026-09-14-15:12:52.118.015 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
+        Solution: In this scenario, collect the plog when the fault occurs and locate the fault based on the plog.
+
+  fia_decode_s1024: aclnnFusedInferAttentionScoreV5: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV5GetWorkspaceSize failed with status 561002
+  CANN: [PID: 1335049] 2026-09-14-15:12:52.197.645 Invalid_Argument(EZ0026): Parameter pse_type of FusedInferAttentionScore has incorrect value 1. Reason: The value of pse_type must be 0.
+        Solution: Check whether the parameter value is correct.
+TraceBack (most recent call last):
+        Failed to execute operator FusedInferAttentionScore_0. Reason: Failed to execute tiling function.
+        Check NnopbaseExecutorDoTiling(executor) failed
+        Check NnopbaseExecutorTilingAndUpdateBinInfo(executor) failed
+        Check NnopbaseExecutorMatchCache(executor) failed
+        Check NnopbaseRunForWorkspace(*executor, workspaceSize) failed
+; aclnnFusedInferAttentionScoreV2: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV2GetWorkspaceSize failed with status 361001
+  CANN: [PID: 1335049] 2026-09-14-15:12:52.197.932 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
+        Solution: In this scenario, collect the plog when the fault occurs and locate the fault based on the plog.
+
+  fia_decode_s2048: aclnnFusedInferAttentionScoreV5: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV5GetWorkspaceSize failed with status 561002
+  CANN: [PID: 1335049] 2026-09-14-15:12:52.350.408 Invalid_Argument(EZ0026): Parameter pse_type of FusedInferAttentionScore has incorrect value 1. Reason: The value of pse_type must be 0.
+        Solution: Check whether the parameter value is correct.
+TraceBack (most recent call last):
+        Failed to execute operator FusedInferAttentionScore_0. Reason: Failed to execute tiling function.
+        Check NnopbaseExecutorDoTiling(executor) failed
+        Check NnopbaseExecutorTilingAndUpdateBinInfo(executor) failed
+        Check NnopbaseExecutorMatchCache(executor) failed
+        Check NnopbaseRunForWorkspace(*executor, workspaceSize) failed
+; aclnnFusedInferAttentionScoreV2: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV2GetWorkspaceSize failed with status 361001
+  CANN: [PID: 1335049] 2026-09-14-15:12:52.350.734 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
+        Solution: In this scenario, collect the plog when the fault occurs and locate the fault based on the plog.
+
