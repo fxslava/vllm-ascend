@@ -28,7 +28,7 @@ pinned elsewhere in the tree; the other two exist only as research baselines:
     ``cpu_pi_sign_vector`` / ``cpu_fwht`` / ``cpu_apply_pi`` in
     ``csrc/tests/reference/turbo_quant_cpu.h`` and ``turboquant_pi_signs`` /
     ``walsh_hadamard`` / ``apply_pi`` in
-    ``vllm_ascend/attention/turboquant_v1.py``.
+    ``vllm_ascend/attention/turboquant_rotation.py``.
   * ``q_absmax`` mirrors ``cpu_quantize_4bit`` + ``cpu_dequantize_4bit`` from
     the same header: symmetric mid-rise grid, ``scale = absmax / 7.5``.
   * ``q_spherical``, ``q_qjl`` and ``q_lloyd_max`` are research baselines
@@ -47,7 +47,7 @@ import math
 import numpy as np
 
 # Seed of the +-1 diagonal of Pi; must equal TURBOQUANT_PI_SEED in
-# vllm_ascend/attention/turboquant_v1.py and kPiSeed in turbo_quant_cpu.h.
+# vllm_ascend/attention/turboquant_rotation.py and kPiSeed in turbo_quant_cpu.h.
 TURBOQUANT_PI_SEED = 0x5F3759DF
 
 

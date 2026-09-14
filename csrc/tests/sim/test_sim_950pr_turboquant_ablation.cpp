@@ -521,15 +521,16 @@ TEST(TurboQuantDecodeAblation, CutStagesExitCleanOnTheCamodel) {
 
     EXPECT_EQ(untouched, 0u) << name << " left partials unwritten";
     watchdog.Arm("the combine after " + name);
-    turboquant_paged_attention_combine_impl(
-        AscendType::FP16, stream, grid.combine_block_dim, workspace.get(), pi_signs.get(), rot_tables.get(),
-        out.get(), static_cast<uint32_t>(kBatch), static_cast<uint32_t>(kNumHeads),
-        static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(grid.num_splits), grid.combine_tasks_per_core,
-        kInvSqrtHeadSize);
+    turboquant_paged_attention_combine_impl(AscendType::FP16, stream, grid.combine_block_dim, workspace.get(),
+                                            out.get(), static_cast<uint32_t>(kBatch),
+                                            static_cast<uint32_t>(kNumHeads), static_cast<uint32_t>(kHeadSize),
+                                            static_cast<uint32_t>(grid.num_splits), grid.combine_tasks_per_core);
     ACL_CHECK(aclrtSynchronizeStream(stream));
     watchdog.Disarm();
 
-    const std::vector<float> output = HalfToFloat(out.ToHost<Half>());
+    // The combine writes the rotated basis; the folded W_o un-rotates in
+    // production and UnrotateHeads does it here.
+    const std::vector<float> output = tqh::UnrotateHeads(HalfToFloat(out.ToHost<Half>()), kHeadSize);
     size_t finite = 0;
     double abs_sum = 0.0;
     for (const float v : output) {

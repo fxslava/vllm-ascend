@@ -121,17 +121,35 @@
 //                                       been launched on a part.
 //   VLLM_ASCEND_TQ_CUBE_WIP=0           drops the Cube legs, leaving the
 //                                       AIV-only 4-bit path.
+//
+// THE OUTPUT BASIS. Every quantised decode leg's combine now writes the rotated
+// output O~ -- the inverse rotation is folded into W_o in production -- so the
+// tq4 and kv4fp8 checksums are over rotated bits. Neither leg times an
+// un-rotation, which is what a folded layer runs; a layer that cannot fold pays
+// one more rotate launch, the size of tq_rotate_s<S>.
+//
+// PREFILL. After the decode summary, a second suite times prefill across a
+// dense sweep of shapes against aclnnFusedInferAttentionScoreV5 over an fp16
+// cache: the TurboQuant write, the rotation of V a folded layer needs, the
+// stock attention and the pipelines they make up, with device time from ACL
+// events, GB/s and the KV-cache compression ratios. See THE PREFILL SUITE below
+// for what it times, what it does not, and its own ASCEND_BENCH_TQ_PREFILL_*
+// variables; ASCEND_BENCH_TQ_PREFILL=0 drops it.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
+#include <initializer_list>
 #include <iterator>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "acl_check.hpp"
@@ -149,7 +167,8 @@ namespace vllm_ascend {
 namespace test {
 namespace bench {
 
-const char* kSuiteName = "turboquant_950pr (4-bit rotated KV cache: AIV, Cube, and an fp16 Cube baseline)";
+const char* kSuiteName =
+    "turboquant_950pr (4-bit rotated KV cache: AIV, Cube, an fp16 Cube baseline, and prefill against FIA V5)";
 
 namespace {
 
@@ -507,7 +526,7 @@ struct DecodeScenario {
     turboquant_paged_attention_impl(
         AscendType::FP16, stream, decode_grid_.split_block_dim, decode_grid_.combine_block_dim, query_rot_.get(),
         key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
-        pi_signs_.get(), decode_tables_.get(), workspace_.get(), out_.get(), static_cast<uint32_t>(kQueryTokens),
+        decode_tables_.get(), workspace_.get(), out_.get(), static_cast<uint32_t>(kQueryTokens),
         static_cast<uint32_t>(kNumHeads), static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize),
         static_cast<uint32_t>(kBlockSize), static_cast<uint32_t>(blocks_per_seq_),
         static_cast<uint32_t>(decode_grid_.num_splits), decode_grid_.split_tasks_per_core,
@@ -655,11 +674,11 @@ struct ModeScenario {
         static_cast<uint32_t>(blocks_per_seq_), static_cast<uint32_t>(decode_grid_.num_splits),
         decode_grid_.split_tasks_per_core, kAttentionScale, kInvSqrtHeadSize);
 
-    turboquant_paged_attention_combine_impl(
-        AscendType::FP16, stream, decode_grid_.combine_block_dim, workspace_.get(), shared.pi_signs(),
-        rot_tables_.get(), out_.get(), static_cast<uint32_t>(kQueryTokens), static_cast<uint32_t>(kNumHeads),
-        static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(decode_grid_.num_splits),
-        decode_grid_.combine_tasks_per_core, kInvSqrtHeadSize);
+    turboquant_paged_attention_combine_impl(AscendType::FP16, stream, decode_grid_.combine_block_dim,
+                                            workspace_.get(), out_.get(), static_cast<uint32_t>(kQueryTokens),
+                                            static_cast<uint32_t>(kNumHeads), static_cast<uint32_t>(kHeadSize),
+                                            static_cast<uint32_t>(decode_grid_.num_splits),
+                                            decode_grid_.combine_tasks_per_core);
   }
 
   void FillCache(const DecodeScenario& shared, aclrtStream stream) const {
@@ -1119,6 +1138,926 @@ void PrintDecodeSummary(const BenchmarkRunner& runner, const std::vector<Traffic
   }
 }
 
+// =============================================================================
+// THE PREFILL SUITE
+// =============================================================================
+//
+// What a prefill step costs over a TurboQuant KV cache, against the stock CANN
+// operator over an unquantised one, across a dense sweep of shapes. It runs in
+// its own BenchmarkRunner on the decode suite's stream: the shapes are orders of
+// magnitude heavier than a decode step, so it has its own iteration budget,
+// its own result table and its own CSVs. Failures are mirrored into the decode
+// runner, so the process exit code still reflects them.
+//
+// A prefill over a TurboQuant cache is PrefillNoCache in
+// vllm_ascend/attention/turboquant_v1.py: the cache write, then full-precision
+// attention over the batch's own K/V -- nothing is read back from the 4-bit
+// cache. So the quantised pipeline is the stock attention plus a different
+// write, and for a layer whose o_proj is Pi-folded, plus a rotation of V:
+//
+//   pf_tq4_write            turboquant_reshape_and_cache over B*S tokens.
+//   pf_rotate_v             npu_turboquant_rotate_q on V, [B*S, H_KV, D] -> fp32.
+//   pf_fp16_write           aclnnScatterPaKvCache into an fp16 paged cache, the
+//                           baseline's own write.
+//   pf_fia_v5               aclnnFusedInferAttentionScoreV5 (V2 as a fallback),
+//                           TND, sparse_mode 3 with the 2048x2048 causal mask --
+//                           the argument list the plugin's prefill passes. fp16.
+//   pf_fp16_pipeline        pf_fp16_write + pf_fia_v5.
+//   pf_tq4_pipeline         pf_tq4_write + pf_fia_v5: a layer with an unfolded
+//                           o_proj, whose prefill is unchanged.
+//   pf_tq4_folded_pipeline  pf_tq4_write + pf_rotate_v + FIA V5 over V~ = Pi V:
+//                           a folded layer, whose prefill has to hand o_proj the
+//                           rotated basis the decode does.
+//
+// NOT TIMED, and said so rather than hidden: the folded pipeline's fp32 -> fp16
+// cast of V~. The backend does it with a torch cast; this suite has no
+// header-verified aclnnCast prototype, so V~ is also prepared on the host in
+// fp16 and FIA reads that copy. The cast is one elementwise pass over
+// B*S*H_KV*D values and is not in any number below.
+//
+// npu_fusion_attention (aclnnFlashAttentionScore) is NOT a leg. Its argument
+// list could not be read out of a CANN header in this environment -- the 9.1.0
+// toolkit image carries no aclnnop operator headers -- and a guessed prototype
+// behind dlsym is undefined behaviour at launch, not a planning refusal. The
+// FIA V5 prototype this suite uses was transcribed from
+// aclnn_fused_infer_attention_score_v5.h; see common/aclnn_ops_950pr.hpp.
+//
+// THE SWEEP. The cartesian product of
+//
+//   S in {512, 1024, 2048, 4096, 8192}    ASCEND_BENCH_TQ_PREFILL_S
+//   B in {1, 2, 4}                        ASCEND_BENCH_TQ_PREFILL_B
+//   D in {128, 256}                       ASCEND_BENCH_TQ_PREFILL_D
+//   H_Q in {32, 64, 128}                  ASCEND_BENCH_TQ_PREFILL_HQ
+//   H_KV in {1, 2, 8}                     ASCEND_BENCH_TQ_PREFILL_HKV
+//
+// 270 shapes by default, each list overridable as a comma list. H_KV = 1 is the
+// MQA form DeepSeek MLA's single latent cache takes when it is served through
+// this operator -- a shape proxy, not the MLA kernel, which splits the rotary
+// half of Q/K into query_rope/key_rope. H_KV in {2, 8} are the GQA shapes.
+//
+// A shape whose estimated footprint exceeds 85% of free HBM is skipped with the
+// two numbers in the reason; the estimate does not know FIA's workspace, and
+// allows one more attention output for it.
+//
+// BUDGET. ASCEND_BENCH_TQ_PREFILL_WARMUP (3), _ITERS (10) and _BATCH (1), NOT the
+// shared ASCEND_BENCH_WARMUP / _ITERS / _BATCH: the largest shape attends over
+// 32,768 tokens and the decode suite's 20 + 3 * 100 launches would take hours on
+// it alone. Every timing mode ASCEND_BENCH_MODES selects still runs.
+//
+//   ASCEND_BENCH_TQ_PREFILL=0                 drops the suite.
+//   ASCEND_BENCH_TQ_PREFILL_LEGS=a,b          runs only the named legs.
+//   ASCEND_BENCH_TQ_PREFILL_CSV=<path>        the raw (case, mode) table.
+//   ASCEND_BENCH_TQ_PREFILL_COMPARE_CSV=<p>   one row per shape, every leg.
+//
+// REPORTED per shape: device time from ACL events (the device-events mode's
+// median, pipelined when that mode is not selected), GB/s over each leg's own
+// traffic model, TFLOP/s for the attention legs, and the KV-cache footprint of
+// TurboQuant 4-bit and of an 8-bit layout against fp16. The 8-bit figure is
+// LAYOUT ARITHMETIC ONLY: one byte per coordinate plus the same scale plane.
+// There is no 8-bit TurboQuant kernel -- TurboQuantCodec is instantiated for
+// b = 4 alone -- so there is no 8-bit leg to time.
+//
+// One correctness check runs once, on the smallest shape, before any timing:
+// FIA over V~, un-rotated on the host, must match FIA over V (cos > 0.9999).
+// That is the device-level statement that the folded prefill hands o_proj the
+// basis the fold expects.
+
+namespace prefill {
+
+// Every paged cache here is block_size 128, as the plugin's PrefillNoCache
+// branch names it.
+constexpr int64_t kBlockSize = s950::kDefaultBlockSize;
+// FIA's compressed causal mask for sparse_mode 3 is always 2048 x 2048, whatever
+// the sequence length; AttentionMaskBuilder.get_splitfuse_attn_mask builds the
+// same int8 triu(ones, diagonal=1).
+constexpr int64_t kCausalMaskSide = 2048;
+constexpr int64_t kFiaSparseModeRightDownCausal = 3;
+// FIA reads no paging in prefill, so its block size argument is torch_npu's 0.
+constexpr int64_t kFiaNoPaging = 0;
+// Tokens of distinct random data a scenario draws; longer contexts tile it.
+// Attention latency does not depend on the values, and generating 1e9 fp16
+// elements on the host for the largest query would cost minutes per shape.
+constexpr int64_t kPatternTokens = 1024;
+// Share of free HBM a shape may plan to occupy before it is skipped.
+constexpr double kHbmBudget = 0.85;
+// Elements a checksum reads back: enough to catch a nondeterministic launch
+// without copying gigabytes to the host twice per case.
+constexpr size_t kChecksumElements = 1u << 20;
+constexpr double kFoldIdentityMinCosine = 0.9999;
+constexpr int kDefaultWarmup = 3;
+constexpr int kDefaultIterations = 10;
+constexpr int kDefaultPipelineBatch = 1;
+
+constexpr const char* kLegTq4Write = "pf_tq4_write";
+constexpr const char* kLegRotateValue = "pf_rotate_v";
+constexpr const char* kLegFp16Write = "pf_fp16_write";
+constexpr const char* kLegFia = "pf_fia_v5";
+constexpr const char* kLegFp16Pipeline = "pf_fp16_pipeline";
+constexpr const char* kLegTq4Pipeline = "pf_tq4_pipeline";
+constexpr const char* kLegTq4FoldedPipeline = "pf_tq4_folded_pipeline";
+const char* const kAllLegs[] = {kLegTq4Write,     kLegRotateValue, kLegFp16Write,        kLegFia,
+                                kLegFp16Pipeline, kLegTq4Pipeline, kLegTq4FoldedPipeline};
+
+struct Shape {
+  int64_t batch = 0;
+  int64_t seq_len = 0;
+  int64_t head_size = 0;
+  int64_t num_heads = 0;
+  int64_t num_kv_heads = 0;
+
+  int64_t tokens() const { return batch * seq_len; }
+  int64_t blocks_per_seq() const { return tqh::CeilDiv(seq_len, kBlockSize); }
+  int64_t num_blocks() const { return batch * blocks_per_seq(); }
+};
+
+const char* Family(const Shape& shape) {
+  if (shape.num_kv_heads == 1) {
+    return "mqa/mla";
+  }
+  return shape.num_kv_heads == shape.num_heads ? "mha" : "gqa";
+}
+
+std::string CaseName(const char* leg, const Shape& shape) {
+  std::ostringstream name;
+  name << leg << "_b" << shape.batch << "_s" << shape.seq_len << "_d" << shape.head_size << "_hq" << shape.num_heads
+       << "_kv" << shape.num_kv_heads;
+  return name.str();
+}
+
+std::vector<int64_t> EnvList(const char* name, const std::vector<int64_t>& defaults) {
+  const char* raw = std::getenv(name);
+  if (raw == nullptr || *raw == '\0') {
+    return defaults;
+  }
+  std::vector<int64_t> values;
+  std::istringstream stream(raw);
+  std::string field;
+  while (std::getline(stream, field, ',')) {
+    const long long parsed = std::strtoll(field.c_str(), nullptr, 10);
+    if (parsed > 0) {
+      values.push_back(static_cast<int64_t>(parsed));
+    }
+  }
+  if (values.empty()) {
+    std::printf("[ascend-bench] %s='%s' parsed to nothing; using the default list\n", name, raw);
+    return defaults;
+  }
+  return values;
+}
+
+int EnvInt(const char* name, int fallback, int minimum) {
+  const char* raw = std::getenv(name);
+  if (raw == nullptr || *raw == '\0') {
+    return fallback;
+  }
+  const long parsed = std::strtol(raw, nullptr, 10);
+  return parsed < minimum ? minimum : static_cast<int>(parsed);
+}
+
+bool Enabled() {
+  const char* raw = std::getenv("ASCEND_BENCH_TQ_PREFILL");
+  return raw == nullptr || *raw == '\0' || std::string(raw) != "0";
+}
+
+bool LegEnabled(const char* leg) {
+  const char* raw = std::getenv("ASCEND_BENCH_TQ_PREFILL_LEGS");
+  if (raw == nullptr || *raw == '\0') {
+    return true;
+  }
+  std::istringstream stream(raw);
+  std::string field;
+  while (std::getline(stream, field, ',')) {
+    if (field == leg) {
+      return true;
+    }
+  }
+  return false;
+}
+
+BenchmarkOptions Options(const BenchmarkOptions& base) {
+  BenchmarkOptions options = base;
+  options.warmup_iterations = EnvInt("ASCEND_BENCH_TQ_PREFILL_WARMUP", kDefaultWarmup, 0);
+  options.timed_iterations = EnvInt("ASCEND_BENCH_TQ_PREFILL_ITERS", kDefaultIterations, 1);
+  options.pipeline_batch = EnvInt("ASCEND_BENCH_TQ_PREFILL_BATCH", kDefaultPipelineBatch, 1);
+  const char* csv = std::getenv("ASCEND_BENCH_TQ_PREFILL_CSV");
+  options.csv_path = csv == nullptr ? std::string() : std::string(csv);
+  return options;
+}
+
+// Ordered by D, H_Q, H_KV, B, S, so consecutive shapes allocate similar sizes and
+// the table reads as nested sweeps. Shapes the kernels reject are dropped here,
+// with a line saying so, rather than failing one by one.
+std::vector<Shape> Sweep() {
+  const std::vector<int64_t> seq_lens = EnvList("ASCEND_BENCH_TQ_PREFILL_S", {512, 1024, 2048, 4096, 8192});
+  const std::vector<int64_t> batches = EnvList("ASCEND_BENCH_TQ_PREFILL_B", {1, 2, 4});
+  const std::vector<int64_t> head_sizes = EnvList("ASCEND_BENCH_TQ_PREFILL_D", {128, 256});
+  const std::vector<int64_t> query_heads = EnvList("ASCEND_BENCH_TQ_PREFILL_HQ", {32, 64, 128});
+  const std::vector<int64_t> kv_heads = EnvList("ASCEND_BENCH_TQ_PREFILL_HKV", {1, 2, 8});
+
+  constexpr int64_t kMinHeadSize = 64;
+  constexpr int64_t kMaxHeadSize = 256;
+  std::vector<Shape> shapes;
+  for (const int64_t d : head_sizes) {
+    if (d < kMinHeadSize || d > kMaxHeadSize || (d & (d - 1)) != 0) {
+      std::printf("[ascend-bench] prefill: dropping D=%lld; the TurboQuant kernels take a power of two in [64, 256]\n",
+                  static_cast<long long>(d));
+      continue;
+    }
+    for (const int64_t hq : query_heads) {
+      for (const int64_t hkv : kv_heads) {
+        if (hkv > hq || hq % hkv != 0) {
+          std::printf("[ascend-bench] prefill: dropping H_Q=%lld H_KV=%lld; H_Q must be a multiple of H_KV\n",
+                      static_cast<long long>(hq), static_cast<long long>(hkv));
+          continue;
+        }
+        for (const int64_t b : batches) {
+          for (const int64_t s : seq_lens) {
+            Shape shape;
+            shape.batch = b;
+            shape.seq_len = s;
+            shape.head_size = d;
+            shape.num_heads = hq;
+            shape.num_kv_heads = hkv;
+            shapes.push_back(shape);
+          }
+        }
+      }
+    }
+  }
+  return shapes;
+}
+
+// --- traffic -----------------------------------------------------------------
+//
+// Bytes each leg is handed in and writes out, under the decode suite's
+// convention: what the kernel asks the memory system for, not an internal
+// working set nobody can see. FIA's own workspace is therefore not in it.
+struct Traffic {
+  double fp16_kv = 0.0;
+  double tq4_kv = 0.0;
+  double kv8_kv = 0.0;
+  double tq4_write = 0.0;
+  double rotate_value = 0.0;
+  double fp16_write = 0.0;
+  double fia = 0.0;
+  double fp16_pipeline = 0.0;
+  double tq4_pipeline = 0.0;
+  double tq4_folded_pipeline = 0.0;
+  // Causal attention, QK^T and the value accumulation at two operations per
+  // element each: 4 * B * H_Q * D * S (S + 1) / 2. The decode suite's
+  // AttentionFlops is the same count at one query token.
+  double attention_flops = 0.0;
+
+  double tq4_ratio() const { return tq4_kv > 0.0 ? fp16_kv / tq4_kv : 0.0; }
+  double kv8_ratio() const { return kv8_kv > 0.0 ? fp16_kv / kv8_kv : 0.0; }
+};
+
+Traffic ModelTraffic(const Shape& shape) {
+  const double t = static_cast<double>(shape.tokens());
+  const double s = static_cast<double>(shape.seq_len);
+  const double d = static_cast<double>(shape.head_size);
+  const double hq = static_cast<double>(shape.num_heads);
+  const double kv = static_cast<double>(shape.num_kv_heads);
+  const double scale_plane = t * static_cast<double>(tqh::ScaleSlotFloats(shape.num_kv_heads)) * kFloatBytes;
+
+  Traffic traffic;
+  traffic.fp16_kv = 2.0 * t * kv * d * kHalfBytes;
+  traffic.tq4_kv = 2.0 * t * kv * (d / static_cast<double>(tqh::kPackFactor)) + scale_plane;
+  traffic.kv8_kv = 2.0 * t * kv * d + scale_plane;
+
+  const double slots = t * kFloatBytes;
+  const double query = t * hq * d * kHalfBytes;
+  const double output = query;
+  const double mask = static_cast<double>(kCausalMaskSide * kCausalMaskSide);
+  traffic.tq4_write = traffic.fp16_kv + traffic.tq4_kv + slots;
+  traffic.rotate_value = t * kv * d * (kHalfBytes + kFloatBytes);
+  traffic.fp16_write = 2.0 * traffic.fp16_kv + slots;
+  traffic.fia = query + traffic.fp16_kv + output + mask;
+  traffic.fp16_pipeline = traffic.fp16_write + traffic.fia;
+  traffic.tq4_pipeline = traffic.tq4_write + traffic.fia;
+  traffic.tq4_folded_pipeline = traffic.tq4_write + traffic.rotate_value + traffic.fia;
+  traffic.attention_flops = 4.0 * static_cast<double>(shape.batch) * hq * d * s * (s + 1.0) / 2.0;
+  return traffic;
+}
+
+// HBM a scenario allocates, bar FIA's workspace, which is allowed one more
+// attention output.
+double ScenarioBytes(const Shape& shape) {
+  const double t = static_cast<double>(shape.tokens());
+  const double d = static_cast<double>(shape.head_size);
+  const double hq = static_cast<double>(shape.num_heads);
+  const double kv = static_cast<double>(shape.num_kv_heads);
+  const double pool_rows = static_cast<double>(shape.num_blocks() * kBlockSize);
+  const double attention_output = t * hq * d * kHalfBytes;
+  const double activations = attention_output + 3.0 * t * kv * d * kHalfBytes + t * kv * d * kFloatBytes;
+  const double tq4_cache = 2.0 * pool_rows * kv * (d / static_cast<double>(tqh::kPackFactor)) +
+                           pool_rows * static_cast<double>(tqh::ScaleSlotFloats(shape.num_kv_heads)) * kFloatBytes;
+  const double fp16_cache = 2.0 * pool_rows * kv * d * kHalfBytes;
+  return activations + 3.0 * attention_output + tq4_cache + fp16_cache +
+         static_cast<double>(kCausalMaskSide * kCausalMaskSide);
+}
+
+// --- device data -------------------------------------------------------------
+
+// Fills `dst` by repeating `pattern` end to end. Whole-pattern copies, so the
+// tiled rows stay aligned to token boundaries when the pattern is whole tokens.
+template <typename T>
+void TileToDevice(const DeviceBuffer& dst, const std::vector<T>& pattern) {
+  const size_t total = dst.size_bytes();
+  const size_t chunk = pattern.size() * sizeof(T);
+  for (size_t offset = 0; offset < total && chunk > 0; offset += chunk) {
+    const size_t bytes = std::min(chunk, total - offset);
+    ACL_CHECK(aclrtMemcpy(static_cast<char*>(dst.get()) + offset, dst.capacity_bytes() - offset, pattern.data(),
+                          bytes, ACL_MEMCPY_HOST_TO_DEVICE));
+  }
+}
+
+// Checksum over at most kChecksumElements leading elements of a buffer.
+template <typename T>
+std::vector<T> LeadingElements(const DeviceBuffer& buffer) {
+  std::vector<T> host(std::min(buffer.size_bytes() / sizeof(T), kChecksumElements));
+  if (!host.empty()) {
+    buffer.CopyToHost(host.data(), host.size() * sizeof(T));
+  }
+  return host;
+}
+
+const AclnnOp& FiaV5() {
+  static const AclnnOp op(ops950::kFusedInferAttentionScoreV5);
+  return op;
+}
+const AclnnOp& FiaV2() {
+  static const AclnnOp op(ops950::kFusedInferAttentionScoreV2);
+  return op;
+}
+const AclnnOp& ScatterPaKvCache() {
+  static const AclnnOp op(ops::kScatterPaKvCache);
+  return op;
+}
+
+/*
+ * One prefill shape on the device. Built, timed and destroyed before the next
+ * shape is built, so the sweep's peak HBM is its largest shape's and not the
+ * sum of all of them.
+ *
+ * The aclnn descriptors are unique_ptrs created in dependency order, and the
+ * planned operators are declared last so they are destroyed first: a
+ * PlannedOp holds the descriptor handles it was planned with.
+ */
+class Scenario {
+ public:
+  Scenario(const Shape& shape, int64_t aiv_num) : shape_(shape), aiv_num_(aiv_num) {
+    const int64_t t = shape.tokens();
+    const int64_t d = shape.head_size;
+    const int64_t hq = shape.num_heads;
+    const int64_t hkv = shape.num_kv_heads;
+    const int64_t pattern_tokens = std::min<int64_t>(t, kPatternTokens);
+    const auto elems = [](int64_t a, int64_t b, int64_t c) { return static_cast<size_t>(a * b * c); };
+
+    DeterministicRandom rng(0x9F11u + static_cast<uint32_t>(shape.seq_len + 7 * shape.batch + 31 * d +
+                                                              127 * hq + 509 * hkv));
+    const std::vector<float> query = rng.NormalHalfExact(elems(pattern_tokens, hq, d), 0.0f, 1.0f);
+    const std::vector<float> key = rng.NormalHalfExact(elems(pattern_tokens, hkv, d), 0.0f, 1.0f);
+    std::vector<float> value = rng.NormalHalfExact(elems(pattern_tokens, hkv, d), 0.0f, 1.0f);
+
+    query_ = DeviceBuffer::Empty<Half>(elems(t, hq, d), kBenchmarkAlignBytes);
+    key_ = DeviceBuffer::Empty<Half>(elems(t, hkv, d), kBenchmarkAlignBytes);
+    value_ = DeviceBuffer::Empty<Half>(elems(t, hkv, d), kBenchmarkAlignBytes);
+    value_rot_half_ = DeviceBuffer::Empty<Half>(elems(t, hkv, d), kBenchmarkAlignBytes);
+    TileToDevice(query_, FloatToHalf(query));
+    TileToDevice(key_, FloatToHalf(key));
+    TileToDevice(value_, FloatToHalf(value));
+    // V~ = Pi V, per head, for the folded pipeline's attention; see the note on
+    // the untimed cast at the top of this section.
+    const std::vector<int8_t> signs = turboquant_ref::cpu_pi_sign_vector(static_cast<int>(d));
+    for (size_t base = 0; base + static_cast<size_t>(d) <= value.size(); base += static_cast<size_t>(d)) {
+      turboquant_ref::cpu_apply_pi(value.data() + base, static_cast<int>(d), signs.data());
+    }
+    TileToDevice(value_rot_half_, FloatToHalf(value));
+    value_rot_fp32_ = DeviceBuffer::Empty<float>(elems(t, hkv, d), kBenchmarkAlignBytes);
+
+    // Each sequence gets its own run of blocks out of a shuffled pool, so the
+    // cache writes scatter the way a serving pool does.
+    const int64_t blocks_per_seq = shape.blocks_per_seq();
+    const std::vector<int32_t> pool = rng.Permutation(static_cast<int32_t>(shape.num_blocks()));
+    std::vector<int32_t> slots(static_cast<size_t>(t));
+    for (int64_t seq = 0; seq < shape.batch; ++seq) {
+      for (int64_t pos = 0; pos < shape.seq_len; ++pos) {
+        const int32_t block = pool[static_cast<size_t>(seq * blocks_per_seq + pos / kBlockSize)];
+        slots[static_cast<size_t>(seq * shape.seq_len + pos)] =
+            block * static_cast<int32_t>(kBlockSize) + static_cast<int32_t>(pos % kBlockSize);
+      }
+    }
+    slots_ = DeviceBuffer::FromHost(slots, kBenchmarkAlignBytes);
+    pi_signs_ = DeviceBuffer::FromHost(tqh::PiSigns(d), kBenchmarkAlignBytes);
+    h16_ = DeviceBuffer::FromHost(tqh::Hadamard16Half(), kBenchmarkAlignBytes);
+    write_tables_ = DeviceBuffer::FromHost(tqh::CodecTables(d, 1), kBenchmarkAlignBytes);
+
+    tq4_key_cache_ = DeviceBuffer::Empty<int8_t>(tqh::PackedCacheBytes(shape.num_blocks(), kBlockSize, hkv, d),
+                                                 kBenchmarkAlignBytes);
+    tq4_value_cache_ = DeviceBuffer::Empty<int8_t>(tq4_key_cache_.size_bytes(), kBenchmarkAlignBytes);
+    scale_plane_ = DeviceBuffer::Empty<float>(tqh::ScalePlaneFloats(shape.num_blocks(), kBlockSize, hkv),
+                                              kBenchmarkAlignBytes);
+    fp16_key_cache_ = DeviceBuffer::Empty<Half>(elems(shape.num_blocks() * kBlockSize, hkv, d), kBenchmarkAlignBytes);
+    fp16_value_cache_ = DeviceBuffer::Empty<Half>(fp16_key_cache_.size_bytes() / sizeof(Half), kBenchmarkAlignBytes);
+
+    std::vector<int8_t> mask(static_cast<size_t>(kCausalMaskSide * kCausalMaskSide), 0);
+    for (int64_t row = 0; row < kCausalMaskSide; ++row) {
+      for (int64_t col = row + 1; col < kCausalMaskSide; ++col) {
+        mask[static_cast<size_t>(row * kCausalMaskSide + col)] = 1;
+      }
+    }
+    mask_ = DeviceBuffer::FromHost(mask, kBenchmarkAlignBytes);
+    out_ = DeviceBuffer::Empty<Half>(elems(t, hq, d), kBenchmarkAlignBytes);
+    out_rot_ = DeviceBuffer::Empty<Half>(elems(t, hq, d), kBenchmarkAlignBytes);
+    lse_ = DeviceBuffer::Empty<Half>(1, kBenchmarkAlignBytes);
+    lse_rot_ = DeviceBuffer::Empty<Half>(1, kBenchmarkAlignBytes);
+
+    write_grid_ = tqh::PlanReshapeAndCache(t, aiv_num);
+
+    // --- descriptors ---------------------------------------------------------
+    query_tnd_.reset(new AclnnTensor({t, hq, d}, ACL_FLOAT16, query_.get()));
+    key_tnd_.reset(new AclnnTensor({t, hkv, d}, ACL_FLOAT16, key_.get()));
+    value_tnd_.reset(new AclnnTensor({t, hkv, d}, ACL_FLOAT16, value_.get()));
+    value_rot_tnd_.reset(new AclnnTensor({t, hkv, d}, ACL_FLOAT16, value_rot_half_.get()));
+    mask_tensor_.reset(new AclnnTensor({kCausalMaskSide, kCausalMaskSide}, ACL_INT8, mask_.get()));
+    out_tensor_.reset(new AclnnTensor({t, hq, d}, ACL_FLOAT16, out_.get()));
+    out_rot_tensor_.reset(new AclnnTensor({t, hq, d}, ACL_FLOAT16, out_rot_.get()));
+    lse_tensor_.reset(new AclnnTensor({1}, ACL_FLOAT16, lse_.get()));
+    lse_rot_tensor_.reset(new AclnnTensor({1}, ACL_FLOAT16, lse_rot_.get()));
+    slots_tensor_.reset(new AclnnTensor({t}, ACL_INT32, slots_.get()));
+    fp16_key_cache_tensor_.reset(
+        new AclnnTensor({shape.num_blocks(), kBlockSize, hkv, d}, ACL_FLOAT16, fp16_key_cache_.get()));
+    fp16_value_cache_tensor_.reset(
+        new AclnnTensor({shape.num_blocks(), kBlockSize, hkv, d}, ACL_FLOAT16, fp16_value_cache_.get()));
+    key_list_.reset(new AclnnTensorList({key_tnd_->get()}));
+    value_list_.reset(new AclnnTensorList({value_tnd_->get()}));
+    value_rot_list_.reset(new AclnnTensorList({value_rot_tnd_->get()}));
+    // TND wants the cumulative token count at the end of each sequence, the
+    // actual_seq_lengths_q the plugin passes for both Q and KV.
+    std::vector<int64_t> cumulative(static_cast<size_t>(shape.batch));
+    for (int64_t seq = 0; seq < shape.batch; ++seq) {
+      cumulative[static_cast<size_t>(seq)] = (seq + 1) * shape.seq_len;
+    }
+    seq_lens_.reset(new AclnnIntArray(cumulative));
+
+    // --- planning ------------------------------------------------------------
+    fia_ = PlanFia(value_list_->get(), out_tensor_->get(), lse_tensor_->get(), &fia_op_, &fia_note_);
+    fia_rot_ = PlanFia(value_rot_list_->get(), out_rot_tensor_->get(), lse_rot_tensor_->get(), &fia_op_, &fia_note_);
+    try {
+      fp16_write_.reset(new PlannedOp(PlanAclnn<ops::ScatterPaKvCacheWorkspaceFn>(
+          ScatterPaKvCache(), key_tnd_->get(), fp16_key_cache_tensor_->get(), slots_tensor_->get(),
+          value_tnd_->get(), fp16_value_cache_tensor_->get(), /*compress_lens=*/nullptr,
+          /*compress_seq_offset=*/nullptr, /*seq_lens=*/nullptr, const_cast<char*>(ops::kScatterCacheModeNorm),
+          /*scatter_mode=*/nullptr, /*strides=*/nullptr, /*offsets=*/nullptr)));
+    } catch (const AclError& error) {
+      fp16_write_note_ = std::string(ops::kScatterPaKvCache) + ": " + error.what();
+    }
+  }
+
+  void EnqueueTq4Write(aclrtStream stream) const {
+    turboquant_reshape_and_cache_impl(
+        AscendType::FP16, stream, write_grid_.block_dim, key_.get(), value_.get(), tq4_key_cache_.get(),
+        tq4_value_cache_.get(), scale_plane_.get(), slots_.get(), pi_signs_.get(), write_tables_.get(),
+        static_cast<uint32_t>(shape_.tokens()), static_cast<uint32_t>(shape_.num_kv_heads),
+        static_cast<uint32_t>(shape_.head_size), static_cast<uint32_t>(kBlockSize), write_grid_.tokens_per_core,
+        1.0f / std::sqrt(static_cast<float>(shape_.head_size)));
+  }
+
+  // The same operator the backend launches on V for a folded layer. It is the
+  // query rotation's kernel; Pi does not care which activation it is handed.
+  void EnqueueRotateValue(aclrtStream stream) const {
+    tqh::RotateQuery(stream, AscendType::FP16, value_.get(), pi_signs_.get(), h16_.get(), write_tables_.get(),
+                     value_rot_fp32_.get(), shape_.tokens(), shape_.num_kv_heads, shape_.head_size, aiv_num_,
+                     /*input_exact_in_half=*/true);
+  }
+
+  void EnqueueFp16Write(aclrtStream stream) const { fp16_write_->Launch(stream); }
+  void EnqueueFia(aclrtStream stream) const { fia_->Launch(stream); }
+  void EnqueueFiaRotated(aclrtStream stream) const { fia_rot_->Launch(stream); }
+
+  bool fia_available() const { return fia_ != nullptr && fia_rot_ != nullptr; }
+  bool fp16_write_available() const { return fp16_write_ != nullptr; }
+  const std::string& fia_op() const { return fia_op_; }
+  const std::string& fia_note() const { return fia_note_; }
+  const std::string& fp16_write_note() const { return fp16_write_note_; }
+
+  double ScaleChecksum() const { return ChecksumSum(LeadingElements<float>(scale_plane_)); }
+  double RotatedValueChecksum() const { return ChecksumSum(LeadingElements<float>(value_rot_fp32_)); }
+  double Fp16CacheChecksum() const { return ChecksumSum(HalfToFloat(LeadingElements<Half>(fp16_value_cache_))); }
+  double OutputChecksum() const { return ChecksumSum(HalfToFloat(LeadingElements<Half>(out_))); }
+  double RotatedOutputChecksum() const { return ChecksumSum(HalfToFloat(LeadingElements<Half>(out_rot_))); }
+
+  std::vector<float> Output() const { return HalfToFloat(out_.ToHost<Half>()); }
+  std::vector<float> RotatedOutput() const { return HalfToFloat(out_rot_.ToHost<Half>()); }
+
+ private:
+  std::unique_ptr<PlannedOp> PlanFia(const aclTensorList* value_list, const aclTensor* out, const aclTensor* lse,
+                                     std::string* op_name, std::string* note) {
+    const int64_t hq = shape_.num_heads;
+    const int64_t hkv = shape_.num_kv_heads;
+    const double scale = 1.0 / std::sqrt(static_cast<double>(shape_.head_size));
+    try {
+      std::unique_ptr<PlannedOp> planned(new PlannedOp(PlanAclnn<ops950::FusedInferAttentionScoreV5WorkspaceFn>(
+          FiaV5(), query_tnd_->get(), key_list_->get(), value_list, /*pse_shift=*/nullptr, mask_tensor_->get(),
+          seq_lens_->get(), seq_lens_->get(), /*deq_scale1=*/nullptr, /*quant_scale1=*/nullptr,
+          /*deq_scale2=*/nullptr, /*quant_scale2=*/nullptr, /*quant_offset2=*/nullptr, /*antiquant_scale=*/nullptr,
+          /*antiquant_offset=*/nullptr, /*block_table=*/nullptr, /*query_padding_size=*/nullptr,
+          /*kv_padding_size=*/nullptr, /*key_antiquant_scale=*/nullptr, /*key_antiquant_offset=*/nullptr,
+          /*value_antiquant_scale=*/nullptr, /*value_antiquant_offset=*/nullptr, /*key_shared_prefix=*/nullptr,
+          /*value_shared_prefix=*/nullptr, /*actual_shared_prefix_len=*/nullptr, /*query_rope=*/nullptr,
+          /*key_rope=*/nullptr, /*key_rope_antiquant_scale=*/nullptr, /*dequant_scale_query=*/nullptr,
+          /*learnable_sink=*/nullptr, /*q_start_idx=*/nullptr, /*kv_start_idx=*/nullptr, hq, scale,
+          s950::kFiaUnboundedTokens, s950::kFiaUnboundedTokens, const_cast<char*>(ops950::kFiaLayoutTnd), hkv,
+          kFiaSparseModeRightDownCausal, s950::kFiaInnerPreciseDefault, kFiaNoPaging, /*antiquant_mode=*/0,
+          /*softmax_lse_flag=*/false, /*key_antiquant_mode=*/0, /*value_antiquant_mode=*/0,
+          s950::kFiaQueryQuantModeNone, s950::kFiaPseTypeDefault, out, lse)));
+      *op_name = ops950::kFusedInferAttentionScoreV5;
+      return planned;
+    } catch (const AclError& error) {
+      *note = std::string(ops950::kFusedInferAttentionScoreV5) + ": " + error.what();
+    }
+    try {
+      std::unique_ptr<PlannedOp> planned(new PlannedOp(PlanAclnn<ops950::FusedInferAttentionScoreV2WorkspaceFn>(
+          FiaV2(), query_tnd_->get(), key_list_->get(), value_list, /*pse_shift=*/nullptr, mask_tensor_->get(),
+          seq_lens_->get(), seq_lens_->get(), /*deq_scale1=*/nullptr, /*quant_scale1=*/nullptr,
+          /*deq_scale2=*/nullptr, /*quant_scale2=*/nullptr, /*quant_offset2=*/nullptr, /*antiquant_scale=*/nullptr,
+          /*antiquant_offset=*/nullptr, /*block_table=*/nullptr, /*query_padding_size=*/nullptr,
+          /*kv_padding_size=*/nullptr, /*key_antiquant_scale=*/nullptr, /*key_antiquant_offset=*/nullptr,
+          /*value_antiquant_scale=*/nullptr, /*value_antiquant_offset=*/nullptr, /*key_shared_prefix=*/nullptr,
+          /*value_shared_prefix=*/nullptr, /*actual_shared_prefix_len=*/nullptr, hq, scale,
+          s950::kFiaUnboundedTokens, s950::kFiaUnboundedTokens, const_cast<char*>(ops950::kFiaLayoutTnd), hkv,
+          kFiaSparseModeRightDownCausal, s950::kFiaInnerPreciseDefault, kFiaNoPaging, /*antiquant_mode=*/0,
+          /*softmax_lse_flag=*/false, /*key_antiquant_mode=*/0, /*value_antiquant_mode=*/0, out, lse)));
+      *op_name = ops950::kFusedInferAttentionScoreV2;
+      return planned;
+    } catch (const AclError& error) {
+      *note += std::string("; ") + ops950::kFusedInferAttentionScoreV2 + ": " + error.what();
+    }
+    return nullptr;
+  }
+
+  Shape shape_;
+  int64_t aiv_num_ = 0;
+  tqh::ReshapeAndCacheGrid write_grid_;
+
+  DeviceBuffer query_, key_, value_, value_rot_half_, value_rot_fp32_;
+  DeviceBuffer slots_, pi_signs_, h16_, write_tables_;
+  DeviceBuffer tq4_key_cache_, tq4_value_cache_, scale_plane_;
+  DeviceBuffer fp16_key_cache_, fp16_value_cache_;
+  DeviceBuffer mask_, out_, out_rot_, lse_, lse_rot_;
+
+  std::unique_ptr<AclnnTensor> query_tnd_, key_tnd_, value_tnd_, value_rot_tnd_, mask_tensor_;
+  std::unique_ptr<AclnnTensor> out_tensor_, out_rot_tensor_, lse_tensor_, lse_rot_tensor_;
+  std::unique_ptr<AclnnTensor> slots_tensor_, fp16_key_cache_tensor_, fp16_value_cache_tensor_;
+  std::unique_ptr<AclnnTensorList> key_list_, value_list_, value_rot_list_;
+  std::unique_ptr<AclnnIntArray> seq_lens_;
+
+  std::string fia_op_, fia_note_, fp16_write_note_;
+  // Last, so destroyed first.
+  std::unique_ptr<PlannedOp> fia_, fia_rot_, fp16_write_;
+};
+
+// --- reporting ---------------------------------------------------------------
+
+struct Sample {
+  bool present = false;
+  double median_us = 0.0;
+  double gigabytes_per_second = 0.0;
+  double tflops = 0.0;
+  const char* mode = "-";
+};
+
+// Device time: the device-events mode when it ran, pipelined otherwise.
+Sample SampleFor(const BenchmarkRunner& runner, const char* leg, const Shape& shape) {
+  Sample sample;
+  const std::string name = CaseName(leg, shape);
+  for (const TimingMode mode : {TimingMode::kDeviceEvents, TimingMode::kPipelined}) {
+    const BenchmarkResult* result = FindResult(runner, name, mode);
+    if (result != nullptr && result->latency.median_us > 0.0) {
+      sample.present = true;
+      sample.median_us = result->latency.median_us;
+      sample.gigabytes_per_second = result->gigabytes_per_second();
+      sample.tflops = result->tflops();
+      sample.mode = TimingModeLabel(mode);
+      return sample;
+    }
+  }
+  return sample;
+}
+
+double Ratio(const Sample& numerator, const Sample& denominator) {
+  return numerator.present && denominator.present && denominator.median_us > 0.0
+             ? numerator.median_us / denominator.median_us
+             : 0.0;
+}
+
+void PrintCompression(const std::vector<Shape>& sweep) {
+  std::printf("\n[ascend-bench] prefill KV-cache footprint per token (layout arithmetic, both K and V)\n");
+  std::printf("  %4s %4s  %12s %12s %12s  %9s %9s\n", "D", "H_KV", "fp16 B", "tq4 B", "kv8 B", "fp16/tq4",
+              "fp16/kv8");
+  std::vector<std::pair<int64_t, int64_t>> printed;
+  for (const Shape& shape : sweep) {
+    const std::pair<int64_t, int64_t> key(shape.head_size, shape.num_kv_heads);
+    if (std::find(printed.begin(), printed.end(), key) != printed.end()) {
+      continue;
+    }
+    printed.push_back(key);
+    Shape one = shape;
+    one.batch = 1;
+    one.seq_len = 1;
+    const Traffic traffic = ModelTraffic(one);
+    std::printf("  %4lld %4lld  %12.0f %12.0f %12.0f  %8.2fx %8.2fx\n", static_cast<long long>(shape.head_size),
+                static_cast<long long>(shape.num_kv_heads), traffic.fp16_kv, traffic.tq4_kv, traffic.kv8_kv,
+                traffic.tq4_ratio(), traffic.kv8_ratio());
+  }
+  std::printf("[ascend-bench]   tq4 is the shipping 4-bit layout: D/2 packed bytes per vector plus a scale plane of\n"
+              "[ascend-bench]   round_up(2 * H_KV, 8) fp32 per token, whose burst padding is why H_KV = 1 and 2 pay\n"
+              "[ascend-bench]   more per head. kv8 is the same scale plane with a byte per coordinate. There is NO\n"
+              "[ascend-bench]   8-bit TurboQuant kernel; that column is arithmetic, not a measurement.\n");
+}
+
+void WriteCompareCsv(const BenchmarkRunner& runner, const std::vector<Shape>& sweep, const std::string& path,
+                     const std::string& fia_operator) {
+  std::ofstream csv(path, std::ios::trunc);
+  if (!csv) {
+    std::printf("[ascend-bench] could not open ASCEND_BENCH_TQ_PREFILL_COMPARE_CSV='%s' for writing\n",
+                path.c_str());
+    return;
+  }
+  csv << "batch,seq_len,head_dim,num_heads,num_kv_heads,family,fia_operator";
+  for (const char* leg : kAllLegs) {
+    csv << ',' << leg << "_us," << leg << "_gbps";
+  }
+  csv << ",fia_tflops,tq4_pipeline_over_fp16,tq4_folded_over_fp16,fp16_kv_bytes,tq4_kv_bytes,kv8_kv_bytes,"
+      << "fp16_over_tq4,fp16_over_kv8\n";
+  for (const Shape& shape : sweep) {
+    const Traffic traffic = ModelTraffic(shape);
+    csv << shape.batch << ',' << shape.seq_len << ',' << shape.head_size << ',' << shape.num_heads << ','
+        << shape.num_kv_heads << ',' << Family(shape) << ',' << fia_operator;
+    for (const char* leg : kAllLegs) {
+      const Sample sample = SampleFor(runner, leg, shape);
+      csv << ',';
+      if (sample.present) {
+        csv << sample.median_us;
+      }
+      csv << ',';
+      if (sample.present) {
+        csv << sample.gigabytes_per_second;
+      }
+    }
+    const Sample fia = SampleFor(runner, kLegFia, shape);
+    const Sample fp16 = SampleFor(runner, kLegFp16Pipeline, shape);
+    const double ratios[] = {Ratio(SampleFor(runner, kLegTq4Pipeline, shape), fp16),
+                             Ratio(SampleFor(runner, kLegTq4FoldedPipeline, shape), fp16)};
+    csv << ',';
+    if (fia.present) {
+      csv << fia.tflops;
+    }
+    for (const double ratio : ratios) {
+      csv << ',';
+      if (ratio > 0.0) {
+        csv << ratio;
+      }
+    }
+    csv << ',' << traffic.fp16_kv << ',' << traffic.tq4_kv << ',' << traffic.kv8_kv << ',' << traffic.tq4_ratio()
+        << ',' << traffic.kv8_ratio() << '\n';
+  }
+  std::printf("[ascend-bench] prefill comparison CSV written to %s\n", path.c_str());
+}
+
+void PrintSummary(const BenchmarkRunner& runner, const std::vector<Shape>& sweep, const std::string& fia_operator) {
+  std::printf("\n[ascend-bench] TurboQuant prefill summary: device time from ACL events, median us (stock operator: "
+              "%s)\n",
+              fia_operator.c_str());
+  std::printf("  %2s %5s %4s %4s %3s %-7s | %10s %10s %10s %11s | %11s %11s %11s | %7s %7s | %8s %8s %8s\n", "B",
+              "S", "D", "H_Q", "KV", "family", "tq4 write", "rotate V", "fp16 write", "fia v5", "fp16 pipe",
+              "tq4 pipe", "tq4 folded", "tq4/fp", "fold/fp", "fia GB/s", "tq4 GB/s", "fia TF/s");
+  bool any = false;
+  for (const Shape& shape : sweep) {
+    const Sample samples[] = {SampleFor(runner, kLegTq4Write, shape),     SampleFor(runner, kLegRotateValue, shape),
+                              SampleFor(runner, kLegFp16Write, shape),    SampleFor(runner, kLegFia, shape),
+                              SampleFor(runner, kLegFp16Pipeline, shape), SampleFor(runner, kLegTq4Pipeline, shape),
+                              SampleFor(runner, kLegTq4FoldedPipeline, shape)};
+    bool row = false;
+    for (const Sample& sample : samples) {
+      row = row || sample.present;
+    }
+    if (!row) {
+      continue;
+    }
+    any = true;
+    std::printf("  %2lld %5lld %4lld %4lld %3lld %-7s |", static_cast<long long>(shape.batch),
+                static_cast<long long>(shape.seq_len), static_cast<long long>(shape.head_size),
+                static_cast<long long>(shape.num_heads), static_cast<long long>(shape.num_kv_heads), Family(shape));
+    const int widths[] = {10, 10, 10, 11, 11, 11, 11};
+    for (size_t leg = 0; leg < sizeof(samples) / sizeof(samples[0]); ++leg) {
+      if (samples[leg].present) {
+        std::printf(" %*.1f", widths[leg], samples[leg].median_us);
+      } else {
+        std::printf(" %*s", widths[leg], "-");
+      }
+      if (leg == 3) {
+        std::printf(" |");
+      }
+    }
+    std::printf(" |");
+    for (const double ratio : {Ratio(samples[5], samples[4]), Ratio(samples[6], samples[4])}) {
+      if (ratio > 0.0) {
+        std::printf(" %6.3fx", ratio);
+      } else {
+        std::printf(" %7s", "-");
+      }
+    }
+    std::printf(" |");
+    for (const double value : {samples[3].gigabytes_per_second, samples[5].gigabytes_per_second, samples[3].tflops}) {
+      if (value > 0.0) {
+        std::printf(" %8.2f", value);
+      } else {
+        std::printf(" %8s", "-");
+      }
+    }
+    std::printf("\n");
+  }
+  if (!any) {
+    std::printf("  (no prefill case produced a sample)\n");
+  }
+  std::printf("[ascend-bench]   tq4/fp and fold/fp are pipeline latency over the fp16 pipeline: above 1 is what the\n"
+              "[ascend-bench]   4-bit cache costs a prefill, since both pipelines run the same fp16 attention and differ\n"
+              "[ascend-bench]   in the write (and, folded, the rotation of V). The saving is in the cache footprint\n"
+              "[ascend-bench]   below and in the decode suite, not here. GB/s is each leg's traffic model over its own\n"
+              "[ascend-bench]   time; the folded pipeline's fp32 -> fp16 cast of V~ is not in any column.\n");
+  PrintCompression(sweep);
+  std::fflush(stdout);
+
+  const char* path = std::getenv("ASCEND_BENCH_TQ_PREFILL_COMPARE_CSV");
+  if (path != nullptr && *path != '\0') {
+    WriteCompareCsv(runner, sweep, path, fia_operator);
+  }
+}
+
+// FIA over V~ un-rotated on the host must be FIA over V: the fold identity at
+// the attention output, on the device, before anything is timed.
+double FoldedBasisCosine(const Scenario& scenario, const Shape& shape, aclrtStream stream) {
+  scenario.EnqueueFia(stream);
+  scenario.EnqueueFiaRotated(stream);
+  ACL_CHECK(aclrtSynchronizeStream(stream));
+  const std::vector<float> plain = scenario.Output();
+  const std::vector<float> folded = tqh::UnrotateHeads(scenario.RotatedOutput(), shape.head_size);
+  return turboquant_ref::cpu_fidelity(folded, plain).cosine_similarity;
+}
+
+void Run(BenchmarkRunner& decode_runner, int64_t aiv_num) {
+  if (!Enabled()) {
+    std::printf("\n[ascend-bench] prefill suite dropped by ASCEND_BENCH_TQ_PREFILL=0\n");
+    return;
+  }
+  const std::vector<Shape> sweep = Sweep();
+  BenchmarkRunner runner(std::string(kSuiteName) + " -- prefill", Options(decode_runner.options()),
+                         decode_runner.stream());
+  std::printf("\n[ascend-bench] TurboQuant prefill suite: %zu shapes x %zu legs, warmup=%d iterations=%d "
+              "pipeline_batch=%d per case\n",
+              sweep.size(), sizeof(kAllLegs) / sizeof(kAllLegs[0]), runner.options().warmup_iterations,
+              runner.options().timed_iterations, runner.options().pipeline_batch);
+  std::fflush(stdout);
+
+  const auto fail = [&](const std::string& name, const std::string& why) {
+    runner.RecordFailure(name, why);
+    decode_runner.RecordFailure(name, why);
+  };
+  const auto run_leg = [&](const char* leg, const Shape& shape, double flops, double bytes, int tasks,
+                           std::function<void(aclrtStream)> launch, std::function<double()> checksum) {
+    const std::string name = CaseName(leg, shape);
+    if (!LegEnabled(leg)) {
+      runner.Skip(name, "not in ASCEND_BENCH_TQ_PREFILL_LEGS");
+      return;
+    }
+    try {
+      BenchmarkCase benchmark_case;
+      benchmark_case.name = name;
+      benchmark_case.flops_per_iteration = flops;
+      benchmark_case.bytes_per_iteration = bytes;
+      benchmark_case.tasks_per_launch = tasks;
+      benchmark_case.launch = std::move(launch);
+      benchmark_case.checksum = std::move(checksum);
+      runner.Run(benchmark_case);
+    } catch (const std::exception& error) {
+      fail(name, error.what());
+    }
+  };
+
+  // The identity check runs on the smallest shape, where reading two attention
+  // outputs back costs megabytes rather than gigabytes.
+  size_t check_index = sweep.size();
+  for (size_t index = 0; index < sweep.size(); ++index) {
+    if (check_index == sweep.size() || sweep[index].tokens() * sweep[index].num_heads * sweep[index].head_size <
+                                           sweep[check_index].tokens() * sweep[check_index].num_heads *
+                                               sweep[check_index].head_size) {
+      check_index = index;
+    }
+  }
+
+  std::string fia_operator = "none";
+  for (size_t index = 0; index < sweep.size(); ++index) {
+    const Shape& shape = sweep[index];
+    const Traffic traffic = ModelTraffic(shape);
+
+    size_t free_hbm = 0;
+    size_t total_hbm = 0;
+    const bool known = aclrtGetMemInfo(ACL_HBM_MEM, &free_hbm, &total_hbm) == ACL_SUCCESS && free_hbm > 0;
+    const double needed = ScenarioBytes(shape);
+    if (known && needed > kHbmBudget * static_cast<double>(free_hbm)) {
+      std::ostringstream why;
+      why << "needs ~" << needed / (1024.0 * 1024.0 * 1024.0) << " GiB of HBM, " << kHbmBudget * 100.0 << "% of "
+          << static_cast<double>(free_hbm) / (1024.0 * 1024.0 * 1024.0) << " GiB free is the budget";
+      for (const char* leg : kAllLegs) {
+        runner.Skip(CaseName(leg, shape), why.str());
+      }
+      continue;
+    }
+
+    std::unique_ptr<Scenario> scenario;
+    try {
+      scenario.reset(new Scenario(shape, aiv_num));
+    } catch (const std::exception& error) {
+      fail(CaseName("pf_setup", shape), error.what());
+      continue;
+    }
+    std::printf("[ascend-bench] prefill B=%lld S=%lld D=%lld H_Q=%lld H_KV=%lld (%s): %s%s\n",
+                static_cast<long long>(shape.batch), static_cast<long long>(shape.seq_len),
+                static_cast<long long>(shape.head_size), static_cast<long long>(shape.num_heads),
+                static_cast<long long>(shape.num_kv_heads), Family(shape),
+                scenario->fia_available() ? scenario->fia_op().c_str() : "no stock operator -- ",
+                scenario->fia_available() ? "" : scenario->fia_note().c_str());
+    std::fflush(stdout);
+    if (scenario->fia_available()) {
+      fia_operator = scenario->fia_op();
+    }
+
+    if (index == check_index && scenario->fia_available()) {
+      try {
+        const double cosine = FoldedBasisCosine(*scenario, shape, runner.stream());
+        std::printf("[ascend-bench]   folded-basis identity: FIA(V~) un-rotated vs FIA(V), cos = %.9f (bound %.4f)\n",
+                    cosine, kFoldIdentityMinCosine);
+        if (!(cosine > kFoldIdentityMinCosine)) {
+          fail(CaseName("pf_fold_identity", shape), "FIA over Pi V does not un-rotate to FIA over V");
+        }
+      } catch (const std::exception& error) {
+        fail(CaseName("pf_fold_identity", shape), error.what());
+      }
+    }
+
+    const Scenario* sc = scenario.get();
+    run_leg(kLegTq4Write, shape, 0.0, traffic.tq4_write, 1, [sc](aclrtStream s) { sc->EnqueueTq4Write(s); },
+            [sc]() { return sc->ScaleChecksum(); });
+    run_leg(kLegRotateValue, shape, 0.0, traffic.rotate_value, 1, [sc](aclrtStream s) { sc->EnqueueRotateValue(s); },
+            [sc]() { return sc->RotatedValueChecksum(); });
+
+    if (!sc->fp16_write_available()) {
+      runner.Skip(CaseName(kLegFp16Write, shape), sc->fp16_write_note());
+      runner.Skip(CaseName(kLegFp16Pipeline, shape), sc->fp16_write_note());
+    } else {
+      run_leg(kLegFp16Write, shape, 0.0, traffic.fp16_write, 1, [sc](aclrtStream s) { sc->EnqueueFp16Write(s); },
+              [sc]() { return sc->Fp16CacheChecksum(); });
+    }
+
+    if (!sc->fia_available()) {
+      for (const char* leg : {kLegFia, kLegFp16Pipeline, kLegTq4Pipeline, kLegTq4FoldedPipeline}) {
+        runner.Skip(CaseName(leg, shape), sc->fia_note());
+      }
+      continue;
+    }
+    run_leg(kLegFia, shape, traffic.attention_flops, traffic.fia, 1, [sc](aclrtStream s) { sc->EnqueueFia(s); },
+            [sc]() { return sc->OutputChecksum(); });
+    if (sc->fp16_write_available()) {
+      run_leg(kLegFp16Pipeline, shape, traffic.attention_flops, traffic.fp16_pipeline, 2,
+              [sc](aclrtStream s) {
+                sc->EnqueueFp16Write(s);
+                sc->EnqueueFia(s);
+              },
+              [sc]() { return sc->OutputChecksum(); });
+    }
+    run_leg(kLegTq4Pipeline, shape, traffic.attention_flops, traffic.tq4_pipeline, 2,
+            [sc](aclrtStream s) {
+              sc->EnqueueTq4Write(s);
+              sc->EnqueueFia(s);
+            },
+            [sc]() { return sc->OutputChecksum(); });
+    run_leg(kLegTq4FoldedPipeline, shape, traffic.attention_flops, traffic.tq4_folded_pipeline, 3,
+            [sc](aclrtStream s) {
+              sc->EnqueueTq4Write(s);
+              sc->EnqueueRotateValue(s);
+              sc->EnqueueFiaRotated(s);
+            },
+            [sc]() { return sc->RotatedOutputChecksum(); });
+  }
+
+  runner.Report();
+  PrintSummary(runner, sweep, fia_operator);
+}
+
+}  // namespace prefill
+
 }  // namespace
 
 void BuildSuite(BenchmarkRunner& runner) {
@@ -1393,6 +2332,15 @@ void BuildSuite(BenchmarkRunner& runner) {
     }
   }
   PrintDecodeSummary(runner, models, cube, fia_operator);
+
+  // The decode scenarios hold four caches per context length; the prefill sweep
+  // wants that HBM back. The operator legs read the fp16 legs' caches, so they
+  // go first.
+  fia_scenarios.clear();
+  fp16_scenarios.clear();
+  kv4_scenarios.clear();
+  scenarios.clear();
+  prefill::Run(runner, aiv_num);
 }
 
 }  // namespace bench

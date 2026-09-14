@@ -283,19 +283,21 @@ class DeviceScenario {
 
     turboquant_paged_attention_impl(
         AscendType::FP16, stream_, grid.split_block_dim, grid.combine_block_dim, query_rot_.get(), key_cache_.get(),
-        value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(), pi_signs_.get(),
-        decode_tables_.get(), workspace_.get(), out_.get(), static_cast<uint32_t>(kQueryTokens),
-        static_cast<uint32_t>(kNumHeads), static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize),
-        static_cast<uint32_t>(kBlockSize), static_cast<uint32_t>(blocks_per_seq),
-        static_cast<uint32_t>(grid.num_splits), grid.split_tasks_per_core, grid.combine_tasks_per_core,
-        kAttentionScale, kInvSqrtHeadSize);
+        value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(), decode_tables_.get(),
+        workspace_.get(), out_.get(), static_cast<uint32_t>(kQueryTokens), static_cast<uint32_t>(kNumHeads),
+        static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kBlockSize),
+        static_cast<uint32_t>(blocks_per_seq), static_cast<uint32_t>(grid.num_splits), grid.split_tasks_per_core,
+        grid.combine_tasks_per_core, kAttentionScale, kInvSqrtHeadSize);
     ACL_CHECK(aclrtSynchronizeStream(stream_));
   }
 
   std::vector<int8_t> KeyCache() const { return key_cache_.ToHost<int8_t>(); }
   std::vector<int8_t> ValueCache() const { return value_cache_.ToHost<int8_t>(); }
   std::vector<float> ScalePlane() const { return scale_plane_.ToHost<float>(); }
-  std::vector<float> Output() const { return HalfToFloat(out_.ToHost<Half>()); }
+  // Un-rotated on the host, as the folded W_o would; see UnrotateHeads.
+  std::vector<float> Output() const { return tqh::UnrotateHeads(HalfToFloat(out_.ToHost<Half>()), kHeadSize); }
+  // The kernel's output as written, in the rotated basis.
+  std::vector<float> RotatedOutput() const { return HalfToFloat(out_.ToHost<Half>()); }
   int64_t aiv_num() const { return aiv_num_; }
   bool aiv_queried() const { return aiv_queried_; }
 
@@ -405,6 +407,65 @@ TEST(TurboQuantLaunchContract, CodecTablesHaveTheDocumentedLayout) {
   for (int i = 0; i < tq::kThresholdCount; ++i) {
     const float midpoint = 0.5f * (tq::kLloydMaxCentroids[i] + tq::kLloydMaxCentroids[i + 1]);
     ASSERT_NEAR(tq::kLloydMaxThresholds[i], midpoint, 1e-6f) << "threshold " << i;
+  }
+}
+
+// The combine's UB, before and after the inverse rotation moved into W_o. The
+// figures are the ones quoted in TurboQuantPagedAttentionCombine::Init and in
+// TURBOQUANT_TESTS.md 13.23; if the kernel's buffer list changes, this and that
+// comment change together.
+TEST(TurboQuantLaunchContract, CombineHoldsNoRotationState) {
+  constexpr size_t kHalfBytes = sizeof(uint16_t);
+
+  const tqh::CombineUbFootprint d256 = tqh::PlanCombineUb(256, kHalfBytes);
+  EXPECT_EQ(d256.unrotation_codec_tables + d256.unrotation_codec_scratch, 82272u);
+  EXPECT_EQ(d256.Released(), 84320u);
+  EXPECT_EQ(d256.Current(), 3808u);
+  EXPECT_EQ(d256.Previous(), 88128u);
+
+  const tqh::CombineUbFootprint d128 = tqh::PlanCombineUb(128, kHalfBytes);
+  EXPECT_EQ(d128.Released(), 42336u);
+  EXPECT_EQ(d128.Current(), 2528u);
+
+  // The table image the combine no longer copies in is exactly the decode's
+  // kTileRows image, not a smaller rotation-only slice of it.
+  for (const int64_t head_size : {64, 128, 256}) {
+    const tqh::CombineUbFootprint ub = tqh::PlanCombineUb(head_size, kHalfBytes);
+    EXPECT_EQ(ub.unrotation_codec_tables, tqh::CodecTables(head_size, tqh::kTileRows).size() * sizeof(int32_t))
+        << "head_size " << head_size;
+    // Every buffer the combine still holds is a whole number of 32-byte bursts.
+    for (const size_t bytes : {ub.accumulators, ub.state, ub.partial, ub.broadcast}) {
+      EXPECT_EQ(bytes % 32u, 0u) << "head_size " << head_size;
+    }
+    EXPECT_LT(ub.Current() * 10u, ub.Previous()) << "head_size " << head_size
+                                                  << ": the combine should keep under a tenth of its old UB";
+  }
+}
+
+// UnrotateHeads is what every sim and device fixture now applies to a decode
+// output, standing in for the folded W_o. It has to be Pi per head, and so its
+// own inverse.
+TEST(TurboQuantLaunchContract, UnrotateHeadsIsPiPerHead) {
+  constexpr int64_t kHeads = 3;
+  for (const int64_t head_size : {64, 128, 256}) {
+    DeterministicRandom rng(0xF01Du + static_cast<uint32_t>(head_size));
+    const std::vector<float> rotated = rng.NormalHalfExact(static_cast<size_t>(kHeads * head_size), 0.0f, 1.0f);
+    const std::vector<float> unrotated = tqh::UnrotateHeads(rotated, head_size);
+
+    const std::vector<int8_t> signs = tq::cpu_pi_sign_vector(static_cast<int>(head_size));
+    for (int64_t head = 0; head < kHeads; ++head) {
+      std::vector<float> expected(rotated.begin() + head * head_size, rotated.begin() + (head + 1) * head_size);
+      tq::cpu_apply_pi(expected.data(), static_cast<int>(head_size), signs.data());
+      for (int64_t c = 0; c < head_size; ++c) {
+        ASSERT_EQ(unrotated[static_cast<size_t>(head * head_size + c)], expected[static_cast<size_t>(c)])
+            << "head_size " << head_size << " head " << head << " channel " << c;
+      }
+    }
+
+    const std::vector<float> round_trip = tqh::UnrotateHeads(unrotated, head_size);
+    for (size_t i = 0; i < rotated.size(); ++i) {
+      ASSERT_NEAR(round_trip[i], rotated[i], 1e-5f) << "head_size " << head_size << " element " << i;
+    }
   }
 }
 
@@ -564,9 +625,11 @@ TEST(TurboQuantKernels, PagedAttentionMatchesTheCpuReference) {
               metrics.cosine_similarity, metrics.snr_db, metrics.relative_l2,
               static_cast<long long>(device.aiv_num()), device.aiv_queried() ? "" : ", assumed");
 
-  // The kernel keeps the accumulator in fp32 and rounds once, at the store, and
-  // so does the reference, so the two differ only by the fp16 output
-  // quantisation and by the order the online softmax visits blocks.
+  // The kernel keeps the accumulator in fp32 and rounds once, at the store --
+  // in the rotated basis now, before the host un-rotates. Pi is orthogonal, so
+  // that rounding error keeps its norm through the un-rotation, and the two
+  // still differ only by the fp16 output quantisation and by the order the
+  // online softmax visits blocks.
   EXPECT_GT(metrics.cosine_similarity, 0.9995) << "the decode kernel disagrees with the reference in direction, "
                                                   "which fp16 rounding of the output cannot cause";
   EXPECT_LT(metrics.relative_l2, 5e-3) << "the decode kernel disagrees with the reference in magnitude";

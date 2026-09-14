@@ -26,7 +26,10 @@
  *
  * The KV cache is already stored rotated (turboquant_reshape_and_cache), and Pi
  * is orthogonal, so <Pi q, Pi k> = <q, k> and nothing downstream changes basis.
- * The output's inverse rotation stays where it was, in the combine kernel.
+ * The output's inverse rotation is folded into the output projection's weights;
+ * a layer that cannot fold it -- an elementwise output gate between attention
+ * and W_o -- launches this same kernel on the attention output instead, which
+ * is correct because Pi is an involution.
  *
  * TWO PATHS, ONE OPERATOR
  *

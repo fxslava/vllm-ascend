@@ -344,6 +344,34 @@ CubeDecodeGrid PlanCubeDecode(int64_t num_tokens, int64_t num_heads, int64_t num
   return grid;
 }
 
+std::vector<float> UnrotateHeads(std::vector<float> rotated, int64_t head_size) {
+  const std::vector<int8_t> signs = tq::cpu_pi_sign_vector(static_cast<int>(head_size));
+  const size_t row = static_cast<size_t>(head_size);
+  for (size_t base = 0; base + row <= rotated.size(); base += row) {
+    tq::cpu_apply_pi(rotated.data() + base, static_cast<int>(head_size), signs.data());
+  }
+  return rotated;
+}
+
+CombineUbFootprint PlanCombineUb(int64_t head_size, int64_t scalar_bytes) {
+  constexpr size_t kFloat = sizeof(float);
+  constexpr size_t kBrcbDstLanes = static_cast<size_t>(kFp32PerBlock * kFp32PerBlock);
+  const size_t d = static_cast<size_t>(head_size);
+
+  CombineUbFootprint ub;
+  ub.out_queue = d * static_cast<size_t>(scalar_bytes);
+  ub.accumulators = 2 * d * kFloat;
+  ub.state = 5 * static_cast<size_t>(kFp32PerBlock) * kFloat;
+  ub.partial = static_cast<size_t>(kPartialTail) * kFloat;
+  ub.broadcast = 4 * kBrcbDstLanes * kFloat;
+
+  ub.unrotation_codec_tables = static_cast<size_t>(CodecTableWords(head_size, kTileRows)) * sizeof(int32_t);
+  ub.unrotation_codec_scratch = static_cast<size_t>(CodecWorkBufferWords(head_size, kTileRows)) * kFloat;
+  ub.unrotation_signs = d * kFloat;
+  ub.unrotation_ping_pong = d * kFloat;
+  return ub;
+}
+
 std::vector<uint16_t> Hadamard16Half() {
   std::vector<uint16_t> h(static_cast<size_t>(vllm_ascend::turboquant::kRotateQH16Elements));
   vllm_ascend::turboquant::FillHadamard16Half(h.data());

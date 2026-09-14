@@ -19,20 +19,31 @@
 The cache is plain contiguous ND -- ``(2, num_blocks, block_size, num_kv_heads,
 head_size // 2)`` int8, two 4-bit codes per byte.
 
-Rotation is a *pure runtime activation transform*.  Model weights are never
-touched: ``q``, ``k`` and ``v`` reach the operators exactly as the projections
-and RoPE produced them, and the kernels apply
+``q``, ``k`` and ``v`` reach the operators exactly as the projections and RoPE
+produced them, and the kernels apply
 
     Pi x = D (H (D x)),   D = diag(+-1),   H = normalised Walsh-Hadamard
 
 in UB.  Pi is symmetric (``Pi^T = D^T H^T D^T = D H D = Pi``) and an involution
-(``Pi^2 = D H D D H D = I``), so a single transform both rotates K, V and Q on
-the way in and un-rotates the attention accumulator on the way out.  Being
-orthogonal, it also leaves scores alone: ``(Pi q) . (Pi k) == q . k``.
+(``Pi^2 = D H D D H D = I``).  Being orthogonal, it leaves scores alone:
+``(Pi q) . (Pi k) == q . k``.  Keeping Q, K and V rotation out of the weights is
+what makes RoPE correct: RoPE is applied *before* anything is rotated.
 
-Keeping the rotation out of the weights is what makes RoPE correct: RoPE is
-applied to q and k *before* anything is rotated, so the position encoding never
-sees the rotated basis.
+The decode's output is left in the rotated basis, ``O~ = softmax(q k^T) V~``:
+the combine kernel no longer un-rotates it.  Where it goes back out depends on
+the layer, and :attr:`AscendTurboQuantAttentionBackendImpl.output_rotation_folded`
+records which:
+
+* folded -- the checkpoint's ``o_proj`` was rewritten offline to
+  ``W_o (I_H (x) Pi)`` (``scripts/tq_fold_output_rotation.py``), so the
+  projection un-rotates for free.  Prefill then has to produce ``O~`` as well,
+  and does by rotating V before the dense attention.
+* not folded -- the default, and the only option for a layer with an
+  elementwise output gate between attention and ``o_proj``.  The decode
+  un-rotates its own output with ``npu_turboquant_rotate_q``, and prefill is
+  unchanged.
+
+See :mod:`vllm_ascend.attention.turboquant_rotation` for the fold itself.
 """
 
 import torch
@@ -47,12 +58,8 @@ from vllm_ascend.attention.attention_v1 import (
     AscendAttentionState,
     AscendMetadata,
 )
+from vllm_ascend.attention.turboquant_rotation import output_rotation_is_folded, turboquant_pi_signs
 from vllm_ascend.attention.utils import notify_kv_cache_written
-
-# Seed of the +-1 diagonal of Pi.  It is fixed so that every rank, every layer
-# and every restart agree on the rotation; the cache is only ever read back by
-# the same transform that wrote it.
-TURBOQUANT_PI_SEED = 0x5F3759DF
 
 # Two 4-bit codes per byte.
 TURBOQUANT_PACK_FACTOR = 2
@@ -104,7 +111,6 @@ TURBOQUANT_LLOYD_MAX_THRESHOLDS = (
     1.4371387916845330, 1.8435318062766393, 2.4008033987632817,
 )
 
-_PI_SIGN_CACHE: dict[tuple[int, str], torch.Tensor] = {}
 _CODEC_TABLE_CACHE: dict[tuple[int, int, str], torch.Tensor] = {}
 _HADAMARD16_CACHE: dict[str, torch.Tensor] = {}
 
@@ -131,59 +137,6 @@ def _is_capturing() -> bool:
         return bool(_EXTRA_CTX.capturing)
     except (AssertionError, AttributeError, RuntimeError):
         return False
-
-
-def turboquant_pi_signs(head_size: int, device: torch.device) -> torch.Tensor:
-    """Return the deterministic +-1 diagonal of Pi for ``head_size`` channels.
-
-    Generated from an explicit LCG rather than ``torch.Generator`` so that the
-    host C++ reference (``csrc/tests/reference/turbo_quant_cpu.h``) produces the
-    identical vector without either side depending on the other's RNG.
-    """
-    key = (head_size, str(device))
-    cached = _PI_SIGN_CACHE.get(key)
-    if cached is not None:
-        return cached
-    state = (TURBOQUANT_PI_SEED + head_size) & 0xFFFFFFFF
-    bits = []
-    for _ in range(head_size):
-        state = (state * 1664525 + 1013904223) & 0xFFFFFFFF
-        bits.append(1.0 if (state >> 16) & 1 else -1.0)
-    signs = torch.tensor(bits, dtype=torch.float32, device=device)
-    _PI_SIGN_CACHE[key] = signs
-    return signs
-
-
-def walsh_hadamard(x: torch.Tensor, dim: int) -> torch.Tensor:
-    """Normalised fast Walsh-Hadamard transform along ``dim``.
-
-    Host reference for the vectorised Ascend C transform; used by the tests and
-    by anyone reproducing the cache contents offline.
-    """
-    length = x.shape[dim]
-    if length & (length - 1):
-        raise ValueError(f"Walsh-Hadamard needs a power-of-two length, got {length}")
-    out = x.movedim(dim, -1).contiguous()
-    lead = out.shape[:-1]
-    out = out.reshape(-1, length)
-    stride = 1
-    while stride < length:
-        out = out.view(-1, length // (2 * stride), 2, stride)
-        top = out[:, :, 0, :]
-        bottom = out[:, :, 1, :]
-        out = torch.stack((top + bottom, top - bottom), dim=2)
-        out = out.reshape(-1, length)
-        stride *= 2
-    out = out.reshape(*lead, length) / (length**0.5)
-    return out.movedim(-1, dim)
-
-
-def apply_pi(x: torch.Tensor, pi_signs: torch.Tensor) -> torch.Tensor:
-    """Host reference for ``Pi x = D (H (D x))`` over the last axis.
-
-    Pi is its own inverse, so this is both the rotation and the un-rotation.
-    """
-    return walsh_hadamard(x * pi_signs, dim=-1) * pi_signs
 
 
 def turboquant_hadamard16(device: torch.device) -> torch.Tensor:
@@ -346,10 +299,16 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         # and for the same reason; see _rotated_query.
         self.rotated_query: torch.Tensor | None = None
         self._hadamard16: torch.Tensor | None = None
+        # Whether this layer's o_proj carries Pi, i.e. consumes the rotated
+        # basis. False unless the checkpoint says otherwise, because False is
+        # correct for every model and True is only correct for a folded one;
+        # activate_turboquant_backend reads the checkpoint's marker.
+        self.output_rotation_folded = False
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
-        # Nothing is folded into the weights: q_proj, k_proj, v_proj and o_proj
-        # stay exactly as loaded, which is what keeps RoPE correct.
+        # q_proj, k_proj and v_proj stay exactly as loaded, which is what keeps
+        # RoPE correct. o_proj is either as loaded or was folded OFFLINE, before
+        # the checkpoint was written; nothing is rewritten here.
         super().process_weights_after_loading(act_dtype)
         # Prime the C++ device registry while we are still loading. The vector
         # core count is what sizes both kernels' grids, and the driver query
@@ -357,8 +316,9 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         # a decode step or, worse, inside a graph capture.
         torch.ops._C_ascend.npu_turboquant_vector_core_num()
         logger.info_once(
-            "[vllm-ascend/turboquant] 4-bit KV cache active; Pi is applied at runtime -- "
-            "to K/V on the write path, and to Q in npu_turboquant_rotate_q before each decode"
+            "[vllm-ascend/turboquant] 4-bit KV cache active; Pi is applied at runtime to K/V on the write path and "
+            "to Q before each decode. The decode output stays rotated for a folded o_proj and is un-rotated on "
+            "the device otherwise."
         )
 
     def pi_signs(self, device: torch.device) -> torch.Tensor:
@@ -529,7 +489,8 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
         num_tokens = query.shape[0]
-        # Post-RoPE query.  Three launches, ordered by the stream.
+        # Post-RoPE query.  Three launches, ordered by the stream, and a fourth
+        # for a layer whose o_proj was not folded.
         #
         #   1. rotate_q writes q~ = Pi q, once per (token, head).  It used to
         #      live inside the split kernel, which ran it once per
@@ -537,13 +498,16 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         #      at eight sequence splits the same transform ran eight times over.
         #   2. the split stage runs softmax and the value accumulation in the
         #      rotated basis and writes per-sequence-split partials into the
-        #      persistent workspace.  It applies no rotation at all now.
-        #   3. the combine stage reduces them and applies Pi once more on the
-        #      output, which is where the un-rotation has always been.
+        #      persistent workspace.  It applies no rotation at all.
+        #   3. the combine stage reduces them and writes O~, still rotated.  It
+        #      used to apply Pi on the way out; that now lives in o_proj's weights.
+        #   4. only when o_proj is NOT folded: rotate_q again, on the output.  Pi
+        #      is an involution, so the same launch that rotated the query is the
+        #      inverse here, and O = Pi O~ is written back over the output.
         #
         # 2 and 3 are separate launches because no in-kernel barrier orders an
-        # arbitrary grid; 1 is separate for the same reason, and because its
-        # grid is a function of B * H_Q rather than of the paging.
+        # arbitrary grid; 1 and 4 are separate for the same reason, and because
+        # their grid is a function of B * H_Q rather than of the paging.
         rotated_query = self._rotated_query(num_tokens, query.device)
         torch.ops._C_ascend.npu_turboquant_rotate_q(
             query[:num_tokens],
@@ -553,6 +517,7 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             rotated_query,
         )
         block_tables = attn_metadata.block_tables.to(torch.int32)
+        attention_output = output[:num_tokens].view(num_tokens, self.num_heads, self.head_size)
         torch.ops._C_ascend.npu_turboquant_paged_attention(
             rotated_query,
             self.key_cache,
@@ -560,15 +525,52 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             self.scale_cache,
             block_tables,
             attn_metadata.seq_lens.to(torch.int32),
-            self.pi_signs(query.device),
             self.codec_tables(query.device, TURBOQUANT_TILE_ROWS),
             self._decode_workspace(num_tokens, block_tables.shape[1], query.device),
             self.num_kv_heads,
             self.num_heads,
             self.scale,
-            output[:num_tokens].view(num_tokens, self.num_heads, self.head_size),
+            attention_output,
         )
+        if not self.output_rotation_folded:
+            # The landing buffer is the rotated query's own: the split launched
+            # above has already consumed it by the time this launch writes it,
+            # and stream order is what guarantees that, exactly as it orders the
+            # split against the combine. Reusing it keeps a second
+            # [num_tokens, num_heads, head_size] high-water buffer -- and a second
+            # way to grow during a capture -- off the decode path.
+            torch.ops._C_ascend.npu_turboquant_rotate_q(
+                attention_output,
+                self.pi_signs(query.device),
+                self.codec_tables(query.device, 1),
+                self.hadamard16(query.device),
+                rotated_query,
+            )
+            attention_output.copy_(rotated_query)
         return output
+
+    def _rotate_value_for_prefill(self, value: torch.Tensor) -> torch.Tensor:
+        """Return ``V~ = Pi V`` in ``value``'s own dtype.
+
+        For a folded o_proj the prefill has to hand the projection the rotated
+        basis the decode does. Rotating V is sufficient -- ``softmax(q k^T)(V Pi)
+        = O Pi`` -- and it is ``H_KV`` vectors per token rather than the ``H_Q`` a
+        rotation of the output would be. Q and K stay unrotated, so RoPE and the
+        scores are untouched.
+
+        Allocates: prefill is not replayed from a captured graph, and a buffer
+        sized for the longest prompt would sit in HBM for the whole run.
+        """
+        value = value.contiguous()
+        rotated = torch.empty(value.shape, dtype=torch.float32, device=value.device)
+        torch.ops._C_ascend.npu_turboquant_rotate_q(
+            value,
+            self.pi_signs(value.device),
+            self.codec_tables(value.device, 1),
+            self.hadamard16(value.device),
+            rotated,
+        )
+        return rotated.to(value.dtype)
 
     def _forward_prefill_no_cache(
         self,
@@ -580,14 +582,18 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
     ) -> torch.Tensor:
         """Full-precision prefill over the current batch's K/V.
 
-        Nothing is read back from the quantised cache here, so this is exact.
+        Nothing is read back from the quantised cache here, so this is exact up
+        to the rotation of V, which a folded o_proj undoes.
         """
         actual_seq_qlen = attn_metadata.actual_seq_lengths_q
         num_tokens = int(actual_seq_qlen[-1])
+        prefill_value = value[:num_tokens]
+        if self.output_rotation_folded:
+            prefill_value = self._rotate_value_for_prefill(prefill_value)
         attn_output, _ = torch_npu.npu_fused_infer_attention_score(
             query=query[:num_tokens],
             key=key[:num_tokens],
-            value=value[:num_tokens],
+            value=prefill_value,
             atten_mask=attn_metadata.attn_mask,
             input_layout="TND",
             actual_seq_lengths=actual_seq_qlen,
@@ -663,8 +669,24 @@ def activate_turboquant_backend(layer: torch.nn.Module) -> None:
     layer.kv_cache_torch_dtype = torch.int8
     impl = getattr(layer, "impl", None)
     if impl is not None:
+        # __init__ does not run on a class swap, so every attribute it would
+        # have set is set here -- a missing one is an AttributeError on the
+        # first decode, not at load.
         impl.__class__ = AscendTurboQuantAttentionBackendImpl
         impl.scale_cache = None
         impl._pi_signs = None
         impl.decode_workspace = None
         impl._workspace_floats = {}
+        impl.rotated_query = None
+        impl._hadamard16 = None
+        vllm_config = getattr(impl, "vllm_config", None)
+        hf_config = None if vllm_config is None else vllm_config.model_config.hf_config
+        layer_name = getattr(layer, "layer_name", "")
+        impl.output_rotation_folded = output_rotation_is_folded(hf_config, layer_name, impl.head_size)
+        logger.debug(
+            "[vllm-ascend/turboquant] %s: o_proj %s",
+            layer_name,
+            "is Pi-folded; the decode output stays rotated"
+            if impl.output_rotation_folded
+            else "is not folded; the decode un-rotates its output on the device",
+        )

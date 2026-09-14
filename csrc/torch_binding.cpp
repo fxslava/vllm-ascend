@@ -3164,9 +3164,11 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("npu_turboquant_reshape_and_cache", torch::kPrivateUse1,
              &vllm_ascend::npu_turboquant_reshape_and_cache);
 
-    // Pi q for every query vector of a decode step, once per (token, head).
-    // Must run before npu_turboquant_paged_attention, which takes its output
-    // and applies no rotation of its own.
+    // Pi x for every [token, head] vector. Must run on the query before
+    // npu_turboquant_paged_attention, which takes its output and applies no
+    // rotation of its own. Pi is an involution, so the backend also runs it to
+    // un-rotate an output whose projection was not folded, and to rotate the
+    // prefill value of a layer whose projection was.
     ops.def(
         "npu_turboquant_rotate_q(Tensor query, "
         "                        Tensor pi_signs, "
@@ -3183,7 +3185,6 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(CONCAT(_C, _ascend), ops)
         "                               Tensor scale_cache, "
         "                               Tensor block_tables, "
         "                               Tensor context_lens, "
-        "                               Tensor pi_signs, "
         "                               Tensor codec_tables, "
         "                               Tensor! workspace, "
         "                               int num_kv_heads, "

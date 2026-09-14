@@ -2657,3 +2657,269 @@ invocation the contract costs. It has not been run: this host has no NPU, and
 the ~8.6 us floor in `hadamard_benchmark_results.csv` is a `replan-per-launch`
 harness artefact, not the graph-replay figure a decode step pays. Until that
 number exists, the latency case for the split rests on an estimate.
+
+### 13.23 The output de-rotation moved into W_o, and prefill against FIA V5
+
+The combine kernel no longer applies Pi. `TurboQuantPagedAttentionCombine` merges
+the per-split `(max, sum, accumulator)` triples, normalises, and writes the
+**rotated** output `O~ = softmax(q k^T) V~`. The inverse lives in the weights of
+the output projection instead, folded offline. The query's rotation stays where
+13.22 put it, in `npu_turboquant_rotate_q`; K, V and Q still rotate as
+activations, so RoPE never sees the rotated basis.
+
+#### The fold
+
+With `W_o` of shape `[hidden, H * D]` acting as `y = W_o o`, `o` the
+concatenation of `H` head vectors, and each head's output `o_h = Pi o~_h`:
+
+```
+y = W_o (I_H (x) Pi) o~ = W_o' o~,        W_o' = W_o (I_H (x) Pi)
+```
+
+Every `D`-wide input block of every row is multiplied by Pi -- `(W_h Pi)[r] =
+Pi W_h[r]` because Pi is symmetric -- so the fold is one `apply_pi` over the
+trailing axis of `W_o.view(hidden, H, D)`. In the row-vector convention it is
+`Pi^T W_o = Pi W_o`. Two properties make it deployable:
+
+- it is **block diagonal over heads**, so it commutes with `RowParallelLinear`'s
+  sharding of `o_proj`'s input dimension, which always cuts on head boundaries;
+- the **bias is untouched**.
+
+`vllm_ascend/attention/turboquant_rotation.py` holds it
+(`fold_pi_into_output_projection`, `validate_output_projection_fold`), and imports
+torch alone so `scripts/tq_fold_output_rotation.py` runs on a host with no
+torch_npu and no vLLM. The script rewrites every
+`<prefix>.self_attn.o_proj.weight` of a safetensors checkpoint, validates each,
+and records the fold in `config.json`:
+
+```json
+"turboquant_output_rotation": {"format_version": 1, "pi_seed": 1597463007,
+                               "head_size": 128, "folded_modules": ["model.layers.0.self_attn", ...]}
+```
+
+The seed and head size are there because a fold is only valid for the Pi it was
+made with, and nothing else in a checkpoint says which one that was.
+
+**Measured, float64 reference, 256 random rotated outputs per case** (host,
+torch 2.13):
+
+| check | D=128 H=32 | D=256 H=8 | D=128 H=64 | D=256 H=16 |
+|---|---|---|---|---|
+| `|fold - W_o block_diag(Pi)| / |W_o|` | 4.05e-16 | 5.56e-16 | 4.05e-16 | 5.57e-16 |
+| TP shards folded separately vs whole | 0 | 0 | 0 | 0 |
+| worst cos, `W_o'` stored fp32 | 1.000000000 | 1.000000000 | 1.000000000 | 1.000000000 |
+| worst cos, `W_o'` stored fp16 | 0.999999976 | 0.999999976 | 0.999999977 | 0.999999977 |
+| worst cos, `W_o'` stored bf16 | 0.999998454 | 0.999998405 | 0.999998524 | 0.999998490 |
+
+The bound the tool enforces is `cos > 0.9999`; bf16's rounding of the rotated
+weights is the largest error and sits two orders of magnitude inside it.
+End to end, `softmax(q k^T) V~` projected by `W_o'` against `softmax(q k^T) V`
+projected by `W_o` (D=256, H=8, S=300, float64): cos `0.9999999999999996`,
+relative error `1.8e-15`.
+
+#### Where the fold is wrong: the output gate
+
+Qwen3-Next and Qwen3.5 -- this suite's own golden layer, see
+`scripts/dump_qwen35_layer3.py` -- multiply the attention output by
+`sigmoid(gate)` **before** `o_proj`. An elementwise gate does not commute with Pi:
+
+```
+o_proj( O * g )  !=  o_proj'( (O Pi) * g )
+```
+
+Measured with the same random layer and a random gate: **cos 0.859**. So those
+layers are never folded, and vLLM makes this easy to get wrong -- it reads
+`attn_output_gate` with a default of `True`, so a config that omits the key is
+gated. The script refuses when the gate is truthy **or absent on a model type
+that gates by default**, refuses model types it has not checked unless told
+`--assume-no-output-gate`, and refuses a quantised `o_proj` (a non-float weight
+or companion tensors such as `weight_scale`): rotating a quantised weight needs a
+requantisation, so fold first.
+
+#### The runtime contract
+
+Two ways to get the basis wrong, and both produce plausible-looking text rather
+than an error: un-rotating into a folded projection, or not un-rotating into an
+unfolded one. So the backend decides per layer, from the checkpoint, and refuses
+rather than guesses:
+
+| `turboquant_output_rotation` in the config | layer listed | `output_rotation_folded` | decode | prefill |
+|---|---|---|---|---|
+| absent | -- | `False` | rotate Q, split, combine, **rotate the output** (Pi is an involution) and copy it back | unchanged |
+| present, seed and head size match | yes | `True` | rotate Q, split, combine; output stays `O~` | **rotate V** before FIA |
+| present | no, or seed / head size differ | load fails with the reason | -- | -- |
+
+- The default is the unfolded path because it is correct for every model. It
+  costs one more `npu_turboquant_rotate_q` launch per decode step, the size of
+  `tq_rotate_s<S>`, and lands in the rotated query's own buffer: the split has
+  consumed it by then and stream order guarantees it, so no second high-water
+  buffer can grow during a capture.
+- A folded prefill rotates **V**, not the output: `softmax(q k^T)(V Pi) = O Pi`,
+  and V is `H_KV` vectors per token where the output is `H_Q`. Q and K stay
+  unrotated, so RoPE and the scores are untouched.
+- `activate_turboquant_backend` now sets `rotated_query` and `_hadamard16`. A
+  class swap does not run `__init__`, and before this change a real activation
+  would have raised `AttributeError` on the first decode -- the unit tests built
+  their impls by hand and never saw it.
+- `npu_turboquant_paged_attention` loses `pi_signs`: twelve arguments, and nothing
+  in either kernel reads a sign. Schema, meta signature, adapter, Python caller
+  and unit tests changed together.
+
+#### UB freed in the combine
+
+From the allocation list, per block. `TurboQuantPagedAttentionCombine::Init` and
+`turboquant_host::PlanCombineUb` quote the same numbers, and
+`TurboQuantLaunchContract.CombineHoldsNoRotationState` pins them:
+
+| head_size | codec table image | codec scratch | signs | ApplyPi ping-pong | released | combine before | combine after |
+|---|---|---|---|---|---|---|---|
+| 128 | 20,032 B | 21,280 B | 512 B | 512 B | **42,336 B** | 44,864 B | 2,528 B |
+| 256 | 40,000 B | 42,272 B | 1,024 B | 1,024 B | **84,320 B** | 88,128 B | 3,808 B |
+
+The combine keeps 4.3% of the UB it held at head_size 256. The launch prologue
+also loses the GM -> UB copies of the table image (10,000 words at head_size 256) and of the signs,
+per block, per launch, and each `(token, head)` task loses a whole `ApplyPi`:
+two sign multiplies, three `Gather` shuffle stages, `log2(D / 8)` block-strided
+butterflies, a normalisation and their `PipeBarrier<PIPE_V>`s.
+
+**Not A/B'd for placement.** 13.17 measured UB placement moving a kernel by 12%.
+`accBuf_` shrinks by 4 * head_size bytes, which slides `stateBuf_`,
+`partialBuf_` and `brcbBuf_` down; the codec and `signBuf_` were at the end of
+the list and move nothing. No tick number for the combine should be believed
+until that has been measured.
+
+#### Prefill against FIA V5
+
+`bench_device_950pr_turboquant` runs a second suite after the decode summary, in
+its own `BenchmarkRunner` on the same stream, with its own budget (warmup 3,
+10 iterations, pipeline batch 1 by default) because the largest shape is four
+8,192-token sequences, 32,768 tokens in one launch. Failures are mirrored into the decode runner so the exit
+code still reflects them.
+
+A TurboQuant prefill is `PrefillNoCache`: the cache write, then full-precision
+attention over the batch's own K/V. So the pipelines differ only in the write and,
+folded, in the rotation of V:
+
+| leg | launches | what |
+|---|---|---|
+| `pf_tq4_write` | 1 | `turboquant_reshape_and_cache` over `B * S` tokens |
+| `pf_rotate_v` | 1 | `npu_turboquant_rotate_q` on V, `[B*S, H_KV, D]` -> fp32 |
+| `pf_fp16_write` | 1 | `aclnnScatterPaKvCache`, the baseline's own write |
+| `pf_fia_v5` | 1 | `aclnnFusedInferAttentionScoreV5`, TND, `sparse_mode` 3, the 2048x2048 int8 causal mask; V2 as a fallback |
+| `pf_fp16_pipeline` | 2 | fp16 write + FIA |
+| `pf_tq4_pipeline` | 2 | tq4 write + FIA -- an unfolded layer |
+| `pf_tq4_folded_pipeline` | 3 | tq4 write + rotate V + FIA over `V~` -- a folded layer |
+
+The sweep is the cartesian product of S {512, 1024, 2048, 4096, 8192}, B {1, 2,
+4}, D {128, 256}, H_Q {32, 64, 128} and H_KV {1, 2, 8}: 270 shapes, every axis an
+`ASCEND_BENCH_TQ_PREFILL_*` comma list. `H_KV = 1` is the MQA form DeepSeek MLA's
+single latent cache takes through this operator -- a shape proxy, not the MLA
+kernel. A shape whose estimated footprint exceeds 85% of free HBM is skipped
+with both numbers in the reason. Each shape is built, timed and destroyed before
+the next, and 1,024 tokens of random data are tiled across the context rather
+than 1e9 fp16 values generated on the host.
+
+Reported per shape: device time from ACL events (the device-events median,
+pipelined when that mode is not selected), GB/s over each leg's own traffic
+model, TFLOP/s for the attention legs, tq4 and folded pipeline latency over the
+fp16 pipeline, and the KV-cache footprint:
+
+| D | H_KV | fp16 B/token | tq4 B/token | kv8 B/token | fp16/tq4 | fp16/kv8 |
+|---|---|---|---|---|---|---|
+| 128 | 1 | 512 | 160 | 288 | 3.20x | 1.78x |
+| 128 | 2 | 1,024 | 288 | 544 | 3.56x | 1.88x |
+| 128 | 8 | 4,096 | 1,088 | 2,112 | 3.76x | 1.94x |
+| 256 | 1 | 1,024 | 288 | 544 | 3.56x | 1.88x |
+| 256 | 2 | 2,048 | 544 | 1,056 | 3.76x | 1.94x |
+| 256 | 8 | 8,192 | 2,112 | 4,160 | 3.88x | 1.97x |
+
+tq4 is the shipping layout: `D / 2` packed bytes per vector plus a scale plane of
+`round_up(2 * H_KV, 8)` fp32 per token, whose burst padding is why small `H_KV`
+compresses less. **kv8 is layout arithmetic only** -- a byte per coordinate and
+the same scale plane. `TurboQuantCodec` is instantiated for `b = 4` alone, so
+there is no 8-bit kernel and no 8-bit leg.
+
+Before any timing, on the smallest shape, the suite checks the fold identity on
+the device: FIA over `V~`, un-rotated on the host, against FIA over V, cos above
+0.9999. A failure is recorded as a failure, not a skip.
+
+**What the prefill suite does not measure, deliberately:**
+
+- **The folded pipeline's fp32 -> fp16 cast of `V~`.** The backend does it with a
+  torch cast; this suite has no header-verified `aclnnCast` prototype, so FIA
+  reads a host-prepared fp16 `V~` and the cast is in no column. It is one
+  elementwise pass over `B * S * H_KV * D` values.
+- **`npu_fusion_attention` (`aclnnFlashAttentionScore`).** Its argument list could
+  not be read from a CANN header here: the 9.1.0 toolkit image carries no
+  `aclnnop` operator headers at all, only `aclnn_util.h`. The symbol is exported
+  by `libopapi.so`, but a guessed prototype behind `dlsym` is undefined behaviour
+  at launch, not a planning refusal. Adding the leg needs the header, nothing
+  else; the FIA V5 prototype this suite uses was transcribed from one.
+- **FIA's workspace traffic.** GB/s counts what each operator is handed and
+  writes, the decode suite's convention.
+
+`scripts/run_950pr_npu_baseline.sh` sets `ASCEND_BENCH_TQ_PREFILL=0` for its
+decode baseline and its msprof stage: the sweep is hours, and neither stage is
+about prefill.
+
+#### What was executed, and what was not
+
+Toolchain: `ghcr.io/fxslava/vllm-ascend-950pr:x86_64-offline`, CANN 9.1.0, g++
+11.4, arch35 CAModel `Ascend950PR_9599`.
+
+**Build.** Clean under `-DVLLM_ASCEND_TESTS_WERROR=ON`, zero compiler warnings,
+in three configurations: host-only, `SOC_VERSION=Ascend950PR_9599 RUN_MODE=npu`
+(benchmarks on, so the prefill suite compiles) and `RUN_MODE=sim`. The only
+"warning" text in the logs is the ascendc generator's pre-existing "multiple
+kernel functions per file" notice. The exported symbols carry the new
+signatures: `turboquant_paged_attention_combine_impl` takes ten parameters, with
+no `piSigns`, `tables` or `invSqrtLen`.
+
+**The wheel's adapter, syntax only.** `turboquant_torch_adpt.h` and
+`torch_binding_meta.cpp` compile with `-fsyntax-only -Wall -Wextra -Werror`
+against the image's torch 2.10 and torch_npu headers, with a function-pointer
+check pinning `npu_turboquant_paged_attention` to the twelve-argument schema
+order. The full wheel was not built.
+
+**Camodel**, 32/32 `excp_log` dumps at 0 bytes after every run:
+
+| binary | shape | result |
+|---|---|---|
+| `test_sim_950pr_turboquant_kernels` | D=64, 4 / 2 heads, S=32 | **10/10 pass**, 191 s. Includes `CombineHoldsNoRotationState` and `UnrotateHeadsIsPiPerHead`. Write -> decode -> combine, un-rotated on the host, vs the CPU reference: **cos 1.000000, 72.87 dB, relL2 2.27e-4** |
+| `test_sim_950pr_turboquant_multimode`, `ASCEND_TQ_SIM_MODES=kv4fp8` | D=256, 4 / 2 heads, B=1, S=16 | **pass**, 104 s. Cube split + the shared combine vs fp32 host attention: **cos 0.991817** -- the same six digits 13.22 measured with the un-rotation still in the kernel |
+| `test_sim_950pr_turboquant_decode` | D=64, 4 / 2 heads, S=32, 2 splits | **pass**, 84 s. vs the CPU reference **cos 1.000000, 74.00 dB, relL2 1.99e-4**; vs exact fp32 cos 0.991182, 17.54 dB. The fp16 control still skips on the V2 `361001` refusal |
+
+The multimode figure agreeing to six digits is the check that matters: moving
+the un-rotation from the kernel's fp32 accumulator to after its fp16 store adds
+at most one fp16 rounding, and Pi is orthogonal, so it cannot move the result
+beyond that.
+
+**Unit tests.** `tests/ut/attention/test_turboquant_v1.py`, **61/61**, run under
+unittest in the same image with `tests/ut/conftest.py` executed first (its CPU
+torch_npu fakes) and `TORCH_DEVICE_BACKEND_AUTOLOAD=0`. New: the fold against a
+dense block-diagonal Pi, TP-shard commutation, fp32 / fp16 / bf16 acceptance,
+the output-gate counterexample, the fold record's checks, activation per layer,
+decode un-rotation computed through a Pi-implementing mock of rotate_q, and
+the folded prefill's rotated V.
+
+**The offline tool**, on synthetic sharded fp16 checkpoints: an ungated `qwen3`
+config folds three projections (worst cos 0.999999976), every other tensor and
+dtype comes back byte-identical, and the written record round-trips through the
+backend's resolver; a `qwen3_5` config with no `attn_output_gate` key, a
+`weight_scale` beside `o_proj`, an unknown model type and an already-folded
+checkpoint are each refused with exit 2 and nothing written.
+
+**Not executed:**
+
+- **Any timing.** No physical 950PR is attached, and the device tier refuses
+  the camodel by construction. Neither the decode legs since this change nor
+  any `pf_*` leg has produced a number, and the FIA V5 prefill argument list --
+  `sparse_mode` 3, TND, no block table, the int8 2048x2048 mask -- has never been
+  through a planning call.
+- **The un-rotation launch on the output**, and the rotation of prefill V, on
+  the camodel. Both are `npu_turboquant_rotate_q`, which 13.22 verified on
+  queries, but not on `B*S*H_KV` vectors at prefill scale, and not on a bf16
+  input's `kHiLo` path.
+- **A real checkpoint** through the tool, a multi-rank TP load of a folded one,
+  or a vLLM model load exercising the fold record end to end.
+- **UB placement A/B** for the combine; see above.
