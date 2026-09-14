@@ -1,4 +1,3 @@
-~/vllm-ascend/build/csrc-tests-npu/device/bench_device_950pr_turboquant
 [ascend-bench] vllm-ascend Ascend 950PR kernel microbenchmarks (no Python, no torch)
 [ascend-bench] device 0 ready, soc='Ascend950PR_9589'
 [ascend-bench] TurboQuant decode: vector cores = 64 (from aclGetDeviceCapability)
@@ -13,7 +12,7 @@
 [ascend-bench]   Ascend950 (status 361001) and V5 has never been planned on hardware, so a
 [ascend-bench]   baseline resting on either would print an empty column. See this file's header.
 [ascend-bench] S=64: no stock operator baseline -- aclnnFusedInferAttentionScoreV5: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV5GetWorkspaceSize failed with status 561002
-  CANN: [PID: 1335049] 2026-09-14-15:12:52.070.072 Invalid_Argument(EZ0026): Parameter pse_type of FusedInferAttentionScore has incorrect value 1. Reason: The value of pse_type must be 0.
+  CANN: [PID: 3622306] 2026-09-14-20:45:24.303.473 Invalid_Argument(EZ0026): Parameter pse_type of FusedInferAttentionScore has incorrect value 1. Reason: The value of pse_type must be 0.
         Solution: Check whether the parameter value is correct.
 TraceBack (most recent call last):
         Failed to execute operator FusedInferAttentionScore_0. Reason: Failed to execute tiling function.
@@ -22,11 +21,11 @@ TraceBack (most recent call last):
         Check NnopbaseExecutorMatchCache(executor) failed
         Check NnopbaseRunForWorkspace(*executor, workspaceSize) failed
 ; aclnnFusedInferAttentionScoreV2: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV2GetWorkspaceSize failed with status 361001
-  CANN: [PID: 1335049] 2026-09-14-15:12:52.070.609 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
+  CANN: [PID: 3622306] 2026-09-14-20:45:24.303.796 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
         Solution: In this scenario, collect the plog when the fault occurs and locate the fault based on the plog.
 
 [ascend-bench] S=512: no stock operator baseline -- aclnnFusedInferAttentionScoreV5: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV5GetWorkspaceSize failed with status 561002
-  CANN: [PID: 1335049] 2026-09-14-15:12:52.117.796 Invalid_Argument(EZ0026): Parameter pse_type of FusedInferAttentionScore has incorrect value 1. Reason: The value of pse_type must be 0.
+  CANN: [PID: 3622306] 2026-09-14-20:45:24.345.399 Invalid_Argument(EZ0026): Parameter pse_type of FusedInferAttentionScore has incorrect value 1. Reason: The value of pse_type must be 0.
         Solution: Check whether the parameter value is correct.
 TraceBack (most recent call last):
         Failed to execute operator FusedInferAttentionScore_0. Reason: Failed to execute tiling function.
@@ -35,11 +34,11 @@ TraceBack (most recent call last):
         Check NnopbaseExecutorMatchCache(executor) failed
         Check NnopbaseRunForWorkspace(*executor, workspaceSize) failed
 ; aclnnFusedInferAttentionScoreV2: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV2GetWorkspaceSize failed with status 361001
-  CANN: [PID: 1335049] 2026-09-14-15:12:52.118.015 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
+  CANN: [PID: 3622306] 2026-09-14-20:45:24.345.702 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
         Solution: In this scenario, collect the plog when the fault occurs and locate the fault based on the plog.
 
 [ascend-bench] S=1024: no stock operator baseline -- aclnnFusedInferAttentionScoreV5: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV5GetWorkspaceSize failed with status 561002
-  CANN: [PID: 1335049] 2026-09-14-15:12:52.197.645 Invalid_Argument(EZ0026): Parameter pse_type of FusedInferAttentionScore has incorrect value 1. Reason: The value of pse_type must be 0.
+  CANN: [PID: 3622306] 2026-09-14-20:45:24.420.120 Invalid_Argument(EZ0026): Parameter pse_type of FusedInferAttentionScore has incorrect value 1. Reason: The value of pse_type must be 0.
         Solution: Check whether the parameter value is correct.
 TraceBack (most recent call last):
         Failed to execute operator FusedInferAttentionScore_0. Reason: Failed to execute tiling function.
@@ -48,11 +47,11 @@ TraceBack (most recent call last):
         Check NnopbaseExecutorMatchCache(executor) failed
         Check NnopbaseRunForWorkspace(*executor, workspaceSize) failed
 ; aclnnFusedInferAttentionScoreV2: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV2GetWorkspaceSize failed with status 361001
-  CANN: [PID: 1335049] 2026-09-14-15:12:52.197.932 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
+  CANN: [PID: 3622306] 2026-09-14-20:45:24.420.428 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
         Solution: In this scenario, collect the plog when the fault occurs and locate the fault based on the plog.
 
 [ascend-bench] S=2048: no stock operator baseline -- aclnnFusedInferAttentionScoreV5: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV5GetWorkspaceSize failed with status 561002
-  CANN: [PID: 1335049] 2026-09-14-15:12:52.350.408 Invalid_Argument(EZ0026): Parameter pse_type of FusedInferAttentionScore has incorrect value 1. Reason: The value of pse_type must be 0.
+  CANN: [PID: 3622306] 2026-09-14-20:45:24.576.698 Invalid_Argument(EZ0026): Parameter pse_type of FusedInferAttentionScore has incorrect value 1. Reason: The value of pse_type must be 0.
         Solution: Check whether the parameter value is correct.
 TraceBack (most recent call last):
         Failed to execute operator FusedInferAttentionScore_0. Reason: Failed to execute tiling function.
@@ -61,7 +60,7 @@ TraceBack (most recent call last):
         Check NnopbaseExecutorMatchCache(executor) failed
         Check NnopbaseRunForWorkspace(*executor, workspaceSize) failed
 ; aclnnFusedInferAttentionScoreV2: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV2GetWorkspaceSize failed with status 361001
-  CANN: [PID: 1335049] 2026-09-14-15:12:52.350.734 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
+  CANN: [PID: 3622306] 2026-09-14-20:45:24.577.014 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
         Solution: In this scenario, collect the plog when the fault occurs and locate the fault based on the plog.
 
 
@@ -99,32 +98,32 @@ TraceBack (most recent call last):
 
        S      kv4 us     tq4 us    fp16 us     fia us
   ----------------------------------------------------
-      64       21.36      25.22      15.05          -
-     512       29.00      44.05      15.38          -
-    1024       32.19      48.90      19.12          -
-    2048       43.29      78.91      26.29          -
+      64       20.58      25.20      14.05          -
+     512       27.61      43.95      15.41          -
+    1024       30.77      48.66      19.05          -
+    2048       40.50      78.69      26.20          -
 
        S     vs fp16     vs tq4     vs fia
   -----------------------------------------
-      64       0.70x      1.18x          -
-     512       0.53x      1.52x          -
-    1024       0.59x      1.52x          -
-    2048       0.61x      1.82x          -
+      64       0.68x      1.22x          -
+     512       0.56x      1.59x          -
+    1024       0.62x      1.58x          -
+    2048       0.65x      1.94x          -
 
        S  leg          steps/s       GB/s    TFLOP/s
   ---------------------------------------------------
-      64  kv4fp8         46815        2.9      0.025
-      64  tq4            39643        6.9      0.021
-      64  fp16           66465       35.4      0.035
-     512  kv4fp8         34480       12.9      0.145
-     512  tq4            22702       28.5      0.095
-     512  fp16           65038      273.3      0.273
-    1024  kv4fp8         31061       22.9      0.261
-    1024  tq4            20449       51.3      0.172
-    1024  fp16           52300      439.2      0.439
-    2048  kv4fp8         23100       30.7      0.388
-    2048  tq4            12672       61.7      0.213
-    2048  fp16           38041      638.5      0.638
+      64  kv4fp8         48592        3.0      0.025
+      64  tq4            39688        6.9      0.021
+      64  fp16           71182       37.9      0.037
+     512  kv4fp8         36223       13.5      0.152
+     512  tq4            22755       28.6      0.095
+     512  fp16           64888      272.7      0.272
+    1024  kv4fp8         32495       24.0      0.273
+    1024  tq4            20551       51.5      0.172
+    1024  fp16           52498      440.8      0.440
+    2048  kv4fp8         24691       32.8      0.414
+    2048  tq4            12707       61.8      0.213
+    2048  fp16           38163      640.6      0.640
 
 [ascend-bench]   steps/s is one sequence's decode step, not a batch -- every row is B=1; the
 [ascend-bench]   batch axis is validated by test_device_950pr_turboquant_multimode and not timed
@@ -149,89 +148,89 @@ TraceBack (most recent call last):
 
   case                              mode              min    median      mean       p95       p99    stddev     TFLOP/s      GB/s
   ---------------------------------------------------------------------------------------------------------------------
-  tq4_write_s64                     pipelined       20.29     20.43     20.46     20.58     21.45      0.20           -       8.1
-  tq4_write_s64                     device          20.09     20.62     20.84     20.96     21.10      2.32           -       8.1
-  tq4_write_s64                     host            33.79     36.69     36.93     40.34     44.72      2.07           -       4.5
+  tq4_write_s64                     pipelined       20.15     20.32     20.35     20.47     21.36      0.19           -       8.2
+  tq4_write_s64                     device          20.04     20.51     20.67     20.84     20.96      1.63           -       8.1
+  tq4_write_s64                     host            28.76     30.30     30.54     32.76     33.51      1.80           -       5.5
 
-  tq4_decode_s64                    pipelined       25.09     25.22     25.27     25.32     26.55      0.25       0.021       6.9
-  tq4_decode_s64                    device          25.17     25.46     25.61     25.67     25.76      1.55       0.021       6.8
-  tq4_decode_s64                    host            38.72     39.96     40.14     41.55     44.34      1.45       0.013       4.3
+  tq4_decode_s64                    pipelined       25.08     25.20     25.23     25.32     26.20      0.19       0.021       6.9
+  tq4_decode_s64                    device          25.21     25.42     25.55     25.71     25.84      1.23       0.021       6.8
+  tq4_decode_s64                    host            34.32     34.98     35.26     36.02     37.35      1.54       0.015       4.9
 
-  kv4fp8_write_s64                  pipelined       27.22     27.88     27.82     28.34     28.68      0.46           -       6.0
-  kv4fp8_write_s64                  device          27.24     28.25     28.37     28.82     28.96      2.31           -       5.9
-  kv4fp8_write_s64                  host            36.92     39.40     39.86     40.17     64.89      5.04           -       4.2
+  kv4fp8_write_s64                  pipelined       27.29     27.81     27.80     28.20     28.59      0.38           -       6.0
+  kv4fp8_write_s64                  device          27.32     28.22     28.23     28.67     28.88      1.44           -       5.9
+  kv4fp8_write_s64                  host            35.85     38.34     38.54     39.83     40.31      1.76           -       4.3
 
-  kv4fp8_decode_s64                 pipelined       21.20     21.36     21.39     21.49     22.41      0.21       0.025       2.9
-  kv4fp8_decode_s64                 device          21.26     21.58     21.73     21.70     23.17      1.63       0.024       2.9
-  kv4fp8_decode_s64                 host            32.32     35.10     35.21     35.80     36.08      1.07       0.015       1.8
+  kv4fp8_decode_s64                 pipelined       20.32     20.58     20.59     20.79     21.74      0.28       0.025       3.0
+  kv4fp8_decode_s64                 device          20.50     20.64     20.88     21.08     22.47      1.35       0.025       3.0
+  kv4fp8_decode_s64                 host            30.79     33.89     34.01     35.21     36.64      1.63       0.015       1.8
 
-  fp16_decode_s64                   pipelined       14.82     15.05     15.19     15.99     17.04      0.47       0.035      35.4
-  fp16_decode_s64                   device          16.18     17.60     17.73     19.17     23.76      1.33       0.030      30.3
-  fp16_decode_s64                   host            18.80     22.08     22.35     23.31     24.76      1.74       0.024      24.1
+  fp16_decode_s64                   pipelined       13.76     14.05     14.20     15.23     15.83      0.50       0.037      37.9
+  fp16_decode_s64                   device          15.66     16.66     16.98     18.62     22.15      1.43       0.031      32.0
+  fp16_decode_s64                   host            19.26     21.99     21.87     22.46     22.69      1.61       0.024      24.2
 
-  tq4_write_s512                    pipelined       98.45     98.72     98.74     98.90     99.89      0.21           -      13.5
-  tq4_write_s512                    device          98.30     98.90     99.05     99.30     99.49      1.37           -      13.4
-  tq4_write_s512                    host           107.51    108.46    108.79    110.74    113.09      1.12           -      12.3
+  tq4_write_s512                    pipelined       98.95     99.19     99.23     99.36    100.42      0.26           -      13.4
+  tq4_write_s512                    device          98.90     99.34     99.65     99.78    100.00      2.75           -      13.4
+  tq4_write_s512                    host           107.25    108.88    109.44    111.96    112.74      1.74           -      12.2
 
-  tq4_decode_s512                   pipelined       43.90     44.05     44.08     44.13     45.06      0.18       0.095      28.5
-  tq4_decode_s512                   device          43.79     44.24     44.37     44.55     44.72      1.30       0.095      28.4
-  tq4_decode_s512                   host            53.01     53.65     54.20     56.83     58.56      2.13       0.078      23.4
+  tq4_decode_s512                   pipelined       43.71     43.95     43.98     44.08     45.40      0.26       0.095      28.6
+  tq4_decode_s512                   device          43.77     44.14     44.31     44.48     44.56      1.61       0.095      28.5
+  tq4_decode_s512                   host            52.28     53.49     53.90     56.17     59.88      2.12       0.078      23.5
 
-  kv4fp8_write_s512                 pipelined      163.21    163.95    163.88    164.32    164.68      0.48           -       8.1
-  kv4fp8_write_s512                 device         163.19    163.83    164.11    164.91    164.95      1.60           -       8.1
-  kv4fp8_write_s512                 host           174.37    175.57    175.98    177.87    178.93      2.11           -       7.6
+  kv4fp8_write_s512                 pipelined      163.76    164.31    164.31    164.61    166.38      0.61           -       8.1
+  kv4fp8_write_s512                 device         163.67    164.29    164.74    164.93    165.31      3.90           -       8.1
+  kv4fp8_write_s512                 host           173.52    175.18    175.69    177.83    178.26      2.92           -       7.6
 
-  kv4fp8_decode_s512                pipelined       28.77     29.00     29.03     29.10     30.11      0.21       0.145      12.9
-  kv4fp8_decode_s512                device          28.80     29.20     29.33     29.47     29.61      1.29       0.144      12.8
-  kv4fp8_decode_s512                host            39.81     40.81     41.02     41.90     44.38      1.64       0.103       9.1
+  kv4fp8_decode_s512                pipelined       27.46     27.61     27.65     27.72     28.86      0.22       0.152      13.5
+  kv4fp8_decode_s512                device          27.50     27.82     27.96     28.10     28.18      1.38       0.151      13.4
+  kv4fp8_decode_s512                host            37.60     38.89     38.90     39.21     41.48      1.59       0.108       9.6
 
-  fp16_decode_s512                  pipelined       15.19     15.38     15.49     16.35     17.06      0.38       0.273     273.3
-  fp16_decode_s512                  device          17.09     18.32     18.71     21.23     23.63      1.38       0.229     229.4
-  fp16_decode_s512                  host            24.48     25.06     25.56     26.37     27.10      1.39       0.167     167.7
+  fp16_decode_s512                  pipelined       15.29     15.41     15.45     15.55     16.52      0.19       0.272     272.7
+  fp16_decode_s512                  device          16.73     17.57     18.11     21.90     25.83      1.71       0.239     239.1
+  fp16_decode_s512                  host            24.53     24.86     25.19     26.03     29.49      1.58       0.169     169.1
 
-  tq4_write_s1024                   pipelined      187.85    188.08    188.09    188.25    189.20      0.21           -      14.1
-  tq4_write_s1024                   device         187.81    188.23    188.54    188.68    188.90      2.93           -      14.1
-  tq4_write_s1024                   host           196.84    198.21    198.84    201.94    203.09      1.99           -      13.4
+  tq4_write_s1024                   pipelined      189.00    189.15    189.20    189.34    190.54      0.27           -      14.1
+  tq4_write_s1024                   device         188.92    189.37    189.56    189.78    189.89      1.79           -      14.0
+  tq4_write_s1024                   host           197.57    199.35    200.18    202.50    216.14      3.33           -      13.3
 
-  tq4_decode_s1024                  pipelined       48.75     48.90     48.94     49.09     49.92      0.20       0.172      51.3
-  tq4_decode_s1024                  device          48.67     49.06     49.21     49.46     49.93      1.33       0.171      51.1
-  tq4_decode_s1024                  host            57.95     59.66     59.86     61.66     63.08      1.67       0.141      42.0
+  tq4_decode_s1024                  pipelined       48.40     48.66     48.70     48.92     49.89      0.25       0.172      51.5
+  tq4_decode_s1024                  device          48.13     48.82     48.95     49.35     49.43      1.21       0.172      51.3
+  tq4_decode_s1024                  host            57.37     59.17     59.72     62.12     67.50      2.12       0.142      42.4
 
-  kv4fp8_write_s1024                pipelined      318.59    319.26    319.18    319.66    319.91      0.48           -       8.3
-  kv4fp8_write_s1024                device         318.57    319.03    319.56    320.09    320.31      3.35           -       8.3
-  kv4fp8_write_s1024                host           329.98    333.95    334.10    336.51    337.75      3.06           -       8.0
+  kv4fp8_write_s1024                pipelined      319.63    320.15    320.12    320.44    321.10      0.57           -       8.3
+  kv4fp8_write_s1024                device         319.50    320.12    320.42    320.87    321.25      2.14           -       8.3
+  kv4fp8_write_s1024                host           330.29    333.68    334.14    337.85    338.94      2.76           -       8.0
 
-  kv4fp8_decode_s1024               pipelined       32.07     32.19     32.24     32.36     33.67      0.26       0.261      22.9
-  kv4fp8_decode_s1024               device          31.91     32.41     32.53     32.72     32.88      1.27       0.259      22.7
-  kv4fp8_decode_s1024               host            42.89     44.02     44.59     47.05     48.30      1.68       0.191      16.7
+  kv4fp8_decode_s1024               pipelined       30.58     30.77     30.79     30.88     31.94      0.23       0.273      24.0
+  kv4fp8_decode_s1024               device          30.53     30.95     31.10     31.27     31.34      1.43       0.271      23.8
+  kv4fp8_decode_s1024               host            41.17     42.55     43.12     45.80     46.19      1.88       0.197      17.3
 
-  fp16_decode_s1024                 pipelined       18.87     19.12     19.15     19.32     20.18      0.24       0.439     439.2
-  fp16_decode_s1024                 device          18.88     19.33     19.45     19.69     21.42      1.12       0.434     434.4
-  fp16_decode_s1024                 host            28.18     28.48     28.64     28.88     30.06      1.23       0.295     294.8
+  fp16_decode_s1024                 pipelined       18.78     19.05     19.07     19.25     20.20      0.23       0.440     440.8
+  fp16_decode_s1024                 device          18.78     19.22     19.36     19.62     20.72      1.13       0.436     436.8
+  fp16_decode_s1024                 host            27.00     28.52     28.42     28.91     29.24      1.39       0.294     294.4
 
-  tq4_write_s2048                   pipelined      367.15    367.49    367.54    367.72    368.61      0.31           -      14.5
-  tq4_write_s2048                   device         366.98    367.67    367.94    368.50    368.84      1.97           -      14.5
-  tq4_write_s2048                   host           377.15    380.04    380.57    383.75    384.86      2.45           -      14.0
+  tq4_write_s2048                   pipelined      369.57    369.78    369.80    369.93    371.04      0.20           -      14.4
+  tq4_write_s2048                   device         369.46    369.99    370.28    370.51    370.92      2.68           -      14.4
+  tq4_write_s2048                   host           379.22    382.51    383.01    386.73    387.90      2.60           -      13.9
 
-  tq4_decode_s2048                  pipelined       78.66     78.91     78.94     79.10     79.84      0.19       0.213      61.7
-  tq4_decode_s2048                  device          78.54     79.13     79.28     79.57     79.76      1.29       0.212      61.5
-  tq4_decode_s2048                  host            88.28     89.47     89.87     91.78     92.65      1.65       0.188      54.4
+  tq4_decode_s2048                  pipelined       78.38     78.69     78.70     78.91     79.60      0.22       0.213      61.8
+  tq4_decode_s2048                  device          78.13     78.92     79.06     79.45     79.89      1.23       0.213      61.7
+  tq4_decode_s2048                  host            87.40     89.20     89.67     92.22     92.39      2.24       0.188      54.6
 
-  kv4fp8_write_s2048                pipelined      629.21    629.91    629.83    630.28    631.54      0.62           -       8.4
-  kv4fp8_write_s2048                device         629.15    630.29    630.49    630.78    630.85      3.77           -       8.4
-  kv4fp8_write_s2048                host           639.13    642.89    643.32    646.87    649.88      4.61           -       8.3
+  kv4fp8_write_s2048                pipelined      631.25    631.75    631.77    632.17    633.50      0.58           -       8.4
+  kv4fp8_write_s2048                device         631.29    632.16    632.26    632.57    632.60      2.18           -       8.4
+  kv4fp8_write_s2048                host           640.96    644.03    644.64    648.01    649.40      3.87           -       8.3
 
-  kv4fp8_decode_s2048               pipelined       43.14     43.29     43.32     43.39     44.32      0.20       0.388      30.7
-  kv4fp8_decode_s2048               device          43.02     43.51     43.66     43.78     44.04      1.43       0.386      30.5
-  kv4fp8_decode_s2048               host            52.93     53.83     54.10     54.39     58.13      1.80       0.312      24.7
+  kv4fp8_decode_s2048               pipelined       40.26     40.50     40.53     40.72     41.93      0.26       0.414      32.8
+  kv4fp8_decode_s2048               device          40.07     40.76     40.99     41.06     41.23      2.33       0.412      32.6
+  kv4fp8_decode_s2048               host            49.77     50.98     51.51     53.75     68.12      2.79       0.329      26.0
 
-  fp16_decode_s2048                 pipelined       25.93     26.29     26.30     26.55     27.01      0.23       0.638     638.5
-  fp16_decode_s2048                 device          26.03     26.57     26.70     26.91     27.13      1.35       0.632     631.8
-  fp16_decode_s2048                 host            34.77     35.86     36.04     36.62     41.01      1.49       0.468     468.1
+  fp16_decode_s2048                 pipelined       25.92     26.20     26.20     26.41     27.12      0.22       0.640     640.6
+  fp16_decode_s2048                 device          25.97     26.46     26.57     26.77     26.85      1.27       0.634     634.3
+  fp16_decode_s2048                 host            34.27     35.16     35.43     36.03     41.22      1.75       0.477     477.4
 
 [ascend-bench] skipped:
   fia_decode_s64: aclnnFusedInferAttentionScoreV5: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV5GetWorkspaceSize failed with status 561002
-  CANN: [PID: 1335049] 2026-09-14-15:12:52.070.072 Invalid_Argument(EZ0026): Parameter pse_type of FusedInferAttentionScore has incorrect value 1. Reason: The value of pse_type must be 0.
+  CANN: [PID: 3622306] 2026-09-14-20:45:24.303.473 Invalid_Argument(EZ0026): Parameter pse_type of FusedInferAttentionScore has incorrect value 1. Reason: The value of pse_type must be 0.
         Solution: Check whether the parameter value is correct.
 TraceBack (most recent call last):
         Failed to execute operator FusedInferAttentionScore_0. Reason: Failed to execute tiling function.
@@ -240,11 +239,11 @@ TraceBack (most recent call last):
         Check NnopbaseExecutorMatchCache(executor) failed
         Check NnopbaseRunForWorkspace(*executor, workspaceSize) failed
 ; aclnnFusedInferAttentionScoreV2: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV2GetWorkspaceSize failed with status 361001
-  CANN: [PID: 1335049] 2026-09-14-15:12:52.070.609 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
+  CANN: [PID: 3622306] 2026-09-14-20:45:24.303.796 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
         Solution: In this scenario, collect the plog when the fault occurs and locate the fault based on the plog.
 
   fia_decode_s512: aclnnFusedInferAttentionScoreV5: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV5GetWorkspaceSize failed with status 561002
-  CANN: [PID: 1335049] 2026-09-14-15:12:52.117.796 Invalid_Argument(EZ0026): Parameter pse_type of FusedInferAttentionScore has incorrect value 1. Reason: The value of pse_type must be 0.
+  CANN: [PID: 3622306] 2026-09-14-20:45:24.345.399 Invalid_Argument(EZ0026): Parameter pse_type of FusedInferAttentionScore has incorrect value 1. Reason: The value of pse_type must be 0.
         Solution: Check whether the parameter value is correct.
 TraceBack (most recent call last):
         Failed to execute operator FusedInferAttentionScore_0. Reason: Failed to execute tiling function.
@@ -253,11 +252,11 @@ TraceBack (most recent call last):
         Check NnopbaseExecutorMatchCache(executor) failed
         Check NnopbaseRunForWorkspace(*executor, workspaceSize) failed
 ; aclnnFusedInferAttentionScoreV2: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV2GetWorkspaceSize failed with status 361001
-  CANN: [PID: 1335049] 2026-09-14-15:12:52.118.015 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
+  CANN: [PID: 3622306] 2026-09-14-20:45:24.345.702 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
         Solution: In this scenario, collect the plog when the fault occurs and locate the fault based on the plog.
 
   fia_decode_s1024: aclnnFusedInferAttentionScoreV5: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV5GetWorkspaceSize failed with status 561002
-  CANN: [PID: 1335049] 2026-09-14-15:12:52.197.645 Invalid_Argument(EZ0026): Parameter pse_type of FusedInferAttentionScore has incorrect value 1. Reason: The value of pse_type must be 0.
+  CANN: [PID: 3622306] 2026-09-14-20:45:24.420.120 Invalid_Argument(EZ0026): Parameter pse_type of FusedInferAttentionScore has incorrect value 1. Reason: The value of pse_type must be 0.
         Solution: Check whether the parameter value is correct.
 TraceBack (most recent call last):
         Failed to execute operator FusedInferAttentionScore_0. Reason: Failed to execute tiling function.
@@ -266,11 +265,11 @@ TraceBack (most recent call last):
         Check NnopbaseExecutorMatchCache(executor) failed
         Check NnopbaseRunForWorkspace(*executor, workspaceSize) failed
 ; aclnnFusedInferAttentionScoreV2: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV2GetWorkspaceSize failed with status 361001
-  CANN: [PID: 1335049] 2026-09-14-15:12:52.197.932 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
+  CANN: [PID: 3622306] 2026-09-14-20:45:24.420.428 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
         Solution: In this scenario, collect the plog when the fault occurs and locate the fault based on the plog.
 
   fia_decode_s2048: aclnnFusedInferAttentionScoreV5: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV5GetWorkspaceSize failed with status 561002
-  CANN: [PID: 1335049] 2026-09-14-15:12:52.350.408 Invalid_Argument(EZ0026): Parameter pse_type of FusedInferAttentionScore has incorrect value 1. Reason: The value of pse_type must be 0.
+  CANN: [PID: 3622306] 2026-09-14-20:45:24.576.698 Invalid_Argument(EZ0026): Parameter pse_type of FusedInferAttentionScore has incorrect value 1. Reason: The value of pse_type must be 0.
         Solution: Check whether the parameter value is correct.
 TraceBack (most recent call last):
         Failed to execute operator FusedInferAttentionScore_0. Reason: Failed to execute tiling function.
@@ -279,6 +278,5 @@ TraceBack (most recent call last):
         Check NnopbaseExecutorMatchCache(executor) failed
         Check NnopbaseRunForWorkspace(*executor, workspaceSize) failed
 ; aclnnFusedInferAttentionScoreV2: /home/o60133706/vllm-ascend/csrc/tests/common/benchmark.cpp:517: aclnnFusedInferAttentionScoreV2GetWorkspaceSize failed with status 361001
-  CANN: [PID: 1335049] 2026-09-14-15:12:52.350.734 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
+  CANN: [PID: 3622306] 2026-09-14-20:45:24.577.014 AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer supported on Ascend950.
         Solution: In this scenario, collect the plog when the fault occurs and locate the fault based on the plog.
-
