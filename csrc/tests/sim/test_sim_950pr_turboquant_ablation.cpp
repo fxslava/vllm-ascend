@@ -59,6 +59,11 @@
 //   ASCEND_TQ_ABLATION_STAGES=0,4,5          stages to dispatch, in that order (default 0..5)
 //   ASCEND_TQ_ABLATION_CONTEXT=192           context, a positive multiple of 64 (default 256)
 //   ASCEND_TQ_ABLATION_STAGE_TIMEOUT_S=3600  per-launch hang budget in seconds (default 5400)
+//   ASCEND_TQ_ABLATION_HOST_FILL=1           fill the packed cache from the host instead of
+//                                            launching the write, which is 20 minutes of
+//                                            camodel at S = 256. The flag protocol does not
+//                                            read the values; stage 5's cosine is then not
+//                                            checked.
 
 #include <dirent.h>
 #include <sys/stat.h>
@@ -175,6 +180,23 @@ std::vector<tqm::DecodeAblationStage> Stages() {
 int64_t StageTimeoutSeconds() {
   const std::vector<int64_t> parsed = IntListFromEnv("ASCEND_TQ_ABLATION_STAGE_TIMEOUT_S");
   return parsed.size() == 1 && parsed[0] > 0 ? parsed[0] : kDefaultStageTimeoutSeconds;
+}
+
+bool HostFillRequested() {
+  const char* raw = std::getenv("ASCEND_TQ_ABLATION_HOST_FILL");
+  return raw != nullptr && raw[0] == '1';
+}
+
+// Deterministic bytes for a host-filled packed cache. Any byte is two valid
+// 4-bit codes, so the unpack sees the kind of input the encoder writes.
+std::vector<int8_t> PseudoRandomBytes(size_t count, uint32_t seed) {
+  std::vector<int8_t> bytes(count);
+  uint32_t state = seed;
+  for (int8_t& byte : bytes) {
+    state = state * 1664525u + 1013904223u;
+    byte = static_cast<int8_t>(state >> 24);
+  }
+  return bytes;
 }
 
 // --- hang detection ------------------------------------------------------------
@@ -402,10 +424,15 @@ TEST(TurboQuantDecodeAblation, CutStagesExitCleanOnTheCamodel) {
   DeviceBuffer write_tables = DeviceBuffer::FromHost(tqh::ModeTables(kMode, kHeadSize, 1, /*nz_rows=*/0));
   DeviceBuffer decode_tables =
       DeviceBuffer::FromHost(tqh::ModeTables(kMode, kHeadSize, tqh::kUnpackRows, tqh::kCubeTileRows));
-  DeviceBuffer key_cache =
-      DeviceBuffer::Empty<int8_t>(tqh::ModePackedCacheBytes(kMode, num_blocks, kBlockSize, kNumKvHeads, kHeadSize));
-  DeviceBuffer value_cache = DeviceBuffer::Empty<int8_t>(key_cache.size_bytes());
-  DeviceBuffer scale_plane = DeviceBuffer::Empty<float>(tqh::ScalePlaneFloats(num_blocks, kBlockSize, kNumKvHeads));
+  const bool host_fill = HostFillRequested();
+  const size_t cache_bytes = tqh::ModePackedCacheBytes(kMode, num_blocks, kBlockSize, kNumKvHeads, kHeadSize);
+  const size_t scale_floats = tqh::ScalePlaneFloats(num_blocks, kBlockSize, kNumKvHeads);
+  DeviceBuffer key_cache = host_fill ? DeviceBuffer::FromHost(PseudoRandomBytes(cache_bytes, 0x4B455931u))
+                                     : DeviceBuffer::Empty<int8_t>(cache_bytes);
+  DeviceBuffer value_cache = host_fill ? DeviceBuffer::FromHost(PseudoRandomBytes(cache_bytes, 0x56414C31u))
+                                       : DeviceBuffer::Empty<int8_t>(cache_bytes);
+  DeviceBuffer scale_plane = host_fill ? DeviceBuffer::FromHost(std::vector<float>(scale_floats, 1.0f))
+                                       : DeviceBuffer::Empty<float>(scale_floats);
   DeviceBuffer out = DeviceBuffer::Empty<Half>(static_cast<size_t>(kNumHeads * kHeadSize));
   const std::vector<float> sentinel(grid.workspace_floats, kWorkspaceSentinel);
 
@@ -415,16 +442,21 @@ TEST(TurboQuantDecodeAblation, CutStagesExitCleanOnTheCamodel) {
               static_cast<unsigned long long>(at_start.bytes));
 
   auto clock = std::chrono::steady_clock::now();
-  watchdog.Arm("the cache write");
-  turboquant_mm_reshape_and_cache_impl(
-      static_cast<int32_t>(kMode), AscendType::FP16, stream, write_grid.block_dim, key_dev.get(), value_dev.get(),
-      key_cache.get(), value_cache.get(), scale_plane.get(), slots_dev.get(), pi_signs.get(), rot_tables.get(),
-      write_tables.get(), static_cast<uint32_t>(context_len), static_cast<uint32_t>(kNumKvHeads),
-      static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kBlockSize), write_grid.tokens_per_core,
-      kInvSqrtHeadSize);
-  ACL_CHECK(aclrtSynchronizeStream(stream));
-  watchdog.Disarm();
-  std::printf("[ ablation ] cache written in %.1f s\n", SecondsSince(clock));
+  if (host_fill) {
+    std::printf("[ ablation ] cache filled from the host (ASCEND_TQ_ABLATION_HOST_FILL=1); stage 5's cosine is "
+                "not checked\n");
+  } else {
+    watchdog.Arm("the cache write");
+    turboquant_mm_reshape_and_cache_impl(
+        static_cast<int32_t>(kMode), AscendType::FP16, stream, write_grid.block_dim, key_dev.get(), value_dev.get(),
+        key_cache.get(), value_cache.get(), scale_plane.get(), slots_dev.get(), pi_signs.get(), rot_tables.get(),
+        write_tables.get(), static_cast<uint32_t>(context_len), static_cast<uint32_t>(kNumKvHeads),
+        static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kBlockSize), write_grid.tokens_per_core,
+        kInvSqrtHeadSize);
+    ACL_CHECK(aclrtSynchronizeStream(stream));
+    watchdog.Disarm();
+    std::printf("[ ablation ] cache written in %.1f s\n", SecondsSince(clock));
+  }
   std::fflush(stdout);
 
   const std::vector<float> reference = HostAttention(context_len, query, key, value);
@@ -493,7 +525,9 @@ TEST(TurboQuantDecodeAblation, CutStagesExitCleanOnTheCamodel) {
     std::fflush(stdout);
     EXPECT_EQ(finite, output.size()) << name << " produced non-finite output";
     EXPECT_GT(abs_sum, 0.0) << name << " produced an identically zero output";
-    EXPECT_GT(cos, kSmokeCos) << name << " does not track the host reference; this is a structural bound";
+    if (!host_fill) {
+      EXPECT_GT(cos, kSmokeCos) << name << " does not track the host reference; this is a structural bound";
+    }
   }
 }
 

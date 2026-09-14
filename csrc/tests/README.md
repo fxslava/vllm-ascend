@@ -70,7 +70,8 @@ csrc/tests/
 |   |-- bench_950pr_cube_hadamard.cpp             spike: the same sweep, timed, --csv=
 |   |-- bench_main_950pr_hadamard.cpp             its entry point; only it takes argv
 |   |-- bench_device_950pr_turboquant.cpp         the AIV-only baseline
-|   `-- bench_device_950pr_turboquant_ablation.cpp  the kv4fp8 Cube split, cut stage by stage
+|   |-- bench_device_950pr_turboquant_ablation.cpp  the kv4fp8 Cube split, cut stage by stage
+|   `-- bench_main_950pr_ablation.cpp             its entry point; takes --stage= and --sync-timeout-ms=
 |
 `-- device_310p/            the 310P leg -- NOT configured under a 950PR SoC
     |-- test_*_310p.cpp
@@ -343,6 +344,8 @@ warmup.
 | `ASCEND_BENCH_TQ_CONTEXTS` | `512,1024,2048` | `bench_device_950pr_turboquant` only: the context lengths to sweep |
 | `ASCEND_BENCH_TQ_ABLATION_DIMS` | `256,512` | `bench_device_950pr_turboquant_ablation` only: head sizes, powers of two in [64, 512] |
 | `ASCEND_BENCH_TQ_ABLATION_CONTEXTS` | `64,512,1024,2048` | `bench_device_950pr_turboquant_ablation` only: contexts, positive multiples of 8 (TURBOQUANT_TESTS.md 13.20) |
+| `ASCEND_BENCH_TQ_ABLATION_STAGES` | `0,1,2,3,4,5` | `bench_device_950pr_turboquant_ablation` only: stages to run, in order; `--stage=` sets it |
+| `ASCEND_BENCH_TQ_ABLATION_SYNC_TIMEOUT_MS` | `30000` | `bench_device_950pr_turboquant_ablation` only: deadline for each stage's first launch, `0` for none; a miss exits 3. `--sync-timeout-ms=` sets it |
 | `ASCEND_TEST_DEVICE_ID` | 0 | device ordinal, shared with the tests |
 
 ```bash
