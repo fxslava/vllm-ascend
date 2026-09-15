@@ -19,8 +19,9 @@
 The cache is plain contiguous ND -- ``(2, num_blocks, block_size, num_kv_heads,
 head_size // 2)`` int8, two 4-bit codes per byte.
 
-``q``, ``k`` and ``v`` reach the operators exactly as the projections and RoPE
-produced them, and the kernels apply
+``q``, ``k`` and ``v`` reach the operators holding exactly the values the
+projections and RoPE produced -- packed contiguous, because the adapter refuses
+the strided slices a fused QKV split leaves -- and the kernels apply
 
     Pi x = D (H (D x)),   D = diag(+-1),   H = normalised Walsh-Hadamard
 
@@ -321,13 +322,16 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
         slots = attn_metadata.slot_mapping if encoder_decoder else attn_metadata.slot_mapping[:num_actual_tokens]
 
+        cached_key = key if encoder_decoder else key[:num_actual_tokens]
+        cached_value = value if encoder_decoder else value[:num_actual_tokens]
+
         torch.ops._C_ascend.npu_turboquant_reshape_and_cache(
-            key if encoder_decoder else key[:num_actual_tokens],
-            value if encoder_decoder else value[:num_actual_tokens],
+            cached_key.contiguous(),
+            cached_value.contiguous(),
             self.key_cache,
             self.value_cache,
             self.scale_cache,
-            slots.to(torch.int32),
+            slots.to(torch.int32).contiguous(),
             self.pi_signs(key.device),
             self.codec_tables(key.device, 1),
         )
@@ -421,13 +425,13 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         num_tokens = query.shape[0]
         rotated_query = self._rotated_query(num_tokens, query.device)
         torch.ops._C_ascend.npu_turboquant_rotate_q(
-            query[:num_tokens],
+            query.contiguous(),
             self.pi_signs(query.device),
             self.codec_tables(query.device, 1),
             self.hadamard16(query.device),
             rotated_query,
         )
-        block_tables = attn_metadata.block_tables.to(torch.int32)
+        block_tables = attn_metadata.block_tables.to(torch.int32).contiguous()
         attention_output = output[:num_tokens].view(num_tokens, self.num_heads, self.head_size)
         torch.ops._C_ascend.npu_turboquant_paged_attention(
             rotated_query,
@@ -435,7 +439,7 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             self.value_cache,
             self.scale_cache,
             block_tables,
-            attn_metadata.seq_lens.to(torch.int32),
+            attn_metadata.seq_lens.to(torch.int32).contiguous(),
             self.codec_tables(query.device, TURBOQUANT_TILE_ROWS),
             self._decode_workspace(num_tokens, block_tables.shape[1], query.device),
             self.num_kv_heads,
