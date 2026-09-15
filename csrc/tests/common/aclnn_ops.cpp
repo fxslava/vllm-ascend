@@ -34,14 +34,10 @@ AclnnOp ResolveFirstAvailable(std::initializer_list<const char*> candidate_names
       return candidate;
     }
   }
-  // Nothing resolved. Return the first candidate so the skip message names a
-  // concrete operator, and let the caller print the full list.
   return AclnnOp(first != nullptr ? first : "<no candidates>");
 }
 
 std::vector<OpAvailability> ProbeAllOperators() {
-  // Order: the operators the suite uses, then the three that CANN 9.1.0 does not
-  // provide as aclnn (kept so the inventory documents their absence).
   const char* names[] = {
       kMatmul,
       kRmsNorm,
@@ -50,7 +46,6 @@ std::vector<OpAvailability> ProbeAllOperators() {
       kApplyRotaryPosEmb,
       kScatterPaKvCache,
       kIncreFlashAttentionV4,
-      // ATB-backed / GE-backed, expected MISSING on CANN 9.1.0:
       kRotaryMul,
       kReshapeAndCache,
       kPagedAttention,
@@ -83,6 +78,6 @@ void PrintOperatorInventory() {
   }
 }
 
-}  // namespace ops
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}

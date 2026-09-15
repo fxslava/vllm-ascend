@@ -14,10 +14,6 @@
  * limitations under the License.
  */
 
-// Host-side IEEE-754 binary16 <-> binary32 conversion, written out here because
-// the suite avoids <torch/types.h>, ATen and the CANN half type. Rounding is
-// round-to-nearest-even, matching both the DaVinci vector unit and PyTorch.
-
 #pragma once
 
 #include <cstdint>
@@ -35,9 +31,8 @@ inline float HalfBitsToFloat(uint16_t h) {
 
   if (exponent == 0) {
     if (mantissa == 0) {
-      bits = sign;  // +/- zero
+      bits = sign;
     } else {
-      // Subnormal binary16: renormalise into the binary32 normal range.
       exponent = 127 - 15 + 1;
       while ((mantissa & 0x400u) == 0) {
         mantissa <<= 1;
@@ -47,7 +42,7 @@ inline float HalfBitsToFloat(uint16_t h) {
       bits = sign | (exponent << 23) | (mantissa << 13);
     }
   } else if (exponent == 0x1Fu) {
-    bits = sign | 0x7F800000u | (mantissa << 13);  // Inf / NaN
+    bits = sign | 0x7F800000u | (mantissa << 13);
   } else {
     bits = sign | ((exponent - 15 + 127) << 23) | (mantissa << 13);
   }
@@ -66,20 +61,19 @@ inline uint16_t FloatToHalfBits(float value) {
   uint32_t mantissa = bits & 0x7FFFFFu;
 
   if (raw_exponent == 0xFFu) {
-    // Inf stays Inf; NaN keeps a non-zero payload so it stays NaN.
     return static_cast<uint16_t>(sign | 0x7C00u | (mantissa != 0 ? 0x200u : 0u));
   }
 
   const int32_t exponent = static_cast<int32_t>(raw_exponent) - 127 + 15;
   if (exponent >= 0x1F) {
-    return static_cast<uint16_t>(sign | 0x7C00u);  // overflow saturates to Inf
+    return static_cast<uint16_t>(sign | 0x7C00u);
   }
 
   if (exponent <= 0) {
     if (exponent < -10) {
-      return static_cast<uint16_t>(sign);  // underflows past the subnormal range
+      return static_cast<uint16_t>(sign);
     }
-    mantissa |= 0x800000u;  // restore the implicit leading one
+    mantissa |= 0x800000u;
     const uint32_t shift = static_cast<uint32_t>(14 - exponent);
     uint32_t result = mantissa >> shift;
     const uint32_t remainder = mantissa & ((1u << shift) - 1u);
@@ -90,8 +84,6 @@ inline uint16_t FloatToHalfBits(float value) {
     return static_cast<uint16_t>(sign | result);
   }
 
-  // A carry out of the mantissa here correctly increments the exponent field,
-  // and an exponent that reaches 0x1F lands on the Inf pattern.
   uint32_t result = (static_cast<uint32_t>(exponent) << 10) | (mantissa >> 13);
   const uint32_t remainder = mantissa & 0x1FFFu;
   if (remainder > 0x1000u || (remainder == 0x1000u && (result & 1u) != 0)) {
@@ -100,9 +92,6 @@ inline uint16_t FloatToHalfBits(float value) {
   return static_cast<uint16_t>(sign | result);
 }
 
-// Storage-only half type. It has no arithmetic operators on purpose: every
-// computation in the reference implementations happens in float or double, and
-// the conversion points are meant to be visible in the code.
 struct Half {
   uint16_t bits = 0;
 
@@ -129,9 +118,6 @@ inline std::vector<float> HalfToFloat(const std::vector<Half>& src) {
   return out;
 }
 
-// Rounds every element to the nearest representable binary16 value while
-// keeping float storage. Reference implementations use this to model the
-// precision of an fp16 input without giving up float arithmetic.
 inline std::vector<float> QuantizeToHalf(const std::vector<float>& src) {
   std::vector<float> out(src.size());
   for (size_t i = 0; i < src.size(); ++i) {
@@ -140,5 +126,5 @@ inline std::vector<float> QuantizeToHalf(const std::vector<float>& src) {
   return out;
 }
 
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}

@@ -14,25 +14,6 @@
  * limitations under the License.
  */
 
-// MatMul on Ascend 310P, fp16 in / fp16 out, with a transposed B. The only
-// suite here that exercises the v200 cube unit.
-//
-// Two deliberate choices, both of which the tolerance depends on:
-//
-// 1. B is presented transposed. A Linear layer stores its weight as
-//    [out_features, in_features] = [N, K] and computes x @ W^T. The test
-//    uploads that [N, K] buffer and describes it as a [K, N] view with strides
-//    {1, K} (DeviceTensor::HalfTransposed2D), as torch_npu does.
-//
-// 2. Inputs are scaled so the output lands near unit magnitude. A K=4096 dot
-//    product of N(0,1) terms has magnitude ~sqrt(K)=64, where one fp16 ULP is
-//    0.0625 and the output rounding alone would exceed atol=1e-3. Drawing B
-//    with stddev 1/sqrt(K) keeps the result near 1.0, where one fp16 ULP is
-//    ~9.8e-4.
-//
-// NOT COVERED: M > 1. Decode is M=1, but a GEMV does not exercise the cube
-// unit's M tiling at all.
-
 #include <gtest/gtest.h>
 
 #include <cmath>
@@ -60,8 +41,6 @@ const AclnnOp& MatmulOp() {
   return op;
 }
 
-// Runs aclnnMatmul with `b_t` supplied in Linear [N, K] layout and viewed as
-// [K, N], and returns the fp16 [M, N] output widened back to float.
 std::vector<float> RunMatmulOnDevice(const std::vector<float>& a, const std::vector<float>& b_t, int64_t m,
                                      int64_t k, int64_t n, const AclnnOp& op) {
   aclrtStream stream = AscendTestEnvironment::Instance().stream();
@@ -76,13 +55,7 @@ std::vector<float> RunMatmulOnDevice(const std::vector<float>& a, const std::vec
   return out_device.ToFloatFromHalf();
 }
 
-// -----------------------------------------------------------------------------
-// Host-only checks. These run on a build machine with no NPU attached, so a
-// mistake in the reference itself is caught before any hardware is involved.
-// -----------------------------------------------------------------------------
-
 TEST(MatmulReference, IdentityWeightReproducesInput) {
-  // b_t = I in [n, k] layout with n == k means out[0][j] = a[0][j].
   const int64_t k = 8;
   const int64_t n = 8;
   std::vector<float> a(static_cast<size_t>(k));
@@ -105,10 +78,6 @@ TEST(MatmulReference, IdentityWeightReproducesInput) {
 }
 
 TEST(MatmulReference, MatchesHandComputedCase) {
-  // a = [1, 2, 3]                 (m=1, k=3)
-  // b_t = [[1, 0, -1],            (n=2, k=3) -> output channel 0
-  //        [2, 2,  2]]                          output channel 1
-  // out = [1*1 + 2*0 + 3*(-1), 1*2 + 2*2 + 3*2] = [-2, 12]
   const std::vector<float> a{1.0f, 2.0f, 3.0f};
   const std::vector<float> b_t{1.0f, 0.0f, -1.0f, 2.0f, 2.0f, 2.0f};
 
@@ -121,11 +90,9 @@ TEST(MatmulReference, MatchesHandComputedCase) {
 }
 
 TEST(MatmulReference, IsLinearInTheInput) {
-  // matmul(a1 + a2, B) == matmul(a1, B) + matmul(a2, B). Catches an indexing
-  // error that happens to be self-consistent on a single input.
   const int64_t k = 32;
   const int64_t n = 16;
-  DeterministicRandom random(0x4c494e21u);  // "LIN!"
+  DeterministicRandom random(0x4c494e21u);
 
   const std::vector<float> a1 = random.NormalHalfExact(static_cast<size_t>(k), 0.0f, 1.0f);
   const std::vector<float> a2 = random.NormalHalfExact(static_cast<size_t>(k), 0.0f, 1.0f);
@@ -150,9 +117,6 @@ TEST(MatmulReference, IsLinearInTheInput) {
 }
 
 TEST(MatmulShapes, QwenProjectionShapesAreBurstAligned) {
-  // K is the contiguous axis of A and of the [N, K] weight buffer, so an fp16
-  // row must be a whole number of 32-byte MTE bursts. N is the contiguous axis
-  // of the output. Both hold for every Qwen3.5 projection width.
   for (int64_t k : shapes::LinearInputSizes()) {
     EXPECT_EQ(k % shapes::kFp16ElementsPerBurst, 0)
         << "K=" << k << " is not a multiple of " << shapes::kFp16ElementsPerBurst << " fp16 elements (32 bytes)";
@@ -163,18 +127,12 @@ TEST(MatmulShapes, QwenProjectionShapesAreBurstAligned) {
   }
 }
 
-// -----------------------------------------------------------------------------
-// Device parity
-// -----------------------------------------------------------------------------
-
 class Matmul310PTest : public ::testing::TestWithParam<std::tuple<int64_t, int64_t>> {
  protected:
   int64_t k() const { return std::get<0>(GetParam()); }
   int64_t n() const { return std::get<1>(GetParam()); }
   int64_t m() const { return shapes::kDecodeTokenCount; }
 
-  // stddev 1/sqrt(K) for the weights, so the output sits near unit magnitude.
-  // See the tolerance discussion at the top of this file.
   float weight_stddev() const { return 1.0f / std::sqrt(static_cast<float>(k())); }
 };
 
@@ -182,10 +140,8 @@ TEST_P(Matmul310PTest, MatchesCpuReference) {
   REQUIRE_ASCEND_310P();
   REQUIRE_ACLNN_OP(MatmulOp());
 
-  DeterministicRandom random(0x4d4d554cu);  // "MMUL"
+  DeterministicRandom random(0x4d4d554cu);
 
-  // Pre-rounded to fp16 so the device and the reference start from
-  // bit-identical inputs and the comparison measures arithmetic only.
   const std::vector<float> a = random.NormalHalfExact(static_cast<size_t>(m() * k()), 0.0f, 1.0f);
   const std::vector<float> b_t =
       random.NormalHalfExact(static_cast<size_t>(n() * k()), 0.0f, weight_stddev());
@@ -195,8 +151,6 @@ TEST_P(Matmul310PTest, MatchesCpuReference) {
   std::vector<float> expected;
   reference::MatmulTransposedB(a, b_t, m(), k(), n(), &expected);
 
-  // The device writes fp16, so the reference is rounded the same way before
-  // comparing; otherwise the output quantisation alone eats the tolerance.
   EXPECT_TENSORS_ALLCLOSE(actual, QuantizeToHalf(expected), kFp16DefaultTolerance);
 }
 
@@ -204,10 +158,7 @@ TEST_P(Matmul310PTest, ZeroWeightsProduceZeroOutput) {
   REQUIRE_ASCEND_310P();
   REQUIRE_ACLNN_OP(MatmulOp());
 
-  // An all-zero weight must give an exactly zero output, with no NaN leaking in
-  // from an uninitialised accumulator or a padded K tile. This needs no
-  // reference at all, so it isolates the kernel from the host arithmetic.
-  DeterministicRandom random(0x5a45524fu);  // "ZERO"
+  DeterministicRandom random(0x5a45524fu);
 
   const std::vector<float> a = random.NormalHalfExact(static_cast<size_t>(m() * k()), 0.0f, 1.0f);
   const std::vector<float> b_t(static_cast<size_t>(n() * k()), 0.0f);
@@ -225,10 +176,7 @@ TEST_P(Matmul310PTest, IsLinearInTheInput) {
   REQUIRE_ASCEND_310P();
   REQUIRE_ACLNN_OP(MatmulOp());
 
-  // Scaling A by 2 must scale the output by 2. 2 is exact in fp16, so this
-  // catches a kernel that folds a scale or a tile offset in the wrong place
-  // without depending on the CPU reference.
-  DeterministicRandom random(0x4c494e32u);  // "LIN2"
+  DeterministicRandom random(0x4c494e32u);
 
   const std::vector<float> a = random.NormalHalfExact(static_cast<size_t>(m() * k()), 0.0f, 1.0f);
   const std::vector<float> b_t =
@@ -261,6 +209,6 @@ INSTANTIATE_TEST_SUITE_P(Qwen35, Matmul310PTest,
                                             ::testing::ValuesIn(shapes::LinearOutputSizes())),
                          MatmulTestName);
 
-}  // namespace
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}

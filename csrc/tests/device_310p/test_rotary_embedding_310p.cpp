@@ -14,16 +14,6 @@
  * limitations under the License.
  */
 
-// Rotary position embedding on Ascend 310P, fp16 in / fp16 out.
-//
-// Mirrors vllm_ascend/_310p/ops/rotary_embedding.py :: _rope_forward_oot, which
-// reshapes query and key to BSND [1, num_tokens, num_heads, head_dim] and calls
-// torch_npu.npu_apply_rotary_pos_emb in place with cos/sin already widened.
-//
-// Both rotary layouts are covered:
-//   rotary_mode "half"       - neox style, pairs i with i + rotary_dim/2
-//   rotary_mode "interleave" - GPT-J style, pairs 2k with 2k + 1
-
 #include <gtest/gtest.h>
 
 #include <cmath>
@@ -47,9 +37,6 @@ namespace {
 
 using reference::RotaryMode;
 
-// _rope_forward_oot builds BSND-shaped tensors before the call. `layout` is an
-// int64 enum in the verified prototype, not a string; see
-// ops::kApplyRotaryPosEmbLayoutBsnd.
 char kRotaryModeHalf[] = "half";
 char kRotaryModeInterleave[] = "interleave";
 
@@ -60,8 +47,6 @@ char* RotaryModeString(RotaryMode mode) {
 const char* RotaryModeLabel(RotaryMode mode) { return (mode == RotaryMode::kHalf) ? "half" : "interleave"; }
 
 const AclnnOp& ApplyRotaryPosEmbOp() {
-  // The operator gained a V2 suffix partway through the CANN 8.x line; try the
-  // newer name first and fall back to the original.
   static const AclnnOp op = ops::ResolveFirstAvailable({ops::kApplyRotaryPosEmbV2, ops::kApplyRotaryPosEmb});
   return op;
 }
@@ -71,8 +56,6 @@ struct RotaryResult {
   std::vector<float> key;
 };
 
-// query/key are [num_tokens, num_heads, head_dim] on entry and are rotated in
-// place by the operator, so the result is read back out of the same buffers.
 RotaryResult RunApplyRotaryPosEmbOnDevice(const std::vector<float>& query, const std::vector<float>& key,
                                           const std::vector<float>& cos_full, const std::vector<float>& sin_full,
                                           int64_t num_tokens, int64_t num_q_heads, int64_t num_kv_heads,
@@ -94,8 +77,6 @@ RotaryResult RunApplyRotaryPosEmbOnDevice(const std::vector<float>& query, const
   return result;
 }
 
-// L2 norm of each rotary pair. A rotation preserves it exactly, which is a
-// property check that needs no reference implementation.
 std::vector<float> PairNorms(const std::vector<float>& x, int64_t num_tokens, int64_t num_heads, int64_t head_dim,
                              RotaryMode mode) {
   const int64_t half = head_dim / 2;
@@ -117,18 +98,12 @@ std::vector<float> PairNorms(const std::vector<float>& x, int64_t num_tokens, in
   return norms;
 }
 
-// -----------------------------------------------------------------------------
-// Host-only checks
-// -----------------------------------------------------------------------------
-
 TEST(RotaryReference, PositionZeroIsTheIdentity) {
-  // cos(0) = 1 and sin(0) = 0, so position 0 must leave the vector untouched
-  // regardless of the rotary layout.
   const int64_t head_dim = 128;
   const std::vector<float> cache = reference::BuildCosSinCache(8, head_dim, shapes::kRopeThetaDefault);
   const std::vector<int32_t> positions = {0};
 
-  DeterministicRandom random(0x524f5045u);  // "ROPE"
+  DeterministicRandom random(0x524f5045u);
   const std::vector<float> x = random.NormalHalfExact(static_cast<size_t>(head_dim), 0.0f, 1.0f);
 
   for (RotaryMode mode : {RotaryMode::kHalf, RotaryMode::kInterleave}) {
@@ -153,7 +128,7 @@ TEST(RotaryReference, PreservesPairNorms) {
       reference::BuildCosSinCache(shapes::kMaxPositionEmbeddings, head_dim, shapes::kRopeThetaDefault);
   const std::vector<int32_t> positions = {0, 1, 17, 512, 4095};
 
-  DeterministicRandom random(0x4e4f524du);  // "NORM"
+  DeterministicRandom random(0x4e4f524du);
   const std::vector<float> x = random.NormalHalfExact(static_cast<size_t>(num_tokens * head_dim), 0.0f, 1.0f);
 
   for (RotaryMode mode : {RotaryMode::kHalf, RotaryMode::kInterleave}) {
@@ -174,13 +149,11 @@ TEST(RotaryReference, PreservesPairNorms) {
 }
 
 TEST(RotaryReference, HalfAndInterleaveDisagree) {
-  // If the two layouts ever produced the same answer, the mode parameter would
-  // be untested by everything else in this file.
   const int64_t head_dim = 64;
   const std::vector<float> cache = reference::BuildCosSinCache(64, head_dim, shapes::kRopeThetaDefault);
   const std::vector<int32_t> positions = {7};
 
-  DeterministicRandom random(0x44494646u);  // "DIFF"
+  DeterministicRandom random(0x44494646u);
   const std::vector<float> x = random.NormalHalfExact(static_cast<size_t>(head_dim), 0.0f, 1.0f);
 
   std::vector<float> cos_half;
@@ -208,17 +181,11 @@ TEST(RotaryReference, HalfAndInterleaveDisagree) {
 }
 
 TEST(RotaryShapes, OnlyHeadDims64And128AreSupportedOn310P) {
-  // AscendMRotaryEmbedding310 gates on `self.rotary_dim in (64, 128)`; anything
-  // else falls back to the torch path. The suite therefore only exercises those.
   for (int64_t head_dim : shapes::RotaryHeadDims()) {
     EXPECT_TRUE(head_dim == 64 || head_dim == 128) << "unexpected head dim " << head_dim;
     EXPECT_EQ(head_dim % 2, 0);
   }
 }
-
-// -----------------------------------------------------------------------------
-// Device parity
-// -----------------------------------------------------------------------------
 
 struct RotaryCase {
   int64_t num_tokens;
@@ -236,15 +203,13 @@ TEST_P(RotaryEmbedding310PTest, MatchesCpuReference) {
   REQUIRE_ACLNN_OP(ApplyRotaryPosEmbOp());
 
   const RotaryCase& test_case = GetParam();
-  DeterministicRandom random(0x51524f50u);  // "QROP"
+  DeterministicRandom random(0x51524f50u);
 
   const std::vector<float> query = random.NormalHalfExact(
       static_cast<size_t>(test_case.num_tokens * test_case.num_q_heads * test_case.head_dim), 0.0f, 1.0f);
   const std::vector<float> key = random.NormalHalfExact(
       static_cast<size_t>(test_case.num_tokens * test_case.num_kv_heads * test_case.head_dim), 0.0f, 1.0f);
 
-  // Positions are scattered rather than sequential so a kernel that ignores the
-  // per-token cos/sin row cannot pass by accident.
   std::vector<int32_t> positions(static_cast<size_t>(test_case.num_tokens));
   for (int64_t i = 0; i < test_case.num_tokens; ++i) {
     positions[static_cast<size_t>(i)] =
@@ -258,9 +223,6 @@ TEST_P(RotaryEmbedding310PTest, MatchesCpuReference) {
   std::vector<float> sin_full;
   reference::GatherFullCosSin(cache, positions, test_case.head_dim, test_case.mode, &cos_full, &sin_full);
 
-  // The device reads cos/sin as fp16, so the reference has to use the same
-  // rounded angles or the comparison measures the cache precision instead of
-  // the kernel.
   const std::vector<float> cos_half_exact = QuantizeToHalf(cos_full);
   const std::vector<float> sin_half_exact = QuantizeToHalf(sin_full);
 
@@ -286,7 +248,7 @@ TEST_P(RotaryEmbedding310PTest, PositionZeroLeavesTheInputUnchanged) {
   REQUIRE_ACLNN_OP(ApplyRotaryPosEmbOp());
 
   const RotaryCase& test_case = GetParam();
-  DeterministicRandom random(0x5a45524fu);  // "ZERO"
+  DeterministicRandom random(0x5a45524fu);
 
   const std::vector<float> query = random.NormalHalfExact(
       static_cast<size_t>(test_case.num_tokens * test_case.num_q_heads * test_case.head_dim), 0.0f, 1.0f);
@@ -314,7 +276,7 @@ TEST_P(RotaryEmbedding310PTest, PreservesPairNormsOnDevice) {
   REQUIRE_ACLNN_OP(ApplyRotaryPosEmbOp());
 
   const RotaryCase& test_case = GetParam();
-  DeterministicRandom random(0x504e524du);  // "PNRM"
+  DeterministicRandom random(0x504e524du);
 
   const std::vector<float> query = random.NormalHalfExact(
       static_cast<size_t>(test_case.num_tokens * test_case.num_q_heads * test_case.head_dim), 0.0f, 1.0f);
@@ -342,8 +304,6 @@ TEST_P(RotaryEmbedding310PTest, PreservesPairNormsOnDevice) {
       PairNorms(actual.query, test_case.num_tokens, test_case.num_q_heads, test_case.head_dim, test_case.mode);
 
   ASSERT_EQ(before.size(), after.size());
-  // Looser than the parity bound: the norm is a product of two fp16 roundings
-  // plus the sqrt, so it accumulates a little more than a single element does.
   const Tolerance norm_tolerance{5e-3, 5e-3, "pair norm through two fp16 roundings plus a square root"};
   EXPECT_TENSORS_ALLCLOSE(after, before, norm_tolerance);
 }
@@ -359,19 +319,17 @@ std::string RotaryTestName(const ::testing::TestParamInfo<RotaryCase>& info) {
 INSTANTIATE_TEST_SUITE_P(
     Qwen35, RotaryEmbedding310PTest,
     ::testing::Values(
-        // head_dim 128 with the two Qwen3.5 GQA splits, both rotary layouts.
         RotaryCase{1, 128, 28, 4, RotaryMode::kHalf, shapes::kRopeThetaDefault},
         RotaryCase{16, 128, 28, 4, RotaryMode::kHalf, shapes::kRopeThetaDefault},
         RotaryCase{128, 128, 28, 4, RotaryMode::kHalf, shapes::kRopeThetaExtended},
         RotaryCase{16, 128, 32, 8, RotaryMode::kHalf, shapes::kRopeThetaDefault},
         RotaryCase{16, 128, 32, 8, RotaryMode::kInterleave, shapes::kRopeThetaDefault},
         RotaryCase{128, 128, 32, 8, RotaryMode::kInterleave, shapes::kRopeThetaExtended},
-        // head_dim 64, the other size npu_apply_rotary_pos_emb accepts.
         RotaryCase{1, 64, 16, 2, RotaryMode::kHalf, shapes::kRopeThetaDefault},
         RotaryCase{32, 64, 16, 2, RotaryMode::kHalf, shapes::kRopeThetaDefault},
         RotaryCase{32, 64, 16, 2, RotaryMode::kInterleave, shapes::kRopeThetaDefault}),
     RotaryTestName);
 
-}  // namespace
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}

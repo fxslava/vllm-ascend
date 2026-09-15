@@ -14,43 +14,6 @@
  * limitations under the License.
  */
 
-// The TurboQuant 4-bit KV cache on a PHYSICAL Ascend 950PR: production shapes,
-// driven straight through AscendCL, with the camodel explicitly excluded.
-//
-// This file runs head_size 256, block_size 128 and context 64 / 512 / 1024 /
-// 2048 -- the shapes Qwen3.5-2B actually decodes at, plus the one the camodel
-// verified the Cube path at -- so every case is a claim about silicon.
-//
-// S=64 is here so the silicon sweep starts at the shape simulation covered.
-// It is also the only entry that is SMALLER than block_size, which makes it the
-// one case in this file where the sequence occupies a partial paged block and
-// the tail masking in the decode is live.
-//
-// Under RUN_MODE=sim aclrtGetSocName() reports a genuine 950PR bin, so
-// REQUIRE_ASCEND_950PR would pass and the S=2048 cases would run for days.
-// REQUIRE_PHYSICAL_ASCEND_950PR looks at what is mapped into the process
-// instead. ASCEND_TEST_ALLOW_SIMULATOR=1 overrides it and
-// ASCEND_TQ_BARE_METAL_CONTEXTS shrinks the sweep.
-//
-// WHAT IT VALIDATES:
-//
-//   1. topology       the part answers aclGetDeviceCapability with a vector core
-//                     count and has the HBM the shapes assume.
-//   2. write path     the packed cache and the scale plane against
-//                     reference/turbo_quant_cpu.h, compared in bin indices with
-//                     a one-bin tolerance (the device sums its RMS scale in a
-//                     tree and the host serially).
-//   3. bit-exactness  byte-for-byte equality on inputs constructed so tie-break
-//                     cannot happen; see MakePiPreimageContext.
-//   4. decode         the split/combine pipeline against the same CPU
-//                     reference, reading back the cache the device wrote.
-//   5. memory layout  the geometry all five copies of it must agree on, plus
-//                     the 32-byte alignment claims the kernel source makes.
-//   6. bounds         a poisoned cache and a slot mapping with -1 entries: every
-//                     byte outside the mapping must survive untouched.
-//   7. determinism    eight decode launches from one filled cache, required to
-//                     be bit-identical.
-
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -80,35 +43,20 @@ namespace tq = turboquant_ref;
 namespace tqh = turboquant_host;
 namespace s950 = shapes950;
 
-// --- the shape ---------------------------------------------------------------
-//
-// Qwen3.5-2B's full-attention layer, as common/ascend950_shapes.hpp records it.
-
-constexpr int kHeadSize = static_cast<int>(s950::kHeadDim);       // 256
-constexpr int kNumHeads = static_cast<int>(s950::kNumHeads);      // 8
-constexpr int kNumKvHeads = static_cast<int>(s950::kNumKvHeads);  // 2, so a GQA group of 4
-constexpr int kBlockSize = static_cast<int>(s950::kBlockSize);    // 128
-constexpr int kQueryTokens = 1;                                   // decode
-constexpr float kAttentionScale = s950::kAttentionScale;          // 1 / sqrt(256)
+constexpr int kHeadSize = static_cast<int>(s950::kHeadDim);
+constexpr int kNumHeads = static_cast<int>(s950::kNumHeads);
+constexpr int kNumKvHeads = static_cast<int>(s950::kNumKvHeads);
+constexpr int kBlockSize = static_cast<int>(s950::kBlockSize);
+constexpr int kQueryTokens = 1;
+constexpr float kAttentionScale = s950::kAttentionScale;
 constexpr float kInvSqrtHeadSize = s950::kAttentionScale;
 
-// The brief's sweep, with S=64 prepended: that is the context the Cube-native
-// decode's fidelity was measured at on the camodel (TURBOQUANT_TESTS.md section
-// 13.9), so having it here means silicon and simulation overlap at one shape
-// instead of meeting nowhere. ASCEND_TQ_BARE_METAL_CONTEXTS overrides the list.
 const int kDefaultContextLens[] = {64, 512, 1024, 2048};
 
-// --- bounds ------------------------------------------------------------------
-//
-// The same two the kernels test uses at the small shape, unrelaxed: nothing
-// about a longer context makes a bin slip more likely, since the quantisation
-// is per vector.
 constexpr int kMaxLevelDrift = 1;
 constexpr double kMaxDifferingChannelFraction = 0.02;
 constexpr double kScaleRelativeTolerance = 1e-5;
 
-// Decode against the CPU reference. Both sides run the identical algorithm, so
-// the only licensed difference is the fp16 rounding at the store.
 constexpr double kMinDecodeCosine = 0.999;
 constexpr double kMaxDecodeRelativeL2 = 5e-3;
 
@@ -129,31 +77,23 @@ std::vector<int> ContextLens() {
   return lens.empty() ? std::vector<int>(std::begin(kDefaultContextLens), std::end(kDefaultContextLens)) : lens;
 }
 
-// --- one scenario ------------------------------------------------------------
-
 struct Scenario {
   int context_len = 0;
   int blocks_per_seq = 0;
   int num_blocks = 0;
-  std::vector<float> key;    // [context_len, num_kv_heads, head_size], fp16-exact
-  std::vector<float> value;  // same
-  std::vector<float> query;  // [query_tokens, num_heads, head_size], fp16-exact
+  std::vector<float> key;
+  std::vector<float> value;
+  std::vector<float> query;
   std::vector<int32_t> slots;
   std::vector<int32_t> table;
 };
 
-// `key_override` and `value_override`, when non-empty, replace the random
-// context: that is how the bit-exact case feeds the write path a vector whose
-// rotation it can predict exactly.
 Scenario MakeScenario(int context_len, uint32_t seed, const std::vector<float>& key_override = {},
                       const std::vector<float>& value_override = {}) {
   DeterministicRandom rng(seed);
   Scenario s;
   s.context_len = context_len;
   s.blocks_per_seq = (context_len + kBlockSize - 1) / kBlockSize;
-  // Four times the blocks the context needs, so the block table is a scatter
-  // through a pool rather than a consecutive run - a decode that assumed the
-  // cache was sequential in the sequence would pass on the latter.
   s.num_blocks = std::max(4, s.blocks_per_seq * 4);
 
   const size_t kv_elems = static_cast<size_t>(context_len) * kNumKvHeads * kHeadSize;
@@ -172,8 +112,6 @@ Scenario MakeScenario(int context_len, uint32_t seed, const std::vector<float>& 
   return s;
 }
 
-// The CPU reference's write path over a whole scenario, into freshly zeroed
-// planes. `fill` seeds both planes, so a poisoned run can be mirrored exactly.
 void ReferenceWritePath(const Scenario& s, int8_t fill, std::vector<int8_t>* key_cache,
                         std::vector<int8_t>* value_cache, std::vector<float>* scale_plane) {
   const std::vector<int8_t> signs = tq::cpu_pi_sign_vector(kHeadSize);
@@ -196,8 +134,6 @@ void ReferenceWritePath(const Scenario& s, int8_t fill, std::vector<int8_t>* key
   }
 }
 
-// Bin index of channel c of a packed vector: the low nibble for an even channel,
-// the high nibble for an odd one, with the -128 store bias undone.
 int BinOf(const int8_t* vec, int c) {
   const int byte = static_cast<int>(vec[c / tq::kPackFactor]) + static_cast<int>(tq::kInt8Bias);
   return (c % tq::kPackFactor == 0) ? (byte % tq::kLevels) : (byte / tq::kLevels);
@@ -212,10 +148,6 @@ struct BinAgreement {
   }
 };
 
-// Compares two packed caches over the rows the scenario wrote, in bin indices
-// rather than in reconstructed values: the Lloyd-Max levels are unevenly spaced,
-// so a value-space bound tight enough to catch a two-bin slip at the centre of
-// the table would reject a legitimate one-bin tie-break at its edge.
 BinAgreement ComparePackedCaches(const std::vector<int8_t>& actual, const std::vector<int8_t>& expected,
                                  const std::vector<int32_t>& slots) {
   BinAgreement agreement;
@@ -239,11 +171,6 @@ BinAgreement ComparePackedCaches(const std::vector<int8_t>& actual, const std::v
   return agreement;
 }
 
-// --- device driver -----------------------------------------------------------
-
-// Everything one scenario needs on the device. Unlike the small-shape driver in
-// test_sim_950pr_turboquant_kernels.cpp this one takes the fill byte, because the
-// bounds case needs a poisoned cache rather than a zeroed one.
 class DeviceScenario {
  public:
   DeviceScenario(const Scenario& s, aclrtStream stream, int8_t cache_fill = 0) : scenario_(s), stream_(stream) {
@@ -253,9 +180,6 @@ class DeviceScenario {
     slots_ = DeviceBuffer::FromHost(s.slots);
     pi_signs_ = DeviceBuffer::FromHost(tqh::PiSigns(kHeadSize));
 
-    // The write path expands one vector per call and the decode path expands a
-    // kTileRows tile; the two table images differ in their trailing sections and
-    // are not interchangeable.
     write_tables_ = DeviceBuffer::FromHost(tqh::CodecTables(kHeadSize, 1));
     decode_tables_ = DeviceBuffer::FromHost(tqh::CodecTables(kHeadSize, tqh::kTileRows));
 
@@ -291,15 +215,12 @@ class DeviceScenario {
   void RunDecode() {
     const tqh::PagedAttentionGrid grid =
         tqh::PlanPagedAttention(kQueryTokens, kNumHeads, kHeadSize, scenario_.blocks_per_seq, aiv_num_);
-    // Sized here rather than in the constructor: the split count, and with it
-    // the workspace, is a function of the block table this decode reads.
     workspace_ = DeviceBuffer::Empty<float>(grid.workspace_floats);
 
-    // Pi q once per (token, head), before the split that consumes it.
     rotate_plan_ =
         tqh::RotateQuery(stream_, AscendType::FP16, query_.get(), pi_signs_.get(), h16_.get(), write_tables_.get(),
                          query_rot_.get(), kQueryTokens, kNumHeads, kHeadSize, aiv_num_,
-                         /*input_exact_in_half=*/true);
+                         true);
 
     turboquant_paged_attention_impl(
         AscendType::FP16, stream_, grid.split_block_dim, grid.combine_block_dim, query_rot_.get(), key_cache_.get(),
@@ -314,19 +235,12 @@ class DeviceScenario {
   std::vector<int8_t> KeyCache() const { return key_cache_.ToHost<int8_t>(); }
   std::vector<int8_t> ValueCache() const { return value_cache_.ToHost<int8_t>(); }
   std::vector<float> ScalePlane() const { return scale_plane_.ToHost<float>(); }
-  // The kernel's own fp16 bits, still in the rotated basis. What determinism is
-  // judged on: a race shows up in these, and un-rotating first would only
-  // smear it.
   std::vector<Half> RawOutput() const { return out_.ToHost<Half>(); }
-  // The attention context W_o sees once Pi is folded into it, so it compares
-  // against the unrotated CPU reference directly.
   std::vector<float> Output() const { return tqh::UnrotateHeads(HalfToFloat(out_.ToHost<Half>()), kHeadSize); }
 
   int64_t aiv_num() const { return aiv_num_; }
   bool aiv_queried() const { return aiv_queried_; }
 
-  // Every global address the kernels touch has to be 32-byte aligned; see the
-  // layout note at the top of turboquant_kernels.cpp. These are the bases.
   std::vector<const void*> DeviceBases() const {
     return {key_.get(),        value_.get(),       query_.get(),      slots_.get(),      pi_signs_.get(),
             write_tables_.get(), decode_tables_.get(), key_cache_.get(), value_cache_.get(),
@@ -346,21 +260,6 @@ class DeviceScenario {
   bool aiv_queried_ = false;
 };
 
-// --- the bit-exact fixture ---------------------------------------------------
-
-// A context whose rotated coordinates are exactly +-1.
-//
-// Pi is an involution, so feeding the write path Pi u hands the codec back u.
-// Choosing u in {-1, +1}^D makes every step exact on both sides:
-//
-//   * sum of squares is exactly D in any summation order, so the scale is
-//     exactly 1.0 on both;
-//   * every normalised coordinate is exactly +-1.0, 0.2 away from the nearest
-//     Lloyd-Max decision boundary;
-//   * Pi u is a multiple of 1/8 bounded by sqrt(D), so it survives the fp16
-//     store without rounding. The test asserts that rather than trusting it.
-//
-// Only valid where 1/sqrt(D) is a power of two -- D = 64 and D = 256.
 std::vector<float> PiPreimageOfSignVector(uint32_t seed) {
   const std::vector<int8_t> signs = tq::cpu_pi_sign_vector(kHeadSize);
   DeterministicRandom rng(seed);
@@ -384,11 +283,7 @@ class TurboQuantBareMetal : public ::testing::Test {
   }
 };
 
-}  // namespace
-
-// ---------------------------------------------------------------------------
-// 1. Topology
-// ---------------------------------------------------------------------------
+}
 
 TEST_F(TurboQuantBareMetal, DeviceIsPhysicalSiliconAndReportsItsTopology) {
   REQUIRE_PHYSICAL_ASCEND_950PR();
@@ -408,26 +303,15 @@ TEST_F(TurboQuantBareMetal, DeviceIsPhysicalSiliconAndReportsItsTopology) {
               mem_known ? static_cast<double>(total_bytes) / (1024.0 * 1024.0 * 1024.0) : 0.0);
   std::fflush(stdout);
 
-  // On silicon the runtime answers this. It is an EXPECT rather than an ASSERT
-  // because a grid is only a work split - a wrong core count changes how many
-  // blocks are launched, not what the kernels compute - so a release that
-  // declines to answer should say so loudly and still run the rest.
   EXPECT_TRUE(queried) << "aclGetDeviceCapability(ACL_DEVICE_INFO_VECTOR_CORE_NUM) declined on a physical part; "
                           "every grid below is planned against the assumed count of "
                        << tqh::kFallbackVectorCoreNum;
   EXPECT_GT(aiv_num, 0);
 
-  // The largest scenario allocates two packed caches, a scale plane, the fp16
-  // context and the workspace. Well under a gigabyte, but a part reporting
-  // nothing free is worth knowing about before the allocation fails.
   if (mem_known) {
     EXPECT_GT(free_bytes, 0u);
   }
 }
-
-// ---------------------------------------------------------------------------
-// 2. Write path
-// ---------------------------------------------------------------------------
 
 TEST_F(TurboQuantBareMetal, WritePathMatchesTheCpuReferenceAcrossContexts) {
   REQUIRE_PHYSICAL_ASCEND_950PR();
@@ -471,9 +355,6 @@ TEST_F(TurboQuantBareMetal, WritePathMatchesTheCpuReferenceAcrossContexts) {
           << agreement.examined << " channels landed on a different level";
     }
 
-    // The scales themselves: one fp32 division of a reduced sum of squares. A
-    // relative difference larger than the tolerance means the reduction
-    // disagreed, not that rounding did.
     const size_t slot_floats = tq::cpu_scale_slot_floats(kNumKvHeads);
     double worst_scale_error = 0.0;
     for (const int32_t slot : scenario.slots) {
@@ -495,23 +376,14 @@ TEST_F(TurboQuantBareMetal, WritePathMatchesTheCpuReferenceAcrossContexts) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// 3. Bit-exactness
-// ---------------------------------------------------------------------------
-
 TEST_F(TurboQuantBareMetal, PackedCacheIsByteIdenticalOnRotationExactInputs) {
   REQUIRE_PHYSICAL_ASCEND_950PR();
 
-  // One context length is enough: what is under test is the arithmetic of a
-  // single vector, repeated. The shortest one keeps the case quick.
   const int context_len = ContextLens().front();
 
   const std::vector<float> vector_k = PiPreimageOfSignVector(0x1111u);
   const std::vector<float> vector_v = PiPreimageOfSignVector(0x2222u);
 
-  // The premise, asserted rather than assumed: Pi u has to survive the fp16
-  // store the device reads it through, or the device and the host are not
-  // starting from the same numbers and everything below is meaningless.
   for (int c = 0; c < kHeadSize; ++c) {
     ASSERT_FLOAT_EQ(HalfBitsToFloat(FloatToHalfBits(vector_k[static_cast<size_t>(c)])),
                     vector_k[static_cast<size_t>(c)])
@@ -542,10 +414,6 @@ TEST_F(TurboQuantBareMetal, PackedCacheIsByteIdenticalOnRotationExactInputs) {
   const std::vector<int8_t> actual_value = device.ValueCache();
   const std::vector<float> actual_scales = device.ScalePlane();
 
-  // The rotated coordinates are +-1 and the scale is exactly 1, so every byte
-  // of the packed cache is decided by arithmetic that cannot round differently
-  // on the two sides. No tolerance, no drift count: the bytes are equal or the
-  // kernel is wrong.
   const size_t packed_stride = static_cast<size_t>(kHeadSize / tq::kPackFactor);
   const size_t slot_floats = tq::cpu_scale_slot_floats(kNumKvHeads);
   size_t compared_bytes = 0;
@@ -559,9 +427,6 @@ TEST_F(TurboQuantBareMetal, PackedCacheIsByteIdenticalOnRotationExactInputs) {
           << "value slot " << slot << " kv_head " << kv_head << " is not byte-identical to the CPU reference";
       compared_bytes += 2 * packed_stride;
 
-      // And the scale is the exact 1.0 the construction predicts, on both
-      // sides. A device that reduced the squares differently would land beside
-      // it, not on it.
       for (const int lane : {kv_head, kNumKvHeads + kv_head}) {
         const size_t scale_off = static_cast<size_t>(slot) * slot_floats + static_cast<size_t>(lane);
         EXPECT_FLOAT_EQ(actual_scales[scale_off], expected_scales[scale_off])
@@ -576,10 +441,6 @@ TEST_F(TurboQuantBareMetal, PackedCacheIsByteIdenticalOnRotationExactInputs) {
   std::fflush(stdout);
 }
 
-// ---------------------------------------------------------------------------
-// 4. Decode
-// ---------------------------------------------------------------------------
-
 TEST_F(TurboQuantBareMetal, DecodeMatchesTheCpuReferenceAcrossContexts) {
   REQUIRE_PHYSICAL_ASCEND_950PR();
 
@@ -593,8 +454,6 @@ TEST_F(TurboQuantBareMetal, DecodeMatchesTheCpuReferenceAcrossContexts) {
     device.RunWritePath();
     device.RunDecode();
 
-    // The reference reads back the cache the device itself wrote, so a
-    // disagreement here is the decode kernel and not the write path.
     const std::vector<int8_t> key_cache = device.KeyCache();
     const std::vector<int8_t> value_cache = device.ValueCache();
     const std::vector<float> scale_plane = device.ScalePlane();
@@ -621,17 +480,9 @@ TEST_F(TurboQuantBareMetal, DecodeMatchesTheCpuReferenceAcrossContexts) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// 5. Memory layout
-// ---------------------------------------------------------------------------
-
 TEST_F(TurboQuantBareMetal, CacheGeometryAndAlignmentMatchTheDocumentedLayout) {
   REQUIRE_PHYSICAL_ASCEND_950PR();
 
-  // The alignment claims turboquant_kernels.cpp makes about this layout, which
-  // are what let every transfer be a DataCopy rather than a DataCopyPad. They
-  // are properties of the shape, so they are checked before anything is
-  // allocated.
   constexpr size_t kBurstBytes = 32;
   const size_t scale_slot = tq::cpu_scale_slot_floats(kNumKvHeads);
   EXPECT_EQ(scale_slot % (kBurstBytes / sizeof(float)), 0u)
@@ -647,7 +498,6 @@ TEST_F(TurboQuantBareMetal, CacheGeometryAndAlignmentMatchTheDocumentedLayout) {
   DeviceScenario device(scenario, Stream());
   PrintHeader("layout", context_len, device);
 
-  // The allocation sizes, against the same arithmetic the production host does.
   const size_t packed_bytes = tqh::PackedCacheBytes(scenario.num_blocks, kBlockSize, kNumKvHeads, kHeadSize);
   const size_t scale_floats = tqh::ScalePlaneFloats(scenario.num_blocks, kBlockSize, kNumKvHeads);
   EXPECT_EQ(packed_bytes, static_cast<size_t>(scenario.num_blocks) * kBlockSize * kNumKvHeads *
@@ -657,15 +507,11 @@ TEST_F(TurboQuantBareMetal, CacheGeometryAndAlignmentMatchTheDocumentedLayout) {
   EXPECT_EQ(device.ValueCache().size(), packed_bytes);
   EXPECT_EQ(device.ScalePlane().size(), scale_floats);
 
-  // Every base the kernels are handed has to sit on a 32-byte boundary; an
-  // unaligned one is what DataCopyPad exists for and this path never calls it.
   for (const void* base : device.DeviceBases()) {
     EXPECT_EQ(reinterpret_cast<uintptr_t>(base) % kBurstBytes, 0u)
         << "device allocation at " << base << " is not 32-byte aligned";
   }
 
-  // The 4-bit cache against the fp16 one it replaces: the capacity claim, stated
-  // in bytes rather than in a ratio someone has to trust.
   const double fp16_bytes = 2.0 * static_cast<double>(context_len) * kNumKvHeads * kHeadSize * sizeof(uint16_t);
   const double tq4_bytes = 2.0 * static_cast<double>(context_len) * kNumKvHeads * (kHeadSize / tq::kPackFactor) +
                            static_cast<double>(context_len) * static_cast<double>(scale_slot) * sizeof(float);
@@ -677,10 +523,6 @@ TEST_F(TurboQuantBareMetal, CacheGeometryAndAlignmentMatchTheDocumentedLayout) {
   EXPECT_GT(fp16_bytes / tq4_bytes, 3.0) << "the 4-bit cache is not saving what its layout says it should";
 }
 
-// ---------------------------------------------------------------------------
-// 6. Bounds
-// ---------------------------------------------------------------------------
-
 TEST_F(TurboQuantBareMetal, WritePathTouchesNoByteOutsideItsSlotMapping) {
   REQUIRE_PHYSICAL_ASCEND_950PR();
 
@@ -688,8 +530,6 @@ TEST_F(TurboQuantBareMetal, WritePathTouchesNoByteOutsideItsSlotMapping) {
   const int context_len = ContextLens().front();
   Scenario scenario = MakeScenario(context_len, 0x9E11u);
 
-  // Every eighth token is dropped, the way a padded batch drops one. The kernel
-  // must skip it entirely: not write it, and not write a zero over it either.
   for (int i = 0; i < context_len; i += 8) {
     scenario.slots[static_cast<size_t>(i)] = -1;
   }
@@ -701,7 +541,6 @@ TEST_F(TurboQuantBareMetal, WritePathTouchesNoByteOutsideItsSlotMapping) {
   const std::vector<int8_t> key_cache = device.KeyCache();
   const std::vector<int8_t> value_cache = device.ValueCache();
 
-  // Which rows of the cache the mapping licensed the kernel to write.
   std::vector<bool> live_slot(static_cast<size_t>(scenario.num_blocks) * kBlockSize, false);
   for (const int32_t slot : scenario.slots) {
     if (slot >= 0) {
@@ -731,9 +570,6 @@ TEST_F(TurboQuantBareMetal, WritePathTouchesNoByteOutsideItsSlotMapping) {
     }
   }
 
-  // The complement of that check: the licensed rows really were written, so a
-  // kernel that wrote nothing at all does not pass by leaving the poison intact
-  // everywhere.
   size_t untouched_live_rows = 0;
   for (size_t slot = 0; slot < live_slot.size(); ++slot) {
     if (!live_slot[slot]) {
@@ -758,16 +594,9 @@ TEST_F(TurboQuantBareMetal, WritePathTouchesNoByteOutsideItsSlotMapping) {
       << "rows the slot mapping names came back unwritten; the scatter did not reach them";
 }
 
-// ---------------------------------------------------------------------------
-// 7. Determinism
-// ---------------------------------------------------------------------------
-
 TEST_F(TurboQuantBareMetal, RepeatedDecodeLaunchesAreBitIdentical) {
   REQUIRE_PHYSICAL_ASCEND_950PR();
 
-  // The longest context in the sweep: the more sequence splits the grid uses,
-  // the more partials the combine stage has to reduce, and a race between them
-  // is what this case is for.
   const std::vector<int> contexts = ContextLens();
   const int context_len = *std::max_element(contexts.begin(), contexts.end());
 
@@ -796,5 +625,5 @@ TEST_F(TurboQuantBareMetal, RepeatedDecodeLaunchesAreBitIdentical) {
   std::fflush(stdout);
 }
 
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}

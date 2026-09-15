@@ -41,35 +41,22 @@ import numpy as np
 import torch
 from scipy.stats import norm
 
-# Qwen3.5 hybrid-attention geometry: head_dim is 256, not 128, and only 6 of
-# the 24 layers carry a softmax KV cache at all.
 HEAD_DIM = 256
 CONTEXT_LEN = 512
 NUM_HEADS = 8
 NUM_QUERIES = 8
 SEEDS = (0, 1, 2, 3)
 
-# The fidelity gate this pipeline is asked to clear.
 COS_GATE = 0.995
 
-# fp8_e4m3fn: 1-4-3, no infinities, max finite 448, min subnormal 2^-9.
 FP8_MAX = 448.0
 
-# Post-rotation excess kurtosis measured on real Qwen3.5-2B activations across
-# the six full-attention layers: |g2| < 0.12 everywhere except V at layer 23.
 TARGET_EXCESS_KURTOSIS = 0.10
 
-# Pre-rotation outlier structure: a few channels carry the heavy tail.  KAPPA is
-# not free -- it is calibrated so that the *post*-rotation excess kurtosis of the
-# RMS-normalized coordinates lands inside the band measured on real Qwen3.5-2B
-# activations (|g2| < 0.12 across the six full-attention layers).  KAPPA=4 gives
-# -0.063; KAPPA=16 would give -0.57, which is not a Qwen-like distribution and
-# would make every number below an artifact of the fixture.
 OUTLIER_CHANNELS = 3
 OUTLIER_KAPPA = 4.0
 
 
-# ------------------------------------------------------------------ rotation --
 def pi_signs(d: int) -> np.ndarray:
     """The +-1 diagonal of Pi = D H D, from the LCG both host and device use.
 
@@ -107,7 +94,6 @@ def apply_pi(v: np.ndarray, signs: np.ndarray) -> np.ndarray:
     return fwht(v * signs) * signs
 
 
-# ----------------------------------------------------------- Lloyd-Max solve --
 def lloyd_max_gaussian(n_levels: int = 16, iters: int = 20000, tol: float = 1e-15):
     """Closed-form Lloyd-Max fixed point for N(0,1).
 
@@ -156,7 +142,6 @@ def lloyd_max_empirical(sample: np.ndarray, n_levels: int = 16, iters: int = 500
     return thr, cen, float(np.mean((x - cen[idx]) ** 2))
 
 
-# ------------------------------------------------------------- fp8 machinery --
 def to_fp8(x: np.ndarray) -> np.ndarray:
     """Round-trip through real fp8_e4m3fn (torch), returning fp32."""
     t = torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32))
@@ -178,7 +163,6 @@ def lut_distortion(thresholds: np.ndarray, centroids: np.ndarray) -> float:
     edges = np.concatenate(([-np.inf], thresholds.astype(np.float64), [np.inf]))
     lo, hi = edges[:-1], edges[1:]
     mass = norm.cdf(hi) - norm.cdf(lo)
-    # E[X | bin] and E[X^2 | bin] for a truncated Gaussian.
     m1 = norm.pdf(lo) - norm.pdf(hi)
     lo_f = np.where(np.isfinite(lo), lo, 0.0)
     hi_f = np.where(np.isfinite(hi), hi, 0.0)
@@ -187,7 +171,6 @@ def lut_distortion(thresholds: np.ndarray, centroids: np.ndarray) -> float:
     return float(np.sum(m2 - 2.0 * c * m1 + mass * c ** 2))
 
 
-# ------------------------------------------------------------------- codec ----
 def quantize_4bit(v: np.ndarray, thresholds: np.ndarray):
     """Rotated vectors -> (4-bit indices, per-vector RMS scale).
 
@@ -207,7 +190,6 @@ def dequantize_lut(codes: np.ndarray, lut: np.ndarray) -> np.ndarray:
     return lut[codes]
 
 
-# ------------------------------------------------------------------ fixture ---
 def make_activations(rng: np.random.Generator, heads: int, s_len: int, d: int):
     """Qwen-like pre-rotation K/V: near-Gaussian bulk plus per-channel outliers.
 
@@ -232,7 +214,6 @@ def excess_kurtosis(x: np.ndarray) -> float:
     return float(np.mean(z ** 4) - 3.0)
 
 
-# ---------------------------------------------------------------- attention ---
 def _softmax(logits: np.ndarray) -> np.ndarray:
     m = logits.max(axis=-1, keepdims=True)
     e = np.exp(logits - m)
@@ -256,8 +237,6 @@ def attention_quantized(q, k, v, thresholds, lut, signs,
     d = q.shape[-1]
     scale = 1.0 / math.sqrt(d)
 
-    # Stage 1. Pi is orthogonal, so Q.K^T is invariant under it; the rotation is
-    # there to Gaussianize the coordinates the codec sees, nothing more.
     q_rot = apply_pi(q, signs)
     k_rot = apply_pi(k, signs)
     v_rot = apply_pi(v, signs)
@@ -265,7 +244,7 @@ def attention_quantized(q, k, v, thresholds, lut, signs,
     if quantize_kv:
         k_codes, k_scale = quantize_4bit(k_rot, thresholds)
         v_codes, v_scale = quantize_4bit(v_rot, thresholds)
-        k_hat = dequantize_lut(k_codes, lut)   # already fp8-valued
+        k_hat = dequantize_lut(k_codes, lut)
         v_hat = dequantize_lut(v_codes, lut)
     else:
         k_hat, v_hat = k_rot, v_rot
@@ -273,18 +252,14 @@ def attention_quantized(q, k, v, thresholds, lut, signs,
         v_scale = np.ones((*v_rot.shape[:-1], 1), np.float32)
 
     if fp8_compute:
-        # Q carries real magnitudes and must be scaled into the e4m3 range
-        # before the cast; the Cube consumes the scale as an fp32 multiplier.
         q_amax = np.abs(q_rot).max(axis=(-2, -1), keepdims=True) + 1e-20
         q_sf = (FP8_MAX / q_amax).astype(np.float32)
         q_in = to_fp8(q_rot * q_sf)
-        k_in = to_fp8(k_hat)                   # a no-op when quantize_kv
+        k_in = to_fp8(k_hat)
     else:
         q_sf = np.ones((q.shape[0], 1, 1), np.float32)
         q_in, k_in = q_rot, k_hat
 
-    # Cube GEMM 1: fp8 x fp8, fp32 accumulate. The per-vector K scale folds into
-    # the score row here, which is why it never had to enter the LUT.
     logits = np.einsum("hqd,hkd->hqk",
                        q_in.astype(np.float32),
                        k_in.astype(np.float32)).astype(np.float32)
@@ -292,13 +267,9 @@ def attention_quantized(q, k, v, thresholds, lut, signs,
 
     p = _softmax(logits)
 
-    # The per-vector V scale folds into the softmax probabilities, so the row
-    # the Cube multiplies is P * s_v rather than P.
     p_scaled = (p * np.swapaxes(v_scale, -1, -2)).astype(np.float32)
 
     if fp8_compute:
-        # P is in [0,1]; scaled up so the mantissa is not thrown away against
-        # e4m3's 2^-9 subnormal floor.
         p_amax = np.abs(p_scaled).max(axis=-1, keepdims=True) + 1e-20
         p_sf = (FP8_MAX / p_amax).astype(np.float32)
         p_in = to_fp8(p_scaled * p_sf)
@@ -307,15 +278,12 @@ def attention_quantized(q, k, v, thresholds, lut, signs,
         p_sf = np.ones((*p_scaled.shape[:-1], 1), np.float32)
         p_in, v_in = p_scaled, v_hat
 
-    # Cube GEMM 2, then the single un-rotation of the accumulator. Pi^2 = I is
-    # what makes that the same routine as the input rotation.
     out_rot = np.einsum("hqk,hkd->hqd",
                         p_in.astype(np.float32),
                         v_in.astype(np.float32)).astype(np.float32) / p_sf
     return apply_pi(out_rot, signs)
 
 
-# ------------------------------------------------------------------ metrics ---
 def cosine(a, b):
     a, b = a.ravel().astype(np.float64), b.ravel().astype(np.float64)
     return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
@@ -327,7 +295,6 @@ def snr_db(ref, got):
     return float(10.0 * np.log10(float(np.sum(ref ** 2)) / max(err, 1e-300)))
 
 
-# ------------------------------------------------------- gate back-solve ------
 def gate_snr_requirement(signs, seeds=(0, 1), lo=10.0, hi=40.0, tol=0.02):
     """Per-coordinate SNR at which attention cosine crosses COS_GATE.
 
@@ -358,7 +325,6 @@ def gate_snr_requirement(signs, seeds=(0, 1), lo=10.0, hi=40.0, tol=0.02):
     return 0.5 * (lo + hi)
 
 
-# ------------------------------------------------------------------- report ---
 def _fmt_row(cells, widths):
     return "| " + " | ".join(str(c).ljust(w) for c, w in zip(cells, widths)) + " |"
 
@@ -374,7 +340,6 @@ def main():
 
     signs = pi_signs(HEAD_DIM)
 
-    # -- 1. calibration ------------------------------------------------------
     thr_g, cen_g, dist_g = lloyd_max_gaussian(16)
 
     rng = np.random.default_rng(1234)
@@ -415,7 +380,6 @@ def main():
     print("  gain over the N(0,1) table           : %.4f dB"
           % (10.0 * math.log10(dist_g_fp8 / dist_e_fp8)))
 
-    # -- 2. end-to-end simulation -------------------------------------------
     print()
     print("=" * 78)
     print("2. END-TO-END ATTENTION  (d=%d, S=%d, heads=%d, %d seeds)"
@@ -456,7 +420,6 @@ def main():
           + "  ".join("s%d=%.6f" % (s, c)
                       for s, c in zip(SEEDS, list(results.values())[0][0])))
 
-    # -- 3. rate sweep: what rate would clear the gate -----------------------
     print()
     print("=" * 78)
     print("4. RATE SWEEP  (same pipeline, wider codebook; fp8 compute throughout)")
@@ -479,12 +442,10 @@ def main():
             cs.append(cosine(ref, got))
             ss.append(snr_db(ref, got))
         cs, ss = np.array(cs), np.array(ss)
-        # 2 planes (K and V) * head_dim coords * bits, plus the E8M0 scale byte.
         per_tok = 2 * HEAD_DIM * bits / 8.0 + 2
         print(_fmt_row(["%d-bit Lloyd-Max LUT" % bits, "%.6f" % cs.mean(),
                         "%.6f" % cs.min(), "%.2f" % ss.mean(), "%.0f" % per_tok,
                         "PASS" if cs.min() > COS_GATE else "FAIL"], w))
-    # fp8 KV storage: no 4-bit stage at all, K/V held directly as e4m3.
     cs, ss = [], []
     for seed in SEEDS:
         r = np.random.default_rng(seed)

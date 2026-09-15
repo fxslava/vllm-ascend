@@ -14,12 +14,6 @@
  * limitations under the License.
  */
 
-// Numerical comparison between an NPU result and the CPU reference.
-//
-// The predicate is the same one torch.allclose uses:
-//     |actual - expected| <= atol + rtol * |expected|
-// so a tolerance chosen here means the same thing as in the Python tests.
-
 #pragma once
 
 #include <gtest/gtest.h>
@@ -38,19 +32,12 @@ namespace test {
 struct Tolerance {
   double atol;
   double rtol;
-  // Why these numbers, so a future change to them is a deliberate decision.
   const char* rationale;
 };
 
-// Default from the plugin Python tests. One fp16 ULP at magnitude 1.0 is about
-// 9.8e-4, so this is roughly "within one ULP plus a rounding step" and is the
-// right bar for the elementwise and single-reduction kernels.
 inline constexpr Tolerance kFp16DefaultTolerance{1e-3, 1e-3,
                                                  "atol=rtol=1e-3, matching tests/ut; ~1 fp16 ULP near unit scale"};
 
-// Softmax over a long context accumulates over hundreds of terms and the
-// hardware exp differs from libm in the last bits, so the decode attention
-// output needs more room than a single elementwise op.
 inline constexpr Tolerance kPagedAttentionTolerance{
     4e-3, 4e-3, "relaxed from 1e-3: fp16 softmax over multi-block contexts; re-tune on first hardware run"};
 
@@ -103,7 +90,6 @@ inline ComparisonReport CompareAllClose(const std::vector<float>& actual, const 
 
     if (!std::isfinite(a) || !std::isfinite(e)) {
       ++report.non_finite_count;
-      // Two NaNs or two identical infinities agree; anything else is a failure.
       const bool both_nan = std::isnan(a) && std::isnan(e);
       const bool same_inf = std::isinf(a) && std::isinf(e) && ((a > 0) == (e > 0));
       if (!both_nan && !same_inf) {
@@ -163,5 +149,5 @@ inline ComparisonReport CompareAllClose(const std::vector<float>& actual, const 
         << vllm_ascend_report.Describe(tolerance);                                              \
   } while (false)
 
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}

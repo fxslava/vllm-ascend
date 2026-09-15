@@ -14,15 +14,6 @@
  * limitations under the License.
  */
 
-// Torch-free access to the CANN single-operator API (aclnn), resolved with
-// dlsym rather than linked: the operator set in libopapi.so moves between CANN
-// releases, so a missing operator becomes a GTEST_SKIP naming the symbol rather
-// than a link error for the whole binary. This mirrors what torch_npu itself
-// does in csrc/aclnn_torch_adapter/op_api_common.h.
-//
-// The cost is that each GetWorkspaceSize argument list is declared by hand in
-// aclnn_ops.hpp rather than checked by the compiler.
-
 #pragma once
 
 #include <acl/acl.h>
@@ -35,8 +26,6 @@
 #include "acl_check.hpp"
 #include "device_buffer.hpp"
 
-// Opaque aclnn handle types, matching the forward declarations in
-// csrc/aclnn_torch_adapter/op_api_common.h.
 typedef struct aclOpExecutor aclOpExecutor;
 typedef struct aclTensor aclTensor;
 typedef struct aclScalar aclScalar;
@@ -47,35 +36,15 @@ typedef struct aclTensorList aclTensorList;
 namespace vllm_ascend {
 namespace test {
 
-// Process-wide handle to libopapi.so and the constructor/destructor entry
-// points it re-exports from libnnopbase.so, plus any custom operator packages
-// installed alongside it.
-//
-// The custom packages matter because the kernels in csrc/ are not in
-// libopapi.so at all: the CANN op build installs them as libcust_opapi.so under
-// a vendor directory. The search order is copied from
-// csrc/aclnn_torch_adapter/op_api_common.h :: GetOpApiFuncAddr --
-// ASCEND_CUSTOM_OPP_PATH first, then the vendors named by load_priority in
-// $ASCEND_OPP_PATH/vendors/config.ini, then stock CANN -- so a symbol resolves
-// here to the same implementation torch_npu would have called.
 class OpApiLibrary {
  public:
   static OpApiLibrary& Instance();
 
-  // True when stock libopapi.so opened. A tree with only a custom package and
-  // no CANN op-api is not a configuration this suite supports, so `loaded()`
-  // does not consider the custom handles.
   bool loaded() const { return handle_ != nullptr; }
   const std::string& load_error() const { return load_error_; }
 
-  // Custom operator packages that opened, in search order. Empty on a stock
-  // CANN install, which is the normal case and not an error.
   const std::vector<std::string>& custom_library_paths() const { return custom_paths_; }
 
-  // Returns nullptr when the symbol is absent; callers decide whether that is
-  // a skip or a failure. When `source` is non-null it receives the path of the
-  // library the symbol came from, which is what tells a reader whether a pass
-  // exercised the custom kernel or the stock one.
   void* Resolve(const char* symbol, std::string* source = nullptr) const;
 
   aclTensor* CreateTensor(const std::vector<int64_t>& view_dims, const std::vector<int64_t>& strides,
@@ -86,8 +55,6 @@ class OpApiLibrary {
   aclIntArray* CreateIntArray(const int64_t* values, uint64_t size) const;
   void DestroyIntArray(const aclIntArray* array) const;
 
-  // `value` points at one element of `dtype`. aclCreateScalar copies it, so the
-  // pointer does not have to outlive the call.
   aclScalar* CreateScalar(void* value, aclDataType dtype) const;
   void DestroyScalar(const aclScalar* scalar) const;
 
@@ -104,21 +71,16 @@ class OpApiLibrary {
   std::vector<std::string> custom_paths_;
 };
 
-// Row-major contiguous strides, in elements, for the given shape.
 std::vector<int64_t> ContiguousStrides(const std::vector<int64_t>& dims);
 
 size_t ElementCount(const std::vector<int64_t>& dims);
 
-// RAII aclTensor. Owns the descriptor only; the device memory belongs to the
-// DeviceBuffer that was passed in.
 class AclnnTensor {
  public:
   AclnnTensor() = default;
 
-  // Contiguous ND tensor over the given device pointer.
   AclnnTensor(std::vector<int64_t> dims, aclDataType dtype, void* data, aclFormat format = ACL_FORMAT_ND);
 
-  // Explicit strides, for views such as one half of a SwiGLU input.
   AclnnTensor(std::vector<int64_t> dims, std::vector<int64_t> strides, int64_t offset, aclDataType dtype,
               aclFormat format, std::vector<int64_t> storage_dims, void* data);
 
@@ -156,14 +118,8 @@ class AclnnIntArray {
   aclIntArray* array_ = nullptr;
 };
 
-// RAII aclScalar. Needed by the operators that take a host-side scalar next to
-// their tensors - aclnnInplaceAdd's `alpha`, for one - which is otherwise the
-// only argument in this suite with no wrapper.
 class AclnnScalar {
  public:
-  // Only the float form, because it is the only one the suite passes. Add an
-  // overload rather than a template when a second type is needed, so the
-  // aclDataType stays paired with the C++ type instead of being deduced.
   explicit AclnnScalar(float value);
   ~AclnnScalar();
 
@@ -192,7 +148,6 @@ class AclnnTensorList {
   aclTensorList* list_ = nullptr;
 };
 
-// A resolved aclnn operator: the two-phase GetWorkspaceSize / launch pair.
 class AclnnOp {
  public:
   explicit AclnnOp(const char* name);
@@ -200,15 +155,10 @@ class AclnnOp {
   bool available() const { return get_workspace_size_ != nullptr && launch_ != nullptr; }
   const std::string& name() const { return name_; }
 
-  // Path of the library the operator resolved from - stock libopapi.so, or a
-  // custom package's libcust_opapi.so. Empty when it did not resolve.
   const std::string& source() const { return source_; }
 
-  // True when the operator came from a custom operator package rather than from
-  // CANN, i.e. it is one of the kernels built out of csrc/.
   bool is_custom() const { return source_.find("libcust_opapi.so") != std::string::npos; }
 
-  // Human-readable explanation of why available() is false.
   std::string unavailable_reason() const;
 
   void* get_workspace_size_fn() const { return get_workspace_size_; }
@@ -221,16 +171,9 @@ class AclnnOp {
   void* launch_ = nullptr;
 };
 
-// Launch phase, shared by every aclnn operator.
 using AclnnLaunchFn = int (*)(void* workspace, uint64_t workspace_size, aclOpExecutor* executor,
                               aclrtStream stream);
 
-// Runs the two-phase call: resolve workspace size, allocate it, launch, then
-// synchronise. WorkspaceSizeFn is the operator-specific function-pointer type
-// declared in aclnn_ops.hpp; args are the operator arguments up to but not
-// including the trailing workspaceSize and executor out-parameters.
-//
-// Throws AclError on any non-zero status, with the CANN diagnostic attached.
 template <typename WorkspaceSizeFn, typename... Args>
 void RunAclnn(const AclnnOp& op, aclrtStream stream, Args... args) {
   if (!op.available()) {
@@ -261,8 +204,6 @@ void RunAclnn(const AclnnOp& op, aclrtStream stream, Args... args) {
   ACL_CHECK(aclrtSynchronizeStream(stream));
 }
 
-// Skips the current test when the operator could not be resolved. Kept as a
-// macro so that GTEST_SKIP lands in the test body.
 #define REQUIRE_ACLNN_OP(op)                     \
   do {                                           \
     if (!(op).available()) {                     \
@@ -270,5 +211,5 @@ void RunAclnn(const AclnnOp& op, aclrtStream stream, Args... args) {
     }                                            \
   } while (false)
 
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}

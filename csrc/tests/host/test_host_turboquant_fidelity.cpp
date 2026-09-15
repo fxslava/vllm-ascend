@@ -14,22 +14,6 @@
  * limitations under the License.
  */
 
-// End-to-end fidelity report for the TurboQuant 4-bit KV cache, run entirely on
-// the host against the Qwen3.5 layer-3 golden dump.
-//
-// This binary links no CANN runtime: the write path, the rotated-basis decode
-// and the un-rotation are all the CPU reference in
-// ../../reference/turbo_quant_cpu.h.
-//
-// Assertion policy: this is an analytical reporter. It prints cosine
-// similarity, SNR and relative L2 error and never asserts on any of them. The
-// only EXPECTs are on structural invariants that are exact integer or
-// involution identities.
-//
-// The golden dump is a single decode step with kContextLen == 1, so it measures
-// the codec on real Qwen activations but not the online-softmax accumulation;
-// the synthetic case below covers a full 128-position context for that.
-
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -54,8 +38,6 @@ namespace {
 namespace s = shapes950;
 namespace tq = turboquant_ref;
 
-// The golden dump is fp16 on the wire; every stage boundary rounds back to it
-// so the reference tracks what a kernel actually stores.
 std::vector<float> RoundToHalf(const std::vector<float>& values) { return QuantizeToHalf(values); }
 
 std::vector<float> ProjectOnCpu(const std::vector<float>& a, const std::vector<float>& w, int64_t m, int64_t k,
@@ -69,10 +51,6 @@ void PrintMetrics(const char* label, const tq::FidelityMetrics& m) {
   std::printf("  %-38s cos=%.6f  snr=%7.2f dB  relL2=%.6f\n", label, m.cosine_similarity, m.snr_db, m.relative_l2);
 }
 
-// Exact fp32 paged attention over the same cache geometry, with K and V held at
-// full precision. Written in the same shape as
-// cpu_paged_attention_turboquant so the two differ only in the codec, not in
-// how the softmax is arranged.
 void ExactPagedAttention(const std::vector<float>& query, const std::vector<float>& key,
                          const std::vector<float>& value, int context_len, int num_heads, int num_kv_heads, int d,
                          float scale, std::vector<float>* out) {
@@ -106,8 +84,6 @@ void ExactPagedAttention(const std::vector<float>& query, const std::vector<floa
   }
 }
 
-// Writes every context position of K and V through the TurboQuant write path,
-// then reads them back with the rotated-basis decode.
 void RunTurboQuantDecode(const std::vector<float>& query, const std::vector<float>& key,
                          const std::vector<float>& value, int context_len, int num_heads, int num_kv_heads, int d,
                          int block_size, float scale, std::vector<float>* out) {
@@ -118,7 +94,6 @@ void RunTurboQuantDecode(const std::vector<float>& query, const std::vector<floa
 
   std::vector<int8_t> key_cache(static_cast<size_t>(num_blocks) * block_size * num_kv_heads * packed_stride, 0);
   std::vector<int8_t> value_cache(key_cache.size(), 0);
-  // One scale plane, indexed by token: K lanes then V lanes, burst-padded.
   std::vector<float> scale_plane(static_cast<size_t>(num_blocks) * block_size * slot_floats, 0.0f);
 
   for (int pos = 0; pos < context_len; ++pos) {
@@ -142,9 +117,6 @@ void RunTurboQuantDecode(const std::vector<float>& query, const std::vector<floa
                                      signs.data(), out->data());
 }
 
-// Stages 6 to 9 of the layer, taking an attention context and producing the
-// layer output. Shared so the exact and quantised contexts travel the identical
-// downstream and the metric isolates the codec.
 std::vector<float> LayerTailFromContext(const GoldenLayer3& golden, const std::vector<float>& attn_context,
                                         const std::vector<float>& attn_gate) {
   std::vector<float> gated(static_cast<size_t>(s::kTokens * s::kQDim));
@@ -188,11 +160,6 @@ std::vector<float> LayerTailFromContext(const GoldenLayer3& golden, const std::v
   }
   return RoundToHalf(x);
 }
-
-// -----------------------------------------------------------------------------
-// Structural invariants. Exact identities, independent of the activations, so
-// these are safe to assert without making the suite flaky.
-// -----------------------------------------------------------------------------
 
 TEST(TurboQuantCodecInvariants, PiIsAnInvolution) {
   constexpr int d = 256;
@@ -238,10 +205,6 @@ TEST(TurboQuantCodecInvariants, PiPreservesDotProducts) {
   EXPECT_NEAR(rotated, plain, 1e-3 * std::max(1.0, std::fabs(plain)));
 }
 
-// The sign vector is a derived constant shared by this header,
-// vllm_ascend/attention/turboquant_v1.py, and anything that writes a cache
-// another implementation reads back. Pinning the first few values catches a
-// drift in any of them.
 TEST(TurboQuantCodecInvariants, PiSignVectorMatchesThePythonReference) {
   const std::vector<int8_t> d256 = tq::cpu_pi_sign_vector(256);
   const std::vector<int8_t> d128 = tq::cpu_pi_sign_vector(128);
@@ -263,7 +226,6 @@ TEST(TurboQuantCodecInvariants, NibblePackRoundTripsExactly) {
   constexpr int d = 64;
   std::vector<int8_t> packed(static_cast<size_t>(d / tq::kPackFactor));
   std::vector<float> levels(static_cast<size_t>(d));
-  // Every one of the 16 codes appears in both nibble positions.
   for (int i = 0; i < d; ++i) {
     levels[static_cast<size_t>(i)] = static_cast<float>(i % tq::kLevels);
   }
@@ -284,23 +246,10 @@ TEST(TurboQuantCodecInvariants, NibblePackRoundTripsExactly) {
   EXPECT_EQ(mismatches, 0);
 }
 
-// -----------------------------------------------------------------------------
-// Buffer poisoning: nothing may depend on pre-zeroed scratch
-// -----------------------------------------------------------------------------
-//
-// The Ascend C codec carves its swap, scratch and shuffle tables out of one UB
-// pool sized for a full `batchRows`, and TPipe hands that pool over
-// uninitialised, so a call with rows < batchRows runs with live garbage after
-// its payload. These tests reproduce that on the host: every buffer is
-// pre-filled with values impossible to produce arithmetically.
-
-// Signalling NaN, quiet NaN, and a pattern that is a large finite negative
-// float rather than a NaN, so a leak that survives an isnan() filter is still
-// caught.
 constexpr uint32_t kPoisonBits[] = {0x7F800001u, 0x7FC00000u, 0xDEADBEEFu};
 constexpr uint32_t kPoisonBitsAlt[] = {0x7FC00001u, 0x7F800002u, 0xBAADF00Du};
-constexpr int8_t kPoisonInt8A = 127;   // 0x7F
-constexpr int8_t kPoisonInt8B = -128;  // 0x80
+constexpr int8_t kPoisonInt8A = 127;
+constexpr int8_t kPoisonInt8B = -128;
 
 float BitsToFloat(uint32_t bits) {
   float out = 0.0f;
@@ -314,9 +263,6 @@ uint32_t FloatToBits(float value) {
   return out;
 }
 
-// `variant` selects between two disjoint poison alphabets. Running the same
-// operation under both and demanding identical output is the definitive check
-// that nothing outside the payload was read.
 void PoisonFloats(float* dst, size_t count, int variant = 0) {
   const uint32_t* table = (variant == 0) ? kPoisonBits : kPoisonBitsAlt;
   for (size_t i = 0; i < count; ++i) {
@@ -346,9 +292,6 @@ bool IsPoisonFloat(float value) {
   return false;
 }
 
-// A payload flanked by guard bytes, so a write one byte past either end is
-// detected. The guards are whole elements of T, which keeps the payload
-// correctly aligned while still being checked byte by byte.
 template <typename T>
 class GuardedBuffer {
  public:
@@ -383,7 +326,6 @@ class GuardedBuffer {
   std::vector<T> storage_;
 };
 
-// A deterministic, poison-free input vector.
 std::vector<float> MakeVector(int d, float amplitude = 1.0f, uint32_t seed = 7u) {
   std::vector<float> out(static_cast<size_t>(d));
   uint32_t state = seed;
@@ -405,8 +347,6 @@ TEST(TurboQuantPoison, QuantizeIgnoresPoisonedDestinationAndPadding) {
   float reference_scale = 0.0f;
   tq::cpu_quantize_4bit(vec.data(), d, reference.data(), &reference_scale);
 
-  // Same call, but the destination and all the padding behind it up to
-  // batchLen_ are poisoned first, with two disjoint alphabets.
   for (int variant = 0; variant < 2; ++variant) {
     std::vector<int8_t> packed(packed_stride * batch_rows);
     PoisonInt8(packed.data(), packed.size(), variant);
@@ -421,11 +361,9 @@ TEST(TurboQuantPoison, QuantizeIgnoresPoisonedDestinationAndPadding) {
     EXPECT_EQ(FloatToBits(scale_slot[0]), FloatToBits(reference_scale));
     EXPECT_FALSE(IsPoisonFloat(scale_slot[0]));
 
-    // Padding past the payload stays exactly as poisoned.
     std::vector<int8_t> expected_tail(packed.size() - packed_stride);
     PoisonInt8(expected_tail.data(), expected_tail.size(), variant);
     for (size_t i = 0; i < expected_tail.size(); ++i) {
-      // The poison alphabet alternates on absolute index, so re-derive it.
       const size_t absolute = packed_stride + i;
       const bool even = (absolute % 2) == 0;
       const int8_t want = (variant == 0) ? (even ? kPoisonInt8A : kPoisonInt8B)
@@ -454,7 +392,6 @@ TEST(TurboQuantPoison, QuantizeWritesNoByteOutsideItsSlice) {
 }
 
 TEST(TurboQuantPoison, DequantizePartialBatchIgnoresPoisonedTail) {
-  // rows < batchRows is the case the kernel's shuffle tables are oversized for.
   for (int d : {64, 128, 256}) {
     for (int batch_rows : {4, 8}) {
       for (int rows : {1, 3}) {
@@ -467,7 +404,6 @@ TEST(TurboQuantPoison, DequantizePartialBatchIgnoresPoisonedTail) {
         const size_t batch_packed = packed_stride * static_cast<size_t>(batch_rows);
         const size_t batch_out = static_cast<size_t>(d) * static_cast<size_t>(batch_rows);
 
-        // Live payload: every nibble value, so no code path is untested.
         std::vector<int8_t> live(live_packed);
         for (size_t i = 0; i < live.size(); ++i) {
           const int low = static_cast<int>(i % 16);
@@ -498,8 +434,6 @@ TEST(TurboQuantPoison, DequantizePartialBatchIgnoresPoisonedTail) {
           results[variant].assign(out.begin(), out.begin() + static_cast<ptrdiff_t>(live_out));
         }
 
-        // Two disjoint poison alphabets, identical output: the tail was never
-        // read, not merely never propagated in a recognisable form.
         for (size_t i = 0; i < live_out; ++i) {
           ASSERT_EQ(FloatToBits(results[0][i]), FloatToBits(results[1][i]))
               << "output depends on padding content: d=" << d << " rows=" << rows << " index=" << i;
@@ -534,7 +468,6 @@ TEST(TurboQuantPoison, ApplyPiIgnoresSurroundingMemory) {
     tq::cpu_apply_pi(reference.data(), d, signs.data());
 
     for (int variant = 0; variant < 2; ++variant) {
-      // Payload sits inside a guarded, poisoned arena four times its length.
       GuardedBuffer<float> arena(static_cast<size_t>(d) * 4);
       PoisonFloats(arena.data(), arena.size(), variant);
       std::copy(vec.begin(), vec.end(), arena.data());
@@ -553,18 +486,6 @@ TEST(TurboQuantPoison, ApplyPiIgnoresSurroundingMemory) {
   }
 }
 
-// -----------------------------------------------------------------------------
-// Table-driven simulation of the kernel's actual buffer discipline
-// -----------------------------------------------------------------------------
-//
-// The reference above is a plain loop; the kernel is not. The two routines
-// below reproduce its data flow -- same table formulae, same oversized buffers,
-// same live prefix -- so the poison sits where it sits in UB. The tables are
-// built from the same formulae the host mirror uses
-// (vllm_ascend/attention/turboquant_v1.py::turboquant_codec_tables).
-
-// expandOffset_[p] = 4 * (p >> 1): an arithmetic progression, halved, floored,
-// and scaled to bytes -- the formula the host bakes into the table image.
 std::vector<int32_t> BuildExpandOffsets(size_t batch_len) {
   std::vector<int32_t> table(batch_len);
   for (size_t p = 0; p < batch_len; ++p) {
@@ -574,7 +495,6 @@ std::vector<int32_t> BuildExpandOffsets(size_t batch_len) {
   return table;
 }
 
-// oddSelect_[p] = p & 1, derived from the stride-1 sign pattern.
 std::vector<float> BuildOddSelect(size_t batch_len) {
   std::vector<float> table(batch_len);
   for (size_t p = 0; p < batch_len; ++p) {
@@ -584,7 +504,6 @@ std::vector<float> BuildOddSelect(size_t batch_len) {
   return table;
 }
 
-// evenOffset_[c] = 8c and oddOffset_[c] = 8c + 4, in bytes.
 std::vector<int32_t> BuildPackOffsets(size_t packed_len, bool odd) {
   std::vector<int32_t> table(packed_len);
   const float stride = static_cast<float>(tq::kPackFactor * sizeof(float));
@@ -595,8 +514,6 @@ std::vector<int32_t> BuildPackOffsets(size_t packed_len, bool odd) {
   return table;
 }
 
-// Dequantize4Bit as the kernel performs it: oversized poisoned scratch, three
-// precomputed tables, one Gather over exactly n elements.
 void TableDrivenDequantize(const int8_t* packed, int rows, int len, int batch_rows, float* out, int variant) {
   const size_t batch_len = static_cast<size_t>(batch_rows) * static_cast<size_t>(len);
   const size_t n = static_cast<size_t>(rows) * static_cast<size_t>(len);
@@ -605,27 +522,20 @@ void TableDrivenDequantize(const int8_t* packed, int rows, int len, int batch_ro
   const std::vector<int32_t> expand = BuildExpandOffsets(batch_len);
   const std::vector<float> odd_select = BuildOddSelect(batch_len);
 
-  // The UB pool, handed over uninitialised.
   std::vector<float> swap(batch_len);
   std::vector<float> scratch(batch_len);
   PoisonFloats(swap.data(), swap.size(), variant);
   PoisonFloats(scratch.data(), scratch.size(), variant);
 
-  // int8 -> half -> float, then undo the -128 bias. Only packed_count entries.
   for (size_t c = 0; c < packed_count; ++c) {
     scratch[c] = static_cast<float>(packed[c]) + tq::kInt8Bias;
   }
 
-  // Gather(swap_, scratch_, expandOffset_, base, n).
   for (size_t p = 0; p < n; ++p) {
     const size_t source = static_cast<size_t>(expand[p]) / sizeof(float);
     swap[p] = scratch[source];
   }
 
-  // high = floor(byte / 16); low = byte - 16 * high; select by parity, then
-  // Gather(dst, centroid_, offsets, base, n) against the 16-entry table. The
-  // offset is the bin index scaled by sizeof(float), exactly as the kernel
-  // builds it, so a table indexed in elements rather than bytes fails here.
   for (size_t p = 0; p < n; ++p) {
     const float high = std::floor(swap[p] / tq::kPackHigh);
     const float low = swap[p] - tq::kPackHigh * high;
@@ -635,8 +545,6 @@ void TableDrivenDequantize(const int8_t* packed, int rows, int len, int batch_ro
   }
 }
 
-// Quantize4Bit as the kernel performs it: the two deinterleaving Gathers run
-// over packed = n/2 elements of a scratch buffer whose tail is poisoned.
 void TableDrivenQuantize(const float* vec, int len, int batch_rows, int8_t* packed, float* scale, int variant) {
   const size_t batch_len = static_cast<size_t>(batch_rows) * static_cast<size_t>(len);
   const size_t n = static_cast<size_t>(len);
@@ -655,18 +563,12 @@ void TableDrivenQuantize(const float* vec, int len, int batch_rows, int8_t* pack
     sumsq += vec[i] * vec[i];
   }
   const float rms = std::sqrt(sumsq) * (1.0f / std::sqrt(static_cast<float>(len))) + tq::kEps;
-  // The kernel broadcasts -1/scale and multiplies, so the threshold loop sees
-  // -u rather than u. The negation is exact in IEEE, so this is not an
-  // approximation of what the device does -- it is the same value.
   const float neg_inv_scale = -1.0f / rms;
 
   for (size_t i = 0; i < n; ++i) {
     const float neg_u = vec[i] * neg_inv_scale;
     int32_t bin = 0;
     for (int t = 0; t < tq::kThresholdCount; ++t) {
-      // b = uint32(t_i - u) >> 31: the fp32 sign bit, which is 1 exactly when
-      // u > t_i. A subtraction cannot round across zero, so this is bit-for-bit
-      // the strict comparison the reference makes.
       const float diff = neg_u + tq::kLloydMaxThresholds[t];
       uint32_t bits = 0;
       std::memcpy(&bits, &diff, sizeof(bits));
@@ -675,7 +577,6 @@ void TableDrivenQuantize(const float* vec, int len, int batch_rows, int8_t* pack
     scratch[i] = static_cast<float>(bin);
   }
 
-  // Gather(swap_, scratch_, evenOffset_, base, packed) and the odd twin.
   for (size_t c = 0; c < packed_count; ++c) {
     swap[c] = scratch[static_cast<size_t>(even[c]) / sizeof(float)];
     swap[packed_count + c] = scratch[static_cast<size_t>(odd[c]) / sizeof(float)];
@@ -749,10 +650,6 @@ TEST(TurboQuantTableDriven, QuantizeMatchesTheReferenceWithPoisonedScratch) {
   }
 }
 
-// -----------------------------------------------------------------------------
-// Numerical edge cases
-// -----------------------------------------------------------------------------
-
 TEST(TurboQuantEdgeCases, AllZeroVectorIsNumericallyStable) {
   for (int d : {64, 128, 256}) {
     const std::vector<float> zeros(static_cast<size_t>(d), 0.0f);
@@ -762,15 +659,10 @@ TEST(TurboQuantEdgeCases, AllZeroVectorIsNumericallyStable) {
 
     tq::cpu_quantize_4bit(zeros.data(), d, packed.data(), &step);
 
-    // The kEps floor keeps the reciprocal finite; the scale stays positive.
     ASSERT_TRUE(std::isfinite(step)) << "scale is not finite for an all-zero vector, d=" << d;
     ASSERT_GT(step, 0.0f) << "scale collapsed to zero, d=" << d;
     EXPECT_FLOAT_EQ(step, tq::kEps);
 
-    // The Lloyd-Max table has no exact zero either: u = 0 fails every strict
-    // `u > t_i` from the boundary at t = 0 upwards and clears the seven below
-    // it, so every channel lands on bin 7, the negative half of the innermost
-    // pair. What matters is that the reconstruction is numerically zero.
     std::vector<float> levels(static_cast<size_t>(d));
     tq::cpu_dequantize_4bit(packed.data(), d, 1.0f, levels.data());
     for (int i = 0; i < d; ++i) {
@@ -799,9 +691,6 @@ TEST(TurboQuantEdgeCases, SingleDominantOutlier) {
     float step = 0.0f;
     tq::cpu_quantize_4bit(vec.data(), d, packed.data(), &step);
 
-    // The scale is the RMS, so a lone outlier moves it by 1/sqrt(d) rather than
-    // setting it outright -- the behavioural difference from an absmax codec,
-    // which would size the grid off this one coordinate.
     EXPECT_NEAR(step, std::fabs(magnitude) / std::sqrt(static_cast<float>(d)),
                 std::fabs(magnitude) * 1e-6f);
     ASSERT_TRUE(std::isfinite(step));
@@ -816,15 +705,11 @@ TEST(TurboQuantEdgeCases, SingleDominantOutlier) {
           << "zero channel " << i << " moved off bin 7";
     }
 
-    // Packing an extreme next to a mid bin must stay inside int8.
     for (size_t i = 0; i < packed.size(); ++i) {
       ASSERT_GE(static_cast<int>(packed[i]), -128);
       ASSERT_LE(static_cast<int>(packed[i]), 127);
     }
 
-    // The outlier is clipped to the outermost centroid, so it comes back at
-    // c[15] / sqrt(d) of its magnitude rather than at its magnitude. Asserting
-    // the clip explicitly is what stops it being read as a regression.
     std::vector<float> recon(static_cast<size_t>(d));
     tq::cpu_dequantize_4bit(packed.data(), d, step, recon.data());
     const float clipped =
@@ -838,10 +723,6 @@ TEST(TurboQuantEdgeCases, ClampingAndSaturationExtremes) {
   constexpr int d = 64;
   constexpr float amplitude = 3.0f;
 
-  // Reaching the outermost bins takes a *sparse* outlier under an RMS scale: a
-  // vector whose channels all share a magnitude normalises to u = +-1, nowhere
-  // near the +-2.4008 outermost boundary, while two live channels among d - 2
-  // zeros normalise to +-sqrt(d / 2) = +-5.66 and saturate.
   struct Case {
     const char* name;
     float first;
@@ -849,9 +730,6 @@ TEST(TurboQuantEdgeCases, ClampingAndSaturationExtremes) {
     int expected_low;
     int expected_high;
   };
-  // Both nibbles at 15 give byte 255, which the -128 bias maps to +127; both at
-  // 0 give -128. Those are exactly the int8 endpoints, so this is where a
-  // signed overflow or a truncated cast would show up.
   const Case cases[] = {
       {"(+A, +A) -> (15, 15) -> +127", amplitude, amplitude, 15, 15},
       {"(-A, -A) -> ( 0,  0) -> -128", -amplitude, -amplitude, 0, 0},
@@ -859,7 +737,6 @@ TEST(TurboQuantEdgeCases, ClampingAndSaturationExtremes) {
       {"(-A, +A) -> ( 0, 15) -> +112", -amplitude, amplitude, 0, 15},
   };
 
-  // Every other channel is zero, so it lands in bin 7 and packs to this byte.
   const int quiet_byte = 7 + 16 * 7 - 128;
 
   for (const Case& c : cases) {
@@ -872,8 +749,6 @@ TEST(TurboQuantEdgeCases, ClampingAndSaturationExtremes) {
     float step = 0.0f;
     tq::cpu_quantize_4bit(vec.data(), d, packed.data(), &step);
 
-    // The two live channels must actually clear the outermost boundary, or the
-    // case is testing a bin it did not mean to.
     const float u = amplitude / step;
     ASSERT_GT(u, tq::kLloydMaxThresholds[tq::kThresholdCount - 1])
         << c.name << ": the sparse outlier no longer saturates, so the endpoints are untested";
@@ -896,8 +771,6 @@ TEST(TurboQuantEdgeCases, ClampingAndSaturationExtremes) {
 }
 
 TEST(TurboQuantEdgeCases, EveryNibblePairRoundTrips) {
-  // All 256 (low, high) combinations, including the two that sit on the int8
-  // endpoints. A truncating or sign-extending cast fails here, not on averages.
   int mismatches = 0;
   for (int low = 0; low < 16; ++low) {
     for (int high = 0; high < 16; ++high) {
@@ -915,10 +788,6 @@ TEST(TurboQuantEdgeCases, EveryNibblePairRoundTrips) {
   EXPECT_EQ(mismatches, 0);
 }
 
-// Largest reconstruction error the table can produce for a coordinate that
-// falls inside it: the greatest distance from any decision boundary to the
-// centroid of the bin it opens or closes. 0.3318, at the outermost interior
-// boundary, where the bins are widest.
 inline float WidestHalfBin() {
   float widest = 0.0f;
   for (int i = 0; i < tq::kThresholdCount; ++i) {
@@ -929,8 +798,6 @@ inline float WidestHalfBin() {
 }
 
 TEST(TurboQuantEdgeCases, PartialBatchesMatchPerRowQuantisation) {
-  // A partial batch must produce exactly what quantising each row on its own
-  // produces: no cross-row scale, no dependence on how many rows follow.
   const float kWidestHalfBin = WidestHalfBin();
   for (int d : {64, 128, 256}) {
     for (int batch_rows : {4, 8}) {
@@ -943,7 +810,6 @@ TEST(TurboQuantEdgeCases, PartialBatchesMatchPerRowQuantisation) {
 
         std::vector<float> rows_data;
         for (int row = 0; row < rows; ++row) {
-          // Amplitude varies per row so a leaked shared scale is visible.
           const std::vector<float> vec =
               MakeVector(d, 1.0f + static_cast<float>(row) * 4.0f, 11u + static_cast<uint32_t>(row));
           rows_data.insert(rows_data.end(), vec.begin(), vec.end());
@@ -962,10 +828,6 @@ TEST(TurboQuantEdgeCases, PartialBatchesMatchPerRowQuantisation) {
             const size_t idx = static_cast<size_t>(row) * d + i;
             const float recon = expanded[idx] * scales[static_cast<size_t>(row)];
             const float want = rows_data[idx];
-            // Lloyd-Max 4-bit: inside the table's range the worst case is the
-            // largest distance from a decision boundary to its own centroid,
-            // 0.3318. Outside it the error is unbounded, so the fixture is
-            // checked for clipping first.
             const float u = want / scales[static_cast<size_t>(row)];
             ASSERT_LE(std::fabs(u), tq::kLloydMaxThresholds[tq::kThresholdCount - 1])
                 << "this fixture clipped, so the in-range bound below does not apply: d=" << d << " row=" << row
@@ -997,8 +859,6 @@ TEST(TurboQuantEdgeCases, InvolutionOnCanonicalBasisVectors) {
       std::vector<float> rotated = basis;
       tq::cpu_apply_pi(rotated.data(), d, signs.data());
 
-      // Pi is orthogonal, so a unit basis vector stays a unit vector and the
-      // energy is spread over every channel rather than left in one.
       double norm_sq = 0.0;
       for (int i = 0; i < d; ++i) {
         norm_sq += static_cast<double>(rotated[static_cast<size_t>(i)]) * rotated[static_cast<size_t>(i)];
@@ -1024,10 +884,6 @@ TEST(TurboQuantEdgeCases, InvolutionOnCanonicalBasisVectors) {
   }
 }
 
-// -----------------------------------------------------------------------------
-// Golden fidelity report
-// -----------------------------------------------------------------------------
-
 class TurboQuantGoldenFidelity : public ::testing::Test {
  protected:
   static void SetUpTestSuite() {
@@ -1048,8 +904,6 @@ TEST_F(TurboQuantGoldenFidelity, Qwen35Layer3DecodeReport) {
     GTEST_SKIP() << "golden dump unavailable: " << error_;
   }
 
-  // Golden activations, taken straight from the dump: post-RoPE Q and K, and V
-  // sliced out of tap_qkv, which is laid out [Q | K | V].
   const std::vector<float>& rope_q = golden_.tap_rope_q;
   const std::vector<float>& rope_k = golden_.tap_rope_k;
   const std::vector<float> value(golden_.tap_qkv.begin() + static_cast<ptrdiff_t>(s::kQDim + s::kKvDim),
@@ -1073,9 +927,6 @@ TEST_F(TurboQuantGoldenFidelity, Qwen35Layer3DecodeReport) {
   RunTurboQuantDecode(rope_q, rope_k, value, context_len, num_heads, num_kv_heads, d, block_size,
                       s::kAttentionScale, &tq_context);
 
-  // The attention gate is not dumped on its own, so recompute it from norm1 the
-  // way the layer does; it is shared by both downstream runs and so cancels out
-  // of the comparison between them.
   std::vector<float> norm1;
   std::vector<float> rstd;
   reference::RmsNorm(golden_.input_x, golden_.input_norm_gamma, s::kTokens, s::kHidden, s::kRmsNormEps, &norm1,
@@ -1102,20 +953,14 @@ TEST_F(TurboQuantGoldenFidelity, Qwen35Layer3DecodeReport) {
   SUCCEED();
 }
 
-// -----------------------------------------------------------------------------
-// Synthetic long-context report: covers what the ctx=1 golden dump cannot.
-// -----------------------------------------------------------------------------
-
 TEST(TurboQuantSyntheticFidelity, LongContextDecodeReport) {
   constexpr int d = 128;
   constexpr int num_heads = 8;
   constexpr int num_kv_heads = 2;
   constexpr int block_size = 128;
-  constexpr int context_len = 300;  // spans three paged blocks, last one partial
+  constexpr int context_len = 300;
   const float scale = 1.0f / std::sqrt(static_cast<float>(d));
 
-  // Deterministic pseudo-random activations; the same LCG the sign vector uses,
-  // so the report is reproducible bit for bit on any host.
   uint32_t state = 12345u;
   auto next = [&state]() {
     state = state * 1664525u + 1013904223u;
@@ -1134,8 +979,6 @@ TEST(TurboQuantSyntheticFidelity, LongContextDecodeReport) {
   for (auto& value : value_cache) {
     value = next();
   }
-  // One channel per K vector carries an outlier: this is the regime the
-  // rotation exists for, and the case plain absmax quantisation handles worst.
   for (int pos = 0; pos < context_len; ++pos) {
     for (int h = 0; h < num_kv_heads; ++h) {
       key[(static_cast<size_t>(pos) * num_kv_heads + h) * d] *= 30.0f;
@@ -1155,6 +998,6 @@ TEST(TurboQuantSyntheticFidelity, LongContextDecodeReport) {
   SUCCEED();
 }
 
-}  // namespace
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}

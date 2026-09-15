@@ -14,80 +14,6 @@
  * limitations under the License.
  */
 
-// The Cube-native kv4fp8 decode split, cut at each stage of its tile pipeline
-// and timed, so the kernel's latency reads as a sum of parts.
-//
-// The ladder is DecodeAblationStage in attention/turboquant/turboquant_mode.h.
-// Every rung runs everything the rung below it does plus one more piece; the
-// cut is a template parameter on TurboQuantCubeDecodeSplit, not a runtime
-// branch; and the top rung is the shipping split kernel itself. A rung's
-// latency minus its neighbour's is therefore what that piece costs in situ,
-// including what it does to the overlap between the vector cores, the DMA pipes
-// and the Cube -- which a per-operator microbenchmark cannot show.
-//
-//   stage0_mte2         packed K/V and scale tiles, GM -> UB (CopyInTile)
-//   stage1_unpack       + UnpackAffine onto the fp8 grid, in UB
-//   stage2_query_prep   + the query: pre-rotated GM read, amax, operand cast
-//   stage3_l1_staging   + every V -> MTE3 edge and UB -> L1 copy
-//   stage4_score_gemm   + MTE1 Load2D, Q . K^T Mmad, Fixpipe to UB, handshake
-//   stage5_full         + online softmax, P . V GEMM, accumulator, GM writeback
-//
-// Per head size D in {256, 512} and context S in {64, 512, 1024, 2048}, at
-// Qwen3.5-2B's 8 query and 2 kv heads and block size 128. One launch per
-// iteration: the split alone.
-//
-// READ THESE BEFORE THE NUMBERS.
-//
-//   * Stage 2 is per TASK, not per tile. The cache is written already rotated,
-//     so the split's only Walsh-Hadamard is the query's -- once per query head
-//     of each kv head -- and its delta should not grow with S. There is no
-//     output inverse rotation on the device at all any more: it is folded into
-//     W_o, and the combine the ladder does not time only reduces. The delta
-//     also carries the query's amax, scale and fp8 cast.
-//   * Stages 0 to 2 end each tile read or unpack pass with PipeBarrier<PIPE_ALL>
-//     where production has a HardEvent edge, because at those cuts the edge's
-//     wait would have no consumer on its pipe. Stage 1 swaps stage 0's barrier
-//     for the MTE2 -> V edge its unpack consumes; stage 3 swaps stage 2's for
-//     production's V -> MTE3 per chunk plus MTE3 -> V. So stage 3's delta is
-//     the copies and the difference in synchronisation, not the copies alone.
-//   * Stages 0 to 4 write nothing to GM. Each runs against a freshly zeroed
-//     workspace, and a case fails if the workspace is not still zero after it:
-//     a leaked writeback would mean the rung is not the cut it claims to be.
-//   * D = 512 is outside what the production adapter accepts (CheckHeadSize in
-//     turboquant_torch_adpt.h caps head_size at 256) and has never run
-//     anywhere. By static count the split's UB buffers come to 234,624 B of the
-//     part's 253,952. So straight after each shape's stage 5 the combine runs
-//     once, untimed, and the output is held to a cosine against an fp32 host
-//     attention; below kFidelityCos the shape is marked UNTRUSTED and the suite
-//     fails. The timings of a kernel that is aliasing UB are not timings of
-//     this kernel.
-//
-// HANG GUARD. The shared harness synchronises without a deadline, so a cut
-// kernel that deadlocks the part would hang the process with nothing printed.
-// Each stage's first launch is therefore issued here and synchronised with
-// aclrtSynchronizeStreamWithTimeout before the harness sees the case. A stage
-// that misses the deadline is named, the waterfall so far is printed, and the
-// process ends with kHangExitCode without the shared report or any teardown:
-// a deadlocked stream does not come back, and destroying it blocks as well.
-//
-// Command line, from bench_main_950pr_ablation.cpp:
-//
-//   --stage=4                 run only these stages, in this order; one stage
-//                             per process is the isolation for a suspect stage
-//   --sync-timeout-ms=30000   deadline for each stage's first launch; 0 waits
-//                             forever
-//
-// Environment, on top of the shared ASCEND_BENCH_* set in common/benchmark.hpp.
-// A command-line flag sets the matching variable, so the two cannot disagree:
-//
-//   ASCEND_BENCH_TQ_ABLATION_DIMS=256            head sizes; powers of two in [64, 512]
-//   ASCEND_BENCH_TQ_ABLATION_CONTEXTS=64,512     contexts; positive multiples of 8,
-//                                                see TURBOQUANT_TESTS.md 13.20
-//   ASCEND_BENCH_TQ_ABLATION_STAGES=0,1,2        stages (default 0..5)
-//   ASCEND_BENCH_TQ_ABLATION_SYNC_TIMEOUT_MS=0   first-launch deadline (default 30000)
-//
-// A variable that fails validation falls back to its default, loudly.
-
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -123,36 +49,23 @@ namespace s950 = shapes950;
 
 constexpr tqm::TurboQuantMode kMode = tqm::TurboQuantMode::KV4_FP8;
 
-constexpr int64_t kNumHeads = s950::kNumHeads;      // 8
-constexpr int64_t kNumKvHeads = s950::kNumKvHeads;  // 2
-constexpr int64_t kBlockSize = s950::kBlockSize;    // 128
-constexpr int64_t kQueryTokens = 1;                 // decode
+constexpr int64_t kNumHeads = s950::kNumHeads;
+constexpr int64_t kNumKvHeads = s950::kNumKvHeads;
+constexpr int64_t kBlockSize = s950::kBlockSize;
+constexpr int64_t kQueryTokens = 1;
 
 const int64_t kDefaultHeadSizes[] = {256, 512};
 const int64_t kDefaultContextLens[] = {64, 512, 1024, 2048};
 
-// Head sizes the sweep accepts: the Walsh-Hadamard needs a power of two, and
-// nothing below 64 or above 512 is a shape anyone has asked about.
 constexpr int64_t kMinHeadSize = 64;
 constexpr int64_t kMaxHeadSize = 512;
-// What turboquant_torch_adpt.h's CheckHeadSize lets a model reach.
 constexpr int64_t kAdapterMaxHeadSize = 256;
-// The softmax's tail mask faults on a partial tile whose valid row count is not
-// a multiple of this. See TURBOQUANT_TESTS.md 13.20.
 constexpr int64_t kContextMultiple = 8;
 
-// The bound a shape's stage 5 output has to clear for its rows to be trusted.
-// The multimode test's smoke bound: kv4fp8 measures 0.986 at S=64, and a decode
-// that aliases UB or mis-stages an operand lands far below it.
 constexpr double kFidelityCos = 0.90;
 
-// A decode split is milliseconds on the part at every shape here, so thirty
-// seconds is a deadlock and not a slow launch.
 constexpr int64_t kDefaultSyncTimeoutMs = 30000;
-// What aclrtSynchronizeStreamWithTimeout takes for "no deadline".
 constexpr int32_t kWaitForever = -1;
-// Distinct from the harness's 0, 1 and 77, so a caller can tell a deadlock from
-// a failed case.
 constexpr int kHangExitCode = 3;
 
 constexpr int64_t kFloatBytes = 4;
@@ -160,11 +73,6 @@ constexpr double kPercent = 100.0;
 
 uint32_t U32(int64_t value) { return static_cast<uint32_t>(value); }
 
-// --- the sweep ----------------------------------------------------------------
-
-// A comma-separated list of decimal integers no smaller than `min_value`, or
-// false with `values` untouched. A bare strtoll turns a typo into a 0 that some
-// later division trips over; this refuses it instead.
 bool ParseDecimalList(const char* raw, int64_t min_value, std::vector<int64_t>* values) {
   constexpr size_t kMaxDigits = 9;
   std::vector<int64_t> parsed;
@@ -255,8 +163,6 @@ std::vector<tqm::DecodeAblationStage> Stages() {
   return stages;
 }
 
-// The first-launch deadline in milliseconds, as aclrtSynchronizeStreamWithTimeout
-// takes it: kWaitForever for 0.
 int32_t SyncTimeoutMs() {
   const char* raw = std::getenv("ASCEND_BENCH_TQ_ABLATION_SYNC_TIMEOUT_MS");
   int64_t timeout_ms = kDefaultSyncTimeoutMs;
@@ -283,8 +189,6 @@ std::string CaseName(const std::string& shape, tqm::DecodeAblationStage stage) {
   return shape + "_" + tqm::DecodeAblationStageName(stage);
 }
 
-// --- the host reference ---------------------------------------------------------
-
 double Cosine(const std::vector<float>& a, const std::vector<float>& b) {
   if (a.size() != b.size()) {
     return 0.0;
@@ -303,11 +207,6 @@ double Cosine(const std::vector<float>& a, const std::vector<float>& b) {
   return dot / (std::sqrt(na) * std::sqrt(nb));
 }
 
-// fp32 attention over the unquantised inputs, one decode token: no rotation and
-// no codec, so agreeing with it is evidence about the whole pipeline rather than
-// one stage of it. `query` is [heads, D]; `key` and `value` are [S, kv heads, D].
-// The same computation as HostAttention in sim/test_sim_950pr_turboquant_multimode.cpp,
-// with the head size and scale as arguments.
 std::vector<float> HostAttention(int64_t head_size, int64_t context_len, double scale,
                                  const std::vector<float>& query, const std::vector<float>& key,
                                  const std::vector<float>& value) {
@@ -342,11 +241,6 @@ std::vector<float> HostAttention(int64_t head_size, int64_t context_len, double 
   return out;
 }
 
-// --- one shape ------------------------------------------------------------------
-
-// Everything one (D, S) shape needs, allocated once and alive for its cases and
-// its fidelity check. The same data layout, table images and grids as
-// ModeScenario in bench_device_950pr_turboquant.cpp, with the head size free.
 class AblationScenario {
  public:
   AblationScenario(int64_t head_size, int64_t context_len, int64_t aiv_num)
@@ -354,8 +248,6 @@ class AblationScenario {
         context_len_(context_len),
         attention_scale_(static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_size)))) {
     blocks_per_seq_ = (context_len + kBlockSize - 1) / kBlockSize;
-    // Four times the blocks the context needs, so the block table scatters
-    // through a pool instead of reading a resident run of consecutive blocks.
     num_blocks_ = std::max<int64_t>(4, blocks_per_seq_ * 4);
 
     DeterministicRandom rng(0x7451u);
@@ -388,10 +280,8 @@ class AblationScenario {
                                             kBenchmarkAlignBytes);
     aiv_num_ = aiv_num;
 
-    // The rotation image is the shipping 4-bit codec's; the two mode images are
-    // a single zero block each, because the affine codec reads no table.
     rot_tables_ = DeviceBuffer::FromHost(tqh::CodecTables(head_size, 1), kBenchmarkAlignBytes);
-    write_tables_ = DeviceBuffer::FromHost(tqh::ModeTables(kMode, head_size, 1, /*nz_rows=*/0), kBenchmarkAlignBytes);
+    write_tables_ = DeviceBuffer::FromHost(tqh::ModeTables(kMode, head_size, 1, 0), kBenchmarkAlignBytes);
     decode_tables_ = DeviceBuffer::FromHost(
         tqh::ModeTables(kMode, head_size, tqh::kUnpackRows, tqh::kCubeTileRows), kBenchmarkAlignBytes);
 
@@ -407,7 +297,6 @@ class AblationScenario {
     ResetWorkspace();
   }
 
-  // Writes the whole context once, outside any timed region.
   void FillCache(aclrtStream stream) const {
     turboquant_mm_reshape_and_cache_impl(
         static_cast<int32_t>(kMode), AscendType::FP16, stream, write_grid_.block_dim, key_.get(), value_.get(),
@@ -417,24 +306,14 @@ class AblationScenario {
     ACL_CHECK(aclrtSynchronizeStream(stream));
   }
 
-  // Zeros uploaded rather than left to the allocator, before every stage, so a
-  // cut stage's untouched check does not depend on which stages ran before it.
   void ResetWorkspace() {
     workspace_ = DeviceBuffer::FromHost(std::vector<float>(decode_grid_.workspace_floats, 0.0f), kBenchmarkAlignBytes);
   }
 
-  /*
-   * The query rotation, once, outside every timed rung.
-   *
-   * It is deliberately NOT part of EnqueueSplit: every rung consumes the same
-   * pre-rotated query, so no rung's delta carries any of it and the waterfall
-   * measures only what the split kernel itself does. What used to be stage 2's
-   * bulk is now this call, and pricing it is the rotate benchmark's job.
-   */
   void RotateQueryOnce(aclrtStream stream) {
     rotate_plan_ = tqh::RotateQuery(stream, AscendType::FP16, query_.get(), pi_signs_.get(), h16_.get(),
                                     rot_tables_.get(), query_rot_.get(), kQueryTokens, kNumHeads, head_size_,
-                                    aiv_num_, /*input_exact_in_half=*/true);
+                                    aiv_num_, true);
     ACL_CHECK(aclrtSynchronizeStream(stream));
   }
 
@@ -449,10 +328,6 @@ class AblationScenario {
         U32(decode_grid_.num_splits), decode_grid_.split_tasks_per_core, attention_scale_, attention_scale_);
   }
 
-  // The combine, which the ladder does not time. Reads the partials stage 5
-  // left in the workspace, so it is only meaningful straight after that case.
-  // Returned un-rotated, as the folded W_o would see it, so it compares against
-  // Reference() directly.
   std::vector<float> CombineAndReadBack(aclrtStream stream) const {
     turboquant_paged_attention_combine_impl(AscendType::FP16, stream, decode_grid_.combine_block_dim,
                                             workspace_.get(), out_.get(), U32(kQueryTokens), U32(kNumHeads),
@@ -469,10 +344,6 @@ class AblationScenario {
 
   std::vector<float> Workspace() const { return workspace_.ToHost<float>(); }
 
-  // Bytes CopyInTile moves per launch. Every tile of every kv head reads a full
-  // kCubeTileRows rows of K, of V and of the scale plane whatever its valid row
-  // count, so this counts tiles the way CountTiles does. The same at every rung:
-  // GB/s is comparable up the ladder, and at stage 0 it is the MTE2 figure.
   double TileReadBytes() const {
     int64_t tiles = 0;
     for (int64_t block = 0; block < blocks_per_seq_; ++block) {
@@ -506,24 +377,19 @@ class AblationScenario {
   int64_t aiv_num_ = 1;
 };
 
-// What the waterfall needs to say about a shape beyond its latencies.
 struct ShapeVerdict {
   int64_t head_size = 0;
   int64_t context_len = 0;
   bool fidelity_checked = false;
   double cos = 0.0;
-  // Empty when the shape's rows can be read at face value.
   std::string distrust;
 };
 
 enum class ShapeOutcome {
   kCompleted,
-  // A stage missed its first-launch deadline. Nothing more may be launched on
-  // the stream, and nothing may tear it down.
   kStreamWedged,
 };
 
-// Straight after stage 5: the combine, and the cosine against the host.
 void CheckFidelity(BenchmarkRunner& runner, const AblationScenario& ready, const std::string& shape,
                    ShapeVerdict* verdict) {
   const std::string fidelity_name = shape + "_fidelity";
@@ -531,7 +397,6 @@ void CheckFidelity(BenchmarkRunner& runner, const AblationScenario& ready, const
     const std::vector<float> output = ready.CombineAndReadBack(runner.stream());
     verdict->cos = Cosine(ready.Reference(), output);
     verdict->fidelity_checked = true;
-    // Negated so a NaN cosine fails too.
     if (!(verdict->cos >= kFidelityCos)) {
       std::ostringstream reason;
       reason << "stage 5 plus combine gives cos " << verdict->cos << " against the fp32 host attention, below "
@@ -553,8 +418,6 @@ ShapeOutcome RunShape(BenchmarkRunner& runner, int64_t aiv_num, const std::vecto
   try {
     scenario.reset(new AblationScenario(verdict->head_size, verdict->context_len, aiv_num));
     scenario->FillCache(runner.stream());
-    // Once, before any rung: every stage reads the same rotated query, so the
-    // waterfall's deltas are the split kernel's alone.
     scenario->RotateQueryOnce(runner.stream());
   } catch (const std::exception& error) {
     for (const tqm::DecodeAblationStage stage : stages) {
@@ -579,9 +442,6 @@ ShapeOutcome RunShape(BenchmarkRunner& runner, int64_t aiv_num, const std::vecto
     const std::string name = CaseName(shape, stage);
     mutable_scenario.ResetWorkspace();
 
-    // The hang guard; see the file header. One launch, synchronised against a
-    // deadline, before the harness -- whose synchronisations have none -- is
-    // handed the case.
     std::printf("[ascend-bench] %s: first launch, deadline %d ms\n", name.c_str(), sync_timeout_ms);
     std::fflush(stdout);
     ready.EnqueueSplit(stage, runner.stream());
@@ -600,10 +460,9 @@ ShapeOutcome RunShape(BenchmarkRunner& runner, int64_t aiv_num, const std::vecto
       BenchmarkCase ablation_case;
       ablation_case.name = name;
       ablation_case.bytes_per_iteration = ready.TileReadBytes();
-      ablation_case.tasks_per_launch = 1;  // the split alone
+      ablation_case.tasks_per_launch = 1;
       ablation_case.launch = [&ready, stage](aclrtStream stream) { ready.EnqueueSplit(stage, stream); };
       if (writes_workspace) {
-        // Same partials every launch, so bit-identical.
         ablation_case.checksum = [&ready]() { return ChecksumSum(ready.Workspace()); };
       } else {
         ablation_case.checksum = [&ready]() { return ChecksumSumOfSquares(ready.Workspace()); };
@@ -613,9 +472,6 @@ ShapeOutcome RunShape(BenchmarkRunner& runner, int64_t aiv_num, const std::vecto
       if (writes_workspace) {
         CheckFidelity(runner, ready, shape, verdict);
       } else if (ChecksumSumOfSquares(ready.Workspace()) != 0.0) {
-        // The checksum above only proves the workspace did not change between
-        // two reads; a cut that wrote the same partials every launch passes it.
-        // Zero is the stronger statement, and only a cut below stage 5 owes it.
         runner.RecordFailure(name, "wrote the workspace: a cut below stage 5 must not reach the partial writeback");
         verdict->distrust = "an ablation gate leaked the writeback";
       }
@@ -626,10 +482,6 @@ ShapeOutcome RunShape(BenchmarkRunner& runner, int64_t aiv_num, const std::vecto
   return ShapeOutcome::kCompleted;
 }
 
-// --- the waterfall --------------------------------------------------------------
-
-// The timing mode the waterfall quotes: pipelined when it ran, else the first
-// mode that did, so a narrowed ASCEND_BENCH_MODES still gets a table.
 TimingMode WaterfallMode(const BenchmarkRunner& runner) {
   const std::vector<TimingMode>& modes = runner.options().modes;
   if (std::find(modes.begin(), modes.end(), TimingMode::kPipelined) != modes.end() || modes.empty()) {
@@ -651,7 +503,6 @@ struct Rung {
   bool present = false;
   double median_us = 0.0;
   double p95_us = 0.0;
-  // Against the rung below; valid only when both are present.
   bool has_delta = false;
   double delta_us = 0.0;
 };
@@ -717,8 +568,6 @@ void PrintShapeWaterfall(const BenchmarkRunner& runner, TimingMode mode, const S
   }
 }
 
-// One table per head size, a column per context: each stage's delta, so how a
-// piece scales with S can be read along a row. Stage 2 should be flat.
 void PrintDeltaByContext(const BenchmarkRunner& runner, TimingMode mode, const std::vector<ShapeVerdict>& verdicts,
                          int64_t head_size) {
   std::vector<const ShapeVerdict*> columns;
@@ -829,7 +678,7 @@ void PrintBanner(const std::vector<int64_t>& head_sizes, const std::vector<int64
   std::fflush(stdout);
 }
 
-}  // namespace
+}
 
 void BuildSuite(BenchmarkRunner& runner) {
   const std::vector<int64_t> head_sizes = HeadSizes();
@@ -841,9 +690,6 @@ void BuildSuite(BenchmarkRunner& runner) {
   const int64_t aiv_num = tqh::VectorCoreNum(&aiv_queried);
   PrintBanner(head_sizes, context_lens, stages, sync_timeout_ms, aiv_num, aiv_queried);
 
-  // Head size is the outer loop so every shape the production adapter accepts
-  // is measured before one it does not: a D = 512 launch that faults the part
-  // cannot take the D = 256 numbers with it.
   std::vector<ShapeVerdict> verdicts;
   for (const int64_t head_size : head_sizes) {
     for (const int64_t context_len : context_lens) {
@@ -865,6 +711,6 @@ void BuildSuite(BenchmarkRunner& runner) {
   PrintWaterfall(runner, head_sizes, verdicts);
 }
 
-}  // namespace bench
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}

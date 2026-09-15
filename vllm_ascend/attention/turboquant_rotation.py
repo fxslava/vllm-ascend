@@ -50,31 +50,18 @@ from typing import Any
 
 import torch
 
-# Seed of the +-1 diagonal of Pi.  It is fixed so that every rank, every layer
-# and every restart agree on the rotation; the cache is only ever read back by
-# the same transform that wrote it, and a folded checkpoint is only valid for
-# the Pi it was folded with.
 TURBOQUANT_PI_SEED = 0x5F3759DF
 
-# The explicit LCG the sign vector is drawn from. Restated in
-# csrc/tests/reference/turbo_quant_cpu.h::cpu_pi_sign_vector.
 _LCG_MULTIPLIER = 1664525
 _LCG_INCREMENT = 1013904223
 _UINT32_MASK = 0xFFFFFFFF
 _LCG_SIGN_BIT = 16
 
-# The attribute of the model's HF config that records a folded checkpoint. The
-# offline tool writes it into config.json next to the weights it rewrote, so the
-# two travel together.
 TURBOQUANT_OUTPUT_ROTATION_CONFIG_KEY = "turboquant_output_rotation"
 TURBOQUANT_OUTPUT_ROTATION_FORMAT_VERSION = 1
 
-# Acceptance bound for a fold: the worst per-sample cosine between the original
-# projection of O and the folded projection of O~, with the folded weight in the
-# dtype it is stored in.
 TURBOQUANT_FOLD_MIN_COSINE = 0.9999
 
-# Rotated outputs a validation draws when the caller does not say.
 TURBOQUANT_FOLD_VALIDATION_SAMPLES = 64
 
 _PI_SIGN_CACHE: dict[tuple[int, str], torch.Tensor] = {}
@@ -170,11 +157,8 @@ def fold_pi_into_output_projection(weight: torch.Tensor, head_size: int) -> torc
 class OutputProjectionFoldReport:
     """How closely a folded projection reproduces the original one."""
 
-    # Worst per-sample cosine between W_o (Pi o~) and W_o' o~.
     min_cosine: float
-    # Worst per-sample ||W_o' o~ - W_o (Pi o~)|| / ||W_o (Pi o~)||.
     max_relative_error: float
-    # ||W_o' - W_o (I_H (x) Pi)||_F / ||W_o||_F, with W_o' as stored.
     weight_relative_error: float
     num_samples: int
 

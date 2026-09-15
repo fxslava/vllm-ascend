@@ -39,9 +39,6 @@ using DestroyTensorListFn = int (*)(const aclTensorList* list);
 using CreateScalarFn = aclScalar* (*)(void* value, aclDataType dtype);
 using DestroyScalarFn = int (*)(const aclScalar* scalar);
 
-// libopapi.so lives in the CANN op-api lib directory, which the standard
-// set_env.sh puts on LD_LIBRARY_PATH. The absolute candidates cover the case
-// where a test binary is launched without sourcing it.
 std::vector<std::string> OpApiCandidatePaths() {
   std::vector<std::string> candidates;
   candidates.emplace_back("libopapi.so");
@@ -54,9 +51,6 @@ std::vector<std::string> OpApiCandidatePaths() {
     const std::string home(ascend_home);
     candidates.push_back(home + "/lib64/libopapi.so");
     candidates.push_back(home + "/lib64/stub/libopapi.so");
-    // Some CANN packages install a multi-architecture root with no lib64 of its
-    // own, only <arch>-linux/lib64, so the two candidates above cannot resolve.
-    // Probing costs two failed dlopens on a normal install.
     candidates.push_back(home + "/aarch64-linux/lib64/libopapi.so");
     candidates.push_back(home + "/x86_64-linux/lib64/libopapi.so");
   }
@@ -73,8 +67,6 @@ std::vector<std::string> SplitOn(const std::string& text, char separator) {
   std::string current;
   std::istringstream stream(text);
   while (std::getline(stream, current, separator)) {
-    // Trim, because config.ini values are hand-edited often enough to pick up
-    // stray whitespace and a path with a trailing space silently fails to open.
     const size_t first = current.find_first_not_of(" \t\r\n");
     if (first == std::string::npos) {
       continue;
@@ -85,13 +77,6 @@ std::vector<std::string> SplitOn(const std::string& text, char separator) {
   return parts;
 }
 
-// Custom operator packages, in the order GetOpApiFuncAddr searches them:
-//
-//   1. every entry of ASCEND_CUSTOM_OPP_PATH (colon separated)
-//   2. every vendor named by load_priority in $ASCEND_OPP_PATH/vendors/config.ini
-//
-// with "/op_api/lib/libcust_opapi.so" appended to each. A path that does not
-// exist is skipped: an install with no custom package is the normal case.
 std::vector<std::string> CustomOpApiCandidatePaths() {
   std::vector<std::string> candidates;
 
@@ -125,27 +110,21 @@ std::vector<std::string> CustomOpApiCandidatePaths() {
   return candidates;
 }
 
-}  // namespace
+}
 
 OpApiLibrary::OpApiLibrary() {
-  // Custom packages first, so a kernel built from csrc/ shadows a stock
-  // operator of the same name exactly as it would under torch_npu.
   for (const std::string& candidate : CustomOpApiCandidatePaths()) {
     void* custom = dlopen(candidate.c_str(), RTLD_LAZY | RTLD_GLOBAL);
     if (custom != nullptr) {
       custom_handles_.push_back(custom);
       custom_paths_.push_back(candidate);
     } else {
-      // Clear the error so a later dlerror() reports the failure it belongs to.
-      // A missing custom package is the normal case, not something to report.
       dlerror();
     }
   }
 
   std::ostringstream failures;
   for (const std::string& candidate : OpApiCandidatePaths()) {
-    // RTLD_LAZY matches op_api_common.h; RTLD_GLOBAL lets dlsym on this handle
-    // reach the aclCreateTensor family that libnnopbase.so provides.
     handle_ = dlopen(candidate.c_str(), RTLD_LAZY | RTLD_GLOBAL);
     if (handle_ != nullptr) {
       library_path_ = candidate;
@@ -163,7 +142,7 @@ OpApiLibrary& OpApiLibrary::Instance() {
 }
 
 void* OpApiLibrary::Resolve(const char* symbol, std::string* source) const {
-  dlerror();  // clear any stale error before the lookups
+  dlerror();
 
   for (size_t i = 0; i < custom_handles_.size(); ++i) {
     void* address = dlsym(custom_handles_[i], symbol);
@@ -350,9 +329,6 @@ AclnnTensorList::~AclnnTensorList() { OpApiLibrary::Instance().DestroyTensorList
 AclnnOp::AclnnOp(const char* name) : name_(name) {
   const OpApiLibrary& library = OpApiLibrary::Instance();
   const std::string workspace_symbol = name_ + "GetWorkspaceSize";
-  // The planning entry point decides the source: both phases come out of the
-  // same library, and mixing a custom planner with a stock launcher would be a
-  // broken install rather than something to paper over.
   get_workspace_size_ = library.Resolve(workspace_symbol.c_str(), &source_);
   launch_ = library.Resolve(name_.c_str());
   if (!available()) {
@@ -373,9 +349,6 @@ std::string AclnnOp::unavailable_reason() const {
   reason << name_ << "GetWorkspaceSize=" << (get_workspace_size_ != nullptr ? "found" : "missing");
   reason << ", " << name_ << "=" << (launch_ != nullptr ? "found" : "missing") << "). ";
   reason << "Check the operator name against " << "$ASCEND_HOME_PATH/include/aclnnop/.";
-  // Custom operators are the common case for a missing symbol on this suite, so
-  // say which packages were searched rather than leaving the reader to guess
-  // that none were.
   const std::vector<std::string>& custom = library.custom_library_paths();
   if (custom.empty()) {
     reason << " No custom operator package was found: set ASCEND_CUSTOM_OPP_PATH,"
@@ -389,5 +362,5 @@ std::string AclnnOp::unavailable_reason() const {
   return reason.str();
 }
 
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}

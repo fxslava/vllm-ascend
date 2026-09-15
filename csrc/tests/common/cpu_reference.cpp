@@ -124,13 +124,11 @@ void GatherFullCosSin(const std::vector<float>& cos_sin_cache, const std::vector
       const float sin_value = cos_sin_cache[cache_row + static_cast<size_t>(half + i)];
 
       if (mode == RotaryMode::kHalf) {
-        // concat(cos, cos): index i and index i + half share one value.
         (*cos_full)[out_row + static_cast<size_t>(i)] = cos_value;
         (*cos_full)[out_row + static_cast<size_t>(half + i)] = cos_value;
         (*sin_full)[out_row + static_cast<size_t>(i)] = sin_value;
         (*sin_full)[out_row + static_cast<size_t>(half + i)] = sin_value;
       } else {
-        // repeat_interleave(2): index 2i and index 2i + 1 share one value.
         (*cos_full)[out_row + static_cast<size_t>(2 * i)] = cos_value;
         (*cos_full)[out_row + static_cast<size_t>(2 * i + 1)] = cos_value;
         (*sin_full)[out_row + static_cast<size_t>(2 * i)] = sin_value;
@@ -157,8 +155,6 @@ void ApplyRotaryPosEmb(const std::vector<float>& x, const std::vector<float>& co
       const size_t base = static_cast<size_t>((token * num_heads + head) * head_dim);
 
       for (int64_t i = 0; i < rotary_dim; ++i) {
-        // rotate(x)[i] is the partner element, negated on the first element of
-        // each pair and kept positive on the second.
         int64_t partner = 0;
         float sign = 0.0f;
         if (mode == RotaryMode::kHalf) {
@@ -176,7 +172,6 @@ void ApplyRotaryPosEmb(const std::vector<float>& x, const std::vector<float>& co
             sign * partner_value * sin_full[angle_row + static_cast<size_t>(i)];
       }
 
-      // Dimensions past rotary_dim pass through unchanged.
       for (int64_t i = rotary_dim; i < head_dim; ++i) {
         (*out)[base + static_cast<size_t>(i)] = x[base + static_cast<size_t>(i)];
       }
@@ -209,7 +204,7 @@ void ReshapeAndCache(const std::vector<float>& key, const std::vector<float>& va
   for (int64_t token = 0; token < num_tokens; ++token) {
     const int32_t slot = slot_mapping[static_cast<size_t>(token)];
     if (slot < 0) {
-      continue;  // vLLM marks padded tokens with a negative slot
+      continue;
     }
     const int64_t block_id = slot / layout.block_size;
     const int64_t block_offset = slot % layout.block_size;
@@ -268,7 +263,6 @@ void PagedAttentionDecode(const std::vector<float>& query, const std::vector<flo
         }
       }
 
-      // Softmax with the standard max subtraction, matching the kernel.
       float denominator = 0.0f;
       for (int64_t position = 0; position < context_len; ++position) {
         const float weight = std::exp(scores[static_cast<size_t>(position)] - max_score);
@@ -292,6 +286,6 @@ void PagedAttentionDecode(const std::vector<float>& query, const std::vector<flo
   }
 }
 
-}  // namespace reference
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}

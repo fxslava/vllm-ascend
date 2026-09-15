@@ -14,13 +14,6 @@
  * limitations under the License.
  */
 
-/*
- * Cube-side TurboQuant GEMM support for the selected mode.
- *
- * This header keeps the operand type, tile sizes, and L1/L0 ownership model
- * described by the Ascend-C kernel contracts.
- */
-
 #ifndef VLLM_ASCEND_ATTENTION_TURBOQUANT_CUBE_MM_H
 #define VLLM_ASCEND_ATTENTION_TURBOQUANT_CUBE_MM_H
 
@@ -30,66 +23,22 @@
 namespace vllm_ascend {
 namespace turboquant {
 
-// L0C -> UB, row major.  No predefined FixpipeConfig sets isToUB, which exists
-// only on arch35 and 5102; on any other arch this header does not compile, and
-// that is correct -- there is no Cube path for them here.
 constexpr AscendC::FixpipeConfig kFixpipeToUb = {AscendC::CO2Layout::ROW_MAJOR, true};
 
-// The Cube's M/N granularity for 8-bit operands, and the K granularity one
-// LoadData2D step covers.  A GEMM whose M is smaller is padded, not split.
 constexpr uint32_t kCubeTileM = 16;
 constexpr uint32_t kCubeKStep = 64;
 
-// Depth of the L1 ping-pong, and the modulus every slot index is taken at.
 constexpr uint32_t kSlots = 2;
 
-/*
- * Cross-core flag ids.
- *
- * TWO MAPS SHARE THIS RANGE, and they are disjoint by kernel rather than by
- * value.  The lockstep pair below is what TurboQuantFp16DecodeSplit and
- * TurboQuantCubeGemmProbe still use; the pipelined map is
- * TurboQuantCubeDecodeSplit's alone.  No launch runs both, so the overlap at 0
- * and 1 is a reuse and not a collision -- but it is the reason neither map may
- * be renumbered without reading the other.
- *
- * Ids 11..14 belong to CANN's own SyncAll (SYNC_AIC_FLAG, SYNC_AIV_FLAG,
- * SYNC_AIC_AIV_FLAG, SYNC_AIV_ONLY_ALL in
- * dav_3510/kernel_operator_sync_impl.h) and GetffstMsg masks the id to four
- * bits, so 0..7 is the whole range these kernels may spend.  The pipelined map
- * spends seven of the eight.
- */
-constexpr uint16_t kFlagOperandsReady = 0;  // lockstep, AIV -> AIC
-constexpr uint16_t kFlagProductReady = 1;   // lockstep, AIC -> AIV
+constexpr uint16_t kFlagOperandsReady = 0;
+constexpr uint16_t kFlagProductReady = 1;
 
-/*
- * The pipelined map.  Lockstep needed only two ids because each side's wait for
- * the other was ALSO what kept it off the buffer the other was still using.
- * Double-buffering removes that accident, so the reverse edge has to be named
- * (kFlagSlotFree), and so does the one ordering that used to be implicit:
- *
- *   kFlagProbsReady  the probability row of tile i is staged in A1Probs.  In
- *                    the lockstep loop the AIV's V-unpack sat between the
- *                    softmax and the context GEMM, so the operands-ready flag
- *                    that guarded the V staging guarded the probabilities too.
- *                    The pipelined loop stages V a whole tile earlier, which
- *                    dissolves that ordering -- without this flag the Cube
- *                    multiplies the PREVIOUS tile's probability row and nothing
- *                    faults.
- *
- * The two product edges are split into one id each rather than one id posted
- * twice.  They alternate strictly, so a single counting id would also be
- * correct; two make the AIC's stall point legible in a flag dump.
- */
-constexpr uint16_t kFlagSlotReady = 0;     // 0, 1  AIV -> AIC, K and V of a tile are in L1[slot]
-constexpr uint16_t kFlagSlotFree = 2;      // 2, 3  AIC -> AIV, MTE1 has drained L1[slot] into L0B
-constexpr uint16_t kFlagScoresReady = 4;   //       AIC -> AIV
-constexpr uint16_t kFlagContextReady = 5;  //       AIC -> AIV
-constexpr uint16_t kFlagProbsReady = 6;    //       AIV -> AIC
+constexpr uint16_t kFlagSlotReady = 0;
+constexpr uint16_t kFlagSlotFree = 2;
+constexpr uint16_t kFlagScoresReady = 4;
+constexpr uint16_t kFlagContextReady = 5;
+constexpr uint16_t kFlagProbsReady = 6;
 
-// The operand type for a mode, as a C++ type.  fp4x2_e2m1_t names a *pair* of
-// fp4 values, so size fp4 buffers through TurboQuantModeCodec::OperandElems and
-// never through the head size.
 template <TurboQuantMode MODE>
 struct TurboQuantOperandType;
 
@@ -106,65 +55,22 @@ struct TurboQuantOperandType<TurboQuantMode::KV5_FP8> {
     using Type = fp8_e4m3fn_t;
 };
 
-/*
- * The Cube stage for one mode.  Owns L1 on both halves of the MIX kernel and
- * L0A, L0B and L0C on the AIC alone -- see Init, where that split is not a
- * micro-optimisation; the AIV's unpack buffers belong to the codec, and the two
- * halves meet at StageA/StageB (UB -> L1, an AIV-side MTE3) and at the Fixpipe
- * (L0C -> UB).
- *
- *   maxM   rows of the A operand, i.e. the GQA group padded to kCubeTileM
- *   maxN   columns of the B operand; kTileRows for the score GEMM and head_size
- *          for the context GEMM, so this is sized off the larger
- *   maxK   the reduction length; head_size for scores, kTileRows for context
- */
 template <TurboQuantMode MODE>
 class TurboQuantCubeMm {
 public:
     using OperandT = typename TurboQuantOperandType<MODE>::Type;
     static constexpr bool kIsFp4 = TurboQuantModeTraits<MODE>::kOperand == TurboQuantOperand::kFp4E2m1;
 
-    // Operand elements for `n` logical coordinates.  fp4 packs two per element.
     __aicore__ static constexpr uint32_t OperandElems(uint32_t n) { return kIsFp4 ? n / 2 : n; }
 
-    /*
-     * headSize   the reduction length of the score GEMM and the width of the
-     *            context GEMM; a power of two in [64, 256]
-     * tileRows   K/V rows per tile; the width of the score GEMM and the
-     *            reduction length of the context GEMM
-     */
     __aicore__ inline void Init(AscendC::TPipe *pipe, uint32_t headSize, uint32_t tileRows)
     {
         headSize_ = headSize;
         tileRows_ = tileRows;
 
-        // Two A1 buffers -- the query and the probability row, both live at
-        // once -- and FOUR B1 buffers: K and V, each ping-ponged across kSlots.
-        //
-        // K and V need separate buffers, not one reused within a tile, because
-        // the pipelined loop stages both halves of tile i + 1 in a single burst
-        // while the Cube still has tile i's K in flight; and each needs kSlots
-        // of them because that burst runs against the Cube's GEMMs on tile i.
-        // See PipelineAiv in turboquant_mm_kernels.cpp.
-        //
-        // L1 RESIDENCY, worst case (head_size 256, fp8 operand, tileRows 64):
-        //   aQ1_        16 * 256            =   4096 B
-        //   aP1_        16 *  64            =   1024 B
-        //   bK1_, bV1_  4 * 64 * 256        =  65536 B
-        //                                     -------
-        //                                      70656 B, ~69 KiB
-        // The lockstep form spent 21504 B, so one tile of lookahead costs
-        // +48 KiB; kv3fp4 halves the B and query figures again, since fp4x2
-        // packs two coordinates per element.  head_size is capped at 256 and
-        // tileRows is the fixed kCubeTileRows, so 70656 B is the ceiling for
-        // every shape this kernel accepts -- comfortably inside any arch35 L1,
-        // but the figure is written out so a future tileRows or head_size
-        // change is checked against it rather than assumed to fit.
         const uint32_t qBytes = kCubeTileM * OperandElems(headSize_);
         const uint32_t pBytes = kCubeTileM * OperandElems(tileRows_);
         const uint32_t bBytes = tileRows_ * OperandElems(headSize_);
-        // L1 on both halves of the MIX kernel: the AIV stages into these and
-        // the AIC reads them.
         pipe->InitBuffer(aQ1_, qBytes);
         pipe->InitBuffer(aP1_, pBytes);
         for (uint32_t slot = 0; slot < kSlots; ++slot) {
@@ -172,66 +78,26 @@ public:
             pipe->InitBuffer(bV1_[slot], bBytes);
         }
 
-        // L0 on the AIC alone.  A vector core has no L0A, L0B or L0C, so an
-        // unconditional InitBuffer here hands the AIV tensors whose base is not
-        // an address it can reach; the part reports the first touch as
-        // `pem_lsu: unrecognize ldst addr` with `ldst_addr: 2` and the whole
-        // decode stalls there.  Nothing on the AIV side reads these -- LoadA,
-        // LoadBFrom*, and Compute all run under ASCEND_IS_AIC at their call
-        // sites -- so leaving them unallocated on that core costs nothing.
         if ASCEND_IS_AIC {
             pipe->InitBuffer(a2_, qBytes > pBytes ? qBytes : pBytes);
-            // L0B holds the [k, n] form's chunks end to end: ceil(k/16)/2 of
-            // them, each ceil(n/16) * 16 * 32 elements. For the shapes here
-            // that is the same bBytes the tile occupies, but it is written out
-            // rather than assumed because the chunking rounds k up to a
-            // multiple of 32.
             pipe->InitBuffer(b2_, bBytes);
-            // L0C carries [kCubeTileM, headSize] fp32, which also covers
-            // [kCubeTileM, tileRows] since tileRows <= headSize on every shape
-            // here.
             pipe->InitBuffer(co1_, kCubeTileM * headSize_ * sizeof(float));
         }
     }
 
-    // AIV side: the three L1 landing buffers, exposed so the caller can place
-    // into them with whatever DataCopy stride it needs.  Everything written
-    // here must already be in NZ order, and the writes are MTE3 from the vector
-    // core's point of view, so the flag that follows them is set on PIPE_MTE3.
     __aicore__ inline AscendC::LocalTensor<OperandT> A1Query() { return aQ1_.template Get<OperandT>(); }
     __aicore__ inline AscendC::LocalTensor<OperandT> A1Probs() { return aP1_.template Get<OperandT>(); }
-    // The K and V landing buffers of one ping-pong slot.
     __aicore__ inline AscendC::LocalTensor<OperandT> B1K(uint32_t slot) { return bK1_[slot].template Get<OperandT>(); }
     __aicore__ inline AscendC::LocalTensor<OperandT> B1V(uint32_t slot) { return bV1_[slot].template Get<OperandT>(); }
-    // The single B operand the lockstep callers stage into.  Slot 0's K buffer
-    // by construction: they run one GEMM at a time and never ping-pong.
     __aicore__ inline AscendC::LocalTensor<OperandT> B1() { return B1K(0); }
 
-    // The NZ position of logical coordinate (r, c) in a `rows` x `cols` tile,
-    // transcribed from TransND2NZ in
-    // .../impl/basic_api/dav_3510/kernel_operator_data_copy_impl.h.  The host
-    // mirror is turboquant_host::NzOffset and a test pins the two together.
     __aicore__ static constexpr uint32_t NzOffset(uint32_t r, uint32_t c, uint32_t rows)
     {
         return (c / kOperandC0) * rows * kOperandC0 + r * kOperandC0 + (c % kOperandC0);
     }
 
-    // Elements of OperandT in one C0 block: 32 bytes over the element size, so
-    // 32 for fp8 and 32 fp4-pairs (64 fp4 coordinates) for fp4.
     static constexpr uint32_t kOperandC0 = 32;
 
-    /*
-     * AIC side, GEMM 1: scores[m, n] = Q[m, k] . K[n, k]^T, fp32 accumulate.
-     * K is staged as [n, k], which loads with one LoadData at ifTranspose
-     * false.  See LoadBFromNk.
-     *
-     * VERIFIED: test_sim_950pr_cube_gemm reports max|err| = 0 for this form.
-     * An earlier note here claimed it did not reproduce the host product and
-     * prescribed staging K transposed; that was the all-zero product caused by
-     * the missing V -> MTE3 handshake on the UB -> L1 staging (see
-     * SyncVectorToMte3), which is indistinguishable from a wrong fractal layout
-     * because nothing faults.  Both B forms were correct the whole time.
-     */
     __aicore__ inline void GemmScores(const AscendC::LocalTensor<float> &dstUb,
                                       const AscendC::LocalTensor<OperandT> &bL1, uint32_t m, uint32_t k, uint32_t n)
     {
@@ -242,9 +108,6 @@ public:
         Compute(dstUb, m, k, n);
     }
 
-    // AIC side, GEMM 2: ctx[m, n] = P[m, k] . V[k, n], fp32 accumulate.  V is
-    // staged as [k, n], which for the B operand needs ifTranspose true and, for
-    // an 8-bit type, a loop.  See LoadBFromKn.
     __aicore__ inline void GemmContext(const AscendC::LocalTensor<float> &dstUb,
                                        const AscendC::LocalTensor<OperandT> &bL1, uint32_t m, uint32_t k, uint32_t n,
                                        uint32_t variant = 0)
@@ -257,31 +120,8 @@ public:
     }
 
 private:
-    /*
-     * THE FRACTAL CONTRACT for LoadData2DParamsV2, transcribed from
-     *
-     *   .../impl/adv_api/detail/matmul/stage/split/load_to_l0a/load_to_l0a_load2dV2.h
-     *   .../impl/adv_api/detail/matmul/stage/split/load_to_l0b/load_to_l0b_load2dV2.h
-     *
-     * and pinned numerically by csrc/tests/sim/test_sim_950pr_cube_gemm.cpp.
-     *
-     *   * mStep counts 16-row fractals; kStep counts C0 elements, and C0 is 32
-     *     for every 8-bit type (AuxGetC0Size), not 64.
-     *   * srcStride and dstStride are not optional.  srcStride is the L1
-     *     matrix's leading extent over 16 and dstStride is the L0 fragment's
-     *     over 16; zero for either silently reads the wrong fractals.
-     *   * ifTranspose on the B operand means the opposite of what it reads as.
-     *     B staged [n, k] loads with ifTranspose FALSE; B staged [k, n] loads
-     *     with ifTranspose TRUE.
-     *   * an 8-bit B operand in the [k, n] orientation must be loaded in
-     *     mStep = 2 chunks; a single call with mStep = 4 raises
-     *     mte_instr_addr_misalign.
-     */
     static constexpr uint16_t kFractalRows = 16;
-    // C0 elements of an 8-bit Cube operand. fp4 packs two per element, so a
-    // LocalTensor<fp4x2> of C0 elements covers 2 * C0 coordinates.
     static constexpr uint16_t kC0 = 32;
-    // The only mStep an 8-bit [k, n] B operand accepts.
     static constexpr uint16_t kB8MStep = 2;
 
     __aicore__ static constexpr uint16_t CeilDivU16(uint32_t a, uint32_t b)
@@ -289,7 +129,6 @@ private:
         return static_cast<uint16_t>((a + b - 1) / b);
     }
 
-    // A is [m, k] in L1; L0A wants [m, k]. Straight load.
     __aicore__ inline void LoadA(uint32_t m, uint32_t k)
     {
         AscendC::LocalTensor<OperandT> ta1 = aActive_;
@@ -305,7 +144,6 @@ private:
         AscendC::LoadData(ta2, ta1, p);
     }
 
-    // B is [n, k] in L1. One load, no loop, ifTranspose false.
     __aicore__ inline void LoadBFromNk(uint32_t k, uint32_t n)
     {
         AscendC::LocalTensor<OperandT> tb1 = bActive_;
@@ -321,15 +159,6 @@ private:
         AscendC::LoadData(tb2, tb1, p);
     }
 
-    /*
-     * B is [k, n] in L1, loaded with ifTranspose true and, for an 8-bit
-     * operand, in mStep = 2 chunks.
-     *
-     * `variant` exists so test_sim_950pr_cube_gemm can sweep the parameters
-     * this transcription is uncertain about rather than assert a guess; 0 is
-     * the shipping path and the only one production ever passes. See the
-     * variant table in that test.
-     */
     __aicore__ inline void LoadBFromKn(uint32_t k, uint32_t n, uint32_t variant = 0)
     {
         AscendC::LocalTensor<OperandT> tb1 = bActive_;
@@ -343,8 +172,6 @@ private:
 
         const uint16_t mSteps = CeilDivU16(k, kFractalRows);
 
-        // Variant 7: no chunking at all -- one call at the full mStep. The b8
-        // restriction this loop exists for may not apply on every CANN.
         if (variant == 7) {
             p.mStartPosition = 0;
             p.mStep = mSteps;
@@ -352,13 +179,10 @@ private:
             return;
         }
 
-        // CANN's dstAddrStride is CeilAlign(madN, ALIGN_NUM) * ONE_BLK_SIZE,
-        // and CeilAlign rounds UP to a multiple, so at n = 256 that is
-        // 256 * 32 = 8192 elements -- exactly one chunk's k-rows x n.
         uint32_t dstStrideElems =
             static_cast<uint32_t>(CeilDivU16(n, kFractalRows)) * kFractalRows * kC0;
         if (variant == 1) {
-            dstStrideElems /= kC0;  // the same figure read as 32-byte blocks
+            dstStrideElems /= kC0;
         } else if (variant == 2) {
             dstStrideElems = static_cast<uint32_t>(CeilDivU16(n, kFractalRows)) * kC0;
         }
@@ -370,24 +194,6 @@ private:
         for (uint16_t i = 0; i < loops; ++i) {
             p.mStartPosition = static_cast<uint32_t>(kB8MStep) * i;
             AscendC::LoadData(tb2[dstOffset], tb1, p);
-            /*
-             * An MTE1 -> M set/wait after EVERY chunk, and it is not redundant
-             * with the one Compute issues.
-             *
-             * Compute's single set/wait is enough on the first Cube GEMM of a
-             * process and not on the ones after it: with a dirty event state
-             * left by an earlier launch, the Mmad issues against an L0B whose
-             * second chunk LoadData has not finished writing, and reads zeros
-             * there. The failure is total rather than partial -- the whole
-             * product comes back zero -- which is what makes it read as a
-             * layout error rather than a race.
-             *
-             * Measured by test_sim_950pr_cube_gemm's LoadBFromKnVariantSweep:
-             * with this sync the context GEMM is exact at every position in the
-             * launch order; without it, exact only when it runs first. Variant 4
-             * of that sweep is this path without the sync, kept so the pair can
-             * be re-measured.
-             */
             if (variant != 4) {
                 const event_t ev = static_cast<event_t>(pipe->FetchEventID(AscendC::HardEvent::MTE1_M));
                 AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(ev);
@@ -400,20 +206,12 @@ private:
         }
     }
 
-    /*
-     * cmatrixInitVal is always true: every call starts a fresh product, because
-     * the accumulator lives in UB (see the file header) rather than in L0C.
-     */
     __aicore__ inline void Compute(const AscendC::LocalTensor<float> &dstUb, uint32_t m, uint32_t k, uint32_t n)
     {
         AscendC::LocalTensor<OperandT> ta2 = a2_.template Get<OperandT>();
         AscendC::LocalTensor<OperandT> tb2 = b2_.template Get<OperandT>();
         AscendC::LocalTensor<float> tco = co1_.template Get<float>();
 
-        // Cross-pipe synchronisation, and it is not optional: PipeBarrier<MTE1>
-        // orders MTE1 against MTE1 and says nothing about the M pipe, so
-        // without these the Mmad reads an L0A/L0B that LoadData is still
-        // filling.  Same for M -> FIX.
         AscendC::TPipe *pipe = GetTPipePtr();
         const event_t mte1ToM = static_cast<event_t>(pipe->FetchEventID(AscendC::HardEvent::MTE1_M));
         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(mte1ToM);
@@ -427,9 +225,6 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::M_FIX>(mToFix);
         AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(mToFix);
 
-        // dstStride is the UB row pitch in elements, i.e. n.  srcStride is m
-        // rounded UP to a multiple of 16 -- not m over 16, which is the
-        // convention LoadData uses two lines earlier.
         AscendC::Fixpipe<float, float, kFixpipeToUb>(
             dstUb, tco,
             AscendC::FixpipeParamsC310<AscendC::CO2Layout::ROW_MAJOR>(
@@ -452,7 +247,7 @@ private:
     uint32_t tileRows_ = 0;
 };
 
-}  // namespace turboquant
-}  // namespace vllm_ascend
+}
+}
 
-#endif  // VLLM_ASCEND_ATTENTION_TURBOQUANT_CUBE_MM_H
+#endif

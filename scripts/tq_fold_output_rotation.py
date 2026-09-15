@@ -68,17 +68,10 @@ CONFIG_NAME = "config.json"
 SAFETENSORS_INDEX_NAME = "model.safetensors.index.json"
 SAFETENSORS_SUFFIX = ".safetensors"
 
-# <module prefix>.o_proj.weight, where the prefix ends in self_attn. The prefix
-# is what the marker records and what the backend matches vLLM's layer name to.
 O_PROJ_WEIGHT_PATTERN = re.compile(r"^(?P<prefix>.*\bself_attn)\.o_proj\.weight$")
 O_PROJ_ALLOWED_SUFFIXES = ("weight", "bias")
 
-# Model types whose attention output reaches o_proj directly. Not a list of
-# what TurboQuant supports -- a list of what this tool has checked has no
-# operation between the attention and the projection.
 UNGATED_MODEL_TYPES = frozenset({"llama", "mistral", "mixtral", "qwen2", "qwen2_moe", "qwen3", "qwen3_moe"})
-# Model types whose attention applies an elementwise output gate when the
-# config does not say otherwise (vLLM reads attn_output_gate with default True).
 GATED_BY_DEFAULT_MODEL_TYPES = frozenset({"qwen3_next", "qwen3_5", "qwen3_5_moe"})
 
 
@@ -264,8 +257,6 @@ def main(argv: list[str]) -> int:
     try:
         return fold_checkpoint(parse_args(argv, rotation), rotation)
     except (FoldRefused, ValueError) as refusal:
-        # ValueError is the fold helper refusing a weight it cannot rotate
-        # exactly (a non-float dtype, a width that is not whole heads).
         print(f"refused: {refusal}", file=sys.stderr)
         return 2
 

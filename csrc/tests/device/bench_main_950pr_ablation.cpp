@@ -14,23 +14,6 @@
  * limitations under the License.
  */
 
-// Entry point for bench_device_950pr_turboquant_ablation, and the only reason it
-// is not common/bench_main_950pr.cpp: a suspect stage has to be runnable alone,
-// in its own process, and the deadline on its first launch has to be settable,
-// so the binary takes
-//
-//   --stage=<list>          stages to run, in order, e.g. --stage=4 or --stage=0,1,2
-//   --sync-timeout-ms=<ms>  deadline for each stage's first launch; 0 waits forever
-//
-// Each flag is translated into the environment variable the suite reads, the way
-// bench_main_950pr_hadamard.cpp does for --csv=, so the command line and the
-// environment cannot disagree. Unlike the environment, a malformed flag is an
-// error rather than a fallback: --stage=4x silently running all six stages would
-// relaunch the stage it was meant to isolate.
-//
-// Everything else - the banner, the SoC check and the camodel refusal - is the
-// shared entry point's behaviour, restated because it has no argv overload.
-
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -43,19 +26,17 @@ namespace vllm_ascend {
 namespace test {
 namespace bench {
 
-// Defined by bench_device_950pr_turboquant_ablation.cpp.
 extern const char* kSuiteName;
 void BuildSuite(BenchmarkRunner& runner);
 
-}  // namespace bench
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}
 
 namespace {
 
 constexpr const char* kStageFlag = "--stage=";
 constexpr const char* kTimeoutFlag = "--sync-timeout-ms=";
-// DecodeAblationStage runs 0..5; see attention/turboquant/turboquant_mode.h.
 constexpr char kLastStageDigit = '5';
 constexpr size_t kMaxTimeoutDigits = 9;
 constexpr int kUsageExitCode = 2;
@@ -74,7 +55,6 @@ void PrintUsage(const char* argv0) {
               argv0);
 }
 
-// Single digits 0..5 separated by single commas.
 bool IsStageList(const std::string& value) {
   if (value.empty()) {
     return false;
@@ -94,7 +74,7 @@ bool IsTimeout(const std::string& value) {
          value.find_first_not_of("0123456789") == std::string::npos;
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {

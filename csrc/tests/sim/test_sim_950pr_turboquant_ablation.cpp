@@ -14,57 +14,6 @@
  * limitations under the License.
  */
 
-// Camodel smoke of the decode ablation ladder: every DecodeAblationStage of the
-// kv4fp8 Cube split, dispatched in turn in one process.
-//
-// The cut kernels compile cross-core flags and barriers out in pairs. A pair
-// removed on one side and not the other does not fault, it hangs -- and on
-// silicon it hangs with nothing in the log. The benchmark
-// (device/bench_device_950pr_turboquant_ablation.cpp) refuses the camodel, so
-// this is the only place a cut kernel runs before the part does.
-//
-// THE SHAPE: B = 1, 8 query heads over 2 kv heads (the production group of 4),
-// head_size 256, block_size 64, S = 256.
-//
-//   block_size 64   the smallest block CopyInTile supports -- it reads a whole
-//                   kCubeTileRows = 64 rows per tile -- so every tile is also a
-//                   block and NextTile's block walk runs on every tile.
-//   S = 256         four tiles in ONE split. The split count is pinned to 1 so
-//                   the tiles are not spread across tasks. Four is the smallest
-//                   tile count at which every flag id the pipelined loop spends
-//                   fires: the L1 slots wrap at tile 2, and kFlagSlotFree fires
-//                   for slot 0 at tile 0 and for slot 1 at tile 1. Three tiles
-//                   never frees slot 1.
-//
-// WHAT IS ASSERTED, per stage, in launch order:
-//
-//   exits       the launch returns and the stream synchronises within the
-//               per-stage budget. A stage that does not is named and the
-//               process exits kHangExitCode: a deadlocked stream cannot be
-//               recovered for the stages after it.
-//   no dumps    no core*excp_log*.dump in the cwd holds a byte. Whether the
-//               camodel writes those as it goes or only at exit is not something
-//               this file can know, so the run script's census after exit is
-//               the authoritative one; this per-stage figure attributes only what
-//               it can see.
-//   untouched   stages 0-4: the partial workspace -- the split's only GM output
-//               -- still holds the sentinel it was filled with.
-//   fidelity    stage 5: every partial was written, and split plus combine track
-//               an fp32 host attention at cos > kSmokeCos.
-//
-// Nothing here is a timing. The per-stage durations printed are camodel wall
-// clock, there to tell a slow stage from a stuck one.
-//
-// Knobs:
-//   ASCEND_TQ_ABLATION_STAGES=0,4,5          stages to dispatch, in that order (default 0..5)
-//   ASCEND_TQ_ABLATION_CONTEXT=192           context, a positive multiple of 64 (default 256)
-//   ASCEND_TQ_ABLATION_STAGE_TIMEOUT_S=3600  per-launch hang budget in seconds (default 5400)
-//   ASCEND_TQ_ABLATION_HOST_FILL=1           fill the packed cache from the host instead of
-//                                            launching the write, which is 20 minutes of
-//                                            camodel at S = 256. The flag protocol does not
-//                                            read the values; stage 5's cosine is then not
-//                                            checked.
-
 #include <dirent.h>
 #include <sys/stat.h>
 
@@ -102,28 +51,19 @@ constexpr int64_t kBatch = 1;
 constexpr int64_t kNumHeads = 8;
 constexpr int64_t kNumKvHeads = 2;
 constexpr int64_t kHeadSize = 256;
-constexpr int64_t kBlockSize = tqh::kCubeTileRows;  // 64
+constexpr int64_t kBlockSize = tqh::kCubeTileRows;
 constexpr int64_t kPoolFactor = 4;
-constexpr float kInvSqrtHeadSize = 0.0625f;  // 1 / sqrt(256), exact in fp32
+constexpr float kInvSqrtHeadSize = 0.0625f;
 constexpr float kAttentionScale = kInvSqrtHeadSize;
 
 constexpr int64_t kDefaultContextLen = 256;
 constexpr int64_t kDefaultStageTimeoutSeconds = 5400;
 
-// The multimode test's structural bound: kv4fp8 measures 0.986 at S = 64, and a
-// transposed operand or a mis-staged row lands near zero.
 constexpr double kSmokeCos = 0.90;
 
-// Filled into every workspace word before a launch. No partial the split writes
-// can equal it: the accumulator is a weighted sum of unit-scale values, and the
-// tail is a running max and sum of probabilities.
 constexpr float kWorkspaceSentinel = -1234.5f;
 
-// Distinct from gtest's 1 and from timeout(1)'s 124, so the run script can say
-// which of the three ended the process.
 constexpr int kHangExitCode = 3;
-
-// --- knobs ------------------------------------------------------------------
 
 std::vector<int64_t> IntListFromEnv(const char* name) {
   std::vector<int64_t> parsed;
@@ -187,8 +127,6 @@ bool HostFillRequested() {
   return raw != nullptr && raw[0] == '1';
 }
 
-// Deterministic bytes for a host-filled packed cache. Any byte is two valid
-// 4-bit codes, so the unpack sees the kind of input the encoder writes.
 std::vector<int8_t> PseudoRandomBytes(size_t count, uint32_t seed) {
   std::vector<int8_t> bytes(count);
   uint32_t state = seed;
@@ -199,11 +137,6 @@ std::vector<int8_t> PseudoRandomBytes(size_t count, uint32_t seed) {
   return bytes;
 }
 
-// --- hang detection ------------------------------------------------------------
-
-// Armed around one launch and its synchronise. If it is not disarmed within the
-// budget it names the launch and ends the process, because the thread that
-// would record a gtest failure is the one blocked in aclrtSynchronizeStream.
 class LaunchWatchdog {
  public:
   explicit LaunchWatchdog(int64_t budget_seconds) : budget_(budget_seconds), thread_([this] { Watch(); }) {}
@@ -264,11 +197,8 @@ class LaunchWatchdog {
   bool armed_ = false;
   bool stop_ = false;
   uint64_t generation_ = 0;
-  // Last, so everything Watch() touches is constructed before it starts.
   std::thread thread_;
 };
-
-// --- camodel exception dumps -------------------------------------------------
 
 struct DumpCensus {
   size_t files = 0;
@@ -276,7 +206,6 @@ struct DumpCensus {
   uint64_t bytes = 0;
 };
 
-// The camodel's exception dumps in the process cwd: core<N>...excp_log...dump.
 DumpCensus ExceptionDumps() {
   DumpCensus census;
   DIR* dir = opendir(".");
@@ -303,8 +232,6 @@ DumpCensus ExceptionDumps() {
   return census;
 }
 
-// --- the host reference ---------------------------------------------------------
-
 double Cosine(const std::vector<float>& a, const std::vector<float>& b) {
   double dot = 0.0;
   double na = 0.0;
@@ -320,10 +247,6 @@ double Cosine(const std::vector<float>& a, const std::vector<float>& b) {
   return dot / (std::sqrt(na) * std::sqrt(nb));
 }
 
-// fp32 attention for one decode token over the unquantised context. Same
-// computation as HostAttention in test_sim_950pr_turboquant_multimode.cpp at
-// B = 1: no rotation and no codec, so agreeing with it says the whole pipeline
-// is right rather than one stage of it.
 std::vector<float> HostAttention(int64_t context_len, const std::vector<float>& query, const std::vector<float>& key,
                                  const std::vector<float>& value) {
   std::vector<float> out(static_cast<size_t>(kNumHeads * kHeadSize), 0.0f);
@@ -389,12 +312,8 @@ TEST(TurboQuantDecodeAblation, CutStagesExitCleanOnTheCamodel) {
   bool queried = false;
   const int64_t aiv_num = tqh::VectorCoreNum(&queried);
   const tqh::ReshapeAndCacheGrid write_grid = tqh::PlanReshapeAndCache(context_len, aiv_num);
-  // max_blocks_per_seq = 1 here is what caps PlanCubeDecode's split count at
-  // one. The kernel is still handed the real blocks_per_seq below; at B = 1 it
-  // only ever indexes row 0 of the block table, so the planner's argument
-  // changes the grid and nothing else.
   const tqh::CubeDecodeGrid grid =
-      tqh::PlanCubeDecode(kBatch, kNumHeads, kNumKvHeads, kHeadSize, /*max_blocks_per_seq=*/1, aiv_num);
+      tqh::PlanCubeDecode(kBatch, kNumHeads, kNumKvHeads, kHeadSize, 1, aiv_num);
   ASSERT_EQ(grid.num_splits, 1) << "the smoke needs every tile in one split";
 
   std::printf("[ ablation ] tier=%s mode=kv4fp8 B=%lld heads=%lld kv_heads=%lld head_size=%lld block=%lld S=%lld\n",
@@ -421,7 +340,7 @@ TEST(TurboQuantDecodeAblation, CutStagesExitCleanOnTheCamodel) {
   DeviceBuffer context_dev = DeviceBuffer::FromHost(std::vector<int32_t>(1, static_cast<int32_t>(context_len)));
   DeviceBuffer pi_signs = DeviceBuffer::FromHost(tqh::PiSigns(kHeadSize));
   DeviceBuffer rot_tables = DeviceBuffer::FromHost(tqh::CodecTables(kHeadSize, 1));
-  DeviceBuffer write_tables = DeviceBuffer::FromHost(tqh::ModeTables(kMode, kHeadSize, 1, /*nz_rows=*/0));
+  DeviceBuffer write_tables = DeviceBuffer::FromHost(tqh::ModeTables(kMode, kHeadSize, 1, 0));
   DeviceBuffer decode_tables =
       DeviceBuffer::FromHost(tqh::ModeTables(kMode, kHeadSize, tqh::kUnpackRows, tqh::kCubeTileRows));
   const bool host_fill = HostFillRequested();
@@ -461,16 +380,12 @@ TEST(TurboQuantDecodeAblation, CutStagesExitCleanOnTheCamodel) {
 
   const std::vector<float> reference = HostAttention(context_len, query, key, value);
 
-  // The rotation is outside the ladder: every rung consumes the same
-  // pre-rotated query, so no rung's delta carries any part of it. That is the
-  // change this ladder now measures the absence of -- stage 2 used to be the
-  // Pi transform and is now the read and the operand scaling alone.
   DeviceBuffer h16 = DeviceBuffer::FromHost(tqh::Hadamard16Half());
   DeviceBuffer query_rot = DeviceBuffer::Empty<float>(static_cast<size_t>(kBatch) * kNumHeads * kHeadSize);
   watchdog.Arm("the query rotation");
   const vllm_ascend::turboquant::RotateQPlan rotate_plan =
       tqh::RotateQuery(stream, AscendType::FP16, query_dev.get(), pi_signs.get(), h16.get(), rot_tables.get(),
-                       query_rot.get(), kBatch, kNumHeads, kHeadSize, aiv_num, /*input_exact_in_half=*/true);
+                       query_rot.get(), kBatch, kNumHeads, kHeadSize, aiv_num, true);
   ACL_CHECK(aclrtSynchronizeStream(stream));
   watchdog.Disarm();
   std::printf("[ ablation ] query rotated once for every stage: %s path, %u blocks x %u vectors, chunk %u\n",
@@ -482,9 +397,6 @@ TEST(TurboQuantDecodeAblation, CutStagesExitCleanOnTheCamodel) {
     const std::string name = tqm::DecodeAblationStageName(stage);
     const bool full = stage == tqm::DecodeAblationStage::STAGE_5_FULL_PIPELINE;
 
-    // Fresh sentinel before every stage, so no stage's check depends on what
-    // ran before it and stage 5's "every partial written" is not satisfied by a
-    // leftover.
     DeviceBuffer workspace = DeviceBuffer::FromHost(sentinel);
 
     std::printf("\n[ ablation ] %s: launching\n", name.c_str());
@@ -528,8 +440,6 @@ TEST(TurboQuantDecodeAblation, CutStagesExitCleanOnTheCamodel) {
     ACL_CHECK(aclrtSynchronizeStream(stream));
     watchdog.Disarm();
 
-    // The combine writes the rotated basis; the folded W_o un-rotates in
-    // production and UnrotateHeads does it here.
     const std::vector<float> output = tqh::UnrotateHeads(HalfToFloat(out.ToHost<Half>()), kHeadSize);
     size_t finite = 0;
     double abs_sum = 0.0;
@@ -549,6 +459,6 @@ TEST(TurboQuantDecodeAblation, CutStagesExitCleanOnTheCamodel) {
   }
 }
 
-}  // namespace
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}

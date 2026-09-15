@@ -14,28 +14,6 @@
  * limitations under the License.
  */
 
-// Entry point for bench_950pr_cube_hadamard, and the only reason it is not
-// common/bench_main_950pr.cpp: this sweep is meant to be plotted, so it takes
-// --csv=<path> on the command line and writes a CSV by default rather than only
-// when ASCEND_BENCH_CSV is set.
-//
-// The flag is translated into that same environment variable before the suite
-// runs, because BenchmarkOptions::FromEnvironment is what the shared harness
-// reads and adding an argv path to it would change every other benchmark's
-// interface for one binary's convenience.
-//
-// Precedence, most specific first:
-//
-//   --csv=<path>     writes there
-//   --csv=           writes nothing; the escape hatch for a run that only wants
-//                    the table on stdout
-//   ASCEND_BENCH_CSV honoured when no flag is given, as everywhere else
-//   neither          hadamard_benchmark_results.csv in the working directory
-//
-// Everything else - the banner, the SoC check and the camodel refusal - is the
-// shared entry point's behaviour, restated rather than shared because there is
-// no argv-taking overload of it.
-
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -48,13 +26,12 @@ namespace vllm_ascend {
 namespace test {
 namespace bench {
 
-// Defined by bench_950pr_cube_hadamard.cpp.
 extern const char* kSuiteName;
 void BuildSuite(BenchmarkRunner& runner);
 
-}  // namespace bench
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}
 
 namespace {
 
@@ -75,7 +52,7 @@ void PrintUsage(const char* argv0) {
       argv0, kDefaultCsvPath);
 }
 
-}  // namespace
+}
 
 int main(int argc, char** argv) {
   bool csv_from_flag = false;
@@ -98,8 +75,6 @@ int main(int argc, char** argv) {
   }
 
   if (csv_from_flag) {
-    // An empty --csv= clears whatever the environment asked for, which is what
-    // makes it an off switch rather than a no-op.
     ::setenv("ASCEND_BENCH_CSV", csv_path.c_str(), 1);
   } else if (std::getenv("ASCEND_BENCH_CSV") == nullptr) {
     ::setenv("ASCEND_BENCH_CSV", kDefaultCsvPath, 1);

@@ -1904,16 +1904,11 @@ std::tuple<at::Tensor, at::Tensor> situ_mx_quant_meta(
 }
 
 #ifdef VLLM_ENABLE_TURBOQUANT
-// Both TurboQuant ops write through mutable arguments and return nothing, so
-// tracing needs no shape inference -- only a registered kernel.
 void npu_turboquant_reshape_and_cache_meta(at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &,
                                            at::Tensor &, at::Tensor &, at::Tensor &)
 {
 }
 
-// The workspace is scratch the caller owns, so tracing it needs nothing beyond
-// the argument existing: the operator reads none of it and leaves nothing in it.
-// Twelve arguments: pi_signs left the schema with the combine's un-rotation.
 void npu_turboquant_paged_attention_meta(at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &,
                                          at::Tensor &, at::Tensor &, at::Tensor &, int64_t, int64_t, double,
                                          at::Tensor &)

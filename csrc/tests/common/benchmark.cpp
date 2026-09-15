@@ -40,17 +40,11 @@ namespace bench {
 
 namespace {
 
-// ---------------------------------------------------------------------------
-// Environment plumbing
-// ---------------------------------------------------------------------------
-
 std::string EnvironmentString(const char* name) {
   const char* raw = std::getenv(name);
   return (raw != nullptr) ? std::string(raw) : std::string();
 }
 
-// strtol rather than atoi: atoi cannot tell "0" from "banana" and is undefined
-// on a value too large for int, so a typo becomes a plausible configuration.
 int EnvironmentInt(const char* name, int fallback, int minimum, int maximum) {
   const std::string raw = EnvironmentString(name);
   if (raw.empty()) {
@@ -73,7 +67,6 @@ std::vector<std::string> SplitOnCommas(const std::string& value) {
   std::string current;
   std::istringstream stream(value);
   while (std::getline(stream, current, ',')) {
-    // Trim, so "device, host" parses the same as "device,host".
     const size_t first = current.find_first_not_of(" \t");
     const size_t last = current.find_last_not_of(" \t");
     if (first != std::string::npos) {
@@ -83,19 +76,9 @@ std::vector<std::string> SplitOnCommas(const std::string& value) {
   return parts;
 }
 
-// ---------------------------------------------------------------------------
-// Repeatable-executor API, resolved the same way the operators are
-// ---------------------------------------------------------------------------
-
 using SetExecutorRepeatableFn = int (*)(aclOpExecutor*);
 using DestroyExecutorFn = int (*)(aclOpExecutor*);
 
-// VERIFIED against CANN 9.1.0
-// $ASCEND_HOME_PATH/include/aclnn/acl_meta.h:76
-//   aclnnStatus aclSetAclOpExecutorRepeatable(aclOpExecutor *executor);
-//   aclnnStatus aclDestroyAclOpExecutor(aclOpExecutor *executor);
-// Both are exported by libnnopbase.so. Older CANN lines do not have them, which
-// is why PlannedOp has a re-plan fallback.
 struct ExecutorApi {
   SetExecutorRepeatableFn set_repeatable = nullptr;
   DestroyExecutorFn destroy = nullptr;
@@ -113,8 +96,6 @@ struct ExecutorApi {
   }
 };
 
-// Why a repeatable executor was not used, when it was not. Recorded globally
-// because the answer is a property of the CANN build, not of one operator.
 enum class LaunchPath {
   kRepeatable,
   kSymbolAbsent,
@@ -125,9 +106,6 @@ enum class LaunchPath {
 LaunchPath g_launch_path = LaunchPath::kSymbolAbsent;
 bool g_repeatable_allowed = true;
 
-// libopapi.so caches planning scratch per thread when these are called around
-// the work, which is what torch_npu's EXEC_NPU_CMD does. Without them the
-// re-plan fallback pays an allocation per iteration that the plugin would not.
 using InitHugeMemThreadLocalFn = int (*)(void*, bool);
 using UnInitHugeMemThreadLocalFn = void (*)(void*, bool);
 
@@ -155,24 +133,12 @@ struct HugeMemScope {
   HugeMemScope& operator=(const HugeMemScope&) = delete;
 };
 
-// ---------------------------------------------------------------------------
-// Timing events
-// ---------------------------------------------------------------------------
-
-// ACL_EVENT_TIME_LINE is what makes an event carry a device timestamp, and
-// therefore what makes aclrtEventElapsedTime mean anything; ACL_EVENT_SYNC
-// additionally makes it host-waitable. Plain aclrtCreateEvent guarantees
-// neither, and the elapsed time between two untimestamped events is undefined.
 enum class EventTimingSource {
   kTimelineAndSync,
   kTimelineOnly,
   kRuntimeDefault,
 };
 
-// Resolved once per process with a single probe event, so the per-event path is
-// one call that either works or fails loudly. Probing per event would also
-// leave a stale aclGetRecentErrMsg behind every unsupported flag combination,
-// which is exactly the diagnostic a real failure needs to carry.
 EventTimingSource ResolveEventTimingSource() {
   static const EventTimingSource resolved = [] {
     aclrtEvent probe = nullptr;
@@ -210,10 +176,6 @@ aclrtEvent CreateTimingEvent() {
   return event;
 }
 
-// A pool of start/stop event pairs, created before the timed loop and destroyed
-// after it. Creating a fresh pair per iteration keeps the loop free of the
-// re-record semantics aclrtResetEvent exists for, which differ across CANN
-// releases, and event creation is a setup-phase cost either way.
 class EventPool {
  public:
   explicit EventPool(size_t pair_count) : events_(pair_count * 2, nullptr) {
@@ -222,10 +184,6 @@ class EventPool {
         events_[i] = CreateTimingEvent();
       }
     } catch (...) {
-      // A constructor that throws gets no destructor, so the events created
-      // before the failure have to go back here. Without this, a run that hits
-      // the device's event limit part-way through leaks a pool's worth of
-      // events per attempt and every later case fails for the same reason.
       Destroy();
       throw;
     }
@@ -252,23 +210,10 @@ class EventPool {
   std::vector<aclrtEvent> events_;
 };
 
-// An Ascend stream holds a bounded number of submitted tasks; past that the
-// runtime either blocks the host or refuses the submission. At the defaults a
-// pipelined run enqueues 100 * (10 + 2) = 1200 tasks, over the documented 1024,
-// so the timing loops drain at sample boundaries once they get close.
 constexpr int kMaxInFlightTasks = 768;
 
-// Two events bracket a pipelined batch, so this is the largest batch that can
-// be submitted without the runtime blocking the host part-way through a sample.
-// ASCEND_BENCH_BATCH is clamped to it with a warning.
 constexpr int kMaxPipelineBatch = kMaxInFlightTasks - 2;
 
-// Reads the time between two recorded events, in microseconds.
-//
-// Returns false, without throwing, when the runtime hands back something that
-// cannot be a duration: negative, NaN or infinite. Both events are resolved
-// first, so a caller that has lost the stream barrier waits rather than reading
-// a timestamp the device has not written.
 bool ReadElapsedMicroseconds(aclrtEvent start, aclrtEvent stop, double* microseconds) {
   if (ResolveEventTimingSource() != EventTimingSource::kTimelineOnly) {
     ACL_CHECK(aclrtSynchronizeEvent(start));
@@ -278,9 +223,6 @@ bool ReadElapsedMicroseconds(aclrtEvent start, aclrtEvent stop, double* microsec
   float milliseconds = 0.0f;
   ACL_CHECK(aclrtEventElapsedTime(&milliseconds, start, stop));
 
-  // Widen before the scale, and stay in double from here to the report: the
-  // conversion never passes through a narrower integer, which is the other way
-  // a long sample comes out negative.
   const double elapsed_us = static_cast<double>(milliseconds) * 1000.0;
   if (!std::isfinite(elapsed_us) || elapsed_us < 0.0) {
     return false;
@@ -288,10 +230,6 @@ bool ReadElapsedMicroseconds(aclrtEvent start, aclrtEvent stop, double* microsec
   *microseconds = elapsed_us;
   return true;
 }
-
-// ---------------------------------------------------------------------------
-// Output verification
-// ---------------------------------------------------------------------------
 
 void CheckChecksum(const BenchmarkCase& benchmark_case, double after_warmup, double after_timing) {
   if (!std::isfinite(after_timing)) {
@@ -310,11 +248,7 @@ void CheckChecksum(const BenchmarkCase& benchmark_case, double after_warmup, dou
   }
 }
 
-}  // namespace
-
-// ---------------------------------------------------------------------------
-// BenchmarkOptions
-// ---------------------------------------------------------------------------
+}
 
 const char* TimingModeLabel(TimingMode mode) {
   switch (mode) {
@@ -342,9 +276,6 @@ const char* EventTimingSourceLabel() {
 
 BenchmarkOptions BenchmarkOptions::FromEnvironment() {
   BenchmarkOptions options;
-  // An upper bound on the loop counts as well as a lower one: the event pool a
-  // timed loop builds is two events per iteration, so an ASCEND_BENCH_ITERS
-  // with an extra digit in it is a typo and not a sweep.
   constexpr int kMaxIterationCount = 1000000;
   options.warmup_iterations =
       EnvironmentInt("ASCEND_BENCH_WARMUP", options.warmup_iterations, 0, kMaxIterationCount);
@@ -381,16 +312,9 @@ BenchmarkOptions BenchmarkOptions::FromEnvironment() {
   return options;
 }
 
-// ---------------------------------------------------------------------------
-// LatencyStatistics
-// ---------------------------------------------------------------------------
-
 LatencyStatistics LatencyStatistics::From(std::vector<double> samples_us) {
   LatencyStatistics statistics;
 
-  // A sample that is not a positive finite duration is a wrapped or unresolved
-  // device counter, not a duration. The count is carried out so the drop is
-  // never silent.
   const size_t requested = samples_us.size();
   samples_us.erase(std::remove_if(samples_us.begin(), samples_us.end(),
                                   [](double sample) { return !std::isfinite(sample) || sample <= 0.0; }),
@@ -406,8 +330,6 @@ LatencyStatistics LatencyStatistics::From(std::vector<double> samples_us) {
   statistics.min_us = samples_us.front();
   statistics.max_us = samples_us.back();
 
-  // Even counts take the mean of the two middle samples, matching numpy's
-  // default so a figure here can be compared with one computed from the CSV.
   statistics.median_us = (count % 2 == 1) ? samples_us[count / 2]
                                           : 0.5 * (samples_us[count / 2 - 1] + samples_us[count / 2]);
 
@@ -422,11 +344,8 @@ LatencyStatistics LatencyStatistics::From(std::vector<double> samples_us) {
     const double deviation = sample - statistics.mean_us;
     sum_of_squares += deviation * deviation;
   }
-  // Population standard deviation: these are all the samples taken, not a
-  // sample drawn from a larger set.
   statistics.stddev_us = std::sqrt(sum_of_squares / static_cast<double>(count));
 
-  // Nearest-rank percentiles, so every reported figure is an observed sample.
   const auto percentile = [&samples_us, count](double fraction) {
     size_t rank = static_cast<size_t>(std::ceil(fraction * static_cast<double>(count)));
     if (rank == 0) {
@@ -441,10 +360,6 @@ LatencyStatistics LatencyStatistics::From(std::vector<double> samples_us) {
   statistics.p99_us = percentile(0.99);
   return statistics;
 }
-
-// ---------------------------------------------------------------------------
-// Checksums
-// ---------------------------------------------------------------------------
 
 double ChecksumSum(const std::vector<float>& values) {
   double total = 0.0;
@@ -463,15 +378,10 @@ double ChecksumSumOfSquares(const std::vector<float>& values) {
   return total;
 }
 
-// ---------------------------------------------------------------------------
-// BenchmarkResult
-// ---------------------------------------------------------------------------
-
 double BenchmarkResult::tflops() const {
   if (flops_per_iteration <= 0.0 || latency.median_us <= 0.0) {
     return 0.0;
   }
-  // FLOP / us -> FLOP / s is 1e6; FLOP/s -> TFLOP/s is 1e-12.
   return flops_per_iteration / latency.median_us * 1e-6;
 }
 
@@ -479,14 +389,8 @@ double BenchmarkResult::gigabytes_per_second() const {
   if (bytes_per_iteration <= 0.0 || latency.median_us <= 0.0) {
     return 0.0;
   }
-  // byte / us -> byte / s is 1e6; byte/s -> GB/s is 1e-9. GB is 1e9 bytes here,
-  // not 2^30, which is how HBM bandwidth is specified.
   return bytes_per_iteration / latency.median_us * 1e-3;
 }
-
-// ---------------------------------------------------------------------------
-// PlannedOp
-// ---------------------------------------------------------------------------
 
 void PlannedOp::SetRepeatableExecutorAllowed(bool allowed) { g_repeatable_allowed = allowed; }
 
@@ -524,13 +428,8 @@ PlannedOp::PlannedOp(std::string op_name, void* launch_fn, Planner planner)
   if (!g_repeatable_allowed) {
     g_launch_path = LaunchPath::kDisabledByEnvironment;
   } else if (api.set_repeatable == nullptr || api.destroy == nullptr) {
-    // Both halves or neither. A repeatable executor opts out of being consumed
-    // by the launch, so a build that can mark one but cannot destroy one would
-    // strand an executor per case for the length of the sweep; re-planning is
-    // slower but bounded.
     g_launch_path = LaunchPath::kSymbolAbsent;
   } else if (api.set_repeatable(executor_) != 0) {
-    // The executor is still valid and will be consumed by the first Launch.
     g_launch_path = LaunchPath::kRejectedByRuntime;
   } else {
     repeatable_ = true;
@@ -565,10 +464,6 @@ void PlannedOp::DestroyOrphanedExecutor(aclOpExecutor* executor) {
 }
 
 void PlannedOp::DestroyExecutor() {
-  // executor_ is non-null exactly when an executor exists that no launch has
-  // consumed: a repeatable one, which opted out of being consumed and is ours
-  // to free, or the plan from the constructor on a case that threw before its
-  // first launch. Both need destroying; a consumed one has already been zeroed.
   DestroyOrphanedExecutor(executor_);
   executor_ = nullptr;
 }
@@ -577,10 +472,6 @@ void PlannedOp::Launch(aclrtStream stream) {
   aclOpExecutor* executor = executor_;
   const bool replanned = (executor == nullptr);
   if (replanned) {
-    // Fallback path: the previous launch consumed the executor, so plan again.
-    // The workspace is not reallocated -- the arguments are identical, so the
-    // size cannot change -- and the buffer PlannedOp has owned since the
-    // constructor stays valid and stays put.
     uint64_t workspace_size = 0;
     const int status = planner_(&workspace_size, &executor);
     if (status != 0) {
@@ -588,7 +479,6 @@ void PlannedOp::Launch(aclrtStream stream) {
       throw AclError(label.c_str(), __FILE__, __LINE__, status);
     }
     if (workspace_size > workspace_size_) {
-      // This executor is local to the call and nothing else will free it.
       DestroyOrphanedExecutor(executor);
       throw AclError((op_name_ + ": workspace grew between identical plans").c_str(), __FILE__, __LINE__, -1);
     }
@@ -598,23 +488,15 @@ void PlannedOp::Launch(aclrtStream stream) {
   const int status =
       reinterpret_cast<LaunchFn>(launch_fn_)(workspace_.get(), workspace_size_, executor, stream);
   if (status != 0) {
-    // A failed launch does not consume the executor. The one from the
-    // constructor is still in executor_ for the destructor to deal with; a
-    // re-planned one exists only in this frame and has to go back here, or a
-    // suite that fails one case per shape strands one executor per failure.
     if (replanned) {
       DestroyOrphanedExecutor(executor);
     }
     throw AclError(op_name_.c_str(), __FILE__, __LINE__, status);
   }
   if (!repeatable_) {
-    executor_ = nullptr;  // consumed by the launch above
+    executor_ = nullptr;
   }
 }
-
-// ---------------------------------------------------------------------------
-// BenchmarkRunner
-// ---------------------------------------------------------------------------
 
 BenchmarkRunner::BenchmarkRunner(std::string suite_name, const BenchmarkOptions& options, aclrtStream stream)
     : suite_name_(std::move(suite_name)), options_(options), stream_(stream) {}
@@ -645,14 +527,7 @@ void BenchmarkRunner::DrainIfQueueIsDeep(int* enqueued, int about_to_enqueue) {
 }
 
 void BenchmarkRunner::WarmUp(const BenchmarkCase& benchmark_case) {
-  // Kernel compilation and caching, the driver-side first touch of the
-  // workspace, and the AI Core clock ramp all happen here rather than in sample
-  // 0. A long warmup is drained on the way so it cannot overrun the queue.
   const int tasks_per_launch = std::max(1, benchmark_case.tasks_per_launch);
-  // At least one launch, even at ASCEND_BENCH_WARMUP=0: the reference checksum
-  // is read straight after this, and with no launch it would be taken over the
-  // allocation's zero fill. Warmup 0 is legitimate -- it is how a camodel run
-  // stays finite -- so the floor lives here rather than in the option parse.
   const int warmup_iterations =
       benchmark_case.checksum ? std::max(1, options_.warmup_iterations) : options_.warmup_iterations;
   int enqueued = 0;
@@ -661,9 +536,6 @@ void BenchmarkRunner::WarmUp(const BenchmarkCase& benchmark_case) {
     benchmark_case.launch(stream_);
     enqueued += tasks_per_launch;
   }
-  // The hard barrier between warmup and timing. Every warmup launch, and every
-  // MTE transfer it queued, has retired before the first sample is recorded, so
-  // sample 0 is never charged for the backlog behind it.
   ACL_CHECK(aclrtSynchronizeStream(stream_));
 }
 
@@ -672,10 +544,6 @@ LatencySamples BenchmarkRunner::TimePipelined(const BenchmarkCase& benchmark_cas
   const int batch = options_.pipeline_batch;
   EventPool events(samples);
 
-  // Nothing between the launches: the whole point of this mode is to let the
-  // runtime keep the pipeline full. The batch plus both events is what one
-  // sample puts on the stream, and the drain is told about all of it up front
-  // so a deep batch cannot be split by the runtime's own back-pressure.
   const int tasks_per_sample = batch * std::max(1, benchmark_case.tasks_per_launch) + 2;
   int enqueued = 0;
   for (size_t sample = 0; sample < samples; ++sample) {
@@ -687,7 +555,6 @@ LatencySamples BenchmarkRunner::TimePipelined(const BenchmarkCase& benchmark_cas
     ACL_CHECK(aclrtRecordEvent(events.stop(sample), stream_));
     enqueued += tasks_per_sample;
   }
-  // Every launch and every event has retired before a timestamp is read.
   ACL_CHECK(aclrtSynchronizeStream(stream_));
 
   LatencySamples result;
@@ -707,9 +574,6 @@ LatencySamples BenchmarkRunner::TimeDeviceEvents(const BenchmarkCase& benchmark_
   const size_t samples = static_cast<size_t>(options_.timed_iterations);
   EventPool events(samples);
 
-  // Every event is recorded before anything is read back, so the loop never
-  // waits on the host.
-  // Whatever the launch submits, plus both events.
   const int tasks_per_sample = std::max(1, benchmark_case.tasks_per_launch) + 2;
   int enqueued = 0;
   for (size_t sample = 0; sample < samples; ++sample) {
@@ -739,10 +603,6 @@ LatencySamples BenchmarkRunner::TimeHostWallClock(const BenchmarkCase& benchmark
   LatencySamples result;
   result.microseconds.reserve(samples);
 
-  // steady_clock rather than high_resolution_clock: on libstdc++ the latter is
-  // an alias for system_clock, which is not monotonic. The difference is taken
-  // in the clock's own 64-bit nanosecond representation and converted once, in
-  // double; microseconds in a 32-bit signed integer wrap after 2.14 seconds.
   for (size_t sample = 0; sample < samples; ++sample) {
     const auto started = std::chrono::steady_clock::now();
     benchmark_case.launch(stream_);
@@ -759,10 +619,6 @@ void BenchmarkRunner::Run(const BenchmarkCase& benchmark_case) {
   try {
     RunOrThrow(benchmark_case);
   } catch (...) {
-    // The caller's handler is about to destroy the tensors and the workspace
-    // this case launched against, and a failed launch can leave earlier work
-    // still in flight. Drain first, or the next case reports a fault that has
-    // nothing to do with it.
     ACL_CHECK_NOTHROW(aclrtSynchronizeStream(stream_));
     throw;
   }
@@ -795,9 +651,6 @@ void BenchmarkRunner::RunOrThrow(const BenchmarkCase& benchmark_case) {
         break;
     }
 
-    // Two ways a sample can be lost: the runtime would not report a duration
-    // for it at all, and it reported one that is not a duration. Both are
-    // discards and both are reported as one number.
     LatencyStatistics latency = LatencyStatistics::From(std::move(samples.microseconds));
     latency.discarded_count += samples.rejected;
     const size_t attempted = latency.discarded_count + latency.sample_count;
@@ -841,8 +694,6 @@ void BenchmarkRunner::PrintTable() const {
   table << "[ascend-bench]   device timing events: " << EventTimingSourceLabel() << "\n";
   table << "[ascend-bench]   times are microseconds per operator launch; percentiles are nearest-rank\n\n";
 
-  // Column widths chosen so the longest shape label in any of the five suites
-  // fits without the numbers moving.
   const int name_width = 34;
   table << "  " << std::left << std::setw(name_width) << "case" << std::setw(11) << "mode" << std::right
         << std::setw(10) << "min" << std::setw(10) << "median" << std::setw(10) << "mean" << std::setw(10)
@@ -852,7 +703,6 @@ void BenchmarkRunner::PrintTable() const {
 
   std::string previous_case;
   for (const BenchmarkResult& result : results_) {
-    // Blank line between cases keeps the three mode rows visually grouped.
     if (!previous_case.empty() && result.case_name != previous_case) {
       table << "\n";
     }
@@ -877,9 +727,6 @@ void BenchmarkRunner::PrintTable() const {
     table << "\n";
   }
 
-  // Every figure above is drawn only from samples that passed validation, so a
-  // run that dropped some has to say which and how many: a median over 40 of
-  // 100 samples is a different claim from a median over all 100.
   size_t total_discarded = 0;
   for (const BenchmarkResult& result : results_) {
     total_discarded += result.latency.discarded_count;
@@ -925,9 +772,6 @@ void BenchmarkRunner::WriteCsv() const {
                  options_.csv_path.c_str());
     return;
   }
-  // `samples` is what the statistics were computed from and `discarded` is what
-  // was thrown away, so a consumer can tell a clean run from a salvaged one
-  // without going back to the log.
   csv << "suite,case,mode,samples,discarded,min_us,median_us,mean_us,p95_us,p99_us,max_us,stddev_us,tflops,"
          "gbps,flops_per_iter,bytes_per_iter,launch_path,event_timing\n";
   csv << std::setprecision(9);
@@ -949,19 +793,11 @@ void BenchmarkRunner::Report() const {
   WriteCsv();
 }
 
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
-
 namespace {
 
-// Whether `soc` names a device of the target part. The empty-name case differs
-// by part on purpose; see BenchmarkTargetPart.
 bool SocMatchesTargetPart(const std::string& soc, BenchmarkTargetPart part) {
   switch (part) {
     case BenchmarkTargetPart::kAscend310P:
-      // Empty means the runtime would not tell us; the correctness suite treats
-      // that the same way rather than refusing to run.
       return soc.empty() || soc.find("310P") != std::string::npos || soc.find("310p") != std::string::npos;
     case BenchmarkTargetPart::kAscend950PR:
       return shapes950::IsAscend950PrSocName(soc);
@@ -973,7 +809,7 @@ const char* TargetPartLabel(BenchmarkTargetPart part) {
   return part == BenchmarkTargetPart::kAscend310P ? "Ascend 310P" : "Ascend 950PR";
 }
 
-}  // namespace
+}
 
 int RunBenchmarkSuite(const char* suite_name, const std::function<void(BenchmarkRunner&)>& build) {
   return RunBenchmarkSuite(suite_name, BenchmarkTargetPart::kAscend310P, build);
@@ -983,10 +819,6 @@ int RunBenchmarkSuite(const char* suite_name, BenchmarkTargetPart part,
                       const std::function<void(BenchmarkRunner&)>& build) {
   std::printf("[ascend-bench] vllm-ascend %s kernel microbenchmarks (no Python, no torch)\n",
               TargetPartLabel(part));
-  // The inventory is the 310P operator audit. A 950PR suite drives kernels built
-  // out of csrc/ rather than stock operators, so printing it there would list a
-  // pipeline none of its cases touch; those suites print whatever availability
-  // note they actually depend on themselves.
   if (part == BenchmarkTargetPart::kAscend310P) {
     ops::PrintOperatorInventory();
   }
@@ -1012,8 +844,6 @@ int RunBenchmarkSuite(const char* suite_name, BenchmarkTargetPart part,
   const BenchmarkOptions options = BenchmarkOptions::FromEnvironment();
   PlannedOp::SetRepeatableExecutorAllowed(options.allow_repeatable_executor);
 
-  // A stream of its own, so nothing the setup phase or the runtime left on the
-  // device's default stream lands inside a timed region.
   aclrtStream stream = nullptr;
   ACL_CHECK(aclrtCreateStream(&stream));
 
@@ -1031,7 +861,6 @@ int RunBenchmarkSuite(const char* suite_name, BenchmarkTargetPart part,
     if (runner.failure_count() > 0) {
       exit_code = 1;
     } else if (!runner.has_results()) {
-      // Everything skipped: nothing ran, so this is not a pass.
       exit_code = kBenchmarkSkipExitCode;
     }
   }
@@ -1041,6 +870,6 @@ int RunBenchmarkSuite(const char* suite_name, BenchmarkTargetPart part,
   return exit_code;
 }
 
-}  // namespace bench
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}

@@ -48,13 +48,9 @@ from ..registry import register_scheme
 class AscendTurboQuantKVCacheAttentionMethod(AscendAttentionScheme):
     """4-bit rotated KV cache for dense-attention models."""
 
-    # Re-exported so a model runner can ask for the cache geometry without
-    # importing the attention module directly.
     backend = AscendTurboQuantAttentionBackend
 
     def create_weights(self, layer: torch.nn.Module) -> None:
-        # The packed cache is int8; two 4-bit codes share a byte and the
-        # per-vector scales live in a side allocation owned by the impl.
         layer.kv_cache_torch_dtype = torch.int8
         activate_turboquant_backend(layer)
         logger.info_once(
@@ -63,11 +59,6 @@ class AscendTurboQuantKVCacheAttentionMethod(AscendAttentionScheme):
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Deliberately empty. Folding Pi into q/k/v would put RoPE in the rotated
-        # basis, so K, V and Q rotate at runtime. Folding it into o_proj alone is
-        # valid, but happens offline, before quantisation, and only for a layer
-        # with no output gate -- not here, where o_proj may already be quantised
-        # and this layer cannot see it.
         return
 
     def apply(

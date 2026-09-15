@@ -14,15 +14,6 @@
  * limitations under the License.
  */
 
-// Regression tests for the parts of the benchmark harness that decide what a
-// timing report says, none of which need a device -- the only test binary in
-// the suite with no REQUIRE_ASCEND_DEVICE in it.
-//
-// Covered: the arithmetic a negative or malformed sample is handed to, the
-// ASCEND_BENCH_* option parse, and the alignment arithmetic DeviceBuffer is
-// built on. Not covered: aclrtEventElapsedTime validation and the allocator
-// itself, which need recorded events and aclrtMalloc.
-
 #include <gtest/gtest.h>
 
 #include <cmath>
@@ -39,15 +30,7 @@ namespace test {
 namespace bench {
 namespace {
 
-// ---------------------------------------------------------------------------
-// LatencyStatistics: nothing that is not a duration reaches a reported figure
-// ---------------------------------------------------------------------------
-
 TEST(LatencyStatistics, DropsNonPositiveSamples) {
-  // -5 is what aclrtEventElapsedTime returns for an event pair the device never
-  // resolved, and 0 is what a host clock too coarse for the kernel returns.
-  // Neither is a duration, and before the fix both were averaged in: the mean
-  // of this set was 11 us and its minimum was -5 us.
   const LatencyStatistics statistics = LatencyStatistics::From({10.0, -5.0, 20.0, 0.0, 30.0});
 
   EXPECT_EQ(statistics.sample_count, 3u);
@@ -70,9 +53,6 @@ TEST(LatencyStatistics, DropsNonFiniteSamples) {
 }
 
 TEST(LatencyStatistics, ReportsNoSamplesWhenNothingIsUsable) {
-  // BenchmarkRunner keys the "this mode measured nothing" failure off
-  // sample_count, so a set with nothing usable in it has to come back empty
-  // rather than as a row of zeros that reads like a fast kernel.
   const LatencyStatistics statistics = LatencyStatistics::From({-1.0, -2.0, 0.0});
 
   EXPECT_EQ(statistics.sample_count, 0u);
@@ -101,15 +81,12 @@ TEST(LatencyStatistics, PercentilesAreNearestRankOverTheSurvivingSamples) {
 
   EXPECT_EQ(statistics.sample_count, 100u);
   EXPECT_EQ(statistics.discarded_count, 0u);
-  // Even count, so the median is the mean of the two middle samples.
   EXPECT_DOUBLE_EQ(statistics.median_us, 50.5);
   EXPECT_DOUBLE_EQ(statistics.p95_us, 95.0);
   EXPECT_DOUBLE_EQ(statistics.p99_us, 99.0);
 }
 
 TEST(LatencyStatistics, PercentilesRankAgainstTheSurvivorsNotTheRequest) {
-  // Ranks are taken over what is left, so a run that lost half its samples
-  // still reports an observed sample for P95 rather than indexing off the end.
   std::vector<double> samples;
   for (int i = 1; i <= 10; ++i) {
     samples.push_back(static_cast<double>(i));
@@ -123,25 +100,17 @@ TEST(LatencyStatistics, PercentilesRankAgainstTheSurvivorsNotTheRequest) {
   EXPECT_DOUBLE_EQ(statistics.p99_us, 10.0);
 }
 
-// ---------------------------------------------------------------------------
-// Derived throughput
-// ---------------------------------------------------------------------------
-
 TEST(BenchmarkResult, ThroughputIsComputedFromTheMedian) {
   BenchmarkResult result;
   result.flops_per_iteration = 2.0e9;
   result.bytes_per_iteration = 1.0e6;
   result.latency = LatencyStatistics::From({100.0});
 
-  // 2e9 FLOP in 100 us is 2e13 FLOP/s, i.e. 20 TFLOP/s.
   EXPECT_DOUBLE_EQ(result.tflops(), 20.0);
-  // 1e6 bytes in 100 us is 1e10 byte/s, i.e. 10 GB/s.
   EXPECT_DOUBLE_EQ(result.gigabytes_per_second(), 10.0);
 }
 
 TEST(BenchmarkResult, ThroughputIsZeroWhenNothingWasMeasured) {
-  // The median of an all-discarded set is 0, and dividing by it would give an
-  // infinite TFLOP/s. Reporting zero is what makes the empty row obvious.
   BenchmarkResult result;
   result.flops_per_iteration = 2.0e9;
   result.bytes_per_iteration = 1.0e6;
@@ -151,10 +120,6 @@ TEST(BenchmarkResult, ThroughputIsZeroWhenNothingWasMeasured) {
   EXPECT_DOUBLE_EQ(result.tflops(), 0.0);
   EXPECT_DOUBLE_EQ(result.gigabytes_per_second(), 0.0);
 }
-
-// ---------------------------------------------------------------------------
-// BenchmarkOptions::FromEnvironment
-// ---------------------------------------------------------------------------
 
 class BenchmarkEnvironment : public ::testing::Test {
  protected:
@@ -194,9 +159,6 @@ TEST_F(BenchmarkEnvironment, WellFormedValuesAreTaken) {
 }
 
 TEST_F(BenchmarkEnvironment, NonNumericValuesFallBackInsteadOfBecomingZero) {
-  // atoi returned 0 for all three of these. Zero warmup is a valid setting, so
-  // the typo did not announce itself: it just moved the kernel compile into
-  // sample 0 of every case.
   Set("ASCEND_BENCH_WARMUP", "twenty");
   Set("ASCEND_BENCH_ITERS", "100x");
   Set("ASCEND_BENCH_BATCH", "");
@@ -208,8 +170,6 @@ TEST_F(BenchmarkEnvironment, NonNumericValuesFallBackInsteadOfBecomingZero) {
 }
 
 TEST_F(BenchmarkEnvironment, OutOfRangeValuesFallBack) {
-  // Below the minimum, and past what a stream can hold in one sample or an int
-  // can hold at all.
   Set("ASCEND_BENCH_ITERS", "0");
   Set("ASCEND_BENCH_BATCH", "100000");
   Set("ASCEND_BENCH_WARMUP", "99999999999999");
@@ -237,13 +197,7 @@ TEST_F(BenchmarkEnvironment, AnAllUnknownModeListFallsBackToPipelined) {
   EXPECT_STREQ(TimingModeLabel(options.modes[0]), "pipelined");
 }
 
-// ---------------------------------------------------------------------------
-// Allocation arithmetic
-// ---------------------------------------------------------------------------
-
 TEST(DeviceBufferAlignment, PaddedCapacityFitsInsideTheRequestForAnyBaseAddress) {
-  // The invariant DeviceBuffer::Allocate checks at runtime, stated over every
-  // base-address residue rather than the one aclrtMalloc happens to return.
   for (size_t alignment : {kDeviceAlignBytes, kBenchmarkAlignBytes}) {
     for (size_t size_bytes : {size_t{1}, size_t{31}, size_t{512}, size_t{1536}, size_t{11008 * 2}}) {
       const size_t capacity = AlignUp(size_bytes, alignment);
@@ -268,15 +222,7 @@ TEST(DeviceBufferAlignment, AlignUpNeverShrinksAndLandsOnTheBoundary) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Checksum reductions
-// ---------------------------------------------------------------------------
-
 TEST(Checksum, AccumulateInDoubleAndAreOrderStable) {
-  // The guard that catches an operator which stopped writing its output is only
-  // as good as its reproducibility: two calls over an unchanged buffer have to
-  // agree bit for bit, which is why both reductions accumulate in double in a
-  // fixed order rather than in the element type.
   std::vector<float> values;
   for (int i = 0; i < 1000; ++i) {
     values.push_back(static_cast<float>(i % 7) - 3.0f);
@@ -287,7 +233,7 @@ TEST(Checksum, AccumulateInDoubleAndAreOrderStable) {
   EXPECT_GE(ChecksumSumOfSquares(values), 0.0);
 }
 
-}  // namespace
-}  // namespace bench
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}
+}

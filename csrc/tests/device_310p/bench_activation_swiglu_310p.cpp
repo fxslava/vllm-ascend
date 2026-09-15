@@ -14,13 +14,6 @@
  * limitations under the License.
  */
 
-// SiluAndMul / SwiGLU (aclnnSwiGlu) on the v200 vector unit, fp16 in / fp16 out.
-//
-// Purely elementwise over a 3:1 ratio of traffic, so bandwidth-bound and GB/s
-// is the figure to read. Every intermediate size benchmarked satisfies the
-// `x.shape[-1] % 32 == 0` gate in AscendSiluAndMul310.forward, so all of them
-// take the kernel path rather than the eager fallback.
-
 #include <cstdint>
 #include <sstream>
 #include <stdexcept>
@@ -42,7 +35,6 @@ const char* kSuiteName = "activation_swiglu_310p (aclnnSwiGlu, vector unit, fp16
 
 namespace {
 
-// Matches npu_swiglu's default: split the last axis.
 constexpr int64_t kSwiGluSplitDim = -1;
 
 const AclnnOp& SwiGluOp() {
@@ -56,7 +48,7 @@ std::string CaseName(int64_t num_tokens, int64_t intermediate) {
   return name.str();
 }
 
-}  // namespace
+}
 
 void BuildSuite(BenchmarkRunner& runner) {
   const AclnnOp& op = SwiGluOp();
@@ -65,16 +57,12 @@ void BuildSuite(BenchmarkRunner& runner) {
     return;
   }
 
-  DeterministicRandom random(0x42535747u);  // "BSWG"
+  DeterministicRandom random(0x42535747u);
 
   for (int64_t num_tokens : shapes::BenchmarkTokenCounts()) {
     for (int64_t intermediate : shapes::IntermediateSizes()) {
       const std::string name = CaseName(num_tokens, intermediate);
       try {
-        // stddev 2 puts a useful share of the gate into silu's saturating
-        // tails. That does not change the timing on a branch-free vector unit,
-        // but it does mean the checksum is exercising the same code path the
-        // parity test does.
         const std::vector<float> x =
             random.NormalHalfExact(static_cast<size_t>(num_tokens * intermediate * 2), 0.0f, 2.0f);
 
@@ -88,7 +76,6 @@ void BuildSuite(BenchmarkRunner& runner) {
 
         BenchmarkCase benchmark_case;
         benchmark_case.name = name;
-        // 2 * intermediate read, intermediate written, all fp16.
         benchmark_case.bytes_per_iteration =
             2.0 * static_cast<double>(num_tokens) * static_cast<double>(intermediate) * 3.0;
         benchmark_case.launch = [&planned](aclrtStream stream) { planned.Launch(stream); };
@@ -102,6 +89,6 @@ void BuildSuite(BenchmarkRunner& runner) {
   }
 }
 
-}  // namespace bench
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}

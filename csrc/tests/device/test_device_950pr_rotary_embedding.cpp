@@ -14,24 +14,6 @@
  * limitations under the License.
  */
 
-// Partial rotary position embedding on Ascend 950PR, fp16 in / fp16 out.
-//
-// Stages 3 and 4 of the Qwen3.5 decoder layer. partial_rotary_factor 0.25
-// against head_dim 256, so channels [0, 64) of every head rotate and [64, 256)
-// must come out bit-identical. Two consequences:
-//
-//   * The 310P cannot run this shape: AscendMRotaryEmbedding310 gates on
-//     rotary_dim in (64, 128).
-//   * The stock aclnnApplyRotaryPosEmbV2 cannot express a partial rotation;
-//     common/partial_rotary_950pr.hpp documents the two ways round that and
-//     picks between them at run time.
-//
-// Every device test below prints which path ran.
-//
-// Seeds, shapes and tolerances follow
-// csrc/tests/kernels/cuda/test_rotary_embedding.cpp; the 256/64 cases are new
-// here.
-
 #include <gtest/gtest.h>
 
 #include <cmath>
@@ -57,10 +39,6 @@ namespace {
 namespace s = shapes950;
 using reference::RotaryMode;
 
-// The dump, the plugin and this suite all use neox / rotate_half. The
-// interleave layout is a different model family's convention and there is no
-// Qwen3.5 shape that reaches it, so it is not swept here - unlike on the 310P,
-// where both were covered because the plugin picks between them per model.
 constexpr RotaryMode kMode = RotaryMode::kHalf;
 
 struct RotaryCase {
@@ -83,8 +61,6 @@ RotaryResult RunPartialRotaryOnDevice(const std::vector<float>& query, const std
                                       const RotaryCase& test_case) {
   aclrtStream stream = AscendTestEnvironment::Instance().stream();
 
-  // Flat [tokens * heads * head_dim] allocations; the helper builds whatever
-  // BSND views the operator it picks needs over the same memory.
   DeviceTensor query_device =
       DeviceTensor::Half({test_case.num_tokens, test_case.num_q_heads, test_case.head_dim}, query);
   DeviceTensor key_device =
@@ -100,8 +76,6 @@ RotaryResult RunPartialRotaryOnDevice(const std::vector<float>& query, const std
   return result;
 }
 
-// Scattered rather than sequential, so a kernel that ignores the per-token
-// cos/sin row cannot pass by accident.
 std::vector<int32_t> ScatteredPositions(int64_t num_tokens) {
   std::vector<int32_t> positions(static_cast<size_t>(num_tokens));
   for (int64_t i = 0; i < num_tokens; ++i) {
@@ -110,9 +84,6 @@ std::vector<int32_t> ScatteredPositions(int64_t num_tokens) {
   return positions;
 }
 
-// cos/sin as the device will see them: built at the rotary width, gathered for
-// these positions and rounded to fp16, so the reference uses the same angles
-// and the comparison measures the kernel rather than the cache precision.
 void BuildDeviceAngles(const RotaryCase& test_case, const std::vector<int32_t>& positions,
                        std::vector<float>* cos_full, std::vector<float>* sin_full) {
   const std::vector<float> cache =
@@ -122,9 +93,6 @@ void BuildDeviceAngles(const RotaryCase& test_case, const std::vector<int32_t>& 
   *sin_full = QuantizeToHalf(*sin_full);
 }
 
-// L2 norm of each rotary pair. A rotation preserves it exactly, which is a
-// property check that needs no reference implementation. Only pairs inside the
-// rotary slice are collected: the pass-through channels are not paired at all.
 std::vector<float> RotaryPairNorms(const std::vector<float>& x, int64_t num_tokens, int64_t num_heads,
                                    int64_t head_dim, int64_t rotary_dim) {
   const int64_t half = rotary_dim / 2;
@@ -144,25 +112,16 @@ std::vector<float> RotaryPairNorms(const std::vector<float>& x, int64_t num_toke
   return norms;
 }
 
-// -----------------------------------------------------------------------------
-// Host-only checks
-// -----------------------------------------------------------------------------
-
 TEST(Rotary950PrReference, PartialRotationLeavesTheTailAlone) {
-  // The property the whole file exists for, checked against the reference first
-  // so a device failure cannot be blamed on the reference.
   const int64_t head_dim = s::kHeadDim;
   const int64_t rotary_dim = s::kRotaryDim;
 
-  DeterministicRandom random(0x50525450u);  // "PRTP"
+  DeterministicRandom random(0x50525450u);
   const std::vector<float> x = random.NormalHalfExact(static_cast<size_t>(head_dim), 0.0f, 1.0f);
 
   const std::vector<float> cache = reference::BuildCosSinCache(64, rotary_dim, s::kRopeThetaExtended);
   std::vector<float> cos_full;
   std::vector<float> sin_full;
-  // Position 17 is arbitrary but non-zero: at position 0 the rotation is the
-  // identity and the tail would be preserved even by a kernel that rotated
-  // everything.
   reference::GatherFullCosSin(cache, {17}, rotary_dim, kMode, &cos_full, &sin_full);
 
   std::vector<float> out;
@@ -184,39 +143,24 @@ TEST(Rotary950PrReference, PartialRotationLeavesTheTailAlone) {
 }
 
 TEST(Rotary950PrShapes, QwenHeadDimIsWithinTheOperatorLimit) {
-  // The 950 rotary operator accepts head dims up to 1024 in half mode, and the
-  // dim must be even. head_dim 256 with rotary_dim 64 satisfies both; the same
-  // shape is out of range on the 310P, which is the reason this file is not a
-  // copy of the 310P one.
   EXPECT_LE(s::kHeadDim, s::kMaxRotaryHeadDim);
   EXPECT_EQ(s::kHeadDim % s::kRotaryHalfModeDimMultiple, 0);
   EXPECT_EQ(s::kRotaryDim % s::kRotaryHalfModeDimMultiple, 0);
   EXPECT_LT(s::kRotaryDim, s::kHeadDim) << "this suite is about the partial case";
-  // partial_rotary_factor 0.25.
   EXPECT_EQ(s::kRotaryDim * 4, s::kHeadDim);
 }
 
 TEST(Rotary950PrPathSelection, FullRotationDoesNotNeedTheCustomOperator) {
-  // A shape with rotary_dim == head_dim needs no slicing, so it must never be
-  // routed through the custom operator or the packed fallback even when the
-  // custom operator is present. This runs with no device: it only inspects
-  // which operators resolved.
   PartialRotaryPath path = PartialRotaryPath::kPackedApplyRotary;
   std::string reason;
-  if (!SelectPartialRotaryPath(/*head_dim=*/128, /*rotary_dim=*/128, &path, &reason)) {
+  if (!SelectPartialRotaryPath(128, 128, &path, &reason)) {
     GTEST_SKIP() << reason;
   }
   EXPECT_EQ(path, PartialRotaryPath::kFullApplyRotary);
 }
 
-// -----------------------------------------------------------------------------
-// Device parity
-// -----------------------------------------------------------------------------
-
 class Rotary950PrTest : public ::testing::TestWithParam<RotaryCase> {
  protected:
-  // Skips when no rotary operator resolved, and otherwise records the path so
-  // every test in the suite reports it.
   void RequireRotaryOperator() {
     PartialRotaryPath path = PartialRotaryPath::kPackedApplyRotary;
     std::string reason;
@@ -232,7 +176,7 @@ TEST_P(Rotary950PrTest, MatchesCpuReference) {
   RequireRotaryOperator();
 
   const RotaryCase& test_case = GetParam();
-  DeterministicRandom random(0x51524f50u);  // "QROP"
+  DeterministicRandom random(0x51524f50u);
 
   const std::vector<float> query = random.NormalHalfExact(
       static_cast<size_t>(test_case.num_tokens * test_case.num_q_heads * test_case.head_dim), 0.0f, 1.0f);
@@ -267,11 +211,7 @@ TEST_P(Rotary950PrTest, LeavesChannelsPastRotaryDimBitIdentical) {
     GTEST_SKIP() << "full rotation: there are no pass-through channels to check";
   }
 
-  // The assertion the partial path exists for, and the one an "improvement"
-  // that rotated the whole head would fail. It is bit-exact deliberately: the
-  // pass-through channels are copied, not computed, so any difference at all is
-  // a bug rather than a rounding question.
-  DeterministicRandom random(0x50415353u);  // "PASS"
+  DeterministicRandom random(0x50415353u);
 
   const std::vector<float> query = random.NormalHalfExact(
       static_cast<size_t>(test_case.num_tokens * test_case.num_q_heads * test_case.head_dim), 0.0f, 1.0f);
@@ -318,15 +258,13 @@ TEST_P(Rotary950PrTest, PositionZeroLeavesTheInputUnchanged) {
   RequireRotaryOperator();
 
   const RotaryCase& test_case = GetParam();
-  DeterministicRandom random(0x5a45524fu);  // "ZERO"
+  DeterministicRandom random(0x5a45524fu);
 
   const std::vector<float> query = random.NormalHalfExact(
       static_cast<size_t>(test_case.num_tokens * test_case.num_q_heads * test_case.head_dim), 0.0f, 1.0f);
   const std::vector<float> key = random.NormalHalfExact(
       static_cast<size_t>(test_case.num_tokens * test_case.num_kv_heads * test_case.head_dim), 0.0f, 1.0f);
 
-  // cos(0) = 1, sin(0) = 0, so every channel - rotated or passed through - must
-  // come back exactly as it went in.
   const std::vector<int32_t> positions(static_cast<size_t>(test_case.num_tokens), 0);
   std::vector<float> cos_full;
   std::vector<float> sin_full;
@@ -343,11 +281,8 @@ TEST_P(Rotary950PrTest, PreservesRotaryPairNorms) {
   REQUIRE_ASCEND_950PR();
   RequireRotaryOperator();
 
-  // A rotation is orthogonal within each (k, k + rotary_dim/2) pair, so the
-  // pair norm is invariant. This needs no reference at all and would catch a
-  // kernel that applied cos and sin from the wrong row.
   const RotaryCase& test_case = GetParam();
-  DeterministicRandom random(0x504e524du);  // "PNRM"
+  DeterministicRandom random(0x504e524du);
 
   const std::vector<float> query = random.NormalHalfExact(
       static_cast<size_t>(test_case.num_tokens * test_case.num_q_heads * test_case.head_dim), 0.0f, 1.0f);
@@ -362,8 +297,6 @@ TEST_P(Rotary950PrTest, PreservesRotaryPairNorms) {
   const RotaryResult actual = RunPartialRotaryOnDevice(query, key, cos_full, sin_full, test_case);
   SCOPED_TRACE(PartialRotaryPathName(actual.path));
 
-  // Two fp16 roundings and a square root, so this is looser than the parity
-  // tolerance by design.
   const Tolerance norm_tolerance{5e-3, 5e-3, "pair norm through two fp16 roundings plus a square root"};
 
   EXPECT_TENSORS_ALLCLOSE(RotaryPairNorms(actual.query, test_case.num_tokens, test_case.num_q_heads,
@@ -389,21 +322,15 @@ std::string RotaryTestName(const ::testing::TestParamInfo<RotaryCase>& info) {
 INSTANTIATE_TEST_SUITE_P(
     Qwen35, Rotary950PrTest,
     ::testing::Values(
-        // The layer-3 decode shape the golden test runs, and a prefill-sized
-        // batch of it. rope_theta 1e6 is what scripts/dump_qwen35_layer3.py
-        // defaults to.
         RotaryCase{1, s::kHeadDim, s::kRotaryDim, s::kNumHeads, s::kNumKvHeads, s::kRopeThetaExtended},
         RotaryCase{32, s::kHeadDim, s::kRotaryDim, s::kNumHeads, s::kNumKvHeads, s::kRopeThetaExtended},
         RotaryCase{128, s::kHeadDim, s::kRotaryDim, s::kNumHeads, s::kNumKvHeads, s::kRopeThetaDefault},
-        // A second partial ratio, so a kernel that hard-coded 0.25 fails.
         RotaryCase{16, s::kHeadDim, 128, s::kNumHeads, s::kNumKvHeads, s::kRopeThetaDefault},
-        // Full-rotation cases, identical to the ones the 310P suite sweeps, so
-        // the two backends can be compared directly on the same shapes.
         RotaryCase{1, 128, 128, 28, 4, s::kRopeThetaDefault},
         RotaryCase{16, 128, 128, 32, 8, s::kRopeThetaExtended},
         RotaryCase{32, 64, 64, 16, 2, s::kRopeThetaDefault}),
     RotaryTestName);
 
-}  // namespace
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}

@@ -14,9 +14,6 @@
  * limitations under the License.
  */
 
-// Entry point shared by every kernel test binary. The environment inventory is
-// printed before the first test so a run that ends in skips says why up front.
-
 #include <gtest/gtest.h>
 
 #include <cstdio>

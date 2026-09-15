@@ -31,24 +31,17 @@ namespace {
 
 namespace tq = turboquant_ref;
 
-// Bytes per Gather offset unit. The device gathers 4-byte lanes, so every
-// offset table below is a byte offset scaled by four.
 constexpr int32_t kWord = 4;
 
-// Reinterprets a float as the int32 the table image carries. The kernel copies
-// the image in as int32 and reads the sign lanes back as float, so what has to
-// match is the bit pattern, not the numeric value.
 int32_t FloatBits(float value) {
   int32_t bits = 0;
   std::memcpy(&bits, &value, sizeof(bits));
   return bits;
 }
 
-}  // namespace
+}
 
 std::vector<float> PiSigns(int64_t head_size) {
-  // One generator for the whole project: the CPU reference's LCG. Regenerating
-  // the sequence here would be a second place for the seed to drift.
   const std::vector<int8_t> signs = tq::cpu_pi_sign_vector(static_cast<int>(head_size));
   std::vector<float> out(signs.size());
   for (size_t i = 0; i < signs.size(); ++i) {
@@ -63,8 +56,6 @@ std::vector<int32_t> CodecTables(int64_t head_size, int64_t batch_rows) {
   std::vector<int32_t> tables;
   tables.reserve(static_cast<size_t>(CodecTableWords(d, batch_rows)));
 
-  // Stages 0, 1, 2 (strides 1, 2, 4): the sign pattern of the butterfly and the
-  // byte offset of the XOR partner Gather materialises.
   for (int stage = 0; stage < 3; ++stage) {
     const int64_t stride = static_cast<int64_t>(1) << stage;
     for (int64_t c = 0; c < d; ++c) {
@@ -76,7 +67,6 @@ std::vector<int32_t> CodecTables(int64_t head_size, int64_t batch_rows) {
     }
   }
 
-  // The nibble split: even channel then odd channel of each packed byte.
   for (int64_t p = 0; p < d / kPackFactor; ++p) {
     tables.push_back(static_cast<int32_t>(kWord * kPackFactor * p));
   }
@@ -84,8 +74,6 @@ std::vector<int32_t> CodecTables(int64_t head_size, int64_t batch_rows) {
     tables.push_back(static_cast<int32_t>(kWord * kPackFactor * p + kWord));
   }
 
-  // Batched expansion: which packed byte each output channel comes from, and
-  // whether it is the low or the high nibble.
   for (int64_t b = 0; b < batch; ++b) {
     tables.push_back(static_cast<int32_t>(kWord * (b / kPackFactor)));
   }
@@ -93,9 +81,6 @@ std::vector<int32_t> CodecTables(int64_t head_size, int64_t batch_rows) {
     tables.push_back(FloatBits(static_cast<float>(b % kPackFactor)));
   }
 
-  // The Lloyd-Max reconstruction levels, gathered by Dequantize4Bit. Taken from
-  // the CPU reference rather than restated, so the device and the host cannot
-  // disagree about the table itself -- only about how they index it.
   for (int level = 0; level < static_cast<int>(kCodecLevels); ++level) {
     tables.push_back(FloatBits(tq::kLloydMaxCentroids[level]));
   }
@@ -132,10 +117,6 @@ PagedAttentionGrid PlanPagedAttention(int64_t num_tokens, int64_t num_heads, int
 
   const int64_t base_tasks = num_tokens * num_heads;
 
-  // Split the sequence only as far as there are idle cores to absorb it, and
-  // never past the number of blocks a sequence actually has - a split with no
-  // block in it contributes an empty partial the combine stage still has to
-  // read.
   int64_t num_splits = CeilDiv(aiv_num, base_tasks);
   num_splits = std::min(num_splits, std::min<int64_t>(kMaxSequenceSplits, std::max<int64_t>(1, max_blocks_per_seq)));
   num_splits = std::max<int64_t>(num_splits, 1);
@@ -155,15 +136,10 @@ PagedAttentionGrid PlanPagedAttention(int64_t num_tokens, int64_t num_heads, int
   return grid;
 }
 
-// --- multi-mode, Cube-native path -------------------------------------------
-
 namespace {
 
 namespace tqm = vllm_ascend::turboquant;
 
-// Plane geometry, mirroring TurboQuantPlanes in turboquant_codec_mx.h. Kept
-// local because it is device-side packing detail: the mode header exposes only
-// PackedBytes, which is what the rest of the host needs.
 struct ModePlanes {
   int32_t low_bits;
   int32_t msb_bits;
@@ -201,7 +177,7 @@ int64_t Shift(int32_t digits_per_byte) {
   return shift;
 }
 
-}  // namespace
+}
 
 int64_t ModePackedBytes(tqm::TurboQuantMode mode, int64_t head_size) {
   return tqm::TurboQuantModeConfigOf(mode).PackedBytes(head_size);
@@ -215,26 +191,15 @@ size_t ModePackedCacheBytes(tqm::TurboQuantMode mode, int64_t num_blocks, int64_
 
 int64_t ModeTableWords(tqm::TurboQuantMode mode, int64_t head_size, int64_t batch_rows) {
   const tqm::TurboQuantModeConfig cfg = tqm::TurboQuantModeConfigOf(mode);
-  // An affine rate reads no constant table at all: its expand is shifts and an
-  // Adds, with neither a byte-offset table nor a codebook to address.
-  // TurboQuantModeCodec<MODE>::ConstTableWords is 0 for it and Init allocates
-  // nothing -- but the launch still binds a modeTables pointer, so ModeTables
-  // emits one zero block and this reports that block rather than 0.
   if (cfg.is_affine) {
     return kFp32PerBlock;
   }
-  // 2B + 3 periodic blocks + packOffset_ + centroid_, matching
-  // TurboQuantModeCodec<MODE>::ConstTableWords.
   return 2 * head_size * batch_rows + 3 * kFp32PerBlock + head_size + cfg.levels;
 }
 
 std::vector<int32_t> ModeTables(tqm::TurboQuantMode mode, int64_t head_size, int64_t batch_rows, int64_t nz_rows) {
   const ModePlanes planes = PlanesOf(mode);
   const tqm::TurboQuantModeConfig cfg = tqm::TurboQuantModeConfigOf(mode);
-  // The affine rate's image is a placeholder; see ModeTableWords. batch_rows
-  // and nz_rows are meaningless for it -- its expand is byte-major and its
-  // output order is fixed by the packing, not by an offset table -- so callers
-  // may pass whatever they pass for the codebook rates.
   if (cfg.is_affine) {
     return std::vector<int32_t>(static_cast<size_t>(kFp32PerBlock), 0);
   }
@@ -247,15 +212,6 @@ std::vector<int32_t> ModeTables(tqm::TurboQuantMode mode, int64_t head_size, int
   std::vector<int32_t> tables;
   tables.reserve(static_cast<size_t>(ModeTableWords(mode, d, batch_rows)));
 
-  // lowOffset_ and msbOffset_.
-  //
-  // Output position p is a plain row-major index when nz_rows == 0, and an NZ
-  // position within this batch's band of an nz_rows-row tile otherwise:
-  //
-  //     p = b * (batch_rows * C0) + r * C0 + w,   c = b * C0 + w
-  //
-  // so decoding p back to (r, c) is the inverse of TurboQuantCubeMm::NzOffset
-  // with `rows` set to batch_rows. nz_rows is only checked for consistency.
   for (int plane = 0; plane < 2; ++plane) {
     for (int64_t p = 0; p < batch; ++p) {
       int64_t r = p / d;
@@ -273,9 +229,6 @@ std::vector<int32_t> ModeTables(tqm::TurboQuantMode mode, int64_t head_size, int
     }
   }
 
-  // lowRecip_: radix^-(p mod low_per_byte), one 32-byte block. The period
-  // divides the block's 8 lanes and survives the NZ permutation because C0 is a
-  // multiple of every period here.
   for (int64_t lane = 0; lane < kFp32PerBlock; ++lane) {
     float recip = 1.0f;
     for (int64_t j = 0; j < lane % planes.low_per_byte; ++j) {
@@ -283,25 +236,19 @@ std::vector<int32_t> ModeTables(tqm::TurboQuantMode mode, int64_t head_size, int
     }
     tables.push_back(FloatBits(recip));
   }
-  // msbRecip_: 2^-(p mod 8).
   for (int64_t lane = 0; lane < kFp32PerBlock; ++lane) {
     tables.push_back(FloatBits(1.0f / static_cast<float>(static_cast<int64_t>(1) << lane)));
   }
-  // msbWeight_: 2^(p mod 8), the encoder's bit-plane fold.
   for (int64_t lane = 0; lane < kFp32PerBlock; ++lane) {
     tables.push_back(FloatBits(static_cast<float>(static_cast<int64_t>(1) << lane)));
   }
 
-  // packOffset_: the encoder's low-plane deinterleave, low_per_byte tables of
-  // d / low_per_byte entries laid end to end. Always d words in total, which is
-  // why the image's size does not depend on the radix.
   for (int64_t j = 0; j < planes.low_per_byte; ++j) {
     for (int64_t b = 0; b < low_bytes; ++b) {
       tables.push_back(static_cast<int32_t>(kWord * (b * planes.low_per_byte + j)));
     }
   }
 
-  // centroid_, the stored codebook: cast(gain * c), already on the operand grid.
   const float *centroids = CentroidsOf(mode);
   for (int64_t level = 0; level < cfg.levels; ++level) {
     tables.push_back(FloatBits(centroids[level]));
@@ -317,9 +264,6 @@ CubeDecodeGrid PlanCubeDecode(int64_t num_tokens, int64_t num_heads, int64_t num
     return grid;
   }
 
-  // One task per (token, kv_head): the query heads sharing a kv head are batched
-  // into the GEMM's M dimension, so there are num_kv_heads tasks per token and
-  // not num_heads.
   const int64_t base_tasks = num_tokens * num_kv_heads;
 
   int64_t num_splits = CeilDiv(aiv_num, base_tasks);
@@ -327,8 +271,6 @@ CubeDecodeGrid PlanCubeDecode(int64_t num_tokens, int64_t num_heads, int64_t num
   num_splits = std::max<int64_t>(num_splits, 1);
   grid.num_splits = num_splits;
 
-  // The workspace is indexed per *head*, not per task: the combine stage is the
-  // AIV path's and reads (token, head, split).
   const int64_t partial_stride = head_size + kPartialTail;
   const int64_t combine_tasks = num_tokens * num_heads;
   grid.workspace_floats = static_cast<size_t>(combine_tasks * num_splits * partial_stride);
@@ -382,9 +324,6 @@ vllm_ascend::turboquant::RotateQPlan RotateQuery(void *stream, AscendType type, 
                                                  void *h16, void *rot_tables, void *query_rot, int64_t num_tokens,
                                                  int64_t num_heads, int64_t head_size, int64_t aiv_num,
                                                  bool input_exact_in_half) {
-  // MIX blocks, not vector cores: arch35 pairs one cube core with two vector
-  // subcores, and blockDim on a MIX launch counts the pairs. Mirrors the same
-  // halving in npu_turboquant_rotate_q.
   int64_t core_num = aiv_num / 2;
   if (core_num < 1) {
     core_num = 1;
@@ -399,6 +338,6 @@ vllm_ascend::turboquant::RotateQPlan RotateQuery(void *stream, AscendType type, 
   return plan;
 }
 
-}  // namespace turboquant_host
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}

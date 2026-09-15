@@ -2710,9 +2710,6 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 #endif
 
 #ifdef VLLM_ENABLE_TURBOQUANT
-// TurboQuant 4-bit KV cache.  Registered as a library fragment so the ops exist
-// on every SOC that can build the kernels (910B and 950PR) rather than being
-// duplicated inside the per-platform TORCH_LIBRARY blocks above.
 TORCH_LIBRARY_FRAGMENT_EXPAND(CONCAT(_C, _ascend), ops)
 {
     ops.def(
@@ -2727,11 +2724,6 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("npu_turboquant_reshape_and_cache", torch::kPrivateUse1,
              &vllm_ascend::npu_turboquant_reshape_and_cache);
 
-    // Pi x for every [token, head] vector. Must run on the query before
-    // npu_turboquant_paged_attention, which takes its output and applies no
-    // rotation of its own. Pi is an involution, so the backend also runs it to
-    // un-rotate an output whose projection was not folded, and to rotate the
-    // prefill value of a layer whose projection was.
     ops.def(
         "npu_turboquant_rotate_q(Tensor query, "
         "                        Tensor pi_signs, "
@@ -2757,10 +2749,6 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("npu_turboquant_paged_attention", torch::kPrivateUse1,
              &vllm_ascend::npu_turboquant_paged_attention);
 
-    // Host-side helpers, called while the model loads rather than on the decode
-    // path.  Registered as catch-all kernels rather than under kPrivateUse1:
-    // neither takes a tensor, so the dispatcher has no argument to read a
-    // backend key off and a PrivateUse1-only kernel would be unreachable.
     ops.def("npu_turboquant_vector_core_num() -> int");
     ops.impl("npu_turboquant_vector_core_num",
              &vllm_ascend::npu_turboquant_vector_core_num);

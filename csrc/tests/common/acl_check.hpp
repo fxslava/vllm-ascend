@@ -14,11 +14,6 @@
  * limitations under the License.
  */
 
-// Error-checking helpers for the raw ACL runtime.
-//   * ACL_CHECK      - throws AclError. Use it inside RAII types and helpers
-//                      where a GTest fatal assertion cannot unwind cleanly.
-//   * ASSERT_ACL_OK  - GTest fatal assertion. Use it directly in test bodies.
-
 #pragma once
 
 #include <acl/acl.h>
@@ -31,8 +26,6 @@
 namespace vllm_ascend {
 namespace test {
 
-// aclGetRecentErrMsg() carries the CANN-side diagnostic and is far more useful
-// than the numeric status on its own, so it is always folded into the message.
 inline std::string AclRecentErrorMessage() {
   const char* message = aclGetRecentErrMsg();
   return (message != nullptr) ? std::string(message) : std::string("<no CANN error message>");
@@ -67,8 +60,6 @@ class AclError : public std::exception {
     }                                                                             \
   } while (false)
 
-// Non-throwing variant for destructors and teardown paths, where an exception
-// would terminate the process and hide the original failure.
 #define ACL_CHECK_NOTHROW(expression)                                             \
   do {                                                                            \
     const int vllm_ascend_acl_status = static_cast<int>(expression);               \
@@ -96,5 +87,5 @@ void ReportIgnoredAclFailure(const char* expression, const char* file, int line,
                                                vllm_ascend_acl_status);           \
   } while (false)
 
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}

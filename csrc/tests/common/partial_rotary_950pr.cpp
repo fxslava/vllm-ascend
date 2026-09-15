@@ -28,14 +28,8 @@ namespace {
 
 constexpr size_t kHalfBytes = sizeof(uint16_t);
 
-// "half" is the neox / rotate_half pairing: element k with element
-// k + rotary_dim/2, which is what Qwen3.5 uses and what the cos/sin tables in
-// the dump are laid out for. Non-const because the operator takes char*.
 char kRotaryModeHalfString[] = "half";
 
-// Copies the [0, rotary_dim) slice of every head out of a
-// [tokens, heads, head_dim] buffer into a contiguous
-// [tokens, heads, rotary_dim] one, or back again. One copy per head.
 void CopyRotarySlices(void* strided, void* packed, int64_t tokens, int64_t heads, int64_t head_dim,
                       int64_t rotary_dim, bool pack, aclrtStream stream) {
   auto* strided_bytes = static_cast<uint8_t*>(strided);
@@ -51,8 +45,6 @@ void CopyRotarySlices(void* strided, void* packed, int64_t tokens, int64_t heads
   }
 }
 
-// Runs the stock operator over two BSND tensors that are already exactly
-// rotary_dim wide.
 void RunStockRotary(void* q_data, void* k_data, const DeviceTensor& cos, const DeviceTensor& sin, int64_t tokens,
                     int64_t q_heads, int64_t kv_heads, int64_t width, aclrtStream stream) {
   AclnnTensor query({1, tokens, q_heads, width}, ACL_FLOAT16, q_data);
@@ -63,13 +55,9 @@ void RunStockRotary(void* q_data, void* k_data, const DeviceTensor& cos, const D
                                               kRotaryModeHalfString);
 }
 
-// Runs the custom operator once per tensor over the full head width.
 void RunCustomRotary(void* q_data, void* k_data, const DeviceTensor& cos, const DeviceTensor& sin, int64_t tokens,
                      int64_t q_heads, int64_t kv_heads, int64_t head_dim, int64_t rotary_dim,
                      aclrtStream stream) {
-  // partial_slice as {start, length}: rotate [0, rotary_dim) of every head. See
-  // the UNVERIFIED note on kInplacePartialRotaryMul - the default {0, 0} means
-  // "no slice", which is what makes {start, length} the reading this assumes.
   AclnnIntArray partial_slice(std::vector<int64_t>{0, rotary_dim});
 
   AclnnTensor query({1, tokens, q_heads, head_dim}, ACL_FLOAT16, q_data);
@@ -81,7 +69,7 @@ void RunCustomRotary(void* q_data, void* k_data, const DeviceTensor& cos, const 
                                                        sin.get(), ops950::kRotaryModeHalf, partial_slice.get());
 }
 
-}  // namespace
+}
 
 const char* PartialRotaryPathName(PartialRotaryPath path) {
   switch (path) {
@@ -101,8 +89,6 @@ const AclnnOp& PartialRotaryCustomOp() {
 }
 
 const AclnnOp& PartialRotaryStockOp() {
-  // The operator gained a V2 suffix partway through the CANN 8.x line; try the
-  // newer name first and fall back to the original.
   static const AclnnOp op = ops::ResolveFirstAvailable({ops::kApplyRotaryPosEmbV2, ops::kApplyRotaryPosEmb});
   return op;
 }
@@ -117,7 +103,6 @@ bool SelectPartialRotaryPath(int64_t head_dim, int64_t rotary_dim, PartialRotary
     return true;
   }
 
-  // Partial rotation. Prefer the operator that was written for it.
   if (PartialRotaryCustomOp().available()) {
     *path = PartialRotaryPath::kCustomOp;
     return true;
@@ -143,9 +128,6 @@ PartialRotaryPath ApplyPartialRotaryQK(void* q_data, void* k_data, const std::ve
     throw AclError(reason.c_str(), __FILE__, __LINE__, -1);
   }
 
-  // BSND with the head axis broadcast: cos and sin are shared across heads, so
-  // the N axis is 1. This is the shape _rope_forward_oot builds and the shape
-  // the golden dump's [1, rotary_dim] tables widen to for tokens == 1.
   DeviceTensor cos = DeviceTensor::Half({1, tokens, 1, rotary_dim}, cos_full);
   DeviceTensor sin = DeviceTensor::Half({1, tokens, 1, rotary_dim}, sin_full);
 
@@ -162,29 +144,21 @@ PartialRotaryPath ApplyPartialRotaryQK(void* q_data, void* k_data, const std::ve
       DeviceBuffer packed_q(static_cast<size_t>(tokens * q_heads * rotary_dim) * kHalfBytes);
       DeviceBuffer packed_k(static_cast<size_t>(tokens * kv_heads * rotary_dim) * kHalfBytes);
 
-      CopyRotarySlices(q_data, packed_q.get(), tokens, q_heads, head_dim, rotary_dim, /*pack=*/true, stream);
-      CopyRotarySlices(k_data, packed_k.get(), tokens, kv_heads, head_dim, rotary_dim, /*pack=*/true, stream);
-      // RunAclnn synchronises after the launch, but the copies above are async
-      // on the same stream and the operator has to see them completed. Same
-      // stream means same order, so this is ordering, not a race - the
-      // synchronise is here so a failure in a copy is reported against the copy.
+      CopyRotarySlices(q_data, packed_q.get(), tokens, q_heads, head_dim, rotary_dim, true, stream);
+      CopyRotarySlices(k_data, packed_k.get(), tokens, kv_heads, head_dim, rotary_dim, true, stream);
       ACL_CHECK(aclrtSynchronizeStream(stream));
 
       RunStockRotary(packed_q.get(), packed_k.get(), cos, sin, tokens, q_heads, kv_heads, rotary_dim, stream);
 
-      CopyRotarySlices(q_data, packed_q.get(), tokens, q_heads, head_dim, rotary_dim, /*pack=*/false, stream);
-      CopyRotarySlices(k_data, packed_k.get(), tokens, kv_heads, head_dim, rotary_dim, /*pack=*/false, stream);
-      // packed_q and packed_k are freed when this scope ends, so the unpack has
-      // to have finished before that happens.
+      CopyRotarySlices(q_data, packed_q.get(), tokens, q_heads, head_dim, rotary_dim, false, stream);
+      CopyRotarySlices(k_data, packed_k.get(), tokens, kv_heads, head_dim, rotary_dim, false, stream);
       ACL_CHECK(aclrtSynchronizeStream(stream));
       return path;
     }
   }
 
-  // Unreachable: every enumerator returns above. Kept so the function has a
-  // definite return value under compilers that do not see that.
   return path;
 }
 
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}

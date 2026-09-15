@@ -14,21 +14,6 @@
  * limitations under the License.
  */
 
-// Rotary position embedding (aclnnApplyRotaryPosEmbV2) on the v200 vector unit,
-// fp16, BSND layout, in place on query and key.
-//
-// It is in place, so each launch rotates the output of the previous one and the
-// usual bit-identical-output guard cannot be used. What survives repeated
-// rotation is the sum of squares, so that is what the checksum tracks, with
-// room for the fp16 drift of a few hundred launches.
-//
-// Both rotary layouts are benchmarked: "half" (neox) reads the two halves of
-// the head dim, "interleave" (GPT-J) reads adjacent pairs. Same byte count,
-// different access pattern.
-//
-// Bandwidth-bound: query and key are each read and written, cos and sin are
-// read once per token and shared across heads.
-
 #include <cstdint>
 #include <sstream>
 #include <stdexcept>
@@ -54,7 +39,6 @@ namespace {
 
 using reference::RotaryMode;
 
-// The prototype takes rotaryMode as a mutable char*, so these need storage.
 char kRotaryModeHalf[] = "half";
 char kRotaryModeInterleave[] = "interleave";
 
@@ -69,9 +53,6 @@ const AclnnOp& ApplyRotaryPosEmbOp() {
   return op;
 }
 
-// The head splits the parity suite covers, minus the duplicated shapes: what
-// varies here is token count, not the GQA ratio, because the rotation cost is
-// linear in num_heads and nothing interesting happens between the ratios.
 struct HeadConfiguration {
   int64_t head_dim;
   int64_t num_q_heads;
@@ -94,7 +75,7 @@ std::string CaseName(int64_t num_tokens, const HeadConfiguration& configuration)
   return name.str();
 }
 
-}  // namespace
+}
 
 void BuildSuite(BenchmarkRunner& runner) {
   const AclnnOp& op = ApplyRotaryPosEmbOp();
@@ -103,7 +84,7 @@ void BuildSuite(BenchmarkRunner& runner) {
     return;
   }
 
-  DeterministicRandom random(0x42524f50u);  // "BROP"
+  DeterministicRandom random(0x42524f50u);
 
   for (int64_t num_tokens : shapes::BenchmarkTokenCounts()) {
     for (const HeadConfiguration& configuration : kHeadConfigurations) {
@@ -115,8 +96,6 @@ void BuildSuite(BenchmarkRunner& runner) {
         const std::vector<float> key = random.NormalHalfExact(
             static_cast<size_t>(num_tokens * configuration.num_kv_heads * head_dim), 0.0f, 1.0f);
 
-        // Scattered positions, as in the parity test, so the cos/sin rows a
-        // token needs are not contiguous and the gather is not free.
         std::vector<int32_t> positions(static_cast<size_t>(num_tokens));
         for (int64_t i = 0; i < num_tokens; ++i) {
           positions[static_cast<size_t>(i)] =
@@ -153,19 +132,12 @@ void BuildSuite(BenchmarkRunner& runner) {
             static_cast<double>(num_tokens) * static_cast<double>(configuration.num_kv_heads) *
             static_cast<double>(head_dim);
         const double cos_sin_elements = 2.0 * static_cast<double>(num_tokens) * static_cast<double>(head_dim);
-        // Query and key are read and written; cos and sin are read once.
         benchmark_case.bytes_per_iteration = 2.0 * (2.0 * (q_elements + k_elements) + cos_sin_elements);
         benchmark_case.launch = [&planned](aclrtStream stream) { planned.Launch(stream); };
-        // Sum of squares, which the rotation preserves. See the file header for
-        // why an equality check would be wrong here.
         benchmark_case.checksum = [&query_device, &key_device]() {
           return ChecksumSumOfSquares(query_device.ToFloatFromHalf()) +
                  ChecksumSumOfSquares(key_device.ToFloatFromHalf());
         };
-        // Each launch re-rounds every element to fp16, so the invariant walks
-        // by roughly sqrt(launches) ULPs over the ~1300 launches a full run
-        // does. 5% leaves room for that while still catching a kernel that
-        // stops writing or starts scaling.
         benchmark_case.checksum_rtol = 5e-2;
 
         runner.Run(benchmark_case);
@@ -176,6 +148,6 @@ void BuildSuite(BenchmarkRunner& runner) {
   }
 }
 
-}  // namespace bench
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}
