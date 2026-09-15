@@ -76,10 +76,12 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
+    FullAttentionSpec,
     HiddenStateCacheSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
+    KVQuantMode,
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -173,6 +175,7 @@ from vllm_ascend.spec_decode.utils import (
 from vllm_ascend.utils import (
     AscendDeviceType,
     calc_split_factor,
+    turboquant_enabled,
     check_gdn_layer,
     embedding_tp_enable,
     enable_sfa_dcp_replicated_indexer,
@@ -219,6 +222,7 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
     AscendSFAIndexerCacheSpec,
     AscendSlidingWindowMLASpec,
+    AscendTurboQuantAttentionSpec,
 )
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
@@ -4156,6 +4160,39 @@ class NPUModelRunner(GPUModelRunner):
                     # and rope head dim.
                     current_kv_cache_spec = layer_kv_cache_spec[layer_name]
                     assert isinstance(current_kv_cache_spec, AttentionSpec)
+
+                    if isinstance(current_kv_cache_spec, AscendTurboQuantAttentionSpec):
+                        # Three planes out of one page budget: packed keys, packed
+                        # values and the fp32 scale plane. Splitting by bytes per
+                        # token keeps each plane contiguous, which the kernels
+                        # require, and keeps the scale plane inside the allocation
+                        # the cache manager sized -- so it is no longer a side
+                        # tensor the block accounting cannot see.
+                        spec = current_kv_cache_spec
+                        per_token = [
+                            spec.num_kv_heads * (spec.head_size // spec.pack_factor),
+                            spec.num_kv_heads * (spec.head_size // spec.pack_factor),
+                            spec.scale_slot_floats * get_dtype_size(torch.float32),
+                        ]
+                        # Integer arithmetic rather than calc_split_factor's float
+                        # ratios: the reshape below asserts the three planes are a
+                        # whole number of pages, and a one-byte rounding error
+                        # would break that.
+                        page_per_token = sum(per_token)
+                        plane_sizes = [
+                            kv_cache_tensor.size * plane_bytes // page_per_token for plane_bytes in per_token
+                        ]
+                        assert sum(plane_sizes) == kv_cache_tensor.size, (
+                            f"{layer_name}: TurboQuant planes {plane_sizes} do not add up to the "
+                            f"{kv_cache_tensor.size}-byte allocation"
+                        )
+                        planes = tuple(
+                            self._allocate_int8_cache_tensor(plane_size, alignment) for plane_size in plane_sizes
+                        )
+                        for layer_name_inner in kv_cache_tensor.shared_by:
+                            kv_cache_raw_tensors[layer_name_inner] = planes
+                        continue
+
                     current_sparse_sfa_c8 = self.use_sparse and kv_cache_spec_uses_sparse_sfa_c8(
                         current_kv_cache_spec
                     )
@@ -4257,6 +4294,46 @@ class NPUModelRunner(GPUModelRunner):
             storage_offset_bytes += stride[0] * dtype_size
         return reshaped_kv_tensors
 
+    def _as_turboquant_spec(self, layer_name: str, spec: KVCacheSpec) -> KVCacheSpec:
+        """Re-describe a dense attention layer's cache for the 4-bit layout.
+
+        vLLM hands dense layers a ``FullAttentionSpec`` sized from the unpacked
+        head size, which over-allocates the packed cache about fourfold and has
+        no concept of the fp32 scale plane at all. The Ascend spec budgets both
+        packed planes and the burst-aligned scale plane, so the block allocator
+        sizes pages from what the kernels actually write.
+
+        Anything that is not a plain full-attention layer is returned unchanged:
+        TurboQuant refuses sliding-window attention in ``forward``, and MLA
+        carries its own spec.
+        """
+        if not turboquant_enabled(self.vllm_config):
+            return spec
+        if type(spec) is not FullAttentionSpec:
+            return spec
+        if getattr(spec, "sliding_window", None) is not None:
+            return spec
+
+        converted = AscendTurboQuantAttentionSpec(
+            block_size=spec.block_size,
+            num_kv_heads=spec.num_kv_heads,
+            head_size=spec.head_size,
+            head_size_v=spec.head_size_v,
+            dtype=spec.dtype,
+            kv_quant_mode=KVQuantMode.INT4_PER_TOKEN_HEAD,
+            attention_chunk_size=spec.attention_chunk_size,
+            non_causal=spec.non_causal,
+        )
+        logger.debug(
+            "[vllm-ascend/turboquant] %s: page %d B -> %d B (%d B payload + %d B scale plane)",
+            layer_name,
+            spec.page_size_bytes,
+            converted.page_size_bytes,
+            converted.payload_bytes,
+            converted.scale_plane_bytes,
+        )
+        return converted
+
     @staticmethod
     def _view_raw_kv_cache(raw_tensor: torch.Tensor, dtype: torch.dtype, shape: tuple[int, ...]) -> torch.Tensor:
         """View one raw int8 K or V cache buffer as ``shape``.
@@ -4305,6 +4382,38 @@ class NPUModelRunner(GPUModelRunner):
                     continue
 
                 current_kv_cache_spec = layer_kv_cache_spec[layer_name]
+
+                if isinstance(current_kv_cache_spec, AscendTurboQuantAttentionSpec):
+                    # The three planes allocated together in
+                    # _allocate_kv_cache_tensors, viewed as the kernels read them:
+                    # two packed int8 planes and the fp32 scale plane. No leading
+                    # slice is needed here -- unlike the ENABLE_TURBOQUANT path
+                    # over a stock spec, this page was sized for exactly these
+                    # bytes, so nothing is left over.
+                    spec = current_kv_cache_spec
+                    raw_planes = kv_cache_raw_tensors[layer_name]
+                    assert isinstance(raw_planes, tuple) and len(raw_planes) == 3, (
+                        f"{layer_name}: TurboQuant expects three raw planes, got {type(raw_planes)}"
+                    )
+                    raw_k, raw_v, raw_scale = raw_planes
+                    total_bytes = raw_k.numel() + raw_v.numel() + raw_scale.numel()
+                    assert total_bytes % spec.page_size_bytes == 0, (
+                        f"{layer_name}: {total_bytes} raw bytes is not a whole number of "
+                        f"{spec.page_size_bytes}-byte TurboQuant pages"
+                    )
+                    num_blocks = total_bytes // spec.page_size_bytes
+                    assert num_blocks >= kv_cache_config.num_blocks
+
+                    packed_shape = attn_backend.get_kv_cache_shape(
+                        num_blocks, spec.block_size, spec.num_kv_heads, spec.head_size
+                    )[1:]
+                    scale_shape = (num_blocks, spec.block_size, spec.scale_slot_floats)
+                    kv_caches[layer_name] = (
+                        raw_k.view(torch.int8).view(packed_shape),
+                        raw_v.view(torch.int8).view(packed_shape),
+                        raw_scale.view(torch.float32).view(scale_shape),
+                    )
+                    continue
 
                 # TODO: remove this after the OOM issue is located and fixed, otherwise, some model may
                 # encounter OOM issue
@@ -4862,7 +4971,7 @@ class NPUModelRunner(GPUModelRunner):
                     kv_cache_spec[layer_name] = spec
             elif isinstance(attn_module, Attention):
                 if spec := attn_module.get_kv_cache_spec(self.vllm_config):
-                    kv_cache_spec[layer_name] = spec
+                    kv_cache_spec[layer_name] = self._as_turboquant_spec(layer_name, spec)
                     attn_layer_names.add(layer_name)
 
             elif isinstance(attn_module, MLAAttention):

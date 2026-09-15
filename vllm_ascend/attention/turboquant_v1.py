@@ -237,6 +237,45 @@ class AscendTurboQuantAttentionBackend(AscendAttentionBackend):
     def get_supported_kernel_block_sizes() -> list[int]:
         return [128]
 
+    @staticmethod
+    def swap_blocks(
+        src_kv_cache: list[torch.Tensor],
+        dst_kv_cache: list[torch.Tensor],
+        src_to_dst: torch.Tensor,
+    ) -> None:
+        """Move packed blocks *and* the scale lanes that decode them.
+
+        The base implementation moves ``kv_cache[0]`` and ``kv_cache[1]`` only.
+        A TurboQuant block is meaningless without its scales, so relocating the
+        codes without them does not raise -- it produces plausible wrong
+        numbers. Anything the cache holds beyond the two packed planes is
+        indexed by block in dimension 0 as well, so the same gather applies.
+        """
+        src_indices = src_to_dst[:, 0]
+        dst_indices = src_to_dst[:, 1]
+        for src_plane, dst_plane in zip(src_kv_cache, dst_kv_cache):
+            if src_plane is None or dst_plane is None:
+                continue
+            dst_plane[dst_indices] = src_plane[src_indices].to(dst_plane.device)
+
+    @staticmethod
+    def copy_blocks(
+        kv_caches: list[torch.Tensor],
+        src_to_dists: torch.Tensor,
+    ) -> None:
+        """Copy packed blocks together with their scale lanes.
+
+        See :meth:`swap_blocks`: a copy that leaves the scales behind is the
+        same silent corruption.
+        """
+        src_indices = src_to_dists[:, 0]
+        dst_indices = src_to_dists[:, 1]
+        for kv_cache in kv_caches:
+            for plane in kv_cache:
+                if plane is None:
+                    continue
+                plane[dst_indices] = plane[src_indices]
+
 
 class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
     """Attention over a 4-bit TurboQuant KV cache.
@@ -284,18 +323,51 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         return self._hadamard16
 
     def _ensure_scale_cache(self, kv_cache: tuple[torch.Tensor, ...]) -> None:
-        """Allocate the fp32 scale plane that accompanies the packed cache.
+        """Bind the fp32 scale plane that accompanies the packed cache.
 
         The packed cache shape is fixed by ``get_kv_cache_shape`` and has no room
-        for a per-vector scale, so the scales live in a side allocation shaped
+        for a per-vector scale, so the scales occupy their own plane shaped
         ``(num_blocks, block_size, scale_slot)``.  Indexing by token rather than
         by head is what makes the kernel's scatter a single aligned burst; see
         :func:`turboquant_scale_slot` for what the padding costs.
+
+        The model runner carves that plane out of the same KV cache allocation
+        as the two packed planes and hands it over as ``kv_cache[2]``, budgeted
+        by :class:`AscendTurboQuantAttentionSpec`.  That is what keeps it
+        visible to everything that accounts for the cache in pages.
+
+        A two-element ``kv_cache`` means the runner did not provide one, which
+        is the pre-spec arrangement and still what the CPU harness passes.  The
+        plane is then allocated here, once, and refused during a graph capture
+        for the same reason the decode workspace is: a capture replays the
+        addresses it recorded.
         """
         if self.scale_cache is not None:
             return
+
         num_blocks, block_size, num_kv_heads, _ = kv_cache[0].shape
         shape = (num_blocks, block_size, turboquant_scale_slot(num_kv_heads))
+
+        if len(kv_cache) >= 3 and kv_cache[2] is not None:
+            provided = kv_cache[2]
+            if provided.shape != shape:
+                raise RuntimeError(
+                    f"[vllm-ascend/turboquant] the scale plane is {tuple(provided.shape)}, expected {shape} "
+                    f"for a {num_blocks}-block cache of {num_kv_heads} kv heads"
+                )
+            if provided.dtype != torch.float32:
+                raise RuntimeError(
+                    f"[vllm-ascend/turboquant] the scale plane must be float32, got {provided.dtype}"
+                )
+            self.scale_cache = provided
+            return
+
+        if _is_capturing():
+            raise RuntimeError(
+                f"[vllm-ascend/turboquant] the {shape} scale plane would have to be allocated during a "
+                "graph capture. Run this layer once outside capture, or let the model runner carve the "
+                "plane from the KV cache allocation so there is nothing left to allocate here."
+            )
         self.scale_cache = torch.zeros(shape, dtype=torch.float32, device=kv_cache[0].device)
 
     def reshape_and_cache(
