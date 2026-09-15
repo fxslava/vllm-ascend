@@ -37,17 +37,23 @@ namespace {
 
 constexpr const char* kStageFlag = "--stage=";
 constexpr const char* kTimeoutFlag = "--sync-timeout-ms=";
+constexpr const char* kBypassFlag = "--bypass-unpack";
+constexpr const char* kBypassOnlyFlag = "--bypass-unpack=only";
 constexpr char kLastStageDigit = '5';
 constexpr size_t kMaxTimeoutDigits = 9;
 constexpr int kUsageExitCode = 2;
 
 void PrintUsage(const char* argv0) {
-  std::printf("usage: %s [--stage=<list>] [--sync-timeout-ms=<ms>] [--help]\n"
+  std::printf("usage: %s [--stage=<list>] [--sync-timeout-ms=<ms>] [--bypass-unpack[=only]] [--help]\n"
               "\n"
               "  --stage=<list>          comma-separated stages 0..5, run in that order.\n"
               "                          Default: all six. One stage per process isolates it.\n"
               "  --sync-timeout-ms=<ms>  deadline for each stage's first launch. Default 30000;\n"
               "                          0 waits forever. A stage that misses it exits 3.\n"
+              "  --bypass-unpack         after the ladder, time the full split against the same split\n"
+              "                          fed pre-unpacked fp8 operands (UnpackAffine removed), on one\n"
+              "                          mirrored host cache, head_size <= 256 only.\n"
+              "  --bypass-unpack=only    the bypass pair without the stage ladder.\n"
               "\n"
               "Restrict the shapes with ASCEND_BENCH_TQ_ABLATION_DIMS and\n"
               "ASCEND_BENCH_TQ_ABLATION_CONTEXTS, and shape the timing with the shared\n"
@@ -96,6 +102,14 @@ int main(int argc, char** argv) {
         return kUsageExitCode;
       }
       ::setenv("ASCEND_BENCH_TQ_ABLATION_SYNC_TIMEOUT_MS", value.c_str(), 1);
+      continue;
+    }
+    if (std::strcmp(arg, kBypassFlag) == 0) {
+      ::setenv("ASCEND_BENCH_TQ_ABLATION_BYPASS_UNPACK", "1", 1);
+      continue;
+    }
+    if (std::strcmp(arg, kBypassOnlyFlag) == 0) {
+      ::setenv("ASCEND_BENCH_TQ_ABLATION_BYPASS_UNPACK", "only", 1);
       continue;
     }
     if (std::strcmp(arg, "--help") == 0 || std::strcmp(arg, "-h") == 0) {

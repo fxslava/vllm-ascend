@@ -311,12 +311,15 @@ private:
 };
 
 template <TurboQuantMode MODE, typename scalar_t,
-          DecodeAblationStage STAGE = DecodeAblationStage::STAGE_5_FULL_PIPELINE>
+          DecodeAblationStage STAGE = DecodeAblationStage::STAGE_5_FULL_PIPELINE, bool BYPASS_UNPACK = false>
 class TurboQuantCubeDecodeSplit {
 public:
     using Codec = TurboQuantModeCodec<MODE>;
     using Mm = TurboQuantCubeMm<MODE>;
     using OperandT = typename Mm::OperandT;
+
+    static_assert(!BYPASS_UNPACK || (Codec::kIsAffine && STAGE == DecodeAblationStage::STAGE_5_FULL_PIPELINE),
+                  "the unpack bypass replaces the affine unpack of the full pipeline and nothing else");
 
     __aicore__ static constexpr bool Keeps(DecodeAblationStage stage)
     {
@@ -353,7 +356,12 @@ public:
         }
         unpackBytes_ = unpackGroups_ * kCubeTileRows * kOperandC0;
 
-        if constexpr (Codec::kIsAffine) {
+        if constexpr (BYPASS_UNPACK) {
+            const uint32_t operandPlane = numKvHeads_ * operandElems_;
+            tileParams_ = AscendC::DataCopyParams{static_cast<uint16_t>(kCubeTileRows), 1,
+                                                  static_cast<uint16_t>((operandPlane - kOperandC0) / 32), 0};
+            unpackParams_ = AscendC::DataCopyParams{1, static_cast<uint16_t>(unpackBytes_ / 32), 0, 0};
+        } else if constexpr (Codec::kIsAffine) {
             tileParams_ = AscendC::DataCopyParams{static_cast<uint16_t>(kCubeTileRows), 1,
                                                   static_cast<uint16_t>((packedPlane_ - kOperandC0) / 32), 0};
             unpackParams_ = AscendC::DataCopyParams{1, static_cast<uint16_t>(unpackBytes_ / 32), 0, 0};
@@ -406,6 +414,9 @@ public:
 
         codec_.Init(pipe_, headSize_,
                     Codec::kIsAffine ? (2 * unpackBytes_ / headSize_) : kUnpackRows, invSqrtLen, modeTablesGm_);
+        if constexpr (BYPASS_UNPACK) {
+            pipe_->InitBuffer(operandTileBuf_, 2 * kCubeTileRows * operandElems_);
+        }
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 
@@ -627,6 +638,13 @@ private:
     {
         AscendC::LocalTensor<int8_t> packedTile = kvBuf_.Get<int8_t>();
         AscendC::LocalTensor<float> scaleTile = scaleTileBuf_.Get<float>();
+        if constexpr (BYPASS_UNPACK) {
+            AscendC::LocalTensor<int8_t> operandTile = operandTileBuf_.Get<int8_t>();
+            CopyInTile(operandTile, scaleTile, tile.physical, kvHead, tile.base);
+            StageOperandsToL1(operandTile, mm_.B1K(l1SlotIdx));
+            StageOperandsToL1(operandTile[kCubeTileRows * operandElems_], mm_.B1V(l1SlotIdx));
+            return;
+        }
         CopyInTile(packedTile, scaleTile, tile.physical, kvHead, tile.base);
         if constexpr (!Keeps(DecodeAblationStage::STAGE_1_UNPACK)) {
             return;
@@ -735,7 +753,17 @@ private:
         const uint64_t cacheOff = row * packedPlane_ + static_cast<uint64_t>(kvHead) * packedBytes_;
         const uint64_t scaleOff = row * scaleSlot_;
 
-        if constexpr (Codec::kIsAffine) {
+        if constexpr (BYPASS_UNPACK) {
+            const uint32_t groupElems = kCubeTileRows * kOperandC0;
+            const uint64_t operandOff =
+                row * numKvHeads_ * operandElems_ + static_cast<uint64_t>(kvHead) * operandElems_;
+            for (uint32_t groupIdx = 0; groupIdx < operandElems_ / kOperandC0; ++groupIdx) {
+                AscendC::DataCopy(kv[groupIdx * groupElems],
+                                  keyCacheGm_[operandOff + groupIdx * kOperandC0], tileParams_);
+                AscendC::DataCopy(kv[kCubeTileRows * operandElems_ + groupIdx * groupElems],
+                                  valueCacheGm_[operandOff + groupIdx * kOperandC0], tileParams_);
+            }
+        } else if constexpr (Codec::kIsAffine) {
             const uint32_t groupElems = kCubeTileRows * kOperandC0;
             for (uint32_t groupIdx = 0; groupIdx < packedGroups_; ++groupIdx) {
                 AscendC::DataCopy(kv[groupIdx * groupElems],
@@ -798,6 +826,23 @@ private:
         } else {
             AscendC::PipeBarrier<PIPE_ALL>();
         }
+    }
+
+    __aicore__ inline void StageOperandsToL1(const AscendC::LocalTensor<int8_t> &operands,
+                                             const AscendC::LocalTensor<OperandT> &l1Dst)
+    {
+        if ASCEND_IS_AIC {
+            return;
+        }
+        const AscendC::LocalTensor<OperandT> operandUb = operands.template ReinterpretCast<OperandT>();
+        const uint32_t groupElems = kCubeTileRows * kOperandC0;
+        for (uint32_t groupBase = 0; groupBase < packedGroups_; groupBase += unpackGroups_) {
+            SyncVectorToMte3();
+            AscendC::DataCopy(l1Dst[groupBase * groupElems], operandUb[groupBase * groupElems], unpackParams_);
+            AscendC::DataCopy(l1Dst[(packedGroups_ + groupBase) * groupElems],
+                              operandUb[(packedGroups_ + groupBase) * groupElems], unpackParams_);
+        }
+        SyncMte3ToVector();
     }
 
     __aicore__ inline void SoftmaxStageProbs(const AscendC::LocalTensor<float> &scores,
@@ -947,6 +992,7 @@ private:
     AscendC::TBuf<AscendC::QuePosition::VECCALC> stateBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> reduceBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> scaleIdxBuf_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> operandTileBuf_;
     AscendC::GlobalTensor<float> queryRotGm_;
     AscendC::GlobalTensor<int8_t> keyCacheGm_;
     AscendC::GlobalTensor<int8_t> valueCacheGm_;
@@ -1584,6 +1630,21 @@ TURBOQUANT_MM_DECODE_ABLATION_DECLARE(s1, DecodeAblationStage::STAGE_1_UNPACK)
 TURBOQUANT_MM_DECODE_ABLATION_DECLARE(s2, DecodeAblationStage::STAGE_2_QUERY_PREP)
 TURBOQUANT_MM_DECODE_ABLATION_DECLARE(s3, DecodeAblationStage::STAGE_3_L1_STAGING)
 TURBOQUANT_MM_DECODE_ABLATION_DECLARE(s4, DecodeAblationStage::STAGE_4_SCORE_GEMM)
+
+extern "C" __global__ __aicore__ void turboquant_mm_decode_bypass_unpack_kv4fp8_half(
+    GM_ADDR queryRot, GM_ADDR keyOperandCache, GM_ADDR valueOperandCache, GM_ADDR scaleCache, GM_ADDR blockTables,
+    GM_ADDR contextLens, GM_ADDR modeTables, GM_ADDR workspace,
+    uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,
+    uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t tasksPerCore, float scale, float invSqrtLen)
+{
+    AscendC::TPipe pipe;
+    TurboQuantCubeDecodeSplit<TurboQuantMode::KV4_FP8, half, DecodeAblationStage::STAGE_5_FULL_PIPELINE, true> op(
+        &pipe);
+    op.Init(queryRot, keyOperandCache, valueOperandCache, scaleCache, blockTables, contextLens, modeTables,
+            workspace, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, scale,
+            invSqrtLen);
+    op.Process(tasksPerCore);
+}
 #endif
 
 #define TURBOQUANT_FP16_DECODE_SPLIT_DECLARE(TYPE)                                                                   \
@@ -1735,6 +1796,23 @@ void turboquant_mm_decode_ablation_impl(int32_t stage, AscendType type, void *st
                 tasksPerCore, scale, invSqrtLen);
             break;
     }
+}
+
+void turboquant_mm_decode_bypass_unpack_impl(AscendType type, void *stream, uint32_t blockDim, void *queryRot,
+                                             void *keyOperandCache, void *valueOperandCache, void *scaleCache,
+                                             void *blockTables, void *contextLens, void *modeTables,
+                                             void *workspace, uint32_t numTokens, uint32_t numHeads,
+                                             uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,
+                                             uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t tasksPerCore,
+                                             float scale, float invSqrtLen)
+{
+    if (type != AscendType::FP16) {
+        return;
+    }
+    turboquant_mm_decode_bypass_unpack_kv4fp8_half<<<blockDim, nullptr, stream>>>(
+        queryRot, keyOperandCache, valueOperandCache, scaleCache, blockTables, contextLens, modeTables, workspace,
+        numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, tasksPerCore, scale,
+        invSqrtLen);
 }
 #endif
 
