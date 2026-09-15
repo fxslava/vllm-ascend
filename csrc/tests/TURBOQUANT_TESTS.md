@@ -928,6 +928,56 @@ fills the packed cache from the host instead of launching the 1,232 s write:
 nothing on the flag protocol reads the values, so it is the right cache for a
 hang check and the wrong one for a cosine.
 
+#### The unpack bypass
+
+**What it answers:** how much of the full split is `UnpackAffine`, measured by
+removing it rather than by subtracting ladder rungs. `BYPASS_UNPACK`, a fourth
+template parameter on `TurboQuantCubeDecodeSplit` (stage 5, affine mode only),
+builds `turboquant_mm_decode_bypass_unpack_kv4fp8_half`. It takes a
+pre-unpacked **fp8 operand** cache, `[blocks, block, kv_heads, head_size]`, in
+place of the packed one.
+
+**What changes, and what does not.**
+- Changed: `CopyInTile` reads that cache GM -> UB in 32-byte group bursts, and
+  `StageOperandsToL1` hands it to L1 with the same `SyncVectorToMte3()` +
+  `DataCopy` pairs and `SyncMte3ToVector()` as `UnpackToL1`.
+- Unchanged: query prep, softmax, every cross-core flag, both GEMMs, the partial
+  writeback and the combine.
+- The 2 x 64 x `head_size` tile buffer is allocated after every other buffer, so
+  the shared ones keep their UB base addresses (13.21).
+- fp8 rather than fp16, because the Cube operand is fp8 and there is no
+  half -> fp8 cast.
+- The bypass moves **twice the GM bytes** of the packed read, so its saving is a
+  lower bound on the unpack's cost.
+- At `head_size` 512 the extra 65,536 B would exceed UB, so the bench skips
+  that size.
+
+**The cache it runs on.** `common/turboquant_mirrored_cache.hpp` mirrors each
+K/V vector's halves, `x[j] == x[j + D/2]`. Every packed byte therefore holds
+two equal nibbles, and the fp8 image is the codec's expansion under either
+nibble order. Unwritten slots hold +0.5, the expansion of a zero byte. Both
+splits run on one such cache, so their partials must match **bit for bit**.
+`test_host_turboquant_fidelity` pins the builder.
+
+**Camodel smoke,** `TurboQuantDecodeAblation.BypassUnpackKeepsThePipelineOnTheCamodel`
+(4 query heads over 1 kv head, D 256, block 64, one split, 2026-09-15):
+
+| S | path | split wall | cos vs fp32 | partials | exception dumps | exit |
+| --- | --- | --- | --- | --- | --- | --- |
+| 256 | standard | 136.2 s | 0.999496 | written | 0 bytes | 0 |
+| 256 | bypass | 96.8 s (0.711x) | 0.999496 | **0 of 1088 words differ** | 0 bytes | 0 |
+| 2048 | standard | 883.0 s, 290,297 ticks over a setup-only process | 0.999530 | written | 0 bytes | 0 |
+| 2048 | bypass | stopped before it returned | -- | -- | -- | -- |
+
+On the camodel, `aclrtEventElapsedTime` reads 0.000 ms around every launch, so
+the only measures there are wall clock and the simulator's per-process
+`Total tick`. Wall clock is not device time. **Keep camodel runs at S <= 256.**
+The timing question belongs to the bench: `--bypass-unpack` adds the pair
+after the ladder, and `--bypass-unpack=only` runs the pair alone. It reports
+standard and bypass medians, the ratio, the removed share, both tile reads,
+partial identity and both cosines. Setup failures, bit mismatches, or a cos
+below 0.90 are recorded as failures and marked UNTRUSTED.
+
 ---
 
 ## 8. The fp16 baseline, and the V2 → V5 migration

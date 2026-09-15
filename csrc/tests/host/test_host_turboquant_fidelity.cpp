@@ -29,7 +29,9 @@
 #include "cpu_reference.hpp"
 #include "fp16.hpp"
 #include "golden_layer3.hpp"
+#include "random_data.hpp"
 #include "turbo_quant_cpu.h"
+#include "turboquant_mirrored_cache.hpp"
 
 namespace vllm_ascend {
 namespace test {
@@ -843,6 +845,90 @@ TEST(TurboQuantEdgeCases, PartialBatchesMatchPerRowQuantisation) {
       }
     }
   }
+}
+
+TEST(TurboQuantMirroredCache, PackedBytesAndFp8OperandsDescribeTheSameLevels) {
+  namespace tqh = turboquant_host;
+  constexpr int64_t kContext = 20;
+  constexpr int64_t kBlock = 16;
+  constexpr int64_t kKvHeads = 2;
+  constexpr int64_t kHead = 64;
+  constexpr int64_t kBlocks = 4;
+  constexpr int kSignedNibbleRange = 16;
+  constexpr int kSignedNibbleMax = 7;
+  const std::vector<int32_t> table = {2, 0};
+
+  for (int32_t index = 0; index < tqh::kMirroredLevels; ++index) {
+    const float level = tqh::MirroredLevel(index);
+    ASSERT_EQ(tqh::Fp8E4m3fnValue(tqh::Fp8E4m3fnBits(level)), level);
+  }
+
+  DeterministicRandom rng(0x4D49u);
+  const tqh::MirroredKvCache cache = tqh::BuildMirroredKvCache(rng, kContext, kBlocks, kBlock, kKvHeads, kHead, table);
+  const size_t half = static_cast<size_t>(kHead / 2);
+  const size_t head = static_cast<size_t>(kHead);
+  const size_t kv_heads = static_cast<size_t>(kKvHeads);
+  const size_t slot_floats = static_cast<size_t>(tqh::MirroredScaleSlotFloats(kKvHeads));
+  const size_t slots = static_cast<size_t>(kBlocks * kBlock);
+  ASSERT_EQ(cache.key_packed.size(), slots * kv_heads * half);
+  ASSERT_EQ(cache.key_operands.size(), slots * kv_heads * head);
+  ASSERT_EQ(cache.scales.size(), slots * slot_floats);
+
+  std::vector<bool> written(slots, false);
+  size_t mismatches = 0;
+  for (int64_t t = 0; t < kContext; ++t) {
+    const size_t slot = static_cast<size_t>(table[static_cast<size_t>(t / kBlock)] * kBlock + t % kBlock);
+    written[slot] = true;
+    for (size_t kv = 0; kv < kv_heads; ++kv) {
+      for (int plane = 0; plane < 2; ++plane) {
+        const std::vector<int8_t>& packed = plane == 0 ? cache.key_packed : cache.value_packed;
+        const std::vector<int8_t>& operands = plane == 0 ? cache.key_operands : cache.value_operands;
+        const std::vector<float>& dense = plane == 0 ? cache.key : cache.value;
+        const float scale = cache.scales[slot * slot_floats + (plane == 0 ? kv : kv_heads + kv)];
+        ASSERT_GT(scale, 0.0f);
+        const size_t row = slot * kv_heads + kv;
+        const size_t dense_row = (static_cast<size_t>(t) * kv_heads + kv) * head;
+        for (size_t j = 0; j < half; ++j) {
+          const uint32_t byte = static_cast<uint8_t>(packed[row * half + j]);
+          const int low = static_cast<int>(byte & tqh::kMirroredNibbleMask);
+          const int high = static_cast<int>(byte >> tqh::kMirroredNibbleBits);
+          const int signed_nibble = low > kSignedNibbleMax ? low - kSignedNibbleRange : low;
+          const float level =
+              static_cast<float>(signed_nibble) + (tqh::kMirroredNibbleSignShift - tqh::kMirroredAffineBias);
+          const float first = tqh::Fp8E4m3fnValue(static_cast<uint8_t>(operands[row * head + j]));
+          const float second = tqh::Fp8E4m3fnValue(static_cast<uint8_t>(operands[row * head + half + j]));
+          const float expected = level * scale / tqh::kMirroredGain;
+          mismatches += (low != high || first != level || second != level || dense[dense_row + j] != expected ||
+                         dense[dense_row + half + j] != expected)
+                            ? 1u
+                            : 0u;
+        }
+      }
+    }
+  }
+  EXPECT_EQ(mismatches, 0u);
+
+  const float zero_byte_level = tqh::MirroredLevel(tqh::kMirroredNibbleSignShift);
+  size_t pad_mismatches = 0;
+  for (size_t slot = 0; slot < slots; ++slot) {
+    if (written[slot]) {
+      continue;
+    }
+    for (size_t e = 0; e < kv_heads * half; ++e) {
+      pad_mismatches += (cache.key_packed[slot * kv_heads * half + e] != 0 ||
+                         cache.value_packed[slot * kv_heads * half + e] != 0)
+                            ? 1u
+                            : 0u;
+    }
+    for (size_t e = 0; e < kv_heads * head; ++e) {
+      const size_t at = slot * kv_heads * head + e;
+      pad_mismatches += (tqh::Fp8E4m3fnValue(static_cast<uint8_t>(cache.key_operands[at])) != zero_byte_level ||
+                         tqh::Fp8E4m3fnValue(static_cast<uint8_t>(cache.value_operands[at])) != zero_byte_level)
+                            ? 1u
+                            : 0u;
+    }
+  }
+  EXPECT_EQ(pad_mismatches, 0u) << "an unwritten slot's operands must be the expansion of a zero packed byte";
 }
 
 TEST(TurboQuantEdgeCases, InvolutionOnCanonicalBasisVectors) {

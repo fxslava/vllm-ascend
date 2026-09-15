@@ -70,6 +70,14 @@ void turboquant_mm_decode_ablation_impl(int32_t stage, AscendType type, void *st
                                         uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,
                                         uint32_t numSplits, uint32_t tasksPerCore, float scale, float invSqrtLen);
 
+void turboquant_mm_decode_bypass_unpack_impl(AscendType type, void *stream, uint32_t blockDim, void *queryRot,
+                                             void *keyOperandCache, void *valueOperandCache, void *scaleCache,
+                                             void *blockTables, void *contextLens, void *modeTables,
+                                             void *workspace, uint32_t numTokens, uint32_t numHeads,
+                                             uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,
+                                             uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t tasksPerCore,
+                                             float scale, float invSqrtLen);
+
 void turboquant_fp16_decode_impl(AscendType type, void *stream, uint32_t splitBlockDim, uint32_t combineBlockDim,
                                  void *query, void *keyCache, void *valueCache, void *blockTables,
                                  void *contextLens, void *workspace, void *output, uint32_t numTokens,

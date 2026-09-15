@@ -357,6 +357,7 @@ warmup.
 | `ASCEND_BENCH_TQ_ABLATION_CONTEXTS` | `64,512,1024,2048` | `bench_device_950pr_turboquant_ablation` only: contexts, positive multiples of 8 (TURBOQUANT_TESTS.md 13.20) |
 | `ASCEND_BENCH_TQ_ABLATION_STAGES` | `0,1,2,3,4,5` | `bench_device_950pr_turboquant_ablation` only: stages to run, in order; `--stage=` sets it |
 | `ASCEND_BENCH_TQ_ABLATION_SYNC_TIMEOUT_MS` | `30000` | `bench_device_950pr_turboquant_ablation` only: deadline for each stage's first launch, `0` for none; a miss exits 3. `--sync-timeout-ms=` sets it |
+| `ASCEND_BENCH_TQ_ABLATION_BYPASS_UNPACK` | `0` | `bench_device_950pr_turboquant_ablation` only: `1` adds the unpack-bypass pair (`split_standard` vs `split_bypass`, head_size <= 256) after the ladder, `only` runs the pair alone. `--bypass-unpack[=only]` sets it (TURBOQUANT_TESTS.md 7.6) |
 | `ASCEND_TEST_DEVICE_ID` | 0 | device ordinal, shared with the tests |
 
 ```bash
