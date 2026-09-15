@@ -52,7 +52,7 @@ constexpr int64_t kFiaInnerPreciseDefault = 1;
 
 constexpr int64_t kFiaQueryQuantModeNone = 0;
 
-constexpr int64_t kFiaPseTypeDefault = 1;
+constexpr int64_t kFiaPseTypeDefault = 0;
 
 constexpr int64_t kTokens = 1;
 constexpr int64_t kHidden = 2048;
