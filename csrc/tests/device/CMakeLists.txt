@@ -217,3 +217,21 @@ if(VLLM_ASCEND_TESTS_BUILD_BENCHMARKS AND VLLM_ASCEND_TESTS_HAVE_TURBOQUANT)
 
   message(STATUS "vllm-ascend tests: [device] ${VLLM_ASCEND_DEVICE_BENCHMARKS}")
 endif()
+
+# --- profiling ----------------------------------------------------------------
+#
+# A trace harness, not a benchmark: per shape it launches the TurboQuant attention
+# chain once and aclnnFusedInferAttentionScoreV5 once, each bracketed by mstx
+# ranges, so an msprof timeline shows the launch gaps a median hides. It defines
+# its own main() for --models= / --contexts= / --batches= / --mode=.
+#
+# Deliberately not registered with ctest. Without msprof attached it records
+# nothing, so neither the correctness run nor the benchmark run has a use for
+# it; it prints the msprof command that collects its trace. It does not depend
+# on VLLM_ASCEND_TESTS_BUILD_BENCHMARKS for the same reason. TURBOQUANT_TESTS.md
+# section 7.7.
+if(VLLM_ASCEND_TESTS_HAVE_TURBOQUANT)
+  vllm_ascend_add_device_executable(prof_device_950pr_msprof_trace prof_device_950pr_msprof_trace.cpp)
+  target_link_libraries(prof_device_950pr_msprof_trace PRIVATE vllm_ascend_test_turboquant)
+  message(STATUS "vllm-ascend tests: [device] prof_device_950pr_msprof_trace (not a ctest entry)")
+endif()

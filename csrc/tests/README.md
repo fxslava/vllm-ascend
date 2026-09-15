@@ -72,7 +72,8 @@ csrc/tests/
 |   |-- bench_main_950pr_hadamard.cpp             its entry point; only it takes argv
 |   |-- bench_device_950pr_turboquant.cpp         decode legs, then the prefill sweep against FIA V5
 |   |-- bench_device_950pr_turboquant_ablation.cpp  the kv4fp8 Cube split, cut stage by stage
-|   `-- bench_main_950pr_ablation.cpp             its entry point; takes --stage= and --sync-timeout-ms=
+|   |-- bench_main_950pr_ablation.cpp             its entry point; takes --stage= and --sync-timeout-ms=
+|   `-- prof_device_950pr_msprof_trace.cpp        one launch per leg under mstx ranges, for msprof; own main()
 |
 `-- device_310p/            the 310P leg -- NOT configured under a 950PR SoC
     |-- test_*_310p.cpp
@@ -358,6 +359,9 @@ warmup.
 | `ASCEND_BENCH_TQ_ABLATION_STAGES` | `0,1,2,3,4,5` | `bench_device_950pr_turboquant_ablation` only: stages to run, in order; `--stage=` sets it |
 | `ASCEND_BENCH_TQ_ABLATION_SYNC_TIMEOUT_MS` | `30000` | `bench_device_950pr_turboquant_ablation` only: deadline for each stage's first launch, `0` for none; a miss exits 3. `--sync-timeout-ms=` sets it |
 | `ASCEND_BENCH_TQ_ABLATION_BYPASS_UNPACK` | `0` | `bench_device_950pr_turboquant_ablation` only: `1` adds the unpack-bypass pair (`split_standard` vs `split_bypass`, head_size <= 256) after the ladder, `only` runs the pair alone. `--bypass-unpack[=only]` sets it (TURBOQUANT_TESTS.md 7.6) |
+| `ASCEND_TQ_TRACE_MODELS` | all three | `prof_device_950pr_msprof_trace` only: comma list of `Qwen3.5-9B,DeepSeek-V4-Flash,GLM-5.2-744B`, or their keys `qwen35,dsv4,glm52`. `--models=` overrides it |
+| `ASCEND_TQ_TRACE_CONTEXTS` / `_BATCHES` | `2048,32768` / `1,4` | `prof_device_950pr_msprof_trace` only: contexts (positive multiples of 8) and batches. `--contexts=` / `--batches=` override them |
+| `ASCEND_TQ_TRACE_MODE` | `decode` | `prof_device_950pr_msprof_trace` only: `decode`, `prefill` or `both`. `--mode=` overrides it |
 | `ASCEND_TEST_DEVICE_ID` | 0 | device ordinal, shared with the tests |
 
 ```bash
@@ -477,6 +481,25 @@ For a memory-access view instead of a pipe-utilisation view:
 msprof --application="./build/csrc-tests/test_activation_swiglu_310p" --output=./prof/swiglu --aic-metrics=MemoryUB
 ```
 
+### The TurboQuant attention chain against FIA V5, as one timeline
+
+`bench_device_950pr_turboquant` reports medians, and a median cannot show where
+the time between two launches went. `prof_device_950pr_msprof_trace` launches
+each leg exactly once per shape -- `TQ_Pipeline` (rotate_q, split, combine, and
+rotate_o when W_o is unfolded), a 10 ms gap, `V5_Native` (GetWorkspaceSize,
+workspace, launch), another 10 ms gap -- and brackets every stage with a
+stream-bound mstx range, so each sub-kernel's host enqueue and device execution
+sit side by side:
+
+```bash
+msprof --output=./prof/tq_trace --msproftx=on --task-time=l1 --runtime-api=on ./build/dev/device/prof_device_950pr_msprof_trace --models=DeepSeek-V4-Flash --contexts=2048 --batches=1 --mode=decode
+```
+
+Without `--msproftx=on` the markers are not collected. The binary prints this
+command for its own flags before it touches the device, then one line per
+shape. Export with `msprof --export=on --output=./prof/tq_trace`. See
+TURBOQUANT_TESTS.md 7.7 for what each range contains.
+
 ---
 
 ## 310P specifics encoded in the tests
@@ -533,6 +556,7 @@ saying so rather than silently building the wrong leg.
 | `test_device_950pr_turboquant` | 5 — the same, at Qwen3.5-2B's real shapes | ditto. **Device tier**: silicon only, refuses a camodel |
 | `bench_device_950pr_turboquant` | 5 — the AIV-only decode, timed | ditto, with `aclnnFusedInferAttentionScoreV5` (V2 fallback) as the fp16 baseline |
 | `bench_device_950pr_turboquant_ablation` | 5 — the kv4fp8 Cube split, timed stage by stage | the TurboQuant kernels, plus five test-only entry points built under `VLLM_ASCEND_TQ_DECODE_ABLATION` |
+| `prof_device_950pr_msprof_trace` | 5 — the attention chain and FIA V5, one launch each, for an msprof timeline | the TurboQuant kernels and `aclnnFusedInferAttentionScoreV5`, bracketed by mstx ranges. Not a ctest entry |
 
 `common/aclnn_ops_950pr.hpp` carries the operator audit: which stage runs on a
 stock CANN operator, which on a kernel built out of `csrc/`, and the CANN header

@@ -40,6 +40,7 @@ from vllm.v1.attention.backends.registry import (  # type: ignore
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import AttentionSpec, CrossAttentionSpec
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.utils import (
@@ -82,6 +83,12 @@ class AscendAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_impl_cls() -> type["AscendAttentionBackendImpl"]:
+        if envs_ascend.ENABLE_TURBOQUANT:
+            if enable_dcp():
+                raise ValueError("ENABLE_TURBOQUANT=1 cannot be combined with decode context parallel")
+            from vllm_ascend.attention.turboquant_v1 import AscendTurboQuantAttentionBackendImpl
+
+            return AscendTurboQuantAttentionBackendImpl
         if enable_dcp():
             from vllm_ascend.attention.context_parallel.attention_cp import AscendAttentionDCPImpl
 
@@ -104,6 +111,11 @@ class AscendAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "",
     ) -> tuple[int, ...]:
+        is_turboquant_dtype = isinstance(cache_dtype_str, str) and cache_dtype_str.startswith("turboquant_")
+        if envs_ascend.ENABLE_TURBOQUANT or is_turboquant_dtype:
+            from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_PACK_FACTOR
+
+            return (2, num_blocks, block_size, num_kv_heads, head_size // TURBOQUANT_PACK_FACTOR)
         return (2, num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod

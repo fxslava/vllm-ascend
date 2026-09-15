@@ -104,6 +104,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Route AscendAttentionBackend to the TurboQuant 4-bit KV cache implementation
+    # (vllm_ascend/attention/turboquant_v1.py) and pack its KV cache to
+    # head_size // 2 int8 elements. 0 (default): off. 1: on. It applies to every
+    # layer on AscendAttentionBackend, so enable it only for dense-attention models
+    # the TurboQuant kernels support; it cannot be combined with decode context
+    # parallel.
+    "ENABLE_TURBOQUANT": lambda: bool(int(os.getenv("ENABLE_TURBOQUANT", "0"))),
 }
 
 # end-env-vars-definition

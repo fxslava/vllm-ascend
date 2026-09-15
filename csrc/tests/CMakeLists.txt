@@ -455,9 +455,11 @@ if(NOT VLLM_ASCEND_TESTS_HOST_ONLY)
 endif()
 
 # Shared configuration for both the test and the benchmark binaries: they differ
-# only in which main() they link and how ctest is told to run them.
-function(vllm_ascend_add_device_executable target_name source_file entry_point)
-  add_executable(${target_name} "${source_file}" "${entry_point}")
+# only in which main() they link and how ctest is told to run them. The entry
+# point is the optional third argument; a source that defines its own main()
+# passes none.
+function(vllm_ascend_add_device_executable target_name source_file)
+  add_executable(${target_name} "${source_file}" ${ARGN})
   target_link_libraries(${target_name} PRIVATE vllm_ascend_test_common)
 
   # $ORIGIN keeps a copied-out build tree working; the CANN lib dirs cover the

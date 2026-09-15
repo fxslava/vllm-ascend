@@ -82,6 +82,26 @@ class TestAscendAttentionBackend(TestBase):
         result = AscendAttentionBackend.get_kv_cache_shape(10, 20, 30, 40)
         self.assertEqual(result, (2, 10, 20, 30, 40))
 
+    @patch.dict("os.environ", {"ENABLE_TURBOQUANT": "1"})
+    def test_get_impl_cls_routes_to_turboquant(self):
+        from vllm_ascend.attention.turboquant_v1 import AscendTurboQuantAttentionBackendImpl
+
+        self.assertIs(AscendAttentionBackend.get_impl_cls(), AscendTurboQuantAttentionBackendImpl)
+
+    @patch.dict("os.environ", {"ENABLE_TURBOQUANT": "1"})
+    def test_get_impl_cls_turboquant_rejects_decode_context_parallel(self):
+        with patch.object(attn_module, "enable_dcp", return_value=True), self.assertRaises(ValueError):
+            AscendAttentionBackend.get_impl_cls()
+
+    @patch.dict("os.environ", {"ENABLE_TURBOQUANT": "1"})
+    def test_get_kv_cache_shape_turboquant_env_packs_head_size(self):
+        result = AscendAttentionBackend.get_kv_cache_shape(12918, 128, 4, 128)
+        self.assertEqual(result, (2, 12918, 128, 4, 64))
+
+    def test_get_kv_cache_shape_turboquant_dtype_packs_head_size(self):
+        result = AscendAttentionBackend.get_kv_cache_shape(10, 128, 4, 128, cache_dtype_str="turboquant_4bit_nc")
+        self.assertEqual(result, (2, 10, 128, 4, 64))
+
     def test_swap_blocks(self):
         src_kv_cache = [torch.zeros((10, 20)), torch.zeros((10, 20))]
         dst_kv_cache = [torch.zeros((10, 20)), torch.zeros((10, 20))]

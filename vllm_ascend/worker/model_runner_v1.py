@@ -111,6 +111,7 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 # yapf: enable
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
@@ -4256,6 +4257,27 @@ class NPUModelRunner(GPUModelRunner):
             storage_offset_bytes += stride[0] * dtype_size
         return reshaped_kv_tensors
 
+    @staticmethod
+    def _view_raw_kv_cache(raw_tensor: torch.Tensor, dtype: torch.dtype, shape: tuple[int, ...]) -> torch.Tensor:
+        """View one raw int8 K or V cache buffer as ``shape``.
+
+        With ENABLE_TURBOQUANT the backend packs two 4-bit codes per int8 element,
+        but the KV cache spec still sizes pages from the unpacked head size, so the
+        buffer holds more elements than the packed shape needs. The leading
+        ``prod(shape)`` elements are used and the tail stays allocated but unused.
+        The TurboQuant kernels only accept int8, so the view is int8 whatever the
+        spec dtype is (vLLM maps its ``turboquant_*`` cache dtypes to uint8). A
+        buffer smaller than the shape still fails in ``view``, as it does without
+        TurboQuant.
+        """
+        if not envs_ascend.ENABLE_TURBOQUANT:
+            return raw_tensor.view(dtype).view(shape)
+        packed = raw_tensor.view(torch.int8)
+        needed = math.prod(shape)
+        if packed.numel() > needed:
+            packed = packed[:needed]
+        return packed.view(shape)
+
 
     def _reshape_kv_cache_tensors(
         self,
@@ -4516,7 +4538,10 @@ class NPUModelRunner(GPUModelRunner):
                     if not isinstance(current_kv_cache_spec, AscendMLAAttentionSpec):
                         k_shape = kv_cache_shape[1:]
                         if hasattr(current_kv_cache_spec, "head_size_v"):
-                            v_shape = (*kv_cache_shape[1:-1], current_kv_cache_spec.head_size_v)
+                            v_head_dim = current_kv_cache_spec.head_size_v
+                            if envs_ascend.ENABLE_TURBOQUANT:
+                                v_head_dim = attn_backend.get_kv_cache_shape(1, 1, 1, v_head_dim)[-1]
+                            v_shape = (*kv_cache_shape[1:-1], v_head_dim)
                         else:
                             v_shape = k_shape
                     else:
@@ -4552,12 +4577,12 @@ class NPUModelRunner(GPUModelRunner):
                     if current_sparse_sfa_c8:
                         k_cache_dtype = self.c8_k_cache_dtype
 
-                    k_cache = raw_k_tensor.view(k_cache_dtype).view(k_shape)
+                    k_cache = self._view_raw_kv_cache(raw_k_tensor, k_cache_dtype, k_shape)
                     if current_sparse_sfa_c8:
                         v_cache = None
                     else:
                         assert raw_v_tensor is not None
-                        v_cache = raw_v_tensor.view(v_cache_dtype).view(v_shape)
+                        v_cache = self._view_raw_kv_cache(raw_v_tensor, v_cache_dtype, v_shape)
 
                     if current_sparse_sfa_c8:
                         kv_caches[layer_name] = (k_cache,)

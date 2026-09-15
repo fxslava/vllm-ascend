@@ -65,7 +65,8 @@ csrc/tests/
 │   ├── test_device_950pr_qwen_layer_golden.cpp
 │   ├── test_device_950pr_benchmark_harness.cpp
 │   ├── bench_device_950pr_turboquant.cpp
-│   └── bench_device_950pr_turboquant_ablation.cpp
+│   ├── bench_device_950pr_turboquant_ablation.cpp
+│   └── prof_device_950pr_msprof_trace.cpp
 │
 └── device_310p/            the 310P leg — a different part, not a tier
     ├── test_*_310p.cpp
@@ -349,7 +350,7 @@ it is printed and never asserted.
 
 | | |
 | --- | --- |
-| **Binaries** | `test_device_950pr_turboquant`, `test_device_950pr_{matmul,rmsnorm,rotary_embedding,activation_swiglu,qwen_layer_golden}`, `test_device_950pr_benchmark_harness`, `bench_device_950pr_turboquant`, `bench_device_950pr_turboquant_ablation` |
+| **Binaries** | `test_device_950pr_turboquant`, `test_device_950pr_{matmul,rmsnorm,rotary_embedding,activation_swiglu,qwen_layer_golden}`, `test_device_950pr_benchmark_harness`, `bench_device_950pr_turboquant`, `bench_device_950pr_turboquant_ablation`, and `prof_device_950pr_msprof_trace`, which is not a ctest entry (§7.7) |
 | **Purpose** | Correctness at the shapes the model actually decodes at, and **every timing number this project quotes**. |
 | **Target hardware** | Physical Ascend 950PR. Real `libruntime.so` and `libascendcl.so`, no camodel on the link line, none on the `RUNPATH`, no fallback. |
 | **Exit criterion** | Every correctness case passes; the benchmarks exit 0 having produced a table, or exit 77 when no 950PR is attached, which ctest records as a skip. A benchmark that fails its checksum is a **correctness** failure wearing a benchmark's clothes — the launches stopped agreeing with each other — and must be treated as one. |
@@ -978,6 +979,72 @@ standard and bypass medians, the ratio, the removed share, both tile reads,
 partial identity and both cosines. Setup failures, bit mismatches, or a cos
 below 0.90 are recorded as failures and marked UNTRUSTED.
 
+### 7.7 `prof_device_950pr_msprof_trace`
+
+**What it answers:** where the time between launches goes. §7.5 reduces the
+composite-versus-sum-of-parts gap to one median percentage; this binary produces
+the timeline that gap comes from. It is a trace harness, not a benchmark: no
+warmup, no timing loop, no statistics. It is **not a ctest entry**, because
+without msprof attached it records nothing.
+
+Per shape -- model x S x B, and phase under `--mode=both` -- in one process:
+
+| Step | Ranges and marks | Contents |
+| --- | --- | --- |
+| setup | `setup` | buffers and descriptors; for decode, the whole-context TurboQuant cache write, synchronised |
+| leg 1 | `TQ_Pipeline_Start`, `TQ_Pipeline`, `TQ_Pipeline_End` | decode: `TQ_rotate_q`; `TQ_DecodeSplit` and `TQ_Combine` (Cube) or `TQ_PagedAttention_SplitCombine` (AIV); `TQ_rotate_o` when W_o is unfolded; `TQ_sync`. Prefill: `TQ_rotate_q`, `TQ_FIA_V5_GetWorkspaceSize`, `TQ_FIA_V5_Launch`, `TQ_rotate_o` when unfolded, `TQ_sync` |
+| gap | -- | 10 ms host sleep |
+| leg 2 | `V5_Native_Start`, `V5_Native`, `V5_Native_End` | `V5_GetWorkspaceSize` (the plan and its workspace allocation), `V5_Launch`, `V5_sync` |
+| after | `readback`, `teardown` | absolute sum over the leading 2^20 elements of each leg's output, then every buffer freed |
+| gap | -- | 10 ms host sleep before the next shape |
+
+A leg that throws gets a `_Aborted` mark instead of its `_End`, and the shape's
+log line says `FAILED` with the CANN message.
+
+The shapes, the path routing and both FIA V5 argument lists are the audit's.
+The model table, `SelectPath` and `PrefillChunk` moved into
+`common/turboquant_audit_models.hpp`, which both binaries include, so every trace
+is of a Table A or Table B row by construction, and
+`ASCEND_BENCH_TQ_AUDIT_PATH`, `_GLM_D` and `_CHUNK` steer both.
+
+**Markers.** mstx ranges and marks from `libms_tools_ext.so`
+(`tools/mstx/lib64`), resolved with `dlopen` like every other CANN symbol this
+suite calls rather than linked. Launch ranges are passed the stream, so each is
+stamped on the host when the stage is enqueued and on the device when the stream
+reaches it. The planning and synchronisation ranges get a null stream, because
+they are host work. If mstx does not resolve, the harness falls back to
+`aclprofMarkEx`, which `libmsprofiler.so` exports and `libascendcl.so` already
+loads, and every range becomes a `_Start`/`_End` pair of marks. Either way it is
+`msprof --msproftx=on` that records them:
+
+```bash
+msprof --output=./prof/tq_trace --msproftx=on --task-time=l1 --runtime-api=on ./build/dev/device/prof_device_950pr_msprof_trace --models=DeepSeek-V4-Flash,Qwen3.5-9B,GLM-5.2-744B --contexts=2048,32768 --batches=1,4 --mode=decode
+```
+
+The binary prints that line for its own flags before it touches the device.
+
+**Caveats, each deliberate:**
+
+1. **No warmup**, so the first shape carries every kernel image load and the
+   operator's first plan. Read it as the cold-start profile, or put the shape
+   that matters second.
+2. **The AIV split is not separable.** `turboquant_paged_attention_impl` enqueues
+   split and combine through one launcher and exports no split-only entry point,
+   so one range covers both. msprof's task timeline still shows the two kernel
+   tasks under it. The Cube path's two launches get a range each.
+3. **Prefill shares FIA between the legs.** Leg 1 plans and launches FIA V5 over
+   the rotated basis, leg 2 over the plain one, so leg 2 may reuse state leg 1
+   created. And as in §7.5, FIA reads a host-rotated fp16 query: the fp32 -> fp16
+   narrowing after rotate_q is not launched.
+4. **Stream-bound markers are device tasks too.** They add a few tiny tasks per
+   shape to the timeline they label.
+5. **The readback check is not a fidelity bound.** It fails a shape whose output
+   is all zero or non-finite, which is what a leg that dispatched nothing looks
+   like, and nothing more.
+
+Exit status: 0 when every shape dispatched both legs with non-empty output, 1
+otherwise, 2 on a bad flag, 77 with no 950PR attached or a camodel loaded.
+
 ---
 
 ## 8. The fp16 baseline, and the V2 → V5 migration
@@ -1204,6 +1271,15 @@ configurations: host-only, 310P, 950PR device, 950PR sim.
 **Not executed:** `RepeatedDecodeLaunchesAreBitIdentical` (nine decode passes is
 hours under the camodel); every case at `S = 512 / 1024 / 2048`; and every
 timing. All wait on silicon, which is what the device tier is for.
+
+`prof_device_950pr_msprof_trace` (§7.7) has **not executed at all**. It builds
+clean under `-Werror` (host 4, sim 35 and npu 41 unique targets, 0 diagnostics;
+the host and sim sets are unchanged and npu gained only this binary), but in the
+`tq950-sim` build container it aborts before `main()` with
+`basic_string::_S_construct null not valid`, the no-driver static-initialisation
+failure described below. It still aborts with the camodel runtime and the
+sim-mode kernel library shadowing their silicon counterparts on
+`LD_LIBRARY_PATH`, so not even its argument parser has run.
 
 Defects found by running the above and fixed in the shared harness:
 

@@ -39,6 +39,7 @@
 #include "fp16.hpp"
 #include "random_data.hpp"
 #include "turbo_quant_cpu.h"
+#include "turboquant_audit_models.hpp"
 #include "turboquant_launch.hpp"
 
 namespace vllm_ascend {
@@ -53,6 +54,14 @@ namespace {
 namespace tqh = turboquant_host;
 namespace tqm = vllm_ascend::turboquant;
 namespace s950 = shapes950;
+namespace tqa = turboquant_audit;
+
+using tqa::ModelSpec;
+using tqa::Models;
+using tqa::PathLabel;
+using tqa::PathMode;
+using tqa::PrefillChunk;
+using tqa::SelectPath;
 
 constexpr int64_t kBlockSize = s950::kDefaultBlockSize;
 
@@ -61,8 +70,6 @@ constexpr int64_t kFiaSparseModeRightDownCausal = 3;
 constexpr int64_t kFiaNoPaging = 0;
 
 constexpr int64_t kPatternTokens = 1024;
-
-constexpr int64_t kPrefillChunkTokens = 2048;
 
 constexpr double kHbmBudget = 0.85;
 
@@ -111,15 +118,6 @@ int EnvInt(const char* name, int fallback, int minimum) {
   return parsed < minimum ? minimum : static_cast<int>(parsed);
 }
 
-int64_t EnvInt64(const char* name, int64_t fallback, int64_t minimum) {
-  const char* raw = std::getenv(name);
-  if (raw == nullptr || *raw == '\0') {
-    return fallback;
-  }
-  const long long parsed = std::strtoll(raw, nullptr, 10);
-  return parsed < minimum ? minimum : static_cast<int64_t>(parsed);
-}
-
 bool EnvOn(const char* name) {
   const char* raw = std::getenv(name);
   return raw == nullptr || *raw == '\0' || std::strcmp(raw, "0") != 0;
@@ -149,39 +147,6 @@ std::string EnvString(const char* name) {
   return raw == nullptr ? std::string() : std::string(raw);
 }
 
-struct ModelSpec {
-  const char* key;
-  const char* label;
-  int64_t head_size;
-  int64_t num_heads;
-  int64_t num_kv_heads;
-  bool folds_output;
-  const char* note;
-};
-
-int64_t GlmHeadSize() {
-  const int64_t d = EnvInt64("ASCEND_BENCH_TQ_AUDIT_GLM_D", 128, 64);
-  if (d != 128 && d != 256) {
-    std::printf("[ascend-bench] ASCEND_BENCH_TQ_AUDIT_GLM_D=%lld is neither 128 nor 256; using 128\n",
-                static_cast<long long>(d));
-    return 128;
-  }
-  return d;
-}
-
-std::vector<ModelSpec> Models() {
-  return {
-      ModelSpec{"qwen35", "Qwen3.5-9B", 128, 4, 1, false,
-                "attn_output_gate: sigmoid(gate) * context sits between attention and o_proj, "
-                "so W_o cannot absorb Pi and the O de-rotation is measured"},
-      ModelSpec{"dsv4", "DeepSeek-V4-Flash", 256, 16, 1, true,
-                "MLA, decoupled latent KV; the 16:1 group exactly fills the Cube's M=16 fractal; "
-                "W_o folded offline"},
-      ModelSpec{"glm52", "GLM-5.2-744B", GlmHeadSize(), 8, 1, true,
-                "ultra-wide GQA; W_o folded offline"},
-  };
-}
-
 struct Regime {
   int64_t seq_len;
   std::vector<int64_t> batches;
@@ -195,27 +160,6 @@ std::vector<Regime> Regimes() {
       Regime{262144, {1, 2}, "ultra-long"},
       Regime{1048576, {1}, "extreme-needle/1M"},
   };
-}
-
-enum class PathMode { kCube, kAiv };
-
-const char* PathLabel(PathMode path) { return path == PathMode::kCube ? "Cube" : "AIV"; }
-
-PathMode SelectPath(const ModelSpec& model) {
-  const std::string forced = EnvString("ASCEND_BENCH_TQ_AUDIT_PATH");
-  if (forced == "cube") {
-    return PathMode::kCube;
-  }
-  if (forced == "aiv") {
-    return PathMode::kAiv;
-  }
-  const int64_t group = model.num_heads / model.num_kv_heads;
-  return group >= tqh::kCubeTileM ? PathMode::kCube : PathMode::kAiv;
-}
-
-int64_t PrefillChunk(int64_t seq_len) {
-  const int64_t chunk = EnvInt64("ASCEND_BENCH_TQ_AUDIT_CHUNK", kPrefillChunkTokens, 1);
-  return std::min(seq_len, chunk);
 }
 
 struct Budget {

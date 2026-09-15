@@ -1,3 +1,4 @@
+import math
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -17,6 +18,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
 from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
 from vllm_ascend.utils import AscendDeviceType
@@ -319,6 +321,56 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
 
         self.assertEqual(k_cache.shape, (2, 16, 8, 64))
         self.assertEqual(v_cache.shape, (2, 16, 8, 64))
+
+    @patch.dict("os.environ", {"ENABLE_TURBOQUANT": "1"})
+    def test_turboquant_reshape_packs_k_and_v_into_the_leading_elements(self):
+        runner = self._build_runner()
+        kv_cache_spec = FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=8,
+            head_size=64,
+            dtype=torch.uint8,
+        )
+        kv_cache_config = KVCacheConfig(
+            num_blocks=2,
+            kv_cache_tensors=[KVCacheTensor(size=kv_cache_spec.page_size_bytes * 2, shared_by=["attn"])],
+            kv_cache_groups=[KVCacheGroupSpec(layer_names=["attn"], kv_cache_spec=kv_cache_spec)],
+        )
+        kv_cache_raw_tensors = runner._allocate_kv_cache_tensors(kv_cache_config)
+        raw_k, raw_v = kv_cache_raw_tensors["attn"]
+        runner._kv_cache_spec_attn_group_iterator = lambda: [
+            SimpleNamespace(
+                kv_cache_spec=kv_cache_spec,
+                backend=AscendAttentionBackend,
+                layer_names=["attn"],
+            )
+        ]
+
+        k_cache, v_cache = runner._reshape_kv_cache_tensors(kv_cache_config, kv_cache_raw_tensors)["attn"]
+
+        self.assertEqual(k_cache.shape, (2, 16, 8, 32))
+        self.assertEqual(v_cache.shape, (2, 16, 8, 32))
+        self.assertEqual(k_cache.dtype, torch.int8)
+        self.assertEqual(v_cache.dtype, torch.int8)
+        self.assertEqual(k_cache.data_ptr(), raw_k.data_ptr())
+        self.assertEqual(v_cache.data_ptr(), raw_v.data_ptr())
+        k_cache.view(-1)[-1] = 1
+        self.assertEqual(int(raw_k[k_cache.numel() - 1]), 1)
+        self.assertFalse(bool(raw_k[k_cache.numel() :].any()))
+
+    @patch.dict("os.environ", {"ENABLE_TURBOQUANT": "1"})
+    def test_turboquant_raw_kv_cache_view_rejects_an_undersized_buffer(self):
+        shape = (2, 16, 8, 32)
+        raw = torch.zeros(math.prod(shape) - 1, dtype=torch.int8)
+        with self.assertRaises(RuntimeError):
+            NPUModelRunner._view_raw_kv_cache(raw, torch.uint8, shape)
+
+    @patch.dict("os.environ", {"ENABLE_TURBOQUANT": "0"})
+    def test_raw_kv_cache_view_without_turboquant_keeps_the_exact_size_check(self):
+        shape = (2, 16, 8, 32)
+        raw = torch.zeros(2 * math.prod(shape), dtype=torch.int8)
+        with self.assertRaises(RuntimeError):
+            NPUModelRunner._view_raw_kv_cache(raw, torch.int8, shape)
 
     @patch("vllm_ascend.worker.model_runner_v1.has_ec_transfer", return_value=False)
     @patch("vllm_ascend.worker.model_runner_v1.get_layers_from_vllm_config")
