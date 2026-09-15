@@ -14,137 +14,247 @@
  * limitations under the License.
  */
 
-// TurboQuant KV cache: the AIV-only 4-bit decode and the Cube-native kv4fp8
-// decode, timed, against a physical fp16 decode of the same shape.
+// ============================================================================
+// TurboQuant end-to-end audit against the native CANN V5 attention operator
+// ============================================================================
 //
-// Nothing in csrc/attention/turboquant/turboquant_kernels.cpp touches the Cube,
-// so every number the tq4 legs report is what the vector cores alone can do.
+// One question, asked twice -- once for prefill and once for decode:
 //
-// What is timed, per context length S in {512, 1024, 2048}:
+//     does a TurboQuant layer finish an attention step sooner than the same
+//     layer built on the stock CANN operator, AFTER every transformation the
+//     4-bit rotated cache imposes has been paid for?
 //
-//   tq4_write_s<S>      the cache write path: S tokens rotated, quantised to
-//                       4 bits and scattered. One launch.
-//   tq_rotate_s<S>      the query rotation, q~ = Pi q, on its own. ONE launch,
-//                       and the only single-launch decode-side case here. Both
-//                       decode legs enqueue this same rotation ahead of their
-//                       own kernels, so subtracting it is what prices the extra
-//                       operator invocation the pre-rotated Q contract costs.
-//                       Flat in S: it reads the query and nothing paged.
-//   tq4_decode_s<S>     the decode: rotate, split, combine -- three launches on
-//                       one stream. The cache is written once during setup, so
-//                       the timed region is the read path only.
-//   kv4fp8_write_s<S>   the 4-bit cache write through the multi-rate codec.
-//   kv4fp8_decode_s<S>  the Cube-native decode: the same 128-byte slot tq4
-//                       stores, unpacked to fp8_e4m3fn on the AIV and
-//                       multiplied on the Cube.
-//   fp16_decode_s<S>    the baseline: the same Cube decode over an unquantised
-//                       fp16 paged KV cache.
+// Everything in this binary exists to answer that and nothing else. There is no
+// leg here that compares TurboQuant against a hypothetical fp16 memory layout,
+// and no leg that compares one TurboQuant kernel against another: those are
+// ablations, they live in bench_device_950pr_turboquant_ablation, and a
+// benchmark that mixes them with a competitive comparison invites reading an
+// internal ratio as a product claim. What is left is a component-by-component
+// breakdown of the shipping path and one native baseline to divide it by.
 //
-// All five run by default. The comparison the binary exists to make is the
-// three-way one at a fixed context length: tq4 against kv4fp8 is the Cube
-// against the vector cores, and kv4fp8 against fp16 is what the 4-bit cache buys
-// over an unquantised one.
+// ---------------------------------------------------------------------------
+// WHICH NATIVE OPERATOR, AND WHY IT IS NOT THE ONE THE BRIEF NAMED
+// ---------------------------------------------------------------------------
 //
-// THE CODEC IS NO LONGER HELD FIXED ACROSS tq4 AND kv4fp8, and the first column
-// has to be read with that in mind. Both still store 4 bits per coordinate in a
-// 128-byte slot, so the cache geometry and every DMA volume match -- but tq4
-// stores a Lloyd-Max index and expands it with two UB Gathers, while kv4fp8 now
-// stores a symmetric INT4 level and expands it with integer shifts and an Adds
-// (TURBOQUANT_TESTS.md section 13.9). So the ratio is the Cube path with the new
-// expand against the vector path with the old one, which conflates two changes.
-// Separating them would mean keeping a Lloyd-Max Cube leg alive purely as a
-// benchmark control; that has not been done.
+// The brief for this file asked for `aclnnPromptFlashAttentionV5` in the
+// prefill role and `aclnnFusionIncrementalAttention` in the decode role.
+// NEITHER SYMBOL EXISTS. The CANN 9.2.0-beta.2 toolkit this tree builds against
+// ships `aclnn_prompt_flash_attention{,_v2,_v3}.h` and
+// `aclnn_incre_flash_attention{,_v2,_v3,_v4}.h` -- the PFA family stops at V3
+// and the IFA family at V4 -- and there is no header, and no exported symbol,
+// spelled `aclnnFusionIncrementalAttention` anywhere in the install.
 //
-// kv3fp4 and kv5fp8 are still built and still dispatched by the sim tier; they
-// have no leg here. Neither is on the 4-bit path this binary measures, and a
-// column for each was three more cache allocations of the same shape for a
-// comparison nothing was asking of this binary.
+// What DOES exist, and what "the native V5 suite" means on this part, is
+// `aclnnFusedInferAttentionScore`, whose V5 interface is the unified successor
+// that REPLACES both families: V1..V4 of it are withdrawn on an Ascend950
+// (planning returns 361001, measured on CANN 9.1.0), and V5 is what a caller
+// has left. One operator covers both roles, selected by its argument list:
 //
-// WHAT IS AND IS NOT VERIFIED. The Cube-native decode is correct: kv4fp8
-// reaches cos 0.982351 against an fp32 host reference on the arch35 camodel at
-// S=64, with no device error of any kind, and test_sim_950pr_cube_gemm pins
-// both B operand forms at max|err| = 0. The defects that made it wrong -- the
-// V -> MTE3 staging hazard above all -- are closed; see TURBOQUANT_TESTS.md
-// section 13.8.
+//     prefill role   ("prompt")       sparse_mode 3, the 2048x2048 compressed
+//                                     right-down causal mask, contiguous TND
+//                                     K/V, block_size 0 -- no paging.
+//     decode role    ("incremental")  sparse_mode 0, a block table, the paged
+//                                     fp16 cache as a one-entry aclTensorList,
+//                                     actualSeqLengthsKv per sequence.
 //
-// What is NOT verified is anything this file measures. No Ascend 950PR silicon
-// has been available to this project, so every number below is the first of its
-// kind, and the fidelity evidence above covers S=64 on a simulator rather than
-// the S in {512, 1024, 2048} swept here. The fp16 baseline shares the corrected
-// staging but has no fidelity check of its own: it is a comparator, and nothing
-// asserts that it computes the right thing.
+// Both roles are planned and timed below, and both are labelled by the operator
+// that actually planned. `aclnnFusedInferAttentionScoreV2` is kept as a fallback
+// for a toolkit where V5 is absent; the row records which one answered.
 //
-// TWO BASELINES, and they answer different questions.
+// Guessing a prototype for the two symbols the brief named was considered and
+// rejected. A hand-declared argument list behind `dlsym` that does not match the
+// operator is undefined behaviour AT LAUNCH, not a planning refusal -- it takes
+// the stream down and every case queued behind it -- and this suite's rule is
+// that every aclnn prototype is transcribed from a header it can point at. See
+// common/aclnn_ops_950pr.hpp, where the V5 list is quoted line for line.
 //
-//   fp16_decode   turboquant_fp16_decode_split in
-//                 csrc/attention/turboquant/turboquant_mm_kernels.cpp: the same
-//                 Cube decode with the codec removed. Same task decomposition,
-//                 GQA batching, tile size, online softmax and split count, so
-//                 the ratio to it measures the CODEC and nothing else.
-//   fia_decode    the stock CANN operator, aclnnFusedInferAttentionScoreV5 with
-//                 aclnnFusedInferAttentionScoreV2 as a fallback, over the same
-//                 fp16 paged cache. The ratio to it is what a caller would
-//                 actually gain by switching, since this is what they have
-//                 today.
+// ---------------------------------------------------------------------------
+// THE ACCOUNTING
+// ---------------------------------------------------------------------------
 //
-// The operator leg is BEST-EFFORT and expected to be absent on some builds: V1
-// to V4 are withdrawn on an Ascend950 (planning returns 361001, measured on CANN
-// 9.1.0) and V5's argument list has never been planned on hardware. Whichever
-// way it goes, the outcome is recorded -- a latency if it planned, the operator
-// name and the planning status if it did not -- so the comparison table says why
-// a column is empty instead of omitting it.
+//     T_TQ_E2E = T_rot_q + T_attn_core + T_rot_o
 //
-// The traffic model is also printed. It is exact arithmetic over the two cache
-// layouts, not a measurement.
+// measured on the device with ACL events, per component AND as one composite
+// region over the whole graph. Both are reported: the components say where the
+// time goes, the composite says what the caller waits for, and the difference
+// between the composite and the sum of the parts is the launch overhead the
+// component view cannot see. A row whose composite is far from its sum is
+// launch-bound, and the footer prints that residual rather than leaving a
+// reader to subtract.
 //
-// OUTPUT. Three things: the generic per-case table and its CSV
-// (ASCEND_BENCH_CSV), this suite's own summary, and a shape-keyed comparison CSV
-// written when ASCEND_BENCH_TQ_COMPARE_CSV names a path -- one row per shape with
-// every leg's latency, the speedups, and the derived rates. That last one is the
-// artifact meant for pasting into a report.
+//   T_rot_q       npu_turboquant_rotate_q over the step's query.
+//   T_attn_core   decode:  the Cube split + the shared combine, or the AIV
+//                          launcher that submits both.
+//                 prefill: FIA V5 over the rotated basis (Q~, K~, V~).
+//   T_rot_o       npu_turboquant_rotate_q over the attention output, before the
+//                 sigmoid gate. EXACTLY 0.0 us for a folded layer -- W_o' = W_o
+//                 (I (x) Pi) absorbs it offline -- and measured for a layer that
+//                 cannot fold. The 0.0 is printed as a number and not as a dash,
+//                 because it is a fact about the layer and not a missing sample.
 //
-// BATCH. One decode step per launch, so the B column is 1 throughout. The batch
-// axis is validated rather than timed, by
-// test_device_950pr_turboquant_multimode, which sweeps batch {1, 8}; sweeping it
-// here would multiply four context lengths of KV cache by the batch and is a
-// separate change.
+// The native column is the V5 operator alone on standard uncompressed tensors,
+// and neither side's KV-cache WRITE is inside its E2E figure. TurboQuant's write
+// is reported in its own column (Table A, "TQ Ingest / Reshape"); the native
+// write (`aclnnScatterPaKvCache`) is timed as `pf_v5_ingest` and carried in the
+// prefill CSV. Symmetric, and both are visible.
 //
-// SHAPES. Qwen3.5-2B's full-attention layer as common/ascend950_shapes.hpp
-// records it: head_dim 256, 8 query heads over 2 kv heads, block_size 128.
+// ---------------------------------------------------------------------------
+// WHAT IS STILL NOT PRICED, SAID HERE RATHER THAN HIDDEN
+// ---------------------------------------------------------------------------
 //
-//   ASCEND_BENCH_TQ_CONTEXTS=512,1024   restricts the sweep. Everything else is
-//                                       the shared ASCEND_BENCH_* set; see
-//                                       common/benchmark.hpp.
-//   ASCEND_BENCH_TQ_COMPARE_CSV=<path>  writes the shape-keyed comparison CSV.
-//   ASCEND_BENCH_TQ_FIA=0               drops the stock-operator leg, which is
-//                                       the one leg whose argument list has never
-//                                       been launched on a part.
-//   VLLM_ASCEND_TQ_CUBE_WIP=0           drops the Cube legs, leaving the
-//                                       AIV-only 4-bit path.
+// 1. The fp32 -> fp16 narrowing between the rotation kernel and FIA, in the
+//    PREFILL core only. npu_turboquant_rotate_q writes fp32; FIA reads fp16.
+//    Production does the cast with a torch op; this suite has no header-verified
+//    aclnnCast prototype and will not guess one, so the rotated tensors FIA is
+//    handed are prepared on the host in fp16 and the cast is not in any number
+//    below. It is one elementwise pass over B*C*H_Q*D (query) and B*S*H_KV*D
+//    (value) elements; the modelled byte cost of both is in the prefill CSV as
+//    `untimed_cast_bytes` so a reader can bound it. The DECODE core has no such
+//    gap: the split kernels consume the fp32 rotation directly.
+// 2. The sigmoid gate itself, for Qwen3.5. T_rot_o stops where the brief says it
+//    stops -- "prior to the sigmoid gate" -- and the gate is the same elementwise
+//    cost on both sides of the comparison.
+// 3. Nothing about accuracy. TurboQuant stores 4 bits per coordinate and the
+//    native leg stores 16; the outputs are not the same numbers and are not
+//    meant to be. The fidelity gates are test_device_950pr_turboquant,
+//    test_host_turboquant_fidelity and the sim tier. What this file does check
+//    is that both legs are attending over the same context at all -- see THE TWO
+//    DEVICE CHECKS below.
 //
-// THE OUTPUT BASIS. Every quantised decode leg's combine now writes the rotated
-// output O~ -- the inverse rotation is folded into W_o in production -- so the
-// tq4 and kv4fp8 checksums are over rotated bits. Neither leg times an
-// un-rotation, which is what a folded layer runs; a layer that cannot fold pays
-// one more rotate launch, the size of tq_rotate_s<S>.
+// ---------------------------------------------------------------------------
+// THE WORKLOAD
+// ---------------------------------------------------------------------------
 //
-// PREFILL. After the decode summary, a second suite times prefill across a
-// dense sweep of shapes against aclnnFusedInferAttentionScoreV5 over an fp16
-// cache: the TurboQuant write, the rotation of V a folded layer needs, the
-// stock attention and the pipelines they make up, with device time from ACL
-// events, GB/s and the KV-cache compression ratios. See THE PREFILL SUITE below
-// for what it times, what it does not, and its own ASCEND_BENCH_TQ_PREFILL_*
-// variables; ASCEND_BENCH_TQ_PREFILL=0 drops it.
+// Three flagship families at TP=8, one NPU's share of each. These are serving
+// ranks, not a geometric sweep: a dense cartesian product of head counts
+// produces hundreds of shapes nobody deploys and buries the nine that matter.
+//
+//   Qwen3.5-9B          D=128  H_Q=4   H_KV=1   GQA 4:1    UNFOLDED
+//                       attn_output_gate multiplies the context by sigmoid(gate)
+//                       before o_proj, so W_o cannot absorb Pi and T_rot_o is a
+//                       real kernel on the critical path.
+//   DeepSeek-V4-Flash   D=256  H_Q=16  H_KV=1   MLA        folded
+//                       decoupled latent KV. The 16:1 group exactly fills the
+//                       Cube's M=16 fractal, which is what puts this family on
+//                       the Cube decode.
+//   GLM-5.2-744B        D=128  H_Q=8   H_KV=1   GQA 8:1    folded
+//
+//   S = 2048      B in {1, 4, 8}      short / interactive
+//   S = 32768     B in {1, 4, 8}      enterprise long
+//   S = 262144    B in {1, 2}         ultra-long
+//   S = 1048576   B in {1}            extreme needle / 1M
+//
+// 3 families x 9 (S, B) pairs = 27 configurations, each audited in both phases:
+// 27 rows in Table A and 27 in Table B.
+//
+// PREFILL IS CHUNKED, and the table says so. A step processes C = min(S, 2048)
+// query tokens against the S-token prefix, which is what vLLM's scheduler
+// actually submits and what keeps a 1M-context row from costing 2.5 hours of
+// O(S^2) attention per iteration. The S column prints `S/C` whenever C < S. At
+// S = 2048 the chunk is the whole prefill and the column prints plain `2048`.
+//
+// ITERATIONS ARE ADAPTIVE. S <= 32K gets 5 warmup and 20 timed; S >= 262K gets
+// 1 and 3. Two budgets means two BenchmarkRunners -- the generic table stamps
+// one warmup/iterations line on the whole of itself, so a second budget gets a
+// second table rather than rows its header misdescribes.
+//
+// ---------------------------------------------------------------------------
+// THE DECODE PATH IS CHOSEN BY THE GQA GROUP, NOT BY A FLAG
+// ---------------------------------------------------------------------------
+//
+// The Cube decode batches a kv head's query heads into the GEMM's M dimension,
+// and that fractal is 16 rows wide (turboquant_host::kCubeTileM). A 16:1 group
+// fills it; a 4:1 or 8:1 group would run it three-quarters or half empty, and
+// the vector path is the right one there. So:
+//
+//     group = H_Q / H_KV >= 16   ->  Cube   (TurboQuantCubeDecodeSplit +
+//                                            TurboQuantPagedAttentionCombine,
+//                                            two launches, separately timed)
+//     group < 16                 ->  AIV    (turboquant_paged_attention, one
+//                                            launcher submitting both stages)
+//
+// which puts DeepSeek-V4-Flash on the Cube and Qwen3.5 / GLM-5.2 on the AIV
+// path. `ASCEND_BENCH_TQ_AUDIT_PATH=cube|aiv` overrides it for both.
+//
+// THE AIV PATH'S SPLIT COLUMN IS DERIVED, AND IS MARKED WITH `~`. There is no
+// exported entry point for the AIV split alone -- turboquant_paged_attention_impl
+// submits split and combine together -- so T_DecodeSplit for that path is the
+// measured core minus the separately measured combine. The Cube path's split is
+// measured directly and carries no marker. The CSV carries the flag as
+// `split_is_derived`.
+//
+// ---------------------------------------------------------------------------
+// THE TWO DEVICE CHECKS, BEFORE ANYTHING IS TIMED
+// ---------------------------------------------------------------------------
+//
+// 1. THE ROTATED-BASIS IDENTITY. Pi is orthogonal, so attention in the rotated
+//    basis is attention: softmax(Q~ K~^T) V~ = Pi (softmax(Q K^T) V). The check
+//    runs FIA over (Q~, K~, V~), un-rotates the result on the host, and demands
+//    cos > 0.999 against FIA over (Q, K, V). That is the device-level statement
+//    that the prefill core this file times is computing the layer's attention
+//    and not some other bilinear form, and it is what licenses timing the folded
+//    path with T_rot_o = 0.
+// 2. THE DECODE TIE-POINT. On the smallest configuration whose context fits an
+//    exact host image, the TurboQuant decode's output is un-rotated and compared
+//    against the native V5 decode over the same context in the same slots:
+//    cos > 0.90. That bound is deliberately loose -- 4 bits against 16 will not
+//    do better, and the fidelity gates are elsewhere -- but it is tight enough to
+//    catch the failure this binary is otherwise blind to, which is timing a
+//    kernel that is reading an empty cache.
+//
+// Both are recorded as failures when they miss, so ctest sees them.
+//
+// ---------------------------------------------------------------------------
+// TRAFFIC, AND WHAT THE GB/s COLUMNS MEAN
+// ---------------------------------------------------------------------------
+//
+// Every byte figure is COMPULSORY traffic: each distinct byte the step must move
+// across HBM, counted once, under one convention for every leg. A cached KV row
+// is counted once per kv head and not once per query head, whichever path reads
+// it, so the ratio between two legs' byte counts is the ratio between their
+// storage formats and not between their task decompositions. Re-reads that L2
+// may or may not absorb are not guessed at in either direction.
+//
+// ---------------------------------------------------------------------------
+// OUTPUT
+// ---------------------------------------------------------------------------
+//
+//   Table A   prefill pipeline, one row per configuration
+//   Table B   decode latency breakdown, one row per configuration
+//   plus the generic per-case table and CSV from the shared harness.
+//
+//   ASCEND_BENCH_TQ_AUDIT_PREFILL_CSV=<path>   Table A, plus every column the
+//                                              terminal has no room for.
+//   ASCEND_BENCH_TQ_AUDIT_DECODE_CSV=<path>    Table B, likewise.
+//   ASCEND_BENCH_TQ_AUDIT_MODELS=qwen35,dsv4,glm52
+//   ASCEND_BENCH_TQ_AUDIT_S=2048,32768         restrict the context regimes
+//   ASCEND_BENCH_TQ_AUDIT_B=1,4                restrict the batches
+//   ASCEND_BENCH_TQ_AUDIT_PHASES=prefill,decode
+//   ASCEND_BENCH_TQ_AUDIT_LEGS=dec_e2e,dec_v5  restrict the legs
+//   ASCEND_BENCH_TQ_AUDIT_CHUNK=2048           the prefill chunk C
+//   ASCEND_BENCH_TQ_AUDIT_PATH=auto|cube|aiv
+//   ASCEND_BENCH_TQ_AUDIT_GLM_D=128            GLM-5.2 is specified at 128 or 256
+//   ASCEND_BENCH_TQ_AUDIT_WARMUP / _ITERS      the S <= 32K budget (5 / 20)
+//   ASCEND_BENCH_TQ_AUDIT_ULTRA_WARMUP / _ULTRA_ITERS   the S >= 262K one (1 / 3)
+//   ASCEND_BENCH_TQ_FIA=0                      drop the native V5 legs entirely
+//
+// and the shared ASCEND_BENCH_* set; see common/benchmark.hpp. Note that
+// ASCEND_BENCH_MODES selects three timing modes by default and every one of them
+// is a full warmup-plus-iterations run: on the ultra-long rows that is the
+// difference between minutes and tens of minutes.
+//
+// NOTHING BELOW HAS EVER RUN ON SILICON. No Ascend 950PR part has been available
+// to this project. The kernels are verified on the arch35 camodel and the
+// numbers this file would print are, as of this writing, hypothetical.
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <functional>
-#include <initializer_list>
-#include <iterator>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -153,6 +263,7 @@
 #include <vector>
 
 #include "acl_check.hpp"
+#include "aclnn_ops.hpp"
 #include "aclnn_ops_950pr.hpp"
 #include "aclnn_runtime.hpp"
 #include "ascend950_shapes.hpp"
@@ -168,7 +279,7 @@ namespace test {
 namespace bench {
 
 const char* kSuiteName =
-    "turboquant_950pr (4-bit rotated KV cache: AIV, Cube, an fp16 Cube baseline, and prefill against FIA V5)";
+    "turboquant_950pr (end-to-end audit: TurboQuant against the native CANN V5 attention operator)";
 
 namespace {
 
@@ -176,1133 +287,87 @@ namespace tqh = turboquant_host;
 namespace tqm = vllm_ascend::turboquant;
 namespace s950 = shapes950;
 
-// --- the shape ---------------------------------------------------------------
-
-constexpr int64_t kHeadSize = s950::kHeadDim;        // 256
-constexpr int64_t kNumHeads = s950::kNumHeads;       // 8
-constexpr int64_t kNumKvHeads = s950::kNumKvHeads;   // 2
-constexpr int64_t kBlockSize = s950::kBlockSize;     // 128
-constexpr int64_t kQueryTokens = 1;                  // decode
-// 1 / sqrt(256), exact in fp16 and in fp32, so the scale contributes no
-// rounding of its own. The kernels take the reciprocal square root rather than
-// computing one.
-constexpr float kAttentionScale = s950::kAttentionScale;
-constexpr float kInvSqrtHeadSize = s950::kAttentionScale;
-
-// Context lengths, in tokens. The brief's sweep, with S=64 prepended so the
-// timings start at the shape the Cube decode's fidelity was measured at on the
-// camodel (TURBOQUANT_TESTS.md section 13.9) -- otherwise every timed shape is
-// one whose numerics have never been checked anywhere.
-const int64_t kDefaultContextLens[] = {64, 512, 1024, 2048};
-
-// fp16 bytes per element, and the fp32 words in a partial's tail. Named so the
-// traffic arithmetic below reads as arithmetic rather than as constants.
-constexpr double kHalfBytes = 2.0;
-constexpr double kFloatBytes = 4.0;
-
-std::vector<int64_t> ContextLens() {
-  const char* override_value = std::getenv("ASCEND_BENCH_TQ_CONTEXTS");
-  if (override_value == nullptr || *override_value == '\0') {
-    return std::vector<int64_t>(std::begin(kDefaultContextLens), std::end(kDefaultContextLens));
-  }
-  std::vector<int64_t> lens;
-  std::istringstream stream(override_value);
-  std::string field;
-  while (std::getline(stream, field, ',')) {
-    const long long parsed = std::strtoll(field.c_str(), nullptr, 10);
-    if (parsed > 0) {
-      lens.push_back(static_cast<int64_t>(parsed));
-    }
-  }
-  if (lens.empty()) {
-    std::printf("[ascend-bench] ASCEND_BENCH_TQ_CONTEXTS='%s' parsed to nothing; using the default sweep\n",
-                override_value);
-    return std::vector<int64_t>(std::begin(kDefaultContextLens), std::end(kDefaultContextLens));
-  }
-  return lens;
-}
-
-/*
- * The stock-operator leg, on by default and droppable.
- *
- * It exists because the aclnn argument list for a paged fp16 decode has never
- * been planned on this part, let alone launched: V1..V4 are withdrawn on an
- * Ascend950 and V5's list is transcribed from a header. A refusal at plan time is
- * harmless -- the leg records a skip and the sweep continues -- but a plan that
- * succeeds and a launch that faults takes the stream down and every case queued
- * behind it, which is the same hazard the Cube switch exists for. So it gets the
- * same treatment: ASCEND_BENCH_TQ_FIA=0 drops it before anything is constructed.
- */
-bool FiaEnabled() {
-  const char* raw = std::getenv("ASCEND_BENCH_TQ_FIA");
-  return raw == nullptr || *raw == 0 || std::string(raw) != "0";
-}
-
-// --- THE CUBE LEGS -----------------------------------------------------------
-//
-// kv4fp8_write, kv4fp8_decode and fp16_decode drive
-// csrc/attention/turboquant/turboquant_mm_kernels.cpp and are ON by default.
-// The defect that used to make that unsafe is closed: L0A/L0B/L0C were being
-// allocated on both halves of the MIX kernel, and the AIV half stalled on
-// "pem_lsu: unrecognize ldst addr" with ldst_addr: 2 the first time anything
-// touched one. Both Cube kernels now allocate L1 on both cores and L0 on the
-// AIC alone.
-//
-// They are no longer provisional: the decode is measured correct on the
-// camodel and the rates here are what the device verification runs.
-//
-// VLLM_ASCEND_TQ_CUBE_WIP=0 drops them, which is what to reach for if a future
-// defect does take the stream down: a launch into a faulting kernel takes every
-// case queued behind it with it, so the switch is before the launch rather than
-// a check after it.
-#if defined(VLLM_ASCEND_TQ_CUBE_OFF_BY_DEFAULT)
-constexpr bool kCubeDefault = false;
-#else
-constexpr bool kCubeDefault = true;
-#endif
-
-bool CubeEnabled() {
-  const char* raw = std::getenv("VLLM_ASCEND_TQ_CUBE_WIP");
-  if (raw == nullptr || *raw == '\0') {
-    return kCubeDefault;
-  }
-  return raw[0] != '0';
-}
-
-void PrintCubeBanner(bool enabled) {
-  if (enabled) {
-    std::printf("[ascend-bench] Cube-native legs (kv4fp8_write, kv4fp8_decode, fp16_decode) are ON.\n"
-                "[ascend-bench]   kv4fp8 is verified: cos 0.982351 against an fp32 host reference on the\n"
-                "[ascend-bench]   arch35 camodel at S=64, no device errors. What that does NOT cover is the\n"
-                "[ascend-bench]   context lengths swept here, nor the fp16 leg, which is a comparator with no\n"
-                "[ascend-bench]   fidelity check of its own. Timings from this binary have never been taken on\n"
-                "[ascend-bench]   silicon. VLLM_ASCEND_TQ_CUBE_WIP=0 drops the Cube legs.\n");
-  } else {
-    std::printf("[ascend-bench] Cube-native legs (kv4fp8_write, kv4fp8_decode, fp16_decode) are SKIPPED\n"
-                "[ascend-bench]   (VLLM_ASCEND_TQ_CUBE_WIP=0). This run is the AIV-only 4-bit path, and the\n"
-                "[ascend-bench]   only comparison in it is the traffic model.\n");
-  }
-  std::fflush(stdout);
-}
-
-// --- the traffic model -------------------------------------------------------
-//
-// Exact byte counts, not estimates. Two different questions:
-//
-//   footprint   what the KV cache for S tokens occupies in HBM -- the capacity
-//               win, independent of how attention reads it.
-//   decode read what one decode step streams -- the bandwidth win. Larger per
-//               byte of cache than the footprint suggests, because every query
-//               head re-reads its kv head's rows. Whether L2 absorbs some of
-//               those re-reads is not guessed at: the model counts what the
-//               kernel asks the memory system for, under the same convention
-//               for both legs.
-struct TrafficModel {
-  int64_t context_len = 0;
-  double fp16_footprint_bytes = 0.0;
-  double tq4_packed_bytes = 0.0;
-  double tq4_scale_bytes = 0.0;
-  double tq4_footprint_bytes = 0.0;
-  double kv4_packed_bytes = 0.0;
-  double kv4_footprint_bytes = 0.0;
-  double fp16_decode_read_bytes = 0.0;
-  double tq4_decode_read_bytes = 0.0;
-  double kv4_decode_read_bytes = 0.0;
-
-  double footprint_ratio() const {
-    return tq4_footprint_bytes > 0.0 ? fp16_footprint_bytes / tq4_footprint_bytes : 0.0;
-  }
-  double decode_read_ratio() const {
-    return tq4_decode_read_bytes > 0.0 ? fp16_decode_read_bytes / tq4_decode_read_bytes : 0.0;
-  }
-  double kv4_footprint_ratio() const {
-    return kv4_footprint_bytes > 0.0 ? fp16_footprint_bytes / kv4_footprint_bytes : 0.0;
-  }
-  double kv4_decode_read_ratio() const {
-    return kv4_decode_read_bytes > 0.0 ? fp16_decode_read_bytes / kv4_decode_read_bytes : 0.0;
-  }
-};
-
-TrafficModel ModelTrafficFor(int64_t context_len, const tqh::PagedAttentionGrid& decode_grid) {
-  const double s = static_cast<double>(context_len);
-  const double d = static_cast<double>(kHeadSize);
-  const double kv = static_cast<double>(kNumKvHeads);
-  const double heads = static_cast<double>(kNumHeads);
-  const double scale_slot = static_cast<double>(tqh::ScaleSlotFloats(kNumKvHeads));
-
-  TrafficModel model;
-  model.context_len = context_len;
-
-  // Residency: K and V, one row per token per kv head.
-  model.fp16_footprint_bytes = 2.0 * s * kv * d * kHalfBytes;
-  model.tq4_packed_bytes = 2.0 * s * kv * (d / tqh::kPackFactor);
-  model.tq4_scale_bytes = s * scale_slot * kFloatBytes;
-  model.tq4_footprint_bytes = model.tq4_packed_bytes + model.tq4_scale_bytes;
-
-  // The Cube slot, derived from the mode config rather than from a constant
-  // restated here. It is d/2 -- the same 128 bytes at d=256 the AIV path
-  // stores, because the two share the nibble layout -- and the scale plane is
-  // the 4-bit path's, whose geometry does not depend on the rate. So the kv4
-  // footprint equals the tq4 one exactly, and this is computed rather than
-  // aliased so that a change to either mode's packing shows up as a difference.
-  const double kv4_slot = static_cast<double>(tqh::ModePackedBytes(tqm::TurboQuantMode::KV4_FP8, kHeadSize));
-  model.kv4_packed_bytes = 2.0 * s * kv * kv4_slot;
-  model.kv4_footprint_bytes = model.kv4_packed_bytes + model.tq4_scale_bytes;
-
-  // One decode step. Query and output rows are two fp16 vectors per head and
-  // are kept in the count so the legs are counted the same way, not because
-  // they matter next to the context.
-  const double query_and_output = 2.0 * heads * d * kHalfBytes;
-
-  model.fp16_decode_read_bytes = heads * s * 2.0 * d * kHalfBytes + query_and_output;
-
-  // The packed rows and the scale-plane tile that is copied in with them, plus
-  // the flash-decoding partials: the split stage writes them and the combine
-  // stage reads them back, so they cross HBM twice.
-  const double partials = 2.0 * static_cast<double>(kQueryTokens * kNumHeads) *
-                          static_cast<double>(decode_grid.num_splits) *
-                          static_cast<double>(kHeadSize + tqh::kPartialTail) * kFloatBytes;
-  model.tq4_decode_read_bytes =
-      heads * s * 2.0 * (d / tqh::kPackFactor) + heads * s * scale_slot * kFloatBytes + query_and_output + partials;
-
-  // The Cube decode reads each cached row once per *kv* head rather than once
-  // per query head, because the query heads of a group are batched into the
-  // GEMM's M dimension. Partial traffic is unchanged: partials are indexed per
-  // head either way. That is why the kv4 decode-read figure is well below the
-  // tq4 one at the same slot width -- the storage is identical and only the
-  // task decomposition differs.
-  model.kv4_decode_read_bytes =
-      kv * s * 2.0 * kv4_slot + kv * s * scale_slot * kFloatBytes + query_and_output + partials;
-
-  return model;
-}
-
-// Attention FLOPs for one decode step: QK^T and the value accumulation, two
-// operations per element of each. The rotation and the codec are not counted,
-// so this is the same number the fp16 leg does and TFLOP/s is comparable
-// between them.
-double AttentionFlops(int64_t context_len) {
-  return 4.0 * static_cast<double>(kNumHeads) * static_cast<double>(context_len) * static_cast<double>(kHeadSize);
-}
-
-void PrintTrafficModel(const std::vector<TrafficModel>& models) {
-  std::printf("\n[ascend-bench] KV traffic model (exact byte counts, head_dim=%lld heads=%lld kv_heads=%lld "
-              "block=%lld)\n",
-              static_cast<long long>(kHeadSize), static_cast<long long>(kNumHeads),
-              static_cast<long long>(kNumKvHeads), static_cast<long long>(kBlockSize));
-  std::printf("[ascend-bench]   cache footprint for S tokens, and the bytes one decode step streams\n\n");
-  std::printf("  %6s  %14s %14s %8s   %16s %16s %8s\n", "S", "fp16 cache", "tq4 cache", "ratio",
-              "fp16 decode read", "tq4 decode read", "ratio");
-  std::printf("  %s\n", std::string(6 + 2 + 14 + 1 + 14 + 1 + 8 + 3 + 16 + 1 + 16 + 1 + 8, '-').c_str());
-  for (const TrafficModel& model : models) {
-    std::printf("  %6lld  %11.1f KiB %11.1f KiB %7.2fx   %13.1f KiB %13.1f KiB %7.2fx\n",
-                static_cast<long long>(model.context_len), model.fp16_footprint_bytes / 1024.0,
-                model.tq4_footprint_bytes / 1024.0, model.footprint_ratio(),
-                model.fp16_decode_read_bytes / 1024.0, model.tq4_decode_read_bytes / 1024.0,
-                model.decode_read_ratio());
-  }
-  // kv4fp8 gets its own table rather than two more columns on the first: it is
-  // read by a different task decomposition -- once per kv head rather than once
-  // per query head -- and putting it beside the AIV path's invites reading the
-  // two decode-read columns as if they counted the same thing. Its cache column
-  // is identical to tq4's by construction, the two storing the same nibbles, so
-  // the decode-read column is the only one that separates them and that
-  // difference is the decomposition alone.
-  std::printf("\n  %6s  %14s %8s %16s %8s\n", "S", "kv4 cache", "ratio", "kv4 decode read", "ratio");
-  std::printf("  %s\n", std::string(6 + 2 + 14 + 1 + 8 + 1 + 16 + 1 + 8, '-').c_str());
-  for (const TrafficModel& model : models) {
-    std::printf("  %6lld  %11.1f KiB %7.2fx %13.1f KiB %7.2fx\n", static_cast<long long>(model.context_len),
-                model.kv4_footprint_bytes / 1024.0, model.kv4_footprint_ratio(),
-                model.kv4_decode_read_bytes / 1024.0, model.kv4_decode_read_ratio());
-  }
-  // Derived from the same ScaleSlotFloats the kernel uses rather than quoted: a
-  // token carries 2 * num_kv_heads live scale lanes in a slot rounded up to a
-  // whole 32-byte burst.
-  const double live_lanes = 2.0 * static_cast<double>(kNumKvHeads);
-  const double slot_lanes = static_cast<double>(tqh::ScaleSlotFloats(kNumKvHeads));
-  std::printf("\n[ascend-bench]   the tq4 cache column is %.1f%% packed codes and %.1f%% scale plane; at "
-              "kv_heads=%lld a token's\n"
-              "[ascend-bench]   slot is %.0f fp32 lanes for %.0f live ones, so %.0f%% of that scale plane is "
-              "burst padding -\n"
-              "[ascend-bench]   %.1f%% of the whole 4-bit cache, and the price of every DMA being aligned\n",
-              100.0 * models.front().tq4_packed_bytes / models.front().tq4_footprint_bytes,
-              100.0 * models.front().tq4_scale_bytes / models.front().tq4_footprint_bytes,
-              static_cast<long long>(kNumKvHeads), slot_lanes, live_lanes,
-              100.0 * (slot_lanes - live_lanes) / slot_lanes,
-              100.0 * models.front().tq4_scale_bytes * (slot_lanes - live_lanes) / slot_lanes /
-                  models.front().tq4_footprint_bytes);
-  std::fflush(stdout);
-}
-
-// --- device-side scenario ----------------------------------------------------
-
-std::string CaseName(const char* prefix, int64_t context_len) {
-  std::ostringstream name;
-  name << prefix << "_s" << context_len;
-  return name.str();
-}
-
-// Everything one context length needs on the device, allocated once in
-// BuildSuite and alive for the whole of that shape's cases. Buffers are asked
-// for kBenchmarkAlignBytes rather than the 32-byte test default.
-struct DecodeScenario {
-  explicit DecodeScenario(int64_t context_len) : context_len_(context_len) {
-    blocks_per_seq_ = (context_len + kBlockSize - 1) / kBlockSize;
-    // Four times the blocks the context needs, so the block table is a genuine
-    // scatter through a pool rather than a run of consecutive blocks that would
-    // stay resident and flatter the measurement.
-    num_blocks_ = std::max<int64_t>(4, blocks_per_seq_ * 4);
-
-    DeterministicRandom rng(0x7451u);
-    const size_t kv_elems = static_cast<size_t>(context_len * kNumKvHeads * kHeadSize);
-    // Kept on the host as well as on the device, so the kv4 and fp16 legs
-    // quantise, cache and read exactly the same context.
-    key_host_ = rng.NormalHalfExact(kv_elems, 0.0f, 1.0f);
-    value_host_ = rng.NormalHalfExact(kv_elems, 0.0f, 1.0f);
-    const std::vector<float> query =
-        rng.NormalHalfExact(static_cast<size_t>(kQueryTokens * kNumHeads * kHeadSize), 0.0f, 1.0f);
-    const std::vector<float>& key = key_host_;
-    const std::vector<float>& value = value_host_;
-
-    const std::vector<int32_t> permutation = rng.Permutation(static_cast<int32_t>(num_blocks_));
-    block_table_.assign(permutation.begin(), permutation.begin() + static_cast<size_t>(blocks_per_seq_));
-
-    std::vector<int32_t> slots(static_cast<size_t>(context_len));
-    for (int64_t i = 0; i < context_len; ++i) {
-      const int32_t block = block_table_[static_cast<size_t>(i / kBlockSize)];
-      slots[static_cast<size_t>(i)] = block * static_cast<int32_t>(kBlockSize) + static_cast<int32_t>(i % kBlockSize);
-    }
-    slots_host_ = slots;
-
-    key_ = DeviceBuffer::FromHost(FloatToHalf(key), kBenchmarkAlignBytes);
-    value_ = DeviceBuffer::FromHost(FloatToHalf(value), kBenchmarkAlignBytes);
-    query_ = DeviceBuffer::FromHost(FloatToHalf(query), kBenchmarkAlignBytes);
-    slots_ = DeviceBuffer::FromHost(slots, kBenchmarkAlignBytes);
-    block_tables_ = DeviceBuffer::FromHost(block_table_, kBenchmarkAlignBytes);
-    context_lens_ = DeviceBuffer::FromHost(std::vector<int32_t>(static_cast<size_t>(kQueryTokens),
-                                                               static_cast<int32_t>(context_len)),
-                                           kBenchmarkAlignBytes);
-    pi_signs_ = DeviceBuffer::FromHost(tqh::PiSigns(kHeadSize), kBenchmarkAlignBytes);
-    // The query rotation's constant and its output. One of each, shared by every
-    // quantised leg for the same reason the query itself is: a second copy is a
-    // second chance for the legs to disagree.
-    h16_ = DeviceBuffer::FromHost(tqh::Hadamard16Half(), kBenchmarkAlignBytes);
-    query_rot_ = DeviceBuffer::Empty<float>(static_cast<size_t>(kQueryTokens * kNumHeads * kHeadSize),
-                                            kBenchmarkAlignBytes);
-
-    // The write path expands one vector per call and the decode path expands a
-    // kTileRows tile; the two table images differ and are not interchangeable.
-    write_tables_ = DeviceBuffer::FromHost(tqh::CodecTables(kHeadSize, 1), kBenchmarkAlignBytes);
-    decode_tables_ = DeviceBuffer::FromHost(tqh::CodecTables(kHeadSize, tqh::kTileRows), kBenchmarkAlignBytes);
-
-    key_cache_ = DeviceBuffer::Empty<int8_t>(
-        tqh::PackedCacheBytes(num_blocks_, kBlockSize, kNumKvHeads, kHeadSize), kBenchmarkAlignBytes);
-    value_cache_ = DeviceBuffer::Empty<int8_t>(key_cache_.size_bytes(), kBenchmarkAlignBytes);
-    scale_plane_ = DeviceBuffer::Empty<float>(tqh::ScalePlaneFloats(num_blocks_, kBlockSize, kNumKvHeads),
-                                              kBenchmarkAlignBytes);
-    out_ = DeviceBuffer::Empty<Half>(static_cast<size_t>(kQueryTokens * kNumHeads * kHeadSize),
-                                     kBenchmarkAlignBytes);
-
-    aiv_num_ = tqh::VectorCoreNum(&aiv_queried_);
-    write_grid_ = tqh::PlanReshapeAndCache(context_len, aiv_num_);
-    decode_grid_ = tqh::PlanPagedAttention(kQueryTokens, kNumHeads, kHeadSize, blocks_per_seq_, aiv_num_);
-    workspace_ = DeviceBuffer::Empty<float>(decode_grid_.workspace_floats, kBenchmarkAlignBytes);
-  }
-
-  void EnqueueWrite(aclrtStream stream) const {
-    turboquant_reshape_and_cache_impl(
-        AscendType::FP16, stream, write_grid_.block_dim, key_.get(), value_.get(), key_cache_.get(),
-        value_cache_.get(), scale_plane_.get(), slots_.get(), pi_signs_.get(), write_tables_.get(),
-        static_cast<uint32_t>(context_len_), static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize),
-        static_cast<uint32_t>(kBlockSize), write_grid_.tokens_per_core, kInvSqrtHeadSize);
-  }
-
-  // Two launches, ordered by the stream. The split stage writes one partial per
-  // (token, head, sequence split) and the combine stage reduces them; an
-  // in-kernel barrier cannot order those across an arbitrary grid, so stream
-  // order is the barrier.
-  void EnqueueDecode(aclrtStream stream) const {
-    EnqueueRotate(stream);
-    turboquant_paged_attention_impl(
-        AscendType::FP16, stream, decode_grid_.split_block_dim, decode_grid_.combine_block_dim, query_rot_.get(),
-        key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
-        decode_tables_.get(), workspace_.get(), out_.get(), static_cast<uint32_t>(kQueryTokens),
-        static_cast<uint32_t>(kNumHeads), static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize),
-        static_cast<uint32_t>(kBlockSize), static_cast<uint32_t>(blocks_per_seq_),
-        static_cast<uint32_t>(decode_grid_.num_splits), decode_grid_.split_tasks_per_core,
-        decode_grid_.combine_tasks_per_core, kAttentionScale, kInvSqrtHeadSize);
-  }
-
-  // Fills the cache once, outside any timed region, so the decode case reads a
-  // cache that holds the scenario's data rather than the allocation's zeros.
-  void FillCache(aclrtStream stream) const {
-    EnqueueWrite(stream);
-    ACL_CHECK(aclrtSynchronizeStream(stream));
-  }
-
-  int64_t context_len() const { return context_len_; }
-  int64_t blocks_per_seq() const { return blocks_per_seq_; }
-  int64_t num_blocks() const { return num_blocks_; }
-  int64_t aiv_num() const { return aiv_num_; }
-  bool aiv_queried() const { return aiv_queried_; }
-  const tqh::PagedAttentionGrid& decode_grid() const { return decode_grid_; }
-  const tqh::ReshapeAndCacheGrid& write_grid() const { return write_grid_; }
-  const std::vector<int32_t>& block_table() const { return block_table_; }
-  const std::vector<int32_t>& slots() const { return slots_host_; }
-  const std::vector<float>& key_host() const { return key_host_; }
-  const std::vector<float>& value_host() const { return value_host_; }
-
-  std::vector<float> Output() const { return HalfToFloat(out_.ToHost<Half>()); }
-  std::vector<float> ScalePlane() const { return scale_plane_.ToHost<float>(); }
-
-  // The device-side inputs the other two legs reuse verbatim. Shared rather
-  // than re-uploaded so that every leg reads one set of bytes: a second upload
-  // would be a second chance for the legs to disagree.
-  void* key() const { return key_.get(); }
-  void* value() const { return value_.get(); }
-  void* query() const { return query_.get(); }
-  void* slots_dev() const { return slots_.get(); }
-  void* block_tables() const { return block_tables_.get(); }
-  void* context_lens() const { return context_lens_.get(); }
-  void* pi_signs() const { return pi_signs_.get(); }
-  void* h16() const { return h16_.get(); }
-  void* query_rot() const { return query_rot_.get(); }
-  void* write_tables() const { return write_tables_.get(); }
-  std::vector<float> RotatedQuery() const { return query_rot_.ToHost<float>(); }
-
-  /*
-   * Enqueue Pi q for this step. Every quantised leg calls it at the head of its
-   * own EnqueueDecode, so the rotation is inside the timed region exactly where
-   * it used to be when the split kernel did it -- the accounting across the
-   * refactor is unchanged, and `vs fp16` still compares a rotated decode with an
-   * unrotated one.
-   */
-  vllm_ascend::turboquant::RotateQPlan EnqueueRotate(aclrtStream stream) const {
-    return tqh::RotateQuery(stream, AscendType::FP16, query_.get(), pi_signs_.get(), h16_.get(),
-                            write_tables_.get(), query_rot_.get(), kQueryTokens, kNumHeads, kHeadSize, aiv_num_,
-                            /*input_exact_in_half=*/true);
-  }
-
- private:
-  int64_t context_len_ = 0;
-  int64_t blocks_per_seq_ = 0;
-  int64_t num_blocks_ = 0;
-  int64_t aiv_num_ = 0;
-  bool aiv_queried_ = false;
-
-  std::vector<int32_t> block_table_;
-  std::vector<int32_t> slots_host_;
-  std::vector<float> key_host_, value_host_;
-
-  DeviceBuffer key_, value_, query_, slots_, block_tables_, context_lens_, pi_signs_;
-  DeviceBuffer h16_, query_rot_;
-  DeviceBuffer write_tables_, decode_tables_;
-  DeviceBuffer key_cache_, value_cache_, scale_plane_, workspace_, out_;
-  tqh::ReshapeAndCacheGrid write_grid_;
-  tqh::PagedAttentionGrid decode_grid_;
-};
-
-// --- the Cube-native quantised legs -----------------------------------------
-//
-// One scenario for every Cube-native storage rate. The mode is a template
-// parameter and not a constructor argument for the same reason it is one on the
-// device: the cache slot width, the table image and the codebook all follow
-// from it, and a rate that only agreed at run time could size a buffer for one
-// rate and write it with another.
-//
-// Nothing constructs this unless CubeEnabled(); see THE CUBE LEGS above.
-template <tqm::TurboQuantMode MODE>
-struct ModeScenario {
-  static constexpr tqm::TurboQuantMode kMode = MODE;
-
-  ModeScenario(const DecodeScenario& shared, int64_t context_len)
-      : context_len_(context_len),
-        blocks_per_seq_(shared.blocks_per_seq()),
-        num_blocks_(shared.num_blocks()),
-        aiv_num_(shared.aiv_num()) {
-    key_cache_ = DeviceBuffer::Empty<int8_t>(
-        tqh::ModePackedCacheBytes(kMode, num_blocks_, kBlockSize, kNumKvHeads, kHeadSize), kBenchmarkAlignBytes);
-    value_cache_ = DeviceBuffer::Empty<int8_t>(key_cache_.size_bytes(), kBenchmarkAlignBytes);
-    // The scale plane's layout does not depend on the rate: one fp32 per
-    // (token, kv head, K/V), padded to a whole burst, is what both codecs
-    // write, which is why the traffic model reuses the 4-bit figure for it.
-    scale_plane_ = DeviceBuffer::Empty<float>(tqh::ScalePlaneFloats(num_blocks_, kBlockSize, kNumKvHeads),
-                                              kBenchmarkAlignBytes);
-    out_ = DeviceBuffer::Empty<Half>(static_cast<size_t>(kQueryTokens * kNumHeads * kHeadSize),
-                                     kBenchmarkAlignBytes);
-
-    // Three table images, and they are not interchangeable. The rotation image
-    // is the shipping 4-bit codec's, because both kernels drive Pi through a
-    // TurboQuantCodec4; the mode ones are this rate's. For a codebook rate the
-    // decode image carries the NZ permutation (nz_rows = kCubeTileRows) and the
-    // write image does not; for an affine rate both are a single zero block,
-    // because that codec reads no table and both arguments are ignored (see
-    // turboquant_host::ModeTables).
-    rot_tables_ = DeviceBuffer::FromHost(tqh::CodecTables(kHeadSize, 1), kBenchmarkAlignBytes);
-    write_tables_ =
-        DeviceBuffer::FromHost(tqh::ModeTables(kMode, kHeadSize, 1, /*nz_rows=*/0), kBenchmarkAlignBytes);
-    decode_tables_ = DeviceBuffer::FromHost(
-        tqh::ModeTables(kMode, kHeadSize, tqh::kUnpackRows, tqh::kCubeTileRows), kBenchmarkAlignBytes);
-
-    write_grid_ = tqh::PlanReshapeAndCache(context_len, aiv_num_);
-    decode_grid_ =
-        tqh::PlanCubeDecode(kQueryTokens, kNumHeads, kNumKvHeads, kHeadSize, blocks_per_seq_, aiv_num_);
-    workspace_ = DeviceBuffer::Empty<float>(decode_grid_.workspace_floats, kBenchmarkAlignBytes);
-  }
-
-  void EnqueueWrite(const DecodeScenario& shared, aclrtStream stream) const {
-    turboquant_mm_reshape_and_cache_impl(
-        static_cast<int32_t>(kMode), AscendType::FP16, stream, write_grid_.block_dim, shared.key(), shared.value(),
-        key_cache_.get(), value_cache_.get(), scale_plane_.get(), shared.slots_dev(), shared.pi_signs(),
-        rot_tables_.get(), write_tables_.get(), static_cast<uint32_t>(context_len_),
-        static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kBlockSize),
-        write_grid_.tokens_per_core, kInvSqrtHeadSize);
-  }
-
-  // Split on the Cube, then combine. The combine stage is the shipping
-  // AIV path's, unchanged: the partials the Cube split writes are in exactly
-  // its layout, so there is no second reduction to keep in step. Stream order
-  // is the barrier between the two, for the same reason as in the 4-bit path.
-  void EnqueueDecode(const DecodeScenario& shared, aclrtStream stream) const {
-    shared.EnqueueRotate(stream);
-    turboquant_mm_decode_split_impl(
-        static_cast<int32_t>(kMode), AscendType::FP16, stream, decode_grid_.split_block_dim, shared.query_rot(),
-        key_cache_.get(), value_cache_.get(), scale_plane_.get(), shared.block_tables(), shared.context_lens(),
-        decode_tables_.get(), workspace_.get(),
-        static_cast<uint32_t>(kQueryTokens), static_cast<uint32_t>(kNumHeads), static_cast<uint32_t>(kNumKvHeads),
-        static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kBlockSize),
-        static_cast<uint32_t>(blocks_per_seq_), static_cast<uint32_t>(decode_grid_.num_splits),
-        decode_grid_.split_tasks_per_core, kAttentionScale, kInvSqrtHeadSize);
-
-    turboquant_paged_attention_combine_impl(AscendType::FP16, stream, decode_grid_.combine_block_dim,
-                                            workspace_.get(), out_.get(), static_cast<uint32_t>(kQueryTokens),
-                                            static_cast<uint32_t>(kNumHeads), static_cast<uint32_t>(kHeadSize),
-                                            static_cast<uint32_t>(decode_grid_.num_splits),
-                                            decode_grid_.combine_tasks_per_core);
-  }
-
-  void FillCache(const DecodeScenario& shared, aclrtStream stream) const {
-    EnqueueWrite(shared, stream);
-    ACL_CHECK(aclrtSynchronizeStream(stream));
-  }
-
-  std::vector<float> Output() const { return HalfToFloat(out_.ToHost<Half>()); }
-  std::vector<float> ScalePlane() const { return scale_plane_.ToHost<float>(); }
-  const tqh::CubeDecodeGrid& decode_grid() const { return decode_grid_; }
-
- private:
-  int64_t context_len_ = 0;
-  int64_t blocks_per_seq_ = 0;
-  int64_t num_blocks_ = 0;
-  int64_t aiv_num_ = 0;
-
-  DeviceBuffer key_cache_, value_cache_, scale_plane_, workspace_, out_;
-  DeviceBuffer rot_tables_, write_tables_, decode_tables_;
-  tqh::ReshapeAndCacheGrid write_grid_;
-  tqh::CubeDecodeGrid decode_grid_;
-};
-
-// The 4-bit Cube rate, and the only mode with a leg here. kv3fp4 and kv5fp8
-// are scaffolded on the device and covered by the sim tier; instantiating
-// ModeScenario for either would allocate another KV cache of the same shape per
-// context length for a comparison this binary is not making.
-using Kv4Scenario = ModeScenario<tqm::TurboQuantMode::KV4_FP8>;
-
-// --- the physical fp16 baseline ----------------------------------------------
-//
-// The same Cube decode over an unquantised fp16 paged cache: no codec, no
-// tables, no scale plane, and the same shape, paging and context as the
-// quantised legs.
-//
-// Behind the same switch as the quantised Cube leg, and it shares that leg's
-// staging -- it is the same kernel with the codec removed, so it is not an
-// independent control, and nothing asserts it computes the right thing.
-struct Fp16Scenario {
-  Fp16Scenario(const DecodeScenario& shared, int64_t context_len)
-      : context_len_(context_len), blocks_per_seq_(shared.blocks_per_seq()) {
-    const size_t cache_elems =
-        static_cast<size_t>(shared.num_blocks() * kBlockSize * kNumKvHeads * kHeadSize);
-    std::vector<float> key_cache(cache_elems, 0.0f);
-    std::vector<float> value_cache(cache_elems, 0.0f);
-
-    // The same context, written into the same slots the quantised legs used, so
-    // every leg reads identical data through identical paging and the
-    // comparison is of the codec rather than of the access pattern.
-    const std::vector<float>& key = shared.key_host();
-    const std::vector<float>& value = shared.value_host();
-    for (int64_t pos = 0; pos < context_len; ++pos) {
-      const size_t slot = static_cast<size_t>(shared.slots()[static_cast<size_t>(pos)]);
-      const size_t src = static_cast<size_t>(pos * kNumKvHeads * kHeadSize);
-      const size_t dst = slot * static_cast<size_t>(kNumKvHeads * kHeadSize);
-      std::copy(key.begin() + static_cast<std::ptrdiff_t>(src),
-                key.begin() + static_cast<std::ptrdiff_t>(src + kNumKvHeads * kHeadSize),
-                key_cache.begin() + static_cast<std::ptrdiff_t>(dst));
-      std::copy(value.begin() + static_cast<std::ptrdiff_t>(src),
-                value.begin() + static_cast<std::ptrdiff_t>(src + kNumKvHeads * kHeadSize),
-                value_cache.begin() + static_cast<std::ptrdiff_t>(dst));
-    }
-
-    key_cache_ = DeviceBuffer::FromHost(FloatToHalf(key_cache), kBenchmarkAlignBytes);
-    value_cache_ = DeviceBuffer::FromHost(FloatToHalf(value_cache), kBenchmarkAlignBytes);
-    out_ = DeviceBuffer::Empty<Half>(static_cast<size_t>(kQueryTokens * kNumHeads * kHeadSize),
-                                     kBenchmarkAlignBytes);
-
-    // The same split count the quantised leg gets, from the same planner. The
-    // partial traffic is the one term the two legs' models share exactly, and
-    // they only share it if the grids agree.
-    decode_grid_ = tqh::PlanCubeDecode(kQueryTokens, kNumHeads, kNumKvHeads, kHeadSize, blocks_per_seq_,
-                                       shared.aiv_num());
-    workspace_ = DeviceBuffer::Empty<float>(decode_grid_.workspace_floats, kBenchmarkAlignBytes);
-  }
-
-  // One call: unlike the quantised leg this kernel owns both stages, because
-  // there is no codec between them that would want its own launch.
-  void EnqueueDecode(const DecodeScenario& shared, aclrtStream stream) const {
-    turboquant_fp16_decode_impl(
-        AscendType::FP16, stream, decode_grid_.split_block_dim, decode_grid_.combine_block_dim, shared.query(),
-        key_cache_.get(), value_cache_.get(), shared.block_tables(), shared.context_lens(), workspace_.get(),
-        out_.get(), static_cast<uint32_t>(kQueryTokens), static_cast<uint32_t>(kNumHeads),
-        static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kBlockSize),
-        static_cast<uint32_t>(blocks_per_seq_), static_cast<uint32_t>(decode_grid_.num_splits),
-        decode_grid_.split_tasks_per_core, decode_grid_.combine_tasks_per_core, kAttentionScale);
-  }
-
-  std::vector<float> Output() const { return HalfToFloat(out_.ToHost<Half>()); }
-  const tqh::CubeDecodeGrid& decode_grid() const { return decode_grid_; }
-
-  // For the stock-operator leg, which reads the same two caches rather than
-  // allocating a third pair: the comparison is of the decode, so both sides have
-  // to see the identical bytes through the identical paging.
-  void* key_cache() const { return key_cache_.get(); }
-  void* value_cache() const { return value_cache_.get(); }
-
- private:
-  int64_t context_len_ = 0;
-  int64_t blocks_per_seq_ = 0;
-  DeviceBuffer key_cache_, value_cache_, workspace_, out_;
-  tqh::CubeDecodeGrid decode_grid_;
-};
-
-/*
- * --- the stock-operator baseline --------------------------------------------
- *
- * aclnnFusedInferAttentionScore over the fp16 paged cache Fp16Scenario built,
- * with the plugin's own decode argument list (the DecodeOnly branch of
- * AscendAttentionBackendImpl._get_fia_params): layout TND, one entry in the key
- * and value tensor lists, the block table as a tensor, and the context length as
- * actualSeqLengthsKv.
- *
- * V5 FIRST, V2 AS A FALLBACK. V1 to V4 are withdrawn on an Ascend950 -- planning
- * returns 361001, measured -- and V5 is what replaces them, but V5's argument
- * list has never been planned on a part. Trying both and recording what happened
- * is the only honest arrangement: a build where neither plans still gets a row
- * in the table, with the operator name and the status in it.
- *
- * Planned once at construction rather than per launch. PlanAclnn does the
- * GetWorkspaceSize call and the workspace allocation up front, so Launch() is as
- * close to the kernel as the runtime allows -- which is the same treatment every
- * other leg gets, and without it this column would be measuring the aclnn
- * planner.
- *
- * The member order is load-bearing: the tensor wrappers must outlive the
- * PlannedOp that captured their handles, and the lists and the output tensor
- * must be constructed after the tensors and the buffers they point at.
- */
-struct FiaScenario {
-  FiaScenario(const Fp16Scenario& fp16, const DecodeScenario& shared, int64_t context_len)
-      : out_(DeviceBuffer::Empty<Half>(static_cast<size_t>(kQueryTokens * kNumHeads * kHeadSize),
-                                       kBenchmarkAlignBytes)),
-        // softmaxLse is a required output even with softmaxLseFlag false; the
-        // plugin allocates one element for it and discards it.
-        lse_(DeviceBuffer::Empty<Half>(1, kBenchmarkAlignBytes)),
-        key_flat_(s950::FiaKeyCacheView(shared.num_blocks(), kBlockSize, kNumKvHeads, kHeadSize), ACL_FLOAT16,
-                  fp16.key_cache()),
-        value_flat_(s950::FiaKeyCacheView(shared.num_blocks(), kBlockSize, kNumKvHeads, kHeadSize), ACL_FLOAT16,
-                    fp16.value_cache()),
-        key_list_({key_flat_.get()}),
-        value_list_({value_flat_.get()}),
-        query_tnd_({kQueryTokens, kNumHeads, kHeadSize}, ACL_FLOAT16, shared.query()),
-        block_table_({kQueryTokens, shared.blocks_per_seq()}, ACL_INT32, shared.block_tables()),
-        context_tensor_({kQueryTokens, kNumHeads, kHeadSize}, ACL_FLOAT16, out_.get()),
-        lse_tensor_({1}, ACL_FLOAT16, lse_.get()),
-        actual_seq_lengths_(std::vector<int64_t>{kQueryTokens}),
-        actual_seq_lengths_kv_(std::vector<int64_t>{context_len}) {
-    try {
-      planned_.reset(new PlannedOp(PlanAclnn<ops950::FusedInferAttentionScoreV5WorkspaceFn>(
-          V5(), query_tnd_.get(), key_list_.get(), value_list_.get(), /*pse_shift=*/nullptr,
-          /*atten_mask=*/nullptr, actual_seq_lengths_.get(), actual_seq_lengths_kv_.get(), /*deq_scale1=*/nullptr,
-          /*quant_scale1=*/nullptr, /*deq_scale2=*/nullptr, /*quant_scale2=*/nullptr, /*quant_offset2=*/nullptr,
-          /*antiquant_scale=*/nullptr, /*antiquant_offset=*/nullptr, block_table_.get(),
-          /*query_padding_size=*/nullptr, /*kv_padding_size=*/nullptr, /*key_antiquant_scale=*/nullptr,
-          /*key_antiquant_offset=*/nullptr, /*value_antiquant_scale=*/nullptr, /*value_antiquant_offset=*/nullptr,
-          /*key_shared_prefix=*/nullptr, /*value_shared_prefix=*/nullptr, /*actual_shared_prefix_len=*/nullptr,
-          /*query_rope=*/nullptr, /*key_rope=*/nullptr, /*key_rope_antiquant_scale=*/nullptr,
-          /*dequant_scale_query=*/nullptr, /*learnable_sink=*/nullptr, /*q_start_idx=*/nullptr,
-          /*kv_start_idx=*/nullptr, kNumHeads, static_cast<double>(kAttentionScale), s950::kFiaUnboundedTokens,
-          s950::kFiaUnboundedTokens, const_cast<char*>(ops950::kFiaLayoutTnd), kNumKvHeads,
-          s950::kFiaSparseModeNone, s950::kFiaInnerPreciseDefault, kBlockSize, /*antiquant_mode=*/0,
-          /*softmax_lse_flag=*/false, /*key_antiquant_mode=*/0, /*value_antiquant_mode=*/0,
-          s950::kFiaQueryQuantModeNone, s950::kFiaPseTypeDefault, context_tensor_.get(), lse_tensor_.get())));
-      op_name_ = ops950::kFusedInferAttentionScoreV5;
-      return;
-    } catch (const AclError& error) {
-      note_ = std::string(ops950::kFusedInferAttentionScoreV5) + ": " + error.what();
-    }
-    try {
-      planned_.reset(new PlannedOp(PlanAclnn<ops950::FusedInferAttentionScoreV2WorkspaceFn>(
-          V2(), query_tnd_.get(), key_list_.get(), value_list_.get(), /*pse_shift=*/nullptr,
-          /*atten_mask=*/nullptr, actual_seq_lengths_.get(), actual_seq_lengths_kv_.get(), /*deq_scale1=*/nullptr,
-          /*quant_scale1=*/nullptr, /*deq_scale2=*/nullptr, /*quant_scale2=*/nullptr, /*quant_offset2=*/nullptr,
-          /*antiquant_scale=*/nullptr, /*antiquant_offset=*/nullptr, block_table_.get(),
-          /*query_padding_size=*/nullptr, /*kv_padding_size=*/nullptr, /*key_antiquant_scale=*/nullptr,
-          /*key_antiquant_offset=*/nullptr, /*value_antiquant_scale=*/nullptr, /*value_antiquant_offset=*/nullptr,
-          /*key_shared_prefix=*/nullptr, /*value_shared_prefix=*/nullptr, /*actual_shared_prefix_len=*/nullptr,
-          kNumHeads, static_cast<double>(kAttentionScale), s950::kFiaUnboundedTokens, s950::kFiaUnboundedTokens,
-          const_cast<char*>(ops950::kFiaLayoutTnd), kNumKvHeads, s950::kFiaSparseModeNone,
-          s950::kFiaInnerPreciseDefault, kBlockSize, /*antiquant_mode=*/0, /*softmax_lse_flag=*/false,
-          /*key_antiquant_mode=*/0, /*value_antiquant_mode=*/0, context_tensor_.get(), lse_tensor_.get())));
-      op_name_ = ops950::kFusedInferAttentionScoreV2;
-    } catch (const AclError& error) {
-      note_ += std::string("; ") + ops950::kFusedInferAttentionScoreV2 + ": " + error.what();
-    }
-  }
-
-  bool available() const { return planned_ != nullptr; }
-  const std::string& note() const { return note_; }
-  const std::string& op_name() const { return op_name_; }
-
-  void EnqueueDecode(aclrtStream stream) const { planned_->Launch(stream); }
-  std::vector<float> Output() const { return HalfToFloat(out_.ToHost<Half>()); }
-
- private:
-  static const AclnnOp& V5() {
-    static const AclnnOp op(ops950::kFusedInferAttentionScoreV5);
-    return op;
-  }
-  static const AclnnOp& V2() {
-    static const AclnnOp op(ops950::kFusedInferAttentionScoreV2);
-    return op;
-  }
-
-  DeviceBuffer out_, lse_;
-  AclnnTensor key_flat_, value_flat_;
-  AclnnTensorList key_list_, value_list_;
-  AclnnTensor query_tnd_, block_table_, context_tensor_, lse_tensor_;
-  AclnnIntArray actual_seq_lengths_, actual_seq_lengths_kv_;
-  std::unique_ptr<PlannedOp> planned_;
-  std::string note_;
-  std::string op_name_;
-};
-
-// --- reporting ---------------------------------------------------------------
-
-const BenchmarkResult* FindResult(const BenchmarkRunner& runner, const std::string& case_name, TimingMode mode) {
-  for (const BenchmarkResult& result : runner.results()) {
-    if (result.case_name == case_name && result.mode == mode) {
-      return &result;
-    }
-  }
-  return nullptr;
-}
-
-// One leg's numbers at one shape, or "did not run". Pulling the four figures
-// out of the result table once, into a struct, is what keeps the printing and the
-// CSV from disagreeing about which median they quoted.
-struct LegSample {
-  bool present = false;
-  double median_us = 0.0;
-  double p95_us = 0.0;
-  double gigabytes_per_second = 0.0;
-  double tflops = 0.0;
-};
-
-LegSample SampleFor(const BenchmarkRunner& runner, const char* leg, int64_t context_len) {
-  LegSample sample;
-  const BenchmarkResult* result = FindResult(runner, CaseName(leg, context_len), TimingMode::kPipelined);
-  if (result == nullptr || result->latency.median_us <= 0.0) {
-    return sample;
-  }
-  sample.present = true;
-  sample.median_us = result->latency.median_us;
-  sample.p95_us = result->latency.p95_us;
-  sample.gigabytes_per_second = result->gigabytes_per_second();
-  sample.tflops = result->tflops();
-  return sample;
-}
-
-// numerator / denominator, or 0 when either leg produced no sample. Callers print
-// a dash for 0 rather than a ratio, because a 0.00x would read as a measurement.
-double Speedup(const LegSample& baseline, const LegSample& candidate) {
-  if (!baseline.present || !candidate.present || candidate.median_us <= 0.0) {
-    return 0.0;
-  }
-  return baseline.median_us / candidate.median_us;
-}
-
-void PrintMicroseconds(const LegSample& sample) {
-  if (sample.present) {
-    std::printf("%10.2f ", sample.median_us);
-  } else {
-    std::printf("%10s ", "-");
-  }
-}
-
-void PrintRatio(double ratio, const char* tail) {
-  if (ratio > 0.0) {
-    std::printf("%9.2fx%s", ratio, tail);
-  } else {
-    std::printf("%10s%s", "-", tail);
-  }
-}
-
-/*
- * The shape-keyed comparison CSV, written when ASCEND_BENCH_TQ_COMPARE_CSV names
- * a path. One row per shape, every leg in it, so a spreadsheet can plot the
- * sweep without reshaping anything.
- *
- * Separate from the generic ASCEND_BENCH_CSV, which is one row per (case, mode)
- * and knows nothing about which cases are baselines for which. This one is the
- * comparison; that one is the raw record.
- *
- * An absent leg leaves its fields EMPTY rather than writing 0 -- a zero latency
- * or a zero speedup in a spreadsheet is indistinguishable from a measurement,
- * and this is the artifact most likely to be read without its banner.
- */
-void WriteComparisonCsv(const BenchmarkRunner& runner, const std::vector<TrafficModel>& models,
-                        const std::string& path, const std::string& fia_operator) {
-  std::ofstream csv(path, std::ios::trunc);
-  if (!csv) {
-    std::printf("[ascend-bench] could not open ASCEND_BENCH_TQ_COMPARE_CSV='%s' for writing\n", path.c_str());
-    return;
-  }
-  csv << "batch,context_len,num_heads,head_dim,num_kv_heads,block_size,"
-      << "kv4fp8_us,tq4_us,fp16_us,fia_us,fia_operator,"
-      << "speedup_vs_fp16,speedup_vs_tq4,speedup_vs_fia,"
-      << "kv4fp8_gbps,kv4fp8_tflops,fp16_gbps,fp16_tflops,fia_gbps,fia_tflops,"
-      << "kv4fp8_p95_us,fp16_p95_us,fia_p95_us,kv4fp8_bytes_per_step,fp16_bytes_per_step\n";
-
-  for (const TrafficModel& model : models) {
-    const LegSample kv4 = SampleFor(runner, "kv4fp8_decode", model.context_len);
-    const LegSample tq4 = SampleFor(runner, "tq4_decode", model.context_len);
-    const LegSample fp16 = SampleFor(runner, "fp16_decode", model.context_len);
-    const LegSample fia = SampleFor(runner, "fia_decode", model.context_len);
-
-    csv << kQueryTokens << ',' << model.context_len << ',' << kNumHeads << ',' << kHeadSize << ','
-        << kNumKvHeads << ',' << kBlockSize << ',';
-    const LegSample legs[] = {kv4, tq4, fp16, fia};
-    for (const LegSample& leg : legs) {
-      if (leg.present) {
-        csv << leg.median_us;
-      }
-      csv << ',';
-    }
-    csv << fia_operator << ',';
-    const double ratios[] = {Speedup(fp16, kv4), Speedup(tq4, kv4), Speedup(fia, kv4)};
-    for (const double ratio : ratios) {
-      if (ratio > 0.0) {
-        csv << ratio;
-      }
-      csv << ',';
-    }
-    const LegSample rate_legs[] = {kv4, fp16, fia};
-    for (const LegSample& leg : rate_legs) {
-      if (leg.present) {
-        csv << leg.gigabytes_per_second << ',' << leg.tflops;
-      } else {
-        csv << ',';
-      }
-      csv << ',';
-    }
-    for (const LegSample& leg : rate_legs) {
-      if (leg.present) {
-        csv << leg.p95_us;
-      }
-      csv << ',';
-    }
-    csv << model.kv4_decode_read_bytes << ',' << model.fp16_decode_read_bytes << '\n';
-  }
-  std::printf("[ascend-bench] comparison CSV written to %s\n", path.c_str());
-}
-
-/*
- * The suite's own summary, printed after every case has run and before the
- * generic table. What it adds is the three things the generic table cannot know:
- * which legs are baselines for which, the speedups that follow, and the derived
- * rates side by side.
- *
- * Three tables. The first is the latency comparison the binary exists to make --
- * the AIV 4-bit path, the Cube 4-bit path, the unquantised fp16 Cube path and the
- * stock operator, at one shape per row. The second is the speedups read off it.
- * The third is the derived rates per leg.
- */
-void PrintDecodeSummary(const BenchmarkRunner& runner, const std::vector<TrafficModel>& models,
-                        bool cube_enabled, const std::string& fia_operator) {
-  std::printf("\n[ascend-bench] TurboQuant decode summary (median of the pipelined mode)\n");
-  std::printf("[ascend-bench] shape: B=%lld H=%lld D=%lld kv_heads=%lld block=%lld\n",
-              static_cast<long long>(kQueryTokens), static_cast<long long>(kNumHeads),
-              static_cast<long long>(kHeadSize), static_cast<long long>(kNumKvHeads),
-              static_cast<long long>(kBlockSize));
-  std::printf("\n  %6s  %10s %10s %10s %10s\n", "S", "kv4 us", "tq4 us", "fp16 us", "fia us");
-  std::printf("  %s\n", std::string(6 + 2 + 4 * 11, '-').c_str());
-
-  bool any = false;
-  for (const TrafficModel& model : models) {
-    const LegSample kv4 = SampleFor(runner, "kv4fp8_decode", model.context_len);
-    const LegSample tq4 = SampleFor(runner, "tq4_decode", model.context_len);
-    const LegSample fp16 = SampleFor(runner, "fp16_decode", model.context_len);
-    const LegSample fia = SampleFor(runner, "fia_decode", model.context_len);
-    if (!kv4.present && !tq4.present && !fp16.present && !fia.present) {
-      continue;
-    }
-    any = true;
-    std::printf("  %6lld  ", static_cast<long long>(model.context_len));
-    const LegSample legs[] = {kv4, tq4, fp16, fia};
-    for (const LegSample& leg : legs) {
-      PrintMicroseconds(leg);
-    }
-    std::printf("\n");
-  }
-  if (!any) {
-    std::printf("  (no decode case produced a pipelined sample)\n");
-    std::fflush(stdout);
-    return;
-  }
-
-  // The speedups. Every one is kv4 against a denominator, because kv4 is the
-  // thing being proposed and the other three are what it would replace.
-  std::printf("\n  %6s  %10s %10s %10s\n", "S", "vs fp16", "vs tq4", "vs fia");
-  std::printf("  %s\n", std::string(6 + 2 + 3 * 11, '-').c_str());
-  for (const TrafficModel& model : models) {
-    const LegSample kv4 = SampleFor(runner, "kv4fp8_decode", model.context_len);
-    const LegSample tq4 = SampleFor(runner, "tq4_decode", model.context_len);
-    const LegSample fp16 = SampleFor(runner, "fp16_decode", model.context_len);
-    const LegSample fia = SampleFor(runner, "fia_decode", model.context_len);
-    if (!kv4.present) {
-      continue;
-    }
-    std::printf("  %6lld  ", static_cast<long long>(model.context_len));
-    PrintRatio(Speedup(fp16, kv4), " ");
-    PrintRatio(Speedup(tq4, kv4), " ");
-    PrintRatio(Speedup(fia, kv4), "\n");
-  }
-
-  // The derived rates, now for every leg that produced a sample rather than for
-  // kv4 alone. Each leg's GB/s is its OWN traffic model over its own measured
-  // time, so the column compares a leg to its own memory demand and not to
-  // another leg's -- a 4-bit cache and an fp16 one do not read the same bytes,
-  // which is the entire point of the change.
-  std::printf("\n  %6s  %-8s %11s %10s %10s\n", "S", "leg", "steps/s", "GB/s", "TFLOP/s");
-  std::printf("  %s\n", std::string(6 + 2 + 9 + 11 + 10 + 10 + 3, '-').c_str());
-  const char* rate_legs[] = {"kv4fp8_decode", "tq4_decode", "fp16_decode", "fia_decode"};
-  const char* rate_labels[] = {"kv4fp8", "tq4", "fp16", "fia"};
-  for (const TrafficModel& model : models) {
-    for (size_t leg = 0; leg < sizeof(rate_legs) / sizeof(rate_legs[0]); ++leg) {
-      const LegSample sample = SampleFor(runner, rate_legs[leg], model.context_len);
-      if (!sample.present) {
-        continue;
-      }
-      std::printf("  %6lld  %-8s %11.0f %10.1f %10.3f\n", static_cast<long long>(model.context_len),
-                  rate_labels[leg], 1.0e6 / sample.median_us, sample.gigabytes_per_second, sample.tflops);
-    }
-  }
-
-  std::printf("\n[ascend-bench]   steps/s is one sequence's decode step, not a batch -- every row is B=1; the\n"
-              "[ascend-bench]   batch axis is validated by test_device_950pr_turboquant_multimode and not timed\n"
-              "[ascend-bench]   here. A GB/s column is that leg's traffic-model decode-read bytes over its own\n"
-              "[ascend-bench]   measured time, so it is what the kernel asked the memory system for and not a\n"
-              "[ascend-bench]   fill-rate ceiling.\n");
-  std::printf("[ascend-bench]   vs fp16 is against the physical fp16 Cube decode in this binary -- the same\n"
-              "[ascend-bench]   kernel with the codec removed -- so it isolates the codec. vs tq4 is the Cube\n"
-              "[ascend-bench]   against the vector cores at 4 bits, and since kv4fp8 became affine INT4 while\n"
-              "[ascend-bench]   tq4 stayed Lloyd-Max that ratio now moves two things at once; see the header.\n"
-              "[ascend-bench]   vs fia is against the stock CANN operator, which is what a caller has today.\n");
-  if (cube_enabled) {
-    // Repeated here rather than only in the banner, because the summary is the
-    // part that gets pasted into a report and the banner is not.
-    std::printf("[ascend-bench]   the kv4 decode is verified correct at S=64 on the camodel; these are the\n"
-                "[ascend-bench]   first timings ever taken of it, and at S in {512,1024,2048} its fidelity has\n"
-                "[ascend-bench]   not been measured anywhere. The fp16 column is a comparator with no fidelity\n"
-                "[ascend-bench]   check of its own. See TURBOQUANT_TESTS.md sections 13.8 and 13.9.\n");
-  } else {
-    // A row of dashes in a table invites the reading that the hardware tried
-    // and could not.
-    std::printf("[ascend-bench]   the kv4, fp16 and fia columns are empty because the Cube legs were dropped\n"
-                "[ascend-bench]   (VLLM_ASCEND_TQ_CUBE_WIP=0), not because they ran and produced nothing. This\n"
-                "[ascend-bench]   is a 4-bit AIV run, and the only comparison in it is the traffic model.\n");
-  }
-  std::fflush(stdout);
-
-  const char* csv_path = std::getenv("ASCEND_BENCH_TQ_COMPARE_CSV");
-  if (csv_path != nullptr && *csv_path != 0) {
-    WriteComparisonCsv(runner, models, csv_path, fia_operator);
-  }
-}
-
-// =============================================================================
-// THE PREFILL SUITE
-// =============================================================================
-//
-// What a prefill step costs over a TurboQuant KV cache, against the stock CANN
-// operator over an unquantised one, across a dense sweep of shapes. It runs in
-// its own BenchmarkRunner on the decode suite's stream: the shapes are orders of
-// magnitude heavier than a decode step, so it has its own iteration budget,
-// its own result table and its own CSVs. Failures are mirrored into the decode
-// runner, so the process exit code still reflects them.
-//
-// A prefill over a TurboQuant cache is PrefillNoCache in
-// vllm_ascend/attention/turboquant_v1.py: the cache write, then full-precision
-// attention over the batch's own K/V -- nothing is read back from the 4-bit
-// cache. So the quantised pipeline is the stock attention plus a different
-// write, and for a layer whose o_proj is Pi-folded, plus a rotation of V:
-//
-//   pf_tq4_write            turboquant_reshape_and_cache over B*S tokens.
-//   pf_rotate_v             npu_turboquant_rotate_q on V, [B*S, H_KV, D] -> fp32.
-//   pf_fp16_write           aclnnScatterPaKvCache into an fp16 paged cache, the
-//                           baseline's own write.
-//   pf_fia_v5               aclnnFusedInferAttentionScoreV5 (V2 as a fallback),
-//                           TND, sparse_mode 3 with the 2048x2048 causal mask --
-//                           the argument list the plugin's prefill passes. fp16.
-//   pf_fp16_pipeline        pf_fp16_write + pf_fia_v5.
-//   pf_tq4_pipeline         pf_tq4_write + pf_fia_v5: a layer with an unfolded
-//                           o_proj, whose prefill is unchanged.
-//   pf_tq4_folded_pipeline  pf_tq4_write + pf_rotate_v + FIA V5 over V~ = Pi V:
-//                           a folded layer, whose prefill has to hand o_proj the
-//                           rotated basis the decode does.
-//
-// NOT TIMED, and said so rather than hidden: the folded pipeline's fp32 -> fp16
-// cast of V~. The backend does it with a torch cast; this suite has no
-// header-verified aclnnCast prototype, so V~ is also prepared on the host in
-// fp16 and FIA reads that copy. The cast is one elementwise pass over
-// B*S*H_KV*D values and is not in any number below.
-//
-// npu_fusion_attention (aclnnFlashAttentionScore) is NOT a leg. Its argument
-// list could not be read out of a CANN header in this environment -- the 9.1.0
-// toolkit image carries no aclnnop operator headers -- and a guessed prototype
-// behind dlsym is undefined behaviour at launch, not a planning refusal. The
-// FIA V5 prototype this suite uses was transcribed from
-// aclnn_fused_infer_attention_score_v5.h; see common/aclnn_ops_950pr.hpp.
-//
-// THE SWEEP. The cartesian product of
-//
-//   S in {512, 1024, 2048, 4096, 8192}    ASCEND_BENCH_TQ_PREFILL_S
-//   B in {1, 2, 4}                        ASCEND_BENCH_TQ_PREFILL_B
-//   D in {128, 256}                       ASCEND_BENCH_TQ_PREFILL_D
-//   H_Q in {32, 64, 128}                  ASCEND_BENCH_TQ_PREFILL_HQ
-//   H_KV in {1, 2, 8}                     ASCEND_BENCH_TQ_PREFILL_HKV
-//
-// 270 shapes by default, each list overridable as a comma list. H_KV = 1 is the
-// MQA form DeepSeek MLA's single latent cache takes when it is served through
-// this operator -- a shape proxy, not the MLA kernel, which splits the rotary
-// half of Q/K into query_rope/key_rope. H_KV in {2, 8} are the GQA shapes.
-//
-// A shape whose estimated footprint exceeds 85% of free HBM is skipped with the
-// two numbers in the reason; the estimate does not know FIA's workspace, and
-// allows one more attention output for it.
-//
-// BUDGET. ASCEND_BENCH_TQ_PREFILL_WARMUP (3), _ITERS (10) and _BATCH (1), NOT the
-// shared ASCEND_BENCH_WARMUP / _ITERS / _BATCH: the largest shape attends over
-// 32,768 tokens and the decode suite's 20 + 3 * 100 launches would take hours on
-// it alone. Every timing mode ASCEND_BENCH_MODES selects still runs.
-//
-//   ASCEND_BENCH_TQ_PREFILL=0                 drops the suite.
-//   ASCEND_BENCH_TQ_PREFILL_LEGS=a,b          runs only the named legs.
-//   ASCEND_BENCH_TQ_PREFILL_CSV=<path>        the raw (case, mode) table.
-//   ASCEND_BENCH_TQ_PREFILL_COMPARE_CSV=<p>   one row per shape, every leg.
-//
-// REPORTED per shape: device time from ACL events (the device-events mode's
-// median, pipelined when that mode is not selected), GB/s over each leg's own
-// traffic model, TFLOP/s for the attention legs, and the KV-cache footprint of
-// TurboQuant 4-bit and of an 8-bit layout against fp16. The 8-bit figure is
-// LAYOUT ARITHMETIC ONLY: one byte per coordinate plus the same scale plane.
-// There is no 8-bit TurboQuant kernel -- TurboQuantCodec is instantiated for
-// b = 4 alone -- so there is no 8-bit leg to time.
-//
-// One correctness check runs once, on the smallest shape, before any timing:
-// FIA over V~, un-rotated on the host, must match FIA over V (cos > 0.9999).
-// That is the device-level statement that the folded prefill hands o_proj the
-// basis the fold expects.
-
-namespace prefill {
-
-// Every paged cache here is block_size 128, as the plugin's PrefillNoCache
-// branch names it.
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+// Every paged cache here is block_size 128, as the plugin's own cache manager
+// names it.
 constexpr int64_t kBlockSize = s950::kDefaultBlockSize;
-// FIA's compressed causal mask for sparse_mode 3 is always 2048 x 2048, whatever
+
+// FIA's compressed causal mask for sparse_mode 3 is always 2048 x 2048 whatever
 // the sequence length; AttentionMaskBuilder.get_splitfuse_attn_mask builds the
 // same int8 triu(ones, diagonal=1).
 constexpr int64_t kCausalMaskSide = 2048;
 constexpr int64_t kFiaSparseModeRightDownCausal = 3;
-// FIA reads no paging in prefill, so its block size argument is torch_npu's 0.
+// FIA reads no paging in the prompt role, so its block-size argument is 0.
 constexpr int64_t kFiaNoPaging = 0;
-// Tokens of distinct random data a scenario draws; longer contexts tile it.
-// Attention latency does not depend on the values, and generating 1e9 fp16
-// elements on the host for the largest query would cost minutes per shape.
+
+// Tokens of distinct random data a scenario draws; longer contexts tile it. The
+// pattern is a whole number of tokens, so a tile boundary never falls inside a
+// D-wide vector and the host-rotated copies stay exactly Pi applied to the
+// unrotated ones, tile for tile. Attention latency does not depend on the
+// values, and generating 5e8 fp16 elements on the host for a 1M context would
+// cost minutes per configuration and risk a host OOM.
 constexpr int64_t kPatternTokens = 1024;
-// Share of free HBM a shape may plan to occupy before it is skipped.
+
+// Query tokens one chunked-prefill step submits. vLLM's scheduler default
+// scale; see THE WORKLOAD above for why prefill is chunked at all.
+constexpr int64_t kPrefillChunkTokens = 2048;
+
+// Share of free HBM a configuration may plan to occupy before it is skipped.
 constexpr double kHbmBudget = 0.85;
-// Elements a checksum reads back: enough to catch a nondeterministic launch
-// without copying gigabytes to the host twice per case.
+
+// Elements a checksum reads back. Enough to catch a launch that has stopped
+// writing without copying gigabytes to the host twice per case.
 constexpr size_t kChecksumElements = 1u << 20;
-constexpr double kFoldIdentityMinCosine = 0.9999;
-constexpr int kDefaultWarmup = 3;
-constexpr int kDefaultIterations = 10;
-constexpr int kDefaultPipelineBatch = 1;
 
-constexpr const char* kLegTq4Write = "pf_tq4_write";
-constexpr const char* kLegRotateValue = "pf_rotate_v";
-constexpr const char* kLegFp16Write = "pf_fp16_write";
-constexpr const char* kLegFia = "pf_fia_v5";
-constexpr const char* kLegFp16Pipeline = "pf_fp16_pipeline";
-constexpr const char* kLegTq4Pipeline = "pf_tq4_pipeline";
-constexpr const char* kLegTq4FoldedPipeline = "pf_tq4_folded_pipeline";
-const char* const kAllLegs[] = {kLegTq4Write,     kLegRotateValue, kLegFp16Write,        kLegFia,
-                                kLegFp16Pipeline, kLegTq4Pipeline, kLegTq4FoldedPipeline};
+// Context elements (B * S * H_KV * D) below which the fp16 paged cache is built
+// slot-exact on the host, which is what the decode tie-point needs. Above it the
+// cache is filled by tiling, because the host image would be gigabytes.
+constexpr size_t kExactContextElements = 1u << 22;
 
-struct Shape {
-  int64_t batch = 0;
-  int64_t seq_len = 0;
-  int64_t head_size = 0;
-  int64_t num_heads = 0;
-  int64_t num_kv_heads = 0;
+constexpr double kRotatedBasisMinCosine = 0.999;
+constexpr double kDecodeTiePointMinCosine = 0.90;
 
-  int64_t tokens() const { return batch * seq_len; }
-  int64_t blocks_per_seq() const { return tqh::CeilDiv(seq_len, kBlockSize); }
-  int64_t num_blocks() const { return batch * blocks_per_seq(); }
-};
+constexpr double kHalfBytes = 2.0;
+constexpr double kFloatBytes = 4.0;
+constexpr double kMiB = 1024.0 * 1024.0;
 
-const char* Family(const Shape& shape) {
-  if (shape.num_kv_heads == 1) {
-    return "mqa/mla";
-  }
-  return shape.num_kv_heads == shape.num_heads ? "mha" : "gqa";
-}
+// The two iteration budgets, per the context regime.
+constexpr int kShortWarmup = 5;
+constexpr int kShortIterations = 20;
+constexpr int kUltraWarmup = 1;
+constexpr int kUltraIterations = 3;
+// One launch per event pair. These shapes are orders of magnitude heavier than
+// the microbenchmarks the shared default of 10 was chosen for.
+constexpr int kPipelineBatch = 1;
 
-std::string CaseName(const char* leg, const Shape& shape) {
-  std::ostringstream name;
-  name << leg << "_b" << shape.batch << "_s" << shape.seq_len << "_d" << shape.head_size << "_hq" << shape.num_heads
-       << "_kv" << shape.num_kv_heads;
-  return name.str();
-}
+// Contexts at or above this take the ultra budget.
+constexpr int64_t kUltraContextThreshold = 262144;
+// Below this the block pool is over-allocated so the block table is a genuine
+// scatter rather than a run of consecutive blocks; above it nothing is resident
+// anyway and a 4x pool is gigabytes of idle HBM.
+constexpr int64_t kOversizedPoolContextLimit = 8192;
+constexpr int64_t kPoolOversizeFactor = 4;
 
-std::vector<int64_t> EnvList(const char* name, const std::vector<int64_t>& defaults) {
-  const char* raw = std::getenv(name);
+// ---------------------------------------------------------------------------
+// Environment
+// ---------------------------------------------------------------------------
+
+std::vector<std::string> SplitCsv(const char* raw) {
+  std::vector<std::string> fields;
   if (raw == nullptr || *raw == '\0') {
-    return defaults;
+    return fields;
   }
-  std::vector<int64_t> values;
   std::istringstream stream(raw);
   std::string field;
   while (std::getline(stream, field, ',')) {
-    const long long parsed = std::strtoll(field.c_str(), nullptr, 10);
-    if (parsed > 0) {
-      values.push_back(static_cast<int64_t>(parsed));
+    if (!field.empty()) {
+      fields.push_back(field);
     }
   }
-  if (values.empty()) {
-    std::printf("[ascend-bench] %s='%s' parsed to nothing; using the default list\n", name, raw);
-    return defaults;
-  }
-  return values;
+  return fields;
 }
 
 int EnvInt(const char* name, int fallback, int minimum) {
@@ -1314,165 +379,423 @@ int EnvInt(const char* name, int fallback, int minimum) {
   return parsed < minimum ? minimum : static_cast<int>(parsed);
 }
 
-bool Enabled() {
-  const char* raw = std::getenv("ASCEND_BENCH_TQ_PREFILL");
-  return raw == nullptr || *raw == '\0' || std::string(raw) != "0";
+int64_t EnvInt64(const char* name, int64_t fallback, int64_t minimum) {
+  const char* raw = std::getenv(name);
+  if (raw == nullptr || *raw == '\0') {
+    return fallback;
+  }
+  const long long parsed = std::strtoll(raw, nullptr, 10);
+  return parsed < minimum ? minimum : static_cast<int64_t>(parsed);
 }
 
-bool LegEnabled(const char* leg) {
-  const char* raw = std::getenv("ASCEND_BENCH_TQ_PREFILL_LEGS");
+// True unless the variable is set to exactly "0". An unset variable means the
+// default, which for every switch here is "on".
+bool EnvOn(const char* name) {
+  const char* raw = std::getenv(name);
+  return raw == nullptr || *raw == '\0' || std::strcmp(raw, "0") != 0;
+}
+
+// True when `value` is in the comma list `name` names, or when the variable is
+// unset -- an unset filter selects everything.
+bool EnvSelects(const char* name, const std::string& value) {
+  const char* raw = std::getenv(name);
   if (raw == nullptr || *raw == '\0') {
     return true;
   }
-  std::istringstream stream(raw);
-  std::string field;
-  while (std::getline(stream, field, ',')) {
-    if (field == leg) {
+  for (const std::string& field : SplitCsv(raw)) {
+    if (field == value) {
       return true;
     }
   }
   return false;
 }
 
-BenchmarkOptions Options(const BenchmarkOptions& base) {
-  BenchmarkOptions options = base;
-  options.warmup_iterations = EnvInt("ASCEND_BENCH_TQ_PREFILL_WARMUP", kDefaultWarmup, 0);
-  options.timed_iterations = EnvInt("ASCEND_BENCH_TQ_PREFILL_ITERS", kDefaultIterations, 1);
-  options.pipeline_batch = EnvInt("ASCEND_BENCH_TQ_PREFILL_BATCH", kDefaultPipelineBatch, 1);
-  const char* csv = std::getenv("ASCEND_BENCH_TQ_PREFILL_CSV");
-  options.csv_path = csv == nullptr ? std::string() : std::string(csv);
-  return options;
+bool EnvSelectsInt(const char* name, int64_t value) {
+  std::ostringstream text;
+  text << value;
+  return EnvSelects(name, text.str());
 }
 
-// Ordered by D, H_Q, H_KV, B, S, so consecutive shapes allocate similar sizes and
-// the table reads as nested sweeps. Shapes the kernels reject are dropped here,
-// with a line saying so, rather than failing one by one.
-std::vector<Shape> Sweep() {
-  const std::vector<int64_t> seq_lens = EnvList("ASCEND_BENCH_TQ_PREFILL_S", {512, 1024, 2048, 4096, 8192});
-  const std::vector<int64_t> batches = EnvList("ASCEND_BENCH_TQ_PREFILL_B", {1, 2, 4});
-  const std::vector<int64_t> head_sizes = EnvList("ASCEND_BENCH_TQ_PREFILL_D", {128, 256});
-  const std::vector<int64_t> query_heads = EnvList("ASCEND_BENCH_TQ_PREFILL_HQ", {32, 64, 128});
-  const std::vector<int64_t> kv_heads = EnvList("ASCEND_BENCH_TQ_PREFILL_HKV", {1, 2, 8});
+std::string EnvString(const char* name) {
+  const char* raw = std::getenv(name);
+  return raw == nullptr ? std::string() : std::string(raw);
+}
 
-  constexpr int64_t kMinHeadSize = 64;
-  constexpr int64_t kMaxHeadSize = 256;
-  std::vector<Shape> shapes;
-  for (const int64_t d : head_sizes) {
-    if (d < kMinHeadSize || d > kMaxHeadSize || (d & (d - 1)) != 0) {
-      std::printf("[ascend-bench] prefill: dropping D=%lld; the TurboQuant kernels take a power of two in [64, 256]\n",
-                  static_cast<long long>(d));
+// ---------------------------------------------------------------------------
+// The workload
+// ---------------------------------------------------------------------------
+
+struct ModelSpec {
+  const char* key;     // selector for ASCEND_BENCH_TQ_AUDIT_MODELS and case names
+  const char* label;   // the table column
+  int64_t head_size;
+  int64_t num_heads;     // H_Q on one NPU at TP=8
+  int64_t num_kv_heads;  // H_KV on one NPU at TP=8
+  // False when the output projection cannot absorb Pi, so the de-rotation is a
+  // kernel on the critical path rather than an offline weight transform.
+  bool folds_output;
+  const char* note;
+};
+
+// GLM-5.2 is specified at D = 128 or 256; 128 is the default and the variable
+// switches it, because the two differ in how much of the Cube's C0 a vector
+// fills and a reader may want both.
+int64_t GlmHeadSize() {
+  const int64_t d = EnvInt64("ASCEND_BENCH_TQ_AUDIT_GLM_D", 128, 64);
+  if (d != 128 && d != 256) {
+    std::printf("[ascend-bench] ASCEND_BENCH_TQ_AUDIT_GLM_D=%lld is neither 128 nor 256; using 128\n",
+                static_cast<long long>(d));
+    return 128;
+  }
+  return d;
+}
+
+std::vector<ModelSpec> Models() {
+  return {
+      ModelSpec{"qwen35", "Qwen3.5-9B", 128, 4, 1, /*folds_output=*/false,
+                "attn_output_gate: sigmoid(gate) * context sits between attention and o_proj, "
+                "so W_o cannot absorb Pi and the O de-rotation is measured"},
+      ModelSpec{"dsv4", "DeepSeek-V4-Flash", 256, 16, 1, /*folds_output=*/true,
+                "MLA, decoupled latent KV; the 16:1 group exactly fills the Cube's M=16 fractal; "
+                "W_o folded offline"},
+      ModelSpec{"glm52", "GLM-5.2-744B", GlmHeadSize(), 8, 1, /*folds_output=*/true,
+                "ultra-wide GQA; W_o folded offline"},
+  };
+}
+
+struct Regime {
+  int64_t seq_len;
+  std::vector<int64_t> batches;
+  const char* label;
+};
+
+std::vector<Regime> Regimes() {
+  return {
+      Regime{2048, {1, 4, 8}, "short/interactive"},
+      Regime{32768, {1, 4, 8}, "enterprise-long"},
+      Regime{262144, {1, 2}, "ultra-long"},
+      Regime{1048576, {1}, "extreme-needle/1M"},
+  };
+}
+
+// How TurboQuant's decode splits the work at this shape.
+enum class PathMode { kCube, kAiv };
+
+const char* PathLabel(PathMode path) { return path == PathMode::kCube ? "Cube" : "AIV"; }
+
+// The GQA group the Cube's M dimension has to be filled from; see THE DECODE
+// PATH IS CHOSEN BY THE GQA GROUP above.
+PathMode SelectPath(const ModelSpec& model) {
+  const std::string forced = EnvString("ASCEND_BENCH_TQ_AUDIT_PATH");
+  if (forced == "cube") {
+    return PathMode::kCube;
+  }
+  if (forced == "aiv") {
+    return PathMode::kAiv;
+  }
+  const int64_t group = model.num_heads / model.num_kv_heads;
+  return group >= tqh::kCubeTileM ? PathMode::kCube : PathMode::kAiv;
+}
+
+int64_t PrefillChunk(int64_t seq_len) {
+  const int64_t chunk = EnvInt64("ASCEND_BENCH_TQ_AUDIT_CHUNK", kPrefillChunkTokens, 1);
+  return std::min(seq_len, chunk);
+}
+
+struct Budget {
+  int warmup = 0;
+  int iterations = 0;
+
+  bool operator==(const Budget& other) const {
+    return warmup == other.warmup && iterations == other.iterations;
+  }
+};
+
+Budget BudgetFor(int64_t seq_len) {
+  if (seq_len >= kUltraContextThreshold) {
+    return Budget{EnvInt("ASCEND_BENCH_TQ_AUDIT_ULTRA_WARMUP", kUltraWarmup, 0),
+                  EnvInt("ASCEND_BENCH_TQ_AUDIT_ULTRA_ITERS", kUltraIterations, 1)};
+  }
+  return Budget{EnvInt("ASCEND_BENCH_TQ_AUDIT_WARMUP", kShortWarmup, 0),
+                EnvInt("ASCEND_BENCH_TQ_AUDIT_ITERS", kShortIterations, 1)};
+}
+
+struct Config {
+  ModelSpec model;
+  int64_t seq_len = 0;
+  int64_t batch = 0;
+  int64_t chunk = 0;
+  PathMode path = PathMode::kAiv;
+  Budget budget;
+  const char* regime = "";
+
+  // Query tokens one prefill step submits, across the batch.
+  int64_t chunk_tokens() const { return batch * chunk; }
+  // Tokens of context the whole batch holds.
+  int64_t context_tokens() const { return batch * seq_len; }
+  int64_t blocks_per_seq() const { return tqh::CeilDiv(seq_len, kBlockSize); }
+  int64_t pool_blocks() const {
+    const int64_t needed = blocks_per_seq() * batch;
+    return seq_len <= kOversizedPoolContextLimit ? needed * kPoolOversizeFactor : needed;
+  }
+  float attention_scale() const { return 1.0f / std::sqrt(static_cast<float>(model.head_size)); }
+
+  std::string id() const {
+    std::ostringstream name;
+    name << model.key << "_s" << seq_len << "_b" << batch;
+    return name.str();
+  }
+  // "2048" when the chunk is the whole prefill, "262144/2048" when it is not.
+  std::string context_label() const {
+    std::ostringstream text;
+    text << seq_len;
+    if (chunk < seq_len) {
+      text << '/' << chunk;
+    }
+    return text.str();
+  }
+};
+
+std::vector<Config> BuildSweep() {
+  std::vector<Config> sweep;
+  for (const ModelSpec& model : Models()) {
+    if (!EnvSelects("ASCEND_BENCH_TQ_AUDIT_MODELS", model.key)) {
       continue;
     }
-    for (const int64_t hq : query_heads) {
-      for (const int64_t hkv : kv_heads) {
-        if (hkv > hq || hq % hkv != 0) {
-          std::printf("[ascend-bench] prefill: dropping H_Q=%lld H_KV=%lld; H_Q must be a multiple of H_KV\n",
-                      static_cast<long long>(hq), static_cast<long long>(hkv));
+    for (const Regime& regime : Regimes()) {
+      if (!EnvSelectsInt("ASCEND_BENCH_TQ_AUDIT_S", regime.seq_len)) {
+        continue;
+      }
+      for (const int64_t batch : regime.batches) {
+        if (!EnvSelectsInt("ASCEND_BENCH_TQ_AUDIT_B", batch)) {
           continue;
         }
-        for (const int64_t b : batches) {
-          for (const int64_t s : seq_lens) {
-            Shape shape;
-            shape.batch = b;
-            shape.seq_len = s;
-            shape.head_size = d;
-            shape.num_heads = hq;
-            shape.num_kv_heads = hkv;
-            shapes.push_back(shape);
-          }
-        }
+        Config config;
+        config.model = model;
+        config.seq_len = regime.seq_len;
+        config.batch = batch;
+        config.chunk = PrefillChunk(regime.seq_len);
+        config.path = SelectPath(model);
+        config.budget = BudgetFor(regime.seq_len);
+        config.regime = regime.label;
+        sweep.push_back(config);
       }
     }
   }
-  return shapes;
+  return sweep;
 }
 
-// --- traffic -----------------------------------------------------------------
-//
-// Bytes each leg is handed in and writes out, under the decode suite's
-// convention: what the kernel asks the memory system for, not an internal
-// working set nobody can see. FIA's own workspace is therefore not in it.
-struct Traffic {
-  double fp16_kv = 0.0;
-  double tq4_kv = 0.0;
-  double kv8_kv = 0.0;
-  double tq4_write = 0.0;
-  double rotate_value = 0.0;
-  double fp16_write = 0.0;
-  double fia = 0.0;
-  double fp16_pipeline = 0.0;
-  double tq4_pipeline = 0.0;
-  double tq4_folded_pipeline = 0.0;
-  // Causal attention, QK^T and the value accumulation at two operations per
-  // element each: 4 * B * H_Q * D * S (S + 1) / 2. The decode suite's
-  // AttentionFlops is the same count at one query token.
-  double attention_flops = 0.0;
+// ---------------------------------------------------------------------------
+// Legs
+// ---------------------------------------------------------------------------
 
-  double tq4_ratio() const { return tq4_kv > 0.0 ? fp16_kv / tq4_kv : 0.0; }
-  double kv8_ratio() const { return kv8_kv > 0.0 ? fp16_kv / kv8_kv : 0.0; }
+constexpr const char* kLegPfIngest = "pf_ingest";
+constexpr const char* kLegPfRotQ = "pf_rot_q";
+constexpr const char* kLegPfAttnCore = "pf_attn_core";
+constexpr const char* kLegPfRotO = "pf_rot_o";
+constexpr const char* kLegPfE2E = "pf_e2e";
+constexpr const char* kLegPfV5 = "pf_v5";
+constexpr const char* kLegPfV5Ingest = "pf_v5_ingest";
+
+constexpr const char* kLegDecRotQ = "dec_rot_q";
+constexpr const char* kLegDecSplit = "dec_split";
+constexpr const char* kLegDecCombine = "dec_combine";
+constexpr const char* kLegDecAttnCore = "dec_attn_core";
+constexpr const char* kLegDecRotO = "dec_rot_o";
+constexpr const char* kLegDecE2E = "dec_e2e";
+constexpr const char* kLegDecV5 = "dec_v5";
+
+const char* const kPrefillLegs[] = {kLegPfIngest, kLegPfRotQ, kLegPfAttnCore, kLegPfRotO,
+                                    kLegPfE2E,    kLegPfV5,   kLegPfV5Ingest};
+const char* const kDecodeLegs[] = {kLegDecRotQ, kLegDecSplit,  kLegDecCombine, kLegDecAttnCore,
+                                   kLegDecRotO, kLegDecE2E,    kLegDecV5};
+
+std::string CaseName(const char* leg, const Config& config) {
+  return std::string(leg) + "_" + config.id();
+}
+
+bool LegEnabled(const char* leg) { return EnvSelects("ASCEND_BENCH_TQ_AUDIT_LEGS", leg); }
+bool PhaseEnabled(const char* phase) { return EnvSelects("ASCEND_BENCH_TQ_AUDIT_PHASES", phase); }
+bool NativeEnabled() { return EnvOn("ASCEND_BENCH_TQ_FIA"); }
+
+// ---------------------------------------------------------------------------
+// Traffic
+// ---------------------------------------------------------------------------
+//
+// Compulsory bytes: each distinct byte the step moves across HBM, once, under
+// one convention for every leg. See TRAFFIC above.
+struct Traffic {
+  // Residency, for the whole batch's context.
+  double fp16_kv_bytes = 0.0;
+  double tq_kv_bytes = 0.0;
+
+  // Prefill, per step.
+  double pf_ingest = 0.0;
+  double pf_rot_q = 0.0;
+  double pf_attn_core = 0.0;
+  double pf_rot_o = 0.0;
+  double pf_e2e = 0.0;
+  double pf_v5 = 0.0;
+  double pf_v5_ingest = 0.0;
+  double pf_flops = 0.0;
+  // The fp32 -> fp16 narrowing this suite does not time; see WHAT IS STILL NOT
+  // PRICED. Reported so a reader can bound it, never added to a leg.
+  double pf_untimed_cast = 0.0;
+
+  // Decode, per step.
+  double dec_rot_q = 0.0;
+  double dec_split = 0.0;
+  double dec_combine = 0.0;
+  double dec_attn_core = 0.0;
+  double dec_rot_o = 0.0;
+  double dec_e2e = 0.0;
+  double dec_v5 = 0.0;
+  double dec_flops = 0.0;
+  // Flash-decoding splits the grid planned for this shape, which is what the
+  // partial term above was computed from. Carried so the CSV can state it
+  // rather than leaving a reader to re-derive the planner's arithmetic.
+  int64_t dec_split_count = 1;
+
+  double compression_ratio() const { return tq_kv_bytes > 0.0 ? fp16_kv_bytes / tq_kv_bytes : 0.0; }
+  double saved_mib() const { return (fp16_kv_bytes - tq_kv_bytes) / kMiB; }
 };
 
-Traffic ModelTraffic(const Shape& shape) {
-  const double t = static_cast<double>(shape.tokens());
-  const double s = static_cast<double>(shape.seq_len);
-  const double d = static_cast<double>(shape.head_size);
-  const double hq = static_cast<double>(shape.num_heads);
-  const double kv = static_cast<double>(shape.num_kv_heads);
-  const double scale_plane = t * static_cast<double>(tqh::ScaleSlotFloats(shape.num_kv_heads)) * kFloatBytes;
+Traffic ModelTraffic(const Config& config, int64_t num_splits) {
+  const double d = static_cast<double>(config.model.head_size);
+  const double hq = static_cast<double>(config.model.num_heads);
+  const double hkv = static_cast<double>(config.model.num_kv_heads);
+  const double packed_slot = d / static_cast<double>(tqh::kPackFactor);
+  const double scale_slot = static_cast<double>(tqh::ScaleSlotFloats(config.model.num_kv_heads)) * kFloatBytes;
+  const double context = static_cast<double>(config.context_tokens());
+  const double chunk = static_cast<double>(config.chunk_tokens());
+  const double batch = static_cast<double>(config.batch);
+  const double splits = static_cast<double>(num_splits);
 
   Traffic traffic;
-  traffic.fp16_kv = 2.0 * t * kv * d * kHalfBytes;
-  traffic.tq4_kv = 2.0 * t * kv * (d / static_cast<double>(tqh::kPackFactor)) + scale_plane;
-  traffic.kv8_kv = 2.0 * t * kv * d + scale_plane;
+  traffic.fp16_kv_bytes = 2.0 * context * hkv * d * kHalfBytes;
+  traffic.tq_kv_bytes = 2.0 * context * hkv * packed_slot + context * scale_slot;
 
-  const double slots = t * kFloatBytes;
-  const double query = t * hq * d * kHalfBytes;
-  const double output = query;
+  // --- prefill -------------------------------------------------------------
+  const double chunk_kv_fp16 = 2.0 * chunk * hkv * d * kHalfBytes;
+  const double chunk_kv_tq = 2.0 * chunk * hkv * packed_slot + chunk * scale_slot;
+  const double chunk_query = chunk * hq * d * kHalfBytes;
   const double mask = static_cast<double>(kCausalMaskSide * kCausalMaskSide);
-  traffic.tq4_write = traffic.fp16_kv + traffic.tq4_kv + slots;
-  traffic.rotate_value = t * kv * d * (kHalfBytes + kFloatBytes);
-  traffic.fp16_write = 2.0 * traffic.fp16_kv + slots;
-  traffic.fia = query + traffic.fp16_kv + output + mask;
-  traffic.fp16_pipeline = traffic.fp16_write + traffic.fia;
-  traffic.tq4_pipeline = traffic.tq4_write + traffic.fia;
-  traffic.tq4_folded_pipeline = traffic.tq4_write + traffic.rotate_value + traffic.fia;
-  traffic.attention_flops = 4.0 * static_cast<double>(shape.batch) * hq * d * s * (s + 1.0) / 2.0;
+
+  traffic.pf_ingest = chunk_kv_fp16 + chunk_kv_tq + chunk * kFloatBytes;
+  traffic.pf_rot_q = chunk * hq * d * (kHalfBytes + kFloatBytes);
+  // Q in, the whole prefix's K and V, O out, and the compressed mask.
+  traffic.pf_attn_core = chunk_query + traffic.fp16_kv_bytes + chunk_query + mask;
+  traffic.pf_rot_o = chunk * hq * d * (kHalfBytes + kFloatBytes);
+  traffic.pf_e2e = traffic.pf_rot_q + traffic.pf_attn_core +
+                   (config.model.folds_output ? 0.0 : traffic.pf_rot_o);
+  traffic.pf_v5 = traffic.pf_attn_core;
+  // The native write: read the chunk's fp16 K/V, write them into the paged
+  // cache, read the slot map.
+  traffic.pf_v5_ingest = 2.0 * chunk_kv_fp16 + chunk * kFloatBytes;
+  // Causal over a chunk at the tail of an S-token prefix: query i of the chunk
+  // attends to S - C + i + 1 keys, so the count is C * (S - C/2 + 1/2) per
+  // sequence per head. Two operations per element for QK^T and two for the value
+  // accumulation.
+  {
+    const double s = static_cast<double>(config.seq_len);
+    const double c = static_cast<double>(config.chunk);
+    traffic.pf_flops = 4.0 * batch * hq * d * c * (s - 0.5 * c + 0.5);
+  }
+  // One elementwise narrowing of the rotated query and the rotated value.
+  traffic.pf_untimed_cast = chunk * hq * d * (kFloatBytes + kHalfBytes) +
+                            context * hkv * d * (kFloatBytes + kHalfBytes);
+
+  // --- decode --------------------------------------------------------------
+  const double step_query_fp16 = batch * hq * d * kHalfBytes;
+  const double step_query_fp32 = batch * hq * d * kFloatBytes;
+  const double step_out_fp16 = step_query_fp16;
+  // Flash-decoding partials: the split writes one per (token, head, split) and
+  // the combine reads it back, so each crosses HBM twice.
+  const double partials = batch * hq * splits * static_cast<double>(config.model.head_size + tqh::kPartialTail) *
+                          kFloatBytes;
+
+  traffic.dec_rot_q = step_query_fp16 + step_query_fp32;
+  traffic.dec_split = step_query_fp32 + traffic.tq_kv_bytes + partials;
+  traffic.dec_combine = partials + step_out_fp16;
+  traffic.dec_attn_core = traffic.dec_split + traffic.dec_combine;
+  traffic.dec_rot_o = step_out_fp16 + batch * hq * d * kFloatBytes;
+  traffic.dec_e2e = traffic.dec_rot_q + traffic.dec_attn_core +
+                    (config.model.folds_output ? 0.0 : traffic.dec_rot_o);
+  traffic.dec_v5 = step_query_fp16 + traffic.fp16_kv_bytes + step_out_fp16;
+  traffic.dec_flops = 4.0 * batch * hq * d * static_cast<double>(config.seq_len);
+  traffic.dec_split_count = num_splits;
+
   return traffic;
 }
 
-// HBM a scenario allocates, bar FIA's workspace, which is allowed one more
-// attention output.
-double ScenarioBytes(const Shape& shape) {
-  const double t = static_cast<double>(shape.tokens());
-  const double d = static_cast<double>(shape.head_size);
-  const double hq = static_cast<double>(shape.num_heads);
-  const double kv = static_cast<double>(shape.num_kv_heads);
-  const double pool_rows = static_cast<double>(shape.num_blocks() * kBlockSize);
-  const double attention_output = t * hq * d * kHalfBytes;
-  const double activations = attention_output + 3.0 * t * kv * d * kHalfBytes + t * kv * d * kFloatBytes;
-  const double tq4_cache = 2.0 * pool_rows * kv * (d / static_cast<double>(tqh::kPackFactor)) +
-                           pool_rows * static_cast<double>(tqh::ScaleSlotFloats(shape.num_kv_heads)) * kFloatBytes;
-  const double fp16_cache = 2.0 * pool_rows * kv * d * kHalfBytes;
-  return activations + 3.0 * attention_output + tq4_cache + fp16_cache +
-         static_cast<double>(kCausalMaskSide * kCausalMaskSide);
+// HBM a configuration allocates, bar the operators' own workspaces, which are
+// allowed one more attention output each.
+double ScenarioBytes(const Config& config) {
+  const double d = static_cast<double>(config.model.head_size);
+  const double hq = static_cast<double>(config.model.num_heads);
+  const double hkv = static_cast<double>(config.model.num_kv_heads);
+  const double context = static_cast<double>(config.context_tokens());
+  const double chunk = static_cast<double>(config.chunk_tokens());
+  const double pool_rows = static_cast<double>(config.pool_blocks() * kBlockSize);
+  const double scale_slot = static_cast<double>(tqh::ScaleSlotFloats(config.model.num_kv_heads)) * kFloatBytes;
+
+  // K, V, K~ and V~ over the whole prefix.
+  const double contiguous_kv = 4.0 * context * hkv * d * kHalfBytes;
+  // The chunk's own K and V, which the ingest leg writes from.
+  const double chunk_kv = 2.0 * chunk * hkv * d * kHalfBytes;
+  const double tq_cache = 2.0 * pool_rows * hkv * (d / static_cast<double>(tqh::kPackFactor)) +
+                          pool_rows * scale_slot;
+  const double fp16_cache = 2.0 * pool_rows * hkv * d * kHalfBytes;
+  // Q, Q~ (fp16), Q~ (fp32), O_tq, O_v5, O~ (fp32) for the chunk; the same six
+  // for the decode step, which is negligible beside them.
+  const double prefill_activations = chunk * hq * d * (4.0 * kHalfBytes + 2.0 * kFloatBytes);
+  const double decode_activations =
+      static_cast<double>(config.batch) * hq * d * (4.0 * kHalfBytes + 2.0 * kFloatBytes);
+  const double mask = static_cast<double>(kCausalMaskSide * kCausalMaskSide);
+  // Two attention outputs' worth of slack for the operators' workspaces.
+  const double workspace_allowance = 2.0 * chunk * hq * d * kHalfBytes;
+
+  return contiguous_kv + chunk_kv + tq_cache + fp16_cache + prefill_activations + decode_activations + mask +
+         workspace_allowance;
 }
 
-// --- device data -------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Device helpers
+// ---------------------------------------------------------------------------
 
-// Fills `dst` by repeating `pattern` end to end. Whole-pattern copies, so the
-// tiled rows stay aligned to token boundaries when the pattern is whole tokens.
+// Fills `dst` by repeating `pattern` end to end, one whole-pattern copy at a
+// time. Chunked by construction: a 1M-token context is filled from a
+// 1024-token host image and never needs a host buffer of its own size.
 template <typename T>
 void TileToDevice(const DeviceBuffer& dst, const std::vector<T>& pattern) {
   const size_t total = dst.size_bytes();
   const size_t chunk = pattern.size() * sizeof(T);
-  for (size_t offset = 0; offset < total && chunk > 0; offset += chunk) {
+  if (chunk == 0) {
+    return;
+  }
+  for (size_t offset = 0; offset < total; offset += chunk) {
     const size_t bytes = std::min(chunk, total - offset);
     ACL_CHECK(aclrtMemcpy(static_cast<char*>(dst.get()) + offset, dst.capacity_bytes() - offset, pattern.data(),
                           bytes, ACL_MEMCPY_HOST_TO_DEVICE));
   }
 }
 
-// Checksum over at most kChecksumElements leading elements of a buffer.
+// The host image of what TileToDevice would have written: `pattern` repeated to
+// `elements`. Only ever called for a context small enough to hold exactly; see
+// kExactContextElements.
+template <typename T>
+std::vector<T> HostTiled(const std::vector<T>& pattern, size_t elements) {
+  std::vector<T> tiled(elements);
+  if (pattern.empty()) {
+    return tiled;
+  }
+  for (size_t i = 0; i < elements; ++i) {
+    tiled[i] = pattern[i % pattern.size()];
+  }
+  return tiled;
+}
+
+// Checksum source: at most kChecksumElements leading elements of a buffer.
 template <typename T>
 std::vector<T> LeadingElements(const DeviceBuffer& buffer) {
   std::vector<T> host(std::min(buffer.size_bytes() / sizeof(T), kChecksumElements));
@@ -1480,6 +803,15 @@ std::vector<T> LeadingElements(const DeviceBuffer& buffer) {
     buffer.CopyToHost(host.data(), host.size() * sizeof(T));
   }
   return host;
+}
+
+// Pi applied to every head_size-wide row, on the host, in place.
+void RotateRowsInPlace(std::vector<float>& values, int64_t head_size) {
+  const std::vector<int8_t> signs = turboquant_ref::cpu_pi_sign_vector(static_cast<int>(head_size));
+  const size_t row = static_cast<size_t>(head_size);
+  for (size_t base = 0; base + row <= values.size(); base += row) {
+    turboquant_ref::cpu_apply_pi(values.data() + base, static_cast<int>(head_size), signs.data());
+  }
 }
 
 const AclnnOp& FiaV5() {
@@ -1490,77 +822,203 @@ const AclnnOp& FiaV2() {
   static const AclnnOp op(ops950::kFusedInferAttentionScoreV2);
   return op;
 }
-const AclnnOp& ScatterPaKvCache() {
+const AclnnOp& ScatterPaKvCacheOp() {
   static const AclnnOp op(ops::kScatterPaKvCache);
   return op;
 }
 
-/*
- * One prefill shape on the device. Built, timed and destroyed before the next
- * shape is built, so the sweep's peak HBM is its largest shape's and not the
- * sum of all of them.
- *
- * The aclnn descriptors are unique_ptrs created in dependency order, and the
- * planned operators are declared last so they are destroyed first: a
- * PlannedOp holds the descriptor handles it was planned with.
- */
+// ---------------------------------------------------------------------------
+// One configuration on the device
+// ---------------------------------------------------------------------------
+//
+// Built, audited and destroyed before the next one is built, so the sweep's peak
+// HBM is its largest configuration's and not the sum of all of them.
+//
+// The aclnn descriptors are unique_ptrs created in dependency order and the
+// planned operators are declared last, so they are destroyed first: a PlannedOp
+// holds the descriptor handles it was planned with.
 class Scenario {
  public:
-  Scenario(const Shape& shape, int64_t aiv_num) : shape_(shape), aiv_num_(aiv_num) {
-    const int64_t t = shape.tokens();
-    const int64_t d = shape.head_size;
-    const int64_t hq = shape.num_heads;
-    const int64_t hkv = shape.num_kv_heads;
-    const int64_t pattern_tokens = std::min<int64_t>(t, kPatternTokens);
-    const auto elems = [](int64_t a, int64_t b, int64_t c) { return static_cast<size_t>(a * b * c); };
+  Scenario(const Config& config, int64_t aiv_num) : config_(config), aiv_num_(aiv_num) {
+    const int64_t d = config.model.head_size;
+    const int64_t hq = config.model.num_heads;
+    const int64_t hkv = config.model.num_kv_heads;
+    const int64_t context = config.context_tokens();
+    const int64_t chunk = config.chunk_tokens();
+    const int64_t pattern = std::min<int64_t>(context, kPatternTokens);
+    const auto elems = [](int64_t a, int64_t b, int64_t c) {
+      return static_cast<size_t>(a) * static_cast<size_t>(b) * static_cast<size_t>(c);
+    };
 
-    DeterministicRandom rng(0x9F11u + static_cast<uint32_t>(shape.seq_len + 7 * shape.batch + 31 * d +
-                                                              127 * hq + 509 * hkv));
-    const std::vector<float> query = rng.NormalHalfExact(elems(pattern_tokens, hq, d), 0.0f, 1.0f);
-    const std::vector<float> key = rng.NormalHalfExact(elems(pattern_tokens, hkv, d), 0.0f, 1.0f);
-    std::vector<float> value = rng.NormalHalfExact(elems(pattern_tokens, hkv, d), 0.0f, 1.0f);
+    exact_context_ = elems(context, hkv, d) <= kExactContextElements;
 
-    query_ = DeviceBuffer::Empty<Half>(elems(t, hq, d), kBenchmarkAlignBytes);
-    key_ = DeviceBuffer::Empty<Half>(elems(t, hkv, d), kBenchmarkAlignBytes);
-    value_ = DeviceBuffer::Empty<Half>(elems(t, hkv, d), kBenchmarkAlignBytes);
-    value_rot_half_ = DeviceBuffer::Empty<Half>(elems(t, hkv, d), kBenchmarkAlignBytes);
-    TileToDevice(query_, FloatToHalf(query));
-    TileToDevice(key_, FloatToHalf(key));
-    TileToDevice(value_, FloatToHalf(value));
-    // V~ = Pi V, per head, for the folded pipeline's attention; see the note on
-    // the untimed cast at the top of this section.
-    const std::vector<int8_t> signs = turboquant_ref::cpu_pi_sign_vector(static_cast<int>(d));
-    for (size_t base = 0; base + static_cast<size_t>(d) <= value.size(); base += static_cast<size_t>(d)) {
-      turboquant_ref::cpu_apply_pi(value.data() + base, static_cast<int>(d), signs.data());
-    }
-    TileToDevice(value_rot_half_, FloatToHalf(value));
-    value_rot_fp32_ = DeviceBuffer::Empty<float>(elems(t, hkv, d), kBenchmarkAlignBytes);
+    DeterministicRandom rng(0xA53Du + static_cast<uint32_t>(config.seq_len + 7 * config.batch + 31 * d +
+                                                            127 * hq + 509 * hkv));
 
+    // --- the context, tiled --------------------------------------------------
+    //
+    // K and V are one pattern; K~ and V~ are Pi applied to that same pattern and
+    // then tiled the same way, so the four buffers stand in the exact Pi
+    // relationship the rotated-basis identity asserts, at any context length.
+    const std::vector<float> key_pattern = rng.NormalHalfExact(elems(pattern, hkv, d), 0.0f, 1.0f);
+    const std::vector<float> value_pattern = rng.NormalHalfExact(elems(pattern, hkv, d), 0.0f, 1.0f);
+    std::vector<float> key_rot_pattern = key_pattern;
+    std::vector<float> value_rot_pattern = value_pattern;
+    RotateRowsInPlace(key_rot_pattern, d);
+    RotateRowsInPlace(value_rot_pattern, d);
+
+    key_ctx_ = DeviceBuffer::Empty<Half>(elems(context, hkv, d), kBenchmarkAlignBytes);
+    value_ctx_ = DeviceBuffer::Empty<Half>(elems(context, hkv, d), kBenchmarkAlignBytes);
+    key_ctx_rot_ = DeviceBuffer::Empty<Half>(elems(context, hkv, d), kBenchmarkAlignBytes);
+    value_ctx_rot_ = DeviceBuffer::Empty<Half>(elems(context, hkv, d), kBenchmarkAlignBytes);
+    TileToDevice(key_ctx_, FloatToHalf(key_pattern));
+    TileToDevice(value_ctx_, FloatToHalf(value_pattern));
+    TileToDevice(key_ctx_rot_, FloatToHalf(key_rot_pattern));
+    TileToDevice(value_ctx_rot_, FloatToHalf(value_rot_pattern));
+
+    // --- the prefill chunk ---------------------------------------------------
+    const int64_t chunk_pattern = std::min<int64_t>(chunk, kPatternTokens);
+    const std::vector<float> chunk_key = rng.NormalHalfExact(elems(chunk_pattern, hkv, d), 0.0f, 1.0f);
+    const std::vector<float> chunk_value = rng.NormalHalfExact(elems(chunk_pattern, hkv, d), 0.0f, 1.0f);
+    key_chunk_ = DeviceBuffer::Empty<Half>(elems(chunk, hkv, d), kBenchmarkAlignBytes);
+    value_chunk_ = DeviceBuffer::Empty<Half>(elems(chunk, hkv, d), kBenchmarkAlignBytes);
+    TileToDevice(key_chunk_, FloatToHalf(chunk_key));
+    TileToDevice(value_chunk_, FloatToHalf(chunk_value));
+
+    const int64_t query_pattern = std::min<int64_t>(chunk, kPatternTokens);
+    std::vector<float> prefill_query = rng.NormalHalfExact(elems(query_pattern, hq, d), 0.0f, 1.0f);
+    query_pf_ = DeviceBuffer::Empty<Half>(elems(chunk, hq, d), kBenchmarkAlignBytes);
+    TileToDevice(query_pf_, FloatToHalf(prefill_query));
+    std::vector<float> prefill_query_rot = prefill_query;
+    RotateRowsInPlace(prefill_query_rot, d);
+    query_pf_rot_half_ = DeviceBuffer::Empty<Half>(elems(chunk, hq, d), kBenchmarkAlignBytes);
+    TileToDevice(query_pf_rot_half_, FloatToHalf(prefill_query_rot));
+    query_pf_rot_fp32_ = DeviceBuffer::Empty<float>(elems(chunk, hq, d), kBenchmarkAlignBytes);
+
+    out_pf_tq_ = DeviceBuffer::Empty<Half>(elems(chunk, hq, d), kBenchmarkAlignBytes);
+    out_pf_v5_ = DeviceBuffer::Empty<Half>(elems(chunk, hq, d), kBenchmarkAlignBytes);
+    out_pf_rot_ = DeviceBuffer::Empty<float>(elems(chunk, hq, d), kBenchmarkAlignBytes);
+    lse_pf_tq_ = DeviceBuffer::Empty<Half>(1, kBenchmarkAlignBytes);
+    lse_pf_v5_ = DeviceBuffer::Empty<Half>(1, kBenchmarkAlignBytes);
+
+    // --- the decode step -----------------------------------------------------
+    const std::vector<float> decode_query =
+        rng.NormalHalfExact(elems(config.batch, hq, d), 0.0f, 1.0f);
+    query_dec_ = DeviceBuffer::FromHost(FloatToHalf(decode_query), kBenchmarkAlignBytes);
+    query_dec_rot_ = DeviceBuffer::Empty<float>(elems(config.batch, hq, d), kBenchmarkAlignBytes);
+    out_dec_tq_ = DeviceBuffer::Empty<Half>(elems(config.batch, hq, d), kBenchmarkAlignBytes);
+    out_dec_v5_ = DeviceBuffer::Empty<Half>(elems(config.batch, hq, d), kBenchmarkAlignBytes);
+    out_dec_rot_ = DeviceBuffer::Empty<float>(elems(config.batch, hq, d), kBenchmarkAlignBytes);
+    lse_dec_ = DeviceBuffer::Empty<Half>(1, kBenchmarkAlignBytes);
+
+    // --- paging --------------------------------------------------------------
+    //
     // Each sequence gets its own run of blocks out of a shuffled pool, so the
-    // cache writes scatter the way a serving pool does.
-    const int64_t blocks_per_seq = shape.blocks_per_seq();
-    const std::vector<int32_t> pool = rng.Permutation(static_cast<int32_t>(shape.num_blocks()));
-    std::vector<int32_t> slots(static_cast<size_t>(t));
-    for (int64_t seq = 0; seq < shape.batch; ++seq) {
-      for (int64_t pos = 0; pos < shape.seq_len; ++pos) {
-        const int32_t block = pool[static_cast<size_t>(seq * blocks_per_seq + pos / kBlockSize)];
-        slots[static_cast<size_t>(seq * shape.seq_len + pos)] =
+    // cache scatters the way a serving pool does rather than reading as one
+    // contiguous sweep.
+    const int64_t blocks_per_seq = config.blocks_per_seq();
+    const std::vector<int32_t> pool = rng.Permutation(static_cast<int32_t>(config.pool_blocks()));
+    std::vector<int32_t> block_table(static_cast<size_t>(config.batch * blocks_per_seq));
+    for (int64_t seq = 0; seq < config.batch; ++seq) {
+      for (int64_t block = 0; block < blocks_per_seq; ++block) {
+        block_table[static_cast<size_t>(seq * blocks_per_seq + block)] =
+            pool[static_cast<size_t>(seq * blocks_per_seq + block)];
+      }
+    }
+    block_tables_ = DeviceBuffer::FromHost(block_table, kBenchmarkAlignBytes);
+
+    // Slot maps: every context position, for the setup fill; and the chunk's own
+    // positions, which sit at the tail of each sequence's prefix the way a
+    // chunked prefill's do.
+    std::vector<int32_t> slots_full(static_cast<size_t>(context));
+    for (int64_t seq = 0; seq < config.batch; ++seq) {
+      for (int64_t pos = 0; pos < config.seq_len; ++pos) {
+        const int32_t block = block_table[static_cast<size_t>(seq * blocks_per_seq + pos / kBlockSize)];
+        slots_full[static_cast<size_t>(seq * config.seq_len + pos)] =
             block * static_cast<int32_t>(kBlockSize) + static_cast<int32_t>(pos % kBlockSize);
       }
     }
-    slots_ = DeviceBuffer::FromHost(slots, kBenchmarkAlignBytes);
+    std::vector<int32_t> slots_chunk(static_cast<size_t>(chunk));
+    for (int64_t seq = 0; seq < config.batch; ++seq) {
+      for (int64_t j = 0; j < config.chunk; ++j) {
+        const int64_t pos = config.seq_len - config.chunk + j;
+        slots_chunk[static_cast<size_t>(seq * config.chunk + j)] =
+            slots_full[static_cast<size_t>(seq * config.seq_len + pos)];
+      }
+    }
+    slots_full_ = DeviceBuffer::FromHost(slots_full, kBenchmarkAlignBytes);
+    slots_chunk_ = DeviceBuffer::FromHost(slots_chunk, kBenchmarkAlignBytes);
+    context_lens_ = DeviceBuffer::FromHost(
+        std::vector<int32_t>(static_cast<size_t>(config.batch), static_cast<int32_t>(config.seq_len)),
+        kBenchmarkAlignBytes);
+
+    // --- TurboQuant constants and cache -------------------------------------
     pi_signs_ = DeviceBuffer::FromHost(tqh::PiSigns(d), kBenchmarkAlignBytes);
     h16_ = DeviceBuffer::FromHost(tqh::Hadamard16Half(), kBenchmarkAlignBytes);
-    write_tables_ = DeviceBuffer::FromHost(tqh::CodecTables(d, 1), kBenchmarkAlignBytes);
+    rot_tables_ = DeviceBuffer::FromHost(tqh::CodecTables(d, 1), kBenchmarkAlignBytes);
 
-    tq4_key_cache_ = DeviceBuffer::Empty<int8_t>(tqh::PackedCacheBytes(shape.num_blocks(), kBlockSize, hkv, d),
-                                                 kBenchmarkAlignBytes);
-    tq4_value_cache_ = DeviceBuffer::Empty<int8_t>(tq4_key_cache_.size_bytes(), kBenchmarkAlignBytes);
-    scale_plane_ = DeviceBuffer::Empty<float>(tqh::ScalePlaneFloats(shape.num_blocks(), kBlockSize, hkv),
+    const int64_t pool_blocks = config.pool_blocks();
+    if (config.path == PathMode::kCube) {
+      key_cache_ = DeviceBuffer::Empty<int8_t>(
+          tqh::ModePackedCacheBytes(kCubeMode, pool_blocks, kBlockSize, hkv, d), kBenchmarkAlignBytes);
+      write_tables_ =
+          DeviceBuffer::FromHost(tqh::ModeTables(kCubeMode, d, 1, /*nz_rows=*/0), kBenchmarkAlignBytes);
+      decode_tables_ = DeviceBuffer::FromHost(
+          tqh::ModeTables(kCubeMode, d, tqh::kUnpackRows, tqh::kCubeTileRows), kBenchmarkAlignBytes);
+      cube_grid_ = tqh::PlanCubeDecode(config.batch, hq, hkv, d, blocks_per_seq, aiv_num);
+      num_splits_ = cube_grid_.num_splits;
+      workspace_floats_ = cube_grid_.workspace_floats;
+    } else {
+      key_cache_ =
+          DeviceBuffer::Empty<int8_t>(tqh::PackedCacheBytes(pool_blocks, kBlockSize, hkv, d), kBenchmarkAlignBytes);
+      write_tables_ = DeviceBuffer::FromHost(tqh::CodecTables(d, 1), kBenchmarkAlignBytes);
+      decode_tables_ = DeviceBuffer::FromHost(tqh::CodecTables(d, tqh::kTileRows), kBenchmarkAlignBytes);
+      aiv_grid_ = tqh::PlanPagedAttention(config.batch, hq, d, blocks_per_seq, aiv_num);
+      num_splits_ = aiv_grid_.num_splits;
+      workspace_floats_ = aiv_grid_.workspace_floats;
+    }
+    value_cache_ = DeviceBuffer::Empty<int8_t>(key_cache_.size_bytes(), kBenchmarkAlignBytes);
+    scale_plane_ = DeviceBuffer::Empty<float>(tqh::ScalePlaneFloats(pool_blocks, kBlockSize, hkv),
                                               kBenchmarkAlignBytes);
-    fp16_key_cache_ = DeviceBuffer::Empty<Half>(elems(shape.num_blocks() * kBlockSize, hkv, d), kBenchmarkAlignBytes);
-    fp16_value_cache_ = DeviceBuffer::Empty<Half>(fp16_key_cache_.size_bytes() / sizeof(Half), kBenchmarkAlignBytes);
+    workspace_ = DeviceBuffer::Empty<float>(workspace_floats_, kBenchmarkAlignBytes);
 
+    context_write_grid_ = tqh::PlanReshapeAndCache(context, aiv_num);
+    chunk_write_grid_ = tqh::PlanReshapeAndCache(chunk, aiv_num);
+
+    // --- the native operator's fp16 paged cache ------------------------------
+    //
+    // Slot-exact when the context fits a host image, because the decode
+    // tie-point compares the two legs over the same context in the same slots.
+    // Tiled otherwise: above kExactContextElements the host image would be
+    // gigabytes, and attention latency does not depend on the values.
+    const size_t cache_elements = elems(pool_blocks * kBlockSize, hkv, d);
+    fp16_key_cache_ = DeviceBuffer::Empty<Half>(cache_elements, kBenchmarkAlignBytes);
+    fp16_value_cache_ = DeviceBuffer::Empty<Half>(cache_elements, kBenchmarkAlignBytes);
+    if (exact_context_) {
+      const size_t row = static_cast<size_t>(hkv * d);
+      const std::vector<float> key_host = HostTiled(key_pattern, elems(context, hkv, d));
+      const std::vector<float> value_host = HostTiled(value_pattern, elems(context, hkv, d));
+      std::vector<float> key_cache(cache_elements, 0.0f);
+      std::vector<float> value_cache(cache_elements, 0.0f);
+      for (int64_t pos = 0; pos < context; ++pos) {
+        const size_t slot = static_cast<size_t>(slots_full[static_cast<size_t>(pos)]);
+        const size_t src = static_cast<size_t>(pos) * row;
+        const size_t dst = slot * row;
+        std::copy(key_host.begin() + static_cast<std::ptrdiff_t>(src),
+                  key_host.begin() + static_cast<std::ptrdiff_t>(src + row),
+                  key_cache.begin() + static_cast<std::ptrdiff_t>(dst));
+        std::copy(value_host.begin() + static_cast<std::ptrdiff_t>(src),
+                  value_host.begin() + static_cast<std::ptrdiff_t>(src + row),
+                  value_cache.begin() + static_cast<std::ptrdiff_t>(dst));
+      }
+      fp16_key_cache_.CopyFromHost(FloatToHalf(key_cache).data(), cache_elements * sizeof(Half));
+      fp16_value_cache_.CopyFromHost(FloatToHalf(value_cache).data(), cache_elements * sizeof(Half));
+    } else {
+      TileToDevice(fp16_key_cache_, FloatToHalf(key_pattern));
+      TileToDevice(fp16_value_cache_, FloatToHalf(value_pattern));
+    }
+
+    // --- the causal mask -----------------------------------------------------
     std::vector<int8_t> mask(static_cast<size_t>(kCausalMaskSide * kCausalMaskSide), 0);
     for (int64_t row = 0; row < kCausalMaskSide; ++row) {
       for (int64_t col = row + 1; col < kCausalMaskSide; ++col) {
@@ -1568,100 +1026,325 @@ class Scenario {
       }
     }
     mask_ = DeviceBuffer::FromHost(mask, kBenchmarkAlignBytes);
-    out_ = DeviceBuffer::Empty<Half>(elems(t, hq, d), kBenchmarkAlignBytes);
-    out_rot_ = DeviceBuffer::Empty<Half>(elems(t, hq, d), kBenchmarkAlignBytes);
-    lse_ = DeviceBuffer::Empty<Half>(1, kBenchmarkAlignBytes);
-    lse_rot_ = DeviceBuffer::Empty<Half>(1, kBenchmarkAlignBytes);
 
-    write_grid_ = tqh::PlanReshapeAndCache(t, aiv_num);
+    BuildDescriptors();
+    PlanOperators();
+  }
 
-    // --- descriptors ---------------------------------------------------------
-    query_tnd_.reset(new AclnnTensor({t, hq, d}, ACL_FLOAT16, query_.get()));
-    key_tnd_.reset(new AclnnTensor({t, hkv, d}, ACL_FLOAT16, key_.get()));
-    value_tnd_.reset(new AclnnTensor({t, hkv, d}, ACL_FLOAT16, value_.get()));
-    value_rot_tnd_.reset(new AclnnTensor({t, hkv, d}, ACL_FLOAT16, value_rot_half_.get()));
-    mask_tensor_.reset(new AclnnTensor({kCausalMaskSide, kCausalMaskSide}, ACL_INT8, mask_.get()));
-    out_tensor_.reset(new AclnnTensor({t, hq, d}, ACL_FLOAT16, out_.get()));
-    out_rot_tensor_.reset(new AclnnTensor({t, hq, d}, ACL_FLOAT16, out_rot_.get()));
-    lse_tensor_.reset(new AclnnTensor({1}, ACL_FLOAT16, lse_.get()));
-    lse_rot_tensor_.reset(new AclnnTensor({1}, ACL_FLOAT16, lse_rot_.get()));
-    slots_tensor_.reset(new AclnnTensor({t}, ACL_INT32, slots_.get()));
-    fp16_key_cache_tensor_.reset(
-        new AclnnTensor({shape.num_blocks(), kBlockSize, hkv, d}, ACL_FLOAT16, fp16_key_cache_.get()));
-    fp16_value_cache_tensor_.reset(
-        new AclnnTensor({shape.num_blocks(), kBlockSize, hkv, d}, ACL_FLOAT16, fp16_value_cache_.get()));
-    key_list_.reset(new AclnnTensorList({key_tnd_->get()}));
-    value_list_.reset(new AclnnTensorList({value_tnd_->get()}));
-    value_rot_list_.reset(new AclnnTensorList({value_rot_tnd_->get()}));
-    // TND wants the cumulative token count at the end of each sequence, the
-    // actual_seq_lengths_q the plugin passes for both Q and KV.
-    std::vector<int64_t> cumulative(static_cast<size_t>(shape.batch));
-    for (int64_t seq = 0; seq < shape.batch; ++seq) {
-      cumulative[static_cast<size_t>(seq)] = (seq + 1) * shape.seq_len;
-    }
-    seq_lens_.reset(new AclnnIntArray(cumulative));
+  // --- prefill ------------------------------------------------------------
 
-    // --- planning ------------------------------------------------------------
-    fia_ = PlanFia(value_list_->get(), out_tensor_->get(), lse_tensor_->get(), &fia_op_, &fia_note_);
-    fia_rot_ = PlanFia(value_rot_list_->get(), out_rot_tensor_->get(), lse_rot_tensor_->get(), &fia_op_, &fia_note_);
-    try {
-      fp16_write_.reset(new PlannedOp(PlanAclnn<ops::ScatterPaKvCacheWorkspaceFn>(
-          ScatterPaKvCache(), key_tnd_->get(), fp16_key_cache_tensor_->get(), slots_tensor_->get(),
-          value_tnd_->get(), fp16_value_cache_tensor_->get(), /*compress_lens=*/nullptr,
-          /*compress_seq_offset=*/nullptr, /*seq_lens=*/nullptr, const_cast<char*>(ops::kScatterCacheModeNorm),
-          /*scatter_mode=*/nullptr, /*strides=*/nullptr, /*offsets=*/nullptr)));
-    } catch (const AclError& error) {
-      fp16_write_note_ = std::string(ops::kScatterPaKvCache) + ": " + error.what();
+  void EnqueuePrefillIngest(aclrtStream stream) const {
+    EnqueueCacheWrite(stream, key_chunk_.get(), value_chunk_.get(), slots_chunk_.get(), config_.chunk_tokens(),
+                      chunk_write_grid_);
+  }
+
+  void EnqueuePrefillRotateQ(aclrtStream stream) const {
+    tqh::RotateQuery(stream, AscendType::FP16, query_pf_.get(), pi_signs_.get(), h16_.get(), rot_tables_.get(),
+                     query_pf_rot_fp32_.get(), config_.chunk_tokens(), config_.model.num_heads,
+                     config_.model.head_size, aiv_num_, /*input_exact_in_half=*/true);
+  }
+
+  void EnqueuePrefillAttnCore(aclrtStream stream) const { fia_prefill_rotated_->Launch(stream); }
+
+  void EnqueuePrefillRotateO(aclrtStream stream) const {
+    tqh::RotateQuery(stream, AscendType::FP16, out_pf_tq_.get(), pi_signs_.get(), h16_.get(), rot_tables_.get(),
+                     out_pf_rot_.get(), config_.chunk_tokens(), config_.model.num_heads, config_.model.head_size,
+                     aiv_num_, /*input_exact_in_half=*/true);
+  }
+
+  void EnqueuePrefillE2E(aclrtStream stream) const {
+    EnqueuePrefillRotateQ(stream);
+    EnqueuePrefillAttnCore(stream);
+    if (!config_.model.folds_output) {
+      EnqueuePrefillRotateO(stream);
     }
   }
 
-  void EnqueueTq4Write(aclrtStream stream) const {
-    turboquant_reshape_and_cache_impl(
-        AscendType::FP16, stream, write_grid_.block_dim, key_.get(), value_.get(), tq4_key_cache_.get(),
-        tq4_value_cache_.get(), scale_plane_.get(), slots_.get(), pi_signs_.get(), write_tables_.get(),
-        static_cast<uint32_t>(shape_.tokens()), static_cast<uint32_t>(shape_.num_kv_heads),
-        static_cast<uint32_t>(shape_.head_size), static_cast<uint32_t>(kBlockSize), write_grid_.tokens_per_core,
-        1.0f / std::sqrt(static_cast<float>(shape_.head_size)));
+  void EnqueuePrefillNative(aclrtStream stream) const { fia_prefill_native_->Launch(stream); }
+  void EnqueuePrefillNativeIngest(aclrtStream stream) const { native_write_->Launch(stream); }
+
+  // --- decode -------------------------------------------------------------
+
+  void EnqueueDecodeRotateQ(aclrtStream stream) const {
+    tqh::RotateQuery(stream, AscendType::FP16, query_dec_.get(), pi_signs_.get(), h16_.get(), rot_tables_.get(),
+                     query_dec_rot_.get(), config_.batch, config_.model.num_heads, config_.model.head_size,
+                     aiv_num_, /*input_exact_in_half=*/true);
   }
 
-  // The same operator the backend launches on V for a folded layer. It is the
-  // query rotation's kernel; Pi does not care which activation it is handed.
-  void EnqueueRotateValue(aclrtStream stream) const {
-    tqh::RotateQuery(stream, AscendType::FP16, value_.get(), pi_signs_.get(), h16_.get(), write_tables_.get(),
-                     value_rot_fp32_.get(), shape_.tokens(), shape_.num_kv_heads, shape_.head_size, aiv_num_,
+  // The Cube split alone. Only meaningful on the Cube path; the AIV launcher
+  // does not expose its split stage separately, which is why that path's split
+  // column is derived. See THE DECODE PATH above.
+  void EnqueueDecodeSplit(aclrtStream stream) const {
+    turboquant_mm_decode_split_impl(
+        static_cast<int32_t>(kCubeMode), AscendType::FP16, stream, cube_grid_.split_block_dim,
+        query_dec_rot_.get(), key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(),
+        context_lens_.get(), decode_tables_.get(), workspace_.get(), static_cast<uint32_t>(config_.batch),
+        static_cast<uint32_t>(config_.model.num_heads), static_cast<uint32_t>(config_.model.num_kv_heads),
+        static_cast<uint32_t>(config_.model.head_size), static_cast<uint32_t>(kBlockSize),
+        static_cast<uint32_t>(config_.blocks_per_seq()), static_cast<uint32_t>(cube_grid_.num_splits),
+        cube_grid_.split_tasks_per_core, config_.attention_scale(), config_.attention_scale());
+  }
+
+  // The shared reduction, on both paths. Reads the workspace and nothing else.
+  void EnqueueDecodeCombine(aclrtStream stream) const {
+    const uint32_t block_dim =
+        config_.path == PathMode::kCube ? cube_grid_.combine_block_dim : aiv_grid_.combine_block_dim;
+    const uint32_t tasks =
+        config_.path == PathMode::kCube ? cube_grid_.combine_tasks_per_core : aiv_grid_.combine_tasks_per_core;
+    turboquant_paged_attention_combine_impl(
+        AscendType::FP16, stream, block_dim, workspace_.get(), out_dec_tq_.get(),
+        static_cast<uint32_t>(config_.batch), static_cast<uint32_t>(config_.model.num_heads),
+        static_cast<uint32_t>(config_.model.head_size), static_cast<uint32_t>(num_splits_), tasks);
+  }
+
+  void EnqueueDecodeAttnCore(aclrtStream stream) const {
+    if (config_.path == PathMode::kCube) {
+      EnqueueDecodeSplit(stream);
+      EnqueueDecodeCombine(stream);
+      return;
+    }
+    turboquant_paged_attention_impl(
+        AscendType::FP16, stream, aiv_grid_.split_block_dim, aiv_grid_.combine_block_dim, query_dec_rot_.get(),
+        key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
+        decode_tables_.get(), workspace_.get(), out_dec_tq_.get(), static_cast<uint32_t>(config_.batch),
+        static_cast<uint32_t>(config_.model.num_heads), static_cast<uint32_t>(config_.model.num_kv_heads),
+        static_cast<uint32_t>(config_.model.head_size), static_cast<uint32_t>(kBlockSize),
+        static_cast<uint32_t>(config_.blocks_per_seq()), static_cast<uint32_t>(aiv_grid_.num_splits),
+        aiv_grid_.split_tasks_per_core, aiv_grid_.combine_tasks_per_core, config_.attention_scale(),
+        config_.attention_scale());
+  }
+
+  void EnqueueDecodeRotateO(aclrtStream stream) const {
+    tqh::RotateQuery(stream, AscendType::FP16, out_dec_tq_.get(), pi_signs_.get(), h16_.get(), rot_tables_.get(),
+                     out_dec_rot_.get(), config_.batch, config_.model.num_heads, config_.model.head_size, aiv_num_,
                      /*input_exact_in_half=*/true);
   }
 
-  void EnqueueFp16Write(aclrtStream stream) const { fp16_write_->Launch(stream); }
-  void EnqueueFia(aclrtStream stream) const { fia_->Launch(stream); }
-  void EnqueueFiaRotated(aclrtStream stream) const { fia_rot_->Launch(stream); }
+  void EnqueueDecodeE2E(aclrtStream stream) const {
+    EnqueueDecodeRotateQ(stream);
+    EnqueueDecodeAttnCore(stream);
+    if (!config_.model.folds_output) {
+      EnqueueDecodeRotateO(stream);
+    }
+  }
 
-  bool fia_available() const { return fia_ != nullptr && fia_rot_ != nullptr; }
-  bool fp16_write_available() const { return fp16_write_ != nullptr; }
-  const std::string& fia_op() const { return fia_op_; }
+  void EnqueueDecodeNative(aclrtStream stream) const { fia_decode_native_->Launch(stream); }
+
+  // --- setup, outside every timed region ----------------------------------
+
+  // Quantises the whole batch's context into the TurboQuant cache, so the decode
+  // reads a populated cache rather than the allocation's zeros.
+  void FillCache(aclrtStream stream) const {
+    EnqueueCacheWrite(stream, key_ctx_.get(), value_ctx_.get(), slots_full_.get(), config_.context_tokens(),
+                      context_write_grid_);
+    ACL_CHECK(aclrtSynchronizeStream(stream));
+  }
+
+  // Leaves the flash-decoding workspace and both attention outputs holding real
+  // values. Without it `dec_combine` timed on its own would reduce a workspace
+  // of zeros -- a zero softmax denominator, so a non-finite checksum and a
+  // spurious failure -- and `dec_rot_o` / `pf_rot_o` would rotate zeros.
+  void Prime(aclrtStream stream) const {
+    EnqueueDecodeRotateQ(stream);
+    EnqueueDecodeAttnCore(stream);
+    if (prefill_available()) {
+      EnqueuePrefillAttnCore(stream);
+      EnqueuePrefillNative(stream);
+    }
+    ACL_CHECK(aclrtSynchronizeStream(stream));
+  }
+
+  // --- availability -------------------------------------------------------
+
+  bool prefill_available() const { return fia_prefill_rotated_ != nullptr && fia_prefill_native_ != nullptr; }
+  bool decode_available() const { return fia_decode_native_ != nullptr; }
+  bool native_write_available() const { return native_write_ != nullptr; }
+  bool exact_context() const { return exact_context_; }
+  const std::string& fia_operator() const { return fia_operator_; }
   const std::string& fia_note() const { return fia_note_; }
-  const std::string& fp16_write_note() const { return fp16_write_note_; }
+  const std::string& native_write_note() const { return native_write_note_; }
+  int64_t num_splits() const { return num_splits_; }
+  uint32_t split_block_dim() const {
+    return config_.path == PathMode::kCube ? cube_grid_.split_block_dim : aiv_grid_.split_block_dim;
+  }
+  uint32_t combine_block_dim() const {
+    return config_.path == PathMode::kCube ? cube_grid_.combine_block_dim : aiv_grid_.combine_block_dim;
+  }
+
+  // --- checksums and readback ---------------------------------------------
 
   double ScaleChecksum() const { return ChecksumSum(LeadingElements<float>(scale_plane_)); }
-  double RotatedValueChecksum() const { return ChecksumSum(LeadingElements<float>(value_rot_fp32_)); }
-  double Fp16CacheChecksum() const { return ChecksumSum(HalfToFloat(LeadingElements<Half>(fp16_value_cache_))); }
-  double OutputChecksum() const { return ChecksumSum(HalfToFloat(LeadingElements<Half>(out_))); }
-  double RotatedOutputChecksum() const { return ChecksumSum(HalfToFloat(LeadingElements<Half>(out_rot_))); }
+  double WorkspaceChecksum() const { return ChecksumSum(LeadingElements<float>(workspace_)); }
+  double PrefillRotatedQueryChecksum() const { return ChecksumSum(LeadingElements<float>(query_pf_rot_fp32_)); }
+  double PrefillTqChecksum() const { return ChecksumSum(HalfToFloat(LeadingElements<Half>(out_pf_tq_))); }
+  double PrefillNativeChecksum() const { return ChecksumSum(HalfToFloat(LeadingElements<Half>(out_pf_v5_))); }
+  double PrefillRotatedOutChecksum() const { return ChecksumSum(LeadingElements<float>(out_pf_rot_)); }
+  double NativeCacheChecksum() const {
+    return ChecksumSum(HalfToFloat(LeadingElements<Half>(fp16_value_cache_)));
+  }
+  double DecodeRotatedQueryChecksum() const { return ChecksumSum(LeadingElements<float>(query_dec_rot_)); }
+  double DecodeTqChecksum() const { return ChecksumSum(HalfToFloat(LeadingElements<Half>(out_dec_tq_))); }
+  double DecodeNativeChecksum() const { return ChecksumSum(HalfToFloat(LeadingElements<Half>(out_dec_v5_))); }
+  double DecodeRotatedOutChecksum() const { return ChecksumSum(LeadingElements<float>(out_dec_rot_)); }
 
-  std::vector<float> Output() const { return HalfToFloat(out_.ToHost<Half>()); }
-  std::vector<float> RotatedOutput() const { return HalfToFloat(out_rot_.ToHost<Half>()); }
+  // The prefill E2E's product: the rotated output for an unfolded layer, the
+  // rotated-basis attention output for a folded one.
+  double PrefillPipelineChecksum() const {
+    return config_.model.folds_output ? PrefillTqChecksum() : PrefillRotatedOutChecksum();
+  }
+  double DecodePipelineChecksum() const {
+    return config_.model.folds_output ? DecodeTqChecksum() : DecodeRotatedOutChecksum();
+  }
+
+  std::vector<float> PrefillTqOutput() const { return HalfToFloat(out_pf_tq_.ToHost<Half>()); }
+  std::vector<float> PrefillNativeOutput() const { return HalfToFloat(out_pf_v5_.ToHost<Half>()); }
+  std::vector<float> DecodeTqOutput() const { return HalfToFloat(out_dec_tq_.ToHost<Half>()); }
+  std::vector<float> DecodeNativeOutput() const { return HalfToFloat(out_dec_v5_.ToHost<Half>()); }
 
  private:
-  std::unique_ptr<PlannedOp> PlanFia(const aclTensorList* value_list, const aclTensor* out, const aclTensor* lse,
-                                     std::string* op_name, std::string* note) {
-    const int64_t hq = shape_.num_heads;
-    const int64_t hkv = shape_.num_kv_heads;
-    const double scale = 1.0 / std::sqrt(static_cast<double>(shape_.head_size));
+  // The Cube-native rate this audit stores at. kv3fp4 and kv5fp8 are built and
+  // covered by the sim tier; neither is the shipping 4-bit path.
+  static constexpr tqm::TurboQuantMode kCubeMode = tqm::TurboQuantMode::KV4_FP8;
+
+  void EnqueueCacheWrite(aclrtStream stream, void* key, void* value, void* slots, int64_t tokens,
+                         const tqh::ReshapeAndCacheGrid& grid) const {
+    const uint32_t token_count = static_cast<uint32_t>(tokens);
+    const uint32_t kv_heads = static_cast<uint32_t>(config_.model.num_kv_heads);
+    const uint32_t head_size = static_cast<uint32_t>(config_.model.head_size);
+    if (config_.path == PathMode::kCube) {
+      turboquant_mm_reshape_and_cache_impl(static_cast<int32_t>(kCubeMode), AscendType::FP16, stream,
+                                           grid.block_dim, key, value, key_cache_.get(), value_cache_.get(),
+                                           scale_plane_.get(), slots, pi_signs_.get(), rot_tables_.get(),
+                                           write_tables_.get(), token_count, kv_heads, head_size,
+                                           static_cast<uint32_t>(kBlockSize), grid.tokens_per_core,
+                                           config_.attention_scale());
+      return;
+    }
+    turboquant_reshape_and_cache_impl(AscendType::FP16, stream, grid.block_dim, key, value, key_cache_.get(),
+                                      value_cache_.get(), scale_plane_.get(), slots, pi_signs_.get(),
+                                      write_tables_.get(), token_count, kv_heads, head_size,
+                                      static_cast<uint32_t>(kBlockSize), grid.tokens_per_core,
+                                      config_.attention_scale());
+  }
+
+  void BuildDescriptors() {
+    const int64_t d = config_.model.head_size;
+    const int64_t hq = config_.model.num_heads;
+    const int64_t hkv = config_.model.num_kv_heads;
+    const int64_t chunk = config_.chunk_tokens();
+    const int64_t context = config_.context_tokens();
+    const int64_t pool_blocks = config_.pool_blocks();
+
+    query_pf_tnd_.reset(new AclnnTensor({chunk, hq, d}, ACL_FLOAT16, query_pf_.get()));
+    query_pf_rot_tnd_.reset(new AclnnTensor({chunk, hq, d}, ACL_FLOAT16, query_pf_rot_half_.get()));
+    key_ctx_tnd_.reset(new AclnnTensor({context, hkv, d}, ACL_FLOAT16, key_ctx_.get()));
+    value_ctx_tnd_.reset(new AclnnTensor({context, hkv, d}, ACL_FLOAT16, value_ctx_.get()));
+    key_ctx_rot_tnd_.reset(new AclnnTensor({context, hkv, d}, ACL_FLOAT16, key_ctx_rot_.get()));
+    value_ctx_rot_tnd_.reset(new AclnnTensor({context, hkv, d}, ACL_FLOAT16, value_ctx_rot_.get()));
+    mask_tensor_.reset(new AclnnTensor({kCausalMaskSide, kCausalMaskSide}, ACL_INT8, mask_.get()));
+    out_pf_tq_tensor_.reset(new AclnnTensor({chunk, hq, d}, ACL_FLOAT16, out_pf_tq_.get()));
+    out_pf_v5_tensor_.reset(new AclnnTensor({chunk, hq, d}, ACL_FLOAT16, out_pf_v5_.get()));
+    lse_pf_tq_tensor_.reset(new AclnnTensor({1}, ACL_FLOAT16, lse_pf_tq_.get()));
+    lse_pf_v5_tensor_.reset(new AclnnTensor({1}, ACL_FLOAT16, lse_pf_v5_.get()));
+
+    key_ctx_list_.reset(new AclnnTensorList({key_ctx_tnd_->get()}));
+    value_ctx_list_.reset(new AclnnTensorList({value_ctx_tnd_->get()}));
+    key_ctx_rot_list_.reset(new AclnnTensorList({key_ctx_rot_tnd_->get()}));
+    value_ctx_rot_list_.reset(new AclnnTensorList({value_ctx_rot_tnd_->get()}));
+
+    // TND wants the cumulative token count at the end of each sequence, for the
+    // query and the key independently: a chunked prefill has C query tokens
+    // against S keys, which is exactly what sparse_mode 3 anchors bottom-right.
+    std::vector<int64_t> cumulative_q(static_cast<size_t>(config_.batch));
+    std::vector<int64_t> cumulative_kv(static_cast<size_t>(config_.batch));
+    for (int64_t seq = 0; seq < config_.batch; ++seq) {
+      cumulative_q[static_cast<size_t>(seq)] = (seq + 1) * config_.chunk;
+      cumulative_kv[static_cast<size_t>(seq)] = (seq + 1) * config_.seq_len;
+    }
+    prefill_seq_q_.reset(new AclnnIntArray(cumulative_q));
+    prefill_seq_kv_.reset(new AclnnIntArray(cumulative_kv));
+
+    // The decode role: one query token per sequence, the paged cache as a
+    // one-entry list, and the context length per sequence.
+    query_dec_tnd_.reset(new AclnnTensor({config_.batch, hq, d}, ACL_FLOAT16, query_dec_.get()));
+    out_dec_v5_tensor_.reset(new AclnnTensor({config_.batch, hq, d}, ACL_FLOAT16, out_dec_v5_.get()));
+    lse_dec_tensor_.reset(new AclnnTensor({1}, ACL_FLOAT16, lse_dec_.get()));
+    fp16_key_flat_.reset(new AclnnTensor(s950::FiaKeyCacheView(pool_blocks, kBlockSize, hkv, d), ACL_FLOAT16,
+                                         fp16_key_cache_.get()));
+    fp16_value_flat_.reset(new AclnnTensor(s950::FiaKeyCacheView(pool_blocks, kBlockSize, hkv, d), ACL_FLOAT16,
+                                           fp16_value_cache_.get()));
+    fp16_key_list_.reset(new AclnnTensorList({fp16_key_flat_->get()}));
+    fp16_value_list_.reset(new AclnnTensorList({fp16_value_flat_->get()}));
+    block_table_tensor_.reset(
+        new AclnnTensor({config_.batch, config_.blocks_per_seq()}, ACL_INT32, block_tables_.get()));
+    // The plugin's own decode convention, which the golden test reproduces
+    // argument for argument: actualSeqLengths is the CUMULATIVE query token
+    // count -- one token per sequence, so 1, 2, ... B -- and actualSeqLengthsKv
+    // is the context length PER SEQUENCE, not cumulative. The two readings
+    // coincide at B=1, which is why nothing in this tree had to distinguish them
+    // before; at B > 1 they do not, and this follows
+    // AscendAttentionBackendImpl._get_fia_params rather than guessing.
+    {
+      std::vector<int64_t> cumulative_q(static_cast<size_t>(config_.batch));
+      for (int64_t seq = 0; seq < config_.batch; ++seq) {
+        cumulative_q[static_cast<size_t>(seq)] = seq + 1;
+      }
+      decode_seq_q_.reset(new AclnnIntArray(cumulative_q));
+      std::vector<int64_t> kv_lens(static_cast<size_t>(config_.batch), config_.seq_len);
+      decode_seq_kv_.reset(new AclnnIntArray(kv_lens));
+    }
+
+    // The native write's descriptors, over the chunk.
+    key_chunk_tensor_.reset(new AclnnTensor({chunk, hkv, d}, ACL_FLOAT16, key_chunk_.get()));
+    value_chunk_tensor_.reset(new AclnnTensor({chunk, hkv, d}, ACL_FLOAT16, value_chunk_.get()));
+    slots_chunk_tensor_.reset(new AclnnTensor({chunk}, ACL_INT32, slots_chunk_.get()));
+    fp16_key_cache_tensor_.reset(
+        new AclnnTensor({pool_blocks, kBlockSize, hkv, d}, ACL_FLOAT16, fp16_key_cache_.get()));
+    fp16_value_cache_tensor_.reset(
+        new AclnnTensor({pool_blocks, kBlockSize, hkv, d}, ACL_FLOAT16, fp16_value_cache_.get()));
+  }
+
+  void PlanOperators() {
+    if (!NativeEnabled()) {
+      fia_note_ = "the native V5 legs were dropped by ASCEND_BENCH_TQ_FIA=0";
+      return;
+    }
+    // Two plans over the same shape: TurboQuant's core reads the rotated basis
+    // (Q~, K~, V~) and produces O~; the native leg reads the plain one. Pi is
+    // orthogonal, so the two compute the same attention up to that rotation --
+    // which is what the rotated-basis identity check asserts on the device.
+    fia_prefill_rotated_ = PlanPrefill(query_pf_rot_tnd_->get(), key_ctx_rot_list_->get(),
+                                       value_ctx_rot_list_->get(), out_pf_tq_tensor_->get(),
+                                       lse_pf_tq_tensor_->get());
+    fia_prefill_native_ = PlanPrefill(query_pf_tnd_->get(), key_ctx_list_->get(), value_ctx_list_->get(),
+                                      out_pf_v5_tensor_->get(), lse_pf_v5_tensor_->get());
+    fia_decode_native_ = PlanDecode();
+    try {
+      native_write_.reset(new PlannedOp(PlanAclnn<ops::ScatterPaKvCacheWorkspaceFn>(
+          ScatterPaKvCacheOp(), key_chunk_tensor_->get(), fp16_key_cache_tensor_->get(),
+          slots_chunk_tensor_->get(), value_chunk_tensor_->get(), fp16_value_cache_tensor_->get(),
+          /*compress_lens=*/nullptr, /*compress_seq_offset=*/nullptr, /*seq_lens=*/nullptr,
+          const_cast<char*>(ops::kScatterCacheModeNorm), /*scatter_mode=*/nullptr, /*strides=*/nullptr,
+          /*offsets=*/nullptr)));
+    } catch (const AclError& error) {
+      native_write_note_ = std::string(ops::kScatterPaKvCache) + ": " + error.what();
+    }
+  }
+
+  // The prompt role: contiguous TND K/V, no paging, sparse_mode 3 with the
+  // compressed causal mask. V5 first, V2 as a fallback.
+  std::unique_ptr<PlannedOp> PlanPrefill(const aclTensor* query, const aclTensorList* key_list,
+                                         const aclTensorList* value_list, const aclTensor* out,
+                                         const aclTensor* lse) {
+    const int64_t hq = config_.model.num_heads;
+    const int64_t hkv = config_.model.num_kv_heads;
+    const double scale = static_cast<double>(config_.attention_scale());
     try {
       std::unique_ptr<PlannedOp> planned(new PlannedOp(PlanAclnn<ops950::FusedInferAttentionScoreV5WorkspaceFn>(
-          FiaV5(), query_tnd_->get(), key_list_->get(), value_list, /*pse_shift=*/nullptr, mask_tensor_->get(),
-          seq_lens_->get(), seq_lens_->get(), /*deq_scale1=*/nullptr, /*quant_scale1=*/nullptr,
-          /*deq_scale2=*/nullptr, /*quant_scale2=*/nullptr, /*quant_offset2=*/nullptr, /*antiquant_scale=*/nullptr,
+          FiaV5(), query,
+          key_list, value_list, /*pse_shift=*/nullptr, mask_tensor_->get(), prefill_seq_q_->get(),
+          prefill_seq_kv_->get(), /*deq_scale1=*/nullptr, /*quant_scale1=*/nullptr, /*deq_scale2=*/nullptr,
+          /*quant_scale2=*/nullptr, /*quant_offset2=*/nullptr, /*antiquant_scale=*/nullptr,
           /*antiquant_offset=*/nullptr, /*block_table=*/nullptr, /*query_padding_size=*/nullptr,
           /*kv_padding_size=*/nullptr, /*key_antiquant_scale=*/nullptr, /*key_antiquant_offset=*/nullptr,
           /*value_antiquant_scale=*/nullptr, /*value_antiquant_offset=*/nullptr, /*key_shared_prefix=*/nullptr,
@@ -1672,71 +1355,249 @@ class Scenario {
           kFiaSparseModeRightDownCausal, s950::kFiaInnerPreciseDefault, kFiaNoPaging, /*antiquant_mode=*/0,
           /*softmax_lse_flag=*/false, /*key_antiquant_mode=*/0, /*value_antiquant_mode=*/0,
           s950::kFiaQueryQuantModeNone, s950::kFiaPseTypeDefault, out, lse)));
-      *op_name = ops950::kFusedInferAttentionScoreV5;
+      RecordOperator(ops950::kFusedInferAttentionScoreV5);
       return planned;
     } catch (const AclError& error) {
-      *note = std::string(ops950::kFusedInferAttentionScoreV5) + ": " + error.what();
+      AppendNote(std::string(ops950::kFusedInferAttentionScoreV5) + " (prompt role): " + error.what());
     }
     try {
       std::unique_ptr<PlannedOp> planned(new PlannedOp(PlanAclnn<ops950::FusedInferAttentionScoreV2WorkspaceFn>(
-          FiaV2(), query_tnd_->get(), key_list_->get(), value_list, /*pse_shift=*/nullptr, mask_tensor_->get(),
-          seq_lens_->get(), seq_lens_->get(), /*deq_scale1=*/nullptr, /*quant_scale1=*/nullptr,
-          /*deq_scale2=*/nullptr, /*quant_scale2=*/nullptr, /*quant_offset2=*/nullptr, /*antiquant_scale=*/nullptr,
-          /*antiquant_offset=*/nullptr, /*block_table=*/nullptr, /*query_padding_size=*/nullptr,
-          /*kv_padding_size=*/nullptr, /*key_antiquant_scale=*/nullptr, /*key_antiquant_offset=*/nullptr,
-          /*value_antiquant_scale=*/nullptr, /*value_antiquant_offset=*/nullptr, /*key_shared_prefix=*/nullptr,
-          /*value_shared_prefix=*/nullptr, /*actual_shared_prefix_len=*/nullptr, hq, scale,
-          s950::kFiaUnboundedTokens, s950::kFiaUnboundedTokens, const_cast<char*>(ops950::kFiaLayoutTnd), hkv,
-          kFiaSparseModeRightDownCausal, s950::kFiaInnerPreciseDefault, kFiaNoPaging, /*antiquant_mode=*/0,
-          /*softmax_lse_flag=*/false, /*key_antiquant_mode=*/0, /*value_antiquant_mode=*/0, out, lse)));
-      *op_name = ops950::kFusedInferAttentionScoreV2;
+          FiaV2(), query, key_list,
+          value_list, /*pse_shift=*/nullptr, mask_tensor_->get(), prefill_seq_q_->get(), prefill_seq_kv_->get(),
+          /*deq_scale1=*/nullptr, /*quant_scale1=*/nullptr, /*deq_scale2=*/nullptr, /*quant_scale2=*/nullptr,
+          /*quant_offset2=*/nullptr, /*antiquant_scale=*/nullptr, /*antiquant_offset=*/nullptr,
+          /*block_table=*/nullptr, /*query_padding_size=*/nullptr, /*kv_padding_size=*/nullptr,
+          /*key_antiquant_scale=*/nullptr, /*key_antiquant_offset=*/nullptr, /*value_antiquant_scale=*/nullptr,
+          /*value_antiquant_offset=*/nullptr, /*key_shared_prefix=*/nullptr, /*value_shared_prefix=*/nullptr,
+          /*actual_shared_prefix_len=*/nullptr, hq, scale, s950::kFiaUnboundedTokens, s950::kFiaUnboundedTokens,
+          const_cast<char*>(ops950::kFiaLayoutTnd), hkv, kFiaSparseModeRightDownCausal,
+          s950::kFiaInnerPreciseDefault, kFiaNoPaging, /*antiquant_mode=*/0, /*softmax_lse_flag=*/false,
+          /*key_antiquant_mode=*/0, /*value_antiquant_mode=*/0, out, lse)));
+      RecordOperator(ops950::kFusedInferAttentionScoreV2);
       return planned;
     } catch (const AclError& error) {
-      *note += std::string("; ") + ops950::kFusedInferAttentionScoreV2 + ": " + error.what();
+      AppendNote(std::string(ops950::kFusedInferAttentionScoreV2) + " (prompt role): " + error.what());
     }
     return nullptr;
   }
 
-  Shape shape_;
+  // The incremental role: one query token per sequence over the paged fp16
+  // cache, sparse_mode 0, the block table as a tensor.
+  std::unique_ptr<PlannedOp> PlanDecode() {
+    const int64_t hq = config_.model.num_heads;
+    const int64_t hkv = config_.model.num_kv_heads;
+    const double scale = static_cast<double>(config_.attention_scale());
+    try {
+      std::unique_ptr<PlannedOp> planned(new PlannedOp(PlanAclnn<ops950::FusedInferAttentionScoreV5WorkspaceFn>(
+          FiaV5(), query_dec_tnd_->get(), fp16_key_list_->get(), fp16_value_list_->get(), /*pse_shift=*/nullptr,
+          /*atten_mask=*/nullptr, decode_seq_q_->get(), decode_seq_kv_->get(), /*deq_scale1=*/nullptr,
+          /*quant_scale1=*/nullptr, /*deq_scale2=*/nullptr, /*quant_scale2=*/nullptr, /*quant_offset2=*/nullptr,
+          /*antiquant_scale=*/nullptr, /*antiquant_offset=*/nullptr, block_table_tensor_->get(),
+          /*query_padding_size=*/nullptr, /*kv_padding_size=*/nullptr, /*key_antiquant_scale=*/nullptr,
+          /*key_antiquant_offset=*/nullptr, /*value_antiquant_scale=*/nullptr, /*value_antiquant_offset=*/nullptr,
+          /*key_shared_prefix=*/nullptr, /*value_shared_prefix=*/nullptr, /*actual_shared_prefix_len=*/nullptr,
+          /*query_rope=*/nullptr, /*key_rope=*/nullptr, /*key_rope_antiquant_scale=*/nullptr,
+          /*dequant_scale_query=*/nullptr, /*learnable_sink=*/nullptr, /*q_start_idx=*/nullptr,
+          /*kv_start_idx=*/nullptr, hq, scale, s950::kFiaUnboundedTokens, s950::kFiaUnboundedTokens,
+          const_cast<char*>(ops950::kFiaLayoutTnd), hkv, s950::kFiaSparseModeNone,
+          s950::kFiaInnerPreciseDefault, kBlockSize, /*antiquant_mode=*/0, /*softmax_lse_flag=*/false,
+          /*key_antiquant_mode=*/0, /*value_antiquant_mode=*/0, s950::kFiaQueryQuantModeNone,
+          s950::kFiaPseTypeDefault, out_dec_v5_tensor_->get(), lse_dec_tensor_->get())));
+      RecordOperator(ops950::kFusedInferAttentionScoreV5);
+      return planned;
+    } catch (const AclError& error) {
+      AppendNote(std::string(ops950::kFusedInferAttentionScoreV5) + " (incremental role): " + error.what());
+    }
+    try {
+      std::unique_ptr<PlannedOp> planned(new PlannedOp(PlanAclnn<ops950::FusedInferAttentionScoreV2WorkspaceFn>(
+          FiaV2(), query_dec_tnd_->get(), fp16_key_list_->get(), fp16_value_list_->get(), /*pse_shift=*/nullptr,
+          /*atten_mask=*/nullptr, decode_seq_q_->get(), decode_seq_kv_->get(), /*deq_scale1=*/nullptr,
+          /*quant_scale1=*/nullptr, /*deq_scale2=*/nullptr, /*quant_scale2=*/nullptr, /*quant_offset2=*/nullptr,
+          /*antiquant_scale=*/nullptr, /*antiquant_offset=*/nullptr, block_table_tensor_->get(),
+          /*query_padding_size=*/nullptr, /*kv_padding_size=*/nullptr, /*key_antiquant_scale=*/nullptr,
+          /*key_antiquant_offset=*/nullptr, /*value_antiquant_scale=*/nullptr, /*value_antiquant_offset=*/nullptr,
+          /*key_shared_prefix=*/nullptr, /*value_shared_prefix=*/nullptr, /*actual_shared_prefix_len=*/nullptr, hq,
+          scale, s950::kFiaUnboundedTokens, s950::kFiaUnboundedTokens, const_cast<char*>(ops950::kFiaLayoutTnd),
+          hkv, s950::kFiaSparseModeNone, s950::kFiaInnerPreciseDefault, kBlockSize, /*antiquant_mode=*/0,
+          /*softmax_lse_flag=*/false, /*key_antiquant_mode=*/0, /*value_antiquant_mode=*/0,
+          out_dec_v5_tensor_->get(), lse_dec_tensor_->get())));
+      RecordOperator(ops950::kFusedInferAttentionScoreV2);
+      return planned;
+    } catch (const AclError& error) {
+      AppendNote(std::string(ops950::kFusedInferAttentionScoreV2) + " (incremental role): " + error.what());
+    }
+    return nullptr;
+  }
+
+  void RecordOperator(const char* name) {
+    if (fia_operator_.empty()) {
+      fia_operator_ = name;
+    }
+  }
+  void AppendNote(const std::string& note) {
+    if (!fia_note_.empty()) {
+      fia_note_ += "; ";
+    }
+    fia_note_ += note;
+  }
+
+  Config config_;
   int64_t aiv_num_ = 0;
-  tqh::ReshapeAndCacheGrid write_grid_;
+  bool exact_context_ = false;
+  int64_t num_splits_ = 1;
+  size_t workspace_floats_ = 0;
 
-  DeviceBuffer query_, key_, value_, value_rot_half_, value_rot_fp32_;
-  DeviceBuffer slots_, pi_signs_, h16_, write_tables_;
-  DeviceBuffer tq4_key_cache_, tq4_value_cache_, scale_plane_;
+  tqh::ReshapeAndCacheGrid context_write_grid_;
+  tqh::ReshapeAndCacheGrid chunk_write_grid_;
+  tqh::PagedAttentionGrid aiv_grid_;
+  tqh::CubeDecodeGrid cube_grid_;
+
+  DeviceBuffer key_ctx_, value_ctx_, key_ctx_rot_, value_ctx_rot_;
+  DeviceBuffer key_chunk_, value_chunk_;
+  DeviceBuffer query_pf_, query_pf_rot_half_, query_pf_rot_fp32_;
+  DeviceBuffer out_pf_tq_, out_pf_v5_, out_pf_rot_, lse_pf_tq_, lse_pf_v5_;
+  DeviceBuffer query_dec_, query_dec_rot_;
+  DeviceBuffer out_dec_tq_, out_dec_v5_, out_dec_rot_, lse_dec_;
+  DeviceBuffer slots_full_, slots_chunk_, block_tables_, context_lens_;
+  DeviceBuffer pi_signs_, h16_, rot_tables_, write_tables_, decode_tables_;
+  DeviceBuffer key_cache_, value_cache_, scale_plane_, workspace_;
   DeviceBuffer fp16_key_cache_, fp16_value_cache_;
-  DeviceBuffer mask_, out_, out_rot_, lse_, lse_rot_;
+  DeviceBuffer mask_;
 
-  std::unique_ptr<AclnnTensor> query_tnd_, key_tnd_, value_tnd_, value_rot_tnd_, mask_tensor_;
-  std::unique_ptr<AclnnTensor> out_tensor_, out_rot_tensor_, lse_tensor_, lse_rot_tensor_;
-  std::unique_ptr<AclnnTensor> slots_tensor_, fp16_key_cache_tensor_, fp16_value_cache_tensor_;
-  std::unique_ptr<AclnnTensorList> key_list_, value_list_, value_rot_list_;
-  std::unique_ptr<AclnnIntArray> seq_lens_;
+  std::unique_ptr<AclnnTensor> query_pf_tnd_, query_pf_rot_tnd_;
+  std::unique_ptr<AclnnTensor> key_ctx_tnd_, value_ctx_tnd_, key_ctx_rot_tnd_, value_ctx_rot_tnd_;
+  std::unique_ptr<AclnnTensor> mask_tensor_, out_pf_tq_tensor_, out_pf_v5_tensor_;
+  std::unique_ptr<AclnnTensor> lse_pf_tq_tensor_, lse_pf_v5_tensor_;
+  std::unique_ptr<AclnnTensor> query_dec_tnd_, out_dec_v5_tensor_, lse_dec_tensor_;
+  std::unique_ptr<AclnnTensor> fp16_key_flat_, fp16_value_flat_, block_table_tensor_;
+  std::unique_ptr<AclnnTensor> key_chunk_tensor_, value_chunk_tensor_, slots_chunk_tensor_;
+  std::unique_ptr<AclnnTensor> fp16_key_cache_tensor_, fp16_value_cache_tensor_;
+  std::unique_ptr<AclnnTensorList> key_ctx_list_, value_ctx_list_, key_ctx_rot_list_, value_ctx_rot_list_;
+  std::unique_ptr<AclnnTensorList> fp16_key_list_, fp16_value_list_;
+  std::unique_ptr<AclnnIntArray> prefill_seq_q_, prefill_seq_kv_, decode_seq_q_, decode_seq_kv_;
 
-  std::string fia_op_, fia_note_, fp16_write_note_;
-  // Last, so destroyed first.
-  std::unique_ptr<PlannedOp> fia_, fia_rot_, fp16_write_;
+  std::string fia_operator_;
+  std::string fia_note_;
+  std::string native_write_note_;
+  // Last, so destroyed first: a PlannedOp holds the descriptor handles above.
+  std::unique_ptr<PlannedOp> fia_prefill_rotated_, fia_prefill_native_, fia_decode_native_, native_write_;
 };
 
-// --- reporting ---------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Runners, one per iteration budget
+// ---------------------------------------------------------------------------
+
+class RunnerSet {
+ public:
+  RunnerSet(BenchmarkRunner& primary, const std::vector<Budget>& budgets) : primary_(&primary) {
+    if (budgets.empty()) {
+      budgets_.push_back(Budget{kShortWarmup, kShortIterations});
+    } else {
+      budgets_ = budgets;
+    }
+    // The first budget goes on the runner the harness owns and will report; the
+    // rest each get one of their own. Setting options before any case has run is
+    // what keeps every table header describing the rows under it.
+    BenchmarkOptions options = Options(primary.options(), budgets_.front());
+    primary.set_options(options);
+    runners_.push_back(&primary);
+    for (size_t index = 1; index < budgets_.size(); ++index) {
+      std::ostringstream name;
+      name << kSuiteName << " -- warmup " << budgets_[index].warmup << ", " << budgets_[index].iterations
+           << " iterations";
+      owned_.emplace_back(new BenchmarkRunner(name.str(), Options(primary.options(), budgets_[index]),
+                                              primary.stream()));
+      runners_.push_back(owned_.back().get());
+    }
+  }
+
+  BenchmarkRunner& For(const Budget& budget) const {
+    for (size_t index = 0; index < budgets_.size(); ++index) {
+      if (budgets_[index] == budget) {
+        return *runners_[index];
+      }
+    }
+    return *primary_;
+  }
+
+  const std::vector<BenchmarkRunner*>& all() const { return runners_; }
+
+  // A failure recorded anywhere has to reach the runner the harness reads the
+  // exit code from.
+  void Fail(const std::string& name, const std::string& why) const { primary_->RecordFailure(name, why); }
+
+  // The same, for a failure already recorded against `runner` so that it shows
+  // up in that runner's own report. Mirrored into the primary only when `runner`
+  // is not the primary, so a failure is never counted twice.
+  void MirrorFail(const BenchmarkRunner& runner, const std::string& name, const std::string& why) const {
+    if (&runner != primary_) {
+      primary_->RecordFailure(name, why);
+    }
+  }
+
+  // Everything but the primary, which the harness reports for us after
+  // BuildSuite returns.
+  void ReportExtras() const {
+    for (const std::unique_ptr<BenchmarkRunner>& runner : owned_) {
+      runner->Report();
+    }
+  }
+
+ private:
+  static BenchmarkOptions Options(const BenchmarkOptions& base, const Budget& budget) {
+    BenchmarkOptions options = base;
+    options.warmup_iterations = budget.warmup;
+    options.timed_iterations = budget.iterations;
+    options.pipeline_batch = kPipelineBatch;
+    return options;
+  }
+
+  BenchmarkRunner* primary_;
+  std::vector<Budget> budgets_;
+  std::vector<std::unique_ptr<BenchmarkRunner>> owned_;
+  std::vector<BenchmarkRunner*> runners_;
+};
+
+// ---------------------------------------------------------------------------
+// Reading the results back
+// ---------------------------------------------------------------------------
 
 struct Sample {
   bool present = false;
+  // True for a figure that is true by construction rather than measured: a
+  // folded layer's T_rot_o. Printed as a number, flagged in the CSV.
+  bool structural_zero = false;
   double median_us = 0.0;
+  double p95_us = 0.0;
   double gigabytes_per_second = 0.0;
   double tflops = 0.0;
   const char* mode = "-";
 };
 
-// Device time: the device-events mode when it ran, pipelined otherwise.
-Sample SampleFor(const BenchmarkRunner& runner, const char* leg, const Shape& shape) {
+const BenchmarkResult* FindResult(const std::vector<BenchmarkRunner*>& runners, const std::string& name,
+                                  TimingMode mode) {
+  for (const BenchmarkRunner* runner : runners) {
+    for (const BenchmarkResult& result : runner->results()) {
+      if (result.case_name == name && result.mode == mode) {
+        return &result;
+      }
+    }
+  }
+  return nullptr;
+}
+
+// Device time: the device-events mode when it ran, the pipelined one otherwise.
+// Both are ACL event pairs; the host wall clock is never used for a reported
+// figure, only as a cross-check in the raw table.
+Sample SampleFor(const std::vector<BenchmarkRunner*>& runners, const char* leg, const Config& config) {
   Sample sample;
-  const std::string name = CaseName(leg, shape);
+  const std::string name = CaseName(leg, config);
   for (const TimingMode mode : {TimingMode::kDeviceEvents, TimingMode::kPipelined}) {
-    const BenchmarkResult* result = FindResult(runner, name, mode);
+    const BenchmarkResult* result = FindResult(runners, name, mode);
     if (result != nullptr && result->latency.median_us > 0.0) {
       sample.present = true;
       sample.median_us = result->latency.median_us;
+      sample.p95_us = result->latency.p95_us;
       sample.gigabytes_per_second = result->gigabytes_per_second();
       sample.tflops = result->tflops();
       sample.mode = TimingModeLabel(mode);
@@ -1746,601 +1607,851 @@ Sample SampleFor(const BenchmarkRunner& runner, const char* leg, const Shape& sh
   return sample;
 }
 
-double Ratio(const Sample& numerator, const Sample& denominator) {
-  return numerator.present && denominator.present && denominator.median_us > 0.0
-             ? numerator.median_us / denominator.median_us
-             : 0.0;
+Sample StructuralZero() {
+  Sample sample;
+  sample.present = true;
+  sample.structural_zero = true;
+  sample.mode = "folded";
+  return sample;
 }
 
-void PrintCompression(const std::vector<Shape>& sweep) {
-  std::printf("\n[ascend-bench] prefill KV-cache footprint per token (layout arithmetic, both K and V)\n");
-  std::printf("  %4s %4s  %12s %12s %12s  %9s %9s\n", "D", "H_KV", "fp16 B", "tq4 B", "kv8 B", "fp16/tq4",
-              "fp16/kv8");
-  std::vector<std::pair<int64_t, int64_t>> printed;
-  for (const Shape& shape : sweep) {
-    const std::pair<int64_t, int64_t> key(shape.head_size, shape.num_kv_heads);
-    if (std::find(printed.begin(), printed.end(), key) != printed.end()) {
-      continue;
-    }
-    printed.push_back(key);
-    Shape one = shape;
-    one.batch = 1;
-    one.seq_len = 1;
-    const Traffic traffic = ModelTraffic(one);
-    std::printf("  %4lld %4lld  %12.0f %12.0f %12.0f  %8.2fx %8.2fx\n", static_cast<long long>(shape.head_size),
-                static_cast<long long>(shape.num_kv_heads), traffic.fp16_kv, traffic.tq4_kv, traffic.kv8_kv,
-                traffic.tq4_ratio(), traffic.kv8_ratio());
+// T_rot_o: exactly zero for a folded layer, measured otherwise.
+Sample RotateOutputSample(const std::vector<BenchmarkRunner*>& runners, const char* leg, const Config& config) {
+  return config.model.folds_output ? StructuralZero() : SampleFor(runners, leg, config);
+}
+
+double Speedup(const Sample& baseline, const Sample& candidate) {
+  if (!baseline.present || !candidate.present || candidate.median_us <= 0.0) {
+    return 0.0;
   }
-  std::printf("[ascend-bench]   tq4 is the shipping 4-bit layout: D/2 packed bytes per vector plus a scale plane of\n"
-              "[ascend-bench]   round_up(2 * H_KV, 8) fp32 per token, whose burst padding is why H_KV = 1 and 2 pay\n"
-              "[ascend-bench]   more per head. kv8 is the same scale plane with a byte per coordinate. There is NO\n"
-              "[ascend-bench]   8-bit TurboQuant kernel; that column is arithmetic, not a measurement.\n");
+  return baseline.median_us / candidate.median_us;
 }
 
-void WriteCompareCsv(const BenchmarkRunner& runner, const std::vector<Shape>& sweep, const std::string& path,
-                     const std::string& fia_operator) {
-  std::ofstream csv(path, std::ios::trunc);
-  if (!csv) {
-    std::printf("[ascend-bench] could not open ASCEND_BENCH_TQ_PREFILL_COMPARE_CSV='%s' for writing\n",
-                path.c_str());
+void PrintUs(const Sample& sample, int width) {
+  if (sample.present) {
+    std::printf(" %*.2f", width, sample.median_us);
+  } else {
+    std::printf(" %*s", width, "-");
+  }
+}
+
+// The AIV split figure is the measured core minus the measured combine, and is
+// marked so no reader takes it for a direct measurement.
+void PrintUsDerived(const Sample& sample, int width, bool derived) {
+  if (!sample.present) {
+    std::printf(" %*s ", width, "-");
     return;
   }
-  csv << "batch,seq_len,head_dim,num_heads,num_kv_heads,family,fia_operator";
-  for (const char* leg : kAllLegs) {
-    csv << ',' << leg << "_us," << leg << "_gbps";
-  }
-  csv << ",fia_tflops,tq4_pipeline_over_fp16,tq4_folded_over_fp16,fp16_kv_bytes,tq4_kv_bytes,kv8_kv_bytes,"
-      << "fp16_over_tq4,fp16_over_kv8\n";
-  for (const Shape& shape : sweep) {
-    const Traffic traffic = ModelTraffic(shape);
-    csv << shape.batch << ',' << shape.seq_len << ',' << shape.head_size << ',' << shape.num_heads << ','
-        << shape.num_kv_heads << ',' << Family(shape) << ',' << fia_operator;
-    for (const char* leg : kAllLegs) {
-      const Sample sample = SampleFor(runner, leg, shape);
-      csv << ',';
-      if (sample.present) {
-        csv << sample.median_us;
-      }
-      csv << ',';
-      if (sample.present) {
-        csv << sample.gigabytes_per_second;
-      }
-    }
-    const Sample fia = SampleFor(runner, kLegFia, shape);
-    const Sample fp16 = SampleFor(runner, kLegFp16Pipeline, shape);
-    const double ratios[] = {Ratio(SampleFor(runner, kLegTq4Pipeline, shape), fp16),
-                             Ratio(SampleFor(runner, kLegTq4FoldedPipeline, shape), fp16)};
-    csv << ',';
-    if (fia.present) {
-      csv << fia.tflops;
-    }
-    for (const double ratio : ratios) {
-      csv << ',';
-      if (ratio > 0.0) {
-        csv << ratio;
-      }
-    }
-    csv << ',' << traffic.fp16_kv << ',' << traffic.tq4_kv << ',' << traffic.kv8_kv << ',' << traffic.tq4_ratio()
-        << ',' << traffic.kv8_ratio() << '\n';
-  }
-  std::printf("[ascend-bench] prefill comparison CSV written to %s\n", path.c_str());
+  std::printf(" %*.2f%c", width, sample.median_us, derived ? '~' : ' ');
 }
 
-void PrintSummary(const BenchmarkRunner& runner, const std::vector<Shape>& sweep, const std::string& fia_operator) {
-  std::printf("\n[ascend-bench] TurboQuant prefill summary: device time from ACL events, median us (stock operator: "
-              "%s)\n",
+void PrintRatio(double ratio, int width) {
+  if (ratio > 0.0) {
+    std::printf(" %*.3fx", width - 1, ratio);
+  } else {
+    std::printf(" %*s", width, "-");
+  }
+}
+
+// Prints a column header and a rule of exactly its own width underneath. The
+// width comes from the snprintf that built the header rather than from a sum of
+// the field widths restated here, so the two cannot drift as columns move.
+void PrintHeaderAndRule(const char* header, int width) {
+  std::printf("%s\n", header);
+  const size_t indent = 2;
+  const size_t rule = width > static_cast<int>(indent) ? static_cast<size_t>(width) - indent : 0;
+  std::printf("  %s\n", std::string(rule, '-').c_str());
+}
+
+void PrintDouble(double value, int width, int precision) {
+  if (value > 0.0) {
+    std::printf(" %*.*f", width, precision, value);
+  } else {
+    std::printf(" %*s", width, "-");
+  }
+}
+
+// One configuration's worth of derived figures, computed once so the table and
+// the CSV cannot disagree about them.
+struct PrefillRow {
+  Sample ingest, rot_q, attn_core, rot_o, e2e, native, native_ingest;
+  double sum_of_parts_us = 0.0;
+  double speedup = 0.0;
+  double gigabytes_per_second = 0.0;
+};
+
+struct DecodeRow {
+  Sample rot_q, split, combine, attn_core, rot_o, e2e, native;
+  bool split_is_derived = false;
+  double sum_of_parts_us = 0.0;
+  double speedup = 0.0;
+  double gigabytes_per_second = 0.0;
+};
+
+PrefillRow ReadPrefillRow(const std::vector<BenchmarkRunner*>& runners, const Config& config,
+                          const Traffic& traffic) {
+  PrefillRow row;
+  row.ingest = SampleFor(runners, kLegPfIngest, config);
+  row.rot_q = SampleFor(runners, kLegPfRotQ, config);
+  row.attn_core = SampleFor(runners, kLegPfAttnCore, config);
+  row.rot_o = RotateOutputSample(runners, kLegPfRotO, config);
+  row.e2e = SampleFor(runners, kLegPfE2E, config);
+  row.native = SampleFor(runners, kLegPfV5, config);
+  row.native_ingest = SampleFor(runners, kLegPfV5Ingest, config);
+  row.sum_of_parts_us = (row.rot_q.present ? row.rot_q.median_us : 0.0) +
+                        (row.attn_core.present ? row.attn_core.median_us : 0.0) +
+                        (row.rot_o.present ? row.rot_o.median_us : 0.0);
+  row.speedup = Speedup(row.native, row.e2e);
+  if (row.e2e.present && row.e2e.median_us > 0.0) {
+    row.gigabytes_per_second = traffic.pf_e2e / (row.e2e.median_us * 1.0e3);
+  }
+  return row;
+}
+
+DecodeRow ReadDecodeRow(const std::vector<BenchmarkRunner*>& runners, const Config& config,
+                        const Traffic& traffic) {
+  DecodeRow row;
+  row.rot_q = SampleFor(runners, kLegDecRotQ, config);
+  row.combine = SampleFor(runners, kLegDecCombine, config);
+  row.attn_core = SampleFor(runners, kLegDecAttnCore, config);
+  row.rot_o = RotateOutputSample(runners, kLegDecRotO, config);
+  row.e2e = SampleFor(runners, kLegDecE2E, config);
+  row.native = SampleFor(runners, kLegDecV5, config);
+
+  if (config.path == PathMode::kCube) {
+    row.split = SampleFor(runners, kLegDecSplit, config);
+  } else if (row.attn_core.present && row.combine.present) {
+    // No exported entry point for the AIV split alone; see THE DECODE PATH.
+    row.split.present = true;
+    row.split.median_us = std::max(0.0, row.attn_core.median_us - row.combine.median_us);
+    row.split.mode = row.attn_core.mode;
+    row.split_is_derived = true;
+  }
+
+  row.sum_of_parts_us = (row.rot_q.present ? row.rot_q.median_us : 0.0) +
+                        (row.attn_core.present ? row.attn_core.median_us : 0.0) +
+                        (row.rot_o.present ? row.rot_o.median_us : 0.0);
+  row.speedup = Speedup(row.native, row.e2e);
+  if (row.e2e.present && row.e2e.median_us > 0.0) {
+    row.gigabytes_per_second = traffic.dec_e2e / (row.e2e.median_us * 1.0e3);
+  }
+  return row;
+}
+
+// Median relative gap between the composite E2E measurement and the sum of its
+// separately measured parts, over the rows that produced both. Reported rather
+// than hidden: it is the launch overhead the component view cannot see.
+double MedianResidual(const std::vector<double>& residuals) {
+  if (residuals.empty()) {
+    return 0.0;
+  }
+  std::vector<double> sorted = residuals;
+  std::sort(sorted.begin(), sorted.end());
+  return sorted[sorted.size() / 2];
+}
+
+// ---------------------------------------------------------------------------
+// Table A -- prefill
+// ---------------------------------------------------------------------------
+
+void PrintTableA(const std::vector<BenchmarkRunner*>& runners, const std::vector<Config>& sweep,
+                 const std::vector<Traffic>& traffic, const std::string& fia_operator) {
+  std::printf("\n");
+  std::printf("[ascend-bench] ====================================================================\n");
+  std::printf("[ascend-bench] TABLE A -- PREFILL PIPELINE PERFORMANCE\n");
+  std::printf("[ascend-bench] ====================================================================\n");
+  std::printf("[ascend-bench] device time from ACL events, median us per step; native operator: %s\n",
               fia_operator.c_str());
-  std::printf("  %2s %5s %4s %4s %3s %-7s | %10s %10s %10s %11s | %11s %11s %11s | %7s %7s | %8s %8s %8s\n", "B",
-              "S", "D", "H_Q", "KV", "family", "tq4 write", "rotate V", "fp16 write", "fia v5", "fp16 pipe",
-              "tq4 pipe", "tq4 folded", "tq4/fp", "fold/fp", "fia GB/s", "tq4 GB/s", "fia TF/s");
+  std::printf("[ascend-bench] TQ_E2E = T_rot_q + T_attn_core + T_rot_o, measured as ONE composite region\n");
+  std::printf("[ascend-bench] Context S/C means a chunked step: C query tokens against an S-token prefix\n\n");
+
+  char header[512];
+  const int header_width =
+      std::snprintf(header, sizeof(header), "  %-17s %13s %3s %9s %4s | %11s %10s %12s %10s %11s %11s | %8s %10s %12s",
+                    "Model", "Context (S)", "B", "H_Q/H_KV", "D", "TQ Ingest", "T_rot_q", "T_attn_core", "T_rot_o",
+                    "TQ_E2E", "V5_Native", "Speedup", "HBM GB/s", "KV Saved MB");
+  PrintHeaderAndRule(header, header_width);
+
   bool any = false;
-  for (const Shape& shape : sweep) {
-    const Sample samples[] = {SampleFor(runner, kLegTq4Write, shape),     SampleFor(runner, kLegRotateValue, shape),
-                              SampleFor(runner, kLegFp16Write, shape),    SampleFor(runner, kLegFia, shape),
-                              SampleFor(runner, kLegFp16Pipeline, shape), SampleFor(runner, kLegTq4Pipeline, shape),
-                              SampleFor(runner, kLegTq4FoldedPipeline, shape)};
-    bool row = false;
-    for (const Sample& sample : samples) {
-      row = row || sample.present;
-    }
-    if (!row) {
+  std::vector<double> residuals;
+  for (size_t index = 0; index < sweep.size(); ++index) {
+    const Config& config = sweep[index];
+    const PrefillRow row = ReadPrefillRow(runners, config, traffic[index]);
+    if (!row.ingest.present && !row.rot_q.present && !row.attn_core.present && !row.e2e.present &&
+        !row.native.present) {
       continue;
     }
     any = true;
-    std::printf("  %2lld %5lld %4lld %4lld %3lld %-7s |", static_cast<long long>(shape.batch),
-                static_cast<long long>(shape.seq_len), static_cast<long long>(shape.head_size),
-                static_cast<long long>(shape.num_heads), static_cast<long long>(shape.num_kv_heads), Family(shape));
-    const int widths[] = {10, 10, 10, 11, 11, 11, 11};
-    for (size_t leg = 0; leg < sizeof(samples) / sizeof(samples[0]); ++leg) {
-      if (samples[leg].present) {
-        std::printf(" %*.1f", widths[leg], samples[leg].median_us);
-      } else {
-        std::printf(" %*s", widths[leg], "-");
-      }
-      if (leg == 3) {
-        std::printf(" |");
-      }
-    }
+    std::ostringstream heads;
+    heads << config.model.num_heads << '/' << config.model.num_kv_heads;
+    std::printf("  %-17s %13s %3lld %9s %4lld |", config.model.label, config.context_label().c_str(),
+                static_cast<long long>(config.batch), heads.str().c_str(),
+                static_cast<long long>(config.model.head_size));
+    PrintUs(row.ingest, 11);
+    PrintUs(row.rot_q, 10);
+    PrintUs(row.attn_core, 12);
+    PrintUs(row.rot_o, 10);
+    PrintUs(row.e2e, 11);
+    PrintUs(row.native, 11);
     std::printf(" |");
-    for (const double ratio : {Ratio(samples[5], samples[4]), Ratio(samples[6], samples[4])}) {
-      if (ratio > 0.0) {
-        std::printf(" %6.3fx", ratio);
-      } else {
-        std::printf(" %7s", "-");
-      }
-    }
-    std::printf(" |");
-    for (const double value : {samples[3].gigabytes_per_second, samples[5].gigabytes_per_second, samples[3].tflops}) {
-      if (value > 0.0) {
-        std::printf(" %8.2f", value);
-      } else {
-        std::printf(" %8s", "-");
-      }
-    }
+    PrintRatio(row.speedup, 8);
+    PrintDouble(row.gigabytes_per_second, 10, 1);
+    PrintDouble(traffic[index].saved_mib(), 12, 1);
     std::printf("\n");
+
+    if (row.e2e.present && row.sum_of_parts_us > 0.0) {
+      residuals.push_back(std::fabs(row.e2e.median_us - row.sum_of_parts_us) / row.e2e.median_us);
+    }
   }
   if (!any) {
-    std::printf("  (no prefill case produced a sample)\n");
+    std::printf("  (no prefill configuration produced a sample)\n");
   }
-  std::printf("[ascend-bench]   tq4/fp and fold/fp are pipeline latency over the fp16 pipeline: above 1 is what the\n"
-              "[ascend-bench]   4-bit cache costs a prefill, since both pipelines run the same fp16 attention and differ\n"
-              "[ascend-bench]   in the write (and, folded, the rotation of V). The saving is in the cache footprint\n"
-              "[ascend-bench]   below and in the decode suite, not here. GB/s is each leg's traffic model over its own\n"
-              "[ascend-bench]   time; the folded pipeline's fp32 -> fp16 cast of V~ is not in any column.\n");
-  PrintCompression(sweep);
-  std::fflush(stdout);
 
-  const char* path = std::getenv("ASCEND_BENCH_TQ_PREFILL_COMPARE_CSV");
-  if (path != nullptr && *path != '\0') {
-    WriteCompareCsv(runner, sweep, path, fia_operator);
+  std::printf("\n[ascend-bench]   Speedup is V5_Native / TQ_E2E: above 1.000x is TurboQuant ahead. TQ Ingest is\n"
+              "[ascend-bench]   reported beside the pipeline and is NOT inside TQ_E2E, matching the accounting\n"
+              "[ascend-bench]   this audit was specified with; the native operator's own cache write is timed as\n"
+              "[ascend-bench]   pf_v5_ingest and carried in the CSV, so neither side hides a write.\n");
+  std::printf("[ascend-bench]   T_rot_o = 0.00 on a folded layer is exact, not missing: W_o' = W_o (I (x) Pi)\n"
+              "[ascend-bench]   absorbs the de-rotation offline. Qwen3.5 cannot fold -- attn_output_gate sits\n"
+              "[ascend-bench]   between attention and o_proj -- so its column is a measured kernel.\n");
+  std::printf("[ascend-bench]   HBM GB/s is the pipeline's compulsory traffic over its measured composite time.\n"
+              "[ascend-bench]   KV Saved MB is the whole batch's context: fp16 residency minus TurboQuant's.\n");
+  if (!residuals.empty()) {
+    std::printf("[ascend-bench]   composite vs sum-of-parts: median gap %.1f%% over %zu rows. That gap is the\n"
+                "[ascend-bench]   launch overhead between stages, which the per-component columns cannot show.\n",
+                100.0 * MedianResidual(residuals), residuals.size());
+  }
+  std::printf("[ascend-bench]   NOT TIMED: the fp32 -> fp16 narrowing between npu_turboquant_rotate_q and FIA.\n"
+              "[ascend-bench]   See WHAT IS STILL NOT PRICED in this file's header; its modelled byte cost is in\n"
+              "[ascend-bench]   the CSV as untimed_cast_bytes.\n");
+  std::fflush(stdout);
+}
+
+// ---------------------------------------------------------------------------
+// Table B -- decode
+// ---------------------------------------------------------------------------
+
+void PrintTableB(const std::vector<BenchmarkRunner*>& runners, const std::vector<Config>& sweep,
+                 const std::vector<Traffic>& traffic, const std::string& fia_operator) {
+  std::printf("\n");
+  std::printf("[ascend-bench] ====================================================================\n");
+  std::printf("[ascend-bench] TABLE B -- DECODE LATENCY BREAKDOWN\n");
+  std::printf("[ascend-bench] ====================================================================\n");
+  std::printf("[ascend-bench] device time from ACL events, median us per decode step; native operator: %s\n",
+              fia_operator.c_str());
+  std::printf("[ascend-bench] one decode token per sequence; B is the batch of sequences\n\n");
+
+  char header[512];
+  const int header_width =
+      std::snprintf(header, sizeof(header), "  %-17s %9s %3s %5s | %10s %14s %11s %10s %11s %11s | %8s %10s %12s",
+                    "Model", "Context", "B", "Path", "T_rot_q", "T_DecodeSplit", "T_Combine", "T_rot_o", "TQ_E2E",
+                    "V5_Decode", "Speedup", "Eff GB/s", "Compression");
+  PrintHeaderAndRule(header, header_width);
+
+  bool any = false;
+  bool any_derived = false;
+  std::vector<double> residuals;
+  for (size_t index = 0; index < sweep.size(); ++index) {
+    const Config& config = sweep[index];
+    const DecodeRow row = ReadDecodeRow(runners, config, traffic[index]);
+    if (!row.rot_q.present && !row.attn_core.present && !row.e2e.present && !row.native.present) {
+      continue;
+    }
+    any = true;
+    any_derived = any_derived || row.split_is_derived;
+    std::printf("  %-17s %9lld %3lld %5s |", config.model.label, static_cast<long long>(config.seq_len),
+                static_cast<long long>(config.batch), PathLabel(config.path));
+    PrintUs(row.rot_q, 10);
+    PrintUsDerived(row.split, 13, row.split_is_derived);
+    PrintUs(row.combine, 11);
+    PrintUs(row.rot_o, 10);
+    PrintUs(row.e2e, 11);
+    PrintUs(row.native, 11);
+    std::printf(" |");
+    PrintRatio(row.speedup, 8);
+    PrintDouble(row.gigabytes_per_second, 10, 1);
+    PrintDouble(traffic[index].compression_ratio(), 12, 3);
+    std::printf("\n");
+
+    if (row.e2e.present && row.sum_of_parts_us > 0.0) {
+      residuals.push_back(std::fabs(row.e2e.median_us - row.sum_of_parts_us) / row.e2e.median_us);
+    }
+  }
+  if (!any) {
+    std::printf("  (no decode configuration produced a sample)\n");
+  }
+
+  std::printf("\n[ascend-bench]   Speedup is V5_Decode / TQ_E2E: above 1.000x is TurboQuant ahead. TQ_E2E is one\n"
+              "[ascend-bench]   composite ACL-event region over rotate-q, the attention core and (unfolded only)\n"
+              "[ascend-bench]   rotate-o; T_DecodeSplit + T_Combine are the core's two stages.\n");
+  if (any_derived) {
+    std::printf("[ascend-bench]   `~` marks a DERIVED split: the AIV path submits both stages through one\n"
+                "[ascend-bench]   launcher and exports no split-only entry point, so that column is the measured\n"
+                "[ascend-bench]   core minus the measured combine. The Cube path's split is measured directly.\n");
+  }
+  std::printf("[ascend-bench]   Path is chosen by the GQA group and not by a flag: H_Q/H_KV >= %lld fills the\n"
+              "[ascend-bench]   Cube's M fractal and takes the Cube split, anything narrower takes the vector\n"
+              "[ascend-bench]   path. ASCEND_BENCH_TQ_AUDIT_PATH overrides it.\n",
+              static_cast<long long>(tqh::kCubeTileM));
+  std::printf("[ascend-bench]   Eff GB/s is the step's compulsory traffic over its measured composite time.\n"
+              "[ascend-bench]   Compression is fp16 KV residency over TurboQuant's, scale plane included -- at\n"
+              "[ascend-bench]   H_KV=1 the scale plane's 32-byte burst floor is most of the gap from 4.00x.\n");
+  if (!residuals.empty()) {
+    std::printf("[ascend-bench]   composite vs sum-of-parts: median gap %.1f%% over %zu rows.\n",
+                100.0 * MedianResidual(residuals), residuals.size());
+  }
+  std::fflush(stdout);
+}
+
+// ---------------------------------------------------------------------------
+// CSVs
+// ---------------------------------------------------------------------------
+
+// An absent leg leaves its fields EMPTY rather than writing 0: a zero latency in
+// a spreadsheet is indistinguishable from a measurement, and a CSV is the
+// artifact most likely to be read without its banner. A structural zero -- a
+// folded layer's T_rot_o -- is written as 0 and flagged in its own column.
+void WriteCell(std::ofstream& csv, const Sample& sample) {
+  csv << ',';
+  if (sample.present) {
+    csv << sample.median_us;
   }
 }
 
-// FIA over V~ un-rotated on the host must be FIA over V: the fold identity at
-// the attention output, on the device, before anything is timed.
-double FoldedBasisCosine(const Scenario& scenario, const Shape& shape, aclrtStream stream) {
-  scenario.EnqueueFia(stream);
-  scenario.EnqueueFiaRotated(stream);
+void WritePrefillCsv(const std::vector<BenchmarkRunner*>& runners, const std::vector<Config>& sweep,
+                     const std::vector<Traffic>& traffic, const std::string& path,
+                     const std::string& fia_operator) {
+  std::ofstream csv(path, std::ios::trunc);
+  if (!csv) {
+    std::printf("[ascend-bench] could not open ASCEND_BENCH_TQ_AUDIT_PREFILL_CSV='%s' for writing\n",
+                path.c_str());
+    return;
+  }
+  csv << "model,regime,seq_len,chunk_tokens,batch,num_heads,num_kv_heads,head_dim,path,native_operator,"
+      << "tq_ingest_us,t_rot_q_us,t_attn_core_us,t_rot_o_us,rot_o_is_structural_zero,"
+      << "tq_e2e_us,tq_e2e_sum_of_parts_us,tq_e2e_with_ingest_us,"
+      << "v5_native_us,v5_native_ingest_us,net_speedup,net_speedup_with_ingest,"
+      << "hbm_gbps,attn_core_gbps,v5_gbps,attn_core_tflops,v5_tflops,"
+      << "fp16_kv_bytes,tq_kv_bytes,kv_saved_mib,compression_ratio,"
+      << "e2e_bytes,attention_flops,untimed_cast_bytes,warmup,iterations,timing_mode\n";
+
+  for (size_t index = 0; index < sweep.size(); ++index) {
+    const Config& config = sweep[index];
+    const Traffic& model = traffic[index];
+    const PrefillRow row = ReadPrefillRow(runners, config, model);
+
+    csv << config.model.key << ',' << config.regime << ',' << config.seq_len << ',' << config.chunk << ','
+        << config.batch << ',' << config.model.num_heads << ',' << config.model.num_kv_heads << ','
+        << config.model.head_size << ',' << PathLabel(config.path) << ',' << fia_operator;
+    WriteCell(csv, row.ingest);
+    WriteCell(csv, row.rot_q);
+    WriteCell(csv, row.attn_core);
+    WriteCell(csv, row.rot_o);
+    csv << ',' << (row.rot_o.structural_zero ? 1 : 0);
+    WriteCell(csv, row.e2e);
+    csv << ',';
+    if (row.sum_of_parts_us > 0.0) {
+      csv << row.sum_of_parts_us;
+    }
+    csv << ',';
+    if (row.e2e.present && row.ingest.present) {
+      csv << row.e2e.median_us + row.ingest.median_us;
+    }
+    WriteCell(csv, row.native);
+    WriteCell(csv, row.native_ingest);
+    csv << ',';
+    if (row.speedup > 0.0) {
+      csv << row.speedup;
+    }
+    csv << ',';
+    if (row.e2e.present && row.ingest.present && row.native.present && row.native_ingest.present) {
+      const double tq = row.e2e.median_us + row.ingest.median_us;
+      if (tq > 0.0) {
+        csv << (row.native.median_us + row.native_ingest.median_us) / tq;
+      }
+    }
+    csv << ',';
+    if (row.gigabytes_per_second > 0.0) {
+      csv << row.gigabytes_per_second;
+    }
+    csv << ',';
+    if (row.attn_core.present) {
+      csv << row.attn_core.gigabytes_per_second;
+    }
+    csv << ',';
+    if (row.native.present) {
+      csv << row.native.gigabytes_per_second;
+    }
+    csv << ',';
+    if (row.attn_core.present) {
+      csv << row.attn_core.tflops;
+    }
+    csv << ',';
+    if (row.native.present) {
+      csv << row.native.tflops;
+    }
+    csv << ',' << model.fp16_kv_bytes << ',' << model.tq_kv_bytes << ',' << model.saved_mib() << ','
+        << model.compression_ratio() << ',' << model.pf_e2e << ',' << model.pf_flops << ','
+        << model.pf_untimed_cast << ',' << config.budget.warmup << ',' << config.budget.iterations << ','
+        << row.e2e.mode << '\n';
+  }
+  std::printf("[ascend-bench] Table A written to %s\n", path.c_str());
+}
+
+void WriteDecodeCsv(const std::vector<BenchmarkRunner*>& runners, const std::vector<Config>& sweep,
+                    const std::vector<Traffic>& traffic, const std::string& path,
+                    const std::string& fia_operator) {
+  std::ofstream csv(path, std::ios::trunc);
+  if (!csv) {
+    std::printf("[ascend-bench] could not open ASCEND_BENCH_TQ_AUDIT_DECODE_CSV='%s' for writing\n", path.c_str());
+    return;
+  }
+  csv << "model,regime,seq_len,batch,num_heads,num_kv_heads,head_dim,path,num_splits,native_operator,"
+      << "t_rot_q_us,t_decode_split_us,split_is_derived,t_combine_us,t_rot_o_us,rot_o_is_structural_zero,"
+      << "tq_e2e_us,tq_e2e_sum_of_parts_us,v5_decode_us,net_speedup,"
+      << "effective_gbps,attn_core_gbps,v5_gbps,attn_core_tflops,v5_tflops,"
+      << "fp16_kv_bytes,tq_kv_bytes,kv_saved_mib,compression_ratio,"
+      << "e2e_bytes,attention_flops,tq_e2e_p95_us,v5_p95_us,warmup,iterations,timing_mode\n";
+
+  for (size_t index = 0; index < sweep.size(); ++index) {
+    const Config& config = sweep[index];
+    const Traffic& model = traffic[index];
+    const DecodeRow row = ReadDecodeRow(runners, config, model);
+
+    csv << config.model.key << ',' << config.regime << ',' << config.seq_len << ',' << config.batch << ','
+        << config.model.num_heads << ',' << config.model.num_kv_heads << ',' << config.model.head_size << ','
+        << PathLabel(config.path) << ',' << model.dec_split_count << ',' << fia_operator;
+    WriteCell(csv, row.rot_q);
+    WriteCell(csv, row.split);
+    csv << ',' << (row.split_is_derived ? 1 : 0);
+    WriteCell(csv, row.combine);
+    WriteCell(csv, row.rot_o);
+    csv << ',' << (row.rot_o.structural_zero ? 1 : 0);
+    WriteCell(csv, row.e2e);
+    csv << ',';
+    if (row.sum_of_parts_us > 0.0) {
+      csv << row.sum_of_parts_us;
+    }
+    WriteCell(csv, row.native);
+    csv << ',';
+    if (row.speedup > 0.0) {
+      csv << row.speedup;
+    }
+    csv << ',';
+    if (row.gigabytes_per_second > 0.0) {
+      csv << row.gigabytes_per_second;
+    }
+    csv << ',';
+    if (row.attn_core.present) {
+      csv << row.attn_core.gigabytes_per_second;
+    }
+    csv << ',';
+    if (row.native.present) {
+      csv << row.native.gigabytes_per_second;
+    }
+    csv << ',';
+    if (row.attn_core.present) {
+      csv << row.attn_core.tflops;
+    }
+    csv << ',';
+    if (row.native.present) {
+      csv << row.native.tflops;
+    }
+    csv << ',' << model.fp16_kv_bytes << ',' << model.tq_kv_bytes << ',' << model.saved_mib() << ','
+        << model.compression_ratio() << ',' << model.dec_e2e << ',' << model.dec_flops << ',';
+    if (row.e2e.present) {
+      csv << row.e2e.p95_us;
+    }
+    csv << ',';
+    if (row.native.present) {
+      csv << row.native.p95_us;
+    }
+    csv << ',' << config.budget.warmup << ',' << config.budget.iterations << ',' << row.e2e.mode << '\n';
+  }
+  std::printf("[ascend-bench] Table B written to %s\n", path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// The two device checks
+// ---------------------------------------------------------------------------
+
+// Pi is orthogonal, so FIA over (Q~, K~, V~) un-rotated per head must be FIA
+// over (Q, K, V). The device-level statement that the prefill core below is the
+// layer's attention, and what licenses timing the folded path with T_rot_o = 0.
+double RotatedBasisCosine(const Scenario& scenario, const Config& config, aclrtStream stream) {
+  scenario.EnqueuePrefillAttnCore(stream);
+  scenario.EnqueuePrefillNative(stream);
   ACL_CHECK(aclrtSynchronizeStream(stream));
-  const std::vector<float> plain = scenario.Output();
-  const std::vector<float> folded = tqh::UnrotateHeads(scenario.RotatedOutput(), shape.head_size);
+  const std::vector<float> plain = scenario.PrefillNativeOutput();
+  const std::vector<float> folded = tqh::UnrotateHeads(scenario.PrefillTqOutput(), config.model.head_size);
   return turboquant_ref::cpu_fidelity(folded, plain).cosine_similarity;
 }
 
-void Run(BenchmarkRunner& decode_runner, int64_t aiv_num) {
-  if (!Enabled()) {
-    std::printf("\n[ascend-bench] prefill suite dropped by ASCEND_BENCH_TQ_PREFILL=0\n");
-    return;
-  }
-  const std::vector<Shape> sweep = Sweep();
-  BenchmarkRunner runner(std::string(kSuiteName) + " -- prefill", Options(decode_runner.options()),
-                         decode_runner.stream());
-  std::printf("\n[ascend-bench] TurboQuant prefill suite: %zu shapes x %zu legs, warmup=%d iterations=%d "
-              "pipeline_batch=%d per case\n",
-              sweep.size(), sizeof(kAllLegs) / sizeof(kAllLegs[0]), runner.options().warmup_iterations,
-              runner.options().timed_iterations, runner.options().pipeline_batch);
-  std::fflush(stdout);
-
-  const auto fail = [&](const std::string& name, const std::string& why) {
-    runner.RecordFailure(name, why);
-    decode_runner.RecordFailure(name, why);
-  };
-  const auto run_leg = [&](const char* leg, const Shape& shape, double flops, double bytes, int tasks,
-                           std::function<void(aclrtStream)> launch, std::function<double()> checksum) {
-    const std::string name = CaseName(leg, shape);
-    if (!LegEnabled(leg)) {
-      runner.Skip(name, "not in ASCEND_BENCH_TQ_PREFILL_LEGS");
-      return;
-    }
-    try {
-      BenchmarkCase benchmark_case;
-      benchmark_case.name = name;
-      benchmark_case.flops_per_iteration = flops;
-      benchmark_case.bytes_per_iteration = bytes;
-      benchmark_case.tasks_per_launch = tasks;
-      benchmark_case.launch = std::move(launch);
-      benchmark_case.checksum = std::move(checksum);
-      runner.Run(benchmark_case);
-    } catch (const std::exception& error) {
-      fail(name, error.what());
-    }
-  };
-
-  // The identity check runs on the smallest shape, where reading two attention
-  // outputs back costs megabytes rather than gigabytes.
-  size_t check_index = sweep.size();
-  for (size_t index = 0; index < sweep.size(); ++index) {
-    if (check_index == sweep.size() || sweep[index].tokens() * sweep[index].num_heads * sweep[index].head_size <
-                                           sweep[check_index].tokens() * sweep[check_index].num_heads *
-                                               sweep[check_index].head_size) {
-      check_index = index;
-    }
-  }
-
-  std::string fia_operator = "none";
-  for (size_t index = 0; index < sweep.size(); ++index) {
-    const Shape& shape = sweep[index];
-    const Traffic traffic = ModelTraffic(shape);
-
-    size_t free_hbm = 0;
-    size_t total_hbm = 0;
-    const bool known = aclrtGetMemInfo(ACL_HBM_MEM, &free_hbm, &total_hbm) == ACL_SUCCESS && free_hbm > 0;
-    const double needed = ScenarioBytes(shape);
-    if (known && needed > kHbmBudget * static_cast<double>(free_hbm)) {
-      std::ostringstream why;
-      why << "needs ~" << needed / (1024.0 * 1024.0 * 1024.0) << " GiB of HBM, " << kHbmBudget * 100.0 << "% of "
-          << static_cast<double>(free_hbm) / (1024.0 * 1024.0 * 1024.0) << " GiB free is the budget";
-      for (const char* leg : kAllLegs) {
-        runner.Skip(CaseName(leg, shape), why.str());
-      }
-      continue;
-    }
-
-    std::unique_ptr<Scenario> scenario;
-    try {
-      scenario.reset(new Scenario(shape, aiv_num));
-    } catch (const std::exception& error) {
-      fail(CaseName("pf_setup", shape), error.what());
-      continue;
-    }
-    std::printf("[ascend-bench] prefill B=%lld S=%lld D=%lld H_Q=%lld H_KV=%lld (%s): %s%s\n",
-                static_cast<long long>(shape.batch), static_cast<long long>(shape.seq_len),
-                static_cast<long long>(shape.head_size), static_cast<long long>(shape.num_heads),
-                static_cast<long long>(shape.num_kv_heads), Family(shape),
-                scenario->fia_available() ? scenario->fia_op().c_str() : "no stock operator -- ",
-                scenario->fia_available() ? "" : scenario->fia_note().c_str());
-    std::fflush(stdout);
-    if (scenario->fia_available()) {
-      fia_operator = scenario->fia_op();
-    }
-
-    if (index == check_index && scenario->fia_available()) {
-      try {
-        const double cosine = FoldedBasisCosine(*scenario, shape, runner.stream());
-        std::printf("[ascend-bench]   folded-basis identity: FIA(V~) un-rotated vs FIA(V), cos = %.9f (bound %.4f)\n",
-                    cosine, kFoldIdentityMinCosine);
-        if (!(cosine > kFoldIdentityMinCosine)) {
-          fail(CaseName("pf_fold_identity", shape), "FIA over Pi V does not un-rotate to FIA over V");
-        }
-      } catch (const std::exception& error) {
-        fail(CaseName("pf_fold_identity", shape), error.what());
-      }
-    }
-
-    const Scenario* sc = scenario.get();
-    run_leg(kLegTq4Write, shape, 0.0, traffic.tq4_write, 1, [sc](aclrtStream s) { sc->EnqueueTq4Write(s); },
-            [sc]() { return sc->ScaleChecksum(); });
-    run_leg(kLegRotateValue, shape, 0.0, traffic.rotate_value, 1, [sc](aclrtStream s) { sc->EnqueueRotateValue(s); },
-            [sc]() { return sc->RotatedValueChecksum(); });
-
-    if (!sc->fp16_write_available()) {
-      runner.Skip(CaseName(kLegFp16Write, shape), sc->fp16_write_note());
-      runner.Skip(CaseName(kLegFp16Pipeline, shape), sc->fp16_write_note());
-    } else {
-      run_leg(kLegFp16Write, shape, 0.0, traffic.fp16_write, 1, [sc](aclrtStream s) { sc->EnqueueFp16Write(s); },
-              [sc]() { return sc->Fp16CacheChecksum(); });
-    }
-
-    if (!sc->fia_available()) {
-      for (const char* leg : {kLegFia, kLegFp16Pipeline, kLegTq4Pipeline, kLegTq4FoldedPipeline}) {
-        runner.Skip(CaseName(leg, shape), sc->fia_note());
-      }
-      continue;
-    }
-    run_leg(kLegFia, shape, traffic.attention_flops, traffic.fia, 1, [sc](aclrtStream s) { sc->EnqueueFia(s); },
-            [sc]() { return sc->OutputChecksum(); });
-    if (sc->fp16_write_available()) {
-      run_leg(kLegFp16Pipeline, shape, traffic.attention_flops, traffic.fp16_pipeline, 2,
-              [sc](aclrtStream s) {
-                sc->EnqueueFp16Write(s);
-                sc->EnqueueFia(s);
-              },
-              [sc]() { return sc->OutputChecksum(); });
-    }
-    run_leg(kLegTq4Pipeline, shape, traffic.attention_flops, traffic.tq4_pipeline, 2,
-            [sc](aclrtStream s) {
-              sc->EnqueueTq4Write(s);
-              sc->EnqueueFia(s);
-            },
-            [sc]() { return sc->OutputChecksum(); });
-    run_leg(kLegTq4FoldedPipeline, shape, traffic.attention_flops, traffic.tq4_folded_pipeline, 3,
-            [sc](aclrtStream s) {
-              sc->EnqueueTq4Write(s);
-              sc->EnqueueRotateValue(s);
-              sc->EnqueueFiaRotated(s);
-            },
-            [sc]() { return sc->RotatedOutputChecksum(); });
-  }
-
-  runner.Report();
-  PrintSummary(runner, sweep, fia_operator);
+// The TurboQuant decode's output, un-rotated, against the native decode over the
+// same context in the same slots. A loose bound on purpose: 4 bits against 16
+// will not do better, and what this catches is a leg reading an empty cache.
+double DecodeTiePointCosine(const Scenario& scenario, const Config& config, aclrtStream stream) {
+  scenario.EnqueueDecodeE2E(stream);
+  scenario.EnqueueDecodeNative(stream);
+  ACL_CHECK(aclrtSynchronizeStream(stream));
+  const std::vector<float> native = scenario.DecodeNativeOutput();
+  const std::vector<float> folded = tqh::UnrotateHeads(scenario.DecodeTqOutput(), config.model.head_size);
+  return turboquant_ref::cpu_fidelity(folded, native).cosine_similarity;
 }
 
-}  // namespace prefill
+// ---------------------------------------------------------------------------
+// Banner
+// ---------------------------------------------------------------------------
+
+void PrintBanner(const std::vector<Config>& sweep, int64_t aiv_num, bool aiv_queried) {
+  std::printf("[ascend-bench] TurboQuant end-to-end audit against the native CANN V5 attention operator\n");
+  std::printf("[ascend-bench]   vector cores = %lld%s\n", static_cast<long long>(aiv_num),
+              aiv_queried ? " (from aclGetDeviceCapability)" : " (assumed; the runtime declined to answer)");
+  std::printf("[ascend-bench]\n");
+  std::printf("[ascend-bench]   THE NATIVE OPERATOR IS aclnnFusedInferAttentionScoreV5, in both roles.\n"
+              "[ascend-bench]   aclnnPromptFlashAttentionV5 and aclnnFusionIncrementalAttention DO NOT EXIST in\n"
+              "[ascend-bench]   this toolkit -- the PFA family stops at V3 and the IFA family at V4, and the\n"
+              "[ascend-bench]   second name appears in no header at all. FIA V5 is the unified interface that\n"
+              "[ascend-bench]   replaces both on an Ascend950 (V1..V4 of it return 361001), and it covers the\n"
+              "[ascend-bench]   prompt role and the incremental role through its argument list. V2 is the\n"
+              "[ascend-bench]   fallback; every table says which one actually planned.\n");
+  std::printf("[ascend-bench]\n");
+  std::printf("[ascend-bench]   NO NUMBER BELOW HAS EVER BEEN TAKEN ON SILICON. No Ascend 950PR part has been\n"
+              "[ascend-bench]   available to this project; the kernels are verified on the arch35 camodel.\n");
+  std::printf("[ascend-bench]\n");
+
+  if (sweep.empty()) {
+    std::printf("[ascend-bench]   the sweep is empty: every configuration was filtered out by an\n"
+                "[ascend-bench]   ASCEND_BENCH_TQ_AUDIT_* selector.\n");
+    std::fflush(stdout);
+    return;
+  }
+
+  std::printf("[ascend-bench]   %zu configurations:\n", sweep.size());
+  std::string previous_model;
+  for (const Config& config : sweep) {
+    if (previous_model != config.model.key) {
+      previous_model = config.model.key;
+      std::printf("[ascend-bench]     %-17s D=%-4lld H_Q=%-3lld H_KV=%-2lld  %-6s  %s\n", config.model.label,
+                  static_cast<long long>(config.model.head_size),
+                  static_cast<long long>(config.model.num_heads),
+                  static_cast<long long>(config.model.num_kv_heads),
+                  config.model.folds_output ? "folded" : "UNFOLD", PathLabel(config.path));
+      std::printf("[ascend-bench]       %s\n", config.model.note);
+    }
+  }
+  std::fflush(stdout);
+}
 
 }  // namespace
 
-void BuildSuite(BenchmarkRunner& runner) {
-  const std::vector<int64_t> context_lens = ContextLens();
-  const bool cube = CubeEnabled();
-  const bool fia = cube && FiaEnabled();
+// ---------------------------------------------------------------------------
+// The suite
+// ---------------------------------------------------------------------------
 
+void BuildSuite(BenchmarkRunner& primary) {
   bool aiv_queried = false;
   const int64_t aiv_num = tqh::VectorCoreNum(&aiv_queried);
-  std::printf("[ascend-bench] TurboQuant decode: vector cores = %lld%s\n", static_cast<long long>(aiv_num),
-              aiv_queried ? " (from aclGetDeviceCapability)" : " (assumed; the runtime declined to answer)");
-  PrintCubeBanner(cube);
-  if (cube) {
-    std::printf("[ascend-bench] fp16 baseline: turboquant_fp16_decode, the Cube decode with the codec removed.\n"
-                "[ascend-bench]   aclnnFusedInferAttentionScore is not used: V1..V4 are withdrawn on an\n"
-                "[ascend-bench]   Ascend950 (status 361001) and V5 has never been planned on hardware, so a\n"
-                "[ascend-bench]   baseline resting on either would print an empty column. See this file's header.\n");
+
+  const std::vector<Config> sweep = BuildSweep();
+  PrintBanner(sweep, aiv_num, aiv_queried);
+  if (sweep.empty()) {
+    return;
+  }
+
+  // One runner per distinct iteration budget, in the order the sweep first asks
+  // for them; see RunnerSet.
+  std::vector<Budget> budgets;
+  for (const Config& config : sweep) {
+    if (std::find(budgets.begin(), budgets.end(), config.budget) == budgets.end()) {
+      budgets.push_back(config.budget);
+    }
+  }
+  RunnerSet runners(primary, budgets);
+  for (const Budget& budget : budgets) {
+    std::printf("[ascend-bench]   budget: warmup %d, %d timed iterations, pipeline_batch %d\n", budget.warmup,
+                budget.iterations, kPipelineBatch);
   }
   std::fflush(stdout);
 
-  // Built alongside the scenarios so the model's partial-traffic term uses the
-  // split count the decode is actually going to launch with.
-  std::vector<TrafficModel> models;
-  std::vector<std::unique_ptr<DecodeScenario>> scenarios;
-  std::vector<std::unique_ptr<Kv4Scenario>> kv4_scenarios;
-  std::vector<std::unique_ptr<Fp16Scenario>> fp16_scenarios;
-  std::vector<std::unique_ptr<FiaScenario>> fia_scenarios;
-  scenarios.reserve(context_lens.size());
-  for (const int64_t context_len : context_lens) {
-    scenarios.emplace_back(new DecodeScenario(context_len));
-    // Gated at construction and not only at launch: these allocate two more KV
-    // caches of the same shape, which over the sweep is real HBM spent on a
-    // path that is not going to run.
-    if (cube) {
-      kv4_scenarios.emplace_back(new Kv4Scenario(*scenarios.back(), context_len));
-      fp16_scenarios.emplace_back(new Fp16Scenario(*scenarios.back(), context_len));
-      // No allocation of its own beyond one output: it reads the fp16 caches the
-      // line above built. Constructing it plans the operator, which is where a
-      // 361001 refusal surfaces, so the reason is available before any timing.
-      //
-      // An `if`, not an early `continue`: the traffic model is appended after
-      // this block and every later loop indexes `models` by shape, so skipping
-      // the rest of an iteration would leave that vector short and the
-      // registration loop would read past its end.
-      if (fia) {
-        fia_scenarios.emplace_back(new FiaScenario(*fp16_scenarios.back(), *scenarios.back(), context_len));
-        if (fia_scenarios.back()->available()) {
-          std::printf("[ascend-bench] S=%lld: stock operator baseline is %s\n",
-                      static_cast<long long>(context_len), fia_scenarios.back()->op_name().c_str());
-        } else {
-          std::printf("[ascend-bench] S=%lld: no stock operator baseline -- %s\n",
-                      static_cast<long long>(context_len), fia_scenarios.back()->note().c_str());
-        }
-      }
+  const bool run_prefill = PhaseEnabled("prefill");
+  const bool run_decode = PhaseEnabled("decode");
+
+  // The rotated-basis identity runs once, on the configuration whose attention
+  // output is smallest, where reading two of them back costs megabytes rather
+  // than gigabytes. The decode tie-point runs once, on the smallest
+  // configuration whose context also fits an exact host image.
+  size_t basis_check = sweep.size();
+  size_t tie_point_check = sweep.size();
+  for (size_t index = 0; index < sweep.size(); ++index) {
+    const auto weight = [](const Config& config) {
+      return config.chunk_tokens() * config.model.num_heads * config.model.head_size;
+    };
+    if (basis_check == sweep.size() || weight(sweep[index]) < weight(sweep[basis_check])) {
+      basis_check = index;
     }
-    models.push_back(ModelTrafficFor(context_len, scenarios.back()->decode_grid()));
+    const bool exact = static_cast<size_t>(sweep[index].context_tokens() * sweep[index].model.num_kv_heads *
+                                           sweep[index].model.head_size) <= kExactContextElements;
+    if (exact && (tie_point_check == sweep.size() ||
+                  sweep[index].context_tokens() < sweep[tie_point_check].context_tokens())) {
+      tie_point_check = index;
+    }
   }
-  PrintTrafficModel(models);
 
-  for (size_t index = 0; index < context_lens.size(); ++index) {
-    const int64_t context_len = context_lens[index];
-    DecodeScenario& scenario = *scenarios[index];
-    const TrafficModel& model = models[index];
+  std::vector<Traffic> traffic;
+  traffic.reserve(sweep.size());
+  std::string fia_operator = "none";
 
-    if (cube) {
-      // One Cube grid line, not one per leg: PlanCubeDecode does not take the
-      // mode, so kv4fp8 and the fp16 baseline launch the same grid. Printing it
-      // twice would suggest they could differ.
-      const Kv4Scenario& cube_grid = *kv4_scenarios[index];
-      std::printf("\n[ascend-bench] S=%lld: blocks_per_seq=%lld pool=%lld "
-                  "tq4 splits=%lld grid(split)=%u | cube splits=%lld grid(split)=%u grid(combine)=%u\n",
-                  static_cast<long long>(context_len), static_cast<long long>(scenario.blocks_per_seq()),
-                  static_cast<long long>(scenario.num_blocks()),
-                  static_cast<long long>(scenario.decode_grid().num_splits),
-                  scenario.decode_grid().split_block_dim,
-                  static_cast<long long>(cube_grid.decode_grid().num_splits),
-                  cube_grid.decode_grid().split_block_dim, cube_grid.decode_grid().combine_block_dim);
-    } else {
-      std::printf("\n[ascend-bench] S=%lld: blocks_per_seq=%lld pool=%lld tq4 splits=%lld "
-                  "grid(write)=%u grid(split)=%u grid(combine)=%u\n",
-                  static_cast<long long>(context_len), static_cast<long long>(scenario.blocks_per_seq()),
-                  static_cast<long long>(scenario.num_blocks()),
-                  static_cast<long long>(scenario.decode_grid().num_splits), scenario.write_grid().block_dim,
-                  scenario.decode_grid().split_block_dim, scenario.decode_grid().combine_block_dim);
-    }
-    std::fflush(stdout);
+  for (size_t index = 0; index < sweep.size(); ++index) {
+    const Config& config = sweep[index];
+    BenchmarkRunner& runner = runners.For(config.budget);
 
-    // --- the 4-bit cache write ----------------------------------------------
-    const std::string write_name = CaseName("tq4_write", context_len);
-    try {
-      BenchmarkCase write_case;
-      write_case.name = write_name;
-      // Read: S tokens of fp16 K and V. Written: the packed codes and the scale
-      // plane for those tokens, plus the int32 slot mapping that is read.
-      write_case.bytes_per_iteration = model.fp16_footprint_bytes + model.tq4_footprint_bytes +
-                                       kFloatBytes * static_cast<double>(context_len);
-      write_case.launch = [&scenario](aclrtStream stream) { scenario.EnqueueWrite(stream); };
-      // The write is idempotent: the same tokens go to the same slots every
-      // launch, so the scale plane must come back bit-identical. It is summed
-      // whole rather than over the written slots alone, so a scale written
-      // outside the slot mapping is caught too.
-      write_case.checksum = [&scenario]() { return ChecksumSum(scenario.ScalePlane()); };
-      runner.Run(write_case);
-    } catch (const std::exception& error) {
-      runner.RecordFailure(write_name, error.what());
-    }
+    // The split count follows from the grid, which follows from the shape, and
+    // the traffic model's partial term needs it. Planned here rather than read
+    // off the scenario so that a configuration skipped for HBM still gets a row
+    // in the model.
+    const int64_t planned_splits =
+        config.path == PathMode::kCube
+            ? tqh::PlanCubeDecode(config.batch, config.model.num_heads, config.model.num_kv_heads,
+                                  config.model.head_size, config.blocks_per_seq(), aiv_num)
+                  .num_splits
+            : tqh::PlanPagedAttention(config.batch, config.model.num_heads, config.model.head_size,
+                                      config.blocks_per_seq(), aiv_num)
+                  .num_splits;
+    traffic.push_back(ModelTraffic(config, planned_splits));
 
-    // --- the query rotation, on its own -------------------------------------
-    //
-    // ONE launch, and the only case in this file that is one. Both decode legs
-    // below now enqueue this same rotation ahead of their own kernels, so
-    //
-    //     tq_rotate_sS  is  launch + the rotation itself
-    //     tq4_decode_sS  minus  tq_rotate_sS  is what the decode costs without
-    //
-    // and the difference between this and an empty launch is what pricing the
-    // extra operator invocation actually needs. That is the measurement the
-    // decision to make the rotation a separate operator rests on, and nothing
-    // in this repository had produced it before: the standalone Hadamard sweep
-    // in hadamard_benchmark_results.csv records its launch path as
-    // `replan-per-launch`, which is a harness artefact and not the graph-replay
-    // figure a decode step actually pays.
-    //
-    // Flat in S by construction -- the rotation reads the query and nothing
-    // paged -- so a row that grows with the context is a bug in this case and
-    // not a property of the kernel.
-    const std::string rotate_name = CaseName("tq_rotate", context_len);
-    try {
-      BenchmarkCase rotate_case;
-      rotate_case.name = rotate_name;
-      // Read: the fp16 query. Written: its fp32 rotation.
-      rotate_case.bytes_per_iteration =
-          static_cast<double>(kQueryTokens * kNumHeads * kHeadSize) * (sizeof(Half) + kFloatBytes);
-      rotate_case.launch = [&scenario](aclrtStream stream) { scenario.EnqueueRotate(stream); };
-      // Deterministic: the same query through the same transform every launch.
-      rotate_case.checksum = [&scenario]() { return ChecksumSum(scenario.RotatedQuery()); };
-      runner.Run(rotate_case);
-    } catch (const std::exception& error) {
-      runner.RecordFailure(rotate_name, error.what());
-    }
-
-    // --- the 4-bit AIV decode -----------------------------------------------
-    const std::string decode_name = CaseName("tq4_decode", context_len);
-    try {
-      scenario.FillCache(runner.stream());
-
-      BenchmarkCase decode_case;
-      decode_case.name = decode_name;
-      decode_case.flops_per_iteration = AttentionFlops(context_len);
-      decode_case.bytes_per_iteration = model.tq4_decode_read_bytes;
-      decode_case.tasks_per_launch = 3;  // rotate, split, then combine
-      decode_case.launch = [&scenario](aclrtStream stream) { scenario.EnqueueDecode(stream); };
-      decode_case.checksum = [&scenario]() { return ChecksumSum(scenario.Output()); };
-      runner.Run(decode_case);
-    } catch (const std::exception& error) {
-      runner.RecordFailure(decode_name, error.what());
-    }
-
-    // --- the Cube legs ------------------------------------------------------
-    //
-    // On by default. A skip is recorded for each case when they are dropped, so
-    // the absence shows up in the result table.
-    if (!cube) {
-      for (const char* dropped : {"kv4fp8_write", "kv4fp8_decode"}) {
-        runner.Skip(CaseName(dropped, context_len), "Cube legs dropped by VLLM_ASCEND_TQ_CUBE_WIP=0");
+    // --- the HBM guard ------------------------------------------------------
+    size_t free_hbm = 0;
+    size_t total_hbm = 0;
+    const bool known = aclrtGetMemInfo(ACL_HBM_MEM, &free_hbm, &total_hbm) == ACL_SUCCESS && free_hbm > 0;
+    const double needed = ScenarioBytes(config);
+    if (known && needed > kHbmBudget * static_cast<double>(free_hbm)) {
+      std::ostringstream why;
+      why << "needs ~" << needed / (1024.0 * 1024.0 * 1024.0) << " GiB of HBM; the budget is "
+          << kHbmBudget * 100.0 << "% of " << static_cast<double>(free_hbm) / (1024.0 * 1024.0 * 1024.0)
+          << " GiB free";
+      for (const char* leg : kPrefillLegs) {
+        runner.Skip(CaseName(leg, config), why.str());
       }
-      runner.Skip(CaseName("fp16_decode", context_len),
-                  "the fp16 baseline is the same Cube kernel with the codec removed, and is dropped with it");
-      runner.Skip(CaseName("fia_decode", context_len),
-                  "the stock-operator baseline reads the fp16 cache the Cube legs build, and is dropped with them");
+      for (const char* leg : kDecodeLegs) {
+        runner.Skip(CaseName(leg, config), why.str());
+      }
+      std::printf("[ascend-bench] %s: skipped -- %s\n", config.id().c_str(), why.str().c_str());
+      std::fflush(stdout);
       continue;
     }
 
-    Kv4Scenario& kv4 = *kv4_scenarios[index];
-    Fp16Scenario& fp16 = *fp16_scenarios[index];
-
-    // --- the Cube-native 4-bit cache write ----------------------------------
-    //
-    // Four bits per coordinate into a 128-byte slot, as tq4_write, and a
-    // different kernel AND a different quantiser: this one is
-    // turboquant_mm_reshape_and_cache at MODE = KV4_FP8, which bins against
-    // uniform thresholds and packs the two nibbles of a byte as coordinates b
-    // and b + d/2. tq4_write bins against Lloyd-Max thresholds and interleaves
-    // 2b with 2b + 1. The cache geometry is identical and the contents are not,
-    // so the pair measures the packer and the quantiser together; see the note
-    // on the codec at the head of this file.
-    const std::string kv4_write_name = CaseName("kv4fp8_write", context_len);
+    // --- build --------------------------------------------------------------
+    std::unique_ptr<Scenario> scenario;
     try {
-      BenchmarkCase write_case;
-      write_case.name = kv4_write_name;
-      write_case.bytes_per_iteration = model.fp16_footprint_bytes + model.kv4_footprint_bytes +
-                                       kFloatBytes * static_cast<double>(context_len);
-      write_case.launch = [&kv4, &scenario](aclrtStream stream) { kv4.EnqueueWrite(scenario, stream); };
-      write_case.checksum = [&kv4]() { return ChecksumSum(kv4.ScalePlane()); };
-      runner.Run(write_case);
+      scenario.reset(new Scenario(config, aiv_num));
     } catch (const std::exception& error) {
-      runner.RecordFailure(kv4_write_name, error.what());
+      runners.Fail(CaseName("setup", config), error.what());
+      continue;
+    }
+    if (!scenario->fia_operator().empty()) {
+      fia_operator = scenario->fia_operator();
+    }
+    std::printf("\n[ascend-bench] %-17s S=%lld B=%lld D=%lld H_Q=%lld H_KV=%lld | %s path, chunk %lld, "
+                "blocks/seq %lld, pool %lld, splits %lld, grid %u/%u | native: %s\n",
+                config.model.label, static_cast<long long>(config.seq_len),
+                static_cast<long long>(config.batch), static_cast<long long>(config.model.head_size),
+                static_cast<long long>(config.model.num_heads),
+                static_cast<long long>(config.model.num_kv_heads), PathLabel(config.path),
+                static_cast<long long>(config.chunk), static_cast<long long>(config.blocks_per_seq()),
+                static_cast<long long>(config.pool_blocks()), static_cast<long long>(scenario->num_splits()),
+                scenario->split_block_dim(), scenario->combine_block_dim(),
+                scenario->decode_available() ? scenario->fia_operator().c_str() : "unavailable");
+    if (!scenario->prefill_available() || !scenario->decode_available()) {
+      std::printf("[ascend-bench]   native operator note: %s\n", scenario->fia_note().c_str());
+    }
+    std::fflush(stdout);
+
+    // --- setup, outside every timed region ----------------------------------
+    //
+    // The cache is filled from the whole context, then one untimed pass leaves
+    // the flash-decoding workspace and both attention outputs holding real
+    // values -- see Scenario::Prime for why a timed combine cannot start from
+    // zeros.
+    try {
+      scenario->FillCache(runner.stream());
+      scenario->Prime(runner.stream());
+    } catch (const std::exception& error) {
+      runners.Fail(CaseName("fill", config), error.what());
+      continue;
     }
 
-    // --- the Cube-native 4-bit decode ---------------------------------------
-    const std::string kv4_decode_name = CaseName("kv4fp8_decode", context_len);
-    try {
-      kv4.FillCache(scenario, runner.stream());
-
-      BenchmarkCase decode_case;
-      decode_case.name = kv4_decode_name;
-      decode_case.flops_per_iteration = AttentionFlops(context_len);
-      decode_case.bytes_per_iteration = model.kv4_decode_read_bytes;
-      decode_case.tasks_per_launch = 3;  // rotate, split, then combine
-      decode_case.launch = [&kv4, &scenario](aclrtStream stream) { kv4.EnqueueDecode(scenario, stream); };
-      decode_case.checksum = [&kv4]() { return ChecksumSum(kv4.Output()); };
-      runner.Run(decode_case);
-    } catch (const std::exception& error) {
-      runner.RecordFailure(kv4_decode_name, error.what());
-    }
-
-    // --- the physical fp16 baseline -----------------------------------------
-    //
-    // A failure here is a failure and not a skip: this leg is a kernel in this
-    // binary, so if it does not run something is broken rather than missing.
-    const std::string fp16_name = CaseName("fp16_decode", context_len);
-    try {
-      BenchmarkCase fp16_case;
-      fp16_case.name = fp16_name;
-      fp16_case.flops_per_iteration = AttentionFlops(context_len);
-      fp16_case.bytes_per_iteration = model.fp16_decode_read_bytes;
-      fp16_case.tasks_per_launch = 2;  // split, then combine
-      fp16_case.launch = [&fp16, &scenario](aclrtStream stream) { fp16.EnqueueDecode(scenario, stream); };
-      fp16_case.checksum = [&fp16]() { return ChecksumSum(fp16.Output()); };
-      runner.Run(fp16_case);
-    } catch (const std::exception& error) {
-      runner.RecordFailure(fp16_name, error.what());
-    }
-
-    // --- the stock-operator baseline ----------------------------------------
-    //
-    // A SKIP and not a failure when the operator did not plan: an Ascend950 with
-    // V1..V4 withdrawn and no V5 is a configuration, not a defect in this
-    // binary, and the reason carries into the report.
-    const std::string fia_name = CaseName("fia_decode", context_len);
-    if (!fia) {
-      runner.Skip(fia_name, "the stock-operator leg was dropped by ASCEND_BENCH_TQ_FIA=0");
-    } else if (!fia_scenarios[index]->available()) {
-      runner.Skip(fia_name, fia_scenarios[index]->note());
-    } else {
-      const FiaScenario& operator_leg = *fia_scenarios[index];
+    // --- the two device checks, before anything is timed --------------------
+    if (index == basis_check && scenario->prefill_available()) {
       try {
-        BenchmarkCase fia_case;
-        fia_case.name = fia_name;
-        fia_case.flops_per_iteration = AttentionFlops(context_len);
-        // The same bytes the fp16 leg reads, because it is the same cache. That
-        // makes the two GB/s figures comparable and both of them a statement
-        // about the traffic model rather than about the operator's internals.
-        fia_case.bytes_per_iteration = model.fp16_decode_read_bytes;
-        fia_case.tasks_per_launch = 1;  // one operator, one task
-        fia_case.launch = [&operator_leg](aclrtStream stream) { operator_leg.EnqueueDecode(stream); };
-        fia_case.checksum = [&operator_leg]() { return ChecksumSum(operator_leg.Output()); };
-        runner.Run(fia_case);
+        const double cosine = RotatedBasisCosine(*scenario, config, runner.stream());
+        std::printf("[ascend-bench]   rotated-basis identity: FIA(Q~,K~,V~) un-rotated vs FIA(Q,K,V), "
+                    "cos = %.9f (bound %.4f)\n",
+                    cosine, kRotatedBasisMinCosine);
+        if (!(cosine > kRotatedBasisMinCosine)) {
+          runners.Fail(CaseName("rotated_basis_identity", config),
+                       "attention in the rotated basis does not un-rotate to attention in the plain one");
+        }
       } catch (const std::exception& error) {
-        runner.RecordFailure(fia_name, error.what());
+        runners.Fail(CaseName("rotated_basis_identity", config), error.what());
+      }
+    }
+    if (index == tie_point_check && scenario->decode_available() && scenario->exact_context()) {
+      try {
+        const double cosine = DecodeTiePointCosine(*scenario, config, runner.stream());
+        std::printf("[ascend-bench]   decode tie-point: TurboQuant un-rotated vs native V5 over the same "
+                    "context, cos = %.6f (bound %.2f)\n",
+                    cosine, kDecodeTiePointMinCosine);
+        if (!(cosine > kDecodeTiePointMinCosine)) {
+          runners.Fail(CaseName("decode_tie_point", config),
+                       "the TurboQuant decode and the native decode are not attending over the same context");
+        }
+      } catch (const std::exception& error) {
+        runners.Fail(CaseName("decode_tie_point", config), error.what());
+      }
+    }
+    std::fflush(stdout);
+
+    // --- registration -------------------------------------------------------
+    const Traffic& model = traffic.back();
+    const Scenario* sc = scenario.get();
+    const auto run_leg = [&](const char* leg, double flops, double bytes, int tasks,
+                             std::function<void(aclrtStream)> launch, std::function<double()> checksum) {
+      const std::string name = CaseName(leg, config);
+      if (!LegEnabled(leg)) {
+        runner.Skip(name, "not in ASCEND_BENCH_TQ_AUDIT_LEGS");
+        return;
+      }
+      try {
+        BenchmarkCase benchmark_case;
+        benchmark_case.name = name;
+        benchmark_case.flops_per_iteration = flops;
+        benchmark_case.bytes_per_iteration = bytes;
+        benchmark_case.tasks_per_launch = tasks;
+        benchmark_case.launch = std::move(launch);
+        benchmark_case.checksum = std::move(checksum);
+        runner.Run(benchmark_case);
+      } catch (const std::exception& error) {
+        runner.RecordFailure(name, error.what());
+        runners.MirrorFail(runner, name, error.what());
+      }
+    };
+    const int rot_o_tasks = config.model.folds_output ? 0 : 1;
+
+    // DECODE FIRST, then prefill. The prefill ingest leg rewrites the tail of
+    // the TurboQuant cache from the chunk's own K/V and the native ingest leg
+    // rewrites part of the fp16 paged cache, so running them first would leave
+    // the decode legs reading a cache the setup phase did not build. Neither
+    // rewrite changes any latency -- both write the same bytes to the same slots
+    // every launch -- but the order keeps the decode measuring a cache whose
+    // provenance is the one the tie-point checked.
+    if (run_decode) {
+      run_leg(kLegDecRotQ, 0.0, model.dec_rot_q, 1, [sc](aclrtStream s) { sc->EnqueueDecodeRotateQ(s); },
+              [sc]() { return sc->DecodeRotatedQueryChecksum(); });
+
+      if (config.path == PathMode::kCube) {
+        run_leg(kLegDecSplit, model.dec_flops, model.dec_split, 1,
+                [sc](aclrtStream s) { sc->EnqueueDecodeSplit(s); },
+                [sc]() { return sc->WorkspaceChecksum(); });
+      } else {
+        runner.Skip(CaseName(kLegDecSplit, config),
+                    "the AIV path submits split and combine through one launcher and exports no split-only "
+                    "entry point; Table B derives that column");
+      }
+
+      run_leg(kLegDecCombine, 0.0, model.dec_combine, 1, [sc](aclrtStream s) { sc->EnqueueDecodeCombine(s); },
+              [sc]() { return sc->DecodeTqChecksum(); });
+      run_leg(kLegDecAttnCore, model.dec_flops, model.dec_attn_core, 2,
+              [sc](aclrtStream s) { sc->EnqueueDecodeAttnCore(s); },
+              [sc]() { return sc->DecodeTqChecksum(); });
+
+      if (config.model.folds_output) {
+        runner.Skip(CaseName(kLegDecRotO, config),
+                    "W_o is folded: the de-rotation is an offline weight transform and costs 0.0 us at runtime");
+      } else {
+        run_leg(kLegDecRotO, 0.0, model.dec_rot_o, 1, [sc](aclrtStream s) { sc->EnqueueDecodeRotateO(s); },
+                [sc]() { return sc->DecodeRotatedOutChecksum(); });
+      }
+
+      // rotate-q, the core's two stages, and the de-rotation when the layer
+      // cannot fold. The count has to be right: the harness uses it to decide
+      // when the stream is close to full, and a case that undercounts starts
+      // measuring the runtime's back-pressure rather than the kernels.
+      run_leg(kLegDecE2E, model.dec_flops, model.dec_e2e, 3 + rot_o_tasks,
+              [sc](aclrtStream s) { sc->EnqueueDecodeE2E(s); },
+              [sc]() { return sc->DecodePipelineChecksum(); });
+
+      if (!sc->decode_available()) {
+        runner.Skip(CaseName(kLegDecV5, config), sc->fia_note());
+      } else {
+        run_leg(kLegDecV5, model.dec_flops, model.dec_v5, 1, [sc](aclrtStream s) { sc->EnqueueDecodeNative(s); },
+                [sc]() { return sc->DecodeNativeChecksum(); });
+      }
+    }
+
+    if (run_prefill) {
+      run_leg(kLegPfIngest, 0.0, model.pf_ingest, 1, [sc](aclrtStream s) { sc->EnqueuePrefillIngest(s); },
+              [sc]() { return sc->ScaleChecksum(); });
+      run_leg(kLegPfRotQ, 0.0, model.pf_rot_q, 1, [sc](aclrtStream s) { sc->EnqueuePrefillRotateQ(s); },
+              [sc]() { return sc->PrefillRotatedQueryChecksum(); });
+
+      if (!sc->prefill_available()) {
+        for (const char* leg : {kLegPfAttnCore, kLegPfRotO, kLegPfE2E, kLegPfV5}) {
+          runner.Skip(CaseName(leg, config), sc->fia_note());
+        }
+      } else {
+        run_leg(kLegPfAttnCore, model.pf_flops, model.pf_attn_core, 1,
+                [sc](aclrtStream s) { sc->EnqueuePrefillAttnCore(s); },
+                [sc]() { return sc->PrefillTqChecksum(); });
+
+        if (config.model.folds_output) {
+          runner.Skip(CaseName(kLegPfRotO, config),
+                      "W_o is folded: the de-rotation is an offline weight transform and costs 0.0 us at runtime");
+        } else {
+          run_leg(kLegPfRotO, 0.0, model.pf_rot_o, 1, [sc](aclrtStream s) { sc->EnqueuePrefillRotateO(s); },
+                  [sc]() { return sc->PrefillRotatedOutChecksum(); });
+        }
+
+        run_leg(kLegPfE2E, model.pf_flops, model.pf_e2e, 1 + 1 + rot_o_tasks,
+                [sc](aclrtStream s) { sc->EnqueuePrefillE2E(s); },
+                [sc]() { return sc->PrefillPipelineChecksum(); });
+        run_leg(kLegPfV5, model.pf_flops, model.pf_v5, 1, [sc](aclrtStream s) { sc->EnqueuePrefillNative(s); },
+                [sc]() { return sc->PrefillNativeChecksum(); });
+      }
+
+      if (!sc->native_write_available()) {
+        runner.Skip(CaseName(kLegPfV5Ingest, config), sc->native_write_note().empty()
+                                                          ? std::string("the native write was not planned")
+                                                          : sc->native_write_note());
+      } else {
+        run_leg(kLegPfV5Ingest, 0.0, model.pf_v5_ingest, 1,
+                [sc](aclrtStream s) { sc->EnqueuePrefillNativeIngest(s); },
+                [sc]() { return sc->NativeCacheChecksum(); });
       }
     }
   }
 
-  // The operator name the CSV records. Every shape plans the same operator, so
-  // the first scenario that resolved one names it; "none" when none did.
-  std::string fia_operator = "none";
-  for (const std::unique_ptr<FiaScenario>& operator_leg : fia_scenarios) {
-    if (operator_leg->available()) {
-      fia_operator = operator_leg->op_name();
-      break;
+  // The extra budgets' raw tables. The primary's is printed by the harness after
+  // this function returns, which is why the audit tables come last: they are the
+  // artifact, and the raw per-case table is the record behind them.
+  runners.ReportExtras();
+
+  if (run_prefill) {
+    PrintTableA(runners.all(), sweep, traffic, fia_operator);
+    const std::string path = EnvString("ASCEND_BENCH_TQ_AUDIT_PREFILL_CSV");
+    if (!path.empty()) {
+      WritePrefillCsv(runners.all(), sweep, traffic, path, fia_operator);
     }
   }
-  PrintDecodeSummary(runner, models, cube, fia_operator);
-
-  // The decode scenarios hold four caches per context length; the prefill sweep
-  // wants that HBM back. The operator legs read the fp16 legs' caches, so they
-  // go first.
-  fia_scenarios.clear();
-  fp16_scenarios.clear();
-  kv4_scenarios.clear();
-  scenarios.clear();
-  prefill::Run(runner, aiv_num);
+  if (run_decode) {
+    PrintTableB(runners.all(), sweep, traffic, fia_operator);
+    const std::string path = EnvString("ASCEND_BENCH_TQ_AUDIT_DECODE_CSV");
+    if (!path.empty()) {
+      WriteDecodeCsv(runners.all(), sweep, traffic, path, fia_operator);
+    }
+  }
+  std::printf("\n[ascend-bench] the raw per-case table for the first iteration budget follows below.\n");
+  std::fflush(stdout);
 }
 
 }  // namespace bench

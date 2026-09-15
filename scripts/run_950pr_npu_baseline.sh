@@ -112,24 +112,32 @@ done
 
 # --- stage 3: the performance baseline ---------------------------------------
 #
-# This is the number the NZ-staging work has to beat. The summary prints tq4
-# (AIV only), kv4 (Cube) and fp16 (unquantised Cube) side by side, plus
-# kv4:fp16 and kv4:tq4.
+# This is the number the NZ-staging work has to beat. The binary is an
+# end-to-end audit now (csrc/tests/TURBOQUANT_TESTS.md 7.5): Table B breaks a
+# decode step into rotate-q, split, combine and rotate-o, sums them into TQ_E2E
+# and divides the native aclnnFusedInferAttentionScoreV5 decode by it.
 #
-# Leave ASCEND_BENCH_WARMUP alone: a checksummed case reads its reference on the
-# first warmup launch, and zero warmup used to fail every one of them.
+# Restricted to the two short regimes and the small batches. The full sweep is
+# 27 configurations across four context regimes up to 1M and both phases, which
+# is hours; this stage wants a decode baseline that finishes.
+#
+# Leave ASCEND_BENCH_WARMUP alone: it no longer reaches this binary (the audit
+# pins its own 5/20 and 1/3 budgets), but the other stages still read it, and a
+# checksummed case reads its reference on the first warmup launch.
 echo
 echo "===== stage 3: decode latency baseline ====="
 export ASCEND_BENCH_CSV="$OUT/bench.csv"
-# The binary also carries a 270-shape prefill sweep (TURBOQUANT_TESTS.md 13.23),
-# hours on its own; this stage is the decode baseline, so it is dropped here.
-# Run it separately with ASCEND_BENCH_TQ_PREFILL_COMPARE_CSV set.
-ASCEND_BENCH_TQ_PREFILL=0 ASCEND_BENCH_TQ_CONTEXTS=512,1024,2048 \
+ASCEND_BENCH_TQ_AUDIT_PHASES=decode \
+ASCEND_BENCH_TQ_AUDIT_S=2048,32768 \
+ASCEND_BENCH_TQ_AUDIT_B=1,4 \
+ASCEND_BENCH_TQ_AUDIT_DECODE_CSV="$OUT/decode_audit.csv" \
   "$DEV/bench_device_950pr_turboquant" > "$OUT/stage3_bench.log" 2>&1
 rc3=$?
 echo "exit $rc3  (77 = no usable 950PR attached)"
-sed -n '/TurboQuant decode summary/,/^$/p' "$OUT/stage3_bench.log"
-grep -E "^  *[0-9]+ " "$OUT/stage3_bench.log" | tail -20
+# To the footer, not to the first blank line: the table's banner has blank lines
+# in it, so a /^$/ range stops before any row is printed.
+sed -n '/TABLE B/,/Speedup is V5_Decode/p' "$OUT/stage3_bench.log"
+grep -E "^  (Qwen|DeepSeek|GLM)" "$OUT/stage3_bench.log" | tail -20
 
 # --- stage 4: where the time goes --------------------------------------------
 #
@@ -142,7 +150,8 @@ grep -E "^  *[0-9]+ " "$OUT/stage3_bench.log" | tail -20
 echo
 echo "===== stage 4: msprof pipe utilisation ====="
 if command -v msprof >/dev/null 2>&1; then
-  ASCEND_BENCH_TQ_PREFILL=0 ASCEND_BENCH_TQ_CONTEXTS=512 ASCEND_BENCH_ITERS=20 ASCEND_BENCH_WARMUP=5 \
+  ASCEND_BENCH_TQ_AUDIT_PHASES=decode ASCEND_BENCH_TQ_AUDIT_S=2048 \
+  ASCEND_BENCH_TQ_AUDIT_B=1 ASCEND_BENCH_TQ_AUDIT_MODELS=dsv4 \
   msprof --application="$DEV/bench_device_950pr_turboquant" \
          --output="$OUT/prof" \
          --ai-core=on \

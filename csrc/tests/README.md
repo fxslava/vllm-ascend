@@ -342,12 +342,17 @@ warmup.
 | `ASCEND_BENCH_MODES` | all three | comma-separated subset of `pipelined,device,host` |
 | `ASCEND_BENCH_CSV` | unset | write one row per (case, mode) to this path |
 | `ASCEND_BENCH_REPEATABLE` | on | `0` forces the re-plan-per-launch path |
-| `ASCEND_BENCH_TQ_CONTEXTS` | `512,1024,2048` | `bench_device_950pr_turboquant` only: the context lengths to sweep |
-| `ASCEND_BENCH_TQ_PREFILL` | on | `bench_device_950pr_turboquant` only: `0` drops the prefill suite |
-| `ASCEND_BENCH_TQ_PREFILL_S` / `_B` / `_D` / `_HQ` / `_HKV` | `512..8192` / `1,2,4` / `128,256` / `32,64,128` / `1,2,8` | the prefill sweep's axes, comma lists; the suite runs their cartesian product |
-| `ASCEND_BENCH_TQ_PREFILL_WARMUP` / `_ITERS` / `_BATCH` | 3 / 10 / 1 | the prefill suite's own budget; the shared `ASCEND_BENCH_WARMUP` / `_ITERS` / `_BATCH` do not apply to it |
-| `ASCEND_BENCH_TQ_PREFILL_LEGS` | all | comma list of `pf_*` legs to run |
-| `ASCEND_BENCH_TQ_PREFILL_CSV` / `_COMPARE_CSV` | unset | the prefill suite's raw (case, mode) CSV, and its one-row-per-shape comparison |
+| `ASCEND_BENCH_TQ_AUDIT_MODELS` | all three | `bench_device_950pr_turboquant` only: `qwen35,dsv4,glm52` |
+| `ASCEND_BENCH_TQ_AUDIT_S` / `_B` | all | the context regimes and batches to keep, comma lists over `2048,32768,262144,1048576` and `1,2,4,8` |
+| `ASCEND_BENCH_TQ_AUDIT_PHASES` | both | `prefill`, `decode` |
+| `ASCEND_BENCH_TQ_AUDIT_LEGS` | all | comma list of `pf_*` / `dec_*` legs to run |
+| `ASCEND_BENCH_TQ_AUDIT_CHUNK` | 2048 | query tokens one chunked-prefill step submits; `C = min(S, this)` |
+| `ASCEND_BENCH_TQ_AUDIT_PATH` | `auto` | `cube` or `aiv` to override the `H_Q/H_KV >= 16` rule that picks the decode path |
+| `ASCEND_BENCH_TQ_AUDIT_GLM_D` | 128 | GLM-5.2's head size; it is specified at 128 **or** 256 |
+| `ASCEND_BENCH_TQ_AUDIT_WARMUP` / `_ITERS` | 5 / 20 | the `S <= 32K` budget. The shared `ASCEND_BENCH_WARMUP` / `_ITERS` do not apply, and `pipeline_batch` is pinned to 1 |
+| `ASCEND_BENCH_TQ_AUDIT_ULTRA_WARMUP` / `_ULTRA_ITERS` | 1 / 3 | the `S >= 262K` budget, which gets its own runner and its own report table |
+| `ASCEND_BENCH_TQ_AUDIT_PREFILL_CSV` / `_DECODE_CSV` | unset | Table A and Table B as CSVs, one row per configuration |
+| `ASCEND_BENCH_TQ_FIA` | on | `bench_device_950pr_turboquant` only: `0` drops every native `aclnnFusedInferAttentionScoreV5` leg |
 | `ASCEND_BENCH_TQ_ABLATION_DIMS` | `256,512` | `bench_device_950pr_turboquant_ablation` only: head sizes, powers of two in [64, 512] |
 | `ASCEND_BENCH_TQ_ABLATION_CONTEXTS` | `64,512,1024,2048` | `bench_device_950pr_turboquant_ablation` only: contexts, positive multiples of 8 (TURBOQUANT_TESTS.md 13.20) |
 | `ASCEND_BENCH_TQ_ABLATION_STAGES` | `0,1,2,3,4,5` | `bench_device_950pr_turboquant_ablation` only: stages to run, in order; `--stage=` sets it |
@@ -604,8 +609,8 @@ production head count, gated on `cos > 0.90` per shape - and compiles the sim
 tier's source so the two tiers cannot enforce different bounds;
 `ASCEND_TQ_SIM_BATCH` and `ASCEND_TQ_SIM_CONTEXT` narrow either axis. `bench_device_950pr_turboquant` is built
 under `RUN_MODE=sim` but disabled in ctest for the same reason;
-`ASCEND_BENCH_TQ_CONTEXTS` and the usual `ASCEND_BENCH_*` knobs make a hand-run
-smoke check tractable.
+`ASCEND_BENCH_TQ_AUDIT_MODELS`, `_S`, `_B` and the usual `ASCEND_BENCH_*` knobs
+make a hand-run smoke check tractable.
 
 `test_host_turboquant_fidelity` needs none of this. It is host-only, links neither
 `libascendcl.so` nor a kernel, and reports the codec's fidelity on the Qwen3.5

@@ -619,6 +619,15 @@ void PlannedOp::Launch(aclrtStream stream) {
 BenchmarkRunner::BenchmarkRunner(std::string suite_name, const BenchmarkOptions& options, aclrtStream stream)
     : suite_name_(std::move(suite_name)), options_(options), stream_(stream) {}
 
+void BenchmarkRunner::set_options(const BenchmarkOptions& options) {
+  if (!results_.empty()) {
+    throw AclError("BenchmarkRunner::set_options after a case has run: the report header states one option "
+                   "set for the whole table",
+                   __FILE__, __LINE__, -1);
+  }
+  options_ = options;
+}
+
 void BenchmarkRunner::Skip(const std::string& case_name, const std::string& reason) {
   skipped_.push_back(SkippedCase{case_name, reason});
 }
