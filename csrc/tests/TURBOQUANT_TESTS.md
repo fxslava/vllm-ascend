@@ -440,43 +440,314 @@ and `D = 256` and is stated as such at the construction site.
 
 ### 7.5 `bench_device_950pr_turboquant`
 
-**Why "AIV-only" is the headline.** Nothing in `turboquant_kernels.cpp` touches
-the Cube: the score row is a vector `Mul` plus a `ReduceSum`, the value
-accumulation is a vector FMA, the Walsh-Hadamard is `Add`/`Sub` and `Gather`, the
-codec is compares and a `Gather` over a 16-entry table. Grep the source for
-`Matmul`, `Mmad` or an `[aic]` block and it comes back empty. This is the
-baseline any future Cube-assisted INT4 path has to beat, and measuring it before
-that path exists is the only way the later comparison means anything.
+This binary is an **end-to-end audit**, not a kernel microbenchmark. It asks one
+question, twice — once for prefill and once for decode:
 
-**Cases**, per context length `S in {512, 1024, 2048}`:
+> does a TurboQuant layer finish an attention step sooner than the same layer
+> built on the stock CANN operator, **after** every transformation the 4-bit
+> rotated cache imposes has been paid for?
 
-| Case | What is timed | Notes |
+Everything that does not serve that question has been taken out. There is no leg
+comparing TurboQuant against a hypothetical unquantised fp16 memory layout, and
+no leg comparing one TurboQuant kernel against another: those are *ablations*,
+they live in `bench_device_950pr_turboquant_ablation` (§7.6), and mixing them
+with a competitive comparison invites reading an internal ratio as a product
+claim. What is left is a component-by-component breakdown of the shipping path
+and one native baseline to divide it by.
+
+#### Which native operator, and why it is not the one that was asked for
+
+The specification for this audit named `aclnnPromptFlashAttentionV5` for the
+prefill role and `aclnnFusionIncrementalAttention` for the decode role.
+**Neither symbol exists.** CANN 9.2.0-beta.2 ships:
+
+| family | highest version in `include/aclnnop/` |
+| --- | --- |
+| `aclnn_prompt_flash_attention` | **V3** |
+| `aclnn_incre_flash_attention` | **V4** |
+| `aclnn_fused_infer_attention_score` | **V5** |
+
+and `aclnnFusionIncrementalAttention` appears in no header, and in no exported
+symbol, anywhere in the install. What *does* exist — and what "the native V5
+suite" means on an Ascend950 — is **`aclnnFusedInferAttentionScore`**, whose V5
+interface is the unified successor that replaces both families (§8: V1..V4 of it
+return `361001` on this part). One operator covers both roles, selected by its
+argument list:
+
+| role | `sparseMode` | mask | K/V | `blockSize` | `actualSeqLengths` / `…Kv` |
+| --- | --- | --- | --- | --- | --- |
+| **prompt** | 3 (right-down causal) | 2048×2048 compressed `int8` | contiguous TND | 0 — no paging | cumulative over `C` / cumulative over `S` |
+| **incremental** | 0 | none | paged pool as a 1-entry `aclTensorList` + block table | 128 | cumulative query tokens / context length **per sequence** |
+
+`aclnnFusedInferAttentionScoreV2` remains the fallback, and every table names the
+operator that actually planned.
+
+Guessing a prototype for the two symbols that were asked for was considered and
+rejected. A hand-declared argument list behind `dlsym` that does not match the
+operator is undefined behaviour **at launch**, not a planning refusal — it takes
+the stream down and every case queued behind it. This suite's rule is that every
+`aclnn` prototype is transcribed from a header it can point at; see §8 and
+`common/aclnn_ops_950pr.hpp`.
+
+#### The accounting
+
+```
+T_TQ_E2E = T_rot_q + T_attn_core + T_rot_o
+```
+
+measured with ACL events **per component and again as one composite region over
+the whole graph**. Both are reported. The components say where the time goes; the
+composite says what the caller waits for; the difference between them is the
+inter-stage launch overhead the component view cannot see, and the footer under
+each table prints that residual as a median percentage rather than leaving a
+reader to subtract.
+
+| term | prefill | decode |
 | --- | --- | --- |
-| `tq4_write_s<S>` | The cache write path: `S` tokens rotated, quantised and scattered. One launch. | Prefill-shaped — a decode step writes one token — and here because the cache has to be filled before it can be read and the fill is not free. |
-| `tq4_decode_s<S>` | The decode: split then combine, **two** launches on one stream. | The cache is written once during setup, so the timed region is the read path only. `tasks_per_launch = 2`, so the harness's queue-depth accounting knows this case submits two tasks per iteration. |
-| `fp16_decode_s<S>` | The same decode with an unquantised fp16 paged KV cache, through `aclnnFusedInferAttentionScoreV5` (or V2 where that is what resolves). | See §8. |
+| `T_rot_q` | `npu_turboquant_rotate_q` over the chunk's query | the same, over the step's query |
+| `T_attn_core` | FIA V5 over the rotated basis `(Q~, K~, V~)` | `TurboQuantCubeDecodeSplit` + `TurboQuantPagedAttentionCombine`, or the AIV launcher that submits both |
+| `T_rot_o` | `npu_turboquant_rotate_q` over the attention output, before the sigmoid gate | the same |
 
-Each case carries a checksum the harness verifies after warmup and again after
-the last timed iteration — the standard defence against timing an operator that
-has stopped writing its output. The write path's checksum is the whole scale
-plane, so a scale written outside the slot mapping is caught too.
+`T_rot_o` is **exactly `0.00 us` for a folded layer** — `W_o' = W_o (I ⊗ Π)`
+absorbs the de-rotation offline — and it is printed as a number rather than a
+dash, because it is a fact about the layer and not a missing sample. The CSV
+flags it as `rot_o_is_structural_zero`. Qwen3.5 cannot fold: `attn_output_gate`
+multiplies the context by `sigmoid(gate)` between attention and `o_proj`, so its
+column is a measured kernel on the critical path.
 
-**Reported metrics.** The shared harness reports min / median / mean / P95 / P99
-/ stddev per case across three timing modes (`pipelined`, `device`, `host`), plus
-TFLOP/s and GB/s. On top of that this suite prints its own summary: median
-pipelined latency, **decode steps per second**, KV GB/s from the traffic model's
-decode-read bytes over the measured time, TFLOP/s, and the ratio to the fp16 leg.
+Neither side's KV-cache **write** is inside its E2E figure, and both are visible:
+TurboQuant's is Table A's `TQ Ingest / Reshape` column, and the native write
+(`aclnnScatterPaKvCache`) is timed as `pf_v5_ingest` and carried in the prefill
+CSV alongside a `net_speedup_with_ingest` column that includes both.
 
-`flops_per_iteration` counts the attention math only — `QK^T` and the value
-accumulation, two operations per element of each. The rotation and the codec are
-**not** counted, so TFLOP/s is directly comparable between the two legs, and the
-gap between that figure and the kernel's real instruction count is exactly what
-the codec costs.
+#### Why prefill is chunked
 
-**Knobs:** everything in `common/benchmark.hpp` (`ASCEND_BENCH_WARMUP`,
-`ASCEND_BENCH_ITERS`, `ASCEND_BENCH_BATCH`, `ASCEND_BENCH_MODES`,
-`ASCEND_BENCH_CSV`, `ASCEND_BENCH_REPEATABLE`), plus `ASCEND_BENCH_TQ_CONTEXTS`
-to restrict the context sweep.
+A step processes `C = min(S, 2048)` query tokens against the `S`-token prefix,
+which is what vLLM's scheduler actually submits. Without it a 1M-context row is
+`O(S²)` attention — on the order of `8 × 10¹⁸` FLOPs for DeepSeek-V4-Flash, hours
+per iteration — and the table would be empty where it matters most. The
+`Context (S)` column prints `S/C` whenever `C < S`, and plain `S` when the chunk
+is the whole prefill. `ASCEND_BENCH_TQ_AUDIT_CHUNK` changes it.
+
+Chunking is also what makes `T_rot_q` meaningful in prefill at all. A chunk's
+query attends over a prefix that is already in the cache, and the cache stores
+`Π k`; the query has to be rotated to match. Π is orthogonal, so attention in the
+rotated basis is attention — `softmax(Q~ K~ᵀ) V~ = Π · softmax(Q Kᵀ) V` — which is
+the identity the first device check below asserts.
+
+#### The workload
+
+Three flagship families at TP=8, one NPU's share of each. Serving ranks, not a
+geometric sweep: a dense cartesian product of head counts produces hundreds of
+shapes nobody deploys and buries the nine that matter.
+
+| model | `D` | `H_Q` | `H_KV` | fold | decode path | why |
+| --- | --- | --- | --- | --- | --- | --- |
+| Qwen3.5-9B | 128 | 4 | 1 | **no** | AIV | GQA 4:1; `attn_output_gate` blocks the fold |
+| DeepSeek-V4-Flash-284B | 256 | 16 | 1 | yes | **Cube** | MLA decoupled latent KV; 16:1 exactly fills the Cube's M fractal |
+| GLM-5.2-744B | 128 | 8 | 1 | yes | AIV | ultra-wide GQA |
+
+| regime | `S` | `B` | warmup | timed |
+| --- | --- | --- | --- | --- |
+| short / interactive | 2 048 | 1, 4, 8 | 5 | 20 |
+| enterprise long | 32 768 | 1, 4, 8 | 5 | 20 |
+| ultra-long | 262 144 | 1, 2 | 1 | 3 |
+| extreme needle / 1M | 1 048 576 | 1 | 1 | 3 |
+
+3 families × 9 `(S, B)` pairs = **27 configurations**, each audited in both
+phases: 27 rows in Table A and 27 in Table B.
+
+**Two iteration budgets means two `BenchmarkRunner`s.** The generic per-case table
+stamps one `warmup= iterations= pipeline_batch=` line on the whole of itself, so a
+regime with a different budget gets its own runner and its own table rather than
+rows its header misdescribes. `BenchmarkRunner::set_options` exists for this and
+throws if it is called after a case has run.
+
+#### The decode path is chosen by the GQA group, not by a flag
+
+The Cube decode batches a kv head's query heads into the GEMM's `M` dimension, and
+that fractal is 16 rows wide (`turboquant_host::kCubeTileM`). A 16:1 group fills
+it; a 4:1 or 8:1 group runs it three-quarters or half empty and the vector path is
+the right one there. So `H_Q / H_KV >= 16` takes the Cube split and anything
+narrower takes `turboquant_paged_attention`. `ASCEND_BENCH_TQ_AUDIT_PATH=cube|aiv`
+overrides it.
+
+**The AIV path's `T_DecodeSplit` is derived, and is marked `~`.** There is no
+exported entry point for the AIV split alone — `turboquant_paged_attention_impl`
+submits both stages — so that column is the measured core minus the separately
+measured combine. The Cube path's split is measured directly and carries no
+marker. The CSV carries the flag as `split_is_derived`.
+
+#### The two device checks, before anything is timed
+
+| check | what it asserts | bound |
+| --- | --- | --- |
+| **rotated-basis identity** | FIA over `(Q~, K~, V~)`, un-rotated per head on the host, equals FIA over `(Q, K, V)`. The device-level statement that the prefill core is computing *the layer's* attention, and what licenses timing the folded path with `T_rot_o = 0`. | cos > 0.999 |
+| **decode tie-point** | the TurboQuant decode's output, un-rotated, against the native V5 decode over the same context in the same slots. | cos > 0.90 |
+
+The second bound is loose on purpose: 4 bits against 16 will not do better, and
+the fidelity gates are §5, §6 and `test_device_950pr_turboquant`. What it catches
+is the one failure the checksums are blind to — **timing a kernel that is reading
+an empty cache**. It runs on the smallest configuration whose context also fits an
+exact host image (`B·S·H_KV·D ≤ 2²²`), which is what lets the fp16 paged cache be
+built slot-exact rather than tiled. Both checks are recorded as ctest-visible
+failures when they miss.
+
+#### Cases, per configuration
+
+| leg | what is timed |
+| --- | --- |
+| `pf_ingest` | the TurboQuant cache write over the chunk — the Cube-native codec on the Cube path, the Lloyd-Max one on the AIV path |
+| `pf_rot_q` | `npu_turboquant_rotate_q` over the chunk's query |
+| `pf_attn_core` | FIA V5 over `(Q~, K~, V~)` |
+| `pf_rot_o` | the O de-rotation — skipped with a reason on a folded layer |
+| `pf_e2e` | the composite: rot-q, core, and rot-o when the layer needs it |
+| `pf_v5` | FIA V5 over `(Q, K, V)`, native uncompressed tensors |
+| `pf_v5_ingest` | `aclnnScatterPaKvCache`, the baseline's own cache write |
+| `dec_rot_q` | `npu_turboquant_rotate_q` over the step's query |
+| `dec_split` | `TurboQuantCubeDecodeSplit` — Cube path only; skipped with a reason on the AIV path |
+| `dec_combine` | `TurboQuantPagedAttentionCombine`, on both paths |
+| `dec_attn_core` | split + combine, or the AIV launcher |
+| `dec_rot_o` | the O de-rotation — skipped with a reason on a folded layer |
+| `dec_e2e` | the composite |
+| `dec_v5` | FIA V5 paged decode over the fp16 pool |
+
+**Decode legs run before prefill legs, per configuration, and the order is load
+bearing.** `pf_ingest` rewrites the tail of the TurboQuant cache from the chunk's
+own K/V and `pf_v5_ingest` rewrites part of the fp16 pool; running them first
+would leave the decode legs reading a cache the setup phase did not build. Neither
+rewrite changes any latency — both write the same bytes to the same slots every
+launch — but the order keeps the decode measuring a cache whose provenance is the
+one the tie-point checked.
+
+Every case carries a checksum the harness verifies after warmup and again after
+the last timed iteration. One consequence is worth naming: `dec_combine` timed on
+its own would reduce a workspace of zeros — a zero softmax denominator, so a
+non-finite checksum and a spurious failure — so `Scenario::Prime` runs one untimed
+pass of the attention core and both FIA plans before any case is registered,
+leaving the workspace and every output buffer holding real values.
+
+#### What is still not priced, said here rather than hidden
+
+1. **The `fp32 → fp16` narrowing between the rotation kernel and FIA, in the
+   prefill core only.** `npu_turboquant_rotate_q` writes fp32; FIA reads fp16.
+   Production does the cast with a torch op; this suite has no header-verified
+   `aclnnCast` prototype and will not guess one, so the rotated tensors FIA is
+   handed are prepared on the host in fp16. The modelled byte cost of both casts
+   is in the prefill CSV as `untimed_cast_bytes`. **The decode core has no such
+   gap** — the split kernels consume the fp32 rotation directly.
+2. **The sigmoid gate itself, for Qwen3.5.** `T_rot_o` stops where the
+   specification says it stops, and the gate is the same elementwise cost on both
+   sides of the comparison.
+3. **Accuracy.** TurboQuant stores 4 bits per coordinate and the native leg stores
+   16; the outputs are not the same numbers and are not meant to be. The decode
+   tie-point above is a provenance check, not a fidelity gate.
+
+#### Traffic, and what the GB/s columns mean
+
+Every byte figure is **compulsory traffic**: each distinct byte the step must move
+across HBM, counted once, under one convention for every leg. A cached KV row is
+counted once per *kv* head and not once per query head, whichever path reads it,
+so the ratio between two legs' byte counts is the ratio between their storage
+formats and not between their task decompositions. Re-reads that L2 may or may not
+absorb are not guessed at in either direction. `HBM Bandwidth` (Table A) and
+`Effective BW` (Table B) are the pipeline's compulsory traffic over its measured
+**composite** time.
+
+`Memory Compression Ratio` is fp16 KV residency over TurboQuant's, **scale plane
+included**. At `H_KV = 1` a token's scale slot is `round_up(2·H_KV, 8) = 8` fp32
+lanes for 2 live ones, so 24 of its 32 bytes are burst padding — which is most of
+the gap between the measured ratio and a naive 4.00×, and why every row in this
+sweep lands near 3.2× (`D = 128`) or 3.6× (`D = 256`) rather than at 4.
+
+#### Reported
+
+Two summary tables, printed after every case has run, plus the generic per-case
+table and CSV from the shared harness. The column definitions are §7.5.1 below.
+
+**Table A — prefill pipeline performance**
+
+```
+Model | Context (S) | B | H_Q/H_KV | D | TQ Ingest | T_rot_q | T_attn_core |
+T_rot_o | TQ_E2E | V5_Native | Net Speedup | HBM GB/s | KV Saved MB
+```
+
+**Table B — decode latency breakdown**
+
+```
+Model | Context | B | Path | T_rot_q | T_DecodeSplit | T_Combine | T_rot_o |
+TQ_E2E | V5_Decode | Net Speedup | Eff GB/s | Compression
+```
+
+`Net Speedup` is `V5 / TQ_E2E` in both: **above 1.000× is TurboQuant ahead.** An
+absent leg prints a dash; `0.00` would read as a measurement, except where it is
+one (a folded `T_rot_o`).
+
+#### 7.5.1 Column definitions
+
+| column | table | definition |
+| --- | --- | --- |
+| `Model` | A, B | the family label from the catalogue at the head of the file |
+| `Context (S)` | A | KV prefix length; `S/C` when the step is a `C`-token chunk of it |
+| `Context` | B | KV length per sequence |
+| `B` | A, B | sequences in the batch. In decode that is also the query token count |
+| `H_Q / H_KV` | A | query and kv heads on one NPU at TP=8 |
+| `D` | A | head size |
+| `Path Mode` | B | `Cube` or `AIV`, chosen by `H_Q/H_KV ≥ 16` |
+| `TQ Ingest / Reshape` | A | `pf_ingest`: rotate, quantise and scatter the chunk. **Not inside `TQ_E2E`** |
+| `T_rot_q` | A, B | `pf_rot_q` / `dec_rot_q` |
+| `T_attn_core` | A | `pf_attn_core`: FIA V5 over the rotated basis |
+| `T_DecodeSplit` | B | `dec_split` on the Cube path; core − combine, marked `~`, on the AIV path |
+| `T_Combine` | B | `dec_combine`, measured directly on both paths |
+| `T_rot_o` | A, B | `pf_rot_o` / `dec_rot_o`; exactly `0.00` on a folded layer |
+| `TQ_E2E` | A, B | `pf_e2e` / `dec_e2e`, **one composite ACL-event region**, not a sum |
+| `V5_Native` / `V5_Decode` | A, B | `pf_v5` / `dec_v5` on native uncompressed tensors |
+| `Net Speedup` | A, B | `V5 / TQ_E2E` |
+| `HBM Bandwidth` / `Effective BW` | A, B | compulsory E2E traffic ÷ measured composite time |
+| `KV Cache Memory Saved` | A | `(fp16 residency − TurboQuant residency)` for `B·S` tokens, MiB |
+| `Memory Compression Ratio` | B | fp16 residency ÷ TurboQuant residency, scale plane included |
+
+The CSVs carry everything above plus, per row: the regime label, the chunk length,
+the split count, `tq_e2e_sum_of_parts_us` beside the composite, per-leg GB/s and
+TFLOP/s, p95s, the raw byte and FLOP counts, `untimed_cast_bytes`, the flags
+`rot_o_is_structural_zero` and `split_is_derived`, the warmup/iteration budget the
+row ran under, and which timing mode the median came from. An absent leg leaves
+its fields **empty** rather than writing 0: a CSV is the artifact most likely to be
+read without its banner.
+
+#### Knobs
+
+| variable | default | effect |
+| --- | --- | --- |
+| `ASCEND_BENCH_TQ_AUDIT_MODELS` | all | `qwen35,dsv4,glm52` |
+| `ASCEND_BENCH_TQ_AUDIT_S` | all | restrict the context regimes |
+| `ASCEND_BENCH_TQ_AUDIT_B` | all | restrict the batches |
+| `ASCEND_BENCH_TQ_AUDIT_PHASES` | both | `prefill`, `decode` |
+| `ASCEND_BENCH_TQ_AUDIT_LEGS` | all | restrict the legs by name |
+| `ASCEND_BENCH_TQ_AUDIT_CHUNK` | 2048 | the prefill chunk `C` |
+| `ASCEND_BENCH_TQ_AUDIT_PATH` | `auto` | `cube` or `aiv` to override the group rule |
+| `ASCEND_BENCH_TQ_AUDIT_GLM_D` | 128 | GLM-5.2 is specified at 128 **or** 256 |
+| `ASCEND_BENCH_TQ_AUDIT_WARMUP` / `_ITERS` | 5 / 20 | the `S ≤ 32K` budget |
+| `ASCEND_BENCH_TQ_AUDIT_ULTRA_WARMUP` / `_ULTRA_ITERS` | 1 / 3 | the `S ≥ 262K` budget |
+| `ASCEND_BENCH_TQ_AUDIT_PREFILL_CSV` | unset | Table A as a CSV |
+| `ASCEND_BENCH_TQ_AUDIT_DECODE_CSV` | unset | Table B as a CSV |
+| `ASCEND_BENCH_TQ_FIA` | on | `0` drops every native V5 leg |
+
+plus the shared `ASCEND_BENCH_*` set (`common/benchmark.hpp`). Note that
+`ASCEND_BENCH_MODES` selects **three** timing modes by default and each is a full
+warmup-plus-iterations run: on the ultra-long rows that is the difference between
+minutes and tens of minutes. `pipeline_batch` is pinned to 1 regardless of
+`ASCEND_BENCH_BATCH`, because these shapes are orders of magnitude heavier than
+the microbenchmarks the shared default of 10 was chosen for.
+
+A configuration whose estimated footprint exceeds 85% of free HBM is skipped with
+both numbers in the reason, and every one of its legs gets a recorded skip so the
+hole is visible in the report.
+
+> **NOTHING THIS BINARY PRINTS HAS EVER BEEN TAKEN ON SILICON.** No Ascend 950PR
+> part has been available to this project. The kernels are verified on the arch35
+> camodel (§13.8, §13.10) and the FIA V5 argument list has never been through a
+> planning call on hardware (§8). Every number is hypothetical until that changes.
 
 ### 7.6 `bench_device_950pr_turboquant_ablation`
 
@@ -710,9 +981,17 @@ attached, not as corruption.
 > argument list has never been through a planning call. If the first silicon run
 > returns non-zero here, the argument list is the first suspect — and within it,
 > `kFiaPseTypeDefault` and the seven optional tensors are the two things to vary
-> first. Until that run happens, **there are no measured `fp16 us`, no measured
-> speedup and no measured fp16 GB/s.** What exists is the traffic model in §7.5,
-> which is exact arithmetic over the two layouts and not a measurement.
+> first. Until that run happens, **there is no measured `V5_Native`, no measured
+> `V5_Decode` and no measured net speedup** in either of §7.5's tables. What
+> exists is the traffic model behind their byte and compression columns, which is
+> exact arithmetic over the two layouts and not a measurement.
+
+> **The geometry above is the old fixed shape.** Since the audit rewrite, V5 is
+> planned per configuration across three model families and both roles — the
+> prompt role with `sparseMode` 3 and a compressed causal mask, the incremental
+> role with `sparseMode` 0 and a block table — rather than at one `head_dim` 256
+> / 8-over-2 shape. §7.5 has the current argument lists and the reason the two
+> operators the audit was specified against do not exist.
 
 ---
 
@@ -1088,6 +1367,14 @@ loop (§ the four defects in the 2026-09-08 run).
 
 ### 13.6 The fp16 baseline is now a kernel, not an operator
 
+> **Superseded by §7.5 / §13.7.** `turboquant_fp16_decode` is still built, still
+> exported and still declared in `common/turboquant_launch.hpp`, but it **no
+> longer has a leg in `bench_device_950pr_turboquant`**. That binary is an
+> end-to-end audit against the native V5 operator now, and a Cube decode over an
+> unquantised cache measures the *codec* — an ablation, not a competitive claim.
+> Everything below is still an accurate description of the kernel; it is no
+> longer a description of what the benchmark reports.
+
 §8 records that `aclnnFusedInferAttentionScore` V1–V4 are withdrawn on an
 Ascend950 — the planning call returns `361001` — and that the suite migrated to
 V5 with V2 as a fallback. V5 is exported but has never been planned on hardware,
@@ -1114,137 +1401,82 @@ accumulator was never rotated, so un-rotating it would be wrong.
 
 ### 13.7 What the benchmark now reports
 
-`bench_device_950pr_turboquant`, per `S in {64, 512, 1024, 2048}`, warmup 20,
-100 iterations, at `B=1 H=8 D=256` over 2 kv heads with `block_size` 128:
+`bench_device_950pr_turboquant` **is no longer a kernel comparison table.** It is
+an end-to-end audit of the shipping path against the native CANN V5 operator, and
+the full specification — workload, accounting, checks, columns and knobs — is
+§7.5. This section records what changed and why, for anyone holding an older run.
 
-| case | what it times | default |
-|---|---|---|
-| `tq4_write_s<S>` / `tq4_decode_s<S>` | the AIV-only 4-bit path, unchanged | **runs** |
-| `kv4fp8_write_s<S>` | the 4-bit cache write through the multi-rate codec | **runs** |
-| `kv4fp8_decode_s<S>` | the Cube-native 4-bit decode, split then combine | **runs** |
-| `fp16_decode_s<S>` | the physical fp16 Cube baseline | **runs** |
-| `fia_decode_s<S>` | the **stock CANN operator** baseline over the same fp16 paged cache | **attempted** |
+#### What was removed, and why
 
-`S=64` is in the sweep so the timings start at the one shape whose numerics have
-been checked anywhere (§13.9); without it every timed shape is one whose fidelity
-is unmeasured.
+| removed | why |
+| --- | --- |
+| `fp16_decode_s<S>` — `turboquant_fp16_decode`, the Cube decode with the codec removed | It measured the **codec** against a physical fp16 cache nobody would deploy. That is an ablation, not a competitive claim, and a reader seeing `vs fp16` beside `vs fia` in one table has no way to know only the second is a product statement. |
+| `tq4_write_s<S>` / `tq4_decode_s<S>` beside `kv4fp8_*` | The AIV-vs-Cube ratio is a kernel comparison. Since §13.9 it also moved the *quantiser* and the *compute unit* together — Lloyd-Max on one side, affine INT4 on the other — so it had stopped isolating anything. The path is now **chosen** per model by the GQA group (§7.5) and only the chosen one is timed. |
+| `pf_fp16_write` / `pf_fp16_pipeline` | Same reason: a pipeline built on an unquantised write is not what the comparison is against. `aclnnScatterPaKvCache` survives as `pf_v5_ingest`, which is the **native baseline's own** cache write and therefore a real cost on the other side of the ledger. |
+| the 270-shape prefill sweep (`S`×`B`×`D`×`H_Q`×`H_KV`) | A dense cartesian product of head counts produces hundreds of shapes nobody deploys and buries the ones that matter. Replaced by 27 serving ranks across three flagship families at TP=8. |
+| the standalone traffic-model tables | Folded into the two summary tables as the `KV Cache Memory Saved` and `Memory Compression Ratio` columns, and into the CSVs as raw byte counts. |
 
-**The operator leg is `aclnnFusedInferAttentionScoreV5`, falling back to
-`aclnnFusedInferAttentionScoreV2`, and it is expected to be absent on some
-builds.** V1..V4 are withdrawn on an Ascend950 — planning returns 361001,
-measured on CANN 9.1.0 — and V5's argument list has never been planned on
-hardware. Both are tried at construction, before any timing, and the outcome is
-recorded either way: a latency if one planned, or the operator name and the
-planning status as a ctest-visible **skip** if neither did. A configuration where
-no stock operator exists is a fact about the part, not a defect in this binary,
-which is why it is a skip and not a failure.
+#### What was added
 
-It reads the **same** fp16 caches `fp16_decode` built rather than allocating its
-own, so both sides of that comparison see identical bytes through identical
-paging, and it is planned once at construction through `PlanAclnn` so the timed
-region is the launch rather than the aclnn planner.
+- **A strict E2E definition**, `T_rot_q + T_attn_core + T_rot_o`, measured per
+  component *and* as one composite ACL-event region, with the residual between
+  them printed. Nothing about the rotated cache is outside a timed region any
+  more except the one narrowing named in §7.5 and repeated in the file header.
+- **The folded / unfolded distinction as a first-class column.** Qwen3.5's
+  `attn_output_gate` is the reason `T_rot_o` exists as a measurement; DeepSeek-V4
+  and GLM-5.2 fold it into `W_o` and report an exact `0.00 us`.
+- **Chunked prefill**, `C = min(S, 2048)`, without which the 262K and 1M rows are
+  hours of `O(S²)` attention per iteration and the table is empty exactly where
+  the memory argument is strongest.
+- **Adaptive iteration budgets**, 5/20 below 262K and 1/3 at or above it, which is
+  why the binary now prints **two** generic per-case tables — one per budget, each
+  with a header that describes its own rows. `BenchmarkRunner::set_options` was
+  added for this and refuses to run after a case has been recorded.
+- **Two device checks before any timing**: the rotated-basis identity
+  (`cos > 0.999`) and the decode tie-point against the native operator
+  (`cos > 0.90`). The second exists to catch a benchmark timing a kernel that is
+  reading an empty cache, which no checksum can detect.
+- **`H_KV = 1` everywhere.** All three families are MQA-shaped at TP=8. That makes
+  the scale plane's burst padding the dominant term in the compression ratio —
+  24 of every 32 scale-plane bytes are padding — and it is why the ratios land
+  near 3.2× and 3.6× rather than at 4.
 
-**All four legs run by default.** The gate that used to hold the Cube legs shut
-was §13.8's fifth defect - `TurboQuantCubeMm::Init` allocating L0A/L0B/L0C on
-both halves of the MIX kernel, which faulted the AIV half rather than returning
-a wrong number - and that defect is closed. Both Cube kernels now allocate L1 on
-both cores and L0 under `ASCEND_IS_AIC`; the same split was applied to
-`TurboQuantFp16DecodeSplit::Init`, which had it too and would have taken the
-fp16 baseline down with it.
+#### The operator the specification asked for does not exist
 
-What is still open is the score GEMM's operand form, and that is a wrong number
-rather than a dead stream: the launch completes and the checksum is stable, so
-it cannot take the queue down behind it. **The benchmark says so on every run**,
-in the banner and again at the foot of the summary, because the summary is the
-part that gets pasted into a report. Treat every Cube column as provisional
-until §13.8's open defect is closed.
+The audit was specified against `aclnnPromptFlashAttentionV5` and
+`aclnnFusionIncrementalAttention`. CANN 9.2.0-beta.2 ships PFA up to **V3**, IFA
+up to **V4**, and no symbol named `aclnnFusionIncrementalAttention` at all.
+`aclnnFusedInferAttentionScoreV5` is the unified interface that replaces both
+families on an Ascend950 (§8), and it is what both roles are planned against —
+`sparseMode 3` with the compressed causal mask for the prompt role, `sparseMode 0`
+with a block table for the incremental one. Guessing a prototype for a symbol that
+is not in a header is undefined behaviour at launch rather than a planning
+refusal, and this suite does not do it. See §7.5 and §8.
 
-`VLLM_ASCEND_TQ_CUBE_WIP=0` drops the Cube legs, which is what to reach for if a
-future defect does fault: a faulting launch takes the stream down and every case
-queued behind it, so the switch is before the launch, and before *construction*
-too - a dropped run never allocates the second and third KV caches either.
+#### Still true, and still the headline
 
-```bash
-VLLM_ASCEND_TQ_CUBE_WIP=0 ./bench_device_950pr_turboquant   # AIV-only baseline
-```
+**kv3fp4 and kv5fp8 have no leg here.** Both are still built, still dispatched and
+still covered by the sim tier. Neither is on the 4-bit path this binary measures.
+`kv5fp8`'s fidelity — the one that clears `cos > 0.995` — is measured by
+`scripts/tq_multimode_calibration.py` and recorded in §13.3.
 
-`-DVLLM_ASCEND_TESTS_ENABLE_WIP_CUBE=ON` is now **sim-tier only**: it flips the
-default that `REQUIRE_CUBE_WIP_OPT_IN` reads in `test_sim_950pr_cube_gemm` and
-`test_sim_950pr_turboquant_multimode`, and no longer has anything to say about
-this binary. The environment variable is still read by both tiers, so setting it
-explicitly keeps them in step. The Cube sources are **compiled in every
-configuration** regardless; the switch decides what launches, not what builds.
+`test_device_950pr_turboquant`, the bare-metal correctness binary, is unchanged
+and needs no switch of its own: it drives `turboquant_kernels.cpp` only and calls
+nothing in `turboquant_mm_kernels.cpp`. Keep it that way.
 
-**kv3fp4 and kv5fp8 have no leg here.** Both are still built, still dispatched
-and still covered by the sim tier. Neither is on the 4-bit path this binary
-measures, and a column for each was another KV cache of the same shape per
-context length for a comparison nothing was asking of a benchmark whose subject
-is the 4-bit ecosystem. `kv5fp8`'s fidelity - the one that clears cos > 0.995 -
-is measured by `scripts/tq_multimode_calibration.py` and recorded in §13.3, not
-here.
+`VLLM_ASCEND_TQ_CUBE_WIP` no longer gates anything in this binary. The Cube legs
+it used to hold shut are the *selected path* for one of the three families now,
+and a family whose group does not fill the Cube fractal never launches a Cube
+kernel in the first place. `ASCEND_BENCH_TQ_AUDIT_PATH=aiv` is what to reach for
+if a future Cube defect faults: it moves every family onto the vector path before
+any launch. `-DVLLM_ASCEND_TESTS_ENABLE_WIP_CUBE=ON` remains sim-tier only.
 
-`test_device_950pr_turboquant`, the bare-metal correctness binary, needs no
-switch of its own: it drives `turboquant_kernels.cpp` only and calls nothing in
-`turboquant_mm_kernels.cpp`. Keep it that way.
-
-The summary prints three tables, all keyed on the shape.
-
-**1. Latency**, one row per `S`, columns `kv4 us` / `tq4 us` / `fp16 us` /
-`fia us`. A leg with no sample prints a dash; `0.00` would read as a measurement.
-
-**2. Speedups**, every one `kv4` against a denominator, because `kv4` is the
-thing being proposed and the other three are what it would replace:
-
-| column | what it is | what it isolates |
-|---|---|---|
-| `vs fp16` | against the unquantised fp16 Cube decode | the **codec**, and nothing else: same kernel, codec removed |
-| `vs tq4` | against the AIV-only 4-bit decode | the Cube against the vector cores — but see below |
-| `vs fia` | against the stock CANN operator | what a caller actually gains by switching |
-
-**3. Derived rates**, now per leg rather than for `kv4fp8` alone: steps/s, GB/s
-and TFLOP/s. Each leg's GB/s is **its own** traffic model over **its own**
-measured time, so the column compares a leg to its own memory demand and not to
-another leg's — a 4-bit cache and an fp16 one do not read the same bytes, which
-is the entire point of the change.
-
-**`vs tq4` no longer holds the codec fixed, and the old claim that it did is
-now wrong.** It used to be true that `tq4` and `kv4fp8` stored identical nibbles
-against identical thresholds. Since §13.9, `kv4fp8` bins against uniform
-thresholds and packs coordinates `b` / `b + d/2` into a byte, while `tq4` still
-bins against Lloyd-Max thresholds and interleaves `2b` / `2b + 1`. The cache
-geometry is identical and the contents are not, so that ratio now moves the
-quantiser and the compute unit together. Separating them again would mean keeping
-a Lloyd-Max Cube leg alive purely as a benchmark control, which has not been
-done.
-
-A failure in the fp16 case is recorded as a **failure** and not a skip: it is a
-kernel in the same binary, so if it does not run, something is broken rather than
-missing. That is a different thing from the dropped-leg skip, which is a decision
-taken before any launch, and from the operator leg's skip, which is a fact about
-the CANN build.
-
-**The comparison CSV.** `ASCEND_BENCH_TQ_COMPARE_CSV=<path>` writes one row per
-shape with `batch,context_len,num_heads,head_dim,num_kv_heads,block_size`, each
-leg's median, the operator that planned, the three speedups, per-leg GB/s and
-TFLOP/s, per-leg p95, and both traffic-model byte counts. It is separate from the
-generic `ASCEND_BENCH_CSV`, which is one row per (case, mode) and knows nothing
-about which cases are baselines for which: that one is the raw record, this one is
-the comparison. An absent leg leaves its fields **empty** rather than writing 0,
-because this is the artifact most likely to be read without its banner.
-
-**Every row is `B=1`.** The benchmark times one decode step per launch. The batch
-axis is *validated* rather than timed, by `test_device_950pr_turboquant_multimode`
-at batch `{1, 8}`; sweeping it here would multiply four context lengths of KV
-cache by the batch and is a separate change.
-
-The traffic model is printed either way and is still not a measurement. The kv4
-rate gets its own table rather than two more columns on the 4-bit one, because
-one line of it is easy to misread: the Cube decode reads each cached row once
-per *kv* head rather than once per query head, since the query heads of a group
-are batched into M. That is a property of the task decomposition, not of the
-rate, and it is why the kv4 decode-read column is not the tq4 one - **the two
-cache footprints are identical**, byte for byte, and only the decode-read column
-separates them.
+> **NO NUMBER THIS BINARY PRINTS HAS EVER BEEN TAKEN ON SILICON**, and the banner
+> says so on every run. No Ascend 950PR part has been available to this project;
+> the kernels are verified on the arch35 camodel (§13.8, §13.10), and the FIA V5
+> argument list has never been through a planning call on hardware (§8). The
+> tables are a measurement *apparatus*, complete and self-describing; the
+> measurements do not exist yet.
 
 ### 13.8 What has actually been executed, and what has not
 
@@ -2789,6 +3021,16 @@ the list and move nothing. No tick number for the combine should be believed
 until that has been measured.
 
 #### Prefill against FIA V5
+
+> **Superseded by §7.5 / §13.7.** This describes the 270-shape prefill sweep as it
+> was first built. It has been replaced by the end-to-end audit: 27 serving ranks
+> across three flagship families instead of a cartesian product, chunked prefill
+> instead of full-context, and `pf_fp16_write` / `pf_fp16_pipeline` dropped as
+> unquantised-memory comparisons. The fold-identity check, the tiled context data,
+> the 85%-of-free-HBM guard and the untimed-cast caveat all survive into the
+> audit; the footprint table below is unchanged arithmetic and is still correct.
+> The `ASCEND_BENCH_TQ_PREFILL_*` variables named here no longer exist — see
+> §7.5's knob table for the `ASCEND_BENCH_TQ_AUDIT_*` set that replaced them.
 
 `bench_device_950pr_turboquant` runs a second suite after the decode summary, in
 its own `BenchmarkRunner` on the same stream, with its own budget (warmup 3,

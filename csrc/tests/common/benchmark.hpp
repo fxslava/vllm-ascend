@@ -275,6 +275,15 @@ class BenchmarkRunner {
   aclrtStream stream() const { return stream_; }
   const BenchmarkOptions& options() const { return options_; }
 
+  // Replaces the option set future cases run under. Legal only before the first
+  // Run(): PrintTable stamps ONE warmup / iterations / pipeline_batch line on
+  // the whole table, so a change after a case has been recorded would leave that
+  // header describing rows it does not cover. A suite that needs two iteration
+  // budgets -- a 2K context and a 1M one do not want the same one -- takes a
+  // second runner for the second budget rather than switching mid-table; see
+  // device/bench_device_950pr_turboquant.cpp.
+  void set_options(const BenchmarkOptions& options);
+
   // Warms up, times every enabled mode, and records the results. Throws
   // AclError on a launch failure; the caller decides whether one bad case ends
   // the suite.
