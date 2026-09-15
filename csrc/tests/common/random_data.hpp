@@ -14,10 +14,6 @@
  * limitations under the License.
  */
 
-// Deterministic test data. std::mt19937 is specified bit-exactly by the
-// standard but the distribution classes are not, so Box-Muller and the uniform
-// mapping are written out here and a failure reproduces on every host.
-
 #pragma once
 
 #include <cmath>
@@ -35,7 +31,6 @@ class DeterministicRandom {
   explicit DeterministicRandom(uint32_t seed) : engine_(seed) {}
 
   float Uniform(float low, float high) {
-    // 24 bits of mantissa is the most a float can hold exactly.
     const uint32_t bits = engine_() >> 8;
     const float unit = static_cast<float>(bits) / static_cast<float>(1u << 24);
     return low + unit * (high - low);
@@ -46,7 +41,6 @@ class DeterministicRandom {
       has_spare_ = false;
       return mean + stddev * spare_;
     }
-    // Box-Muller. u1 is clamped away from zero so the log stays finite.
     float u1 = Uniform(0.0f, 1.0f);
     if (u1 < 1e-7f) {
       u1 = 1e-7f;
@@ -64,8 +58,6 @@ class DeterministicRandom {
     return low + static_cast<int32_t>(engine_() % span);
   }
 
-  // Values already rounded to fp16, so the reference and the device see exactly
-  // the same inputs and the only difference measured is the arithmetic.
   std::vector<float> NormalHalfExact(size_t count, float mean, float stddev) {
     std::vector<float> values(count);
     for (size_t i = 0; i < count; ++i) {
@@ -82,8 +74,6 @@ class DeterministicRandom {
     return values;
   }
 
-  // Fisher-Yates shuffle over 0..count-1, used for block tables and slot maps
-  // so paged accesses are genuinely scattered rather than sequential.
   std::vector<int32_t> Permutation(int32_t count) {
     std::vector<int32_t> values(static_cast<size_t>(count));
     for (int32_t i = 0; i < count; ++i) {
@@ -104,5 +94,5 @@ class DeterministicRandom {
   bool has_spare_ = false;
 };
 
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}

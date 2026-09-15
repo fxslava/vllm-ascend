@@ -14,24 +14,6 @@
  * limitations under the License.
  */
 
-// Linear projections on Ascend 950PR, through the cube unit.
-//
-// Stages 2, 6 and 8 of the Qwen3.5 decoder layer. Every one is x @ W^T with W
-// stored in the torch [out_features, in_features] layout, which is what
-// DeviceTensor::HalfTransposed2D describes with strides rather than a host-side
-// transpose.
-//
-// The operator is the stock aclnnMatmul with cubeMathType KEEP_DTYPE, so fp16
-// operands stay fp16 through the cube unit. The 950PR custom matmuls are all
-// quantised, grouped or fused forms.
-//
-// Seeds, shapes and tolerances match csrc/tests/kernels/cuda/test_matmul.cpp.
-//
-// NOT COVERED: M > 1. Decode is M=1, but a GEMV does not exercise the cube
-// unit's M tiling, and arch35 splits cube and vector into separate cores
-// (cube_vector_combine=split), so the M tiling and the cube/vector handover are
-// 950PR-specific behaviour a single-row case cannot reach.
-
 #include <gtest/gtest.h>
 
 #include <cmath>
@@ -61,8 +43,6 @@ const AclnnOp& MatmulOp() {
   return op;
 }
 
-// Runs aclnnMatmul with `b_t` supplied in Linear [N, K] layout and viewed as
-// [K, N], and returns the fp16 [M, N] output widened back to float.
 std::vector<float> RunMatmulOnDevice(const std::vector<float>& a, const std::vector<float>& b_t, int64_t m,
                                      int64_t k, int64_t n) {
   aclrtStream stream = AscendTestEnvironment::Instance().stream();
@@ -77,15 +57,7 @@ std::vector<float> RunMatmulOnDevice(const std::vector<float>& a, const std::vec
   return out_device.ToFloatFromHalf();
 }
 
-// -----------------------------------------------------------------------------
-// Host-only checks
-// -----------------------------------------------------------------------------
-
 TEST(Matmul950PrShapes, LayerProjectionsAreCoveredByTheSweep) {
-  // The five distinct (K, N) pairs the golden layer puts through the cube unit.
-  // If one of them is not in the sweep, a projection that only the end-to-end
-  // test touches has no unit-level coverage at all, and a failure there has to
-  // be bisected by hand.
   struct Projection {
     const char* name;
     int64_t k;
@@ -98,21 +70,12 @@ TEST(Matmul950PrShapes, LayerProjectionsAreCoveredByTheSweep) {
   };
 
   for (const Projection& projection : projections) {
-    // Both sides must be a whole number of fp16 bursts for the cube unit's
-    // 16-element fractal to be exact.
     EXPECT_EQ(projection.k % s::kFp16ElementsPerBurst, 0) << projection.name << " K";
     EXPECT_EQ(projection.n % s::kFp16ElementsPerBurst, 0) << projection.name << " N";
   }
 }
 
 TEST(Matmul950PrReference, MatchesHandComputedCase) {
-  // a = [1, 2, 3]                 (m=1, k=3)
-  // b_t = [[1, 0, -1],            (n=2, k=3) -> output channel 0
-  //        [2, 2,  2]]                          output channel 1
-  // out = [1*1 + 2*0 + 3*(-1), 1*2 + 2*2 + 3*2] = [-2, 12]
-  //
-  // The reference is shared with the 310P and CUDA suites, so this is really a
-  // check that the [N, K] weight layout is being read the same way here.
   const std::vector<float> a{1.0f, 2.0f, 3.0f};
   const std::vector<float> b_t{1.0f, 0.0f, -1.0f, 2.0f, 2.0f, 2.0f};
 
@@ -124,20 +87,12 @@ TEST(Matmul950PrReference, MatchesHandComputedCase) {
   EXPECT_FLOAT_EQ(out[1], 12.0f);
 }
 
-// -----------------------------------------------------------------------------
-// Device parity
-// -----------------------------------------------------------------------------
-
 class Matmul950PrTest : public ::testing::TestWithParam<std::tuple<int64_t, int64_t>> {
  protected:
   int64_t k() const { return std::get<0>(GetParam()); }
   int64_t n() const { return std::get<1>(GetParam()); }
   int64_t m() const { return s::kDecodeTokenCount; }
 
-  // stddev 1/sqrt(K) for the weights, so the output sits near unit magnitude.
-  // At magnitude ~1 an fp16 ULP is ~9.8e-4 and atol=rtol=1e-3 is a one-ULP bar;
-  // with N(0,1) weights a 2048-deep dot product lands near magnitude 45, where
-  // the tolerance would be measuring fp16 storage instead of the kernel.
   float weight_stddev() const { return 1.0f / std::sqrt(static_cast<float>(k())); }
 };
 
@@ -145,10 +100,8 @@ TEST_P(Matmul950PrTest, MatchesCpuReference) {
   REQUIRE_ASCEND_950PR();
   REQUIRE_ACLNN_OP(MatmulOp());
 
-  DeterministicRandom random(0x4d4d554cu);  // "MMUL"
+  DeterministicRandom random(0x4d4d554cu);
 
-  // Pre-rounded to fp16 so the device and the reference start from
-  // bit-identical inputs and the comparison measures arithmetic only.
   const std::vector<float> a = random.NormalHalfExact(static_cast<size_t>(m() * k()), 0.0f, 1.0f);
   const std::vector<float> b_t = random.NormalHalfExact(static_cast<size_t>(n() * k()), 0.0f, weight_stddev());
 
@@ -164,10 +117,7 @@ TEST_P(Matmul950PrTest, ZeroWeightsProduceZeroOutput) {
   REQUIRE_ASCEND_950PR();
   REQUIRE_ACLNN_OP(MatmulOp());
 
-  // An all-zero weight must give an exactly zero output, with no NaN leaking in
-  // from an uninitialised accumulator or a padded K tile. This needs no
-  // reference at all, so it isolates the kernel from the host arithmetic.
-  DeterministicRandom random(0x5a45524fu);  // "ZERO"
+  DeterministicRandom random(0x5a45524fu);
 
   const std::vector<float> a = random.NormalHalfExact(static_cast<size_t>(m() * k()), 0.0f, 1.0f);
   const std::vector<float> b_t(static_cast<size_t>(n() * k()), 0.0f);
@@ -185,10 +135,7 @@ TEST_P(Matmul950PrTest, IsLinearInTheInput) {
   REQUIRE_ASCEND_950PR();
   REQUIRE_ACLNN_OP(MatmulOp());
 
-  // Scaling A by 2 must scale the output by 2. 2 is exact in fp16, so this
-  // catches a kernel that folds a scale or a tile offset in the wrong place
-  // without depending on the CPU reference.
-  DeterministicRandom random(0x4c494e32u);  // "LIN2"
+  DeterministicRandom random(0x4c494e32u);
 
   const std::vector<float> a = random.NormalHalfExact(static_cast<size_t>(m() * k()), 0.0f, 1.0f);
   const std::vector<float> b_t = random.NormalHalfExact(static_cast<size_t>(n() * k()), 0.0f, weight_stddev());
@@ -220,6 +167,6 @@ INSTANTIATE_TEST_SUITE_P(Qwen35, Matmul950PrTest,
                                             ::testing::ValuesIn(s::LinearOutputSizes())),
                          MatmulTestName);
 
-}  // namespace
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}

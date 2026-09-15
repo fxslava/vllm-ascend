@@ -14,9 +14,6 @@
  * limitations under the License.
  */
 
-// Pairs a device allocation with the aclTensor descriptor that points at it,
-// so the two live and die together.
-
 #pragma once
 
 #include <cassert>
@@ -47,33 +44,20 @@ class DeviceTensor {
   size_t element_count() const { return element_count_; }
   void* data() const { return buffer_.get(); }
 
-  // --- fp16 -----------------------------------------------------------------
-
-  // Uploads float values, rounding each to fp16 on the way. Pass values that
-  // are already exactly representable in fp16 when the test needs the device
-  // and the reference to start from identical bits.
   static DeviceTensor Half(const std::vector<int64_t>& dims, const std::vector<float>& values,
                            aclFormat format = ACL_FORMAT_ND, size_t alignment = kDeviceAlignBytes);
   static DeviceTensor HalfEmpty(const std::vector<int64_t>& dims, aclFormat format = ACL_FORMAT_ND,
                                 size_t alignment = kDeviceAlignBytes);
   std::vector<float> ToFloatFromHalf() const;
 
-  // A [k, n] tensor whose storage is [n, k] row-major, described with strides
-  // {1, k} instead of being copied. This is the weight layout a Linear layer
-  // already holds, so a matmul test can pass a transposed B the way the plugin
-  // does. `values` is the [n, k] buffer, n * k elements.
   static DeviceTensor HalfTransposed2D(int64_t n, int64_t k, const std::vector<float>& values,
                                        size_t alignment = kDeviceAlignBytes);
-
-  // --- fp32 -----------------------------------------------------------------
 
   static DeviceTensor Float(const std::vector<int64_t>& dims, const std::vector<float>& values,
                             aclFormat format = ACL_FORMAT_ND, size_t alignment = kDeviceAlignBytes);
   static DeviceTensor FloatEmpty(const std::vector<int64_t>& dims, aclFormat format = ACL_FORMAT_ND,
                                  size_t alignment = kDeviceAlignBytes);
   std::vector<float> ToFloat() const;
-
-  // --- int32 ----------------------------------------------------------------
 
   static DeviceTensor Int32(const std::vector<int64_t>& dims, const std::vector<int32_t>& values,
                             aclFormat format = ACL_FORMAT_ND, size_t alignment = kDeviceAlignBytes);
@@ -128,14 +112,12 @@ inline DeviceTensor DeviceTensor::HalfTransposed2D(int64_t n, int64_t k, const s
   }
 
   DeviceTensor tensor;
-  // dims_ is the logical view the operator sees; the allocation is the same
-  // n * k elements either way.
   tensor.dims_ = {k, n};
   tensor.element_count_ = count;
   tensor.buffer_.Allocate(count * sizeof(uint16_t), alignment);
   tensor.buffer_.CopyFromHost(bits.data(), bits.size() * sizeof(uint16_t));
-  tensor.tensor_ = AclnnTensor(/*dims=*/{k, n}, /*strides=*/{1, k}, /*offset=*/0, ACL_FLOAT16, ACL_FORMAT_ND,
-                               /*storage_dims=*/{n, k}, tensor.buffer_.get());
+  tensor.tensor_ = AclnnTensor({k, n}, {1, k}, 0, ACL_FLOAT16, ACL_FORMAT_ND,
+                               {n, k}, tensor.buffer_.get());
   return tensor;
 }
 
@@ -182,5 +164,5 @@ inline std::vector<int32_t> DeviceTensor::ToInt32() const {
   return values;
 }
 
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}

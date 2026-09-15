@@ -14,239 +14,6 @@
  * limitations under the License.
  */
 
-// ============================================================================
-// TurboQuant end-to-end audit against the native CANN V5 attention operator
-// ============================================================================
-//
-// One question, asked twice -- once for prefill and once for decode:
-//
-//     does a TurboQuant layer finish an attention step sooner than the same
-//     layer built on the stock CANN operator, AFTER every transformation the
-//     4-bit rotated cache imposes has been paid for?
-//
-// Everything in this binary exists to answer that and nothing else. There is no
-// leg here that compares TurboQuant against a hypothetical fp16 memory layout,
-// and no leg that compares one TurboQuant kernel against another: those are
-// ablations, they live in bench_device_950pr_turboquant_ablation, and a
-// benchmark that mixes them with a competitive comparison invites reading an
-// internal ratio as a product claim. What is left is a component-by-component
-// breakdown of the shipping path and one native baseline to divide it by.
-//
-// ---------------------------------------------------------------------------
-// WHICH NATIVE OPERATOR, AND WHY IT IS NOT THE ONE THE BRIEF NAMED
-// ---------------------------------------------------------------------------
-//
-// The brief for this file asked for `aclnnPromptFlashAttentionV5` in the
-// prefill role and `aclnnFusionIncrementalAttention` in the decode role.
-// NEITHER SYMBOL EXISTS. The CANN 9.2.0-beta.2 toolkit this tree builds against
-// ships `aclnn_prompt_flash_attention{,_v2,_v3}.h` and
-// `aclnn_incre_flash_attention{,_v2,_v3,_v4}.h` -- the PFA family stops at V3
-// and the IFA family at V4 -- and there is no header, and no exported symbol,
-// spelled `aclnnFusionIncrementalAttention` anywhere in the install.
-//
-// What DOES exist, and what "the native V5 suite" means on this part, is
-// `aclnnFusedInferAttentionScore`, whose V5 interface is the unified successor
-// that REPLACES both families: V1..V4 of it are withdrawn on an Ascend950
-// (planning returns 361001, measured on CANN 9.1.0), and V5 is what a caller
-// has left. One operator covers both roles, selected by its argument list:
-//
-//     prefill role   ("prompt")       sparse_mode 3, the 2048x2048 compressed
-//                                     right-down causal mask, contiguous TND
-//                                     K/V, block_size 0 -- no paging.
-//     decode role    ("incremental")  sparse_mode 0, a block table, the paged
-//                                     fp16 cache as a one-entry aclTensorList,
-//                                     actualSeqLengthsKv per sequence.
-//
-// Both roles are planned and timed below, and both are labelled by the operator
-// that actually planned. `aclnnFusedInferAttentionScoreV2` is kept as a fallback
-// for a toolkit where V5 is absent; the row records which one answered.
-//
-// Guessing a prototype for the two symbols the brief named was considered and
-// rejected. A hand-declared argument list behind `dlsym` that does not match the
-// operator is undefined behaviour AT LAUNCH, not a planning refusal -- it takes
-// the stream down and every case queued behind it -- and this suite's rule is
-// that every aclnn prototype is transcribed from a header it can point at. See
-// common/aclnn_ops_950pr.hpp, where the V5 list is quoted line for line.
-//
-// ---------------------------------------------------------------------------
-// THE ACCOUNTING
-// ---------------------------------------------------------------------------
-//
-//     T_TQ_E2E = T_rot_q + T_attn_core + T_rot_o
-//
-// measured on the device with ACL events, per component AND as one composite
-// region over the whole graph. Both are reported: the components say where the
-// time goes, the composite says what the caller waits for, and the difference
-// between the composite and the sum of the parts is the launch overhead the
-// component view cannot see. A row whose composite is far from its sum is
-// launch-bound, and the footer prints that residual rather than leaving a
-// reader to subtract.
-//
-//   T_rot_q       npu_turboquant_rotate_q over the step's query.
-//   T_attn_core   decode:  the Cube split + the shared combine, or the AIV
-//                          launcher that submits both.
-//                 prefill: FIA V5 over the rotated basis (Q~, K~, V~).
-//   T_rot_o       npu_turboquant_rotate_q over the attention output, before the
-//                 sigmoid gate. EXACTLY 0.0 us for a folded layer -- W_o' = W_o
-//                 (I (x) Pi) absorbs it offline -- and measured for a layer that
-//                 cannot fold. The 0.0 is printed as a number and not as a dash,
-//                 because it is a fact about the layer and not a missing sample.
-//
-// The native column is the V5 operator alone on standard uncompressed tensors,
-// and neither side's KV-cache WRITE is inside its E2E figure. TurboQuant's write
-// is reported in its own column (Table A, "TQ Ingest / Reshape"); the native
-// write (`aclnnScatterPaKvCache`) is timed as `pf_v5_ingest` and carried in the
-// prefill CSV. Symmetric, and both are visible.
-//
-// ---------------------------------------------------------------------------
-// WHAT IS STILL NOT PRICED, SAID HERE RATHER THAN HIDDEN
-// ---------------------------------------------------------------------------
-//
-// 1. The fp32 -> fp16 narrowing between the rotation kernel and FIA, in the
-//    PREFILL core only. npu_turboquant_rotate_q writes fp32; FIA reads fp16.
-//    Production does the cast with a torch op; this suite has no header-verified
-//    aclnnCast prototype and will not guess one, so the rotated tensors FIA is
-//    handed are prepared on the host in fp16 and the cast is not in any number
-//    below. It is one elementwise pass over B*C*H_Q*D (query) and B*S*H_KV*D
-//    (value) elements; the modelled byte cost of both is in the prefill CSV as
-//    `untimed_cast_bytes` so a reader can bound it. The DECODE core has no such
-//    gap: the split kernels consume the fp32 rotation directly.
-// 2. The sigmoid gate itself, for Qwen3.5. T_rot_o stops where the brief says it
-//    stops -- "prior to the sigmoid gate" -- and the gate is the same elementwise
-//    cost on both sides of the comparison.
-// 3. Nothing about accuracy. TurboQuant stores 4 bits per coordinate and the
-//    native leg stores 16; the outputs are not the same numbers and are not
-//    meant to be. The fidelity gates are test_device_950pr_turboquant,
-//    test_host_turboquant_fidelity and the sim tier. What this file does check
-//    is that both legs are attending over the same context at all -- see THE TWO
-//    DEVICE CHECKS below.
-//
-// ---------------------------------------------------------------------------
-// THE WORKLOAD
-// ---------------------------------------------------------------------------
-//
-// Three flagship families at TP=8, one NPU's share of each. These are serving
-// ranks, not a geometric sweep: a dense cartesian product of head counts
-// produces hundreds of shapes nobody deploys and buries the nine that matter.
-//
-//   Qwen3.5-9B          D=128  H_Q=4   H_KV=1   GQA 4:1    UNFOLDED
-//                       attn_output_gate multiplies the context by sigmoid(gate)
-//                       before o_proj, so W_o cannot absorb Pi and T_rot_o is a
-//                       real kernel on the critical path.
-//   DeepSeek-V4-Flash   D=256  H_Q=16  H_KV=1   MLA        folded
-//                       decoupled latent KV. The 16:1 group exactly fills the
-//                       Cube's M=16 fractal, which is what puts this family on
-//                       the Cube decode.
-//   GLM-5.2-744B        D=128  H_Q=8   H_KV=1   GQA 8:1    folded
-//
-//   S = 2048      B in {1, 4, 8}      short / interactive
-//   S = 32768     B in {1, 4, 8}      enterprise long
-//   S = 262144    B in {1, 2}         ultra-long
-//   S = 1048576   B in {1}            extreme needle / 1M
-//
-// 3 families x 9 (S, B) pairs = 27 configurations, each audited in both phases:
-// 27 rows in Table A and 27 in Table B.
-//
-// PREFILL IS CHUNKED, and the table says so. A step processes C = min(S, 2048)
-// query tokens against the S-token prefix, which is what vLLM's scheduler
-// actually submits and what keeps a 1M-context row from costing 2.5 hours of
-// O(S^2) attention per iteration. The S column prints `S/C` whenever C < S. At
-// S = 2048 the chunk is the whole prefill and the column prints plain `2048`.
-//
-// ITERATIONS ARE ADAPTIVE. S <= 32K gets 5 warmup and 20 timed; S >= 262K gets
-// 1 and 3. Two budgets means two BenchmarkRunners -- the generic table stamps
-// one warmup/iterations line on the whole of itself, so a second budget gets a
-// second table rather than rows its header misdescribes.
-//
-// ---------------------------------------------------------------------------
-// THE DECODE PATH IS CHOSEN BY THE GQA GROUP, NOT BY A FLAG
-// ---------------------------------------------------------------------------
-//
-// The Cube decode batches a kv head's query heads into the GEMM's M dimension,
-// and that fractal is 16 rows wide (turboquant_host::kCubeTileM). A 16:1 group
-// fills it; a 4:1 or 8:1 group would run it three-quarters or half empty, and
-// the vector path is the right one there. So:
-//
-//     group = H_Q / H_KV >= 16   ->  Cube   (TurboQuantCubeDecodeSplit +
-//                                            TurboQuantPagedAttentionCombine,
-//                                            two launches, separately timed)
-//     group < 16                 ->  AIV    (turboquant_paged_attention, one
-//                                            launcher submitting both stages)
-//
-// which puts DeepSeek-V4-Flash on the Cube and Qwen3.5 / GLM-5.2 on the AIV
-// path. `ASCEND_BENCH_TQ_AUDIT_PATH=cube|aiv` overrides it for both.
-//
-// THE AIV PATH'S SPLIT COLUMN IS DERIVED, AND IS MARKED WITH `~`. There is no
-// exported entry point for the AIV split alone -- turboquant_paged_attention_impl
-// submits split and combine together -- so T_DecodeSplit for that path is the
-// measured core minus the separately measured combine. The Cube path's split is
-// measured directly and carries no marker. The CSV carries the flag as
-// `split_is_derived`.
-//
-// ---------------------------------------------------------------------------
-// THE TWO DEVICE CHECKS, BEFORE ANYTHING IS TIMED
-// ---------------------------------------------------------------------------
-//
-// 1. THE ROTATED-BASIS IDENTITY. Pi is orthogonal, so attention in the rotated
-//    basis is attention: softmax(Q~ K~^T) V~ = Pi (softmax(Q K^T) V). The check
-//    runs FIA over (Q~, K~, V~), un-rotates the result on the host, and demands
-//    cos > 0.999 against FIA over (Q, K, V). That is the device-level statement
-//    that the prefill core this file times is computing the layer's attention
-//    and not some other bilinear form, and it is what licenses timing the folded
-//    path with T_rot_o = 0.
-// 2. THE DECODE TIE-POINT. On the smallest configuration whose context fits an
-//    exact host image, the TurboQuant decode's output is un-rotated and compared
-//    against the native V5 decode over the same context in the same slots:
-//    cos > 0.90. That bound is deliberately loose -- 4 bits against 16 will not
-//    do better, and the fidelity gates are elsewhere -- but it is tight enough to
-//    catch the failure this binary is otherwise blind to, which is timing a
-//    kernel that is reading an empty cache.
-//
-// Both are recorded as failures when they miss, so ctest sees them.
-//
-// ---------------------------------------------------------------------------
-// TRAFFIC, AND WHAT THE GB/s COLUMNS MEAN
-// ---------------------------------------------------------------------------
-//
-// Every byte figure is COMPULSORY traffic: each distinct byte the step must move
-// across HBM, counted once, under one convention for every leg. A cached KV row
-// is counted once per kv head and not once per query head, whichever path reads
-// it, so the ratio between two legs' byte counts is the ratio between their
-// storage formats and not between their task decompositions. Re-reads that L2
-// may or may not absorb are not guessed at in either direction.
-//
-// ---------------------------------------------------------------------------
-// OUTPUT
-// ---------------------------------------------------------------------------
-//
-//   Table A   prefill pipeline, one row per configuration
-//   Table B   decode latency breakdown, one row per configuration
-//   plus the generic per-case table and CSV from the shared harness.
-//
-//   ASCEND_BENCH_TQ_AUDIT_PREFILL_CSV=<path>   Table A, plus every column the
-//                                              terminal has no room for.
-//   ASCEND_BENCH_TQ_AUDIT_DECODE_CSV=<path>    Table B, likewise.
-//   ASCEND_BENCH_TQ_AUDIT_MODELS=qwen35,dsv4,glm52
-//   ASCEND_BENCH_TQ_AUDIT_S=2048,32768         restrict the context regimes
-//   ASCEND_BENCH_TQ_AUDIT_B=1,4                restrict the batches
-//   ASCEND_BENCH_TQ_AUDIT_PHASES=prefill,decode
-//   ASCEND_BENCH_TQ_AUDIT_LEGS=dec_e2e,dec_v5  restrict the legs
-//   ASCEND_BENCH_TQ_AUDIT_CHUNK=2048           the prefill chunk C
-//   ASCEND_BENCH_TQ_AUDIT_PATH=auto|cube|aiv
-//   ASCEND_BENCH_TQ_AUDIT_GLM_D=128            GLM-5.2 is specified at 128 or 256
-//   ASCEND_BENCH_TQ_AUDIT_WARMUP / _ITERS      the S <= 32K budget (5 / 20)
-//   ASCEND_BENCH_TQ_AUDIT_ULTRA_WARMUP / _ULTRA_ITERS   the S >= 262K one (1 / 3)
-//   ASCEND_BENCH_TQ_FIA=0                      drop the native V5 legs entirely
-//
-// and the shared ASCEND_BENCH_* set; see common/benchmark.hpp. Note that
-// ASCEND_BENCH_MODES selects three timing modes by default and every one of them
-// is a full warmup-plus-iterations run: on the ultra-long rows that is the
-// difference between minutes and tens of minutes.
-//
-// NOTHING BELOW HAS EVER RUN ON SILICON. No Ascend 950PR part has been available
-// to this project. The kernels are verified on the arch35 camodel and the
-// numbers this file would print are, as of this writing, hypothetical.
-
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -287,44 +54,20 @@ namespace tqh = turboquant_host;
 namespace tqm = vllm_ascend::turboquant;
 namespace s950 = shapes950;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-// Every paged cache here is block_size 128, as the plugin's own cache manager
-// names it.
 constexpr int64_t kBlockSize = s950::kDefaultBlockSize;
 
-// FIA's compressed causal mask for sparse_mode 3 is always 2048 x 2048 whatever
-// the sequence length; AttentionMaskBuilder.get_splitfuse_attn_mask builds the
-// same int8 triu(ones, diagonal=1).
 constexpr int64_t kCausalMaskSide = 2048;
 constexpr int64_t kFiaSparseModeRightDownCausal = 3;
-// FIA reads no paging in the prompt role, so its block-size argument is 0.
 constexpr int64_t kFiaNoPaging = 0;
 
-// Tokens of distinct random data a scenario draws; longer contexts tile it. The
-// pattern is a whole number of tokens, so a tile boundary never falls inside a
-// D-wide vector and the host-rotated copies stay exactly Pi applied to the
-// unrotated ones, tile for tile. Attention latency does not depend on the
-// values, and generating 5e8 fp16 elements on the host for a 1M context would
-// cost minutes per configuration and risk a host OOM.
 constexpr int64_t kPatternTokens = 1024;
 
-// Query tokens one chunked-prefill step submits. vLLM's scheduler default
-// scale; see THE WORKLOAD above for why prefill is chunked at all.
 constexpr int64_t kPrefillChunkTokens = 2048;
 
-// Share of free HBM a configuration may plan to occupy before it is skipped.
 constexpr double kHbmBudget = 0.85;
 
-// Elements a checksum reads back. Enough to catch a launch that has stopped
-// writing without copying gigabytes to the host twice per case.
 constexpr size_t kChecksumElements = 1u << 20;
 
-// Context elements (B * S * H_KV * D) below which the fp16 paged cache is built
-// slot-exact on the host, which is what the decode tie-point needs. Above it the
-// cache is filled by tiling, because the host image would be gigabytes.
 constexpr size_t kExactContextElements = 1u << 22;
 
 constexpr double kRotatedBasisMinCosine = 0.999;
@@ -334,26 +77,15 @@ constexpr double kHalfBytes = 2.0;
 constexpr double kFloatBytes = 4.0;
 constexpr double kMiB = 1024.0 * 1024.0;
 
-// The two iteration budgets, per the context regime.
 constexpr int kShortWarmup = 5;
 constexpr int kShortIterations = 20;
 constexpr int kUltraWarmup = 1;
 constexpr int kUltraIterations = 3;
-// One launch per event pair. These shapes are orders of magnitude heavier than
-// the microbenchmarks the shared default of 10 was chosen for.
 constexpr int kPipelineBatch = 1;
 
-// Contexts at or above this take the ultra budget.
 constexpr int64_t kUltraContextThreshold = 262144;
-// Below this the block pool is over-allocated so the block table is a genuine
-// scatter rather than a run of consecutive blocks; above it nothing is resident
-// anyway and a 4x pool is gigabytes of idle HBM.
 constexpr int64_t kOversizedPoolContextLimit = 8192;
 constexpr int64_t kPoolOversizeFactor = 4;
-
-// ---------------------------------------------------------------------------
-// Environment
-// ---------------------------------------------------------------------------
 
 std::vector<std::string> SplitCsv(const char* raw) {
   std::vector<std::string> fields;
@@ -388,15 +120,11 @@ int64_t EnvInt64(const char* name, int64_t fallback, int64_t minimum) {
   return parsed < minimum ? minimum : static_cast<int64_t>(parsed);
 }
 
-// True unless the variable is set to exactly "0". An unset variable means the
-// default, which for every switch here is "on".
 bool EnvOn(const char* name) {
   const char* raw = std::getenv(name);
   return raw == nullptr || *raw == '\0' || std::strcmp(raw, "0") != 0;
 }
 
-// True when `value` is in the comma list `name` names, or when the variable is
-// unset -- an unset filter selects everything.
 bool EnvSelects(const char* name, const std::string& value) {
   const char* raw = std::getenv(name);
   if (raw == nullptr || *raw == '\0') {
@@ -421,25 +149,16 @@ std::string EnvString(const char* name) {
   return raw == nullptr ? std::string() : std::string(raw);
 }
 
-// ---------------------------------------------------------------------------
-// The workload
-// ---------------------------------------------------------------------------
-
 struct ModelSpec {
-  const char* key;     // selector for ASCEND_BENCH_TQ_AUDIT_MODELS and case names
-  const char* label;   // the table column
+  const char* key;
+  const char* label;
   int64_t head_size;
-  int64_t num_heads;     // H_Q on one NPU at TP=8
-  int64_t num_kv_heads;  // H_KV on one NPU at TP=8
-  // False when the output projection cannot absorb Pi, so the de-rotation is a
-  // kernel on the critical path rather than an offline weight transform.
+  int64_t num_heads;
+  int64_t num_kv_heads;
   bool folds_output;
   const char* note;
 };
 
-// GLM-5.2 is specified at D = 128 or 256; 128 is the default and the variable
-// switches it, because the two differ in how much of the Cube's C0 a vector
-// fills and a reader may want both.
 int64_t GlmHeadSize() {
   const int64_t d = EnvInt64("ASCEND_BENCH_TQ_AUDIT_GLM_D", 128, 64);
   if (d != 128 && d != 256) {
@@ -452,13 +171,13 @@ int64_t GlmHeadSize() {
 
 std::vector<ModelSpec> Models() {
   return {
-      ModelSpec{"qwen35", "Qwen3.5-9B", 128, 4, 1, /*folds_output=*/false,
+      ModelSpec{"qwen35", "Qwen3.5-9B", 128, 4, 1, false,
                 "attn_output_gate: sigmoid(gate) * context sits between attention and o_proj, "
                 "so W_o cannot absorb Pi and the O de-rotation is measured"},
-      ModelSpec{"dsv4", "DeepSeek-V4-Flash", 256, 16, 1, /*folds_output=*/true,
+      ModelSpec{"dsv4", "DeepSeek-V4-Flash", 256, 16, 1, true,
                 "MLA, decoupled latent KV; the 16:1 group exactly fills the Cube's M=16 fractal; "
                 "W_o folded offline"},
-      ModelSpec{"glm52", "GLM-5.2-744B", GlmHeadSize(), 8, 1, /*folds_output=*/true,
+      ModelSpec{"glm52", "GLM-5.2-744B", GlmHeadSize(), 8, 1, true,
                 "ultra-wide GQA; W_o folded offline"},
   };
 }
@@ -478,13 +197,10 @@ std::vector<Regime> Regimes() {
   };
 }
 
-// How TurboQuant's decode splits the work at this shape.
 enum class PathMode { kCube, kAiv };
 
 const char* PathLabel(PathMode path) { return path == PathMode::kCube ? "Cube" : "AIV"; }
 
-// The GQA group the Cube's M dimension has to be filled from; see THE DECODE
-// PATH IS CHOSEN BY THE GQA GROUP above.
 PathMode SelectPath(const ModelSpec& model) {
   const std::string forced = EnvString("ASCEND_BENCH_TQ_AUDIT_PATH");
   if (forced == "cube") {
@@ -529,9 +245,7 @@ struct Config {
   Budget budget;
   const char* regime = "";
 
-  // Query tokens one prefill step submits, across the batch.
   int64_t chunk_tokens() const { return batch * chunk; }
-  // Tokens of context the whole batch holds.
   int64_t context_tokens() const { return batch * seq_len; }
   int64_t blocks_per_seq() const { return tqh::CeilDiv(seq_len, kBlockSize); }
   int64_t pool_blocks() const {
@@ -545,7 +259,6 @@ struct Config {
     name << model.key << "_s" << seq_len << "_b" << batch;
     return name.str();
   }
-  // "2048" when the chunk is the whole prefill, "262144/2048" when it is not.
   std::string context_label() const {
     std::ostringstream text;
     text << seq_len;
@@ -585,10 +298,6 @@ std::vector<Config> BuildSweep() {
   return sweep;
 }
 
-// ---------------------------------------------------------------------------
-// Legs
-// ---------------------------------------------------------------------------
-
 constexpr const char* kLegPfIngest = "pf_ingest";
 constexpr const char* kLegPfRotQ = "pf_rot_q";
 constexpr const char* kLegPfAttnCore = "pf_attn_core";
@@ -618,18 +327,10 @@ bool LegEnabled(const char* leg) { return EnvSelects("ASCEND_BENCH_TQ_AUDIT_LEGS
 bool PhaseEnabled(const char* phase) { return EnvSelects("ASCEND_BENCH_TQ_AUDIT_PHASES", phase); }
 bool NativeEnabled() { return EnvOn("ASCEND_BENCH_TQ_FIA"); }
 
-// ---------------------------------------------------------------------------
-// Traffic
-// ---------------------------------------------------------------------------
-//
-// Compulsory bytes: each distinct byte the step moves across HBM, once, under
-// one convention for every leg. See TRAFFIC above.
 struct Traffic {
-  // Residency, for the whole batch's context.
   double fp16_kv_bytes = 0.0;
   double tq_kv_bytes = 0.0;
 
-  // Prefill, per step.
   double pf_ingest = 0.0;
   double pf_rot_q = 0.0;
   double pf_attn_core = 0.0;
@@ -638,11 +339,8 @@ struct Traffic {
   double pf_v5 = 0.0;
   double pf_v5_ingest = 0.0;
   double pf_flops = 0.0;
-  // The fp32 -> fp16 narrowing this suite does not time; see WHAT IS STILL NOT
-  // PRICED. Reported so a reader can bound it, never added to a leg.
   double pf_untimed_cast = 0.0;
 
-  // Decode, per step.
   double dec_rot_q = 0.0;
   double dec_split = 0.0;
   double dec_combine = 0.0;
@@ -651,9 +349,6 @@ struct Traffic {
   double dec_e2e = 0.0;
   double dec_v5 = 0.0;
   double dec_flops = 0.0;
-  // Flash-decoding splits the grid planned for this shape, which is what the
-  // partial term above was computed from. Carried so the CSV can state it
-  // rather than leaving a reader to re-derive the planner's arithmetic.
   int64_t dec_split_count = 1;
 
   double compression_ratio() const { return tq_kv_bytes > 0.0 ? fp16_kv_bytes / tq_kv_bytes : 0.0; }
@@ -675,7 +370,6 @@ Traffic ModelTraffic(const Config& config, int64_t num_splits) {
   traffic.fp16_kv_bytes = 2.0 * context * hkv * d * kHalfBytes;
   traffic.tq_kv_bytes = 2.0 * context * hkv * packed_slot + context * scale_slot;
 
-  // --- prefill -------------------------------------------------------------
   const double chunk_kv_fp16 = 2.0 * chunk * hkv * d * kHalfBytes;
   const double chunk_kv_tq = 2.0 * chunk * hkv * packed_slot + chunk * scale_slot;
   const double chunk_query = chunk * hq * d * kHalfBytes;
@@ -683,34 +377,23 @@ Traffic ModelTraffic(const Config& config, int64_t num_splits) {
 
   traffic.pf_ingest = chunk_kv_fp16 + chunk_kv_tq + chunk * kFloatBytes;
   traffic.pf_rot_q = chunk * hq * d * (kHalfBytes + kFloatBytes);
-  // Q in, the whole prefix's K and V, O out, and the compressed mask.
   traffic.pf_attn_core = chunk_query + traffic.fp16_kv_bytes + chunk_query + mask;
   traffic.pf_rot_o = chunk * hq * d * (kHalfBytes + kFloatBytes);
   traffic.pf_e2e = traffic.pf_rot_q + traffic.pf_attn_core +
                    (config.model.folds_output ? 0.0 : traffic.pf_rot_o);
   traffic.pf_v5 = traffic.pf_attn_core;
-  // The native write: read the chunk's fp16 K/V, write them into the paged
-  // cache, read the slot map.
   traffic.pf_v5_ingest = 2.0 * chunk_kv_fp16 + chunk * kFloatBytes;
-  // Causal over a chunk at the tail of an S-token prefix: query i of the chunk
-  // attends to S - C + i + 1 keys, so the count is C * (S - C/2 + 1/2) per
-  // sequence per head. Two operations per element for QK^T and two for the value
-  // accumulation.
   {
     const double s = static_cast<double>(config.seq_len);
     const double c = static_cast<double>(config.chunk);
     traffic.pf_flops = 4.0 * batch * hq * d * c * (s - 0.5 * c + 0.5);
   }
-  // One elementwise narrowing of the rotated query and the rotated value.
   traffic.pf_untimed_cast = chunk * hq * d * (kFloatBytes + kHalfBytes) +
                             context * hkv * d * (kFloatBytes + kHalfBytes);
 
-  // --- decode --------------------------------------------------------------
   const double step_query_fp16 = batch * hq * d * kHalfBytes;
   const double step_query_fp32 = batch * hq * d * kFloatBytes;
   const double step_out_fp16 = step_query_fp16;
-  // Flash-decoding partials: the split writes one per (token, head, split) and
-  // the combine reads it back, so each crosses HBM twice.
   const double partials = batch * hq * splits * static_cast<double>(config.model.head_size + tqh::kPartialTail) *
                           kFloatBytes;
 
@@ -728,8 +411,6 @@ Traffic ModelTraffic(const Config& config, int64_t num_splits) {
   return traffic;
 }
 
-// HBM a configuration allocates, bar the operators' own workspaces, which are
-// allowed one more attention output each.
 double ScenarioBytes(const Config& config) {
   const double d = static_cast<double>(config.model.head_size);
   const double hq = static_cast<double>(config.model.num_heads);
@@ -739,33 +420,21 @@ double ScenarioBytes(const Config& config) {
   const double pool_rows = static_cast<double>(config.pool_blocks() * kBlockSize);
   const double scale_slot = static_cast<double>(tqh::ScaleSlotFloats(config.model.num_kv_heads)) * kFloatBytes;
 
-  // K, V, K~ and V~ over the whole prefix.
   const double contiguous_kv = 4.0 * context * hkv * d * kHalfBytes;
-  // The chunk's own K and V, which the ingest leg writes from.
   const double chunk_kv = 2.0 * chunk * hkv * d * kHalfBytes;
   const double tq_cache = 2.0 * pool_rows * hkv * (d / static_cast<double>(tqh::kPackFactor)) +
                           pool_rows * scale_slot;
   const double fp16_cache = 2.0 * pool_rows * hkv * d * kHalfBytes;
-  // Q, Q~ (fp16), Q~ (fp32), O_tq, O_v5, O~ (fp32) for the chunk; the same six
-  // for the decode step, which is negligible beside them.
   const double prefill_activations = chunk * hq * d * (4.0 * kHalfBytes + 2.0 * kFloatBytes);
   const double decode_activations =
       static_cast<double>(config.batch) * hq * d * (4.0 * kHalfBytes + 2.0 * kFloatBytes);
   const double mask = static_cast<double>(kCausalMaskSide * kCausalMaskSide);
-  // Two attention outputs' worth of slack for the operators' workspaces.
   const double workspace_allowance = 2.0 * chunk * hq * d * kHalfBytes;
 
   return contiguous_kv + chunk_kv + tq_cache + fp16_cache + prefill_activations + decode_activations + mask +
          workspace_allowance;
 }
 
-// ---------------------------------------------------------------------------
-// Device helpers
-// ---------------------------------------------------------------------------
-
-// Fills `dst` by repeating `pattern` end to end, one whole-pattern copy at a
-// time. Chunked by construction: a 1M-token context is filled from a
-// 1024-token host image and never needs a host buffer of its own size.
 template <typename T>
 void TileToDevice(const DeviceBuffer& dst, const std::vector<T>& pattern) {
   const size_t total = dst.size_bytes();
@@ -780,9 +449,6 @@ void TileToDevice(const DeviceBuffer& dst, const std::vector<T>& pattern) {
   }
 }
 
-// The host image of what TileToDevice would have written: `pattern` repeated to
-// `elements`. Only ever called for a context small enough to hold exactly; see
-// kExactContextElements.
 template <typename T>
 std::vector<T> HostTiled(const std::vector<T>& pattern, size_t elements) {
   std::vector<T> tiled(elements);
@@ -795,7 +461,6 @@ std::vector<T> HostTiled(const std::vector<T>& pattern, size_t elements) {
   return tiled;
 }
 
-// Checksum source: at most kChecksumElements leading elements of a buffer.
 template <typename T>
 std::vector<T> LeadingElements(const DeviceBuffer& buffer) {
   std::vector<T> host(std::min(buffer.size_bytes() / sizeof(T), kChecksumElements));
@@ -805,7 +470,6 @@ std::vector<T> LeadingElements(const DeviceBuffer& buffer) {
   return host;
 }
 
-// Pi applied to every head_size-wide row, on the host, in place.
 void RotateRowsInPlace(std::vector<float>& values, int64_t head_size) {
   const std::vector<int8_t> signs = turboquant_ref::cpu_pi_sign_vector(static_cast<int>(head_size));
   const size_t row = static_cast<size_t>(head_size);
@@ -827,16 +491,6 @@ const AclnnOp& ScatterPaKvCacheOp() {
   return op;
 }
 
-// ---------------------------------------------------------------------------
-// One configuration on the device
-// ---------------------------------------------------------------------------
-//
-// Built, audited and destroyed before the next one is built, so the sweep's peak
-// HBM is its largest configuration's and not the sum of all of them.
-//
-// The aclnn descriptors are unique_ptrs created in dependency order and the
-// planned operators are declared last, so they are destroyed first: a PlannedOp
-// holds the descriptor handles it was planned with.
 class Scenario {
  public:
   Scenario(const Config& config, int64_t aiv_num) : config_(config), aiv_num_(aiv_num) {
@@ -855,11 +509,6 @@ class Scenario {
     DeterministicRandom rng(0xA53Du + static_cast<uint32_t>(config.seq_len + 7 * config.batch + 31 * d +
                                                             127 * hq + 509 * hkv));
 
-    // --- the context, tiled --------------------------------------------------
-    //
-    // K and V are one pattern; K~ and V~ are Pi applied to that same pattern and
-    // then tiled the same way, so the four buffers stand in the exact Pi
-    // relationship the rotated-basis identity asserts, at any context length.
     const std::vector<float> key_pattern = rng.NormalHalfExact(elems(pattern, hkv, d), 0.0f, 1.0f);
     const std::vector<float> value_pattern = rng.NormalHalfExact(elems(pattern, hkv, d), 0.0f, 1.0f);
     std::vector<float> key_rot_pattern = key_pattern;
@@ -876,7 +525,6 @@ class Scenario {
     TileToDevice(key_ctx_rot_, FloatToHalf(key_rot_pattern));
     TileToDevice(value_ctx_rot_, FloatToHalf(value_rot_pattern));
 
-    // --- the prefill chunk ---------------------------------------------------
     const int64_t chunk_pattern = std::min<int64_t>(chunk, kPatternTokens);
     const std::vector<float> chunk_key = rng.NormalHalfExact(elems(chunk_pattern, hkv, d), 0.0f, 1.0f);
     const std::vector<float> chunk_value = rng.NormalHalfExact(elems(chunk_pattern, hkv, d), 0.0f, 1.0f);
@@ -901,7 +549,6 @@ class Scenario {
     lse_pf_tq_ = DeviceBuffer::Empty<Half>(1, kBenchmarkAlignBytes);
     lse_pf_v5_ = DeviceBuffer::Empty<Half>(1, kBenchmarkAlignBytes);
 
-    // --- the decode step -----------------------------------------------------
     const std::vector<float> decode_query =
         rng.NormalHalfExact(elems(config.batch, hq, d), 0.0f, 1.0f);
     query_dec_ = DeviceBuffer::FromHost(FloatToHalf(decode_query), kBenchmarkAlignBytes);
@@ -911,11 +558,6 @@ class Scenario {
     out_dec_rot_ = DeviceBuffer::Empty<float>(elems(config.batch, hq, d), kBenchmarkAlignBytes);
     lse_dec_ = DeviceBuffer::Empty<Half>(1, kBenchmarkAlignBytes);
 
-    // --- paging --------------------------------------------------------------
-    //
-    // Each sequence gets its own run of blocks out of a shuffled pool, so the
-    // cache scatters the way a serving pool does rather than reading as one
-    // contiguous sweep.
     const int64_t blocks_per_seq = config.blocks_per_seq();
     const std::vector<int32_t> pool = rng.Permutation(static_cast<int32_t>(config.pool_blocks()));
     std::vector<int32_t> block_table(static_cast<size_t>(config.batch * blocks_per_seq));
@@ -927,9 +569,6 @@ class Scenario {
     }
     block_tables_ = DeviceBuffer::FromHost(block_table, kBenchmarkAlignBytes);
 
-    // Slot maps: every context position, for the setup fill; and the chunk's own
-    // positions, which sit at the tail of each sequence's prefix the way a
-    // chunked prefill's do.
     std::vector<int32_t> slots_full(static_cast<size_t>(context));
     for (int64_t seq = 0; seq < config.batch; ++seq) {
       for (int64_t pos = 0; pos < config.seq_len; ++pos) {
@@ -952,7 +591,6 @@ class Scenario {
         std::vector<int32_t>(static_cast<size_t>(config.batch), static_cast<int32_t>(config.seq_len)),
         kBenchmarkAlignBytes);
 
-    // --- TurboQuant constants and cache -------------------------------------
     pi_signs_ = DeviceBuffer::FromHost(tqh::PiSigns(d), kBenchmarkAlignBytes);
     h16_ = DeviceBuffer::FromHost(tqh::Hadamard16Half(), kBenchmarkAlignBytes);
     rot_tables_ = DeviceBuffer::FromHost(tqh::CodecTables(d, 1), kBenchmarkAlignBytes);
@@ -962,7 +600,7 @@ class Scenario {
       key_cache_ = DeviceBuffer::Empty<int8_t>(
           tqh::ModePackedCacheBytes(kCubeMode, pool_blocks, kBlockSize, hkv, d), kBenchmarkAlignBytes);
       write_tables_ =
-          DeviceBuffer::FromHost(tqh::ModeTables(kCubeMode, d, 1, /*nz_rows=*/0), kBenchmarkAlignBytes);
+          DeviceBuffer::FromHost(tqh::ModeTables(kCubeMode, d, 1, 0), kBenchmarkAlignBytes);
       decode_tables_ = DeviceBuffer::FromHost(
           tqh::ModeTables(kCubeMode, d, tqh::kUnpackRows, tqh::kCubeTileRows), kBenchmarkAlignBytes);
       cube_grid_ = tqh::PlanCubeDecode(config.batch, hq, hkv, d, blocks_per_seq, aiv_num);
@@ -985,12 +623,6 @@ class Scenario {
     context_write_grid_ = tqh::PlanReshapeAndCache(context, aiv_num);
     chunk_write_grid_ = tqh::PlanReshapeAndCache(chunk, aiv_num);
 
-    // --- the native operator's fp16 paged cache ------------------------------
-    //
-    // Slot-exact when the context fits a host image, because the decode
-    // tie-point compares the two legs over the same context in the same slots.
-    // Tiled otherwise: above kExactContextElements the host image would be
-    // gigabytes, and attention latency does not depend on the values.
     const size_t cache_elements = elems(pool_blocks * kBlockSize, hkv, d);
     fp16_key_cache_ = DeviceBuffer::Empty<Half>(cache_elements, kBenchmarkAlignBytes);
     fp16_value_cache_ = DeviceBuffer::Empty<Half>(cache_elements, kBenchmarkAlignBytes);
@@ -1018,7 +650,6 @@ class Scenario {
       TileToDevice(fp16_value_cache_, FloatToHalf(value_pattern));
     }
 
-    // --- the causal mask -----------------------------------------------------
     std::vector<int8_t> mask(static_cast<size_t>(kCausalMaskSide * kCausalMaskSide), 0);
     for (int64_t row = 0; row < kCausalMaskSide; ++row) {
       for (int64_t col = row + 1; col < kCausalMaskSide; ++col) {
@@ -1031,8 +662,6 @@ class Scenario {
     PlanOperators();
   }
 
-  // --- prefill ------------------------------------------------------------
-
   void EnqueuePrefillIngest(aclrtStream stream) const {
     EnqueueCacheWrite(stream, key_chunk_.get(), value_chunk_.get(), slots_chunk_.get(), config_.chunk_tokens(),
                       chunk_write_grid_);
@@ -1041,7 +670,7 @@ class Scenario {
   void EnqueuePrefillRotateQ(aclrtStream stream) const {
     tqh::RotateQuery(stream, AscendType::FP16, query_pf_.get(), pi_signs_.get(), h16_.get(), rot_tables_.get(),
                      query_pf_rot_fp32_.get(), config_.chunk_tokens(), config_.model.num_heads,
-                     config_.model.head_size, aiv_num_, /*input_exact_in_half=*/true);
+                     config_.model.head_size, aiv_num_, true);
   }
 
   void EnqueuePrefillAttnCore(aclrtStream stream) const { fia_prefill_rotated_->Launch(stream); }
@@ -1049,7 +678,7 @@ class Scenario {
   void EnqueuePrefillRotateO(aclrtStream stream) const {
     tqh::RotateQuery(stream, AscendType::FP16, out_pf_tq_.get(), pi_signs_.get(), h16_.get(), rot_tables_.get(),
                      out_pf_rot_.get(), config_.chunk_tokens(), config_.model.num_heads, config_.model.head_size,
-                     aiv_num_, /*input_exact_in_half=*/true);
+                     aiv_num_, true);
   }
 
   void EnqueuePrefillE2E(aclrtStream stream) const {
@@ -1063,17 +692,12 @@ class Scenario {
   void EnqueuePrefillNative(aclrtStream stream) const { fia_prefill_native_->Launch(stream); }
   void EnqueuePrefillNativeIngest(aclrtStream stream) const { native_write_->Launch(stream); }
 
-  // --- decode -------------------------------------------------------------
-
   void EnqueueDecodeRotateQ(aclrtStream stream) const {
     tqh::RotateQuery(stream, AscendType::FP16, query_dec_.get(), pi_signs_.get(), h16_.get(), rot_tables_.get(),
                      query_dec_rot_.get(), config_.batch, config_.model.num_heads, config_.model.head_size,
-                     aiv_num_, /*input_exact_in_half=*/true);
+                     aiv_num_, true);
   }
 
-  // The Cube split alone. Only meaningful on the Cube path; the AIV launcher
-  // does not expose its split stage separately, which is why that path's split
-  // column is derived. See THE DECODE PATH above.
   void EnqueueDecodeSplit(aclrtStream stream) const {
     turboquant_mm_decode_split_impl(
         static_cast<int32_t>(kCubeMode), AscendType::FP16, stream, cube_grid_.split_block_dim,
@@ -1085,7 +709,6 @@ class Scenario {
         cube_grid_.split_tasks_per_core, config_.attention_scale(), config_.attention_scale());
   }
 
-  // The shared reduction, on both paths. Reads the workspace and nothing else.
   void EnqueueDecodeCombine(aclrtStream stream) const {
     const uint32_t block_dim =
         config_.path == PathMode::kCube ? cube_grid_.combine_block_dim : aiv_grid_.combine_block_dim;
@@ -1117,7 +740,7 @@ class Scenario {
   void EnqueueDecodeRotateO(aclrtStream stream) const {
     tqh::RotateQuery(stream, AscendType::FP16, out_dec_tq_.get(), pi_signs_.get(), h16_.get(), rot_tables_.get(),
                      out_dec_rot_.get(), config_.batch, config_.model.num_heads, config_.model.head_size, aiv_num_,
-                     /*input_exact_in_half=*/true);
+                     true);
   }
 
   void EnqueueDecodeE2E(aclrtStream stream) const {
@@ -1130,20 +753,12 @@ class Scenario {
 
   void EnqueueDecodeNative(aclrtStream stream) const { fia_decode_native_->Launch(stream); }
 
-  // --- setup, outside every timed region ----------------------------------
-
-  // Quantises the whole batch's context into the TurboQuant cache, so the decode
-  // reads a populated cache rather than the allocation's zeros.
   void FillCache(aclrtStream stream) const {
     EnqueueCacheWrite(stream, key_ctx_.get(), value_ctx_.get(), slots_full_.get(), config_.context_tokens(),
                       context_write_grid_);
     ACL_CHECK(aclrtSynchronizeStream(stream));
   }
 
-  // Leaves the flash-decoding workspace and both attention outputs holding real
-  // values. Without it `dec_combine` timed on its own would reduce a workspace
-  // of zeros -- a zero softmax denominator, so a non-finite checksum and a
-  // spurious failure -- and `dec_rot_o` / `pf_rot_o` would rotate zeros.
   void Prime(aclrtStream stream) const {
     EnqueueDecodeRotateQ(stream);
     EnqueueDecodeAttnCore(stream);
@@ -1153,8 +768,6 @@ class Scenario {
     }
     ACL_CHECK(aclrtSynchronizeStream(stream));
   }
-
-  // --- availability -------------------------------------------------------
 
   bool prefill_available() const { return fia_prefill_rotated_ != nullptr && fia_prefill_native_ != nullptr; }
   bool decode_available() const { return fia_decode_native_ != nullptr; }
@@ -1171,8 +784,6 @@ class Scenario {
     return config_.path == PathMode::kCube ? cube_grid_.combine_block_dim : aiv_grid_.combine_block_dim;
   }
 
-  // --- checksums and readback ---------------------------------------------
-
   double ScaleChecksum() const { return ChecksumSum(LeadingElements<float>(scale_plane_)); }
   double WorkspaceChecksum() const { return ChecksumSum(LeadingElements<float>(workspace_)); }
   double PrefillRotatedQueryChecksum() const { return ChecksumSum(LeadingElements<float>(query_pf_rot_fp32_)); }
@@ -1187,8 +798,6 @@ class Scenario {
   double DecodeNativeChecksum() const { return ChecksumSum(HalfToFloat(LeadingElements<Half>(out_dec_v5_))); }
   double DecodeRotatedOutChecksum() const { return ChecksumSum(LeadingElements<float>(out_dec_rot_)); }
 
-  // The prefill E2E's product: the rotated output for an unfolded layer, the
-  // rotated-basis attention output for a folded one.
   double PrefillPipelineChecksum() const {
     return config_.model.folds_output ? PrefillTqChecksum() : PrefillRotatedOutChecksum();
   }
@@ -1202,8 +811,6 @@ class Scenario {
   std::vector<float> DecodeNativeOutput() const { return HalfToFloat(out_dec_v5_.ToHost<Half>()); }
 
  private:
-  // The Cube-native rate this audit stores at. kv3fp4 and kv5fp8 are built and
-  // covered by the sim tier; neither is the shipping 4-bit path.
   static constexpr tqm::TurboQuantMode kCubeMode = tqm::TurboQuantMode::KV4_FP8;
 
   void EnqueueCacheWrite(aclrtStream stream, void* key, void* value, void* slots, int64_t tokens,
@@ -1252,9 +859,6 @@ class Scenario {
     key_ctx_rot_list_.reset(new AclnnTensorList({key_ctx_rot_tnd_->get()}));
     value_ctx_rot_list_.reset(new AclnnTensorList({value_ctx_rot_tnd_->get()}));
 
-    // TND wants the cumulative token count at the end of each sequence, for the
-    // query and the key independently: a chunked prefill has C query tokens
-    // against S keys, which is exactly what sparse_mode 3 anchors bottom-right.
     std::vector<int64_t> cumulative_q(static_cast<size_t>(config_.batch));
     std::vector<int64_t> cumulative_kv(static_cast<size_t>(config_.batch));
     for (int64_t seq = 0; seq < config_.batch; ++seq) {
@@ -1264,8 +868,6 @@ class Scenario {
     prefill_seq_q_.reset(new AclnnIntArray(cumulative_q));
     prefill_seq_kv_.reset(new AclnnIntArray(cumulative_kv));
 
-    // The decode role: one query token per sequence, the paged cache as a
-    // one-entry list, and the context length per sequence.
     query_dec_tnd_.reset(new AclnnTensor({config_.batch, hq, d}, ACL_FLOAT16, query_dec_.get()));
     out_dec_v5_tensor_.reset(new AclnnTensor({config_.batch, hq, d}, ACL_FLOAT16, out_dec_v5_.get()));
     lse_dec_tensor_.reset(new AclnnTensor({1}, ACL_FLOAT16, lse_dec_.get()));
@@ -1277,13 +879,6 @@ class Scenario {
     fp16_value_list_.reset(new AclnnTensorList({fp16_value_flat_->get()}));
     block_table_tensor_.reset(
         new AclnnTensor({config_.batch, config_.blocks_per_seq()}, ACL_INT32, block_tables_.get()));
-    // The plugin's own decode convention, which the golden test reproduces
-    // argument for argument: actualSeqLengths is the CUMULATIVE query token
-    // count -- one token per sequence, so 1, 2, ... B -- and actualSeqLengthsKv
-    // is the context length PER SEQUENCE, not cumulative. The two readings
-    // coincide at B=1, which is why nothing in this tree had to distinguish them
-    // before; at B > 1 they do not, and this follows
-    // AscendAttentionBackendImpl._get_fia_params rather than guessing.
     {
       std::vector<int64_t> cumulative_q(static_cast<size_t>(config_.batch));
       for (int64_t seq = 0; seq < config_.batch; ++seq) {
@@ -1294,7 +889,6 @@ class Scenario {
       decode_seq_kv_.reset(new AclnnIntArray(kv_lens));
     }
 
-    // The native write's descriptors, over the chunk.
     key_chunk_tensor_.reset(new AclnnTensor({chunk, hkv, d}, ACL_FLOAT16, key_chunk_.get()));
     value_chunk_tensor_.reset(new AclnnTensor({chunk, hkv, d}, ACL_FLOAT16, value_chunk_.get()));
     slots_chunk_tensor_.reset(new AclnnTensor({chunk}, ACL_INT32, slots_chunk_.get()));
@@ -1309,10 +903,6 @@ class Scenario {
       fia_note_ = "the native V5 legs were dropped by ASCEND_BENCH_TQ_FIA=0";
       return;
     }
-    // Two plans over the same shape: TurboQuant's core reads the rotated basis
-    // (Q~, K~, V~) and produces O~; the native leg reads the plain one. Pi is
-    // orthogonal, so the two compute the same attention up to that rotation --
-    // which is what the rotated-basis identity check asserts on the device.
     fia_prefill_rotated_ = PlanPrefill(query_pf_rot_tnd_->get(), key_ctx_rot_list_->get(),
                                        value_ctx_rot_list_->get(), out_pf_tq_tensor_->get(),
                                        lse_pf_tq_tensor_->get());
@@ -1323,16 +913,14 @@ class Scenario {
       native_write_.reset(new PlannedOp(PlanAclnn<ops::ScatterPaKvCacheWorkspaceFn>(
           ScatterPaKvCacheOp(), key_chunk_tensor_->get(), fp16_key_cache_tensor_->get(),
           slots_chunk_tensor_->get(), value_chunk_tensor_->get(), fp16_value_cache_tensor_->get(),
-          /*compress_lens=*/nullptr, /*compress_seq_offset=*/nullptr, /*seq_lens=*/nullptr,
-          const_cast<char*>(ops::kScatterCacheModeNorm), /*scatter_mode=*/nullptr, /*strides=*/nullptr,
-          /*offsets=*/nullptr)));
+          nullptr, nullptr, nullptr,
+          const_cast<char*>(ops::kScatterCacheModeNorm), nullptr, nullptr,
+          nullptr)));
     } catch (const AclError& error) {
       native_write_note_ = std::string(ops::kScatterPaKvCache) + ": " + error.what();
     }
   }
 
-  // The prompt role: contiguous TND K/V, no paging, sparse_mode 3 with the
-  // compressed causal mask. V5 first, V2 as a fallback.
   std::unique_ptr<PlannedOp> PlanPrefill(const aclTensor* query, const aclTensorList* key_list,
                                          const aclTensorList* value_list, const aclTensor* out,
                                          const aclTensor* lse) {
@@ -1342,18 +930,18 @@ class Scenario {
     try {
       std::unique_ptr<PlannedOp> planned(new PlannedOp(PlanAclnn<ops950::FusedInferAttentionScoreV5WorkspaceFn>(
           FiaV5(), query,
-          key_list, value_list, /*pse_shift=*/nullptr, mask_tensor_->get(), prefill_seq_q_->get(),
-          prefill_seq_kv_->get(), /*deq_scale1=*/nullptr, /*quant_scale1=*/nullptr, /*deq_scale2=*/nullptr,
-          /*quant_scale2=*/nullptr, /*quant_offset2=*/nullptr, /*antiquant_scale=*/nullptr,
-          /*antiquant_offset=*/nullptr, /*block_table=*/nullptr, /*query_padding_size=*/nullptr,
-          /*kv_padding_size=*/nullptr, /*key_antiquant_scale=*/nullptr, /*key_antiquant_offset=*/nullptr,
-          /*value_antiquant_scale=*/nullptr, /*value_antiquant_offset=*/nullptr, /*key_shared_prefix=*/nullptr,
-          /*value_shared_prefix=*/nullptr, /*actual_shared_prefix_len=*/nullptr, /*query_rope=*/nullptr,
-          /*key_rope=*/nullptr, /*key_rope_antiquant_scale=*/nullptr, /*dequant_scale_query=*/nullptr,
-          /*learnable_sink=*/nullptr, /*q_start_idx=*/nullptr, /*kv_start_idx=*/nullptr, hq, scale,
+          key_list, value_list, nullptr, mask_tensor_->get(), prefill_seq_q_->get(),
+          prefill_seq_kv_->get(), nullptr, nullptr, nullptr,
+          nullptr, nullptr, nullptr,
+          nullptr, nullptr, nullptr,
+          nullptr, nullptr, nullptr,
+          nullptr, nullptr, nullptr,
+          nullptr, nullptr, nullptr,
+          nullptr, nullptr, nullptr,
+          nullptr, nullptr, nullptr, hq, scale,
           s950::kFiaUnboundedTokens, s950::kFiaUnboundedTokens, const_cast<char*>(ops950::kFiaLayoutTnd), hkv,
-          kFiaSparseModeRightDownCausal, s950::kFiaInnerPreciseDefault, kFiaNoPaging, /*antiquant_mode=*/0,
-          /*softmax_lse_flag=*/false, /*key_antiquant_mode=*/0, /*value_antiquant_mode=*/0,
+          kFiaSparseModeRightDownCausal, s950::kFiaInnerPreciseDefault, kFiaNoPaging, 0,
+          false, 0, 0,
           s950::kFiaQueryQuantModeNone, s950::kFiaPseTypeDefault, out, lse)));
       RecordOperator(ops950::kFusedInferAttentionScoreV5);
       return planned;
@@ -1363,16 +951,16 @@ class Scenario {
     try {
       std::unique_ptr<PlannedOp> planned(new PlannedOp(PlanAclnn<ops950::FusedInferAttentionScoreV2WorkspaceFn>(
           FiaV2(), query, key_list,
-          value_list, /*pse_shift=*/nullptr, mask_tensor_->get(), prefill_seq_q_->get(), prefill_seq_kv_->get(),
-          /*deq_scale1=*/nullptr, /*quant_scale1=*/nullptr, /*deq_scale2=*/nullptr, /*quant_scale2=*/nullptr,
-          /*quant_offset2=*/nullptr, /*antiquant_scale=*/nullptr, /*antiquant_offset=*/nullptr,
-          /*block_table=*/nullptr, /*query_padding_size=*/nullptr, /*kv_padding_size=*/nullptr,
-          /*key_antiquant_scale=*/nullptr, /*key_antiquant_offset=*/nullptr, /*value_antiquant_scale=*/nullptr,
-          /*value_antiquant_offset=*/nullptr, /*key_shared_prefix=*/nullptr, /*value_shared_prefix=*/nullptr,
-          /*actual_shared_prefix_len=*/nullptr, hq, scale, s950::kFiaUnboundedTokens, s950::kFiaUnboundedTokens,
+          value_list, nullptr, mask_tensor_->get(), prefill_seq_q_->get(), prefill_seq_kv_->get(),
+          nullptr, nullptr, nullptr, nullptr,
+          nullptr, nullptr, nullptr,
+          nullptr, nullptr, nullptr,
+          nullptr, nullptr, nullptr,
+          nullptr, nullptr, nullptr,
+          nullptr, hq, scale, s950::kFiaUnboundedTokens, s950::kFiaUnboundedTokens,
           const_cast<char*>(ops950::kFiaLayoutTnd), hkv, kFiaSparseModeRightDownCausal,
-          s950::kFiaInnerPreciseDefault, kFiaNoPaging, /*antiquant_mode=*/0, /*softmax_lse_flag=*/false,
-          /*key_antiquant_mode=*/0, /*value_antiquant_mode=*/0, out, lse)));
+          s950::kFiaInnerPreciseDefault, kFiaNoPaging, 0, false,
+          0, 0, out, lse)));
       RecordOperator(ops950::kFusedInferAttentionScoreV2);
       return planned;
     } catch (const AclError& error) {
@@ -1381,27 +969,25 @@ class Scenario {
     return nullptr;
   }
 
-  // The incremental role: one query token per sequence over the paged fp16
-  // cache, sparse_mode 0, the block table as a tensor.
   std::unique_ptr<PlannedOp> PlanDecode() {
     const int64_t hq = config_.model.num_heads;
     const int64_t hkv = config_.model.num_kv_heads;
     const double scale = static_cast<double>(config_.attention_scale());
     try {
       std::unique_ptr<PlannedOp> planned(new PlannedOp(PlanAclnn<ops950::FusedInferAttentionScoreV5WorkspaceFn>(
-          FiaV5(), query_dec_tnd_->get(), fp16_key_list_->get(), fp16_value_list_->get(), /*pse_shift=*/nullptr,
-          /*atten_mask=*/nullptr, decode_seq_q_->get(), decode_seq_kv_->get(), /*deq_scale1=*/nullptr,
-          /*quant_scale1=*/nullptr, /*deq_scale2=*/nullptr, /*quant_scale2=*/nullptr, /*quant_offset2=*/nullptr,
-          /*antiquant_scale=*/nullptr, /*antiquant_offset=*/nullptr, block_table_tensor_->get(),
-          /*query_padding_size=*/nullptr, /*kv_padding_size=*/nullptr, /*key_antiquant_scale=*/nullptr,
-          /*key_antiquant_offset=*/nullptr, /*value_antiquant_scale=*/nullptr, /*value_antiquant_offset=*/nullptr,
-          /*key_shared_prefix=*/nullptr, /*value_shared_prefix=*/nullptr, /*actual_shared_prefix_len=*/nullptr,
-          /*query_rope=*/nullptr, /*key_rope=*/nullptr, /*key_rope_antiquant_scale=*/nullptr,
-          /*dequant_scale_query=*/nullptr, /*learnable_sink=*/nullptr, /*q_start_idx=*/nullptr,
-          /*kv_start_idx=*/nullptr, hq, scale, s950::kFiaUnboundedTokens, s950::kFiaUnboundedTokens,
+          FiaV5(), query_dec_tnd_->get(), fp16_key_list_->get(), fp16_value_list_->get(), nullptr,
+          nullptr, decode_seq_q_->get(), decode_seq_kv_->get(), nullptr,
+          nullptr, nullptr, nullptr, nullptr,
+          nullptr, nullptr, block_table_tensor_->get(),
+          nullptr, nullptr, nullptr,
+          nullptr, nullptr, nullptr,
+          nullptr, nullptr, nullptr,
+          nullptr, nullptr, nullptr,
+          nullptr, nullptr, nullptr,
+          nullptr, hq, scale, s950::kFiaUnboundedTokens, s950::kFiaUnboundedTokens,
           const_cast<char*>(ops950::kFiaLayoutTnd), hkv, s950::kFiaSparseModeNone,
-          s950::kFiaInnerPreciseDefault, kBlockSize, /*antiquant_mode=*/0, /*softmax_lse_flag=*/false,
-          /*key_antiquant_mode=*/0, /*value_antiquant_mode=*/0, s950::kFiaQueryQuantModeNone,
+          s950::kFiaInnerPreciseDefault, kBlockSize, 0, false,
+          0, 0, s950::kFiaQueryQuantModeNone,
           s950::kFiaPseTypeDefault, out_dec_v5_tensor_->get(), lse_dec_tensor_->get())));
       RecordOperator(ops950::kFusedInferAttentionScoreV5);
       return planned;
@@ -1410,16 +996,16 @@ class Scenario {
     }
     try {
       std::unique_ptr<PlannedOp> planned(new PlannedOp(PlanAclnn<ops950::FusedInferAttentionScoreV2WorkspaceFn>(
-          FiaV2(), query_dec_tnd_->get(), fp16_key_list_->get(), fp16_value_list_->get(), /*pse_shift=*/nullptr,
-          /*atten_mask=*/nullptr, decode_seq_q_->get(), decode_seq_kv_->get(), /*deq_scale1=*/nullptr,
-          /*quant_scale1=*/nullptr, /*deq_scale2=*/nullptr, /*quant_scale2=*/nullptr, /*quant_offset2=*/nullptr,
-          /*antiquant_scale=*/nullptr, /*antiquant_offset=*/nullptr, block_table_tensor_->get(),
-          /*query_padding_size=*/nullptr, /*kv_padding_size=*/nullptr, /*key_antiquant_scale=*/nullptr,
-          /*key_antiquant_offset=*/nullptr, /*value_antiquant_scale=*/nullptr, /*value_antiquant_offset=*/nullptr,
-          /*key_shared_prefix=*/nullptr, /*value_shared_prefix=*/nullptr, /*actual_shared_prefix_len=*/nullptr, hq,
+          FiaV2(), query_dec_tnd_->get(), fp16_key_list_->get(), fp16_value_list_->get(), nullptr,
+          nullptr, decode_seq_q_->get(), decode_seq_kv_->get(), nullptr,
+          nullptr, nullptr, nullptr, nullptr,
+          nullptr, nullptr, block_table_tensor_->get(),
+          nullptr, nullptr, nullptr,
+          nullptr, nullptr, nullptr,
+          nullptr, nullptr, nullptr, hq,
           scale, s950::kFiaUnboundedTokens, s950::kFiaUnboundedTokens, const_cast<char*>(ops950::kFiaLayoutTnd),
-          hkv, s950::kFiaSparseModeNone, s950::kFiaInnerPreciseDefault, kBlockSize, /*antiquant_mode=*/0,
-          /*softmax_lse_flag=*/false, /*key_antiquant_mode=*/0, /*value_antiquant_mode=*/0,
+          hkv, s950::kFiaSparseModeNone, s950::kFiaInnerPreciseDefault, kBlockSize, 0,
+          false, 0, 0,
           out_dec_v5_tensor_->get(), lse_dec_tensor_->get())));
       RecordOperator(ops950::kFusedInferAttentionScoreV2);
       return planned;
@@ -1479,13 +1065,8 @@ class Scenario {
   std::string fia_operator_;
   std::string fia_note_;
   std::string native_write_note_;
-  // Last, so destroyed first: a PlannedOp holds the descriptor handles above.
   std::unique_ptr<PlannedOp> fia_prefill_rotated_, fia_prefill_native_, fia_decode_native_, native_write_;
 };
-
-// ---------------------------------------------------------------------------
-// Runners, one per iteration budget
-// ---------------------------------------------------------------------------
 
 class RunnerSet {
  public:
@@ -1495,9 +1076,6 @@ class RunnerSet {
     } else {
       budgets_ = budgets;
     }
-    // The first budget goes on the runner the harness owns and will report; the
-    // rest each get one of their own. Setting options before any case has run is
-    // what keeps every table header describing the rows under it.
     BenchmarkOptions options = Options(primary.options(), budgets_.front());
     primary.set_options(options);
     runners_.push_back(&primary);
@@ -1522,21 +1100,14 @@ class RunnerSet {
 
   const std::vector<BenchmarkRunner*>& all() const { return runners_; }
 
-  // A failure recorded anywhere has to reach the runner the harness reads the
-  // exit code from.
   void Fail(const std::string& name, const std::string& why) const { primary_->RecordFailure(name, why); }
 
-  // The same, for a failure already recorded against `runner` so that it shows
-  // up in that runner's own report. Mirrored into the primary only when `runner`
-  // is not the primary, so a failure is never counted twice.
   void MirrorFail(const BenchmarkRunner& runner, const std::string& name, const std::string& why) const {
     if (&runner != primary_) {
       primary_->RecordFailure(name, why);
     }
   }
 
-  // Everything but the primary, which the harness reports for us after
-  // BuildSuite returns.
   void ReportExtras() const {
     for (const std::unique_ptr<BenchmarkRunner>& runner : owned_) {
       runner->Report();
@@ -1558,14 +1129,8 @@ class RunnerSet {
   std::vector<BenchmarkRunner*> runners_;
 };
 
-// ---------------------------------------------------------------------------
-// Reading the results back
-// ---------------------------------------------------------------------------
-
 struct Sample {
   bool present = false;
-  // True for a figure that is true by construction rather than measured: a
-  // folded layer's T_rot_o. Printed as a number, flagged in the CSV.
   bool structural_zero = false;
   double median_us = 0.0;
   double p95_us = 0.0;
@@ -1586,9 +1151,6 @@ const BenchmarkResult* FindResult(const std::vector<BenchmarkRunner*>& runners, 
   return nullptr;
 }
 
-// Device time: the device-events mode when it ran, the pipelined one otherwise.
-// Both are ACL event pairs; the host wall clock is never used for a reported
-// figure, only as a cross-check in the raw table.
 Sample SampleFor(const std::vector<BenchmarkRunner*>& runners, const char* leg, const Config& config) {
   Sample sample;
   const std::string name = CaseName(leg, config);
@@ -1615,7 +1177,6 @@ Sample StructuralZero() {
   return sample;
 }
 
-// T_rot_o: exactly zero for a folded layer, measured otherwise.
 Sample RotateOutputSample(const std::vector<BenchmarkRunner*>& runners, const char* leg, const Config& config) {
   return config.model.folds_output ? StructuralZero() : SampleFor(runners, leg, config);
 }
@@ -1635,8 +1196,6 @@ void PrintUs(const Sample& sample, int width) {
   }
 }
 
-// The AIV split figure is the measured core minus the measured combine, and is
-// marked so no reader takes it for a direct measurement.
 void PrintUsDerived(const Sample& sample, int width, bool derived) {
   if (!sample.present) {
     std::printf(" %*s ", width, "-");
@@ -1653,9 +1212,6 @@ void PrintRatio(double ratio, int width) {
   }
 }
 
-// Prints a column header and a rule of exactly its own width underneath. The
-// width comes from the snprintf that built the header rather than from a sum of
-// the field widths restated here, so the two cannot drift as columns move.
 void PrintHeaderAndRule(const char* header, int width) {
   std::printf("%s\n", header);
   const size_t indent = 2;
@@ -1671,8 +1227,6 @@ void PrintDouble(double value, int width, int precision) {
   }
 }
 
-// One configuration's worth of derived figures, computed once so the table and
-// the CSV cannot disagree about them.
 struct PrefillRow {
   Sample ingest, rot_q, attn_core, rot_o, e2e, native, native_ingest;
   double sum_of_parts_us = 0.0;
@@ -1721,7 +1275,6 @@ DecodeRow ReadDecodeRow(const std::vector<BenchmarkRunner*>& runners, const Conf
   if (config.path == PathMode::kCube) {
     row.split = SampleFor(runners, kLegDecSplit, config);
   } else if (row.attn_core.present && row.combine.present) {
-    // No exported entry point for the AIV split alone; see THE DECODE PATH.
     row.split.present = true;
     row.split.median_us = std::max(0.0, row.attn_core.median_us - row.combine.median_us);
     row.split.mode = row.attn_core.mode;
@@ -1738,9 +1291,6 @@ DecodeRow ReadDecodeRow(const std::vector<BenchmarkRunner*>& runners, const Conf
   return row;
 }
 
-// Median relative gap between the composite E2E measurement and the sum of its
-// separately measured parts, over the rows that produced both. Reported rather
-// than hidden: it is the launch overhead the component view cannot see.
 double MedianResidual(const std::vector<double>& residuals) {
   if (residuals.empty()) {
     return 0.0;
@@ -1749,10 +1299,6 @@ double MedianResidual(const std::vector<double>& residuals) {
   std::sort(sorted.begin(), sorted.end());
   return sorted[sorted.size() / 2];
 }
-
-// ---------------------------------------------------------------------------
-// Table A -- prefill
-// ---------------------------------------------------------------------------
 
 void PrintTableA(const std::vector<BenchmarkRunner*>& runners, const std::vector<Config>& sweep,
                  const std::vector<Traffic>& traffic, const std::string& fia_operator) {
@@ -1827,10 +1373,6 @@ void PrintTableA(const std::vector<BenchmarkRunner*>& runners, const std::vector
   std::fflush(stdout);
 }
 
-// ---------------------------------------------------------------------------
-// Table B -- decode
-// ---------------------------------------------------------------------------
-
 void PrintTableB(const std::vector<BenchmarkRunner*>& runners, const std::vector<Config>& sweep,
                  const std::vector<Traffic>& traffic, const std::string& fia_operator) {
   std::printf("\n");
@@ -1903,14 +1445,6 @@ void PrintTableB(const std::vector<BenchmarkRunner*>& runners, const std::vector
   std::fflush(stdout);
 }
 
-// ---------------------------------------------------------------------------
-// CSVs
-// ---------------------------------------------------------------------------
-
-// An absent leg leaves its fields EMPTY rather than writing 0: a zero latency in
-// a spreadsheet is indistinguishable from a measurement, and a CSV is the
-// artifact most likely to be read without its banner. A structural zero -- a
-// folded layer's T_rot_o -- is written as 0 and flagged in its own column.
 void WriteCell(std::ofstream& csv, const Sample& sample) {
   csv << ',';
   if (sample.present) {
@@ -2071,13 +1605,6 @@ void WriteDecodeCsv(const std::vector<BenchmarkRunner*>& runners, const std::vec
   std::printf("[ascend-bench] Table B written to %s\n", path.c_str());
 }
 
-// ---------------------------------------------------------------------------
-// The two device checks
-// ---------------------------------------------------------------------------
-
-// Pi is orthogonal, so FIA over (Q~, K~, V~) un-rotated per head must be FIA
-// over (Q, K, V). The device-level statement that the prefill core below is the
-// layer's attention, and what licenses timing the folded path with T_rot_o = 0.
 double RotatedBasisCosine(const Scenario& scenario, const Config& config, aclrtStream stream) {
   scenario.EnqueuePrefillAttnCore(stream);
   scenario.EnqueuePrefillNative(stream);
@@ -2087,9 +1614,6 @@ double RotatedBasisCosine(const Scenario& scenario, const Config& config, aclrtS
   return turboquant_ref::cpu_fidelity(folded, plain).cosine_similarity;
 }
 
-// The TurboQuant decode's output, un-rotated, against the native decode over the
-// same context in the same slots. A loose bound on purpose: 4 bits against 16
-// will not do better, and what this catches is a leg reading an empty cache.
 double DecodeTiePointCosine(const Scenario& scenario, const Config& config, aclrtStream stream) {
   scenario.EnqueueDecodeE2E(stream);
   scenario.EnqueueDecodeNative(stream);
@@ -2098,10 +1622,6 @@ double DecodeTiePointCosine(const Scenario& scenario, const Config& config, aclr
   const std::vector<float> folded = tqh::UnrotateHeads(scenario.DecodeTqOutput(), config.model.head_size);
   return turboquant_ref::cpu_fidelity(folded, native).cosine_similarity;
 }
-
-// ---------------------------------------------------------------------------
-// Banner
-// ---------------------------------------------------------------------------
 
 void PrintBanner(const std::vector<Config>& sweep, int64_t aiv_num, bool aiv_queried) {
   std::printf("[ascend-bench] TurboQuant end-to-end audit against the native CANN V5 attention operator\n");
@@ -2143,11 +1663,7 @@ void PrintBanner(const std::vector<Config>& sweep, int64_t aiv_num, bool aiv_que
   std::fflush(stdout);
 }
 
-}  // namespace
-
-// ---------------------------------------------------------------------------
-// The suite
-// ---------------------------------------------------------------------------
+}
 
 void BuildSuite(BenchmarkRunner& primary) {
   bool aiv_queried = false;
@@ -2159,8 +1675,6 @@ void BuildSuite(BenchmarkRunner& primary) {
     return;
   }
 
-  // One runner per distinct iteration budget, in the order the sweep first asks
-  // for them; see RunnerSet.
   std::vector<Budget> budgets;
   for (const Config& config : sweep) {
     if (std::find(budgets.begin(), budgets.end(), config.budget) == budgets.end()) {
@@ -2177,10 +1691,6 @@ void BuildSuite(BenchmarkRunner& primary) {
   const bool run_prefill = PhaseEnabled("prefill");
   const bool run_decode = PhaseEnabled("decode");
 
-  // The rotated-basis identity runs once, on the configuration whose attention
-  // output is smallest, where reading two of them back costs megabytes rather
-  // than gigabytes. The decode tie-point runs once, on the smallest
-  // configuration whose context also fits an exact host image.
   size_t basis_check = sweep.size();
   size_t tie_point_check = sweep.size();
   for (size_t index = 0; index < sweep.size(); ++index) {
@@ -2206,10 +1716,6 @@ void BuildSuite(BenchmarkRunner& primary) {
     const Config& config = sweep[index];
     BenchmarkRunner& runner = runners.For(config.budget);
 
-    // The split count follows from the grid, which follows from the shape, and
-    // the traffic model's partial term needs it. Planned here rather than read
-    // off the scenario so that a configuration skipped for HBM still gets a row
-    // in the model.
     const int64_t planned_splits =
         config.path == PathMode::kCube
             ? tqh::PlanCubeDecode(config.batch, config.model.num_heads, config.model.num_kv_heads,
@@ -2220,7 +1726,6 @@ void BuildSuite(BenchmarkRunner& primary) {
                   .num_splits;
     traffic.push_back(ModelTraffic(config, planned_splits));
 
-    // --- the HBM guard ------------------------------------------------------
     size_t free_hbm = 0;
     size_t total_hbm = 0;
     const bool known = aclrtGetMemInfo(ACL_HBM_MEM, &free_hbm, &total_hbm) == ACL_SUCCESS && free_hbm > 0;
@@ -2241,7 +1746,6 @@ void BuildSuite(BenchmarkRunner& primary) {
       continue;
     }
 
-    // --- build --------------------------------------------------------------
     std::unique_ptr<Scenario> scenario;
     try {
       scenario.reset(new Scenario(config, aiv_num));
@@ -2267,12 +1771,6 @@ void BuildSuite(BenchmarkRunner& primary) {
     }
     std::fflush(stdout);
 
-    // --- setup, outside every timed region ----------------------------------
-    //
-    // The cache is filled from the whole context, then one untimed pass leaves
-    // the flash-decoding workspace and both attention outputs holding real
-    // values -- see Scenario::Prime for why a timed combine cannot start from
-    // zeros.
     try {
       scenario->FillCache(runner.stream());
       scenario->Prime(runner.stream());
@@ -2281,7 +1779,6 @@ void BuildSuite(BenchmarkRunner& primary) {
       continue;
     }
 
-    // --- the two device checks, before anything is timed --------------------
     if (index == basis_check && scenario->prefill_available()) {
       try {
         const double cosine = RotatedBasisCosine(*scenario, config, runner.stream());
@@ -2312,7 +1809,6 @@ void BuildSuite(BenchmarkRunner& primary) {
     }
     std::fflush(stdout);
 
-    // --- registration -------------------------------------------------------
     const Traffic& model = traffic.back();
     const Scenario* sc = scenario.get();
     const auto run_leg = [&](const char* leg, double flops, double bytes, int tasks,
@@ -2338,13 +1834,6 @@ void BuildSuite(BenchmarkRunner& primary) {
     };
     const int rot_o_tasks = config.model.folds_output ? 0 : 1;
 
-    // DECODE FIRST, then prefill. The prefill ingest leg rewrites the tail of
-    // the TurboQuant cache from the chunk's own K/V and the native ingest leg
-    // rewrites part of the fp16 paged cache, so running them first would leave
-    // the decode legs reading a cache the setup phase did not build. Neither
-    // rewrite changes any latency -- both write the same bytes to the same slots
-    // every launch -- but the order keeps the decode measuring a cache whose
-    // provenance is the one the tie-point checked.
     if (run_decode) {
       run_leg(kLegDecRotQ, 0.0, model.dec_rot_q, 1, [sc](aclrtStream s) { sc->EnqueueDecodeRotateQ(s); },
               [sc]() { return sc->DecodeRotatedQueryChecksum(); });
@@ -2373,10 +1862,6 @@ void BuildSuite(BenchmarkRunner& primary) {
                 [sc]() { return sc->DecodeRotatedOutChecksum(); });
       }
 
-      // rotate-q, the core's two stages, and the de-rotation when the layer
-      // cannot fold. The count has to be right: the harness uses it to decide
-      // when the stream is close to full, and a case that undercounts starts
-      // measuring the runtime's back-pressure rather than the kernels.
       run_leg(kLegDecE2E, model.dec_flops, model.dec_e2e, 3 + rot_o_tasks,
               [sc](aclrtStream s) { sc->EnqueueDecodeE2E(s); },
               [sc]() { return sc->DecodePipelineChecksum(); });
@@ -2431,9 +1916,6 @@ void BuildSuite(BenchmarkRunner& primary) {
     }
   }
 
-  // The extra budgets' raw tables. The primary's is printed by the harness after
-  // this function returns, which is why the audit tables come last: they are the
-  // artifact, and the raw per-case table is the record behind them.
   runners.ReportExtras();
 
   if (run_prefill) {
@@ -2454,6 +1936,6 @@ void BuildSuite(BenchmarkRunner& primary) {
   std::fflush(stdout);
 }
 
-}  // namespace bench
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}

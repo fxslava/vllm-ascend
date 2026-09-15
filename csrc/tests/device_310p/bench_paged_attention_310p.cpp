@@ -14,20 +14,6 @@
  * limitations under the License.
  */
 
-// The paged KV path on Ascend 310P: the cache write, benchmarked, and the
-// decode attention, which cannot be.
-//
-// aclnnPagedAttention does not exist on CANN 9.1.0.
-// torch_npu._npu_paged_attention is an ATB operator, and the aclnn alternative
-// aclnnIncreFlashAttentionV4 expects a different paged KV layout from the 310P
-// 5-D NZ cache. See common/aclnn_ops.hpp. The decode case is registered as a
-// skip with that reason so the report shows the hole.
-//
-// What is benchmarked is aclnnScatterPaKvCache, a pure scatter with no
-// arithmetic, so GB/s is the only meaningful figure. The slot mapping is a
-// shuffle rather than a run of consecutive slots, which is both the realistic
-// case and the one the kernel cannot coalesce.
-
 #include <algorithm>
 #include <cstdint>
 #include <sstream>
@@ -53,11 +39,8 @@ namespace {
 
 using reference::PagedKvLayout;
 
-// The runner allocates both halves of the KV cache with FRACTAL_NZ over the
-// already-decomposed 4-D shape, so the descriptors carry the same tag.
 constexpr aclFormat kKvCacheFormat = ACL_FORMAT_FRACTAL_NZ;
 
-// cacheMode is a mutable char* in the verified prototype.
 char kCacheModeNorm[] = "Norm";
 
 const AclnnOp& ScatterPaKvCacheOp() {
@@ -65,9 +48,6 @@ const AclnnOp& ScatterPaKvCacheOp() {
   return op;
 }
 
-// The KV cache write depends only on num_kv_heads and head_size, not on the
-// query head count, so the four GQA configurations in qwen_shapes.hpp collapse
-// to these three distinct KV shapes.
 struct KvConfiguration {
   const char* label;
   int64_t num_kv_heads;
@@ -80,8 +60,6 @@ const KvConfiguration kKvConfigurations[] = {
     KvConfiguration{"kv2_d64", 2, 64},
 };
 
-// Tokens written per launch: one decode step of a batch this size, or a
-// prefill chunk of this length.
 const int64_t kTokenCounts[] = {1, 32, 128, 512};
 
 std::vector<int64_t> KvCacheDims(const PagedKvLayout& layout) {
@@ -94,11 +72,9 @@ std::string CaseName(const KvConfiguration& configuration, int64_t block_size, i
   return name.str();
 }
 
-}  // namespace
+}
 
 void BuildSuite(BenchmarkRunner& runner) {
-  // Register the hole first, so it is visible even if the scatter benchmarks
-  // then fail for an unrelated reason.
   runner.Skip("paged attention decode",
               "aclnnPagedAttention is not provided by CANN 9.1.0; torch_npu._npu_paged_attention is backed by "
               "ATB (libatb.so), which the aclnn launch path cannot drive. See csrc/tests/common/aclnn_ops.hpp "
@@ -110,7 +86,7 @@ void BuildSuite(BenchmarkRunner& runner) {
     return;
   }
 
-  DeterministicRandom random(0x42504143u);  // "BPAC"
+  DeterministicRandom random(0x42504143u);
 
   for (const KvConfiguration& configuration : kKvConfigurations) {
     for (int64_t block_size : shapes::Supported310PBlockSizes()) {
@@ -129,9 +105,6 @@ void BuildSuite(BenchmarkRunner& runner) {
           layout.block_size = block_size;
           layout.num_kv_heads = configuration.num_kv_heads;
           layout.head_size = configuration.head_size;
-          // Four times as many blocks as the tokens strictly need, so the
-          // shuffled slots land in genuinely unrelated blocks rather than in a
-          // handful that would stay resident.
           const int64_t minimum_blocks = (num_tokens + block_size - 1) / block_size;
           layout.num_blocks = std::max<int64_t>(4, minimum_blocks * 4);
 
@@ -161,8 +134,6 @@ void BuildSuite(BenchmarkRunner& runner) {
           DeviceTensor value_cache_device =
               DeviceTensor::HalfEmpty(cache_dims, kKvCacheFormat, kBenchmarkAlignBytes);
 
-          // Argument order follows the header exactly: key, keyCache,
-          // slotMapping, then value, valueCache, then the optional tensors.
           PlannedOp planned = PlanAclnn<ops::ScatterPaKvCacheWorkspaceFn>(
               op, key_device.get(), key_cache_device.get(), slot_device.get(), value_device.get(),
               value_cache_device.get(), static_cast<const aclTensor*>(nullptr),
@@ -172,15 +143,9 @@ void BuildSuite(BenchmarkRunner& runner) {
 
           BenchmarkCase benchmark_case;
           benchmark_case.name = name;
-          // key and value read, key cache and value cache written, plus the
-          // int32 slot mapping. The cache is far larger than this, but only the
-          // written slots are touched.
           benchmark_case.bytes_per_iteration =
               2.0 * 2.0 * 2.0 * static_cast<double>(kv_elements) + 4.0 * static_cast<double>(num_tokens);
           benchmark_case.launch = [&planned](aclrtStream stream) { planned.Launch(stream); };
-          // The scatter is idempotent, so the cache must be bit-identical
-          // across the run. The whole cache is summed rather than just the
-          // written slots, so a stray write outside the mapping is caught too.
           benchmark_case.checksum = [&key_cache_device]() {
             return ChecksumSum(key_cache_device.ToFloatFromHalf());
           };
@@ -194,6 +159,6 @@ void BuildSuite(BenchmarkRunner& runner) {
   }
 }
 
-}  // namespace bench
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}

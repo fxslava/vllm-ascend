@@ -14,24 +14,18 @@
  * limitations under the License.
  */
 
-// Entry point shared by every benchmark binary. Each device_310p/bench_*.cpp
-// provides the two symbols declared here and nothing else: no GTest, no test
-// registration, and no global constructors that could run before the runtime
-// is up.
-
 #include "benchmark.hpp"
 
 namespace vllm_ascend {
 namespace test {
 namespace bench {
 
-// Defined by the bench_*.cpp this binary links.
 extern const char* kSuiteName;
 void BuildSuite(BenchmarkRunner& runner);
 
-}  // namespace bench
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}
 
 int main() {
   return ::vllm_ascend::test::bench::RunBenchmarkSuite(::vllm_ascend::test::bench::kSuiteName,

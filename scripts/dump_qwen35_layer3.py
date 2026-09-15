@@ -64,7 +64,6 @@ from pathlib import Path
 
 import torch
 
-# --- Layer 3 configuration ---------------------------------------------------
 
 HIDDEN_SIZE = 2048
 INTERMEDIATE_SIZE = 6144
@@ -74,9 +73,9 @@ HEAD_DIM = 256
 PARTIAL_ROTARY_FACTOR = 0.25
 ATTN_OUTPUT_GATE = True
 
-Q_DIM = NUM_ATTENTION_HEADS * HEAD_DIM  # 2048
-KV_DIM = NUM_KEY_VALUE_HEADS * HEAD_DIM  # 512
-ROTARY_DIM = int(HEAD_DIM * PARTIAL_ROTARY_FACTOR)  # 64
+Q_DIM = NUM_ATTENTION_HEADS * HEAD_DIM
+KV_DIM = NUM_KEY_VALUE_HEADS * HEAD_DIM
+ROTARY_DIM = int(HEAD_DIM * PARTIAL_ROTARY_FACTOR)
 RMS_NORM_EPS = 1e-6
 ATTENTION_SCALE = 1.0 / math.sqrt(HEAD_DIM)
 
@@ -135,7 +134,6 @@ def apply_partial_rope(
 
     rotated[..., :half] = first * cos_first - second * sin_first
     rotated[..., half:rotary_dim] = second * cos_second + first * sin_second
-    # rotated[..., rotary_dim:] keeps the clone's pass-through values.
     return rotated
 
 
@@ -210,9 +208,6 @@ def main() -> None:
         f" gate={ATTN_OUTPUT_GATE} pos={args.pos} ctx={args.ctx_len}\n"
     )
 
-    # --- parameters ----------------------------------------------------------
-    # fp16 on disk and fp16 as the stage input, so the reference and the device
-    # start from bit-identical values.
     x_in = h(normal(generator, 1, HIDDEN_SIZE, std=1.0))
     gamma1 = h(torch.empty(HIDDEN_SIZE, dtype=torch.float32).normal_(1.0, 0.1, generator=generator))
     gamma2 = h(torch.empty(HIDDEN_SIZE, dtype=torch.float32).normal_(1.0, 0.1, generator=generator))
@@ -232,23 +227,18 @@ def main() -> None:
     cos_tab, sin_tab = build_rope_tables(args.pos, ROTARY_DIM, args.rope_theta)
     cos_tab, sin_tab = h(cos_tab), h(sin_tab)
 
-    # Prior context, if any. The new token always occupies the last slot, which
-    # is what a decode step does.
     past = args.ctx_len - 1
     k_past = h(normal(generator, past, NUM_KEY_VALUE_HEADS, HEAD_DIM, std=1.0)) if past else None
     v_past = h(normal(generator, past, NUM_KEY_VALUE_HEADS, HEAD_DIM, std=1.0)) if past else None
 
-    # --- stage 1: input RMSNorm ----------------------------------------------
     norm1 = h(rms_norm(f(x_in), f(gamma1), RMS_NORM_EPS))
 
-    # --- stage 2: Q/K/V and the attention gate -------------------------------
     q = h(f(norm1) @ f(w_q).t())
     k = h(f(norm1) @ f(w_k).t())
     v = h(f(norm1) @ f(w_v).t())
     attn_gate = h(f(norm1) @ f(w_gate_attn).t())
     qkv = torch.cat([q, k, v], dim=-1)
 
-    # --- stage 3: partial RoPE ------------------------------------------------
     q_rope = h(
         apply_partial_rope(
             f(q).view(1, NUM_ATTENTION_HEADS, HEAD_DIM), f(cos_tab), f(sin_tab), ROTARY_DIM
@@ -260,7 +250,6 @@ def main() -> None:
         )
     ).view(1, KV_DIM)
 
-    # --- stage 4: paged decode attention -------------------------------------
     k_new = k_rope.view(1, NUM_KEY_VALUE_HEADS, HEAD_DIM)
     v_new = v.view(1, NUM_KEY_VALUE_HEADS, HEAD_DIM)
     k_ctx = torch.cat([k_past, k_new], dim=0) if past else k_new
@@ -272,25 +261,19 @@ def main() -> None:
         )
     ).view(1, Q_DIM)
 
-    # --- stage 5: output gate, out projection, residual -----------------------
     gated = h(f(context) * torch.sigmoid(f(attn_gate))) if ATTN_OUTPUT_GATE else context
     attn_out = h(f(gated) @ f(w_out).t())
     x_after_attn = h(f(x_in) + f(attn_out))
 
-    # --- stage 6: post-attention RMSNorm --------------------------------------
     norm2 = h(rms_norm(f(x_after_attn), f(gamma2), RMS_NORM_EPS))
 
-    # --- stage 7: SwiGLU MLP --------------------------------------------------
     mlp_gate = h(f(norm2) @ f(w_gate).t())
     mlp_up = h(f(norm2) @ f(w_up).t())
-    # silu(v) = v / (1 + exp(-v)), the form SiluFloat in swiglu_kernel.cu uses.
     swiglu = h(f(mlp_gate) / (1.0 + torch.exp(-f(mlp_gate))) * f(mlp_up))
     mlp_out = h(f(swiglu) @ f(w_down).t())
 
-    # --- stage 8: final residual ----------------------------------------------
     golden = h(f(x_after_attn) + f(mlp_out))
 
-    # --- write ----------------------------------------------------------------
     print("inputs and weights")
     write(out_dir / "input_x.bin", x_in)
     write(out_dir / "input_norm_gamma.bin", gamma1)

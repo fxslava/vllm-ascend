@@ -14,20 +14,6 @@
  * limitations under the License.
  */
 
-// Paged attention and the KV cache write on Ascend 310P, fp16.
-//
-// Mirrors two call sites:
-//   torch_npu._npu_reshape_and_cache
-//     vllm_ascend/device/device_op.py :: Ascend310PDeviceAdaptor.reshape_and_cache
-//   torch_npu._npu_paged_attention
-//     vllm_ascend/_310p/attention/attention_v1.py :: forward_paged_attention
-//
-// get_kv_cache_shape on the 310P backend returns
-//     (2, num_blocks, num_kv_heads * head_size / 16, block_size, 16)
-// and the runner allocates each half with acl_format=ACL_FORMAT_FRACTAL_NZ. The
-// suite is layered so the layout arithmetic, the cache write and the attention
-// numerics fail independently.
-
 #include <gtest/gtest.h>
 
 #include <cmath>
@@ -52,21 +38,13 @@ namespace {
 using reference::PagedAttentionShape;
 using reference::PagedKvLayout;
 
-// The runner allocates both halves of the KV cache with
-// acl_format=ACL_FORMAT_FRACTAL_NZ over the already-decomposed 4-D shape, so
-// the descriptors handed to the operator carry the same tag. If a CANN release
-// rejects it, ACL_FORMAT_ND is the one thing to try first.
 constexpr aclFormat kKvCacheFormat = ACL_FORMAT_FRACTAL_NZ;
 
-// aclnnReshapeAndCache does not exist on CANN 9.1.0 (it is an ATB operator).
-// aclnnScatterPaKvCache is the aclnn route to the same paged KV write, and is
-// what BaseDeviceAdaptor.reshape_and_cache calls via npu_scatter_pa_kv_cache.
 const AclnnOp& ScatterPaKvCacheOp() {
   static const AclnnOp op(ops::kScatterPaKvCache);
   return op;
 }
 
-// cacheMode is a mutable char* in the prototype, so it needs a real array.
 char kCacheModeNorm[] = "Norm";
 
 std::vector<int64_t> KvCacheDims(const PagedKvLayout& layout) {
@@ -83,17 +61,13 @@ struct DecodeCase {
   int64_t max_context_len;
 };
 
-// Builds a scattered block table plus per-sequence context lengths. Physical
-// blocks are drawn from a shuffled pool so that logical order never matches
-// physical order, which is what catches an indexing bug that a sequential table
-// would hide.
 struct PagedLayoutFixture {
   PagedKvLayout layout;
   PagedAttentionShape shape;
   std::vector<int32_t> block_table;
   std::vector<int32_t> context_lens;
   int64_t total_cached_tokens = 0;
-  std::vector<int32_t> slot_mapping;  // one slot per cached token, in fill order
+  std::vector<int32_t> slot_mapping;
 };
 
 PagedLayoutFixture BuildPagedLayout(const DecodeCase& test_case, DeterministicRandom* random) {
@@ -106,7 +80,6 @@ PagedLayoutFixture BuildPagedLayout(const DecodeCase& test_case, DeterministicRa
   const int64_t blocks_per_seq =
       (test_case.max_context_len + test_case.block_size - 1) / test_case.block_size;
   fixture.shape.max_blocks_per_seq = blocks_per_seq;
-  // Over-allocate the pool so the shuffle has room to scatter.
   fixture.layout.num_blocks = test_case.num_seqs * blocks_per_seq + 4;
 
   fixture.shape.num_seqs = test_case.num_seqs;
@@ -123,8 +96,6 @@ PagedLayoutFixture BuildPagedLayout(const DecodeCase& test_case, DeterministicRa
 
   int32_t next_block = 0;
   for (int64_t seq = 0; seq < test_case.num_seqs; ++seq) {
-    // Vary the context length per sequence so partially filled trailing blocks
-    // are exercised alongside exactly-full ones.
     const int64_t context_len =
         (seq == 0) ? test_case.max_context_len
                    : static_cast<int64_t>(random->IntInRange(1, static_cast<int32_t>(test_case.max_context_len)));
@@ -149,13 +120,7 @@ PagedLayoutFixture BuildPagedLayout(const DecodeCase& test_case, DeterministicRa
   return fixture;
 }
 
-// -----------------------------------------------------------------------------
-// Host-only checks on the 310P cache layout
-// -----------------------------------------------------------------------------
-
 TEST(PagedKvLayout, MatchesGetKvCacheShapeOn310P) {
-  // AscendAttentionBackend310.get_kv_cache_shape:
-  //   (2, num_blocks, (num_kv_heads * head_size) // 16, block_size, 16)
   for (const shapes::AttentionHeads& heads : shapes::GqaConfigurations()) {
     for (int64_t block_size : shapes::Supported310PBlockSizes()) {
       if (!shapes::IsValid310PBlockSize(block_size, heads.head_size)) {
@@ -179,8 +144,6 @@ TEST(PagedKvLayout, MatchesGetKvCacheShapeOn310P) {
 }
 
 TEST(PagedKvLayout, OffsetsAreUniqueAndInBounds) {
-  // A collision here would silently make two heads alias in the cache, which is
-  // the kind of bug an end-to-end accuracy test reports as "slightly worse".
   PagedKvLayout layout;
   layout.num_blocks = 3;
   layout.block_size = 64;
@@ -212,7 +175,7 @@ TEST(PagedKvLayout, ReshapeAndCacheRoundTripsThroughTheReference) {
   layout.num_kv_heads = 2;
   layout.head_size = 128;
 
-  DeterministicRandom random(0x4b564341u);  // "KVCA"
+  DeterministicRandom random(0x4b564341u);
   const int64_t num_tokens = 100;
 
   const std::vector<float> key = random.NormalHalfExact(
@@ -247,7 +210,6 @@ TEST(PagedKvLayout, ReshapeAndCacheRoundTripsThroughTheReference) {
 }
 
 TEST(PagedAttentionReference, SingleTokenContextReturnsThatValue) {
-  // With one key in the context, softmax is 1 and the output is exactly v.
   PagedKvLayout layout;
   layout.num_blocks = 1;
   layout.block_size = 64;
@@ -263,7 +225,7 @@ TEST(PagedAttentionReference, SingleTokenContextReturnsThatValue) {
   shape.max_blocks_per_seq = 1;
   shape.scale = 1.0f / 8.0f;
 
-  DeterministicRandom random(0x53314b56u);  // "S1KV"
+  DeterministicRandom random(0x53314b56u);
   const std::vector<float> query = random.NormalHalfExact(64, 0.0f, 1.0f);
   const std::vector<float> key = random.NormalHalfExact(64, 0.0f, 1.0f);
   const std::vector<float> value = random.NormalHalfExact(64, 0.0f, 1.0f);
@@ -282,9 +244,6 @@ TEST(PagedAttentionReference, SingleTokenContextReturnsThatValue) {
 }
 
 TEST(PagedAttentionReference, IdenticalKeysGiveTheMeanOfTheValues) {
-  // Equal scores make softmax uniform, so the output is the arithmetic mean of
-  // the value vectors. This pins the softmax normalisation independently of the
-  // dot-product path.
   PagedKvLayout layout;
   layout.num_blocks = 1;
   layout.block_size = 64;
@@ -303,8 +262,8 @@ TEST(PagedAttentionReference, IdenticalKeysGiveTheMeanOfTheValues) {
   const int64_t context_len = 8;
   const std::vector<float> query(16, 0.5f);
 
-  DeterministicRandom random(0x4d45414eu);  // "MEAN"
-  std::vector<float> key(static_cast<size_t>(context_len * 16), 0.25f);  // every key identical
+  DeterministicRandom random(0x4d45414eu);
+  std::vector<float> key(static_cast<size_t>(context_len * 16), 0.25f);
   const std::vector<float> value = random.NormalHalfExact(static_cast<size_t>(context_len * 16), 0.0f, 1.0f);
 
   std::vector<int32_t> slot_mapping(static_cast<size_t>(context_len));
@@ -331,8 +290,6 @@ TEST(PagedAttentionReference, IdenticalKeysGiveTheMeanOfTheValues) {
 }
 
 TEST(PagedAttentionShapes, BlockSizesRespectThe310PProduct) {
-  // block_size * head_size must stay within 128 * 128 or the runner drops down
-  // to a smaller block. Confirm the combinations the suite uses are legal.
   for (const shapes::AttentionHeads& heads : shapes::GqaConfigurations()) {
     bool any_legal = false;
     for (int64_t block_size : shapes::Supported310PBlockSizes()) {
@@ -344,10 +301,6 @@ TEST(PagedAttentionShapes, BlockSizesRespectThe310PProduct) {
   }
 }
 
-// -----------------------------------------------------------------------------
-// Device: KV cache write
-// -----------------------------------------------------------------------------
-
 class ReshapeAndCache310PTest : public ::testing::TestWithParam<DecodeCase> {};
 
 TEST_P(ReshapeAndCache310PTest, WritesTheSameBytesAsTheHostScatter) {
@@ -355,7 +308,7 @@ TEST_P(ReshapeAndCache310PTest, WritesTheSameBytesAsTheHostScatter) {
   REQUIRE_ACLNN_OP(ScatterPaKvCacheOp());
 
   const DecodeCase& test_case = GetParam();
-  DeterministicRandom random(0x52414331u);  // "RAC1"
+  DeterministicRandom random(0x52414331u);
 
   PagedLayoutFixture fixture = BuildPagedLayout(test_case, &random);
   const int64_t num_tokens = fixture.total_cached_tokens;
@@ -377,8 +330,6 @@ TEST_P(ReshapeAndCache310PTest, WritesTheSameBytesAsTheHostScatter) {
   DeviceTensor key_cache_device = DeviceTensor::HalfEmpty(cache_dims, kKvCacheFormat);
   DeviceTensor value_cache_device = DeviceTensor::HalfEmpty(cache_dims, kKvCacheFormat);
 
-  // Argument order follows the header exactly: key, keyCache, slotMapping,
-  // then value, valueCache, then the optional tensors and modes.
   RunAclnn<ops::ScatterPaKvCacheWorkspaceFn>(
       ScatterPaKvCacheOp(), stream, key_device.get(), key_cache_device.get(), slot_device.get(),
       value_device.get(), value_cache_device.get(), static_cast<const aclTensor*>(nullptr),
@@ -391,25 +342,14 @@ TEST_P(ReshapeAndCache310PTest, WritesTheSameBytesAsTheHostScatter) {
   reference::ReshapeAndCache(key, value, fixture.slot_mapping, fixture.layout, &expected_key_cache,
                              &expected_value_cache);
 
-  // The values are already fp16-exact and only copied, so this must match bit
-  // for bit; a non-zero tolerance here would hide a layout error.
   const Tolerance exact{0.0, 0.0, "cache write is a pure copy of fp16-exact values"};
   EXPECT_TENSORS_ALLCLOSE(key_cache_device.ToFloatFromHalf(), expected_key_cache, exact);
   EXPECT_TENSORS_ALLCLOSE(value_cache_device.ToFloatFromHalf(), expected_value_cache, exact);
 }
 
-// -----------------------------------------------------------------------------
-// Device: paged attention decode
-// -----------------------------------------------------------------------------
-
 class PagedAttention310PTest : public ::testing::TestWithParam<DecodeCase> {};
 
 TEST_P(PagedAttention310PTest, MatchesCpuReference) {
-  // aclnnPagedAttention does not exist on CANN 9.1.0;
-  // torch_npu._npu_paged_attention is an ATB operator RunAclnn cannot drive,
-  // and aclnnIncreFlashAttentionV4 expects a different paged KV layout. The NZ
-  // layout arithmetic and the attention reference are covered by the host-only
-  // suites above.
   GTEST_SKIP() << "aclnnPagedAttention is not provided by CANN 9.1.0; "
                   "torch_npu._npu_paged_attention is backed by ATB (libatb.so). "
                   "See csrc/tests/common/aclnn_ops.hpp for the verified "
@@ -417,11 +357,6 @@ TEST_P(PagedAttention310PTest, MatchesCpuReference) {
 }
 
 TEST_P(PagedAttention310PTest, AttendsOnlyWithinTheContextLength) {
-  // aclnnPagedAttention does not exist on CANN 9.1.0;
-  // torch_npu._npu_paged_attention is an ATB operator RunAclnn cannot drive,
-  // and aclnnIncreFlashAttentionV4 expects a different paged KV layout. The NZ
-  // layout arithmetic and the attention reference are covered by the host-only
-  // suites above.
   GTEST_SKIP() << "aclnnPagedAttention is not provided by CANN 9.1.0; "
                   "torch_npu._npu_paged_attention is backed by ATB (libatb.so). "
                   "See csrc/tests/common/aclnn_ops.hpp for the verified "
@@ -430,9 +365,6 @@ TEST_P(PagedAttention310PTest, AttendsOnlyWithinTheContextLength) {
 
 std::string DecodeTestName(const ::testing::TestParamInfo<DecodeCase>& info) { return info.param.label; }
 
-// Head counts follow the Qwen3.5 GQA splits; block sizes are the two the 310P
-// kernel supports. max_context_len values straddle block boundaries so both
-// exactly-full and partially-filled trailing blocks appear.
 const DecodeCase kDecodeCases[] = {
     DecodeCase{"seq1_h28_kv4_d128_b64_ctx64", 1, 28, 4, 128, 64, 64},
     DecodeCase{"seq4_h28_kv4_d128_b64_ctx200", 4, 28, 4, 128, 64, 200},
@@ -446,6 +378,6 @@ const DecodeCase kDecodeCases[] = {
 INSTANTIATE_TEST_SUITE_P(Qwen35, ReshapeAndCache310PTest, ::testing::ValuesIn(kDecodeCases), DecodeTestName);
 INSTANTIATE_TEST_SUITE_P(Qwen35, PagedAttention310PTest, ::testing::ValuesIn(kDecodeCases), DecodeTestName);
 
-}  // namespace
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}

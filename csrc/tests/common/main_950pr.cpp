@@ -14,11 +14,6 @@
  * limitations under the License.
  */
 
-// Entry point shared by the Ascend 950PR test binaries of both device-side
-// tiers, sim/ and device/. Same shape as common/main.cpp, but it prints the
-// 950PR pipeline inventory instead of the 310P one, states which tier the
-// binary belongs to, and says whether a camodel is loaded.
-
 #include <gtest/gtest.h>
 
 #include <cstdio>
@@ -26,8 +21,6 @@
 #include "aclnn_ops_950pr.hpp"
 #include "test_harness.hpp"
 
-// Set per target by the tier's CMakeLists.txt. The fallback keeps the file
-// buildable on its own.
 #ifndef VLLM_ASCEND_TEST_TIER
 #define VLLM_ASCEND_TEST_TIER "unspecified"
 #endif

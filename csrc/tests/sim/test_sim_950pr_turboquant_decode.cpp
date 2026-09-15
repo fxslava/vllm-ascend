@@ -14,45 +14,6 @@
  * limitations under the License.
  */
 
-// End-to-end fidelity of the TurboQuant 4-bit KV cache, measured on an Ascend
-// 950PR or on the CANN camodel simulator standing in for one.
-//
-// ONE PASS, ON PURPOSE: the camodel simulates the pipeline cycle by cycle, so a
-// launch that is microseconds on silicon is minutes here. Every shape is the
-// smallest that still exercises the thing it is there to exercise:
-//
-//   head_size 64      the bottom of the supported range; the Walsh-Hadamard is
-//                     still four stages deep, so both its block-strided and its
-//                     Gather-shuffled halves run
-//   block_size 16     exactly one kTileRows tile
-//   context 32        two blocks through a non-identity block table, so the
-//                     online softmax carries state across a block boundary
-//   4 heads / 2 kv    a GQA group of two
-//
-// WHAT IS COMPARED. Three outputs of the same decode step:
-//
-//   quantised   the two TurboQuant kernels on the device.
-//   control     the same attention with an unquantised fp16 KV cache through
-//               aclnnFusedInferAttentionScoreV2. Attempted, not required: on an
-//               Ascend950 the planning call returns 361001 because the V1..V4
-//               family is withdrawn (see aclnn_ops_950pr.hpp).
-//   exact       fp32 attention over the same fp16 inputs, on the host. Always
-//               available, which is why the assertions hang off it.
-//
-// WHAT IS ASSERTED:
-//
-//   quantised vs the CPU TurboQuant reference   -   tight (cos > 0.999)
-//       Both run the identical algorithm, so anything beyond fp16 output
-//       rounding is a kernel bug. This is the regression detector.
-//
-//   quantised vs exact fp32                     -   a floor (SNR >= 12 dB)
-//       The scheme's error, not the kernel's. The floor sits well below what
-//       the codec achieves because the number moves with the data; what it
-//       catches is gross breakage -- a dropped un-rotation, a scale read from
-//       the wrong lane, a block table ignored.
-//
-// Timing is printed and never asserted.
-
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -83,8 +44,6 @@ namespace tq = turboquant_ref;
 namespace tqh = turboquant_host;
 namespace s = shapes950;
 
-// --- the one shape this file runs -------------------------------------------
-
 constexpr int64_t kHeadSize = 64;
 constexpr int64_t kNumKvHeads = 2;
 constexpr int64_t kNumHeads = 4;
@@ -93,32 +52,16 @@ constexpr int64_t kNumBlocks = 4;
 constexpr int64_t kContextLen = 32;
 constexpr int64_t kBlocksPerSeq = kContextLen / kBlockSize;
 constexpr int64_t kQueryTokens = 1;
-constexpr float kAttentionScale = 0.125f;   // 1 / sqrt(64)
-constexpr float kInvSqrtHeadSize = 0.125f;  // the kernels take this rather than doing a scalar sqrt
+constexpr float kAttentionScale = 0.125f;
+constexpr float kInvSqrtHeadSize = 0.125f;
 
-// --- the bounds -------------------------------------------------------------
-
-// Kernel against the CPU reference. The two run the same arithmetic; the only
-// licensed difference is the single fp16 rounding at the store.
 constexpr double kMinKernelCosine = 0.999;
 constexpr double kMaxKernelRelativeL2 = 5e-3;
 
-// The codec against exact fp32. The bounds sit well clear of what this shape
-// measures, because the number moves with the data.
-//
-// They do not discriminate "the Pi rotation was dropped": on iid Gaussian
-// channels a bare absmax quantiser scores the same, since what the rotation
-// buys is protection against anisotropic and outlier-heavy channels, which
-// test_host_turboquant_fidelity.cpp measures on real activations instead. What
-// they do catch is an un-rotation that never happened.
 constexpr double kMinCosine = 0.97;
 constexpr double kMinSnrDb = 12.0;
 constexpr double kMaxRelativeL2 = 0.30;
 
-// --- host-side pieces --------------------------------------------------------
-
-// Exact fp32 paged attention over the unquantised context. Same arrangement as
-// cpu_paged_attention_turboquant so the two differ only in the codec.
 void ExactAttention(const std::vector<float>& query, const std::vector<float>& key, const std::vector<float>& value,
                     std::vector<float>* out) {
   const int64_t group = kNumHeads / kNumKvHeads;
@@ -163,12 +106,10 @@ const AclnnOp& FusedInferAttentionOp() {
   return op;
 }
 
-// One decode step's inputs, all fp16-exact so the device and the host see the
-// identical bit patterns and the only difference measured is the arithmetic.
 struct Inputs {
-  std::vector<float> key;    // [context_len, num_kv_heads, head_size]
-  std::vector<float> value;  // same
-  std::vector<float> query;  // [1, num_heads, head_size]
+  std::vector<float> key;
+  std::vector<float> value;
+  std::vector<float> query;
   std::vector<int32_t> slots;
   std::vector<int32_t> block_table;
 };
@@ -181,8 +122,6 @@ Inputs MakeInputs() {
   in.value = rng.NormalHalfExact(kv_elems, 0.0f, 1.0f);
   in.query = rng.NormalHalfExact(static_cast<size_t>(kNumHeads * kHeadSize), 0.0f, 1.0f);
 
-  // A non-identity block table, so a decode that ignores paging reads the wrong
-  // blocks rather than accidentally reading the right ones.
   const std::vector<int32_t> permutation = rng.Permutation(static_cast<int32_t>(kNumBlocks));
   in.block_table.assign(permutation.begin(), permutation.begin() + kBlocksPerSeq);
 
@@ -194,8 +133,6 @@ Inputs MakeInputs() {
   return in;
 }
 
-// Milliseconds of wall clock around a synchronised launch. Reported, not
-// asserted: under the camodel this is the simulator's speed.
 template <typename Fn>
 double TimeMs(Fn&& fn) {
   const auto start = std::chrono::steady_clock::now();
@@ -206,7 +143,7 @@ double TimeMs(Fn&& fn) {
 
 class TurboQuantSimulatorFidelity : public ::testing::Test {};
 
-}  // namespace
+}
 
 TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
   REQUIRE_ASCEND_950PR();
@@ -225,12 +162,6 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
               static_cast<long long>(kContextLen), static_cast<long long>(kNumBlocks),
               static_cast<long long>(aiv_num), aiv_queried ? "" : " (assumed, runtime declined)");
 
-  // --- 1. device memory for the quantised path -------------------------------
-  //
-  // Plain contiguous ND: the packed cache is
-  // [num_blocks, block_size, num_kv_heads, head_size / 2] int8 and the scale
-  // plane is [num_blocks, block_size, scale_slot] fp32, indexed by token.
-
   DeviceBuffer key_dev = DeviceBuffer::FromHost(FloatToHalf(in.key));
   DeviceBuffer value_dev = DeviceBuffer::FromHost(FloatToHalf(in.value));
   DeviceBuffer query_dev = DeviceBuffer::FromHost(FloatToHalf(in.query));
@@ -240,13 +171,9 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
       DeviceBuffer::FromHost(std::vector<int32_t>{static_cast<int32_t>(kContextLen)});
   DeviceBuffer pi_signs_dev = DeviceBuffer::FromHost(tqh::PiSigns(kHeadSize));
   DeviceBuffer h16_dev = DeviceBuffer::FromHost(tqh::Hadamard16Half());
-  // The rotated query the split kernel now reads instead of rotating for
-  // itself. fp32, same element count as the query.
   DeviceBuffer query_rot_dev =
       DeviceBuffer::Empty<float>(static_cast<size_t>(kQueryTokens * kNumHeads * kHeadSize));
 
-  // The write path expands one vector per call and the decode path expands a
-  // kTileRows tile; their table images differ and are not interchangeable.
   DeviceBuffer write_tables_dev = DeviceBuffer::FromHost(tqh::CodecTables(kHeadSize, 1));
   DeviceBuffer decode_tables_dev = DeviceBuffer::FromHost(tqh::CodecTables(kHeadSize, tqh::kTileRows));
 
@@ -261,8 +188,6 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
       tqh::PlanPagedAttention(kQueryTokens, kNumHeads, kHeadSize, kBlocksPerSeq, aiv_num);
   DeviceBuffer workspace_dev = DeviceBuffer::Empty<float>(decode_grid.workspace_floats);
 
-  // --- 2. the quantised invocation -------------------------------------------
-
   const tqh::ReshapeAndCacheGrid write_grid = tqh::PlanReshapeAndCache(kContextLen, aiv_num);
   const double write_ms = TimeMs([&] {
     turboquant_reshape_and_cache_impl(
@@ -273,16 +198,10 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
     ACL_CHECK(aclrtSynchronizeStream(stream));
   });
 
-  // Two launches on one stream: split writes one partial per (token, head,
-  // sequence split), combine reduces them. They cannot share a launch - an
-  // in-kernel barrier only orders co-resident blocks - so stream order is the
-  // barrier, and the single synchronise below covers both.
   const double decode_ms = TimeMs([&] {
-    // Three launches on one stream now: the rotation, then the split, then the
-    // combine. The rotation has to come first and stream order is what says so.
     tqh::RotateQuery(stream, AscendType::FP16, query_dev.get(), pi_signs_dev.get(), h16_dev.get(),
                      write_tables_dev.get(), query_rot_dev.get(), kQueryTokens, kNumHeads, kHeadSize, aiv_num,
-                     /*input_exact_in_half=*/true);
+                     true);
     turboquant_paged_attention_impl(
         AscendType::FP16, stream, decode_grid.split_block_dim, decode_grid.combine_block_dim, query_rot_dev.get(),
         key_cache_dev.get(), value_cache_dev.get(), scale_plane_dev.get(), block_table_dev.get(),
@@ -294,16 +213,7 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
     ACL_CHECK(aclrtSynchronizeStream(stream));
   });
 
-  // The combine writes the rotated basis; production's folded W_o is what takes
-  // it out. UnrotateHeads is that fold on the host, so every comparison below
-  // is still between attention contexts in the model's own basis.
   const std::vector<float> quantised = tqh::UnrotateHeads(HalfToFloat(quantised_out_dev.ToHost<Half>()), kHeadSize);
-
-  // --- 3. the unquantised control --------------------------------------------
-  //
-  // Same decode, same paging, fp16 KV cache, through the stock CANN operator the
-  // plugin's DecodeOnly path calls. FiaKeyCacheView reproduces the head-axis
-  // flattening _get_fia_params does before the call.
 
   std::vector<float> control;
   double control_ms = 0.0;
@@ -312,8 +222,6 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
   if (!FusedInferAttentionOp().available()) {
     control_note = "not run: " + FusedInferAttentionOp().unavailable_reason();
   } else {
-    // The unquantised cache, written on the host into the same slots the
-    // TurboQuant write path used, so both legs read the identical paging.
     std::vector<float> fp16_key_cache(
         static_cast<size_t>(kNumBlocks * kBlockSize * kNumKvHeads * kHeadSize), 0.0f);
     std::vector<float> fp16_value_cache(fp16_key_cache.size(), 0.0f);
@@ -350,23 +258,20 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
     AclnnIntArray actual_seq_lengths(std::vector<int64_t>{kQueryTokens});
     AclnnIntArray actual_seq_lengths_kv(std::vector<int64_t>{kContextLen});
 
-    // The control is best-effort: its argument list has never been executed on
-    // this part, and a camodel run may have no binary kernel for the operator.
-    // A failure is reported and the exact-path comparison carries on.
     try {
       control_ms = TimeMs([&] {
         RunAclnn<ops950::FusedInferAttentionScoreV2WorkspaceFn>(
             FusedInferAttentionOp(), stream, query_tnd.get(), key_list.get(), value_list.get(),
-            /*pse_shift=*/nullptr, /*atten_mask=*/nullptr, actual_seq_lengths.get(), actual_seq_lengths_kv.get(),
-            /*deq_scale1=*/nullptr, /*quant_scale1=*/nullptr, /*deq_scale2=*/nullptr, /*quant_scale2=*/nullptr,
-            /*quant_offset2=*/nullptr, /*antiquant_scale=*/nullptr, /*antiquant_offset=*/nullptr,
-            block_table_tensor.get(), /*query_padding_size=*/nullptr, /*kv_padding_size=*/nullptr,
-            /*key_antiquant_scale=*/nullptr, /*key_antiquant_offset=*/nullptr, /*value_antiquant_scale=*/nullptr,
-            /*value_antiquant_offset=*/nullptr, /*key_shared_prefix=*/nullptr, /*value_shared_prefix=*/nullptr,
-            /*actual_shared_prefix_len=*/nullptr, kNumHeads, static_cast<double>(kAttentionScale),
+            nullptr, nullptr, actual_seq_lengths.get(), actual_seq_lengths_kv.get(),
+            nullptr, nullptr, nullptr, nullptr,
+            nullptr, nullptr, nullptr,
+            block_table_tensor.get(), nullptr, nullptr,
+            nullptr, nullptr, nullptr,
+            nullptr, nullptr, nullptr,
+            nullptr, kNumHeads, static_cast<double>(kAttentionScale),
             s::kFiaUnboundedTokens, s::kFiaUnboundedTokens, const_cast<char*>(ops950::kFiaLayoutTnd), kNumKvHeads,
-            s::kFiaSparseModeNone, s::kFiaInnerPreciseDefault, kBlockSize, /*antiquant_mode=*/0,
-            /*softmax_lse_flag=*/false, /*key_antiquant_mode=*/0, /*value_antiquant_mode=*/0, context_tensor.get(),
+            s::kFiaSparseModeNone, s::kFiaInnerPreciseDefault, kBlockSize, 0,
+            false, 0, 0, context_tensor.get(),
             lse_tensor.get());
       });
       control = HalfToFloat(control_out.ToHost<Half>());
@@ -376,15 +281,9 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
     }
   }
 
-  // --- 4. the exact path and the reference -----------------------------------
-
   std::vector<float> exact;
   ExactAttention(in.query, in.key, in.value, &exact);
 
-  // The CPU TurboQuant reference, reading back the cache the device actually
-  // wrote. Using the device's cache rather than a separately quantised one is
-  // deliberate: it isolates the decode kernel, so a disagreement here is the
-  // decode and not the write path.
   const std::vector<int8_t> device_key_cache = key_cache_dev.ToHost<int8_t>();
   const std::vector<int8_t> device_value_cache = value_cache_dev.ToHost<int8_t>();
   const std::vector<float> device_scale_plane = scale_plane_dev.ToHost<float>();
@@ -396,8 +295,6 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
                                      static_cast<int>(kContextLen), static_cast<int>(kNumHeads),
                                      static_cast<int>(kNumKvHeads), static_cast<int>(kHeadSize),
                                      static_cast<int>(kBlockSize), kAttentionScale, signs.data(), reference.data());
-
-  // --- 5. the report ----------------------------------------------------------
 
   const tq::FidelityMetrics vs_exact = tq::cpu_fidelity(quantised, exact);
   const tq::FidelityMetrics vs_reference = tq::cpu_fidelity(quantised, reference);
@@ -414,10 +311,6 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
     PrintMetrics("fp16 control vs exact fp32", control_vs_exact);
     PrintMetrics("4-bit NPU vs fp16 control", quantised_vs_control);
 
-    // The control is the device's own fp16 error floor. If it is worse than the
-    // 4-bit path against the same reference, the control did not compute the
-    // attention this test thinks it did, and reading anything into the
-    // comparison would be wrong.
     EXPECT_GT(control_vs_exact.snr_db, vs_exact.snr_db)
         << "the unquantised fp16 control is no more accurate than the 4-bit path; the control's argument list is "
            "the unverified one from aclnn_ops_950pr.hpp and is the first thing to doubt";
@@ -428,16 +321,12 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
   }
   std::fflush(stdout);
 
-  // --- 6. the assertions ------------------------------------------------------
-
-  // Tight: same algorithm on both sides.
   EXPECT_GT(vs_reference.cosine_similarity, kMinKernelCosine)
       << "the decode kernel and the CPU reference run the same arithmetic; a disagreement in direction is a kernel "
          "bug, not quantisation";
   EXPECT_LT(vs_reference.relative_l2, kMaxKernelRelativeL2)
       << "the decode kernel and the CPU reference disagree in magnitude by more than fp16 output rounding allows";
 
-  // A floor: the 4-bit scheme's own error against exact attention.
   EXPECT_GT(vs_exact.cosine_similarity, kMinCosine)
       << "the 4-bit output points somewhere else entirely, which quantisation noise does not do - suspect the "
          "un-rotation or the scale lane";
@@ -446,5 +335,5 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
   EXPECT_LT(vs_exact.relative_l2, kMaxRelativeL2) << "4-bit TurboQuant relative L2 error has grown past its floor";
 }
 
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}

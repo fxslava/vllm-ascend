@@ -14,59 +14,6 @@
  * limitations under the License.
  */
 
-/*
- * EXPLORATORY SPIKE, timed: what the Cube factorisation of the Walsh-Hadamard
- * transform is actually worth on silicon.
- *
- * Four legs at every (D, V) in {64, 128, 256, 512} x {1, 8, 16, 32}:
- *
- *   aiv       all log2(D) butterfly stages on the vector unit, one vector at a
- *             time, in the shape TurboQuantCodec runs them. The baseline, and
- *             the only leg here that is a model of something the project
- *             already ships.
- *   single    lower four stages as one fp16 Mmad. Fastest and least accurate;
- *             it is in the sweep so the cost of the hi/lo split can be read off
- *             directly rather than inferred.
- *   hilo      the same with x = hi + lo, two Mmads into one L0C. The
- *             configuration that clears 1e-4 - see
- *             device/test_device_950pr_cube_hadamard.cpp - and therefore the
- *             one whose time matters.
- *   dualdst   hilo with Fixpipe's dualDstCtl = 0b01, so both vector subcores
- *             run the residual instead of one. Skipped at V = 1, where a chunk
- *             is a single vector and the M split would land inside its tile.
- *
- * THE COMPARISON THIS BINARY EXISTS TO MAKE is aiv against dualdst at fixed
- * (D, V): same input, same output, same GM traffic, differing only in where the
- * lower four stages ran. aiv against single isolates the operand grid, and hilo
- * against single prices the accuracy.
- *
- * WHAT THE NUMBERS DO AND DO NOT COVER. Every leg here moves its input in from
- * GM and its result back out, because that is the only shape a standalone
- * kernel can have. In the decode the rotation happens on data already in UB, so
- * the GM traffic is common overhead that flatters both sides and compresses the
- * ratio between them. The hybrid additionally pays a UB -> L1 staging the
- * AIV-only form does not - a cost TurboQuant milestone 2 is separately trying
- * to remove. Read the ratio as a lower bound on the vector-unit saving, not as
- * a decode speedup.
- *
- * CAModel evidence, for orientation only, at D = 256, V = 16: 3.2x fewer vector
- * instructions per subcore and 2.2x fewer ticks for dualdst against aiv, of
- * which 1.44x is the dual-destination Fixpipe alone. A functional simulator
- * cannot produce a time, which is why this file exists.
- *
- * OUTPUT
- *
- *   --csv=<path>   writes the per-case table. Defaults to
- *                  hadamard_benchmark_results.csv in the working directory;
- *                  --csv= (empty) turns it off. ASCEND_BENCH_CSV does the same
- *                  and the flag wins. The `case` column is d<D>_v<V>_<leg>, so
- *                  it splits on '_' into the three sweep axes.
- *
- *   ASCEND_BENCH_HADAMARD_DIMS=256,512      restrict the D sweep
- *   ASCEND_BENCH_HADAMARD_BATCHES=16,32     restrict the V sweep
- *   everything else is the shared ASCEND_BENCH_* set; see common/benchmark.hpp.
- */
-
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -116,16 +63,6 @@ std::vector<int64_t> ParseList(const char* env_name, const int64_t* defaults, si
   return out;
 }
 
-/*
- * One shape's device-side state, allocated once and reused by every leg at that
- * shape. The timed region must not allocate, so the buffers, the constant
- * images and the launch arguments all exist before the first launch.
- *
- * The hybrid and the AIV leg write the same output buffer. That is deliberate:
- * they compute the same function, so their checksums are directly comparable
- * and a leg that has quietly stopped computing the transform shows up as a
- * checksum that does not match its neighbours'.
- */
 class Shape {
  public:
   Shape(int64_t dim, int64_t num_vectors)
@@ -158,10 +95,6 @@ class Shape {
   int64_t num_vectors() const { return num_vectors_; }
   int64_t vectors_per_chunk() const { return vectors_per_chunk_; }
 
-  // Read and written per launch: the fp32 input in, the fp32 result out. The
-  // fp16 staging copy and the Cube operands live in L1 and L0 and never reach
-  // HBM, and H_16 is 512 bytes read once per launch - below the noise of a
-  // bandwidth figure, so it is not counted.
   double bytes_per_iteration() const { return 2.0 * kFloatBytes * static_cast<double>(elements_); }
 
  private:
@@ -176,7 +109,7 @@ class Shape {
   DeviceBuffer output_;
 };
 
-}  // namespace
+}
 
 void BuildSuite(BenchmarkRunner& runner) {
   const std::vector<int64_t> dims =
@@ -191,8 +124,6 @@ void BuildSuite(BenchmarkRunner& runner) {
               "[ascend-bench]   GM round trip does to that ratio.\n");
   std::fflush(stdout);
 
-  // Held for the whole suite: a case's launch closure captures its shape by
-  // reference and the runner replays it long after this loop has moved on.
   std::vector<std::unique_ptr<Shape>> shapes;
   shapes.reserve(dims.size() * batches.size());
 
@@ -202,7 +133,6 @@ void BuildSuite(BenchmarkRunner& runner) {
       try {
         owned.reset(new Shape(dim, num_vectors));
       } catch (const std::exception& error) {
-        // One shape that will not allocate must not cost the rest of the sweep.
         for (const char* leg : {"aiv", "single", "hilo", "dualdst"}) {
           runner.RecordFailure(hs::CaseLabel(dim, num_vectors, leg), error.what());
         }
@@ -234,8 +164,6 @@ void BuildSuite(BenchmarkRunner& runner) {
         const std::string name = hs::CaseLabel(dim, num_vectors, leg.label);
         if (leg.variant == (hs::kHybridHiLo | hs::kHybridDualDst) &&
             !hs::HadamardDualDstApplies(dim, num_vectors)) {
-          // The kernel would silently take the single-destination path, so the
-          // row would duplicate hilo under a name that says otherwise.
           runner.Skip(name, "chunk holds one vector; the dual-destination Fixpipe does not apply");
           continue;
         }
@@ -249,10 +177,6 @@ void BuildSuite(BenchmarkRunner& runner) {
           } else {
             bench_case.launch = [&shape](aclrtStream stream) { shape.EnqueueAiv(stream); };
           }
-          // The transform is idempotent in the sense that matters here: the
-          // same input goes in every launch, so the output must come back
-          // bit-identical. A leg whose checksum moves between the warmup and
-          // the last timed iteration is racing, not slow.
           bench_case.checksum = [&shape]() { return ChecksumSum(shape.Output()); };
           runner.Run(bench_case);
         } catch (const std::exception& error) {
@@ -263,6 +187,6 @@ void BuildSuite(BenchmarkRunner& runner) {
   }
 }
 
-}  // namespace bench
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}

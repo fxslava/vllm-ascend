@@ -14,19 +14,6 @@
  * limitations under the License.
  */
 
-// RAII wrapper around a device allocation, with the alignment rules the
-// DaVinci v200 (Ascend 310P) data-movement units impose.
-//
-// MTE2 (GM -> UB) and MTE3 (UB -> GM) move data in 32-byte bursts and a kernel
-// whose tail block is short still issues a full burst, so the allocation is
-// padded up to a 32-byte multiple.
-//
-// Allocate() takes an optional stronger alignment: the correctness tests use
-// the 32-byte default, the benchmarks ask for 512. Every request over-allocates
-// by one alignment and offsets into the block rather than trusting aclrtMalloc,
-// and the slack is unconditional -- without it a base pointer that needs
-// advancing leaves fewer than capacity_bytes_ bytes addressable from data_.
-
 #pragma once
 
 #include <acl/acl.h>
@@ -42,12 +29,8 @@
 namespace vllm_ascend {
 namespace test {
 
-// Burst size of the MTE2/MTE3 units on DaVinci v200.
 constexpr size_t kDeviceAlignBytes = 32;
 
-// Alignment the benchmarks request. 512 bytes is a whole L2 line on v200 and a
-// whole HBM burst, so a timed buffer never starts mid-line; see the note at the
-// top of this file for why it is requested rather than assumed.
 constexpr size_t kBenchmarkAlignBytes = 512;
 
 constexpr size_t AlignUp(size_t value, size_t alignment) {
@@ -101,21 +84,15 @@ class DeviceBuffer {
       return;
     }
     alignment_ = (alignment < kDeviceAlignBytes) ? kDeviceAlignBytes : alignment;
-    // AlignUp and the `% alignment_` check below are a correct pair only for a
-    // power of two, and every burst and line size on this part is one.
     if ((alignment_ & (alignment_ - 1)) != 0) {
       throw AclError("device allocation alignment must be a power of two", __FILE__, __LINE__, -1);
     }
-    // AlignUp wraps rather than saturating, so without this a size near the top
-    // of the address space would quietly produce a tiny allocation.
     if (size_bytes > SIZE_MAX - 2 * alignment_) {
       throw AclError("device allocation size overflows when padded to alignment", __FILE__, __LINE__, -1);
     }
     size_bytes_ = size_bytes;
     capacity_bytes_ = AlignUp(size_bytes, alignment_);
 
-    // One alignment of slack, always; see the note at the top of this file for
-    // why making it conditional was wrong.
     const size_t request = capacity_bytes_ + alignment_;
     ACL_CHECK(aclrtMalloc(&base_, request, ACL_MEM_MALLOC_HUGE_FIRST));
 
@@ -123,13 +100,10 @@ class DeviceBuffer {
     const size_t data_address = AlignUp(base_address, alignment_);
     data_ = reinterpret_cast<void*>(data_address);
 
-    // The two invariants everything below relies on: data_ is aligned as asked,
-    // and capacity_bytes_ bytes really are addressable from it.
     if ((data_address % alignment_) != 0 ||
         (data_address - base_address) + capacity_bytes_ > request) {
       throw AclError("device allocation could not be aligned as requested", __FILE__, __LINE__, -1);
     }
-    // Zero the padding so a tail burst never reads uninitialised device memory.
     ACL_CHECK(aclrtMemset(data_, capacity_bytes_, 0, capacity_bytes_));
   }
 
@@ -187,12 +161,12 @@ class DeviceBuffer {
   bool empty() const { return data_ == nullptr; }
 
  private:
-  void* base_ = nullptr;       // pointer aclrtFree must be given
-  void* data_ = nullptr;       // base_, advanced to the requested alignment
-  size_t size_bytes_ = 0;      // logical size requested by the caller
-  size_t capacity_bytes_ = 0;  // usable size from data_, padded to alignment_
+  void* base_ = nullptr;
+  void* data_ = nullptr;
+  size_t size_bytes_ = 0;
+  size_t capacity_bytes_ = 0;
   size_t alignment_ = kDeviceAlignBytes;
 };
 
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}

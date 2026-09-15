@@ -25,29 +25,11 @@
 #include <atomic>
 #include <cstdint>
 
-// A per-device cache of the hardware properties a kernel launch needs to size
-// its grid.  The properties are fixed for the life of the process, and
-// aclGetDeviceCapability enters the CANN driver, so querying once per device
-// and reading a cached word keeps a context switch off the decode path.
-//
-// The cache is a flat array of atomics indexed by device id: a hit is one
-// relaxed load, and two threads racing on a cold slot both store the same
-// value, so no stronger ordering is needed.
 namespace vllm_ascend {
 namespace device_registry {
 
-// Slots in the registry.  ACL identifies devices by a small dense index, so a
-// flat array indexed by id is both the fastest lookup and the whole data
-// structure; 64 covers any single host this runs on.
 constexpr int32_t kMaxDevices = 64;
 
-// The device this thread is currently bound to.
-//
-// c10_npu::GetDevice answers from torch's own bookkeeping and lazily
-// initialises the device when the thread has not touched the NPU yet, which a
-// bare aclrtGetDevice would report as an error; current_device() is the
-// fallback.  Resolving per thread is what makes the registry correct under
-// tensor parallelism.
 inline int32_t CurrentDevice()
 {
     int32_t device_id = 0;
@@ -57,10 +39,6 @@ inline int32_t CurrentDevice()
     return device_id;
 }
 
-// Ask the driver for a device's AI Vector core count.  Which of
-// aclrtGetDeviceInfo and aclGetDeviceCapability answers depends on the CANN
-// version and the SOC; mirrors the fallback chain in
-// csrc/attention/k2q_csr/k2q_csr_torch_adpt.h.
 inline int64_t QueryVectorCoreNum(int32_t device_id)
 {
     int64_t aiv = 0;
@@ -73,12 +51,8 @@ inline int64_t QueryVectorCoreNum(int32_t device_id)
     return aiv;
 }
 
-// Cached AI Vector core count of `device_id`.  The driver is asked at most once
-// per device per process; every later call is a relaxed atomic load.
 inline int64_t VectorCoreNum(int32_t device_id)
 {
-    // Zero means "not yet queried"; a real count is always positive, so the
-    // sentinel cannot collide with a valid answer.
     static std::array<std::atomic<int64_t>, kMaxDevices> cache{};
 
     TORCH_CHECK(device_id >= 0 && device_id < kMaxDevices, "device id ", device_id,
@@ -93,11 +67,10 @@ inline int64_t VectorCoreNum(int32_t device_id)
     return aiv;
 }
 
-// Cached AI Vector core count of the calling thread's device.
 inline int64_t VectorCoreNum()
 {
     return VectorCoreNum(CurrentDevice());
 }
 
-}  // namespace device_registry
-}  // namespace vllm_ascend
+}
+}

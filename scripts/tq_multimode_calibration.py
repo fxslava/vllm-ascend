@@ -91,18 +91,9 @@ from tq_fp8_lut_calibration import (  # noqa: E402
 
 CONTEXT_LEN = 512
 
-# fp16 KV bytes per token per head at head_dim 256, the denominator of every
-# memory-reduction figure below.
 FP16_BYTES_PER_VECTOR = HEAD_DIM * 2
 
 
-# ------------------------------------------------------------- fp4 machinery --
-# e2m1: 1 sign, 2 exponent, 1 mantissa bit.  Fifteen distinct values, no
-# infinities and no NaN.  torch has no float4 dtype, so the grid is written out
-# and the cast is a nearest-neighbour search against it -- which is exactly what
-# the hardware converter does, ties away from zero being unreachable here
-# because no midpoint of the grid is ever a codebook entry after the gain
-# search.
 FP4_E2M1_GRID = np.array(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float64
 )
@@ -116,7 +107,6 @@ def to_fp4_e2m1(x: np.ndarray) -> np.ndarray:
     return (np.sign(x) * FP4_E2M1_GRID[idx]).astype(np.float32)
 
 
-# --------------------------------------------------------------- mode table --
 class ModeSpec:
     """One TurboQuantMode: rate, target float grid, and packing geometry."""
 
@@ -131,8 +121,6 @@ class ModeSpec:
         self.bytes_per_group = bytes_per_group
         self.cube_op = cube_op
         self.query_cast = query_cast
-        # Uniform levels rather than Lloyd-Max ones, so fit_affine replaces
-        # fit_lut and the device needs no centroid table.
         self.affine = affine
 
     def packed_bytes(self, d: int = HEAD_DIM) -> int:
@@ -140,23 +128,15 @@ class ModeSpec:
 
 
 MODES = {
-    # 8 codes / 3 bytes: three bit-planes, 96 bytes for a d=256 vector, and 96
-    # is three whole 32-byte bursts.
     "kv3fp4": ModeSpec("kv3fp4", 3, to_fp4_e2m1, FP4_MAX, 8, 3,
                        "mad_mx (FP4 x FP4)", to_fp4_e2m1),
-    # 2 codes / byte, the shipping layout: 128 bytes, four bursts. The two
-    # nibbles of a byte are coordinates b and b + d/2, not 2b and 2b + 1 -- a
-    # plane split, so the device's expand is contiguous; it does not change any
-    # number this script computes.
     "kv4fp8": ModeSpec("kv4fp8", 4, to_fp8, FP8_MAX, 2, 1,
                        "mad (FP8 x FP8)", to_fp8, affine=True),
-    # 8 codes / 5 bytes: five bit-planes, 160 bytes, five bursts.
     "kv5fp8": ModeSpec("kv5fp8", 5, to_fp8, FP8_MAX, 8, 5,
                        "mad (FP8 x FP8)", to_fp8),
 }
 
 
-# --------------------------------------------------------------- LUT fitting --
 def fit_lut(spec: ModeSpec, gains=None):
     """Place a Lloyd-Max codebook on the mode's float grid.
 
@@ -178,9 +158,6 @@ def fit_lut(spec: ModeSpec, gains=None):
     """
     thr, cen, _ = lloyd_max_gaussian(spec.levels)
     if gains is None:
-        # The useful range is bounded above by the grid's top: a gain that
-        # pushes the outermost centroid past grid_max clips it, which costs far
-        # more than the interior placement gains.
         hi = spec.grid_max / float(np.max(np.abs(cen)))
         gains = np.concatenate([
             np.linspace(0.25, min(hi, 8.0), 512),
@@ -189,11 +166,6 @@ def fit_lut(spec: ModeSpec, gains=None):
 
     best = None
     for g in gains:
-        # `stored` is what lands in UB and what the Cube multiplies; the
-        # codebook the model sees is stored/g, and that is what D is measured
-        # against.  Returning `stored` rather than the effective codebook is
-        # deliberate: it is the array the C++ header carries, and the single
-        # place the gain is undone is the per-vector scale.
         stored = spec.cast((cen * g).astype(np.float32)).astype(np.float64)
         d = lut_distortion(thr, stored / g)
         if best is None or d < best[2]:
@@ -231,16 +203,9 @@ def fit_affine(spec: ModeSpec, steps=None):
         return lut_distortion(thr, stored * step)
 
     if steps is None:
-        # Wide enough to bracket the optimum from both sides at 16 levels
-        # (0.3352) and at any other rate this would be used at.
         steps = np.linspace(0.02, 1.5, 1481)
 
     coarse = min((float(step) for step in steps), key=distortion)
-    # Refine, because the emitted thresholds have to be derivable from the
-    # emitted gain to ten decimals -- the device bins against the thresholds and
-    # divides the scale by the gain, and an inconsistent pair is a systematic
-    # bias no test would attribute to this table. D is unimodal in the step, so
-    # a ternary search on the bracket the sweep leaves is enough.
     span = float(steps[1] - steps[0]) if len(steps) > 1 else 0.01
     lo, hi = coarse - span, coarse + span
     for _ in range(200):
@@ -251,8 +216,6 @@ def fit_affine(spec: ModeSpec, steps=None):
         else:
             lo = m1
 
-    # Round-trip through fp32 in the direction the header stores: kGain is the
-    # fp32 constant, and the thresholds are then (i - bias + 0.5) / kGain.
     gain = float(np.float32(1.0 / ((lo + hi) / 2.0)))
     step = 1.0 / gain
     thr = (np.arange(spec.levels - 1, dtype=np.float64) - (bias - 0.5)) * step
@@ -264,7 +227,6 @@ def fit_mode(spec: ModeSpec):
     return fit_affine(spec) if spec.affine else fit_lut(spec)
 
 
-# ------------------------------------------------------------------- codec ----
 def quantize(v: np.ndarray, thresholds: np.ndarray):
     """Rotated vectors -> (code indices, per-vector RMS scale).
 
@@ -279,7 +241,6 @@ def quantize(v: np.ndarray, thresholds: np.ndarray):
     return codes, s.astype(np.float32)
 
 
-# ---------------------------------------------------------------- attention ---
 def attention_mode(q, k, v, spec: ModeSpec, thresholds, lut, gain, signs,
                    quantize_kv=True, cube_compute=True):
     """The full mode pipeline: rotate, store at `bits`, expand to the Cube grid.
@@ -304,7 +265,6 @@ def attention_mode(q, k, v, spec: ModeSpec, thresholds, lut, gain, signs,
     if quantize_kv:
         k_codes, k_scale = quantize(k_rot, thresholds)
         v_codes, v_scale = quantize(v_rot, thresholds)
-        # The LUT holds cast(g*c); the gain comes back out through the scale.
         k_hat = lut[k_codes]
         v_hat = lut[v_codes]
         k_scale = k_scale / gain
@@ -315,14 +275,10 @@ def attention_mode(q, k, v, spec: ModeSpec, thresholds, lut, gain, signs,
         v_scale = np.ones((*v_rot.shape[:-1], 1), np.float32)
 
     if cube_compute:
-        # Q carries real magnitudes and has to be scaled into the operand
-        # grid's range before the cast; the fp32 multiplier comes back out of
-        # the score row.  For kv3fp4 this is an fp4 cast, because
-        # fp4 x fp8 is not a supported Mmad tuple on arch35.
         q_amax = np.abs(q_rot).max(axis=(-2, -1), keepdims=True) + 1e-20
         q_sf = (spec.grid_max / q_amax).astype(np.float32)
         q_in = spec.query_cast(q_rot * q_sf)
-        k_in = k_hat  # already on the grid by construction
+        k_in = k_hat
     else:
         q_sf = np.ones((q.shape[0], 1, 1), np.float32)
         q_in, k_in = q_rot, k_hat
@@ -336,7 +292,6 @@ def attention_mode(q, k, v, spec: ModeSpec, thresholds, lut, gain, signs,
     p_scaled = (p * np.swapaxes(v_scale, -1, -2)).astype(np.float32)
 
     if cube_compute:
-        # P is in [0,1] and would land in the subnormals without this.
         p_amax = np.abs(p_scaled).max(axis=-1, keepdims=True) + 1e-20
         p_sf = (spec.grid_max / p_amax).astype(np.float32)
         p_in = spec.query_cast(p_scaled * p_sf)
@@ -364,7 +319,6 @@ def sweep_mode(spec, thresholds, lut, gain, signs, heads, s_len, **kw):
     return np.array(cos), np.array(snr)
 
 
-# ------------------------------------------------------------------ layout ----
 def layout_rows():
     """Packing geometry per mode, at d=256, with the burst check."""
     rows = []
@@ -384,7 +338,6 @@ def layout_rows():
     return rows
 
 
-# ------------------------------------------------------------------ header ----
 def emit_header(results):
     """The centroid tables as the C++ header wants them."""
     for name, r in results.items():
@@ -408,7 +361,6 @@ def emit_header(results):
         print()
 
 
-# ------------------------------------------------------------------ report ----
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--report", action="store_true")
@@ -433,7 +385,6 @@ def main():
     print("fixture OUTLIER_KAPPA = %.1f   gate: cos > %.3f" % (OUTLIER_KAPPA, FIDELITY_GATE))
     print("=" * 78)
 
-    # -- 1. packing layout ---------------------------------------------------
     print()
     print("1. PACKED LAYOUT  (one d=%d vector slot, scale plane counted separately)" % HEAD_DIM)
     print("-" * 78)
@@ -451,7 +402,6 @@ def main():
     print("  covers two vector slots rather than one -- which is why the packed")
     print("  cache is indexed by token and not by vector.")
 
-    # -- 2. codebooks --------------------------------------------------------
     print()
     print("2. CODEBOOK PLACEMENT ON THE OPERAND GRID")
     print("-" * 78)
@@ -487,7 +437,6 @@ def main():
     print("    out of the per-vector scale, so no instruction is spent on it.")
     del thr5
 
-    # -- 3. end-to-end -------------------------------------------------------
     print()
     print("3. END-TO-END ATTENTION FIDELITY")
     print("-" * 78)
@@ -504,7 +453,6 @@ def main():
               % (name, spec.cube_op, cos.mean(), cos.min(), snr.mean(),
                  "PASS" if cos.min() > FIDELITY_GATE else "FAIL"))
 
-    # The attribution the primary target needs: storage rate versus Cube grid.
     print()
     print("  attribution for kv5fp8 (same fixture, same seeds):")
     spec5 = MODES["kv5fp8"]
@@ -520,11 +468,6 @@ def main():
     print("    both stages                                     : cos %.5f  %.2f dB"
           % (verdict["kv5fp8"][0].mean(), verdict["kv5fp8"][1].mean()))
 
-    # kv3fp4's error is not where it looks.  Its Cube tuple has to be
-    # fp4 x fp4 -- arch35 rejects fp4x2_e2m1 x fp8_e4m3fn -- so Q and the
-    # softmax row go onto the e2m1 grid too, and that dominates the 3-bit
-    # storage by a wide margin.  Worth printing because the obvious reading of
-    # the 0.93 above is "3 bits is too few", and it is not the whole story.
     print()
     print("  attribution for kv3fp4 (why fp4 operands, not 3-bit storage, dominate):")
     spec3 = MODES["kv3fp4"]
@@ -540,7 +483,6 @@ def main():
     print("    both stages                                     : cos %.5f  %.2f dB"
           % (verdict["kv3fp4"][0].mean(), verdict["kv3fp4"][1].mean()))
 
-    # -- 4. verdict ----------------------------------------------------------
     print()
     print("4. VERDICT")
     print("-" * 78)

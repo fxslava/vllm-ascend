@@ -14,23 +14,6 @@
  * limitations under the License.
  */
 
-// The fp8 Cube contract, pinned numerically: the NZ layout the operands must be
-// in, LoadData2DParamsV2's step and stride fields, Mmad's argument order, and
-// Fixpipe's output layout. All four are undocumented in the toolkit's public
-// headers; TurboQuantCubeMm is a transcription of CANN's own matmul, and this
-// file is the check that the transcription is right.
-//
-// It drives TurboQuantCubeMm itself, through turboquant_cube_gemm_probe.
-//
-// Both B forms are covered:
-//
-//   score GEMM    B staged [n, k] loads with ifTranspose FALSE, one LoadData.
-//   context GEMM  B staged [k, n] loads with ifTranspose TRUE and, for an
-//                 8-bit operand, in mStep = 2 chunks. A single call with a
-//                 larger mStep raises mte_instr_addr_misalign.
-//
-// A camodel pass here is under a minute, against minutes for the whole decode.
-
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -50,19 +33,12 @@ namespace {
 
 namespace tqh = turboquant_host;
 
-// Elements of an fp8 Cube operand in one C0 block. AuxGetC0Size returns
-// B8_C0SIZE = 32 for every 8-bit type on arch35, not 64.
 constexpr int64_t kC0 = 32;
 
-// The decode's real shapes, so what is pinned is what runs. head_size 256 makes
-// the score GEMM's reduction eight C0 blocks deep, and the 64-row tile makes
-// the context GEMM's chunked B load run more than one chunk.
 constexpr int64_t kHeadSize = 256;
 constexpr int64_t kTileRows = 64;
-constexpr int64_t kGroupHeads = 16;  // the GEMM's M, one Cube tile
+constexpr int64_t kGroupHeads = 16;
 
-// Values exact in fp8_e4m3fn, so the reference is exact and any mismatch is a
-// layout error rather than rounding.
 float ExactFp8(int64_t i) { return static_cast<float>((i % 9) - 4) * 0.5f; }
 
 uint8_t Fp8Bits(float v) {
@@ -70,7 +46,6 @@ uint8_t Fp8Bits(float v) {
     float value;
     uint8_t bits;
   };
-  // e4m3fn is 1-4-3 with bias 7: 0.5 = 2^-1 -> exponent field 6, mantissa 0.
   static const Entry kTable[] = {
       {0.0f, 0x00},  {0.5f, 0x30},  {1.0f, 0x38},  {1.5f, 0x3C}, {2.0f, 0x40},
       {-0.5f, 0xB0}, {-1.0f, 0xB8}, {-1.5f, 0xBC}, {-2.0f, 0xC0},
@@ -83,9 +58,6 @@ uint8_t Fp8Bits(float v) {
   return 0x00;
 }
 
-// The image is padded up to a whole C0 block in the column direction: the NZ
-// layout addresses whole blocks, so a matrix whose width is not a multiple of
-// C0 still occupies ceil(cols / C0) of them.
 int64_t NzElems(int64_t rows, int64_t cols) { return rows * ((cols + kC0 - 1) / kC0) * kC0; }
 
 std::vector<int8_t> ToNz(const std::vector<float>& nd, int64_t rows, int64_t cols) {
@@ -99,16 +71,12 @@ std::vector<int8_t> ToNz(const std::vector<float>& nd, int64_t rows, int64_t col
   return out;
 }
 
-// One GEMM of the decode, in the orientation the decode stages it.
 struct Case {
   const char* name;
   int64_t m;
   int64_t k;
   int64_t n;
-  // B staged [n, k] (the score GEMM) or [k, n] (the context GEMM).
   bool b_is_nk;
-  // LoadBFromKn parameter variant; 0 is the shipping path. Ignored when
-  // b_is_nk, which routes through LoadBFromNk and has no variants.
   uint32_t variant;
 };
 
@@ -117,7 +85,6 @@ double RunCase(const Case& c, aclrtStream stream) {
   for (size_t i = 0; i < a_nd.size(); ++i) {
     a_nd[i] = ExactFp8(static_cast<int64_t>(i));
   }
-  // B in its logical [k, n] orientation, which is what the product needs.
   std::vector<float> b_kn(static_cast<size_t>(c.k * c.n));
   for (size_t i = 0; i < b_kn.size(); ++i) {
     b_kn[i] = ExactFp8(static_cast<int64_t>(i) + 3);
@@ -183,17 +150,12 @@ double RunCase(const Case& c, aclrtStream stream) {
   }
   std::fflush(stdout);
 
-  // Exact, not approximate: every operand is an exact fp8 value and the
-  // accumulate is fp32, so the only thing a difference can mean is that the
-  // Cube read a different matrix than the one that was staged.
   EXPECT_EQ(worst, 0.0) << c.name
                         << " does not reproduce the host product, so TurboQuantCubeMm's transcription of the "
                            "fractal contract is wrong on this CANN";
   return worst;
 }
 
-// The same case without the assertion, for the sweep: a variant that is wrong
-// is data, not a failure.
 double ProbeCase(const Case& c, aclrtStream stream) {
   std::vector<float> a_nd(static_cast<size_t>(c.m * c.k));
   for (size_t i = 0; i < a_nd.size(); ++i) {
@@ -240,27 +202,8 @@ double ProbeCase(const Case& c, aclrtStream stream) {
   return worst;
 }
 
-// Sweeps the LoadBFromKn parameters the transcription is uncertain about.
-// Every variant runs; the point is the table, not a pass. Variant 0 is the
-// shipping path, and CANN's own load_to_l0b_load2dV2.h says it is right --
-// which is exactly why the others are worth measuring rather than reasoning
-// about.
-//
-//   0  shipping: dstAddrStride = CeilAlign(n,16) * 32 elements
-//   1  the same figure read as 32-byte blocks (/ 32)
-//   2  CeilDiv(n,16) * 32, i.e. CeilAlign misread as CeilDiv
-//   3  0 + PipeBarrier<PIPE_MTE1> between chunks
-//   4  0 + an MTE1 -> M set/wait after every chunk
-//   5  kStep over the 16-element fractal width instead of the 32-element C0
-//   6  srcStride over C0 instead of the fractal row count
-//   7  no chunking: one call at the full mStep
-//   8  dstStride over C0 instead of the fractal row count
 TEST(CubeGemmContract, LoadBFromKnVariantSweep) {
   REQUIRE_ASCEND_950PR();
-  // Off unless asked for. Variant 7 raises mte_instr_addr_misalign by design --
-  // it is the unchunked load the b8 restriction forbids -- and a Cube fault
-  // makes every launch after it in the same process return zeros, so running
-  // this ahead of the two pinned cases makes their results meaningless.
   if (std::getenv("ASCEND_TQ_GEMM_SWEEP") == nullptr) {
     GTEST_SKIP() << "set ASCEND_TQ_GEMM_SWEEP=1 to sweep the LoadBFromKn parameters";
   }
@@ -283,10 +226,6 @@ TEST(CubeGemmContract, LoadBFromKnVariantSweep) {
   std::fflush(stdout);
 }
 
-// Is the context GEMM wrong, or is only the FIRST Cube GEMM of a process
-// right? The sweep hinted at the latter: identical parameters were exact at
-// launch 1 and all-zero afterwards. This runs one unchanging case several times
-// and prints each, which separates the two readings outright.
 TEST(CubeGemmContract, ContextGemmRepeated) {
   REQUIRE_ASCEND_950PR();
   REQUIRE_CUBE_WIP_OPT_IN("The repeated context GEMM",
@@ -298,9 +237,6 @@ TEST(CubeGemmContract, ContextGemmRepeated) {
     std::printf("[ repeat ] launch %d: ", i);
     ProbeCase(c, stream);
   }
-  // Variant 10 (a second AIC wait) is deliberately not run: both subcores
-  // signal and the pair's two sets satisfy exactly one wait, so a second one
-  // blocks forever. That was measured, not assumed.
   std::fflush(stdout);
 }
 
@@ -319,6 +255,6 @@ TEST(CubeGemmContract, ContextGemmBStagedKn) {
   RunCase(c, AscendTestEnvironment::Instance().stream());
 }
 
-}  // namespace
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}

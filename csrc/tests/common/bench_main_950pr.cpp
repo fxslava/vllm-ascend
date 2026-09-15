@@ -14,15 +14,6 @@
  * limitations under the License.
  */
 
-// Entry point for the Ascend 950PR benchmark binaries. Identical to
-// common/bench_main.cpp except for the part it names, which decides the banner
-// and which SoC names RunBenchmarkSuite accepts. A 950PR suite started on a
-// 310P exits 77 and ctest records a skip.
-
-// It also refuses to measure anything under a camodel: a simulator produces a
-// plausible-looking number that means nothing. Exiting 77 keeps the device
-// tier's claim that its timings came from silicon.
-
 #include <cstdio>
 
 #include "benchmark.hpp"
@@ -32,13 +23,12 @@ namespace vllm_ascend {
 namespace test {
 namespace bench {
 
-// Defined by the device/bench_*.cpp this binary links.
 extern const char* kSuiteName;
 void BuildSuite(BenchmarkRunner& runner);
 
-}  // namespace bench
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}
 
 int main() {
   if (::vllm_ascend::test::IsRunningOnSimulator()) {

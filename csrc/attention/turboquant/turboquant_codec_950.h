@@ -14,29 +14,6 @@
  * limitations under the License.
  */
 
-/*
- * TurboQuant KV-cache codec for Ascend 950PR (arch35) and 910B (arch32).
- *
- * A KV vector of head_size channels is stored as
- *
- *     packed[c] = int8((q[2c] + 16 * q[2c + 1]) - 128),   c in [0, D/2)
- *     scale     = ||Pi x||_2 / sqrt(D)
- *
- * where q in [0, 15] indexes the 16-level Lloyd-Max quantiser for N(0, 1),
- * u = Pi x / scale, q = sum_{i=1}^{15} [u > t_i], and the reconstruction is
- * scale * c[q].  The rotation is
- *
- *     Pi x = D (H (D x)),    D = diag(+-1),   H = normalised Walsh-Hadamard
- *
- * a symmetric orthogonal involution, so one routine both rotates and
- * un-rotates.  K, V and Q are rotated as activations; the one weight that is
- * rewritten is the output projection, into which the host folds the inverse
- * rotation (W_o <- W_o (I_H (x) Pi)) so the decode's output can stay rotated.
- *
- * ConstTableWords() is the constant-table layout contract; the host mirror is
- * vllm_ascend/attention/turboquant_v1.py::turboquant_codec_tables.
- */
-
 #ifndef VLLM_ASCEND_ATTENTION_TURBOQUANT_CODEC_950_H
 #define VLLM_ASCEND_ATTENTION_TURBOQUANT_CODEC_950_H
 
@@ -45,61 +22,31 @@
 namespace vllm_ascend {
 namespace turboquant {
 
-// fp32 lanes in one 32B UB block; also the smallest butterfly stride that can
-// be expressed with block-strided Add/Sub.
 constexpr uint32_t kFp32PerBlock = 8;
-// fp32 lanes covered by a single vector instruction repeat.
 constexpr uint32_t kFp32PerRepeat = 64;
-// Brcb consumes eight source lanes and emits eight 32B blocks per repeat, so
-// broadcasting one value needs 8 readable source lanes and 64 lanes of
-// destination -- only the first block of which is meaningful.
 constexpr uint32_t kBrcbSrcLanes = kFp32PerBlock;
 constexpr uint32_t kBrcbDstLanes = kFp32PerBlock * kFp32PerBlock;
 
-// Gather's srcBaseAddr is a byte offset *within* srcLocal, not the UB address
-// of srcLocal.  Every offset table here already indexes from the start of its
-// source tensor, so the correct value is zero.
 constexpr uint32_t kGatherSrcBase = 0;
 
-/*
- * b-bit TurboQuant codec.  Only b == 4 is instantiated; the template keeps the
- * level arithmetic in one place should an 8-bit variant ever be added.
- */
 template <int BITS>
 class TurboQuantCodec {
     static_assert(BITS == 4, "TurboQuantCodec is only implemented for b = 4");
 
 public:
     static constexpr int kBits = BITS;
-    static constexpr int kLevels = 1 << BITS;                            // 16
-    static constexpr uint32_t kPackFactor = 8 / BITS;                    // codes per byte
-    static constexpr float kLevelMax = static_cast<float>(kLevels - 1);  // 15
-    static constexpr float kPackHigh = static_cast<float>(kLevels);      // 16
+    static constexpr int kLevels = 1 << BITS;
+    static constexpr uint32_t kPackFactor = 8 / BITS;
+    static constexpr float kLevelMax = static_cast<float>(kLevels - 1);
+    static constexpr float kPackHigh = static_cast<float>(kLevels);
     static constexpr float kInt8Bias = 128.0f;
-    // Guards the reciprocal of an all-zero vector; far below fp16 denormals.
     static constexpr float kEps = 1e-20f;
-    // Strides 1, 2 and 4 all live inside a single 32B block.
     static constexpr int kEarlyStages = 3;
-    // Decision boundaries, one fewer than there are levels.
-    static constexpr int kThresholdCount = kLevels - 1;                  // 15
-    // Gather consumes byte offsets, and the centroid table is fp32.
+    static constexpr int kThresholdCount = kLevels - 1;
     static constexpr float kCentroidStride = static_cast<float>(sizeof(float));
-    // Bit position of the fp32 sign, which is how a comparison is turned into
-    // an integer 0/1 without a mask register.
     static constexpr uint32_t kSignBitShift = 31;
-    // Boundary tests Quantize4Bit keeps in flight, one scratch buffer each.
     static constexpr int kBinLanes = 8;
 
-    /*
-     * The 16-level Lloyd-Max quantiser for N(0, 1): the fixed point of
-     *
-     *     t_i = (c_{i-1} + c_i) / 2,     c_i = E[X | t_i < X < t_{i+1}],
-     *
-     * re-derivable with
-     * scripts/tq_kv_quant_reference.py::lloyd_max_gaussian_table().
-     * The centroids reach UB (see ConstTableWords); the thresholds stay
-     * compile-time constants because Quantize4Bit uses them as Adds immediates.
-     */
     __aicore__ static inline float Threshold(int i)
     {
         constexpr float kThresholds[kThresholdCount] = {
@@ -110,38 +57,17 @@ public:
         return kThresholds[i];
     }
 
-    /*
-     * Constant-table layout, in 4-byte words.  The host writes this exact image
-     * and Init() copies it in one DataCopy.
-     *
-     *   [0 .. 6*len)              sign_[s] then xorOffset_[s], per stage
-     *   [6*len .. 7*len)          evenOffset_ then oddOffset_, len/2 words each
-     *   [7*len .. 7*len+B)        expandOffset_
-     *   [7*len+B .. 7*len+2B)     oddSelect_          (B = len * batchRows)
-     *   [7*len+2B .. +kLevels)    centroid_
-     *
-     * sign_, oddSelect_ and centroid_ are fp32 bit patterns; the offset tables
-     * are uint32 byte offsets for Gather.  Every entry is four bytes wide.
-     */
     __aicore__ static inline uint32_t ConstTableWords(uint32_t vecLen, uint32_t batchRows)
     {
         return 7u * vecLen + 2u * vecLen * batchRows + static_cast<uint32_t>(kLevels);
     }
 
-    // Scratch, deliberately uninitialised. Purely internal: no host mirror.
     __aicore__ static inline uint32_t WorkBufferWords(uint32_t vecLen, uint32_t batchRows)
     {
         return 2u * vecLen * batchRows + vecLen + kBrcbDstLanes + kFp32PerBlock +
                static_cast<uint32_t>(kBinLanes) * vecLen;
     }
 
-    /*
-     * vecLen      head_size, a power of two in [64, 256].
-     * batchRows   how many vectors Dequantize4Bit may expand in one call; must
-     *             match the batchRows the host built `tablesGm` for.
-     * invSqrtLen  1 / sqrt(vecLen), passed in so the kernel needs no scalar sqrt.
-     * tablesGm    ConstTableWords(vecLen, batchRows) int32 words.
-     */
     __aicore__ inline void Init(AscendC::TPipe *pipe, uint32_t vecLen, uint32_t batchRows, float invSqrtLen,
                                 const AscendC::GlobalTensor<int32_t> &tablesGm)
     {
@@ -192,9 +118,6 @@ public:
         }
     }
 
-    // In-place normalised fast Walsh-Hadamard transform of x[0, len).
-    // Strides 1, 2 and 4 straddle the 32B block and run as a Gather shuffle
-    // rather than a block-strided Add/Sub pair.
     __aicore__ inline void FastWalshHadamardTransform(AscendC::LocalTensor<float> &x,
                                                       AscendC::LocalTensor<float> &tmp, int len)
     {
@@ -228,8 +151,6 @@ public:
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    // In-place Pi x = D (H (D x)).  Pi is a symmetric orthogonal involution, so
-    // this is both the rotation and the un-rotation.
     __aicore__ inline void ApplyPi(AscendC::LocalTensor<float> &x, AscendC::LocalTensor<float> &tmp,
                                    const AscendC::LocalTensor<float> &piSigns, int len)
     {
@@ -241,18 +162,6 @@ public:
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    /*
-     * Quantise one rotated vector to 4 bits against the Lloyd-Max table.
-     *
-     *   dstPacked  [len / 2] int8, low nibble = channel 2c, high nibble = 2c+1
-     *   src        [len]     fp32, already rotated
-     *   scaleOut   [1]       fp32, ||src||_2 / sqrt(len).  Brcb reads a whole
-     *                        32B block, so back this with 8 readable lanes.
-     *
-     * The bin index is q = sum_{i=1}^{15} [u > t_i].  The difference is taken
-     * as t_i - u so its sign bit answers the strict `>` the table's boundaries
-     * are defined with, which is the tie-break the host reference takes.
-     */
     __aicore__ inline void Quantize4Bit(const AscendC::LocalTensor<int8_t> &dstPacked,
                                         const AscendC::LocalTensor<float> &src,
                                         const AscendC::LocalTensor<float> &scaleOut, int len)
@@ -260,9 +169,6 @@ public:
         const uint32_t n = static_cast<uint32_t>(len);
         const uint32_t packed = n / kPackFactor;
 
-        // scale = ||src||_2 / sqrt(len), the RMS the Lloyd-Max table is stated
-        // in.  invSqrtLen_ is the same reciprocal the Hadamard normalises with,
-        // so the kernel still needs no scalar sqrt of its own.
         AscendC::Mul(scratch_, src, src, n);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::ReduceSum<float>(scaleOut, scratch_, reduceWork_, n);
@@ -274,7 +180,6 @@ public:
         AscendC::Adds(scaleOut, scaleOut, kEps, 1);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // broadcast_[0..7] = scale; broadcast_[64..71] = -1 / scale.
         AscendC::Brcb(broadcast_, scaleOut, 1, {1, static_cast<uint16_t>(kFp32PerBlock)});
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Duplicate(broadcast_[kBrcbDstLanes], -1.0f, kFp32PerBlock);
@@ -282,12 +187,8 @@ public:
         AscendC::Div(broadcast_[kBrcbDstLanes], broadcast_[kBrcbDstLanes], broadcast_, kFp32PerBlock);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // scratch_ = -u = -src / scale.
         BroadcastMul(scratch_, src, broadcast_[kBrcbDstLanes], n);
 
-        // reduceWork_ is the ReduceSum scratch, and the reduction is finished:
-        // reusing it as the bin accumulator keeps the codec's UB footprint
-        // unchanged by the switch to a non-uniform table.
         AscendC::LocalTensor<int32_t> bins = reduceWork_.ReinterpretCast<int32_t>();
         AscendC::Duplicate(bins, 0, n);
         AscendC::PipeBarrier<PIPE_V>();
@@ -296,22 +197,17 @@ public:
             const int lanes =
                 (kThresholdCount - base) < kBinLanes ? (kThresholdCount - base) : kBinLanes;
 
-            // t_i - u, written the way round that puts the answer to the strict
-            // comparison in the sign bit.  Independent across lanes.
             for (int lane = 0; lane < lanes; ++lane) {
                 AscendC::Adds(binLane_[lane], scratch_, Threshold(base + lane), n);
             }
             AscendC::PipeBarrier<PIPE_V>();
 
-            // Sign bit -> integer 0/1, in place, still independent across lanes.
             for (int lane = 0; lane < lanes; ++lane) {
                 AscendC::LocalTensor<uint32_t> bits = binLane_[lane].ReinterpretCast<uint32_t>();
                 AscendC::ShiftRight(bits, bits, kSignBitShift, static_cast<int32_t>(n));
             }
             AscendC::PipeBarrier<PIPE_V>();
 
-            // Pairwise tree over the lanes: log2(lanes) barriers rather than one
-            // per boundary.  Every Add in a round is independent of the others.
             for (int span = 1; span < lanes; span <<= 1) {
                 for (int lane = 0; lane + span < lanes; lane += 2 * span) {
                     AscendC::LocalTensor<int32_t> dst = binLane_[lane].ReinterpretCast<int32_t>();
@@ -324,12 +220,9 @@ public:
             AscendC::Add(bins, bins, binLane_[0].ReinterpretCast<int32_t>(), n);
             AscendC::PipeBarrier<PIPE_V>();
         }
-        // q lands in [0, 15] by construction -- there are fifteen boundaries --
-        // so the uniform grid's clamp has nothing left to do.
         AscendC::Cast(scratch_, bins, AscendC::RoundMode::CAST_NONE, n);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // Deinterleave even/odd channels with two Gathers, then build the byte.
         AscendC::Gather(swap_, scratch_, evenOffset_, kGatherSrcBase, packed);
         AscendC::Gather(swap_[packed], scratch_, oddOffset_, kGatherSrcBase, packed);
         AscendC::PipeBarrier<PIPE_V>();
@@ -337,8 +230,6 @@ public:
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Add(swap_, swap_, swap_[packed], packed);
         AscendC::PipeBarrier<PIPE_V>();
-        // [0, 255] -> [-128, 127].  The decoder adds the bias back numerically,
-        // so nothing here depends on the int8 bit pattern.
         AscendC::Adds(swap_, swap_, -kInt8Bias, packed);
         AscendC::PipeBarrier<PIPE_V>();
 
@@ -349,13 +240,6 @@ public:
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    /*
-     * Expand `rows` packed vectors into Lloyd-Max centroids c[q], fp32.
-     *
-     * The per-vector `scale` is not applied here: the decode path folds it into
-     * the score vector (K) or the softmax probabilities (V), which is valid
-     * because scale * c[q] is linear in the scale.
-     */
     __aicore__ inline void Dequantize4Bit(const AscendC::LocalTensor<float> &dst,
                                           const AscendC::LocalTensor<int8_t> &srcPacked, int rows, int len)
     {
@@ -370,11 +254,9 @@ public:
         AscendC::Adds(scratch_, scratch_, kInt8Bias, packed);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // swap_[p] = byte[p >> 1] for every output channel p.
         AscendC::Gather(swap_, scratch_, expandOffset_, kGatherSrcBase, n);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // high = floor(byte / 16); low = byte - 16 * high.
         AscendC::Muls(dst, swap_, 1.0f / kPackHigh, n);
         AscendC::PipeBarrier<PIPE_V>();
         FloorInPlace(dst, n);
@@ -383,7 +265,6 @@ public:
         AscendC::Add(scratch_, scratch_, swap_, n);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // Odd channels take the high nibble: q = low + oddSelect * (high - low).
         AscendC::Sub(dst, dst, scratch_, n);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Mul(dst, dst, oddSelect_, n);
@@ -391,8 +272,6 @@ public:
         AscendC::Add(dst, dst, scratch_, n);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // Gather counts byte offsets from the start of centroid_, so the index
-        // is scaled by the word size before it is cast.
         AscendC::Muls(scratch_, dst, kCentroidStride, n);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::LocalTensor<int32_t> offsets = swap_.ReinterpretCast<int32_t>();
@@ -402,8 +281,6 @@ public:
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    // dst[i] = src[i] * scalarBlock[i % 8], for a 32B block whose lanes are all
-    // equal.  Used to apply a reduction result without reading it to a scalar.
     __aicore__ static inline void BroadcastMul(const AscendC::LocalTensor<float> &dst,
                                                const AscendC::LocalTensor<float> &src,
                                                const AscendC::LocalTensor<float> &scalarBlock, uint32_t count)
@@ -433,8 +310,6 @@ private:
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    // One butterfly stage for stride >= 8, as a single Add/Sub pair.  A stride
-    // wider than one repeat (> 64 lanes) falls back to a short contiguous loop.
     __aicore__ inline void BlockStage(AscendC::LocalTensor<float> &dst, AscendC::LocalTensor<float> &src,
                                       uint32_t stride, uint32_t n)
     {
@@ -454,8 +329,6 @@ private:
         }
     }
 
-    // floor() via the fp32 <-> int32 converter, which is available on every
-    // supported arch; the dedicated Floor intrinsic is not.
     __aicore__ static inline void FloorInPlace(const AscendC::LocalTensor<float> &x, uint32_t count)
     {
         AscendC::LocalTensor<int32_t> intView = x.ReinterpretCast<int32_t>();
@@ -486,7 +359,7 @@ private:
 
 using TurboQuantCodec4 = TurboQuantCodec<4>;
 
-}  // namespace turboquant
-}  // namespace vllm_ascend
+}
+}
 
-#endif  // VLLM_ASCEND_ATTENTION_TURBOQUANT_CODEC_950_H
+#endif

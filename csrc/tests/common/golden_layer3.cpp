@@ -34,8 +34,6 @@ namespace {
 
 namespace s = shapes950;
 
-// std::getenv trips MSVC's C4996 and this suite can be built warnings-as-errors,
-// so the sanctioned _dupenv_s is used there and plain getenv everywhere else.
 std::string EnvOrEmpty(const char* name) {
 #ifdef _MSC_VER
   char* value = nullptr;
@@ -52,7 +50,7 @@ std::string EnvOrEmpty(const char* name) {
 #endif
 }
 
-}  // namespace
+}
 
 std::string GoldenLayer3Dir() {
   const std::string env = EnvOrEmpty("QWEN_GOLDEN_LAYER3_DIR");
@@ -75,9 +73,6 @@ bool ReadHalfFile(const std::string& path, size_t expected_elements, std::vector
 
   const std::streamsize expected_bytes = static_cast<std::streamsize>(expected_elements * sizeof(uint16_t));
   if (size_bytes != expected_bytes) {
-    // An unfetched LFS pointer is a ~130 byte text file whose first line is
-    // "version https://git-lfs.github.com/spec/v1". Recognising it turns a
-    // clone that never ran `git lfs pull` into a skip that names the fix.
     char head[8] = {0};
     file.read(head, static_cast<std::streamsize>(sizeof(head) - 1));
     if (file.gcount() >= 7 && std::string(head) == "version") {
@@ -150,5 +145,5 @@ bool LoadGoldenLayer3(GoldenLayer3* golden, std::string* error) {
   return true;
 }
 
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}

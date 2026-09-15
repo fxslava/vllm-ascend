@@ -14,17 +14,6 @@
  * limitations under the License.
  */
 
-// RMSNorm (aclnnRmsNorm) on the v200 vector unit, fp16 in / fp16 out.
-//
-// One pass to accumulate the sum of squares and a second to scale, with no
-// reuse to exploit, so bandwidth-bound at every shape here and GB/s is the
-// number that means something.
-//
-// The bytes counted are the ones that must cross the HBM boundary: x read once,
-// y written once, gamma read once per row batch, and the fp32 rstd written once
-// per token. A kernel that spills the row to GM between the two passes moves
-// twice as much.
-
 #include <cstdint>
 #include <sstream>
 #include <stdexcept>
@@ -57,7 +46,7 @@ std::string CaseName(int64_t num_tokens, int64_t hidden) {
   return name.str();
 }
 
-}  // namespace
+}
 
 void BuildSuite(BenchmarkRunner& runner) {
   const AclnnOp& op = RmsNormOp();
@@ -66,7 +55,7 @@ void BuildSuite(BenchmarkRunner& runner) {
     return;
   }
 
-  DeterministicRandom random(0x42524d53u);  // "BRMS"
+  DeterministicRandom random(0x42524d53u);
 
   for (int64_t num_tokens : shapes::BenchmarkTokenCounts()) {
     for (int64_t hidden : shapes::RmsNormHiddenSizes()) {
@@ -83,7 +72,6 @@ void BuildSuite(BenchmarkRunner& runner) {
             DeviceTensor::Half({hidden}, gamma, ACL_FORMAT_ND, kBenchmarkAlignBytes);
         DeviceTensor y_device =
             DeviceTensor::HalfEmpty({num_tokens, hidden}, ACL_FORMAT_ND, kBenchmarkAlignBytes);
-        // Required output even though the plugin discards it, and it is fp32.
         DeviceTensor rstd_device =
             DeviceTensor::FloatEmpty({num_tokens, 1}, ACL_FORMAT_ND, kBenchmarkAlignBytes);
 
@@ -94,9 +82,9 @@ void BuildSuite(BenchmarkRunner& runner) {
         BenchmarkCase benchmark_case;
         benchmark_case.name = name;
         benchmark_case.bytes_per_iteration =
-            2.0 * static_cast<double>(num_tokens) * static_cast<double>(hidden) * 2.0  // x in, y out
-            + 2.0 * static_cast<double>(hidden)                                        // gamma
-            + 4.0 * static_cast<double>(num_tokens);                                   // rstd, fp32
+            2.0 * static_cast<double>(num_tokens) * static_cast<double>(hidden) * 2.0
+            + 2.0 * static_cast<double>(hidden)
+            + 4.0 * static_cast<double>(num_tokens);
         benchmark_case.launch = [&planned](aclrtStream stream) { planned.Launch(stream); };
         benchmark_case.checksum = [&y_device]() { return ChecksumSum(y_device.ToFloatFromHalf()); };
 
@@ -108,6 +96,6 @@ void BuildSuite(BenchmarkRunner& runner) {
   }
 }
 
-}  // namespace bench
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}

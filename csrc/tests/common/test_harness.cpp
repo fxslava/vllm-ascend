@@ -44,9 +44,6 @@ int ResolveDeviceId() {
 
 namespace {
 
-// aclrtGetSocName is not present in every CANN release the plugin supports, so
-// it is resolved at runtime instead of being a link-time dependency. RTLD_DEFAULT
-// finds it in libascendcl.so, which the test binary already links.
 std::string QuerySocName() {
   using GetSocNameFn = const char* (*)();
   auto* symbol = reinterpret_cast<GetSocNameFn>(dlsym(RTLD_DEFAULT, "aclrtGetSocName"));
@@ -57,15 +54,6 @@ std::string QuerySocName() {
   return (name != nullptr) ? std::string(name) : std::string();
 }
 
-// The mapped object that shows the CANN camodel is standing in for the runtime,
-// or an empty string when nothing in the address space says so.
-//
-// Detection is by loaded object rather than by SoC name: under the camodel
-// aclrtGetSocName() reports a real bin. RUN_MODE=sim links libruntime_camodel.so
-// in place of libruntime.so out of $ASCEND_HOME_PATH/tools/simulator/<bin>/lib.
-//
-// A host with no readable /proc reports "not a simulator": silicon is the
-// default assumption.
 std::string QuerySimulatorEvidence() {
   std::ifstream maps("/proc/self/maps");
   if (!maps.is_open()) {
@@ -82,12 +70,9 @@ std::string QuerySimulatorEvidence() {
   return std::string();
 }
 
-}  // namespace
+}
 
 const std::string& SimulatorEvidence() {
-  // Queried once: the mapping list does not change after the runtime is loaded,
-  // and every REQUIRE_PHYSICAL_ASCEND_950PR in a binary would otherwise reread
-  // /proc.
   static const std::string evidence = QuerySimulatorEvidence();
   return evidence;
 }
@@ -97,8 +82,6 @@ bool IsRunningOnSimulator() { return !SimulatorEvidence().empty(); }
 AscendDevice::AscendDevice() {
   device_id_ = ResolveDeviceId();
   try {
-    // A null config path means "use the built-in defaults"; the tests do not
-    // need a dump or profiling json here, msprof attaches externally.
     ACL_CHECK(aclInit(nullptr));
     acl_initialised_ = true;
 
@@ -111,8 +94,6 @@ AscendDevice::AscendDevice() {
 
     soc_name_ = QuerySocName();
   } catch (...) {
-    // Undo whatever succeeded before rethrowing, so a failed construction does
-    // not leave the runtime half-initialised for the next attempt.
     if (stream_ != nullptr) {
       ACL_CHECK_NOTHROW(aclrtDestroyStream(stream_));
       stream_ = nullptr;
@@ -135,8 +116,6 @@ AscendDevice::AscendDevice() {
 
 AscendDevice::~AscendDevice() {
   if (stream_ != nullptr) {
-    // Drain before destroying: an in-flight task holding a reference to a
-    // freed stream is the usual source of teardown EXCEPTIONs.
     ACL_CHECK_NOTHROW(aclrtSynchronizeStream(stream_));
     ACL_CHECK_NOTHROW(aclrtDestroyStream(stream_));
     stream_ = nullptr;
@@ -186,8 +165,6 @@ AscendDevice& AscendTestEnvironment::device() {
 aclrtStream AscendTestEnvironment::stream() { return device().stream(); }
 
 bool AscendTestEnvironment::is_310p() const {
-  // Covers Ascend310P1/P3/P5 and the "Ascend310P" short form. An empty SoC name
-  // means the runtime could not tell us, in which case we do not block the test.
   if (soc_name_.empty()) {
     return true;
   }
@@ -195,15 +172,10 @@ bool AscendTestEnvironment::is_310p() const {
 }
 
 bool AscendTestEnvironment::is_950pr() const {
-  // The platform_config SoC_version for every 950PR bin starts "Ascend950PR".
-  // Ascend950DT shares the family but not the part, so a prefix match rather
-  // than a "950" substring. An empty name is rejected.
   return ::vllm_ascend::test::shapes950::IsAscend950PrSocName(soc_name_);
 }
 
 void RegisterAscendTestEnvironment() {
-  // GTest takes ownership of registered environments and deletes them, so the
-  // singleton is wrapped in a non-owning shim.
   class EnvironmentShim : public ::testing::Environment {
    public:
     void SetUp() override { AscendTestEnvironment::Instance().SetUp(); }
@@ -212,5 +184,5 @@ void RegisterAscendTestEnvironment() {
   ::testing::AddGlobalTestEnvironment(new EnvironmentShim());
 }
 
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}

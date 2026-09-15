@@ -46,12 +46,9 @@ import math
 
 import numpy as np
 
-# Seed of the +-1 diagonal of Pi; must equal TURBOQUANT_PI_SEED in
-# vllm_ascend/attention/turboquant_rotation.py and kPiSeed in turbo_quant_cpu.h.
 TURBOQUANT_PI_SEED = 0x5F3759DF
 
 
-# ----------------------------------------------------------------- rotation --
 def fwht(x):
     """Normalised FWHT over the last axis (length must be a power of two)."""
     x = x.astype(np.float32).copy()
@@ -82,7 +79,6 @@ def apply_pi(x, signs):
     return fwht(x * signs) * signs
 
 
-# --------------------------------------------------------------- quantizers --
 def q_absmax(v, bits=4):
     """Symmetric mid-rise grid, scale = absmax / zp.  Matches cpu_quantize_4bit."""
     lv = (1 << bits) - 1
@@ -130,27 +126,12 @@ def q_qjl(v, clip_sigma=3.0):
     resid = u - base
     sgn = np.sign(resid)
     sgn[sgn == 0] = 1.0
-    beta = np.abs(resid).mean(-1, keepdims=True)  # MMSE magnitude for a sign code
+    beta = np.abs(resid).mean(-1, keepdims=True)
     uh = base + beta * sgn
     uh = uh * mmse_gain(u, uh)
     return uh * nrm
 
 
-# ------------------------------------------------- Lloyd-Max, 16 levels, N(0,1) --
-#
-# The MSE-optimal *non-uniform* 4-bit scalar quantizer for a standardised
-# Gaussian: the fixed point of
-#
-#     c_i = E[X | t_i < X < t_{i+1}]        (centroid condition)
-#     t_i = (c_{i-1} + c_i) / 2             (nearest-neighbour condition)
-#
-# with t_0 = -inf and t_16 = +inf.  Derived by lloyd_max_gaussian_table() below
-# and pinned here so the codec has no scipy dependency at call time; the
-# derivation is kept so the constants can be re-verified rather than trusted.
-#
-# Distortion of this quantizer on N(0,1) is D = 0.00950101 (20.222 dB), against
-# 0.01386 for the shipped absmax grid measured on the same d=256 Gaussian --
-# see the module test at the bottom of verify_integration.py.
 LLOYD_MAX_4BIT_CENTROIDS = np.array([
     -2.732589570995171, -2.069017226531392, -1.6180463860218863, -1.2562311973471796,
     -0.9423404564869651, -0.6567591185324659, -0.38804829949029185, -0.12839502985114726,
@@ -158,7 +139,6 @@ LLOYD_MAX_4BIT_CENTROIDS = np.array([
     1.2562311973471796, 1.6180463860218863, 2.069017226531392, 2.732589570995171,
 ], dtype=np.float32)
 
-# The 15 interior decision boundaries; t_i = (c_{i-1} + c_i) / 2 exactly.
 LLOYD_MAX_4BIT_THRESHOLDS = np.array([
     -2.4008033987632817, -1.8435318062766393, -1.437138791684533, -1.0992858269170722,
     -0.7995497875097155, -0.5224037090113789, -0.25822166467071955, 0.0,
@@ -166,7 +146,6 @@ LLOYD_MAX_4BIT_THRESHOLDS = np.array([
     1.437138791684533, 1.8435318062766393, 2.4008033987632817,
 ], dtype=np.float32)
 
-# Distortion E[(X - Q(X))^2] of the table above on N(0,1).
 LLOYD_MAX_4BIT_DISTORTION = 0.009501008008191723
 
 
@@ -192,11 +171,10 @@ def lloyd_max_gaussian_table(n_levels=16, iters=10000, tol=1e-15):
             c = c_new
             break
         c = c_new
-    c = 0.5 * (c - c[::-1])  # impose the exact symmetry the problem has
+    c = 0.5 * (c - c[::-1])
     t = np.concatenate(([-np.inf], 0.5 * (c[:-1] + c[1:]), [np.inf]))
     pa, pb = norm.pdf(t[:-1]), norm.pdf(t[1:])
     mass = norm.cdf(t[1:]) - norm.cdf(t[:-1])
-    # x * phi(x) -> 0 at +-inf, but inf * 0.0 is nan, so zero the edge first.
     fin = lambda x, p: np.where(np.isfinite(x), x, 0.0) * p  # noqa: E731
     ex2 = mass + fin(t[:-1], pa) - fin(t[1:], pb)
     ex1 = pa - pb
@@ -225,7 +203,6 @@ def q_lloyd_max(v, centroids=None, thresholds=None):
     return (s * cen[q]).astype(np.float32)
 
 
-# ------------------------------------------------------------------ regimes --
 def make_regimes(d, clip4=3.0, clip4r=3.0, clipq=3.0):
     """The four evaluated regimes at a matched 4 bits/coord, keyed by label.
 
@@ -234,7 +211,7 @@ def make_regimes(d, clip4=3.0, clip4r=3.0, clipq=3.0):
     """
     s = pi_signs(d)
     rot = lambda v: apply_pi(v, s)  # noqa: E731 - Pi is an involution ...
-    unrot = rot                     # ... so the un-rotation is the same call
+    unrot = rot
     return {
         "R1 absmax L_inf 4b (baseline)": lambda v: q_absmax(v, 4),
         "R2 spherical L2 4b": lambda v: q_spherical(v, 4, clip4),

@@ -14,22 +14,6 @@
  * limitations under the License.
  */
 
-// SwiGLU / SiluAndMul on Ascend 950PR, fp16 in / fp16 out.
-//
-// Stage 8 of the Qwen3.5 decoder layer: the operator splits the last axis in
-// half and returns silu(first) * second, with silu(v) = v * sigmoid(v), so
-// out.shape[-1] is half the input's.
-//
-// The operator is the stock aclnnSwiGlu; the 950PR custom SwiGLU variants are
-// all quantised or grouped MoE forms.
-//
-// AscendSiluAndMul310's x.shape[-1] % 32 == 0 gate is a v200 constraint and is
-// deliberately not carried over. What is asserted is the 16-element fp16 burst
-// alignment, which holds on both parts.
-//
-// Seeds, shapes and tolerances match
-// csrc/tests/kernels/cuda/test_activation_swiglu.cpp.
-
 #include <gtest/gtest.h>
 
 #include <cmath>
@@ -54,7 +38,6 @@ namespace {
 
 namespace s = shapes950;
 
-// aclnnSwiGlu splits the last axis, matching npu_swiglu with its default dim.
 constexpr int64_t kSwiGluSplitDim = -1;
 
 const AclnnOp& SwiGluOp() {
@@ -73,17 +56,11 @@ std::vector<float> RunSwiGluOnDevice(const std::vector<float>& x, int64_t num_to
   return out_device.ToFloatFromHalf();
 }
 
-// -----------------------------------------------------------------------------
-// Host-only checks
-// -----------------------------------------------------------------------------
-
 TEST(SwiGlu950PrReference, MatchesClosedFormAtKnownPoints) {
-  // silu(0) = 0, silu(1) = 1/(1+e^-1) = 0.7310586, silu(-1) = -0.2689414,
-  // silu(2) = 2/(1+e^-2) = 1.7615942.
-  const std::vector<float> x = {0.0f, 1.0f, -1.0f, 2.0f,  // gate half
-                                3.0f, 2.0f, 5.0f, 0.0f};  // up half
+  const std::vector<float> x = {0.0f, 1.0f, -1.0f, 2.0f,
+                                3.0f, 2.0f, 5.0f, 0.0f};
   std::vector<float> out;
-  reference::SiluAndMul(x, /*num_tokens=*/1, /*intermediate=*/4, &out);
+  reference::SiluAndMul(x, 1, 4, &out);
 
   ASSERT_EQ(out.size(), 4u);
   EXPECT_NEAR(out[0], 0.0f, 1e-6f);
@@ -93,8 +70,6 @@ TEST(SwiGlu950PrReference, MatchesClosedFormAtKnownPoints) {
 }
 
 TEST(SwiGlu950PrShapes, LayerAndSweepWidthsAreBurstAligned) {
-  // The kernel reads 2 * intermediate and writes intermediate, so both have to
-  // be whole 32-byte fp16 bursts.
   EXPECT_EQ(s::kIntermediate % s::kFp16ElementsPerBurst, 0);
   EXPECT_EQ((s::kIntermediate * 2) % s::kFp16ElementsPerBurst, 0);
   for (int64_t intermediate : s::IntermediateSizes()) {
@@ -102,10 +77,6 @@ TEST(SwiGlu950PrShapes, LayerAndSweepWidthsAreBurstAligned) {
     EXPECT_EQ((intermediate * 2) % s::kFp16ElementsPerBurst, 0) << "intermediate=" << intermediate;
   }
 }
-
-// -----------------------------------------------------------------------------
-// Device parity
-// -----------------------------------------------------------------------------
 
 class SwiGlu950PrTest : public ::testing::TestWithParam<std::tuple<int64_t, int64_t>> {
  protected:
@@ -117,10 +88,8 @@ TEST_P(SwiGlu950PrTest, MatchesCpuReference) {
   REQUIRE_ASCEND_950PR();
   REQUIRE_ACLNN_OP(SwiGluOp());
 
-  DeterministicRandom random(0x53574755u);  // "SWGU"
+  DeterministicRandom random(0x53574755u);
 
-  // A stddev of 2 pushes a useful fraction of the gate into the saturating
-  // tails of silu, where a low-precision sigmoid approximation would show up.
   const std::vector<float> x =
       random.NormalHalfExact(static_cast<size_t>(num_tokens() * intermediate() * 2), 0.0f, 2.0f);
 
@@ -136,12 +105,9 @@ TEST_P(SwiGlu950PrTest, SplitsTheInputAtTheHalfwayPoint) {
   REQUIRE_ASCEND_950PR();
   REQUIRE_ACLNN_OP(SwiGluOp());
 
-  // Zeroing the up half must zero the whole output. A kernel that split the
-  // input at the wrong offset, or interleaved the halves, fails here even
-  // though a random-input comparison might stay inside the tolerance.
   const int64_t width = intermediate();
   std::vector<float> x(static_cast<size_t>(num_tokens() * width * 2), 0.0f);
-  DeterministicRandom random(0x53504c54u);  // "SPLT"
+  DeterministicRandom random(0x53504c54u);
 
   for (int64_t token = 0; token < num_tokens(); ++token) {
     const size_t row = static_cast<size_t>(token * width * 2);
@@ -161,9 +127,6 @@ TEST_P(SwiGlu950PrTest, SaturatesRatherThanOverflowsOnLargeGates) {
   REQUIRE_ASCEND_950PR();
   REQUIRE_ACLNN_OP(SwiGluOp());
 
-  // silu saturates to the identity for large positive input and to zero for
-  // large negative input. fp16 tops out near 65504, so a gate of +/-30 with a
-  // unit up projection stays representable while still exercising the tails.
   const int64_t width = intermediate();
   std::vector<float> x(static_cast<size_t>(num_tokens() * width * 2), 0.0f);
   for (int64_t token = 0; token < num_tokens(); ++token) {
@@ -182,8 +145,6 @@ TEST_P(SwiGlu950PrTest, SaturatesRatherThanOverflowsOnLargeGates) {
       const float value = actual[row + static_cast<size_t>(i)];
       ASSERT_TRUE(std::isfinite(value)) << "non-finite output at token " << token << " index " << i;
       if (i % 2 == 0) {
-        // One fp16 ULP at magnitude 30 is 0.03125, so the bound has to sit
-        // above that or an exactly-correct rounded result would fail.
         EXPECT_NEAR(value, 30.0f, 5e-2f) << "positive tail at token " << token << " index " << i;
       } else {
         EXPECT_NEAR(value, 0.0f, 1e-3f) << "negative tail at token " << token << " index " << i;
@@ -203,6 +164,6 @@ INSTANTIATE_TEST_SUITE_P(Qwen35, SwiGlu950PrTest,
                                             ::testing::ValuesIn(s::IntermediateSizes())),
                          SwiGluTestName);
 
-}  // namespace
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}

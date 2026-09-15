@@ -23,8 +23,6 @@ namespace test {
 namespace ops950 {
 
 std::vector<ops::OpAvailability> ProbeAscend950Operators() {
-  // Pipeline order, so the inventory reads like the layer: norm, projections,
-  // rotary, KV write, decode, activation, elementwise.
   struct Entry {
     const char* name;
     const char* note;
@@ -52,9 +50,6 @@ std::vector<ops::OpAvailability> ProbeAscend950Operators() {
     record.name = entry.name;
     record.available = op.available();
     record.detail = entry.note;
-    // Which library it came from is as interesting as whether it resolved: a
-    // "found" that came out of libcust_opapi.so is a kernel from csrc/, and a
-    // "found" from libopapi.so is stock CANN.
     if (op.available()) {
       record.detail += op.is_custom() ? "  [custom op package]" : "  [CANN]";
     }
@@ -81,8 +76,6 @@ void PrintAscend950OperatorInventory() {
     std::printf("[ascend-test]   %-34s %-7s %s\n", entry.name.c_str(), entry.available ? "found" : "MISSING",
                 entry.detail.c_str());
   }
-  // The one expected MISSING on a tree with stock CANN, called out so a reader
-  // does not treat it as a broken install. See the header for why.
   if (!AclnnOp(kInplacePartialRotaryMul).available()) {
     std::printf(
         "[ascend-test]   note: %s comes from the vllm-ascend custom op package\n"
@@ -92,6 +85,6 @@ void PrintAscend950OperatorInventory() {
   }
 }
 
-}  // namespace ops950
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}

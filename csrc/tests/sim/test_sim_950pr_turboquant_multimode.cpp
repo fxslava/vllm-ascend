@@ -14,66 +14,6 @@
  * limitations under the License.
  */
 
-// Functional check of the Cube-native multi-mode decode. ONE SOURCE, TWO TIERS:
-// compiled as test_sim_950pr_turboquant_multimode against the arch35 camodel and
-// as test_device_950pr_turboquant_multimode against silicon, so the cos bound
-// the simulator enforces and the one hardware enforces cannot drift apart.
-//
-// It asserts nothing about time on either tier. Every timing this project quotes
-// comes from bench_device_950pr_turboquant on physical silicon.
-//
-// THE SWEEP IS THE ONE THING THAT DIFFERS, and the asymmetry is deliberate: a
-// camodel pass is cycle-level, so there the default is a SINGLE shape and the
-// sweep loop runs exactly once. On silicon the default is the whole validation
-// matrix. See kDefaultContextLens / kDefaultBatchSizes for the lists and
-// ASCEND_TQ_SIM_CONTEXT / ASCEND_TQ_SIM_BATCH for overriding either on either
-// tier.
-//
-// THE SHAPE:
-//
-//   head_size 256     the production head dim, and the one the Cube path is
-//                     sized for. It cannot drop to 64: the score GEMM's
-//                     reduction length is head_size and the Cube's K step is
-//                     64, so a smaller head would stop exercising the
-//                     multi-step LoadData.
-//   block_size 128    the production block size, and required: see kBlockSize.
-//   heads / kv        4 over 2 on the camodel -- a GQA group of two is enough to
-//                     prove the batching happens -- and the production 8 over 2
-//                     on silicon.
-//   batch             1 on the camodel; 1 and 8 on silicon, so the per-sequence
-//                     block tables and context lengths are exercised. A wrong
-//                     batch axis shows up as a collapsed cosine on every
-//                     sequence but the first, which is why the fidelity check
-//                     reports the worst sequence and not only the batch figure.
-//   context           16 on the camodel (a partial 64-row tile, so the tail
-//                     masking in the softmax is live); 64 / 512 / 1024 / 2048 on
-//                     silicon, where 64 is the shape the camodel verified and
-//                     the rest are the model's own and exercise the tile loop.
-//
-// WHAT IS ASSERTED, in increasing strength:
-//
-//   dispatch    every mode's write and decode launch returns ACL_SUCCESS and the
-//               stream synchronises. This is the only thing kv3fp4 is held to.
-//   finite      every mode's output is entirely finite and not identically zero.
-//   fidelity    kv4fp8's and kv5fp8's output against an fp32 host reference.
-//               Both expand onto the same fp8 e4m3fn operand grid, so a
-//               structural defect that is common to them -- a transposed K
-//               operand, a probability row staged at the wrong stride -- shows
-//               up in both. They no longer share a packing or an expand: kv4fp8
-//               is affine INT4 with a plane-split packing and a flat L1 stage,
-//               kv5fp8 a Lloyd-Max index with an interleaved one and a strided
-//               band stage (TURBOQUANT_TESTS.md section 13.9), so a defect in
-//               either one's own layout shows up only there. The bound is
-//               deliberately loose (see kSmokeCos) and is NOT the cos > 0.995
-//               gate, whose measurement lives in
-//               scripts/tq_multimode_calibration.py; there kv4fp8 reaches
-//               0.98752 and kv5fp8 0.99613 at S = 512.
-//
-//               kv3fp4 is exempt because its operand grid is fp4 e2m1, which
-//               costs it more than its codebook does: the same script measures
-//               0.92813, and a bound loose enough to admit that would not catch
-//               anything.
-
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -100,16 +40,6 @@ namespace tqh = turboquant_host;
 namespace tq = turboquant_ref;
 namespace tqm = vllm_ascend::turboquant;
 
-// THE SHAPE DIFFERS BY TIER, and only in the query-head count.
-//
-// The simulator runs 4 query heads over 2 kv heads because a camodel pass is
-// minutes and a GQA group of two is already enough to prove the heads are being
-// batched into the GEMM's M dimension at all. Silicon runs the production 8
-// over 2 -- shapes950::kNumHeads -- because there the point is not "does the
-// batching happen" but "does it hold at the group width the model decodes at".
-//
-// head_dim 256 and block_size 128 are the production values on BOTH tiers; see
-// kBlockSize below for why the block size is not negotiable here.
 #ifdef VLLM_ASCEND_TEST_TIER_DEVICE
 constexpr int64_t kNumHeads = 8;
 #else
@@ -117,46 +47,9 @@ constexpr int64_t kNumHeads = 4;
 #endif
 constexpr int64_t kHeadSize = 256;
 constexpr int64_t kNumKvHeads = 2;
-// 128, the production block size, and NOT the 16 the rest of this tier uses to
-// keep camodel passes short. The Cube decode tiles the packed cache in
-// kCubeTileRows = 64 row blocks and requires that to divide block_size:
-// CopyInTile issues one 64-row DataCopy per tile unconditionally, so at
-// block_size 16 it reads 48 rows past the end of the block it was given -- into
-// the next blocks of the pool, and past the end of the cache and scale-plane
-// allocations entirely when the block is the last one. The garbage that pulls
-// into the per-row scale lanes is multiplied into the score row before the
-// invalid columns are masked, which is where the vec_err_idata_inf_nan flood
-// came from. It is a shape this kernel does not support, not a kernel defect.
-//
-// It costs nothing here: at S <= 128 the tile loop still runs one 64-row tile,
-// because rows is clamped to the context length.
 constexpr int64_t kBlockSize = 128;
 constexpr int64_t kMinBlocks = 4;
 
-/*
- * THE SWEEP, and why it has one entry on the simulator and a matrix on silicon.
- *
- * A camodel pass is cycle-level: the single-tile shape below takes about seven
- * minutes and S=512 takes most of an hour. So the simulator default is ONE
- * batch and ONE context length, and the loop in the test body runs exactly once.
- * That is the constraint the old "do not add a loop to this file" note was
- * protecting, and it still holds -- what changed is that the loop is now over a
- * list whose simulator default has length one.
- *
- * On silicon a decode step is microseconds, so the device default is the whole
- * validation matrix:
- *
- *   batch    1, 8            one sequence, and a real decode batch
- *   context  64              the shape the camodel verified, so the two tiers
- *                            overlap at one point instead of meeting nowhere
- *            512, 1024, 2048 the shapes Qwen3.5-2B decodes at, and the ones
- *                            that exercise the tile loop and real paging
- *
- * ASCEND_TQ_SIM_CONTEXT and ASCEND_TQ_SIM_BATCH override either list as a
- * comma-separated set of positive integers, on both tiers -- that is how a
- * camodel run covers a second shape (one process per shape) and how a silicon
- * run narrows to the one that regressed.
- */
 #ifdef VLLM_ASCEND_TEST_TIER_DEVICE
 const int64_t kDefaultContextLens[] = {64, 512, 1024, 2048};
 const int64_t kDefaultBatchSizes[] = {1, 8};
@@ -165,11 +58,6 @@ const int64_t kDefaultContextLens[] = {16};
 const int64_t kDefaultBatchSizes[] = {1};
 #endif
 
-// A comma-separated list of positive integers from `name`, or `fallback`
-// unchanged when the variable is unset, empty, or parses to nothing. A partly
-// parseable list keeps the entries that parsed: substituting the default because
-// one field was a typo would silently run a different sweep than the one asked
-// for, and so would dropping the list.
 std::vector<int64_t> Int64ListFromEnv(const char* name, const int64_t* fallback, size_t fallback_count) {
   const std::vector<int64_t> defaults(fallback, fallback + fallback_count);
   const char* raw = std::getenv(name);
@@ -192,7 +80,6 @@ std::vector<int64_t> Int64ListFromEnv(const char* name, const int64_t* fallback,
   return parsed;
 }
 
-// Parsed once each: the sweep is fixed for the life of the process.
 const std::vector<int64_t>& ContextLens() {
   static const std::vector<int64_t> value =
       Int64ListFromEnv("ASCEND_TQ_SIM_CONTEXT", kDefaultContextLens,
@@ -208,25 +95,12 @@ const std::vector<int64_t>& BatchSizes() {
 
 int64_t BlocksPerSeq(int64_t context_len) { return (context_len + kBlockSize - 1) / kBlockSize; }
 
-// The block pool, for `batch` sequences of `context_len` tokens each.
-// Deliberately larger than the sequences need so the block table is a genuine
-// scatter rather than a run of consecutive blocks, which is what makes the paged
-// addressing real -- at the smallest shape that is a pool of 4 for a sequence
-// needing 1.
-//
-// Sized off the whole batch and not off one sequence: the sequences must not
-// share blocks, or a decode that read the wrong sequence's cache would still
-// find plausible data there and the batch axis would go unchecked.
 int64_t NumBlocks(int64_t batch, int64_t context_len) {
   return std::max(kMinBlocks, batch * BlocksPerSeq(context_len) * 4);
 }
-constexpr float kInvSqrtHeadSize = 0.0625f;  // 1 / sqrt(256), exact in fp32
+constexpr float kInvSqrtHeadSize = 0.0625f;
 constexpr float kAttentionScale = kInvSqrtHeadSize;
 
-// The loose bound described in the file header: roughly four times the distance
-// from 1.0 that the calibration script's S = 512 measurement shows, which
-// leaves room for the short-context effect but not for a structurally wrong
-// decode -- a transposed K operand lands near zero cosine.
 constexpr double kSmokeCos = 0.90;
 
 double Cosine(const std::vector<float>& a, const std::vector<float>& b) {
@@ -244,16 +118,6 @@ double Cosine(const std::vector<float>& a, const std::vector<float>& b) {
   return dot / (std::sqrt(na) * std::sqrt(nb));
 }
 
-// fp32 attention over the unquantised inputs, on the host: the reference the
-// fidelity bound is quoted against. Deliberately not a copy of the device's
-// arithmetic -- no rotation, no codebook -- so that agreeing with it is
-// evidence about the pipeline as a whole and not about one stage.
-//
-// Shapes: `query` is [batch, num_heads, head_size], `key` and `value` are
-// [batch, context_len, num_kv_heads, head_size], and the result is
-// [batch, num_heads, head_size]. One decode step per sequence, each over its own
-// context -- which is what the device does, so a batch axis dropped on either
-// side shows up as a cosine collapse on every sequence but the first.
 std::vector<float> HostAttention(int64_t batch, int64_t context_len, const std::vector<float>& query,
                                  const std::vector<float>& key, const std::vector<float>& value) {
   std::vector<float> out(static_cast<size_t>(batch * kNumHeads * kHeadSize), 0.0f);
@@ -291,29 +155,24 @@ std::vector<float> HostAttention(int64_t batch, int64_t context_len, const std::
   return out;
 }
 
-// One shape: `batch` sequences of `context_len` tokens, with the block pool and
-// the block table that go with them. Built once per shape and shared by every
-// rate, so the rates are compared on identical data.
 struct Shape {
   int64_t batch = 1;
   int64_t context_len = 0;
   int64_t blocks_per_seq = 0;
   int64_t num_blocks = 0;
-  std::vector<float> key;    // [batch, context_len, num_kv_heads, head_size]
-  std::vector<float> value;  // same
-  std::vector<float> query;  // [batch, num_heads, head_size]
-  std::vector<int32_t> slots;        // [batch * context_len], the write path's scatter
-  std::vector<int32_t> block_table;  // [batch, blocks_per_seq]
-  std::vector<int32_t> context_lens;  // [batch]
+  std::vector<float> key;
+  std::vector<float> value;
+  std::vector<float> query;
+  std::vector<int32_t> slots;
+  std::vector<int32_t> block_table;
+  std::vector<int32_t> context_lens;
 };
 
-// One mode's whole pipeline: write the cache, decode it, read the output back.
 struct ModeRun {
   std::vector<float> output;
   std::vector<float> scale_plane;
   int64_t num_splits = 0;
   int64_t packed_bytes = 0;
-  // Which query-rotation path this shape selected, and how it was tiled.
   vllm_ascend::turboquant::RotateQPlan rotate_plan;
 };
 
@@ -331,12 +190,8 @@ ModeRun RunMode(tqm::TurboQuantMode mode, const Shape& shape, aclrtStream stream
   DeviceBuffer context_dev = DeviceBuffer::FromHost(shape.context_lens);
   DeviceBuffer pi_signs = DeviceBuffer::FromHost(tqh::PiSigns(kHeadSize));
 
-  // Two table images. The rotation one is the shipping 4-bit codec's, because
-  // both kernels drive Pi through a TurboQuantCodec4; the mode one is this
-  // rate's. The decode's mode image carries the NZ permutation
-  // (nz_rows = kCubeTileRows); the write path's does not.
   DeviceBuffer rot_tables = DeviceBuffer::FromHost(tqh::CodecTables(kHeadSize, 1));
-  DeviceBuffer write_tables = DeviceBuffer::FromHost(tqh::ModeTables(mode, kHeadSize, 1, /*nz_rows=*/0));
+  DeviceBuffer write_tables = DeviceBuffer::FromHost(tqh::ModeTables(mode, kHeadSize, 1, 0));
   DeviceBuffer decode_tables =
       DeviceBuffer::FromHost(tqh::ModeTables(mode, kHeadSize, tqh::kUnpackRows, tqh::kCubeTileRows));
 
@@ -351,9 +206,6 @@ ModeRun RunMode(tqm::TurboQuantMode mode, const Shape& shape, aclrtStream stream
 
   bool queried = false;
   const int64_t aiv_num = tqh::VectorCoreNum(&queried);
-  // The write path's token count is the whole batch's, because every sequence's
-  // context has to be encoded into the pool; the decode's is one step per
-  // sequence, which is what `batch` counts.
   const tqh::ReshapeAndCacheGrid write_grid = tqh::PlanReshapeAndCache(batch * context_len, aiv_num);
   const tqh::CubeDecodeGrid decode_grid =
       tqh::PlanCubeDecode(batch, kNumHeads, kNumKvHeads, kHeadSize, shape.blocks_per_seq, aiv_num);
@@ -369,12 +221,9 @@ ModeRun RunMode(tqm::TurboQuantMode mode, const Shape& shape, aclrtStream stream
       kInvSqrtHeadSize);
   ACL_CHECK(aclrtSynchronizeStream(stream));
 
-  // Pi q for the whole step, once, before the split reads it. `run.rotate_plan`
-  // records which of the two paths the shape selected so the case can assert on
-  // it rather than infer it.
   run.rotate_plan = tqh::RotateQuery(stream, AscendType::FP16, query_dev.get(), pi_signs.get(), h16.get(),
                                      rot_tables.get(), query_rot.get(), batch, kNumHeads, kHeadSize, aiv_num,
-                                     /*input_exact_in_half=*/true);
+                                     true);
 
   turboquant_mm_decode_split_impl(
       static_cast<int32_t>(mode), AscendType::FP16, stream, decode_grid.split_block_dim, query_rot.get(),
@@ -385,9 +234,6 @@ ModeRun RunMode(tqm::TurboQuantMode mode, const Shape& shape, aclrtStream stream
       static_cast<uint32_t>(decode_grid.num_splits), decode_grid.split_tasks_per_core, kAttentionScale,
       kInvSqrtHeadSize);
 
-  // The combine is the AIV path's, reused verbatim: the partials above are in
-  // its layout. Stream order is the barrier -- an in-kernel one would order
-  // only co-resident blocks.
   turboquant_paged_attention_combine_impl(AscendType::FP16, stream, decode_grid.combine_block_dim, workspace.get(),
                                           out.get(), static_cast<uint32_t>(batch), static_cast<uint32_t>(kNumHeads),
                                           static_cast<uint32_t>(kHeadSize),
@@ -395,22 +241,11 @@ ModeRun RunMode(tqm::TurboQuantMode mode, const Shape& shape, aclrtStream stream
                                           decode_grid.combine_tasks_per_core);
   ACL_CHECK(aclrtSynchronizeStream(stream));
 
-  // Rotated on the device; un-rotated here as the folded W_o would.
   run.output = tqh::UnrotateHeads(HalfToFloat(out.ToHost<Half>()), kHeadSize);
   run.scale_plane = scale_plane.ToHost<float>();
   return run;
 }
 
-// The modes this process runs, from ASCEND_TQ_SIM_MODES as a comma-separated
-// list of the names below; empty or unset runs all three.
-//
-// One mode per process is the useful form when what is being asked is "does
-// this rate fault or hang at this shape", because a camodel pass is minutes and
-// a fault in the first mode costs the others. gtest's own --gtest_filter cannot
-// express it: the three modes are a loop inside one test, not three tests.
-// One shape's inputs. Every sequence gets its own run of blocks out of one
-// shuffled pool, so no two sequences share a block and the block table is a
-// scatter in both axes.
 Shape MakeShape(int64_t batch, int64_t context_len, DeterministicRandom* rng) {
   Shape shape;
   shape.batch = batch;
@@ -463,11 +298,6 @@ bool ModeSelected(const char* name) {
 
 TEST(TurboQuantMultiMode, DispatchAndFidelityAcrossShapes) {
   REQUIRE_ASCEND_950PR();
-  // No test-level opt-in any more: kv4fp8 runs by default and asserts its
-  // fidelity bound, because the Cube-native decode is corrected and measured
-  // (see TURBOQUANT_TESTS.md sections 13.8 and 13.9). The gate moved onto the
-  // two rates that are still scaffolded -- see `provisional` in the table
-  // below -- so promoting one rate does not promote the others.
 
   aclrtStream stream = AscendTestEnvironment::Instance().stream();
 
@@ -475,15 +305,8 @@ TEST(TurboQuantMultiMode, DispatchAndFidelityAcrossShapes) {
     tqm::TurboQuantMode mode;
     const char* name;
     bool assert_fidelity;
-    // Still behind VLLM_ASCEND_TQ_CUBE_WIP. kv4fp8 is not: it is the rate the
-    // device verification runs, and it is measured rather than scaffolded.
-    // Neither of the others has been re-measured through the corrected
-    // staging, which is the whole reason they stay gated.
     bool provisional;
   };
-  // kv4fp8 first: it is the one that runs by default and carries the bound, so
-  // a failure there is reported before a multi-minute pass has been spent on a
-  // rate nobody is gating a release on.
   const ModeCase cases[] = {
       {tqm::TurboQuantMode::KV4_FP8, "kv4fp8", true, false},
       {tqm::TurboQuantMode::KV5_FP8, "kv5fp8", true, true},
@@ -496,9 +319,6 @@ TEST(TurboQuantMultiMode, DispatchAndFidelityAcrossShapes) {
   std::printf("[ multimode ] sweep: batch x context = %zu x %zu = %zu shape(s)\n", BatchSizes().size(),
               ContextLens().size(), BatchSizes().size() * ContextLens().size());
 
-  // Every shape gets its own generator seeded the same way, so a shape's inputs
-  // do not depend on which other shapes the sweep happened to include -- a
-  // narrowed rerun reproduces the case it narrowed to.
   for (const int64_t batch : BatchSizes()) {
     for (const int64_t context_len : ContextLens()) {
       DeterministicRandom rng(0x5A17u);
@@ -533,9 +353,6 @@ TEST(TurboQuantMultiMode, DispatchAndFidelityAcrossShapes) {
 
         const ModeRun run = RunMode(mode_case.mode, shape, stream);
 
-        // Dispatch: reaching here at all means every launch returned ACL_SUCCESS
-        // and the stream drained. On the camodel a pipeline fault does not return
-        // quietly, so this is the instruction-level check.
         std::printf("[ multimode ] %s: dispatched, splits=%lld\n", mode_case.name,
                     static_cast<long long>(run.num_splits));
 
@@ -550,18 +367,12 @@ TEST(TurboQuantMultiMode, DispatchAndFidelityAcrossShapes) {
         EXPECT_EQ(finite, run.output.size()) << mode_case.name << " produced non-finite output";
         EXPECT_GT(abs_sum, 0.0) << mode_case.name << " produced an identically zero output";
 
-        // The scale plane is written by the encoder and read by the decoder; an
-        // all-zero one means the write path never ran, which would make the decode
-        // a decode of zeros and still finite.
         double scale_sum = 0.0;
         for (const float v : run.scale_plane) {
           scale_sum += std::fabs(static_cast<double>(v));
         }
         EXPECT_GT(scale_sum, 0.0) << mode_case.name << " left the scale plane empty";
 
-        // One cosine over the whole batch, and then the per-sequence worst. The
-        // batched figure alone would hide a single wrong sequence in seven right
-        // ones, which is exactly the failure a batch axis introduces.
         const double cos = Cosine(reference, run.output);
         double worst_cos = cos;
         int64_t worst_seq = 0;
@@ -595,6 +406,6 @@ TEST(TurboQuantMultiMode, DispatchAndFidelityAcrossShapes) {
   }
 }
 
-}  // namespace
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}
+}

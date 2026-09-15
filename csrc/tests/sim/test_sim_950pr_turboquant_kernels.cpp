@@ -14,30 +14,6 @@
  * limitations under the License.
  */
 
-// The TurboQuant 4-bit KV-cache kernels, driven straight through the CANN
-// runtime and checked against the CPU reference in reference/turbo_quant_cpu.h.
-//
-// Two things are under test:
-//
-//   * the launch contract -- the scale-plane geometry, the codec table image
-//     and the grid arithmetic. These are pure functions of the shapes,
-//     duplicated in five places that can drift independently, and the cases
-//     below run with no device at all.
-//
-//   * the kernels themselves -- the split/combine decode pipeline and the write
-//     path, compared element by element against the CPU reference. These gate
-//     on REQUIRE_ASCEND_950PR.
-//
-// turbo_quant_cpu.h mirrors turboquant_codec_950.h instruction for instruction
-// and is not an independent reimplementation. What it establishes is that the
-// kernel does on the device what the reference does on the host.
-//
-// ON EXACTNESS. The reconstruction check is exact-to-one-level rather than
-// byte-identical: a channel whose rotated value sits exactly on a rounding
-// boundary can be pushed either way by one ulp of difference in the fp32
-// accumulation order. The assertions are that no channel is off by more than
-// one level and that the fraction differing at all is small.
-
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -63,36 +39,25 @@ namespace {
 namespace tq = turboquant_ref;
 namespace tqh = turboquant_host;
 
-// Shapes for the device cases. Deliberately small: this file runs on the
-// camodel as well as on silicon. head_size 64 is the bottom of the supported
-// range; block_size 16 is one kTileRows tile.
 constexpr int kHeadSize = 64;
 constexpr int kNumKvHeads = 2;
-constexpr int kNumHeads = 4;  // group of 2, so the GQA head->kv_head mapping is live
+constexpr int kNumHeads = 4;
 constexpr int kBlockSize = 16;
 constexpr int kNumBlocks = 4;
-constexpr int kContextLen = 32;  // two blocks
-constexpr int kQueryTokens = 1;  // decode
-constexpr float kAttentionScale = 0.125f;  // 1 / sqrt(64)
+constexpr int kContextLen = 32;
+constexpr int kQueryTokens = 1;
+constexpr float kAttentionScale = 0.125f;
 
-// Bounds for the reconstruction comparison, in bins rather than reconstructed
-// values. The device sums the squares for its RMS scale in a tree and the host
-// sums them serially, so a coordinate on a decision boundary can fall either
-// side of it. One bin is what that can cost; two is a real disagreement.
 constexpr int kMaxLevelDrift = 1;
 constexpr double kMaxDifferingChannelFraction = 0.02;
-// The scale is one fp32 division of a reduced absmax. A relative difference
-// larger than this means the reduction itself disagreed, not that rounding did.
 constexpr double kScaleRelativeTolerance = 1e-5;
 
-// One synthetic decode step: the context that gets written into the cache, the
-// query that reads it back, and the paging that connects them.
 struct Scenario {
-  std::vector<float> key;         // [context_len, num_kv_heads, head_size]
-  std::vector<float> value;       // same shape as key
-  std::vector<float> query;       // [query_tokens, num_heads, head_size]
-  std::vector<int32_t> slots;     // [context_len], flat (block, offset) row index
-  std::vector<int32_t> table;     // [max_blocks_per_seq] physical block ids
+  std::vector<float> key;
+  std::vector<float> value;
+  std::vector<float> query;
+  std::vector<int32_t> slots;
+  std::vector<int32_t> table;
   int blocks_per_seq = 0;
 };
 
@@ -101,14 +66,10 @@ Scenario MakeScenario(uint32_t seed) {
   Scenario s;
   const size_t kv_elems = static_cast<size_t>(kContextLen) * kNumKvHeads * kHeadSize;
 
-  // fp16-exact inputs: the device is handed these bit patterns, so the only
-  // difference the comparison can see is the arithmetic, never the input.
   s.key = rng.NormalHalfExact(kv_elems, 0.0f, 1.0f);
   s.value = rng.NormalHalfExact(kv_elems, 0.0f, 1.0f);
   s.query = rng.NormalHalfExact(static_cast<size_t>(kQueryTokens) * kNumHeads * kHeadSize, 0.0f, 1.0f);
 
-  // A scattered block table, so a bug that assumes the cache is sequential in
-  // the sequence rather than paged shows up.
   s.blocks_per_seq = (kContextLen + kBlockSize - 1) / kBlockSize;
   const std::vector<int32_t> permutation = rng.Permutation(kNumBlocks);
   s.table.assign(permutation.begin(), permutation.begin() + s.blocks_per_seq);
@@ -121,7 +82,6 @@ Scenario MakeScenario(uint32_t seed) {
   return s;
 }
 
-// The CPU reference's version of the write path over a whole scenario.
 void ReferenceWritePath(const Scenario& s, std::vector<int8_t>* key_cache, std::vector<int8_t>* value_cache,
                         std::vector<float>* scale_plane) {
   const std::vector<int8_t> signs = tq::cpu_pi_sign_vector(kHeadSize);
@@ -144,15 +104,6 @@ void ReferenceWritePath(const Scenario& s, std::vector<int8_t>* key_cache, std::
   }
 }
 
-// Compares two packed caches by the bins they select rather than by their
-// bytes. `label` names the plane in the failure message.
-//
-// The Lloyd-Max levels are unevenly spaced, so a value-space bound tight enough
-// to catch a two-bin slip at the centre of the table would reject a legitimate
-// one-bin tie-break at its edge. The indices are exact, so the bound can be.
-//
-// Only the rows the scenario wrote are examined: everything else is the zero
-// fill, which quantises to a single bin.
 void ExpectPackedCachesAgree(const char* label, const std::vector<int8_t>& actual, const std::vector<int8_t>& expected,
                              const std::vector<int32_t>& slots) {
   ASSERT_EQ(actual.size(), expected.size()) << label << ": cache sizes differ";
@@ -162,8 +113,6 @@ void ExpectPackedCachesAgree(const char* label, const std::vector<int8_t>& actua
   size_t differing = 0;
   size_t examined = 0;
 
-  // Bin index of channel c of a packed vector: the low nibble for an even
-  // channel, the high nibble for an odd one, with the -128 store bias undone.
   const auto bin_of = [](const int8_t* vec, int c) {
     const int byte = static_cast<int>(vec[c / tq::kPackFactor]) + static_cast<int>(tq::kInt8Bias);
     return (c % tq::kPackFactor == 0) ? (byte % tq::kLevels) : (byte / tq::kLevels);
@@ -218,12 +167,6 @@ void ExpectScalePlanesAgree(const std::vector<float>& actual, const std::vector<
   }
 }
 
-// --- device driver ----------------------------------------------------------
-
-// Everything the two kernels need on the device for one scenario, allocated
-// once and reused by both launches. The cache and the scale plane are the
-// pieces the write path fills and the decode path reads, so they deliberately
-// outlive a single call.
 class DeviceScenario {
  public:
   DeviceScenario(const Scenario& s, aclrtStream stream) : stream_(stream) {
@@ -235,9 +178,6 @@ class DeviceScenario {
     slots_ = DeviceBuffer::FromHost(s.slots);
     pi_signs_ = DeviceBuffer::FromHost(pi_signs);
 
-    // The write path expands one vector at a time; the decode path expands a
-    // kTileRows tile. Their table images differ in the trailing expandOffset_ /
-    // oddSelect_ sections and are not interchangeable.
     write_tables_ = DeviceBuffer::FromHost(tqh::CodecTables(kHeadSize, 1));
     decode_tables_ = DeviceBuffer::FromHost(tqh::CodecTables(kHeadSize, tqh::kTileRows));
 
@@ -245,7 +185,6 @@ class DeviceScenario {
     value_cache_ = DeviceBuffer::Empty<int8_t>(key_cache_.size_bytes());
     scale_plane_ = DeviceBuffer::Empty<float>(tqh::ScalePlaneFloats(kNumBlocks, kBlockSize, kNumKvHeads));
 
-    // One block-table row per query token, all reading the same context.
     std::vector<int32_t> block_tables;
     for (int t = 0; t < kQueryTokens; ++t) {
       block_tables.insert(block_tables.end(), s.table.begin(), s.table.end());
@@ -272,14 +211,10 @@ class DeviceScenario {
   void RunDecode(int blocks_per_seq) {
     const tqh::PagedAttentionGrid grid =
         tqh::PlanPagedAttention(kQueryTokens, kNumHeads, kHeadSize, blocks_per_seq, aiv_num_);
-    // Sized here rather than in the constructor: the split count, and so the
-    // workspace, is a function of the block table this decode reads.
     workspace_ = DeviceBuffer::Empty<float>(grid.workspace_floats);
 
-    // The query rotation is its own launch and must precede the split; the
-    // split kernel applies no transform of its own any more.
     tqh::RotateQuery(stream_, AscendType::FP16, query_.get(), pi_signs_.get(), h16_.get(), write_tables_.get(),
-                     query_rot_.get(), kQueryTokens, kNumHeads, kHeadSize, aiv_num_, /*input_exact_in_half=*/true);
+                     query_rot_.get(), kQueryTokens, kNumHeads, kHeadSize, aiv_num_, true);
 
     turboquant_paged_attention_impl(
         AscendType::FP16, stream_, grid.split_block_dim, grid.combine_block_dim, query_rot_.get(), key_cache_.get(),
@@ -294,15 +229,13 @@ class DeviceScenario {
   std::vector<int8_t> KeyCache() const { return key_cache_.ToHost<int8_t>(); }
   std::vector<int8_t> ValueCache() const { return value_cache_.ToHost<int8_t>(); }
   std::vector<float> ScalePlane() const { return scale_plane_.ToHost<float>(); }
-  // Un-rotated on the host, as the folded W_o would; see UnrotateHeads.
   std::vector<float> Output() const { return tqh::UnrotateHeads(HalfToFloat(out_.ToHost<Half>()), kHeadSize); }
-  // The kernel's output as written, in the rotated basis.
   std::vector<float> RotatedOutput() const { return HalfToFloat(out_.ToHost<Half>()); }
   int64_t aiv_num() const { return aiv_num_; }
   bool aiv_queried() const { return aiv_queried_; }
 
  private:
-  static constexpr float kInvSqrtHeadSize = 0.125f;  // 1 / sqrt(64)
+  static constexpr float kInvSqrtHeadSize = 0.125f;
 
   aclrtStream stream_;
   DeviceBuffer key_, value_, query_, slots_, pi_signs_;
@@ -314,14 +247,9 @@ class DeviceScenario {
   bool aiv_queried_ = false;
 };
 
-}  // namespace
-
-// ---------------------------------------------------------------------------
-// Launch contract - no device needed
-// ---------------------------------------------------------------------------
+}
 
 TEST(TurboQuantLaunchContract, ScaleSlotMatchesTheCpuReference) {
-  // Five copies of this number exist; two of them are here.
   for (int heads = 1; heads <= 16; ++heads) {
     EXPECT_EQ(static_cast<size_t>(tqh::ScaleSlotFloats(heads)), tq::cpu_scale_slot_floats(heads))
         << "num_kv_heads " << heads;
@@ -338,7 +266,6 @@ TEST(TurboQuantLaunchContract, CodecTableWordsMatchTheLayoutContract) {
       EXPECT_EQ(words, 7 * head_size + 2 * head_size * batch_rows + tq::kLevels);
       EXPECT_EQ(static_cast<int64_t>(tqh::CodecTables(head_size, batch_rows).size()), words)
           << "head_size " << head_size << ", batch_rows " << batch_rows;
-      // Init() moves the image with one DataCopy, so it must be a whole burst.
       EXPECT_EQ(words % tqh::kFp32PerBlock, 0)
           << "head_size " << head_size << ", batch_rows " << batch_rows;
     }
@@ -356,7 +283,6 @@ TEST(TurboQuantLaunchContract, CodecTablesHaveTheDocumentedLayout) {
     return value;
   };
 
-  // [0, 6D): three (sign, xorOffset) pairs, for strides 1, 2 and 4.
   for (int stage = 0; stage < 3; ++stage) {
     const int stride = 1 << stage;
     const size_t sign_base = static_cast<size_t>(2 * stage) * kD;
@@ -369,7 +295,6 @@ TEST(TurboQuantLaunchContract, CodecTablesHaveTheDocumentedLayout) {
     }
   }
 
-  // [6D, 7D): the nibble split, D/2 even offsets then D/2 odd offsets.
   const size_t even_base = 6 * static_cast<size_t>(kD);
   const size_t odd_base = even_base + static_cast<size_t>(kD / 2);
   for (int p = 0; p < kD / 2; ++p) {
@@ -377,7 +302,6 @@ TEST(TurboQuantLaunchContract, CodecTablesHaveTheDocumentedLayout) {
     ASSERT_EQ(tables[odd_base + static_cast<size_t>(p)], 8 * p + 4) << "pair " << p;
   }
 
-  // [7D, 7D + B) and [7D + B, 7D + 2B): batched expansion.
   const size_t expand_base = 7 * static_cast<size_t>(kD);
   const size_t select_base = expand_base + static_cast<size_t>(kD) * kRows;
   for (int b = 0; b < kD * kRows; ++b) {
@@ -386,10 +310,6 @@ TEST(TurboQuantLaunchContract, CodecTablesHaveTheDocumentedLayout) {
         << "batch lane " << b;
   }
 
-  // [7D + 2B, +16): the Lloyd-Max reconstruction levels, which Dequantize4Bit
-  // gathers against with a byte offset of 4 * bin. Checked for the two
-  // properties the codec relies on -- that it is the table the host reference
-  // quantises with, and that it is strictly increasing.
   const size_t centroid_base = select_base + static_cast<size_t>(kD) * kRows;
   ASSERT_EQ(tables.size(), centroid_base + static_cast<size_t>(tq::kLevels));
   for (int level = 0; level < tq::kLevels; ++level) {
@@ -400,20 +320,12 @@ TEST(TurboQuantLaunchContract, CodecTablesHaveTheDocumentedLayout) {
     ASSERT_LT(tq::kLloydMaxCentroids[level - 1], tq::kLloydMaxCentroids[level]) << "centroid " << level;
   }
 
-  // The table is the Lloyd-Max fixed point, so every threshold must sit exactly
-  // midway between the centroids it separates. A table edited on one side only
-  // would still be monotone and would still decode; it would just quantise to
-  // something other than the nearest centroid.
   for (int i = 0; i < tq::kThresholdCount; ++i) {
     const float midpoint = 0.5f * (tq::kLloydMaxCentroids[i] + tq::kLloydMaxCentroids[i + 1]);
     ASSERT_NEAR(tq::kLloydMaxThresholds[i], midpoint, 1e-6f) << "threshold " << i;
   }
 }
 
-// The combine's UB, before and after the inverse rotation moved into W_o. The
-// figures are the ones quoted in TurboQuantPagedAttentionCombine::Init and in
-// TURBOQUANT_TESTS.md 13.23; if the kernel's buffer list changes, this and that
-// comment change together.
 TEST(TurboQuantLaunchContract, CombineHoldsNoRotationState) {
   constexpr size_t kHalfBytes = sizeof(uint16_t);
 
@@ -427,13 +339,10 @@ TEST(TurboQuantLaunchContract, CombineHoldsNoRotationState) {
   EXPECT_EQ(d128.Released(), 42336u);
   EXPECT_EQ(d128.Current(), 2528u);
 
-  // The table image the combine no longer copies in is exactly the decode's
-  // kTileRows image, not a smaller rotation-only slice of it.
   for (const int64_t head_size : {64, 128, 256}) {
     const tqh::CombineUbFootprint ub = tqh::PlanCombineUb(head_size, kHalfBytes);
     EXPECT_EQ(ub.unrotation_codec_tables, tqh::CodecTables(head_size, tqh::kTileRows).size() * sizeof(int32_t))
         << "head_size " << head_size;
-    // Every buffer the combine still holds is a whole number of 32-byte bursts.
     for (const size_t bytes : {ub.accumulators, ub.state, ub.partial, ub.broadcast}) {
       EXPECT_EQ(bytes % 32u, 0u) << "head_size " << head_size;
     }
@@ -442,9 +351,6 @@ TEST(TurboQuantLaunchContract, CombineHoldsNoRotationState) {
   }
 }
 
-// UnrotateHeads is what every sim and device fixture now applies to a decode
-// output, standing in for the folded W_o. It has to be Pi per head, and so its
-// own inverse.
 TEST(TurboQuantLaunchContract, UnrotateHeadsIsPiPerHead) {
   constexpr int64_t kHeads = 3;
   for (const int64_t head_size : {64, 128, 256}) {
@@ -480,15 +386,9 @@ TEST(TurboQuantLaunchContract, PiSignsMatchTheCpuReference) {
     }
   }
 
-  // The first eight values at head_size 128, pinned on the Python side too
-  // (tests/ut/attention/test_turboquant_v1.py). A cache written by one half of
-  // the project has to be readable by the other, and this is the cheapest place
-  // a seed change would be caught.
   const std::vector<float> pinned = tqh::PiSigns(128);
   uint32_t state = tq::kPiSeed + 128u;
   for (int i = 0; i < 8; ++i) {
-    // Recomputed from the documented LCG rather than transcribed, so this stays
-    // a check on the generator and not on a copied literal.
     state = state * 1664525u + 1013904223u;
     const float from_lcg = ((state >> 16) & 1u) ? 1.0f : -1.0f;
     EXPECT_FLOAT_EQ(pinned[static_cast<size_t>(i)], from_lcg) << "channel " << i;
@@ -498,8 +398,6 @@ TEST(TurboQuantLaunchContract, PiSignsMatchTheCpuReference) {
 TEST(TurboQuantLaunchContract, GridPlansMatchTheAdapterArithmetic) {
   constexpr int64_t kAiv = 40;
 
-  // Write path: every token is covered exactly once, and no core is launched
-  // with nothing to do.
   for (int64_t tokens : {1, 7, 40, 41, 1024}) {
     const tqh::ReshapeAndCacheGrid grid = tqh::PlanReshapeAndCache(tokens, kAiv);
     EXPECT_GT(grid.tokens_per_core, 0u) << "tokens " << tokens;
@@ -508,8 +406,6 @@ TEST(TurboQuantLaunchContract, GridPlansMatchTheAdapterArithmetic) {
     EXPECT_LE(static_cast<int64_t>(grid.block_dim), kAiv) << "tokens " << tokens;
   }
 
-  // Decode: the split count never exceeds the cap, never exceeds the blocks a
-  // sequence has, and is at least one even for an empty block table.
   for (int64_t tokens : {1, 4, 64}) {
     for (int64_t blocks : {0, 1, 3, 64}) {
       const tqh::PagedAttentionGrid grid = tqh::PlanPagedAttention(tokens, kNumHeads, kHeadSize, blocks, kAiv);
@@ -523,21 +419,13 @@ TEST(TurboQuantLaunchContract, GridPlansMatchTheAdapterArithmetic) {
           << "tokens " << tokens << " blocks " << blocks;
       EXPECT_GT(grid.split_block_dim, 0u) << "tokens " << tokens << " blocks " << blocks;
       EXPECT_GT(grid.combine_block_dim, 0u) << "tokens " << tokens << " blocks " << blocks;
-      // The combine stage has exactly base_tasks work items, so it must never
-      // be given a larger grid than the split stage.
       EXPECT_LE(grid.combine_block_dim, grid.split_block_dim) << "tokens " << tokens << " blocks " << blocks;
     }
   }
 
-  // Zero tokens is a no-op on both paths rather than a zero-sized grid, which
-  // the runtime rejects.
   EXPECT_EQ(tqh::PlanReshapeAndCache(0, kAiv).block_dim, 0u);
   EXPECT_EQ(tqh::PlanPagedAttention(0, kNumHeads, kHeadSize, 4, kAiv).split_block_dim, 0u);
 }
-
-// ---------------------------------------------------------------------------
-// The kernels themselves
-// ---------------------------------------------------------------------------
 
 TEST(TurboQuantKernels, ReshapeAndCacheMatchesTheCpuReference) {
   REQUIRE_ASCEND_950PR();
@@ -560,9 +448,6 @@ TEST(TurboQuantKernels, ReshapeAndCacheMatchesTheCpuReference) {
 TEST(TurboQuantKernels, ReshapeAndCacheLeavesNegativeSlotsUntouched) {
   REQUIRE_ASCEND_950PR();
 
-  // A -1 slot is how the scheduler marks a padded token. The kernel must skip
-  // it entirely - not write zeros, not write the quantised value somewhere
-  // else - or a padded step would corrupt whatever block id -1 aliases to.
   Scenario scenario = MakeScenario(0x13572468u);
   const int kSkipped = 5;
   const int32_t skipped_slot = scenario.slots[kSkipped];
@@ -575,8 +460,6 @@ TEST(TurboQuantKernels, ReshapeAndCacheLeavesNegativeSlotsUntouched) {
   std::vector<float> reference_scales;
   ReferenceWritePath(scenario, &reference_key, &reference_value, &reference_scales);
 
-  // Both caches start zeroed and the reference skips the same token, so the
-  // slot that -1 replaced must still be all zero on the device.
   const std::vector<int8_t> device_key = device.KeyCache();
   const size_t packed_stride = static_cast<size_t>(kHeadSize / tq::kPackFactor);
   for (int kv_head = 0; kv_head < kNumKvHeads; ++kv_head) {
@@ -597,9 +480,6 @@ TEST(TurboQuantKernels, PagedAttentionMatchesTheCpuReference) {
   const Scenario scenario = MakeScenario(0x0BADC0DEu);
   DeviceScenario device(scenario, AscendTestEnvironment::Instance().stream());
 
-  // The decode has to read what the write path wrote, not a separately built
-  // cache: that is what makes this a test of the pipeline rather than of two
-  // kernels that happen to agree with the same reference.
   device.RunWritePath();
   device.RunDecode(scenario.blocks_per_seq);
 
@@ -625,15 +505,10 @@ TEST(TurboQuantKernels, PagedAttentionMatchesTheCpuReference) {
               metrics.cosine_similarity, metrics.snr_db, metrics.relative_l2,
               static_cast<long long>(device.aiv_num()), device.aiv_queried() ? "" : ", assumed");
 
-  // The kernel keeps the accumulator in fp32 and rounds once, at the store --
-  // in the rotated basis now, before the host un-rotates. Pi is orthogonal, so
-  // that rounding error keeps its norm through the un-rotation, and the two
-  // still differ only by the fp16 output quantisation and by the order the
-  // online softmax visits blocks.
   EXPECT_GT(metrics.cosine_similarity, 0.9995) << "the decode kernel disagrees with the reference in direction, "
                                                   "which fp16 rounding of the output cannot cause";
   EXPECT_LT(metrics.relative_l2, 5e-3) << "the decode kernel disagrees with the reference in magnitude";
 }
 
-}  // namespace test
-}  // namespace vllm_ascend
+}
+}

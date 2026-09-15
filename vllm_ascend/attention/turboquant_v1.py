@@ -61,39 +61,14 @@ from vllm_ascend.attention.attention_v1 import (
 from vllm_ascend.attention.turboquant_rotation import output_rotation_is_folded, turboquant_pi_signs
 from vllm_ascend.attention.utils import notify_kv_cache_written
 
-# Two 4-bit codes per byte.
 TURBOQUANT_PACK_FACTOR = 2
 
-# fp32 lanes in one 32-byte burst.
 TURBOQUANT_BURST_FLOATS = 8
 
-# Rows of a paged block the decode kernel handles per tile.  Must match
-# kTileRows in csrc/attention/turboquant/turboquant_kernels.cpp: the codec's
-# shuffle tables are sized for that batch, and the kernel asserts the length.
 TURBOQUANT_TILE_ROWS = 16
 
-# Reconstruction levels of the codec, and so the length of the centroid table
-# the constant-table image carries.  Mirrors TurboQuantCodec<4>::kLevels.
 TURBOQUANT_LEVELS = 16
 
-# The 16-level Lloyd-Max quantiser for N(0, 1): the fixed point of
-#
-#     t_i = (c_{i-1} + c_i) / 2,     c_i = E[X | t_i < X < t_{i+1}],
-#
-# solved with the closed-form truncated-Gaussian moments and symmetrised
-# exactly.  Its distortion E[(X - Q(X))^2] is 0.0095010080, i.e. 20.222 dB,
-# against 0.01388 for the uniform mid-rise grid it replaced.
-#
-# The rotation is what earns the table: Pi drives the coordinates of a KV vector
-# to very nearly i.i.d. N(0, 1) -- measured |excess kurtosis| < 0.12 at every
-# full-attention layer of Qwen3.5-2B -- which is precisely the distribution
-# these levels are optimal for.  The matching scale is therefore the RMS
-# ||v||_2 / sqrt(d) rather than an absmax, which sizes its step off a single
-# outlier and leaves the bulk of the coordinates crushed.
-#
-# Byte-identical to TurboQuantCodec<4>::Threshold() and kLloydMaxCentroids in
-# csrc/tests/reference/turbo_quant_cpu.h.  Re-derivable with
-# scripts/tq_kv_quant_reference.py::lloyd_max_gaussian_table().
 TURBOQUANT_LLOYD_MAX_CENTROIDS = (
     -2.7325895709951710, -2.0690172265313920, -1.6180463860218863, -1.2562311973471796,
     -0.9423404564869651, -0.6567591185324659, -0.3880482994902919, -0.1283950298511473,
@@ -101,9 +76,6 @@ TURBOQUANT_LLOYD_MAX_CENTROIDS = (
     1.2562311973471796, 1.6180463860218863, 2.0690172265313920, 2.7325895709951710,
 )
 
-# The 15 interior decision boundaries, t_i = (c_{i-1} + c_i) / 2 exactly.  The
-# device holds these as Adds immediates rather than in UB -- they are the same
-# on every launch, so a UB copy would buy nothing and cost fifteen scalar loads.
 TURBOQUANT_LLOYD_MAX_THRESHOLDS = (
     -2.4008033987632817, -1.8435318062766393, -1.4371387916845330, -1.0992858269170722,
     -0.7995497875097155, -0.5224037090113789, -0.2582216646707196, 0.0,
@@ -114,13 +86,8 @@ TURBOQUANT_LLOYD_MAX_THRESHOLDS = (
 _CODEC_TABLE_CACHE: dict[tuple[int, int, str], torch.Tensor] = {}
 _HADAMARD16_CACHE: dict[str, torch.Tensor] = {}
 
-# Order of the constant matrix the Cube rotation path multiplies by, and the
-# Cube's fractal quantum. Mirrors kRotateQTile in
-# csrc/attention/turboquant/turboquant_rotate_q.h.
 TURBOQUANT_ROTATE_TILE = 16
 
-# Distinct decode shapes whose workspace size is remembered before the memo is
-# dropped; see AscendTurboQuantAttentionBackendImpl._decode_workspace.
 _WORKSPACE_MEMO_LIMIT = 1024
 
 
@@ -212,7 +179,7 @@ def turboquant_codec_tables(head_size: int, batch_rows: int, device: torch.devic
     if cached is not None:
         return cached
 
-    word = 4  # bytes per Gather offset unit
+    word = 4
     channels = torch.arange(head_size, dtype=torch.int64)
     parts: list[torch.Tensor] = []
     for stage in range(3):
@@ -253,7 +220,6 @@ class AscendTurboQuantAttentionBackend(AscendAttentionBackend):
 
     @classmethod
     def supports_pcp(cls) -> bool:
-        # Prefill context parallelism is owned by the dense GQA implementation.
         return False
 
     @staticmethod
@@ -264,8 +230,6 @@ class AscendTurboQuantAttentionBackend(AscendAttentionBackend):
         head_size: int,
         cache_dtype_str: str = "",
     ) -> tuple[int, ...]:
-        # Contiguous ND, two 4-bit codes per byte.  Deliberately not a 5D NZ
-        # view: the kernels address the cache as flat bytes.
         return (2, num_blocks, block_size, num_kv_heads, head_size // TURBOQUANT_PACK_FACTOR)
 
     @staticmethod
@@ -290,30 +254,14 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         super().__init__(*args, **kwargs)
         self.scale_cache: torch.Tensor | None = None
         self._pi_signs: torch.Tensor | None = None
-        # Scratch for the decode split/combine reduction, grown to a high-water
-        # mark and then reused forever; see _decode_workspace.
         self.decode_workspace: torch.Tensor | None = None
         self._workspace_floats: dict[tuple[int, int], int] = {}
-        # fp32 [num_tokens, num_heads, head_size] landing buffer for the
-        # pre-rotated query, grown to a high-water mark like the workspace above
-        # and for the same reason; see _rotated_query.
         self.rotated_query: torch.Tensor | None = None
         self._hadamard16: torch.Tensor | None = None
-        # Whether this layer's o_proj carries Pi, i.e. consumes the rotated
-        # basis. False unless the checkpoint says otherwise, because False is
-        # correct for every model and True is only correct for a folded one;
-        # activate_turboquant_backend reads the checkpoint's marker.
         self.output_rotation_folded = False
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
-        # q_proj, k_proj and v_proj stay exactly as loaded, which is what keeps
-        # RoPE correct. o_proj is either as loaded or was folded OFFLINE, before
-        # the checkpoint was written; nothing is rewritten here.
         super().process_weights_after_loading(act_dtype)
-        # Prime the C++ device registry while we are still loading. The vector
-        # core count is what sizes both kernels' grids, and the driver query
-        # behind it is only ever paid on this first call -- here, rather than on
-        # a decode step or, worse, inside a graph capture.
         torch.ops._C_ascend.npu_turboquant_vector_core_num()
         logger.info_once(
             "[vllm-ascend/turboquant] 4-bit KV cache active; Pi is applied at runtime to K/V on the write path and "
@@ -364,8 +312,6 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         if self.key_cache is None:
             self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
         if self.kv_sharing_target_layer_name is not None:
-            # KV-sharing layers consume another layer's cache; writing here
-            # would overwrite shared slots.
             if self.is_kv_producer:
                 attn_metadata.reshape_cache_event.record()
             return query, key, value, output
@@ -375,8 +321,6 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
         slots = attn_metadata.slot_mapping if encoder_decoder else attn_metadata.slot_mapping[:num_actual_tokens]
 
-        # Post-RoPE key and raw projection value, straight through: the kernel
-        # applies Pi and quantises, nothing is pre-rotated on the host.
         torch.ops._C_ascend.npu_turboquant_reshape_and_cache(
             key if encoder_decoder else key[:num_actual_tokens],
             value if encoder_decoder else value[:num_actual_tokens],
@@ -414,11 +358,6 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         needed = self._workspace_floats.get(key)
         if needed is None:
             if len(self._workspace_floats) >= _WORKSPACE_MEMO_LIMIT:
-                # A memo, not a table. Captured runs reuse a handful of shapes
-                # forever, but an uncaptured one drifts through new
-                # max_blocks_per_seq as sequences grow, and a dict that only
-                # ever grows is a slow leak. Dropping it costs one operator
-                # dispatch per shape afterwards.
                 self._workspace_floats.clear()
             needed = int(
                 torch.ops._C_ascend.npu_turboquant_workspace_size(
@@ -432,15 +371,6 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             return workspace
 
         if _is_capturing():
-            # Replacing the buffer mid-capture would bake a pointer into the
-            # graph that nothing owns by the time it replays.  What keeps this
-            # from firing is that vLLM warms every capture size up with
-            # capturing unset before it captures that size, so the buffer has
-            # already grown by the time the capture runs.  Note it is the warmup
-            # and not the capture order that saves us: the requirement is not
-            # monotonic in num_tokens -- a small batch leaves cores idle, which
-            # raises num_splits and can need *more* scratch than a large one --
-            # so capturing widest-first would not on its own be enough.
             raise RuntimeError(
                 "[vllm-ascend/turboquant] the decode workspace would have to grow to "
                 f"{needed} float32 words during a graph capture "
@@ -489,25 +419,6 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
         num_tokens = query.shape[0]
-        # Post-RoPE query.  Three launches, ordered by the stream, and a fourth
-        # for a layer whose o_proj was not folded.
-        #
-        #   1. rotate_q writes q~ = Pi q, once per (token, head).  It used to
-        #      live inside the split kernel, which ran it once per
-        #      (token, kv_head, sequence split) and again per query head -- so
-        #      at eight sequence splits the same transform ran eight times over.
-        #   2. the split stage runs softmax and the value accumulation in the
-        #      rotated basis and writes per-sequence-split partials into the
-        #      persistent workspace.  It applies no rotation at all.
-        #   3. the combine stage reduces them and writes O~, still rotated.  It
-        #      used to apply Pi on the way out; that now lives in o_proj's weights.
-        #   4. only when o_proj is NOT folded: rotate_q again, on the output.  Pi
-        #      is an involution, so the same launch that rotated the query is the
-        #      inverse here, and O = Pi O~ is written back over the output.
-        #
-        # 2 and 3 are separate launches because no in-kernel barrier orders an
-        # arbitrary grid; 1 and 4 are separate for the same reason, and because
-        # their grid is a function of B * H_Q rather than of the paging.
         rotated_query = self._rotated_query(num_tokens, query.device)
         torch.ops._C_ascend.npu_turboquant_rotate_q(
             query[:num_tokens],
@@ -533,12 +444,6 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             attention_output,
         )
         if not self.output_rotation_folded:
-            # The landing buffer is the rotated query's own: the split launched
-            # above has already consumed it by the time this launch writes it,
-            # and stream order is what guarantees that, exactly as it orders the
-            # split against the combine. Reusing it keeps a second
-            # [num_tokens, num_heads, head_size] high-water buffer -- and a second
-            # way to grow during a capture -- off the decode path.
             torch.ops._C_ascend.npu_turboquant_rotate_q(
                 attention_output,
                 self.pi_signs(query.device),
@@ -669,9 +574,6 @@ def activate_turboquant_backend(layer: torch.nn.Module) -> None:
     layer.kv_cache_torch_dtype = torch.int8
     impl = getattr(layer, "impl", None)
     if impl is not None:
-        # __init__ does not run on a class swap, so every attribute it would
-        # have set is set here -- a missing one is an AttributeError on the
-        # first decode, not at load.
         impl.__class__ = AscendTurboQuantAttentionBackendImpl
         impl.scale_cache = None
         impl._pi_signs = None
