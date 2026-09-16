@@ -109,30 +109,36 @@ ReshapeAndCacheGrid PlanReshapeAndCache(int64_t num_tokens, int64_t aiv_num) {
 }
 
 PagedAttentionGrid PlanPagedAttention(int64_t num_tokens, int64_t num_heads, int64_t head_size,
-                                      int64_t max_blocks_per_seq, int64_t aiv_num) {
+                                      int64_t max_blocks_per_seq, int64_t block_size, int64_t aiv_num,
+                                      int64_t fused_context_limit) {
   PagedAttentionGrid grid;
   if (num_tokens <= 0 || num_heads <= 0) {
     return grid;
   }
 
   const int64_t base_tasks = num_tokens * num_heads;
+  const int64_t blocks = std::max<int64_t>(1, max_blocks_per_seq);
+  const int64_t context_bound = blocks * block_size;
 
-  int64_t num_splits = CeilDiv(aiv_num, base_tasks);
-  num_splits = std::min(num_splits, std::min<int64_t>(kMaxSequenceSplits, std::max<int64_t>(1, max_blocks_per_seq)));
-  num_splits = std::max<int64_t>(num_splits, 1);
+  int64_t num_splits = 1;
+  if (context_bound > fused_context_limit) {
+    const int64_t by_context =
+        fused_context_limit > 0 ? CeilDiv(context_bound, fused_context_limit) : kMaxSequenceSplits;
+    num_splits = std::max(CeilDiv(aiv_num, base_tasks), by_context);
+    num_splits = std::min(num_splits, std::min<int64_t>(kMaxSequenceSplits, blocks));
+  }
   grid.num_splits = num_splits;
-
-  const int64_t partial_stride = head_size + kPartialTail;
-  grid.workspace_floats = static_cast<size_t>(base_tasks * num_splits * partial_stride);
 
   const int64_t split_tasks = base_tasks * num_splits;
   const int64_t split_tasks_per_core = CeilDiv(split_tasks, aiv_num);
-  const int64_t combine_tasks_per_core = CeilDiv(base_tasks, aiv_num);
+  const int64_t block_dim = CeilDiv(split_tasks, split_tasks_per_core);
 
+  grid.block_dim = static_cast<uint32_t>(block_dim);
   grid.split_tasks_per_core = static_cast<uint32_t>(split_tasks_per_core);
-  grid.combine_tasks_per_core = static_cast<uint32_t>(combine_tasks_per_core);
-  grid.split_block_dim = static_cast<uint32_t>(CeilDiv(split_tasks, split_tasks_per_core));
-  grid.combine_block_dim = static_cast<uint32_t>(CeilDiv(base_tasks, combine_tasks_per_core));
+  if (num_splits > 1) {
+    grid.reduce_tasks_per_core = static_cast<uint32_t>(CeilDiv(base_tasks, block_dim));
+    grid.workspace_floats = static_cast<size_t>(split_tasks * (head_size + kPartialTail));
+  }
   return grid;
 }
 
@@ -286,6 +292,52 @@ CubeDecodeGrid PlanCubeDecode(int64_t num_tokens, int64_t num_heads, int64_t num
   return grid;
 }
 
+FusedDecodeGrid PlanFusedDecode(int64_t num_tokens, int64_t num_heads, int64_t num_kv_heads, int64_t head_size,
+                                int64_t max_blocks_per_seq, int64_t block_size, int64_t aiv_num,
+                                int64_t fused_context_limit) {
+  FusedDecodeGrid grid;
+  if (num_tokens <= 0 || num_heads <= 0 || num_kv_heads <= 0) {
+    return grid;
+  }
+
+  const int64_t mix_blocks = std::max<int64_t>(1, aiv_num / kVectorSubcoresPerBlock);
+  const int64_t group = num_heads / num_kv_heads;
+  const int64_t blocks = std::max<int64_t>(1, max_blocks_per_seq);
+  const int64_t context_bound = blocks * block_size;
+
+  int64_t num_splits = 1;
+  if (context_bound > fused_context_limit) {
+    const int64_t by_context =
+        fused_context_limit > 0 ? CeilDiv(context_bound, fused_context_limit) : kMaxSequenceSplits;
+    num_splits = std::max(CeilDiv(mix_blocks, num_tokens * num_kv_heads), by_context);
+    num_splits = std::min(num_splits, std::min<int64_t>(kMaxSequenceSplits, blocks));
+  }
+  grid.num_splits = num_splits;
+
+  const int64_t groups = num_tokens * num_kv_heads * num_splits;
+  int64_t heads_per_task = 1;
+  if (group > 1) {
+    const int64_t fewest_chunks = CeilDiv(group, kCubeTileM);
+    const int64_t most_chunks = CeilDiv(group, kVectorSubcoresPerBlock);
+    const int64_t chunks = std::min(std::max(CeilDiv(mix_blocks, groups), fewest_chunks), most_chunks);
+    heads_per_task = CeilDiv(group, chunks);
+  }
+  grid.heads_per_task = static_cast<uint32_t>(heads_per_task);
+
+  const int64_t tasks = groups * CeilDiv(group, heads_per_task);
+  const int64_t tasks_per_block = CeilDiv(tasks, mix_blocks);
+  const int64_t block_dim = CeilDiv(tasks, tasks_per_block);
+  grid.num_tasks = tasks;
+  grid.tasks_per_block = static_cast<uint32_t>(tasks_per_block);
+  grid.block_dim = static_cast<uint32_t>(block_dim);
+  if (num_splits > 1) {
+    const int64_t reduce_tasks = num_tokens * num_heads;
+    grid.reduce_tasks_per_block = static_cast<uint32_t>(CeilDiv(reduce_tasks, block_dim));
+    grid.workspace_floats = static_cast<size_t>(reduce_tasks * num_splits * (head_size + kPartialTail));
+  }
+  return grid;
+}
+
 std::vector<float> UnrotateHeads(std::vector<float> rotated, int64_t head_size) {
   const std::vector<int8_t> signs = tq::cpu_pi_sign_vector(static_cast<int>(head_size));
   const size_t row = static_cast<size_t>(head_size);
@@ -302,9 +354,9 @@ CombineUbFootprint PlanCombineUb(int64_t head_size, int64_t scalar_bytes) {
 
   CombineUbFootprint ub;
   ub.out_queue = d * static_cast<size_t>(scalar_bytes);
-  ub.accumulators = 2 * d * kFloat;
+  ub.accumulators = (2 * d + static_cast<size_t>(kPartialTail)) * kFloat;
   ub.state = 5 * static_cast<size_t>(kFp32PerBlock) * kFloat;
-  ub.partial = static_cast<size_t>(kPartialTail) * kFloat;
+  ub.partial = 0;
   ub.broadcast = 4 * kBrcbDstLanes * kFloat;
 
   ub.unrotation_codec_tables = static_cast<size_t>(CodecTableWords(head_size, kTileRows)) * sizeof(int32_t);
@@ -323,14 +375,14 @@ std::vector<uint16_t> Hadamard16Half() {
 vllm_ascend::turboquant::RotateQPlan RotateQuery(void *stream, AscendType type, void *query, void *pi_signs,
                                                  void *h16, void *rot_tables, void *query_rot, int64_t num_tokens,
                                                  int64_t num_heads, int64_t head_size, int64_t aiv_num,
-                                                 bool input_exact_in_half) {
+                                                 vllm_ascend::turboquant::RotateQPrecision precision) {
   int64_t core_num = aiv_num / 2;
   if (core_num < 1) {
     core_num = 1;
   }
   const int64_t num_vectors = num_tokens * num_heads;
   const vllm_ascend::turboquant::RotateQPlan plan =
-      vllm_ascend::turboquant::PlanRotateQ(num_vectors, head_size, core_num, input_exact_in_half);
+      vllm_ascend::turboquant::PlanRotateQ(num_tokens, num_vectors, head_size, core_num, precision);
   const float inv_sqrt_len = 1.0f / std::sqrt(static_cast<float>(head_size));
   turboquant_rotate_q_impl(type, stream, plan.block_dim, plan.use_cube, query, pi_signs, h16, rot_tables, query_rot,
                            static_cast<uint32_t>(num_vectors), static_cast<uint32_t>(head_size),

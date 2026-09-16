@@ -62,6 +62,9 @@ set(VLLM_ASCEND_SIM_TESTS
   test_sim_950pr_turboquant_rotate_q
   test_sim_950pr_turboquant_kernels
   test_sim_950pr_turboquant_decode
+  # The fused single-launch Cube decode against the legacy split + combine, one
+  # kv4fp8 tile at D = 256: bit parity, no sentinel left, no exception dump.
+  test_sim_950pr_turboquant_fused
   # Single-shot dispatch + fidelity smoke of the Cube-native multi-mode decode.
   # One pass per mode at S = 16; see the file header for why it must stay one.
   test_sim_950pr_turboquant_multimode

@@ -29,9 +29,16 @@ constexpr int64_t kRotateQMaxChunkElements = 4096;
 constexpr uint16_t kRotateQHalfOne = 0x3C00;
 constexpr uint16_t kRotateQHalfMinusOne = 0xBC00;
 
+constexpr int64_t kRotateQMinCubeTokens = 2;
+
 enum RotateQVariant : uint32_t {
     kHiLo = 0x1u,
     kDualDst = 0x2u,
+};
+
+enum class RotateQPrecision : uint32_t {
+    kSinglePassRint = 0,
+    kHiLoResidual = 1,
 };
 
 struct RotateQPlan {
@@ -42,10 +49,11 @@ struct RotateQPlan {
     uint32_t variant = 0;
 };
 
-inline RotateQPlan PlanRotateQ(int64_t num_vectors, int64_t head_size, int64_t core_num, bool input_exact_in_half)
+inline RotateQPlan PlanRotateQ(int64_t num_tokens, int64_t num_vectors, int64_t head_size, int64_t core_num,
+                               RotateQPrecision precision = RotateQPrecision::kSinglePassRint)
 {
     RotateQPlan plan;
-    if (num_vectors <= 0 || head_size <= 0) {
+    if (num_tokens <= 0 || num_vectors <= 0 || head_size <= 0) {
         return plan;
     }
     if (core_num < 1) {
@@ -53,8 +61,9 @@ inline RotateQPlan PlanRotateQ(int64_t num_vectors, int64_t head_size, int64_t c
     }
 
     const int64_t fits = kRotateQMaxChunkElements / head_size;
+    const bool cube_worth_staging = num_tokens >= kRotateQMinCubeTokens && num_vectors >= core_num;
 
-    if (num_vectors >= kRotateQTile && num_vectors % kRotateQTile == 0 && fits >= 2) {
+    if (cube_worth_staging && num_vectors >= kRotateQTile && num_vectors % kRotateQTile == 0 && fits >= 2) {
         int64_t vectors_per_block = num_vectors;
         for (int64_t tile = kRotateQTile; tile <= num_vectors; tile += kRotateQTile) {
             if (num_vectors % tile != 0) {
@@ -80,7 +89,7 @@ inline RotateQPlan PlanRotateQ(int64_t num_vectors, int64_t head_size, int64_t c
             plan.vectors_per_chunk = static_cast<uint32_t>(vectors_per_chunk);
             plan.block_dim = static_cast<uint32_t>(num_vectors / vectors_per_block);
             plan.variant = static_cast<uint32_t>(kDualDst);
-            if (!input_exact_in_half) {
+            if (precision == RotateQPrecision::kHiLoResidual) {
                 plan.variant |= static_cast<uint32_t>(kHiLo);
             }
             return plan;

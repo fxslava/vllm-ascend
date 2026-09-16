@@ -555,7 +555,7 @@ class Scenario {
           DeviceBuffer::Empty<int8_t>(tqh::PackedCacheBytes(pool_blocks, kBlockSize, hkv, d), kBenchmarkAlignBytes);
       write_tables_ = DeviceBuffer::FromHost(tqh::CodecTables(d, 1), kBenchmarkAlignBytes);
       decode_tables_ = DeviceBuffer::FromHost(tqh::CodecTables(d, tqh::kTileRows), kBenchmarkAlignBytes);
-      aiv_grid_ = tqh::PlanPagedAttention(config.batch, hq, d, blocks_per_seq, aiv_num);
+      aiv_grid_ = tqh::PlanPagedAttention(config.batch, hq, d, blocks_per_seq, kBlockSize, aiv_num);
       num_splits_ = aiv_grid_.num_splits;
       workspace_floats_ = aiv_grid_.workspace_floats;
     }
@@ -614,7 +614,7 @@ class Scenario {
   void EnqueuePrefillRotateQ(aclrtStream stream) const {
     tqh::RotateQuery(stream, AscendType::FP16, query_pf_.get(), pi_signs_.get(), h16_.get(), rot_tables_.get(),
                      query_pf_rot_fp32_.get(), config_.chunk_tokens(), config_.model.num_heads,
-                     config_.model.head_size, aiv_num_, true);
+                     config_.model.head_size, aiv_num_);
   }
 
   void EnqueuePrefillAttnCore(aclrtStream stream) const { fia_prefill_rotated_->Launch(stream); }
@@ -622,7 +622,7 @@ class Scenario {
   void EnqueuePrefillRotateO(aclrtStream stream) const {
     tqh::RotateQuery(stream, AscendType::FP16, out_pf_tq_.get(), pi_signs_.get(), h16_.get(), rot_tables_.get(),
                      out_pf_rot_.get(), config_.chunk_tokens(), config_.model.num_heads, config_.model.head_size,
-                     aiv_num_, true);
+                     aiv_num_);
   }
 
   void EnqueuePrefillE2E(aclrtStream stream) const {
@@ -639,7 +639,7 @@ class Scenario {
   void EnqueueDecodeRotateQ(aclrtStream stream) const {
     tqh::RotateQuery(stream, AscendType::FP16, query_dec_.get(), pi_signs_.get(), h16_.get(), rot_tables_.get(),
                      query_dec_rot_.get(), config_.batch, config_.model.num_heads, config_.model.head_size,
-                     aiv_num_, true);
+                     aiv_num_);
   }
 
   void EnqueueDecodeSplit(aclrtStream stream) const {
@@ -654,14 +654,11 @@ class Scenario {
   }
 
   void EnqueueDecodeCombine(aclrtStream stream) const {
-    const uint32_t block_dim =
-        config_.path == PathMode::kCube ? cube_grid_.combine_block_dim : aiv_grid_.combine_block_dim;
-    const uint32_t tasks =
-        config_.path == PathMode::kCube ? cube_grid_.combine_tasks_per_core : aiv_grid_.combine_tasks_per_core;
     turboquant_paged_attention_combine_impl(
-        AscendType::FP16, stream, block_dim, workspace_.get(), out_dec_tq_.get(),
+        AscendType::FP16, stream, cube_grid_.combine_block_dim, workspace_.get(), out_dec_tq_.get(),
         static_cast<uint32_t>(config_.batch), static_cast<uint32_t>(config_.model.num_heads),
-        static_cast<uint32_t>(config_.model.head_size), static_cast<uint32_t>(num_splits_), tasks);
+        static_cast<uint32_t>(config_.model.head_size), static_cast<uint32_t>(num_splits_),
+        cube_grid_.combine_tasks_per_core);
   }
 
   void EnqueueDecodeAttnCore(aclrtStream stream) const {
@@ -671,20 +668,18 @@ class Scenario {
       return;
     }
     turboquant_paged_attention_impl(
-        AscendType::FP16, stream, aiv_grid_.split_block_dim, aiv_grid_.combine_block_dim, query_dec_rot_.get(),
-        key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
-        decode_tables_.get(), workspace_.get(), out_dec_tq_.get(), static_cast<uint32_t>(config_.batch),
-        static_cast<uint32_t>(config_.model.num_heads), static_cast<uint32_t>(config_.model.num_kv_heads),
-        static_cast<uint32_t>(config_.model.head_size), static_cast<uint32_t>(kBlockSize),
-        static_cast<uint32_t>(config_.blocks_per_seq()), static_cast<uint32_t>(aiv_grid_.num_splits),
-        aiv_grid_.split_tasks_per_core, aiv_grid_.combine_tasks_per_core, config_.attention_scale(),
-        config_.attention_scale());
+        AscendType::FP16, stream, aiv_grid_.block_dim, query_dec_rot_.get(), key_cache_.get(), value_cache_.get(),
+        scale_plane_.get(), block_tables_.get(), context_lens_.get(), decode_tables_.get(), workspace_.get(),
+        out_dec_tq_.get(), static_cast<uint32_t>(config_.batch), static_cast<uint32_t>(config_.model.num_heads),
+        static_cast<uint32_t>(config_.model.num_kv_heads), static_cast<uint32_t>(config_.model.head_size),
+        static_cast<uint32_t>(kBlockSize), static_cast<uint32_t>(config_.blocks_per_seq()),
+        static_cast<uint32_t>(aiv_grid_.num_splits), aiv_grid_.split_tasks_per_core, aiv_grid_.reduce_tasks_per_core,
+        static_cast<uint32_t>(tqh::kFusedContextLimit), config_.attention_scale(), config_.attention_scale());
   }
 
   void EnqueueDecodeRotateO(aclrtStream stream) const {
     tqh::RotateQuery(stream, AscendType::FP16, out_dec_tq_.get(), pi_signs_.get(), h16_.get(), rot_tables_.get(),
-                     out_dec_rot_.get(), config_.batch, config_.model.num_heads, config_.model.head_size, aiv_num_,
-                     true);
+                     out_dec_rot_.get(), config_.batch, config_.model.num_heads, config_.model.head_size, aiv_num_);
   }
 
   void EnqueueDecodeE2E(aclrtStream stream) const {
@@ -722,11 +717,9 @@ class Scenario {
   const std::string& native_write_note() const { return native_write_note_; }
   int64_t num_splits() const { return num_splits_; }
   uint32_t split_block_dim() const {
-    return config_.path == PathMode::kCube ? cube_grid_.split_block_dim : aiv_grid_.split_block_dim;
+    return config_.path == PathMode::kCube ? cube_grid_.split_block_dim : aiv_grid_.block_dim;
   }
-  uint32_t combine_block_dim() const {
-    return config_.path == PathMode::kCube ? cube_grid_.combine_block_dim : aiv_grid_.combine_block_dim;
-  }
+  uint32_t combine_block_dim() const { return config_.path == PathMode::kCube ? cube_grid_.combine_block_dim : 0u; }
 
   double ScaleChecksum() const { return ChecksumSum(LeadingElements<float>(scale_plane_)); }
   double WorkspaceChecksum() const { return ChecksumSum(LeadingElements<float>(workspace_)); }
@@ -1666,7 +1659,7 @@ void BuildSuite(BenchmarkRunner& primary) {
                                   config.model.head_size, config.blocks_per_seq(), aiv_num)
                   .num_splits
             : tqh::PlanPagedAttention(config.batch, config.model.num_heads, config.model.head_size,
-                                      config.blocks_per_seq(), aiv_num)
+                                      config.blocks_per_seq(), kBlockSize, aiv_num)
                   .num_splits;
     traffic.push_back(ModelTraffic(config, planned_splits));
 

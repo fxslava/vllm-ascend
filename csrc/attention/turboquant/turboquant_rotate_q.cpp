@@ -22,9 +22,10 @@
 
 namespace {
 
-using vllm_ascend::turboquant::kFp32PerBlock;
 using vllm_ascend::turboquant::kRotateQTile;
+using vllm_ascend::turboquant::RepeatButterfly;
 using vllm_ascend::turboquant::RotateQVariant;
+using vllm_ascend::turboquant::VecBarrier;
 
 using TurboQuantCodec4 = vllm_ascend::turboquant::TurboQuantCodec<4>;
 
@@ -32,7 +33,7 @@ constexpr uint32_t kHalfC0 = 16;
 
 constexpr uint32_t kResidualFirstStride = kRotateQTile;
 
-constexpr uint32_t kMaxRepeat = 255;
+constexpr bool kRotateQVecBarriers = false;
 
 constexpr uint16_t kFlagOperandsReady = 0;
 constexpr uint16_t kFlagOperandsFree = 2;
@@ -74,25 +75,7 @@ __aicore__ inline void SyncEvent()
 __aicore__ inline void BlockButterfly(const AscendC::LocalTensor<float> &dst,
                                       const AscendC::LocalTensor<float> &src, uint32_t stride, uint32_t count)
 {
-    const uint32_t groups = count / (2 * stride);
-    constexpr uint32_t kFp32PerRepeat = 64;
-    if (stride > kFp32PerRepeat) {
-        for (uint32_t g = 0; g < groups; ++g) {
-            const uint32_t base = g * 2 * stride;
-            AscendC::Add(dst[base], src[base], src[base + stride], stride);
-            AscendC::Sub(dst[base + stride], src[base], src[base + stride], stride);
-        }
-        return;
-    }
-    const uint8_t rep = static_cast<uint8_t>(2 * stride / kFp32PerBlock);
-    const AscendC::BinaryRepeatParams params{1, 1, 1, rep, rep, rep};
-    const uint64_t mask = static_cast<uint64_t>(stride);
-    for (uint32_t done = 0; done < groups; done += kMaxRepeat) {
-        const uint32_t batch = (groups - done) < kMaxRepeat ? (groups - done) : kMaxRepeat;
-        const uint32_t base = done * 2 * stride;
-        AscendC::Add(dst[base], src[base], src[base + stride], mask, static_cast<uint8_t>(batch), params);
-        AscendC::Sub(dst[base + stride], src[base], src[base + stride], mask, static_cast<uint8_t>(batch), params);
-    }
+    RepeatButterfly(dst, src, stride, count / (2 * stride));
 }
 
 template <typename scalar_t>
@@ -135,13 +118,17 @@ public:
 
         for (uint32_t slot = 0; slot < kSlots; ++slot) {
             pipe_->InitBuffer(aHi1_[slot], paddedElems_ * sizeof(half));
-            pipe_->InitBuffer(aLo1_[slot], paddedElems_ * sizeof(half));
+            if (HiLo()) {
+                pipe_->InitBuffer(aLo1_[slot], paddedElems_ * sizeof(half));
+            }
         }
         pipe_->InitBuffer(b1_, kRotateQTile * kRotateQTile * sizeof(half));
 
         if ASCEND_IS_AIC {
             pipe_->InitBuffer(a2Hi_, paddedElems_ * sizeof(half));
-            pipe_->InitBuffer(a2Lo_, paddedElems_ * sizeof(half));
+            if (HiLo()) {
+                pipe_->InitBuffer(a2Lo_, paddedElems_ * sizeof(half));
+            }
             pipe_->InitBuffer(b2_, kRotateQTile * kRotateQTile * sizeof(half));
             pipe_->InitBuffer(co1_, paddedElems_ * sizeof(float));
         }
@@ -154,10 +141,15 @@ public:
             pipe_->InitBuffer(prodBuf_[slot], chunkElems_ * sizeof(float));
             pipe_->InitBuffer(tmpBuf_[slot], paddedElems_ * sizeof(float));
         }
+        pipe_->InitBuffer(scaledSignBuf_, headSize_ * sizeof(float));
 
         AscendC::LocalTensor<float> signs = signBuf_.Get<float>();
         AscendC::DataCopy(signs, piSignsGm_, headSize_);
         AscendC::PipeBarrier<PIPE_ALL>();
+        if ASCEND_IS_AIV {
+            AscendC::Muls(scaledSignBuf_.Get<float>(), signs, invSqrtLen_, headSize_);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
     }
 
     __aicore__ inline void Process()
@@ -229,6 +221,8 @@ private:
         AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(static_cast<uint16_t>(kFlagProductFree + slot));
     }
 
+    __aicore__ inline bool HiLo() const { return (variant_ & RotateQVariant::kHiLo) != 0; }
+
     __aicore__ inline bool DualDst() const
     {
         return (variant_ & RotateQVariant::kDualDst) != 0 && (vectorsPerChunk_ % 2 == 0);
@@ -258,7 +252,9 @@ private:
         AscendC::LocalTensor<float> tmp = tmpBuf_[slot].Get<float>();
         AscendC::LocalTensor<float> signs = signBuf_.Get<float>();
 
-        SyncEvent<AscendC::HardEvent::V_MTE2>();
+        if (chunk > 0) {
+            SyncEvent<AscendC::HardEvent::V_MTE2>();
+        }
 
         if (!h16Staged_) {
             AscendC::DataCopy(cast, h16Gm_, kRotateQTile * kRotateQTile);
@@ -271,28 +267,26 @@ private:
         AscendC::DataCopy(qIn, queryGm_[base], chunkElems_);
         SyncEvent<AscendC::HardEvent::MTE2_V>();
         AscendC::Cast(in, qIn, AscendC::RoundMode::CAST_NONE, chunkElems_);
-        AscendC::PipeBarrier<PIPE_V>();
-
         if (paddedElems_ > chunkElems_) {
             AscendC::Duplicate(in[chunkElems_], 0.0f, paddedElems_ - chunkElems_);
-            AscendC::PipeBarrier<PIPE_V>();
         }
+        VecBarrier<kRotateQVecBarriers>();
 
         for (uint32_t v = 0; v < vectorsPerChunk_; ++v) {
             AscendC::Mul(in[v * headSize_], in[v * headSize_], signs, headSize_);
         }
-        AscendC::PipeBarrier<PIPE_V>();
+        VecBarrier<kRotateQVecBarriers>();
 
         SyncEvent<AscendC::HardEvent::MTE3_V>();
         AscendC::Cast(cast, in, AscendC::RoundMode::CAST_RINT, paddedElems_);
         SyncVectorToMte3();
         AscendC::DataCopy(aHi1_[slot].Get<half>(), cast, paddedElems_);
 
-        if ((variant_ & RotateQVariant::kHiLo) != 0) {
+        if (HiLo()) {
             AscendC::Cast(tmp, cast, AscendC::RoundMode::CAST_NONE, paddedElems_);
-            AscendC::PipeBarrier<PIPE_V>();
+            VecBarrier<kRotateQVecBarriers>();
             AscendC::Sub(in, in, tmp, paddedElems_);
-            AscendC::PipeBarrier<PIPE_V>();
+            VecBarrier<kRotateQVecBarriers>();
             SyncEvent<AscendC::HardEvent::MTE3_V>();
             AscendC::Cast(cast, in, AscendC::RoundMode::CAST_RINT, paddedElems_);
             SyncVectorToMte3();
@@ -330,7 +324,7 @@ private:
     {
         SyncEvent<AscendC::HardEvent::M_MTE1>();
         LoadA(aHi1_[slot].Get<half>(), a2Hi_.Get<half>());
-        if ((variant_ & RotateQVariant::kHiLo) != 0) {
+        if (HiLo()) {
             LoadA(aLo1_[slot].Get<half>(), a2Lo_.Get<half>());
         }
         LoadB();
@@ -345,7 +339,7 @@ private:
         AscendC::Mmad(acc, a2Hi_.Get<half>(), b2_.Get<half>(),
                       AscendC::MmadParams(static_cast<uint16_t>(chunkRows_), static_cast<uint16_t>(kRotateQTile),
                                           static_cast<uint16_t>(kRotateQTile), 0, false, true));
-        if ((variant_ & RotateQVariant::kHiLo) != 0) {
+        if (HiLo()) {
             AscendC::Mmad(acc, a2Lo_.Get<half>(), b2_.Get<half>(),
                           AscendC::MmadParams(static_cast<uint16_t>(chunkRows_), static_cast<uint16_t>(kRotateQTile),
                                               static_cast<uint16_t>(kRotateQTile), 0, false, false));
@@ -373,7 +367,7 @@ private:
         const uint32_t count = mine * headSize_;
         AscendC::LocalTensor<float> src = prodBuf_[slot].Get<float>();
         AscendC::LocalTensor<float> dst = tmpBuf_[slot].Get<float>();
-        AscendC::LocalTensor<float> signs = signBuf_.Get<float>();
+        AscendC::LocalTensor<float> scaledSigns = scaledSignBuf_.Get<float>();
 
         for (uint32_t stride = kResidualFirstStride; stride < headSize_; stride <<= 1) {
             BlockButterfly(dst, src, stride, count);
@@ -383,11 +377,8 @@ private:
             dst = hold;
         }
 
-        AscendC::Muls(src, src, invSqrtLen_, count);
-        AscendC::PipeBarrier<PIPE_V>();
-
         for (uint32_t v = 0; v < mine; ++v) {
-            AscendC::Mul(src[v * headSize_], src[v * headSize_], signs, headSize_);
+            AscendC::Mul(src[v * headSize_], src[v * headSize_], scaledSigns, headSize_);
         }
 
         SyncVectorToMte3();
@@ -410,6 +401,7 @@ private:
     AscendC::TBuf<AscendC::QuePosition::VECCALC> signBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> prodBuf_[kSlots];
     AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpBuf_[kSlots];
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> scaledSignBuf_;
     AscendC::GlobalTensor<scalar_t> queryGm_;
     AscendC::GlobalTensor<float> piSignsGm_;
     AscendC::GlobalTensor<half> h16Gm_;
@@ -489,9 +481,9 @@ private:
         AscendC::DataCopy(qIn, queryGm_[static_cast<uint64_t>(vector) * headSize_], headSize_);
         SyncEvent<AscendC::HardEvent::MTE2_V>();
         AscendC::Cast(x, qIn, AscendC::RoundMode::CAST_NONE, headSize_);
-        AscendC::PipeBarrier<PIPE_V>();
+        VecBarrier<kRotateQVecBarriers>();
 
-        codec_.ApplyPi(x, tmp, signs, static_cast<int>(headSize_));
+        codec_.ApplyPi<kRotateQVecBarriers>(x, tmp, signs, static_cast<int>(headSize_));
 
         SyncVectorToMte3();
         AscendC::DataCopy(queryRotGm_[static_cast<uint64_t>(vector) * headSize_], x, headSize_);

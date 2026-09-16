@@ -222,8 +222,7 @@ ModeRun RunMode(tqm::TurboQuantMode mode, const Shape& shape, aclrtStream stream
   ACL_CHECK(aclrtSynchronizeStream(stream));
 
   run.rotate_plan = tqh::RotateQuery(stream, AscendType::FP16, query_dev.get(), pi_signs.get(), h16.get(),
-                                     rot_tables.get(), query_rot.get(), batch, kNumHeads, kHeadSize, aiv_num,
-                                     true);
+                                     rot_tables.get(), query_rot.get(), batch, kNumHeads, kHeadSize, aiv_num);
 
   turboquant_mm_decode_split_impl(
       static_cast<int32_t>(mode), AscendType::FP16, stream, decode_grid.split_block_dim, query_rot.get(),

@@ -354,7 +354,7 @@ class AblationScenario {
   void RotateQueryOnce(aclrtStream stream) {
     rotate_plan_ = tqh::RotateQuery(stream, AscendType::FP16, query_.get(), pi_signs_.get(), h16_.get(),
                                     rot_tables_.get(), query_rot_.get(), kQueryTokens, kNumHeads, head_size_,
-                                    aiv_num_, true);
+                                    aiv_num_);
     ACL_CHECK(aclrtSynchronizeStream(stream));
   }
 
@@ -579,7 +579,7 @@ class BypassScenario {
 
   void RotateQueryOnce(aclrtStream stream) {
     tqh::RotateQuery(stream, AscendType::FP16, query_.get(), pi_signs_.get(), h16_.get(), rot_tables_.get(),
-                     query_rot_.get(), kQueryTokens, kNumHeads, head_size_, aiv_num_, true);
+                     query_rot_.get(), kQueryTokens, kNumHeads, head_size_, aiv_num_);
     ACL_CHECK(aclrtSynchronizeStream(stream));
     reference_ = HostAttention(head_size_, context_len_, static_cast<double>(attention_scale_),
                                query_rot_.ToHost<float>(), cache_.key, cache_.value);

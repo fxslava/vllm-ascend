@@ -410,11 +410,17 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         notify_kv_cache_written()
         return query, key, value, output
 
-    def _decode_workspace(self, num_tokens: int, max_blocks_per_seq: int, device: torch.device) -> torch.Tensor:
-        """Return scratch for the decode split/combine stages.
+    def _decode_workspace(
+        self, num_tokens: int, max_blocks_per_seq: int, block_size: int, device: torch.device
+    ) -> torch.Tensor:
+        """Return scratch for the decode's in-launch sequence reduction.
 
-        The split stage writes one partial per (token, head, sequence split) and
-        the combine stage reduces them.  That buffer used to be an ``at::empty``
+        The decode is one launch.  A sequence that fits the fused context limit
+        writes its output directly and needs no scratch at all, so the operator
+        asks for a workspace only when ``max_blocks_per_seq * block_size`` can
+        exceed that limit: those sequences are split, and each split writes one
+        partial per (token, head, split) that the same launch then reduces.
+        That buffer used to be an ``at::empty``
         inside the operator, which put an allocation on every decode step and
         left the operator uncapturable: a graph replays the addresses it was
         captured with, and a fresh allocation each step is a different address.
@@ -422,8 +428,9 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         So the buffer lives here instead, is grown only when a decode needs more
         than any seen before, and is otherwise handed to the kernel unchanged.
         Steady-state decode allocates nothing.  "More" is deliberately not "a
-        bigger batch": a batch small enough to leave cores idle is split further
-        along the sequence, so the peak requirement can sit at a *small* decode.
+        bigger batch": a long-context batch small enough to leave cores idle is
+        split further along the sequence, so the peak requirement can sit at a
+        *small* decode.
 
         The size comes from the operator's own arithmetic rather than a copy of
         it -- the split count depends on the device's vector core count, which
@@ -437,7 +444,7 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
                 self._workspace_floats.clear()
             needed = int(
                 torch.ops._C_ascend.npu_turboquant_workspace_size(
-                    num_tokens, self.num_heads, self.head_size, max_blocks_per_seq
+                    num_tokens, self.num_heads, self.head_size, max_blocks_per_seq, block_size
                 )
             )
             self._workspace_floats[key] = needed
@@ -513,7 +520,7 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             block_tables,
             attn_metadata.seq_lens.to(torch.int32).contiguous(),
             self.codec_tables(query.device, TURBOQUANT_TILE_ROWS),
-            self._decode_workspace(num_tokens, block_tables.shape[1], query.device),
+            self._decode_workspace(num_tokens, block_tables.shape[1], self.key_cache.shape[1], query.device),
             self.num_kv_heads,
             self.num_heads,
             self.scale,

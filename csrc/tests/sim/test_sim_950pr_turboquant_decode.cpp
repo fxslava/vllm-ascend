@@ -55,6 +55,8 @@ constexpr int64_t kQueryTokens = 1;
 constexpr float kAttentionScale = 0.125f;
 constexpr float kInvSqrtHeadSize = 0.125f;
 
+constexpr int64_t kSplitEveryContext = 0;
+
 constexpr double kMinKernelCosine = 0.999;
 constexpr double kMaxKernelRelativeL2 = 5e-3;
 
@@ -185,7 +187,9 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
   DeviceBuffer quantised_out_dev = DeviceBuffer::Empty<Half>(static_cast<size_t>(kQueryTokens * kNumHeads * kHeadSize));
 
   const tqh::PagedAttentionGrid decode_grid =
-      tqh::PlanPagedAttention(kQueryTokens, kNumHeads, kHeadSize, kBlocksPerSeq, aiv_num);
+      tqh::PlanPagedAttention(kQueryTokens, kNumHeads, kHeadSize, kBlocksPerSeq, kBlockSize, aiv_num,
+                              kSplitEveryContext);
+  ASSERT_GT(decode_grid.num_splits, 1) << "this case exists to run the in-launch reduction";
   DeviceBuffer workspace_dev = DeviceBuffer::Empty<float>(decode_grid.workspace_floats);
 
   const tqh::ReshapeAndCacheGrid write_grid = tqh::PlanReshapeAndCache(kContextLen, aiv_num);
@@ -200,16 +204,16 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
 
   const double decode_ms = TimeMs([&] {
     tqh::RotateQuery(stream, AscendType::FP16, query_dev.get(), pi_signs_dev.get(), h16_dev.get(),
-                     write_tables_dev.get(), query_rot_dev.get(), kQueryTokens, kNumHeads, kHeadSize, aiv_num,
-                     true);
+                     write_tables_dev.get(), query_rot_dev.get(), kQueryTokens, kNumHeads, kHeadSize, aiv_num);
     turboquant_paged_attention_impl(
-        AscendType::FP16, stream, decode_grid.split_block_dim, decode_grid.combine_block_dim, query_rot_dev.get(),
-        key_cache_dev.get(), value_cache_dev.get(), scale_plane_dev.get(), block_table_dev.get(),
-        context_lens_dev.get(), decode_tables_dev.get(), workspace_dev.get(),
-        quantised_out_dev.get(), static_cast<uint32_t>(kQueryTokens), static_cast<uint32_t>(kNumHeads),
-        static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kBlockSize),
-        static_cast<uint32_t>(kBlocksPerSeq), static_cast<uint32_t>(decode_grid.num_splits),
-        decode_grid.split_tasks_per_core, decode_grid.combine_tasks_per_core, kAttentionScale, kInvSqrtHeadSize);
+        AscendType::FP16, stream, decode_grid.block_dim, query_rot_dev.get(), key_cache_dev.get(),
+        value_cache_dev.get(), scale_plane_dev.get(), block_table_dev.get(), context_lens_dev.get(),
+        decode_tables_dev.get(), workspace_dev.get(), quantised_out_dev.get(), static_cast<uint32_t>(kQueryTokens),
+        static_cast<uint32_t>(kNumHeads), static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize),
+        static_cast<uint32_t>(kBlockSize), static_cast<uint32_t>(kBlocksPerSeq),
+        static_cast<uint32_t>(decode_grid.num_splits), decode_grid.split_tasks_per_core,
+        decode_grid.reduce_tasks_per_core, static_cast<uint32_t>(kSplitEveryContext), kAttentionScale,
+        kInvSqrtHeadSize);
     ACL_CHECK(aclrtSynchronizeStream(stream));
   });
 
@@ -299,7 +303,7 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
   const tq::FidelityMetrics vs_exact = tq::cpu_fidelity(quantised, exact);
   const tq::FidelityMetrics vs_reference = tq::cpu_fidelity(quantised, reference);
 
-  std::printf("  splits=%lld  write %.2f ms, decode %.2f ms (2 launches)\n",
+  std::printf("  splits=%lld  write %.2f ms, decode %.2f ms (rotate + 1 launch, reduction in-launch)\n",
               static_cast<long long>(decode_grid.num_splits), write_ms, decode_ms);
   PrintMetrics("4-bit NPU vs exact fp32", vs_exact);
   PrintMetrics("4-bit NPU vs CPU TurboQuant reference", vs_reference);

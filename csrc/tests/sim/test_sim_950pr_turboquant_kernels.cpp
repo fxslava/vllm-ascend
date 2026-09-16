@@ -208,22 +208,23 @@ class DeviceScenario {
     ACL_CHECK(aclrtSynchronizeStream(stream_));
   }
 
-  void RunDecode(int blocks_per_seq) {
-    const tqh::PagedAttentionGrid grid =
-        tqh::PlanPagedAttention(kQueryTokens, kNumHeads, kHeadSize, blocks_per_seq, aiv_num_);
+  tqh::PagedAttentionGrid RunDecode(int blocks_per_seq, int64_t fused_context_limit = tqh::kFusedContextLimit) {
+    const tqh::PagedAttentionGrid grid = tqh::PlanPagedAttention(kQueryTokens, kNumHeads, kHeadSize, blocks_per_seq,
+                                                                 kBlockSize, aiv_num_, fused_context_limit);
     workspace_ = DeviceBuffer::Empty<float>(grid.workspace_floats);
 
     tqh::RotateQuery(stream_, AscendType::FP16, query_.get(), pi_signs_.get(), h16_.get(), write_tables_.get(),
-                     query_rot_.get(), kQueryTokens, kNumHeads, kHeadSize, aiv_num_, true);
+                     query_rot_.get(), kQueryTokens, kNumHeads, kHeadSize, aiv_num_);
 
     turboquant_paged_attention_impl(
-        AscendType::FP16, stream_, grid.split_block_dim, grid.combine_block_dim, query_rot_.get(), key_cache_.get(),
-        value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(), decode_tables_.get(),
-        workspace_.get(), out_.get(), static_cast<uint32_t>(kQueryTokens), static_cast<uint32_t>(kNumHeads),
+        AscendType::FP16, stream_, grid.block_dim, query_rot_.get(), key_cache_.get(), value_cache_.get(),
+        scale_plane_.get(), block_tables_.get(), context_lens_.get(), decode_tables_.get(), workspace_.get(),
+        out_.get(), static_cast<uint32_t>(kQueryTokens), static_cast<uint32_t>(kNumHeads),
         static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kBlockSize),
         static_cast<uint32_t>(blocks_per_seq), static_cast<uint32_t>(grid.num_splits), grid.split_tasks_per_core,
-        grid.combine_tasks_per_core, kAttentionScale, kInvSqrtHeadSize);
+        grid.reduce_tasks_per_core, static_cast<uint32_t>(fused_context_limit), kAttentionScale, kInvSqrtHeadSize);
     ACL_CHECK(aclrtSynchronizeStream(stream_));
+    return grid;
   }
 
   std::vector<int8_t> KeyCache() const { return key_cache_.ToHost<int8_t>(); }
@@ -406,25 +407,49 @@ TEST(TurboQuantLaunchContract, GridPlansMatchTheAdapterArithmetic) {
     EXPECT_LE(static_cast<int64_t>(grid.block_dim), kAiv) << "tokens " << tokens;
   }
 
-  for (int64_t tokens : {1, 4, 64}) {
-    for (int64_t blocks : {0, 1, 3, 64}) {
-      const tqh::PagedAttentionGrid grid = tqh::PlanPagedAttention(tokens, kNumHeads, kHeadSize, blocks, kAiv);
-      EXPECT_GE(grid.num_splits, 1) << "tokens " << tokens << " blocks " << blocks;
-      EXPECT_LE(grid.num_splits, tqh::kMaxSequenceSplits) << "tokens " << tokens << " blocks " << blocks;
-      if (blocks > 0) {
-        EXPECT_LE(grid.num_splits, blocks) << "tokens " << tokens << " blocks " << blocks;
+  for (int64_t block_size : {16, 128}) {
+    for (int64_t tokens : {1, 4, 64}) {
+      for (int64_t blocks : {0, 1, 3, 32, 64}) {
+        const tqh::PagedAttentionGrid grid =
+            tqh::PlanPagedAttention(tokens, kNumHeads, kHeadSize, blocks, block_size, kAiv);
+        const std::string where = "tokens " + std::to_string(tokens) + " blocks " + std::to_string(blocks) +
+                                  " block_size " + std::to_string(block_size);
+        const bool fits = std::max<int64_t>(blocks, 1) * block_size <= tqh::kFusedContextLimit;
+        EXPECT_GE(grid.num_splits, 1) << where;
+        EXPECT_LE(grid.num_splits, tqh::kMaxSequenceSplits) << where;
+        if (blocks > 0) {
+          EXPECT_LE(grid.num_splits, blocks) << where;
+        }
+        if (fits) {
+          EXPECT_EQ(grid.num_splits, 1) << where << ": a context that fits the fused limit is never split";
+          EXPECT_EQ(grid.workspace_floats, 0u) << where << ": a fused decode needs no workspace";
+          EXPECT_EQ(grid.reduce_tasks_per_core, 0u) << where;
+        }
+        if (grid.num_splits > 1) {
+          EXPECT_EQ(grid.workspace_floats,
+                    static_cast<size_t>(tokens * kNumHeads * grid.num_splits * (kHeadSize + tqh::kPartialTail)))
+              << where;
+          EXPECT_GE(static_cast<int64_t>(grid.reduce_tasks_per_core) * grid.block_dim, tokens * kNumHeads)
+              << where << ": the in-launch reduction must reach every (token, head)";
+        }
+        EXPECT_GT(grid.block_dim, 0u) << where;
+        EXPECT_GE(static_cast<int64_t>(grid.split_tasks_per_core) * grid.block_dim,
+                  tokens * kNumHeads * grid.num_splits)
+            << where;
+        EXPECT_LE(static_cast<int64_t>(grid.block_dim), kAiv) << where;
       }
-      EXPECT_EQ(grid.workspace_floats,
-                static_cast<size_t>(tokens * kNumHeads * grid.num_splits * (kHeadSize + tqh::kPartialTail)))
-          << "tokens " << tokens << " blocks " << blocks;
-      EXPECT_GT(grid.split_block_dim, 0u) << "tokens " << tokens << " blocks " << blocks;
-      EXPECT_GT(grid.combine_block_dim, 0u) << "tokens " << tokens << " blocks " << blocks;
-      EXPECT_LE(grid.combine_block_dim, grid.split_block_dim) << "tokens " << tokens << " blocks " << blocks;
     }
   }
 
+  const tqh::PagedAttentionGrid long_decode = tqh::PlanPagedAttention(1, kNumHeads, kHeadSize, 64, 128, kAiv);
+  EXPECT_GT(long_decode.num_splits, 1) << "a 8192-token bound must split";
+  EXPECT_GT(long_decode.workspace_floats, 0u);
+
+  const tqh::PagedAttentionGrid forced = tqh::PlanPagedAttention(1, kNumHeads, kHeadSize, 2, 16, kAiv, 0);
+  EXPECT_EQ(forced.num_splits, 2) << "a zero fused limit splits even a short sequence, capped by its blocks";
+
   EXPECT_EQ(tqh::PlanReshapeAndCache(0, kAiv).block_dim, 0u);
-  EXPECT_EQ(tqh::PlanPagedAttention(0, kNumHeads, kHeadSize, 4, kAiv).split_block_dim, 0u);
+  EXPECT_EQ(tqh::PlanPagedAttention(0, kNumHeads, kHeadSize, 4, kBlockSize, kAiv).block_dim, 0u);
 }
 
 TEST(TurboQuantKernels, ReshapeAndCacheMatchesTheCpuReference) {

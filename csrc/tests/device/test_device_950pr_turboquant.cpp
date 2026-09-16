@@ -214,21 +214,21 @@ class DeviceScenario {
 
   void RunDecode() {
     const tqh::PagedAttentionGrid grid =
-        tqh::PlanPagedAttention(kQueryTokens, kNumHeads, kHeadSize, scenario_.blocks_per_seq, aiv_num_);
+        tqh::PlanPagedAttention(kQueryTokens, kNumHeads, kHeadSize, scenario_.blocks_per_seq, kBlockSize, aiv_num_);
     workspace_ = DeviceBuffer::Empty<float>(grid.workspace_floats);
 
     rotate_plan_ =
         tqh::RotateQuery(stream_, AscendType::FP16, query_.get(), pi_signs_.get(), h16_.get(), write_tables_.get(),
-                         query_rot_.get(), kQueryTokens, kNumHeads, kHeadSize, aiv_num_,
-                         true);
+                         query_rot_.get(), kQueryTokens, kNumHeads, kHeadSize, aiv_num_);
 
     turboquant_paged_attention_impl(
-        AscendType::FP16, stream_, grid.split_block_dim, grid.combine_block_dim, query_rot_.get(), key_cache_.get(),
-        value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(), decode_tables_.get(),
-        workspace_.get(), out_.get(), static_cast<uint32_t>(kQueryTokens), static_cast<uint32_t>(kNumHeads),
+        AscendType::FP16, stream_, grid.block_dim, query_rot_.get(), key_cache_.get(), value_cache_.get(),
+        scale_plane_.get(), block_tables_.get(), context_lens_.get(), decode_tables_.get(), workspace_.get(),
+        out_.get(), static_cast<uint32_t>(kQueryTokens), static_cast<uint32_t>(kNumHeads),
         static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kBlockSize),
         static_cast<uint32_t>(scenario_.blocks_per_seq), static_cast<uint32_t>(grid.num_splits),
-        grid.split_tasks_per_core, grid.combine_tasks_per_core, kAttentionScale, kInvSqrtHeadSize);
+        grid.split_tasks_per_core, grid.reduce_tasks_per_core, static_cast<uint32_t>(tqh::kFusedContextLimit),
+        kAttentionScale, kInvSqrtHeadSize);
     ACL_CHECK(aclrtSynchronizeStream(stream_));
   }
 

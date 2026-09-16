@@ -36,14 +36,14 @@ extern void turboquant_reshape_and_cache_impl(AscendType type, void *stream, uin
                                               uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,
                                               uint32_t tokensPerCore, float invSqrtLen);
 
-extern void turboquant_paged_attention_impl(AscendType type, void *stream, uint32_t splitBlockDim,
-                                            uint32_t combineBlockDim, void *queryRot, void *keyCache,
-                                            void *valueCache, void *scaleCache, void *blockTables,
+extern void turboquant_paged_attention_impl(AscendType type, void *stream, uint32_t blockDim, void *queryRot,
+                                            void *keyCache, void *valueCache, void *scaleCache, void *blockTables,
                                             void *contextLens, void *tables, void *workspace, void *output,
                                             uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads,
                                             uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,
                                             uint32_t numSplits, uint32_t splitTasksPerCore,
-                                            uint32_t combineTasksPerCore, float scale, float invSqrtLen);
+                                            uint32_t reduceTasksPerCore, uint32_t fusedContextLimit, float scale,
+                                            float invSqrtLen);
 
 extern void turboquant_rotate_q_impl(AscendType type, void *stream, uint32_t blockDim, bool useCube, void *query,
                                      void *piSigns, void *h16, void *rotTables, void *queryRot, uint32_t numVectors,
@@ -53,6 +53,7 @@ extern void turboquant_rotate_q_impl(AscendType type, void *stream, uint32_t blo
 namespace turboquant_adpt {
 
 constexpr int64_t kMaxSequenceSplits = 8;
+constexpr int64_t kFusedContextLimit = 4096;
 constexpr int64_t kPartialTail = 16;
 constexpr int64_t kFp32PerBlock = 8;
 constexpr int64_t kTileRows = 16;
@@ -110,14 +111,13 @@ inline int64_t PartialStride(int64_t headSize)
 struct PagedAttentionPlan {
     int64_t num_splits = 1;
     int64_t workspace_floats = 0;
-    uint32_t split_block_dim = 0;
-    uint32_t combine_block_dim = 0;
+    uint32_t block_dim = 0;
     uint32_t split_tasks_per_core = 0;
-    uint32_t combine_tasks_per_core = 0;
+    uint32_t reduce_tasks_per_core = 0;
 };
 
 inline PagedAttentionPlan PlanPagedAttention(int64_t numTokens, int64_t numHeads, int64_t headSize,
-                                             int64_t maxBlocksPerSeq, int64_t aivNum)
+                                             int64_t maxBlocksPerSeq, int64_t blockSize, int64_t aivNum)
 {
     PagedAttentionPlan plan;
 
@@ -126,20 +126,22 @@ inline PagedAttentionPlan PlanPagedAttention(int64_t numTokens, int64_t numHeads
         return plan;
     }
 
-    int64_t num_splits = CeilDiv(aivNum, base_tasks);
-    num_splits = std::min(num_splits, std::min<int64_t>(kMaxSequenceSplits, std::max<int64_t>(1, maxBlocksPerSeq)));
-    num_splits = std::max<int64_t>(num_splits, 1);
+    const int64_t blocks = std::max<int64_t>(1, maxBlocksPerSeq);
+    int64_t num_splits = 1;
+    if (blocks * blockSize > kFusedContextLimit) {
+        num_splits = std::max(CeilDiv(aivNum, base_tasks), CeilDiv(blocks * blockSize, kFusedContextLimit));
+        num_splits = std::min(num_splits, std::min<int64_t>(kMaxSequenceSplits, blocks));
+    }
 
     const int64_t split_tasks = base_tasks * num_splits;
     const int64_t split_tasks_per_core = CeilDiv(split_tasks, aivNum);
-    const int64_t combine_tasks_per_core = CeilDiv(base_tasks, aivNum);
+    const int64_t block_dim = CeilDiv(split_tasks, split_tasks_per_core);
 
     plan.num_splits = num_splits;
-    plan.workspace_floats = split_tasks * PartialStride(headSize);
-    plan.split_block_dim = static_cast<uint32_t>(CeilDiv(split_tasks, split_tasks_per_core));
-    plan.combine_block_dim = static_cast<uint32_t>(CeilDiv(base_tasks, combine_tasks_per_core));
+    plan.workspace_floats = num_splits > 1 ? split_tasks * PartialStride(headSize) : 0;
+    plan.block_dim = static_cast<uint32_t>(block_dim);
     plan.split_tasks_per_core = static_cast<uint32_t>(split_tasks_per_core);
-    plan.combine_tasks_per_core = static_cast<uint32_t>(combine_tasks_per_core);
+    plan.reduce_tasks_per_core = num_splits > 1 ? static_cast<uint32_t>(CeilDiv(base_tasks, block_dim)) : 0;
     return plan;
 }
 
@@ -151,13 +153,15 @@ inline int64_t npu_turboquant_vector_core_num()
 }
 
 inline int64_t npu_turboquant_workspace_size(int64_t num_tokens, int64_t num_heads, int64_t head_size,
-                                             int64_t max_blocks_per_seq)
+                                             int64_t max_blocks_per_seq, int64_t block_size)
 {
     namespace adpt = turboquant_adpt;
     TORCH_CHECK(num_tokens >= 0 && num_heads > 0, "workspace sizing needs num_tokens >= 0 and num_heads > 0, got ",
                 num_tokens, " and ", num_heads);
+    TORCH_CHECK(block_size > 0, "workspace sizing needs block_size > 0, got ", block_size);
     adpt::CheckHeadSize(head_size);
-    return adpt::PlanPagedAttention(num_tokens, num_heads, head_size, max_blocks_per_seq, adpt::VectorCoreNum())
+    return adpt::PlanPagedAttention(num_tokens, num_heads, head_size, max_blocks_per_seq, block_size,
+                                    adpt::VectorCoreNum())
         .workspace_floats;
 }
 
@@ -262,8 +266,7 @@ inline void npu_turboquant_rotate_q(at::Tensor &query, at::Tensor &pi_signs, at:
     if (core_num < 1) {
         core_num = 1;
     }
-    const bool input_exact_in_half = query.scalar_type() == at::ScalarType::Half;
-    const tq::RotateQPlan plan = tq::PlanRotateQ(num_vectors, head_size, core_num, input_exact_in_half);
+    const tq::RotateQPlan plan = tq::PlanRotateQ(num_tokens, num_vectors, head_size, core_num);
 
     if (plan.use_cube) {
         TORCH_CHECK(plan.vectors_per_block > 0 && num_vectors % plan.vectors_per_block == 0,
@@ -337,8 +340,9 @@ inline void npu_turboquant_paged_attention(at::Tensor &query_rot, at::Tensor &ke
         return;
     }
 
-    const adpt::PagedAttentionPlan plan =
-        adpt::PlanPagedAttention(num_tokens, num_heads, head_size, max_blocks_per_seq, adpt::VectorCoreNum());
+    const adpt::PagedAttentionPlan plan = adpt::PlanPagedAttention(num_tokens, num_heads, head_size,
+                                                                   max_blocks_per_seq, block_size,
+                                                                   adpt::VectorCoreNum());
 
     TORCH_CHECK(workspace.scalar_type() == at::ScalarType::Float, "the decode workspace must be float32, got ",
                 workspace.scalar_type());
@@ -353,13 +357,13 @@ inline void npu_turboquant_paged_attention(at::Tensor &query_rot, at::Tensor &ke
 
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     turboquant_paged_attention_impl(
-        adpt::ToAscendType(out.scalar_type()), stream, plan.split_block_dim, plan.combine_block_dim,
-        query_rot.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(), scale_cache.data_ptr(),
-        block_tables.data_ptr(), context_lens.data_ptr(), codec_tables.data_ptr(), workspace.data_ptr(),
-        out.data_ptr(), static_cast<uint32_t>(num_tokens), static_cast<uint32_t>(num_heads),
-        static_cast<uint32_t>(num_kv_heads), static_cast<uint32_t>(head_size), static_cast<uint32_t>(block_size),
+        adpt::ToAscendType(out.scalar_type()), stream, plan.block_dim, query_rot.data_ptr(), key_cache.data_ptr(),
+        value_cache.data_ptr(), scale_cache.data_ptr(), block_tables.data_ptr(), context_lens.data_ptr(),
+        codec_tables.data_ptr(), plan.workspace_floats > 0 ? workspace.data_ptr() : nullptr, out.data_ptr(),
+        static_cast<uint32_t>(num_tokens), static_cast<uint32_t>(num_heads), static_cast<uint32_t>(num_kv_heads),
+        static_cast<uint32_t>(head_size), static_cast<uint32_t>(block_size),
         static_cast<uint32_t>(max_blocks_per_seq), static_cast<uint32_t>(plan.num_splits), plan.split_tasks_per_core,
-        plan.combine_tasks_per_core, scale, inv_sqrt_len);
+        plan.reduce_tasks_per_core, static_cast<uint32_t>(adpt::kFusedContextLimit), scale, inv_sqrt_len);
 }
 
 }

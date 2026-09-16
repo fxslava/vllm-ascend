@@ -3194,7 +3194,8 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(CONCAT(_C, _ascend), ops)
         "npu_turboquant_workspace_size(int num_tokens, "
         "                              int num_heads, "
         "                              int head_size, "
-        "                              int max_blocks_per_seq) -> int");
+        "                              int max_blocks_per_seq, "
+        "                              int block_size) -> int");
     ops.impl("npu_turboquant_workspace_size",
              &vllm_ascend::npu_turboquant_workspace_size);
 }

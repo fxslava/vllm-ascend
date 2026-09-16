@@ -44,6 +44,8 @@ constexpr int64_t kNumHeads = 8;
 
 constexpr float kCubeAbsTolerance = 1e-5f;
 
+constexpr int64_t kCubeCoreNum = 4;
+
 struct Batch {
   int64_t batch = 0;
   int64_t num_vectors = 0;
@@ -95,7 +97,7 @@ Deviation Compare(const std::vector<float>& got, const std::vector<float>& want)
 }
 
 std::vector<float> RunRotation(const Batch& b, aclrtStream stream, bool force_aiv,
-                               tqr::RotateQPlan* plan_out = nullptr) {
+                               tqr::RotateQPlan* plan_out = nullptr, int64_t core_num_override = 0) {
   DeviceBuffer query = DeviceBuffer::FromHost(FloatToHalf(b.query));
   DeviceBuffer pi_signs = DeviceBuffer::FromHost(b.pi_signs);
   DeviceBuffer h16 = DeviceBuffer::FromHost(tqh::Hadamard16Half());
@@ -104,12 +106,12 @@ std::vector<float> RunRotation(const Batch& b, aclrtStream stream, bool force_ai
 
   bool queried = false;
   const int64_t aiv_num = tqh::VectorCoreNum(&queried);
-  int64_t core_num = aiv_num / 2;
+  int64_t core_num = core_num_override > 0 ? core_num_override : aiv_num / 2;
   if (core_num < 1) {
     core_num = 1;
   }
 
-  tqr::RotateQPlan plan = tqr::PlanRotateQ(b.num_vectors, kHeadSize, core_num, true);
+  tqr::RotateQPlan plan = tqr::PlanRotateQ(b.batch, b.num_vectors, kHeadSize, core_num);
   if (force_aiv && plan.use_cube) {
     int64_t vectors_per_block = (b.num_vectors + core_num - 1) / core_num;
     if (vectors_per_block < 2) {
@@ -136,28 +138,38 @@ std::vector<float> RunRotation(const Batch& b, aclrtStream stream, bool force_ai
 
 TEST(RotateQPlan, Dispatch) {
   struct Expect {
+    int64_t num_tokens;
     int64_t num_vectors;
     int64_t head_size;
     int64_t core_num;
     bool use_cube;
   };
   const Expect cases[] = {
-      {4, 256, 16, false},
-      {8, 256, 16, false},
-      {12, 256, 16, false},
-      {16, 256, 16, true},
-      {32, 256, 16, true},
-      {64, 256, 16, true},
-      {256, 256, 16, true},
-      {1, 256, 16, false},
-      {16, 128, 16, true},
-      {16, 64, 16, true},
+      {1, 4, 256, 16, false},
+      {1, 8, 256, 16, false},
+      {3, 12, 256, 16, false},
+      {2, 16, 256, 16, true},
+      {4, 32, 256, 16, true},
+      {8, 64, 256, 16, true},
+      {32, 256, 256, 16, true},
+      {1, 1, 256, 16, false},
+      {2, 16, 128, 16, true},
+      {2, 16, 64, 16, true},
+      {1, 16, 256, 4, false},
+      {1, 256, 256, 16, false},
+      {2, 16, 256, 32, false},
+      {4, 32, 256, 32, true},
+      {0, 16, 256, 16, false},
   };
 
   for (const Expect& e : cases) {
-    const tqr::RotateQPlan plan = tqr::PlanRotateQ(e.num_vectors, e.head_size, e.core_num, true);
+    const tqr::RotateQPlan plan = tqr::PlanRotateQ(e.num_tokens, e.num_vectors, e.head_size, e.core_num);
     EXPECT_EQ(plan.use_cube, e.use_cube)
-        << "N=" << e.num_vectors << " D=" << e.head_size << " cores=" << e.core_num;
+        << "B=" << e.num_tokens << " N=" << e.num_vectors << " D=" << e.head_size << " cores=" << e.core_num;
+    if (e.num_tokens <= 0) {
+      EXPECT_EQ(plan.block_dim, 0u) << "an empty batch must not launch";
+      continue;
+    }
     EXPECT_GT(plan.block_dim, 0u) << "N=" << e.num_vectors;
 
     if (plan.use_cube) {
@@ -178,9 +190,18 @@ TEST(RotateQPlan, Dispatch) {
     }
   }
 
-  const tqr::RotateQPlan bf16 = tqr::PlanRotateQ(64, 256, 16, false);
-  ASSERT_TRUE(bf16.use_cube);
-  EXPECT_NE(bf16.variant & static_cast<uint32_t>(tqr::kHiLo), 0u);
+  const tqr::RotateQPlan single = tqr::PlanRotateQ(8, 64, 256, 16);
+  ASSERT_TRUE(single.use_cube);
+  EXPECT_EQ(single.variant & static_cast<uint32_t>(tqr::kHiLo), 0u)
+      << "the residual Mmad must be opted into, for fp16 and bf16 alike";
+
+  const tqr::RotateQPlan hilo = tqr::PlanRotateQ(8, 64, 256, 16, tqr::RotateQPrecision::kHiLoResidual);
+  ASSERT_TRUE(hilo.use_cube);
+  EXPECT_NE(hilo.variant & static_cast<uint32_t>(tqr::kHiLo), 0u);
+
+  const tqr::RotateQPlan decode = tqr::PlanRotateQ(1, 64, 256, 1, tqr::RotateQPrecision::kHiLoResidual);
+  EXPECT_FALSE(decode.use_cube) << "a single-token decode rotates on the vector units at any head count";
+  EXPECT_EQ(decode.variant, 0u);
 }
 
 TEST(RotateQVector, SparseBatchIsBitIdenticalToTheReference) {
@@ -209,7 +230,7 @@ TEST_P(RotateQCube, MatchesTheReference) {
 
   tqr::RotateQPlan plan;
   const std::vector<float> got = RunRotation(b, AscendTestEnvironment::Instance().stream(), false,
-                                             &plan);
+                                             &plan, kCubeCoreNum);
   ASSERT_TRUE(plan.use_cube) << "N=" << b.num_vectors << " should select the Cube path";
 
   const Deviation d = Compare(got, b.reference);
@@ -236,7 +257,7 @@ TEST(RotateQCube, AgreesWithTheVectorPathOnIdenticalInput) {
   aclrtStream stream = AscendTestEnvironment::Instance().stream();
 
   tqr::RotateQPlan cube_plan;
-  const std::vector<float> cube = RunRotation(b, stream, false, &cube_plan);
+  const std::vector<float> cube = RunRotation(b, stream, false, &cube_plan, kCubeCoreNum);
   ASSERT_TRUE(cube_plan.use_cube);
 
   tqr::RotateQPlan aiv_plan;

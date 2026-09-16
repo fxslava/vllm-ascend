@@ -29,6 +29,34 @@ constexpr uint32_t kBrcbDstLanes = kFp32PerBlock * kFp32PerBlock;
 
 constexpr uint32_t kGatherSrcBase = 0;
 
+constexpr uint32_t kMaxRepeatTimes = 255;
+
+template <bool ENABLED>
+__aicore__ inline void VecBarrier()
+{
+    if constexpr (ENABLED) {
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+}
+
+__aicore__ inline void RepeatButterfly(const AscendC::LocalTensor<float> &dst, const AscendC::LocalTensor<float> &src,
+                                       uint32_t stride, uint32_t groups)
+{
+    const uint32_t lanes = stride < kFp32PerRepeat ? stride : kFp32PerRepeat;
+    const uint8_t rep = static_cast<uint8_t>(2 * stride / kFp32PerBlock);
+    const AscendC::BinaryRepeatParams params{1, 1, 1, rep, rep, rep};
+    for (uint32_t done = 0; done < groups; done += kMaxRepeatTimes) {
+        const uint8_t batch = static_cast<uint8_t>((groups - done) < kMaxRepeatTimes ? (groups - done) : kMaxRepeatTimes);
+        const uint32_t base = done * 2 * stride;
+        for (uint32_t lane = 0; lane < stride; lane += lanes) {
+            const uint32_t lo = base + lane;
+            const uint32_t hi = lo + stride;
+            AscendC::Add(dst[lo], src[lo], src[hi], static_cast<uint64_t>(lanes), batch, params);
+            AscendC::Sub(dst[hi], src[lo], src[hi], static_cast<uint64_t>(lanes), batch, params);
+        }
+    }
+}
+
 template <int BITS>
 class TurboQuantCodec {
     static_assert(BITS == 4, "TurboQuantCodec is only implemented for b = 4");
@@ -118,6 +146,7 @@ public:
         }
     }
 
+    template <bool VEC_BARRIERS = true>
     __aicore__ inline void FastWalshHadamardTransform(AscendC::LocalTensor<float> &x,
                                                       AscendC::LocalTensor<float> &tmp, int len)
     {
@@ -128,14 +157,14 @@ public:
             if (stride >= n) {
                 return;
             }
-            ShuffleStage(x, tmp, stage, n);
+            ShuffleStage<VEC_BARRIERS>(x, tmp, stage, n);
         }
 
         AscendC::LocalTensor<float> src = x;
         AscendC::LocalTensor<float> dst = tmp;
         bool inTmp = false;
         for (uint32_t stride = kFp32PerBlock; stride < n; stride <<= 1) {
-            BlockStage(dst, src, stride, n);
+            RepeatButterfly(dst, src, stride, n / (2 * stride));
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::LocalTensor<float> hold = src;
             src = dst;
@@ -148,18 +177,19 @@ public:
         }
 
         AscendC::Muls(x, x, invSqrtLen_, n);
-        AscendC::PipeBarrier<PIPE_V>();
+        VecBarrier<VEC_BARRIERS>();
     }
 
+    template <bool VEC_BARRIERS = true>
     __aicore__ inline void ApplyPi(AscendC::LocalTensor<float> &x, AscendC::LocalTensor<float> &tmp,
                                    const AscendC::LocalTensor<float> &piSigns, int len)
     {
         const uint32_t n = static_cast<uint32_t>(len);
         AscendC::Mul(x, x, piSigns, n);
-        AscendC::PipeBarrier<PIPE_V>();
-        FastWalshHadamardTransform(x, tmp, len);
+        VecBarrier<VEC_BARRIERS>();
+        FastWalshHadamardTransform<VEC_BARRIERS>(x, tmp, len);
         AscendC::Mul(x, x, piSigns, n);
-        AscendC::PipeBarrier<PIPE_V>();
+        VecBarrier<VEC_BARRIERS>();
     }
 
     __aicore__ inline void Quantize4Bit(const AscendC::LocalTensor<int8_t> &dstPacked,
@@ -281,6 +311,7 @@ public:
         AscendC::PipeBarrier<PIPE_V>();
     }
 
+    template <bool VEC_BARRIERS = true>
     __aicore__ static inline void BroadcastMul(const AscendC::LocalTensor<float> &dst,
                                                const AscendC::LocalTensor<float> &src,
                                                const AscendC::LocalTensor<float> &scalarBlock, uint32_t count)
@@ -296,37 +327,19 @@ public:
             const uint32_t base = repeats * kFp32PerRepeat;
             AscendC::Mul(dst[base], src[base], scalarBlock, static_cast<uint64_t>(tail), 1, {1, 1, 0, 0, 0, 0});
         }
-        AscendC::PipeBarrier<PIPE_V>();
+        VecBarrier<VEC_BARRIERS>();
     }
 
 private:
+    template <bool VEC_BARRIERS>
     __aicore__ inline void ShuffleStage(AscendC::LocalTensor<float> &x, AscendC::LocalTensor<float> &tmp, int stage,
                                         uint32_t n)
     {
         AscendC::Gather(swap_, x, xorOffset_[stage], kGatherSrcBase, n);
         AscendC::Mul(tmp, x, sign_[stage], n);
-        AscendC::PipeBarrier<PIPE_V>();
+        VecBarrier<VEC_BARRIERS>();
         AscendC::Add(x, swap_, tmp, n);
-        AscendC::PipeBarrier<PIPE_V>();
-    }
-
-    __aicore__ inline void BlockStage(AscendC::LocalTensor<float> &dst, AscendC::LocalTensor<float> &src,
-                                      uint32_t stride, uint32_t n)
-    {
-        const uint32_t groups = n / (2 * stride);
-        if (stride <= kFp32PerRepeat) {
-            const uint8_t rep = static_cast<uint8_t>(2 * stride / kFp32PerBlock);
-            const AscendC::BinaryRepeatParams params{1, 1, 1, rep, rep, rep};
-            const uint64_t mask = static_cast<uint64_t>(stride);
-            AscendC::Add(dst, src, src[stride], mask, static_cast<uint8_t>(groups), params);
-            AscendC::Sub(dst[stride], src, src[stride], mask, static_cast<uint8_t>(groups), params);
-            return;
-        }
-        for (uint32_t g = 0; g < groups; ++g) {
-            const uint32_t base = g * 2 * stride;
-            AscendC::Add(dst[base], src[base], src[base + stride], stride);
-            AscendC::Sub(dst[base + stride], src[base], src[base + stride], stride);
-        }
+        VecBarrier<VEC_BARRIERS>();
     }
 
     __aicore__ static inline void FloorInPlace(const AscendC::LocalTensor<float> &x, uint32_t count)

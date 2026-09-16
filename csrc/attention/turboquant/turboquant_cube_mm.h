@@ -98,6 +98,7 @@ public:
 
     static constexpr uint32_t kOperandC0 = 32;
 
+    template <bool DUAL_DST = false>
     __aicore__ inline void GemmScores(const AscendC::LocalTensor<float> &dstUb,
                                       const AscendC::LocalTensor<OperandT> &bL1, uint32_t m, uint32_t k, uint32_t n)
     {
@@ -105,9 +106,10 @@ public:
         bActive_ = bL1;
         LoadA(m, k);
         LoadBFromNk(k, n);
-        Compute(dstUb, m, k, n);
+        Compute<DUAL_DST>(dstUb, m, k, n);
     }
 
+    template <bool DUAL_DST = false>
     __aicore__ inline void GemmContext(const AscendC::LocalTensor<float> &dstUb,
                                        const AscendC::LocalTensor<OperandT> &bL1, uint32_t m, uint32_t k, uint32_t n,
                                        uint32_t variant = 0)
@@ -116,13 +118,15 @@ public:
         bActive_ = bL1;
         LoadA(m, k);
         LoadBFromKn(k, n, variant);
-        Compute(dstUb, m, k, n);
+        Compute<DUAL_DST>(dstUb, m, k, n);
     }
 
 private:
     static constexpr uint16_t kFractalRows = 16;
     static constexpr uint16_t kC0 = 32;
     static constexpr uint16_t kB8MStep = 2;
+    static constexpr uint32_t kDualDstSubcores = 2;
+    static constexpr uint8_t kDualDstSplitM = 1;
 
     __aicore__ static constexpr uint16_t CeilDivU16(uint32_t a, uint32_t b)
     {
@@ -206,6 +210,7 @@ private:
         }
     }
 
+    template <bool DUAL_DST>
     __aicore__ inline void Compute(const AscendC::LocalTensor<float> &dstUb, uint32_t m, uint32_t k, uint32_t n)
     {
         AscendC::LocalTensor<OperandT> ta2 = a2_.template Get<OperandT>();
@@ -225,11 +230,21 @@ private:
         AscendC::SetFlag<AscendC::HardEvent::M_FIX>(mToFix);
         AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(mToFix);
 
-        AscendC::Fixpipe<float, float, kFixpipeToUb>(
-            dstUb, tco,
-            AscendC::FixpipeParamsC310<AscendC::CO2Layout::ROW_MAJOR>(
-                static_cast<uint16_t>(n), static_cast<uint16_t>(m),
-                static_cast<uint16_t>(CeilDivU16(m, kFractalRows) * kFractalRows), n));
+        if constexpr (DUAL_DST) {
+            const uint32_t evenM = CeilDivU16(m, kDualDstSubcores) * kDualDstSubcores;
+            AscendC::FixpipeParamsC310<AscendC::CO2Layout::ROW_MAJOR> fp(
+                static_cast<uint16_t>(n), static_cast<uint16_t>(evenM),
+                static_cast<uint16_t>(CeilDivU16(evenM, kFractalRows) * kFractalRows), n);
+            fp.dualDstCtl = kDualDstSplitM;
+            fp.subBlockId = false;
+            AscendC::Fixpipe<float, float, kFixpipeToUb>(dstUb, tco, fp);
+        } else {
+            AscendC::Fixpipe<float, float, kFixpipeToUb>(
+                dstUb, tco,
+                AscendC::FixpipeParamsC310<AscendC::CO2Layout::ROW_MAJOR>(
+                    static_cast<uint16_t>(n), static_cast<uint16_t>(m),
+                    static_cast<uint16_t>(CeilDivU16(m, kFractalRows) * kFractalRows), n));
+        }
         AscendC::PipeBarrier<PIPE_FIX>();
     }
 

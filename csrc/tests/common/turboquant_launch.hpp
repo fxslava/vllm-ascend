@@ -32,13 +32,13 @@ void turboquant_reshape_and_cache_impl(AscendType type, void *stream, uint32_t b
                                        uint32_t headSize, uint32_t blockSize, uint32_t tokensPerCore,
                                        float invSqrtLen);
 
-void turboquant_paged_attention_impl(AscendType type, void *stream, uint32_t splitBlockDim, uint32_t combineBlockDim,
-                                     void *queryRot, void *keyCache, void *valueCache, void *scaleCache,
-                                     void *blockTables, void *contextLens, void *tables, void *workspace,
-                                     void *output, uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads,
-                                     uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,
-                                     uint32_t numSplits, uint32_t splitTasksPerCore, uint32_t combineTasksPerCore,
-                                     float scale, float invSqrtLen);
+void turboquant_paged_attention_impl(AscendType type, void *stream, uint32_t blockDim, void *queryRot,
+                                     void *keyCache, void *valueCache, void *scaleCache, void *blockTables,
+                                     void *contextLens, void *tables, void *workspace, void *output,
+                                     uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize,
+                                     uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits,
+                                     uint32_t splitTasksPerCore, uint32_t reduceTasksPerCore,
+                                     uint32_t fusedContextLimit, float scale, float invSqrtLen);
 
 void turboquant_rotate_q_impl(AscendType type, void *stream, uint32_t blockDim, bool useCube, void *query,
                               void *piSigns, void *h16, void *rotTables, void *queryRot, uint32_t numVectors,
@@ -78,12 +78,13 @@ void turboquant_mm_decode_bypass_unpack_impl(AscendType type, void *stream, uint
                                              uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t tasksPerCore,
                                              float scale, float invSqrtLen);
 
-void turboquant_fp16_decode_impl(AscendType type, void *stream, uint32_t splitBlockDim, uint32_t combineBlockDim,
-                                 void *query, void *keyCache, void *valueCache, void *blockTables,
-                                 void *contextLens, void *workspace, void *output, uint32_t numTokens,
-                                 uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,
-                                 uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t splitTasksPerCore,
-                                 uint32_t combineTasksPerCore, float scale);
+void turboquant_mm_fused_decode_impl(int32_t mode, AscendType type, void *stream, uint32_t blockDim, void *queryRot,
+                                    void *keyCache, void *valueCache, void *scaleCache, void *blockTables,
+                                    void *contextLens, void *modeTables, void *workspace, void *output,
+                                    uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize,
+                                    uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits,
+                                    uint32_t headsPerTask, uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,
+                                    uint32_t fusedContextLimit, float scale, float invSqrtLen);
 
 void turboquant_cube_gemm_probe_impl(void *stream, void *a, void *b, void *c, uint32_t m, uint32_t k, uint32_t n,
                                      uint32_t headSize, uint32_t tileRows, uint32_t aElems, uint32_t bElems,
@@ -93,6 +94,7 @@ namespace test {
 namespace turboquant_host {
 
 constexpr int64_t kMaxSequenceSplits = 8;
+constexpr int64_t kFusedContextLimit = 4096;
 constexpr int64_t kPartialTail = 16;
 constexpr int64_t kFp32PerBlock = 8;
 constexpr int64_t kTileRows = 16;
@@ -136,16 +138,16 @@ struct ReshapeAndCacheGrid {
 ReshapeAndCacheGrid PlanReshapeAndCache(int64_t num_tokens, int64_t aiv_num);
 
 struct PagedAttentionGrid {
-  uint32_t split_block_dim = 0;
-  uint32_t combine_block_dim = 0;
+  uint32_t block_dim = 0;
   uint32_t split_tasks_per_core = 0;
-  uint32_t combine_tasks_per_core = 0;
+  uint32_t reduce_tasks_per_core = 0;
   int64_t num_splits = 1;
   size_t workspace_floats = 0;
 };
 
 PagedAttentionGrid PlanPagedAttention(int64_t num_tokens, int64_t num_heads, int64_t head_size,
-                                      int64_t max_blocks_per_seq, int64_t aiv_num);
+                                      int64_t max_blocks_per_seq, int64_t block_size, int64_t aiv_num,
+                                      int64_t fused_context_limit = kFusedContextLimit);
 
 std::vector<float> UnrotateHeads(std::vector<float> rotated, int64_t head_size);
 
@@ -206,12 +208,29 @@ struct CubeDecodeGrid {
 CubeDecodeGrid PlanCubeDecode(int64_t num_tokens, int64_t num_heads, int64_t num_kv_heads, int64_t head_size,
                               int64_t max_blocks_per_seq, int64_t aiv_num);
 
+constexpr int64_t kVectorSubcoresPerBlock = 2;
+
+struct FusedDecodeGrid {
+  uint32_t block_dim = 0;
+  uint32_t tasks_per_block = 0;
+  uint32_t reduce_tasks_per_block = 0;
+  uint32_t heads_per_task = 0;
+  int64_t num_splits = 1;
+  int64_t num_tasks = 0;
+  size_t workspace_floats = 0;
+};
+
+FusedDecodeGrid PlanFusedDecode(int64_t num_tokens, int64_t num_heads, int64_t num_kv_heads, int64_t head_size,
+                                int64_t max_blocks_per_seq, int64_t block_size, int64_t aiv_num,
+                                int64_t fused_context_limit = kFusedContextLimit);
+
 std::vector<uint16_t> Hadamard16Half();
 
 vllm_ascend::turboquant::RotateQPlan RotateQuery(void *stream, AscendType type, void *query, void *pi_signs,
                                                  void *h16, void *rot_tables, void *query_rot, int64_t num_tokens,
                                                  int64_t num_heads, int64_t head_size, int64_t aiv_num,
-                                                 bool input_exact_in_half);
+                                                 vllm_ascend::turboquant::RotateQPrecision precision =
+                                                     vllm_ascend::turboquant::RotateQPrecision::kSinglePassRint);
 
 }
 }

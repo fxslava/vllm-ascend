@@ -80,6 +80,9 @@ CPU = torch.device("cpu")
 # asks the operator for it instead of computing it here.
 WORKSPACE_FLOATS = 4096
 
+# The block size of the decode fixtures' caches; the workspace plan needs it to bound the context.
+DECODE_BLOCK_SIZE = 128
+
 
 def _ops_mock(workspace_floats: int = WORKSPACE_FLOATS) -> MagicMock:
     """A stand-in for ``torch.ops._C_ascend``.
@@ -308,9 +311,9 @@ class TestPureRuntimeContract(TestBase):
         return impl
 
     def _decode_fixture(self, impl, num_tokens):
-        impl.key_cache = torch.zeros(1, 128, 2, HEAD_SIZE // TURBOQUANT_PACK_FACTOR, dtype=torch.int8)
+        impl.key_cache = torch.zeros(1, DECODE_BLOCK_SIZE, 2, HEAD_SIZE // TURBOQUANT_PACK_FACTOR, dtype=torch.int8)
         impl.value_cache = impl.key_cache
-        impl.scale_cache = torch.zeros(1, 128, turboquant_scale_slot(2))
+        impl.scale_cache = torch.zeros(1, DECODE_BLOCK_SIZE, turboquant_scale_slot(2))
         query = torch.randn(num_tokens, impl.num_heads, HEAD_SIZE)
         output = torch.zeros(num_tokens, impl.num_heads, HEAD_SIZE)
         metadata = MagicMock(
@@ -426,9 +429,9 @@ class TestPureRuntimeContract(TestBase):
         """The rotation never allocates on a decode step, for the same reason
         the reduction workspace does not: a graph replays captured addresses."""
         impl = self._make_impl()
-        impl.key_cache = torch.zeros(1, 128, 2, HEAD_SIZE // TURBOQUANT_PACK_FACTOR, dtype=torch.int8)
+        impl.key_cache = torch.zeros(1, DECODE_BLOCK_SIZE, 2, HEAD_SIZE // TURBOQUANT_PACK_FACTOR, dtype=torch.int8)
         impl.value_cache = impl.key_cache
-        impl.scale_cache = torch.zeros(1, 128, turboquant_scale_slot(2))
+        impl.scale_cache = torch.zeros(1, DECODE_BLOCK_SIZE, turboquant_scale_slot(2))
 
         def run(num_tokens):
             query = torch.randn(num_tokens, impl.num_heads, HEAD_SIZE)
@@ -468,7 +471,7 @@ class TestPureRuntimeContract(TestBase):
         self.assertEqual(workspace.numel(), WORKSPACE_FLOATS)
         # Sized from the operator's own arithmetic, not a copy of it here.
         ops.npu_turboquant_workspace_size.assert_called_once_with(
-            num_tokens, impl.num_heads, impl.head_size, 1
+            num_tokens, impl.num_heads, impl.head_size, 1, DECODE_BLOCK_SIZE
         )
 
 
@@ -492,8 +495,8 @@ class TestDecodeWorkspace(TestBase):
         impl = self._make_impl()
         ops = _ops_mock()
         with patch.object(torch.ops, "_C_ascend", ops, create=True):
-            first = impl._decode_workspace(2, 1, CPU)
-            second = impl._decode_workspace(2, 1, CPU)
+            first = impl._decode_workspace(2, 1, DECODE_BLOCK_SIZE, CPU)
+            second = impl._decode_workspace(2, 1, DECODE_BLOCK_SIZE, CPU)
 
         self.assertIs(first, second)
         # The size is memoised per shape, so the steady-state step costs a dict
@@ -505,8 +508,8 @@ class TestDecodeWorkspace(TestBase):
         ops = _ops_mock()
         ops.npu_turboquant_workspace_size.side_effect = [WORKSPACE_FLOATS, WORKSPACE_FLOATS // 4]
         with patch.object(torch.ops, "_C_ascend", ops, create=True):
-            wide = impl._decode_workspace(8, 4, CPU)
-            narrow = impl._decode_workspace(2, 1, CPU)
+            wide = impl._decode_workspace(8, 4, DECODE_BLOCK_SIZE, CPU)
+            narrow = impl._decode_workspace(2, 1, DECODE_BLOCK_SIZE, CPU)
 
         self.assertIs(wide, narrow)
         self.assertEqual(narrow.numel(), WORKSPACE_FLOATS)
@@ -516,8 +519,8 @@ class TestDecodeWorkspace(TestBase):
         ops = _ops_mock()
         ops.npu_turboquant_workspace_size.side_effect = [WORKSPACE_FLOATS, WORKSPACE_FLOATS * 2]
         with patch.object(torch.ops, "_C_ascend", ops, create=True):
-            narrow = impl._decode_workspace(2, 1, CPU)
-            wide = impl._decode_workspace(8, 4, CPU)
+            narrow = impl._decode_workspace(2, 1, DECODE_BLOCK_SIZE, CPU)
+            wide = impl._decode_workspace(8, 4, DECODE_BLOCK_SIZE, CPU)
 
         self.assertIsNot(narrow, wide)
         self.assertEqual(wide.numel(), WORKSPACE_FLOATS * 2)
@@ -535,8 +538,8 @@ class TestDecodeWorkspace(TestBase):
         ops = _ops_mock()
         ops.npu_turboquant_workspace_size.side_effect = [WORKSPACE_FLOATS, WORKSPACE_FLOATS * 2]
         with patch.object(torch.ops, "_C_ascend", ops, create=True):
-            big_batch = impl._decode_workspace(3, 8, CPU)
-            small_batch = impl._decode_workspace(1, 8, CPU)
+            big_batch = impl._decode_workspace(3, 8, DECODE_BLOCK_SIZE, CPU)
+            small_batch = impl._decode_workspace(1, 8, DECODE_BLOCK_SIZE, CPU)
 
         self.assertIsNot(big_batch, small_batch)
         self.assertEqual(small_batch.numel(), WORKSPACE_FLOATS * 2)
@@ -547,7 +550,7 @@ class TestDecodeWorkspace(TestBase):
         impl._workspace_floats = {(0, i): 1 for i in range(tq_module._WORKSPACE_MEMO_LIMIT)}
         ops = _ops_mock()
         with patch.object(torch.ops, "_C_ascend", ops, create=True):
-            impl._decode_workspace(2, 1, CPU)
+            impl._decode_workspace(2, 1, DECODE_BLOCK_SIZE, CPU)
 
         self.assertEqual(len(impl._workspace_floats), 1)
         self.assertEqual(impl._workspace_floats[(2, 1)], WORKSPACE_FLOATS)
@@ -558,18 +561,18 @@ class TestDecodeWorkspace(TestBase):
         ops = _ops_mock()
         ops.npu_turboquant_workspace_size.side_effect = [WORKSPACE_FLOATS, WORKSPACE_FLOATS * 2]
         with patch.object(torch.ops, "_C_ascend", ops, create=True):
-            impl._decode_workspace(2, 1, CPU)
+            impl._decode_workspace(2, 1, DECODE_BLOCK_SIZE, CPU)
             with patch.object(tq_module, "_EXTRA_CTX", SimpleNamespace(capturing=True)):
                 with self.assertRaisesRegex(RuntimeError, "during a graph capture"):
-                    impl._decode_workspace(8, 4, CPU)
+                    impl._decode_workspace(8, 4, DECODE_BLOCK_SIZE, CPU)
 
     def test_a_capture_that_needs_no_growth_is_allowed(self):
         impl = self._make_impl()
         ops = _ops_mock()
         with patch.object(torch.ops, "_C_ascend", ops, create=True):
-            warmed = impl._decode_workspace(2, 1, CPU)
+            warmed = impl._decode_workspace(2, 1, DECODE_BLOCK_SIZE, CPU)
             with patch.object(tq_module, "_EXTRA_CTX", SimpleNamespace(capturing=True)):
-                captured = impl._decode_workspace(2, 1, CPU)
+                captured = impl._decode_workspace(2, 1, DECODE_BLOCK_SIZE, CPU)
 
         self.assertIs(warmed, captured)
 

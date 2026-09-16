@@ -45,6 +45,7 @@ from tests.ut.attention.turboquant_cpu_ops import (
     TURBOQUANT_OP_SCHEMAS,
     cpu_fused_infer_attention_score,
     dequantize,
+    paged_attention_workspace_floats,
     turboquant_cpu_ops,
 )
 from tests.ut.base import TestBase
@@ -328,6 +329,25 @@ class TestTurboQuantCpuOps(TestBase):
             for message, call in cases:
                 with self.subTest(message=message), self.assertRaisesRegex(RuntimeError, re.escape(message)):
                     call()
+
+    def test_only_a_context_past_the_fused_limit_needs_a_workspace(self):
+        """The decode is one launch: a context that fits the fused limit writes its output directly."""
+        fused_limit_blocks, block_size = 32, 128
+        with turboquant_cpu_ops():
+            workspace_size = torch.ops._C_ascend.npu_turboquant_workspace_size
+            at_limit = workspace_size(1, NUM_HEADS, HEAD_SIZE, fused_limit_blocks, block_size)
+            wide_batch = workspace_size(64, NUM_HEADS, HEAD_SIZE, 1, BLOCK_SIZE)
+            past_limit = workspace_size(1, NUM_HEADS, HEAD_SIZE, 2 * fused_limit_blocks, block_size)
+        self.assertEqual(at_limit, 0)
+        self.assertEqual(wide_batch, 0)
+        self.assertGreater(past_limit, 0)
+        self.assertEqual(past_limit % (NUM_HEADS * (HEAD_SIZE + 16)), 0)
+        self.assertEqual(
+            past_limit,
+            paged_attention_workspace_floats(
+                1, NUM_HEADS, HEAD_SIZE, 2 * fused_limit_blocks, block_size, CPU_VECTOR_CORES
+            ),
+        )
 
     def test_leaving_the_block_removes_every_registration(self):
         """Otherwise a later test that mocks torch.ops._C_ascend would inherit these kernels."""

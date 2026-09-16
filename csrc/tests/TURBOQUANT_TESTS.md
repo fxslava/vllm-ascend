@@ -26,6 +26,8 @@ Companion documents: [README.md](README.md) for how to build and run the suite,
 - [11. What none of this covers](#11-what-none-of-this-covers)
 - [12. What has actually been executed](#12-what-has-actually-been-executed)
 - [13. Multi-mode TurboQuant and the Cube-native decode](#13-multi-mode-turboquant-and-the-cube-native-decode)
+  - [13.24 Corrections from silicon profiling](#1324-corrections-from-silicon-profiling-2026-09-16)
+  - [13.25 The fused Cube decode](#1325-the-fused-cube-decode-turboquantfuseddecode)
 
 ---
 
@@ -1779,6 +1781,10 @@ context length.
 
 ### 13.9 INT4 storage, and where the NZ permutation went
 
+> **Superseded by 13.24 rule 1 (silicon, 2026-09-16).** The group-major 32 B GM -> UB tile
+> read described below throttles the HBM controller to 44.1 GB/s. It is not an acceptable
+> trade. The fused decode reads GM in wide bursts and permutes in the vector unit.
+
 Two changes, and they are one change: the second is forced by the first.
 
 **Milestone 1 — the stored code is the level, not an index.** `kv4fp8` used to
@@ -1967,6 +1973,9 @@ will execute; what is verified today is the simulator column, at `B=1` and
 `S in {16, 64}`.
 
 ### 13.11 The decode's AIV/AIC pipeline is double-buffered
+
+> **See 13.24 rule 3.** At B=1 and S <= 4096 the split/combine chain this section tunes is
+> replaced by one fused launch. The legacy split keeps this pipeline as the A/B reference.
 
 `TurboQuantCubeDecodeSplit` used to run its tiles in lock-step: the Cube sat
 idle through the MTE2 read, the INT4 unpack and the MTE3 staging of every tile,
@@ -2180,6 +2189,10 @@ bodies that obey them. The kernel now carries one-line pointers here instead.
 
 #### 13.14.1 The Fixpipe lands in ONE subcore's UB
 
+> **See 13.24 rule 2.** The fact below still holds. The conclusion "gate every consumer on
+> subcore 0" is a correctness workaround that idles AIV1. The fused decode splits each task's
+> heads into two contiguous halves and feeds both subcores with `dualDstCtl = 0b01`.
+
 `IsPrimarySubcore()` -- `GetSubBlockIdx() == 0`.
 
 The accumulator, the score row and the context row live in UB, and **UB is
@@ -2240,6 +2253,10 @@ loop the same edge must be carried deferred -- posted after the vector writes,
 waited before the DMA. See 13.13.
 
 ### 13.15 Where the 68,576 ticks actually go
+
+> **Overridden by 13.24.** Every percentage below is a camodel tick share. The "reject"
+> verdict on splitting the softmax across both AIV subcores, and the reading that
+> barriers are cheap, do not survive the silicon profile.
 
 Measured, not estimated. The CAModel writes a per-instruction log per core with
 issue-cycle timestamps and a unit class; charging the gap between one
@@ -3291,3 +3308,80 @@ checkpoint are each refused with exit 2 and nothing written.
 - **A real checkpoint** through the tool, a multi-rank TP load of a folded one,
   or a vLLM model load exercising the fold record end to end.
 - **UB placement A/B** for the combine; see above.
+
+### 13.24 Corrections from silicon profiling (2026-09-16)
+
+The four rules below come from a user-supplied profile of the TurboQuant decode on a physical
+950PR. **They are reported numbers, not traces this suite produced**; they are recorded here
+because they overturn design conclusions this document drew from the camodel, which models
+neither HBM throughput nor dispatch cost.
+
+| measurement (silicon, user-reported) | value |
+|---|---|
+| native `aclnnFusedInferAttentionScoreV5` decode | **14.16 us** |
+| TurboQuant rotate -> split -> combine chain | **~850 us** |
+| of which inter-kernel dispatch bubbles and stream syncs | 48.4 us |
+| of which `Combine` re-reading GM partials | ~11 us |
+| vector time inflated by `PipeBarrier<PIPE_V>` | 31.3 us |
+| effective HBM throughput of the 32 B group-major tile read | **44.1 GB/s** (peak 1.6 TB/s) |
+
+1. **MTE2 bursts stay contiguous and >= 128-256 B.** The group-major read of 13.9 fragments
+   every tile into 32 B descriptors. A permutation belongs in the vector unit: a
+   `DataCopy(UB, UB, DataCopyParams)` block move (lowered on `PIPE_V` as `CopyUbufToUbuf` in
+   CANN 9.2.0's `dav_3510/kernel_operator_data_copy_impl.h`), `DeInterleave`, or a `Gather`
+   from contiguous UB. Never through fragmented GM access.
+2. **Both AIV subcores work in decode.** Heads split by `GetSubBlockIdx()`: subcore 0 takes the
+   first `ceil(M / 2)` heads of a task and subcore 1 the rest (the split `dualDstCtl = 0b01`
+   makes in M), and both GEMM products are Fixpiped with `dualDstCtl = 0b01`. 13.14.1's per-subcore UB fact is why dual-destination is needed. It is
+   not a reason to gate.
+3. **No Split-K and no combine at B=1, S <= 4096.** One fused launch over grid `[B, H_Q]`:
+   online softmax in UB, direct GM writeback of the output token, no workspace. Above 4096 the
+   reduction runs inside the same launch after an `AscendC::SyncAll`, never as a second
+   host-dispatched kernel.
+4. **No intra-loop `PipeBarrier<PIPE_V>` between arithmetic ops.** The stated reason is that
+   ccec tracks intra-pipe RAW/WAR hazards on the vector registers. Explicit event pairs stay
+   at the cross-pipe interfaces (MTE2 -> V, V -> MTE3, FIX -> V).
+   **Open question:** CANN's own `sigmoid_v100_impl.h` puts `PipeBarrier<PIPE_V>` between
+   dependent vector ops. The fused kernel therefore compiles the barriers behind a template
+   switch, and a test-only barriered instance runs as an A/B against it (13.25).
+
+### 13.25 The fused Cube decode (`TurboQuantFusedDecode`)
+
+`turboquant_mm_kernels.cpp` now carries `TurboQuantFusedDecode<MODE, scalar_t, VEC_BARRIERS>`
+and `turboquant_mm_fused_decode_impl`, which apply 13.24's four rules to the Cube multi-mode
+decode. The legacy `TurboQuantCubeDecodeSplit` + combine stays, unchanged and barriered, as the
+A/B reference. The dead fp16 reference chain (`TurboQuantFp16DecodeSplit`,
+`TurboQuantPlainCombine`, `turboquant_fp16_decode_impl`) is gone. It had no caller.
+
+| rule | what the kernel does |
+|---|---|
+| 1. wide bursts | One contiguous row-major GM read per tile plane (16 * D/2 B at H_KV = 1; one head's D/2 B per row at D >= 256; the whole row plane into UB otherwise), unpacked in UB and permuted to NZ with a UB -> UB `DataCopyParams` block move, then one MTE3 burst into L1 |
+| 2. both subcores | A task is (token, kv head, split, head chunk). Subcore 0 owns the first `ceil(M/2)` heads and stages the K plane, subcore 1 owns the rest and stages the V plane. `GemmScores<true>` / `GemmContext<true>` Fixpipe with `dualDstCtl = 1` over an even M. No `IsPrimarySubcore()` anywhere in it |
+| 3. one launch | Tokens with `context_len <= fusedContextLimit` run one split, normalise in UB and write the output token to GM. Longer ones write partials that the same launch reduces after `AscendC::SyncAll` |
+| 4. no intra-loop barriers | Every dependent vector op goes through `VecBarrier<VEC_BARRIERS>`, `kFusedVecBarriers = false`. Cross-pipe edges keep explicit `SetFlag`/`WaitFlag` events |
+
+Host planning is `PlanFusedDecode` in `common/turboquant_launch.cpp`. The helpers it shares with the
+legacy split (`BroadcastMul`, `UnpackAffine`, `CastToOperand`, `GemmScores`, `GemmContext`) took a
+template switch whose default is the old behaviour, so the legacy instance compiles as before.
+
+The shipping AIV decode (`turboquant_kernels.cpp`) took rule 4 in the same change.
+`AccumulateTile`, `RowSums` and `WriteOutput` switch 26 vector barriers behind
+`kPagedAttentionVecBarriers = false`, plus the barriers inside the three broadcast helpers they
+call. `WriteOutput`'s GM writeback uses a V -> MTE3 / MTE3 -> V event pair instead of two
+`PIPE_ALL` barriers. `ComputeSplit`'s initialisation barrier stays, because it orders two
+overlapping `Duplicate` writes. The combine and the reshape keep theirs.
+
+**Executed (camodel, Ascend950PR_9589, one process each, every `excp_log.dump` 0 B):**
+
+| test | shape | result |
+|---|---|---|
+| `test_sim_950pr_turboquant_fused` | kv4fp8, H_Q 4, H_KV 2, D 256, block 64, S 64, aiv 64 | fused: 1 launch, splits 1, block_dim 2, 2 heads/task, no sentinel left, cos 0.999407 vs fp32. **0 of 1024 elements differ from the legacy split + combine** (max abs err 0) |
+| `test_sim_950pr_turboquant_kernels` | AIV decode, barriers off | 10/10; decode vs CPU reference cos 1.000000, SNR 72.87 dB, relL2 2.27e-4, the same to printed precision as the barriered build |
+
+All three tiers build clean under `-Werror` (4 / 36 / 41 targets). The msprof trace harness's Cube
+leg now enqueues `TQ_FusedDecode` (one launch) in place of `TQ_DecodeSplit` + `TQ_Combine`.
+
+**Not executed:** kv3fp4 and kv5fp8 through the fused kernel (compiled only); any shape with a
+tail tile (`context_len % 64 != 0`, the `Min` mask path); head chunking (`H_Q / H_KV > 16`); the
+in-launch reduction (`context_len > 4096`, which the camodel policy keeps off the simulator); and
+anything on silicon. The camodel wall times in the test output are not latency.

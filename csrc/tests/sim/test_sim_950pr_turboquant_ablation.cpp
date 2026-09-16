@@ -494,7 +494,7 @@ TEST(TurboQuantDecodeAblation, CutStagesExitCleanOnTheCamodel) {
   watchdog.Arm("the query rotation");
   const vllm_ascend::turboquant::RotateQPlan rotate_plan =
       tqh::RotateQuery(stream, AscendType::FP16, query_dev.get(), pi_signs.get(), h16.get(), rot_tables.get(),
-                       query_rot.get(), kBatch, kNumHeads, kHeadSize, aiv_num, true);
+                       query_rot.get(), kBatch, kNumHeads, kHeadSize, aiv_num);
   ACL_CHECK(aclrtSynchronizeStream(stream));
   watchdog.Disarm();
   std::printf("[ ablation ] query rotated once for every stage: %s path, %u blocks x %u vectors, chunk %u\n",
@@ -647,7 +647,7 @@ TEST(TurboQuantDecodeAblation, BypassUnpackKeepsThePipelineOnTheCamodel) {
   watchdog.Arm("the query rotation");
   const vllm_ascend::turboquant::RotateQPlan rotate_plan =
       tqh::RotateQuery(stream, AscendType::FP16, query_dev.get(), pi_signs.get(), h16.get(), rot_tables.get(),
-                       query_rot.get(), kBatch, kBypassNumHeads, kHeadSize, aiv_num, true);
+                       query_rot.get(), kBatch, kBypassNumHeads, kHeadSize, aiv_num);
   ACL_CHECK(aclrtSynchronizeStream(stream));
   watchdog.Disarm();
   const std::vector<float> reference = HostAttention(context_len, kBypassNumHeads, kBypassNumKvHeads,

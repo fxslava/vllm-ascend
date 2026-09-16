@@ -65,7 +65,8 @@ TURBOQUANT_OP_SCHEMAS = {
     ),
     "npu_turboquant_vector_core_num": "npu_turboquant_vector_core_num() -> int",
     "npu_turboquant_workspace_size": (
-        "npu_turboquant_workspace_size(int num_tokens, int num_heads, int head_size, int max_blocks_per_seq) -> int"
+        "npu_turboquant_workspace_size(int num_tokens, int num_heads, int head_size, int max_blocks_per_seq, "
+        "int block_size) -> int"
     ),
 }
 
@@ -76,6 +77,7 @@ _DEVICE_QUERY_DISPATCH_KEY = "CompositeExplicitAutograd"
 
 # turboquant_adpt
 _MAX_SEQUENCE_SPLITS = 8
+_FUSED_CONTEXT_LIMIT = 4096
 _PARTIAL_TAIL = 16
 _FP32_PER_BLOCK = 8
 _TILE_ROWS = 16
@@ -112,15 +114,19 @@ def codec_table_words(head_size: int, batch_rows: int) -> int:
 
 
 def paged_attention_workspace_floats(
-    num_tokens: int, num_heads: int, head_size: int, max_blocks_per_seq: int, vector_cores: int
+    num_tokens: int, num_heads: int, head_size: int, max_blocks_per_seq: int, block_size: int, vector_cores: int
 ) -> int:
     """``PlanPagedAttention(...).workspace_floats``."""
     base_tasks = num_tokens * num_heads
     if base_tasks <= 0:
         return 0
-    num_splits = _ceil_div(vector_cores, base_tasks)
-    num_splits = min(num_splits, min(_MAX_SEQUENCE_SPLITS, max(1, max_blocks_per_seq)))
-    num_splits = max(num_splits, 1)
+    blocks = max(1, max_blocks_per_seq)
+    if blocks * block_size <= _FUSED_CONTEXT_LIMIT:
+        return 0
+    num_splits = max(_ceil_div(vector_cores, base_tasks), _ceil_div(blocks * block_size, _FUSED_CONTEXT_LIMIT))
+    num_splits = min(num_splits, min(_MAX_SEQUENCE_SPLITS, blocks))
+    if num_splits <= 1:
+        return 0
     return base_tasks * num_splits * (head_size + _PARTIAL_TAIL)
 
 
@@ -357,7 +363,9 @@ def _paged_attention(
     if num_tokens == 0:
         return
 
-    needed = paged_attention_workspace_floats(num_tokens, num_heads, head_size, max_blocks_per_seq, vector_cores)
+    needed = paged_attention_workspace_floats(
+        num_tokens, num_heads, head_size, max_blocks_per_seq, block_size, vector_cores
+    )
     _check(workspace.dtype == torch.float32, "the decode workspace must be float32, got ", workspace.dtype)
     _check(workspace.is_contiguous(), "the decode workspace must be contiguous")
     _check(
@@ -405,14 +413,17 @@ def _paged_attention(
 
 
 def _workspace_size(
-    num_tokens: int, num_heads: int, head_size: int, max_blocks_per_seq: int, *, vector_cores: int
+    num_tokens: int, num_heads: int, head_size: int, max_blocks_per_seq: int, block_size: int, *, vector_cores: int
 ) -> int:
     _check(
         num_tokens >= 0 and num_heads > 0,
         "workspace sizing needs num_tokens >= 0 and num_heads > 0, got ", num_tokens, " and ", num_heads,
     )  # fmt: skip
+    _check(block_size > 0, "workspace sizing needs block_size > 0, got ", block_size)
     _check_head_size(head_size)
-    return paged_attention_workspace_floats(num_tokens, num_heads, head_size, max_blocks_per_seq, vector_cores)
+    return paged_attention_workspace_floats(
+        num_tokens, num_heads, head_size, max_blocks_per_seq, block_size, vector_cores
+    )
 
 
 def cpu_fused_infer_attention_score(

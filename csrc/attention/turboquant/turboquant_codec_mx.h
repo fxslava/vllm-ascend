@@ -290,7 +290,7 @@ public:
         CastToOperand(dst, low_, n);
     }
 
-    template <typename OperandT>
+    template <typename OperandT, bool VEC_BARRIERS = true>
     __aicore__ inline void UnpackAffine(const AscendC::LocalTensor<OperandT> &dstLow,
                                         const AscendC::LocalTensor<OperandT> &dstHigh,
                                         const AscendC::LocalTensor<int8_t> &srcPacked, uint32_t bytes)
@@ -302,29 +302,29 @@ public:
 
         AscendC::LocalTensor<half> nibbles = msb_.ReinterpretCast<half>();
         AscendC::Cast(nibbles, srcPacked.ReinterpretCast<int4b_t>(), AscendC::RoundMode::CAST_NONE, elems);
-        AscendC::PipeBarrier<PIPE_V>();
+        VecBarrier<VEC_BARRIERS>();
 
         AscendC::LocalTensor<half> planes = expand_.ReinterpretCast<half>();
         AscendC::DeInterleave(planes, planes[bytes], nibbles, static_cast<int32_t>(elems));
-        AscendC::PipeBarrier<PIPE_V>();
+        VecBarrier<VEC_BARRIERS>();
 
-        ExpandNibblePlane(dstLow, planes, bytes);
-        ExpandNibblePlane(dstHigh, planes[bytes], bytes);
+        ExpandNibblePlane<OperandT, VEC_BARRIERS>(dstLow, planes, bytes);
+        ExpandNibblePlane<OperandT, VEC_BARRIERS>(dstHigh, planes[bytes], bytes);
     }
 
-    template <typename OperandT>
+    template <typename OperandT, bool VEC_BARRIERS = true>
     __aicore__ inline void CastToOperand(const AscendC::LocalTensor<OperandT> &dst,
                                          const AscendC::LocalTensor<float> &src, uint32_t n)
     {
         if constexpr (kIsFp4) {
             AscendC::LocalTensor<bfloat16_t> bf = scratch_.ReinterpretCast<bfloat16_t>();
             AscendC::Cast(bf, src, AscendC::RoundMode::CAST_RINT, n);
-            AscendC::PipeBarrier<PIPE_V>();
+            VecBarrier<VEC_BARRIERS>();
             AscendC::Cast(dst, bf, AscendC::RoundMode::CAST_RINT, n);
-            AscendC::PipeBarrier<PIPE_V>();
+            VecBarrier<VEC_BARRIERS>();
         } else {
             AscendC::Cast(dst, src, AscendC::RoundMode::CAST_RINT, n);
-            AscendC::PipeBarrier<PIPE_V>();
+            VecBarrier<VEC_BARRIERS>();
         }
     }
 
@@ -341,15 +341,15 @@ private:
     static constexpr float kNibbleSignShift = static_cast<float>(Planes::kLowRadix / 2);
     static constexpr float kSignedLevelOffset = kNibbleSignShift - kAffineBias;
 
-    template <typename OperandT>
+    template <typename OperandT, bool VEC_BARRIERS>
     __aicore__ inline void ExpandNibblePlane(const AscendC::LocalTensor<OperandT> &dst,
                                              const AscendC::LocalTensor<half> &plane, uint32_t bytes)
     {
         AscendC::Cast(msb_, plane, AscendC::RoundMode::CAST_NONE, bytes);
-        AscendC::PipeBarrier<PIPE_V>();
+        VecBarrier<VEC_BARRIERS>();
         AscendC::Adds(msb_, msb_, kSignedLevelOffset, bytes);
-        AscendC::PipeBarrier<PIPE_V>();
-        CastToOperand(dst, msb_, bytes);
+        VecBarrier<VEC_BARRIERS>();
+        CastToOperand<OperandT, VEC_BARRIERS>(dst, msb_, bytes);
     }
 
     __aicore__ static inline void FloorInPlace(const AscendC::LocalTensor<float> &x, uint32_t count)
