@@ -646,7 +646,7 @@ class Scenario {
         static_cast<uint32_t>(config_.model.head_size), static_cast<uint32_t>(kBlockSize),
         static_cast<uint32_t>(config_.blocks_per_seq()), static_cast<uint32_t>(cube_grid_.num_splits),
         cube_grid_.heads_per_task, cube_grid_.tasks_per_block, cube_grid_.reduce_tasks_per_block,
-        static_cast<uint32_t>(tqh::kFusedContextLimit), config_.attention_scale(), config_.attention_scale());
+        cube_grid_.fused_context_limit, config_.attention_scale(), config_.attention_scale());
   }
 
   void EnqueueDecodeAttnCore(aclrtStream stream) const {

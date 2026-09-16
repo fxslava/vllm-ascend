@@ -55,8 +55,10 @@ struct FusedRun {
   int64_t num_splits = 1;
   uint32_t block_dim = 0;
   uint32_t heads_per_task = 0;
+  uint32_t fused_context_limit = 0;
   int64_t launches = 0;
   size_t untouched = 0;
+  uint64_t fnv1a = 0;
   double host_s = 0.0;
 };
 
@@ -79,6 +81,22 @@ inline double FusedCosine(const std::vector<float>& a, const std::vector<float>&
     return 0.0;
   }
   return dot / (std::sqrt(na) * std::sqrt(nb));
+}
+
+// FNV-1a over the output's half bit patterns, low byte first: the regression golden of a launch.
+inline uint64_t Fnv1a64(const std::vector<Half>& raw) {
+  constexpr uint64_t kOffsetBasis = 0xcbf29ce484222325ull;
+  constexpr uint64_t kPrime = 0x100000001b3ull;
+  constexpr unsigned kByteBits = 8;
+  constexpr uint32_t kByteMask = 0xff;
+  uint64_t hash = kOffsetBasis;
+  for (const Half& value : raw) {
+    for (unsigned byte = 0; byte < sizeof(value.bits); ++byte) {
+      hash ^= static_cast<uint64_t>((static_cast<uint32_t>(value.bits) >> (byte * kByteBits)) & kByteMask);
+      hash *= kPrime;
+    }
+  }
+  return hash;
 }
 
 inline FusedAgreement CompareValues(const std::vector<float>& a, const std::vector<float>& b) {
@@ -131,21 +149,27 @@ class FusedCubeScenario {
     query_rot_host_ = query_rot_.ToHost<float>();
   }
 
-  FusedRun RunFused(int64_t fused_context_limit = kFusedContextLimit) { return Run(false, fused_context_limit); }
+  // plan_aiv is the vector-core budget the planner tiles for (0: the device's own); a smaller budget
+  // than the device has forces fewer, wider tasks without changing the kernel.
+  FusedDecodeGrid Plan(int64_t plan_aiv = 0, FusedSplitPolicy split_policy = FusedSplitPolicy::kFillBlocks) const {
+    return PlanFusedDecode(1, shape_.num_heads, shape_.num_kv_heads, shape_.head_size, blocks_per_seq_,
+                           shape_.block_size, plan_aiv > 0 ? plan_aiv : aiv_num_, kFusedContextLimit, split_policy);
+  }
+
+  FusedRun RunFused(const FusedDecodeGrid& grid) { return Run(grid, false); }
 
   // The same grid through the test-only instance that keeps every vector barrier: the bit-exact A/B
   // reference for the barrier-free kernel.
-  FusedRun RunBarriered(int64_t fused_context_limit = kFusedContextLimit) { return Run(true, fused_context_limit); }
+  FusedRun RunBarriered(const FusedDecodeGrid& grid) { return Run(grid, true); }
 
-  FusedRun Run(bool barriered, int64_t fused_context_limit) {
+  FusedRun Run(const FusedDecodeGrid& grid, bool barriered) {
     const int64_t d = shape_.head_size;
-    const FusedDecodeGrid grid = PlanFusedDecode(1, shape_.num_heads, shape_.num_kv_heads, d, blocks_per_seq_,
-                                                 shape_.block_size, aiv_num_, fused_context_limit);
     DeviceBuffer workspace = DeviceBuffer::Empty<float>(grid.workspace_floats);
     FusedRun run;
     run.num_splits = grid.num_splits;
     run.block_dim = grid.block_dim;
     run.heads_per_task = grid.heads_per_task;
+    run.fused_context_limit = grid.fused_context_limit;
     run.launches = 1;
     PoisonOutput();
     const float inv_sqrt_len = 1.0f / std::sqrt(static_cast<float>(d));
@@ -157,7 +181,7 @@ class FusedCubeScenario {
           out_.get(), 1, static_cast<uint32_t>(shape_.num_heads), static_cast<uint32_t>(shape_.num_kv_heads),
           static_cast<uint32_t>(d), static_cast<uint32_t>(shape_.block_size), static_cast<uint32_t>(blocks_per_seq_),
           static_cast<uint32_t>(grid.num_splits), grid.heads_per_task, grid.tasks_per_block,
-          grid.reduce_tasks_per_block, static_cast<uint32_t>(fused_context_limit), scale_, inv_sqrt_len);
+          grid.reduce_tasks_per_block, grid.fused_context_limit, scale_, inv_sqrt_len);
     } else {
       turboquant_mm_fused_decode_impl(
           static_cast<int32_t>(kFusedMode), AscendType::FP16, stream_, grid.block_dim, query_rot_.get(),
@@ -166,7 +190,7 @@ class FusedCubeScenario {
           static_cast<uint32_t>(shape_.num_kv_heads), static_cast<uint32_t>(d),
           static_cast<uint32_t>(shape_.block_size), static_cast<uint32_t>(blocks_per_seq_),
           static_cast<uint32_t>(grid.num_splits), grid.heads_per_task, grid.tasks_per_block,
-          grid.reduce_tasks_per_block, static_cast<uint32_t>(fused_context_limit), scale_, inv_sqrt_len);
+          grid.reduce_tasks_per_block, grid.fused_context_limit, scale_, inv_sqrt_len);
     }
     ACL_CHECK(aclrtSynchronizeStream(stream_));
     run.host_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -219,6 +243,7 @@ class FusedCubeScenario {
     run->raw = out_.ToHost<Half>();
     run->output = HalfToFloat(run->raw);
     run->untouched = static_cast<size_t>(std::count(run->output.begin(), run->output.end(), kFusedOutputSentinel));
+    run->fnv1a = Fnv1a64(run->raw);
   }
 
   FusedShape shape_;

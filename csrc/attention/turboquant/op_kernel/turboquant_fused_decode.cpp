@@ -41,6 +41,7 @@ using vllm_ascend::turboquant::kGatherSrcBase;
 using vllm_ascend::turboquant::kVectorSubcoresPerBlock;
 using vllm_ascend::turboquant::MixBlockIdx;
 using vllm_ascend::turboquant::ScaleSlotFloats;
+using vllm_ascend::turboquant::SyncVectorToMte2;
 using vllm_ascend::turboquant::TurboQuantCodec4;
 using vllm_ascend::turboquant::TurboQuantCubeDecodeService;
 using vllm_ascend::turboquant::TurboQuantCubeMm;
@@ -363,6 +364,11 @@ private:
         const TurboQuantTaskHeads heads = Vector::Heads(kvHead * groupHeads_ + offset, rows);
 
         if ASCEND_IS_AIV {
+            if constexpr (Vector::kBatched) {
+                // Nothing drains the vector unit between tasks, and the previous task's vector work may still
+                // read the query buffer and an ingest slot. This task's reads must land behind it.
+                SyncVectorToMte2();
+            }
             vector_.BeginTask(heads);
         }
 
@@ -462,6 +468,10 @@ private:
         if (numTiles == 0) {
             return;
         }
+        if constexpr (Vector::kBatched) {
+            PipelineAivRing(token, contextLen, blockStart, blockEnd, numTiles, kvHead, heads);
+            return;
+        }
         TileCursor stageCursor;
         TileCursor consumeCursor;
         stageCursor.block = blockStart;
@@ -476,7 +486,7 @@ private:
             NextTile(consumeCursor, token, contextLen, blockEnd);
 
             AscendC::CrossCoreWaitFlag(kFlagScoresReady);
-            vector_.SoftmaxStageProbs(mm_, consumeCursor.valid, heads);
+            vector_.SoftmaxStageProbs(mm_, consumeCursor.valid, heads, 0);
             AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(kFlagProbsReady);
             vector_.SoftmaxRescaleAcc(heads);
 
@@ -487,6 +497,56 @@ private:
                 NextTile(stageCursor, token, contextLen, blockEnd);
                 vector_.StageTile(mm_, stageCursor.physical, stageCursor.base, kvHead, nextSlotIdx, true);
                 SignalSlotReady(nextSlotIdx);
+            }
+
+            AscendC::CrossCoreWaitFlag(kFlagContextReady);
+            vector_.Accumulate(heads);
+        }
+    }
+
+    // The same pipeline with the MTE2 half of the ingest a tile further ahead. Tile t reads into ingest
+    // slot t % kCubeSlots; the first two are read up front and tile t + 2 as soon as tile t's softmax has
+    // consumed its scale lanes, so the read overlaps tile t + 1's stage, GEMMs and accumulation, and a
+    // stage only waits on its own slot's read.
+    __aicore__ inline void PipelineAivRing(uint32_t token, uint32_t contextLen, uint32_t blockStart,
+                                           uint32_t blockEnd, uint32_t numTiles, uint32_t kvHead,
+                                           const TurboQuantTaskHeads &heads)
+    {
+        TileCursor readCursor;
+        TileCursor consumeCursor;
+        readCursor.block = blockStart;
+        consumeCursor.block = blockStart;
+
+        const uint32_t primed = numTiles < kCubeSlots ? numTiles : kCubeSlots;
+        for (uint32_t slot = 0; slot < primed; ++slot) {
+            NextTile(readCursor, token, contextLen, blockEnd);
+            vector_.ReadTile(readCursor.physical, readCursor.base, kvHead, slot);
+        }
+        vector_.StageSlot(mm_, kvHead, 0);
+        SignalSlotReady(0);
+
+        for (uint32_t tileIdx = 0; tileIdx < numTiles; ++tileIdx) {
+            const uint32_t slot = tileIdx % kCubeSlots;
+            const uint32_t nextSlot = (tileIdx + 1) % kCubeSlots;
+            NextTile(consumeCursor, token, contextLen, blockEnd);
+
+            AscendC::CrossCoreWaitFlag(kFlagScoresReady);
+            vector_.SoftmaxStageProbs(mm_, consumeCursor.valid, heads, slot);
+            AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(kFlagProbsReady);
+
+            if (tileIdx + kCubeSlots < numTiles) {
+                SyncVectorToMte2();
+                NextTile(readCursor, token, contextLen, blockEnd);
+                vector_.ReadTile(readCursor.physical, readCursor.base, kvHead, slot);
+            }
+            vector_.SoftmaxRescaleAcc(heads);
+
+            if (tileIdx + 1 < numTiles) {
+                if (tileIdx + 1 >= kCubeSlots) {
+                    AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kFlagSlotFree + nextSlot));
+                }
+                vector_.StageSlot(mm_, kvHead, nextSlot);
+                SignalSlotReady(nextSlot);
             }
 
             AscendC::CrossCoreWaitFlag(kFlagContextReady);

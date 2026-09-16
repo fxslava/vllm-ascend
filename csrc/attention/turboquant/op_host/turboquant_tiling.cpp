@@ -105,7 +105,7 @@ PagedAttentionGrid PlanPagedAttention(int64_t num_tokens, int64_t num_heads, int
 
 FusedDecodeGrid PlanFusedDecode(int64_t num_tokens, int64_t num_heads, int64_t num_kv_heads, int64_t head_size,
                                 int64_t max_blocks_per_seq, int64_t block_size, int64_t aiv_num,
-                                int64_t fused_context_limit)
+                                int64_t fused_context_limit, FusedSplitPolicy split_policy)
 {
     FusedDecodeGrid grid;
     if (num_tokens <= 0 || num_heads <= 0 || num_kv_heads <= 0) {
@@ -120,23 +120,38 @@ FusedDecodeGrid PlanFusedDecode(int64_t num_tokens, int64_t num_heads, int64_t n
     const int64_t blocks = std::max<int64_t>(1, max_blocks_per_seq);
     const int64_t context_bound = blocks * block_size;
 
+    // Head chunks per GQA group once `groups` (token, kv head, split) triples share the blocks.
+    const auto chunks_for = [&](int64_t groups) -> int64_t {
+        if (group <= 1) {
+            return 1;
+        }
+        const int64_t fewest_chunks = CeilDiv64(group, tile_m);
+        const int64_t most_chunks = CeilDiv64(group, subcores);
+        return std::min(std::max(CeilDiv64(mix_blocks, groups), fewest_chunks), most_chunks);
+    };
+
     int64_t num_splits = 1;
+    int64_t launch_limit = fused_context_limit;
     if (context_bound > fused_context_limit) {
         const int64_t by_context =
             fused_context_limit > 0 ? CeilDiv64(context_bound, fused_context_limit) : max_splits;
         num_splits = std::max(CeilDiv64(mix_blocks, num_tokens * num_kv_heads), by_context);
         num_splits = std::min(num_splits, std::min(max_splits, blocks));
+    } else if (split_policy == FusedSplitPolicy::kFillBlocks) {
+        // Only as many splits as leave every task a block of its own: the chunking at one split is
+        // what a split multiplies, and it does not change once the splits fit.
+        const int64_t unsplit_tasks = num_tokens * num_kv_heads * chunks_for(num_tokens * num_kv_heads);
+        const int64_t fill = std::min(std::min(max_splits, blocks), mix_blocks / unsplit_tasks);
+        if (fill > 1) {
+            num_splits = fill;
+            launch_limit = 0;
+        }
     }
     grid.num_splits = num_splits;
+    grid.fused_context_limit = static_cast<uint32_t>(std::max<int64_t>(0, launch_limit));
 
     const int64_t groups = num_tokens * num_kv_heads * num_splits;
-    int64_t heads_per_task = 1;
-    if (group > 1) {
-        const int64_t fewest_chunks = CeilDiv64(group, tile_m);
-        const int64_t most_chunks = CeilDiv64(group, subcores);
-        const int64_t chunks = std::min(std::max(CeilDiv64(mix_blocks, groups), fewest_chunks), most_chunks);
-        heads_per_task = CeilDiv64(group, chunks);
-    }
+    const int64_t heads_per_task = group > 1 ? CeilDiv64(group, chunks_for(groups)) : 1;
     grid.heads_per_task = static_cast<uint32_t>(heads_per_task);
 
     const int64_t tasks = groups * CeilDiv64(group, heads_per_task);

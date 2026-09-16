@@ -89,6 +89,7 @@ constexpr int64_t kFallbackVectorCoreNum = 8;
 
 using tqt::CodecTableWords;
 using tqt::FusedDecodeGrid;
+using tqt::FusedSplitPolicy;
 using tqt::PackedCacheBytes;
 using tqt::PagedAttentionGrid;
 using tqt::PlanFusedDecode;

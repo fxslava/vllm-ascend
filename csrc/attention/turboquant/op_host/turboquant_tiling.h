@@ -64,13 +64,22 @@ PagedAttentionGrid PlanPagedAttention(int64_t num_tokens, int64_t num_heads, int
                                       int64_t max_blocks_per_seq, int64_t block_size, int64_t aiv_num,
                                       int64_t fused_context_limit = kFusedContextLimit);
 
+// Whether the Cube decode also splits a context inside the fused limit, to put the MIX blocks one task
+// per (token, kv head) leaves idle to work. The splits are reduced in the same launch either way.
+enum class FusedSplitPolicy : uint32_t {
+    kContextOnly = 0,
+    kFillBlocks = 1,
+};
+
 // The Cube decode. Tasks are (token, kv head, split, head chunk) over the AIC blocks; each task's heads
-// are shared between the block's two vector subcores.
+// are shared between the block's two vector subcores. fused_context_limit is what the launch has to be
+// told: 0 when the grid splits a context the caller's limit would have kept whole.
 struct FusedDecodeGrid {
     uint32_t block_dim = 0;
     uint32_t tasks_per_block = 0;
     uint32_t reduce_tasks_per_block = 0;
     uint32_t heads_per_task = 0;
+    uint32_t fused_context_limit = kFusedContextLimit;
     int64_t num_splits = 1;
     int64_t num_tasks = 0;
     size_t workspace_floats = 0;
@@ -78,7 +87,8 @@ struct FusedDecodeGrid {
 
 FusedDecodeGrid PlanFusedDecode(int64_t num_tokens, int64_t num_heads, int64_t num_kv_heads, int64_t head_size,
                                 int64_t max_blocks_per_seq, int64_t block_size, int64_t aiv_num,
-                                int64_t fused_context_limit = kFusedContextLimit);
+                                int64_t fused_context_limit = kFusedContextLimit,
+                                FusedSplitPolicy split_policy = FusedSplitPolicy::kFillBlocks);
 
 // The query rotation Pi = D H D: on the Cube (Mmad over a 16x16 fp16 Hadamard plus AIV butterflies)
 // when there are enough vectors to be worth staging, on the AIV cores alone otherwise.

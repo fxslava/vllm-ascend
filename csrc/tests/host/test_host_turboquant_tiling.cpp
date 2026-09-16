@@ -16,8 +16,9 @@
 
 // The TurboQuant host tiling (op_host/turboquant_tiling.cpp) is what the adapter compiles into the wheel.
 // These are its contracts, checked without a toolkit: a context inside the fused limit is one launch with
-// no workspace, a split launch sizes its workspace for every partial, every task lands on a block, and a
-// Cube task never carries more heads than the Cube's M fractal.
+// no workspace unless the Cube planner splits it to fill idle MIX blocks, a split launch sizes its
+// workspace for every partial, every task lands on a block, and a Cube task never carries more heads than
+// the Cube's M fractal.
 
 #include <gtest/gtest.h>
 
@@ -73,33 +74,104 @@ TEST(TurboQuantTiling, PagedAttentionIsOneLaunchWithoutWorkspaceInsideTheFusedLi
 }
 
 TEST(TurboQuantTiling, FusedDecodeTasksCoverEveryHeadOnTheCubeFractal) {
-  for (const int64_t aiv : kVectorCores) {
-    for (const int64_t tokens : {1, 8}) {
-      for (const int64_t kv_heads : {1, 2, 4}) {
-        for (const int64_t group : {1, 2, 5, 16, 20}) {
-          for (const int64_t blocks : {1, 4, 64}) {
-            const int64_t heads = kv_heads * group;
-            const tqt::FusedDecodeGrid grid = tqt::PlanFusedDecode(
-                tokens, heads, kv_heads, kHeadSize, blocks, static_cast<int64_t>(tqt::kCubeTileRows), aiv);
-            const std::string where = "aiv " + std::to_string(aiv) + " tokens " + std::to_string(tokens) +
-                                      " kv_heads " + std::to_string(kv_heads) + " group " + std::to_string(group) +
-                                      " blocks " + std::to_string(blocks);
-            ASSERT_GE(grid.heads_per_task, 1u) << where;
-            ASSERT_LE(grid.heads_per_task, tqt::kCubeTileM) << where;
-            ASSERT_LE(static_cast<int64_t>(grid.heads_per_task), group) << where;
-            const int64_t chunks = (group + grid.heads_per_task - 1) / grid.heads_per_task;
-            ASSERT_EQ(grid.num_tasks, tokens * kv_heads * grid.num_splits * chunks) << where;
-            ASSERT_GE(static_cast<int64_t>(grid.block_dim) * grid.tasks_per_block, grid.num_tasks) << where;
-            ASSERT_LE(static_cast<int64_t>(grid.block_dim), std::max<int64_t>(1, aiv / 2)) << where;
-            if (blocks * static_cast<int64_t>(tqt::kCubeTileRows) <= static_cast<int64_t>(tqt::kFusedContextLimit)) {
-              EXPECT_EQ(grid.num_splits, 1) << where;
-              EXPECT_EQ(grid.workspace_floats, 0u) << where;
+  for (const tqt::FusedSplitPolicy policy : {tqt::FusedSplitPolicy::kContextOnly, tqt::FusedSplitPolicy::kFillBlocks}) {
+    for (const int64_t aiv : kVectorCores) {
+      for (const int64_t tokens : {1, 8}) {
+        for (const int64_t kv_heads : {1, 2, 4, 8}) {
+          for (const int64_t group : {1, 2, 5, 16, 20}) {
+            for (const int64_t blocks : {1, 2, 4, 64, 128}) {
+              const int64_t heads = kv_heads * group;
+              const int64_t mix_blocks = std::max<int64_t>(1, aiv / 2);
+              const tqt::FusedDecodeGrid grid =
+                  tqt::PlanFusedDecode(tokens, heads, kv_heads, kHeadSize, blocks,
+                                       static_cast<int64_t>(tqt::kCubeTileRows), aiv, tqt::kFusedContextLimit, policy);
+              const std::string where =
+                  "policy " + std::to_string(static_cast<int>(policy)) + " aiv " + std::to_string(aiv) + " tokens " +
+                  std::to_string(tokens) + " kv_heads " + std::to_string(kv_heads) + " group " +
+                  std::to_string(group) + " blocks " + std::to_string(blocks);
+              ASSERT_GE(grid.heads_per_task, 1u) << where;
+              ASSERT_LE(grid.heads_per_task, tqt::kCubeTileM) << where;
+              ASSERT_LE(static_cast<int64_t>(grid.heads_per_task), group) << where;
+              const int64_t chunks = (group + grid.heads_per_task - 1) / grid.heads_per_task;
+              ASSERT_EQ(grid.num_tasks, tokens * kv_heads * grid.num_splits * chunks) << where;
+              ASSERT_GE(static_cast<int64_t>(grid.block_dim) * grid.tasks_per_block, grid.num_tasks) << where;
+              ASSERT_LE(static_cast<int64_t>(grid.block_dim), mix_blocks) << where;
+              ASSERT_GE(grid.num_splits, 1) << where;
+              ASSERT_LE(grid.num_splits, std::min<int64_t>(blocks, tqt::kMaxSequenceSplits)) << where;
+              if (grid.num_splits > 1) {
+                EXPECT_EQ(grid.workspace_floats,
+                          static_cast<size_t>(tokens * heads * grid.num_splits *
+                                              (kHeadSize + static_cast<int64_t>(tqt::kPartialTail))))
+                    << where;
+                EXPECT_GE(static_cast<int64_t>(grid.block_dim) * grid.reduce_tasks_per_block, tokens * heads)
+                    << where;
+              } else {
+                EXPECT_EQ(grid.workspace_floats, 0u) << where;
+              }
+              if (blocks * static_cast<int64_t>(tqt::kCubeTileRows) > static_cast<int64_t>(tqt::kFusedContextLimit)) {
+                EXPECT_EQ(grid.fused_context_limit, tqt::kFusedContextLimit) << where;
+                continue;
+              }
+              if (policy == tqt::FusedSplitPolicy::kContextOnly) {
+                EXPECT_EQ(grid.num_splits, 1) << where;
+                EXPECT_EQ(grid.fused_context_limit, tqt::kFusedContextLimit) << where;
+                continue;
+              }
+              // Filling splits a context inside the limit only when every task still gets a block of its
+              // own, and then the launch must be told to reduce them.
+              if (grid.num_splits > 1) {
+                EXPECT_EQ(grid.fused_context_limit, 0u) << where;
+                EXPECT_EQ(grid.tasks_per_block, 1u) << where;
+                EXPECT_LE(grid.num_tasks, mix_blocks) << where;
+              } else {
+                EXPECT_EQ(grid.fused_context_limit, tqt::kFusedContextLimit) << where;
+                EXPECT_TRUE(blocks == 1 || 2 * tokens * kv_heads * chunks > mix_blocks) << where;
+              }
             }
           }
         }
       }
     }
   }
+}
+
+TEST(TurboQuantTiling, FusedDecodeFillsEveryMixBlockAtTheSingleTokenBaseline) {
+  constexpr int64_t kAiv = 64;
+  constexpr int64_t kMixBlocks = kAiv / 2;
+  constexpr int64_t kBaselineHeads = 16;
+  constexpr int64_t kBaselineKvHeads = 8;
+  constexpr int64_t kContextBlocks = 32;
+  constexpr int64_t kSplits = 4;
+  const tqt::FusedDecodeGrid grid = tqt::PlanFusedDecode(
+      1, kBaselineHeads, kBaselineKvHeads, kHeadSize, kContextBlocks, static_cast<int64_t>(tqt::kCubeTileRows), kAiv);
+  EXPECT_EQ(grid.num_splits, kSplits);
+  EXPECT_EQ(grid.heads_per_task, 2u);
+  EXPECT_EQ(grid.num_tasks, kMixBlocks);
+  EXPECT_EQ(grid.block_dim, static_cast<uint32_t>(kMixBlocks));
+  EXPECT_EQ(grid.tasks_per_block, 1u);
+  EXPECT_EQ(grid.fused_context_limit, 0u);
+  EXPECT_EQ(grid.reduce_tasks_per_block, 1u);
+
+  const tqt::FusedDecodeGrid unsplit =
+      tqt::PlanFusedDecode(1, kBaselineHeads, kBaselineKvHeads, kHeadSize, kContextBlocks,
+                           static_cast<int64_t>(tqt::kCubeTileRows), kAiv, tqt::kFusedContextLimit,
+                           tqt::FusedSplitPolicy::kContextOnly);
+  EXPECT_EQ(unsplit.num_splits, 1);
+  EXPECT_EQ(unsplit.block_dim, static_cast<uint32_t>(kBaselineKvHeads));
+  EXPECT_EQ(unsplit.fused_context_limit, tqt::kFusedContextLimit);
+
+  // The msprof trace's Cube leg, DeepSeek-V4-Flash at S 2048 and block 128: eight 2-head chunks of the
+  // 16:1 group, each split four times.
+  constexpr int64_t kTraceHeads = 16;
+  constexpr int64_t kTraceKvHeads = 1;
+  constexpr int64_t kTraceBlockSize = 128;
+  constexpr int64_t kTraceContext = 2048;
+  const tqt::FusedDecodeGrid trace = tqt::PlanFusedDecode(1, kTraceHeads, kTraceKvHeads, kHeadSize,
+                                                          kTraceContext / kTraceBlockSize, kTraceBlockSize, kAiv);
+  EXPECT_EQ(trace.num_splits, kSplits);
+  EXPECT_EQ(trace.heads_per_task, 2u);
+  EXPECT_EQ(trace.block_dim, static_cast<uint32_t>(kMixBlocks));
+  EXPECT_EQ(trace.fused_context_limit, 0u);
 }
 
 TEST(TurboQuantTiling, RotateQStagesTheCubeOnlyWithEvenDualDestinationChunks) {

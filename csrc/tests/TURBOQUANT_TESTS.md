@@ -28,6 +28,8 @@ Companion documents: [README.md](README.md) for how to build and run the suite,
 - [13. Multi-mode TurboQuant and the Cube-native decode](#13-multi-mode-turboquant-and-the-cube-native-decode)
   - [13.24 Corrections from silicon profiling](#1324-corrections-from-silicon-profiling-2026-09-16)
   - [13.25 The fused Cube decode](#1325-the-fused-cube-decode-turboquantfuseddecode)
+  - [13.26 Filled MIX blocks, the ingest ring and the head-batched softmax](#1326-filled-mix-blocks-the-ingest-ring-and-the-head-batched-softmax)
+  - [13.27 CAModel cycle profile of 13.26](#1327-camodel-cycle-profile-of-1326-2026-09-17)
 
 ---
 
@@ -3347,6 +3349,9 @@ neither HBM throughput nor dispatch cost.
 
 ### 13.25 The fused Cube decode (`TurboQuantFusedDecode`)
 
+> **See 13.26.** The tail-tile mask path and the in-launch reduction listed as not executed below
+> now run on the camodel, and the kv4fp8 instance's ingest and softmax changed shape.
+
 `turboquant_mm_kernels.cpp` now carries `TurboQuantFusedDecode<MODE, scalar_t, VEC_BARRIERS>`
 and `turboquant_mm_fused_decode_impl`, which apply 13.24's four rules to the Cube multi-mode
 decode. The legacy `TurboQuantCubeDecodeSplit` + combine stays, unchanged and barriered, as the
@@ -3385,3 +3390,195 @@ leg now enqueues `TQ_FusedDecode` (one launch) in place of `TQ_DecodeSplit` + `T
 tail tile (`context_len % 64 != 0`, the `Min` mask path); head chunking (`H_Q / H_KV > 16`); the
 in-launch reduction (`context_len > 4096`, which the camodel policy keeps off the simulator); and
 anything on silicon. The camodel wall times in the test output are not latency.
+
+### 13.26 Filled MIX blocks, the ingest ring and the head-batched softmax
+
+Three changes aimed at the fused decode's silicon latency: 126.34 us per decode step against a
+~34 us native `FusedInferAttentionScore` target, both user-reported. **Nothing here was timed.**
+The camodel shows that the outputs are correct and that the pipes neither hang nor fault. It
+cannot show whether the changes pay off.
+
+The two kernel changes apply to the kv4fp8 instances only (`kBatchedCubeDecode<MODE>`). kv3fp4 and
+kv5fp8 still compile the per-head, lock-step decode of 13.25 and are still not executed.
+
+#### 1. Host tiling fills the MIX blocks
+
+`PlanFusedDecode` takes a `FusedSplitPolicy`. Under the default, `kFillBlocks`, a context inside
+the fused limit is split anyway whenever every task can still have a block of its own:
+
+```
+K = min(kMaxSequenceSplits, blocks_per_seq, mix_blocks / unsplit_tasks)     split when K > 1
+```
+
+`unsplit_tasks` is `tokens * kv_heads * head_chunks`, and splitting does not change the chunking
+(the planner comment says why). A split grid returns `fused_context_limit = 0`, so `IsFused()` is
+false, `NeedsReduction()` is true, and the same launch reduces the partials after
+`AscendC::SyncAll`. Callers now pass `grid.fused_context_limit` to the kernel, not the constant.
+A caller that passes the constant with a split grid still gets the right answer, because the
+kernel then treats the context as fused and returns early from every task with `split > 0`. It
+just wastes the blocks. `kContextOnly` is the old behaviour.
+
+| shape, aiv 64 | before | after |
+|---|---|---|
+| B 1, H_Q 16, H_KV 8, 32 blocks | 8 tasks, 8 blocks | 4 splits, 32 tasks, 32 blocks, limit 0 |
+| DeepSeek-V4-Flash, B 1, S 2048, block 128 (the trace's Cube leg) | 8 tasks, 8 blocks | 4 splits x 8 two-head chunks, 32 blocks |
+| B 4 or S > 4096 | unchanged | unchanged |
+
+`test_host_turboquant_tiling` pins both rows and checks the policy's contract over the whole sweep.
+**Open on silicon:** the reduction reads every partial back from GM, `tokens * H_Q * K * (D + 16)`
+floats. Whether 4x the parallel tiles buys more than that costs at S <= 4096 has not been measured.
+
+#### 2. The ingest is a two-slot ring
+
+`kvBuf_` and `scaleTileBuf_` each have `kCubeSlots` slots, and tile t uses slot `t % 2`. That is
+the same slot as its L1 operands. The ingest is split in two:
+
+- `ReadTile` is the MTE2 half. It reads the tile's plane and scale lanes into the slot, then sets
+  an MTE2 -> V event taken with `AllocEventID`. `FetchEventID` only peeks at the first free id and
+  would give two in-flight reads the same id.
+- `StageSlot` is the vector half. It waits on that slot's event and releases the id, then unpacks,
+  permutes and stages the tile into L1 with MTE3.
+
+Tiles 0 and 1 are read before anything is staged. Tile t + 2 is read right after tile t's softmax,
+behind a V -> MTE2 edge, so the read overlaps tile t + 1's stage, both GEMMs and the accumulation.
+The scale lanes need the second slot as much as the packed plane does, because tile t + 2 lands
+in tile t's slot. The same edge is what lets an id be reused: the read that takes a released id is
+always issued behind the vector work of the stage that released it.
+
+Every AIV task now starts with a V -> MTE2 edge as well. Once the scalar readback below was gone,
+nothing drained the vector unit between tasks. The next task's query and tile reads could then
+land under vector work of the previous task that still reads those buffers.
+
+This differs from 13.13's rejected attempt in that it adds no queue object. The buffers are plain
+`TBuf`s and the ids come from the pipe's event pool, which is the "hand-rolled ping-pong" 13.13
+suggested. UB grows by one tile plane and one scale tile, 10 KB at D 256. The whole-row burst
+layout (`packedBytes < 128` with H_KV > 1) now holds two planes.
+
+#### 3. The softmax batches the heads and never reads back to the scalar core
+
+Every per-head scalar of the kv4fp8 softmax is now kept broadcast over its head's 8-lane block.
+That has three effects:
+
+- One `m * 8`-lane op advances all `m` heads.
+- The same state field is the block operand of a row op
+  (`BinaryRepeatParams{1, 1, 0, 8, 8, 1}` over `m` repeats).
+- Lane `j * 8` still holds head j's value, so `WriteNormalizedHeads` and `WritePartials` are
+  unchanged.
+
+Two scalar stalls are gone:
+
+| stall | where | frequency |
+|---|---|---|
+| `PipeBarrier<PIPE_V>` + `qScale.GetValue` for `qScaleInv_` | `PrepareTask` | per task |
+| Level-2 `ReduceSum<float>`, which on dav_3510 ends in a V -> S event and a scalar load of the sum | the softmax | **per head, per tile** |
+
+The row sums and maxima are now `ReduceRepeat<SUM/MAX>`. That makes one register reduce per row,
+one lane per head, with no readback, and it matches the per-head bits exactly. The reciprocals
+stay in UB as head blocks. Per tile, the kv4fp8 softmax issues 21 vector ops whatever the head
+count (22 with the tail mask); before, it issued about 21 per head plus a stall per head. The
+query's row max stays a per-head Level-2 `ReduceMax`, because a D 256 row is wider than one
+register. That reduce has no readback.
+
+#### Harness
+
+`test_sim_950pr_turboquant_fused` runs four shapes. Each runs through the barrier-free and the
+barriered instance, and each output is hashed with FNV-1a over its fp16 bit patterns:
+
+| case | shape | covers | golden (b48ed2951) |
+|---|---|---|---|
+| (a) | H_Q 4, H_KV 2, S 64, block 64 | one tile | `0x6176461416358ec1`, cos 0.999407 |
+| (b) | H_Q 4, H_KV 2, S 256, `kContextOnly` | four tiles in one task, the slot-free edge | `0x470dad36e6708da5`, cos 0.999400 |
+| (c) | (b) under `kFillBlocks` | 4 splits on 8 blocks, the in-launch reduction | `0xda6a2c77e20ff4a1`, cos 0.999400 |
+| (d) | H_Q 8, H_KV 2, S 120, planned for 4 AIVs | a masked tail tile (`valid` 56), two heads per subcore | `0xcc1fcdfed39b48e5`, cos 0.999517 |
+
+The goldens were recorded from b48ed2951 before any of the three changes, with (c) planned at
+`fused_context_limit = 0`. That produces the same grid `kFillBlocks` does. (c) must also agree
+with (b) to cos >= 0.999999, and must stay within 1e-6 of (b)'s cos against fp32.
+
+**Executed (camodel `Ascend950PR_9589`, aiv 64, `quay.io/ascend/vllm-ascend:v0.26.0rc1-a5`,
+one process per run, 32 `excp_log.dump` files, all 0 B):**
+
+| build | (a) | (b) | (c) | (d) |
+|---|---|---|---|---|
+| b48ed2951 + harness | golden | golden | golden; vs (b) cos 1.000000000, fp32 cos 0.999400043 vs 0.999400044 | golden |
+| + fill policy | golden | golden | golden, now from `kFillBlocks` | golden |
+| + ring + batched softmax | golden | golden | golden | golden |
+
+Fused matched barriered bit for bit in every run. The ring and the batched softmax were verified
+together, not one at a time. All three tiers build clean under `-Werror` (6 / 45 / 40 targets).
+`test_host_turboquant_tiling` passes 6/6 and `test_host_turboquant_fidelity` 20/20. No run needed
+the teardown watchdog.
+
+**Not executed:** anything on silicon, the msprof trace and the bench included (they build, and
+they plan and launch the filled grid); kv3fp4 and kv5fp8; the whole-row burst layout;
+3 to 8 heads per subcore; head chunking; contexts above 4096.
+
+### 13.27 CAModel cycle profile of 13.26 (2026-09-17)
+
+Silicon was not available, so this profiles the camodel. Each profiled process ran one fused decode
+launch and nothing else, with the rotated query drawn on the host so no rotation launch ran either.
+Cycles come from the per-core `coreN.{veccore0,veccore1,cubecore0}` logs in the working directory:
+
+- The `instr_log` records each instruction's issue cycle and unit class. The gap to the next
+  issued instruction is charged to the unit.
+- The `ccu_log` records every issue attempt. Retries of one instruction id are its blocked cycles,
+  and they are subtracted from that charge.
+- `WAIT_FLAG_DEV` is issued on the cycle its cross-core flag is released, which gives a per-tile
+  handshake timeline.
+
+The `profile_*_log0.toml` tables stayed empty and were not used. A launch's span (first to last
+instruction over all cores) was reproduced exactly by repeated runs; `Total tick` moved by up to 7.
+**These are camodel cycles, not silicon latency.**
+
+"Baseline kernel" below is the current tree with `turboquant_fused_decode.cpp` and
+`turboquant_vector_service.h` taken from b48ed2951. The planner and the harness are the same in
+both builds, so the grid is a separate variable. kv4fp8, D 256, block 64, 64 AIVs, launch span in
+cycles:
+
+| shape | grid | baseline kernel | current kernel | delta |
+|---|---|---:|---:|---:|
+| H_Q 16, H_KV 8, S 256 | unsplit: 8 blocks, 4 tiles per task | 35,339 | 35,242 | -0.3% |
+| H_Q 16, H_KV 8, S 256 | fill: 32 blocks, K 4, 1 tile per task | 22,142 | 23,551 | **+6.4%** |
+| H_Q 16, H_KV 1, S 256, one block | 8 heads per subcore, 4 tiles | 59,400 | 50,949 | **-14.2%** |
+| H_Q 16, H_KV 8, S 1024 | unsplit: 8 blocks, 16 tiles per task | 113,695 | 100,860 | -11.3% |
+| H_Q 16, H_KV 8, S 1024 | fill: 32 blocks, K 4, 4 tiles per task | 41,505 | 43,069 | +3.8% |
+
+**The grid is the large lever.** Filling the blocks cuts the span 1.60x at S 256 and 2.74x at
+S 1024 on the baseline kernel, and 1.50x and 2.34x on the current one. From the b48ed2951 state
+(unsplit grid, old kernel) to the current state (fill grid, new kernel), the span falls 1.50x at
+S 256 and 2.64x at S 1024.
+
+**The two kernel changes pull in opposite directions at one head per subcore.** An ablation at
+S 256 built each change on its own:
+
+| | unsplit | fill | 8 heads per subcore |
+|---|---:|---:|---:|
+| ring only | -5.3% | -0.8% | -0.7% |
+| batched softmax only | +5.5% | +9.0% | -13.0% |
+| both (the current kernel) | -0.3% | +6.4% | -14.2% |
+
+- **The ring pays in steady state.** On the unsplit S 256 grid (block 0), a tile's slot is staged
+  4,048 cycles after the previous tile's probabilities, against ~5,330 before. The tile period falls
+  from 6,521 to 5,434 cycles (-17%). At 8 heads per subcore it falls from 11,769 to 9,266 (-21%).
+  The ring issues each MTE2 read 4-8 K cycles ahead of its stage, where the baseline issues it
+  1 cycle ahead.
+- **Most of that is lost on short tasks.** The ring's prologue costs more, and a 1-tile task (the
+  fill grid at S 256) is all prologue.
+- **The batched softmax only pays with more than one head per subcore.** At 8 heads the softmax
+  falls from 5,275 to 3,793 cycles per tile. At one head it rises from 920 to 1,129: its `Brcb` and
+  `ReduceRepeat` calls cost more than the per-head path's readback. The readbacks do go away:
+  V -> S events fall from 112 to 32 on the unsplit grid.
+- **The score GEMM is 257 cycles per tile.** Staging the next tile's operands on the vector pipe,
+  4-7 K cycles, is what the Cube waits on.
+
+**Outputs.** At S 256 all four builds give one bit pattern per shape and grid. **At S 1024 the
+baseline and current kernels differ bitwise** (`0xbf9622c0a6ff6d35` vs `0xead7bf890165bacd`), while
+cos against fp32 is 0.999414 for both. Within each kernel, the fill grid reproduces the unsplit grid
+bit for bit. The source of the difference was not investigated; the 13.26 goldens only cover
+S <= 256. Every run left all 32 `excp_log.dump` files at 0 B.
+
+**Follow-ups this points at:**
+- Take the batched softmax only when `heads.mine > 1`. At one head the per-head path is 5-9%
+  faster, and the ring alone keeps its gain.
+- Find the S 1024 divergence before extending the goldens.
+- Treat the vector-pipe unpack as the critical path at every shape profiled.
