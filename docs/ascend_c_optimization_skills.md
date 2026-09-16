@@ -20,11 +20,19 @@ Source files referenced below:
 
 | File | Role |
 | --- | --- |
-| `csrc/attention/turboquant/turboquant_kernels.cpp` | Shipping AIV decode (`TurboQuantPagedAttentionSplit`, `...Combine`, fused launcher) |
-| `csrc/attention/turboquant/turboquant_rotate_q.cpp` | Query rotation `Pi = D H D`: Cube (Mmad + Fixpipe) and AIV paths |
-| `csrc/attention/turboquant/turboquant_codec_950.h` | 4-bit codec, `RepeatButterfly`, `VecBarrier<ENABLED>` |
-| `csrc/attention/turboquant/turboquant_torch_adpt.h` | `PlanPagedAttention`: split and workspace planning |
-| `csrc/attention/turboquant/turboquant_mm_kernels.cpp` | Cube multi-mode decode (test-only): fused `TurboQuantFusedDecode`, plus the legacy split kept as the A/B reference |
+| `op_host/turboquant_tiling.{h,cpp}` | Torch-free launch plans: `PlanPagedAttention`, `PlanFusedDecode`, `PlanRotateQ`, buffer sizes |
+| `op_kernel/common/turboquant_layout.h` | Every constant the kernels and the tiling share (tiles, flags, fused limit) |
+| `op_kernel/common/turboquant_common.h` | `SyncEvent`, `VecBarrier<ENABLED>`, `MixBlockIdx`, broadcasts, `RepeatButterfly` |
+| `op_kernel/common/turboquant_codec_950.h`, `turboquant_codec_mx.h` | The 4-bit and multi-mode codecs |
+| `op_kernel/cube/turboquant_cube_service.h` | `TurboQuantCubeMm` (L1 -> L0 load, Mmad, dual-destination Fixpipe) and `TurboQuantCubeDecodeService` |
+| `op_kernel/vector/turboquant_vector_service.h` | `TurboQuantTileBurst`, `WriteNormalizedHeads`, `TurboQuantPartialReducer`, `TurboQuantVectorDecodeService` |
+| `op_kernel/turboquant_paged_attention.cpp` | Shipping AIV decode (`TurboQuantPagedAttentionSplit`) and the 4-bit cache write |
+| `op_kernel/turboquant_rotate_q.cpp` | Query rotation `Pi = D H D`: Cube (Mmad + Fixpipe) and AIV paths |
+| `op_kernel/turboquant_fused_decode.cpp` | Cube multi-mode decode (test-only): `TurboQuantFusedDecode` composes the two services |
+| `op_adapter/turboquant_torch_adpt.h` | The Torch ops; plans come from `op_host` |
+
+All paths are under `csrc/attention/turboquant/`. The split/combine decode, its separate combine kernel
+and the decode ablation ladder are retired; no host launcher issues more than one decode launch.
 
 ---
 
@@ -38,7 +46,7 @@ primitive to use depends on whether data crosses a pipe or stays inside one.
 
 | Situation | Primitive | Example in tree |
 | --- | --- | --- |
-| Data crosses a pipe boundary on the same core | Hard event: `SetFlag<EVENT>(ev)` + `WaitFlag<EVENT>(ev)`, with `ev = GetTPipePtr()->FetchEventID(EVENT)` | `SyncEvent<>()` / `SyncVectorToMte3()` in `turboquant_rotate_q.cpp` and `turboquant_kernels.cpp` |
+| Data crosses a pipe boundary on the same core | Hard event: `SetFlag<EVENT>(ev)` + `WaitFlag<EVENT>(ev)`, with `ev = GetTPipePtr()->FetchEventID(EVENT)` | `SyncEvent<>()` / `SyncVectorToMte3()` in `op_kernel/common/turboquant_common.h` |
 | AIC ↔ AIV handshake (Cube product ready, slot free) | `CrossCoreSetFlag<0x2, PIPE_X>(id)` / `CrossCoreWaitFlag(id)` | `kFlagOperandsReady/Free`, `kFlagProductReady/Free` in `TurboQuantRotateQCube` |
 | Ping-pong butterfly stage (`src`/`dst` swapped after each stride) | `PipeBarrier<PIPE_V>()` — **always kept** | `FastWalshHadamardTransform` in the codec; `Residual` in rotate_q |
 | Dependent arithmetic inside one V pipe (`Mul`, `Muls`, `Adds`, `Sub`, `Exp`, `Cast`) | **No barrier.** Use `VecBarrier<kSwitch>()`, which compiles to nothing when the switch is false | `StageOperands`, `Rotate`, `ApplyPi<kRotateQVecBarriers>` |
@@ -49,7 +57,7 @@ primitive to use depends on whether data crosses a pipe or stays inside one.
 
 | Event | Direction | Where it gates |
 | --- | --- | --- |
-| `MTE2_V` | GM read → vector | After `DataCopy(qIn, queryGm_…)`, and after the whole-row KV read in `CopyInTile` |
+| `MTE2_V` | GM read → vector | After `DataCopy(qIn, queryGm_…)`, and after a whole-row KV read by `TurboQuantTileBurst` |
 | `V_MTE2` | vector → GM read | Before re-reading GM for chunks > 0 (`StageOperands`), and before a whole-row KV burst |
 | `MTE2_MTE3` / `MTE3_MTE2` | GM read ↔ L1 write | Hadamard `h16` staged into `b1_`; rotated query written back to GM |
 | `V_MTE3` / `MTE3_V` | vector ↔ L1 or GM write | Cast operands before `DataCopy` into `aHi1_` / `aLo1_`; `Residual` write-back |
@@ -75,7 +83,7 @@ without barriers is user-stated. It contradicts CANN's own `sigmoid_v100_impl.h`
   reference. The AIV path gives 0 of 2,048 elements differing at N=8. The Cube path gives 0 of 16,384 at
   N=64 (D=256, dual-destination variant `0x2`). The HiLo residual variant (`kHiLo`) is not requested by
   production planning, so it has **not** been run with barriers off.
-- **Shipping AIV decode:** `AccumulateTile`, `RowSums` and `WriteOutput` in `turboquant_kernels.cpp`
+- **Shipping AIV decode:** `AccumulateTile`, `RowSums` and `WriteOutput` in `turboquant_paged_attention.cpp`
   switch 26 barriers, plus those in the broadcast helpers they call, behind
   `kPagedAttentionVecBarriers = false`. With barriers off, `test_sim_950pr_turboquant_kernels` still
   reports cos 1.000000, SNR 72.87 dB and relL2 2.27e-4 against the CPU reference. That matches the
@@ -83,7 +91,11 @@ without barriers is user-stated. It contradicts CANN's own `sigmoid_v100_impl.h`
   `ComputeSplit`: it separates `Duplicate(state, 0)` from `Duplicate(runMax, -inf)`, which write
   overlapping memory, so their order is a real write-after-write dependency.
 - **Fused Cube decode:** `TurboQuantFusedDecode` runs with `kFusedVecBarriers = false`. On one kv4fp8
-  tile it is **bit-identical** (0 of 1,024 elements) to the fully barriered legacy split + combine.
+  tile it was bit-identical (0 of 1,024 elements) to the fully barriered split + combine it replaced. That
+  split is retired; the A/B reference is now a test-only instance of the same kernel with every barrier
+  kept (`turboquant_mm_fused_decode_barriered_impl`), and the two are still bit-identical.
+- **Overlapping initialisations keep a real barrier.** `BeginTask` and `TurboQuantPartialReducer::Reduce`
+  zero a state block and then write `-inf` into a lane of it; that barrier is unconditional.
 
 ### 1.4 Deadlock diagnosis
 
@@ -175,7 +187,7 @@ throughput to 44.1 GB/s, under 3% of the 1.6 TB/s peak. **Never fragment MTE2 re
 3. Bracket the burst with `V_MTE2` → `MTE2_V`, so the vector unit does not consume the UB before MTE2
    has filled it.
 
-### 3.2 The KV tile read in `CopyInTile`
+### 3.2 The KV tile read (`TurboQuantTileBurst`)
 
 | Case | Read | Burst size |
 | --- | --- | --- |
@@ -193,11 +205,11 @@ kTileRows · scaleSlot)`.
 holds both planes) and some redundant bytes, in exchange for keeping the controller in burst mode. The
 test shape (D=64, H_kv=2) exercises this path.
 
-**The Cube decode** (`TurboQuantFusedDecode::CopyInTile`) follows the same three cases for one plane per
-subcore. It unpacks row-major in UB, then moves each 32-byte column group into NZ order with a UB → UB
-`DataCopy(nz, lowBytes, {rows, 1, planeGroups − 1, 0})`, and stages the whole tile into L1 in one MTE3
-burst. The legacy `TurboQuantCubeDecodeSplit` keeps its 32 B-per-row group-major read as the A/B
-reference only.
+**Both decodes use the same reader.** `TurboQuantTileBurst` (vector service) implements the three
+cases; the AIV decode reads the K and V planes of a tile, the Cube decode's vector service reads one
+plane per subcore. The Cube side then unpacks row-major in UB, moves each 32-byte column group into NZ
+order with a UB → UB `DataCopy(nz, lowBytes, {rows, 1, planeGroups − 1, 0})`, and stages the whole tile
+into L1 in one MTE3 burst. The 32 B-per-row group-major read is gone with the split it belonged to.
 
 ---
 
@@ -259,19 +271,20 @@ normalizes all of them with one repeat `Mul` and writes them to GM in one `heads
 
 ### 4.4 Long contexts stay one launch
 
-When `S > 4096`, `ComputeSplit` still writes partials. The same launcher then calls
-`AscendC::SyncAll<true>()` and runs `TurboQuantPagedAttentionCombine` inside the launch, skipping every
-token that took the fused path (`contextLen ≤ fusedContextLimit`). The host issues one
-`turboquant_paged_attention_fused_*` call either way. `Combine` also reads each partial in one
-`partialStride` burst instead of two.
+When `S > 4096`, the split phase still writes partials. The same launcher then calls
+`AscendC::SyncAll` and hands every split token to `TurboQuantPartialReducer` (vector service), which
+reads each partial in one `partialStride` burst, merges the splits with the online-softmax recurrence and
+closes out through `WriteNormalizedHeads`. Both decodes use it; there is no combine kernel and no second
+host launch.
 
 ### 4.5 Evidence (camodel, Ascend950PR_9589, one process each, all `excp_log.dump` 0 B)
 
 | Test | Path | Result |
 | --- | --- | --- |
 | `TurboQuantKernels.PagedAttentionMatchesTheCpuReference` | AIV fused (splits = 1), aiv = 64, barriers off | cos 1.000000, SNR 72.87 dB, relL2 2.27e-4 |
-| `TurboQuantFusedDecode.MatchesTheLegacySplitAndCombine` | Cube fused, kv4fp8, H_Q 4, H_KV 2, D 256, S 64: 1 launch, block_dim 2 | 0 of 1,024 elements differ from legacy split + combine (2 launches); cos 0.999407 vs fp32; no sentinel value left in the output |
-| `TurboQuantSimulatorFidelity.SingleDecodePassQuantisedVersusExact` | Forced splits = 2, in-launch reduction | vs CPU TurboQuant: cos 1.000000, SNR 74.00 dB, relL2 1.99e-4; vs exact fp32: cos 0.991182 (4-bit quantization error) |
+| `TurboQuantFusedDecode.IsBitIdenticalToItsBarrieredInstance` | Cube fused, kv4fp8, H_Q 4, H_KV 2, D 256, S 64: 1 launch, block_dim 2 | 0 of 1,024 elements differ from the barriered instance; cos 0.999407 vs fp32, the value the retired split + combine produced; no sentinel value left |
+| `TurboQuantSimulatorFidelity.SingleDecodePassQuantisedVersusExact` | AIV, forced splits = 2, reduction by `TurboQuantPartialReducer` | vs CPU TurboQuant: cos 1.000000, SNR 74.00 dB, relL2 1.99e-4; vs exact fp32: cos 0.991182 (4-bit quantization error) |
+| `TurboQuantMultiMode.DispatchAndFidelityAcrossShapes` | Cube fused, kv4fp8, S 16 (one partial tile, the `Min` mask) | cos 0.991817 vs fp32 |
 
 The residual error against the CPU reference is fp16 output rounding. Neither test is a latency
 measurement.

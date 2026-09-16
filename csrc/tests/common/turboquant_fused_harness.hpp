@@ -131,7 +131,13 @@ class FusedCubeScenario {
     query_rot_host_ = query_rot_.ToHost<float>();
   }
 
-  FusedRun RunFused(int64_t fused_context_limit = kFusedContextLimit) {
+  FusedRun RunFused(int64_t fused_context_limit = kFusedContextLimit) { return Run(false, fused_context_limit); }
+
+  // The same grid through the test-only instance that keeps every vector barrier: the bit-exact A/B
+  // reference for the barrier-free kernel.
+  FusedRun RunBarriered(int64_t fused_context_limit = kFusedContextLimit) { return Run(true, fused_context_limit); }
+
+  FusedRun Run(bool barriered, int64_t fused_context_limit) {
     const int64_t d = shape_.head_size;
     const FusedDecodeGrid grid = PlanFusedDecode(1, shape_.num_heads, shape_.num_kv_heads, d, blocks_per_seq_,
                                                  shape_.block_size, aiv_num_, fused_context_limit);
@@ -142,48 +148,26 @@ class FusedCubeScenario {
     run.heads_per_task = grid.heads_per_task;
     run.launches = 1;
     PoisonOutput();
+    const float inv_sqrt_len = 1.0f / std::sqrt(static_cast<float>(d));
     const auto start = std::chrono::steady_clock::now();
-    turboquant_mm_fused_decode_impl(
-        static_cast<int32_t>(kFusedMode), AscendType::FP16, stream_, grid.block_dim, query_rot_.get(),
-        key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
-        mode_tables_.get(), workspace.get(), out_.get(), 1, static_cast<uint32_t>(shape_.num_heads),
-        static_cast<uint32_t>(shape_.num_kv_heads), static_cast<uint32_t>(d),
-        static_cast<uint32_t>(shape_.block_size), static_cast<uint32_t>(blocks_per_seq_),
-        static_cast<uint32_t>(grid.num_splits), grid.heads_per_task, grid.tasks_per_block,
-        grid.reduce_tasks_per_block, static_cast<uint32_t>(fused_context_limit), scale_,
-        1.0f / std::sqrt(static_cast<float>(d)));
-    ACL_CHECK(aclrtSynchronizeStream(stream_));
-    run.host_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    Collect(&run);
-    return run;
-  }
-
-  FusedRun RunSplitAndCombine(int64_t num_splits) {
-    const int64_t d = shape_.head_size;
-    const int64_t split_tasks = shape_.num_kv_heads * num_splits;
-    const int64_t split_per_core = CeilDiv(split_tasks, aiv_num_);
-    const int64_t combine_tasks = shape_.num_heads;
-    const int64_t combine_per_core = CeilDiv(combine_tasks, aiv_num_);
-    DeviceBuffer workspace =
-        DeviceBuffer::Empty<float>(static_cast<size_t>(shape_.num_heads * num_splits * (d + kPartialTail)));
-    FusedRun run;
-    run.num_splits = num_splits;
-    run.block_dim = static_cast<uint32_t>(CeilDiv(split_tasks, split_per_core));
-    run.launches = 2;
-    PoisonOutput();
-    const auto start = std::chrono::steady_clock::now();
-    turboquant_mm_decode_split_impl(
-        static_cast<int32_t>(kFusedMode), AscendType::FP16, stream_, run.block_dim, query_rot_.get(),
-        key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
-        mode_tables_.get(), workspace.get(), 1, static_cast<uint32_t>(shape_.num_heads),
-        static_cast<uint32_t>(shape_.num_kv_heads), static_cast<uint32_t>(d),
-        static_cast<uint32_t>(shape_.block_size), static_cast<uint32_t>(blocks_per_seq_),
-        static_cast<uint32_t>(num_splits), static_cast<uint32_t>(split_per_core), scale_,
-        1.0f / std::sqrt(static_cast<float>(d)));
-    turboquant_paged_attention_combine_impl(
-        AscendType::FP16, stream_, static_cast<uint32_t>(CeilDiv(combine_tasks, combine_per_core)),
-        workspace.get(), out_.get(), 1, static_cast<uint32_t>(shape_.num_heads), static_cast<uint32_t>(d),
-        static_cast<uint32_t>(num_splits), static_cast<uint32_t>(combine_per_core));
+    if (barriered) {
+      turboquant_mm_fused_decode_barriered_impl(
+          AscendType::FP16, stream_, grid.block_dim, query_rot_.get(), key_cache_.get(), value_cache_.get(),
+          scale_plane_.get(), block_tables_.get(), context_lens_.get(), mode_tables_.get(), workspace.get(),
+          out_.get(), 1, static_cast<uint32_t>(shape_.num_heads), static_cast<uint32_t>(shape_.num_kv_heads),
+          static_cast<uint32_t>(d), static_cast<uint32_t>(shape_.block_size), static_cast<uint32_t>(blocks_per_seq_),
+          static_cast<uint32_t>(grid.num_splits), grid.heads_per_task, grid.tasks_per_block,
+          grid.reduce_tasks_per_block, static_cast<uint32_t>(fused_context_limit), scale_, inv_sqrt_len);
+    } else {
+      turboquant_mm_fused_decode_impl(
+          static_cast<int32_t>(kFusedMode), AscendType::FP16, stream_, grid.block_dim, query_rot_.get(),
+          key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
+          mode_tables_.get(), workspace.get(), out_.get(), 1, static_cast<uint32_t>(shape_.num_heads),
+          static_cast<uint32_t>(shape_.num_kv_heads), static_cast<uint32_t>(d),
+          static_cast<uint32_t>(shape_.block_size), static_cast<uint32_t>(blocks_per_seq_),
+          static_cast<uint32_t>(grid.num_splits), grid.heads_per_task, grid.tasks_per_block,
+          grid.reduce_tasks_per_block, static_cast<uint32_t>(fused_context_limit), scale_, inv_sqrt_len);
+    }
     ACL_CHECK(aclrtSynchronizeStream(stream_));
     run.host_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     Collect(&run);

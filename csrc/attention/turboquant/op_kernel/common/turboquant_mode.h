@@ -189,41 +189,6 @@ inline const char *TurboQuantModeName(TurboQuantMode mode)
     return "kv5fp8";
 }
 
-enum class DecodeAblationStage : int32_t {
-    STAGE_0_MTE2_ONLY = 0,
-    STAGE_1_UNPACK = 1,
-    STAGE_2_QUERY_PREP = 2,
-    STAGE_3_L1_STAGING = 3,
-    STAGE_4_SCORE_GEMM = 4,
-    STAGE_5_FULL_PIPELINE = 5,
-};
-
-constexpr int32_t kDecodeAblationStageCount = 6;
-
-constexpr bool DecodeAblationStageIsValid(int32_t raw)
-{
-    return raw >= 0 && raw < kDecodeAblationStageCount;
-}
-
-inline const char *DecodeAblationStageName(DecodeAblationStage stage)
-{
-    switch (stage) {
-        case DecodeAblationStage::STAGE_0_MTE2_ONLY:
-            return "stage0_mte2";
-        case DecodeAblationStage::STAGE_1_UNPACK:
-            return "stage1_unpack";
-        case DecodeAblationStage::STAGE_2_QUERY_PREP:
-            return "stage2_query_prep";
-        case DecodeAblationStage::STAGE_3_L1_STAGING:
-            return "stage3_l1_staging";
-        case DecodeAblationStage::STAGE_4_SCORE_GEMM:
-            return "stage4_score_gemm";
-        case DecodeAblationStage::STAGE_5_FULL_PIPELINE:
-            return "stage5_full";
-    }
-    return "stage5_full";
-}
-
 constexpr int64_t TurboQuantOperandBytes(TurboQuantOperand operand, int64_t elems)
 {
     return operand == TurboQuantOperand::kFp4E2m1 ? elems / 2 : elems;

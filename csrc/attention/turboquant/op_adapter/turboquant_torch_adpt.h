@@ -24,9 +24,9 @@
 #include <algorithm>
 #include <cmath>
 
-#include "../../kernels/types.h"
-#include "../../npu_device_registry.h"
-#include "turboquant_rotate_q.h"
+#include "../../../kernels/types.h"
+#include "../../../npu_device_registry.h"
+#include "../op_host/turboquant_tiling.h"
 
 namespace vllm_ascend {
 
@@ -52,12 +52,7 @@ extern void turboquant_rotate_q_impl(AscendType type, void *stream, uint32_t blo
 
 namespace turboquant_adpt {
 
-constexpr int64_t kMaxSequenceSplits = 8;
-constexpr int64_t kFusedContextLimit = 4096;
-constexpr int64_t kPartialTail = 16;
-constexpr int64_t kFp32PerBlock = 8;
-constexpr int64_t kTileRows = 16;
-constexpr int64_t kCodecLevels = 16;
+namespace tq = vllm_ascend::turboquant;
 
 inline AscendType ToAscendType(at::ScalarType scalarType)
 {
@@ -71,21 +66,6 @@ inline int64_t VectorCoreNum()
     return device_registry::VectorCoreNum();
 }
 
-inline int64_t CeilDiv(int64_t a, int64_t b)
-{
-    return (a + b - 1) / b;
-}
-
-inline int64_t ScaleSlotFloats(int64_t numKvHeads)
-{
-    return CeilDiv(2 * numKvHeads, kFp32PerBlock) * kFp32PerBlock;
-}
-
-inline int64_t CodecTableWords(int64_t headSize, int64_t batchRows)
-{
-    return 7 * headSize + 2 * headSize * batchRows + kCodecLevels;
-}
-
 inline void CheckHeadSize(int64_t headSize)
 {
     TORCH_CHECK(headSize >= 64 && headSize <= 256, "TurboQuant requires 64 <= head_size <= 256, got ", headSize);
@@ -96,53 +76,11 @@ inline void CheckHeadSize(int64_t headSize)
 
 inline void CheckCodecTables(const at::Tensor &tables, int64_t headSize, int64_t batchRows)
 {
+    const int64_t words = tq::CodecTableWords(headSize, batchRows);
     TORCH_CHECK(tables.scalar_type() == at::ScalarType::Int, "codec tables must be int32");
     TORCH_CHECK(tables.is_contiguous(), "codec tables must be contiguous");
-    TORCH_CHECK(tables.numel() == CodecTableWords(headSize, batchRows), "codec tables must hold ",
-                CodecTableWords(headSize, batchRows), " words for head_size ", headSize, " and batch_rows ",
-                batchRows, ", got ", tables.numel());
-}
-
-inline int64_t PartialStride(int64_t headSize)
-{
-    return headSize + kPartialTail;
-}
-
-struct PagedAttentionPlan {
-    int64_t num_splits = 1;
-    int64_t workspace_floats = 0;
-    uint32_t block_dim = 0;
-    uint32_t split_tasks_per_core = 0;
-    uint32_t reduce_tasks_per_core = 0;
-};
-
-inline PagedAttentionPlan PlanPagedAttention(int64_t numTokens, int64_t numHeads, int64_t headSize,
-                                             int64_t maxBlocksPerSeq, int64_t blockSize, int64_t aivNum)
-{
-    PagedAttentionPlan plan;
-
-    const int64_t base_tasks = numTokens * numHeads;
-    if (base_tasks <= 0) {
-        return plan;
-    }
-
-    const int64_t blocks = std::max<int64_t>(1, maxBlocksPerSeq);
-    int64_t num_splits = 1;
-    if (blocks * blockSize > kFusedContextLimit) {
-        num_splits = std::max(CeilDiv(aivNum, base_tasks), CeilDiv(blocks * blockSize, kFusedContextLimit));
-        num_splits = std::min(num_splits, std::min<int64_t>(kMaxSequenceSplits, blocks));
-    }
-
-    const int64_t split_tasks = base_tasks * num_splits;
-    const int64_t split_tasks_per_core = CeilDiv(split_tasks, aivNum);
-    const int64_t block_dim = CeilDiv(split_tasks, split_tasks_per_core);
-
-    plan.num_splits = num_splits;
-    plan.workspace_floats = num_splits > 1 ? split_tasks * PartialStride(headSize) : 0;
-    plan.block_dim = static_cast<uint32_t>(block_dim);
-    plan.split_tasks_per_core = static_cast<uint32_t>(split_tasks_per_core);
-    plan.reduce_tasks_per_core = num_splits > 1 ? static_cast<uint32_t>(CeilDiv(base_tasks, block_dim)) : 0;
-    return plan;
+    TORCH_CHECK(tables.numel() == words, "codec tables must hold ", words, " words for head_size ", headSize,
+                " and batch_rows ", batchRows, ", got ", tables.numel());
 }
 
 }
@@ -160,9 +98,10 @@ inline int64_t npu_turboquant_workspace_size(int64_t num_tokens, int64_t num_hea
                 num_tokens, " and ", num_heads);
     TORCH_CHECK(block_size > 0, "workspace sizing needs block_size > 0, got ", block_size);
     adpt::CheckHeadSize(head_size);
-    return adpt::PlanPagedAttention(num_tokens, num_heads, head_size, max_blocks_per_seq, block_size,
-                                    adpt::VectorCoreNum())
-        .workspace_floats;
+    return static_cast<int64_t>(vllm_ascend::turboquant::PlanPagedAttention(num_tokens, num_heads, head_size,
+                                                                            max_blocks_per_seq, block_size,
+                                                                            adpt::VectorCoreNum())
+                                    .workspace_floats);
 }
 
 inline void npu_turboquant_reshape_and_cache(at::Tensor &key, at::Tensor &value, at::Tensor &key_cache,
@@ -204,26 +143,25 @@ inline void npu_turboquant_reshape_and_cache(at::Tensor &key, at::Tensor &value,
     TORCH_CHECK(pi_signs.numel() == head_size, "pi_signs must hold one sign per channel");
     TORCH_CHECK(scale_cache.size(0) == num_blocks && scale_cache.size(1) == block_size,
                 "the scale plane must be shaped to the same blocks as the cache");
-    TORCH_CHECK(scale_cache.size(2) == adpt::ScaleSlotFloats(num_kv_heads),
-                "scale slot must be round_up(2 * num_kv_heads, 8) = ", adpt::ScaleSlotFloats(num_kv_heads), ", got ",
-                scale_cache.size(2));
+    TORCH_CHECK(scale_cache.size(2) == vllm_ascend::turboquant::ScaleSlotFloats64(num_kv_heads),
+                "scale slot must be round_up(2 * num_kv_heads, 8) = ",
+                vllm_ascend::turboquant::ScaleSlotFloats64(num_kv_heads), ", got ", scale_cache.size(2));
 
     if (num_tokens == 0) {
         return;
     }
 
-    const int64_t aiv_num = adpt::VectorCoreNum();
-    const int64_t tokens_per_core = adpt::CeilDiv(num_tokens, aiv_num);
-    const uint32_t block_dim = static_cast<uint32_t>(adpt::CeilDiv(num_tokens, tokens_per_core));
+    const vllm_ascend::turboquant::ReshapeAndCacheGrid grid =
+        vllm_ascend::turboquant::PlanReshapeAndCache(num_tokens, adpt::VectorCoreNum());
     const float inv_sqrt_len = 1.0f / std::sqrt(static_cast<float>(head_size));
 
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     turboquant_reshape_and_cache_impl(
-        adpt::ToAscendType(key.scalar_type()), stream, block_dim, key.data_ptr(), value.data_ptr(),
+        adpt::ToAscendType(key.scalar_type()), stream, grid.block_dim, key.data_ptr(), value.data_ptr(),
         key_cache.data_ptr(), value_cache.data_ptr(), scale_cache.data_ptr(), slot_mapping.data_ptr(),
         pi_signs.data_ptr(), codec_tables.data_ptr(), static_cast<uint32_t>(num_tokens),
         static_cast<uint32_t>(num_kv_heads), static_cast<uint32_t>(head_size), static_cast<uint32_t>(block_size),
-        static_cast<uint32_t>(tokens_per_core), inv_sqrt_len);
+        grid.tokens_per_core, inv_sqrt_len);
 }
 
 inline void npu_turboquant_rotate_q(at::Tensor &query, at::Tensor &pi_signs, at::Tensor &codec_tables,
@@ -253,8 +191,8 @@ inline void npu_turboquant_rotate_q(at::Tensor &query, at::Tensor &pi_signs, at:
     const int64_t head_size = query.size(2);
     adpt::CheckHeadSize(head_size);
     TORCH_CHECK(pi_signs.numel() == head_size, "pi_signs must hold one sign per channel");
-    TORCH_CHECK(codec_tables.numel() >= adpt::CodecTableWords(head_size, 1), "codec tables must hold at least ",
-                adpt::CodecTableWords(head_size, 1), " words for head_size ", head_size, ", got ",
+    TORCH_CHECK(codec_tables.numel() >= vllm_ascend::turboquant::CodecTableWords(head_size, 1), "codec tables must hold at least ",
+                vllm_ascend::turboquant::CodecTableWords(head_size, 1), " words for head_size ", head_size, ", got ",
                 codec_tables.numel());
 
     const int64_t num_vectors = num_tokens * num_heads;
@@ -262,11 +200,8 @@ inline void npu_turboquant_rotate_q(at::Tensor &query, at::Tensor &pi_signs, at:
         return;
     }
 
-    int64_t core_num = adpt::VectorCoreNum() / 2;
-    if (core_num < 1) {
-        core_num = 1;
-    }
-    const tq::RotateQPlan plan = tq::PlanRotateQ(num_tokens, num_vectors, head_size, core_num);
+    const tq::RotateQPlan plan =
+        tq::PlanRotateQ(num_tokens, num_vectors, head_size, tq::RotateQCoreNum(adpt::VectorCoreNum()));
 
     if (plan.use_cube) {
         TORCH_CHECK(plan.vectors_per_block > 0 && num_vectors % plan.vectors_per_block == 0,
@@ -319,7 +254,7 @@ inline void npu_turboquant_paged_attention(at::Tensor &query_rot, at::Tensor &ke
     const int64_t max_blocks_per_seq = block_tables.size(1);
 
     adpt::CheckHeadSize(head_size);
-    adpt::CheckCodecTables(codec_tables, head_size, adpt::kTileRows);
+    adpt::CheckCodecTables(codec_tables, head_size, vllm_ascend::turboquant::kAivTileRows);
     TORCH_CHECK(query_rot.size(1) == num_heads, "query head count ", query_rot.size(1), " does not match num_heads ",
                 num_heads);
     TORCH_CHECK(num_kv_heads > 0 && num_heads % num_kv_heads == 0, "num_heads ", num_heads,
@@ -328,11 +263,12 @@ inline void npu_turboquant_paged_attention(at::Tensor &query_rot, at::Tensor &ke
                 num_kv_heads);
     TORCH_CHECK(key_cache.size(3) == head_size / 2, "packed cache head dim must be head_size / 2, got ",
                 key_cache.size(3));
-    TORCH_CHECK(block_size % adpt::kTileRows == 0, "TurboQuant requires block_size to be a multiple of ",
-                adpt::kTileRows, ", got ", block_size);
-    TORCH_CHECK(scale_cache.size(2) == adpt::ScaleSlotFloats(num_kv_heads),
-                "scale slot must be round_up(2 * num_kv_heads, 8) = ", adpt::ScaleSlotFloats(num_kv_heads), ", got ",
-                scale_cache.size(2));
+    TORCH_CHECK(block_size % vllm_ascend::turboquant::kAivTileRows == 0,
+                "TurboQuant requires block_size to be a multiple of ", vllm_ascend::turboquant::kAivTileRows,
+                ", got ", block_size);
+    TORCH_CHECK(scale_cache.size(2) == vllm_ascend::turboquant::ScaleSlotFloats64(num_kv_heads),
+                "scale slot must be round_up(2 * num_kv_heads, 8) = ",
+                vllm_ascend::turboquant::ScaleSlotFloats64(num_kv_heads), ", got ", scale_cache.size(2));
     TORCH_CHECK(block_tables.size(0) == num_tokens, "block_tables must hold one row per query token");
     TORCH_CHECK(context_lens.numel() == num_tokens, "context_lens must hold one length per query token");
 
@@ -340,15 +276,15 @@ inline void npu_turboquant_paged_attention(at::Tensor &query_rot, at::Tensor &ke
         return;
     }
 
-    const adpt::PagedAttentionPlan plan = adpt::PlanPagedAttention(num_tokens, num_heads, head_size,
-                                                                   max_blocks_per_seq, block_size,
-                                                                   adpt::VectorCoreNum());
+    const vllm_ascend::turboquant::PagedAttentionGrid plan = vllm_ascend::turboquant::PlanPagedAttention(
+        num_tokens, num_heads, head_size, max_blocks_per_seq, block_size, adpt::VectorCoreNum());
+    const int64_t workspace_floats = static_cast<int64_t>(plan.workspace_floats);
 
     TORCH_CHECK(workspace.scalar_type() == at::ScalarType::Float, "the decode workspace must be float32, got ",
                 workspace.scalar_type());
     TORCH_CHECK(workspace.is_contiguous(), "the decode workspace must be contiguous");
-    TORCH_CHECK(workspace.numel() >= plan.workspace_floats, "the decode workspace holds ", workspace.numel(),
-                " float32 words but this launch needs ", plan.workspace_floats, " (num_tokens ", num_tokens,
+    TORCH_CHECK(workspace.numel() >= workspace_floats, "the decode workspace holds ", workspace.numel(),
+                " float32 words but this launch needs ", workspace_floats, " (num_tokens ", num_tokens,
                 ", num_heads ", num_heads, ", head_size ", head_size, ", num_splits ", plan.num_splits,
                 "); size it with npu_turboquant_workspace_size");
 
@@ -359,11 +295,11 @@ inline void npu_turboquant_paged_attention(at::Tensor &query_rot, at::Tensor &ke
     turboquant_paged_attention_impl(
         adpt::ToAscendType(out.scalar_type()), stream, plan.block_dim, query_rot.data_ptr(), key_cache.data_ptr(),
         value_cache.data_ptr(), scale_cache.data_ptr(), block_tables.data_ptr(), context_lens.data_ptr(),
-        codec_tables.data_ptr(), plan.workspace_floats > 0 ? workspace.data_ptr() : nullptr, out.data_ptr(),
+        codec_tables.data_ptr(), workspace_floats > 0 ? workspace.data_ptr() : nullptr, out.data_ptr(),
         static_cast<uint32_t>(num_tokens), static_cast<uint32_t>(num_heads), static_cast<uint32_t>(num_kv_heads),
         static_cast<uint32_t>(head_size), static_cast<uint32_t>(block_size),
         static_cast<uint32_t>(max_blocks_per_seq), static_cast<uint32_t>(plan.num_splits), plan.split_tasks_per_core,
-        plan.reduce_tasks_per_core, static_cast<uint32_t>(adpt::kFusedContextLimit), scale, inv_sqrt_len);
+        plan.reduce_tasks_per_core, vllm_ascend::turboquant::kFusedContextLimit, scale, inv_sqrt_len);
 }
 
 }

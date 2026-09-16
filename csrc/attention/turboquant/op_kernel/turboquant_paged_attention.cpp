@@ -14,76 +14,43 @@
  * limitations under the License.
  */
 
+// The shipping TurboQuant kernels (built into the wheel for arch32 and arch35): the 4-bit cache write
+// and the AIV-only paged-attention decode. One launch per decode step; a context above the fused limit
+// is split and reduced inside the same launch.
+
 #include "kernel_operator.h"
 
-#include "../../kernels/types.h"
-#include "turboquant_codec_950.h"
+#include "../../../kernels/types.h"
+#include "common/turboquant_codec_950.h"
+#include "vector/turboquant_vector_service.h"
 
 namespace {
 
+using vllm_ascend::turboquant::BroadcastScalar;
+using vllm_ascend::turboquant::BroadcastSub;
+using vllm_ascend::turboquant::CeilDiv;
 using vllm_ascend::turboquant::kBrcbDstLanes;
 using vllm_ascend::turboquant::kFp32PerBlock;
 using vllm_ascend::turboquant::kFp32PerRepeat;
 using vllm_ascend::turboquant::kGatherSrcBase;
+using vllm_ascend::turboquant::kPartialMaxLane;
+using vllm_ascend::turboquant::kPartialSumLane;
+using vllm_ascend::turboquant::kPartialTail;
+using vllm_ascend::turboquant::ScaleSlotFloats;
+using vllm_ascend::turboquant::SyncMte3ToVector;
+using vllm_ascend::turboquant::SyncMte2ToVector;
+using vllm_ascend::turboquant::SyncVectorToMte2;
+using vllm_ascend::turboquant::SyncVectorToMte3;
 using vllm_ascend::turboquant::TurboQuantCodec4;
+using vllm_ascend::turboquant::TurboQuantPartialReducer;
+using vllm_ascend::turboquant::TurboQuantTileBurst;
 using vllm_ascend::turboquant::VecBarrier;
+using vllm_ascend::turboquant::WriteNormalizedHeads;
 
-constexpr uint32_t kTileRows = 16;
+constexpr uint32_t kTileRows = vllm_ascend::turboquant::kAivTileRows;
 constexpr float kNegInf = -1.0e30f;
-constexpr uint32_t kPartialTail = 2u * kFp32PerBlock;
-constexpr uint32_t kPartialMaxLane = 0;
-constexpr uint32_t kPartialSumLane = kFp32PerBlock;
 constexpr uint32_t kSlotRing = 4;
-constexpr uint32_t kMinBurstBytes = 128;
 constexpr bool kPagedAttentionVecBarriers = false;
-
-template <AscendC::HardEvent EVENT>
-__aicore__ inline void SyncEvent()
-{
-    const event_t ev = static_cast<event_t>(GetTPipePtr()->FetchEventID(EVENT));
-    AscendC::SetFlag<EVENT>(ev);
-    AscendC::WaitFlag<EVENT>(ev);
-}
-
-__aicore__ inline uint32_t CeilDiv(uint32_t a, uint32_t b)
-{
-    return (a + b - 1) / b;
-}
-
-__aicore__ inline uint32_t RoundUp(uint32_t value, uint32_t multiple)
-{
-    return CeilDiv(value, multiple) * multiple;
-}
-
-__aicore__ inline uint32_t ScaleSlotFloats(uint32_t numKvHeads)
-{
-    return RoundUp(2u * numKvHeads, kFp32PerBlock);
-}
-
-template <bool VEC_BARRIERS = true>
-__aicore__ inline void BroadcastSub(const AscendC::LocalTensor<float> &dst, const AscendC::LocalTensor<float> &src,
-                                    const AscendC::LocalTensor<float> &scalarBlock, uint32_t count)
-{
-    constexpr uint8_t kRepBlocks = static_cast<uint8_t>(kFp32PerRepeat / kFp32PerBlock);
-    const uint32_t repeats = count / kFp32PerRepeat;
-    if (repeats > 0) {
-        AscendC::Sub(dst, src, scalarBlock, static_cast<uint64_t>(kFp32PerRepeat), static_cast<uint8_t>(repeats),
-                     {1, 1, 0, kRepBlocks, kRepBlocks, 0});
-    }
-    const uint32_t tail = count - repeats * kFp32PerRepeat;
-    if (tail > 0) {
-        const uint32_t base = repeats * kFp32PerRepeat;
-        AscendC::Sub(dst[base], src[base], scalarBlock, static_cast<uint64_t>(tail), 1, {1, 1, 0, 0, 0, 0});
-    }
-    VecBarrier<VEC_BARRIERS>();
-}
-
-template <bool VEC_BARRIERS = true>
-__aicore__ inline void BroadcastScalar(const AscendC::LocalTensor<float> &dst, const AscendC::LocalTensor<float> &src)
-{
-    AscendC::Brcb(dst, src, 1, {1, static_cast<uint16_t>(kFp32PerBlock)});
-    VecBarrier<VEC_BARRIERS>();
-}
 
 template <typename scalar_t>
 class TurboQuantReshapeAndCache {
@@ -285,9 +252,6 @@ public:
         packedPlane_ = numKvHeads_ * packedBytes_;
         scaleSlot_ = ScaleSlotFloats(numKvHeads_);
         partialStride_ = headSize + kPartialTail;
-        wholeRowRead_ = (numKvHeads_ > 1 && packedBytes_ < kMinBurstBytes) ? 1u : 0u;
-        rowParams_ = AscendC::DataCopyParams{static_cast<uint16_t>(kTileRows), static_cast<uint16_t>(packedBytes_ / 32),
-                                             static_cast<uint16_t>((packedPlane_ - packedBytes_) / 32), 0};
 
         queryRotGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(queryRot));
         keyCacheGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(keyCache));
@@ -315,9 +279,7 @@ public:
 
         codec_.Init(pipe_, headSize_, kTileRows, invSqrtLen, tablesGm_);
         pipe_->InitBuffer(outBuf_, headSize_ * sizeof(scalar_t));
-        if (wholeRowRead_ != 0) {
-            pipe_->InitBuffer(rowsBuf_, 2 * kTileRows * packedPlane_ * sizeof(int8_t));
-        }
+        burst_.Init(pipe_, numKvHeads_, packedBytes_, kTileRows, 2);
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 
@@ -347,6 +309,24 @@ public:
             const uint32_t head = (task / numSplits_) % numHeads_;
             const uint32_t token = task / (numSplits_ * numHeads_);
             ComputeSplit(token, head, split);
+        }
+    }
+
+    // After AscendC::SyncAll: merge the partials of every split token this block owns.
+    __aicore__ inline void Reduce(TurboQuantPartialReducer<scalar_t, kPagedAttentionVecBarriers> &reducer,
+                                  uint32_t tasksPerCore)
+    {
+        const uint32_t tasks = numTokens_ * numHeads_;
+        const uint32_t start = static_cast<uint32_t>(AscendC::GetBlockIdx()) * tasksPerCore;
+        uint32_t end = start + tasksPerCore;
+        if (end > tasks) {
+            end = tasks;
+        }
+        for (uint32_t task = start; task < end; ++task) {
+            const uint32_t token = task / numHeads_;
+            if (!IsFused(contextLenGm_.GetValue(token))) {
+                reducer.Reduce(token, task % numHeads_);
+            }
         }
     }
 
@@ -427,33 +407,19 @@ private:
             return;
         }
         const uint64_t offset = PartialOffset(token, head, split);
-        AscendC::PipeBarrier<PIPE_ALL>();
+        SyncVectorToMte3();
         AscendC::DataCopy(workspaceGm_[offset], acc, headSize_);
         AscendC::DataCopy(workspaceGm_[offset + headSize_], state, kPartialTail);
-        AscendC::PipeBarrier<PIPE_ALL>();
+        SyncMte3ToVector();
     }
 
     __aicore__ inline void WriteOutput(uint32_t token, uint32_t head, const AscendC::LocalTensor<float> &acc,
                                        const AscendC::LocalTensor<float> &runSum)
     {
-        AscendC::LocalTensor<float> brcb = brcbBuf_.Get<float>();
-        AscendC::LocalTensor<float> bSum = brcb[2 * kBrcbDstLanes];
-        AscendC::LocalTensor<float> invSum = brcb[3 * kBrcbDstLanes];
-
-        AscendC::Adds(runSum, runSum, TurboQuantCodec4::kEps, 1);
-        VecBarrier<kPagedAttentionVecBarriers>();
-        BroadcastScalar<kPagedAttentionVecBarriers>(bSum, runSum);
-        AscendC::Duplicate(invSum, 1.0f, kFp32PerBlock);
-        VecBarrier<kPagedAttentionVecBarriers>();
-        AscendC::Div(invSum, invSum, bSum, kFp32PerBlock);
-        VecBarrier<kPagedAttentionVecBarriers>();
-        TurboQuantCodec4::BroadcastMul<kPagedAttentionVecBarriers>(acc, acc, invSum, headSize_);
-
-        AscendC::LocalTensor<scalar_t> out = outBuf_.Get<scalar_t>();
-        AscendC::Cast(out, acc, AscendC::RoundMode::CAST_RINT, headSize_);
-        SyncEvent<AscendC::HardEvent::V_MTE3>();
-        AscendC::DataCopy(outputGm_[(static_cast<uint64_t>(token) * numHeads_ + head) * headSize_], out, headSize_);
-        SyncEvent<AscendC::HardEvent::MTE3_V>();
+        const AscendC::LocalTensor<float> brcb = brcbBuf_.Get<float>();
+        WriteNormalizedHeads<scalar_t, kPagedAttentionVecBarriers>(
+            acc, runSum, 1, headSize_, brcb[2 * kBrcbDstLanes], brcb[3 * kBrcbDstLanes], outBuf_.Get<scalar_t>(),
+            outputGm_, (static_cast<uint64_t>(token) * numHeads_ + head) * headSize_);
     }
 
     __aicore__ inline void PrepareTask(uint32_t token, uint32_t head, uint32_t kvHead)
@@ -485,29 +451,20 @@ private:
 
         const uint64_t row = static_cast<uint64_t>(physical) * blockSize_ + rowBase;
         const uint64_t rowOff = row * packedPlane_;
-        const uint64_t scaleOff = row * scaleSlot_;
         const uint32_t tileBytes = kTileRows * packedBytes_;
 
-        if (numKvHeads_ == 1) {
-            AscendC::DataCopy(kv, keyCacheGm_[rowOff], tileBytes);
-            AscendC::DataCopy(kv[tileBytes], valueCacheGm_[rowOff], tileBytes);
-        } else if (wholeRowRead_ == 0) {
-            const uint64_t cacheOff = rowOff + static_cast<uint64_t>(kvHead) * packedBytes_;
-            AscendC::DataCopy(kv, keyCacheGm_[cacheOff], rowParams_);
-            AscendC::DataCopy(kv[tileBytes], valueCacheGm_[cacheOff], rowParams_);
-        } else {
-            const uint32_t planeBytes = kTileRows * packedPlane_;
-            const uint32_t headOff = kvHead * packedBytes_;
-            AscendC::LocalTensor<int8_t> rows = rowsBuf_.Get<int8_t>();
-            SyncEvent<AscendC::HardEvent::V_MTE2>();
-            AscendC::DataCopy(rows, keyCacheGm_[rowOff], planeBytes);
-            AscendC::DataCopy(rows[planeBytes], valueCacheGm_[rowOff], planeBytes);
-            SyncEvent<AscendC::HardEvent::MTE2_V>();
-            AscendC::DataCopy(kv, rows[headOff], rowParams_);
-            AscendC::DataCopy(kv[tileBytes], rows[planeBytes + headOff], rowParams_);
+        if (burst_.WholeRow()) {
+            SyncVectorToMte2();
+        }
+        burst_.Read(kv, keyCacheGm_, rowOff, kvHead, 0);
+        burst_.Read(kv[tileBytes], valueCacheGm_, rowOff, kvHead, 1);
+        if (burst_.WholeRow()) {
+            SyncMte2ToVector();
+            burst_.Permute(kv, kvHead, 0);
+            burst_.Permute(kv[tileBytes], kvHead, 1);
         }
 
-        AscendC::DataCopy(scales, scaleCacheGm_[scaleOff], kTileRows * scaleSlot_);
+        AscendC::DataCopy(scales, scaleCacheGm_[row * scaleSlot_], kTileRows * scaleSlot_);
 
         kvQueue_.EnQue(kv);
         scaleQueue_.EnQue(scales);
@@ -634,6 +591,7 @@ private:
 
     AscendC::TPipe *pipe_;
     TurboQuantCodec4 codec_;
+    TurboQuantTileBurst burst_;
     AscendC::TQue<AscendC::QuePosition::VECIN, 2> kvQueue_;
     AscendC::TQue<AscendC::QuePosition::VECIN, 2> scaleQueue_;
     AscendC::TQue<AscendC::QuePosition::VECIN, 1> qInQueue_;
@@ -646,7 +604,6 @@ private:
     AscendC::TBuf<AscendC::QuePosition::VECCALC> stateBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> scaleIdxBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> outBuf_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> rowsBuf_;
     AscendC::GlobalTensor<float> queryRotGm_;
     AscendC::GlobalTensor<int8_t> keyCacheGm_;
     AscendC::GlobalTensor<int8_t> valueCacheGm_;
@@ -656,7 +613,6 @@ private:
     AscendC::GlobalTensor<int32_t> tablesGm_;
     AscendC::GlobalTensor<float> workspaceGm_;
     AscendC::GlobalTensor<scalar_t> outputGm_;
-    AscendC::DataCopyParams rowParams_;
     uint32_t numTokens_ = 0;
     uint32_t numHeads_ = 0;
     uint32_t numKvHeads_ = 0;
@@ -670,153 +626,7 @@ private:
     uint32_t packedPlane_ = 0;
     uint32_t scaleSlot_ = 0;
     uint32_t partialStride_ = 0;
-    uint32_t wholeRowRead_ = 0;
     float scale_ = 1.0f;
-};
-
-template <typename scalar_t>
-class TurboQuantPagedAttentionCombine {
-public:
-    __aicore__ inline explicit TurboQuantPagedAttentionCombine(AscendC::TPipe *pipe) : pipe_(pipe) {}
-
-    __aicore__ inline void Init(__gm__ void *workspace, __gm__ void *output, uint32_t numTokens, uint32_t numHeads,
-                                uint32_t headSize, uint32_t numSplits, __gm__ void *contextLens = nullptr,
-                                uint32_t fusedContextLimit = 0)
-    {
-        numTokens_ = numTokens;
-        numHeads_ = numHeads;
-        headSize_ = headSize;
-        numSplits_ = numSplits;
-        fusedContextLimit_ = fusedContextLimit;
-        partialStride_ = headSize + kPartialTail;
-
-        workspaceGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(workspace));
-        outputGm_.SetGlobalBuffer(reinterpret_cast<__gm__ scalar_t *>(output));
-        contextLenGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(contextLens), numTokens);
-
-        pipe_->InitBuffer(outQueue_, 1, headSize_ * sizeof(scalar_t));
-        pipe_->InitBuffer(accBuf_, (2 * headSize_ + kPartialTail) * sizeof(float));
-        pipe_->InitBuffer(stateBuf_, 5 * kFp32PerBlock * sizeof(float));
-        pipe_->InitBuffer(brcbBuf_, 4 * kBrcbDstLanes * sizeof(float));
-        AscendC::PipeBarrier<PIPE_ALL>();
-    }
-
-    __aicore__ inline void Process(uint32_t tasksPerCore)
-    {
-        const uint32_t tasks = numTokens_ * numHeads_;
-        uint32_t start = static_cast<uint32_t>(AscendC::GetBlockIdx()) * tasksPerCore;
-        uint32_t end = start + tasksPerCore;
-        if (end > tasks) {
-            end = tasks;
-        }
-        for (uint32_t task = start; task < end; ++task) {
-            const uint32_t token = task / numHeads_;
-            if (fusedContextLimit_ > 0 &&
-                contextLenGm_.GetValue(token) <= static_cast<int32_t>(fusedContextLimit_)) {
-                continue;
-            }
-            Combine(token, task % numHeads_);
-        }
-    }
-
-private:
-    __aicore__ inline uint64_t PartialOffset(uint32_t token, uint32_t head, uint32_t split) const
-    {
-        return ((static_cast<uint64_t>(token) * numHeads_ + head) * numSplits_ + split) * partialStride_;
-    }
-
-    __aicore__ inline void Combine(uint32_t token, uint32_t head)
-    {
-        AscendC::LocalTensor<float> acc = accBuf_.Get<float>();
-        AscendC::LocalTensor<float> partAcc = acc[headSize_];
-
-        AscendC::LocalTensor<float> state = stateBuf_.Get<float>();
-        AscendC::LocalTensor<float> runMax = state[kPartialMaxLane];
-        AscendC::LocalTensor<float> runSum = state[kPartialSumLane];
-        AscendC::LocalTensor<float> newMax = state[2 * kFp32PerBlock];
-        AscendC::LocalTensor<float> alpha = state[3 * kFp32PerBlock];
-        AscendC::LocalTensor<float> beta = state[4 * kFp32PerBlock];
-
-        AscendC::LocalTensor<float> brcb = brcbBuf_.Get<float>();
-        AscendC::LocalTensor<float> bAlpha = brcb;
-        AscendC::LocalTensor<float> bBeta = brcb[kBrcbDstLanes];
-        AscendC::LocalTensor<float> bSum = brcb[2 * kBrcbDstLanes];
-        AscendC::LocalTensor<float> invSum = brcb[3 * kBrcbDstLanes];
-
-        AscendC::LocalTensor<float> partState = acc[2 * headSize_];
-        AscendC::LocalTensor<float> partMax = partState[kPartialMaxLane];
-        AscendC::LocalTensor<float> partSum = partState[kPartialSumLane];
-
-        AscendC::Duplicate(acc, 0.0f, headSize_);
-        AscendC::Duplicate(state, 0.0f, 5 * kFp32PerBlock);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Duplicate(runMax, kNegInf, 1);
-        AscendC::PipeBarrier<PIPE_V>();
-
-        for (uint32_t split = 0; split < numSplits_; ++split) {
-            const uint64_t offset = PartialOffset(token, head, split);
-            AscendC::PipeBarrier<PIPE_ALL>();
-            AscendC::DataCopy(partAcc, workspaceGm_[offset], partialStride_);
-            AscendC::PipeBarrier<PIPE_ALL>();
-
-            AscendC::Max(newMax, runMax, partMax, 1);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Sub(alpha, runMax, newMax, 1);
-            AscendC::Sub(beta, partMax, newMax, 1);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Exp(alpha, alpha, 1);
-            AscendC::Exp(beta, beta, 1);
-            AscendC::PipeBarrier<PIPE_V>();
-
-            AscendC::Mul(runSum, runSum, alpha, 1);
-            AscendC::Mul(partSum, partSum, beta, 1);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Add(runSum, runSum, partSum, 1);
-            AscendC::PipeBarrier<PIPE_V>();
-
-            BroadcastScalar(bAlpha, alpha);
-            BroadcastScalar(bBeta, beta);
-            TurboQuantCodec4::BroadcastMul(acc, acc, bAlpha, headSize_);
-            TurboQuantCodec4::BroadcastMul(partAcc, partAcc, bBeta, headSize_);
-            AscendC::Add(acc, acc, partAcc, headSize_);
-            AscendC::PipeBarrier<PIPE_V>();
-
-            AscendC::Adds(runMax, newMax, 0.0f, 1);
-            AscendC::PipeBarrier<PIPE_V>();
-        }
-
-        AscendC::Adds(runSum, runSum, TurboQuantCodec4::kEps, 1);
-        AscendC::PipeBarrier<PIPE_V>();
-        BroadcastScalar(bSum, runSum);
-        AscendC::Duplicate(invSum, 1.0f, kFp32PerBlock);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Div(invSum, invSum, bSum, kFp32PerBlock);
-        AscendC::PipeBarrier<PIPE_V>();
-        TurboQuantCodec4::BroadcastMul(acc, acc, invSum, headSize_);
-
-        AscendC::LocalTensor<scalar_t> out = outQueue_.template AllocTensor<scalar_t>();
-        AscendC::Cast(out, acc, AscendC::RoundMode::CAST_RINT, headSize_);
-        AscendC::PipeBarrier<PIPE_V>();
-        outQueue_.EnQue(out);
-        out = outQueue_.template DeQue<scalar_t>();
-        AscendC::DataCopy(outputGm_[(static_cast<uint64_t>(token) * numHeads_ + head) * headSize_], out, headSize_);
-        outQueue_.FreeTensor(out);
-    }
-
-    AscendC::TPipe *pipe_;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueue_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> accBuf_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> stateBuf_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> brcbBuf_;
-    AscendC::GlobalTensor<float> workspaceGm_;
-    AscendC::GlobalTensor<scalar_t> outputGm_;
-    AscendC::GlobalTensor<int32_t> contextLenGm_;
-    uint32_t numTokens_ = 0;
-    uint32_t numHeads_ = 0;
-    uint32_t headSize_ = 0;
-    uint32_t numSplits_ = 1;
-    uint32_t fusedContextLimit_ = 0;
-    uint32_t partialStride_ = 0;
 };
 
 }
@@ -850,31 +660,17 @@ private:
         split.Process(splitTasksPerCore);                                                                            \
         if (split.NeedsReduction()) {                                                                                \
             AscendC::SyncAll<true>();                                                                                \
-            TurboQuantPagedAttentionCombine<TYPE> combine(&pipe);                                                    \
-            combine.Init(workspace, output, numTokens, numHeads, headSize, numSplits, contextLens,                   \
-                         fusedContextLimit);                                                                         \
-            combine.Process(reduceTasksPerCore);                                                                     \
+            TurboQuantPartialReducer<TYPE, kPagedAttentionVecBarriers> reducer(&pipe);                               \
+            reducer.Init(workspace, output, numHeads, headSize, numSplits);                                          \
+            split.Reduce(reducer, reduceTasksPerCore);                                                               \
         }                                                                                                            \
-    }
-
-#define TURBOQUANT_PAGED_ATTENTION_COMBINE_DECLARE(TYPE)                                                             \
-    extern "C" __global__ __aicore__ void turboquant_paged_attention_combine_##TYPE(                                 \
-        GM_ADDR workspace, GM_ADDR output, uint32_t numTokens, uint32_t numHeads, uint32_t headSize,                 \
-        uint32_t numSplits, uint32_t tasksPerCore)                                                                   \
-    {                                                                                                                \
-        AscendC::TPipe pipe;                                                                                         \
-        TurboQuantPagedAttentionCombine<TYPE> op(&pipe);                                                             \
-        op.Init(workspace, output, numTokens, numHeads, headSize, numSplits);                                        \
-        op.Process(tasksPerCore);                                                                                    \
     }
 
 TURBOQUANT_RESHAPE_AND_CACHE_DECLARE(half)
 TURBOQUANT_PAGED_ATTENTION_FUSED_DECLARE(half)
-TURBOQUANT_PAGED_ATTENTION_COMBINE_DECLARE(half)
 #if !defined(__CCE_AICORE__) || (__CCE_AICORE__ >= 220)
 TURBOQUANT_RESHAPE_AND_CACHE_DECLARE(bfloat16_t)
 TURBOQUANT_PAGED_ATTENTION_FUSED_DECLARE(bfloat16_t)
-TURBOQUANT_PAGED_ATTENTION_COMBINE_DECLARE(bfloat16_t)
 #endif
 
 namespace vllm_ascend {
@@ -917,21 +713,6 @@ void turboquant_paged_attention_impl(AscendType type, void *stream, uint32_t blo
             queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, tables, workspace, output,
             numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, splitTasksPerCore,
             reduceTasksPerCore, fusedContextLimit, scale, invSqrtLen);
-#endif
-    }
-}
-
-void turboquant_paged_attention_combine_impl(AscendType type, void *stream, uint32_t blockDim, void *workspace,
-                                             void *output, uint32_t numTokens, uint32_t numHeads, uint32_t headSize,
-                                             uint32_t numSplits, uint32_t tasksPerCore)
-{
-    if (type == AscendType::FP16) {
-        turboquant_paged_attention_combine_half<<<blockDim, nullptr, stream>>>(
-            workspace, output, numTokens, numHeads, headSize, numSplits, tasksPerCore);
-#if !defined(__CCE_AICORE__) || (__CCE_AICORE__ >= 220)
-    } else if (type == AscendType::BF16) {
-        turboquant_paged_attention_combine_bfloat16_t<<<blockDim, nullptr, stream>>>(
-            workspace, output, numTokens, numHeads, headSize, numSplits, tasksPerCore);
 #endif
     }
 }

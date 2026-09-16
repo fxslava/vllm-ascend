@@ -220,7 +220,7 @@ void PrintUsage(const char* argv0) {
       "\n"
       "One msprof timeline of the TurboQuant attention chain against aclnnFusedInferAttentionScoreV5.\n"
       "Every shape launches each leg exactly once -- no warmup, no timing loop:\n"
-      "  TQ_Pipeline  npu_turboquant_rotate_q -> decode split -> combine [-> rotate_o, unfolded W_o only]\n"
+      "  TQ_Pipeline  npu_turboquant_rotate_q -> TQ_FusedDecode, one launch [-> rotate_o, unfolded W_o only]\n"
       "  V5_Native    GetWorkspaceSize + workspace -> aclnnFusedInferAttentionScoreV5\n"
       "with a %lld ms gap after each leg.\n"
       "\n"
@@ -695,12 +695,14 @@ class DecodeScenario final : public Scenario {
       const TraceRange range(markers, "TQ_rotate_q", stream);
       EnqueueRotation(stream, query_, query_rot_, config_.batch);
     }
-    if (config_.path == tqa::PathMode::kCube) {
+    {
+      // One marker name on both paths, so the timeline compares like with like against V5_Native.
       const TraceRange range(markers, "TQ_FusedDecode", stream);
-      EnqueueCubeFused(stream);
-    } else {
-      const TraceRange range(markers, "TQ_PagedAttention_Fused", stream);
-      EnqueueAivPagedAttention(stream);
+      if (config_.path == tqa::PathMode::kCube) {
+        EnqueueCubeFused(stream);
+      } else {
+        EnqueueAivPagedAttention(stream);
+      }
     }
     if (!config_.model.folds_output) {
       const TraceRange range(markers, "TQ_rotate_o", stream);

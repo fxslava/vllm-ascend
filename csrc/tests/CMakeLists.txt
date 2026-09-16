@@ -136,7 +136,7 @@ option(VLLM_ASCEND_TESTS_HOST_ONLY "Build only the targets that need no CANN too
 option(VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS
        "Compile the TurboQuant Ascend C kernels and build the tests that drive them" ON)
 
-# The Cube-native multi-mode decode (turboquant_mm_kernels.cpp) is work in
+# The Cube-native multi-mode decode (op_kernel/turboquant_fused_decode.cpp) is work in
 # progress and does not pass: the score GEMM's [n, k] B form does not reproduce
 # the host product, and TurboQuantCubeMm::Init allocates L0 on both halves of
 # the MIX kernel, which stalls the split kernel on the camodel.
@@ -420,6 +420,18 @@ if(VLLM_ASCEND_TESTS_WERROR)
   target_compile_options(vllm_ascend_test_host PUBLIC -Werror)
 endif()
 
+# The TurboQuant host tiling the adapter compiles into the wheel: every block and
+# buffer size a launch uses. Toolkit-free, so the host tier builds and tests it too,
+# and the device tiers plan launches with it instead of with a copy.
+add_library(vllm_ascend_turboquant_tiling STATIC
+  "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/op_host/turboquant_tiling.cpp")
+target_include_directories(vllm_ascend_turboquant_tiling
+  PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant")
+target_compile_options(vllm_ascend_turboquant_tiling PRIVATE -Wall -Wextra)
+if(VLLM_ASCEND_TESTS_WERROR)
+  target_compile_options(vllm_ascend_turboquant_tiling PRIVATE -Werror)
+endif()
+
 if(NOT EXISTS "${VLLM_ASCEND_GOLDEN_LAYER3_DIR}/golden_output.bin")
   message(WARNING
     "golden dump not found at ${VLLM_ASCEND_GOLDEN_LAYER3_DIR}.\n"
@@ -659,8 +671,8 @@ if(VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE)
   #
   # The only part of this suite that compiles device code. Everything else calls
   # operators CANN already built; these are built here, from
-  # csrc/attention/turboquant/turboquant_kernels.cpp - the same source the wheel
-  # compiles, not a copy.
+  # csrc/attention/turboquant/op_kernel/ - the same sources the wheel compiles,
+  # not copies.
   #
   # One library per tree, built for whichever RUN_MODE this configuration
   # selected. That is precisely why sim/ and device/ cannot both be configured:
@@ -669,21 +681,18 @@ if(VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE)
   set(VLLM_ASCEND_TESTS_HAVE_TURBOQUANT FALSE)
 
   if(VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS)
-    # Two sources, one library. turboquant_kernels.cpp is the AIV-only 4-bit
-    # path; turboquant_mm_kernels.cpp is the multi-mode Cube-native one. They
-    # share a library rather than having one each because the Cube decode reuses
-    # the AIV path's combine kernel, and a <<<>>> call site can only reach a
+    # One library for every kernel source: a <<<>>> call site can only reach a
     # kernel whose generated launcher is in the same ascendc_library.
+    #   op_kernel/turboquant_paged_attention.cpp  the shipping AIV-only 4-bit path
+    #   op_kernel/turboquant_rotate_q.cpp         the query rotation (also shipping)
+    #   op_kernel/turboquant_fused_decode.cpp     the multi-mode Cube-native path,
+    #                                             test-only: the wheel builds the two above
     set(VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE
-        "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/turboquant_kernels.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/turboquant_mm_kernels.cpp"
-        # The standalone query rotation both decode paths now depend on. In the
-        # wheel it sits beside turboquant_kernels.cpp in the same library, for
-        # the same reason the two above share one: a <<<>>> call site can only
-        # reach a launcher generated into the library it links.
-        "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/turboquant_rotate_q.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/op_kernel/turboquant_paged_attention.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/op_kernel/turboquant_fused_decode.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/op_kernel/turboquant_rotate_q.cpp"
         # Test-owned device code, and the one source in this list the wheel does
-        # not build - the root CMakeLists.txt names only the two above. It is an
+        # not build - the root CMakeLists.txt names only the first and third. It is an
         # exploratory spike (a Cube-factorised Walsh-Hadamard, see its header)
         # and it rides in this library rather than one of its own because a
         # <<<>>> call site can only reach a kernel whose generated launcher is
@@ -720,6 +729,7 @@ if(VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE)
     # ATen. Carries the reference/ include directory because the Pi diagonal
     # comes from the CPU reference rather than from a second generator.
     add_library(vllm_ascend_test_turboquant STATIC common/turboquant_launch.cpp)
+    target_link_libraries(vllm_ascend_test_turboquant PUBLIC vllm_ascend_turboquant_tiling)
 
     target_include_directories(vllm_ascend_test_turboquant
       PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/reference")

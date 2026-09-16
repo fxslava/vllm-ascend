@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 
-// Smoke of the fused single-launch Cube decode (TURBOQUANT_TESTS.md 13.25) against the legacy
-// split + combine chain it replaces, on one shape: kv4fp8, H_Q 4, H_KV 2, D 256, one 64-row
-// tile. The legacy chain keeps every vector barrier and the subcore-0 gate, so agreement
-// between the two is the A/B for the barrier-free, dual-destination kernel.
+// Smoke of the fused single-launch Cube decode (TURBOQUANT_TESTS.md 13.25) on one shape: kv4fp8, H_Q 4,
+// H_KV 2, D 256, one 64-row tile. Two checks. The barrier-free kernel is bit-identical to the instance
+// of the same kernel that keeps every intra-pipe vector barrier (the A/B for the claim that ccec orders
+// dependent vector ops on its own). And its cosine against exact fp32 attention has not regressed from
+// the value the retired split + combine chain produced on this shape.
 
 #include <gtest/gtest.h>
 
@@ -38,8 +39,11 @@ namespace {
 namespace tqh = turboquant_host;
 
 constexpr int64_t kLaunchBudgetSeconds = 900;
-constexpr double kMinReferenceCosine = 0.97;
-constexpr double kMaxCosineShortfall = 1e-4;
+
+// cos(fused, exact fp32) measured 2026-09-16 on this shape, bit-identical to the retired split + combine.
+constexpr double kRecordedReferenceCosine = 0.999407;
+// The recorded value is printed to six places; anything below it by more than that rounding regressed.
+constexpr double kCosineRounding = 5e-7;
 
 void PrintRun(const char* label, const tqh::FusedRun& run, const std::vector<float>& reference) {
   std::printf("  %-16s launches=%lld splits=%lld block_dim=%u heads/task=%u untouched=%zu cos_vs_fp32=%.6f %.1f s\n",
@@ -47,7 +51,7 @@ void PrintRun(const char* label, const tqh::FusedRun& run, const std::vector<flo
               run.heads_per_task, run.untouched, tqh::FusedCosine(run.output, reference), run.host_s);
 }
 
-TEST(TurboQuantFusedDecode, MatchesTheLegacySplitAndCombine) {
+TEST(TurboQuantFusedDecode, IsBitIdenticalToItsBarrieredInstance) {
   REQUIRE_ASCEND_950PR();
   aclrtStream stream = AscendTestEnvironment::Instance().stream();
   bool queried = false;
@@ -71,27 +75,27 @@ TEST(TurboQuantFusedDecode, MatchesTheLegacySplitAndCombine) {
   watchdog.Disarm();
   PrintRun("fused", fused, reference);
 
-  watchdog.Arm("legacy turboquant_mm_decode_split_impl + combine");
-  const tqh::FusedRun legacy = scenario.RunSplitAndCombine(1);
+  watchdog.Arm("turboquant_mm_fused_decode_barriered_impl");
+  const tqh::FusedRun barriered = scenario.RunBarriered();
   watchdog.Disarm();
-  PrintRun("legacy split", legacy, reference);
+  PrintRun("fused barriered", barriered, reference);
 
-  const tqh::FusedAgreement agreement = tqh::CompareValues(fused.output, legacy.output);
+  const tqh::FusedAgreement agreement = tqh::CompareValues(fused.output, barriered.output);
   const double fused_cos = tqh::FusedCosine(fused.output, reference);
-  const double legacy_cos = tqh::FusedCosine(legacy.output, reference);
-  std::printf("[ fused ] fused vs legacy: %zu of %zu elements differ, max |err| %.3e\n", agreement.differing,
+  std::printf("[ fused ] fused vs barriered: %zu of %zu elements differ, max |err| %.3e\n", agreement.differing,
               agreement.compared, agreement.max_abs);
+  std::printf("[ fused ] cos vs fp32 %.6f (recorded %.6f)\n", fused_cos, kRecordedReferenceCosine);
 
   const DumpCensus dumps = ExceptionDumps();
   std::printf("[ fused ] excp dumps in cwd: %zu files, %zu non-empty, %llu B\n", dumps.files, dumps.non_empty,
               static_cast<unsigned long long>(dumps.bytes));
 
   EXPECT_EQ(fused.num_splits, 1) << "a context inside the fused limit is never split";
+  EXPECT_EQ(fused.launches, 1);
   EXPECT_EQ(fused.untouched, 0u) << "the fused launch left sentinel values in the output";
-  EXPECT_EQ(legacy.untouched, 0u) << "the legacy chain left sentinel values in the output";
-  EXPECT_EQ(agreement.differing, 0u) << "the fused decode is not bit-identical to the legacy split + combine";
-  EXPECT_GE(fused_cos, kMinReferenceCosine) << "fused decode vs exact fp32 attention";
-  EXPECT_GE(fused_cos, legacy_cos - kMaxCosineShortfall) << "the fused decode is less faithful than the legacy chain";
+  EXPECT_EQ(barriered.untouched, 0u) << "the barriered launch left sentinel values in the output";
+  EXPECT_EQ(agreement.differing, 0u) << "the barrier-free kernel is not bit-identical to its barriered instance";
+  EXPECT_GE(fused_cos, kRecordedReferenceCosine - kCosineRounding) << "cos vs exact fp32 regressed";
   EXPECT_EQ(dumps.non_empty, 0u) << "the camodel wrote an exception dump";
 }
 

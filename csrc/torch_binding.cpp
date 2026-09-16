@@ -52,7 +52,7 @@
 #include "moe/situ_mx_quant/situ_mx_quant_torch_adpt.h"
 #include "attention/mla_prolog_v3/mla_prolog_v3_torch_adpt.h"
 #ifdef VLLM_ENABLE_TURBOQUANT
-#include "attention/turboquant/turboquant_torch_adpt.h"
+#include "attention/turboquant/op_adapter/turboquant_torch_adpt.h"
 #endif
 #include <c10/core/Device.h>
 #include <c10/core/Scalar.h>

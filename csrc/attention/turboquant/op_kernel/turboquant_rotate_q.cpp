@@ -16,15 +16,18 @@
 
 #include "kernel_operator.h"
 
-#include "../../kernels/types.h"
-#include "turboquant_codec_950.h"
-#include "turboquant_rotate_q.h"
+#include "../../../kernels/types.h"
+#include "common/turboquant_codec_950.h"
 
 namespace {
 
+using vllm_ascend::turboquant::CeilDiv;
 using vllm_ascend::turboquant::kRotateQTile;
+using vllm_ascend::turboquant::MixBlockIdx;
 using vllm_ascend::turboquant::RepeatButterfly;
 using vllm_ascend::turboquant::RotateQVariant;
+using vllm_ascend::turboquant::SyncEvent;
+using vllm_ascend::turboquant::SyncVectorToMte3;
 using vllm_ascend::turboquant::VecBarrier;
 
 using TurboQuantCodec4 = vllm_ascend::turboquant::TurboQuantCodec<4>;
@@ -44,32 +47,11 @@ constexpr uint32_t kSlots = 2;
 
 constexpr AscendC::FixpipeConfig kFixpipeToUb = {AscendC::CO2Layout::ROW_MAJOR, true};
 
-__aicore__ inline uint32_t CeilDiv(uint32_t a, uint32_t b) { return (a + b - 1) / b; }
 __aicore__ inline uint32_t AlignUp(uint32_t a, uint32_t b) { return CeilDiv(a, b) * b; }
 
 __aicore__ inline uint16_t CeilDivU16(uint32_t a, uint32_t b)
 {
     return static_cast<uint16_t>((a + b - 1) / b);
-}
-
-__aicore__ inline uint32_t MixBlockIdx()
-{
-    return static_cast<uint32_t>(AscendC::GetBlockIdx() / AscendC::GetSubBlockNum());
-}
-
-__aicore__ inline void SyncVectorToMte3()
-{
-    const event_t ev = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::V_MTE3));
-    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(ev);
-    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(ev);
-}
-
-template <AscendC::HardEvent EVENT>
-__aicore__ inline void SyncEvent()
-{
-    const event_t ev = static_cast<event_t>(GetTPipePtr()->FetchEventID(EVENT));
-    AscendC::SetFlag<EVENT>(ev);
-    AscendC::WaitFlag<EVENT>(ev);
 }
 
 __aicore__ inline void BlockButterfly(const AscendC::LocalTensor<float> &dst,

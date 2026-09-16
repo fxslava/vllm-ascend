@@ -83,11 +83,11 @@ if(SOC_VERSION MATCHES "ascend910b.*|ascend910_93|ascend950")
     set(VLLM_ASCEND_BUILD_TURBOQUANT ON)
     message(STATUS "Hardware ${SOC_VERSION} detected: building TurboQuant KV cache kernels")
     # Two sources, one library: a <<<>>> call site can only reach a kernel whose
-    # generated launcher is in the same ascendc_library, and the decode operator
-    # launches both the split/combine kernels and the query rotation.
+    # generated launcher is in the same ascendc_library, and the adapter launches
+    # both the fused paged-attention decode and the query rotation.
     ascendc_library(vllm_ascend_turboquant SHARED
-        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/turboquant_kernels.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/turboquant_rotate_q.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/op_kernel/turboquant_paged_attention.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/op_kernel/turboquant_rotate_q.cpp
     )
 else()
     set(VLLM_ASCEND_BUILD_TURBOQUANT OFF)
@@ -104,6 +104,12 @@ else()
     file(GLOB VLLM_ASCEND_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/*.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/aclnn_torch_adapter/*.cpp)
+endif()
+
+# The TurboQuant adapter's host tiling (op_host/): plain C++, compiled into the extension.
+if(VLLM_ASCEND_BUILD_TURBOQUANT)
+    list(APPEND VLLM_ASCEND_SRC
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/op_host/turboquant_tiling.cpp)
 endif()
 
 include_directories(

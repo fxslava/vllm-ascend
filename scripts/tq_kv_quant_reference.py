@@ -193,7 +193,7 @@ def q_lloyd_max(v, centroids=None, thresholds=None):
     The reconstruction stays *linear in s*, exactly as (q - 7.5) * step does for
     the uniform grid.  That is what lets the device keep folding the per-vector
     scale into the score row rather than broadcasting it over head_size; see
-    Dequantize4Bit in csrc/attention/turboquant/turboquant_codec_950.h.
+    Dequantize4Bit in csrc/attention/turboquant/op_kernel/common/turboquant_codec_950.h.
     """
     cen = LLOYD_MAX_4BIT_CENTROIDS if centroids is None else centroids
     thr = LLOYD_MAX_4BIT_THRESHOLDS if thresholds is None else thresholds

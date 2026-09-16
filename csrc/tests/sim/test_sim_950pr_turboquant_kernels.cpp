@@ -327,31 +327,6 @@ TEST(TurboQuantLaunchContract, CodecTablesHaveTheDocumentedLayout) {
   }
 }
 
-TEST(TurboQuantLaunchContract, CombineHoldsNoRotationState) {
-  constexpr size_t kHalfBytes = sizeof(uint16_t);
-
-  const tqh::CombineUbFootprint d256 = tqh::PlanCombineUb(256, kHalfBytes);
-  EXPECT_EQ(d256.unrotation_codec_tables + d256.unrotation_codec_scratch, 82272u);
-  EXPECT_EQ(d256.Released(), 84320u);
-  EXPECT_EQ(d256.Current(), 3808u);
-  EXPECT_EQ(d256.Previous(), 88128u);
-
-  const tqh::CombineUbFootprint d128 = tqh::PlanCombineUb(128, kHalfBytes);
-  EXPECT_EQ(d128.Released(), 42336u);
-  EXPECT_EQ(d128.Current(), 2528u);
-
-  for (const int64_t head_size : {64, 128, 256}) {
-    const tqh::CombineUbFootprint ub = tqh::PlanCombineUb(head_size, kHalfBytes);
-    EXPECT_EQ(ub.unrotation_codec_tables, tqh::CodecTables(head_size, tqh::kTileRows).size() * sizeof(int32_t))
-        << "head_size " << head_size;
-    for (const size_t bytes : {ub.accumulators, ub.state, ub.partial, ub.broadcast}) {
-      EXPECT_EQ(bytes % 32u, 0u) << "head_size " << head_size;
-    }
-    EXPECT_LT(ub.Current() * 10u, ub.Previous()) << "head_size " << head_size
-                                                  << ": the combine should keep under a tenth of its old UB";
-  }
-}
-
 TEST(TurboQuantLaunchContract, UnrotateHeadsIsPiPerHead) {
   constexpr int64_t kHeads = 3;
   for (const int64_t head_size : {64, 128, 256}) {
@@ -396,7 +371,7 @@ TEST(TurboQuantLaunchContract, PiSignsMatchTheCpuReference) {
   }
 }
 
-TEST(TurboQuantLaunchContract, GridPlansMatchTheAdapterArithmetic) {
+TEST(TurboQuantLaunchContract, TilingPlansHonourTheFusedLimit) {
   constexpr int64_t kAiv = 40;
 
   for (int64_t tokens : {1, 7, 40, 41, 1024}) {

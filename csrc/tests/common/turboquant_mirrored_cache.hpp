@@ -22,7 +22,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "../../attention/turboquant/turboquant_mode.h"
+#include "../../attention/turboquant/op_kernel/common/turboquant_mode.h"
 #include "random_data.hpp"
 
 namespace vllm_ascend {

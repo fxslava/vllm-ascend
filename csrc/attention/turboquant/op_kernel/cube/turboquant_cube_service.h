@@ -14,30 +14,16 @@
  * limitations under the License.
  */
 
-#ifndef VLLM_ASCEND_ATTENTION_TURBOQUANT_CUBE_MM_H
-#define VLLM_ASCEND_ATTENTION_TURBOQUANT_CUBE_MM_H
+#ifndef VLLM_ASCEND_ATTENTION_TURBOQUANT_CUBE_SERVICE_H
+#define VLLM_ASCEND_ATTENTION_TURBOQUANT_CUBE_SERVICE_H
 
-#include "kernel_operator.h"
-#include "turboquant_mode.h"
+#include "../common/turboquant_common.h"
+#include "../common/turboquant_mode.h"
 
 namespace vllm_ascend {
 namespace turboquant {
 
 constexpr AscendC::FixpipeConfig kFixpipeToUb = {AscendC::CO2Layout::ROW_MAJOR, true};
-
-constexpr uint32_t kCubeTileM = 16;
-constexpr uint32_t kCubeKStep = 64;
-
-constexpr uint32_t kSlots = 2;
-
-constexpr uint16_t kFlagOperandsReady = 0;
-constexpr uint16_t kFlagProductReady = 1;
-
-constexpr uint16_t kFlagSlotReady = 0;
-constexpr uint16_t kFlagSlotFree = 2;
-constexpr uint16_t kFlagScoresReady = 4;
-constexpr uint16_t kFlagContextReady = 5;
-constexpr uint16_t kFlagProbsReady = 6;
 
 template <TurboQuantMode MODE>
 struct TurboQuantOperandType;
@@ -73,7 +59,7 @@ public:
         const uint32_t bBytes = tileRows_ * OperandElems(headSize_);
         pipe->InitBuffer(aQ1_, qBytes);
         pipe->InitBuffer(aP1_, pBytes);
-        for (uint32_t slot = 0; slot < kSlots; ++slot) {
+        for (uint32_t slot = 0; slot < kCubeSlots; ++slot) {
             pipe->InitBuffer(bK1_[slot], bBytes);
             pipe->InitBuffer(bV1_[slot], bBytes);
         }
@@ -96,7 +82,6 @@ public:
         return (c / kOperandC0) * rows * kOperandC0 + r * kOperandC0 + (c % kOperandC0);
     }
 
-    static constexpr uint32_t kOperandC0 = 32;
 
     template <bool DUAL_DST = false>
     __aicore__ inline void GemmScores(const AscendC::LocalTensor<float> &dstUb,
@@ -253,13 +238,43 @@ private:
 
     AscendC::TBuf<AscendC::TPosition::A1> aQ1_;
     AscendC::TBuf<AscendC::TPosition::A1> aP1_;
-    AscendC::TBuf<AscendC::TPosition::B1> bK1_[kSlots];
-    AscendC::TBuf<AscendC::TPosition::B1> bV1_[kSlots];
+    AscendC::TBuf<AscendC::TPosition::B1> bK1_[kCubeSlots];
+    AscendC::TBuf<AscendC::TPosition::B1> bV1_[kCubeSlots];
     AscendC::TBuf<AscendC::TPosition::A2> a2_;
     AscendC::TBuf<AscendC::TPosition::B2> b2_;
     AscendC::TBuf<AscendC::TPosition::CO1> co1_;
     uint32_t headSize_ = 0;
     uint32_t tileRows_ = 0;
+};
+
+// The Cube half of the fused decode. For every tile the AIV subcores stage, the AIC runs the score
+// GEMM and then the context GEMM, each Fixpiped into BOTH subcores' UB (dualDstCtl = 1, M split in
+// half), and hands off with the cross-core flags the vector service waits on. Rows are the task's
+// head count; the Fixpipe pads M to even and each subcore reads its half at UB offset 0.
+template <TurboQuantMode MODE>
+struct TurboQuantCubeDecodeService {
+    using Mm = TurboQuantCubeMm<MODE>;
+
+    __aicore__ static inline void RunTiles(Mm &mm, const AscendC::LocalTensor<float> &scoresUb,
+                                           const AscendC::LocalTensor<float> &contextUb, uint32_t numTiles,
+                                           uint32_t rows, uint32_t headSize)
+    {
+        for (uint32_t tileIdx = 0; tileIdx < numTiles; ++tileIdx) {
+            const uint32_t l1SlotIdx = tileIdx % kCubeSlots;
+
+            AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kFlagSlotReady + l1SlotIdx));
+            mm.template GemmScores<true>(scoresUb, mm.B1K(l1SlotIdx), rows, headSize, kCubeTileRows);
+            AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(kFlagScoresReady);
+
+            AscendC::CrossCoreWaitFlag(kFlagProbsReady);
+            mm.template GemmContext<true>(contextUb, mm.B1V(l1SlotIdx), rows, kCubeTileRows, headSize);
+            AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(kFlagContextReady);
+
+            if (tileIdx + kCubeSlots < numTiles) {
+                AscendC::CrossCoreSetFlag<0x2, PIPE_MTE1>(static_cast<uint16_t>(kFlagSlotFree + l1SlotIdx));
+            }
+        }
+    }
 };
 
 }

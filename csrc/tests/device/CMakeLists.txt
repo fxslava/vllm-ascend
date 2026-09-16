@@ -193,28 +193,6 @@ if(VLLM_ASCEND_TESTS_BUILD_BENCHMARKS AND VLLM_ASCEND_TESTS_HAVE_TURBOQUANT)
     # 16 shapes x 4 legs x (warmup + 100 timed iterations), all tiny kernels.
     TIMEOUT 1800)
 
-  # The kv4fp8 split cut at each DecodeAblationStage. Its stage 0-4 entry points
-  # exist only in this tree's kernel library (see ../turboquant/CMakeLists.txt).
-  # Its own entry point for the same reason as the Hadamard sweep's: it takes
-  # --stage= and --sync-timeout-ms= on the command line, so a suspect stage runs
-  # alone in its own process under a deadline. A stage that misses the deadline
-  # exits 3, which ctest records as a failure.
-  vllm_ascend_add_device_executable(bench_device_950pr_turboquant_ablation
-                                    bench_device_950pr_turboquant_ablation.cpp
-                                    bench_main_950pr_ablation.cpp)
-  target_link_libraries(bench_device_950pr_turboquant_ablation PRIVATE vllm_ascend_test_turboquant)
-  target_compile_definitions(bench_device_950pr_turboquant_ablation PRIVATE VLLM_ASCEND_TEST_TIER="device")
-  add_dependencies(benchmarks bench_device_950pr_turboquant_ablation)
-  list(APPEND VLLM_ASCEND_DEVICE_BENCHMARKS bench_device_950pr_turboquant_ablation)
-
-  add_test(NAME bench_device_950pr_turboquant_ablation COMMAND bench_device_950pr_turboquant_ablation)
-  set_tests_properties(bench_device_950pr_turboquant_ablation PROPERTIES
-    ENVIRONMENT "LD_LIBRARY_PATH=${VLLM_ASCEND_TEST_LIBRARY_PATH};ASCEND_HOME_PATH=${ASCEND_HOME_PATH}"
-    LABELS "benchmark;${VLLM_ASCEND_TEST_TIER_LABEL}"
-    SKIP_RETURN_CODE 77
-    # 8 shapes x 6 stages x (deadline launch + warmup + 3 timed modes).
-    TIMEOUT 1800)
-
   message(STATUS "vllm-ascend tests: [device] ${VLLM_ASCEND_DEVICE_BENCHMARKS}")
 endif()
 

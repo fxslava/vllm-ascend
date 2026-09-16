@@ -28,7 +28,7 @@ table -- see TurboQuantModeCodec::UnpackAffine -- and the numbers below are what
 that costs: 0.746 dB of codebook SNR, and 0.003 of attention cosine at S = 64.
 
 This is the host-side twin of TurboQuantModeTraits in
-csrc/attention/turboquant/turboquant_mode.h: the centroid tables printed here
+csrc/attention/turboquant/op_kernel/common/turboquant_mode.h: the centroid tables printed here
 are the tables that header ships, and --emit-header regenerates them.
 
 WHAT THIS ADDS OVER scripts/tq_fp8_lut_calibration.py, which it imports its

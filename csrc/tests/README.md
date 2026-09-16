@@ -50,12 +50,15 @@ csrc/tests/
 |-- turboquant/             ascendc_library() for the Ascend C kernels
 |
 |-- host/                   TIER 1 -- no CANN at all, no NPU, runs anywhere
-|   `-- test_host_turboquant_fidelity.cpp
+|   |-- test_host_turboquant_fidelity.cpp
+|   `-- test_host_turboquant_tiling.cpp           the adapter's block and buffer plans
 |
 |-- sim/                    TIER 2 -- CAModel only; links libruntime_camodel.so
 |   |-- test_sim_950pr_turboquant_rotate_q.cpp    the standalone query rotation, both paths
 |   |-- test_sim_950pr_turboquant_kernels.cpp
 |   |-- test_sim_950pr_turboquant_decode.cpp
+|   |-- test_sim_950pr_turboquant_fused.cpp       the fused Cube decode vs its barriered instance
+|   |-- test_sim_950pr_turboquant_multimode.cpp   the fused Cube decode, all three modes
 |   |-- test_sim_950pr_cube_hadamard.cpp          spike: one shape of the sweep below
 |   `-- sim_hadamard_hybrid_kernels.cpp           spike: test-owned Ascend C, not the decode
 |
@@ -71,8 +74,6 @@ csrc/tests/
 |   |-- bench_950pr_cube_hadamard.cpp             spike: the same sweep, timed, --csv=
 |   |-- bench_main_950pr_hadamard.cpp             its entry point; only it takes argv
 |   |-- bench_device_950pr_turboquant.cpp         decode legs, then the prefill sweep against FIA V5
-|   |-- bench_device_950pr_turboquant_ablation.cpp  the kv4fp8 Cube split, cut stage by stage
-|   |-- bench_main_950pr_ablation.cpp             its entry point; takes --stage= and --sync-timeout-ms=
 |   `-- prof_device_950pr_msprof_trace.cpp        one launch per leg under mstx ranges, for msprof; own main()
 |
 `-- device_310p/            the 310P leg -- NOT configured under a 950PR SoC
@@ -354,11 +355,6 @@ warmup.
 | `ASCEND_BENCH_TQ_AUDIT_ULTRA_WARMUP` / `_ULTRA_ITERS` | 1 / 3 | the `S >= 262K` budget, which gets its own runner and its own report table |
 | `ASCEND_BENCH_TQ_AUDIT_PREFILL_CSV` / `_DECODE_CSV` | unset | Table A and Table B as CSVs, one row per configuration |
 | `ASCEND_BENCH_TQ_FIA` | on | `bench_device_950pr_turboquant` only: `0` drops every native `aclnnFusedInferAttentionScoreV5` leg |
-| `ASCEND_BENCH_TQ_ABLATION_DIMS` | `256,512` | `bench_device_950pr_turboquant_ablation` only: head sizes, powers of two in [64, 512] |
-| `ASCEND_BENCH_TQ_ABLATION_CONTEXTS` | `64,512,1024,2048` | `bench_device_950pr_turboquant_ablation` only: contexts, positive multiples of 8 (TURBOQUANT_TESTS.md 13.20) |
-| `ASCEND_BENCH_TQ_ABLATION_STAGES` | `0,1,2,3,4,5` | `bench_device_950pr_turboquant_ablation` only: stages to run, in order; `--stage=` sets it |
-| `ASCEND_BENCH_TQ_ABLATION_SYNC_TIMEOUT_MS` | `30000` | `bench_device_950pr_turboquant_ablation` only: deadline for each stage's first launch, `0` for none; a miss exits 3. `--sync-timeout-ms=` sets it |
-| `ASCEND_BENCH_TQ_ABLATION_BYPASS_UNPACK` | `0` | `bench_device_950pr_turboquant_ablation` only: `1` adds the unpack-bypass pair (`split_standard` vs `split_bypass`, head_size <= 256) after the ladder, `only` runs the pair alone. `--bypass-unpack[=only]` sets it (TURBOQUANT_TESTS.md 7.6) |
 | `ASCEND_TQ_TRACE_MODELS` | all three | `prof_device_950pr_msprof_trace` only: comma list of `Qwen3.5-9B,DeepSeek-V4-Flash,GLM-5.2-744B`, or their keys `qwen35,dsv4,glm52`. `--models=` overrides it |
 | `ASCEND_TQ_TRACE_CONTEXTS` / `_BATCHES` | `2048,32768` / `1,4` | `prof_device_950pr_msprof_trace` only: contexts (positive multiples of 8) and batches. `--contexts=` / `--batches=` override them |
 | `ASCEND_TQ_TRACE_MODE` | `decode` | `prof_device_950pr_msprof_trace` only: `decode`, `prefill` or `both`. `--mode=` overrides it |
@@ -382,17 +378,14 @@ matter for performance are not the ones that matter for correctness:
   mapping. Decode attention is registered as an explicit skip, for the reason in
   `common/aclnn_ops.hpp`.
 - `bench_device_950pr_turboquant` sweeps context 512 / 1024 / 2048 at Qwen3.5-2B's
-  `head_dim` 256, timing the 4-bit cache write and the AIV-only split/combine
-  decode, with an fp16 decode through `aclnnFusedInferAttentionScoreV5` (V2 as a
-  fallback) as the baseline where that operator exists. It then runs the prefill
+  `head_dim` 256, timing the 4-bit cache write and the fused single-launch decode
+  (the AIV-only path, or the Cube path at H_Q/H_KV >= 16) head to head against an
+  fp16 decode through `aclnnFusedInferAttentionScoreV5` (V2 as a fallback): 5
+  warmup and 50 timed iterations per leg, effective GB/s, and a cosine >= 0.99
+  tie-point against the native output. It then runs the prefill
   sweep -- S 512..8192, B 1/2/4, D 128/256, H_Q 32/64/128, H_KV 1/2/8 -- timing
   the TurboQuant write, the rotation of V a folded o_proj needs and FIA V5, alone
   and as pipelines, with the KV-cache compression ratios. TURBOQUANT_TESTS.md 13.23.
-- `bench_device_950pr_turboquant_ablation` times the kv4fp8 Cube split cut at
-  each `DecodeAblationStage` -- MTE2 read, unpack, query rotation, L1 staging,
-  score GEMM, full pipeline -- over D in {256, 512} and S in {64, 512, 1024,
-  2048}, and prints a per-stage latency waterfall. See TURBOQUANT_TESTS.md 7.6.
-
 See [COVERAGE.md](COVERAGE.md) for what this does and does not close, and
 [TURBOQUANT_TESTS.md](TURBOQUANT_TESTS.md) for the TurboQuant leg specifically.
 
@@ -485,7 +478,7 @@ msprof --application="./build/csrc-tests/test_activation_swiglu_310p" --output=.
 
 `bench_device_950pr_turboquant` reports medians, and a median cannot show where
 the time between two launches went. `prof_device_950pr_msprof_trace` launches
-each leg exactly once per shape -- `TQ_Pipeline` (rotate_q, split, combine, and
+each leg exactly once per shape -- `TQ_Pipeline` (rotate_q, `TQ_FusedDecode`, and
 rotate_o when W_o is unfolded), a 10 ms gap, `V5_Native` (GetWorkspaceSize,
 workspace, launch), another 10 ms gap -- and brackets every stage with a
 stream-bound mstx range, so each sub-kernel's host enqueue and device execution
@@ -554,8 +547,7 @@ saying so rather than silently building the wrong leg.
 | `test_sim_950pr_turboquant_kernels` | 5 — decode, 4-bit KV cache | the TurboQuant kernels out of `csrc/attention/turboquant`, not an aclnn operator. **Sim tier** |
 | `test_sim_950pr_turboquant_decode` | 5 — one decode pass end to end | ditto, with `aclnnFusedInferAttentionScore*` as an optional unquantised control. **Sim tier** |
 | `test_device_950pr_turboquant` | 5 — the same, at Qwen3.5-2B's real shapes | ditto. **Device tier**: silicon only, refuses a camodel |
-| `bench_device_950pr_turboquant` | 5 — the AIV-only decode, timed | ditto, with `aclnnFusedInferAttentionScoreV5` (V2 fallback) as the fp16 baseline |
-| `bench_device_950pr_turboquant_ablation` | 5 — the kv4fp8 Cube split, timed stage by stage | the TurboQuant kernels, plus five test-only entry points built under `VLLM_ASCEND_TQ_DECODE_ABLATION` |
+| `bench_device_950pr_turboquant` | 5 — the fused decode (AIV-only or Cube), timed | ditto, head to head with `aclnnFusedInferAttentionScoreV5` (V2 fallback) as the fp16 baseline |
 | `prof_device_950pr_msprof_trace` | 5 — the attention chain and FIA V5, one launch each, for an msprof timeline | the TurboQuant kernels and `aclnnFusedInferAttentionScoreV5`, bracketed by mstx ranges. Not a ctest entry |
 
 `common/aclnn_ops_950pr.hpp` carries the operator audit: which stage runs on a
@@ -571,8 +563,8 @@ each prototype was verified against.
 
 The last four binaries in that table are unlike everything else in this suite:
 they drive kernels that are **compiled here**, from
-`csrc/attention/turboquant/turboquant_kernels.cpp` - the same source the wheel
-builds, not a copy - rather than calling an operator CANN already shipped. That
+`csrc/attention/turboquant/op_kernel/` - the same sources the wheel builds, not
+copies - rather than calling an operator CANN already shipped. That
 makes them the only part of the project that needs the Ascend C kernel
 toolchain (`ccec` / `bisheng` and `tools/tikcpp/ascendc_kernel_cmake`), which is
 why they sit behind their own option:
@@ -706,7 +698,7 @@ contracts, GQA head mapping, both rotary layouts, block-table paging across
 multiple blocks, context-length bounds, and per-shape latency and throughput.
 
 Also covered, since the TurboQuant leg landed: the 4-bit rotated KV cache - its
-write path and its split/combine decode, bin for bin against the CPU reference,
+write path and its fused decode, bin for bin against the CPU reference,
 plus the fidelity of the scheme itself against exact fp32 attention.  The write
 path is compared in bin indices rather than bytes because the codec's RMS scale
 is a sum the device reduces in a tree and the host sums serially: the two agree

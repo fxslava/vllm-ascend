@@ -22,7 +22,7 @@ any of the Python orchestration around it has run. :func:`turboquant_cpu_ops` de
 extension's own schemas through :mod:`torch.library` and gives each operator a CPU kernel that
 
 * raises the ``RuntimeError`` the adapter's ``TORCH_CHECK`` raises
-  (``csrc/attention/turboquant/turboquant_torch_adpt.h``), with the same message;
+  (``csrc/attention/turboquant/op_adapter/turboquant_torch_adpt.h``), with the same message;
 * also refuses what the adapter reads through ``data_ptr`` without checking -- a strided
   ``slot_mapping``, ``block_tables`` or ``context_lens``, a value whose dtype is not the key's,
   a slot or block outside the cache -- because on the device those are silent misreads;

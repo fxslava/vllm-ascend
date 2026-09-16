@@ -17,45 +17,10 @@
 #ifndef VLLM_ASCEND_ATTENTION_TURBOQUANT_CODEC_950_H
 #define VLLM_ASCEND_ATTENTION_TURBOQUANT_CODEC_950_H
 
-#include "kernel_operator.h"
+#include "turboquant_common.h"
 
 namespace vllm_ascend {
 namespace turboquant {
-
-constexpr uint32_t kFp32PerBlock = 8;
-constexpr uint32_t kFp32PerRepeat = 64;
-constexpr uint32_t kBrcbSrcLanes = kFp32PerBlock;
-constexpr uint32_t kBrcbDstLanes = kFp32PerBlock * kFp32PerBlock;
-
-constexpr uint32_t kGatherSrcBase = 0;
-
-constexpr uint32_t kMaxRepeatTimes = 255;
-
-template <bool ENABLED>
-__aicore__ inline void VecBarrier()
-{
-    if constexpr (ENABLED) {
-        AscendC::PipeBarrier<PIPE_V>();
-    }
-}
-
-__aicore__ inline void RepeatButterfly(const AscendC::LocalTensor<float> &dst, const AscendC::LocalTensor<float> &src,
-                                       uint32_t stride, uint32_t groups)
-{
-    const uint32_t lanes = stride < kFp32PerRepeat ? stride : kFp32PerRepeat;
-    const uint8_t rep = static_cast<uint8_t>(2 * stride / kFp32PerBlock);
-    const AscendC::BinaryRepeatParams params{1, 1, 1, rep, rep, rep};
-    for (uint32_t done = 0; done < groups; done += kMaxRepeatTimes) {
-        const uint8_t batch = static_cast<uint8_t>((groups - done) < kMaxRepeatTimes ? (groups - done) : kMaxRepeatTimes);
-        const uint32_t base = done * 2 * stride;
-        for (uint32_t lane = 0; lane < stride; lane += lanes) {
-            const uint32_t lo = base + lane;
-            const uint32_t hi = lo + stride;
-            AscendC::Add(dst[lo], src[lo], src[hi], static_cast<uint64_t>(lanes), batch, params);
-            AscendC::Sub(dst[hi], src[lo], src[hi], static_cast<uint64_t>(lanes), batch, params);
-        }
-    }
-}
 
 template <int BITS>
 class TurboQuantCodec {

@@ -119,7 +119,7 @@ def turboquant_hadamard16(device: torch.device) -> torch.Tensor:
     whatever ``D`` is, so four stages of the query's rotation collapse into a
     single Mmad and only the ``log2(R)`` whole-row stages above stride 8 stay on
     the vector unit.  Mirrors ``FillHadamard16Half`` in
-    ``csrc/attention/turboquant/turboquant_rotate_q.h``.
+    ``csrc/attention/turboquant/op_host/turboquant_tiling.cpp``.
     """
     key = str(device)
     cached = _HADAMARD16_CACHE.get(key)

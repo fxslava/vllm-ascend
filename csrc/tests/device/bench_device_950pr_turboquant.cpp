@@ -78,14 +78,14 @@ constexpr size_t kChecksumElements = 1u << 20;
 constexpr size_t kExactContextElements = 1u << 22;
 
 constexpr double kRotatedBasisMinCosine = 0.999;
-constexpr double kDecodeTiePointMinCosine = 0.90;
+constexpr double kDecodeTiePointMinCosine = 0.99;
 
 constexpr double kHalfBytes = 2.0;
 constexpr double kFloatBytes = 4.0;
 constexpr double kMiB = 1024.0 * 1024.0;
 
 constexpr int kShortWarmup = 5;
-constexpr int kShortIterations = 20;
+constexpr int kShortIterations = 50;
 constexpr int kUltraWarmup = 1;
 constexpr int kUltraIterations = 3;
 constexpr int kPipelineBatch = 1;
@@ -251,8 +251,6 @@ constexpr const char* kLegPfV5 = "pf_v5";
 constexpr const char* kLegPfV5Ingest = "pf_v5_ingest";
 
 constexpr const char* kLegDecRotQ = "dec_rot_q";
-constexpr const char* kLegDecSplit = "dec_split";
-constexpr const char* kLegDecCombine = "dec_combine";
 constexpr const char* kLegDecAttnCore = "dec_attn_core";
 constexpr const char* kLegDecRotO = "dec_rot_o";
 constexpr const char* kLegDecE2E = "dec_e2e";
@@ -260,8 +258,7 @@ constexpr const char* kLegDecV5 = "dec_v5";
 
 const char* const kPrefillLegs[] = {kLegPfIngest, kLegPfRotQ, kLegPfAttnCore, kLegPfRotO,
                                     kLegPfE2E,    kLegPfV5,   kLegPfV5Ingest};
-const char* const kDecodeLegs[] = {kLegDecRotQ, kLegDecSplit,  kLegDecCombine, kLegDecAttnCore,
-                                   kLegDecRotO, kLegDecE2E,    kLegDecV5};
+const char* const kDecodeLegs[] = {kLegDecRotQ, kLegDecAttnCore, kLegDecRotO, kLegDecE2E, kLegDecV5};
 
 std::string CaseName(const char* leg, const Config& config) {
   return std::string(leg) + "_" + config.id();
@@ -286,8 +283,6 @@ struct Traffic {
   double pf_untimed_cast = 0.0;
 
   double dec_rot_q = 0.0;
-  double dec_split = 0.0;
-  double dec_combine = 0.0;
   double dec_attn_core = 0.0;
   double dec_rot_o = 0.0;
   double dec_e2e = 0.0;
@@ -342,9 +337,9 @@ Traffic ModelTraffic(const Config& config, int64_t num_splits) {
                           kFloatBytes;
 
   traffic.dec_rot_q = step_query_fp16 + step_query_fp32;
-  traffic.dec_split = step_query_fp32 + traffic.tq_kv_bytes + partials;
-  traffic.dec_combine = partials + step_out_fp16;
-  traffic.dec_attn_core = traffic.dec_split + traffic.dec_combine;
+  // One launch: the query, the packed cache and the output token; partials cross GM twice only when the
+  // context is split, both inside the same launch.
+  traffic.dec_attn_core = step_query_fp32 + traffic.tq_kv_bytes + step_out_fp16 + (num_splits > 1 ? 2.0 * partials : 0.0);
   traffic.dec_rot_o = step_out_fp16 + batch * hq * d * kFloatBytes;
   traffic.dec_e2e = traffic.dec_rot_q + traffic.dec_attn_core +
                     (config.model.folds_output ? 0.0 : traffic.dec_rot_o);
@@ -547,7 +542,7 @@ class Scenario {
           DeviceBuffer::FromHost(tqh::ModeTables(kCubeMode, d, 1, 0), kBenchmarkAlignBytes);
       decode_tables_ = DeviceBuffer::FromHost(
           tqh::ModeTables(kCubeMode, d, tqh::kUnpackRows, tqh::kCubeTileRows), kBenchmarkAlignBytes);
-      cube_grid_ = tqh::PlanCubeDecode(config.batch, hq, hkv, d, blocks_per_seq, aiv_num);
+      cube_grid_ = tqh::PlanFusedDecode(config.batch, hq, hkv, d, blocks_per_seq, kBlockSize, aiv_num);
       num_splits_ = cube_grid_.num_splits;
       workspace_floats_ = cube_grid_.workspace_floats;
     } else {
@@ -642,29 +637,21 @@ class Scenario {
                      aiv_num_);
   }
 
-  void EnqueueDecodeSplit(aclrtStream stream) const {
-    turboquant_mm_decode_split_impl(
-        static_cast<int32_t>(kCubeMode), AscendType::FP16, stream, cube_grid_.split_block_dim,
-        query_dec_rot_.get(), key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(),
-        context_lens_.get(), decode_tables_.get(), workspace_.get(), static_cast<uint32_t>(config_.batch),
+  void EnqueueDecodeFusedCube(aclrtStream stream) const {
+    turboquant_mm_fused_decode_impl(
+        static_cast<int32_t>(kCubeMode), AscendType::FP16, stream, cube_grid_.block_dim, query_dec_rot_.get(),
+        key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
+        decode_tables_.get(), workspace_.get(), out_dec_tq_.get(), static_cast<uint32_t>(config_.batch),
         static_cast<uint32_t>(config_.model.num_heads), static_cast<uint32_t>(config_.model.num_kv_heads),
         static_cast<uint32_t>(config_.model.head_size), static_cast<uint32_t>(kBlockSize),
         static_cast<uint32_t>(config_.blocks_per_seq()), static_cast<uint32_t>(cube_grid_.num_splits),
-        cube_grid_.split_tasks_per_core, config_.attention_scale(), config_.attention_scale());
-  }
-
-  void EnqueueDecodeCombine(aclrtStream stream) const {
-    turboquant_paged_attention_combine_impl(
-        AscendType::FP16, stream, cube_grid_.combine_block_dim, workspace_.get(), out_dec_tq_.get(),
-        static_cast<uint32_t>(config_.batch), static_cast<uint32_t>(config_.model.num_heads),
-        static_cast<uint32_t>(config_.model.head_size), static_cast<uint32_t>(num_splits_),
-        cube_grid_.combine_tasks_per_core);
+        cube_grid_.heads_per_task, cube_grid_.tasks_per_block, cube_grid_.reduce_tasks_per_block,
+        static_cast<uint32_t>(tqh::kFusedContextLimit), config_.attention_scale(), config_.attention_scale());
   }
 
   void EnqueueDecodeAttnCore(aclrtStream stream) const {
     if (config_.path == PathMode::kCube) {
-      EnqueueDecodeSplit(stream);
-      EnqueueDecodeCombine(stream);
+      EnqueueDecodeFusedCube(stream);
       return;
     }
     turboquant_paged_attention_impl(
@@ -716,13 +703,9 @@ class Scenario {
   const std::string& fia_note() const { return fia_note_; }
   const std::string& native_write_note() const { return native_write_note_; }
   int64_t num_splits() const { return num_splits_; }
-  uint32_t split_block_dim() const {
-    return config_.path == PathMode::kCube ? cube_grid_.split_block_dim : aiv_grid_.block_dim;
-  }
-  uint32_t combine_block_dim() const { return config_.path == PathMode::kCube ? cube_grid_.combine_block_dim : 0u; }
+  uint32_t block_dim() const { return config_.path == PathMode::kCube ? cube_grid_.block_dim : aiv_grid_.block_dim; }
 
   double ScaleChecksum() const { return ChecksumSum(LeadingElements<float>(scale_plane_)); }
-  double WorkspaceChecksum() const { return ChecksumSum(LeadingElements<float>(workspace_)); }
   double PrefillRotatedQueryChecksum() const { return ChecksumSum(LeadingElements<float>(query_pf_rot_fp32_)); }
   double PrefillTqChecksum() const { return ChecksumSum(HalfToFloat(LeadingElements<Half>(out_pf_tq_))); }
   double PrefillNativeChecksum() const { return ChecksumSum(HalfToFloat(LeadingElements<Half>(out_pf_v5_))); }
@@ -973,7 +956,7 @@ class Scenario {
   tqh::ReshapeAndCacheGrid context_write_grid_;
   tqh::ReshapeAndCacheGrid chunk_write_grid_;
   tqh::PagedAttentionGrid aiv_grid_;
-  tqh::CubeDecodeGrid cube_grid_;
+  tqh::FusedDecodeGrid cube_grid_;
 
   DeviceBuffer key_ctx_, value_ctx_, key_ctx_rot_, value_ctx_rot_;
   DeviceBuffer key_chunk_, value_chunk_;
@@ -1133,14 +1116,6 @@ void PrintUs(const Sample& sample, int width) {
   }
 }
 
-void PrintUsDerived(const Sample& sample, int width, bool derived) {
-  if (!sample.present) {
-    std::printf(" %*s ", width, "-");
-    return;
-  }
-  std::printf(" %*.2f%c", width, sample.median_us, derived ? '~' : ' ');
-}
-
 void PrintRatio(double ratio, int width) {
   if (ratio > 0.0) {
     std::printf(" %*.3fx", width - 1, ratio);
@@ -1172,8 +1147,7 @@ struct PrefillRow {
 };
 
 struct DecodeRow {
-  Sample rot_q, split, combine, attn_core, rot_o, e2e, native;
-  bool split_is_derived = false;
+  Sample rot_q, attn_core, rot_o, e2e, native;
   double sum_of_parts_us = 0.0;
   double speedup = 0.0;
   double gigabytes_per_second = 0.0;
@@ -1203,20 +1177,10 @@ DecodeRow ReadDecodeRow(const std::vector<BenchmarkRunner*>& runners, const Conf
                         const Traffic& traffic) {
   DecodeRow row;
   row.rot_q = SampleFor(runners, kLegDecRotQ, config);
-  row.combine = SampleFor(runners, kLegDecCombine, config);
   row.attn_core = SampleFor(runners, kLegDecAttnCore, config);
   row.rot_o = RotateOutputSample(runners, kLegDecRotO, config);
   row.e2e = SampleFor(runners, kLegDecE2E, config);
   row.native = SampleFor(runners, kLegDecV5, config);
-
-  if (config.path == PathMode::kCube) {
-    row.split = SampleFor(runners, kLegDecSplit, config);
-  } else if (row.attn_core.present && row.combine.present) {
-    row.split.present = true;
-    row.split.median_us = std::max(0.0, row.attn_core.median_us - row.combine.median_us);
-    row.split.mode = row.attn_core.mode;
-    row.split_is_derived = true;
-  }
 
   row.sum_of_parts_us = (row.rot_q.present ? row.rot_q.median_us : 0.0) +
                         (row.attn_core.present ? row.attn_core.median_us : 0.0) +
@@ -1323,12 +1287,11 @@ void PrintTableB(const std::vector<BenchmarkRunner*>& runners, const std::vector
   char header[512];
   const int header_width =
       std::snprintf(header, sizeof(header), "  %-17s %9s %3s %5s | %10s %14s %11s %10s %11s %11s | %8s %10s %12s",
-                    "Model", "Context", "B", "Path", "T_rot_q", "T_DecodeSplit", "T_Combine", "T_rot_o", "TQ_E2E",
+                    "Model", "Context", "B", "Path", "T_rot_q", "T_FusedDecode", "Launches", "T_rot_o", "TQ_E2E",
                     "V5_Decode", "Speedup", "Eff GB/s", "Compression");
   PrintHeaderAndRule(header, header_width);
 
   bool any = false;
-  bool any_derived = false;
   std::vector<double> residuals;
   for (size_t index = 0; index < sweep.size(); ++index) {
     const Config& config = sweep[index];
@@ -1337,12 +1300,11 @@ void PrintTableB(const std::vector<BenchmarkRunner*>& runners, const std::vector
       continue;
     }
     any = true;
-    any_derived = any_derived || row.split_is_derived;
     std::printf("  %-17s %9lld %3lld %5s |", config.model.label, static_cast<long long>(config.seq_len),
                 static_cast<long long>(config.batch), PathLabel(config.path));
     PrintUs(row.rot_q, 10);
-    PrintUsDerived(row.split, 13, row.split_is_derived);
-    PrintUs(row.combine, 11);
+    PrintUs(row.attn_core, 13);
+    std::printf(" %10d", config.model.folds_output ? 2 : 3);
     PrintUs(row.rot_o, 10);
     PrintUs(row.e2e, 11);
     PrintUs(row.native, 11);
@@ -1362,14 +1324,11 @@ void PrintTableB(const std::vector<BenchmarkRunner*>& runners, const std::vector
 
   std::printf("\n[ascend-bench]   Speedup is V5_Decode / TQ_E2E: above 1.000x is TurboQuant ahead. TQ_E2E is one\n"
               "[ascend-bench]   composite ACL-event region over rotate-q, the attention core and (unfolded only)\n"
-              "[ascend-bench]   rotate-o; T_DecodeSplit + T_Combine are the core's two stages.\n");
-  if (any_derived) {
-    std::printf("[ascend-bench]   `~` marks a DERIVED split: the AIV path submits both stages through one\n"
-                "[ascend-bench]   launcher and exports no split-only entry point, so that column is the measured\n"
-                "[ascend-bench]   core minus the measured combine. The Cube path's split is measured directly.\n");
-  }
+              "[ascend-bench]   rotate-o; T_FusedDecode is the attention core, ONE launch on either path (a\n"
+              "[ascend-bench]   context above 4096 is split and reduced inside that launch). Launches counts the\n"
+              "[ascend-bench]   host dispatches of one decode step: rotate-q, the core, and rotate-o if unfolded.\n");
   std::printf("[ascend-bench]   Path is chosen by the GQA group and not by a flag: H_Q/H_KV >= %lld fills the\n"
-              "[ascend-bench]   Cube's M fractal and takes the Cube split, anything narrower takes the vector\n"
+              "[ascend-bench]   Cube's M fractal and takes the Cube decode, anything narrower takes the vector\n"
               "[ascend-bench]   path. ASCEND_BENCH_TQ_AUDIT_PATH overrides it.\n",
               static_cast<long long>(tqh::kCubeTileM));
   std::printf("[ascend-bench]   Eff GB/s is the step's compulsory traffic over its measured composite time.\n"
@@ -1478,7 +1437,7 @@ void WriteDecodeCsv(const std::vector<BenchmarkRunner*>& runners, const std::vec
     return;
   }
   csv << "model,regime,seq_len,batch,num_heads,num_kv_heads,head_dim,path,num_splits,native_operator,"
-      << "t_rot_q_us,t_decode_split_us,split_is_derived,t_combine_us,t_rot_o_us,rot_o_is_structural_zero,"
+      << "t_rot_q_us,t_fused_decode_us,decode_launches,t_rot_o_us,rot_o_is_structural_zero,"
       << "tq_e2e_us,tq_e2e_sum_of_parts_us,v5_decode_us,net_speedup,"
       << "effective_gbps,attn_core_gbps,v5_gbps,attn_core_tflops,v5_tflops,"
       << "fp16_kv_bytes,tq_kv_bytes,kv_saved_mib,compression_ratio,"
@@ -1493,9 +1452,8 @@ void WriteDecodeCsv(const std::vector<BenchmarkRunner*>& runners, const std::vec
         << config.model.num_heads << ',' << config.model.num_kv_heads << ',' << config.model.head_size << ','
         << PathLabel(config.path) << ',' << model.dec_split_count << ',' << fia_operator;
     WriteCell(csv, row.rot_q);
-    WriteCell(csv, row.split);
-    csv << ',' << (row.split_is_derived ? 1 : 0);
-    WriteCell(csv, row.combine);
+    WriteCell(csv, row.attn_core);
+    csv << ',' << (config.model.folds_output ? 2 : 3);
     WriteCell(csv, row.rot_o);
     csv << ',' << (row.rot_o.structural_zero ? 1 : 0);
     WriteCell(csv, row.e2e);
@@ -1655,8 +1613,8 @@ void BuildSuite(BenchmarkRunner& primary) {
 
     const int64_t planned_splits =
         config.path == PathMode::kCube
-            ? tqh::PlanCubeDecode(config.batch, config.model.num_heads, config.model.num_kv_heads,
-                                  config.model.head_size, config.blocks_per_seq(), aiv_num)
+            ? tqh::PlanFusedDecode(config.batch, config.model.num_heads, config.model.num_kv_heads,
+                                   config.model.head_size, config.blocks_per_seq(), kBlockSize, aiv_num)
                   .num_splits
             : tqh::PlanPagedAttention(config.batch, config.model.num_heads, config.model.head_size,
                                       config.blocks_per_seq(), kBlockSize, aiv_num)
@@ -1694,14 +1652,14 @@ void BuildSuite(BenchmarkRunner& primary) {
       fia_operator = scenario->fia_operator();
     }
     std::printf("\n[ascend-bench] %-17s S=%lld B=%lld D=%lld H_Q=%lld H_KV=%lld | %s path, chunk %lld, "
-                "blocks/seq %lld, pool %lld, splits %lld, grid %u/%u | native: %s\n",
+                "blocks/seq %lld, pool %lld, splits %lld, grid %u | native: %s\n",
                 config.model.label, static_cast<long long>(config.seq_len),
                 static_cast<long long>(config.batch), static_cast<long long>(config.model.head_size),
                 static_cast<long long>(config.model.num_heads),
                 static_cast<long long>(config.model.num_kv_heads), PathLabel(config.path),
                 static_cast<long long>(config.chunk), static_cast<long long>(config.blocks_per_seq()),
                 static_cast<long long>(config.pool_blocks()), static_cast<long long>(scenario->num_splits()),
-                scenario->split_block_dim(), scenario->combine_block_dim(),
+                scenario->block_dim(),
                 scenario->decode_available() ? scenario->fia_operator().c_str() : "unavailable");
     if (!scenario->prefill_available() || !scenario->decode_available()) {
       std::printf("[ascend-bench]   native operator note: %s\n", scenario->fia_note().c_str());
@@ -1775,19 +1733,7 @@ void BuildSuite(BenchmarkRunner& primary) {
       run_leg(kLegDecRotQ, 0.0, model.dec_rot_q, 1, [sc](aclrtStream s) { sc->EnqueueDecodeRotateQ(s); },
               [sc]() { return sc->DecodeRotatedQueryChecksum(); });
 
-      if (config.path == PathMode::kCube) {
-        run_leg(kLegDecSplit, model.dec_flops, model.dec_split, 1,
-                [sc](aclrtStream s) { sc->EnqueueDecodeSplit(s); },
-                [sc]() { return sc->WorkspaceChecksum(); });
-      } else {
-        runner.Skip(CaseName(kLegDecSplit, config),
-                    "the AIV path submits split and combine through one launcher and exports no split-only "
-                    "entry point; Table B derives that column");
-      }
-
-      run_leg(kLegDecCombine, 0.0, model.dec_combine, 1, [sc](aclrtStream s) { sc->EnqueueDecodeCombine(s); },
-              [sc]() { return sc->DecodeTqChecksum(); });
-      run_leg(kLegDecAttnCore, model.dec_flops, model.dec_attn_core, 2,
+      run_leg(kLegDecAttnCore, model.dec_flops, model.dec_attn_core, 1,
               [sc](aclrtStream s) { sc->EnqueueDecodeAttnCore(s); },
               [sc]() { return sc->DecodeTqChecksum(); });
 
@@ -1799,7 +1745,7 @@ void BuildSuite(BenchmarkRunner& primary) {
                 [sc]() { return sc->DecodeRotatedOutChecksum(); });
       }
 
-      run_leg(kLegDecE2E, model.dec_flops, model.dec_e2e, 3 + rot_o_tasks,
+      run_leg(kLegDecE2E, model.dec_flops, model.dec_e2e, 2 + rot_o_tasks,
               [sc](aclrtStream s) { sc->EnqueueDecodeE2E(s); },
               [sc]() { return sc->DecodePipelineChecksum(); });
 

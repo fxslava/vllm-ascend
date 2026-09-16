@@ -207,8 +207,8 @@ ModeRun RunMode(tqm::TurboQuantMode mode, const Shape& shape, aclrtStream stream
   bool queried = false;
   const int64_t aiv_num = tqh::VectorCoreNum(&queried);
   const tqh::ReshapeAndCacheGrid write_grid = tqh::PlanReshapeAndCache(batch * context_len, aiv_num);
-  const tqh::CubeDecodeGrid decode_grid =
-      tqh::PlanCubeDecode(batch, kNumHeads, kNumKvHeads, kHeadSize, shape.blocks_per_seq, aiv_num);
+  const tqh::FusedDecodeGrid decode_grid = tqh::PlanFusedDecode(batch, kNumHeads, kNumKvHeads, kHeadSize,
+                                                                shape.blocks_per_seq, kBlockSize, aiv_num);
   run.num_splits = decode_grid.num_splits;
 
   DeviceBuffer workspace = DeviceBuffer::Empty<float>(decode_grid.workspace_floats);
@@ -224,20 +224,14 @@ ModeRun RunMode(tqm::TurboQuantMode mode, const Shape& shape, aclrtStream stream
   run.rotate_plan = tqh::RotateQuery(stream, AscendType::FP16, query_dev.get(), pi_signs.get(), h16.get(),
                                      rot_tables.get(), query_rot.get(), batch, kNumHeads, kHeadSize, aiv_num);
 
-  turboquant_mm_decode_split_impl(
-      static_cast<int32_t>(mode), AscendType::FP16, stream, decode_grid.split_block_dim, query_rot.get(),
-      key_cache.get(), value_cache.get(), scale_plane.get(), block_table_dev.get(), context_dev.get(),
-      decode_tables.get(), workspace.get(), static_cast<uint32_t>(batch),
-      static_cast<uint32_t>(kNumHeads), static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize),
-      static_cast<uint32_t>(kBlockSize), static_cast<uint32_t>(shape.blocks_per_seq),
-      static_cast<uint32_t>(decode_grid.num_splits), decode_grid.split_tasks_per_core, kAttentionScale,
-      kInvSqrtHeadSize);
-
-  turboquant_paged_attention_combine_impl(AscendType::FP16, stream, decode_grid.combine_block_dim, workspace.get(),
-                                          out.get(), static_cast<uint32_t>(batch), static_cast<uint32_t>(kNumHeads),
-                                          static_cast<uint32_t>(kHeadSize),
-                                          static_cast<uint32_t>(decode_grid.num_splits),
-                                          decode_grid.combine_tasks_per_core);
+  turboquant_mm_fused_decode_impl(
+      static_cast<int32_t>(mode), AscendType::FP16, stream, decode_grid.block_dim, query_rot.get(), key_cache.get(),
+      value_cache.get(), scale_plane.get(), block_table_dev.get(), context_dev.get(), decode_tables.get(),
+      workspace.get(), out.get(), static_cast<uint32_t>(batch), static_cast<uint32_t>(kNumHeads),
+      static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kBlockSize),
+      static_cast<uint32_t>(shape.blocks_per_seq), static_cast<uint32_t>(decode_grid.num_splits),
+      decode_grid.heads_per_task, decode_grid.tasks_per_block, decode_grid.reduce_tasks_per_block,
+      static_cast<uint32_t>(tqh::kFusedContextLimit), kAttentionScale, kInvSqrtHeadSize);
   ACL_CHECK(aclrtSynchronizeStream(stream));
 
   run.output = tqh::UnrotateHeads(HalfToFloat(out.ToHost<Half>()), kHeadSize);

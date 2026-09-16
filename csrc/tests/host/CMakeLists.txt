@@ -52,4 +52,16 @@ set_tests_properties(test_host_turboquant_fidelity PROPERTIES
 
 vllm_ascend_record_binary(test_host_turboquant_fidelity)
 
-message(STATUS "vllm-ascend tests: [host] test_host_turboquant_fidelity")
+add_executable(test_host_turboquant_tiling test_host_turboquant_tiling.cpp)
+
+target_link_libraries(test_host_turboquant_tiling
+  PRIVATE vllm_ascend_turboquant_tiling vllm_ascend_test_host ${VLLM_ASCEND_TEST_GTEST_MAIN_TARGET})
+
+add_test(NAME test_host_turboquant_tiling COMMAND test_host_turboquant_tiling)
+set_tests_properties(test_host_turboquant_tiling PROPERTIES
+  LABELS "correctness;${VLLM_ASCEND_TEST_TIER_LABEL}"
+  TIMEOUT 300)
+
+vllm_ascend_record_binary(test_host_turboquant_tiling)
+
+message(STATUS "vllm-ascend tests: [host] test_host_turboquant_fidelity test_host_turboquant_tiling")
