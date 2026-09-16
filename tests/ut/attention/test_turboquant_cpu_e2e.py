@@ -436,6 +436,29 @@ class TestTurboQuantCpuEndToEnd(TestBase):
         self.assertFalse(key.is_contiguous())
         self.assertFalse(value.is_contiguous())
 
+    def test_the_prefill_packs_the_strided_split_before_the_dense_attention(self):
+        """The dense prefill reads the same fused-QKV slices ``reshape_and_cache`` does.
+
+        ``npu_fused_infer_attention_score`` is handed q, k and v straight from the projection,
+        so whatever arrives strided has to be packed here as well.  The stand-in computes over
+        strides without complaint -- it is ``scaled_dot_product_attention`` underneath -- so the
+        layout handed over is asserted directly rather than inferred from the numbers.
+        """
+        seen: list[tuple[bool, bool, bool]] = []
+
+        def recording_fia(query, key, value, **kwargs):
+            seen.append((query.is_contiguous(), key.is_contiguous(), value.is_contiguous()))
+            return cpu_fused_infer_attention_score(query, key, value, **kwargs)
+
+        # Folded rotates V through its own operator and unfolded passes it along; both reach
+        # the same call, so both have to arrive packed.
+        for folded in (False, True):
+            with self.subTest(folded=folded):
+                seen.clear()
+                with patch.object(tq_module.torch_npu, "npu_fused_infer_attention_score", recording_fia, create=True):
+                    self._run(folded)
+                self.assertEqual(seen, [(True, True, True)])
+
     def test_prefill_then_decode_track_exact_attention(self):
         for folded in (False, True):
             with self.subTest(folded=folded):

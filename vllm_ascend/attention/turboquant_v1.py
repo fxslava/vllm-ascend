@@ -568,12 +568,19 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         """
         actual_seq_qlen = attn_metadata.actual_seq_lengths_q
         num_tokens = int(actual_seq_qlen[-1])
-        prefill_value = value[:num_tokens]
+        # Packed for the reason reshape_and_cache packs: a fused QKV projection hands
+        # the backend column slices of one matrix, and V never passes through RoPE, so
+        # nothing on the way would pack it.  A prefill runs once per prompt, so the copy
+        # is not on the hot path; the rotated V is already packed by its own operator.
+        prefill_query = query[:num_tokens].contiguous()
+        prefill_key = key[:num_tokens].contiguous()
         if self.output_rotation_folded:
-            prefill_value = self._rotate_value_for_prefill(prefill_value)
+            prefill_value = self._rotate_value_for_prefill(value[:num_tokens])
+        else:
+            prefill_value = value[:num_tokens].contiguous()
         attn_output, _ = torch_npu.npu_fused_infer_attention_score(
-            query=query[:num_tokens],
-            key=key[:num_tokens],
+            query=prefill_query,
+            key=prefill_key,
             value=prefill_value,
             atten_mask=attn_metadata.attn_mask,
             input_layout="TND",
