@@ -75,12 +75,6 @@ struct FusedRun {
   double host_s = 0.0;
 };
 
-struct FusedAgreement {
-  size_t differing = 0;
-  size_t compared = 0;
-  double max_abs = 0.0;
-};
-
 inline double FusedCosine(const std::vector<float>& a, const std::vector<float>& b) {
   double dot = 0.0;
   double na = 0.0;
@@ -110,21 +104,6 @@ inline uint64_t Fnv1a64(const std::vector<Half>& raw) {
     }
   }
   return hash;
-}
-
-inline FusedAgreement CompareValues(const std::vector<float>& a, const std::vector<float>& b) {
-  FusedAgreement agreement;
-  agreement.compared = std::min(a.size(), b.size());
-  for (size_t i = 0; i < agreement.compared; ++i) {
-    if (a[i] != b[i]) {
-      ++agreement.differing;
-      agreement.max_abs = std::max(agreement.max_abs, std::fabs(static_cast<double>(a[i]) - b[i]));
-    }
-  }
-  if (a.size() != b.size()) {
-    agreement.differing += std::max(a.size(), b.size()) - agreement.compared;
-  }
-  return agreement;
 }
 
 class FusedCubeScenario {
@@ -173,13 +152,7 @@ class FusedCubeScenario {
                            shape_.block_size, plan_aiv > 0 ? plan_aiv : aiv_num_, kFusedContextLimit, split_policy);
   }
 
-  FusedRun RunFused(const FusedDecodeGrid& grid) { return Run(grid, false); }
-
-  // The same grid through the test-only instance that keeps every vector barrier: the bit-exact A/B
-  // reference for the barrier-free kernel.
-  FusedRun RunBarriered(const FusedDecodeGrid& grid) { return Run(grid, true); }
-
-  FusedRun Run(const FusedDecodeGrid& grid, bool barriered) {
+  FusedRun RunFused(const FusedDecodeGrid& grid) {
     const int64_t d = shape_.head_size;
     DeviceBuffer workspace = DeviceBuffer::Empty<float>(grid.workspace_floats);
     FusedRun run;
@@ -191,24 +164,14 @@ class FusedCubeScenario {
     PoisonOutput();
     const float inv_sqrt_len = 1.0f / std::sqrt(static_cast<float>(d));
     const auto start = std::chrono::steady_clock::now();
-    if (barriered) {
-      turboquant_mm_fused_decode_barriered_impl(
-          AscendType::FP16, stream_, grid.block_dim, query_rot_.get(), key_cache_.get(), value_cache_.get(),
-          scale_plane_.get(), block_tables_.get(), context_lens_.get(), mode_tables_.get(), workspace.get(),
-          out_.get(), 1, static_cast<uint32_t>(shape_.num_heads), static_cast<uint32_t>(shape_.num_kv_heads),
-          static_cast<uint32_t>(d), static_cast<uint32_t>(shape_.block_size), static_cast<uint32_t>(blocks_per_seq_),
-          static_cast<uint32_t>(grid.num_splits), grid.heads_per_task, grid.tasks_per_block,
-          grid.reduce_tasks_per_block, grid.fused_context_limit, scale_, inv_sqrt_len);
-    } else {
-      turboquant_mm_fused_decode_impl(
-          static_cast<int32_t>(kFusedMode), AscendType::FP16, stream_, grid.block_dim, query_rot_.get(),
-          key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
-          mode_tables_.get(), workspace.get(), out_.get(), 1, static_cast<uint32_t>(shape_.num_heads),
-          static_cast<uint32_t>(shape_.num_kv_heads), static_cast<uint32_t>(d),
-          static_cast<uint32_t>(shape_.block_size), static_cast<uint32_t>(blocks_per_seq_),
-          static_cast<uint32_t>(grid.num_splits), grid.heads_per_task, grid.tasks_per_block,
-          grid.reduce_tasks_per_block, grid.fused_context_limit, scale_, inv_sqrt_len);
-    }
+    turboquant_mm_fused_decode_impl(
+        static_cast<int32_t>(kFusedMode), AscendType::FP16, stream_, grid.block_dim, query_rot_.get(),
+        key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
+        mode_tables_.get(), workspace.get(), out_.get(), 1, static_cast<uint32_t>(shape_.num_heads),
+        static_cast<uint32_t>(shape_.num_kv_heads), static_cast<uint32_t>(d),
+        static_cast<uint32_t>(shape_.block_size), static_cast<uint32_t>(blocks_per_seq_),
+        static_cast<uint32_t>(grid.num_splits), grid.heads_per_task, grid.tasks_per_block,
+        grid.reduce_tasks_per_block, grid.fused_context_limit, scale_, inv_sqrt_len);
     ACL_CHECK(aclrtSynchronizeStream(stream_));
     run.host_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     Collect(&run);

@@ -21,41 +21,36 @@
 
 namespace {
 
-using vllm_ascend::turboquant::CeilDiv;
+using vllm_ascend::turboquant::AlignUp;
+using vllm_ascend::turboquant::CeilDivU16;
+using vllm_ascend::turboquant::kFixpipeToUb;
 using vllm_ascend::turboquant::kRotateQTile;
+using vllm_ascend::turboquant::kSubBlockSyncMode;
 using vllm_ascend::turboquant::MixBlockIdx;
 using vllm_ascend::turboquant::RepeatButterfly;
 using vllm_ascend::turboquant::RotateQVariant;
 using vllm_ascend::turboquant::SyncEvent;
+using vllm_ascend::turboquant::SyncMatrixToFixpipe;
+using vllm_ascend::turboquant::SyncMte1ToMatrix;
 using vllm_ascend::turboquant::SyncVectorToMte3;
-using vllm_ascend::turboquant::VecBarrier;
 
 using TurboQuantCodec4 = vllm_ascend::turboquant::TurboQuantCodec<4>;
 
-constexpr uint32_t kHalfC0 = 16;
+// The fp16 operand's C0: a 16 x 16 fractal of the H16 Hadamard factor.
+constexpr uint32_t kHalfOperandC0 = 16;
 
+// The Cube applies the lower four butterfly stages (H16); the vector unit starts at stride 16.
 constexpr uint32_t kResidualFirstStride = kRotateQTile;
 
-constexpr bool kRotateQVecBarriers = false;
+constexpr uint16_t kRotateQFlagOperandsReady = 0;
+constexpr uint16_t kRotateQFlagOperandsFree = 2;
+constexpr uint16_t kRotateQFlagProductReady = 4;
+constexpr uint16_t kRotateQFlagProductFree = 6;
 
-constexpr uint16_t kFlagOperandsReady = 0;
-constexpr uint16_t kFlagOperandsFree = 2;
-constexpr uint16_t kFlagProductReady = 4;
-constexpr uint16_t kFlagProductFree = 6;
+constexpr uint32_t kOperandSlots = 2;
 
-constexpr uint32_t kSlots = 2;
-
-constexpr AscendC::FixpipeConfig kFixpipeToUb = {AscendC::CO2Layout::ROW_MAJOR, true};
-
-__aicore__ inline uint32_t AlignUp(uint32_t a, uint32_t b) { return CeilDiv(a, b) * b; }
-
-__aicore__ inline uint16_t CeilDivU16(uint32_t a, uint32_t b)
-{
-    return static_cast<uint16_t>((a + b - 1) / b);
-}
-
-__aicore__ inline void BlockButterfly(const AscendC::LocalTensor<float> &dst,
-                                      const AscendC::LocalTensor<float> &src, uint32_t stride, uint32_t count)
+__aicore__ inline void BlockButterfly(const AscendC::LocalTensor<float> &dst, const AscendC::LocalTensor<float> &src,
+                                      const uint32_t stride, const uint32_t count)
 {
     RepeatButterfly(dst, src, stride, count / (2 * stride));
 }
@@ -65,9 +60,9 @@ class TurboQuantRotateQCube {
 public:
     __aicore__ inline explicit TurboQuantRotateQCube(AscendC::TPipe *pipe) : pipe_(pipe) {}
 
-    __aicore__ inline void Init(GM_ADDR query, GM_ADDR piSigns, GM_ADDR h16, GM_ADDR queryRot, uint32_t numVectors,
-                                uint32_t headSize, uint32_t vectorsPerBlock, uint32_t vectorsPerChunk,
-                                uint32_t variant, float invSqrtLen)
+    __aicore__ inline void Init(GM_ADDR query, GM_ADDR piSigns, GM_ADDR h16, GM_ADDR queryRot, const uint32_t numVectors,
+                                const uint32_t headSize, const uint32_t vectorsPerBlock, const uint32_t vectorsPerChunk,
+                                const uint32_t variant, const float invSqrtLen)
     {
         headSize_ = headSize;
         numVectors_ = numVectors;
@@ -76,14 +71,14 @@ public:
         invSqrtLen_ = invSqrtLen;
 
         blockBase_ = MixBlockIdx() * vectorsPerBlock;
-        uint32_t mine = 0;
+        uint32_t blockVectors = 0;
         if (blockBase_ < numVectors_) {
-            mine = numVectors_ - blockBase_;
-            if (mine > vectorsPerBlock) {
-                mine = vectorsPerBlock;
+            blockVectors = numVectors_ - blockBase_;
+            if (blockVectors > vectorsPerBlock) {
+                blockVectors = vectorsPerBlock;
             }
         }
-        blockVectors_ = mine;
+        blockVectors_ = blockVectors;
 
         rowsPerVector_ = headSize_ / kRotateQTile;
         chunkElems_ = vectorsPerChunk_ * headSize_;
@@ -98,39 +93,39 @@ public:
         h16Gm_.SetGlobalBuffer(reinterpret_cast<__gm__ half *>(h16));
         queryRotGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(queryRot));
 
-        for (uint32_t slot = 0; slot < kSlots; ++slot) {
-            pipe_->InitBuffer(aHi1_[slot], paddedElems_ * sizeof(half));
+        for (uint32_t slot = 0; slot < kOperandSlots; ++slot) {
+            pipe_->InitBuffer(queryHiA1_[slot], paddedElems_ * sizeof(half));
             if (HiLo()) {
-                pipe_->InitBuffer(aLo1_[slot], paddedElems_ * sizeof(half));
+                pipe_->InitBuffer(queryLoA1_[slot], paddedElems_ * sizeof(half));
             }
         }
-        pipe_->InitBuffer(b1_, kRotateQTile * kRotateQTile * sizeof(half));
+        pipe_->InitBuffer(h16B1_, kRotateQTile * kRotateQTile * sizeof(half));
 
         if ASCEND_IS_AIC {
-            pipe_->InitBuffer(a2Hi_, paddedElems_ * sizeof(half));
+            pipe_->InitBuffer(queryHiA2_, paddedElems_ * sizeof(half));
             if (HiLo()) {
-                pipe_->InitBuffer(a2Lo_, paddedElems_ * sizeof(half));
+                pipe_->InitBuffer(queryLoA2_, paddedElems_ * sizeof(half));
             }
-            pipe_->InitBuffer(b2_, kRotateQTile * kRotateQTile * sizeof(half));
-            pipe_->InitBuffer(co1_, paddedElems_ * sizeof(float));
+            pipe_->InitBuffer(h16B2_, kRotateQTile * kRotateQTile * sizeof(half));
+            pipe_->InitBuffer(productCo1_, paddedElems_ * sizeof(float));
         }
 
-        pipe_->InitBuffer(qInBuf_, chunkElems_ * sizeof(scalar_t));
-        pipe_->InitBuffer(inBuf_, paddedElems_ * sizeof(float));
-        pipe_->InitBuffer(castBuf_, paddedElems_ * sizeof(half));
+        pipe_->InitBuffer(queryInBuf_, chunkElems_ * sizeof(scalar_t));
+        pipe_->InitBuffer(queryFloatBuf_, paddedElems_ * sizeof(float));
+        pipe_->InitBuffer(queryHalfBuf_, paddedElems_ * sizeof(half));
         pipe_->InitBuffer(signBuf_, headSize_ * sizeof(float));
-        for (uint32_t slot = 0; slot < kSlots; ++slot) {
-            pipe_->InitBuffer(prodBuf_[slot], chunkElems_ * sizeof(float));
-            pipe_->InitBuffer(tmpBuf_[slot], paddedElems_ * sizeof(float));
+        for (uint32_t slot = 0; slot < kOperandSlots; ++slot) {
+            pipe_->InitBuffer(productBuf_[slot], chunkElems_ * sizeof(float));
+            pipe_->InitBuffer(butterflyBuf_[slot], paddedElems_ * sizeof(float));
         }
         pipe_->InitBuffer(scaledSignBuf_, headSize_ * sizeof(float));
 
-        AscendC::LocalTensor<float> signs = signBuf_.Get<float>();
+        const AscendC::LocalTensor<float> signs = signBuf_.Get<float>();
         AscendC::DataCopy(signs, piSignsGm_, headSize_);
+        // Init hand-off: the signs land in UB before the vector unit scales them.
         AscendC::PipeBarrier<PIPE_ALL>();
         if ASCEND_IS_AIV {
             AscendC::Muls(scaledSignBuf_.Get<float>(), signs, invSqrtLen_, headSize_);
-            AscendC::PipeBarrier<PIPE_V>();
         }
     }
 
@@ -151,56 +146,58 @@ private:
     __aicore__ inline void ProcessAiv()
     {
         StageOperands(0, 0);
-        SignalOperandsReady(0);
+        SyncOperandsReady(0);
 
         for (uint32_t chunk = 1; chunk < numChunks_; ++chunk) {
-            const uint32_t slot = chunk % kSlots;
-            const uint32_t prev = (chunk - 1) % kSlots;
+            const uint32_t slot = chunk % kOperandSlots;
+            const uint32_t prevSlot = (chunk - 1) % kOperandSlots;
 
-            if (chunk >= kSlots) {
-                AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kFlagOperandsFree + slot));
+            if (chunk >= kOperandSlots) {
+                AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kRotateQFlagOperandsFree + slot));
             }
             StageOperands(chunk, slot);
-            SignalOperandsReady(slot);
+            SyncOperandsReady(slot);
 
-            AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kFlagProductReady + prev));
-            Residual(prev, chunk - 1);
+            AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kRotateQFlagProductReady + prevSlot));
+            ComputeResidual(prevSlot, chunk - 1);
             if (chunk + 1 < numChunks_) {
-                SignalProductFree(prev);
+                SyncProductFree(prevSlot);
             }
         }
 
-        const uint32_t last = (numChunks_ - 1) % kSlots;
-        AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kFlagProductReady + last));
-        Residual(last, numChunks_ - 1);
+        const uint32_t lastSlot = (numChunks_ - 1) % kOperandSlots;
+        AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kRotateQFlagProductReady + lastSlot));
+        ComputeResidual(lastSlot, numChunks_ - 1);
     }
 
     __aicore__ inline void ProcessAic()
     {
         for (uint32_t chunk = 0; chunk < numChunks_; ++chunk) {
-            const uint32_t slot = chunk % kSlots;
+            const uint32_t slot = chunk % kOperandSlots;
 
-            AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kFlagOperandsReady + slot));
-            LoadCubeOperands(slot);
-            if (chunk + kSlots < numChunks_) {
-                AscendC::CrossCoreSetFlag<0x2, PIPE_MTE1>(static_cast<uint16_t>(kFlagOperandsFree + slot));
+            AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kRotateQFlagOperandsReady + slot));
+            StageCubeOperands(slot);
+            if (chunk + kOperandSlots < numChunks_) {
+                AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_MTE1>(
+                    static_cast<uint16_t>(kRotateQFlagOperandsFree + slot));
             }
-            if (chunk >= kSlots) {
-                AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kFlagProductFree + slot));
+            if (chunk >= kOperandSlots) {
+                AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kRotateQFlagProductFree + slot));
             }
-            MmadAndFixpipe(slot);
-            AscendC::CrossCoreSetFlag<0x2, PIPE_FIX>(static_cast<uint16_t>(kFlagProductReady + slot));
+            ComputeProduct(slot);
+            AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_FIX>(
+                static_cast<uint16_t>(kRotateQFlagProductReady + slot));
         }
     }
 
-    __aicore__ inline void SignalOperandsReady(uint32_t slot)
+    __aicore__ inline void SyncOperandsReady(const uint32_t slot)
     {
-        AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(static_cast<uint16_t>(kFlagOperandsReady + slot));
+        AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_MTE3>(static_cast<uint16_t>(kRotateQFlagOperandsReady + slot));
     }
 
-    __aicore__ inline void SignalProductFree(uint32_t slot)
+    __aicore__ inline void SyncProductFree(const uint32_t slot)
     {
-        AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(static_cast<uint16_t>(kFlagProductFree + slot));
+        AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_MTE3>(static_cast<uint16_t>(kRotateQFlagProductFree + slot));
     }
 
     __aicore__ inline bool HiLo() const { return (variant_ & RotateQVariant::kHiLo) != 0; }
@@ -210,7 +207,7 @@ private:
         return (variant_ & RotateQVariant::kDualDst) != 0 && (vectorsPerChunk_ % 2 == 0);
     }
 
-    __aicore__ inline uint32_t MyVectors() const
+    __aicore__ inline uint32_t OwnedVectors() const
     {
         if (DualDst()) {
             return vectorsPerChunk_ / 2;
@@ -218,7 +215,7 @@ private:
         return AscendC::GetSubBlockIdx() == 0 ? vectorsPerChunk_ : 0;
     }
 
-    __aicore__ inline uint32_t MyChunkOffset() const
+    __aicore__ inline uint32_t OwnedChunkOffset() const
     {
         if (DualDst()) {
             return static_cast<uint32_t>(AscendC::GetSubBlockIdx()) * (vectorsPerChunk_ / 2);
@@ -226,163 +223,166 @@ private:
         return 0;
     }
 
-    __aicore__ inline void StageOperands(uint32_t chunk, uint32_t slot)
+    // One chunk of query vectors, sign-flipped and cast to the fp16 operand grid, into L1 slot `slot`. With
+    // HiLo the rounding residual is cast into a second operand.
+    __aicore__ inline void StageOperands(const uint32_t chunk, const uint32_t slot)
     {
-        AscendC::LocalTensor<scalar_t> qIn = qInBuf_.Get<scalar_t>();
-        AscendC::LocalTensor<float> in = inBuf_.Get<float>();
-        AscendC::LocalTensor<half> cast = castBuf_.Get<half>();
-        AscendC::LocalTensor<float> tmp = tmpBuf_[slot].Get<float>();
-        AscendC::LocalTensor<float> signs = signBuf_.Get<float>();
+        const AscendC::LocalTensor<scalar_t> queryIn = queryInBuf_.Get<scalar_t>();
+        const AscendC::LocalTensor<float> queryFloat = queryFloatBuf_.Get<float>();
+        const AscendC::LocalTensor<half> queryHalf = queryHalfBuf_.Get<half>();
+        const AscendC::LocalTensor<float> hiWidened = butterflyBuf_[slot].Get<float>();
+        const AscendC::LocalTensor<float> signs = signBuf_.Get<float>();
 
         if (chunk > 0) {
             SyncEvent<AscendC::HardEvent::V_MTE2>();
         }
 
         if (!h16Staged_) {
-            AscendC::DataCopy(cast, h16Gm_, kRotateQTile * kRotateQTile);
+            AscendC::DataCopy(queryHalf, h16Gm_, kRotateQTile * kRotateQTile);
             SyncEvent<AscendC::HardEvent::MTE2_MTE3>();
-            AscendC::DataCopy(b1_.Get<half>(), cast, kRotateQTile * kRotateQTile);
+            AscendC::DataCopy(h16B1_.Get<half>(), queryHalf, kRotateQTile * kRotateQTile);
             h16Staged_ = true;
         }
 
         const uint64_t base = static_cast<uint64_t>(blockBase_ + chunk * vectorsPerChunk_) * headSize_;
-        AscendC::DataCopy(qIn, queryGm_[base], chunkElems_);
+        AscendC::DataCopy(queryIn, queryGm_[base], chunkElems_);
         SyncEvent<AscendC::HardEvent::MTE2_V>();
-        AscendC::Cast(in, qIn, AscendC::RoundMode::CAST_NONE, chunkElems_);
+        AscendC::Cast(queryFloat, queryIn, AscendC::RoundMode::CAST_NONE, chunkElems_);
         if (paddedElems_ > chunkElems_) {
-            AscendC::Duplicate(in[chunkElems_], 0.0f, paddedElems_ - chunkElems_);
+            AscendC::Duplicate(queryFloat[chunkElems_], 0.0f, paddedElems_ - chunkElems_);
         }
-        VecBarrier<kRotateQVecBarriers>();
 
-        for (uint32_t v = 0; v < vectorsPerChunk_; ++v) {
-            AscendC::Mul(in[v * headSize_], in[v * headSize_], signs, headSize_);
+        for (uint32_t vector = 0; vector < vectorsPerChunk_; ++vector) {
+            AscendC::Mul(queryFloat[vector * headSize_], queryFloat[vector * headSize_], signs, headSize_);
         }
-        VecBarrier<kRotateQVecBarriers>();
 
         SyncEvent<AscendC::HardEvent::MTE3_V>();
-        AscendC::Cast(cast, in, AscendC::RoundMode::CAST_RINT, paddedElems_);
+        AscendC::Cast(queryHalf, queryFloat, AscendC::RoundMode::CAST_RINT, paddedElems_);
         SyncVectorToMte3();
-        AscendC::DataCopy(aHi1_[slot].Get<half>(), cast, paddedElems_);
+        AscendC::DataCopy(queryHiA1_[slot].Get<half>(), queryHalf, paddedElems_);
 
         if (HiLo()) {
-            AscendC::Cast(tmp, cast, AscendC::RoundMode::CAST_NONE, paddedElems_);
-            VecBarrier<kRotateQVecBarriers>();
-            AscendC::Sub(in, in, tmp, paddedElems_);
-            VecBarrier<kRotateQVecBarriers>();
-            SyncEvent<AscendC::HardEvent::MTE3_V>();
-            AscendC::Cast(cast, in, AscendC::RoundMode::CAST_RINT, paddedElems_);
+            AscendC::Cast(hiWidened, queryHalf, AscendC::RoundMode::CAST_NONE, paddedElems_);
+                AscendC::Sub(queryFloat, queryFloat, hiWidened, paddedElems_);
+                SyncEvent<AscendC::HardEvent::MTE3_V>();
+            AscendC::Cast(queryHalf, queryFloat, AscendC::RoundMode::CAST_RINT, paddedElems_);
             SyncVectorToMte3();
-            AscendC::DataCopy(aLo1_[slot].Get<half>(), cast, paddedElems_);
+            AscendC::DataCopy(queryLoA1_[slot].Get<half>(), queryHalf, paddedElems_);
         }
     }
 
-    __aicore__ inline void LoadA(const AscendC::LocalTensor<half> &src, const AscendC::LocalTensor<half> &dst)
+    __aicore__ inline void StageA2(const AscendC::LocalTensor<half> &srcA1, const AscendC::LocalTensor<half> &dstA2)
     {
-        AscendC::LoadData2DParamsV2 p;
-        p.mStartPosition = 0;
-        p.kStartPosition = 0;
-        p.mStep = CeilDivU16(paddedRows_, kRotateQTile);
-        p.kStep = CeilDivU16(kRotateQTile, kHalfC0);
-        p.srcStride = CeilDivU16(paddedRows_, kRotateQTile);
-        p.dstStride = CeilDivU16(paddedRows_, kRotateQTile);
-        p.ifTranspose = false;
-        AscendC::LoadData(dst, src, p);
+        AscendC::LoadData2DParamsV2 params;
+        params.mStartPosition = 0;
+        params.kStartPosition = 0;
+        params.mStep = CeilDivU16(paddedRows_, kRotateQTile);
+        params.kStep = CeilDivU16(kRotateQTile, kHalfOperandC0);
+        params.srcStride = CeilDivU16(paddedRows_, kRotateQTile);
+        params.dstStride = CeilDivU16(paddedRows_, kRotateQTile);
+        params.ifTranspose = false;
+        AscendC::LoadData(dstA2, srcA1, params);
     }
 
-    __aicore__ inline void LoadB()
+    __aicore__ inline void StageB2()
     {
-        AscendC::LoadData2DParamsV2 p;
-        p.mStartPosition = 0;
-        p.kStartPosition = 0;
-        p.mStep = CeilDivU16(kRotateQTile, kRotateQTile);
-        p.kStep = CeilDivU16(kRotateQTile, kHalfC0);
-        p.srcStride = CeilDivU16(kRotateQTile, kRotateQTile);
-        p.dstStride = CeilDivU16(kRotateQTile, kRotateQTile);
-        p.ifTranspose = false;
-        AscendC::LoadData(b2_.Get<half>(), b1_.Get<half>(), p);
+        AscendC::LoadData2DParamsV2 params;
+        params.mStartPosition = 0;
+        params.kStartPosition = 0;
+        params.mStep = CeilDivU16(kRotateQTile, kRotateQTile);
+        params.kStep = CeilDivU16(kRotateQTile, kHalfOperandC0);
+        params.srcStride = CeilDivU16(kRotateQTile, kRotateQTile);
+        params.dstStride = CeilDivU16(kRotateQTile, kRotateQTile);
+        params.ifTranspose = false;
+        AscendC::LoadData(h16B2_.Get<half>(), h16B1_.Get<half>(), params);
     }
 
-    __aicore__ inline void LoadCubeOperands(uint32_t slot)
+    __aicore__ inline void StageCubeOperands(const uint32_t slot)
     {
         SyncEvent<AscendC::HardEvent::M_MTE1>();
-        LoadA(aHi1_[slot].Get<half>(), a2Hi_.Get<half>());
+        StageA2(queryHiA1_[slot].Get<half>(), queryHiA2_.Get<half>());
         if (HiLo()) {
-            LoadA(aLo1_[slot].Get<half>(), a2Lo_.Get<half>());
+            StageA2(queryLoA1_[slot].Get<half>(), queryLoA2_.Get<half>());
         }
-        LoadB();
-        SyncEvent<AscendC::HardEvent::MTE1_M>();
+        StageB2();
+        SyncMte1ToMatrix();
     }
 
-    __aicore__ inline void MmadAndFixpipe(uint32_t slot)
+    // Query rows x H16 (plus the low residual rows with HiLo), Fixpiped into productBuf_[slot].
+    __aicore__ inline void ComputeProduct(const uint32_t slot)
     {
         SyncEvent<AscendC::HardEvent::FIX_M>();
 
-        AscendC::LocalTensor<float> acc = co1_.Get<float>();
-        AscendC::Mmad(acc, a2Hi_.Get<half>(), b2_.Get<half>(),
+        const AscendC::LocalTensor<float> product = productCo1_.Get<float>();
+        AscendC::Mmad(product, queryHiA2_.Get<half>(), h16B2_.Get<half>(),
                       AscendC::MmadParams(static_cast<uint16_t>(chunkRows_), static_cast<uint16_t>(kRotateQTile),
                                           static_cast<uint16_t>(kRotateQTile), 0, false, true));
         if (HiLo()) {
-            AscendC::Mmad(acc, a2Lo_.Get<half>(), b2_.Get<half>(),
+            AscendC::Mmad(product, queryLoA2_.Get<half>(), h16B2_.Get<half>(),
                           AscendC::MmadParams(static_cast<uint16_t>(chunkRows_), static_cast<uint16_t>(kRotateQTile),
                                               static_cast<uint16_t>(kRotateQTile), 0, false, false));
         }
 
-        SyncEvent<AscendC::HardEvent::M_FIX>();
+        SyncMatrixToFixpipe();
 
-        AscendC::FixpipeParamsC310<AscendC::CO2Layout::ROW_MAJOR> fp(
+        AscendC::FixpipeParamsC310<AscendC::CO2Layout::ROW_MAJOR> fixParams(
             static_cast<uint16_t>(kRotateQTile), static_cast<uint16_t>(chunkRows_),
             static_cast<uint16_t>(paddedRows_), kRotateQTile);
         if (DualDst()) {
-            fp.dualDstCtl = 0b01;
-            fp.subBlockId = false;
+            fixParams.dualDstCtl = 0b01;
+            fixParams.subBlockId = false;
         }
-        AscendC::Fixpipe<float, float, kFixpipeToUb>(prodBuf_[slot].Get<float>(), acc, fp);
+        AscendC::Fixpipe<float, float, kFixpipeToUb>(productBuf_[slot].Get<float>(), product, fixParams);
+        // Drains the Fixpipe before the product-ready flag releases the vector unit onto its UB rows.
         AscendC::PipeBarrier<PIPE_FIX>();
     }
 
-    __aicore__ inline void Residual(uint32_t slot, uint32_t chunk)
+    // The butterfly stages above H16 on this subcore's vectors, the output sign flip and 1 / sqrt(D), and the
+    // write to GM.
+    __aicore__ inline void ComputeResidual(const uint32_t slot, const uint32_t chunk)
     {
-        const uint32_t mine = MyVectors();
-        if (mine == 0) {
+        const uint32_t owned = OwnedVectors();
+        if (owned == 0) {
             return;
         }
-        const uint32_t count = mine * headSize_;
-        AscendC::LocalTensor<float> src = prodBuf_[slot].Get<float>();
-        AscendC::LocalTensor<float> dst = tmpBuf_[slot].Get<float>();
-        AscendC::LocalTensor<float> scaledSigns = scaledSignBuf_.Get<float>();
+        const uint32_t count = owned * headSize_;
+        AscendC::LocalTensor<float> src = productBuf_[slot].Get<float>();
+        AscendC::LocalTensor<float> dst = butterflyBuf_[slot].Get<float>();
+        const AscendC::LocalTensor<float> scaledSigns = scaledSignBuf_.Get<float>();
 
         for (uint32_t stride = kResidualFirstStride; stride < headSize_; stride <<= 1) {
             BlockButterfly(dst, src, stride, count);
+            // FWHT ping-pong: this pass's destination is the next pass's source over the same two buffers.
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::LocalTensor<float> hold = src;
+            const AscendC::LocalTensor<float> hold = src;
             src = dst;
             dst = hold;
         }
 
-        for (uint32_t v = 0; v < mine; ++v) {
-            AscendC::Mul(src[v * headSize_], src[v * headSize_], scaledSigns, headSize_);
+        for (uint32_t vector = 0; vector < owned; ++vector) {
+            AscendC::Mul(src[vector * headSize_], src[vector * headSize_], scaledSigns, headSize_);
         }
 
         SyncVectorToMte3();
         const uint64_t out =
-            (static_cast<uint64_t>(blockBase_ + chunk * vectorsPerChunk_) + MyChunkOffset()) * headSize_;
+            (static_cast<uint64_t>(blockBase_ + chunk * vectorsPerChunk_) + OwnedChunkOffset()) * headSize_;
         AscendC::DataCopy(queryRotGm_[out], src, count);
     }
 
     AscendC::TPipe *pipe_;
-    AscendC::TBuf<AscendC::TPosition::A1> aHi1_[kSlots];
-    AscendC::TBuf<AscendC::TPosition::A1> aLo1_[kSlots];
-    AscendC::TBuf<AscendC::TPosition::B1> b1_;
-    AscendC::TBuf<AscendC::TPosition::A2> a2Hi_;
-    AscendC::TBuf<AscendC::TPosition::A2> a2Lo_;
-    AscendC::TBuf<AscendC::TPosition::B2> b2_;
-    AscendC::TBuf<AscendC::TPosition::CO1> co1_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> qInBuf_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> inBuf_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> castBuf_;
+    AscendC::TBuf<AscendC::TPosition::A1> queryHiA1_[kOperandSlots];
+    AscendC::TBuf<AscendC::TPosition::A1> queryLoA1_[kOperandSlots];
+    AscendC::TBuf<AscendC::TPosition::B1> h16B1_;
+    AscendC::TBuf<AscendC::TPosition::A2> queryHiA2_;
+    AscendC::TBuf<AscendC::TPosition::A2> queryLoA2_;
+    AscendC::TBuf<AscendC::TPosition::B2> h16B2_;
+    AscendC::TBuf<AscendC::TPosition::CO1> productCo1_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> queryInBuf_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> queryFloatBuf_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> queryHalfBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> signBuf_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> prodBuf_[kSlots];
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> tmpBuf_[kSlots];
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> productBuf_[kOperandSlots];
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> butterflyBuf_[kOperandSlots];
     AscendC::TBuf<AscendC::QuePosition::VECCALC> scaledSignBuf_;
     AscendC::GlobalTensor<scalar_t> queryGm_;
     AscendC::GlobalTensor<float> piSignsGm_;
@@ -410,7 +410,8 @@ public:
     __aicore__ inline explicit TurboQuantRotateQAiv(AscendC::TPipe *pipe) : pipe_(pipe) {}
 
     __aicore__ inline void Init(GM_ADDR query, GM_ADDR piSigns, GM_ADDR rotTables, GM_ADDR queryRot,
-                                uint32_t numVectors, uint32_t headSize, uint32_t vectorsPerBlock, float invSqrtLen)
+                                const uint32_t numVectors, const uint32_t headSize, const uint32_t vectorsPerBlock,
+                                const float invSqrtLen)
     {
         headSize_ = headSize;
         numVectors_ = numVectors;
@@ -421,14 +422,15 @@ public:
         rotTablesGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(rotTables));
         queryRotGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(queryRot));
 
-        pipe_->InitBuffer(qInBuf_, headSize_ * sizeof(scalar_t));
+        pipe_->InitBuffer(queryInBuf_, headSize_ * sizeof(scalar_t));
         pipe_->InitBuffer(workBuf_, 2 * headSize_ * sizeof(float));
         pipe_->InitBuffer(signBuf_, headSize_ * sizeof(float));
 
         codec_.Init(pipe_, headSize_, 1, invSqrtLen, rotTablesGm_);
 
-        AscendC::LocalTensor<float> signs = signBuf_.Get<float>();
+        const AscendC::LocalTensor<float> signs = signBuf_.Get<float>();
         AscendC::DataCopy(signs, piSignsGm_, headSize_);
+        // Init hand-off: the signs and the codec tables land in UB before the first rotation.
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 
@@ -443,29 +445,28 @@ public:
             if (end > numVectors_) {
                 end = numVectors_;
             }
-            const uint32_t sub = static_cast<uint32_t>(AscendC::GetSubBlockIdx());
-            const uint32_t step = static_cast<uint32_t>(AscendC::GetSubBlockNum());
-            for (uint32_t v = base + sub; v < end; v += step) {
-                Rotate(v);
+            const uint32_t subcore = static_cast<uint32_t>(AscendC::GetSubBlockIdx());
+            const uint32_t subcores = static_cast<uint32_t>(AscendC::GetSubBlockNum());
+            for (uint32_t vector = base + subcore; vector < end; vector += subcores) {
+                ComputeRotation(vector);
             }
         }
     }
 
 private:
-    __aicore__ inline void Rotate(uint32_t vector)
+    __aicore__ inline void ComputeRotation(const uint32_t vector)
     {
-        AscendC::LocalTensor<scalar_t> qIn = qInBuf_.Get<scalar_t>();
-        AscendC::LocalTensor<float> work = workBuf_.Get<float>();
-        AscendC::LocalTensor<float> x = work;
-        AscendC::LocalTensor<float> tmp = work[headSize_];
-        AscendC::LocalTensor<float> signs = signBuf_.Get<float>();
+        const AscendC::LocalTensor<scalar_t> queryIn = queryInBuf_.Get<scalar_t>();
+        const AscendC::LocalTensor<float> work = workBuf_.Get<float>();
+        const AscendC::LocalTensor<float> x = work;
+        const AscendC::LocalTensor<float> tmp = work[headSize_];
+        const AscendC::LocalTensor<float> signs = signBuf_.Get<float>();
 
-        AscendC::DataCopy(qIn, queryGm_[static_cast<uint64_t>(vector) * headSize_], headSize_);
+        AscendC::DataCopy(queryIn, queryGm_[static_cast<uint64_t>(vector) * headSize_], headSize_);
         SyncEvent<AscendC::HardEvent::MTE2_V>();
-        AscendC::Cast(x, qIn, AscendC::RoundMode::CAST_NONE, headSize_);
-        VecBarrier<kRotateQVecBarriers>();
+        AscendC::Cast(x, queryIn, AscendC::RoundMode::CAST_NONE, headSize_);
 
-        codec_.ApplyPi<kRotateQVecBarriers>(x, tmp, signs, static_cast<int>(headSize_));
+        codec_.ApplyPi(x, tmp, signs, headSize_);
 
         SyncVectorToMte3();
         AscendC::DataCopy(queryRotGm_[static_cast<uint64_t>(vector) * headSize_], x, headSize_);
@@ -475,7 +476,7 @@ private:
 
     AscendC::TPipe *pipe_;
     TurboQuantCodec4 codec_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> qInBuf_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> queryInBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> workBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> signBuf_;
     AscendC::GlobalTensor<scalar_t> queryGm_;
@@ -489,7 +490,7 @@ private:
 
 }
 
-#define TURBOQUANT_ROTATE_Q_CUBE_DECLARE(TYPE)                                                                       \
+#define ASCEND_TQ_DECLARE_ROTATE_Q_CUBE(TYPE)                                                                        \
     extern "C" __global__ __aicore__ void turboquant_rotate_q_cube_##TYPE(                                            \
         GM_ADDR query, GM_ADDR piSigns, GM_ADDR h16, GM_ADDR queryRot, uint32_t numVectors, uint32_t headSize,       \
         uint32_t vectorsPerBlock, uint32_t vectorsPerChunk, uint32_t variant, float invSqrtLen)                       \
@@ -501,7 +502,7 @@ private:
         op.Process();                                                                                                \
     }
 
-#define TURBOQUANT_ROTATE_Q_AIV_DECLARE(TYPE)                                                                        \
+#define ASCEND_TQ_DECLARE_ROTATE_Q_AIV(TYPE)                                                                         \
     extern "C" __global__ __aicore__ void turboquant_rotate_q_aiv_##TYPE(                                             \
         GM_ADDR query, GM_ADDR piSigns, GM_ADDR rotTables, GM_ADDR queryRot, uint32_t numVectors,                    \
         uint32_t headSize, uint32_t vectorsPerBlock, float invSqrtLen)                                                \
@@ -512,12 +513,15 @@ private:
         op.Process();                                                                                                \
     }
 
-TURBOQUANT_ROTATE_Q_CUBE_DECLARE(half)
-TURBOQUANT_ROTATE_Q_AIV_DECLARE(half)
+ASCEND_TQ_DECLARE_ROTATE_Q_CUBE(half)
+ASCEND_TQ_DECLARE_ROTATE_Q_AIV(half)
 #if !defined(__CCE_AICORE__) || (__CCE_AICORE__ >= 220)
-TURBOQUANT_ROTATE_Q_CUBE_DECLARE(bfloat16_t)
-TURBOQUANT_ROTATE_Q_AIV_DECLARE(bfloat16_t)
+ASCEND_TQ_DECLARE_ROTATE_Q_CUBE(bfloat16_t)
+ASCEND_TQ_DECLARE_ROTATE_Q_AIV(bfloat16_t)
 #endif
+
+#undef ASCEND_TQ_DECLARE_ROTATE_Q_AIV
+#undef ASCEND_TQ_DECLARE_ROTATE_Q_CUBE
 
 namespace vllm_ascend {
 

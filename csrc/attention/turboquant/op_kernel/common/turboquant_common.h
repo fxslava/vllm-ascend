@@ -14,8 +14,10 @@
  * limitations under the License.
  */
 
-// Kernel-side helpers every TurboQuant operator shares: the cross-pipe event idiom, the compile-time
-// vector barrier switch, block indexing, and the one-block broadcasts.
+// Kernel-side helpers every TurboQuant operator shares: the cross-pipe event idiom, block indexing, and the
+// one-block broadcasts. Vector chains issue without intra-pipe barriers (ccec tracks RAW/WAR/WAW within a
+// pipe); a PipeBarrier<PIPE_V> stays only where a UB buffer is reinterpreted or written twice over the same
+// lanes, or between the FWHT's ping-pong passes, and says which next to it.
 
 #ifndef VLLM_ASCEND_ATTENTION_TURBOQUANT_COMMON_H
 #define VLLM_ASCEND_ATTENTION_TURBOQUANT_COMMON_H
@@ -26,30 +28,33 @@
 namespace vllm_ascend {
 namespace turboquant {
 
-// A dependent vector op issues without a barrier; `true` restores CANN's barriered form for an A/B.
-template <bool ENABLED>
-__aicore__ inline void VecBarrier()
-{
-    if constexpr (ENABLED) {
-        AscendC::PipeBarrier<PIPE_V>();
-    }
-}
+// The CrossCoreSetFlag mode that releases both AIV subcores of a MIX block (CANN's NotifyEvent default).
+constexpr uint8_t kSubBlockSyncMode = 0x2;
+
+// A Fixpipe that lands the Cube's product rows in a vector subcore's UB, row-major.
+constexpr AscendC::FixpipeConfig kFixpipeToUb = {AscendC::CO2Layout::ROW_MAJOR, true};
 
 // PipeBarrier orders a pipe against itself only; a hand-off between pipes needs a hard event.
 template <AscendC::HardEvent EVENT>
 __aicore__ inline void SyncEvent()
 {
-    const event_t ev = static_cast<event_t>(GetTPipePtr()->FetchEventID(EVENT));
-    AscendC::SetFlag<EVENT>(ev);
-    AscendC::WaitFlag<EVENT>(ev);
+    const event_t eventId = static_cast<event_t>(GetTPipePtr()->FetchEventID(EVENT));
+    AscendC::SetFlag<EVENT>(eventId);
+    AscendC::WaitFlag<EVENT>(eventId);
 }
 
 __aicore__ inline void SyncVectorToMte3() { SyncEvent<AscendC::HardEvent::V_MTE3>(); }
 __aicore__ inline void SyncMte3ToVector() { SyncEvent<AscendC::HardEvent::MTE3_V>(); }
 __aicore__ inline void SyncMte2ToVector() { SyncEvent<AscendC::HardEvent::MTE2_V>(); }
 __aicore__ inline void SyncVectorToMte2() { SyncEvent<AscendC::HardEvent::V_MTE2>(); }
+__aicore__ inline void SyncMte1ToMatrix() { SyncEvent<AscendC::HardEvent::MTE1_M>(); }
+__aicore__ inline void SyncMatrixToFixpipe() { SyncEvent<AscendC::HardEvent::M_FIX>(); }
 
 __aicore__ inline uint32_t CeilDiv(uint32_t a, uint32_t b) { return (a + b - 1) / b; }
+
+__aicore__ inline uint32_t AlignUp(uint32_t a, uint32_t b) { return CeilDiv(a, b) * b; }
+
+__aicore__ inline uint16_t CeilDivU16(uint32_t a, uint32_t b) { return static_cast<uint16_t>((a + b - 1) / b); }
 
 __aicore__ inline uint32_t ScaleSlotFloats(uint32_t numKvHeads)
 {
@@ -63,16 +68,13 @@ __aicore__ inline uint32_t MixBlockIdx()
     return static_cast<uint32_t>(AscendC::GetBlockIdx() / AscendC::GetSubBlockNum());
 }
 
-template <bool VEC_BARRIERS = true>
 __aicore__ inline void BroadcastScalar(const AscendC::LocalTensor<float> &dst, const AscendC::LocalTensor<float> &src)
 {
     AscendC::Brcb(dst, src, 1, {1, static_cast<uint16_t>(kFp32PerBlock)});
-    VecBarrier<VEC_BARRIERS>();
 }
 
-template <bool VEC_BARRIERS = true>
 __aicore__ inline void BroadcastSub(const AscendC::LocalTensor<float> &dst, const AscendC::LocalTensor<float> &src,
-                                    const AscendC::LocalTensor<float> &scalarBlock, uint32_t count)
+                                    const AscendC::LocalTensor<float> &scalarBlock, const uint32_t count)
 {
     constexpr uint8_t kRepBlocks = static_cast<uint8_t>(kFp32PerRepeat / kFp32PerBlock);
     const uint32_t repeats = count / kFp32PerRepeat;
@@ -85,11 +87,10 @@ __aicore__ inline void BroadcastSub(const AscendC::LocalTensor<float> &dst, cons
         const uint32_t base = repeats * kFp32PerRepeat;
         AscendC::Sub(dst[base], src[base], scalarBlock, static_cast<uint64_t>(tail), 1, {1, 1, 0, 0, 0, 0});
     }
-    VecBarrier<VEC_BARRIERS>();
 }
 
 __aicore__ inline void RepeatButterfly(const AscendC::LocalTensor<float> &dst, const AscendC::LocalTensor<float> &src,
-                                       uint32_t stride, uint32_t groups)
+                                       const uint32_t stride, const uint32_t groups)
 {
     const uint32_t lanes = stride < kFp32PerRepeat ? stride : kFp32PerRepeat;
     const uint8_t rep = static_cast<uint8_t>(2 * stride / kFp32PerBlock);

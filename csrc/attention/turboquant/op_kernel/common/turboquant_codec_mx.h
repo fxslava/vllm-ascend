@@ -107,8 +107,8 @@ public:
 
     __aicore__ static inline float Threshold(int i) { return Traits::kThresholds[i]; }
 
-    __aicore__ inline void Init(AscendC::TPipe *pipe, uint32_t vecLen, uint32_t batchRows, float invSqrtLen,
-                                const AscendC::GlobalTensor<int32_t> &tablesGm)
+    __aicore__ inline void Init(AscendC::TPipe *pipe, const uint32_t vecLen, const uint32_t batchRows,
+                                const float invSqrtLen, const AscendC::GlobalTensor<int32_t> &tablesGm)
     {
         len_ = vecLen;
         rows_ = batchRows;
@@ -121,212 +121,151 @@ public:
             const uint32_t constWords = ConstTableWords(vecLen, batchRows);
             pipe->InitBuffer(constBuf_, constWords * sizeof(int32_t));
 
-            AscendC::LocalTensor<int32_t> pool = constBuf_.Get<int32_t>();
+            const AscendC::LocalTensor<int32_t> pool = constBuf_.Get<int32_t>();
             AscendC::DataCopy(pool, tablesGm, constWords);
+            // Init hand-off: the GM tables land in UB before any vector op reads them.
             AscendC::PipeBarrier<PIPE_ALL>();
 
-            AscendC::LocalTensor<float> poolF = pool.template ReinterpretCast<float>();
-            uint32_t coff = 0;
-            lowOffset_ = pool[coff].template ReinterpretCast<uint32_t>();
-            coff += batchLen_;
-            msbOffset_ = pool[coff].template ReinterpretCast<uint32_t>();
-            coff += batchLen_;
-            lowRecip_ = poolF[coff];
-            coff += kFp32PerBlock;
-            msbRecip_ = poolF[coff];
-            coff += kFp32PerBlock;
-            msbWeight_ = poolF[coff];
-            coff += kFp32PerBlock;
-            packOffset_ = pool[coff].template ReinterpretCast<uint32_t>();
-            coff += len_;
-            centroid_ = poolF[coff];
+            const AscendC::LocalTensor<float> poolFloat = pool.template ReinterpretCast<float>();
+            uint32_t constOffset = 0;
+            lowOffset_ = pool[constOffset].template ReinterpretCast<uint32_t>();
+            constOffset += batchLen_;
+            msbOffset_ = pool[constOffset].template ReinterpretCast<uint32_t>();
+            constOffset += batchLen_;
+            lowRecip_ = poolFloat[constOffset];
+            constOffset += kFp32PerBlock;
+            msbRecip_ = poolFloat[constOffset];
+            constOffset += kFp32PerBlock;
+            msbWeight_ = poolFloat[constOffset];
+            constOffset += kFp32PerBlock;
+            packOffset_ = pool[constOffset].template ReinterpretCast<uint32_t>();
+            constOffset += len_;
+            centroid_ = poolFloat[constOffset];
         }
 
-        AscendC::LocalTensor<float> work = workBuf_.Get<float>();
-        uint32_t off = 0;
+        const AscendC::LocalTensor<float> work = workBuf_.Get<float>();
+        uint32_t offset = 0;
         if constexpr (kIsAffine) {
-            expand_ = work[off];
-            off += batchLen_ / 2u;
-            msb_ = work[off];
-            off += batchLen_ / 2u;
-            low_ = work[off];
-            off += len_;
-            scratch_ = work[off];
-            off += len_;
+            expand_ = work[offset];
+            offset += batchLen_ / 2u;
+            msb_ = work[offset];
+            offset += batchLen_ / 2u;
+            low_ = work[offset];
+            offset += len_;
+            scratch_ = work[offset];
+            offset += len_;
         } else {
-            expand_ = work[off];
-            off += batchLen_;
-            low_ = work[off];
-            off += batchLen_;
-            msb_ = work[off];
-            off += batchLen_;
-            scratch_ = work[off];
-            off += batchLen_;
+            expand_ = work[offset];
+            offset += batchLen_;
+            low_ = work[offset];
+            offset += batchLen_;
+            msb_ = work[offset];
+            offset += batchLen_;
+            scratch_ = work[offset];
+            offset += batchLen_;
         }
-        reduceWork_ = work[off];
-        off += len_;
-        broadcast_ = work[off];
-        off += kBrcbDstLanes + kFp32PerBlock;
+        reduceWork_ = work[offset];
+        offset += len_;
+        broadcast_ = work[offset];
+        offset += kBrcbDstLanes + kFp32PerBlock;
         for (int lane = 0; lane < kBinLanes; ++lane) {
-            binLane_[lane] = work[off];
-            off += len_;
+            binLane_[lane] = work[offset];
+            offset += len_;
         }
     }
 
     __aicore__ inline void Encode(const AscendC::LocalTensor<int8_t> &dstPacked,
                                   const AscendC::LocalTensor<float> &src,
-                                  const AscendC::LocalTensor<float> &scaleOut, int len)
+                                  const AscendC::LocalTensor<float> &scaleOut, const uint32_t n)
     {
-        const uint32_t n = static_cast<uint32_t>(len);
-
-        AscendC::Mul(scratch_, src, src, n);
-        ChainBarrier();
-        AscendC::ReduceSum<float>(scaleOut, scratch_, reduceWork_, n);
-        ChainBarrier();
-        AscendC::Sqrt(scaleOut, scaleOut, 1);
-        ChainBarrier();
-        AscendC::Muls(scaleOut, scaleOut, invSqrtLen_, 1);
-        ChainBarrier();
-        AscendC::Adds(scaleOut, scaleOut, kEps, 1);
-        ChainBarrier();
-
-        AscendC::Brcb(broadcast_, scaleOut, 1, {1, static_cast<uint16_t>(kFp32PerBlock)});
-        ChainBarrier();
-        AscendC::Duplicate(broadcast_[kBrcbDstLanes], -1.0f, kFp32PerBlock);
-        ChainBarrier();
-        AscendC::Div(broadcast_[kBrcbDstLanes], broadcast_[kBrcbDstLanes], broadcast_, kFp32PerBlock);
-        ChainBarrier();
-
-        // The broadcast ends in a barrier on purpose: reduceWork_ held the reduce's float intermediates and
-        // is rewritten as int32 bins next.
+        ComputeInverseScale(src, scaleOut, n);
         TurboQuantCodec4::BroadcastMul(scratch_, src, broadcast_[kBrcbDstLanes], n);
-
-        AscendC::LocalTensor<int32_t> bins = reduceWork_.ReinterpretCast<int32_t>();
-        AscendC::Duplicate(bins, 0, n);
-        ChainBarrier();
-
-        // Each bin lane is written as float, shifted as uint32 and summed as int32, and the next pass writes
-        // it as float again: those three barriers mark reinterpretations and stay.
-        for (int base = 0; base < kThresholdCount; base += kBinLanes) {
-            const int lanes = (kThresholdCount - base) < kBinLanes ? (kThresholdCount - base) : kBinLanes;
-            for (int lane = 0; lane < lanes; ++lane) {
-                AscendC::Adds(binLane_[lane], scratch_, Threshold(base + lane), n);
-            }
-            AscendC::PipeBarrier<PIPE_V>();
-            for (int lane = 0; lane < lanes; ++lane) {
-                AscendC::LocalTensor<uint32_t> bits = binLane_[lane].ReinterpretCast<uint32_t>();
-                AscendC::ShiftRight(bits, bits, kSignBitShift, static_cast<int32_t>(n));
-            }
-            AscendC::PipeBarrier<PIPE_V>();
-            for (int span = 1; span < lanes; span <<= 1) {
-                for (int lane = 0; lane + span < lanes; lane += 2 * span) {
-                    AscendC::LocalTensor<int32_t> dst = binLane_[lane].ReinterpretCast<int32_t>();
-                    AscendC::LocalTensor<int32_t> src2 = binLane_[lane + span].ReinterpretCast<int32_t>();
-                    AscendC::Add(dst, dst, src2, n);
-                }
-                ChainBarrier();
-            }
-            AscendC::Add(bins, bins, binLane_[0].ReinterpretCast<int32_t>(), n);
-            AscendC::PipeBarrier<PIPE_V>();
-        }
-        AscendC::Cast(low_, bins, AscendC::RoundMode::CAST_NONE, n);
-        ChainBarrier();
+        // Reinterpretation: reduceWork_ held the ReduceSum's float intermediates and is written as int32 bins next.
+        AscendC::PipeBarrier<PIPE_V>();
+        ComputeLevelBins(n);
 
         if constexpr (kHasMsbPlane) {
-            AscendC::Muls(msb_, low_, 1.0f / static_cast<float>(Planes::kLowRadix), n);
-            AscendC::PipeBarrier<PIPE_V>();
-            FloorInPlace(msb_, n);
-            AscendC::Muls(scratch_, msb_, -static_cast<float>(Planes::kLowRadix), n);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Add(low_, low_, scratch_, n);
-            AscendC::PipeBarrier<PIPE_V>();
+            ComputeMsbDigits(n);
         }
 
         if constexpr (kIsAffine) {
-            PackAffinePlane(dstPacked, low_, n);
+            StageAffinePlane(dstPacked, low_, n);
         } else {
-            PackLowPlane(dstPacked, low_, n);
+            StageLowPlane(dstPacked, low_, n);
             if constexpr (kHasMsbPlane) {
-                PackMsbPlane(dstPacked[LowPlaneBytes(len_)], msb_, n);
+                StageMsbPlane(dstPacked[LowPlaneBytes(len_)], msb_, n);
             }
         }
     }
 
     template <typename OperandT>
     __aicore__ inline void Unpack(const AscendC::LocalTensor<OperandT> &dst,
-                                  const AscendC::LocalTensor<int8_t> &srcPacked, int rows, int len)
+                                  const AscendC::LocalTensor<int8_t> &srcPacked, const uint32_t rows,
+                                  const uint32_t len)
     {
         static_assert(!kIsAffine, "an affine mode expands through UnpackAffine; it has no centroid table");
-        const uint32_t n = static_cast<uint32_t>(rows) * static_cast<uint32_t>(len);
-        const uint32_t packedBytes =
-            static_cast<uint32_t>(rows) * PackedBytes(static_cast<uint32_t>(len));
+        const uint32_t n = rows * len;
+        const uint32_t packedBytes = rows * PackedBytes(len);
 
-        AscendC::LocalTensor<half> halfView = scratch_.ReinterpretCast<half>();
+        const AscendC::LocalTensor<half> halfView = scratch_.ReinterpretCast<half>();
         AscendC::Cast(halfView, srcPacked, AscendC::RoundMode::CAST_NONE, packedBytes);
-        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Cast(expand_, halfView, AscendC::RoundMode::CAST_NONE, packedBytes);
-        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Adds(expand_, expand_, kInt8Bias, packedBytes);
-        AscendC::PipeBarrier<PIPE_V>();
 
         AscendC::Gather(low_, expand_, lowOffset_, kGatherSrcBase, n);
-        AscendC::PipeBarrier<PIPE_V>();
-        ExtractDigit(low_, lowRecip_, Planes::kLowRadix, n);
+        ComputeDigit(low_, lowRecip_, Planes::kLowRadix, n);
 
         if constexpr (kHasMsbPlane) {
             AscendC::Gather(msb_, expand_, msbOffset_, kGatherSrcBase, n);
-            AscendC::PipeBarrier<PIPE_V>();
-            ExtractDigit(msb_, msbRecip_, 2, n);
+            ComputeDigit(msb_, msbRecip_, 2, n);
             AscendC::Muls(msb_, msb_, static_cast<float>(Planes::kLowRadix), n);
-            AscendC::PipeBarrier<PIPE_V>();
             AscendC::Add(low_, low_, msb_, n);
-            AscendC::PipeBarrier<PIPE_V>();
         }
 
         AscendC::Muls(scratch_, low_, kCentroidStride, n);
+        // Reinterpretation: expand_ was last read as float and is written as int32 offsets next.
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::LocalTensor<int32_t> offsets = expand_.ReinterpretCast<int32_t>();
+        const AscendC::LocalTensor<int32_t> offsets = expand_.ReinterpretCast<int32_t>();
         AscendC::Cast(offsets, scratch_, AscendC::RoundMode::CAST_RINT, n);
+        // Reinterpretation: the offsets were just written as int32 and the Gather reads them as uint32.
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Gather(low_, centroid_, expand_.ReinterpretCast<uint32_t>(), kGatherSrcBase, n);
-        AscendC::PipeBarrier<PIPE_V>();
 
         CastToOperand(dst, low_, n);
+        // Reinterpretation: scratch_ ends the band as float (fp8) or bf16 (fp4); the next band writes it as half.
+        AscendC::PipeBarrier<PIPE_V>();
     }
 
-    template <typename OperandT, bool VEC_BARRIERS = true>
+    template <typename OperandT>
     __aicore__ inline void UnpackAffine(const AscendC::LocalTensor<OperandT> &dstLow,
                                         const AscendC::LocalTensor<OperandT> &dstHigh,
-                                        const AscendC::LocalTensor<int8_t> &srcPacked, uint32_t bytes)
+                                        const AscendC::LocalTensor<int8_t> &srcPacked, const uint32_t bytes)
     {
         static_assert(kIsAffine, "UnpackAffine is only defined for a mode with uniform levels");
         static_assert(!kHasMsbPlane, "an affine mode stores one plane; there is no msb digit to fold in");
         static_assert(Planes::kLowPerByte == 2, "the plane split assumes two nibbles per byte");
         const uint32_t elems = 2u * bytes;
 
-        AscendC::LocalTensor<half> nibbles = msb_.ReinterpretCast<half>();
+        const AscendC::LocalTensor<half> nibbles = msb_.ReinterpretCast<half>();
         AscendC::Cast(nibbles, srcPacked.ReinterpretCast<int4b_t>(), AscendC::RoundMode::CAST_NONE, elems);
 
-        AscendC::LocalTensor<half> planes = expand_.ReinterpretCast<half>();
+        const AscendC::LocalTensor<half> planes = expand_.ReinterpretCast<half>();
         AscendC::DeInterleave(planes, planes[bytes], nibbles, static_cast<int32_t>(elems));
 
-        ExpandNibblePlane<OperandT, VEC_BARRIERS>(dstLow, planes, bytes);
-        ExpandNibblePlane<OperandT, VEC_BARRIERS>(dstHigh, planes[bytes], bytes);
+        ComputeNibbleOperands(dstLow, planes, bytes);
+        ComputeNibbleOperands(dstHigh, planes[bytes], bytes);
     }
 
-    template <typename OperandT, bool VEC_BARRIERS = true>
+    template <typename OperandT>
     __aicore__ inline void CastToOperand(const AscendC::LocalTensor<OperandT> &dst,
-                                         const AscendC::LocalTensor<float> &src, uint32_t n)
+                                         const AscendC::LocalTensor<float> &src, const uint32_t n)
     {
         if constexpr (kIsFp4) {
-            AscendC::LocalTensor<bfloat16_t> bf = scratch_.ReinterpretCast<bfloat16_t>();
-            AscendC::Cast(bf, src, AscendC::RoundMode::CAST_RINT, n);
-            VecBarrier<VEC_BARRIERS>();
-            AscendC::Cast(dst, bf, AscendC::RoundMode::CAST_RINT, n);
-            VecBarrier<VEC_BARRIERS>();
+            const AscendC::LocalTensor<bfloat16_t> bf16View = scratch_.ReinterpretCast<bfloat16_t>();
+            AscendC::Cast(bf16View, src, AscendC::RoundMode::CAST_RINT, n);
+            AscendC::Cast(dst, bf16View, AscendC::RoundMode::CAST_RINT, n);
         } else {
             AscendC::Cast(dst, src, AscendC::RoundMode::CAST_RINT, n);
-            VecBarrier<VEC_BARRIERS>();
         }
     }
 
@@ -343,102 +282,149 @@ private:
     static constexpr float kNibbleSignShift = static_cast<float>(Planes::kLowRadix / 2);
     static constexpr float kSignedLevelOffset = kNibbleSignShift - kAffineBias;
 
-    template <typename OperandT, bool VEC_BARRIERS>
-    __aicore__ inline void ExpandNibblePlane(const AscendC::LocalTensor<OperandT> &dst,
-                                             const AscendC::LocalTensor<half> &plane, uint32_t bytes)
+    // scaleOut = RMS(src) + eps, and broadcast_[kBrcbDstLanes] = -1 / scaleOut as one block.
+    __aicore__ inline void ComputeInverseScale(const AscendC::LocalTensor<float> &src,
+                                               const AscendC::LocalTensor<float> &scaleOut, const uint32_t n)
+    {
+        AscendC::Mul(scratch_, src, src, n);
+        AscendC::ReduceSum<float>(scaleOut, scratch_, reduceWork_, n);
+        AscendC::Sqrt(scaleOut, scaleOut, 1);
+        AscendC::Muls(scaleOut, scaleOut, invSqrtLen_, 1);
+        AscendC::Adds(scaleOut, scaleOut, kEps, 1);
+
+        AscendC::Brcb(broadcast_, scaleOut, 1, {1, static_cast<uint16_t>(kFp32PerBlock)});
+        AscendC::Duplicate(broadcast_[kBrcbDstLanes], -1.0f, kFp32PerBlock);
+        AscendC::Div(broadcast_[kBrcbDstLanes], broadcast_[kBrcbDstLanes], broadcast_, kFp32PerBlock);
+    }
+
+    // The level of every coordinate of scratch_ against the thresholds, counted as int32 bins in reduceWork_
+    // and cast back to float into low_.
+    __aicore__ inline void ComputeLevelBins(const uint32_t n)
+    {
+        const AscendC::LocalTensor<int32_t> bins = reduceWork_.ReinterpretCast<int32_t>();
+        AscendC::Duplicate(bins, 0, n);
+
+        for (int base = 0; base < kThresholdCount; base += kBinLanes) {
+            const int lanes = (kThresholdCount - base) < kBinLanes ? (kThresholdCount - base) : kBinLanes;
+            for (int lane = 0; lane < lanes; ++lane) {
+                AscendC::Adds(binLane_[lane], scratch_, Threshold(base + lane), n);
+            }
+            // Reinterpretation: the bin lanes were just written as float and are shifted as uint32 next.
+            AscendC::PipeBarrier<PIPE_V>();
+            for (int lane = 0; lane < lanes; ++lane) {
+                const AscendC::LocalTensor<uint32_t> signBits = binLane_[lane].ReinterpretCast<uint32_t>();
+                AscendC::ShiftRight(signBits, signBits, kSignBitShift, static_cast<int32_t>(n));
+            }
+            // Reinterpretation: the bin lanes were just written as uint32 and are summed as int32 next.
+            AscendC::PipeBarrier<PIPE_V>();
+            for (int span = 1; span < lanes; span <<= 1) {
+                for (int lane = 0; lane + span < lanes; lane += 2 * span) {
+                    const AscendC::LocalTensor<int32_t> sum = binLane_[lane].ReinterpretCast<int32_t>();
+                    const AscendC::LocalTensor<int32_t> addend = binLane_[lane + span].ReinterpretCast<int32_t>();
+                    AscendC::Add(sum, sum, addend, n);
+                }
+            }
+            AscendC::Add(bins, bins, binLane_[0].ReinterpretCast<int32_t>(), n);
+            // Reinterpretation: the bin lanes were last read as int32 and the next pass writes them as float.
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+        AscendC::Cast(low_, bins, AscendC::RoundMode::CAST_NONE, n);
+    }
+
+    // Splits low_'s levels into the low-radix digit (low_) and the msb digit (msb_).
+    __aicore__ inline void ComputeMsbDigits(const uint32_t n)
+    {
+        AscendC::Muls(msb_, low_, 1.0f / static_cast<float>(Planes::kLowRadix), n);
+        FloorInPlace(msb_, n);
+        AscendC::Muls(scratch_, msb_, -static_cast<float>(Planes::kLowRadix), n);
+        AscendC::Add(low_, low_, scratch_, n);
+    }
+
+    template <typename OperandT>
+    __aicore__ inline void ComputeNibbleOperands(const AscendC::LocalTensor<OperandT> &dst,
+                                                 const AscendC::LocalTensor<half> &plane, const uint32_t bytes)
     {
         AscendC::Cast(msb_, plane, AscendC::RoundMode::CAST_NONE, bytes);
         AscendC::Adds(msb_, msb_, kSignedLevelOffset, bytes);
-        CastToOperand<OperandT, VEC_BARRIERS>(dst, msb_, bytes);
+        CastToOperand(dst, msb_, bytes);
     }
 
-    // A barrier between two dependent ops of the encode chain. kv4fp8's chain issues without them and keeps
-    // only the barriers that mark a buffer reinterpretation (csrc/tests/TURBOQUANT_TESTS.md 13.29); the
-    // codebook modes keep the barriers they were written with.
-    __aicore__ static inline void ChainBarrier()
+    __aicore__ static inline void FloorInPlace(const AscendC::LocalTensor<float> &x, const uint32_t count)
     {
-        if constexpr (!kIsAffine) {
-            AscendC::PipeBarrier<PIPE_V>();
-        }
-    }
-
-    __aicore__ static inline void FloorInPlace(const AscendC::LocalTensor<float> &x, uint32_t count)
-    {
-        AscendC::LocalTensor<int32_t> intView = x.ReinterpretCast<int32_t>();
+        const AscendC::LocalTensor<int32_t> intView = x.ReinterpretCast<int32_t>();
+        // Reinterpretation: x was last written as float and is overwritten in place through an int32 view.
+        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Cast(intView, x, AscendC::RoundMode::CAST_FLOOR, count);
+        // Reinterpretation: the int32 view is cast back over the same lanes as float.
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Cast(x, intView, AscendC::RoundMode::CAST_NONE, count);
-        AscendC::PipeBarrier<PIPE_V>();
     }
 
-    __aicore__ inline void ExtractDigit(const AscendC::LocalTensor<float> &x,
-                                        const AscendC::LocalTensor<float> &recip, int32_t radix, uint32_t n)
+    // x = floor(x * recip) mod radix.
+    __aicore__ inline void ComputeDigit(const AscendC::LocalTensor<float> &x, const AscendC::LocalTensor<float> &recip,
+                                        const int32_t radix, const uint32_t n)
     {
         TurboQuantCodec4::BroadcastMul(x, x, recip, n);
         FloorInPlace(x, n);
         AscendC::Muls(scratch_, x, 1.0f / static_cast<float>(radix), n);
-        AscendC::PipeBarrier<PIPE_V>();
         FloorInPlace(scratch_, n);
         AscendC::Muls(scratch_, scratch_, -static_cast<float>(radix), n);
-        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Add(x, x, scratch_, n);
-        AscendC::PipeBarrier<PIPE_V>();
     }
 
-    __aicore__ inline void PackAffinePlane(const AscendC::LocalTensor<int8_t> &dst,
-                                           const AscendC::LocalTensor<float> &digits, uint32_t n)
+    __aicore__ inline void StageAffinePlane(const AscendC::LocalTensor<int8_t> &dst,
+                                            const AscendC::LocalTensor<float> &digits, const uint32_t n)
     {
         const uint32_t bytes = n / 2u;
         AscendC::Adds(digits, digits, -kNibbleSignShift, n);
-        AscendC::LocalTensor<half> levels = scratch_.ReinterpretCast<half>();
+        const AscendC::LocalTensor<half> levels = scratch_.ReinterpretCast<half>();
         AscendC::Cast(levels, digits, AscendC::RoundMode::CAST_RINT, n);
 
-        AscendC::LocalTensor<half> woven = expand_.ReinterpretCast<half>();
+        const AscendC::LocalTensor<half> woven = expand_.ReinterpretCast<half>();
         AscendC::Interleave(woven, woven[bytes], levels, levels[bytes], static_cast<int32_t>(bytes));
         AscendC::Cast(dst.ReinterpretCast<int4b_t>(), woven, AscendC::RoundMode::CAST_RINT, n);
-        // scratch_ held half levels here, and the next vector's encode writes it as float.
+        // Reinterpretation: scratch_ holds half levels, and the next vector's encode writes it as float.
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    __aicore__ inline void PackLowPlane(const AscendC::LocalTensor<int8_t> &dst,
-                                        const AscendC::LocalTensor<float> &digits, uint32_t n)
+    __aicore__ inline void StageLowPlane(const AscendC::LocalTensor<int8_t> &dst,
+                                         const AscendC::LocalTensor<float> &digits, const uint32_t n)
     {
-        constexpr int32_t kDpb = Planes::kLowPerByte;
-        const uint32_t bytes = n / static_cast<uint32_t>(kDpb);
+        constexpr int32_t kDigitsPerByte = Planes::kLowPerByte;
+        const uint32_t bytes = n / static_cast<uint32_t>(kDigitsPerByte);
 
         AscendC::Gather(expand_, digits, packOffset_, kGatherSrcBase, bytes);
-        AscendC::PipeBarrier<PIPE_V>();
         float weight = 1.0f;
-        for (int32_t j = 1; j < kDpb; ++j) {
+        for (int32_t digit = 1; digit < kDigitsPerByte; ++digit) {
             weight *= static_cast<float>(Planes::kLowRadix);
-            AscendC::Gather(low_, digits, packOffset_[static_cast<uint32_t>(j) * bytes], kGatherSrcBase, bytes);
+            AscendC::Gather(low_, digits, packOffset_[static_cast<uint32_t>(digit) * bytes], kGatherSrcBase, bytes);
+            // Overlapping write: digits is low_, so this Gather rewrites the lanes the next digit gathers from.
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Muls(low_, low_, weight, bytes);
-            AscendC::PipeBarrier<PIPE_V>();
             AscendC::Add(expand_, expand_, low_, bytes);
-            AscendC::PipeBarrier<PIPE_V>();
         }
-        EmitBytes(dst, bytes);
+        StageBytes(dst, bytes);
     }
 
-    __aicore__ inline void PackMsbPlane(const AscendC::LocalTensor<int8_t> &dst,
-                                        const AscendC::LocalTensor<float> &digits, uint32_t n)
+    __aicore__ inline void StageMsbPlane(const AscendC::LocalTensor<int8_t> &dst,
+                                         const AscendC::LocalTensor<float> &digits, const uint32_t n)
     {
         const uint32_t bytes = n / static_cast<uint32_t>(kMsbPerByte);
         TurboQuantCodec4::BroadcastMul(scratch_, digits, msbWeight_, n);
         AscendC::WholeReduceSum<float>(expand_, scratch_, kMsbPerByte, static_cast<uint8_t>(bytes), 1, 1, 1);
-        AscendC::PipeBarrier<PIPE_V>();
-        EmitBytes(dst, bytes);
+        StageBytes(dst, bytes);
     }
 
-    __aicore__ inline void EmitBytes(const AscendC::LocalTensor<int8_t> &dst, uint32_t bytes)
+    // expand_ holds unsigned byte values as float: bias them to int8 and cast into dst.
+    __aicore__ inline void StageBytes(const AscendC::LocalTensor<int8_t> &dst, const uint32_t bytes)
     {
         AscendC::Adds(expand_, expand_, -kInt8Bias, bytes);
+        // Reinterpretation: scratch_ was last used as float and is written as half next.
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::LocalTensor<half> halfView = scratch_.ReinterpretCast<half>();
+        const AscendC::LocalTensor<half> halfView = scratch_.ReinterpretCast<half>();
         AscendC::Cast(halfView, expand_, AscendC::RoundMode::CAST_NONE, bytes);
-        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Cast(dst, halfView, AscendC::RoundMode::CAST_RINT, bytes);
+        // Reinterpretation: scratch_ holds half bytes, and the msb plane or the next vector writes it as float.
         AscendC::PipeBarrier<PIPE_V>();
     }
 
@@ -470,21 +456,6 @@ private:
 using TurboQuantCodecKv3Fp4 = TurboQuantModeCodec<TurboQuantMode::KV3_FP4>;
 using TurboQuantCodecKv4Fp8 = TurboQuantModeCodec<TurboQuantMode::KV4_FP8>;
 using TurboQuantCodecKv5Fp8 = TurboQuantModeCodec<TurboQuantMode::KV5_FP8>;
-
-__aicore__ inline void unpack_tq4_to_fp8(TurboQuantCodecKv4Fp8 &codec,
-                                         const AscendC::LocalTensor<fp8_e4m3fn_t> &dstLow,
-                                         const AscendC::LocalTensor<fp8_e4m3fn_t> &dstHigh,
-                                         const AscendC::LocalTensor<int8_t> &srcPacked, uint32_t bytes)
-{
-    codec.UnpackAffine(dstLow, dstHigh, srcPacked, bytes);
-}
-
-__aicore__ inline void unpack_tq5_to_fp8(TurboQuantCodecKv5Fp8 &codec,
-                                         const AscendC::LocalTensor<fp8_e4m3fn_t> &dst,
-                                         const AscendC::LocalTensor<int8_t> &srcPacked, int rows, int len)
-{
-    codec.Unpack(dst, srcPacked, rows, len);
-}
 
 }
 }

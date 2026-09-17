@@ -3839,3 +3839,54 @@ the decode keeps the cross-core flags the AIC sets on `PIPE_FIX` (`kFlagScoresRe
 The +31.3 us silicon figure could therefore not be reproduced as camodel cycles. Whether the purge
 buys it back needs the device trace. The barriered decode instance now differs from the fused one
 only inside the broadcast and cast helpers that still take the switch. It remains a (weaker) A/B.
+
+### 13.30 Tree-wide barrier hygiene and the retired barriered twin (2026-09-17)
+
+The 13.29 rules applied to every TurboQuant kernel source, not only the kv4fp8 decode and writer:
+`turboquant_paged_attention.cpp`, `turboquant_rotate_q.cpp`, both codecs, the cube and vector services.
+
+**Barriers.** Vector barrier call sites (`PipeBarrier<PIPE_V>`, `VecBarrier<>`, `ChainBarrier`) went from
+132 to 34 across the tree. The switch itself (`VecBarrier`, every `VEC_BARRIERS` template parameter,
+`ChainBarrier`, `kBarrierFreeWriter`, `kPagedAttentionVecBarriers`, `kRotateQVecBarriers`) is gone. A kept
+barrier sits at one of:
+- a UB reinterpretation (float/int32/uint32/half/bf16 views of one buffer: the bin lanes, `FloorInPlace`,
+  the offset gathers, the half scratch between vectors or bands);
+- an overlapping write (`Duplicate` then an overlapping `Duplicate`/`Gather`; the in-place low-digit
+  `Gather` of the codebook pack);
+- the FWHT ping-pong (butterfly passes, the copy back into `x`);
+- the vector -> scalar `GetValue` readback of the per-head query path.
+
+Each carries a one-line comment naming its case. The `PIPE_ALL` init barriers, the `PIPE_FIX` barrier
+after each Fixpipe and the probe's `PIPE_MTE1` variant are unchanged and now commented. The codebook
+writer's `Init` hands its signs over with `SyncMte2ToVector()` like kv4fp8's. `FloorInPlace` takes its
+entry barrier itself instead of relying on the caller's.
+
+For kv4fp8's fused decode and writer the barrier set is the one 13.29 left: the fused instance issued no
+switchable barrier, and the writer's encode keeps the same four reinterpretation barriers. The shipping
+AIV path (`Quantize4Bit`, `Dequantize4Bit`, the rotation, `AccumulateTile`) and the kv3fp4 / kv5fp8
+codec chains lost their arithmetic barriers here; **none of those were executed after this change** (the
+test scope is fused (a)-(e), kv4fp8 only).
+
+**The barriered twin is retired.** With no switch left, `turboquant_mm_fused_decode_barriered_kv4fp8_half`
+compiled to the same launch, so it and `turboquant_mm_fused_decode_barriered_impl`, `RunBarriered` and the
+fused-vs-barriered comparison were removed. The goldens are the bit-exact reference. Case (a) is renamed
+`DecodesASingleTileToItsGolden`.
+
+**Structure.** Helpers split out with `Stage*` / `Compute*` / `Sync*` names (e.g.
+`ComputeSoftmaxAndStageProbs`, `ComputeRowSoftmaxStep`, `StageNzTileToL1`, `ComputeTile`), read-only
+tensors and extents taken as `const`, `TurboQuantTaskSpan` for the tile pipeline, shared `kFixpipeToUb` /
+`CeilDivU16` / `AlignUp` / `kSubBlockSyncMode` in `turboquant_common.h`, named `CubeLoadVariant`s for the
+probe, and `ASCEND_TQ_`-prefixed declare macros that are `#undef`ed after use. The dead `unpack_tq4_to_fp8`
+/ `unpack_tq5_to_fp8` wrappers were removed.
+
+**Results (camodel, one process per test):** host / sim / npu clean under `-Werror` with target sets equal
+to 13.29's. Fused (a)-(e) pass: all five goldens, cosines equal to the recorded values, (c) vs (b) cos
+1.000000000, (e) 0 of 131,072 written bytes differ (29,700 with lanes swapped), 0 B exception dumps.
+
+**Spans, not conclusive.** Launch spans read higher than 13.29's (a +3.8%, b +19%, c +45%, d +7.6%,
+e +12%, writer +11%). Vector-function call counts and body-size histograms are identical to 13.29, while
+the mean VF dispatch latency moved (writer 265 -> 291 cycles, b 180 -> 214). 13.29's own build shows the
+same latency swinging between identical instances (c 193 vs c_bar 149). The AIV instruction count rose by
+212 in (a) and 1,044 in (b), consistent with the extra per-tile `TBuf::Get` lookups of the split softmax
+helpers. A sequential same-session A/B was started and stopped by user direction. Latency is to be judged
+on silicon (`msprof`), not on these spans.

@@ -22,11 +22,11 @@
 //   (d) H_Q 8,  H_KV 2, S 120, block 64   a masked tail tile, two heads on each vector subcore
 //   (e) (a) with its cache written by the kv4fp8 kernel writer (13.28) instead of uploaded
 //
-// Every launch runs twice, through the barrier-free kernel and through the instance of the same kernel
-// that keeps every intra-pipe vector barrier; the two must be bit-identical. Each fused output is hashed
-// (FNV-1a over its half bit patterns) against a golden, and its cosine against exact fp32 attention must
-// not regress. (a) to (d) decode a host-built cache and their goldens date from b48ed2951; (c) must agree
-// with (b) to rounding. (e) draws independent vector halves, so a swapped nibble lane would show, and
+// Each fused output is hashed (FNV-1a over its half bit patterns) against a golden, and its cosine against
+// exact fp32 attention must not regress. The goldens are the bit-exact reference: the barriered A/B instance
+// they were once checked against was retired in TURBOQUANT_TESTS.md 13.30, when no switchable vector barrier
+// was left for it to differ by. (a) to (d) decode a host-built cache and their goldens date from b48ed2951;
+// (c) must agree with (b) to rounding. (e) draws independent vector halves, so a swapped nibble lane would show, and
 // checks the written GM cache against the host encoder before decoding it.
 
 #include <gtest/gtest.h>
@@ -130,7 +130,7 @@ void PrintRun(const char* tag, const char* label, const tqh::FusedRun& run, cons
               static_cast<unsigned long long>(run.fnv1a), tqh::FusedCosine(run.output, reference), run.host_s);
 }
 
-// Runs a case through both instances and checks what every case shares. Returns the fused run.
+// Runs a case through the fused kernel and checks what every case shares. Returns the fused run.
 tqh::FusedRun RunCase(tqh::FusedCubeScenario* scenario, const FusedCase& fused_case, LaunchWatchdog* watchdog,
                       const std::vector<float>& reference) {
   const tqh::FusedDecodeGrid grid = scenario->Plan(fused_case.plan_aiv, fused_case.split_policy);
@@ -141,15 +141,7 @@ tqh::FusedRun RunCase(tqh::FusedCubeScenario* scenario, const FusedCase& fused_c
   watchdog->Disarm();
   PrintRun(fused_case.tag, "fused", fused, reference);
 
-  watchdog->Arm(tag + " turboquant_mm_fused_decode_barriered_impl");
-  const tqh::FusedRun barriered = scenario->RunBarriered(grid);
-  watchdog->Disarm();
-  PrintRun(fused_case.tag, "fused barriered", barriered, reference);
-
-  const tqh::FusedAgreement agreement = tqh::CompareValues(fused.output, barriered.output);
   const double cosine = tqh::FusedCosine(fused.output, reference);
-  std::printf("[ fused ] %s fused vs barriered: %zu of %zu elements differ, max |err| %.3e\n", fused_case.tag,
-              agreement.differing, agreement.compared, agreement.max_abs);
   if (fused_case.golden == kGoldenUnrecorded) {
     std::printf("[ fused ] %s golden not recorded; this build's is 0x%016llx\n", fused_case.tag,
                 static_cast<unsigned long long>(fused.fnv1a));
@@ -161,9 +153,6 @@ tqh::FusedRun RunCase(tqh::FusedCubeScenario* scenario, const FusedCase& fused_c
 
   EXPECT_EQ(fused.launches, 1) << tag;
   EXPECT_EQ(fused.untouched, 0u) << tag << ": the fused launch left sentinel values in the output";
-  EXPECT_EQ(barriered.untouched, 0u) << tag << ": the barriered launch left sentinel values in the output";
-  EXPECT_EQ(agreement.differing, 0u) << tag
-                                     << ": the barrier-free kernel is not bit-identical to its barriered instance";
   if (fused_case.golden != kGoldenUnrecorded) {
     EXPECT_EQ(fused.fnv1a, fused_case.golden) << tag << ": the output moved off its recorded golden";
   }
@@ -194,7 +183,7 @@ class TurboQuantFusedDecode : public ::testing::Test {
   LaunchWatchdog watchdog_{kLaunchBudgetSeconds, "[ fused ]"};
 };
 
-TEST_F(TurboQuantFusedDecode, IsBitIdenticalToItsBarrieredInstance) {
+TEST_F(TurboQuantFusedDecode, DecodesASingleTileToItsGolden) {
   PrintShape(kCaseA, aiv_num_, queried_);
   watchdog_.Arm("(a) scenario setup and query rotation");
   tqh::FusedCubeScenario scenario(kCaseA.shape, stream_, aiv_num_);

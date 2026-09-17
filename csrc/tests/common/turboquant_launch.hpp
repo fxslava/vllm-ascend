@@ -59,15 +59,6 @@ void turboquant_mm_fused_decode_impl(int32_t mode, AscendType type, void *stream
                                     uint32_t headsPerTask, uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,
                                     uint32_t fusedContextLimit, float scale, float invSqrtLen);
 
-void turboquant_mm_fused_decode_barriered_impl(AscendType type, void *stream, uint32_t blockDim, void *queryRot,
-                                              void *keyCache, void *valueCache, void *scaleCache, void *blockTables,
-                                              void *contextLens, void *modeTables, void *workspace, void *output,
-                                              uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads,
-                                              uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,
-                                              uint32_t numSplits, uint32_t headsPerTask, uint32_t tasksPerBlock,
-                                              uint32_t reduceTasksPerBlock, uint32_t fusedContextLimit, float scale,
-                                              float invSqrtLen);
-
 void turboquant_cube_gemm_probe_impl(void *stream, void *a, void *b, void *c, uint32_t m, uint32_t k, uint32_t n,
                                      uint32_t headSize, uint32_t tileRows, uint32_t aElems, uint32_t bElems,
                                      uint32_t cElems, uint32_t bIsNk, uint32_t variant);
