@@ -73,6 +73,8 @@ struct FusedRun {
   size_t untouched = 0;
   uint64_t fnv1a = 0;
   double host_s = 0.0;
+  // Raw-query runs only: fp32 words of the in-launch rotation that differ from the rotate_q launch's.
+  size_t prologue_mismatches = 0;
 };
 
 inline double FusedCosine(const std::vector<float>& a, const std::vector<float>& b) {
@@ -153,28 +155,38 @@ class FusedCubeScenario {
   }
 
   FusedRun RunFused(const FusedDecodeGrid& grid) {
-    const int64_t d = shape_.head_size;
-    DeviceBuffer workspace = DeviceBuffer::Empty<float>(grid.workspace_floats);
-    FusedRun run;
-    run.num_splits = grid.num_splits;
-    run.block_dim = grid.block_dim;
-    run.heads_per_task = grid.heads_per_task;
-    run.fused_context_limit = grid.fused_context_limit;
-    run.launches = 1;
-    PoisonOutput();
-    const float inv_sqrt_len = 1.0f / std::sqrt(static_cast<float>(d));
-    const auto start = std::chrono::steady_clock::now();
-    turboquant_mm_fused_decode_impl(
-        static_cast<int32_t>(kFusedMode), AscendType::FP16, stream_, grid.block_dim, query_rot_.get(),
-        key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
-        mode_tables_.get(), workspace.get(), out_.get(), 1, static_cast<uint32_t>(shape_.num_heads),
-        static_cast<uint32_t>(shape_.num_kv_heads), static_cast<uint32_t>(d),
-        static_cast<uint32_t>(shape_.block_size), static_cast<uint32_t>(blocks_per_seq_),
-        static_cast<uint32_t>(grid.num_splits), grid.heads_per_task, grid.tasks_per_block,
-        grid.reduce_tasks_per_block, grid.fused_context_limit, scale_, inv_sqrt_len);
-    ACL_CHECK(aclrtSynchronizeStream(stream_));
-    run.host_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    Collect(&run);
+    return Launch(grid, [&](void* workspace, float inv_sqrt_len) {
+      turboquant_mm_fused_decode_impl(
+          static_cast<int32_t>(kFusedMode), AscendType::FP16, stream_, grid.block_dim, query_rot_.get(),
+          key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
+          mode_tables_.get(), workspace, out_.get(), 1, static_cast<uint32_t>(shape_.num_heads),
+          static_cast<uint32_t>(shape_.num_kv_heads), static_cast<uint32_t>(shape_.head_size),
+          static_cast<uint32_t>(shape_.block_size), static_cast<uint32_t>(blocks_per_seq_),
+          static_cast<uint32_t>(grid.num_splits), grid.heads_per_task, grid.tasks_per_block,
+          grid.reduce_tasks_per_block, grid.fused_context_limit, scale_, inv_sqrt_len);
+    });
+  }
+
+  // The same grid through the raw-query decode: the launch is handed the fp16 query and rotates it itself,
+  // into a fresh buffer that is then compared word for word with what rotate_q wrote at setup.
+  FusedRun RunFusedRawQuery(const FusedDecodeGrid& grid) {
+    DeviceBuffer rotated = DeviceBuffer::FromHost(std::vector<float>(query_rot_host_.size(), kFusedOutputSentinel));
+    FusedRun run = Launch(grid, [&](void* workspace, float inv_sqrt_len) {
+      turboquant_mm_fused_decode_raw_query_impl(
+          static_cast<int32_t>(kFusedMode), AscendType::FP16, stream_, grid.block_dim, query_.get(), pi_signs_.get(),
+          rot_tables_.get(), rotated.get(), key_cache_.get(), value_cache_.get(), scale_plane_.get(),
+          block_tables_.get(), context_lens_.get(), mode_tables_.get(), workspace, out_.get(), 1,
+          static_cast<uint32_t>(shape_.num_heads), static_cast<uint32_t>(shape_.num_kv_heads),
+          static_cast<uint32_t>(shape_.head_size), static_cast<uint32_t>(shape_.block_size),
+          static_cast<uint32_t>(blocks_per_seq_), static_cast<uint32_t>(grid.num_splits), grid.heads_per_task,
+          grid.tasks_per_block, grid.reduce_tasks_per_block, grid.prologue_vectors_per_block,
+          grid.fused_context_limit, scale_, inv_sqrt_len);
+    });
+    const std::vector<float> in_launch = rotated.ToHost<float>();
+    for (size_t i = 0; i < query_rot_host_.size(); ++i) {
+      run.prologue_mismatches +=
+          (i >= in_launch.size() || std::memcmp(&in_launch[i], &query_rot_host_[i], sizeof(float)) != 0) ? 1u : 0u;
+    }
     return run;
   }
 
@@ -316,6 +328,26 @@ class FusedCubeScenario {
         }
       }
     }
+  }
+
+  // One timed launch over `grid`: a fresh workspace, a poisoned output, then `launch(workspace, 1 / sqrt(D))`.
+  template <typename LaunchFn>
+  FusedRun Launch(const FusedDecodeGrid& grid, LaunchFn&& launch) {
+    DeviceBuffer workspace = DeviceBuffer::Empty<float>(grid.workspace_floats);
+    FusedRun run;
+    run.num_splits = grid.num_splits;
+    run.block_dim = grid.block_dim;
+    run.heads_per_task = grid.heads_per_task;
+    run.fused_context_limit = grid.fused_context_limit;
+    run.launches = 1;
+    PoisonOutput();
+    const float inv_sqrt_len = 1.0f / std::sqrt(static_cast<float>(shape_.head_size));
+    const auto start = std::chrono::steady_clock::now();
+    launch(workspace.get(), inv_sqrt_len);
+    ACL_CHECK(aclrtSynchronizeStream(stream_));
+    run.host_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    Collect(&run);
+    return run;
   }
 
   void PoisonOutput() {

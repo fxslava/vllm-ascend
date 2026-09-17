@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// The fused single-launch Cube decode (TURBOQUANT_TESTS.md 13.25), kv4fp8, on six shapes (D 256 unless noted):
+// The fused single-launch Cube decode (TURBOQUANT_TESTS.md 13.25), kv4fp8, on seven cases (D 256 unless noted):
 //
 //   (a) H_Q 4,  H_KV 2, S 64,  block 64   one tile
 //   (b) H_Q 4,  H_KV 2, S 256, block 64   four tiles in one task: the L1 slot ring and its free edge
@@ -23,6 +23,9 @@
 //   (e) (a) with its cache written by the kv4fp8 kernel writer (13.28) instead of uploaded
 //   (f) H_Q 4,  H_KV 1, D 128, S 64,  block 64   Qwen3.5's 4:1 group at D = 128: a smoke of the D = 128 Cube
 //       fractals (4 C0 groups per row) ahead of the silicon bench (13.31)
+//   (g) (c) through the raw-query entry (PRE_ROTATED = false): the launch rotates the fp16 query itself, once
+//       per vector ahead of the four splits, and must land on (c)'s golden with a rotation bit-identical to
+//       rotate_q's (13.33)
 //
 // Each fused output is hashed (FNV-1a over its half bit patterns) against a golden, and its cosine against
 // exact fp32 attention must not regress. The goldens are the bit-exact reference: the barriered A/B instance
@@ -120,6 +123,10 @@ const FusedCase kCaseE = {"(e)", Shape(kNarrowGroupHeads, kSingleTileContext, tr
 // Recorded 2026-09-17 on the same camodel from 539d4ab63 plus this case (TURBOQUANT_TESTS.md 13.32).
 const FusedCase kCaseF = {"(f)", Shape(kNarrowGroupHeads, kSingleTileContext, false, kQwenKvHeads, kQwenHeadSize), 0,
                           kFillBlocks, 0.999543, 0xedc60ea1714295f1ull};
+// (c)'s grid and golden: the in-launch AIV rotation runs the same ApplyPi as rotate_q's AIV path, which is the
+// path rotate_q takes for four vectors, so nothing downstream of the query may move.
+const FusedCase kCaseG = {"(g)", kCaseC.shape, kCaseC.plan_aiv, kCaseC.split_policy, kCaseC.recorded_cosine,
+                          kCaseC.golden};
 
 void PrintShape(const FusedCase& fused_case, int64_t aiv_num, bool queried) {
   const tqh::FusedShape& shape = fused_case.shape;
@@ -141,14 +148,15 @@ void PrintRun(const char* tag, const char* label, const tqh::FusedRun& run, cons
               static_cast<unsigned long long>(run.fnv1a), tqh::FusedCosine(run.output, reference), run.host_s);
 }
 
-// Runs a case through the fused kernel and checks what every case shares. Returns the fused run.
+// Runs a case through the fused kernel (the raw-query entry when raw_query) and checks what every case shares.
+// Returns the fused run.
 tqh::FusedRun RunCase(tqh::FusedCubeScenario* scenario, const FusedCase& fused_case, LaunchWatchdog* watchdog,
-                      const std::vector<float>& reference) {
+                      const std::vector<float>& reference, bool raw_query = false) {
   const tqh::FusedDecodeGrid grid = scenario->Plan(fused_case.plan_aiv, fused_case.split_policy);
   const std::string tag(fused_case.tag);
 
-  watchdog->Arm(tag + " turboquant_mm_fused_decode_impl");
-  const tqh::FusedRun fused = scenario->RunFused(grid);
+  watchdog->Arm(tag + (raw_query ? " turboquant_mm_fused_decode_raw_query_impl" : " turboquant_mm_fused_decode_impl"));
+  const tqh::FusedRun fused = raw_query ? scenario->RunFusedRawQuery(grid) : scenario->RunFused(grid);
   watchdog->Disarm();
   PrintRun(fused_case.tag, "fused", fused, reference);
 
@@ -279,6 +287,21 @@ TEST_F(TurboQuantFusedDecode, DecodesHeadSize128OnAQwenGroup) {
   EXPECT_GE(tqh::FusedCosine(fused.output, reference), kHeadSize128CosineFloor)
       << "(f) the D = 128 Cube decode does not reproduce exact attention";
   ExpectNoExceptionDumps(kCaseF.tag);
+}
+
+TEST_F(TurboQuantFusedDecode, RotatesARawQueryOnceAheadOfItsSplits) {
+  PrintShape(kCaseG, aiv_num_, queried_);
+  watchdog_.Arm("(g) scenario setup and query rotation");
+  tqh::FusedCubeScenario scenario(kCaseG.shape, stream_, aiv_num_);
+  watchdog_.Disarm();
+
+  const tqh::FusedRun fused = RunCase(&scenario, kCaseG, &watchdog_, scenario.Reference(), true);
+  std::printf("[ fused ] (g) in-launch rotation: %zu of %lld fp32 words differ from rotate_q\n",
+              fused.prologue_mismatches, static_cast<long long>(kCaseG.shape.num_heads * kCaseG.shape.head_size));
+  EXPECT_GT(fused.num_splits, 1) << "(g) must rotate once ahead of more than one split";
+  EXPECT_EQ(fused.fused_context_limit, 0u) << "(g) must reduce its splits in the launch";
+  EXPECT_EQ(fused.prologue_mismatches, 0u) << "the in-launch rotation differs from rotate_q's";
+  ExpectNoExceptionDumps(kCaseG.tag);
 }
 
 }

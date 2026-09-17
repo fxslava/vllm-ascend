@@ -53,6 +53,7 @@ using vllm_ascend::turboquant::TurboQuantCubeMm;
 using vllm_ascend::turboquant::TurboQuantMode;
 using vllm_ascend::turboquant::TurboQuantModeCodec;
 using vllm_ascend::turboquant::TurboQuantPartialReducer;
+using vllm_ascend::turboquant::TurboQuantQueryPrologue;
 using vllm_ascend::turboquant::TurboQuantTaskHeads;
 using vllm_ascend::turboquant::TurboQuantVectorDecodeService;
 
@@ -258,7 +259,11 @@ private:
 // subcore runs the online softmax for its half of the heads (TurboQuantVectorDecodeService). A token
 // whose context fits fusedContextLimit writes its output straight to GM; a longer one leaves
 // partials that the same launch reduces after AscendC::SyncAll.
-template <TurboQuantMode MODE, typename scalar_t>
+//
+// PRE_ROTATED is where Pi q happens. true: the caller hands in the rotated fp32 query (rotate_q, or an
+// upstream fusion) and the launch has no rotation code or buffer at all. false: the caller hands in the raw
+// query and RotateQuery() rotates every vector once, in UB, before Process() starts the task loop.
+template <TurboQuantMode MODE, typename scalar_t, bool PRE_ROTATED = true>
 class TurboQuantFusedDecode {
 public:
     using Mm = TurboQuantCubeMm<MODE>;
@@ -266,6 +271,7 @@ public:
     using Vector = TurboQuantVectorDecodeService<MODE, scalar_t, Mm, Codec>;
     using Cube = TurboQuantCubeDecodeService<MODE>;
     using Reducer = TurboQuantPartialReducer<scalar_t>;
+    using Prologue = TurboQuantQueryPrologue<scalar_t, !PRE_ROTATED>;
 
     __aicore__ inline explicit TurboQuantFusedDecode(AscendC::TPipe *pipe) : pipe_(pipe) {}
 
@@ -303,6 +309,16 @@ public:
                      numKvHeads, headSize, blockSize, numSplits, scale, invSqrtLen);
         // Init boundary: drains every pipe before the first task's GM reads and cross-core flags.
         AscendC::PipeBarrier<PIPE_ALL>();
+    }
+
+    // The raw-query prologue: queryRot, the buffer Init() pointed the tasks at, is where the rotation lands.
+    // After Init(), before Process().
+    __aicore__ inline void RotateQuery(__gm__ void *query, __gm__ void *piSigns, __gm__ void *rotTables,
+                                       __gm__ void *queryRot, const uint32_t vectorsPerBlock, const float invSqrtLen)
+    {
+        static_assert(Prologue::kEnabled, "a pre-rotated decode has no query rotation");
+        prologue_.Init(pipe_, query, piSigns, rotTables, queryRot, headSize_, invSqrtLen);
+        prologue_.Rotate(numTokens_ * numHeads_, vectorsPerBlock);
     }
 
     __aicore__ inline void Process(const uint32_t tasksPerBlock)
@@ -610,6 +626,8 @@ private:
     uint32_t maxBlocksPerSeq_ = 0;
     uint32_t numSplits_ = 1;
     uint32_t fusedContextLimit_ = 0;
+    // Last, so a pre-rotated decode's members keep their offsets; empty when PRE_ROTATED.
+    Prologue prologue_;
 };
 
 class TurboQuantCubeGemmProbe {
@@ -726,6 +744,34 @@ private:
         }                                                                                                            \
     }
 
+// The raw-query decode: query is the unrotated scalar_t query and queryRot the fp32 buffer the prologue
+// rotates it into, sized like a pre-rotated decode's query.
+#define ASCEND_TQ_DECLARE_MM_FUSED_DECODE_RAW_QUERY(NAME, MODE, TYPE)                                                \
+    extern "C" __global__ __aicore__ void NAME(                                                                      \
+        GM_ADDR query, GM_ADDR piSigns, GM_ADDR rotTables, GM_ADDR queryRot, GM_ADDR keyCache, GM_ADDR valueCache,   \
+        GM_ADDR scaleCache, GM_ADDR blockTables, GM_ADDR contextLens, GM_ADDR modeTables, GM_ADDR workspace,         \
+        GM_ADDR output, uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize,               \
+        uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t headsPerTask,                     \
+        uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock, uint32_t prologueVectorsPerBlock,                      \
+        uint32_t fusedContextLimit, float scale, float invSqrtLen)                                                   \
+    {                                                                                                                \
+        AscendC::TPipe pipe;                                                                                         \
+        TurboQuantFusedDecode<MODE, TYPE, false> op(&pipe);                                                          \
+        op.Init(queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output, \
+                numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,      \
+                fusedContextLimit, scale, invSqrtLen);                                                               \
+        op.RotateQuery(query, piSigns, rotTables, queryRot, prologueVectorsPerBlock, invSqrtLen);                    \
+        op.Process(tasksPerBlock);                                                                                   \
+        if (op.NeedsReduction()) {                                                                                   \
+            AscendC::SyncAll<false>();                                                                               \
+            if ASCEND_IS_AIV {                                                                                       \
+                TurboQuantPartialReducer<TYPE> reducer(&pipe);                                                       \
+                reducer.Init(workspace, output, numHeads, headSize, numSplits);                                      \
+                op.Reduce(reducer, reduceTasksPerBlock);                                                             \
+            }                                                                                                        \
+        }                                                                                                            \
+    }
+
 #define ASCEND_TQ_DECLARE_MM_MODE(MODE_NAME, MODE)                                                                   \
     ASCEND_TQ_DECLARE_MM_RESHAPE_AND_CACHE(MODE_NAME, MODE, half)                                                    \
     ASCEND_TQ_DECLARE_MM_FUSED_DECODE(turboquant_mm_fused_decode_##MODE_NAME##_half, MODE, half)
@@ -733,8 +779,12 @@ private:
 ASCEND_TQ_DECLARE_MM_MODE(kv3fp4, TurboQuantMode::KV3_FP4)
 ASCEND_TQ_DECLARE_MM_MODE(kv4fp8, TurboQuantMode::KV4_FP8)
 ASCEND_TQ_DECLARE_MM_MODE(kv5fp8, TurboQuantMode::KV5_FP8)
+// kv4fp8 only: the one mode the fused decode is validated in (TURBOQUANT_TESTS.md 13.25).
+ASCEND_TQ_DECLARE_MM_FUSED_DECODE_RAW_QUERY(turboquant_mm_fused_decode_raw_query_kv4fp8_half, TurboQuantMode::KV4_FP8,
+                                            half)
 
 #undef ASCEND_TQ_DECLARE_MM_MODE
+#undef ASCEND_TQ_DECLARE_MM_FUSED_DECODE_RAW_QUERY
 #undef ASCEND_TQ_DECLARE_MM_FUSED_DECODE
 #undef ASCEND_TQ_DECLARE_MM_RESHAPE_AND_CACHE
 
@@ -809,6 +859,27 @@ void turboquant_mm_fused_decode_impl(int32_t mode, AscendType type, void *stream
                 tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen);
             break;
     }
+}
+
+void turboquant_mm_fused_decode_raw_query_impl(int32_t mode, AscendType type, void *stream, uint32_t blockDim,
+                                              void *query, void *piSigns, void *rotTables, void *queryRot,
+                                              void *keyCache, void *valueCache, void *scaleCache, void *blockTables,
+                                              void *contextLens, void *modeTables, void *workspace, void *output,
+                                              uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads,
+                                              uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,
+                                              uint32_t numSplits, uint32_t headsPerTask, uint32_t tasksPerBlock,
+                                              uint32_t reduceTasksPerBlock, uint32_t prologueVectorsPerBlock,
+                                              uint32_t fusedContextLimit, float scale, float invSqrtLen)
+{
+    if (type != AscendType::FP16 || blockDim == 0 ||
+        static_cast<turboquant::TurboQuantMode>(mode) != turboquant::TurboQuantMode::KV4_FP8) {
+        return;
+    }
+    turboquant_mm_fused_decode_raw_query_kv4fp8_half<<<blockDim, nullptr, stream>>>(
+        query, piSigns, rotTables, queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables,
+        workspace, output, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,
+        headsPerTask, tasksPerBlock, reduceTasksPerBlock, prologueVectorsPerBlock, fusedContextLimit, scale,
+        invSqrtLen);
 }
 
 void turboquant_cube_gemm_probe_impl(void *stream, void *a, void *b, void *c, uint32_t m, uint32_t k, uint32_t n,

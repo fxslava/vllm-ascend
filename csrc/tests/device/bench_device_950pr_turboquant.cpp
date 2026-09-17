@@ -61,6 +61,7 @@ using tqa::Models;
 using tqa::PathLabel;
 using tqa::PathMode;
 using tqa::PrefillChunk;
+using tqa::PrefillChunkTokens;
 using tqa::SelectPath;
 
 constexpr int64_t kBlockSize = s950::kDefaultBlockSize;
@@ -203,14 +204,6 @@ struct Config {
     name << model.key << "_s" << seq_len << "_b" << batch;
     return name.str();
   }
-  std::string context_label() const {
-    std::ostringstream text;
-    text << seq_len;
-    if (chunk < seq_len) {
-      text << '/' << chunk;
-    }
-    return text.str();
-  }
 };
 
 std::vector<Config> BuildSweep() {
@@ -293,6 +286,12 @@ struct Traffic {
   double compression_ratio() const { return tq_kv_bytes > 0.0 ? fp16_kv_bytes / tq_kv_bytes : 0.0; }
   double saved_mib() const { return (fp16_kv_bytes - tq_kv_bytes) / kMiB; }
 };
+
+// The benchmarked slice (config.model.num_kv_heads kv heads of one layer) scaled to the full model's residency.
+double FullModelSavedMib(const Config& config, const Traffic& traffic) {
+  return traffic.saved_mib() * static_cast<double>(config.model.kv_layers * config.model.model_kv_heads) /
+         static_cast<double>(config.model.num_kv_heads);
+}
 
 Traffic ModelTraffic(const Config& config, int64_t num_splits) {
   const double d = static_cast<double>(config.model.head_size);
@@ -1210,12 +1209,14 @@ void PrintTableA(const std::vector<BenchmarkRunner*>& runners, const std::vector
   std::printf("[ascend-bench] device time from ACL events, median us per step; native operator: %s\n",
               fia_operator.c_str());
   std::printf("[ascend-bench] TQ_E2E = T_rot_q + T_attn_core + T_rot_o, measured as ONE composite region\n");
-  std::printf("[ascend-bench] Context S/C means a chunked step: C query tokens against an S-token prefix\n\n");
+  std::printf("[ascend-bench] Context is the prefix S; every prefill step is chunked: min(S, %lld) query tokens "
+              "against it (ASCEND_BENCH_TQ_AUDIT_CHUNK)\n\n",
+              static_cast<long long>(PrefillChunkTokens()));
 
   char header[512];
   const int header_width =
       std::snprintf(header, sizeof(header), "  %-17s %13s %3s %9s %4s | %11s %10s %12s %10s %11s %11s | %8s %10s %12s",
-                    "Model", "Context (S)", "B", "H_Q/H_KV", "D", "TQ Ingest", "T_rot_q", "T_attn_core", "T_rot_o",
+                    "Model", "Context", "B", "H_Q/H_KV", "D", "TQ Ingest", "T_rot_q", "T_attn_core", "T_rot_o",
                     "TQ_E2E", "V5_Native", "Speedup", "HBM GB/s", "KV Saved MB");
   PrintHeaderAndRule(header, header_width);
 
@@ -1231,7 +1232,7 @@ void PrintTableA(const std::vector<BenchmarkRunner*>& runners, const std::vector
     any = true;
     std::ostringstream heads;
     heads << config.model.num_heads << '/' << config.model.num_kv_heads;
-    std::printf("  %-17s %13s %3lld %9s %4lld |", config.model.label, config.context_label().c_str(),
+    std::printf("  %-17s %13lld %3lld %9s %4lld |", config.model.label, static_cast<long long>(config.seq_len),
                 static_cast<long long>(config.batch), heads.str().c_str(),
                 static_cast<long long>(config.model.head_size));
     PrintUs(row.ingest, 11);
@@ -1243,7 +1244,7 @@ void PrintTableA(const std::vector<BenchmarkRunner*>& runners, const std::vector
     std::printf(" |");
     PrintRatio(row.speedup, 8);
     PrintDouble(row.gigabytes_per_second, 10, 1);
-    PrintDouble(traffic[index].saved_mib(), 12, 1);
+    PrintDouble(FullModelSavedMib(config, traffic[index]), 12, 1);
     std::printf("\n");
 
     if (row.e2e.present && row.sum_of_parts_us > 0.0) {
@@ -1262,7 +1263,13 @@ void PrintTableA(const std::vector<BenchmarkRunner*>& runners, const std::vector
               "[ascend-bench]   absorbs the de-rotation offline. Qwen3.5 cannot fold -- attn_output_gate sits\n"
               "[ascend-bench]   between attention and o_proj -- so its column is a measured kernel.\n");
   std::printf("[ascend-bench]   HBM GB/s is the pipeline's compulsory traffic over its measured composite time.\n"
-              "[ascend-bench]   KV Saved MB is the whole batch's context: fp16 residency minus TurboQuant's.\n");
+              "[ascend-bench]   KV Saved MB is the whole batch's context over the whole model: fp16 residency minus\n"
+              "[ascend-bench]   TurboQuant's for the benchmarked kv head, times KV layers x cached heads per layer\n"
+              "[ascend-bench]   (config.json; hybrid linear-attention layers keep no KV, an MLA latent is one slot):\n");
+  for (const ModelSpec& model : Models()) {
+    std::printf("[ascend-bench]     %-17s %lld KV layers x %lld kv heads\n", model.label,
+                static_cast<long long>(model.kv_layers), static_cast<long long>(model.model_kv_heads));
+  }
   if (!residuals.empty()) {
     std::printf("[ascend-bench]   composite vs sum-of-parts: median gap %.1f%% over %zu rows. That gap is the\n"
                 "[ascend-bench]   launch overhead between stages, which the per-component columns cannot show.\n",

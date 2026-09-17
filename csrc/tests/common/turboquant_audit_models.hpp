@@ -48,6 +48,10 @@ struct ModelSpec {
   int64_t num_kv_heads;
   bool folds_output;
   const char* note;
+  // Full-model KV residency, from the checkpoint's config.json: the layers that keep a KV cache (hybrid
+  // linear-attention layers keep none) and the cached heads per layer (an MLA latent is one slot).
+  int64_t kv_layers;
+  int64_t model_kv_heads;
 };
 
 inline int64_t GlmHeadSize() {
@@ -64,11 +68,13 @@ inline std::vector<ModelSpec> Models() {
   return {
       ModelSpec{"qwen35", "Qwen3.5-9B", 128, 4, 1, false,
                 "attn_output_gate: sigmoid(gate) * context sits between attention and o_proj, "
-                "so W_o cannot absorb Pi and the O de-rotation is measured"},
+                "so W_o cannot absorb Pi and the O de-rotation is measured",
+                8, 4},
       ModelSpec{"dsv4", "DeepSeek-V4-Flash", 256, 16, 1, true,
-                "MLA, decoupled latent KV; one 16:1 group is one 16-row Cube task; W_o folded offline"},
+                "MLA, decoupled latent KV; one 16:1 group is one 16-row Cube task; W_o folded offline",
+                43, 1},
       ModelSpec{"glm52", "GLM-5.2-744B", GlmHeadSize(), 8, 1, true,
-                "ultra-wide GQA; W_o folded offline"},
+                "ultra-wide GQA; W_o folded offline", 78, 1},
   };
 }
 
@@ -91,10 +97,9 @@ inline PathMode SelectPath(const ModelSpec& model) {
   return PathMode::kCube;
 }
 
-inline int64_t PrefillChunk(int64_t seq_len) {
-  const int64_t chunk = EnvInt64("ASCEND_BENCH_TQ_AUDIT_CHUNK", kPrefillChunkTokens, 1);
-  return std::min(seq_len, chunk);
-}
+inline int64_t PrefillChunkTokens() { return EnvInt64("ASCEND_BENCH_TQ_AUDIT_CHUNK", kPrefillChunkTokens, 1); }
+
+inline int64_t PrefillChunk(int64_t seq_len) { return std::min(seq_len, PrefillChunkTokens()); }
 
 }
 }

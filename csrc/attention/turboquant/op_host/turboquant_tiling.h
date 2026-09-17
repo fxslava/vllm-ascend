@@ -79,6 +79,8 @@ struct FusedDecodeGrid {
     uint32_t tasks_per_block = 0;
     uint32_t reduce_tasks_per_block = 0;
     uint32_t heads_per_task = 0;
+    // The raw-query decode's prologue: query vectors (tokens x heads) each MIX block rotates.
+    uint32_t prologue_vectors_per_block = 0;
     uint32_t fused_context_limit = kFusedContextLimit;
     int64_t num_splits = 1;
     int64_t num_tasks = 0;

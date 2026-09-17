@@ -3945,3 +3945,46 @@ before any golden exists.
 
 **Not covered:** the kv4fp8 kernel writer at D = 128 (64 B per kv head); split reduction, tail masks and
 wider groups at D = 128; GLM-5.2's 8:1 group. Run with `build/nz_runs.sh <tag> <snap> f`.
+
+### 13.33 PRE_ROTATED: the raw-query prologue, and full-model KV Saved MB (2026-09-17)
+
+`TurboQuantFusedDecode<MODE, scalar_t, PRE_ROTATED = true>` now says where Pi q happens.
+
+- **`PRE_ROTATED = true`** (every existing entry point). The caller hands in the rotated fp32 query, as before.
+  The prologue member is the empty specialisation of `TurboQuantQueryPrologue`, declared last so no other
+  member moves. It allocates no UB and issues no instruction. Cases (a)-(f) reproduce every golden unchanged.
+- **`PRE_ROTATED = false`** (`turboquant_mm_fused_decode_raw_query_kv4fp8_half`, kv4fp8 only). The launch is
+  handed the fp16 query, Pi signs and rotation tables. `RotateQuery()` runs after `Init()` and before
+  `Process()`. Each MIX block's two subcores take contiguous halves of `[block * v, (block + 1) * v)` query
+  vectors (`FusedDecodeGrid::prologue_vectors_per_block`). Each vector is read from GM, rotated in UB with
+  `TurboQuantCodec4::ApplyPi`, the same body as rotate_q's AIV path, and written as fp32 into the buffer the
+  tasks read. One `SyncAll` then drains every core, so no split task on another block can read an unwritten
+  vector. The rotation therefore runs once per (token, head), not once per split. That matters because
+  `kFillBlocks` gives 4 splits at B = 1.
+- The prologue adds about 24 KB of UB at D = 256: the codec's tables and work area plus 3.6 KB of its own.
+  It is allocated after the decode's buffers, so the decode's UB layout does not move.
+
+**Case (g)** `RotatesARawQueryOnceAheadOfItsSplits` runs (c)'s grid (S 256, 4 splits, 8 blocks, fused limit 0,
+in-launch reduction) through the raw-query entry. Camodel, one process each, against a clean `-Werror` sim tier:
+
+| case | golden | cos vs fp32 | notes |
+|---|---|---|---|
+| (a) | `0x6176461416358ec1` | 0.999407 | 76 s |
+| (b) / (c) | `0x470dad36e6708da5` / `0xda6a2c77e20ff4a1` | 0.999400 / 0.999400 | 260 s |
+| (d) | `0xcc1fcdfed39b48e5` | 0.999517 | 112 s |
+| (e) | `0x9ffe02efde1506cf` | 0.999576 | written cache 0 of 131,072 bytes differ; 505 s |
+| (f) | `0xedc60ea1714295f1` | 0.999543 | 66 s |
+| (g) | `0xda6a2c77e20ff4a1` (= (c)) | 0.999400 | in-launch rotation 0 of 1,024 fp32 words differ from rotate_q; 148 s |
+
+Every run left 0 B of exception dumps. Run (g) with `build/nz_runs.sh <tag> <build> g`, or all seven with `ag`.
+
+**Not covered:** the raw-query entry at D = 128, at B > 1 and on bf16; no camodel span A/B of the prologue
+against a separate rotate_q launch (the launch-dispatch saving it exists for is a silicon number); no Python
+or adapter wiring, since the shipping `npu_turboquant_paged_attention` still takes the pre-rotated query.
+
+**Bench (`bench_device_950pr_turboquant`, Table A).** The Context column prints S alone. The chunk C
+(`ASCEND_BENCH_TQ_AUDIT_CHUNK`) moved to the legend. KV Saved MB is now whole-model: the benchmarked kv head's
+saving times `kv_layers x model_kv_heads / num_kv_heads`, from each checkpoint's config.json. Qwen3.5-9B has
+32 layers, but only 8 are full attention, with H_KV 4. DeepSeek-V4-Flash has 43 layers and H_KV 1.
+GLM-5.2 has 78 layers of MLA, and its latent counts as one slot. The legend prints the factors. The CSV
+`kv_saved_mib` keeps the per-slice value. Only the npu tier compiled this; no silicon run exists.

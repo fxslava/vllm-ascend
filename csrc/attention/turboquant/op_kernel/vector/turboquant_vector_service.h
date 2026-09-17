@@ -19,6 +19,7 @@
 //   TurboQuantTileBurst            DMA: one tile of a row-major packed cache in wide GM bursts (>= 128 B)
 //   WriteNormalizedHeads           online softmax close-out: 1 / (sum + eps), cast, direct GM write
 //   TurboQuantPartialReducer       the in-launch reduction of per-split partials (context > 4096)
+//   TurboQuantQueryPrologue        the in-launch Pi rotation of a raw query, once per vector, before the tasks
 //   TurboQuantVectorDecodeService  the AIV half of the Cube decode: query and KV staging into L1,
 //                                  the online softmax over the Cube's score rows, the accumulation
 //
@@ -243,6 +244,102 @@ private:
     uint32_t headSize_ = 0;
     uint32_t numSplits_ = 1;
     uint32_t partialStride_ = 0;
+};
+
+// ----------------------------------------------------------------------------------------------------
+// In-launch query rotation prologue
+// ----------------------------------------------------------------------------------------------------
+
+// Pi q = D H D q for a decode that is handed the raw query: every (token, head) vector once, ahead of the
+// task loop, however many splits later read it. The block's vector range is halved between its two
+// subcores; each vector is read from GM, rotated in UB with the same ApplyPi the AIV rotate_q runs, and
+// written as fp32 where a pre-rotated decode reads its query. The disabled specialisation is empty: a
+// pre-rotated decode allocates no rotation buffer and issues no rotation instruction.
+template <typename scalar_t, bool ENABLED>
+class TurboQuantQueryPrologue {
+public:
+    static constexpr bool kEnabled = true;
+
+    // Call after the decode's own buffers: the UB layout is allocation order, and the decode's must not move.
+    __aicore__ inline void Init(AscendC::TPipe *pipe, __gm__ void *query, __gm__ void *piSigns,
+                                __gm__ void *rotTables, __gm__ void *queryRot, const uint32_t headSize,
+                                const float invSqrtLen)
+    {
+        headSize_ = headSize;
+        queryGm_.SetGlobalBuffer(reinterpret_cast<__gm__ scalar_t *>(query));
+        piSignsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(piSigns), headSize_);
+        rotTablesGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(rotTables));
+        queryRotGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(queryRot));
+
+        pipe->InitBuffer(queryInBuf_, headSize_ * sizeof(scalar_t));
+        pipe->InitBuffer(workBuf_, 2 * headSize_ * sizeof(float));
+        pipe->InitBuffer(signBuf_, headSize_ * sizeof(float));
+        codec_.Init(pipe, headSize_, 1, invSqrtLen, rotTablesGm_);
+
+        AscendC::DataCopy(signBuf_.Get<float>(), piSignsGm_, headSize_);
+        // Init hand-off: the signs land in UB before the first rotation.
+        AscendC::PipeBarrier<PIPE_ALL>();
+    }
+
+    // Rotates this subcore's half of the block's share of the numVectors query vectors, then drains every
+    // core so no task reads a rotated vector another block has not yet written.
+    __aicore__ inline void Rotate(const uint32_t numVectors, const uint32_t vectorsPerBlock)
+    {
+        if ASCEND_IS_AIV {
+            const uint32_t start = MixBlockIdx() * vectorsPerBlock;
+            uint32_t end = start + vectorsPerBlock;
+            if (end > numVectors) {
+                end = numVectors;
+            }
+            if (start < end) {
+                const uint32_t firstHalf = CeilDiv(end - start, kVectorSubcoresPerBlock);
+                const bool secondSubcore = AscendC::GetSubBlockIdx() != 0;
+                const uint32_t from = secondSubcore ? start + firstHalf : start;
+                const uint32_t to = secondSubcore ? end : start + firstHalf;
+                for (uint32_t vector = from; vector < to; ++vector) {
+                    RotateVector(vector);
+                }
+            }
+        }
+        AscendC::SyncAll<false>();
+    }
+
+private:
+    __aicore__ inline void RotateVector(const uint32_t vector)
+    {
+        const AscendC::LocalTensor<scalar_t> queryIn = queryInBuf_.Get<scalar_t>();
+        const AscendC::LocalTensor<float> work = workBuf_.Get<float>();
+        const AscendC::LocalTensor<float> x = work;
+        const AscendC::LocalTensor<float> tmp = work[headSize_];
+        const uint64_t elem = static_cast<uint64_t>(vector) * headSize_;
+
+        AscendC::DataCopy(queryIn, queryGm_[elem], headSize_);
+        SyncMte2ToVector();
+        AscendC::Cast(x, queryIn, AscendC::RoundMode::CAST_NONE, headSize_);
+
+        codec_.ApplyPi(x, tmp, signBuf_.Get<float>(), headSize_);
+
+        SyncVectorToMte3();
+        AscendC::DataCopy(queryRotGm_[elem], x, headSize_);
+        SyncEvent<AscendC::HardEvent::MTE3_MTE2>();
+        SyncMte3ToVector();
+    }
+
+    TurboQuantCodec4 codec_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> queryInBuf_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> workBuf_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> signBuf_;
+    AscendC::GlobalTensor<scalar_t> queryGm_;
+    AscendC::GlobalTensor<float> piSignsGm_;
+    AscendC::GlobalTensor<int32_t> rotTablesGm_;
+    AscendC::GlobalTensor<float> queryRotGm_;
+    uint32_t headSize_ = 0;
+};
+
+template <typename scalar_t>
+class TurboQuantQueryPrologue<scalar_t, false> {
+public:
+    static constexpr bool kEnabled = false;
 };
 
 // ----------------------------------------------------------------------------------------------------

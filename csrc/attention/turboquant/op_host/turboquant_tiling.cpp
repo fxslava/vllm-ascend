@@ -160,6 +160,7 @@ FusedDecodeGrid PlanFusedDecode(int64_t num_tokens, int64_t num_heads, int64_t n
     grid.num_tasks = tasks;
     grid.tasks_per_block = static_cast<uint32_t>(tasks_per_block);
     grid.block_dim = static_cast<uint32_t>(block_dim);
+    grid.prologue_vectors_per_block = static_cast<uint32_t>(CeilDiv64(num_tokens * num_heads, block_dim));
     if (num_splits > 1) {
         const int64_t reduce_tasks = num_tokens * num_heads;
         grid.reduce_tasks_per_block = static_cast<uint32_t>(CeilDiv64(reduce_tasks, block_dim));

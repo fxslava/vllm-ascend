@@ -96,6 +96,9 @@ TEST(TurboQuantTiling, FusedDecodeTasksCoverEveryHeadOnTheCubeFractal) {
               ASSERT_EQ(grid.num_tasks, tokens * kv_heads * grid.num_splits * chunks) << where;
               ASSERT_GE(static_cast<int64_t>(grid.block_dim) * grid.tasks_per_block, grid.num_tasks) << where;
               ASSERT_LE(static_cast<int64_t>(grid.block_dim), mix_blocks) << where;
+              // The raw-query prologue rotates [block * per_block, (block + 1) * per_block) on each block.
+              ASSERT_GE(static_cast<int64_t>(grid.block_dim) * grid.prologue_vectors_per_block, tokens * heads)
+                  << where;
               ASSERT_GE(grid.num_splits, 1) << where;
               ASSERT_LE(grid.num_splits, std::min<int64_t>(blocks, tqt::kMaxSequenceSplits)) << where;
               if (grid.num_splits > 1) {
