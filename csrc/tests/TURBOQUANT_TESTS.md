@@ -3931,3 +3931,17 @@ on the camodel's `aiv_instr` (`build/nz_profile.py`):
 
 **Results.** host / sim / npu clean under `-Werror` with unchanged target sets. Fused (a)-(e) pass: goldens,
 (c) vs (b), (e) 0 of 131,072 written bytes differ, 0 B exception dumps.
+
+### 13.32 Fused case (f): D = 128 on the Cube (2026-09-17)
+
+`DecodesHeadSize128OnAQwenGroup` covers Qwen3.5's shape: H_Q 4, H_KV 1, D 128, S 64, block 64, with a
+host-built cache. It is the first execution of the D = 128 Cube fractals: 4 C0 groups per query row, an
+8,192 B L1 tile, and a context Fixpipe with n = 128. The planner gives 2 tasks and 2 heads per task.
+
+Camodel, one process: golden `0xedc60ea1714295f1`, cos vs exact fp32 **0.999543** (the D = 256 cases sit at
+0.99940-0.99958), no sentinel left, 0 B exception dumps, ~70 s. A second build reproduced both pinned values.
+The case also holds an absolute floor of cos >= 0.99, so a wrong stride or C0 mapping fails it even
+before any golden exists.
+
+**Not covered:** the kv4fp8 kernel writer at D = 128 (64 B per kv head); split reduction, tail masks and
+wider groups at D = 128; GLM-5.2's 8:1 group. Run with `build/nz_runs.sh <tag> <snap> f`.

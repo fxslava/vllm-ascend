@@ -14,13 +14,15 @@
  * limitations under the License.
  */
 
-// The fused single-launch Cube decode (TURBOQUANT_TESTS.md 13.25), kv4fp8 at D 256, on five shapes:
+// The fused single-launch Cube decode (TURBOQUANT_TESTS.md 13.25), kv4fp8, on six shapes (D 256 unless noted):
 //
 //   (a) H_Q 4,  H_KV 2, S 64,  block 64   one tile
 //   (b) H_Q 4,  H_KV 2, S 256, block 64   four tiles in one task: the L1 slot ring and its free edge
 //   (c) (b) planned to fill the MIX blocks: parallel splits and the in-launch reduction
 //   (d) H_Q 8,  H_KV 2, S 120, block 64   a masked tail tile, two heads on each vector subcore
 //   (e) (a) with its cache written by the kv4fp8 kernel writer (13.28) instead of uploaded
+//   (f) H_Q 4,  H_KV 1, D 128, S 64,  block 64   Qwen3.5's 4:1 group at D = 128: a smoke of the D = 128 Cube
+//       fractals (4 C0 groups per row) ahead of the silicon bench (13.31)
 //
 // Each fused output is hashed (FNV-1a over its half bit patterns) against a golden, and its cosine against
 // exact fp32 attention must not regress. The goldens are the bit-exact reference: the barriered A/B instance
@@ -65,6 +67,11 @@ constexpr int64_t kWideGroupHeads = 8;
 constexpr int64_t kNarrowGroupHeads = 4;
 constexpr int64_t kKvHeads = 2;
 constexpr int64_t kHeadSize = 256;
+constexpr int64_t kQwenHeadSize = 128;
+constexpr int64_t kQwenKvHeads = 1;
+// A D = 128 decode whose fractal strides or C0 grouping were wrong would not reach this against exact fp32
+// attention; the kv4fp8 D = 256 cases sit near 0.9994.
+constexpr double kHeadSize128CosineFloor = 0.99;
 constexpr int64_t kBlockSize = 64;
 // Two MIX blocks for (d): the planner then keeps each GQA group of four in one task, two heads per subcore.
 constexpr int64_t kTwoBlockAiv = 4;
@@ -84,11 +91,12 @@ struct FusedCase {
   uint64_t golden;
 };
 
-tqh::FusedShape Shape(int64_t num_heads, int64_t context_len, bool kernel_writer = false) {
+tqh::FusedShape Shape(int64_t num_heads, int64_t context_len, bool kernel_writer = false,
+                      int64_t num_kv_heads = kKvHeads, int64_t head_size = kHeadSize) {
   tqh::FusedShape shape;
   shape.num_heads = num_heads;
-  shape.num_kv_heads = kKvHeads;
-  shape.head_size = kHeadSize;
+  shape.num_kv_heads = num_kv_heads;
+  shape.head_size = head_size;
   shape.block_size = kBlockSize;
   shape.context_len = context_len;
   shape.kernel_writer = kernel_writer;
@@ -109,6 +117,9 @@ const FusedCase kCaseD = {"(d)", Shape(kWideGroupHeads, kTailContext), kTwoBlock
 // Recorded 2026-09-17 on the same camodel from the NZ-tiled kernel writer (TURBOQUANT_TESTS.md 13.28).
 const FusedCase kCaseE = {"(e)", Shape(kNarrowGroupHeads, kSingleTileContext, true), 0, kFillBlocks, 0.999576,
                           0x9ffe02efde1506cfull};
+// Recorded 2026-09-17 on the same camodel from 539d4ab63 plus this case (TURBOQUANT_TESTS.md 13.32).
+const FusedCase kCaseF = {"(f)", Shape(kNarrowGroupHeads, kSingleTileContext, false, kQwenKvHeads, kQwenHeadSize), 0,
+                          kFillBlocks, 0.999543, 0xedc60ea1714295f1ull};
 
 void PrintShape(const FusedCase& fused_case, int64_t aiv_num, bool queried) {
   const tqh::FusedShape& shape = fused_case.shape;
@@ -254,6 +265,20 @@ TEST_F(TurboQuantFusedDecode, MasksATailTileWithTwoHeadsPerSubcore) {
   EXPECT_EQ(fused.heads_per_task, static_cast<uint32_t>(kWideTaskHeads))
       << "(d) must put two heads on each vector subcore";
   ExpectNoExceptionDumps(kCaseD.tag);
+}
+
+TEST_F(TurboQuantFusedDecode, DecodesHeadSize128OnAQwenGroup) {
+  PrintShape(kCaseF, aiv_num_, queried_);
+  watchdog_.Arm("(f) scenario setup and query rotation");
+  tqh::FusedCubeScenario scenario(kCaseF.shape, stream_, aiv_num_);
+  watchdog_.Disarm();
+  const std::vector<float> reference = scenario.Reference();
+
+  const tqh::FusedRun fused = RunCase(&scenario, kCaseF, &watchdog_, reference);
+  EXPECT_EQ(fused.num_splits, 1) << "a context inside the fused limit is never split";
+  EXPECT_GE(tqh::FusedCosine(fused.output, reference), kHeadSize128CosineFloor)
+      << "(f) the D = 128 Cube decode does not reproduce exact attention";
+  ExpectNoExceptionDumps(kCaseF.tag);
 }
 
 }

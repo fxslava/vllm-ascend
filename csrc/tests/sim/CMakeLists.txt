@@ -62,7 +62,7 @@ set(VLLM_ASCEND_SIM_TESTS
   test_sim_950pr_turboquant_rotate_q
   test_sim_950pr_turboquant_kernels
   test_sim_950pr_turboquant_decode
-  # The fused single-launch Cube decode, kv4fp8 at D = 256, five shapes: goldens,
+  # The fused single-launch Cube decode, kv4fp8, six shapes (one at D = 128): goldens,
   # cos vs fp32, the kernel writer's cache bytes, no sentinel left, no exception dump.
   test_sim_950pr_turboquant_fused
   # Single-shot dispatch + fidelity smoke of the Cube-native multi-mode decode.

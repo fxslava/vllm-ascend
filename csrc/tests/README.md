@@ -57,7 +57,7 @@ csrc/tests/
 |   |-- test_sim_950pr_turboquant_rotate_q.cpp    the standalone query rotation, both paths
 |   |-- test_sim_950pr_turboquant_kernels.cpp
 |   |-- test_sim_950pr_turboquant_decode.cpp
-|   |-- test_sim_950pr_turboquant_fused.cpp       the fused Cube decode, five shapes, vs goldens and the kernel writer
+|   |-- test_sim_950pr_turboquant_fused.cpp       the fused Cube decode, six shapes (D 256 and 128), vs goldens and the kernel writer
 |   |-- test_sim_950pr_turboquant_multimode.cpp   the fused Cube decode, all three modes
 |   |-- test_sim_950pr_cube_hadamard.cpp          spike: one shape of the sweep below
 |   `-- sim_hadamard_hybrid_kernels.cpp           spike: test-owned Ascend C, not the decode
