@@ -87,9 +87,12 @@ constexpr int64_t kTileRows = tqt::kAivTileRows;
 constexpr int64_t kPackFactor = tqt::kPackFactor;
 constexpr int64_t kCodecLevels = tqt::kCodecLevels;
 
+constexpr int64_t kVectorSubcoresPerBlock = tqt::kVectorSubcoresPerBlock;
+
 constexpr int64_t kFallbackVectorCoreNum = 8;
 
 using tqt::CodecTableWords;
+using tqt::DecodeNeedsReduction;
 using tqt::FusedDecodeGrid;
 using tqt::FusedSplitPolicy;
 using tqt::PackedCacheBytes;

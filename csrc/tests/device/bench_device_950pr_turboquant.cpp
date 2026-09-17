@@ -82,6 +82,9 @@ constexpr size_t kExactContextElements = 1u << 22;
 
 constexpr double kRotatedBasisMinCosine = 0.999;
 constexpr double kDecodeTiePointMinCosine = 0.99;
+// The two rotation modes decode the same cache; only rotate_q's Cube rounding (B >= 2) may separate them.
+constexpr double kRotationModeMinCosine = 0.9999;
+constexpr float kUnwrittenSentinel = -1234.5f;
 
 constexpr double kHalfBytes = 2.0;
 constexpr double kFloatBytes = 4.0;
@@ -150,6 +153,36 @@ std::string EnvString(const char* name) {
   return raw == nullptr ? std::string() : std::string(raw);
 }
 
+// Where a decode step rotates its query. kSeparate launches rotate_q ahead of the decode (PRE_ROTATED = true);
+// kFusedPrologue hands the raw fp16 query to the decode, which rotates it inside the same launch
+// (PRE_ROTATED = false, fused case (g); kv4fp8 on the Cube path only).
+enum class RotationMode { kSeparate, kFusedPrologue };
+
+const RotationMode kRotationModes[] = {RotationMode::kSeparate, RotationMode::kFusedPrologue};
+
+constexpr const char* kRotationModeEnv = "ASCEND_BENCH_TQ_ROTATION_MODE";
+constexpr const char* kRotationModeBoth = "both";
+
+const char* RotationModeKey(RotationMode mode) {
+  return mode == RotationMode::kSeparate ? "separate" : "fused_prologue";
+}
+
+bool RotationModeValid() {
+  const std::string raw = EnvString(kRotationModeEnv);
+  return raw.empty() || raw == kRotationModeBoth || raw == RotationModeKey(RotationMode::kSeparate) ||
+         raw == RotationModeKey(RotationMode::kFusedPrologue);
+}
+
+// ASCEND_BENCH_TQ_ROTATION_MODE=separate|fused_prologue|both, both by default; the banner reports any other
+// value, which is read as both.
+bool RotationModeEnabled(RotationMode mode) {
+  const std::string raw = EnvString(kRotationModeEnv);
+  if (raw == RotationModeKey(RotationMode::kSeparate) || raw == RotationModeKey(RotationMode::kFusedPrologue)) {
+    return raw == RotationModeKey(mode);
+  }
+  return true;
+}
+
 struct Regime {
   int64_t seq_len;
   std::vector<int64_t> batches;
@@ -206,6 +239,21 @@ struct Config {
     name << model.key << "_s" << seq_len << "_b" << batch;
     return name.str();
   }
+
+  // The raw-query decode entry exists for the Cube decode alone.
+  bool decodes_in_mode(RotationMode mode) const {
+    return RotationModeEnabled(mode) && (mode == RotationMode::kSeparate || path == PathMode::kCube);
+  }
+
+  std::string path_tag(RotationMode mode) const {
+    return std::string(PathLabel(path)) + (mode == RotationMode::kSeparate ? "-Sep" : "-FusedQ");
+  }
+
+  // Host dispatches of one decode step: rotate-q unless the decode rotates in its launch, the decode, and
+  // rotate-o unless W_o is folded.
+  int decode_launches(RotationMode mode) const {
+    return (mode == RotationMode::kSeparate ? 2 : 1) + (model.folds_output ? 0 : 1);
+  }
 };
 
 std::vector<Config> BuildSweep() {
@@ -250,10 +298,13 @@ constexpr const char* kLegDecAttnCore = "dec_attn_core";
 constexpr const char* kLegDecRotO = "dec_rot_o";
 constexpr const char* kLegDecE2E = "dec_e2e";
 constexpr const char* kLegDecV5 = "dec_v5";
+constexpr const char* kLegDecFusedQAttnCore = "dec_fq_attn_core";
+constexpr const char* kLegDecFusedQE2E = "dec_fq_e2e";
 
 const char* const kPrefillLegs[] = {kLegPfIngest, kLegPfRotQ, kLegPfAttnCore, kLegPfRotO,
                                     kLegPfE2E,    kLegPfV5,   kLegPfV5Ingest};
-const char* const kDecodeLegs[] = {kLegDecRotQ, kLegDecAttnCore, kLegDecRotO, kLegDecE2E, kLegDecV5};
+const char* const kDecodeLegs[] = {kLegDecRotQ, kLegDecAttnCore,       kLegDecRotO,     kLegDecE2E,
+                                   kLegDecV5,   kLegDecFusedQAttnCore, kLegDecFusedQE2E};
 
 std::string CaseName(const char* leg, const Config& config) {
   return std::string(leg) + "_" + config.id();
@@ -262,6 +313,48 @@ std::string CaseName(const char* leg, const Config& config) {
 bool LegEnabled(const char* leg) { return EnvSelects("ASCEND_BENCH_TQ_AUDIT_LEGS", leg); }
 bool PhaseEnabled(const char* phase) { return EnvSelects("ASCEND_BENCH_TQ_AUDIT_PHASES", phase); }
 bool NativeEnabled() { return EnvOn("ASCEND_BENCH_TQ_FIA"); }
+
+// One decode step's dispatch vector as the planner tiles it (Table B's Cfg [K/Tsk/Blk/Red]).
+struct DecodeDispatch {
+  int64_t split_k = 1;
+  // Cube: B x H_KV x K x head chunks. AIV: B x H_Q x K.
+  int64_t total_tasks = 0;
+  // Blocks the launch spans, of device_blocks: MIX blocks on the Cube path, vector cores on the AIV path.
+  int64_t active_blocks = 0;
+  int64_t device_blocks = 0;
+  // The launch reduces split partials after a SyncAll (the kernels' NeedsReduction()).
+  bool needs_reduction = false;
+
+  std::string label() const {
+    std::ostringstream text;
+    text << split_k << '/' << total_tasks << '/' << active_blocks << '/' << (needs_reduction ? "ON" : "OFF");
+    return text.str();
+  }
+};
+
+DecodeDispatch PlanDispatch(const Config& config, int64_t aiv_num) {
+  const int64_t hq = config.model.num_heads;
+  DecodeDispatch dispatch;
+  if (config.path == PathMode::kCube) {
+    const tqh::FusedDecodeGrid grid =
+        tqh::PlanFusedDecode(config.batch, hq, config.model.num_kv_heads, config.model.head_size,
+                             config.blocks_per_seq(), kBlockSize, aiv_num, tqh::kFusedContextLimit, SplitPolicy());
+    dispatch.split_k = grid.num_splits;
+    dispatch.total_tasks = grid.num_tasks;
+    dispatch.active_blocks = grid.block_dim;
+    dispatch.device_blocks = std::max<int64_t>(1, aiv_num / tqh::kVectorSubcoresPerBlock);
+    dispatch.needs_reduction = tqh::DecodeNeedsReduction(grid.num_splits, config.seq_len, grid.fused_context_limit);
+    return dispatch;
+  }
+  const tqh::PagedAttentionGrid grid = tqh::PlanPagedAttention(config.batch, hq, config.model.head_size,
+                                                               config.blocks_per_seq(), kBlockSize, aiv_num);
+  dispatch.split_k = grid.num_splits;
+  dispatch.total_tasks = config.batch * hq * grid.num_splits;
+  dispatch.active_blocks = grid.block_dim;
+  dispatch.device_blocks = aiv_num;
+  dispatch.needs_reduction = tqh::DecodeNeedsReduction(grid.num_splits, config.seq_len, tqh::kFusedContextLimit);
+  return dispatch;
+}
 
 struct Traffic {
   double fp16_kv_bytes = 0.0;
@@ -279,11 +372,13 @@ struct Traffic {
 
   double dec_rot_q = 0.0;
   double dec_attn_core = 0.0;
+  // The raw-query decode moves rotate_q's bytes too: the fp16 query in, the rotated fp32 query into GM.
+  double dec_fused_q_attn_core = 0.0;
   double dec_rot_o = 0.0;
   double dec_e2e = 0.0;
   double dec_v5 = 0.0;
   double dec_flops = 0.0;
-  int64_t dec_split_count = 1;
+  DecodeDispatch dispatch;
 
   double compression_ratio() const { return tq_kv_bytes > 0.0 ? fp16_kv_bytes / tq_kv_bytes : 0.0; }
   double saved_mib() const { return (fp16_kv_bytes - tq_kv_bytes) / kMiB; }
@@ -295,7 +390,7 @@ double FullModelSavedMib(const Config& config, const Traffic& traffic) {
          static_cast<double>(config.model.num_kv_heads);
 }
 
-Traffic ModelTraffic(const Config& config, int64_t num_splits) {
+Traffic ModelTraffic(const Config& config, const DecodeDispatch& dispatch) {
   const double d = static_cast<double>(config.model.head_size);
   const double hq = static_cast<double>(config.model.num_heads);
   const double hkv = static_cast<double>(config.model.num_kv_heads);
@@ -304,7 +399,7 @@ Traffic ModelTraffic(const Config& config, int64_t num_splits) {
   const double context = static_cast<double>(config.context_tokens());
   const double chunk = static_cast<double>(config.chunk_tokens());
   const double batch = static_cast<double>(config.batch);
-  const double splits = static_cast<double>(num_splits);
+  const double splits = static_cast<double>(dispatch.split_k);
 
   Traffic traffic;
   traffic.fp16_kv_bytes = 2.0 * context * hkv * d * kHalfBytes;
@@ -339,14 +434,16 @@ Traffic ModelTraffic(const Config& config, int64_t num_splits) {
 
   traffic.dec_rot_q = step_query_fp16 + step_query_fp32;
   // One launch: the query, the packed cache and the output token; partials cross GM twice only when the
-  // context is split, both inside the same launch.
-  traffic.dec_attn_core = step_query_fp32 + traffic.tq_kv_bytes + step_out_fp16 + (num_splits > 1 ? 2.0 * partials : 0.0);
+  // launch reduces its splits, both inside the same launch.
+  traffic.dec_attn_core =
+      step_query_fp32 + traffic.tq_kv_bytes + step_out_fp16 + (dispatch.needs_reduction ? 2.0 * partials : 0.0);
+  traffic.dec_fused_q_attn_core = traffic.dec_rot_q + traffic.dec_attn_core;
   traffic.dec_rot_o = step_out_fp16 + batch * hq * d * kFloatBytes;
   traffic.dec_e2e = traffic.dec_rot_q + traffic.dec_attn_core +
                     (config.model.folds_output ? 0.0 : traffic.dec_rot_o);
   traffic.dec_v5 = step_query_fp16 + traffic.fp16_kv_bytes + step_out_fp16;
   traffic.dec_flops = 4.0 * batch * hq * d * static_cast<double>(config.seq_len);
-  traffic.dec_split_count = num_splits;
+  traffic.dispatch = dispatch;
 
   return traffic;
 }
@@ -493,6 +590,7 @@ class Scenario {
         rng.NormalHalfExact(elems(config.batch, hq, d), 0.0f, 1.0f);
     query_dec_ = DeviceBuffer::FromHost(FloatToHalf(decode_query), kBenchmarkAlignBytes);
     query_dec_rot_ = DeviceBuffer::Empty<float>(elems(config.batch, hq, d), kBenchmarkAlignBytes);
+    query_dec_prologue_rot_ = DeviceBuffer::Empty<float>(elems(config.batch, hq, d), kBenchmarkAlignBytes);
     out_dec_tq_ = DeviceBuffer::Empty<Half>(elems(config.batch, hq, d), kBenchmarkAlignBytes);
     out_dec_v5_ = DeviceBuffer::Empty<Half>(elems(config.batch, hq, d), kBenchmarkAlignBytes);
     out_dec_rot_ = DeviceBuffer::Empty<float>(elems(config.batch, hq, d), kBenchmarkAlignBytes);
@@ -651,6 +749,60 @@ class Scenario {
         cube_grid_.fused_context_limit, config_.attention_scale(), config_.attention_scale());
   }
 
+  // The same grid handed the raw fp16 query: the launch rotates every (token, head) into
+  // query_dec_prologue_rot_ ahead of its split tasks, so no rotate_q launch precedes it.
+  void EnqueueDecodeFusedQ(aclrtStream stream) const {
+    turboquant_mm_fused_decode_raw_query_impl(
+        static_cast<int32_t>(kCubeMode), AscendType::FP16, stream, cube_grid_.block_dim, query_dec_.get(),
+        pi_signs_.get(), rot_tables_.get(), query_dec_prologue_rot_.get(), key_cache_.get(), value_cache_.get(),
+        scale_plane_.get(), block_tables_.get(), context_lens_.get(), decode_tables_.get(), workspace_.get(),
+        out_dec_tq_.get(), static_cast<uint32_t>(config_.batch), static_cast<uint32_t>(config_.model.num_heads),
+        static_cast<uint32_t>(config_.model.num_kv_heads), static_cast<uint32_t>(config_.model.head_size),
+        static_cast<uint32_t>(kBlockSize), static_cast<uint32_t>(config_.blocks_per_seq()),
+        static_cast<uint32_t>(cube_grid_.num_splits), cube_grid_.heads_per_task, cube_grid_.tasks_per_block,
+        cube_grid_.reduce_tasks_per_block, cube_grid_.prologue_vectors_per_block, cube_grid_.fused_context_limit,
+        config_.attention_scale(), config_.attention_scale());
+  }
+
+  void EnqueueDecodeFusedQE2E(aclrtStream stream) const {
+    EnqueueDecodeFusedQ(stream);
+    if (!config_.model.folds_output) {
+      EnqueueDecodeRotateO(stream);
+    }
+  }
+
+  // Both rotation modes over the same cache: the in-launch rotation against rotate_q's word for word, and the
+  // two decode outputs against each other. rotate_q stages the Cube from two tokens on, whose rounding the
+  // prologue's AIV rotation does not share, so only the outputs are held to a bound.
+  struct RotationAgreement {
+    size_t rotated_words = 0;
+    size_t word_mismatches = 0;
+    double output_cosine = 0.0;
+  };
+
+  RotationAgreement CompareRotationModes(aclrtStream stream) {
+    EnqueueDecodeRotateQ(stream);
+    EnqueueDecodeFusedCube(stream);
+    ACL_CHECK(aclrtSynchronizeStream(stream));
+    const std::vector<float> separate_rot = query_dec_rot_.ToHost<float>();
+    const std::vector<float> separate_out = DecodeTqOutput();
+
+    const std::vector<float> unwritten(separate_rot.size(), kUnwrittenSentinel);
+    query_dec_prologue_rot_.CopyFromHost(unwritten.data(), unwritten.size() * sizeof(float));
+    EnqueueDecodeFusedQ(stream);
+    ACL_CHECK(aclrtSynchronizeStream(stream));
+    const std::vector<float> fused_rot = query_dec_prologue_rot_.ToHost<float>();
+
+    RotationAgreement agreement;
+    agreement.rotated_words = separate_rot.size();
+    for (size_t i = 0; i < separate_rot.size(); ++i) {
+      agreement.word_mismatches +=
+          (i >= fused_rot.size() || std::memcmp(&separate_rot[i], &fused_rot[i], sizeof(float)) != 0) ? 1u : 0u;
+    }
+    agreement.output_cosine = turboquant_ref::cpu_fidelity(DecodeTqOutput(), separate_out).cosine_similarity;
+    return agreement;
+  }
+
   void EnqueueDecodeAttnCore(aclrtStream stream) const {
     if (config_.path == PathMode::kCube) {
       EnqueueDecodeFusedCube(stream);
@@ -690,6 +842,9 @@ class Scenario {
   void Prime(aclrtStream stream) const {
     EnqueueDecodeRotateQ(stream);
     EnqueueDecodeAttnCore(stream);
+    if (config_.decodes_in_mode(RotationMode::kFusedPrologue)) {
+      EnqueueDecodeFusedQ(stream);
+    }
     if (prefill_available()) {
       EnqueuePrefillAttnCore(stream);
       EnqueuePrefillNative(stream);
@@ -964,7 +1119,7 @@ class Scenario {
   DeviceBuffer key_chunk_, value_chunk_;
   DeviceBuffer query_pf_, query_pf_rot_half_, query_pf_rot_fp32_;
   DeviceBuffer out_pf_tq_, out_pf_v5_, out_pf_rot_, lse_pf_tq_, lse_pf_v5_;
-  DeviceBuffer query_dec_, query_dec_rot_;
+  DeviceBuffer query_dec_, query_dec_rot_, query_dec_prologue_rot_;
   DeviceBuffer out_dec_tq_, out_dec_v5_, out_dec_rot_, lse_dec_;
   DeviceBuffer slots_full_, slots_chunk_, block_tables_, context_lens_;
   DeviceBuffer pi_signs_, h16_, rot_tables_, write_tables_, decode_tables_;
@@ -1103,6 +1258,13 @@ Sample RotateOutputSample(const std::vector<BenchmarkRunner*>& runners, const ch
   return config.model.folds_output ? StructuralZero() : SampleFor(runners, leg, config);
 }
 
+// A decode that rotates its raw query in its own launch has no rotate_q to time.
+Sample InLaunchZero() {
+  Sample sample = StructuralZero();
+  sample.mode = "in-launch";
+  return sample;
+}
+
 double Speedup(const Sample& baseline, const Sample& candidate) {
   if (!baseline.present || !candidate.present || candidate.median_us <= 0.0) {
     return 0.0;
@@ -1153,6 +1315,10 @@ struct DecodeRow {
   double sum_of_parts_us = 0.0;
   double speedup = 0.0;
   double gigabytes_per_second = 0.0;
+
+  bool measured() const {
+    return (rot_q.present && !rot_q.structural_zero) || attn_core.present || e2e.present || native.present;
+  }
 };
 
 PrefillRow ReadPrefillRow(const std::vector<BenchmarkRunner*>& runners, const Config& config,
@@ -1175,13 +1341,14 @@ PrefillRow ReadPrefillRow(const std::vector<BenchmarkRunner*>& runners, const Co
   return row;
 }
 
-DecodeRow ReadDecodeRow(const std::vector<BenchmarkRunner*>& runners, const Config& config,
-                        const Traffic& traffic) {
+DecodeRow ReadDecodeRow(const std::vector<BenchmarkRunner*>& runners, const Config& config, const Traffic& traffic,
+                        RotationMode mode) {
+  const bool separate = mode == RotationMode::kSeparate;
   DecodeRow row;
-  row.rot_q = SampleFor(runners, kLegDecRotQ, config);
-  row.attn_core = SampleFor(runners, kLegDecAttnCore, config);
+  row.rot_q = separate ? SampleFor(runners, kLegDecRotQ, config) : InLaunchZero();
+  row.attn_core = SampleFor(runners, separate ? kLegDecAttnCore : kLegDecFusedQAttnCore, config);
   row.rot_o = RotateOutputSample(runners, kLegDecRotO, config);
-  row.e2e = SampleFor(runners, kLegDecE2E, config);
+  row.e2e = SampleFor(runners, separate ? kLegDecE2E : kLegDecFusedQE2E, config);
   row.native = SampleFor(runners, kLegDecV5, config);
 
   row.sum_of_parts_us = (row.rot_q.present ? row.rot_q.median_us : 0.0) +
@@ -1284,70 +1451,122 @@ void PrintTableA(const std::vector<BenchmarkRunner*>& runners, const std::vector
   std::fflush(stdout);
 }
 
+std::string RotationModesLabel() {
+  std::string label;
+  for (const RotationMode mode : kRotationModes) {
+    if (RotationModeEnabled(mode)) {
+      label += (label.empty() ? "" : ", ") + std::string(RotationModeKey(mode));
+    }
+  }
+  return label;
+}
+
 void PrintTableB(const std::vector<BenchmarkRunner*>& runners, const std::vector<Config>& sweep,
-                 const std::vector<Traffic>& traffic, const std::string& fia_operator) {
+                 const std::vector<Traffic>& traffic, const std::string& fia_operator, int64_t aiv_num) {
   std::printf("\n");
   std::printf("[ascend-bench] ====================================================================\n");
   std::printf("[ascend-bench] TABLE B -- DECODE LATENCY BREAKDOWN\n");
   std::printf("[ascend-bench] ====================================================================\n");
   std::printf("[ascend-bench] device time from ACL events, median us per decode step; native operator: %s\n",
               fia_operator.c_str());
-  std::printf("[ascend-bench] one decode token per sequence; B is the batch of sequences; K is the context\n"
-              "[ascend-bench] splits of one Cube launch, split policy %s (ASCEND_BENCH_TQ_AUDIT_SPLIT)\n\n",
-              SplitPolicyLabel(SplitPolicy()));
+  std::printf("[ascend-bench] one decode token per sequence; B is the batch of sequences; split policy %s\n"
+              "[ascend-bench] (ASCEND_BENCH_TQ_AUDIT_SPLIT); rotation modes %s (%s)\n\n",
+              SplitPolicyLabel(SplitPolicy()), RotationModesLabel().c_str(), kRotationModeEnv);
 
   char header[512];
   const int header_width =
-      std::snprintf(header, sizeof(header), "  %-17s %9s %3s %5s %2s | %10s %14s %11s %10s %11s %11s | %8s %10s %12s",
-                    "Model", "Context", "B", "Path", "K", "T_rot_q", "T_FusedDecode", "Launches", "T_rot_o", "TQ_E2E",
-                    "V5_Decode", "Speedup", "Eff GB/s", "Compression");
+      std::snprintf(header, sizeof(header), "  %-17s %9s %3s %-11s %-19s | %10s %14s %8s %10s %11s %11s | %8s %10s",
+                    "Model", "Context", "B", "Path", "Cfg [K/Tsk/Blk/Red]", "T_rot_q", "T_FusedDecode", "Launches",
+                    "T_rot_o", "TQ_E2E", "V5_Decode", "Speedup", "Eff GB/s");
   PrintHeaderAndRule(header, header_width);
 
   bool any = false;
   std::vector<double> residuals;
+  std::vector<std::string> deltas;
   for (size_t index = 0; index < sweep.size(); ++index) {
     const Config& config = sweep[index];
-    const DecodeRow row = ReadDecodeRow(runners, config, traffic[index]);
-    if (!row.rot_q.present && !row.attn_core.present && !row.e2e.present && !row.native.present) {
-      continue;
-    }
-    any = true;
-    std::printf("  %-17s %9lld %3lld %5s %2lld |", config.model.label, static_cast<long long>(config.seq_len),
-                static_cast<long long>(config.batch), PathLabel(config.path),
-                static_cast<long long>(traffic[index].dec_split_count));
-    PrintUs(row.rot_q, 10);
-    PrintUs(row.attn_core, 13);
-    std::printf(" %10d", config.model.folds_output ? 2 : 3);
-    PrintUs(row.rot_o, 10);
-    PrintUs(row.e2e, 11);
-    PrintUs(row.native, 11);
-    std::printf(" |");
-    PrintRatio(row.speedup, 8);
-    PrintDouble(row.gigabytes_per_second, 10, 1);
-    PrintDouble(traffic[index].compression_ratio(), 12, 3);
-    std::printf("\n");
+    const Traffic& model = traffic[index];
+    DecodeRow separate;
+    DecodeRow fused_q;
+    for (const RotationMode mode : kRotationModes) {
+      if (!config.decodes_in_mode(mode)) {
+        continue;
+      }
+      const DecodeRow row = ReadDecodeRow(runners, config, model, mode);
+      if (mode == RotationMode::kSeparate) {
+        separate = row;
+      } else {
+        fused_q = row;
+      }
+      if (!row.measured()) {
+        continue;
+      }
+      any = true;
+      std::printf("  %-17s %9lld %3lld %-11s %-19s |", config.model.label, static_cast<long long>(config.seq_len),
+                  static_cast<long long>(config.batch), config.path_tag(mode).c_str(),
+                  model.dispatch.label().c_str());
+      PrintUs(row.rot_q, 10);
+      PrintUs(row.attn_core, 14);
+      std::printf(" %8d", config.decode_launches(mode));
+      PrintUs(row.rot_o, 10);
+      PrintUs(row.e2e, 11);
+      PrintUs(row.native, 11);
+      std::printf(" |");
+      PrintRatio(row.speedup, 8);
+      PrintDouble(row.gigabytes_per_second, 10, 1);
+      std::printf("\n");
 
-    if (row.e2e.present && row.sum_of_parts_us > 0.0) {
-      residuals.push_back(std::fabs(row.e2e.median_us - row.sum_of_parts_us) / row.e2e.median_us);
+      if (row.e2e.present && row.sum_of_parts_us > 0.0) {
+        residuals.push_back(std::fabs(row.e2e.median_us - row.sum_of_parts_us) / row.e2e.median_us);
+      }
+    }
+    if (separate.e2e.present && fused_q.e2e.present && separate.e2e.median_us > 0.0) {
+      char line[256];
+      const double delta = fused_q.e2e.median_us - separate.e2e.median_us;
+      std::snprintf(line, sizeof(line), "  %-17s %9lld %3lld | TQ_E2E %+9.2f us (%+6.1f%%)", config.model.label,
+                    static_cast<long long>(config.seq_len), static_cast<long long>(config.batch), delta,
+                    100.0 * delta / separate.e2e.median_us);
+      std::string text(line);
+      if (separate.attn_core.present && fused_q.attn_core.present && separate.rot_q.present) {
+        std::snprintf(line, sizeof(line), ", T_FusedDecode %+9.2f us against a %.2f us rotate_q launch",
+                      fused_q.attn_core.median_us - separate.attn_core.median_us, separate.rot_q.median_us);
+        text += line;
+      }
+      deltas.push_back(text);
     }
   }
   if (!any) {
     std::printf("  (no decode configuration produced a sample)\n");
   }
 
+  const int64_t mix_blocks = std::max<int64_t>(1, aiv_num / tqh::kVectorSubcoresPerBlock);
   std::printf("\n[ascend-bench]   Speedup is V5_Decode / TQ_E2E: above 1.000x is TurboQuant ahead. TQ_E2E is one\n"
-              "[ascend-bench]   composite ACL-event region over rotate-q, the attention core and (unfolded only)\n"
-              "[ascend-bench]   rotate-o; T_FusedDecode is the attention core, ONE launch on either path (K > 1\n"
-              "[ascend-bench]   splits are reduced inside that launch after a SyncAll). Launches counts the\n"
-              "[ascend-bench]   host dispatches of one decode step: rotate-q, the core, and rotate-o if unfolded.\n");
+              "[ascend-bench]   composite ACL-event region over the step's launches; T_FusedDecode is the\n"
+              "[ascend-bench]   attention core, ONE launch on either path. Launches counts the host dispatches\n"
+              "[ascend-bench]   of one decode step: rotate-q (-Sep only), the core, and rotate-o if unfolded.\n");
+  std::printf("[ascend-bench]   Path -Sep launches rotate_q ahead of the decode. Path -FusedQ hands the decode the\n"
+              "[ascend-bench]   raw fp16 query, which it rotates in the same launch ahead of its split tasks\n"
+              "[ascend-bench]   (PRE_ROTATED=false, Cube kv4fp8 only): its T_rot_q is 0.00 by construction and\n"
+              "[ascend-bench]   its T_FusedDecode includes the rotation. Both share the same Cfg, T_rot_o and V5.\n");
+  std::printf("[ascend-bench]   Cfg [K/Tsk/Blk/Red]: K context splits per sequence; Tsk tasks the launch\n"
+              "[ascend-bench]   schedules (Cube B x H_KV x K x head chunks, AIV B x H_Q x K); Blk the blocks it\n"
+              "[ascend-bench]   spans, of %lld MIX blocks on the Cube path and %lld vector cores on the AIV path;\n"
+              "[ascend-bench]   Red ON when the launch reduces split partials after a SyncAll (NeedsReduction).\n",
+              static_cast<long long>(mix_blocks), static_cast<long long>(aiv_num));
   std::printf("[ascend-bench]   Every model takes the Cube decode, whatever its GQA group or head size;\n"
               "[ascend-bench]   ASCEND_BENCH_TQ_AUDIT_PATH=aiv forces the vector-only path for an A/B.\n");
   std::printf("[ascend-bench]   Eff GB/s is the step's compulsory traffic over its measured composite time.\n"
-              "[ascend-bench]   Compression is fp16 KV residency over TurboQuant's, scale plane included -- at\n"
-              "[ascend-bench]   H_KV=1 the scale plane's 32-byte burst floor is most of the gap from 4.00x.\n");
+              "[ascend-bench]   KV compression (fp16 over TurboQuant residency) is in the decode CSV.\n");
   if (!residuals.empty()) {
     std::printf("[ascend-bench]   composite vs sum-of-parts: median gap %.1f%% over %zu rows.\n",
                 100.0 * MedianResidual(residuals), residuals.size());
+  }
+  if (!deltas.empty()) {
+    std::printf("\n[ascend-bench]   in-launch rotation (-FusedQ) against a separate rotate_q launch (-Sep), "
+                "negative is -FusedQ faster:\n");
+    for (const std::string& line : deltas) {
+      std::printf("%s\n", line.c_str());
+    }
   }
   std::fflush(stdout);
 }
@@ -1439,6 +1658,58 @@ void WritePrefillCsv(const std::vector<BenchmarkRunner*>& runners, const std::ve
   std::printf("[ascend-bench] Table A written to %s\n", path.c_str());
 }
 
+// The timed columns of one decode CSV row, from t_rot_q_us on.
+void WriteDecodeCsvTimings(std::ofstream& csv, const Config& config, const Traffic& model, const DecodeRow& row,
+                           RotationMode mode) {
+  WriteCell(csv, row.rot_q);
+  WriteCell(csv, row.attn_core);
+  csv << ',' << config.decode_launches(mode);
+  WriteCell(csv, row.rot_o);
+  csv << ',' << (row.rot_o.structural_zero ? 1 : 0);
+  WriteCell(csv, row.e2e);
+  csv << ',';
+  if (row.sum_of_parts_us > 0.0) {
+    csv << row.sum_of_parts_us;
+  }
+  WriteCell(csv, row.native);
+  csv << ',';
+  if (row.speedup > 0.0) {
+    csv << row.speedup;
+  }
+  csv << ',';
+  if (row.gigabytes_per_second > 0.0) {
+    csv << row.gigabytes_per_second;
+  }
+  csv << ',';
+  if (row.attn_core.present) {
+    csv << row.attn_core.gigabytes_per_second;
+  }
+  csv << ',';
+  if (row.native.present) {
+    csv << row.native.gigabytes_per_second;
+  }
+  csv << ',';
+  if (row.attn_core.present) {
+    csv << row.attn_core.tflops;
+  }
+  csv << ',';
+  if (row.native.present) {
+    csv << row.native.tflops;
+  }
+  csv << ',' << model.fp16_kv_bytes << ',' << model.tq_kv_bytes << ',' << model.saved_mib() << ','
+      << model.compression_ratio() << ',' << model.dec_e2e << ',' << model.dec_flops << ',';
+  if (row.e2e.present) {
+    csv << row.e2e.p95_us;
+  }
+  csv << ',';
+  if (row.native.present) {
+    csv << row.native.p95_us;
+  }
+  csv << ',' << config.budget.warmup << ',' << config.budget.iterations << ',' << row.e2e.mode << ','
+      << SplitPolicyLabel(SplitPolicy()) << '\n';
+}
+
+// One row per (configuration, rotation mode) the sweep decodes in.
 void WriteDecodeCsv(const std::vector<BenchmarkRunner*>& runners, const std::vector<Config>& sweep,
                     const std::vector<Traffic>& traffic, const std::string& path,
                     const std::string& fia_operator) {
@@ -1447,7 +1718,8 @@ void WriteDecodeCsv(const std::vector<BenchmarkRunner*>& runners, const std::vec
     std::printf("[ascend-bench] could not open ASCEND_BENCH_TQ_AUDIT_DECODE_CSV='%s' for writing\n", path.c_str());
     return;
   }
-  csv << "model,regime,seq_len,batch,num_heads,num_kv_heads,head_dim,path,num_splits,native_operator,"
+  csv << "model,regime,seq_len,batch,num_heads,num_kv_heads,head_dim,path,rotation_mode,"
+      << "split_k,total_tasks,active_blocks,device_blocks,needs_reduction,native_operator,"
       << "t_rot_q_us,t_fused_decode_us,decode_launches,t_rot_o_us,rot_o_is_structural_zero,"
       << "tq_e2e_us,tq_e2e_sum_of_parts_us,v5_decode_us,net_speedup,"
       << "effective_gbps,attn_core_gbps,v5_gbps,attn_core_tflops,v5_tflops,"
@@ -1457,57 +1729,20 @@ void WriteDecodeCsv(const std::vector<BenchmarkRunner*>& runners, const std::vec
   for (size_t index = 0; index < sweep.size(); ++index) {
     const Config& config = sweep[index];
     const Traffic& model = traffic[index];
-    const DecodeRow row = ReadDecodeRow(runners, config, model);
+    for (const RotationMode mode : kRotationModes) {
+      if (!config.decodes_in_mode(mode)) {
+        continue;
+      }
+      const DecodeRow row = ReadDecodeRow(runners, config, model, mode);
+      const DecodeDispatch& dispatch = model.dispatch;
 
-    csv << config.model.key << ',' << config.regime << ',' << config.seq_len << ',' << config.batch << ','
-        << config.model.num_heads << ',' << config.model.num_kv_heads << ',' << config.model.head_size << ','
-        << PathLabel(config.path) << ',' << model.dec_split_count << ',' << fia_operator;
-    WriteCell(csv, row.rot_q);
-    WriteCell(csv, row.attn_core);
-    csv << ',' << (config.model.folds_output ? 2 : 3);
-    WriteCell(csv, row.rot_o);
-    csv << ',' << (row.rot_o.structural_zero ? 1 : 0);
-    WriteCell(csv, row.e2e);
-    csv << ',';
-    if (row.sum_of_parts_us > 0.0) {
-      csv << row.sum_of_parts_us;
+      csv << config.model.key << ',' << config.regime << ',' << config.seq_len << ',' << config.batch << ','
+          << config.model.num_heads << ',' << config.model.num_kv_heads << ',' << config.model.head_size << ','
+          << PathLabel(config.path) << ',' << RotationModeKey(mode) << ',' << dispatch.split_k << ','
+          << dispatch.total_tasks << ',' << dispatch.active_blocks << ',' << dispatch.device_blocks << ','
+          << (dispatch.needs_reduction ? 1 : 0) << ',' << fia_operator;
+      WriteDecodeCsvTimings(csv, config, model, row, mode);
     }
-    WriteCell(csv, row.native);
-    csv << ',';
-    if (row.speedup > 0.0) {
-      csv << row.speedup;
-    }
-    csv << ',';
-    if (row.gigabytes_per_second > 0.0) {
-      csv << row.gigabytes_per_second;
-    }
-    csv << ',';
-    if (row.attn_core.present) {
-      csv << row.attn_core.gigabytes_per_second;
-    }
-    csv << ',';
-    if (row.native.present) {
-      csv << row.native.gigabytes_per_second;
-    }
-    csv << ',';
-    if (row.attn_core.present) {
-      csv << row.attn_core.tflops;
-    }
-    csv << ',';
-    if (row.native.present) {
-      csv << row.native.tflops;
-    }
-    csv << ',' << model.fp16_kv_bytes << ',' << model.tq_kv_bytes << ',' << model.saved_mib() << ','
-        << model.compression_ratio() << ',' << model.dec_e2e << ',' << model.dec_flops << ',';
-    if (row.e2e.present) {
-      csv << row.e2e.p95_us;
-    }
-    csv << ',';
-    if (row.native.present) {
-      csv << row.native.p95_us;
-    }
-    csv << ',' << config.budget.warmup << ',' << config.budget.iterations << ',' << row.e2e.mode << ','
-        << SplitPolicyLabel(SplitPolicy()) << '\n';
   }
   std::printf("[ascend-bench] Table B written to %s\n", path.c_str());
 }
@@ -1545,6 +1780,13 @@ void PrintBanner(const std::vector<Config>& sweep, int64_t aiv_num, bool aiv_que
   std::printf("[ascend-bench]\n");
   std::printf("[ascend-bench]   NO NUMBER BELOW HAS EVER BEEN TAKEN ON SILICON. No Ascend 950PR part has been\n"
               "[ascend-bench]   available to this project; the kernels are verified on the arch35 camodel.\n");
+  std::printf("[ascend-bench]\n");
+  std::printf("[ascend-bench]   decode: split policy %s (ASCEND_BENCH_TQ_AUDIT_SPLIT), rotation modes %s (%s)\n",
+              SplitPolicyLabel(SplitPolicy()), RotationModesLabel().c_str(), kRotationModeEnv);
+  if (!RotationModeValid()) {
+    std::printf("[ascend-bench]   %s='%s' is not separate, fused_prologue or both; timing both\n", kRotationModeEnv,
+                EnvString(kRotationModeEnv).c_str());
+  }
   std::printf("[ascend-bench]\n");
 
   if (sweep.empty()) {
@@ -1623,16 +1865,8 @@ void BuildSuite(BenchmarkRunner& primary) {
     const Config& config = sweep[index];
     BenchmarkRunner& runner = runners.For(config.budget);
 
-    const int64_t planned_splits =
-        config.path == PathMode::kCube
-            ? tqh::PlanFusedDecode(config.batch, config.model.num_heads, config.model.num_kv_heads,
-                                   config.model.head_size, config.blocks_per_seq(), kBlockSize, aiv_num,
-                                   tqh::kFusedContextLimit, SplitPolicy())
-                  .num_splits
-            : tqh::PlanPagedAttention(config.batch, config.model.num_heads, config.model.head_size,
-                                      config.blocks_per_seq(), kBlockSize, aiv_num)
-                  .num_splits;
-    traffic.push_back(ModelTraffic(config, planned_splits));
+    const DecodeDispatch dispatch = PlanDispatch(config, aiv_num);
+    traffic.push_back(ModelTraffic(config, dispatch));
 
     size_t free_hbm = 0;
     size_t total_hbm = 0;
@@ -1665,15 +1899,19 @@ void BuildSuite(BenchmarkRunner& primary) {
       fia_operator = scenario->fia_operator();
     }
     std::printf("\n[ascend-bench] %-17s S=%lld B=%lld D=%lld H_Q=%lld H_KV=%lld | %s path, chunk %lld, "
-                "blocks/seq %lld, pool %lld, splits %lld, grid %u | native: %s\n",
+                "blocks/seq %lld, pool %lld, Cfg [K/Tsk/Blk/Red] %s of %lld blocks | native: %s\n",
                 config.model.label, static_cast<long long>(config.seq_len),
                 static_cast<long long>(config.batch), static_cast<long long>(config.model.head_size),
                 static_cast<long long>(config.model.num_heads),
                 static_cast<long long>(config.model.num_kv_heads), PathLabel(config.path),
                 static_cast<long long>(config.chunk), static_cast<long long>(config.blocks_per_seq()),
-                static_cast<long long>(config.pool_blocks()), static_cast<long long>(scenario->num_splits()),
-                scenario->block_dim(),
+                static_cast<long long>(config.pool_blocks()), dispatch.label().c_str(),
+                static_cast<long long>(dispatch.device_blocks),
                 scenario->decode_available() ? scenario->fia_operator().c_str() : "unavailable");
+    if (scenario->num_splits() != dispatch.split_k ||
+        static_cast<int64_t>(scenario->block_dim()) != dispatch.active_blocks) {
+      runners.Fail(CaseName("dispatch", config), "the scenario launches a different grid than Table B reports");
+    }
     if (!scenario->prefill_available() || !scenario->decode_available()) {
       std::printf("[ascend-bench]   native operator note: %s\n", scenario->fia_note().c_str());
     }
@@ -1715,6 +1953,23 @@ void BuildSuite(BenchmarkRunner& primary) {
         runners.Fail(CaseName("decode_tie_point", config), error.what());
       }
     }
+    // Every configuration that times the raw-query decode first checks it against the pre-rotated one: the
+    // raw entry had executed on the camodel at B = 1, D = 256 only.
+    if (run_decode && config.decodes_in_mode(RotationMode::kFusedPrologue)) {
+      try {
+        const Scenario::RotationAgreement agreement = scenario->CompareRotationModes(runner.stream());
+        std::printf("[ascend-bench]   rotation modes: the in-launch rotation differs from rotate_q in %zu of %zu "
+                    "fp32 words; decode outputs agree to cos = %.9f (bound %.4f)\n",
+                    agreement.word_mismatches, agreement.rotated_words, agreement.output_cosine,
+                    kRotationModeMinCosine);
+        if (!(agreement.output_cosine > kRotationModeMinCosine)) {
+          runners.Fail(CaseName("rotation_mode_agreement", config),
+                       "the raw-query decode does not reproduce the pre-rotated decode");
+        }
+      } catch (const std::exception& error) {
+        runners.Fail(CaseName("rotation_mode_agreement", config), error.what());
+      }
+    }
     std::fflush(stdout);
 
     const Traffic& model = traffic.back();
@@ -1743,12 +1998,33 @@ void BuildSuite(BenchmarkRunner& primary) {
     const int rot_o_tasks = config.model.folds_output ? 0 : 1;
 
     if (run_decode) {
-      run_leg(kLegDecRotQ, 0.0, model.dec_rot_q, 1, [sc](aclrtStream s) { sc->EnqueueDecodeRotateQ(s); },
-              [sc]() { return sc->DecodeRotatedQueryChecksum(); });
+      const bool separate = config.decodes_in_mode(RotationMode::kSeparate);
+      const bool fused_q = config.decodes_in_mode(RotationMode::kFusedPrologue);
+      const std::string separate_off =
+          std::string("rotation mode separate is not selected by ") + kRotationModeEnv;
+      const std::string fused_q_off =
+          config.path != PathMode::kCube
+              ? std::string("the raw-query decode exists on the Cube path only")
+              : std::string("rotation mode fused_prologue is not selected by ") + kRotationModeEnv;
 
-      run_leg(kLegDecAttnCore, model.dec_flops, model.dec_attn_core, 1,
-              [sc](aclrtStream s) { sc->EnqueueDecodeAttnCore(s); },
-              [sc]() { return sc->DecodeTqChecksum(); });
+      if (separate) {
+        run_leg(kLegDecRotQ, 0.0, model.dec_rot_q, 1, [sc](aclrtStream s) { sc->EnqueueDecodeRotateQ(s); },
+                [sc]() { return sc->DecodeRotatedQueryChecksum(); });
+        run_leg(kLegDecAttnCore, model.dec_flops, model.dec_attn_core, 1,
+                [sc](aclrtStream s) { sc->EnqueueDecodeAttnCore(s); },
+                [sc]() { return sc->DecodeTqChecksum(); });
+      } else {
+        runner.Skip(CaseName(kLegDecRotQ, config), separate_off);
+        runner.Skip(CaseName(kLegDecAttnCore, config), separate_off);
+      }
+
+      if (fused_q) {
+        run_leg(kLegDecFusedQAttnCore, model.dec_flops, model.dec_fused_q_attn_core, 1,
+                [sc](aclrtStream s) { sc->EnqueueDecodeFusedQ(s); },
+                [sc]() { return sc->DecodeTqChecksum(); });
+      } else {
+        runner.Skip(CaseName(kLegDecFusedQAttnCore, config), fused_q_off);
+      }
 
       if (config.model.folds_output) {
         runner.Skip(CaseName(kLegDecRotO, config),
@@ -1758,9 +2034,21 @@ void BuildSuite(BenchmarkRunner& primary) {
                 [sc]() { return sc->DecodeRotatedOutChecksum(); });
       }
 
-      run_leg(kLegDecE2E, model.dec_flops, model.dec_e2e, 2 + rot_o_tasks,
-              [sc](aclrtStream s) { sc->EnqueueDecodeE2E(s); },
-              [sc]() { return sc->DecodePipelineChecksum(); });
+      if (separate) {
+        run_leg(kLegDecE2E, model.dec_flops, model.dec_e2e, config.decode_launches(RotationMode::kSeparate),
+                [sc](aclrtStream s) { sc->EnqueueDecodeE2E(s); },
+                [sc]() { return sc->DecodePipelineChecksum(); });
+      } else {
+        runner.Skip(CaseName(kLegDecE2E, config), separate_off);
+      }
+
+      if (fused_q) {
+        run_leg(kLegDecFusedQE2E, model.dec_flops, model.dec_e2e, config.decode_launches(RotationMode::kFusedPrologue),
+                [sc](aclrtStream s) { sc->EnqueueDecodeFusedQE2E(s); },
+                [sc]() { return sc->DecodePipelineChecksum(); });
+      } else {
+        runner.Skip(CaseName(kLegDecFusedQE2E, config), fused_q_off);
+      }
 
       if (!sc->decode_available()) {
         runner.Skip(CaseName(kLegDecV5, config), sc->fia_note());
@@ -1822,7 +2110,7 @@ void BuildSuite(BenchmarkRunner& primary) {
     }
   }
   if (run_decode) {
-    PrintTableB(runners.all(), sweep, traffic, fia_operator);
+    PrintTableB(runners.all(), sweep, traffic, fia_operator, aiv_num);
     const std::string path = EnvString("ASCEND_BENCH_TQ_AUDIT_DECODE_CSV");
     if (!path.empty()) {
       WriteDecodeCsv(runners.all(), sweep, traffic, path, fia_operator);

@@ -64,12 +64,26 @@ PagedAttentionGrid PlanPagedAttention(int64_t num_tokens, int64_t num_heads, int
                                       int64_t max_blocks_per_seq, int64_t block_size, int64_t aiv_num,
                                       int64_t fused_context_limit = kFusedContextLimit);
 
+// The host side of both decodes' NeedsReduction(): a launch of more than one split reduces its partials after
+// a SyncAll as soon as one of its contexts is longer than the fused limit the launch was given.
+bool DecodeNeedsReduction(int64_t num_splits, int64_t max_context_len, int64_t fused_context_limit);
+
+// The adaptive Cube planner's bandwidth tier. From kBandwidthSplitContext tokens on, a decode is bound by HBM
+// throughput, not by the reduction: one MTE2 stream per sequence cannot keep enough DMA transactions in flight
+// to load the multi-channel controller, so the context is split at least once per kBandwidthSplitRows rows,
+// saturated grid or not, rounded up to a power of two: 4 splits at 8192 tokens, kMaxSequenceSplits beyond.
+constexpr int64_t kBandwidthSplitContext = 8192;
+constexpr int64_t kBandwidthSplitRows = 2048;
+
 // When the Cube decode splits a context along the sequence. The splits are reduced in the same launch.
 //   kContextOnly  only a context beyond the fused limit
 //   kFillBlocks   also one inside it, while every task still gets a MIX block of its own
-//   kAdaptive     by grid saturation, at any context: split only while the unsplit tasks (tokens x kv heads
-//                 x head chunks) leave MIX blocks idle; a saturated grid never splits, so its launch has
-//                 no SyncAll, workspace or reduction
+//   kAdaptive     two tiers, on the longest context the grid is planned for:
+//                 below kBandwidthSplitContext, by grid saturation: split only while the unsplit tasks
+//                 (tokens x kv heads x head chunks) leave MIX blocks idle; a saturated grid never splits, so
+//                 its launch has no SyncAll, workspace or reduction;
+//                 from kBandwidthSplitContext on, also at least once per kBandwidthSplitRows rows (a power of
+//                 two of splits), so a saturated grid splits too
 enum class FusedSplitPolicy : uint32_t {
     kContextOnly = 0,
     kFillBlocks = 1,

@@ -21,6 +21,19 @@
 namespace vllm_ascend {
 namespace turboquant {
 
+namespace {
+
+int64_t CeilPow2(int64_t value)
+{
+    int64_t pow2 = 1;
+    while (pow2 < value) {
+        pow2 *= 2;
+    }
+    return pow2;
+}
+
+}
+
 int64_t CeilDiv64(int64_t a, int64_t b)
 {
     return (a + b - 1) / b;
@@ -65,6 +78,11 @@ ReshapeAndCacheGrid PlanReshapeAndCache(int64_t num_tokens, int64_t aiv_num)
     grid.tokens_per_core = static_cast<uint32_t>(tokens_per_core);
     grid.block_dim = static_cast<uint32_t>(CeilDiv64(num_tokens, tokens_per_core));
     return grid;
+}
+
+bool DecodeNeedsReduction(int64_t num_splits, int64_t max_context_len, int64_t fused_context_limit)
+{
+    return num_splits > 1 && max_context_len > fused_context_limit;
 }
 
 PagedAttentionGrid PlanPagedAttention(int64_t num_tokens, int64_t num_heads, int64_t head_size,
@@ -133,16 +151,22 @@ FusedDecodeGrid PlanFusedDecode(int64_t num_tokens, int64_t num_heads, int64_t n
     int64_t num_splits = 1;
     int64_t launch_limit = fused_context_limit;
     if (split_policy == FusedSplitPolicy::kAdaptive) {
-        // Saturation alone decides, at any context length. Tasks that already fill the blocks unsplit run
+        // Latency tier, every context: saturation decides. Tasks that already fill the blocks unsplit run
         // unsplit: every token is fused, so the launch has no SyncAll, no workspace round trip and no
-        // reduction. An under-filled grid splits every context to put the idle blocks to work.
+        // reduction. An under-filled grid splits to put the idle blocks to work.
         // Count the chunks the heads-per-task rounding realises, not the chunk count asked for: 16 heads
         // asked into 5 chunks are 4 heads per task, so 4 tasks.
         const int64_t unsplit_heads = group > 1 ? CeilDiv64(group, chunks_for(num_tokens * num_kv_heads)) : 1;
         const int64_t base_tasks = num_tokens * num_kv_heads * CeilDiv64(group, unsplit_heads);
-        if (base_tasks < mix_blocks) {
-            num_splits = std::min(CeilDiv64(mix_blocks, base_tasks), std::min(max_splits, blocks));
+        int64_t wanted = base_tasks < mix_blocks ? CeilDiv64(mix_blocks, base_tasks) : 1;
+        // Bandwidth tier: a long context splits whether the grid is saturated or not, and never into fewer
+        // splits than the latency tier gives the same grid, so K does not dip as the context crosses in.
+        // K is rounded up to a power of two: blocks take tasks in equal runs, so 5 to 7 splits of the
+        // power-of-two tasks leave blocks idle (6 splits of 8 tasks are 48 tasks on 24 of 32 blocks).
+        if (context_bound >= kBandwidthSplitContext) {
+            wanted = CeilPow2(std::max(wanted, CeilDiv64(context_bound, kBandwidthSplitRows)));
         }
+        num_splits = std::min(wanted, std::min(max_splits, blocks));
         if (num_splits > 1) {
             launch_limit = 0;
         }

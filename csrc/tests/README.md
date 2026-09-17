@@ -347,13 +347,15 @@ warmup.
 | `ASCEND_BENCH_TQ_AUDIT_MODELS` | all three | `bench_device_950pr_turboquant` only: `qwen35,dsv4,glm52` |
 | `ASCEND_BENCH_TQ_AUDIT_S` / `_B` | all | the context regimes and batches to keep, comma lists over `2048,32768,262144,1048576` and `1,2,4,8` |
 | `ASCEND_BENCH_TQ_AUDIT_PHASES` | both | `prefill`, `decode` |
-| `ASCEND_BENCH_TQ_AUDIT_LEGS` | all | comma list of `pf_*` / `dec_*` legs to run |
+| `ASCEND_BENCH_TQ_AUDIT_LEGS` | all | comma list of `pf_*` / `dec_*` legs to run; `dec_fq_attn_core` and `dec_fq_e2e` are the in-launch rotation's |
 | `ASCEND_BENCH_TQ_AUDIT_CHUNK` | 2048 | query tokens one chunked-prefill step submits; `C = min(S, this)` |
 | `ASCEND_BENCH_TQ_AUDIT_PATH` | `cube` | `aiv` forces the AIV-only decode; every model takes the Cube decode otherwise |
+| `ASCEND_BENCH_TQ_AUDIT_SPLIT` | `adaptive` | the Cube decode's split policy: `adaptive` (two tiers: grid saturation below 8192 tokens, at least one split per 2048 rows from there), `fill` or `context` for an A/B |
+| `ASCEND_BENCH_TQ_ROTATION_MODE` | `both` | `bench_device_950pr_turboquant` only: `separate` times rotate_q as its own launch ahead of the decode, `fused_prologue` hands the Cube decode the raw query to rotate in the same launch (Table B path `Cube-FusedQ`, `T_rot_q` 0.00), `both` times each |
 | `ASCEND_BENCH_TQ_AUDIT_GLM_D` | 128 | GLM-5.2's head size; it is specified at 128 **or** 256 |
 | `ASCEND_BENCH_TQ_AUDIT_WARMUP` / `_ITERS` | 5 / 20 | the `S <= 32K` budget. The shared `ASCEND_BENCH_WARMUP` / `_ITERS` do not apply, and `pipeline_batch` is pinned to 1 |
 | `ASCEND_BENCH_TQ_AUDIT_ULTRA_WARMUP` / `_ULTRA_ITERS` | 1 / 3 | the `S >= 262K` budget, which gets its own runner and its own report table |
-| `ASCEND_BENCH_TQ_AUDIT_PREFILL_CSV` / `_DECODE_CSV` | unset | Table A and Table B as CSVs, one row per configuration |
+| `ASCEND_BENCH_TQ_AUDIT_PREFILL_CSV` / `_DECODE_CSV` | unset | Table A and Table B as CSVs: one prefill row per configuration, one decode row per configuration and rotation mode, with its `split_k,total_tasks,active_blocks,device_blocks,needs_reduction` dispatch vector |
 | `ASCEND_BENCH_TQ_FIA` | on | `bench_device_950pr_turboquant` only: `0` drops every native `aclnnFusedInferAttentionScoreV5` leg |
 | `ASCEND_TQ_TRACE_MODELS` | all three | `prof_device_950pr_msprof_trace` only: comma list of `Qwen3.5-9B,DeepSeek-V4-Flash,GLM-5.2-744B`, or their keys `qwen35,dsv4,glm52`. `--models=` overrides it |
 | `ASCEND_TQ_TRACE_CONTEXTS` / `_BATCHES` | `2048,32768` / `1,4` | `prof_device_950pr_msprof_trace` only: contexts (positive multiples of 8) and batches. `--contexts=` / `--batches=` override them |

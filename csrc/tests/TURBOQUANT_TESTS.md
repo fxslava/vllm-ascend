@@ -4033,3 +4033,117 @@ decode leg, its traffic model and the msprof trace. Table B gains a K column and
 CSV gains a trailing `split_policy` column. Silicon A/B:
 `ASCEND_BENCH_TQ_AUDIT_MODELS=qwen35,glm52 ASCEND_BENCH_TQ_AUDIT_S=2048,32768`, once per policy, with
 `ASCEND_BENCH_TQ_AUDIT_DECODE_CSV` set per run. No silicon number exists yet.
+
+### 13.35 Two-tier adaptive split policy, dispatch telemetry and the rotation-mode A/B (2026-09-17)
+
+**Why.** The user benchmarked 13.34's first adaptive draft on 950PR silicon at S = 32768, B = 4. Their numbers
+(no trace from this project backs them):
+
+| model | K = 8 (fill) | adaptive draft | draft K |
+|---|---|---|---|
+| DeepSeek-V4-Flash | 306.10 us, 124.4 GB/s | 1241.47 us, 30.4 GB/s | 1 |
+| GLM-5.2-744B | 171.27 us, 121.5 GB/s | 491.94 us, 42.5 GB/s | 2 |
+| Qwen3.5-9B | 147.17 us, 136.3 GB/s | 253.81 us, 80.6 GB/s | 4 |
+
+Their reading: one MTE2 stream per sequence cannot keep enough DMA transactions in flight to load the
+multi-channel HBM controller. That costs hundreds of microseconds, against 2-4 us for the partial reduction.
+
+**Policy.** `kAdaptive` now has two tiers, keyed on the longest context the grid is planned for,
+`blocks x block_size`.
+- **Latency tier (every context).** Unchanged from 13.34: K = ceil(mix_blocks / base_tasks) on an
+  under-filled grid, K = 1 on a saturated one.
+- **Bandwidth tier (context >= `kBandwidthSplitContext` = 8192).** K = CeilPow2(max(latency K,
+  ceil(S / `kBandwidthSplitRows` = 2048))). This splits a saturated grid too.
+- **Caps.** Both tiers are capped at `min(kMaxSequenceSplits, blocks)`. The fused limit is 0 whenever K > 1.
+
+Two changes to the directive's literal formula, both from the planner's own arithmetic:
+- **The max with the latency tier.** Without it, K is not monotonic in S. Qwen B = 1 plans 8 splits at 8064,
+  would get ceil(8192 / 2048) = 4 at 8192, and 8 again at 16384.
+- **The power-of-two rounding.** Blocks take tasks in equal runs, so 5 to 7 splits of power-of-two tasks
+  leave blocks idle. A literal ceil(12288 / 2048) = 6 puts 48 tasks on 24 of 32 blocks for Qwen B = 4, and
+  36 tasks on 18 blocks for DeepSeek B = 1. With the rounding, the tier is 4 splits at exactly 8192 tokens and 8 beyond.
+
+`DecodeNeedsReduction(K, max context, fused limit)` is the host side of both kernels' `NeedsReduction()`.
+
+**Schedule.** aiv 64 (32 MIX blocks), block 128, H_KV 1; `K/Tsk/Blk/Red`:
+
+| model | S | B 1 | B 2 | B 4 | B 8 |
+|---|---|---|---|---|---|
+| Qwen3.5 4:1 D128 | 2048 | 8/16/16/ON | 8/32/32/ON | 4/32/32/ON | 2/32/32/ON |
+| Qwen3.5 4:1 D128 | 32768, 262144, 1048576 | 8/16/16/ON | 8/32/32/ON | 8/32/32/ON (draft 4) | 8/64/32/ON (draft 2) |
+| DeepSeek-V4-Flash 16:1 D256 | 2048 | 4/32/32/ON | 2/32/32/ON | 1/32/32/OFF | 1/32/32/OFF |
+| DeepSeek-V4-Flash 16:1 D256 | 32768, 262144, 1048576 | 8/32/32/ON (draft 4) | 8/32/32/ON (draft 2) | 8/32/32/ON (draft 1) | 8/64/32/ON (draft 1) |
+| GLM-5.2 8:1 D128 | 2048 | 8/32/32/ON | 4/32/32/ON | 2/32/32/ON | 1/32/32/OFF |
+| GLM-5.2 8:1 D128 | 32768, 262144, 1048576 | 8/32/32/ON | 8/32/32/ON (draft 4) | 8/32/32/ON (draft 2) | 8/64/32/ON (draft 1) |
+
+- **Bench rows.** On every row the adaptive grid is now the fill policy's: same K, tasks, heads per task
+  and blocks. Only the launch limit differs, 0 against 4096, and a uniform batch beyond 4096 reduces either way.
+- **The 2048 rows** are 13.34's, pruning included.
+- **Where adaptive and fill still differ, off the bench.** At S in (4096, 8192) a saturated grid gets K = 1
+  against fill's >= 2. At S in [8192, 16384], adaptive gives 8 against fill's 4 at B = 8, and 4 against 8 for
+  DeepSeek at B = 1, 8192.
+
+**Telemetry (bench).**
+- **Table B columns:** `Model | Context | B | Path | Cfg [K/Tsk/Blk/Red] | T_rot_q | T_FusedDecode | Launches |
+  T_rot_o | TQ_E2E | V5_Decode | Speedup | Eff GB/s`.
+- **Cfg:** Tsk is the launch's task count (Cube B x H_KV x K x head chunks; AIV B x H_Q x K). Blk counts
+  MIX blocks (Cube) or vector cores (AIV); the legend prints the device totals.
+- **Compression** left the table; it stays in the CSV as `compression_ratio`.
+- **Alignment fix.** The old rows printed T_FusedDecode and Launches one column narrower than their headers.
+- **Decode CSV.** One row per (configuration, rotation mode). New columns: `rotation_mode, split_k, total_tasks,
+  active_blocks, device_blocks, needs_reduction`. `num_splits` became `split_k`.
+- **Consistency check.** Each configuration fails a `dispatch_*` case if the scenario's launched grid differs
+  from what the table reports.
+- **Traffic model.** The partials term follows `needs_reduction`, not K > 1.
+
+**Rotation mode (bench, user directive).** `ASCEND_BENCH_TQ_ROTATION_MODE=separate|fused_prologue|both`
+(default `both`).
+- **`fused_prologue`.** Path `Cube-FusedQ` feeds the raw fp16 query, the Pi signs and `CodecTables(D, 1)` to
+  `turboquant_mm_fused_decode_raw_query_impl` over the same grid, and passes `prologue_vectors_per_block`.
+- **New legs.** `dec_fq_attn_core` and `dec_fq_e2e`. T_rot_q is a structural 0.00 ("in-launch").
+  T_FusedDecode includes the rotation. Launches is one fewer than `Cube-Sep`.
+- **Shared with `-Sep`.** T_rot_o, V5 and Cfg.
+- **Delta block.** After the legend, one line per configuration gives TQ_E2E(-FusedQ) - TQ_E2E(-Sep), and the
+  T_FusedDecode difference against the rotate_q launch it replaces.
+- **AIV path.** It has no raw entry, so its `-FusedQ` legs are skipped.
+- **Agreement gate.** Before timing, every configuration that times `-FusedQ` runs both modes once.
+  - It prints how many fp32 words of the in-launch rotation differ from rotate_q's. This count is not gated:
+    rotate_q stages the Cube from two tokens on, and its rounding differs.
+  - It fails `rotation_mode_agreement_*` if the two decode outputs agree below cos 0.9999.
+  - Silicon is the first place the raw entry runs at B > 1 or D = 128.
+
+**Tests.**
+- **Host tiling test.**
+  - The sweep contract covers both tiers, with blocks 130 and 512 added.
+  - `FusedDecodeAdaptivePinsTheBenchSchedule` pins all 48 rows above and their equality with fill.
+  - `FusedDecodeAdaptiveCrossesIntoTheBandwidthTier` pins the boundary rows.
+  - `FusedDecodeAdaptiveNeverDipsOrStrandsBlocks` walks 1..512 blocks for B in {1..8, 16}, kv heads
+    {1, 2, 4, 8} and groups {1, 2, 4, 8, 16}: K never falls, and a power-of-two batch never leaves a block
+    idle.
+  - `FusedDecodeKeepsTheCamodelCaseGrids` pins (a)-(g)'s grids under their recorded policies. Those policies
+    are explicit in the fused test, so the adaptive policy was never on their path.
+  - `DecodeNeedsReductionMirrorsTheKernels` checks the host mirror.
+- **Kernel.** No kernel source changed.
+
+**Verification.** Host, sim and npu tiers built clean under `-Werror`: 0 diagnostic lines, target sets
+unchanged at 6 / 37 / 42. `test_host_turboquant_tiling` passed 11 of 11. Fused (a)-(g) ran on the camodel
+against the new sim tier, one process each (`build/nz_runs.sh bw /workspace/build_sim ag`), with the grids
+the host test pins:
+
+| case | K / blocks / heads per task / limit | golden | cos vs fp32 | notes |
+|---|---|---|---|---|
+| (a) | 1 / 2 / 2 / 4096 | `0x6176461416358ec1` | 0.999407 | 78 s |
+| (b) / (c) | 1 / 2 / 2 / 4096, 4 / 8 / 2 / 0 | `0x470dad36e6708da5` / `0xda6a2c77e20ff4a1` | 0.999400 / 0.999400 | (c) vs (b) cos 1.000000000; 250 s |
+| (d) | 1 / 2 / 4 / 4096 | `0xcc1fcdfed39b48e5` | 0.999517 | 102 s |
+| (e) | 1 / 2 / 2 / 4096 | `0x9ffe02efde1506cf` | 0.999576 | written cache 0 of 131,072 bytes differ; 446 s |
+| (f) | 1 / 2 / 2 / 4096 | `0xedc60ea1714295f1` | 0.999543 | 71 s |
+| (g) | 4 / 8 / 2 / 0 | `0xda6a2c77e20ff4a1` | 0.999400 | in-launch rotation 0 of 1,024 words differ; 164 s |
+
+Every run left 0 B of exception dumps. `build/bandwidth_tiers.sh` and `build/bandwidth_sim_ag.sh` repeat the
+two steps. `build/split_ab_compare.py` now keys on the rotation mode as well and reads `split_k` (or an older
+CSV's `num_splits`).
+
+**Not covered.**
+- No silicon number exists for either tier or either rotation mode.
+- The msprof trace harness plans with the new policy but has no rotation mode.
+- `test_sim_950pr_turboquant_multimode` (contexts <= 2048, so latency tier only) was built, not run.
