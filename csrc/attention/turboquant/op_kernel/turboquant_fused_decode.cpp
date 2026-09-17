@@ -252,16 +252,6 @@ private:
     uint32_t scaleSlot_ = 0;
 };
 
-// The block range of one decode task over one token's context, and how many Cube tiles it spans.
-struct TurboQuantTaskSpan {
-    uint32_t token = 0;
-    uint32_t contextLen = 0;
-    uint32_t blockStart = 0;
-    uint32_t blockEnd = 0;
-    uint32_t numTiles = 0;
-    uint32_t kvHead = 0;
-};
-
 // One launch per decode step on the arch35 Cube. A task is (token, kv head, sequence split, head
 // chunk). For every tile of a task the two AIV subcores stage K (subcore 0) and V (subcore 1) into L1;
 // the AIC runs the score and context GEMMs into both subcores' UB (TurboQuantCubeDecodeService); each
@@ -407,30 +397,26 @@ private:
 
         const uint32_t seqBlocks = contextLen > 0 ? CeilDiv(static_cast<uint32_t>(contextLen), blockSize_) : 0;
         const uint32_t blocksPerSplit = CeilDiv(seqBlocks, fused ? 1u : numSplits_);
-
-        TurboQuantTaskSpan span;
-        span.token = token;
-        span.kvHead = kvHead;
-        span.blockStart = split * blocksPerSplit;
-        span.blockEnd = span.blockStart + blocksPerSplit;
-        if (span.blockEnd > seqBlocks) {
-            span.blockEnd = seqBlocks;
+        const uint32_t blockStart = split * blocksPerSplit;
+        uint32_t blockEnd = blockStart + blocksPerSplit;
+        if (blockEnd > seqBlocks) {
+            blockEnd = seqBlocks;
         }
 
-        if (span.blockStart < span.blockEnd) {
-            span.contextLen = static_cast<uint32_t>(contextLen);
-            span.numTiles = CountTiles(span);
+        if (blockStart < blockEnd) {
+            const uint32_t ctxLen = static_cast<uint32_t>(contextLen);
+            const uint32_t numTiles = CountTiles(token, ctxLen, blockStart, blockEnd);
             if ASCEND_IS_AIV {
                 vector_.StageQuery(mm_, token, kvHead, heads);
-                const uint32_t tail = span.contextLen % kCubeTileRows;
-                if (heads.mine > 0 && span.blockEnd == seqBlocks && tail != 0) {
+                const uint32_t tail = ctxLen % kCubeTileRows;
+                if (heads.mine > 0 && blockEnd == seqBlocks && tail != 0) {
                     vector_.ComputeTailMask(tail);
                 }
-                StageTiles(span, heads);
+                StageTiles(token, ctxLen, blockStart, blockEnd, numTiles, kvHead, heads);
             }
             if ASCEND_IS_AIC {
-                if (span.numTiles > 0) {
-                    Cube::RunTiles(mm_, vector_.Scores(), vector_.Context(), span.numTiles, heads.rows, headSize_);
+                if (numTiles > 0) {
+                    Cube::RunTiles(mm_, vector_.Scores(), vector_.Context(), numTiles, heads.rows, headSize_);
                 }
             }
         }
@@ -440,35 +426,30 @@ private:
         }
     }
 
-    // Valid rows of a block of the span: blockSize_, or fewer in the context's last block.
-    __aicore__ inline uint32_t BlockRows(const TurboQuantTaskSpan &span, const uint32_t block) const
-    {
-        uint32_t rows = blockSize_;
-        const uint32_t consumed = block * blockSize_;
-        if (consumed + rows > span.contextLen) {
-            rows = span.contextLen - consumed;
-        }
-        return rows;
-    }
-
-    __aicore__ inline int32_t PhysicalBlock(const TurboQuantTaskSpan &span, const uint32_t block)
-    {
-        return blockTableGm_.GetValue(static_cast<uint64_t>(span.token) * maxBlocksPerSeq_ + block);
-    }
-
-    __aicore__ inline uint32_t CountTiles(const TurboQuantTaskSpan &span)
+    // The block range and tile cursor below take the task's extents as separate scalars on purpose: packed
+    // into a struct they are reloaded from memory on every tile, and the AIV issues more scalar instructions.
+    __aicore__ inline uint32_t CountTiles(const uint32_t token, const uint32_t contextLen, const uint32_t blockStart,
+                                          const uint32_t blockEnd)
     {
         uint32_t tiles = 0;
-        for (uint32_t block = span.blockStart; block < span.blockEnd; ++block) {
-            if (PhysicalBlock(span, block) < 0) {
+        for (uint32_t block = blockStart; block < blockEnd; ++block) {
+            const int32_t physical =
+                blockTableGm_.GetValue(static_cast<uint64_t>(token) * maxBlocksPerSeq_ + block);
+            if (physical < 0) {
                 continue;
             }
-            tiles += CeilDiv(BlockRows(span, block), kCubeTileRows);
+            uint32_t rows = blockSize_;
+            const uint32_t consumed = block * blockSize_;
+            if (consumed + rows > contextLen) {
+                rows = contextLen - consumed;
+            }
+            tiles += CeilDiv(rows, kCubeTileRows);
         }
         return tiles;
     }
 
-    __aicore__ inline bool NextTile(TileCursor &cursor, const TurboQuantTaskSpan &span)
+    __aicore__ inline bool NextTile(TileCursor &cursor, const uint32_t token, const uint32_t contextLen,
+                                    const uint32_t blockEnd)
     {
         if (cursor.active) {
             cursor.base += kCubeTileRows;
@@ -482,10 +463,15 @@ private:
             cursor.active = false;
             ++cursor.block;
         }
-        while (cursor.block < span.blockEnd) {
-            const int32_t physical = PhysicalBlock(span, cursor.block);
+        while (cursor.block < blockEnd) {
+            const int32_t physical =
+                blockTableGm_.GetValue(static_cast<uint64_t>(token) * maxBlocksPerSeq_ + cursor.block);
             if (physical >= 0) {
-                const uint32_t rows = BlockRows(span, cursor.block);
+                uint32_t rows = blockSize_;
+                const uint32_t consumed = cursor.block * blockSize_;
+                if (consumed + rows > contextLen) {
+                    rows = contextLen - consumed;
+                }
                 if (rows > 0) {
                     cursor.physical = static_cast<uint32_t>(physical);
                     cursor.rows = rows;
@@ -500,46 +486,51 @@ private:
         return false;
     }
 
-    __aicore__ inline void StageTiles(const TurboQuantTaskSpan &span, const TurboQuantTaskHeads &heads)
+    __aicore__ inline void StageTiles(const uint32_t token, const uint32_t contextLen, const uint32_t blockStart,
+                                      const uint32_t blockEnd, const uint32_t numTiles, const uint32_t kvHead,
+                                      const TurboQuantTaskHeads &heads)
     {
-        if (span.numTiles == 0) {
+        if (numTiles == 0) {
             return;
         }
         if constexpr (Vector::kBatched) {
-            StageTilesRing(span, heads);
+            StageTilesRing(token, contextLen, blockStart, blockEnd, numTiles, kvHead, heads);
         } else {
-            StageTilesLockStep(span, heads);
+            StageTilesLockStep(token, contextLen, blockStart, blockEnd, numTiles, kvHead, heads);
         }
     }
 
     // The AIV side of the tile pipeline. Tile t+1 is staged while the Cube multiplies tile t, so the
     // two L1 slots alternate; every subcore sets every AIV -> AIC flag because the AIC's wait needs both.
-    __aicore__ inline void StageTilesLockStep(const TurboQuantTaskSpan &span, const TurboQuantTaskHeads &heads)
+    __aicore__ inline void StageTilesLockStep(const uint32_t token, const uint32_t contextLen,
+                                              const uint32_t blockStart, const uint32_t blockEnd,
+                                              const uint32_t numTiles, const uint32_t kvHead,
+                                              const TurboQuantTaskHeads &heads)
     {
         TileCursor stageCursor;
         TileCursor consumeCursor;
-        stageCursor.block = span.blockStart;
-        consumeCursor.block = span.blockStart;
+        stageCursor.block = blockStart;
+        consumeCursor.block = blockStart;
 
-        NextTile(stageCursor, span);
-        vector_.StageTile(mm_, stageCursor.physical, stageCursor.base, span.kvHead, 0, false);
+        NextTile(stageCursor, token, contextLen, blockEnd);
+        vector_.StageTile(mm_, stageCursor.physical, stageCursor.base, kvHead, 0, false);
         SyncSlotReady(0);
 
-        for (uint32_t tileIdx = 0; tileIdx < span.numTiles; ++tileIdx) {
+        for (uint32_t tileIdx = 0; tileIdx < numTiles; ++tileIdx) {
             const uint32_t nextSlot = (tileIdx + 1) % kCubeSlots;
-            NextTile(consumeCursor, span);
+            NextTile(consumeCursor, token, contextLen, blockEnd);
 
             AscendC::CrossCoreWaitFlag(kFlagScoresReady);
             vector_.ComputeSoftmaxAndStageProbs(mm_, consumeCursor.valid, heads, 0);
             AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_MTE3>(kFlagProbsReady);
             vector_.ComputeAccumulatorDecay(heads);
 
-            if (tileIdx + 1 < span.numTiles) {
+            if (tileIdx + 1 < numTiles) {
                 if (tileIdx + 1 >= kCubeSlots) {
                     AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kFlagSlotFree + nextSlot));
                 }
-                NextTile(stageCursor, span);
-                vector_.StageTile(mm_, stageCursor.physical, stageCursor.base, span.kvHead, nextSlot, true);
+                NextTile(stageCursor, token, contextLen, blockEnd);
+                vector_.StageTile(mm_, stageCursor.physical, stageCursor.base, kvHead, nextSlot, true);
                 SyncSlotReady(nextSlot);
             }
 
@@ -552,42 +543,44 @@ private:
     // slot t % kCubeSlots; the first two are read up front and tile t + 2 as soon as tile t's softmax has
     // consumed its scale lanes, so the read overlaps tile t + 1's stage, GEMMs and accumulation, and a
     // stage only waits on its own slot's read.
-    __aicore__ inline void StageTilesRing(const TurboQuantTaskSpan &span, const TurboQuantTaskHeads &heads)
+    __aicore__ inline void StageTilesRing(const uint32_t token, const uint32_t contextLen, const uint32_t blockStart,
+                                          const uint32_t blockEnd, const uint32_t numTiles, const uint32_t kvHead,
+                                          const TurboQuantTaskHeads &heads)
     {
         TileCursor readCursor;
         TileCursor consumeCursor;
-        readCursor.block = span.blockStart;
-        consumeCursor.block = span.blockStart;
+        readCursor.block = blockStart;
+        consumeCursor.block = blockStart;
 
-        const uint32_t primed = span.numTiles < kCubeSlots ? span.numTiles : kCubeSlots;
+        const uint32_t primed = numTiles < kCubeSlots ? numTiles : kCubeSlots;
         for (uint32_t slot = 0; slot < primed; ++slot) {
-            NextTile(readCursor, span);
-            vector_.ReadTileToSlot(readCursor.physical, readCursor.base, span.kvHead, slot);
+            NextTile(readCursor, token, contextLen, blockEnd);
+            vector_.ReadTileToSlot(readCursor.physical, readCursor.base, kvHead, slot);
         }
-        vector_.StageSlotToL1(mm_, span.kvHead, 0);
+        vector_.StageSlotToL1(mm_, kvHead, 0);
         SyncSlotReady(0);
 
-        for (uint32_t tileIdx = 0; tileIdx < span.numTiles; ++tileIdx) {
+        for (uint32_t tileIdx = 0; tileIdx < numTiles; ++tileIdx) {
             const uint32_t slot = tileIdx % kCubeSlots;
             const uint32_t nextSlot = (tileIdx + 1) % kCubeSlots;
-            NextTile(consumeCursor, span);
+            NextTile(consumeCursor, token, contextLen, blockEnd);
 
             AscendC::CrossCoreWaitFlag(kFlagScoresReady);
             vector_.ComputeSoftmaxAndStageProbs(mm_, consumeCursor.valid, heads, slot);
             AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_MTE3>(kFlagProbsReady);
 
-            if (tileIdx + kCubeSlots < span.numTiles) {
+            if (tileIdx + kCubeSlots < numTiles) {
                 SyncVectorToMte2();
-                NextTile(readCursor, span);
-                vector_.ReadTileToSlot(readCursor.physical, readCursor.base, span.kvHead, slot);
+                NextTile(readCursor, token, contextLen, blockEnd);
+                vector_.ReadTileToSlot(readCursor.physical, readCursor.base, kvHead, slot);
             }
             vector_.ComputeAccumulatorDecay(heads);
 
-            if (tileIdx + 1 < span.numTiles) {
+            if (tileIdx + 1 < numTiles) {
                 if (tileIdx + 1 >= kCubeSlots) {
                     AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kFlagSlotFree + nextSlot));
                 }
-                vector_.StageSlotToL1(mm_, span.kvHead, nextSlot);
+                vector_.StageSlotToL1(mm_, kvHead, nextSlot);
                 SyncSlotReady(nextSlot);
             }
 

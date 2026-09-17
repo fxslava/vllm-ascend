@@ -349,7 +349,7 @@ warmup.
 | `ASCEND_BENCH_TQ_AUDIT_PHASES` | both | `prefill`, `decode` |
 | `ASCEND_BENCH_TQ_AUDIT_LEGS` | all | comma list of `pf_*` / `dec_*` legs to run |
 | `ASCEND_BENCH_TQ_AUDIT_CHUNK` | 2048 | query tokens one chunked-prefill step submits; `C = min(S, this)` |
-| `ASCEND_BENCH_TQ_AUDIT_PATH` | `auto` | `cube` or `aiv` to override the `H_Q/H_KV >= 16` rule that picks the decode path |
+| `ASCEND_BENCH_TQ_AUDIT_PATH` | `cube` | `aiv` forces the AIV-only decode; every model takes the Cube decode otherwise |
 | `ASCEND_BENCH_TQ_AUDIT_GLM_D` | 128 | GLM-5.2's head size; it is specified at 128 **or** 256 |
 | `ASCEND_BENCH_TQ_AUDIT_WARMUP` / `_ITERS` | 5 / 20 | the `S <= 32K` budget. The shared `ASCEND_BENCH_WARMUP` / `_ITERS` do not apply, and `pipeline_batch` is pinned to 1 |
 | `ASCEND_BENCH_TQ_AUDIT_ULTRA_WARMUP` / `_ULTRA_ITERS` | 1 / 3 | the `S >= 262K` budget, which gets its own runner and its own report table |

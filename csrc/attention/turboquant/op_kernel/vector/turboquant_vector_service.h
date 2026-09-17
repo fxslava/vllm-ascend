@@ -342,8 +342,36 @@ public:
         if (heads.mine == 0) {
             return;
         }
-        StageQueryRowsToL1(mm, token, heads);
-        ComputeScaleGatherIndex(kvHead);
+        const AscendC::LocalTensor<float> queryIn = queryInBuf_.Get<float>();
+        const AscendC::LocalTensor<OperandT> queryOperand = queryOperandBuf_.Get<OperandT>();
+        const AscendC::LocalTensor<OperandT> queryL1 = mm.A1Query();
+
+        AscendC::DataCopy(queryIn,
+                          queryRotGm_[(static_cast<uint64_t>(token) * numHeads_ + heads.first + heads.base) *
+                                      headSize_],
+                          heads.mine * headSize_);
+        SyncMte2ToVector();
+
+        if constexpr (kBatched) {
+            ComputeQueryOperandRows(heads.mine);
+        } else {
+            ComputeQueryOperandHeads(heads.mine);
+        }
+
+        SyncVectorToMte3();
+        for (uint32_t j = 0; j < heads.mine; ++j) {
+            AscendC::DataCopy(queryL1[(heads.base + j) * kOperandC0], queryOperand[j * operandElems_],
+                              queryRowToL1Params_);
+        }
+
+        // Byte offsets of the task's kv head in each tile row's scale slot: K lanes first, V lanes after.
+        const int32_t slotBytes = static_cast<int32_t>(scaleSlot_ * sizeof(float));
+        const AscendC::LocalTensor<int32_t> scaleIndex = scaleIndexBuf_.Get<int32_t>();
+        AscendC::ArithProgression(scaleIndex, static_cast<int32_t>(kvHead * sizeof(float)), slotBytes,
+                                  static_cast<int32_t>(kCubeTileRows));
+        AscendC::ArithProgression(scaleIndex[kCubeTileRows],
+                                  static_cast<int32_t>((numKvHeads_ + kvHead) * sizeof(float)), slotBytes,
+                                  static_cast<int32_t>(kCubeTileRows));
     }
 
     // The mask a partial last tile is Min-ed with: 0-crossing at `valid`, +huge before, -huge after.
@@ -401,17 +429,26 @@ public:
 
     // Scores for this subcore's heads arrived from the Cube: finish the logits, advance the running
     // max / log-sum per head, and stage the probability rows (on the operand grid) into L1. `slot` is the
-    // ingest slot holding this tile's scale lanes.
+    // ingest slot holding this tile's scale lanes. One body on purpose: split into helpers, the per-tile
+    // tensor views are re-derived in each and the AIV issues more scalar instructions per tile.
     __aicore__ inline void ComputeSoftmaxAndStageProbs(Mm &mm, const uint32_t valid, const TurboQuantTaskHeads &heads,
                                                        const uint32_t slot)
     {
         if (heads.mine == 0) {
             return;
         }
+        const AscendC::LocalTensor<float> scaleTile = scaleTileBuf_[slot].Get<float>();
         const AscendC::LocalTensor<float> reduce = reduceBuf_.Get<float>();
         const AscendC::LocalTensor<float> keyScale = reduce;
         const AscendC::LocalTensor<float> valueScale = reduce[kCubeTileRows];
-        ComputeTileScales(keyScale, valueScale, slot);
+        const AscendC::LocalTensor<OperandT> probOperand = probOperandBuf_.Get<OperandT>();
+        const uint32_t probElems = Mm::OperandElems(kCubeTileRows);
+
+        const AscendC::LocalTensor<uint32_t> scaleIndex = scaleIndexBuf_.Get<int32_t>().ReinterpretCast<uint32_t>();
+        AscendC::Gather(keyScale, scaleTile, scaleIndex, kGatherSrcBase, kCubeTileRows);
+        AscendC::Gather(valueScale, scaleTile, scaleIndex[kCubeTileRows], kGatherSrcBase, kCubeTileRows);
+        AscendC::Muls(keyScale, keyScale, scoreScale_, kCubeTileRows);
+        AscendC::Muls(valueScale, valueScale, invGain_, kCubeTileRows);
 
         if constexpr (kBatched) {
             ComputeSoftmaxRows(valid, heads.mine, keyScale, valueScale);
@@ -419,7 +456,12 @@ public:
             ComputeSoftmaxHeads(valid, heads.mine, keyScale, valueScale);
         }
 
-        StageProbRowsToL1(mm, heads);
+        const AscendC::LocalTensor<OperandT> probsL1 = mm.A1Probs();
+        SyncVectorToMte3();
+        for (uint32_t j = 0; j < heads.mine; ++j) {
+            AscendC::DataCopy(probsL1[(heads.base + j) * kOperandC0], probOperand[j * probElems], probRowToL1Params_);
+        }
+        SyncMte3ToVector();
     }
 
     // Decays the accumulators by alpha = exp(runMax - newMax) before this tile's context lands.
@@ -616,69 +658,6 @@ private:
         return Plane() == kKeyPlane ? mm.B1K(slot) : mm.B1V(slot);
     }
 
-    __aicore__ inline void StageQueryRowsToL1(Mm &mm, const uint32_t token, const TurboQuantTaskHeads &heads)
-    {
-        const AscendC::LocalTensor<float> queryIn = queryInBuf_.Get<float>();
-        const AscendC::LocalTensor<OperandT> queryOperand = queryOperandBuf_.Get<OperandT>();
-        const AscendC::LocalTensor<OperandT> queryL1 = mm.A1Query();
-
-        AscendC::DataCopy(queryIn,
-                          queryRotGm_[(static_cast<uint64_t>(token) * numHeads_ + heads.first + heads.base) *
-                                      headSize_],
-                          heads.mine * headSize_);
-        SyncMte2ToVector();
-
-        if constexpr (kBatched) {
-            ComputeQueryOperandRows(heads.mine);
-        } else {
-            ComputeQueryOperandHeads(heads.mine);
-        }
-
-        SyncVectorToMte3();
-        for (uint32_t j = 0; j < heads.mine; ++j) {
-            AscendC::DataCopy(queryL1[(heads.base + j) * kOperandC0], queryOperand[j * operandElems_],
-                              queryRowToL1Params_);
-        }
-    }
-
-    // Byte offsets of the task's kv head in each tile row's scale slot: K lanes first, V lanes after.
-    __aicore__ inline void ComputeScaleGatherIndex(const uint32_t kvHead)
-    {
-        const int32_t slotBytes = static_cast<int32_t>(scaleSlot_ * sizeof(float));
-        const AscendC::LocalTensor<int32_t> scaleIndex = scaleIndexBuf_.Get<int32_t>();
-        AscendC::ArithProgression(scaleIndex, static_cast<int32_t>(kvHead * sizeof(float)), slotBytes,
-                                  static_cast<int32_t>(kCubeTileRows));
-        AscendC::ArithProgression(scaleIndex[kCubeTileRows],
-                                  static_cast<int32_t>((numKvHeads_ + kvHead) * sizeof(float)), slotBytes,
-                                  static_cast<int32_t>(kCubeTileRows));
-    }
-
-    // Gathers the tile's K and V scales of the task's kv head and folds the score scale and the codebook gain
-    // into them.
-    __aicore__ inline void ComputeTileScales(const AscendC::LocalTensor<float> &keyScale,
-                                             const AscendC::LocalTensor<float> &valueScale, const uint32_t slot)
-    {
-        const AscendC::LocalTensor<float> scaleTile = scaleTileBuf_[slot].Get<float>();
-        const AscendC::LocalTensor<uint32_t> scaleIndex =
-            scaleIndexBuf_.Get<int32_t>().ReinterpretCast<uint32_t>();
-        AscendC::Gather(keyScale, scaleTile, scaleIndex, kGatherSrcBase, kCubeTileRows);
-        AscendC::Gather(valueScale, scaleTile, scaleIndex[kCubeTileRows], kGatherSrcBase, kCubeTileRows);
-        AscendC::Muls(keyScale, keyScale, scoreScale_, kCubeTileRows);
-        AscendC::Muls(valueScale, valueScale, invGain_, kCubeTileRows);
-    }
-
-    __aicore__ inline void StageProbRowsToL1(Mm &mm, const TurboQuantTaskHeads &heads)
-    {
-        const AscendC::LocalTensor<OperandT> probOperand = probOperandBuf_.Get<OperandT>();
-        const AscendC::LocalTensor<OperandT> probsL1 = mm.A1Probs();
-        const uint32_t probElems = Mm::OperandElems(kCubeTileRows);
-        SyncVectorToMte3();
-        for (uint32_t j = 0; j < heads.mine; ++j) {
-            AscendC::DataCopy(probsL1[(heads.base + j) * kOperandC0], probOperand[j * probElems], probRowToL1Params_);
-        }
-        SyncMte3ToVector();
-    }
-
     // This subcore's plane of one tile and the tile's scale lanes, into ingest slot `slot`. rowBase is a
     // whole number of tiles into the block, so an NZ-tiled (tile, kv head) starts at
     // (row * kv heads + kvHead * kCubeTileRows) * packedBytes (turboquant_layout.h, NzTiledPackedByte).
@@ -858,36 +837,11 @@ private:
     }
 
     // The same recurrence over every row at once: a row op repeats over the heads, a per-head scalar is a
-    // head block, and the row sums and maxima are whole-row reduces with no scalar readback.
+    // head block, and the row sums and maxima are whole-row reduces with no scalar readback. Logits, one
+    // online-softmax step (newMax, alpha, runSum), then the probability rows on the operand grid.
     __aicore__ inline void ComputeSoftmaxRows(const uint32_t valid, const uint32_t heads,
                                               const AscendC::LocalTensor<float> &keyScale,
                                               const AscendC::LocalTensor<float> &valueScale)
-    {
-        ComputeRowLogits(valid, heads, keyScale);
-        ComputeRowSoftmaxStep(heads);
-        ComputeRowProbOperands(heads, valueScale);
-    }
-
-    // scores *= kScale (per tile row) * 1 / qScale (per head), then the tail mask.
-    __aicore__ inline void ComputeRowLogits(const uint32_t valid, const uint32_t heads,
-                                            const AscendC::LocalTensor<float> &keyScale)
-    {
-        const AscendC::LocalTensor<float> scores = scoreBuf_.Get<float>();
-        const AscendC::LocalTensor<float> qInv = StateField(kStateQInv);
-        const AscendC::LocalTensor<float> mask = maskBuf_.Get<float>();
-        const uint64_t rowLanes = kCubeTileRows;
-        const uint8_t rows = static_cast<uint8_t>(heads);
-
-        AscendC::Mul(scores, scores, keyScale, rowLanes, rows, tileByVectorParams_);
-        AscendC::Mul(scores, scores, qInv, rowLanes, rows, tileByBlockParams_);
-        if (valid < kCubeTileRows) {
-            AscendC::Min(scores, scores, mask, rowLanes, rows, tileByVectorParams_);
-        }
-    }
-
-    // One online-softmax step per head: newMax, alpha = exp(runMax - newMax), scores = exp(scores - newMax),
-    // runSum = runSum * alpha + sum(scores).
-    __aicore__ inline void ComputeRowSoftmaxStep(const uint32_t heads)
     {
         const AscendC::LocalTensor<float> scores = scoreBuf_.Get<float>();
         const AscendC::LocalTensor<float> runMax = StateField(kStateRunMax);
@@ -895,10 +849,20 @@ private:
         const AscendC::LocalTensor<float> tileMax = StateField(kStateTileMax);
         const AscendC::LocalTensor<float> newMax = StateField(kStateNewMax);
         const AscendC::LocalTensor<float> alpha = StateField(kStateAlpha);
+        const AscendC::LocalTensor<float> probScale = StateField(kStateProbScale);
+        const AscendC::LocalTensor<float> qInv = StateField(kStateQInv);
         const AscendC::LocalTensor<float> part = StateField(kStatePart);
+        const AscendC::LocalTensor<float> mask = maskBuf_.Get<float>();
+        const AscendC::LocalTensor<OperandT> probOperand = probOperandBuf_.Get<OperandT>();
         const uint64_t rowLanes = kCubeTileRows;
         const uint8_t rows = static_cast<uint8_t>(heads);
         const uint32_t lanes = heads * kFp32PerBlock;
+
+        AscendC::Mul(scores, scores, keyScale, rowLanes, rows, tileByVectorParams_);
+        AscendC::Mul(scores, scores, qInv, rowLanes, rows, tileByBlockParams_);
+        if (valid < kCubeTileRows) {
+            AscendC::Min(scores, scores, mask, rowLanes, rows, tileByVectorParams_);
+        }
 
         ReduceTileRows<AscendC::ReduceType::MAX>(tileMax, scores, heads);
         AscendC::Max(newMax, runMax, tileMax, static_cast<int32_t>(lanes));
@@ -910,19 +874,6 @@ private:
         ReduceTileRows<AscendC::ReduceType::SUM>(part, scores, heads);
         AscendC::Mul(runSum, runSum, alpha, lanes);
         AscendC::Add(runSum, runSum, part, lanes);
-    }
-
-    // probs = scores * vScale on the operand grid: scaled per head to OperandMax, then cast.
-    __aicore__ inline void ComputeRowProbOperands(const uint32_t heads, const AscendC::LocalTensor<float> &valueScale)
-    {
-        const AscendC::LocalTensor<float> scores = scoreBuf_.Get<float>();
-        const AscendC::LocalTensor<float> probScale = StateField(kStateProbScale);
-        const AscendC::LocalTensor<float> part = StateField(kStatePart);
-        const AscendC::LocalTensor<OperandT> probOperand = probOperandBuf_.Get<OperandT>();
-        const uint64_t rowLanes = kCubeTileRows;
-        const uint8_t rows = static_cast<uint8_t>(heads);
-        const uint32_t lanes = heads * kFp32PerBlock;
-
         AscendC::Mul(scores, scores, valueScale, rowLanes, rows, tileByVectorParams_);
 
         ReduceTileRows<AscendC::ReduceType::MAX>(part, scores, heads);

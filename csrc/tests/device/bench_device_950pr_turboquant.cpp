@@ -1327,10 +1327,8 @@ void PrintTableB(const std::vector<BenchmarkRunner*>& runners, const std::vector
               "[ascend-bench]   rotate-o; T_FusedDecode is the attention core, ONE launch on either path (a\n"
               "[ascend-bench]   context above 4096 is split and reduced inside that launch). Launches counts the\n"
               "[ascend-bench]   host dispatches of one decode step: rotate-q, the core, and rotate-o if unfolded.\n");
-  std::printf("[ascend-bench]   Path is chosen by the GQA group and not by a flag: H_Q/H_KV >= %lld fills the\n"
-              "[ascend-bench]   Cube's M fractal and takes the Cube decode, anything narrower takes the vector\n"
-              "[ascend-bench]   path. ASCEND_BENCH_TQ_AUDIT_PATH overrides it.\n",
-              static_cast<long long>(tqh::kCubeTileM));
+  std::printf("[ascend-bench]   Every model takes the Cube decode, whatever its GQA group or head size;\n"
+              "[ascend-bench]   ASCEND_BENCH_TQ_AUDIT_PATH=aiv forces the vector-only path for an A/B.\n");
   std::printf("[ascend-bench]   Eff GB/s is the step's compulsory traffic over its measured composite time.\n"
               "[ascend-bench]   Compression is fp16 KV residency over TurboQuant's, scale plane included -- at\n"
               "[ascend-bench]   H_KV=1 the scale plane's 32-byte burst floor is most of the gap from 4.00x.\n");

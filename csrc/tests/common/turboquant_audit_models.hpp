@@ -66,8 +66,7 @@ inline std::vector<ModelSpec> Models() {
                 "attn_output_gate: sigmoid(gate) * context sits between attention and o_proj, "
                 "so W_o cannot absorb Pi and the O de-rotation is measured"},
       ModelSpec{"dsv4", "DeepSeek-V4-Flash", 256, 16, 1, true,
-                "MLA, decoupled latent KV; the 16:1 group exactly fills the Cube's M=16 fractal; "
-                "W_o folded offline"},
+                "MLA, decoupled latent KV; one 16:1 group is one 16-row Cube task; W_o folded offline"},
       ModelSpec{"glm52", "GLM-5.2-744B", GlmHeadSize(), 8, 1, true,
                 "ultra-wide GQA; W_o folded offline"},
   };
@@ -77,17 +76,19 @@ enum class PathMode { kCube, kAiv };
 
 inline const char* PathLabel(PathMode path) { return path == PathMode::kCube ? "Cube" : "AIV"; }
 
+// Every model decodes on the Cube: silicon measured the Cube path at 1.98x-2.18x and the AIV-only path at
+// 0.05x-0.19x, narrow GQA groups (4:1, 8:1) and D = 128 included. A task's M is its head chunk, padded to
+// the 16-row fractal by the Fixpipe; rows from different kv heads cannot share one score GEMM, because each
+// multiplies its own kv head's key tile. ASCEND_BENCH_TQ_AUDIT_PATH=aiv still forces the AIV-only decode
+// for an A/B.
 inline PathMode SelectPath(const ModelSpec& model) {
+  static_cast<void>(model);
   const char* raw = std::getenv("ASCEND_BENCH_TQ_AUDIT_PATH");
   const std::string forced = raw == nullptr ? std::string() : std::string(raw);
-  if (forced == "cube") {
-    return PathMode::kCube;
-  }
   if (forced == "aiv") {
     return PathMode::kAiv;
   }
-  const int64_t group = model.num_heads / model.num_kv_heads;
-  return group >= turboquant_host::kCubeTileM ? PathMode::kCube : PathMode::kAiv;
+  return PathMode::kCube;
 }
 
 inline int64_t PrefillChunk(int64_t seq_len) {

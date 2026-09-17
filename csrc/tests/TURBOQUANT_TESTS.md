@@ -548,9 +548,9 @@ shapes nobody deploys and buries the nine that matter.
 
 | model | `D` | `H_Q` | `H_KV` | fold | decode path | why |
 | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3.5-9B | 128 | 4 | 1 | **no** | AIV | GQA 4:1; `attn_output_gate` blocks the fold |
+| Qwen3.5-9B | 128 | 4 | 1 | **no** | **Cube** (AIV before 13.31) | GQA 4:1; `attn_output_gate` blocks the fold |
 | DeepSeek-V4-Flash-284B | 256 | 16 | 1 | yes | **Cube** | MLA decoupled latent KV; 16:1 exactly fills the Cube's M fractal |
-| GLM-5.2-744B | 128 | 8 | 1 | yes | AIV | ultra-wide GQA |
+| GLM-5.2-744B | 128 | 8 | 1 | yes | **Cube** (AIV before 13.31) | ultra-wide GQA |
 
 | regime | `S` | `B` | warmup | timed |
 | --- | --- | --- | --- | --- |
@@ -571,11 +571,10 @@ throws if it is called after a case has run.
 #### The decode path is chosen by the GQA group, not by a flag
 
 The Cube decode batches a kv head's query heads into the GEMM's `M` dimension, and
-that fractal is 16 rows wide (`turboquant_host::kCubeTileM`). A 16:1 group fills
-it; a 4:1 or 8:1 group runs it three-quarters or half empty and the vector path is
-the right one there. So `H_Q / H_KV >= 16` takes the Cube split and anything
-narrower takes `turboquant_paged_attention`. `ASCEND_BENCH_TQ_AUDIT_PATH=cube|aiv`
-overrides it.
+that fractal is 16 rows wide (`turboquant_host::kCubeTileM`). **Superseded 2026-09-17
+(13.31):** every model now takes the Cube decode. Silicon measured it at 1.98x-2.18x and
+the AIV-only path at 0.05x-0.19x, narrow groups included. `ASCEND_BENCH_TQ_AUDIT_PATH=aiv`
+forces the AIV-only path.
 
 **The AIV path's `T_DecodeSplit` is derived, and is marked `~`.** There is no
 exported entry point for the AIV split alone — `turboquant_paged_attention_impl`
@@ -730,7 +729,7 @@ read without its banner.
 | `ASCEND_BENCH_TQ_AUDIT_PHASES` | both | `prefill`, `decode` |
 | `ASCEND_BENCH_TQ_AUDIT_LEGS` | all | restrict the legs by name |
 | `ASCEND_BENCH_TQ_AUDIT_CHUNK` | 2048 | the prefill chunk `C` |
-| `ASCEND_BENCH_TQ_AUDIT_PATH` | `auto` | `cube` or `aiv` to override the group rule |
+| `ASCEND_BENCH_TQ_AUDIT_PATH` | `cube` | `aiv` forces the AIV-only decode (13.31) |
 | `ASCEND_BENCH_TQ_AUDIT_GLM_D` | 128 | GLM-5.2 is specified at 128 **or** 256 |
 | `ASCEND_BENCH_TQ_AUDIT_WARMUP` / `_ITERS` | 5 / 20 | the `S ≤ 32K` budget |
 | `ASCEND_BENCH_TQ_AUDIT_ULTRA_WARMUP` / `_ULTRA_ITERS` | 1 / 3 | the `S ≥ 262K` budget |
@@ -3890,3 +3889,45 @@ same latency swinging between identical instances (c 193 vs c_bar 149). The AIV 
 212 in (a) and 1,044 in (b), consistent with the extra per-tile `TBuf::Get` lookups of the split softmax
 helpers. A sequential same-session A/B was started and stopped by user direction. Latency is to be judged
 on silicon (`msprof`), not on these spans.
+
+### 13.31 Every model on the Cube decode; the scalar overhead of 13.30 removed (2026-09-17)
+
+**Routing.** Silicon measured the Cube decode at 1.98x-2.18x and the AIV-only decode at 0.05x-0.19x (user
+report). `SelectPath` (`turboquant_audit_models.hpp`) therefore returns `kCube` for every model: Qwen3.5-9B
+(D 128, 4:1) and GLM-5.2 (8:1) move off the AIV path. `ASCEND_BENCH_TQ_AUDIT_PATH=aiv` still forces the
+AIV-only decode for an A/B. `PlanFusedDecode` had no D or group gate and is unchanged, so the K = 4
+context splits of the 32-block grid still apply. The wheel's adapter is not touched and still dispatches
+`turboquant_paged_attention`; the Cube decode stays test-only.
+
+**D = 128 needs no kernel change.** Every size in the kv4fp8 Cube path follows from `headSize` and the
+32 B C0: a 64 x 64 B NZ tile burst, two 2,048 B unpack chunks, an 8,192 B L1 tile in 256 C0 blocks,
+query rows of 4 C0 groups, a context Fixpipe with n = 128, and 64 B per kv head in the writer. **D = 128
+has not executed on the Cube** (fused (a)-(e) are D = 256); its first run is the silicon bench.
+
+**Not implemented: packing kv heads into M = 16.** A score GEMM multiplies the task's query rows by ONE
+kv head's key tile (`B1K(slot)` holds a single (tile, kv head) plane), so query rows from different kv
+heads cannot share it. Packing them would score them against the wrong keys. Qwen3.5 and GLM-5.2 have
+H_KV = 1 anyway, so at batch 1 there is nothing to pack. Tasks with M < 16 already run: the Fixpipe pads
+M to the 16-row fractal ((a) runs M = 2 and (d) M = 4).
+
+**Scalar instructions.** 13.30 added 212 AIV instructions to (a) and 1,044 to (b). Two changes, measured
+on the camodel's `aiv_instr` (`build/nz_profile.py`):
+
+| build | (a) | (b) | (c) |
+| --- | --- | --- | --- |
+| 13.29 (3a0b70797) | 35,388 | 104,348 | 147,684 |
+| 13.30 (67fa2f2d7) | 35,600 | 105,392 | 148,412 |
+| every TBuf view cached once in `Init` | 41,724 | 111,824 | 172,896 |
+| softmax helpers folded back into one body | 35,508 | 104,720 | 148,228 |
+| + task span and cursor back to scalar arguments | **35,388** | **104,348** | **147,684** |
+
+- **Caching `TBuf::Get` views does not help.** It added ~96 instructions per AIV core of `Init` and saved
+  nothing per tile, so `Get` is not what costs. That change was reverted.
+- **The cost was structure.** `ComputeSoftmaxAndStageProbs` was split into `ComputeTileScales`,
+  `ComputeRowLogits`, `ComputeRowSoftmaxStep`, `ComputeRowProbOperands` and `StageProbRowsToL1`, and each
+  re-derived its views and extents. The task extents were packed into `TurboQuantTaskSpan`, whose fields
+  `NextTile` reloaded from memory on every tile. Both are back in their 13.29 form, commented as
+  deliberate, and the instruction counts equal 13.29's exactly.
+
+**Results.** host / sim / npu clean under `-Werror` with unchanged target sets. Fused (a)-(e) pass: goldens,
+(c) vs (b), (e) 0 of 131,072 written bytes differ, 0 B exception dumps.
