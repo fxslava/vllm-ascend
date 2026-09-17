@@ -48,7 +48,13 @@ import torch
 from tq_longbench._ascend import assert_no_vllm_imported
 from tq_longbench.kv_cache import CacheGeometry, dense_equivalent_bytes
 from tq_longbench.layers import CausalLM, ForwardBatch, ModelShape, fold_output_rotation
-from tq_longbench.ops import AttentionBackend, LayerShape, NativeV5Backend, build_backend
+from tq_longbench.ops import (
+    DENSE_BACKENDS,
+    AttentionBackend,
+    LayerShape,
+    build_backend,
+    dense_backend_for,
+)
 
 PREFILL_MODES = ("dense_staging", "batched_decode")
 
@@ -82,9 +88,9 @@ class RunnerConfig:
     def __post_init__(self) -> None:
         if self.prefill_mode not in PREFILL_MODES:
             raise ValueError(f"unknown prefill mode {self.prefill_mode!r}; choose one of {list(PREFILL_MODES)}")
-        if self.backend == NativeV5Backend.name and self.prefill_mode != "dense_staging":
+        if self.backend in DENSE_BACKENDS and self.prefill_mode != "dense_staging":
             raise ValueError(
-                "the native_v5 baseline decodes out of the unquantised cache, so it needs --prefill-mode "
+                f"the {self.backend} baseline decodes out of the unquantised cache, so it needs --prefill-mode "
                 "dense_staging; batched_decode never allocates one."
             )
         if self.chunk_size <= 0:
@@ -160,10 +166,11 @@ class StandaloneModelRunner:
             config.backend, self.geometry, layer_shape, self.device, config.dtype, config.fold_output_rotation
         )
         # dense_staging needs the unquantised pool as well, unless the decode
-        # backend already is it.
-        if config.prefill_mode == "dense_staging" and not isinstance(self.decode_backend, NativeV5Backend):
-            self.prefill_backend: AttentionBackend = NativeV5Backend(
-                self.geometry, layer_shape, self.device, config.dtype
+        # backend already is it. Which unquantised backend that is follows the
+        # device, not --backend: a CUDA run stages through torch.
+        if config.prefill_mode == "dense_staging" and config.backend not in DENSE_BACKENDS:
+            self.prefill_backend: AttentionBackend = build_backend(
+                dense_backend_for(self.device), self.geometry, layer_shape, self.device, config.dtype
             )
         else:
             self.prefill_backend = self.decode_backend
@@ -177,7 +184,7 @@ class StandaloneModelRunner:
             else (self.prefill_backend, self.decode_backend)
         )
 
-        self.model = CausalLM(self.shape, config.max_seq_len, config.dtype, self.device, qkv_bias=self._qkv_bias())
+        self.model = CausalLM(self.shape, config.max_seq_len, config.dtype, self.device)
         self.model.eval()
         if not config.random_weights:
             self.load_weights()
@@ -195,13 +202,45 @@ class StandaloneModelRunner:
         return AutoConfig.from_pretrained(self.config.model_path, trust_remote_code=True)
 
     def _load_shape(self) -> ModelShape:
-        return ModelShape.from_hf_config(self._hf_config(), self.config.attn_output_gate)
+        return ModelShape.from_hf_config(self._hf_config(), self.config.attn_output_gate, **self._checkpoint_features())
 
-    def _qkv_bias(self) -> bool:
-        if self.config.random_weights or not self._config_path().is_file():
-            return False
-        raw = json.loads(self._config_path().read_text(encoding="utf-8"))
-        return bool(raw.get("attention_bias", False))
+    def _tensor_names(self) -> list[str]:
+        """Every tensor name in the checkpoint, read from the index or the shard headers.
+
+        Names only -- ``safe_open`` gives them without reading a byte of tensor
+        data, so this costs nothing next to the load that follows.
+        """
+        root = Path(self.config.model_path)
+        index = root / "model.safetensors.index.json"
+        if index.is_file():
+            return list(json.loads(index.read_text(encoding="utf-8"))["weight_map"])
+
+        from safetensors import safe_open
+
+        names: list[str] = []
+        for shard in sorted(root.glob("*.safetensors")):
+            with safe_open(str(shard), framework="pt") as handle:
+                names.extend(handle.keys())
+        return names
+
+    def _checkpoint_features(self) -> dict:
+        """What the config does not say: whether q/k are normed, and whether qkv has a bias.
+
+        Read off the tensor names rather than the config, because neither is
+        reliably declared. Qwen2.5 carries q/k/v biases with no ``attention_bias``
+        key, and ``model_type`` alone does not separate a Qwen3 checkpoint (which
+        norms each head) from a Qwen2 one (which does not). Getting either wrong
+        builds a model whose parameters and the checkpoint's do not correspond,
+        which :meth:`load_weights` then refuses -- loudly, rather than by
+        normalising with a weight of 1 that was never loaded.
+        """
+        if self.config.random_weights:
+            return {}
+        names = self._tensor_names()
+        return {
+            "qk_norm": any(name.endswith("self_attn.q_norm.weight") for name in names),
+            "qkv_bias": any(name.endswith("self_attn.q_proj.bias") for name in names),
+        }
 
     # --------------------------------------------------------------- weights
 

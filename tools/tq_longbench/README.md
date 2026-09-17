@@ -44,6 +44,33 @@ against the dense equivalent.
 | `native_v5` | `npu_fused_infer_attention_score` | dense fp16/bf16 | the baseline; the only path whose numbers are not a quantisation of anything |
 | `turboquant_cube` | `npu_turboquant_cube_decode` | kv4fp8 packed | one launch: raw-query rotation prologue, attention, un-rotation, `sigmoid(gate)`. float16 only, `block_size % 64 == 0` |
 | `turboquant_aiv` | `rotate_q` + `paged_attention` + `rotate_q` | 4-bit packed | every build and both dtypes; the only TurboQuant path with a CPU stand-in |
+| `dense_reference` | `scaled_dot_product_attention` | dense fp16/bf16 | the baseline in torch, for a host with no Ascend runtime |
+| `turboquant_reference` | torch | 4-bit packed | the 4-bit path in torch: rotate, quantise, pack, dequantise, attend, un-rotate |
+
+The first three launch Ascend C operators and are **refused** where those cannot
+run, rather than quietly falling back — a latency table torch produced under an
+Ascend backend's name would be worse than no table. A CPU with the operator
+stand-ins registered counts as able to run them; a CUDA device never does.
+
+### The reference backends
+
+`reference.py` is a functional twin, not a simulation: the arithmetic matches
+(packing, Lloyd-Max bins, RMS scale, rotation, the scale plane's burst padding),
+the performance does not, and nothing it produces says anything about what a
+kernel costs. Its correctness argument is transitive —
+`tests/ut/attention/turboquant_cpu_ops.py` is held to the kernels' own goldens,
+and the reference is held to *it*:
+
+| golden bound | measured | where |
+|---|---|---|
+| packed + scale planes byte-identical to the stand-ins | exact | `test_the_packed_planes_are_byte_identical` |
+| decode vs stand-ins, 8 heads / 512 ctx | > 0.9999 | `test_the_decode_agrees_at_uniform_and_ragged_contexts` |
+| decode vs stand-ins, **16 heads / 2 kv / D=128 / 4096 ctx** | **0.99999995** | `test_the_golden_bound_holds_at_a_real_model_geometry` |
+| streaming softmax, window 8192 vs 1365 | 1.00000000 | `test_the_streaming_softmax_does_not_depend_on_the_window` |
+| CUDA vs CPU | 1.00000000 | `test_cuda_and_cpu_agree` |
+
+The third row is the geometry of Qwen2.5-3B-Instruct, which is what the CUDA
+smoke numbers below rest on.
 
 The Cube decode is the `PRE_ROTATED = false` entry — it takes the raw fp16 query
 and changes basis itself, so nothing precedes it and nothing follows it.
@@ -86,12 +113,17 @@ to a centroid rather than to nothing.
 ```text
 _ascend.py       borrow the shipped layout and rotation, by file path
 kv_cache.py      StaticKVCache: DenseKVCache and TurboQuantKVCache, allocated once
-ops.py           the three backends, their scratch buffers and the tie point
+ops.py           the Ascend backends, their scratch buffers and the tie point
+reference.py     the same arithmetic in torch, for CUDA and CPU
 layers.py        RMSNorm, RoPE, attention, SwiGLU, the decoder stack, the o_proj fold
 engine.py        StandaloneModelRunner: weights, chunked prefill, greedy decode, metrics
+hf_bridge.py     give a Hugging Face model's full-attention layers this KV cache
 tasks.py         LongBench prompts and metrics, and the synthetic NIAH generator
 cpu_reference.py serve the operators from the CPU, for a run with no device
-run_eval.py      the CLI
+run_eval.py      the evaluation CLI
+smoke_dense.py   dense GQA end to end, against eager Hugging Face
+smoke_hf.py      a hybrid model through the bridge, against eager Hugging Face
+diagnose.py      per-layer quantisation loss on real weights
 ```
 
 ## Tests
@@ -116,16 +148,67 @@ Two boundaries it does not cross:
   across the whole prefix — at 32768 and 131072, at every depth, and with a
   negative control that collapses when the context stops short of the needle.
 
+## Measured baselines
+
+RTX 5070 (12 GB), float16, `reference` backends, 2026-09-18. These are what a
+regression shows against.
+
+**Qwen2.5-3B-Instruct** (36 layers, 16 heads / 2 kv, `head_dim` 128) through the
+standalone runner — `smoke_dense.py`:
+
+- both paths reproduce **eager Hugging Face 16/16 tokens** on a short prompt, so
+  any gap below is the cache's and not the model's;
+- **288 B/token/layer** against the dense **1024** (3.56x);
+- needle-in-a-haystack at 8192 tokens, five depths: **dense 5/5, TurboQuant 1/5**.
+
+That last number is real 4-bit loss, not a harness fault — the reference is
+byte-identical to the operator stand-ins at this exact geometry (table above).
+`diagnose.py` localises it, comparing both backends on the *same* query per
+layer so error cannot accumulate:
+
+> median **0.9933**, max 0.9968, and two outliers — **layer 0 at 0.8953** and
+> **layer 20 at 0.8608**.
+
+Layer 0 is the expected one: its attention is dominated by the sink token, whose
+key and value sit far outside the distribution a per-vector RMS scale is chosen
+for. Retrieving an exact five-digit code through unshielded layers like that is
+where 4 bits runs out.
+
+**Qwen3.5-2B** through `hf_bridge.py` + `smoke_hf.py` (6 of 24 layers claimed):
+`cos(dense_reference, unpatched HF) = 1.00000000`, so the bridge is faithful;
+`cos(turboquant_reference, unpatched HF) = 0.99532467`, with the argmax
+unchanged; 544 B/token/layer against 2048.
+
+**Known limit:** at `max_seq_len=32768`, `dense_staging` allocates both pools
+(1.2 GB dense + 0.34 GB packed) beside a 6 GB model and does not fit in 12 GB.
+Use `--prefill-mode batched_decode` there, which never allocates the dense pool.
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` does not help — it is
+unsupported on Windows.
+
 ## Model coverage
 
-Qwen3-shaped dense models, including the Qwen3.5 `attn_output_gate` variant
-(`--attn-output-gate`), where `q_proj` emits `[query | gate]` and the gate is
-handed to the Cube decode's epilogue rather than applied in torch.
+Two routes, because not every model is dense.
+
+**The standalone runner** (`layers.py` + `engine.py`) builds the model itself and
+needs nothing of `transformers` but the tokenizer. It covers **dense GQA with a
+SwiGLU MLP** — Qwen2.5 and Qwen3 shapes, including the Qwen3.5
+`attn_output_gate` variant (`--attn-output-gate`) where `q_proj` emits
+`[query | gate]`. Two things no config states are read off the checkpoint's own
+tensor names rather than guessed: `qk_norm` (Qwen3 norms each head of q and k,
+Qwen2.5 does not) and `qkv_bias` (Qwen2 carries one with no `attention_bias`
+key). Guessing either wrong does not misbehave quietly — it fails to load.
+
+**The bridge** (`hf_bridge.py`) inverts the arrangement for a model the runner
+cannot build: `transformers` keeps the weights, the linear attention, the
+multimodal RoPE and the vision tower, and only the `full_attention` layers'
+attention comes from here. That is the Qwen3.5 case — 18 of its 24 layers are
+Gated DeltaNet, which keeps a recurrent state rather than a KV cache, so there is
+nothing for TurboQuant to hold in them. It hooks `ALL_ATTENTION_FUNCTIONS`, the
+supported extension point, so nothing is monkeypatched.
 
 `--fold-output-rotation` rewrites every `o_proj` to `W_o (I ⊗ Π)` so the decode's
 `ROTATED_BASIS` output needs no runtime un-rotation. A gated layer is refused:
 the gate sits between attention and `o_proj`, where the output is still rotated.
 
-DeepSeek-V4-Flash and GLM-5.2 are **not implemented** — MLA and the MoE stack are
-a separate adapter, and `layers.py` currently assumes dense GQA attention with a
-SwiGLU MLP.
+DeepSeek-V4-Flash and GLM are **not implemented** in either route — MLA and the
+MoE stack are a separate adapter.

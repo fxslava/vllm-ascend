@@ -65,7 +65,7 @@ from tq_longbench.engine import (  # noqa: E402
     RunnerConfig,
     StandaloneModelRunner,
 )
-from tq_longbench.ops import BACKENDS  # noqa: E402
+from tq_longbench.ops import DENSE_BACKENDS, backend_names, reference_equivalent  # noqa: E402
 from tq_longbench.tasks import NIAH_TASK, EvalItem, load_longbench, niah_sweep, score  # noqa: E402
 
 _DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
@@ -82,7 +82,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=NIAH_TASK,
         help="'niah' for the synthetic retrieval sweep, or longbench_<task> (e.g. longbench_narrativeqa)",
     )
-    parser.add_argument("--backend", default="turboquant_cube", choices=sorted(BACKENDS))
+    parser.add_argument(
+        "--backend",
+        default=None,
+        choices=backend_names(),
+        help="default: turboquant_cube on an NPU, turboquant_reference elsewhere",
+    )
     parser.add_argument(
         "--prefill-mode",
         default=None,
@@ -93,7 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunk-size", type=int, default=2048)
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--dtype", default="float16", choices=sorted(_DTYPES))
-    parser.add_argument("--device", default="npu:0")
+    parser.add_argument("--device", default=None, help="default: npu:0, else cuda:0, else cpu")
     parser.add_argument("--limit", type=int, default=None, help="evaluate at most this many items")
     parser.add_argument("--max-new-tokens", type=int, default=None, help="override the task's own budget")
     parser.add_argument("--attn-output-gate", action="store_true", help="Qwen3.5-style [query | gate] projection")
@@ -116,6 +121,27 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def default_device() -> str:
+    """The best accelerator present, preferring the one the kernels are written for.
+
+    ``torch_npu`` has to be imported before ``torch.npu`` exists, which is why
+    the probe is an import rather than a ``hasattr``.
+    """
+    try:
+        import torch_npu  # noqa: F401
+
+        if torch.npu.is_available():
+            return "npu:0"
+    except (ImportError, AttributeError):
+        pass
+    return "cuda:0" if torch.cuda.is_available() else "cpu"
+
+
+def default_backend(device: torch.device) -> str:
+    """The Cube decode where it exists, its torch reference where it does not."""
+    return "turboquant_cube" if device.type == "npu" else reference_equivalent("turboquant_cube")
+
+
 def default_prefill_mode(max_seq_len: int, backend: str) -> str:
     """dense_staging while the fp16 pool is affordable, batched_decode past it.
 
@@ -123,7 +149,7 @@ def default_prefill_mode(max_seq_len: int, backend: str) -> str:
     prefill and is what the NIAH alignment check wants, so it is preferred right
     up to the point where the unquantised pool stops fitting.
     """
-    if backend == "native_v5":
+    if backend in DENSE_BACKENDS:
         return "dense_staging"
     return "dense_staging" if max_seq_len <= DENSE_STAGING_RECOMMENDED_MAX_SEQ else "batched_decode"
 
@@ -141,17 +167,19 @@ def load_items(args: argparse.Namespace) -> list[EvalItem]:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    prefill_mode = args.prefill_mode or default_prefill_mode(args.max_seq_len, args.backend)
+    device = torch.device(args.device or default_device())
+    backend = args.backend or default_backend(device)
+    prefill_mode = args.prefill_mode or default_prefill_mode(args.max_seq_len, backend)
 
     config = RunnerConfig(
         model_path=args.model_path,
-        backend=args.backend,
+        backend=backend,
         prefill_mode=prefill_mode,
         max_seq_len=args.max_seq_len,
         chunk_size=args.chunk_size,
         block_size=args.block_size,
         dtype=_DTYPES[args.dtype],
-        device=args.device,
+        device=str(device),
         attn_output_gate=args.attn_output_gate,
         fold_output_rotation=args.fold_output_rotation,
         random_weights=args.random_weights,
@@ -164,7 +192,7 @@ def main(argv: list[str] | None = None) -> int:
     runner = StandaloneModelRunner(config)
     memory = runner.memory_report()
     print(
-        f"[tq_longbench] backend={args.backend} prefill={prefill_mode} "
+        f"[tq_longbench] backend={backend} device={device} prefill={prefill_mode} "
         f"max_seq_len={args.max_seq_len} kv={memory['kv_cache_mb']:.1f} MB "
         f"(dense equivalent {memory['dense_equivalent_mb']:.1f} MB)",
         file=sys.stderr,
@@ -193,7 +221,7 @@ def main(argv: list[str] | None = None) -> int:
 
             record = {
                 "index": index,
-                "backend": args.backend,
+                "backend": backend,
                 "prefill_mode": prefill_mode,
                 "metric": item.metric,
                 "score": round(value, 4),

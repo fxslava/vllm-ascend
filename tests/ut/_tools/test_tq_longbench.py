@@ -56,6 +56,7 @@ from tq_longbench.engine import RunnerConfig, StandaloneModelRunner  # noqa: E40
 from tq_longbench.kv_cache import CacheGeometry, DenseKVCache, TurboQuantKVCache, dense_equivalent_bytes  # noqa: E402
 from tq_longbench.layers import ModelShape  # noqa: E402
 from tq_longbench.ops import LayerShape, TurboQuantAivBackend, TurboQuantCubeBackend, build_backend  # noqa: E402
+from tq_longbench.reference import DenseReferenceBackend, TurboQuantReferenceBackend  # noqa: E402
 from tq_longbench.tasks import f1_score, needle_in_a_haystack, rouge_l, score  # noqa: E402
 
 CPU = torch.device("cpu")
@@ -76,6 +77,19 @@ NEEDLE_GAIN = 4.0
 # is quantisation loss rather than error.
 EXACT_COSINE = 0.9999
 RETRIEVAL_COSINE = 0.99
+
+# The golden bound for the torch reference against the operator stand-ins. The
+# two agree to float ordering, not to quantisation: measured 0.99999995 at
+# Qwen2.5-3B's geometry (16 heads / 2 kv / head_size 128) over a 4096-token
+# context on 2026-09-18. Held well inside that, and orders of magnitude tighter
+# than the ~0.99 band 4 bits sit in, so it gates the implementation rather than
+# the codec.
+REFERENCE_FIDELITY_COSINE = 0.999999
+
+# Qwen2.5-3B-Instruct's attention geometry, as the CUDA smoke test runs it.
+QWEN25_3B_HEADS = 16
+QWEN25_3B_KV_HEADS = 2
+QWEN25_3B_HEAD_SIZE = 128
 
 
 def cosine(actual: torch.Tensor, expected: torch.Tensor) -> float:
@@ -499,6 +513,13 @@ class TestCubeDispatch(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "not registered"):
             TurboQuantCubeBackend(geometry, shape, CPU)
 
+    def test_an_ascend_backend_is_refused_with_no_operators_registered(self):
+        """Nothing is serving them here, so a CPU run cannot have them either."""
+        geometry = _geometry(512)
+        shape = LayerShape(NUM_HEADS, NUM_KV_HEADS, HEAD_SIZE, HEAD_SIZE**-0.5)
+        with self.assertRaisesRegex(ValueError, "cannot run on cpu"):
+            build_backend("turboquant_aiv", geometry, shape, CPU, torch.float16)
+
 
 class TestTaskScoring(unittest.TestCase):
     def test_f1_and_rouge_agree_on_the_easy_cases(self):
@@ -519,6 +540,313 @@ class TestTaskScoring(unittest.TestCase):
             body = item.prompt[: item.prompt.index("Question:")]
             found = body.index(item.answers[0])
             self.assertAlmostEqual(found / len(body), depth, delta=0.15)
+
+
+class TestReferenceMatchesTheStandIns(_TurboQuantCase):
+    """The torch backends carry the whole correctness argument for a run with no NPU.
+
+    ``turboquant_cpu_ops`` is held to the kernels' own goldens; this holds
+    :mod:`tq_longbench.reference` to *it*.  Without that link a number produced
+    on CUDA would be a number produced by a second, unvalidated implementation
+    of the codec, which is exactly the drift the shared layout module exists to
+    prevent on the host side.
+    """
+
+    LENGTH = 512
+
+    def _both(self):
+        geometry = _geometry(self.LENGTH)
+        shape = LayerShape(NUM_HEADS, NUM_KV_HEADS, HEAD_SIZE, HEAD_SIZE**-0.5)
+        return TurboQuantAivBackend(geometry, shape, CPU), TurboQuantReferenceBackend(geometry, shape, CPU)
+
+    def _fill(self, *backends):
+        key = torch.randn(self.LENGTH, NUM_KV_HEADS, HEAD_SIZE, dtype=DTYPE)
+        value = torch.randn(self.LENGTH, NUM_KV_HEADS, HEAD_SIZE, dtype=DTYPE)
+        for start in range(0, self.LENGTH, 128):
+            for backend in backends:
+                backend.write_kv(
+                    0, key[start : start + 128], value[start : start + 128], backend.cache.slot_mapping(start, 128)
+                )
+        return key, value
+
+    def test_the_packed_planes_are_byte_identical(self):
+        """Same rotation, same RMS scale, same Lloyd-Max bins, same nibble packing."""
+        kernel, reference = self._both()
+        self._fill(kernel, reference)
+        for name, left, right in zip(("key", "value", "scale"), kernel.cache.planes(0), reference.cache.planes(0)):
+            self.assertTrue(torch.equal(left, right), f"the {name} plane differs from the stand-in's")
+
+    def test_the_decode_agrees_at_uniform_and_ragged_contexts(self):
+        kernel, reference = self._both()
+        self._fill(kernel, reference)
+        query = torch.randn(4, NUM_HEADS, HEAD_SIZE, dtype=DTYPE)
+        for label, lengths in (("uniform", [self.LENGTH] * 4), ("ragged", [1, 129, 384, self.LENGTH])):
+            with self.subTest(contexts=label):
+                context_lens = torch.tensor(lengths, dtype=torch.int32)
+                from_kernel = torch.empty(4, NUM_HEADS, HEAD_SIZE, dtype=DTYPE)
+                from_reference = torch.empty(4, NUM_HEADS, HEAD_SIZE, dtype=DTYPE)
+                kernel.decode(0, query, context_lens, from_kernel)
+                reference.decode(0, query, context_lens, from_reference)
+                self.assertGreater(cosine(from_reference, from_kernel), EXACT_COSINE)
+
+    def test_the_streaming_softmax_does_not_depend_on_the_window(self):
+        """A 128k context is reduced window by window; the answer must not know that.
+
+        The running max, denominator and numerator are the whole reason a long
+        context never materialises a long score matrix, and a rescaling bug
+        there would show up only at lengths the quick tests do not reach.
+        """
+        import tq_longbench.reference as reference_module
+
+        _, reference = self._both()
+        self._fill(reference)
+        query = torch.randn(2, NUM_HEADS, HEAD_SIZE, dtype=DTYPE)
+        context_lens = torch.tensor([self.LENGTH, self.LENGTH // 3], dtype=torch.int32)
+
+        wide = torch.empty(2, NUM_HEADS, HEAD_SIZE, dtype=DTYPE)
+        reference.decode(0, query, context_lens, wide)
+        saved = reference_module._CONTEXT_WINDOW
+        try:
+            reference_module._CONTEXT_WINDOW = 64
+            narrow = torch.empty(2, NUM_HEADS, HEAD_SIZE, dtype=DTYPE)
+            reference.decode(0, query, context_lens, narrow)
+        finally:
+            reference_module._CONTEXT_WINDOW = saved
+        self.assertGreater(cosine(narrow, wide), 0.99999)
+
+    def test_the_dense_reference_is_exact_attention(self):
+        geometry = _geometry(self.LENGTH)
+        shape = LayerShape(NUM_HEADS, NUM_KV_HEADS, HEAD_SIZE, HEAD_SIZE**-0.5)
+        dense = DenseReferenceBackend(geometry, shape, CPU, DTYPE)
+        key, value = self._fill(dense)
+        query = torch.randn(2, NUM_HEADS, HEAD_SIZE, dtype=DTYPE)
+        out = torch.empty(2, NUM_HEADS, HEAD_SIZE, dtype=DTYPE)
+        dense.decode(0, query, torch.tensor([self.LENGTH] * 2, dtype=torch.int32), out)
+
+        group = NUM_HEADS // NUM_KV_HEADS
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            query.to(torch.float32).transpose(0, 1),
+            key.to(torch.float32).transpose(0, 1).repeat_interleave(group, dim=0),
+            value.to(torch.float32).transpose(0, 1).repeat_interleave(group, dim=0),
+            scale=shape.scale,
+        ).transpose(0, 1)
+        self.assertGreater(cosine(out, expected), EXACT_COSINE)
+
+    def test_the_golden_bound_holds_at_a_real_model_geometry(self):
+        """The bound the CUDA smoke test's numbers rest on, at the geometry it runs.
+
+        The short cases above use 8 heads and a 512-token context. A real decode
+        is 16 heads over thousands of positions, which is where the streaming
+        softmax actually streams and where the group broadcast is widest --
+        neither of which the short cases reach. Recorded as a golden bound
+        because every claim made from a CUDA run is a claim about this number.
+        """
+        length = 4096
+        geometry = CacheGeometry(
+            num_layers=1,
+            num_kv_heads=QWEN25_3B_KV_HEADS,
+            head_size=QWEN25_3B_HEAD_SIZE,
+            block_size=BLOCK_SIZE,
+            max_seq_len=length,
+        )
+        shape = LayerShape(QWEN25_3B_HEADS, QWEN25_3B_KV_HEADS, QWEN25_3B_HEAD_SIZE, QWEN25_3B_HEAD_SIZE**-0.5)
+        kernel = TurboQuantAivBackend(geometry, shape, CPU)
+        reference = TurboQuantReferenceBackend(geometry, shape, CPU)
+        key = torch.randn(length, QWEN25_3B_KV_HEADS, QWEN25_3B_HEAD_SIZE, dtype=torch.float16)
+        value = torch.randn(length, QWEN25_3B_KV_HEADS, QWEN25_3B_HEAD_SIZE, dtype=torch.float16)
+        for start in range(0, length, 1024):
+            for backend in (kernel, reference):
+                backend.write_kv(
+                    0,
+                    key[start : start + 1024],
+                    value[start : start + 1024],
+                    backend.cache.slot_mapping(start, 1024),
+                )
+        for name, left, right in zip(("key", "value", "scale"), kernel.cache.planes(0), reference.cache.planes(0)):
+            self.assertTrue(torch.equal(left, right), f"the {name} plane differs at the real geometry")
+
+        query = torch.randn(3, QWEN25_3B_HEADS, QWEN25_3B_HEAD_SIZE, dtype=torch.float16)
+        for label, lengths in (("uniform", [length] * 3), ("ragged", [1, 2049, length])):
+            with self.subTest(contexts=label):
+                context_lens = torch.tensor(lengths, dtype=torch.int32)
+                from_kernel = torch.empty(3, QWEN25_3B_HEADS, QWEN25_3B_HEAD_SIZE, dtype=torch.float16)
+                from_reference = torch.empty_like(from_kernel)
+                kernel.decode(0, query, context_lens, from_kernel)
+                reference.decode(0, query, context_lens, from_reference)
+                self.assertGreater(cosine(from_reference, from_kernel), REFERENCE_FIDELITY_COSINE)
+
+    def test_an_ascend_backend_is_refused_where_its_operators_cannot_run(self):
+        """Refused, not quietly swapped: a latency table torch produced would be a lie.
+
+        A CUDA device can never serve these operators, so the refusal holds even
+        with the CPU stand-ins live -- which they are, inside this case.
+        """
+        geometry = _geometry(512)
+        shape = LayerShape(NUM_HEADS, NUM_KV_HEADS, HEAD_SIZE, HEAD_SIZE**-0.5)
+        with self.assertRaisesRegex(ValueError, "cannot run on cuda"):
+            build_backend("turboquant_cube", geometry, shape, torch.device("cuda"), torch.float16)
+        # The CPU is allowed only because the stand-ins are serving them here.
+        self.assertIsInstance(build_backend("turboquant_aiv", geometry, shape, CPU, DTYPE), TurboQuantAivBackend)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "no CUDA device")
+class TestReferenceOnCuda(unittest.TestCase):
+    """The same arithmetic, on a device whose float ordering is not the CPU's."""
+
+    LENGTH = 1024
+
+    def test_cuda_and_cpu_agree(self):
+        torch.manual_seed(0)
+        geometry = _geometry(self.LENGTH)
+        shape = LayerShape(NUM_HEADS, NUM_KV_HEADS, HEAD_SIZE, HEAD_SIZE**-0.5)
+        key = torch.randn(self.LENGTH, NUM_KV_HEADS, HEAD_SIZE, dtype=torch.float16)
+        value = torch.randn(self.LENGTH, NUM_KV_HEADS, HEAD_SIZE, dtype=torch.float16)
+        query = torch.randn(4, NUM_HEADS, HEAD_SIZE, dtype=torch.float16)
+        context_lens = torch.tensor([1, 300, 777, self.LENGTH], dtype=torch.int32)
+
+        answers = {}
+        for name in ("cpu", "cuda:0"):
+            device = torch.device(name)
+            backend = TurboQuantReferenceBackend(geometry, shape, device)
+            backend.write_kv(0, key.to(device), value.to(device), backend.cache.slot_mapping(0, self.LENGTH))
+            out = torch.empty(4, NUM_HEADS, HEAD_SIZE, dtype=torch.float16, device=device)
+            backend.decode(0, query.to(device), context_lens.to(device), out)
+            answers[name] = out.cpu()
+            for plane in backend.cache.planes(0):
+                self.assertEqual(plane.device.type, device.type)
+                self.assertTrue(plane.is_contiguous())
+        self.assertGreater(cosine(answers["cuda:0"], answers["cpu"]), 0.99999)
+
+
+class _FakeAttention(torch.nn.Module):
+    """The structural shape :func:`discover_full_attention_layers` looks for."""
+
+    def __init__(self, config, layer_idx: int, heads: int, kv_heads: int, head_dim: int) -> None:
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.head_dim = head_dim
+        self.scaling = head_dim**-0.5
+        hidden = heads * head_dim
+        self.q_proj = torch.nn.Linear(hidden, heads * head_dim, bias=False)
+        self.k_proj = torch.nn.Linear(hidden, kv_heads * head_dim, bias=False)
+        self.v_proj = torch.nn.Linear(hidden, kv_heads * head_dim, bias=False)
+        self.o_proj = torch.nn.Linear(heads * head_dim, hidden, bias=False)
+
+
+class _FakeLinearAttention(torch.nn.Module):
+    """Gated DeltaNet's shape: a fused qkv projection, no o_proj, no KV cache."""
+
+    def __init__(self, layer_idx: int) -> None:
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.in_proj_qkv = torch.nn.Linear(8, 8, bias=False)
+        self.conv1d = torch.nn.Conv1d(8, 8, 4, groups=8)
+
+
+class _FakeHybridModel(torch.nn.Module):
+    """A hybrid stack: full attention every fourth layer, as Qwen3.5 is."""
+
+    def __init__(self, layers: int = 8, interval: int = 4) -> None:
+        super().__init__()
+        from types import SimpleNamespace
+
+        # One config object shared by every layer, which is what transformers
+        # does and what the install/uninstall regression below turns on.
+        self.config = SimpleNamespace(_attn_implementation="sdpa")
+        self.layers = torch.nn.ModuleList(
+            [
+                _FakeAttention(self.config, index, NUM_HEADS, NUM_KV_HEADS, HEAD_SIZE)
+                if index % interval == interval - 1
+                else _FakeLinearAttention(index)
+                for index in range(layers)
+            ]
+        )
+
+
+class TestHuggingFaceBridge(unittest.TestCase):
+    """Claiming the right layers, and giving the model back exactly as it was."""
+
+    def setUp(self):
+        from tq_longbench.hf_bridge import TurboQuantAttentionBridge, discover_full_attention_layers
+
+        self.bridge_cls = TurboQuantAttentionBridge
+        self.discover = discover_full_attention_layers
+        self.model = _FakeHybridModel()
+
+    def test_only_full_attention_layers_are_claimed(self):
+        """Linear attention keeps a recurrent state, not a KV cache, so it is not ours."""
+        found = self.discover(self.model)
+        self.assertEqual(sorted(found), [3, 7])
+        for module in found.values():
+            self.assertIsInstance(module, _FakeAttention)
+
+    def test_the_planes_are_indexed_by_claimed_layer_not_model_layer(self):
+        bridge = self.bridge_cls(self.model, "turboquant_reference", max_seq_len=512, block_size=BLOCK_SIZE)
+        self.assertEqual(bridge.plane_of, {3: 0, 7: 1})
+        self.assertEqual(bridge.geometry.num_layers, 2)
+
+    def test_uninstall_restores_the_shared_config(self):
+        """Regression: every layer of a model shares one config object.
+
+        Recording the previous implementation per layer reads back the bridge's
+        own name from the second layer onward, so uninstall leaves the model on
+        the bridge it was meant to be leaving. Nothing raises -- the next
+        measurement just compares the backend against itself, which is how this
+        was found.
+        """
+        pristine = self.model.config._attn_implementation
+        first = self.bridge_cls(self.model, "turboquant_reference", max_seq_len=512, block_size=BLOCK_SIZE)
+        with first:
+            self.assertEqual(self.model.config._attn_implementation, first._name)
+        self.assertEqual(self.model.config._attn_implementation, pristine)
+
+        second = self.bridge_cls(self.model, "dense_reference", max_seq_len=512, block_size=BLOCK_SIZE)
+        self.assertNotEqual(second._name, first._name)
+        with second:
+            self.assertEqual(self.model.config._attn_implementation, second._name)
+        self.assertEqual(self.model.config._attn_implementation, pristine)
+
+    def test_installing_twice_is_refused(self):
+        bridge = self.bridge_cls(self.model, "turboquant_reference", max_seq_len=512, block_size=BLOCK_SIZE)
+        with bridge, self.assertRaisesRegex(RuntimeError, "already installed"):
+            bridge.install()
+        self.assertEqual(self.model.config._attn_implementation, "sdpa")
+
+    def test_the_hook_attends_over_the_prefix_the_layer_cached(self):
+        """Prefill then decode through the hook's own signature, as transformers calls it."""
+        bridge = self.bridge_cls(self.model, "turboquant_reference", max_seq_len=512, block_size=BLOCK_SIZE)
+        module = self.discover(self.model)[3]
+        prompt = 64
+        key = torch.randn(1, NUM_KV_HEADS, prompt, HEAD_SIZE)
+        value = torch.randn(1, NUM_KV_HEADS, prompt, HEAD_SIZE)
+        query = torch.randn(1, NUM_HEADS, prompt, HEAD_SIZE)
+
+        out, weights = bridge._attention(module, query, key, value, None, scaling=module.scaling)
+        self.assertEqual(tuple(out.shape), (1, prompt, NUM_HEADS, HEAD_SIZE))
+        self.assertIsNone(weights)
+
+        # One more token, with the layer's cache grown by one as transformers grows it.
+        step_key = torch.cat((key, torch.randn(1, NUM_KV_HEADS, 1, HEAD_SIZE)), dim=2)
+        step_value = torch.cat((value, torch.randn(1, NUM_KV_HEADS, 1, HEAD_SIZE)), dim=2)
+        step_query = torch.randn(1, NUM_HEADS, 1, HEAD_SIZE)
+        step, _ = bridge._attention(module, step_query, step_key, step_value, None, scaling=module.scaling)
+        self.assertEqual(tuple(step.shape), (1, 1, NUM_HEADS, HEAD_SIZE))
+
+    def test_a_padded_batch_is_refused(self):
+        """The bridge replaces the attention mask with context lengths, so it cannot pad."""
+        bridge = self.bridge_cls(self.model, "turboquant_reference", max_seq_len=512, block_size=BLOCK_SIZE)
+        module = self.discover(self.model)[3]
+        shape = (2, NUM_KV_HEADS, 8, HEAD_SIZE)
+        with self.assertRaisesRegex(NotImplementedError, "one sequence at a time"):
+            bridge._attention(
+                module,
+                torch.randn(2, NUM_HEADS, 8, HEAD_SIZE),
+                torch.randn(shape),
+                torch.randn(shape),
+                None,
+                scaling=module.scaling,
+            )
 
 
 if __name__ == "__main__":

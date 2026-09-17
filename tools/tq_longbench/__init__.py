@@ -26,4 +26,17 @@ Nothing is imported eagerly here: the submodules reach ``torch_npu``,
 only needs the metrics should not need a device runtime.
 """
 
-__all__ = ["engine", "kv_cache", "layers", "ops", "run_eval", "tasks"]
+__all__ = [
+    "cpu_reference",
+    "diagnose",
+    "engine",
+    "hf_bridge",
+    "kv_cache",
+    "layers",
+    "ops",
+    "reference",
+    "run_eval",
+    "smoke_dense",
+    "smoke_hf",
+    "tasks",
+]

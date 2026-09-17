@@ -67,9 +67,24 @@ class ModelShape:
     rope_theta: float
     tie_word_embeddings: bool
     attn_output_gate: bool
+    #: Qwen3 normalises each head of q and k before RoPE; Qwen2.5 does not.
+    #: Neither is declared in the config, so both are read off the checkpoint.
+    qk_norm: bool = True
+    #: Qwen2 carries q/k/v biases without an ``attention_bias`` key to say so.
+    qkv_bias: bool = False
 
     @classmethod
-    def from_hf_config(cls, config, attn_output_gate: bool) -> ModelShape:
+    def from_hf_config(cls, config, attn_output_gate: bool, **detected) -> ModelShape:
+        """Read the shape out of an HF config, nested text config and all.
+
+        ``detected`` carries what the config does not state -- ``qk_norm`` and
+        ``qkv_bias`` -- because both vary between checkpoints of the same
+        ``model_type`` and neither has a key. Guessing either wrong does not
+        raise at build time: it raises at load time, on a parameter that has no
+        home or no value, which is the outcome worth having.
+        """
+        # A multimodal checkpoint keeps the language model's shape one level down.
+        config = getattr(config, "text_config", config)
         num_heads = config.num_attention_heads
         head_size = getattr(config, "head_dim", None) or config.hidden_size // num_heads
         return cls(
@@ -84,6 +99,7 @@ class ModelShape:
             rope_theta=float(getattr(config, "rope_theta", 1.0e6)),
             tie_word_embeddings=bool(getattr(config, "tie_word_embeddings", False)),
             attn_output_gate=attn_output_gate,
+            **detected,
         )
 
     @property
@@ -172,37 +188,37 @@ class Attention(torch.nn.Module):
     it does know is whether the gate is its job or the kernel's.
     """
 
-    def __init__(
-        self,
-        shape: ModelShape,
-        layer_index: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        qkv_bias: bool = False,
-    ) -> None:
+    def __init__(self, shape: ModelShape, layer_index: int, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__()
         self.shape = shape
         self.layer_index = layer_index
         q_out = shape.num_heads * shape.head_size
         kv_out = shape.num_kv_heads * shape.head_size
+        bias = shape.qkv_bias
         # Qwen3.5 projects [query | gate] out of one matrix.
         self.q_proj = torch.nn.Linear(
-            shape.hidden_size, q_out * (2 if shape.attn_output_gate else 1), bias=qkv_bias, dtype=dtype, device=device
+            shape.hidden_size, q_out * (2 if shape.attn_output_gate else 1), bias=bias, dtype=dtype, device=device
         )
-        self.k_proj = torch.nn.Linear(shape.hidden_size, kv_out, bias=qkv_bias, dtype=dtype, device=device)
-        self.v_proj = torch.nn.Linear(shape.hidden_size, kv_out, bias=qkv_bias, dtype=dtype, device=device)
+        self.k_proj = torch.nn.Linear(shape.hidden_size, kv_out, bias=bias, dtype=dtype, device=device)
+        self.v_proj = torch.nn.Linear(shape.hidden_size, kv_out, bias=bias, dtype=dtype, device=device)
         self.o_proj = torch.nn.Linear(q_out, shape.hidden_size, bias=False, dtype=dtype, device=device)
-        self.q_norm = RMSNorm(shape.head_size, shape.rms_norm_eps, dtype, device)
-        self.k_norm = RMSNorm(shape.head_size, shape.rms_norm_eps, dtype, device)
+        # Registered only where the checkpoint has them: an unused RMSNorm would
+        # sit at its initial value of 1 and normalise anyway, changing the
+        # numbers without ever failing to load.
+        if shape.qk_norm:
+            self.q_norm = RMSNorm(shape.head_size, shape.rms_norm_eps, dtype, device)
+            self.k_norm = RMSNorm(shape.head_size, shape.rms_norm_eps, dtype, device)
 
-    def forward(
-        self,
-        hidden: torch.Tensor,
-        batch: ForwardBatch,
-        rope: RotaryEmbedding,
-        write_backends: tuple[AttentionBackend, ...],
-        attend_backend: AttentionBackend,
-    ) -> torch.Tensor:
+    def project(
+        self, hidden: torch.Tensor, batch: ForwardBatch, rope: RotaryEmbedding
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Everything before the cache write: ``(query, key, value, gate)``, RoPE applied.
+
+        Split out of :meth:`forward` so that a diagnostic can produce exactly the
+        tensors the backends are handed -- and compare two backends on the same
+        ones -- without reproducing this and drifting from it. See
+        ``tools/tq_longbench/diagnose.py``.
+        """
         num_tokens = hidden.shape[0]
         shape = self.shape
 
@@ -215,28 +231,48 @@ class Attention(torch.nn.Module):
         key = self.k_proj(hidden).view(num_tokens, shape.num_kv_heads, shape.head_size)
         value = self.v_proj(hidden).view(num_tokens, shape.num_kv_heads, shape.head_size)
 
-        query = self.q_norm(query)
-        key = self.k_norm(key)
+        if shape.qk_norm:
+            query = self.q_norm(query)
+            key = self.k_norm(key)
         # RoPE before anything is rotated by Pi: the kernels apply Pi to q and k
         # afterwards, and Pi is orthogonal, so the scores are unchanged -- but
         # only if RoPE has already happened.
-        query = rope.apply(query, batch.positions)
-        key = rope.apply(key, batch.positions)
+        return rope.apply(query, batch.positions), rope.apply(key, batch.positions), value, gate
+
+    def attend(
+        self,
+        query: torch.Tensor,
+        batch: ForwardBatch,
+        backend: AttentionBackend,
+        gate: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Ask one backend for this layer's attention, gated where the backend does that itself."""
+        attention = torch.empty_like(query)
+        kernel_gate = gate if backend.fuses_output_gate else None
+        if batch.is_decode:
+            context_lens = torch.full((query.shape[0],), batch.prefix_end, dtype=torch.int32, device=query.device)
+            backend.check_tie_point(context_lens, batch.prefix_end)
+            backend.decode(self.layer_index, query, context_lens, attention, kernel_gate)
+        else:
+            backend.prefill_chunk(self.layer_index, query, batch.prefix_end, attention, kernel_gate)
+        if gate is not None and kernel_gate is None:
+            attention = attention * torch.sigmoid(gate)
+        return attention
+
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        batch: ForwardBatch,
+        rope: RotaryEmbedding,
+        write_backends: tuple[AttentionBackend, ...],
+        attend_backend: AttentionBackend,
+    ) -> torch.Tensor:
+        query, key, value, gate = self.project(hidden, batch, rope)
+        num_tokens = hidden.shape[0]
 
         for backend in write_backends:
             backend.write_kv(self.layer_index, key, value, batch.slots)
-
-        attention = torch.empty_like(query)
-        kernel_gate = gate if attend_backend.fuses_output_gate else None
-        if batch.is_decode:
-            context_lens = torch.full((num_tokens,), batch.prefix_end, dtype=torch.int32, device=hidden.device)
-            attend_backend.check_tie_point(context_lens, batch.prefix_end)
-            attend_backend.decode(self.layer_index, query, context_lens, attention, kernel_gate)
-        else:
-            attend_backend.prefill_chunk(self.layer_index, query, batch.prefix_end, attention, kernel_gate)
-
-        if gate is not None and kernel_gate is None:
-            attention = attention * torch.sigmoid(gate)
+        attention = self.attend(query, batch, attend_backend, gate)
         return self.o_proj(attention.reshape(num_tokens, -1))
 
 
@@ -255,12 +291,10 @@ class MLP(torch.nn.Module):
 
 
 class DecoderLayer(torch.nn.Module):
-    def __init__(
-        self, shape: ModelShape, layer_index: int, dtype: torch.dtype, device: torch.device, qkv_bias: bool
-    ) -> None:
+    def __init__(self, shape: ModelShape, layer_index: int, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__()
         self.input_layernorm = RMSNorm(shape.hidden_size, shape.rms_norm_eps, dtype, device)
-        self.self_attn = Attention(shape, layer_index, dtype, device, qkv_bias)
+        self.self_attn = Attention(shape, layer_index, dtype, device)
         self.post_attention_layernorm = RMSNorm(shape.hidden_size, shape.rms_norm_eps, dtype, device)
         self.mlp = MLP(shape, dtype, device)
 
@@ -279,19 +313,12 @@ class DecoderLayer(torch.nn.Module):
 class CausalLM(torch.nn.Module):
     """Embedding, the decoder stack, the final norm and the head."""
 
-    def __init__(
-        self,
-        shape: ModelShape,
-        max_seq_len: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        qkv_bias: bool = False,
-    ) -> None:
+    def __init__(self, shape: ModelShape, max_seq_len: int, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__()
         self.shape = shape
         self.embed_tokens = torch.nn.Embedding(shape.vocab_size, shape.hidden_size, dtype=dtype, device=device)
         self.layers = torch.nn.ModuleList(
-            [DecoderLayer(shape, index, dtype, device, qkv_bias) for index in range(shape.num_layers)]
+            [DecoderLayer(shape, index, dtype, device) for index in range(shape.num_layers)]
         )
         self.norm = RMSNorm(shape.hidden_size, shape.rms_norm_eps, dtype, device)
         self.lm_head = torch.nn.Linear(shape.hidden_size, shape.vocab_size, bias=False, dtype=dtype, device=device)

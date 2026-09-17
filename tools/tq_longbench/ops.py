@@ -484,11 +484,33 @@ class TurboQuantAivBackend(_TurboQuantBackend):
         return out
 
 
-BACKENDS = {
+#: Backends that decode out of an unquantised pool. ``dense_staging`` needs one
+#: of these for its prefill, and they are the only backends that can *decode*
+#: out of it -- which is why asking for one with ``batched_decode`` is refused.
+DENSE_BACKENDS = frozenset({"native_v5", "dense_reference"})
+
+#: Backends that launch Ascend C operators. They need the extension and an NPU.
+ASCEND_BACKENDS = {
     NativeV5Backend.name: NativeV5Backend,
     TurboQuantCubeBackend.name: TurboQuantCubeBackend,
     TurboQuantAivBackend.name: TurboQuantAivBackend,
 }
+
+#: What a ``--device`` with no Ascend runtime should use instead. The dense pair
+#: and the quantised pair answer the same questions; only the second element of
+#: each is the thing under test.
+REFERENCE_EQUIVALENT = {
+    NativeV5Backend.name: "dense_reference",
+    TurboQuantCubeBackend.name: "turboquant_reference",
+    TurboQuantAivBackend.name: "turboquant_reference",
+}
+
+
+def backend_names() -> list[str]:
+    """Every backend ``--backend`` accepts, Ascend and reference alike."""
+    from tq_longbench.reference import REFERENCE_BACKENDS
+
+    return sorted({*ASCEND_BACKENDS, *REFERENCE_BACKENDS})
 
 
 def build_backend(
@@ -499,13 +521,61 @@ def build_backend(
     dtype: torch.dtype,
     output_rotation_folded: bool = False,
 ) -> AttentionBackend:
-    """Construct the named backend, allocating its cache pool."""
-    if name not in BACKENDS:
-        raise ValueError(f"unknown backend {name!r}; choose one of {sorted(BACKENDS)}")
-    if name == NativeV5Backend.name:
-        return NativeV5Backend(geometry, shape, device, dtype)
+    """Construct the named backend, allocating its cache pool.
+
+    An Ascend backend asked for where its operators cannot run is **refused**
+    rather than quietly substituted: the reference backends compute the same
+    numbers but say nothing about what a kernel costs, and a latency table
+    torch produced under an Ascend backend's name would be worse than no table.
+    Use the ``*_reference`` names, or :func:`reference_equivalent`, to ask for
+    them deliberately.
+
+    "Cannot run" is about the operators, not the vendor. A CPU that has the
+    stand-ins registered (:func:`tq_longbench.cpu_reference.cpu_turboquant_ops`)
+    *can* serve them, and refusing there would lock the harness out of its own
+    host tests; a CUDA device never can, and never will from this repository.
+    """
+    from tq_longbench.reference import REFERENCE_BACKENDS
+
+    if name in REFERENCE_BACKENDS:
+        if name == "dense_reference":
+            return REFERENCE_BACKENDS[name](geometry, shape, device, dtype)
+        return REFERENCE_BACKENDS[name](geometry, shape, device, output_rotation_folded=output_rotation_folded)
+
+    if name not in ASCEND_BACKENDS:
+        raise ValueError(f"unknown backend {name!r}; choose one of {backend_names()}")
+    # Before the device check: a dtype the kernel cannot take is wrong wherever
+    # it is asked for, and saying so is more use than naming the device.
     if name == TurboQuantCubeBackend.name and dtype != torch.float16:
         raise ValueError(
             f"the Cube decode is float16 only, got {dtype}. Use --dtype float16, or --backend turboquant_aiv."
         )
-    return BACKENDS[name](geometry, shape, device, output_rotation_folded=output_rotation_folded)
+    if device.type != "npu" and not (device.type == "cpu" and _operators_served()):
+        raise ValueError(
+            f"{name} launches Ascend C operators, which cannot run on {device}. "
+            f"Use --backend {REFERENCE_EQUIVALENT[name]} for the same arithmetic in torch "
+            "(correctness only -- it says nothing about latency)."
+        )
+    if name == NativeV5Backend.name:
+        return NativeV5Backend(geometry, shape, device, dtype)
+    return ASCEND_BACKENDS[name](geometry, shape, device, output_rotation_folded=output_rotation_folded)
+
+
+def _operators_served() -> bool:
+    """Whether something has registered the TurboQuant operators in this process."""
+    ops = getattr(torch.ops, _ASCEND_NAMESPACE, None)
+    return ops is not None and hasattr(ops, "npu_turboquant_reshape_and_cache")
+
+
+def reference_equivalent(name: str) -> str:
+    """The torch backend that computes what ``name`` computes."""
+    return REFERENCE_EQUIVALENT.get(name, name)
+
+
+def dense_backend_for(device: torch.device) -> str:
+    """The unquantised backend this device can actually run.
+
+    ``dense_staging`` prefill needs one whatever the decode is, so the choice
+    follows the device rather than the ``--backend`` flag.
+    """
+    return NativeV5Backend.name if device.type == "npu" else "dense_reference"
