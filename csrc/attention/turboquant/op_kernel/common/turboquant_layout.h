@@ -57,6 +57,20 @@ constexpr uint32_t kOperandC0 = 32;
 constexpr uint32_t kCubeTileM = 16;
 constexpr uint32_t kCubeSlots = 2;
 
+// An NZ-tiled packed cache (kv4fp8) lays a physical block out as [kCubeTileRows-row tile][kv head]
+// [kOperandC0-byte column group][tile row][byte], so the packed plane of one (tile, kv head) is a single
+// contiguous [groups, kCubeTileRows, kOperandC0] fractal image. The decode reads it in one burst, and
+// because the nibble expand is byte-wise it lands in the Cube's NZ order as it is unpacked. The block
+// size must be a multiple of kCubeTileRows. This is the byte that holds packed column `column` of
+// (slot, kv head); the kernels issue the same arithmetic as strided DMA.
+constexpr uint64_t NzTiledPackedByte(uint64_t slot, uint64_t kvHead, uint64_t column, uint64_t numKvHeads,
+                                     uint64_t packedBytes)
+{
+    const uint64_t tileRow = slot % kCubeTileRows;
+    return (slot - tileRow) * numKvHeads * packedBytes + kvHead * kCubeTileRows * packedBytes +
+           ((column / kOperandC0) * kCubeTileRows + tileRow) * kOperandC0 + column % kOperandC0;
+}
+
 constexpr uint16_t kFlagOperandsReady = 0;
 constexpr uint16_t kFlagProductReady = 1;
 constexpr uint16_t kFlagSlotReady = 0;

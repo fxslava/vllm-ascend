@@ -1785,7 +1785,8 @@ context length.
 
 > **Superseded by 13.24 rule 1 (silicon, 2026-09-16).** The group-major 32 B GM -> UB tile
 > read described below throttles the HBM controller to 44.1 GB/s. It is not an acceptable
-> trade. The fused decode reads GM in wide bursts and permutes in the vector unit.
+> trade. The fused decode reads GM in wide bursts. Since 13.28 the kv4fp8 cache is stored
+> NZ-tiled, so the permutation happens once, at cache-write time.
 
 Two changes, and they are one change: the second is forced by the first.
 
@@ -3579,6 +3580,262 @@ S <= 256. Every run left all 32 `excp_log.dump` files at 0 B.
 
 **Follow-ups this points at:**
 - Take the batched softmax only when `heads.mine > 1`. At one head the per-head path is 5-9%
-  faster, and the ring alone keeps its gain.
+  faster, and the ring alone keeps its gain. (Implemented and measured in 13.28, where it did not
+  reproduce: on cases (a) to (c) the gate cost 2-25%, and it was dropped.)
 - Find the S 1024 divergence before extending the goldens.
 - Treat the vector-pipe unpack as the critical path at every shape profiled.
+
+### 13.28 NZ-tiled kv4fp8 storage, the kernel writer round trip, a dropped softmax gate (2026-09-17)
+
+Three changes follow up on 13.27, all kv4fp8 only:
+- The NZ permutation moved out of the decode and into the cache write.
+- A one-head softmax gate was measured, found to be a regression, and dropped.
+- A fifth fused case now runs the kernel cache writer.
+
+kv3fp4 and kv5fp8 keep their code paths. Their object code was not compared, and they were not run.
+
+#### 1. The cache is stored in the Cube's order
+
+`kStoresNzTiles<MODE>` (`turboquant_mode.h`) is true for kv4fp8, and `NzTiledPackedByte`
+(`turboquant_layout.h`) defines the layout:
+
+- A physical block is `[64-row tile][kv head][32 B column group][tile row][byte]`, so the packed
+  plane of each (tile, kv head) is the contiguous `[D/64, 64, 32]` fractal image.
+- The cache and the scale plane keep their sizes, and the scale plane stays row-major.
+- The block size must be a multiple of 64, which the Cube decode already required.
+
+The three kernel paths:
+
+- **Write.** `TurboQuantModeReshapeAndCache::WriteNzTiled` issues one strided UB -> GM burst per
+  plane per token, `DataCopyParams{H_kv * D/64, 1, 0, 63}`. Consecutive (kv head, group) cells of one
+  tile row are exactly a tile apart. The 32 B cells are paid once per token.
+- **Read.** `ReadPlane` issues one contiguous GM -> UB burst of `64 * D/2` B (8,192 B at D 256) at
+  `(row * H_kv + kvHead * 64) * D/2`, whatever the block size. `TurboQuantTileBurst` is no longer
+  used on this path, and nothing reads GM below 128 B (13.24 rule 1).
+- **Unpack.** The `int4x2` cast, the `DeInterleave` and the plane expand all work byte by byte.
+  `UnpackPlaneToL1` therefore writes each chunk's low nibbles straight onto NZ groups `[0, D/64)` and
+  its high nibbles one tile plane later, onto `[D/64, D/32)`. The 16 UB -> UB permute copies per tile
+  are gone, and so is the separate 8 KB operand buffer. One MTE3 burst still stages the tile.
+
+**Pinned on the host.** `TurboQuantNzTiledCache.TilesAreContiguousNzImagesAndTheWriterBurstHitsThem`
+(`test_host_turboquant_fidelity`) covers H_kv 1/2/8, D 64/128/256 and block 64/128. It checks three
+things:
+- the layout is a bijection;
+- every cell lies in its (tile, kv head) read window, at exactly the NZ offset (`NzOffset`) the
+  unpack gives it;
+- the writer's strided burst lands on every cell.
+
+`BuildMirroredKvCache` now writes NZ tiles. Its own test moved to block 128, D 128 and S 150, so the
+context crosses a tile and a block.
+
+#### 2. Case (e): the kernel writer round trip
+
+`TurboQuantFusedDecode.DecodesTheCacheTheKernelWriterWrote` is (a)'s shape with
+`FusedShape::kernel_writer`. The scenario works in four steps:
+
+1. It draws **independent** vector halves (`BuildMirroredKvCache(..., mirror_halves = false)`), so a
+   swapped nibble lane changes the data.
+2. It unrotates the host's dequantised vectors, converts them to fp16, and has
+   `turboquant_mm_reshape_and_cache_impl` (kv4fp8) write them into a zeroed cache.
+3. The writer rotates them back. Each coordinate sits half a quantiser step from both neighbouring
+   thresholds, so it lands on the level it came from.
+4. The test then decodes that cache.
+
+The writer's scale is the RMS of the vectors it was given, not of the draw, so the exact-attention
+reference is rescaled to the scales the writer stored.
+
+**Executed (the camodel and container of 13.27):**
+
+| check | result |
+|---|---|
+| packed GM bytes vs the host encoder | **0 of 131,072 differ**; with the two nibble lanes of every byte swapped, 29,700 differ, so lane 0 is the low nibble, as `MirroredPackedPair` assumes |
+| scale plane | 2,048 lanes, 0 pad or unwritten-slot writes, max rel err 1.95e-4 against the host RMS |
+| decode | fused = barriered bit for bit, no sentinel left, cos 0.999576 vs fp32, golden `0x9ffe02efde1506cf` (now pinned) |
+| exception dumps | 32 files, 0 B |
+
+This is the first execution of the NZ-tiled writer. The multimode suite, which also runs the writer,
+was out of scope. Its kv4fp8 figure in `docs/ascend_c_optimization_skills.md` §4.5 predates this
+layout.
+
+#### 3. The one-head softmax gate: measured, and dropped
+
+13.27's follow-up proposed taking the per-head softmax whenever a subcore owns one head. It was
+implemented as `BatchesHeads = heads.mine > 1` and measured against the same tree with the gate off.
+Gate on against gate off:
+
+| case | span | Cube idle on the probability flag |
+|---|---:|---:|
+| (a) | +19% | +45-76% |
+| (b) | +25% | +45-76% |
+| (c) | +1.6% | +45-76% |
+
+The gate was dropped: kv4fp8 batches the softmax at every head count, which is HEAD's code. The
+per-head path's Level-2 reduces cost more than the row repeats on this camodel. 13.27's number came
+from a single-change ablation on H_Q 16 / H_KV 8, a shape not run here.
+
+#### 4. Case (d) regressed, and why
+
+With the gate in (unused in (d), which has two heads per subcore), (d) was 4.4% slower than HEAD
+although its tile stage was 30% faster.
+
+**The mechanism.** The softmax instruction lists were identical in both builds, yet the first tile's
+softmax took 3,722 cycles against 2,158.
+
+- **Two kinds of gap.** An AIV core has *flag waits*, which are gaps that end in `WAIT_FLAG_DEV`.
+  Every other gap of 200+ cycles is a *stall*: neither its scalar nor its vector unit issues
+  anything.
+- **Where the stalls end.** Most end on a `PUSHQ VF` record, a synchronous vector-function call such
+  as the `ReduceRepeat` loop. The record's `vf_execute_time` is up to ~450 cycles, while the body's
+  instructions run in ~40.
+- **What was ruled out.** No cache miss, hazard retry or flag explains the dead time.
+- **How it moved.** Across builds, the same 332 calls with the same bodies averaged 214 (HEAD), 238
+  (gated), 220 and 214 (below) cycles. Stall time on (d)'s AIV cores moved with them: 18,892 ->
+  28,130 -> 16,960 -> 15,543 core-cycles.
+
+So the regression is camodel vector-function dispatch latency, and code layout moves it. It is not
+work the kernel added.
+
+**Ruled out as causes:**
+- **UB addresses.** A control build kept HEAD's addresses and gave (d) 22,476.
+- **The tail mask and the ring.** For a two-tile task the ring issues no mid-task read and no
+  slot-free wait, and tile 1's stage waits only on its own read event, which was set at task start.
+- **The MTE2/MTE3 timeline.** It had the same shape in both builds, with no DMA inside the stalled
+  softmax.
+
+**What cleared it.** `BuildTailMask` did carry four unconditional `PipeBarrier<PIPE_V>` calls between
+dependent ops on one buffer. They became switchable in the build where (d) recovered, together with
+the gate removal. These runs cannot separate those two edits. 13.29 then removed the switch as well.
+
+#### Results
+
+Each test ran in its own process, and all 32 `excp_log.dump` files stayed at 0 B.
+
+- **Goldens.** Every build reproduces (a) `0x6176461416358ec1`, (b) `0x470dad36e6708da5`,
+  (c) `0xda6a2c77e20ff4a1` and (d) `0xcc1fcdfed39b48e5`.
+- **Fidelity.** Cos is unchanged: 0.999407 / 0.999400 / 0.999400 / 0.999517.
+- **A/B twin.** Fused matches barriered bit for bit in every case, and (c) agrees with (b) at cos
+  1.000000000.
+- **Builds.** Clean under `-Werror` with zero compiler warnings: host 6 targets, sim 37, npu 42,
+  the same target sets as HEAD.
+- **Host tests.** Pass: fidelity 21/21, tiling 6/6.
+
+**How the cycles were measured.** `build/nz_profile.py` (gitignored) reads the per-core `instr_log`
+and splits a process's launches at the Cube prologue. `Total tick` is **not** a launch metric: the
+camodel keeps ticking while the host works between launches. The columns are:
+
+- **Span.** From the prologue to the last instruction of the launch, over all cores.
+- **Flag release cycles.** Taken from `WAIT_FLAG_DEV` (flag id in XT), which is issued on the cycle
+  its flag is released.
+- **Tile stage.** From the vector unit's MTE2 -> V wait that opens `StageSlot` to the MTE3
+  `MOV_UB_TO_L1` burst of the tile.
+- **Stalls and VF latency.** `build/nz_stalls.py` and `build/nz_vf.py`.
+
+A repeated process reproduced every figure exactly. Builds that differ only in code layout still move
+a span by up to ~3% through the dispatch latency above, so smaller differences are noise.
+
+Fused launch, cycles. "Shipped" is this section plus 13.29.
+
+| | case | HEAD 41c2012e2 | NZ + one-head gate (dropped) | shipped |
+|---|---|---:|---:|---:|
+| span | (a) S 64, 1 head/subcore | 14,933 | 15,413 | **13,558 (-9.2%)** |
+| | (b) S 256 unsplit, 4 tiles | 31,082 | 30,993 | **24,888 (-19.9%)** |
+| | (c) (b) on the fill grid | 23,132 | 21,360 | **21,041 (-9.0%)** |
+| | (d) S 120, 2 heads/subcore | 21,628 | 22,580 | **18,460 (-14.6%)** |
+| | (e) (a) from the kernel writer | - | - | 12,824 |
+| tile stage, mean | (a) / (b) / (c) / (d) | 2,757 / 3,128 / 2,741 / 3,234 | 1,762 / 2,475 / 1,731 / 2,264 | 1,766 / 2,219 / 1,778 / 2,108 |
+| first slot ready | (a) / (b) / (c) / (d) | 8,859 / 9,466 / 8,770 / 9,784 | 7,560 / 8,150 / 7,542 / 8,561 | 7,622 / 8,318 / 7,776 / 8,583 |
+| Cube idle on slot flags | (a) / (b) / (c) / (d) | 12,169 / 35,775 / 49,877 / 22,355 | 10,807 / 29,003 / 43,074 / 19,733 | 10,783 / 24,481 / 44,301 / 16,442 |
+| Cube idle on probs | (a) / (b) / (c) / (d) | 4,451 / 10,923 / 17,426 / 7,869 | 5,107 / 14,816 / 16,484 / 12,379 | 2,853 / 9,512 / 11,567 / 6,625 |
+| AIV instructions | (a) / (b) / (c) / (d) | 36,764 / 108,688 / 153,072 / 62,964 | 32,220 / 94,772 / 135,040 / 60,872 | 35,388 / 104,348 / 147,684 / 60,588 |
+| probs(t) -> slot(t+1) | (b) / (d) | 4,004 / 4,328 | 3,106 / 3,754 | 2,342 / 2,193 |
+| tile period | (b) / (d) | 5,358 / 6,264 | 4,998 / 6,534 | 3,696 / 4,110 |
+
+**What moved, and what did not:**
+- **Faster.** A tile stages in 29-36% fewer cycles, the first tile reaches the Cube 11-14% sooner,
+  and the tile period falls 31-34%.
+- **Less idle.** The Cube's idle wait on the slot flags falls 11-32%, but it does not collapse.
+- **Target missed.** Staging did not reach the 800-cycle target. What remains (1.7-2.2 K cycles) is
+  the unpack itself: two chunks of eight vector instructions each, over 4,096 packed bytes (8,192
+  nibbles) per chunk.
+- **Dominated by setup.** The first-slot figure is still mostly the ~5-6 K cycles before the first
+  stage: `Init`, the query, the cursor and the reads.
+
+**Not run, by scope:** S 1024, the H_Q 16 / H_KV 8 and 8-heads-per-subcore shapes of 13.27, kv3fp4 /
+kv5fp8, the multimode suite, and anything on silicon.
+
+**Follow-ups this points at:**
+- The unpack is now the staging cost. Two structural options each remove about half of it:
+  - Fold the `+0.5` level offset into the Cube product as a per-head additive correction. This
+    changes the bits, so the goldens would need re-recording.
+  - Pack adjacent NZ columns per byte instead of plane-split, so `Cast<half, int4b_t>` emits NZ order
+    and `DeInterleave` goes away. `DataCopy`'s 32 B granularity cannot scatter the 16 B cells such a
+    layout needs, so the writer would need another mechanism.
+- Take the pre-stage setup (~5-6 K cycles of the first slot) apart the same way the stage was.
+- Measure vector-function dispatch latency on silicon before trusting camodel spans closer than ~3%.
+
+### 13.29 Intra-pipe barriers removed from the kv4fp8 decode and writer (2026-09-17)
+
+The user's rules, from silicon profiling (+31.3 us attributed to vector barriers):
+1. No `PipeBarrier<PIPE_V>` between vector arithmetic; ccec tracks RAW/WAR/WAW itself.
+2. Cross-pipe hand-offs use `HardEvent` set/wait.
+3. A vector barrier stays only for an aliased or reinterpreted buffer, or for back-to-back reductions
+   sharing one scratch buffer.
+
+**Audit, before the change:**
+
+- **The decode.** Its 67 switchable `VecBarrier` calls in `turboquant_vector_service.h` were already
+  compiled out of the production kernel (`kFusedVecBarriers = false`). Only the barriered A/B
+  instance issued them.
+- **Unconditional vector barriers on kv4fp8's paths:**
+  - 2 in the decode (`BeginTask` and `TurboQuantPartialReducer::Reduce`), each separating two
+    overlapping `Duplicate` writes;
+  - 4 in `BuildTailMask`, made switchable in 13.28;
+  - about 37 per encoded vector in the cache writer (the rotation, `Compute`, `Encode` and
+    `PackAffinePlane`). The purge removes 29 of them and keeps 8 plus the FWHT's ping-pong barriers.
+
+**What changed:**
+
+- **`turboquant_vector_service.h`.** All 67 `VecBarrier` calls were deleted, from every chain:
+  softmax, logits, query quantisation, accumulation, tail mask and close-out. The two
+  overlapping-write barriers stay (rule 3, aliased write). The barrier before the per-head path's
+  scalar readback (`QuantizeQueryHeads`, kv3fp4 / kv5fp8 only) is untouched.
+- **`turboquant_codec_mx.h`.**
+  - **Unpack.** `UnpackAffine` and `ExpandNibblePlane` issue barrier-free.
+  - **Encode.** Its chain barriers became `ChainBarrier()`, which is empty for kv4fp8 and unchanged
+    for the codebook modes. Four barriers stay unconditional, each at a reinterpretation:
+    - the reduce's float scratch becomes int32 bins;
+    - float bin lanes become uint32;
+    - uint32 bin lanes become int32, and are written as float by the next pass;
+    - half levels in `scratch_` are written as float by the next vector's encode.
+  - **Pack.** `PackAffinePlane` keeps only that last one.
+  - **Cast.** `CastToOperand` keeps its switch, because the codebook modes' unpack calls it
+    barriered.
+- **Writer (`turboquant_fused_decode.cpp`), for kv4fp8 (`kBarrierFreeWriter<MODE>`):**
+  - The rotation runs `ApplyPi<false>`, the same barrier-free rotation the production query rotation
+    uses. The FWHT's ping-pong barriers stay, as a documented race.
+  - The `Cast -> ApplyPi` and `Gather -> EnQue` barriers are gone.
+  - The `Duplicate -> Gather` barrier over overlapping scale lanes stays.
+  - `Init` hands the signs over with `SyncMte2ToVector()` instead of `PipeBarrier<PIPE_ALL>`.
+
+**Cross-pipe events.** Every GM -> UB, UB -> L1 and UB -> GM hand-off in the decode already uses
+`MTE2_V` / `V_MTE3` / `MTE3_V` events, and the writer's queues use their own. **`HardEvent::FIX_V`
+is not usable here:** `kernel_event.h` lowers `FIX_V` / `V_FIX` only under `__NPU_ARCH__ == 5102`.
+On arch35 (3510) both fall to the empty `default:` assert and emit nothing, the same silent trap as
+an unsupported `Cast` (13.9). The Fixpipe product also lands on another core, the AIV subcores. So
+the decode keeps the cross-core flags the AIC sets on `PIPE_FIX` (`kFlagScoresReady`,
+`kFlagContextReady`), which is the hand-off that works on this part.
+
+**Results (same camodel, one process per test, 0 B dumps everywhere):**
+
+- **Correctness.** All five goldens hold, fused = barriered in every case, and case (e)'s written
+  cache is still byte-identical to the host encoder, with the same scale error.
+- **Decode spans.** They moved by -1.8% to +1.4% against the build before the purge. That is
+  expected, since its removed barriers were already compiled out, and within layout noise.
+- **Writer.** The kv4fp8 writer launch (64 tokens, 64 AIV cores) went from 29,237 to 28,814 cycles
+  (-1.4%). It issued the same 7,424 vector-function calls with the same mean latency (264 -> 265).
+  Its barrier-class instructions fell by only 128 across 256 encoded vectors, so most of the 29
+  barriers per vector emitted nothing to begin with. The writer's time is vector-function dispatch.
+
+The +31.3 us silicon figure could therefore not be reproduced as camodel cycles. Whether the purge
+buys it back needs the device trace. The barriered decode instance now differs from the fused one
+only inside the broadcast and cast helpers that still take the switch. It remains a (weaker) A/B.

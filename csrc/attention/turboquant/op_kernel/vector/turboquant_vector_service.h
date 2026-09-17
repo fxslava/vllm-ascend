@@ -118,19 +118,15 @@ __aicore__ inline void WriteNormalizedHeads(const AscendC::LocalTensor<float> &a
     for (uint32_t j = 0; j < heads; ++j) {
         AscendC::Adds(runSum[j * kFp32PerBlock], runSum[j * kFp32PerBlock], TurboQuantCodec4::kEps, 1);
     }
-    VecBarrier<VEC_BARRIERS>();
     for (uint32_t j = 0; j < heads; ++j) {
         AscendC::Brcb(sums[j * kFp32PerBlock], runSum[j * kFp32PerBlock], 1, {1, static_cast<uint16_t>(kFp32PerBlock)});
     }
     AscendC::Duplicate(invs, 1.0f, heads * kFp32PerBlock);
-    VecBarrier<VEC_BARRIERS>();
     AscendC::Div(invs, invs, sums, heads * kFp32PerBlock);
-    VecBarrier<VEC_BARRIERS>();
     for (uint32_t col = 0; col < headSize; col += kFp32PerRepeat) {
         AscendC::Mul(acc[col], acc[col], invs, static_cast<uint64_t>(kFp32PerRepeat), static_cast<uint8_t>(heads),
                      rowRepeat);
     }
-    VecBarrier<VEC_BARRIERS>();
 
     AscendC::Cast(out, acc, AscendC::RoundMode::CAST_RINT, heads * headSize);
     SyncVectorToMte3();
@@ -192,10 +188,10 @@ public:
 
         AscendC::Duplicate(acc, 0.0f, headSize_);
         AscendC::Duplicate(state, 0.0f, kStateLanes * kFp32PerBlock);
-        // Two writes to overlapping lanes: their order is the result, so this barrier is not optional.
+        // Two writes to overlapping lanes: their order is the result, so this barrier is not optional
+        // (an aliased write, one of the two barriers the decode keeps).
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Duplicate(runMax, kVectorNegInf, 1);
-        VecBarrier<VEC_BARRIERS>();
 
         for (uint32_t split = 0; split < numSplits_; ++split) {
             SyncVectorToMte2();
@@ -203,27 +199,20 @@ public:
             SyncMte2ToVector();
 
             AscendC::Max(newMax, runMax, partMax, 1);
-            VecBarrier<VEC_BARRIERS>();
             AscendC::Sub(alpha, runMax, newMax, 1);
             AscendC::Sub(beta, partMax, newMax, 1);
-            VecBarrier<VEC_BARRIERS>();
             AscendC::Exp(alpha, alpha, 1);
             AscendC::Exp(beta, beta, 1);
-            VecBarrier<VEC_BARRIERS>();
             AscendC::Mul(runSum, runSum, alpha, 1);
             AscendC::Mul(partSum, partSum, beta, 1);
-            VecBarrier<VEC_BARRIERS>();
             AscendC::Add(runSum, runSum, partSum, 1);
-            VecBarrier<VEC_BARRIERS>();
 
             BroadcastScalar<VEC_BARRIERS>(bAlpha, alpha);
             BroadcastScalar<VEC_BARRIERS>(bBeta, beta);
             TurboQuantCodec4::BroadcastMul<VEC_BARRIERS>(acc, acc, bAlpha, headSize_);
             TurboQuantCodec4::BroadcastMul<VEC_BARRIERS>(partAcc, partAcc, bBeta, headSize_);
             AscendC::Add(acc, acc, partAcc, headSize_);
-            VecBarrier<VEC_BARRIERS>();
             AscendC::Adds(runMax, newMax, 0.0f, 1);
-            VecBarrier<VEC_BARRIERS>();
         }
 
         WriteNormalizedHeads<scalar_t, VEC_BARRIERS>(acc, runSum, 1, headSize_, sums, invs, outBuf_.Get<scalar_t>(),
@@ -263,7 +252,9 @@ __aicore__ inline constexpr float OperandMax()
 }
 
 // The ring-buffered tile ingest and the head-batched softmax, validated on kv4fp8 only. The other modes
-// keep the lock-step ingest and the per-head softmax they were verified with.
+// keep the lock-step ingest and the per-head softmax they were verified with. kv4fp8 batches even one
+// head per subcore: the per-head path's Level-2 reduces cost more than the row repeats
+// (csrc/tests/TURBOQUANT_TESTS.md 13.28).
 template <TurboQuantMode MODE>
 constexpr bool kBatchedCubeDecode = MODE == TurboQuantMode::KV4_FP8;
 
@@ -277,7 +268,9 @@ struct TurboQuantTaskHeads {
 };
 
 // Mm is the Cube BMM service (TurboQuantCubeMm<MODE>) that owns the L1 operand slots, and Codec the
-// mode's KV codec. Subcore 0 stages the K plane of every tile and subcore 1 the V plane.
+// mode's KV codec. Subcore 0 stages the K plane of every tile and subcore 1 the V plane. An NZ-tiled
+// cache (kv4fp8) is read one (tile, kv head) per burst and unpacked straight into NZ order; the
+// row-major modes read through TurboQuantTileBurst and unpack in bands.
 //
 // The batched decode keeps every per-head scalar of the softmax broadcast over its head's 8-lane block:
 // one wide op advances all heads, the same field is the block operand of a row op, and lane j * 8 still
@@ -287,6 +280,8 @@ class TurboQuantVectorDecodeService {
 public:
     using OperandT = typename Mm::OperandT;
     static constexpr bool kBatched = kBatchedCubeDecode<MODE>;
+    static constexpr bool kNzTiled = kStoresNzTiles<MODE>;
+    static_assert(kNzTiled == Codec::kIsAffine, "only the byte-wise affine expand streams an NZ-tiled plane");
     // Ring slots of the tile ingest. Tile t reads into slot t % kCubeSlots, the slot of its L1 operands.
     static constexpr uint32_t kIngestSlots = kBatched ? kCubeSlots : 1;
 
@@ -306,10 +301,8 @@ public:
         scaleSlot_ = ScaleSlotFloats(numKvHeads_);
         partialStride_ = headSize + kPartialTail;
         operandElems_ = Mm::OperandElems(headSize_);
-        planeGroups_ = packedBytes_ / kOperandC0;
+        tilePlaneBytes_ = kCubeTileRows * packedBytes_;
         chunkBytes_ = kUnpackChunkRows * packedBytes_;
-        permuteParams_ = AscendC::DataCopyParams{static_cast<uint16_t>(kUnpackChunkRows), 1,
-                                                 static_cast<uint16_t>(planeGroups_ - 1), 0};
         stageParams_ =
             AscendC::DataCopyParams{1, static_cast<uint16_t>(kCubeTileRows * operandElems_ / kOperandC0), 0, 0};
         bandParams_ = AscendC::DataCopyParams{static_cast<uint16_t>(operandElems_ / kOperandC0),
@@ -340,8 +333,7 @@ public:
         for (uint32_t slot = 0; slot < kIngestSlots; ++slot) {
             pipe->InitBuffer(scaleTileBuf_[slot], kCubeTileRows * scaleSlot_ * sizeof(float));
         }
-        if constexpr (Codec::kIsAffine) {
-            pipe->InitBuffer(operandBuf_, 2 * chunkBytes_);
+        if constexpr (kNzTiled) {
             pipe->InitBuffer(nzBuf_, kCubeTileRows * operandElems_);
         } else {
             pipe->InitBuffer(operandBuf_, kCubeUnpackRows * operandElems_);
@@ -359,7 +351,9 @@ public:
         pipe->InitBuffer(scratchBuf_, (headSize_ > kCubeTileRows ? headSize_ : kCubeTileRows) * sizeof(float));
         pipe->InitBuffer(outBuf_, kHalfRows * headSize_ * sizeof(scalar_t));
         pipe->InitBuffer(maskBuf_, 2 * kCubeTileRows * sizeof(float));
-        burst_.Init(pipe, numKvHeads_, packedBytes_, kCubeTileRows, kIngestSlots);
+        if constexpr (!kNzTiled) {
+            burst_.Init(pipe, numKvHeads_, packedBytes_, kCubeTileRows, kIngestSlots);
+        }
 
         codec_.Init(pipe, headSize_, Codec::kIsAffine ? kUnpackChunkRows : kCubeUnpackRows, invSqrtLen,
                     modeTablesGm_);
@@ -392,10 +386,10 @@ public:
         }
         AscendC::Duplicate(accBuf_.Get<float>(), 0.0f, heads.mine * headSize_);
         AscendC::Duplicate(stateBuf_.Get<float>(), 0.0f, kStateFields * kStateField);
-        // Two writes to overlapping lanes: their order is the result, so this barrier is not optional.
+        // Two writes to overlapping lanes: their order is the result, so this barrier is not optional
+        // (an aliased write, one of the two barriers the decode keeps).
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Duplicate(StateField(kStateRunMax), kVectorNegInf, heads.mine * kFp32PerBlock);
-        VecBarrier<VEC_BARRIERS>();
     }
 
     // Quantises this subcore's query heads onto the operand grid and stages them into the Cube's L1
@@ -432,7 +426,6 @@ public:
                                   static_cast<int32_t>(kCubeTileRows));
         AscendC::ArithProgression(idx[kCubeTileRows], static_cast<int32_t>((numKvHeads_ + kvHead) * sizeof(float)),
                                   slotBytes, static_cast<int32_t>(kCubeTileRows));
-        VecBarrier<VEC_BARRIERS>();
     }
 
     // The mask a partial last tile is Min-ed with: 0-crossing at `valid`, +huge before, -huge after.
@@ -441,13 +434,9 @@ public:
         const AscendC::LocalTensor<float> mask = maskBuf_.Get<float>();
         const AscendC::LocalTensor<int32_t> lanes = mask[kCubeTileRows].ReinterpretCast<int32_t>();
         AscendC::ArithProgression(lanes, 0, 1, static_cast<int32_t>(kCubeTileRows));
-        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Cast(mask, lanes, AscendC::RoundMode::CAST_NONE, kCubeTileRows);
-        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Adds(mask, mask, kMaskMidpoint - static_cast<float>(valid), kCubeTileRows);
-        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Muls(mask, mask, kMaskGain, kCubeTileRows);
-        AscendC::PipeBarrier<PIPE_V>();
     }
 
     // Reads this subcore's plane of one tile in a wide burst, unpacks it in UB, reorders it to NZ and
@@ -463,7 +452,7 @@ public:
         const AscendC::LocalTensor<int8_t> packed = kvBuf_[0].Get<int8_t>();
         ReadPlane(physical, rowBase, kvHead, 0);
         SyncMte2ToVector();
-        burst_.Permute(packed, kvHead, 0);
+        PermuteRows(packed, kvHead, 0);
         UnpackToL1(packed, l1Dst);
     }
 
@@ -487,7 +476,7 @@ public:
         GetTPipePtr()->ReleaseEventID<AscendC::HardEvent::MTE2_V>(readEvents_[slot]);
 
         const AscendC::LocalTensor<int8_t> packed = kvBuf_[slot].Get<int8_t>();
-        burst_.Permute(packed, kvHead, slot);
+        PermuteRows(packed, kvHead, slot);
         UnpackToL1(packed, l1Dst);
     }
 
@@ -509,10 +498,8 @@ public:
         const AscendC::LocalTensor<uint32_t> idx = scaleIdxBuf_.Get<int32_t>().ReinterpretCast<uint32_t>();
         AscendC::Gather(kScale, scaleTile, idx, kGatherSrcBase, kCubeTileRows);
         AscendC::Gather(vScale, scaleTile, idx[kCubeTileRows], kGatherSrcBase, kCubeTileRows);
-        VecBarrier<VEC_BARRIERS>();
         AscendC::Muls(kScale, kScale, scoreScale_, kCubeTileRows);
         AscendC::Muls(vScale, vScale, invGain_, kCubeTileRows);
-        VecBarrier<VEC_BARRIERS>();
 
         if constexpr (kBatched) {
             SoftmaxRows(valid, heads.mine, kScale, vScale);
@@ -544,12 +531,9 @@ public:
                 AscendC::Brcb(blocks[j * kFp32PerBlock], alpha[j * kFp32PerBlock], 1,
                               {1, static_cast<uint16_t>(kFp32PerBlock)});
             }
-            VecBarrier<VEC_BARRIERS>();
             MulHeadRows(acc, blocks, heads.mine);
         }
-        VecBarrier<VEC_BARRIERS>();
         AscendC::Adds(StateField(kStateRunMax), StateField(kStateNewMax), 0.0f, heads.mine * kFp32PerBlock);
-        VecBarrier<VEC_BARRIERS>();
     }
 
     // The Cube's context rows are probs * V on the operand grid: undo each head's prob scale and add.
@@ -565,11 +549,8 @@ public:
             const AscendC::LocalTensor<float> inv = StateField(kStateAccInv);
             const uint32_t lanes = heads.mine * kFp32PerBlock;
             AscendC::Duplicate(inv, 1.0f, lanes);
-            VecBarrier<VEC_BARRIERS>();
             AscendC::Div(inv, inv, probScale, lanes);
-            VecBarrier<VEC_BARRIERS>();
             MulHeadRows(ctx, inv, heads.mine);
-            VecBarrier<VEC_BARRIERS>();
         } else {
             const AscendC::LocalTensor<float> reduce = reduceBuf_.Get<float>();
             const AscendC::LocalTensor<float> block = reduce[kReduceAccBlock];
@@ -577,14 +558,11 @@ public:
             for (uint32_t j = 0; j < heads.mine; ++j) {
                 BroadcastScalar<VEC_BARRIERS>(block, probScale[j * kFp32PerBlock]);
                 AscendC::Duplicate(inv, 1.0f, kFp32PerBlock);
-                VecBarrier<VEC_BARRIERS>();
                 AscendC::Div(inv, inv, block, kFp32PerBlock);
-                VecBarrier<VEC_BARRIERS>();
                 TurboQuantCodec4::BroadcastMul<VEC_BARRIERS>(ctx[j * headSize_], ctx[j * headSize_], inv, headSize_);
             }
         }
         AscendC::Add(acc, acc, ctx, heads.mine * headSize_);
-        VecBarrier<VEC_BARRIERS>();
     }
 
     // A fused token writes its output straight to GM; a split token leaves its partials for the
@@ -651,20 +629,36 @@ private:
         return Plane() == kKeyPlane ? mm.B1K(slot) : mm.B1V(slot);
     }
 
-    // This subcore's plane of one tile and the tile's scale lanes, into ingest slot `slot`.
+    // This subcore's plane of one tile and the tile's scale lanes, into ingest slot `slot`. rowBase is a
+    // whole number of tiles into the block, so an NZ-tiled (tile, kv head) starts at
+    // (row * kv heads + kvHead * kCubeTileRows) * packedBytes (turboquant_layout.h, NzTiledPackedByte).
     __aicore__ inline void ReadPlane(uint32_t physical, uint32_t rowBase, uint32_t kvHead, uint32_t slot)
     {
         const uint64_t row = static_cast<uint64_t>(physical) * blockSize_ + rowBase;
-        burst_.Read(kvBuf_[slot].Get<int8_t>(), Plane() == kKeyPlane ? keyCacheGm_ : valueCacheGm_,
-                    row * packedPlane_, kvHead, slot);
+        AscendC::GlobalTensor<int8_t> &cacheGm = Plane() == kKeyPlane ? keyCacheGm_ : valueCacheGm_;
+        if constexpr (kNzTiled) {
+            const uint64_t tile = (row * numKvHeads_ + static_cast<uint64_t>(kvHead) * kCubeTileRows) * packedBytes_;
+            AscendC::DataCopy(kvBuf_[slot].Get<int8_t>(), cacheGm[tile], tilePlaneBytes_);
+        } else {
+            burst_.Read(kvBuf_[slot].Get<int8_t>(), cacheGm, row * packedPlane_, kvHead, slot);
+        }
         AscendC::DataCopy(scaleTileBuf_[slot].Get<float>(), scaleCacheGm_[row * scaleSlot_],
                           kCubeTileRows * scaleSlot_);
+    }
+
+    // The vector half of a row-major read that had to take the whole row plane. An NZ-tiled tile never
+    // needs it.
+    __aicore__ inline void PermuteRows(const AscendC::LocalTensor<int8_t> &packed, uint32_t kvHead, uint32_t slot)
+    {
+        if constexpr (!kNzTiled) {
+            burst_.Permute(packed, kvHead, slot);
+        }
     }
 
     __aicore__ inline void UnpackToL1(const AscendC::LocalTensor<int8_t> &packed,
                                       const AscendC::LocalTensor<OperandT> &l1Dst)
     {
-        if constexpr (Codec::kIsAffine) {
+        if constexpr (kNzTiled) {
             UnpackPlaneToL1(packed, l1Dst);
         } else {
             UnpackBandsToL1(packed, l1Dst);
@@ -696,7 +690,6 @@ private:
                                           static_cast<int32_t>(heads), 1, 1, kTileBlocks,
                                           AscendC::ReduceOrder::ORDER_ONLY_VALUE);
         }
-        VecBarrier<VEC_BARRIERS>();
         AscendC::Brcb(blocks, rowReduce, 1, {1, static_cast<uint16_t>(kFp32PerBlock)});
     }
 
@@ -715,14 +708,10 @@ private:
             const AscendC::LocalTensor<float> vec = qIn[j * headSize_];
             const uint32_t lane = j * kFp32PerBlock;
             AscendC::Abs(tmp, vec, headSize_);
-            VecBarrier<VEC_BARRIERS>();
             AscendC::ReduceMax<float>(amax[lane], tmp, scratch, headSize_, false);
-            VecBarrier<VEC_BARRIERS>();
             AscendC::Adds(amax[lane], amax[lane], TurboQuantCodec4::kEps, 1);
             AscendC::Duplicate(qScale[lane], OperandMax<MODE>(), 1);
-            VecBarrier<VEC_BARRIERS>();
             AscendC::Div(qScale[lane], qScale[lane], amax[lane], 1);
-            VecBarrier<VEC_BARRIERS>();
             BroadcastScalar<VEC_BARRIERS>(brcb, qScale[lane]);
             TurboQuantCodec4::BroadcastMul<VEC_BARRIERS>(vec, vec, brcb, headSize_);
             codec_.template CastToOperand<OperandT, VEC_BARRIERS>(qOperand[j * operandElems_], vec, headSize_);
@@ -748,23 +737,17 @@ private:
         const uint32_t lanes = heads * kFp32PerBlock;
 
         AscendC::Abs(qAbs, qIn, heads * headSize_);
-        VecBarrier<VEC_BARRIERS>();
         // A row is wider than one register, so this reduce stays per head. It has no scalar readback.
         for (uint32_t j = 0; j < heads; ++j) {
             AscendC::ReduceMax<float>(rowMax[j], qAbs[j * headSize_], scratch, headSize_, false);
         }
-        VecBarrier<VEC_BARRIERS>();
         AscendC::Brcb(amax, rowMax, 1, {1, static_cast<uint16_t>(kFp32PerBlock)});
-        VecBarrier<VEC_BARRIERS>();
         AscendC::Adds(amax, amax, TurboQuantCodec4::kEps, lanes);
         AscendC::Duplicate(qScale, OperandMax<MODE>(), lanes);
         AscendC::Duplicate(qInv, 1.0f, lanes);
-        VecBarrier<VEC_BARRIERS>();
         AscendC::Div(qScale, qScale, amax, lanes);
-        VecBarrier<VEC_BARRIERS>();
         AscendC::Div(qInv, qInv, qScale, lanes);
         MulHeadRows(qIn, qScale, heads);
-        VecBarrier<VEC_BARRIERS>();
         codec_.template CastToOperand<OperandT, VEC_BARRIERS>(qOperand, qIn, heads * headSize_);
     }
 
@@ -790,41 +773,29 @@ private:
             const AscendC::LocalTensor<float> row = scores[j * kCubeTileRows];
             const uint32_t lane = j * kFp32PerBlock;
             AscendC::Mul(row, row, kScale, kCubeTileRows);
-            VecBarrier<VEC_BARRIERS>();
             AscendC::Muls(row, row, qScaleInv_[j], kCubeTileRows);
-            VecBarrier<VEC_BARRIERS>();
             if (valid < kCubeTileRows) {
                 AscendC::Min(row, row, mask, static_cast<int32_t>(kCubeTileRows));
-                VecBarrier<VEC_BARRIERS>();
             }
 
             AscendC::ReduceMax<float>(tileMax[lane], row, scratch, kCubeTileRows, false);
-            VecBarrier<VEC_BARRIERS>();
             AscendC::Max(newMax[lane], runMax[lane], tileMax[lane], 1);
-            VecBarrier<VEC_BARRIERS>();
             AscendC::Sub(alpha[lane], runMax[lane], newMax[lane], 1);
-            VecBarrier<VEC_BARRIERS>();
             AscendC::Exp(alpha[lane], alpha[lane], 1);
 
             BroadcastScalar<VEC_BARRIERS>(brcb, newMax[lane]);
             BroadcastSub<VEC_BARRIERS>(row, row, brcb, kCubeTileRows);
             AscendC::Exp(row, row, kCubeTileRows);
-            VecBarrier<VEC_BARRIERS>();
 
             AscendC::ReduceSum<float>(part, row, scratch, kCubeTileRows);
             AscendC::Mul(runSum[lane], runSum[lane], alpha[lane], 1);
-            VecBarrier<VEC_BARRIERS>();
             AscendC::Add(runSum[lane], runSum[lane], part, 1);
 
             AscendC::Mul(row, row, vScale, kCubeTileRows);
-            VecBarrier<VEC_BARRIERS>();
             AscendC::ReduceMax<float>(part, row, scratch, kCubeTileRows, false);
-            VecBarrier<VEC_BARRIERS>();
             AscendC::Adds(part, part, TurboQuantCodec4::kEps, 1);
             AscendC::Duplicate(probScale[lane], OperandMax<MODE>(), 1);
-            VecBarrier<VEC_BARRIERS>();
             AscendC::Div(probScale[lane], probScale[lane], part, 1);
-            VecBarrier<VEC_BARRIERS>();
             BroadcastScalar<VEC_BARRIERS>(brcb, probScale[lane]);
             TurboQuantCodec4::BroadcastMul<VEC_BARRIERS>(row, row, brcb, kCubeTileRows);
 
@@ -853,41 +824,28 @@ private:
         const uint32_t lanes = heads * kFp32PerBlock;
 
         AscendC::Mul(scores, scores, kScale, rowLanes, rows, tileByVectorParams_);
-        VecBarrier<VEC_BARRIERS>();
         AscendC::Mul(scores, scores, qInv, rowLanes, rows, tileByBlockParams_);
-        VecBarrier<VEC_BARRIERS>();
         if (valid < kCubeTileRows) {
             AscendC::Min(scores, scores, mask, rowLanes, rows, tileByVectorParams_);
-            VecBarrier<VEC_BARRIERS>();
         }
 
         ReduceTileRows<AscendC::ReduceType::MAX>(tileMax, scores, heads);
-        VecBarrier<VEC_BARRIERS>();
         AscendC::Max(newMax, runMax, tileMax, static_cast<int32_t>(lanes));
-        VecBarrier<VEC_BARRIERS>();
         AscendC::Sub(alpha, runMax, newMax, lanes);
         AscendC::Sub(scores, scores, newMax, rowLanes, rows, tileByBlockParams_);
-        VecBarrier<VEC_BARRIERS>();
         AscendC::Exp(alpha, alpha, lanes);
         AscendC::Exp(scores, scores, heads * kCubeTileRows);
-        VecBarrier<VEC_BARRIERS>();
 
         ReduceTileRows<AscendC::ReduceType::SUM>(part, scores, heads);
         AscendC::Mul(runSum, runSum, alpha, lanes);
-        VecBarrier<VEC_BARRIERS>();
         AscendC::Add(runSum, runSum, part, lanes);
         AscendC::Mul(scores, scores, vScale, rowLanes, rows, tileByVectorParams_);
-        VecBarrier<VEC_BARRIERS>();
 
         ReduceTileRows<AscendC::ReduceType::MAX>(part, scores, heads);
         AscendC::Duplicate(probScale, OperandMax<MODE>(), lanes);
-        VecBarrier<VEC_BARRIERS>();
         AscendC::Adds(part, part, TurboQuantCodec4::kEps, lanes);
-        VecBarrier<VEC_BARRIERS>();
         AscendC::Div(probScale, probScale, part, lanes);
-        VecBarrier<VEC_BARRIERS>();
         AscendC::Mul(scores, scores, probScale, rowLanes, rows, tileByBlockParams_);
-        VecBarrier<VEC_BARRIERS>();
 
         codec_.template CastToOperand<OperandT, VEC_BARRIERS>(probOperand, scores, heads * kCubeTileRows);
     }
@@ -897,29 +855,19 @@ private:
         return ((static_cast<uint64_t>(token) * numHeads_ + head) * numSplits_ + split) * partialStride_;
     }
 
+    // An NZ-tiled plane is already the NZ image of its bytes, and the expand is byte-wise, so a chunk's
+    // low nibbles land in place on NZ groups [0, groups) and its high nibbles on [groups, 2 * groups).
+    // The staging buffer is the L1 operand as unpacked, and one MTE3 burst stages it.
     __aicore__ inline void UnpackPlaneToL1(const AscendC::LocalTensor<int8_t> &packed,
                                            const AscendC::LocalTensor<OperandT> &l1Dst)
     {
-        const AscendC::LocalTensor<OperandT> low = operandBuf_.Get<OperandT>();
-        const AscendC::LocalTensor<OperandT> high = low[chunkBytes_];
-        const AscendC::LocalTensor<int8_t> lowBytes = low.template ReinterpretCast<int8_t>();
-        const AscendC::LocalTensor<int8_t> highBytes = high.template ReinterpretCast<int8_t>();
-        const AscendC::LocalTensor<int8_t> nz = nzBuf_.Get<int8_t>();
-
-        for (uint32_t chunk = 0; chunk < kCubeTileRows / kUnpackChunkRows; ++chunk) {
-            codec_.template UnpackAffine<OperandT, VEC_BARRIERS>(low, high, packed[chunk * chunkBytes_],
-                                                                 chunkBytes_);
-            const uint32_t rowBase = chunk * kUnpackChunkRows;
-            for (uint32_t group = 0; group < planeGroups_; ++group) {
-                AscendC::DataCopy(nz[(group * kCubeTileRows + rowBase) * kOperandC0], lowBytes[group * kOperandC0],
-                                  permuteParams_);
-                AscendC::DataCopy(nz[((planeGroups_ + group) * kCubeTileRows + rowBase) * kOperandC0],
-                                  highBytes[group * kOperandC0], permuteParams_);
-            }
-            VecBarrier<VEC_BARRIERS>();
+        const AscendC::LocalTensor<OperandT> nz = nzBuf_.Get<OperandT>();
+        const AscendC::LocalTensor<OperandT> nzHigh = nz[tilePlaneBytes_];
+        for (uint32_t base = 0; base < tilePlaneBytes_; base += chunkBytes_) {
+            codec_.template UnpackAffine<OperandT, VEC_BARRIERS>(nz[base], nzHigh[base], packed[base], chunkBytes_);
         }
         SyncVectorToMte3();
-        AscendC::DataCopy(l1Dst, nzBuf_.Get<OperandT>(), stageParams_);
+        AscendC::DataCopy(l1Dst, nz, stageParams_);
         SyncMte3ToVector();
     }
 
@@ -949,7 +897,6 @@ private:
         const AscendC::LocalTensor<float> runSum = StateField(kStateRunSum);
         const AscendC::LocalTensor<float> tails = scoreBuf_.Get<float>();
         AscendC::Duplicate(tails, 0.0f, heads.mine * kPartialTail);
-        VecBarrier<VEC_BARRIERS>();
         for (uint32_t j = 0; j < heads.mine; ++j) {
             AscendC::Adds(tails[j * kPartialTail + kPartialMaxLane], runMax[j * kFp32PerBlock], 0.0f, 1);
             AscendC::Adds(tails[j * kPartialTail + kPartialSumLane], runSum[j * kFp32PerBlock], 0.0f, 1);
@@ -989,7 +936,6 @@ private:
     AscendC::GlobalTensor<int32_t> modeTablesGm_;
     AscendC::GlobalTensor<float> workspaceGm_;
     AscendC::GlobalTensor<scalar_t> outputGm_;
-    AscendC::DataCopyParams permuteParams_;
     AscendC::DataCopyParams stageParams_;
     AscendC::DataCopyParams bandParams_;
     AscendC::DataCopyParams qNzParams_;
@@ -1011,7 +957,7 @@ private:
     uint32_t scaleSlot_ = 0;
     uint32_t partialStride_ = 0;
     uint32_t operandElems_ = 0;
-    uint32_t planeGroups_ = 0;
+    uint32_t tilePlaneBytes_ = 0;
     uint32_t chunkBytes_ = 0;
 };
 

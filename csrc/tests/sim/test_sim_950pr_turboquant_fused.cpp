@@ -14,17 +14,20 @@
  * limitations under the License.
  */
 
-// The fused single-launch Cube decode (TURBOQUANT_TESTS.md 13.25), kv4fp8 at D 256, on four shapes:
+// The fused single-launch Cube decode (TURBOQUANT_TESTS.md 13.25), kv4fp8 at D 256, on five shapes:
 //
 //   (a) H_Q 4,  H_KV 2, S 64,  block 64   one tile
 //   (b) H_Q 4,  H_KV 2, S 256, block 64   four tiles in one task: the L1 slot ring and its free edge
 //   (c) (b) planned to fill the MIX blocks: parallel splits and the in-launch reduction
 //   (d) H_Q 8,  H_KV 2, S 120, block 64   a masked tail tile, two heads on each vector subcore
+//   (e) (a) with its cache written by the kv4fp8 kernel writer (13.28) instead of uploaded
 //
 // Every launch runs twice, through the barrier-free kernel and through the instance of the same kernel
 // that keeps every intra-pipe vector barrier; the two must be bit-identical. Each fused output is hashed
-// (FNV-1a over its half bit patterns) against a golden recorded from the kernel at b48ed2951, and its
-// cosine against exact fp32 attention must not regress. (c) must agree with (b) to rounding.
+// (FNV-1a over its half bit patterns) against a golden, and its cosine against exact fp32 attention must
+// not regress. (a) to (d) decode a host-built cache and their goldens date from b48ed2951; (c) must agree
+// with (b) to rounding. (e) draws independent vector halves, so a swapped nibble lane would show, and
+// checks the written GM cache against the host encoder before decoding it.
 
 #include <gtest/gtest.h>
 
@@ -68,6 +71,9 @@ constexpr int64_t kTwoBlockAiv = 4;
 constexpr int64_t kWideTaskHeads = 4;
 constexpr tqh::FusedSplitPolicy kFillBlocks = tqh::FusedSplitPolicy::kFillBlocks;
 constexpr tqh::FusedSplitPolicy kContextOnly = tqh::FusedSplitPolicy::kContextOnly;
+// The writer's scales are float RMS values of vectors that went through fp16 and back through the rotation;
+// the host's are double RMS values of the vectors before either.
+constexpr double kWrittenScaleTolerance = 2e-3;
 
 struct FusedCase {
   const char* tag;
@@ -78,13 +84,14 @@ struct FusedCase {
   uint64_t golden;
 };
 
-tqh::FusedShape Shape(int64_t num_heads, int64_t context_len) {
+tqh::FusedShape Shape(int64_t num_heads, int64_t context_len, bool kernel_writer = false) {
   tqh::FusedShape shape;
   shape.num_heads = num_heads;
   shape.num_kv_heads = kKvHeads;
   shape.head_size = kHeadSize;
   shape.block_size = kBlockSize;
   shape.context_len = context_len;
+  shape.kernel_writer = kernel_writer;
   return shape;
 }
 
@@ -99,16 +106,20 @@ const FusedCase kCaseC = {"(c)", Shape(kNarrowGroupHeads, kRingContext), 0, kFil
                           0xda6a2c77e20ff4a1ull};
 const FusedCase kCaseD = {"(d)", Shape(kWideGroupHeads, kTailContext), kTwoBlockAiv, kFillBlocks, 0.999517,
                           0xcc1fcdfed39b48e5ull};
+// Recorded 2026-09-17 on the same camodel from the NZ-tiled kernel writer (TURBOQUANT_TESTS.md 13.28).
+const FusedCase kCaseE = {"(e)", Shape(kNarrowGroupHeads, kSingleTileContext, true), 0, kFillBlocks, 0.999576,
+                          0x9ffe02efde1506cfull};
 
 void PrintShape(const FusedCase& fused_case, int64_t aiv_num, bool queried) {
   const tqh::FusedShape& shape = fused_case.shape;
-  std::printf("[ fused ] %s kv4fp8 H_Q=%lld H_KV=%lld D=%lld block=%lld S=%lld aiv=%lld%s plan_aiv=%lld %s\n",
+  std::printf("[ fused ] %s kv4fp8 H_Q=%lld H_KV=%lld D=%lld block=%lld S=%lld aiv=%lld%s plan_aiv=%lld %s%s\n",
               fused_case.tag, static_cast<long long>(shape.num_heads), static_cast<long long>(shape.num_kv_heads),
               static_cast<long long>(shape.head_size), static_cast<long long>(shape.block_size),
               static_cast<long long>(shape.context_len), static_cast<long long>(aiv_num),
               queried ? "" : " (fallback core count)",
               static_cast<long long>(fused_case.plan_aiv > 0 ? fused_case.plan_aiv : aiv_num),
-              fused_case.split_policy == kFillBlocks ? "fill-blocks" : "context-only");
+              fused_case.split_policy == kFillBlocks ? "fill-blocks" : "context-only",
+              shape.kernel_writer ? " kernel-writer" : "");
 }
 
 void PrintRun(const char* tag, const char* label, const tqh::FusedRun& run, const std::vector<float>& reference) {
@@ -220,6 +231,26 @@ TEST_F(TurboQuantFusedDecode, SlotRingAndItsSplitReductionAgree) {
   EXPECT_GE(agreement, kSplitAgreementCosine) << "the split reduction does not reproduce the unsplit decode";
   EXPECT_LE(std::fabs(split_cos - unsplit_cos), kSplitFidelityShift) << "the split moved cos vs exact fp32";
   ExpectNoExceptionDumps(kCaseC.tag);
+}
+
+TEST_F(TurboQuantFusedDecode, DecodesTheCacheTheKernelWriterWrote) {
+  PrintShape(kCaseE, aiv_num_, queried_);
+  watchdog_.Arm("(e) kernel cache write and query rotation");
+  tqh::FusedCubeScenario scenario(kCaseE.shape, stream_, aiv_num_);
+  watchdog_.Disarm();
+
+  const tqh::WrittenCacheAgreement written = scenario.CompareWrittenCache();
+  std::printf("[ fused ] (e) written cache: %zu of %zu packed bytes differ from the host encoder (%zu with the "
+              "nibble lanes swapped); %zu scale lanes, %zu pad mismatches, max rel err %.3e\n",
+              written.packed_mismatches, written.packed_bytes, written.swapped_lane_mismatches, written.scale_lanes,
+              written.scale_pad_mismatches, written.max_scale_rel_err);
+  EXPECT_EQ(written.packed_mismatches, 0u) << "the kernel writer's NZ-tiled bytes differ from the host encoder";
+  EXPECT_EQ(written.scale_pad_mismatches, 0u) << "the kernel writer touched a pad lane or an unwritten slot";
+  EXPECT_LE(written.max_scale_rel_err, kWrittenScaleTolerance) << "a written scale is not the RMS it encodes";
+
+  const tqh::FusedRun fused = RunCase(&scenario, kCaseE, &watchdog_, scenario.Reference());
+  EXPECT_EQ(fused.num_splits, 1) << "a context inside the fused limit is never split";
+  ExpectNoExceptionDumps(kCaseE.tag);
 }
 
 TEST_F(TurboQuantFusedDecode, MasksATailTileWithTwoHeadsPerSubcore) {

@@ -157,6 +157,11 @@ struct TurboQuantModeTraits<TurboQuantMode::KV5_FP8> {
     };
 };
 
+// kv4fp8 writes its packed planes NZ-tiled (turboquant_layout.h, NzTiledPackedByte); the codebook modes
+// keep row-major slots. The cache writer and the Cube decode both key on this.
+template <TurboQuantMode MODE>
+constexpr bool kStoresNzTiles = MODE == TurboQuantMode::KV4_FP8;
+
 constexpr TurboQuantModeConfig TurboQuantModeConfigOf(TurboQuantMode mode)
 {
     return mode == TurboQuantMode::KV3_FP4

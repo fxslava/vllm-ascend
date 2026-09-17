@@ -49,7 +49,8 @@ primitive to use depends on whether data crosses a pipe or stays inside one.
 | Data crosses a pipe boundary on the same core | Hard event: `SetFlag<EVENT>(ev)` + `WaitFlag<EVENT>(ev)`, with `ev = GetTPipePtr()->FetchEventID(EVENT)` | `SyncEvent<>()` / `SyncVectorToMte3()` in `op_kernel/common/turboquant_common.h` |
 | AIC ↔ AIV handshake (Cube product ready, slot free) | `CrossCoreSetFlag<0x2, PIPE_X>(id)` / `CrossCoreWaitFlag(id)` | `kFlagOperandsReady/Free`, `kFlagProductReady/Free` in `TurboQuantRotateQCube` |
 | Ping-pong butterfly stage (`src`/`dst` swapped after each stride) | `PipeBarrier<PIPE_V>()` — **always kept** | `FastWalshHadamardTransform` in the codec; `Residual` in rotate_q |
-| Dependent arithmetic inside one V pipe (`Mul`, `Muls`, `Adds`, `Sub`, `Exp`, `Cast`) | **No barrier.** Use `VecBarrier<kSwitch>()`, which compiles to nothing when the switch is false | `StageOperands`, `Rotate`, `ApplyPi<kRotateQVecBarriers>` |
+| Dependent arithmetic inside one V pipe (`Mul`, `Muls`, `Adds`, `Sub`, `Exp`, `Cast`, reduces) | **No barrier.** The kv4fp8 decode and writer chains carry none; older kernels still switch theirs through `VecBarrier<kSwitch>()`, which compiles to nothing when the switch is false | `TurboQuantVectorDecodeService`, `UnpackAffine`, `ApplyPi<false>` |
+| One UB buffer rewritten through another type, or two overlapping writes whose order is the result | `PipeBarrier<PIPE_V>()` — **kept** | `Encode`'s bin lanes (float → uint32 → int32); `BeginTask` |
 | Kernel `Init` staging, and GM write-back after compute | `PipeBarrier<PIPE_ALL>()` | `Init()` of every operator; `WriteOutput` |
 | Leaving the split phase before an in-launch reduction | `AscendC::SyncAll<true>()` | `TURBOQUANT_PAGED_ATTENTION_FUSED_DECLARE` |
 
@@ -66,6 +67,12 @@ primitive to use depends on whether data crosses a pipe or stays inside one.
 
 After `Fixpipe`, the kernel still issues `PipeBarrier<PIPE_FIX>()`, and a cross-core
 `kFlagProductReady` releases the AIV `Residual`.
+
+**`FIX_V` / `V_FIX` do not exist on this part.** `kernel_event.h` lowers them only under
+`__NPU_ARCH__ == 5102`. On arch35 (3510) `SetFlag<FIX_V>` and `WaitFlag<FIX_V>` fall to an empty
+`default:` assert and emit nothing. In a MIX kernel the Fixpipe product also lands on another core.
+The hand-off that works is a cross-core flag set on `PIPE_FIX` by the AIC and waited for by the AIV
+(`kFlagScoresReady`, `kFlagContextReady` in the fused decode).
 
 ### 1.3 The barrier rule and its A/B guard
 
@@ -90,12 +97,25 @@ without barriers is user-stated. It contradicts CANN's own `sigmoid_v100_impl.h`
   barriered build to printed precision, but it is not a bit-level comparison. One barrier stays in
   `ComputeSplit`: it separates `Duplicate(state, 0)` from `Duplicate(runMax, -inf)`, which write
   overlapping memory, so their order is a real write-after-write dependency.
-- **Fused Cube decode:** `TurboQuantFusedDecode` runs with `kFusedVecBarriers = false`. On one kv4fp8
-  tile it was bit-identical (0 of 1,024 elements) to the fully barriered split + combine it replaced. That
-  split is retired; the A/B reference is now a test-only instance of the same kernel with every barrier
-  kept (`turboquant_mm_fused_decode_barriered_impl`), and the two are still bit-identical.
-- **Overlapping initialisations keep a real barrier.** `BeginTask` and `TurboQuantPartialReducer::Reduce`
-  zero a state block and then write `-inf` into a lane of it; that barrier is unconditional.
+- **Fused Cube decode:** `TurboQuantFusedDecode` runs with `kFusedVecBarriers = false`.
+  - **History.** On one kv4fp8 tile it was bit-identical (0 of 1,024 elements) to the fully barriered
+    split + combine it replaced.
+  - **Barriers removed.** Since TURBOQUANT_TESTS.md 13.29, the decode's own chains (softmax, logits,
+    query quantisation, accumulation, tail mask, affine unpack) carry no switchable barriers at all.
+  - **The A/B reference.** The test-only instance `turboquant_mm_fused_decode_barriered_impl` now
+    differs only inside the broadcast and cast helpers that still take the switch. All five fused
+    cases are still bit-identical to it.
+- **kv4fp8 cache writer:** `kBarrierFreeWriter<MODE>` covers both chains.
+  - **Rotation.** It runs `ApplyPi<false>`.
+  - **Encode.** It keeps only the four barriers that mark a reinterpretation.
+  - **Tables.** They are handed over with `SyncMte2ToVector()` instead of `PipeBarrier<PIPE_ALL>`.
+  - **Result.** The written cache is byte-identical to the host encoder (case (e)).
+  - **Cost.** On the camodel the purge moved the writer launch by -1.4%; its time is
+    vector-function dispatch.
+- **Overlapping initialisations keep a real barrier.** Three sites zero a block and then overwrite
+  part of it, and each keeps an unconditional barrier:
+  - `BeginTask` and `TurboQuantPartialReducer::Reduce`, which write `-inf` into a lane of the block;
+  - the writer's `Duplicate -> Gather` over its scale lanes.
 
 ### 1.4 Deadlock diagnosis
 
@@ -180,7 +200,10 @@ throughput to 44.1 GB/s, under 3% of the 1.6 TB/s peak. **Never fragment MTE2 re
 
 1. Read GM in wide contiguous bursts of at least `kMinBurstBytes = 128` B. Prefer one `DataCopy` over a
    whole tile or plane rather than one per head or per group.
-2. Do any NZ or head permutation in the vector unit, after the burst. Three options:
+2. Store GM in the order its reader wants, so the read needs no permutation at all. kv4fp8's cache
+   is NZ-tiled by the cache write (§3.3), and its decode reads one contiguous burst per (tile, kv head).
+   Where the layout cannot change, do the NZ or head permutation in the vector unit, after the burst.
+   Three options:
    - `DataCopy(UB, UB, DataCopyParams)`, a block move that CANN lowers on `PIPE_V` (`CopyUbufToUbuf`)
    - `Gather` from a contiguous UB tensor
    - the native signed-nibble `Cast` + `DeInterleave`
@@ -205,11 +228,39 @@ kTileRows · scaleSlot)`.
 holds both planes) and some redundant bytes, in exchange for keeping the controller in burst mode. The
 test shape (D=64, H_kv=2) exercises this path.
 
-**Both decodes use the same reader.** `TurboQuantTileBurst` (vector service) implements the three
-cases; the AIV decode reads the K and V planes of a tile, the Cube decode's vector service reads one
-plane per subcore. The Cube side then unpacks row-major in UB, moves each 32-byte column group into NZ
-order with a UB → UB `DataCopy(nz, lowBytes, {rows, 1, planeGroups − 1, 0})`, and stages the whole tile
-into L1 in one MTE3 burst. The 32 B-per-row group-major read is gone with the split it belonged to.
+**Who uses it.** `TurboQuantTileBurst` (vector service) implements the three cases. The AIV decode
+reads a tile's K and V planes through it. The Cube decode's row-major modes (kv3fp4, kv5fp8) read one
+plane per subcore through it and unpack in bands. kv4fp8 does not use it; see §3.3.
+
+### 3.3 NZ-tiled storage (kv4fp8): the permutation moves to the cache write
+
+Cube L1 is always NZ: `nz(r, c) = (c / 32) · rows · 32 + r · 32 + c % 32`. A row-major cache therefore
+needs a permutation on every decode tile. kv4fp8 pays for it once per token, when the cache is written.
+
+- **Layout** (`NzTiledPackedByte` in `turboquant_layout.h`, keyed by `kStoresNzTiles<MODE>`). Each
+  physical block is `[64-row tile][kv head][32 B column group][tile row][byte]`, so the packed plane
+  of one (tile, kv head) is the contiguous `[D/64, 64, 32]` image. The block size must be a multiple
+  of 64. The cache and scale-plane sizes are unchanged. The scale plane stays row-major.
+- **Write** (`TurboQuantModeReshapeAndCache::WriteNzTiled`). One strided UB → GM burst per plane per
+  token, `DataCopyParams{H_kv · D/64, 1, 0, 63}`. Consecutive (kv head, group) cells of one tile row
+  are exactly one tile apart. The 32 B cells are the price, paid once per token.
+- **Read** (`ReadPlane`). One contiguous GM → UB burst of `64 · D/2` B (8,192 B at D 256) at
+  `(row · H_kv + kvHead · 64) · D/2`, at every block size. This never falls back to the 32 B
+  group-major decode read that §3 forbids.
+- **Unpack** (`UnpackPlaneToL1`). `Cast<half, int4b_t>` + `DeInterleave` + the plane expand work byte
+  by byte. So a chunk's low nibbles land in place on NZ groups `[0, D/64)` and its high nibbles on
+  `[D/64, D/32)`, one tile plane further on. The staging buffer is the L1 operand as unpacked, and one
+  MTE3 burst stages it. There is no UB → UB permute loop and no separate operand buffer (8 KB less UB).
+- **Host pin.** `TurboQuantNzTiledCache.TilesAreContiguousNzImagesAndTheWriterBurstHitsThem` checks
+  that the layout is a bijection, that each read window holds exactly its tile's cells in NZ order,
+  and that the writer's strided burst lands on them. It covers H_kv 1/2/8, D 64/128/256 and block
+  64/128.
+- **Executed.** `TurboQuantFusedDecode.DecodesTheCacheTheKernelWriterWrote` (case (e)) runs the
+  kv4fp8 kernel writer and checks the result. With independent vector halves, the written planes
+  match the host encoder in all 131,072 bytes. Lane 0 is the low nibble: swapping the lanes makes
+  29,700 bytes differ. The fused decode of that cache matches its golden.
+- **Cycles (camodel).** A tile stages in 29-36% fewer cycles than with the UB permute, and the fused
+  launch spans fell 9-20% on cases (a) to (d) (TURBOQUANT_TESTS.md 13.28).
 
 ---
 
@@ -284,7 +335,8 @@ host launch.
 | `TurboQuantKernels.PagedAttentionMatchesTheCpuReference` | AIV fused (splits = 1), aiv = 64, barriers off | cos 1.000000, SNR 72.87 dB, relL2 2.27e-4 |
 | `TurboQuantFusedDecode.IsBitIdenticalToItsBarrieredInstance` | Cube fused, kv4fp8, H_Q 4, H_KV 2, D 256, S 64: 1 launch, block_dim 2 | 0 of 1,024 elements differ from the barriered instance; cos 0.999407 vs fp32, the value the retired split + combine produced; no sentinel value left |
 | `TurboQuantSimulatorFidelity.SingleDecodePassQuantisedVersusExact` | AIV, forced splits = 2, reduction by `TurboQuantPartialReducer` | vs CPU TurboQuant: cos 1.000000, SNR 74.00 dB, relL2 1.99e-4; vs exact fp32: cos 0.991182 (4-bit quantization error) |
-| `TurboQuantMultiMode.DispatchAndFidelityAcrossShapes` | Cube fused, kv4fp8, S 16 (one partial tile, the `Min` mask) | cos 0.991817 vs fp32 |
+| `TurboQuantFusedDecode.DecodesTheCacheTheKernelWriterWrote` | kv4fp8 kernel writer (NZ-tiled, barrier-free) → Cube fused, H_Q 4, H_KV 2, S 64 | written planes byte-identical to the host encoder (0 of 131,072); fused = barriered; cos 0.999576 vs fp32 |
+| `TurboQuantMultiMode.DispatchAndFidelityAcrossShapes` | Cube fused, kv4fp8, S 16 (one partial tile, the `Min` mask) | cos 0.991817 vs fp32, measured on the row-major cache; not re-run since kv4fp8 became NZ-tiled (§3.3) |
 
 The residual error against the CPU reference is fp16 output rounding. Neither test is a latency
 measurement.
@@ -295,11 +347,14 @@ measurement.
 
 - [ ] Every pipe crossing has a hard event. Every AIC ↔ AIV handoff has a cross-core flag, and each
       `CrossCoreWaitFlag` has a matching `CrossCoreSetFlag` on every path.
-- [ ] No `PipeBarrier<PIPE_V>` between dependent arithmetic ops, except through a `VecBarrier<kSwitch>`
-      with a recorded bit-exact A/B. Ping-pong barriers are kept.
+- [ ] No `PipeBarrier<PIPE_V>` between dependent arithmetic ops. The only barriers kept are for
+      ping-pong buffers, a buffer rewritten through another type, and overlapping writes whose order
+      is the result.
+- [ ] No `HardEvent` that the part does not lower: `FIX_V` / `V_FIX` compile to nothing on arch35.
 - [ ] No `GetSubBlockIdx() == 0` gating. Tasks are indexed across all subcores, or a Cube feeds both
       through `dualDstCtl = 0b01` with an even row count.
-- [ ] No GM read below 128 B. Permutations happen in UB.
+- [ ] No GM read below 128 B. Prefer storing GM in the reader's order (§3.3); otherwise permutations
+      happen in UB.
 - [ ] Decode for S ≤ 4096 is one launch: no workspace, no combine, output written to GM from UB.
 - [ ] Camodel runs stay at S ≤ 256, one process per case. Latency claims come from a silicon msprof
       trace (`prof_device_950pr_msprof_trace`), never from camodel ticks.
@@ -310,8 +365,12 @@ measurement.
    and Cube legs now each issue one decode launch) and compare them against
    `aclnnFusedInferAttentionScoreV5`. No number in this guide is a silicon latency measured in this
    repository.
-2. Run the fused Cube kernel on the paths the camodel smoke does not reach: kv3fp4 and kv5fp8, a tail
-   tile (`context_len % 64 != 0`), head chunking (`H_Q / H_KV > 16`), and the in-launch reduction above
-   4096. The reduction and deep contexts belong on silicon.
+2. Run the fused Cube kernel on the paths the camodel smoke does not reach: kv3fp4 and kv5fp8, head
+   chunking (`H_Q / H_KV > 16`), and the in-launch reduction above 4096. The reduction and deep
+   contexts belong on silicon.
 3. Measure the shipping AIV decode bit-for-bit against its barriered build. The camodel check so far
    matches only to printed precision.
+4. Re-run `test_sim_950pr_turboquant_multimode` for kv4fp8. The NZ-tiled writer itself has now executed
+   (fused case (e)), but the multimode figure in §4.5 still predates the layout.
+5. Measure vector-function dispatch latency on silicon. On the camodel it moves fused spans by up to
+   ~3% between builds that differ only in code layout, and it is most of the kv4fp8 writer's time.

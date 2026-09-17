@@ -47,6 +47,19 @@ struct FusedShape {
   int64_t block_size = kCubeTileRows;
   int64_t context_len = kCubeTileRows;
   int64_t pool_factor = 4;
+  // Draw independent vector halves and write the cache through the kv4fp8 kernel writer
+  // (turboquant_mm_reshape_and_cache_impl) instead of uploading the host-built image.
+  bool kernel_writer = false;
+};
+
+// What the kernel writer put into GM, against the host encoder of the same levels.
+struct WrittenCacheAgreement {
+  size_t packed_bytes = 0;
+  size_t packed_mismatches = 0;
+  size_t swapped_lane_mismatches = 0;
+  size_t scale_lanes = 0;
+  size_t scale_pad_mismatches = 0;
+  double max_scale_rel_err = 0.0;
 };
 
 struct FusedRun {
@@ -126,7 +139,7 @@ class FusedCubeScenario {
     const std::vector<int32_t> permutation = rng.Permutation(static_cast<int32_t>(num_blocks));
     block_table_.assign(permutation.begin(), permutation.begin() + static_cast<std::ptrdiff_t>(blocks_per_seq_));
     cache_ = BuildMirroredKvCache(rng, shape.context_len, num_blocks, shape.block_size, shape.num_kv_heads, d,
-                                  block_table_);
+                                  block_table_, !shape.kernel_writer);
     const std::vector<float> query = rng.NormalHalfExact(static_cast<size_t>(shape.num_heads * d), 0.0f, 1.0f);
 
     scale_ = 1.0f / std::sqrt(static_cast<float>(d));
@@ -135,9 +148,13 @@ class FusedCubeScenario {
     h16_ = DeviceBuffer::FromHost(Hadamard16Half());
     rot_tables_ = DeviceBuffer::FromHost(CodecTables(d, 1));
     mode_tables_ = DeviceBuffer::FromHost(ModeTables(kFusedMode, d, kUnpackRows, kCubeTileRows));
-    key_cache_ = DeviceBuffer::FromHost(cache_.key_packed);
-    value_cache_ = DeviceBuffer::FromHost(cache_.value_packed);
-    scale_plane_ = DeviceBuffer::FromHost(cache_.scales);
+    if (shape.kernel_writer) {
+      WriteThroughKernel();
+    } else {
+      key_cache_ = DeviceBuffer::FromHost(cache_.key_packed);
+      value_cache_ = DeviceBuffer::FromHost(cache_.value_packed);
+      scale_plane_ = DeviceBuffer::FromHost(cache_.scales);
+    }
     block_tables_ = DeviceBuffer::FromHost(block_table_);
     context_lens_ = DeviceBuffer::FromHost(std::vector<int32_t>(1, static_cast<int32_t>(shape.context_len)));
     query_rot_ = DeviceBuffer::Empty<float>(static_cast<size_t>(shape.num_heads * d));
@@ -233,7 +250,111 @@ class FusedCubeScenario {
 
   int64_t blocks_per_seq() const { return blocks_per_seq_; }
 
+  // The kernel-written GM cache against the host encoder: the packed planes byte for byte (and, for the
+  // diagnosis, with the two nibble lanes of every byte swapped), and the scale plane against the RMS of the
+  // vectors the writer was given, with every pad lane and unwritten slot left at zero.
+  WrittenCacheAgreement CompareWrittenCache() const {
+    constexpr int kNibbleBits = 4;
+    constexpr uint32_t kByteMask = 0xFF;
+    const auto swap_lanes = [](int8_t byte) {
+      const uint32_t bits = static_cast<uint8_t>(byte);
+      return static_cast<int8_t>(((bits << kNibbleBits) | (bits >> kNibbleBits)) & kByteMask);
+    };
+    WrittenCacheAgreement agreement;
+    const std::vector<int8_t>* expected[] = {&cache_.key_packed, &cache_.value_packed};
+    const std::vector<int8_t>* written[] = {&written_key_, &written_value_};
+    for (int plane = 0; plane < 2; ++plane) {
+      const std::vector<int8_t>& want = *expected[plane];
+      const std::vector<int8_t>& got = *written[plane];
+      agreement.packed_bytes += want.size();
+      if (got.size() != want.size()) {
+        agreement.packed_mismatches += want.size();
+        agreement.swapped_lane_mismatches += want.size();
+        continue;
+      }
+      for (size_t i = 0; i < want.size(); ++i) {
+        agreement.packed_mismatches += (got[i] != want[i]) ? 1u : 0u;
+        agreement.swapped_lane_mismatches += (got[i] != swap_lanes(want[i])) ? 1u : 0u;
+      }
+    }
+    agreement.scale_lanes = expected_scales_.size();
+    for (size_t i = 0; i < expected_scales_.size() && i < written_scales_.size(); ++i) {
+      if (expected_scales_[i] == 0.0) {
+        agreement.scale_pad_mismatches += (written_scales_[i] != 0.0f) ? 1u : 0u;
+        continue;
+      }
+      const double rel =
+          std::fabs(static_cast<double>(written_scales_[i]) - expected_scales_[i]) / expected_scales_[i];
+      agreement.max_scale_rel_err = std::max(agreement.max_scale_rel_err, rel);
+    }
+    if (written_scales_.size() != expected_scales_.size()) {
+      agreement.scale_pad_mismatches += expected_scales_.size();
+    }
+    return agreement;
+  }
+
  private:
+  // The writer is given the unrotated fp16 of the host's dequantised vectors. It rotates them back and
+  // quantises each coordinate onto the level it came from, since a dequantised coordinate sits half a step
+  // from both neighbouring thresholds. Its scale is the RMS of those vectors rather than of the draw, so
+  // the exact-attention reference is rescaled to the scales the writer stored.
+  void WriteThroughKernel() {
+    const int64_t d = shape_.head_size;
+    const int64_t tokens = shape_.context_len;
+    const int64_t block_size = shape_.block_size;
+    const size_t head = static_cast<size_t>(d);
+    const size_t kv_heads = static_cast<size_t>(shape_.num_kv_heads);
+    const size_t slot_floats = static_cast<size_t>(MirroredScaleSlotFloats(shape_.num_kv_heads));
+
+    std::vector<int32_t> slots(static_cast<size_t>(tokens));
+    for (int64_t t = 0; t < tokens; ++t) {
+      slots[static_cast<size_t>(t)] = block_table_[static_cast<size_t>(t / block_size)] *
+                                          static_cast<int32_t>(block_size) +
+                                      static_cast<int32_t>(t % block_size);
+    }
+    DeviceBuffer key_fp16 = DeviceBuffer::FromHost(FloatToHalf(UnrotateHeads(cache_.key, d)));
+    DeviceBuffer value_fp16 = DeviceBuffer::FromHost(FloatToHalf(UnrotateHeads(cache_.value, d)));
+    DeviceBuffer slot_mapping = DeviceBuffer::FromHost(slots);
+    DeviceBuffer write_tables = DeviceBuffer::FromHost(ModeTables(kFusedMode, d, 1, 0));
+    key_cache_ = DeviceBuffer::FromHost(std::vector<int8_t>(cache_.key_packed.size(), 0));
+    value_cache_ = DeviceBuffer::FromHost(std::vector<int8_t>(cache_.value_packed.size(), 0));
+    scale_plane_ = DeviceBuffer::FromHost(std::vector<float>(cache_.scales.size(), 0.0f));
+
+    const ReshapeAndCacheGrid grid = PlanReshapeAndCache(tokens, aiv_num_);
+    turboquant_mm_reshape_and_cache_impl(
+        static_cast<int32_t>(kFusedMode), AscendType::FP16, stream_, grid.block_dim, key_fp16.get(), value_fp16.get(),
+        key_cache_.get(), value_cache_.get(), scale_plane_.get(), slot_mapping.get(), pi_signs_.get(),
+        rot_tables_.get(), write_tables.get(), static_cast<uint32_t>(tokens), static_cast<uint32_t>(kv_heads),
+        static_cast<uint32_t>(d), static_cast<uint32_t>(block_size), grid.tokens_per_core,
+        1.0f / std::sqrt(static_cast<float>(d)));
+    ACL_CHECK(aclrtSynchronizeStream(stream_));
+    written_key_ = key_cache_.ToHost<int8_t>();
+    written_value_ = value_cache_.ToHost<int8_t>();
+    written_scales_ = scale_plane_.ToHost<float>();
+
+    expected_scales_.assign(cache_.scales.size(), 0.0);
+    for (int64_t t = 0; t < tokens; ++t) {
+      const size_t slot = static_cast<size_t>(slots[static_cast<size_t>(t)]);
+      for (size_t kv = 0; kv < kv_heads; ++kv) {
+        for (int plane = 0; plane < 2; ++plane) {
+          std::vector<float>& dense = plane == 0 ? cache_.key : cache_.value;
+          const size_t row = (static_cast<size_t>(t) * kv_heads + kv) * head;
+          double energy = 0.0;
+          for (size_t c = 0; c < head; ++c) {
+            energy += static_cast<double>(dense[row + c]) * static_cast<double>(dense[row + c]);
+          }
+          const size_t lane = slot * slot_floats + (plane == 0 ? kv : kv_heads + kv);
+          expected_scales_[lane] = std::sqrt(energy / static_cast<double>(head));
+          const double factor =
+              static_cast<double>(written_scales_[lane]) / static_cast<double>(cache_.scales[lane]);
+          for (size_t c = 0; c < head; ++c) {
+            dense[row + c] = static_cast<float>(static_cast<double>(dense[row + c]) * factor);
+          }
+        }
+      }
+    }
+  }
+
   void PoisonOutput() {
     out_ = DeviceBuffer::FromHost(
         FloatToHalf(std::vector<float>(static_cast<size_t>(shape_.num_heads * shape_.head_size), kFusedOutputSentinel)));
@@ -254,6 +375,10 @@ class FusedCubeScenario {
   std::vector<int32_t> block_table_;
   MirroredKvCache cache_;
   std::vector<float> query_rot_host_;
+  std::vector<int8_t> written_key_;
+  std::vector<int8_t> written_value_;
+  std::vector<float> written_scales_;
+  std::vector<double> expected_scales_;
   DeviceBuffer query_, pi_signs_, h16_, rot_tables_, mode_tables_;
   DeviceBuffer key_cache_, value_cache_, scale_plane_, block_tables_, context_lens_;
   DeviceBuffer query_rot_, out_;

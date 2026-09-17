@@ -38,9 +38,12 @@ using vllm_ascend::turboquant::kFlagSlotFree;
 using vllm_ascend::turboquant::kFlagSlotReady;
 using vllm_ascend::turboquant::kFp32PerBlock;
 using vllm_ascend::turboquant::kGatherSrcBase;
+using vllm_ascend::turboquant::kOperandC0;
+using vllm_ascend::turboquant::kStoresNzTiles;
 using vllm_ascend::turboquant::kVectorSubcoresPerBlock;
 using vllm_ascend::turboquant::MixBlockIdx;
 using vllm_ascend::turboquant::ScaleSlotFloats;
+using vllm_ascend::turboquant::SyncMte2ToVector;
 using vllm_ascend::turboquant::SyncVectorToMte2;
 using vllm_ascend::turboquant::TurboQuantCodec4;
 using vllm_ascend::turboquant::TurboQuantCubeDecodeService;
@@ -54,8 +57,15 @@ using vllm_ascend::turboquant::TurboQuantVectorDecodeService;
 namespace {
 
 // Intra-pipe vector barriers of the fused decode. The barriered instance is compiled once more, for
-// kv4fp8 only, as the bit-exact A/B reference (turboquant_mm_fused_decode_barriered_impl).
+// kv4fp8 only, as the bit-exact A/B reference (turboquant_mm_fused_decode_barriered_impl). Since 13.29 the
+// decode's own chains carry no switchable barriers; the reference differs from the fused instance only
+// inside the broadcast and cast helpers it hands the switch to.
 constexpr bool kFusedVecBarriers = false;
+
+// kv4fp8's cache writer issues its rotation and encode chains barrier-free and hands its tables over with
+// events (csrc/tests/TURBOQUANT_TESTS.md 13.29); the codebook modes keep the barriers they were written with.
+template <TurboQuantMode MODE>
+constexpr bool kBarrierFreeWriter = MODE == TurboQuantMode::KV4_FP8;
 
 template <TurboQuantMode MODE, typename scalar_t>
 class TurboQuantModeReshapeAndCache {
@@ -79,6 +89,9 @@ public:
         headPlane_ = numKvHeads_ * headSize_;
         packedPlane_ = numKvHeads_ * packedBytes_;
         scaleSlot_ = ScaleSlotFloats(numKvHeads_);
+        // Consecutive (kv head, group) cells of one tile row are a tile apart.
+        nzTileParams_ = AscendC::DataCopyParams{static_cast<uint16_t>(packedPlane_ / kOperandC0), 1, 0,
+                                                static_cast<uint16_t>(kCubeTileRows - 1)};
 
         keyGm_.SetGlobalBuffer(reinterpret_cast<__gm__ scalar_t *>(key));
         valueGm_.SetGlobalBuffer(reinterpret_cast<__gm__ scalar_t *>(value));
@@ -107,7 +120,12 @@ public:
         AscendC::LocalTensor<int32_t> gatherIdx = scaleIdxBuf_.Get<int32_t>();
         AscendC::ArithProgression(gatherIdx, 0, static_cast<int32_t>(kFp32PerBlock * sizeof(float)),
                                   static_cast<int32_t>(2 * numKvHeads_));
-        AscendC::PipeBarrier<PIPE_ALL>();
+        if constexpr (kBarrierFreeWriter<MODE>) {
+            // The signs are the only data this Init moves, GM -> UB for the vector unit.
+            SyncMte2ToVector();
+        } else {
+            AscendC::PipeBarrier<PIPE_ALL>();
+        }
     }
 
     __aicore__ inline void Process()
@@ -168,8 +186,12 @@ private:
             for (uint32_t head = 0; head < numKvHeads_; ++head) {
                 const uint32_t src = plane * headPlane_ + head * headSize_;
                 AscendC::Cast(vec, in[src], AscendC::RoundMode::CAST_NONE, headSize_);
-                AscendC::PipeBarrier<PIPE_V>();
-                rotation_.ApplyPi(vec, tmp, signs, static_cast<int>(headSize_));
+                if constexpr (kBarrierFreeWriter<MODE>) {
+                    rotation_.ApplyPi<false>(vec, tmp, signs, static_cast<int>(headSize_));
+                } else {
+                    AscendC::PipeBarrier<PIPE_V>();
+                    rotation_.ApplyPi(vec, tmp, signs, static_cast<int>(headSize_));
+                }
                 codec_.Encode(packed[plane * packedPlane_ + head * packedBytes_], vec,
                               steps[(plane * numKvHeads_ + head) * kFp32PerBlock], static_cast<int>(headSize_));
             }
@@ -178,9 +200,12 @@ private:
 
         AscendC::LocalTensor<uint32_t> idx = scaleIdxBuf_.Get<int32_t>().ReinterpretCast<uint32_t>();
         AscendC::Duplicate(scaleOut, 0.0f, scaleSlot_);
+        // The Gather overwrites lanes the Duplicate just zeroed: an aliased write, so this barrier stays.
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Gather(scaleOut, steps, idx, kGatherSrcBase, 2 * numKvHeads_);
-        AscendC::PipeBarrier<PIPE_V>();
+        if constexpr (!kBarrierFreeWriter<MODE>) {
+            AscendC::PipeBarrier<PIPE_V>();
+        }
 
         outPacked_.EnQue(packed);
         outScale_.EnQue(scaleOut);
@@ -193,12 +218,26 @@ private:
         const int32_t slot = slotRing_[step % kSlotRing];
         if (slot >= 0) {
             const uint64_t row = static_cast<uint64_t>(slot);
-            AscendC::DataCopy(keyCacheGm_[row * packedPlane_], packed, packedPlane_);
-            AscendC::DataCopy(valueCacheGm_[row * packedPlane_], packed[packedPlane_], packedPlane_);
+            if constexpr (kStoresNzTiles<MODE>) {
+                WriteNzTiled(keyCacheGm_, packed, row);
+                WriteNzTiled(valueCacheGm_, packed[packedPlane_], row);
+            } else {
+                AscendC::DataCopy(keyCacheGm_[row * packedPlane_], packed, packedPlane_);
+                AscendC::DataCopy(valueCacheGm_[row * packedPlane_], packed[packedPlane_], packedPlane_);
+            }
             AscendC::DataCopy(scaleCacheGm_[row * scaleSlot_], scaleOut, scaleSlot_);
         }
         outPacked_.FreeTensor(packed);
         outScale_.FreeTensor(scaleOut);
+    }
+
+    // Scatters one token's row-major plane into its NZ-tiled cells (turboquant_layout.h,
+    // NzTiledPackedByte) in a single strided burst, so the decode never permutes.
+    __aicore__ inline void WriteNzTiled(AscendC::GlobalTensor<int8_t> &cacheGm,
+                                        const AscendC::LocalTensor<int8_t> &plane, uint64_t slot)
+    {
+        const uint64_t tileRow = slot % kCubeTileRows;
+        AscendC::DataCopy(cacheGm[(slot - tileRow) * packedPlane_ + tileRow * kOperandC0], plane, nzTileParams_);
     }
 
     AscendC::TPipe *pipe_;
@@ -220,6 +259,7 @@ private:
     AscendC::GlobalTensor<float> piSignsGm_;
     AscendC::GlobalTensor<int32_t> rotTablesGm_;
     AscendC::GlobalTensor<int32_t> modeTablesGm_;
+    AscendC::DataCopyParams nzTileParams_;
     int32_t slotRing_[kSlotRing] = {-1, -1, -1, -1};
     uint32_t numTokens_ = 0;
     uint32_t numKvHeads_ = 0;

@@ -180,29 +180,33 @@ public:
         const uint32_t n = static_cast<uint32_t>(len);
 
         AscendC::Mul(scratch_, src, src, n);
-        AscendC::PipeBarrier<PIPE_V>();
+        ChainBarrier();
         AscendC::ReduceSum<float>(scaleOut, scratch_, reduceWork_, n);
-        AscendC::PipeBarrier<PIPE_V>();
+        ChainBarrier();
         AscendC::Sqrt(scaleOut, scaleOut, 1);
-        AscendC::PipeBarrier<PIPE_V>();
+        ChainBarrier();
         AscendC::Muls(scaleOut, scaleOut, invSqrtLen_, 1);
-        AscendC::PipeBarrier<PIPE_V>();
+        ChainBarrier();
         AscendC::Adds(scaleOut, scaleOut, kEps, 1);
-        AscendC::PipeBarrier<PIPE_V>();
+        ChainBarrier();
 
         AscendC::Brcb(broadcast_, scaleOut, 1, {1, static_cast<uint16_t>(kFp32PerBlock)});
-        AscendC::PipeBarrier<PIPE_V>();
+        ChainBarrier();
         AscendC::Duplicate(broadcast_[kBrcbDstLanes], -1.0f, kFp32PerBlock);
-        AscendC::PipeBarrier<PIPE_V>();
+        ChainBarrier();
         AscendC::Div(broadcast_[kBrcbDstLanes], broadcast_[kBrcbDstLanes], broadcast_, kFp32PerBlock);
-        AscendC::PipeBarrier<PIPE_V>();
+        ChainBarrier();
 
+        // The broadcast ends in a barrier on purpose: reduceWork_ held the reduce's float intermediates and
+        // is rewritten as int32 bins next.
         TurboQuantCodec4::BroadcastMul(scratch_, src, broadcast_[kBrcbDstLanes], n);
 
         AscendC::LocalTensor<int32_t> bins = reduceWork_.ReinterpretCast<int32_t>();
         AscendC::Duplicate(bins, 0, n);
-        AscendC::PipeBarrier<PIPE_V>();
+        ChainBarrier();
 
+        // Each bin lane is written as float, shifted as uint32 and summed as int32, and the next pass writes
+        // it as float again: those three barriers mark reinterpretations and stay.
         for (int base = 0; base < kThresholdCount; base += kBinLanes) {
             const int lanes = (kThresholdCount - base) < kBinLanes ? (kThresholdCount - base) : kBinLanes;
             for (int lane = 0; lane < lanes; ++lane) {
@@ -220,13 +224,13 @@ public:
                     AscendC::LocalTensor<int32_t> src2 = binLane_[lane + span].ReinterpretCast<int32_t>();
                     AscendC::Add(dst, dst, src2, n);
                 }
-                AscendC::PipeBarrier<PIPE_V>();
+                ChainBarrier();
             }
             AscendC::Add(bins, bins, binLane_[0].ReinterpretCast<int32_t>(), n);
             AscendC::PipeBarrier<PIPE_V>();
         }
         AscendC::Cast(low_, bins, AscendC::RoundMode::CAST_NONE, n);
-        AscendC::PipeBarrier<PIPE_V>();
+        ChainBarrier();
 
         if constexpr (kHasMsbPlane) {
             AscendC::Muls(msb_, low_, 1.0f / static_cast<float>(Planes::kLowRadix), n);
@@ -302,11 +306,9 @@ public:
 
         AscendC::LocalTensor<half> nibbles = msb_.ReinterpretCast<half>();
         AscendC::Cast(nibbles, srcPacked.ReinterpretCast<int4b_t>(), AscendC::RoundMode::CAST_NONE, elems);
-        VecBarrier<VEC_BARRIERS>();
 
         AscendC::LocalTensor<half> planes = expand_.ReinterpretCast<half>();
         AscendC::DeInterleave(planes, planes[bytes], nibbles, static_cast<int32_t>(elems));
-        VecBarrier<VEC_BARRIERS>();
 
         ExpandNibblePlane<OperandT, VEC_BARRIERS>(dstLow, planes, bytes);
         ExpandNibblePlane<OperandT, VEC_BARRIERS>(dstHigh, planes[bytes], bytes);
@@ -346,10 +348,18 @@ private:
                                              const AscendC::LocalTensor<half> &plane, uint32_t bytes)
     {
         AscendC::Cast(msb_, plane, AscendC::RoundMode::CAST_NONE, bytes);
-        VecBarrier<VEC_BARRIERS>();
         AscendC::Adds(msb_, msb_, kSignedLevelOffset, bytes);
-        VecBarrier<VEC_BARRIERS>();
         CastToOperand<OperandT, VEC_BARRIERS>(dst, msb_, bytes);
+    }
+
+    // A barrier between two dependent ops of the encode chain. kv4fp8's chain issues without them and keeps
+    // only the barriers that mark a buffer reinterpretation (csrc/tests/TURBOQUANT_TESTS.md 13.29); the
+    // codebook modes keep the barriers they were written with.
+    __aicore__ static inline void ChainBarrier()
+    {
+        if constexpr (!kIsAffine) {
+            AscendC::PipeBarrier<PIPE_V>();
+        }
     }
 
     __aicore__ static inline void FloorInPlace(const AscendC::LocalTensor<float> &x, uint32_t count)
@@ -380,15 +390,13 @@ private:
     {
         const uint32_t bytes = n / 2u;
         AscendC::Adds(digits, digits, -kNibbleSignShift, n);
-        AscendC::PipeBarrier<PIPE_V>();
         AscendC::LocalTensor<half> levels = scratch_.ReinterpretCast<half>();
         AscendC::Cast(levels, digits, AscendC::RoundMode::CAST_RINT, n);
-        AscendC::PipeBarrier<PIPE_V>();
 
         AscendC::LocalTensor<half> woven = expand_.ReinterpretCast<half>();
         AscendC::Interleave(woven, woven[bytes], levels, levels[bytes], static_cast<int32_t>(bytes));
-        AscendC::PipeBarrier<PIPE_V>();
         AscendC::Cast(dst.ReinterpretCast<int4b_t>(), woven, AscendC::RoundMode::CAST_RINT, n);
+        // scratch_ held half levels here, and the next vector's encode writes it as float.
         AscendC::PipeBarrier<PIPE_V>();
     }
 

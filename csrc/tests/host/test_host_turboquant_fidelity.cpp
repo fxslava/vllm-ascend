@@ -847,12 +847,77 @@ TEST(TurboQuantEdgeCases, PartialBatchesMatchPerRowQuantisation) {
   }
 }
 
+// The kv4fp8 cache layout both kernels issue as DMA (turboquant_layout.h, NzTiledPackedByte): every cell of a
+// block is written exactly once, the decode's one-burst (tile, kv head) window holds exactly that tile's cells,
+// the plane read from the window unpacks in the Cube's NZ order, and the writer's strided burst lands on them.
+TEST(TurboQuantNzTiledCache, TilesAreContiguousNzImagesAndTheWriterBurstHitsThem) {
+  namespace tqt = vllm_ascend::turboquant;
+  constexpr uint64_t kTile = tqt::kCubeTileRows;
+  constexpr uint64_t kC0 = tqt::kOperandC0;
+  constexpr uint64_t kBlocks = 2;
+  // The arch35 NZ layout the Cube's LoadData2D consumes (NzOffset in turboquant_launch.hpp).
+  const auto nz_offset = [](uint64_t row, uint64_t column, uint64_t rows) {
+    return (column / kC0) * rows * kC0 + row * kC0 + column % kC0;
+  };
+
+  for (const uint64_t kv_heads : {1u, 2u, 8u}) {
+    for (const uint64_t head_size : {64u, 128u, 256u}) {
+      for (const uint64_t block_size : {64u, 128u}) {
+        const uint64_t packed = head_size / 2;
+        const uint64_t groups = packed / kC0;
+        const uint64_t slots = kBlocks * block_size;
+        std::vector<uint32_t> hits(slots * kv_heads * packed, 0);
+        size_t window_mismatches = 0;
+        size_t nz_mismatches = 0;
+        size_t writer_mismatches = 0;
+        for (uint64_t slot = 0; slot < slots; ++slot) {
+          const uint64_t tile_row = slot % kTile;
+          // What ReadPlane calls row: physical * block_size + rowBase, a whole number of tiles.
+          const uint64_t row = slot - tile_row;
+          // WriteNzTiled's base address; its burst i lands kTile blocks after burst i - 1.
+          const uint64_t writer_base = row * kv_heads * packed + tile_row * kC0;
+          for (uint64_t kv = 0; kv < kv_heads; ++kv) {
+            const uint64_t window = (row * kv_heads + kv * kTile) * packed;
+            for (uint64_t column = 0; column < packed; ++column) {
+              const uint64_t at = tqt::NzTiledPackedByte(slot, kv, column, kv_heads, packed);
+              ASSERT_LT(at, hits.size());
+              ++hits[at];
+              if (at < window || at - window >= kTile * packed) {
+                ++window_mismatches;
+                continue;
+              }
+              // The low nibble is coordinate `column`, the high nibble coordinate `packed + column`, and
+              // UnpackPlaneToL1 writes the high plane one tile plane after the low one.
+              const uint64_t in_window = at - window;
+              nz_mismatches += (in_window != nz_offset(tile_row, column, kTile) ||
+                                kTile * packed + in_window != nz_offset(tile_row, packed + column, kTile))
+                                   ? 1u
+                                   : 0u;
+              const uint64_t burst = kv * groups + column / kC0;
+              writer_mismatches += (writer_base + burst * kTile * kC0 + column % kC0 != at) ? 1u : 0u;
+            }
+          }
+        }
+        const size_t uncovered =
+            static_cast<size_t>(std::count_if(hits.begin(), hits.end(), [](uint32_t n) { return n != 1; }));
+        const std::string shape = "kv_heads=" + std::to_string(kv_heads) + " head_size=" + std::to_string(head_size) +
+                                  " block_size=" + std::to_string(block_size);
+        EXPECT_EQ(uncovered, 0u) << shape << ": the layout is not a bijection onto the block";
+        EXPECT_EQ(window_mismatches, 0u) << shape << ": a cell lies outside its (tile, kv head) read window";
+        EXPECT_EQ(nz_mismatches, 0u) << shape << ": the window does not unpack in NZ order";
+        EXPECT_EQ(writer_mismatches, 0u) << shape << ": the writer's strided burst misses its cells";
+      }
+    }
+  }
+}
+
 TEST(TurboQuantMirroredCache, PackedBytesAndFp8OperandsDescribeTheSameLevels) {
   namespace tqh = turboquant_host;
-  constexpr int64_t kContext = 20;
-  constexpr int64_t kBlock = 16;
+  // Two tiles per block and two column groups per head, with the context crossing a tile and a block.
+  constexpr int64_t kContext = 150;
+  constexpr int64_t kBlock = 128;
   constexpr int64_t kKvHeads = 2;
-  constexpr int64_t kHead = 64;
+  constexpr int64_t kHead = 128;
   constexpr int64_t kBlocks = 4;
   constexpr int kSignedNibbleRange = 16;
   constexpr int kSignedNibbleMax = 7;
@@ -889,7 +954,7 @@ TEST(TurboQuantMirroredCache, PackedBytesAndFp8OperandsDescribeTheSameLevels) {
         const size_t row = slot * kv_heads + kv;
         const size_t dense_row = (static_cast<size_t>(t) * kv_heads + kv) * head;
         for (size_t j = 0; j < half; ++j) {
-          const uint32_t byte = static_cast<uint8_t>(packed[row * half + j]);
+          const uint32_t byte = static_cast<uint8_t>(packed[tqh::MirroredPackedByte(slot, kv, j, kv_heads, half)]);
           const int low = static_cast<int>(byte & tqh::kMirroredNibbleMask);
           const int high = static_cast<int>(byte >> tqh::kMirroredNibbleBits);
           const int signed_nibble = low > kSignedNibbleMax ? low - kSignedNibbleRange : low;
@@ -914,11 +979,11 @@ TEST(TurboQuantMirroredCache, PackedBytesAndFp8OperandsDescribeTheSameLevels) {
     if (written[slot]) {
       continue;
     }
-    for (size_t e = 0; e < kv_heads * half; ++e) {
-      pad_mismatches += (cache.key_packed[slot * kv_heads * half + e] != 0 ||
-                         cache.value_packed[slot * kv_heads * half + e] != 0)
-                            ? 1u
-                            : 0u;
+    for (size_t kv = 0; kv < kv_heads; ++kv) {
+      for (size_t j = 0; j < half; ++j) {
+        const size_t at = tqh::MirroredPackedByte(slot, kv, j, kv_heads, half);
+        pad_mismatches += (cache.key_packed[at] != 0 || cache.value_packed[at] != 0) ? 1u : 0u;
+      }
     }
     for (size_t e = 0; e < kv_heads * head; ++e) {
       const size_t at = slot * kv_heads * head + e;

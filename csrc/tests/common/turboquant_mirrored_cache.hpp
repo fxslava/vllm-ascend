@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "../../attention/turboquant/op_kernel/common/turboquant_layout.h"
 #include "../../attention/turboquant/op_kernel/common/turboquant_mode.h"
 #include "random_data.hpp"
 
@@ -70,6 +71,15 @@ inline int64_t MirroredScaleSlotFloats(int64_t num_kv_heads) {
   return (2 * num_kv_heads + kMirroredScaleLanes - 1) / kMirroredScaleLanes * kMirroredScaleLanes;
 }
 
+// The byte of packed column `column` of (slot, kv head) in kv4fp8's NZ-tiled cache.
+inline size_t MirroredPackedByte(size_t slot, size_t kv_head, size_t column, size_t num_kv_heads,
+                                 size_t packed_bytes) {
+  return static_cast<size_t>(
+      vllm_ascend::turboquant::NzTiledPackedByte(slot, kv_head, column, num_kv_heads, packed_bytes));
+}
+
+// key_packed / value_packed are NZ-tiled like the kernel writer's; key_operands / value_operands, key and
+// value stay row-major, [slot][kv head][column] and [token][kv head][column].
 struct MirroredKvCache {
   std::vector<int8_t> key_packed;
   std::vector<int8_t> value_packed;
@@ -80,9 +90,21 @@ struct MirroredKvCache {
   std::vector<float> value;
 };
 
+// The packed byte of kv4fp8 pairs coordinate j (nibble lane 0) with coordinate j + head_size / 2 (lane 1).
+// Lane 0 is taken to be the low nibble; the kernel writer round trip in test_sim_950pr_turboquant_fused
+// checks that against the device.
+inline int8_t MirroredPackedPair(int32_t low_index, int32_t high_index) {
+  const uint32_t low = static_cast<uint32_t>(low_index - kMirroredNibbleSignShift) & kMirroredNibbleMask;
+  const uint32_t high = static_cast<uint32_t>(high_index - kMirroredNibbleSignShift) & kMirroredNibbleMask;
+  return static_cast<int8_t>(low | (high << kMirroredNibbleBits));
+}
+
+// block_size must be a multiple of kCubeTileRows, as the NZ-tiled cache requires. With mirror_halves every
+// vector's second half repeats its first, which is what the fused goldens were recorded on; without it the
+// halves are drawn independently, so a swapped nibble lane changes the data.
 inline MirroredKvCache BuildMirroredKvCache(DeterministicRandom& rng, int64_t context_len, int64_t num_blocks,
                                             int64_t block_size, int64_t num_kv_heads, int64_t head_size,
-                                            const std::vector<int32_t>& block_table) {
+                                            const std::vector<int32_t>& block_table, bool mirror_halves = true) {
   const size_t half = static_cast<size_t>(head_size / 2);
   const size_t head = static_cast<size_t>(head_size);
   const size_t packed_bytes =
@@ -111,29 +133,30 @@ inline MirroredKvCache BuildMirroredKvCache(DeterministicRandom& rng, int64_t co
         std::vector<int8_t>& operands = plane == 0 ? cache.key_operands : cache.value_operands;
         std::vector<float>& dense = plane == 0 ? cache.key : cache.value;
 
-        const std::vector<float> source = rng.NormalHalfExact(half, 0.0f, 1.0f);
+        const std::vector<float> source = rng.NormalHalfExact(mirror_halves ? half : head, 0.0f, 1.0f);
         double energy = 0.0;
         for (const float x : source) {
           energy += static_cast<double>(x) * static_cast<double>(x);
         }
-        const float scale = static_cast<float>(std::sqrt(energy / static_cast<double>(half)));
+        const float scale = static_cast<float>(std::sqrt(energy / static_cast<double>(source.size())));
         cache.scales[slot * slot_floats + (plane == 0 ? kv : kv_heads + kv)] = scale;
 
         const size_t row = slot * kv_heads + kv;
         const size_t dense_row = (static_cast<size_t>(t) * kv_heads + kv) * head;
+        const auto index_of = [&](float x) {
+          return std::clamp(static_cast<int32_t>(std::floor(x / scale * kMirroredGain + kMirroredAffineBias + 0.5f)),
+                            0, kMirroredLevels - 1);
+        };
         for (size_t j = 0; j < half; ++j) {
-          const int32_t index = std::clamp(
-              static_cast<int32_t>(std::floor(source[j] / scale * kMirroredGain + kMirroredAffineBias + 0.5f)), 0,
-              kMirroredLevels - 1);
-          const float level = MirroredLevel(index);
-          const uint32_t nibble = static_cast<uint32_t>(index - kMirroredNibbleSignShift) & kMirroredNibbleMask;
-          packed[row * packed_bytes + j] = static_cast<int8_t>(nibble | (nibble << kMirroredNibbleBits));
-          const int8_t operand = static_cast<int8_t>(Fp8E4m3fnBits(level));
-          operands[row * head + j] = operand;
-          operands[row * head + half + j] = operand;
-          const float dequantised = level * scale / kMirroredGain;
-          dense[dense_row + j] = dequantised;
-          dense[dense_row + half + j] = dequantised;
+          const int32_t low_index = index_of(source[j]);
+          const int32_t high_index = mirror_halves ? low_index : index_of(source[half + j]);
+          packed[MirroredPackedByte(slot, kv, j, kv_heads, packed_bytes)] = MirroredPackedPair(low_index, high_index);
+          const float low_level = MirroredLevel(low_index);
+          const float high_level = MirroredLevel(high_index);
+          operands[row * head + j] = static_cast<int8_t>(Fp8E4m3fnBits(low_level));
+          operands[row * head + half + j] = static_cast<int8_t>(Fp8E4m3fnBits(high_level));
+          dense[dense_row + j] = low_level * scale / kMirroredGain;
+          dense[dense_row + half + j] = high_level * scale / kMirroredGain;
         }
       }
     }
