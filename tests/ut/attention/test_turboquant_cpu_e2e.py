@@ -42,6 +42,7 @@ from vllm.v1.attention.backend import AttentionType  # type: ignore
 
 from tests.ut.attention.turboquant_cpu_ops import (
     CPU_VECTOR_CORES,
+    TURBOQUANT_CUBE_OP_SCHEMAS,
     TURBOQUANT_OP_SCHEMAS,
     cpu_fused_infer_attention_score,
     dequantize,
@@ -273,7 +274,7 @@ class TestTurboQuantCpuOps(TestBase):
             schema = " ".join("".join(re.findall(rf"{_STRING_LITERAL}", literals)).replace('"', "").split())
             if schema.startswith("npu_turboquant_"):
                 compiled[schema.partition("(")[0]] = schema
-        self.assertEqual(compiled, TURBOQUANT_OP_SCHEMAS)
+        self.assertEqual(compiled, {**TURBOQUANT_OP_SCHEMAS, **TURBOQUANT_CUBE_OP_SCHEMAS})
 
     def test_kernels_refuse_what_the_adapter_refuses(self):
         num_tokens = 4

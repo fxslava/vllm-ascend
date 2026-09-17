@@ -1621,6 +1621,10 @@ TURBOQUANT_KV_CACHE_DTYPE = "int4_per_token_head"
 # codec's tile height, so a block has to be a whole number of tiles.
 TURBOQUANT_BLOCK_SIZE_MULTIPLE = 16
 
+# The attention op of a gated layer whose TurboQuant decode gates in its own launch
+# (vllm_ascend/ops/turboquant_attention.py); a graph splitting op like vLLM's unified one.
+TURBOQUANT_GATED_ATTENTION_OP = "vllm::turboquant_gated_attention"
+
 
 def is_turboquant_cache_dtype(cache_dtype: object) -> bool:
     """Whether ``cache_dtype`` names a TurboQuant KV cache."""

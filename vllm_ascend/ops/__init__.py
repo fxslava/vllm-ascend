@@ -20,6 +20,7 @@ from vllm.triton_utils import HAS_TRITON
 
 import vllm_ascend.ops.layernorm  # noqa
 import vllm_ascend.ops.register_custom_ops  # noqa
+import vllm_ascend.ops.turboquant_attention  # noqa
 
 if HAS_TRITON:
     import vllm_ascend.ops.triton.linearnorm.split_qkv_rmsnorm_rope  # noqa

@@ -50,6 +50,10 @@ struct FusedShape {
   // Draw independent vector halves and write the cache through the kv4fp8 kernel writer
   // (turboquant_mm_reshape_and_cache_impl) instead of uploading the host-built image.
   bool kernel_writer = false;
+  // Decode tokens. Every token reads the same sequence through its own block-table row, with its own query.
+  int64_t batch = 1;
+  // Draw an attn_output_gate logit per query element, for the raw-query decode's kGated output stage.
+  bool gated = false;
 };
 
 // What the kernel writer put into GM, against the host encoder of the same levels.
@@ -73,9 +77,16 @@ struct FusedRun {
   size_t untouched = 0;
   uint64_t fnv1a = 0;
   double host_s = 0.0;
-  // Raw-query runs only: fp32 words of the in-launch rotation that differ from the rotate_q launch's.
+  // Raw-query runs only: fp32 words of the in-launch rotation that differ from the rotate_q launch's, and the
+  // largest difference.
   size_t prologue_mismatches = 0;
+  double prologue_max_abs = 0.0;
 };
+
+constexpr uint32_t kRotatedBasis = static_cast<uint32_t>(vllm_ascend::turboquant::TurboQuantOutputStage::kRotatedBasis);
+constexpr uint32_t kGatedOutput = static_cast<uint32_t>(vllm_ascend::turboquant::TurboQuantOutputStage::kGated);
+// The spread of the drawn gate logits: sigmoid(gate) then covers most of (0, 1).
+constexpr float kGateLogitStddev = 2.0f;
 
 inline double FusedCosine(const std::vector<float>& a, const std::vector<float>& b) {
   double dot = 0.0;
@@ -121,7 +132,12 @@ class FusedCubeScenario {
     block_table_.assign(permutation.begin(), permutation.begin() + static_cast<std::ptrdiff_t>(blocks_per_seq_));
     cache_ = BuildMirroredKvCache(rng, shape.context_len, num_blocks, shape.block_size, shape.num_kv_heads, d,
                                   block_table_, !shape.kernel_writer);
-    const std::vector<float> query = rng.NormalHalfExact(static_cast<size_t>(shape.num_heads * d), 0.0f, 1.0f);
+    const size_t query_elems = static_cast<size_t>(shape.batch * shape.num_heads * d);
+    const std::vector<float> query = rng.NormalHalfExact(query_elems, 0.0f, 1.0f);
+    if (shape.gated) {
+      gate_host_ = rng.NormalHalfExact(query_elems, 0.0f, kGateLogitStddev);
+      gate_ = DeviceBuffer::FromHost(FloatToHalf(gate_host_));
+    }
 
     scale_ = 1.0f / std::sqrt(static_cast<float>(d));
     query_ = DeviceBuffer::FromHost(FloatToHalf(query));
@@ -136,13 +152,18 @@ class FusedCubeScenario {
       value_cache_ = DeviceBuffer::FromHost(cache_.value_packed);
       scale_plane_ = DeviceBuffer::FromHost(cache_.scales);
     }
-    block_tables_ = DeviceBuffer::FromHost(block_table_);
-    context_lens_ = DeviceBuffer::FromHost(std::vector<int32_t>(1, static_cast<int32_t>(shape.context_len)));
-    query_rot_ = DeviceBuffer::Empty<float>(static_cast<size_t>(shape.num_heads * d));
-    out_ = DeviceBuffer::Empty<Half>(static_cast<size_t>(shape.num_heads * d));
+    std::vector<int32_t> block_rows;
+    for (int64_t token = 0; token < shape.batch; ++token) {
+      block_rows.insert(block_rows.end(), block_table_.begin(), block_table_.end());
+    }
+    block_tables_ = DeviceBuffer::FromHost(block_rows);
+    context_lens_ = DeviceBuffer::FromHost(
+        std::vector<int32_t>(static_cast<size_t>(shape.batch), static_cast<int32_t>(shape.context_len)));
+    query_rot_ = DeviceBuffer::Empty<float>(query_elems);
+    out_ = DeviceBuffer::Empty<Half>(query_elems);
 
     RotateQuery(stream_, AscendType::FP16, query_.get(), pi_signs_.get(), h16_.get(), rot_tables_.get(),
-                query_rot_.get(), 1, shape.num_heads, d, aiv_num_);
+                query_rot_.get(), shape.batch, shape.num_heads, d, aiv_num_);
     ACL_CHECK(aclrtSynchronizeStream(stream_));
     query_rot_host_ = query_rot_.ToHost<float>();
   }
@@ -150,7 +171,7 @@ class FusedCubeScenario {
   // plan_aiv is the vector-core budget the planner tiles for (0: the device's own); a smaller budget
   // than the device has forces fewer, wider tasks without changing the kernel.
   FusedDecodeGrid Plan(int64_t plan_aiv = 0, FusedSplitPolicy split_policy = FusedSplitPolicy::kFillBlocks) const {
-    return PlanFusedDecode(1, shape_.num_heads, shape_.num_kv_heads, shape_.head_size, blocks_per_seq_,
+    return PlanFusedDecode(shape_.batch, shape_.num_heads, shape_.num_kv_heads, shape_.head_size, blocks_per_seq_,
                            shape_.block_size, plan_aiv > 0 ? plan_aiv : aiv_num_, kFusedContextLimit, split_policy);
   }
 
@@ -159,44 +180,61 @@ class FusedCubeScenario {
       turboquant_mm_fused_decode_impl(
           static_cast<int32_t>(kFusedMode), AscendType::FP16, stream_, grid.block_dim, query_rot_.get(),
           key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
-          mode_tables_.get(), workspace, out_.get(), 1, static_cast<uint32_t>(shape_.num_heads),
-          static_cast<uint32_t>(shape_.num_kv_heads), static_cast<uint32_t>(shape_.head_size),
-          static_cast<uint32_t>(shape_.block_size), static_cast<uint32_t>(blocks_per_seq_),
-          static_cast<uint32_t>(grid.num_splits), grid.heads_per_task, grid.tasks_per_block,
-          grid.reduce_tasks_per_block, grid.fused_context_limit, scale_, inv_sqrt_len);
+          mode_tables_.get(), workspace, out_.get(), static_cast<uint32_t>(shape_.batch),
+          static_cast<uint32_t>(shape_.num_heads), static_cast<uint32_t>(shape_.num_kv_heads),
+          static_cast<uint32_t>(shape_.head_size), static_cast<uint32_t>(shape_.block_size),
+          static_cast<uint32_t>(blocks_per_seq_), static_cast<uint32_t>(grid.num_splits), grid.heads_per_task,
+          grid.tasks_per_block, grid.reduce_tasks_per_block, grid.fused_context_limit, scale_, inv_sqrt_len);
     });
   }
 
   // The same grid through the raw-query decode: the launch is handed the fp16 query and rotates it itself,
-  // into a fresh buffer that is then compared word for word with what rotate_q wrote at setup.
-  FusedRun RunFusedRawQuery(const FusedDecodeGrid& grid) {
+  // into a fresh buffer that is then compared word for word with what rotate_q wrote at setup. output_stage is a
+  // TurboQuantOutputStage; kGatedOutput needs a gated shape.
+  FusedRun RunFusedRawQuery(const FusedDecodeGrid& grid, uint32_t output_stage = kRotatedBasis) {
     DeviceBuffer rotated = DeviceBuffer::FromHost(std::vector<float>(query_rot_host_.size(), kFusedOutputSentinel));
+    void* gate = output_stage == kGatedOutput ? gate_.get() : nullptr;
     FusedRun run = Launch(grid, [&](void* workspace, float inv_sqrt_len) {
       turboquant_mm_fused_decode_raw_query_impl(
           static_cast<int32_t>(kFusedMode), AscendType::FP16, stream_, grid.block_dim, query_.get(), pi_signs_.get(),
-          rot_tables_.get(), rotated.get(), key_cache_.get(), value_cache_.get(), scale_plane_.get(),
-          block_tables_.get(), context_lens_.get(), mode_tables_.get(), workspace, out_.get(), 1,
-          static_cast<uint32_t>(shape_.num_heads), static_cast<uint32_t>(shape_.num_kv_heads),
-          static_cast<uint32_t>(shape_.head_size), static_cast<uint32_t>(shape_.block_size),
-          static_cast<uint32_t>(blocks_per_seq_), static_cast<uint32_t>(grid.num_splits), grid.heads_per_task,
-          grid.tasks_per_block, grid.reduce_tasks_per_block, grid.prologue_vectors_per_block,
-          grid.fused_context_limit, scale_, inv_sqrt_len);
+          rot_tables_.get(), h16_.get(), gate, rotated.get(), key_cache_.get(), value_cache_.get(),
+          scale_plane_.get(), block_tables_.get(), context_lens_.get(), mode_tables_.get(), workspace, out_.get(),
+          static_cast<uint32_t>(shape_.batch), static_cast<uint32_t>(shape_.num_heads),
+          static_cast<uint32_t>(shape_.num_kv_heads), static_cast<uint32_t>(shape_.head_size),
+          static_cast<uint32_t>(shape_.block_size), static_cast<uint32_t>(blocks_per_seq_),
+          static_cast<uint32_t>(grid.num_splits), grid.heads_per_task, grid.tasks_per_block,
+          grid.reduce_tasks_per_block, grid.prologue_vectors_per_block, grid.prologue_cube_chunk_vectors,
+          output_stage, grid.fused_context_limit, scale_, inv_sqrt_len);
     });
     const std::vector<float> in_launch = rotated.ToHost<float>();
     for (size_t i = 0; i < query_rot_host_.size(); ++i) {
+      const bool written = i < in_launch.size();
       run.prologue_mismatches +=
-          (i >= in_launch.size() || std::memcmp(&in_launch[i], &query_rot_host_[i], sizeof(float)) != 0) ? 1u : 0u;
+          (!written || std::memcmp(&in_launch[i], &query_rot_host_[i], sizeof(float)) != 0) ? 1u : 0u;
+      const double err = written ? std::fabs(static_cast<double>(in_launch[i]) - query_rot_host_[i]) : HUGE_VAL;
+      run.prologue_max_abs = std::max(run.prologue_max_abs, err);
     }
     return run;
+  }
+
+  // What an o_proj reads: the rotated-basis rows un-rotated head by head, then multiplied by sigmoid(gate).
+  std::vector<float> ModelBasis(const std::vector<float>& rotated) const {
+    std::vector<float> out = UnrotateHeads(rotated, shape_.head_size);
+    for (size_t i = 0; i < out.size() && i < gate_host_.size(); ++i) {
+      const double gate = 1.0 / (1.0 + std::exp(-static_cast<double>(gate_host_[i])));
+      out[i] = static_cast<float>(static_cast<double>(out[i]) * gate);
+    }
+    return out;
   }
 
   std::vector<float> Reference() const {
     const int64_t d = shape_.head_size;
     const int64_t heads_per_kv = shape_.num_heads / shape_.num_kv_heads;
-    std::vector<float> out(static_cast<size_t>(shape_.num_heads * d), 0.0f);
+    std::vector<float> out(static_cast<size_t>(shape_.batch * shape_.num_heads * d), 0.0f);
     std::vector<double> logits(static_cast<size_t>(shape_.context_len), 0.0);
-    for (int64_t h = 0; h < shape_.num_heads; ++h) {
-      const int64_t kv = h / heads_per_kv;
+    // h is a (token, head) row; every token attends to the same sequence.
+    for (int64_t h = 0; h < shape_.batch * shape_.num_heads; ++h) {
+      const int64_t kv = (h % shape_.num_heads) / heads_per_kv;
       double max_logit = -1e30;
       for (int64_t t = 0; t < shape_.context_len; ++t) {
         double dot = 0.0;
@@ -351,8 +389,8 @@ class FusedCubeScenario {
   }
 
   void PoisonOutput() {
-    out_ = DeviceBuffer::FromHost(
-        FloatToHalf(std::vector<float>(static_cast<size_t>(shape_.num_heads * shape_.head_size), kFusedOutputSentinel)));
+    out_ = DeviceBuffer::FromHost(FloatToHalf(std::vector<float>(
+        static_cast<size_t>(shape_.batch * shape_.num_heads * shape_.head_size), kFusedOutputSentinel)));
   }
 
   void Collect(FusedRun* run) const {
@@ -377,6 +415,8 @@ class FusedCubeScenario {
   DeviceBuffer query_, pi_signs_, h16_, rot_tables_, mode_tables_;
   DeviceBuffer key_cache_, value_cache_, scale_plane_, block_tables_, context_lens_;
   DeviceBuffer query_rot_, out_;
+  std::vector<float> gate_host_;
+  DeviceBuffer gate_;
 };
 
 }

@@ -15,14 +15,16 @@
  */
 
 // The Cube-native multi-mode TurboQuant kernels: the mode-parameterised cache write, the fused
-// single-launch decode, and the fp8 GEMM probe the Cube contract test drives. Test-only today: the
-// wheel's library builds turboquant_paged_attention.cpp and turboquant_rotate_q.cpp.
+// single-launch decode, and the fp8 GEMM probe the Cube contract test drives. The wheel builds this file
+// for arch35 and ships kv4fp8 only: the other modes and the probe are compiled under
+// VLLM_ASCEND_TQ_TEST_KERNELS, which only csrc/tests defines.
 
 #include "kernel_operator.h"
 
 #include "../../../kernels/types.h"
 #include "common/turboquant_codec_mx.h"
 #include "cube/turboquant_cube_service.h"
+#include "cube/turboquant_query_basis.h"
 #include "vector/turboquant_vector_service.h"
 
 using vllm_ascend::turboquant::CeilDiv;
@@ -53,7 +55,7 @@ using vllm_ascend::turboquant::TurboQuantCubeMm;
 using vllm_ascend::turboquant::TurboQuantMode;
 using vllm_ascend::turboquant::TurboQuantModeCodec;
 using vllm_ascend::turboquant::TurboQuantPartialReducer;
-using vllm_ascend::turboquant::TurboQuantQueryPrologue;
+using vllm_ascend::turboquant::TurboQuantQueryBasis;
 using vllm_ascend::turboquant::TurboQuantTaskHeads;
 using vllm_ascend::turboquant::TurboQuantVectorDecodeService;
 
@@ -261,8 +263,10 @@ private:
 // partials that the same launch reduces after AscendC::SyncAll.
 //
 // PRE_ROTATED is where Pi q happens. true: the caller hands in the rotated fp32 query (rotate_q, or an
-// upstream fusion) and the launch has no rotation code or buffer at all. false: the caller hands in the raw
-// query and RotateQuery() rotates every vector once, in UB, before Process() starts the task loop.
+// upstream fusion), the launch has no rotation code or buffer at all, and the output stays in the rotated
+// basis. false: the caller hands in the raw query, RotateQuery() rotates every vector once before Process()
+// starts the task loop, and the output stage InitBasis() selects runs on every head before its output cast
+// (cube/turboquant_query_basis.h).
 template <TurboQuantMode MODE, typename scalar_t, bool PRE_ROTATED = true>
 class TurboQuantFusedDecode {
 public:
@@ -271,7 +275,7 @@ public:
     using Vector = TurboQuantVectorDecodeService<MODE, scalar_t, Mm, Codec>;
     using Cube = TurboQuantCubeDecodeService<MODE>;
     using Reducer = TurboQuantPartialReducer<scalar_t>;
-    using Prologue = TurboQuantQueryPrologue<scalar_t, !PRE_ROTATED>;
+    using Basis = TurboQuantQueryBasis<scalar_t, !PRE_ROTATED>;
 
     __aicore__ inline explicit TurboQuantFusedDecode(AscendC::TPipe *pipe) : pipe_(pipe) {}
 
@@ -311,14 +315,22 @@ public:
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 
-    // The raw-query prologue: queryRot, the buffer Init() pointed the tasks at, is where the rotation lands.
-    // After Init(), before Process().
-    __aicore__ inline void RotateQuery(__gm__ void *query, __gm__ void *piSigns, __gm__ void *rotTables,
-                                       __gm__ void *queryRot, const uint32_t vectorsPerBlock, const float invSqrtLen)
+    // The raw-query decode's two basis stages. queryRot, the buffer Init() pointed the tasks at, is where the
+    // prologue's rotation lands. After Init(), before RotateQuery().
+    __aicore__ inline void InitBasis(__gm__ void *query, __gm__ void *piSigns, __gm__ void *rotTables, __gm__ void *h16,
+                                     __gm__ void *gate, __gm__ void *queryRot, const uint32_t cubeChunkVectors,
+                                     const uint32_t outputStage, const float invSqrtLen)
     {
-        static_assert(Prologue::kEnabled, "a pre-rotated decode has no query rotation");
-        prologue_.Init(pipe_, query, piSigns, rotTables, queryRot, headSize_, invSqrtLen);
-        prologue_.Rotate(numTokens_ * numHeads_, vectorsPerBlock);
+        static_assert(Basis::kEnabled, "a pre-rotated decode has no query rotation");
+        basis_.Init(pipe_, query, piSigns, rotTables, h16, gate, queryRot, numHeads_, headSize_, cubeChunkVectors,
+                    outputStage, invSqrtLen);
+    }
+
+    // The prologue. Before Process().
+    __aicore__ inline void RotateQuery(const uint32_t vectorsPerBlock)
+    {
+        static_assert(Basis::kEnabled, "a pre-rotated decode has no query rotation");
+        basis_.Rotate(numTokens_ * numHeads_, vectorsPerBlock);
     }
 
     __aicore__ inline void Process(const uint32_t tasksPerBlock)
@@ -370,7 +382,7 @@ public:
         for (uint32_t task = from; task < to; ++task) {
             const uint32_t token = task / numHeads_;
             if (!IsFused(contextLenGm_.GetValue(token))) {
-                reducer.Reduce(token, task % numHeads_);
+                reducer.Reduce(token, task % numHeads_, basis_);
             }
         }
     }
@@ -438,7 +450,7 @@ private:
         }
 
         if ASCEND_IS_AIV {
-            vector_.StageTaskOutput(token, split, heads, fused);
+            vector_.StageTaskOutput(token, split, heads, fused, basis_);
         }
     }
 
@@ -627,9 +639,11 @@ private:
     uint32_t numSplits_ = 1;
     uint32_t fusedContextLimit_ = 0;
     // Last, so a pre-rotated decode's members keep their offsets; empty when PRE_ROTATED.
-    Prologue prologue_;
+    Basis basis_;
 };
 
+#if defined(VLLM_ASCEND_TQ_TEST_KERNELS)
+// Test-only: the fp8 GEMM probe test_sim_950pr_cube_gemm drives.
 class TurboQuantCubeGemmProbe {
 public:
     using Mm = TurboQuantCubeMm<TurboQuantMode::KV5_FP8>;
@@ -704,6 +718,7 @@ private:
     uint32_t bElems_ = 0;
     uint32_t cElems_ = 0;
 };
+#endif
 
 }
 
@@ -744,15 +759,17 @@ private:
         }                                                                                                            \
     }
 
-// The raw-query decode: query is the unrotated scalar_t query and queryRot the fp32 buffer the prologue
-// rotates it into, sized like a pre-rotated decode's query.
+// The raw-query decode: query is the unrotated scalar_t query and queryRot the fp32 buffer the prologue rotates
+// it into, sized like a pre-rotated decode's query. h16 is read only with a Cube chunk size, gate only when
+// outputStage is kGated; either may be null otherwise.
 #define ASCEND_TQ_DECLARE_MM_FUSED_DECODE_RAW_QUERY(NAME, MODE, TYPE)                                                \
     extern "C" __global__ __aicore__ void NAME(                                                                      \
-        GM_ADDR query, GM_ADDR piSigns, GM_ADDR rotTables, GM_ADDR queryRot, GM_ADDR keyCache, GM_ADDR valueCache,   \
-        GM_ADDR scaleCache, GM_ADDR blockTables, GM_ADDR contextLens, GM_ADDR modeTables, GM_ADDR workspace,         \
-        GM_ADDR output, uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize,               \
-        uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t headsPerTask,                     \
-        uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock, uint32_t prologueVectorsPerBlock,                      \
+        GM_ADDR query, GM_ADDR piSigns, GM_ADDR rotTables, GM_ADDR h16, GM_ADDR gate, GM_ADDR queryRot,             \
+        GM_ADDR keyCache, GM_ADDR valueCache, GM_ADDR scaleCache, GM_ADDR blockTables, GM_ADDR contextLens,          \
+        GM_ADDR modeTables, GM_ADDR workspace, GM_ADDR output, uint32_t numTokens, uint32_t numHeads,                \
+        uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits,    \
+        uint32_t headsPerTask, uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,                                 \
+        uint32_t prologueVectorsPerBlock, uint32_t prologueCubeChunkVectors, uint32_t outputStage,                   \
         uint32_t fusedContextLimit, float scale, float invSqrtLen)                                                   \
     {                                                                                                                \
         AscendC::TPipe pipe;                                                                                         \
@@ -760,7 +777,9 @@ private:
         op.Init(queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output, \
                 numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,      \
                 fusedContextLimit, scale, invSqrtLen);                                                               \
-        op.RotateQuery(query, piSigns, rotTables, queryRot, prologueVectorsPerBlock, invSqrtLen);                    \
+        op.InitBasis(query, piSigns, rotTables, h16, gate, queryRot, prologueCubeChunkVectors, outputStage,          \
+                     invSqrtLen);                                                                                    \
+        op.RotateQuery(prologueVectorsPerBlock);                                                                     \
         op.Process(tasksPerBlock);                                                                                   \
         if (op.NeedsReduction()) {                                                                                   \
             AscendC::SyncAll<false>();                                                                               \
@@ -776,17 +795,14 @@ private:
     ASCEND_TQ_DECLARE_MM_RESHAPE_AND_CACHE(MODE_NAME, MODE, half)                                                    \
     ASCEND_TQ_DECLARE_MM_FUSED_DECODE(turboquant_mm_fused_decode_##MODE_NAME##_half, MODE, half)
 
-ASCEND_TQ_DECLARE_MM_MODE(kv3fp4, TurboQuantMode::KV3_FP4)
 ASCEND_TQ_DECLARE_MM_MODE(kv4fp8, TurboQuantMode::KV4_FP8)
-ASCEND_TQ_DECLARE_MM_MODE(kv5fp8, TurboQuantMode::KV5_FP8)
 // kv4fp8 only: the one mode the fused decode is validated in (TURBOQUANT_TESTS.md 13.25).
 ASCEND_TQ_DECLARE_MM_FUSED_DECODE_RAW_QUERY(turboquant_mm_fused_decode_raw_query_kv4fp8_half, TurboQuantMode::KV4_FP8,
                                             half)
-
-#undef ASCEND_TQ_DECLARE_MM_MODE
-#undef ASCEND_TQ_DECLARE_MM_FUSED_DECODE_RAW_QUERY
-#undef ASCEND_TQ_DECLARE_MM_FUSED_DECODE
-#undef ASCEND_TQ_DECLARE_MM_RESHAPE_AND_CACHE
+#if defined(VLLM_ASCEND_TQ_TEST_KERNELS)
+// The codebook modes have never executed through the fused decode, so only the test library builds them.
+ASCEND_TQ_DECLARE_MM_MODE(kv3fp4, TurboQuantMode::KV3_FP4)
+ASCEND_TQ_DECLARE_MM_MODE(kv5fp8, TurboQuantMode::KV5_FP8)
 
 extern "C" __global__ __aicore__ void turboquant_cube_gemm_probe_fp8(
     GM_ADDR a, GM_ADDR b, GM_ADDR c, uint32_t m, uint32_t k, uint32_t n, uint32_t headSize, uint32_t tileRows,
@@ -797,6 +813,12 @@ extern "C" __global__ __aicore__ void turboquant_cube_gemm_probe_fp8(
     op.Init(a, b, c, headSize, tileRows, aElems, bElems, cElems);
     op.Run(m, k, n, bIsNk, variant);
 }
+#endif
+
+#undef ASCEND_TQ_DECLARE_MM_MODE
+#undef ASCEND_TQ_DECLARE_MM_FUSED_DECODE_RAW_QUERY
+#undef ASCEND_TQ_DECLARE_MM_FUSED_DECODE
+#undef ASCEND_TQ_DECLARE_MM_RESHAPE_AND_CACHE
 
 namespace vllm_ascend {
 
@@ -810,20 +832,24 @@ void turboquant_mm_reshape_and_cache_impl(int32_t mode, AscendType type, void *s
         return;
     }
     switch (static_cast<turboquant::TurboQuantMode>(mode)) {
-        case turboquant::TurboQuantMode::KV3_FP4:
-            turboquant_mm_reshape_and_cache_kv3fp4_half<<<blockDim, nullptr, stream>>>(
-                key, value, keyCache, valueCache, scaleCache, slotMapping, piSigns, rotTables, modeTables, numTokens,
-                numKvHeads, headSize, blockSize, tokensPerCore, invSqrtLen);
-            break;
         case turboquant::TurboQuantMode::KV4_FP8:
             turboquant_mm_reshape_and_cache_kv4fp8_half<<<blockDim, nullptr, stream>>>(
                 key, value, keyCache, valueCache, scaleCache, slotMapping, piSigns, rotTables, modeTables, numTokens,
                 numKvHeads, headSize, blockSize, tokensPerCore, invSqrtLen);
             break;
-        default:
+#if defined(VLLM_ASCEND_TQ_TEST_KERNELS)
+        case turboquant::TurboQuantMode::KV3_FP4:
+            turboquant_mm_reshape_and_cache_kv3fp4_half<<<blockDim, nullptr, stream>>>(
+                key, value, keyCache, valueCache, scaleCache, slotMapping, piSigns, rotTables, modeTables, numTokens,
+                numKvHeads, headSize, blockSize, tokensPerCore, invSqrtLen);
+            break;
+        case turboquant::TurboQuantMode::KV5_FP8:
             turboquant_mm_reshape_and_cache_kv5fp8_half<<<blockDim, nullptr, stream>>>(
                 key, value, keyCache, valueCache, scaleCache, slotMapping, piSigns, rotTables, modeTables, numTokens,
                 numKvHeads, headSize, blockSize, tokensPerCore, invSqrtLen);
+            break;
+#endif
+        default:
             break;
     }
 }
@@ -840,48 +866,55 @@ void turboquant_mm_fused_decode_impl(int32_t mode, AscendType type, void *stream
         return;
     }
     switch (static_cast<turboquant::TurboQuantMode>(mode)) {
-        case turboquant::TurboQuantMode::KV3_FP4:
-            turboquant_mm_fused_decode_kv3fp4_half<<<blockDim, nullptr, stream>>>(
-                queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,
-                numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,
-                tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen);
-            break;
         case turboquant::TurboQuantMode::KV4_FP8:
             turboquant_mm_fused_decode_kv4fp8_half<<<blockDim, nullptr, stream>>>(
                 queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,
                 numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,
                 tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen);
             break;
-        default:
+#if defined(VLLM_ASCEND_TQ_TEST_KERNELS)
+        case turboquant::TurboQuantMode::KV3_FP4:
+            turboquant_mm_fused_decode_kv3fp4_half<<<blockDim, nullptr, stream>>>(
+                queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,
+                numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,
+                tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen);
+            break;
+        case turboquant::TurboQuantMode::KV5_FP8:
             turboquant_mm_fused_decode_kv5fp8_half<<<blockDim, nullptr, stream>>>(
                 queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,
                 numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,
                 tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen);
             break;
+#endif
+        default:
+            break;
     }
 }
 
 void turboquant_mm_fused_decode_raw_query_impl(int32_t mode, AscendType type, void *stream, uint32_t blockDim,
-                                              void *query, void *piSigns, void *rotTables, void *queryRot,
-                                              void *keyCache, void *valueCache, void *scaleCache, void *blockTables,
-                                              void *contextLens, void *modeTables, void *workspace, void *output,
-                                              uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads,
-                                              uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,
-                                              uint32_t numSplits, uint32_t headsPerTask, uint32_t tasksPerBlock,
-                                              uint32_t reduceTasksPerBlock, uint32_t prologueVectorsPerBlock,
-                                              uint32_t fusedContextLimit, float scale, float invSqrtLen)
+                                              void *query, void *piSigns, void *rotTables, void *h16, void *gate,
+                                              void *queryRot, void *keyCache, void *valueCache, void *scaleCache,
+                                              void *blockTables, void *contextLens, void *modeTables,
+                                              void *workspace, void *output, uint32_t numTokens, uint32_t numHeads,
+                                              uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,
+                                              uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t headsPerTask,
+                                              uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,
+                                              uint32_t prologueVectorsPerBlock, uint32_t prologueCubeChunkVectors,
+                                              uint32_t outputStage, uint32_t fusedContextLimit, float scale,
+                                              float invSqrtLen)
 {
     if (type != AscendType::FP16 || blockDim == 0 ||
         static_cast<turboquant::TurboQuantMode>(mode) != turboquant::TurboQuantMode::KV4_FP8) {
         return;
     }
     turboquant_mm_fused_decode_raw_query_kv4fp8_half<<<blockDim, nullptr, stream>>>(
-        query, piSigns, rotTables, queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables,
-        workspace, output, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,
-        headsPerTask, tasksPerBlock, reduceTasksPerBlock, prologueVectorsPerBlock, fusedContextLimit, scale,
-        invSqrtLen);
+        query, piSigns, rotTables, h16, gate, queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens,
+        modeTables, workspace, output, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,
+        headsPerTask, tasksPerBlock, reduceTasksPerBlock, prologueVectorsPerBlock, prologueCubeChunkVectors,
+        outputStage, fusedContextLimit, scale, invSqrtLen);
 }
 
+#if defined(VLLM_ASCEND_TQ_TEST_KERNELS)
 void turboquant_cube_gemm_probe_impl(void *stream, void *a, void *b, void *c, uint32_t m, uint32_t k, uint32_t n,
                                      uint32_t headSize, uint32_t tileRows, uint32_t aElems, uint32_t bElems,
                                      uint32_t cElems, uint32_t bIsNk, uint32_t variant)
@@ -889,5 +922,6 @@ void turboquant_cube_gemm_probe_impl(void *stream, void *a, void *b, void *c, ui
     turboquant_cube_gemm_probe_fp8<<<1, nullptr, stream>>>(a, b, c, m, k, n, headSize, tileRows, aElems, bElems,
                                                            cElems, bIsNk, variant);
 }
+#endif
 
 }

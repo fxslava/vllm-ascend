@@ -70,6 +70,25 @@ TURBOQUANT_OP_SCHEMAS = {
     ),
 }
 
+# The kv4fp8 Cube path's definitions, which only an Ascend 950 build registers. They have no CPU
+# stand-in here, and leaving them undefined keeps the CPU pass on the AIV decode it reproduces.
+TURBOQUANT_CUBE_OP_SCHEMAS = {
+    "npu_turboquant_cube_reshape_and_cache": (
+        "npu_turboquant_cube_reshape_and_cache(Tensor key, Tensor value, Tensor! key_cache, Tensor! value_cache, "
+        "Tensor! scale_cache, Tensor slot_mapping, Tensor pi_signs, Tensor codec_tables) -> ()"
+    ),
+    "npu_turboquant_cube_decode": (
+        "npu_turboquant_cube_decode(Tensor query, Tensor? gate, Tensor pi_signs, Tensor codec_tables, "
+        "Tensor hadamard16, Tensor key_cache, Tensor value_cache, Tensor scale_cache, Tensor block_tables, "
+        "Tensor context_lens, Tensor! workspace, Tensor! query_rot, int num_kv_heads, int num_heads, "
+        "float scale_value, int output_stage, Tensor! out) -> ()"
+    ),
+    "npu_turboquant_cube_workspace_size": (
+        "npu_turboquant_cube_workspace_size(int num_tokens, int num_heads, int num_kv_heads, int head_size, "
+        "int max_blocks_per_seq, int block_size) -> int"
+    ),
+}
+
 _NAMESPACE = "_C_ascend"
 # The two device queries take no tensor, so there is no backend key to dispatch on; the
 # extension registers them as catch-all kernels too.
@@ -506,6 +525,82 @@ def turboquant_cpu_ops(vector_cores: int = CPU_VECTOR_CORES) -> Iterator[None]:
             library.impl(
                 "npu_turboquant_workspace_size",
                 functools.partial(_workspace_size, vector_cores=vector_cores),
+                _DEVICE_QUERY_DISPATCH_KEY,
+            )
+        yield
+    finally:
+        library._destroy()
+
+
+# What the stand-in for npu_turboquant_cube_workspace_size answers. Sizing is the Cube planner's arithmetic,
+# which this module does not reproduce, so a meta pass hands the decode an empty workspace.
+META_CUBE_WORKSPACE_FLOATS = 0
+
+
+def _cube_reshape_and_cache_meta(key, value, key_cache, value_cache, scale_cache, slot_mapping, pi_signs, codec_tables):
+    torch._check(key.dim() == 3 and key.shape == value.shape, lambda: "key and value must be [num_tokens, H_KV, D]")
+    torch._check(key_cache.dim() == 4 and key_cache.shape == value_cache.shape, lambda: "K and V caches differ")
+    torch._check(key_cache.shape[2] == key.shape[1], lambda: "cache num_kv_heads mismatch")
+    torch._check(key_cache.shape[3] * 2 == key.shape[2], lambda: "packed cache head dim must be head_size / 2")
+    torch._check(scale_cache.shape[:2] == key_cache.shape[:2], lambda: "scale plane must match the cache blocks")
+    torch._check(slot_mapping.numel() == key.shape[0], lambda: "slot_mapping must hold one slot per token")
+    torch._check(pi_signs.numel() == key.shape[2], lambda: "pi_signs must hold head_size signs")
+
+
+def _cube_decode_meta(
+    query,
+    gate,
+    pi_signs,
+    codec_tables,
+    hadamard16,
+    key_cache,
+    value_cache,
+    scale_cache,
+    block_tables,
+    context_lens,
+    workspace,
+    query_rot,
+    num_kv_heads,
+    num_heads,
+    scale_value,
+    output_stage,
+    out,
+):
+    torch._check(query.dim() == 3, lambda: "query must be [num_tokens, num_heads, head_size]")
+    torch._check(out.shape == query.shape, lambda: "out must have the same shape as query")
+    torch._check(query_rot.dtype == torch.float32, lambda: "query_rot must be float32")
+    torch._check(query_rot.numel() == query.numel(), lambda: "query_rot must hold one fp32 word per query element")
+    torch._check(gate is None or gate.numel() == query.numel(), lambda: "gate must hold one logit per query element")
+    torch._check(query.shape[1] == num_heads and num_heads % num_kv_heads == 0, lambda: "head counts mismatch")
+    torch._check(key_cache.shape == value_cache.shape and key_cache.shape[2] == num_kv_heads, lambda: "cache heads")
+    torch._check(block_tables.dim() == 2 and block_tables.shape[0] == query.shape[0], lambda: "one table row per token")
+    torch._check(context_lens.numel() == query.shape[0], lambda: "one context length per query token")
+
+
+@contextlib.contextmanager
+def turboquant_cube_meta_ops() -> Iterator[None]:
+    """Define the Cube operators' pinned schemas with ``Meta`` kernels only, for the block's duration.
+
+    The kernels check the shapes that tie one call together and write nothing: both operators return ``()`` and
+    mutate their outputs in place, so a meta pass has no tensor to produce. There is deliberately no CPU kernel;
+    what the launch computes is verified on the camodel (``test_sim_950pr_turboquant_fused``), not here.
+    """
+    library = Library(_NAMESPACE, "FRAGMENT")
+    try:
+        namespace = getattr(torch.ops, _NAMESPACE)
+        defined = set()
+        for name, schema in TURBOQUANT_CUBE_OP_SCHEMAS.items():
+            if not hasattr(namespace, name):
+                library.define(schema)
+                defined.add(name)
+        if "npu_turboquant_cube_reshape_and_cache" in defined:
+            library.impl("npu_turboquant_cube_reshape_and_cache", _cube_reshape_and_cache_meta, "Meta")
+        if "npu_turboquant_cube_decode" in defined:
+            library.impl("npu_turboquant_cube_decode", _cube_decode_meta, "Meta")
+        if "npu_turboquant_cube_workspace_size" in defined:
+            library.impl(
+                "npu_turboquant_cube_workspace_size",
+                lambda *sizes: META_CUBE_WORKSPACE_FLOATS,
                 _DEVICE_QUERY_DISPATCH_KEY,
             )
         yield

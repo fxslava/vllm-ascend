@@ -1149,6 +1149,16 @@
 #       patch Qwen3_5GatedDeltaNet._forward_core to use triton ops like `fused_recurrent_gated_delta_rule`.
 #    Future Plan:
 #       Remove this patch when all ops in _forward_core support both Qwen3_5 and Qwen3Next.
+#   2. `vllm.model_executor.models.qwen3_next.Qwen3NextAttention.forward`
+#    Why:
+#       The TurboQuant kv4fp8 Cube decode un-rotates its output and applies `attn_output_gate`
+#       inside its own launch, but `unified_attention_with_output` has no argument for the gate.
+#    How：
+#       When the layer's attention impl reports `fuses_output_gate`, call
+#       `vllm::turboquant_gated_attention` (vllm_ascend/ops/turboquant_attention.py) with the raw
+#       gate and skip the model's own sigmoid and multiply.
+#    Future Plan:
+#       Remove this branch if upstream attention layers gain an output-gate argument.
 #
 # ** 17. File: worker/patch_qwen3_dflash.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

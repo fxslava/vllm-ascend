@@ -111,6 +111,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # the TurboQuant kernels support; it cannot be combined with decode context
     # parallel.
     "ENABLE_TURBOQUANT": lambda: bool(int(os.getenv("ENABLE_TURBOQUANT", "0"))),
+    # Decode the TurboQuant 4-bit KV cache with the kv4fp8 Cube kernels: one launch per step
+    # that rotates the raw query and, for an o_proj without Pi folded in, un-rotates the output
+    # and applies an attn_output_gate itself (vllm_ascend/attention/turboquant_v1.py).
+    # 1 (default): on wherever the build has the Cube kernels (Ascend 950) and the model runs
+    # in float16; everywhere else the AIV decode is used regardless. 0: always the AIV decode,
+    # with separate query and output rotation launches. The two write different cache layouts,
+    # so the value is read once per layer, when its attention impl is built.
+    "VLLM_ASCEND_TURBOQUANT_CUBE_DECODE": lambda: bool(int(os.getenv("VLLM_ASCEND_TURBOQUANT_CUBE_DECODE", "1"))),
 }
 
 # end-env-vars-definition

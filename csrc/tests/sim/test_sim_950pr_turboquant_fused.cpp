@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// The fused single-launch Cube decode (TURBOQUANT_TESTS.md 13.25), kv4fp8, on seven cases (D 256 unless noted):
+// The fused single-launch Cube decode (TURBOQUANT_TESTS.md 13.25), kv4fp8, on eight cases (D 256 unless noted):
 //
 //   (a) H_Q 4,  H_KV 2, S 64,  block 64   one tile
 //   (b) H_Q 4,  H_KV 2, S 256, block 64   four tiles in one task: the L1 slot ring and its free edge
@@ -26,6 +26,9 @@
 //   (g) (c) through the raw-query entry (PRE_ROTATED = false): the launch rotates the fp16 query itself, once
 //       per vector ahead of the four splits, and must land on (c)'s golden with a rotation bit-identical to
 //       rotate_q's (13.33)
+//   (h) H_Q 8,  H_KV 2, S 128, block 64, three tokens, through the raw-query entry (13.36): 24 query vectors,
+//       so the prologue rotates one 16-vector H16 chunk on the Cube and the other 8 on the vector cores; the
+//       output is written in the rotated basis, then un-rotated and gated unsplit, then over two splits
 //
 // Each fused output is hashed (FNV-1a over its half bit patterns) against a golden, and its cosine against
 // exact fp32 attention must not regress. The goldens are the bit-exact reference: the barriered A/B instance
@@ -84,6 +87,15 @@ constexpr tqh::FusedSplitPolicy kContextOnly = tqh::FusedSplitPolicy::kContextOn
 // The writer's scales are float RMS values of vectors that went through fp16 and back through the rotation;
 // the host's are double RMS values of the vectors before either.
 constexpr double kWrittenScaleTolerance = 2e-3;
+constexpr int64_t kBatchContext = 128;
+constexpr int64_t kBatchTokens = 3;
+constexpr uint32_t kBatchCubeChunk = 16;
+// rotate_q rotates three tokens on the vector cores, which is bit-exact with the CPU reference; the Cube chunk
+// reassociates its first four butterfly stages (test_sim_950pr_turboquant_rotate_q's bound).
+constexpr double kCubeRotationTolerance = 1e-5;
+// The in-launch output stage against the same stage applied on the host to the rotated-basis launch: they
+// differ by that launch's fp16 cast before the un-rotation, far below a wrong transform or gate.
+constexpr double kOutputStageAgreementCosine = 0.99999;
 
 struct FusedCase {
   const char* tag;
@@ -103,6 +115,13 @@ tqh::FusedShape Shape(int64_t num_heads, int64_t context_len, bool kernel_writer
   shape.block_size = kBlockSize;
   shape.context_len = context_len;
   shape.kernel_writer = kernel_writer;
+  return shape;
+}
+
+tqh::FusedShape GatedBatchShape() {
+  tqh::FusedShape shape = Shape(kWideGroupHeads, kBatchContext);
+  shape.batch = kBatchTokens;
+  shape.gated = true;
   return shape;
 }
 
@@ -127,17 +146,23 @@ const FusedCase kCaseF = {"(f)", Shape(kNarrowGroupHeads, kSingleTileContext, fa
 // path rotate_q takes for four vectors, so nothing downstream of the query may move.
 const FusedCase kCaseG = {"(g)", kCaseC.shape, kCaseC.plan_aiv, kCaseC.split_policy, kCaseC.recorded_cosine,
                           kCaseC.golden};
+// Recorded 2026-09-17 on the same camodel from 2d516f529 plus the output stage (TURBOQUANT_TESTS.md 13.36). The
+// gated split shares the unsplit golden: the reduction's output stage is the fused path's, bit for bit.
+const tqh::FusedShape kBatchShape = GatedBatchShape();
+const FusedCase kCaseH = {"(h)", kBatchShape, 0, kContextOnly, 0.999510, 0x964ba5db49bdfb2dull};
+const FusedCase kCaseHGated = {"(h) gated", kBatchShape, 0, kContextOnly, 0.999507, 0x80ddb42451590ba1ull};
+const FusedCase kCaseHGatedSplit = {"(h) gated split", kBatchShape, 0, kFillBlocks, 0.999507, 0x80ddb42451590ba1ull};
 
 void PrintShape(const FusedCase& fused_case, int64_t aiv_num, bool queried) {
   const tqh::FusedShape& shape = fused_case.shape;
-  std::printf("[ fused ] %s kv4fp8 H_Q=%lld H_KV=%lld D=%lld block=%lld S=%lld aiv=%lld%s plan_aiv=%lld %s%s\n",
-              fused_case.tag, static_cast<long long>(shape.num_heads), static_cast<long long>(shape.num_kv_heads),
-              static_cast<long long>(shape.head_size), static_cast<long long>(shape.block_size),
-              static_cast<long long>(shape.context_len), static_cast<long long>(aiv_num),
-              queried ? "" : " (fallback core count)",
+  std::printf("[ fused ] %s kv4fp8 B=%lld H_Q=%lld H_KV=%lld D=%lld block=%lld S=%lld aiv=%lld%s plan_aiv=%lld %s%s%s\n",
+              fused_case.tag, static_cast<long long>(shape.batch), static_cast<long long>(shape.num_heads),
+              static_cast<long long>(shape.num_kv_heads), static_cast<long long>(shape.head_size),
+              static_cast<long long>(shape.block_size), static_cast<long long>(shape.context_len),
+              static_cast<long long>(aiv_num), queried ? "" : " (fallback core count)",
               static_cast<long long>(fused_case.plan_aiv > 0 ? fused_case.plan_aiv : aiv_num),
               fused_case.split_policy == kFillBlocks ? "fill-blocks" : "context-only",
-              shape.kernel_writer ? " kernel-writer" : "");
+              shape.kernel_writer ? " kernel-writer" : "", shape.gated ? " gated" : "");
 }
 
 void PrintRun(const char* tag, const char* label, const tqh::FusedRun& run, const std::vector<float>& reference) {
@@ -148,15 +173,17 @@ void PrintRun(const char* tag, const char* label, const tqh::FusedRun& run, cons
               static_cast<unsigned long long>(run.fnv1a), tqh::FusedCosine(run.output, reference), run.host_s);
 }
 
-// Runs a case through the fused kernel (the raw-query entry when raw_query) and checks what every case shares.
-// Returns the fused run.
+// Runs a case through the fused kernel (the raw-query entry, with output_stage, when raw_query) and checks what
+// every case shares. Returns the fused run.
 tqh::FusedRun RunCase(tqh::FusedCubeScenario* scenario, const FusedCase& fused_case, LaunchWatchdog* watchdog,
-                      const std::vector<float>& reference, bool raw_query = false) {
+                      const std::vector<float>& reference, bool raw_query = false,
+                      uint32_t output_stage = tqh::kRotatedBasis) {
   const tqh::FusedDecodeGrid grid = scenario->Plan(fused_case.plan_aiv, fused_case.split_policy);
   const std::string tag(fused_case.tag);
 
   watchdog->Arm(tag + (raw_query ? " turboquant_mm_fused_decode_raw_query_impl" : " turboquant_mm_fused_decode_impl"));
-  const tqh::FusedRun fused = raw_query ? scenario->RunFusedRawQuery(grid) : scenario->RunFused(grid);
+  const tqh::FusedRun fused =
+      raw_query ? scenario->RunFusedRawQuery(grid, output_stage) : scenario->RunFused(grid);
   watchdog->Disarm();
   PrintRun(fused_case.tag, "fused", fused, reference);
 
@@ -302,6 +329,50 @@ TEST_F(TurboQuantFusedDecode, RotatesARawQueryOnceAheadOfItsSplits) {
   EXPECT_EQ(fused.fused_context_limit, 0u) << "(g) must reduce its splits in the launch";
   EXPECT_EQ(fused.prologue_mismatches, 0u) << "the in-launch rotation differs from rotate_q's";
   ExpectNoExceptionDumps(kCaseG.tag);
+}
+
+TEST_F(TurboQuantFusedDecode, UnrotatesAndGatesARawQueryBatch) {
+  PrintShape(kCaseH, aiv_num_, queried_);
+  PrintShape(kCaseHGatedSplit, aiv_num_, queried_);
+  watchdog_.Arm("(h) scenario setup and query rotation");
+  tqh::FusedCubeScenario scenario(kCaseH.shape, stream_, aiv_num_);
+  watchdog_.Disarm();
+
+  const tqh::FusedDecodeGrid unsplit_grid = scenario.Plan(kCaseH.plan_aiv, kCaseH.split_policy);
+  std::printf("[ fused ] (h) prologue: %lld vectors, %u per block over %u blocks, Cube chunk %u\n",
+              static_cast<long long>(kBatchTokens * kWideGroupHeads), unsplit_grid.prologue_vectors_per_block,
+              unsplit_grid.block_dim, unsplit_grid.prologue_cube_chunk_vectors);
+  ASSERT_EQ(unsplit_grid.prologue_cube_chunk_vectors, kBatchCubeChunk) << "(h) must rotate a chunk on the Cube";
+  ASSERT_NE((kBatchTokens * kWideGroupHeads) % kBatchCubeChunk, 0) << "(h) must leave a remainder for the vector cores";
+
+  const std::vector<float> rotated_reference = scenario.Reference();
+  const std::vector<float> model_reference = scenario.ModelBasis(rotated_reference);
+
+  const tqh::FusedRun rotated = RunCase(&scenario, kCaseH, &watchdog_, rotated_reference, true, tqh::kRotatedBasis);
+  std::printf("[ fused ] (h) in-launch rotation: %zu of %lld fp32 words differ from rotate_q, max |err| %.3e\n",
+              rotated.prologue_mismatches,
+              static_cast<long long>(kBatchTokens * kWideGroupHeads * kHeadSize), rotated.prologue_max_abs);
+  EXPECT_LT(rotated.prologue_max_abs, kCubeRotationTolerance) << "the in-launch rotation differs from rotate_q's";
+
+  const tqh::FusedRun gated =
+      RunCase(&scenario, kCaseHGated, &watchdog_, model_reference, true, tqh::kGatedOutput);
+  const tqh::FusedRun gated_split =
+      RunCase(&scenario, kCaseHGatedSplit, &watchdog_, model_reference, true, tqh::kGatedOutput);
+
+  const std::vector<float> host_stage = scenario.ModelBasis(rotated.output);
+  const double stage_agreement = tqh::FusedCosine(gated.output, host_stage);
+  const double split_agreement = tqh::FusedCosine(gated_split.output, gated.output);
+  std::printf("[ fused ] (h) output stage vs host stage on the rotated launch: cos %.9f; gated split vs unsplit: "
+              "cos %.9f; cos vs fp32 %.6f rotated, %.6f gated, %.6f gated split\n",
+              stage_agreement, split_agreement, tqh::FusedCosine(rotated.output, rotated_reference),
+              tqh::FusedCosine(gated.output, model_reference), tqh::FusedCosine(gated_split.output, model_reference));
+
+  EXPECT_EQ(rotated.num_splits, 1) << "(h) must write the rotated basis from an unsplit launch";
+  EXPECT_EQ(gated.num_splits, 1) << "(h) gated must finish its heads on the fused path";
+  EXPECT_GT(gated_split.num_splits, 1) << "(h) gated split must finish its heads in the in-launch reduction";
+  EXPECT_GE(stage_agreement, kOutputStageAgreementCosine) << "the in-launch un-rotation and gate are wrong";
+  EXPECT_GE(split_agreement, kSplitAgreementCosine) << "the reduction's output stage differs from the fused path's";
+  ExpectNoExceptionDumps(kCaseH.tag);
 }
 
 }

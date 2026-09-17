@@ -97,6 +97,26 @@ enum class RotateQPrecision : uint32_t {
     kHiLoResidual = 1,
 };
 
+// The raw-query Cube decode's query prologue. A block whose share holds kQueryBasisMinCubeVectors or more
+// query vectors rotates them kQueryBasisCubeVectors at a time: one single-pass fp16 H16 Mmad per chunk, split
+// between the two vector subcores by a dual-destination Fixpipe. A share below that, and the remainder of
+// one, rotate on the vector cores alone, so no Mmad carries padding rows that would idle a subcore.
+constexpr uint32_t kQueryBasisCubeVectors = 16;
+constexpr uint32_t kQueryBasisMinCubeVectors = 16;
+
+// What the raw-query Cube decode writes to its output, chosen per launch:
+//   kRotatedBasis  softmax(q k^T) Pi v, for an o_proj with Pi folded into it offline
+//   kUnrotated     Pi applied once more to the fp32 accumulator before the output cast (Pi^2 = I)
+//   kGated         kUnrotated, then divided by 1 + exp(-gate): an attn_output_gate layer's sigmoid gate
+enum class TurboQuantOutputStage : uint32_t {
+    kRotatedBasis = 0,
+    kUnrotated = 1,
+    kGated = 2,
+};
+
+// Gate logits are clamped from below before exp(-gate), so the denominator stays finite in fp32.
+constexpr float kGateLogitFloor = -80.0f;
+
 }
 }
 

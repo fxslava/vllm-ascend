@@ -29,6 +29,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from tests.ut.attention.turboquant_cpu_ops import TURBOQUANT_CUBE_OP_SCHEMAS, turboquant_cube_meta_ops
 from tests.ut.base import TestBase
 from vllm_ascend.attention import turboquant_rotation as rotation_module
 from vllm_ascend.attention import turboquant_v1 as tq_module
@@ -1066,6 +1067,303 @@ class TestBackendContract(TestBase):
         metadata = MagicMock(attn_state=AscendAttentionState.ChunkedPrefill)
         with self.assertRaises(NotImplementedError):
             impl.forward_impl(None, None, None, (), metadata, None)
+
+
+CUBE_WORKSPACE_FLOATS = 2048
+
+
+def _cube_ops(stage_output: torch.Tensor | None = None) -> MagicMock:
+    """Operators with the Cube path registered; the decode writes ``stage_output`` if given."""
+    ops = _ops_mock()
+    ops.npu_turboquant_cube_workspace_size.return_value = CUBE_WORKSPACE_FLOATS
+    if stage_output is not None:
+
+        def cube_decode(*args):
+            args[-1].copy_(stage_output)
+
+        ops.npu_turboquant_cube_decode.side_effect = cube_decode
+    return ops
+
+
+class TestCubeDecode(TestBase):
+    """The kv4fp8 Cube decode: one launch per step that rotates the raw query and hands o_proj its basis."""
+
+    def _make_impl(self, folded: bool = False) -> AscendTurboQuantAttentionBackendImpl:
+        impl = AscendTurboQuantAttentionBackendImpl.__new__(AscendTurboQuantAttentionBackendImpl)
+        impl.head_size = HEAD_SIZE
+        impl.num_heads = 8
+        impl.num_kv_heads = 2
+        impl.scale = HEAD_SIZE**-0.5
+        impl.attn_type = "decoder"
+        impl.kv_sharing_target_layer_name = None
+        impl.is_kv_producer = False
+        impl.key_cache = torch.zeros(1, DECODE_BLOCK_SIZE, 2, HEAD_SIZE // TURBOQUANT_PACK_FACTOR, dtype=torch.int8)
+        impl.value_cache = torch.zeros_like(impl.key_cache)
+        impl.scale_cache = torch.zeros(1, DECODE_BLOCK_SIZE, turboquant_scale_slot(2))
+        impl._pi_signs = None
+        impl.decode_workspace = None
+        impl._workspace_floats = {}
+        impl.rotated_query = None
+        impl._hadamard16 = None
+        impl.output_rotation_folded = folded
+        impl.cube_decode = True
+        return impl
+
+    def _decode(self, impl, ops, num_tokens=3, gate=None):
+        query = torch.randn(num_tokens, impl.num_heads, HEAD_SIZE)
+        output = torch.zeros(num_tokens, impl.num_heads, HEAD_SIZE)
+        metadata = MagicMock(
+            attn_state=AscendAttentionState.DecodeOnly,
+            block_tables=torch.zeros(num_tokens, 2, dtype=torch.int64),
+            seq_lens=torch.ones(num_tokens, dtype=torch.int64),
+        )
+        with patch.object(torch.ops, "_C_ascend", ops, create=True):
+            result = impl.forward_impl(query, None, None, (), metadata, output, gate)
+        return query, output, result
+
+    def test_a_decode_step_is_one_launch_over_the_raw_query(self):
+        impl = self._make_impl()
+        ops = _cube_ops()
+        query, output, _ = self._decode(impl, ops)
+
+        ops.npu_turboquant_cube_decode.assert_called_once()
+        ops.npu_turboquant_rotate_q.assert_not_called()
+        ops.npu_turboquant_paged_attention.assert_not_called()
+        args = ops.npu_turboquant_cube_decode.call_args.args
+        # query, gate, pi_signs, codec_tables, hadamard16, k_cache, v_cache, scale_cache, block_tables,
+        # context_lens, workspace, query_rot, num_kv_heads, num_heads, scale, output_stage, out.
+        self.assertEqual(len(args), 17)
+        # The raw query, not a rotation of it: the launch rotates it itself.
+        torch.testing.assert_close(args[0], query)
+        self.assertIsNone(args[1])
+        torch.testing.assert_close(args[2], turboquant_pi_signs(HEAD_SIZE, CPU))
+        torch.testing.assert_close(args[3], turboquant_codec_tables(HEAD_SIZE, 1, CPU))
+        torch.testing.assert_close(args[4], turboquant_hadamard16(CPU))
+        self.assertIs(args[5], impl.key_cache)
+        self.assertIs(args[6], impl.value_cache)
+        self.assertEqual(args[8].dtype, torch.int32)
+        self.assertEqual(args[9].dtype, torch.int32)
+        self.assertIs(args[10], impl.decode_workspace)
+        # The in-launch rotation lands in the same persistent buffer the separate rotation used.
+        self.assertEqual(args[11].dtype, torch.float32)
+        self.assertEqual(args[11].data_ptr(), impl.rotated_query.data_ptr())
+        self.assertEqual(args[12], impl.num_kv_heads)
+        self.assertEqual(args[13], impl.num_heads)
+        self.assertEqual(args[15], int(tq_module.TurboQuantOutputStage.UNROTATED))
+        self.assertEqual(args[16].data_ptr(), output.data_ptr())
+
+    def test_the_workspace_is_sized_by_the_cube_planner(self):
+        impl = self._make_impl()
+        ops = _cube_ops()
+        self._decode(impl, ops, num_tokens=4)
+        ops.npu_turboquant_workspace_size.assert_not_called()
+        ops.npu_turboquant_cube_workspace_size.assert_called_once_with(
+            4, impl.num_heads, impl.num_kv_heads, impl.head_size, 2, DECODE_BLOCK_SIZE
+        )
+        self.assertEqual(impl.decode_workspace.numel(), CUBE_WORKSPACE_FLOATS)
+
+    def test_a_folded_layer_keeps_the_rotated_basis(self):
+        impl = self._make_impl(folded=True)
+        ops = _cube_ops()
+        self._decode(impl, ops)
+        self.assertEqual(
+            ops.npu_turboquant_cube_decode.call_args.args[15], int(tq_module.TurboQuantOutputStage.ROTATED_BASIS)
+        )
+        self.assertFalse(impl.fuses_output_gate)
+
+    def test_a_gate_is_applied_in_the_launch_and_nowhere_else(self):
+        impl = self._make_impl()
+        written = torch.randn(2, impl.num_heads, HEAD_SIZE)
+        gate = torch.randn(2, impl.num_heads, HEAD_SIZE)
+        ops = _cube_ops(stage_output=written)
+        _, output, result = self._decode(impl, ops, num_tokens=2, gate=gate)
+
+        args = ops.npu_turboquant_cube_decode.call_args.args
+        self.assertEqual(args[15], int(tq_module.TurboQuantOutputStage.GATED))
+        torch.testing.assert_close(args[1], gate)
+        # What the launch wrote is what o_proj reads: the host neither re-rotates nor re-gates it.
+        torch.testing.assert_close(output, written)
+        self.assertIs(result, output)
+        self.assertTrue(impl.fuses_output_gate)
+
+    def test_a_folded_layer_refuses_a_gate(self):
+        impl = self._make_impl(folded=True)
+        with self.assertRaises(ValueError):
+            self._decode(impl, _cube_ops(), gate=torch.randn(3, impl.num_heads, HEAD_SIZE))
+
+    def test_the_writer_follows_the_decode(self):
+        impl = self._make_impl()
+        impl.key_cache = None
+        key = torch.randn(4, impl.num_kv_heads, HEAD_SIZE)
+        cache = torch.zeros(
+            3, DECODE_BLOCK_SIZE, impl.num_kv_heads, HEAD_SIZE // TURBOQUANT_PACK_FACTOR, dtype=torch.int8
+        )
+        metadata = MagicMock(num_actual_tokens=4, slot_mapping=torch.arange(4, dtype=torch.int64))
+        ops = _cube_ops()
+        with patch.object(torch.ops, "_C_ascend", ops, create=True):
+            impl.reshape_and_cache(None, key, torch.randn_like(key), (cache, cache), metadata, None)
+
+        ops.npu_turboquant_reshape_and_cache.assert_not_called()
+        ops.npu_turboquant_cube_reshape_and_cache.assert_called_once()
+        args = ops.npu_turboquant_cube_reshape_and_cache.call_args.args
+        self.assertEqual(len(args), 8)
+        torch.testing.assert_close(args[0], key)
+        torch.testing.assert_close(args[7], turboquant_codec_tables(HEAD_SIZE, 1, CPU))
+
+    def test_a_block_that_is_not_whole_cube_tiles_is_refused(self):
+        impl = self._make_impl()
+        impl.scale_cache = None
+        cache = torch.zeros(3, 16, 2, HEAD_SIZE // TURBOQUANT_PACK_FACTOR, dtype=torch.int8)
+        with self.assertRaises(ValueError):
+            impl._ensure_scale_cache((cache, cache))
+
+    def test_the_aiv_decode_applies_a_handed_gate_in_torch(self):
+        impl = self._make_impl()
+        impl.cube_decode = False
+        rotated = torch.randn(2, impl.num_heads, HEAD_SIZE)
+        gate = torch.randn(2, impl.num_heads, HEAD_SIZE)
+        _, output, _ = self._decode(impl, _numeric_ops(rotated), num_tokens=2, gate=gate)
+        expected = apply_pi(rotated, turboquant_pi_signs(HEAD_SIZE, CPU)) * torch.sigmoid(gate)
+        torch.testing.assert_close(output, expected, atol=1e-5, rtol=0)
+        self.assertFalse(impl.fuses_output_gate)
+
+    def test_a_prefill_applies_a_handed_gate_in_torch(self):
+        impl = self._make_impl()
+        num_tokens = 5
+        attended = torch.randn(num_tokens, impl.num_heads, HEAD_SIZE)
+        gate = torch.randn(num_tokens, impl.num_heads, HEAD_SIZE)
+        output = torch.zeros(num_tokens, impl.num_heads, HEAD_SIZE)
+        metadata = MagicMock(
+            attn_state=AscendAttentionState.PrefillNoCache, actual_seq_lengths_q=[num_tokens], attn_mask=None
+        )
+        fia = MagicMock(return_value=(attended, None))
+        with (
+            patch.object(torch.ops, "_C_ascend", _cube_ops(), create=True),
+            patch.object(tq_module.torch_npu, "npu_fused_infer_attention_score", fia, create=True),
+        ):
+            impl.forward_impl(
+                torch.randn(num_tokens, impl.num_heads, HEAD_SIZE),
+                torch.randn(num_tokens, 2, HEAD_SIZE),
+                torch.randn(num_tokens, 2, HEAD_SIZE),
+                (),
+                metadata,
+                output,
+                gate,
+            )
+        torch.testing.assert_close(output, attended * torch.sigmoid(gate))
+
+    def test_the_cube_path_needs_the_switch_the_build_and_float16(self):
+        cube_ops = SimpleNamespace(npu_turboquant_cube_decode=object())
+        aiv_ops = SimpleNamespace()
+        cases = (
+            ("1", cube_ops, torch.float16, True),
+            ("0", cube_ops, torch.float16, False),
+            ("1", aiv_ops, torch.float16, False),
+            ("1", cube_ops, torch.bfloat16, False),
+            ("1", cube_ops, None, False),
+        )
+        for switch, ops, dtype, expected in cases:
+            with (
+                patch.dict("os.environ", {"VLLM_ASCEND_TURBOQUANT_CUBE_DECODE": switch}),
+                patch.object(torch.ops, "_C_ascend", ops, create=True),
+            ):
+                self.assertEqual(
+                    tq_module.turboquant_cube_decode_selected(dtype),
+                    expected,
+                    f"switch {switch} dtype {dtype} ops {ops}",
+                )
+
+    def test_the_output_stages_match_the_kernel_layout(self):
+        # turboquant_layout.h: TurboQuantOutputStage.
+        self.assertEqual(int(tq_module.TurboQuantOutputStage.ROTATED_BASIS), 0)
+        self.assertEqual(int(tq_module.TurboQuantOutputStage.UNROTATED), 1)
+        self.assertEqual(int(tq_module.TurboQuantOutputStage.GATED), 2)
+
+
+META = torch.device("meta")
+
+
+class TestCubeOpsOnMeta(TestBase):
+    """The backend's Cube calls through the real dispatcher against the pinned schemas, on meta tensors only.
+
+    TestCubeDecode replaces ``torch.ops._C_ascend`` with a mock, which accepts any argument list. Here every call
+    has to bind to the schema in TURBOQUANT_CUBE_OP_SCHEMAS (pinned to csrc/torch_binding.cpp) and pass the meta
+    kernels' shape checks. Nothing is computed: the launch's numbers are the camodel's to verify.
+    """
+
+    NUM_HEADS = 8
+    NUM_KV_HEADS = 2
+    NUM_BLOCKS = 3
+
+    def _make_impl(self, folded: bool = False) -> AscendTurboQuantAttentionBackendImpl:
+        impl = AscendTurboQuantAttentionBackendImpl.__new__(AscendTurboQuantAttentionBackendImpl)
+        impl.head_size = HEAD_SIZE
+        impl.num_heads = self.NUM_HEADS
+        impl.num_kv_heads = self.NUM_KV_HEADS
+        impl.scale = HEAD_SIZE**-0.5
+        impl.attn_type = "decoder"
+        impl.kv_sharing_target_layer_name = None
+        impl.is_kv_producer = False
+        cache_shape = (self.NUM_BLOCKS, DECODE_BLOCK_SIZE, self.NUM_KV_HEADS, HEAD_SIZE // TURBOQUANT_PACK_FACTOR)
+        impl.key_cache = torch.empty(cache_shape, dtype=torch.int8, device=META)
+        impl.value_cache = torch.empty(cache_shape, dtype=torch.int8, device=META)
+        impl.scale_cache = torch.empty(
+            self.NUM_BLOCKS, DECODE_BLOCK_SIZE, turboquant_scale_slot(self.NUM_KV_HEADS), device=META
+        )
+        impl._pi_signs = None
+        impl.decode_workspace = None
+        impl._workspace_floats = {}
+        impl.rotated_query = None
+        impl._hadamard16 = None
+        impl.output_rotation_folded = folded
+        impl.cube_decode = True
+        return impl
+
+    def _decode(self, impl, num_tokens: int, gate: torch.Tensor | None = None) -> torch.Tensor:
+        query = torch.empty(num_tokens, impl.num_heads, HEAD_SIZE, dtype=torch.float16, device=META)
+        output = torch.empty_like(query)
+        metadata = MagicMock(
+            attn_state=AscendAttentionState.DecodeOnly,
+            block_tables=torch.empty(num_tokens, 2, dtype=torch.int64, device=META),
+            seq_lens=torch.empty(num_tokens, dtype=torch.int64, device=META),
+        )
+        with turboquant_cube_meta_ops():
+            return impl.forward_impl(query, None, None, (), metadata, output, gate)
+
+    def test_a_decode_step_binds_to_the_pinned_schema_in_every_stage(self):
+        for folded, gated in ((True, False), (False, False), (False, True)):
+            with self.subTest(folded=folded, gated=gated):
+                impl = self._make_impl(folded=folded)
+                gate = torch.empty(4, impl.num_heads, HEAD_SIZE, dtype=torch.float16, device=META) if gated else None
+                result = self._decode(impl, num_tokens=4, gate=gate)
+                self.assertEqual(result.shape, (4, impl.num_heads, HEAD_SIZE))
+                self.assertEqual(result.device, META)
+                self.assertEqual(impl.rotated_query.dtype, torch.float32)
+
+    def test_a_malformed_call_is_refused_without_a_cpu_kernel(self):
+        impl = self._make_impl()
+        # A cache whose kv head count is not the layer's.
+        impl.key_cache = torch.empty(
+            self.NUM_BLOCKS, DECODE_BLOCK_SIZE, 3, HEAD_SIZE // TURBOQUANT_PACK_FACTOR, dtype=torch.int8, device=META
+        )
+        impl.value_cache = impl.key_cache
+        with self.assertRaisesRegex(RuntimeError, "cache heads"):
+            self._decode(impl, num_tokens=2)
+
+    def test_the_writer_binds_to_the_pinned_schema(self):
+        impl = self._make_impl()
+        key = torch.empty(4, self.NUM_KV_HEADS, HEAD_SIZE, dtype=torch.float16, device=META)
+        metadata = MagicMock(num_actual_tokens=4, slot_mapping=torch.empty(4, dtype=torch.int64, device=META))
+        with turboquant_cube_meta_ops(), patch.object(tq_module, "notify_kv_cache_written"):
+            impl.reshape_and_cache(None, key, torch.empty_like(key), (impl.key_cache, impl.value_cache), metadata, None)
+
+    def test_the_stubs_leave_nothing_behind(self):
+        before = {name: hasattr(torch.ops._C_ascend, name) for name in TURBOQUANT_CUBE_OP_SCHEMAS}
+        with turboquant_cube_meta_ops():
+            self.assertTrue(all(hasattr(torch.ops._C_ascend, name) for name in TURBOQUANT_CUBE_OP_SCHEMAS))
+        after = {name: hasattr(torch.ops._C_ascend, name) for name in TURBOQUANT_CUBE_OP_SCHEMAS}
+        self.assertEqual(before, after)
+
 
 class TestOutputProjectionFold(TestBase):
     """W_o' = W_o (I_H (x) Pi): the one weight rewrite TurboQuant does."""

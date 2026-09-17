@@ -34,6 +34,7 @@ from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
+from vllm_ascend.ops.turboquant_attention import turboquant_fuses_output_gate, turboquant_gated_attention_forward
 from vllm_ascend.utils import is_310p
 
 
@@ -102,11 +103,14 @@ class AscendQwen3NextAttention(Qwen3NextAttention):
 
             q, k = self.rotary_emb(positions, q, k)
 
-        attn_output = self.attn(q, k, v)
-
-        if self.attn_output_gate:
-            gate = torch.sigmoid(gate)
-            attn_output = attn_output * gate
+        if self.attn_output_gate and turboquant_fuses_output_gate(self.attn):
+            # The TurboQuant Cube decode applies sigmoid(gate) inside its launch.
+            attn_output = turboquant_gated_attention_forward(self.attn, q, k, v, gate)
+        else:
+            attn_output = self.attn(q, k, v)
+            if self.attn_output_gate:
+                gate = torch.sigmoid(gate)
+                attn_output = attn_output * gate
 
         out, _ = self.o_proj(attn_output)
         if output is not None:

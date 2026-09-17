@@ -4147,3 +4147,99 @@ CSV's `num_splits`).
 - No silicon number exists for either tier or either rotation mode.
 - The msprof trace harness plans with the new policy but has no rotation mode.
 - `test_sim_950pr_turboquant_multimode` (contexts <= 2048, so latency tier only) was built, not run.
+
+### 13.36 Downstream fusion: un-rotation and output gate in the raw-query launch, and the Python wiring (2026-09-17)
+
+**What moved into the launch.** The raw-query Cube decode (`PRE_ROTATED = false`, 13.33) now changes basis at
+both ends. `cube/turboquant_query_basis.h` (`TurboQuantQueryBasis`, which replaces `TurboQuantQueryPrologue`)
+holds both stages:
+- **`Rotate()`, the prologue.** It rotates Pi q = D H D q once per (token, head) before the task loop. A block
+  whose share holds at least `kQueryBasisMinCubeVectors` = 16 vectors rotates whole 16-vector chunks on the
+  Cube. The AIV subcores sign-flip and stage their halves into one L1 tile, the AIC multiplies it by H16
+  (butterfly strides 1-8) and dual-destination Fixpipes the halves back, and each subcore runs the strides from
+  16 up. The remainder, and any share below 16, rotates on the vector cores with `ApplyPi`, as before. The host
+  plans the chunk with `QueryBasisCubeChunk` into `FusedDecodeGrid::prologue_cube_chunk_vectors`.
+- **`FinishHeads()`, the output stage.** It runs on every normalised fp32 head row before the output cast, chosen
+  per launch by `TurboQuantOutputStage`: `kRotatedBasis` (0, folded W_o, unchanged), `kUnrotated` (1, Pi once
+  more) or `kGated` (2, un-rotated, then divided by 1 + exp(-gate), with the gate logit floored at
+  `kGateLogitFloor` = -80). The vector service's fused path and the Split-K reducer both call the finisher, so a
+  split decode and an unsplit one share the stage.
+
+The raw-query entry takes two new pointers, `h16` and `gate`, and two new sizes, `prologueCubeChunkVectors` and
+`outputStage`. For an unfolded layer, a decode step is now one launch: no rotate_q before it, no rotate_q(o),
+copy_, sigmoid or mul after it.
+
+**Wheel and Python.**
+- **Root `CMakeLists.txt`.** For `ascend950` SOCs it adds `turboquant_fused_decode.cpp` to the shipped
+  `vllm_ascend_turboquant` library and defines `VLLM_ENABLE_TURBOQUANT_CUBE`. The kv3fp4 / kv5fp8 modes and the
+  fp8 GEMM probe compile only under `VLLM_ASCEND_TQ_TEST_KERNELS`, which only `csrc/tests` sets.
+- **Operators** (`torch_binding.cpp`, adapter, Meta no-ops): `npu_turboquant_cube_reshape_and_cache`,
+  `npu_turboquant_cube_decode` and `npu_turboquant_cube_workspace_size`.
+- **Backend.** `turboquant_v1.py` selects the Cube path when `VLLM_ASCEND_TURBOQUANT_CUBE_DECODE` (default 1), the
+  build and float16 all allow it. The writer follows the decode, because the two layouts differ.
+- **Gated layers.** `vllm::turboquant_gated_attention` (`vllm_ascend/ops/turboquant_attention.py`, a graph
+  splitting op with a fake impl) hands a Qwen3.5 gated layer's raw gate to the impl. `patch_qwen3_5.py` then
+  skips the model's own sigmoid and multiply.
+
+**Tests.**
+- **Host tiling.** `FusedDecodePrologueRoutesWholeChunksToTheCube` pins (h)'s grids. 12 of 12 pass.
+- **Fused case (h).** `UnrotatesAndGatesARawQueryBatch`: H_Q 8, H_KV 2, D 256, S 128, block 64, B = 3, raw-query
+  entry. The 24 query vectors put one 16-vector chunk on the Cube and 8 on the vector cores. The case runs three
+  launches over one cache:
+  1. rotated basis, unsplit;
+  2. gated, unsplit;
+  3. gated, filled to 2 splits.
+
+  It gates on four checks. The prologue must match rotate_q within 1e-5. The kernel's output stage must agree
+  with the host applying Pi and the gate to launch 1 at cos >= 0.99999. The split and unsplit gated outputs must
+  agree at cos >= 0.999999. Goldens and cosines are pinned.
+- **Python.**
+  - `TURBOQUANT_CUBE_OP_SCHEMAS` pins the three schemas against `torch_binding.cpp`.
+  - Deliberately, there is no CPU kernel for them. `turboquant_cube_meta_ops()` defines the schemas with shape-only
+    `Meta` kernels, and `TestCubeOpsOnMeta` sends the backend's decode (all three stages) and cache write through the
+    real dispatcher on meta tensors.
+  - `TestCubeDecode` (mocked ops) and `tests/ut/ops/test_turboquant_attention.py` cover the call contract and the
+    gated op.
+- **Bench.**
+  - The `-FusedQ` path passes `h16` and the stage (`kUnrotated` unless W_o is folded). Its T_rot_o is an in-launch
+    0.00, and its decode is one launch.
+  - The rotation agreement gate now compares the model-basis outputs.
+  - Eff GB/s and the decode CSV's `e2e_bytes` use `dec_fused_q_e2e` on `-FusedQ` rows. Before this, those rows
+    divided by the separate path's bytes.
+
+**Verification.**
+- **Tiers.** Host, sim and npu built clean under `-Werror` (0 diagnostic lines). The npu tier was rebuilt after the
+  bench fix with its 42 targets unchanged.
+- **Adapter.** The adapter, `torch_binding.cpp` and `torch_binding_meta.cpp` pass a syntax check against the vendor
+  image's torch / torch_npu headers, with and without `VLLM_ENABLE_TURBOQUANT_CUBE`.
+- **Python** (`quay.io/ascend/vllm-ascend:v0.26.0rc1-a5`). The five TurboQuant files plus
+  `tests/ut/ops/test_turboquant_attention.py` give 128 passed. `tests/ut/{attention,ops,patch}`, `test_platform`,
+  `test_utils` and `test_envs` give 201 failed / 841 passed, against 201 / 822 at HEAD, with an identical set of
+  failing test ids. Both sides share two collection errors (`test_select_experts.py`, `test_comm_utils.py`).
+
+Camodel, one process per case (`build/nz_runs.sh dualh /workspace/build_sim ah`):
+
+| case | K / blocks / heads per task / limit | golden | cos vs fp32 | notes |
+|---|---|---|---|---|
+| (a) | 1 / 2 / 2 / 4096 | `0x6176461416358ec1` | 0.999407 | 85 s, 22,697 ticks |
+| (b) / (c) | 1 / 2 / 2 / 4096, 4 / 8 / 2 / 0 | `0x470dad36e6708da5` / `0xda6a2c77e20ff4a1` | 0.999400 / 0.999400 | 270 s, 68,369 ticks |
+| (d) | 1 / 2 / 4 / 4096 | `0xcc1fcdfed39b48e5` | 0.999517 | 110 s, 29,310 ticks |
+| (e) | 1 / 2 / 2 / 4096 | `0x9ffe02efde1506cf` | 0.999576 | written cache 0 of 131,072 bytes differ; 491 s, 52,935 ticks |
+| (f) | 1 / 2 / 2 / 4096 | `0xedc60ea1714295f1` | 0.999543 | 75 s, 20,587 ticks |
+| (g) | 4 / 8 / 2 / 0 | `0xda6a2c77e20ff4a1` | 0.999400 | in-launch rotation 0 of 1,024 words differ; 185 s, 43,604 ticks |
+| (h) rotated | 1 / 12 / 2 / 4096 | `0x964ba5db49bdfb2d` | 0.999510 | in-launch rotation 0 of 6,144 words differ (max err 0) |
+| (h) gated | 1 / 12 / 2 / 4096 | `0x80ddb42451590ba1` | 0.999507 | output stage vs host stage cos 0.999999957 |
+| (h) gated split | 2 / 24 / 2 / 0 | `0x80ddb42451590ba1` | 0.999507 | vs unsplit cos 1.000000000; (h) total 836 s, 151,183 ticks |
+
+(a)-(g) are unchanged from 13.35. Every run left 0 B of exception dumps. Tick counts are per process and include
+host time between launches (see the camodel run policy), so they are not per-launch spans. A clean sim
+rebuild with (h)'s goldens pinned (0 diagnostics, 37 targets unchanged) reproduced all three hashes and cosines
+(`build/final_sim_h.sh`, 770 s, 151,176 ticks, 0 B dumps).
+
+**Not covered.**
+- No silicon number exists for the one-launch step, or for the gate.
+- The wheel's own CMake path (`ascend950` SOC, `VLLM_ENABLE_TURBOQUANT_CUBE`) has not been built. Only the adapter
+  and binding sources were syntax-checked.
+- Raw-query output stages at D = 128, in bf16, and with a Cube chunk on more than one block.
+- The Python Cube path and `patch_qwen3_5.py`'s gated branch have not run on a device.
+- No camodel launch spans were taken with `build/nz_profile.py`.

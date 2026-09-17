@@ -80,6 +80,23 @@ ReshapeAndCacheGrid PlanReshapeAndCache(int64_t num_tokens, int64_t aiv_num)
     return grid;
 }
 
+int64_t QueryBasisCubeChunk(int64_t num_vectors, int64_t head_size)
+{
+    if (num_vectors < static_cast<int64_t>(kQueryBasisMinCubeVectors) || head_size < kRotateQTile) {
+        return 0;
+    }
+    int64_t chunk = static_cast<int64_t>(kQueryBasisCubeVectors);
+    while (chunk > 2 && chunk * head_size > static_cast<int64_t>(kRotateQMaxChunkElements)) {
+        chunk /= 2;
+    }
+    // Each subcore takes half a chunk, and a chunk's rows have to fill whole 16-row fractals.
+    const int64_t rows = chunk * head_size / kRotateQTile;
+    if (chunk * head_size > static_cast<int64_t>(kRotateQMaxChunkElements) || rows % kRotateQTile != 0) {
+        return 0;
+    }
+    return chunk;
+}
+
 bool DecodeNeedsReduction(int64_t num_splits, int64_t max_context_len, int64_t fused_context_limit)
 {
     return num_splits > 1 && max_context_len > fused_context_limit;
@@ -198,7 +215,16 @@ FusedDecodeGrid PlanFusedDecode(int64_t num_tokens, int64_t num_heads, int64_t n
     grid.num_tasks = tasks;
     grid.tasks_per_block = static_cast<uint32_t>(tasks_per_block);
     grid.block_dim = static_cast<uint32_t>(block_dim);
-    grid.prologue_vectors_per_block = static_cast<uint32_t>(CeilDiv64(num_tokens * num_heads, block_dim));
+    const int64_t query_vectors = num_tokens * num_heads;
+    const int64_t cube_chunk = QueryBasisCubeChunk(query_vectors, head_size);
+    if (cube_chunk > 0) {
+        // Whole chunks per block, so only the last share can hold a remainder for the vector cores.
+        grid.prologue_cube_chunk_vectors = static_cast<uint32_t>(cube_chunk);
+        grid.prologue_vectors_per_block =
+            static_cast<uint32_t>(cube_chunk * CeilDiv64(query_vectors, cube_chunk * block_dim));
+    } else {
+        grid.prologue_vectors_per_block = static_cast<uint32_t>(CeilDiv64(query_vectors, block_dim));
+    }
     if (num_splits > 1) {
         const int64_t reduce_tasks = num_tokens * num_heads;
         grid.reduce_tasks_per_block = static_cast<uint32_t>(CeilDiv64(reduce_tasks, block_dim));

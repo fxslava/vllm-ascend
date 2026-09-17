@@ -54,6 +54,7 @@ from vllm_ascend.utils import (
     enable_sp,
     TURBOQUANT_BLOCK_SIZE_MULTIPLE,
     TURBOQUANT_CACHE_DTYPE_PREFIX,
+    TURBOQUANT_GATED_ATTENTION_OP,
     TURBOQUANT_KV_CACHE_DTYPE,
     turboquant_enabled,
 )
@@ -651,6 +652,7 @@ class NPUPlatform(Platform):
                 [
                     "vllm::mla_forward",
                     "vllm::dsa_forward",
+                    TURBOQUANT_GATED_ATTENTION_OP,
                 ]
             )
             # TODO(2026/7/15): Delete the reduced gear after the new driver is released.

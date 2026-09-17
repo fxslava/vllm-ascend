@@ -82,15 +82,27 @@ endif()
 if(SOC_VERSION MATCHES "ascend910b.*|ascend910_93|ascend950")
     set(VLLM_ASCEND_BUILD_TURBOQUANT ON)
     message(STATUS "Hardware ${SOC_VERSION} detected: building TurboQuant KV cache kernels")
-    # Two sources, one library: a <<<>>> call site can only reach a kernel whose
+    # One library for every source: a <<<>>> call site can only reach a kernel whose
     # generated launcher is in the same ascendc_library, and the adapter launches
-    # both the fused paged-attention decode and the query rotation.
-    ascendc_library(vllm_ascend_turboquant SHARED
+    # the AIV paged-attention decode, the query rotation and, on 950, the Cube decode.
+    set(VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/op_kernel/turboquant_paged_attention.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/op_kernel/turboquant_rotate_q.cpp
     )
+    # The kv4fp8 Cube decode and its NZ-tiled cache writer use the arch35 Cube (fp8 Mmad,
+    # dual-destination Fixpipe), so they build for 950 alone.
+    if(SOC_VERSION MATCHES "ascend950")
+        set(VLLM_ASCEND_BUILD_TURBOQUANT_CUBE ON)
+        list(APPEND VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCES
+            ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/op_kernel/turboquant_fused_decode.cpp)
+        message(STATUS "Hardware ${SOC_VERSION} detected: building the TurboQuant Cube decode")
+    else()
+        set(VLLM_ASCEND_BUILD_TURBOQUANT_CUBE OFF)
+    endif()
+    ascendc_library(vllm_ascend_turboquant SHARED ${VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCES})
 else()
     set(VLLM_ASCEND_BUILD_TURBOQUANT OFF)
+    set(VLLM_ASCEND_BUILD_TURBOQUANT_CUBE OFF)
     message(STATUS "Hardware ${SOC_VERSION} detected: skip TurboQuant KV cache kernels")
 endif()
 
@@ -177,6 +189,10 @@ endif()
 
 if(VLLM_ASCEND_BUILD_TURBOQUANT)
     target_compile_definitions(vllm_ascend_C PRIVATE -DVLLM_ENABLE_TURBOQUANT)
+endif()
+
+if(VLLM_ASCEND_BUILD_TURBOQUANT_CUBE)
+    target_compile_definitions(vllm_ascend_C PRIVATE -DVLLM_ENABLE_TURBOQUANT_CUBE)
 endif()
 
 if(NOT (SOC_VERSION MATCHES "ascend310p.*|ascend950"))

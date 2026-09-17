@@ -98,13 +98,21 @@ struct FusedDecodeGrid {
     uint32_t tasks_per_block = 0;
     uint32_t reduce_tasks_per_block = 0;
     uint32_t heads_per_task = 0;
-    // The raw-query decode's prologue: query vectors (tokens x heads) each MIX block rotates.
+    // The raw-query decode's prologue: query vectors (tokens x heads) each MIX block rotates, and the Cube chunk
+    // they rotate in (QueryBasisCubeChunk; 0: the vector cores alone). With a chunk, every block's share is a
+    // whole number of chunks except the last non-empty one's, whose remainder the vector cores rotate.
     uint32_t prologue_vectors_per_block = 0;
+    uint32_t prologue_cube_chunk_vectors = 0;
     uint32_t fused_context_limit = kFusedContextLimit;
     int64_t num_splits = 1;
     int64_t num_tasks = 0;
     size_t workspace_floats = 0;
 };
+
+// The raw-query prologue's Cube chunk for num_vectors query vectors: kQueryBasisCubeVectors, halved until one
+// chunk fits kRotateQMaxChunkElements, once there are at least kQueryBasisMinCubeVectors; 0 below that, or when
+// no even chunk fills whole 16-row fractals.
+int64_t QueryBasisCubeChunk(int64_t num_vectors, int64_t head_size);
 
 FusedDecodeGrid PlanFusedDecode(int64_t num_tokens, int64_t num_heads, int64_t num_kv_heads, int64_t head_size,
                                 int64_t max_blocks_per_seq, int64_t block_size, int64_t aiv_num,

@@ -153,9 +153,11 @@ std::string EnvString(const char* name) {
   return raw == nullptr ? std::string() : std::string(raw);
 }
 
-// Where a decode step rotates its query. kSeparate launches rotate_q ahead of the decode (PRE_ROTATED = true);
-// kFusedPrologue hands the raw fp16 query to the decode, which rotates it inside the same launch
-// (PRE_ROTATED = false, fused case (g); kv4fp8 on the Cube path only).
+// Where a decode step changes basis. kSeparate launches rotate_q ahead of the decode (PRE_ROTATED = true) and,
+// for an unfolded W_o, rotate_q again over its output; kFusedPrologue hands the raw fp16 query to the decode,
+// which rotates it and, unfolded, un-rotates its output inside the same launch (PRE_ROTATED = false,
+// kUnrotated; fused cases (g) and (h); kv4fp8 on the Cube path only). A Qwen3.5 layer would also gate in that
+// launch (kGated); the bench leaves the gate out on both sides, as it does for the native decode.
 enum class RotationMode { kSeparate, kFusedPrologue };
 
 const RotationMode kRotationModes[] = {RotationMode::kSeparate, RotationMode::kFusedPrologue};
@@ -249,10 +251,16 @@ struct Config {
     return std::string(PathLabel(path)) + (mode == RotationMode::kSeparate ? "-Sep" : "-FusedQ");
   }
 
-  // Host dispatches of one decode step: rotate-q unless the decode rotates in its launch, the decode, and
-  // rotate-o unless W_o is folded.
+  // Host dispatches of one decode step: separately, rotate-q, the decode and rotate-o unless W_o is folded;
+  // in-launch, the decode alone.
   int decode_launches(RotationMode mode) const {
-    return (mode == RotationMode::kSeparate ? 2 : 1) + (model.folds_output ? 0 : 1);
+    return mode == RotationMode::kSeparate ? 2 + (model.folds_output ? 0 : 1) : 1;
+  }
+
+  // What the raw-query decode writes: the rotated basis for a folded W_o, the model basis otherwise.
+  uint32_t fused_q_output_stage() const {
+    return static_cast<uint32_t>(model.folds_output ? vllm_ascend::turboquant::TurboQuantOutputStage::kRotatedBasis
+                                                    : vllm_ascend::turboquant::TurboQuantOutputStage::kUnrotated);
   }
 };
 
@@ -372,8 +380,10 @@ struct Traffic {
 
   double dec_rot_q = 0.0;
   double dec_attn_core = 0.0;
-  // The raw-query decode moves rotate_q's bytes too: the fp16 query in, the rotated fp32 query into GM.
+  // The raw-query decode moves rotate_q's bytes too: the fp16 query in, the rotated fp32 query into GM. Its
+  // output stage adds none: the un-rotated output is the one fp16 write the decode makes anyway.
   double dec_fused_q_attn_core = 0.0;
+  double dec_fused_q_e2e = 0.0;
   double dec_rot_o = 0.0;
   double dec_e2e = 0.0;
   double dec_v5 = 0.0;
@@ -438,6 +448,7 @@ Traffic ModelTraffic(const Config& config, const DecodeDispatch& dispatch) {
   traffic.dec_attn_core =
       step_query_fp32 + traffic.tq_kv_bytes + step_out_fp16 + (dispatch.needs_reduction ? 2.0 * partials : 0.0);
   traffic.dec_fused_q_attn_core = traffic.dec_rot_q + traffic.dec_attn_core;
+  traffic.dec_fused_q_e2e = traffic.dec_fused_q_attn_core;
   traffic.dec_rot_o = step_out_fp16 + batch * hq * d * kFloatBytes;
   traffic.dec_e2e = traffic.dec_rot_q + traffic.dec_attn_core +
                     (config.model.folds_output ? 0.0 : traffic.dec_rot_o);
@@ -750,30 +761,29 @@ class Scenario {
   }
 
   // The same grid handed the raw fp16 query: the launch rotates every (token, head) into
-  // query_dec_prologue_rot_ ahead of its split tasks, so no rotate_q launch precedes it.
+  // query_dec_prologue_rot_ ahead of its split tasks (on the Cube from 16 vectors), so no rotate_q launch
+  // precedes it, and for an unfolded W_o it writes out_dec_tq_ un-rotated, so no rotate_o launch follows.
   void EnqueueDecodeFusedQ(aclrtStream stream) const {
     turboquant_mm_fused_decode_raw_query_impl(
         static_cast<int32_t>(kCubeMode), AscendType::FP16, stream, cube_grid_.block_dim, query_dec_.get(),
-        pi_signs_.get(), rot_tables_.get(), query_dec_prologue_rot_.get(), key_cache_.get(), value_cache_.get(),
-        scale_plane_.get(), block_tables_.get(), context_lens_.get(), decode_tables_.get(), workspace_.get(),
-        out_dec_tq_.get(), static_cast<uint32_t>(config_.batch), static_cast<uint32_t>(config_.model.num_heads),
-        static_cast<uint32_t>(config_.model.num_kv_heads), static_cast<uint32_t>(config_.model.head_size),
-        static_cast<uint32_t>(kBlockSize), static_cast<uint32_t>(config_.blocks_per_seq()),
-        static_cast<uint32_t>(cube_grid_.num_splits), cube_grid_.heads_per_task, cube_grid_.tasks_per_block,
-        cube_grid_.reduce_tasks_per_block, cube_grid_.prologue_vectors_per_block, cube_grid_.fused_context_limit,
-        config_.attention_scale(), config_.attention_scale());
+        pi_signs_.get(), rot_tables_.get(), h16_.get(), nullptr, query_dec_prologue_rot_.get(), key_cache_.get(),
+        value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(), decode_tables_.get(),
+        workspace_.get(), out_dec_tq_.get(), static_cast<uint32_t>(config_.batch),
+        static_cast<uint32_t>(config_.model.num_heads), static_cast<uint32_t>(config_.model.num_kv_heads),
+        static_cast<uint32_t>(config_.model.head_size), static_cast<uint32_t>(kBlockSize),
+        static_cast<uint32_t>(config_.blocks_per_seq()), static_cast<uint32_t>(cube_grid_.num_splits),
+        cube_grid_.heads_per_task, cube_grid_.tasks_per_block, cube_grid_.reduce_tasks_per_block,
+        cube_grid_.prologue_vectors_per_block, cube_grid_.prologue_cube_chunk_vectors,
+        config_.fused_q_output_stage(), cube_grid_.fused_context_limit, config_.attention_scale(),
+        config_.attention_scale());
   }
 
-  void EnqueueDecodeFusedQE2E(aclrtStream stream) const {
-    EnqueueDecodeFusedQ(stream);
-    if (!config_.model.folds_output) {
-      EnqueueDecodeRotateO(stream);
-    }
-  }
+  // One launch: the in-launch output stage leaves nothing to follow it.
+  void EnqueueDecodeFusedQE2E(aclrtStream stream) const { EnqueueDecodeFusedQ(stream); }
 
   // Both rotation modes over the same cache: the in-launch rotation against rotate_q's word for word, and the
-  // two decode outputs against each other. rotate_q stages the Cube from two tokens on, whose rounding the
-  // prologue's AIV rotation does not share, so only the outputs are held to a bound.
+  // two decode outputs in the basis the step hands on (after rotate_o, unfolded) against each other. The two
+  // rotations stage the Cube under different rules, so only the outputs are held to a bound.
   struct RotationAgreement {
     size_t rotated_words = 0;
     size_t word_mismatches = 0;
@@ -781,11 +791,11 @@ class Scenario {
   };
 
   RotationAgreement CompareRotationModes(aclrtStream stream) {
-    EnqueueDecodeRotateQ(stream);
-    EnqueueDecodeFusedCube(stream);
+    EnqueueDecodeE2E(stream);
     ACL_CHECK(aclrtSynchronizeStream(stream));
     const std::vector<float> separate_rot = query_dec_rot_.ToHost<float>();
-    const std::vector<float> separate_out = DecodeTqOutput();
+    const std::vector<float> separate_out =
+        config_.model.folds_output ? DecodeTqOutput() : out_dec_rot_.ToHost<float>();
 
     const std::vector<float> unwritten(separate_rot.size(), kUnwrittenSentinel);
     query_dec_prologue_rot_.CopyFromHost(unwritten.data(), unwritten.size() * sizeof(float));
@@ -1347,7 +1357,8 @@ DecodeRow ReadDecodeRow(const std::vector<BenchmarkRunner*>& runners, const Conf
   DecodeRow row;
   row.rot_q = separate ? SampleFor(runners, kLegDecRotQ, config) : InLaunchZero();
   row.attn_core = SampleFor(runners, separate ? kLegDecAttnCore : kLegDecFusedQAttnCore, config);
-  row.rot_o = RotateOutputSample(runners, kLegDecRotO, config);
+  row.rot_o = separate || config.model.folds_output ? RotateOutputSample(runners, kLegDecRotO, config)
+                                                     : InLaunchZero();
   row.e2e = SampleFor(runners, separate ? kLegDecE2E : kLegDecFusedQE2E, config);
   row.native = SampleFor(runners, kLegDecV5, config);
 
@@ -1356,7 +1367,7 @@ DecodeRow ReadDecodeRow(const std::vector<BenchmarkRunner*>& runners, const Conf
                         (row.rot_o.present ? row.rot_o.median_us : 0.0);
   row.speedup = Speedup(row.native, row.e2e);
   if (row.e2e.present && row.e2e.median_us > 0.0) {
-    row.gigabytes_per_second = traffic.dec_e2e / (row.e2e.median_us * 1.0e3);
+    row.gigabytes_per_second = (separate ? traffic.dec_e2e : traffic.dec_fused_q_e2e) / (row.e2e.median_us * 1.0e3);
   }
   return row;
 }
@@ -1544,10 +1555,11 @@ void PrintTableB(const std::vector<BenchmarkRunner*>& runners, const std::vector
               "[ascend-bench]   composite ACL-event region over the step's launches; T_FusedDecode is the\n"
               "[ascend-bench]   attention core, ONE launch on either path. Launches counts the host dispatches\n"
               "[ascend-bench]   of one decode step: rotate-q (-Sep only), the core, and rotate-o if unfolded.\n");
-  std::printf("[ascend-bench]   Path -Sep launches rotate_q ahead of the decode. Path -FusedQ hands the decode the\n"
-              "[ascend-bench]   raw fp16 query, which it rotates in the same launch ahead of its split tasks\n"
-              "[ascend-bench]   (PRE_ROTATED=false, Cube kv4fp8 only): its T_rot_q is 0.00 by construction and\n"
-              "[ascend-bench]   its T_FusedDecode includes the rotation. Both share the same Cfg, T_rot_o and V5.\n");
+  std::printf("[ascend-bench]   Path -Sep launches rotate_q ahead of the decode and, unfolded, rotate_q over its\n"
+              "[ascend-bench]   output. Path -FusedQ hands the decode the raw fp16 query, which it rotates in the\n"
+              "[ascend-bench]   same launch ahead of its split tasks, and un-rotates the output before its fp16\n"
+              "[ascend-bench]   write (PRE_ROTATED=false, kUnrotated, Cube kv4fp8 only): T_rot_q and T_rot_o are\n"
+              "[ascend-bench]   0.00 in-launch and T_FusedDecode includes both. Both share the same Cfg and V5.\n");
   std::printf("[ascend-bench]   Cfg [K/Tsk/Blk/Red]: K context splits per sequence; Tsk tasks the launch\n"
               "[ascend-bench]   schedules (Cube B x H_KV x K x head chunks, AIV B x H_Q x K); Blk the blocks it\n"
               "[ascend-bench]   spans, of %lld MIX blocks on the Cube path and %lld vector cores on the AIV path;\n"
@@ -1562,7 +1574,7 @@ void PrintTableB(const std::vector<BenchmarkRunner*>& runners, const std::vector
                 100.0 * MedianResidual(residuals), residuals.size());
   }
   if (!deltas.empty()) {
-    std::printf("\n[ascend-bench]   in-launch rotation (-FusedQ) against a separate rotate_q launch (-Sep), "
+    std::printf("\n[ascend-bench]   in-launch basis change (-FusedQ) against separate rotate_q launches (-Sep), "
                 "negative is -FusedQ faster:\n");
     for (const std::string& line : deltas) {
       std::printf("%s\n", line.c_str());
@@ -1697,7 +1709,8 @@ void WriteDecodeCsvTimings(std::ofstream& csv, const Config& config, const Traff
     csv << row.native.tflops;
   }
   csv << ',' << model.fp16_kv_bytes << ',' << model.tq_kv_bytes << ',' << model.saved_mib() << ','
-      << model.compression_ratio() << ',' << model.dec_e2e << ',' << model.dec_flops << ',';
+      << model.compression_ratio() << ','
+      << (mode == RotationMode::kSeparate ? model.dec_e2e : model.dec_fused_q_e2e) << ',' << model.dec_flops << ',';
   if (row.e2e.present) {
     csv << row.e2e.p95_us;
   }
@@ -2043,9 +2056,10 @@ void BuildSuite(BenchmarkRunner& primary) {
       }
 
       if (fused_q) {
-        run_leg(kLegDecFusedQE2E, model.dec_flops, model.dec_e2e, config.decode_launches(RotationMode::kFusedPrologue),
+        run_leg(kLegDecFusedQE2E, model.dec_flops, model.dec_fused_q_e2e,
+                config.decode_launches(RotationMode::kFusedPrologue),
                 [sc](aclrtStream s) { sc->EnqueueDecodeFusedQE2E(s); },
-                [sc]() { return sc->DecodePipelineChecksum(); });
+                [sc]() { return sc->DecodeTqChecksum(); });
       } else {
         runner.Skip(CaseName(kLegDecFusedQE2E, config), fused_q_off);
       }

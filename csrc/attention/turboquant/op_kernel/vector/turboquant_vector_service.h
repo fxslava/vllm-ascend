@@ -17,15 +17,17 @@
 // Vector-unit services of the TurboQuant decodes.
 //
 //   TurboQuantTileBurst            DMA: one tile of a row-major packed cache in wide GM bursts (>= 128 B)
-//   WriteNormalizedHeads           online softmax close-out: 1 / (sum + eps), cast, direct GM write
+//   NormalizeHeads / WriteHeads    online softmax close-out: 1 / (sum + eps), then cast and direct GM write;
+//                                  WriteNormalizedHeads is the two back to back
+//   TurboQuantRotatedOutput        the output stage of a decode that writes the rotated basis: nothing
 //   TurboQuantPartialReducer       the in-launch reduction of per-split partials (context > 4096)
-//   TurboQuantQueryPrologue        the in-launch Pi rotation of a raw query, once per vector, before the tasks
 //   TurboQuantVectorDecodeService  the AIV half of the Cube decode: query and KV staging into L1,
 //                                  the online softmax over the Cube's score rows, the accumulation
 //
-// The first three are shared by the AIV-only and the Cube decodes. Nothing here names a Cube type,
+// The first four are shared by the AIV-only and the Cube decodes. Nothing here names a Cube type,
 // so the AIV-only decode (which the wheel also builds for arch32) can include this header; the Cube
-// decode service takes its Cube and codec types as template parameters.
+// decode service takes its Cube and codec types as template parameters. The raw-query Cube decode's
+// query rotation and output stage are in cube/turboquant_query_basis.h.
 
 #ifndef VLLM_ASCEND_ATTENTION_TURBOQUANT_VECTOR_SERVICE_H
 #define VLLM_ASCEND_ATTENTION_TURBOQUANT_VECTOR_SERVICE_H
@@ -106,16 +108,12 @@ private:
 // Online softmax close-out
 // ----------------------------------------------------------------------------------------------------
 
-// Normalises `heads` accumulators by 1 / (runSum + eps), casts them to the output type in UB and
-// writes them to GM in one burst. runSum holds one kFp32PerBlock lane per head; sums and invs need
-// heads * kFp32PerBlock floats each. Requires headSize to be a multiple of kFp32PerRepeat.
-template <typename scalar_t>
-__aicore__ inline void WriteNormalizedHeads(const AscendC::LocalTensor<float> &acc,
-                                            const AscendC::LocalTensor<float> &runSum, const uint32_t heads,
-                                            const uint32_t headSize, const AscendC::LocalTensor<float> &sums,
-                                            const AscendC::LocalTensor<float> &invs,
-                                            const AscendC::LocalTensor<scalar_t> &out,
-                                            AscendC::GlobalTensor<scalar_t> &outputGm, const uint64_t outputElem)
+// Normalises `heads` accumulators by 1 / (runSum + eps) in place. runSum holds one kFp32PerBlock lane per
+// head; sums and invs need heads * kFp32PerBlock floats each. Requires headSize to be a multiple of
+// kFp32PerRepeat.
+__aicore__ inline void NormalizeHeads(const AscendC::LocalTensor<float> &acc, const AscendC::LocalTensor<float> &runSum,
+                                      const uint32_t heads, const uint32_t headSize,
+                                      const AscendC::LocalTensor<float> &sums, const AscendC::LocalTensor<float> &invs)
 {
     const uint8_t rowBlocks = static_cast<uint8_t>(headSize / kFp32PerBlock);
     const AscendC::BinaryRepeatParams rowRepeat{1, 1, 0, rowBlocks, rowBlocks, 1};
@@ -132,12 +130,44 @@ __aicore__ inline void WriteNormalizedHeads(const AscendC::LocalTensor<float> &a
         AscendC::Mul(acc[col], acc[col], invs, static_cast<uint64_t>(kFp32PerRepeat), static_cast<uint8_t>(heads),
                      rowRepeat);
     }
+}
 
+// Casts `heads` fp32 rows to the output type in UB and writes them to GM in one burst.
+template <typename scalar_t>
+__aicore__ inline void WriteHeads(const AscendC::LocalTensor<float> &acc, const uint32_t heads, const uint32_t headSize,
+                                  const AscendC::LocalTensor<scalar_t> &out, AscendC::GlobalTensor<scalar_t> &outputGm,
+                                  const uint64_t outputElem)
+{
     AscendC::Cast(out, acc, AscendC::RoundMode::CAST_RINT, heads * headSize);
     SyncVectorToMte3();
     AscendC::DataCopy(outputGm[outputElem], out, heads * headSize);
     SyncMte3ToVector();
 }
+
+template <typename scalar_t>
+__aicore__ inline void WriteNormalizedHeads(const AscendC::LocalTensor<float> &acc,
+                                            const AscendC::LocalTensor<float> &runSum, const uint32_t heads,
+                                            const uint32_t headSize, const AscendC::LocalTensor<float> &sums,
+                                            const AscendC::LocalTensor<float> &invs,
+                                            const AscendC::LocalTensor<scalar_t> &out,
+                                            AscendC::GlobalTensor<scalar_t> &outputGm, const uint64_t outputElem)
+{
+    NormalizeHeads(acc, runSum, heads, headSize, sums, invs);
+    WriteHeads<scalar_t>(acc, heads, headSize, out, outputGm, outputElem);
+}
+
+// The output stage of a decode whose output stays in the rotated basis. A finisher is handed the
+// normalised fp32 rows of `heads` heads of `token`, starting at `firstHead`, before they are cast and written.
+struct TurboQuantRotatedOutput {
+    __aicore__ static inline void FinishHeads(const AscendC::LocalTensor<float> &acc, const uint32_t token,
+                                              const uint32_t firstHead, const uint32_t heads)
+    {
+        static_cast<void>(acc);
+        static_cast<void>(token);
+        static_cast<void>(firstHead);
+        static_cast<void>(heads);
+    }
+};
 
 // ----------------------------------------------------------------------------------------------------
 // In-launch reduction of split partials
@@ -172,6 +202,14 @@ public:
     }
 
     __aicore__ inline void Reduce(const uint32_t token, const uint32_t head)
+    {
+        TurboQuantRotatedOutput rotated;
+        Reduce(token, head, rotated);
+    }
+
+    // `finisher` sees the merged, normalised head before it is cast and written (TurboQuantRotatedOutput).
+    template <typename Finisher>
+    __aicore__ inline void Reduce(const uint32_t token, const uint32_t head, Finisher &finisher)
     {
         const AscendC::LocalTensor<float> acc = accBuf_.Get<float>();
         const AscendC::LocalTensor<float> partAcc = acc[headSize_];
@@ -220,9 +258,10 @@ public:
             AscendC::Adds(runMax, newMax, 0.0f, 1);
         }
 
-        WriteNormalizedHeads<scalar_t>(acc, runSum, 1, headSize_, sums, invs, outBuf_.Get<scalar_t>(),
-                                                     outputGm_,
-                                                     (static_cast<uint64_t>(token) * numHeads_ + head) * headSize_);
+        NormalizeHeads(acc, runSum, 1, headSize_, sums, invs);
+        finisher.FinishHeads(acc, token, head, 1);
+        WriteHeads<scalar_t>(acc, 1, headSize_, outBuf_.Get<scalar_t>(), outputGm_,
+                             (static_cast<uint64_t>(token) * numHeads_ + head) * headSize_);
     }
 
 private:
@@ -244,102 +283,6 @@ private:
     uint32_t headSize_ = 0;
     uint32_t numSplits_ = 1;
     uint32_t partialStride_ = 0;
-};
-
-// ----------------------------------------------------------------------------------------------------
-// In-launch query rotation prologue
-// ----------------------------------------------------------------------------------------------------
-
-// Pi q = D H D q for a decode that is handed the raw query: every (token, head) vector once, ahead of the
-// task loop, however many splits later read it. The block's vector range is halved between its two
-// subcores; each vector is read from GM, rotated in UB with the same ApplyPi the AIV rotate_q runs, and
-// written as fp32 where a pre-rotated decode reads its query. The disabled specialisation is empty: a
-// pre-rotated decode allocates no rotation buffer and issues no rotation instruction.
-template <typename scalar_t, bool ENABLED>
-class TurboQuantQueryPrologue {
-public:
-    static constexpr bool kEnabled = true;
-
-    // Call after the decode's own buffers: the UB layout is allocation order, and the decode's must not move.
-    __aicore__ inline void Init(AscendC::TPipe *pipe, __gm__ void *query, __gm__ void *piSigns,
-                                __gm__ void *rotTables, __gm__ void *queryRot, const uint32_t headSize,
-                                const float invSqrtLen)
-    {
-        headSize_ = headSize;
-        queryGm_.SetGlobalBuffer(reinterpret_cast<__gm__ scalar_t *>(query));
-        piSignsGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(piSigns), headSize_);
-        rotTablesGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(rotTables));
-        queryRotGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(queryRot));
-
-        pipe->InitBuffer(queryInBuf_, headSize_ * sizeof(scalar_t));
-        pipe->InitBuffer(workBuf_, 2 * headSize_ * sizeof(float));
-        pipe->InitBuffer(signBuf_, headSize_ * sizeof(float));
-        codec_.Init(pipe, headSize_, 1, invSqrtLen, rotTablesGm_);
-
-        AscendC::DataCopy(signBuf_.Get<float>(), piSignsGm_, headSize_);
-        // Init hand-off: the signs land in UB before the first rotation.
-        AscendC::PipeBarrier<PIPE_ALL>();
-    }
-
-    // Rotates this subcore's half of the block's share of the numVectors query vectors, then drains every
-    // core so no task reads a rotated vector another block has not yet written.
-    __aicore__ inline void Rotate(const uint32_t numVectors, const uint32_t vectorsPerBlock)
-    {
-        if ASCEND_IS_AIV {
-            const uint32_t start = MixBlockIdx() * vectorsPerBlock;
-            uint32_t end = start + vectorsPerBlock;
-            if (end > numVectors) {
-                end = numVectors;
-            }
-            if (start < end) {
-                const uint32_t firstHalf = CeilDiv(end - start, kVectorSubcoresPerBlock);
-                const bool secondSubcore = AscendC::GetSubBlockIdx() != 0;
-                const uint32_t from = secondSubcore ? start + firstHalf : start;
-                const uint32_t to = secondSubcore ? end : start + firstHalf;
-                for (uint32_t vector = from; vector < to; ++vector) {
-                    RotateVector(vector);
-                }
-            }
-        }
-        AscendC::SyncAll<false>();
-    }
-
-private:
-    __aicore__ inline void RotateVector(const uint32_t vector)
-    {
-        const AscendC::LocalTensor<scalar_t> queryIn = queryInBuf_.Get<scalar_t>();
-        const AscendC::LocalTensor<float> work = workBuf_.Get<float>();
-        const AscendC::LocalTensor<float> x = work;
-        const AscendC::LocalTensor<float> tmp = work[headSize_];
-        const uint64_t elem = static_cast<uint64_t>(vector) * headSize_;
-
-        AscendC::DataCopy(queryIn, queryGm_[elem], headSize_);
-        SyncMte2ToVector();
-        AscendC::Cast(x, queryIn, AscendC::RoundMode::CAST_NONE, headSize_);
-
-        codec_.ApplyPi(x, tmp, signBuf_.Get<float>(), headSize_);
-
-        SyncVectorToMte3();
-        AscendC::DataCopy(queryRotGm_[elem], x, headSize_);
-        SyncEvent<AscendC::HardEvent::MTE3_MTE2>();
-        SyncMte3ToVector();
-    }
-
-    TurboQuantCodec4 codec_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> queryInBuf_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> workBuf_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> signBuf_;
-    AscendC::GlobalTensor<scalar_t> queryGm_;
-    AscendC::GlobalTensor<float> piSignsGm_;
-    AscendC::GlobalTensor<int32_t> rotTablesGm_;
-    AscendC::GlobalTensor<float> queryRotGm_;
-    uint32_t headSize_ = 0;
-};
-
-template <typename scalar_t>
-class TurboQuantQueryPrologue<scalar_t, false> {
-public:
-    static constexpr bool kEnabled = false;
 };
 
 // ----------------------------------------------------------------------------------------------------
@@ -612,20 +555,24 @@ public:
         AscendC::Add(acc, acc, context, heads.mine * headSize_);
     }
 
-    // A fused token writes its output straight to GM; a split token leaves its partials for the
-    // in-launch reduction.
+    // A fused token writes its output straight to GM, after `finisher` has seen its normalised rows; a split
+    // token leaves its partials for the in-launch reduction, which calls the finisher instead.
+    template <typename Finisher>
     __aicore__ inline void StageTaskOutput(const uint32_t token, const uint32_t split, const TurboQuantTaskHeads &heads,
-                                           const bool fused)
+                                           const bool fused, Finisher &finisher)
     {
         if (heads.mine == 0) {
             return;
         }
         const AscendC::LocalTensor<float> reduce = reduceBuf_.Get<float>();
         if (fused) {
-            WriteNormalizedHeads<scalar_t>(
-                accBuf_.Get<float>(), StateField(kStateRunSum), heads.mine, headSize_, reduce[kReduceBlocks],
-                reduce[kReduceInv], outBuf_.Get<scalar_t>(), outputGm_,
-                (static_cast<uint64_t>(token) * numHeads_ + heads.first + heads.base) * headSize_);
+            const AscendC::LocalTensor<float> acc = accBuf_.Get<float>();
+            const uint32_t firstHead = heads.first + heads.base;
+            NormalizeHeads(acc, StateField(kStateRunSum), heads.mine, headSize_, reduce[kReduceBlocks],
+                           reduce[kReduceInv]);
+            finisher.FinishHeads(acc, token, firstHead, heads.mine);
+            WriteHeads<scalar_t>(acc, heads.mine, headSize_, outBuf_.Get<scalar_t>(), outputGm_,
+                                 (static_cast<uint64_t>(token) * numHeads_ + firstHead) * headSize_);
             return;
         }
         StagePartials(token, split, heads);

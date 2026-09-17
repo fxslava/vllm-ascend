@@ -416,6 +416,62 @@ TEST(TurboQuantTiling, FusedDecodeKeepsTheCamodelCaseGrids) {
   }
 }
 
+// The raw-query prologue (TURBOQUANT_TESTS.md 13.36). Below kQueryBasisMinCubeVectors query vectors every share
+// rotates on the vector cores, so a B = 1, H_Q = 8 decode never pads an Mmad. From there each block's share is a
+// whole number of Cube chunks, except the last one's remainder, and a chunk is one H16 staging that the two
+// subcores split on whole 16-row fractals inside the kernel's scratch.
+TEST(TurboQuantTiling, FusedDecodePrologueRoutesWholeChunksToTheCube) {
+  constexpr int64_t kBlock = 64;
+  constexpr int64_t kBlocks = 2;
+  for (const int64_t aiv : kVectorCores) {
+    for (const int64_t tokens : {1, 2, 3, 4, 8, 64}) {
+      for (const int64_t heads : {4, 8, 16, 32}) {
+        for (const int64_t head_size : {64, 128, 256}) {
+          const int64_t kv_heads = std::max<int64_t>(1, heads / 4);
+          const tqt::FusedDecodeGrid grid =
+              tqt::PlanFusedDecode(tokens, heads, kv_heads, head_size, kBlocks, kBlock, aiv);
+          const int64_t vectors = tokens * heads;
+          const int64_t chunk = grid.prologue_cube_chunk_vectors;
+          const std::string where = "aiv " + std::to_string(aiv) + " tokens " + std::to_string(tokens) +
+                                    " heads " + std::to_string(heads) + " head_size " + std::to_string(head_size);
+          ASSERT_GE(static_cast<int64_t>(grid.block_dim) * grid.prologue_vectors_per_block, vectors) << where;
+          EXPECT_EQ(chunk, tqt::QueryBasisCubeChunk(vectors, head_size)) << where;
+          if (vectors < static_cast<int64_t>(tqt::kQueryBasisMinCubeVectors)) {
+            EXPECT_EQ(chunk, 0) << where << ": too few vectors fill a Cube chunk";
+            EXPECT_EQ(grid.prologue_vectors_per_block, static_cast<uint32_t>((vectors + grid.block_dim - 1) /
+                                                                             grid.block_dim))
+                << where;
+            continue;
+          }
+          ASSERT_GT(chunk, 0) << where;
+          EXPECT_EQ(chunk % 2, 0) << where << ": the dual-destination Fixpipe splits a chunk in half";
+          EXPECT_LE(chunk / 2, static_cast<int64_t>(tqt::kCubeTileM / 2)) << where << ": half a chunk is kernel scratch";
+          EXPECT_LE(chunk * head_size, static_cast<int64_t>(tqt::kRotateQMaxChunkElements)) << where;
+          const int64_t rows = chunk * head_size / tqt::kRotateQTile;
+          EXPECT_EQ((rows / 2) % tqt::kRotateQTile, 0) << where << ": each half has to fill whole 16-row fractals";
+          EXPECT_EQ(grid.prologue_vectors_per_block % chunk, 0) << where << ": a block share splits a chunk";
+        }
+      }
+    }
+  }
+
+  // Fused case (h): three tokens of H_Q 8 / H_KV 2, D 256, S 128 on 64 vector cores, unsplit and filled.
+  constexpr int64_t kAiv = 64;
+  const tqt::FusedDecodeGrid unsplit = tqt::PlanFusedDecode(3, 8, 2, 256, kBlocks, kBlock, kAiv, tqt::kFusedContextLimit,
+                                                            tqt::FusedSplitPolicy::kContextOnly);
+  EXPECT_EQ(unsplit.num_splits, 1);
+  EXPECT_EQ(unsplit.block_dim, 12u);
+  EXPECT_EQ(unsplit.prologue_vectors_per_block, 16u);
+  EXPECT_EQ(unsplit.prologue_cube_chunk_vectors, 16u);
+  const tqt::FusedDecodeGrid filled = tqt::PlanFusedDecode(3, 8, 2, 256, kBlocks, kBlock, kAiv, tqt::kFusedContextLimit,
+                                                           tqt::FusedSplitPolicy::kFillBlocks);
+  EXPECT_EQ(filled.num_splits, 2);
+  EXPECT_EQ(filled.block_dim, 24u);
+  EXPECT_EQ(filled.fused_context_limit, 0u);
+  EXPECT_EQ(filled.prologue_vectors_per_block, 16u);
+  EXPECT_EQ(filled.prologue_cube_chunk_vectors, 16u);
+}
+
 TEST(TurboQuantTiling, RotateQStagesTheCubeOnlyWithEvenDualDestinationChunks) {
   for (const int64_t aiv : kVectorCores) {
     const int64_t cores = tqt::RotateQCoreNum(aiv);

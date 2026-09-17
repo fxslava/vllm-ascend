@@ -1930,6 +1930,20 @@ void npu_turboquant_paged_attention_meta(at::Tensor &, at::Tensor &, at::Tensor 
 }
 #endif
 
+#ifdef VLLM_ENABLE_TURBOQUANT_CUBE
+void npu_turboquant_cube_reshape_and_cache_meta(at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &,
+                                                at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &)
+{
+}
+
+void npu_turboquant_cube_decode_meta(at::Tensor &, const c10::optional<at::Tensor> &, at::Tensor &, at::Tensor &,
+                                     at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &,
+                                     at::Tensor &, at::Tensor &, at::Tensor &, int64_t, int64_t, double, int64_t,
+                                     at::Tensor &)
+{
+}
+#endif
+
 } // namespace meta
 } // namespace vllm_ascend
 
@@ -2060,6 +2074,16 @@ namespace {
 TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_turboquant_reshape_and_cache", &vllm_ascend::meta::npu_turboquant_reshape_and_cache_meta);
     ops.impl("npu_turboquant_paged_attention", &vllm_ascend::meta::npu_turboquant_paged_attention_meta);
+}
+}
+#endif
+
+#ifdef VLLM_ENABLE_TURBOQUANT_CUBE
+namespace {
+TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
+    ops.impl("npu_turboquant_cube_reshape_and_cache",
+             &vllm_ascend::meta::npu_turboquant_cube_reshape_and_cache_meta);
+    ops.impl("npu_turboquant_cube_decode", &vllm_ascend::meta::npu_turboquant_cube_decode_meta);
 }
 }
 #endif

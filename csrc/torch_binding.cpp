@@ -3200,3 +3200,51 @@ TORCH_LIBRARY_FRAGMENT_EXPAND(CONCAT(_C, _ascend), ops)
              &vllm_ascend::npu_turboquant_workspace_size);
 }
 #endif
+
+#ifdef VLLM_ENABLE_TURBOQUANT_CUBE
+TORCH_LIBRARY_FRAGMENT_EXPAND(CONCAT(_C, _ascend), ops)
+{
+    ops.def(
+        "npu_turboquant_cube_reshape_and_cache(Tensor key, "
+        "                                      Tensor value, "
+        "                                      Tensor! key_cache, "
+        "                                      Tensor! value_cache, "
+        "                                      Tensor! scale_cache, "
+        "                                      Tensor slot_mapping, "
+        "                                      Tensor pi_signs, "
+        "                                      Tensor codec_tables) -> ()");
+    ops.impl("npu_turboquant_cube_reshape_and_cache", torch::kPrivateUse1,
+             &vllm_ascend::npu_turboquant_cube_reshape_and_cache);
+
+    ops.def(
+        "npu_turboquant_cube_decode(Tensor query, "
+        "                           Tensor? gate, "
+        "                           Tensor pi_signs, "
+        "                           Tensor codec_tables, "
+        "                           Tensor hadamard16, "
+        "                           Tensor key_cache, "
+        "                           Tensor value_cache, "
+        "                           Tensor scale_cache, "
+        "                           Tensor block_tables, "
+        "                           Tensor context_lens, "
+        "                           Tensor! workspace, "
+        "                           Tensor! query_rot, "
+        "                           int num_kv_heads, "
+        "                           int num_heads, "
+        "                           float scale_value, "
+        "                           int output_stage, "
+        "                           Tensor! out) -> ()");
+    ops.impl("npu_turboquant_cube_decode", torch::kPrivateUse1,
+             &vllm_ascend::npu_turboquant_cube_decode);
+
+    ops.def(
+        "npu_turboquant_cube_workspace_size(int num_tokens, "
+        "                                   int num_heads, "
+        "                                   int num_kv_heads, "
+        "                                   int head_size, "
+        "                                   int max_blocks_per_seq, "
+        "                                   int block_size) -> int");
+    ops.impl("npu_turboquant_cube_workspace_size",
+             &vllm_ascend::npu_turboquant_cube_workspace_size);
+}
+#endif

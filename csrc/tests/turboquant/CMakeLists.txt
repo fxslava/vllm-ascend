@@ -81,3 +81,15 @@ include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 # sources, and quoting it would hand ascendc_library one semicolon-joined path.
 ascendc_library(vllm_ascend_turboquant SHARED
   ${VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE})
+
+# The Cube kernels only the suite launches: the kv3fp4 / kv5fp8 fused decode and cache write, and the fp8
+# GEMM probe (op_kernel/turboquant_fused_decode.cpp). The root CMakeLists.txt does not set this, so the
+# wheel ships the kv4fp8 kernels alone; those compile identically either way.
+#
+# It takes two calls because ascendc_library compiles the source twice. ascendc_compile_definitions reaches
+# the device precompile only -- alone, it builds the kernels and their launchers but not the host-side
+# *_impl functions that call them, and the tests fail to link. The host stub's flags come from
+# host_intf_pub, which only ascendc_compile_options feeds, through -forward-options-to-host-compiler.
+ascendc_compile_definitions(vllm_ascend_turboquant PRIVATE VLLM_ASCEND_TQ_TEST_KERNELS)
+ascendc_compile_options(vllm_ascend_turboquant PRIVATE
+  -forward-options-to-host-compiler -DVLLM_ASCEND_TQ_TEST_KERNELS)
