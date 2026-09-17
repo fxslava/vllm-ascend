@@ -74,7 +74,8 @@ TEST(TurboQuantTiling, PagedAttentionIsOneLaunchWithoutWorkspaceInsideTheFusedLi
 }
 
 TEST(TurboQuantTiling, FusedDecodeTasksCoverEveryHeadOnTheCubeFractal) {
-  for (const tqt::FusedSplitPolicy policy : {tqt::FusedSplitPolicy::kContextOnly, tqt::FusedSplitPolicy::kFillBlocks}) {
+  for (const tqt::FusedSplitPolicy policy :
+       {tqt::FusedSplitPolicy::kContextOnly, tqt::FusedSplitPolicy::kFillBlocks, tqt::FusedSplitPolicy::kAdaptive}) {
     for (const int64_t aiv : kVectorCores) {
       for (const int64_t tokens : {1, 8}) {
         for (const int64_t kv_heads : {1, 2, 4, 8}) {
@@ -110,6 +111,23 @@ TEST(TurboQuantTiling, FusedDecodeTasksCoverEveryHeadOnTheCubeFractal) {
                     << where;
               } else {
                 EXPECT_EQ(grid.workspace_floats, 0u) << where;
+                EXPECT_EQ(grid.reduce_tasks_per_block, 0u) << where;
+              }
+              if (policy == tqt::FusedSplitPolicy::kAdaptive) {
+                // The unsplit tasks are what a one-block context plans to under any policy.
+                const int64_t base_tasks =
+                    tqt::PlanFusedDecode(tokens, heads, kv_heads, kHeadSize, 1,
+                                         static_cast<int64_t>(tqt::kCubeTileRows), aiv, tqt::kFusedContextLimit,
+                                         tqt::FusedSplitPolicy::kContextOnly)
+                        .num_tasks;
+                const int64_t want =
+                    base_tasks >= mix_blocks
+                        ? 1
+                        : std::min((mix_blocks + base_tasks - 1) / base_tasks,
+                                   std::min<int64_t>(blocks, tqt::kMaxSequenceSplits));
+                EXPECT_EQ(grid.num_splits, want) << where << " base_tasks " << base_tasks;
+                EXPECT_EQ(grid.fused_context_limit, grid.num_splits > 1 ? 0u : tqt::kFusedContextLimit) << where;
+                continue;
               }
               if (blocks * static_cast<int64_t>(tqt::kCubeTileRows) > static_cast<int64_t>(tqt::kFusedContextLimit)) {
                 EXPECT_EQ(grid.fused_context_limit, tqt::kFusedContextLimit) << where;
@@ -175,6 +193,78 @@ TEST(TurboQuantTiling, FusedDecodeFillsEveryMixBlockAtTheSingleTokenBaseline) {
   EXPECT_EQ(trace.heads_per_task, 2u);
   EXPECT_EQ(trace.block_dim, static_cast<uint32_t>(kMixBlocks));
   EXPECT_EQ(trace.fused_context_limit, 0u);
+}
+
+// The bench's decode rows (aiv 64, block 128) under the default adaptive policy, against the fill policy it
+// replaced: a saturated grid runs unsplit at every context, an under-filled one splits at every context.
+TEST(TurboQuantTiling, FusedDecodeAdaptiveSplitsOnlyAnUnderfilledGrid) {
+  constexpr int64_t kAiv = 64;
+  constexpr int64_t kBlock = 128;
+  struct Row {
+    int64_t heads;
+    int64_t head_size;
+    int64_t context;
+    int64_t batch;
+    int64_t adaptive_splits;
+    int64_t fill_splits;
+  };
+  // H_KV 1 throughout: Qwen3.5 4:1 D 128, GLM-5.2 8:1 D 128, DeepSeek-V4-Flash 16:1 D 256.
+  const Row rows[] = {
+      {4, 128, 2048, 1, 8, 8},   {4, 128, 2048, 4, 4, 4},   {4, 128, 2048, 8, 2, 2},
+      {4, 128, 32768, 1, 8, 8},  {4, 128, 32768, 4, 4, 8},  {4, 128, 32768, 8, 2, 8},
+      {8, 128, 2048, 1, 8, 8},   {8, 128, 2048, 4, 2, 2},   {8, 128, 2048, 8, 1, 1},
+      {8, 128, 32768, 1, 8, 8},  {8, 128, 32768, 4, 2, 8},  {8, 128, 32768, 8, 1, 8},
+      {16, 256, 2048, 1, 4, 4},  {16, 256, 2048, 4, 1, 1},  {16, 256, 32768, 4, 1, 8},
+  };
+  for (const Row& row : rows) {
+    const int64_t blocks = (row.context + kBlock - 1) / kBlock;
+    const std::string where = "H_Q " + std::to_string(row.heads) + " S " + std::to_string(row.context) + " B " +
+                              std::to_string(row.batch);
+    const tqt::FusedDecodeGrid adaptive =
+        tqt::PlanFusedDecode(row.batch, row.heads, 1, row.head_size, blocks, kBlock, kAiv);
+    const tqt::FusedDecodeGrid fill = tqt::PlanFusedDecode(row.batch, row.heads, 1, row.head_size, blocks, kBlock,
+                                                           kAiv, tqt::kFusedContextLimit,
+                                                           tqt::FusedSplitPolicy::kFillBlocks);
+    EXPECT_EQ(adaptive.num_splits, row.adaptive_splits) << where;
+    EXPECT_EQ(fill.num_splits, row.fill_splits) << where;
+    if (adaptive.num_splits == 1) {
+      EXPECT_EQ(adaptive.workspace_floats, 0u) << where;
+      EXPECT_EQ(adaptive.reduce_tasks_per_block, 0u) << where;
+    } else {
+      EXPECT_EQ(adaptive.fused_context_limit, 0u) << where;
+    }
+  }
+}
+
+// Every camodel fused case (test_sim_950pr_turboquant_fused, S <= 256) plans the same grid under the adaptive
+// policy as under the one its golden was recorded with, so the default change moves no executed grid.
+TEST(TurboQuantTiling, FusedDecodeAdaptiveKeepsTheCamodelCaseGrids) {
+  constexpr int64_t kAiv = 64;
+  constexpr int64_t kTwoBlockAiv = 4;
+  constexpr int64_t kBlock = 64;
+  struct Case {
+    int64_t heads;
+    int64_t kv_heads;
+    int64_t head_size;
+    int64_t context;
+    int64_t aiv;
+  };
+  const Case cases[] = {
+      {4, 2, 256, 64, kAiv}, {4, 2, 256, 256, kAiv}, {8, 2, 256, 120, kTwoBlockAiv}, {4, 1, 128, 64, kAiv}};
+  for (const Case& c : cases) {
+    const int64_t blocks = (c.context + kBlock - 1) / kBlock;
+    const std::string where = "H_Q " + std::to_string(c.heads) + " S " + std::to_string(c.context);
+    const tqt::FusedDecodeGrid adaptive =
+        tqt::PlanFusedDecode(1, c.heads, c.kv_heads, c.head_size, blocks, kBlock, c.aiv);
+    const tqt::FusedDecodeGrid fill = tqt::PlanFusedDecode(1, c.heads, c.kv_heads, c.head_size, blocks, kBlock, c.aiv,
+                                                           tqt::kFusedContextLimit,
+                                                           tqt::FusedSplitPolicy::kFillBlocks);
+    EXPECT_EQ(adaptive.num_splits, fill.num_splits) << where;
+    EXPECT_EQ(adaptive.heads_per_task, fill.heads_per_task) << where;
+    EXPECT_EQ(adaptive.block_dim, fill.block_dim) << where;
+    EXPECT_EQ(adaptive.tasks_per_block, fill.tasks_per_block) << where;
+    EXPECT_EQ(adaptive.fused_context_limit, fill.fused_context_limit) << where;
+  }
 }
 
 TEST(TurboQuantTiling, RotateQStagesTheCubeOnlyWithEvenDualDestinationChunks) {

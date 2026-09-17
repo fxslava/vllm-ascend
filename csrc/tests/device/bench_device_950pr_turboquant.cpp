@@ -63,6 +63,8 @@ using tqa::PathMode;
 using tqa::PrefillChunk;
 using tqa::PrefillChunkTokens;
 using tqa::SelectPath;
+using tqa::SplitPolicy;
+using tqa::SplitPolicyLabel;
 
 constexpr int64_t kBlockSize = s950::kDefaultBlockSize;
 
@@ -541,7 +543,8 @@ class Scenario {
           DeviceBuffer::FromHost(tqh::ModeTables(kCubeMode, d, 1, 0), kBenchmarkAlignBytes);
       decode_tables_ = DeviceBuffer::FromHost(
           tqh::ModeTables(kCubeMode, d, tqh::kUnpackRows, tqh::kCubeTileRows), kBenchmarkAlignBytes);
-      cube_grid_ = tqh::PlanFusedDecode(config.batch, hq, hkv, d, blocks_per_seq, kBlockSize, aiv_num);
+      cube_grid_ = tqh::PlanFusedDecode(config.batch, hq, hkv, d, blocks_per_seq, kBlockSize, aiv_num,
+                                        tqh::kFusedContextLimit, SplitPolicy());
       num_splits_ = cube_grid_.num_splits;
       workspace_floats_ = cube_grid_.workspace_floats;
     } else {
@@ -1289,12 +1292,14 @@ void PrintTableB(const std::vector<BenchmarkRunner*>& runners, const std::vector
   std::printf("[ascend-bench] ====================================================================\n");
   std::printf("[ascend-bench] device time from ACL events, median us per decode step; native operator: %s\n",
               fia_operator.c_str());
-  std::printf("[ascend-bench] one decode token per sequence; B is the batch of sequences\n\n");
+  std::printf("[ascend-bench] one decode token per sequence; B is the batch of sequences; K is the context\n"
+              "[ascend-bench] splits of one Cube launch, split policy %s (ASCEND_BENCH_TQ_AUDIT_SPLIT)\n\n",
+              SplitPolicyLabel(SplitPolicy()));
 
   char header[512];
   const int header_width =
-      std::snprintf(header, sizeof(header), "  %-17s %9s %3s %5s | %10s %14s %11s %10s %11s %11s | %8s %10s %12s",
-                    "Model", "Context", "B", "Path", "T_rot_q", "T_FusedDecode", "Launches", "T_rot_o", "TQ_E2E",
+      std::snprintf(header, sizeof(header), "  %-17s %9s %3s %5s %2s | %10s %14s %11s %10s %11s %11s | %8s %10s %12s",
+                    "Model", "Context", "B", "Path", "K", "T_rot_q", "T_FusedDecode", "Launches", "T_rot_o", "TQ_E2E",
                     "V5_Decode", "Speedup", "Eff GB/s", "Compression");
   PrintHeaderAndRule(header, header_width);
 
@@ -1307,8 +1312,9 @@ void PrintTableB(const std::vector<BenchmarkRunner*>& runners, const std::vector
       continue;
     }
     any = true;
-    std::printf("  %-17s %9lld %3lld %5s |", config.model.label, static_cast<long long>(config.seq_len),
-                static_cast<long long>(config.batch), PathLabel(config.path));
+    std::printf("  %-17s %9lld %3lld %5s %2lld |", config.model.label, static_cast<long long>(config.seq_len),
+                static_cast<long long>(config.batch), PathLabel(config.path),
+                static_cast<long long>(traffic[index].dec_split_count));
     PrintUs(row.rot_q, 10);
     PrintUs(row.attn_core, 13);
     std::printf(" %10d", config.model.folds_output ? 2 : 3);
@@ -1331,8 +1337,8 @@ void PrintTableB(const std::vector<BenchmarkRunner*>& runners, const std::vector
 
   std::printf("\n[ascend-bench]   Speedup is V5_Decode / TQ_E2E: above 1.000x is TurboQuant ahead. TQ_E2E is one\n"
               "[ascend-bench]   composite ACL-event region over rotate-q, the attention core and (unfolded only)\n"
-              "[ascend-bench]   rotate-o; T_FusedDecode is the attention core, ONE launch on either path (a\n"
-              "[ascend-bench]   context above 4096 is split and reduced inside that launch). Launches counts the\n"
+              "[ascend-bench]   rotate-o; T_FusedDecode is the attention core, ONE launch on either path (K > 1\n"
+              "[ascend-bench]   splits are reduced inside that launch after a SyncAll). Launches counts the\n"
               "[ascend-bench]   host dispatches of one decode step: rotate-q, the core, and rotate-o if unfolded.\n");
   std::printf("[ascend-bench]   Every model takes the Cube decode, whatever its GQA group or head size;\n"
               "[ascend-bench]   ASCEND_BENCH_TQ_AUDIT_PATH=aiv forces the vector-only path for an A/B.\n");
@@ -1446,7 +1452,7 @@ void WriteDecodeCsv(const std::vector<BenchmarkRunner*>& runners, const std::vec
       << "tq_e2e_us,tq_e2e_sum_of_parts_us,v5_decode_us,net_speedup,"
       << "effective_gbps,attn_core_gbps,v5_gbps,attn_core_tflops,v5_tflops,"
       << "fp16_kv_bytes,tq_kv_bytes,kv_saved_mib,compression_ratio,"
-      << "e2e_bytes,attention_flops,tq_e2e_p95_us,v5_p95_us,warmup,iterations,timing_mode\n";
+      << "e2e_bytes,attention_flops,tq_e2e_p95_us,v5_p95_us,warmup,iterations,timing_mode,split_policy\n";
 
   for (size_t index = 0; index < sweep.size(); ++index) {
     const Config& config = sweep[index];
@@ -1500,7 +1506,8 @@ void WriteDecodeCsv(const std::vector<BenchmarkRunner*>& runners, const std::vec
     if (row.native.present) {
       csv << row.native.p95_us;
     }
-    csv << ',' << config.budget.warmup << ',' << config.budget.iterations << ',' << row.e2e.mode << '\n';
+    csv << ',' << config.budget.warmup << ',' << config.budget.iterations << ',' << row.e2e.mode << ','
+        << SplitPolicyLabel(SplitPolicy()) << '\n';
   }
   std::printf("[ascend-bench] Table B written to %s\n", path.c_str());
 }
@@ -1619,7 +1626,8 @@ void BuildSuite(BenchmarkRunner& primary) {
     const int64_t planned_splits =
         config.path == PathMode::kCube
             ? tqh::PlanFusedDecode(config.batch, config.model.num_heads, config.model.num_kv_heads,
-                                   config.model.head_size, config.blocks_per_seq(), kBlockSize, aiv_num)
+                                   config.model.head_size, config.blocks_per_seq(), kBlockSize, aiv_num,
+                                   tqh::kFusedContextLimit, SplitPolicy())
                   .num_splits
             : tqh::PlanPagedAttention(config.batch, config.model.num_heads, config.model.head_size,
                                       config.blocks_per_seq(), kBlockSize, aiv_num)

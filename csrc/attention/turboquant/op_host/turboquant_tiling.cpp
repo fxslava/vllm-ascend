@@ -132,7 +132,21 @@ FusedDecodeGrid PlanFusedDecode(int64_t num_tokens, int64_t num_heads, int64_t n
 
     int64_t num_splits = 1;
     int64_t launch_limit = fused_context_limit;
-    if (context_bound > fused_context_limit) {
+    if (split_policy == FusedSplitPolicy::kAdaptive) {
+        // Saturation alone decides, at any context length. Tasks that already fill the blocks unsplit run
+        // unsplit: every token is fused, so the launch has no SyncAll, no workspace round trip and no
+        // reduction. An under-filled grid splits every context to put the idle blocks to work.
+        // Count the chunks the heads-per-task rounding realises, not the chunk count asked for: 16 heads
+        // asked into 5 chunks are 4 heads per task, so 4 tasks.
+        const int64_t unsplit_heads = group > 1 ? CeilDiv64(group, chunks_for(num_tokens * num_kv_heads)) : 1;
+        const int64_t base_tasks = num_tokens * num_kv_heads * CeilDiv64(group, unsplit_heads);
+        if (base_tasks < mix_blocks) {
+            num_splits = std::min(CeilDiv64(mix_blocks, base_tasks), std::min(max_splits, blocks));
+        }
+        if (num_splits > 1) {
+            launch_limit = 0;
+        }
+    } else if (context_bound > fused_context_limit) {
         const int64_t by_context =
             fused_context_limit > 0 ? CeilDiv64(context_bound, fused_context_limit) : max_splits;
         num_splits = std::max(CeilDiv64(mix_blocks, num_tokens * num_kv_heads), by_context);

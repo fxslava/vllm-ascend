@@ -641,7 +641,8 @@ class DecodeScenario final : public Scenario {
       write_tables_ = DeviceBuffer::FromHost(tqh::ModeTables(kCubeMode, d, 1, 0), kBenchmarkAlignBytes);
       decode_tables_ = DeviceBuffer::FromHost(
           tqh::ModeTables(kCubeMode, d, tqh::kUnpackRows, tqh::kCubeTileRows), kBenchmarkAlignBytes);
-      cube_grid_ = tqh::PlanFusedDecode(batch, hq, hkv, d, blocks_per_seq, kBlockSize, aiv_num);
+      cube_grid_ = tqh::PlanFusedDecode(batch, hq, hkv, d, blocks_per_seq, kBlockSize, aiv_num,
+                                        tqh::kFusedContextLimit, tqa::SplitPolicy());
       num_splits_ = cube_grid_.num_splits;
       workspace_floats = cube_grid_.workspace_floats;
     } else {

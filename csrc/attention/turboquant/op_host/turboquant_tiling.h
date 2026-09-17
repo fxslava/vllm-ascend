@@ -64,11 +64,16 @@ PagedAttentionGrid PlanPagedAttention(int64_t num_tokens, int64_t num_heads, int
                                       int64_t max_blocks_per_seq, int64_t block_size, int64_t aiv_num,
                                       int64_t fused_context_limit = kFusedContextLimit);
 
-// Whether the Cube decode also splits a context inside the fused limit, to put the MIX blocks one task
-// per (token, kv head) leaves idle to work. The splits are reduced in the same launch either way.
+// When the Cube decode splits a context along the sequence. The splits are reduced in the same launch.
+//   kContextOnly  only a context beyond the fused limit
+//   kFillBlocks   also one inside it, while every task still gets a MIX block of its own
+//   kAdaptive     by grid saturation, at any context: split only while the unsplit tasks (tokens x kv heads
+//                 x head chunks) leave MIX blocks idle; a saturated grid never splits, so its launch has
+//                 no SyncAll, workspace or reduction
 enum class FusedSplitPolicy : uint32_t {
     kContextOnly = 0,
     kFillBlocks = 1,
+    kAdaptive = 2,
 };
 
 // The Cube decode. Tasks are (token, kv head, split, head chunk) over the AIC blocks; each task's heads
@@ -90,7 +95,7 @@ struct FusedDecodeGrid {
 FusedDecodeGrid PlanFusedDecode(int64_t num_tokens, int64_t num_heads, int64_t num_kv_heads, int64_t head_size,
                                 int64_t max_blocks_per_seq, int64_t block_size, int64_t aiv_num,
                                 int64_t fused_context_limit = kFusedContextLimit,
-                                FusedSplitPolicy split_policy = FusedSplitPolicy::kFillBlocks);
+                                FusedSplitPolicy split_policy = FusedSplitPolicy::kAdaptive);
 
 // The query rotation Pi = D H D: on the Cube (Mmad over a 16x16 fp16 Hadamard plus AIV butterflies)
 // when there are enough vectors to be worth staging, on the AIV cores alone otherwise.

@@ -97,6 +97,31 @@ inline PathMode SelectPath(const ModelSpec& model) {
   return PathMode::kCube;
 }
 
+// The Cube decode's split policy: adaptive (grid saturation) unless ASCEND_BENCH_TQ_AUDIT_SPLIT=fill or context
+// selects an older policy for an A/B in the same build.
+inline turboquant_host::FusedSplitPolicy SplitPolicy() {
+  const char* raw = std::getenv("ASCEND_BENCH_TQ_AUDIT_SPLIT");
+  const std::string forced = raw == nullptr ? std::string() : std::string(raw);
+  if (forced == "fill") {
+    return turboquant_host::FusedSplitPolicy::kFillBlocks;
+  }
+  if (forced == "context") {
+    return turboquant_host::FusedSplitPolicy::kContextOnly;
+  }
+  return turboquant_host::FusedSplitPolicy::kAdaptive;
+}
+
+inline const char* SplitPolicyLabel(turboquant_host::FusedSplitPolicy policy) {
+  switch (policy) {
+    case turboquant_host::FusedSplitPolicy::kFillBlocks:
+      return "fill";
+    case turboquant_host::FusedSplitPolicy::kContextOnly:
+      return "context";
+    default:
+      return "adaptive";
+  }
+}
+
 inline int64_t PrefillChunkTokens() { return EnvInt64("ASCEND_BENCH_TQ_AUDIT_CHUNK", kPrefillChunkTokens, 1); }
 
 inline int64_t PrefillChunk(int64_t seq_len) { return std::min(seq_len, PrefillChunkTokens()); }

@@ -3988,3 +3988,48 @@ saving times `kv_layers x model_kv_heads / num_kv_heads`, from each checkpoint's
 32 layers, but only 8 are full attention, with H_KV 4. DeepSeek-V4-Flash has 43 layers and H_KV 1.
 GLM-5.2 has 78 layers of MLA, and its latent counts as one slot. The legend prints the factors. The CSV
 `kv_saved_mib` keeps the per-slice value. Only the npu tier compiled this; no silicon run exists.
+
+### 13.34 Adaptive split policy: split by grid saturation, not by context length (2026-09-17)
+
+`PlanFusedDecode` defaults to `FusedSplitPolicy::kAdaptive`. `kFillBlocks` and `kContextOnly` stay selectable.
+
+- **Base tasks.** `base_tasks = tokens x kv_heads x chunks`, where chunks is the count the heads-per-task
+  rounding realises. It is not the count `chunks_for()` asks for: 16 heads asked into 5 chunks make 4.
+  The first draft used the asked count, and the host contract test caught it calling an under-filled grid
+  saturated (aiv 40, kv 4, group 16: 16 tasks on 20 blocks).
+- **Saturated grid** (`base_tasks >= mix_blocks`). K = 1 at every context length. `IsFused()` is true for
+  every token, so `NeedsReduction()` is false and the launch has no `SyncAll`, workspace or reducer.
+  `reduce_tasks_per_block` and `workspace_floats` are 0.
+- **Under-filled grid.** K = min(ceil(mix_blocks / base_tasks), kMaxSequenceSplits = 8, blocks), and the fused
+  limit is 0 whenever K > 1. This holds at any S, so B = 1 at S <= 4096 keeps its fill splits (the 2026-09-17 permanence
+  rule for the context splits of 41c2012e2). The directive's S > 4096 condition and its cap of 4 were dropped by user decision.
+- **The 4096 limit was not a numeric bound.** It came from the wording of 13.24 rule 3. The online-softmax
+  recurrence is length-agnostic, and an unsplit multi-tile task is what case (b) runs. What has never run,
+  on the camodel or on silicon, is an unsplit task over more than 4096 rows.
+
+Bench decode rows, aiv 64, block 128, H_KV 1 (K and tasks on 32 MIX blocks):
+
+| model | S | B | fill K / tasks | adaptive K / tasks |
+|---|---|---|---|---|
+| Qwen3.5 4:1 D128 | 2048 | 1 / 4 / 8 | 8/16, 4/32, 2/32 | unchanged |
+| Qwen3.5 4:1 D128 | 32768 | 1 / 4 / 8 | 8/16, 8/32, 8/64 | 8/16, **4/32, 2/32** |
+| GLM-5.2 8:1 D128 | 2048 | 1 / 4 / 8 | 8/32, 2/32, 1/32 | unchanged |
+| GLM-5.2 8:1 D128 | 32768 | 1 / 4 / 8 | 8/32, 8/32, 8/64 | 8/32, **2/32, 1/32** |
+| DeepSeek-V4-Flash 16:1 D256 | 2048 | 1 / 4 / 8 | 4/32, 1/32, 1/32 | unchanged |
+| DeepSeek-V4-Flash 16:1 D256 | 32768 | 1 / 4 / 8 | 8/32, 8/32, 8/64 | **4/32, 1/32, 1/32** |
+
+At S <= 4096 the two policies agree on every row. Qwen 4:1 at H_KV 1 never saturates 32 blocks by B = 8
+(16 base tasks), so it keeps 2 splits there. That is the literal saturation test the user chose, over
+forcing K = 1 at B >= 4.
+
+**Tests.** `test_host_turboquant_tiling` holds the adaptive contract over the whole sweep. It pins the rows above
+(`FusedDecodeAdaptiveSplitsOnlyAnUnderfilledGrid`) and checks that every camodel fused case plans the same grid
+under adaptive as under the policy its golden was recorded with (`FusedDecodeAdaptiveKeepsTheCamodelCaseGrids`).
+The kernel is unchanged, so no camodel case was re-run. `test_sim_950pr_turboquant_multimode` plans with the
+default policy, so its grid may move; per the test-scope rule it was built, not run.
+
+**Bench.** `ASCEND_BENCH_TQ_AUDIT_SPLIT=adaptive|fill|context` (default adaptive) selects the policy for the
+decode leg, its traffic model and the msprof trace. Table B gains a K column and prints the policy. The decode
+CSV gains a trailing `split_policy` column. Silicon A/B:
+`ASCEND_BENCH_TQ_AUDIT_MODELS=qwen35,glm52 ASCEND_BENCH_TQ_AUDIT_S=2048,32768`, once per policy, with
+`ASCEND_BENCH_TQ_AUDIT_DECODE_CSV` set per run. No silicon number exists yet.
