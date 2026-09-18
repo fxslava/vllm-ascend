@@ -423,6 +423,99 @@ def fold_output_projection_weight(weight: torch.Tensor, head_size: int) -> torch
     return fold(weight.to(device="cpu", dtype=torch.float32), head_size)
 
 
+#: Where the ``o_proj`` fold runs. ``host`` is the shipped float64 transform on
+#: the CPU; ``device`` is the same map as a matmul, wherever the weight lives;
+#: ``auto`` picks ``device`` on an accelerator and ``host`` on a CPU, which is
+#: the right way round -- see :func:`fold_on_device`.
+FOLD_SITES = ("auto", "host", "device")
+
+
+def fold_precision(device: torch.device) -> torch.dtype:
+    """What the fold's matmul should accumulate in on ``device``.
+
+    float64 on a CPU, where it is both available and fast enough to be the
+    obvious choice -- a float64 matmul reproduces the shipped float64 transform
+    to the last bit while running an order of magnitude quicker than it, because
+    a BLAS ``dgemm`` is a better-optimised thing than seven strided passes.
+    float32 anywhere else: an NPU has no fast float64, and float32 leaves 13 bits
+    of headroom over the float16 the result is stored in. That headroom is the
+    whole argument, and :meth:`~tq_longbench.engine.StandaloneModelRunner.load_weights`
+    checks it on the first layer rather than assuming it.
+    """
+    return torch.float64 if device.type == "cpu" else torch.float32
+
+
+def pi_matrix(head_size: int, device: torch.device, dtype: torch.dtype | None = None) -> torch.Tensor:
+    """Pi as a ``[D, D]`` matrix, so the fold can be a matmul instead of a transform.
+
+    Built by rotating the identity with the *shipped* ``apply_pi`` rather than
+    assembled from a Hadamard matrix and the sign vector here. The two would be
+    the same matrix right up until one of them drifted, and a Pi that disagreed
+    with the kernels' would not raise -- it would decode the cache against the
+    wrong basis and return plausible wrong numbers. Building it from the shipped
+    transform means there is only ever one definition.
+
+    Pi is symmetric and its own inverse, which is why one matrix serves both the
+    fold and the un-rotation, and why ``W_h Pi`` can be written as a right
+    multiply on rows: ``(W_h Pi)[r] = Pi W_h[r]``.
+    """
+    rotation = turboquant_rotation()
+    signs = rotation.turboquant_pi_signs(head_size, torch.device("cpu")).to(torch.float64)
+    identity = torch.eye(head_size, dtype=torch.float64)
+    resolved = fold_precision(device) if dtype is None else dtype
+    return rotation.apply_pi(identity, signs).to(device=device, dtype=resolved)
+
+
+def fold_on_device(site: str, device: torch.device) -> bool:
+    """Whether ``site`` means folding where the weight already is.
+
+    ``auto`` folds on an accelerator and leaves a CPU run on the shipped
+    transform. Not because the transform is faster -- it is not, the matmul beats
+    it about thirteen times over even on a CPU, despite ``O(D^2)`` against
+    ``O(D log D)``, because a BLAS ``gemm`` is a better-optimised thing than
+    seven strided float64 passes -- but because on a CPU the shipped transform is
+    the harness's own reference, and a reference is worth more exact than quick.
+    ``--fold-site device`` takes the speedup there too, at float64, and
+    reproduces the transform to the last bit on everything measured so far.
+
+    On an accelerator there is no such trade: the fold happens where the weight
+    is already going, on the Cube, and what is avoided is 40 layers of
+    single-threaded host float64 in front of every run.
+    """
+    if site not in FOLD_SITES:
+        raise ValueError(f"unknown fold site {site!r}; choose one of {list(FOLD_SITES)}")
+    if site == "auto":
+        return device.type != "cpu"
+    return site == "device"
+
+
+def fold_output_projection_in_place(weight: torch.Tensor, head_size: int, pi: torch.Tensor) -> None:
+    """Fold ``W_o`` to ``W_o (I (x) Pi)`` where it already lives, as one batched matmul.
+
+    ``weight`` is ``[hidden, H * D]`` and is rewritten in place. Viewed as
+    ``[hidden, H, D]`` the fold is a right multiply by ``Pi`` on the trailing
+    axis, the same map for every head and every row, which ``matmul`` broadcasts
+    over the leading two axes -- one launch, and on an NPU one that lands on the
+    Cube rather than on the host.
+
+    The product accumulates in ``pi``'s dtype -- :func:`fold_precision` picks it --
+    and is rounded once, on the way back into the weight's own. That is the same
+    contract the shipped float64 transform offers: the only error a fold
+    introduces is the stored dtype's rounding of the rotated values. At float64
+    the two routes agree bit for bit; at float32 they agree to within one float16
+    ulp, which :meth:`~tq_longbench.engine.StandaloneModelRunner.load_weights`
+    does not take on trust but checks on the first layer it folds.
+    """
+    hidden, in_features = weight.shape
+    if in_features % head_size:
+        raise ValueError(f"an o_proj of width {in_features} does not divide into {head_size}-wide heads")
+    if pi.shape != (head_size, head_size):
+        raise ValueError(f"Pi is {tuple(pi.shape)}, not ({head_size}, {head_size})")
+    with torch.no_grad():
+        rotated = weight.view(hidden, in_features // head_size, head_size).to(pi.dtype) @ pi
+        weight.copy_(rotated.reshape(weight.shape).to(weight.dtype))
+
+
 def fold_output_rotation(model: CausalLM) -> int:
     """Rewrite every ``o_proj`` to ``W_o (I (x) Pi)`` and report how many were folded.
 

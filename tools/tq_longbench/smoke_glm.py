@@ -95,7 +95,12 @@ from dataclasses import dataclass, field  # noqa: E402
 import torch  # noqa: E402
 
 from tq_longbench._ascend import assert_no_vllm_imported, turboquant_layout  # noqa: E402
-from tq_longbench.engine import DEFAULT_CHUNK_SIZE, PREFILL_MODES, RunnerConfig, StandaloneModelRunner  # noqa: E402
+from tq_longbench.engine import (  # noqa: E402
+    DEFAULT_CHUNK_SIZE,
+    PREFILL_MODES,
+    RunnerConfig,
+    StandaloneModelRunner,
+)
 from tq_longbench.glm4 import (  # noqa: E402
     GLM4_BATCHED_DECODE_MIN_TOKENS,
     glm4_model_shape,
@@ -103,6 +108,7 @@ from tq_longbench.glm4 import (  # noqa: E402
     is_glm4_config,
     read_config,
 )
+from tq_longbench.layers import FOLD_SITES  # noqa: E402
 from tq_longbench.ops import (  # noqa: E402
     DENSE_BACKENDS,
     LayerShape,
@@ -179,6 +185,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="no tokenizer at all: run a 64-token prompt of ones through the short-prompt stage only "
         "(kernel sanity check; skips needle in a haystack)",
+    )
+    parser.add_argument(
+        "--fold-site",
+        default="auto",
+        choices=list(FOLD_SITES),
+        help="where the o_proj fold runs: auto (the device when there is one), host, or device",
     )
     parser.add_argument("--seed", type=int, default=0)
     return parser
@@ -505,6 +517,7 @@ def build_runner(
             # A dense baseline's decode never rotates anything, so there is nothing to fold for.
             fold_output_rotation=not args.no_fold_output_rotation and backend not in DENSE_BACKENDS,
             seed=args.seed,
+            fold_site=args.fold_site,
             dense_attention_api=dense_attention_api,
             dense_staging_backend=dense_staging_backend,
         )
@@ -698,6 +711,7 @@ def main(argv: list[str] | None = None) -> int:
     # Both of these used to be decided silently, by which transformers happened
     # to be installed. An empty stop set in particular is invisible from the
     # output: it looks exactly like a model with more to say.
+    print(f"  {runner.fold_report.describe()}")
     print(f"  prompt: {prompt_route(tokenizer, use_chat_template, glm4=True)}")
     print(f"  stop ids: {sorted(eos_ids) if eos_ids else 'NONE -- generation will run its whole budget'}")
     memory = runner.memory_report()

@@ -63,6 +63,7 @@ if str(REPO_ROOT / "tools") not in sys.path:
     sys.path.append(str(REPO_ROOT / "tools"))
 
 from tq_longbench import _ascend, build_turboquant_ops  # noqa: E402
+from tq_longbench import engine as engine_module  # noqa: E402
 from tq_longbench import ops as ops_module  # noqa: E402
 from tq_longbench import preflight as preflight_module  # noqa: E402
 from tq_longbench._ascend import assert_no_vllm_imported, turboquant_layout, turboquant_rotation  # noqa: E402
@@ -76,7 +77,14 @@ from tq_longbench.glm4 import (  # noqa: E402
     is_glm4_config,
 )
 from tq_longbench.kv_cache import CacheGeometry, DenseKVCache, TurboQuantKVCache, dense_equivalent_bytes  # noqa: E402
-from tq_longbench.layers import ModelShape, RotaryEmbedding  # noqa: E402
+from tq_longbench.layers import (  # noqa: E402
+    ModelShape,
+    RotaryEmbedding,
+    fold_on_device,
+    fold_output_projection_in_place,
+    fold_precision,
+    pi_matrix,
+)
 from tq_longbench.ops import (  # noqa: E402
     DENSE_BACKENDS,
     CANNDenseBackend,
@@ -1773,6 +1781,149 @@ class TestGlm4ChatPrompt(unittest.TestCase):
         self.assertIn("assembled here", prompt_route(plain, use_chat_template=True, glm4=True))
         self.assertIn("raw", prompt_route(plain, use_chat_template=False, glm4=True))
         self.assertIn("not GLM-4", prompt_route(plain, use_chat_template=True, glm4=False))
+
+
+class TestOutputProjectionFold(unittest.TestCase):
+    """Pi as a matrix, and the fold as a matmul instead of a transform.
+
+    The fold was seven strided float64 passes per layer on the host, in front of
+    every run. The same map written as a right multiply by a ``[D, D]`` matrix is
+    what a Cube is built for -- and, it turns out, what a BLAS ``gemm`` is too, so
+    the matmul wins on a CPU as well despite ``O(D^2)`` against ``O(D log D)``.
+    """
+
+    HEAD_SIZE = 128
+
+    def _pi(self, dtype=torch.float64):
+        return pi_matrix(self.HEAD_SIZE, CPU, dtype)
+
+    def test_pi_is_built_from_the_shipped_transform(self):
+        """Not assembled here from a Hadamard and the signs: there is one definition.
+
+        A second copy of Pi would not raise when it drifted -- it would rotate the
+        cache into a basis the kernels do not share and return plausible numbers.
+        """
+        rotation = turboquant_rotation()
+        signs = rotation.turboquant_pi_signs(self.HEAD_SIZE, CPU).to(torch.float64)
+        pi = self._pi()
+        torch.manual_seed(0)
+        x = torch.randn(5, 3, self.HEAD_SIZE, dtype=torch.float64)
+        # The matrix *is* the transform: applying one is multiplying by the other.
+        torch.testing.assert_close(rotation.apply_pi(x, signs), x @ pi)
+
+    def test_pi_is_a_symmetric_involution(self):
+        """Which is why one matrix serves both the fold and the un-rotation."""
+        pi = self._pi()
+        torch.testing.assert_close(pi, pi.T)
+        torch.testing.assert_close(pi @ pi, torch.eye(self.HEAD_SIZE, dtype=torch.float64))
+
+    def test_the_matmul_fold_reproduces_the_shipped_one_exactly(self):
+        """At float64 the two routes agree to the last bit, on both stored dtypes."""
+        rotation = turboquant_rotation()
+        torch.manual_seed(0)
+        for dtype in (torch.float16, torch.float32):
+            with self.subTest(stored=dtype):
+                weight = torch.randn(256, 512, dtype=dtype)
+                shipped = rotation.fold_pi_into_output_projection(weight, self.HEAD_SIZE)
+                mine = weight.clone()
+                fold_output_projection_in_place(mine, self.HEAD_SIZE, self._pi())
+                self.assertTrue(torch.equal(shipped, mine))
+
+    def test_float32_accumulation_stays_inside_one_float16_ulp(self):
+        """What an NPU will actually do, held to what the host would have done.
+
+        float32 is not float64 and the two do not agree bit for bit. What matters
+        is that the disagreement is smaller than the float16 the result is stored
+        in, so the fold's only error is still that dtype's rounding.
+        """
+        rotation = turboquant_rotation()
+        torch.manual_seed(0)
+        weight = torch.randn(512, 512, dtype=torch.float16)
+        shipped = rotation.fold_pi_into_output_projection(weight, self.HEAD_SIZE)
+        mine = weight.clone()
+        fold_output_projection_in_place(mine, self.HEAD_SIZE, self._pi(torch.float32))
+        largest = float((shipped.to(torch.float64) - mine.to(torch.float64)).abs().max())
+        self.assertLessEqual(largest, 2 * float(torch.finfo(torch.float16).eps))
+        self.assertGreater(cosine(mine, shipped), 0.99999999)
+
+    def test_the_precision_follows_the_device(self):
+        """float64 where it is fast, float32 where there is no fast float64."""
+        self.assertIs(fold_precision(CPU), torch.float64)
+        self.assertIs(fold_precision(types.SimpleNamespace(type="npu")), torch.float32)
+        self.assertEqual(pi_matrix(self.HEAD_SIZE, CPU).dtype, torch.float64)
+
+    def test_where_the_fold_runs_follows_the_site(self):
+        npu = types.SimpleNamespace(type="npu")
+        self.assertFalse(fold_on_device("auto", CPU))
+        self.assertTrue(fold_on_device("auto", npu))
+        self.assertFalse(fold_on_device("host", npu))
+        self.assertTrue(fold_on_device("device", CPU))
+        with self.assertRaisesRegex(ValueError, "unknown fold site"):
+            fold_on_device("elsewhere", CPU)
+
+    def test_a_misshapen_projection_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "does not divide"):
+            fold_output_projection_in_place(torch.zeros(4, 130), self.HEAD_SIZE, self._pi())
+        with self.assertRaisesRegex(ValueError, "Pi is"):
+            fold_output_projection_in_place(torch.zeros(4, 256), self.HEAD_SIZE, self._pi()[:4, :4])
+
+
+class TestFoldSiteEndToEnd(_Glm4TinyCheckpoint):
+    """The two sites through the whole loader, on the tiny checkpoint."""
+
+    def _folded(self, site: str):
+        # Written once per test: _write creates the directory, so a second call
+        # for the second site would fail before anything was folded.
+        if not hasattr(self, "_path"):
+            self._path = self._write("chatglm", TINY_GLM, self.tensors)
+        return self._runner(self._path, backend="turboquant_reference", fold_output_rotation=True, fold_site=site)
+
+    def test_both_sites_fold_every_layer_to_the_same_weights(self):
+        host, device = self._folded("host"), self._folded("device")
+        fold = turboquant_rotation().fold_pi_into_output_projection
+        for index, (left, right) in enumerate(zip(host.model.layers, device.model.layers)):
+            with self.subTest(layer=index):
+                original = self.tensors[f"transformer.encoder.layers.{index}.self_attention.dense.weight"]
+                expected = fold(original.to(torch.float32), TINY_GLM["kv_channels"])
+                self.assertTrue(torch.equal(left.self_attn.o_proj.weight, expected))
+                self.assertTrue(torch.equal(right.self_attn.o_proj.weight, expected))
+
+    def test_both_sites_generate_the_same_tokens(self):
+        host = self._folded("host").generate(self.token_ids)[0]
+        device = self._folded("device").generate(self.token_ids)[0]
+        self.assertEqual(host, device)
+
+    def test_the_run_says_where_it_folded_and_what_it_cost(self):
+        for site in ("host", "device"):
+            with self.subTest(site=site):
+                report = self._folded(site).fold_report
+                self.assertEqual(report.folded, TINY_GLM["num_layers"])
+                self.assertEqual(report.site, site)
+                self.assertIn(f"on the {site}", report.describe())
+
+    def test_a_run_that_folds_nothing_still_has_a_report(self):
+        """Printed unconditionally, so it must exist before load_weights runs."""
+        self.assertEqual(self._runner(self._write("chatglm", TINY_GLM, self.tensors)).fold_report.folded, 0)
+
+    def test_an_unknown_fold_site_is_refused_at_config_time(self):
+        with self.assertRaisesRegex(ValueError, "unknown fold_site"):
+            RunnerConfig(model_path="<random weights>", fold_site="somewhere")
+
+    def test_a_device_fold_that_does_not_reproduce_the_host_one_is_refused(self):
+        """The check that catches a device whose float32 matmul is not float32.
+
+        Simulated by folding through a Pi that is not Pi -- which is the shape of
+        the failure a reduced-precision matmul would produce, and which nothing
+        downstream would raise on: the run would be fluent and wrong.
+        """
+        self._folded("host")  # writes the checkpoint
+        blunt = mock.patch.object(
+            engine_module,
+            "pi_matrix",
+            return_value=torch.eye(TINY_GLM["kv_channels"], dtype=torch.float64),
+        )
+        with blunt, self.assertRaisesRegex(RuntimeError, "does not reproduce the host fold"):
+            self._folded("device")
 
 
 class TestGlm4LegacyTokenizer(unittest.TestCase):

@@ -47,14 +47,18 @@ from pathlib import Path
 import torch
 
 from tq_longbench import glm4
-from tq_longbench._ascend import assert_no_vllm_imported
+from tq_longbench._ascend import assert_no_vllm_imported, turboquant_rotation
 from tq_longbench.kv_cache import CacheGeometry, dense_equivalent_bytes
 from tq_longbench.layers import (
+    FOLD_SITES,
     CausalLM,
     ForwardBatch,
     ModelShape,
+    fold_on_device,
+    fold_output_projection_in_place,
     fold_output_projection_weight,
     fold_output_rotation,
+    pi_matrix,
     require_foldable,
 )
 from tq_longbench.ops import (
@@ -79,6 +83,18 @@ _O_PROJ_WEIGHT_SUFFIX = "self_attn.o_proj.weight"
 
 #: ``(checkpoint name, tensor) -> [(harness parameter, tensor), ...]``; empty to skip.
 CheckpointMapper = Callable[[str, torch.Tensor], list[tuple[str, torch.Tensor]]]
+
+
+@dataclass(frozen=True)
+class FoldReport:
+    """How many ``o_proj`` weights were folded, where, and what it cost."""
+
+    folded: int
+    site: str
+    seconds: float
+
+    def describe(self) -> str:
+        return f"{self.folded} o_proj folded on the {self.site} in {self.seconds:.2f} s"
 
 
 @dataclass
@@ -107,6 +123,11 @@ class RunnerConfig:
     #: the preferred one is refused here -- an Ascend 950 stages through
     #: ``cann_dense``, because op-plugin's fused attention is refused on it.
     dense_staging_backend: str | None = None
+    #: Where the ``o_proj`` fold runs (``layers.FOLD_SITES``). ``auto`` folds on
+    #: the device when there is one: the shipped float64 transform is 40 layers
+    #: of single-threaded host work, and the same map is a matmul the Cube does
+    #: while the next shard is still being read.
+    fold_site: str = "auto"
 
     def __post_init__(self) -> None:
         if self.prefill_mode not in PREFILL_MODES:
@@ -118,6 +139,8 @@ class RunnerConfig:
             )
         if self.chunk_size <= 0:
             raise ValueError(f"chunk_size must be positive, got {self.chunk_size}")
+        if self.fold_site not in FOLD_SITES:
+            raise ValueError(f"unknown fold_site {self.fold_site!r}; choose one of {list(FOLD_SITES)}")
         if self.dense_staging_backend is not None and self.dense_staging_backend not in DENSE_BACKENDS:
             raise ValueError(
                 f"dense_staging_backend {self.dense_staging_backend!r} does not decode out of an unquantised "
@@ -247,6 +270,8 @@ class StandaloneModelRunner:
 
         self.model = CausalLM(self.shape, config.max_seq_len, config.dtype, self.device)
         self.model.eval()
+        #: Filled by :meth:`load_weights`; a run with random weights folds nothing.
+        self.fold_report = FoldReport(0, "host", 0.0)
         if config.fold_output_rotation:
             require_foldable(self.shape)
         if not config.random_weights:
@@ -358,8 +383,12 @@ class StandaloneModelRunner:
         destinations = dict(self.model.named_parameters())
         mapper = self._checkpoint_mapper()
         fold = self.config.fold_output_rotation
+        on_device = fold and fold_on_device(self.config.fold_site, self.device)
+        pi = pi_matrix(self.shape.head_size, self.device) if on_device else None
         filled: set[str] = set()
         folded = 0
+        checked_the_device_fold = False
+        fold_seconds = 0.0
         for shard in shards:
             # One shard resident at a time: a 128k-context run has no headroom
             # for the whole checkpoint in host memory alongside the pools.
@@ -373,11 +402,27 @@ class StandaloneModelRunner:
                             f"{name} is {tuple(piece.shape)} in the checkpoint but {tuple(parameter.shape)} in the "
                             f"harness. If this is a gated model, pass --attn-output-gate."
                         )
-                    if fold and target.endswith(_O_PROJ_WEIGHT_SUFFIX):
+                    is_o_proj = fold and target.endswith(_O_PROJ_WEIGHT_SUFFIX)
+                    started = time.perf_counter()
+                    if is_o_proj and not on_device:
                         piece = fold_output_projection_weight(piece, self.shape.head_size)
-                        folded += 1
+                    fold_seconds += time.perf_counter() - started if is_o_proj else 0.0
                     with torch.no_grad():
                         parameter.copy_(piece.to(device=self.device, dtype=parameter.dtype))
+                    if is_o_proj and on_device:
+                        started = time.perf_counter()
+                        fold_output_projection_in_place(parameter, self.shape.head_size, pi)
+                        if not checked_the_device_fold:
+                            # Once, on the first one: the matmul accumulates in
+                            # float32, and a device that quietly gives a matmul
+                            # less precision than that would fold every layer
+                            # slightly wrong and raise nowhere. Checked against
+                            # the weight it came from, so it is the fold that is
+                            # under test rather than the route.
+                            self._check_device_fold(piece, parameter)
+                            checked_the_device_fold = True
+                        fold_seconds += time.perf_counter() - started
+                    folded += is_o_proj
                     filled.add(target)
 
         unfilled = sorted(set(destinations) - filled)
@@ -392,7 +437,31 @@ class StandaloneModelRunner:
             # A layer the decode treats as folded but whose o_proj was not would
             # hand the rotated basis to a projection that does not undo it.
             raise RuntimeError(f"folded {folded} o_proj weights for {self.shape.num_layers} layers")
+        self.fold_report = FoldReport(folded, "device" if on_device else "host", fold_seconds)
         return len(filled)
+
+    def _check_device_fold(self, original: torch.Tensor, folded: torch.Tensor) -> None:
+        """Hold one device-folded projection to the float64 host route it replaces.
+
+        ``validate_output_projection_fold`` draws rotated attention outputs and
+        compares ``o~ W_folded`` against ``o W_original`` -- which is the product
+        the decode actually forms, rather than the weights side by side. A fold
+        that is wrong in the way a reduced-precision matmul would make it wrong
+        shows up there and nowhere else: the run would otherwise be fluent.
+        """
+        rotation = turboquant_rotation()
+        report = rotation.validate_output_projection_fold(
+            original.to(device="cpu", dtype=torch.float32),
+            folded.to(device="cpu", dtype=torch.float32),
+            self.shape.head_size,
+        )
+        if not report.passed():
+            raise RuntimeError(
+                f"the o_proj fold on {self.device} does not reproduce the host fold: cosine "
+                f"{report.min_cosine:.6f} over {report.num_samples} samples, relative error "
+                f"{report.max_relative_error:.3e}. This device's float32 matmul is not float32 enough to "
+                "fold through; re-run with fold_site='host' (--fold-site host)."
+            )
 
     # ---------------------------------------------------------------- memory
 

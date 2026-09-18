@@ -95,6 +95,7 @@ quiet_tensorflow()
 from tq_longbench._ascend import assert_no_vllm_imported  # noqa: E402
 from tq_longbench.engine import DEFAULT_CHUNK_SIZE, PREFILL_MODES, RunnerConfig, StandaloneModelRunner  # noqa: E402
 from tq_longbench.glm4 import glm4_prefill_mode, is_glm4_config, read_config  # noqa: E402
+from tq_longbench.layers import FOLD_SITES  # noqa: E402
 from tq_longbench.ops import DENSE_BACKENDS, backend_names  # noqa: E402
 from tq_longbench.tasks import needle_in_a_haystack, needle_report  # noqa: E402
 
@@ -166,6 +167,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-preflight",
         action="store_true",
         help="skip the synthetic one-layer probe of every attention path before the weights load",
+    )
+    parser.add_argument(
+        "--fold-site",
+        default="auto",
+        choices=list(FOLD_SITES),
+        help="where the o_proj fold runs: auto (the device when there is one), host, or device",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out-file", type=Path, default=None, help="JSONL results; stdout if omitted")
@@ -244,6 +251,7 @@ def build_runner(
             # A dense baseline's decode never rotates anything, so there is nothing to fold for.
             fold_output_rotation=not args.no_fold_output_rotation and backend not in DENSE_BACKENDS,
             seed=args.seed,
+            fold_site=args.fold_site,
             dense_attention_api=plan.dense_api_for(backend),
             dense_staging_backend=plan.staging_backend,
         )
