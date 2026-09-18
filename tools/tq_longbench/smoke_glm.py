@@ -116,7 +116,7 @@ from tq_longbench.preflight import (  # noqa: E402
     select_dense_api,
     select_dense_backend,
 )
-from tq_longbench.tasks import needle_in_a_haystack  # noqa: E402
+from tq_longbench.tasks import needle_in_a_haystack, needle_report  # noqa: E402
 
 _DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
 
@@ -610,21 +610,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.tokens:
         print(f"\n=== 3. needle in a haystack at ~{args.tokens} tokens ===")
         keep = max_seq_len - CONTEXT_HEADROOM_TOKENS - args.max_new_tokens
-        hits = 0
+        hits = clean = 0
         for depth in depths:
             item = needle_in_a_haystack(args.tokens, depth=depth, seed=int(depth * 100) + args.seed)
             prompt_ids = truncate_middle(encode(tokenizer, item.prompt, use_chat_template), keep)
             produced, metrics = runner.generate(prompt_ids.to(runner.device), max_new_tokens=args.max_new_tokens)
             answer, failure = decode_text(tokenizer, stop_at_eos(produced, eos_ids))
-            found = item.answers[0] in answer
-            hits += found
+            report = needle_report(answer, item.answers[0], item.extra.get("city"))
+            hits += report.found
+            clean += report.clean
             summary = metrics.summary()
             print(
-                f"    depth {depth:<5} tokens={prompt_ids.numel():>7} found={str(found):5s} "
+                f"    depth {depth:<5} tokens={prompt_ids.numel():>7} {report.describe():<11s} "
                 f"ttft {summary['ttft_ms']:.0f} ms decode p50 {summary['decode_p50_us']:.0f} us "
                 f"{answer.strip()[:40]!r}" + (f" <undecodable: {failure}>" if failure else "")
             )
-        print(f"  {args.backend}: {hits}/{len(depths)} retrieved")
+        # Both counts, always: a run where they differ retrieved the needle and
+        # then kept going, which "3/3 retrieved" on its own reads as a clean pass.
+        print(f"  {args.backend}: {hits}/{len(depths)} retrieved, {clean}/{len(depths)} clean")
     return 0
 
 

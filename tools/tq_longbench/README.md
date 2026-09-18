@@ -217,11 +217,57 @@ smoke_glm.py     GLM-4 end to end: the folded-o_proj contract, a prompt, NIAH
 diagnose.py      per-layer quantisation loss on real weights
 ```
 
+## Scoring the needle
+
+`found` is the passcode appearing in the continuation **as a whole token**
+(`needle_match`), not as a substring: `894772` does not match `1894772`, so a
+model that invented a longer number cannot score. Reciting the needle's sentence
+without the number scores nothing.
+
+That verdict is necessary and not sufficient, which is why `needle_report`
+travels with it. A continuation can carry the passcode and still be worth
+looking at:
+
+| column | meaning |
+|---|---|
+| `found` | the passcode is in there, wherever |
+| `answered_first` | it is the *first* number produced — the model answered rather than wandered into it |
+| `first_number` | what it did lead with, so a miss can be read |
+| `echoed_prompt` | the needle sentence or the question came back too: recitation, still retrieval |
+| `degenerate` | the continuation is a loop |
+| `clean` | found, led with it, did not loop |
+
+Both counts are printed, always. `5/5 retrieved, 3/5 clean` is a run that
+answered correctly five times and then kept talking twice — which `5/5` on its
+own reads as an unqualified pass, and which is exactly how a set of answers like
+`894772. The secret passcode for ` and `581850. 581850. 581850. ` came to be
+reported as clean. Per-item verdicts are `found`, `found+late`, `found+loop` and
+`missed`.
+
 ## Tests
 
 ```bash
 python -m unittest tests.ut._tools.test_tq_longbench -v
 ```
+
+One GLM-4 attention layer at the lengths the short cases never reach — 32 heads
+over 4 kv heads, `D=128`, `rotary_dim=64` interleaved, a 3072-token prefill in
+2048-token chunks and a decode over a 4096-token prefix — lives on its own
+because it is minutes rather than milliseconds:
+
+```bash
+python -m unittest tests.ut._tools.test_attention_layer_cpu_equiv -v
+```
+
+Every backend is held to naive causal attention computed in float32 on the host,
+never to another backend, and each case prints the cosine it measured rather
+than only whether it passed. `TQ_EQUIV_SLOW=0` skips the two long cases and
+leaves the RoPE ones; `TQ_EQUIV_DEVICE=npu:0` runs the whole file on a device,
+which is the only way to include `turboquant_cube` (it has no CPU stand-in by
+design). The cross-chunk case scores the second chunk against a *deliberately
+broken* reference as well as the right one, and asserts the two disagree first —
+a cosine that only ever sees the right answer says nothing about what it would
+do with the wrong one.
 
 Runs on any host — no NPU, no pytest, no vLLM. The CPU operator stand-ins
 (`tests/ut/attention/turboquant_cpu_ops.py`) compute what the device computes, so

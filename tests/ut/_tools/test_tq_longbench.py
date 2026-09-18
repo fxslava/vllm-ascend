@@ -96,7 +96,15 @@ from tq_longbench.preflight import (  # noqa: E402
     select_dense_backend,
 )
 from tq_longbench.reference import DenseReferenceBackend, TurboQuantReferenceBackend  # noqa: E402
-from tq_longbench.tasks import f1_score, needle_in_a_haystack, rouge_l, score  # noqa: E402
+from tq_longbench.tasks import (  # noqa: E402
+    f1_score,
+    needle_in_a_haystack,
+    needle_match,
+    needle_report,
+    rouge_l,
+    score,
+    substring_match,
+)
 
 CPU = torch.device("cpu")
 DTYPE = torch.bfloat16
@@ -584,6 +592,85 @@ class TestTaskScoring(unittest.TestCase):
             self.assertAlmostEqual(found / len(body), depth, delta=0.15)
 
 
+class TestNeedleScoring(unittest.TestCase):
+    """What ``found`` means, and what it deliberately does not.
+
+    Written after a run printed ``5/5 retrieved`` over continuations that had
+    answered correctly and then recited the haystack. The verdict was right --
+    every one of those had the passcode -- and the table had nowhere to say the
+    rest. These cases pin both halves: the scoring is strict about the passcode,
+    and the report is explicit about the rambling.
+    """
+
+    NEEDLE = "894772"
+
+    def test_a_longer_number_containing_the_needle_is_not_the_needle(self):
+        """The one way a substring match over digits can be generous, closed."""
+        for invented in ("1894772", "8947720", "18947720"):
+            with self.subTest(prediction=invented):
+                self.assertEqual(substring_match(f"the code is {invented}", self.NEEDLE), 1.0)
+                self.assertEqual(needle_match(f"the code is {invented}", self.NEEDLE), 0.0)
+        self.assertEqual(needle_match(f"the code is {self.NEEDLE}", self.NEEDLE), 1.0)
+
+    def test_the_boilerplate_without_the_passcode_scores_nothing(self):
+        """Reciting the needle's sentence is not answering with the needle."""
+        for recited in (
+            "The secret passcode for Valencia is",
+            "the secret passcode for Valencia is not in the document",
+            "I could not find a passcode.",
+        ):
+            with self.subTest(prediction=recited):
+                self.assertEqual(needle_match(recited, self.NEEDLE), 0.0)
+                self.assertFalse(needle_report(recited, self.NEEDLE, "Valencia").found)
+
+    def test_the_niah_item_scores_on_the_token_boundary_metric(self):
+        item = needle_in_a_haystack(1024, depth=0.5)
+        self.assertEqual(item.metric, "needle_match")
+        self.assertEqual(score(f"the code is {item.answers[0]}", item.answers, item.metric), 1.0)
+        self.assertEqual(score(f"the code is 9{item.answers[0]}", item.answers, item.metric), 0.0)
+
+    def test_an_answer_followed_by_a_ramble_is_found_but_not_clean(self):
+        """The depth-0.75 shape: right answer, then the haystack's own filler."""
+        report = needle_report(f"{self.NEEDLE}. blue. Trees grow slowly near the river.", self.NEEDLE, "Valencia")
+        self.assertTrue(report.found)
+        self.assertTrue(report.answered_first)
+        self.assertEqual(report.first_number, self.NEEDLE)
+        self.assertFalse(report.degenerate)
+        self.assertTrue(report.clean)
+        self.assertEqual(report.describe(), "found")
+
+    def test_a_repetition_loop_is_found_but_never_clean(self):
+        """The depth-1.0 shape: the passcode, then the passcode, then the passcode."""
+        report = needle_report(f"{self.NEEDLE}. " * 8, self.NEEDLE, "Valencia")
+        self.assertTrue(report.found)
+        self.assertTrue(report.degenerate)
+        self.assertFalse(report.clean)
+        self.assertEqual(report.describe(), "found+loop")
+
+    def test_a_passcode_reached_late_is_marked_late(self):
+        """Wandering the haystack and hitting the number on the way is not answering."""
+        report = needle_report(f"There are 12 trees and 7 paths. {self.NEEDLE}", self.NEEDLE, "Valencia")
+        self.assertTrue(report.found)
+        self.assertFalse(report.answered_first)
+        self.assertEqual(report.first_number, "12")
+        self.assertEqual(report.describe(), "found+late")
+
+    def test_an_ordinary_sentence_is_not_a_loop(self):
+        """The degeneracy rule has to leave real answers alone."""
+        for prose in (
+            f"The secret passcode for Valencia is {self.NEEDLE}.",
+            f"{self.NEEDLE}",
+            f"Based on the document, the passcode you asked about is {self.NEEDLE}.",
+        ):
+            with self.subTest(prediction=prose):
+                self.assertFalse(needle_report(prose, self.NEEDLE, "Valencia").degenerate)
+
+    def test_echoing_the_needle_sentence_is_flagged_but_still_retrieval(self):
+        report = needle_report(f"The secret passcode for Valencia is {self.NEEDLE}.", self.NEEDLE, "Valencia")
+        self.assertTrue(report.echoed_prompt)
+        self.assertTrue(report.found)
+
+
 class TestReferenceMatchesTheStandIns(_TurboQuantCase):
     """The torch backends carry the whole correctness argument for a run with no NPU.
 
@@ -949,8 +1036,9 @@ class TestPython39Compatibility(unittest.TestCase):
         "vllm_ascend/attention/turboquant_rotation.py",
         "vllm_ascend/attention/turboquant_layout.py",
         "tests/ut/attention/turboquant_cpu_ops.py",
-        # This file too: the 3.9 host imports it before any test can run.
+        # These too: the 3.9 host imports them before any test can run.
         "tests/ut/_tools/test_tq_longbench.py",
+        "tests/ut/_tools/test_attention_layer_cpu_equiv.py",
         *sorted(path.relative_to(REPO_ROOT).as_posix() for path in (REPO_ROOT / "tools" / "tq_longbench").glob("*.py")),
     )
 
@@ -1394,6 +1482,10 @@ class TestRunBenchmark(unittest.TestCase):
                 self.assertEqual(record["generated_tokens"], self.NEW_TOKENS)
                 self.assertIsInstance(record["found"], bool)
                 self.assertIsNone(record["decode_failure"])
+                # The verdict columns travel with the record, not just the count:
+                # a results file that says only "found" cannot be re-read later.
+                self.assertIn(record["verdict"], ("missed", "found", "found+late", "found+loop", "found+late+loop"))
+                self.assertEqual(record["clean"], record["found"] and "+" not in record["verdict"])
 
     def test_the_record_carries_the_metrics_the_ladder_exists_to_report(self):
         """TTFT, the decode percentiles and the memory, each measured rather than derived."""
@@ -1431,6 +1523,11 @@ class TestRunBenchmark(unittest.TestCase):
         for line, context in zip(lines, self.CONTEXTS):
             self.assertIn(str(context), line)
             self.assertIn(f"/{len(self.DEPTHS)}", line)
+        # Retrieved and clean are both columns, so a rambling run cannot read as
+        # an unqualified pass. This is the regression for that reading.
+        header = next(line for line in printed.splitlines() if "retrieved" in line)
+        self.assertIn("clean", header)
+        self.assertIn("retrieved > clean", printed)
 
     def test_tensorflow_is_off_before_transformers_can_be_imported(self):
         """A TensorFlow that predates NumPy 2 makes ``import transformers`` raise, not warn."""

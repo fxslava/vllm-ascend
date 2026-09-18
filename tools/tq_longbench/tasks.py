@@ -166,11 +166,30 @@ def substring_match(prediction: str, ground_truth: str) -> float:
     return float(normalize_answer(ground_truth) in normalize_answer(prediction))
 
 
+def needle_match(prediction: str, ground_truth: str) -> float:
+    """The needle as a **whole token** of the continuation, not as a substring of one.
+
+    :func:`substring_match` is what LongBench-style retrieval usually means, and
+    for a passcode it is one character too generous: the needle ``894772`` is a
+    substring of ``1894772`` and of ``8947720``, so a model that emitted a longer
+    number it invented would score as having retrieved. Tokenising both sides
+    first closes that, and closes nothing else -- a continuation that carries the
+    passcode anywhere still counts, which is the point of the task.
+
+    It does not, and cannot, distinguish a retrieved needle from a recited one:
+    a model that copies the whole needle sentence out of the prompt has still
+    read it out of the context. :func:`needle_report` is what separates answering
+    from rambling.
+    """
+    return float(normalize_answer(ground_truth) in normalize_answer(prediction).split())
+
+
 METRICS = {
     "f1": f1_score,
     "rouge_l": rouge_l,
     "exact_match": exact_match,
     "substring_match": substring_match,
+    "needle_match": needle_match,
 }
 
 _TASK_METRICS = {
@@ -191,6 +210,87 @@ def score(prediction: str, answers: list[str], metric: str) -> float:
 
 
 # -------------------------------------------------------------------- items
+
+
+@dataclass(frozen=True)
+class NeedleReport:
+    """What a continuation did with the needle, past the yes/no of finding it.
+
+    ``found`` alone is what made a run of answers like ``"894772. The secret
+    passcode for "`` and ``"581850. 581850. 581850. "`` print as ``5/5``: every
+    one of them *had* retrieved the passcode, and the table had no column in
+    which the rest of the sentence could appear. These are those columns.
+
+    ``found`` is still the retrieval verdict, and still the only one used to
+    score. The rest describe the continuation around it:
+
+    * ``answered_first`` -- the needle is the first number in the continuation.
+      A model that answers and stops has it; a model that wanders through the
+      haystack and hits the passcode on the way does not.
+    * ``first_number`` -- what it did lead with, so a miss can be read.
+    * ``echoed_prompt`` -- the needle sentence or the question came back with it,
+      which is recitation rather than an answer, though still retrieval.
+    * ``degenerate`` -- the continuation is a loop. Not a retrieval failure and
+      not scored as one, but it is what a collapsing decode looks like, so it
+      does not belong hidden inside a passing row.
+    """
+
+    found: bool
+    answered_first: bool
+    first_number: str | None
+    echoed_prompt: bool
+    degenerate: bool
+
+    @property
+    def clean(self) -> bool:
+        """Retrieved, led with it, and did not fall into a loop."""
+        return self.found and self.answered_first and not self.degenerate
+
+    def describe(self) -> str:
+        """The one-word verdict for a results table."""
+        if not self.found:
+            return "missed"
+        flags = [name for name, on in (("late", not self.answered_first), ("loop", self.degenerate)) if on]
+        return "found" if not flags else "found+" + "+".join(flags)
+
+
+def needle_report(prediction: str, needle: str, city: str | None = None) -> NeedleReport:
+    """Score one continuation against one passcode, and describe what else it did.
+
+    ``needle`` is the passcode itself. ``city`` is the needle sentence's subject
+    when there is one; it only sharpens ``echoed_prompt``, which is a diagnostic,
+    never the verdict.
+    """
+    normalized = normalize_answer(prediction)
+    words = normalized.split()
+    numbers = [word for word in words if word.isdigit()]
+    target = normalize_answer(needle)
+    stem = normalize_answer(_NIAH_NEEDLE.format(city=city or "", code="")).replace(" is", "").strip()
+    return NeedleReport(
+        found=target in words,
+        answered_first=bool(numbers) and numbers[0] == target,
+        first_number=numbers[0] if numbers else None,
+        echoed_prompt=bool(stem) and stem in normalized,
+        degenerate=_is_degenerate(words),
+    )
+
+
+#: A continuation this long or longer is judged for repetition; below it there is
+#: not enough of one to tell a loop from an answer that happens to repeat a word.
+_DEGENERATE_MIN_WORDS = 6
+
+#: Distinct words over total, under which the continuation is a loop rather than a
+#: sentence. "581850. 581850. 581850. 581850." is 0.25; ordinary English prose does
+#: not come near it until it is hundreds of words long, which a needle answer is not.
+_DEGENERATE_DISTINCT_RATIO = 0.35
+
+
+def _is_degenerate(words: list[str]) -> bool:
+    """Whether a continuation is repeating itself rather than saying something."""
+    if len(words) < _DEGENERATE_MIN_WORDS:
+        return False
+    return len(set(words)) / len(words) < _DEGENERATE_DISTINCT_RATIO
+
 
 _NIAH_NEEDLE = "The secret passcode for {city} is {code}."
 _NIAH_QUESTION = "What is the secret passcode for {city}?"
@@ -241,7 +341,7 @@ def needle_in_a_haystack(
     return EvalItem(
         prompt=prompt,
         answers=[code],
-        metric="substring_match",
+        metric="needle_match",
         max_new_tokens=16,
         extra={"task": NIAH_TASK, "depth": depth, "city": city, "approximate_tokens": approximate_tokens},
     )

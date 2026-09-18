@@ -95,7 +95,7 @@ from tq_longbench._ascend import assert_no_vllm_imported  # noqa: E402
 from tq_longbench.engine import DEFAULT_CHUNK_SIZE, PREFILL_MODES, RunnerConfig, StandaloneModelRunner  # noqa: E402
 from tq_longbench.glm4 import glm4_prefill_mode, is_glm4_config, read_config  # noqa: E402
 from tq_longbench.ops import DENSE_BACKENDS, backend_names  # noqa: E402
-from tq_longbench.tasks import needle_in_a_haystack, score  # noqa: E402
+from tq_longbench.tasks import needle_in_a_haystack, needle_report  # noqa: E402
 
 _DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
 
@@ -277,7 +277,19 @@ class Rung:
 
     @property
     def hits(self) -> int:
+        """Continuations that carried the passcode, wherever in them it turned up."""
         return sum(record["found"] for record in self.records)
+
+    @property
+    def clean(self) -> int:
+        """Of those, the ones that led with it and did not fall into a loop.
+
+        Reported next to :attr:`hits` rather than instead of it, because the gap
+        between the two is what a retrieval column on its own cannot show: a
+        model that answers and then recites the haystack has retrieved, and is
+        still worth looking at.
+        """
+        return sum(record["clean"] for record in self.records)
 
     def median(self, key: str) -> float:
         values = [record[key] for record in self.records]
@@ -307,12 +319,18 @@ def run_rung(
         started = time.perf_counter()
         produced, metrics = runner.generate(prompt_ids.to(runner.device), max_new_tokens=args.max_new_tokens)
         answer, failure = decode_text(tokenizer, stop_at_eos(produced, eos_ids))
+        report = needle_report(answer, item.answers[0], item.extra.get("city"))
         record = {
             "backend": backend,
             "prefill_mode": prefill_mode,
             "context_requested": context,
             "depth": depth,
-            "found": bool(score(answer, item.answers, item.metric)),
+            "found": report.found,
+            "clean": report.clean,
+            "verdict": report.describe(),
+            "first_number": report.first_number,
+            "echoed_prompt": report.echoed_prompt,
+            "degenerate": report.degenerate,
             "prediction": answer,
             "answers": item.answers,
             "decode_failure": failure,
@@ -323,10 +341,10 @@ def run_rung(
         sink.write(json.dumps(record, ensure_ascii=False) + "\n")
         sink.flush()
         print(
-            f"    depth {depth:<5} tokens={record['prompt_tokens']:>7} found={str(record['found']):5s} "
+            f"    depth {depth:<5} tokens={record['prompt_tokens']:>7} {record['verdict']:<11s} "
             f"ttft {record['ttft_ms']:>8.0f} ms  p50 {record['decode_p50_us']:>8.0f} us  "
             f"p99 {record['decode_p99_us']:>8.0f} us  peak {record['device_peak_mb']:>7.0f} MB  "
-            f"{answer.strip()[:32]!r}" + (f"  <undecodable: {failure}>" if failure else ""),
+            f"{answer.strip()[:40]!r}" + (f"  <undecodable: {failure}>" if failure else ""),
             file=sys.stderr,
         )
     return rung
@@ -335,19 +353,23 @@ def run_rung(
 def summarise(rungs: list[Rung], depths: tuple[float, ...]) -> str:
     """The table the run exists to produce, one line per rung."""
     header = (
-        f"{'backend':22s} {'context':>8s} {'prefill':>14s} {'retrieved':>10s} {'ttft ms':>10s} "
+        f"{'backend':22s} {'context':>8s} {'prefill':>14s} {'retrieved':>10s} {'clean':>10s} {'ttft ms':>10s} "
         f"{'p50 us':>9s} {'p99 us':>9s} {'kv MB':>9s} {'dense MB':>9s} {'peak MB':>9s}"
     )
     lines = [header, "-" * len(header)]
     for rung in rungs:
         lines.append(
             f"{rung.backend:22s} {rung.context:>8d} {rung.prefill_mode:>14s} "
-            f"{f'{rung.hits}/{len(depths)}':>10s} {rung.median('ttft_ms'):>10.0f} "
+            f"{f'{rung.hits}/{len(depths)}':>10s} {f'{rung.clean}/{len(depths)}':>10s} "
+            f"{rung.median('ttft_ms'):>10.0f} "
             f"{rung.median('decode_p50_us'):>9.0f} {rung.median('decode_p99_us'):>9.0f} "
             f"{rung.median('kv_cache_mb'):>9.1f} {rung.median('dense_equivalent_mb'):>9.1f} "
             f"{rung.peak('device_peak_mb'):>9.0f}"
         )
     lines.append("")
+    lines.append("retrieved: the passcode appears in the continuation as a whole token, wherever in it.")
+    lines.append("clean: it also led with it and did not loop. retrieved > clean means the model rambled after")
+    lines.append("answering -- read the per-item verdicts (found+late, found+loop) and the predictions.")
     lines.append("ttft/p50/p99 are medians over the depths; peak MB is the allocator's high-water mark over them.")
     lines.append("The first decode step of a sequence pays first-touch costs no later step does: it lands in p99.")
     return "\n".join(lines)
