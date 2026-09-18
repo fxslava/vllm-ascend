@@ -378,6 +378,37 @@ the load and registers the declared tokens at their ids. The result was checked
 to encode identically to 4.44. `--dummy-prompt` skips the tokenizer entirely: a
 64-token prompt of ones, short-prompt stage only, for a kernel sanity check.
 
+### Stopping, and the prompt format
+
+Two things that used to be decided silently by which `transformers` happened to
+be installed, and are now printed before every run:
+
+**Stop tokens.** `glm-4-9b-chat-1m`'s `config.json` declares no `eos_token_id`,
+and on the 4.28 path `tokenizer.eos_token_id` is `None` — so the stop set was
+**empty** and nothing halted generation. Every continuation ran its whole budget
+and was trimmed afterwards, which is indistinguishable from a model with more to
+say. `eos_ids_for` now also resolves GLM-4's three turn-enders — `<|endoftext|>`,
+`<|user|>`, `<|observation|>` — by name through the tokenizer, falling back to
+their published ids (151329 / 151336 / 151338) only if it does not know them.
+`generate(stop_ids=...)` ends the **loop**, not just the text: a run that
+generates its budget and is trimmed on the way out has already paid for every
+step, so its decode percentiles average over tokens the model never meant to
+emit.
+
+**The chat template.** `encode` takes the first of three routes that works: the
+tokenizer's own `apply_chat_template`; GLM-4's turn markers assembled here —
+`[gMASK]<sop><|user|>
+{prompt}
+<|assistant|>`, built by id rather than parsed
+from a string — for a `transformers` that has no `apply_chat_template` at all;
+and the bare text. Falling through to the third is not a neutral default: a chat
+model handed a document with no `<|user|>` before it and no `<|assistant|>` after
+it continues the document, which over a needle-in-a-haystack prompt means
+continuing the haystack.
+
+Both are reported in stage 1 (`prompt:` and `stop ids:`), and an empty stop set
+says so in as many words.
+
 DeepSeek-V4-Flash is **not implemented** in either route — MLA and the MoE stack
 are a separate adapter.
 

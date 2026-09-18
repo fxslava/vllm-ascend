@@ -83,6 +83,7 @@ from tq_longbench.smoke_glm import (  # noqa: E402
     eos_ids_for,
     load_tokenizer,
     plan_attention,
+    prompt_route,
     quiet_tensorflow,
     resolve_device,
     stop_at_eos,
@@ -310,14 +311,17 @@ def run_rung(
     depths: tuple[float, ...],
     keep: int,
     sink,
+    glm4: bool,
 ) -> Rung:
     """One needle per depth at this context, each written out as it finishes."""
     rung = Rung(backend, context, prefill_mode)
     for depth in depths:
         item = needle_in_a_haystack(context, depth=depth, seed=int(depth * 100) + args.seed)
-        prompt_ids = truncate_middle(encode(tokenizer, item.prompt, not args.raw_prompt), keep)
+        prompt_ids = truncate_middle(encode(tokenizer, item.prompt, not args.raw_prompt, glm4=glm4), keep)
         started = time.perf_counter()
-        produced, metrics = runner.generate(prompt_ids.to(runner.device), max_new_tokens=args.max_new_tokens)
+        produced, metrics = runner.generate(
+            prompt_ids.to(runner.device), max_new_tokens=args.max_new_tokens, stop_ids=eos_ids
+        )
         answer, failure = decode_text(tokenizer, stop_at_eos(produced, eos_ids))
         report = needle_report(answer, item.answers[0], item.extra.get("city"))
         record = {
@@ -387,6 +391,11 @@ def main(argv: list[str] | None = None) -> int:
     tokenizer = load_tokenizer(args.model_path) if glm4 else _auto_tokenizer(args.model_path)
     eos_ids = eos_ids_for(config, tokenizer)
     longest = max(contexts)
+    print(f"prompt: {prompt_route(tokenizer, not args.raw_prompt, glm4)}", file=sys.stderr)
+    print(
+        f"stop ids: {sorted(eos_ids) if eos_ids else 'NONE -- every continuation will run its whole budget'}",
+        file=sys.stderr,
+    )
 
     sink = args.out_file.open("w", encoding="utf-8") if args.out_file else sys.stdout
     rungs: list[Rung] = []
@@ -411,7 +420,9 @@ def main(argv: list[str] | None = None) -> int:
                     free_device(args.device)
                     runner = build_runner(args, backend, mode, max_seq_len, plan)
                 keep = max_seq_len - CONTEXT_HEADROOM_TOKENS - args.max_new_tokens
-                rungs.append(run_rung(args, runner, tokenizer, eos_ids, backend, context, mode, depths, keep, sink))
+                rungs.append(
+                    run_rung(args, runner, tokenizer, eos_ids, backend, context, mode, depths, keep, sink, glm4)
+                )
             runner = None
             free_device(args.device)
     finally:

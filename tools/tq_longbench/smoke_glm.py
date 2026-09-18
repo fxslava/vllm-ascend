@@ -211,9 +211,127 @@ def choose_prefill_mode(args: argparse.Namespace) -> str:
     return mode
 
 
-def encode(tokenizer, text: str, use_chat_template: bool) -> torch.Tensor:
-    """Token ids for one user turn, through the chat template when the tokenizer has one."""
-    if use_chat_template and getattr(tokenizer, "chat_template", None):
+#: GLM-4's stop tokens, and the ids ``glm-4-9b-chat`` and ``-1m`` give them.
+#: All three end an assistant turn: ``<|endoftext|>`` ends the document,
+#: ``<|user|>`` starts the next turn, and ``<|observation|>`` hands control to a
+#: tool. Generation that ignores the last two runs straight on into a turn it
+#: then has to invent both halves of, which is what rambling into the haystack
+#: looks like from the inside.
+#:
+#: The ids are a fallback, not the lookup: :func:`special_token_id` resolves each
+#: by name through the tokenizer first, so a checkpoint that numbers them
+#: differently still stops. They are written down because the alternative -- an
+#: empty stop set -- fails silently, and because ``config.json`` for these
+#: checkpoints carries no ``eos_token_id`` at all to fall back on.
+GLM4_STOP_TOKENS = {"<|endoftext|>": 151329, "<|user|>": 151336, "<|observation|>": 151338}
+
+#: The tokens GLM-4's chat template is built from, with the same published ids.
+#: ``[gMASK]<sop>`` is the document prefix the tokenizer normally prepends itself;
+#: ``<|user|>`` and ``<|assistant|>`` are the turn markers.
+GLM4_TEMPLATE_TOKENS = {"[gMASK]": 151331, "<sop>": 151333, "<|user|>": 151336, "<|assistant|>": 151337}
+
+
+def special_token_id(tokenizer, name: str, published: int) -> int:
+    """The id this tokenizer gives ``name``, or the published one if it does not know it.
+
+    Three places to look, because which of them answers depends on the
+    ``transformers`` release: the added-token table :func:`register_declared_special_tokens`
+    fills on 4.28, the tokenizer's own conversion on anything newer, and the
+    constant as the last word. A lookup that returns the unknown-token id is
+    treated as not knowing, since ``<unk>`` is not a stop token and would quietly
+    truncate every continuation at the first unknown word.
+    """
+    table = getattr(tokenizer, "added_tokens_encoder", None) or {}
+    if name in table:
+        return int(table[name])
+    convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if convert is not None:
+        try:
+            resolved = convert(name)
+        except Exception:  # a tokenizer that raises for an unknown token has answered
+            resolved = None
+        unknown = getattr(tokenizer, "unk_token_id", None)
+        if isinstance(resolved, int) and resolved != unknown:
+            return resolved
+    return published
+
+
+def glm4_stop_ids(tokenizer) -> set[int]:
+    """Every id that should end a GLM-4 assistant turn."""
+    return {special_token_id(tokenizer, name, published) for name, published in GLM4_STOP_TOKENS.items()}
+
+
+def glm4_chat_prompt_ids(tokenizer, text: str) -> torch.Tensor:
+    """``[gMASK]<sop><|user|>\\n{text}\\n<|assistant|>`` as ids, assembled rather than parsed.
+
+    The special tokens are put in by id and the body is tokenised on its own, so
+    nothing depends on the tokenizer recognising ``[gMASK]`` as a token when it
+    meets those six characters in a string -- which it does only once
+    :func:`register_declared_special_tokens` has taught it to, and which would
+    fail as ordinary text rather than raise.
+
+    This is the path for a ``transformers`` with no ``apply_chat_template`` (4.28,
+    which is the release the rest of :func:`load_tokenizer` exists for). Where the
+    method is available it is used instead, because the checkpoint's own template
+    is the authority on its format and this is a transcription of it.
+    """
+    marker = {name: special_token_id(tokenizer, name, id) for name, id in GLM4_TEMPLATE_TOKENS.items()}
+    body = _body_ids(tokenizer, f"\n{text}\n").tolist()
+    ids = [marker["[gMASK]"], marker["<sop>"], marker["<|user|>"], *body, marker["<|assistant|>"]]
+    return torch.tensor(ids, dtype=torch.int64)
+
+
+def _body_ids(tokenizer, text: str) -> torch.Tensor:
+    """The text's own tokens, with whatever prefix the tokenizer adds stripped off.
+
+    ChatGLM4Tokenizer prepends ``[gMASK]<sop>`` to everything it encodes. Asking
+    for ``add_special_tokens=False`` is the direct way to decline that; where the
+    signature does not take it, the prefix is *measured* -- by encoding the empty
+    string -- rather than assumed to be two tokens long.
+    """
+    try:
+        return tokenizer(text, return_tensors="pt", add_special_tokens=False).input_ids[0]
+    except TypeError:  # a tokenizer whose __call__ does not take the flag
+        prefix = tokenizer("", return_tensors="pt").input_ids[0].numel()
+        return tokenizer(text, return_tensors="pt").input_ids[0][prefix:]
+
+
+def prompt_route(tokenizer, use_chat_template: bool, glm4: bool) -> str:
+    """Which of :func:`encode`'s three routes this tokenizer will take.
+
+    Printed before a run rather than inferred from its output: the difference
+    between a chat prompt and a bare document is the difference between a model
+    that answers and one that continues the haystack, and until now it was
+    decided silently by which ``transformers`` happened to be installed.
+    """
+    if not use_chat_template:
+        return "raw (--raw-prompt): no turn markers"
+    if _has_chat_template(tokenizer):
+        return "the tokenizer's own chat template"
+    if glm4:
+        return "GLM-4 turn markers, assembled here (this transformers has no apply_chat_template)"
+    return "raw: this tokenizer has no chat template and the checkpoint is not GLM-4"
+
+
+def _has_chat_template(tokenizer) -> bool:
+    return bool(getattr(tokenizer, "chat_template", None)) and hasattr(tokenizer, "apply_chat_template")
+
+
+def encode(tokenizer, text: str, use_chat_template: bool, glm4: bool = False) -> torch.Tensor:
+    """Token ids for one user turn, as a chat turn wherever that is possible.
+
+    Three routes, in order of authority (:func:`prompt_route` names the one taken):
+    the checkpoint's own chat template; GLM-4's turn markers assembled here, for a
+    ``transformers`` that has no ``apply_chat_template``; and the bare text.
+
+    The middle route is the one this function exists for. Falling through to the
+    bare text is not a neutral default -- a chat model handed a document with no
+    ``<|user|>`` before it and no ``<|assistant|>`` after it continues the
+    document, which over a needle-in-a-haystack prompt means continuing the
+    haystack. That failure reads as a model problem and is a prompt problem, so
+    it is worth the transcription.
+    """
+    if use_chat_template and _has_chat_template(tokenizer):
         encoded = tokenizer.apply_chat_template(
             [{"role": "user", "content": text}],
             add_generation_prompt=True,
@@ -221,10 +339,10 @@ def encode(tokenizer, text: str, use_chat_template: bool) -> torch.Tensor:
             return_tensors="pt",
             return_dict=True,
         )
-        ids = encoded["input_ids"]
-    else:
-        ids = tokenizer(text, return_tensors="pt").input_ids
-    return ids[0].to(torch.int64)
+        return encoded["input_ids"][0].to(torch.int64)
+    if use_chat_template and glm4:
+        return glm4_chat_prompt_ids(tokenizer, text)
+    return tokenizer(text, return_tensors="pt").input_ids[0].to(torch.int64)
 
 
 def truncate_middle(token_ids: torch.Tensor, keep: int) -> torch.Tensor:
@@ -243,10 +361,25 @@ def stop_at_eos(produced: list[int], eos_ids: set[int]) -> list[int]:
 
 
 def eos_ids_for(config: dict, tokenizer) -> set[int]:
+    """Every id that should end a continuation, from all three places one can be declared.
+
+    ``config.json``, the tokenizer, and -- for GLM-4 -- :data:`GLM4_STOP_TOKENS`.
+    The third is not belt and braces. ``glm-4-9b-chat-1m``'s ``config.json``
+    declares no ``eos_token_id``, and on the ``transformers`` 4.28 path
+    :func:`load_tokenizer` builds for, ``tokenizer.eos_token_id`` is ``None`` as
+    well: without this the stop set is **empty**, nothing ever halts generation,
+    and every continuation runs its whole budget. That is not a tuning question,
+    it is the difference between an answer and an answer followed by whatever the
+    model says next.
+    """
     configured = config.get("eos_token_id")
     ids = set(configured if isinstance(configured, list) else [configured] if configured is not None else [])
-    if tokenizer is not None and tokenizer.eos_token_id is not None:
+    if tokenizer is None:
+        return ids
+    if getattr(tokenizer, "eos_token_id", None) is not None:
         ids.add(tokenizer.eos_token_id)
+    if is_glm4_config(config):
+        ids |= glm4_stop_ids(tokenizer)
     return ids
 
 
@@ -545,7 +678,7 @@ def main(argv: list[str] | None = None) -> int:
         short_ids = dummy_prompt_ids()
     else:
         tokenizer = load_tokenizer(args.model_path)
-        short_ids = encode(tokenizer, DEFAULT_PROMPT, use_chat_template)
+        short_ids = encode(tokenizer, DEFAULT_PROMPT, use_chat_template, glm4=True)
     eos_ids = eos_ids_for(config, tokenizer)
     max_seq_len = max(args.tokens, short_ids.numel()) + args.max_new_tokens + CONTEXT_HEADROOM_TOKENS
 
@@ -562,6 +695,11 @@ def main(argv: list[str] | None = None) -> int:
         f"  rope: theta {shape.rope_theta:.6g}, rotary_dim {shape.rotary_dim} of {shape.head_size}, "
         f"interleaved={shape.rope_interleaved}; qkv_bias={shape.qkv_bias} gate={shape.attn_output_gate}"
     )
+    # Both of these used to be decided silently, by which transformers happened
+    # to be installed. An empty stop set in particular is invisible from the
+    # output: it looks exactly like a model with more to say.
+    print(f"  prompt: {prompt_route(tokenizer, use_chat_template, glm4=True)}")
+    print(f"  stop ids: {sorted(eos_ids) if eos_ids else 'NONE -- generation will run its whole budget'}")
     memory = runner.memory_report()
     print(
         f"  backend {args.backend} on {args.device}, prefill {prefill_mode}, max_seq_len {max_seq_len}, "
@@ -573,7 +711,9 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     print("\n=== 2. short prompt ===")
-    produced, metrics = runner.generate(short_ids.to(runner.device), max_new_tokens=args.max_new_tokens)
+    produced, metrics = runner.generate(
+        short_ids.to(runner.device), max_new_tokens=args.max_new_tokens, stop_ids=eos_ids
+    )
     produced = stop_at_eos(produced, eos_ids)
     summary = metrics.summary()
     print(f"  {args.backend:20s} {render(tokenizer, produced)}")
@@ -593,7 +733,9 @@ def main(argv: list[str] | None = None) -> int:
             short_ids.numel() + args.max_new_tokens + 64,
             plan.dense_api_for(args.reference_backend),
         )
-        expected, _ = reference.generate(short_ids.to(reference.device), max_new_tokens=args.max_new_tokens)
+        expected, _ = reference.generate(
+            short_ids.to(reference.device), max_new_tokens=args.max_new_tokens, stop_ids=eos_ids
+        )
         expected = stop_at_eos(expected, eos_ids)
         agreed = sum(mine == theirs for mine, theirs in zip(produced, expected))
         print(f"  {args.reference_backend:20s} {render(tokenizer, expected)}  ({agreed}/{len(expected)} tokens agree)")
@@ -613,8 +755,10 @@ def main(argv: list[str] | None = None) -> int:
         hits = clean = 0
         for depth in depths:
             item = needle_in_a_haystack(args.tokens, depth=depth, seed=int(depth * 100) + args.seed)
-            prompt_ids = truncate_middle(encode(tokenizer, item.prompt, use_chat_template), keep)
-            produced, metrics = runner.generate(prompt_ids.to(runner.device), max_new_tokens=args.max_new_tokens)
+            prompt_ids = truncate_middle(encode(tokenizer, item.prompt, use_chat_template, glm4=True), keep)
+            produced, metrics = runner.generate(
+                prompt_ids.to(runner.device), max_new_tokens=args.max_new_tokens, stop_ids=eos_ids
+            )
             answer, failure = decode_text(tokenizer, stop_at_eos(produced, eos_ids))
             report = needle_report(answer, item.answers[0], item.extra.get("city"))
             hits += report.found

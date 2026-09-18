@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -144,6 +144,11 @@ class RunMetrics:
     device_allocated_mb: float = 0.0
     device_peak_mb: float = 0.0
     device_reserved_mb: float = 0.0
+    #: The stop token the loop ended on, or ``None`` where it ran out of budget.
+    #: A whole run of ``None`` means nothing is stopping generation -- which is
+    #: what an empty stop set looks like from the outside, and is otherwise
+    #: indistinguishable from a model that simply had more to say.
+    stopped_on_token: int | None = None
 
     @property
     def prefill_tokens_per_second(self) -> float:
@@ -176,6 +181,8 @@ class RunMetrics:
             "device_allocated_mb": round(self.device_allocated_mb, 2),
             "device_peak_mb": round(self.device_peak_mb, 2),
             "device_reserved_mb": round(self.device_reserved_mb, 2),
+            "stopped_on_token": self.stopped_on_token,
+            "hit_token_budget": self.stopped_on_token is None,
         }
 
 
@@ -433,8 +440,23 @@ class StandaloneModelRunner:
         return logits
 
     @torch.inference_mode()
-    def generate(self, token_ids: torch.Tensor, max_new_tokens: int | None = None) -> tuple[list[int], RunMetrics]:
-        """Greedy continuation of ``token_ids``; returns the new tokens and what they cost."""
+    def generate(
+        self,
+        token_ids: torch.Tensor,
+        max_new_tokens: int | None = None,
+        stop_ids: Collection[int] | None = None,
+    ) -> tuple[list[int], RunMetrics]:
+        """Greedy continuation of ``token_ids``; returns the new tokens and what they cost.
+
+        ``stop_ids`` ends the loop, rather than only ending the text afterwards.
+        The difference is not cosmetic: a run that generates its whole budget and
+        is trimmed on the way out has already paid for every step, so its decode
+        percentiles average over tokens the model never meant to emit, and the
+        continuation on record is a trimmed version of something longer. The stop
+        token itself is kept in the returned ids -- it is what happened -- and
+        :func:`tq_longbench.smoke_glm.stop_at_eos` is still what turns them into
+        text, so the two agree about where the answer ends.
+        """
         metrics = RunMetrics(**self._memory_metrics())
         _reset_peak_memory(self.device)
         started = time.perf_counter()
@@ -450,6 +472,9 @@ class StandaloneModelRunner:
                 # boundary is the token existing, not the launch being queued.
                 metrics.ttft_seconds = time.perf_counter() - started
             produced.append(next_token)
+            if stop_ids and next_token in stop_ids:
+                metrics.stopped_on_token = next_token
+                break
             if position + 1 > self.config.max_seq_len:
                 break
             step = torch.tensor([next_token], dtype=torch.int64, device=self.device)

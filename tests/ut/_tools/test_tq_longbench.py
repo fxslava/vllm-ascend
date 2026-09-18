@@ -96,6 +96,14 @@ from tq_longbench.preflight import (  # noqa: E402
     select_dense_backend,
 )
 from tq_longbench.reference import DenseReferenceBackend, TurboQuantReferenceBackend  # noqa: E402
+from tq_longbench.smoke_glm import (  # noqa: E402
+    encode,
+    eos_ids_for,
+    glm4_stop_ids,
+    prompt_route,
+    special_token_id,
+    stop_at_eos,
+)
 from tq_longbench.tasks import (  # noqa: E402
     f1_score,
     needle_in_a_haystack,
@@ -1298,8 +1306,12 @@ class TestGlm4Rope(unittest.TestCase):
         torch.testing.assert_close(rope.apply(x, positions), expected, rtol=1e-5, atol=1e-5)
 
 
-class TestGlm4Checkpoint(unittest.TestCase):
-    """A tiny GLM-4 on disk, loaded by the engine exactly as the 9B one would be."""
+class _Glm4TinyCheckpoint(unittest.TestCase):
+    """A tiny GLM-4 written to disk, and the runner that loads it.
+
+    Split from the cases below so a second class can reuse the fixture without
+    inheriting -- and re-running -- the first one's tests.
+    """
 
     PROMPT_TOKENS = 40
     NEW_TOKENS = 6
@@ -1341,6 +1353,10 @@ class TestGlm4Checkpoint(unittest.TestCase):
             produced.append(int(torch.argmax(_chatglm_eager_logits(TINY_GLM, tensors, ids)[-1])))
             ids = torch.cat((ids, torch.tensor([produced[-1]])))
         return produced
+
+
+class TestGlm4Checkpoint(_Glm4TinyCheckpoint):
+    """The tiny checkpoint loaded and run exactly as the 9B one would be."""
 
     def test_the_chatglm_checkpoint_runs_as_chatglm_does(self):
         runner = self._runner(self._write("chatglm", TINY_GLM, self.tensors))
@@ -1409,17 +1425,34 @@ class _ByteTokenizer:
     The benchmark's own tests are about the harness -- the rungs, the records,
     the metrics -- not about what a tiny random checkpoint retrieves, so the
     tokenizer only has to be reversible and to keep inside the vocabulary.
+
+    It declares GLM-4's special tokens at ids this vocabulary actually has, near
+    the top of it. That is not a convenience: ``special_token_id`` resolves each
+    marker through the tokenizer before falling back to the published id, and a
+    stub that declared none would have the 151xxx constants assembled into a
+    prompt for a 320-token embedding. Which is the same thing that would happen
+    to a real checkpoint that numbered its tokens differently, so resolving by
+    name is what is under test here as well.
     """
+
+    SPECIAL = {"[gMASK]": 310, "<sop>": 311, "<|user|>": 312, "<|assistant|>": 313, "<|observation|>": 314}
 
     eos_token_id = None
     chat_template = None
+    unk_token_id = 0
 
-    def __call__(self, text, return_tensors=None):
-        ids = [ord(character) % TINY_GLM["padded_vocab_size"] for character in text]
+    def __init__(self):
+        self.added_tokens_encoder = dict(self.SPECIAL, **{"<|endoftext|>": 315})
+
+    def __call__(self, text, return_tensors=None, add_special_tokens=True):
+        ids = [ord(character) % 256 for character in text]
         return types.SimpleNamespace(input_ids=torch.tensor([ids], dtype=torch.int64))
 
+    def convert_tokens_to_ids(self, token):
+        return self.added_tokens_encoder.get(token, self.unk_token_id)
+
     def decode(self, token_ids, skip_special_tokens=True):
-        return "".join(chr(int(token)) for token in token_ids)
+        return "".join(chr(int(token)) for token in token_ids if int(token) < 256)
 
 
 class TestRunBenchmark(unittest.TestCase):
@@ -1479,7 +1512,11 @@ class TestRunBenchmark(unittest.TestCase):
             with self.subTest(context=record["context_requested"], depth=record["depth"]):
                 self.assertEqual(record["backend"], "dense_reference")
                 self.assertEqual(record["prefill_mode"], "dense_staging")
-                self.assertEqual(record["generated_tokens"], self.NEW_TOKENS)
+                # At most the budget, and fewer when a stop token came first --
+                # which is now a legitimate ending rather than a trimmed one.
+                self.assertGreater(record["generated_tokens"], 0)
+                self.assertLessEqual(record["generated_tokens"], self.NEW_TOKENS)
+                self.assertEqual(record["hit_token_budget"], record["stopped_on_token"] is None)
                 self.assertIsInstance(record["found"], bool)
                 self.assertIsNone(record["decode_failure"])
                 # The verdict columns travel with the record, not just the count:
@@ -1538,6 +1575,204 @@ class TestRunBenchmark(unittest.TestCase):
         self.assertIsNot(run_benchmark.quiet_tensorflow, None)
         # The harness never imports it, so nothing here can have reached it.
         self.assertNotIn("tensorflow", sys.modules)
+
+
+class _ChatGLM4LikeTokenizer:
+    """ChatGLM4Tokenizer's shape on ``transformers`` 4.28, which is where this matters.
+
+    It prepends ``[gMASK]<sop>`` to everything it encodes, declares its special
+    tokens in ``added_tokens_encoder`` (where
+    :func:`register_declared_special_tokens` puts them), has no ``chat_template``
+    and no ``apply_chat_template``, and -- the part that made generation never
+    stop -- reports ``eos_token_id`` as ``None``.
+    """
+
+    PREFIX = [151331, 151333]
+    added_tokens_encoder = {
+        "<|endoftext|>": 151329,
+        "[gMASK]": 151331,
+        "<sop>": 151333,
+        "<|user|>": 151336,
+        "<|assistant|>": 151337,
+        "<|observation|>": 151338,
+    }
+    eos_token_id = None
+    unk_token_id = 0
+
+    def _body(self, text):
+        return [ord(character) % 256 for character in text]
+
+    def __call__(self, text, return_tensors=None, add_special_tokens=True):
+        ids = (self.PREFIX + self._body(text)) if add_special_tokens else self._body(text)
+        return types.SimpleNamespace(input_ids=torch.tensor([ids], dtype=torch.int64))
+
+    def convert_tokens_to_ids(self, token):
+        return self.added_tokens_encoder.get(token, self.unk_token_id)
+
+    def decode(self, token_ids, skip_special_tokens=True):
+        return "".join(chr(int(token)) for token in token_ids if int(token) < 256)
+
+
+class TestGenerationStops(unittest.TestCase):
+    """That a stop token ends the loop, and that GLM-4's stop set is never empty.
+
+    Both halves were silently absent. ``glm-4-9b-chat-1m``'s ``config.json``
+    declares no ``eos_token_id`` and the 4.28 tokenizer reports ``None`` for it,
+    so the stop set was ``{}``; and ``stop_at_eos`` trimmed the text *after* the
+    fact, so even a correct stop set would have let every continuation run its
+    whole budget first. A run could only be read as a model that had more to say.
+    """
+
+    BUDGET = 6
+
+    def test_the_glm4_stop_set_is_never_empty(self):
+        """The three ids that end an assistant turn, from a tokenizer that declares none."""
+        tokenizer = _ChatGLM4LikeTokenizer()
+        self.assertIsNone(tokenizer.eos_token_id)
+        self.assertNotIn("eos_token_id", GLM4_9B_CHAT_1M_CONFIG)
+        self.assertEqual(eos_ids_for(GLM4_9B_CHAT_1M_CONFIG, tokenizer), {151329, 151336, 151338})
+
+    def test_the_stop_ids_come_from_the_tokenizer_before_the_constants(self):
+        """A checkpoint that numbers its special tokens differently still stops."""
+        tokenizer = _ChatGLM4LikeTokenizer()
+        tokenizer.added_tokens_encoder = dict(tokenizer.added_tokens_encoder, **{"<|user|>": 999})
+        self.assertIn(999, glm4_stop_ids(tokenizer))
+        self.assertNotIn(151336, glm4_stop_ids(tokenizer))
+
+    def test_an_unknown_special_token_falls_back_rather_than_becoming_unk(self):
+        """``<unk>`` is not a stop token; treating it as one truncates at the first odd word."""
+
+        class Ignorant:
+            added_tokens_encoder: dict = {}
+            unk_token_id = 0
+
+            def convert_tokens_to_ids(self, token):
+                return 0
+
+        self.assertEqual(special_token_id(Ignorant(), "<|user|>", 151336), 151336)
+
+    def test_a_non_glm4_checkpoint_keeps_its_own_stop_tokens(self):
+        """GLM-4's ids are GLM-4's: nothing here leaks into another model's vocabulary."""
+        qwen = {"model_type": "qwen2", "eos_token_id": 151645}
+        self.assertEqual(eos_ids_for(qwen, _ChatGLM4LikeTokenizer()), {151645})
+
+    def test_stopping_turns_the_reported_loop_into_a_clean_answer(self):
+        """The observed depth-1.0 continuation, with and without the loop being ended.
+
+        ``581850. 581850. 581850. ...`` is what a correct answer looks like when
+        nothing stops the model afterwards. Ending the loop at the stop token it
+        emitted leaves the answer, and the verdict goes from found+loop to clean.
+
+        What this pins is the composition -- generate stops, stop_at_eos trims,
+        needle_report scores -- not that GLM-4 emits a stop token there. That is
+        a property of the model and the prompt, and only silicon can report it.
+        """
+        needle = "581850"
+        unbounded = f"{needle}. " * 8
+        self.assertEqual(needle_report(unbounded, needle, None).describe(), "found+loop")
+        self.assertFalse(needle_report(unbounded, needle, None).clean)
+
+        stopped = f"{needle}."
+        self.assertEqual(needle_report(stopped, needle, None).describe(), "found")
+        self.assertTrue(needle_report(stopped, needle, None).clean)
+
+
+class TestStopTokenEndsTheLoop(_Glm4TinyCheckpoint):
+    """The loop itself, on the tiny checkpoint the other GLM-4 cases use."""
+
+    def _first_token(self, runner) -> int:
+        produced, _ = runner.generate(self.token_ids, max_new_tokens=1)
+        return produced[0]
+
+    def test_a_stop_token_ends_the_loop_not_just_the_text(self):
+        """Told to stop on what it is about to produce, the run produces one token and stops.
+
+        The decode-step list is the assertion that matters: an empty one means no
+        step was ever launched past the stop, which is what "halts immediately"
+        has to mean if the latency percentiles are to describe tokens the model
+        meant to emit.
+        """
+        path = self._write("chatglm", TINY_GLM, self.tensors)
+        stop = self._first_token(self._runner(path))
+        produced, metrics = self._runner(path).generate(self.token_ids, max_new_tokens=8, stop_ids={stop})
+        self.assertEqual(produced, [stop])
+        self.assertEqual(metrics.stopped_on_token, stop)
+        self.assertEqual(metrics.decode_step_us, [])
+        self.assertFalse(metrics.summary()["hit_token_budget"])
+        # The text is what precedes the stop token, so the two agree about the end.
+        self.assertEqual(stop_at_eos(produced, {stop}), [])
+
+    def test_without_a_stop_set_the_whole_budget_is_spent(self):
+        """The old behaviour, kept as the contrast: this is what an empty stop set looks like."""
+        path = self._write("chatglm", TINY_GLM, self.tensors)
+        produced, metrics = self._runner(path).generate(self.token_ids, max_new_tokens=self.BUDGET_TOKENS)
+        self.assertEqual(len(produced), self.BUDGET_TOKENS)
+        self.assertIsNone(metrics.stopped_on_token)
+        self.assertTrue(metrics.summary()["hit_token_budget"])
+
+    def test_a_stop_id_the_model_never_emits_changes_nothing(self):
+        path = self._write("chatglm", TINY_GLM, self.tensors)
+        plain, _ = self._runner(path).generate(self.token_ids, max_new_tokens=self.BUDGET_TOKENS)
+        guarded, metrics = self._runner(path).generate(
+            self.token_ids, max_new_tokens=self.BUDGET_TOKENS, stop_ids={TINY_GLM["padded_vocab_size"] + 1}
+        )
+        self.assertEqual(guarded, plain)
+        self.assertIsNone(metrics.stopped_on_token)
+
+    BUDGET_TOKENS = 6
+
+
+class TestGlm4ChatPrompt(unittest.TestCase):
+    """The turn markers, for a ``transformers`` that cannot apply the template itself."""
+
+    def test_the_prompt_is_the_documented_format(self):
+        """``[gMASK]<sop><|user|>\\n{prompt}\\n<|assistant|>``, assembled by id."""
+        tokenizer = _ChatGLM4LikeTokenizer()
+        ids = encode(tokenizer, "HI", use_chat_template=True, glm4=True).tolist()
+        self.assertEqual(ids[:3], [151331, 151333, 151336])
+        self.assertEqual(ids[-1], 151337)
+        self.assertEqual(ids[3:-1], [ord("\n"), ord("H"), ord("I"), ord("\n")])
+
+    def test_the_tokenizers_own_prefix_does_not_appear_twice(self):
+        """ChatGLM4Tokenizer prepends [gMASK]<sop> to everything; the body must not carry it."""
+        ids = encode(_ChatGLM4LikeTokenizer(), "HI", use_chat_template=True, glm4=True).tolist()
+        self.assertEqual(ids.count(151331), 1)
+        self.assertEqual(ids.count(151333), 1)
+
+    def test_a_tokenizer_without_the_flag_has_its_prefix_measured(self):
+        """``add_special_tokens`` is the direct way to decline the prefix; not every call takes it."""
+
+        class NoFlag(_ChatGLM4LikeTokenizer):
+            def __call__(self, text, return_tensors=None):
+                return types.SimpleNamespace(
+                    input_ids=torch.tensor([self.PREFIX + self._body(text)], dtype=torch.int64)
+                )
+
+        with_flag = encode(_ChatGLM4LikeTokenizer(), "HI", use_chat_template=True, glm4=True)
+        measured = encode(NoFlag(), "HI", use_chat_template=True, glm4=True)
+        self.assertEqual(measured.tolist(), with_flag.tolist())
+
+    def test_the_tokenizers_own_template_wins_where_it_exists(self):
+        """A transcription is a fallback, never a preference: the checkpoint's own format rules."""
+
+        class Modern(_ChatGLM4LikeTokenizer):
+            chat_template = "{{ 'x' }}"
+
+            def apply_chat_template(self, messages, **kwargs):
+                return {"input_ids": torch.tensor([[7, 7, 7]], dtype=torch.int64)}
+
+        self.assertEqual(encode(Modern(), "HI", use_chat_template=True, glm4=True).tolist(), [7, 7, 7])
+
+    def test_raw_prompt_still_means_raw(self):
+        ids = encode(_ChatGLM4LikeTokenizer(), "HI", use_chat_template=False, glm4=True).tolist()
+        self.assertNotIn(151336, ids)
+
+    def test_the_route_is_named_rather_than_inferred(self):
+        """Which of the three routes ran is printed, because it used to be invisible."""
+        plain = _ChatGLM4LikeTokenizer()
+        self.assertIn("assembled here", prompt_route(plain, use_chat_template=True, glm4=True))
+        self.assertIn("raw", prompt_route(plain, use_chat_template=False, glm4=True))
+        self.assertIn("not GLM-4", prompt_route(plain, use_chat_template=True, glm4=False))
 
 
 class TestGlm4LegacyTokenizer(unittest.TestCase):
