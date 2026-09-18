@@ -781,6 +781,26 @@ class _FakeHybridModel(torch.nn.Module):
         )
 
 
+def _has_attention_registry() -> bool:
+    """Whether the installed ``transformers`` has a registry the bridge can install into.
+
+    The same lookup ``hf_bridge._register_attention`` makes: an
+    ``AttentionInterface`` with ``register``, or the older
+    ``ALL_ATTENTION_FUNCTIONS`` dict. ``transformers`` 4.28 on the NPU host has
+    neither, and the bridge refuses to install there by design.
+    """
+    try:
+        import transformers
+        from transformers import modeling_utils
+    except ImportError:
+        return False
+    interface = getattr(transformers, "AttentionInterface", None) or getattr(modeling_utils, "AttentionInterface", None)
+    return hasattr(interface, "register") or hasattr(modeling_utils, "ALL_ATTENTION_FUNCTIONS")
+
+
+_NO_ATTENTION_REGISTRY = "transformers version lacks attention registry"
+
+
 class TestHuggingFaceBridge(unittest.TestCase):
     """Claiming the right layers, and giving the model back exactly as it was."""
 
@@ -803,6 +823,7 @@ class TestHuggingFaceBridge(unittest.TestCase):
         self.assertEqual(bridge.plane_of, {3: 0, 7: 1})
         self.assertEqual(bridge.geometry.num_layers, 2)
 
+    @unittest.skipIf(not _has_attention_registry(), _NO_ATTENTION_REGISTRY)
     def test_uninstall_restores_the_shared_config(self):
         """Regression: every layer of a model shares one config object.
 
@@ -824,6 +845,7 @@ class TestHuggingFaceBridge(unittest.TestCase):
             self.assertEqual(self.model.config._attn_implementation, second._name)
         self.assertEqual(self.model.config._attn_implementation, pristine)
 
+    @unittest.skipIf(not _has_attention_registry(), _NO_ATTENTION_REGISTRY)
     def test_installing_twice_is_refused(self):
         bridge = self.bridge_cls(self.model, "turboquant_reference", max_seq_len=512, block_size=BLOCK_SIZE)
         with bridge, self.assertRaisesRegex(RuntimeError, "already installed"):
