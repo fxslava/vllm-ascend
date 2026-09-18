@@ -1487,6 +1487,50 @@ class TestStandaloneTurboQuantLibrary(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "does not register the operator"):
             self._cube_backend()
 
+    def _with_kernel_library(self) -> Path:
+        kernels = self.library.parent / _ascend.TURBOQUANT_KERNELS_LIB_NAME
+        kernels.write_bytes(b"not a real library either")
+        os.environ[_ascend.TURBOQUANT_LIB_ENV] = str(self.library)
+        return kernels
+
+    def test_the_kernel_library_is_preloaded_globally_before_the_binding(self):
+        """A binding whose $ORIGIN did not survive the link still finds its kernels by SONAME."""
+        kernels = self._with_kernel_library()
+        order = mock.Mock()
+        order.attach_mock(self.enterPatch(mock.patch.object(_ascend.ctypes, "CDLL")), "cdll")
+        order.attach_mock(
+            self.enterPatch(mock.patch.object(torch.ops, "load_library", side_effect=self._registers_the_operators)),
+            "load_library",
+        )
+        self._cube_backend()
+        self.assertEqual(
+            order.mock_calls,
+            [
+                mock.call.cdll(str(kernels), mode=ctypes.RTLD_GLOBAL),
+                mock.call.load_library(str(self.library)),
+            ],
+        )
+
+    def test_without_a_kernel_library_beside_it_nothing_is_preloaded(self):
+        os.environ[_ascend.TURBOQUANT_LIB_ENV] = str(self.library)
+        cdll = self.enterPatch(mock.patch.object(_ascend.ctypes, "CDLL"))
+        self.enterPatch(mock.patch.object(torch.ops, "load_library", side_effect=self._registers_the_operators))
+        self._cube_backend()
+        cdll.assert_not_called()
+
+    def test_a_failed_preload_is_reported_and_the_binding_left_alone(self):
+        kernels = self._with_kernel_library()
+        self.enterPatch(
+            mock.patch.object(_ascend.ctypes, "CDLL", side_effect=OSError("libc_sec.so: cannot open shared object"))
+        )
+        loader = self.enterPatch(mock.patch.object(torch.ops, "load_library"))
+        with self.assertRaisesRegex(RuntimeError, "not registered") as raised:
+            self._cube_backend()
+        self.assertIn("preloading the kernels beside", str(raised.exception))
+        self.assertIn("libc_sec.so: cannot open shared object", str(raised.exception))
+        self.assertTrue(kernels.is_file())
+        loader.assert_not_called()
+
     def test_no_library_means_nothing_is_loaded(self):
         os.environ[_ascend.TURBOQUANT_LIB_ENV] = str(self.library.parent / "missing.so")
         loader = self.enterPatch(mock.patch.object(torch.ops, "load_library"))

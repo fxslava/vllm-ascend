@@ -84,11 +84,22 @@ target_link_libraries(vllm_turboquant_cube PRIVATE
 
 # $ORIGIN finds the kernel library installed beside it; the absolute paths let a
 # bare torch.ops.load_library() resolve torch and torch_npu on the host that built it.
-# A linker flag, as the root CMakeLists.txt does: the INSTALL_RPATH property never
-# reaches this link (checked with readelf on CANN 9.1.0).
+#
+# Through the RPATH properties, not a -Wl,-rpath link option. Under the Makefiles
+# generator CMake 3.22 writes a "$ORIGIN" link option into the binary as "$$ORIGIN"
+# -- a literal directory that never matches, so the kernel library "cannot be found"
+# beside the binding -- while CMake 4.x keeps it; quoting it ('$ORIGIN') leaves the
+# quotes in DT_RUNPATH on both. The properties come out as $ORIGIN on both
+# (readelf, 3.22.1 and 4.4.3). They only apply once CMAKE_SKIP_RPATH is off again:
+# CANN's host_config.cmake and bisheng_config.cmake set it TRUE for the whole
+# directory, which silently discards every RPATH property.
+set(CMAKE_SKIP_RPATH FALSE)
 get_filename_component(VLLM_TQ_TORCH_LIB_DIR "${TORCH_LIBRARY}" DIRECTORY)
-target_link_options(vllm_turboquant_cube PRIVATE
-  "-Wl,-rpath,$ORIGIN:${TORCH_NPU_PATH}/lib:${VLLM_TQ_TORCH_LIB_DIR}:${ASCEND_HOME_PATH}/lib64")
+set(VLLM_TQ_RPATH "$ORIGIN" "${TORCH_NPU_PATH}/lib" "${VLLM_TQ_TORCH_LIB_DIR}" "${ASCEND_HOME_PATH}/lib64")
+set_target_properties(vllm_turboquant_cube PROPERTIES
+  BUILD_RPATH "${VLLM_TQ_RPATH}"
+  INSTALL_RPATH "${VLLM_TQ_RPATH}"
+)
 
 # Straight into CMAKE_INSTALL_PREFIX, under a component of its own: ascendc_library()
 # adds install rules too (COMPONENT asc-devkit: the kernel library into lib/, its

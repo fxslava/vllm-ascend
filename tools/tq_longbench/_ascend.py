@@ -41,6 +41,7 @@ op registrations, which imports no Python from ``vllm_ascend`` at all.
 
 from __future__ import annotations
 
+import ctypes
 import importlib.util
 import os
 import sys
@@ -61,6 +62,9 @@ TURBOQUANT_LIB_ENV = "TURBOQUANT_LIB_PATH"
 
 #: What ``tools/tq_longbench/build_turboquant_ops.py`` installs.
 TURBOQUANT_LIB_NAME = "libvllm_turboquant_cube.so"
+
+#: The Ascend C kernels the binding launches, installed beside it.
+TURBOQUANT_KERNELS_LIB_NAME = "libvllm_turboquant_cube_kernels.so"
 
 _RELATIVE = Path("vllm_ascend") / "attention"
 
@@ -172,12 +176,34 @@ def load_turboquant_library(is_registered: Callable[[], bool]) -> LibraryLoad:
     library = present[0]
     _import_torch_npu()
     try:
+        _preload_kernel_library(library)
+    except OSError as error:
+        return LibraryLoad(False, f"preloading the kernels beside {library} failed: {error}")
+    try:
         torch.ops.load_library(str(library))
     except OSError as error:
         return LibraryLoad(False, f"torch.ops.load_library({library}) failed: {error}")
     if not is_registered():
         return LibraryLoad(False, f"loaded {library}, but it does not register the operator")
     return LibraryLoad(True, f"loaded {library}")
+
+
+def _preload_kernel_library(library: Path) -> Path | None:
+    """Load the kernel library beside ``library`` first, globally, if it is there.
+
+    The binding finds it through its ``$ORIGIN`` RUNPATH -- when that survived the
+    build: a CMake 3.22 ``-Wl,-rpath,$ORIGIN`` link option lands as a literal
+    ``$$ORIGIN``, and the load fails with "cannot open shared object file" while
+    both files sit side by side. Once a library with the kernels' SONAME is
+    loaded, the dynamic linker satisfies the binding's NEEDED entry with it, so
+    this makes the load independent of how the binding was linked. After
+    torch_npu, whose ACL symbols the kernel library leaves undefined.
+    """
+    kernels = library.parent / TURBOQUANT_KERNELS_LIB_NAME
+    if not kernels.is_file():
+        return None
+    ctypes.CDLL(str(kernels), mode=ctypes.RTLD_GLOBAL)
+    return kernels
 
 
 def _import_torch_npu() -> None:
