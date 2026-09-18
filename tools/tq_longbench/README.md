@@ -236,5 +236,12 @@ Its prefill defaults to `batched_decode` from 32768 context tokens up (and
 `run_eval.py` does the same for a GLM-4 checkpoint), `dense_staging` below.
 GLM-4-0414 (`model_type: glm4`) adds sandwich norms and is refused.
 
+On `transformers` 4.28 the checkpoint's tokenizer cannot load as shipped: 4.28
+ignores `tokenizer_config.json`'s `added_tokens_decoder`, so every special-token
+lookup raises `KeyError`. `smoke_glm.py` suppresses `sanitize_special_tokens` for
+the load and registers the declared tokens at their ids. The result was checked
+to encode identically to 4.44. `--dummy-prompt` skips the tokenizer entirely: a
+64-token prompt of ones, short-prompt stage only, for a kernel sanity check.
+
 DeepSeek-V4-Flash is **not implemented** in either route — MLA and the MoE stack
 are a separate adapter.

@@ -36,6 +36,11 @@ The prefill mode follows the context unless ``--prefill-mode`` says otherwise:
 a 9B chatglm checkpoint's remote modeling code on the NPU is its own project --
 so ``--reference-backend native_v5`` is the way to A/B the short prompt against
 the unquantised cache.
+
+``--dummy-prompt`` skips the tokenizer altogether -- a 64-token prompt of ones,
+the short prompt only -- for a kernel sanity check on a host whose
+``transformers`` cannot load GLM-4's tokenizer. Without it, :func:`load_tokenizer`
+carries the tokenizer through ``transformers`` 4.28 (see there).
 """
 
 from __future__ import annotations
@@ -55,6 +60,7 @@ _bootstrap_path()
 
 import argparse  # noqa: E402  (after the path bootstrap above)
 import gc  # noqa: E402
+import json  # noqa: E402
 
 import torch  # noqa: E402
 
@@ -78,6 +84,9 @@ DEFAULT_DEPTHS = "0.0,0.5,1.0"
 #: Cache room beyond the prompt and the generated tokens, so a tokenised prompt
 #: a little over its estimate still fits.
 CONTEXT_HEADROOM_TOKENS = 512
+
+#: ``--dummy-prompt``: ``[batch, tokens]`` of token id 1, no tokenizer involved.
+DUMMY_PROMPT_SHAPE = (1, 64)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -117,6 +126,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="also run the short prompt on this backend (e.g. native_v5) and count agreeing tokens",
     )
     parser.add_argument("--raw-prompt", action="store_true", help="skip the tokenizer's chat template")
+    parser.add_argument(
+        "--dummy-prompt",
+        action="store_true",
+        help="no tokenizer at all: run a 64-token prompt of ones through the short-prompt stage only "
+        "(kernel sanity check; skips needle in a haystack)",
+    )
     parser.add_argument("--seed", type=int, default=0)
     return parser
 
@@ -182,9 +197,89 @@ def stop_at_eos(produced: list[int], eos_ids: set[int]) -> list[int]:
 def _eos_ids(config: dict, tokenizer) -> set[int]:
     configured = config.get("eos_token_id")
     ids = set(configured if isinstance(configured, list) else [configured] if configured is not None else [])
-    if tokenizer.eos_token_id is not None:
+    if tokenizer is not None and tokenizer.eos_token_id is not None:
         ids.add(tokenizer.eos_token_id)
     return ids
+
+
+def dummy_prompt_ids() -> torch.Tensor:
+    """The ``--dummy-prompt`` input, flattened to the one sequence the runner takes."""
+    return torch.ones(DUMMY_PROMPT_SHAPE, dtype=torch.long)[0]
+
+
+def load_tokenizer(model_path: str):
+    """GLM-4's remote-code tokenizer, loadable on ``transformers`` 4.28 as well.
+
+    ``ChatGLM4Tokenizer._convert_token_to_id`` looks tokens up in its tiktoken
+    ``mergeable_ranks``, which hold no special tokens. Newer ``transformers``
+    registers ``<|endoftext|>``, ``[gMASK]``, ``<sop>`` and the rest from
+    ``tokenizer_config.json``'s ``added_tokens_decoder`` before anything looks
+    them up; 4.28 does not read that field, so two things break:
+
+    * ``from_pretrained`` ends in ``sanitize_special_tokens()``, which looks the
+      special tokens up -- ``KeyError: '<|endoftext|>'``. It is suppressed for
+      that one call and restored after. Letting it run would not help anyway:
+      it would append the tokens at fresh ids past the vocabulary.
+    * Every later lookup -- the ``[gMASK]<sop>`` prefix on each encode, the
+      special ids ``decode`` skips, ``eos_token_id`` -- hits the same
+      ``KeyError``. So the tokens the config declares are registered at the ids
+      it declares, which is what newer releases do on their own.
+
+    On a ``transformers`` that already registered them, both steps are no-ops.
+    """
+    from transformers import AutoTokenizer
+    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+    # Wherever the method is defined, the class attribute shadows it for the
+    # one call; afterwards either the class's own method goes back or the
+    # shadow is removed, so nothing outlives the load.
+    patched = hasattr(PreTrainedTokenizerBase, "sanitize_special_tokens")
+    own = PreTrainedTokenizerBase.__dict__.get("sanitize_special_tokens")
+    if patched:
+        PreTrainedTokenizerBase.sanitize_special_tokens = lambda self: 0
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    finally:
+        if own is not None:
+            PreTrainedTokenizerBase.sanitize_special_tokens = own
+        elif patched:
+            del PreTrainedTokenizerBase.sanitize_special_tokens
+    register_declared_special_tokens(tokenizer, model_path)
+    return tokenizer
+
+
+def register_declared_special_tokens(tokenizer, model_path: str) -> list[str]:
+    """Give the tokenizer the special tokens ``tokenizer_config.json`` declares, at their ids.
+
+    Returns the tokens that were missing. Only a ``transformers`` that ignores
+    ``added_tokens_decoder`` (4.28) is missing any; on it ``added_tokens_encoder``
+    and ``added_tokens_decoder`` are plain dicts, and ``unique_no_split_tokens``
+    keeps ``tokenize`` from splitting a special token that appears in the text.
+    """
+    path = Path(model_path) / "tokenizer_config.json"
+    if not path.is_file():
+        return []
+    declared = json.loads(path.read_text(encoding="utf-8")).get("added_tokens_decoder", {})
+    missing = {
+        int(index): entry["content"]
+        for index, entry in declared.items()
+        if entry["content"] not in tokenizer.added_tokens_encoder
+    }
+    if not missing:
+        return []
+    for index, content in missing.items():
+        tokenizer.added_tokens_encoder[content] = index
+        tokenizer.added_tokens_decoder[index] = content
+    tokenizer.unique_no_split_tokens = sorted(set(tokenizer.unique_no_split_tokens) | set(missing.values()))
+    tokenizer._create_trie(tokenizer.unique_no_split_tokens)
+    return sorted(missing.values())
+
+
+def render(tokenizer, token_ids: list[int]) -> str:
+    """Text when there is a tokenizer, the raw ids under ``--dummy-prompt``."""
+    if tokenizer is None:
+        return f"ids {token_ids}"
+    return repr(tokenizer.decode(token_ids, skip_special_tokens=True))
 
 
 def build_runner(args, backend: str, prefill_mode: str, max_seq_len: int) -> StandaloneModelRunner:
@@ -241,14 +336,20 @@ def main(argv: list[str] | None = None) -> int:
     config = read_config(args.model_path)
     if not is_glm4_config(config):
         raise SystemExit(f"{args.model_path} is model_type {config.get('model_type')!r}, not a GLM-4 checkpoint")
+    if args.dummy_prompt and args.tokens:
+        # Nothing to build a haystack out of without a tokenizer.
+        print(f"  --dummy-prompt: skipping the needle-in-a-haystack stage (--tokens {args.tokens})", file=sys.stderr)
+        args.tokens = 0
     prefill_mode = choose_prefill_mode(args)
 
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-    eos_ids = _eos_ids(config, tokenizer)
     use_chat_template = not args.raw_prompt
-    short_ids = encode(tokenizer, DEFAULT_PROMPT, use_chat_template)
+    if args.dummy_prompt:
+        tokenizer = None
+        short_ids = dummy_prompt_ids()
+    else:
+        tokenizer = load_tokenizer(args.model_path)
+        short_ids = encode(tokenizer, DEFAULT_PROMPT, use_chat_template)
+    eos_ids = _eos_ids(config, tokenizer)
     max_seq_len = max(args.tokens, short_ids.numel()) + args.max_new_tokens + CONTEXT_HEADROOM_TOKENS
 
     print("=== 1. the contract ===")
@@ -276,7 +377,7 @@ def main(argv: list[str] | None = None) -> int:
     produced, metrics = runner.generate(short_ids.to(runner.device), max_new_tokens=args.max_new_tokens)
     produced = stop_at_eos(produced, eos_ids)
     summary = metrics.summary()
-    print(f"  {args.backend:20s} {tokenizer.decode(produced, skip_special_tokens=True)!r}")
+    print(f"  {args.backend:20s} {render(tokenizer, produced)}")
     print(f"  {'':20s} decode p50 {summary['decode_p50_us']:.0f} us, p99 {summary['decode_p99_us']:.0f} us")
 
     if args.reference_backend:
@@ -289,10 +390,7 @@ def main(argv: list[str] | None = None) -> int:
         expected, _ = reference.generate(short_ids.to(reference.device), max_new_tokens=args.max_new_tokens)
         expected = stop_at_eos(expected, eos_ids)
         agreed = sum(mine == theirs for mine, theirs in zip(produced, expected))
-        print(
-            f"  {args.reference_backend:20s} {tokenizer.decode(expected, skip_special_tokens=True)!r}  "
-            f"({agreed}/{len(expected)} tokens agree)"
-        )
+        print(f"  {args.reference_backend:20s} {render(tokenizer, expected)}  ({agreed}/{len(expected)} tokens agree)")
         del reference
         _free(args.device)
         runner = build_runner(args, args.backend, prefill_mode, max_seq_len) if args.tokens else None

@@ -1274,6 +1274,61 @@ class TestGlm4Checkpoint(unittest.TestCase):
             unfolded = self._runner(path, backend="turboquant_cube", dtype=torch.float16)
             self.assertEqual(check_contract(unfolded), "UNROTATED (stage 1)")
 
+    def test_dummy_prompt_runs_without_a_tokenizer(self):
+        """``--dummy-prompt`` end to end: 64 ones through the runner, and no tokenizer is ever loaded."""
+        from tq_longbench import smoke_glm
+
+        path = self._write("chatglm", TINY_GLM, self.tensors)
+        argv = ["--model-path", path, "--device", "cpu", "--backend", "dense_reference", "--dtype", "float32"]
+        argv += ["--dummy-prompt", "--max-new-tokens", "4", "--tokens", "8192"]
+        refuse = mock.patch.object(smoke_glm, "load_tokenizer", side_effect=AssertionError("tokenizer loaded"))
+        with refuse, contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(smoke_glm.main(argv), 0)
+        self.assertIn("ids [", out.getvalue())
+        self.assertNotIn("needle in a haystack", out.getvalue())
+        prompt = smoke_glm.dummy_prompt_ids()
+        self.assertEqual((prompt.shape, prompt.dtype, int(prompt.sum())), ((64,), torch.long, 64))
+
+
+class TestGlm4LegacyTokenizer(unittest.TestCase):
+    """The special-token registration ``transformers`` 4.28 needs for GLM-4, on a stand-in tokenizer.
+
+    Checked against the real ChatGLM4Tokenizer on 4.28.0 and 4.44.0 on
+    2026-09-18: identical ids for the short prompt and a 1717-token haystack.
+    """
+
+    DECLARED = {"151329": {"content": "<|endoftext|>"}, "151331": {"content": "[gMASK]"}}
+
+    def _tokenizer(self, registered: dict[str, int]):
+        tokenizer = types.SimpleNamespace(
+            added_tokens_encoder=dict(registered),
+            added_tokens_decoder={index: token for token, index in registered.items()},
+            unique_no_split_tokens=[],
+            _create_trie=mock.Mock(),
+        )
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        (root / "tokenizer_config.json").write_text(json.dumps({"added_tokens_decoder": self.DECLARED}))
+        return tokenizer, str(root)
+
+    def test_a_tokenizer_that_ignored_the_config_gets_its_tokens_at_their_ids(self):
+        from tq_longbench.smoke_glm import register_declared_special_tokens
+
+        tokenizer, root = self._tokenizer({})
+        self.assertEqual(register_declared_special_tokens(tokenizer, root), ["<|endoftext|>", "[gMASK]"])
+        self.assertEqual(tokenizer.added_tokens_encoder, {"<|endoftext|>": 151329, "[gMASK]": 151331})
+        self.assertEqual(tokenizer.added_tokens_decoder, {151329: "<|endoftext|>", 151331: "[gMASK]"})
+        self.assertEqual(tokenizer.unique_no_split_tokens, ["<|endoftext|>", "[gMASK]"])
+        tokenizer._create_trie.assert_called_once_with(["<|endoftext|>", "[gMASK]"])
+
+    def test_a_tokenizer_that_read_the_config_is_left_alone(self):
+        from tq_longbench.smoke_glm import register_declared_special_tokens
+
+        tokenizer, root = self._tokenizer({"<|endoftext|>": 151329, "[gMASK]": 151331})
+        self.assertEqual(register_declared_special_tokens(tokenizer, root), [])
+        tokenizer._create_trie.assert_not_called()
+
 
 class TestGlm4CheckpointNames(unittest.TestCase):
     SHAPE = glm4_model_shape(TINY_GLM)
