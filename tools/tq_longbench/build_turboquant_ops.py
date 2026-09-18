@@ -24,14 +24,18 @@ TurboQuant kernel sources, the host tiling and one binding file -- and installs
     tools/tq_longbench/lib/libvllm_turboquant_cube.so
     tools/tq_longbench/lib/libvllm_turboquant_cube_kernels.so
 
-where :func:`tq_longbench._ascend.load_turboquant_library` finds them. The first
-registers ``torch.ops._C_ascend.npu_turboquant_*`` -- the same schemas as the full
+where :func:`tq_longbench._ascend.load_turboquant_library` finds them, and nothing
+else: ``ascendc_library()`` adds install rules of its own (the kernel library
+under ``lib/``, its launch headers under ``include/``), so only this project's
+``install()`` component is installed. The first library registers
+``torch.ops._C_ascend.npu_turboquant_*`` -- the same schemas as the full
 extension, from the same source -- when ``torch.ops.load_library`` opens it.
 
 **The SoC must be a full variant** (``Ascend950PR_9599``, not ``Ascend950PR``):
 the variant's platform config fixes the core counts the kernels are compiled for,
 and CANN ships nine 950PR variants. It comes from ``--soc-version``, else
-``$SOC_VERSION``, else ``npu-smi`` the way ``setup.py`` reads it.
+``$SOC_VERSION``, else the device itself: ``aclrtGetSocName`` through ``ctypes``,
+then ``torch_npu.npu.get_device_name``. No ``npu-smi``.
 
 Two properties of CANN's ``ascendc_library()`` are enforced rather than left to
 fail obscurely: every build starts from an empty build directory (it cannot build
@@ -39,18 +43,21 @@ incrementally -- a rebuild dies with ``ld.lld: unknown file type``), and a sourc
 tree under a dot-directory such as ``.claude/worktrees/`` is refused (its object
 glob skips dot-directories and the link dies with ``TooFewObj``).
 
-Imports neither ``torch`` nor ``torch_npu``: both are located on disk, because
-importing ``torch_npu`` on a build host with no NPU can fail outright.
+``torch`` and ``torch_npu`` are located on disk rather than imported, because
+importing ``torch_npu`` on a build host with no NPU can fail outright; only the
+last SoC fallback imports it, and it survives that failing.
 """
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import importlib.util
 import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -60,6 +67,16 @@ DEFAULT_BUILD_ROOT = REPO_ROOT / "build" / "tq_standalone"
 
 LIBRARY_NAME = "libvllm_turboquant_cube.so"
 
+#: The standalone CMakeLists.txt's install() component. ``ascendc_library()``'s own
+#: rules are ``asc-devkit`` and would nest ``lib/`` and ``include/`` in the output.
+INSTALL_COMPONENT = "vllm_turboquant"
+
+#: What the pre-component builds left in the output directory besides the libraries.
+_STALE_ASCENDC_INSTALL = (
+    Path("lib") / "libvllm_turboquant_cube_kernels.so",
+    Path("include") / "vllm_turboquant_cube_kernels",
+)
+
 #: ``ascendc_library()`` needs Makefiles: under Ninja, CANN's extract_host_stub.py dies with a KeyError.
 CMAKE_GENERATOR = "Unix Makefiles"
 
@@ -68,6 +85,7 @@ _ASCEND_HOME_ENVS = ("ASCEND_HOME_PATH", "ASCEND_TOOLKIT_HOME")
 _SOC_VERSION_ENV = "SOC_VERSION"
 _SOC_FAMILY = "ascend950"
 _CMAKE_CACHE = "CMakeCache.txt"
+_ACL_SUCCESS = 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -78,7 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--soc-version",
         default=None,
-        help="full CANN SoC variant, e.g. Ascend950PR_9599 (default: $SOC_VERSION, else detected with npu-smi)",
+        help="full CANN SoC variant, e.g. Ascend950PR_9599 (default: $SOC_VERSION, else read from the device)",
     )
     parser.add_argument("--ascend-home", type=Path, default=None, help="CANN toolkit root (default: $ASCEND_HOME_PATH)")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="where the .so files go")
@@ -118,35 +136,66 @@ def platform_variants(home: Path) -> list[str]:
     )
 
 
-def detect_soc_version() -> str | None:
-    """``npu-smi``'s chip and NPU name, joined as ``setup.py`` joins them for a 950."""
+def detect_soc_version(home: Path) -> str | None:
+    """The SoC the runtime reports, e.g. ``Ascend950PR_9599``, or ``None`` with no device to ask.
+
+    ``aclrtGetSocName`` straight out of the toolkit's ``libascendcl.so`` first,
+    through ``ctypes``, so nothing initialises torch_npu to answer; then
+    ``torch_npu.npu.get_device_name(0)``, which asks the same runtime.
+    """
+    return acl_soc_name(home / "lib64" / "libascendcl.so") or torch_npu_soc_name()
+
+
+def acl_soc_name(libascendcl: Path, loader: Callable[[str], ctypes.CDLL] = ctypes.CDLL) -> str | None:
+    """``aclrtGetSocName()``; with ``aclInit`` around it only if the bare call has no answer.
+
+    The header states no precondition and returns null on failure, so the bare
+    call comes first. If ACL has to be initialised for it, it is finalised again
+    only when this call was the one that initialised it.
+    """
     try:
-        listing = subprocess.run(["npu-smi", "info", "-l"], capture_output=True, text=True, check=True).stdout
-        npu_id = _field(listing, "NPU ID")
-        board = subprocess.run(
-            ["npu-smi", "info", "-t", "board", "-i", npu_id], capture_output=True, text=True, check=True
-        ).stdout
-    except (OSError, subprocess.CalledProcessError, ValueError):
+        acl = loader(str(libascendcl))
+    except OSError:
+        # Typically the driver's libascend_hal.so is not on the loader path.
         return None
-    chip, npu = _field(board, "Chip Name", required=False), _field(board, "NPU Name", required=False)
-    if chip and npu and "950" in chip:
-        return f"{chip}_{npu}"
-    return None
+    get_soc_name = acl.aclrtGetSocName
+    get_soc_name.argtypes = []
+    get_soc_name.restype = ctypes.c_char_p
+    name = get_soc_name()
+    if not name:
+        acl.aclInit.argtypes = [ctypes.c_char_p]
+        acl.aclInit.restype = ctypes.c_int
+        status = acl.aclInit(None)
+        try:
+            name = get_soc_name()
+        finally:
+            if status == _ACL_SUCCESS:
+                acl.aclFinalize()
+    return name.decode() if name else None
 
 
-def _field(lines: str, key: str, required: bool = True) -> str:
-    for line in lines.splitlines():
-        name, _, value = line.partition(":")
-        if name.strip() == key:
-            return value.strip()
-    if required:
-        raise ValueError(f"npu-smi printed no {key!r}")
-    return ""
+def torch_npu_soc_name() -> str | None:
+    """``torch_npu.npu.get_device_name(0)``, when torch_npu is installed and sees a device."""
+    if importlib.util.find_spec("torch_npu") is None:
+        return None
+    try:
+        import torch_npu
+
+        return torch_npu.npu.get_device_name(0) or None
+    except Exception:  # any failure to reach a device means "no answer", not a crash
+        return None
 
 
-def resolve_soc_version(explicit: str | None, variants: list[str], detect=detect_soc_version) -> str:
-    """The variant to compile for, refusing a family name that does not pick one."""
-    soc = explicit or os.environ.get(_SOC_VERSION_ENV) or detect()
+def resolve_soc_version(
+    explicit: str | None, variants: list[str], detect: Callable[[], str | None] | None = None
+) -> str:
+    """The variant to compile for, refusing a family name that does not pick one.
+
+    ``--soc-version``, then ``$SOC_VERSION``, then what ``detect`` reads off the
+    device. Whichever it is, it is matched against CANN's platform configs, and
+    the spelling CANN ships is the one returned.
+    """
+    soc = explicit or os.environ.get(_SOC_VERSION_ENV) or (detect() if detect else None)
     choices = ", ".join(variants) or "none found in this CANN"
     if not soc:
         raise SystemExit(f"no SoC variant: pass --soc-version or set {_SOC_VERSION_ENV} (choices: {choices})")
@@ -204,7 +253,7 @@ def cmake_commands(
         f"-DCMAKE_INSTALL_PREFIX={output_dir.resolve()}",
     ]
     build = ["cmake", "--build", str(build_dir), "-j", str(max(1, args.jobs))]
-    install = ["cmake", "--install", str(build_dir)]
+    install = ["cmake", "--install", str(build_dir), "--component", INSTALL_COMPONENT]
     return [configure, build, install]
 
 
@@ -222,6 +271,29 @@ def build_environment(home: Path) -> dict[str, str]:
     return env
 
 
+def prepare_output_dir(output_dir: Path) -> list[Path]:
+    """Create ``output_dir``, and remove what an earlier build's ``asc-devkit`` install left in it.
+
+    Only the two known paths, and a ``lib/`` or ``include/`` they leave empty:
+    anything else there is not this script's to delete. Returns what was removed.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    removed = []
+    for relative in _STALE_ASCENDC_INSTALL:
+        stale = output_dir / relative
+        if stale.is_dir():
+            shutil.rmtree(stale)
+        elif stale.is_file():
+            stale.unlink()
+        else:
+            continue
+        removed.append(stale)
+        parent = stale.parent
+        if parent != output_dir and not any(parent.iterdir()):
+            parent.rmdir()
+    return removed
+
+
 def fresh_build_dir(build_dir: Path) -> None:
     """Empty ``build_dir``, but only if it is empty already or a CMake tree this script could have made."""
     if build_dir.exists():
@@ -234,7 +306,7 @@ def fresh_build_dir(build_dir: Path) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     home = ascend_home(args.ascend_home)
-    soc = resolve_soc_version(args.soc_version, platform_variants(home))
+    soc = resolve_soc_version(args.soc_version, platform_variants(home), lambda: detect_soc_version(home))
     refuse_dot_directories(STANDALONE_SOURCE_DIR)
     build_dir = args.build_dir or DEFAULT_BUILD_ROOT / soc.lower()
     commands = cmake_commands(
@@ -248,6 +320,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     fresh_build_dir(build_dir)
+    for stale in prepare_output_dir(args.output_dir.resolve()):
+        print(f"[build_turboquant_ops] removed {stale}, left by an earlier build", file=sys.stderr)
     env = build_environment(home)
     for command in commands:
         subprocess.run(command, check=True, env=env)

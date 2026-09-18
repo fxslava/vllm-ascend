@@ -41,6 +41,7 @@ from __future__ import annotations
 import __future__
 
 import contextlib
+import ctypes
 import io
 import json
 import os
@@ -1517,17 +1518,64 @@ class TestBuildTurboQuantOps(unittest.TestCase):
             build_turboquant_ops.resolve_soc_version("ascend950pr_9599", self.VARIANTS), "Ascend950PR_9599"
         )
 
-    def test_the_soc_falls_back_to_the_environment_then_npu_smi(self):
+    def test_the_soc_falls_back_to_the_environment_then_the_device(self):
         detected = mock.Mock(return_value="Ascend950PR_9589")
         self.assertEqual(build_turboquant_ops.resolve_soc_version(None, self.VARIANTS, detected), "Ascend950PR_9589")
         os.environ["SOC_VERSION"] = "ascend950pr_9599"
         self.assertEqual(build_turboquant_ops.resolve_soc_version(None, self.VARIANTS, detected), "Ascend950PR_9599")
         detected.assert_called_once()
 
-    def test_npu_smi_fields_are_read_by_name(self):
-        board = "        Chip Name                      : Ascend950PR\n        NPU Name                       : 9599\n"
-        self.assertEqual(build_turboquant_ops._field(board, "Chip Name"), "Ascend950PR")
-        self.assertEqual(build_turboquant_ops._field(board, "Board ID", required=False), "")
+    def test_what_the_device_reports_is_matched_against_the_platform_configs(self):
+        with self.assertRaisesRegex(SystemExit, "no platform config"):
+            build_turboquant_ops.resolve_soc_version(None, self.VARIANTS, lambda: "Ascend950PR_957d")
+        with self.assertRaisesRegex(SystemExit, "no SoC variant"):
+            build_turboquant_ops.resolve_soc_version(None, self.VARIANTS, lambda: None)
+
+    @staticmethod
+    def _libascendcl(names, init_status=0):
+        """A stand-in for ``ctypes.CDLL(libascendcl.so)``: ``aclrtGetSocName`` answers from ``names`` in turn."""
+        answers = iter(names)
+        acl = mock.Mock()
+        acl.aclrtGetSocName = mock.Mock(side_effect=lambda: next(answers))
+        acl.aclInit = mock.Mock(return_value=init_status)
+        return acl
+
+    def test_the_soc_name_comes_straight_from_acl(self):
+        acl = self._libascendcl([b"Ascend950PR_9599"])
+        loader = mock.Mock(return_value=acl)
+        self.assertEqual(
+            build_turboquant_ops.acl_soc_name(Path("/cann/lib64/libascendcl.so"), loader), "Ascend950PR_9599"
+        )
+        loader.assert_called_once_with(str(Path("/cann/lib64/libascendcl.so")))
+        acl.aclInit.assert_not_called()
+        # The return type is set before the call, or ctypes would hand back an int.
+        self.assertIs(acl.aclrtGetSocName.restype, ctypes.c_char_p)
+
+    def test_acl_is_initialised_only_when_the_bare_call_has_no_answer(self):
+        acl = self._libascendcl([None, b"Ascend950PR_9589"])
+        self.assertEqual(
+            build_turboquant_ops.acl_soc_name(Path("acl.so"), mock.Mock(return_value=acl)), "Ascend950PR_9589"
+        )
+        acl.aclInit.assert_called_once_with(None)
+        acl.aclFinalize.assert_called_once()
+
+    def test_acl_initialised_by_someone_else_is_not_finalised(self):
+        acl = self._libascendcl([None, None], init_status=100002)  # ACL_ERROR_REPEAT_INITIALIZE
+        self.assertIsNone(build_turboquant_ops.acl_soc_name(Path("acl.so"), mock.Mock(return_value=acl)))
+        acl.aclFinalize.assert_not_called()
+
+    def test_a_libascendcl_that_will_not_load_is_no_answer(self):
+        loader = mock.Mock(side_effect=OSError("libascend_hal.so: cannot open shared object file"))
+        self.assertIsNone(build_turboquant_ops.acl_soc_name(Path("acl.so"), loader))
+
+    def test_detection_falls_back_to_torch_npu_and_never_runs_npu_smi(self):
+        with (
+            mock.patch.object(build_turboquant_ops, "acl_soc_name", return_value=None),
+            mock.patch.object(build_turboquant_ops, "torch_npu_soc_name", return_value="Ascend950PR_9599"),
+            mock.patch.object(build_turboquant_ops.subprocess, "run") as run,
+        ):
+            self.assertEqual(build_turboquant_ops.detect_soc_version(Path("/cann")), "Ascend950PR_9599")
+        run.assert_not_called()
 
     def test_a_source_tree_under_a_dot_directory_is_refused(self):
         with self.assertRaisesRegex(SystemExit, "TooFewObj"):
@@ -1545,7 +1593,41 @@ class TestBuildTurboQuantOps(unittest.TestCase):
         self.assertIn("-DCMAKE_BUILD_TYPE=Release", configure)
         self.assertEqual(configure[configure.index("-S") + 1], str(build_turboquant_ops.STANDALONE_SOURCE_DIR))
         self.assertEqual(build[-2:], ["-j", "3"])
-        self.assertEqual(install, ["cmake", "--install", str(Path("/b"))])
+        self.assertEqual(install, ["cmake", "--install", str(Path("/b")), "--component", "vllm_turboquant"])
+
+    def test_only_this_projects_component_is_installed(self):
+        """``ascendc_library()``'s asc-devkit rules would nest lib/ and include/ in the output."""
+        args = build_turboquant_ops.build_parser().parse_args([])
+        *_, install = build_turboquant_ops.cmake_commands(
+            "Ascend950PR_9599", Path("/cann"), Path("/t"), Path("/n"), Path("/b"), Path("/o"), args
+        )
+        self.assertEqual(install[-2:], ["--component", build_turboquant_ops.INSTALL_COMPONENT])
+        cmake = (build_turboquant_ops.STANDALONE_SOURCE_DIR / "CMakeLists.txt").read_text(encoding="utf-8")
+        rule = cmake[cmake.index("install(TARGETS") :]
+        rule = rule[: rule.index(")") + 1]
+        self.assertIn(f"COMPONENT {build_turboquant_ops.INSTALL_COMPONENT}", rule)
+        self.assertIn("DESTINATION .", rule)
+        self.assertNotIn("DESTINATION lib", rule)
+
+    def test_the_output_dir_is_created_and_an_old_nested_install_removed(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        output = Path(directory.name) / "tools" / "tq_longbench" / "lib"
+        self.assertEqual(build_turboquant_ops.prepare_output_dir(output), [])
+        self.assertTrue(output.is_dir())
+
+        (output / "lib").mkdir()
+        (output / "lib" / "libvllm_turboquant_cube_kernels.so").write_bytes(b"old")
+        (output / "include" / "vllm_turboquant_cube_kernels").mkdir(parents=True)
+        (output / "include" / "vllm_turboquant_cube_kernels" / "aclrtlaunch_x.h").write_text("x")
+        (output / "include" / "mine.h").write_text("kept")
+        (output / build_turboquant_ops.LIBRARY_NAME).write_bytes(b"current")
+        removed = build_turboquant_ops.prepare_output_dir(output)
+        self.assertEqual(len(removed), 2)
+        self.assertFalse((output / "lib").exists())
+        self.assertTrue((output / "include" / "mine.h").is_file())
+        self.assertFalse((output / "include" / "vllm_turboquant_cube_kernels").exists())
+        self.assertTrue((output / build_turboquant_ops.LIBRARY_NAME).is_file())
 
     def test_only_an_empty_or_cmake_build_dir_is_wiped(self):
         directory = tempfile.TemporaryDirectory()

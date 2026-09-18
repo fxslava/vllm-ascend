@@ -3,7 +3,7 @@
 # registers the same torch.ops._C_ascend schemas -- without configuring, compiling or
 # linking anything else of the package.
 #
-# Produces, under CMAKE_INSTALL_PREFIX:
+# Produces, directly under CMAKE_INSTALL_PREFIX (cmake --install --component vllm_turboquant):
 #   libvllm_turboquant_cube.so          load this: torch.ops.load_library(...)
 #   libvllm_turboquant_cube_kernels.so  the Ascend C kernels it launches (found via $ORIGIN)
 #
@@ -90,7 +90,10 @@ get_filename_component(VLLM_TQ_TORCH_LIB_DIR "${TORCH_LIBRARY}" DIRECTORY)
 target_link_options(vllm_turboquant_cube PRIVATE
   "-Wl,-rpath,$ORIGIN:${TORCH_NPU_PATH}/lib:${VLLM_TQ_TORCH_LIB_DIR}:${ASCEND_HOME_PATH}/lib64")
 
+# Straight into CMAKE_INSTALL_PREFIX, under a component of its own: ascendc_library()
+# adds install rules too (COMPONENT asc-devkit: the kernel library into lib/, its
+# aclrtlaunch_*.h into include/), which would nest a lib/lib in tools/tq_longbench/lib.
+# The build script installs --component vllm_turboquant alone.
 install(TARGETS vllm_turboquant_cube vllm_turboquant_cube_kernels
-  LIBRARY DESTINATION .
-  ARCHIVE DESTINATION .
+  LIBRARY DESTINATION . COMPONENT vllm_turboquant
 )

@@ -94,8 +94,15 @@ It compiles `csrc/attention/turboquant/standalone/` into
 `tools/tq_longbench/lib/libvllm_turboquant_cube.so` and its kernel library. The
 flags are `-DVLLM_ENABLE_TURBOQUANT_CUBE=1`, C++17, `-O3` and the given SoC. The
 SoC has to be a full variant, because it fixes the core counts. It comes from
-`--soc-version`, then `$SOC_VERSION`, then `npu-smi`. The schemas are the full
-extension's own: both include `op_adapter/turboquant_torch_ops.h`.
+`--soc-version`, then `$SOC_VERSION`, then the device: `aclrtGetSocName` via
+`ctypes` from the toolkit's `libascendcl.so`, then `torch_npu.npu.get_device_name(0)`.
+Either answer is matched against CANN's platform configs. The schemas are the
+full extension's own: both include `op_adapter/turboquant_torch_ops.h`.
+
+Only the project's own `vllm_turboquant` install component is installed, so the
+output holds the two libraries and nothing else. `ascendc_library()` adds
+`asc-devkit` rules that would put a copy under `lib/lib` and launch headers under
+`include/`. Leftovers of that kind from an earlier build are removed.
 
 When the operators are missing, the Cube backend (and `ascend_ops()` for the
 AIV one) loads the library with `torch.ops.load_library`. It is looked for at
