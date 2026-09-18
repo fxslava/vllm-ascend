@@ -46,6 +46,7 @@ import io
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 import types
@@ -2079,17 +2080,16 @@ class TestNeedleSlots(unittest.TestCase):
 
 
 class TestRunLongBench(unittest.TestCase):
-    """The LongBench ladder end to end, with the dataset stubbed.
+    """The LongBench pipeline end to end, over JSONL written the way the suite writes it.
 
-    ``datasets`` is not a harness dependency and downloading LongBench is not a
-    unit test's business, so ``load_longbench`` is replaced with items built from
-    the suite's own prompt templates. What is under test is the sweep -- tasks
-    times rungs, one runner per rung, the record and the table -- not the corpus.
+    No ``datasets`` and no download: the loader reads ``{task}.jsonl`` with
+    ``json.loads``, which is the whole point of it, so a test can hand it four
+    lines and exercise the real path rather than a mock of it.
     """
 
-    TASKS = ("narrativeqa", "gov_report")
-    CONTEXTS = (128, 256)
-    ITEMS = 2
+    TASKS = ("narrativeqa", "gov_report", "trec", "lcc")
+    CONTEXT = 192
+    ITEMS = 3
 
     def setUp(self):
         torch.manual_seed(0)
@@ -2105,20 +2105,30 @@ class TestRunLongBench(unittest.TestCase):
             {key: value.contiguous() for key, value in _chatglm_checkpoint(TINY_GLM).items()},
             str(self.model_path / "model.safetensors"),
         )
+        self.dataset_dir = self.root / "longbench"
+        self.dataset_dir.mkdir()
+        self.answers = {
+            "narrativeqa": ["alpha beta"],
+            "gov_report": ["alpha beta gamma"],
+            "trec": ["sports"],
+            "lcc": ["return a + b"],
+        }
+        for task in self.TASKS:
+            extra = {"all_classes": ["sports", "politics"]} if task == "trec" else {}
+            rows = [
+                {
+                    "context": "alpha beta gamma delta " * 12,
+                    "input": "what?",
+                    "answers": self.answers[task],
+                    "length": 60,
+                    **extra,
+                }
+                for _ in range(self.ITEMS)
+            ]
+            path = self.dataset_dir / f"{task}.jsonl"
+            path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
 
-    def _items(self, task, limit=None):
-        from tq_longbench.tasks import _TASK_METRICS, LONGBENCH_MAX_NEW_TOKENS, LONGBENCH_PROMPTS, EvalItem
-
-        for index in range(limit or self.ITEMS):
-            yield EvalItem(
-                prompt=LONGBENCH_PROMPTS[task].format(context="alpha beta gamma delta " * 20, input="what?"),
-                answers=["alpha beta"],
-                metric=_TASK_METRICS[task],
-                max_new_tokens=LONGBENCH_MAX_NEW_TOKENS[task],
-                extra={"task": task, "index": index},
-            )
-
-    def _run(self, *extra):
+    def _run(self, *extra, tasks=None):
         from tq_longbench import run_longbench
 
         out_file = self.root / "longbench.jsonl"
@@ -2126,18 +2136,18 @@ class TestRunLongBench(unittest.TestCase):
             "--model-path", str(self.model_path),
             "--device", "cpu",
             "--backends", "dense_reference",
-            "--tasks", ",".join(self.TASKS),
-            "--contexts", ",".join(str(c) for c in self.CONTEXTS),
+            "--tasks", ",".join(tasks or self.TASKS),
+            "--dataset-dir", str(self.dataset_dir),
+            "--max-context-len", str(self.CONTEXT),
             "--limit", str(self.ITEMS),
-            "--max-new-tokens", "3",
+            "--max-new-tokens", "4",
             "--dtype", "float32",
-            "--chunk-size", "32",
+            "--chunk-size", "48",
             "--out-file", str(out_file),
             *extra,
         ]  # fmt: skip
         with (
             mock.patch.object(run_longbench, "load_tokenizer", return_value=_ByteTokenizer()),
-            mock.patch.object(run_longbench, "load_longbench", self._items),
             contextlib.redirect_stdout(io.StringIO()) as out,
             contextlib.redirect_stderr(io.StringIO()) as err,
         ):
@@ -2145,62 +2155,189 @@ class TestRunLongBench(unittest.TestCase):
         records = [json.loads(line) for line in out_file.read_text(encoding="utf-8").splitlines()]
         return records, out.getvalue(), err.getvalue()
 
-    def test_every_task_at_every_rung_leaves_its_items(self):
-        records, _, _ = self._run()
-        self.assertEqual(len(records), len(self.TASKS) * len(self.CONTEXTS) * self.ITEMS)
-        seen = {(r["context_requested"], r["task"]) for r in records}
-        self.assertEqual(seen, {(c, t) for c in self.CONTEXTS for t in self.TASKS})
+    def test_the_items_come_off_disk_through_the_tasks_own_template(self):
+        records, _, logged = self._run()
+        self.assertEqual(len(records), len(self.TASKS) * self.ITEMS)
+        for task in self.TASKS:
+            with self.subTest(task=task):
+                self.assertIn(f"{task}.jsonl", logged)
+                self.assertFalse(any(r["synthetic"] for r in records if r["task"] == task))
 
-    def test_each_record_carries_the_score_and_the_cost(self):
+    def test_each_task_is_scored_by_its_own_official_metric(self):
+        """The metric is a property of the task, so the record has to name it."""
         records, _, _ = self._run()
-        for record in records:
-            with self.subTest(task=record["task"], context=record["context_requested"]):
-                self.assertEqual(record["metric"], "rouge_l" if record["task"] == "gov_report" else "f1")
-                self.assertGreaterEqual(record["score"], 0.0)
-                self.assertLessEqual(record["score"], 1.0)
-                for key in ("ttft_ms", "decode_p50_us", "decode_p99_us", "kv_cache_mb", "device_peak_mb"):
-                    self.assertIn(key, record)
-                # These prompts are far longer than the rungs, so every one was cut.
-                self.assertEqual(record["truncated"], 1)
-                self.assertGreater(record["untruncated_tokens"], record["prompt_tokens"])
+        seen = {record["task"]: record["metric"] for record in records}
+        self.assertEqual(seen["narrativeqa"], "F1")
+        self.assertEqual(seen["gov_report"], "ROUGE-L")
+        self.assertEqual(seen["trec"], "Accuracy")
+        self.assertEqual(seen["lcc"], "Edit-Sim")
 
-    def test_a_rungs_cache_is_sized_for_the_rung(self):
-        """One runner per rung, so the memory column describes the rung and not the ladder."""
-        records, _, _ = self._run()
-        held = {}
-        for record in records:
-            held.setdefault(record["context_requested"], record["kv_cache_mb"])
-        self.assertLess(held[self.CONTEXTS[0]], held[self.CONTEXTS[1]])
+    def test_a_missing_jsonl_falls_back_to_stubs_and_says_so_everywhere(self):
+        """Loudly: a stub row is not a LongBench score and must not read as one."""
+        records, printed, logged = self._run(tasks=("narrativeqa", "qasper"))
+        self.assertIn("SYNTHETIC STUBS", logged)
+        self.assertIn("measure the harness, not the model", logged)
+        self.assertTrue(all(r["synthetic"] for r in records if r["task"] == "qasper"))
+        self.assertFalse(any(r["synthetic"] for r in records if r["task"] == "narrativeqa"))
+        self.assertIn("qasper *", printed)
+        self.assertIn("synthetic stubs", printed)
 
-    def test_the_table_has_a_line_per_task_and_rung(self):
+    def test_the_markdown_table_has_a_row_per_task_and_an_average(self):
         _, printed, _ = self._run()
-        lines = [line for line in printed.splitlines() if line.startswith("dense_reference")]
-        self.assertEqual(len(lines), len(self.TASKS) * len(self.CONTEXTS))
-        self.assertIn("cut counts items whose middle was truncated", printed)
+        self.assertIn("| Task                 | Metric", printed)
+        for task in self.TASKS:
+            with self.subTest(task=task):
+                self.assertRegex(printed, rf"\|\s*{re.escape(task)}\s*\|")
+        self.assertIn("Overall Average", printed)
+        self.assertIn("### dense_reference @ 192 tokens", printed)
+        # Every body row carries a number followed by a percent sign; the header
+        # says "Score (%)" and must not be counted as one.
+        rows = [line for line in printed.splitlines() if re.search(r"\|\s+\d+\.\d%", line)]
+        self.assertEqual(len(rows), len(self.TASKS) + 1)
 
-    def test_the_prompt_route_and_stop_set_are_reported(self):
-        """The same two lines smoke_glm prints: a score must not be measuring a missing marker."""
+    def test_a_perfect_prediction_scores_a_hundred_percent(self):
+        """The scoring wired end to end, with the model replaced by the right answer.
+
+        A tiny random checkpoint scores zero on everything, which cannot tell a
+        working scorer from one that returns zero. Handing the loop the reference
+        answer proves the other end of the range, and with it the whole chain:
+        loader, template, truncation, generation, decode, metric, aggregate.
+
+        One task per metric family -- F1, ROUGE-L, classification, edit
+        similarity -- because each has its own normalisation, and a family
+        whose ideal answer scored 99% would be a scorer bug hiding at the top.
+        """
+        from tq_longbench import run_longbench
+
+        # Items run task by task in --tasks order, so the reference answers can
+        # be handed out in that same order.
+        references = iter([self.answers[task][0] for task in self.TASKS for _ in range(self.ITEMS)])
+
+        def perfect(tokenizer, token_ids):
+            return next(references), None
+
+        with mock.patch.object(run_longbench, "decode_text", perfect):
+            records, printed, _ = self._run()
+        self.assertEqual(len(records), len(self.TASKS) * self.ITEMS)
+        for record in records:
+            with self.subTest(task=record["task"], index=record["index"]):
+                self.assertEqual(record["prediction"], self.answers[record["task"]][0])
+                self.assertEqual(record["score"], 1.0)
+        average = next(line for line in printed.splitlines() if "Overall Average" in line)
+        self.assertIn("100.0%", average)
+
+    def test_the_prompt_route_the_config_and_the_segmenter_are_all_reported(self):
+        """Three things that silently change a score, so none of them is left to be guessed."""
         _, _, logged = self._run()
         self.assertIn("GLM-4 turn markers", logged)
         self.assertIn("stop ids: [", logged)
+        self.assertIn("prompts:", logged)
+        self.assertIn("chinese segmentation:", logged)
 
-    def test_profile_layers_prints_the_table_and_is_off_by_default(self):
-        _, _, quiet = self._run()
+    def test_the_suites_own_config_wins_over_the_transcription(self):
+        """A downloaded LongBench ships the prompts it was scored with; they beat ours."""
+        from tq_longbench.tasks import config_source, longbench_config
+
+        mine, _ = longbench_config(self.dataset_dir)
+        config = self.dataset_dir / "config"
+        config.mkdir()
+        (config / "dataset2prompt.json").write_text(
+            json.dumps({"narrativeqa": "OVERRIDDEN {context} {input}"}), encoding="utf-8"
+        )
+        theirs, _ = longbench_config(self.dataset_dir)
+        self.assertNotEqual(mine["narrativeqa"], theirs["narrativeqa"])
+        self.assertEqual(theirs["narrativeqa"], "OVERRIDDEN {context} {input}")
+        # Tasks the override does not mention keep the transcription.
+        self.assertEqual(mine["gov_report"], theirs["gov_report"])
+        self.assertIn("config", config_source(self.dataset_dir))
+
+    def test_profile_layers_is_off_by_default(self):
+        _, _, quiet = self._run(tasks=("narrativeqa",))
         self.assertNotIn("layer probe", quiet)
-        _, _, loud = self._run("--profile-layers")
+        _, _, loud = self._run("--profile-layers", tasks=("narrativeqa",))
         self.assertIn("layer probe", loud)
-        self.assertIn("hidden_cos", loud)
-        # One probe per (rung, task), on the first item only.
-        self.assertEqual(loud.count("layer probe"), len(self.TASKS) * len(self.CONTEXTS))
 
-    def test_an_unknown_task_is_refused_by_name(self):
+    def test_an_unknown_task_is_refused_and_all_means_all(self):
+        from tq_longbench.metrics import TASK_METRICS
         from tq_longbench.run_longbench import parse_tasks
 
         self.assertEqual(parse_tasks("longbench_qasper,gov_report"), ("qasper", "gov_report"))
-        with self.assertRaisesRegex(ValueError, "no prompt template"):
+        self.assertEqual(set(parse_tasks("all")), set(TASK_METRICS))
+        with self.assertRaisesRegex(ValueError, "no LongBench metric"):
             parse_tasks("narrativeqa,not_a_task")
+
+
+class TestLongBenchJsonlLoader(unittest.TestCase):
+    """``load_longbench_jsonl`` on its own: the file shape the suite ships, and its failure modes."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dataset_dir = Path(self._tmp.name)
+
+    def _write(self, task, rows, blank_lines=False):
+        lines = [json.dumps(row, ensure_ascii=False) for row in rows]
+        separator = "\n\n" if blank_lines else "\n"
+        (self.dataset_dir / f"{task}.jsonl").write_text(separator.join(lines) + "\n", encoding="utf-8")
+
+    def test_a_row_becomes_an_item_through_the_tasks_template(self):
+        from tq_longbench.tasks import load_longbench_jsonl, longbench_config
+
+        row = {"context": "CTX-MARKER", "input": "INPUT-MARKER", "answers": ["x", "y"], "length": 7}
+        self._write("hotpotqa", [row])
+        (item,) = load_longbench_jsonl("hotpotqa", self.dataset_dir)
+        prompts, budgets = longbench_config(self.dataset_dir)
+        self.assertEqual(item.prompt, prompts["hotpotqa"].format(context="CTX-MARKER", input="INPUT-MARKER"))
+        self.assertEqual(item.answers, ["x", "y"])
+        self.assertEqual(item.metric, "hotpotqa")
+        self.assertEqual(item.max_new_tokens, budgets["hotpotqa"])
+        self.assertEqual(item.extra["length"], 7)
+
+    def test_classification_classes_and_language_travel_on_the_item(self):
+        """``trec`` cannot be scored without its class list, so the loader must not drop it."""
+        from tq_longbench.metrics import score_prediction
+        from tq_longbench.tasks import load_longbench_jsonl
+
+        classes = ["Abbreviation", "Entity", "Location"]
+        self._write("trec", [{"context": "c", "input": "i", "answers": ["Location"], "all_classes": classes}])
+        (item,) = load_longbench_jsonl("trec", self.dataset_dir)
+        self.assertEqual(item.extra["all_classes"], classes)
+        self.assertEqual(score_prediction("trec", "Location", item.answers, item.extra["all_classes"]), 1.0)
+
+    def test_chinese_rows_round_trip_unescaped(self):
+        from tq_longbench.tasks import load_longbench_jsonl
+
+        self._write("multifieldqa_zh", [{"context": "上下文", "input": "问题", "answers": ["答案"], "language": "zh"}])
+        (item,) = load_longbench_jsonl("multifieldqa_zh", self.dataset_dir)
+        self.assertIn("上下文", item.prompt)
+        self.assertEqual(item.answers, ["答案"])
+        self.assertEqual(item.extra["language"], "zh")
+
+    def test_limit_counts_rows_and_blank_lines_are_skipped(self):
+        from tq_longbench.tasks import load_longbench_jsonl
+
+        rows = [{"context": str(n), "input": "q", "answers": [str(n)]} for n in range(5)]
+        self._write("qasper", rows, blank_lines=True)
+        loaded = [item.answers for item in load_longbench_jsonl("qasper", self.dataset_dir)]
+        self.assertEqual(loaded, [[str(n)] for n in range(5)])
+        limited = list(load_longbench_jsonl("qasper", self.dataset_dir, limit=2))
+        self.assertEqual([item.extra["index"] for item in limited], [0, 1])
+
+    def test_a_missing_file_and_an_unknown_task_are_refused_by_name(self):
+        from tq_longbench.tasks import load_longbench_jsonl, local_task_path
+
+        self.assertIsNone(local_task_path("narrativeqa", self.dataset_dir))
+        with self.assertRaisesRegex(FileNotFoundError, "narrativeqa.jsonl"):
+            next(load_longbench_jsonl("narrativeqa", self.dataset_dir))
+        with self.assertRaisesRegex(ValueError, "not_a_task"):
+            next(load_longbench_jsonl("not_a_task", self.dataset_dir))
+
+    def test_the_hf_loader_refuses_a_task_it_cannot_score(self):
+        """The prompt table has all 21 tasks, but ``score`` knows six: refuse before downloading."""
+        from tq_longbench.tasks import load_longbench
+
         with self.assertRaisesRegex(ValueError, "no prompt template"):
-            parse_tasks("")
+            next(load_longbench("longbench_trec"))
 
 
 class TestGlm4LegacyTokenizer(unittest.TestCase):

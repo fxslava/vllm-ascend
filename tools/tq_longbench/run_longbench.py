@@ -63,6 +63,7 @@ import argparse  # noqa: E402  (after the path bootstrap above)
 import json  # noqa: E402
 import statistics  # noqa: E402
 import time  # noqa: E402
+from collections.abc import Iterator  # noqa: E402
 from dataclasses import dataclass, field  # noqa: E402
 
 import torch  # noqa: E402
@@ -94,9 +95,23 @@ quiet_tensorflow()
 from tq_longbench.engine import DEFAULT_CHUNK_SIZE, PREFILL_MODES, RunMetrics  # noqa: E402
 from tq_longbench.glm4 import is_glm4_config, read_config  # noqa: E402
 from tq_longbench.layers import FOLD_SITES  # noqa: E402
+from tq_longbench.metrics import (  # noqa: E402
+    TASK_METRICS,
+    as_percentage,
+    metric_label,
+    score_prediction,
+    segmentation_backend,
+)
 from tq_longbench.ops import backend_names  # noqa: E402
 from tq_longbench.probe import LayerProbe  # noqa: E402
-from tq_longbench.tasks import LONGBENCH_MAX_NEW_TOKENS, LONGBENCH_PROMPTS, load_longbench, score  # noqa: E402
+from tq_longbench.tasks import (  # noqa: E402
+    DEFAULT_DATASET_DIR,
+    EvalItem,
+    config_source,
+    load_longbench_jsonl,
+    local_task_path,
+    longbench_config,
+)
 
 _DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
 
@@ -114,6 +129,11 @@ DEFAULT_LIMIT = 20
 #: Which unquantised backend the ``--profile-layers`` reference prefill uses.
 PROBE_REFERENCE_BACKEND = "cann_dense"
 
+#: How many stand-in items a task gets when its JSONL is not on disk. Few, on
+#: purpose: the fallback exists to prove the pipeline runs, not to produce a
+#: number anyone might mistake for a benchmark.
+STUB_ITEMS = 3
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -123,8 +143,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-path", required=True, help="directory holding config.json and safetensors shards")
     parser.add_argument("--device", default="npu", help="npu, npu:N, cuda:N or cpu (default: npu)")
     parser.add_argument("--backends", default="turboquant_cube", help=f"comma-separated; one of {backend_names()}")
-    parser.add_argument("--tasks", default=DEFAULT_TASKS, help=f"comma-separated; known: {sorted(LONGBENCH_PROMPTS)}")
+    parser.add_argument("--tasks", default=DEFAULT_TASKS, help=f"comma-separated; known: {sorted(TASK_METRICS)}")
     parser.add_argument("--contexts", default=DEFAULT_CONTEXTS, help="comma-separated prompt lengths in tokens")
+    parser.add_argument(
+        "--max-context-len",
+        type=int,
+        default=None,
+        help="run one length instead of the --contexts ladder; prompts longer than this are cut from the middle",
+    )
+    parser.add_argument(
+        "--dataset-dir",
+        type=Path,
+        default=Path(DEFAULT_DATASET_DIR),
+        help=f"directory of {{task}}.jsonl files (default: {DEFAULT_DATASET_DIR}); falls back to synthetic "
+        "stubs where a file is missing",
+    )
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT, help="items per task per rung")
     parser.add_argument(
         "--max-new-tokens",
@@ -152,13 +185,46 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def parse_tasks(text: str) -> tuple[str, ...]:
+    """``all`` for every v1 task, otherwise the named ones."""
+    if text.strip() == "all":
+        return tuple(TASK_METRICS)
     names = tuple(part.strip().removeprefix("longbench_") for part in text.split(",") if part.strip())
-    unknown = [name for name in names if name not in LONGBENCH_PROMPTS]
+    unknown = [name for name in names if name not in TASK_METRICS]
     if not names or unknown:
-        raise ValueError(
-            f"--tasks: no prompt template for {unknown or 'nothing given'}; known {sorted(LONGBENCH_PROMPTS)}"
-        )
+        raise ValueError(f"--tasks: no LongBench metric for {unknown or 'nothing given'}; known {sorted(TASK_METRICS)}")
     return names
+
+
+def load_items(task: str, dataset_dir: Path, limit: int) -> tuple[list[EvalItem], str]:
+    """``(items, where they came from)``: the local JSONL if it is there, else a stub.
+
+    Falling back rather than failing, because the ladder is useful before the
+    corpus arrives -- but the source travels into every record and onto the
+    table, because a score computed over three synthetic items is not a LongBench
+    score and the two must never be read as the same number.
+    """
+    if local_task_path(task, dataset_dir) is not None:
+        return list(load_longbench_jsonl(task, dataset_dir, limit=limit)), "jsonl"
+    return list(synthetic_items(task, dataset_dir, limit=min(limit, STUB_ITEMS))), "stub"
+
+
+def synthetic_items(task: str, dataset_dir: Path, limit: int) -> Iterator[EvalItem]:
+    """Stand-in items in the task's own prompt template, for a host without the corpus.
+
+    Deliberately trivial: the answer is in the context verbatim, so a working
+    pipeline scores near the top and a broken one scores zero. It measures the
+    harness, never the model.
+    """
+    prompts, budgets = longbench_config(dataset_dir)
+    for index in range(limit):
+        answer = f"stub answer {index}"
+        yield EvalItem(
+            prompt=prompts[task].format(context=f"The answer to question {index} is {answer}. " * 8, input="what?"),
+            answers=[answer],
+            metric=task,
+            max_new_tokens=budgets.get(task, 64),
+            extra={"task": task, "index": index, "all_classes": [answer, "other"], "synthetic": True},
+        )
 
 
 @dataclass
@@ -169,7 +235,14 @@ class TaskRung:
     context: int
     task: str
     metric: str
+    #: ``"jsonl"`` or ``"stub"``. On the table, because a stub row is not a score.
+    source: str = "jsonl"
     records: list[dict] = field(default_factory=list)
+
+    @property
+    def percentage(self) -> float:
+        """The suite's aggregate: the mean, times 100, to two places."""
+        return as_percentage(record["score"] for record in self.records)
 
     @property
     def mean_score(self) -> float:
@@ -192,15 +265,17 @@ def run_item(args, runner, tokenizer, eos_ids, item, keep: int, glm4: bool) -> t
     full = encode(tokenizer, item.prompt, not args.raw_prompt, glm4=glm4)
     prompt_ids = truncate_middle(full, keep)
     budget = args.max_new_tokens or item.max_new_tokens
+    task = item.extra.get("task")
     started = time.perf_counter()
     produced, metrics = runner.generate(prompt_ids.to(runner.device), max_new_tokens=budget, stop_ids=eos_ids)
     text, failure = decode_text(tokenizer, stop_at_eos(produced, eos_ids))
     record = {
         "backend": runner.config.backend,
-        "task": item.extra.get("task"),
+        "task": task,
         "index": item.extra.get("index"),
-        "metric": item.metric,
-        "score": round(score(text, item.answers, item.metric), 4),
+        "metric": metric_label(task),
+        "synthetic": bool(item.extra.get("synthetic")),
+        "score": round(score_prediction(task, text, item.answers, item.extra.get("all_classes")), 4),
         "prediction": text,
         "answers": item.answers,
         "decode_failure": failure,
@@ -235,25 +310,65 @@ def profile_item(args, runner, tokenizer, prompt_ids: torch.Tensor, item, plan) 
 
 
 def summarise(rungs: list[TaskRung]) -> str:
-    """One line per (backend, context, task)."""
-    header = (
-        f"{'backend':20s} {'task':17s} {'context':>8s} {'items':>6s} {'cut':>4s} {'score':>7s} "
-        f"{'ttft ms':>10s} {'p50 us':>9s} {'p99 us':>9s} {'kv MB':>8s} {'peak MB':>8s}"
-    )
-    lines = [header, "-" * len(header)]
-    for rung in rungs:
-        lines.append(
-            f"{rung.backend:20s} {rung.task:17s} {rung.context:>8d} {len(rung.records):>6d} "
-            f"{rung.truncated:>4d} {rung.mean_score:>7.4f} {rung.median('ttft_ms'):>10.0f} "
-            f"{rung.median('decode_p50_us'):>9.0f} {rung.median('decode_p99_us'):>9.0f} "
-            f"{rung.median('kv_cache_mb'):>8.1f} {rung.peak('device_peak_mb'):>8.0f}"
+    """The markdown table the run exists to produce, one block per (backend, context).
+
+    Per backend and rung rather than one table for everything, because a score
+    only means something next to the length it was measured at: ``narrativeqa``
+    at 4k and at 64k are different numbers about the same items, and a single
+    column would average them into one that is about neither.
+
+    ``Overall Average`` is the mean of the task scores, which is what LongBench
+    reports -- not the mean over items, which would weight a task by how many of
+    them it happens to have.
+    """
+    widths = (20, 11, 9, 7, 9, 12, 13)
+    blocks = []
+    for (backend, context), group in _grouped(rungs):
+        header = (
+            f"| {'Task':<20} | {'Metric':<11} | {'Score (%)':>9} | {'Samples':>7} | "
+            f"{'TTFT (ms)':>9} | {'Dec p50 (us)':>12} | {'Peak HBM (MB)':>13} |"
         )
-    lines.append("")
-    lines.append("score is the task's own metric (f1, or rouge_l for gov_report), averaged over its items.")
-    lines.append("cut counts items whose middle was truncated to reach the rung: those are not comparable")
-    lines.append("to published LongBench numbers, which score the whole item.")
-    lines.append("ttft/p50/p99/kv are medians over the items; peak MB is the high-water mark over them.")
-    return "\n".join(lines)
+        rule = "|" + "|".join("-" * (width + 2) for width in widths) + "|"
+        lines = [f"### {backend} @ {context} tokens", "", header, rule]
+        for rung in group:
+            note = " *" if rung.source == "stub" else ""
+            lines.append(
+                f"| {rung.task + note:<20} | {rung.metric:<11} | {rung.percentage:>8.1f}% | "
+                f"{len(rung.records):>7} | {rung.median('ttft_ms'):>9.0f} | "
+                f"{rung.median('decode_p50_us'):>12.0f} | {rung.peak('device_peak_mb'):>13.0f} |"
+            )
+        average = as_percentage([rung.percentage / 100 for rung in group])
+        lines.append(
+            f"| {'Overall Average':<20} | {'':<11} | {average:>8.1f}% | {'':>7} | {'':>9} | {'':>12} | {'':>13} |"
+        )
+        blocks.append("\n".join(lines))
+
+    notes = [
+        "",
+        "Score is the task's own LongBench metric as a percentage: the mean over items x 100.",
+        "Overall Average is the mean of the task scores, not of the items, which is how the suite reports it.",
+        "TTFT and Dec p50 are medians over a task's items; Peak HBM is the high-water mark over them.",
+    ]
+    if any(rung.source == "stub" for rung in rungs):
+        notes.append("* no JSONL on disk for this task: it ran on synthetic stubs and measures the harness only.")
+    if any(record.get("truncated") for rung in rungs for record in rung.records):
+        notes.append(
+            "Items longer than the rung were cut from the middle, so those rows are not comparable with "
+            "published LongBench numbers; every JSONL record carries its own `truncated` flag."
+        )
+    return "\n\n".join(blocks) + "\n" + "\n".join(notes)
+
+
+def _grouped(rungs: list[TaskRung]):
+    """``((backend, context), rungs)``, in the order they were run."""
+    order, grouped = [], {}
+    for rung in rungs:
+        key = (rung.backend, rung.context)
+        if key not in grouped:
+            order.append(key)
+            grouped[key] = []
+        grouped[key].append(rung)
+    return [(key, grouped[key]) for key in order]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -261,7 +376,7 @@ def main(argv: list[str] | None = None) -> int:
     args.device = resolve_device(args.device)
     backends = parse_backends(args.backends)
     tasks = parse_tasks(args.tasks)
-    contexts = parse_int_list(args.contexts, "contexts")
+    contexts = (args.max_context_len,) if args.max_context_len else parse_int_list(args.contexts, "contexts")
     config = read_config(args.model_path)
     glm4 = is_glm4_config(config)
     tokenizer = load_tokenizer(args.model_path) if glm4 else _auto_tokenizer(args.model_path)
@@ -269,10 +384,20 @@ def main(argv: list[str] | None = None) -> int:
     print(f"prompt: {prompt_route(tokenizer, not args.raw_prompt, glm4)}", file=sys.stderr)
     print(f"stop ids: {sorted(eos_ids) or 'NONE -- every item will run its whole budget'}", file=sys.stderr)
 
+    print(f"prompts: {config_source(args.dataset_dir)}", file=sys.stderr)
+    print(f"chinese segmentation: {segmentation_backend()}", file=sys.stderr)
+
     # Loaded once and reused at every rung: the rung truncates the same items.
-    items = {task: list(load_longbench(task, limit=args.limit)) for task in tasks}
-    for task, loaded in items.items():
-        print(f"{task}: {len(loaded)} items", file=sys.stderr)
+    items, sources = {}, {}
+    for task in tasks:
+        items[task], sources[task] = load_items(task, args.dataset_dir, args.limit)
+        where = str(args.dataset_dir / f"{task}.jsonl") if sources[task] == "jsonl" else "SYNTHETIC STUBS"
+        print(f"{task}: {len(items[task])} items from {where}", file=sys.stderr)
+    if any(source == "stub" for source in sources.values()):
+        print(
+            "warning: some tasks fell back to stubs -- those rows measure the harness, not the model",
+            file=sys.stderr,
+        )
 
     sink = args.out_file.open("w", encoding="utf-8") if args.out_file else sys.stdout
     rungs: list[TaskRung] = []
@@ -291,7 +416,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  {backend} at {context} ({mode}, cache {max_seq_len})", file=sys.stderr)
                 keep = max_seq_len - CONTEXT_HEADROOM_TOKENS - _largest_budget(args, tasks)
                 for task in tasks:
-                    rung = TaskRung(backend, context, task, items[task][0].metric if items[task] else "f1")
+                    rung = TaskRung(backend, context, task, metric_label(task), sources[task])
                     for position, item in enumerate(items[task]):
                         record, prompt_ids = run_item(args, runner, tokenizer, eos_ids, item, keep, glm4)
                         record.update(context_requested=context, prefill_mode=mode)
@@ -332,7 +457,7 @@ def _target_token(tokenizer, item) -> int | None:
     return int(ids[-1]) if ids.numel() else None
 
 
-def _largest_budget(args, tasks: tuple[str, ...]) -> int:
+def _largest_budget(args: argparse.Namespace, tasks: tuple[str, ...]) -> int:
     """The longest continuation any task at this rung can ask for.
 
     One cache size per rung rather than one per task, so the rung's memory
@@ -340,7 +465,8 @@ def _largest_budget(args, tasks: tuple[str, ...]) -> int:
     """
     if args.max_new_tokens:
         return args.max_new_tokens
-    return max(LONGBENCH_MAX_NEW_TOKENS[task] for task in tasks)
+    _, budgets = longbench_config(args.dataset_dir)
+    return max(budgets.get(task, 64) for task in tasks)
 
 
 def _auto_tokenizer(model_path: str):

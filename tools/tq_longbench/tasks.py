@@ -29,66 +29,65 @@ Two sources of items:
 
 from __future__ import annotations
 
+import json
 import random
 import string
 from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from pathlib import Path
 
-# LongBench's own prompt templates, abbreviated to the tasks this harness runs.
-# Verbatim from the suite: a reworded prompt scores differently and would make
-# the numbers incomparable to published ones.
-LONGBENCH_PROMPTS = {
-    "narrativeqa": (
-        "You are given a story, which can be either a novel or a movie script, and a question. "
-        "Answer the question as concisely as you can, using a single phrase if possible. "
-        "Do not provide any explanation.\n\nStory: {context}\n\n"
-        "Now, answer the question based on the story as concisely as you can, using a single phrase "
-        "if possible. Do not provide any explanation.\n\nQuestion: {input}\n\nAnswer:"
-    ),
-    "qasper": (
-        "You are given a scientific article and a question. Answer the question as concisely as you "
-        "can, using a single phrase or sentence if possible. If the question cannot be answered based "
-        'on the information in the article, write "unanswerable". If the question is a yes/no '
-        'question, answer "yes", "no", or "unanswerable". Do not provide any explanation.\n\n'
-        "Article: {context}\n\n Answer the question based on the above article as concisely as you "
-        "can, using a single phrase or sentence if possible. If the question cannot be answered based "
-        'on the information in the article, write "unanswerable". If the question is a yes/no '
-        'question, answer "yes", "no", or "unanswerable". Do not provide any explanation.\n\n'
-        "Question: {input}\n\nAnswer:"
-    ),
-    "hotpotqa": (
-        "Answer the question based on the given passages. Only give me the answer and do not output "
-        "any other words.\n\nThe following are given passages.\n{context}\n\n"
-        "Answer the question based on the given passages. Only give me the answer and do not output "
-        "any other words.\n\nQuestion: {input}\nAnswer:"
-    ),
-    "2wikimqa": (
-        "Answer the question based on the given passages. Only give me the answer and do not output "
-        "any other words.\n\nThe following are given passages.\n{context}\n\n"
-        "Answer the question based on the given passages. Only give me the answer and do not output "
-        "any other words.\n\nQuestion: {input}\nAnswer:"
-    ),
-    "multifieldqa_en": (
-        "Read the following text and answer briefly.\n\n{context}\n\n"
-        "Now, answer the following question based on the above text, only give me the answer and do "
-        "not output any other words.\n\nQuestion: {input}\nAnswer:"
-    ),
-    "gov_report": (
-        "You are given a report by a government agency. Write a one-page summary of the report.\n\n"
-        "Report:\n{context}\n\nNow, write a one-page summary of all the report.\n\nSummary:"
-    ),
-}
+#: LongBench's own prompt templates and per-task generation budgets, kept as data
+#: rather than as Python. Two reasons, and the second is the real one:
+#:
+#: * a prompt full of newlines and quotes is a bad thing to escape into a source
+#:   file, and a prompt that is subtly wrong scores differently without failing;
+#: * this file is ``dataset2prompt.json`` and ``dataset2maxlen.json`` in the
+#:   suite's own shape, so it can be diffed against the copy that ships with a
+#:   download -- and :func:`longbench_config` prefers that copy where there is
+#:   one. The table here is a transcription and is treated as one.
+PROMPT_TABLE = Path(__file__).with_name("longbench_prompts.json")
 
-#: LongBench's own per-task generation budgets.
-LONGBENCH_MAX_NEW_TOKENS = {
-    "narrativeqa": 128,
-    "qasper": 128,
-    "hotpotqa": 32,
-    "2wikimqa": 32,
-    "multifieldqa_en": 64,
-    "gov_report": 512,
-}
+
+def longbench_config(dataset_dir: str | Path | None = None) -> tuple[dict, dict]:
+    """``(prompts, budgets)``, from the downloaded suite's own config where it has one.
+
+    A LongBench checkout keeps ``config/dataset2prompt.json`` and
+    ``config/dataset2maxlen.json`` next to the data. Where ``dataset_dir`` has
+    them they win outright: they are the file the published numbers were produced
+    with, and this module's copy is a transcription that can only be as good as
+    the transcribing. Where it does not, the transcription is used and the caller
+    is told which -- :func:`config_source`.
+    """
+    shipped = json.loads(PROMPT_TABLE.read_text(encoding="utf-8"))
+    prompts, budgets = dict(shipped["dataset2prompt"]), dict(shipped["dataset2maxlen"])
+    for name, target in (("dataset2prompt", prompts), ("dataset2maxlen", budgets)):
+        path = _config_path(dataset_dir, name)
+        if path is not None:
+            target.update(json.loads(path.read_text(encoding="utf-8")))
+    return prompts, budgets
+
+
+def config_source(dataset_dir: str | Path | None = None) -> str:
+    """Which config a run used, for the banner. Never left to be inferred from a score."""
+    found = [name for name in ("dataset2prompt", "dataset2maxlen") if _config_path(dataset_dir, name)]
+    if len(found) == 2:
+        return f"{dataset_dir}/config (the suite's own)"
+    if found:
+        return f"{dataset_dir}/config for {found[0]}, this harness's transcription for the rest"
+    return "this harness's transcription of dataset2prompt.json"
+
+
+def _config_path(dataset_dir: str | Path | None, name: str) -> Path | None:
+    if dataset_dir is None:
+        return None
+    for candidate in (Path(dataset_dir) / "config" / f"{name}.json", Path(dataset_dir) / f"{name}.json"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+LONGBENCH_PROMPTS, LONGBENCH_MAX_NEW_TOKENS = longbench_config()
 
 NIAH_TASK = "niah"
 
@@ -368,6 +367,63 @@ def niah_sweep(
         yield needle_in_a_haystack(context_tokens, depth=depth, seed=seed + index)
 
 
+#: Where a downloaded LongBench lives, relative to the repository root.
+DEFAULT_DATASET_DIR = "datasets/longbench"
+
+
+def local_task_path(task: str, dataset_dir: str | Path) -> Path | None:
+    """``{dataset_dir}/{task}.jsonl`` if it is there, else ``None``."""
+    path = Path(dataset_dir) / f"{task}.jsonl"
+    return path if path.is_file() else None
+
+
+def load_longbench_jsonl(task: str, dataset_dir: str | Path, limit: int | None = None) -> Iterator[EvalItem]:
+    """Stream a task out of a local ``{task}.jsonl``, through its own prompt template.
+
+    The suite ships one JSON object per line with ``context``, ``input``,
+    ``answers`` and -- for the classification tasks -- ``all_classes``. Read with
+    :func:`json.loads` and nothing else: ``datasets`` is not a harness dependency,
+    and an evaluation host that has the files should not need a network to use
+    them.
+
+    ``all_classes`` travels on the item because ``trec`` and ``lsht`` cannot be
+    scored without it; a classification task whose classes went missing would
+    score zero everywhere rather than raise, which is the kind of result that
+    gets believed.
+
+    ``EvalItem.metric`` is set to the **task name** rather than a metric name,
+    because that is what :func:`tq_longbench.metrics.score_prediction` dispatches
+    on: the metric, the first-line cut and the class list are all a function of
+    the task, and splitting them across two names is how they come apart.
+    """
+    prompts, budgets = longbench_config(dataset_dir)
+    if task not in prompts:
+        raise ValueError(f"no prompt template for LongBench task {task!r}; known: {sorted(prompts)}")
+    path = local_task_path(task, dataset_dir)
+    if path is None:
+        raise FileNotFoundError(f"{Path(dataset_dir) / f'{task}.jsonl'} does not exist")
+    with path.open(encoding="utf-8") as handle:
+        # Rows, not lines: a blank line must neither use up ``limit`` nor shift
+        # the ``index`` a record is joined back to its item by.
+        rows = (json.loads(line) for line in handle if line.strip())
+        for index, row in enumerate(rows):
+            if limit is not None and index >= limit:
+                return
+            yield EvalItem(
+                prompt=prompts[task].format(context=row.get("context", ""), input=row.get("input", "")),
+                answers=list(row.get("answers", [])),
+                metric=task,
+                max_new_tokens=budgets.get(task, 64),
+                extra={
+                    "task": task,
+                    "index": index,
+                    "length": row.get("length"),
+                    "all_classes": row.get("all_classes"),
+                    "language": row.get("language"),
+                },
+            )
+
+
 def load_longbench(task: str, limit: int | None = None) -> Iterator[EvalItem]:
     """Stream a LongBench task through its own prompt template.
 
@@ -375,12 +431,15 @@ def load_longbench(task: str, limit: int | None = None) -> Iterator[EvalItem]:
     path -- the one the harness's tests use -- needs nothing installed beyond
     torch.
     """
+    name = task.removeprefix("longbench_")
+    # Gated on the tasks this path can score, not on the prompt table: the table
+    # holds all 21 v1 tasks, :func:`score` knows six of them, and admitting the
+    # rest here would fail a whole download later on a KeyError.
+    if name not in _TASK_METRICS:
+        raise ValueError(f"no prompt template for LongBench task {name!r}; known: {sorted(_TASK_METRICS)}")
+    template = LONGBENCH_PROMPTS[name]
     from datasets import load_dataset
 
-    name = task.removeprefix("longbench_")
-    if name not in LONGBENCH_PROMPTS:
-        raise ValueError(f"no prompt template for LongBench task {name!r}; known: {sorted(LONGBENCH_PROMPTS)}")
-    template = LONGBENCH_PROMPTS[name]
     rows = load_dataset("THUDM/LongBench", name, split="test")
     for index, row in enumerate(rows):
         if limit is not None and index >= limit:
