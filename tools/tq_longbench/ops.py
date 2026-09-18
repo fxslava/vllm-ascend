@@ -46,7 +46,7 @@ from dataclasses import dataclass
 
 import torch
 
-from tq_longbench._ascend import turboquant_layout, turboquant_rotation
+from tq_longbench._ascend import load_turboquant_library, turboquant_layout, turboquant_rotation
 from tq_longbench.kv_cache import CacheGeometry, DenseKVCache, TurboQuantKVCache
 
 # The codec table image is built for a batch of rows; the writer and the query
@@ -64,17 +64,23 @@ _BOTTOM_RIGHT_CAUSAL_SPARSE_MODE = 3
 def ascend_ops():
     """The operator namespace the extension registers into.
 
-    Raised on rather than returned as ``None``: every caller needs it, and an
-    ``AttributeError`` from deep inside a launch says far less than this does.
+    When nothing has registered the operators, a standalone library
+    (``tools/tq_longbench/build_turboquant_ops.py``) is loaded if one is found;
+    the check is free once they are there. Raised on rather than returned as
+    ``None``: every caller needs it, and an ``AttributeError`` from deep inside
+    a launch says far less than this does.
     """
-    ops = getattr(torch.ops, _ASCEND_NAMESPACE, None)
-    if ops is None or not hasattr(ops, "npu_turboquant_reshape_and_cache"):
-        raise RuntimeError(
-            "the TurboQuant operators are not registered. Build vllm-ascend's C++ extension with "
-            "VLLM_ENABLE_TURBOQUANT (and VLLM_ENABLE_TURBOQUANT_CUBE for the Cube decode), or run under "
-            "tests.ut.attention.turboquant_cpu_ops.turboquant_cpu_ops() to serve them from the CPU."
-        )
-    return ops
+    if not _operators_served():
+        outcome = load_turboquant_library(_operators_served)
+        if not outcome.registered:
+            raise RuntimeError(
+                "the TurboQuant operators are not registered. Build vllm-ascend's C++ extension with "
+                "VLLM_ENABLE_TURBOQUANT (and VLLM_ENABLE_TURBOQUANT_CUBE for the Cube decode), build the standalone "
+                "library with tools/tq_longbench/build_turboquant_ops.py, or run under "
+                "tests.ut.attention.turboquant_cpu_ops.turboquant_cpu_ops() to serve them from the CPU. "
+                f"Standalone library: {outcome.detail}."
+            )
+    return getattr(torch.ops, _ASCEND_NAMESPACE)
 
 
 def cube_decode_available() -> bool:
@@ -371,10 +377,15 @@ class TurboQuantCubeBackend(_TurboQuantBackend):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.geometry.require_cube_tiling()
-        if not cube_decode_available():
+        # Only when the full extension has not registered it: a standalone build
+        # (tools/tq_longbench/build_turboquant_ops.py), from $TURBOQUANT_LIB_PATH,
+        # tools/tq_longbench/lib/ or build/.
+        outcome = load_turboquant_library(cube_decode_available)
+        if not outcome.registered:
             raise RuntimeError(
                 "npu_turboquant_cube_decode is not registered: this build has no kv4fp8 Cube kernels. "
-                "Use --backend turboquant_aiv, or build with VLLM_ENABLE_TURBOQUANT_CUBE on an Ascend 950 target."
+                "Use --backend turboquant_aiv, build with VLLM_ENABLE_TURBOQUANT_CUBE on an Ascend 950 target, or "
+                f"build the standalone library with tools/tq_longbench/build_turboquant_ops.py. {outcome.detail}."
             )
 
     @property

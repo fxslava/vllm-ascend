@@ -32,6 +32,11 @@ So the two modules that are already free of intra-package imports --
 :mod:`vllm_ascend.attention.turboquant_rotation`, both of which import only
 ``torch`` -- are loaded **by file path**, under private module names.  Nothing
 named ``vllm`` is imported, and :func:`assert_no_vllm_imported` says so.
+
+The operators themselves come from a shared library. Without the full extension,
+:func:`load_turboquant_library` opens the standalone one that
+``tools/tq_longbench/build_turboquant_ops.py`` builds -- a library of kernels and
+op registrations, which imports no Python from ``vllm_ascend`` at all.
 """
 
 from __future__ import annotations
@@ -39,6 +44,8 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 
@@ -47,6 +54,13 @@ _LAYOUT_MODULE = "tq_longbench._vendored_turboquant_layout"
 _ROTATION_MODULE = "tq_longbench._vendored_turboquant_rotation"
 
 _SOURCE_ROOT_ENV = "VLLM_ASCEND_SOURCE_ROOT"
+
+#: A standalone TurboQuant library to load, or a directory holding one. When set it
+#: is the only candidate: a run asked for one build must not quietly get another.
+TURBOQUANT_LIB_ENV = "TURBOQUANT_LIB_PATH"
+
+#: What ``tools/tq_longbench/build_turboquant_ops.py`` installs.
+TURBOQUANT_LIB_NAME = "libvllm_turboquant_cube.so"
 
 _RELATIVE = Path("vllm_ascend") / "attention"
 
@@ -101,6 +115,76 @@ def turboquant_layout() -> ModuleType:
 def turboquant_rotation() -> ModuleType:
     """``Pi`` itself: the sign draw, the Walsh-Hadamard transform, and the o_proj fold."""
     return _load(_ROTATION_MODULE, "turboquant_rotation.py")
+
+
+@dataclass(frozen=True)
+class LibraryLoad:
+    """Whether the operators are registered now, and what was done to get there."""
+
+    registered: bool
+    detail: str
+
+
+def turboquant_library_candidates() -> list[Path]:
+    """Where a standalone TurboQuant library may be, in the order they are tried.
+
+    ``$TURBOQUANT_LIB_PATH`` (a file, or a directory holding
+    :data:`TURBOQUANT_LIB_NAME`) replaces the search rather than joining it.
+    Otherwise ``tools/tq_longbench/lib/``, where the build script installs, then
+    the checkout's ``build/``.
+    """
+    override = os.environ.get(TURBOQUANT_LIB_ENV)
+    if override:
+        path = Path(override).expanduser()
+        return [path / TURBOQUANT_LIB_NAME if path.is_dir() else path]
+    return [
+        Path(__file__).resolve().parent / "lib" / TURBOQUANT_LIB_NAME,
+        source_root() / "build" / TURBOQUANT_LIB_NAME,
+    ]
+
+
+def load_turboquant_library(is_registered: Callable[[], bool]) -> LibraryLoad:
+    """Register the TurboQuant operators from a standalone library, if they are missing.
+
+    Nothing is loaded when ``is_registered()`` already holds -- the full extension,
+    the CPU stand-ins or an earlier load got there first, and loading a second
+    library would redefine the same ``_C_ascend`` schemas. Otherwise the first
+    existing candidate is opened with ``torch.ops.load_library`` and the check is
+    repeated, so a library that loads but lacks the operator is reported as such.
+    The detail names the path and the loader's own error, which is what a
+    failure on the NPU host needs to be diagnosed from a log.
+    """
+    if is_registered():
+        return LibraryLoad(True, "already registered")
+    candidates = turboquant_library_candidates()
+    present = [path for path in candidates if path.is_file()]
+    if not present:
+        where = f"${TURBOQUANT_LIB_ENV}" if os.environ.get(TURBOQUANT_LIB_ENV) else "the default locations"
+        searched = ", ".join(str(path) for path in candidates)
+        return LibraryLoad(
+            False,
+            f"no standalone TurboQuant library at {where} ({searched}); build one with "
+            "tools/tq_longbench/build_turboquant_ops.py",
+        )
+
+    import torch
+
+    library = present[0]
+    _import_torch_npu()
+    try:
+        torch.ops.load_library(str(library))
+    except OSError as error:
+        return LibraryLoad(False, f"torch.ops.load_library({library}) failed: {error}")
+    if not is_registered():
+        return LibraryLoad(False, f"loaded {library}, but it does not register the operator")
+    return LibraryLoad(True, f"loaded {library}")
+
+
+def _import_torch_npu() -> None:
+    """The library links torch_npu, and its NPU kernels expect the runtime initialised."""
+    if "torch_npu" in sys.modules or importlib.util.find_spec("torch_npu") is None:
+        return
+    import torch_npu  # noqa: F401
 
 
 def assert_no_vllm_imported() -> None:

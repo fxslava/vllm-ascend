@@ -43,6 +43,8 @@ build_out/
 # (Docker volume mount points at /workspace/build_sim and /workspace/build_npu).
 /build_sim/
 /build_npu/
+# tools/tq_longbench/build_turboquant_ops.py output (built per host and SoC).
+/tools/tq_longbench/lib/
 !csrc/cmake/third_party/build/
 !csrc/cmake/third_party/build/modules/
 !csrc/cmake/third_party/build/modules/patch/

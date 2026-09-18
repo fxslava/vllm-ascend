@@ -1287,7 +1287,7 @@ class TestCubeOpsOnMeta(TestBase):
     """The backend's Cube calls through the real dispatcher against the pinned schemas, on meta tensors only.
 
     TestCubeDecode replaces ``torch.ops._C_ascend`` with a mock, which accepts any argument list. Here every call
-    has to bind to the schema in TURBOQUANT_CUBE_OP_SCHEMAS (pinned to csrc/torch_binding.cpp) and pass the meta
+    has to bind to the schema in TURBOQUANT_CUBE_OP_SCHEMAS (pinned to turboquant_torch_ops.h) and pass the meta
     kernels' shape checks. Nothing is computed: the launch's numbers are the camodel's to verify.
     """
 

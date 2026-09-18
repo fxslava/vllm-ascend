@@ -43,6 +43,7 @@ import __future__
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import types
@@ -60,6 +61,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT / "tools") not in sys.path:
     sys.path.append(str(REPO_ROOT / "tools"))
 
+from tq_longbench import _ascend, build_turboquant_ops  # noqa: E402
 from tq_longbench._ascend import assert_no_vllm_imported, turboquant_layout, turboquant_rotation  # noqa: E402
 from tq_longbench.cpu_reference import cpu_turboquant_ops  # noqa: E402
 from tq_longbench.engine import RunMetrics, RunnerConfig, StandaloneModelRunner  # noqa: E402
@@ -72,7 +74,14 @@ from tq_longbench.glm4 import (  # noqa: E402
 )
 from tq_longbench.kv_cache import CacheGeometry, DenseKVCache, TurboQuantKVCache, dense_equivalent_bytes  # noqa: E402
 from tq_longbench.layers import ModelShape, RotaryEmbedding  # noqa: E402
-from tq_longbench.ops import LayerShape, TurboQuantAivBackend, TurboQuantCubeBackend, build_backend  # noqa: E402
+from tq_longbench.ops import (  # noqa: E402
+    LayerShape,
+    TurboQuantAivBackend,
+    TurboQuantCubeBackend,
+    ascend_ops,
+    build_backend,
+    cube_decode_available,
+)
 from tq_longbench.reference import DenseReferenceBackend, TurboQuantReferenceBackend  # noqa: E402
 from tq_longbench.tasks import f1_score, needle_in_a_haystack, rouge_l, score  # noqa: E402
 
@@ -526,8 +535,11 @@ class TestCubeDispatch(unittest.TestCase):
     def test_an_unbuilt_cube_decode_says_so(self):
         geometry = _geometry(512)
         shape = LayerShape(NUM_HEADS, NUM_KV_HEADS, HEAD_SIZE, HEAD_SIZE**-0.5)
-        # Outside turboquant_cube_meta_ops the operator is not registered at all.
-        with self.assertRaisesRegex(RuntimeError, "not registered"):
+        # Outside turboquant_cube_meta_ops the operator is not registered at all, and
+        # no standalone library is on offer to load it from.
+        missing = str(REPO_ROOT / "build" / "no-such-dir" / _ascend.TURBOQUANT_LIB_NAME)
+        no_library = mock.patch.dict(os.environ, {_ascend.TURBOQUANT_LIB_ENV: missing})
+        with no_library, self.assertRaisesRegex(RuntimeError, "not registered"):
             TurboQuantCubeBackend(geometry, shape, CPU)
 
     def test_an_ascend_backend_is_refused_with_no_operators_registered(self):
@@ -1387,6 +1399,167 @@ class TestGlm4PrefillPolicy(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_depths("1.5")
         self.assertEqual(truncate_middle(torch.arange(10), 4).tolist(), [0, 1, 8, 9])
+
+
+class TestStandaloneTurboQuantLibrary(unittest.TestCase):
+    """Finding and loading ``libvllm_turboquant_cube.so`` when nothing registered the operators.
+
+    ``torch.ops.load_library`` is mocked: its stand-in registers the CPU operators,
+    which is what the real library's static registrations do on the NPU host. The
+    real library was built and link-checked in the vendor image (CANN 9.1.0,
+    torch 2.10); opening it needs a device driver, which no host here has.
+    """
+
+    def setUp(self):
+        self.enterPatch(mock.patch.dict(os.environ))
+        os.environ.pop(_ascend.TURBOQUANT_LIB_ENV, None)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.library = Path(directory.name) / _ascend.TURBOQUANT_LIB_NAME
+        self.library.write_bytes(b"not a real library")
+        self.registrations = contextlib.ExitStack()
+        self.addCleanup(self.registrations.close)
+
+    def enterPatch(self, patcher):  # noqa: N802  (unittest's camelCase)
+        value = patcher.start()
+        self.addCleanup(patcher.stop)
+        return value
+
+    def _registers_the_operators(self, path: str) -> None:
+        """What dlopen of the real library does: register every TurboQuant op, Cube included."""
+        stand_ins = self.registrations.enter_context(cpu_turboquant_ops())
+        self.registrations.enter_context(stand_ins.turboquant_cube_meta_ops())
+
+    def _cube_backend(self) -> TurboQuantCubeBackend:
+        shape = LayerShape(NUM_HEADS, NUM_KV_HEADS, HEAD_SIZE, HEAD_SIZE**-0.5)
+        return TurboQuantCubeBackend(_geometry(512), shape, CPU)
+
+    def test_the_default_search_is_the_build_script_output_then_build(self):
+        candidates = _ascend.turboquant_library_candidates()
+        self.assertEqual(candidates[0], REPO_ROOT / "tools" / "tq_longbench" / "lib" / _ascend.TURBOQUANT_LIB_NAME)
+        self.assertEqual(candidates[1], REPO_ROOT / "build" / _ascend.TURBOQUANT_LIB_NAME)
+
+    def test_the_environment_replaces_the_search(self):
+        os.environ[_ascend.TURBOQUANT_LIB_ENV] = str(self.library)
+        self.assertEqual(_ascend.turboquant_library_candidates(), [self.library])
+        # A directory names the library inside it.
+        os.environ[_ascend.TURBOQUANT_LIB_ENV] = str(self.library.parent)
+        self.assertEqual(_ascend.turboquant_library_candidates(), [self.library])
+
+    def test_the_cube_backend_loads_the_library_when_the_decode_is_missing(self):
+        os.environ[_ascend.TURBOQUANT_LIB_ENV] = str(self.library)
+        loader = self.enterPatch(
+            mock.patch.object(torch.ops, "load_library", side_effect=self._registers_the_operators)
+        )
+        backend = self._cube_backend()
+        loader.assert_called_once_with(str(self.library))
+        self.assertTrue(cube_decode_available())
+        self.assertIsNotNone(backend.cache)
+
+    def test_the_operator_namespace_loads_the_library_for_the_aiv_path(self):
+        os.environ[_ascend.TURBOQUANT_LIB_ENV] = str(self.library)
+        loader = self.enterPatch(
+            mock.patch.object(torch.ops, "load_library", side_effect=self._registers_the_operators)
+        )
+        self.assertTrue(hasattr(ascend_ops(), "npu_turboquant_reshape_and_cache"))
+        loader.assert_called_once_with(str(self.library))
+
+    def test_nothing_is_loaded_when_the_operators_are_registered(self):
+        os.environ[_ascend.TURBOQUANT_LIB_ENV] = str(self.library)
+        loader = self.enterPatch(mock.patch.object(torch.ops, "load_library"))
+        with cpu_turboquant_ops() as stand_ins, stand_ins.turboquant_cube_meta_ops():
+            self._cube_backend()
+            ascend_ops()
+        loader.assert_not_called()
+
+    def test_a_library_that_fails_to_open_is_reported_with_the_loader_error(self):
+        os.environ[_ascend.TURBOQUANT_LIB_ENV] = str(self.library)
+        self.enterPatch(mock.patch.object(torch.ops, "load_library", side_effect=OSError("undefined symbol: _Zfoo")))
+        with self.assertRaisesRegex(RuntimeError, "not registered") as raised:
+            self._cube_backend()
+        self.assertIn("undefined symbol: _Zfoo", str(raised.exception))
+        self.assertIn(str(self.library), str(raised.exception))
+
+    def test_a_library_without_the_decode_is_reported(self):
+        os.environ[_ascend.TURBOQUANT_LIB_ENV] = str(self.library)
+        self.enterPatch(mock.patch.object(torch.ops, "load_library"))
+        with self.assertRaisesRegex(RuntimeError, "does not register the operator"):
+            self._cube_backend()
+
+    def test_no_library_means_nothing_is_loaded(self):
+        os.environ[_ascend.TURBOQUANT_LIB_ENV] = str(self.library.parent / "missing.so")
+        loader = self.enterPatch(mock.patch.object(torch.ops, "load_library"))
+        with self.assertRaisesRegex(RuntimeError, r"not registered.*\$TURBOQUANT_LIB_PATH"):
+            self._cube_backend()
+        loader.assert_not_called()
+
+
+class TestBuildTurboQuantOps(unittest.TestCase):
+    """The standalone build's inputs; the build itself was run in the vendor image."""
+
+    VARIANTS = ["Ascend950PR_9589", "Ascend950PR_9599"]
+
+    def setUp(self):
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("SOC_VERSION", None)
+
+    def test_a_soc_variant_is_required_not_a_family(self):
+        with self.assertRaisesRegex(SystemExit, "family, not a variant"):
+            build_turboquant_ops.resolve_soc_version("Ascend950PR", self.VARIANTS)
+        with self.assertRaisesRegex(SystemExit, "Ascend 950 only"):
+            build_turboquant_ops.resolve_soc_version("ascend910b1", self.VARIANTS)
+        with self.assertRaisesRegex(SystemExit, "no platform config"):
+            build_turboquant_ops.resolve_soc_version("Ascend950PR_0000", self.VARIANTS)
+        # The spelling CANN ships wins over the one typed.
+        self.assertEqual(
+            build_turboquant_ops.resolve_soc_version("ascend950pr_9599", self.VARIANTS), "Ascend950PR_9599"
+        )
+
+    def test_the_soc_falls_back_to_the_environment_then_npu_smi(self):
+        detected = mock.Mock(return_value="Ascend950PR_9589")
+        self.assertEqual(build_turboquant_ops.resolve_soc_version(None, self.VARIANTS, detected), "Ascend950PR_9589")
+        os.environ["SOC_VERSION"] = "ascend950pr_9599"
+        self.assertEqual(build_turboquant_ops.resolve_soc_version(None, self.VARIANTS, detected), "Ascend950PR_9599")
+        detected.assert_called_once()
+
+    def test_npu_smi_fields_are_read_by_name(self):
+        board = "        Chip Name                      : Ascend950PR\n        NPU Name                       : 9599\n"
+        self.assertEqual(build_turboquant_ops._field(board, "Chip Name"), "Ascend950PR")
+        self.assertEqual(build_turboquant_ops._field(board, "Board ID", required=False), "")
+
+    def test_a_source_tree_under_a_dot_directory_is_refused(self):
+        with self.assertRaisesRegex(SystemExit, "TooFewObj"):
+            build_turboquant_ops.refuse_dot_directories(Path("/work/.claude/worktrees/x/csrc"))
+        build_turboquant_ops.refuse_dot_directories(Path("/work/vllm-ascend/csrc"))
+
+    def test_the_cmake_invocation(self):
+        args = build_turboquant_ops.build_parser().parse_args(["--jobs", "3"])
+        configure, build, install = build_turboquant_ops.cmake_commands(
+            "Ascend950PR_9599", Path("/cann"), Path("/py/torch"), Path("/py/torch_npu"), Path("/b"), Path("/o"), args
+        )
+        self.assertEqual(configure[configure.index("-G") + 1], "Unix Makefiles")
+        self.assertIn("-DSOC_VERSION=Ascend950PR_9599", configure)
+        self.assertIn(f"-DCMAKE_PREFIX_PATH={Path('/py/torch') / 'share' / 'cmake'}", configure)
+        self.assertIn("-DCMAKE_BUILD_TYPE=Release", configure)
+        self.assertEqual(configure[configure.index("-S") + 1], str(build_turboquant_ops.STANDALONE_SOURCE_DIR))
+        self.assertEqual(build[-2:], ["-j", "3"])
+        self.assertEqual(install, ["cmake", "--install", str(Path("/b"))])
+
+    def test_only_an_empty_or_cmake_build_dir_is_wiped(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        (root / "keep").mkdir()
+        (root / "keep" / "precious.txt").write_text("x")
+        with self.assertRaisesRegex(SystemExit, "refusing to delete"):
+            build_turboquant_ops.fresh_build_dir(root / "keep")
+        (root / "tree").mkdir()
+        (root / "tree" / "CMakeCache.txt").write_text("x")
+        (root / "tree" / "stale.o").write_text("x")
+        build_turboquant_ops.fresh_build_dir(root / "tree")
+        self.assertEqual(list((root / "tree").iterdir()), [])
 
 
 if __name__ == "__main__":

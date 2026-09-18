@@ -27,6 +27,7 @@ only needs the metrics should not need a device runtime.
 """
 
 __all__ = [
+    "build_turboquant_ops",
     "cpu_reference",
     "diagnose",
     "engine",

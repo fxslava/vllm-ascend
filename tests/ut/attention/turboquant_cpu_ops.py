@@ -50,7 +50,7 @@ from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_LLOYD_MAX_THRESHOLDS
 # What the triton stub in tests/ut/conftest.py reports as num_vectorcore.
 CPU_VECTOR_CORES = 8
 
-# csrc/torch_binding.cpp's definitions, whitespace collapsed.
+# csrc/attention/turboquant/op_adapter/turboquant_torch_ops.h's definitions, whitespace collapsed.
 TURBOQUANT_OP_SCHEMAS = {
     "npu_turboquant_reshape_and_cache": (
         "npu_turboquant_reshape_and_cache(Tensor key, Tensor value, Tensor! key_cache, Tensor! value_cache, "

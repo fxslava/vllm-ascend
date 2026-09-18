@@ -80,6 +80,34 @@ and changes basis itself, so nothing precedes it and nothing follows it.
 > (in `vllm_ascend/ops/turboquant_attention.py`) is the *plugin's* way of routing
 > a gate through `unified_attention_with_output`, which this harness does not use.
 
+### The operators without the package build
+
+The Ascend backends need `torch.ops._C_ascend.npu_turboquant_*` registered. The
+full extension does that; so does a standalone library holding only the
+TurboQuant kernels and their bindings, built in one step:
+
+```bash
+python tools/tq_longbench/build_turboquant_ops.py --soc-version Ascend950PR_9599
+```
+
+It compiles `csrc/attention/turboquant/standalone/` into
+`tools/tq_longbench/lib/libvllm_turboquant_cube.so` and its kernel library. The
+flags are `-DVLLM_ENABLE_TURBOQUANT_CUBE=1`, C++17, `-O3` and the given SoC. The
+SoC has to be a full variant, because it fixes the core counts. It comes from
+`--soc-version`, then `$SOC_VERSION`, then `npu-smi`. The schemas are the full
+extension's own: both include `op_adapter/turboquant_torch_ops.h`.
+
+When the operators are missing, the Cube backend (and `ascend_ops()` for the
+AIV one) loads the library with `torch.ops.load_library`. It is looked for at
+`$TURBOQUANT_LIB_PATH` (a file or a directory; when set, the only candidate),
+else in `tools/tq_longbench/lib/`, then in `build/`. Nothing is loaded when the
+operators are already registered: a second library would redefine the schemas.
+The error names the path and the loader's message when a load fails.
+
+Checked in the vendor image (CANN 9.1.0, torch 2.10, `Ascend950PR_9599`): it
+builds with zero warnings, links, and exports every launcher the adapter calls.
+Opening it needs the Ascend driver, so the first load happens on an NPU host.
+
 ## Prefill (`--prefill-mode`)
 
 There is no paged prefill kernel over the 4-bit cache, so the prefix a chunk
@@ -111,7 +139,8 @@ to a centroid rather than to nothing.
 ## Layout
 
 ```text
-_ascend.py       borrow the shipped layout and rotation, by file path
+_ascend.py       borrow the shipped layout and rotation, by file path; load the standalone ops library
+build_turboquant_ops.py  build that library alone (csrc/attention/turboquant/standalone)
 kv_cache.py      StaticKVCache: DenseKVCache and TurboQuantKVCache, allocated once
 ops.py           the Ascend backends, their scratch buffers and the tie point
 reference.py     the same arithmetic in torch, for CUDA and CPU

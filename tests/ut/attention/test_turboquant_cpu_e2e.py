@@ -102,7 +102,11 @@ MIN_DECODE_COSINE = 0.98
 # What reading the wrong sequence's blocks has to cost.
 MAX_MISALIGNED_COSINE = 0.9
 
-TORCH_BINDING = Path(__file__).resolve().parents[3] / "csrc" / "torch_binding.cpp"
+CSRC = Path(__file__).resolve().parents[3] / "csrc"
+TORCH_BINDING = CSRC / "torch_binding.cpp"
+# Where the TurboQuant schemas are defined, for vllm_ascend_C and the standalone library alike.
+TURBOQUANT_TORCH_OPS = CSRC / "attention" / "turboquant" / "op_adapter" / "turboquant_torch_ops.h"
+STANDALONE_BINDING = CSRC / "attention" / "turboquant" / "standalone" / "turboquant_standalone_binding.cpp"
 _STRING_LITERAL = r'"(?:[^"\\]|\\.)*"'
 
 
@@ -265,10 +269,19 @@ def _cache_cosine(trace: _Trace) -> torch.Tensor:
 class TestTurboQuantCpuOps(TestBase):
     """The stand-ins: the extension's own schemas, the adapter's strictness, and no leftovers."""
 
-    @unittest.skipUnless(TORCH_BINDING.is_file(), "needs csrc/torch_binding.cpp")
+    @unittest.skipUnless(
+        TURBOQUANT_TORCH_OPS.is_file(), "needs csrc/attention/turboquant/op_adapter/turboquant_torch_ops.h"
+    )
     def test_schemas_match_the_compiled_extension(self):
-        """A schema that drifts from csrc would mock an operator the device does not have."""
-        source = TORCH_BINDING.read_text(encoding="utf-8")
+        """A schema that drifts from csrc would mock an operator the device does not have.
+
+        Both libraries that register the operators must take them from the one header,
+        or the pinned schemas would describe only one of them.
+        """
+        include = '#include "attention/turboquant/op_adapter/turboquant_torch_ops.h"'
+        for binding in (TORCH_BINDING, STANDALONE_BINDING):
+            self.assertIn(include, binding.read_text(encoding="utf-8"), f"{binding.name} registers its own schemas")
+        source = TURBOQUANT_TORCH_OPS.read_text(encoding="utf-8")
         compiled = {}
         for literals in re.findall(rf"ops\.def\(\s*((?:{_STRING_LITERAL}\s*)+)\)", source):
             schema = " ".join("".join(re.findall(rf"{_STRING_LITERAL}", literals)).replace('"', "").split())
