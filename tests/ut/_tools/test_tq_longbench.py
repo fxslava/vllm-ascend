@@ -37,6 +37,7 @@ Runs under pytest in CI and under ``python -m unittest`` anywhere, because it
 imports neither ``tests.ut.base`` (which reaches vLLM) nor pytest itself.
 """
 
+from __future__ import annotations
 import __future__
 
 import contextlib
@@ -47,6 +48,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from typing import Optional
 from unittest import mock
 
 import torch
@@ -829,7 +831,7 @@ class TestHuggingFaceBridge(unittest.TestCase):
         self.assertEqual(self.model.config._attn_implementation, "sdpa")
 
     @staticmethod
-    def _legacy_transformers(registry: dict | None):
+    def _legacy_transformers(registry: Optional[dict]):  # noqa: UP045  (Optional survives a 3.9 runtime eval)
         """``transformers`` as an older release has it: no ``AttentionInterface`` anywhere."""
         package = types.ModuleType("transformers")
         package.__version__ = "4.48.0"
@@ -900,6 +902,8 @@ class TestPython39Compatibility(unittest.TestCase):
         "vllm_ascend/attention/turboquant_rotation.py",
         "vllm_ascend/attention/turboquant_layout.py",
         "tests/ut/attention/turboquant_cpu_ops.py",
+        # This file too: the 3.9 host imports it before any test can run.
+        "tests/ut/_tools/test_tq_longbench.py",
         *sorted(path.relative_to(REPO_ROOT).as_posix() for path in (REPO_ROOT / "tools" / "tq_longbench").glob("*.py")),
     )
 
