@@ -41,7 +41,7 @@ against the dense equivalent.
 
 | | decode | cache | notes |
 |---|---|---|---|
-| `native_v5` | `npu_fused_infer_attention_score` | dense fp16/bf16 | the baseline; the only path whose numbers are not a quantisation of anything |
+| `native_v5` | `npu_fused_infer_attention_score_v2` (aclnn FIA V5) | dense fp16/bf16 | the baseline; the only path whose numbers are not a quantisation of anything |
 | `turboquant_cube` | `npu_turboquant_cube_decode` | kv4fp8 packed | one launch: raw-query rotation prologue, attention, un-rotation, `sigmoid(gate)`. float16 only, `block_size % 64 == 0` |
 | `turboquant_aiv` | `rotate_q` + `paged_attention` + `rotate_q` | 4-bit packed | every build and both dtypes; the only TurboQuant path with a CPU stand-in |
 | `dense_reference` | `scaled_dot_product_attention` | dense fp16/bf16 | the baseline in torch, for a host with no Ascend runtime |
@@ -115,6 +115,35 @@ Checked in the vendor image (CANN 9.1.0, torch 2.10, `Ascend950PR_9599`): it
 builds with zero warnings, links, and exports every launcher the adapter calls.
 Opening it needs the Ascend driver, so the first load happens on an NPU host.
 
+### Ascend 950 and the dense path
+
+Ascend 950 refuses `aclnnFusedInferAttentionScore` V1 to V4 (`EZ9903`). V1–V4
+is what `torch_npu.npu_fused_infer_attention_score` drives. `native_v5` and the
+`dense_staging` pool therefore call `npu_fused_infer_attention_score_v2` (the
+V5 interface, which vllm-ascend's own attention uses). Prefill is TND over the
+paged cache, with `sparse_mode=3` and the compressed 2048 × 2048 int8 causal
+mask it requires; decode is one TND row per token with no mask. Two fallbacks
+cover a torch_npu that predates `_v2`:
+
+- the original entry point, which works where V1–V4 are accepted;
+- `npu_prompt_flash_attention` over the contiguous prefix, for prefill only,
+  since it has no block table.
+
+Which one a run uses is not guessed. `smoke_glm.py` first runs a **pre-flight**
+(`preflight.py`), before any weights load. One synthetic layer, 16 tokens with
+GLM-4's head counts, is written, prefilled and decoded through every attention
+path the run will take, and checked against exact attention in float32. A path
+that raises fails, and so does one that runs but returns the wrong numbers. The
+first dense entry point that passes is the one the run gets. If the dense
+prefill passes nowhere and `--prefill-mode` was not given, the run prefills
+through the decode backend (`batched_decode`) instead. If `dense_staging` was
+asked for explicitly, it stops with every probe's reason. `--skip-preflight`
+bypasses all of this.
+
+All five real calls (V5 prefill and decode, V1 prefill and decode, PFA prefill)
+bind to torch_npu 2.10.0.post4's schemas and pass its meta kernels at GLM-4's
+geometry. Whether a 950 accepts them is what the pre-flight reports.
+
 ## Prefill (`--prefill-mode`)
 
 There is no paged prefill kernel over the 4-bit cache, so the prefix a chunk
@@ -160,6 +189,7 @@ run_eval.py      the evaluation CLI
 smoke_dense.py   dense GQA end to end, against eager Hugging Face
 smoke_hf.py      a hybrid model through the bridge, against eager Hugging Face
 glm4.py          GLM-4: config.json to shape, fused-tensor splitting, prefill policy
+preflight.py     one synthetic layer through a backend, against exact attention, before any weights
 smoke_glm.py     GLM-4 end to end: the folded-o_proj contract, a prompt, NIAH
 diagnose.py      per-layer quantisation loss on real weights
 ```

@@ -36,6 +36,7 @@ __all__ = [
     "kv_cache",
     "layers",
     "ops",
+    "preflight",
     "reference",
     "run_eval",
     "smoke_dense",

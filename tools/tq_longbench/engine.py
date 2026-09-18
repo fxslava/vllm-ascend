@@ -98,6 +98,10 @@ class RunnerConfig:
     #: checks where a checkpoint is neither available nor relevant.
     random_weights: bool = False
     seed: int = 0
+    #: NativeV5Backend's torch_npu entry point (ops.DENSE_ATTENTION_APIS); ``None``
+    #: takes the most preferred one torch_npu has. ``smoke_glm``'s pre-flight
+    #: fills it with the one that actually ran on this SoC.
+    dense_attention_api: str | None = None
 
     def __post_init__(self) -> None:
         if self.prefill_mode not in PREFILL_MODES:
@@ -177,7 +181,13 @@ class StandaloneModelRunner:
         )
 
         self.decode_backend: AttentionBackend = build_backend(
-            config.backend, self.geometry, layer_shape, self.device, config.dtype, config.fold_output_rotation
+            config.backend,
+            self.geometry,
+            layer_shape,
+            self.device,
+            config.dtype,
+            config.fold_output_rotation,
+            config.dense_attention_api,
         )
         # dense_staging needs the unquantised pool as well, unless the decode
         # backend already is it. Which unquantised backend that is follows the
@@ -191,6 +201,7 @@ class StandaloneModelRunner:
                 self.device,
                 config.dtype,
                 config.fold_output_rotation,
+                config.dense_attention_api,
             )
         else:
             self.prefill_backend = self.decode_backend

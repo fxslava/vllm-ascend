@@ -20,9 +20,10 @@ Each backend answers the same two questions -- write this chunk's K/V into the
 cache, and attend over the prefix -- so the decoder layer never learns which one
 it is driving.  What differs is underneath:
 
-* :class:`NativeV5Backend` -- ``npu_fused_infer_attention_score`` over the dense
-  paged cache.  The baseline, and the only path whose numbers are not a
-  quantisation of anything.
+* :class:`NativeV5Backend` -- torch_npu's fused infer attention over the dense
+  paged cache: ``npu_fused_infer_attention_score_v2`` (aclnn V5, the only
+  version Ascend 950 accepts) where torch_npu has it.  The baseline, and the
+  only path whose numbers are not a quantisation of anything.
 * :class:`TurboQuantCubeBackend` -- one ``npu_turboquant_cube_decode`` launch
   per step.  It takes the **raw** query (the ``PRE_ROTATED = false`` entry),
   rotates it in its own prologue, and its output stage un-rotates the result and
@@ -55,9 +56,9 @@ _ROTATE_BATCH_ROWS = 1
 
 _ASCEND_NAMESPACE = "_C_ascend"
 
-# npu_fused_infer_attention_score's bottom-right causal mask: with more kv than
-# q the diagonal aligns to the end of the prefix, which is what a chunk arriving
-# after a populated cache needs.
+# FIA's (and PFA's) bottom-right causal mask: with more kv than q the diagonal
+# aligns to the end of the prefix, which is what a chunk arriving after a
+# populated cache needs.
 _BOTTOM_RIGHT_CAUSAL_SPARSE_MODE = 3
 
 
@@ -197,8 +198,57 @@ class AttentionBackend(abc.ABC):
             raise RuntimeError(f"context length {longest} exceeds the {self.geometry.max_seq_len}-token static cache")
 
 
+#: The torch_npu entry points :class:`NativeV5Backend` can attend through, most preferred first.
+#: ``fia_v5`` is ``npu_fused_infer_attention_score_v2``, which drives aclnnFusedInferAttentionScoreV5 --
+#: the only FIA interface Ascend 950 accepts ("versions V1 to V4 are no longer supported", EZ9903)
+#: and the one vllm-ascend's own attention calls. ``fia_v1`` is the original entry point (V1-V4),
+#: still the one older torch_npu builds have. ``pfa`` is ``npu_prompt_flash_attention`` over the
+#: contiguous prefix -- it has no block table, so it serves prefill only.
+DENSE_ATTENTION_APIS = {
+    "fia_v5": "npu_fused_infer_attention_score_v2",
+    "fia_v1": "npu_fused_infer_attention_score",
+    "pfa": "npu_prompt_flash_attention",
+}
+
+#: The APIs that can decode: a batch of single-token rows over a paged prefix needs a block table.
+_DECODE_CAPABLE_APIS = ("fia_v5", "fia_v1")
+
+#: sparse_mode 2/3/4 read a compressed 2048 x 2048 causal mask rather than one per shape --
+#: the int8 upper triangle vllm-ascend builds (AttentionMaskBuilder.get_splitfuse_attn_mask).
+_COMPRESSED_CAUSAL_MASK_SIZE = 2048
+
+#: ``next_tokens`` for a causal call, as vllm-ascend passes it next to sparse_mode 3.
+_CAUSAL_NEXT_TOKENS = 0
+
+
+def _torch_npu():
+    """Deferred: only the native backend needs the device runtime."""
+    import torch_npu
+
+    return torch_npu
+
+
+def available_dense_attention_apis(role: str = "prefill") -> list[str]:
+    """The :data:`DENSE_ATTENTION_APIS` this torch_npu has, most preferred first.
+
+    ``role`` is ``"prefill"`` or ``"decode"``; PFA is offered for prefill only.
+    Having an entry point says nothing about whether this SoC's CANN accepts it --
+    which is what :mod:`tq_longbench.preflight` finds out.
+    """
+    torch_npu = _torch_npu()
+    candidates = DENSE_ATTENTION_APIS if role == "prefill" else _DECODE_CAPABLE_APIS
+    return [api for api in candidates if hasattr(torch_npu, DENSE_ATTENTION_APIS[api])]
+
+
 class NativeV5Backend(AttentionBackend):
-    """``npu_fused_infer_attention_score`` over the unquantised paged cache."""
+    """The unquantised paged cache, through torch_npu's own attention.
+
+    Which torch_npu entry point is ``attention_api``: by default the most preferred
+    one this torch_npu has (``fia_v5`` where it exists). Whether the SoC accepts it
+    is a runtime question -- Ascend 950 refuses ``fia_v1`` -- so ``smoke_glm``'s
+    pre-flight tries the candidates on a synthetic layer and passes the one that
+    worked in here.
+    """
 
     name = "native_v5"
 
@@ -209,14 +259,34 @@ class NativeV5Backend(AttentionBackend):
         device: torch.device,
         dtype: torch.dtype,
         output_rotation_folded: bool = False,
+        attention_api: str | None = None,
     ) -> None:
         super().__init__(geometry, shape, device)
         self.cache = DenseKVCache(geometry, device, dtype)
         self.dtype = dtype
         self.output_rotation_folded = output_rotation_folded
+        if attention_api is None:
+            available = available_dense_attention_apis("prefill")
+            if not available:
+                raise RuntimeError(f"this torch_npu has none of {sorted(DENSE_ATTENTION_APIS.values())}")
+            attention_api = available[0]
+        if attention_api not in DENSE_ATTENTION_APIS:
+            raise ValueError(f"unknown attention_api {attention_api!r}; choose one of {sorted(DENSE_ATTENTION_APIS)}")
+        self.attention_api = attention_api
+        # Built once: a prefill chunk passes it on every layer.
+        self._causal_mask = torch.triu(
+            torch.ones(_COMPRESSED_CAUSAL_MASK_SIZE, _COMPRESSED_CAUSAL_MASK_SIZE, dtype=torch.int8, device=device),
+            diagonal=1,
+        )
 
     def write_kv(self, layer: int, key: torch.Tensor, value: torch.Tensor, slots: torch.Tensor) -> None:
         self.cache.write(layer, key, value, slots)
+
+    def _finish(self, attn_output: torch.Tensor, out: torch.Tensor, gate: torch.Tensor | None) -> torch.Tensor:
+        out.copy_(attn_output.view_as(out))
+        if gate is not None:
+            out.mul_(torch.sigmoid(gate).view_as(out))
+        return self._into_folded_basis(out)
 
     def decode(
         self,
@@ -226,28 +296,46 @@ class NativeV5Backend(AttentionBackend):
         out: torch.Tensor,
         gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        import torch_npu  # Deferred: only this backend needs the device runtime.
-
+        """Each query token a sequence of its own (TND), attending its whole context: no mask."""
+        if self.attention_api not in _DECODE_CAPABLE_APIS:
+            raise NotImplementedError(
+                f"{self.attention_api} has no block table, so it cannot decode out of the paged cache; "
+                f"it serves the dense_staging prefill only. Decode needs one of {list(_DECODE_CAPABLE_APIS)}."
+            )
         num_tokens = query.shape[0]
         key, value = self.cache.flat(layer)
         block_table = self.cache.block_table(int(context_lens.max()) if context_lens.numel() else 0)
-        attn_output, _ = torch_npu.npu_fused_infer_attention_score(
-            query=query.contiguous(),
-            key=key,
-            value=value,
-            block_table=block_table.expand(num_tokens, -1).contiguous(),
-            input_layout="TND",
-            block_size=self.geometry.block_size,
-            actual_seq_lengths=list(range(1, num_tokens + 1)),
-            actual_seq_lengths_kv=context_lens.tolist(),
-            num_key_value_heads=self.shape.num_kv_heads,
-            num_heads=self.shape.num_heads,
-            scale=self.shape.scale,
-        )
-        out.copy_(attn_output.view_as(out))
-        if gate is not None:
-            out.mul_(torch.sigmoid(gate).view_as(out))
-        return self._into_folded_basis(out)
+        block_tables = block_table.expand(num_tokens, -1).contiguous()
+        query_lens = list(range(1, num_tokens + 1))
+        if self.attention_api == "fia_v5":
+            attn_output, _ = _torch_npu().npu_fused_infer_attention_score_v2(
+                query.contiguous(),
+                key,
+                value,
+                block_table=block_tables,
+                input_layout="TND",
+                block_size=self.geometry.block_size,
+                actual_seq_qlen=query_lens,
+                actual_seq_kvlen=context_lens.tolist(),
+                num_query_heads=self.shape.num_heads,
+                num_key_value_heads=self.shape.num_kv_heads,
+                softmax_scale=self.shape.scale,
+            )
+        else:
+            attn_output, _ = _torch_npu().npu_fused_infer_attention_score(
+                query=query.contiguous(),
+                key=key,
+                value=value,
+                block_table=block_tables,
+                input_layout="TND",
+                block_size=self.geometry.block_size,
+                actual_seq_lengths=query_lens,
+                actual_seq_lengths_kv=context_lens.tolist(),
+                num_key_value_heads=self.shape.num_kv_heads,
+                num_heads=self.shape.num_heads,
+                scale=self.shape.scale,
+            )
+        return self._finish(attn_output, out, gate)
 
     def prefill_chunk(
         self,
@@ -259,37 +347,81 @@ class NativeV5Backend(AttentionBackend):
     ) -> torch.Tensor:
         """One request of ``count`` query tokens against a ``prefix_end``-token cache.
 
-        ``sparse_mode=3`` is the bottom-right causal mask the operator builds
-        itself: with more kv than q it aligns the diagonal to the *end* of the
-        prefix, which is exactly a chunk arriving after ``prefix_end - count``
-        tokens are already cached.  Spelling the same mask out as one request per
-        token (what the base class does) would be correct and far slower.
+        ``sparse_mode=3`` is the bottom-right causal mask: with more kv than q it
+        aligns the diagonal to the *end* of the prefix, which is exactly a chunk
+        arriving after ``prefix_end - count`` tokens are already cached. It reads
+        the compressed 2048 x 2048 mask rather than one built per shape. Spelling
+        the same mask out as one request per token (what the base class does)
+        would be correct and far slower.
         """
-        import torch_npu  # Deferred: only this backend needs the device runtime.
-
         count = query.shape[0]
         if prefix_end - count < 0:
             raise ValueError(f"a {count}-token chunk cannot end at prefix {prefix_end}")
+        if self.attention_api == "pfa":
+            return self._finish(self._prompt_flash_attention(layer, query, prefix_end), out, gate)
         key, value = self.cache.flat(layer)
         block_table = self.cache.block_table(prefix_end)
-        attn_output, _ = torch_npu.npu_fused_infer_attention_score(
-            query=query.contiguous(),
-            key=key,
-            value=value,
-            block_table=block_table,
-            input_layout="TND",
-            block_size=self.geometry.block_size,
+        if self.attention_api == "fia_v5":
+            attn_output, _ = _torch_npu().npu_fused_infer_attention_score_v2(
+                query.contiguous(),
+                key,
+                value,
+                atten_mask=self._causal_mask,
+                block_table=block_table,
+                input_layout="TND",
+                block_size=self.geometry.block_size,
+                actual_seq_qlen=[count],
+                actual_seq_kvlen=[prefix_end],
+                num_query_heads=self.shape.num_heads,
+                num_key_value_heads=self.shape.num_kv_heads,
+                softmax_scale=self.shape.scale,
+                sparse_mode=_BOTTOM_RIGHT_CAUSAL_SPARSE_MODE,
+                next_tokens=_CAUSAL_NEXT_TOKENS,
+            )
+        else:
+            attn_output, _ = _torch_npu().npu_fused_infer_attention_score(
+                query=query.contiguous(),
+                key=key,
+                value=value,
+                atten_mask=self._causal_mask,
+                block_table=block_table,
+                input_layout="TND",
+                block_size=self.geometry.block_size,
+                actual_seq_lengths=[count],
+                actual_seq_lengths_kv=[prefix_end],
+                num_key_value_heads=self.shape.num_kv_heads,
+                num_heads=self.shape.num_heads,
+                scale=self.shape.scale,
+                sparse_mode=_BOTTOM_RIGHT_CAUSAL_SPARSE_MODE,
+                next_tokens=_CAUSAL_NEXT_TOKENS,
+            )
+        return self._finish(attn_output, out, gate)
+
+    def _prompt_flash_attention(self, layer: int, query: torch.Tensor, prefix_end: int) -> torch.Tensor:
+        """PFA over the prefix as one contiguous ``[1, prefix_end, H_kv * D]`` sequence.
+
+        The paging is the identity (a slot is a position), so the pool's first
+        ``prefix_end`` rows *are* the prefix in order, and a slice of them is the
+        dense key PFA wants without a copy.
+        """
+        count = query.shape[0]
+        hidden_kv = self.shape.num_kv_heads * self.shape.head_size
+        keys = self.cache.key_planes[layer].view(1, -1, hidden_kv)[:, :prefix_end]
+        values = self.cache.value_planes[layer].view(1, -1, hidden_kv)[:, :prefix_end]
+        return _torch_npu().npu_prompt_flash_attention(
+            query.contiguous().view(1, count, -1),
+            keys,
+            values,
+            atten_mask=self._causal_mask,
             actual_seq_lengths=[count],
             actual_seq_lengths_kv=[prefix_end],
-            num_key_value_heads=self.shape.num_kv_heads,
             num_heads=self.shape.num_heads,
-            scale=self.shape.scale,
+            num_key_value_heads=self.shape.num_kv_heads,
+            scale_value=self.shape.scale,
+            input_layout="BSH",
             sparse_mode=_BOTTOM_RIGHT_CAUSAL_SPARSE_MODE,
+            next_tokens=_CAUSAL_NEXT_TOKENS,
         )
-        out.copy_(attn_output.view_as(out))
-        if gate is not None:
-            out.mul_(torch.sigmoid(gate).view_as(out))
-        return self._into_folded_basis(out)
 
 
 class _TurboQuantBackend(AttentionBackend):
@@ -557,8 +689,12 @@ def build_backend(
     device: torch.device,
     dtype: torch.dtype,
     output_rotation_folded: bool = False,
+    dense_attention_api: str | None = None,
 ) -> AttentionBackend:
     """Construct the named backend, allocating its cache pool.
+
+    ``dense_attention_api`` picks :class:`NativeV5Backend`'s torch_npu entry point
+    (see :data:`DENSE_ATTENTION_APIS`); every other backend ignores it.
 
     An Ascend backend asked for where its operators cannot run is **refused**
     rather than quietly substituted: the reference backends compute the same
@@ -594,7 +730,7 @@ def build_backend(
             "(correctness only -- it says nothing about latency)."
         )
     if name == NativeV5Backend.name:
-        return NativeV5Backend(geometry, shape, device, dtype, output_rotation_folded)
+        return NativeV5Backend(geometry, shape, device, dtype, output_rotation_folded, dense_attention_api)
     return ASCEND_BACKENDS[name](geometry, shape, device, output_rotation_folded=output_rotation_folded)
 
 

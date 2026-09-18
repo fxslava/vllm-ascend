@@ -77,12 +77,14 @@ from tq_longbench.kv_cache import CacheGeometry, DenseKVCache, TurboQuantKVCache
 from tq_longbench.layers import ModelShape, RotaryEmbedding  # noqa: E402
 from tq_longbench.ops import (  # noqa: E402
     LayerShape,
+    NativeV5Backend,
     TurboQuantAivBackend,
     TurboQuantCubeBackend,
     ascend_ops,
     build_backend,
     cube_decode_available,
 )
+from tq_longbench.preflight import exact_attention, probe_backend, select_dense_api  # noqa: E402
 from tq_longbench.reference import DenseReferenceBackend, TurboQuantReferenceBackend  # noqa: E402
 from tq_longbench.tasks import f1_score, needle_in_a_haystack, rouge_l, score  # noqa: E402
 
@@ -1686,6 +1688,291 @@ class TestBuildTurboQuantOps(unittest.TestCase):
         (root / "tree" / "stale.o").write_text("x")
         build_turboquant_ops.fresh_build_dir(root / "tree")
         self.assertEqual(list((root / "tree").iterdir()), [])
+
+
+# The keywords torch_npu 2.10.0.post4 declares for each entry point (its npu:: schemas),
+# so a call spelled for another version is refused here as it would be there.
+_FIA_V2_SCHEMA_WORDS = (
+    "query key value query_rope key_rope pse_shift atten_mask actual_seq_qlen actual_seq_kvlen block_table "
+    "dequant_scale_query dequant_scale_key dequant_offset_key dequant_scale_value dequant_offset_value "
+    "dequant_scale_key_rope quant_scale_out quant_offset_out quant_scale_p learnable_sink num_query_heads "
+    "num_key_value_heads softmax_scale pre_tokens next_tokens input_layout sparse_mode block_size "
+    "query_quant_mode key_quant_mode value_quant_mode inner_precise return_softmax_lse query_dtype key_dtype "
+    "value_dtype query_rope_dtype key_rope_dtype key_shared_prefix_dtype value_shared_prefix_dtype "
+    "dequant_scale_query_dtype dequant_scale_key_dtype dequant_scale_value_dtype dequant_scale_key_rope_dtype "
+    "out_dtype"
+)
+_FIA_V2_KWARGS = frozenset(_FIA_V2_SCHEMA_WORDS.split())
+_FIA_V1_SCHEMA_WORDS = (
+    "query key value pse_shift atten_mask actual_seq_lengths actual_seq_lengths_kv dequant_scale1 quant_scale1 "
+    "dequant_scale2 quant_scale2 quant_offset2 antiquant_scale antiquant_offset key_antiquant_scale "
+    "key_antiquant_offset value_antiquant_scale value_antiquant_offset block_table query_padding_size "
+    "kv_padding_size key_shared_prefix value_shared_prefix actual_shared_prefix_len query_rope key_rope "
+    "key_rope_antiquant_scale num_heads scale pre_tokens next_tokens input_layout num_key_value_heads "
+    "sparse_mode inner_precise block_size antiquant_mode key_antiquant_mode value_antiquant_mode "
+    "softmax_lse_flag"
+)
+_FIA_V1_KWARGS = frozenset(_FIA_V1_SCHEMA_WORDS.split())
+_PFA_SCHEMA_WORDS = (
+    "query key value padding_mask atten_mask pse_shift actual_seq_lengths deq_scale1 quant_scale1 deq_scale2 "
+    "quant_scale2 quant_offset2 num_heads scale_value pre_tokens next_tokens input_layout num_key_value_heads "
+    "actual_seq_lengths_kv sparse_mode"
+)
+_PFA_KWARGS = frozenset(_PFA_SCHEMA_WORDS.split())
+_EZ9903 = (
+    "AclNN_Runtime_Error(EZ9903): Interface aclnnFusedInferAttentionScore versions V1 to V4 are no longer "
+    "supported on Ascend950."
+)
+
+
+def _dense_attention(query, key, value, scale, causal):
+    """``[q, H, D]`` over ``[k, H_kv, D]``; bottom-right causal when ``causal``."""
+    if causal:
+        return exact_attention(query, key, value, scale)
+    group = query.shape[1] // key.shape[1]
+    key, value = key.repeat_interleave(group, dim=1).float(), value.repeat_interleave(group, dim=1).float()
+    scores = torch.einsum("qhd,khd->hqk", query.float(), key) * scale
+    return torch.einsum("hqk,khd->qhd", torch.softmax(scores, dim=-1), value)
+
+
+def fake_torch_npu(v5=True, v1=True, pfa=True, refused=(), ignore_causal=False):
+    """torch_npu's three attention entry points, computing what the device computes.
+
+    ``refused`` names entry points that raise EZ9903, as V1-V4 do on Ascend 950;
+    ``ignore_causal`` makes FIA V5 read sparse_mode 3 as no mask at all -- a call
+    that runs and returns plausible numbers, which only the probe's comparison catches.
+    """
+    module = types.ModuleType("torch_npu")
+
+    def check(name, allowed, kwargs):
+        unknown = sorted(set(kwargs) - allowed)
+        if unknown:
+            raise TypeError(f"{name}() got unexpected keyword arguments {unknown}")
+        if name in refused:
+            raise RuntimeError(_EZ9903)
+
+    def paged(cache, table_row, length, kv_heads):
+        return cache[table_row.long()].reshape(-1, kv_heads, cache.shape[-1] // kv_heads)[:length]
+
+    def fia(query, key, value, *, q_ends, kv_lens, table, kv_heads, scale, sparse_mode, mask):
+        if sparse_mode == 3 and (mask is None or tuple(mask.shape) != (2048, 2048)):
+            raise RuntimeError("sparse_mode 3 needs the compressed 2048 x 2048 atten_mask")
+        causal = sparse_mode == 3 and not ignore_causal
+        out, start = torch.empty_like(query), 0
+        for row, (end, length) in enumerate(zip(q_ends, kv_lens)):
+            keys, values = (paged(cache, table[row], length, kv_heads) for cache in (key, value))
+            out[start:end] = _dense_attention(query[start:end], keys, values, scale, causal).to(out.dtype)
+            start = end
+        return out, torch.empty(0)
+
+    if v5:
+
+        def npu_fused_infer_attention_score_v2(query, key, value, **kwargs):
+            check("fia_v5", _FIA_V2_KWARGS, kwargs)
+            assert kwargs["input_layout"] == "TND"
+            return fia(
+                query, key, value, q_ends=kwargs["actual_seq_qlen"], kv_lens=kwargs["actual_seq_kvlen"],
+                table=kwargs["block_table"], kv_heads=kwargs["num_key_value_heads"], scale=kwargs["softmax_scale"],
+                sparse_mode=kwargs.get("sparse_mode", 0), mask=kwargs.get("atten_mask"),
+            )  # fmt: skip
+
+        module.npu_fused_infer_attention_score_v2 = npu_fused_infer_attention_score_v2
+    if v1:
+
+        def npu_fused_infer_attention_score(**kwargs):
+            check("fia_v1", _FIA_V1_KWARGS, kwargs)
+            return fia(
+                kwargs["query"], kwargs["key"], kwargs["value"], q_ends=kwargs["actual_seq_lengths"],
+                kv_lens=kwargs["actual_seq_lengths_kv"], table=kwargs["block_table"],
+                kv_heads=kwargs["num_key_value_heads"], scale=kwargs["scale"],
+                sparse_mode=kwargs.get("sparse_mode", 0), mask=kwargs.get("atten_mask"),
+            )  # fmt: skip
+
+        module.npu_fused_infer_attention_score = npu_fused_infer_attention_score
+    if pfa:
+
+        def npu_prompt_flash_attention(query, key, value, **kwargs):
+            check("pfa", _PFA_KWARGS, kwargs)
+            assert kwargs["input_layout"] == "BSH" and kwargs["sparse_mode"] == 3
+            heads, kv_heads = kwargs["num_heads"], kwargs["num_key_value_heads"]
+            q = query[0].view(query.shape[1], heads, -1)
+            k, v = (t[0].view(t.shape[1], kv_heads, -1) for t in (key, value))
+            out = _dense_attention(q, k, v, kwargs["scale_value"], causal=True).to(query.dtype)
+            return out.reshape(query.shape)
+
+        module.npu_prompt_flash_attention = npu_prompt_flash_attention
+    return module
+
+
+# GLM-4 9B-chat-1M's attention geometry, which the pre-flight probes with.
+GLM4_LAYER = LayerShape(32, 4, 128, 128**-0.5)
+
+
+class _FakeNpuCase(unittest.TestCase):
+    def setUp(self):
+        self._serving = False
+
+    def use(self, module) -> None:
+        """Make ``module`` the torch_npu this test sees; may be called again to swap it."""
+        patcher = mock.patch.dict(sys.modules, {"torch_npu": module})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # native_v5 builds on a CPU only while something serves the TurboQuant operators.
+        # Registered once: torch 2.10 refuses a second Python kernel for the same key.
+        if not self._serving:
+            ops = cpu_turboquant_ops()
+            ops.__enter__()
+            self.addCleanup(ops.__exit__, None, None, None)
+            self._serving = True
+
+
+class TestNativeAttentionApis(_FakeNpuCase):
+    """NativeV5Backend's three torch_npu entry points, against exact attention."""
+
+    CONTEXT, CHUNK = 48, 16
+
+    def _filled(self, api):
+        geometry = _geometry(BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
+        backend = NativeV5Backend(geometry, LayerShape(NUM_HEADS, NUM_KV_HEADS, HEAD_SIZE, HEAD_SIZE**-0.5), CPU,
+                                  torch.float32, attention_api=api)  # fmt: skip
+        key = torch.randn(self.CONTEXT, NUM_KV_HEADS, HEAD_SIZE)
+        value = torch.randn(self.CONTEXT, NUM_KV_HEADS, HEAD_SIZE)
+        backend.write_kv(0, key, value, backend.cache.slot_mapping(0, self.CONTEXT))
+        return backend, key, value
+
+    def _check_prefill(self, api):
+        backend, key, value = self._filled(api)
+        query = torch.randn(self.CHUNK, NUM_HEADS, HEAD_SIZE)
+        out = torch.empty_like(query)
+        backend.prefill_chunk(0, query, self.CONTEXT, out)
+        torch.testing.assert_close(out, exact_attention(query, key, value, HEAD_SIZE**-0.5), rtol=1e-4, atol=1e-5)
+
+    def _check_decode(self, api):
+        backend, key, value = self._filled(api)
+        query = torch.randn(3, NUM_HEADS, HEAD_SIZE)
+        lengths = torch.tensor([self.CONTEXT, 20, 7], dtype=torch.int32)
+        out = torch.empty_like(query)
+        backend.decode(0, query, lengths, out)
+        for row, length in enumerate(lengths.tolist()):
+            expected = exact_attention(query[row : row + 1], key[:length], value[:length], HEAD_SIZE**-0.5)
+            torch.testing.assert_close(out[row : row + 1], expected, rtol=1e-4, atol=1e-5)
+
+    def test_v5_is_the_default_where_torch_npu_has_it(self):
+        self.use(fake_torch_npu())
+        self.assertEqual(self._filled(None)[0].attention_api, "fia_v5")
+        self.use(fake_torch_npu(v5=False))
+        self.assertEqual(self._filled(None)[0].attention_api, "fia_v1")
+
+    def test_fia_v5_prefills_bottom_right_causal_and_decodes_ragged_rows(self):
+        self.use(fake_torch_npu())
+        self._check_prefill("fia_v5")
+        self._check_decode("fia_v5")
+
+    def test_fia_v1_now_passes_the_mask_sparse_mode_3_reads(self):
+        self.use(fake_torch_npu())
+        self._check_prefill("fia_v1")
+        self._check_decode("fia_v1")
+
+    def test_pfa_prefills_the_contiguous_prefix_and_refuses_to_decode(self):
+        self.use(fake_torch_npu())
+        self._check_prefill("pfa")
+        with self.assertRaisesRegex(NotImplementedError, "no block table"):
+            self._check_decode("pfa")
+
+
+class TestPreflight(_FakeNpuCase):
+    """The synthetic one-layer probe, at GLM-4's head counts."""
+
+    def test_on_ascend_950_the_v5_entry_point_is_chosen(self):
+        self.use(fake_torch_npu(refused={"fia_v1"}))
+        for role in ("prefill", "decode"):
+            with self.subTest(role=role):
+                chosen = select_dense_api("native_v5", GLM4_LAYER, CPU, torch.float32, BLOCK_SIZE, role=role)
+                self.assertTrue(chosen.passed)
+                self.assertEqual(chosen.api, "fia_v5")
+
+    def test_a_torch_npu_without_v5_prefills_through_pfa_and_cannot_decode(self):
+        self.use(fake_torch_npu(v5=False, refused={"fia_v1"}))
+        prefill = select_dense_api("native_v5", GLM4_LAYER, CPU, torch.float32, BLOCK_SIZE, role="prefill")
+        self.assertEqual((prefill.passed, prefill.api), (True, "pfa"))
+        self.assertIn("EZ9903", prefill.results[0].detail)
+        decode = select_dense_api("native_v5", GLM4_LAYER, CPU, torch.float32, BLOCK_SIZE, role="decode")
+        self.assertFalse(decode.passed)
+
+    def test_a_call_that_runs_but_ignores_the_causal_mask_fails_the_probe(self):
+        self.use(fake_torch_npu(ignore_causal=True))
+        result = probe_backend("native_v5", GLM4_LAYER, CPU, torch.float32, BLOCK_SIZE, dense_attention_api="fia_v5")
+        self.assertFalse(result.passed)
+        self.assertIn("prefill cos", result.detail)
+
+    def test_the_quantised_backends_clear_their_floor(self):
+        self.use(fake_torch_npu())
+        for name, folded in (("turboquant_aiv", False), ("turboquant_aiv", True), ("turboquant_reference", True)):
+            with self.subTest(backend=name, folded=folded):
+                result = probe_backend(name, GLM4_LAYER, CPU, torch.bfloat16, BLOCK_SIZE, output_rotation_folded=folded)
+                self.assertTrue(result.passed, result.describe())
+
+    def test_a_backend_that_cannot_be_built_is_a_verdict_not_a_crash(self):
+        refused = probe_backend("turboquant_cube", GLM4_LAYER, CPU, torch.float16, BLOCK_SIZE)
+        self.assertFalse(refused.passed)
+        self.assertIn("cannot run on cpu", refused.detail)
+        # Operators served, but no Cube library anywhere to load it from.
+        self.use(fake_torch_npu())
+        missing = str(REPO_ROOT / "build" / "no-such-dir" / _ascend.TURBOQUANT_LIB_NAME)
+        with mock.patch.dict(os.environ, {_ascend.TURBOQUANT_LIB_ENV: missing}):
+            unregistered = probe_backend("turboquant_cube", GLM4_LAYER, CPU, torch.float16, BLOCK_SIZE)
+        self.assertFalse(unregistered.passed)
+        self.assertIn("not registered", unregistered.detail)
+
+
+class TestSmokeGlmPreflight(unittest.TestCase):
+    """How smoke_glm acts on the probes: switch, stop, or carry the chosen entry point into the runners."""
+
+    def _args(self, *extra):
+        from tq_longbench.smoke_glm import build_parser
+
+        args = build_parser().parse_args(["--model-path", "/m", "--device", "cpu", *extra])
+        args.device = CPU
+        return args
+
+    def _plan(self, args, prefill_mode, dense_passes, decode_passes=True):
+        from tq_longbench import smoke_glm
+        from tq_longbench.preflight import DenseSelection, ProbeResult
+
+        dense = DenseSelection(dense_passes, "fia_v5" if dense_passes else None,
+                               [ProbeResult("native_v5", "fia_v5", dense_passes, 0.01, _EZ9903)])  # fmt: skip
+        decode = ProbeResult(args.backend, None, decode_passes, 0.01, "decode cos 0.99")
+        with (
+            mock.patch.object(smoke_glm, "select_dense_api", return_value=dense),
+            mock.patch.object(smoke_glm, "probe_backend", return_value=decode),
+        ):
+            return smoke_glm.plan_attention(args, GLM4_9B_CHAT_1M_CONFIG, prefill_mode)
+
+    def test_a_failed_default_dense_prefill_switches_to_batched_decode(self):
+        plan = self._plan(self._args("--backend", "turboquant_reference"), "dense_staging", dense_passes=False)
+        self.assertEqual(plan.prefill_mode, "batched_decode")
+        self.assertIn("batched_decode", plan.notes[0])
+
+    def test_an_explicit_dense_staging_stops_before_the_weights(self):
+        from tq_longbench.smoke_glm import PreflightFailed
+
+        args = self._args("--backend", "turboquant_reference", "--prefill-mode", "dense_staging")
+        with self.assertRaisesRegex(PreflightFailed, "--prefill-mode batched_decode") as raised:
+            self._plan(args, "dense_staging", dense_passes=False)
+        self.assertIn("EZ9903", str(raised.exception))
+
+    def test_a_failed_decode_stops_before_the_weights(self):
+        from tq_longbench.smoke_glm import PreflightFailed
+
+        with self.assertRaisesRegex(PreflightFailed, "decode does not run here"):
+            self._plan(self._args("--backend", "turboquant_reference"), "batched_decode", True, decode_passes=False)
+
+    def test_the_entry_point_that_passed_is_the_one_the_runners_get(self):
+        plan = self._plan(self._args("--backend", "turboquant_reference"), "dense_staging", dense_passes=True)
+        self.assertEqual(plan.prefill_mode, "dense_staging")
+        self.assertEqual(plan.dense_api_for("turboquant_reference"), "fia_v5")
+        native = self._plan(self._args("--backend", "native_v5"), "dense_staging", dense_passes=True)
+        self.assertEqual(native.dense_api_for("native_v5"), "fia_v5")
 
 
 if __name__ == "__main__":

@@ -19,8 +19,16 @@
     python tools/tq_longbench/smoke_glm.py --model-path /models/glm-4-9b-chat-1m \\
         --device npu --backend turboquant_cube --tokens 131072
 
-Three stages, in order:
+Four stages, in order:
 
+0. **Pre-flight**, before a byte of the checkpoint is read: every attention path
+   the run will take -- the decode backend, the dense_staging prefill, the
+   reference backend -- runs one synthetic layer with GLM-4's head counts and is
+   checked against exact attention (:mod:`tq_longbench.preflight`). An operator
+   the SoC refuses fails here in well under the time ingestion takes. When the
+   dense prefill is what fails and ``--prefill-mode`` was left to default, the
+   run switches to ``batched_decode`` rather than stopping; the torch_npu entry
+   point that did pass is the one the run then uses. ``--skip-preflight`` skips it.
 1. **The contract.** The shape read off ``config.json`` (head counts, the
    half-width interleaved RoPE, the qkv bias), and the decode's output stage:
    ungated, with ``W_o' = W_o (I (x) Pi)`` folded at ingestion, the Cube decode
@@ -61,6 +69,8 @@ _bootstrap_path()
 import argparse  # noqa: E402  (after the path bootstrap above)
 import gc  # noqa: E402
 import json  # noqa: E402
+import time  # noqa: E402
+from dataclasses import dataclass, field  # noqa: E402
 
 import torch  # noqa: E402
 
@@ -68,11 +78,19 @@ from tq_longbench._ascend import assert_no_vllm_imported, turboquant_layout  # n
 from tq_longbench.engine import DEFAULT_CHUNK_SIZE, PREFILL_MODES, RunnerConfig, StandaloneModelRunner  # noqa: E402
 from tq_longbench.glm4 import (  # noqa: E402
     GLM4_BATCHED_DECODE_MIN_TOKENS,
+    glm4_model_shape,
     glm4_prefill_mode,
     is_glm4_config,
     read_config,
 )
-from tq_longbench.ops import DENSE_BACKENDS, TurboQuantCubeBackend, backend_names  # noqa: E402
+from tq_longbench.ops import (  # noqa: E402
+    DENSE_BACKENDS,
+    LayerShape,
+    TurboQuantCubeBackend,
+    backend_names,
+    dense_backend_for,
+)
+from tq_longbench.preflight import ProbeResult, probe_backend, select_dense_api  # noqa: E402
 from tq_longbench.tasks import needle_in_a_haystack  # noqa: E402
 
 _DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
@@ -126,6 +144,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="also run the short prompt on this backend (e.g. native_v5) and count agreeing tokens",
     )
     parser.add_argument("--raw-prompt", action="store_true", help="skip the tokenizer's chat template")
+    parser.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="skip the synthetic one-layer probe of every attention path before the weights load",
+    )
     parser.add_argument(
         "--dummy-prompt",
         action="store_true",
@@ -282,7 +305,9 @@ def render(tokenizer, token_ids: list[int]) -> str:
     return repr(tokenizer.decode(token_ids, skip_special_tokens=True))
 
 
-def build_runner(args, backend: str, prefill_mode: str, max_seq_len: int) -> StandaloneModelRunner:
+def build_runner(
+    args, backend: str, prefill_mode: str, max_seq_len: int, dense_attention_api: str | None = None
+) -> StandaloneModelRunner:
     runner = StandaloneModelRunner(
         RunnerConfig(
             model_path=args.model_path,
@@ -297,10 +322,104 @@ def build_runner(args, backend: str, prefill_mode: str, max_seq_len: int) -> Sta
             # A dense baseline's decode never rotates anything, so there is nothing to fold for.
             fold_output_rotation=not args.no_fold_output_rotation and backend not in DENSE_BACKENDS,
             seed=args.seed,
+            dense_attention_api=dense_attention_api,
         )
     )
     assert_no_vllm_imported()
     return runner
+
+
+class PreflightFailed(SystemExit):
+    """Raised before any weight loads, with every probe's verdict in the message."""
+
+
+@dataclass
+class AttentionPlan:
+    """What the pre-flight settled: the prefill mode, and the torch_npu entry point each dense path uses."""
+
+    prefill_mode: str
+    #: ``native_v5``'s entry point when it is the decode (or reference) backend, and
+    #: ``"staging"``'s when the dense_staging pool only prefills. Absent: torch_npu's default.
+    dense_apis: dict[str, str | None] = field(default_factory=dict)
+    results: list[ProbeResult] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+    def dense_api_for(self, backend: str) -> str | None:
+        """The entry point a runner decoding with ``backend`` hands its dense pool."""
+        return self.dense_apis.get(backend if backend in DENSE_BACKENDS else "staging")
+
+    def report(self) -> str:
+        lines = [f"  {result.describe()}" for result in self.results]
+        lines += [f"  {note}" for note in self.notes]
+        return "\n".join(lines)
+
+
+def plan_attention(args, config: dict, prefill_mode: str) -> AttentionPlan:
+    """Probe every attention path the run will take, on one synthetic layer, before any weight loads.
+
+    Raises :class:`PreflightFailed` when a path the run cannot do without fails.
+    The one it can do without is the dense_staging prefill: when that fails and
+    ``--prefill-mode`` was not given, the run prefills through the decode backend
+    (``batched_decode``) instead, which the decode backend's probe has just run.
+    """
+    plan = AttentionPlan(prefill_mode)
+    shape = glm4_model_shape(config)
+    layer = LayerShape(shape.num_heads, shape.num_kv_heads, shape.head_size, shape.scale)
+    probe = {"device": args.device, "dtype": _DTYPES[args.dtype], "block_size": args.block_size}
+    folded = not args.no_fold_output_rotation
+
+    def need(passed: bool, what: str, hint: str) -> None:
+        if not passed:
+            raise PreflightFailed(
+                f"pre-flight failed before loading any weights: {what}\n{plan.report()}\n  hint: {hint}"
+            )
+
+    def dense_decode(backend: str) -> None:
+        selection = select_dense_api(backend, layer, **probe, role="decode")
+        plan.results.extend(selection.results)
+        need(
+            selection.passed,
+            f"no torch_npu attention entry point runs {backend} here",
+            "Ascend 950 accepts only aclnnFusedInferAttentionScoreV5 (torch_npu.npu_fused_infer_attention_score_v2); "
+            "a torch_npu without it cannot run the dense baseline on this SoC.",
+        )
+        plan.dense_apis[backend] = selection.api
+
+    if args.backend in DENSE_BACKENDS:
+        dense_decode(args.backend)
+    else:
+        # prefill_chunk as well as decode: that is batched_decode's prefill path.
+        decode = probe_backend(args.backend, layer, **probe, output_rotation_folded=folded)
+        plan.results.append(decode)
+        need(decode.passed, f"the {args.backend} decode does not run here", "see the error on its line above")
+        if prefill_mode == "dense_staging":
+            staging = dense_backend_for(args.device)
+            selection = select_dense_api(staging, layer, **probe, role="prefill", output_rotation_folded=folded)
+            plan.results.extend(selection.results)
+            if selection.passed:
+                plan.dense_apis["staging"] = selection.api
+            elif args.prefill_mode is None:
+                plan.prefill_mode = "batched_decode"
+                plan.notes.append(
+                    f"the dense_staging prefill ({staging}) does not run here; prefilling through the "
+                    f"{args.backend} decode instead (batched_decode), which passed above"
+                )
+            else:
+                need(
+                    False,
+                    f"--prefill-mode dense_staging, but its unquantised prefill ({staging}) does not run here",
+                    f"--prefill-mode batched_decode prefills through the {args.backend} decode, which passed",
+                )
+
+    reference = args.reference_backend
+    if reference and reference != args.backend:
+        if reference in DENSE_BACKENDS:
+            dense_decode(reference)
+        else:
+            result = probe_backend(reference, layer, **probe, output_rotation_folded=folded)
+            plan.results.append(result)
+            need(result.passed, f"the reference backend {reference} does not run here", "drop --reference-backend")
+    return plan
 
 
 def check_contract(runner: StandaloneModelRunner) -> str:
@@ -342,6 +461,17 @@ def main(argv: list[str] | None = None) -> int:
         args.tokens = 0
     prefill_mode = choose_prefill_mode(args)
 
+    if args.skip_preflight:
+        plan = AttentionPlan(prefill_mode)
+    else:
+        print("=== 0. pre-flight: one synthetic layer through every attention path, no weights ===")
+        started = time.perf_counter()
+        plan = plan_attention(args, config, prefill_mode)
+        print(plan.report())
+        print(f"  {time.perf_counter() - started:.2f} s; prefill {plan.prefill_mode}")
+        print()
+    prefill_mode = plan.prefill_mode
+
     use_chat_template = not args.raw_prompt
     if args.dummy_prompt:
         tokenizer = None
@@ -353,7 +483,7 @@ def main(argv: list[str] | None = None) -> int:
     max_seq_len = max(args.tokens, short_ids.numel()) + args.max_new_tokens + CONTEXT_HEADROOM_TOKENS
 
     print("=== 1. the contract ===")
-    runner = build_runner(args, args.backend, prefill_mode, max_seq_len)
+    runner = build_runner(args, args.backend, prefill_mode, max_seq_len, plan.dense_api_for(args.backend))
     shape = runner.shape
     print(
         f"  {shape.num_layers} layers, {shape.num_heads} heads / {shape.num_kv_heads} kv, D={shape.head_size}, "
@@ -385,7 +515,11 @@ def main(argv: list[str] | None = None) -> int:
         del runner
         _free(args.device)
         reference = build_runner(
-            args, args.reference_backend, reference_mode, short_ids.numel() + args.max_new_tokens + 64
+            args,
+            args.reference_backend,
+            reference_mode,
+            short_ids.numel() + args.max_new_tokens + 64,
+            plan.dense_api_for(args.reference_backend),
         )
         expected, _ = reference.generate(short_ids.to(reference.device), max_new_tokens=args.max_new_tokens)
         expected = stop_at_eos(expected, eos_ids)
@@ -393,7 +527,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {args.reference_backend:20s} {render(tokenizer, expected)}  ({agreed}/{len(expected)} tokens agree)")
         del reference
         _free(args.device)
-        runner = build_runner(args, args.backend, prefill_mode, max_seq_len) if args.tokens else None
+        runner = (
+            build_runner(args, args.backend, prefill_mode, max_seq_len, plan.dense_api_for(args.backend))
+            if args.tokens
+            else None
+        )
 
     if args.tokens:
         print(f"\n=== 3. needle in a haystack at ~{args.tokens} tokens ===")
