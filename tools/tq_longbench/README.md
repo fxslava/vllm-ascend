@@ -209,6 +209,8 @@ tasks.py         LongBench prompts and metrics, and the synthetic NIAH generator
 cpu_reference.py serve the operators from the CPU, for a run with no device
 run_eval.py      the evaluation CLI
 run_benchmark.py NIAH retrieval, TTFT, decode percentiles and HBM across a context ladder
+run_longbench.py the published LongBench tasks across that same ladder
+probe.py         per-layer needle mass, entropy, logit lens and divergence from the dense baseline
 smoke_dense.py   dense GQA end to end, against eager Hugging Face
 smoke_hf.py      a hybrid model through the bridge, against eager Hugging Face
 glm4.py          GLM-4: config.json to shape, fused-tensor splitting, prefill policy
@@ -452,3 +454,78 @@ predates NumPy 2, `transformers`' backend probe is not a slow no-op but an
 
 A record per item is written as it completes (`--out-file`, JSONL), so a ladder
 that dies at 64k still leaves 32k and below on disk.
+
+## LongBench across the ladder (`run_longbench.py`)
+
+The same rungs, but the published tasks rather than the synthetic needle.
+
+```bash
+python tools/tq_longbench/run_longbench.py --model-path /models/glm-4-9b-chat-1m --tasks narrativeqa,qasper,gov_report,multifieldqa_en --contexts 4096,8192,16384,32768,65536 --out-file longbench.jsonl
+```
+
+One line per (backend, task, context): the task's own metric (F1, or ROUGE-L for
+`gov_report`), TTFT, decode P50/P99, KV megabytes and the allocator's peak.
+
+Context scaling on a fixed dataset **is truncation** — a LongBench item is as
+long as it is. Each prompt is cut from the middle, the way the suite itself cuts,
+so the head's instructions and the tail's question both survive and a short rung
+is the same item with less of its middle. That makes the ladder a measure of how
+much of the middle the model needed, which is the question worth asking of a KV
+cache. It also means a rung that truncated is **not comparable to published
+LongBench numbers**, so the `cut` column counts the items it happened to.
+
+The prompt format and the stop set are `smoke_glm`'s, and both are printed
+before the sweep: a task score should not be quietly measuring a missing
+`<|assistant|>` marker or a continuation that ran its whole budget.
+
+## Where a long-context answer broke (`--profile-layers`)
+
+`probe.py` reads four numbers off every layer, for the last token of the prefill
+— the token whose logits choose the answer's first word:
+
+| column | what it says |
+|---|---|
+| `needle_mass` | how much of that token's attention landed on the needle's positions |
+| `attention_entropy` | mean entropy over heads, in nats, against a `ln(context)` ceiling |
+| `target_rank` | logit lens: the layer's state through the *final* norm and the unembedding, and where the expected token ranks |
+| `hidden_cosine` | the layer's output against an fp16 `cann_dense` prefill of the same prompt |
+
+The table ends with `L*`, the layer the run stopped making sense at: the first
+layer whose hidden state left the dense baseline, or — when no baseline was run
+— the steepest fall in needle mass, and it says which of the two it meant.
+
+Only `hidden_cosine` needs two runs. It is also the one that separates "the model
+does this anyway" from "the quantised cache did this", which is usually the
+question.
+
+**Off costs nothing.** The hooks are registered by the probe's context manager
+and removed on the way out, so an unprofiled run has empty hook dicts and torch's
+own fast path skips the machinery. `layers.py` does not know the module exists.
+On, it costs one extra qkv projection and one attention row per layer per chunk.
+
+## Folding `o_proj` (`--fold-site`)
+
+The fold is `W_o -> W_o (I ⊗ Π)`, and Π is a sign flip and a fast
+Walsh-Hadamard transform — `O(D log D)`, not a matmul. Written as a right
+multiply by a `[D, D]` matrix it becomes `O(D²)`, 37× the arithmetic, and runs
+much faster anyway: one `gemm` is a better thing to ask a machine for than seven
+strided float64 passes. At glm-4-9b's geometry (4096 × 4096, 40 layers) on one
+6-thread CPU:
+
+| route | 40 layers | vs the shipped transform |
+|---|---|---|
+| shipped FWHT, float64 | 25.0 s | — |
+| matmul, float64 | 1.85 s | 13.5× faster, bit-identical |
+| matmul, float32 | 1.23 s | 20.4× faster, within one fp16 ulp |
+
+`--fold-site auto` folds on an accelerator, where the weight is going anyway, and
+leaves a CPU run on the shipped transform — not because that is faster there but
+because on a CPU it is the harness's own reference. `--fold-site device` takes
+the speedup there too. The accumulation dtype follows the device: float64 on a
+CPU, float32 on an NPU, which has no fast float64.
+
+float32 is not assumed to be enough. The first layer folded on a device is
+checked with the shipped `validate_output_projection_fold` against the weight it
+came from, so a device whose float32 matmul is quietly *not* float32 fails the
+load rather than folding all 40 layers slightly wrong — a failure with no other
+symptom, since the run would be fluent.

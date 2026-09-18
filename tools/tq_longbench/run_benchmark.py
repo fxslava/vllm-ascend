@@ -412,16 +412,16 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\n=== {backend} ===", file=sys.stderr)
             # The plan is per backend, and is settled at the longest rung: a
             # prefill path refused there is refused everywhere below it too.
-            plan = _plan(args, backend, contexts, glm4)
+            plan = plan_for_backend(args, backend, contexts, glm4)
             if plan.results or plan.notes:
                 print(plan.report(), file=sys.stderr)
             runner = None
             shared_mode = rung_prefill_mode(args, plan, backend, longest, glm4)
             if args.reuse_runner:
-                runner = build_runner(args, backend, shared_mode, _cache_tokens(args, longest), plan)
+                runner = build_runner(args, backend, shared_mode, cache_tokens(args, longest), plan)
             for context in contexts:
                 mode = shared_mode if args.reuse_runner else rung_prefill_mode(args, plan, backend, context, glm4)
-                max_seq_len = _cache_tokens(args, longest if args.reuse_runner else context)
+                max_seq_len = cache_tokens(args, longest if args.reuse_runner else context)
                 print(f"  context {context} ({mode}, cache {max_seq_len})", file=sys.stderr)
                 if not args.reuse_runner:
                     runner = None
@@ -442,12 +442,12 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _cache_tokens(args: argparse.Namespace, context: int) -> int:
+def cache_tokens(args: argparse.Namespace, context: int) -> int:
     """The static cache a rung needs: the prompt, its continuation and room to over-tokenise into."""
     return context + args.max_new_tokens + CONTEXT_HEADROOM_TOKENS
 
 
-def _plan(args: argparse.Namespace, backend: str, contexts: tuple[int, ...], glm4: bool) -> AttentionPlan:
+def plan_for_backend(args: argparse.Namespace, backend: str, contexts: tuple[int, ...], glm4: bool) -> AttentionPlan:
     """Pre-flight this backend once, covering every prefill path the ladder will take.
 
     Probed as ``dense_staging`` when *any* rung would stage, not when the longest

@@ -44,6 +44,7 @@ import contextlib
 import ctypes
 import io
 import json
+import math
 import os
 import sys
 import tempfile
@@ -102,6 +103,12 @@ from tq_longbench.preflight import (  # noqa: E402
     probe_backend,
     select_dense_api,
     select_dense_backend,
+)
+from tq_longbench.probe import (  # noqa: E402
+    DIVERGENCE_COSINE,
+    LayerProbe,
+    cached_keys,
+    needle_slot_positions,
 )
 from tq_longbench.reference import DenseReferenceBackend, TurboQuantReferenceBackend  # noqa: E402
 from tq_longbench.smoke_glm import (  # noqa: E402
@@ -1924,6 +1931,276 @@ class TestFoldSiteEndToEnd(_Glm4TinyCheckpoint):
         )
         with blunt, self.assertRaisesRegex(RuntimeError, "does not reproduce the host fold"):
             self._folded("device")
+
+
+class TestLayerProbe(_Glm4TinyCheckpoint):
+    """The layer-wise diagnostic, on the tiny checkpoint.
+
+    What is under test is that the four columns are read off the run rather than
+    modelled, that a divergence put in on purpose is the layer the table points
+    at, and -- the one that would otherwise rot -- that a run without the probe
+    carries no hooks at all.
+    """
+
+    CONTEXT = 200
+    NEEDLE = slice(40, 46)
+
+    def _prompt(self):
+        ids = torch.randint(0, TINY_GLM["padded_vocab_size"], (self.CONTEXT,), dtype=torch.int64)
+        return ids, needle_slot_positions(ids, ids[self.NEEDLE].clone())
+
+    def _probe(self, backend, ids, slots, reference=None, target=None):
+        path = getattr(self, "_path", None) or self._write("chatglm", TINY_GLM, self.tensors)
+        self._path = path
+        runner = self._runner(path, backend=backend, chunk_size=64, max_seq_len=512)
+        probe = LayerProbe(runner, needle_slots=slots, target_token=target, reference=reference)
+        with probe:
+            runner.prefill(ids, RunMetrics())
+        return runner, probe
+
+    def test_a_run_without_the_probe_carries_no_hooks(self):
+        """Zero overhead is a claim about the hook dict, so that is what is asserted.
+
+        torch skips its whole hook machinery when the dicts are empty, so an
+        unprobed run costs exactly what it did before this module existed. A
+        probe that left a handle behind would make every later run pay for a
+        diagnostic nobody asked for.
+        """
+        ids, slots = self._prompt()
+        runner, probe = self._probe("dense_reference", ids, slots)
+        for layer in runner.model.layers:
+            with self.subTest(module="layer"):
+                self.assertEqual(len(layer._forward_hooks), 0)
+                self.assertEqual(len(layer.self_attn._forward_hooks), 0)
+        self.assertEqual(probe._handles, [])
+
+    def test_the_hooks_exist_only_inside_the_context(self):
+        ids, slots = self._prompt()
+        path = self._write("chatglm", TINY_GLM, self.tensors)
+        self._path = path
+        runner = self._runner(path, backend="dense_reference", chunk_size=64, max_seq_len=512)
+        layer = runner.model.layers[0]
+        self.assertEqual(len(layer._forward_hooks), 0)
+        with LayerProbe(runner, needle_slots=slots):
+            self.assertEqual(len(layer._forward_hooks), 1)
+            self.assertEqual(len(layer.self_attn._forward_hooks), 1)
+        self.assertEqual(len(layer._forward_hooks), 0)
+        self.assertEqual(len(layer.self_attn._forward_hooks), 0)
+
+    def test_every_layer_reports_every_column(self):
+        ids, slots = self._prompt()
+        base_runner, base = self._probe("dense_reference", ids, slots, target=int(ids[-1]))
+        _, test = self._probe("dense_reference", ids, slots, reference=base.hidden, target=int(ids[-1]))
+        report = test.report()
+        self.assertEqual(len(report.readings), TINY_GLM["num_layers"])
+        self.assertEqual(report.context, self.CONTEXT)
+        for reading in report.readings:
+            with self.subTest(layer=reading.layer):
+                self.assertIsNotNone(reading.needle_mass)
+                self.assertIsNotNone(reading.attention_entropy)
+                self.assertIsNotNone(reading.target_rank)
+                self.assertIsNotNone(reading.hidden_cosine)
+                # A probability mass and an entropy inside their own ranges.
+                self.assertGreaterEqual(reading.needle_mass, 0.0)
+                self.assertLessEqual(reading.needle_mass, 1.0)
+                self.assertGreater(reading.attention_entropy, 0.0)
+                self.assertLessEqual(reading.attention_entropy, math.log(self.CONTEXT) + 1e-6)
+        # The same run against itself: every layer identical.
+        self.assertGreater(min(r.hidden_cosine for r in report.readings), 0.999999)
+        self.assertIs(base_runner.model.layers[0].self_attn.shape, base_runner.model.layers[0].self_attn.shape)
+
+    def test_the_table_points_at_a_layer_that_was_made_to_diverge(self):
+        """The assertion with teeth: break one layer and see whether L* finds it.
+
+        A probe that only ever sees healthy runs says nothing about what it would
+        do with a broken one. Layer 1's output projection is scaled hard enough
+        that everything downstream of it leaves the baseline, and L* has to be 1
+        rather than 0 or the last one.
+        """
+        ids, slots = self._prompt()
+        _, base = self._probe("dense_reference", ids, slots)
+
+        path, broken = self._path, 1
+        runner = self._runner(path, backend="dense_reference", chunk_size=64, max_seq_len=512)
+        with torch.no_grad():
+            runner.model.layers[broken].self_attn.o_proj.weight.mul_(50.0)
+        with LayerProbe(runner, needle_slots=slots, reference=base.hidden) as probe:
+            runner.prefill(ids, RunMetrics())
+
+        report = probe.report()
+        self.assertTrue(report.compared)
+        self.assertEqual(report.breakdown_layer(), broken)
+        self.assertGreater(report.readings[0].hidden_cosine, DIVERGENCE_COSINE)
+        self.assertLess(report.readings[broken].hidden_cosine, DIVERGENCE_COSINE)
+        self.assertIn("left the dense baseline", report.describe())
+
+    def test_a_run_with_no_baseline_says_so_rather_than_claiming_divergence(self):
+        ids, slots = self._prompt()
+        _, probe = self._probe("dense_reference", ids, slots)
+        report = probe.report()
+        self.assertFalse(report.compared)
+        self.assertTrue(all(r.hidden_cosine is None for r in report.readings))
+        self.assertIn("No dense baseline was run", report.describe())
+
+    def test_the_quantised_cache_is_read_back_in_the_models_own_basis(self):
+        """A 4-bit pool holds Pi k; the probe has to undo that or measure nonsense.
+
+        Held to the dense pool's own keys: the two differ by the codec and by
+        nothing else, so a missing un-rotation shows up immediately -- Pi scatters
+        a vector across all 128 channels, and the cosine would collapse.
+        """
+        ids, slots = self._prompt()
+        with cpu_turboquant_ops():
+            dense_runner, _ = self._probe("dense_reference", ids, slots)
+            quant_runner, _ = self._probe("turboquant_reference", ids, slots)
+            dense = cached_keys(dense_runner.decode_backend, 0, self.CONTEXT)
+            quantised = cached_keys(quant_runner.decode_backend, 0, self.CONTEXT)
+        self.assertEqual(dense.shape, quantised.shape)
+        self.assertGreater(cosine(quantised, dense), 0.98)
+
+    def test_an_unknown_cache_degrades_rather_than_guessing(self):
+        self.assertIsNone(cached_keys(types.SimpleNamespace(cache=None, shape=None), 0, 8))
+
+
+class TestNeedleSlots(unittest.TestCase):
+    """Finding the needle's positions in the tokenised prompt."""
+
+    def test_every_occurrence_is_found(self):
+        """A haystack built by repetition can carry the answer twice by accident."""
+        prompt = torch.tensor([9, 1, 2, 3, 9, 9, 1, 2, 3, 9], dtype=torch.int64)
+        needle = torch.tensor([1, 2, 3], dtype=torch.int64)
+        self.assertEqual(needle_slot_positions(prompt, needle).tolist(), [1, 2, 3, 6, 7, 8])
+
+    def test_a_needle_that_is_not_there_is_empty_not_wrong(self):
+        prompt = torch.arange(10, dtype=torch.int64)
+        self.assertEqual(needle_slot_positions(prompt, torch.tensor([99, 98])).numel(), 0)
+        self.assertEqual(needle_slot_positions(prompt, torch.empty(0, dtype=torch.int64)).numel(), 0)
+        self.assertEqual(needle_slot_positions(torch.tensor([1]), torch.arange(5)).numel(), 0)
+
+
+class TestRunLongBench(unittest.TestCase):
+    """The LongBench ladder end to end, with the dataset stubbed.
+
+    ``datasets`` is not a harness dependency and downloading LongBench is not a
+    unit test's business, so ``load_longbench`` is replaced with items built from
+    the suite's own prompt templates. What is under test is the sweep -- tasks
+    times rungs, one runner per rung, the record and the table -- not the corpus.
+    """
+
+    TASKS = ("narrativeqa", "gov_report")
+    CONTEXTS = (128, 256)
+    ITEMS = 2
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.model_path = self.root / "chatglm"
+        self.model_path.mkdir()
+        (self.model_path / "config.json").write_text(json.dumps(TINY_GLM), encoding="utf-8")
+        from safetensors.torch import save_file
+
+        save_file(
+            {key: value.contiguous() for key, value in _chatglm_checkpoint(TINY_GLM).items()},
+            str(self.model_path / "model.safetensors"),
+        )
+
+    def _items(self, task, limit=None):
+        from tq_longbench.tasks import _TASK_METRICS, LONGBENCH_MAX_NEW_TOKENS, LONGBENCH_PROMPTS, EvalItem
+
+        for index in range(limit or self.ITEMS):
+            yield EvalItem(
+                prompt=LONGBENCH_PROMPTS[task].format(context="alpha beta gamma delta " * 20, input="what?"),
+                answers=["alpha beta"],
+                metric=_TASK_METRICS[task],
+                max_new_tokens=LONGBENCH_MAX_NEW_TOKENS[task],
+                extra={"task": task, "index": index},
+            )
+
+    def _run(self, *extra):
+        from tq_longbench import run_longbench
+
+        out_file = self.root / "longbench.jsonl"
+        argv = [
+            "--model-path", str(self.model_path),
+            "--device", "cpu",
+            "--backends", "dense_reference",
+            "--tasks", ",".join(self.TASKS),
+            "--contexts", ",".join(str(c) for c in self.CONTEXTS),
+            "--limit", str(self.ITEMS),
+            "--max-new-tokens", "3",
+            "--dtype", "float32",
+            "--chunk-size", "32",
+            "--out-file", str(out_file),
+            *extra,
+        ]  # fmt: skip
+        with (
+            mock.patch.object(run_longbench, "load_tokenizer", return_value=_ByteTokenizer()),
+            mock.patch.object(run_longbench, "load_longbench", self._items),
+            contextlib.redirect_stdout(io.StringIO()) as out,
+            contextlib.redirect_stderr(io.StringIO()) as err,
+        ):
+            self.assertEqual(run_longbench.main(argv), 0)
+        records = [json.loads(line) for line in out_file.read_text(encoding="utf-8").splitlines()]
+        return records, out.getvalue(), err.getvalue()
+
+    def test_every_task_at_every_rung_leaves_its_items(self):
+        records, _, _ = self._run()
+        self.assertEqual(len(records), len(self.TASKS) * len(self.CONTEXTS) * self.ITEMS)
+        seen = {(r["context_requested"], r["task"]) for r in records}
+        self.assertEqual(seen, {(c, t) for c in self.CONTEXTS for t in self.TASKS})
+
+    def test_each_record_carries_the_score_and_the_cost(self):
+        records, _, _ = self._run()
+        for record in records:
+            with self.subTest(task=record["task"], context=record["context_requested"]):
+                self.assertEqual(record["metric"], "rouge_l" if record["task"] == "gov_report" else "f1")
+                self.assertGreaterEqual(record["score"], 0.0)
+                self.assertLessEqual(record["score"], 1.0)
+                for key in ("ttft_ms", "decode_p50_us", "decode_p99_us", "kv_cache_mb", "device_peak_mb"):
+                    self.assertIn(key, record)
+                # These prompts are far longer than the rungs, so every one was cut.
+                self.assertEqual(record["truncated"], 1)
+                self.assertGreater(record["untruncated_tokens"], record["prompt_tokens"])
+
+    def test_a_rungs_cache_is_sized_for_the_rung(self):
+        """One runner per rung, so the memory column describes the rung and not the ladder."""
+        records, _, _ = self._run()
+        held = {}
+        for record in records:
+            held.setdefault(record["context_requested"], record["kv_cache_mb"])
+        self.assertLess(held[self.CONTEXTS[0]], held[self.CONTEXTS[1]])
+
+    def test_the_table_has_a_line_per_task_and_rung(self):
+        _, printed, _ = self._run()
+        lines = [line for line in printed.splitlines() if line.startswith("dense_reference")]
+        self.assertEqual(len(lines), len(self.TASKS) * len(self.CONTEXTS))
+        self.assertIn("cut counts items whose middle was truncated", printed)
+
+    def test_the_prompt_route_and_stop_set_are_reported(self):
+        """The same two lines smoke_glm prints: a score must not be measuring a missing marker."""
+        _, _, logged = self._run()
+        self.assertIn("GLM-4 turn markers", logged)
+        self.assertIn("stop ids: [", logged)
+
+    def test_profile_layers_prints_the_table_and_is_off_by_default(self):
+        _, _, quiet = self._run()
+        self.assertNotIn("layer probe", quiet)
+        _, _, loud = self._run("--profile-layers")
+        self.assertIn("layer probe", loud)
+        self.assertIn("hidden_cos", loud)
+        # One probe per (rung, task), on the first item only.
+        self.assertEqual(loud.count("layer probe"), len(self.TASKS) * len(self.CONTEXTS))
+
+    def test_an_unknown_task_is_refused_by_name(self):
+        from tq_longbench.run_longbench import parse_tasks
+
+        self.assertEqual(parse_tasks("longbench_qasper,gov_report"), ("qasper", "gov_report"))
+        with self.assertRaisesRegex(ValueError, "no prompt template"):
+            parse_tasks("narrativeqa,not_a_task")
+        with self.assertRaisesRegex(ValueError, "no prompt template"):
+            parse_tasks("")
 
 
 class TestGlm4LegacyTokenizer(unittest.TestCase):

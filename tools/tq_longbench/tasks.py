@@ -74,6 +74,10 @@ LONGBENCH_PROMPTS = {
         "Now, answer the following question based on the above text, only give me the answer and do "
         "not output any other words.\n\nQuestion: {input}\nAnswer:"
     ),
+    "gov_report": (
+        "You are given a report by a government agency. Write a one-page summary of the report.\n\n"
+        "Report:\n{context}\n\nNow, write a one-page summary of all the report.\n\nSummary:"
+    ),
 }
 
 #: LongBench's own per-task generation budgets.
@@ -83,6 +87,7 @@ LONGBENCH_MAX_NEW_TOKENS = {
     "hotpotqa": 32,
     "2wikimqa": 32,
     "multifieldqa_en": 64,
+    "gov_report": 512,
 }
 
 NIAH_TASK = "niah"
@@ -198,6 +203,9 @@ _TASK_METRICS = {
     "hotpotqa": "f1",
     "2wikimqa": "f1",
     "multifieldqa_en": "f1",
+    # A summarisation task, so overlap of the longest common subsequence rather
+    # than of the bag of tokens: gov_report's references are paragraphs.
+    "gov_report": "rouge_l",
 }
 
 
