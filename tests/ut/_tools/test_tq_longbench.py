@@ -44,8 +44,10 @@ import io
 import json
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import torch
 
@@ -823,6 +825,31 @@ class TestHuggingFaceBridge(unittest.TestCase):
     def test_installing_twice_is_refused(self):
         bridge = self.bridge_cls(self.model, "turboquant_reference", max_seq_len=512, block_size=BLOCK_SIZE)
         with bridge, self.assertRaisesRegex(RuntimeError, "already installed"):
+            bridge.install()
+        self.assertEqual(self.model.config._attn_implementation, "sdpa")
+
+    @staticmethod
+    def _legacy_transformers(registry: dict | None):
+        """``transformers`` as an older release has it: no ``AttentionInterface`` anywhere."""
+        package = types.ModuleType("transformers")
+        package.__version__ = "4.48.0"
+        modeling_utils = types.ModuleType("transformers.modeling_utils")
+        if registry is not None:
+            modeling_utils.ALL_ATTENTION_FUNCTIONS = registry
+        package.modeling_utils = modeling_utils
+        return mock.patch.dict(sys.modules, {"transformers": package, "transformers.modeling_utils": modeling_utils})
+
+    def test_an_older_transformers_registers_through_the_dict(self):
+        registry: dict = {}
+        bridge = self.bridge_cls(self.model, "turboquant_reference", max_seq_len=512, block_size=BLOCK_SIZE)
+        with self._legacy_transformers(registry), bridge:
+            self.assertEqual(registry, {bridge._name: bridge._attention})
+            self.assertEqual(self.model.config._attn_implementation, bridge._name)
+        self.assertEqual(self.model.config._attn_implementation, "sdpa")
+
+    def test_a_transformers_with_no_registry_is_refused_at_install(self):
+        bridge = self.bridge_cls(self.model, "turboquant_reference", max_seq_len=512, block_size=BLOCK_SIZE)
+        with self._legacy_transformers(None), self.assertRaisesRegex(RuntimeError, "no attention registry"):
             bridge.install()
         self.assertEqual(self.model.config._attn_implementation, "sdpa")
 

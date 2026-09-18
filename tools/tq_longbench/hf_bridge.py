@@ -130,12 +130,10 @@ class TurboQuantAttentionBridge:
         intercepting, and the next measurement compares the backend against
         itself.
         """
-        from transformers import AttentionInterface
-
         if self._installed:
             raise RuntimeError("this bridge is already installed; uninstall it before installing again")
 
-        AttentionInterface.register(self._name, self._attention)
+        _register_attention(self._name, self._attention)
         original: dict[int, tuple[object, str]] = {}
         for module in self.attentions.values():
             config = module.config
@@ -230,6 +228,39 @@ class TurboQuantAttentionBridge:
         # The layer applies sigmoid(gate) to what it gets back, so this must be
         # ungated. See the module docstring.
         return out.unsqueeze(0), None
+
+
+def _register_attention(name: str, function) -> None:
+    """Add ``function`` to ``transformers``' attention registry under ``name``.
+
+    ``AttentionInterface`` is recent; the older ``transformers`` on the NPU host
+    does not export it, and there ``ALL_ATTENTION_FUNCTIONS`` is a plain dict
+    that the models index by ``config._attn_implementation`` -- so an entry in
+    it is the same registration. A release with neither dispatches attention
+    through per-model classes, where there is no seam to register into; that
+    is refused here, when the bridge is installed, rather than at import.
+    """
+    try:
+        from transformers import AttentionInterface
+    except ImportError:
+        try:
+            from transformers.modeling_utils import AttentionInterface
+        except ImportError:
+            AttentionInterface = object
+
+    if hasattr(AttentionInterface, "register"):
+        AttentionInterface.register(name, function)
+        return
+    try:
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    except ImportError:
+        import transformers
+
+        raise RuntimeError(
+            f"transformers {transformers.__version__} has neither AttentionInterface nor ALL_ATTENTION_FUNCTIONS, "
+            "so there is no attention registry for the bridge to install into"
+        ) from None
+    ALL_ATTENTION_FUNCTIONS[name] = function
 
 
 def discover_full_attention_layers(model: torch.nn.Module) -> dict[int, torch.nn.Module]:
