@@ -40,14 +40,23 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
 
+from tq_longbench import glm4
 from tq_longbench._ascend import assert_no_vllm_imported
 from tq_longbench.kv_cache import CacheGeometry, dense_equivalent_bytes
-from tq_longbench.layers import CausalLM, ForwardBatch, ModelShape, fold_output_rotation
+from tq_longbench.layers import (
+    CausalLM,
+    ForwardBatch,
+    ModelShape,
+    fold_output_projection_weight,
+    fold_output_rotation,
+    require_foldable,
+)
 from tq_longbench.ops import (
     DENSE_BACKENDS,
     AttentionBackend,
@@ -65,6 +74,11 @@ DEFAULT_CHUNK_SIZE = 2048
 DENSE_STAGING_RECOMMENDED_MAX_SEQ = 32768
 
 _MEGABYTE = 1024 * 1024
+
+_O_PROJ_WEIGHT_SUFFIX = "self_attn.o_proj.weight"
+
+#: ``(checkpoint name, tensor) -> [(harness parameter, tensor), ...]``; empty to skip.
+CheckpointMapper = Callable[[str, torch.Tensor], list[tuple[str, torch.Tensor]]]
 
 
 @dataclass
@@ -169,8 +183,14 @@ class StandaloneModelRunner:
         # backend already is it. Which unquantised backend that is follows the
         # device, not --backend: a CUDA run stages through torch.
         if config.prefill_mode == "dense_staging" and config.backend not in DENSE_BACKENDS:
+            # Folded like the decode: its output feeds the same o_proj.
             self.prefill_backend: AttentionBackend = build_backend(
-                dense_backend_for(self.device), self.geometry, layer_shape, self.device, config.dtype
+                dense_backend_for(self.device),
+                self.geometry,
+                layer_shape,
+                self.device,
+                config.dtype,
+                config.fold_output_rotation,
             )
         else:
             self.prefill_backend = self.decode_backend
@@ -186,9 +206,12 @@ class StandaloneModelRunner:
 
         self.model = CausalLM(self.shape, config.max_seq_len, config.dtype, self.device)
         self.model.eval()
-        if not config.random_weights:
-            self.load_weights()
         if config.fold_output_rotation:
+            require_foldable(self.shape)
+        if not config.random_weights:
+            # Folds each o_proj as its shard tensor is ingested.
+            self.load_weights()
+        elif config.fold_output_rotation:
             fold_output_rotation(self.model)
 
     # ---------------------------------------------------------------- config
@@ -201,8 +224,30 @@ class StandaloneModelRunner:
 
         return AutoConfig.from_pretrained(self.config.model_path, trust_remote_code=True)
 
+    def _raw_config(self) -> dict:
+        return glm4.read_config(self.config.model_path)
+
+    def _is_glm4(self) -> bool:
+        return not self.config.random_weights and glm4.is_glm4_config(self._raw_config())
+
     def _load_shape(self) -> ModelShape:
+        if self._is_glm4():
+            # Read off config.json directly: the chatglm config class is remote
+            # code, and nothing it computes is needed that the JSON does not say.
+            return glm4.glm4_model_shape(self._raw_config(), self.config.attn_output_gate)
         return ModelShape.from_hf_config(self._hf_config(), self.config.attn_output_gate, **self._checkpoint_features())
+
+    def _checkpoint_mapper(self) -> CheckpointMapper:
+        """How this checkpoint's tensor names land on the harness's modules."""
+        if self._is_glm4():
+            shape = self.shape
+            return lambda name, tensor: glm4.glm4_checkpoint_targets(name, tensor, shape)
+
+        def one_to_one(name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+            target = _map_checkpoint_name(name)
+            return [] if target is None else [(target, tensor)]
+
+        return one_to_one
 
     def _tensor_names(self) -> list[str]:
         """Every tensor name in the checkpoint, read from the index or the shard headers.
@@ -251,6 +296,10 @@ class StandaloneModelRunner:
         is that no framework sits between the checkpoint and the kernels, and a
         loader that instantiates an HF model first would allocate the weights
         twice on a device that has no room for it.
+
+        With ``fold_output_rotation`` every ``o_proj`` is folded to
+        ``W_o (I (x) Pi)`` here, on the host tensor, before it reaches the
+        device -- see :func:`~tq_longbench.layers.fold_output_projection_weight`.
         """
         from safetensors.torch import load_file
 
@@ -266,25 +315,29 @@ class StandaloneModelRunner:
             raise FileNotFoundError(f"no safetensors shards under {root}")
 
         destinations = dict(self.model.named_parameters())
+        mapper = self._checkpoint_mapper()
+        fold = self.config.fold_output_rotation
         filled: set[str] = set()
+        folded = 0
         for shard in shards:
             # One shard resident at a time: a 128k-context run has no headroom
             # for the whole checkpoint in host memory alongside the pools.
             for name, tensor in load_file(str(shard)).items():
-                target = _map_checkpoint_name(name)
-                if target is None:
-                    continue
-                parameter = destinations.get(target)
-                if parameter is None:
-                    raise KeyError(f"{name} maps to {target}, which this harness's module tree does not have")
-                if tuple(parameter.shape) != tuple(tensor.shape):
-                    raise ValueError(
-                        f"{name} is {tuple(tensor.shape)} in the checkpoint but {tuple(parameter.shape)} in the "
-                        f"harness. If this is a gated model, pass --attn-output-gate."
-                    )
-                with torch.no_grad():
-                    parameter.copy_(tensor.to(device=self.device, dtype=parameter.dtype))
-                filled.add(target)
+                for target, piece in mapper(name, tensor):
+                    parameter = destinations.get(target)
+                    if parameter is None:
+                        raise KeyError(f"{name} maps to {target}, which this harness's module tree does not have")
+                    if tuple(parameter.shape) != tuple(piece.shape):
+                        raise ValueError(
+                            f"{name} is {tuple(piece.shape)} in the checkpoint but {tuple(parameter.shape)} in the "
+                            f"harness. If this is a gated model, pass --attn-output-gate."
+                        )
+                    if fold and target.endswith(_O_PROJ_WEIGHT_SUFFIX):
+                        piece = fold_output_projection_weight(piece, self.shape.head_size)
+                        folded += 1
+                    with torch.no_grad():
+                        parameter.copy_(piece.to(device=self.device, dtype=parameter.dtype))
+                    filled.add(target)
 
         unfilled = sorted(set(destinations) - filled)
         if self.shape.tie_word_embeddings:
@@ -294,6 +347,10 @@ class StandaloneModelRunner:
                 f"{len(unfilled)} parameters were never filled from the checkpoint, starting with {unfilled[:4]}. "
                 "Running with them at their initial values would produce fluent nonsense rather than an error."
             )
+        if fold and folded != self.shape.num_layers:
+            # A layer the decode treats as folded but whose o_proj was not would
+            # hand the rotated basis to a projection that does not undo it.
+            raise RuntimeError(f"folded {folded} o_proj weights for {self.shape.num_layers} layers")
         return len(filled)
 
     # ---------------------------------------------------------------- memory

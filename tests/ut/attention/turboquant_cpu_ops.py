@@ -35,6 +35,8 @@ only check that nothing raised. :func:`cpu_fused_infer_attention_score` is the m
 stand-in for the dense prefill.
 """
 
+from __future__ import annotations
+
 import contextlib
 import functools
 from collections.abc import Iterator, Sequence

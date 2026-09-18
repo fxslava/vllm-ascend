@@ -36,9 +36,14 @@ Two details are TurboQuant's rather than Qwen3's:
   and doing it here as well would square the sigmoid.
 * **The folded ``o_proj``.** With ``Pi`` folded into the projection
   (``W_o (I (x) Pi)``) the decode leaves its output rotated and the projection
-  un-rotates it for free.  The fold is applied to the weight at load time by
+  un-rotates it for free.  The fold is applied to each checkpoint tensor as it
+  is ingested (:func:`fold_output_projection_weight`), or to random weights by
   :func:`fold_output_rotation`; a gated layer cannot use it, because the gate
   sits between attention and ``o_proj`` where the output is still rotated.
+
+GLM-4 fits the same stack: its fused ``query_key_value`` and ``dense_h_to_4h``
+are split into these modules at load time (:mod:`tq_longbench.glm4`), and its
+half-width interleaved RoPE is a :class:`RotaryEmbedding` variant.
 """
 
 from __future__ import annotations
@@ -72,6 +77,17 @@ class ModelShape:
     qk_norm: bool = True
     #: Qwen2 carries q/k/v biases without an ``attention_bias`` key to say so.
     qkv_bias: bool = False
+    #: Leading channels of each head that RoPE rotates; ``None`` rotates all of
+    #: them. GLM-4 rotates the first half and passes the second half through.
+    rotary_dim: int | None = None
+    #: Rotate adjacent pairs ``(2i, 2i+1)`` -- ChatGLM / GLM-4 -- rather than the
+    #: NeoX halves ``(i, i + d/2)`` Qwen uses. Same frequencies, different
+    #: channels: pairing them the wrong way does not raise, it scrambles position.
+    rope_interleaved: bool = False
+
+    def __post_init__(self) -> None:
+        if self.rotary_dim is not None and not (0 < self.rotary_dim <= self.head_size and self.rotary_dim % 2 == 0):
+            raise ValueError(f"rotary_dim {self.rotary_dim} must be even and within head_size {self.head_size}")
 
     @classmethod
     def from_hf_config(cls, config, attn_output_gate: bool, **detected) -> ModelShape:
@@ -156,15 +172,33 @@ class RotaryEmbedding:
     Built once for ``max_seq_len`` rather than per step: at 128k this is two
     ``max_seq_len x head_size`` tables, and recomputing them inside the decode
     would put a transcendental sweep on the critical path of every token.
+
+    Two variants beyond Qwen's full-width NeoX rotation, both GLM-4's:
+    ``rotary_dim`` rotates only the leading channels (the frequencies are those
+    of a ``rotary_dim``-wide head, as ChatGLM's ``RotaryEmbedding(kv_channels // 2)``
+    and HF ``GlmRotaryEmbedding`` both compute them), and ``interleaved`` pairs
+    channel ``2i`` with ``2i+1`` instead of ``i`` with ``i + rotary_dim / 2``.
     """
 
     def __init__(
-        self, head_size: int, max_seq_len: int, theta: float, dtype: torch.dtype, device: torch.device
+        self,
+        head_size: int,
+        max_seq_len: int,
+        theta: float,
+        dtype: torch.dtype,
+        device: torch.device,
+        rotary_dim: int | None = None,
+        interleaved: bool = False,
     ) -> None:
-        inv_freq = 1.0 / (theta ** (torch.arange(0, head_size, 2, dtype=torch.float32, device=device) / head_size))
+        span = head_size if rotary_dim is None else rotary_dim
+        if not (0 < span <= head_size and span % 2 == 0):
+            raise ValueError(f"rotary_dim {span} must be even and within head_size {head_size}")
+        self.rotary_dim = span
+        self.interleaved = interleaved
+        inv_freq = 1.0 / (theta ** (torch.arange(0, span, 2, dtype=torch.float32, device=device) / span))
         positions = torch.arange(max_seq_len, dtype=torch.float32, device=device)
         angles = torch.outer(positions, inv_freq)
-        emb = torch.cat((angles, angles), dim=-1)
+        emb = angles.repeat_interleave(2, dim=-1) if interleaved else torch.cat((angles, angles), dim=-1)
         self.cos = emb.cos().to(dtype)
         self.sin = emb.sin().to(dtype)
 
@@ -173,11 +207,20 @@ class RotaryEmbedding:
         half = x.shape[-1] // 2
         return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
 
+    @staticmethod
+    def _rotate_pairs(x: torch.Tensor) -> torch.Tensor:
+        """``(x0, x1, x2, x3, ...) -> (-x1, x0, -x3, x2, ...)``: the interleaved quarter turn."""
+        return torch.stack((-x[..., 1::2], x[..., 0::2]), dim=-1).flatten(-2)
+
     def apply(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Rotate ``[num_tokens, num_heads, head_size]`` in place of its own basis."""
         cos = self.cos[positions].unsqueeze(1)
         sin = self.sin[positions].unsqueeze(1)
-        return x * cos + self._rotate_half(x) * sin
+        turn = self._rotate_pairs if self.interleaved else self._rotate_half
+        if self.rotary_dim == x.shape[-1]:
+            return x * cos + turn(x) * sin
+        rotated, passed = x[..., : self.rotary_dim], x[..., self.rotary_dim :]
+        return torch.cat((rotated * cos + turn(rotated) * sin, passed), dim=-1)
 
 
 class Attention(torch.nn.Module):
@@ -324,7 +367,15 @@ class CausalLM(torch.nn.Module):
         self.lm_head = torch.nn.Linear(shape.hidden_size, shape.vocab_size, bias=False, dtype=dtype, device=device)
         if shape.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
-        self.rope = RotaryEmbedding(shape.head_size, max_seq_len, shape.rope_theta, dtype, device)
+        self.rope = RotaryEmbedding(
+            shape.head_size,
+            max_seq_len,
+            shape.rope_theta,
+            dtype,
+            device,
+            rotary_dim=shape.rotary_dim,
+            interleaved=shape.rope_interleaved,
+        )
 
     def forward(
         self,
@@ -344,20 +395,43 @@ class CausalLM(torch.nn.Module):
         return self.lm_head(self.norm(hidden))
 
 
-def fold_output_rotation(model: CausalLM) -> int:
-    """Rewrite every ``o_proj`` to ``W_o (I (x) Pi)`` and report how many were folded.
+def require_foldable(shape: ModelShape) -> None:
+    """Refuse a fold the model cannot take, before any weight is touched.
 
-    With the fold in place the decode's ``ROTATED_BASIS`` output stage is what
-    ``o_proj`` wants, so nothing un-rotates at runtime.  A gated layer is
-    refused rather than skipped: silently leaving it unfolded while the decode
-    was told the layer is folded would return the rotated basis to a projection
-    that does not undo it.
+    A gated layer is refused rather than skipped: silently leaving it unfolded
+    while the decode was told the layer is folded would return the rotated basis
+    to a projection that does not undo it.
     """
-    if model.shape.attn_output_gate:
+    if shape.attn_output_gate:
         raise ValueError(
             "a layer with an attn_output_gate cannot fold Pi into o_proj: the gate sits between attention and "
             "o_proj, where the output is still rotated"
         )
+
+
+def fold_output_projection_weight(weight: torch.Tensor, head_size: int) -> torch.Tensor:
+    """``W_o (I (x) Pi)`` for one checkpoint tensor, folded where it was loaded.
+
+    This is the ingestion-time fold: the shard tensor is still on the host in
+    the checkpoint's own dtype, so the arithmetic runs in float64 there and the
+    result is rounded once, into float32, before the copy onto the device casts
+    it to the run's dtype. Folding after the load instead would round bf16 to
+    fp16 first and then round the rotated values again -- and would ask the NPU
+    for float64, which it does not do well.
+    """
+    fold = turboquant_rotation().fold_pi_into_output_projection
+    return fold(weight.to(device="cpu", dtype=torch.float32), head_size)
+
+
+def fold_output_rotation(model: CausalLM) -> int:
+    """Rewrite every ``o_proj`` to ``W_o (I (x) Pi)`` and report how many were folded.
+
+    With the fold in place the decode's ``ROTATED_BASIS`` output stage is what
+    ``o_proj`` wants, so nothing un-rotates at runtime.  A checkpoint run folds
+    at ingestion instead (:func:`fold_output_projection_weight`); this is for
+    weights that never came from one.
+    """
+    require_foldable(model.shape)
     fold = turboquant_rotation().fold_pi_into_output_projection
     folded = 0
     for layer in model.layers:

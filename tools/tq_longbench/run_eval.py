@@ -65,6 +65,7 @@ from tq_longbench.engine import (  # noqa: E402
     RunnerConfig,
     StandaloneModelRunner,
 )
+from tq_longbench.glm4 import glm4_prefill_mode, is_glm4_checkpoint  # noqa: E402
 from tq_longbench.ops import DENSE_BACKENDS, backend_names, reference_equivalent  # noqa: E402
 from tq_longbench.tasks import NIAH_TASK, EvalItem, load_longbench, niah_sweep, score  # noqa: E402
 
@@ -142,13 +143,16 @@ def default_backend(device: torch.device) -> str:
     return "turboquant_cube" if device.type == "npu" else reference_equivalent("turboquant_cube")
 
 
-def default_prefill_mode(max_seq_len: int, backend: str) -> str:
+def default_prefill_mode(max_seq_len: int, backend: str, glm4_checkpoint: bool = False) -> str:
     """dense_staging while the fp16 pool is affordable, batched_decode past it.
 
     The threshold is about HBM, not accuracy: dense_staging gives the exact
     prefill and is what the NIAH alignment check wants, so it is preferred right
-    up to the point where the unquantised pool stops fitting.
+    up to the point where the unquantised pool stops fitting. A GLM-4 checkpoint
+    switches at 32768 itself rather than above it (:func:`glm4_prefill_mode`).
     """
+    if glm4_checkpoint:
+        return glm4_prefill_mode(max_seq_len, backend)
     if backend in DENSE_BACKENDS:
         return "dense_staging"
     return "dense_staging" if max_seq_len <= DENSE_STAGING_RECOMMENDED_MAX_SEQ else "batched_decode"
@@ -169,7 +173,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     device = torch.device(args.device or default_device())
     backend = args.backend or default_backend(device)
-    prefill_mode = args.prefill_mode or default_prefill_mode(args.max_seq_len, backend)
+    prefill_mode = args.prefill_mode or default_prefill_mode(
+        args.max_seq_len, backend, glm4_checkpoint=is_glm4_checkpoint(args.model_path)
+    )
 
     config = RunnerConfig(
         model_path=args.model_path,

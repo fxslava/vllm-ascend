@@ -30,6 +30,7 @@ __all__ = [
     "cpu_reference",
     "diagnose",
     "engine",
+    "glm4",
     "hf_bridge",
     "kv_cache",
     "layers",
@@ -37,6 +38,7 @@ __all__ = [
     "reference",
     "run_eval",
     "smoke_dense",
+    "smoke_glm",
     "smoke_hf",
     "tasks",
 ]

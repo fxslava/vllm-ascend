@@ -104,11 +104,29 @@ class AttentionBackend(abc.ABC):
     #: Whether :meth:`decode` applies ``sigmoid(gate)`` itself. When False the
     #: caller multiplies in torch, so a gated layer is correct either way.
     fuses_output_gate: bool = False
+    #: Whether the ``o_proj`` this backend feeds has Pi folded into it, so the
+    #: attention output must leave in the rotated basis, ``O Pi``.
+    output_rotation_folded: bool = False
 
     def __init__(self, geometry: CacheGeometry, shape: LayerShape, device: torch.device) -> None:
         self.geometry = geometry
         self.shape = shape
         self.device = device
+
+    def _into_folded_basis(self, out: torch.Tensor) -> torch.Tensor:
+        """Rotate an unquantised attention output by Pi when the projection expects that.
+
+        A dense backend attends in the model's own basis, so behind a folded
+        ``o_proj`` its output must be rotated before the projection un-rotates
+        it. This is ``dense_staging``'s prefill whenever the decode is folded:
+        skipping it would feed every prefill token's attention through the wrong
+        basis, and nothing downstream would raise.
+        """
+        if self.output_rotation_folded:
+            rotation = turboquant_rotation()
+            signs = rotation.turboquant_pi_signs(self.shape.head_size, out.device)
+            out.copy_(rotation.apply_pi(out.to(torch.float32), signs).to(out.dtype))
+        return out
 
     @abc.abstractmethod
     def write_kv(self, layer: int, key: torch.Tensor, value: torch.Tensor, slots: torch.Tensor) -> None:
@@ -178,10 +196,18 @@ class NativeV5Backend(AttentionBackend):
 
     name = "native_v5"
 
-    def __init__(self, geometry: CacheGeometry, shape: LayerShape, device: torch.device, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        geometry: CacheGeometry,
+        shape: LayerShape,
+        device: torch.device,
+        dtype: torch.dtype,
+        output_rotation_folded: bool = False,
+    ) -> None:
         super().__init__(geometry, shape, device)
         self.cache = DenseKVCache(geometry, device, dtype)
         self.dtype = dtype
+        self.output_rotation_folded = output_rotation_folded
 
     def write_kv(self, layer: int, key: torch.Tensor, value: torch.Tensor, slots: torch.Tensor) -> None:
         self.cache.write(layer, key, value, slots)
@@ -215,7 +241,7 @@ class NativeV5Backend(AttentionBackend):
         out.copy_(attn_output.view_as(out))
         if gate is not None:
             out.mul_(torch.sigmoid(gate).view_as(out))
-        return out
+        return self._into_folded_basis(out)
 
     def prefill_chunk(
         self,
@@ -257,7 +283,7 @@ class NativeV5Backend(AttentionBackend):
         out.copy_(attn_output.view_as(out))
         if gate is not None:
             out.mul_(torch.sigmoid(gate).view_as(out))
-        return out
+        return self._into_folded_basis(out)
 
 
 class _TurboQuantBackend(AttentionBackend):
@@ -539,7 +565,7 @@ def build_backend(
 
     if name in REFERENCE_BACKENDS:
         if name == "dense_reference":
-            return REFERENCE_BACKENDS[name](geometry, shape, device, dtype)
+            return REFERENCE_BACKENDS[name](geometry, shape, device, dtype, output_rotation_folded)
         return REFERENCE_BACKENDS[name](geometry, shape, device, output_rotation_folded=output_rotation_folded)
 
     if name not in ASCEND_BACKENDS:
@@ -557,7 +583,7 @@ def build_backend(
             "(correctness only -- it says nothing about latency)."
         )
     if name == NativeV5Backend.name:
-        return NativeV5Backend(geometry, shape, device, dtype)
+        return NativeV5Backend(geometry, shape, device, dtype, output_rotation_folded)
     return ASCEND_BACKENDS[name](geometry, shape, device, output_rotation_folded=output_rotation_folded)
 
 

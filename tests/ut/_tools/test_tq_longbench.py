@@ -37,7 +37,13 @@ Runs under pytest in CI and under ``python -m unittest`` anywhere, because it
 imports neither ``tests.ut.base`` (which reaches vLLM) nor pytest itself.
 """
 
+import __future__
+
+import contextlib
+import io
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -52,9 +58,16 @@ if str(REPO_ROOT / "tools") not in sys.path:
 
 from tq_longbench._ascend import assert_no_vllm_imported, turboquant_layout, turboquant_rotation  # noqa: E402
 from tq_longbench.cpu_reference import cpu_turboquant_ops  # noqa: E402
-from tq_longbench.engine import RunnerConfig, StandaloneModelRunner  # noqa: E402
+from tq_longbench.engine import RunMetrics, RunnerConfig, StandaloneModelRunner  # noqa: E402
+from tq_longbench.glm4 import (  # noqa: E402
+    GLM4_BATCHED_DECODE_MIN_TOKENS,
+    glm4_checkpoint_targets,
+    glm4_model_shape,
+    glm4_prefill_mode,
+    is_glm4_config,
+)
 from tq_longbench.kv_cache import CacheGeometry, DenseKVCache, TurboQuantKVCache, dense_equivalent_bytes  # noqa: E402
-from tq_longbench.layers import ModelShape  # noqa: E402
+from tq_longbench.layers import ModelShape, RotaryEmbedding  # noqa: E402
 from tq_longbench.ops import LayerShape, TurboQuantAivBackend, TurboQuantCubeBackend, build_backend  # noqa: E402
 from tq_longbench.reference import DenseReferenceBackend, TurboQuantReferenceBackend  # noqa: E402
 from tq_longbench.tasks import f1_score, needle_in_a_haystack, rouge_l, score  # noqa: E402
@@ -847,6 +860,425 @@ class TestHuggingFaceBridge(unittest.TestCase):
                 None,
                 scaling=module.scaling,
             )
+
+
+class TestPython39Compatibility(unittest.TestCase):
+    """The NPU host runs Python 3.9, where ``torch.Tensor | None`` in a signature is a TypeError.
+
+    Postponed evaluation (PEP 563) is what makes those annotations legal there,
+    so the compiled flag is asserted rather than the source text.
+    """
+
+    MODULES = (
+        "vllm_ascend/attention/turboquant_rotation.py",
+        "vllm_ascend/attention/turboquant_layout.py",
+        "tests/ut/attention/turboquant_cpu_ops.py",
+        *sorted(path.relative_to(REPO_ROOT).as_posix() for path in (REPO_ROOT / "tools" / "tq_longbench").glob("*.py")),
+    )
+
+    def test_every_harness_module_postpones_its_annotations(self):
+        flag = __future__.annotations.compiler_flag
+        for relative in self.MODULES:
+            with self.subTest(module=relative):
+                path = REPO_ROOT / relative
+                source = path.read_text(encoding="utf-8")
+                if "| None" not in source:
+                    continue
+                code = compile(source, str(path), "exec", dont_inherit=True)
+                self.assertTrue(code.co_flags & flag, f"{relative} uses PEP 604 unions without postponed annotations")
+
+
+# glm-4-9b-chat-1m's config.json as published, fetched 2026-09-18. Its
+# multi_query_group_num is 4; glm-4-9b-chat's is 2.
+GLM4_9B_CHAT_1M_CONFIG = {
+    "model_type": "chatglm",
+    "add_bias_linear": False,
+    "add_qkv_bias": True,
+    "apply_residual_connection_post_layernorm": False,
+    "ffn_hidden_size": 13696,
+    "hidden_size": 4096,
+    "kv_channels": 128,
+    "layernorm_epsilon": 1.5625e-07,
+    "multi_query_attention": True,
+    "multi_query_group_num": 4,
+    "num_attention_heads": 32,
+    "num_layers": 40,
+    "original_rope": True,
+    "padded_vocab_size": 151552,
+    "post_layer_norm": True,
+    "rmsnorm": True,
+    "rope_ratio": 10000,
+    "seq_length": 1048576,
+    "tie_word_embeddings": False,
+}
+
+# A two-layer GLM-4 small enough to run eagerly: GQA 4/2, D=64 (Pi needs a power of two).
+TINY_GLM = {
+    **GLM4_9B_CHAT_1M_CONFIG,
+    "ffn_hidden_size": 192,
+    "hidden_size": 256,
+    "kv_channels": 64,
+    "multi_query_group_num": 2,
+    "num_attention_heads": 4,
+    "num_layers": 2,
+    "padded_vocab_size": 320,
+    "rope_ratio": 500,
+}
+
+
+def _chatglm_rope(x: torch.Tensor, positions: torch.Tensor, head_size: int, rope_ratio: float) -> torch.Tensor:
+    """ChatGLM's ``RotaryEmbedding`` + ``apply_rotary_pos_emb``, transcribed from modeling_chatglm.py."""
+    n_elem = head_size // 2
+    theta = 1.0 / ((10000 * rope_ratio) ** (torch.arange(0, n_elem, 2, dtype=torch.float32) / n_elem))
+    idx_theta = torch.outer(positions.to(torch.float32), theta)
+    cache = torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)], dim=-1)  # [s, n_elem / 2, 2]
+    rot_dim = cache.shape[-2] * 2
+    x, x_pass = x[..., :rot_dim], x[..., rot_dim:]
+    xshaped = x.reshape(x.shape[0], x.shape[1], rot_dim // 2, 2)
+    cache = cache.view(x.shape[0], 1, rot_dim // 2, 2)
+    out = torch.stack(
+        [
+            xshaped[..., 0] * cache[..., 0] - xshaped[..., 1] * cache[..., 1],
+            xshaped[..., 1] * cache[..., 0] + xshaped[..., 0] * cache[..., 1],
+        ],
+        -1,
+    ).flatten(2)
+    return torch.cat((out, x_pass), dim=-1)
+
+
+def _hf_glm_rope(x: torch.Tensor, positions: torch.Tensor, head_size: int, theta: float) -> torch.Tensor:
+    """HF ``modeling_glm``'s partial rotary: cos/sin repeat-interleaved, interleaved rotate_half."""
+    rotary_dim = head_size // 2
+    inv_freq = 1.0 / (theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim))
+    freqs = torch.outer(positions.to(torch.float32), inv_freq)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    cos = emb.cos()[..., : emb.shape[-1] // 2].repeat_interleave(2, dim=-1).unsqueeze(1)
+    sin = emb.sin()[..., : emb.shape[-1] // 2].repeat_interleave(2, dim=-1).unsqueeze(1)
+    x_rot, x_pass = x[..., :rotary_dim], x[..., rotary_dim:]
+    rotated_half = torch.stack((-x_rot[..., 1::2], x_rot[..., 0::2]), dim=-1).flatten(-2)
+    return torch.cat((x_rot * cos + rotated_half * sin, x_pass), dim=-1)
+
+
+def _chatglm_checkpoint(config: dict, seed: int = 0) -> dict[str, torch.Tensor]:
+    """Random weights under chatglm's tensor names, fused qkv and gate/up included."""
+    generator = torch.Generator().manual_seed(seed)
+    hidden, heads, groups = config["hidden_size"], config["num_attention_heads"], config["multi_query_group_num"]
+    head_size, ffn, vocab = config["kv_channels"], config["ffn_hidden_size"], config["padded_vocab_size"]
+
+    def rand(*shape, scale=0.05):
+        return torch.randn(*shape, generator=generator) * scale
+
+    tensors = {
+        "transformer.embedding.word_embeddings.weight": rand(vocab, hidden, scale=1.0),
+        "transformer.encoder.final_layernorm.weight": 1.0 + rand(hidden),
+        "transformer.output_layer.weight": rand(vocab, hidden),
+        "transformer.rotary_pos_emb.inv_freq": torch.ones(head_size // 4),
+    }
+    qkv_rows = (heads + 2 * groups) * head_size
+    for index in range(config["num_layers"]):
+        prefix = f"transformer.encoder.layers.{index}."
+        tensors.update(
+            {
+                prefix + "input_layernorm.weight": 1.0 + rand(hidden),
+                prefix + "post_attention_layernorm.weight": 1.0 + rand(hidden),
+                prefix + "self_attention.query_key_value.weight": rand(qkv_rows, hidden),
+                prefix + "self_attention.query_key_value.bias": rand(qkv_rows, scale=0.5),
+                prefix + "self_attention.dense.weight": rand(hidden, heads * head_size),
+                prefix + "mlp.dense_h_to_4h.weight": rand(2 * ffn, hidden),
+                prefix + "mlp.dense_4h_to_h.weight": rand(hidden, ffn),
+            }
+        )
+    return tensors
+
+
+def _as_hf_glm(config: dict, tensors: dict[str, torch.Tensor]) -> tuple[dict, dict[str, torch.Tensor]]:
+    """The same model under HF ``glm``'s config keys and split-q/k/v tensor names."""
+    heads, groups, head_size = config["num_attention_heads"], config["multi_query_group_num"], config["kv_channels"]
+    hf_config = {
+        "model_type": "glm",
+        "num_hidden_layers": config["num_layers"],
+        "num_attention_heads": heads,
+        "num_key_value_heads": groups,
+        "head_dim": head_size,
+        "hidden_size": config["hidden_size"],
+        "intermediate_size": config["ffn_hidden_size"],
+        "vocab_size": config["padded_vocab_size"],
+        "rms_norm_eps": config["layernorm_epsilon"],
+        "rope_theta": 10000.0 * config["rope_ratio"],
+        "partial_rotary_factor": 0.5,
+        "attention_bias": True,
+        "tie_word_embeddings": False,
+    }
+    if not tensors:
+        return hf_config, {}
+    hf = {
+        "model.embed_tokens.weight": tensors["transformer.embedding.word_embeddings.weight"],
+        "model.norm.weight": tensors["transformer.encoder.final_layernorm.weight"],
+        "lm_head.weight": tensors["transformer.output_layer.weight"],
+    }
+    sizes = (heads * head_size, groups * head_size, groups * head_size)
+    for index in range(config["num_layers"]):
+        old, new = f"transformer.encoder.layers.{index}.", f"model.layers.{index}."
+        for kind in ("weight", "bias"):
+            fused = tensors[old + f"self_attention.query_key_value.{kind}"]
+            for name, piece in zip(("q_proj", "k_proj", "v_proj"), fused.split(sizes, dim=0)):
+                hf[new + f"self_attn.{name}.{kind}"] = piece.clone()
+        hf[new + "self_attn.o_proj.weight"] = tensors[old + "self_attention.dense.weight"]
+        hf[new + "mlp.gate_up_proj.weight"] = tensors[old + "mlp.dense_h_to_4h.weight"]
+        hf[new + "mlp.down_proj.weight"] = tensors[old + "mlp.dense_4h_to_h.weight"]
+        hf[new + "input_layernorm.weight"] = tensors[old + "input_layernorm.weight"]
+        hf[new + "post_attention_layernorm.weight"] = tensors[old + "post_attention_layernorm.weight"]
+    return hf_config, hf
+
+
+def _chatglm_eager_logits(config: dict, tensors: dict[str, torch.Tensor], token_ids: torch.Tensor) -> torch.Tensor:
+    """ChatGLM's forward pass in float32, written from modeling_chatglm.py rather than from layers.py."""
+    heads, groups, head_size = config["num_attention_heads"], config["multi_query_group_num"], config["kv_channels"]
+    eps = config["layernorm_epsilon"]
+    count = token_ids.numel()
+    positions = torch.arange(count)
+
+    def rms(x, weight):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight
+
+    hidden = tensors["transformer.embedding.word_embeddings.weight"][token_ids]
+    for index in range(config["num_layers"]):
+        prefix = f"transformer.encoder.layers.{index}."
+        normed = rms(hidden, tensors[prefix + "input_layernorm.weight"])
+        mixed = normed @ tensors[prefix + "self_attention.query_key_value.weight"].T
+        mixed = mixed + tensors[prefix + "self_attention.query_key_value.bias"]
+        query, key, value = mixed.split((heads * head_size, groups * head_size, groups * head_size), dim=-1)
+        query = _chatglm_rope(query.view(count, heads, head_size), positions, head_size, config["rope_ratio"])
+        key = _chatglm_rope(key.view(count, groups, head_size), positions, head_size, config["rope_ratio"])
+        value = value.view(count, groups, head_size)
+        attended = torch.nn.functional.scaled_dot_product_attention(
+            query.transpose(0, 1),
+            key.transpose(0, 1).repeat_interleave(heads // groups, dim=0),
+            value.transpose(0, 1).repeat_interleave(heads // groups, dim=0),
+            is_causal=True,
+        ).transpose(0, 1)
+        hidden = hidden + attended.reshape(count, -1) @ tensors[prefix + "self_attention.dense.weight"].T
+        normed = rms(hidden, tensors[prefix + "post_attention_layernorm.weight"])
+        gate, up = (normed @ tensors[prefix + "mlp.dense_h_to_4h.weight"].T).chunk(2, dim=-1)
+        hidden = hidden + (torch.nn.functional.silu(gate) * up) @ tensors[prefix + "mlp.dense_4h_to_h.weight"].T
+    final = rms(hidden, tensors["transformer.encoder.final_layernorm.weight"])
+    return final @ tensors["transformer.output_layer.weight"].T
+
+
+class TestGlm4Config(unittest.TestCase):
+    def test_the_published_1m_config_reads_as_its_attention_contract(self):
+        shape = glm4_model_shape(GLM4_9B_CHAT_1M_CONFIG)
+        self.assertEqual((shape.num_heads, shape.num_kv_heads, shape.head_size), (32, 4, 128))
+        self.assertEqual((shape.num_layers, shape.hidden_size, shape.intermediate_size), (40, 4096, 13696))
+        self.assertEqual(shape.vocab_size, 151552)
+        self.assertEqual(shape.rope_theta, 1.0e8)
+        self.assertEqual(shape.rotary_dim, 64)
+        self.assertTrue(shape.rope_interleaved)
+        self.assertTrue(shape.qkv_bias)
+        self.assertFalse(shape.qk_norm)
+        self.assertFalse(shape.attn_output_gate)
+        self.assertFalse(shape.tie_word_embeddings)
+
+    def test_the_hf_export_reads_as_the_same_shape(self):
+        hf_config, _ = _as_hf_glm(GLM4_9B_CHAT_1M_CONFIG, {})
+        self.assertEqual(glm4_model_shape(hf_config), glm4_model_shape(GLM4_9B_CHAT_1M_CONFIG))
+
+    def test_a_layer_variant_the_harness_does_not_build_is_refused(self):
+        for key, value in (("rmsnorm", False), ("add_bias_linear", True), ("original_rope", False)):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
+                glm4_model_shape({**GLM4_9B_CHAT_1M_CONFIG, key: value})
+        with self.assertRaisesRegex(ValueError, "no attention output gate"):
+            glm4_model_shape(GLM4_9B_CHAT_1M_CONFIG, attn_output_gate=True)
+
+    def test_glm4_0414_is_refused_by_name(self):
+        self.assertTrue(is_glm4_config(GLM4_9B_CHAT_1M_CONFIG))
+        self.assertFalse(is_glm4_config({"model_type": "qwen3"}))
+        with self.assertRaisesRegex(ValueError, "0414"):
+            is_glm4_config({"model_type": "glm4"})
+
+
+class TestGlm4Rope(unittest.TestCase):
+    """Half the head, adjacent pairs: checked against both upstream formulations."""
+
+    def _rope(self, head_size: int, theta: float) -> RotaryEmbedding:
+        return RotaryEmbedding(head_size, 4096, theta, torch.float32, CPU, rotary_dim=head_size // 2, interleaved=True)
+
+    def test_it_is_chatglms_rotation(self):
+        positions = torch.tensor([0, 1, 7, 1000, 4095])
+        x = torch.randn(positions.numel(), 4, 128)
+        expected = _chatglm_rope(x, positions, 128, rope_ratio=10000)
+        torch.testing.assert_close(self._rope(128, 1.0e8).apply(x, positions), expected, rtol=1e-5, atol=1e-5)
+
+    def test_it_is_hf_glms_rotation(self):
+        positions = torch.tensor([0, 3, 511, 4095])
+        x = torch.randn(positions.numel(), 2, 128)
+        expected = _hf_glm_rope(x, positions, 128, theta=5.0e6)
+        torch.testing.assert_close(self._rope(128, 5.0e6).apply(x, positions), expected, rtol=1e-5, atol=1e-5)
+
+    def test_the_second_half_of_each_head_passes_through(self):
+        positions = torch.tensor([5, 900])
+        x = torch.randn(2, 3, 128)
+        self.assertTrue(torch.equal(self._rope(128, 1.0e8).apply(x, positions)[..., 64:], x[..., 64:]))
+
+    def test_the_neox_default_is_unchanged(self):
+        """Qwen's full-width rotate_half, restated independently of layers.py."""
+        positions = torch.tensor([0, 17, 2048])
+        x = torch.randn(3, 2, 64)
+        inv_freq = 1.0 / (1.0e6 ** (torch.arange(0, 64, 2, dtype=torch.float32) / 64))
+        emb = torch.outer(positions.to(torch.float32), inv_freq).repeat(1, 2)
+        rotated = torch.cat((-x[..., 32:], x[..., :32]), dim=-1)
+        expected = x * emb.cos().unsqueeze(1) + rotated * emb.sin().unsqueeze(1)
+        rope = RotaryEmbedding(64, 4096, 1.0e6, torch.float32, CPU)
+        torch.testing.assert_close(rope.apply(x, positions), expected, rtol=1e-5, atol=1e-5)
+
+
+class TestGlm4Checkpoint(unittest.TestCase):
+    """A tiny GLM-4 on disk, loaded by the engine exactly as the 9B one would be."""
+
+    PROMPT_TOKENS = 40
+    NEW_TOKENS = 6
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.tensors = _chatglm_checkpoint(TINY_GLM)
+        self.token_ids = torch.randint(0, TINY_GLM["padded_vocab_size"], (self.PROMPT_TOKENS,), dtype=torch.int64)
+
+    def _write(self, name: str, config: dict, tensors: dict[str, torch.Tensor]) -> str:
+        from safetensors.torch import save_file
+
+        path = self.root / name
+        path.mkdir()
+        (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        save_file({key: value.contiguous() for key, value in tensors.items()}, str(path / "model.safetensors"))
+        return str(path)
+
+    def _runner(self, model_path: str, backend: str = "dense_reference", **overrides) -> StandaloneModelRunner:
+        settings = {
+            "backend": backend,
+            "prefill_mode": "dense_staging",
+            "max_seq_len": 256,
+            "chunk_size": 16,
+            "block_size": BLOCK_SIZE,
+            "dtype": torch.float32,
+            "device": "cpu",
+            "max_new_tokens": self.NEW_TOKENS,
+            **overrides,
+        }
+        return StandaloneModelRunner(RunnerConfig(model_path=model_path, **settings))
+
+    def _eager_greedy(self, tensors: dict[str, torch.Tensor]) -> list[int]:
+        ids, produced = self.token_ids.clone(), []
+        for _ in range(self.NEW_TOKENS):
+            produced.append(int(torch.argmax(_chatglm_eager_logits(TINY_GLM, tensors, ids)[-1])))
+            ids = torch.cat((ids, torch.tensor([produced[-1]])))
+        return produced
+
+    def test_the_chatglm_checkpoint_runs_as_chatglm_does(self):
+        runner = self._runner(self._write("chatglm", TINY_GLM, self.tensors))
+        self.assertEqual((runner.shape.num_heads, runner.shape.num_kv_heads, runner.shape.head_size), (4, 2, 64))
+        logits = runner.prefill(self.token_ids, RunMetrics())
+        expected = _chatglm_eager_logits(TINY_GLM, self.tensors, self.token_ids)[-1:]
+        torch.testing.assert_close(logits, expected, rtol=1e-4, atol=1e-4)
+        produced, _ = self._runner(runner.config.model_path).generate(self.token_ids)
+        self.assertEqual(produced, self._eager_greedy(self.tensors))
+
+    def test_the_hf_export_loads_to_the_same_weights(self):
+        chatglm = self._runner(self._write("chatglm", TINY_GLM, self.tensors))
+        hf_config, hf_tensors = _as_hf_glm(TINY_GLM, self.tensors)
+        hf = self._runner(self._write("glm", hf_config, hf_tensors))
+        self.assertEqual(hf.shape, chatglm.shape)
+        mine, theirs = dict(chatglm.model.named_parameters()), dict(hf.model.named_parameters())
+        self.assertEqual(sorted(mine), sorted(theirs))
+        for name, parameter in mine.items():
+            self.assertTrue(torch.equal(parameter, theirs[name]), name)
+
+    def test_o_proj_is_folded_as_it_is_ingested(self):
+        path = self._write("chatglm", TINY_GLM, self.tensors)
+        folded = self._runner(path, backend="turboquant_reference", fold_output_rotation=True)
+        fold = turboquant_rotation().fold_pi_into_output_projection
+        for index, layer in enumerate(folded.model.layers):
+            original = self.tensors[f"transformer.encoder.layers.{index}.self_attention.dense.weight"]
+            self.assertTrue(torch.equal(layer.self_attn.o_proj.weight, fold(original, TINY_GLM["kv_channels"])))
+        # The folded projection un-rotates what the decode leaves rotated, so the
+        # run is the unfolded one's up to the fold's own rounding. dense_staging
+        # prefills through the *dense* pool, so this also holds its output to
+        # O Pi: left unrotated, the tokens diverge from the first one.
+        unfolded = self._runner(path, backend="turboquant_reference")
+        self.assertTrue(folded.decode_backend.output_rotation_folded)
+        self.assertEqual(folded.generate(self.token_ids)[0], unfolded.generate(self.token_ids)[0])
+
+    def test_the_cube_decode_is_asked_for_the_rotated_basis(self):
+        """kv4fp8 Cube, folded, ungated: stage 0, the kernel passes its output through."""
+        from tq_longbench.smoke_glm import check_contract
+
+        path = self._write("chatglm", TINY_GLM, self.tensors)
+        with cpu_turboquant_ops() as stand_ins, stand_ins.turboquant_cube_meta_ops():
+            folded = self._runner(path, backend="turboquant_cube", dtype=torch.float16, fold_output_rotation=True)
+            self.assertEqual(check_contract(folded), "ROTATED_BASIS (stage 0)")
+            unfolded = self._runner(path, backend="turboquant_cube", dtype=torch.float16)
+            self.assertEqual(check_contract(unfolded), "UNROTATED (stage 1)")
+
+
+class TestGlm4CheckpointNames(unittest.TestCase):
+    SHAPE = glm4_model_shape(TINY_GLM)
+    QKV = "transformer.encoder.layers.1.self_attention.query_key_value.weight"
+
+    def test_the_fused_qkv_splits_query_first(self):
+        rows = (4 + 2 * 2) * 64
+        fused = torch.arange(rows, dtype=torch.float32).unsqueeze(1).expand(rows, 3)
+        targets = dict(glm4_checkpoint_targets(self.QKV, fused, self.SHAPE))
+        self.assertEqual(sorted(targets), [f"layers.1.self_attn.{p}_proj.weight" for p in "kqv"])
+        self.assertEqual(targets["layers.1.self_attn.q_proj.weight"][0, 0], 0)
+        self.assertEqual(targets["layers.1.self_attn.k_proj.weight"][0, 0], 256)
+        self.assertEqual(targets["layers.1.self_attn.v_proj.weight"][0, 0], 384)
+
+    def test_a_qkv_that_disagrees_with_the_kv_heads_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "multi_query_group_num"):
+            glm4_checkpoint_targets(self.QKV, torch.zeros(10, 3), self.SHAPE)
+
+    def test_an_unmodelled_tensor_raises_instead_of_being_skipped(self):
+        self.assertEqual(glm4_checkpoint_targets("transformer.rotary_pos_emb.inv_freq", torch.zeros(4), self.SHAPE), [])
+        with self.assertRaisesRegex(KeyError, "does not model"):
+            glm4_checkpoint_targets(
+                "transformer.encoder.layers.0.self_attention.dense.bias", torch.zeros(4), self.SHAPE
+            )
+
+
+class TestGlm4PrefillPolicy(unittest.TestCase):
+    def test_batched_decode_from_32k_up(self):
+        self.assertEqual(GLM4_BATCHED_DECODE_MIN_TOKENS, 32768)
+        self.assertEqual(glm4_prefill_mode(32767, "turboquant_cube"), "dense_staging")
+        self.assertEqual(glm4_prefill_mode(32768, "turboquant_cube"), "batched_decode")
+        self.assertEqual(glm4_prefill_mode(1048576, "turboquant_aiv"), "batched_decode")
+        # A dense baseline decodes out of the fp16 pool; it has no other mode.
+        self.assertEqual(glm4_prefill_mode(131072, "native_v5"), "dense_staging")
+
+    def test_run_eval_routes_a_glm_checkpoint_by_the_same_rule(self):
+        from tq_longbench.run_eval import default_prefill_mode
+
+        self.assertEqual(default_prefill_mode(32768, "turboquant_cube", glm4_checkpoint=True), "batched_decode")
+        self.assertEqual(default_prefill_mode(32768, "turboquant_cube"), "dense_staging")
+
+    def test_the_smoke_runner_takes_its_flags(self):
+        from tq_longbench.smoke_glm import build_parser, choose_prefill_mode, parse_depths, truncate_middle
+
+        parser = build_parser()
+        args = parser.parse_args(
+            ["--model-path", "/m", "--device", "npu", "--backend", "turboquant_cube", "--tokens", "131072"]
+        )
+        self.assertEqual((args.device, args.backend, args.tokens), ("npu", "turboquant_cube", 131072))
+        self.assertEqual(choose_prefill_mode(args), "batched_decode")
+        args = parser.parse_args(["--model-path", "/m", "--tokens", "131072", "--prefill-mode", "dense_staging"])
+        with contextlib.redirect_stderr(io.StringIO()) as warning:
+            self.assertEqual(choose_prefill_mode(args), "dense_staging")
+        self.assertIn("HBM", warning.getvalue())
+        self.assertEqual(parse_depths("0,0.5,1"), (0.0, 0.5, 1.0))
+        with self.assertRaises(ValueError):
+            parse_depths("1.5")
+        self.assertEqual(truncate_middle(torch.arange(10), 4).tolist(), [0, 1, 8, 9])
 
 
 if __name__ == "__main__":

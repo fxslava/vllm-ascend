@@ -123,6 +123,8 @@ cpu_reference.py serve the operators from the CPU, for a run with no device
 run_eval.py      the evaluation CLI
 smoke_dense.py   dense GQA end to end, against eager Hugging Face
 smoke_hf.py      a hybrid model through the bridge, against eager Hugging Face
+glm4.py          GLM-4: config.json to shape, fused-tensor splitting, prefill policy
+smoke_glm.py     GLM-4 end to end: the folded-o_proj contract, a prompt, NIAH
 diagnose.py      per-layer quantisation loss on real weights
 ```
 
@@ -207,8 +209,32 @@ nothing for TurboQuant to hold in them. It hooks `ALL_ATTENTION_FUNCTIONS`, the
 supported extension point, so nothing is monkeypatched.
 
 `--fold-output-rotation` rewrites every `o_proj` to `W_o (I ⊗ Π)` so the decode's
-`ROTATED_BASIS` output needs no runtime un-rotation. A gated layer is refused:
-the gate sits between attention and `o_proj`, where the output is still rotated.
+`ROTATED_BASIS` output needs no runtime un-rotation. The fold happens as each
+checkpoint tensor is ingested, on the host in float64, and is rounded once into
+the run's dtype — never on the device, which has no fast float64. Under
+`dense_staging` the unquantised prefill backend rotates its own output by Π too,
+because it feeds the same folded projection. A gated layer is refused: the gate
+sits between attention and `o_proj`, where the output is still rotated.
 
-DeepSeek-V4-Flash and GLM are **not implemented** in either route — MLA and the
-MoE stack are a separate adapter.
+**GLM-4** (`THUDM/glm-4-9b-chat-1m`, `glm4.py`) runs on the runner directly. It
+is dense GQA with no q/k norm and no gate. Both the `chatglm` checkpoint (fused
+`query_key_value` with bias, fused `dense_h_to_4h`) and the HF `glm` export
+(split q/k/v, fused `gate_up_proj`) load; fused tensors are split at load time.
+The shape is read from `config.json` without running the checkpoint's remote
+config code. For the 1M checkpoint that is 32 query heads over **4** KV heads
+(`multi_query_group_num`; `glm-4-9b-chat` has 2), `D = 128`, and RoPE base
+`10000 · rope_ratio = 1e8`. RoPE rotates the first 64 channels of each head and
+pairs *adjacent* channels, which is ChatGLM's `reshape(..., rot_dim // 2, 2)`,
+not NeoX halves. Having no gate, it folds Π into `o_proj`, and the Cube decode
+runs `ROTATED_BASIS` (`kRotatedBasis`, stage 0): no in-kernel un-rotation.
+
+```bash
+python tools/tq_longbench/smoke_glm.py --model-path /models/glm-4-9b-chat-1m --device npu --backend turboquant_cube --tokens 131072
+```
+
+Its prefill defaults to `batched_decode` from 32768 context tokens up (and
+`run_eval.py` does the same for a GLM-4 checkpoint), `dense_staging` below.
+GLM-4-0414 (`model_type: glm4`) adds sandwich norms and is refused.
+
+DeepSeek-V4-Flash is **not implemented** in either route — MLA and the MoE stack
+are a separate adapter.

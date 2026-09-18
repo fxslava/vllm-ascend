@@ -116,10 +116,18 @@ class DenseReferenceBackend(AttentionBackend):
 
     name = "dense_reference"
 
-    def __init__(self, geometry: CacheGeometry, shape: LayerShape, device: torch.device, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        geometry: CacheGeometry,
+        shape: LayerShape,
+        device: torch.device,
+        dtype: torch.dtype,
+        output_rotation_folded: bool = False,
+    ) -> None:
         super().__init__(geometry, shape, device)
         self.cache = DenseKVCache(geometry, device, dtype)
         self.dtype = dtype
+        self.output_rotation_folded = output_rotation_folded
 
     def write_kv(self, layer: int, key: torch.Tensor, value: torch.Tensor, slots: torch.Tensor) -> None:
         self.cache.write(layer, key, value, slots)
@@ -166,7 +174,7 @@ class DenseReferenceBackend(AttentionBackend):
         out.copy_(self._attend(layer, query.contiguous(), mask, longest).to(out.dtype))
         if gate is not None:
             out.mul_(torch.sigmoid(gate).view_as(out))
-        return out
+        return self._into_folded_basis(out)
 
     def prefill_chunk(
         self,
@@ -193,7 +201,7 @@ class DenseReferenceBackend(AttentionBackend):
         out.copy_(self._attend(layer, query.contiguous(), mask, prefix_end).to(out.dtype))
         if gate is not None:
             out.mul_(torch.sigmoid(gate).view_as(out))
-        return out
+        return self._into_folded_basis(out)
 
 
 class TurboQuantReferenceBackend(AttentionBackend):
