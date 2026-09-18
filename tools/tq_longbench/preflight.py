@@ -34,7 +34,10 @@ the failure modes (a wrong mask or basis lands far below it).
 :func:`select_dense_api` does this once per torch_npu entry point
 (:data:`tq_longbench.ops.DENSE_ATTENTION_APIS`) and keeps the first that passes,
 so a run uses what this SoC and CANN actually accept rather than what the
-torch_npu build merely exports.
+torch_npu build merely exports. :func:`select_dense_backend` widens that to the
+unquantised backends themselves: where no fused entry point is accepted at all,
+which is every Ascend 950, it settles on ``cann_dense`` -- matmul, softmax,
+matmul -- rather than leaving the run with no unquantised path.
 """
 
 from __future__ import annotations
@@ -52,6 +55,7 @@ from tq_longbench.ops import (
     NativeV5Backend,
     available_dense_attention_apis,
     build_backend,
+    dense_backend_candidates,
 )
 
 #: Synthetic context length: a full prefill chunk and a decode over it, one block.
@@ -184,11 +188,14 @@ def probe_backend(
 
 @dataclass(frozen=True)
 class DenseSelection:
-    """Whether an unquantised path works here, through which entry point, and every probe run to find out."""
+    """Whether an unquantised path works here, through which backend and entry point, and every probe run."""
 
     passed: bool
     api: str | None
     results: list[ProbeResult]
+    #: The backend that passed. ``None`` until :func:`select_dense_backend`
+    #: chooses between them; :func:`select_dense_api` was asked about one.
+    backend: str | None = None
 
 
 def select_dense_api(
@@ -213,7 +220,7 @@ def select_dense_api(
         result = probe_backend(
             name, shape, device, dtype, block_size, output_rotation_folded=output_rotation_folded, decode=decode
         )
-        return DenseSelection(result.passed, None, [result])
+        return DenseSelection(result.passed, None, [result], name if result.passed else None)
     try:
         candidates = available_dense_attention_apis(role)
     except ImportError as error:
@@ -235,5 +242,40 @@ def select_dense_api(
         )
         results.append(result)
         if result.passed:
-            return DenseSelection(True, api, results)
+            return DenseSelection(True, api, results, name)
+    return DenseSelection(False, None, results)
+
+
+def select_dense_backend(
+    device: torch.device,
+    shape: LayerShape,
+    dtype: torch.dtype,
+    block_size: int,
+    *,
+    role: str,
+    output_rotation_folded: bool = False,
+) -> DenseSelection:
+    """The first unquantised backend that passes the probe, with its entry point.
+
+    :func:`tq_longbench.ops.dense_backend_candidates` sets the order: the fused
+    kernel first because it is the one worth measuring, ``cann_dense`` behind it
+    because matmul and softmax are accepted where ``aclnnFusedInferAttentionScore``
+    V1-V4 is not. On Ascend 950 that is the whole of op-plugin's FIA (``EZ9903``),
+    so on a 950 this is what keeps an unquantised baseline in the run at all --
+    every probe above it fails, and the results carry each refusal's reason.
+    """
+    results: list[ProbeResult] = []
+    for name in dense_backend_candidates(device):
+        selection = select_dense_api(
+            name,
+            shape,
+            device,
+            dtype,
+            block_size,
+            role=role,
+            output_rotation_folded=output_rotation_folded,
+        )
+        results.extend(selection.results)
+        if selection.passed:
+            return DenseSelection(True, selection.api, results, name)
     return DenseSelection(False, None, results)

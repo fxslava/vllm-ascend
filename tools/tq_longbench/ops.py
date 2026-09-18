@@ -14,7 +14,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
-"""The three attention paths a run can take, and the buffers they reuse.
+"""The four attention paths a run can take, and the buffers they reuse.
 
 Each backend answers the same two questions -- write this chunk's K/V into the
 cache, and attend over the prefix -- so the decoder layer never learns which one
@@ -24,6 +24,10 @@ it is driving.  What differs is underneath:
   paged cache: ``npu_fused_infer_attention_score_v2`` (aclnn V5, the only
   version Ascend 950 accepts) where torch_npu has it.  The baseline, and the
   only path whose numbers are not a quantisation of anything.
+* :class:`CANNDenseBackend` -- the same dense pool with no fused kernel over it
+  at all: matmul, softmax, matmul, each a CANN operator torch_npu launches.
+  Slower, and the unquantised baseline that survives where op-plugin's FIA does
+  not -- which on Ascend 950 is everywhere (``EZ9903``).
 * :class:`TurboQuantCubeBackend` -- one ``npu_turboquant_cube_decode`` launch
   per step.  It takes the **raw** query (the ``PRE_ROTATED = false`` entry),
   rotates it in its own prologue, and its output stage un-rotates the result and
@@ -220,6 +224,12 @@ _COMPRESSED_CAUSAL_MASK_SIZE = 2048
 #: ``next_tokens`` for a causal call, as vllm-ascend passes it next to sparse_mode 3.
 _CAUSAL_NEXT_TOKENS = 0
 
+#: float32 scores one :class:`CANNDenseBackend` tile may hold: 64Mi elements. That is
+#: 256 MB of scores, 256 MB again for the softmax's output and 64 MB for the mask --
+#: ~576 MB of HBM live at the peak, chosen to leave a 64 GB device most of itself for
+#: the weights and the pools.
+_SCORE_TILE_ELEMENTS = 64 * 1024 * 1024
+
 
 def _torch_npu():
     """Deferred: only the native backend needs the device runtime."""
@@ -240,7 +250,45 @@ def available_dense_attention_apis(role: str = "prefill") -> list[str]:
     return [api for api in candidates if hasattr(torch_npu, DENSE_ATTENTION_APIS[api])]
 
 
-class NativeV5Backend(AttentionBackend):
+class _DensePagedBackend(AttentionBackend):
+    """Shared plumbing for the two unquantised paths: the fp16 pool and the output stage."""
+
+    def __init__(
+        self,
+        geometry: CacheGeometry,
+        shape: LayerShape,
+        device: torch.device,
+        dtype: torch.dtype,
+        output_rotation_folded: bool = False,
+    ) -> None:
+        super().__init__(geometry, shape, device)
+        self.cache = DenseKVCache(geometry, device, dtype)
+        self.dtype = dtype
+        self.output_rotation_folded = output_rotation_folded
+
+    def write_kv(self, layer: int, key: torch.Tensor, value: torch.Tensor, slots: torch.Tensor) -> None:
+        self.cache.write(layer, key, value, slots)
+
+    def _finish(self, attn_output: torch.Tensor, out: torch.Tensor, gate: torch.Tensor | None) -> torch.Tensor:
+        out.copy_(attn_output.view_as(out))
+        if gate is not None:
+            out.mul_(torch.sigmoid(gate).view_as(out))
+        return self._into_folded_basis(out)
+
+    def _prefix(self, layer: int, length: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """The first ``length`` cached K and V as ``[length, H_kv, D]``, without a copy.
+
+        The paging is the identity (a slot is a position), so the pool's first
+        ``length`` rows *are* the prefix, in order.
+        """
+        packed = (-1, self.shape.num_kv_heads, self.shape.head_size)
+        return (
+            self.cache.key_planes[layer].view(packed)[:length],
+            self.cache.value_planes[layer].view(packed)[:length],
+        )
+
+
+class NativeV5Backend(_DensePagedBackend):
     """The unquantised paged cache, through torch_npu's own attention.
 
     Which torch_npu entry point is ``attention_api``: by default the most preferred
@@ -261,10 +309,7 @@ class NativeV5Backend(AttentionBackend):
         output_rotation_folded: bool = False,
         attention_api: str | None = None,
     ) -> None:
-        super().__init__(geometry, shape, device)
-        self.cache = DenseKVCache(geometry, device, dtype)
-        self.dtype = dtype
-        self.output_rotation_folded = output_rotation_folded
+        super().__init__(geometry, shape, device, dtype, output_rotation_folded)
         if attention_api is None:
             available = available_dense_attention_apis("prefill")
             if not available:
@@ -278,15 +323,6 @@ class NativeV5Backend(AttentionBackend):
             torch.ones(_COMPRESSED_CAUSAL_MASK_SIZE, _COMPRESSED_CAUSAL_MASK_SIZE, dtype=torch.int8, device=device),
             diagonal=1,
         )
-
-    def write_kv(self, layer: int, key: torch.Tensor, value: torch.Tensor, slots: torch.Tensor) -> None:
-        self.cache.write(layer, key, value, slots)
-
-    def _finish(self, attn_output: torch.Tensor, out: torch.Tensor, gate: torch.Tensor | None) -> torch.Tensor:
-        out.copy_(attn_output.view_as(out))
-        if gate is not None:
-            out.mul_(torch.sigmoid(gate).view_as(out))
-        return self._into_folded_basis(out)
 
     def decode(
         self,
@@ -400,9 +436,8 @@ class NativeV5Backend(AttentionBackend):
     def _prompt_flash_attention(self, layer: int, query: torch.Tensor, prefix_end: int) -> torch.Tensor:
         """PFA over the prefix as one contiguous ``[1, prefix_end, H_kv * D]`` sequence.
 
-        The paging is the identity (a slot is a position), so the pool's first
-        ``prefix_end`` rows *are* the prefix in order, and a slice of them is the
-        dense key PFA wants without a copy.
+        :meth:`_prefix` in the layout PFA wants: the same rows, flattened over the
+        kv heads and given the batch dimension, still without a copy.
         """
         count = query.shape[0]
         hidden_kv = self.shape.num_kv_heads * self.shape.head_size
@@ -422,6 +457,128 @@ class NativeV5Backend(AttentionBackend):
             sparse_mode=_BOTTOM_RIGHT_CAUSAL_SPARSE_MODE,
             next_tokens=_CAUSAL_NEXT_TOKENS,
         )
+
+
+class CANNDenseBackend(_DensePagedBackend):
+    """The unquantised fp16 cache, attended by discrete CANN operators.
+
+    No fused attention kernel at all: the scores are a batched matmul, the
+    softmax is a softmax, and the values are a second batched matmul. On NPU
+    tensors torch_npu dispatches those to CANN's own ``aclnnBatchMatMul`` and
+    ``aclnnSoftmax``, so the Cube and Vector units do the arithmetic and the host
+    only launches -- but none of it goes through ``aclnnFusedInferAttentionScore``,
+    which is the point. Ascend 950 refuses that operator's V1 to V4 interfaces
+    (``EZ9903``) and op-plugin reaches no further than V4, so on a 950 every
+    :class:`NativeV5Backend` entry point fails its pre-flight and this is the only
+    unquantised baseline left. It is slower than a fused kernel by the margin a
+    materialised score matrix costs; it is not a *reference*, because the operators
+    under it are the device's.
+
+    One code path serves both halves of the run, because both are the same
+    question. :meth:`decode` gives query row ``r`` the whole of its own context
+    (``context_lens[r]`` columns) and :meth:`prefill_chunk` gives it
+    ``prefix_end - count + r + 1`` -- bottom-right causal written out as a column
+    count. So both build a per-row visible length and hand it to :meth:`_attend`,
+    which masks on it. The masking is exact, never an approximation of a causal
+    kernel's: a column at or past a row's length contributes nothing.
+    """
+
+    name = "cann_dense"
+
+    def decode(
+        self,
+        layer: int,
+        query: torch.Tensor,
+        context_lens: torch.Tensor,
+        out: torch.Tensor,
+        gate: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Each query row attends its whole context: visible length is the context length."""
+        lengths = context_lens.to(device=query.device, dtype=torch.int64).reshape(-1)
+        # A device-to-host sync per layer per step, because how much of the pool to
+        # slice is a host decision. Unavoidable here and not new: the tie-point check
+        # the caller runs first, and NativeV5Backend's actual_seq_kvlen list, both
+        # already read this same tensor back on every layer.
+        longest = int(lengths.max()) if lengths.numel() else 0
+        return self._finish(self._attend(layer, query, lengths, longest), out, gate)
+
+    def prefill_chunk(
+        self,
+        layer: int,
+        query: torch.Tensor,
+        prefix_end: int,
+        out: torch.Tensor,
+        gate: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """The whole chunk in one pass, rather than the base class's row at a time.
+
+        The default :meth:`AttentionBackend.prefill_chunk` re-presents a chunk as
+        one decode per token because the TurboQuant kernels have no paged prefill.
+        Here there is nothing to re-present: the visible lengths *are* the causal
+        mask, so a 2048-token chunk is the same three launches a single token is.
+        """
+        count = query.shape[0]
+        first = prefix_end - count
+        if first < 0:
+            raise ValueError(f"a {count}-token chunk cannot end at prefix {prefix_end}")
+        lengths = torch.arange(first + 1, prefix_end + 1, dtype=torch.int64, device=query.device)
+        return self._finish(self._attend(layer, query, lengths, prefix_end), out, gate)
+
+    def _attend(self, layer: int, query: torch.Tensor, lengths: torch.Tensor, longest: int) -> torch.Tensor:
+        """``query`` ``[q, H, D]`` over the prefix, row ``r`` seeing columns ``0 .. lengths[r] - 1``.
+
+        The query heads sharing a kv head are folded into the batched matmul's rows,
+        so each stage is one launch over ``H_kv`` rather than a loop over ``H``.
+        The query is scaled before the first matmul, not the scores after it: at
+        float16 an unscaled ``q . k`` over a long context is what overflows, and
+        the scaled one cannot.
+
+        Neither K nor V is copied to be multiplied. The pool holds ``[k, H_kv, D]``
+        contiguous, so ``keys.permute(1, 2, 0)`` is ``[H_kv, D, k]`` with the D axis
+        at stride 1 -- a column-major ``K``, which is exactly the transposed operand
+        a batched GEMM takes a flag for -- and ``values.permute(1, 0, 2)`` is
+        ``[H_kv, k, D]`` row-major. Both carry batch stride ``D`` over the kv heads.
+        These are the layouts to keep if this is ever rewritten: a permute that
+        landed either operand with no unit-stride axis would turn one view per
+        layer per step into one full copy of the prefix.
+
+        Tiled over the query rows only because the score matrix is materialised --
+        a 2048-token chunk over a 32k prefix is 32 x 2048 x 32768 float32 scores,
+        8 GB at once. The tiling changes the launch count, never the result.
+        """
+        if lengths.numel() != query.shape[0]:
+            raise ValueError(f"{lengths.numel()} context lengths for {query.shape[0]} query rows")
+        # An all-masked row would leave softmax dividing by zero and return NaN,
+        # which nothing downstream raises on.
+        if lengths.numel() and int(lengths.min()) < 1:
+            raise ValueError("a query row with a context length of 0 attends to nothing; there is no answer to return")
+        if longest > self.geometry.max_seq_len:
+            raise RuntimeError(f"context length {longest} exceeds the {self.geometry.max_seq_len}-token static cache")
+
+        count, heads, head_size = query.shape
+        kv_heads = self.shape.num_kv_heads
+        group = heads // kv_heads
+        keys, values = self._prefix(layer, longest)
+        keys_t = keys.permute(1, 2, 0)  # [H_kv, D, k]
+        values_t = values.permute(1, 0, 2)  # [H_kv, k, D]
+        columns = torch.arange(longest, device=query.device).view(1, 1, 1, -1)
+
+        rows_per_tile = max(1, _SCORE_TILE_ELEMENTS // max(1, heads * longest))
+        tiles = []
+        for start in range(0, count, rows_per_tile):
+            tile = query[start : start + rows_per_tile]
+            rows = tile.shape[0]
+            stacked = (tile * self.shape.scale).view(rows, kv_heads, group, head_size)
+            stacked = stacked.permute(1, 2, 0, 3).reshape(kv_heads, group * rows, head_size)
+            scores = torch.bmm(stacked, keys_t).float().view(kv_heads, group, rows, longest)
+            visible = lengths[start : start + rows].view(1, 1, -1, 1)
+            # In place: .float() above already returned a tensor of this tile's own,
+            # and a second one of it is the largest allocation in the loop.
+            scores.masked_fill_(columns >= visible, float("-inf"))
+            weights = torch.softmax(scores, dim=-1).to(values.dtype).view(kv_heads, group * rows, longest)
+            attended = torch.bmm(weights, values_t).view(kv_heads, group, rows, head_size)
+            tiles.append(attended.permute(2, 0, 1, 3).reshape(rows, heads, head_size))
+        return tiles[0] if len(tiles) == 1 else torch.cat(tiles)
 
 
 class _TurboQuantBackend(AttentionBackend):
@@ -656,20 +813,30 @@ class TurboQuantAivBackend(_TurboQuantBackend):
 #: Backends that decode out of an unquantised pool. ``dense_staging`` needs one
 #: of these for its prefill, and they are the only backends that can *decode*
 #: out of it -- which is why asking for one with ``batched_decode`` is refused.
-DENSE_BACKENDS = frozenset({"native_v5", "dense_reference"})
+DENSE_BACKENDS = frozenset({"native_v5", "cann_dense", "dense_reference"})
 
-#: Backends that launch Ascend C operators. They need the extension and an NPU.
+#: The device backends, by ``--backend`` name.
 ASCEND_BACKENDS = {
     NativeV5Backend.name: NativeV5Backend,
+    CANNDenseBackend.name: CANNDenseBackend,
     TurboQuantCubeBackend.name: TurboQuantCubeBackend,
     TurboQuantAivBackend.name: TurboQuantAivBackend,
 }
+
+#: Of those, the ones that launch Ascend C operators from this repository (the
+#: TurboQuant kernels) or the vendor's fused attention. They need an NPU -- or,
+#: for the TurboQuant pair, a CPU with the stand-ins registered.
+#: :class:`CANNDenseBackend` is not among them: matmul and softmax are torch
+#: operators wherever it runs, so it is refused nowhere and is honest everywhere
+#: about being the device's operators only when the device is one.
+_ACCELERATOR_ONLY_BACKENDS = frozenset(ASCEND_BACKENDS) - {CANNDenseBackend.name}
 
 #: What a ``--device`` with no Ascend runtime should use instead. The dense pair
 #: and the quantised pair answer the same questions; only the second element of
 #: each is the thing under test.
 REFERENCE_EQUIVALENT = {
     NativeV5Backend.name: "dense_reference",
+    CANNDenseBackend.name: "dense_reference",
     TurboQuantCubeBackend.name: "turboquant_reference",
     TurboQuantAivBackend.name: "turboquant_reference",
 }
@@ -707,6 +874,9 @@ def build_backend(
     stand-ins registered (:func:`tq_longbench.cpu_reference.cpu_turboquant_ops`)
     *can* serve them, and refusing there would lock the harness out of its own
     host tests; a CUDA device never can, and never will from this repository.
+    :class:`CANNDenseBackend` has no such operators to refuse over -- matmul and
+    softmax exist on every device -- so it builds anywhere, and is CANN-native
+    only in the sense that on an NPU those are the operators torch_npu launches.
     """
     from tq_longbench.reference import REFERENCE_BACKENDS
 
@@ -723,7 +893,8 @@ def build_backend(
         raise ValueError(
             f"the Cube decode is float16 only, got {dtype}. Use --dtype float16, or --backend turboquant_aiv."
         )
-    if device.type != "npu" and not (device.type == "cpu" and _operators_served()):
+    accelerator_only = name in _ACCELERATOR_ONLY_BACKENDS
+    if accelerator_only and device.type != "npu" and not (device.type == "cpu" and _operators_served()):
         raise ValueError(
             f"{name} launches Ascend C operators, which cannot run on {device}. "
             f"Use --backend {REFERENCE_EQUIVALENT[name]} for the same arithmetic in torch "
@@ -731,6 +902,8 @@ def build_backend(
         )
     if name == NativeV5Backend.name:
         return NativeV5Backend(geometry, shape, device, dtype, output_rotation_folded, dense_attention_api)
+    if name == CANNDenseBackend.name:
+        return CANNDenseBackend(geometry, shape, device, dtype, output_rotation_folded)
     return ASCEND_BACKENDS[name](geometry, shape, device, output_rotation_folded=output_rotation_folded)
 
 
@@ -751,4 +924,18 @@ def dense_backend_for(device: torch.device) -> str:
     ``dense_staging`` prefill needs one whatever the decode is, so the choice
     follows the device rather than the ``--backend`` flag.
     """
-    return NativeV5Backend.name if device.type == "npu" else "dense_reference"
+    return dense_backend_candidates(device)[0]
+
+
+def dense_backend_candidates(device: torch.device) -> list[str]:
+    """The unquantised backends this device could stage a prefill through, best first.
+
+    On an NPU the fused kernel comes first because it is the one worth measuring,
+    and :class:`CANNDenseBackend` behind it because it is the one that still runs
+    when op-plugin's FIA is refused -- which on Ascend 950 is always. Which of the
+    two a run gets is not guessed: :func:`tq_longbench.preflight.select_dense_backend`
+    tries them in this order on a synthetic layer before any weights load.
+    """
+    if device.type != "npu":
+        return ["dense_reference"]
+    return [NativeV5Backend.name, CANNDenseBackend.name]

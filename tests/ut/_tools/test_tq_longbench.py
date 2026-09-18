@@ -63,6 +63,8 @@ if str(REPO_ROOT / "tools") not in sys.path:
     sys.path.append(str(REPO_ROOT / "tools"))
 
 from tq_longbench import _ascend, build_turboquant_ops  # noqa: E402
+from tq_longbench import ops as ops_module  # noqa: E402
+from tq_longbench import preflight as preflight_module  # noqa: E402
 from tq_longbench._ascend import assert_no_vllm_imported, turboquant_layout, turboquant_rotation  # noqa: E402
 from tq_longbench.cpu_reference import cpu_turboquant_ops  # noqa: E402
 from tq_longbench.engine import RunMetrics, RunnerConfig, StandaloneModelRunner  # noqa: E402
@@ -76,6 +78,8 @@ from tq_longbench.glm4 import (  # noqa: E402
 from tq_longbench.kv_cache import CacheGeometry, DenseKVCache, TurboQuantKVCache, dense_equivalent_bytes  # noqa: E402
 from tq_longbench.layers import ModelShape, RotaryEmbedding  # noqa: E402
 from tq_longbench.ops import (  # noqa: E402
+    DENSE_BACKENDS,
+    CANNDenseBackend,
     LayerShape,
     NativeV5Backend,
     TurboQuantAivBackend,
@@ -83,8 +87,14 @@ from tq_longbench.ops import (  # noqa: E402
     ascend_ops,
     build_backend,
     cube_decode_available,
+    reference_equivalent,
 )
-from tq_longbench.preflight import exact_attention, probe_backend, select_dense_api  # noqa: E402
+from tq_longbench.preflight import (  # noqa: E402
+    exact_attention,
+    probe_backend,
+    select_dense_api,
+    select_dense_backend,
+)
 from tq_longbench.reference import DenseReferenceBackend, TurboQuantReferenceBackend  # noqa: E402
 from tq_longbench.tasks import f1_score, needle_in_a_haystack, rouge_l, score  # noqa: E402
 
@@ -1305,6 +1315,134 @@ class TestGlm4Checkpoint(unittest.TestCase):
         self.assertEqual((prompt.shape, prompt.dtype, int(prompt.sum())), ((64,), torch.long, 64))
 
 
+class _ByteTokenizer:
+    """The least a tokenizer can be and still drive the ladder: characters as ids.
+
+    The benchmark's own tests are about the harness -- the rungs, the records,
+    the metrics -- not about what a tiny random checkpoint retrieves, so the
+    tokenizer only has to be reversible and to keep inside the vocabulary.
+    """
+
+    eos_token_id = None
+    chat_template = None
+
+    def __call__(self, text, return_tensors=None):
+        ids = [ord(character) % TINY_GLM["padded_vocab_size"] for character in text]
+        return types.SimpleNamespace(input_ids=torch.tensor([ids], dtype=torch.int64))
+
+    def decode(self, token_ids, skip_special_tokens=True):
+        return "".join(chr(int(token)) for token in token_ids)
+
+
+class TestRunBenchmark(unittest.TestCase):
+    """The context ladder end to end, on the same tiny GLM-4 the checkpoint tests use."""
+
+    CONTEXTS = (64, 128)
+    DEPTHS = (0.0, 1.0)
+    NEW_TOKENS = 2
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.model_path = self.root / "chatglm"
+        self.model_path.mkdir()
+        (self.model_path / "config.json").write_text(json.dumps(TINY_GLM), encoding="utf-8")
+        from safetensors.torch import save_file
+
+        tensors = _chatglm_checkpoint(TINY_GLM)
+        save_file(
+            {key: value.contiguous() for key, value in tensors.items()},
+            str(self.model_path / "model.safetensors"),
+        )
+
+    def _run(self, *extra):
+        from tq_longbench import run_benchmark
+
+        out_file = self.root / "bench.jsonl"
+        argv = [
+            "--model-path", str(self.model_path),
+            "--device", "cpu",
+            "--backends", "dense_reference",
+            "--contexts", ",".join(str(context) for context in self.CONTEXTS),
+            "--depths", ",".join(str(depth) for depth in self.DEPTHS),
+            "--max-new-tokens", str(self.NEW_TOKENS),
+            "--dtype", "float32",
+            "--chunk-size", "16",
+            "--block-size", str(BLOCK_SIZE),
+            "--out-file", str(out_file),
+            *extra,
+        ]  # fmt: skip
+        tokenizer = mock.patch.object(run_benchmark, "load_tokenizer", return_value=_ByteTokenizer())
+        with tokenizer, contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(run_benchmark.main(argv), 0)
+        records = [json.loads(line) for line in out_file.read_text(encoding="utf-8").splitlines()]
+        return records, out.getvalue()
+
+    def test_every_rung_and_depth_leaves_a_record(self):
+        records, _ = self._run()
+        self.assertEqual(len(records), len(self.CONTEXTS) * len(self.DEPTHS))
+        self.assertEqual(
+            [(record["context_requested"], record["depth"]) for record in records],
+            [(context, depth) for context in self.CONTEXTS for depth in self.DEPTHS],
+        )
+        for record in records:
+            with self.subTest(context=record["context_requested"], depth=record["depth"]):
+                self.assertEqual(record["backend"], "dense_reference")
+                self.assertEqual(record["prefill_mode"], "dense_staging")
+                self.assertEqual(record["generated_tokens"], self.NEW_TOKENS)
+                self.assertIsInstance(record["found"], bool)
+                self.assertIsNone(record["decode_failure"])
+
+    def test_the_record_carries_the_metrics_the_ladder_exists_to_report(self):
+        """TTFT, the decode percentiles and the memory, each measured rather than derived."""
+        records, _ = self._run()
+        for record in records:
+            with self.subTest(context=record["context_requested"]):
+                for key in ("ttft_ms", "decode_p50_us", "decode_p99_us", "kv_cache_mb", "dense_equivalent_mb"):
+                    self.assertIn(key, record)
+                # Time to first token is the prefill plus the argmax over its
+                # logits and nothing else, so it brackets the prefill from above
+                # and the whole item from below.
+                self.assertGreaterEqual(record["ttft_ms"], record["prefill_seconds"] * 1e3)
+                self.assertLessEqual(record["ttft_ms"], record["wall_seconds"] * 1e3)
+                self.assertGreaterEqual(record["decode_p99_us"], record["decode_p50_us"])
+                # No allocator on the CPU to ask, and a zero says so rather than guessing.
+                self.assertEqual(record["device_peak_mb"], 0.0)
+
+    def test_a_rungs_pool_is_sized_for_that_rung_not_for_the_ladder(self):
+        """Which is the whole reason a runner is rebuilt per rung: a shared one reports one size."""
+        records, _ = self._run()
+        by_context = {}
+        for record in records:
+            by_context.setdefault(record["context_requested"], record["kv_cache_mb"])
+        self.assertEqual(sorted(by_context), sorted(self.CONTEXTS))
+        self.assertLess(by_context[self.CONTEXTS[0]], by_context[self.CONTEXTS[1]])
+
+        shared, _ = self._run("--reuse-runner")
+        held = {record["kv_cache_mb"] for record in shared}
+        self.assertEqual(len(held), 1, "--reuse-runner should report the one pool it allocated")
+
+    def test_the_summary_has_a_line_per_rung(self):
+        _, printed = self._run()
+        lines = [line for line in printed.splitlines() if line.startswith("dense_reference")]
+        self.assertEqual(len(lines), len(self.CONTEXTS))
+        for line, context in zip(lines, self.CONTEXTS):
+            self.assertIn(str(context), line)
+            self.assertIn(f"/{len(self.DEPTHS)}", line)
+
+    def test_tensorflow_is_off_before_transformers_can_be_imported(self):
+        """A TensorFlow that predates NumPy 2 makes ``import transformers`` raise, not warn."""
+        from tq_longbench import run_benchmark, smoke_glm
+
+        for name, value in smoke_glm.TENSORFLOW_OFF.items():
+            self.assertEqual(os.environ.get(name), value)
+        self.assertIsNot(run_benchmark.quiet_tensorflow, None)
+        # The harness never imports it, so nothing here can have reached it.
+        self.assertNotIn("tensorflow", sys.modules)
+
+
 class TestGlm4LegacyTokenizer(unittest.TestCase):
     """The special-token registration ``transformers`` 4.28 needs for GLM-4, on a stand-in tokenizer.
 
@@ -1343,6 +1481,37 @@ class TestGlm4LegacyTokenizer(unittest.TestCase):
         tokenizer, root = self._tokenizer({"<|endoftext|>": 151329, "[gMASK]": 151331})
         self.assertEqual(register_declared_special_tokens(tokenizer, root), [])
         tokenizer._create_trie.assert_not_called()
+
+    def test_a_decode_that_raises_leaves_the_ids_rather_than_ending_the_run(self):
+        """GLM-4's tokenizer raises for an id outside its tiktoken ranks.
+
+        Which is exactly what a run worth looking at produces: a wrong basis or a
+        truncated context emits ids no vocabulary has. Taking the run down there
+        would lose the latency and the memory the item had already measured, and
+        the ids themselves, which are the evidence.
+        """
+        from tq_longbench.smoke_glm import decode_text, render
+
+        class _Raises:
+            def decode(self, token_ids, skip_special_tokens=True):
+                raise KeyError("<|endoftext|>")
+
+        self.assertEqual(decode_text(_Raises(), [7, 8]), ("", "KeyError: '<|endoftext|>'"))
+        rendered = render(_Raises(), [7, 8])
+        self.assertIn("undecodable", rendered)
+        self.assertIn("ids [7, 8]", rendered)
+        # No tokenizer at all (--dummy-prompt) is not a failure, just ids.
+        self.assertEqual(render(None, [7, 8]), "ids [7, 8]")
+
+    def test_a_decode_that_works_is_the_text_and_no_failure(self):
+        from tq_longbench.smoke_glm import decode_text, render
+
+        class _Works:
+            def decode(self, token_ids, skip_special_tokens=True):
+                return "hello"
+
+        self.assertEqual(decode_text(_Works(), [1]), ("hello", None))
+        self.assertEqual(render(_Works(), [1]), "'hello'")
 
 
 class TestGlm4CheckpointNames(unittest.TestCase):
@@ -1808,6 +1977,132 @@ def fake_torch_npu(v5=True, v1=True, pfa=True, refused=(), ignore_causal=False):
 GLM4_LAYER = LayerShape(32, 4, 128, 128**-0.5)
 
 
+class TestCANNDenseBackend(unittest.TestCase):
+    """The unquantised baseline that is not a fused kernel: matmul, softmax, matmul.
+
+    Held to exact attention in float32 rather than to the fused path, because the
+    reason it exists is that on Ascend 950 there is no fused path to compare it
+    with. Everything here runs on the CPU, where the same torch operators
+    dispatch to the CPU rather than to the Cube and Vector units -- what is under
+    test is the masking, the grouping and the tiling, none of which are the
+    device's.
+    """
+
+    LENGTH = 300
+    SHAPE = LayerShape(NUM_HEADS, NUM_KV_HEADS, HEAD_SIZE, HEAD_SIZE**-0.5)
+
+    def _filled(self, length=None):
+        torch.manual_seed(0)
+        length = length or self.LENGTH
+        backend = CANNDenseBackend(_geometry(max(BLOCK_SIZE, length)), self.SHAPE, CPU, torch.float16)
+        key = torch.randn(length, NUM_KV_HEADS, HEAD_SIZE, dtype=torch.float16)
+        value = torch.randn(length, NUM_KV_HEADS, HEAD_SIZE, dtype=torch.float16)
+        backend.write_kv(0, key, value, backend.cache.slot_mapping(0, length))
+        return backend, key, value
+
+    def test_the_cache_it_decodes_out_of_is_unquantised(self):
+        backend, key, _ = self._filled()
+        self.assertIsInstance(backend.cache, DenseKVCache)
+        self.assertEqual(backend.cache.key_planes[0].dtype, torch.float16)
+        # Not a codec, a copy: what was written is what is there, bit for bit.
+        held = backend.cache.key_planes[0].view(-1, NUM_KV_HEADS, HEAD_SIZE)[: self.LENGTH]
+        self.assertTrue(torch.equal(held, key))
+
+    def test_a_decode_is_exact_attention_over_each_rows_own_context(self):
+        backend, key, value = self._filled()
+        query = torch.randn(3, NUM_HEADS, HEAD_SIZE, dtype=torch.float16)
+        lengths = torch.tensor([1, 177, self.LENGTH], dtype=torch.int32)
+        out = torch.empty(3, NUM_HEADS, HEAD_SIZE, dtype=torch.float16)
+        backend.decode(0, query, lengths, out)
+        for row, length in enumerate(lengths.tolist()):
+            with self.subTest(context=length):
+                expected = exact_attention(query[row : row + 1], key[:length], value[:length], self.SHAPE.scale)
+                self.assertGreater(cosine(out[row : row + 1], expected), EXACT_COSINE)
+
+    def test_a_prefill_chunk_is_bottom_right_causal(self):
+        """A chunk arriving after a populated cache: row r sees the prefix plus r of its own."""
+        written, count = 200, 100
+        backend, key, value = self._filled(written + count)
+        query = torch.randn(count, NUM_HEADS, HEAD_SIZE, dtype=torch.float16)
+        out = torch.empty(count, NUM_HEADS, HEAD_SIZE, dtype=torch.float16)
+        backend.prefill_chunk(0, query, written + count, out)
+        expected = exact_attention(query, key, value, self.SHAPE.scale)
+        self.assertGreater(cosine(out, expected), EXACT_COSINE)
+        # Row by row too, so a mask that is causal only on average cannot pass.
+        for row in (0, count // 2, count - 1):
+            with self.subTest(row=row):
+                visible = written + row + 1
+                one = exact_attention(query[row : row + 1], key[:visible], value[:visible], self.SHAPE.scale)
+                self.assertGreater(cosine(out[row : row + 1], one), EXACT_COSINE)
+
+    def test_tiling_the_score_matrix_does_not_change_the_answer(self):
+        """The tile size is an HBM budget, so it has to be invisible in the result."""
+        backend, _, _ = self._filled()
+        query = torch.randn(64, NUM_HEADS, HEAD_SIZE, dtype=torch.float16)
+        answers = []
+        for budget in (ops_module._SCORE_TILE_ELEMENTS, NUM_HEADS * self.LENGTH):
+            with mock.patch.object(ops_module, "_SCORE_TILE_ELEMENTS", budget):
+                out = torch.empty(64, NUM_HEADS, HEAD_SIZE, dtype=torch.float16)
+                backend.prefill_chunk(0, query, self.LENGTH, out)
+                answers.append(out.clone())
+        # All 64 rows in one tile against one row per tile: float ordering apart, the same.
+        self.assertGreater(cosine(answers[0], answers[1]), 0.9999999)
+
+    def test_a_row_with_no_context_is_refused_rather_than_returning_nan(self):
+        """An all-masked softmax row is NaN, and nothing downstream raises on NaN."""
+        backend, _, _ = self._filled()
+        query = torch.randn(1, NUM_HEADS, HEAD_SIZE, dtype=torch.float16)
+        out = torch.empty(1, NUM_HEADS, HEAD_SIZE, dtype=torch.float16)
+        with self.assertRaisesRegex(ValueError, "attends to nothing"):
+            backend.decode(0, query, torch.tensor([0], dtype=torch.int32), out)
+
+    def test_a_context_past_the_pool_is_refused(self):
+        backend, _, _ = self._filled()
+        query = torch.randn(1, NUM_HEADS, HEAD_SIZE, dtype=torch.float16)
+        out = torch.empty(1, NUM_HEADS, HEAD_SIZE, dtype=torch.float16)
+        with self.assertRaisesRegex(RuntimeError, "exceeds the"):
+            backend.decode(0, query, torch.tensor([10**6], dtype=torch.int32), out)
+
+    def test_it_is_built_where_the_ascend_backends_are_refused(self):
+        """No Ascend C operator to be missing, so no device to be refused on.
+
+        This is why it is a backend of its own rather than another ``native_v5``
+        entry point: it is the unquantised path that is always there, and
+        ``build_backend`` must not treat it like a kernel. The TurboQuant
+        backends beside it stay refused, operators registered or not.
+        """
+        geometry = _geometry(512)
+        self.assertIn("cann_dense", DENSE_BACKENDS)
+        self.assertEqual(reference_equivalent("cann_dense"), "dense_reference")
+        built = build_backend("cann_dense", geometry, self.SHAPE, CPU, torch.float16)
+        self.assertIsInstance(built, CANNDenseBackend)
+        with self.assertRaisesRegex(ValueError, "cannot run on cuda"):
+            build_backend("turboquant_aiv", geometry, self.SHAPE, torch.device("cuda"), torch.float16)
+
+    def test_it_clears_the_preflight_on_a_glm4_layer(self):
+        """What smoke_glm runs before any weights load, at GLM-4's own head counts."""
+        result = probe_backend("cann_dense", GLM4_LAYER, CPU, torch.float16, BLOCK_SIZE)
+        self.assertTrue(result.passed, result.describe())
+        self.assertIn("prefill cos", result.detail)
+
+    def test_the_staging_pool_falls_back_to_it_when_no_fused_path_runs(self):
+        """The Ascend 950 case, with the fused candidate failing as it does there.
+
+        ``native_v5`` is offered first and cannot even be built here (no
+        torch_npu), which is the same verdict a 950 reaches by another route --
+        every entry point refused. What matters is that the selection does not
+        stop there but settles on ``cann_dense``, and still reports the failure.
+        """
+        candidates = mock.patch.object(
+            preflight_module, "dense_backend_candidates", return_value=["native_v5", "cann_dense"]
+        )
+        with candidates:
+            selection = select_dense_backend(CPU, GLM4_LAYER, torch.float16, BLOCK_SIZE, role="decode")
+        self.assertTrue(selection.passed, [result.describe() for result in selection.results])
+        self.assertEqual(selection.backend, "cann_dense")
+        self.assertTrue(any(not result.passed for result in selection.results), "the failed probe is not reported")
+
+
 class _FakeNpuCase(unittest.TestCase):
     def setUp(self):
         self._serving = False
@@ -1935,15 +2230,23 @@ class TestSmokeGlmPreflight(unittest.TestCase):
         args.device = CPU
         return args
 
-    def _plan(self, args, prefill_mode, dense_passes, decode_passes=True):
+    def _plan(self, args, prefill_mode, dense_passes, decode_passes=True, dense_backend="native_v5"):
+        """``plan_attention`` with every probe answered, so only its branching is under test.
+
+        Both selectors are stubbed with the same verdict: an explicitly named
+        dense backend goes through ``select_dense_api``, the staging pool through
+        ``select_dense_backend``, and which one a case exercises is the case's point.
+        """
         from tq_longbench import smoke_glm
         from tq_longbench.preflight import DenseSelection, ProbeResult
 
         dense = DenseSelection(dense_passes, "fia_v5" if dense_passes else None,
-                               [ProbeResult("native_v5", "fia_v5", dense_passes, 0.01, _EZ9903)])  # fmt: skip
+                               [ProbeResult("native_v5", "fia_v5", dense_passes, 0.01, _EZ9903)],
+                               dense_backend if dense_passes else None)  # fmt: skip
         decode = ProbeResult(args.backend, None, decode_passes, 0.01, "decode cos 0.99")
         with (
             mock.patch.object(smoke_glm, "select_dense_api", return_value=dense),
+            mock.patch.object(smoke_glm, "select_dense_backend", return_value=dense),
             mock.patch.object(smoke_glm, "probe_backend", return_value=decode),
         ):
             return smoke_glm.plan_attention(args, GLM4_9B_CHAT_1M_CONFIG, prefill_mode)
@@ -1971,8 +2274,22 @@ class TestSmokeGlmPreflight(unittest.TestCase):
         plan = self._plan(self._args("--backend", "turboquant_reference"), "dense_staging", dense_passes=True)
         self.assertEqual(plan.prefill_mode, "dense_staging")
         self.assertEqual(plan.dense_api_for("turboquant_reference"), "fia_v5")
+        self.assertEqual(plan.staging_backend, "native_v5")
         native = self._plan(self._args("--backend", "native_v5"), "dense_staging", dense_passes=True)
         self.assertEqual(native.dense_api_for("native_v5"), "fia_v5")
+
+    def test_a_staging_pool_that_fell_back_is_named_and_carried(self):
+        """The 950 case: no fused entry point runs, so the pool stages through cann_dense.
+
+        The prefill mode is untouched -- the pool exists, it is just not the
+        preferred one -- and which backend it is has to reach the runner, or the
+        engine would build the one that just failed.
+        """
+        args = self._args("--backend", "turboquant_reference")
+        plan = self._plan(args, "dense_staging", dense_passes=True, dense_backend="cann_dense")
+        self.assertEqual(plan.prefill_mode, "dense_staging")
+        self.assertEqual(plan.staging_backend, "cann_dense")
+        self.assertTrue(any("cann_dense" in note for note in plan.notes), plan.notes)
 
 
 if __name__ == "__main__":

@@ -42,15 +42,25 @@ against the dense equivalent.
 | | decode | cache | notes |
 |---|---|---|---|
 | `native_v5` | `npu_fused_infer_attention_score_v2` (aclnn FIA V5) | dense fp16/bf16 | the baseline; the only path whose numbers are not a quantisation of anything |
+| `cann_dense` | `matmul` → `softmax` → `matmul` (aclnnBatchMatMul, aclnnSoftmax) | dense fp16/bf16 | the unquantised baseline with no fused kernel under it — slower, and the one that runs on Ascend 950 |
 | `turboquant_cube` | `npu_turboquant_cube_decode` | kv4fp8 packed | one launch: raw-query rotation prologue, attention, un-rotation, `sigmoid(gate)`. float16 only, `block_size % 64 == 0` |
 | `turboquant_aiv` | `rotate_q` + `paged_attention` + `rotate_q` | 4-bit packed | every build and both dtypes; the only TurboQuant path with a CPU stand-in |
 | `dense_reference` | `scaled_dot_product_attention` | dense fp16/bf16 | the baseline in torch, for a host with no Ascend runtime |
 | `turboquant_reference` | torch | 4-bit packed | the 4-bit path in torch: rotate, quantise, pack, dequantise, attend, un-rotate |
 
-The first three launch Ascend C operators and are **refused** where those cannot
-run, rather than quietly falling back — a latency table torch produced under an
-Ascend backend's name would be worse than no table. A CPU with the operator
-stand-ins registered counts as able to run them; a CUDA device never does.
+`native_v5` and the two TurboQuant backends launch vendor or Ascend C operators
+and are **refused** where those cannot run, rather than quietly falling back — a
+latency table torch produced under an Ascend backend's name would be worse than
+no table. A CPU with the operator stand-ins registered counts as able to run
+them; a CUDA device never does.
+
+`cann_dense` is the exception, because it has no such operator to be missing:
+`torch.matmul` and `torch.softmax` exist everywhere, and on an NPU they are what
+torch_npu dispatches to CANN's `aclnnBatchMatMul` and `aclnnSoftmax`. So it
+builds on any device, and is CANN-native only in the sense that on an NPU the
+Cube and Vector units do the arithmetic. It materialises the score matrix, which
+a fused kernel does not, so a chunk's query rows are tiled to a fixed HBM budget
+(`_SCORE_TILE_ELEMENTS`); the tiling changes the launch count, never the result.
 
 ### The reference backends
 
@@ -117,28 +127,40 @@ Opening it needs the Ascend driver, so the first load happens on an NPU host.
 
 ### Ascend 950 and the dense path
 
-Ascend 950 refuses `aclnnFusedInferAttentionScore` V1 to V4 (`EZ9903`). V1–V4
-is what `torch_npu.npu_fused_infer_attention_score` drives. `native_v5` and the
-`dense_staging` pool therefore call `npu_fused_infer_attention_score_v2` (the
-V5 interface, which vllm-ascend's own attention uses). Prefill is TND over the
-paged cache, with `sparse_mode=3` and the compressed 2048 × 2048 int8 causal
-mask it requires; decode is one TND row per token with no mask. Two fallbacks
-cover a torch_npu that predates `_v2`:
+Ascend 950 refuses `aclnnFusedInferAttentionScore` V1 to V4 (`EZ9903`), and
+op-plugin reaches no further than V4: `torch_npu.npu_fused_infer_attention_score`
+launches V2/V3 and `npu_fused_infer_attention_score_v2` launches V4. So on a 950
+**every** `native_v5` entry point is refused, whatever the torch_npu build
+exports. Elsewhere the three are tried in order — `_v2` first, since that is what
+vllm-ascend's own attention calls, then the original entry point, then
+`npu_prompt_flash_attention` over the contiguous prefix, which has no block table
+and so serves prefill only. Prefill is TND over the paged cache with
+`sparse_mode=3` and the compressed 2048 × 2048 int8 causal mask it requires;
+decode is one TND row per token with no mask.
 
-- the original entry point, which works where V1–V4 are accepted;
-- `npu_prompt_flash_attention` over the contiguous prefix, for prefill only,
-  since it has no block table.
+Which one a run uses is not guessed. `smoke_glm.py` and `run_benchmark.py` first
+run a **pre-flight** (`preflight.py`), before any weights load. One synthetic
+layer, 16 tokens with GLM-4's head counts, is written, prefilled and decoded
+through every attention path the run will take, and checked against exact
+attention in float32. A path that raises fails, and so does one that runs but
+returns the wrong numbers.
 
-Which one a run uses is not guessed. `smoke_glm.py` first runs a **pre-flight**
-(`preflight.py`), before any weights load. One synthetic layer, 16 tokens with
-GLM-4's head counts, is written, prefilled and decoded through every attention
-path the run will take, and checked against exact attention in float32. A path
-that raises fails, and so does one that runs but returns the wrong numbers. The
-first dense entry point that passes is the one the run gets. If the dense
-prefill passes nowhere and `--prefill-mode` was not given, the run prefills
-through the decode backend (`batched_decode`) instead. If `dense_staging` was
-asked for explicitly, it stops with every probe's reason. `--skip-preflight`
-bypasses all of this.
+The fallback chain has two steps, in this order:
+
+1. the first `native_v5` entry point that passes;
+2. `cann_dense` — matmul, softmax, matmul — which calls no FIA interface at all
+   and is therefore what a 950 settles on. The `dense_staging` pool is built
+   through it, and the probes that failed on the way are printed with their
+   reasons.
+
+Only when neither runs does the prefill mode change: with `--prefill-mode` left
+to default the run prefills through the decode backend (`batched_decode`)
+instead, and if `dense_staging` was asked for explicitly it stops with every
+probe's reason. `--skip-preflight` bypasses all of this.
+
+Asking for `--backend native_v5` on a 950 is still refused rather than swapped
+for `cann_dense`: a named backend is a request to measure that backend. Ask for
+`--backend cann_dense` to get the unquantised baseline there.
 
 All five real calls (V5 prefill and decode, V1 prefill and decode, PFA prefill)
 bind to torch_npu 2.10.0.post4's schemas and pass its meta kernels at GLM-4's
@@ -186,6 +208,7 @@ hf_bridge.py     give a Hugging Face model's full-attention layers this KV cache
 tasks.py         LongBench prompts and metrics, and the synthetic NIAH generator
 cpu_reference.py serve the operators from the CPU, for a run with no device
 run_eval.py      the evaluation CLI
+run_benchmark.py NIAH retrieval, TTFT, decode percentiles and HBM across a context ladder
 smoke_dense.py   dense GQA end to end, against eager Hugging Face
 smoke_hf.py      a hybrid model through the bridge, against eager Hugging Face
 glm4.py          GLM-4: config.json to shape, fused-tensor splitting, prefill policy
@@ -311,3 +334,44 @@ to encode identically to 4.44. `--dummy-prompt` skips the tokenizer entirely: a
 
 DeepSeek-V4-Flash is **not implemented** in either route — MLA and the MoE stack
 are a separate adapter.
+
+## The context ladder (`run_benchmark.py`)
+
+`smoke_glm.py` answers *does this backend work at all*. `run_benchmark.py`
+answers *what does it cost, and does it still retrieve, as the context grows*:
+the same needle at every rung of a ladder, with the clock and the allocator read
+at each.
+
+```bash
+python tools/tq_longbench/run_benchmark.py --model-path /models/glm-4-9b-chat-1m --backends turboquant_cube,cann_dense --contexts 4096,8192,16384,32768,65536 --out-file bench.jsonl
+```
+
+One line per (backend, context):
+
+| column | what it is |
+|---|---|
+| `retrieved` | needles found over `--depths` (default `0, 0.25, 0.5, 0.75, 1`) |
+| `ttft ms` | time to first token: the prompt in, the first token chosen — prefill plus the argmax over its logits |
+| `p50 us` / `p99 us` | decode latency per token. The first step of a sequence pays first-touch costs no later step does, so it lands in P99 and not in P50 |
+| `kv MB` / `dense MB` | what the pools hold, against what the same context would have cost unquantised |
+| `peak MB` | the device allocator's own high-water mark, which includes transients no pool budget shows |
+
+A runner's KV pool is static and sized by `max_seq_len`, so **each rung builds
+its own runner** — a 4k rung measured inside a 64k runner would report 64k's
+memory. That costs a weight load per rung; `--reuse-runner` trades it away for
+one runner per backend sized to the longest rung, and the memory columns then
+describe that size at every rung.
+
+`--max-new-tokens` defaults to **48**, not to the needle task's own 16: the
+answer is a six-digit passcode behind whatever preamble the chat template
+invites, and a budget that ends mid-number scores as a miss that was not one. It
+is a budget, not a length — generation still stops at EOS. Note the difference
+from `smoke_glm.py`, where `--tokens` is context *in*.
+
+Both entry points set `USE_TF=0` and `TF_ENABLE_ONEDNN_OPTS=0` as they are
+imported, before anything can reach `transformers`. On a host whose TensorFlow
+predates NumPy 2, `transformers`' backend probe is not a slow no-op but an
+`AttributeError` out of `np.object` during the import itself.
+
+A record per item is written as it completes (`--out-file`, JSONL), so a ladder
+that dies at 64k still leaves 32k and below on disk.

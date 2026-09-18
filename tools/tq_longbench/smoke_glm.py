@@ -53,8 +53,16 @@ carries the tokenizer through ``transformers`` 4.28 (see there).
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
+
+#: Keep ``transformers`` from importing TensorFlow when it probes for a backend.
+#: Nothing here is a TF model, and on a host whose TensorFlow predates NumPy 2 the
+#: probe is not a slow no-op but an ``AttributeError`` out of ``np.object``/``np.bool``
+#: during ``import transformers`` -- a failure with nothing to do with the run.
+#: ``TF_ENABLE_ONEDNN_OPTS`` silences the banner a TF that does load prints.
+TENSORFLOW_OFF = {"USE_TF": "0", "TF_ENABLE_ONEDNN_OPTS": "0"}
 
 
 def _bootstrap_path() -> None:
@@ -64,7 +72,19 @@ def _bootstrap_path() -> None:
         sys.path.append(parent)
 
 
+def quiet_tensorflow() -> None:
+    """Apply :data:`TENSORFLOW_OFF`, unless the environment already said otherwise.
+
+    Import-time, not inside ``main``: ``transformers`` reads these once, when it
+    is first imported, and a caller that imports this module has already decided
+    to run the harness. An explicit ``USE_TF`` in the environment is left alone.
+    """
+    for name, value in TENSORFLOW_OFF.items():
+        os.environ.setdefault(name, value)
+
+
 _bootstrap_path()
+quiet_tensorflow()
 
 import argparse  # noqa: E402  (after the path bootstrap above)
 import gc  # noqa: E402
@@ -90,7 +110,12 @@ from tq_longbench.ops import (  # noqa: E402
     backend_names,
     dense_backend_for,
 )
-from tq_longbench.preflight import ProbeResult, probe_backend, select_dense_api  # noqa: E402
+from tq_longbench.preflight import (  # noqa: E402
+    ProbeResult,
+    probe_backend,
+    select_dense_api,
+    select_dense_backend,
+)
 from tq_longbench.tasks import needle_in_a_haystack  # noqa: E402
 
 _DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
@@ -217,7 +242,7 @@ def stop_at_eos(produced: list[int], eos_ids: set[int]) -> list[int]:
     return produced
 
 
-def _eos_ids(config: dict, tokenizer) -> set[int]:
+def eos_ids_for(config: dict, tokenizer) -> set[int]:
     configured = config.get("eos_token_id")
     ids = set(configured if isinstance(configured, list) else [configured] if configured is not None else [])
     if tokenizer is not None and tokenizer.eos_token_id is not None:
@@ -299,14 +324,39 @@ def register_declared_special_tokens(tokenizer, model_path: str) -> list[str]:
 
 
 def render(tokenizer, token_ids: list[int]) -> str:
-    """Text when there is a tokenizer, the raw ids under ``--dummy-prompt``."""
+    """Text when there is a tokenizer, the raw ids under ``--dummy-prompt``.
+
+    A tokenizer that cannot decode what the model produced falls back to the ids
+    rather than ending the run. GLM-4's remote-code tokenizer raises for an id
+    outside its tiktoken ranks -- which a wrong-basis decode emits, and which is
+    exactly the run whose output is worth seeing.
+    """
     if tokenizer is None:
         return f"ids {token_ids}"
-    return repr(tokenizer.decode(token_ids, skip_special_tokens=True))
+    text, failure = decode_text(tokenizer, token_ids)
+    return repr(text) if failure is None else f"<undecodable: {failure}> ids {token_ids}"
+
+
+def decode_text(tokenizer, token_ids: list[int]) -> tuple[str, str | None]:
+    """The continuation as text, and why it is empty when it is.
+
+    A decode that raises leaves the scoring to fail honestly -- an empty string
+    matches no needle -- instead of taking the run down with it. Which is worth
+    distinguishing from a model that answered wrongly, hence the second value.
+    """
+    try:
+        return tokenizer.decode(token_ids, skip_special_tokens=True), None
+    except Exception as error:  # a decode failure is a finding, not the end of the run
+        return "", f"{type(error).__name__}: {' '.join(str(error).split())[:80]}"
 
 
 def build_runner(
-    args, backend: str, prefill_mode: str, max_seq_len: int, dense_attention_api: str | None = None
+    args,
+    backend: str,
+    prefill_mode: str,
+    max_seq_len: int,
+    dense_attention_api: str | None = None,
+    dense_staging_backend: str | None = None,
 ) -> StandaloneModelRunner:
     runner = StandaloneModelRunner(
         RunnerConfig(
@@ -323,6 +373,7 @@ def build_runner(
             fold_output_rotation=not args.no_fold_output_rotation and backend not in DENSE_BACKENDS,
             seed=args.seed,
             dense_attention_api=dense_attention_api,
+            dense_staging_backend=dense_staging_backend,
         )
     )
     assert_no_vllm_imported()
@@ -335,12 +386,15 @@ class PreflightFailed(SystemExit):
 
 @dataclass
 class AttentionPlan:
-    """What the pre-flight settled: the prefill mode, and the torch_npu entry point each dense path uses."""
+    """What the pre-flight settled: the prefill mode, the staging backend, and each dense path's entry point."""
 
     prefill_mode: str
     #: ``native_v5``'s entry point when it is the decode (or reference) backend, and
     #: ``"staging"``'s when the dense_staging pool only prefills. Absent: torch_npu's default.
     dense_apis: dict[str, str | None] = field(default_factory=dict)
+    #: Which unquantised backend the dense_staging pool passed its probe as.
+    #: ``None`` where there is no staging pool, or where it failed everywhere.
+    staging_backend: str | None = None
     results: list[ProbeResult] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -379,9 +433,9 @@ def plan_attention(args, config: dict, prefill_mode: str) -> AttentionPlan:
         plan.results.extend(selection.results)
         need(
             selection.passed,
-            f"no torch_npu attention entry point runs {backend} here",
-            "Ascend 950 accepts only aclnnFusedInferAttentionScoreV5 (torch_npu.npu_fused_infer_attention_score_v2); "
-            "a torch_npu without it cannot run the dense baseline on this SoC.",
+            f"no attention entry point runs {backend} here",
+            "Ascend 950 refuses aclnnFusedInferAttentionScore V1-V4 (EZ9903), which is as far as op-plugin's "
+            "entry points reach; --backend cann_dense is the unquantised baseline that does not call it.",
         )
         plan.dense_apis[backend] = selection.api
 
@@ -394,10 +448,23 @@ def plan_attention(args, config: dict, prefill_mode: str) -> AttentionPlan:
         need(decode.passed, f"the {args.backend} decode does not run here", "see the error on its line above")
         if prefill_mode == "dense_staging":
             staging = dense_backend_for(args.device)
-            selection = select_dense_api(staging, layer, **probe, role="prefill", output_rotation_folded=folded)
+            selection = select_dense_backend(
+                args.device,
+                layer,
+                role="prefill",
+                output_rotation_folded=folded,
+                dtype=probe["dtype"],
+                block_size=probe["block_size"],
+            )
             plan.results.extend(selection.results)
             if selection.passed:
                 plan.dense_apis["staging"] = selection.api
+                plan.staging_backend = selection.backend
+                if selection.backend != staging:
+                    plan.notes.append(
+                        f"the dense_staging prefill runs through {selection.backend}, not {staging}: no fused "
+                        "attention entry point is accepted here (see the FAILED lines above)"
+                    )
             elif args.prefill_mode is None:
                 plan.prefill_mode = "batched_decode"
                 plan.notes.append(
@@ -479,11 +546,13 @@ def main(argv: list[str] | None = None) -> int:
     else:
         tokenizer = load_tokenizer(args.model_path)
         short_ids = encode(tokenizer, DEFAULT_PROMPT, use_chat_template)
-    eos_ids = _eos_ids(config, tokenizer)
+    eos_ids = eos_ids_for(config, tokenizer)
     max_seq_len = max(args.tokens, short_ids.numel()) + args.max_new_tokens + CONTEXT_HEADROOM_TOKENS
 
     print("=== 1. the contract ===")
-    runner = build_runner(args, args.backend, prefill_mode, max_seq_len, plan.dense_api_for(args.backend))
+    runner = build_runner(
+        args, args.backend, prefill_mode, max_seq_len, plan.dense_api_for(args.backend), plan.staging_backend
+    )
     shape = runner.shape
     print(
         f"  {shape.num_layers} layers, {shape.num_heads} heads / {shape.num_kv_heads} kv, D={shape.head_size}, "
@@ -508,7 +577,10 @@ def main(argv: list[str] | None = None) -> int:
     produced = stop_at_eos(produced, eos_ids)
     summary = metrics.summary()
     print(f"  {args.backend:20s} {render(tokenizer, produced)}")
-    print(f"  {'':20s} decode p50 {summary['decode_p50_us']:.0f} us, p99 {summary['decode_p99_us']:.0f} us")
+    print(
+        f"  {'':20s} ttft {summary['ttft_ms']:.0f} ms, decode p50 {summary['decode_p50_us']:.0f} us, "
+        f"p99 {summary['decode_p99_us']:.0f} us, peak {summary['device_peak_mb']:.0f} MB"
+    )
 
     if args.reference_backend:
         reference_mode = "dense_staging" if args.reference_backend in DENSE_BACKENDS else prefill_mode
@@ -528,7 +600,9 @@ def main(argv: list[str] | None = None) -> int:
         del reference
         _free(args.device)
         runner = (
-            build_runner(args, args.backend, prefill_mode, max_seq_len, plan.dense_api_for(args.backend))
+            build_runner(
+                args, args.backend, prefill_mode, max_seq_len, plan.dense_api_for(args.backend), plan.staging_backend
+            )
             if args.tokens
             else None
         )
@@ -541,14 +615,14 @@ def main(argv: list[str] | None = None) -> int:
             item = needle_in_a_haystack(args.tokens, depth=depth, seed=int(depth * 100) + args.seed)
             prompt_ids = truncate_middle(encode(tokenizer, item.prompt, use_chat_template), keep)
             produced, metrics = runner.generate(prompt_ids.to(runner.device), max_new_tokens=args.max_new_tokens)
-            answer = tokenizer.decode(stop_at_eos(produced, eos_ids), skip_special_tokens=True)
+            answer, failure = decode_text(tokenizer, stop_at_eos(produced, eos_ids))
             found = item.answers[0] in answer
             hits += found
             summary = metrics.summary()
             print(
                 f"    depth {depth:<5} tokens={prompt_ids.numel():>7} found={str(found):5s} "
-                f"prefill {summary['prefill_seconds']:.1f}s decode p50 {summary['decode_p50_us']:.0f} us "
-                f"{answer.strip()[:40]!r}"
+                f"ttft {summary['ttft_ms']:.0f} ms decode p50 {summary['decode_p50_us']:.0f} us "
+                f"{answer.strip()[:40]!r}" + (f" <undecodable: {failure}>" if failure else "")
             )
         print(f"  {args.backend}: {hits}/{len(depths)} retrieved")
     return 0

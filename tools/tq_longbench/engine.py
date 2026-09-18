@@ -102,6 +102,11 @@ class RunnerConfig:
     #: takes the most preferred one torch_npu has. ``smoke_glm``'s pre-flight
     #: fills it with the one that actually ran on this SoC.
     dense_attention_api: str | None = None
+    #: Which unquantised backend ``dense_staging`` allocates its pool through;
+    #: ``None`` takes :func:`ops.dense_backend_for`. The pre-flight fills it when
+    #: the preferred one is refused here -- an Ascend 950 stages through
+    #: ``cann_dense``, because op-plugin's fused attention is refused on it.
+    dense_staging_backend: str | None = None
 
     def __post_init__(self) -> None:
         if self.prefill_mode not in PREFILL_MODES:
@@ -113,6 +118,11 @@ class RunnerConfig:
             )
         if self.chunk_size <= 0:
             raise ValueError(f"chunk_size must be positive, got {self.chunk_size}")
+        if self.dense_staging_backend is not None and self.dense_staging_backend not in DENSE_BACKENDS:
+            raise ValueError(
+                f"dense_staging_backend {self.dense_staging_backend!r} does not decode out of an unquantised "
+                f"cache; choose one of {sorted(DENSE_BACKENDS)}"
+            )
 
 
 @dataclass
@@ -122,9 +132,18 @@ class RunMetrics:
     prompt_tokens: int = 0
     generated_tokens: int = 0
     prefill_seconds: float = 0.0
+    #: Time to first token: the prompt in, the first token chosen. Prefill plus
+    #: the argmax that reads its logits, which is the only work between them.
+    ttft_seconds: float = 0.0
     decode_step_us: list[float] = field(default_factory=list)
     kv_cache_mb: float = 0.0
     dense_equivalent_mb: float = 0.0
+    #: Device memory at the end of the run, from the allocator rather than the
+    #: pools: what the caches hold is budgeted, what the run peaked at is measured.
+    #: Zero on a device with no allocator to ask (CPU).
+    device_allocated_mb: float = 0.0
+    device_peak_mb: float = 0.0
+    device_reserved_mb: float = 0.0
 
     @property
     def prefill_tokens_per_second(self) -> float:
@@ -147,12 +166,16 @@ class RunMetrics:
             "generated_tokens": self.generated_tokens,
             "prefill_seconds": round(self.prefill_seconds, 4),
             "prefill_tokens_per_second": round(self.prefill_tokens_per_second, 2),
+            "ttft_ms": round(self.ttft_seconds * 1e3, 2),
             "decode_p50_us": round(self.percentile(0.50), 2),
             "decode_p90_us": round(self.percentile(0.90), 2),
             "decode_p99_us": round(self.percentile(0.99), 2),
             "kv_cache_mb": round(self.kv_cache_mb, 2),
             "dense_equivalent_mb": round(self.dense_equivalent_mb, 2),
             "kv_saved_mb": round(self.kv_saved_mb, 2),
+            "device_allocated_mb": round(self.device_allocated_mb, 2),
+            "device_peak_mb": round(self.device_peak_mb, 2),
+            "device_reserved_mb": round(self.device_reserved_mb, 2),
         }
 
 
@@ -195,7 +218,7 @@ class StandaloneModelRunner:
         if config.prefill_mode == "dense_staging" and config.backend not in DENSE_BACKENDS:
             # Folded like the decode: its output feeds the same o_proj.
             self.prefill_backend: AttentionBackend = build_backend(
-                dense_backend_for(self.device),
+                config.dense_staging_backend or dense_backend_for(self.device),
                 self.geometry,
                 layer_shape,
                 self.device,
@@ -413,6 +436,8 @@ class StandaloneModelRunner:
     def generate(self, token_ids: torch.Tensor, max_new_tokens: int | None = None) -> tuple[list[int], RunMetrics]:
         """Greedy continuation of ``token_ids``; returns the new tokens and what they cost."""
         metrics = RunMetrics(**self._memory_metrics())
+        _reset_peak_memory(self.device)
+        started = time.perf_counter()
         logits = self.prefill(token_ids, metrics)
         produced: list[int] = []
         position = token_ids.numel()
@@ -420,18 +445,24 @@ class StandaloneModelRunner:
 
         for _ in range(limit):
             next_token = int(torch.argmax(logits[-1]))
+            if not produced:
+                # argmax syncs on its own (the id crosses to the host), so this
+                # boundary is the token existing, not the launch being queued.
+                metrics.ttft_seconds = time.perf_counter() - started
             produced.append(next_token)
             if position + 1 > self.config.max_seq_len:
                 break
             step = torch.tensor([next_token], dtype=torch.int64, device=self.device)
             batch = self._batch(position, 1, is_decode=True)
             _synchronize(self.device)
-            started = time.perf_counter()
+            step_started = time.perf_counter()
             logits = self.model(step, batch, self.write_backends, self.decode_backend)
             _synchronize(self.device)
-            metrics.decode_step_us.append((time.perf_counter() - started) * 1e6)
+            metrics.decode_step_us.append((time.perf_counter() - step_started) * 1e6)
             position += 1
         metrics.generated_tokens = len(produced)
+        for name, value in device_memory_mb(self.device).items():
+            setattr(metrics, name, value)
         return produced, metrics
 
     def _memory_metrics(self) -> dict:
@@ -477,6 +508,34 @@ def _map_checkpoint_name(name: str) -> str | None:
     if rest.startswith("mlp.") or rest in ("input_layernorm.weight", "post_attention_layernorm.weight"):
         return f"layers.{index}.{rest}"
     return None
+
+
+def device_memory_mb(device: torch.device) -> dict:
+    """What the allocator holds on ``device``, in megabytes; zeros where there is no allocator.
+
+    The pools' own arithmetic (:meth:`StandaloneModelRunner.memory_report`) says
+    what the caches were budgeted. This says what the process actually took --
+    weights, pools, and whatever a prefill chunk's score matrix peaked at, which
+    on ``cann_dense`` is the largest transient in the run and is invisible to a
+    budget.
+    """
+    module = getattr(torch, device.type, None)
+    if module is None or not all(hasattr(module, name) for name in ("memory_allocated", "max_memory_allocated")):
+        return {"device_allocated_mb": 0.0, "device_peak_mb": 0.0, "device_reserved_mb": 0.0}
+    reserved = getattr(module, "memory_reserved", None)
+    return {
+        "device_allocated_mb": module.memory_allocated(device) / _MEGABYTE,
+        "device_peak_mb": module.max_memory_allocated(device) / _MEGABYTE,
+        "device_reserved_mb": (reserved(device) if reserved else 0) / _MEGABYTE,
+    }
+
+
+def _reset_peak_memory(device: torch.device) -> None:
+    """Start a sequence's peak from here, so one run's transients are not the next one's."""
+    module = getattr(torch, device.type, None)
+    reset = getattr(module, "reset_peak_memory_stats", None)
+    if reset is not None:
+        reset(device)
 
 
 def _synchronize(device: torch.device) -> None:

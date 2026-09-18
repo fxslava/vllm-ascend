@@ -38,6 +38,7 @@ __all__ = [
     "ops",
     "preflight",
     "reference",
+    "run_benchmark",
     "run_eval",
     "smoke_dense",
     "smoke_glm",
