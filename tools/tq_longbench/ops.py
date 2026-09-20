@@ -108,6 +108,17 @@ class LayerShape:
             raise ValueError(f"num_heads {self.num_heads} is not a multiple of num_kv_heads {self.num_kv_heads}")
 
 
+def longest_context(context_lens: torch.Tensor) -> int:
+    """The longest context length, read back to the host.
+
+    Named rather than inlined because it is the synchronisation the static decode
+    path exists to remove: every call is a device-to-host copy, and on the decode
+    it happens once per layer per step. A backend handed a ``window`` never
+    reaches here.
+    """
+    return int(context_lens.max()) if context_lens.numel() else 0
+
+
 class AttentionBackend(abc.ABC):
     """One decode path, bound to one cache pool, serving every layer of the model."""
 
@@ -118,6 +129,20 @@ class AttentionBackend(abc.ABC):
     #: Whether the ``o_proj`` this backend feeds has Pi folded into it, so the
     #: attention output must leave in the rotated basis, ``O Pi``.
     output_rotation_folded: bool = False
+    #: Whether :meth:`decode` runs with no device-to-host copy when it is given a
+    #: ``window``. False means every step reads its own context lengths back --
+    #: correct, but a stall per layer per step, and not something a graph can be
+    #: captured around: the lengths would be frozen at the length the capture saw.
+    supports_static_decode: bool = False
+    #: Whether *every* call this backend makes on the decode path -- the cache
+    #: write as well as the decode -- has a shape fixed before it runs. This is
+    #: the stricter of the two and the one graph capture needs, because a shape
+    #: that depends on a tensor's values is a host read wherever it appears.
+    #: Separate from :attr:`supports_static_decode` because the two can differ:
+    #: :class:`~tq_longbench.reference.TurboQuantReferenceBackend` decodes
+    #: without asking the host anything and still cannot be captured, because its
+    #: write filters padding slots with a boolean mask.
+    supports_graph_capture: bool = False
 
     def __init__(self, geometry: CacheGeometry, shape: LayerShape, device: torch.device) -> None:
         self.geometry = geometry
@@ -151,12 +176,22 @@ class AttentionBackend(abc.ABC):
         context_lens: torch.Tensor,
         out: torch.Tensor,
         gate: torch.Tensor | None = None,
+        window: int | None = None,
     ) -> torch.Tensor:
         """Attend ``query`` ``[num_tokens, num_heads, head_size]`` over each token's prefix.
 
         ``context_lens`` holds one length per query token, so the same call
         serves a single decode step and a whole prefill chunk presented as a
         batch of per-position decodes.
+
+        ``window`` fixes how many cache slots the call reads. Without it each
+        backend asks ``context_lens`` for its longest entry, which is a
+        device-to-host copy -- one per layer per step, and illegal inside a graph
+        capture. With it the shape is a constant the caller chose and the lengths
+        are only ever read on the device, as the mask they already were.
+        It must cover every length in ``context_lens``; slots past a row's own
+        length are masked off exactly as they always were, so a window wider
+        than the prefix costs reads and changes no number.
         """
 
     def prefill_chunk(
@@ -180,7 +215,7 @@ class AttentionBackend(abc.ABC):
         if first < 0:
             raise ValueError(f"a {count}-token chunk cannot end at prefix {prefix_end}")
         context_lens = torch.arange(first + 1, prefix_end + 1, dtype=torch.int32, device=query.device)
-        return self.decode(layer, query, context_lens, out, gate)
+        return self.decode(layer, query, context_lens, out, gate, window=prefix_end)
 
     def check_tie_point(self, context_lens: torch.Tensor, expected_prefix: int) -> None:
         """Refuse a decode whose kv length disagrees with the prefix actually written.
@@ -275,6 +310,20 @@ class _DensePagedBackend(AttentionBackend):
             out.mul_(torch.sigmoid(gate).view_as(out))
         return self._into_folded_basis(out)
 
+    def _columns(self, length: int) -> torch.Tensor:
+        """``arange(length)`` for the mask, built once for the longest length asked for.
+
+        A fresh ``arange`` per layer per step is a launch and an allocation for a
+        tensor that is the same every time. One buffer, grown as needed and
+        sliced, is neither -- and under graph capture the slice is a view of an
+        address the replay already knows.
+        """
+        cached = getattr(self, "_column_index", None)
+        if cached is None or cached.numel() < length:
+            cached = torch.arange(max(length, self.geometry.max_seq_len), device=self.device)
+            self._column_index = cached
+        return cached[:length]
+
     def _prefix(self, layer: int, length: int) -> tuple[torch.Tensor, torch.Tensor]:
         """The first ``length`` cached K and V as ``[length, H_kv, D]``, without a copy.
 
@@ -331,8 +380,16 @@ class NativeV5Backend(_DensePagedBackend):
         context_lens: torch.Tensor,
         out: torch.Tensor,
         gate: torch.Tensor | None = None,
+        window: int | None = None,
     ) -> torch.Tensor:
-        """Each query token a sequence of its own (TND), attending its whole context: no mask."""
+        """Each query token a sequence of its own (TND), attending its whole context: no mask.
+
+        ``window`` sizes the block table, and that is as far as it reaches here:
+        both entry points take the kv lengths as a Python list, so they cross to
+        the host whatever the window says. Hence ``supports_static_decode`` is
+        left False -- this is the one backend a graph cannot be captured around,
+        and saying so beats capturing one whose sequence lengths were frozen.
+        """
         if self.attention_api not in _DECODE_CAPABLE_APIS:
             raise NotImplementedError(
                 f"{self.attention_api} has no block table, so it cannot decode out of the paged cache; "
@@ -340,7 +397,7 @@ class NativeV5Backend(_DensePagedBackend):
             )
         num_tokens = query.shape[0]
         key, value = self.cache.flat(layer)
-        block_table = self.cache.block_table(int(context_lens.max()) if context_lens.numel() else 0)
+        block_table = self.cache.block_table(window if window is not None else longest_context(context_lens))
         block_tables = block_table.expand(num_tokens, -1).contiguous()
         query_lens = list(range(1, num_tokens + 1))
         if self.attention_api == "fia_v5":
@@ -484,6 +541,10 @@ class CANNDenseBackend(_DensePagedBackend):
     """
 
     name = "cann_dense"
+    # Matmul, softmax, matmul: nothing here asks the host anything once the
+    # window is fixed, and the cache write is a scatter at a fixed shape.
+    supports_static_decode = True
+    supports_graph_capture = True
 
     def decode(
         self,
@@ -492,15 +553,18 @@ class CANNDenseBackend(_DensePagedBackend):
         context_lens: torch.Tensor,
         out: torch.Tensor,
         gate: torch.Tensor | None = None,
+        window: int | None = None,
     ) -> torch.Tensor:
-        """Each query row attends its whole context: visible length is the context length."""
+        """Each query row attends its whole context: visible length is the context length.
+
+        Without a ``window`` the longest length is read back to the host, because
+        how much of the pool to slice is then a host decision -- a device-to-host
+        sync per layer per step. With one, the slice is the caller's constant and
+        the lengths stay on the device, where :meth:`_attend`'s mask reads them.
+        """
         lengths = context_lens.to(device=query.device, dtype=torch.int64).reshape(-1)
-        # A device-to-host sync per layer per step, because how much of the pool to
-        # slice is a host decision. Unavoidable here and not new: the tie-point check
-        # the caller runs first, and NativeV5Backend's actual_seq_kvlen list, both
-        # already read this same tensor back on every layer.
-        longest = int(lengths.max()) if lengths.numel() else 0
-        return self._finish(self._attend(layer, query, lengths, longest), out, gate)
+        longest = window if window is not None else longest_context(lengths)
+        return self._finish(self._attend(layer, query, lengths, longest, checked=window is not None), out, gate)
 
     def prefill_chunk(
         self,
@@ -522,9 +586,11 @@ class CANNDenseBackend(_DensePagedBackend):
         if first < 0:
             raise ValueError(f"a {count}-token chunk cannot end at prefix {prefix_end}")
         lengths = torch.arange(first + 1, prefix_end + 1, dtype=torch.int64, device=query.device)
-        return self._finish(self._attend(layer, query, lengths, prefix_end), out, gate)
+        return self._finish(self._attend(layer, query, lengths, prefix_end, checked=True), out, gate)
 
-    def _attend(self, layer: int, query: torch.Tensor, lengths: torch.Tensor, longest: int) -> torch.Tensor:
+    def _attend(
+        self, layer: int, query: torch.Tensor, lengths: torch.Tensor, longest: int, checked: bool = False
+    ) -> torch.Tensor:
         """``query`` ``[q, H, D]`` over the prefix, row ``r`` seeing columns ``0 .. lengths[r] - 1``.
 
         The query heads sharing a kv head are folded into the batched matmul's rows,
@@ -549,8 +615,12 @@ class CANNDenseBackend(_DensePagedBackend):
         if lengths.numel() != query.shape[0]:
             raise ValueError(f"{lengths.numel()} context lengths for {query.shape[0]} query rows")
         # An all-masked row would leave softmax dividing by zero and return NaN,
-        # which nothing downstream raises on.
-        if lengths.numel() and int(lengths.min()) < 1:
+        # which nothing downstream raises on. Reading the shortest length back to
+        # the host is the only way to notice, so it is skipped for a caller that
+        # has already established the lengths are positive -- which both callers
+        # that fix a window have: a decode's length is its position plus one, and
+        # a prefill chunk's are ``arange(first + 1, ...)`` after ``first >= 0``.
+        if not checked and lengths.numel() and int(lengths.min()) < 1:
             raise ValueError("a query row with a context length of 0 attends to nothing; there is no answer to return")
         if longest > self.geometry.max_seq_len:
             raise RuntimeError(f"context length {longest} exceeds the {self.geometry.max_seq_len}-token static cache")
@@ -561,7 +631,7 @@ class CANNDenseBackend(_DensePagedBackend):
         keys, values = self._prefix(layer, longest)
         keys_t = keys.permute(1, 2, 0)  # [H_kv, D, k]
         values_t = values.permute(1, 0, 2)  # [H_kv, k, D]
-        columns = torch.arange(longest, device=query.device).view(1, 1, 1, -1)
+        columns = self._columns(longest).view(1, 1, 1, -1)
 
         rows_per_tile = max(1, _SCORE_TILE_ELEMENTS // max(1, heads * longest))
         tiles = []
@@ -662,6 +732,13 @@ class TurboQuantCubeBackend(_TurboQuantBackend):
     """
 
     name = "turboquant_cube"
+    # The kernel takes the context lengths as a device tensor and the writer
+    # takes the slots as one; with the block table's width fixed, a step asks
+    # the host nothing. Capture is declared but has not been exercised on
+    # silicon from here -- a device that refuses it falls back (decode_graph
+    # 'auto'), which is what that mode is for.
+    supports_static_decode = True
+    supports_graph_capture = True
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -718,10 +795,11 @@ class TurboQuantCubeBackend(_TurboQuantBackend):
         context_lens: torch.Tensor,
         out: torch.Tensor,
         gate: torch.Tensor | None = None,
+        window: int | None = None,
     ) -> torch.Tensor:
         num_tokens = query.shape[0]
         key_plane, value_plane, scale_plane = self.cache.planes(layer)
-        block_table = self.cache.block_table(int(context_lens.max()) if context_lens.numel() else 0)
+        block_table = self.cache.block_table(window if window is not None else longest_context(context_lens))
         block_tables = block_table.expand(num_tokens, -1).contiguous()
         ascend_ops().npu_turboquant_cube_decode(
             query.contiguous(),
@@ -755,6 +833,13 @@ class TurboQuantAivBackend(_TurboQuantBackend):
     """
 
     name = "turboquant_aiv"
+    # The kernel takes the context lengths as a device tensor and the writer
+    # takes the slots as one; with the block table's width fixed, a step asks
+    # the host nothing. Capture is declared but has not been exercised on
+    # silicon from here -- a device that refuses it falls back (decode_graph
+    # 'auto'), which is what that mode is for.
+    supports_static_decode = True
+    supports_graph_capture = True
 
     @property
     def _writer(self):
@@ -778,13 +863,14 @@ class TurboQuantAivBackend(_TurboQuantBackend):
         context_lens: torch.Tensor,
         out: torch.Tensor,
         gate: torch.Tensor | None = None,
+        window: int | None = None,
     ) -> torch.Tensor:
         ops = ascend_ops()
         num_tokens = query.shape[0]
         rotated = self._rotated_query_buffer(num_tokens)
         ops.npu_turboquant_rotate_q(query.contiguous(), self._pi_signs, self._write_tables, self._hadamard16, rotated)
         key_plane, value_plane, scale_plane = self.cache.planes(layer)
-        block_table = self.cache.block_table(int(context_lens.max()) if context_lens.numel() else 0)
+        block_table = self.cache.block_table(window if window is not None else longest_context(context_lens))
         block_tables = block_table.expand(num_tokens, -1).contiguous()
         ops.npu_turboquant_paged_attention(
             rotated,

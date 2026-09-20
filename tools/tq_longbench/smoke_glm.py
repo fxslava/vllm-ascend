@@ -14,27 +14,38 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
-"""Smoke-test GLM-4 (``THUDM/glm-4-9b-chat-1m``) through the standalone runner.
+"""Smoke-test one checkpoint through the standalone runner, on whatever device it has.
 
     python tools/tq_longbench/smoke_glm.py --model-path /models/glm-4-9b-chat-1m \\
         --device npu --backend turboquant_cube --tokens 131072
 
-Four stages, in order:
+    python tools/tq_longbench/smoke_glm.py --model-path F:/AI/models/Qwen2.5-3B-Instruct \\
+        --device cuda --backend cann_dense --tokens 256 --max-new-tokens 32
+
+Nothing below is GLM-4's by construction. The shape comes off ``config.json``
+through :func:`~tq_longbench.engine.read_checkpoint_shape` -- head counts, head
+size, the RoPE base and how much of each head it rotates -- and what the config
+cannot state (which tokens end a turn, how a turn is assembled) comes from the
+family :func:`~tq_longbench.families.family_for` reads out of ``model_type``.
+``chatglm`` is GLM-4's half-width *interleaved* RoPE over 32 query heads and 4 kv,
+with three stop tokens its config declares none of; ``qwen2`` is Qwen2.5's
+full-width NeoX RoPE at ``theta = 1e6``, 16 query heads over 2 kv, and ChatML.
+Both run the same four stages, and neither is hardcoded anywhere in this file.
 
 0. **Pre-flight**, before a byte of the checkpoint is read: every attention path
    the run will take -- the decode backend, the dense_staging prefill, the
-   reference backend -- runs one synthetic layer with GLM-4's head counts and is
-   checked against exact attention (:mod:`tq_longbench.preflight`). An operator
-   the SoC refuses fails here in well under the time ingestion takes. When the
-   dense prefill is what fails and ``--prefill-mode`` was left to default, the
-   run switches to ``batched_decode`` rather than stopping; the torch_npu entry
-   point that did pass is the one the run then uses. ``--skip-preflight`` skips it.
-1. **The contract.** The shape read off ``config.json`` (head counts, the
-   half-width interleaved RoPE, the qkv bias), and the decode's output stage:
-   ungated, with ``W_o' = W_o (I (x) Pi)`` folded at ingestion, the Cube decode
-   must run ``ROTATED_BASIS`` -- the kernel's ``kRotatedBasis``, stage 0, where
-   its output passes straight to ``o_proj`` with nothing un-rotated in-kernel.
-   Anything else is refused before a token is generated.
+   reference backend -- runs one synthetic layer with *this checkpoint's* head
+   counts and is checked against exact attention (:mod:`tq_longbench.preflight`).
+   An operator the SoC refuses fails here in well under the time ingestion takes.
+   When the dense prefill is what fails and ``--prefill-mode`` was left to
+   default, the run switches to ``batched_decode`` rather than stopping; the
+   torch_npu entry point that did pass is the one the run then uses.
+   ``--skip-preflight`` skips it.
+1. **The contract.** The shape read off ``config.json``, and the decode's output
+   stage: ungated, with ``W_o' = W_o (I (x) Pi)`` folded at ingestion, the Cube
+   decode must run ``ROTATED_BASIS`` -- the kernel's ``kRotatedBasis``, stage 0,
+   where its output passes straight to ``o_proj`` with nothing un-rotated
+   in-kernel. Anything else is refused before a token is generated.
 2. **A short prompt**, greedy, with the decode latency it cost.
 3. **Needle in a haystack** at ``--tokens``, one prefill per depth.
 
@@ -47,8 +58,8 @@ the unquantised cache.
 
 ``--dummy-prompt`` skips the tokenizer altogether -- a 64-token prompt of ones,
 the short prompt only -- for a kernel sanity check on a host whose
-``transformers`` cannot load GLM-4's tokenizer. Without it, :func:`load_tokenizer`
-carries the tokenizer through ``transformers`` 4.28 (see there).
+``transformers`` cannot load the checkpoint's tokenizer. Without it,
+:func:`load_tokenizer` carries GLM-4's through ``transformers`` 4.28 (see there).
 """
 
 from __future__ import annotations
@@ -96,18 +107,20 @@ import torch  # noqa: E402
 
 from tq_longbench._ascend import assert_no_vllm_imported, turboquant_layout  # noqa: E402
 from tq_longbench.engine import (  # noqa: E402
+    DECODE_GRAPH_MODES,
     DEFAULT_CHUNK_SIZE,
     PREFILL_MODES,
     RunnerConfig,
     StandaloneModelRunner,
+    read_checkpoint_shape,
 )
-from tq_longbench.glm4 import (  # noqa: E402
-    GLM4_BATCHED_DECODE_MIN_TOKENS,
-    glm4_model_shape,
-    glm4_prefill_mode,
-    is_glm4_config,
-    read_config,
+from tq_longbench.families import (  # noqa: E402
+    DENSE_STAGING_MAX_TOKENS,
+    GLM4,
+    ModelFamily,
+    family_for,
 )
+from tq_longbench.glm4 import read_config  # noqa: E402
 from tq_longbench.layers import FOLD_SITES  # noqa: E402
 from tq_longbench.ops import (  # noqa: E402
     DENSE_BACKENDS,
@@ -141,9 +154,14 @@ DUMMY_PROMPT_SHAPE = (1, 64)
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python tools/tq_longbench/smoke_glm.py",
-        description="Run GLM-4 (glm-4-9b-chat-1m) through the standalone runner with the folded-o_proj contract.",
+        description="Run a checkpoint through the standalone runner with the folded-o_proj contract.",
     )
-    parser.add_argument("--model-path", required=True, help="directory holding config.json and safetensors shards")
+    parser.add_argument(
+        "--model-path",
+        required=True,
+        type=model_directory,
+        help="directory holding config.json and safetensors shards; a Windows path in either slash is fine",
+    )
     parser.add_argument("--device", default="npu", help="npu, npu:N, cuda:N or cpu (default: npu)")
     parser.add_argument("--backend", default="turboquant_cube", choices=backend_names())
     parser.add_argument(
@@ -156,7 +174,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--prefill-mode",
         default=None,
         choices=list(PREFILL_MODES),
-        help=f"default: batched_decode from {GLM4_BATCHED_DECODE_MIN_TOKENS} context tokens up, dense_staging below",
+        help="default: the family's policy -- for GLM-4 and Qwen2.5, batched_decode from "
+        f"{DENSE_STAGING_MAX_TOKENS} context tokens up and dense_staging below",
     )
     parser.add_argument("--depths", default=DEFAULT_DEPTHS, help="comma-separated needle depths in [0, 1]")
     parser.add_argument("--max-new-tokens", type=int, default=32)
@@ -192,8 +211,48 @@ def build_parser() -> argparse.ArgumentParser:
         choices=list(FOLD_SITES),
         help="where the o_proj fold runs: auto (the device when there is one), host, or device",
     )
+    parser.add_argument(
+        "--decode-graph",
+        default="auto",
+        choices=list(DECODE_GRAPH_MODES),
+        help="capture the single-token decode as a device graph: auto (where the device and backend allow it), "
+        "on (refuse a run that cannot), off (launch it a kernel at a time -- the baseline to compare against)",
+    )
     parser.add_argument("--seed", type=int, default=0)
     return parser
+
+
+def model_directory(text: str) -> str:
+    """``--model-path`` written the way this host spells paths, whatever was typed.
+
+    Three things a checkpoint directory brings that are not the caller's problem,
+    and all three are Windows': the separator, since ``F:/AI/models/X`` and
+    ``F:\\AI\\models\\X`` are one directory and :class:`~pathlib.Path` already
+    knows it; a trailing separator tab-completion leaves behind; and ``~`` or a
+    ``%VAR%`` the shell did not expand. Normalised once here so that every later
+    ``Path(model_path) / ...`` and every message quoting it agree on one spelling.
+
+    Nothing is opened: an ``argparse`` type runs while the parser is still being
+    built, and whether the directory exists is :func:`require_checkpoint`'s
+    question, asked once in :func:`main` where the answer can be a sentence.
+    """
+    return str(Path(os.path.expandvars(text)).expanduser())
+
+
+def require_checkpoint(model_path: str) -> None:
+    """Refuse a ``--model-path`` that is not a checkpoint directory, before anything reads it.
+
+    Because of what the first read would say instead: a directory that does not
+    exist surfaces as ``FileNotFoundError: no safetensors shards under ...`` from
+    inside the weight load, three stages and a pre-flight later, and a config
+    that is not there reads as ``model_type None``. A typo in a drive letter
+    deserves to be one sentence at the top of the run.
+    """
+    path = Path(model_path)
+    if not path.is_dir():
+        raise SystemExit(f"--model-path {model_path} is not a directory")
+    if not (path / "config.json").is_file():
+        raise SystemExit(f"--model-path {model_path} holds no config.json; it wants the checkpoint directory")
 
 
 def resolve_device(name: str) -> torch.device:
@@ -212,9 +271,18 @@ def parse_depths(text: str) -> tuple[float, ...]:
     return depths
 
 
-def choose_prefill_mode(args: argparse.Namespace) -> str:
-    mode = args.prefill_mode or glm4_prefill_mode(args.tokens, args.backend)
-    if mode == "dense_staging" and args.tokens >= GLM4_BATCHED_DECODE_MIN_TOKENS and args.backend not in DENSE_BACKENDS:
+def choose_prefill_mode(args: argparse.Namespace, family: ModelFamily) -> str:
+    """``--prefill-mode`` if given, else the family's policy -- and a warning where they differ.
+
+    The warning is the flag overriding the policy, not a length: it fires exactly
+    when ``--prefill-mode dense_staging`` was asked for somewhere the family
+    would have prefilled through the decode instead. A dense baseline decodes out
+    of the unquantised pool, so for it the policy *is* ``dense_staging`` and there
+    is nothing to warn about.
+    """
+    policy = family.prefill_mode(args.tokens, args.backend)
+    mode = args.prefill_mode or policy
+    if mode == "dense_staging" and policy == "batched_decode":
         print(
             f"  warning: dense_staging at {args.tokens} tokens allocates a full fp16 KV pool beside the quantised "
             "one; batched_decode is the default here because that pool is what exhausts HBM",
@@ -223,92 +291,7 @@ def choose_prefill_mode(args: argparse.Namespace) -> str:
     return mode
 
 
-#: GLM-4's stop tokens, and the ids ``glm-4-9b-chat`` and ``-1m`` give them.
-#: All three end an assistant turn: ``<|endoftext|>`` ends the document,
-#: ``<|user|>`` starts the next turn, and ``<|observation|>`` hands control to a
-#: tool. Generation that ignores the last two runs straight on into a turn it
-#: then has to invent both halves of, which is what rambling into the haystack
-#: looks like from the inside.
-#:
-#: The ids are a fallback, not the lookup: :func:`special_token_id` resolves each
-#: by name through the tokenizer first, so a checkpoint that numbers them
-#: differently still stops. They are written down because the alternative -- an
-#: empty stop set -- fails silently, and because ``config.json`` for these
-#: checkpoints carries no ``eos_token_id`` at all to fall back on.
-GLM4_STOP_TOKENS = {"<|endoftext|>": 151329, "<|user|>": 151336, "<|observation|>": 151338}
-
-#: The tokens GLM-4's chat template is built from, with the same published ids.
-#: ``[gMASK]<sop>`` is the document prefix the tokenizer normally prepends itself;
-#: ``<|user|>`` and ``<|assistant|>`` are the turn markers.
-GLM4_TEMPLATE_TOKENS = {"[gMASK]": 151331, "<sop>": 151333, "<|user|>": 151336, "<|assistant|>": 151337}
-
-
-def special_token_id(tokenizer, name: str, published: int) -> int:
-    """The id this tokenizer gives ``name``, or the published one if it does not know it.
-
-    Three places to look, because which of them answers depends on the
-    ``transformers`` release: the added-token table :func:`register_declared_special_tokens`
-    fills on 4.28, the tokenizer's own conversion on anything newer, and the
-    constant as the last word. A lookup that returns the unknown-token id is
-    treated as not knowing, since ``<unk>`` is not a stop token and would quietly
-    truncate every continuation at the first unknown word.
-    """
-    table = getattr(tokenizer, "added_tokens_encoder", None) or {}
-    if name in table:
-        return int(table[name])
-    convert = getattr(tokenizer, "convert_tokens_to_ids", None)
-    if convert is not None:
-        try:
-            resolved = convert(name)
-        except Exception:  # a tokenizer that raises for an unknown token has answered
-            resolved = None
-        unknown = getattr(tokenizer, "unk_token_id", None)
-        if isinstance(resolved, int) and resolved != unknown:
-            return resolved
-    return published
-
-
-def glm4_stop_ids(tokenizer) -> set[int]:
-    """Every id that should end a GLM-4 assistant turn."""
-    return {special_token_id(tokenizer, name, published) for name, published in GLM4_STOP_TOKENS.items()}
-
-
-def glm4_chat_prompt_ids(tokenizer, text: str) -> torch.Tensor:
-    """``[gMASK]<sop><|user|>\\n{text}\\n<|assistant|>`` as ids, assembled rather than parsed.
-
-    The special tokens are put in by id and the body is tokenised on its own, so
-    nothing depends on the tokenizer recognising ``[gMASK]`` as a token when it
-    meets those six characters in a string -- which it does only once
-    :func:`register_declared_special_tokens` has taught it to, and which would
-    fail as ordinary text rather than raise.
-
-    This is the path for a ``transformers`` with no ``apply_chat_template`` (4.28,
-    which is the release the rest of :func:`load_tokenizer` exists for). Where the
-    method is available it is used instead, because the checkpoint's own template
-    is the authority on its format and this is a transcription of it.
-    """
-    marker = {name: special_token_id(tokenizer, name, id) for name, id in GLM4_TEMPLATE_TOKENS.items()}
-    body = _body_ids(tokenizer, f"\n{text}\n").tolist()
-    ids = [marker["[gMASK]"], marker["<sop>"], marker["<|user|>"], *body, marker["<|assistant|>"]]
-    return torch.tensor(ids, dtype=torch.int64)
-
-
-def _body_ids(tokenizer, text: str) -> torch.Tensor:
-    """The text's own tokens, with whatever prefix the tokenizer adds stripped off.
-
-    ChatGLM4Tokenizer prepends ``[gMASK]<sop>`` to everything it encodes. Asking
-    for ``add_special_tokens=False`` is the direct way to decline that; where the
-    signature does not take it, the prefix is *measured* -- by encoding the empty
-    string -- rather than assumed to be two tokens long.
-    """
-    try:
-        return tokenizer(text, return_tensors="pt", add_special_tokens=False).input_ids[0]
-    except TypeError:  # a tokenizer whose __call__ does not take the flag
-        prefix = tokenizer("", return_tensors="pt").input_ids[0].numel()
-        return tokenizer(text, return_tensors="pt").input_ids[0][prefix:]
-
-
-def prompt_route(tokenizer, use_chat_template: bool, glm4: bool) -> str:
+def prompt_route(tokenizer, use_chat_template: bool, family: ModelFamily) -> str:
     """Which of :func:`encode`'s three routes this tokenizer will take.
 
     Printed before a run rather than inferred from its output: the difference
@@ -320,28 +303,28 @@ def prompt_route(tokenizer, use_chat_template: bool, glm4: bool) -> str:
         return "raw (--raw-prompt): no turn markers"
     if _has_chat_template(tokenizer):
         return "the tokenizer's own chat template"
-    if glm4:
-        return "GLM-4 turn markers, assembled here (this transformers has no apply_chat_template)"
-    return "raw: this tokenizer has no chat template and the checkpoint is not GLM-4"
+    if family.has_turn():
+        return f"{family.name} turn markers, assembled here (this transformers has no apply_chat_template)"
+    return f"raw: this tokenizer has no chat template and no turn is transcribed for {family.name}"
 
 
 def _has_chat_template(tokenizer) -> bool:
     return bool(getattr(tokenizer, "chat_template", None)) and hasattr(tokenizer, "apply_chat_template")
 
 
-def encode(tokenizer, text: str, use_chat_template: bool, glm4: bool = False) -> torch.Tensor:
+def encode(tokenizer, text: str, use_chat_template: bool, family: ModelFamily) -> torch.Tensor:
     """Token ids for one user turn, as a chat turn wherever that is possible.
 
-    Three routes, in order of authority (:func:`prompt_route` names the one taken):
-    the checkpoint's own chat template; GLM-4's turn markers assembled here, for a
-    ``transformers`` that has no ``apply_chat_template``; and the bare text.
+    Three routes, in order of authority (:func:`prompt_route` names the one
+    taken): the checkpoint's own chat template; the family's turn markers
+    assembled here (:meth:`~tq_longbench.families.ModelFamily.chat_prompt_ids`),
+    for a ``transformers`` that has no ``apply_chat_template``; and the bare text.
 
     The middle route is the one this function exists for. Falling through to the
     bare text is not a neutral default -- a chat model handed a document with no
-    ``<|user|>`` before it and no ``<|assistant|>`` after it continues the
-    document, which over a needle-in-a-haystack prompt means continuing the
-    haystack. That failure reads as a model problem and is a prompt problem, so
-    it is worth the transcription.
+    turn markers around it continues the document, which over a
+    needle-in-a-haystack prompt means continuing the haystack. That failure reads
+    as a model problem and is a prompt problem, so it is worth the transcription.
     """
     if use_chat_template and _has_chat_template(tokenizer):
         encoded = tokenizer.apply_chat_template(
@@ -352,8 +335,8 @@ def encode(tokenizer, text: str, use_chat_template: bool, glm4: bool = False) ->
             return_dict=True,
         )
         return encoded["input_ids"][0].to(torch.int64)
-    if use_chat_template and glm4:
-        return glm4_chat_prompt_ids(tokenizer, text)
+    if use_chat_template and family.has_turn():
+        return family.chat_prompt_ids(tokenizer, text)
     return tokenizer(text, return_tensors="pt").input_ids[0].to(torch.int64)
 
 
@@ -365,6 +348,42 @@ def truncate_middle(token_ids: torch.Tensor, keep: int) -> torch.Tensor:
     return torch.cat((token_ids[:half], token_ids[-(keep - half) :]))
 
 
+def describe_decode(runner, summary: dict) -> str:
+    """Whether the decode ran as a graph, and what the captures cost.
+
+    Printed because the eager and captured paths differ by roughly a factor of
+    three and by nothing at all in the text. A run that fell back quietly would
+    read as the kernels being slow, which is the one conclusion this harness
+    should never lead someone to by accident.
+    """
+    if not summary["decode_graph"]:
+        return f"decode: eager, a kernel at a time ({runner.decode_graph_refusal})"
+    captured = f"{summary['captures']} window(s) captured in {summary['capture_ms']:.0f} ms"
+    return f"decode: replayed from a captured graph; {captured}, which is not counted in the percentiles"
+
+
+def describe_stop(metrics, tokenizer, budget: int) -> str:
+    """How generation ended: on which token, or against the budget.
+
+    Printed because the two look identical from the text. A continuation that
+    ended on ``<|im_end|>`` and one that was still going when the budget ran out
+    both come back as a plausible sentence, and only the second is a finding --
+    it means the stop set did not contain what this checkpoint actually emits,
+    and every latency percentile above it averages over tokens the model never
+    meant to send.
+    """
+    token = metrics.stopped_on_token
+    if token is None:
+        return f"ran the whole {budget}-token budget -- nothing in the stop set was emitted"
+    name = None
+    if tokenizer is not None and hasattr(tokenizer, "convert_ids_to_tokens"):
+        try:
+            name = tokenizer.convert_ids_to_tokens(token)
+        except Exception:  # a tokenizer that cannot name an id has answered
+            name = None
+    return f"stopped on {name!r} ({token})" if name else f"stopped on token {token}"
+
+
 def stop_at_eos(produced: list[int], eos_ids: set[int]) -> list[int]:
     for index, token in enumerate(produced):
         if token in eos_ids:
@@ -372,17 +391,22 @@ def stop_at_eos(produced: list[int], eos_ids: set[int]) -> list[int]:
     return produced
 
 
-def eos_ids_for(config: dict, tokenizer) -> set[int]:
+def eos_ids_for(config: dict, tokenizer, family: ModelFamily | None = None) -> set[int]:
     """Every id that should end a continuation, from all three places one can be declared.
 
-    ``config.json``, the tokenizer, and -- for GLM-4 -- :data:`GLM4_STOP_TOKENS`.
-    The third is not belt and braces. ``glm-4-9b-chat-1m``'s ``config.json``
-    declares no ``eos_token_id``, and on the ``transformers`` 4.28 path
-    :func:`load_tokenizer` builds for, ``tokenizer.eos_token_id`` is ``None`` as
-    well: without this the stop set is **empty**, nothing ever halts generation,
-    and every continuation runs its whole budget. That is not a tuning question,
-    it is the difference between an answer and an answer followed by whatever the
-    model says next.
+    ``config.json``, the tokenizer, and the family's own stop tokens. The third
+    is not belt and braces in either direction. ``glm-4-9b-chat-1m``'s
+    ``config.json`` declares no ``eos_token_id``, and on the ``transformers``
+    4.28 path :func:`load_tokenizer` builds for, ``tokenizer.eos_token_id`` is
+    ``None`` as well: without it the stop set is **empty**, nothing ever halts
+    generation, and every continuation runs its whole budget. Qwen2.5 is the
+    milder version of the same thing -- its config names ``<|im_end|>`` and its
+    ``generation_config.json`` names ``<|endoftext|>`` beside it, and only the
+    first is read here. Either way the difference is between an answer and an
+    answer followed by whatever the model says next.
+
+    The family defaults to whichever one ``config`` names, so nothing borrows
+    another model's ids by being asked the wrong question.
     """
     configured = config.get("eos_token_id")
     ids = set(configured if isinstance(configured, list) else [configured] if configured is not None else [])
@@ -390,9 +414,7 @@ def eos_ids_for(config: dict, tokenizer) -> set[int]:
         return ids
     if getattr(tokenizer, "eos_token_id", None) is not None:
         ids.add(tokenizer.eos_token_id)
-    if is_glm4_config(config):
-        ids |= glm4_stop_ids(tokenizer)
-    return ids
+    return ids | (family or family_for(config)).stop_ids(tokenizer)
 
 
 def dummy_prompt_ids() -> torch.Tensor:
@@ -400,9 +422,10 @@ def dummy_prompt_ids() -> torch.Tensor:
     return torch.ones(DUMMY_PROMPT_SHAPE, dtype=torch.long)[0]
 
 
-def load_tokenizer(model_path: str):
-    """GLM-4's remote-code tokenizer, loadable on ``transformers`` 4.28 as well.
+def load_tokenizer(model_path: str, family: ModelFamily):
+    """The checkpoint's tokenizer; GLM-4's remote-code one on ``transformers`` 4.28 as well.
 
+    Only GLM-4 takes the long way round, and only because its tokenizer needs it:
     ``ChatGLM4Tokenizer._convert_token_to_id`` looks tokens up in its tiktoken
     ``mergeable_ranks``, which hold no special tokens. Newer ``transformers``
     registers ``<|endoftext|>``, ``[gMASK]``, ``<sop>`` and the rest from
@@ -419,8 +442,16 @@ def load_tokenizer(model_path: str):
       it declares, which is what newer releases do on their own.
 
     On a ``transformers`` that already registered them, both steps are no-ops.
+    Every other family is an ordinary ``from_pretrained``: Qwen2.5's tokenizer is
+    a plain ``Qwen2Tokenizer`` whose added-token table every supported
+    ``transformers`` reads for itself, and shadowing a base-class method to load
+    it would be a workaround for a problem it does not have.
     """
     from transformers import AutoTokenizer
+
+    if family is not GLM4:
+        return AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
     from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
     # Wherever the method is defined, the class attribute shadows it for the
@@ -520,6 +551,7 @@ def build_runner(
             fold_site=args.fold_site,
             dense_attention_api=dense_attention_api,
             dense_staging_backend=dense_staging_backend,
+            decode_graph=args.decode_graph,
         )
     )
     assert_no_vllm_imported()
@@ -554,8 +586,13 @@ class AttentionPlan:
         return "\n".join(lines)
 
 
-def plan_attention(args, config: dict, prefill_mode: str) -> AttentionPlan:
+def plan_attention(args, shape, prefill_mode: str) -> AttentionPlan:
     """Probe every attention path the run will take, on one synthetic layer, before any weight loads.
+
+    ``shape`` is the checkpoint's own, so the probe runs the head counts the run
+    will run rather than a stand-in: a GQA ratio is what decides how a fused
+    kernel groups its rows, and an entry point that is refused at 16/2 and
+    accepted at 32/4 would pass a probe that guessed.
 
     Raises :class:`PreflightFailed` when a path the run cannot do without fails.
     The one it can do without is the dense_staging prefill: when that fails and
@@ -563,7 +600,6 @@ def plan_attention(args, config: dict, prefill_mode: str) -> AttentionPlan:
     (``batched_decode``) instead, which the decode backend's probe has just run.
     """
     plan = AttentionPlan(prefill_mode)
-    shape = glm4_model_shape(config)
     layer = LayerShape(shape.num_heads, shape.num_kv_heads, shape.head_size, shape.scale)
     probe = {"device": args.device, "dtype": _DTYPES[args.dtype], "block_size": args.block_size}
     folded = not args.no_fold_output_rotation
@@ -636,9 +672,15 @@ def plan_attention(args, config: dict, prefill_mode: str) -> AttentionPlan:
 
 
 def check_contract(runner: StandaloneModelRunner) -> str:
-    """Refuse a run that is not GLM-4's attention contract; return its output stage's name."""
+    """Refuse a run that is not the ungated folded-o_proj contract; return its output stage's name.
+
+    Neither GLM-4 nor Qwen2.5 gates its attention output, so ``o_proj`` consumes
+    the decode's output directly and Pi folds into it offline. A gate would sit
+    between the two, where the output is still rotated, and the fold would be
+    applied to the wrong side of it.
+    """
     if runner.shape.attn_output_gate:
-        raise RuntimeError("GLM-4 has no output gate, but the runner built one")
+        raise RuntimeError("this contract is the ungated one, but the runner built an output gate")
     backend = runner.decode_backend
     folded = backend.output_rotation_folded
     if backend.name in DENSE_BACKENDS:
@@ -663,23 +705,30 @@ def _free(device: torch.device) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    require_checkpoint(args.model_path)
     args.device = resolve_device(args.device)
     depths = parse_depths(args.depths)
     config = read_config(args.model_path)
-    if not is_glm4_config(config):
-        raise SystemExit(f"{args.model_path} is model_type {config.get('model_type')!r}, not a GLM-4 checkpoint")
+    # Raises for a GLM the harness does not build (GLM-4-0414's sandwich norms);
+    # anything else it does not recognise gets families.GENERIC, whose tokenizer
+    # and config are then the only authorities on the prompt and the stop set.
+    family = family_for(config)
+    # Reads config.json and the shard headers, no tensor data. The pre-flight
+    # probes this shape and the runner builds it from the same reader, so the
+    # layer that is probed is the layer that will run.
+    checkpoint_shape = read_checkpoint_shape(args.model_path)
     if args.dummy_prompt and args.tokens:
         # Nothing to build a haystack out of without a tokenizer.
         print(f"  --dummy-prompt: skipping the needle-in-a-haystack stage (--tokens {args.tokens})", file=sys.stderr)
         args.tokens = 0
-    prefill_mode = choose_prefill_mode(args)
+    prefill_mode = choose_prefill_mode(args, family)
 
     if args.skip_preflight:
         plan = AttentionPlan(prefill_mode)
     else:
         print("=== 0. pre-flight: one synthetic layer through every attention path, no weights ===")
         started = time.perf_counter()
-        plan = plan_attention(args, config, prefill_mode)
+        plan = plan_attention(args, checkpoint_shape, prefill_mode)
         print(plan.report())
         print(f"  {time.perf_counter() - started:.2f} s; prefill {plan.prefill_mode}")
         print()
@@ -690,9 +739,9 @@ def main(argv: list[str] | None = None) -> int:
         tokenizer = None
         short_ids = dummy_prompt_ids()
     else:
-        tokenizer = load_tokenizer(args.model_path)
-        short_ids = encode(tokenizer, DEFAULT_PROMPT, use_chat_template, glm4=True)
-    eos_ids = eos_ids_for(config, tokenizer)
+        tokenizer = load_tokenizer(args.model_path, family)
+        short_ids = encode(tokenizer, DEFAULT_PROMPT, use_chat_template, family)
+    eos_ids = eos_ids_for(config, tokenizer, family)
     max_seq_len = max(args.tokens, short_ids.numel()) + args.max_new_tokens + CONTEXT_HEADROOM_TOKENS
 
     print("=== 1. the contract ===")
@@ -701,8 +750,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     shape = runner.shape
     print(
-        f"  {shape.num_layers} layers, {shape.num_heads} heads / {shape.num_kv_heads} kv, D={shape.head_size}, "
-        f"ffn {shape.intermediate_size}, vocab {shape.vocab_size}"
+        f"  {family.name} ({config.get('model_type')!r}): {shape.num_layers} layers, {shape.num_heads} heads / "
+        f"{shape.num_kv_heads} kv, D={shape.head_size}, ffn {shape.intermediate_size}, vocab {shape.vocab_size}"
     )
     print(
         f"  rope: theta {shape.rope_theta:.6g}, rotary_dim {shape.rotary_dim} of {shape.head_size}, "
@@ -712,7 +761,7 @@ def main(argv: list[str] | None = None) -> int:
     # to be installed. An empty stop set in particular is invisible from the
     # output: it looks exactly like a model with more to say.
     print(f"  {runner.fold_report.describe()}")
-    print(f"  prompt: {prompt_route(tokenizer, use_chat_template, glm4=True)}")
+    print(f"  prompt: {prompt_route(tokenizer, use_chat_template, family)}")
     print(f"  stop ids: {sorted(eos_ids) if eos_ids else 'NONE -- generation will run its whole budget'}")
     memory = runner.memory_report()
     print(
@@ -732,9 +781,12 @@ def main(argv: list[str] | None = None) -> int:
     summary = metrics.summary()
     print(f"  {args.backend:20s} {render(tokenizer, produced)}")
     print(
-        f"  {'':20s} ttft {summary['ttft_ms']:.0f} ms, decode p50 {summary['decode_p50_us']:.0f} us, "
-        f"p99 {summary['decode_p99_us']:.0f} us, peak {summary['device_peak_mb']:.0f} MB"
+        f"  {'':20s} ttft {summary['ttft_ms']:.0f} ms, decode p50 {summary['decode_p50_us'] / 1e3:.2f} ms "
+        f"({summary['decode_tokens_per_second']:.1f} tok/s), p90 {summary['decode_p90_us'] / 1e3:.2f}, "
+        f"p99 {summary['decode_p99_us'] / 1e3:.2f}, peak {summary['device_peak_mb']:.0f} MB"
     )
+    print(f"  {'':20s} {describe_decode(runner, summary)}")
+    print(f"  {'':20s} {describe_stop(metrics, tokenizer, args.max_new_tokens)}")
 
     if args.reference_backend:
         reference_mode = "dense_staging" if args.reference_backend in DENSE_BACKENDS else prefill_mode
@@ -769,7 +821,7 @@ def main(argv: list[str] | None = None) -> int:
         hits = clean = 0
         for depth in depths:
             item = needle_in_a_haystack(args.tokens, depth=depth, seed=int(depth * 100) + args.seed)
-            prompt_ids = truncate_middle(encode(tokenizer, item.prompt, use_chat_template, glm4=True), keep)
+            prompt_ids = truncate_middle(encode(tokenizer, item.prompt, use_chat_template, family), keep)
             produced, metrics = runner.generate(
                 prompt_ids.to(runner.device), max_new_tokens=args.max_new_tokens, stop_ids=eos_ids
             )

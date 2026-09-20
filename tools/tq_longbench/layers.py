@@ -56,6 +56,41 @@ import torch
 from tq_longbench._ascend import turboquant_rotation
 from tq_longbench.ops import AttentionBackend
 
+#: Where an HF config states the RoPE base, newest spelling first. ``transformers``
+#: 5 moved ``rope_theta`` into ``rope_parameters`` (mirrored on ``rope_scaling``)
+#: and stopped setting the top-level attribute; 4.x has only the attribute.
+_ROPE_PARAMETER_DICTS = ("rope_parameters", "rope_scaling")
+
+
+def rope_theta_of(config) -> float:
+    """The RoPE base this config states, wherever the installed ``transformers`` put it.
+
+    Asked in three places and **refused** if none of them answers, because the
+    obvious alternative -- default to 1e6 and carry on -- is how a run gets the
+    wrong base without anything going wrong. A base that is off by a factor does
+    not raise and does not garble the output: it moves every position, so the
+    model is fluent, locally sensible, and worse at reaching back into a long
+    context. That is the failure this harness exists to measure, which makes it
+    the one failure it cannot be quiet about.
+
+    Qwen2.5 is where this showed up. Its ``config.json`` says
+    ``rope_theta: 1000000.0`` and ``transformers`` 5 reports it only as
+    ``rope_parameters["rope_theta"]`` -- and 1e6 was the old default, so reading
+    it from the wrong place returned the right number for this checkpoint and
+    the wrong one for a checkpoint at 500000.
+    """
+    for name in _ROPE_PARAMETER_DICTS:
+        parameters = getattr(config, name, None)
+        if isinstance(parameters, dict) and parameters.get("rope_theta") is not None:
+            return float(parameters["rope_theta"])
+    theta = getattr(config, "rope_theta", None)
+    if theta is None:
+        raise ValueError(
+            f"{getattr(config, 'model_type', 'this config')} states no RoPE base: neither rope_theta nor "
+            f"{list(_ROPE_PARAMETER_DICTS)}. Defaulting would put every position at the wrong angle silently."
+        )
+    return float(theta)
+
 
 @dataclass(frozen=True)
 class ModelShape:
@@ -112,7 +147,7 @@ class ModelShape:
             intermediate_size=config.intermediate_size,
             vocab_size=config.vocab_size,
             rms_norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            rope_theta=float(getattr(config, "rope_theta", 1.0e6)),
+            rope_theta=rope_theta_of(config),
             tie_word_embeddings=bool(getattr(config, "tie_word_embeddings", False)),
             attn_output_gate=attn_output_gate,
             **detected,
@@ -131,20 +166,124 @@ class ForwardBatch:
     occupy ``slots``, and after the write the cache holds exactly ``prefix_end``
     tokens.  Everything downstream derives its context lengths from
     ``prefix_end``, so the two cannot drift apart silently.
+
+    ``workspace`` is the single-token decode's pre-allocated buffers
+    (:class:`DecodeWorkspace`). Where it is present the stack writes into it
+    rather than allocating, and ``prefix_end`` is **not** to be read: it is a
+    host integer, and the whole point of the static path is that the step's
+    length lives on the device where a graph replay can see the current value.
+    :attr:`context_lens` is that length.
     """
 
     positions: torch.Tensor
     slots: torch.Tensor
     prefix_end: int
     is_decode: bool
+    workspace: DecodeWorkspace | None = None
+    #: ``[num_tokens]`` int32 on the device: how much prefix each row attends
+    #: over. Only the static decode path sets it; everywhere else the backends
+    #: build it from ``prefix_end``.
+    context_lens: torch.Tensor | None = None
+    #: How many cache slots the decode reads, fixed across a captured graph.
+    #: ``None`` lets each backend read the longest context length back to the
+    #: host, which is a synchronisation per layer per step and cannot be captured.
+    window: int | None = None
 
     def __post_init__(self) -> None:
         if self.positions.numel() != self.slots.numel():
             raise ValueError(f"{self.positions.numel()} positions but {self.slots.numel()} slots: one slot per token")
+        if self.workspace is not None:
+            # Reading positions[-1] here would be a device-to-host copy per step,
+            # and under graph capture it is also wrong: the value baked in at
+            # capture time is not the value a later replay runs on.
+            return
         if self.prefix_end != int(self.positions[-1]) + 1:
             raise ValueError(
                 f"prefix_end {self.prefix_end} does not follow the last position {int(self.positions[-1])}"
             )
+
+
+@dataclass
+class DecodeWorkspace:
+    """Every buffer one single-token decode step writes into, allocated once.
+
+    A BS=1 decode step launches on the order of ten kernels per layer, none of
+    which runs for long enough to cover the host work behind it -- so the
+    allocator, the autograd bookkeeping and the Python frames are the step. The
+    buffers here exist to take the allocator out of that: nothing on the decode
+    path calls ``torch.empty`` after this is built.
+
+    They are shared by **every** layer, which is safe because the decode is
+    strictly sequential: layer *i* has consumed its ``qkv`` before layer *i+1*
+    writes it. ``hidden`` is the residual stream and is updated in place, so it
+    is the one buffer whose contents cross a layer boundary.
+
+    The addresses are also the contract a captured graph is recorded against:
+    a replay reads whatever is in these buffers *now* and writes its answer back
+    into them, so :attr:`token_ids` both receives the step's input and is where
+    the graph leaves the token it chose.
+    """
+
+    #: The token this step consumes; the graph writes the next one back into it.
+    token_ids: torch.Tensor
+    positions: torch.Tensor
+    slots: torch.Tensor
+    #: How much prefix to attend over, on the device so a replay sees it change.
+    context_lens: torch.Tensor
+    #: The residual stream, updated in place across the whole stack.
+    hidden: torch.Tensor
+    #: ``[1, q_out + 2 * kv_out]``, the fused projection's output.
+    qkv: torch.Tensor
+    #: ``[1, num_heads, head_size]``, what the attention backend writes.
+    attention: torch.Tensor
+    #: ``[1, 2 * intermediate_size]``, the fused gate/up projection's output.
+    gate_up: torch.Tensor
+    #: ``[1, vocab_size]``.
+    logits: torch.Tensor
+    #: The greedy choice, so the argmax is inside whatever the step is -- a
+    #: captured graph included -- and the host reads one integer rather than
+    #: launching a reduction over the vocabulary itself.
+    next_token: torch.Tensor
+
+    @classmethod
+    def build(cls, shape: ModelShape, dtype: torch.dtype, device: torch.device) -> DecodeWorkspace:
+        query_rows = shape.num_heads * shape.head_size * (2 if shape.attn_output_gate else 1)
+        kv_rows = shape.num_kv_heads * shape.head_size
+        index = {"dtype": torch.int64, "device": device}
+        return cls(
+            token_ids=torch.zeros(1, **index),
+            positions=torch.zeros(1, **index),
+            slots=torch.zeros(1, dtype=torch.int32, device=device),
+            context_lens=torch.ones(1, dtype=torch.int32, device=device),
+            hidden=torch.zeros(1, shape.hidden_size, dtype=dtype, device=device),
+            qkv=torch.zeros(1, query_rows + 2 * kv_rows, dtype=dtype, device=device),
+            attention=torch.zeros(1, shape.num_heads, shape.head_size, dtype=dtype, device=device),
+            gate_up=torch.zeros(1, 2 * shape.intermediate_size, dtype=dtype, device=device),
+            logits=torch.zeros(1, shape.vocab_size, dtype=dtype, device=device),
+            next_token=torch.zeros(1, **index),
+        )
+
+    def bytes_allocated(self) -> int:
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in (self.hidden, self.qkv, self.attention, self.gate_up, self.logits)
+        )
+
+    def seat(self, token: int, position: int, context_len: int) -> None:
+        """Point the buffers at one step, without reading anything back.
+
+        Three ``fill_`` launches rather than three host-to-device copies, and no
+        allocation: the values are what the next replay (or eager step) will see.
+        """
+        self.token_ids.fill_(token)
+        self.positions.fill_(position)
+        self.slots.fill_(position)
+        self.context_lens.fill_(context_len)
+
+
+#: Whether this torch has the fused norm. Looked up once: the decode calls it
+#: seventy-two times a token, and ``hasattr`` on a module is not free at that rate.
+_HAS_FUSED_RMS_NORM = hasattr(torch.nn.functional, "rms_norm")
 
 
 class RMSNorm(torch.nn.Module):
@@ -153,14 +292,31 @@ class RMSNorm(torch.nn.Module):
     The accumulation is fp32 whatever the weights are: at 128k context the
     hidden state's variance is summed over thousands of channels, and doing that
     in fp16 loses the low bits of the mean before the reciprocal square root.
+
+    ``torch.nn.functional.rms_norm`` is that same definition as one kernel, and
+    it is the one used where the installed torch has it. The expression below is
+    what it replaced, kept as the fallback and as the statement of what the
+    kernel is supposed to compute -- written out, it is a promote, a square, a
+    mean, an add, a reciprocal square root, two multiplies and a cast, which is
+    eight launches for one norm. A decode step does seventy-two of them, and at a
+    few microseconds of launch each that was the largest non-GEMM cost in the
+    step.
+
+    The two agree **bit for bit** on the one-token rows a decode norms. Over a
+    2048-token prefill chunk they differ on about one element in forty thousand,
+    by a single float16 ulp, which is a different summation order rounding
+    differently and not a different definition.
     """
 
     def __init__(self, hidden_size: int, eps: float, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__()
         self.weight = torch.nn.Parameter(torch.ones(hidden_size, dtype=dtype, device=device))
         self.eps = eps
+        self.normalized_shape = (hidden_size,)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _HAS_FUSED_RMS_NORM:
+            return torch.nn.functional.rms_norm(x, self.normalized_shape, self.weight, self.eps)
         promoted = x.to(torch.float32)
         normed = promoted * torch.rsqrt(promoted.pow(2).mean(-1, keepdim=True) + self.eps)
         return (normed * self.weight.to(torch.float32)).to(x.dtype)
@@ -222,6 +378,27 @@ class RotaryEmbedding:
         rotated, passed = x[..., : self.rotary_dim], x[..., self.rotary_dim :]
         return torch.cat((rotated * cos + turn(rotated) * sin, passed), dim=-1)
 
+    def apply_(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        """:meth:`apply` written back over ``x``, for the decode's fused qkv buffer.
+
+        Same arithmetic, no allocation for the result: q and k are slices of the
+        one projection buffer and are rotated where they already sit. The two
+        temporaries the expression still needs -- ``turn(x)``, and the gather of
+        ``cos``/``sin`` -- are small and, under graph capture, come from the
+        graph's own pool and are never re-allocated.
+
+        The pass-through channels a partial rotary leaves alone (GLM-4's second
+        half of each head) are already in place, so only the leading
+        ``rotary_dim`` are written.
+        """
+        cos = self.cos[positions].unsqueeze(1)
+        sin = self.sin[positions].unsqueeze(1)
+        turn = self._rotate_pairs if self.interleaved else self._rotate_half
+        rotated = x if self.rotary_dim == x.shape[-1] else x[..., : self.rotary_dim]
+        turned = turn(rotated)
+        rotated.mul_(cos).add_(turned.mul_(sin))
+        return x
+
 
 class Attention(torch.nn.Module):
     """Projections, RoPE, the cache write, and whichever attention the backend is.
@@ -235,16 +412,28 @@ class Attention(torch.nn.Module):
         super().__init__()
         self.shape = shape
         self.layer_index = layer_index
-        q_out = shape.num_heads * shape.head_size
-        kv_out = shape.num_kv_heads * shape.head_size
-        bias = shape.qkv_bias
-        # Qwen3.5 projects [query | gate] out of one matrix.
-        self.q_proj = torch.nn.Linear(
-            shape.hidden_size, q_out * (2 if shape.attn_output_gate else 1), bias=bias, dtype=dtype, device=device
+        # Qwen3.5 projects [query | gate] out of the query matrix, so the query
+        # half of the fused tensor is twice as tall there.
+        query_rows = shape.num_heads * shape.head_size * (2 if shape.attn_output_gate else 1)
+        kv_rows = shape.num_kv_heads * shape.head_size
+        #: How the fused projection's columns divide into query, key and value.
+        #: The order is the checkpoints' own -- ``chatglm``'s ``query_key_value``
+        #: is concatenated exactly this way -- so a fused checkpoint tensor lands
+        #: here unchanged and a split one is re-fused at load time.
+        self.qkv_split = (query_rows, kv_rows, kv_rows)
+        self.qkv_proj = torch.nn.Linear(
+            shape.hidden_size, sum(self.qkv_split), bias=shape.qkv_bias, dtype=dtype, device=device
         )
-        self.k_proj = torch.nn.Linear(shape.hidden_size, kv_out, bias=bias, dtype=dtype, device=device)
-        self.v_proj = torch.nn.Linear(shape.hidden_size, kv_out, bias=bias, dtype=dtype, device=device)
-        self.o_proj = torch.nn.Linear(q_out, shape.hidden_size, bias=False, dtype=dtype, device=device)
+        #: Whether q and k can be rotated as one tensor: they are adjacent in the
+        #: fused projection, so they are -- unless a gate sits between them (the
+        #: layout is then ``[q | gate | k | v]``), or ``qk_norm`` has already
+        #: copied each out of the buffer to normalise it.
+        self._rotates_together = not shape.attn_output_gate and not shape.qk_norm
+        #: How many of the fused projection's columns that one rotation covers.
+        self._rotary_columns = query_rows + kv_rows
+        self.o_proj = torch.nn.Linear(
+            shape.num_heads * shape.head_size, shape.hidden_size, bias=False, dtype=dtype, device=device
+        )
         # Registered only where the checkpoint has them: an unused RMSNorm would
         # sit at its initial value of 1 and normalise anyway, changing the
         # numbers without ever failing to load.
@@ -257,6 +446,14 @@ class Attention(torch.nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Everything before the cache write: ``(query, key, value, gate)``, RoPE applied.
 
+        One GEMM, then three views. ``split`` on the output's last axis is free --
+        the pieces share the projection's storage -- and reshaping each to
+        ``[tokens, heads, D]`` stays a view because only the (contiguous) last
+        axis is divided. So the saving over three projections is three launches
+        and two kernel tails per layer, and nothing is copied to get it. The
+        arithmetic is unchanged: cuBLAS splits the output rows of one GEMM the
+        same way it would compute three, and the results agree bit for bit.
+
         Split out of :meth:`forward` so that a diagnostic can produce exactly the
         tensors the backends are handed -- and compare two backends on the same
         ones -- without reproducing this and drifting from it. See
@@ -264,15 +461,27 @@ class Attention(torch.nn.Module):
         """
         num_tokens = hidden.shape[0]
         shape = self.shape
+        workspace = batch.workspace
 
-        query = self.q_proj(hidden)
+        if workspace is None:
+            fused = self.qkv_proj(hidden)
+        else:
+            # The decode's one GEMM, into the buffer it always uses.
+            fused = workspace.qkv
+            weight, bias = self.qkv_proj.weight, self.qkv_proj.bias
+            if bias is None:
+                torch.mm(hidden, weight.t(), out=fused)
+            else:
+                torch.addmm(bias, hidden, weight.t(), out=fused)
+
+        query, key, value = fused.split(self.qkv_split, dim=-1)
         gate = None
         if shape.attn_output_gate:
             query, gate = query.chunk(2, dim=-1)
-            gate = gate.view(num_tokens, shape.num_heads, shape.head_size)
+            gate = gate.reshape(num_tokens, shape.num_heads, shape.head_size)
         query = query.view(num_tokens, shape.num_heads, shape.head_size)
-        key = self.k_proj(hidden).view(num_tokens, shape.num_kv_heads, shape.head_size)
-        value = self.v_proj(hidden).view(num_tokens, shape.num_kv_heads, shape.head_size)
+        key = key.view(num_tokens, shape.num_kv_heads, shape.head_size)
+        value = value.view(num_tokens, shape.num_kv_heads, shape.head_size)
 
         if shape.qk_norm:
             query = self.q_norm(query)
@@ -280,7 +489,19 @@ class Attention(torch.nn.Module):
         # RoPE before anything is rotated by Pi: the kernels apply Pi to q and k
         # afterwards, and Pi is orthogonal, so the scores are unchanged -- but
         # only if RoPE has already happened.
-        return rope.apply(query, batch.positions), rope.apply(key, batch.positions), value, gate
+        if workspace is None or shape.qk_norm:
+            # q_norm/k_norm have already copied q and k out of the buffer, so
+            # there is nothing left to rotate in place.
+            return rope.apply(query, batch.positions), rope.apply(key, batch.positions), value, gate
+        if self._rotates_together:
+            # One rotation for both. RoPE is the same map on every head, and the
+            # fusion put q's heads and k's immediately before one another in the
+            # buffer -- so the two together are one ``[tokens, H + H_kv, D]``
+            # view, and rotating it is rotating each of them. Seven launches a
+            # layer instead of fourteen, for arithmetic that is unchanged.
+            rope.apply_(fused[..., : self._rotary_columns].view(num_tokens, -1, shape.head_size), batch.positions)
+            return query, key, value, gate
+        return rope.apply_(query, batch.positions), rope.apply_(key, batch.positions), value, gate
 
     def attend(
         self,
@@ -289,13 +510,25 @@ class Attention(torch.nn.Module):
         backend: AttentionBackend,
         gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Ask one backend for this layer's attention, gated where the backend does that itself."""
-        attention = torch.empty_like(query)
+        """Ask one backend for this layer's attention, gated where the backend does that itself.
+
+        On the static path the context length is a device tensor the caller owns
+        and the window is fixed, so no length is read back to the host: the
+        tie-point check is exactly the read the static path exists to remove, and
+        the invariant it guards -- that the decode attends over the prefix that
+        was written -- holds there by construction, because one buffer is both
+        the slot written and the length attended over.
+        """
+        workspace = batch.workspace
+        attention = torch.empty_like(query) if workspace is None else workspace.attention
         kernel_gate = gate if backend.fuses_output_gate else None
         if batch.is_decode:
-            context_lens = torch.full((query.shape[0],), batch.prefix_end, dtype=torch.int32, device=query.device)
-            backend.check_tie_point(context_lens, batch.prefix_end)
-            backend.decode(self.layer_index, query, context_lens, attention, kernel_gate)
+            if batch.context_lens is not None:
+                context_lens = batch.context_lens
+            else:
+                context_lens = torch.full((query.shape[0],), batch.prefix_end, dtype=torch.int32, device=query.device)
+                backend.check_tie_point(context_lens, batch.prefix_end)
+            backend.decode(self.layer_index, query, context_lens, attention, kernel_gate, window=batch.window)
         else:
             backend.prefill_chunk(self.layer_index, query, batch.prefix_end, attention, kernel_gate)
         if gate is not None and kernel_gate is None:
@@ -320,17 +553,29 @@ class Attention(torch.nn.Module):
 
 
 class MLP(torch.nn.Module):
-    """SwiGLU: ``down(silu(gate(x)) * up(x))``."""
+    """SwiGLU: ``down(silu(gate(x)) * up(x))``, with gate and up projected together."""
 
     def __init__(self, shape: ModelShape, dtype: torch.dtype, device: torch.device) -> None:
         super().__init__()
         kwargs = {"bias": False, "dtype": dtype, "device": device}
-        self.gate_proj = torch.nn.Linear(shape.hidden_size, shape.intermediate_size, **kwargs)
-        self.up_proj = torch.nn.Linear(shape.hidden_size, shape.intermediate_size, **kwargs)
+        self.intermediate_size = shape.intermediate_size
+        # Gate and up read the same input and are the same shape, so they are one
+        # GEMM whose output is read as two halves. This is also the layout the
+        # checkpoints that fuse them already use -- chatglm's ``dense_h_to_4h``
+        # and the HF glm export's ``gate_up_proj``, both gate-then-up.
+        self.gate_up_proj = torch.nn.Linear(shape.hidden_size, 2 * shape.intermediate_size, **kwargs)
         self.down_proj = torch.nn.Linear(shape.intermediate_size, shape.hidden_size, **kwargs)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(torch.nn.functional.silu(self.gate_proj(x)) * self.up_proj(x))
+    def forward(self, x: torch.Tensor, workspace: DecodeWorkspace | None = None) -> torch.Tensor:
+        if workspace is None:
+            gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+            return self.down_proj(torch.nn.functional.silu(gate) * up)
+        fused = workspace.gate_up
+        torch.mm(x, self.gate_up_proj.weight.t(), out=fused)
+        gate, up = fused.split((self.intermediate_size, self.intermediate_size), dim=-1)
+        # silu writes back over the gate half and the product over it again, so
+        # the activation costs no allocation at all; ``up`` is read, never written.
+        return self.down_proj(torch.nn.functional.silu(gate, inplace=True).mul_(up))
 
 
 class DecoderLayer(torch.nn.Module):
@@ -349,8 +594,14 @@ class DecoderLayer(torch.nn.Module):
         write_backends: tuple[AttentionBackend, ...],
         attend_backend: AttentionBackend,
     ) -> torch.Tensor:
-        hidden = hidden + self.self_attn(self.input_layernorm(hidden), batch, rope, write_backends, attend_backend)
-        return hidden + self.mlp(self.post_attention_layernorm(hidden))
+        workspace = batch.workspace
+        if workspace is None:
+            hidden = hidden + self.self_attn(self.input_layernorm(hidden), batch, rope, write_backends, attend_backend)
+            return hidden + self.mlp(self.post_attention_layernorm(hidden))
+        # ``hidden`` is the workspace's residual stream: both residuals are added
+        # back into it, so the stack allocates nothing per layer.
+        hidden.add_(self.self_attn(self.input_layernorm(hidden), batch, rope, write_backends, attend_backend))
+        return hidden.add_(self.mlp(self.post_attention_layernorm(hidden), workspace))
 
 
 class CausalLM(torch.nn.Module):
@@ -385,14 +636,60 @@ class CausalLM(torch.nn.Module):
         attend_backend: AttentionBackend,
         last_token_only: bool = True,
     ) -> torch.Tensor:
-        hidden = self.embed_tokens(token_ids)
+        workspace = batch.workspace
+        if workspace is None:
+            hidden = self.embed_tokens(token_ids)
+        else:
+            # ``index_select`` is ``embed_tokens`` with somewhere to put the row.
+            hidden = workspace.hidden
+            torch.index_select(self.embed_tokens.weight, 0, token_ids, out=hidden)
         for layer in self.layers:
             hidden = layer(hidden, batch, self.rope, write_backends, attend_backend)
         if last_token_only:
             # Only the final position can produce the next token, and at a 2048
             # token chunk the head is a 2048 x vocab matmul that nothing reads.
             hidden = hidden[-1:]
-        return self.lm_head(self.norm(hidden))
+        if workspace is None:
+            return self.lm_head(self.norm(hidden))
+        torch.mm(self.norm(hidden), self.lm_head.weight.t(), out=workspace.logits)
+        return workspace.logits
+
+    def load_destinations(self) -> dict[str, torch.Tensor]:
+        """Where each checkpoint tensor goes, under the name a checkpoint calls it.
+
+        The module tree fuses q/k/v into one projection and gate/up into another,
+        but a checkpoint names them separately -- and the loader's contract is
+        that an unrecognised name *raises* rather than being skipped. So the
+        loader is handed views: ``self_attn.q_proj.weight`` is the first
+        ``query_rows`` rows of ``qkv_proj.weight``, and copying into it writes
+        the fused tensor in place.
+
+        This is also what keeps the fusion honest about a checkpoint that was
+        already fused. ``chatglm``'s ``query_key_value`` is split by
+        :func:`~tq_longbench.glm4.glm4_checkpoint_targets` into the three logical
+        names and lands back in one tensor in the same order it arrived, so the
+        bytes on the device are the bytes in the shard.
+
+        Every parameter that is not part of a fusion maps to itself, so the
+        loader's unfilled-parameter check still covers the whole model.
+        """
+        destinations = {name: tensor for name, tensor in self.named_parameters()}
+        for index, layer in enumerate(self.layers):
+            prefix = f"layers.{index}."
+            attention, mlp = layer.self_attn, layer.mlp
+            query_rows, kv_rows, _ = attention.qkv_split
+            for kind, fused in (("weight", attention.qkv_proj.weight), ("bias", attention.qkv_proj.bias)):
+                if fused is None:
+                    continue
+                del destinations[f"{prefix}self_attn.qkv_proj.{kind}"]
+                pieces = fused.split((query_rows, kv_rows, kv_rows), dim=0)
+                for name, piece in zip(("q_proj", "k_proj", "v_proj"), pieces):
+                    destinations[f"{prefix}self_attn.{name}.{kind}"] = piece
+            del destinations[f"{prefix}mlp.gate_up_proj.weight"]
+            gate, up = mlp.gate_up_proj.weight.split((mlp.intermediate_size, mlp.intermediate_size), dim=0)
+            destinations[f"{prefix}mlp.gate_proj.weight"] = gate
+            destinations[f"{prefix}mlp.up_proj.weight"] = up
+        return destinations
 
 
 def require_foldable(shape: ModelShape) -> None:

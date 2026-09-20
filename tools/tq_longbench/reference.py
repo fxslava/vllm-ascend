@@ -49,7 +49,7 @@ import torch
 
 from tq_longbench._ascend import turboquant_layout, turboquant_rotation
 from tq_longbench.kv_cache import CacheGeometry, DenseKVCache, TurboQuantKVCache
-from tq_longbench.ops import AttentionBackend, LayerShape
+from tq_longbench.ops import AttentionBackend, LayerShape, longest_context
 
 # TurboQuantCodec<4>: two 4-bit codes per byte, stored biased into int8.
 _NIBBLE_RADIX = 16
@@ -115,6 +115,11 @@ class DenseReferenceBackend(AttentionBackend):
     """
 
     name = "dense_reference"
+    # SDPA over a mask this builds from the lengths on the device, and a
+    # scatter of fixed shape to write: with the window fixed, a step asks the
+    # host nothing.
+    supports_static_decode = True
+    supports_graph_capture = True
 
     def __init__(
         self,
@@ -166,8 +171,9 @@ class DenseReferenceBackend(AttentionBackend):
         context_lens: torch.Tensor,
         out: torch.Tensor,
         gate: torch.Tensor | None = None,
+        window: int | None = None,
     ) -> torch.Tensor:
-        longest = int(context_lens.max()) if context_lens.numel() else 0
+        longest = window if window is not None else longest_context(context_lens)
         positions = torch.arange(longest, device=query.device).view(1, -1)
         # One row per query token, each seeing exactly its own prefix.
         mask = (positions < context_lens.to(query.device).view(-1, 1)).unsqueeze(0)
@@ -216,6 +222,14 @@ class TurboQuantReferenceBackend(AttentionBackend):
     """
 
     name = "turboquant_reference"
+    supports_static_decode = True
+    # ...but not captured. :meth:`write_kv` drops padding slots with a boolean
+    # mask, whose result has as many rows as there were live slots -- a shape
+    # that depends on values, which is a host read wherever it appears. The
+    # kernels this stands in for have no such step: they hand the slots to the
+    # operator and let it skip the padding. Nothing is lost by not capturing a
+    # backend whose whole purpose is to compute the right numbers off an NPU.
+    supports_graph_capture = False
 
     def __init__(
         self,
@@ -278,13 +292,14 @@ class TurboQuantReferenceBackend(AttentionBackend):
         context_lens: torch.Tensor,
         out: torch.Tensor,
         gate: torch.Tensor | None = None,
+        window: int | None = None,
     ) -> torch.Tensor:
         if self.output_rotation_folded and gate is not None:
             raise ValueError(
                 "a layer with Pi folded into o_proj cannot carry an output gate: the gate sits between "
                 "attention and o_proj, where the output is still rotated"
             )
-        longest = int(context_lens.max()) if context_lens.numel() else 0
+        longest = window if window is not None else longest_context(context_lens)
         tokens, heads, head_size = query.shape
         device = query.device
         lengths = context_lens.to(device).view(-1, 1, 1)

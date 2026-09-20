@@ -83,6 +83,7 @@ from tq_longbench.smoke_glm import (  # noqa: E402
     encode,
     eos_ids_for,
     load_tokenizer,
+    model_directory,
     prompt_route,
     quiet_tensorflow,
     resolve_device,
@@ -93,7 +94,8 @@ from tq_longbench.smoke_glm import (  # noqa: E402
 quiet_tensorflow()
 
 from tq_longbench.engine import DEFAULT_CHUNK_SIZE, PREFILL_MODES, RunMetrics  # noqa: E402
-from tq_longbench.glm4 import is_glm4_config, read_config  # noqa: E402
+from tq_longbench.families import ModelFamily, family_for  # noqa: E402
+from tq_longbench.glm4 import read_config  # noqa: E402
 from tq_longbench.layers import FOLD_SITES  # noqa: E402
 from tq_longbench.metrics import (  # noqa: E402
     TASK_METRICS,
@@ -140,7 +142,12 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python tools/tq_longbench/run_longbench.py",
         description="LongBench sub-tasks across a context ladder, with TTFT, decode percentiles and peak HBM.",
     )
-    parser.add_argument("--model-path", required=True, help="directory holding config.json and safetensors shards")
+    parser.add_argument(
+        "--model-path",
+        required=True,
+        type=model_directory,
+        help="directory holding config.json and safetensors shards; a Windows path in either slash is fine",
+    )
     parser.add_argument("--device", default="npu", help="npu, npu:N, cuda:N or cpu (default: npu)")
     parser.add_argument("--backends", default="turboquant_cube", help=f"comma-separated; one of {backend_names()}")
     parser.add_argument("--tasks", default=DEFAULT_TASKS, help=f"comma-separated; known: {sorted(TASK_METRICS)}")
@@ -260,9 +267,9 @@ class TaskRung:
         return max((r[key] for r in self.records), default=0.0)
 
 
-def run_item(args, runner, tokenizer, eos_ids, item, keep: int, glm4: bool) -> tuple[dict, torch.Tensor]:
+def run_item(args, runner, tokenizer, eos_ids, item, keep: int, family: ModelFamily) -> tuple[dict, torch.Tensor]:
     """One LongBench item, truncated to the rung, scored by its own metric."""
-    full = encode(tokenizer, item.prompt, not args.raw_prompt, glm4=glm4)
+    full = encode(tokenizer, item.prompt, not args.raw_prompt, family)
     prompt_ids = truncate_middle(full, keep)
     budget = args.max_new_tokens or item.max_new_tokens
     task = item.extra.get("task")
@@ -378,10 +385,10 @@ def main(argv: list[str] | None = None) -> int:
     tasks = parse_tasks(args.tasks)
     contexts = (args.max_context_len,) if args.max_context_len else parse_int_list(args.contexts, "contexts")
     config = read_config(args.model_path)
-    glm4 = is_glm4_config(config)
-    tokenizer = load_tokenizer(args.model_path) if glm4 else _auto_tokenizer(args.model_path)
-    eos_ids = eos_ids_for(config, tokenizer)
-    print(f"prompt: {prompt_route(tokenizer, not args.raw_prompt, glm4)}", file=sys.stderr)
+    family = family_for(config)
+    tokenizer = load_tokenizer(args.model_path, family)
+    eos_ids = eos_ids_for(config, tokenizer, family)
+    print(f"prompt: {prompt_route(tokenizer, not args.raw_prompt, family)}", file=sys.stderr)
     print(f"stop ids: {sorted(eos_ids) or 'NONE -- every item will run its whole budget'}", file=sys.stderr)
 
     print(f"prompts: {config_source(args.dataset_dir)}", file=sys.stderr)
@@ -403,12 +410,12 @@ def main(argv: list[str] | None = None) -> int:
     rungs: list[TaskRung] = []
     try:
         for backend in backends:
-            plan = plan_for_backend(args, backend, contexts, glm4)
+            plan = plan_for_backend(args, backend, contexts, family)
             if plan.results or plan.notes:
                 print(plan.report(), file=sys.stderr)
             runner = None
             for context in contexts:
-                mode = rung_prefill_mode(args, plan, backend, context, glm4)
+                mode = rung_prefill_mode(args, plan, backend, context, family)
                 max_seq_len = context + _largest_budget(args, tasks) + CONTEXT_HEADROOM_TOKENS
                 runner = None
                 free_device(args.device)
@@ -418,7 +425,7 @@ def main(argv: list[str] | None = None) -> int:
                 for task in tasks:
                     rung = TaskRung(backend, context, task, metric_label(task), sources[task])
                     for position, item in enumerate(items[task]):
-                        record, prompt_ids = run_item(args, runner, tokenizer, eos_ids, item, keep, glm4)
+                        record, prompt_ids = run_item(args, runner, tokenizer, eos_ids, item, keep, family)
                         record.update(context_requested=context, prefill_mode=mode)
                         rung.records.append(record)
                         sink.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -467,12 +474,6 @@ def _largest_budget(args: argparse.Namespace, tasks: tuple[str, ...]) -> int:
         return args.max_new_tokens
     _, budgets = longbench_config(args.dataset_dir)
     return max(budgets.get(task, 64) for task in tasks)
-
-
-def _auto_tokenizer(model_path: str):
-    from transformers import AutoTokenizer
-
-    return AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
 
 if __name__ == "__main__":

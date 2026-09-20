@@ -140,7 +140,7 @@ decode is one TND row per token with no mask.
 
 Which one a run uses is not guessed. `smoke_glm.py` and `run_benchmark.py` first
 run a **pre-flight** (`preflight.py`), before any weights load. One synthetic
-layer, 16 tokens with GLM-4's head counts, is written, prefilled and decoded
+layer, 16 tokens with the checkpoint's own head counts, is written, prefilled and decoded
 through every attention path the run will take, and checked against exact
 attention in float32. A path that raises fails, and so does one that runs but
 returns the wrong numbers.
@@ -202,8 +202,8 @@ build_turboquant_ops.py  build that library alone (csrc/attention/turboquant/sta
 kv_cache.py      StaticKVCache: DenseKVCache and TurboQuantKVCache, allocated once
 ops.py           the Ascend backends, their scratch buffers and the tie point
 reference.py     the same arithmetic in torch, for CUDA and CPU
-layers.py        RMSNorm, RoPE, attention, SwiGLU, the decoder stack, the o_proj fold
-engine.py        StandaloneModelRunner: weights, chunked prefill, greedy decode, metrics
+layers.py        RMSNorm, RoPE, fused projections, the decoder stack, the decode workspace
+engine.py        StandaloneModelRunner and StaticDecodeGraph: weights, prefill, the captured decode
 hf_bridge.py     give a Hugging Face model's full-attention layers this KV cache
 tasks.py         LongBench prompts and metrics, and the synthetic NIAH generator
 cpu_reference.py serve the operators from the CPU, for a run with no device
@@ -213,11 +213,108 @@ run_longbench.py the published LongBench tasks across that same ladder
 probe.py         per-layer needle mass, entropy, logit lens and divergence from the dense baseline
 smoke_dense.py   dense GQA end to end, against eager Hugging Face
 smoke_hf.py      a hybrid model through the bridge, against eager Hugging Face
+families.py      which family a config.json is: stop tokens, turn markers, prefill policy
 glm4.py          GLM-4: config.json to shape, fused-tensor splitting, prefill policy
 preflight.py     one synthetic layer through a backend, against exact attention, before any weights
-smoke_glm.py     GLM-4 end to end: the folded-o_proj contract, a prompt, NIAH
+smoke_glm.py     one checkpoint end to end: the folded-o_proj contract, a prompt, NIAH
 diagnose.py      per-layer quantisation loss on real weights
 ```
+
+## The decode step (`--decode-graph`)
+
+A single-token decode of a 3B model is about four hundred kernel launches, and
+not one of them runs for as long as it takes the host to submit the next. On an
+RTX 5070 that showed up as **42 ms a token of which 42 ms was host time** — the
+device idle, waiting for Python. The step is now recorded once and replayed,
+which is worth rather more than any arithmetic saved along the way.
+
+Three things had to become true of a step before it could be recorded, and each
+is worth having on its own:
+
+**One GEMM where there were three.** `q_proj`/`k_proj`/`v_proj` are one
+`qkv_proj` and `gate_proj`/`up_proj` are one `gate_up_proj`. A checkpoint still
+names them separately and still loads: `CausalLM.load_destinations` hands the
+loader *views* into the fused tensors, so `self_attn.q_proj.weight` is the first
+`num_heads · D` rows of `qkv_proj.weight` and copying into it writes the fused
+one. A checkpoint that was already fused (`chatglm`'s `query_key_value`,
+`dense_h_to_4h`) is split by the adapter and lands back in one tensor in the
+order it arrived. cuBLAS splits one GEMM's output rows exactly as it would
+compute three, so the fusion is **bit-identical**, not merely close. It also
+puts q's heads immediately before k's, which is why RoPE is one call per layer
+instead of two.
+
+**Buffers instead of allocations.** `DecodeWorkspace` holds every tensor a
+one-token step writes into — the residual stream, the fused projection, the
+attention output, the fused gate/up, the logits, and the three indices that aim
+them. They are shared by every layer, which is safe because the decode is
+sequential: layer *i* has consumed its `qkv` before layer *i+1* writes it.
+Nothing on the path calls `torch.empty`.
+
+**No reading the device back.** Every backend's decode used to open with
+`int(context_lens.max())` to decide how much of the pool to slice — a
+device-to-host copy **per layer per step**, 36 of them a token — and the
+tie-point check read the same tensor again. Both are gone from this path. The
+decode is handed a `window` (how many slots to read) and the lengths stay on the
+device as the mask they already were; slots past a row's own length are masked
+off exactly as before, so a window wider than the prefix costs reads and changes
+no number. `native_v5` is the one backend this cannot reach: its entry points
+take the kv lengths as a Python list, so it reports
+`supports_static_decode = False` and is refused a capture rather than given one
+whose lengths were frozen at record time.
+
+With those, `StaticDecodeGraph` records the whole step — every layer, the head
+and the argmax — into a `CUDAGraph` on CUDA or an `NPUGraph` on NPU, after
+`GRAPH_WARMUP_STEPS` (3) real passes. The warmup passes execute, and that is
+safe: writing the same token at the same position is idempotent, so a warmup
+pass *is* the step, run more than once. Recording executes nothing, so the step
+the caller asked for is the replay that follows.
+
+Captures are bucketed by window — powers of two up to the cache — so a 128k run
+holds ten graphs rather than 128k of them and no step reads more than twice the
+cache it needs. They share one memory pool, because they are replayed one at a
+time. The step that captures is timed separately (`captures`, `capture_ms`) and
+kept out of the percentiles: it is real time the run spent, and it is not what a
+steady-state token costs.
+
+`--decode-graph off` is the same arithmetic over the same buffers, launched a
+kernel at a time — the honest thing to compare against, not a different model.
+`on` refuses a run that cannot capture, which is what a benchmark wants: a quiet
+fallback reporting 26 ms a token reads as slow kernels.
+
+### What it measured
+
+Qwen2.5-3B-Instruct, fp16, `cann_dense`, 256-token prompt, 60 decode steps,
+RTX 5070 (12 GB, ~505 GiB/s measured):
+
+| | p50 | p90 | p99 | tok/s |
+| --- | --- | --- | --- | --- |
+| before | 51.08 ms | 53.09 | 55.30 | 19.6 |
+| fused + buffers + window, eager | 25.59 ms | 27.16 | 28.00 | 39.1 |
+| replayed from a captured graph | **12.49 ms** | 12.89 | 13.49 | **80.0** |
+
+Same tokens in all three. The verification run
+(`smoke_glm.py --device cuda --backend cann_dense --tokens 256`) reports
+p50 12.30 ms / 81.3 tok/s and stops on `<|im_end|>`.
+
+**Where the remaining 12.5 ms goes, and why it is nearly the floor.** BS=1 decode
+reads every weight once a token: 6.17 GB for this checkpoint, which at the
+~505 GiB/s this card sustains on a large read is **11.0 ms** before any
+arithmetic. Timed directly, the four GEMMs over 36 layers plus the head are
+10.0 + 1.0 ms of the 12.5, so the step is now **device-bound** — synchronising
+around a replay costs 0.08 ms, and seating the three indices and reading the
+token back costs 0.04 ms. The other ~1.5 ms is the elementwise work between the
+GEMMs (RoPE, the KV write, the attention, the residuals). There is no fp16 path
+to 10 ms a token on this card; that needs smaller weights, not fewer launches.
+
+`RMSNorm` calls `torch.nn.functional.rms_norm` where the installed torch has it,
+which was the largest single non-GEMM cost: written out it is a promote, a
+square, a mean, an add, a reciprocal square root, two multiplies and a cast —
+eight launches, seventy-two times a token. The explicit expression is kept as
+the fallback and as the statement of what the kernel computes. The two agree bit
+for bit on the one-token rows a decode norms; over a 2048-token prefill chunk
+they differ on about one element in forty thousand by a single float16 ulp,
+which is a summation order rounding differently rather than a different
+definition, and changed no token on anything measured here.
 
 ## Scoring the needle
 
@@ -353,6 +450,12 @@ the run's dtype — never on the device, which has no fast float64. Under
 because it feeds the same folded projection. A gated layer is refused: the gate
 sits between attention and `o_proj`, where the output is still rotated.
 
+`smoke_glm.py` runs any of these end to end, and reads which one it has from
+`config.json`. The shape — head counts, head size, the RoPE base and how much
+of each head it rotates — comes from `read_checkpoint_shape` in `engine.py`;
+what a config cannot state comes from the *family* `families.py` matches on
+`model_type` (below). Nothing in `smoke_glm.py` is one model's.
+
 **GLM-4** (`THUDM/glm-4-9b-chat-1m`, `glm4.py`) runs on the runner directly. It
 is dense GQA with no q/k norm and no gate. Both the `chatglm` checkpoint (fused
 `query_key_value` with bias, fused `dense_h_to_4h`) and the HF `glm` export
@@ -373,12 +476,42 @@ Its prefill defaults to `batched_decode` from 32768 context tokens up (and
 `run_eval.py` does the same for a GLM-4 checkpoint), `dense_staging` below.
 GLM-4-0414 (`model_type: glm4`) adds sandwich norms and is refused.
 
-On `transformers` 4.28 the checkpoint's tokenizer cannot load as shipped: 4.28
-ignores `tokenizer_config.json`'s `added_tokens_decoder`, so every special-token
-lookup raises `KeyError`. `smoke_glm.py` suppresses `sanitize_special_tokens` for
-the load and registers the declared tokens at their ids. The result was checked
-to encode identically to 4.44. `--dummy-prompt` skips the tokenizer entirely: a
-64-token prompt of ones, short-prompt stage only, for a kernel sanity check.
+On `transformers` 4.28 GLM-4's tokenizer cannot load as shipped: 4.28 ignores
+`tokenizer_config.json`'s `added_tokens_decoder`, so every special-token lookup
+raises `KeyError`. `load_tokenizer` suppresses `sanitize_special_tokens` for the
+load and registers the declared tokens at their ids — for that family only, since
+`Qwen2Tokenizer` has no such problem and shadowing a base-class method to load it
+would be a workaround for one it does not have. The result was checked to encode
+identically to 4.44. `--dummy-prompt` skips the tokenizer entirely: a 64-token
+prompt of ones, short-prompt stage only, for a kernel sanity check.
+
+**Qwen2.5** (`model_type: qwen2`) needs no adapter at all: its `config.json` is
+an ordinary HF one, so the shape comes from `ModelShape.from_hf_config` like any
+dense GQA checkpoint, and the contrast with GLM-4 is entirely in what the config
+says. `Qwen2.5-3B-Instruct` is 36 layers, **16** query heads over **2** KV heads
+(8:1 GQA), `D = 128`, RoPE base `1e6` — and NeoX halves over the *whole* head,
+where GLM-4 pairs adjacent channels over the first half. It ties `lm_head` to the
+embedding and ships no `lm_head.weight`. Having no gate, it folds Π into `o_proj`
+on the same contract GLM-4 does.
+
+```bash
+python tools/tq_longbench/smoke_glm.py --model-path "F:/AI/models/Qwen2.5-3B-Instruct" --device cuda --backend cann_dense --tokens 256 --max-new-tokens 32
+```
+
+`--model-path` is normalised before anything opens it, so either slash, a
+trailing separator and `~` all name the same directory; a path that is not a
+checkpoint is one sentence rather than a `FileNotFoundError` from inside the
+weight load. On a CUDA host `cann_dense` is torch's batched matmul and softmax
+over the paged pool and `dense_reference` is `scaled_dot_product_attention` over
+the same pool; the TurboQuant kernels need an NPU, and `turboquant_reference`
+computes what they compute in torch (correctness only — it says nothing about
+latency).
+
+A `model_type` no family claims still runs. It gets `families.GENERIC`, whose
+tokenizer's own chat template and config's own `eos_token_id` are the only
+authorities on the prompt and the stop set, and which stages no unquantised pool
+at any length because what one would cost per token is exactly what is not known
+about it. What `GENERIC` never does is lend it another model's ids.
 
 ### Stopping, and the prompt format
 
@@ -389,24 +522,31 @@ be installed, and are now printed before every run:
 and on the 4.28 path `tokenizer.eos_token_id` is `None` — so the stop set was
 **empty** and nothing halted generation. Every continuation ran its whole budget
 and was trimmed afterwards, which is indistinguishable from a model with more to
-say. `eos_ids_for` now also resolves GLM-4's three turn-enders — `<|endoftext|>`,
-`<|user|>`, `<|observation|>` — by name through the tokenizer, falling back to
-their published ids (151329 / 151336 / 151338) only if it does not know them.
-`generate(stop_ids=...)` ends the **loop**, not just the text: a run that
-generates its budget and is trimmed on the way out has already paid for every
-step, so its decode percentiles average over tokens the model never meant to
-emit.
+say. Qwen2.5 is the milder form of the same thing: its `config.json` names
+`<|im_end|>` and says nothing about `<|endoftext|>`, which its own
+`generation_config.json` lists beside it. So each family writes its stop tokens
+down **by name** and `eos_ids_for` resolves every one through the tokenizer,
+falling back to the published id only if the tokenizer does not know it —
+GLM-4's three turn-enders `<|endoftext|>` / `<|user|>` / `<|observation|>`
+(151329 / 151336 / 151338), Qwen2.5's `<|im_end|>` / `<|endoftext|>`
+(151645 / 151643). `generate(stop_ids=...)` ends the **loop**, not just the
+text: a run that generates its budget and is trimmed on the way out has already
+paid for every step, so its decode percentiles average over tokens the model
+never meant to emit. Which of the two happened is printed after the short
+prompt — `stopped on '<|im_end|>' (151645)`, or the budget it ran out against —
+because on the page they are the same sentence.
 
 **The chat template.** `encode` takes the first of three routes that works: the
-tokenizer's own `apply_chat_template`; GLM-4's turn markers assembled here —
-`[gMASK]<sop><|user|>
-{prompt}
-<|assistant|>`, built by id rather than parsed
-from a string — for a `transformers` that has no `apply_chat_template` at all;
-and the bare text. Falling through to the third is not a neutral default: a chat
-model handed a document with no `<|user|>` before it and no `<|assistant|>` after
-it continues the document, which over a needle-in-a-haystack prompt means
-continuing the haystack.
+tokenizer's own `apply_chat_template`; the family's turn markers assembled here,
+built by id rather than parsed from a string, for a `transformers` that has no
+`apply_chat_template` at all; and the bare text. The transcriptions are
+`[gMASK]<sop><|user|>\n{prompt}\n<|assistant|>` for GLM-4 and ChatML —
+`<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n` — for Qwen2.5.
+Literal text adjacent to the prompt is tokenised *with* it, in one call, because
+a BPE tokenizer merges across the join. Falling through to the third route is not
+a neutral default: a chat model handed a document with no turn markers around it
+continues the document, which over a needle-in-a-haystack prompt means continuing
+the haystack.
 
 Both are reported in stage 1 (`prompt:` and `stop ids:`), and an empty stop set
 says so in as many words.

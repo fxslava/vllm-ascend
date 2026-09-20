@@ -39,6 +39,7 @@ measurement would have to subtract again.
 from __future__ import annotations
 
 import json
+import sys
 import time
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
@@ -52,6 +53,7 @@ from tq_longbench.kv_cache import CacheGeometry, dense_equivalent_bytes
 from tq_longbench.layers import (
     FOLD_SITES,
     CausalLM,
+    DecodeWorkspace,
     ForwardBatch,
     ModelShape,
     fold_on_device,
@@ -76,6 +78,9 @@ DEFAULT_CHUNK_SIZE = 2048
 #: Above this the fp16 staging pool stops being affordable; ``run_eval`` says so
 #: rather than letting the allocation fail halfway through a sweep.
 DENSE_STAGING_RECOMMENDED_MAX_SEQ = 32768
+
+#: ``RunnerConfig.decode_graph``.
+DECODE_GRAPH_MODES = ("auto", "on", "off")
 
 _MEGABYTE = 1024 * 1024
 
@@ -128,8 +133,16 @@ class RunnerConfig:
     #: of single-threaded host work, and the same map is a matmul the Cube does
     #: while the next shard is still being read.
     fold_site: str = "auto"
+    #: Whether the decode runs as a captured graph (``DECODE_GRAPH_MODES``).
+    #: ``auto`` captures wherever the device and the backend allow it and falls
+    #: back quietly where they do not; ``on`` makes a run that cannot capture an
+    #: error rather than a slow success, which is what a benchmark wants; ``off``
+    #: is the eager path, and the one to compare against.
+    decode_graph: str = "auto"
 
     def __post_init__(self) -> None:
+        if self.decode_graph not in DECODE_GRAPH_MODES:
+            raise ValueError(f"unknown decode_graph {self.decode_graph!r}; choose one of {list(DECODE_GRAPH_MODES)}")
         if self.prefill_mode not in PREFILL_MODES:
             raise ValueError(f"unknown prefill mode {self.prefill_mode!r}; choose one of {list(PREFILL_MODES)}")
         if self.backend in DENSE_BACKENDS and self.prefill_mode != "dense_staging":
@@ -146,6 +159,250 @@ class RunnerConfig:
                 f"dense_staging_backend {self.dense_staging_backend!r} does not decode out of an unquantised "
                 f"cache; choose one of {sorted(DENSE_BACKENDS)}"
             )
+
+
+#: How many real decode passes run before a capture records one.
+#:
+#: Three, because the first is not representative of the ones after it and the
+#: capture must record the steady state: cuBLAS picks and caches a kernel for
+#: each new GEMM shape on first call, the caching allocator learns the step's
+#: block sizes, and lazy module state (the column index the dense backend grows,
+#: a backend's scratch) is built. Capturing any of that would bake a one-off into
+#: every replay -- or, for an allocation that happens once, capture a pointer the
+#: replay then reuses for something else.
+GRAPH_WARMUP_STEPS = 3
+
+#: Graph capture is per *window* -- how many cache slots the decode reads -- and
+#: the windows are powers of two, so a run captures ``log2`` of its context
+#: rather than one graph per position. A step takes the smallest window that
+#: covers it; the slots between its context length and the window are masked off
+#: by ``context_lens``, exactly as an over-long window always was, so the only
+#: cost of rounding up is reading cache that contributes nothing.
+GRAPH_WINDOW_GROWTH = 2
+
+
+def graph_windows(max_seq_len: int, block_size: int) -> tuple[int, ...]:
+    """The window sizes a run may capture, smallest first.
+
+    Powers of two from one block up to the cache, so a 128k run holds ten graphs
+    rather than 128k of them and no step reads more than twice the cache it
+    needs. The cache's own length is always the last, because a step at the very
+    end must have a window that covers it.
+    """
+    windows: list[int] = []
+    window = block_size
+    while window < max_seq_len:
+        windows.append(window)
+        window *= GRAPH_WINDOW_GROWTH
+    windows.append(max_seq_len)
+    return tuple(windows)
+
+
+class GraphCaptureUnavailable(RuntimeError):
+    """Why this run cannot capture a decode graph. Never raised past ``decode_graph='on'``."""
+
+
+def _graph_api(device: torch.device):
+    """``(new_graph, capture_context)`` for this device, or ``None`` where there is none.
+
+    The two vendors spell the same thing the same way one level down:
+    ``torch.cuda.CUDAGraph`` / ``torch.cuda.graph``, and ``NPUGraph`` / ``graph``
+    on the NPU. Only the module differs, so only the module is dispatched on.
+
+    ``torch_npu`` is never imported here. It is reached through
+    ``sys.modules`` if something else has already imported it -- which
+    :func:`tq_longbench.smoke_glm.resolve_device` does before torch can parse an
+    ``npu`` device at all -- and through ``torch.npu``, the alias it installs,
+    otherwise. A CUDA run must not import it and a CPU run has nothing to import.
+    """
+    if device.type == "cuda":
+        return torch.cuda.CUDAGraph, torch.cuda.graph
+    if device.type != "npu":
+        return None
+    for module in (getattr(sys.modules.get("torch_npu"), "npu", None), getattr(torch, "npu", None)):
+        graph_type = getattr(module, "NPUGraph", None)
+        capture = getattr(module, "graph", None)
+        if graph_type is not None and capture is not None:
+            return graph_type, capture
+    return None
+
+
+class StaticDecodeGraph:
+    """The whole single-token decode -- every layer, the head and the argmax -- recorded once.
+
+    A BS=1 decode step of a 3B model is on the order of four hundred kernel
+    launches, none of which runs for as long as it takes the host to submit the
+    next one. Measured on an RTX 5070 before any of this: 42 ms a token, of which
+    **42 ms was host time** -- the device was idle, waiting for Python. Fusing
+    the projections took a millisecond off, because the problem was never the
+    number of GEMMs, it was that every launch crosses the interpreter.
+
+    A captured graph is the answer to exactly that: the launches are recorded
+    once into a structure the driver replays as a unit, so a step costs one
+    submission and whatever the kernels genuinely take.
+
+    Three things have to be true of a step before it can be recorded, and the
+    rest of this harness's decode path was changed to make them true:
+
+    * **Fixed addresses.** A replay reads and writes the buffers the capture saw.
+      That is :class:`~tq_longbench.layers.DecodeWorkspace`, and it is why the
+      step's inputs are written into tensors rather than passed as arguments.
+    * **Fixed shapes.** The context grows by a token a step, so the attention's
+      shape would too. Hence the window: the decode reads a fixed number of cache
+      slots and masks off the ones past its own length, and the captures are
+      bucketed by window (:func:`graph_windows`).
+    * **No synchronisation.** Every host read of a device tensor is illegal
+      during capture -- and was a stall before it. The tie-point check and each
+      backend's ``int(context_lens.max())`` were the two, and both are gone from
+      this path: the length lives in ``context_lens`` on the device, which is
+      also what makes a replay see a length the capture never knew.
+
+    What a replay cannot do is change how long the model is or which layer runs;
+    it re-executes the recorded work over whatever the buffers now hold. So the
+    graph is invalidated by nothing here -- the weights, the pools and the
+    workspace all outlive it -- and the only per-step host work left is seating
+    three integers and reading one back.
+    """
+
+    def __init__(
+        self,
+        model: CausalLM,
+        workspace: DecodeWorkspace,
+        write_backends: tuple[AttentionBackend, ...],
+        decode_backend: AttentionBackend,
+        windows: tuple[int, ...],
+        device: torch.device,
+    ) -> None:
+        self.model = model
+        self.workspace = workspace
+        self.write_backends = write_backends
+        self.decode_backend = decode_backend
+        self.windows = windows
+        self.device = device
+        api = _graph_api(device)
+        if api is None:
+            raise GraphCaptureUnavailable(f"{device.type} has no graph capture in this torch build")
+        if not decode_backend.supports_static_decode:
+            raise GraphCaptureUnavailable(
+                f"the {decode_backend.name} decode reads its context lengths back to the host on every layer, "
+                "which cannot be captured; its lengths would be frozen at the length the capture saw"
+            )
+        if not decode_backend.supports_graph_capture:
+            raise GraphCaptureUnavailable(
+                f"the {decode_backend.name} decode path has a shape that depends on a tensor's values, which is "
+                "a host read wherever it appears; see its supports_graph_capture"
+            )
+        self._new_graph, self._capture = api
+        self._graphs: dict[int, object] = {}
+        self._pool = None
+        #: Every window that was captured, in the order it was first needed.
+        self.captured: list[int] = []
+
+    # ------------------------------------------------------------- the step
+
+    def window_for(self, context_len: int) -> int:
+        """The smallest captured window that covers ``context_len`` slots."""
+        for window in self.windows:
+            if window >= context_len:
+                return window
+        raise ValueError(f"a context of {context_len} exceeds the {self.windows[-1]}-slot cache")
+
+    def _batch(self, window: int) -> ForwardBatch:
+        workspace = self.workspace
+        return ForwardBatch(
+            positions=workspace.positions,
+            slots=workspace.slots,
+            # Never read on this path: the length that matters is context_lens,
+            # on the device, where a replay can see it change.
+            prefix_end=0,
+            is_decode=True,
+            workspace=workspace,
+            context_lens=workspace.context_lens,
+            window=window,
+        )
+
+    def _run(self, window: int) -> None:
+        """One decode step into the workspace, ending with the token it chose.
+
+        The argmax is part of the step rather than the caller's: inside a capture
+        it costs nothing extra, and it turns the host's job from launching a
+        reduction over 152k logits into reading one integer back.
+        """
+        workspace = self.workspace
+        logits = self.model(
+            workspace.token_ids,
+            self._batch(window),
+            self.write_backends,
+            self.decode_backend,
+        )
+        torch.argmax(logits[-1], dim=-1, keepdim=True, out=workspace.next_token)
+
+    def capture(self, window: int) -> None:
+        """Warm up and record one window, if it is not recorded already.
+
+        The warmup passes are real: they execute, and they write this step's K/V
+        into this step's slot. That is safe because writing the same token at the
+        same position is idempotent -- the pass is the step, run more than once --
+        and it is *necessary*, because a capture that had not seen the steady
+        state would record a kernel choice or an allocation that only the first
+        call makes.
+
+        Recording itself executes nothing, so the caller still replays afterwards
+        to get the step it asked for.
+        """
+        if window in self._graphs:
+            return
+        stream_api = getattr(torch, self.device.type)
+        side = stream_api.Stream()
+        side.wait_stream(stream_api.current_stream())
+        with stream_api.stream(side):
+            for _ in range(GRAPH_WARMUP_STEPS):
+                self._run(window)
+        stream_api.current_stream().wait_stream(side)
+        stream_api.synchronize()
+
+        graph = self._new_graph()
+        with self._capture_context(graph):
+            self._run(window)
+        if self._pool is None:
+            self._pool = getattr(graph, "pool", lambda: None)()
+        self._graphs[window] = graph
+        self.captured.append(window)
+
+    def _capture_context(self, graph):
+        """The vendor's capture context, sharing one memory pool across the windows.
+
+        The graphs are replayed one at a time and never overlap, so one pool
+        means the largest window's intermediates are the whole cost rather than
+        the sum of every window's. A capture API that does not take a pool is
+        used without one -- a bigger footprint, not a wrong answer -- because
+        refusing to capture over it would be the worse trade.
+        """
+        if self._pool is None:
+            return self._capture(graph)
+        try:
+            return self._capture(graph, pool=self._pool)
+        except TypeError:
+            return self._capture(graph)
+
+    def step(self, token: int, position: int) -> int:
+        """Run one decode step for ``token`` at ``position``; return the token it chose.
+
+        The three integers are written into the workspace with ``fill_``, which
+        is a launch rather than a copy across the bus, and the answer comes back
+        as one host read. Everything between them is the replay.
+        """
+        context_len = position + 1
+        window = self.window_for(context_len)
+        self.workspace.seat(token, position, context_len)
+        self.capture(window)
+        self._graphs[window].replay()
+        return int(self.workspace.next_token)
+
+    def describe(self) -> str:
+        if not self.captured:
+            return "decode graph: ready, nothing captured yet"
+        return f"decode graph: {len(self.captured)} captured at windows {sorted(self.captured)}"
 
 
 @dataclass
@@ -172,6 +429,14 @@ class RunMetrics:
     #: what an empty stop set looks like from the outside, and is otherwise
     #: indistinguishable from a model that simply had more to say.
     stopped_on_token: int | None = None
+    #: Whether the decode ran as a captured graph. On the record because the two
+    #: paths differ by an order of magnitude and by nothing visible in the text.
+    decode_graph: bool = False
+    #: The steps that also captured a window, kept apart from
+    #: :attr:`decode_step_us` rather than dropped: they are real time the run
+    #: spent, they are not what a steady-state token costs, and averaging them in
+    #: would make a long run look better than a short one for no reason.
+    capture_us: list[float] = field(default_factory=list)
 
     @property
     def prefill_tokens_per_second(self) -> float:
@@ -180,6 +445,17 @@ class RunMetrics:
     @property
     def kv_saved_mb(self) -> float:
         return self.dense_equivalent_mb - self.kv_cache_mb
+
+    @property
+    def decode_tokens_per_second(self) -> float:
+        """Steady-state decode throughput, from the median step rather than the mean.
+
+        The median because a capture is not a decode and an allocator's first
+        touch is not either: both land in the tail, and a mean over sixteen steps
+        lets one of them halve the number the run is judged on.
+        """
+        median = self.percentile(0.50)
+        return 1e6 / median if median else 0.0
 
     def percentile(self, fraction: float) -> float:
         if not self.decode_step_us:
@@ -206,6 +482,10 @@ class RunMetrics:
             "device_reserved_mb": round(self.device_reserved_mb, 2),
             "stopped_on_token": self.stopped_on_token,
             "hit_token_budget": self.stopped_on_token is None,
+            "decode_graph": self.decode_graph,
+            "captures": len(self.capture_us),
+            "capture_ms": round(sum(self.capture_us) / 1e3, 2),
+            "decode_tokens_per_second": round(self.decode_tokens_per_second, 2),
         }
 
 
@@ -280,15 +560,38 @@ class StandaloneModelRunner:
         elif config.fold_output_rotation:
             fold_output_rotation(self.model)
 
+        #: The single-token decode's buffers, and the graph recorded over them.
+        #: Both are built here rather than on the first step, so what a run costs
+        #: to set up is paid before anything is timed.
+        self.workspace = DecodeWorkspace.build(self.shape, config.dtype, self.device)
+        self.decode_graph, self.decode_graph_refusal = self._build_decode_graph()
+
+    def _build_decode_graph(self) -> tuple[StaticDecodeGraph | None, str | None]:
+        """The decode graph, or ``None`` and the reason there is not one.
+
+        ``decode_graph='on'`` turns the reason into an error. That is the mode a
+        benchmark should use: a run that quietly fell back to eager and reported
+        75 ms a token would read as the kernels being slow, which is the one
+        conclusion this harness exists to make impossible to reach by accident.
+        """
+        if self.config.decode_graph == "off":
+            return None, "decode_graph='off'"
+        try:
+            graph = StaticDecodeGraph(
+                self.model,
+                self.workspace,
+                self.write_backends,
+                self.decode_backend,
+                graph_windows(self.config.max_seq_len, self.config.block_size),
+                self.device,
+            )
+        except GraphCaptureUnavailable as refusal:
+            if self.config.decode_graph == "on":
+                raise
+            return None, str(refusal)
+        return graph, None
+
     # ---------------------------------------------------------------- config
-
-    def _config_path(self) -> Path:
-        return Path(self.config.model_path) / "config.json"
-
-    def _hf_config(self):
-        from transformers import AutoConfig
-
-        return AutoConfig.from_pretrained(self.config.model_path, trust_remote_code=True)
 
     def _raw_config(self) -> dict:
         return glm4.read_config(self.config.model_path)
@@ -297,11 +600,11 @@ class StandaloneModelRunner:
         return not self.config.random_weights and glm4.is_glm4_config(self._raw_config())
 
     def _load_shape(self) -> ModelShape:
-        if self._is_glm4():
-            # Read off config.json directly: the chatglm config class is remote
-            # code, and nothing it computes is needed that the JSON does not say.
-            return glm4.glm4_model_shape(self._raw_config(), self.config.attn_output_gate)
-        return ModelShape.from_hf_config(self._hf_config(), self.config.attn_output_gate, **self._checkpoint_features())
+        return read_checkpoint_shape(
+            self.config.model_path,
+            self.config.attn_output_gate,
+            weights_on_disk=not self.config.random_weights,
+        )
 
     def _checkpoint_mapper(self) -> CheckpointMapper:
         """How this checkpoint's tensor names land on the harness's modules."""
@@ -314,44 +617,6 @@ class StandaloneModelRunner:
             return [] if target is None else [(target, tensor)]
 
         return one_to_one
-
-    def _tensor_names(self) -> list[str]:
-        """Every tensor name in the checkpoint, read from the index or the shard headers.
-
-        Names only -- ``safe_open`` gives them without reading a byte of tensor
-        data, so this costs nothing next to the load that follows.
-        """
-        root = Path(self.config.model_path)
-        index = root / "model.safetensors.index.json"
-        if index.is_file():
-            return list(json.loads(index.read_text(encoding="utf-8"))["weight_map"])
-
-        from safetensors import safe_open
-
-        names: list[str] = []
-        for shard in sorted(root.glob("*.safetensors")):
-            with safe_open(str(shard), framework="pt") as handle:
-                names.extend(handle.keys())
-        return names
-
-    def _checkpoint_features(self) -> dict:
-        """What the config does not say: whether q/k are normed, and whether qkv has a bias.
-
-        Read off the tensor names rather than the config, because neither is
-        reliably declared. Qwen2.5 carries q/k/v biases with no ``attention_bias``
-        key, and ``model_type`` alone does not separate a Qwen3 checkpoint (which
-        norms each head) from a Qwen2 one (which does not). Getting either wrong
-        builds a model whose parameters and the checkpoint's do not correspond,
-        which :meth:`load_weights` then refuses -- loudly, rather than by
-        normalising with a weight of 1 that was never loaded.
-        """
-        if self.config.random_weights:
-            return {}
-        names = self._tensor_names()
-        return {
-            "qk_norm": any(name.endswith("self_attn.q_norm.weight") for name in names),
-            "qkv_bias": any(name.endswith("self_attn.q_proj.bias") for name in names),
-        }
 
     # --------------------------------------------------------------- weights
 
@@ -380,7 +645,10 @@ class StandaloneModelRunner:
         if not shards:
             raise FileNotFoundError(f"no safetensors shards under {root}")
 
-        destinations = dict(self.model.named_parameters())
+        # Views, not parameters: q/k/v and gate/up are each one fused tensor in
+        # the module tree, and a checkpoint's separate names write into slices of
+        # it. See CausalLM.load_destinations.
+        destinations = self.model.load_destinations()
         mapper = self._checkpoint_mapper()
         fold = self.config.fold_output_rotation
         on_device = fold and fold_on_device(self.config.fold_site, self.device)
@@ -476,6 +744,9 @@ class StandaloneModelRunner:
             "dense_equivalent_mb": dense_bytes / _MEGABYTE,
             "decode_cache_mb": self.decode_backend.cache.bytes_allocated() / _MEGABYTE,
             "bytes_per_token_per_layer": self.decode_backend.cache.bytes_per_token_per_layer(),
+            # Budgeted like the pools rather than left to the allocator: small
+            # next to a KV cache, and the whole of what a decode step writes into.
+            "decode_workspace_mb": self.workspace.bytes_allocated() / _MEGABYTE,
         }
 
     # -------------------------------------------------------------- the loop
@@ -533,31 +804,101 @@ class StandaloneModelRunner:
         produced: list[int] = []
         position = token_ids.numel()
         limit = self.config.max_new_tokens if max_new_tokens is None else max_new_tokens
+        metrics.decode_graph = self.decode_graph is not None
+        next_token = int(torch.argmax(logits[-1]))
+        # argmax syncs on its own (the id crosses to the host), so this boundary
+        # is the token existing, not the launch being queued.
+        metrics.ttft_seconds = time.perf_counter() - started
 
         for _ in range(limit):
-            next_token = int(torch.argmax(logits[-1]))
-            if not produced:
-                # argmax syncs on its own (the id crosses to the host), so this
-                # boundary is the token existing, not the launch being queued.
-                metrics.ttft_seconds = time.perf_counter() - started
             produced.append(next_token)
             if stop_ids and next_token in stop_ids:
                 metrics.stopped_on_token = next_token
                 break
             if position + 1 > self.config.max_seq_len:
                 break
-            step = torch.tensor([next_token], dtype=torch.int64, device=self.device)
-            batch = self._batch(position, 1, is_decode=True)
+            # A capture the first time a window is needed, and the step it was
+            # captured for runs as the replay right after, so nothing is
+            # generated twice and nothing is timed that was not a decode. The
+            # capture itself lands in that step's latency, which is why it is
+            # reported (``captures``) rather than smoothed away.
+            captured_before = len(self.decode_graph.captured) if self.decode_graph else 0
             _synchronize(self.device)
             step_started = time.perf_counter()
-            logits = self.model(step, batch, self.write_backends, self.decode_backend)
+            if self.decode_graph is not None:
+                next_token = self._graph_step(next_token, position)
+            else:
+                next_token = self._eager_step(next_token, position)
             _synchronize(self.device)
-            metrics.decode_step_us.append((time.perf_counter() - step_started) * 1e6)
+            elapsed_us = (time.perf_counter() - step_started) * 1e6
+            metrics.decode_graph = self.decode_graph is not None
+            if self.decode_graph and len(self.decode_graph.captured) != captured_before:
+                metrics.capture_us.append(elapsed_us)
+            else:
+                metrics.decode_step_us.append(elapsed_us)
             position += 1
         metrics.generated_tokens = len(produced)
         for name, value in device_memory_mb(self.device).items():
             setattr(metrics, name, value)
         return produced, metrics
+
+    def _graph_step(self, token: int, position: int) -> int:
+        """One step through the graph, falling back to eager if a capture is refused.
+
+        Only under ``decode_graph='auto'``, and only once: a device whose graph
+        API exists but will not record this step -- which no machine here can
+        rule out for an NPU -- finishes its run eagerly instead of failing it,
+        and says so. ``on`` lets the failure through, because a run that asked
+        for a graph and silently did not get one is a benchmark reporting the
+        wrong number.
+
+        The step is retried eagerly rather than lost: the capture executed
+        nothing, so the token it was for has not been generated yet.
+        """
+        try:
+            return self.decode_graph.step(token, position)
+        except Exception as failure:
+            if self.config.decode_graph == "on":
+                raise
+            self.decode_graph = None
+            self.decode_graph_refusal = f"capture failed and the run continued eagerly: {failure}"
+            return self._eager_step(token, position)
+
+    def _eager_step(self, token: int, position: int) -> int:
+        """One decode step through the workspace, launch by launch.
+
+        The same arithmetic the graph records, over the same buffers -- so the
+        two paths differ in how the work is submitted and in nothing else, and
+        ``--decode-graph off`` is a fair thing to compare against rather than a
+        different model. The window is the graph's too: it is what removes the
+        per-layer read of ``context_lens`` back to the host, and that is worth
+        having whether or not a graph is captured over it.
+        """
+        workspace = self.workspace
+        context_len = position + 1
+        workspace.seat(token, position, context_len)
+        batch = ForwardBatch(
+            positions=workspace.positions,
+            slots=workspace.slots,
+            prefix_end=0,
+            is_decode=True,
+            workspace=workspace,
+            context_lens=workspace.context_lens,
+            window=self._eager_window(context_len),
+        )
+        logits = self.model(workspace.token_ids, batch, self.write_backends, self.decode_backend)
+        torch.argmax(logits[-1], dim=-1, keepdim=True, out=workspace.next_token)
+        return int(workspace.next_token)
+
+    def _eager_window(self, context_len: int) -> int | None:
+        """How many slots the eager decode reads, or ``None`` to let the backend ask.
+
+        A backend that cannot run window-free is one that reads its lengths back
+        anyway, so there is nothing to save; everywhere else the window is the
+        context itself, because without a graph there is no reason to round up
+        to a bucket and read cache that contributes nothing.
+        """
+        return context_len if self.decode_backend.supports_static_decode else None
 
     def _memory_metrics(self) -> dict:
         report = self.memory_report()
@@ -575,6 +916,77 @@ _ATTENTION_SUFFIXES = {
     "q_norm.weight",
     "k_norm.weight",
 }
+
+
+def checkpoint_tensor_names(model_path: str | Path) -> list[str]:
+    """Every tensor name in the checkpoint, read from the index or the shard headers.
+
+    Names only -- ``safe_open`` gives them without reading a byte of tensor data,
+    so this costs nothing next to the load that follows.
+    """
+    root = Path(model_path)
+    index = root / "model.safetensors.index.json"
+    if index.is_file():
+        return list(json.loads(index.read_text(encoding="utf-8"))["weight_map"])
+
+    from safetensors import safe_open
+
+    names: list[str] = []
+    for shard in sorted(root.glob("*.safetensors")):
+        with safe_open(str(shard), framework="pt") as handle:
+            names.extend(handle.keys())
+    return names
+
+
+def checkpoint_features(model_path: str | Path) -> dict:
+    """What the config does not say: whether q/k are normed, and whether qkv has a bias.
+
+    Read off the tensor names rather than the config, because neither is
+    reliably declared. Qwen2.5 carries q/k/v biases with no ``attention_bias``
+    key, and ``model_type`` alone does not separate a Qwen3 checkpoint (which
+    norms each head) from a Qwen2 one (which does not). Getting either wrong
+    builds a model whose parameters and the checkpoint's do not correspond,
+    which :meth:`StandaloneModelRunner.load_weights` then refuses -- loudly,
+    rather than by normalising with a weight of 1 that was never loaded.
+    """
+    names = checkpoint_tensor_names(model_path)
+    return {
+        "qk_norm": any(name.endswith("self_attn.q_norm.weight") for name in names),
+        "qkv_bias": any(name.endswith("self_attn.q_proj.bias") for name in names),
+    }
+
+
+def read_checkpoint_shape(
+    model_path: str | Path,
+    attn_output_gate: bool = False,
+    *,
+    weights_on_disk: bool = True,
+) -> ModelShape:
+    """The harness's shape for the checkpoint at ``model_path``, without loading a weight.
+
+    Two readers, chosen by ``model_type``: GLM-4's, because ``chatglm`` spells
+    every field its own way, and the HF one for everything else -- Qwen2.5
+    included, whose config states its head counts, its ``rope_theta`` and its
+    full-width NeoX RoPE in the ordinary keys. Both are read here rather than
+    once in the runner and again in the pre-flight: the synthetic layer the
+    pre-flight probes has to be the layer the run will build, and a second
+    reader is a second thing that can drift.
+
+    ``weights_on_disk=False`` is a random-weights run: ``config.json`` is all
+    there is, so the GLM-4 reader (which the fused tensor names go with) is not
+    used and :func:`checkpoint_features` has nothing to read.
+    """
+    config = glm4.read_config(model_path)
+    if weights_on_disk and glm4.is_glm4_config(config):
+        # Read off config.json directly: the chatglm config class is remote code,
+        # and nothing it computes is needed that the JSON does not say.
+        return glm4.glm4_model_shape(config, attn_output_gate)
+
+    from transformers import AutoConfig
+
+    hf_config = AutoConfig.from_pretrained(str(model_path), trust_remote_code=True)
+    detected = checkpoint_features(model_path) if weights_on_disk else {}
+    return ModelShape.from_hf_config(hf_config, attn_output_gate, **detected)
 
 
 def _map_checkpoint_name(name: str) -> str | None:

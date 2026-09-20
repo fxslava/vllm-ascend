@@ -82,6 +82,7 @@ from tq_longbench.smoke_glm import (  # noqa: E402
     encode,
     eos_ids_for,
     load_tokenizer,
+    model_directory,
     plan_attention,
     prompt_route,
     quiet_tensorflow,
@@ -93,8 +94,15 @@ from tq_longbench.smoke_glm import (  # noqa: E402
 quiet_tensorflow()
 
 from tq_longbench._ascend import assert_no_vllm_imported  # noqa: E402
-from tq_longbench.engine import DEFAULT_CHUNK_SIZE, PREFILL_MODES, RunnerConfig, StandaloneModelRunner  # noqa: E402
-from tq_longbench.glm4 import glm4_prefill_mode, is_glm4_config, read_config  # noqa: E402
+from tq_longbench.engine import (  # noqa: E402
+    DEFAULT_CHUNK_SIZE,
+    PREFILL_MODES,
+    RunnerConfig,
+    StandaloneModelRunner,
+    read_checkpoint_shape,
+)
+from tq_longbench.families import ModelFamily, family_for  # noqa: E402
+from tq_longbench.glm4 import read_config  # noqa: E402
 from tq_longbench.layers import FOLD_SITES  # noqa: E402
 from tq_longbench.ops import DENSE_BACKENDS, backend_names  # noqa: E402
 from tq_longbench.tasks import needle_in_a_haystack, needle_report  # noqa: E402
@@ -122,7 +130,12 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python tools/tq_longbench/run_benchmark.py",
         description="Needle-in-a-haystack retrieval, TTFT, decode percentiles and HBM across a context ladder.",
     )
-    parser.add_argument("--model-path", required=True, help="directory holding config.json and safetensors shards")
+    parser.add_argument(
+        "--model-path",
+        required=True,
+        type=model_directory,
+        help="directory holding config.json and safetensors shards; a Windows path in either slash is fine",
+    )
     parser.add_argument("--device", default="npu", help="npu, npu:N, cuda:N or cpu (default: npu)")
     parser.add_argument(
         "--backends",
@@ -201,20 +214,18 @@ def parse_backends(text: str) -> tuple[str, ...]:
     return names
 
 
-def prefill_mode_for(args: argparse.Namespace, backend: str, context: int, glm4: bool) -> str:
-    """What this rung prefills through: the flag if given, else the checkpoint's policy.
+def prefill_mode_for(args: argparse.Namespace, backend: str, context: int, family: ModelFamily) -> str:
+    """What this rung prefills through: the flag if given, else the family's policy.
 
     Per rung rather than once, because the policy is a function of the length --
     GLM-4 stages a 16k prefill through the unquantised pool and refuses to at 64k,
-    where that pool is what would exhaust HBM.
+    where that pool is what would exhaust HBM. A family nothing has sized stages
+    at no length at all (``batched_decode_min_tokens`` 0), which is the same
+    conservative answer this gave before any family was named.
     """
     if args.prefill_mode:
         return args.prefill_mode
-    if glm4:
-        return glm4_prefill_mode(context, backend)
-    if backend in DENSE_BACKENDS:
-        return "dense_staging"
-    return "batched_decode"
+    return family.prefill_mode(context, backend)
 
 
 def plan_namespace(args: argparse.Namespace, backend: str) -> argparse.Namespace:
@@ -319,13 +330,13 @@ def run_rung(
     depths: tuple[float, ...],
     keep: int,
     sink,
-    glm4: bool,
+    family: ModelFamily,
 ) -> Rung:
     """One needle per depth at this context, each written out as it finishes."""
     rung = Rung(backend, context, prefill_mode)
     for depth in depths:
         item = needle_in_a_haystack(context, depth=depth, seed=int(depth * 100) + args.seed)
-        prompt_ids = truncate_middle(encode(tokenizer, item.prompt, not args.raw_prompt, glm4=glm4), keep)
+        prompt_ids = truncate_middle(encode(tokenizer, item.prompt, not args.raw_prompt, family), keep)
         started = time.perf_counter()
         produced, metrics = runner.generate(
             prompt_ids.to(runner.device), max_new_tokens=args.max_new_tokens, stop_ids=eos_ids
@@ -394,12 +405,12 @@ def main(argv: list[str] | None = None) -> int:
     contexts = parse_int_list(args.contexts, "contexts")
     depths = parse_depths(args.depths)
     config = read_config(args.model_path)
-    glm4 = is_glm4_config(config)
+    family = family_for(config)
 
-    tokenizer = load_tokenizer(args.model_path) if glm4 else _auto_tokenizer(args.model_path)
-    eos_ids = eos_ids_for(config, tokenizer)
+    tokenizer = load_tokenizer(args.model_path, family)
+    eos_ids = eos_ids_for(config, tokenizer, family)
     longest = max(contexts)
-    print(f"prompt: {prompt_route(tokenizer, not args.raw_prompt, glm4)}", file=sys.stderr)
+    print(f"prompt: {prompt_route(tokenizer, not args.raw_prompt, family)}", file=sys.stderr)
     print(
         f"stop ids: {sorted(eos_ids) if eos_ids else 'NONE -- every continuation will run its whole budget'}",
         file=sys.stderr,
@@ -412,15 +423,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\n=== {backend} ===", file=sys.stderr)
             # The plan is per backend, and is settled at the longest rung: a
             # prefill path refused there is refused everywhere below it too.
-            plan = plan_for_backend(args, backend, contexts, glm4)
+            plan = plan_for_backend(args, backend, contexts, family)
             if plan.results or plan.notes:
                 print(plan.report(), file=sys.stderr)
             runner = None
-            shared_mode = rung_prefill_mode(args, plan, backend, longest, glm4)
+            shared_mode = rung_prefill_mode(args, plan, backend, longest, family)
             if args.reuse_runner:
                 runner = build_runner(args, backend, shared_mode, cache_tokens(args, longest), plan)
             for context in contexts:
-                mode = shared_mode if args.reuse_runner else rung_prefill_mode(args, plan, backend, context, glm4)
+                mode = shared_mode if args.reuse_runner else rung_prefill_mode(args, plan, backend, context, family)
                 max_seq_len = cache_tokens(args, longest if args.reuse_runner else context)
                 print(f"  context {context} ({mode}, cache {max_seq_len})", file=sys.stderr)
                 if not args.reuse_runner:
@@ -429,7 +440,7 @@ def main(argv: list[str] | None = None) -> int:
                     runner = build_runner(args, backend, mode, max_seq_len, plan)
                 keep = max_seq_len - CONTEXT_HEADROOM_TOKENS - args.max_new_tokens
                 rungs.append(
-                    run_rung(args, runner, tokenizer, eos_ids, backend, context, mode, depths, keep, sink, glm4)
+                    run_rung(args, runner, tokenizer, eos_ids, backend, context, mode, depths, keep, sink, family)
                 )
             runner = None
             free_device(args.device)
@@ -447,40 +458,37 @@ def cache_tokens(args: argparse.Namespace, context: int) -> int:
     return context + args.max_new_tokens + CONTEXT_HEADROOM_TOKENS
 
 
-def plan_for_backend(args: argparse.Namespace, backend: str, contexts: tuple[int, ...], glm4: bool) -> AttentionPlan:
+def plan_for_backend(
+    args: argparse.Namespace, backend: str, contexts: tuple[int, ...], family: ModelFamily
+) -> AttentionPlan:
     """Pre-flight this backend once, covering every prefill path the ladder will take.
 
     Probed as ``dense_staging`` when *any* rung would stage, not when the longest
     one would: GLM-4 stages at 16k and refuses to at 64k, and a plan settled at 64k
     alone would never learn whether the unquantised pool runs here at all.
     """
-    modes = {prefill_mode_for(args, backend, context, glm4) for context in contexts}
+    modes = {prefill_mode_for(args, backend, context, family) for context in contexts}
     mode = "dense_staging" if "dense_staging" in modes else "batched_decode"
     if args.skip_preflight:
         return AttentionPlan(mode)
     try:
-        return plan_attention(plan_namespace(args, backend), read_config(args.model_path), mode)
+        return plan_attention(plan_namespace(args, backend), read_checkpoint_shape(args.model_path), mode)
     except PreflightFailed as failure:
         raise SystemExit(f"{backend}: {failure}") from failure
 
 
-def rung_prefill_mode(args: argparse.Namespace, plan: AttentionPlan, backend: str, context: int, glm4: bool) -> str:
+def rung_prefill_mode(
+    args: argparse.Namespace, plan: AttentionPlan, backend: str, context: int, family: ModelFamily
+) -> str:
     """This rung's own policy, unless the pre-flight found no unquantised pool runs here.
 
     The pre-flight's fallback is the run's, not one rung's: a staging pool that
     could not be built on the synthetic layer cannot be built at 4k either.
     """
-    mode = prefill_mode_for(args, backend, context, glm4)
+    mode = prefill_mode_for(args, backend, context, family)
     if mode == "dense_staging" and backend not in DENSE_BACKENDS and plan.prefill_mode == "batched_decode":
         return "batched_decode"
     return mode
-
-
-def _auto_tokenizer(model_path: str):
-    """Any non-GLM-4 checkpoint's tokenizer; GLM-4's needs :func:`load_tokenizer`'s repairs."""
-    from transformers import AutoTokenizer
-
-    return AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
 
 if __name__ == "__main__":

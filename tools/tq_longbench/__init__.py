@@ -31,6 +31,7 @@ __all__ = [
     "cpu_reference",
     "diagnose",
     "engine",
+    "families",
     "glm4",
     "hf_bridge",
     "kv_cache",

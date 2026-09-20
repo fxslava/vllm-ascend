@@ -66,11 +66,28 @@ if str(REPO_ROOT / "tools") not in sys.path:
 
 from tq_longbench import _ascend, build_turboquant_ops  # noqa: E402
 from tq_longbench import engine as engine_module  # noqa: E402
+from tq_longbench import layers as layers_module  # noqa: E402
 from tq_longbench import ops as ops_module  # noqa: E402
 from tq_longbench import preflight as preflight_module  # noqa: E402
 from tq_longbench._ascend import assert_no_vllm_imported, turboquant_layout, turboquant_rotation  # noqa: E402
 from tq_longbench.cpu_reference import cpu_turboquant_ops  # noqa: E402
-from tq_longbench.engine import RunMetrics, RunnerConfig, StandaloneModelRunner  # noqa: E402
+from tq_longbench.engine import (  # noqa: E402
+    GraphCaptureUnavailable,
+    RunMetrics,
+    RunnerConfig,
+    StandaloneModelRunner,
+    graph_windows,
+    read_checkpoint_shape,
+)
+from tq_longbench.families import (  # noqa: E402
+    BODY,
+    GENERIC,
+    GLM4,
+    QWEN2,
+    ModelFamily,
+    family_for,
+    special_token_id,
+)
 from tq_longbench.glm4 import (  # noqa: E402
     GLM4_BATCHED_DECODE_MIN_TOKENS,
     glm4_checkpoint_targets,
@@ -80,7 +97,10 @@ from tq_longbench.glm4 import (  # noqa: E402
 )
 from tq_longbench.kv_cache import CacheGeometry, DenseKVCache, TurboQuantKVCache, dense_equivalent_bytes  # noqa: E402
 from tq_longbench.layers import (  # noqa: E402
+    CausalLM,
+    DecodeWorkspace,
     ModelShape,
+    RMSNorm,
     RotaryEmbedding,
     fold_on_device,
     fold_output_projection_in_place,
@@ -115,9 +135,8 @@ from tq_longbench.reference import DenseReferenceBackend, TurboQuantReferenceBac
 from tq_longbench.smoke_glm import (  # noqa: E402
     encode,
     eos_ids_for,
-    glm4_stop_ids,
+    model_directory,
     prompt_route,
-    special_token_id,
     stop_at_eos,
 )
 from tq_longbench.tasks import (  # noqa: E402
@@ -478,14 +497,17 @@ class TestFullStack(_TurboQuantCase):
             for layer in model.layers:
                 normed = layer.input_layernorm(hidden)
                 attn = layer.self_attn
-                query = attn.q_proj(normed)
+                # The projections are fused in the module tree; here they are
+                # taken apart again, so this stays a transcription of the model
+                # rather than a second call into the thing under test.
+                query, key, value = attn.qkv_proj(normed).split(attn.qkv_split, dim=-1)
                 gate = None
                 if shape.attn_output_gate:
                     query, gate = query.chunk(2, dim=-1)
-                    gate = gate.view(count, shape.num_heads, shape.head_size)
-                query = attn.q_norm(query.view(count, shape.num_heads, shape.head_size))
-                key = attn.k_norm(attn.k_proj(normed).view(count, shape.num_kv_heads, shape.head_size))
-                value = attn.v_proj(normed).view(count, shape.num_kv_heads, shape.head_size)
+                    gate = gate.reshape(count, shape.num_heads, shape.head_size)
+                query = attn.q_norm(query.reshape(count, shape.num_heads, shape.head_size))
+                key = attn.k_norm(key.reshape(count, shape.num_kv_heads, shape.head_size))
+                value = value.reshape(count, shape.num_kv_heads, shape.head_size)
                 query = model.rope.apply(query, positions)
                 key = model.rope.apply(key, positions)
                 attended = (
@@ -1435,6 +1457,920 @@ class TestGlm4Checkpoint(_Glm4TinyCheckpoint):
         self.assertEqual((prompt.shape, prompt.dtype, int(prompt.sum())), ((64,), torch.long, 64))
 
 
+# Qwen2.5-3B-Instruct's published config.json, verbatim. The one checkpoint
+# these cases are about that is too large to write down.
+QWEN2_5_3B_INSTRUCT_CONFIG = {
+    "architectures": ["Qwen2ForCausalLM"],
+    "attention_dropout": 0.0,
+    "bos_token_id": 151643,
+    "eos_token_id": 151645,
+    "hidden_act": "silu",
+    "hidden_size": 2048,
+    "initializer_range": 0.02,
+    "intermediate_size": 11008,
+    "max_position_embeddings": 32768,
+    "max_window_layers": 70,
+    "model_type": "qwen2",
+    "num_attention_heads": 16,
+    "num_hidden_layers": 36,
+    "num_key_value_heads": 2,
+    "rms_norm_eps": 1e-06,
+    "rope_theta": 1000000.0,
+    "sliding_window": 32768,
+    "tie_word_embeddings": True,
+    "torch_dtype": "bfloat16",
+    "use_cache": True,
+    "use_sliding_window": False,
+    "vocab_size": 151936,
+}
+
+# A two-layer Qwen2 small enough to run eagerly, at the 3B's 8:1 GQA ratio.
+# D=64 because Pi needs a power of two; the vocabulary is tiny and untied, so
+# that a wrong lm_head cannot hide behind the embedding.
+TINY_QWEN2 = {
+    **QWEN2_5_3B_INSTRUCT_CONFIG,
+    "hidden_size": 256,
+    "intermediate_size": 192,
+    "num_attention_heads": 4,
+    "num_hidden_layers": 2,
+    "num_key_value_heads": 2,
+    "rope_theta": 5.0e6,
+    "tie_word_embeddings": False,
+    "vocab_size": 320,
+}
+
+
+def _qwen2_rope(x: torch.Tensor, positions: torch.Tensor, head_size: int, theta: float) -> torch.Tensor:
+    """HF ``modeling_qwen2``'s rotary, transcribed: NeoX halves over the whole head.
+
+    The contrast with :func:`_chatglm_rope` is the whole of what ``model_type``
+    decides about position here -- the same frequencies, paired ``(i, i + d/2)``
+    instead of ``(2i, 2i+1)``, and applied to all of the head rather than its
+    first half. Pairing them the other way does not raise; it scrambles position.
+    """
+    inv_freq = 1.0 / (theta ** (torch.arange(0, head_size, 2, dtype=torch.float32) / head_size))
+    freqs = torch.outer(positions.to(torch.float32), inv_freq)
+    emb = torch.cat((freqs, freqs), dim=-1)
+    cos, sin = emb.cos().unsqueeze(1), emb.sin().unsqueeze(1)
+    half = head_size // 2
+    rotated = torch.cat((-x[..., half:], x[..., :half]), dim=-1)
+    return x * cos + rotated * sin
+
+
+def _qwen2_checkpoint(config: dict, seed: int = 0) -> dict[str, torch.Tensor]:
+    """Random weights under Qwen2's tensor names: split q/k/v, with the biases only it carries."""
+    generator = torch.Generator().manual_seed(seed)
+    hidden, heads = config["hidden_size"], config["num_attention_heads"]
+    groups, ffn, vocab = config["num_key_value_heads"], config["intermediate_size"], config["vocab_size"]
+    head_size = hidden // heads
+
+    def rand(*shape, scale=0.05):
+        return torch.randn(*shape, generator=generator) * scale
+
+    tensors = {
+        "model.embed_tokens.weight": rand(vocab, hidden, scale=1.0),
+        "model.norm.weight": 1.0 + rand(hidden),
+        "lm_head.weight": rand(vocab, hidden),
+    }
+    for index in range(config["num_hidden_layers"]):
+        prefix = f"model.layers.{index}."
+        tensors.update(
+            {
+                prefix + "input_layernorm.weight": 1.0 + rand(hidden),
+                prefix + "post_attention_layernorm.weight": 1.0 + rand(hidden),
+                prefix + "self_attn.q_proj.weight": rand(heads * head_size, hidden),
+                prefix + "self_attn.q_proj.bias": rand(heads * head_size, scale=0.5),
+                prefix + "self_attn.k_proj.weight": rand(groups * head_size, hidden),
+                prefix + "self_attn.k_proj.bias": rand(groups * head_size, scale=0.5),
+                prefix + "self_attn.v_proj.weight": rand(groups * head_size, hidden),
+                prefix + "self_attn.v_proj.bias": rand(groups * head_size, scale=0.5),
+                prefix + "self_attn.o_proj.weight": rand(hidden, heads * head_size),
+                prefix + "mlp.gate_proj.weight": rand(ffn, hidden),
+                prefix + "mlp.up_proj.weight": rand(ffn, hidden),
+                prefix + "mlp.down_proj.weight": rand(hidden, ffn),
+            }
+        )
+    return tensors
+
+
+def _qwen2_eager_logits(config: dict, tensors: dict[str, torch.Tensor], token_ids: torch.Tensor) -> torch.Tensor:
+    """Qwen2's forward pass in float32, written from modeling_qwen2.py rather than from layers.py."""
+    heads, groups = config["num_attention_heads"], config["num_key_value_heads"]
+    head_size = config["hidden_size"] // heads
+    eps, theta = config["rms_norm_eps"], config["rope_theta"]
+    count = token_ids.numel()
+    positions = torch.arange(count)
+
+    def rms(x, weight):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight
+
+    hidden = tensors["model.embed_tokens.weight"][token_ids]
+    for index in range(config["num_hidden_layers"]):
+        prefix = f"model.layers.{index}."
+
+        def project(name, width, x, prefix=prefix):
+            out = x @ tensors[prefix + f"self_attn.{name}.weight"].T + tensors[prefix + f"self_attn.{name}.bias"]
+            return out.view(count, width, head_size)
+
+        normed = rms(hidden, tensors[prefix + "input_layernorm.weight"])
+        query = _qwen2_rope(project("q_proj", heads, normed), positions, head_size, theta)
+        key = _qwen2_rope(project("k_proj", groups, normed), positions, head_size, theta)
+        value = project("v_proj", groups, normed)
+        attended = torch.nn.functional.scaled_dot_product_attention(
+            query.transpose(0, 1),
+            key.transpose(0, 1).repeat_interleave(heads // groups, dim=0),
+            value.transpose(0, 1).repeat_interleave(heads // groups, dim=0),
+            is_causal=True,
+        ).transpose(0, 1)
+        hidden = hidden + attended.reshape(count, -1) @ tensors[prefix + "self_attn.o_proj.weight"].T
+        normed = rms(hidden, tensors[prefix + "post_attention_layernorm.weight"])
+        gate = normed @ tensors[prefix + "mlp.gate_proj.weight"].T
+        up = normed @ tensors[prefix + "mlp.up_proj.weight"].T
+        hidden = hidden + (torch.nn.functional.silu(gate) * up) @ tensors[prefix + "mlp.down_proj.weight"].T
+    return rms(hidden, tensors["model.norm.weight"]) @ tensors["lm_head.weight"].T
+
+
+class TestModelFamilies(unittest.TestCase):
+    """Which family a ``config.json`` is, and what each one lends a run.
+
+    The dispatch is the whole of what ``model_type`` decides outside the shape,
+    and every branch of it has a way of failing silently: a GLM-4 stop set lent
+    to a Qwen checkpoint stops on ids that mean nothing there, a Qwen one lent to
+    GLM-4 never stops at all, and a family invented for an unknown checkpoint
+    would do either.
+    """
+
+    def test_each_model_type_finds_its_own_family(self):
+        self.assertIs(family_for({"model_type": "qwen2"}), QWEN2)
+        self.assertIs(family_for({"model_type": "chatglm"}), GLM4)
+        self.assertIs(family_for({"model_type": "glm"}), GLM4)
+        self.assertIs(family_for({"model_type": "qwen3"}), GENERIC)
+        self.assertIs(family_for({}), GENERIC)
+
+    def test_a_glm_the_harness_cannot_build_is_still_refused_by_name(self):
+        """GLM-4-0414's sandwich norms: matching it as a family would load two norms short."""
+        with self.assertRaisesRegex(ValueError, "post-attention and post-MLP norms"):
+            family_for({"model_type": "glm4"})
+
+    def test_the_two_families_lend_each_other_nothing(self):
+        self.assertFalse(set(GLM4.stop_tokens) & set(QWEN2.stop_tokens) - {"<|endoftext|>"})
+        # Both call it <|endoftext|>; they do not agree on what it is numbered.
+        self.assertNotEqual(GLM4.stop_tokens["<|endoftext|>"], QWEN2.stop_tokens["<|endoftext|>"])
+        self.assertEqual(GENERIC.stop_ids(None), set())
+
+    def test_an_unsized_family_never_holds_a_second_kv_pool(self):
+        """GENERIC stages at no length: what an fp16 pool would cost is what is not known."""
+        for context in (1024, 4096, 131072):
+            self.assertEqual(GENERIC.prefill_mode(context, "turboquant_cube"), "batched_decode")
+        # Except where the decode itself reads that pool, which is not a policy.
+        self.assertEqual(GENERIC.prefill_mode(1024, "cann_dense"), "dense_staging")
+
+    def test_a_sized_family_stages_below_its_threshold_and_not_above(self):
+        for family in (GLM4, QWEN2):
+            with self.subTest(family=family.name):
+                self.assertEqual(family.prefill_mode(16384, "turboquant_cube"), "dense_staging")
+                self.assertEqual(family.prefill_mode(32768, "turboquant_cube"), "batched_decode")
+
+    def test_a_turn_that_never_says_where_the_prompt_goes_is_refused(self):
+        """The one way to transcribe a template wrongly that would not raise at run time."""
+        with self.assertRaisesRegex(ValueError, "BODY exactly once"):
+            ModelFamily(name="x", model_types=frozenset(), template_tokens={"<a>": 1}, turn=("<a>",))
+        with self.assertRaisesRegex(ValueError, "BODY exactly once"):
+            ModelFamily(name="x", model_types=frozenset(), template_tokens={"<a>": 1}, turn=("<a>", BODY, BODY))
+        with self.assertRaisesRegex(ValueError, "not a turn"):
+            ModelFamily(name="x", model_types=frozenset(), turn=("hello ", BODY))
+
+    def test_a_marker_with_no_id_is_refused(self):
+        """It would go through the tokenizer as six characters of text and encode to something."""
+        with self.assertRaisesRegex(ValueError, r"\['<\|im_end\|>'\]"):
+            ModelFamily(
+                name="x",
+                model_types=frozenset(),
+                template_tokens={"<|im_start|>": 1},
+                turn=("<|im_start|>", BODY, "<|im_end|>"),
+            )
+
+
+class TestQwen2Config(unittest.TestCase):
+    """The published Qwen2.5-3B-Instruct config, as the harness reads it.
+
+    No family reads this one: ``qwen2`` goes through ``ModelShape.from_hf_config``
+    like any HF decoder, and the two fields the config does not state are read off
+    the checkpoint's tensor names. So what is pinned here is that the ordinary
+    path gets Qwen2.5 right -- the full-width NeoX RoPE in particular, which is
+    the default and would therefore never announce itself as a choice.
+    """
+
+    def _write_index(self, root: Path, config: dict, tensors) -> str:
+        """The config and a weight map, with no shard behind it.
+
+        ``checkpoint_features`` reads names, never tensors, so an index is the
+        whole of what a shape needs -- and writing one keeps the 3B's real tensor
+        names in the test instead of a 6 GB download.
+        """
+        path = root / "qwen2"
+        path.mkdir()
+        (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        weight_map = {name: "model-00001-of-00001.safetensors" for name in tensors}
+        (path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}), encoding="utf-8")
+        return str(path)
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        names = [
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            *(
+                f"model.layers.{index}.self_attn.{part}"
+                for index in range(QWEN2_5_3B_INSTRUCT_CONFIG["num_hidden_layers"])
+                for part in ("q_proj.weight", "q_proj.bias", "k_proj.bias", "v_proj.bias", "o_proj.weight")
+            ),
+        ]
+        self.path = self._write_index(Path(self._tmp.name), QWEN2_5_3B_INSTRUCT_CONFIG, names)
+
+    def test_the_published_config_reads_as_its_attention_contract(self):
+        shape = read_checkpoint_shape(self.path)
+        self.assertEqual((shape.num_heads, shape.num_kv_heads, shape.head_size), (16, 2, 128))
+        self.assertEqual((shape.num_layers, shape.hidden_size, shape.intermediate_size), (36, 2048, 11008))
+        self.assertEqual(shape.vocab_size, 151936)
+        self.assertEqual(shape.rope_theta, 1.0e6)
+        # The two that separate it from GLM-4: all of each head, NeoX halves.
+        self.assertIsNone(shape.rotary_dim)
+        self.assertFalse(shape.rope_interleaved)
+        self.assertFalse(shape.attn_output_gate)
+        self.assertTrue(shape.tie_word_embeddings)
+
+    def test_the_bias_and_the_norms_are_read_off_the_checkpoint_not_the_type(self):
+        """``attention_bias`` is absent from this config and the biases are there anyway."""
+        self.assertNotIn("attention_bias", QWEN2_5_3B_INSTRUCT_CONFIG)
+        shape = read_checkpoint_shape(self.path)
+        self.assertTrue(shape.qkv_bias)
+        # Qwen3 norms each head and Qwen2.5 does not; only the tensors say so.
+        self.assertFalse(shape.qk_norm)
+
+
+class _Qwen2TinyCheckpoint(unittest.TestCase):
+    """A tiny Qwen2 written to disk, and the runner that loads it."""
+
+    PROMPT_TOKENS = 40
+    NEW_TOKENS = 6
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.tensors = _qwen2_checkpoint(TINY_QWEN2)
+        self.token_ids = torch.randint(0, TINY_QWEN2["vocab_size"], (self.PROMPT_TOKENS,), dtype=torch.int64)
+        self.model_path = self._write("qwen2", TINY_QWEN2, self.tensors)
+
+    def _write(self, name: str, config: dict, tensors: dict[str, torch.Tensor]) -> str:
+        from safetensors.torch import save_file
+
+        path = self.root / name
+        path.mkdir()
+        (path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        save_file({key: value.contiguous() for key, value in tensors.items()}, str(path / "model.safetensors"))
+        return str(path)
+
+    def _runner(self, backend: str = "dense_reference", **overrides) -> StandaloneModelRunner:
+        settings = {
+            "backend": backend,
+            "prefill_mode": "dense_staging",
+            "max_seq_len": 256,
+            "chunk_size": 16,
+            "block_size": BLOCK_SIZE,
+            "dtype": torch.float32,
+            "device": "cpu",
+            "max_new_tokens": self.NEW_TOKENS,
+            **overrides,
+        }
+        return StandaloneModelRunner(RunnerConfig(model_path=self.model_path, **settings))
+
+
+class TestQwen2Checkpoint(_Qwen2TinyCheckpoint):
+    """The tiny checkpoint loaded and run exactly as Qwen2.5-3B-Instruct would be.
+
+    Eager PyTorch is the reference rather than another path through this harness:
+    what is under test is that ``model_type: qwen2`` builds the model the
+    checkpoint is, and a comparison against the harness's own reading of the
+    config could not tell a wrong RoPE from a consistently wrong one.
+    """
+
+    def test_the_qwen2_checkpoint_runs_as_qwen2_does(self):
+        runner = self._runner()
+        self.assertEqual((runner.shape.num_heads, runner.shape.num_kv_heads, runner.shape.head_size), (4, 2, 64))
+        self.assertTrue(runner.shape.qkv_bias)
+        logits = runner.prefill(self.token_ids, RunMetrics())
+        expected = _qwen2_eager_logits(TINY_QWEN2, self.tensors, self.token_ids)[-1:]
+        torch.testing.assert_close(logits, expected, rtol=1e-4, atol=1e-4)
+
+    def test_the_greedy_continuation_is_the_eager_one(self):
+        ids, expected = self.token_ids.clone(), []
+        for _ in range(self.NEW_TOKENS):
+            expected.append(int(torch.argmax(_qwen2_eager_logits(TINY_QWEN2, self.tensors, ids)[-1])))
+            ids = torch.cat((ids, torch.tensor([expected[-1]])))
+        produced, _ = self._runner().generate(self.token_ids)
+        self.assertEqual(produced, expected)
+
+    def test_a_tied_lm_head_is_loaded_from_the_embedding(self):
+        """Qwen2.5-3B ships no ``lm_head.weight``; an untied harness would run it at random."""
+        tied = dict(TINY_QWEN2, tie_word_embeddings=True)
+        tensors = {name: value for name, value in self.tensors.items() if name != "lm_head.weight"}
+        self.model_path = self._write("qwen2-tied", tied, tensors)
+        runner = self._runner()
+        self.assertTrue(
+            torch.equal(runner.model.lm_head.weight, runner.model.embed_tokens.weight),
+        )
+
+    def test_o_proj_is_folded_as_it_is_ingested(self):
+        """The folded-o_proj contract is the family's, not GLM-4's: ungated is ungated."""
+        folded = self._runner(backend="turboquant_reference", fold_output_rotation=True)
+        fold = turboquant_rotation().fold_pi_into_output_projection
+        head_size = TINY_QWEN2["hidden_size"] // TINY_QWEN2["num_attention_heads"]
+        for index, layer in enumerate(folded.model.layers):
+            original = self.tensors[f"model.layers.{index}.self_attn.o_proj.weight"]
+            self.assertTrue(torch.equal(layer.self_attn.o_proj.weight, fold(original, head_size)))
+        unfolded = self._runner(backend="turboquant_reference")
+        self.assertEqual(folded.generate(self.token_ids)[0], unfolded.generate(self.token_ids)[0])
+
+    def test_the_smoke_runner_takes_a_qwen2_checkpoint_end_to_end(self):
+        """``smoke_glm.main`` on a ``qwen2`` checkpoint: family, shape, pre-flight, contract, generation.
+
+        ``--dummy-prompt`` because the tiny checkpoint has no tokenizer; what the
+        stages report is what is being checked, and the first line of stage 1 is
+        the one that used to read "not a GLM-4 checkpoint" and exit.
+        """
+        from tq_longbench import smoke_glm
+
+        argv = ["--model-path", self.model_path, "--device", "cpu", "--backend", "dense_reference"]
+        argv += ["--dtype", "float32", "--dummy-prompt", "--max-new-tokens", "4", "--tokens", "0"]
+        refuse = mock.patch.object(smoke_glm, "load_tokenizer", side_effect=AssertionError("tokenizer loaded"))
+        with refuse, contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(smoke_glm.main(argv), 0)
+        printed = out.getvalue()
+        self.assertIn("Qwen2.5 ('qwen2')", printed)
+        self.assertIn("4 heads / 2 kv", printed)
+        self.assertIn("interleaved=False", printed)
+        self.assertIn("rotary_dim None of 64", printed)
+
+
+class TestQwen2ChatPrompt(unittest.TestCase):
+    """ChatML, for a ``transformers`` that cannot apply the template itself."""
+
+    class Tokenizer:
+        """Characters as ids, with ChatML's markers declared where this vocabulary has room."""
+
+        SPECIAL = {"<|im_start|>": 300, "<|im_end|>": 301, "<|endoftext|>": 302}
+
+        chat_template = None
+        eos_token_id = None
+        unk_token_id = 0
+
+        def __init__(self):
+            self.added_tokens_encoder = dict(self.SPECIAL)
+
+        def __call__(self, text, return_tensors=None, add_special_tokens=True):
+            ids = [ord(character) % 256 for character in text]
+            return types.SimpleNamespace(input_ids=torch.tensor([ids], dtype=torch.int64))
+
+        def convert_tokens_to_ids(self, token):
+            return self.added_tokens_encoder.get(token, self.unk_token_id)
+
+    def test_the_prompt_is_the_documented_format(self):
+        """``<|im_start|>user\\n{prompt}<|im_end|>\\n<|im_start|>assistant\\n``, assembled by id."""
+        tokenizer = self.Tokenizer()
+        ids = encode(tokenizer, "HI", use_chat_template=True, family=QWEN2).tolist()
+        start, end = tokenizer.SPECIAL["<|im_start|>"], tokenizer.SPECIAL["<|im_end|>"]
+        text = lambda s: [ord(character) for character in s]  # noqa: E731
+        self.assertEqual(ids, [start, *text("user\nHI"), end, *text("\n"), start, *text("assistant\n")])
+
+    def test_the_markers_resolve_through_the_tokenizer_before_the_constants(self):
+        """A vocabulary of 320 cannot hold 151644, and nothing here assumes it can."""
+        ids = encode(self.Tokenizer(), "HI", use_chat_template=True, family=QWEN2).tolist()
+        self.assertNotIn(151644, ids)
+        self.assertEqual(ids[0], self.Tokenizer.SPECIAL["<|im_start|>"])
+
+    def test_the_body_is_tokenised_with_the_text_around_it(self):
+        """``user\\n`` and the prompt are one encode: a BPE tokenizer merges across the join."""
+        calls = []
+
+        class Counting(self.Tokenizer):
+            def __call__(self, text, return_tensors=None, add_special_tokens=True):
+                calls.append(text)
+                return super().__call__(text, return_tensors, add_special_tokens)
+
+        encode(Counting(), "HI", use_chat_template=True, family=QWEN2)
+        self.assertEqual(calls, ["user\nHI", "\n", "assistant\n"])
+
+    def test_the_tokenizers_own_template_wins_where_it_exists(self):
+        class Modern(self.Tokenizer):
+            chat_template = "{{ 'x' }}"
+
+            def apply_chat_template(self, messages, **kwargs):
+                return {"input_ids": torch.tensor([[7, 7, 7]], dtype=torch.int64)}
+
+        self.assertEqual(encode(Modern(), "HI", use_chat_template=True, family=QWEN2).tolist(), [7, 7, 7])
+
+    def test_the_route_is_named_rather_than_inferred(self):
+        plain = self.Tokenizer()
+        self.assertIn("Qwen2.5 turn markers", prompt_route(plain, use_chat_template=True, family=QWEN2))
+        self.assertIn("raw", prompt_route(plain, use_chat_template=False, family=QWEN2))
+
+    def test_the_stop_set_carries_both_ends_of_a_turn(self):
+        """``config.json`` names one of the two; a run that took it at its word would over-run."""
+        config = dict(QWEN2_5_3B_INSTRUCT_CONFIG)
+        self.assertEqual(config["eos_token_id"], 151645)
+        tokenizer = self.Tokenizer()
+        ids = eos_ids_for(config, tokenizer)
+        self.assertEqual(ids, {151645, tokenizer.SPECIAL["<|im_end|>"], tokenizer.SPECIAL["<|endoftext|>"]})
+
+
+class TestFusedProjections(unittest.TestCase):
+    """q/k/v in one tensor and gate/up in another, and the checkpoint names that write into them.
+
+    The fusion is worth two GEMMs a layer and, because it puts q's heads next to
+    k's, one RoPE call instead of two. What it must not be worth is a row in the
+    wrong place: a q/k/v boundary off by a head loads without complaint and
+    generates fluent nonsense, which is the failure this class exists to make
+    impossible.
+    """
+
+    SHAPE = ModelShape(
+        num_layers=2,
+        num_heads=4,
+        num_kv_heads=2,
+        head_size=64,
+        hidden_size=256,
+        intermediate_size=192,
+        vocab_size=320,
+        rms_norm_eps=1e-6,
+        rope_theta=1.0e6,
+        tie_word_embeddings=False,
+        attn_output_gate=False,
+        qk_norm=False,
+        qkv_bias=True,
+    )
+
+    def _model(self, shape: ModelShape | None = None) -> CausalLM:
+        return CausalLM(shape or self.SHAPE, max_seq_len=128, dtype=torch.float32, device=CPU)
+
+    def test_the_fused_tensor_is_exactly_as_tall_as_its_three_parts(self):
+        attention = self._model().layers[0].self_attn
+        shape = self.SHAPE
+        query_rows = shape.num_heads * shape.head_size
+        kv_rows = shape.num_kv_heads * shape.head_size
+        self.assertEqual(attention.qkv_split, (query_rows, kv_rows, kv_rows))
+        self.assertEqual(attention.qkv_proj.weight.shape, (query_rows + 2 * kv_rows, shape.hidden_size))
+        self.assertEqual(attention.qkv_proj.bias.shape, (query_rows + 2 * kv_rows,))
+
+    def test_a_checkpoints_separate_names_write_into_the_fused_rows(self):
+        """``q_proj.weight`` is a view of the fused tensor, so loading one writes the other."""
+        model = self._model()
+        destinations = model.load_destinations()
+        attention = model.layers[0].self_attn
+        query_rows, kv_rows, _ = attention.qkv_split
+
+        marks = {"q_proj": 1.0, "k_proj": 2.0, "v_proj": 3.0}
+        with torch.no_grad():
+            for name, value in marks.items():
+                destinations[f"layers.0.self_attn.{name}.weight"].fill_(value)
+        fused = attention.qkv_proj.weight
+        self.assertTrue(torch.all(fused[:query_rows] == 1.0))
+        self.assertTrue(torch.all(fused[query_rows : query_rows + kv_rows] == 2.0))
+        self.assertTrue(torch.all(fused[query_rows + kv_rows :] == 3.0))
+
+    def test_gate_comes_before_up_which_is_the_order_the_checkpoints_fuse_them_in(self):
+        model = self._model()
+        destinations = model.load_destinations()
+        with torch.no_grad():
+            destinations["layers.0.mlp.gate_proj.weight"].fill_(1.0)
+            destinations["layers.0.mlp.up_proj.weight"].fill_(2.0)
+        fused = model.layers[0].mlp.gate_up_proj.weight
+        half = self.SHAPE.intermediate_size
+        self.assertTrue(torch.all(fused[:half] == 1.0))
+        self.assertTrue(torch.all(fused[half:] == 2.0))
+
+    def test_every_parameter_has_a_name_a_checkpoint_could_fill(self):
+        """The loader refuses an unfilled parameter, so the table must reach all of them.
+
+        Counted rather than listed: a fused tensor is one parameter under two or
+        three names, so the table is *longer* than the parameter list and the
+        check that matters is that no parameter's storage is left out of it.
+        """
+        model = self._model()
+        destinations = model.load_destinations()
+        reachable = {tensor.data_ptr() for tensor in destinations.values()}
+        for name, parameter in model.named_parameters():
+            with self.subTest(parameter=name):
+                self.assertIn(parameter.data_ptr(), reachable)
+        self.assertNotIn("layers.0.self_attn.qkv_proj.weight", destinations)
+        self.assertIn("layers.0.self_attn.q_proj.weight", destinations)
+
+    def test_the_fused_projection_computes_what_three_would_have(self):
+        model = self._model()
+        attention = model.layers[0].self_attn
+        torch.manual_seed(0)
+        with torch.no_grad():
+            attention.qkv_proj.weight.normal_()
+            attention.qkv_proj.bias.normal_()
+        hidden = torch.randn(3, self.SHAPE.hidden_size)
+        weights = attention.qkv_proj.weight.split(attention.qkv_split, dim=0)
+        biases = attention.qkv_proj.bias.split(attention.qkv_split, dim=0)
+        separate = [torch.nn.functional.linear(hidden, w, b) for w, b in zip(weights, biases)]
+        fused = attention.qkv_proj(hidden).split(attention.qkv_split, dim=-1)
+        for name, mine, theirs in zip(("q", "k", "v"), fused, separate):
+            with self.subTest(projection=name):
+                torch.testing.assert_close(mine, theirs, rtol=0, atol=0)
+
+    def test_q_and_k_are_adjacent_so_one_rotation_serves_both(self):
+        """The combined RoPE is only sound because the fusion put them side by side."""
+        attention = self._model().layers[0].self_attn
+        shape = self.SHAPE
+        self.assertTrue(attention._rotates_together)
+        self.assertEqual(attention._rotary_columns, (shape.num_heads + shape.num_kv_heads) * shape.head_size)
+
+    def test_a_gate_between_q_and_k_is_rotated_separately(self):
+        """``[q | gate | k | v]``: rotating across the gate would rotate the gate."""
+        gated = ModelShape(**{**self.SHAPE.__dict__, "attn_output_gate": True})
+        self.assertFalse(self._model(gated).layers[0].self_attn._rotates_together)
+
+    def test_normed_heads_are_rotated_separately(self):
+        """q_norm/k_norm copy each out of the buffer, so there is no shared view left."""
+        normed = ModelShape(**{**self.SHAPE.__dict__, "qk_norm": True})
+        self.assertFalse(self._model(normed).layers[0].self_attn._rotates_together)
+
+
+class TestRotaryInPlace(unittest.TestCase):
+    """``apply_`` writes the rotation back over the projection buffer it read."""
+
+    def _rope(self, **kwargs) -> RotaryEmbedding:
+        return RotaryEmbedding(64, 128, 1.0e6, torch.float32, CPU, **kwargs)
+
+    def test_it_is_apply_written_back(self):
+        for interleaved in (False, True):
+            for rotary_dim in (None, 32):
+                with self.subTest(interleaved=interleaved, rotary_dim=rotary_dim):
+                    rope = self._rope(interleaved=interleaved, rotary_dim=rotary_dim)
+                    x = torch.randn(3, 4, 64)
+                    positions = torch.arange(3)
+                    expected = rope.apply(x, positions)
+                    written = rope.apply_(x.clone(), positions)
+                    torch.testing.assert_close(written, expected, rtol=1e-6, atol=1e-6)
+
+    def test_it_returns_the_tensor_it_was_given(self):
+        rope = self._rope()
+        x = torch.randn(2, 4, 64)
+        self.assertIs(rope.apply_(x, torch.arange(2)), x)
+
+    def test_the_pass_through_channels_are_left_alone(self):
+        """A partial rotary rewrites the leading channels and nothing after them."""
+        rope = self._rope(rotary_dim=32)
+        x = torch.randn(2, 4, 64)
+        tail = x[..., 32:].clone()
+        rope.apply_(x, torch.arange(2))
+        self.assertTrue(torch.equal(x[..., 32:], tail))
+
+    def test_rotating_q_and_k_together_is_rotating_each(self):
+        """What the decode does once instead of twice, held to the two calls it replaces."""
+        rope = self._rope()
+        heads, kv_heads, head_size = 4, 2, 64
+        fused = torch.randn(1, (heads + kv_heads) * head_size)
+        positions = torch.arange(1)
+        query = fused[:, : heads * head_size].view(1, heads, head_size).clone()
+        key = fused[:, heads * head_size :].view(1, kv_heads, head_size).clone()
+        expected = (rope.apply(query, positions), rope.apply(key, positions))
+
+        rope.apply_(fused.view(1, heads + kv_heads, head_size), positions)
+        torch.testing.assert_close(fused[:, : heads * head_size].view(1, heads, head_size), expected[0])
+        torch.testing.assert_close(fused[:, heads * head_size :].view(1, kv_heads, head_size), expected[1])
+
+
+class TestFusedRMSNorm(unittest.TestCase):
+    """The library kernel, against the expression it replaced."""
+
+    def test_the_two_agree_exactly_on_the_row_a_decode_norms(self):
+        """One token is the decode's whole batch, and there the two are bit for bit."""
+        if not layers_module._HAS_FUSED_RMS_NORM:
+            self.skipTest("this torch has no torch.nn.functional.rms_norm")
+        torch.manual_seed(0)
+        norm = RMSNorm(256, 1e-6, torch.float32, CPU)
+        with torch.no_grad():
+            norm.weight.normal_(mean=1.0, std=0.1)
+        x = torch.randn(1, 256)
+        fused = norm(x)
+        layers_module._HAS_FUSED_RMS_NORM = False
+        try:
+            explicit = norm(x)
+        finally:
+            layers_module._HAS_FUSED_RMS_NORM = True
+        self.assertTrue(torch.equal(fused, explicit))
+
+    def test_the_accumulation_is_still_float32_under_a_float16_weight(self):
+        """The property the explicit expression existed to state, held to on the kernel."""
+        if not layers_module._HAS_FUSED_RMS_NORM:
+            self.skipTest("this torch has no torch.nn.functional.rms_norm")
+        norm = RMSNorm(4096, 1e-6, torch.float16, CPU)
+        # Values whose squares overflow float16 (max 65504) but not float32.
+        x = torch.full((1, 4096), 300.0, dtype=torch.float16)
+        out = norm(x)
+        self.assertTrue(torch.isfinite(out).all())
+        torch.testing.assert_close(out, torch.ones_like(out), rtol=1e-3, atol=1e-3)
+
+
+class TestDecodeWorkspace(unittest.TestCase):
+    """The buffers a decode step writes into, and the three integers that aim them."""
+
+    SHAPE = TestFusedProjections.SHAPE
+
+    def test_every_buffer_is_the_shape_one_token_needs(self):
+        shape = self.SHAPE
+        workspace = DecodeWorkspace.build(shape, torch.float32, CPU)
+        query_rows = shape.num_heads * shape.head_size
+        kv_rows = shape.num_kv_heads * shape.head_size
+        self.assertEqual(workspace.hidden.shape, (1, shape.hidden_size))
+        self.assertEqual(workspace.qkv.shape, (1, query_rows + 2 * kv_rows))
+        self.assertEqual(workspace.attention.shape, (1, shape.num_heads, shape.head_size))
+        self.assertEqual(workspace.gate_up.shape, (1, 2 * shape.intermediate_size))
+        self.assertEqual(workspace.logits.shape, (1, shape.vocab_size))
+        self.assertEqual(workspace.slots.dtype, torch.int32)
+        self.assertEqual(workspace.context_lens.dtype, torch.int32)
+        self.assertEqual(workspace.token_ids.dtype, torch.int64)
+
+    def test_a_gated_layer_gets_room_for_the_gate(self):
+        gated = ModelShape(**{**self.SHAPE.__dict__, "attn_output_gate": True})
+        workspace = DecodeWorkspace.build(gated, torch.float32, CPU)
+        rows = gated.num_heads * gated.head_size
+        self.assertEqual(workspace.qkv.shape, (1, 2 * rows + 2 * gated.num_kv_heads * gated.head_size))
+
+    def test_the_buffers_are_budgeted_like_the_pools_are(self):
+        """Small beside a KV cache, and on the record rather than left to the allocator."""
+        workspace = DecodeWorkspace.build(self.SHAPE, torch.float32, CPU)
+        counted = sum(
+            t.numel() * t.element_size()
+            for t in (workspace.hidden, workspace.qkv, workspace.attention, workspace.gate_up, workspace.logits)
+        )
+        self.assertEqual(workspace.bytes_allocated(), counted)
+
+    def test_seating_a_step_writes_the_buffers_rather_than_replacing_them(self):
+        """A captured graph reads these addresses, so nothing here may be rebound."""
+        workspace = DecodeWorkspace.build(self.SHAPE, torch.float32, CPU)
+        pointers = [t.data_ptr() for t in (workspace.token_ids, workspace.positions, workspace.slots)]
+        workspace.seat(token=17, position=9, context_len=10)
+        self.assertEqual(int(workspace.token_ids), 17)
+        self.assertEqual(int(workspace.positions), 9)
+        self.assertEqual(int(workspace.slots), 9)
+        self.assertEqual(int(workspace.context_lens), 10)
+        self.assertEqual([t.data_ptr() for t in (workspace.token_ids, workspace.positions, workspace.slots)], pointers)
+
+
+class TestDecodeWindow(unittest.TestCase):
+    """The fixed slot count that replaced reading the context length back to the host."""
+
+    def test_the_ladder_covers_the_cache_and_doubles(self):
+        self.assertEqual(graph_windows(800, 128), (128, 256, 512, 800))
+        self.assertEqual(graph_windows(4096, 128), (128, 256, 512, 1024, 2048, 4096))
+        # A cache no longer than one block is one window.
+        self.assertEqual(graph_windows(128, 128), (128,))
+
+    def test_every_window_is_at_least_as_long_as_the_context_it_serves(self):
+        windows = graph_windows(4096, 128)
+        for context in (1, 127, 128, 129, 1000, 4096):
+            with self.subTest(context=context):
+                chosen = next(w for w in windows if w >= context)
+                self.assertGreaterEqual(chosen, context)
+                self.assertLess(chosen, max(2 * context, windows[0] + 1))
+
+    def test_an_over_wide_window_changes_no_number(self):
+        """Slots past a row's own length are masked off, so rounding up only costs reads."""
+        geometry = CacheGeometry(num_layers=1, num_kv_heads=2, head_size=64, block_size=BLOCK_SIZE, max_seq_len=512)
+        shape = LayerShape(num_heads=4, num_kv_heads=2, head_size=64, scale=0.125)
+        backend = build_backend("cann_dense", geometry, shape, CPU, torch.float32)
+        torch.manual_seed(0)
+        context = 40
+        key = torch.randn(context, 2, 64)
+        value = torch.randn(context, 2, 64)
+        backend.write_kv(0, key, value, backend.cache.slot_mapping(0, context))
+        query = torch.randn(1, 4, 64)
+        lengths = torch.full((1,), context, dtype=torch.int32)
+
+        exact = torch.empty(1, 4, 64)
+        backend.decode(0, query, lengths, exact, window=context)
+        for window in (context + 1, 128, 512):
+            with self.subTest(window=window):
+                wide = torch.empty(1, 4, 64)
+                backend.decode(0, query, lengths, wide, window=window)
+                torch.testing.assert_close(wide, exact, rtol=0, atol=0)
+        # And the same as letting the backend ask the host for the length.
+        asked = torch.empty(1, 4, 64)
+        backend.decode(0, query, lengths, asked, window=None)
+        torch.testing.assert_close(asked, exact, rtol=0, atol=0)
+
+    def test_the_backends_say_whether_they_can_run_window_free(self):
+        """``native_v5`` takes its kv lengths as a Python list, so it never can."""
+        from tq_longbench.ops import CANNDenseBackend, NativeV5Backend, TurboQuantCubeBackend
+
+        self.assertFalse(NativeV5Backend.supports_static_decode)
+        self.assertTrue(CANNDenseBackend.supports_static_decode)
+        self.assertTrue(TurboQuantCubeBackend.supports_static_decode)
+        self.assertTrue(DenseReferenceBackend.supports_static_decode)
+        self.assertTrue(TurboQuantReferenceBackend.supports_static_decode)
+
+    def test_running_window_free_and_being_capturable_are_different_questions(self):
+        """The torch reference of the quantised cache decodes statically and still cannot be captured.
+
+        Its ``write_kv`` drops padding slots with a boolean mask, so the number
+        of rows it writes depends on the slots' values -- a host read, and one
+        the kernels it stands in for do not make. Conflating the two flags would
+        have had this backend attempt a capture that fails mid-record.
+        """
+        self.assertTrue(TurboQuantReferenceBackend.supports_static_decode)
+        self.assertFalse(TurboQuantReferenceBackend.supports_graph_capture)
+        self.assertTrue(DenseReferenceBackend.supports_graph_capture)
+
+
+class TestStaticDecodePath(_Qwen2TinyCheckpoint):
+    """The workspace path on a real (if tiny) checkpoint, against the path it replaced."""
+
+    def test_a_run_is_what_it_was_before_the_buffers(self):
+        """Allocation-free is a property of how the work is submitted, not of the answer."""
+        runner = self._runner()
+        static, _ = runner.generate(self.token_ids, max_new_tokens=self.NEW_TOKENS)
+
+        # The same model, stepped the way the loop did before the workspace:
+        # a fresh batch and fresh tensors every step.
+        eager: list[int] = []
+        ids = self.token_ids.clone()
+        fresh = self._runner()
+        logits = fresh.prefill(ids, RunMetrics())
+        position = ids.numel()
+        for _ in range(self.NEW_TOKENS):
+            token = int(torch.argmax(logits[-1]))
+            eager.append(token)
+            step = torch.tensor([token], dtype=torch.int64)
+            batch = fresh._batch(position, 1, is_decode=True)
+            logits = fresh.model(step, batch, fresh.write_backends, fresh.decode_backend)
+            position += 1
+        self.assertEqual(static, eager)
+
+    def test_the_loop_reports_which_path_it_took(self):
+        """Eager and captured differ by an order of magnitude and by nothing in the text."""
+        runner = self._runner()
+        _, metrics = runner.generate(self.token_ids, max_new_tokens=2)
+        summary = metrics.summary()
+        self.assertFalse(summary["decode_graph"])
+        self.assertEqual(summary["captures"], 0)
+        self.assertGreater(summary["decode_tokens_per_second"], 0)
+        self.assertIsNotNone(runner.decode_graph_refusal)
+
+    def test_a_cpu_run_that_demands_a_graph_is_refused_rather_than_slowed(self):
+        """``on`` is the benchmark's mode: a quiet fallback would read as slow kernels."""
+        with self.assertRaisesRegex(GraphCaptureUnavailable, "cpu"):
+            self._runner(decode_graph="on")
+        # And 'auto' takes the fallback without complaint.
+        self.assertIsNone(self._runner(decode_graph="auto").decode_graph)
+
+    def test_an_unknown_mode_is_refused_at_the_config(self):
+        with self.assertRaisesRegex(ValueError, "decode_graph"):
+            RunnerConfig(model_path=self.model_path, decode_graph="maybe")
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "no CUDA device")
+class TestCapturedDecodeGraph(_Qwen2TinyCheckpoint):
+    """Capture and replay, against the eager path that recorded it.
+
+    The tiny checkpoint rather than a real one, because what is under test is the
+    machinery -- that a replay reads the buffers as they are now and not as they
+    were at capture, that a window boundary is crossed cleanly, and that the
+    tokens are the eager path's. What a 3B model costs is a benchmark, not a test.
+    """
+
+    def _cuda_runner(self, **overrides) -> StandaloneModelRunner:
+        return self._runner(device="cuda:0", dtype=torch.float16, **overrides)
+
+    def test_a_replayed_decode_produces_the_eager_tokens(self):
+        eager, _ = self._cuda_runner(decode_graph="off").generate(self.token_ids.cuda(), max_new_tokens=self.NEW_TOKENS)
+        runner = self._cuda_runner(decode_graph="on")
+        graphed, metrics = runner.generate(self.token_ids.cuda(), max_new_tokens=self.NEW_TOKENS)
+        self.assertEqual(graphed, eager)
+        self.assertTrue(metrics.summary()["decode_graph"])
+        self.assertGreaterEqual(metrics.summary()["captures"], 1)
+
+    def test_a_replay_reads_the_buffers_as_they_are_now(self):
+        """The whole risk of capture: a value frozen at record time would pass silently.
+
+        Two steps at different positions from the same graph. If the replay had
+        baked in the capture's position, the second would attend over the wrong
+        prefix and write its K/V to the wrong slot -- and would still return a
+        plausible token, which is why this is checked against the eager path
+        rather than against nothing.
+        """
+        runner = self._cuda_runner(decode_graph="on")
+        tokens, _ = runner.generate(self.token_ids.cuda(), max_new_tokens=6)
+        reference, _ = self._cuda_runner(decode_graph="off").generate(self.token_ids.cuda(), max_new_tokens=6)
+        self.assertEqual(tokens, reference)
+        # One window served every step here, so the graph really was replayed.
+        self.assertEqual(len(runner.decode_graph.captured), 1)
+
+    def test_crossing_a_window_boundary_captures_a_second_graph(self):
+        """A run long enough to outgrow its window records another and keeps going."""
+        block, max_seq_len = 32, 256
+        first, second = graph_windows(max_seq_len, block)[:2]
+        # A prompt that sits just inside the first window, and a budget that
+        # carries it past -- derived from the ladder so neither can drift.
+        prompt = torch.randint(0, TINY_QWEN2["vocab_size"], (first - 2,), dtype=torch.int64).cuda()
+        budget = second - first
+        settings = {"max_seq_len": max_seq_len, "block_size": block}
+        runner = self._cuda_runner(decode_graph="on", **settings)
+        graphed, metrics = runner.generate(prompt, max_new_tokens=budget)
+        reference, _ = self._cuda_runner(decode_graph="off", **settings).generate(prompt, max_new_tokens=budget)
+        self.assertEqual(graphed, reference)
+        self.assertEqual(runner.decode_graph.captured, [first, second])
+        # The capture steps are kept out of the steady-state percentiles.
+        self.assertEqual(len(metrics.capture_us), 2)
+
+    def test_the_captures_are_reported_rather_than_averaged_in(self):
+        runner = self._cuda_runner(decode_graph="on")
+        _, metrics = runner.generate(self.token_ids.cuda(), max_new_tokens=5)
+        summary = metrics.summary()
+        self.assertEqual(summary["captures"], len(metrics.capture_us))
+        self.assertGreater(summary["capture_ms"], 0)
+        self.assertNotIn(metrics.capture_us[0], metrics.decode_step_us)
+
+    def test_a_backend_that_reads_its_lengths_back_cannot_be_captured(self):
+        """The refusal is by capability, not by device: native_v5 is the one that cannot."""
+        graph = mock.patch.object(ops_module.CANNDenseBackend, "supports_static_decode", False)
+        with graph, self.assertRaisesRegex(GraphCaptureUnavailable, "context lengths back to the host"):
+            self._cuda_runner(decode_graph="on", backend="cann_dense")
+
+    def test_a_backend_with_a_value_dependent_shape_is_refused_too(self):
+        graph = mock.patch.object(ops_module.CANNDenseBackend, "supports_graph_capture", False)
+        with graph, self.assertRaisesRegex(GraphCaptureUnavailable, "depends on a tensor's values"):
+            self._cuda_runner(decode_graph="on", backend="cann_dense")
+        # And 'auto' takes the eager path instead of failing the run.
+        with mock.patch.object(ops_module.CANNDenseBackend, "supports_graph_capture", False):
+            runner = self._cuda_runner(decode_graph="auto", backend="cann_dense")
+        self.assertIsNone(runner.decode_graph)
+        self.assertIn("depends on a tensor's values", runner.decode_graph_refusal)
+
+    def test_a_capture_that_fails_finishes_the_run_eagerly_and_says_so(self):
+        """No device here refuses a capture, so one is made to -- the fallback is the point.
+
+        An NPU that has the graph API but will not record this step is the case
+        this exists for, and it cannot be produced from a machine with no NPU.
+        What is checked is the behaviour: the token the capture was for is still
+        generated, the rest of the run continues, and the reason is on the record
+        rather than showing up as slow kernels.
+        """
+        runner = self._cuda_runner(decode_graph="auto")
+        reference, _ = self._cuda_runner(decode_graph="off").generate(self.token_ids.cuda(), max_new_tokens=4)
+        broken = mock.patch.object(
+            runner.decode_graph, "capture", side_effect=RuntimeError("this device will not record that")
+        )
+        with broken:
+            tokens, metrics = runner.generate(self.token_ids.cuda(), max_new_tokens=4)
+        self.assertEqual(tokens, reference)
+        self.assertIsNone(runner.decode_graph)
+        self.assertFalse(metrics.summary()["decode_graph"])
+        self.assertIn("will not record that", runner.decode_graph_refusal)
+
+
+class TestModelPathNormalisation(unittest.TestCase):
+    """``--model-path``: one spelling for the whole run, and a sentence when it is wrong."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def test_either_slash_and_a_trailing_one_are_the_same_directory(self):
+        """What a Windows shell hands over, in the three spellings it hands it over in."""
+        native = str(self.root)
+        forward = native.replace("\\", "/")
+        self.assertEqual(model_directory(forward), native)
+        self.assertEqual(model_directory(native), native)
+        self.assertEqual(model_directory(native + os.sep), native)
+
+    def test_the_home_directory_is_expanded(self):
+        self.assertEqual(model_directory("~"), str(Path.home()))
+
+    def test_nothing_is_opened_while_the_parser_is_still_being_built(self):
+        """An argparse type that stats would make every parser need a checkpoint on disk."""
+        missing = str(self.root / "nowhere")
+        self.assertEqual(model_directory(missing), missing)
+
+    def test_a_path_that_is_not_a_checkpoint_is_one_sentence_not_a_traceback(self):
+        from tq_longbench.smoke_glm import require_checkpoint
+
+        with self.assertRaisesRegex(SystemExit, "is not a directory"):
+            require_checkpoint(str(self.root / "nowhere"))
+        empty = self.root / "empty"
+        empty.mkdir()
+        with self.assertRaisesRegex(SystemExit, "holds no config.json"):
+            require_checkpoint(str(empty))
+
+
 class _ByteTokenizer:
     """The least a tokenizer can be and still drive the ladder: characters as ids.
 
@@ -1652,8 +2588,8 @@ class TestGenerationStops(unittest.TestCase):
         """A checkpoint that numbers its special tokens differently still stops."""
         tokenizer = _ChatGLM4LikeTokenizer()
         tokenizer.added_tokens_encoder = dict(tokenizer.added_tokens_encoder, **{"<|user|>": 999})
-        self.assertIn(999, glm4_stop_ids(tokenizer))
-        self.assertNotIn(151336, glm4_stop_ids(tokenizer))
+        self.assertIn(999, GLM4.stop_ids(tokenizer))
+        self.assertNotIn(151336, GLM4.stop_ids(tokenizer))
 
     def test_an_unknown_special_token_falls_back_rather_than_becoming_unk(self):
         """``<unk>`` is not a stop token; treating it as one truncates at the first odd word."""
@@ -1668,9 +2604,45 @@ class TestGenerationStops(unittest.TestCase):
         self.assertEqual(special_token_id(Ignorant(), "<|user|>", 151336), 151336)
 
     def test_a_non_glm4_checkpoint_keeps_its_own_stop_tokens(self):
-        """GLM-4's ids are GLM-4's: nothing here leaks into another model's vocabulary."""
+        """GLM-4's ids are GLM-4's: nothing here leaks into another model's vocabulary.
+
+        The tokenizer handed over is GLM-4's, so it answers for ``<|endoftext|>``
+        -- and at *its* id, 151329, not the 151643 Qwen2.5 publishes, because the
+        tokenizer is asked before the constant. What must not appear either way
+        is ``<|user|>`` or ``<|observation|>``: those are GLM-4 turn markers, and
+        nothing about a ``qwen2`` config asks for them.
+        """
         qwen = {"model_type": "qwen2", "eos_token_id": 151645}
-        self.assertEqual(eos_ids_for(qwen, _ChatGLM4LikeTokenizer()), {151645})
+        tokenizer = _ChatGLM4LikeTokenizer()
+        ids = eos_ids_for(qwen, tokenizer)
+        self.assertEqual(ids, {151645, tokenizer.added_tokens_encoder["<|endoftext|>"]})
+        self.assertFalse(ids & {151336, 151338})
+
+    def test_an_unclaimed_model_type_borrows_no_ids_at_all(self):
+        """GENERIC is the honest answer to a checkpoint nothing here has been told about."""
+        llama = {"model_type": "llama", "eos_token_id": [2, 32000]}
+        self.assertIs(family_for(llama), GENERIC)
+        self.assertEqual(eos_ids_for(llama, _ChatGLM4LikeTokenizer()), {2, 32000})
+
+    def test_how_a_run_ended_is_reported_rather_than_read_off_the_text(self):
+        """A stopped continuation and a truncated one are the same sentence on the page."""
+        from tq_longbench.smoke_glm import describe_stop
+
+        class Naming:
+            def convert_ids_to_tokens(self, token):
+                return {151645: "<|im_end|>"}[token]
+
+        stopped = RunMetrics(stopped_on_token=151645)
+        self.assertEqual(describe_stop(stopped, Naming(), 32), "stopped on '<|im_end|>' (151645)")
+        # No tokenizer, or one that cannot name the id: the id is still the answer.
+        self.assertEqual(describe_stop(stopped, None, 32), "stopped on token 151645")
+        self.assertEqual(describe_stop(RunMetrics(stopped_on_token=7), Naming(), 32), "stopped on token 7")
+
+    def test_a_run_that_never_stopped_says_so_in_those_words(self):
+        """The failure this exists for: a stop set that does not hold what the model emits."""
+        from tq_longbench.smoke_glm import describe_stop
+
+        self.assertIn("ran the whole 32-token budget", describe_stop(RunMetrics(), None, 32))
 
     def test_stopping_turns_the_reported_loop_into_a_clean_answer(self):
         """The observed depth-1.0 continuation, with and without the loop being ended.
@@ -1744,14 +2716,14 @@ class TestGlm4ChatPrompt(unittest.TestCase):
     def test_the_prompt_is_the_documented_format(self):
         """``[gMASK]<sop><|user|>\\n{prompt}\\n<|assistant|>``, assembled by id."""
         tokenizer = _ChatGLM4LikeTokenizer()
-        ids = encode(tokenizer, "HI", use_chat_template=True, glm4=True).tolist()
+        ids = encode(tokenizer, "HI", use_chat_template=True, family=GLM4).tolist()
         self.assertEqual(ids[:3], [151331, 151333, 151336])
         self.assertEqual(ids[-1], 151337)
         self.assertEqual(ids[3:-1], [ord("\n"), ord("H"), ord("I"), ord("\n")])
 
     def test_the_tokenizers_own_prefix_does_not_appear_twice(self):
         """ChatGLM4Tokenizer prepends [gMASK]<sop> to everything; the body must not carry it."""
-        ids = encode(_ChatGLM4LikeTokenizer(), "HI", use_chat_template=True, glm4=True).tolist()
+        ids = encode(_ChatGLM4LikeTokenizer(), "HI", use_chat_template=True, family=GLM4).tolist()
         self.assertEqual(ids.count(151331), 1)
         self.assertEqual(ids.count(151333), 1)
 
@@ -1764,8 +2736,8 @@ class TestGlm4ChatPrompt(unittest.TestCase):
                     input_ids=torch.tensor([self.PREFIX + self._body(text)], dtype=torch.int64)
                 )
 
-        with_flag = encode(_ChatGLM4LikeTokenizer(), "HI", use_chat_template=True, glm4=True)
-        measured = encode(NoFlag(), "HI", use_chat_template=True, glm4=True)
+        with_flag = encode(_ChatGLM4LikeTokenizer(), "HI", use_chat_template=True, family=GLM4)
+        measured = encode(NoFlag(), "HI", use_chat_template=True, family=GLM4)
         self.assertEqual(measured.tolist(), with_flag.tolist())
 
     def test_the_tokenizers_own_template_wins_where_it_exists(self):
@@ -1777,18 +2749,18 @@ class TestGlm4ChatPrompt(unittest.TestCase):
             def apply_chat_template(self, messages, **kwargs):
                 return {"input_ids": torch.tensor([[7, 7, 7]], dtype=torch.int64)}
 
-        self.assertEqual(encode(Modern(), "HI", use_chat_template=True, glm4=True).tolist(), [7, 7, 7])
+        self.assertEqual(encode(Modern(), "HI", use_chat_template=True, family=GLM4).tolist(), [7, 7, 7])
 
     def test_raw_prompt_still_means_raw(self):
-        ids = encode(_ChatGLM4LikeTokenizer(), "HI", use_chat_template=False, glm4=True).tolist()
+        ids = encode(_ChatGLM4LikeTokenizer(), "HI", use_chat_template=False, family=GLM4).tolist()
         self.assertNotIn(151336, ids)
 
     def test_the_route_is_named_rather_than_inferred(self):
         """Which of the three routes ran is printed, because it used to be invisible."""
         plain = _ChatGLM4LikeTokenizer()
-        self.assertIn("assembled here", prompt_route(plain, use_chat_template=True, glm4=True))
-        self.assertIn("raw", prompt_route(plain, use_chat_template=False, glm4=True))
-        self.assertIn("not GLM-4", prompt_route(plain, use_chat_template=True, glm4=False))
+        self.assertIn("assembled here", prompt_route(plain, use_chat_template=True, family=GLM4))
+        self.assertIn("raw", prompt_route(plain, use_chat_template=False, family=GLM4))
+        self.assertIn("no turn is transcribed", prompt_route(plain, use_chat_template=True, family=GENERIC))
 
 
 class TestOutputProjectionFold(unittest.TestCase):
@@ -2459,10 +3431,10 @@ class TestGlm4PrefillPolicy(unittest.TestCase):
             ["--model-path", "/m", "--device", "npu", "--backend", "turboquant_cube", "--tokens", "131072"]
         )
         self.assertEqual((args.device, args.backend, args.tokens), ("npu", "turboquant_cube", 131072))
-        self.assertEqual(choose_prefill_mode(args), "batched_decode")
+        self.assertEqual(choose_prefill_mode(args, GLM4), "batched_decode")
         args = parser.parse_args(["--model-path", "/m", "--tokens", "131072", "--prefill-mode", "dense_staging"])
         with contextlib.redirect_stderr(io.StringIO()) as warning:
-            self.assertEqual(choose_prefill_mode(args), "dense_staging")
+            self.assertEqual(choose_prefill_mode(args, GLM4), "dense_staging")
         self.assertIn("HBM", warning.getvalue())
         self.assertEqual(parse_depths("0,0.5,1"), (0.0, 0.5, 1.0))
         with self.assertRaises(ValueError):
@@ -3146,7 +4118,7 @@ class TestSmokeGlmPreflight(unittest.TestCase):
             mock.patch.object(smoke_glm, "select_dense_backend", return_value=dense),
             mock.patch.object(smoke_glm, "probe_backend", return_value=decode),
         ):
-            return smoke_glm.plan_attention(args, GLM4_9B_CHAT_1M_CONFIG, prefill_mode)
+            return smoke_glm.plan_attention(args, glm4_model_shape(GLM4_9B_CHAT_1M_CONFIG), prefill_mode)
 
     def test_a_failed_default_dense_prefill_switches_to_batched_decode(self):
         plan = self._plan(self._args("--backend", "turboquant_reference"), "dense_staging", dense_passes=False)
