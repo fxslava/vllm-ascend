@@ -110,6 +110,7 @@ from tq_longbench.engine import (  # noqa: E402
     DECODE_GRAPH_MODES,
     DEFAULT_CHUNK_SIZE,
     PREFILL_MODES,
+    WEIGHT_NZ_MODES,
     RunnerConfig,
     StandaloneModelRunner,
     read_checkpoint_shape,
@@ -121,6 +122,13 @@ from tq_longbench.families import (  # noqa: E402
     family_for,
 )
 from tq_longbench.glm4 import read_config  # noqa: E402
+from tq_longbench.kv_dump import (  # noqa: E402
+    DumpReport,
+    default_run_name,
+    dump_quantised_cache,
+    normalise_dump_dir,
+    run_directory,
+)
 from tq_longbench.layers import FOLD_SITES  # noqa: E402
 from tq_longbench.ops import (  # noqa: E402
     DENSE_BACKENDS,
@@ -149,6 +157,17 @@ CONTEXT_HEADROOM_TOKENS = 512
 
 #: ``--dummy-prompt``: ``[batch, tokens]`` of token id 1, no tokenizer involved.
 DUMMY_PROMPT_SHAPE = (1, 64)
+
+def quantised_backends() -> list[str]:
+    """The backends that decode out of a TurboQuant pool, and so have one to dump.
+
+    Everything else attends over an unquantised cache, which is not what
+    ``--dump-kv-dir`` is for. A function rather than a module constant because
+    :func:`~tq_longbench.ops.backend_names` imports the reference backends to
+    answer, and doing that while this module is still being imported is a chain
+    worth not starting.
+    """
+    return sorted(set(backend_names()) - DENSE_BACKENDS)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -217,6 +236,19 @@ def build_parser() -> argparse.ArgumentParser:
         choices=list(DECODE_GRAPH_MODES),
         help="capture the single-token decode as a device graph: auto (where the device and backend allow it), "
         "on (refuse a run that cannot), off (launch it a kernel at a time -- the baseline to compare against)",
+    )
+    parser.add_argument(
+        "--weight-nz",
+        default="auto",
+        choices=list(WEIGHT_NZ_MODES),
+        help="cast the fused projections to Ascend's fractal NZ layout: auto (vllm_ascend's own policy for the "
+        "dtype and SoC -- always on a 310P, otherwise not for fp16/bf16), on, off",
+    )
+    parser.add_argument(
+        "--dump-kv-dir",
+        default=None,
+        help="write the quantised KV cache, its metadata and a reconstruction guide under DIR/<run>/ "
+        "after the first needle depth, for offline analysis without this package",
     )
     parser.add_argument("--seed", type=int, default=0)
     return parser
@@ -346,6 +378,75 @@ def truncate_middle(token_ids: torch.Tensor, keep: int) -> torch.Tensor:
         return token_ids
     half = keep // 2
     return torch.cat((token_ids[:half], token_ids[-(keep - half) :]))
+
+
+def require_dumpable(args) -> None:
+    """Refuse a ``--dump-kv-dir`` that could not produce one, before any weight loads.
+
+    Both ways it can come up empty are quiet otherwise: a dense backend has no
+    quantised cache to write, and ``--tokens 0`` never runs the stage the dump
+    hangs off. Either would finish the run normally and leave an empty
+    directory, which is the sort of thing noticed a day later by whoever was
+    waiting for the tensors.
+    """
+    if not args.dump_kv_dir:
+        return
+    if args.backend in DENSE_BACKENDS:
+        raise SystemExit(
+            f"--dump-kv-dir needs a backend with a quantised cache; {args.backend} has none. "
+            f"Choose one of {quantised_backends()}."
+        )
+    if not args.tokens:
+        raise SystemExit("--dump-kv-dir writes the cache the needle stage builds, so it needs --tokens above 0")
+
+
+def cached_extent(prompt_tokens: int, metrics) -> int:
+    """How many slots the pool actually holds after a generation, exactly.
+
+    The prompt, plus one slot per decode step that ran. Not per token
+    *produced*: the loop appends a token and only then forwards it, so the last
+    one -- the stop token, or the one the budget ended on -- was chosen and never
+    written. Counting it would hand the consumer a row of zeros as the final
+    position of the context, which is the sort of thing that shows up in a
+    compression study as a suspiciously compressible token.
+
+    Counted from the timings because every step lands in exactly one of them, so
+    this holds however the loop ended.
+    """
+    return prompt_tokens + len(metrics.decode_step_us) + len(metrics.capture_us)
+
+
+def dump_stage(args, runner, family: ModelFamily, item, prompt_ids, metrics, report) -> DumpReport:
+    """Write this depth's cache out, with what the run did to the prompt beside it.
+
+    ``cached_tokens`` is the prompt *plus* what the decode wrote on top of it,
+    which is what the pool holds. Saying "4096" there when the cache reaches 4127
+    would hand the consumer thirty-odd positions of the model's own continuation
+    labelled as haystack; both numbers go in the metadata for that reason.
+    """
+    cached_tokens = cached_extent(int(prompt_ids.numel()), metrics)
+    needle = {
+        "depth": item.extra.get("depth"),
+        "city": item.extra.get("city"),
+        "answer": item.answers[0],
+        "retrieved": bool(report.found),
+        "clean": bool(report.clean),
+        "verdict": report.describe(),
+    }
+    directory = run_directory(
+        normalise_dump_dir(args.dump_kv_dir),
+        default_run_name(args.model_path, args.backend, args.tokens),
+    )
+    return dump_quantised_cache(
+        runner,
+        directory,
+        model_path=args.model_path,
+        family=family.name,
+        cached_tokens=cached_tokens,
+        context_tokens=int(prompt_ids.numel()),
+        prompt=item.prompt,
+        needle=needle,
+    )
 
 
 def describe_decode(runner, summary: dict) -> str:
@@ -552,6 +653,7 @@ def build_runner(
             dense_attention_api=dense_attention_api,
             dense_staging_backend=dense_staging_backend,
             decode_graph=args.decode_graph,
+            weight_nz=args.weight_nz,
         )
     )
     assert_no_vllm_imported()
@@ -706,6 +808,7 @@ def _free(device: torch.device) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     require_checkpoint(args.model_path)
+    require_dumpable(args)
     args.device = resolve_device(args.device)
     depths = parse_depths(args.depths)
     config = read_config(args.model_path)
@@ -761,6 +864,7 @@ def main(argv: list[str] | None = None) -> int:
     # to be installed. An empty stop set in particular is invisible from the
     # output: it looks exactly like a model with more to say.
     print(f"  {runner.fold_report.describe()}")
+    print(f"  {runner.layout_report.describe()}")
     print(f"  prompt: {prompt_route(tokenizer, use_chat_template, family)}")
     print(f"  stop ids: {sorted(eos_ids) if eos_ids else 'NONE -- generation will run its whole budget'}")
     memory = runner.memory_report()
@@ -819,6 +923,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n=== 3. needle in a haystack at ~{args.tokens} tokens ===")
         keep = max_seq_len - CONTEXT_HEADROOM_TOKENS - args.max_new_tokens
         hits = clean = 0
+        dumped = False
         for depth in depths:
             item = needle_in_a_haystack(args.tokens, depth=depth, seed=int(depth * 100) + args.seed)
             prompt_ids = truncate_middle(encode(tokenizer, item.prompt, use_chat_template, family), keep)
@@ -835,6 +940,12 @@ def main(argv: list[str] | None = None) -> int:
                 f"ttft {summary['ttft_ms']:.0f} ms decode p50 {summary['decode_p50_us']:.0f} us "
                 f"{answer.strip()[:40]!r}" + (f" <undecodable: {failure}>" if failure else "")
             )
+            if args.dump_kv_dir and not dumped:
+                # The first depth only. The pool is one sequence's, so a second
+                # dump would be the second depth's haystack written over the
+                # first -- one cache, one directory, one prompt it belongs to.
+                dumped = True
+                print(f"    {dump_stage(args, runner, family, item, prompt_ids, metrics, report).describe()}")
         # Both counts, always: a run where they differ retrieved the needle and
         # then kept going, which "3/3 retrieved" on its own reads as a clean pass.
         print(f"  {args.backend}: {hits}/{len(depths)} retrieved, {clean}/{len(depths)} clean")

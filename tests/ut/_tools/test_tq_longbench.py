@@ -78,6 +78,7 @@ from tq_longbench.engine import (  # noqa: E402
     StandaloneModelRunner,
     graph_windows,
     read_checkpoint_shape,
+    should_cast_to_nz,
 )
 from tq_longbench.families import (  # noqa: E402
     BODY,
@@ -95,8 +96,17 @@ from tq_longbench.glm4 import (  # noqa: E402
     glm4_prefill_mode,
     is_glm4_config,
 )
+from tq_longbench import kv_dump  # noqa: E402
 from tq_longbench.kv_cache import CacheGeometry, DenseKVCache, TurboQuantKVCache, dense_equivalent_bytes  # noqa: E402
+from tq_longbench.kv_dump import (  # noqa: E402
+    collect_tensors,
+    default_run_name,
+    dump_quantised_cache,
+    normalise_dump_dir,
+    run_directory,
+)
 from tq_longbench.layers import (  # noqa: E402
+    MLP,
     CausalLM,
     DecodeWorkspace,
     ModelShape,
@@ -105,6 +115,7 @@ from tq_longbench.layers import (  # noqa: E402
     fold_on_device,
     fold_output_projection_in_place,
     fold_precision,
+    npu_operator,
     pi_matrix,
 )
 from tq_longbench.ops import (  # noqa: E402
@@ -133,10 +144,12 @@ from tq_longbench.probe import (  # noqa: E402
 )
 from tq_longbench.reference import DenseReferenceBackend, TurboQuantReferenceBackend  # noqa: E402
 from tq_longbench.smoke_glm import (  # noqa: E402
+    cached_extent,
     encode,
     eos_ids_for,
     model_directory,
     prompt_route,
+    require_dumpable,
     stop_at_eos,
 )
 from tq_longbench.tasks import (  # noqa: E402
@@ -2304,6 +2317,42 @@ class TestCapturedDecodeGraph(_Qwen2TinyCheckpoint):
         with graph, self.assertRaisesRegex(GraphCaptureUnavailable, "context lengths back to the host"):
             self._cuda_runner(decode_graph="on", backend="cann_dense")
 
+    def test_replaying_two_windows_in_turn_keeps_both_correct(self):
+        """The shared pool's one real risk: a later graph landing on an earlier one's memory.
+
+        Within a run the window only grows, so alternation needs two runs on the
+        same runner -- the second starts at position zero again and replays the
+        small window after the large one has been captured over the same pool.
+        If anything a replay needs had been allocated in that pool, the second
+        pass through the small window would read what the large one left.
+        """
+        block, max_seq_len = 32, 256
+        first, second = graph_windows(max_seq_len, block)[:2]
+        settings = {"max_seq_len": max_seq_len, "block_size": block}
+        short = torch.randint(0, TINY_QWEN2["vocab_size"], (8,), dtype=torch.int64).cuda()
+        long = torch.randint(0, TINY_QWEN2["vocab_size"], (first + 4,), dtype=torch.int64).cuda()
+
+        eager = self._cuda_runner(decode_graph="off", **settings)
+        expected_short, _ = eager.generate(short, max_new_tokens=4)
+        expected_long, _ = eager.generate(long, max_new_tokens=4)
+
+        runner = self._cuda_runner(decode_graph="on", **settings)
+        self.assertEqual(runner.generate(short, max_new_tokens=4)[0], expected_short)
+        self.assertEqual(runner.generate(long, max_new_tokens=4)[0], expected_long)
+        # ...and back to the first window, after the second was captured over it.
+        self.assertEqual(runner.generate(short, max_new_tokens=4)[0], expected_short)
+        self.assertEqual(runner.decode_graph.captured, [first, second])
+
+    def test_on_refuses_a_failing_capture_rather_than_falling_back(self):
+        """The mode a benchmark uses: a quiet eager fallback would report the wrong number."""
+        runner = self._cuda_runner(decode_graph="on")
+        broken = mock.patch.object(
+            runner.decode_graph, "capture", side_effect=RuntimeError("this device will not record that")
+        )
+        with broken, self.assertRaisesRegex(RuntimeError, "will not record that"):
+            runner.generate(self.token_ids.cuda(), max_new_tokens=4)
+        self.assertIsNotNone(runner.decode_graph)
+
     def test_a_backend_with_a_value_dependent_shape_is_refused_too(self):
         graph = mock.patch.object(ops_module.CANNDenseBackend, "supports_graph_capture", False)
         with graph, self.assertRaisesRegex(GraphCaptureUnavailable, "depends on a tensor's values"):
@@ -2334,6 +2383,653 @@ class TestCapturedDecodeGraph(_Qwen2TinyCheckpoint):
         self.assertIsNone(runner.decode_graph)
         self.assertFalse(metrics.summary()["decode_graph"])
         self.assertIn("will not record that", runner.decode_graph_refusal)
+
+
+class _FakeTorchNpu(types.SimpleNamespace):
+    """The slice of ``torch_npu`` this harness reaches for, with torch underneath.
+
+    Mocked rather than skipped, because every one of these call sites is a branch
+    only an NPU would take and this host has none: the fallbacks are what runs
+    here, so without a stand-in the NPU code would be typed and never executed.
+    What the stand-in cannot check is what the real operators compute; what it
+    does check is the shape of the call -- the arguments, the unpacking, and that
+    the fallback runs when the operator is absent.
+
+    The operators are set as *attributes* rather than defined as methods, so a
+    test can replace one, delete one to play an older torch_npu, or compare the
+    bound object the resolver returned against the one it should have found.
+    Each computes what torch would, so the NPU route can be held to the route it
+    replaces.
+    """
+
+    def __init__(self, soc_version: int = 251, **overrides):
+        super().__init__(**overrides)
+        self.npu = types.SimpleNamespace(get_soc_version=lambda: soc_version)
+        self.calls: dict[str, int] = {}
+        self._formats: dict[int, int] = {}
+        self.npu_rms_norm = self._npu_rms_norm
+        self.npu_swiglu = self._npu_swiglu
+        self.npu_format_cast = self._npu_format_cast
+        self.get_npu_format = self._get_npu_format
+
+    def _count(self, name: str) -> None:
+        self.calls[name] = self.calls.get(name, 0) + 1
+
+    def _npu_rms_norm(self, x, gamma, epsilon=1e-6):
+        """CANN returns ``(normed, rstd)``; a caller that forgets the unpack gets a tuple."""
+        self._count("npu_rms_norm")
+        promoted = x.to(torch.float32)
+        rstd = torch.rsqrt(promoted.pow(2).mean(-1, keepdim=True) + epsilon)
+        return (promoted * rstd * gamma.to(torch.float32)).to(x.dtype), rstd.to(x.dtype)
+
+    def _npu_swiglu(self, x):
+        """Halves the trailing axis and returns ``silu(first) * second``."""
+        self._count("npu_swiglu")
+        gate, up = x.chunk(2, dim=-1)
+        return torch.nn.functional.silu(gate) * up
+
+    def _npu_format_cast(self, tensor, acl_format, **kwargs):
+        self._count("npu_format_cast")
+        cast = tensor.clone()
+        self._formats[cast.data_ptr()] = acl_format
+        return cast
+
+    def _get_npu_format(self, tensor):
+        return self._formats.get(tensor.data_ptr(), 2)
+
+
+@contextlib.contextmanager
+def _fake_torch_npu(**kwargs):
+    """Put a stand-in ``torch_npu`` where :func:`npu_operator` looks for one."""
+    fake = _FakeTorchNpu(**kwargs)
+    with mock.patch.dict(sys.modules, {"torch_npu": fake}):
+        yield fake
+
+
+class _NpuDevice:
+    """A device object that claims to be an NPU without one being present.
+
+    Only ever handed to the resolvers, which read ``.type`` and nothing else; the
+    tensors in these tests stay on the CPU, because what is under test is which
+    branch is taken and not where it runs.
+    """
+
+    type = "npu"
+
+
+class TestNpuOperatorResolution(unittest.TestCase):
+    """Which operator a module binds at construction, and when it binds none."""
+
+    def test_nothing_is_bound_off_an_npu(self):
+        with _fake_torch_npu():
+            self.assertIsNone(npu_operator("npu_rms_norm", CPU))
+            self.assertIsNone(npu_operator("npu_swiglu", torch.device("cuda:0")))
+
+    def test_the_operator_is_bound_on_one(self):
+        with _fake_torch_npu() as fake:
+            self.assertIs(npu_operator("npu_rms_norm", _NpuDevice()), fake.npu_rms_norm)
+
+    def test_an_operator_this_torch_npu_lacks_binds_nothing(self):
+        """An older torch_npu is a fallback, not a crash halfway through a run."""
+        with _fake_torch_npu():
+            self.assertIsNone(npu_operator("npu_something_invented", _NpuDevice()))
+
+    def test_torch_npu_is_never_imported_to_answer(self):
+        """A CUDA or CPU run must not drag it in, and an NPU run has it already."""
+        with mock.patch.dict(sys.modules, {}, clear=False):
+            sys.modules.pop("torch_npu", None)
+            self.assertIsNone(npu_operator("npu_rms_norm", _NpuDevice()))
+
+
+class TestNpuRMSNorm(unittest.TestCase):
+    """CANN's norm in place of the expression, and the unpack it needs."""
+
+    def _norm(self, hidden: int = 256) -> RMSNorm:
+        torch.manual_seed(0)
+        norm = RMSNorm(hidden, 1e-6, torch.float32, CPU)
+        with torch.no_grad():
+            norm.weight.normal_(mean=1.0, std=0.1)
+        return norm
+
+    def test_the_operator_is_used_and_its_second_return_dropped(self):
+        norm = self._norm()
+        x = torch.randn(1, 256)
+        expected = norm(x)
+        with _fake_torch_npu() as fake:
+            norm._npu_rms_norm = fake.npu_rms_norm
+            out = norm(x)
+        self.assertEqual(fake.calls["npu_rms_norm"], 1)
+        # A forgotten [0] would return a tuple and fail here, loudly, which is
+        # the point of asserting the type before the values.
+        self.assertIsInstance(out, torch.Tensor)
+        torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+    def test_epsilon_reaches_the_operator_as_a_keyword(self):
+        """``npu_rms_norm(x, gamma, epsilon=...)`` -- passing it positionally is a different op."""
+        captured = {}
+
+        def recording(x, gamma, epsilon=None):
+            captured["epsilon"] = epsilon
+            return x, x
+
+        norm = self._norm()
+        norm.eps = 1e-5
+        norm._npu_rms_norm = recording
+        norm(torch.randn(1, 256))
+        self.assertEqual(captured["epsilon"], 1e-5)
+
+    def test_without_the_operator_the_torch_route_still_runs(self):
+        norm = self._norm()
+        self.assertIsNone(norm._npu_rms_norm)
+        self.assertEqual(norm(torch.randn(1, 256)).shape, (1, 256))
+
+
+class TestNpuSwiGLU(unittest.TestCase):
+    """CANN's SwiGLU in place of the split, the silu and the multiply."""
+
+    SHAPE = TestFusedProjections.SHAPE
+
+    def _mlp(self) -> MLP:
+        torch.manual_seed(0)
+        mlp = MLP(self.SHAPE, torch.float32, CPU)
+        with torch.no_grad():
+            mlp.gate_up_proj.weight.normal_(std=0.05)
+            mlp.down_proj.weight.normal_(std=0.05)
+        return mlp
+
+    def test_it_computes_what_the_split_and_multiply_did(self):
+        """Gate first, up second: the op halves the trailing axis the way this layout does."""
+        mlp = self._mlp()
+        x = torch.randn(1, self.SHAPE.hidden_size)
+        expected = mlp(x)
+        with _fake_torch_npu() as fake:
+            mlp._npu_swiglu = fake.npu_swiglu
+            out = mlp(x)
+        self.assertEqual(fake.calls["npu_swiglu"], 1)
+        torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+    def test_it_is_handed_the_whole_fused_output_not_a_half(self):
+        """The op does the splitting; handing it one half would silently halve the FFN."""
+        captured = {}
+        mlp = self._mlp()
+
+        def recording(fused):
+            captured["width"] = fused.shape[-1]
+            return fused[..., : self.SHAPE.intermediate_size]
+
+        mlp._npu_swiglu = recording
+        mlp(torch.randn(1, self.SHAPE.hidden_size))
+        self.assertEqual(captured["width"], 2 * self.SHAPE.intermediate_size)
+
+    @torch.inference_mode()
+    def test_the_workspace_path_takes_it_too(self):
+        """The decode is the path that matters, and it reaches the op through the buffer.
+
+        Under ``inference_mode`` because that is the workspace path's contract:
+        it writes through ``out=``, which autograd refuses to track, and both
+        callers (``generate`` and a graph capture) are already inside it.
+        """
+        mlp = self._mlp()
+        workspace = DecodeWorkspace.build(self.SHAPE, torch.float32, CPU)
+        x = torch.randn(1, self.SHAPE.hidden_size)
+        expected = mlp(x, workspace)
+        with _fake_torch_npu() as fake:
+            mlp._npu_swiglu = fake.npu_swiglu
+            out = mlp(x, workspace)
+        self.assertEqual(fake.calls["npu_swiglu"], 1)
+        torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+
+class TestWeightNzPolicy(unittest.TestCase):
+    """When a fused projection goes into FRACTAL_NZ, which is vllm_ascend's question.
+
+    ``auto`` follows ``_should_trans_nz``: never for float32, always on a 310P,
+    and -- for float16 and bfloat16 anywhere else -- only at ``weight_nz_mode 2``,
+    which the shipped default is not. So on a 910 or a 950 the plugin leaves dense
+    half-precision weights in ND, and copying that policy is deliberate: without
+    an NPU to measure on, following the vendor beats guessing that more native
+    must mean faster.
+    """
+
+    def test_off_is_off_everywhere(self):
+        with _fake_torch_npu():
+            for device in (CPU, _NpuDevice()):
+                cast, reason = should_cast_to_nz("off", torch.float16, device)
+                self.assertFalse(cast)
+                self.assertIn("off", reason)
+
+    def test_a_device_with_no_fractal_layout_never_casts(self):
+        cast, reason = should_cast_to_nz("on", torch.float16, CPU)
+        self.assertFalse(cast)
+        self.assertIn("fractal", reason)
+
+    def test_float32_never_casts_even_when_asked(self):
+        with _fake_torch_npu():
+            cast, reason = should_cast_to_nz("on", torch.float32, _NpuDevice())
+            self.assertFalse(cast)
+            self.assertIn("float32", reason)
+
+    def test_a_310p_casts_on_auto(self):
+        for soc in (200, 203, 205):
+            with self.subTest(soc=soc), _fake_torch_npu(soc_version=soc):
+                cast, reason = should_cast_to_nz("auto", torch.float16, _NpuDevice())
+                self.assertTrue(cast)
+                self.assertIn("310P", reason)
+
+    def test_a_950_does_not_cast_half_precision_on_auto(self):
+        """The plugin's default is quantised weights only, and this mirrors it."""
+        with _fake_torch_npu(soc_version=260):
+            cast, reason = should_cast_to_nz("auto", torch.bfloat16, _NpuDevice())
+            self.assertFalse(cast)
+            self.assertIn("weight_nz_mode 2", reason)
+            # ...and 'on' is how to ask for it anyway.
+            self.assertTrue(should_cast_to_nz("on", torch.bfloat16, _NpuDevice())[0])
+
+    def test_a_torch_npu_that_cannot_name_the_soc_does_not_guess(self):
+        with _fake_torch_npu() as fake:
+            fake.npu = types.SimpleNamespace()
+            cast, reason = should_cast_to_nz("auto", torch.float16, _NpuDevice())
+            self.assertFalse(cast)
+            self.assertIn("SoC version", reason)
+
+    def test_an_unknown_mode_is_refused_at_the_config(self):
+        with self.assertRaisesRegex(ValueError, "weight_nz"):
+            RunnerConfig(model_path="/m", weight_nz="fractal")
+
+
+class TestWeightNzCast(_Qwen2TinyCheckpoint):
+    """The cast itself: what it touches, and the check that it did not change the answer.
+
+    The policy is :class:`TestWeightNzPolicy`'s; here it is forced, because
+    whether a device is an NPU and whether the mechanics are right are separate
+    questions and only the second can be asked on a host with no NPU. The tensors
+    stay on the CPU and the stand-in's ``npu_format_cast`` copies rather than
+    retiling -- which is the honest limit of this: it exercises every line, and
+    it cannot tell anyone what a real Cube does with the result.
+    """
+
+    LAYERS = TINY_QWEN2["num_hidden_layers"]
+
+    @contextlib.contextmanager
+    def _forced(self, reason: str = "test"):
+        with mock.patch.object(engine_module, "should_cast_to_nz", return_value=(True, reason)):
+            yield
+
+    def test_nothing_is_cast_off_an_npu_and_the_reason_is_recorded(self):
+        runner = self._runner()
+        self.assertEqual(runner.layout_report.cast, 0)
+        self.assertIn("fractal", runner.layout_report.describe())
+
+    def test_it_casts_both_fused_projections_of_every_layer(self):
+        """qkv and gate_up, and not o_proj -- which carries a fold done on ND values."""
+        runner = self._runner()
+        o_proj = [layer.self_attn.o_proj.weight.data_ptr() for layer in runner.model.layers]
+        with _fake_torch_npu() as fake, self._forced():
+            report = runner._cast_fused_projections()
+        self.assertEqual(report.cast, 2 * self.LAYERS)
+        self.assertEqual(fake.calls["npu_format_cast"], 2 * self.LAYERS)
+        self.assertEqual(report.confirmed_format, 29)
+        self.assertGreater(report.cosine, 0.9999)
+        self.assertIn("FRACTAL_NZ", report.describe())
+        # o_proj and down_proj were left where they were.
+        self.assertEqual([layer.self_attn.o_proj.weight.data_ptr() for layer in runner.model.layers], o_proj)
+
+    def test_the_model_still_generates_what_it_did(self):
+        """A cast that reorders bytes must not move a token."""
+        runner = self._runner()
+        before, _ = runner.generate(self.token_ids, max_new_tokens=self.NEW_TOKENS)
+        with _fake_torch_npu(), self._forced():
+            runner._cast_fused_projections()
+        after, _ = runner.generate(self.token_ids, max_new_tokens=self.NEW_TOKENS)
+        self.assertEqual(after, before)
+
+    def test_a_cast_that_changes_the_product_fails_the_load(self):
+        """A layout the matmul reads wrongly returns numbers; only the probe notices."""
+        runner = self._runner()
+        with _fake_torch_npu() as fake, self._forced():
+            fake.npu_format_cast = lambda tensor, acl_format, **kwargs: tensor.flip(-1).clone()
+            with self.assertRaisesRegex(RuntimeError, "changed what the first fused projection computes"):
+                runner._cast_fused_projections()
+
+    def test_a_torch_npu_without_the_operator_falls_back_unless_on_asked(self):
+        runner = self._runner()
+        with _fake_torch_npu() as fake, self._forced():
+            del fake.npu_format_cast
+            runner.config.weight_nz = "auto"
+            self.assertEqual(runner._cast_fused_projections().cast, 0)
+            runner.config.weight_nz = "on"
+            with self.assertRaisesRegex(RuntimeError, "no npu_format_cast"):
+                runner._cast_fused_projections()
+
+    def test_a_torch_npu_that_cannot_name_a_format_still_casts(self):
+        """``get_npu_format`` is a confirmation, not a prerequisite."""
+        runner = self._runner()
+        with _fake_torch_npu() as fake, self._forced():
+            del fake.get_npu_format
+            report = runner._cast_fused_projections()
+        self.assertEqual(report.cast, 2 * self.LAYERS)
+        self.assertIsNone(report.confirmed_format)
+
+
+class TestBlockTableCache(unittest.TestCase):
+    """The block table a paged decode hands its kernel, built once per shape.
+
+    It was a fresh allocation and a copy per layer per step, for a tensor whose
+    contents depend on nothing but the window. Under capture that is a pointer
+    into the graph's pool; cached, it is an address the replay already holds.
+    """
+
+    def _backend(self):
+        geometry = CacheGeometry(num_layers=1, num_kv_heads=2, head_size=64, block_size=BLOCK_SIZE, max_seq_len=512)
+        shape = LayerShape(num_heads=4, num_kv_heads=2, head_size=64, scale=0.125)
+        return build_backend("cann_dense", geometry, shape, CPU, torch.float32)
+
+    def test_the_same_window_returns_the_same_tensor(self):
+        backend = self._backend()
+        first = backend._block_tables(1, 256)
+        self.assertIs(backend._block_tables(1, 256), first)
+
+    def test_a_different_window_gets_its_own(self):
+        backend = self._backend()
+        narrow, wide = backend._block_tables(1, 128), backend._block_tables(1, 512)
+        self.assertIsNot(narrow, wide)
+        self.assertLess(narrow.shape[1], wide.shape[1])
+
+    def test_it_is_the_table_the_uncached_expression_built(self):
+        backend = self._backend()
+        for tokens, window in ((1, 128), (1, 512), (4, 256)):
+            with self.subTest(tokens=tokens, window=window):
+                expected = backend.cache.block_table(window).expand(tokens, -1).contiguous()
+                torch.testing.assert_close(backend._block_tables(tokens, window), expected, rtol=0, atol=0)
+
+
+class TestKvDumpPaths(unittest.TestCase):
+    """``--dump-kv-dir``: one spelling, and a directory that exists afterwards."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name).resolve()
+
+    def test_either_slash_and_a_trailing_one_name_the_same_directory(self):
+        native = str(self.root)
+        self.assertEqual(normalise_dump_dir(native.replace("\\", "/")), self.root)
+        self.assertEqual(normalise_dump_dir(native + os.sep), self.root)
+
+    def test_the_path_is_absolute_so_the_run_reports_where_it_wrote(self):
+        self.assertTrue(normalise_dump_dir(".").is_absolute())
+
+    def test_the_home_directory_is_expanded(self):
+        self.assertEqual(normalise_dump_dir("~"), Path.home().resolve())
+
+    def test_a_missing_destination_is_created_parents_and_all(self):
+        directory = run_directory(self.root / "nowhere" / "deeper", "a_run")
+        self.assertTrue(directory.is_dir())
+        self.assertEqual(directory.name, "a_run")
+        # Asking twice is not an error; a second depth must not blow up on it.
+        self.assertEqual(run_directory(self.root / "nowhere" / "deeper", "a_run"), directory)
+
+    def test_the_run_name_says_what_the_run_was(self):
+        name = default_run_name("F:/AI/models/Qwen2.5-3B-Instruct", "turboquant_cube", 4096)
+        self.assertTrue(name.startswith("qwen2.5-3b-instruct_turboquant_cube_4096_"), name)
+        # Nothing in it needs quoting on a filesystem.
+        self.assertRegex(name, r"^[0-9a-z._-]+$")
+
+    def test_two_runs_do_not_land_on_one_directory(self):
+        with mock.patch.object(kv_dump.time, "strftime", side_effect=["20260920-120000", "20260920-120001"]):
+            first = default_run_name("/m/model", "turboquant_aiv", 8192)
+            second = default_run_name("/m/model", "turboquant_aiv", 8192)
+        self.assertNotEqual(first, second)
+
+
+class TestKvDumpRefusals(unittest.TestCase):
+    """The two ways a dump would come up empty, refused before the weights load."""
+
+    def _args(self, **overrides):
+        settings = {"dump_kv_dir": "F:/AI/kvcache", "backend": "turboquant_cube", "tokens": 4096, **overrides}
+        return types.SimpleNamespace(**settings)
+
+    def test_a_dense_backend_has_no_quantised_cache_to_write(self):
+        with self.assertRaisesRegex(SystemExit, "has none"):
+            require_dumpable(self._args(backend="cann_dense"))
+
+    def test_the_needle_stage_is_what_builds_the_cache(self):
+        with self.assertRaisesRegex(SystemExit, "--tokens above 0"):
+            require_dumpable(self._args(tokens=0))
+
+    def test_a_run_that_asked_for_no_dump_is_never_refused(self):
+        self.assertIsNone(require_dumpable(self._args(dump_kv_dir=None, backend="cann_dense", tokens=0)))
+
+    def test_a_quantised_backend_at_a_real_context_is_allowed(self):
+        for backend in ("turboquant_cube", "turboquant_aiv", "turboquant_reference"):
+            with self.subTest(backend=backend):
+                self.assertIsNone(require_dumpable(self._args(backend=backend)))
+
+
+class TestCachedExtent(unittest.TestCase):
+    """How much of the pool a generation actually filled -- counted, not inferred.
+
+    The loop appends a token and only then forwards it, so the last one it
+    produced was chosen and never written. Counting produced tokens would put one
+    row of zeros at the end of the context, which in a compression study reads as
+    a suspiciously compressible final position rather than as a bug.
+    """
+
+    def test_it_counts_steps_rather_than_tokens(self):
+        # Ended on a stop token: four produced, three forwarded.
+        metrics = RunMetrics(decode_step_us=[1.0, 2.0, 3.0], stopped_on_token=7)
+        self.assertEqual(cached_extent(100, metrics), 103)
+
+    def test_a_capture_step_wrote_a_slot_too(self):
+        """A captured step is still a step; it is only timed in a different list."""
+        metrics = RunMetrics(decode_step_us=[1.0, 2.0], capture_us=[50.0])
+        self.assertEqual(cached_extent(100, metrics), 103)
+
+    def test_a_prefill_with_no_decode_is_the_prompt(self):
+        self.assertEqual(cached_extent(4096, RunMetrics()), 4096)
+
+
+class TestKvDumpContents(unittest.TestCase):
+    """What the file holds, and that it reads back with nothing of this package loaded."""
+
+    KV_HEADS = 2
+    HEADS = 4
+    HEAD_SIZE = 128
+    LAYERS = 2
+    TOKENS = 40
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.geometry = CacheGeometry(
+            num_layers=self.LAYERS,
+            num_kv_heads=self.KV_HEADS,
+            head_size=self.HEAD_SIZE,
+            block_size=BLOCK_SIZE,
+            max_seq_len=4 * BLOCK_SIZE,
+        )
+        shape = LayerShape(self.HEADS, self.KV_HEADS, self.HEAD_SIZE, self.HEAD_SIZE**-0.5)
+        self.backend = build_backend("turboquant_reference", self.geometry, shape, CPU, torch.float16)
+        self.key = torch.randn(self.TOKENS, self.KV_HEADS, self.HEAD_SIZE)
+        self.value = torch.randn(self.TOKENS, self.KV_HEADS, self.HEAD_SIZE)
+        for layer in range(self.LAYERS):
+            self.backend.write_kv(layer, self.key, self.value, self.backend.cache.slot_mapping(0, self.TOKENS))
+        self.runner = self._runner()
+
+    def _runner(self):
+        """A stand-in with the attributes the dump reads, and no checkpoint behind it."""
+        shape = ModelShape(
+            num_layers=self.LAYERS,
+            num_heads=self.HEADS,
+            num_kv_heads=self.KV_HEADS,
+            head_size=self.HEAD_SIZE,
+            hidden_size=512,
+            intermediate_size=1024,
+            vocab_size=320,
+            rms_norm_eps=1e-6,
+            rope_theta=1.0e6,
+            tie_word_embeddings=False,
+            attn_output_gate=False,
+        )
+        config = types.SimpleNamespace(
+            backend="turboquant_reference", prefill_mode="dense_staging", dtype=torch.float16
+        )
+        return types.SimpleNamespace(decode_backend=self.backend, geometry=self.geometry, shape=shape, config=config)
+
+    def _dump(self, **overrides):
+        settings = {
+            "model_path": "F:/AI/models/Qwen2.5-3B-Instruct",
+            "family": "Qwen2.5",
+            "cached_tokens": self.TOKENS,
+            "context_tokens": self.TOKENS - 8,
+            "prompt": "where is the passcode?",
+            "needle": {"depth": 0.5, "city": "Valencia", "answer": "894772", "retrieved": True, "clean": True},
+            **overrides,
+        }
+        return dump_quantised_cache(self.runner, self.root / "run", **settings)
+
+    def _blob(self):
+        return torch.load(self._dump().directory / "kv_cache_tensors.pt", map_location="cpu", weights_only=True)
+
+    def test_all_three_files_are_written(self):
+        report = self._dump()
+        for name in ("kv_cache_tensors.pt", "metadata.json", "README.md"):
+            with self.subTest(file=name):
+                self.assertTrue((report.directory / name).is_file())
+        self.assertGreater(report.bytes_written, 0)
+        self.assertIn("kv dump", report.describe())
+
+    def test_it_loads_on_a_cpu_with_weights_only(self):
+        """The consumer has torch and nothing else -- no custom class may be in the pickle."""
+        blob = self._blob()
+        self.assertIsInstance(blob, dict)
+        for key in ("key_planes", "value_planes", "scale_planes", "centroids", "pi", "context_lens"):
+            with self.subTest(key=key):
+                self.assertIsInstance(blob[key], torch.Tensor)
+                self.assertEqual(blob[key].device.type, "cpu")
+
+    def test_the_planes_are_layer_major_and_trimmed_to_the_context(self):
+        blob = self._blob()
+        blocks = -(-self.TOKENS // BLOCK_SIZE)
+        packed = (self.LAYERS, blocks, BLOCK_SIZE, self.KV_HEADS, self.HEAD_SIZE // 2)
+        self.assertEqual(tuple(blob["key_planes"].shape), packed)
+        self.assertEqual(tuple(blob["value_planes"].shape), packed)
+        self.assertEqual(
+            tuple(blob["scale_planes"].shape), (self.LAYERS, blocks, BLOCK_SIZE, self.geometry.scale_slot)
+        )
+        # The pool is four blocks; only the one the context reached was written out.
+        self.assertLess(blocks, self.geometry.num_blocks)
+
+    def test_the_dumped_tensors_are_copies_the_run_cannot_move(self):
+        """Cloned and detached: a later decode must not rewrite what was handed over."""
+        blob = self._blob()
+        before = blob["key_planes"][0].clone()
+        self.backend.write_kv(
+            0, torch.randn_like(self.key), self.value, self.backend.cache.slot_mapping(0, self.TOKENS)
+        )
+        self.assertTrue(torch.equal(blob["key_planes"][0], before))
+
+    def test_the_codec_and_the_rotation_travel_with_it(self):
+        """Without these the codes are unreadable, and nothing about the shapes says so."""
+        blob = self._blob()
+        self.assertEqual(tuple(blob["centroids"].shape), (16,))
+        self.assertEqual(tuple(blob["thresholds"].shape), (15,))
+        self.assertEqual(tuple(blob["pi"].shape), (self.HEAD_SIZE, self.HEAD_SIZE))
+        # Pi is its own inverse, which is what makes one matmul enough.
+        identity = torch.eye(self.HEAD_SIZE, dtype=blob["pi"].dtype)
+        torch.testing.assert_close(blob["pi"] @ blob["pi"], identity, rtol=1e-5, atol=1e-5)
+
+    def test_the_readme_recipe_actually_reconstructs_k_and_v(self):
+        """The guide is executed here, on this cache, against the tensors that were written.
+
+        The reason this exists rather than a proofread: every way of getting the
+        reconstruction wrong -- skipping Pi, reading the high nibble first,
+        taking the V scales for the K ones -- produces a tensor of exactly the
+        right shape and dtype full of plausible numbers. A consumer following a
+        stale README would get -0.005 and no error, so the README's own steps are
+        held to the cache they describe.
+        """
+        blob = self._blob()
+        centroids, pi = blob["centroids"], blob["pi"]
+        tokens = int(blob["context_lens"][0])
+        kv_heads, head_dim = self.KV_HEADS, self.HEAD_SIZE
+
+        def rebuild(planes, scales, layer):
+            packed = planes[layer].reshape(-1, kv_heads, head_dim // 2)[:tokens]
+            byte = packed.to(torch.int64) + 128
+            codes = torch.stack((byte % 16, byte // 16), dim=-1).flatten(-2)
+            return (centroids[codes] * scales.unsqueeze(-1)) @ pi
+
+        flat = blob["scale_planes"].reshape(self.LAYERS, -1, blob["scale_planes"].shape[-1])
+        key_hat = rebuild(blob["key_planes"], flat[0, :tokens, :kv_heads], 0)
+        value_hat = rebuild(blob["value_planes"], flat[0, :tokens, kv_heads : 2 * kv_heads], 0)
+
+        # 4 bits, so ~0.995 -- close, and not the 1.0 an unquantised copy would give.
+        self.assertGreater(_cosine_of(key_hat, self.key), 0.99)
+        self.assertGreater(_cosine_of(value_hat, self.value), 0.99)
+        self.assertLess(_cosine_of(key_hat, self.key), 0.9999)
+
+    def test_skipping_the_rotation_is_silent_and_wrong(self):
+        """The number the README quotes, measured rather than asserted in prose."""
+        blob = self._blob()
+        tokens = int(blob["context_lens"][0])
+        packed = blob["key_planes"][0].reshape(-1, self.KV_HEADS, self.HEAD_SIZE // 2)[:tokens]
+        byte = packed.to(torch.int64) + 128
+        codes = torch.stack((byte % 16, byte // 16), dim=-1).flatten(-2)
+        scales = blob["scale_planes"].reshape(self.LAYERS, -1, blob["scale_planes"].shape[-1])
+        rotated = blob["centroids"][codes] * scales[0, :tokens, : self.KV_HEADS].unsqueeze(-1)
+        self.assertLess(abs(_cosine_of(rotated, self.key)), 0.05)
+
+    def test_the_metadata_carries_the_model_the_run_and_the_needle(self):
+        report = self._dump()
+        metadata = json.loads((report.directory / "metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["model_name"], "Qwen2.5-3B-Instruct")
+        self.assertEqual(metadata["model_family"], "Qwen2.5")
+        self.assertEqual(metadata["num_layers"], self.LAYERS)
+        self.assertEqual(metadata["num_kv_heads"], self.KV_HEADS)
+        self.assertEqual(metadata["head_dim"], self.HEAD_SIZE)
+        self.assertEqual(metadata["num_attention_heads"], self.HEADS)
+        self.assertEqual(metadata["backend"], "turboquant_reference")
+        self.assertEqual(metadata["block_size"], BLOCK_SIZE)
+        self.assertEqual(metadata["allocated_blocks"], self.geometry.num_blocks)
+        self.assertTrue(metadata["niah"]["retrieved"])
+        self.assertEqual(metadata["niah"]["depth"], 0.5)
+        self.assertIn("passcode", metadata["prompt"])
+
+    def test_the_prompt_length_and_the_cache_length_are_both_recorded(self):
+        """They differ by what the run generated, and reading one for the other misleads."""
+        metadata = json.loads((self._dump().directory / "metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(metadata["cached_tokens"], self.TOKENS)
+        self.assertEqual(metadata["context_tokens"], self.TOKENS - 8)
+
+    def test_the_readme_describes_this_dump_rather_than_some_other(self):
+        readme = (self._dump().directory / "README.md").read_text(encoding="utf-8")
+        self.assertIn("Qwen2.5-3B-Instruct", readme)
+        self.assertIn("weights_only=True", readme)
+        for key in ("key_planes", "value_planes", "scale_planes", "centroids", "pi"):
+            with self.subTest(key=key):
+                self.assertIn(f"`{key}`", readme)
+        # The shapes in the table are this cache's.
+        blocks = -(-self.TOKENS // BLOCK_SIZE)
+        self.assertIn(str((self.LAYERS, blocks, BLOCK_SIZE, self.KV_HEADS, self.HEAD_SIZE // 2)), readme)
+
+    def test_a_dense_cache_is_refused_by_the_collector_too(self):
+        """Belt and braces on the CLI's own check, for a caller that skipped it."""
+        shape = LayerShape(self.HEADS, self.KV_HEADS, self.HEAD_SIZE, self.HEAD_SIZE**-0.5)
+        self.runner.decode_backend = build_backend("dense_reference", self.geometry, shape, CPU, torch.float16)
+        with self.assertRaisesRegex(TypeError, "no quantised cache"):
+            self._dump()
+
+    def test_every_tensor_has_a_line_in_the_readme_table(self):
+        """A tensor added to the dump without a description would ship unexplained."""
+        self.assertEqual(sorted(collect_tensors(self.runner, self.TOKENS)), sorted(kv_dump._PURPOSE))
+
+
+def _cosine_of(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    left, right = actual.flatten().double(), expected.flatten().double()
+    return float(torch.dot(left, right) / (left.norm() * right.norm()))
 
 
 class TestModelPathNormalisation(unittest.TestCase):

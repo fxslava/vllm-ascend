@@ -281,10 +281,77 @@ kernel at a time — the honest thing to compare against, not a different model.
 `on` refuses a run that cannot capture, which is what a benchmark wants: a quiet
 fallback reporting 26 ms a token reads as slow kernels.
 
+### On an NPU
+
+The step above is written once and takes CANN's own kernels where they exist.
+None of this has run on silicon from here — there is no NPU on the host these
+numbers were measured on — so each piece is arranged to fail loudly or fall back
+rather than to be trusted.
+
+**The operators.** `RMSNorm` calls `torch_npu.npu_rms_norm(x, weight,
+epsilon=...)` and unpacks the `(normed, rstd)` it returns; `MLP` calls
+`torch_npu.npu_swiglu(fused)`, which halves the trailing axis itself and
+computes `silu(first) * second` — exactly what `gate_up_proj` lays out, and what
+`vllm_ascend/ops/activation.py` relies on. Both are resolved once, by
+`npu_operator`, when the module is built: the decode reaches them a hundred-odd
+times a token, and a branch resolved inside a captured region would be recorded
+rather than taken. `torch_npu` is never imported to answer — it is looked up in
+`sys.modules`, where `resolve_device` put it before torch could parse an `npu`
+device at all.
+
+**What a replay must not do.** The audit that mattered for CUDA covers the NPU
+paths too, because they share `layers.py` and the `window`. What is left in the
+TurboQuant decode is all cached rather than allocated: the rotated-query buffer
+and the operator workspace grow on first use and are sized by the 3 warmup
+passes before anything is recorded, `context_lens` is already the int32 the
+kernel wants, and at one token the query view into the fused projection is
+contiguous, so `query.contiguous()` copies nothing. The one allocation left was
+`block_table(window).expand(n, -1).contiguous()` — once per layer per step, for a
+tensor that depends on nothing but the window — and it is now
+`AttentionBackend._block_tables`, keyed on `(tokens, window)` so a captured graph
+and the steps after it share one address.
+
+**The memory pool.** Every window's graph shares one pool, and that is safe here
+for a reason worth stating rather than assuming: a shared pool lets a later
+graph's allocations land on an earlier graph's, so it is sound only when nothing
+an earlier replay left in the pool has to survive. Nothing does — the workspace
+and both KV pools are allocated in the runner's constructor, outside any pool,
+and what is inside is per-step temporaries that are dead when the step ends.
+`test_replaying_two_windows_in_turn_keeps_both_correct` is that claim as a test:
+capture the small window, capture the large one over the same pool, then replay
+the small one again and require the tokens it produced the first time.
+
+**`--weight-nz`.** `npu_format_cast(w, 29)` puts a weight in the Cube's fractal
+NZ tiling. `auto` does what `vllm_ascend`'s own `_should_trans_nz` does, which is
+not what "native is faster" would suggest: never for float32, always on a 310P,
+and for float16 or bfloat16 anywhere else **only at `weight_nz_mode == 2`** —
+which the shipped default (`VLLM_ASCEND_ENABLE_NZ=1`, "quantised weights only")
+is not. So on a 910 or a 950 the plugin leaves dense half-precision weights in
+ND and `auto` does too; `--weight-nz on` is how to ask for the cast and measure
+it. Following the vendor here is deliberate: without an NPU to measure on,
+copying a considered default beats guessing.
+
+The cast is **checked**. The fused projections of every layer are cast (not
+`o_proj`, which carries a fold performed on its ND values), and the first one's
+product against a probe vector is compared with the product it formed a moment
+earlier in ND. A tiling the matmul reads wrongly does not raise on its own — it
+returns numbers, and a model whose first projection is transposed is fluent
+nonsense — so a cosine below `NZ_PROBE_MIN_COSINE` fails the load and names
+`--weight-nz off` as the way past it. `torch_npu.get_npu_format` confirms the
+bytes actually moved, so "cast" does not just mean the call returned.
+
+**What `auto` does when the device disagrees.** `decode_graph='auto'` survives a
+capture that fails mid-record: the step it was for is retried eagerly, the run
+finishes, and the reason goes on the record instead of showing up as slow
+kernels. `on` lets it through, because a benchmark that asked for a graph and
+quietly did not get one reports the wrong number. That fallback exists for
+exactly the case no machine here can produce — an NPU whose `NPUGraph` will not
+record this step.
+
 ### What it measured
 
-Qwen2.5-3B-Instruct, fp16, `cann_dense`, 256-token prompt, 60 decode steps,
-RTX 5070 (12 GB, ~505 GiB/s measured):
+On CUDA, where it could be measured. Qwen2.5-3B-Instruct, fp16, `cann_dense`,
+256-token prompt, 60 decode steps, RTX 5070 (12 GB, ~505 GiB/s measured):
 
 | | p50 | p90 | p99 | tok/s |
 | --- | --- | --- | --- | --- |
@@ -315,6 +382,51 @@ for bit on the one-token rows a decode norms; over a 2048-token prefill chunk
 they differ on about one element in forty thousand by a single float16 ulp,
 which is a summation order rounding differently rather than a different
 definition, and changed no token on anything measured here.
+
+## Dumping the cache (`--dump-kv-dir`)
+
+```bash
+python tools/tq_longbench/smoke_glm.py --model-path "F:/AI/models/Qwen2.5-3B-Instruct" --device cuda --backend turboquant_reference --tokens 4096 --dump-kv-dir "F:/AI/kvcache"
+```
+
+Writes `DIR/<model>_<backend>_<tokens>_<timestamp>/` after the first needle
+depth, holding `kv_cache_tensors.pt`, `metadata.json` and a generated
+`README.md`. It is for someone analysing the quantised representation offline,
+in plain torch, with no `vllm_ascend`, no `torch_npu` and no kernels — so the
+dump carries the codec and the rotation, not just the planes.
+
+The cache is trimmed to the blocks the context reached (whole blocks, so the
+paging still means what it says) and every tensor is cloned, detached and moved
+to the CPU, so a later decode cannot rewrite what was handed over. `metadata.json`
+records the architecture, the run's parameters, and the needle's depth, prompt
+and whether it was actually retrieved — a cache from a run that lost the needle
+is worth analysing, but analysing it as though the model had found it would be
+reading the wrong thing, and the tensors carry no hint either way.
+
+**Three things about this cache fail silently**, which is why the dump is a
+directory rather than a `.pt` file:
+
+- **It does not hold K.** It holds `Pi @ k`, quantised — the rotation is applied
+  before the codec so the 4-bit levels see a flatter distribution. Reconstructing
+  without undoing it gives the right shape, the right dtype, and a cosine against
+  the true K of **-0.005**. So Pi travels as a `[D, D]` matrix (it is an
+  involution, so one matmul undoes it) rather than as a function the consumer
+  cannot call.
+- **Two codes per byte, low nibble first.** Reading them high-first is also
+  silent: cosine **0.000**.
+- **The scales are not derivable.** `scale_planes[..., :kv_heads]` are K's,
+  `[..., kv_heads:2*kv_heads]` are V's, and the slot is padded to an aligned
+  burst beyond that.
+
+The generated README's reconstruction snippet is *executed* by
+`test_the_readme_recipe_actually_reconstructs_k_and_v`, against a real cache,
+and held to a cosine above 0.99 and below 0.9999 — close because it is correct,
+short of 1.0 because it is 4 bits. A guide nobody runs is a guide that drifts,
+and every way of getting this wrong produces plausible numbers.
+
+`--dump-kv-dir` needs a backend with a quantised pool and `--tokens` above zero;
+both are refused before the checkpoint is read rather than leaving an empty
+directory behind.
 
 ## Scoring the needle
 

@@ -49,6 +49,7 @@ half-width interleaved RoPE is a :class:`RotaryEmbedding` variant.
 from __future__ import annotations
 
 import math
+import sys
 from dataclasses import dataclass
 
 import torch
@@ -286,6 +287,27 @@ class DecodeWorkspace:
 _HAS_FUSED_RMS_NORM = hasattr(torch.nn.functional, "rms_norm")
 
 
+def npu_operator(name: str, device: torch.device):
+    """``torch_npu``'s operator of that name, if this device is an NPU and it has one.
+
+    Resolved once, when the module that will call it is built, for the same
+    reason the norm's ``hasattr`` is: a decode step reaches these on the order of
+    a hundred times, and a lookup that answers the same way every time should not
+    be repeated at that rate. It also keeps the decision out of the captured
+    region, where a branch on a missing attribute would be recorded rather than
+    taken.
+
+    ``torch_npu`` is never imported here. It is looked up in ``sys.modules``,
+    where :func:`tq_longbench.smoke_glm.resolve_device` put it before torch could
+    parse an ``npu`` device at all -- so a run that has an NPU device has already
+    imported it, and a run that has not must not be made to.
+    """
+    if device.type != "npu":
+        return None
+    module = sys.modules.get("torch_npu")
+    return None if module is None else getattr(module, name, None)
+
+
 class RMSNorm(torch.nn.Module):
     """Root-mean-square norm in fp32, cast back to the activation dtype.
 
@@ -293,19 +315,23 @@ class RMSNorm(torch.nn.Module):
     hidden state's variance is summed over thousands of channels, and doing that
     in fp16 loses the low bits of the mean before the reciprocal square root.
 
-    ``torch.nn.functional.rms_norm`` is that same definition as one kernel, and
-    it is the one used where the installed torch has it. The expression below is
-    what it replaced, kept as the fallback and as the statement of what the
-    kernel is supposed to compute -- written out, it is a promote, a square, a
-    mean, an add, a reciprocal square root, two multiplies and a cast, which is
-    eight launches for one norm. A decode step does seventy-two of them, and at a
-    few microseconds of launch each that was the largest non-GEMM cost in the
-    step.
+    Three routes to that one definition, in the order they are tried:
+    ``torch_npu.npu_rms_norm`` on an NPU, which is CANN's own kernel and returns
+    ``(normed, rstd)``; ``torch.nn.functional.rms_norm`` where the installed
+    torch has it; and the expression at the bottom.
 
-    The two agree **bit for bit** on the one-token rows a decode norms. Over a
-    2048-token prefill chunk they differ on about one element in forty thousand,
-    by a single float16 ulp, which is a different summation order rounding
-    differently and not a different definition.
+    That expression is what the other two replaced, kept as the fallback and as
+    the statement of what they are supposed to compute. Written out it is a
+    promote, a square, a mean, an add, a reciprocal square root, two multiplies
+    and a cast -- eight launches for one norm, and a decode step does
+    seventy-two of them, which at a few microseconds of launch each made it the
+    largest non-GEMM cost in the step.
+
+    The torch kernel and the expression agree **bit for bit** on the one-token
+    rows a decode norms. Over a 2048-token prefill chunk they differ on about one
+    element in forty thousand, by a single float16 ulp, which is a different
+    summation order rounding differently and not a different definition. What the
+    CANN kernel agrees with has not been measured here, for want of an NPU.
     """
 
     def __init__(self, hidden_size: int, eps: float, dtype: torch.dtype, device: torch.device) -> None:
@@ -313,8 +339,14 @@ class RMSNorm(torch.nn.Module):
         self.weight = torch.nn.Parameter(torch.ones(hidden_size, dtype=dtype, device=device))
         self.eps = eps
         self.normalized_shape = (hidden_size,)
+        self._npu_rms_norm = npu_operator("npu_rms_norm", device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._npu_rms_norm is not None:
+            # ``(normed, rstd)``. The reciprocal standard deviation is the
+            # backward's, and nothing here has a backward -- but the operator
+            # returns it either way, so the unpack is not optional.
+            return self._npu_rms_norm(x, self.weight, epsilon=self.eps)[0]
         if _HAS_FUSED_RMS_NORM:
             return torch.nn.functional.rms_norm(x, self.normalized_shape, self.weight, self.eps)
         promoted = x.to(torch.float32)
@@ -559,6 +591,11 @@ class MLP(torch.nn.Module):
         super().__init__()
         kwargs = {"bias": False, "dtype": dtype, "device": device}
         self.intermediate_size = shape.intermediate_size
+        # CANN's SwiGLU: it halves the trailing axis itself and computes
+        # ``silu(first) * second``, which is the layout gate_up_proj produces and
+        # the one every checkpoint that fuses the two writes. Three launches
+        # become one, and the split stops being a tensor operation at all.
+        self._npu_swiglu = npu_operator("npu_swiglu", device)
         # Gate and up read the same input and are the same shape, so they are one
         # GEMM whose output is read as two halves. This is also the layout the
         # checkpoints that fuse them already use -- chatglm's ``dense_h_to_4h``
@@ -568,11 +605,15 @@ class MLP(torch.nn.Module):
 
     def forward(self, x: torch.Tensor, workspace: DecodeWorkspace | None = None) -> torch.Tensor:
         if workspace is None:
-            gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
-            return self.down_proj(torch.nn.functional.silu(gate) * up)
-        fused = workspace.gate_up
-        torch.mm(x, self.gate_up_proj.weight.t(), out=fused)
+            fused = self.gate_up_proj(x)
+        else:
+            fused = workspace.gate_up
+            torch.mm(x, self.gate_up_proj.weight.t(), out=fused)
+        if self._npu_swiglu is not None:
+            return self.down_proj(self._npu_swiglu(fused))
         gate, up = fused.split((self.intermediate_size, self.intermediate_size), dim=-1)
+        if workspace is None:
+            return self.down_proj(torch.nn.functional.silu(gate) * up)
         # silu writes back over the gate half and the product over it again, so
         # the activation costs no allocation at all; ``up`` is read, never written.
         return self.down_proj(torch.nn.functional.silu(gate, inplace=True).mul_(up))

@@ -102,6 +102,94 @@ class FoldReport:
         return f"{self.folded} o_proj folded on the {self.site} in {self.seconds:.2f} s"
 
 
+#: ``npu_format_cast``'s ACL_FORMAT_FRACTAL_NZ -- the Cube's own tiling, as
+#: ``vllm_ascend/utils.py`` numbers it. A weight already in it needs no layout
+#: conversion on the way into the Cube.
+ACL_FORMAT_FRACTAL_NZ = 29
+
+#: The SoC versions ``torch_npu.npu.get_soc_version()`` reports for a 310P, as
+#: ``vllm_ascend``'s ``check_ascend_device_type`` reads them.
+SOC_VERSIONS_310P = range(200, 206)
+
+#: ``RunnerConfig.weight_nz``. ``auto`` is the plugin's own policy, below.
+WEIGHT_NZ_MODES = ("auto", "on", "off")
+
+#: A cast that reorders a weight's bytes must not change the product it forms.
+#: Held to a cosine rather than an exact match because the Cube may accumulate a
+#: reordered sum differently; anything that is actually the wrong layout lands
+#: nowhere near this.
+NZ_PROBE_MIN_COSINE = 0.9999
+
+
+@dataclass(frozen=True)
+class WeightLayoutReport:
+    """Whether the fused projections were cast to FRACTAL_NZ, and why not if not."""
+
+    cast: int
+    seconds: float
+    reason: str = ""
+    #: What ``torch_npu.get_npu_format`` said about the first weight afterwards,
+    #: so "cast" means the bytes moved rather than that the call returned.
+    confirmed_format: int | None = None
+    #: The probe product's agreement with the same product before the cast.
+    cosine: float | None = None
+
+    def describe(self) -> str:
+        if not self.cast:
+            return f"weights in ND: {self.reason}"
+        confirmed = "" if self.confirmed_format is None else f", format {self.confirmed_format}"
+        agreement = "" if self.cosine is None else f", probe cos {self.cosine:.6f}"
+        return f"{self.cast} fused projections cast to FRACTAL_NZ in {self.seconds:.2f} s{confirmed}{agreement}"
+
+
+def should_cast_to_nz(mode: str, dtype: torch.dtype, device: torch.device) -> tuple[bool, str]:
+    """Whether to put a fused projection in FRACTAL_NZ, and the reason either way.
+
+    ``auto`` is ``vllm_ascend``'s own policy for a weight of this dtype, which is
+    worth following rather than improving on:
+
+    * float32 never converts -- NZ has no float32 tiling.
+    * A 310P always converts; its Cube reads nothing else well.
+    * Anywhere else, ``_should_trans_nz`` converts a float16 or bfloat16 weight
+      only at ``weight_nz_mode == 2``, and the shipped default
+      (``VLLM_ASCEND_ENABLE_NZ=1``) is "quantised weights only". So on a 910/950
+      the plugin leaves dense fp16 weights in ND, and ``auto`` does too.
+
+    ``on`` is that opt-in: it casts wherever the operator exists, which is the
+    thing to measure on silicon before making it the default here. Being unable
+    to measure it is exactly why ``auto`` defers to the plugin instead of
+    guessing that NZ must be faster because it is more native.
+    """
+    if mode == "off":
+        return False, "weight_nz='off'"
+    if device.type != "npu":
+        return False, f"{device.type} has no fractal layout"
+    if dtype == torch.float32:
+        return False, "float32 has no NZ tiling"
+    if mode == "on":
+        return True, "weight_nz='on'"
+    soc = _soc_version()
+    if soc is None:
+        return False, "torch_npu does not report a SoC version, so the 310P rule cannot be applied"
+    if soc in SOC_VERSIONS_310P:
+        return True, f"SoC {soc} is a 310P, which always converts"
+    return False, (
+        f"SoC {soc} is not a 310P and the dtype is {dtype}; vllm_ascend converts these only at "
+        "weight_nz_mode 2, so --weight-nz on is how to ask for it"
+    )
+
+
+def _soc_version() -> int | None:
+    npu = getattr(sys.modules.get("torch_npu"), "npu", None)
+    reader = getattr(npu, "get_soc_version", None)
+    if reader is None:
+        return None
+    try:
+        return int(reader())
+    except Exception:  # a torch_npu that cannot answer has answered
+        return None
+
+
 @dataclass
 class RunnerConfig:
     model_path: str
@@ -139,10 +227,16 @@ class RunnerConfig:
     #: error rather than a slow success, which is what a benchmark wants; ``off``
     #: is the eager path, and the one to compare against.
     decode_graph: str = "auto"
+    #: Whether the fused projections are cast to Ascend's fractal NZ layout
+    #: (``WEIGHT_NZ_MODES``). ``auto`` follows vllm_ascend's own policy for the
+    #: dtype and SoC; see :func:`should_cast_to_nz`.
+    weight_nz: str = "auto"
 
     def __post_init__(self) -> None:
         if self.decode_graph not in DECODE_GRAPH_MODES:
             raise ValueError(f"unknown decode_graph {self.decode_graph!r}; choose one of {list(DECODE_GRAPH_MODES)}")
+        if self.weight_nz not in WEIGHT_NZ_MODES:
+            raise ValueError(f"unknown weight_nz {self.weight_nz!r}; choose one of {list(WEIGHT_NZ_MODES)}")
         if self.prefill_mode not in PREFILL_MODES:
             raise ValueError(f"unknown prefill mode {self.prefill_mode!r}; choose one of {list(PREFILL_MODES)}")
         if self.backend in DENSE_BACKENDS and self.prefill_mode != "dense_staging":
@@ -372,11 +466,20 @@ class StaticDecodeGraph:
     def _capture_context(self, graph):
         """The vendor's capture context, sharing one memory pool across the windows.
 
-        The graphs are replayed one at a time and never overlap, so one pool
-        means the largest window's intermediates are the whole cost rather than
-        the sum of every window's. A capture API that does not take a pool is
-        used without one -- a bigger footprint, not a wrong answer -- because
-        refusing to capture over it would be the worse trade.
+        Sharing is safe here, and it is worth saying why rather than assuming it:
+        a shared pool lets a later graph's allocations land on an earlier
+        graph's, so it is only sound when nothing an earlier replay wrote into
+        the pool has to survive. Nothing does. Everything that crosses a step
+        boundary -- the workspace buffers and both KV pools -- was allocated in
+        the runner's constructor, long before any capture, so it is outside the
+        pool entirely. What is inside is the per-step temporaries: the gather of
+        ``cos``/``sin``, the softmax scratch, each projection's output. All of
+        them are dead by the time the step ends, whichever window ran it.
+
+        So one pool costs the largest window's intermediates rather than the sum
+        of every window's. A capture API that does not take a pool is used
+        without one -- a bigger footprint, not a wrong answer -- because refusing
+        to capture over it would be the worse trade.
         """
         if self._pool is None:
             return self._capture(graph)
@@ -560,11 +663,64 @@ class StandaloneModelRunner:
         elif config.fold_output_rotation:
             fold_output_rotation(self.model)
 
+        #: Whether the fused projections ended up in FRACTAL_NZ, and why not.
+        #: Before the workspace and the graph: a capture records the matmuls the
+        #: weights are in *now*, so the layout has to be settled first.
+        self.layout_report = self._cast_fused_projections()
+
         #: The single-token decode's buffers, and the graph recorded over them.
         #: Both are built here rather than on the first step, so what a run costs
         #: to set up is paid before anything is timed.
         self.workspace = DecodeWorkspace.build(self.shape, config.dtype, self.device)
         self.decode_graph, self.decode_graph_refusal = self._build_decode_graph()
+
+    def _cast_fused_projections(self) -> WeightLayoutReport:
+        """Put ``qkv_proj`` and ``gate_up_proj`` in the Cube's own tiling, where that is the policy.
+
+        The two fused projections and not ``o_proj`` or ``down_proj``: those are
+        the ones a decode step reads twice a layer, and ``o_proj`` has Pi folded
+        into it, which is arithmetic on the ND values that must happen first.
+
+        The cast is **checked**, on the first weight, against the product the ND
+        weight formed a moment earlier. A layout the operator reorders wrongly --
+        or one a later matmul silently converts back -- does not raise: it
+        returns numbers, and a model whose first projection is transposed is
+        fluent nonsense. Checking costs one matmul per run and is the only way to
+        learn the answer without an NPU to try it on.
+        """
+        wanted, reason = should_cast_to_nz(self.config.weight_nz, self.config.dtype, self.device)
+        if not wanted:
+            return WeightLayoutReport(0, 0.0, reason)
+        torch_npu = sys.modules.get("torch_npu")
+        cast = getattr(torch_npu, "npu_format_cast", None)
+        if cast is None:
+            if self.config.weight_nz == "on":
+                raise RuntimeError("weight_nz='on' but this torch_npu has no npu_format_cast")
+            return WeightLayoutReport(0, 0.0, "this torch_npu has no npu_format_cast")
+
+        weights = [
+            weight
+            for layer in self.model.layers
+            for weight in (layer.self_attn.qkv_proj.weight, layer.mlp.gate_up_proj.weight)
+        ]
+        probe = torch.randn(1, self.shape.hidden_size, dtype=self.config.dtype, device=self.device)
+        before = torch.mm(probe, weights[0].t()).to(torch.float32)
+
+        started = time.perf_counter()
+        for weight in weights:
+            weight.data = cast(weight.data, ACL_FORMAT_FRACTAL_NZ)
+        seconds = time.perf_counter() - started
+
+        cosine = _cosine(torch.mm(probe, weights[0].t()).to(torch.float32), before)
+        reader = getattr(torch_npu, "get_npu_format", None)
+        confirmed = None if reader is None else int(reader(weights[0].data))
+        if cosine <= NZ_PROBE_MIN_COSINE:
+            raise RuntimeError(
+                f"the FRACTAL_NZ cast changed what the first fused projection computes: cosine {cosine:.6f} "
+                f"against the same product in ND, floor {NZ_PROBE_MIN_COSINE}. The weights are reordered but "
+                "the matmul is not reading them that way; run with --weight-nz off."
+            )
+        return WeightLayoutReport(len(weights), seconds, reason, confirmed, cosine)
 
     def _build_decode_graph(self) -> tuple[StaticDecodeGraph | None, str | None]:
         """The decode graph, or ``None`` and the reason there is not one.
@@ -916,6 +1072,12 @@ _ATTENTION_SUFFIXES = {
     "q_norm.weight",
     "k_norm.weight",
 }
+
+
+def _cosine(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    left = actual.detach().to("cpu", torch.float64).flatten()
+    right = expected.detach().to("cpu", torch.float64).flatten()
+    return float(torch.dot(left, right) / (left.norm() * right.norm()).clamp_min(1e-30))
 
 
 def checkpoint_tensor_names(model_path: str | Path) -> list[str]:

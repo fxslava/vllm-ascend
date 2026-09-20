@@ -35,6 +35,7 @@ __all__ = [
     "glm4",
     "hf_bridge",
     "kv_cache",
+    "kv_dump",
     "layers",
     "ops",
     "preflight",

@@ -148,6 +148,8 @@ class AttentionBackend(abc.ABC):
         self.geometry = geometry
         self.shape = shape
         self.device = device
+        #: ``(num_tokens, window) -> block table``; see :meth:`_block_tables`.
+        self._expanded_block_tables: dict[tuple[int, int], torch.Tensor] = {}
 
     def _into_folded_basis(self, out: torch.Tensor) -> torch.Tensor:
         """Rotate an unquantised attention output by Pi when the projection expects that.
@@ -216,6 +218,25 @@ class AttentionBackend(abc.ABC):
             raise ValueError(f"a {count}-token chunk cannot end at prefix {prefix_end}")
         context_lens = torch.arange(first + 1, prefix_end + 1, dtype=torch.int32, device=query.device)
         return self.decode(layer, query, context_lens, out, gate, window=prefix_end)
+
+    def _block_tables(self, num_tokens: int, window: int) -> torch.Tensor:
+        """``[num_tokens, blocks]`` for this window, built once per shape it is asked for.
+
+        ``block_table(window).expand(n, -1).contiguous()`` is a fresh allocation
+        and a copy every time it is called -- once per layer per step, for a
+        tensor whose contents depend on nothing but the two numbers here. Cached,
+        it is neither, and under graph capture it is an address the replay
+        already holds rather than a pointer into the graph's pool.
+
+        Keyed on the window rather than on the context length, so a captured
+        graph and the steps that follow it share one entry.
+        """
+        key = (num_tokens, window)
+        table = self._expanded_block_tables.get(key)
+        if table is None:
+            table = self.cache.block_table(window).expand(num_tokens, -1).contiguous()
+            self._expanded_block_tables[key] = table
+        return table
 
     def check_tie_point(self, context_lens: torch.Tensor, expected_prefix: int) -> None:
         """Refuse a decode whose kv length disagrees with the prefix actually written.
@@ -397,8 +418,7 @@ class NativeV5Backend(_DensePagedBackend):
             )
         num_tokens = query.shape[0]
         key, value = self.cache.flat(layer)
-        block_table = self.cache.block_table(window if window is not None else longest_context(context_lens))
-        block_tables = block_table.expand(num_tokens, -1).contiguous()
+        block_tables = self._block_tables(num_tokens, window if window is not None else longest_context(context_lens))
         query_lens = list(range(1, num_tokens + 1))
         if self.attention_api == "fia_v5":
             attn_output, _ = _torch_npu().npu_fused_infer_attention_score_v2(
@@ -799,8 +819,7 @@ class TurboQuantCubeBackend(_TurboQuantBackend):
     ) -> torch.Tensor:
         num_tokens = query.shape[0]
         key_plane, value_plane, scale_plane = self.cache.planes(layer)
-        block_table = self.cache.block_table(window if window is not None else longest_context(context_lens))
-        block_tables = block_table.expand(num_tokens, -1).contiguous()
+        block_tables = self._block_tables(num_tokens, window if window is not None else longest_context(context_lens))
         ascend_ops().npu_turboquant_cube_decode(
             query.contiguous(),
             None if gate is None else gate.contiguous(),
@@ -870,8 +889,7 @@ class TurboQuantAivBackend(_TurboQuantBackend):
         rotated = self._rotated_query_buffer(num_tokens)
         ops.npu_turboquant_rotate_q(query.contiguous(), self._pi_signs, self._write_tables, self._hadamard16, rotated)
         key_plane, value_plane, scale_plane = self.cache.planes(layer)
-        block_table = self.cache.block_table(window if window is not None else longest_context(context_lens))
-        block_tables = block_table.expand(num_tokens, -1).contiguous()
+        block_tables = self._block_tables(num_tokens, window if window is not None else longest_context(context_lens))
         ops.npu_turboquant_paged_attention(
             rotated,
             key_plane,
