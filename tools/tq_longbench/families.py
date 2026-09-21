@@ -56,6 +56,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import Union
 
 import torch
 
@@ -74,7 +75,10 @@ class TurnBody:
 BODY = TurnBody()
 
 #: What a turn is made of: a special token's name, a literal string, or :data:`BODY`.
-TurnPart = str | TurnBody
+#: Spelled with :data:`~typing.Union` rather than ``|``: this is an assignment, not an
+#: annotation, so ``from __future__ import annotations`` does not defer it and the
+#: target runtime evaluates it at import. PEP 604 needs 3.10; the NPU image ships 3.9.
+TurnPart = Union[str, TurnBody]
 
 #: Where ``dense_staging`` stops being affordable, for a family whose KV footprint
 #: per token is known. GLM-4's own threshold

@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import shlex
 from collections.abc import Mapping, Sequence
-from typing import Any, cast
+from typing import Any, Optional, Union, cast
 
 import regex as re
 
 from tools.docs_codegen.errors import make_docs_codegen_error
 
-ScalarValue = str | int | float | bool | None
+# An assignment, not an annotation: `from __future__ import annotations` does
+# not defer it, so PEP 604 here would need 3.10. tests/ut/_tools imports this
+# module, and that suite has to load on the Ascend image's 3.9.
+ScalarValue = Optional[Union[str, int, float, bool]]
 
 # Braced ``${VAR}`` template variables, mirroring runtime.py:TEMPLATE_VAR_RE.
 TEMPLATE_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")

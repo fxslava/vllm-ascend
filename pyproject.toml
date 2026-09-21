@@ -48,6 +48,10 @@ plugins.md024.allow_different_nesting = true # no-duplicate-headers
 plugins.md029.enabled = false # ol-prefix
 
 [tool.ruff]
+# The Ascend NPU runtime image ships Python 3.9 (/usr/local/lib/python3.9). Pin it
+# here so pyupgrade (UP) never rewrites `Optional[X]`/`Union[A, B]` into PEP 604
+# `X | None` / `A | B`, which 3.9 cannot evaluate at runtime.
+target-version = "py39"
 # TODO: according to PEP8, there should be 120 characters per line
 line-length = 120
 # Folder to be modified

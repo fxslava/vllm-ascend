@@ -26,6 +26,8 @@ Nothing is imported eagerly here: the submodules reach ``torch_npu``,
 only needs the metrics should not need a device runtime.
 """
 
+from __future__ import annotations
+
 __all__ = [
     "build_turboquant_ops",
     "cpu_reference",

@@ -13,6 +13,8 @@
 # This file is a part of the vllm-ascend project.
 #
 
+from __future__ import annotations
+
 import importlib.util
 import json
 import sys
