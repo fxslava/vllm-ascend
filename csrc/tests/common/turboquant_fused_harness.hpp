@@ -338,7 +338,8 @@ class FusedCubeScenario {
         static_cast<int32_t>(kFusedMode), AscendType::FP16, stream_, grid.block_dim, key_fp16.get(), value_fp16.get(),
         key_cache_.get(), value_cache_.get(), scale_plane_.get(), slot_mapping.get(), pi_signs_.get(),
         rot_tables_.get(), write_tables.get(), static_cast<uint32_t>(tokens), static_cast<uint32_t>(kv_heads),
-        static_cast<uint32_t>(d), static_cast<uint32_t>(block_size), grid.tokens_per_core,
+        static_cast<uint32_t>(d), static_cast<uint32_t>(block_size),
+        static_cast<uint32_t>(blocks_per_seq_ * shape_.pool_factor), grid.tokens_per_core,
         1.0f / std::sqrt(static_cast<float>(d)));
     ACL_CHECK(aclrtSynchronizeStream(stream_));
     written_key_ = key_cache_.ToHost<int8_t>();

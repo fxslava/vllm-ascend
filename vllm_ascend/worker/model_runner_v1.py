@@ -4404,8 +4404,17 @@ class NPUModelRunner(GPUModelRunner):
                     num_blocks = total_bytes // spec.page_size_bytes
                     assert num_blocks >= kv_cache_config.num_blocks
 
+                    # The cache dtype goes with it: ENABLE_TURBOQUANT is only one of the routes
+                    # into this layout, and --kv-cache-dtype int4_per_token_head is another
+                    # (vllm_ascend.utils.is_turboquant_cache_dtype). Without it the backend
+                    # would report the unpacked shape on the dtype route and the view below
+                    # would fail on a plane sized for the packed one.
                     packed_shape = attn_backend.get_kv_cache_shape(
-                        num_blocks, spec.block_size, spec.num_kv_heads, spec.head_size
+                        num_blocks,
+                        spec.block_size,
+                        spec.num_kv_heads,
+                        spec.head_size,
+                        cache_dtype_str=self.cache_config.cache_dtype,
                     )[1:]
                     scale_shape = (num_blocks, spec.block_size, spec.scale_slot_floats)
                     kv_caches[layer_name] = (

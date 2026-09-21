@@ -204,7 +204,8 @@ class DeviceScenario {
                                       key_cache_.get(), value_cache_.get(), scale_plane_.get(), slots_.get(),
                                       pi_signs_.get(), write_tables_.get(), static_cast<uint32_t>(kContextLen),
                                       static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize),
-                                      static_cast<uint32_t>(kBlockSize), grid.tokens_per_core, kInvSqrtHeadSize);
+                                      static_cast<uint32_t>(kBlockSize), static_cast<uint32_t>(kNumBlocks),
+                                      grid.tokens_per_core, kInvSqrtHeadSize);
     ACL_CHECK(aclrtSynchronizeStream(stream_));
   }
 

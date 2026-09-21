@@ -35,7 +35,7 @@ extern void turboquant_reshape_and_cache_impl(AscendType type, void *stream, uin
                                               void *value, void *keyCache, void *valueCache, void *scaleCache,
                                               void *slotMapping, void *piSigns, void *tables, uint32_t numTokens,
                                               uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,
-                                              uint32_t tokensPerCore, float invSqrtLen);
+                                              uint32_t numBlocks, uint32_t tokensPerCore, float invSqrtLen);
 
 extern void turboquant_paged_attention_impl(AscendType type, void *stream, uint32_t blockDim, void *queryRot,
                                             void *keyCache, void *valueCache, void *scaleCache, void *blockTables,
@@ -56,8 +56,8 @@ extern void turboquant_mm_reshape_and_cache_impl(int32_t mode, AscendType type, 
                                                  void *key, void *value, void *keyCache, void *valueCache,
                                                  void *scaleCache, void *slotMapping, void *piSigns, void *rotTables,
                                                  void *modeTables, uint32_t numTokens, uint32_t numKvHeads,
-                                                 uint32_t headSize, uint32_t blockSize, uint32_t tokensPerCore,
-                                                 float invSqrtLen);
+                                                 uint32_t headSize, uint32_t blockSize, uint32_t numBlocks,
+                                                 uint32_t tokensPerCore, float invSqrtLen);
 
 extern void turboquant_mm_fused_decode_raw_query_impl(
     int32_t mode, AscendType type, void *stream, uint32_t blockDim, void *query, void *piSigns, void *rotTables,
@@ -91,6 +91,20 @@ inline void CheckHeadSize(int64_t headSize)
     TORCH_CHECK((headSize & (headSize - 1)) == 0, "TurboQuant needs a power-of-two head_size for the Walsh-Hadamard "
                                                   "transform, got ",
                 headSize);
+}
+
+// Every global-memory copy the kernels make moves whole 32-byte bursts, so an operand whose address
+// is not a multiple of one starts the copy mid-burst. The AI core reports that as "the address for
+// scalar to access GM is invalid" (error 264) from inside the launch, naming nothing; caught here it
+// names the tensor. A contiguity check does not cover it: a contiguous view keeps its storage offset,
+// so `.contiguous()` can hand the operator an address part-way through a burst.
+constexpr size_t kGmBurstBytes = tq::kFp32PerBlock * sizeof(float);
+
+inline void CheckGmBurstAligned(const at::Tensor &tensor, const char *name)
+{
+    const auto address = reinterpret_cast<uintptr_t>(tensor.data_ptr());
+    TORCH_CHECK(address % kGmBurstBytes == 0, name, " starts at ", address, ", which is not a whole ",
+                kGmBurstBytes, "-byte burst; the kernel's global-memory copies would start mid-burst");
 }
 
 inline void CheckCodecTables(const at::Tensor &tables, int64_t headSize, int64_t batchRows)
@@ -144,6 +158,12 @@ inline void npu_turboquant_reshape_and_cache(at::Tensor &key, at::Tensor &value,
     TORCH_CHECK(key.is_contiguous() && value.is_contiguous(), "key/value must be contiguous");
     TORCH_CHECK(key_cache.is_contiguous() && value_cache.is_contiguous() && scale_cache.is_contiguous(),
                 "the kv cache and its scale plane must be contiguous");
+    adpt::CheckGmBurstAligned(key, "key");
+    adpt::CheckGmBurstAligned(value, "value");
+    adpt::CheckGmBurstAligned(key_cache, "key_cache");
+    adpt::CheckGmBurstAligned(value_cache, "value_cache");
+    adpt::CheckGmBurstAligned(scale_cache, "scale_cache");
+    adpt::CheckGmBurstAligned(slot_mapping, "slot_mapping");
 
     const int64_t num_tokens = key.size(0);
     const int64_t num_kv_heads = key.size(1);
@@ -180,7 +200,7 @@ inline void npu_turboquant_reshape_and_cache(at::Tensor &key, at::Tensor &value,
         key_cache.data_ptr(), value_cache.data_ptr(), scale_cache.data_ptr(), slot_mapping.data_ptr(),
         pi_signs.data_ptr(), codec_tables.data_ptr(), static_cast<uint32_t>(num_tokens),
         static_cast<uint32_t>(num_kv_heads), static_cast<uint32_t>(head_size), static_cast<uint32_t>(block_size),
-        grid.tokens_per_core, inv_sqrt_len);
+        static_cast<uint32_t>(num_blocks), grid.tokens_per_core, inv_sqrt_len);
 }
 
 inline void npu_turboquant_rotate_q(at::Tensor &query, at::Tensor &pi_signs, at::Tensor &codec_tables,
@@ -414,6 +434,12 @@ inline void npu_turboquant_cube_reshape_and_cache(at::Tensor &key, at::Tensor &v
     adpt::CheckCubeCache(key_cache, value_cache, scale_cache, num_kv_heads, head_size);
     adpt::CheckRotationTables(pi_signs, codec_tables, head_size);
     TORCH_CHECK(slot_mapping.numel() == num_tokens, "slot_mapping must hold one slot per token");
+    adpt::CheckGmBurstAligned(key, "key");
+    adpt::CheckGmBurstAligned(value, "value");
+    adpt::CheckGmBurstAligned(key_cache, "key_cache");
+    adpt::CheckGmBurstAligned(value_cache, "value_cache");
+    adpt::CheckGmBurstAligned(scale_cache, "scale_cache");
+    adpt::CheckGmBurstAligned(slot_mapping, "slot_mapping");
 
     if (num_tokens == 0) {
         return;
@@ -428,7 +454,8 @@ inline void npu_turboquant_cube_reshape_and_cache(at::Tensor &key, at::Tensor &v
         key_cache.data_ptr(), value_cache.data_ptr(), scale_cache.data_ptr(), slot_mapping.data_ptr(),
         pi_signs.data_ptr(), codec_tables.data_ptr(), codec_tables.data_ptr(), static_cast<uint32_t>(num_tokens),
         static_cast<uint32_t>(num_kv_heads), static_cast<uint32_t>(head_size),
-        static_cast<uint32_t>(key_cache.size(1)), grid.tokens_per_core, inv_sqrt_len);
+        static_cast<uint32_t>(key_cache.size(1)), static_cast<uint32_t>(key_cache.size(0)), grid.tokens_per_core,
+        inv_sqrt_len);
 }
 
 // One decode launch over the raw query. output_stage is a TurboQuantOutputStage: 0 leaves the output rotated

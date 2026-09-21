@@ -96,6 +96,13 @@ from vllm_ascend.attention.utils import notify_kv_cache_written
 
 _WORKSPACE_MEMO_LIMIT = 1024
 
+# Every global-memory copy the writers make -- the staged activations, the two packed
+# planes and the scale plane -- moves whole 32-byte bursts, so an operand whose address
+# is not a multiple of one starts the copy mid-burst. The AI core reports that as "the
+# address for scalar to access GM is invalid" (error 264), not as a misalignment, which
+# is why it is worth naming here rather than reading out of a core dump.
+TURBOQUANT_GM_BURST_BYTES = TURBOQUANT_BURST_FLOATS * 4
+
 
 def turboquant_cube_decode_available() -> bool:
     """Whether this build registered the kv4fp8 Cube kernels (Ascend 950 builds only)."""
@@ -319,6 +326,74 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             )
         self.scale_cache = torch.zeros(shape, dtype=torch.float32, device=kv_cache[0].device)
 
+    def _validate_cache_write(self, key: torch.Tensor, value: torch.Tensor, slots: torch.Tensor) -> None:
+        """Hold one cache write to what the kernels can address, before the launch.
+
+        Off by default: the slot values live on the device, so reading them costs a
+        device-to-host copy and a synchronisation on every layer of every step. Turn it
+        on with ``VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS=1`` when a write faults.
+
+        The writers already drop a slot they cannot address -- a negative one is how
+        vLLM marks a padding token, and one past the last row of the cache is dropped
+        beside it so a caller bug cannot scribble on whatever else owns that address.
+        Dropping is silent, though, and a dropped row means a token whose K/V is simply
+        not in the cache. This is what turns both into something named: an out-of-range
+        slot raises, and a negative one inside the batch's own token range is warned
+        about, since ``slot_mapping`` was already sliced to ``num_actual_tokens``.
+
+        The pointer checks are here rather than in the operator because the operator is
+        handed addresses, not tensors: ``.contiguous()`` returns a contiguous view
+        unchanged, storage offset and all, so an operand can arrive contiguous and still
+        start part-way through a burst.
+        """
+        operands = {
+            "key": key,
+            "value": value,
+            "key_cache": self.key_cache,
+            "value_cache": self.value_cache,
+            "scale_cache": self.scale_cache,
+            "slot_mapping": slots,
+        }
+        detail = ", ".join(
+            f"{name}{tuple(tensor.shape)} {tensor.dtype} stride={tuple(tensor.stride())} @{tensor.data_ptr():#x}"
+            for name, tensor in operands.items()
+        )
+        logger.debug("[vllm-ascend/turboquant] cache write operands: %s", detail)
+
+        for name, tensor in operands.items():
+            if not tensor.is_contiguous():
+                raise RuntimeError(
+                    f"[vllm-ascend/turboquant] {name} reaches the cache writer non-contiguous; the kernel "
+                    f"indexes it as packed global memory. Operands: {detail}"
+                )
+            if tensor.data_ptr() % TURBOQUANT_GM_BURST_BYTES:
+                raise RuntimeError(
+                    f"[vllm-ascend/turboquant] {name} starts at {tensor.data_ptr():#x}, which is not a whole "
+                    f"{TURBOQUANT_GM_BURST_BYTES}-byte burst; the writer's copies would start mid-burst. "
+                    f"Operands: {detail}"
+                )
+
+        if slots.numel() == 0:
+            return
+        # The one place this costs a synchronisation, and the reason it is opt-in.
+        lowest = int(slots.min())
+        highest = int(slots.max())
+        num_slots = self.key_cache.shape[0] * self.key_cache.shape[1]
+        if highest >= num_slots:
+            raise RuntimeError(
+                f"[vllm-ascend/turboquant] slot_mapping holds {highest}, past the last row of a "
+                f"{self.key_cache.shape[0]}-block cache of {self.key_cache.shape[1]}-token blocks "
+                f"({num_slots} rows). The writer drops it rather than writing outside the cache, so "
+                f"those tokens are missing from the cache. Operands: {detail}"
+            )
+        if lowest < 0:
+            logger.warning_once(
+                "[vllm-ascend/turboquant] slot_mapping carries %d inside the batch's own %d tokens; "
+                "the writer drops those rows, so their K/V never reaches the cache.",
+                lowest,
+                slots.numel(),
+            )
+
     def reshape_and_cache(
         self,
         query: torch.Tensor,
@@ -343,8 +418,16 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
         slots = attn_metadata.slot_mapping if encoder_decoder else attn_metadata.slot_mapping[:num_actual_tokens]
 
-        cached_key = key if encoder_decoder else key[:num_actual_tokens]
-        cached_value = value if encoder_decoder else value[:num_actual_tokens]
+        # Packed, because the kernel indexes all three as raw global memory: a fused QKV
+        # projection hands the backend column slices of one matrix, and a slot_mapping the
+        # metadata builder sliced is a view. Materialised here rather than inside the call so
+        # the validator sees the addresses the operator is actually handed.
+        cached_key = (key if encoder_decoder else key[:num_actual_tokens]).contiguous()
+        cached_value = (value if encoder_decoder else value[:num_actual_tokens]).contiguous()
+        cached_slots = slots.to(torch.int32).contiguous()
+
+        if envs_ascend.VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS:
+            self._validate_cache_write(cached_key, cached_value, cached_slots)
 
         # The two decodes read different byte layouts, so the writer follows the decode.
         write = (
@@ -353,12 +436,12 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             else torch.ops._C_ascend.npu_turboquant_reshape_and_cache
         )
         write(
-            cached_key.contiguous(),
-            cached_value.contiguous(),
+            cached_key,
+            cached_value,
             self.key_cache,
             self.value_cache,
             self.scale_cache,
-            slots.to(torch.int32).contiguous(),
+            cached_slots,
             self.pi_signs(key.device),
             self.codec_tables(key.device, 1),
         )

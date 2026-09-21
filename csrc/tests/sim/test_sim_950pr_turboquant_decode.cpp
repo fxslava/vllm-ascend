@@ -198,7 +198,8 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
         AscendType::FP16, stream, write_grid.block_dim, key_dev.get(), value_dev.get(), key_cache_dev.get(),
         value_cache_dev.get(), scale_plane_dev.get(), slots_dev.get(), pi_signs_dev.get(), write_tables_dev.get(),
         static_cast<uint32_t>(kContextLen), static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize),
-        static_cast<uint32_t>(kBlockSize), write_grid.tokens_per_core, kInvSqrtHeadSize);
+        static_cast<uint32_t>(kBlockSize), static_cast<uint32_t>(kNumBlocks), write_grid.tokens_per_core,
+        kInvSqrtHeadSize);
     ACL_CHECK(aclrtSynchronizeStream(stream));
   });
 

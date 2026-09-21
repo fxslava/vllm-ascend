@@ -207,8 +207,8 @@ class DeviceScenario {
         AscendType::FP16, stream_, grid.block_dim, key_.get(), value_.get(), key_cache_.get(), value_cache_.get(),
         scale_plane_.get(), slots_.get(), pi_signs_.get(), write_tables_.get(),
         static_cast<uint32_t>(scenario_.context_len), static_cast<uint32_t>(kNumKvHeads),
-        static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kBlockSize), grid.tokens_per_core,
-        kInvSqrtHeadSize);
+        static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kBlockSize),
+        static_cast<uint32_t>(scenario_.num_blocks), grid.tokens_per_core, kInvSqrtHeadSize);
     ACL_CHECK(aclrtSynchronizeStream(stream_));
   }
 

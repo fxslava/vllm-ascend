@@ -47,6 +47,7 @@ from vllm_ascend.attention.turboquant_rotation import (
     walsh_hadamard,
 )
 from vllm_ascend.attention.turboquant_v1 import (
+    TURBOQUANT_BURST_FLOATS,
     TURBOQUANT_PACK_FACTOR,
     TURBOQUANT_TILE_ROWS,
     AscendTurboQuantAttentionBackend,
@@ -474,6 +475,129 @@ class TestPureRuntimeContract(TestBase):
         ops.npu_turboquant_workspace_size.assert_called_once_with(
             num_tokens, impl.num_heads, impl.head_size, 1, DECODE_BLOCK_SIZE
         )
+
+
+class TestCacheWriteValidation(TestBase):
+    """The write path's guard rails.
+
+    Every address the writer forms is scaled by the token's slot, so a slot the cache
+    cannot hold is a write outside it -- which the AI core reports as "the address for
+    scalar to access GM is invalid" (error 264) naming nothing at all. The kernels drop
+    such a slot rather than writing it, the same way they drop the negative slot vLLM
+    marks a padding token with. Dropping is silent, so
+    ``VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS`` exists to name it; it is off by default
+    because reading the values costs a device synchronisation per layer per step.
+    """
+
+    NUM_BLOCKS = 3
+    BLOCK_SIZE = 128
+    NUM_TOKENS = 4
+
+    def _make_impl(self) -> AscendTurboQuantAttentionBackendImpl:
+        impl = AscendTurboQuantAttentionBackendImpl.__new__(AscendTurboQuantAttentionBackendImpl)
+        impl.head_size = HEAD_SIZE
+        impl.num_heads = 8
+        impl.num_kv_heads = 2
+        impl.scale = HEAD_SIZE**-0.5
+        impl.attn_type = "decoder"
+        impl.kv_sharing_target_layer_name = None
+        impl.is_kv_producer = False
+        impl.cube_decode = False
+        impl.key_cache = None
+        impl.value_cache = None
+        impl.scale_cache = None
+        impl._pi_signs = None
+        impl._hadamard16 = None
+        return impl
+
+    def _write(self, slots: torch.Tensor, validate: bool, key: torch.Tensor | None = None) -> MagicMock:
+        """Run one cache write; returns the operator mock it was pushed through."""
+        impl = self._make_impl()
+        cache = torch.zeros(
+            self.NUM_BLOCKS,
+            self.BLOCK_SIZE,
+            impl.num_kv_heads,
+            HEAD_SIZE // TURBOQUANT_PACK_FACTOR,
+            dtype=torch.int8,
+        )
+        if key is None:
+            key = torch.randn(slots.numel(), impl.num_kv_heads, HEAD_SIZE)
+        metadata = MagicMock(num_actual_tokens=slots.numel(), slot_mapping=slots)
+        ops = MagicMock()
+        with (
+            patch.dict("os.environ", {"VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS": "1" if validate else "0"}),
+            patch.object(torch.ops, "_C_ascend", ops, create=True),
+        ):
+            impl.reshape_and_cache(None, key, torch.randn_like(key), (cache, cache), metadata, None)
+        return ops
+
+    def _slots(self) -> torch.Tensor:
+        return torch.arange(self.NUM_TOKENS, dtype=torch.int64)
+
+    def test_slots_inside_the_cache_are_written(self):
+        ops = self._write(self._slots(), validate=True)
+        ops.npu_turboquant_reshape_and_cache.assert_called_once()
+
+    def test_a_slot_past_the_last_row_is_named(self):
+        rows = self.NUM_BLOCKS * self.BLOCK_SIZE
+        slots = self._slots()
+        slots[2] = rows
+        with self.assertRaises(RuntimeError) as caught:
+            self._write(slots, validate=True)
+        message = str(caught.exception)
+        self.assertIn(str(rows), message, message)
+        self.assertIn("slot_mapping", message, message)
+
+    def test_an_out_of_range_slot_is_not_checked_on_the_serving_path(self):
+        """The guard that keeps it off the bus is the kernel's, not this one.
+
+        Checking here costs a synchronisation, so by default the writer is launched
+        and drops the row; this test pins that the hot path does not pay for the check.
+        """
+        slots = self._slots()
+        slots[2] = self.NUM_BLOCKS * self.BLOCK_SIZE
+        ops = self._write(slots, validate=False)
+        ops.npu_turboquant_reshape_and_cache.assert_called_once()
+
+    def test_a_padding_slot_warns_rather_than_raising(self):
+        """-1 is how vLLM marks a token with no cache row; the kernels skip it."""
+        slots = self._slots()
+        slots[1] = -1
+        with patch.object(tq_module, "logger") as logger:
+            ops = self._write(slots, validate=True)
+        ops.npu_turboquant_reshape_and_cache.assert_called_once()
+        logger.warning_once.assert_called_once()
+
+    def test_the_writer_is_handed_packed_operands(self):
+        """A fused QKV split hands the backend a strided view; the kernel indexes raw memory."""
+        qkv = torch.randn(self.NUM_TOKENS, 3, 2, HEAD_SIZE)
+        key = qkv[:, 1]
+        self.assertFalse(key.is_contiguous())
+        ops = self._write(self._slots(), validate=True, key=key)
+        args = ops.npu_turboquant_reshape_and_cache.call_args.args
+        self.assertTrue(args[0].is_contiguous())
+        self.assertTrue(args[1].is_contiguous())
+        self.assertEqual(args[5].dtype, torch.int32)
+        torch.testing.assert_close(args[0], key)
+
+    def test_an_operand_that_starts_mid_burst_is_named(self):
+        """``.contiguous()`` keeps a view's storage offset, so contiguity is not alignment."""
+        impl = self._make_impl()
+        elements = self.NUM_TOKENS * impl.num_kv_heads * HEAD_SIZE
+        flat = torch.randn(elements + 1)
+        key = flat[1:].view(self.NUM_TOKENS, impl.num_kv_heads, HEAD_SIZE)
+        self.assertTrue(key.is_contiguous())
+        # Precondition rather than an assumption: a one-float offset from an allocator
+        # that aligns to at least a burst cannot land on a burst boundary.
+        self.assertNotEqual(key.data_ptr() % tq_module.TURBOQUANT_GM_BURST_BYTES, 0)
+        with self.assertRaises(RuntimeError) as caught:
+            self._write(self._slots(), validate=True, key=key)
+        self.assertIn("burst", str(caught.exception))
+
+    def test_the_burst_matches_the_kernel_constant(self):
+        """turboquant_layout.h: kFp32PerBlock fp32 lanes is one 32-byte burst."""
+        self.assertEqual(tq_module.TURBOQUANT_GM_BURST_BYTES, 32)
+        self.assertEqual(tq_module.TURBOQUANT_GM_BURST_BYTES, TURBOQUANT_BURST_FLOATS * 4)
 
 
 class TestDecodeWorkspace(TestBase):

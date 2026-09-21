@@ -217,8 +217,8 @@ ModeRun RunMode(tqm::TurboQuantMode mode, const Shape& shape, aclrtStream stream
       static_cast<int32_t>(mode), AscendType::FP16, stream, write_grid.block_dim, key_dev.get(), value_dev.get(),
       key_cache.get(), value_cache.get(), scale_plane.get(), slots_dev.get(), pi_signs.get(), rot_tables.get(),
       write_tables.get(), static_cast<uint32_t>(batch * context_len), static_cast<uint32_t>(kNumKvHeads),
-      static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kBlockSize), write_grid.tokens_per_core,
-      kInvSqrtHeadSize);
+      static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kBlockSize),
+      static_cast<uint32_t>(shape.num_blocks), write_grid.tokens_per_core, kInvSqrtHeadSize);
   ACL_CHECK(aclrtSynchronizeStream(stream));
 
   run.rotate_plan = tqh::RotateQuery(stream, AscendType::FP16, query_dev.get(), pi_signs.get(), h16.get(),

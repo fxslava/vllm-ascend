@@ -63,7 +63,7 @@ from vllm_ascend.compilation.acl_graph import (
 )
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.memcache_comm_fence import record_attention_compute_start
-from vllm_ascend.utils import is_950, weak_ref_tensors
+from vllm_ascend.utils import is_950, is_turboquant_cache_dtype, turboquant_enabled, weak_ref_tensors
 
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
@@ -83,9 +83,15 @@ class AscendAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_impl_cls() -> type["AscendAttentionBackendImpl"]:
-        if envs_ascend.ENABLE_TURBOQUANT:
+        # Every route into the 4-bit layout, not the env var alone: the cache spec, the page
+        # budget and get_kv_cache_shape all follow turboquant_enabled, and an impl that did not
+        # would be handed a packed cache it cannot read. --kv-cache-dtype int4_per_token_head is
+        # the route that reaches this through the config rather than the environment.
+        from vllm.config import get_current_vllm_config_or_none
+
+        if turboquant_enabled(get_current_vllm_config_or_none()):
             if enable_dcp():
-                raise ValueError("ENABLE_TURBOQUANT=1 cannot be combined with decode context parallel")
+                raise ValueError("The TurboQuant 4-bit KV cache cannot be combined with decode context parallel")
             from vllm_ascend.attention.turboquant_v1 import AscendTurboQuantAttentionBackendImpl
 
             return AscendTurboQuantAttentionBackendImpl
@@ -111,8 +117,7 @@ class AscendAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "",
     ) -> tuple[int, ...]:
-        is_turboquant_dtype = isinstance(cache_dtype_str, str) and cache_dtype_str.startswith("turboquant_")
-        if envs_ascend.ENABLE_TURBOQUANT or is_turboquant_dtype:
+        if envs_ascend.ENABLE_TURBOQUANT or is_turboquant_cache_dtype(cache_dtype_str):
             from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_PACK_FACTOR
 
             return (2, num_blocks, block_size, num_kv_heads, head_size // TURBOQUANT_PACK_FACTOR)

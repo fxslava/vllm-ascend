@@ -24,17 +24,22 @@ is easy to get wrong -- the scale plane's burst padding at small KV-head
 counts, and the comparison against the stock unpacked page.
 """
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import torch
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
 
 from tests.ut.base import TestBase
+from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
 from vllm_ascend.attention.turboquant_v1 import (
     AscendTurboQuantAttentionBackend,
     TURBOQUANT_PACK_FACTOR,
     turboquant_scale_slot,
 )
 from vllm_ascend.core.kv_cache_interface import AscendTurboQuantAttentionSpec
+from vllm_ascend.utils import TURBOQUANT_KV_CACHE_DTYPE, is_turboquant_cache_dtype
 
 HEAD_SIZE = 128
 BLOCK_SIZE = 128
@@ -188,3 +193,83 @@ class TestBlockSizes(TestBase):
         for block_size in (16, 32, 64, 128):
             spec = _spec(8, block_size=block_size)
             self.assertEqual(spec.real_page_size_bytes, base * (block_size // 16))
+
+
+class TestPackedShapeFollowsEveryRoute(TestBase):
+    """The route into the layout and the shape the cache is viewed as must agree.
+
+    ``turboquant_enabled`` opens the layout three ways, and a page is budgeted by
+    :class:`AscendTurboQuantAttentionSpec` for all of them. The backend the model runner
+    actually asks for the shape is the registered ``AscendAttentionBackend``, so it has to
+    report the *packed* shape for the same set -- otherwise a plane allocated for a packed
+    page is viewed as an unpacked one and ``_reshape_kv_cache_tensors`` fails outright.
+    ``--kv-cache-dtype int4_per_token_head`` is the route that does not carry the
+    ``turboquant_`` prefix, which is exactly how the two drifted apart.
+    """
+
+    PACKED = HEAD_SIZE // TURBOQUANT_PACK_FACTOR
+
+    def test_int4_per_token_head_is_a_turboquant_cache_dtype(self):
+        self.assertTrue(is_turboquant_cache_dtype(TURBOQUANT_KV_CACHE_DTYPE))
+        self.assertEqual(TURBOQUANT_KV_CACHE_DTYPE, "int4_per_token_head")
+
+    def test_every_turboquant_cache_dtype_reports_the_packed_shape(self):
+        for cache_dtype in (TURBOQUANT_KV_CACHE_DTYPE, "turboquant_4bit_nc"):
+            with patch.dict("os.environ", {"ENABLE_TURBOQUANT": "0"}):
+                shape = AscendAttentionBackend.get_kv_cache_shape(2, BLOCK_SIZE, 8, HEAD_SIZE, cache_dtype)
+            self.assertEqual(shape[-1], self.PACKED, f"{cache_dtype} did not pack the head")
+            self.assertEqual(
+                shape,
+                AscendTurboQuantAttentionBackend.get_kv_cache_shape(2, BLOCK_SIZE, 8, HEAD_SIZE),
+                f"{cache_dtype} disagrees with the TurboQuant backend's own shape",
+            )
+
+    def test_a_stock_cache_dtype_keeps_the_unpacked_shape(self):
+        for cache_dtype in ("auto", "int8", ""):
+            with patch.dict("os.environ", {"ENABLE_TURBOQUANT": "0"}):
+                shape = AscendAttentionBackend.get_kv_cache_shape(2, BLOCK_SIZE, 8, HEAD_SIZE, cache_dtype)
+            self.assertEqual(shape[-1], HEAD_SIZE, f"{cache_dtype!r} should not pack the head")
+
+    def test_the_budgeted_page_holds_the_shape_that_route_reports(self):
+        """The decisive one: bytes budgeted == bytes the runner then views."""
+        for num_kv_heads in KV_HEAD_COUNTS:
+            with patch.dict("os.environ", {"ENABLE_TURBOQUANT": "0"}):
+                packed = AscendAttentionBackend.get_kv_cache_shape(
+                    1, BLOCK_SIZE, num_kv_heads, HEAD_SIZE, TURBOQUANT_KV_CACHE_DTYPE
+                )
+            payload = 1
+            for dim in packed:
+                payload *= dim
+            scale = BLOCK_SIZE * turboquant_scale_slot(num_kv_heads) * get_dtype_size(torch.float32)
+            self.assertEqual(
+                _spec(num_kv_heads).real_page_size_bytes,
+                payload + scale,
+                f"the int4_per_token_head route mis-sizes the page at num_kv_heads={num_kv_heads}",
+            )
+
+    def test_the_impl_follows_the_same_route_as_the_layout(self):
+        """The shape and the impl have to agree, or a stock impl writes a packed plane.
+
+        ``get_impl_cls`` takes no config, so it reads the current one; the dtype route is
+        the one that reaches it that way rather than through the environment.
+        """
+        from vllm_ascend.attention.turboquant_v1 import AscendTurboQuantAttentionBackendImpl
+
+        config = SimpleNamespace(cache_config=SimpleNamespace(cache_dtype=TURBOQUANT_KV_CACHE_DTYPE))
+        with (
+            patch.dict("os.environ", {"ENABLE_TURBOQUANT": "0"}),
+            patch("vllm.config.get_current_vllm_config_or_none", return_value=config),
+            patch("vllm_ascend.attention.attention_v1.enable_dcp", return_value=False),
+        ):
+            self.assertIs(AscendAttentionBackend.get_impl_cls(), AscendTurboQuantAttentionBackendImpl)
+
+    def test_a_stock_cache_dtype_keeps_the_stock_impl(self):
+        from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
+
+        config = SimpleNamespace(cache_config=SimpleNamespace(cache_dtype="auto"))
+        with (
+            patch.dict("os.environ", {"ENABLE_TURBOQUANT": "0"}),
+            patch("vllm.config.get_current_vllm_config_or_none", return_value=config),
+            patch("vllm_ascend.attention.attention_v1.enable_dcp", return_value=False),
+        ):
+            self.assertIs(AscendAttentionBackend.get_impl_cls(), AscendAttentionBackendImpl)

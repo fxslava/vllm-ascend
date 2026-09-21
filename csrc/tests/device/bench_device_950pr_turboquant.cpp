@@ -910,14 +910,16 @@ class Scenario {
                                            grid.block_dim, key, value, key_cache_.get(), value_cache_.get(),
                                            scale_plane_.get(), slots, pi_signs_.get(), rot_tables_.get(),
                                            write_tables_.get(), token_count, kv_heads, head_size,
-                                           static_cast<uint32_t>(kBlockSize), grid.tokens_per_core,
+                                           static_cast<uint32_t>(kBlockSize),
+                                           static_cast<uint32_t>(config_.pool_blocks()), grid.tokens_per_core,
                                            config_.attention_scale());
       return;
     }
     turboquant_reshape_and_cache_impl(AscendType::FP16, stream, grid.block_dim, key, value, key_cache_.get(),
                                       value_cache_.get(), scale_plane_.get(), slots, pi_signs_.get(),
                                       write_tables_.get(), token_count, kv_heads, head_size,
-                                      static_cast<uint32_t>(kBlockSize), grid.tokens_per_core,
+                                      static_cast<uint32_t>(kBlockSize),
+                                      static_cast<uint32_t>(config_.pool_blocks()), grid.tokens_per_core,
                                       config_.attention_scale());
   }
 

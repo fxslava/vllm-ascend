@@ -72,12 +72,13 @@ public:
                                 __gm__ void *scaleCache, __gm__ void *slotMapping, __gm__ void *piSigns,
                                 __gm__ void *rotTables, __gm__ void *modeTables, const uint32_t numTokens,
                                 const uint32_t numKvHeads, const uint32_t headSize, const uint32_t blockSize,
-                                const uint32_t tokensPerCore, const float invSqrtLen)
+                                const uint32_t numBlocks, const uint32_t tokensPerCore, const float invSqrtLen)
     {
         numTokens_ = numTokens;
         numKvHeads_ = numKvHeads;
         headSize_ = headSize;
         blockSize_ = blockSize;
+        numSlots_ = static_cast<uint64_t>(numBlocks) * blockSize;
         tokensPerCore_ = tokensPerCore;
         packedBytes_ = Codec::PackedBytes(headSize);
         headPlane_ = numKvHeads_ * headSize_;
@@ -148,7 +149,13 @@ private:
 
     __aicore__ inline void StageTokenIn(const uint32_t token, const uint32_t step)
     {
-        const int32_t slot = slotGm_.GetValue(token);
+        const int32_t rawSlot = slotGm_.GetValue(token);
+        // A padding token carries a negative slot, and a slot past the last row of the cache is a caller
+        // bug. Both become -1 here, which is what StageTokenOut reads as "write nothing": every cache
+        // address it forms is scaled by the slot, so either one would write outside the cache -- an AI
+        // core "address for scalar to access GM is invalid" (264) at best, silent corruption of whatever
+        // else lives at that address at worst.
+        const int32_t slot = (rawSlot >= 0 && static_cast<uint64_t>(rawSlot) < numSlots_) ? rawSlot : -1;
         slotRing_[step % kSlotRing] = slot;
         const AscendC::LocalTensor<scalar_t> in = inQueue_.template AllocTensor<scalar_t>();
         if (slot >= 0) {
@@ -244,6 +251,7 @@ private:
     AscendC::GlobalTensor<int32_t> modeTablesGm_;
     AscendC::DataCopyParams nzTileRowParams_;
     int32_t slotRing_[kSlotRing] = {-1, -1, -1, -1};
+    uint64_t numSlots_ = 0;
     uint32_t numTokens_ = 0;
     uint32_t numKvHeads_ = 0;
     uint32_t headSize_ = 0;
@@ -726,12 +734,12 @@ private:
     extern "C" __global__ __aicore__ void turboquant_mm_reshape_and_cache_##MODE_NAME##_##TYPE(                      \
         GM_ADDR key, GM_ADDR value, GM_ADDR keyCache, GM_ADDR valueCache, GM_ADDR scaleCache, GM_ADDR slotMapping,   \
         GM_ADDR piSigns, GM_ADDR rotTables, GM_ADDR modeTables, uint32_t numTokens, uint32_t numKvHeads,             \
-        uint32_t headSize, uint32_t blockSize, uint32_t tokensPerCore, float invSqrtLen)                             \
+        uint32_t headSize, uint32_t blockSize, uint32_t numBlocks, uint32_t tokensPerCore, float invSqrtLen)          \
     {                                                                                                                \
         AscendC::TPipe pipe;                                                                                         \
         TurboQuantModeReshapeAndCache<MODE, TYPE> op(&pipe);                                                         \
         op.Init(key, value, keyCache, valueCache, scaleCache, slotMapping, piSigns, rotTables, modeTables,           \
-                numTokens, numKvHeads, headSize, blockSize, tokensPerCore, invSqrtLen);                              \
+                numTokens, numKvHeads, headSize, blockSize, numBlocks, tokensPerCore, invSqrtLen);                   \
         op.Process();                                                                                                \
     }
 
@@ -826,7 +834,8 @@ void turboquant_mm_reshape_and_cache_impl(int32_t mode, AscendType type, void *s
                                           void *value, void *keyCache, void *valueCache, void *scaleCache,
                                           void *slotMapping, void *piSigns, void *rotTables, void *modeTables,
                                           uint32_t numTokens, uint32_t numKvHeads, uint32_t headSize,
-                                          uint32_t blockSize, uint32_t tokensPerCore, float invSqrtLen)
+                                          uint32_t blockSize, uint32_t numBlocks, uint32_t tokensPerCore,
+                                          float invSqrtLen)
 {
     if (type != AscendType::FP16) {
         return;
@@ -835,18 +844,18 @@ void turboquant_mm_reshape_and_cache_impl(int32_t mode, AscendType type, void *s
         case turboquant::TurboQuantMode::KV4_FP8:
             turboquant_mm_reshape_and_cache_kv4fp8_half<<<blockDim, nullptr, stream>>>(
                 key, value, keyCache, valueCache, scaleCache, slotMapping, piSigns, rotTables, modeTables, numTokens,
-                numKvHeads, headSize, blockSize, tokensPerCore, invSqrtLen);
+                numKvHeads, headSize, blockSize, numBlocks, tokensPerCore, invSqrtLen);
             break;
 #if defined(VLLM_ASCEND_TQ_TEST_KERNELS)
         case turboquant::TurboQuantMode::KV3_FP4:
             turboquant_mm_reshape_and_cache_kv3fp4_half<<<blockDim, nullptr, stream>>>(
                 key, value, keyCache, valueCache, scaleCache, slotMapping, piSigns, rotTables, modeTables, numTokens,
-                numKvHeads, headSize, blockSize, tokensPerCore, invSqrtLen);
+                numKvHeads, headSize, blockSize, numBlocks, tokensPerCore, invSqrtLen);
             break;
         case turboquant::TurboQuantMode::KV5_FP8:
             turboquant_mm_reshape_and_cache_kv5fp8_half<<<blockDim, nullptr, stream>>>(
                 key, value, keyCache, valueCache, scaleCache, slotMapping, piSigns, rotTables, modeTables, numTokens,
-                numKvHeads, headSize, blockSize, tokensPerCore, invSqrtLen);
+                numKvHeads, headSize, blockSize, numBlocks, tokensPerCore, invSqrtLen);
             break;
 #endif
         default:

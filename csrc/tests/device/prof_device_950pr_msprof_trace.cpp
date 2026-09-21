@@ -757,13 +757,15 @@ class DecodeScenario final : public Scenario {
                                            key_ctx_.get(), value_ctx_.get(), key_cache_.get(), value_cache_.get(),
                                            scale_plane_.get(), slots_.get(), pi_signs_.get(), rot_tables_.get(),
                                            write_tables_.get(), tokens, kv_heads, head_size,
-                                           static_cast<uint32_t>(kBlockSize), grid.tokens_per_core,
+                                           static_cast<uint32_t>(kBlockSize),
+                                           static_cast<uint32_t>(config_.pool_blocks()), grid.tokens_per_core,
                                            config_.attention_scale());
     } else {
       turboquant_reshape_and_cache_impl(AscendType::FP16, stream, grid.block_dim, key_ctx_.get(), value_ctx_.get(),
                                         key_cache_.get(), value_cache_.get(), scale_plane_.get(), slots_.get(),
                                         pi_signs_.get(), write_tables_.get(), tokens, kv_heads, head_size,
-                                        static_cast<uint32_t>(kBlockSize), grid.tokens_per_core,
+                                        static_cast<uint32_t>(kBlockSize),
+                                        static_cast<uint32_t>(config_.pool_blocks()), grid.tokens_per_core,
                                         config_.attention_scale());
     }
     ACL_CHECK(aclrtSynchronizeStream(stream));
