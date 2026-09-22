@@ -394,6 +394,27 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
                 slots.numel(),
             )
 
+    def _fence_cache_write(self, device: torch.device) -> None:
+        """Drain the writer's launch so an async fault cannot be blamed on a later one.
+
+        Ascend launches are asynchronous. A kernel that traps does not fail its own
+        launch: the runtime reports the error from a *subsequent* launch API call, and
+        names whichever operator the launch queue was working on. So a fault in this
+        writer surfaces at some unrelated operator, and a fault in an unrelated operator
+        surfaces at this writer -- which is why an "aclnnInplaceCopy" in the message does
+        not mean ``write`` called one. It does not.
+
+        The ``int(slots.min())`` in :meth:`_validate_cache_write` already drains
+        everything queued before the write; this drains the write itself. Together they
+        bracket it, so the next failure names the right side of the boundary. Diagnostic
+        only, and part of what ``VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS`` costs. The
+        global ``ASCEND_LAUNCH_BLOCKING=1`` does the same thing for every operator, but
+        the platform refuses it unless ACL graph is off (``--enforce-eager``).
+        """
+        if device.type != "npu":
+            return
+        torch.npu.synchronize()
+
     def reshape_and_cache(
         self,
         query: torch.Tensor,
@@ -445,6 +466,8 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             self.pi_signs(key.device),
             self.codec_tables(key.device, 1),
         )
+        if envs_ascend.VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS:
+            self._fence_cache_write(key.device)
         notify_kv_cache_written()
         return query, key, value, output
 

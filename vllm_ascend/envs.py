@@ -120,10 +120,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # so the value is read once per layer, when its attention impl is built.
     "VLLM_ASCEND_TURBOQUANT_CUBE_DECODE": lambda: bool(int(os.getenv("VLLM_ASCEND_TURBOQUANT_CUBE_DECODE", "1"))),
     # Check every slot the TurboQuant writer is handed against the cache it writes into, before
-    # the launch (vllm_ascend/attention/turboquant_v1.py). 0 (default): off. 1: on. The values
-    # live on the device, so the check costs a device-to-host copy and a synchronisation on every
-    # cache write of every layer -- diagnostic only, never a serving default. The kernels drop an
-    # unusable slot either way; this is what turns that silent drop into a named error.
+    # the launch, and drain the launch afterwards (vllm_ascend/attention/turboquant_v1.py).
+    # 0 (default): off. 1: on. The values live on the device, so the check costs a device-to-host
+    # copy and a synchronisation on every cache write of every layer -- diagnostic only, never a
+    # serving default. The kernels drop an unusable slot either way; this is what turns that silent
+    # drop into a named error, and the two synchronisations bracket the write so an asynchronous
+    # fault is attributed to the right side of it rather than to a later operator.
     "VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS": lambda: bool(int(os.getenv("VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS", "0"))),
 }
 

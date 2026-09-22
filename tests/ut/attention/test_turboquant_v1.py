@@ -531,6 +531,22 @@ class TestCacheWriteValidation(TestBase):
             impl.reshape_and_cache(None, key, torch.randn_like(key), (cache, cache), metadata, None)
         return ops
 
+    def _write_with(self, impl, slots: torch.Tensor) -> MagicMock:
+        """One cache write through a caller-supplied impl, so its state survives the call."""
+        cache = torch.zeros(
+            self.NUM_BLOCKS,
+            self.BLOCK_SIZE,
+            impl.num_kv_heads,
+            HEAD_SIZE // TURBOQUANT_PACK_FACTOR,
+            dtype=torch.int8,
+        )
+        key = torch.randn(slots.numel(), impl.num_kv_heads, HEAD_SIZE)
+        metadata = MagicMock(num_actual_tokens=slots.numel(), slot_mapping=slots)
+        ops = MagicMock()
+        with patch.object(torch.ops, "_C_ascend", ops, create=True):
+            impl.reshape_and_cache(None, key, torch.randn_like(key), (cache, cache), metadata, None)
+        return ops
+
     def _slots(self) -> torch.Tensor:
         return torch.arange(self.NUM_TOKENS, dtype=torch.int64)
 
@@ -598,6 +614,31 @@ class TestCacheWriteValidation(TestBase):
         """turboquant_layout.h: kFp32PerBlock fp32 lanes is one 32-byte burst."""
         self.assertEqual(tq_module.TURBOQUANT_GM_BURST_BYTES, 32)
         self.assertEqual(tq_module.TURBOQUANT_GM_BURST_BYTES, TURBOQUANT_BURST_FLOATS * 4)
+
+    def test_the_write_is_fenced_on_device_and_nowhere_else(self):
+        """A trap in the writer must not be reported against a later operator.
+
+        The fence is what makes the failing launch legible: without it an Ascend kernel
+        that traps fails a *subsequent* launch API call, which is how a write fault comes
+        back naming an operator the writer never calls.
+        """
+        impl = self._make_impl()
+        with patch.object(tq_module.torch, "npu", MagicMock(), create=True) as npu:
+            impl._fence_cache_write(torch.device("cpu"))
+            npu.synchronize.assert_not_called()
+            impl._fence_cache_write(SimpleNamespace(type="npu"))
+            npu.synchronize.assert_called_once()
+
+    def test_the_serving_path_is_not_fenced(self):
+        """The fence is a synchronisation per layer per step; it rides the diagnostic flag."""
+        impl = self._make_impl()
+        with patch.object(impl, "_fence_cache_write") as fence:
+            with patch.dict("os.environ", {"VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS": "0"}):
+                self._write_with(impl, self._slots())
+            fence.assert_not_called()
+            with patch.dict("os.environ", {"VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS": "1"}):
+                self._write_with(impl, self._slots())
+            fence.assert_called_once()
 
 
 class TestDecodeWorkspace(TestBase):
