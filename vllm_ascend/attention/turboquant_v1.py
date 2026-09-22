@@ -92,6 +92,15 @@ from vllm_ascend.attention.turboquant_layout import (  # noqa: F401  (re-export)
     turboquant_scale_slot,
 )
 from vllm_ascend.attention.turboquant_rotation import output_rotation_is_folded, turboquant_pi_signs
+
+# The diagnostic capture layer: what the operators were handed, appended to its own
+# line-buffered file, and the dry run that walks the engine past the launches so a
+# whole run's configuration can be recorded rather than the first faulting step's.
+from vllm_ascend.attention.turboquant_trace import (
+    describe_indices,
+    describe_tensors,
+    turboquant_tracer,
+)
 from vllm_ascend.attention.utils import notify_kv_cache_written
 
 _WORKSPACE_MEMO_LIMIT = 1024
@@ -137,6 +146,26 @@ def _is_capturing() -> bool:
         return bool(_EXTRA_CTX.capturing)
     except (AssertionError, AttributeError, RuntimeError):
         return False
+
+
+def _attention_phase(attn_metadata: AscendMetadata | None) -> str:
+    """The batch's state, as a name a trace record can carry.
+
+    Read defensively: the phase is only ever used to label a diagnostic, so a
+    metadata object that does not carry a recognisable state is described rather
+    than raised about -- the record exists precisely for the runs where something
+    upstream is not what it should be.
+    """
+    if attn_metadata is None:
+        return "no_metadata"
+    state = getattr(attn_metadata, "attn_state", None)
+    if state is None:
+        return "unknown"
+    if state == AscendAttentionState.DecodeOnly:
+        return "decode"
+    if state == AscendAttentionState.PrefillNoCache:
+        return "prefill"
+    return str(getattr(state, "name", state))
 
 
 class AscendTurboQuantAttentionBackend(AscendAttentionBackend):
@@ -226,6 +255,14 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
     cube_decode = False
     output_rotation_folded = False
 
+    # Which layer this is and how many times it has been entered, for the trace records.
+    # Class-level for the same reason as above, and because everything downstream of
+    # `forward` reads them: a record written from the cache writer has to name the layer
+    # even though only `forward` is handed one.
+    _trace_layer_name: str | None = None
+    _trace_step = 0
+    _trace_phase = "unknown"
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.scale_cache: torch.Tensor | None = None
@@ -259,6 +296,18 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             logger.info_once(
                 "[vllm-ascend/turboquant] kv4fp8 Cube decode: the query rotation, the output un-rotation and any "
                 "attn_output_gate run inside the decode launch."
+            )
+        tracer = turboquant_tracer()
+        if tracer.capture:
+            logger.warning_once(
+                "[vllm-ascend/turboquant] TURBOQUANT_CAPTURE_SIGNATURES=1: every operator invocation is appended "
+                "to %s, at the cost of a device-to-host copy of the index tensors per call. Diagnostic only.",
+                tracer.path,
+            )
+        if tracer.dry_run:
+            logger.warning_once(
+                "[vllm-ascend/turboquant] TURBOQUANT_DRY_RUN=1: no TurboQuant kernel will be launched and the "
+                "attention output is zeroed. The run produces no meaningful tokens."
             )
 
     def pi_signs(self, device: torch.device) -> torch.Tensor:
@@ -394,6 +443,39 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
                 slots.numel(),
             )
 
+    def _trace_caller_context(self) -> dict:
+        """Who is calling, and with which of this backend's two decodes.
+
+        Every record carries it, because a trace is only readable if a record can
+        be attributed to a layer and a step: the interesting failures are the ones
+        where layer 0 step 1 is fine and layer 7 step 300 is not.
+        """
+        return {
+            "layer": self._trace_layer_name,
+            "step": self._trace_step,
+            "phase": self._trace_phase,
+            "is_prefill": self._trace_phase == "prefill",
+            "is_decode": self._trace_phase == "decode",
+            "decode_path": "cube" if self.cube_decode else "aiv",
+            "output_rotation_folded": self.output_rotation_folded,
+            "num_heads": self.num_heads,
+            "num_kv_heads": self.num_kv_heads,
+            "head_dim": self.head_size,
+            "scale": float(self.scale),
+        }
+
+    def _cache_geometry(self) -> dict:
+        """The bound cache's page geometry and the row capacity it implies.
+
+        ``num_blocks * block_size`` is what a slot mapping is bounded by, and the
+        number the writers silently drop a row for exceeding.
+        """
+        cache = self.key_cache
+        if cache is None:
+            return {"num_blocks": None, "block_size": None, "capacity": None}
+        num_blocks, block_size = int(cache.shape[0]), int(cache.shape[1])
+        return {"num_blocks": num_blocks, "block_size": block_size, "capacity": num_blocks * block_size}
+
     def _fence_cache_write(self, device: torch.device) -> None:
         """Drain the writer's launch so an async fault cannot be blamed on a later one.
 
@@ -451,23 +533,57 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             self._validate_cache_write(cached_key, cached_value, cached_slots)
 
         # The two decodes read different byte layouts, so the writer follows the decode.
-        write = (
-            torch.ops._C_ascend.npu_turboquant_cube_reshape_and_cache
-            if self.cube_decode
-            else torch.ops._C_ascend.npu_turboquant_reshape_and_cache
+        writer_name = (
+            "npu_turboquant_cube_reshape_and_cache" if self.cube_decode else "npu_turboquant_reshape_and_cache"
         )
-        write(
-            cached_key,
-            cached_value,
-            self.key_cache,
-            self.value_cache,
-            self.scale_cache,
-            cached_slots,
-            self.pi_signs(key.device),
-            self.codec_tables(key.device, 1),
-        )
-        if envs_ascend.VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS:
-            self._fence_cache_write(key.device)
+        write = getattr(torch.ops._C_ascend, writer_name)
+
+        # Recorded here rather than after the launch because the launch is where the
+        # process dies: the operands are described while they still exist, and the
+        # record is on disk before the writer is asked to touch them.
+        tracer = turboquant_tracer()
+        if tracer.active:
+            geometry = self._cache_geometry()
+            tracer.record(
+                "reshape_and_cache",
+                **self._trace_caller_context(),
+                operator=writer_name,
+                launch_args={
+                    "num_tokens": int(cached_key.shape[0]),
+                    "num_scheduled_tokens": int(num_actual_tokens),
+                    "num_kv_heads": self.num_kv_heads,
+                    "head_dim": self.head_size,
+                    **geometry,
+                },
+                slot_mapping=describe_indices(cached_slots, capacity=geometry["capacity"]),
+                tensors=describe_tensors(
+                    key=cached_key,
+                    value=cached_value,
+                    key_cache=self.key_cache,
+                    value_cache=self.value_cache,
+                    scale_cache=self.scale_cache,
+                    slot_mapping=cached_slots,
+                    pi_signs=self.pi_signs(key.device),
+                    codec_tables=self.codec_tables(key.device, 1),
+                ),
+                bypassed=tracer.dry_run,
+            )
+        if not tracer.dry_run:
+            write(
+                cached_key,
+                cached_value,
+                self.key_cache,
+                self.value_cache,
+                self.scale_cache,
+                cached_slots,
+                self.pi_signs(key.device),
+                self.codec_tables(key.device, 1),
+            )
+            if envs_ascend.VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS:
+                self._fence_cache_write(key.device)
+        # Announced either way: a dry run leaves the cache empty, but the rest of the
+        # engine still has to be told the write path ran, or a KV connector waits for
+        # an event that is never recorded and the run stops before it has traced anything.
         notify_kv_cache_written()
         return query, key, value, output
 
@@ -571,7 +687,37 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
     ) -> torch.Tensor:
         assert output is not None, "Output tensor must be provided."
         num_tokens = query.shape[0]
+        # Hoisted above the first launch so the trace can describe the operands the
+        # kernels are handed rather than the tensors they were derived from. All four
+        # are host-side work -- a view, two dtype casts and a memoised buffer lookup --
+        # so the live path is unchanged by the move.
         rotated_query = self._rotated_query(num_tokens, query.device)
+        block_tables = attn_metadata.block_tables.to(torch.int32).contiguous()
+        seq_lens = attn_metadata.seq_lens.to(torch.int32).contiguous()
+        workspace = self._decode_workspace(num_tokens, block_tables.shape[1], self.key_cache.shape[1], query.device)
+        attention_output = output[:num_tokens].view(num_tokens, self.num_heads, self.head_size)
+
+        tracer = turboquant_tracer()
+        if tracer.active:
+            self._trace_decode(
+                tracer,
+                operator="npu_turboquant_paged_attention",
+                query=query,
+                rotated_query=rotated_query,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                workspace=workspace,
+                attention_output=attention_output,
+                output_gate=None,
+                stage=None,
+            )
+            if tracer.dry_run:
+                # Zero rather than left alone: `output` is whatever the runner last put
+                # there, so an untouched buffer would hand the model stale activations
+                # and make a dry run look like it computed something.
+                attention_output.zero_()
+                return output
+
         torch.ops._C_ascend.npu_turboquant_rotate_q(
             query.contiguous(),
             self.pi_signs(query.device),
@@ -579,17 +725,15 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             self.hadamard16(query.device),
             rotated_query,
         )
-        block_tables = attn_metadata.block_tables.to(torch.int32).contiguous()
-        attention_output = output[:num_tokens].view(num_tokens, self.num_heads, self.head_size)
         torch.ops._C_ascend.npu_turboquant_paged_attention(
             rotated_query,
             self.key_cache,
             self.value_cache,
             self.scale_cache,
             block_tables,
-            attn_metadata.seq_lens.to(torch.int32).contiguous(),
+            seq_lens,
             self.codec_tables(query.device, TURBOQUANT_TILE_ROWS),
-            self._decode_workspace(num_tokens, block_tables.shape[1], self.key_cache.shape[1], query.device),
+            workspace,
             self.num_kv_heads,
             self.num_heads,
             self.scale,
@@ -605,6 +749,60 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             )
             attention_output.copy_(rotated_query)
         return output
+
+    def _trace_decode(
+        self,
+        tracer,
+        *,
+        operator: str,
+        query: torch.Tensor,
+        rotated_query: torch.Tensor,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        workspace: torch.Tensor,
+        attention_output: torch.Tensor,
+        output_gate: torch.Tensor | None,
+        stage: TurboQuantOutputStage | None,
+    ) -> None:
+        """Record one decode launch, whichever of the two decodes is about to run.
+
+        Both take the same cache, the same page geometry and the same reduction
+        workspace, and differ only in whether the query rotation and the output
+        stage are separate launches or part of this one -- so they are worth
+        reading side by side in one file, under one schema.
+        """
+        geometry = self._cache_geometry()
+        tracer.record(
+            "decode_attention",
+            **self._trace_caller_context(),
+            operator=operator,
+            launch_args={
+                "num_tokens": int(query.shape[0]),
+                "num_heads": self.num_heads,
+                "num_kv_heads": self.num_kv_heads,
+                "head_dim": self.head_size,
+                "scale": float(self.scale),
+                "max_blocks_per_seq": int(block_tables.shape[1]),
+                "workspace_floats": int(workspace.numel()),
+                "output_stage": None if stage is None else int(stage),
+                **geometry,
+            },
+            block_tables=describe_indices(block_tables, capacity=geometry["num_blocks"]),
+            seq_lens=describe_indices(seq_lens, capacity=geometry["capacity"]),
+            tensors=describe_tensors(
+                query=query,
+                rotated_query=rotated_query,
+                key_cache=self.key_cache,
+                value_cache=self.value_cache,
+                scale_cache=self.scale_cache,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                workspace=workspace,
+                output_gate=output_gate,
+                output=attention_output,
+            ),
+            bypassed=tracer.dry_run,
+        )
 
     def _cube_output_stage(self, output_gate: torch.Tensor | None) -> TurboQuantOutputStage:
         if self.output_rotation_folded:
@@ -637,7 +835,31 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         stage = self._cube_output_stage(output_gate)
         gate = None if output_gate is None else output_gate[:num_tokens].contiguous()
         block_tables = attn_metadata.block_tables.to(torch.int32).contiguous()
+        # Hoisted for the same reason forward_paged_attention hoists its operands: the
+        # trace has to name the tensors the launch is handed, not their sources.
+        seq_lens = attn_metadata.seq_lens.to(torch.int32).contiguous()
+        workspace = self._decode_workspace(num_tokens, block_tables.shape[1], self.key_cache.shape[1], device)
+        rotated_query = self._rotated_query(num_tokens, device)
         attention_output = output[:num_tokens].view(num_tokens, self.num_heads, self.head_size)
+
+        tracer = turboquant_tracer()
+        if tracer.active:
+            self._trace_decode(
+                tracer,
+                operator="npu_turboquant_cube_decode",
+                query=query,
+                rotated_query=rotated_query,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                workspace=workspace,
+                attention_output=attention_output,
+                output_gate=gate,
+                stage=stage,
+            )
+            if tracer.dry_run:
+                attention_output.zero_()
+                return output
+
         torch.ops._C_ascend.npu_turboquant_cube_decode(
             query.contiguous(),
             gate,
@@ -648,9 +870,9 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             self.value_cache,
             self.scale_cache,
             block_tables,
-            attn_metadata.seq_lens.to(torch.int32).contiguous(),
-            self._decode_workspace(num_tokens, block_tables.shape[1], self.key_cache.shape[1], device),
-            self._rotated_query(num_tokens, device),
+            seq_lens,
+            workspace,
+            rotated_query,
             self.num_kv_heads,
             self.num_heads,
             self.scale,
@@ -672,6 +894,22 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         sized for the longest prompt would sit in HBM for the whole run.
         """
         value = value.contiguous()
+        tracer = turboquant_tracer()
+        if tracer.active:
+            tracer.record(
+                "prefill_rotate_value",
+                **self._trace_caller_context(),
+                operator="npu_turboquant_rotate_q",
+                launch_args={"num_tokens": int(value.shape[0]), "num_kv_heads": self.num_kv_heads},
+                tensors=describe_tensors(value=value, pi_signs=self.pi_signs(value.device)),
+                bypassed=tracer.dry_run,
+            )
+            if tracer.dry_run:
+                # The only TurboQuant launch a prefill makes. Handing the unrotated V
+                # back leaves the dense attention below it running on a stock operator,
+                # so a dry run still walks the whole prefill; it is the wrong basis for
+                # a folded o_proj, which is no worse than the zeroed decode beside it.
+                return value
         rotated = torch.empty(value.shape, dtype=torch.float32, device=value.device)
         torch.ops._C_ascend.npu_turboquant_rotate_q(
             value,
@@ -775,6 +1013,41 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             raise NotImplementedError("TurboQuant KV cache does not implement sliding window attention")
 
         num_tokens = query.shape[0]
+
+        # Before the metadata check, not after: a step with no metadata is the profile
+        # run that sizes the KV cache, and "this layer was entered with nothing to do"
+        # is one of the things a trace is read to establish.
+        tracer = turboquant_tracer()
+        if tracer.active:
+            self._trace_layer_name = getattr(layer, "layer_name", None) or getattr(layer, "prefix", None)
+            self._trace_step += 1
+            self._trace_phase = _attention_phase(attn_metadata)
+            tracer.record(
+                "forward",
+                **self._trace_caller_context(),
+                launch_args={
+                    "num_tokens": num_tokens,
+                    "num_actual_tokens": getattr(attn_metadata, "num_actual_tokens", None),
+                    "num_heads": self.num_heads,
+                    "num_kv_heads": self.num_kv_heads,
+                    "head_dim": self.head_size,
+                    "kv_cache_planes": 0 if kv_cache is None else len(kv_cache),
+                },
+                # The capacity is None until the cache is bound, three lines below: the
+                # very first forward of a layer is exactly the one that has not bound it.
+                slot_mapping=describe_indices(
+                    getattr(attn_metadata, "slot_mapping", None), capacity=self._cache_geometry()["capacity"]
+                ),
+                tensors=describe_tensors(
+                    query=query,
+                    key=key,
+                    value=value,
+                    output=output,
+                    output_gate=output_gate,
+                    **{f"kv_cache[{i}]": plane for i, plane in enumerate(kv_cache or ())},
+                ),
+            )
+
         if attn_metadata is None:
             return output.fill_(0)
 
@@ -805,10 +1078,13 @@ def activate_turboquant_backend(layer: torch.nn.Module) -> None:
         impl._workspace_floats = {}
         impl.rotated_query = None
         impl._hadamard16 = None
+        impl._trace_step = 0
+        impl._trace_phase = "unknown"
         impl.cube_decode = turboquant_cube_decode_selected(_model_dtype(impl))
         vllm_config = getattr(impl, "vllm_config", None)
         hf_config = None if vllm_config is None else vllm_config.model_config.hf_config
         layer_name = getattr(layer, "layer_name", "")
+        impl._trace_layer_name = layer_name or None
         impl.output_rotation_folded = output_rotation_is_folded(hf_config, layer_name, impl.head_size)
         logger.debug(
             "[vllm-ascend/turboquant] %s: %s decode; o_proj %s",

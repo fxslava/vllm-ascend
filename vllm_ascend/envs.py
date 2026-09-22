@@ -127,6 +127,27 @@ env_variables: dict[str, Callable[[], Any]] = {
     # drop into a named error, and the two synchronisations bracket the write so an asynchronous
     # fault is attributed to the right side of it rather than to a later operator.
     "VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS": lambda: bool(int(os.getenv("VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS", "0"))),
+    # Append every TurboQuant operator invocation -- its tensor signatures, pointer
+    # alignments, slot/block index ranges and scalar launch arguments -- as one JSON
+    # record per line to TURBOQUANT_TRACE_PATH
+    # (vllm_ascend/attention/turboquant_trace.py). 0 (default): off. 1: on. Diagnostic
+    # only, never a serving default: summarising the index tensors costs a
+    # device-to-host copy per call site, and the file is line-buffered so a record
+    # survives the process abort an asynchronous kernel fault causes. The file is
+    # written directly rather than through `logger`, because a worker process's log
+    # output is redirected somewhere that may never be flushed.
+    "TURBOQUANT_CAPTURE_SIGNATURES": lambda: bool(int(os.getenv("TURBOQUANT_CAPTURE_SIGNATURES", "0"))),
+    # Skip every TurboQuant kernel launch and leave the destination tensors zeroed
+    # (vllm_ascend/attention/turboquant_trace.py). 0 (default): off. 1: on. The engine
+    # then walks through prefill and every decode step of every layer without ever
+    # reaching an AI core, so TURBOQUANT_CAPTURE_SIGNATURES can record the real
+    # production configuration of a run that otherwise aborts at its first faulting
+    # launch. The outputs are meaningless: this produces no tokens worth reading.
+    "TURBOQUANT_DRY_RUN": lambda: bool(int(os.getenv("TURBOQUANT_DRY_RUN", "0"))),
+    # Where TURBOQUANT_CAPTURE_SIGNATURES appends its records. Defaults to
+    # /workspace/turboquant_trace.log, which is the container's bind mount. A path that
+    # cannot be opened falls back to stderr rather than losing the capture.
+    "TURBOQUANT_TRACE_PATH": lambda: os.getenv("TURBOQUANT_TRACE_PATH", ""),
 }
 
 # end-env-vars-definition

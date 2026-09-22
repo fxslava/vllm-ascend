@@ -23,7 +23,10 @@ and the output projection is the one weight Pi may be folded into -- with the
 decode output left rotated for a folded layer and un-rotated for any other.
 """
 
+import json
 import math
+import os
+import tempfile
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -45,6 +48,14 @@ from vllm_ascend.attention.turboquant_rotation import (
     turboquant_pi_signs,
     validate_output_projection_fold,
     walsh_hadamard,
+)
+from vllm_ascend.attention.turboquant_trace import (
+    TURBOQUANT_TRACE_ALIGNMENTS,
+    TURBOQUANT_TRACE_PREVIEW,
+    describe_indices,
+    describe_tensor,
+    reset_turboquant_tracer,
+    turboquant_tracer,
 )
 from vllm_ascend.attention.turboquant_v1 import (
     TURBOQUANT_BURST_FLOATS,
@@ -1606,3 +1617,426 @@ class TestOutputProjectionFold(TestBase):
             with self.assertRaises(ValueError, msg=field):
                 output_rotation_is_folded(SimpleNamespace(**{TURBOQUANT_OUTPUT_ROTATION_CONFIG_KEY: broken}),
                                           name, HEAD_SIZE)
+
+
+class TestDiagnosticCapture(TestBase):
+    """The spy: what it records, what it costs when it is off, and what a dry run skips.
+
+    An Ascend launch is asynchronous, so the operator that faults is not the one the
+    runtime names, and the engine dies before anything has written down what it was
+    handed. These pin the two halves of the answer to that: a record that reaches disk
+    before the launch it describes, and a mode that skips every launch so a whole run's
+    configuration can be collected in one pass.
+    """
+
+    NUM_BLOCKS = 3
+
+    def setUp(self):
+        super().setUp()
+        self._trace_dir = tempfile.TemporaryDirectory()
+        self.trace_path = os.path.join(self._trace_dir.name, "turboquant_trace.log")
+        reset_turboquant_tracer()
+        self.addCleanup(self._trace_dir.cleanup)
+        self.addCleanup(reset_turboquant_tracer)
+
+    def _tracing(self, capture: str = "1", dry_run: str = "0"):
+        """Rebind the tracer to this test's temp file. The variables are read once, when
+        the tracer is built, so the reset is what makes them take effect."""
+        reset_turboquant_tracer()
+        return patch.dict(
+            os.environ,
+            {
+                "TURBOQUANT_CAPTURE_SIGNATURES": capture,
+                "TURBOQUANT_DRY_RUN": dry_run,
+                "TURBOQUANT_TRACE_PATH": self.trace_path,
+            },
+        )
+
+    def _records(self, event: str | None = None) -> list:
+        turboquant_tracer().close()
+        if not os.path.exists(self.trace_path):
+            return []
+        with open(self.trace_path, encoding="utf-8") as handle:
+            records = [json.loads(line) for line in handle if line.strip()]
+        return [r for r in records if event is None or r["event"] == event]
+
+    def _make_impl(self, cube: bool = False) -> AscendTurboQuantAttentionBackendImpl:
+        impl = AscendTurboQuantAttentionBackendImpl.__new__(AscendTurboQuantAttentionBackendImpl)
+        impl.head_size = HEAD_SIZE
+        impl.num_heads = 8
+        impl.num_kv_heads = 2
+        impl.scale = HEAD_SIZE**-0.5
+        impl.attn_type = "decoder"
+        impl.kv_sharing_target_layer_name = None
+        impl.is_kv_producer = False
+        cache_shape = (self.NUM_BLOCKS, DECODE_BLOCK_SIZE, 2, HEAD_SIZE // TURBOQUANT_PACK_FACTOR)
+        impl.key_cache = torch.zeros(cache_shape, dtype=torch.int8)
+        impl.value_cache = torch.zeros(cache_shape, dtype=torch.int8)
+        impl.scale_cache = torch.zeros(self.NUM_BLOCKS, DECODE_BLOCK_SIZE, turboquant_scale_slot(2))
+        impl._pi_signs = None
+        impl.decode_workspace = None
+        impl._workspace_floats = {}
+        impl.rotated_query = None
+        impl._hadamard16 = None
+        impl.output_rotation_folded = False
+        impl.cube_decode = cube
+        impl.sliding_window = None
+        return impl
+
+    def _decode_metadata(self, num_tokens: int) -> MagicMock:
+        return MagicMock(
+            attn_state=AscendAttentionState.DecodeOnly,
+            num_actual_tokens=num_tokens,
+            block_tables=torch.zeros(num_tokens, 2, dtype=torch.int64),
+            seq_lens=torch.ones(num_tokens, dtype=torch.int64),
+            slot_mapping=torch.arange(num_tokens, dtype=torch.int64),
+        )
+
+    def _write_cache(self, impl, ops, slots: torch.Tensor):
+        num_tokens = slots.numel()
+        key = torch.randn(num_tokens, impl.num_kv_heads, HEAD_SIZE)
+        value = torch.randn_like(key)
+        metadata = MagicMock(num_actual_tokens=num_tokens, slot_mapping=slots)
+        with patch.object(torch.ops, "_C_ascend", ops, create=True):
+            impl.reshape_and_cache(None, key, value, (impl.key_cache, impl.value_cache), metadata, None)
+
+    # -- off by default -------------------------------------------------------
+
+    def test_capture_is_off_by_default_and_writes_nothing(self):
+        """The cost of a disabled tracer is one attribute read, and no file exists."""
+        with patch.dict(os.environ, {"TURBOQUANT_TRACE_PATH": self.trace_path}, clear=False):
+            for name in ("TURBOQUANT_CAPTURE_SIGNATURES", "TURBOQUANT_DRY_RUN"):
+                os.environ.pop(name, None)
+            reset_turboquant_tracer()
+            tracer = turboquant_tracer()
+            self.assertFalse(tracer.capture)
+            self.assertFalse(tracer.dry_run)
+            self.assertFalse(tracer.active)
+
+            impl = self._make_impl()
+            ops = _ops_mock()
+            self._write_cache(impl, ops, torch.arange(4, dtype=torch.int64))
+
+        ops.npu_turboquant_reshape_and_cache.assert_called_once()
+        self.assertFalse(os.path.exists(self.trace_path))
+
+    def test_a_disabled_tracer_never_touches_the_index_tensors(self):
+        """The slot summary is a device-to-host copy; nothing may take it when off."""
+        with self._tracing(capture="0", dry_run="0"):
+            impl = self._make_impl()
+            slots = MagicMock(wraps=torch.arange(4, dtype=torch.int64))
+            slots.to.return_value = torch.arange(4, dtype=torch.int32)
+            metadata = MagicMock(num_actual_tokens=4, slot_mapping=slots)
+            key = torch.randn(4, impl.num_kv_heads, HEAD_SIZE)
+            ops = _ops_mock()
+            with patch.object(torch.ops, "_C_ascend", ops, create=True):
+                impl.reshape_and_cache(None, key, key.clone(), (impl.key_cache, impl.value_cache), metadata, None)
+            slots.cpu.assert_not_called()
+            slots.min.assert_not_called()
+
+    # -- what a record carries ------------------------------------------------
+
+    def test_a_cache_write_records_every_operand_signature(self):
+        impl = self._make_impl()
+        with self._tracing():
+            ops = _ops_mock()
+            self._write_cache(impl, ops, torch.arange(6, dtype=torch.int64))
+
+        ops.npu_turboquant_reshape_and_cache.assert_called_once()
+        (record,) = self._records("reshape_and_cache")
+        self.assertEqual(record["operator"], "npu_turboquant_reshape_and_cache")
+        # Every operand the writer is handed, by the parameter name it arrives under.
+        for name in ("key", "value", "key_cache", "value_cache", "scale_cache", "slot_mapping", "pi_signs"):
+            self.assertIn(name, record["tensors"], name)
+        key = record["tensors"]["key"]
+        self.assertEqual(key["shape"], [6, impl.num_kv_heads, HEAD_SIZE])
+        self.assertEqual(key["stride"], [impl.num_kv_heads * HEAD_SIZE, HEAD_SIZE, 1])
+        self.assertEqual(key["dtype"], "torch.float32")
+        self.assertTrue(key["contiguous"])
+        self.assertTrue(key["data_ptr"].startswith("0x"))
+        # The alignment of the pointer, not just the pointer: an operand can arrive
+        # contiguous and still start part-way through a 32-byte burst.
+        self.assertEqual(sorted(key["align"]), sorted(str(n) for n in TURBOQUANT_TRACE_ALIGNMENTS))
+        self.assertEqual(key["align"]["32"], int(key["data_ptr"], 16) % 32)
+
+    def test_a_cache_write_records_its_scalar_launch_arguments(self):
+        impl = self._make_impl()
+        with self._tracing():
+            self._write_cache(impl, _ops_mock(), torch.arange(6, dtype=torch.int64))
+
+        (record,) = self._records("reshape_and_cache")
+        args = record["launch_args"]
+        self.assertEqual(args["num_tokens"], 6)
+        self.assertEqual(args["num_scheduled_tokens"], 6)
+        self.assertEqual(args["num_kv_heads"], impl.num_kv_heads)
+        self.assertEqual(args["head_dim"], HEAD_SIZE)
+        self.assertEqual(args["num_blocks"], self.NUM_BLOCKS)
+        self.assertEqual(args["block_size"], DECODE_BLOCK_SIZE)
+        # numBlocks * blockSize: the row capacity a slot is dropped for exceeding.
+        self.assertEqual(args["capacity"], self.NUM_BLOCKS * DECODE_BLOCK_SIZE)
+
+    def test_a_cache_write_records_the_slots_that_would_be_dropped(self):
+        """Both ends of the slot range, because the writer drops both silently: a
+        negative slot is vLLM's padding marker, and one past the last row would
+        otherwise scribble on whatever else owns that address."""
+        impl = self._make_impl()
+        capacity = self.NUM_BLOCKS * DECODE_BLOCK_SIZE
+        slots = torch.tensor([-1, -1, 0, 5, capacity, capacity + 1], dtype=torch.int64)
+        with self._tracing():
+            self._write_cache(impl, _ops_mock(), slots)
+
+        (record,) = self._records("reshape_and_cache")
+        summary = record["slot_mapping"]
+        self.assertEqual(summary["count"], 6)
+        self.assertEqual(summary["min"], -1)
+        self.assertEqual(summary["max"], capacity + 1)
+        self.assertEqual(summary["negative"], 2)
+        self.assertEqual(summary["past_capacity"], 2)
+        self.assertEqual(summary["capacity"], capacity)
+        self.assertEqual(summary["first"], slots.tolist())
+
+    def test_a_decode_records_its_page_geometry_and_workspace_plan(self):
+        impl = self._make_impl()
+        with self._tracing():
+            query = torch.randn(3, impl.num_heads, HEAD_SIZE)
+            output = torch.zeros_like(query)
+            ops = _ops_mock()
+            with patch.object(torch.ops, "_C_ascend", ops, create=True):
+                impl.forward_paged_attention(query, self._decode_metadata(3), output)
+
+        ops.npu_turboquant_paged_attention.assert_called_once()
+        (record,) = self._records("decode_attention")
+        self.assertEqual(record["operator"], "npu_turboquant_paged_attention")
+        args = record["launch_args"]
+        self.assertEqual(args["num_tokens"], 3)
+        self.assertEqual(args["num_heads"], impl.num_heads)
+        self.assertEqual(args["num_kv_heads"], impl.num_kv_heads)
+        self.assertEqual(args["head_dim"], HEAD_SIZE)
+        self.assertEqual(args["num_blocks"], self.NUM_BLOCKS)
+        self.assertEqual(args["block_size"], DECODE_BLOCK_SIZE)
+        self.assertEqual(args["max_blocks_per_seq"], 2)
+        # The size the operator itself planned, not a copy of its arithmetic here.
+        self.assertEqual(args["workspace_floats"], WORKSPACE_FLOATS)
+        # A block table is bounded by the block count, a slot mapping by the row count.
+        self.assertEqual(record["block_tables"]["capacity"], self.NUM_BLOCKS)
+        self.assertEqual(record["seq_lens"]["capacity"], self.NUM_BLOCKS * DECODE_BLOCK_SIZE)
+        self.assertEqual(record["tensors"]["rotated_query"]["dtype"], "torch.float32")
+
+    def test_a_cube_decode_records_its_output_stage_and_gate(self):
+        """The Cube decode's stage is the one launch argument that decides whether
+        o_proj is handed a rotated or an un-rotated basis, so a trace that omits it
+        cannot explain the layer's output."""
+        impl = self._make_impl(cube=True)
+        gate = torch.randn(3, impl.num_heads, HEAD_SIZE)
+        with self._tracing():
+            query = torch.randn(3, impl.num_heads, HEAD_SIZE)
+            output = torch.zeros_like(query)
+            ops = _cube_ops()
+            with patch.object(torch.ops, "_C_ascend", ops, create=True):
+                impl.forward_cube_decode(query, self._decode_metadata(3), output, gate)
+
+        ops.npu_turboquant_cube_decode.assert_called_once()
+        (record,) = self._records("decode_attention")
+        self.assertEqual(record["operator"], "npu_turboquant_cube_decode")
+        self.assertEqual(record["decode_path"], "cube")
+        self.assertEqual(record["launch_args"]["output_stage"], int(tq_module.TurboQuantOutputStage.GATED))
+        self.assertEqual(record["tensors"]["output_gate"]["shape"], [3, impl.num_heads, HEAD_SIZE])
+
+    def test_forward_records_the_layer_and_a_per_layer_step_counter(self):
+        """A trace is only readable if a record can be attributed to a layer and a
+        step: the interesting failures are where layer 0 step 1 is fine and a later
+        one is not."""
+        impl = self._make_impl()
+        layer = SimpleNamespace(layer_name="model.layers.7.self_attn.attn")
+        with self._tracing():
+            for _ in range(3):
+                query = torch.randn(2, impl.num_heads, HEAD_SIZE)
+                output = torch.zeros_like(query)
+                ops = _ops_mock()
+                with patch.object(torch.ops, "_C_ascend", ops, create=True):
+                    impl.forward(layer, query, None, None, (), self._decode_metadata(2), output)
+
+        records = self._records("forward")
+        self.assertEqual([r["step"] for r in records], [1, 2, 3])
+        self.assertEqual({r["layer"] for r in records}, {"model.layers.7.self_attn.attn"})
+        self.assertTrue(all(r["is_decode"] and not r["is_prefill"] for r in records))
+        self.assertEqual(records[0]["launch_args"]["num_tokens"], 2)
+
+    def test_forward_labels_a_prefill_as_a_prefill(self):
+        impl = self._make_impl()
+        num_tokens = 4
+        metadata = MagicMock(
+            attn_state=AscendAttentionState.PrefillNoCache,
+            num_actual_tokens=num_tokens,
+            slot_mapping=torch.arange(num_tokens, dtype=torch.int64),
+            actual_seq_lengths_q=[num_tokens],
+            attn_mask=None,
+        )
+        query = torch.randn(num_tokens, impl.num_heads, HEAD_SIZE)
+        key = torch.randn(num_tokens, impl.num_kv_heads, HEAD_SIZE)
+        attn_out = torch.zeros(num_tokens, impl.num_heads * HEAD_SIZE)
+        with self._tracing(), patch.object(tq_module, "torch_npu", MagicMock()) as npu:
+            npu.npu_fused_infer_attention_score.return_value = (attn_out, None)
+            output = torch.zeros(num_tokens, impl.num_heads, HEAD_SIZE)
+            with patch.object(torch.ops, "_C_ascend", _ops_mock(), create=True):
+                impl.forward(SimpleNamespace(layer_name="l0"), query, key, key.clone(), (), metadata, output)
+
+        (record,) = self._records("forward")
+        self.assertEqual(record["phase"], "prefill")
+        self.assertTrue(record["is_prefill"])
+        self.assertFalse(record["is_decode"])
+
+    def test_forward_records_the_profile_run_that_carries_no_metadata(self):
+        """The step that sizes the KV cache enters every layer with nothing to do, and
+        'this layer was entered and did nothing' is one of the things a trace answers."""
+        impl = self._make_impl()
+        with self._tracing():
+            output = torch.ones(2, impl.num_heads, HEAD_SIZE)
+            result = impl.forward(SimpleNamespace(layer_name="l0"), output.clone(), None, None, (), None, output)
+
+        self.assertEqual(self._records("forward")[0]["phase"], "no_metadata")
+        torch.testing.assert_close(result, torch.zeros_like(result))
+
+    # -- dry run --------------------------------------------------------------
+
+    def test_a_dry_run_launches_no_writer_and_still_announces_the_write(self):
+        """Skipping the launch is the point; skipping the notification is not. A KV
+        connector that never sees the event stops the run before it has traced much."""
+        impl = self._make_impl()
+        with self._tracing(dry_run="1"):
+            ops = _ops_mock()
+            with patch.object(tq_module, "notify_kv_cache_written") as notify:
+                self._write_cache(impl, ops, torch.arange(4, dtype=torch.int64))
+
+        ops.npu_turboquant_reshape_and_cache.assert_not_called()
+        ops.npu_turboquant_cube_reshape_and_cache.assert_not_called()
+        notify.assert_called_once()
+        self.assertTrue(self._records("reshape_and_cache")[0]["bypassed"])
+
+    def test_a_dry_run_launches_no_decode_and_zeroes_the_output(self):
+        """Zeroed rather than left alone: ``output`` is whatever the runner last put
+        there, so an untouched buffer would make a dry run look like it computed."""
+        for cube in (False, True):
+            with self.subTest(cube=cube):
+                impl = self._make_impl(cube=cube)
+                with self._tracing(dry_run="1"):
+                    query = torch.randn(3, impl.num_heads, HEAD_SIZE)
+                    output = torch.full((3, impl.num_heads, HEAD_SIZE), 7.0)
+                    ops = _cube_ops() if cube else _ops_mock()
+                    with patch.object(torch.ops, "_C_ascend", ops, create=True):
+                        result = impl.forward_impl(query, None, None, (), self._decode_metadata(3), output)
+
+                ops.npu_turboquant_cube_decode.assert_not_called()
+                ops.npu_turboquant_paged_attention.assert_not_called()
+                ops.npu_turboquant_rotate_q.assert_not_called()
+                torch.testing.assert_close(result, torch.zeros_like(result))
+
+    def test_a_dry_run_completes_a_whole_forward_over_many_layers_and_steps(self):
+        """The reason the mode exists: a real run aborts at the first faulting launch,
+        so the configuration of every later layer and step is never seen."""
+        layers = [SimpleNamespace(layer_name=f"model.layers.{i}.self_attn.attn") for i in range(4)]
+        impls = [self._make_impl() for _ in layers]
+        with self._tracing(dry_run="1"):
+            for step in range(3):
+                for layer, impl in zip(layers, impls):
+                    num_tokens = 2
+                    metadata = self._decode_metadata(num_tokens)
+                    query = torch.randn(num_tokens, impl.num_heads, HEAD_SIZE)
+                    key = torch.randn(num_tokens, impl.num_kv_heads, HEAD_SIZE)
+                    output = torch.zeros(num_tokens, impl.num_heads, HEAD_SIZE)
+                    cache = (impl.key_cache, impl.value_cache)
+                    ops = _ops_mock()
+                    with patch.object(torch.ops, "_C_ascend", ops, create=True):
+                        impl.forward(layer, query, key, key.clone(), cache, metadata, output)
+                    self.assertEqual(ops.npu_turboquant_reshape_and_cache.call_count, 0, step)
+                    self.assertEqual(ops.npu_turboquant_paged_attention.call_count, 0, step)
+
+        self.assertEqual(len(self._records("forward")), 12)
+        self.assertEqual(len(self._records("reshape_and_cache")), 12)
+        self.assertEqual(len(self._records("decode_attention")), 12)
+        # Every layer reached every step, which is what a live run cannot do.
+        self.assertEqual({r["step"] for r in self._records("forward")}, {1, 2, 3})
+        self.assertEqual(len({r["layer"] for r in self._records("forward")}), 4)
+
+    def test_a_dry_run_skips_the_prefill_rotation_and_keeps_the_dense_attention(self):
+        """The V rotation is the only TurboQuant launch a prefill makes; the dense
+        attention beside it is a stock operator and stays."""
+        impl = self._make_impl()
+        impl.output_rotation_folded = True
+        value = torch.randn(4, impl.num_kv_heads, HEAD_SIZE)
+        with self._tracing(dry_run="1"):
+            ops = _ops_mock()
+            with patch.object(torch.ops, "_C_ascend", ops, create=True):
+                rotated = impl._rotate_value_for_prefill(value)
+
+        ops.npu_turboquant_rotate_q.assert_not_called()
+        torch.testing.assert_close(rotated, value)
+        self.assertTrue(self._records("prefill_rotate_value")[0]["bypassed"])
+
+    def test_a_live_capture_records_without_bypassing(self):
+        """Capture and dry-run are independent: a capture of a live run has to launch."""
+        impl = self._make_impl()
+        with self._tracing(capture="1", dry_run="0"):
+            ops = _ops_mock()
+            self._write_cache(impl, ops, torch.arange(4, dtype=torch.int64))
+
+        ops.npu_turboquant_reshape_and_cache.assert_called_once()
+        self.assertFalse(self._records("reshape_and_cache")[0]["bypassed"])
+
+    def test_a_dry_run_without_capture_writes_no_file(self):
+        impl = self._make_impl()
+        with self._tracing(capture="0", dry_run="1"):
+            ops = _ops_mock()
+            self._write_cache(impl, ops, torch.arange(4, dtype=torch.int64))
+
+        ops.npu_turboquant_reshape_and_cache.assert_not_called()
+        self.assertEqual(self._records(), [])
+
+    # -- the diagnostic must never become the failure -------------------------
+
+    def test_the_file_is_line_buffered_so_a_record_survives_an_abort(self):
+        """Nothing flushes or closes this file on the path that matters: the process is
+        killed by the runtime. The record has to be on disk when it is written."""
+        impl = self._make_impl()
+        with self._tracing():
+            self._write_cache(impl, _ops_mock(), torch.arange(4, dtype=torch.int64))
+            # Read it back without closing the tracer -- exactly what a post-mortem does.
+            with open(self.trace_path, encoding="utf-8") as handle:
+                lines = [line for line in handle if line.strip()]
+        self.assertTrue(lines)
+        self.assertEqual(json.loads(lines[0])["event"], "reshape_and_cache")
+
+    def test_an_unopenable_path_falls_back_to_stderr_rather_than_raising(self):
+        impl = self._make_impl()
+        reset_turboquant_tracer()
+        unusable = os.path.join(self.trace_path, "no", "such", "directory", "trace.log")
+        with patch.dict(
+            os.environ,
+            {"TURBOQUANT_CAPTURE_SIGNATURES": "1", "TURBOQUANT_DRY_RUN": "0", "TURBOQUANT_TRACE_PATH": unusable},
+        ):
+            ops = _ops_mock()
+            with patch("sys.stderr", new_callable=MagicMock) as stderr:
+                self._write_cache(impl, ops, torch.arange(4, dtype=torch.int64))
+
+        # The run continued and the writer still launched.
+        ops.npu_turboquant_reshape_and_cache.assert_called_once()
+        self.assertTrue(stderr.write.called)
+
+    def test_a_tensor_that_cannot_be_described_is_recorded_not_raised(self):
+        broken = MagicMock(spec=torch.Tensor)
+        type(broken).shape = property(lambda self: (_ for _ in ()).throw(RuntimeError("no shape")))
+        self.assertIn("describe_failed", describe_tensor(broken))
+        self.assertIn("describe_failed", describe_indices(broken))
+        # And the values the operators legitimately take are described, not refused.
+        self.assertIsNone(describe_tensor(None))
+        self.assertIsNone(describe_indices(None))
+        self.assertIn("not_a_tensor", describe_tensor(3))
+
+    def test_an_index_summary_is_bounded_and_survives_an_empty_tensor(self):
+        long_slots = torch.arange(1000, dtype=torch.int64)
+        summary = describe_indices(long_slots, capacity=500)
+        self.assertEqual(len(summary["first"]), TURBOQUANT_TRACE_PREVIEW)
+        self.assertEqual(summary["past_capacity"], 500)
+        empty = describe_indices(torch.zeros(0, dtype=torch.int64))
+        self.assertEqual(empty["count"], 0)
+        self.assertNotIn("min", empty)
