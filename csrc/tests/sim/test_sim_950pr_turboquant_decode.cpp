@@ -49,8 +49,16 @@ constexpr int64_t kNumKvHeads = 2;
 constexpr int64_t kNumHeads = 4;
 constexpr int64_t kBlockSize = 16;
 constexpr int64_t kNumBlocks = 4;
-constexpr int64_t kContextLen = 32;
-constexpr int64_t kBlocksPerSeq = kContextLen / kBlockSize;
+// Deliberately not a multiple of the 16-row tile the decode reads. 25 rows is one whole
+// tile (valid = 16) followed by a ragged one (valid = 9), so this single length covers both
+// shapes -- where the old 32 only ever produced whole tiles and never reached the tail path
+// at all. The tail is where the kernel masks the rows past the end of the context, and
+// masking them with a vector write to `scores[valid]` was a UB access at byte offset
+// 4 * 9 = 36: "the address for VEC to access UB is not aligned" (error 340), which took the
+// AI core down on the first decode of any sequence whose length left a ragged tail.
+constexpr int64_t kContextLen = 25;
+// Ceiling, because the context no longer divides the block size.
+constexpr int64_t kBlocksPerSeq = (kContextLen + kBlockSize - 1) / kBlockSize;
 constexpr int64_t kQueryTokens = 1;
 constexpr float kAttentionScale = 0.125f;
 constexpr float kInvSqrtHeadSize = 0.125f;

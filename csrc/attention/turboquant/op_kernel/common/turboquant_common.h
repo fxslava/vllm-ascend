@@ -49,6 +49,9 @@ __aicore__ inline void SyncMte2ToVector() { SyncEvent<AscendC::HardEvent::MTE2_V
 __aicore__ inline void SyncVectorToMte2() { SyncEvent<AscendC::HardEvent::V_MTE2>(); }
 __aicore__ inline void SyncMte1ToMatrix() { SyncEvent<AscendC::HardEvent::MTE1_M>(); }
 __aicore__ inline void SyncMatrixToFixpipe() { SyncEvent<AscendC::HardEvent::M_FIX>(); }
+// For the one thing the scalar unit writes into UB that the vector pipe then reads: a lane
+// the vector pipe cannot address because it is not on a 32-byte boundary. See MaskTailLanes.
+__aicore__ inline void SyncScalarToVector() { SyncEvent<AscendC::HardEvent::S_V>(); }
 
 __aicore__ inline uint32_t CeilDiv(uint32_t a, uint32_t b) { return (a + b - 1) / b; }
 

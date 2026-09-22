@@ -28,6 +28,7 @@ namespace {
 
 using vllm_ascend::turboquant::BroadcastScalar;
 using vllm_ascend::turboquant::BroadcastSub;
+using vllm_ascend::turboquant::AlignUp;
 using vllm_ascend::turboquant::CeilDiv;
 using vllm_ascend::turboquant::kBrcbDstLanes;
 using vllm_ascend::turboquant::kFp32PerBlock;
@@ -39,6 +40,7 @@ using vllm_ascend::turboquant::kPartialTail;
 using vllm_ascend::turboquant::ScaleSlotFloats;
 using vllm_ascend::turboquant::SyncMte2ToVector;
 using vllm_ascend::turboquant::SyncMte3ToVector;
+using vllm_ascend::turboquant::SyncScalarToVector;
 using vllm_ascend::turboquant::SyncVectorToMte2;
 using vllm_ascend::turboquant::SyncVectorToMte3;
 using vllm_ascend::turboquant::TurboQuantCodec4;
@@ -50,6 +52,48 @@ constexpr uint32_t kTileRows = vllm_ascend::turboquant::kAivTileRows;
 // The logit a row past the end of a partial tile is masked to.
 constexpr float kMaskedLogit = -1.0e30f;
 constexpr uint32_t kSlotRing = 4;
+
+// Mask the tile lanes at and past `valid`, without ever addressing UB off a 32-byte boundary.
+//
+// `tile[valid]` is a UB address at byte offset `sizeof(float) * valid`, and the AIV refuses a
+// vector access there unless it is a whole 32-byte block: "the address for VEC to access UB is
+// not aligned" (error 340, subErrType 0x4). `valid` is the ragged tail of a context length, so
+// it is a multiple of kFp32PerBlock only by luck -- a 57-token context leaves 9 rows in the
+// last tile, and 9 floats is 36 bytes.
+//
+// So the vector Duplicate starts at the next whole block, and the handful of lanes below it go
+// through the scalar unit, which addresses UB by element and has no such rule. That costs a
+// hand-off in each direction, but only on a tile whose tail is ragged -- at most one per block
+// of context, not one per tile, and an aligned context still takes the single Duplicate it
+// always did.
+//
+// Everywhere else in these kernels a per-lane offset is strided by kFp32PerBlock precisely so
+// the question never arises (the query-scale loop in turboquant_vector_service.h), and the Cube
+// decode masks its own tail without indexing at all: ComputeTailMask there builds a whole-tile
+// +huge/-huge mask arithmetically from a lane progression and Mins the scores with it. That is
+// the better shape where it applies, but it does not cover masking `probs` to zero -- which this
+// kernel needs, because a tile whose rows are all masked would otherwise leave exp(0) = 1 behind.
+// These two tail masks were the only places in any of the kernels indexing UB by a row count.
+__aicore__ inline void MaskTailLanes(const AscendC::LocalTensor<float> &tile, const uint32_t valid,
+                                     const float value)
+{
+    if (valid >= kTileRows) {
+        return;
+    }
+    const uint32_t aligned = AlignUp(valid, kFp32PerBlock);
+    if (aligned > valid) {
+        // Vector -> scalar: the lanes about to be overwritten were just computed by the vector pipe.
+        AscendC::PipeBarrier<PIPE_V>();
+        for (uint32_t lane = valid; lane < aligned; ++lane) {
+            tile.SetValue(lane, value);
+        }
+        // Scalar -> vector: the reductions that follow read the lanes the scalar unit just wrote.
+        SyncScalarToVector();
+    }
+    if (aligned < kTileRows) {
+        AscendC::Duplicate(tile[aligned], value, static_cast<int32_t>(kTileRows - aligned));
+    }
+}
 
 template <typename scalar_t>
 class TurboQuantReshapeAndCache {
@@ -542,9 +586,7 @@ private:
         ComputeRowSums(scores, part, product);
         AscendC::Mul(scores, scores, keyScale, kTileRows);
         AscendC::Muls(scores, scores, scale_, kTileRows);
-        if (valid < kTileRows) {
-            AscendC::Duplicate(scores[valid], kMaskedLogit, kTileRows - valid);
-        }
+        MaskTailLanes(scores, valid, kMaskedLogit);
     }
 
     // newMax, alpha = exp(runMax - newMax), probs = exp(scores - newMax), runSum = runSum * alpha + sum(probs),
@@ -570,9 +612,7 @@ private:
         BroadcastScalar(newMaxBlock, state.newMax);
         BroadcastSub(scores, scores, newMaxBlock, kTileRows);
         AscendC::Exp(probs, scores, kTileRows);
-        if (valid < kTileRows) {
-            AscendC::Duplicate(probs[valid], 0.0f, kTileRows - valid);
-        }
+        MaskTailLanes(probs, valid, 0.0f);
 
         AscendC::WholeReduceSum<float>(part, probs, kTileRows, 1, 1, 1, kTileRows / kFp32PerBlock);
         AscendC::Mul(state.runSum, state.runSum, state.alpha, 1);

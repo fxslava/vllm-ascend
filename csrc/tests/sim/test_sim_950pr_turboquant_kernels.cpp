@@ -44,7 +44,12 @@ constexpr int kNumKvHeads = 2;
 constexpr int kNumHeads = 4;
 constexpr int kBlockSize = 16;
 constexpr int kNumBlocks = 4;
-constexpr int kContextLen = 32;
+// Deliberately not a multiple of the 16-row tile the decode reads: 25 rows is one whole tile
+// (valid = 16) and then a ragged one (valid = 9), so this covers both shapes where 32 only
+// ever produced whole tiles. The ragged tile is where the kernel masks the rows past the end
+// of the context, and a vector write to `scores[valid]` addressed UB at byte offset 4 * 9 = 36
+// -- "the address for VEC to access UB is not aligned" (340). blocks_per_seq already rounds up.
+constexpr int kContextLen = 25;
 constexpr int kQueryTokens = 1;
 constexpr float kAttentionScale = 0.125f;
 
