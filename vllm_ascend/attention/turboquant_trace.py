@@ -108,6 +108,28 @@ def describe_tensors(**named: Any) -> dict[str, Any]:
     return {name: describe_tensor(tensor) for name, tensor in named.items()}
 
 
+def cache_planes(kv_cache: Any) -> tuple:
+    """The KV cache as a tuple of planes, whatever the caller actually passed.
+
+    A served step hands the backend a tuple of planes, but the profile run that
+    sizes the cache (``determine_available_memory`` -> ``profile_run`` ->
+    ``_dummy_run``) hands it a bare empty ``torch.Tensor`` instead.  ``bool()`` on
+    that raises "Boolean value of Tensor with no values is ambiguous" and
+    ``len()`` on a 0-d one raises as well, so neither ``kv_cache or ()`` nor
+    ``len(kv_cache)`` is a question a tensor can answer.  Asking what it is first
+    is: a tensor is one plane, anything iterable is its own planes, and anything
+    else is described as the single object it is rather than refused.
+    """
+    if kv_cache is None:
+        return ()
+    if isinstance(kv_cache, torch.Tensor):
+        return (kv_cache,)
+    try:
+        return tuple(kv_cache)
+    except TypeError:
+        return (kv_cache,)
+
+
 def describe_indices(indices: Any, *, capacity: int | None = None) -> dict[str, Any] | None:
     """Summarise an index tensor -- ``slot_mapping``, ``block_tables``, ``seq_lens``.
 

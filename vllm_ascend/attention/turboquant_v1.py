@@ -97,6 +97,7 @@ from vllm_ascend.attention.turboquant_rotation import output_rotation_is_folded,
 # line-buffered file, and the dry run that walks the engine past the launches so a
 # whole run's configuration can be recorded rather than the first faulting step's.
 from vllm_ascend.attention.turboquant_trace import (
+    cache_planes,
     describe_indices,
     describe_tensors,
     turboquant_tracer,
@@ -1022,6 +1023,11 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             self._trace_layer_name = getattr(layer, "layer_name", None) or getattr(layer, "prefix", None)
             self._trace_step += 1
             self._trace_phase = _attention_phase(attn_metadata)
+            # Not `kv_cache or ()` and not `len(kv_cache)`: the profile run hands this
+            # an empty tensor rather than the tuple of planes a served step does, and a
+            # tensor answers neither question -- it raises, which would make the trace
+            # the crash it exists to explain. See turboquant_trace.cache_planes.
+            planes = cache_planes(kv_cache)
             tracer.record(
                 "forward",
                 **self._trace_caller_context(),
@@ -1031,7 +1037,7 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
                     "num_heads": self.num_heads,
                     "num_kv_heads": self.num_kv_heads,
                     "head_dim": self.head_size,
-                    "kv_cache_planes": 0 if kv_cache is None else len(kv_cache),
+                    "kv_cache_planes": len(planes),
                 },
                 # The capacity is None until the cache is bound, three lines below: the
                 # very first forward of a layer is exactly the one that has not bound it.
@@ -1044,7 +1050,7 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
                     value=value,
                     output=output,
                     output_gate=output_gate,
-                    **{f"kv_cache[{i}]": plane for i, plane in enumerate(kv_cache or ())},
+                    **{f"kv_cache[{i}]": plane for i, plane in enumerate(planes)},
                 ),
             )
 

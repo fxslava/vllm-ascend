@@ -52,6 +52,7 @@ from vllm_ascend.attention.turboquant_rotation import (
 from vllm_ascend.attention.turboquant_trace import (
     TURBOQUANT_TRACE_ALIGNMENTS,
     TURBOQUANT_TRACE_PREVIEW,
+    cache_planes,
     describe_indices,
     describe_tensor,
     reset_turboquant_tracer,
@@ -1896,6 +1897,37 @@ class TestDiagnosticCapture(TestBase):
 
         self.assertEqual(self._records("forward")[0]["phase"], "no_metadata")
         torch.testing.assert_close(result, torch.zeros_like(result))
+
+    def test_the_profile_runs_empty_tensor_cache_is_described_not_evaluated(self):
+        """Regression: ``determine_available_memory`` -> ``profile_run`` -> ``_dummy_run``
+        hands the backend a bare empty tensor where a served step hands a tuple of planes.
+        ``bool()`` on it raises "Boolean value of Tensor with no values is ambiguous", so a
+        trace that asked whether the cache was empty crashed the startup it was capturing."""
+        impl = self._make_impl()
+        with self._tracing():
+            output = torch.ones(2, impl.num_heads, HEAD_SIZE)
+            result = impl.forward(
+                SimpleNamespace(layer_name="l0"), output.clone(), None, None, torch.tensor([]), None, output
+            )
+
+        (record,) = self._records("forward")
+        # Described as the one plane it is, rather than refused or silently dropped.
+        self.assertEqual(record["launch_args"]["kv_cache_planes"], 1)
+        self.assertEqual(record["tensors"]["kv_cache[0]"]["numel"], 0)
+        torch.testing.assert_close(result, torch.zeros_like(result))
+
+    def test_every_shape_a_kv_cache_arrives_in_is_described(self):
+        """A tensor answers neither ``bool()`` nor, when 0-d, ``len()``, so the planes
+        are taken by asking what the argument is rather than by assuming."""
+        planes = (torch.zeros(2), torch.zeros(3))
+        self.assertEqual(cache_planes(None), ())
+        self.assertEqual(cache_planes(planes), planes)
+        self.assertEqual(cache_planes(list(planes)), planes)
+        # The profile run's empty tensor, and a 0-d one, which len() also refuses.
+        self.assertEqual(len(cache_planes(torch.tensor([]))), 1)
+        self.assertEqual(len(cache_planes(torch.tensor(0.0))), 1)
+        # Anything else is described as the single object it is, not raised about.
+        self.assertEqual(cache_planes(object.__new__(object)).__len__(), 1)
 
     # -- dry run --------------------------------------------------------------
 
