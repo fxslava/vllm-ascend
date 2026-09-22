@@ -66,14 +66,6 @@ class DeterministicRandom {
     return values;
   }
 
-  std::vector<float> UniformHalfExact(size_t count, float low, float high) {
-    std::vector<float> values(count);
-    for (size_t i = 0; i < count; ++i) {
-      values[i] = HalfBitsToFloat(FloatToHalfBits(Uniform(low, high)));
-    }
-    return values;
-  }
-
   std::vector<int32_t> Permutation(int32_t count) {
     std::vector<int32_t> values(static_cast<size_t>(count));
     for (int32_t i = 0; i < count; ++i) {

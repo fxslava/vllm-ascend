@@ -121,12 +121,6 @@ int64_t VectorCoreNum(bool *queried);
 
 std::vector<float> UnrotateHeads(std::vector<float> rotated, int64_t head_size);
 
-inline int64_t CodecWorkBufferWords(int64_t head_size, int64_t batch_rows) {
-  constexpr int64_t kBrcbDstLanes = kFp32PerBlock * kFp32PerBlock;
-  constexpr int64_t kBinLanes = 8;
-  return 2 * head_size * batch_rows + head_size + kBrcbDstLanes + kFp32PerBlock + kBinLanes * head_size;
-}
-
 constexpr int64_t kCubeTileRows = tqt::kCubeTileRows;
 constexpr int64_t kUnpackRows = tqt::kCubeUnpackRows;
 constexpr int64_t kOperandC0 = tqt::kOperandC0;

@@ -70,8 +70,18 @@ class TestTurboQuantScaleSlot(TestBase):
             )
 
     def test_the_scale_slot_is_a_whole_burst_and_covers_every_lane(self):
-        for num_kv_heads in KV_HEAD_COUNTS:
-            slot = _spec(num_kv_heads).scale_slot_floats
+        """The arithmetic itself, by value: 2 * num_kv_heads rounded up to a burst.
+
+        Spelled out rather than recomputed, so a change to the rounding has to be
+        written down here to pass. The two invariants underneath it -- every lane
+        kept, every slot burst-aligned -- are what the kernel's one aligned
+        ``DataCopy`` per token depends on.
+        """
+        expected_slots = {1: 8, 2: 8, 3: 8, 4: 8, 5: 16, 6: 16, 8: 16, 16: 32}
+        self.assertEqual(sorted(expected_slots), sorted(KV_HEAD_COUNTS))
+        for num_kv_heads, expected in expected_slots.items():
+            slot = turboquant_scale_slot(num_kv_heads)
+            self.assertEqual(slot, expected, f"num_kv_heads={num_kv_heads}")
             self.assertEqual(slot % 8, 0, f"num_kv_heads={num_kv_heads} is not burst-aligned")
             self.assertGreaterEqual(
                 slot, 2 * num_kv_heads, f"num_kv_heads={num_kv_heads} loses scale lanes"

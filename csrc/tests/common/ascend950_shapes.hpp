@@ -36,8 +36,6 @@ constexpr int64_t kMaxRotaryHeadDim = 1024;
 
 constexpr int64_t kRotaryHalfModeDimMultiple = 2;
 
-constexpr int64_t kKvCacheRank = 4;
-
 inline std::vector<int64_t> FiaKeyCacheView(int64_t num_blocks, int64_t block_size, int64_t num_kv_heads,
                                             int64_t head_size) {
   return {num_blocks, block_size, num_kv_heads * head_size};

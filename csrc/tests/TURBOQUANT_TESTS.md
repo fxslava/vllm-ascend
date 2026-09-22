@@ -2506,7 +2506,7 @@ reason forward from the share.
 | artefact | what it is |
 |---|---|
 | `csrc/tests/common/hadamard_spike.hpp` | host helpers: `Hadamard16Half`, `EarlyStageTables`, chunk sizing, `HadamardDualDstApplies` |
-| `csrc/tests/sim/sim_hadamard_hybrid_kernels.cpp` | 954 lines. AIV-batched butterfly **and** Cube-factorised variants, double-buffered across kSlots |
+| `csrc/tests/common/hadamard_spike_kernels.cpp` | 954 lines. AIV-batched butterfly **and** Cube-factorised variants, double-buffered across kSlots |
 | `csrc/tests/device/bench_950pr_cube_hadamard.cpp` | the silicon benchmark |
 | `hadamard_benchmark_results.csv` | 181 rows of real 950PR device measurements, 100 samples per case |
 | `csrc/attention/turboquant/turboquant_codec_950.h` | the shipping `ApplyPi` / `FastWalshHadamardTransform`, at `batchRows = 1` |
@@ -2566,7 +2566,7 @@ vectors of length L contiguously as `[B][L]`:
   must test the *per-vector* length, not the batched one.
 
 So: two loop bounds, a `batchRows` parameter threaded through `ApplyPi`, and
-longer tables. `sim_hadamard_hybrid_kernels.cpp` already runs a batched butterfly
+longer tables. `common/hadamard_spike_kernels.cpp` already runs a batched butterfly
 of this shape on both CAModel and silicon, so this is porting a proven form
 rather than inventing one.
 

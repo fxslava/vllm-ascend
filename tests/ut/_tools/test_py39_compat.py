@@ -61,6 +61,15 @@ AUDITED_ROOTS = (
     REPO_ROOT / "tests" / "ut" / "_tools",
 )
 
+#: Modules outside those trees that the 3.9 host still imports, by way of the harness.
+#: They are backend code rather than harness code, so they have no root of their own,
+#: but a PEP 604 union in one of them fails the import just the same.
+AUDITED_FILES = (
+    REPO_ROOT / "vllm_ascend" / "attention" / "turboquant_rotation.py",
+    REPO_ROOT / "vllm_ascend" / "attention" / "turboquant_layout.py",
+    REPO_ROOT / "tests" / "ut" / "attention" / "turboquant_cpu_ops.py",
+)
+
 #: The lowest interpreter the Ascend runtime image offers (``/usr/local/lib/python3.9``).
 TARGET_VERSION = (3, 9)
 
@@ -78,10 +87,11 @@ _TYPE_NAMES = frozenset(
 
 
 def audited_sources():
-    """Every module under :data:`AUDITED_ROOTS`, caches excluded."""
+    """Every module under :data:`AUDITED_ROOTS`, plus :data:`AUDITED_FILES`; caches excluded."""
     found = []
     for root in AUDITED_ROOTS:
         found.extend(p for p in sorted(root.rglob("*.py")) if "__pycache__" not in p.parts)
+    found.extend(AUDITED_FILES)
     return found
 
 
@@ -206,6 +216,9 @@ class TestPython39Compatibility(unittest.TestCase):
         names = {path.name for path in sources}
         self.assertIn("families.py", names)
         self.assertIn("run_longbench.py", names)
+        for path in AUDITED_FILES:
+            self.assertTrue(path.is_file(), f"{path} is audited but does not exist")
+            self.assertIn(path, sources)
 
     def test_sources_parse_under_the_39_grammar(self):
         """3.10-only syntax -- ``match``, mostly -- fails before any union does."""

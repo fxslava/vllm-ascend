@@ -122,7 +122,7 @@ if(VLLM_ASCEND_TESTS_HAVE_TURBOQUANT)
 
   # The Cube-Hadamard spike's shape sweep: D in {64, 128, 256, 512} by V in
   # {1, 8, 16, 32}, three hybrid variants and an AIV-only baseline, all against
-  # the CPU golden. It drives a test-owned kernel (sim/sim_hadamard_hybrid_kernels.cpp,
+  # the CPU golden. It drives a test-owned kernel (common/hadamard_spike_kernels.cpp,
   # carried by the same ascendc_library) and touches nothing on the decode path.
   #
   # It lives in the device tier because of arithmetic, not preference: the sim

@@ -78,8 +78,6 @@ inline std::vector<AttentionHeads> GqaConfigurations() {
   };
 }
 
-inline std::vector<int64_t> ContextLengths() { return {1, 63, 64, 200, 512}; }
-
 }
 }
 }

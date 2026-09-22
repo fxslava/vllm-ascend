@@ -53,7 +53,7 @@ set(VLLM_ASCEND_SIM_TESTS
   test_sim_950pr_cube_gemm
   # Exploratory spike, isolated from the decode: a D = 256 Walsh-Hadamard whose
   # lower four butterfly stages are one Cube Mmad. Drives its own kernel source
-  # (sim_hadamard_hybrid_kernels.cpp in this directory), not the decode's.
+  # (common/hadamard_spike_kernels.cpp, shared with the device tier), not the decode's.
   test_sim_950pr_cube_hadamard
   # The standalone query rotation, both dispatch paths, against the CPU
   # reference. No decode in it, so it is seconds to a minute -- and it is the

@@ -125,12 +125,6 @@ class DeviceBuffer {
     ACL_CHECK(aclrtMemcpy(host, size_bytes, data_, size_bytes, ACL_MEMCPY_DEVICE_TO_HOST));
   }
 
-  void Zero() {
-    if (data_ != nullptr) {
-      ACL_CHECK(aclrtMemset(data_, capacity_bytes_, 0, capacity_bytes_));
-    }
-  }
-
   template <typename T>
   static DeviceBuffer FromHost(const std::vector<T>& host, size_t alignment = kDeviceAlignBytes) {
     DeviceBuffer buffer(host.size() * sizeof(T), alignment);

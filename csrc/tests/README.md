@@ -44,7 +44,9 @@ csrc/tests/
 |-- COVERAGE.md             C++ vs Python coverage and parity audit
 |-- TURBOQUANT_TESTS.md     the tier map and every TurboQuant case, reviewed
 |
-|-- common/                 shared infrastructure (see the table below)
+|-- common/                 shared infrastructure (see the table below), including
+|                           hadamard_spike_kernels.cpp -- test-owned Ascend C both
+|                           the sim and device spike binaries link, not the decode
 |-- reference/              turbo_quant_cpu.h, the CPU oracle
 |-- data/golden_layer3/     Git LFS: weights, taps and output of one Qwen3.5 layer
 |-- turboquant/             ascendc_library() for the Ascend C kernels
@@ -59,8 +61,7 @@ csrc/tests/
 |   |-- test_sim_950pr_turboquant_decode.cpp
 |   |-- test_sim_950pr_turboquant_fused.cpp       the fused Cube decode, seven cases (D 256 and 128, raw query), vs goldens and the kernel writer
 |   |-- test_sim_950pr_turboquant_multimode.cpp   the fused Cube decode, all three modes
-|   |-- test_sim_950pr_cube_hadamard.cpp          spike: one shape of the sweep below
-|   `-- sim_hadamard_hybrid_kernels.cpp           spike: test-owned Ascend C, not the decode
+|   `-- test_sim_950pr_cube_hadamard.cpp          spike: one shape of the sweep below
 |
 |-- device/                 TIER 3 -- physical 950PR silicon; every timing
 |   |-- test_device_950pr_turboquant.cpp          production shapes, camodel refused
@@ -90,12 +91,14 @@ csrc/tests/
 | `ascend950_shapes.hpp` | Qwen3.5-2B layer 3 and the arch35 platform rules |
 | `bench_main.cpp` / `bench_main_950pr.cpp` | benchmark entry points; the 950PR one names the part and refuses a camodel |
 | `benchmark.hpp` / `.cpp` | plan-once launch, event timing, statistics, reporting |
+| `camodel_guard.hpp` | a watchdog the sim tier arms around a launch, so a hung camodel exits naming the case instead of running to the ctest timeout |
 | `cpu_reference.hpp` / `.cpp` | naive fp32 references for all five kernels |
 | `device_buffer.hpp` | RAII device allocation, 32-byte default, 512 for benchmarks |
 | `device_tensor.hpp` | device buffer + aclTensor descriptor, with host conversions |
 | `fp16.hpp` | IEEE-754 binary16 conversion, round-to-nearest-even |
 | `golden_layer3.hpp` / `.cpp` | LFS-aware loader for the layer-3 dump |
 | `hadamard_spike.hpp` | the Cube-Hadamard spike's constant images, chunk planning and launchers. Exploratory; not on the decode path |
+| `hadamard_spike_kernels.cpp` | the spike's Ascend C kernels themselves. Test-owned device code, compiled into the same `ascendc_library` as the decode kernels because a `<<<>>>` call site can only reach a launcher in its own library. Linked by the sim and the device spike binaries alike |
 | `main.cpp` / `main_950pr.cpp` | test entry points; the 950PR one prints its tier and whether a camodel is loaded |
 | `partial_rotary_950pr.hpp` / `.cpp` | partial RoPE: custom operator, else packed stock operator |
 | `qwen_shapes.hpp` | Qwen3.5 shapes and the 310P alignment rules |
@@ -103,6 +106,9 @@ csrc/tests/
 | `tensor_compare.hpp` | allclose with a diagnostic report |
 | `test_harness.hpp` / `.cpp` | `AscendTestEnvironment`, and the camodel detection the device tier gates on |
 | `turboquant_launch.hpp` / `.cpp` | torch-free binding for the TurboQuant kernels: the two `_impl` prototypes, the codec table image, the grid maths |
+| `turboquant_audit_models.hpp` | the model geometries the device benchmark and the msprof trace sweep, and the `ASCEND_BENCH_TQ_AUDIT_*` overrides |
+| `turboquant_fused_harness.hpp` | the fused-decode cases' shared fixture: shape, staging, the FNV-1a golden over the raw output, and the output poisoning that catches a kernel that never wrote |
+| `turboquant_mirrored_cache.hpp` | host-side builders for a cache in the kernel's own layout -- packed nibbles, the NZ tiling, the fp8 traits -- so a test can compare cache bytes rather than only decoded values |
 
 ### Which tiers a configuration builds
 

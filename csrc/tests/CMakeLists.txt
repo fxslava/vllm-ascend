@@ -697,10 +697,10 @@ if(VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE)
         # and it rides in this library rather than one of its own because a
         # <<<>>> call site can only reach a kernel whose generated launcher is
         # in the same ascendc_library. Nothing in csrc/attention/ includes it.
-        # Driven by sim/test_sim_950pr_cube_hadamard.cpp at one shape and by
-        # device/test_device_950pr_cube_hadamard.cpp over the whole sweep, so it
-        # has to be in the library both tiers link.
-        "${CMAKE_CURRENT_SOURCE_DIR}/sim/sim_hadamard_hybrid_kernels.cpp")
+        # It lives in common/ because both tiers drive it - sim/ at one shape,
+        # device/ over the whole sweep - beside the common/hadamard_spike.hpp
+        # that declares its launchers.
+        "${CMAKE_CURRENT_SOURCE_DIR}/common/hadamard_spike_kernels.cpp")
 
     foreach(kernel_source ${VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE})
       if(NOT EXISTS "${kernel_source}")

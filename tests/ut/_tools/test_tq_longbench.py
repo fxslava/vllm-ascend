@@ -38,7 +38,6 @@ imports neither ``tests.ut.base`` (which reaches vLLM) nor pytest itself.
 """
 
 from __future__ import annotations
-import __future__
 
 import contextlib
 import ctypes
@@ -1082,35 +1081,6 @@ class TestHuggingFaceBridge(unittest.TestCase):
                 None,
                 scaling=module.scaling,
             )
-
-
-class TestPython39Compatibility(unittest.TestCase):
-    """The NPU host runs Python 3.9, where ``torch.Tensor | None`` in a signature is a TypeError.
-
-    Postponed evaluation (PEP 563) is what makes those annotations legal there,
-    so the compiled flag is asserted rather than the source text.
-    """
-
-    MODULES = (
-        "vllm_ascend/attention/turboquant_rotation.py",
-        "vllm_ascend/attention/turboquant_layout.py",
-        "tests/ut/attention/turboquant_cpu_ops.py",
-        # These too: the 3.9 host imports them before any test can run.
-        "tests/ut/_tools/test_tq_longbench.py",
-        "tests/ut/_tools/test_attention_layer_cpu_equiv.py",
-        *sorted(path.relative_to(REPO_ROOT).as_posix() for path in (REPO_ROOT / "tools" / "tq_longbench").glob("*.py")),
-    )
-
-    def test_every_harness_module_postpones_its_annotations(self):
-        flag = __future__.annotations.compiler_flag
-        for relative in self.MODULES:
-            with self.subTest(module=relative):
-                path = REPO_ROOT / relative
-                source = path.read_text(encoding="utf-8")
-                if "| None" not in source:
-                    continue
-                code = compile(source, str(path), "exec", dont_inherit=True)
-                self.assertTrue(code.co_flags & flag, f"{relative} uses PEP 604 unions without postponed annotations")
 
 
 # glm-4-9b-chat-1m's config.json as published, fetched 2026-09-18. Its
