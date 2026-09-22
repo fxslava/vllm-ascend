@@ -113,6 +113,11 @@ _WORKSPACE_MEMO_LIMIT = 1024
 # is why it is worth naming here rather than reading out of a core dump.
 TURBOQUANT_GM_BURST_BYTES = TURBOQUANT_BURST_FLOATS * 4
 
+# Every index operand the kernels take -- slot_mapping, block_tables, context_lens -- is read
+# as `__gm__ int32_t *`. vLLM hands several of them over as int64, so the staging in
+# _device_index narrows them on the host before the transfer rather than across it.
+TURBOQUANT_INDEX_DTYPE = torch.int32
+
 
 def turboquant_cube_decode_available() -> bool:
     """Whether this build registered the kv4fp8 Cube kernels (Ascend 950 builds only)."""
@@ -500,6 +505,27 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         global ``ASCEND_LAUNCH_BLOCKING=1`` does the same thing for every operator, but
         the platform refuses it unless ACL graph is off (``--enforce-eager``).
         """
+        self._drain_launches(device)
+
+    def _fence_decode(self, device: torch.device) -> None:
+        """Drain the decode's launch, so a core exception names the decode.
+
+        The mirror of :meth:`_fence_cache_write`, and needed for the same reason --
+        with one twist that makes the decode worse to diagnose than the write. The
+        first thing after a decode launch that synchronises with the device is the
+        *next* step's staging copy in :meth:`_device_index`, so a decode that traps
+        comes back as ``ACL_ERROR_RT_VECTOR_CORE_EXCEPTION`` (507035) raised from
+        ``copy_between_host_and_device_opapi`` -- an H2D copy of a handful of int32
+        lengths, which neither reads nor writes anything a core could fault on. The
+        copy is the victim of the queue, not the cause.
+
+        Diagnostic only, and part of what ``VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS``
+        costs: one synchronisation per layer per decode step.
+        """
+        self._drain_launches(device)
+
+    def _drain_launches(self, device: torch.device) -> None:
+        """Wait for everything queued so far. The primitive both fences are."""
         if device.type != "npu":
             return
         torch.npu.synchronize()
@@ -676,25 +702,54 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         allocation for the reason the decode workspace does -- a graph replays the
         addresses it was captured with -- and an operand already on the device is
         returned untouched, so the path that was always correct costs nothing.
+
+        The narrowing and the cast both happen on the operand's own device, before
+        the transfer, so the copy is always same-dtype host-to-device and never asks
+        the runtime to widen or narrow across the bus. The staging buffer is
+        allocated in the operand's dtype and keyed by it, so the two cannot drift
+        apart, and the invariant is checked rather than assumed -- a mismatch here
+        would be a silent reinterpretation of the bytes the kernel then indexes with.
+
+        Note for anyone reading a traceback that lands on the copy below: this is
+        the first call after a decode launch that synchronises with the device, so
+        it is where an *asynchronous* core fault from the previous launch surfaces.
+        ``ACL_ERROR_RT_VECTOR_CORE_EXCEPTION`` (507035) raised from
+        ``copy_between_host_and_device_opapi`` is a kernel that already trapped, not
+        this transfer of a handful of int32 lengths: a copy touches no AI core.
+        :meth:`_fence_decode` is what moves the report back onto the launch that
+        caused it.
         """
-        indices = indices.to(torch.int32).contiguous()
+        # The kernels index with int32 (``__gm__ int32_t *``); vLLM hands these over
+        # as int64 on several paths. Cast first and in place on the source device, so
+        # the transfer below moves int32 words to an int32 buffer.
+        if indices.dtype != TURBOQUANT_INDEX_DTYPE:
+            indices = indices.to(TURBOQUANT_INDEX_DTYPE)
+        indices = indices.contiguous()
         if indices.device == device:
             return indices
 
         if self._device_index_buffers is None:
             self._device_index_buffers = {}
         needed = indices.numel()
-        buffer = self._device_index_buffers.get(name)
+        # Keyed by dtype as well as operand, so a buffer can never be reused under a
+        # dtype it was not allocated for.
+        key = (name, indices.dtype)
+        buffer = self._device_index_buffers.get(key)
         if buffer is None or buffer.numel() < needed:
             if _is_capturing():
                 raise RuntimeError(
                     f"[vllm-ascend/turboquant] {name} lives on {indices.device} and its staging buffer would "
-                    f"have to grow to {needed} int32 words during a graph capture. Run this shape once outside "
-                    "capture so the buffer is sized first."
+                    f"have to grow to {needed} {indices.dtype} words during a graph capture. Run this shape "
+                    "once outside capture so the buffer is sized first."
                 )
-            buffer = torch.empty(needed, dtype=torch.int32, device=device)
-            self._device_index_buffers[name] = buffer
+            buffer = torch.empty(needed, dtype=indices.dtype, device=device)
+            self._device_index_buffers[key] = buffer
         staged = buffer[:needed].view(indices.shape)
+        if staged.dtype != indices.dtype:
+            raise RuntimeError(
+                f"[vllm-ascend/turboquant] the {name} staging buffer is {staged.dtype} but the operand is "
+                f"{indices.dtype}; the copy would reinterpret the bytes the kernel indexes with"
+            )
         staged.copy_(indices)
         return staged
 
@@ -799,6 +854,8 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
                 rotated_query,
             )
             attention_output.copy_(rotated_query)
+        if envs_ascend.VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS:
+            self._fence_decode(query.device)
         return output
 
     def _trace_decode(
@@ -932,6 +989,8 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             int(stage),
             attention_output,
         )
+        if envs_ascend.VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS:
+            self._fence_decode(device)
         return output
 
     def _rotate_value_for_prefill(self, value: torch.Tensor) -> torch.Tensor:

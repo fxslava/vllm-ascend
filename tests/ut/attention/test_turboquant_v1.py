@@ -937,27 +937,31 @@ class TestBufferPoisoning(TestBase):
         # The live rows are handed to the codec inside a buffer sized for a full
         # batch, with the padding poisoned differently on each pass. Identical
         # payload output across both passes means the padding was never read.
+        #
+        # batch_rows is fixed at the kernel's full TPipe pool rather than swept:
+        # what the property needs is that padding exists at all, and a second
+        # pool size only repeats the same 1-live-row and 3-live-row cases.
+        batch_rows = 8
         for head_size in (64, 128, 256):
-            for batch_rows in (4, 8):
-                for rows in (1, 3):
-                    packed_stride = head_size // TURBOQUANT_PACK_FACTOR
-                    live = ((torch.arange(rows * packed_stride) % 256) - 128).to(torch.int8)
-                    live = live.reshape(rows, packed_stride)
-                    isolated = _dequantize_levels(live)
+            for rows in (1, 3):
+                packed_stride = head_size // TURBOQUANT_PACK_FACTOR
+                live = ((torch.arange(rows * packed_stride) % 256) - 128).to(torch.int8)
+                live = live.reshape(rows, packed_stride)
+                isolated = _dequantize_levels(live)
 
-                    payloads = []
-                    for variant in (0, 1):
-                        buffer = self._poison_bytes((batch_rows, packed_stride), variant)
-                        buffer[:rows] = live
-                        expanded = _dequantize_levels(buffer)
-                        payload = expanded[:rows]
-                        self.assertTrue(
-                            torch.isfinite(payload).all(),
-                            f"D={head_size} rows={rows} batch_rows={batch_rows}",
-                        )
-                        torch.testing.assert_close(payload, isolated, atol=0, rtol=0)
-                        payloads.append(payload.clone())
-                    torch.testing.assert_close(payloads[0], payloads[1], atol=0, rtol=0)
+                payloads = []
+                for variant in (0, 1):
+                    buffer = self._poison_bytes((batch_rows, packed_stride), variant)
+                    buffer[:rows] = live
+                    expanded = _dequantize_levels(buffer)
+                    payload = expanded[:rows]
+                    self.assertTrue(
+                        torch.isfinite(payload).all(),
+                        f"D={head_size} rows={rows} batch_rows={batch_rows}",
+                    )
+                    torch.testing.assert_close(payload, isolated, atol=0, rtol=0)
+                    payloads.append(payload.clone())
+                torch.testing.assert_close(payloads[0], payloads[1], atol=0, rtol=0)
 
     def test_dequantize_rows_are_independent(self):
         # Row r of the output must depend only on row r of the input. A shared
@@ -1184,23 +1188,10 @@ class TestBackendContract(TestBase):
 
         ops.npu_turboquant_vector_core_num.assert_called_once_with()
 
-    def test_scale_cache_is_indexed_by_token_and_burst_aligned(self):
-        # Indexing by token rather than by head is what lets the kernel scatter a
-        # token's scales in one aligned burst; the slot is padded to 8 fp32 so
-        # every write lands on a 32-byte boundary.
-        impl = AscendTurboQuantAttentionBackendImpl.__new__(AscendTurboQuantAttentionBackendImpl)
-        impl.scale_cache = None
-        cache = torch.zeros(3, 128, 2, HEAD_SIZE // TURBOQUANT_PACK_FACTOR, dtype=torch.int8)
-        impl._ensure_scale_cache((cache, cache))
-        self.assertEqual(tuple(impl.scale_cache.shape), (3, 128, 8))
-        self.assertEqual(impl.scale_cache.dtype, torch.float32)
-
-    def test_scale_slot_is_a_whole_burst(self):
-        for num_kv_heads, expected in ((1, 8), (2, 8), (4, 8), (5, 16), (8, 16)):
-            slot = turboquant_scale_slot(num_kv_heads)
-            self.assertEqual(slot, expected, f"num_kv_heads={num_kv_heads}")
-            self.assertGreaterEqual(slot, 2 * num_kv_heads)
-            self.assertEqual(slot % 8, 0)
+    # The scale plane's own arithmetic and allocation are not retested here: the
+    # slot table lives in test_turboquant_page_budget.TestTurboQuantScaleSlot and
+    # _ensure_scale_cache in test_turboquant_scale_plane.TestScalePlaneHandover,
+    # which is the module that owns the hand-over.
 
     def _prefill(self, folded: bool):
         impl = AscendTurboQuantAttentionBackendImpl.__new__(AscendTurboQuantAttentionBackendImpl)
@@ -2148,19 +2139,23 @@ class TestDecodeIndexOperandDevice(TestBase):
         impl._device_index(torch.zeros(4, dtype=torch.int32), META, "seq_lens")
         impl._device_index(torch.zeros(4, 2, dtype=torch.int32), META, "block_tables")
         buffers = dict(impl._device_index_buffers)
-        self.assertEqual(sorted(buffers), ["block_tables", "seq_lens"])
-        self.assertIsNot(buffers["seq_lens"], buffers["block_tables"])
+        # Keyed by operand *and* dtype, so a buffer cannot be reused under a dtype it
+        # was not allocated for.
+        lengths = ("seq_lens", tq_module.TURBOQUANT_INDEX_DTYPE)
+        pages = ("block_tables", tq_module.TURBOQUANT_INDEX_DTYPE)
+        self.assertEqual(sorted(buffers), sorted([pages, lengths]))
+        self.assertIsNot(buffers[lengths], buffers[pages])
 
         # A second step of the same shape reuses both allocations.
         impl._device_index(torch.zeros(4, dtype=torch.int32), META, "seq_lens")
-        self.assertIs(impl._device_index_buffers["seq_lens"], buffers["seq_lens"])
+        self.assertIs(impl._device_index_buffers[lengths], buffers[lengths])
         # A narrower step takes a view of the prefix rather than reallocating.
         narrow = impl._device_index(torch.zeros(2, dtype=torch.int32), META, "seq_lens")
-        self.assertIs(impl._device_index_buffers["seq_lens"], buffers["seq_lens"])
+        self.assertIs(impl._device_index_buffers[lengths], buffers[lengths])
         self.assertEqual(narrow.shape, (2,))
         # A wider one has to grow.
         impl._device_index(torch.zeros(64, dtype=torch.int32), META, "seq_lens")
-        self.assertIsNot(impl._device_index_buffers["seq_lens"], buffers["seq_lens"])
+        self.assertIsNot(impl._device_index_buffers[lengths], buffers[lengths])
 
     def test_growing_the_staging_buffer_during_a_capture_is_refused(self):
         impl = self._make_impl(META)
@@ -2218,3 +2213,111 @@ class TestDecodeIndexOperandDevice(TestBase):
         context_lens = ops.npu_turboquant_paged_attention.call_args.args[5]
         self.assertEqual(context_lens.dtype, torch.int32)
         self.assertEqual(context_lens.device, META)
+
+    def test_the_narrowing_happens_before_the_transfer_not_across_it(self):
+        """An int64 operand is narrowed on its own device, so the host-to-device copy
+        is always same-dtype and never asks the runtime to convert across the bus."""
+        impl = self._make_impl(META)
+        host_int64 = torch.tensor([17, 4, 900], dtype=torch.int64)
+        copied: list = []
+
+        original = torch.Tensor.copy_
+
+        def record(dst, src, *args, **kwargs):
+            copied.append((src.dtype, src.device, dst.dtype, dst.device))
+            return original(dst, src, *args, **kwargs)
+
+        with patch.object(torch.Tensor, "copy_", record):
+            staged = impl._device_index(host_int64, META, "seq_lens")
+
+        self.assertEqual(len(copied), 1)
+        src_dtype, src_device, dst_dtype, dst_device = copied[0]
+        # The source was already int32 by the time it crossed, and on the host.
+        self.assertEqual(src_dtype, tq_module.TURBOQUANT_INDEX_DTYPE)
+        self.assertEqual(src_device.type, "cpu")
+        self.assertEqual(dst_dtype, src_dtype)
+        self.assertEqual(dst_device, META)
+        self.assertEqual(staged.dtype, tq_module.TURBOQUANT_INDEX_DTYPE)
+
+    def test_the_staging_buffer_is_allocated_in_the_operand_dtype(self):
+        impl = self._make_impl(META)
+        impl._device_index(torch.zeros(4, dtype=torch.int64), META, "seq_lens")
+        ((key, buffer),) = impl._device_index_buffers.items()
+        # Keyed by dtype as well as operand, so a buffer cannot be reused under a
+        # dtype it was not allocated for.
+        self.assertEqual(key, ("seq_lens", tq_module.TURBOQUANT_INDEX_DTYPE))
+        self.assertEqual(buffer.dtype, tq_module.TURBOQUANT_INDEX_DTYPE)
+
+    def test_a_staging_buffer_of_the_wrong_dtype_is_refused_not_reinterpreted(self):
+        """The copy would otherwise reinterpret the bytes the kernel indexes with."""
+        impl = self._make_impl(META)
+        impl._device_index_buffers = {
+            ("seq_lens", tq_module.TURBOQUANT_INDEX_DTYPE): torch.empty(8, dtype=torch.int16, device=META)
+        }
+        with self.assertRaisesRegex(RuntimeError, "staging buffer is"):
+            impl._device_index(torch.zeros(4, dtype=torch.int64), META, "seq_lens")
+
+
+class TestDecodeFence(TestBase):
+    """507035 is ACL_ERROR_RT_VECTOR_CORE_EXCEPTION, not a copy error.
+
+    An Ascend launch is asynchronous, so a decode that traps does not fail its own
+    launch. The first call after it that synchronises is the *next* step's staging
+    copy in ``_device_index``, which is why the fault comes back from
+    ``copy_between_host_and_device_opapi`` -- a host-to-device transfer of a handful
+    of int32 lengths, which touches no AI core and cannot have raised it. The fence
+    is what moves the report back onto the launch that caused it.
+    """
+
+    def _make_impl(self, cube: bool = False) -> AscendTurboQuantAttentionBackendImpl:
+        impl = AscendTurboQuantAttentionBackendImpl.__new__(AscendTurboQuantAttentionBackendImpl)
+        impl.head_size = HEAD_SIZE
+        impl.num_heads = 8
+        impl.num_kv_heads = 2
+        impl.scale = HEAD_SIZE**-0.5
+        impl.key_cache = torch.zeros(1, DECODE_BLOCK_SIZE, 2, HEAD_SIZE // TURBOQUANT_PACK_FACTOR, dtype=torch.int8)
+        impl.value_cache = impl.key_cache
+        impl.scale_cache = torch.zeros(1, DECODE_BLOCK_SIZE, turboquant_scale_slot(2))
+        impl._pi_signs = None
+        impl.decode_workspace = None
+        impl._workspace_floats = {}
+        impl.rotated_query = None
+        impl._hadamard16 = None
+        impl._device_index_buffers = None
+        impl.output_rotation_folded = False
+        impl.cube_decode = cube
+        return impl
+
+    def _decode(self, impl, ops):
+        query = torch.randn(2, impl.num_heads, HEAD_SIZE)
+        output = torch.zeros_like(query)
+        metadata = MagicMock(
+            attn_state=AscendAttentionState.DecodeOnly,
+            block_tables=torch.zeros(2, 1, dtype=torch.int32),
+            seq_lens=torch.ones(2, dtype=torch.int32),
+        )
+        with patch.object(torch.ops, "_C_ascend", ops, create=True):
+            impl.forward_impl(query, None, None, (), metadata, output)
+
+    def test_the_fence_drains_on_device_and_nowhere_else(self):
+        impl = self._make_impl()
+        with patch.object(tq_module.torch, "npu", MagicMock(), create=True) as npu:
+            impl._fence_decode(torch.device("cpu"))
+            npu.synchronize.assert_not_called()
+            impl._fence_decode(SimpleNamespace(type="npu"))
+            npu.synchronize.assert_called_once()
+
+    def test_both_decodes_are_fenced_only_under_the_diagnostic_flag(self):
+        """One synchronisation per layer per step; it rides the same flag the write
+        fence does and is never a serving default."""
+        for cube in (False, True):
+            with self.subTest(cube=cube):
+                impl = self._make_impl(cube=cube)
+                ops = _cube_ops() if cube else _ops_mock()
+                with patch.object(impl, "_fence_decode") as fence:
+                    with patch.dict("os.environ", {"VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS": "0"}):
+                        self._decode(impl, ops)
+                    fence.assert_not_called()
+                    with patch.dict("os.environ", {"VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS": "1"}):
+                        self._decode(impl, ops)
+                    fence.assert_called_once()
