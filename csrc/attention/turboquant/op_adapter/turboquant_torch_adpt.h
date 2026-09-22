@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 #include "../../../kernels/types.h"
 #include "../../../npu_device_registry.h"
@@ -107,6 +108,22 @@ inline void CheckGmBurstAligned(const at::Tensor &tensor, const char *name)
                 kGmBurstBytes, "-byte burst; the kernel's global-memory copies would start mid-burst");
 }
 
+// Every operand below is handed to a kernel as a `__gm__` pointer, so it has to live in the
+// device's global memory. A host tensor is not a wrong answer, it is "the address for scalar
+// to access GM is invalid" (264) raised from whichever later launch the runtime happened to
+// be working on -- and nothing about the tensor says so, because dtype, shape and contiguity
+// are all exactly what the kernel wants. It is worth naming at the boundary: the metadata
+// keeps some index tensors (seq_lens) on the host on purpose, since the CANN paged attention
+// the stock backend calls reads its lengths host-side to tile with. These kernels do not.
+inline void CheckOnDevice(const at::Tensor &tensor, const char *name, const at::Tensor &reference,
+                          const char *reference_name)
+{
+    TORCH_CHECK(tensor.device() == reference.device(), name, " is on ", tensor.device(), " but ", reference_name,
+                " is on ", reference.device(),
+                "; the kernel reads it from global memory, so a host tensor reaches the AI core as an invalid "
+                "address rather than as a wrong answer");
+}
+
 inline void CheckCodecTables(const at::Tensor &tables, int64_t headSize, int64_t batchRows)
 {
     const int64_t words = tq::CodecTableWords(headSize, batchRows);
@@ -164,6 +181,13 @@ inline void npu_turboquant_reshape_and_cache(at::Tensor &key, at::Tensor &value,
     adpt::CheckGmBurstAligned(value_cache, "value_cache");
     adpt::CheckGmBurstAligned(scale_cache, "scale_cache");
     adpt::CheckGmBurstAligned(slot_mapping, "slot_mapping");
+    for (const auto &operand : {std::make_pair("value", &value), std::make_pair("key_cache", &key_cache),
+                                std::make_pair("value_cache", &value_cache),
+                                std::make_pair("scale_cache", &scale_cache),
+                                std::make_pair("slot_mapping", &slot_mapping), std::make_pair("pi_signs", &pi_signs),
+                                std::make_pair("codec_tables", &codec_tables)}) {
+        adpt::CheckOnDevice(*operand.second, operand.first, key, "key");
+    }
 
     const int64_t num_tokens = key.size(0);
     const int64_t num_kv_heads = key.size(1);
@@ -282,8 +306,17 @@ inline void npu_turboquant_paged_attention(at::Tensor &query_rot, at::Tensor &ke
                 "the scale plane must be a float32 [num_blocks, block_size, scale_slot] tensor");
     TORCH_CHECK(block_tables.dim() == 2 && block_tables.scalar_type() == at::ScalarType::Int,
                 "block_tables must be an int32 [num_tokens, max_blocks_per_seq] tensor");
-    TORCH_CHECK(context_lens.scalar_type() == at::ScalarType::Int, "context_lens must be int32");
+    TORCH_CHECK(context_lens.scalar_type() == at::ScalarType::Int && context_lens.is_contiguous(),
+                "context_lens must be a contiguous int32 tensor");
     TORCH_CHECK(query_rot.is_contiguous() && out.is_contiguous(), "query_rot and out must be contiguous");
+    for (const auto &operand : {std::make_pair("key_cache", &key_cache), std::make_pair("value_cache", &value_cache),
+                                std::make_pair("scale_cache", &scale_cache),
+                                std::make_pair("block_tables", &block_tables),
+                                std::make_pair("context_lens", &context_lens),
+                                std::make_pair("codec_tables", &codec_tables), std::make_pair("workspace", &workspace),
+                                std::make_pair("out", &out)}) {
+        adpt::CheckOnDevice(*operand.second, operand.first, query_rot, "query_rot");
+    }
     TORCH_CHECK(key_cache.is_contiguous() && value_cache.is_contiguous() && scale_cache.is_contiguous(),
                 "the kv cache and its scale plane must be contiguous");
 
@@ -440,6 +473,13 @@ inline void npu_turboquant_cube_reshape_and_cache(at::Tensor &key, at::Tensor &v
     adpt::CheckGmBurstAligned(value_cache, "value_cache");
     adpt::CheckGmBurstAligned(scale_cache, "scale_cache");
     adpt::CheckGmBurstAligned(slot_mapping, "slot_mapping");
+    for (const auto &operand : {std::make_pair("value", &value), std::make_pair("key_cache", &key_cache),
+                                std::make_pair("value_cache", &value_cache),
+                                std::make_pair("scale_cache", &scale_cache),
+                                std::make_pair("slot_mapping", &slot_mapping), std::make_pair("pi_signs", &pi_signs),
+                                std::make_pair("codec_tables", &codec_tables)}) {
+        adpt::CheckOnDevice(*operand.second, operand.first, key, "key");
+    }
 
     if (num_tokens == 0) {
         return;
@@ -495,6 +535,18 @@ inline void npu_turboquant_cube_decode(at::Tensor &query, const c10::optional<at
                 "block_tables must be a contiguous int32 [num_tokens, max_blocks_per_seq] tensor");
     TORCH_CHECK(context_lens.scalar_type() == at::ScalarType::Int && context_lens.is_contiguous(),
                 "context_lens must be a contiguous int32 tensor");
+    for (const auto &operand : {std::make_pair("key_cache", &key_cache), std::make_pair("value_cache", &value_cache),
+                                std::make_pair("scale_cache", &scale_cache),
+                                std::make_pair("block_tables", &block_tables),
+                                std::make_pair("context_lens", &context_lens), std::make_pair("pi_signs", &pi_signs),
+                                std::make_pair("codec_tables", &codec_tables),
+                                std::make_pair("hadamard16", &hadamard16), std::make_pair("query_rot", &query_rot),
+                                std::make_pair("workspace", &workspace), std::make_pair("out", &out)}) {
+        adpt::CheckOnDevice(*operand.second, operand.first, query, "query");
+    }
+    if (gated) {
+        adpt::CheckOnDevice(*gate, "gate", query, "query");
+    }
 
     const int64_t num_tokens = query.size(0);
     const int64_t head_size = query.size(2);

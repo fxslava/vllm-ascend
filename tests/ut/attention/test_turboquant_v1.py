@@ -2072,3 +2072,149 @@ class TestDiagnosticCapture(TestBase):
         empty = describe_indices(torch.zeros(0, dtype=torch.int64))
         self.assertEqual(empty["count"], 0)
         self.assertNotIn("min", empty)
+
+
+class TestDecodeIndexOperandDevice(TestBase):
+    """The decode's index operands have to reach the kernel in global memory.
+
+    ``AscendMetadata.seq_lens`` is deliberately a *host* tensor: the metadata builder
+    takes it from ``seq_lens_cpu``, or copies it to the host if it has to, because the
+    CANN paged attention the stock backend calls reads the lengths host-side to tile
+    with.  The TurboQuant kernels read it with ``contextLenGm_.GetValue(token)`` -- a
+    scalar read from global memory -- so a host tensor reaches a vector core as an
+    invalid address (error 264), reported from whichever later launch the runtime was
+    working on.
+
+    The device here is ``meta`` rather than ``npu``: what is under test is that the
+    staging happens and where it lands, which needs a second device and no driver.
+    """
+
+    NUM_BLOCKS = 2
+
+    def _make_impl(self, device: torch.device) -> AscendTurboQuantAttentionBackendImpl:
+        impl = AscendTurboQuantAttentionBackendImpl.__new__(AscendTurboQuantAttentionBackendImpl)
+        impl.head_size = HEAD_SIZE
+        impl.num_heads = 8
+        impl.num_kv_heads = 2
+        impl.scale = HEAD_SIZE**-0.5
+        impl.attn_type = "decoder"
+        impl.kv_sharing_target_layer_name = None
+        impl.is_kv_producer = False
+        cache_shape = (self.NUM_BLOCKS, DECODE_BLOCK_SIZE, 2, HEAD_SIZE // TURBOQUANT_PACK_FACTOR)
+        impl.key_cache = torch.empty(cache_shape, dtype=torch.int8, device=device)
+        impl.value_cache = torch.empty(cache_shape, dtype=torch.int8, device=device)
+        impl.scale_cache = torch.empty(
+            self.NUM_BLOCKS, DECODE_BLOCK_SIZE, turboquant_scale_slot(2), device=device
+        )
+        impl._pi_signs = None
+        impl.decode_workspace = None
+        impl._workspace_floats = {}
+        impl.rotated_query = None
+        impl._hadamard16 = None
+        impl._device_index_buffers = None
+        impl.output_rotation_folded = False
+        impl.cube_decode = False
+        return impl
+
+    def test_the_int32_cast_alone_does_not_move_a_host_tensor(self):
+        """Why the bug was invisible: the operands already satisfy every other check.
+        ``.to(torch.int32).contiguous()`` on a contiguous int32 host tensor returns the
+        very same object -- right dtype, right shape, right strides, wrong memory."""
+        host = torch.arange(4, dtype=torch.int32)
+        self.assertIs(host.to(torch.int32).contiguous(), host)
+
+    def test_a_host_index_operand_is_staged_onto_the_query_device(self):
+        impl = self._make_impl(META)
+        host_seq_lens = torch.tensor([17, 4, 900], dtype=torch.int32)
+        staged = impl._device_index(host_seq_lens, META, "seq_lens")
+
+        self.assertEqual(staged.device, META)
+        self.assertEqual(staged.dtype, torch.int32)
+        self.assertEqual(staged.shape, host_seq_lens.shape)
+        self.assertTrue(staged.is_contiguous())
+
+    def test_an_operand_already_on_the_device_is_handed_over_untouched(self):
+        """The path that was always correct must not start paying for a copy."""
+        impl = self._make_impl(META)
+        resident = torch.empty(4, dtype=torch.int32, device=META)
+        self.assertIs(impl._device_index(resident, META, "seq_lens"), resident)
+        self.assertIsNone(impl._device_index_buffers)
+
+    def test_the_staging_buffer_is_persistent_and_per_operand(self):
+        """Allocation-free in the steady state, for the reason the decode workspace is:
+        a graph replays the addresses it was captured with. Two operands are staged per
+        decode, so one shared buffer would have them overwrite each other."""
+        impl = self._make_impl(META)
+        impl._device_index(torch.zeros(4, dtype=torch.int32), META, "seq_lens")
+        impl._device_index(torch.zeros(4, 2, dtype=torch.int32), META, "block_tables")
+        buffers = dict(impl._device_index_buffers)
+        self.assertEqual(sorted(buffers), ["block_tables", "seq_lens"])
+        self.assertIsNot(buffers["seq_lens"], buffers["block_tables"])
+
+        # A second step of the same shape reuses both allocations.
+        impl._device_index(torch.zeros(4, dtype=torch.int32), META, "seq_lens")
+        self.assertIs(impl._device_index_buffers["seq_lens"], buffers["seq_lens"])
+        # A narrower step takes a view of the prefix rather than reallocating.
+        narrow = impl._device_index(torch.zeros(2, dtype=torch.int32), META, "seq_lens")
+        self.assertIs(impl._device_index_buffers["seq_lens"], buffers["seq_lens"])
+        self.assertEqual(narrow.shape, (2,))
+        # A wider one has to grow.
+        impl._device_index(torch.zeros(64, dtype=torch.int32), META, "seq_lens")
+        self.assertIsNot(impl._device_index_buffers["seq_lens"], buffers["seq_lens"])
+
+    def test_growing_the_staging_buffer_during_a_capture_is_refused(self):
+        impl = self._make_impl(META)
+        with (
+            patch.object(tq_module, "_EXTRA_CTX", SimpleNamespace(capturing=True)),
+            self.assertRaisesRegex(RuntimeError, "during a graph capture"),
+        ):
+            impl._device_index(torch.zeros(4, dtype=torch.int32), META, "seq_lens")
+
+    def _decode(self, impl, ops, num_tokens=3, seq_lens=None, block_tables=None):
+        query = torch.empty(num_tokens, impl.num_heads, HEAD_SIZE, device=META)
+        output = torch.empty_like(query)
+        metadata = MagicMock(
+            attn_state=AscendAttentionState.DecodeOnly,
+            block_tables=(
+                block_tables if block_tables is not None else torch.empty(num_tokens, 2, dtype=torch.int32, device=META)
+            ),
+            seq_lens=seq_lens if seq_lens is not None else torch.ones(num_tokens, dtype=torch.int32),
+        )
+        with patch.object(torch.ops, "_C_ascend", ops, create=True):
+            impl.forward_impl(query, None, None, (), metadata, output)
+        return metadata
+
+    def test_the_paged_decode_is_handed_device_resident_lengths(self):
+        impl = self._make_impl(META)
+        ops = _ops_mock()
+        host_seq_lens = torch.tensor([9, 9, 9], dtype=torch.int32)
+        self._decode(impl, ops, seq_lens=host_seq_lens)
+
+        # query_rot, k_cache, v_cache, scale_cache, block_tables, context_lens, ...
+        context_lens = ops.npu_turboquant_paged_attention.call_args.args[5]
+        self.assertEqual(context_lens.device, META)
+        self.assertIsNot(context_lens, host_seq_lens)
+        block_tables = ops.npu_turboquant_paged_attention.call_args.args[4]
+        self.assertEqual(block_tables.device, META)
+
+    def test_the_cube_decode_is_handed_device_resident_lengths(self):
+        impl = self._make_impl(META)
+        impl.cube_decode = True
+        ops = _cube_ops()
+        self._decode(impl, ops, seq_lens=torch.tensor([9, 9, 9], dtype=torch.int32))
+
+        # query, gate, pi_signs, codec_tables, hadamard16, k_cache, v_cache,
+        # scale_cache, block_tables, context_lens, ...
+        args = ops.npu_turboquant_cube_decode.call_args.args
+        self.assertEqual(args[9].device, META)
+        self.assertEqual(args[8].device, META)
+
+    def test_an_int64_host_length_reaches_the_kernel_as_int32(self):
+        """The metadata's seq_lens is int64 on some paths; the kernel reads int32."""
+        impl = self._make_impl(META)
+        ops = _ops_mock()
+        self._decode(impl, ops, seq_lens=torch.ones(3, dtype=torch.int64))
+
+        context_lens = ops.npu_turboquant_paged_attention.call_args.args[5]
+        self.assertEqual(context_lens.dtype, torch.int32)
+        self.assertEqual(context_lens.device, META)

@@ -264,9 +264,15 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
     _trace_step = 0
     _trace_phase = "unknown"
 
+    # Staging for an index operand the metadata keeps on the host; see _device_index.
+    # None rather than {} because a mutable class attribute would be shared by every
+    # layer; the dict is created per impl on first use.
+    _device_index_buffers: dict[str, torch.Tensor] | None = None
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.scale_cache: torch.Tensor | None = None
+        self._device_index_buffers = None
         self._pi_signs: torch.Tensor | None = None
         self.decode_workspace: torch.Tensor | None = None
         self._workspace_floats: dict[tuple[int, int], int] = {}
@@ -650,6 +656,48 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         self.decode_workspace = torch.empty(needed, dtype=torch.float32, device=device)
         return self.decode_workspace
 
+    def _device_index(self, indices: torch.Tensor, device: torch.device, name: str) -> torch.Tensor:
+        """Return ``indices`` as a contiguous int32 tensor in the kernels' global memory.
+
+        ``AscendMetadata.seq_lens`` is deliberately a *host* tensor: the metadata
+        builder takes it from ``seq_lens_cpu``, or copies it to the host if it has
+        to, because the CANN paged attention the stock backend calls reads the
+        lengths host-side to tile with. These kernels do not --
+        ``contextLenGm_.GetValue(token)`` is a scalar read from global memory -- so
+        handing them the metadata's tensor hands a vector core a host address. That
+        is not a wrong answer, it is "the address for scalar to access GM is
+        invalid" (error 264), reported from whichever later launch the runtime was
+        working on.
+
+        ``.to(torch.int32).contiguous()`` does not catch it: the tensor is already
+        contiguous int32, so both calls return it unchanged, device and all.
+
+        The copy lands in a persistent per-operand buffer rather than a fresh
+        allocation for the reason the decode workspace does -- a graph replays the
+        addresses it was captured with -- and an operand already on the device is
+        returned untouched, so the path that was always correct costs nothing.
+        """
+        indices = indices.to(torch.int32).contiguous()
+        if indices.device == device:
+            return indices
+
+        if self._device_index_buffers is None:
+            self._device_index_buffers = {}
+        needed = indices.numel()
+        buffer = self._device_index_buffers.get(name)
+        if buffer is None or buffer.numel() < needed:
+            if _is_capturing():
+                raise RuntimeError(
+                    f"[vllm-ascend/turboquant] {name} lives on {indices.device} and its staging buffer would "
+                    f"have to grow to {needed} int32 words during a graph capture. Run this shape once outside "
+                    "capture so the buffer is sized first."
+                )
+            buffer = torch.empty(needed, dtype=torch.int32, device=device)
+            self._device_index_buffers[name] = buffer
+        staged = buffer[:needed].view(indices.shape)
+        staged.copy_(indices)
+        return staged
+
     def _rotated_query(self, num_tokens: int, device: torch.device) -> torch.Tensor:
         """Return the fp32 buffer ``npu_turboquant_rotate_q`` writes into.
 
@@ -693,8 +741,10 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         # are host-side work -- a view, two dtype casts and a memoised buffer lookup --
         # so the live path is unchanged by the move.
         rotated_query = self._rotated_query(num_tokens, query.device)
-        block_tables = attn_metadata.block_tables.to(torch.int32).contiguous()
-        seq_lens = attn_metadata.seq_lens.to(torch.int32).contiguous()
+        # Both are read from global memory by the kernel, and seq_lens reaches the
+        # backend on the host. See _device_index.
+        block_tables = self._device_index(attn_metadata.block_tables, query.device, "block_tables")
+        seq_lens = self._device_index(attn_metadata.seq_lens, query.device, "seq_lens")
         workspace = self._decode_workspace(num_tokens, block_tables.shape[1], self.key_cache.shape[1], query.device)
         attention_output = output[:num_tokens].view(num_tokens, self.num_heads, self.head_size)
 
@@ -835,10 +885,12 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         device = query.device
         stage = self._cube_output_stage(output_gate)
         gate = None if output_gate is None else output_gate[:num_tokens].contiguous()
-        block_tables = attn_metadata.block_tables.to(torch.int32).contiguous()
-        # Hoisted for the same reason forward_paged_attention hoists its operands: the
-        # trace has to name the tensors the launch is handed, not their sources.
-        seq_lens = attn_metadata.seq_lens.to(torch.int32).contiguous()
+        # Staged onto the device for the reason forward_paged_attention stages them --
+        # seq_lens reaches the backend on the host and this launch reads it from global
+        # memory (see _device_index) -- and hoisted for the reason it hoists: the trace
+        # has to name the tensors the launch is handed, not their sources.
+        block_tables = self._device_index(attn_metadata.block_tables, device, "block_tables")
+        seq_lens = self._device_index(attn_metadata.seq_lens, device, "seq_lens")
         workspace = self._decode_workspace(num_tokens, block_tables.shape[1], self.key_cache.shape[1], device)
         rotated_query = self._rotated_query(num_tokens, device)
         attention_output = output[:num_tokens].view(num_tokens, self.num_heads, self.head_size)
@@ -1084,6 +1136,7 @@ def activate_turboquant_backend(layer: torch.nn.Module) -> None:
         impl._workspace_floats = {}
         impl.rotated_query = None
         impl._hadamard16 = None
+        impl._device_index_buffers = None
         impl._trace_step = 0
         impl._trace_phase = "unknown"
         impl.cube_decode = turboquant_cube_decode_selected(_model_dtype(impl))
