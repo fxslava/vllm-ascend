@@ -148,6 +148,21 @@ env_variables: dict[str, Callable[[], Any]] = {
     # /workspace/turboquant_trace.log, which is the container's bind mount. A path that
     # cannot be opened falls back to stderr rather than losing the capture.
     "TURBOQUANT_TRACE_PATH": lambda: os.getenv("TURBOQUANT_TRACE_PATH", ""),
+    # Keep the last TURBOQUANT_FLIGHT_RECORDER dispatches in an in-memory ring and write them
+    # to turboquant_last_crash.jsonl if the process leaves through a Python exception or a
+    # normal exit (vllm_ascend/attention/turboquant_trace.py). 0 (default): off. A positive
+    # integer is the ring's capacity; 1 means "on" and is read as the 128-entry default.
+    # Much cheaper than TURBOQUANT_CAPTURE_SIGNATURES -- nothing is written per dispatch and
+    # no index tensor is summarised, so it costs no device-to-host copy -- but it only
+    # survives a *Python-level* failure. An AI core fault aborts the process, and neither
+    # atexit nor sys.excepthook runs then; the line-buffered trace log is what survives that.
+    "TURBOQUANT_FLIGHT_RECORDER": lambda: int(os.getenv("TURBOQUANT_FLIGHT_RECORDER", "0")),
+    # Append one JSON line per *distinct* launch configuration to turboquant_unique_cases.jsonl,
+    # deduplicated in memory by operator, ragged tail, token and head counts, shapes and strides
+    # (vllm_ascend/attention/turboquant_trace.py). 0 (default): off. 1: on. A long serving run
+    # visits only a handful of distinct shapes, so the file stays small and is what an offline
+    # unit test replays.
+    "TURBOQUANT_RECORD_CASES": lambda: bool(int(os.getenv("TURBOQUANT_RECORD_CASES", "0"))),
 }
 
 # end-env-vars-definition

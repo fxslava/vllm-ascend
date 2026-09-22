@@ -26,6 +26,7 @@ decode output left rotated for a folded layer and un-rotated for any other.
 import json
 import math
 import os
+import sys
 import tempfile
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -35,6 +36,7 @@ import torch
 from tests.ut.attention.turboquant_cpu_ops import TURBOQUANT_CUBE_OP_SCHEMAS, turboquant_cube_meta_ops
 from tests.ut.base import TestBase
 from vllm_ascend.attention import turboquant_rotation as rotation_module
+from vllm_ascend.attention import turboquant_trace as tq_trace
 from vllm_ascend.attention import turboquant_v1 as tq_module
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.turboquant_rotation import (
@@ -50,9 +52,14 @@ from vllm_ascend.attention.turboquant_rotation import (
     walsh_hadamard,
 )
 from vllm_ascend.attention.turboquant_trace import (
+    TURBOQUANT_CASES_FILENAME,
+    TURBOQUANT_CRASH_FILENAME,
+    TURBOQUANT_RING_CAPACITY,
     TURBOQUANT_TRACE_ALIGNMENTS,
     TURBOQUANT_TRACE_PREVIEW,
     cache_planes,
+    compact_tensor,
+    host_seq_lengths,
     describe_indices,
     describe_tensor,
     reset_turboquant_tracer,
@@ -2321,3 +2328,309 @@ class TestDecodeFence(TestBase):
                     with patch.dict("os.environ", {"VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS": "1"}):
                         self._decode(impl, ops)
                     fence.assert_called_once()
+
+
+class TestFlightRecorder(TestBase):
+    """The in-memory ring, its crash dump, and the unique-configuration harvester.
+
+    The ring is the cheap half of the capture layer: it holds the last N dispatches in a
+    deque and writes nothing until the process leaves. What it costs per dispatch is a
+    handful of host-side attribute reads, which is why the sequence lengths it records are
+    taken from the metadata's own host tensor rather than from the staged device copy.
+    """
+
+    NUM_BLOCKS = 3
+
+    def setUp(self):
+        super().setUp()
+        self._dir = tempfile.TemporaryDirectory()
+        self.trace_path = os.path.join(self._dir.name, "turboquant_trace.log")
+        self.crash_path = os.path.join(self._dir.name, TURBOQUANT_CRASH_FILENAME)
+        self.cases_path = os.path.join(self._dir.name, TURBOQUANT_CASES_FILENAME)
+        reset_turboquant_tracer()
+        self.addCleanup(self._dir.cleanup)
+        self.addCleanup(reset_turboquant_tracer)
+
+    def _env(self, **overrides):
+        env = {
+            "TURBOQUANT_TRACE_PATH": self.trace_path,
+            "TURBOQUANT_CAPTURE_SIGNATURES": "0",
+            "TURBOQUANT_DRY_RUN": "0",
+            "TURBOQUANT_FLIGHT_RECORDER": "0",
+            "TURBOQUANT_RECORD_CASES": "0",
+        }
+        env.update(overrides)
+        reset_turboquant_tracer()
+        return patch.dict(os.environ, env)
+
+    def _make_impl(self, cube: bool = False) -> AscendTurboQuantAttentionBackendImpl:
+        impl = AscendTurboQuantAttentionBackendImpl.__new__(AscendTurboQuantAttentionBackendImpl)
+        impl.head_size = HEAD_SIZE
+        impl.num_heads = 8
+        impl.num_kv_heads = 2
+        impl.scale = HEAD_SIZE**-0.5
+        impl.attn_type = "decoder"
+        impl.kv_sharing_target_layer_name = None
+        impl.is_kv_producer = False
+        shape = (self.NUM_BLOCKS, DECODE_BLOCK_SIZE, 2, HEAD_SIZE // TURBOQUANT_PACK_FACTOR)
+        impl.key_cache = torch.zeros(shape, dtype=torch.int8)
+        impl.value_cache = torch.zeros(shape, dtype=torch.int8)
+        impl.scale_cache = torch.zeros(self.NUM_BLOCKS, DECODE_BLOCK_SIZE, turboquant_scale_slot(2))
+        impl._pi_signs = None
+        impl.decode_workspace = None
+        impl._workspace_floats = {}
+        impl.rotated_query = None
+        impl._hadamard16 = None
+        impl._device_index_buffers = None
+        impl.output_rotation_folded = False
+        impl.cube_decode = cube
+        return impl
+
+    def _decode(self, impl, ops, seq_len=57, num_tokens=1):
+        query = torch.randn(num_tokens, impl.num_heads, HEAD_SIZE)
+        output = torch.zeros_like(query)
+        metadata = MagicMock(
+            attn_state=AscendAttentionState.DecodeOnly,
+            block_tables=torch.zeros(num_tokens, 2, dtype=torch.int32),
+            seq_lens=torch.full((num_tokens,), seq_len, dtype=torch.int32),
+        )
+        with patch.object(torch.ops, "_C_ascend", ops, create=True):
+            impl.forward_impl(query, None, None, (), metadata, output)
+
+    def _write(self, impl, ops, num_tokens=4):
+        key = torch.randn(num_tokens, impl.num_kv_heads, HEAD_SIZE)
+        metadata = MagicMock(num_actual_tokens=num_tokens, slot_mapping=torch.arange(num_tokens, dtype=torch.int64))
+        with patch.object(torch.ops, "_C_ascend", ops, create=True):
+            impl.reshape_and_cache(None, key, key.clone(), (impl.key_cache, impl.value_cache), metadata, None)
+
+    def _ring(self):
+        return list(turboquant_tracer()._ring or ())
+
+    # -- off by default -------------------------------------------------------
+
+    def test_the_recorder_is_off_by_default(self):
+        with self._env():
+            tracer = turboquant_tracer()
+            self.assertFalse(tracer.active)
+            self.assertFalse(tracer.recording)
+            self.assertFalse(tracer.record_cases)
+            impl = self._make_impl()
+            self._decode(impl, _ops_mock())
+            self.assertEqual(self._ring(), [])
+        self.assertFalse(os.path.exists(self.crash_path))
+        self.assertFalse(os.path.exists(self.cases_path))
+
+    def test_the_ring_never_reads_an_index_tensor_off_the_device(self):
+        """A synchronisation per dispatch is exactly what the ring exists not to cost, so a
+        device-resident seq_lens is skipped rather than copied back."""
+        self.assertIsNone(host_seq_lengths(torch.ones(3, dtype=torch.int32, device=META)))
+        self.assertIsNone(host_seq_lengths(None))
+        self.assertEqual(host_seq_lengths(torch.tensor([5, 9], dtype=torch.int32)), [5, 9])
+
+    # -- the ring -------------------------------------------------------------
+
+    def test_a_decode_and_a_write_are_both_recorded_under_their_own_names(self):
+        with self._env(TURBOQUANT_FLIGHT_RECORDER="1"):
+            impl = self._make_impl()
+            self._write(impl, _ops_mock())
+            self._decode(impl, _ops_mock())
+            cube = self._make_impl(cube=True)
+            self._decode(cube, _cube_ops())
+            self.assertEqual([e["op"] for e in self._ring()], ["reshape_and_cache", "decode_aiv", "decode_cube"])
+
+    def test_a_decode_records_the_ragged_tail_that_decides_the_last_tile(self):
+        """seq_len % block_size is the quantity a tail-masking kernel turns on -- the shape
+        that produced AI core error 340 -- so it is recorded rather than left to be derived."""
+        with self._env(TURBOQUANT_FLIGHT_RECORDER="1"):
+            impl = self._make_impl()
+            self._decode(impl, _ops_mock(), seq_len=57, num_tokens=1)
+
+        (entry,) = [e for e in self._ring() if e["op"] == "decode_aiv"]
+        self.assertEqual(entry["seq_len"], 57)
+        self.assertEqual(entry["block_size"], DECODE_BLOCK_SIZE)
+        self.assertEqual(entry["seq_len_mod_block"], 57 % DECODE_BLOCK_SIZE)
+        self.assertEqual(entry["num_tokens"], 1)
+        self.assertEqual(entry["num_heads"], impl.num_heads)
+        self.assertEqual(entry["num_kv_heads"], impl.num_kv_heads)
+        self.assertEqual(entry["head_dim"], HEAD_SIZE)
+
+    def test_every_recorded_tensor_carries_its_shape_dtype_and_both_alignments(self):
+        with self._env(TURBOQUANT_FLIGHT_RECORDER="1"):
+            impl = self._make_impl()
+            self._decode(impl, _ops_mock())
+
+        (entry,) = [e for e in self._ring() if e["op"] == "decode_aiv"]
+        # The ring stores raw snapshots -- shape, stride, dtype, device, pointer, straight off
+        # the tensor. Rendering them into JSON is what a dump does, once, at the end.
+        query = tq_trace.render_entry(entry)["tensors"]["query"]
+        self.assertEqual(query["shape"], [1, impl.num_heads, HEAD_SIZE])
+        self.assertEqual(query["stride"], [impl.num_heads * HEAD_SIZE, HEAD_SIZE, 1])
+        self.assertEqual(query["dtype"], "float32")
+        self.assertIn("a32", query)
+        self.assertIn("a512", query)
+        self.assertLess(query["a32"], 32)
+        self.assertLess(query["a512"], 512)
+
+    def test_the_ring_is_bounded_and_keeps_the_most_recent(self):
+        """A flight recorder that grows without bound is a memory leak, not a diagnostic."""
+        with self._env(TURBOQUANT_FLIGHT_RECORDER="4"):
+            impl = self._make_impl()
+            for step in range(9):
+                self._decode(impl, _ops_mock(), seq_len=40 + step)
+            ring = self._ring()
+
+        self.assertEqual(len(ring), 4)
+        self.assertEqual([e["seq_len"] for e in ring], [45, 46, 47, 48])
+
+    def test_the_default_depth_is_the_documented_one(self):
+        with self._env(TURBOQUANT_FLIGHT_RECORDER="1"):
+            self.assertEqual(turboquant_tracer()._ring.maxlen, TURBOQUANT_RING_CAPACITY)
+
+    # -- the crash dump -------------------------------------------------------
+
+    def test_the_ring_is_dumped_as_json_lines_with_a_reason(self):
+        with self._env(TURBOQUANT_FLIGHT_RECORDER="1"):
+            impl = self._make_impl()
+            self._decode(impl, _ops_mock(), seq_len=57)
+            written = turboquant_tracer().dump_ring(reason="RuntimeError: aiv exception")
+
+        self.assertEqual(written, self.crash_path)
+        with open(self.crash_path, encoding="utf-8") as handle:
+            lines = [json.loads(line) for line in handle if line.strip()]
+        header, *entries = lines
+        self.assertEqual(header["reason"], "RuntimeError: aiv exception")
+        self.assertEqual(header["entries"], len(entries))
+        self.assertEqual(entries[-1]["seq_len"], 57)
+
+    def test_an_empty_ring_writes_no_crash_file(self):
+        """A clean run that never dispatched must not leave a crash report behind."""
+        with self._env(TURBOQUANT_FLIGHT_RECORDER="1"):
+            self.assertIsNone(turboquant_tracer().dump_ring(reason="process exit"))
+        self.assertFalse(os.path.exists(self.crash_path))
+
+    def test_the_hooks_are_installed_only_once_a_dispatch_has_been_seen(self):
+        """A worker that never enables the recorder must not have its excepthook rewritten."""
+        original = sys.excepthook
+        with self._env(TURBOQUANT_FLIGHT_RECORDER="1"):
+            tracer = turboquant_tracer()
+            self.assertFalse(tracer._hooks_installed)
+            self.assertIs(sys.excepthook, original)
+            try:
+                impl = self._make_impl()
+                self._decode(impl, _ops_mock())
+                self.assertTrue(tracer._hooks_installed)
+                self.assertIsNot(sys.excepthook, original)
+            finally:
+                sys.excepthook = original
+
+    def test_replacing_the_tracer_gives_the_interpreter_its_hooks_back(self):
+        """Regression: every tracer used to leave its atexit hook behind, so a process that
+        built several spent its shutdown writing dumps for runs that were long over."""
+        original = sys.excepthook
+        with self._env(TURBOQUANT_FLIGHT_RECORDER="1"):
+            impl = self._make_impl()
+            self._decode(impl, _ops_mock())
+            tracer = turboquant_tracer()
+            self.assertTrue(tracer._hooks_installed)
+            tracer.close()
+            self.assertFalse(tracer._hooks_installed)
+            self.assertIs(sys.excepthook, original)
+            # atexit.unregister is idempotent, so a second close is not an error.
+            tracer.close()
+
+    def test_a_chained_excepthook_is_left_alone(self):
+        """Something that installed itself after us owns the chain; restoring over it would
+        silently drop whatever it does."""
+        original = sys.excepthook
+        with self._env(TURBOQUANT_FLIGHT_RECORDER="1"):
+            impl = self._make_impl()
+            self._decode(impl, _ops_mock())
+            later = MagicMock()
+            sys.excepthook = later
+            try:
+                turboquant_tracer().close()
+                self.assertIs(sys.excepthook, later)
+            finally:
+                sys.excepthook = original
+
+    # -- the case harvester ---------------------------------------------------
+
+    def test_a_repeated_configuration_is_written_once(self):
+        with self._env(TURBOQUANT_RECORD_CASES="1"):
+            impl = self._make_impl()
+            for _ in range(5):
+                self._decode(impl, _ops_mock(), seq_len=57)
+            turboquant_tracer().close()
+
+        with open(self.cases_path, encoding="utf-8") as handle:
+            cases = [json.loads(line) for line in handle if line.strip()]
+        self.assertEqual(len(cases), 1)
+        self.assertEqual(cases[0]["op"], "decode_aiv")
+        self.assertEqual(cases[0]["case"], 1)
+
+    def test_a_new_shape_is_a_new_case_but_a_new_step_is_not(self):
+        """Keyed on the ragged tail, not the sequence length: a decode's length grows by one
+        every step, so keying on it would append a line per step forever."""
+        with self._env(TURBOQUANT_RECORD_CASES="1"):
+            impl = self._make_impl()
+            # Same tail, different lengths -- one case.
+            self._decode(impl, _ops_mock(), seq_len=57)
+            self._decode(impl, _ops_mock(), seq_len=57 + DECODE_BLOCK_SIZE)
+            # A different token count is a different launch shape.
+            self._decode(impl, _ops_mock(), seq_len=57, num_tokens=2)
+            turboquant_tracer().close()
+
+        with open(self.cases_path, encoding="utf-8") as handle:
+            cases = [json.loads(line) for line in handle if line.strip()]
+        self.assertEqual(len(cases), 2)
+        self.assertEqual([c["num_tokens"] for c in cases], [1, 2])
+
+    def test_a_harvested_case_carries_what_an_offline_replay_needs(self):
+        with self._env(TURBOQUANT_RECORD_CASES="1"):
+            impl = self._make_impl()
+            self._decode(impl, _ops_mock(), seq_len=57)
+            turboquant_tracer().close()
+
+        with open(self.cases_path, encoding="utf-8") as handle:
+            (case,) = [json.loads(line) for line in handle if line.strip()]
+        for field in ("op", "num_tokens", "block_size", "seq_len", "seq_len_mod_block", "num_blocks"):
+            self.assertIn(field, case)
+        for name in ("query", "block_tables", "seq_lens", "workspace", "output"):
+            self.assertIn(name, case["tensors"], name)
+        self.assertEqual(case["tensors"]["query"]["shape"], [1, impl.num_heads, HEAD_SIZE])
+
+    def test_the_two_recorders_are_independent(self):
+        """Harvesting without the ring writes cases and no crash file; the ring without
+        harvesting writes neither until the process leaves."""
+        with self._env(TURBOQUANT_RECORD_CASES="1"):
+            impl = self._make_impl()
+            self._decode(impl, _ops_mock())
+            self.assertFalse(turboquant_tracer().recording)
+            self.assertEqual(self._ring(), [])
+            turboquant_tracer().close()
+        self.assertTrue(os.path.exists(self.cases_path))
+
+        with self._env(TURBOQUANT_FLIGHT_RECORDER="1"):
+            impl = self._make_impl()
+            self._decode(impl, _ops_mock())
+            self.assertTrue(self._ring())
+        self.assertFalse(os.path.exists(self.crash_path))
+
+    def test_a_recorder_failure_never_reaches_the_caller(self):
+        """The diagnostic must never become the failure it exists to describe."""
+        with self._env(TURBOQUANT_FLIGHT_RECORDER="1"):
+            impl = self._make_impl()
+            with (
+                patch.object(tq_trace, "snapshot_tensor", side_effect=RuntimeError("boom")),
+                patch("sys.stderr", new_callable=MagicMock),
+            ):
+                self._decode(impl, _ops_mock())
+            # The launch still happened; only the record was dropped.
+            self.assertEqual(self._ring(), [])
+
+    def test_compact_tensor_handles_what_the_operators_legitimately_pass(self):
+        self.assertIsNone(compact_tensor(None))
+        self.assertIn("not_a_tensor", compact_tensor(7))
+        described = compact_tensor(torch.zeros(2, 3))
+        self.assertEqual(described["shape"], [2, 3])
+        self.assertEqual(described["dtype"], "float32")

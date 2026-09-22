@@ -577,6 +577,21 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         tracer = turboquant_tracer()
         if tracer.active:
             geometry = self._cache_geometry()
+            # The ring and the case harvester first: both are host-side only, so they run
+            # even where the full record below would be too expensive to leave on.
+            tracer.observe(
+                "reshape_and_cache",
+                tensors={"key": cached_key, "value": cached_value, "slot_mapping": cached_slots},
+                block_size=geometry["block_size"],
+                num_tokens=int(cached_key.shape[0]),
+                layer=self._trace_layer_name,
+                step=self._trace_step,
+                phase=self._trace_phase,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_size,
+                num_blocks=geometry["num_blocks"],
+            )
+        if tracer.capture:
             tracer.record(
                 "reshape_and_cache",
                 **self._trace_caller_context(),
@@ -812,6 +827,7 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
                 rotated_query=rotated_query,
                 block_tables=block_tables,
                 seq_lens=seq_lens,
+                host_seq_lens=attn_metadata.seq_lens,
                 workspace=workspace,
                 attention_output=attention_output,
                 output_gate=None,
@@ -867,6 +883,7 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         rotated_query: torch.Tensor,
         block_tables: torch.Tensor,
         seq_lens: torch.Tensor,
+        host_seq_lens: torch.Tensor,
         workspace: torch.Tensor,
         attention_output: torch.Tensor,
         output_gate: torch.Tensor | None,
@@ -880,6 +897,36 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         reading side by side in one file, under one schema.
         """
         geometry = self._cache_geometry()
+        tracer.observe(
+            "decode_cube" if self.cube_decode else "decode_aiv",
+            tensors={
+                "query": query,
+                "block_tables": block_tables,
+                "seq_lens": seq_lens,
+                "workspace": workspace,
+                "output": attention_output,
+            },
+            block_size=geometry["block_size"],
+            num_tokens=int(query.shape[0]),
+            # The metadata's own tensor, not the staged copy: seq_lens reaches the backend on
+            # the host, and reading it there is free. _device_index has already moved the
+            # operand the kernel reads onto the device, where a read would cost a sync.
+            seq_lens=host_seq_lens,
+            layer=self._trace_layer_name,
+            step=self._trace_step,
+            phase=self._trace_phase,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_size,
+            num_blocks=geometry["num_blocks"],
+            max_blocks_per_seq=int(block_tables.shape[1]),
+            output_stage=None if stage is None else int(stage),
+        )
+        # Everything below builds its arguments eagerly, and describe_indices copies an index
+        # tensor back from the device to do it. That is the price of the full record and must
+        # not be charged to the ring, which exists to be cheap enough to leave on.
+        if not tracer.capture:
+            return
         tracer.record(
             "decode_attention",
             **self._trace_caller_context(),
@@ -961,6 +1008,7 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
                 rotated_query=rotated_query,
                 block_tables=block_tables,
                 seq_lens=seq_lens,
+                host_seq_lens=attn_metadata.seq_lens,
                 workspace=workspace,
                 attention_output=attention_output,
                 output_gate=gate,

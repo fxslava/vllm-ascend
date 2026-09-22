@@ -47,12 +47,14 @@ sites.
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import json
 import os
 import sys
 import threading
 import time
+from collections import deque
 from typing import Any
 
 import torch
@@ -71,6 +73,86 @@ TURBOQUANT_TRACE_ALIGNMENTS = (32, 64, 512)
 TURBOQUANT_TRACE_PREVIEW = 10
 
 TURBOQUANT_TRACE_DEFAULT_PATH = "/workspace/turboquant_trace.log"
+
+# The flight recorder's default depth. A decode step touches one operator per layer, so 128
+# covers roughly the last three steps of a 40-layer model -- enough to see what the shapes were
+# doing on the way into a failure without holding the whole run.
+TURBOQUANT_RING_CAPACITY = 128
+
+# Written beside the trace log, so one directory holds everything a failing run produced.
+TURBOQUANT_CRASH_FILENAME = "turboquant_last_crash.jsonl"
+TURBOQUANT_CASES_FILENAME = "turboquant_unique_cases.jsonl"
+
+
+def snapshot_tensor(tensor: Any) -> tuple | None:
+    """What the ring actually stores: five attribute reads, no formatting, no allocation.
+
+    ``shape`` and ``stride()`` are already tuples and ``dtype``/``device`` are interned
+    objects, so holding them costs nothing and pins nothing -- the tensor itself is
+    deliberately *not* retained, or the ring would keep 128 dispatches of activations alive.
+
+    Formatting is where the time actually goes: building the strings and lists that
+    :func:`render_tensor` produces costs more than the rest of the dispatch path put
+    together, so it happens once, when the ring is written out, rather than 128 times over
+    for entries that are about to be overwritten.
+    """
+    if tensor is None:
+        return None
+    if not isinstance(tensor, torch.Tensor):
+        return (repr(tensor)[:128],)
+    try:
+        return (tensor.shape, tensor.stride(), tensor.dtype, tensor.device, tensor.data_ptr())
+    except Exception as error:  # noqa: BLE001 - a description must never raise
+        return (repr(error),)
+
+
+def render_tensor(snap: tuple | None) -> dict[str, Any] | None:
+    """Turn a :func:`snapshot_tensor` tuple into the JSON a dump or a case file carries."""
+    if snap is None:
+        return None
+    if len(snap) == 1:
+        return {"not_a_tensor": snap[0]}
+    shape, stride, dtype, device, pointer = snap
+    name = str(dtype)
+    return {
+        "shape": list(shape),
+        "stride": list(stride),
+        "dtype": name[6:] if name.startswith("torch.") else name,
+        "device": str(device),
+        "a32": pointer % 32,
+        "a512": pointer % 512,
+    }
+
+
+def render_entry(entry: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    """A ring entry as JSON: the snapshots rendered, everything else passed through."""
+    out = {k: v for k, v in entry.items() if k != "_snaps"}
+    out["t"] = round(out.get("t", 0.0), 6)
+    out["tensors"] = {name: render_tensor(snap) for name, snap in entry.get("_snaps", {}).items()}
+    out.update(extra)
+    return out
+
+
+def compact_tensor(tensor: Any) -> dict[str, Any] | None:
+    """:func:`snapshot_tensor` then :func:`render_tensor`, for a caller that wants both."""
+    return render_tensor(snapshot_tensor(tensor))
+
+
+def host_seq_lengths(seq_lens: Any) -> list[int] | None:
+    """The sequence lengths, but only when reading them is free.
+
+    ``AscendMetadata.seq_lens`` reaches the backend on the *host* (see
+    ``AscendTurboQuantAttentionBackendImpl._device_index``), so for the path that matters
+    these are an ordinary memory read. If a caller hands over a device tensor instead, the
+    values are skipped rather than paid for: a synchronisation per dispatch is exactly what
+    the ring exists not to cost.
+    """
+    if not isinstance(seq_lens, torch.Tensor) or seq_lens.device.type != "cpu":
+        return None
+    try:
+        return seq_lens.detach().reshape(-1).tolist()
+    except Exception:  # noqa: BLE001 - a description must never raise
+        return None
 
 
 def describe_tensor(tensor: Any) -> dict[str, Any] | None:
@@ -174,27 +256,230 @@ class TurboQuantTracer:
     branch on, so a disabled tracer costs one attribute read.
     """
 
-    def __init__(self, *, capture: bool, dry_run: bool, path: str) -> None:
+    def __init__(
+        self,
+        *,
+        capture: bool,
+        dry_run: bool,
+        path: str,
+        ring_capacity: int = 0,
+        record_cases: bool = False,
+    ) -> None:
         self.capture = capture
         self.dry_run = dry_run
         self.path = path
+        self.record_cases = record_cases
         self._file: Any = None
         self._owns_file = False
         self._sequence = 0
         self._lock = threading.Lock()
+        # The flight recorder. A deque with maxlen drops from the far end on append, so the
+        # ring costs one append per dispatch and never grows.
+        self._ring: deque | None = deque(maxlen=ring_capacity) if ring_capacity > 0 else None
+        self._seen_cases: set = set()
+        self._cases_file: Any = None
+        self._hooks_installed = False
+        self._dumped = False
+        self._own_excepthook: Any = None
+        self._previous_excepthook: Any = None
 
     @classmethod
     def from_env(cls) -> TurboQuantTracer:
+        ring = envs_ascend.TURBOQUANT_FLIGHT_RECORDER
+        # "1" means on at the default depth; any larger number is the depth itself.
+        capacity = TURBOQUANT_RING_CAPACITY if ring == 1 else max(ring, 0)
         return cls(
             capture=envs_ascend.TURBOQUANT_CAPTURE_SIGNATURES,
             dry_run=envs_ascend.TURBOQUANT_DRY_RUN,
             path=envs_ascend.TURBOQUANT_TRACE_PATH or TURBOQUANT_TRACE_DEFAULT_PATH,
+            ring_capacity=capacity,
+            record_cases=envs_ascend.TURBOQUANT_RECORD_CASES,
         )
 
     @property
     def active(self) -> bool:
-        """Whether any call site has work to do -- record it, bypass it, or both."""
-        return self.capture or self.dry_run
+        """Whether any call site has work to do -- observe it, record it, bypass it.
+
+        One attribute read is what a disabled tracer costs a dispatch, which is why every
+        mode hangs off this single object rather than being checked separately.
+        """
+        return self.capture or self.dry_run or self._ring is not None or self.record_cases
+
+    @property
+    def recording(self) -> bool:
+        return self._ring is not None
+
+    def sibling_path(self, filename: str) -> str:
+        """A file beside the trace log, so one directory holds a failing run's whole output."""
+        return os.path.join(os.path.dirname(self.path) or ".", filename)
+
+    def observe(
+        self,
+        op: str,
+        *,
+        tensors: dict[str, Any],
+        block_size: int | None = None,
+        num_tokens: int | None = None,
+        seq_lens: Any = None,
+        **fields: Any,
+    ) -> None:
+        """One dispatch, through whichever of the three recorders are enabled.
+
+        The ring first and unconditionally-but-cheaply, then the case harvester (which only
+        writes when the configuration is one it has not seen), and the full JSON record last
+        because it is the only one that touches the disk on every call.
+        """
+        if not (self._ring is not None or self.record_cases):
+            return
+        try:
+            lengths = host_seq_lengths(seq_lens)
+            longest = max(lengths) if lengths else None
+            # The ragged tail: the quantity that decides whether the decode's last tile is a
+            # whole one. A kernel that indexes unified buffer by it faults on anything that is
+            # not a multiple of 8 -- which is what AI core error 340 turned out to be.
+            tail = None if longest is None or not block_size else longest % block_size
+            snaps = {name: snapshot_tensor(t) for name, t in tensors.items()}
+            entry = {
+                "op": op,
+                "t": time.time(),
+                "num_tokens": num_tokens,
+                "block_size": block_size,
+                "seq_len": longest,
+                "seq_len_mod_block": tail,
+                "seq_lens": lengths[:TURBOQUANT_TRACE_PREVIEW] if lengths else None,
+                "_snaps": snaps,
+            }
+            entry.update(fields)
+            if self._ring is not None:
+                self._ring.append(entry)
+                self._install_hooks()
+            if self.record_cases:
+                self._harvest(op, entry, snaps, tail, num_tokens, fields)
+        except Exception as error:  # noqa: BLE001 - the recorder must never fail the run
+            print(f"[vllm-ascend/turboquant] flight record dropped: {error!r}", file=sys.stderr, flush=True)
+
+    def _harvest(
+        self,
+        op: str,
+        entry: dict[str, Any],
+        shapes: dict[str, Any],
+        tail: int | None,
+        num_tokens: int | None,
+        fields: dict[str, Any],
+    ) -> None:
+        """Append the configuration if it is one this process has not launched before.
+
+        Keyed by the ragged tail rather than the sequence length, because the length itself
+        takes a new value on every decode step while the tail is what the kernel's tiling
+        actually turns on -- key on the length and the file grows without bound.
+        """
+        signature = (
+            op,
+            tail,
+            num_tokens,
+            fields.get("num_heads"),
+            fields.get("num_kv_heads"),
+            fields.get("head_dim"),
+            tuple(tuple(s[0]) if s and len(s) == 5 else None for s in shapes.values()),
+            tuple(tuple(s[1]) if s and len(s) == 5 else None for s in shapes.values()),
+        )
+        with self._lock:
+            if signature in self._seen_cases:
+                return
+            self._seen_cases.add(signature)
+            handle = self._cases_handle()
+            if handle is None:
+                return
+            # One write of one line: O_APPEND makes a write of this size atomic, so a second
+            # worker appending to the same file cannot interleave a partial record.
+            handle.write(json.dumps(render_entry(entry, case=len(self._seen_cases)), default=repr) + "\n")
+
+    def _cases_handle(self) -> Any:
+        if self._cases_file is not None:
+            return self._cases_file
+        path = self.sibling_path(TURBOQUANT_CASES_FILENAME)
+        try:
+            self._cases_file = open(path, "a", buffering=1, encoding="utf-8")  # noqa: SIM115
+        except OSError as error:
+            print(f"[vllm-ascend/turboquant] cannot open {path} ({error!r})", file=sys.stderr, flush=True)
+            self.record_cases = False
+            return None
+        return self._cases_file
+
+    def _install_hooks(self) -> None:
+        """Arrange for the ring to reach disk if the process leaves through Python.
+
+        Deliberately not at import time: a process that never dispatches has nothing to dump,
+        and a worker that never enables the recorder should not have its excepthook rewritten.
+
+        The limitation is worth stating plainly -- an AI core fault aborts the process, and
+        neither of these runs then. For that failure the line-buffered trace log
+        (``TURBOQUANT_CAPTURE_SIGNATURES``) is what survives; the ring is for the Python-level
+        exception, which is the case where the last few dispatches are the interesting part
+        and nothing has been written down.
+        """
+        if self._hooks_installed:
+            return
+        self._hooks_installed = True
+        atexit.register(self._dump_on_exit)
+        previous = sys.excepthook
+        self._previous_excepthook = previous
+
+        def hook(exc_type, exc_value, exc_tb):
+            self.dump_ring(reason=f"{getattr(exc_type, '__name__', exc_type)}: {exc_value}")
+            previous(exc_type, exc_value, exc_tb)
+
+        self._own_excepthook = hook
+        sys.excepthook = hook
+
+    def _uninstall_hooks(self) -> None:
+        """Give the interpreter back what it had.
+
+        Without this a tracer that is replaced leaves its atexit hook behind, and every
+        replacement adds another: at shutdown they all fire, each trying to write a dump for a
+        run that is long over. Harmless in a worker, which builds one tracer and keeps it, but
+        it is the tests that build a new one per case -- and a diagnostic that litters the
+        shutdown of the process it was meant to explain is not one worth keeping.
+        """
+        if not self._hooks_installed:
+            return
+        self._hooks_installed = False
+        with contextlib.suppress(Exception):
+            atexit.unregister(self._dump_on_exit)
+        # Only if nothing chained after ours; otherwise the later hook owns the chain.
+        if self._own_excepthook is not None and sys.excepthook is self._own_excepthook:
+            sys.excepthook = self._previous_excepthook
+        self._own_excepthook = None
+        self._previous_excepthook = None
+
+    def _dump_on_exit(self) -> None:
+        self.dump_ring(reason="process exit")
+
+    def dump_ring(self, *, reason: str, path: str | None = None) -> str | None:
+        """Write the ring out as JSON lines. Returns the path, or None if there was nothing."""
+        if self._ring is None:
+            return None
+        with self._lock:
+            entries = list(self._ring)
+            if not entries or self._dumped:
+                return None
+            self._dumped = True
+        target = path or self.sibling_path(TURBOQUANT_CRASH_FILENAME)
+        try:
+            with open(target, "w", encoding="utf-8") as handle:
+                header = {"reason": reason, "pid": os.getpid(), "entries": len(entries), "t": round(time.time(), 6)}
+                handle.write(json.dumps(header, default=repr) + "\n")
+                for entry in entries:
+                    handle.write(json.dumps(render_entry(entry), default=repr) + "\n")
+            print(
+                f"[vllm-ascend/turboquant] wrote the last {len(entries)} dispatches to {target} ({reason})",
+                file=sys.stderr,
+                flush=True,
+            )
+            return target
+        except OSError as error:
+            print(f"[vllm-ascend/turboquant] cannot write {target} ({error!r})", file=sys.stderr, flush=True)
+            return None
 
     def record(self, event: str, **fields: Any) -> None:
         """Append one record. A no-op unless ``TURBOQUANT_CAPTURE_SIGNATURES=1``."""
@@ -218,13 +503,18 @@ class TurboQuantTracer:
             print(f"[vllm-ascend/turboquant] trace record dropped: {error!r}", file=sys.stderr, flush=True)
 
     def close(self) -> None:
-        """Release the file handle. Tests and a clean worker shutdown; not the hot path."""
+        """Release the file handles and the interpreter hooks. Not the hot path."""
+        self._uninstall_hooks()
         with self._lock:
             if self._file is not None and self._owns_file:
                 with contextlib.suppress(OSError):
                     self._file.close()
             self._file = None
             self._owns_file = False
+            if self._cases_file is not None:
+                with contextlib.suppress(OSError):
+                    self._cases_file.close()
+            self._cases_file = None
 
     def _handle(self) -> Any:
         """Open the trace file once, line-buffered, and keep it open.
