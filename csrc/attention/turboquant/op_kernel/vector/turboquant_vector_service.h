@@ -385,7 +385,7 @@ public:
         }
         const AscendC::LocalTensor<float> queryIn = queryInBuf_.Get<float>();
         const AscendC::LocalTensor<OperandT> queryOperand = queryOperandBuf_.Get<OperandT>();
-        const AscendC::LocalTensor<OperandT> queryL1 = mm.A1Query();
+        const AscendC::LocalTensor<OperandT> queryL1 = mm.L1Query();
 
         AscendC::DataCopy(queryIn,
                           queryRotGm_[(static_cast<uint64_t>(token) * numHeads_ + heads.first + heads.base) *
@@ -494,7 +494,7 @@ public:
             ComputeSoftmaxHeads(valid, heads.mine, keyScale, valueScale);
         }
 
-        const AscendC::LocalTensor<OperandT> probsL1 = mm.A1Probs();
+        const AscendC::LocalTensor<OperandT> probsL1 = mm.L1Probs();
         SyncVectorToMte3();
         for (uint32_t j = 0; j < heads.mine; ++j) {
             AscendC::DataCopy(probsL1[(heads.base + j) * kOperandC0], probOperand[j * probElems], probRowToL1Params_);
@@ -732,7 +732,7 @@ private:
 
     __aicore__ inline AscendC::LocalTensor<OperandT> PlaneOperand(Mm &mm, const uint32_t slot)
     {
-        return Plane() == kKeyPlane ? mm.B1K(slot) : mm.B1V(slot);
+        return Plane() == kKeyPlane ? mm.L1Key(slot) : mm.L1Value(slot);
     }
 
     // This subcore's plane of one tile and the tile's scale lanes, into ingest slot `slot`. rowBase is a

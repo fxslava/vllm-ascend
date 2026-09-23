@@ -94,20 +94,20 @@ public:
         queryRotGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(queryRot));
 
         for (uint32_t slot = 0; slot < kOperandSlots; ++slot) {
-            pipe_->InitBuffer(queryHiA1_[slot], paddedElems_ * sizeof(half));
+            pipe_->InitBuffer(queryHiL1Buf_[slot], paddedElems_ * sizeof(half));
             if (HiLo()) {
-                pipe_->InitBuffer(queryLoA1_[slot], paddedElems_ * sizeof(half));
+                pipe_->InitBuffer(queryLoL1Buf_[slot], paddedElems_ * sizeof(half));
             }
         }
-        pipe_->InitBuffer(h16B1_, kRotateQTile * kRotateQTile * sizeof(half));
+        pipe_->InitBuffer(h16L1Buf_, kRotateQTile * kRotateQTile * sizeof(half));
 
         if ASCEND_IS_AIC {
-            pipe_->InitBuffer(queryHiA2_, paddedElems_ * sizeof(half));
+            pipe_->InitBuffer(queryHiL0aBuf_, paddedElems_ * sizeof(half));
             if (HiLo()) {
-                pipe_->InitBuffer(queryLoA2_, paddedElems_ * sizeof(half));
+                pipe_->InitBuffer(queryLoL0aBuf_, paddedElems_ * sizeof(half));
             }
-            pipe_->InitBuffer(h16B2_, kRotateQTile * kRotateQTile * sizeof(half));
-            pipe_->InitBuffer(productCo1_, paddedElems_ * sizeof(float));
+            pipe_->InitBuffer(h16L0bBuf_, kRotateQTile * kRotateQTile * sizeof(half));
+            pipe_->InitBuffer(productL0cBuf_, paddedElems_ * sizeof(float));
         }
 
         pipe_->InitBuffer(queryInBuf_, chunkElems_ * sizeof(scalar_t));
@@ -240,7 +240,7 @@ private:
         if (!h16Staged_) {
             AscendC::DataCopy(queryHalf, h16Gm_, kRotateQTile * kRotateQTile);
             SyncEvent<AscendC::HardEvent::MTE2_MTE3>();
-            AscendC::DataCopy(h16B1_.Get<half>(), queryHalf, kRotateQTile * kRotateQTile);
+            AscendC::DataCopy(h16L1Buf_.Get<half>(), queryHalf, kRotateQTile * kRotateQTile);
             h16Staged_ = true;
         }
 
@@ -259,7 +259,7 @@ private:
         SyncEvent<AscendC::HardEvent::MTE3_V>();
         AscendC::Cast(queryHalf, queryFloat, AscendC::RoundMode::CAST_RINT, paddedElems_);
         SyncVectorToMte3();
-        AscendC::DataCopy(queryHiA1_[slot].Get<half>(), queryHalf, paddedElems_);
+        AscendC::DataCopy(queryHiL1Buf_[slot].Get<half>(), queryHalf, paddedElems_);
 
         if (HiLo()) {
             AscendC::Cast(hiWidened, queryHalf, AscendC::RoundMode::CAST_NONE, paddedElems_);
@@ -267,11 +267,11 @@ private:
                 SyncEvent<AscendC::HardEvent::MTE3_V>();
             AscendC::Cast(queryHalf, queryFloat, AscendC::RoundMode::CAST_RINT, paddedElems_);
             SyncVectorToMte3();
-            AscendC::DataCopy(queryLoA1_[slot].Get<half>(), queryHalf, paddedElems_);
+            AscendC::DataCopy(queryLoL1Buf_[slot].Get<half>(), queryHalf, paddedElems_);
         }
     }
 
-    __aicore__ inline void StageA2(const AscendC::LocalTensor<half> &srcA1, const AscendC::LocalTensor<half> &dstA2)
+    __aicore__ inline void StageToL0a(const AscendC::LocalTensor<half> &srcL1, const AscendC::LocalTensor<half> &dstL0a)
     {
         AscendC::LoadData2DParamsV2 params;
         params.mStartPosition = 0;
@@ -281,10 +281,10 @@ private:
         params.srcStride = CeilDivU16(paddedRows_, kRotateQTile);
         params.dstStride = CeilDivU16(paddedRows_, kRotateQTile);
         params.ifTranspose = false;
-        AscendC::LoadData(dstA2, srcA1, params);
+        AscendC::LoadData(dstL0a, srcL1, params);
     }
 
-    __aicore__ inline void StageB2()
+    __aicore__ inline void StageH16ToL0b()
     {
         AscendC::LoadData2DParamsV2 params;
         params.mStartPosition = 0;
@@ -294,17 +294,17 @@ private:
         params.srcStride = CeilDivU16(kRotateQTile, kRotateQTile);
         params.dstStride = CeilDivU16(kRotateQTile, kRotateQTile);
         params.ifTranspose = false;
-        AscendC::LoadData(h16B2_.Get<half>(), h16B1_.Get<half>(), params);
+        AscendC::LoadData(h16L0bBuf_.Get<half>(), h16L1Buf_.Get<half>(), params);
     }
 
     __aicore__ inline void StageCubeOperands(const uint32_t slot)
     {
         SyncEvent<AscendC::HardEvent::M_MTE1>();
-        StageA2(queryHiA1_[slot].Get<half>(), queryHiA2_.Get<half>());
+        StageToL0a(queryHiL1Buf_[slot].Get<half>(), queryHiL0aBuf_.Get<half>());
         if (HiLo()) {
-            StageA2(queryLoA1_[slot].Get<half>(), queryLoA2_.Get<half>());
+            StageToL0a(queryLoL1Buf_[slot].Get<half>(), queryLoL0aBuf_.Get<half>());
         }
-        StageB2();
+        StageH16ToL0b();
         SyncMte1ToMatrix();
     }
 
@@ -313,12 +313,12 @@ private:
     {
         SyncEvent<AscendC::HardEvent::FIX_M>();
 
-        const AscendC::LocalTensor<float> product = productCo1_.Get<float>();
-        AscendC::Mmad(product, queryHiA2_.Get<half>(), h16B2_.Get<half>(),
+        const AscendC::LocalTensor<float> product = productL0cBuf_.Get<float>();
+        AscendC::Mmad(product, queryHiL0aBuf_.Get<half>(), h16L0bBuf_.Get<half>(),
                       AscendC::MmadParams(static_cast<uint16_t>(chunkRows_), static_cast<uint16_t>(kRotateQTile),
                                           static_cast<uint16_t>(kRotateQTile), 0, false, true));
         if (HiLo()) {
-            AscendC::Mmad(product, queryLoA2_.Get<half>(), h16B2_.Get<half>(),
+            AscendC::Mmad(product, queryLoL0aBuf_.Get<half>(), h16L0bBuf_.Get<half>(),
                           AscendC::MmadParams(static_cast<uint16_t>(chunkRows_), static_cast<uint16_t>(kRotateQTile),
                                               static_cast<uint16_t>(kRotateQTile), 0, false, false));
         }
@@ -370,13 +370,13 @@ private:
     }
 
     AscendC::TPipe *pipe_;
-    AscendC::TBuf<AscendC::TPosition::A1> queryHiA1_[kOperandSlots];
-    AscendC::TBuf<AscendC::TPosition::A1> queryLoA1_[kOperandSlots];
-    AscendC::TBuf<AscendC::TPosition::B1> h16B1_;
-    AscendC::TBuf<AscendC::TPosition::A2> queryHiA2_;
-    AscendC::TBuf<AscendC::TPosition::A2> queryLoA2_;
-    AscendC::TBuf<AscendC::TPosition::B2> h16B2_;
-    AscendC::TBuf<AscendC::TPosition::CO1> productCo1_;
+    AscendC::TBuf<AscendC::TPosition::A1> queryHiL1Buf_[kOperandSlots];
+    AscendC::TBuf<AscendC::TPosition::A1> queryLoL1Buf_[kOperandSlots];
+    AscendC::TBuf<AscendC::TPosition::B1> h16L1Buf_;
+    AscendC::TBuf<AscendC::TPosition::A2> queryHiL0aBuf_;
+    AscendC::TBuf<AscendC::TPosition::A2> queryLoL0aBuf_;
+    AscendC::TBuf<AscendC::TPosition::B2> h16L0bBuf_;
+    AscendC::TBuf<AscendC::TPosition::CO1> productL0cBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> queryInBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> queryFloatBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> queryHalfBuf_;

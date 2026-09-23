@@ -28,6 +28,7 @@
 #include "vector/turboquant_vector_service.h"
 
 using vllm_ascend::turboquant::CeilDiv;
+using vllm_ascend::turboquant::GemmLayout;
 using vllm_ascend::turboquant::kCubeLoadDoubleOperandsWait;
 using vllm_ascend::turboquant::kCubeSlots;
 using vllm_ascend::turboquant::kCubeTileM;
@@ -670,37 +671,38 @@ public:
 
     __aicore__ inline explicit TurboQuantCubeGemmProbe(AscendC::TPipe *pipe) : pipe_(pipe) {}
 
-    __aicore__ inline void Init(__gm__ void *a, __gm__ void *b, __gm__ void *c, const uint32_t headSize,
-                                const uint32_t tileRows, const uint32_t aElems, const uint32_t bElems,
-                                const uint32_t cElems)
+    __aicore__ inline void Init(__gm__ void *leftGm, __gm__ void *rightGm, __gm__ void *outGm,
+                                const uint32_t headSize, const uint32_t tileRows, const uint32_t leftElems,
+                                const uint32_t rightElems, const uint32_t outElems)
     {
-        aElems_ = aElems;
-        bElems_ = bElems;
-        cElems_ = cElems;
-        aGm_.SetGlobalBuffer(reinterpret_cast<__gm__ OperandT *>(a));
-        bGm_.SetGlobalBuffer(reinterpret_cast<__gm__ OperandT *>(b));
-        cGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(c));
+        leftElems_ = leftElems;
+        rightElems_ = rightElems;
+        outElems_ = outElems;
+        leftGm_.SetGlobalBuffer(reinterpret_cast<__gm__ OperandT *>(leftGm));
+        rightGm_.SetGlobalBuffer(reinterpret_cast<__gm__ OperandT *>(rightGm));
+        outGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(outGm));
         mm_.Init(pipe_, headSize, tileRows);
-        pipe_->InitBuffer(stageBuf_, aElems > bElems ? aElems : bElems);
-        pipe_->InitBuffer(outBuf_, cElems * sizeof(float));
+        pipe_->InitBuffer(stageBuf_, leftElems > rightElems ? leftElems : rightElems);
+        pipe_->InitBuffer(outBuf_, outElems * sizeof(float));
         // Init boundary: drains every pipe before the probe's first GM read.
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 
-    __aicore__ inline void Run(const uint32_t m, const uint32_t k, const uint32_t n, const uint32_t bIsNk,
+    __aicore__ inline void Run(const uint32_t m, const uint32_t k, const uint32_t n, const GemmLayout layout,
                                const uint32_t variant)
     {
+        const bool rightIsNk = layout == GemmLayout::Normal;
         const AscendC::LocalTensor<float> out = outBuf_.Get<float>();
         if ASCEND_IS_AIV {
             const AscendC::LocalTensor<OperandT> stage = stageBuf_.Get<OperandT>();
-            AscendC::DataCopy(stage, aGm_, aElems_);
+            AscendC::DataCopy(stage, leftGm_, leftElems_);
             // Probe-only GM -> UB -> L1 hand-off, kept in its original form.
             AscendC::PipeBarrier<PIPE_ALL>();
-            AscendC::DataCopy(bIsNk != 0 ? mm_.A1Query() : mm_.A1Probs(), stage, aElems_);
-            AscendC::DataCopy(stage, bGm_, bElems_);
+            AscendC::DataCopy(rightIsNk ? mm_.L1Query() : mm_.L1Probs(), stage, leftElems_);
+            AscendC::DataCopy(stage, rightGm_, rightElems_);
             // Probe-only GM -> UB -> L1 hand-off, kept in its original form.
             AscendC::PipeBarrier<PIPE_ALL>();
-            AscendC::DataCopy(mm_.B1(), stage, bElems_);
+            AscendC::DataCopy(mm_.L1Weight(), stage, rightElems_);
             AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_MTE3>(kFlagOperandsReady);
         }
         if ASCEND_IS_AIC {
@@ -708,17 +710,17 @@ public:
             if (variant == kCubeLoadDoubleOperandsWait) {
                 AscendC::CrossCoreWaitFlag(kFlagOperandsReady);
             }
-            if (bIsNk != 0) {
-                mm_.GemmScores(out, mm_.B1(), m, k, n);
+            if (rightIsNk) {
+                mm_.GemmScores(out, mm_.L1Weight(), m, k, n);
             } else {
-                mm_.GemmContext(out, mm_.B1(), m, k, n, variant);
+                mm_.GemmContext(out, mm_.L1Weight(), m, k, n, variant);
             }
             AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_FIX>(kFlagProductReady);
         }
         if ASCEND_IS_AIV {
             AscendC::CrossCoreWaitFlag(kFlagProductReady);
             if (AscendC::GetSubBlockIdx() == 0) {
-                AscendC::DataCopy(cGm_, out, cElems_);
+                AscendC::DataCopy(outGm_, out, outElems_);
             }
             // Probe-only: the product's GM write lands before the launch returns.
             AscendC::PipeBarrier<PIPE_ALL>();
@@ -730,12 +732,12 @@ private:
     Mm mm_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> stageBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> outBuf_;
-    AscendC::GlobalTensor<OperandT> aGm_;
-    AscendC::GlobalTensor<OperandT> bGm_;
-    AscendC::GlobalTensor<float> cGm_;
-    uint32_t aElems_ = 0;
-    uint32_t bElems_ = 0;
-    uint32_t cElems_ = 0;
+    AscendC::GlobalTensor<OperandT> leftGm_;
+    AscendC::GlobalTensor<OperandT> rightGm_;
+    AscendC::GlobalTensor<float> outGm_;
+    uint32_t leftElems_ = 0;
+    uint32_t rightElems_ = 0;
+    uint32_t outElems_ = 0;
 };
 #endif
 
@@ -823,14 +825,16 @@ ASCEND_TQ_DECLARE_MM_FUSED_DECODE_RAW_QUERY(turboquant_mm_fused_decode_raw_query
 ASCEND_TQ_DECLARE_MM_MODE(kv3fp4, TurboQuantMode::KV3_FP4)
 ASCEND_TQ_DECLARE_MM_MODE(kv5fp8, TurboQuantMode::KV5_FP8)
 
+// rightLayout is a GemmLayout: 0 transposes the K x N right operand into L0B, 1 takes it as N x K.
 extern "C" __global__ __aicore__ void turboquant_cube_gemm_probe_fp8(
-    GM_ADDR a, GM_ADDR b, GM_ADDR c, uint32_t m, uint32_t k, uint32_t n, uint32_t headSize, uint32_t tileRows,
-    uint32_t aElems, uint32_t bElems, uint32_t cElems, uint32_t bIsNk, uint32_t variant)
+    GM_ADDR leftGm, GM_ADDR rightGm, GM_ADDR outGm, uint32_t m, uint32_t k, uint32_t n, uint32_t headSize,
+    uint32_t tileRows, uint32_t leftElems, uint32_t rightElems, uint32_t outElems, uint32_t rightLayout,
+    uint32_t variant)
 {
     AscendC::TPipe pipe;
     TurboQuantCubeGemmProbe op(&pipe);
-    op.Init(a, b, c, headSize, tileRows, aElems, bElems, cElems);
-    op.Run(m, k, n, bIsNk, variant);
+    op.Init(leftGm, rightGm, outGm, headSize, tileRows, leftElems, rightElems, outElems);
+    op.Run(m, k, n, static_cast<GemmLayout>(rightLayout), variant);
 }
 #endif
 
@@ -935,12 +939,12 @@ void turboquant_mm_fused_decode_raw_query_impl(int32_t mode, AscendType type, vo
 }
 
 #if defined(VLLM_ASCEND_TQ_TEST_KERNELS)
-void turboquant_cube_gemm_probe_impl(void *stream, void *a, void *b, void *c, uint32_t m, uint32_t k, uint32_t n,
-                                     uint32_t headSize, uint32_t tileRows, uint32_t aElems, uint32_t bElems,
-                                     uint32_t cElems, uint32_t bIsNk, uint32_t variant)
+void turboquant_cube_gemm_probe_impl(void *stream, void *leftGm, void *rightGm, void *outGm, uint32_t m, uint32_t k,
+                                     uint32_t n, uint32_t headSize, uint32_t tileRows, uint32_t leftElems,
+                                     uint32_t rightElems, uint32_t outElems, uint32_t rightLayout, uint32_t variant)
 {
-    turboquant_cube_gemm_probe_fp8<<<1, nullptr, stream>>>(a, b, c, m, k, n, headSize, tileRows, aElems, bElems,
-                                                           cElems, bIsNk, variant);
+    turboquant_cube_gemm_probe_fp8<<<1, nullptr, stream>>>(leftGm, rightGm, outGm, m, k, n, headSize, tileRows,
+                                                           leftElems, rightElems, outElems, rightLayout, variant);
 }
 #endif
 

@@ -239,6 +239,97 @@ TEST(TurboQuantTiling, FusedDecodePlansAnEmptyGridForAShapeWithNoTask) {
   }
 }
 
+// Every planner divides by a count it derived from the shape, and a shape that drives one of those counts
+// to zero used to be a SIGFPE inside the tiling rather than a rejected input -- a crash with no message,
+// from a plain host function with no operator-level guard in front of it. This sweeps the degenerate corners
+// of all four planners: no tokens, no heads, more kv heads than heads, no blocks, a zero block size, and a
+// core count of zero or one. Nothing here asserts a particular grid. It asserts that a grid comes back at
+// all, and that what comes back is self-consistent.
+TEST(TurboQuantTiling, PlannersNeverDivideByAShapeDerivedZero) {
+  const int64_t tokens_set[] = {0, 1, 2};
+  const int64_t heads_set[] = {0, 1, 2, 3, 8, 16};
+  const int64_t kv_heads_set[] = {1, 2, 4, 8};
+  const int64_t blocks_set[] = {0, 1, 2, 63};
+  const int64_t block_size_set[] = {0, 1, static_cast<int64_t>(tqt::kCubeTileRows), 128};
+  const int64_t aiv_set[] = {0, 1, 2, 8, 64};
+
+  for (const tqt::FusedSplitPolicy policy :
+       {tqt::FusedSplitPolicy::kContextOnly, tqt::FusedSplitPolicy::kFillBlocks, tqt::FusedSplitPolicy::kAdaptive}) {
+    for (const int64_t tokens : tokens_set) {
+      for (const int64_t heads : heads_set) {
+        for (const int64_t kv_heads : kv_heads_set) {
+          for (const int64_t blocks : blocks_set) {
+            for (const int64_t block_size : block_size_set) {
+              for (const int64_t aiv : aiv_set) {
+                const std::string where = "policy " + std::to_string(static_cast<int>(policy)) + " tokens " +
+                                          std::to_string(tokens) + " heads " + std::to_string(heads) +
+                                          " kv_heads " + std::to_string(kv_heads) + " blocks " +
+                                          std::to_string(blocks) + " block_size " + std::to_string(block_size) +
+                                          " aiv " + std::to_string(aiv);
+
+                const tqt::FusedDecodeGrid fused = tqt::PlanFusedDecode(
+                    tokens, heads, kv_heads, kHeadSize, blocks, block_size, aiv, tqt::kFusedContextLimit, policy);
+                ASSERT_GE(fused.num_splits, 1) << where;
+                ASSERT_LE(fused.heads_per_task, tqt::kCubeTileM) << where;
+                if (fused.num_tasks > 0) {
+                  // A grid with work in it has to be able to launch: every task needs a block to run on.
+                  ASSERT_GE(fused.block_dim, 1u) << where;
+                  ASSERT_GE(fused.tasks_per_block, 1u) << where;
+                  ASSERT_GE(static_cast<int64_t>(fused.block_dim) * fused.tasks_per_block, fused.num_tasks) << where;
+                  ASSERT_GE(fused.heads_per_task, 1u) << where;
+                } else {
+                  // And a grid with no work in it has to say so, rather than launch an empty block_dim.
+                  ASSERT_EQ(fused.block_dim, 0u) << where;
+                  ASSERT_EQ(fused.workspace_floats, 0u) << where;
+                }
+                if (fused.num_splits == 1) {
+                  ASSERT_EQ(fused.workspace_floats, 0u) << where;
+                  ASSERT_EQ(fused.reduce_tasks_per_block, 0u) << where;
+                }
+
+                const tqt::PagedAttentionGrid paged = tqt::PlanPagedAttention(
+                    tokens, heads, kHeadSize, blocks, block_size, aiv, tqt::kFusedContextLimit);
+                ASSERT_GE(paged.num_splits, 1) << where;
+                if (tokens > 0 && heads > 0 && aiv > 0) {
+                  ASSERT_GE(paged.block_dim, 1u) << where;
+                  ASSERT_GE(paged.split_tasks_per_core, 1u) << where;
+                  ASSERT_GE(static_cast<int64_t>(paged.block_dim) * paged.split_tasks_per_core,
+                            tokens * heads * paged.num_splits)
+                      << where;
+                } else {
+                  ASSERT_EQ(paged.block_dim, 0u) << where;
+                }
+
+                const tqt::ReshapeAndCacheGrid write = tqt::PlanReshapeAndCache(tokens, aiv);
+                if (tokens > 0 && aiv > 0) {
+                  ASSERT_GE(write.tokens_per_core, 1u) << where;
+                  ASSERT_GE(static_cast<int64_t>(write.block_dim) * write.tokens_per_core, tokens) << where;
+                } else {
+                  ASSERT_EQ(write.block_dim, 0u) << where;
+                }
+
+                // head_size 0 would divide by zero in the chunk sizing; the planner has to reject it first.
+                for (const int64_t rot_head : {int64_t{0}, int64_t{1}, kHeadSize}) {
+                  const tqt::RotateQPlan rot =
+                      tqt::PlanRotateQ(tokens, tokens * heads, rot_head, tqt::RotateQCoreNum(aiv),
+                                       tqt::RotateQPrecision::kSinglePassRint);
+                  if (tokens > 0 && heads > 0 && rot_head > 0) {
+                    ASSERT_GE(rot.vectors_per_block, 1u) << where << " head_size " << rot_head;
+                    ASSERT_GE(static_cast<int64_t>(rot.block_dim) * rot.vectors_per_block, tokens * heads)
+                        << where << " head_size " << rot_head;
+                  } else {
+                    ASSERT_EQ(rot.block_dim, 0u) << where << " head_size " << rot_head;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 TEST(TurboQuantTiling, DecodeNeedsReductionMirrorsTheKernels) {
   EXPECT_FALSE(tqt::DecodeNeedsReduction(1, 32768, 0));
   EXPECT_FALSE(tqt::DecodeNeedsReduction(8, 4096, tqt::kFusedContextLimit));

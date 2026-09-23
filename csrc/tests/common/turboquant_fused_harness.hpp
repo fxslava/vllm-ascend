@@ -54,6 +54,19 @@ struct FusedShape {
   int64_t batch = 1;
   // Draw an attn_output_gate logit per query element, for the raw-query decode's kGated output stage.
   bool gated = false;
+  // Fill every block-table row with -1, the entry a padding or unmapped block carries. The block range of
+  // every task is then non-empty but holds no tile, which is the decode's numTiles == 0 path: both cores
+  // have to bypass the cross-core pipeline in lock step, and the launch has to finish rather than strand
+  // the AIC on a flag nothing will set. The cache is still built and uploaded, so a decode that read one
+  // of these rows anyway would not read zeros.
+  bool unmapped_block_table = false;
+};
+
+// The raw GM image one cache-writer launch produced, copied out of device memory.
+struct WrittenImage {
+  std::vector<int8_t> key;
+  std::vector<int8_t> value;
+  std::vector<float> scales;
 };
 
 // What the kernel writer put into GM, against the host encoder of the same levels.
@@ -154,7 +167,11 @@ class FusedCubeScenario {
     }
     std::vector<int32_t> block_rows;
     for (int64_t token = 0; token < shape.batch; ++token) {
-      block_rows.insert(block_rows.end(), block_table_.begin(), block_table_.end());
+      if (shape.unmapped_block_table) {
+        block_rows.insert(block_rows.end(), static_cast<size_t>(blocks_per_seq_), -1);
+      } else {
+        block_rows.insert(block_rows.end(), block_table_.begin(), block_table_.end());
+      }
     }
     block_tables_ = DeviceBuffer::FromHost(block_rows);
     context_lens_ = DeviceBuffer::FromHost(
@@ -263,6 +280,25 @@ class FusedCubeScenario {
 
   int64_t blocks_per_seq() const { return blocks_per_seq_; }
 
+  // The GM image the last cache-writer launch produced. Note that the construction-time launch was fed the
+  // original dense cache and every launch after it is fed the rescaled one (see WriteThroughKernel), so a
+  // caller comparing images across launches has to take its own control rather than use the constructor's.
+  WrittenImage CaptureWrittenImage() const { return {written_key_, written_value_, written_scales_}; }
+
+  // Re-runs the kv4fp8 cache writer with slot_mapping handed in `offset_elems` int32s into its allocation,
+  // which is what a PyTorch sub-slice of a slot-mapping tensor looks like: contiguous, element aligned, and
+  // at offset 1, 2 or 3 NOT on a 32-byte burst boundary. The kernel reads slot_mapping only with
+  // GlobalTensor::GetValue, one int32 at a time, so nothing about it needs burst alignment -- this is the
+  // execution-side half of the adapter's CheckGmScalarAligned contract. Needs a kernel_writer shape.
+  //
+  // Returns the GM image to compare against CaptureWrittenImage(), and deliberately does NOT touch the
+  // scenario's host-side reference: the scale rescale WriteThroughKernel does at construction is a one-shot
+  // that rescales cache_.key / cache_.value in place, and running it again would compound it.
+  WrittenImage RewriteAtSlotMappingOffset(int64_t offset_elems) {
+    LaunchWriter(offset_elems);
+    return CaptureWrittenImage();
+  }
+
   // The kernel-written GM cache against the host encoder: the packed planes byte for byte (and, for the
   // diagnosis, with the two nibble lanes of every byte swapped), and the scale plane against the RMS of the
   // vectors the writer was given, with every pad lane and unwritten slot left at zero.
@@ -312,39 +348,11 @@ class FusedCubeScenario {
   // from both neighbouring thresholds. Its scale is the RMS of those vectors rather than of the draw, so
   // the exact-attention reference is rescaled to the scales the writer stored.
   void WriteThroughKernel() {
-    const int64_t d = shape_.head_size;
+    const std::vector<int32_t> slots = LaunchWriter(0);
     const int64_t tokens = shape_.context_len;
-    const int64_t block_size = shape_.block_size;
-    const size_t head = static_cast<size_t>(d);
+    const size_t head = static_cast<size_t>(shape_.head_size);
     const size_t kv_heads = static_cast<size_t>(shape_.num_kv_heads);
     const size_t slot_floats = static_cast<size_t>(MirroredScaleSlotFloats(shape_.num_kv_heads));
-
-    std::vector<int32_t> slots(static_cast<size_t>(tokens));
-    for (int64_t t = 0; t < tokens; ++t) {
-      slots[static_cast<size_t>(t)] = block_table_[static_cast<size_t>(t / block_size)] *
-                                          static_cast<int32_t>(block_size) +
-                                      static_cast<int32_t>(t % block_size);
-    }
-    DeviceBuffer key_fp16 = DeviceBuffer::FromHost(FloatToHalf(UnrotateHeads(cache_.key, d)));
-    DeviceBuffer value_fp16 = DeviceBuffer::FromHost(FloatToHalf(UnrotateHeads(cache_.value, d)));
-    DeviceBuffer slot_mapping = DeviceBuffer::FromHost(slots);
-    DeviceBuffer write_tables = DeviceBuffer::FromHost(ModeTables(kFusedMode, d, 1, 0));
-    key_cache_ = DeviceBuffer::FromHost(std::vector<int8_t>(cache_.key_packed.size(), 0));
-    value_cache_ = DeviceBuffer::FromHost(std::vector<int8_t>(cache_.value_packed.size(), 0));
-    scale_plane_ = DeviceBuffer::FromHost(std::vector<float>(cache_.scales.size(), 0.0f));
-
-    const ReshapeAndCacheGrid grid = PlanReshapeAndCache(tokens, aiv_num_);
-    turboquant_mm_reshape_and_cache_impl(
-        static_cast<int32_t>(kFusedMode), AscendType::FP16, stream_, grid.block_dim, key_fp16.get(), value_fp16.get(),
-        key_cache_.get(), value_cache_.get(), scale_plane_.get(), slot_mapping.get(), pi_signs_.get(),
-        rot_tables_.get(), write_tables.get(), static_cast<uint32_t>(tokens), static_cast<uint32_t>(kv_heads),
-        static_cast<uint32_t>(d), static_cast<uint32_t>(block_size),
-        static_cast<uint32_t>(blocks_per_seq_ * shape_.pool_factor), grid.tokens_per_core,
-        1.0f / std::sqrt(static_cast<float>(d)));
-    ACL_CHECK(aclrtSynchronizeStream(stream_));
-    written_key_ = key_cache_.ToHost<int8_t>();
-    written_value_ = value_cache_.ToHost<int8_t>();
-    written_scales_ = scale_plane_.ToHost<float>();
 
     expected_scales_.assign(cache_.scales.size(), 0.0);
     for (int64_t t = 0; t < tokens; ++t) {
@@ -367,6 +375,48 @@ class FusedCubeScenario {
         }
       }
     }
+  }
+
+  // One cache-writer launch, with slot_mapping handed in `slot_offset_elems` int32s into its allocation.
+  // Fills written_key_ / written_value_ / written_scales_ and returns the slots it wrote. Pure with respect
+  // to the host-side reference; WriteThroughKernel is the one that rescales it, once.
+  std::vector<int32_t> LaunchWriter(int64_t slot_offset_elems) {
+    const int64_t d = shape_.head_size;
+    const int64_t tokens = shape_.context_len;
+    const int64_t block_size = shape_.block_size;
+    const size_t kv_heads = static_cast<size_t>(shape_.num_kv_heads);
+
+    std::vector<int32_t> slots(static_cast<size_t>(tokens));
+    for (int64_t t = 0; t < tokens; ++t) {
+      slots[static_cast<size_t>(t)] = block_table_[static_cast<size_t>(t / block_size)] *
+                                          static_cast<int32_t>(block_size) +
+                                      static_cast<int32_t>(t % block_size);
+    }
+    DeviceBuffer key_fp16 = DeviceBuffer::FromHost(FloatToHalf(UnrotateHeads(cache_.key, d)));
+    DeviceBuffer value_fp16 = DeviceBuffer::FromHost(FloatToHalf(UnrotateHeads(cache_.value, d)));
+    // The slots land `slot_offset_elems` int32s into the allocation, and the kernel is given that address.
+    std::vector<int32_t> slot_storage(static_cast<size_t>(slot_offset_elems), 0);
+    slot_storage.insert(slot_storage.end(), slots.begin(), slots.end());
+    DeviceBuffer slot_mapping = DeviceBuffer::FromHost(slot_storage);
+    void* slot_arg = static_cast<void*>(static_cast<int32_t*>(slot_mapping.get()) + slot_offset_elems);
+    DeviceBuffer write_tables = DeviceBuffer::FromHost(ModeTables(kFusedMode, d, 1, 0));
+    key_cache_ = DeviceBuffer::FromHost(std::vector<int8_t>(cache_.key_packed.size(), 0));
+    value_cache_ = DeviceBuffer::FromHost(std::vector<int8_t>(cache_.value_packed.size(), 0));
+    scale_plane_ = DeviceBuffer::FromHost(std::vector<float>(cache_.scales.size(), 0.0f));
+
+    const ReshapeAndCacheGrid grid = PlanReshapeAndCache(tokens, aiv_num_);
+    turboquant_mm_reshape_and_cache_impl(
+        static_cast<int32_t>(kFusedMode), AscendType::FP16, stream_, grid.block_dim, key_fp16.get(), value_fp16.get(),
+        key_cache_.get(), value_cache_.get(), scale_plane_.get(), slot_arg, pi_signs_.get(),
+        rot_tables_.get(), write_tables.get(), static_cast<uint32_t>(tokens), static_cast<uint32_t>(kv_heads),
+        static_cast<uint32_t>(d), static_cast<uint32_t>(block_size),
+        static_cast<uint32_t>(blocks_per_seq_ * shape_.pool_factor), grid.tokens_per_core,
+        1.0f / std::sqrt(static_cast<float>(d)));
+    ACL_CHECK(aclrtSynchronizeStream(stream_));
+    written_key_ = key_cache_.ToHost<int8_t>();
+    written_value_ = value_cache_.ToHost<int8_t>();
+    written_scales_ = scale_plane_.ToHost<float>();
+    return slots;
   }
 
   // One timed launch over `grid`: a fresh workspace, a poisoned output, then `launch(workspace, 1 / sqrt(D))`.

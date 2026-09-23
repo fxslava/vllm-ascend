@@ -78,12 +78,12 @@ public:
         codec_.Init(pipe, headSize_, 1, invSqrtLen, rotTablesGm_);
 
         if (cubeChunk_ > 0) {
-            pipe->InitBuffer(tileA1_, tileElems_ * sizeof(half));
-            pipe->InitBuffer(h16B1_, kRotateQH16Elements * sizeof(half));
+            pipe->InitBuffer(tileL1Buf_, tileElems_ * sizeof(half));
+            pipe->InitBuffer(h16L1Buf_, kRotateQH16Elements * sizeof(half));
             if ASCEND_IS_AIC {
-                pipe->InitBuffer(tileA2_, tileElems_ * sizeof(half));
-                pipe->InitBuffer(h16B2_, kRotateQH16Elements * sizeof(half));
-                pipe->InitBuffer(productCo1_, tileElems_ * sizeof(float));
+                pipe->InitBuffer(tileL0aBuf_, tileElems_ * sizeof(half));
+                pipe->InitBuffer(h16L0bBuf_, kRotateQH16Elements * sizeof(half));
+                pipe->InitBuffer(productL0cBuf_, tileElems_ * sizeof(float));
             }
         }
 
@@ -94,7 +94,7 @@ public:
                     const AscendC::LocalTensor<half> stage = halfBuf_.Get<half>();
                     AscendC::DataCopy(stage, h16Gm_, kRotateQH16Elements);
                     SyncEvent<AscendC::HardEvent::MTE2_MTE3>();
-                    AscendC::DataCopy(h16B1_.Get<half>(), stage, kRotateQH16Elements);
+                    AscendC::DataCopy(h16L1Buf_.Get<half>(), stage, kRotateQH16Elements);
                 }
             }
         }
@@ -193,7 +193,7 @@ private:
         }
         AscendC::Cast(operand, query, AscendC::RoundMode::CAST_RINT, elems);
         SyncVectorToMte3();
-        AscendC::DataCopy(tileA1_.Get<half>()[subcore * elems], operand, elems);
+        AscendC::DataCopy(tileL1Buf_.Get<half>()[subcore * elems], operand, elems);
         AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_MTE3>(kFlagOperandsReady);
 
         AscendC::CrossCoreWaitFlag(kFlagProductReady);
@@ -229,8 +229,8 @@ private:
         SyncMte1ToMatrix();
 
         SyncEvent<AscendC::HardEvent::FIX_M>();
-        const AscendC::LocalTensor<float> product = productCo1_.Get<float>();
-        AscendC::Mmad(product, tileA2_.Get<half>(), h16B2_.Get<half>(),
+        const AscendC::LocalTensor<float> product = productL0cBuf_.Get<float>();
+        AscendC::Mmad(product, tileL0aBuf_.Get<half>(), h16L0bBuf_.Get<half>(),
                       AscendC::MmadParams(static_cast<uint16_t>(rows), static_cast<uint16_t>(kRotateQTile),
                                           static_cast<uint16_t>(kRotateQTile), 0, false, true));
         SyncMatrixToFixpipe();
@@ -256,7 +256,7 @@ private:
         tile.srcStride = CeilDivU16(rows, kRotateQTile);
         tile.dstStride = CeilDivU16(rows, kRotateQTile);
         tile.ifTranspose = false;
-        AscendC::LoadData(tileA2_.Get<half>(), tileA1_.Get<half>(), tile);
+        AscendC::LoadData(tileL0aBuf_.Get<half>(), tileL1Buf_.Get<half>(), tile);
 
         AscendC::LoadData2DParamsV2 h16;
         h16.mStartPosition = 0;
@@ -266,7 +266,7 @@ private:
         h16.srcStride = CeilDivU16(kRotateQTile, kRotateQTile);
         h16.dstStride = CeilDivU16(kRotateQTile, kRotateQTile);
         h16.ifTranspose = false;
-        AscendC::LoadData(h16B2_.Get<half>(), h16B1_.Get<half>(), h16);
+        AscendC::LoadData(h16L0bBuf_.Get<half>(), h16L1Buf_.Get<half>(), h16);
     }
 
     // One vector on this subcore alone: read, ApplyPi, write.
@@ -295,11 +295,11 @@ private:
     AscendC::TBuf<AscendC::QuePosition::VECCALC> halfBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> pairBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> signBuf_;
-    AscendC::TBuf<AscendC::TPosition::A1> tileA1_;
-    AscendC::TBuf<AscendC::TPosition::B1> h16B1_;
-    AscendC::TBuf<AscendC::TPosition::A2> tileA2_;
-    AscendC::TBuf<AscendC::TPosition::B2> h16B2_;
-    AscendC::TBuf<AscendC::TPosition::CO1> productCo1_;
+    AscendC::TBuf<AscendC::TPosition::A1> tileL1Buf_;
+    AscendC::TBuf<AscendC::TPosition::B1> h16L1Buf_;
+    AscendC::TBuf<AscendC::TPosition::A2> tileL0aBuf_;
+    AscendC::TBuf<AscendC::TPosition::B2> h16L0bBuf_;
+    AscendC::TBuf<AscendC::TPosition::CO1> productL0cBuf_;
     AscendC::GlobalTensor<scalar_t> queryGm_;
     AscendC::GlobalTensor<float> piSignsGm_;
     AscendC::GlobalTensor<int32_t> rotTablesGm_;

@@ -76,9 +76,10 @@ void turboquant_mm_fused_decode_raw_query_impl(int32_t mode, AscendType type, vo
                                               uint32_t outputStage, uint32_t fusedContextLimit, float scale,
                                               float invSqrtLen);
 
-void turboquant_cube_gemm_probe_impl(void *stream, void *a, void *b, void *c, uint32_t m, uint32_t k, uint32_t n,
-                                     uint32_t headSize, uint32_t tileRows, uint32_t aElems, uint32_t bElems,
-                                     uint32_t cElems, uint32_t bIsNk, uint32_t variant);
+// rightLayout is a turboquant::GemmLayout: 0 transposes the K x N right operand into L0B, 1 takes it as N x K.
+void turboquant_cube_gemm_probe_impl(void *stream, void *leftGm, void *rightGm, void *outGm, uint32_t m, uint32_t k,
+                                     uint32_t n, uint32_t headSize, uint32_t tileRows, uint32_t leftElems,
+                                     uint32_t rightElems, uint32_t outElems, uint32_t rightLayout, uint32_t variant);
 
 namespace test {
 namespace turboquant_host {
