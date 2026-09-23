@@ -283,7 +283,7 @@ class LayerProbe:
             last = output[-1:].detach().to(torch.float32)
             self.hidden[index] = last
             if index in self.reference:
-                self._cosines[index] = _cosine(last, self.reference[index])
+                self._cosines[index] = cosine(last, self.reference[index])
             if self.target_token is not None:
                 self._ranks[index] = self._logit_lens_rank(last)
 
@@ -361,7 +361,13 @@ def _attention_metrics(
     return mass, entropy
 
 
-def _cosine(actual: torch.Tensor, expected: torch.Tensor) -> float:
+def cosine(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    """Cosine of two hidden states, in float64 on the host.
+
+    Public because ``--eval-fidelity`` compares a quantised run's output
+    embedding against a dense one's with the same measure the layer table uses,
+    and the two numbers are only comparable if they are the same function.
+    """
     left = actual.detach().to("cpu", torch.float64).flatten()
     right = expected.detach().to("cpu", torch.float64).flatten()
     return float(torch.dot(left, right) / (left.norm() * right.norm()).clamp_min(1e-30))

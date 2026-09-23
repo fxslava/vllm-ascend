@@ -3905,6 +3905,236 @@ class TestRunLongBench(unittest.TestCase):
             parse_tasks("narrativeqa,not_a_task")
 
 
+class TestContextTiers(unittest.TestCase):
+    """``--context-tier`` and the flags that keep a 1M arena from being provisioned by accident.
+
+    Everything here stops short of allocating one. A tier run's whole point is an
+    arena three orders of magnitude past what this suite can hold, so what is
+    checked is the arithmetic and the refusals that stand in front of it: which
+    rung a tier implies, which tasks it reads, what an override does to the cache
+    size, and that the guard, the fidelity cap and the dry run all fire before
+    a single weight is loaded.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.model_path = self.root / "chatglm"
+        self.model_path.mkdir()
+        (self.model_path / "config.json").write_text(json.dumps(TINY_GLM), encoding="utf-8")
+        self.tiered = self.root / "tiered"
+
+    def _args(self, *extra):
+        from tq_longbench.run_longbench import build_parser, parse_budget_overrides
+
+        args = build_parser().parse_args(
+            ["--model-path", str(self.model_path), "--tiered-dir", str(self.tiered), *extra]
+        )
+        args.budget_overrides = parse_budget_overrides(args.max_tokens_override)
+        return args
+
+    def _write_tier(self, tier, tasks=("qasper",), items=1, manifest=True):
+        directory = self.tiered / tier
+        directory.mkdir(parents=True)
+        for task in tasks:
+            rows = [{"context": "alpha beta", "input": "what?", "answers": ["alpha"]} for _ in range(items)]
+            (directory / f"{task}.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+        if manifest:
+            (directory / "manifest.json").write_text(
+                json.dumps({"tier": tier, "tasks": {task: {"items": items} for task in tasks}}), encoding="utf-8"
+            )
+        return directory
+
+    # ------------------------------------------------------------ the budgets
+
+    def test_a_bare_number_overrides_every_task(self):
+        from tq_longbench.run_longbench import parse_budget_overrides
+
+        self.assertEqual(parse_budget_overrides("256"), {None: 256})
+
+    def test_pairs_override_one_task_each(self):
+        from tq_longbench.run_longbench import parse_budget_overrides
+
+        self.assertEqual(parse_budget_overrides("gov_report=1024,qasper=256"), {"gov_report": 1024, "qasper": 256})
+
+    def test_a_task_whose_real_name_starts_with_longbench_survives_the_prefix_strip(self):
+        """``longbench_v2`` is a task, not ``v2`` with a prefix on it."""
+        from tq_longbench.run_longbench import parse_budget_overrides, parse_tasks
+
+        self.assertEqual(parse_tasks("longbench_v2"), ("longbench_v2",))
+        self.assertEqual(parse_tasks("longbench_qasper"), ("qasper",))
+        self.assertEqual(parse_budget_overrides("longbench_v2=32"), {"longbench_v2": 32})
+
+    def test_a_malformed_override_is_refused(self):
+        from tq_longbench.run_longbench import parse_budget_overrides
+
+        for text in ("gov_report", "gov_report=x", "gov_report=0", "not_a_task=64"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                parse_budget_overrides(text)
+
+    def test_the_budget_falls_through_the_flags_in_order(self):
+        from tq_longbench.run_longbench import item_budget
+        from tq_longbench.tasks import EvalItem
+
+        item = EvalItem(prompt="p", answers=["a"], metric="qasper", max_new_tokens=128, extra={"task": "qasper"})
+        args = types.SimpleNamespace(budget_overrides={}, max_new_tokens=None)
+        self.assertEqual(item_budget(args, item), 128)
+        args.max_new_tokens = 16
+        self.assertEqual(item_budget(args, item), 16)
+        args.budget_overrides = {None: 32}
+        self.assertEqual(item_budget(args, item), 32)
+        args.budget_overrides = {None: 32, "qasper": 64}
+        self.assertEqual(item_budget(args, item), 64)
+
+    def test_an_override_widens_the_arena_it_needs(self):
+        """An arena sized off the published budget would be short by the difference."""
+        from tq_longbench.run_longbench import _largest_budget
+
+        args = self._args("--max-tokens-override", "qasper=2048")
+        self.assertEqual(_largest_budget(args, ("qasper", "gov_report")), 2048)
+        # gov_report's published 512 still sets it where no override applies.
+        self.assertEqual(_largest_budget(self._args(), ("qasper", "gov_report")), 512)
+
+    # -------------------------------------------------------------- the tiers
+
+    def test_a_tier_is_one_rung_at_its_ceiling(self):
+        """Not a ladder: the items were chosen for being that long, so a shorter rung would cut them."""
+        from tq_longbench.prepare_buckets import TIERS
+        from tq_longbench.run_longbench import apply_tier
+
+        self._write_tier("256k", tasks=("longbench_v2",))
+        args = self._args("--context-tier", "256k")
+        contexts, tasks = apply_tier(args)
+        self.assertEqual(contexts, (TIERS["256k"].max_tokens,))
+        self.assertEqual(tasks, ("longbench_v2",))
+        self.assertEqual(args.dataset_dir, self.tiered / "256k")
+
+    def test_the_tasks_come_from_the_manifest_and_fall_back_to_the_files(self):
+        from tq_longbench.run_longbench import tier_tasks
+
+        with_manifest = self._write_tier("32k", tasks=("qasper", "gov_report"))
+        self.assertEqual(tier_tasks(with_manifest), ("gov_report", "qasper"))
+        without = self._write_tier("256k", tasks=("longbench_v2",), manifest=False)
+        self.assertEqual(tier_tasks(without), ("longbench_v2",))
+
+    def test_an_explicit_tasks_flag_still_wins_at_a_tier(self):
+        from tq_longbench.run_longbench import apply_tier
+
+        self._write_tier("32k", tasks=("qasper", "gov_report"))
+        _, tasks = apply_tier(self._args("--context-tier", "32k", "--tasks", "qasper"))
+        self.assertEqual(tasks, ("qasper",))
+
+    def test_a_tier_that_was_never_built_says_how_to_build_it(self):
+        from tq_longbench.run_longbench import apply_tier
+
+        with self.assertRaises(SystemExit) as refusal:
+            apply_tier(self._args("--context-tier", "1m"))
+        self.assertIn("prepare_buckets.py", str(refusal.exception))
+
+    def test_an_empty_tier_directory_is_refused_rather_than_run_on_nothing(self):
+        from tq_longbench.run_longbench import apply_tier
+
+        (self.tiered / "32k").mkdir(parents=True)
+        with self.assertRaises(SystemExit) as refusal:
+            apply_tier(self._args("--context-tier", "32k"))
+        self.assertIn("no task JSONL", str(refusal.exception))
+
+    def test_without_a_tier_the_ladder_is_unchanged(self):
+        from tq_longbench.run_longbench import DEFAULT_CONTEXTS, apply_tier
+
+        contexts, tasks = apply_tier(self._args())
+        self.assertEqual(contexts, tuple(int(part) for part in DEFAULT_CONTEXTS.split(",")))
+        self.assertIn("narrativeqa", tasks)
+
+    # ------------------------------------------------------------- the guards
+
+    def test_the_arena_guard_names_the_flag_that_lifts_it(self):
+        from tq_longbench.run_longbench import guard_arena
+
+        args = self._args()
+        guard_arena(args, 1024, 2048)  # well under the default, nothing happens
+        with self.assertRaises(SystemExit) as refusal:
+            guard_arena(args, 1048576, 1049088)
+        message = str(refusal.exception)
+        self.assertIn("--max-context 1049088", message)
+        self.assertIn("--dry-run", message)
+
+    def test_the_guard_lifts_when_it_is_lifted_deliberately(self):
+        from tq_longbench.run_longbench import guard_arena
+
+        guard_arena(self._args("--max-context", "2000000"), 1048576, 1049088)
+
+    def test_the_1m_tier_does_not_run_without_being_asked_twice(self):
+        from tq_longbench import run_longbench
+
+        self._write_tier("1m", tasks=("longbench_v2",))
+        argv = [
+            "--model-path", str(self.model_path),
+            "--tiered-dir", str(self.tiered),
+            "--context-tier", "1m",
+            "--device", "cpu",
+        ]  # fmt: skip
+        with self.assertRaises(SystemExit) as refusal:
+            run_longbench.main(argv)
+        self.assertIn("--max-context", str(refusal.exception))
+
+    def test_fidelity_is_refused_above_the_length_its_second_prefill_fits(self):
+        from tq_longbench import run_longbench
+        from tq_longbench.run_longbench import FIDELITY_MAX_CONTEXT
+
+        self._write_tier("256k", tasks=("longbench_v2",))
+        argv = [
+            "--model-path", str(self.model_path),
+            "--tiered-dir", str(self.tiered),
+            "--context-tier", "256k",
+            "--eval-fidelity",
+            "--device", "cpu",
+        ]  # fmt: skip
+        with self.assertRaises(SystemExit) as refusal:
+            run_longbench.main(argv)
+        message = str(refusal.exception)
+        self.assertIn(str(FIDELITY_MAX_CONTEXT), message)
+        self.assertIn("dataset metrics and the telemetry are measured at every tier", message)
+
+    def test_the_dry_run_prices_the_arena_without_loading_a_weight(self):
+        """config.json is the whole input: the point is to answer 'will this fit' before paying."""
+        from tq_longbench import run_longbench
+
+        self._write_tier("1m", tasks=("longbench_v2",))
+        argv = [
+            "--model-path", str(self.model_path),
+            "--tiered-dir", str(self.tiered),
+            "--context-tier", "1m",
+            "--dry-run",
+            "--device", "cpu",
+        ]  # fmt: skip
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = run_longbench.main(argv)
+        printed = out.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("REFUSED", printed)
+        self.assertIn("Dense KV (MB)", printed)
+        self.assertIn("longbench_v2", printed)
+
+    def test_the_dry_run_passes_a_tier_that_clears_the_guard(self):
+        from tq_longbench import run_longbench
+
+        self._write_tier("32k", tasks=("qasper",))
+        argv = [
+            "--model-path", str(self.model_path),
+            "--tiered-dir", str(self.tiered),
+            "--context-tier", "32k",
+            "--dry-run",
+            "--device", "cpu",
+        ]  # fmt: skip
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            run_longbench.main(argv)
+        printed = out.getvalue()
+        self.assertNotIn("REFUSED", printed)
+        self.assertRegex(printed, r"\s32768\s")
+
+
 class TestLongBenchJsonlLoader(unittest.TestCase):
     """``load_longbench_jsonl`` on its own: the file shape the suite ships, and its failure modes."""
 

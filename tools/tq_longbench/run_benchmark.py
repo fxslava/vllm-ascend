@@ -263,6 +263,9 @@ def build_runner(
             fold_output_rotation=not args.no_fold_output_rotation and backend not in DENSE_BACKENDS,
             seed=args.seed,
             fold_site=args.fold_site,
+            # Not every caller offers the flag; those that do not keep the
+            # engine's own 'auto', which is what this module has always used.
+            decode_graph=getattr(args, "decode_graph", "auto"),
             dense_attention_api=plan.dense_api_for(backend),
             dense_staging_backend=plan.staging_backend,
         )

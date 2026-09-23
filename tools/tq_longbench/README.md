@@ -776,6 +776,38 @@ against the single character `C` would give half credit for containing a `c`.
 Neither it nor InfiniteBench is a v1 task and neither score is comparable to a
 published v1 number.
 
+### Running a tier (`--context-tier`)
+
+```bash
+python tools/tq_longbench/run_longbench.py --model-path ~/models/glm-4-9b-chat-1m --context-tier 256k --max-tokens-override gov_report=1024,qasper=256 --decode-graph on --out-file tier-256k.jsonl
+```
+
+A tier is a **single rung at its ceiling**, not a ladder: its items were selected
+for already being that long, so a shorter rung would start cutting them and
+throw away the property the tier was built for. `truncated` is zero throughout.
+The tasks come from the tier's `manifest.json` unless `--tasks` names others,
+and the arena is `tier_tokens + max_gen_tokens + headroom`.
+
+| Flag | What it does |
+|---|---|
+| `--max-tokens-override` | a bare number for every task, or `task=N` pairs. Beats `--max-new-tokens` and the task's published budget, and widens the arena to match — an arena sized off the published budget would be short by the difference. |
+| `--max-context` | refuses to provision an arena past this many tokens (default 262144). The 32k and 256k tiers clear it; **the 1M tier does not** and has to be let through deliberately. |
+| `--dry-run` | prints what each rung would provision and what the same arena costs dense, from `config.json` alone — no weights, no device, no tokenizer. |
+| `--eval-fidelity` | the output-embedding cosine against a `cann_dense` prefill of the same prompt. Refused above 32k, where the second pool does not fit beside the first; the dataset metrics and the telemetry are measured at every tier regardless. |
+| `--decode-graph on` | refuses to fall back to an eager decode, which is what a benchmark wants. |
+
+`kv_cache_mb`, `dense_equivalent_mb` and `kv_saved_mb` are in every record and
+now on the summary table too — at a tier they are the numbers the compression
+claim rests on. All three describe the rung's **arena**, not the prompt that
+filled it.
+
+`--eval-fidelity` answers a different question from the score beside it. A right
+answer can come out of a stack that has drifted a long way from the dense one;
+the cosine says how far it drifted at the vector the first generated token is
+chosen from. The table reports the **worst** cosine over a task's items, because
+a rung sitting at 0.999 except for one item at 0.4 has a problem that a mean of
+0.94 would wave through.
+
 ## Where a long-context answer broke (`--profile-layers`)
 
 `probe.py` reads four numbers off every layer, for the last token of the prefill
