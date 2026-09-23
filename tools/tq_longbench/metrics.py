@@ -322,6 +322,35 @@ def count_score(prediction: str, ground_truths: Iterable[str]) -> float:
     return _retrieval(prediction, ground_truths, r"(\d+)")
 
 
+#: The letter a LongBench-v2 answer is, wherever the continuation puts it: bare,
+#: parenthesised, or after the lead-in the model insists on writing. Anchored on a
+#: non-letter boundary so the ``A`` in "Answer" is not mistaken for a choice.
+_CHOICE_PATTERN = re.compile(r"(?:^|[^A-Za-z])\(?([A-D])\)?(?:[^A-Za-z]|$)")
+
+
+def multiple_choice_score(prediction: str, ground_truths: Iterable[str]) -> float:
+    """LongBench-v2: did the continuation pick the right one of ``A``-``D``.
+
+    v2 is four-way multiple choice, so it is scored as accuracy and not as any
+    overlap metric -- an F1 against the single character ``C`` would give half
+    credit to a prediction that happened to contain a ``c`` somewhere.
+
+    The **first** choice letter in the continuation is the answer, which is the
+    one judgement this makes that the reference harness does not have to: v2's
+    own scorer reads a model told to emit the letter alone. A model that writes
+    "The answer is (C). B is wrong because..." has answered C, and taking the
+    last letter or requiring a bare one would score it zero for the explanation.
+    A continuation naming no letter at all scores zero rather than raising --
+    that is a real way to be wrong, and the prediction is on the record next to
+    it.
+    """
+    found = _CHOICE_PATTERN.search(prediction.strip())
+    if found is None:
+        return 0.0
+    chosen = found.group(1)
+    return float(any(chosen == str(reference).strip().upper()[:1] for reference in ground_truths))
+
+
 # ------------------------------------------------------------ the task table
 
 
@@ -367,6 +396,13 @@ TASK_METRICS: dict[str, Callable] = {
     # Code
     "lcc": code_similarity_score,
     "repobench-p": code_similarity_score,
+    # Not v1, and kept below the table it is not part of. These are the two
+    # corpora the 256k and 1M context tiers are drawn from -- see
+    # ``tools/tq_longbench/prepare_buckets.py`` -- and they need a metric here
+    # because that is what the runner dispatches on. Neither number is a
+    # published v1 score and neither is comparable to one.
+    "longbench_v2": multiple_choice_score,
+    "infinitebench_qa": qa_f1_score,
 }
 
 #: What to call each metric in a results table.
@@ -381,6 +417,7 @@ _METRIC_LABELS = {
     retrieval_score: "Retrieval",
     retrieval_zh_score: "Retrieval-zh",
     count_score: "Count",
+    multiple_choice_score: "Accuracy-MC",
 }
 
 

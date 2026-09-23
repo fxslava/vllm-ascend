@@ -730,6 +730,52 @@ The prompt format and the stop set are `smoke_glm`'s, and both are printed
 before the sweep: a task score should not be quietly measuring a missing
 `<|assistant|>` marker or a continuation that ran its whole budget.
 
+## Context tiers without truncation (`prepare_buckets.py`)
+
+The ladder above truncates on purpose. When the question is long-context
+behaviour rather than how much of the middle mattered, you want items that are
+*already* the length you are testing at — which means picking them out of the
+corpora by measured length instead of cutting them down to it.
+
+```bash
+python tools/tq_longbench/prepare_buckets.py --model-path ~/models/glm-4-9b-chat-1m --local-dir datasets/longbench --out-dir datasets/tiered --tiers 32k,256k,1m
+```
+
+| Tier | Measured length | Corpus |
+|---|---|---|
+| `32k` | 8k ≤ L ≤ 32k | LongBench v1 — `narrativeqa`, `gov_report`, `qasper`, `multifieldqa_en`, `trec`, `lcc` |
+| `256k` | 64k ≤ L ≤ 256k | LongBench-v2 (multi-chapter reasoning, papers, repositories) |
+| `1m` | 500k ≤ L ≤ 1M | LongBench-v2's long split, InfiniteBench's books |
+
+`L` is the **rendered prompt** — template, chat markers and all — encoded with
+the tokenizer at `--model-path`, because that is the number that decides whether
+an item fits the KV arena. LongBench's own `length` column is a word count on
+the raw context and disagrees with it by a per-task factor. The tiers are
+therefore only valid for the checkpoint that measured them.
+
+Nothing is clipped: an item is admitted only when its whole prompt fits the
+ceiling, so the retained window holds the entire document. On the extractive
+tasks `--require-answer` (the default) additionally drops items whose reference
+does not occur in their own context — a `narrativeqa` paraphrase nobody could
+answer from the text measures priors, not context.
+
+Output is `{out_dir}/{tier}/{task}.jsonl` in v1's own row shape, so
+`load_longbench_jsonl` reads it unchanged; the measured length and the source
+row's index ride along in a `tq` sub-object, and each tier gets a
+`manifest.json` with the counts and the length distribution.
+
+Downloads are opt-in. Without `--download` this reads only what is under
+`--local-dir` and names the corpora that were missing; with it, the missing ones
+come through `datasets` and are cached as JSONL so the second run — and any
+air-gapped host the files are copied to — needs no network. `--dry-run` reports
+what each tier would read and loads no tokenizer.
+
+LongBench-v2 is four-way multiple choice, so it is scored as accuracy
+(`multiple_choice_score`) on the first `A`–`D` the continuation names — an F1
+against the single character `C` would give half credit for containing a `c`.
+Neither it nor InfiniteBench is a v1 task and neither score is comparable to a
+published v1 number.
+
 ## Where a long-context answer broke (`--profile-layers`)
 
 `probe.py` reads four numbers off every layer, for the last token of the prefill

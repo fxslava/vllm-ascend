@@ -289,6 +289,12 @@ class TestScorerBehaviour(unittest.TestCase):
         self.assertIs(TASK_METRICS["triviaqa"], qa_f1_score)
         self.assertIs(TASK_METRICS["passage_retrieval_zh"], retrieval_zh_score)
 
+    #: The corpora that are deliberately in the table but are not LongBench v1,
+    #: and so are not part of the "exactly the published 21" check below. They
+    #: are the 256k and 1M context tiers -- see ``prepare_buckets.py`` -- and a
+    #: score on either is not comparable with a published v1 number.
+    NON_V1_TASKS = {"longbench_v2", "infinitebench_qa"}
+
     def test_every_v1_task_has_a_metric_and_a_label(self):
         expected = {
             "narrativeqa", "qasper", "multifieldqa_en", "multifieldqa_zh",
@@ -298,8 +304,8 @@ class TestScorerBehaviour(unittest.TestCase):
             "passage_count", "passage_retrieval_en", "passage_retrieval_zh",
             "lcc", "repobench-p",
         }  # fmt: skip
-        self.assertEqual(set(TASK_METRICS), expected)
-        for task in expected:
+        self.assertEqual(set(TASK_METRICS) - self.NON_V1_TASKS, expected)
+        for task in expected | self.NON_V1_TASKS:
             with self.subTest(task=task):
                 self.assertTrue(metric_label(task))
 
