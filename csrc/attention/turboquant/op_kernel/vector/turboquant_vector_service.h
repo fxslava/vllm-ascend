@@ -319,12 +319,20 @@ struct TurboQuantTaskHeads {
 // The batched decode keeps every per-head scalar of the softmax broadcast over its head's 8-lane block:
 // one wide op advances all heads, the same field is the block operand of a row op, and lane j * 8 still
 // holds head j's value for the per-task readers the two decodes share.
-template <TurboQuantMode MODE, typename scalar_t, typename Mm, typename Codec>
+//
+// BYPASS_UNPACK is the unpack ablation, and it is a measurement instrument, not a mode. It drops the
+// codec expand out of the ingest and stages the (zeroed, once, in Init) operand buffer into L1 instead.
+// Every other byte still moves: the MTE2 read of the packed plane, the MTE3 burst into L1, the Cube's
+// loads and MACs, and the whole softmax. What disappears is exactly the vector-pipe expand, so the delta
+// against the unablated leg is the unpack's cycle cost with its memory traffic held fixed. The output is
+// deterministic (all-zero scores) and numerically meaningless; nothing but a benchmark may instantiate it.
+template <TurboQuantMode MODE, typename scalar_t, typename Mm, typename Codec, bool BYPASS_UNPACK = false>
 class TurboQuantVectorDecodeService {
 public:
     using OperandT = typename Mm::OperandT;
     static constexpr bool kBatched = kBatchedCubeDecode<MODE>;
     static constexpr bool kNzTiled = kStoresNzTiles<MODE>;
+    static constexpr bool kBypassUnpack = BYPASS_UNPACK;
     static_assert(kNzTiled == Codec::kIsAffine, "only the byte-wise affine expand streams an NZ-tiled plane");
     // Ring slots of the tile ingest. Tile t reads into slot t % kCubeSlots, the slot of its L1 operands.
     static constexpr uint32_t kIngestSlots = kBatched ? kCubeSlots : 1;
@@ -341,6 +349,9 @@ public:
         codec_.Init(pipe, headSize_, Codec::kIsAffine ? kUnpackChunkRows : kCubeUnpackRows, invSqrtLen,
                     modeTablesGm_);
         InitIngestEvents();
+        if constexpr (kBypassUnpack) {
+            ZeroStagingBuffer();
+        }
     }
 
     __aicore__ inline AscendC::LocalTensor<float> Scores() { return scoreBuf_.Get<float>(); }
@@ -773,6 +784,25 @@ private:
         }
     }
 
+    // The ablation's one-time cost: the staging buffer the bypassed expand would have written is zeroed
+    // here, before the first tile, so every ablated tile stages defined bytes and the scores are a clean
+    // zero rather than whatever the UB held. Off the per-tile path on purpose -- it must not show up in
+    // the delta the leg measures.
+    __aicore__ inline void ZeroStagingBuffer()
+    {
+        if ASCEND_IS_AIV {
+            // Only one of the two staging buffers is allocated, so the branch has to be a constant one.
+            if constexpr (kNzTiled) {
+                AscendC::Duplicate(nzOperandBuf_.template Get<half>(), static_cast<half>(0),
+                                   kCubeTileRows * operandElems_ / sizeof(half));
+            } else {
+                AscendC::Duplicate(bandOperandBuf_.template Get<half>(), static_cast<half>(0),
+                                   kCubeUnpackRows * operandElems_ / sizeof(half));
+            }
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+    }
+
     // rows[j * headSize_ ..] *= blocks[j * kFp32PerBlock] for `heads` rows, one 64-lane sweep per column.
     __aicore__ inline void MulHeadRows(const AscendC::LocalTensor<float> &rows,
                                        const AscendC::LocalTensor<float> &blocks, const uint32_t heads)
@@ -974,10 +1004,14 @@ private:
                                            const AscendC::LocalTensor<OperandT> &l1Dst)
     {
         const AscendC::LocalTensor<OperandT> nzLow = nzOperandBuf_.Get<OperandT>();
-        const AscendC::LocalTensor<OperandT> nzHigh = nzLow[tilePlaneBytes_];
-        for (uint32_t base = 0; base < tilePlaneBytes_; base += unpackChunkBytes_) {
-            codec_.template UnpackAffine<OperandT>(nzLow[base], nzHigh[base], packed[base],
-                                                                 unpackChunkBytes_);
+        if constexpr (!kBypassUnpack) {
+            const AscendC::LocalTensor<OperandT> nzHigh = nzLow[tilePlaneBytes_];
+            for (uint32_t base = 0; base < tilePlaneBytes_; base += unpackChunkBytes_) {
+                codec_.template UnpackAffine<OperandT>(nzLow[base], nzHigh[base], packed[base],
+                                                                     unpackChunkBytes_);
+            }
+        } else {
+            (void)packed;
         }
         SyncVectorToMte3();
         AscendC::DataCopy(l1Dst, nzLow, nzTileToL1Params_);
@@ -990,7 +1024,11 @@ private:
         const AscendC::LocalTensor<OperandT> unpacked = bandOperandBuf_.Get<OperandT>();
         const uint32_t bandElems = kCubeUnpackRows * kOperandC0;
         for (uint32_t band = 0; band < kCubeTileRows / kCubeUnpackRows; ++band) {
-            codec_.Unpack(unpacked, packed[band * kCubeUnpackRows * packedBytes_], kCubeUnpackRows, headSize_);
+            if constexpr (!kBypassUnpack) {
+                codec_.Unpack(unpacked, packed[band * kCubeUnpackRows * packedBytes_], kCubeUnpackRows, headSize_);
+            } else {
+                (void)packed;
+            }
             SyncVectorToMte3();
             AscendC::DataCopy(l1Dst[band * bandElems], unpacked, bandToL1Params_);
         }

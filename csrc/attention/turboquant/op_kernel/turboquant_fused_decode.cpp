@@ -276,12 +276,16 @@ private:
 // basis. false: the caller hands in the raw query, RotateQuery() rotates every vector once before Process()
 // starts the task loop, and the output stage InitBasis() selects runs on every head before its output cast
 // (cube/turboquant_query_basis.h).
-template <TurboQuantMode MODE, typename scalar_t, bool PRE_ROTATED = true>
+//
+// BYPASS_UNPACK is the unpack ablation described on TurboQuantVectorDecodeService: a timing-only build of
+// the same decode with the codec expand removed from the ingest and nothing else changed. Its output is
+// all-zero by construction, so only a benchmark instantiates it and only under VLLM_ASCEND_TQ_TEST_KERNELS.
+template <TurboQuantMode MODE, typename scalar_t, bool PRE_ROTATED = true, bool BYPASS_UNPACK = false>
 class TurboQuantFusedDecode {
 public:
     using Mm = TurboQuantCubeMm<MODE>;
     using Codec = TurboQuantModeCodec<MODE>;
-    using Vector = TurboQuantVectorDecodeService<MODE, scalar_t, Mm, Codec>;
+    using Vector = TurboQuantVectorDecodeService<MODE, scalar_t, Mm, Codec, BYPASS_UNPACK>;
     using Cube = TurboQuantCubeDecodeService<MODE>;
     using Reducer = TurboQuantPartialReducer<scalar_t>;
     using Basis = TurboQuantQueryBasis<scalar_t, !PRE_ROTATED>;
@@ -757,6 +761,11 @@ private:
     }
 
 #define ASCEND_TQ_DECLARE_MM_FUSED_DECODE(NAME, MODE, TYPE)                                                          \
+    ASCEND_TQ_DECLARE_MM_FUSED_DECODE_ABLATED(NAME, MODE, TYPE, false)
+
+// BYPASS_UNPACK selects the unpack ablation of the same kernel; see TurboQuantFusedDecode. The argument list
+// and the launch are identical, so the two entries are interchangeable to a benchmark and to msprof.
+#define ASCEND_TQ_DECLARE_MM_FUSED_DECODE_ABLATED(NAME, MODE, TYPE, BYPASS_UNPACK)                                   \
     extern "C" __global__ __aicore__ void NAME(                                                                      \
         GM_ADDR queryRot, GM_ADDR keyCache, GM_ADDR valueCache, GM_ADDR scaleCache, GM_ADDR blockTables,             \
         GM_ADDR contextLens, GM_ADDR modeTables, GM_ADDR workspace, GM_ADDR output, uint32_t numTokens,              \
@@ -765,7 +774,7 @@ private:
         uint32_t fusedContextLimit, float scale, float invSqrtLen)                                                   \
     {                                                                                                                \
         AscendC::TPipe pipe;                                                                                         \
-        TurboQuantFusedDecode<MODE, TYPE> op(&pipe);                                                                 \
+        TurboQuantFusedDecode<MODE, TYPE, true, BYPASS_UNPACK> op(&pipe);                                            \
         op.Init(queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output, \
                 numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,      \
                 fusedContextLimit, scale, invSqrtLen);                                                               \
@@ -824,6 +833,10 @@ ASCEND_TQ_DECLARE_MM_FUSED_DECODE_RAW_QUERY(turboquant_mm_fused_decode_raw_query
 // The codebook modes have never executed through the fused decode, so only the test library builds them.
 ASCEND_TQ_DECLARE_MM_MODE(kv3fp4, TurboQuantMode::KV3_FP4)
 ASCEND_TQ_DECLARE_MM_MODE(kv5fp8, TurboQuantMode::KV5_FP8)
+
+// The unpack ablation of the shipping decode: same launch, same traffic, no codec expand, zero output.
+ASCEND_TQ_DECLARE_MM_FUSED_DECODE_ABLATED(turboquant_mm_fused_decode_nounpack_kv4fp8_half,
+                                          TurboQuantMode::KV4_FP8, half, true)
 
 // rightLayout is a GemmLayout: 0 transposes the K x N right operand into L0B, 1 takes it as N x K.
 extern "C" __global__ __aicore__ void turboquant_cube_gemm_probe_fp8(
@@ -914,6 +927,29 @@ void turboquant_mm_fused_decode_impl(int32_t mode, AscendType type, void *stream
             break;
     }
 }
+
+#if defined(VLLM_ASCEND_TQ_TEST_KERNELS)
+// The unpack ablation's launch. Deliberately a separate entry point rather than a flag on the shipping one:
+// nothing outside csrc/tests can reach a kernel whose output is meaningless by construction.
+void turboquant_mm_fused_decode_nounpack_impl(int32_t mode, AscendType type, void *stream, uint32_t blockDim,
+                                             void *queryRot, void *keyCache, void *valueCache, void *scaleCache,
+                                             void *blockTables, void *contextLens, void *modeTables, void *workspace,
+                                             void *output, uint32_t numTokens, uint32_t numHeads,
+                                             uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,
+                                             uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t headsPerTask,
+                                             uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,
+                                             uint32_t fusedContextLimit, float scale, float invSqrtLen)
+{
+    if (type != AscendType::FP16 || blockDim == 0 ||
+        static_cast<turboquant::TurboQuantMode>(mode) != turboquant::TurboQuantMode::KV4_FP8) {
+        return;
+    }
+    turboquant_mm_fused_decode_nounpack_kv4fp8_half<<<blockDim, nullptr, stream>>>(
+        queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,
+        numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,
+        tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen);
+}
+#endif
 
 void turboquant_mm_fused_decode_raw_query_impl(int32_t mode, AscendType type, void *stream, uint32_t blockDim,
                                               void *query, void *piSigns, void *rotTables, void *h16, void *gate,

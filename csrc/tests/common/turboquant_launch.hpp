@@ -76,6 +76,18 @@ void turboquant_mm_fused_decode_raw_query_impl(int32_t mode, AscendType type, vo
                                               uint32_t outputStage, uint32_t fusedContextLimit, float scale,
                                               float invSqrtLen);
 
+// The unpack ablation of turboquant_mm_fused_decode_impl: the same launch with the codec expand dropped out
+// of the KV ingest and every byte of traffic left in place, so the difference between the two is the unpack
+// phase's cost alone. Its output is all-zero by construction -- a timing instrument, never a result.
+void turboquant_mm_fused_decode_nounpack_impl(int32_t mode, AscendType type, void *stream, uint32_t blockDim,
+                                             void *queryRot, void *keyCache, void *valueCache, void *scaleCache,
+                                             void *blockTables, void *contextLens, void *modeTables, void *workspace,
+                                             void *output, uint32_t numTokens, uint32_t numHeads,
+                                             uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,
+                                             uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t headsPerTask,
+                                             uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,
+                                             uint32_t fusedContextLimit, float scale, float invSqrtLen);
+
 // rightLayout is a turboquant::GemmLayout: 0 transposes the K x N right operand into L0B, 1 takes it as N x K.
 void turboquant_cube_gemm_probe_impl(void *stream, void *leftGm, void *rightGm, void *outGm, uint32_t m, uint32_t k,
                                      uint32_t n, uint32_t headSize, uint32_t tileRows, uint32_t leftElems,
