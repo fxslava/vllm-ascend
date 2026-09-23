@@ -847,7 +847,15 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
                     f"have to grow to {needed} {indices.dtype} words during a graph capture. Run this shape "
                     "once outside capture so the buffer is sized first."
                 )
-            buffer = torch.empty(max(needed, self._reserved_index_words(name)), dtype=indices.dtype, device=device)
+            # Zeroed, not empty. Only the first ``needed`` words are ever copied into,
+            # so everything past them is whatever the allocator handed back -- and a
+            # reserved buffer is bigger than the step that allocated it needs, which
+            # means there is now a tail that no step writes. An operand the kernels
+            # index by a token counter must not be able to return uninitialised memory
+            # for a token the host did not describe: zero is the only value here that
+            # names a sequence of no length rather than an arbitrary one. Paid once,
+            # at the single allocation this buffer ever gets.
+            buffer = torch.zeros(max(needed, self._reserved_index_words(name)), dtype=indices.dtype, device=device)
             self._device_index_buffers[key] = buffer
         staged = buffer[:needed].view(indices.shape)
         if staged.dtype != indices.dtype:
@@ -889,7 +897,10 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         # _decode_capacity gives: a capture cannot be the step that grows it.
         max_num_seqs, _ = self._decode_capacity()
         reserved = max_num_seqs * self.num_heads * self.head_size
-        self.rotated_query = torch.empty(max(needed, reserved), dtype=torch.float32, device=device)
+        # Zeroed for the reason the index staging buffers are: reserving past what the
+        # allocating step needs leaves a tail no step writes, and a decode that reads a
+        # row it was not handed should read zeros rather than an arbitrary float.
+        self.rotated_query = torch.zeros(max(needed, reserved), dtype=torch.float32, device=device)
         return self.rotated_query[:needed].view(num_tokens, self.num_heads, self.head_size)
 
     def forward_paged_attention(
