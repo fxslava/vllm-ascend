@@ -2173,6 +2173,126 @@ class TestDecodeWindow(unittest.TestCase):
         self.assertTrue(DenseReferenceBackend.supports_graph_capture)
 
 
+class TestReservedLaunchBuffers(_TurboQuantCase):
+    """The decode's on-demand buffers, pinned before a graph can be captured over them.
+
+    A replay writes to the addresses its capture recorded. The rotated query and
+    the decode workspace are both sized from a launch's shape and were both grown
+    on demand, so a step that met a longer window replaced the workspace and left
+    every graph captured before it writing into a block the allocator had handed
+    to something else -- silent on the host, and on an Ascend 950 reported only as
+    ``507010 / the task scheduler loses the heartbeat`` once a corrupted block
+    table sends the decode at an address that is not mapped. Which graphs exist
+    when a growth happens is a function of the prompt lengths a run has met, which
+    is why it surfaces on one dataset item and not the forty-five before it.
+    """
+
+    #: A GLM-4-sized arena: the 16k rung's context plus gov_report's 512-token
+    #: budget and the 512 of headroom the runner adds.
+    ARENA = 16384 + 1024
+
+    def ladder(self) -> tuple[int, ...]:
+        return graph_windows(self.ARENA, BLOCK_SIZE)
+
+    @staticmethod
+    def blocks_for(window: int) -> int:
+        return max(1, -(-window // BLOCK_SIZE))
+
+    def test_the_workspace_would_move_as_the_window_ladder_grows(self):
+        """Stated as a fact about the plan, because it is what the reservation is for."""
+        backend = self.backend(self.ARENA)
+        sizes = [backend._workspace_floats_for(1, self.blocks_for(w)) for w in self.ladder()]
+        self.assertGreater(len(set(sizes)), 1, sizes)
+        self.assertEqual(sizes, sorted(sizes))
+
+    def test_reserving_pins_one_address_for_every_window(self):
+        backend = self.backend(self.ARENA)
+        held = backend.reserve_launch_buffers(1)
+        pinned = backend._workspace.data_ptr()
+        for window in self.ladder():
+            with self.subTest(window=window):
+                blocks = self.blocks_for(window)
+                workspace = backend._decode_workspace(1, blocks)
+                self.assertEqual(workspace.data_ptr(), pinned)
+                self.assertGreaterEqual(workspace.numel(), backend._workspace_floats_for(1, blocks))
+        self.assertGreaterEqual(held, backend._workspace.numel() * backend._workspace.element_size())
+
+    def test_the_ceiling_covers_every_width_a_prefill_chunk_can_take(self):
+        """A chunk is ``chunk_size`` tokens except the last, which is whatever is left."""
+        chunk = 64
+        backend = self.backend(self.ARENA)
+        backend.reserve_launch_buffers(chunk)
+        pinned = backend._workspace.data_ptr()
+        blocks = backend.geometry.num_blocks
+        for tokens in range(1, chunk + 1):
+            with self.subTest(tokens=tokens):
+                self.assertEqual(backend._decode_workspace(tokens, blocks).data_ptr(), pinned)
+        # The rotated query is sized for the widest chunk, not for one decode token.
+        self.assertEqual(backend._rotated_query.numel(), chunk * NUM_HEADS * HEAD_SIZE)
+
+    def test_a_pinned_buffer_asked_to_grow_raises_rather_than_moving(self):
+        """Reached only if the reservation under-counted; growing here is the bug itself."""
+        backend = self.backend(self.ARENA)
+        backend.reserve_launch_buffers(1)
+        with self.assertRaisesRegex(RuntimeError, "replaying into freed device memory"):
+            backend._decode_workspace(4096, backend.geometry.num_blocks)
+        with self.assertRaisesRegex(RuntimeError, "rotated query"):
+            backend._rotated_query_buffer(2)
+
+    def test_a_launch_of_no_tokens_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "at least one token"):
+            self.backend(self.ARENA).reserve_launch_buffers(0)
+
+
+class TestLaunchBufferWiring(_Qwen2TinyCheckpoint):
+    """Where the reservation sits in the runner's construction, and what it is told."""
+
+    def _trace(self, **overrides):
+        calls: list[tuple[str, int]] = []
+        reserve = ops_module.AttentionBackend.reserve_launch_buffers
+        graph = engine_module.StandaloneModelRunner._build_decode_graph
+
+        def traced_reserve(backend, max_tokens):
+            calls.append((backend.name, max_tokens))
+            return reserve(backend, max_tokens)
+
+        def traced_graph(runner):
+            calls.append(("build_decode_graph", 0))
+            return graph(runner)
+
+        patches = (
+            mock.patch.object(ops_module.AttentionBackend, "reserve_launch_buffers", traced_reserve),
+            mock.patch.object(engine_module.StandaloneModelRunner, "_build_decode_graph", traced_graph),
+        )
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            runner = self._runner(**overrides)
+        return runner, calls
+
+    def test_every_backend_is_reserved_before_the_graph_is_built(self):
+        """The ordering is the whole point: a capture must not be what grows a buffer."""
+        _, calls = self._trace()
+        self.assertTrue(calls)
+        self.assertEqual(calls[-1], ("build_decode_graph", 0))
+
+    def test_a_decode_only_backend_is_reserved_for_one_token(self):
+        """``dense_staging`` prefills through a different backend, so this one only decodes."""
+        runner, calls = self._trace(backend="turboquant_reference", prefill_mode="dense_staging")
+        self.assertIsNot(runner.prefill_backend, runner.decode_backend)
+        self.assertEqual(dict(calls[:-1])["turboquant_reference"], 1)
+        self.assertEqual(dict(calls[:-1])[runner.prefill_backend.name], runner.config.chunk_size)
+
+    def test_a_backend_that_also_prefills_is_reserved_for_a_whole_chunk(self):
+        """``batched_decode`` runs a chunk through the same ``decode`` call, one row per token."""
+        runner, calls = self._trace(backend="turboquant_reference", prefill_mode="batched_decode")
+        self.assertIs(runner.prefill_backend, runner.decode_backend)
+        self.assertEqual(calls[:-1], [("turboquant_reference", runner.config.chunk_size)])
+
+    def test_a_backend_with_nothing_to_reserve_says_so(self):
+        self.assertEqual(self._runner().reserved_launch_bytes, 0)
+
+
 class TestStaticDecodePath(_Qwen2TinyCheckpoint):
     """The workspace path on a real (if tiny) checkpoint, against the path it replaced."""
 

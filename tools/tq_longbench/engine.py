@@ -672,7 +672,31 @@ class StandaloneModelRunner:
         #: Both are built here rather than on the first step, so what a run costs
         #: to set up is paid before anything is timed.
         self.workspace = DecodeWorkspace.build(self.shape, config.dtype, self.device)
+        #: Bytes the backends hold in buffers they would otherwise have grown.
+        #: Before the graph, and before the first prefill: a replay writes to the
+        #: addresses its capture saw, so a buffer replaced afterwards leaves every
+        #: graph recorded over it writing into memory that has been freed.
+        self.reserved_launch_bytes = self._reserve_launch_buffers()
         self.decode_graph, self.decode_graph_refusal = self._build_decode_graph()
+
+    def _reserve_launch_buffers(self) -> int:
+        """Pin each backend's on-demand buffers at this run's ceiling.
+
+        The widest launch a backend sees is a decode step -- one token -- unless
+        it prefills as well, which is ``batched_decode``, where a chunk is
+        ``chunk_size`` tokens through the same ``decode`` call. ``dense_staging``
+        prefills through a different backend and only ever writes the quantised
+        pool through this one, and a write sizes nothing.
+
+        The two backends are asked separately rather than through
+        ``write_backends``, because what has to be covered is the widest *launch*
+        each one makes, and those differ between them.
+        """
+        prefills = self.prefill_backend is self.decode_backend
+        reserved = self.decode_backend.reserve_launch_buffers(self.config.chunk_size if prefills else 1)
+        if not prefills:
+            reserved += self.prefill_backend.reserve_launch_buffers(self.config.chunk_size)
+        return reserved
 
     def _cast_fused_projections(self) -> WeightLayoutReport:
         """Put ``qkv_proj`` and ``gate_up_proj`` in the Cube's own tiling, where that is the policy.

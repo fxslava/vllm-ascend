@@ -151,6 +151,24 @@ class AttentionBackend(abc.ABC):
         #: ``(num_tokens, window) -> block table``; see :meth:`_block_tables`.
         self._expanded_block_tables: dict[tuple[int, int], torch.Tensor] = {}
 
+    def reserve_launch_buffers(self, max_tokens: int) -> int:
+        """Allocate every buffer a launch would otherwise grow on demand; return the bytes held.
+
+        A captured graph replays the *addresses* the capture saw, so a buffer
+        that is replaced after a graph was recorded over it leaves that graph
+        writing into memory the caching allocator has since handed to something
+        else -- a use-after-free on the device that no launch reports, and whose
+        blast radius includes the block tables allocated next to it. A run's
+        buffers therefore have to reach their final size before the first
+        capture, which is what this call is for; ``_columns`` on the dense path
+        already sizes itself to ``max_seq_len`` for the same reason.
+
+        ``max_tokens`` is the widest launch this backend will be given: one for a
+        decode-only backend, the prefill chunk size where the same backend also
+        prefills. A backend with no on-demand buffer holds nothing and says so.
+        """
+        return 0
+
     def _into_folded_basis(self, out: torch.Tensor) -> torch.Tensor:
         """Rotate an unquantised attention output by Pi when the projection expects that.
 
@@ -692,6 +710,9 @@ class _TurboQuantBackend(AttentionBackend):
         self._workspace: torch.Tensor | None = None
         self._workspace_floats: dict[tuple[int, int], int] = {}
         self._rotated_query: torch.Tensor | None = None
+        #: Set by :meth:`reserve_launch_buffers`; after it, growing either buffer
+        #: is a bug rather than a resize, and raises instead of happening.
+        self._buffers_pinned = False
 
     @property
     @abc.abstractmethod
@@ -716,10 +737,43 @@ class _TurboQuantBackend(AttentionBackend):
             self._write_tables,
         )
 
+    def reserve_launch_buffers(self, max_tokens: int) -> int:
+        """Size the rotated query and the decode workspace for the whole run, once.
+
+        Both are sized from a launch's shape, and both were grown on demand --
+        which is safe exactly until a graph has been captured over them. The
+        decode's window grows through :func:`~tq_longbench.engine.graph_windows`
+        and the planner splits a longer context further, so the workspace walks
+        upwards as a run meets longer prompts; every graph captured before the
+        step that grew it kept the address of the block that step freed. That is
+        the failure this reservation exists to remove, and it is why it runs
+        before :class:`~tq_longbench.engine.StaticDecodeGraph` is built.
+
+        The ceiling is asked of the operator's own planner rather than derived.
+        ``max_blocks_per_seq`` is the pool's own block count, which no window can
+        exceed, and only the largest is asked for because the plan is monotonic
+        in it: more blocks is a longer context bound, and both the saturation and
+        the bandwidth term are non-decreasing in that. The token count is swept
+        rather than taken at ``max_tokens``, because the split count *falls* as
+        the token count rises -- a launch small enough to leave cores idle is
+        split further -- so the widest launch is not by itself the largest one.
+        """
+        if max_tokens < 1:
+            raise ValueError(f"a launch holds at least one token, got max_tokens {max_tokens}")
+        blocks = self.geometry.num_blocks
+        floats = max(self._workspace_floats_for(tokens, blocks) for tokens in range(1, max_tokens + 1))
+        self._buffers_pinned = False
+        self._rotated_query = None
+        self._rotated_query_buffer(max_tokens)
+        self._workspace = torch.empty(max(floats, 1), dtype=torch.float32, device=self.device)
+        self._buffers_pinned = True
+        return sum(buffer.numel() * buffer.element_size() for buffer in (self._rotated_query, self._workspace))
+
     def _rotated_query_buffer(self, num_tokens: int) -> torch.Tensor:
         needed = num_tokens * self.shape.num_heads * self.shape.head_size
         buffer = self._rotated_query
         if buffer is None or buffer.numel() < needed:
+            self._refuse_growth("rotated query", needed, 0 if buffer is None else buffer.numel())
             self._rotated_query = torch.empty(needed, dtype=torch.float32, device=self.device)
             buffer = self._rotated_query
         return buffer[:needed].view(num_tokens, self.shape.num_heads, self.shape.head_size)
@@ -728,19 +782,40 @@ class _TurboQuantBackend(AttentionBackend):
     def _workspace_size(self, num_tokens: int, max_blocks_per_seq: int) -> int:
         """Ask the operator's own planner, rather than reproducing its arithmetic."""
 
-    def _decode_workspace(self, num_tokens: int, max_blocks_per_seq: int) -> torch.Tensor:
+    def _workspace_floats_for(self, num_tokens: int, max_blocks_per_seq: int) -> int:
+        """:meth:`_workspace_size`, memoised on the shape it was asked about."""
         key = (num_tokens, max_blocks_per_seq)
         needed = self._workspace_floats.get(key)
         if needed is None:
             needed = self._workspace_size(num_tokens, max_blocks_per_seq)
             self._workspace_floats[key] = needed
+        return needed
+
+    def _decode_workspace(self, num_tokens: int, max_blocks_per_seq: int) -> torch.Tensor:
+        needed = self._workspace_floats_for(num_tokens, max_blocks_per_seq)
         workspace = self._workspace
         if workspace is None or workspace.numel() < needed:
-            # Not monotonic in num_tokens: a long context small enough to leave
-            # cores idle is split further, so the peak can sit at a small decode.
+            self._refuse_growth("decode workspace", needed, 0 if workspace is None else workspace.numel())
             self._workspace = torch.empty(max(needed, 1), dtype=torch.float32, device=self.device)
             workspace = self._workspace
         return workspace
+
+    def _refuse_growth(self, what: str, needed: int, held: int) -> None:
+        """Raise if a pinned buffer is asked to grow, rather than letting it.
+
+        Reached only when :meth:`reserve_launch_buffers` under-counted, and it
+        must not be silent: replacing the buffer here is exactly what leaves an
+        already captured graph replaying into freed device memory. Raising costs
+        at worst the graph -- ``decode_graph='auto'`` finishes the run eagerly and
+        records why -- where growing it quietly costs the answer.
+        """
+        if not self._buffers_pinned:
+            return
+        raise RuntimeError(
+            f"the {self.name} {what} was reserved at {held} float32 words for this run and a launch now needs "
+            f"{needed}. Growing it would leave every decode graph captured so far replaying into freed device "
+            "memory; reserve_launch_buffers must be given the widest launch the run will make."
+        )
 
 
 class TurboQuantCubeBackend(_TurboQuantBackend):
