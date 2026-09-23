@@ -151,7 +151,16 @@ FusedDecodeGrid PlanFusedDecode(int64_t num_tokens, int64_t num_heads, int64_t n
     const int64_t tile_m = kCubeTileM;
     const int64_t max_splits = kMaxSequenceSplits;
     const int64_t mix_blocks = std::max<int64_t>(1, aiv_num / subcores);
+    // The GQA group. The operators reject a num_heads that is not a positive multiple of num_kv_heads, but
+    // this is a plain host function the tests and any future caller reach directly, and a num_heads below
+    // num_kv_heads truncates the group to zero: the task count goes to zero with it, and CeilDiv64 by the
+    // tasks-per-block it derives is then a divide by zero -- a SIGFPE inside the tiling, with no message.
+    // An empty grid is the honest answer for a shape that holds no task, and it is the one the caller
+    // already gets for zero tokens.
     const int64_t group = num_heads / num_kv_heads;
+    if (group < 1) {
+        return grid;
+    }
     const int64_t blocks = std::max<int64_t>(1, max_blocks_per_seq);
     const int64_t context_bound = blocks * block_size;
 
@@ -195,7 +204,10 @@ FusedDecodeGrid PlanFusedDecode(int64_t num_tokens, int64_t num_heads, int64_t n
     } else if (split_policy == FusedSplitPolicy::kFillBlocks) {
         // Only as many splits as leave every task a block of its own: the chunking at one split is
         // what a split multiplies, and it does not change once the splits fit.
-        const int64_t unsplit_tasks = num_tokens * num_kv_heads * chunks_for(num_tokens * num_kv_heads);
+        // chunks_for never returns less than one and neither count is zero, so the divisor is already at
+        // least one; bounded anyway, because a SIGFPE inside the tiling is a crash with no message at all.
+        const int64_t unsplit_tasks =
+            std::max<int64_t>(1, num_tokens * num_kv_heads * chunks_for(num_tokens * num_kv_heads));
         const int64_t fill = std::min(std::min(max_splits, blocks), mix_blocks / unsplit_tasks);
         if (fill > 1) {
             num_splits = fill;
@@ -210,7 +222,7 @@ FusedDecodeGrid PlanFusedDecode(int64_t num_tokens, int64_t num_heads, int64_t n
     grid.heads_per_task = static_cast<uint32_t>(heads_per_task);
 
     const int64_t tasks = groups * CeilDiv64(group, heads_per_task);
-    const int64_t tasks_per_block = CeilDiv64(tasks, mix_blocks);
+    const int64_t tasks_per_block = std::max<int64_t>(1, CeilDiv64(tasks, mix_blocks));
     const int64_t block_dim = CeilDiv64(tasks, tasks_per_block);
     grid.num_tasks = tasks;
     grid.tasks_per_block = static_cast<uint32_t>(tasks_per_block);

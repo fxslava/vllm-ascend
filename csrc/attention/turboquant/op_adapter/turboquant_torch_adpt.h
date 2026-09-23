@@ -108,6 +108,20 @@ inline void CheckGmBurstAligned(const at::Tensor &tensor, const char *name)
                 kGmBurstBytes, "-byte burst; the kernel's global-memory copies would start mid-burst");
 }
 
+// The check above is about MTE bursts, so it belongs to the operands the kernels DataCopy. An operand the
+// kernels only read one element at a time with GlobalTensor::GetValue -- slot_mapping, and the decodes'
+// block_tables and context_lens, which have never been burst-checked -- is a scalar load, and a scalar load
+// needs its own element's alignment, nothing wider. Holding those to a 32-byte burst rejects sub-slices a
+// caller is entitled to pass: `slot_mapping[1:]` off an int32 tensor is four bytes in, contiguous, and
+// perfectly legal for every access the kernel makes of it.
+inline void CheckGmScalarAligned(const at::Tensor &tensor, const char *name)
+{
+    const auto address = reinterpret_cast<uintptr_t>(tensor.data_ptr());
+    const auto element = static_cast<uintptr_t>(tensor.element_size());
+    TORCH_CHECK(address % element == 0, name, " starts at ", address, ", which is not a multiple of its ",
+                element, "-byte element; the kernel's scalar global-memory reads would be misaligned");
+}
+
 // Every operand below is handed to a kernel as a `__gm__` pointer, so it has to live in the
 // device's global memory. A host tensor is not a wrong answer, it is "the address for scalar
 // to access GM is invalid" (264) raised from whichever later launch the runtime happened to
@@ -180,7 +194,8 @@ inline void npu_turboquant_reshape_and_cache(at::Tensor &key, at::Tensor &value,
     adpt::CheckGmBurstAligned(key_cache, "key_cache");
     adpt::CheckGmBurstAligned(value_cache, "value_cache");
     adpt::CheckGmBurstAligned(scale_cache, "scale_cache");
-    adpt::CheckGmBurstAligned(slot_mapping, "slot_mapping");
+    // slot_mapping is read one int32 at a time (slotGm_.GetValue), never copied.
+    adpt::CheckGmScalarAligned(slot_mapping, "slot_mapping");
     for (const auto &operand : {std::make_pair("value", &value), std::make_pair("key_cache", &key_cache),
                                 std::make_pair("value_cache", &value_cache),
                                 std::make_pair("scale_cache", &scale_cache),
@@ -472,7 +487,8 @@ inline void npu_turboquant_cube_reshape_and_cache(at::Tensor &key, at::Tensor &v
     adpt::CheckGmBurstAligned(key_cache, "key_cache");
     adpt::CheckGmBurstAligned(value_cache, "value_cache");
     adpt::CheckGmBurstAligned(scale_cache, "scale_cache");
-    adpt::CheckGmBurstAligned(slot_mapping, "slot_mapping");
+    // slot_mapping is read one int32 at a time (slotGm_.GetValue), never copied.
+    adpt::CheckGmScalarAligned(slot_mapping, "slot_mapping");
     for (const auto &operand : {std::make_pair("value", &value), std::make_pair("key_cache", &key_cache),
                                 std::make_pair("value_cache", &value_cache),
                                 std::make_pair("scale_cache", &scale_cache),

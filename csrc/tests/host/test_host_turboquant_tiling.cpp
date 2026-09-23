@@ -212,6 +212,33 @@ TEST(TurboQuantTiling, FusedDecodeFillsEveryMixBlockAtTheSingleTokenBaseline) {
   EXPECT_EQ(trace.fused_context_limit, 0u);
 }
 
+// A shape with no task in it must plan an empty grid, not divide by the zero task count it implies. The
+// operators reject num_heads that is not a positive multiple of num_kv_heads, so only a direct caller of the
+// tiling can reach this -- and it used to reach a SIGFPE inside CeilDiv64, which is a crash with no message.
+TEST(TurboQuantTiling, FusedDecodePlansAnEmptyGridForAShapeWithNoTask) {
+  for (const tqt::FusedSplitPolicy policy :
+       {tqt::FusedSplitPolicy::kContextOnly, tqt::FusedSplitPolicy::kFillBlocks, tqt::FusedSplitPolicy::kAdaptive}) {
+    for (const int64_t aiv : kVectorCores) {
+      // More kv heads than query heads: the GQA group truncates to zero, and every task count with it.
+      const tqt::FusedDecodeGrid degenerate =
+          tqt::PlanFusedDecode(1, 2, 4, kHeadSize, 64, static_cast<int64_t>(tqt::kCubeTileRows), aiv,
+                               tqt::kFusedContextLimit, policy);
+      const std::string where =
+          "policy " + std::to_string(static_cast<int>(policy)) + " aiv " + std::to_string(aiv);
+      EXPECT_EQ(degenerate.num_tasks, 0) << where;
+      EXPECT_EQ(degenerate.block_dim, 0u) << where;
+      EXPECT_EQ(degenerate.tasks_per_block, 0u) << where;
+      EXPECT_EQ(degenerate.workspace_floats, 0u) << where;
+      // The zero-token grid is the shape of the answer the caller already knows how to read.
+      const tqt::FusedDecodeGrid empty =
+          tqt::PlanFusedDecode(0, 8, 2, kHeadSize, 64, static_cast<int64_t>(tqt::kCubeTileRows), aiv,
+                               tqt::kFusedContextLimit, policy);
+      EXPECT_EQ(degenerate.num_splits, empty.num_splits) << where;
+      EXPECT_EQ(degenerate.heads_per_task, empty.heads_per_task) << where;
+    }
+  }
+}
+
 TEST(TurboQuantTiling, DecodeNeedsReductionMirrorsTheKernels) {
   EXPECT_FALSE(tqt::DecodeNeedsReduction(1, 32768, 0));
   EXPECT_FALSE(tqt::DecodeNeedsReduction(8, 4096, tqt::kFusedContextLimit));

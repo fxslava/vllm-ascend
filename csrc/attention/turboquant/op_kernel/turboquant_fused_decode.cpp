@@ -358,6 +358,9 @@ public:
         }
     }
 
+    // Grid-uniform on purpose: every block reads every token's length, so the SyncAll the caller guards
+    // with this is entered by all of them or by none. A per-block predicate here would strand the blocks
+    // that answered false in the barrier the rest went on to run.
     __aicore__ inline bool NeedsReduction()
     {
         if (numSplits_ <= 1) {
@@ -448,10 +451,19 @@ private:
                 if (heads.mine > 0 && blockEnd == seqBlocks && tail != 0) {
                     vector_.ComputeTailMask(tail);
                 }
-                StageTiles(token, ctxLen, blockStart, blockEnd, numTiles, kvHead, heads);
             }
-            if ASCEND_IS_AIC {
-                if (numTiles > 0) {
+            // The one condition both cores branch on, so the bypass is visibly lock-step. A block range
+            // can hold no tile at all -- every blockTable entry in it negative, which is what a padding or
+            // unmapped block carries -- and then neither core may touch the cross-core flags: an AIV that
+            // skipped StageTiles while the AIC still ran RunTiles would leave the AIC on kFlagSlotReady
+            // with nothing ever to set it, which is a hung launch, not a wrong answer. CountTiles is safe
+            // to branch on here because both cores run it over the same GM words with the same indices,
+            // so they cannot disagree about it.
+            if (numTiles > 0) {
+                if ASCEND_IS_AIV {
+                    StageTiles(token, ctxLen, blockStart, blockEnd, numTiles, kvHead, heads);
+                }
+                if ASCEND_IS_AIC {
                     Cube::RunTiles(mm_, vector_.Scores(), vector_.Context(), numTiles, heads.rows, headSize_);
                 }
             }
@@ -522,13 +534,12 @@ private:
         return false;
     }
 
+    // numTiles >= 1: ComputeTask bypasses the whole pipeline on both cores when a block range holds no
+    // tile, so neither pipeline below has an empty-range case to carry.
     __aicore__ inline void StageTiles(const uint32_t token, const uint32_t contextLen, const uint32_t blockStart,
                                       const uint32_t blockEnd, const uint32_t numTiles, const uint32_t kvHead,
                                       const TurboQuantTaskHeads &heads)
     {
-        if (numTiles == 0) {
-            return;
-        }
         if constexpr (Vector::kBatched) {
             StageTilesRing(token, contextLen, blockStart, blockEnd, numTiles, kvHead, heads);
         } else {
