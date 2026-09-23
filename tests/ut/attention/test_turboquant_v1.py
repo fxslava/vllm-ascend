@@ -2250,6 +2250,44 @@ class TestDecodeIndexOperandDevice(TestBase):
         with flag, stream, self.assertRaisesRegex(RuntimeError, "during a graph capture"):
             impl._device_index(torch.zeros(4, dtype=torch.int32), META, "seq_lens")
 
+    def test_the_runners_device_lengths_are_used_without_a_copy(self):
+        """The whole point: staging seq_lens was one host-to-device transfer per
+        layer per decode step. The runner already holds the same batch's lengths
+        as a persistent int32 device buffer, so preferring it costs nothing --
+        no copy, no allocation, and the operand handed to the kernel *is* the
+        runner's tensor."""
+        impl = self._make_impl(META)
+        runner_lengths = torch.arange(4, dtype=torch.int32, device=META)
+        metadata = SimpleNamespace(
+            seq_lens=torch.arange(4, dtype=torch.int32),
+            seq_lens_device=runner_lengths,
+        )
+        staged = impl._decode_seq_lens(metadata, META)
+        self.assertIs(staged, runner_lengths)
+        # Nothing was staged, so no buffer was ever allocated for it.
+        self.assertIsNone(impl._device_index_buffers)
+
+    def test_metadata_without_the_device_lengths_still_stages_the_host_tensor(self):
+        """The field is new; a metadata that predates it must still decode."""
+        impl = self._make_impl(META)
+        host = torch.arange(4, dtype=torch.int32)
+        metadata = SimpleNamespace(seq_lens=host, seq_lens_device=None)
+        staged = impl._decode_seq_lens(metadata, META)
+        self.assertEqual(staged.device.type, META.type)
+        self.assertIsNot(staged, host)
+
+        bare = SimpleNamespace(seq_lens=host)
+        self.assertEqual(impl._decode_seq_lens(bare, META).device.type, META.type)
+
+    def test_the_device_lengths_are_still_held_to_the_index_contract(self):
+        """Routed through _device_index rather than used raw, so an operand that
+        is on the device but the wrong dtype is narrowed rather than reinterpreted
+        by a kernel reading it as int32."""
+        impl = self._make_impl(META)
+        wide = torch.arange(4, dtype=torch.int64, device=META)
+        staged = impl._decode_seq_lens(SimpleNamespace(seq_lens=None, seq_lens_device=wide), META)
+        self.assertEqual(staged.dtype, tq_module.TURBOQUANT_INDEX_DTYPE)
+
     def test_the_staging_buffers_are_reserved_at_the_configured_ceiling(self):
         """So the capture is never the step that has to grow one.
 

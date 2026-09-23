@@ -492,24 +492,27 @@ class NPUPlatform(Platform):
         the pieces. That is the whole point of a splitting op and it needs nothing from
         this backend.
 
-        A *full* graph captures the attention layers too, and one thing the decode does
-        cannot survive that. ``AscendMetadata.seq_lens`` is a host tensor by
-        construction, and these kernels read the lengths from global memory, so
-        :meth:`AscendTurboQuantAttentionBackendImpl._device_index` stages it across the
-        bus on every step. Captured, that copy is recorded against the host address it
-        saw at capture time -- a per-step tensor that is gone by the first replay. The
-        replays would not fail; they would attend over whatever lengths that freed page
-        happens to hold. Silently wrong output is worse than slower output, so a full
-        graph is declined here rather than left to produce it.
+        A *full* graph captures the attention layers too. That used to be impossible
+        for this backend: the decode staged the host-side ``AscendMetadata.seq_lens``
+        onto the device on every step, and captured, that copy replays the host address
+        it saw at capture time -- a per-step tensor gone by the first replay, so the
+        replays would attend over whatever that freed page holds. The decode now reads
+        the model runner's own persistent int32 device buffer instead
+        (``AscendMetadata.seq_lens_device``), and every other operand it touches is
+        either that runner's or one of this backend's own persistent buffers.
+
+        So the barrier is gone and the fallback is no longer a statement about what the
+        decode can express -- it is a statement about what has been run. Nothing here
+        has been captured full on hardware, and a full graph that is subtly wrong is
+        silently wrong output rather than a crash. Lifting this is a verification task:
+        capture full, compare against piecewise on the same prompts, and drop the
+        fallback when they agree.
 
         Declined, not refused: ``FULL_DECODE_ONLY`` is the platform's own default for a
         decode-heavy run, so raising would mean ``ENABLE_TURBOQUANT=1`` could not start
         without the user also naming a graph mode. Serving the mode that does work, and
         saying so once, is the useful answer.
 
-        Lifting this needs the decode to take its lengths from a buffer the runner owns
-        and updates in place, the way ``AscendAttentionBackendImpl`` re-launches its
-        captured attention through ``update_graph_params``.
         """
         if not turboquant_enabled(vllm_config):
             return
@@ -529,9 +532,8 @@ class NPUPlatform(Platform):
         else:
             downgraded = CUDAGraphMode.NONE
         logger.warning(
-            "The TurboQuant 4-bit KV cache cannot be served under %s: its decode stages the host-side "
-            "sequence lengths onto the device per step, and a captured copy replays the host address it "
-            "recorded. Falling back to %s.%s",
+            "The TurboQuant 4-bit KV cache has not been verified under %s, where the decode launches are "
+            "captured rather than run between the captured pieces. Falling back to %s.%s",
             compilation_config.cudagraph_mode.name,
             downgraded.name,
             " Attention is split out of the graph there; the rest of the model is still captured."

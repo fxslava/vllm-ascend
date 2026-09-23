@@ -193,6 +193,15 @@ class AscendMetadata:
     # is unified.
     seq_lens: torch.Tensor = None
     seq_lens_cpu: torch.Tensor = None
+    # The same lengths, left where the model runner computes them: a persistent
+    # int32 device buffer, filled on device and zero-padded past ``num_reqs``.
+    # ``seq_lens`` above is deliberately a *host* tensor, because the CANN paged
+    # attention the stock backend calls tiles with it host-side. A backend whose
+    # kernels read the lengths out of global memory instead -- TurboQuant reads
+    # them with a scalar GM load -- wants this one, and wants it without a copy:
+    # taking it here costs nothing, where staging the host tensor costs one
+    # host-to-device transfer per layer per step.
+    seq_lens_device: torch.Tensor | None = None
     seq_lens_list: list[int] = None  # type: ignore
     actual_seq_lengths_q: list[int] = None  # type: ignore
 
@@ -397,6 +406,13 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             query_start_loc=query_start_loc,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens,
+            # Not derived from the host tensor above: this is the runner's own
+            # buffer, sliced to the same num_reqs so the two describe one batch.
+            # None where the caller did not bring one -- the field is optional and
+            # every reader falls back to the host tensor, which is always built.
+            seq_lens_device=(
+                None if common_attn_metadata.seq_lens is None else common_attn_metadata.seq_lens[:num_reqs]
+            ),
             seq_lens_list=seq_lens_list,
             max_query_len=common_attn_metadata.max_query_len,
             actual_seq_lengths_q=actual_seq_lengths_q,

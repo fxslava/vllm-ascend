@@ -63,11 +63,14 @@ Graph mode: a TurboQuant run is compiled and captured *piecewise*.  Both entry
 points into this file -- ``vllm::unified_attention_with_output`` and
 ``vllm::turboquant_gated_attention`` -- are graph splitting ops, so the model
 around attention is captured while these kernels are launched eagerly between
-the pieces, and nothing here is ever traced under FakeTensor.  A full graph
-would capture the launches too, which the decode cannot survive: it stages the
-host-side sequence lengths onto the device per step, and a captured copy replays
-the host address it recorded.  ``NPUPlatform._apply_turboquant_graph_mode``
-falls back to piecewise rather than letting that happen.  Everything persistent
+the pieces, and nothing here is ever traced under FakeTensor.
+``NPUPlatform._apply_turboquant_graph_mode`` falls back to piecewise from a full
+graph, which used to be a hard requirement: the decode staged the host-side
+sequence lengths onto the device per step, and a captured copy would replay the
+host address it recorded.  It no longer does -- it reads the runner's own
+persistent device buffer (:meth:`_decode_seq_lens`) -- so the fallback is now a
+statement about what has been verified on hardware rather than about what the
+decode can express.  Everything persistent
 below -- the scale plane, the reduction workspace, the rotated query, the index
 staging buffers -- is sized to the configured ceiling on its first allocation
 and refuses to grow inside a capture, so a step between two captured pieces
@@ -866,6 +869,35 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         staged.copy_(indices)
         return staged
 
+    def _decode_seq_lens(self, attn_metadata: AscendMetadata, device: torch.device) -> torch.Tensor:
+        """The context lengths, in the global memory the decode reads them from.
+
+        ``AscendMetadata.seq_lens`` is a host tensor on purpose, so staging it was
+        a host-to-device transfer *per layer per decode step* -- sixty of them a
+        step on a sixty-layer model, each moving a few hundred int32 words, and
+        each one pageable and therefore synchronous.
+
+        ``seq_lens_device`` is the same batch's lengths left where the model runner
+        already computes them: a persistent int32 device buffer, written on device
+        and zero-padded past ``num_reqs``. Preferring it makes the whole thing free
+        -- :meth:`_device_index` hands back an operand that is already int32,
+        already contiguous and already on the right device, so nothing is copied
+        and nothing is allocated. The zero padding is the right value too: a row
+        the host did not describe reads as a sequence of no length.
+
+        It is still routed through :meth:`_device_index` rather than used raw, so
+        the dtype and residency invariants are checked rather than assumed, and so
+        a metadata that predates the field still works by staging the host tensor.
+        """
+        lengths = getattr(attn_metadata, "seq_lens_device", None)
+        # isinstance rather than "is not None", for the reason _decode_capacity uses
+        # it: this is an optional field on a metadata object that several builders
+        # and every test double construct, and staging something that is not a tensor
+        # is a worse failure than falling back to the host tensor that always exists.
+        if not isinstance(lengths, torch.Tensor):
+            lengths = attn_metadata.seq_lens
+        return self._device_index(lengths, device, "seq_lens")
+
     def _rotated_query(self, num_tokens: int, device: torch.device) -> torch.Tensor:
         """Return the fp32 buffer ``npu_turboquant_rotate_q`` writes into.
 
@@ -919,7 +951,7 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         # Both are read from global memory by the kernel, and seq_lens reaches the
         # backend on the host. See _device_index.
         block_tables = self._device_index(attn_metadata.block_tables, query.device, "block_tables")
-        seq_lens = self._device_index(attn_metadata.seq_lens, query.device, "seq_lens")
+        seq_lens = self._decode_seq_lens(attn_metadata, query.device)
         workspace = self._decode_workspace(num_tokens, block_tables.shape[1], self.key_cache.shape[1], query.device)
         attention_output = output[:num_tokens].view(num_tokens, self.num_heads, self.head_size)
 
@@ -1099,7 +1131,7 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         # memory (see _device_index) -- and hoisted for the reason it hoists: the trace
         # has to name the tensors the launch is handed, not their sources.
         block_tables = self._device_index(attn_metadata.block_tables, device, "block_tables")
-        seq_lens = self._device_index(attn_metadata.seq_lens, device, "seq_lens")
+        seq_lens = self._decode_seq_lens(attn_metadata, device)
         workspace = self._decode_workspace(num_tokens, block_tables.shape[1], self.key_cache.shape[1], device)
         rotated_query = self._rotated_query(num_tokens, device)
         attention_output = output[:num_tokens].view(num_tokens, self.num_heads, self.head_size)
