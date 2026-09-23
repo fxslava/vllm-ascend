@@ -105,6 +105,23 @@ WORKSPACE_FLOATS = 4096
 DECODE_BLOCK_SIZE = 128
 
 
+def _capture_in_progress():
+    """Make ``tq_module._is_capturing()`` answer True.
+
+    Both halves of the signal have to be faked, because the backend deliberately
+    needs both: ``ACLGraphWrapper`` leaves ``forward_context.capturing`` set for the
+    rest of the forward once it has captured a piece, so the flag alone is also True
+    while the attention layers run *outside* the capture that piecewise compilation
+    splits them out of. Only the stream says whether a capture is open right now --
+    and on a host with no device it says no, which is why a test that patches one
+    has to patch the other.
+    """
+    return (
+        patch.object(tq_module, "_EXTRA_CTX", SimpleNamespace(capturing=True)),
+        patch.object(torch.npu, "is_current_stream_capturing", lambda: True),
+    )
+
+
 def _ops_mock(workspace_floats: int = WORKSPACE_FLOATS) -> MagicMock:
     """A stand-in for ``torch.ops._C_ascend``.
 
@@ -476,6 +493,26 @@ class TestPureRuntimeContract(TestBase):
         self.assertEqual(narrow.shape, (2, impl.num_heads, HEAD_SIZE))
         self.assertEqual(wide.shape, (4, impl.num_heads, HEAD_SIZE))
 
+    def test_the_rotated_query_buffer_is_reserved_at_the_configured_ceiling(self):
+        """A decode carries one token per sequence, so ``max_num_seqs`` is the ceiling.
+        Reserving it up front means no graph capture is ever the step that grows it."""
+        impl = self._make_impl()
+        impl.vllm_config = SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_seqs=32),
+            model_config=SimpleNamespace(max_model_len=1024),
+            cache_config=SimpleNamespace(block_size=DECODE_BLOCK_SIZE),
+        )
+        view = impl._rotated_query(2, CPU)
+        self.assertEqual(view.shape, (2, impl.num_heads, HEAD_SIZE))
+        self.assertEqual(impl.rotated_query.numel(), 32 * impl.num_heads * HEAD_SIZE)
+
+        reserved = impl.rotated_query
+        flag, stream = _capture_in_progress()
+        with flag, stream:
+            widest = impl._rotated_query(32, CPU)
+        self.assertIs(impl.rotated_query, reserved)
+        self.assertEqual(widest.shape, (32, impl.num_heads, HEAD_SIZE))
+
     def test_paged_attention_is_handed_a_preallocated_workspace(self):
         """The operator never allocates its own reduction scratch."""
         impl = self._make_impl()
@@ -747,16 +784,17 @@ class TestDecodeWorkspace(TestBase):
         ops.npu_turboquant_workspace_size.side_effect = [WORKSPACE_FLOATS, WORKSPACE_FLOATS * 2]
         with patch.object(torch.ops, "_C_ascend", ops, create=True):
             impl._decode_workspace(2, 1, DECODE_BLOCK_SIZE, CPU)
-            with patch.object(tq_module, "_EXTRA_CTX", SimpleNamespace(capturing=True)):
-                with self.assertRaisesRegex(RuntimeError, "during a graph capture"):
-                    impl._decode_workspace(8, 4, DECODE_BLOCK_SIZE, CPU)
+            flag, stream = _capture_in_progress()
+            with flag, stream, self.assertRaisesRegex(RuntimeError, "during a graph capture"):
+                impl._decode_workspace(8, 4, DECODE_BLOCK_SIZE, CPU)
 
     def test_a_capture_that_needs_no_growth_is_allowed(self):
         impl = self._make_impl()
         ops = _ops_mock()
         with patch.object(torch.ops, "_C_ascend", ops, create=True):
             warmed = impl._decode_workspace(2, 1, DECODE_BLOCK_SIZE, CPU)
-            with patch.object(tq_module, "_EXTRA_CTX", SimpleNamespace(capturing=True)):
+            flag, stream = _capture_in_progress()
+            with flag, stream:
                 captured = impl._decode_workspace(2, 1, DECODE_BLOCK_SIZE, CPU)
 
         self.assertIs(warmed, captured)
@@ -771,6 +809,48 @@ class TestDecodeWorkspace(TestBase):
 
         with patch.object(tq_module, "_EXTRA_CTX", _NoContext()):
             self.assertFalse(tq_module._is_capturing())
+
+    def test_a_stale_capture_flag_between_pieces_does_not_read_as_a_capture(self):
+        """The piecewise case, which is how TurboQuant is meant to be served.
+
+        ``ACLGraphWrapper`` sets ``forward_context.capturing`` before capturing a
+        piece and only the next step clears it. Attention is split out of those
+        pieces, so from the first captured piece onwards every TurboQuant call in
+        that forward sees the flag set while running outside any capture -- and
+        must be free to grow a buffer. Only the stream can tell the two apart.
+        """
+        with (
+            patch.object(tq_module, "_EXTRA_CTX", SimpleNamespace(capturing=True)),
+            patch.object(torch.npu, "is_current_stream_capturing", lambda: False),
+        ):
+            self.assertFalse(tq_module._is_capturing())
+
+    def test_an_unanswerable_stream_is_treated_as_a_capture(self):
+        """Not knowing is not the same as knowing it is safe to allocate."""
+
+        def unavailable():
+            raise RuntimeError("no device")
+
+        with (
+            patch.object(tq_module, "_EXTRA_CTX", SimpleNamespace(capturing=True)),
+            patch.object(torch.npu, "is_current_stream_capturing", unavailable),
+        ):
+            self.assertTrue(tq_module._is_capturing())
+
+    def test_the_stream_is_not_asked_when_no_capture_is_running(self):
+        """The common path stays off the device: the flag alone answers it."""
+        asked = []
+
+        def record():
+            asked.append(True)
+            return False
+
+        with (
+            patch.object(tq_module, "_EXTRA_CTX", SimpleNamespace(capturing=False)),
+            patch.object(torch.npu, "is_current_stream_capturing", record),
+        ):
+            self.assertFalse(tq_module._is_capturing())
+        self.assertEqual(asked, [])
 
 
 class TestNumericalEdgeCases(TestBase):
@@ -2166,11 +2246,66 @@ class TestDecodeIndexOperandDevice(TestBase):
 
     def test_growing_the_staging_buffer_during_a_capture_is_refused(self):
         impl = self._make_impl(META)
-        with (
-            patch.object(tq_module, "_EXTRA_CTX", SimpleNamespace(capturing=True)),
-            self.assertRaisesRegex(RuntimeError, "during a graph capture"),
-        ):
+        flag, stream = _capture_in_progress()
+        with flag, stream, self.assertRaisesRegex(RuntimeError, "during a graph capture"):
             impl._device_index(torch.zeros(4, dtype=torch.int32), META, "seq_lens")
+
+    def test_the_staging_buffers_are_reserved_at_the_configured_ceiling(self):
+        """So the capture is never the step that has to grow one.
+
+        vLLM warms each graph size up eagerly before capturing it, which usually
+        sizes the buffer first. Reserving the configured maximum on the first
+        allocation makes that hold without depending on the warmup order, for two
+        buffers that are one int32 per sequence and one block-table row per
+        sequence."""
+        impl = self._make_impl(META)
+        impl.vllm_config = SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_seqs=64),
+            model_config=SimpleNamespace(max_model_len=1024),
+            cache_config=SimpleNamespace(block_size=DECODE_BLOCK_SIZE),
+        )
+        impl._device_index(torch.zeros(2, dtype=torch.int32), META, "seq_lens")
+        impl._device_index(torch.zeros(2, 1, dtype=torch.int32), META, "block_tables")
+        buffers = impl._device_index_buffers
+        lengths = buffers[("seq_lens", tq_module.TURBOQUANT_INDEX_DTYPE)]
+        pages = buffers[("block_tables", tq_module.TURBOQUANT_INDEX_DTYPE)]
+        self.assertEqual(lengths.numel(), 64)
+        # 1024 tokens over 128-token blocks is 8 block-table entries per sequence.
+        self.assertEqual(pages.numel(), 64 * 8)
+
+        # And the largest decode the config allows then finds them already big enough.
+        flag, stream = _capture_in_progress()
+        with flag, stream:
+            impl._device_index(torch.zeros(64, dtype=torch.int32), META, "seq_lens")
+            impl._device_index(torch.zeros(64, 8, dtype=torch.int32), META, "block_tables")
+        self.assertIs(buffers[("seq_lens", tq_module.TURBOQUANT_INDEX_DTYPE)], lengths)
+        self.assertIs(buffers[("block_tables", tq_module.TURBOQUANT_INDEX_DTYPE)], pages)
+
+    def test_a_config_that_names_no_limits_reserves_nothing(self):
+        """An impl with no engine around it -- the CPU harness, a profile run before
+        the config is complete -- sizes by the call in hand rather than guessing."""
+        impl = self._make_impl(META)
+        self.assertEqual(impl._decode_capacity(), (0, 0))
+        impl.vllm_config = SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_seqs=MagicMock()),
+            model_config=SimpleNamespace(max_model_len=1024),
+            cache_config=SimpleNamespace(block_size=DECODE_BLOCK_SIZE),
+        )
+        self.assertEqual(impl._decode_capacity(), (0, 0))
+        impl._device_index(torch.zeros(3, dtype=torch.int32), META, "seq_lens")
+        self.assertEqual(impl._device_index_buffers[("seq_lens", tq_module.TURBOQUANT_INDEX_DTYPE)].numel(), 3)
+
+    def test_an_unknown_operand_is_sized_by_the_call_that_stages_it(self):
+        """Only the two the decode stages have a ceiling the config knows."""
+        impl = self._make_impl(META)
+        impl.vllm_config = SimpleNamespace(
+            scheduler_config=SimpleNamespace(max_num_seqs=64),
+            model_config=SimpleNamespace(max_model_len=1024),
+            cache_config=SimpleNamespace(block_size=DECODE_BLOCK_SIZE),
+        )
+        self.assertEqual(impl._reserved_index_words("slot_mapping"), 0)
+        impl._device_index(torch.zeros(5, dtype=torch.int32), META, "slot_mapping")
+        self.assertEqual(impl._device_index_buffers[("slot_mapping", tq_module.TURBOQUANT_INDEX_DTYPE)].numel(), 5)
 
     def _decode(self, impl, ops, num_tokens=3, seq_lens=None, block_tables=None):
         query = torch.empty(num_tokens, impl.num_heads, HEAD_SIZE, device=META)

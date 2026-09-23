@@ -58,11 +58,26 @@ because they write different byte layouts into the same packed planes:
 * the AIV decode -- every other build and dtype: ``npu_turboquant_rotate_q``,
   the paged decode, and ``npu_turboquant_rotate_q`` again over the output
   unless the layer is folded; a gate handed over is applied in torch.
+
+Graph mode: a TurboQuant run is compiled and captured *piecewise*.  Both entry
+points into this file -- ``vllm::unified_attention_with_output`` and
+``vllm::turboquant_gated_attention`` -- are graph splitting ops, so the model
+around attention is captured while these kernels are launched eagerly between
+the pieces, and nothing here is ever traced under FakeTensor.  A full graph
+would capture the launches too, which the decode cannot survive: it stages the
+host-side sequence lengths onto the device per step, and a captured copy replays
+the host address it recorded.  ``NPUPlatform._apply_turboquant_graph_mode``
+falls back to piecewise rather than letting that happen.  Everything persistent
+below -- the scale plane, the reduction workspace, the rotated query, the index
+staging buffers -- is sized to the configured ceiling on its first allocation
+and refuses to grow inside a capture, so a step between two captured pieces
+never moves an address a piece was captured against.
 """
 
 import torch
 import torch_npu
 from vllm.logger import logger
+from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backend import AttentionLayer, AttentionType  # type: ignore
 
 import vllm_ascend.envs as envs_ascend
@@ -140,18 +155,40 @@ def turboquant_cube_decode_selected(model_dtype: torch.dtype | None) -> bool:
 
 
 def _is_capturing() -> bool:
-    """Whether an ACL graph capture is in progress.
+    """Whether an ACL graph capture is in progress *on this stream, right now*.
 
     Reading the flag needs a live forward context, and the answer is only ever
     used to refuse an allocation that would be unsafe *inside* a capture. Where
     there is no forward context at all there is no capture either, so a missing
     one is answered rather than raised -- that keeps a diagnostic from turning
     into the failure it exists to describe.
+
+    The forward context's flag alone is not that answer. ``ACLGraphWrapper`` sets
+    ``forward_context.capturing`` to True before it captures a piece and never
+    clears it; the next step's ``set_ascend_forward_context`` does. Under piecewise
+    compilation the attention layers are *split out* of those pieces, so from the
+    first captured piece onwards every TurboQuant call in that forward sees the
+    flag set while running perfectly ordinarily outside any capture -- and would
+    refuse to grow a buffer it is entirely free to grow.
+
+    So the flag is treated as the cheap necessary condition it is, and the stream
+    is asked to confirm. The query is only reached when the flag is already set,
+    which keeps the device out of the hot path and out of the CPU test harness.
     """
     try:
-        return bool(_EXTRA_CTX.capturing)
+        if not _EXTRA_CTX.capturing:
+            return False
     except (AssertionError, AttributeError, RuntimeError):
         return False
+
+    is_stream_capturing = getattr(getattr(torch, "npu", None), "is_current_stream_capturing", None)
+    if is_stream_capturing is None:
+        # No way to ask: believe the flag rather than allocate into a capture.
+        return True
+    try:
+        return bool(is_stream_capturing())
+    except RuntimeError:
+        return True
 
 
 def _attention_phase(attn_metadata: AscendMetadata | None) -> str:
@@ -697,6 +734,59 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         self.decode_workspace = torch.empty(needed, dtype=torch.float32, device=device)
         return self.decode_workspace
 
+    def _decode_capacity(self) -> tuple[int, int]:
+        """``(sequences, blocks per sequence)`` at the largest decode the config allows.
+
+        The buffers below are grown on demand, and every growth is an allocation the
+        step that needs it has to make. A graph capture cannot make one -- it replays
+        the addresses it recorded -- so a buffer that first has to grow during a
+        capture is a refusal (:func:`_is_capturing`), and the run stops at exactly the
+        shape it was supposed to speed up.
+
+        vLLM captures after one eager warmup per shape, so in practice the warmup
+        sizes the buffer and the capture finds it big enough. "In practice" is the
+        problem: it holds only while the warmup covers every shape the capture does,
+        in the right order. Sizing the *first* allocation to the configured ceiling
+        instead makes it hold unconditionally, for a buffer that is a few hundred
+        kilobytes either way -- these hold one int32 per sequence and one block-table
+        row per sequence, not activations.
+
+        ``(0, 0)`` where the config cannot be read: the caller falls back to sizing by
+        what the call in hand needs, which is the behaviour this replaces.
+        """
+        vllm_config = getattr(self, "vllm_config", None)
+        if vllm_config is None:
+            return 0, 0
+        scheduler_config = getattr(vllm_config, "scheduler_config", None)
+        model_config = getattr(vllm_config, "model_config", None)
+        cache_config = getattr(vllm_config, "cache_config", None)
+        limits = (
+            getattr(scheduler_config, "max_num_seqs", None),
+            getattr(model_config, "max_model_len", None),
+            getattr(cache_config, "block_size", None),
+        )
+        # isinstance rather than truthiness: a partially built config -- or a test
+        # double standing in for one -- answers with something that is not a number,
+        # and sizing a buffer from it would be worse than not reserving at all.
+        if not all(isinstance(limit, int) and limit > 0 for limit in limits):
+            return 0, 0
+        max_num_seqs, max_model_len, block_size = limits
+        return max_num_seqs, cdiv(max_model_len, block_size)
+
+    def _reserved_index_words(self, name: str) -> int:
+        """How many int32 words to reserve for the ``name`` staging buffer up front.
+
+        Only the two operands the decodes stage are known from the config -- one
+        length per sequence, and one block-table row per sequence. Anything else
+        is sized by the call that needs it.
+        """
+        max_num_seqs, max_blocks_per_seq = self._decode_capacity()
+        if name == "seq_lens":
+            return max_num_seqs
+        if name == "block_tables":
+            return max_num_seqs * max_blocks_per_seq
+        return 0
+
     def _device_index(self, indices: torch.Tensor, device: torch.device, name: str) -> torch.Tensor:
         """Return ``indices`` as a contiguous int32 tensor in the kernels' global memory.
 
@@ -757,7 +847,7 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
                     f"have to grow to {needed} {indices.dtype} words during a graph capture. Run this shape "
                     "once outside capture so the buffer is sized first."
                 )
-            buffer = torch.empty(needed, dtype=indices.dtype, device=device)
+            buffer = torch.empty(max(needed, self._reserved_index_words(name)), dtype=indices.dtype, device=device)
             self._device_index_buffers[key] = buffer
         staged = buffer[:needed].view(indices.shape)
         if staged.dtype != indices.dtype:
@@ -795,8 +885,12 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
                 "Run this shape once outside capture so the buffer is sized first."
             )
 
-        self.rotated_query = torch.empty(needed, dtype=torch.float32, device=device)
-        return self.rotated_query.view(num_tokens, self.num_heads, self.head_size)
+        # Sized to the largest decode the config allows, for the reason
+        # _decode_capacity gives: a capture cannot be the step that grows it.
+        max_num_seqs, _ = self._decode_capacity()
+        reserved = max_num_seqs * self.num_heads * self.head_size
+        self.rotated_query = torch.empty(max(needed, reserved), dtype=torch.float32, device=device)
+        return self.rotated_query[:needed].view(num_tokens, self.num_heads, self.head_size)
 
     def forward_paged_attention(
         self,

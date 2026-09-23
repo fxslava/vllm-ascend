@@ -145,3 +145,68 @@ class TestEnablementDetection(TestBase):
 
         with patch("vllm_ascend.envs.ENABLE_TURBOQUANT", True):
             self.assertTrue(turboquant_enabled(None))
+
+
+class TestTurboQuantGraphMode(TestBase):
+    """Which ACL graph mode a TurboQuant run is allowed to reach.
+
+    TurboQuant is served compiled: its two attention entry points are graph
+    splitting ops, so ``PIECEWISE`` captures the model around attention and
+    launches the TurboQuant kernels eagerly between the pieces. A *full* graph
+    captures the attention layers too, which bakes in the per-step host-to-device
+    copy of the sequence lengths -- against a host address that is gone by the
+    first replay. These pin the fallback that keeps that from happening quietly.
+    """
+
+    @staticmethod
+    def _graph_config(cudagraph_mode, mode=None, cache_dtype="int4_per_token_head"):
+        from vllm.config import CompilationMode
+
+        config = _config(cache_dtype=cache_dtype)
+        config.compilation_config = SimpleNamespace(
+            cudagraph_mode=cudagraph_mode,
+            mode=CompilationMode.VLLM_COMPILE if mode is None else mode,
+        )
+        return config
+
+    def test_a_full_graph_falls_back_to_piecewise(self):
+        from vllm.config.compilation import CUDAGraphMode
+
+        for full in (CUDAGraphMode.FULL, CUDAGraphMode.FULL_DECODE_ONLY, CUDAGraphMode.FULL_AND_PIECEWISE):
+            with self.subTest(cudagraph_mode=full.name):
+                config = self._graph_config(full)
+                NPUPlatform._apply_turboquant_graph_mode(config)
+                self.assertEqual(config.compilation_config.cudagraph_mode, CUDAGraphMode.PIECEWISE)
+
+    def test_a_full_graph_without_piecewise_compilation_falls_back_to_no_graph(self):
+        """There is nothing to split when the model was not compiled piecewise."""
+        from vllm.config import CompilationMode
+        from vllm.config.compilation import CUDAGraphMode
+
+        config = self._graph_config(CUDAGraphMode.FULL, mode=CompilationMode.NONE)
+        NPUPlatform._apply_turboquant_graph_mode(config)
+        self.assertEqual(config.compilation_config.cudagraph_mode, CUDAGraphMode.NONE)
+
+    def test_piecewise_is_what_turboquant_is_served_under_and_is_left_alone(self):
+        from vllm.config.compilation import CUDAGraphMode
+
+        for kept in (CUDAGraphMode.PIECEWISE, CUDAGraphMode.NONE):
+            with self.subTest(cudagraph_mode=kept.name):
+                config = self._graph_config(kept)
+                NPUPlatform._apply_turboquant_graph_mode(config)
+                self.assertEqual(config.compilation_config.cudagraph_mode, kept)
+
+    def test_a_run_without_turboquant_keeps_its_full_graph(self):
+        from vllm.config.compilation import CUDAGraphMode
+
+        config = self._graph_config(CUDAGraphMode.FULL, cache_dtype="auto")
+        NPUPlatform._apply_turboquant_graph_mode(config)
+        self.assertEqual(config.compilation_config.cudagraph_mode, CUDAGraphMode.FULL)
+
+    def test_the_env_var_route_is_held_to_it_too(self):
+        from vllm.config.compilation import CUDAGraphMode
+
+        config = self._graph_config(CUDAGraphMode.FULL, cache_dtype="auto")
+        with patch("vllm_ascend.envs.ENABLE_TURBOQUANT", True):
+            NPUPlatform._apply_turboquant_graph_mode(config)
+        self.assertEqual(config.compilation_config.cudagraph_mode, CUDAGraphMode.PIECEWISE)

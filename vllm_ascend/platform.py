@@ -482,6 +482,65 @@ class NPUPlatform(Platform):
             )
 
     @classmethod
+    def _apply_turboquant_graph_mode(cls, vllm_config: VllmConfig) -> None:
+        """Hold a TurboQuant run to the ACL graph mode its decode can be replayed under.
+
+        TurboQuant runs compiled: both of its attention entry points --
+        ``vllm::unified_attention_with_output`` and ``vllm::turboquant_gated_attention``
+        -- are graph splitting ops, so under ``PIECEWISE`` the model around attention is
+        captured and replayed while the TurboQuant kernels are launched eagerly between
+        the pieces. That is the whole point of a splitting op and it needs nothing from
+        this backend.
+
+        A *full* graph captures the attention layers too, and one thing the decode does
+        cannot survive that. ``AscendMetadata.seq_lens`` is a host tensor by
+        construction, and these kernels read the lengths from global memory, so
+        :meth:`AscendTurboQuantAttentionBackendImpl._device_index` stages it across the
+        bus on every step. Captured, that copy is recorded against the host address it
+        saw at capture time -- a per-step tensor that is gone by the first replay. The
+        replays would not fail; they would attend over whatever lengths that freed page
+        happens to hold. Silently wrong output is worse than slower output, so a full
+        graph is declined here rather than left to produce it.
+
+        Declined, not refused: ``FULL_DECODE_ONLY`` is the platform's own default for a
+        decode-heavy run, so raising would mean ``ENABLE_TURBOQUANT=1`` could not start
+        without the user also naming a graph mode. Serving the mode that does work, and
+        saying so once, is the useful answer.
+
+        Lifting this needs the decode to take its lengths from a buffer the runner owns
+        and updates in place, the way ``AscendAttentionBackendImpl`` re-launches its
+        captured attention through ``update_graph_params``.
+        """
+        if not turboquant_enabled(vllm_config):
+            return
+
+        from vllm.config.compilation import CUDAGraphMode
+
+        compilation_config = vllm_config.compilation_config
+        if not compilation_config.cudagraph_mode.has_full_cudagraphs():
+            return
+
+        from vllm.config import CompilationMode
+
+        # PIECEWISE needs the piecewise compilation that only VLLM_COMPILE does; without
+        # it there is nothing to split, so the honest fallback is no graph at all.
+        if compilation_config.mode == CompilationMode.VLLM_COMPILE:
+            downgraded = CUDAGraphMode.PIECEWISE
+        else:
+            downgraded = CUDAGraphMode.NONE
+        logger.warning(
+            "The TurboQuant 4-bit KV cache cannot be served under %s: its decode stages the host-side "
+            "sequence lengths onto the device per step, and a captured copy replays the host address it "
+            "recorded. Falling back to %s.%s",
+            compilation_config.cudagraph_mode.name,
+            downgraded.name,
+            " Attention is split out of the graph there; the rest of the model is still captured."
+            if downgraded == CUDAGraphMode.PIECEWISE
+            else " Pass a compiled mode to keep graph capture for the rest of the model.",
+        )
+        compilation_config.cudagraph_mode = downgraded
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         from vllm_ascend.quantization.utils import maybe_auto_detect_quantization
 
@@ -619,6 +678,8 @@ class NPUPlatform(Platform):
                 cudagraph_mode,
             )
             compilation_config.cudagraph_mode = cudagraph_mode
+
+        cls._apply_turboquant_graph_mode(vllm_config)
 
         # get custom compile backend for graph fusion
         compilation_config.oot_compiler = cls.get_compile_backend()
