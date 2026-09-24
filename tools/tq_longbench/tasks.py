@@ -48,6 +48,36 @@ from pathlib import Path
 #:   one. The table here is a transcription and is treated as one.
 PROMPT_TABLE = Path(__file__).with_name("longbench_prompts.json")
 
+#: The corpora that are **not** LongBench v1, and so are deliberately not in
+#: :data:`PROMPT_TABLE` -- that file is the suite's own two config files and has
+#: to stay diffable against the copy a download ships. These live here instead,
+#: and :func:`longbench_config` merges them in, because everything downstream
+#: (``load_longbench_jsonl``, ``prepare_buckets``, the runner) asks that one
+#: function what a task's prompt is and a task with no answer there cannot be
+#: loaded at all.
+#:
+#: ``longbench_v2`` is four-way multiple choice. The choices are folded into
+#: ``input`` when the row is written (``prepare_buckets.read_v2_row``) rather
+#: than kept as separate ``choice_A``..``choice_D`` fields, which is what lets a
+#: v2 row be stored and read in v1's ``{context}``/``{input}`` shape. The closing
+#: instruction is v2's own, and is what
+#: :func:`~tq_longbench.metrics.multiple_choice_score` reads back.
+EXTRA_PROMPTS = {
+    "longbench_v2": (
+        "Please read the following text and answer the question below.\n\n"
+        "<text>\n{context}\n</text>\n\n"
+        "{input}\n\n"
+        'Format your response as follows: "The correct answer is (insert answer here)".'
+    ),
+    "infinitebench_qa": (
+        "Read the book below and answer a question.\n\n{context}\n\nQuestion: {input}\n\nBe very concise. Answer:"
+    ),
+}
+
+#: Generation budgets for the same two. v2 wants a letter and is given room for
+#: the sentence around it; InfiniteBench's long-book QA references are phrases.
+EXTRA_MAX_NEW_TOKENS = {"longbench_v2": 128, "infinitebench_qa": 64}
+
 
 def longbench_config(dataset_dir: str | Path | None = None) -> tuple[dict, dict]:
     """``(prompts, budgets)``, from the downloaded suite's own config where it has one.
@@ -58,9 +88,15 @@ def longbench_config(dataset_dir: str | Path | None = None) -> tuple[dict, dict]
     with, and this module's copy is a transcription that can only be as good as
     the transcribing. Where it does not, the transcription is used and the caller
     is told which -- :func:`config_source`.
+
+    :data:`EXTRA_PROMPTS` is merged in underneath both, so the non-v1 corpora the
+    context tiers are drawn from can be loaded. A downloaded config still wins
+    over them, on the same reasoning: whatever a corpus ships with is the thing
+    its numbers were produced with.
     """
     shipped = json.loads(PROMPT_TABLE.read_text(encoding="utf-8"))
-    prompts, budgets = dict(shipped["dataset2prompt"]), dict(shipped["dataset2maxlen"])
+    prompts = {**shipped["dataset2prompt"], **EXTRA_PROMPTS}
+    budgets = {**shipped["dataset2maxlen"], **EXTRA_MAX_NEW_TOKENS}
     for name, target in (("dataset2prompt", prompts), ("dataset2maxlen", budgets)):
         path = _config_path(dataset_dir, name)
         if path is not None:

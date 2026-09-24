@@ -42,7 +42,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT / "tools") not in sys.path:
     sys.path.append(str(REPO_ROOT / "tools"))
 
-from tq_longbench.metrics import multiple_choice_score  # noqa: E402
+from tq_longbench.metrics import multiple_choice_score, score_prediction  # noqa: E402
 from tq_longbench.prepare_buckets import (  # noqa: E402
     TIERS,
     SourceRow,
@@ -177,9 +177,33 @@ class LongBenchV2Test(unittest.TestCase):
 
     def test_the_rendered_prompt_carries_both_halves(self):
         row = read_v2_row({"context": "CONTEXT", "question": "Q", "choice_A": "a", "answer": "a"})
-        text = render_prompt("longbench_v2", row, {})
+        text = render_prompt("longbench_v2", row, longbench_config()[0])
         self.assertIn("CONTEXT", text)
         self.assertIn("Q", text)
+
+    def test_the_template_the_runner_reads_back_is_the_one_that_measured_the_item(self):
+        """One table, not two copies.
+
+        The length written into a tier row is only the length the runner will see
+        if ``prepare_buckets`` and ``load_longbench_jsonl`` render the item the
+        same way, so both ask :func:`longbench_config` and neither keeps a
+        template of its own.
+        """
+        prompts, budgets = longbench_config()
+        for task in ("longbench_v2", "infinitebench_qa"):
+            with self.subTest(task=task):
+                self.assertIn(task, prompts)
+                self.assertIn("{context}", prompts[task])
+                self.assertIn("{input}", prompts[task])
+                self.assertGreater(budgets[task], 0)
+
+    def test_the_v1_transcription_stays_diffable_against_the_suites_own(self):
+        """The non-v1 corpora live in tasks.py, never in the file that mirrors the suite."""
+        shipped = json.loads((REPO_ROOT / "tools" / "tq_longbench" / "longbench_prompts.json").read_text("utf-8"))
+        for task in ("longbench_v2", "infinitebench_qa"):
+            with self.subTest(task=task):
+                self.assertNotIn(task, shipped["dataset2prompt"])
+                self.assertNotIn(task, shipped["dataset2maxlen"])
 
     def test_the_metric_reads_a_letter_out_of_a_sentence(self):
         self.assertEqual(multiple_choice_score("The correct answer is (C).", ["C"]), 1.0)
@@ -288,6 +312,41 @@ class PartitionTest(unittest.TestCase):
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0].answers, ["haystack"])
         self.assertIn("haystack", items[0].prompt)
+
+    def test_a_v2_tier_row_loads_back_too(self):
+        """The 256k tier is ``longbench_v2``, and it used to be unreadable.
+
+        ``load_longbench_jsonl`` refuses a task with no prompt template, and
+        ``longbench_v2`` is not in the suite's ``dataset2prompt.json`` -- so
+        every row this script wrote for the 256k tier raised on the way back in.
+        The templates moved into :func:`longbench_config`, which is what both
+        ends ask.
+        """
+        directory = self.root / "tier"
+        directory.mkdir()
+        row = read_v2_row(
+            {
+                "context": "the chapter text",
+                "question": "which one?",
+                "choice_A": "alpha",
+                "choice_B": "beta",
+                "choice_C": "gamma",
+                "choice_D": "delta",
+                "answer": "C",
+            }
+        )
+        written = tier_row("longbench_v2", row, 70000, 0, TIERS["256k"])
+        (directory / "longbench_v2.jsonl").write_text(json.dumps(written) + "\n", encoding="utf-8")
+
+        items = list(load_longbench_jsonl("longbench_v2", directory))
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].answers, ["C"])
+        self.assertEqual(items[0].metric, "longbench_v2")
+        self.assertEqual(items[0].max_new_tokens, 128)
+        self.assertIn("the chapter text", items[0].prompt)
+        self.assertIn("(C) gamma", items[0].prompt)
+        # Scored by v2's own metric, through the task name the item carries.
+        self.assertEqual(score_prediction(items[0].metric, "The correct answer is (C).", items[0].answers), 1.0)
 
 
 class SummariseTest(unittest.TestCase):

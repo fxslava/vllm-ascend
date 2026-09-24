@@ -42,7 +42,7 @@ at the tier's ceiling over those items -- so nothing is cut, ``truncated`` is
 zero throughout, and the score is about long context rather than about the
 scissors. The arena follows the tier (``tier_tokens + max_gen_tokens +
 headroom``), ``--max-tokens-override`` sets per-task generation budgets, and
-``--max-context`` refuses to provision an arena nobody asked for::
+``--max-context`` refuses a rung longer than anybody asked for::
 
     python tools/tq_longbench/run_longbench.py --model-path ~/models/glm-4-9b-chat-1m \\
         --context-tier 256k --max-tokens-override gov_report=1024,qasper=256 --decode-graph on
@@ -163,12 +163,18 @@ PROBE_REFERENCE_BACKEND = "cann_dense"
 #: number anyone might mistake for a benchmark.
 STUB_ITEMS = 3
 
-#: The arena a run will provision without being asked twice, in tokens. The 32k
-#: and 256k tiers clear it; the 1M tier does not, and has to be let through with
-#: an explicit ``--max-context``. A 1M-token arena is tens of gigabytes before a
-#: single weight loads, and the failure mode without a guard is an allocator
-#: abort a long way into a run that had already been paid for.
-DEFAULT_MAX_CONTEXT = 262144
+#: The longest prompt a run will take without being asked twice, in tokens. It is
+#: the 256k tier's own ceiling, so that tier clears it exactly; the 1M tier does
+#: not and has to be let through with an explicit ``--max-context``. A 1M-token
+#: arena is tens of gigabytes before a single weight loads, and the failure mode
+#: without a guard is an allocator abort a long way into a run that had already
+#: been paid for.
+#:
+#: A *rung*, not the arena it implies -- see :func:`guard_arena`. Sized off the
+#: tier table rather than typed, because the two have to agree: a guard written
+#: as a literal that later drifted from ``TIERS["256k"]`` would refuse the tier
+#: it was chosen to admit.
+DEFAULT_MAX_CONTEXT = TIERS["256k"].max_tokens
 
 #: Above this, ``--eval-fidelity``'s cosine is refused. The number needs a second,
 #: *unquantised* prefill of the same prompt held in memory beside the first --
@@ -255,8 +261,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-context",
         type=int,
         default=DEFAULT_MAX_CONTEXT,
-        help=f"refuse to provision an arena larger than this many tokens (default: {DEFAULT_MAX_CONTEXT}); "
-        "raise it deliberately for the 1M tier",
+        help=f"refuse a rung whose prompts are longer than this many tokens (default: {DEFAULT_MAX_CONTEXT}, "
+        "the 256k tier's ceiling); raise it deliberately for the 1M tier",
     )
     parser.add_argument(
         "--dry-run",
@@ -397,20 +403,29 @@ def apply_tier(args: argparse.Namespace) -> tuple[tuple[int, ...], tuple[str, ..
 
 
 def guard_arena(args: argparse.Namespace, context: int, max_seq_len: int) -> None:
-    """Refuse an arena past ``--max-context`` before anything is allocated.
+    """Refuse a rung past ``--max-context`` before anything is allocated.
 
     The 1M tier is the case this exists for. Provisioning its cache is tens of
     gigabytes of device memory committed up front, and without a guard the way
     that goes wrong is an allocator abort partway through a run whose weights
     had already loaded -- ten minutes to learn something the token count knew at
     the start.
+
+    The comparison is against the **rung**, not the arena it implies, and that
+    distinction is the whole of a bug this used to have: an arena is the rung
+    plus a generation budget plus tokenizer headroom, so a guard set to a tier's
+    own ceiling refused that tier by the few hundred tokens of slack it was
+    always going to need. ``--max-context`` means the longest prompt this run may
+    take, which is the number a person actually has in mind when they type it.
+    The arena is still named in the refusal, because it is what the device has to
+    find.
     """
-    if max_seq_len <= args.max_context:
+    if context <= args.max_context:
         return
     raise SystemExit(
-        f"a {context}-token rung needs a {max_seq_len}-token arena, past the {args.max_context}-token "
-        f"--max-context guard. Re-run with --max-context {max_seq_len} once you have checked the device has "
-        f"room for it, or with --dry-run to see what it would cost."
+        f"a {context}-token rung (a {max_seq_len}-token arena with the generation budget and headroom) is "
+        f"past the {args.max_context}-token --max-context guard. Re-run with --max-context {context} once "
+        f"you have checked the device has room for it, or with --dry-run to see what it would cost."
     )
 
 
@@ -439,7 +454,7 @@ def arena_report(args: argparse.Namespace, contexts: tuple[int, ...], tasks: tup
             max_seq_len=max_seq_len,
         )
         dense_mb = dense_equivalent_bytes(geometry, _DTYPES[args.dtype]) / (1024 * 1024)
-        verdict = "ok" if max_seq_len <= args.max_context else "REFUSED"
+        verdict = "ok" if context <= args.max_context else "REFUSED"
         lines.append(f"{context:>9} {max_seq_len:>9} {dense_mb:>14.0f} {verdict:>9}")
     lines += [
         "",
@@ -447,7 +462,7 @@ def arena_report(args: argparse.Namespace, contexts: tuple[int, ...], tasks: tup
         "Dense KV is what the same arena would cost unquantised, from the checkpoint geometry; the "
         "TurboQuant pool's own size is measured per run and reported as kv_cache_mb.",
     ]
-    if any(context + budget + CONTEXT_HEADROOM_TOKENS > args.max_context for context in contexts):
+    if any(context > args.max_context for context in contexts):
         lines.append("A REFUSED rung needs an explicit --max-context to run.")
     return "\n".join(lines)
 

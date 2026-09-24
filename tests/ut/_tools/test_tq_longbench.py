@@ -4177,8 +4177,35 @@ class TestContextTiers(unittest.TestCase):
         with self.assertRaises(SystemExit) as refusal:
             guard_arena(args, 1048576, 1049088)
         message = str(refusal.exception)
-        self.assertIn("--max-context 1049088", message)
+        # The rung is what --max-context means, so it is the number to re-run
+        # with; the arena is named too, because it is what the device must find.
+        self.assertIn("--max-context 1048576", message)
+        self.assertIn("1049088-token arena", message)
         self.assertIn("--dry-run", message)
+
+    def test_a_tier_clears_the_guard_at_its_own_ceiling(self):
+        """The 256k tier used to be refused by its own default, over the slack it always needs.
+
+        An arena is the rung plus a generation budget plus tokenizer headroom, so
+        comparing the *arena* against a guard set to the tier's ceiling refused
+        262144 for wanting 262784. ``--max-context`` is about the prompt.
+        """
+        from tq_longbench.prepare_buckets import TIERS
+        from tq_longbench.run_longbench import CONTEXT_HEADROOM_TOKENS, _largest_budget, guard_arena
+
+        args = self._args()
+        tier = TIERS["256k"]
+        arena = tier.max_tokens + _largest_budget(args, ("longbench_v2",)) + CONTEXT_HEADROOM_TOKENS
+        self.assertGreater(arena, tier.max_tokens)
+        guard_arena(args, tier.max_tokens, arena)
+
+    def test_the_default_guard_tracks_the_tier_table(self):
+        """Typed as a literal, the two could drift apart and refuse the tier it admits."""
+        from tq_longbench.prepare_buckets import TIERS
+        from tq_longbench.run_longbench import DEFAULT_MAX_CONTEXT
+
+        self.assertEqual(DEFAULT_MAX_CONTEXT, TIERS["256k"].max_tokens)
+        self.assertLess(DEFAULT_MAX_CONTEXT, TIERS["1m"].max_tokens)
 
     def test_the_guard_lifts_when_it_is_lifted_deliberately(self):
         from tq_longbench.run_longbench import guard_arena

@@ -95,27 +95,8 @@ from tq_longbench.tasks import DEFAULT_DATASET_DIR, longbench_config  # noqa: E4
 #: Where the tiered corpora are written, relative to the repository root.
 DEFAULT_OUT_DIR = "datasets/tiered"
 
-#: The prompt LongBench-v2 items are rendered with. v2 ships no
-#: ``dataset2prompt.json``; this is its paper's instruction, with the four
-#: choices laid out one per line and the model asked for the letter alone --
-#: which is what :func:`~tq_longbench.metrics.multiple_choice_score` reads.
-LONGBENCH_V2_PROMPT = (
-    "Please read the following text and answer the question below.\n\n"
-    "<text>\n{context}\n</text>\n\n"
-    "{input}\n\n"
-    'Format your response as follows: "The correct answer is (insert answer here)".'
-)
-
-#: InfiniteBench's long-book QA, rendered the way its own harness does: the book,
-#: then the question, then a demand for brevity.
-INFINITEBENCH_QA_PROMPT = (
-    "Read the book below and answer a question.\n\n{context}\n\nQuestion: {input}\n\nBe very concise. Answer:"
-)
-
-#: Generation budgets for the two corpora that have none of their own. v2 wants a
-#: letter and is given room for the sentence around it; InfiniteBench's long-book
-#: QA references are phrases.
-EXTRA_MAX_NEW_TOKENS = {"longbench_v2": 128, "infinitebench_qa": 64}
+#: What a task whose budget nobody wrote down is given.
+DEFAULT_MAX_NEW_TOKENS = 64
 
 #: Tasks whose references are verbatim spans of the context, and so are the ones
 #: :func:`answer_survives` can meaningfully check. Summarisation references are
@@ -318,9 +299,7 @@ def _metric_name(task: str) -> str:
 def _budget(task: str, dataset_dir: Path | None = None) -> int:
     """The task's generation budget: the suite's where it has one, ours otherwise."""
     _, budgets = longbench_config(dataset_dir)
-    if task in budgets:
-        return int(budgets[task])
-    return EXTRA_MAX_NEW_TOKENS.get(task, 64)
+    return int(budgets.get(task, DEFAULT_MAX_NEW_TOKENS))
 
 
 # ------------------------------------------------------------------ reading
@@ -392,14 +371,15 @@ def ensure_sources(tasks: Iterable[str], local_dir: Path, download: bool) -> tup
 
 
 def render_prompt(task: str, row: SourceRow, prompts: dict) -> str:
-    """The item's full prompt text, through whichever template the task owns."""
-    if task == "longbench_v2":
-        template = LONGBENCH_V2_PROMPT
-    elif task == "infinitebench_qa":
-        template = INFINITEBENCH_QA_PROMPT
-    else:
-        template = prompts[task]
-    return template.format(context=row.context, input=row.input)
+    """The item's full prompt text, through the template the task owns.
+
+    ``prompts`` is :func:`~tq_longbench.tasks.longbench_config`'s first return,
+    which carries the non-v1 corpora too. Deliberately that one table and not a
+    private copy: the length measured here is only the length the runner will
+    see if both render the item the same way, and a second copy of a template is
+    a second thing to drift.
+    """
+    return prompts[task].format(context=row.context, input=row.input)
 
 
 def plausible_length(text: str, tier: Tier) -> bool:
