@@ -17,6 +17,8 @@
 """Per-layer quantisation loss on a real checkpoint: which layers the 4-bit cache hurts.
 
     python tools/tq_longbench/diagnose.py --model-path F:/AI/Qwen2.5-3B-Instruct --context 8192
+    python tools/tq_longbench/diagnose.py --model-path /models/glm-4-9b-chat-1m --device npu:0 \
+        --backend turboquant_cube --context 8192
 
 When a long-context answer degrades, the first question is whether the decode is
 wrong or the cache is simply lossy, and an end-to-end score cannot tell the two
@@ -40,6 +42,15 @@ baseline a regression would show against:
 Layer 0 is the expected one: its attention is dominated by the sink token, whose
 key and value are far outside the distribution the per-vector RMS scale is
 chosen for, so 4 bits cost the most there.
+
+The quantised side of the comparison is ``--backend`` -- the Cube decode where
+there is an NPU to run it, its torch reference where there is not -- and the
+dense side is the ``dense_staging`` prefill pool.  Which backend that pool runs
+through is not assumed on a device: :func:`negotiate_dense_staging` probes one
+synthetic layer before any weight loads, because an Ascend 950 refuses
+op-plugin's fused attention outright (``EZ9903``) and stages through
+``cann_dense`` instead.  Without it a 950 run reads as a device error forty
+layers into a prefill rather than as a named refusal.
 """
 
 from __future__ import annotations
@@ -61,8 +72,27 @@ import argparse  # noqa: E402  (after the path bootstrap above)
 
 import torch  # noqa: E402
 
-from tq_longbench.engine import RunnerConfig, StandaloneModelRunner  # noqa: E402
+from tq_longbench.engine import (  # noqa: E402
+    RunnerConfig,
+    StandaloneModelRunner,
+    read_checkpoint_shape,
+)
+from tq_longbench.families import family_for  # noqa: E402
+from tq_longbench.glm4 import read_config  # noqa: E402
 from tq_longbench.layers import ForwardBatch  # noqa: E402
+from tq_longbench.ops import (  # noqa: E402
+    DENSE_ATTENTION_APIS,
+    DENSE_BACKENDS,
+    LayerShape,
+    reference_equivalent,
+)
+from tq_longbench.preflight import select_dense_backend  # noqa: E402
+from tq_longbench.smoke_glm import (  # noqa: E402
+    encode,
+    load_tokenizer,
+    quantised_backends,
+    resolve_device,
+)
 from tq_longbench.tasks import needle_in_a_haystack  # noqa: E402
 
 _DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
@@ -80,19 +110,128 @@ def cosine(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return float(torch.dot(left, right) / (left.norm() * right.norm()))
 
 
+def default_device() -> str:
+    """The best accelerator present, preferring the one the kernels are written for.
+
+    ``torch_npu`` has to be imported before ``torch.npu`` exists, which is why
+    the probe is an import rather than a ``hasattr``: on an Ascend host that has
+    not imported it yet ``hasattr(torch, "npu")`` is False and the NPU goes
+    unnoticed. Where it is not installed the ``ImportError`` is the answer, so a
+    developer host reads ``cpu`` here and nothing below asks it for a device.
+    """
+    try:
+        import torch_npu  # noqa: F401  (registers torch.npu)
+
+        if torch.npu.is_available():
+            return "npu:0"
+    except (ImportError, AttributeError):
+        pass
+    return "cuda:0" if torch.cuda.is_available() else "cpu"
+
+
+def default_backend(device: str) -> str:
+    """The Cube decode where there is an NPU to run it, its torch reference where there is not."""
+    return "turboquant_cube" if device.startswith("npu") else reference_equivalent("turboquant_cube")
+
+
 def build_parser() -> argparse.ArgumentParser:
+    device = default_device()
     parser = argparse.ArgumentParser(
         prog="python tools/tq_longbench/diagnose.py",
         description="Per-layer cosine between the quantised and unquantised decode, on real weights.",
     )
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--context", type=int, default=8192, help="approximate prompt tokens")
-    parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", default=device, help="npu, npu:N, cuda:N or cpu (default: the best one present)")
+    parser.add_argument(
+        "--backend",
+        default=default_backend(device),
+        choices=quantised_backends(),
+        help="the quantised decode under test; the dense side is always the dense_staging pool "
+        "(default: the Cube decode on an NPU, its torch reference elsewhere)",
+    )
     parser.add_argument("--dtype", default="float16", choices=sorted(_DTYPES))
     parser.add_argument("--chunk-size", type=int, default=2048)
     parser.add_argument("--block-size", type=int, default=128)
     parser.add_argument("--attn-output-gate", action="store_true")
+    parser.add_argument(
+        "--fold-output-rotation",
+        action="store_true",
+        help="fold Pi into o_proj at ingestion, so the decode returns its output in the rotated basis",
+    )
+    parser.add_argument(
+        "--dense-staging-backend",
+        default=None,
+        choices=sorted(DENSE_BACKENDS),
+        help="pin the unquantised prefill pool rather than letting the pre-flight negotiate it",
+    )
+    parser.add_argument(
+        "--dense-attention-api",
+        default=None,
+        choices=sorted(DENSE_ATTENTION_APIS),
+        help="pin native_v5's torch_npu entry point rather than letting the pre-flight negotiate it",
+    )
+    parser.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="skip the synthetic one-layer probe of the unquantised prefill path",
+    )
     return parser
+
+
+def prompt_tokens(model_path: str, prompt: str) -> torch.Tensor:
+    """``prompt`` through the checkpoint's own tokenizer, GLM-4's remote-code one included.
+
+    GLM-4's tokenizer is remote code, which a plain ``from_pretrained`` refuses,
+    and on ``transformers`` 4.28 it needs the special tokens registering that
+    :func:`~tq_longbench.smoke_glm.load_tokenizer` registers. The fallback is for
+    a checkpoint that loader has no answer for: the same ``AutoTokenizer`` call,
+    with the trust those configs ask for.
+
+    ``use_chat_template=False`` keeps the bare document this script has always
+    measured -- the numbers in the module docstring are that prompt's, and turn
+    markers would move every token id underneath them.
+    """
+    family = family_for(read_config(model_path))
+    try:
+        tokenizer = load_tokenizer(model_path, family)
+    except Exception as error:
+        print(f"  {family.name} tokenizer loader failed ({error}); falling back to AutoTokenizer", file=sys.stderr)
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    return encode(tokenizer, prompt, use_chat_template=False, family=family)
+
+
+def negotiate_dense_staging(args, device: torch.device) -> tuple[str | None, str | None]:
+    """Which unquantised backend and entry point the dense_staging prefill runs through here.
+
+    Probed on one synthetic layer at the checkpoint's own head counts, before a
+    weight loads, and only on an NPU: elsewhere there is a single candidate
+    (``dense_reference``) and nothing to negotiate. A pinned ``--dense-*`` flag is
+    the answer and is not second-guessed, and a pre-flight that finds no path is
+    not fatal -- the runner still has its own default, and the error it raises
+    then is the one worth reading.
+    """
+    pinned = args.dense_staging_backend is not None or args.dense_attention_api is not None
+    if device.type != "npu" or args.skip_preflight or pinned:
+        return args.dense_staging_backend, args.dense_attention_api
+
+    shape = read_checkpoint_shape(args.model_path, args.attn_output_gate)
+    selection = select_dense_backend(
+        device,
+        LayerShape(shape.num_heads, shape.num_kv_heads, shape.head_size, shape.scale),
+        _DTYPES[args.dtype],
+        args.block_size,
+        role="prefill",
+        output_rotation_folded=args.fold_output_rotation,
+    )
+    if not selection.passed:
+        for result in selection.results:
+            print(f"  {result.describe()}", file=sys.stderr)
+        print("  no unquantised prefill path passed the pre-flight; leaving the choice to the runner", file=sys.stderr)
+        return None, args.dense_attention_api
+    return selection.backend, selection.api
 
 
 @torch.inference_mode()
@@ -106,8 +245,8 @@ def layer_profile(runner: StandaloneModelRunner, token_ids: torch.Tensor) -> dic
     dense, quantised = runner.prefill_backend, runner.decode_backend
     if dense is quantised:
         raise ValueError(
-            "the diagnostic needs two backends to compare. Run with --prefill-mode dense_staging and a "
-            "quantised --backend, which is what this script's RunnerConfig asks for."
+            f"the diagnostic needs two backends to compare, and --backend {runner.config.backend} decodes out "
+            "of the same pool the dense_staging prefill filled. Choose a quantised --backend."
         )
 
     from tq_longbench.engine import RunMetrics
@@ -142,31 +281,35 @@ def layer_profile(runner: StandaloneModelRunner, token_ids: torch.Tensor) -> dic
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    device = resolve_device(args.device)
 
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     item = needle_in_a_haystack(args.context, depth=0.0, seed=0)
-    token_ids = tokenizer(item.prompt, return_tensors="pt").input_ids[0].to(torch.int64)
+    token_ids = prompt_tokens(args.model_path, item.prompt)
+
+    dense_staging_backend, dense_attention_api = negotiate_dense_staging(args, device)
 
     runner = StandaloneModelRunner(
         RunnerConfig(
             model_path=args.model_path,
-            backend="turboquant_reference",
+            backend=args.backend,
             prefill_mode="dense_staging",
             max_seq_len=token_ids.numel() + 64,
             chunk_size=args.chunk_size,
             block_size=args.block_size,
             dtype=_DTYPES[args.dtype],
-            device=args.device,
+            device=str(device),
             attn_output_gate=args.attn_output_gate,
+            fold_output_rotation=args.fold_output_rotation,
+            dense_staging_backend=dense_staging_backend,
+            dense_attention_api=dense_attention_api,
         )
     )
     print(
         f"{args.model_path}: {runner.shape.num_layers} layers, {runner.shape.num_heads} heads / "
         f"{runner.shape.num_kv_heads} kv, head_size {runner.shape.head_size}"
     )
-    print(f"prefill {token_ids.numel()} tokens on {args.device}, then one decode step\n")
+    print(f"dense {runner.prefill_backend.name} against quantised {runner.decode_backend.name}")
+    print(f"prefill {token_ids.numel()} tokens on {device}, then one decode step\n")
 
     profile = layer_profile(runner, token_ids.to(runner.device))
     for index in sorted(profile):
