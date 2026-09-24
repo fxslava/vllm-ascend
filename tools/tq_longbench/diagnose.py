@@ -462,7 +462,12 @@ def _encoded(tokenizer, text: str, add_special_tokens: bool = True) -> torch.Ten
         encoded = tokenizer(text, add_special_tokens=add_special_tokens, return_tensors="pt")
     except Exception:
         return None
-    return encoded["input_ids"][0].to(torch.int64)
+    # transformers' BatchEncoding answers to both; a mapping only to the
+    # subscript, and a tokenizer standing in for one only to the attribute.
+    ids = getattr(encoded, "input_ids", None)
+    if ids is None:
+        ids = encoded["input_ids"]
+    return ids[0].to(torch.int64)
 
 
 def target_token(tokenizer, item) -> int | None:

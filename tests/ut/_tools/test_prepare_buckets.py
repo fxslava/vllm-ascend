@@ -35,8 +35,10 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT / "tools") not in sys.path:
@@ -44,11 +46,15 @@ if str(REPO_ROOT / "tools") not in sys.path:
 
 from tq_longbench.metrics import multiple_choice_score, score_prediction  # noqa: E402
 from tq_longbench.prepare_buckets import (  # noqa: E402
+    SOURCES,
     TIERS,
     SourceRow,
     Tier,
     TierReport,
     answer_survives,
+    apply_floor,
+    download_source,
+    json_safe,
     parse_tiers,
     partition,
     plausible_length,
@@ -94,6 +100,25 @@ class TierBandTest(unittest.TestCase):
         self.assertFalse(tier.admits(8191))
         self.assertFalse(tier.admits(32769))
 
+    def test_parse_tiers_all_is_every_tier(self):
+        self.assertEqual(parse_tiers("all"), tuple(TIERS))
+        self.assertEqual(parse_tiers(" ALL "), tuple(TIERS))
+
+    def test_the_floor_moves_and_the_ceiling_does_not(self):
+        """``--min-tokens``: a tier is its ceiling, so only the floor is negotiable."""
+        moved = apply_floor([TIERS["32k"], TIERS["256k"]], 0)
+        self.assertEqual([tier.min_tokens for tier in moved], [0, 0])
+        self.assertEqual([tier.max_tokens for tier in moved], [TIERS["32k"].max_tokens, TIERS["256k"].max_tokens])
+        self.assertEqual([tier.name for tier in moved], ["32k", "256k"])
+
+    def test_the_floor_is_left_alone_when_nothing_asked(self):
+        self.assertEqual(apply_floor([TIERS["32k"]], None)[0], TIERS["32k"])
+
+    def test_a_floor_cannot_be_raised_past_the_ceiling_or_below_zero(self):
+        self.assertEqual(apply_floor([TIERS["32k"]], 10**9)[0].min_tokens, TIERS["32k"].max_tokens)
+        with self.assertRaises(ValueError):
+            apply_floor([TIERS["32k"]], -1)
+
     def test_parse_tiers_refuses_an_unknown_name(self):
         self.assertEqual(parse_tiers("32k,1m"), ("32k", "1m"))
         with self.assertRaises(ValueError):
@@ -109,12 +134,25 @@ class PlausibleLengthTest(unittest.TestCase):
         self.assertFalse(plausible_length("word " * 100, TIERS["1m"]))
 
     def test_it_skips_what_cannot_fit_the_ceiling(self):
-        # Twelve characters per token is the most generous the band allows, so
+        # Sixteen characters per token is the most generous the band allows, so
         # anything past that many cannot tokenise down into the tier.
-        self.assertFalse(plausible_length("x" * (32768 * 12 + 1), TIERS["32k"]))
+        self.assertFalse(plausible_length("x" * (32768 * 16 + 1), TIERS["32k"]))
 
     def test_it_keeps_anything_that_could_land(self):
         self.assertTrue(plausible_length("x" * (16384 * 4), TIERS["32k"]))
+
+    def test_the_band_holds_a_dense_tokenizer(self):
+        """A CJK document encodes at well under a character per token, and is not English.
+
+        The old 0.5 floor was a statement about English that turned away items
+        which tokenise well inside the tier -- and an item skipped here is gone
+        before anything measures it, so the loss leaves no trace in the manifest.
+        """
+        self.assertTrue(plausible_length("\u6587" * (8192 // 2), TIERS["32k"]))
+
+    def test_the_band_holds_a_sparse_one(self):
+        """A repository encodes at well over twelve characters per token."""
+        self.assertTrue(plausible_length("x" * (32768 * 14), TIERS["32k"]))
 
     def test_the_filter_saves_the_encode(self):
         """The point of the filter is not to be right, it is to not tokenise a book."""
@@ -205,6 +243,12 @@ class LongBenchV2Test(unittest.TestCase):
                 self.assertNotIn(task, shipped["dataset2prompt"])
                 self.assertNotIn(task, shipped["dataset2maxlen"])
 
+    def test_an_answer_that_is_not_a_choice_leaves_the_row_unreferenced(self):
+        """A row partition then drops, rather than one no letter can ever score."""
+        for bad in ("E", "", "1", "the second one"):
+            self.assertEqual(read_v2_row({"context": "c", "question": "q", "answer": bad}).answers, [])
+        self.assertEqual(read_v2_row({"context": "c", "question": "q", "answer": " c "}).answers, ["C"])
+
     def test_the_metric_reads_a_letter_out_of_a_sentence(self):
         self.assertEqual(multiple_choice_score("The correct answer is (C).", ["C"]), 1.0)
         self.assertEqual(multiple_choice_score("C", ["C"]), 1.0)
@@ -288,6 +332,21 @@ class PartitionTest(unittest.TestCase):
         self.assertEqual(manifest["rejected"]["outside the band (measured)"], 1)
         self.assertEqual(manifest["tasks"]["qasper"]["metric"], "qa_f1_score")
 
+    def test_the_generative_tasks_are_never_judged_on_their_references(self):
+        """gov_report's reference is written, not extracted; requiring it would empty the tier."""
+        rows = [_row(words=60, answer="a summary nobody copied out of the report")]
+        _write_v1_corpus(self.root / "raw", "gov_report", rows)
+        # Banded on gov_report's own template, which is not qasper's: a row is
+        # measured through the wrapper the task owns.
+        wrapper = word_measure(
+            render_prompt("gov_report", SourceRow(context="", input="what?", answers=[]), longbench_config()[0])
+        )
+        tier = Tier(name="test", min_tokens=wrapper + 50, max_tokens=wrapper + 100, sources=("gov_report",), why="test")
+        for require in (False, True):
+            out = self.root / f"out{int(require)}"
+            report = partition(tier, self.root / "raw", out, word_measure, None, require, ["gov_report"])
+            self.assertEqual(report.kept, 1, f"require_answer={require} dropped a generative item")
+
     def test_require_answer_drops_an_unanswerable_item(self):
         rows = [_row(words=60, answer="not in the text at all")]
         _write_v1_corpus(self.root / "raw", "qasper", rows)
@@ -368,6 +427,133 @@ class SummariseTest(unittest.TestCase):
         report.record("qasper", 9000)
         report.reject("outside the band (measured)")
         self.assertIn("1 outside the band (measured)", summarise([report], Path("out")))
+
+
+class _Numpyish:
+    """Stands in for a numpy scalar: not JSON, but it knows how to become one."""
+
+    def __init__(self, value):
+        self._value = value
+
+    def item(self):
+        return self._value
+
+
+class JsonSafeTest(unittest.TestCase):
+    """What ``datasets`` hands back is not always what ``json.dumps`` takes."""
+
+    def test_a_scalar_that_is_not_a_python_number(self):
+        self.assertEqual(json_safe(_Numpyish(3)), 3)
+
+    def test_bytes_become_text(self):
+        self.assertEqual(json_safe(b"hello"), "hello")
+        self.assertEqual(json_safe(b"\xff"), "\ufffd")
+
+    def test_it_reaches_inside_containers(self):
+        value = {"a": [_Numpyish(1), {"b": b"x"}], "c": (2, None, True)}
+        self.assertEqual(json_safe(value), {"a": [1, {"b": "x"}], "c": [2, None, True]})
+
+    def test_anything_else_is_its_own_text_rather_than_a_failed_download(self):
+        class Opaque:
+            def __str__(self):
+                return "opaque"
+
+        self.assertEqual(json_safe(Opaque()), "opaque")
+
+    def test_even_a_value_whose_str_raises(self):
+        class Hostile:
+            def __str__(self):
+                raise RuntimeError("no")
+
+        self.assertEqual(json_safe(Hostile()), "<unrepresentable Hostile>")
+
+    def test_the_result_encodes(self):
+        json.dumps(json_safe({"a": _Numpyish(1.5), "b": b"x"}))
+
+
+class DownloadSourceTest(unittest.TestCase):
+    """The cache file a download leaves behind, and the one it must not."""
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self._temporary.name)
+        self.addCleanup(self._temporary.cleanup)
+        self.calls = []
+
+    def _datasets(self, rows, stream_error=None):
+        """A stand-in ``datasets`` module recording how it was called."""
+
+        def load_dataset(repo, config=None, split=None, streaming=False):
+            self.calls.append({"repo": repo, "config": config, "split": split, "streaming": streaming})
+            if streaming and stream_error is not None:
+                raise stream_error
+            return rows() if callable(rows) else rows
+
+        module = types.ModuleType("datasets")
+        module.load_dataset = load_dataset
+        return mock.patch.dict(sys.modules, {"datasets": module})
+
+    def test_it_writes_the_rows_and_leaves_no_partial_file(self):
+        with self._datasets([{"context": "c", "answers": ["a"]}, {"context": "d", "answers": ["b"]}]):
+            path = download_source("qasper", self.root)
+        self.assertEqual([row["context"] for row in _read_jsonl(path)], ["c", "d"])
+        self.assertEqual(list(self.root.glob("*.tmp")), [])
+
+    def test_it_streams_first(self):
+        with self._datasets([{"context": "c", "answers": ["a"]}]):
+            download_source("qasper", self.root)
+        self.assertTrue(self.calls[0]["streaming"])
+
+    def test_a_repository_that_cannot_stream_is_still_downloaded(self):
+        rows = [{"context": "c", "answers": ["a"]}]
+        with self._datasets(rows, stream_error=ValueError("no streaming here")):
+            path = download_source("qasper", self.root)
+        self.assertEqual(len(_read_jsonl(path)), 1)
+        self.assertEqual([call["streaming"] for call in self.calls], [True, False])
+
+    def test_an_interrupted_download_leaves_no_cache_to_be_mistaken_for_one(self):
+        """The bug this replaced: a truncated JSONL that every later run reads as the corpus."""
+
+        def rows():
+            yield {"context": "c", "answers": ["a"]}
+            raise RuntimeError("the network went away")
+
+        with self._datasets(rows), self.assertRaises(RuntimeError):
+            download_source("qasper", self.root)
+        self.assertFalse((self.root / "qasper.jsonl").exists())
+        self.assertEqual(list(self.root.glob("*.tmp")), [])
+
+    def test_an_empty_split_is_refused_rather_than_cached(self):
+        with self._datasets([]), self.assertRaises(RuntimeError):
+            download_source("qasper", self.root)
+        self.assertFalse((self.root / "qasper.jsonl").exists())
+
+    def test_it_does_not_overwrite_a_good_cache_with_a_failed_download(self):
+        good = self.root / "qasper.jsonl"
+        good.parent.mkdir(parents=True, exist_ok=True)
+        good.write_text(json.dumps({"context": "kept", "answers": ["a"]}) + "\n", encoding="utf-8")
+
+        def rows():
+            yield {"context": "new", "answers": ["a"]}
+            raise RuntimeError("the network went away")
+
+        with self._datasets(rows), self.assertRaises(RuntimeError):
+            download_source("qasper", self.root)
+        self.assertEqual(_read_jsonl(good)[0]["context"], "kept")
+
+    def test_values_that_are_not_json_do_not_fail_the_download(self):
+        with self._datasets([{"context": "c", "length": _Numpyish(12), "blob": b"x"}]):
+            path = download_source("qasper", self.root)
+        self.assertEqual(_read_jsonl(path)[0], {"context": "c", "length": 12, "blob": "x"})
+
+    def test_infinitebench_is_a_config_with_a_test_split(self):
+        """The task is InfiniteBench's *config*; naming it as the split downloads nothing."""
+        source = SOURCES["infinitebench_qa"]
+        self.assertEqual((source.config, source.split), ("longbook_qa_eng", "test"))
+        with self._datasets([{"context": "c", "answer": "a"}]):
+            download_source("infinitebench_qa", self.root)
+        self.assertEqual(self.calls[0]["config"], "longbook_qa_eng")
+        self.assertEqual(self.calls[0]["split"], "test")
 
 
 def _row(words: int, marker: str = "filler", answer: str = "filler") -> dict:

@@ -37,6 +37,13 @@ Tier    Measured length        Corpus
 1M      500k <= L <= 1M        LongBench-v2's tail, InfiniteBench
 ======  =====================  ========================================
 
+``--tiers all`` builds every one of them. A floor is a property of the tier and
+not of the corpus, so ``--min-tokens 0`` lowers it: most of the published
+LongBench v1 suite is shorter than the 32k tier's 8192 tokens, and that floor is
+there to describe a tier drawn from v1's long tail rather than to say the rest of
+the suite is unusable. The ceiling never moves -- it is the arena the runner
+provisions and the rung it reports at.
+
 Three things this does that a length field in the source rows cannot:
 
 1. **The length is this checkpoint's.** ``L`` is measured by encoding the fully
@@ -46,9 +53,9 @@ Three things this does that a length field in the source rows cannot:
    raw context and disagrees with it by a factor that varies per task.
 2. **Nothing is clipped.** An item is admitted only if its whole rendered prompt
    lands inside the tier's ceiling, so the retained window contains the entire
-   document including whatever span the answer is in. ``--require-answer`` goes
-   further on the extractive tasks and checks the reference text actually occurs
-   in the context; see :func:`answer_survives`.
+   document including whatever span the answer is in. ``--require-answer`` opts
+   into going further on the extractive tasks and checking that the reference
+   text actually occurs in the context; see :func:`answer_survives`.
 3. **The ceiling is the prompt's, not the arena's.** The generation budget and
    the tokenizer headroom are the runner's problem and it adds them
    (``cache_size = tier_tokens + max_gen_tokens``); what is written here is a
@@ -87,7 +94,7 @@ import argparse  # noqa: E402  (after the path bootstrap above)
 import json  # noqa: E402
 import statistics  # noqa: E402
 from collections.abc import Callable, Iterable, Iterator, Sequence  # noqa: E402
-from dataclasses import dataclass, field  # noqa: E402
+from dataclasses import dataclass, field, replace  # noqa: E402
 
 from tq_longbench.metrics import TASK_METRICS, normalize_answer  # noqa: E402
 from tq_longbench.tasks import DEFAULT_DATASET_DIR, longbench_config  # noqa: E402
@@ -111,8 +118,14 @@ EXTRACTIVE_TASKS = frozenset(
 #: bound decides what is too short to reach the floor, the upper what is too long
 #: to fit the ceiling; both are deliberately loose, because a wrong skip is a
 #: silently missing item and a wrong keep only costs one encode.
-_MIN_CHARS_PER_TOKEN = 0.5
-_MAX_CHARS_PER_TOKEN = 12.0
+#:
+#: Widened from 0.5/12 after the band turned out to be about English: GLM-4 and
+#: Qwen encode Chinese at well under one character per token and a repository at
+#: well over ten, so both ends were dropping items that tokenise into the tier --
+#: which is the failure that leaves no trace, because the item is gone before
+#: anything measures it.
+_MIN_CHARS_PER_TOKEN = 0.2
+_MAX_CHARS_PER_TOKEN = 16.0
 
 
 @dataclass(frozen=True)
@@ -152,6 +165,11 @@ def read_v1_row(row: dict) -> SourceRow:
     )
 
 
+#: v2's four choices, which are also the only answers
+#: :func:`~tq_longbench.metrics.multiple_choice_score` scores against.
+V2_CHOICES = ("A", "B", "C", "D")
+
+
 def read_v2_row(row: dict) -> SourceRow:
     """A LongBench-v2 row: the four choices are folded into ``input``, the answer is a letter.
 
@@ -159,14 +177,23 @@ def read_v2_row(row: dict) -> SourceRow:
     ``answer`` is the letter. Laying the choices out inside ``input`` rather than
     inside the template is what lets the row be stored, and later read, in v1's
     shape -- the loader formats ``{context}`` and ``{input}`` and knows nothing
-    about choices.
+    about choices. The wording either side of them is v2's own, and the closing
+    instruction lives in the template
+    (:data:`~tq_longbench.tasks.EXTRA_PROMPTS`), which is what the metric reads
+    back.
+
+    An ``answer`` that is not one of :data:`V2_CHOICES` yields no answers at all,
+    so :func:`partition` drops the row as unreferenced rather than writing an
+    item whose reference no letter can match. Taking the first character of
+    whatever the column held would have scored every such row zero and called it
+    a model failure.
     """
-    choices = "\n".join(f"({letter}) {row.get('choice_' + letter, '')}" for letter in ("A", "B", "C", "D"))
+    choices = "\n".join(f"({letter}) {row.get('choice_' + letter, '')}" for letter in V2_CHOICES)
     answer = str(row.get("answer", "")).strip().upper()[:1]
     return SourceRow(
         context=str(row.get("context", "")),
         input=f"What is the correct answer to this question: {row.get('question', '')}\nChoices:\n{choices}",
-        answers=[answer] if answer else [],
+        answers=[answer] if answer in V2_CHOICES else [],
     )
 
 
@@ -189,8 +216,12 @@ SOURCES = {
     "infinitebench_qa": Source(
         task="infinitebench_qa",
         repo="xinrongzhang2022/InfiniteBench",
-        config=None,
-        split="longbook_qa_eng",
+        # InfiniteBench publishes each of its tasks as a *config*, every one of
+        # which has a single ``test`` split. Naming the task as the split is the
+        # shape the other two sources have and it is not this one's: it raises
+        # rather than downloading the wrong thing, but only at --download time.
+        config="longbook_qa_eng",
+        split="test",
         reader=read_infinitebench_row,
     ),
 }
@@ -326,6 +357,39 @@ def iter_source_rows(task: str, local_dir: Path) -> Iterator[dict]:
                 yield json.loads(line)
 
 
+def json_safe(value):
+    """A ``datasets`` value as something ``json.dumps`` will encode.
+
+    ``load_dataset`` hands back numpy scalars for numeric columns and ``bytes``
+    for binary ones, neither of which the encoder accepts -- and the way that
+    fails is a ``TypeError`` raised partway through writing a multi-gigabyte
+    corpus, leaving a half-written file behind that looks like a cache. Anything
+    with no better representation becomes its ``str``, because a field this
+    harness does not read is not worth failing a download over.
+    """
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    for attribute in ("tolist", "item"):
+        reader = getattr(value, attribute, None)
+        if callable(reader):
+            try:
+                return json_safe(reader())
+            except Exception:
+                break
+    try:
+        return str(value)
+    except Exception:
+        # A value whose own __str__ raises is still not worth losing a corpus
+        # over; the type name says enough about a field nothing here reads.
+        return f"<unrepresentable {type(value).__name__}>"
+
+
 def download_source(task: str, local_dir: Path) -> Path:
     """Fetch one corpus through ``datasets`` and cache it as JSONL under ``local_dir``.
 
@@ -334,16 +398,47 @@ def download_source(task: str, local_dir: Path) -> Path:
     copied to -- needs nothing but this file. ``datasets`` is imported here and
     nowhere else in the harness, which is what keeps it off the dependency list
     for anyone who already has the corpus.
+
+    Two things this does that the obvious four lines do not:
+
+    * **Streams first.** A non-streaming ``load_dataset`` builds an Arrow table,
+      and both LongBench repositories carry columns whose types do not unify
+      across their per-task files -- ``all_classes`` is a list on some tasks and
+      null on others -- so the build raises before a row is seen. The streaming
+      reader hands back the row dicts and never forms the schema. A repository
+      that refuses to stream is loaded the old way, which is worth one line to
+      keep working.
+    * **Writes somewhere else first.** The download is minutes to hours, and an
+      interrupted one used to leave a truncated ``{task}.jsonl`` that every later
+      run treats as the corpus -- silently partial, which is the worst kind of
+      wrong for a benchmark. The rows go to ``{task}.jsonl.tmp`` and are renamed
+      over the real name only once the last one is written; ``Path.replace`` is
+      atomic within a directory.
     """
     source = SOURCES[task]
     from datasets import load_dataset
 
-    rows = load_dataset(source.repo, source.config, split=source.split)
+    coordinates = (source.repo, source.config, source.split)
+    try:
+        rows = load_dataset(source.repo, source.config, split=source.split, streaming=True)
+    except Exception as error:  # a repository that cannot stream is still worth having
+        print(f"  {coordinates}: streaming refused ({error}); loading it whole", file=sys.stderr)
+        rows = load_dataset(source.repo, source.config, split=source.split)
+
     path = Path(local_dir) / f"{task}.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(dict(row), ensure_ascii=False) + "\n")
+    partial = path.with_name(path.name + ".tmp")
+    written = 0
+    try:
+        with partial.open("w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(json_safe(dict(row)), ensure_ascii=False) + "\n")
+                written += 1
+        if not written:
+            raise RuntimeError(f"{coordinates} yielded no rows; nothing was written to {path}")
+        partial.replace(path)
+    finally:
+        partial.unlink(missing_ok=True)
     return path
 
 
@@ -392,7 +487,9 @@ def plausible_length(text: str, tier: Tier) -> bool:
     the least generous, cannot land in the tier and is never encoded.
 
     Loose on purpose, in the direction that costs an encode rather than the one
-    that loses an item.
+    that loses an item: see :data:`_MIN_CHARS_PER_TOKEN`. A tier whose floor is
+    zero -- ``--min-tokens 0`` -- has no lower bound to check, and every row
+    reaches the tokenizer.
     """
     characters = len(text)
     if characters < tier.min_tokens * _MIN_CHARS_PER_TOKEN:
@@ -411,7 +508,14 @@ def answer_survives(task: str, row: SourceRow) -> bool:
 
     Only the extractive tasks are judged (:data:`EXTRACTIVE_TASKS`); everything
     else passes, because a summarisation reference or a choice letter appearing
-    verbatim in the context would mean nothing either way.
+    verbatim in the context would mean nothing either way. ``gov_report``,
+    ``qmsum``, ``lcc`` and the other generative tasks are therefore never
+    dropped by this, whether or not ``--require-answer`` is given.
+
+    The check itself is opt-in (``--require-answer``). It is a substring test
+    over normalised text, and on a real corpus it turns away items that are
+    answerable from a paraphrase -- which is a judgement about the dataset, not
+    about the harness, and not one to make on anybody's behalf by default.
     """
     if task not in EXTRACTIVE_TASKS or not row.answers:
         return True
@@ -529,11 +633,30 @@ def build_measure(model_path: str, raw_prompt: bool) -> Callable[[str], int]:
 
 
 def parse_tiers(text: str) -> tuple:
+    """``all`` for every tier, otherwise the named ones, in the order given."""
+    if text.strip().lower() == "all":
+        return tuple(TIERS)
     names = tuple(part.strip().lower() for part in text.split(",") if part.strip())
     unknown = [name for name in names if name not in TIERS]
     if not names or unknown:
-        raise ValueError(f"--tiers: no such tier {unknown or 'nothing given'}; known {sorted(TIERS)}")
+        raise ValueError(f"--tiers: no such tier {unknown or 'nothing given'}; known {sorted(TIERS)} or 'all'")
     return names
+
+
+def apply_floor(tiers: Sequence[Tier], min_tokens: int | None) -> list:
+    """``--min-tokens``: the same tiers with their floors moved, or left alone.
+
+    The ceiling is what a tier *is* -- it is the arena the runner provisions and
+    the rung it reports at -- so only the floor moves. Moving it to 0 is what
+    keeps LongBench v1's own items: most of the published suite is well under
+    the 32k tier's 8192-token floor, and that floor exists to describe a tier
+    drawn from v1's long tail rather than to say the short items are unusable.
+    """
+    if min_tokens is None:
+        return list(tiers)
+    if min_tokens < 0:
+        raise ValueError(f"--min-tokens cannot be negative, got {min_tokens}")
+    return [replace(tier, min_tokens=min(min_tokens, tier.max_tokens)) for tier in tiers]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -554,7 +677,19 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"directory of raw {{task}}.jsonl corpora (default: {DEFAULT_DATASET_DIR})",
     )
     parser.add_argument("--out-dir", type=Path, default=Path(DEFAULT_OUT_DIR), help=f"default: {DEFAULT_OUT_DIR}")
-    parser.add_argument("--tiers", default=",".join(TIERS), help=f"comma-separated; known {sorted(TIERS)}")
+    parser.add_argument(
+        "--tiers",
+        default=",".join(TIERS),
+        help=f"comma-separated, or 'all'; known {sorted(TIERS)}",
+    )
+    parser.add_argument(
+        "--min-tokens",
+        type=int,
+        default=None,
+        help="override every selected tier's floor (the ceiling is what a tier is, and does not move). "
+        "--min-tokens 0 keeps LongBench v1's own items, most of which are shorter than the 32k tier's "
+        "8192-token floor",
+    )
     parser.add_argument(
         "--download",
         action="store_true",
@@ -562,9 +697,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--limit", type=int, default=None, help="cap the items kept per task per tier")
     parser.add_argument(
+        "--require-answer",
+        action="store_true",
+        help="drop an extractive item whose reference does not occur verbatim in its context. Off by "
+        "default: the check is a substring test that also turns away items answerable from a paraphrase, "
+        "and it never judged the generative tasks (gov_report, qmsum, lcc) at all",
+    )
+    parser.add_argument(
         "--no-require-answer",
         action="store_true",
-        help="keep extractive items whose reference does not occur in their context (they are dropped by default)",
+        help="accepted and ignored -- this is now the default; pass --require-answer for the old behaviour",
     )
     parser.add_argument("--raw-prompt", action="store_true", help="measure without the chat template")
     parser.add_argument(
@@ -577,7 +719,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list | None = None) -> int:
     args = build_parser().parse_args(argv)
-    tiers = [TIERS[name] for name in parse_tiers(args.tiers)]
+    tiers = apply_floor([TIERS[name] for name in parse_tiers(args.tiers)], args.min_tokens)
     wanted = sorted({task for tier in tiers for task in tier.sources})
 
     present, missing = ensure_sources(wanted, args.local_dir, args.download)
@@ -606,7 +748,7 @@ def main(argv: list | None = None) -> int:
                 args.out_dir,
                 measure,
                 args.limit,
-                not args.no_require_answer,
+                args.require_answer,
                 present,
             )
         )

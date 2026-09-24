@@ -127,6 +127,7 @@ from tq_longbench.smoke_glm import (  # noqa: E402
 
 quiet_tensorflow()
 
+from tq_longbench.diagnose import needle_slots, needle_span, target_token  # noqa: E402
 from tq_longbench.engine import (  # noqa: E402
     DECODE_GRAPH_MODES,
     DEFAULT_CHUNK_SIZE,
@@ -134,6 +135,7 @@ from tq_longbench.engine import (  # noqa: E402
     RunMetrics,
     read_checkpoint_shape,
 )
+from tq_longbench.eval_ppl import sequence_perplexity  # noqa: E402
 from tq_longbench.families import ModelFamily, family_for  # noqa: E402
 from tq_longbench.glm4 import read_config  # noqa: E402
 from tq_longbench.kv_cache import CacheGeometry, dense_equivalent_bytes  # noqa: E402
@@ -207,6 +209,12 @@ FIDELITY_REFERENCE_BACKEND = PROBE_REFERENCE_BACKEND
 #: task and the tiered corpora carry their own; this is the floor under both.
 DEFAULT_BUDGET = 64
 
+#: A directory holding these is a directory of *tiers*, not of tasks --
+#: ``--dataset-dir datasets/tiered`` is one level too high and used to read as a
+#: corpus with no tasks in it, which came out the other end as a full sweep of
+#: synthetic stubs. See :func:`refuse_a_tier_parent`.
+_TIER_MARKER = "manifest.json"
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -266,6 +274,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="per-bucket generation budgets: a bare number for every task, or comma-separated task=N pairs "
         "(gov_report=1024,qasper=256). Beats --max-new-tokens and the task's own budget.",
+    )
+    parser.add_argument(
+        "--eval-ppl",
+        action="store_true",
+        help="also measure each item's perplexity: the model's cross-entropy over the prompt it was "
+        "given, chunk-wise through the prefill path (see tq_longbench/eval_ppl.py for which pool that "
+        "reads, which is the whole meaning of the number)",
+    )
+    parser.add_argument(
+        "--ppl-chunk-size",
+        type=int,
+        default=None,
+        help="tokens per --eval-ppl forward (default: --chunk-size, and capped by it). Lower it where "
+        "a [chunk, vocab] logits block is what does not fit",
     )
     parser.add_argument(
         "--eval-fidelity",
@@ -393,6 +415,40 @@ def tier_tasks(directory: Path) -> tuple[str, ...]:
     return tuple(sorted(path.stem for path in directory.glob("*.jsonl")))
 
 
+def refuse_a_tier_parent(directory: Path) -> None:
+    """Refuse ``--dataset-dir datasets/tiered``, which is the tier *parent*.
+
+    It holds ``32k/``, ``256k/`` and ``1m/``, not ``{task}.jsonl``, so every task
+    missed its file, fell back to :func:`synthetic_items` and produced a sweep of
+    stub scores -- a table full of numbers, none of them about the model. Naming
+    the tiers that are actually there turns that into one line at the start.
+    """
+    if not directory.is_dir() or any(directory.glob("*.jsonl")):
+        return
+    tiers = sorted(
+        child.name
+        for child in directory.iterdir()
+        if child.is_dir() and (child.name in TIERS or (child / _TIER_MARKER).is_file())
+    )
+    if not tiers:
+        return
+    raise SystemExit(
+        f"--dataset-dir {directory} holds tiers ({', '.join(tiers)}), not task JSONL. Point it at one of "
+        f"them -- --dataset-dir {directory / tiers[0]} -- or name the tier: --context-tier {tiers[0]} "
+        f"--tiered-dir {directory}"
+    )
+
+
+def dataset_tasks(directory: Path) -> tuple[str, ...]:
+    """The tasks a prepared directory holds and this harness can score.
+
+    :func:`tier_tasks` reads the manifest or the file names; this drops anything
+    with no metric, so a stray JSONL beside the corpus is ignored rather than
+    raising out of :func:`parse_tasks` with a name nobody typed.
+    """
+    return tuple(task for task in tier_tasks(directory) if task in TASK_METRICS)
+
+
 def apply_tier(args: argparse.Namespace) -> tuple[tuple[int, ...], tuple[str, ...]]:
     """``--context-tier``: the rung and the tasks it implies, or the ladder's own.
 
@@ -402,7 +458,17 @@ def apply_tier(args: argparse.Namespace) -> tuple[tuple[int, ...], tuple[str, ..
     """
     if args.context_tier is None:
         contexts = (args.max_context_len,) if args.max_context_len else parse_int_list(args.contexts, "contexts")
-        return contexts, parse_tasks(args.tasks or DEFAULT_TASKS)
+        if args.tasks:
+            return contexts, parse_tasks(args.tasks)
+        refuse_a_tier_parent(args.dataset_dir)
+        # A --dataset-dir the caller typed is a statement about what to run; the
+        # default one is not, and inferring from it would silently turn the
+        # four-task default into every task a full LongBench checkout holds.
+        if args.dataset_dir != Path(DEFAULT_DATASET_DIR):
+            held = dataset_tasks(args.dataset_dir)
+            if held:
+                return contexts, held
+        return contexts, parse_tasks(DEFAULT_TASKS)
 
     tier = TIERS[args.context_tier]
     directory = args.tiered_dir / tier.name
@@ -413,7 +479,7 @@ def apply_tier(args: argparse.Namespace) -> tuple[tuple[int, ...], tuple[str, ..
             f"--out-dir {args.tiered_dir} --tiers {tier.name}"
         )
     args.dataset_dir = directory
-    tasks = parse_tasks(args.tasks) if args.tasks else tier_tasks(directory)
+    tasks = parse_tasks(args.tasks) if args.tasks else dataset_tasks(directory)
     if not tasks:
         raise SystemExit(f"--context-tier {tier.name}: {directory} holds no task JSONL; re-run prepare_buckets.py")
     return (tier.max_tokens,), tasks
@@ -596,6 +662,18 @@ class TaskRung:
         return max((r[key] for r in self.records), default=0.0)
 
     @property
+    def perplexity(self) -> float | None:
+        """The median perplexity over the items, or ``None`` if none was measured.
+
+        The median rather than the worst, unlike :attr:`fidelity`: a cosine that
+        collapses on one item is a defect and has to be visible, while a
+        perplexity is a property of the text as much as of the model, and one
+        long item of source code says nothing about the rest.
+        """
+        measured = [r["ppl"] for r in self.records if r.get("ppl") is not None]
+        return statistics.median(measured) if measured else None
+
+    @property
     def fidelity(self) -> float | None:
         """The worst output-embedding cosine over the items, or ``None`` if none was measured.
 
@@ -682,8 +760,18 @@ def profile_item(args, runner, tokenizer, prompt_ids: torch.Tensor, item, plan) 
     The reference is prefilled and thrown away: only its per-layer hidden states
     are kept, which is what ``hidden_cosine`` needs and all it needs. Two prefills
     of a 64k prompt is what this costs, which is why it runs on one item a rung.
+
+    The needle slots are resolved against ``prompt_ids`` -- the ids that were
+    actually prefilled, after ``truncate_middle`` -- and not against the item's
+    text. That is what makes ``needle_mass`` right on a truncated item:
+    :func:`~tq_longbench.diagnose.needle_slots` compares the tokenizer's offset
+    mapping with the length in front of it, finds they disagree, and falls
+    through to the id search, which finds the needle wherever truncation moved
+    it. Where the answer is not in the prompt at all -- a summarisation task --
+    there are no slots and the column stays empty, which is the honest reading.
     """
-    target = _target_token(tokenizer, item)
+    target = target_token(tokenizer, item)
+    slots = needle_slots(tokenizer, item.prompt, prompt_ids, needle_span(item))
     # The reference only ever prefills, so it is sized for the prompt rather than
     # through ``cache_tokens`` -- which reads ``--max-new-tokens`` and is ``None``
     # whenever the budget came from the task or from ``--max-tokens-override``.
@@ -696,7 +784,7 @@ def profile_item(args, runner, tokenizer, prompt_ids: torch.Tensor, item, plan) 
     del reference_runner
     free_device(args.device)
 
-    with LayerProbe(runner, target_token=target, reference=hidden) as probe:
+    with LayerProbe(runner, needle_slots=slots, target_token=target, reference=hidden) as probe:
         runner.prefill(prompt_ids.to(runner.device), RunMetrics())
     return probe.report().describe(limit=12)
 
@@ -713,13 +801,13 @@ def summarise(rungs: list[TaskRung]) -> str:
     reports -- not the mean over items, which would weight a task by how many of
     them it happens to have.
     """
-    widths = (20, 11, 9, 7, 9, 12, 13, 10, 10, 10, 9)
+    widths = (20, 11, 9, 7, 9, 12, 13, 10, 10, 10, 9, 9)
     blocks = []
     for (backend, sinks, context), group in _grouped(rungs):
         header = (
             f"| {'Task':<20} | {'Metric':<11} | {'Score (%)':>9} | {'Samples':>7} | "
             f"{'TTFT (ms)':>9} | {'Dec p50 (us)':>12} | {'Peak HBM (MB)':>13} | "
-            f"{'KV (MB)':>10} | {'Dense (MB)':>10} | {'Saved (MB)':>10} | {'Fidelity':>9} |"
+            f"{'KV (MB)':>10} | {'Dense (MB)':>10} | {'Saved (MB)':>10} | {'Fidelity':>9} | {'PPL':>9} |"
         )
         rule = "|" + "|".join("-" * (width + 2) for width in widths) + "|"
         title = f"### {backend} @ {context} tokens"
@@ -729,17 +817,18 @@ def summarise(rungs: list[TaskRung]) -> str:
         for rung in group:
             note = " *" if rung.source == "stub" else ""
             fidelity = f"{rung.fidelity:.6f}" if rung.fidelity is not None else "-"
+            perplexity = f"{rung.perplexity:.3f}" if rung.perplexity is not None else "-"
             lines.append(
                 f"| {rung.task + note:<20} | {rung.metric:<11} | {rung.percentage:>8.1f}% | "
                 f"{len(rung.records):>7} | {rung.median('ttft_ms'):>9.0f} | "
                 f"{rung.median('decode_p50_us'):>12.0f} | {rung.peak('device_peak_mb'):>13.0f} | "
                 f"{rung.peak('kv_cache_mb'):>10.0f} | {rung.peak('dense_equivalent_mb'):>10.0f} | "
-                f"{rung.peak('kv_saved_mb'):>10.0f} | {fidelity:>9} |"
+                f"{rung.peak('kv_saved_mb'):>10.0f} | {fidelity:>9} | {perplexity:>9} |"
             )
         average = as_percentage([rung.percentage / 100 for rung in group])
         lines.append(
             f"| {'Overall Average':<20} | {'':<11} | {average:>8.1f}% | {'':>7} | {'':>9} | {'':>12} | "
-            f"{'':>13} | {'':>10} | {'':>10} | {'':>10} | {'':>9} |"
+            f"{'':>13} | {'':>10} | {'':>10} | {'':>10} | {'':>9} | {'':>9} |"
         )
         blocks.append("\n".join(lines))
 
@@ -758,6 +847,13 @@ def summarise(rungs: list[TaskRung]) -> str:
             "are the measurement; its TTFT and Dec p50 are not comparable with the sink-free block above "
             "it, because the merge recomputes the softmax denominator on the host at O(context) per step "
             "(every record carries its own `sink_tokens` and `sink_cache_mb`)."
+        )
+    if any(rung.perplexity is not None for rung in rungs):
+        notes.append(
+            "PPL is the median over a task's items of the model's cross-entropy over the prompt itself, "
+            "exponentiated -- a finer instrument than the score, which a cache can move a long way before "
+            "an answer changes. It is measured through the rung's prefill path, so under dense_staging it "
+            "is the unquantised model's number and under batched_decode it is the quantised pool's."
         )
     if any(rung.fidelity is not None for rung in rungs):
         notes.append(
@@ -865,6 +961,14 @@ def main(argv: list[str] | None = None) -> int:
                             record.update(context_requested=context, prefill_mode=mode)
                             if args.eval_fidelity:
                                 record["output_cosine"] = fidelity_cosine(args, runner, prompt_ids, plan)
+                            if args.eval_ppl:
+                                # After the fidelity cosine, which re-prefills too: both
+                                # leave the cache holding this prompt, and the next item
+                                # refills it from zero regardless.
+                                reading = sequence_perplexity(runner, prompt_ids, args.ppl_chunk_size)
+                                record["ppl"] = round(reading.perplexity, 4)
+                                record["ppl_loss"] = round(reading.loss, 6)
+                                record["ppl_tokens"] = reading.tokens
                             rung.records.append(record)
                             sink.write(json.dumps(record, ensure_ascii=False) + "\n")
                             sink.flush()
@@ -886,20 +990,6 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print(summarise(rungs))
     return 0
-
-
-def _target_token(tokenizer, item) -> int | None:
-    """The first token of the first reference answer, for the logit lens to rank.
-
-    A LongBench item has no single right token the way a needle has, so this is
-    the nearest honest stand-in: the token the reference answer opens with. A
-    rank that falls through the stack says the layers stopped heading toward the
-    reference; it does not say they headed somewhere wrong.
-    """
-    if not item.answers:
-        return None
-    ids = tokenizer(item.answers[0], return_tensors="pt").input_ids[0]
-    return int(ids[-1]) if ids.numel() else None
 
 
 def _largest_budget(args: argparse.Namespace, tasks: tuple[str, ...]) -> int:
