@@ -46,7 +46,13 @@ from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
 
-from tq_longbench._ascend import assert_no_vllm_imported, source_root, turboquant_layout, turboquant_rotation
+from tq_longbench._ascend import (
+    assert_no_vllm_imported,
+    shell_package,
+    source_root,
+    turboquant_layout,
+    turboquant_rotation,
+)
 
 _CPU_OPS_MODULE = "tests.ut.attention.turboquant_cpu_ops"
 
@@ -55,29 +61,10 @@ _SHELL_PACKAGES = ("vllm_ascend", "vllm_ascend.attention", "tests", "tests.ut", 
 _RELATIVE = Path("tests") / "ut" / "attention" / "turboquant_cpu_ops.py"
 
 
-def _shell_package(name: str) -> ModuleType:
-    """A package object with a real ``__path__`` whose ``__init__`` never runs.
-
-    ``vllm_ascend/__init__.py`` reaches vLLM and ``tests/ut/conftest.py`` reaches
-    the plugin; neither is wanted, and neither is needed to resolve a submodule
-    that is about to be loaded by file path anyway.
-    """
-    module = sys.modules.get(name)
-    if module is not None:
-        return module
-    module = ModuleType(name)
-    module.__path__ = []  # type: ignore[attr-defined]
-    sys.modules[name] = module
-    parent, _, leaf = name.rpartition(".")
-    if parent:
-        setattr(_shell_package(parent), leaf, module)
-    return module
-
-
 def _install_dependencies() -> None:
     """Put ``turboquant_rotation`` and a ``turboquant_v1`` shim where the stand-ins look."""
     for name in _SHELL_PACKAGES:
-        _shell_package(name)
+        shell_package(name)
 
     attention = sys.modules["vllm_ascend.attention"]
     rotation = turboquant_rotation()

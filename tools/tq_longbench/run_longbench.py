@@ -47,6 +47,16 @@ headroom``), ``--max-tokens-override`` sets per-task generation budgets, and
     python tools/tq_longbench/run_longbench.py --model-path ~/models/glm-4-9b-chat-1m \\
         --context-tier 256k --max-tokens-override gov_report=1024,qasper=256 --decode-graph on
 
+``--sink-tokens`` is the uncompressed attention sink ablation, and sweeps: ``0,4``
+runs the whole ladder twice in one pass, once on the 4-bit cache as it ships and once
+with the first four tokens of each sequence kept at activation precision and folded back
+into every decode's softmax.  The count lands in every record, on both tables and in the
+banner, and it is published as ``VLLM_ASCEND_TQ_SINK_TOKENS`` before any runner is built.
+Read those rows for their **scores**: the merge recomputes the quantised context's softmax
+denominator on the host, because neither decode operator returns it, so a decode step also
+costs ``O(context)`` torch work and can be neither static nor captured.  It needs
+``dense_staging`` prefill, which is what the plugin's own backend does.
+
 ``--dry-run`` prints what each rung would provision, from ``config.json`` alone,
 and loads no weights. Every record already carries ``kv_cache_mb``,
 ``dense_equivalent_mb`` and ``kv_saved_mb``; at a tier those are the numbers the
@@ -88,12 +98,17 @@ from dataclasses import dataclass, field  # noqa: E402
 import torch  # noqa: E402
 
 from tq_longbench.run_benchmark import (  # noqa: E402
+    add_sink_arguments,
     build_runner,
     free_device,
     parse_backends,
     parse_int_list,
+    parse_sink_tokens,
     plan_for_backend,
+    prefill_mode_for,
     rung_prefill_mode,
+    sink_banner,
+    use_sink_tokens,
 )
 from tq_longbench.smoke_glm import (  # noqa: E402
     CONTEXT_HEADROOM_TOKENS,
@@ -289,6 +304,7 @@ def build_parser() -> argparse.ArgumentParser:
         "same prompt, and print where the two parted company",
     )
     parser.add_argument("--skip-preflight", action="store_true")
+    add_sink_arguments(parser)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out-file", type=Path, default=None, help="JSONL results; stdout if omitted")
     return parser
@@ -459,12 +475,55 @@ def arena_report(args: argparse.Namespace, contexts: tuple[int, ...], tasks: tup
     lines += [
         "",
         f"tasks: {', '.join(tasks)} (generation budget {budget} tokens, --max-context {args.max_context})",
+        f"sink counts: {', '.join(str(count) for count in parse_sink_tokens(args.sink_tokens))} "
+        "-- each runs the whole ladder above; a positive count adds an uncompressed side-car "
+        "(2 x N x num_kv_heads x head_size activation elements per layer) and a host-side "
+        "O(context) softmax recomputation per decode step.",
         "Dense KV is what the same arena would cost unquantised, from the checkpoint geometry; the "
         "TurboQuant pool's own size is measured per run and reported as kv_cache_mb.",
     ]
     if any(context > args.max_context for context in contexts):
         lines.append("A REFUSED rung needs an explicit --max-context to run.")
     return "\n".join(lines)
+
+
+def refuse_sinks_without_dense_prefill(
+    args: argparse.Namespace,
+    backends: tuple[str, ...],
+    sink_counts: tuple[int, ...],
+    contexts: tuple[int, ...],
+    family: ModelFamily,
+) -> None:
+    """Refuse a sink sweep whose rungs would prefill through the quantised cache.
+
+    ``batched_decode`` presents a prefill chunk as a batch of per-position decodes, so
+    every prompt token would pay the sink merge's ``O(context)`` recomputation and the
+    prefill would be quadratic on the host. :class:`~tq_longbench.engine.RunnerConfig`
+    refuses it either way; this says so before the tokenizer loads and the corpus is
+    read, and names every rung rather than the first one to reach the constructor.
+
+    Only the family's own policy is consulted. The pre-flight can *also* downgrade a rung
+    to ``batched_decode`` when the staging pool will not build on this device, and that
+    answer needs the device -- a run that hits it gets the constructor's message instead,
+    which says the same thing.
+    """
+    if not any(sink_counts):
+        return
+    refused = [
+        (backend, context)
+        for backend in backends
+        for context in contexts
+        if prefill_mode_for(args, backend, context, family) == "batched_decode"
+    ]
+    if not refused:
+        return
+    rungs = ", ".join(f"{backend}@{context}" for backend, context in refused)
+    raise SystemExit(
+        f"--sink-tokens {args.sink_tokens} needs every rung to prefill densely, and these would not: {rungs}. "
+        "The sink merge recomputes the softmax denominator per attending row, so a batched_decode prefill "
+        "pays it once per prompt token. Pass --prefill-mode dense_staging (and an arena that fits its "
+        "unquantised pool), drop the long rungs, or run with --sink-tokens 0."
+    )
 
 
 def load_items(task: str, dataset_dir: Path, limit: int) -> tuple[list[EvalItem], str]:
@@ -509,6 +568,10 @@ class TaskRung:
     metric: str
     #: ``"jsonl"`` or ``"stub"``. On the table, because a stub row is not a score.
     source: str = "jsonl"
+    #: How many leading tokens this rung kept uncompressed. On the table beside the
+    #: backend, because a score measured with sinks and one measured without are
+    #: answers to different questions and must not share a block.
+    sink_tokens: int = 0
     records: list[dict] = field(default_factory=list)
 
     @property
@@ -554,6 +617,7 @@ def run_item(args, runner, tokenizer, eos_ids, item, keep: int, family: ModelFam
     text, failure = decode_text(tokenizer, stop_at_eos(produced, eos_ids))
     record = {
         "backend": runner.config.backend,
+        "sink_tokens": runner.config.sink_tokens,
         "task": task,
         "index": item.extra.get("index"),
         "metric": metric_label(task),
@@ -650,14 +714,17 @@ def summarise(rungs: list[TaskRung]) -> str:
     """
     widths = (20, 11, 9, 7, 9, 12, 13, 10, 10, 10, 9)
     blocks = []
-    for (backend, context), group in _grouped(rungs):
+    for (backend, sinks, context), group in _grouped(rungs):
         header = (
             f"| {'Task':<20} | {'Metric':<11} | {'Score (%)':>9} | {'Samples':>7} | "
             f"{'TTFT (ms)':>9} | {'Dec p50 (us)':>12} | {'Peak HBM (MB)':>13} | "
             f"{'KV (MB)':>10} | {'Dense (MB)':>10} | {'Saved (MB)':>10} | {'Fidelity':>9} |"
         )
         rule = "|" + "|".join("-" * (width + 2) for width in widths) + "|"
-        lines = [f"### {backend} @ {context} tokens", "", header, rule]
+        title = f"### {backend} @ {context} tokens"
+        if sinks:
+            title += f", {sinks} uncompressed sinks"
+        lines = [title, "", header, rule]
         for rung in group:
             note = " *" if rung.source == "stub" else ""
             fidelity = f"{rung.fidelity:.6f}" if rung.fidelity is not None else "-"
@@ -683,6 +750,14 @@ def summarise(rungs: list[TaskRung]) -> str:
         "KV is what the quantised pool holds, Dense what the same arena would cost unquantised, Saved the "
         "difference -- all three sized for the rung's arena rather than for the prompt that filled it.",
     ]
+    if any(rung.sink_tokens for rung in rungs):
+        notes.append(
+            "A block headed 'N uncompressed sinks' kept the sequence's first N tokens out of the 4-bit "
+            "quantisation and folded their exact contribution back into every decode's softmax. Its scores "
+            "are the measurement; its TTFT and Dec p50 are not comparable with the sink-free block above "
+            "it, because the merge recomputes the softmax denominator on the host at O(context) per step "
+            "(every record carries its own `sink_tokens` and `sink_cache_mb`)."
+        )
     if any(rung.fidelity is not None for rung in rungs):
         notes.append(
             f"Fidelity is the *worst* output-embedding cosine over a task's items against a "
@@ -700,10 +775,10 @@ def summarise(rungs: list[TaskRung]) -> str:
 
 
 def _grouped(rungs: list[TaskRung]):
-    """``((backend, context), rungs)``, in the order they were run."""
+    """``((backend, sink_tokens, context), rungs)``, in the order they were run."""
     order, grouped = [], {}
     for rung in rungs:
-        key = (rung.backend, rung.context)
+        key = (rung.backend, rung.sink_tokens, rung.context)
         if key not in grouped:
             order.append(key)
             grouped[key] = []
@@ -716,6 +791,11 @@ def main(argv: list[str] | None = None) -> int:
     args.device = resolve_device(args.device)
     args.budget_overrides = parse_budget_overrides(args.max_tokens_override)
     backends = parse_backends(args.backends)
+    sink_counts = parse_sink_tokens(args.sink_tokens)
+    # Published before the config read, the tokenizer and every runner: anything else in
+    # this process, and any subprocess it spawns, has to see the number the backends are
+    # running with. See run_benchmark.use_sink_tokens.
+    use_sink_tokens(sink_counts[0])
     contexts, tasks = apply_tier(args)
     if args.eval_fidelity and max(contexts) > FIDELITY_MAX_CONTEXT:
         raise SystemExit(
@@ -731,9 +811,12 @@ def main(argv: list[str] | None = None) -> int:
         guard_arena(args, context, context + _largest_budget(args, tasks) + CONTEXT_HEADROOM_TOKENS)
     config = read_config(args.model_path)
     family = family_for(config)
+    refuse_sinks_without_dense_prefill(args, backends, sink_counts, contexts, family)
     tokenizer = load_tokenizer(args.model_path, family)
     eos_ids = eos_ids_for(config, tokenizer, family)
     print(f"prompt: {prompt_route(tokenizer, not args.raw_prompt, family)}", file=sys.stderr)
+    for count in sink_counts:
+        print(sink_banner(count), file=sys.stderr)
     print(f"stop ids: {sorted(eos_ids) or 'NONE -- every item will run its whole budget'}", file=sys.stderr)
 
     print(f"prompts: {config_source(args.dataset_dir)}", file=sys.stderr)
@@ -755,39 +838,45 @@ def main(argv: list[str] | None = None) -> int:
     rungs: list[TaskRung] = []
     try:
         for backend in backends:
+            # Probed once for the whole sweep: sinks change what a decode computes, not
+            # which prefill path this device can run.
             plan = plan_for_backend(args, backend, contexts, family)
             if plan.results or plan.notes:
                 print(plan.report(), file=sys.stderr)
-            runner = None
-            for context in contexts:
-                mode = rung_prefill_mode(args, plan, backend, context, family)
-                max_seq_len = context + _largest_budget(args, tasks) + CONTEXT_HEADROOM_TOKENS
+            for sinks in sink_counts:
                 runner = None
-                free_device(args.device)
-                runner = build_runner(args, backend, mode, max_seq_len, plan)
-                print(f"  {backend} at {context} ({mode}, cache {max_seq_len})", file=sys.stderr)
-                keep = max_seq_len - CONTEXT_HEADROOM_TOKENS - _largest_budget(args, tasks)
-                for task in tasks:
-                    rung = TaskRung(backend, context, task, metric_label(task), sources[task])
-                    for position, item in enumerate(items[task]):
-                        record, prompt_ids = run_item(args, runner, tokenizer, eos_ids, item, keep, family)
-                        record.update(context_requested=context, prefill_mode=mode)
-                        if args.eval_fidelity:
-                            record["output_cosine"] = fidelity_cosine(args, runner, prompt_ids, plan)
-                        rung.records.append(record)
-                        sink.write(json.dumps(record, ensure_ascii=False) + "\n")
-                        sink.flush()
-                        if args.profile_layers and position == 0:
-                            print(f"    layer probe, {task} item 0 at {context}:", file=sys.stderr)
-                            print(profile_item(args, runner, tokenizer, prompt_ids, item, plan), file=sys.stderr)
-                    rungs.append(rung)
+                for context in contexts:
+                    mode = rung_prefill_mode(args, plan, backend, context, family)
+                    max_seq_len = context + _largest_budget(args, tasks) + CONTEXT_HEADROOM_TOKENS
+                    runner = None
+                    free_device(args.device)
+                    runner = build_runner(args, backend, mode, max_seq_len, plan, sinks)
                     print(
-                        f"    {task:17s} {rung.mean_score:.4f} over {len(rung.records)} items "
-                        f"({rung.truncated} cut), ttft {rung.median('ttft_ms'):.0f} ms",
+                        f"  {backend} at {context} ({mode}, cache {max_seq_len}, sinks {sinks})",
                         file=sys.stderr,
                     )
-            runner = None
-            free_device(args.device)
+                    keep = max_seq_len - CONTEXT_HEADROOM_TOKENS - _largest_budget(args, tasks)
+                    for task in tasks:
+                        rung = TaskRung(backend, context, task, metric_label(task), sources[task], sinks)
+                        for position, item in enumerate(items[task]):
+                            record, prompt_ids = run_item(args, runner, tokenizer, eos_ids, item, keep, family)
+                            record.update(context_requested=context, prefill_mode=mode)
+                            if args.eval_fidelity:
+                                record["output_cosine"] = fidelity_cosine(args, runner, prompt_ids, plan)
+                            rung.records.append(record)
+                            sink.write(json.dumps(record, ensure_ascii=False) + "\n")
+                            sink.flush()
+                            if args.profile_layers and position == 0:
+                                print(f"    layer probe, {task} item 0 at {context}:", file=sys.stderr)
+                                print(profile_item(args, runner, tokenizer, prompt_ids, item, plan), file=sys.stderr)
+                        rungs.append(rung)
+                        print(
+                            f"    {task:17s} {rung.mean_score:.4f} over {len(rung.records)} items "
+                            f"({rung.truncated} cut), ttft {rung.median('ttft_ms'):.0f} ms",
+                            file=sys.stderr,
+                        )
+                runner = None
+                free_device(args.device)
     finally:
         if args.out_file:
             sink.close()

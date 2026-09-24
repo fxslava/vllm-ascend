@@ -39,6 +39,7 @@ imports neither ``tests.ut.base`` (which reaches vLLM) nor pytest itself.
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import ctypes
 import io
@@ -63,12 +64,22 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT / "tools") not in sys.path:
     sys.path.append(str(REPO_ROOT / "tools"))
 
-from tq_longbench import _ascend, build_turboquant_ops  # noqa: E402
+from tq_longbench import (  # noqa: E402
+    _ascend,
+    build_turboquant_ops,
+    kv_dump,  # noqa: E402
+)
 from tq_longbench import engine as engine_module  # noqa: E402
 from tq_longbench import layers as layers_module  # noqa: E402
 from tq_longbench import ops as ops_module  # noqa: E402
 from tq_longbench import preflight as preflight_module  # noqa: E402
-from tq_longbench._ascend import assert_no_vllm_imported, turboquant_layout, turboquant_rotation  # noqa: E402
+from tq_longbench import run_benchmark as run_benchmark_module  # noqa: E402
+from tq_longbench._ascend import (  # noqa: E402
+    assert_no_vllm_imported,
+    turboquant_layout,
+    turboquant_rotation,
+    turboquant_sink,
+)
 from tq_longbench.cpu_reference import cpu_turboquant_ops  # noqa: E402
 from tq_longbench.engine import (  # noqa: E402
     GraphCaptureUnavailable,
@@ -95,7 +106,6 @@ from tq_longbench.glm4 import (  # noqa: E402
     glm4_prefill_mode,
     is_glm4_config,
 )
-from tq_longbench import kv_dump  # noqa: E402
 from tq_longbench.kv_cache import CacheGeometry, DenseKVCache, TurboQuantKVCache, dense_equivalent_bytes  # noqa: E402
 from tq_longbench.kv_dump import (  # noqa: E402
     collect_tensors,
@@ -142,6 +152,14 @@ from tq_longbench.probe import (  # noqa: E402
     needle_slot_positions,
 )
 from tq_longbench.reference import DenseReferenceBackend, TurboQuantReferenceBackend  # noqa: E402
+from tq_longbench.run_benchmark import (  # noqa: E402
+    DEFAULT_SINK_TOKENS,
+    SINK_TOKENS_ENV,
+    add_sink_arguments,
+    parse_sink_tokens,
+    sink_banner,
+    use_sink_tokens,
+)
 from tq_longbench.smoke_glm import (  # noqa: E402
     cached_extent,
     encode,
@@ -3837,12 +3855,12 @@ class TestNeedleSlots(unittest.TestCase):
         self.assertEqual(needle_slot_positions(torch.tensor([1]), torch.arange(5)).numel(), 0)
 
 
-class TestRunLongBench(unittest.TestCase):
-    """The LongBench pipeline end to end, over JSONL written the way the suite writes it.
+class _LongBenchCorpus(unittest.TestCase):
+    """A tiny GLM-4 checkpoint and four tasks' JSONL on disk, for the CLI tests below.
 
-    No ``datasets`` and no download: the loader reads ``{task}.jsonl`` with
-    ``json.loads``, which is the whole point of it, so a test can hand it four
-    lines and exercise the real path rather than a mock of it.
+    No test methods of its own: it is the fixture :class:`TestRunLongBench` and
+    :class:`TestRunLongBenchSinks` share, so the second does not re-run the first's
+    assertions against a corpus it has narrowed.
     """
 
     TASKS = ("narrativeqa", "gov_report", "trec", "lcc")
@@ -3912,6 +3930,15 @@ class TestRunLongBench(unittest.TestCase):
             self.assertEqual(run_longbench.main(argv), 0)
         records = [json.loads(line) for line in out_file.read_text(encoding="utf-8").splitlines()]
         return records, out.getvalue(), err.getvalue()
+
+
+class TestRunLongBench(_LongBenchCorpus):
+    """The LongBench pipeline end to end, over JSONL written the way the suite writes it.
+
+    No ``datasets`` and no download: the loader reads ``{task}.jsonl`` with
+    ``json.loads``, which is the whole point of it, so a test can hand it four
+    lines and exercise the real path rather than a mock of it.
+    """
 
     def test_the_items_come_off_disk_through_the_tasks_own_template(self):
         records, _, logged = self._run()
@@ -5203,6 +5230,366 @@ class TestSmokeGlmPreflight(unittest.TestCase):
         self.assertEqual(plan.staging_backend, "cann_dense")
         self.assertTrue(any("cann_dense" in note for note in plan.notes), plan.notes)
 
+
+
+# --------------------------------------------------------------- attention sinks
+
+
+SINK_TOKENS = 4
+
+
+class TestSinkTokenOption(unittest.TestCase):
+    """``--sink-tokens``: what it accepts, and what it publishes before anything is built."""
+
+    def setUp(self):
+        self._env = dict(os.environ)
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(self._env)))
+
+    def test_the_sweep_keeps_the_order_it_was_given_and_deduplicates(self):
+        self.assertEqual(parse_sink_tokens("0"), (0,))
+        self.assertEqual(parse_sink_tokens("4,0"), (4, 0))
+        self.assertEqual(parse_sink_tokens("0,2,4,2"), (0, 2, 4))
+
+    def test_a_count_outside_the_range_is_refused(self):
+        ceiling = turboquant_sink().TURBOQUANT_MAX_SINK_TOKENS
+        for text in ("-1", f"{ceiling + 1}", "", "0,-2"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                parse_sink_tokens(text)
+
+    def test_both_spellings_reach_the_same_destination(self):
+        parser = argparse.ArgumentParser()
+        add_sink_arguments(parser)
+        self.assertEqual(parser.parse_args(["--sink-tokens", "0,4"]).sink_tokens, "0,4")
+        self.assertEqual(parser.parse_args(["--tq-sink-tokens", "2"]).sink_tokens, "2")
+        self.assertEqual(parser.parse_args([]).sink_tokens, DEFAULT_SINK_TOKENS)
+
+    def test_the_count_is_published_in_the_environment(self):
+        """A subprocess inherits the environment as it is at spawn, not as it becomes."""
+        self.assertEqual(use_sink_tokens(4), 4)
+        self.assertEqual(os.environ[SINK_TOKENS_ENV], "4")
+        use_sink_tokens(0)
+        self.assertEqual(os.environ[SINK_TOKENS_ENV], "0")
+
+    def test_the_banner_says_what_a_positive_count_costs(self):
+        self.assertIn("off", sink_banner(0))
+        banner = sink_banner(4)
+        self.assertIn("O(context)", banner)
+        self.assertIn("softmax denominator", banner)
+        self.assertIn(f"{SINK_TOKENS_ENV}=4", banner)
+
+
+class TestSinkModuleIsBorrowedNotImported(unittest.TestCase):
+    """The sink module reaches two siblings, so it needs more than a file-path load."""
+
+    def test_it_loads_without_reaching_vllm(self):
+        module = turboquant_sink()
+        self.assertTrue(hasattr(module, "TurboQuantSinkCache"))
+        self.assertTrue(hasattr(module, "fuse_decode_sinks"))
+        assert_no_vllm_imported()
+        # Registered under the harness's own private name, like the other two borrowed
+        # modules: a real ``vllm_ascend.attention.turboquant_sink`` must still be an
+        # import that reaches the package, not one this answered from a hollow shell.
+        self.assertIn("tq_longbench._vendored_turboquant_sink", sys.modules)
+
+    def test_it_takes_its_own_shell_packages_back_down(self):
+        """What it plants it removes, and what another component planted it leaves.
+
+        ``cpu_reference`` stands up the same shells for the CPU stand-ins and keeps them,
+        so this cannot assert that ``vllm_ascend`` is absent afterwards -- only that this
+        loader is not the one that left it there. The cache and the shells are cleared
+        first so the load really runs, and restored on the way out either way.
+        """
+        saved = {name: sys.modules.pop(name) for name in list(sys.modules) if name.startswith("vllm_ascend")}
+        cached = sys.modules.pop("tq_longbench._vendored_turboquant_sink", None)
+        try:
+            turboquant_sink()
+            self.assertEqual([name for name in sys.modules if name.startswith("vllm_ascend")], [])
+        finally:
+            sys.modules.update(saved)
+            if cached is not None:
+                sys.modules["tq_longbench._vendored_turboquant_sink"] = cached
+
+    def test_it_shares_the_borrowed_codec_rather_than_copying_it(self):
+        """A second copy of the grid would decode the cache against the wrong centroids."""
+        module = turboquant_sink()
+        packed = torch.randint(-128, 127, (3, 2, HEAD_SIZE // 2), dtype=torch.int8)
+        centroids = torch.tensor(turboquant_layout().TURBOQUANT_LLOYD_MAX_CENTROIDS, dtype=torch.float32)
+        with cpu_turboquant_ops() as stand_ins:
+            expected = stand_ins.dequantize(packed, centroids)
+        self.assertTrue(torch.equal(module.turboquant_dequantize(packed), expected))
+
+
+class TestTurboQuantSinkBackend(_TurboQuantCase):
+    """The side-car and the merge inside the harness's own AIV backend."""
+
+    def sink_backend(self, max_seq_len: int, sink_tokens: int = SINK_TOKENS) -> TurboQuantAivBackend:
+        geometry = _geometry(max_seq_len)
+        shape = LayerShape(NUM_HEADS, NUM_KV_HEADS, HEAD_SIZE, HEAD_SIZE**-0.5)
+        return TurboQuantAivBackend(geometry, shape, CPU, sink_tokens=sink_tokens, activation_dtype=DTYPE)
+
+    def _write(self, backend, key, value, chunk=256):
+        for start in range(0, key.shape[0], chunk):
+            count = min(chunk, key.shape[0] - start)
+            backend.write_kv(
+                0,
+                key[start : start + count],
+                value[start : start + count],
+                backend.cache.slot_mapping(start, count),
+            )
+
+    def test_zero_sinks_is_the_backend_that_ships(self):
+        """Off must be free: no plane, no merge, and byte-identical output."""
+        length = 256
+        key = torch.randn(length, NUM_KV_HEADS, HEAD_SIZE, dtype=DTYPE)
+        value = torch.randn(length, NUM_KV_HEADS, HEAD_SIZE, dtype=DTYPE)
+        query = torch.randn(1, NUM_HEADS, HEAD_SIZE, dtype=DTYPE)
+        outputs = []
+        for backend in (self.backend(length), self.sink_backend(length, sink_tokens=0)):
+            self.assertEqual(backend.sink_cache_bytes(), 0)
+            self.assertTrue(backend.supports_static_decode)
+            self.assertTrue(backend.supports_graph_capture)
+            self._write(backend, key, value)
+            out = torch.empty(1, NUM_HEADS, HEAD_SIZE, dtype=DTYPE)
+            backend.decode(0, query, torch.full((1,), length, dtype=torch.int32), out)
+            outputs.append(out)
+        self.assertTrue(torch.equal(*outputs))
+
+    def test_a_positive_count_gives_up_static_decode_and_capture(self):
+        """The merge reads the context lengths on the host; a replay would freeze them."""
+        backend = self.sink_backend(256)
+        self.assertFalse(backend.supports_static_decode)
+        self.assertFalse(backend.supports_graph_capture)
+        self.assertEqual(
+            backend.sink_cache_bytes(),
+            backend.geometry.num_layers * 2 * SINK_TOKENS * NUM_KV_HEADS * HEAD_SIZE * DTYPE.itemsize,
+        )
+
+    def test_the_side_car_holds_the_prefix_whatever_the_chunking(self):
+        length = 512
+        key = torch.randn(length, NUM_KV_HEADS, HEAD_SIZE, dtype=DTYPE)
+        value = torch.randn(length, NUM_KV_HEADS, HEAD_SIZE, dtype=DTYPE)
+        for chunk in (2, 64, 256, 512):
+            with self.subTest(chunk=chunk):
+                backend = self.sink_backend(length)
+                self._write(backend, key, value, chunk=chunk)
+                stored = backend._sink_caches[0]
+                self.assertTrue(torch.equal(stored.planes[0, 0], key[:SINK_TOKENS]))
+                self.assertTrue(torch.equal(stored.planes[1, 0], value[:SINK_TOKENS]))
+                # One side-car per layer, which is what makes the plane a layer's own.
+                self.assertEqual(len(backend._sink_caches), backend.geometry.num_layers)
+
+    def test_a_second_prompt_overwrites_the_first_ones_sinks(self):
+        """The arena restarts at slot 0 per item, and so must the side-car."""
+        length = 128
+        backend = self.sink_backend(length)
+        first = torch.randn(length, NUM_KV_HEADS, HEAD_SIZE, dtype=DTYPE)
+        second = torch.randn(length, NUM_KV_HEADS, HEAD_SIZE, dtype=DTYPE)
+        self._write(backend, first, first)
+        self._write(backend, second, second)
+        self.assertTrue(torch.equal(backend._sink_caches[0].planes[0, 0], second[:SINK_TOKENS]))
+
+    def test_a_write_past_the_sinks_leaves_them_alone(self):
+        """Steady-state decode writes one token at a slot far past the sinks: a no-op here."""
+        length = 256
+        backend = self.sink_backend(length + BLOCK_SIZE)
+        key = torch.randn(length, NUM_KV_HEADS, HEAD_SIZE, dtype=DTYPE)
+        self._write(backend, key, key)
+        before = backend._sink_caches[0].planes.clone()
+        tail = torch.randn(1, NUM_KV_HEADS, HEAD_SIZE, dtype=DTYPE)
+        backend.write_kv(0, tail, tail, backend.cache.slot_mapping(length, 1))
+        self.assertTrue(torch.equal(backend._sink_caches[0].planes, before))
+
+    def _mixed_reference(self, backend, query, key, value, context_len):
+        """Exact attention over the cache, with the sink rows replaced by their true K/V.
+
+        This is what the merge claims to compute: the quantised tail exactly as the
+        operator read it, and the first ``SINK_TOKENS`` rows at activation precision.
+        """
+        layout, rotation = turboquant_layout(), turboquant_rotation()
+        centroids = torch.tensor(layout.TURBOQUANT_LLOYD_MAX_CENTROIDS, dtype=torch.float32)
+        key_plane, value_plane, scale_plane = backend.cache.planes(0)
+        rows = torch.arange(context_len)
+        packed = (-1, NUM_KV_HEADS, HEAD_SIZE // 2)
+        scales = scale_plane.view(-1, scale_plane.shape[-1])[rows]
+        signs = rotation.turboquant_pi_signs(HEAD_SIZE, CPU)
+        keys = self.stand_ins.dequantize(key_plane.view(packed)[rows], centroids) * scales[
+            :, :NUM_KV_HEADS
+        ].unsqueeze(-1)
+        values = self.stand_ins.dequantize(value_plane.view(packed)[rows], centroids) * scales[
+            :, NUM_KV_HEADS : 2 * NUM_KV_HEADS
+        ].unsqueeze(-1)
+        # The cache is in the rotated basis, so the uncompressed sinks go into it too.
+        keys[:SINK_TOKENS] = rotation.apply_pi(key[:SINK_TOKENS].to(torch.float32), signs)
+        values[:SINK_TOKENS] = rotation.apply_pi(value[:SINK_TOKENS].to(torch.float32), signs)
+        group = NUM_HEADS // NUM_KV_HEADS
+        keys = keys.repeat_interleave(group, dim=1)
+        values = values.repeat_interleave(group, dim=1)
+        rotated_query = rotation.apply_pi(query.to(torch.float32), signs)
+        scores = torch.einsum("thd,lhd->thl", rotated_query, keys) * HEAD_SIZE**-0.5
+        attended = torch.einsum("thl,lhd->thd", torch.softmax(scores, dim=-1), values)
+        return rotation.apply_pi(attended, signs)
+
+    def test_the_merge_computes_the_softmax_it_claims_to(self):
+        """Against a reference whose sinks are exact and whose tail is the cache's own bytes."""
+        length = 512
+        key = torch.randn(length, NUM_KV_HEADS, HEAD_SIZE, dtype=DTYPE)
+        value = torch.randn(length, NUM_KV_HEADS, HEAD_SIZE, dtype=DTYPE)
+        # Sinks the query is aligned with, so they hold most of the mass and the merge is
+        # the ill-conditioned subtraction it is meant to be rather than a rounding.
+        query = torch.randn(1, NUM_HEADS, HEAD_SIZE, dtype=DTYPE)
+        direction = query[0].to(torch.float32).mean(dim=0)
+        direction = direction / direction.norm()
+        for sink in range(SINK_TOKENS):
+            key[:, :][sink] = (direction * 16.0).to(DTYPE)
+
+        backend = self.sink_backend(length)
+        self._write(backend, key, value)
+        out = torch.empty(1, NUM_HEADS, HEAD_SIZE, dtype=DTYPE)
+        backend.decode(0, query, torch.full((1,), length, dtype=torch.int32), out)
+        expected = self._mixed_reference(backend, query, key, value, length)
+        self.assertGreater(cosine(out, expected), EXACT_COSINE)
+
+        # And it is a real correction: the same cache read without sinks is measurably
+        # further from the same reference.
+        plain = self.backend(length)
+        self._write(plain, key, value)
+        bare = torch.empty(1, NUM_HEADS, HEAD_SIZE, dtype=DTYPE)
+        plain.decode(0, query, torch.full((1,), length, dtype=torch.int32), bare)
+        self.assertLess(cosine(bare, expected), cosine(out, expected))
+
+    def test_a_context_shorter_than_the_sink_count_decodes(self):
+        length = 2
+        backend = self.sink_backend(BLOCK_SIZE)
+        key = torch.randn(length, NUM_KV_HEADS, HEAD_SIZE, dtype=DTYPE)
+        value = torch.randn(length, NUM_KV_HEADS, HEAD_SIZE, dtype=DTYPE)
+        self._write(backend, key, value)
+        query = torch.randn(1, NUM_HEADS, HEAD_SIZE, dtype=DTYPE)
+        out = torch.empty(1, NUM_HEADS, HEAD_SIZE, dtype=DTYPE)
+        backend.decode(0, query, torch.full((1,), length, dtype=torch.int32), out)
+        self.assertTrue(bool(torch.isfinite(out.to(torch.float32)).all()))
+        expected = self._mixed_reference(backend, query, key, value, length)
+        self.assertGreater(cosine(out, expected), EXACT_COSINE)
+
+
+class TestSinkRunnerConfig(unittest.TestCase):
+    """What a run with sinks is and is not allowed to be."""
+
+    def config(self, **kwargs) -> RunnerConfig:
+        return RunnerConfig(model_path="/nowhere", backend="turboquant_aiv", **kwargs)
+
+    def test_sinks_need_a_dense_prefill(self):
+        self.config(sink_tokens=SINK_TOKENS, prefill_mode="dense_staging")
+        with self.assertRaisesRegex(ValueError, "dense_staging"):
+            self.config(sink_tokens=SINK_TOKENS, prefill_mode="batched_decode")
+        # Off, the mode is nobody's business.
+        self.config(sink_tokens=0, prefill_mode="batched_decode")
+
+    def test_a_dense_backend_has_nothing_to_keep_uncompressed(self):
+        with self.assertRaisesRegex(ValueError, "TurboQuant option"):
+            RunnerConfig(model_path="/nowhere", backend="dense_reference", sink_tokens=SINK_TOKENS)
+
+    def test_a_negative_count_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "cannot be negative"):
+            self.config(sink_tokens=-1)
+
+
+class TestRunLongBenchSinks(_LongBenchCorpus):
+    """The whole CLI with a sink sweep, over the quantised backend the CPU can serve."""
+
+    SINK_TASKS = ("narrativeqa",)
+    SINK_ITEMS = 2
+
+    def _run_sinks(self, sweep: str):
+        from tq_longbench import run_longbench
+
+        out_file = self.root / "sinks.jsonl"
+        argv = [
+            "--model-path", str(self.model_path),
+            "--device", "cpu",
+            "--backends", "turboquant_aiv",
+            "--tasks", ",".join(self.SINK_TASKS),
+            "--dataset-dir", str(self.dataset_dir),
+            "--max-context-len", str(self.CONTEXT),
+            "--limit", str(self.SINK_ITEMS),
+            "--max-new-tokens", "2",
+            "--dtype", "float16",
+            "--chunk-size", "48",
+            "--block-size", str(BLOCK_SIZE),
+            "--prefill-mode", "dense_staging",
+            "--sink-tokens", sweep,
+            "--out-file", str(out_file),
+        ]  # fmt: skip
+        with (
+            cpu_turboquant_ops(),
+            mock.patch.object(run_longbench, "load_tokenizer", return_value=_ByteTokenizer()),
+            contextlib.redirect_stdout(io.StringIO()) as out,
+            contextlib.redirect_stderr(io.StringIO()) as err,
+        ):
+            self.assertEqual(run_longbench.main(argv), 0)
+        records = [json.loads(line) for line in out_file.read_text(encoding="utf-8").splitlines()]
+        return records, out.getvalue(), err.getvalue()
+
+    def test_the_sweep_runs_the_ladder_once_per_count_and_says_which(self):
+        records, printed, logged = self._run_sinks("0,4")
+        self.assertEqual(len(records), 2 * self.SINK_ITEMS)
+        self.assertEqual([record["sink_tokens"] for record in records], [0, 0, 4, 4])
+        # The banner is printed for each count in the sweep, before any runner is built.
+        self.assertIn("sinks: off", logged)
+        self.assertIn("4 uncompressed leading tokens", logged)
+        self.assertIn("O(context)", logged)
+        self.assertIn("sinks 0", logged)
+        self.assertIn("sinks 4", logged)
+        # Two blocks on the table, and only the second is labelled.
+        self.assertIn("4 uncompressed sinks", printed)
+        self.assertEqual(printed.count("### turboquant_aiv"), 2)
+
+    def test_the_record_carries_what_the_side_car_cost(self):
+        records, _, _ = self._run_sinks("0,4")
+        off = [record for record in records if record["sink_tokens"] == 0]
+        on = [record for record in records if record["sink_tokens"] == 4]
+        self.assertTrue(all(record["sink_cache_mb"] == 0.0 for record in off))
+        self.assertTrue(all(record["sink_cache_mb"] > 0.0 for record in on))
+        # Kilobytes, not megabytes: the side-car is a handful of tokens per layer.
+        self.assertLess(max(record["sink_cache_mb"] for record in on), 1.0)
+        # And it is not folded into the compression claim.
+        self.assertEqual({record["kv_cache_mb"] for record in off}, {record["kv_cache_mb"] for record in on})
+
+    def test_the_environment_is_published_before_the_engine(self):
+        seen = []
+        real = engine_module.StandaloneModelRunner
+
+        class Recording(real):  # type: ignore[misc, valid-type]
+            def __init__(self, config, *args, **kwargs):
+                seen.append((config.sink_tokens, os.environ.get(SINK_TOKENS_ENV)))
+                super().__init__(config, *args, **kwargs)
+
+        with mock.patch.object(run_benchmark_module, "StandaloneModelRunner", Recording):
+            self._run_sinks("0,4")
+        self.assertTrue(seen)
+        for configured, published in seen:
+            self.assertEqual(published, str(configured))
+
+    def test_a_sweep_that_would_prefill_through_the_quantised_cache_is_refused(self):
+        from tq_longbench import run_longbench
+
+        argv = [
+            "--model-path", str(self.model_path),
+            "--device", "cpu",
+            "--backends", "turboquant_aiv",
+            "--tasks", ",".join(self.SINK_TASKS),
+            "--dataset-dir", str(self.dataset_dir),
+            "--max-context-len", str(self.CONTEXT),
+            "--limit", "1",
+            "--dtype", "float16",
+            "--prefill-mode", "batched_decode",
+            "--sink-tokens", "4",
+        ]  # fmt: skip
+        with (
+            mock.patch.object(run_longbench, "load_tokenizer", return_value=_ByteTokenizer()),
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaisesRegex(SystemExit, "prefill densely"),
+        ):
+            run_longbench.main(argv)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

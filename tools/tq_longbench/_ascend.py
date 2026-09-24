@@ -54,6 +54,18 @@ from types import ModuleType
 _LAYOUT_MODULE = "tq_longbench._vendored_turboquant_layout"
 _ROTATION_MODULE = "tq_longbench._vendored_turboquant_rotation"
 
+#: ``turboquant_sink`` is the one borrowed module with intra-package imports of its own
+#: -- it reaches ``turboquant_layout`` and ``turboquant_rotation``, which are already
+#: borrowed here. It therefore cannot be loaded by file path alone: the names it imports
+#: have to resolve first. :func:`turboquant_sink` stands the two of them up under their
+#: real dotted names inside shell packages whose ``__init__`` never runs, execs the file,
+#: and takes the shells back down. Nothing named ``vllm`` is imported, and the module
+#: keeps direct references to what it imported, so removing the shells afterwards leaves
+#: it working and leaves no ``vllm_ascend`` in ``sys.modules`` for anything else to find.
+_SINK_MODULE = "tq_longbench._vendored_turboquant_sink"
+
+_SHELL_PACKAGES = ("vllm_ascend", "vllm_ascend.attention")
+
 _SOURCE_ROOT_ENV = "VLLM_ASCEND_SOURCE_ROOT"
 
 #: A standalone TurboQuant library to load, or a directory holding one. When set it
@@ -119,6 +131,57 @@ def turboquant_layout() -> ModuleType:
 def turboquant_rotation() -> ModuleType:
     """``Pi`` itself: the sign draw, the Walsh-Hadamard transform, and the o_proj fold."""
     return _load(_ROTATION_MODULE, "turboquant_rotation.py")
+
+
+def shell_package(name: str) -> ModuleType:
+    """A package object with an empty ``__path__`` whose ``__init__`` never runs.
+
+    ``vllm_ascend/__init__.py`` reaches vLLM and ``tests/ut/conftest.py`` reaches the
+    plugin; neither is wanted, and neither is needed to resolve a submodule that is about
+    to be loaded by file path anyway.
+    """
+    module = sys.modules.get(name)
+    if module is not None:
+        return module
+    module = ModuleType(name)
+    module.__path__ = []  # type: ignore[attr-defined]
+    sys.modules[name] = module
+    parent, _, leaf = name.rpartition(".")
+    if parent:
+        setattr(shell_package(parent), leaf, module)
+    return module
+
+
+def turboquant_sink() -> ModuleType:
+    """The uncompressed attention sinks: the side-car plane and the softmax merge.
+
+    See :data:`_SINK_MODULE` for why this one needs more than a file-path load. The shells
+    are removed again on the way out, whether the exec succeeded or not, so a later
+    ``import vllm_ascend`` anywhere cannot be answered by a hollow package this left behind.
+    """
+    cached = sys.modules.get(_SINK_MODULE)
+    if cached is not None:
+        return cached
+
+    borrowed = {
+        "vllm_ascend.attention.turboquant_layout": turboquant_layout(),
+        "vllm_ascend.attention.turboquant_rotation": turboquant_rotation(),
+    }
+    # Only what this call plants comes back down again: cpu_reference stands up the same
+    # shells for the CPU stand-ins and keeps them, and removing another component's entry
+    # would be a failure it has no way to see coming.
+    planted = [name for name in (*_SHELL_PACKAGES, *borrowed) if name not in sys.modules]
+    attention = shell_package("vllm_ascend.attention")
+    for name, borrowed_module in borrowed.items():
+        sys.modules.setdefault(name, borrowed_module)
+        setattr(attention, name.rpartition(".")[2], borrowed_module)
+    try:
+        module = _load(_SINK_MODULE, "turboquant_sink.py")
+    finally:
+        for name in reversed(planted):
+            sys.modules.pop(name, None)
+    assert_no_vllm_imported()
+    return module
 
 
 @dataclass(frozen=True)

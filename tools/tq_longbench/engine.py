@@ -231,6 +231,14 @@ class RunnerConfig:
     #: (``WEIGHT_NZ_MODES``). ``auto`` follows vllm_ascend's own policy for the
     #: dtype and SoC; see :func:`should_cast_to_nz`.
     weight_nz: str = "auto"
+    #: How many leading tokens of the sequence bypass 4-bit quantisation and are
+    #: attended to at activation precision (``VLLM_ASCEND_TQ_SINK_TOKENS``). 0 is
+    #: off, and every TurboQuant path is then the one that ships. Above 0 each
+    #: decode step also recomputes the quantised context's softmax denominator on
+    #: the host, because neither decode operator returns it, so a step costs
+    #: ``O(context)`` torch work on top of its launch and can be neither static
+    #: nor captured. Only the TurboQuant backends read it.
+    sink_tokens: int = 0
 
     def __post_init__(self) -> None:
         if self.decode_graph not in DECODE_GRAPH_MODES:
@@ -246,6 +254,25 @@ class RunnerConfig:
             )
         if self.chunk_size <= 0:
             raise ValueError(f"chunk_size must be positive, got {self.chunk_size}")
+        if self.sink_tokens < 0:
+            raise ValueError(f"sink_tokens cannot be negative, got {self.sink_tokens}")
+        if self.sink_tokens and self.prefill_mode == "batched_decode":
+            # batched_decode presents a whole chunk as a batch of per-position decodes, so
+            # every prefill row would pay the merge's O(context) recomputation and the
+            # prefill would be O(context^2) on the host. It is also the mode with no
+            # counterpart in the plugin: vllm-ascend's TurboQuant backend refuses chunked
+            # prefill outright and prefills densely, where the sinks are exact anyway.
+            raise ValueError(
+                "sink_tokens needs --prefill-mode dense_staging: the sink merge recomputes the softmax "
+                "denominator per attending row, so a batched_decode prefill would pay it once per prompt "
+                "token. Prefill densely (which is what the plugin's backend does, and where the sinks are "
+                "already exact), or run with --sink-tokens 0."
+            )
+        if self.sink_tokens and self.backend in DENSE_BACKENDS:
+            raise ValueError(
+                f"{self.backend} decodes out of the unquantised cache, so there is nothing for sink_tokens "
+                "to keep uncompressed; it is a TurboQuant option."
+            )
         if self.fold_site not in FOLD_SITES:
             raise ValueError(f"unknown fold_site {self.fold_site!r}; choose one of {list(FOLD_SITES)}")
         if self.dense_staging_backend is not None and self.dense_staging_backend not in DENSE_BACKENDS:
@@ -521,6 +548,10 @@ class RunMetrics:
     decode_step_us: list[float] = field(default_factory=list)
     kv_cache_mb: float = 0.0
     dense_equivalent_mb: float = 0.0
+    #: The uncompressed attention-sink side-car, on top of :attr:`kv_cache_mb` rather
+    #: than inside it: the compression claim is about the packed pool, and this is what
+    #: keeping a handful of tokens out of it costs. Zero with sinks off.
+    sink_cache_mb: float = 0.0
     #: Device memory at the end of the run, from the allocator rather than the
     #: pools: what the caches hold is budgeted, what the run peaked at is measured.
     #: Zero on a device with no allocator to ask (CPU).
@@ -578,6 +609,7 @@ class RunMetrics:
             "decode_p90_us": round(self.percentile(0.90), 2),
             "decode_p99_us": round(self.percentile(0.99), 2),
             "kv_cache_mb": round(self.kv_cache_mb, 2),
+            "sink_cache_mb": round(self.sink_cache_mb, 3),
             "dense_equivalent_mb": round(self.dense_equivalent_mb, 2),
             "kv_saved_mb": round(self.kv_saved_mb, 2),
             "device_allocated_mb": round(self.device_allocated_mb, 2),
@@ -624,6 +656,7 @@ class StandaloneModelRunner:
             config.dtype,
             config.fold_output_rotation,
             config.dense_attention_api,
+            config.sink_tokens,
         )
         # dense_staging needs the unquantised pool as well, unless the decode
         # backend already is it. Which unquantised backend that is follows the
@@ -913,6 +946,11 @@ class StandaloneModelRunner:
 
     # ---------------------------------------------------------------- memory
 
+    def _sink_cache_bytes(self) -> int:
+        """The decode backend's uncompressed sink plane, where it has one."""
+        reader = getattr(self.decode_backend, "sink_cache_bytes", None)
+        return reader() if reader is not None else 0
+
     def memory_report(self) -> dict:
         """What the pools hold, and what the same context would have cost dense."""
         dense_bytes = dense_equivalent_bytes(self.geometry, self.config.dtype)
@@ -927,6 +965,10 @@ class StandaloneModelRunner:
             # Budgeted like the pools rather than left to the allocator: small
             # next to a KV cache, and the whole of what a decode step writes into.
             "decode_workspace_mb": self.workspace.bytes_allocated() / _MEGABYTE,
+            # Zero with sinks off, and counted separately from kv_cache_mb either way:
+            # the compression claim is about the packed pool, and this is what keeping a
+            # handful of tokens out of it costs on top.
+            "sink_cache_mb": self._sink_cache_bytes() / _MEGABYTE,
         }
 
     # -------------------------------------------------------------- the loop
@@ -1082,7 +1124,11 @@ class StandaloneModelRunner:
 
     def _memory_metrics(self) -> dict:
         report = self.memory_report()
-        return {"kv_cache_mb": report["kv_cache_mb"], "dense_equivalent_mb": report["dense_equivalent_mb"]}
+        return {
+            "kv_cache_mb": report["kv_cache_mb"],
+            "dense_equivalent_mb": report["dense_equivalent_mb"],
+            "sink_cache_mb": report["sink_cache_mb"],
+        }
 
 
 _ATTENTION_SUFFIXES = {

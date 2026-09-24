@@ -65,6 +65,7 @@ _bootstrap_path()
 import argparse  # noqa: E402  (after the path bootstrap above)
 import gc  # noqa: E402
 import json  # noqa: E402
+import os  # noqa: E402
 import statistics  # noqa: E402
 import time  # noqa: E402
 from dataclasses import dataclass, field  # noqa: E402
@@ -93,7 +94,7 @@ from tq_longbench.smoke_glm import (  # noqa: E402
 
 quiet_tensorflow()
 
-from tq_longbench._ascend import assert_no_vllm_imported  # noqa: E402
+from tq_longbench._ascend import assert_no_vllm_imported, turboquant_sink  # noqa: E402
 from tq_longbench.engine import (  # noqa: E402
     DEFAULT_CHUNK_SIZE,
     PREFILL_MODES,
@@ -188,8 +189,76 @@ def build_parser() -> argparse.ArgumentParser:
         help="where the o_proj fold runs: auto (the device when there is one), host, or device",
     )
     parser.add_argument("--seed", type=int, default=0)
+    add_sink_arguments(parser)
     parser.add_argument("--out-file", type=Path, default=None, help="JSONL results; stdout if omitted")
     return parser
+
+
+#: What ``--sink-tokens`` publishes before a runner is built. The harness reads the count
+#: out of :class:`~tq_longbench.engine.RunnerConfig` rather than out of the environment --
+#: there is no vLLM in this process to read it, which is the whole point of the harness --
+#: but anything else that *is* in the process, and any subprocess a run spawns, has to see
+#: the same number as the backend that is running. Publishing it is what makes that true,
+#: and it is what the plugin's own attention backend reads when a run is driven through it
+#: instead (``vllm_ascend/envs.py``).
+SINK_TOKENS_ENV = "VLLM_ASCEND_TQ_SINK_TOKENS"
+
+#: The sweep ``--sink-tokens`` runs when it is left alone: sinks off, which is the path
+#: that ships.
+DEFAULT_SINK_TOKENS = "0"
+
+
+def parse_sink_tokens(text: str) -> tuple[int, ...]:
+    """The sink counts to sweep, in the order given, deduplicated.
+
+    Order is kept rather than sorted, so ``--sink-tokens 0,4`` runs the baseline first and
+    a reader of the streamed JSONL sees the comparison in the order they asked for it.
+    """
+    values = tuple(int(part) for part in text.split(",") if part.strip())
+    if not values or any(value < 0 for value in values):
+        raise ValueError(f"--sink-tokens must be comma-separated non-negative integers, got {text!r}")
+    ceiling = turboquant_sink().TURBOQUANT_MAX_SINK_TOKENS
+    if any(value > ceiling for value in values):
+        raise ValueError(f"--sink-tokens must lie in [0, {ceiling}], got {text!r}")
+    return tuple(dict.fromkeys(values))
+
+
+def add_sink_arguments(parser: argparse.ArgumentParser) -> None:
+    """``--sink-tokens``, shared by both CLIs so neither can drift from the other."""
+    parser.add_argument(
+        "--sink-tokens",
+        "--tq-sink-tokens",
+        dest="sink_tokens",
+        default=DEFAULT_SINK_TOKENS,
+        help=(
+            "comma-separated sink counts to sweep (default: 0, off). A positive count keeps that many "
+            "leading tokens of the sequence uncompressed beside the 4-bit cache and folds their exact "
+            "contribution back into each decode's softmax; '0,4' runs the ablation in one pass"
+        ),
+    )
+
+
+def use_sink_tokens(value: int) -> int:
+    """Publish ``value`` in the environment and return it.
+
+    Called immediately before a runner is constructed, so the variable is set strictly
+    before anything that might read it exists -- including a subprocess, which inherits
+    the environment as it is at ``fork``/``spawn`` and not as it becomes afterwards.
+    """
+    os.environ[SINK_TOKENS_ENV] = str(value)
+    return value
+
+
+def sink_banner(value: int) -> str:
+    """One line saying what a positive sink count costs, for the rung header."""
+    if not value:
+        return "sinks: off (VLLM_ASCEND_TQ_SINK_TOKENS=0) -- the 4-bit cache as it ships"
+    return (
+        f"sinks: {value} uncompressed leading tokens ({SINK_TOKENS_ENV}={value}). "
+        "The merge recomputes the quantised context's softmax denominator on the host, because neither "
+        "decode operator returns it -- O(context) torch work per decode step per layer, on top of the "
+        "launch, and no static decode or graph capture. Accuracy work, not a latency measurement."
+    )
 
 
 def parse_int_list(text: str, what: str) -> tuple[int, ...]:
@@ -246,8 +315,15 @@ def plan_namespace(args: argparse.Namespace, backend: str) -> argparse.Namespace
 
 
 def build_runner(
-    args: argparse.Namespace, backend: str, prefill_mode: str, max_seq_len: int, plan: AttentionPlan
+    args: argparse.Namespace,
+    backend: str,
+    prefill_mode: str,
+    max_seq_len: int,
+    plan: AttentionPlan,
+    sink_tokens: int = 0,
 ) -> StandaloneModelRunner:
+    # Before the engine, not with it: see use_sink_tokens.
+    use_sink_tokens(sink_tokens)
     runner = StandaloneModelRunner(
         RunnerConfig(
             model_path=args.model_path,
@@ -268,6 +344,7 @@ def build_runner(
             decode_graph=getattr(args, "decode_graph", "auto"),
             dense_attention_api=plan.dense_api_for(backend),
             dense_staging_backend=plan.staging_backend,
+            sink_tokens=sink_tokens,
         )
     )
     assert_no_vllm_imported()
@@ -296,6 +373,8 @@ class Rung:
     backend: str
     context: int
     prefill_mode: str
+    #: How many leading tokens this rung kept uncompressed; 0 is the shipping path.
+    sink_tokens: int = 0
     records: list[dict] = field(default_factory=list)
 
     @property
@@ -334,9 +413,10 @@ def run_rung(
     keep: int,
     sink,
     family: ModelFamily,
+    sink_tokens: int = 0,
 ) -> Rung:
     """One needle per depth at this context, each written out as it finishes."""
-    rung = Rung(backend, context, prefill_mode)
+    rung = Rung(backend, context, prefill_mode, sink_tokens)
     for depth in depths:
         item = needle_in_a_haystack(context, depth=depth, seed=int(depth * 100) + args.seed)
         prompt_ids = truncate_middle(encode(tokenizer, item.prompt, not args.raw_prompt, family), keep)
@@ -349,6 +429,7 @@ def run_rung(
         record = {
             "backend": backend,
             "prefill_mode": prefill_mode,
+            "sink_tokens": sink_tokens,
             "context_requested": context,
             "depth": depth,
             "found": report.found,
@@ -379,18 +460,19 @@ def run_rung(
 def summarise(rungs: list[Rung], depths: tuple[float, ...]) -> str:
     """The table the run exists to produce, one line per rung."""
     header = (
-        f"{'backend':22s} {'context':>8s} {'prefill':>14s} {'retrieved':>10s} {'clean':>10s} {'ttft ms':>10s} "
-        f"{'p50 us':>9s} {'p99 us':>9s} {'kv MB':>9s} {'dense MB':>9s} {'peak MB':>9s}"
+        f"{'backend':22s} {'sinks':>6s} {'context':>8s} {'prefill':>14s} {'retrieved':>10s} "
+        f"{'clean':>10s} {'ttft ms':>10s} {'p50 us':>9s} {'p99 us':>9s} {'kv MB':>9s} "
+        f"{'sink MB':>8s} {'dense MB':>9s} {'peak MB':>9s}"
     )
     lines = [header, "-" * len(header)]
     for rung in rungs:
         lines.append(
-            f"{rung.backend:22s} {rung.context:>8d} {rung.prefill_mode:>14s} "
+            f"{rung.backend:22s} {rung.sink_tokens:>6d} {rung.context:>8d} {rung.prefill_mode:>14s} "
             f"{f'{rung.hits}/{len(depths)}':>10s} {f'{rung.clean}/{len(depths)}':>10s} "
             f"{rung.median('ttft_ms'):>10.0f} "
             f"{rung.median('decode_p50_us'):>9.0f} {rung.median('decode_p99_us'):>9.0f} "
-            f"{rung.median('kv_cache_mb'):>9.1f} {rung.median('dense_equivalent_mb'):>9.1f} "
-            f"{rung.peak('device_peak_mb'):>9.0f}"
+            f"{rung.median('kv_cache_mb'):>9.1f} {rung.median('sink_cache_mb'):>8.2f} "
+            f"{rung.median('dense_equivalent_mb'):>9.1f} {rung.peak('device_peak_mb'):>9.0f}"
         )
     lines.append("")
     lines.append("retrieved: the passcode appears in the continuation as a whole token, wherever in it.")
@@ -398,6 +480,9 @@ def summarise(rungs: list[Rung], depths: tuple[float, ...]) -> str:
     lines.append("answering -- read the per-item verdicts (found+late, found+loop) and the predictions.")
     lines.append("ttft/p50/p99 are medians over the depths; peak MB is the allocator's high-water mark over them.")
     lines.append("The first decode step of a sequence pays first-touch costs no later step does: it lands in p99.")
+    if any(rung.sink_tokens for rung in rungs):
+        lines.append("sinks > 0 rows carry a host-side O(context) softmax recomputation per step: read them")
+        lines.append("for retrieval, not for p50/p99. sink MB is the side-car, on top of kv MB.")
     return "\n".join(lines)
 
 
@@ -407,6 +492,10 @@ def main(argv: list[str] | None = None) -> int:
     backends = parse_backends(args.backends)
     contexts = parse_int_list(args.contexts, "contexts")
     depths = parse_depths(args.depths)
+    sink_counts = parse_sink_tokens(args.sink_tokens)
+    # Published before the tokenizer, the config read or any runner: whatever else ends up
+    # in this process or in a subprocess of it must not see a stale value.
+    use_sink_tokens(sink_counts[0])
     config = read_config(args.model_path)
     family = family_for(config)
 
@@ -425,28 +514,45 @@ def main(argv: list[str] | None = None) -> int:
         for backend in backends:
             print(f"\n=== {backend} ===", file=sys.stderr)
             # The plan is per backend, and is settled at the longest rung: a
-            # prefill path refused there is refused everywhere below it too.
+            # prefill path refused there is refused everywhere below it too. It does not
+            # depend on the sink count -- sinks change what a decode computes, not which
+            # prefill path this device can run -- so it is probed once for the sweep.
             plan = plan_for_backend(args, backend, contexts, family)
             if plan.results or plan.notes:
                 print(plan.report(), file=sys.stderr)
-            runner = None
-            shared_mode = rung_prefill_mode(args, plan, backend, longest, family)
-            if args.reuse_runner:
-                runner = build_runner(args, backend, shared_mode, cache_tokens(args, longest), plan)
-            for context in contexts:
-                mode = shared_mode if args.reuse_runner else rung_prefill_mode(args, plan, backend, context, family)
-                max_seq_len = cache_tokens(args, longest if args.reuse_runner else context)
-                print(f"  context {context} ({mode}, cache {max_seq_len})", file=sys.stderr)
-                if not args.reuse_runner:
-                    runner = None
-                    free_device(args.device)
-                    runner = build_runner(args, backend, mode, max_seq_len, plan)
-                keep = max_seq_len - CONTEXT_HEADROOM_TOKENS - args.max_new_tokens
-                rungs.append(
-                    run_rung(args, runner, tokenizer, eos_ids, backend, context, mode, depths, keep, sink, family)
-                )
-            runner = None
-            free_device(args.device)
+            for sinks in sink_counts:
+                print(f"  {sink_banner(sinks)}", file=sys.stderr)
+                runner = None
+                shared_mode = rung_prefill_mode(args, plan, backend, longest, family)
+                if args.reuse_runner:
+                    runner = build_runner(args, backend, shared_mode, cache_tokens(args, longest), plan, sinks)
+                for context in contexts:
+                    mode = shared_mode if args.reuse_runner else rung_prefill_mode(args, plan, backend, context, family)
+                    max_seq_len = cache_tokens(args, longest if args.reuse_runner else context)
+                    print(f"  context {context} ({mode}, cache {max_seq_len}, sinks {sinks})", file=sys.stderr)
+                    if not args.reuse_runner:
+                        runner = None
+                        free_device(args.device)
+                        runner = build_runner(args, backend, mode, max_seq_len, plan, sinks)
+                    keep = max_seq_len - CONTEXT_HEADROOM_TOKENS - args.max_new_tokens
+                    rungs.append(
+                        run_rung(
+                            args,
+                            runner,
+                            tokenizer,
+                            eos_ids,
+                            backend,
+                            context,
+                            mode,
+                            depths,
+                            keep,
+                            sink,
+                            family,
+                            sinks,
+                        )
+                    )
+                runner = None
+                free_device(args.device)
     finally:
         if args.out_file:
             sink.close()
