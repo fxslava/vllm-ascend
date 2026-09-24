@@ -319,12 +319,20 @@ struct TurboQuantTaskHeads {
 // The batched decode keeps every per-head scalar of the softmax broadcast over its head's 8-lane block:
 // one wide op advances all heads, the same field is the block operand of a row op, and lane j * 8 still
 // holds head j's value for the per-task readers the two decodes share.
-template <TurboQuantMode MODE, typename scalar_t, typename Mm, typename Codec>
+//
+// BYPASS_UNPACK is the unpack ablation, and it is a measurement instrument, not a mode. It drops the
+// codec expand out of the ingest and stages the (zeroed, once, in Init) operand buffer into L1 instead.
+// Every other byte still moves: the MTE2 read of the packed plane, the MTE3 burst into L1, the Cube's
+// loads and MACs, and the whole softmax. What disappears is exactly the vector-pipe expand, so the delta
+// against the unablated leg is the unpack's cycle cost with its memory traffic held fixed. The output is
+// deterministic (all-zero scores) and numerically meaningless; nothing but a benchmark may instantiate it.
+template <TurboQuantMode MODE, typename scalar_t, typename Mm, typename Codec, bool BYPASS_UNPACK = false>
 class TurboQuantVectorDecodeService {
 public:
     using OperandT = typename Mm::OperandT;
     static constexpr bool kBatched = kBatchedCubeDecode<MODE>;
     static constexpr bool kNzTiled = kStoresNzTiles<MODE>;
+    static constexpr bool kBypassUnpack = BYPASS_UNPACK;
     static_assert(kNzTiled == Codec::kIsAffine, "only the byte-wise affine expand streams an NZ-tiled plane");
     // Ring slots of the tile ingest. Tile t reads into slot t % kCubeSlots, the slot of its L1 operands.
     static constexpr uint32_t kIngestSlots = kBatched ? kCubeSlots : 1;
@@ -340,6 +348,10 @@ public:
         InitBuffers(pipe);
         codec_.Init(pipe, headSize_, Codec::kIsAffine ? kUnpackChunkRows : kCubeUnpackRows, invSqrtLen,
                     modeTablesGm_);
+        InitIngestEvents();
+        if constexpr (kBypassUnpack) {
+            ZeroStagingBuffer();
+        }
     }
 
     __aicore__ inline AscendC::LocalTensor<float> Scores() { return scoreBuf_.Get<float>(); }
@@ -384,7 +396,7 @@ public:
         }
         const AscendC::LocalTensor<float> queryIn = queryInBuf_.Get<float>();
         const AscendC::LocalTensor<OperandT> queryOperand = queryOperandBuf_.Get<OperandT>();
-        const AscendC::LocalTensor<OperandT> queryL1 = mm.A1Query();
+        const AscendC::LocalTensor<OperandT> queryL1 = mm.L1Query();
 
         AscendC::DataCopy(queryIn,
                           queryRotGm_[(static_cast<uint64_t>(token) * numHeads_ + heads.first + heads.base) *
@@ -443,24 +455,21 @@ public:
     }
 
     // The MTE2 half of the ring ingest: one tile's plane and scale lanes into ring slot `slot`, posted to
-    // the vector unit on an event of the slot's own so the stage can wait for exactly this read. The
-    // caller orders it after the vector unit's last read of the slot's previous tile.
+    // the vector unit on the slot's own event id so the stage can wait for exactly this read. The caller
+    // orders it after the vector unit's last read of the slot's previous tile.
     __aicore__ inline void ReadTileToSlot(const uint32_t physical, const uint32_t rowBase, const uint32_t kvHead,
                                           const uint32_t slot)
     {
         ReadPlane(physical, rowBase, kvHead, slot);
-        readEvents_[slot] = GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE2_V>();
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(readEvents_[slot]);
     }
 
     // The vector half: waits for slot `slot`'s read, unpacks it in UB in NZ order and stages it into the
-    // slot's L1 operand in one MTE3 burst. The id is free again once the wait is issued: the next read that
-    // can draw it is ordered behind this stage's vector work by the caller's V -> MTE2 edge.
+    // slot's L1 operand in one MTE3 burst.
     __aicore__ inline void StageSlotToL1(Mm &mm, const uint32_t kvHead, const uint32_t slot)
     {
         const AscendC::LocalTensor<OperandT> l1Dst = PlaneOperand(mm, slot);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(readEvents_[slot]);
-        GetTPipePtr()->ReleaseEventID<AscendC::HardEvent::MTE2_V>(readEvents_[slot]);
 
         const AscendC::LocalTensor<int8_t> packed = kvBuf_[slot].Get<int8_t>();
         SelectKvHeadRows(packed, kvHead, slot);
@@ -496,7 +505,7 @@ public:
             ComputeSoftmaxHeads(valid, heads.mine, keyScale, valueScale);
         }
 
-        const AscendC::LocalTensor<OperandT> probsL1 = mm.A1Probs();
+        const AscendC::LocalTensor<OperandT> probsL1 = mm.L1Probs();
         SyncVectorToMte3();
         for (uint32_t j = 0; j < heads.mine; ++j) {
             AscendC::DataCopy(probsL1[(heads.base + j) * kOperandC0], probOperand[j * probElems], probRowToL1Params_);
@@ -580,6 +589,11 @@ public:
 
 private:
     static constexpr uint32_t kHalfRows = kCubeTileM / 2;
+    // The Cube's score rows: the first half of the dual-destination Fixpipe window, and the offset the
+    // context half starts at. See InitBuffers for why the two are pinned to the head of the UB pool.
+    static constexpr uint32_t kScoreBytes = kHalfRows * kCubeTileRows * sizeof(float);
+    static_assert(kScoreBytes % (kFp32PerBlock * sizeof(float)) == 0,
+                  "the context buffer has to start on a UB block, or the Fixpipe window is misaligned");
     static constexpr uint32_t kUnpackChunkRows = kCubeTileRows / 2;
     static constexpr uint32_t kKeyPlane = 0;
     static constexpr uint32_t kValuePlane = 1;
@@ -658,8 +672,21 @@ private:
     }
 
     // The UB layout is allocation order, so this order is part of the kernel's memory contract.
+    //
+    // The score and context buffers come first, and they come first on purpose. The two of them are the
+    // Cube's dual-destination Fixpipe window: the AIC names them by the offsets its own TPipe handed out
+    // and writes them into BOTH vector subcores' UB, so every core of the launch has to place them at the
+    // same offsets, and nothing in the toolchain checks that. A UB buffer allocated on one core and not
+    // the other -- here, in the codec, or in TurboQuantQueryBasis -- anywhere ahead of them on the shared
+    // pipe would shift the destination on that core alone, and the decode would read another buffer's
+    // bytes with nothing reporting an error. Allocated first they sit at UB offsets 0 and kScoreBytes
+    // whatever else the list below grows, so the contract narrows to one rule: this service's InitBuffers
+    // is the first UB allocation the pipe sees (TurboQuantCubeMm::Init runs before it but allocates in the
+    // L1 and L0 pools only), and these two lines stay at the top of it.
     __aicore__ inline void InitBuffers(AscendC::TPipe *pipe)
     {
+        pipe->InitBuffer(scoreBuf_, kScoreBytes);
+        pipe->InitBuffer(contextBuf_, kHalfRows * headSize_ * sizeof(float));
         for (uint32_t slot = 0; slot < kIngestSlots; ++slot) {
             pipe->InitBuffer(kvBuf_[slot], kCubeTileRows * packedBytes_);
         }
@@ -675,9 +702,7 @@ private:
         pipe->InitBuffer(queryWorkBuf_, (kBatched ? kHalfRows : 1) * headSize_ * sizeof(float));
         pipe->InitBuffer(queryInBuf_, kHalfRows * headSize_ * sizeof(float));
         pipe->InitBuffer(queryOperandBuf_, kHalfRows * operandElems_);
-        pipe->InitBuffer(scoreBuf_, kHalfRows * kCubeTileRows * sizeof(float));
         pipe->InitBuffer(probOperandBuf_, kHalfRows * Mm::OperandElems(kCubeTileRows));
-        pipe->InitBuffer(contextBuf_, kHalfRows * headSize_ * sizeof(float));
         pipe->InitBuffer(stateBuf_, kStateFields * kStateField * sizeof(float));
         pipe->InitBuffer(reduceBuf_, kReduceFloats * sizeof(float));
         pipe->InitBuffer(scaleIndexBuf_, 2 * kCubeTileRows * sizeof(int32_t));
@@ -686,6 +711,25 @@ private:
         pipe->InitBuffer(maskBuf_, 2 * kCubeTileRows * sizeof(float));
         if constexpr (!kNzTiled) {
             rowMajorBurst_.Init(pipe, numKvHeads_, packedBytes_, kCubeTileRows, kIngestSlots);
+        }
+    }
+
+    // One hard MTE2 -> V id per ingest slot, taken once for the launch instead of once per tile. The ring
+    // sets and waits a slot's id in strict alternation -- a slot's next read is ordered behind its previous
+    // stage's vector work by the caller's V -> MTE2 edge -- so a fixed id per slot is all the pipeline needs,
+    // and the tile loop issues no event bookkeeping at all.
+    //
+    // Holding the ids for the launch is also what keeps them out of the way of SyncEvent<MTE2_V>: TPipe's
+    // FetchEventID only peeks at the first *free* id, so an id that stays allocated can never be handed to a
+    // set/wait pair while a slot's read is in flight. kIngestSlots of the 8 the core has, and only on the AIV.
+    __aicore__ inline void InitIngestEvents()
+    {
+        if constexpr (kBatched) {
+            if ASCEND_IS_AIV {
+                for (uint32_t slot = 0; slot < kIngestSlots; ++slot) {
+                    readEvents_[slot] = GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE2_V>();
+                }
+            }
         }
     }
 
@@ -699,7 +743,7 @@ private:
 
     __aicore__ inline AscendC::LocalTensor<OperandT> PlaneOperand(Mm &mm, const uint32_t slot)
     {
-        return Plane() == kKeyPlane ? mm.B1K(slot) : mm.B1V(slot);
+        return Plane() == kKeyPlane ? mm.L1Key(slot) : mm.L1Value(slot);
     }
 
     // This subcore's plane of one tile and the tile's scale lanes, into ingest slot `slot`. rowBase is a
@@ -737,6 +781,25 @@ private:
             StageNzTileToL1(packed, l1Dst);
         } else {
             StageBandsToL1(packed, l1Dst);
+        }
+    }
+
+    // The ablation's one-time cost: the staging buffer the bypassed expand would have written is zeroed
+    // here, before the first tile, so every ablated tile stages defined bytes and the scores are a clean
+    // zero rather than whatever the UB held. Off the per-tile path on purpose -- it must not show up in
+    // the delta the leg measures.
+    __aicore__ inline void ZeroStagingBuffer()
+    {
+        if ASCEND_IS_AIV {
+            // Only one of the two staging buffers is allocated, so the branch has to be a constant one.
+            if constexpr (kNzTiled) {
+                AscendC::Duplicate(nzOperandBuf_.template Get<half>(), static_cast<half>(0),
+                                   kCubeTileRows * operandElems_ / sizeof(half));
+            } else {
+                AscendC::Duplicate(bandOperandBuf_.template Get<half>(), static_cast<half>(0),
+                                   kCubeUnpackRows * operandElems_ / sizeof(half));
+            }
+            AscendC::PipeBarrier<PIPE_V>();
         }
     }
 
@@ -941,10 +1004,14 @@ private:
                                            const AscendC::LocalTensor<OperandT> &l1Dst)
     {
         const AscendC::LocalTensor<OperandT> nzLow = nzOperandBuf_.Get<OperandT>();
-        const AscendC::LocalTensor<OperandT> nzHigh = nzLow[tilePlaneBytes_];
-        for (uint32_t base = 0; base < tilePlaneBytes_; base += unpackChunkBytes_) {
-            codec_.template UnpackAffine<OperandT>(nzLow[base], nzHigh[base], packed[base],
-                                                                 unpackChunkBytes_);
+        if constexpr (!kBypassUnpack) {
+            const AscendC::LocalTensor<OperandT> nzHigh = nzLow[tilePlaneBytes_];
+            for (uint32_t base = 0; base < tilePlaneBytes_; base += unpackChunkBytes_) {
+                codec_.template UnpackAffine<OperandT>(nzLow[base], nzHigh[base], packed[base],
+                                                                     unpackChunkBytes_);
+            }
+        } else {
+            (void)packed;
         }
         SyncVectorToMte3();
         AscendC::DataCopy(l1Dst, nzLow, nzTileToL1Params_);
@@ -957,7 +1024,11 @@ private:
         const AscendC::LocalTensor<OperandT> unpacked = bandOperandBuf_.Get<OperandT>();
         const uint32_t bandElems = kCubeUnpackRows * kOperandC0;
         for (uint32_t band = 0; band < kCubeTileRows / kCubeUnpackRows; ++band) {
-            codec_.Unpack(unpacked, packed[band * kCubeUnpackRows * packedBytes_], kCubeUnpackRows, headSize_);
+            if constexpr (!kBypassUnpack) {
+                codec_.Unpack(unpacked, packed[band * kCubeUnpackRows * packedBytes_], kCubeUnpackRows, headSize_);
+            } else {
+                (void)packed;
+            }
             SyncVectorToMte3();
             AscendC::DataCopy(l1Dst[band * bandElems], unpacked, bandToL1Params_);
         }

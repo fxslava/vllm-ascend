@@ -39,6 +39,15 @@ struct TurboQuantOperandType<TurboQuantMode::KV5_FP8> {
     using Type = fp8_e4m3fn_t;
 };
 
+// How the right-hand operand of a Cube GEMM is laid out in L1, which is what decides whether the L0B
+// load transposes it. The two are the decode's two GEMMs: the score GEMM's key tile is already N x K
+// (LoadData with ifTranspose false), the context GEMM's value tile is K x N and the load transposes it.
+// The values are the wire encoding the contract probe's kernel argument carries, so they are fixed.
+enum class GemmLayout : uint32_t {
+    Transposed = 0,
+    Normal = 1,
+};
+
 // The K x N context load variants the Cube contract probe (turboquant_cube_gemm_probe_impl) selects by
 // number. The decode always issues kCubeLoadDefault.
 enum CubeLoadVariant : uint32_t {
@@ -70,56 +79,56 @@ public:
         const uint32_t queryBytes = kCubeTileM * OperandElems(headSize_);
         const uint32_t probsBytes = kCubeTileM * OperandElems(tileRows_);
         const uint32_t tileBytes = tileRows_ * OperandElems(headSize_);
-        pipe->InitBuffer(queryA1_, queryBytes);
-        pipe->InitBuffer(probsA1_, probsBytes);
+        pipe->InitBuffer(queryL1Buf_, queryBytes);
+        pipe->InitBuffer(probsL1Buf_, probsBytes);
         for (uint32_t slot = 0; slot < kCubeSlots; ++slot) {
-            pipe->InitBuffer(keyB1_[slot], tileBytes);
-            pipe->InitBuffer(valueB1_[slot], tileBytes);
+            pipe->InitBuffer(keyL1Buf_[slot], tileBytes);
+            pipe->InitBuffer(valueL1Buf_[slot], tileBytes);
         }
 
         if ASCEND_IS_AIC {
-            pipe->InitBuffer(operandA2_, queryBytes > probsBytes ? queryBytes : probsBytes);
-            pipe->InitBuffer(operandB2_, tileBytes);
-            pipe->InitBuffer(productCo1_, kCubeTileM * headSize_ * sizeof(float));
+            pipe->InitBuffer(operandL0aBuf_, queryBytes > probsBytes ? queryBytes : probsBytes);
+            pipe->InitBuffer(operandL0bBuf_, tileBytes);
+            pipe->InitBuffer(productL0cBuf_, kCubeTileM * headSize_ * sizeof(float));
         }
     }
 
-    __aicore__ inline AscendC::LocalTensor<OperandT> A1Query() { return queryA1_.template Get<OperandT>(); }
-    __aicore__ inline AscendC::LocalTensor<OperandT> A1Probs() { return probsA1_.template Get<OperandT>(); }
-    __aicore__ inline AscendC::LocalTensor<OperandT> B1K(uint32_t slot) { return keyB1_[slot].template Get<OperandT>(); }
-    __aicore__ inline AscendC::LocalTensor<OperandT> B1V(uint32_t slot)
+    __aicore__ inline AscendC::LocalTensor<OperandT> L1Query() { return queryL1Buf_.template Get<OperandT>(); }
+    __aicore__ inline AscendC::LocalTensor<OperandT> L1Probs() { return probsL1Buf_.template Get<OperandT>(); }
+    __aicore__ inline AscendC::LocalTensor<OperandT> L1Key(uint32_t slot) { return keyL1Buf_[slot].template Get<OperandT>(); }
+    __aicore__ inline AscendC::LocalTensor<OperandT> L1Value(uint32_t slot)
     {
-        return valueB1_[slot].template Get<OperandT>();
+        return valueL1Buf_[slot].template Get<OperandT>();
     }
-    __aicore__ inline AscendC::LocalTensor<OperandT> B1() { return B1K(0); }
+    __aicore__ inline AscendC::LocalTensor<OperandT> L1Weight() { return L1Key(0); }
 
     __aicore__ static constexpr uint32_t NzOffset(uint32_t row, uint32_t column, uint32_t rows)
     {
         return (column / kOperandC0) * rows * kOperandC0 + row * kOperandC0 + (column % kOperandC0);
     }
 
-    // Query rows x key tile: M x K operand in A1, N x K operand in B1.
+    // Query rows x key tile: the M x K left operand in L1, the N x K right operand in L1.
     template <bool DUAL_DST = false>
     __aicore__ inline void GemmScores(const AscendC::LocalTensor<float> &dstUb,
-                                      const AscendC::LocalTensor<OperandT> &keyB1, uint32_t m, uint32_t k, uint32_t n)
+                                      const AscendC::LocalTensor<OperandT> &keyL1, uint32_t m, uint32_t k, uint32_t n)
     {
-        activeA1_ = queryA1_.template Get<OperandT>();
-        activeB1_ = keyB1;
-        StageA2(m, k);
-        StageB2FromNk(k, n);
+        activeLeftL1_ = queryL1Buf_.template Get<OperandT>();
+        activeRightL1_ = keyL1;
+        StageLeftToL0a(m, k);
+        StageRightToL0bFromNk(k, n);
         ComputeProductToUb<DUAL_DST>(dstUb, m, k, n);
     }
 
-    // Probability rows x value tile: M x K operand in A1, K x N operand in B1.
+    // Probability rows x value tile: the M x K left operand in L1, the K x N right operand in L1.
     template <bool DUAL_DST = false>
     __aicore__ inline void GemmContext(const AscendC::LocalTensor<float> &dstUb,
-                                       const AscendC::LocalTensor<OperandT> &valueB1, uint32_t m, uint32_t k, uint32_t n,
-                                       uint32_t variant = kCubeLoadDefault)
+                                       const AscendC::LocalTensor<OperandT> &valueL1, uint32_t m, uint32_t k,
+                                       uint32_t n, uint32_t variant = kCubeLoadDefault)
     {
-        activeA1_ = probsA1_.template Get<OperandT>();
-        activeB1_ = valueB1;
-        StageA2(m, k);
-        StageB2FromKn(k, n, variant);
+        activeLeftL1_ = probsL1Buf_.template Get<OperandT>();
+        activeRightL1_ = valueL1;
+        StageLeftToL0a(m, k);
+        StageRightToL0bFromKn(k, n, variant);
         ComputeProductToUb<DUAL_DST>(dstUb, m, k, n);
     }
 
@@ -131,10 +140,10 @@ private:
     static constexpr uint32_t kDualDstSubcores = 2;
     static constexpr uint8_t kDualDstSplitM = 1;
 
-    __aicore__ inline void StageA2(uint32_t m, uint32_t k)
+    __aicore__ inline void StageLeftToL0a(uint32_t m, uint32_t k)
     {
-        const AscendC::LocalTensor<OperandT> srcA1 = activeA1_;
-        const AscendC::LocalTensor<OperandT> dstA2 = operandA2_.template Get<OperandT>();
+        const AscendC::LocalTensor<OperandT> srcL1 = activeLeftL1_;
+        const AscendC::LocalTensor<OperandT> dstL0a = operandL0aBuf_.template Get<OperandT>();
         AscendC::LoadData2DParamsV2 params;
         params.mStartPosition = 0;
         params.kStartPosition = 0;
@@ -143,13 +152,13 @@ private:
         params.srcStride = CeilDivU16(m, kFractalRows);
         params.dstStride = CeilDivU16(m, kFractalRows);
         params.ifTranspose = false;
-        AscendC::LoadData(dstA2, srcA1, params);
+        AscendC::LoadData(dstL0a, srcL1, params);
     }
 
-    __aicore__ inline void StageB2FromNk(uint32_t k, uint32_t n)
+    __aicore__ inline void StageRightToL0bFromNk(uint32_t k, uint32_t n)
     {
-        const AscendC::LocalTensor<OperandT> srcB1 = activeB1_;
-        const AscendC::LocalTensor<OperandT> dstB2 = operandB2_.template Get<OperandT>();
+        const AscendC::LocalTensor<OperandT> srcL1 = activeRightL1_;
+        const AscendC::LocalTensor<OperandT> dstL0b = operandL0bBuf_.template Get<OperandT>();
         AscendC::LoadData2DParamsV2 params;
         params.mStartPosition = 0;
         params.kStartPosition = 0;
@@ -158,13 +167,13 @@ private:
         params.srcStride = CeilDivU16(n, kFractalRows);
         params.dstStride = CeilDivU16(n, kFractalRows);
         params.ifTranspose = false;
-        AscendC::LoadData(dstB2, srcB1, params);
+        AscendC::LoadData(dstL0b, srcL1, params);
     }
 
-    __aicore__ inline void StageB2FromKn(uint32_t k, uint32_t n, uint32_t variant = kCubeLoadDefault)
+    __aicore__ inline void StageRightToL0bFromKn(uint32_t k, uint32_t n, uint32_t variant = kCubeLoadDefault)
     {
-        const AscendC::LocalTensor<OperandT> srcB1 = activeB1_;
-        const AscendC::LocalTensor<OperandT> dstB2 = operandB2_.template Get<OperandT>();
+        const AscendC::LocalTensor<OperandT> srcL1 = activeRightL1_;
+        const AscendC::LocalTensor<OperandT> dstL0b = operandL0bBuf_.template Get<OperandT>();
         AscendC::LoadData2DParamsV2 params;
         params.kStartPosition = 0;
         params.kStep = (variant == kCubeLoadKStepByFractalRows) ? CeilDivU16(n, kFractalRows) : CeilDivU16(n, kC0);
@@ -177,7 +186,7 @@ private:
         if (variant == kCubeLoadSingleLoad) {
             params.mStartPosition = 0;
             params.mStep = mSteps;
-            AscendC::LoadData(dstB2, srcB1, params);
+            AscendC::LoadData(dstL0b, srcL1, params);
             return;
         }
 
@@ -193,7 +202,7 @@ private:
         uint32_t dstOffset = 0;
         for (uint16_t band = 0; band < bands; ++band) {
             params.mStartPosition = static_cast<uint32_t>(kKnBandRows) * band;
-            AscendC::LoadData(dstB2[dstOffset], srcB1, params);
+            AscendC::LoadData(dstL0b[dstOffset], srcL1, params);
             if (variant != kCubeLoadNoMte1EventPerBand) {
                 SyncMte1ToMatrix();
             }
@@ -209,13 +218,13 @@ private:
     __aicore__ inline void ComputeProductToUb(const AscendC::LocalTensor<float> &dstUb, uint32_t m, uint32_t k,
                                               uint32_t n)
     {
-        const AscendC::LocalTensor<OperandT> a2 = operandA2_.template Get<OperandT>();
-        const AscendC::LocalTensor<OperandT> b2 = operandB2_.template Get<OperandT>();
-        const AscendC::LocalTensor<float> product = productCo1_.template Get<float>();
+        const AscendC::LocalTensor<OperandT> leftL0a = operandL0aBuf_.template Get<OperandT>();
+        const AscendC::LocalTensor<OperandT> rightL0b = operandL0bBuf_.template Get<OperandT>();
+        const AscendC::LocalTensor<float> product = productL0cBuf_.template Get<float>();
 
         SyncMte1ToMatrix();
 
-        AscendC::Mmad(product, a2, b2,
+        AscendC::Mmad(product, leftL0a, rightL0b,
                       AscendC::MmadParams(static_cast<uint16_t>(m), static_cast<uint16_t>(n),
                                           static_cast<uint16_t>(k), 0, false, true));
 
@@ -240,16 +249,16 @@ private:
         AscendC::PipeBarrier<PIPE_FIX>();
     }
 
-    AscendC::LocalTensor<OperandT> activeA1_;
-    AscendC::LocalTensor<OperandT> activeB1_;
+    AscendC::LocalTensor<OperandT> activeLeftL1_;
+    AscendC::LocalTensor<OperandT> activeRightL1_;
 
-    AscendC::TBuf<AscendC::TPosition::A1> queryA1_;
-    AscendC::TBuf<AscendC::TPosition::A1> probsA1_;
-    AscendC::TBuf<AscendC::TPosition::B1> keyB1_[kCubeSlots];
-    AscendC::TBuf<AscendC::TPosition::B1> valueB1_[kCubeSlots];
-    AscendC::TBuf<AscendC::TPosition::A2> operandA2_;
-    AscendC::TBuf<AscendC::TPosition::B2> operandB2_;
-    AscendC::TBuf<AscendC::TPosition::CO1> productCo1_;
+    AscendC::TBuf<AscendC::TPosition::A1> queryL1Buf_;
+    AscendC::TBuf<AscendC::TPosition::A1> probsL1Buf_;
+    AscendC::TBuf<AscendC::TPosition::B1> keyL1Buf_[kCubeSlots];
+    AscendC::TBuf<AscendC::TPosition::B1> valueL1Buf_[kCubeSlots];
+    AscendC::TBuf<AscendC::TPosition::A2> operandL0aBuf_;
+    AscendC::TBuf<AscendC::TPosition::B2> operandL0bBuf_;
+    AscendC::TBuf<AscendC::TPosition::CO1> productL0cBuf_;
     uint32_t headSize_ = 0;
     uint32_t tileRows_ = 0;
 };
@@ -281,7 +290,7 @@ private:
                                                 const uint32_t slot, const uint32_t rows, const uint32_t headSize)
     {
         AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kFlagSlotReady + slot));
-        mm.template GemmScores<true>(scoresUb, mm.B1K(slot), rows, headSize, kCubeTileRows);
+        mm.template GemmScores<true>(scoresUb, mm.L1Key(slot), rows, headSize, kCubeTileRows);
         AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_FIX>(kFlagScoresReady);
     }
 
@@ -289,7 +298,7 @@ private:
                                                  const uint32_t slot, const uint32_t rows, const uint32_t headSize)
     {
         AscendC::CrossCoreWaitFlag(kFlagProbsReady);
-        mm.template GemmContext<true>(contextUb, mm.B1V(slot), rows, kCubeTileRows, headSize);
+        mm.template GemmContext<true>(contextUb, mm.L1Value(slot), rows, kCubeTileRows, headSize);
         AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_FIX>(kFlagContextReady);
     }
 };

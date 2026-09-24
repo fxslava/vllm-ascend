@@ -28,6 +28,7 @@
 #include "vector/turboquant_vector_service.h"
 
 using vllm_ascend::turboquant::CeilDiv;
+using vllm_ascend::turboquant::GemmLayout;
 using vllm_ascend::turboquant::kCubeLoadDoubleOperandsWait;
 using vllm_ascend::turboquant::kCubeSlots;
 using vllm_ascend::turboquant::kCubeTileM;
@@ -275,12 +276,16 @@ private:
 // basis. false: the caller hands in the raw query, RotateQuery() rotates every vector once before Process()
 // starts the task loop, and the output stage InitBasis() selects runs on every head before its output cast
 // (cube/turboquant_query_basis.h).
-template <TurboQuantMode MODE, typename scalar_t, bool PRE_ROTATED = true>
+//
+// BYPASS_UNPACK is the unpack ablation described on TurboQuantVectorDecodeService: a timing-only build of
+// the same decode with the codec expand removed from the ingest and nothing else changed. Its output is
+// all-zero by construction, so only a benchmark instantiates it and only under VLLM_ASCEND_TQ_TEST_KERNELS.
+template <TurboQuantMode MODE, typename scalar_t, bool PRE_ROTATED = true, bool BYPASS_UNPACK = false>
 class TurboQuantFusedDecode {
 public:
     using Mm = TurboQuantCubeMm<MODE>;
     using Codec = TurboQuantModeCodec<MODE>;
-    using Vector = TurboQuantVectorDecodeService<MODE, scalar_t, Mm, Codec>;
+    using Vector = TurboQuantVectorDecodeService<MODE, scalar_t, Mm, Codec, BYPASS_UNPACK>;
     using Cube = TurboQuantCubeDecodeService<MODE>;
     using Reducer = TurboQuantPartialReducer<scalar_t>;
     using Basis = TurboQuantQueryBasis<scalar_t, !PRE_ROTATED>;
@@ -358,6 +363,9 @@ public:
         }
     }
 
+    // Grid-uniform on purpose: every block reads every token's length, so the SyncAll the caller guards
+    // with this is entered by all of them or by none. A per-block predicate here would strand the blocks
+    // that answered false in the barrier the rest went on to run.
     __aicore__ inline bool NeedsReduction()
     {
         if (numSplits_ <= 1) {
@@ -448,10 +456,19 @@ private:
                 if (heads.mine > 0 && blockEnd == seqBlocks && tail != 0) {
                     vector_.ComputeTailMask(tail);
                 }
-                StageTiles(token, ctxLen, blockStart, blockEnd, numTiles, kvHead, heads);
             }
-            if ASCEND_IS_AIC {
-                if (numTiles > 0) {
+            // The one condition both cores branch on, so the bypass is visibly lock-step. A block range
+            // can hold no tile at all -- every blockTable entry in it negative, which is what a padding or
+            // unmapped block carries -- and then neither core may touch the cross-core flags: an AIV that
+            // skipped StageTiles while the AIC still ran RunTiles would leave the AIC on kFlagSlotReady
+            // with nothing ever to set it, which is a hung launch, not a wrong answer. CountTiles is safe
+            // to branch on here because both cores run it over the same GM words with the same indices,
+            // so they cannot disagree about it.
+            if (numTiles > 0) {
+                if ASCEND_IS_AIV {
+                    StageTiles(token, ctxLen, blockStart, blockEnd, numTiles, kvHead, heads);
+                }
+                if ASCEND_IS_AIC {
                     Cube::RunTiles(mm_, vector_.Scores(), vector_.Context(), numTiles, heads.rows, headSize_);
                 }
             }
@@ -522,13 +539,12 @@ private:
         return false;
     }
 
+    // numTiles >= 1: ComputeTask bypasses the whole pipeline on both cores when a block range holds no
+    // tile, so neither pipeline below has an empty-range case to carry.
     __aicore__ inline void StageTiles(const uint32_t token, const uint32_t contextLen, const uint32_t blockStart,
                                       const uint32_t blockEnd, const uint32_t numTiles, const uint32_t kvHead,
                                       const TurboQuantTaskHeads &heads)
     {
-        if (numTiles == 0) {
-            return;
-        }
         if constexpr (Vector::kBatched) {
             StageTilesRing(token, contextLen, blockStart, blockEnd, numTiles, kvHead, heads);
         } else {
@@ -659,37 +675,38 @@ public:
 
     __aicore__ inline explicit TurboQuantCubeGemmProbe(AscendC::TPipe *pipe) : pipe_(pipe) {}
 
-    __aicore__ inline void Init(__gm__ void *a, __gm__ void *b, __gm__ void *c, const uint32_t headSize,
-                                const uint32_t tileRows, const uint32_t aElems, const uint32_t bElems,
-                                const uint32_t cElems)
+    __aicore__ inline void Init(__gm__ void *leftGm, __gm__ void *rightGm, __gm__ void *outGm,
+                                const uint32_t headSize, const uint32_t tileRows, const uint32_t leftElems,
+                                const uint32_t rightElems, const uint32_t outElems)
     {
-        aElems_ = aElems;
-        bElems_ = bElems;
-        cElems_ = cElems;
-        aGm_.SetGlobalBuffer(reinterpret_cast<__gm__ OperandT *>(a));
-        bGm_.SetGlobalBuffer(reinterpret_cast<__gm__ OperandT *>(b));
-        cGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(c));
+        leftElems_ = leftElems;
+        rightElems_ = rightElems;
+        outElems_ = outElems;
+        leftGm_.SetGlobalBuffer(reinterpret_cast<__gm__ OperandT *>(leftGm));
+        rightGm_.SetGlobalBuffer(reinterpret_cast<__gm__ OperandT *>(rightGm));
+        outGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(outGm));
         mm_.Init(pipe_, headSize, tileRows);
-        pipe_->InitBuffer(stageBuf_, aElems > bElems ? aElems : bElems);
-        pipe_->InitBuffer(outBuf_, cElems * sizeof(float));
+        pipe_->InitBuffer(stageBuf_, leftElems > rightElems ? leftElems : rightElems);
+        pipe_->InitBuffer(outBuf_, outElems * sizeof(float));
         // Init boundary: drains every pipe before the probe's first GM read.
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 
-    __aicore__ inline void Run(const uint32_t m, const uint32_t k, const uint32_t n, const uint32_t bIsNk,
+    __aicore__ inline void Run(const uint32_t m, const uint32_t k, const uint32_t n, const GemmLayout layout,
                                const uint32_t variant)
     {
+        const bool rightIsNk = layout == GemmLayout::Normal;
         const AscendC::LocalTensor<float> out = outBuf_.Get<float>();
         if ASCEND_IS_AIV {
             const AscendC::LocalTensor<OperandT> stage = stageBuf_.Get<OperandT>();
-            AscendC::DataCopy(stage, aGm_, aElems_);
+            AscendC::DataCopy(stage, leftGm_, leftElems_);
             // Probe-only GM -> UB -> L1 hand-off, kept in its original form.
             AscendC::PipeBarrier<PIPE_ALL>();
-            AscendC::DataCopy(bIsNk != 0 ? mm_.A1Query() : mm_.A1Probs(), stage, aElems_);
-            AscendC::DataCopy(stage, bGm_, bElems_);
+            AscendC::DataCopy(rightIsNk ? mm_.L1Query() : mm_.L1Probs(), stage, leftElems_);
+            AscendC::DataCopy(stage, rightGm_, rightElems_);
             // Probe-only GM -> UB -> L1 hand-off, kept in its original form.
             AscendC::PipeBarrier<PIPE_ALL>();
-            AscendC::DataCopy(mm_.B1(), stage, bElems_);
+            AscendC::DataCopy(mm_.L1Weight(), stage, rightElems_);
             AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_MTE3>(kFlagOperandsReady);
         }
         if ASCEND_IS_AIC {
@@ -697,17 +714,17 @@ public:
             if (variant == kCubeLoadDoubleOperandsWait) {
                 AscendC::CrossCoreWaitFlag(kFlagOperandsReady);
             }
-            if (bIsNk != 0) {
-                mm_.GemmScores(out, mm_.B1(), m, k, n);
+            if (rightIsNk) {
+                mm_.GemmScores(out, mm_.L1Weight(), m, k, n);
             } else {
-                mm_.GemmContext(out, mm_.B1(), m, k, n, variant);
+                mm_.GemmContext(out, mm_.L1Weight(), m, k, n, variant);
             }
             AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_FIX>(kFlagProductReady);
         }
         if ASCEND_IS_AIV {
             AscendC::CrossCoreWaitFlag(kFlagProductReady);
             if (AscendC::GetSubBlockIdx() == 0) {
-                AscendC::DataCopy(cGm_, out, cElems_);
+                AscendC::DataCopy(outGm_, out, outElems_);
             }
             // Probe-only: the product's GM write lands before the launch returns.
             AscendC::PipeBarrier<PIPE_ALL>();
@@ -719,12 +736,12 @@ private:
     Mm mm_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> stageBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> outBuf_;
-    AscendC::GlobalTensor<OperandT> aGm_;
-    AscendC::GlobalTensor<OperandT> bGm_;
-    AscendC::GlobalTensor<float> cGm_;
-    uint32_t aElems_ = 0;
-    uint32_t bElems_ = 0;
-    uint32_t cElems_ = 0;
+    AscendC::GlobalTensor<OperandT> leftGm_;
+    AscendC::GlobalTensor<OperandT> rightGm_;
+    AscendC::GlobalTensor<float> outGm_;
+    uint32_t leftElems_ = 0;
+    uint32_t rightElems_ = 0;
+    uint32_t outElems_ = 0;
 };
 #endif
 
@@ -744,6 +761,11 @@ private:
     }
 
 #define ASCEND_TQ_DECLARE_MM_FUSED_DECODE(NAME, MODE, TYPE)                                                          \
+    ASCEND_TQ_DECLARE_MM_FUSED_DECODE_ABLATED(NAME, MODE, TYPE, false)
+
+// BYPASS_UNPACK selects the unpack ablation of the same kernel; see TurboQuantFusedDecode. The argument list
+// and the launch are identical, so the two entries are interchangeable to a benchmark and to msprof.
+#define ASCEND_TQ_DECLARE_MM_FUSED_DECODE_ABLATED(NAME, MODE, TYPE, BYPASS_UNPACK)                                   \
     extern "C" __global__ __aicore__ void NAME(                                                                      \
         GM_ADDR queryRot, GM_ADDR keyCache, GM_ADDR valueCache, GM_ADDR scaleCache, GM_ADDR blockTables,             \
         GM_ADDR contextLens, GM_ADDR modeTables, GM_ADDR workspace, GM_ADDR output, uint32_t numTokens,              \
@@ -752,7 +774,7 @@ private:
         uint32_t fusedContextLimit, float scale, float invSqrtLen)                                                   \
     {                                                                                                                \
         AscendC::TPipe pipe;                                                                                         \
-        TurboQuantFusedDecode<MODE, TYPE> op(&pipe);                                                                 \
+        TurboQuantFusedDecode<MODE, TYPE, true, BYPASS_UNPACK> op(&pipe);                                            \
         op.Init(queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output, \
                 numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,      \
                 fusedContextLimit, scale, invSqrtLen);                                                               \
@@ -812,14 +834,20 @@ ASCEND_TQ_DECLARE_MM_FUSED_DECODE_RAW_QUERY(turboquant_mm_fused_decode_raw_query
 ASCEND_TQ_DECLARE_MM_MODE(kv3fp4, TurboQuantMode::KV3_FP4)
 ASCEND_TQ_DECLARE_MM_MODE(kv5fp8, TurboQuantMode::KV5_FP8)
 
+// The unpack ablation of the shipping decode: same launch, same traffic, no codec expand, zero output.
+ASCEND_TQ_DECLARE_MM_FUSED_DECODE_ABLATED(turboquant_mm_fused_decode_nounpack_kv4fp8_half,
+                                          TurboQuantMode::KV4_FP8, half, true)
+
+// rightLayout is a GemmLayout: 0 transposes the K x N right operand into L0B, 1 takes it as N x K.
 extern "C" __global__ __aicore__ void turboquant_cube_gemm_probe_fp8(
-    GM_ADDR a, GM_ADDR b, GM_ADDR c, uint32_t m, uint32_t k, uint32_t n, uint32_t headSize, uint32_t tileRows,
-    uint32_t aElems, uint32_t bElems, uint32_t cElems, uint32_t bIsNk, uint32_t variant)
+    GM_ADDR leftGm, GM_ADDR rightGm, GM_ADDR outGm, uint32_t m, uint32_t k, uint32_t n, uint32_t headSize,
+    uint32_t tileRows, uint32_t leftElems, uint32_t rightElems, uint32_t outElems, uint32_t rightLayout,
+    uint32_t variant)
 {
     AscendC::TPipe pipe;
     TurboQuantCubeGemmProbe op(&pipe);
-    op.Init(a, b, c, headSize, tileRows, aElems, bElems, cElems);
-    op.Run(m, k, n, bIsNk, variant);
+    op.Init(leftGm, rightGm, outGm, headSize, tileRows, leftElems, rightElems, outElems);
+    op.Run(m, k, n, static_cast<GemmLayout>(rightLayout), variant);
 }
 #endif
 
@@ -900,6 +928,29 @@ void turboquant_mm_fused_decode_impl(int32_t mode, AscendType type, void *stream
     }
 }
 
+#if defined(VLLM_ASCEND_TQ_TEST_KERNELS)
+// The unpack ablation's launch. Deliberately a separate entry point rather than a flag on the shipping one:
+// nothing outside csrc/tests can reach a kernel whose output is meaningless by construction.
+void turboquant_mm_fused_decode_nounpack_impl(int32_t mode, AscendType type, void *stream, uint32_t blockDim,
+                                             void *queryRot, void *keyCache, void *valueCache, void *scaleCache,
+                                             void *blockTables, void *contextLens, void *modeTables, void *workspace,
+                                             void *output, uint32_t numTokens, uint32_t numHeads,
+                                             uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,
+                                             uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t headsPerTask,
+                                             uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,
+                                             uint32_t fusedContextLimit, float scale, float invSqrtLen)
+{
+    if (type != AscendType::FP16 || blockDim == 0 ||
+        static_cast<turboquant::TurboQuantMode>(mode) != turboquant::TurboQuantMode::KV4_FP8) {
+        return;
+    }
+    turboquant_mm_fused_decode_nounpack_kv4fp8_half<<<blockDim, nullptr, stream>>>(
+        queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,
+        numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,
+        tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen);
+}
+#endif
+
 void turboquant_mm_fused_decode_raw_query_impl(int32_t mode, AscendType type, void *stream, uint32_t blockDim,
                                               void *query, void *piSigns, void *rotTables, void *h16, void *gate,
                                               void *queryRot, void *keyCache, void *valueCache, void *scaleCache,
@@ -924,12 +975,12 @@ void turboquant_mm_fused_decode_raw_query_impl(int32_t mode, AscendType type, vo
 }
 
 #if defined(VLLM_ASCEND_TQ_TEST_KERNELS)
-void turboquant_cube_gemm_probe_impl(void *stream, void *a, void *b, void *c, uint32_t m, uint32_t k, uint32_t n,
-                                     uint32_t headSize, uint32_t tileRows, uint32_t aElems, uint32_t bElems,
-                                     uint32_t cElems, uint32_t bIsNk, uint32_t variant)
+void turboquant_cube_gemm_probe_impl(void *stream, void *leftGm, void *rightGm, void *outGm, uint32_t m, uint32_t k,
+                                     uint32_t n, uint32_t headSize, uint32_t tileRows, uint32_t leftElems,
+                                     uint32_t rightElems, uint32_t outElems, uint32_t rightLayout, uint32_t variant)
 {
-    turboquant_cube_gemm_probe_fp8<<<1, nullptr, stream>>>(a, b, c, m, k, n, headSize, tileRows, aElems, bElems,
-                                                           cElems, bIsNk, variant);
+    turboquant_cube_gemm_probe_fp8<<<1, nullptr, stream>>>(leftGm, rightGm, outGm, m, k, n, headSize, tileRows,
+                                                           leftElems, rightElems, outElems, rightLayout, variant);
 }
 #endif
 

@@ -42,6 +42,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -118,6 +119,12 @@ tqh::FusedShape Shape(int64_t num_heads, int64_t context_len, bool kernel_writer
   return shape;
 }
 
+tqh::FusedShape UnmappedShape() {
+  tqh::FusedShape shape = Shape(kNarrowGroupHeads, kSingleTileContext);
+  shape.unmapped_block_table = true;
+  return shape;
+}
+
 tqh::FusedShape GatedBatchShape() {
   tqh::FusedShape shape = Shape(kWideGroupHeads, kBatchContext);
   shape.batch = kBatchTokens;
@@ -152,6 +159,19 @@ const tqh::FusedShape kBatchShape = GatedBatchShape();
 const FusedCase kCaseH = {"(h)", kBatchShape, 0, kContextOnly, 0.999510, 0x964ba5db49bdfb2dull};
 const FusedCase kCaseHGated = {"(h) gated", kBatchShape, 0, kContextOnly, 0.999507, 0x80ddb42451590ba1ull};
 const FusedCase kCaseHGatedSplit = {"(h) gated split", kBatchShape, 0, kFillBlocks, 0.999507, 0x80ddb42451590ba1ull};
+
+// (i) and (j) are execution cases, not fidelity cases: neither has a golden, because neither decodes a
+// cache. (i) is (a)'s shape with every block-table entry unmapped, so its answer is exactly zero; (j) is
+// (e)'s writer shape, re-run through slot_mapping addresses that are not burst aligned. Both are one tile's
+// worth of context on purpose -- the camodel charges by the launch, and these two assert reachability and
+// addressing, which the smallest shape shows as well as any.
+const FusedCase kCaseI = {"(i)", UnmappedShape(), 0, kFillBlocks, 0.0, kGoldenUnrecorded};
+const FusedCase kCaseJ = {"(j)", Shape(kNarrowGroupHeads, kSingleTileContext, true), 0, kFillBlocks, 0.0,
+                          kGoldenUnrecorded};
+// Element-aligned int32 offsets that all land inside a 32-byte burst rather than on one.
+const int64_t kSlicedSlotOffsets[] = {1, 2, 3};
+// The MTE burst the adapter's CheckGmBurstAligned holds copied operands to, and that a scalar read does not.
+constexpr size_t kGmBurstBytes = static_cast<size_t>(tqh::kFp32PerBlock) * sizeof(float);
 
 void PrintShape(const FusedCase& fused_case, int64_t aiv_num, bool queried) {
   const tqh::FusedShape& shape = fused_case.shape;
@@ -206,6 +226,19 @@ tqh::FusedRun RunCase(tqh::FusedCubeScenario* scenario, const FusedCase& fused_c
     EXPECT_GE(cosine, fused_case.recorded_cosine - kCosineRounding) << tag << ": cos vs exact fp32 regressed";
   }
   return fused;
+}
+
+// Element positions where two GM images differ. Both sides are raw device reads, so this is a bit compare.
+template <typename T>
+size_t CountDiffs(const std::vector<T>& got, const std::vector<T>& want) {
+  if (got.size() != want.size()) {
+    return want.size() + got.size();
+  }
+  size_t diffs = 0;
+  for (size_t i = 0; i < want.size(); ++i) {
+    diffs += (std::memcmp(&got[i], &want[i], sizeof(T)) != 0) ? 1u : 0u;
+  }
+  return diffs;
 }
 
 void ExpectNoExceptionDumps(const char* tag) {
@@ -286,6 +319,89 @@ TEST_F(TurboQuantFusedDecode, DecodesTheCacheTheKernelWriterWrote) {
   const tqh::FusedRun fused = RunCase(&scenario, kCaseE, &watchdog_, scenario.Reference());
   EXPECT_EQ(fused.num_splits, 1) << "a context inside the fused limit is never split";
   ExpectNoExceptionDumps(kCaseE.tag);
+}
+
+// (i) The numTiles == 0 path. Every block-table entry is -1, so every task has a non-empty block range that
+// holds no tile at all. Both cores have to leave the cross-core pipeline alone in lock step: an AIV that
+// skipped StageTiles while the AIC ran RunTiles would strand the AIC on kFlagSlotReady with nothing left to
+// set it, and the launch would never return -- a hang, not a wrong answer, which is why the watchdog rather
+// than the golden is the real assertion here. The answer itself is exact: BeginTask zeroes the accumulator
+// and the running sum, nothing adds to either, and the close-out writes acc / (sum + eps) = 0.
+TEST_F(TurboQuantFusedDecode, SkipsAnUnmappedBlockTableWithoutStrandingTheCube) {
+  PrintShape(kCaseI, aiv_num_, queried_);
+  watchdog_.Arm("(i) unmapped block table scenario setup");
+  tqh::FusedCubeScenario scenario(kCaseI.shape, stream_, aiv_num_);
+  watchdog_.Disarm();
+
+  const tqh::FusedDecodeGrid grid = scenario.Plan(kCaseI.plan_aiv, kCaseI.split_policy);
+  watchdog_.Arm("(i) turboquant_mm_fused_decode_impl on an unmapped block table");
+  const tqh::FusedRun fused = scenario.RunFused(grid);
+  watchdog_.Disarm();
+  std::printf("[ fused ] (i) unmapped block table: block_dim=%u heads/task=%u splits=%lld untouched=%zu %.1f s\n",
+              fused.block_dim, fused.heads_per_task, static_cast<long long>(fused.num_splits), fused.untouched,
+              fused.host_s);
+
+  EXPECT_EQ(fused.launches, 1) << "(i)";
+  EXPECT_EQ(fused.untouched, 0u) << "(i): the launch left part of the output unwritten";
+  size_t nonzero = 0;
+  size_t first_nonzero = 0;
+  for (size_t i = 0; i < fused.output.size(); ++i) {
+    if (fused.output[i] != 0.0f) {
+      if (nonzero == 0) {
+        first_nonzero = i;
+      }
+      ++nonzero;
+    }
+  }
+  EXPECT_EQ(nonzero, 0u) << "(i): " << nonzero << " of " << fused.output.size()
+                         << " output elements are non-zero, first at " << first_nonzero << " = "
+                         << (first_nonzero < fused.output.size() ? fused.output[first_nonzero] : 0.0f)
+                         << "; a task with no live tile must contribute nothing";
+  ExpectNoExceptionDumps(kCaseI.tag);
+}
+
+// (j) slot_mapping handed to the writer one, two and three int32s into its allocation -- element aligned,
+// but off the 32-byte burst boundary, exactly what a PyTorch sub-slice looks like. The kernel reads it only
+// with GlobalTensor::GetValue, so every offset has to produce the same cache the aligned write produces.
+// This is the execution-side half of the adapter's CheckGmScalarAligned contract; the adapter check itself
+// is host code the bare-metal tier does not build, and the camodel models the scalar read rather than any
+// silicon alignment fault, so a pass here is evidence about the addressing, not about the hardware.
+TEST_F(TurboQuantFusedDecode, WritesTheCacheThroughASlicedSlotMapping) {
+  PrintShape(kCaseJ, aiv_num_, queried_);
+  watchdog_.Arm("(j) kernel cache write and query rotation");
+  tqh::FusedCubeScenario scenario(kCaseJ.shape, stream_, aiv_num_);
+  watchdog_.Disarm();
+
+  // The control is a fresh aligned write taken here, NOT the one the constructor did. WriteThroughKernel
+  // rescales cache_.key / cache_.value in place after its launch, so the constructor's write was fed the
+  // original dense cache and every write after it is fed the rescaled one -- different input, so different
+  // stored scales, even though the quantised levels (and therefore the packed bytes) are identical. Taking
+  // the control now puts all four launches on the same input, which is what makes this a clean comparison:
+  // the only thing that varies across them is the address slot_mapping is read from.
+  watchdog_.Arm("(j) turboquant_mm_reshape_and_cache_impl at an aligned slot_mapping");
+  const tqh::WrittenImage aligned = scenario.RewriteAtSlotMappingOffset(0);
+  watchdog_.Disarm();
+  ASSERT_FALSE(aligned.key.empty()) << "(j): the control image is empty; (j) needs a kernel_writer shape";
+
+  for (const int64_t offset : kSlicedSlotOffsets) {
+    watchdog_.Arm("(j) turboquant_mm_reshape_and_cache_impl at a sliced slot_mapping");
+    const tqh::WrittenImage sliced = scenario.RewriteAtSlotMappingOffset(offset);
+    watchdog_.Disarm();
+    const size_t byte_offset = static_cast<size_t>(offset) * sizeof(int32_t);
+    const size_t key_diff = CountDiffs(sliced.key, aligned.key);
+    const size_t value_diff = CountDiffs(sliced.value, aligned.value);
+    const size_t scale_diff = CountDiffs(sliced.scales, aligned.scales);
+    std::printf("[ fused ] (j) slot_mapping +%lld int32 (%zu B into the burst): %zu of %zu key bytes, %zu of "
+                "%zu value bytes, %zu of %zu scale lanes differ from the aligned write\n",
+                static_cast<long long>(offset), byte_offset % kGmBurstBytes, key_diff, aligned.key.size(),
+                value_diff, aligned.value.size(), scale_diff, aligned.scales.size());
+    EXPECT_NE(byte_offset % kGmBurstBytes, 0u)
+        << "(j): offset " << offset << " is still burst aligned, so it tests nothing";
+    EXPECT_EQ(key_diff, 0u) << "(j): a slot_mapping at +" << offset << " int32 wrote a different key plane";
+    EXPECT_EQ(value_diff, 0u) << "(j): a slot_mapping at +" << offset << " int32 wrote a different value plane";
+    EXPECT_EQ(scale_diff, 0u) << "(j): a slot_mapping at +" << offset << " int32 wrote a different scale plane";
+  }
+  ExpectNoExceptionDumps(kCaseJ.tag);
 }
 
 TEST_F(TurboQuantFusedDecode, MasksATailTileWithTwoHeadsPerSubcore) {

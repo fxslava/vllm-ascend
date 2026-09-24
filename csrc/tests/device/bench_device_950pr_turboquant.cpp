@@ -185,6 +185,46 @@ bool RotationModeEnabled(RotationMode mode) {
   return true;
 }
 
+// The unpack ablation, which exists to price one phase of the Cube decode on silicon: the vector-pipe
+// expand of the packed KV plane into Cube operands. The ablated launch
+// (turboquant_mm_fused_decode_nounpack_impl) is the shipping decode with that expand and nothing else
+// removed -- the MTE2 read of the plane, the MTE3 burst into L1, the Cube's loads and MACs and the whole
+// softmax all still run, and the grid, the launch count and the byte counts are identical. So
+//
+//     T(dec_nounpack) - T(dec_attn_core) = the unpack phase, at fixed memory traffic,
+//
+// and the pair's Eff GB/s columns say whether the phase is on the critical path or hidden behind MTE2.
+//
+// ASCEND_BENCH_TQ_UNPACK=on|off|both, on by default. "on" is the shipping decode alone; "off" runs the
+// ablated launch in its place; "both" runs the pair. The ablated launch stages zeros, so its output is
+// all-zero by construction and its checksum means nothing -- which is why a plain run never reaches it.
+constexpr const char* kUnpackEnv = "ASCEND_BENCH_TQ_UNPACK";
+constexpr const char* kUnpackOn = "on";
+constexpr const char* kUnpackOff = "off";
+constexpr const char* kUnpackBoth = "both";
+
+bool UnpackModeValid() {
+  const std::string raw = EnvString(kUnpackEnv);
+  return raw.empty() || raw == kUnpackOn || raw == kUnpackOff || raw == kUnpackBoth;
+}
+
+// The unablated legs, which an "off" run replaces with the ablated one.
+bool UnpackStandardEnabled() { return EnvString(kUnpackEnv) != kUnpackOff; }
+
+// The ablated leg. Off unless asked for by name.
+bool UnpackAblationEnabled() {
+  const std::string raw = EnvString(kUnpackEnv);
+  return raw == kUnpackOff || raw == kUnpackBoth;
+}
+
+const char* UnpackModeLabel() {
+  const std::string raw = EnvString(kUnpackEnv);
+  if (raw == kUnpackOff) {
+    return kUnpackOff;
+  }
+  return raw == kUnpackBoth ? kUnpackBoth : kUnpackOn;
+}
+
 struct Regime {
   int64_t seq_len;
   std::vector<int64_t> batches;
@@ -308,11 +348,13 @@ constexpr const char* kLegDecE2E = "dec_e2e";
 constexpr const char* kLegDecV5 = "dec_v5";
 constexpr const char* kLegDecFusedQAttnCore = "dec_fq_attn_core";
 constexpr const char* kLegDecFusedQE2E = "dec_fq_e2e";
+// The unpack ablation's counterpart to kLegDecAttnCore; see kUnpackEnv.
+constexpr const char* kLegDecNoUnpack = "dec_nounpack";
 
 const char* const kPrefillLegs[] = {kLegPfIngest, kLegPfRotQ, kLegPfAttnCore, kLegPfRotO,
                                     kLegPfE2E,    kLegPfV5,   kLegPfV5Ingest};
-const char* const kDecodeLegs[] = {kLegDecRotQ, kLegDecAttnCore,       kLegDecRotO,     kLegDecE2E,
-                                   kLegDecV5,   kLegDecFusedQAttnCore, kLegDecFusedQE2E};
+const char* const kDecodeLegs[] = {kLegDecRotQ, kLegDecAttnCore,       kLegDecRotO,      kLegDecE2E,
+                                   kLegDecV5,   kLegDecFusedQAttnCore, kLegDecFusedQE2E, kLegDecNoUnpack};
 
 std::string CaseName(const char* leg, const Config& config) {
   return std::string(leg) + "_" + config.id();
@@ -760,6 +802,21 @@ class Scenario {
         cube_grid_.fused_context_limit, config_.attention_scale(), config_.attention_scale());
   }
 
+  // The unpack ablation of EnqueueDecodeFusedCube: byte-for-byte the same launch on the same buffers, with
+  // the KV ingest's codec expand compiled out. Cube path only -- the AIV paged decode has no separate
+  // unpack phase to remove, its expand and its dot product are the same instruction stream.
+  void EnqueueDecodeNoUnpack(aclrtStream stream) const {
+    turboquant_mm_fused_decode_nounpack_impl(
+        static_cast<int32_t>(kCubeMode), AscendType::FP16, stream, cube_grid_.block_dim, query_dec_rot_.get(),
+        key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
+        decode_tables_.get(), workspace_.get(), out_dec_tq_.get(), static_cast<uint32_t>(config_.batch),
+        static_cast<uint32_t>(config_.model.num_heads), static_cast<uint32_t>(config_.model.num_kv_heads),
+        static_cast<uint32_t>(config_.model.head_size), static_cast<uint32_t>(kBlockSize),
+        static_cast<uint32_t>(config_.blocks_per_seq()), static_cast<uint32_t>(cube_grid_.num_splits),
+        cube_grid_.heads_per_task, cube_grid_.tasks_per_block, cube_grid_.reduce_tasks_per_block,
+        cube_grid_.fused_context_limit, config_.attention_scale(), config_.attention_scale());
+  }
+
   // The same grid handed the raw fp16 query: the launch rotates every (token, head) into
   // query_dec_prologue_rot_ ahead of its split tasks (on the Cube from 16 vectors), so no rotate_q launch
   // precedes it, and for an unfolded W_o it writes out_dec_tq_ un-rotated, so no rotate_o launch follows.
@@ -854,6 +911,9 @@ class Scenario {
     EnqueueDecodeAttnCore(stream);
     if (config_.decodes_in_mode(RotationMode::kFusedPrologue)) {
       EnqueueDecodeFusedQ(stream);
+    }
+    if (config_.path == PathMode::kCube && UnpackAblationEnabled()) {
+      EnqueueDecodeNoUnpack(stream);
     }
     if (prefill_available()) {
       EnqueuePrefillAttnCore(stream);
@@ -1802,6 +1862,16 @@ void PrintBanner(const std::vector<Config>& sweep, int64_t aiv_num, bool aiv_que
     std::printf("[ascend-bench]   %s='%s' is not separate, fused_prologue or both; timing both\n", kRotationModeEnv,
                 EnvString(kRotationModeEnv).c_str());
   }
+  if (!UnpackModeValid()) {
+    std::printf("[ascend-bench]   %s='%s' is not on, off or both; timing the unablated decode\n", kUnpackEnv,
+                EnvString(kUnpackEnv).c_str());
+  }
+  if (UnpackAblationEnabled()) {
+    std::printf("[ascend-bench]   %s=%s: the %s leg is the decode with the KV unpack compiled out. Its\n"
+                "[ascend-bench]   output is all-zero and its checksum means nothing; read it only as the\n"
+                "[ascend-bench]   time %s would take without the expand.\n",
+                kUnpackEnv, UnpackModeLabel(), kLegDecNoUnpack, kLegDecAttnCore);
+  }
   std::printf("[ascend-bench]\n");
 
   if (sweep.empty()) {
@@ -2025,12 +2095,34 @@ void BuildSuite(BenchmarkRunner& primary) {
       if (separate) {
         run_leg(kLegDecRotQ, 0.0, model.dec_rot_q, 1, [sc](aclrtStream s) { sc->EnqueueDecodeRotateQ(s); },
                 [sc]() { return sc->DecodeRotatedQueryChecksum(); });
-        run_leg(kLegDecAttnCore, model.dec_flops, model.dec_attn_core, 1,
-                [sc](aclrtStream s) { sc->EnqueueDecodeAttnCore(s); },
-                [sc]() { return sc->DecodeTqChecksum(); });
+        if (UnpackStandardEnabled()) {
+          run_leg(kLegDecAttnCore, model.dec_flops, model.dec_attn_core, 1,
+                  [sc](aclrtStream s) { sc->EnqueueDecodeAttnCore(s); },
+                  [sc]() { return sc->DecodeTqChecksum(); });
+        } else {
+          runner.Skip(CaseName(kLegDecAttnCore, config),
+                      std::string("the unablated decode is not selected by ") + kUnpackEnv);
+        }
       } else {
         runner.Skip(CaseName(kLegDecRotQ, config), separate_off);
         runner.Skip(CaseName(kLegDecAttnCore, config), separate_off);
+      }
+
+      // The ablated twin of kLegDecAttnCore. It runs under the same rotation mode and the same traffic
+      // model, so the two rows differ in the unpack phase and nothing else. Its checksum is recorded like
+      // any other leg's and is meaningless on purpose: the launch stages zeros.
+      if (!UnpackAblationEnabled()) {
+        runner.Skip(CaseName(kLegDecNoUnpack, config),
+                    std::string("the unpack ablation is not selected by ") + kUnpackEnv);
+      } else if (config.path != PathMode::kCube) {
+        runner.Skip(CaseName(kLegDecNoUnpack, config),
+                    "the unpack ablation exists on the Cube path only");
+      } else if (!separate) {
+        runner.Skip(CaseName(kLegDecNoUnpack, config), separate_off);
+      } else {
+        run_leg(kLegDecNoUnpack, model.dec_flops, model.dec_attn_core, 1,
+                [sc](aclrtStream s) { sc->EnqueueDecodeNoUnpack(s); },
+                [sc]() { return sc->DecodeTqChecksum(); });
       }
 
       if (fused_q) {
