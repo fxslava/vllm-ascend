@@ -355,6 +355,9 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
 
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
         super().process_weights_after_loading(act_dtype)
+        # Before the first cache write rather than at it: a configuration that cannot run
+        # should fail while the message still names a layer being built, not a launch.
+        self._refuse_sinks_on_a_cube_cache()
         torch.ops._C_ascend.npu_turboquant_vector_core_num()
         logger.info_once(
             "[vllm-ascend/turboquant] 4-bit KV cache active; Pi is applied at runtime to K/V on the write path and "
@@ -444,6 +447,38 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             )
         self.scale_cache = torch.zeros(shape, dtype=torch.float32, device=kv_cache[0].device)
 
+    def _refuse_sinks_on_a_cube_cache(self) -> None:
+        """Refuse uncompressed sinks where the merge cannot read the cache.
+
+        The host-side merge in :mod:`vllm_ascend.attention.turboquant_sink` reads the
+        packed planes itself, to recompute the softmax denominator neither decode
+        operator returns and to subtract what the quantised sinks contributed. It reads
+        them **row-major, on the Lloyd-Max codebook grid**, which is what
+        ``npu_turboquant_reshape_and_cache`` writes and what the AIV decode reads back.
+
+        The kv4fp8 Cube writer produces neither: its planes are NZ-tiled
+        (``kStoresNzTiles<KV4_FP8>``) and its codes are affine about 7.5 on an fp8 e4m3
+        grid. The merge therefore reads the wrong bytes off the wrong grid, and nothing
+        raises -- the denominator comes back plausible and wrong and the output is noise.
+        Measured on a real ablation before this refusal existed: LongBench 57.6% at
+        ``sink_tokens=0`` against 14.1% at 4, with multifieldqa_en at 86.4% against 1.5%.
+
+        So the combination is an error rather than a silent 4x regression. A kv4fp8
+        reader is phase-two work beside the ``lse`` decode output that would make the
+        merge free in the first place, and it needs the camodel gate rather than a host
+        test, because what a host test would check is the header this already read.
+        """
+        if not (self.sink_config.enabled and self.cube_decode):
+            return
+        raise RuntimeError(
+            f"[vllm-ascend/turboquant] VLLM_ASCEND_TQ_SINK_TOKENS={self.sink_config.num_sink_tokens} cannot be "
+            "combined with the kv4fp8 Cube decode: the uncompressed-sink merge reads the packed cache on the "
+            "host, and it reads it row-major on the Lloyd-Max grid, where the Cube writer leaves NZ-tiled "
+            "planes of affine fp8 codes. It would return plausible wrong numbers rather than raise. Set "
+            "VLLM_ASCEND_TURBOQUANT_CUBE_DECODE=0 to decode this cache on the AIV path, which is the layout "
+            "the merge reads, or VLLM_ASCEND_TQ_SINK_TOKENS=0 for the path that ships."
+        )
+
     def _ensure_sink_cache(self, kv_cache: tuple[torch.Tensor, ...], dtype: torch.dtype) -> None:
         """Bind the uncompressed sink plane, once, if the feature is on.
 
@@ -458,6 +493,7 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         """
         if not self.sink_config.enabled or self.sink_cache is not None:
             return
+        self._refuse_sinks_on_a_cube_cache()
         num_blocks, block_size, num_kv_heads, _ = kv_cache[0].shape
         if _is_capturing():
             raise RuntimeError(
@@ -1244,12 +1280,11 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
                 "the gate sits between attention and o_proj, where the output is still rotated"
             )
         if self.sink_config.enabled:
-            # The merge is a rescaling of the whole softmax, so it has to see the raw
-            # rotated accumulator: un-rotating or gating first would have the launch apply
-            # a transform to a numerator whose denominator is about to change. Both are
-            # linear, so both are re-applied on the host after the merge, at the cost of
-            # the launch fusion this stage exists to provide. Exposing the softmax
-            # denominator as a decode output is what would give it back.
+            # Unreachable while _refuse_sinks_on_a_cube_cache stands: the merge cannot read
+            # an NZ-tiled kv4fp8 cache. Kept because the ordering is the part that is right
+            # and that a kv4fp8 reader would need unchanged -- the merge is a rescaling of
+            # the whole softmax, so it has to see the raw rotated accumulator, and both the
+            # un-rotation and the gate are linear and re-applied after it.
             return TurboQuantOutputStage.ROTATED_BASIS
         if self.output_rotation_folded:
             return TurboQuantOutputStage.ROTATED_BASIS

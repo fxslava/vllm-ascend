@@ -924,6 +924,20 @@ class TurboQuantCubeBackend(_TurboQuantBackend):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        if self.sink_tokens:
+            # The uncompressed-sink merge reads the packed cache on the host, row-major and
+            # on the Lloyd-Max codebook grid -- what npu_turboquant_reshape_and_cache writes
+            # and the AIV decode reads back. This writer leaves NZ-tiled planes
+            # (kStoresNzTiles<KV4_FP8>) of codes that are affine about 7.5 on an fp8 e4m3
+            # grid, so the merge would read the wrong bytes off the wrong grid and return
+            # plausible wrong numbers rather than raise. A real ablation measured it as
+            # LongBench 57.6% at 0 sinks against 14.1% at 4.
+            raise ValueError(
+                "sink_tokens cannot be combined with turboquant_cube: the merge reads the packed cache "
+                "row-major on the Lloyd-Max grid, and the kv4fp8 writer leaves NZ-tiled planes of affine "
+                "fp8 codes. Use --backends turboquant_aiv, which is the layout the merge reads, or "
+                "--sink-tokens 0."
+            )
         self.geometry.require_cube_tiling()
         # Only when the full extension has not registered it: a standalone build
         # (tools/tq_longbench/build_turboquant_ops.py), from $TURBOQUANT_LIB_PATH,

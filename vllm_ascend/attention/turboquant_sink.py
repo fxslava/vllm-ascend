@@ -104,6 +104,34 @@ for the sequences it splits.  Exposing it as an ``lse`` out-tensor on both
 decodes, for split and unsplit sequences alike, is new plumbing rather than new
 arithmetic, and is what phase two should do first.
 
+Which cache this can read
+=========================
+
+**Row-major planes on the Lloyd-Max codebook grid only** -- that is, the AIV decode
+and its ``npu_turboquant_reshape_and_cache`` writer.  :func:`_dequantized_rows`
+addresses a cache row as ``slot * num_kv_heads * packed_bytes + ...`` and
+reconstructs a nibble through :func:`turboquant_dequantize`, and both are properties
+of *that* writer rather than of the cache shape, which the two writers share.
+
+The kv4fp8 Cube path is neither, on both counts
+(``csrc/attention/turboquant/op_kernel/common/``):
+
+* ``turboquant_mode.h`` sets ``kStoresNzTiles<KV4_FP8>``, so its writer scatters each
+  token into an NZ-tiled ``[tile][kv head][C0 column group][tile row]`` image
+  (``turboquant_layout.h``, ``NzTiledPackedByte``) that the Cube reads as a fractal
+  without permuting;
+* its mode config is ``is_affine = true, affine_bias = 7.5``, so a code reconstructs
+  as ``(code - 7.5) * scale`` on an fp8 e4m3 operand grid, not through the Lloyd-Max
+  centroid table.
+
+Reading a kv4fp8 cache with the functions below therefore returns the wrong bytes
+*and* puts them on the wrong grid. Nothing raises: ``(m, L)`` come back plausible and
+wrong, the subtraction removes a vector that was never added, and the merged output
+is noise -- which is what it did, at a ~4x drop in LongBench score, before the
+callers below learned to refuse it. The refusal lives with each caller rather than
+here, because this module is handed planes and cannot see which writer filled them;
+a kv4fp8 reader is phase-two work and needs the camodel gate, not a host test.
+
 This module imports only ``torch`` and the two TurboQuant modules that do the
 same, so a harness with no engine around it can drive the fusion directly.
 """
@@ -320,6 +348,10 @@ def _dequantized_rows(
     ``rows`` is any integer shape; the result carries ``[..., num_kv_heads, head_size]``
     on top of it.  ``keys_only`` skips the value plane, which is what the softmax
     statistics need and is half the work.
+
+    **Row-major planes on the Lloyd-Max grid only.** See the module docstring: a kv4fp8
+    Cube cache is NZ-tiled and affine, and this reads it as neither. The caller is what
+    knows which writer filled the plane, and what has to refuse.
     """
     head_size = key_cache.shape[-1] * TURBOQUANT_PACK_FACTOR
     packed_shape = (-1, num_kv_heads, head_size // TURBOQUANT_PACK_FACTOR)

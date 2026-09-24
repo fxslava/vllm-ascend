@@ -261,6 +261,35 @@ def sink_banner(value: int) -> str:
     )
 
 
+#: The decode whose cache the uncompressed-sink merge cannot read. The merge reads the
+#: packed planes row-major on the Lloyd-Max codebook grid -- what the AIV writer leaves --
+#: and the kv4fp8 Cube writer leaves NZ-tiled planes of codes that are affine on an fp8
+#: grid. It returns plausible wrong numbers rather than raising, which a real ablation
+#: measured as LongBench 57.6% at 0 sinks against 14.1% at 4.
+SINK_INCOMPATIBLE_BACKENDS = ("turboquant_cube",)
+
+
+def refuse_sinks_on_an_unreadable_cache(backends: tuple[str, ...], sink_counts: tuple[int, ...]) -> None:
+    """Refuse a sink sweep over a backend whose cache layout the merge cannot read.
+
+    :class:`~tq_longbench.engine.RunnerConfig` refuses it too; this says so before the
+    corpus is read, and names every backend rather than the first one to reach the
+    constructor -- which for a sweep is several rungs in.
+    """
+    if not any(sink_counts):
+        return
+    refused = [backend for backend in backends if backend in SINK_INCOMPATIBLE_BACKENDS]
+    if not refused:
+        return
+    raise SystemExit(
+        f"--sink-tokens cannot be combined with {', '.join(refused)}: the uncompressed-sink merge reads the "
+        "packed cache on the host, row-major and on the Lloyd-Max codebook grid, and the kv4fp8 Cube writer "
+        "leaves NZ-tiled planes of codes that are affine on an fp8 grid. It would score a cache it had "
+        "misread rather than fail. Sweep --backends turboquant_aiv, which is the layout the merge reads, or "
+        "run with --sink-tokens 0."
+    )
+
+
 def parse_int_list(text: str, what: str) -> tuple[int, ...]:
     values = tuple(int(part) for part in text.split(",") if part.strip())
     if not values or any(value <= 0 for value in values):
@@ -493,6 +522,7 @@ def main(argv: list[str] | None = None) -> int:
     contexts = parse_int_list(args.contexts, "contexts")
     depths = parse_depths(args.depths)
     sink_counts = parse_sink_tokens(args.sink_tokens)
+    refuse_sinks_on_an_unreadable_cache(backends, sink_counts)
     # Published before the tokenizer, the config read or any runner: whatever else ends up
     # in this process or in a subprocess of it must not see a stale value.
     use_sink_tokens(sink_counts[0])

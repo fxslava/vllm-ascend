@@ -106,6 +106,7 @@ from tq_longbench.run_benchmark import (  # noqa: E402
     parse_sink_tokens,
     plan_for_backend,
     prefill_mode_for,
+    refuse_sinks_on_an_unreadable_cache,
     rung_prefill_mode,
     sink_banner,
     use_sink_tokens,
@@ -792,6 +793,7 @@ def main(argv: list[str] | None = None) -> int:
     args.budget_overrides = parse_budget_overrides(args.max_tokens_override)
     backends = parse_backends(args.backends)
     sink_counts = parse_sink_tokens(args.sink_tokens)
+    refuse_sinks_on_an_unreadable_cache(backends, sink_counts)
     # Published before the config read, the tokenizer and every runner: anything else in
     # this process, and any subprocess it spawns, has to see the number the backends are
     # running with. See run_benchmark.use_sink_tokens.

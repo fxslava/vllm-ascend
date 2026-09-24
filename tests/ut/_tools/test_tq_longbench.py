@@ -154,9 +154,11 @@ from tq_longbench.probe import (  # noqa: E402
 from tq_longbench.reference import DenseReferenceBackend, TurboQuantReferenceBackend  # noqa: E402
 from tq_longbench.run_benchmark import (  # noqa: E402
     DEFAULT_SINK_TOKENS,
+    SINK_INCOMPATIBLE_BACKENDS,
     SINK_TOKENS_ENV,
     add_sink_arguments,
     parse_sink_tokens,
+    refuse_sinks_on_an_unreadable_cache,
     sink_banner,
     use_sink_tokens,
 )
@@ -5471,6 +5473,123 @@ class TestTurboQuantSinkBackend(_TurboQuantCase):
         self.assertGreater(cosine(out, expected), EXACT_COSINE)
 
 
+
+class TestTheMergeCannotReadAKv4Fp8Cache(_TurboQuantCase):
+    """Why ``--sink-tokens`` is refused on turboquant_cube, demonstrated rather than asserted.
+
+    The merge reads the packed planes itself -- row-major, and through the Lloyd-Max
+    codebook -- to recompute the softmax denominator and subtract what the quantised sinks
+    contributed. The kv4fp8 Cube writer leaves neither: NZ-tiled planes
+    (``kStoresNzTiles<KV4_FP8>``) of codes that are affine about 7.5 on an fp8 e4m3 grid.
+    Reading one with the other's addressing returns plausible wrong numbers and raises
+    nothing, which on a real ablation was LongBench 57.6% at 0 sinks against 14.1% at 4.
+    """
+
+    #: csrc/attention/turboquant/op_kernel/common/turboquant_layout.h.
+    CUBE_TILE_ROWS = 64
+    OPERAND_C0 = 32
+    #: TurboQuantModeConfigOf(KV4_FP8): is_affine, affine_bias.
+    AFFINE_BIAS = 7.5
+
+    def nz_tiled_packed_byte(self, slot: int, kv_head: int, column: int, num_kv_heads: int, packed: int) -> int:
+        """``NzTiledPackedByte``, transcribed from the header the kernels compile against."""
+        tile_row = slot % self.CUBE_TILE_ROWS
+        return (
+            (slot - tile_row) * num_kv_heads * packed
+            + kv_head * self.CUBE_TILE_ROWS * packed
+            + ((column // self.OPERAND_C0) * self.CUBE_TILE_ROWS + tile_row) * self.OPERAND_C0
+            + column % self.OPERAND_C0
+        )
+
+    def test_the_header_and_the_row_major_reader_disagree_about_every_interesting_row(self):
+        """The addresses are the same only for the first tile row of the first kv head."""
+        num_kv_heads, packed, block_size = 2, HEAD_SIZE // 2, BLOCK_SIZE
+        agreed, disagreed = 0, 0
+        for slot in range(block_size):
+            for kv_head in range(num_kv_heads):
+                for column in range(0, packed, 7):
+                    row_major = (slot * num_kv_heads + kv_head) * packed + column
+                    nz = self.nz_tiled_packed_byte(slot, kv_head, column, num_kv_heads, packed)
+                    if row_major == nz:
+                        agreed += 1
+                    else:
+                        disagreed += 1
+        # A handful coincide -- the first tile row of the first kv head, below the first
+        # C0 group -- and everything else lands somewhere the other addressing never looks.
+        self.assertLess(agreed / (agreed + disagreed), 0.02)
+
+    def test_reading_an_nz_tiled_plane_row_major_recovers_nothing(self):
+        """Write a known plane the way the Cube writer does; read it the way the merge does."""
+        sink_module = turboquant_sink()
+        num_kv_heads, slots = 2, self.CUBE_TILE_ROWS
+        packed = HEAD_SIZE // 2
+        row_major = torch.randint(-128, 127, (slots, num_kv_heads, packed), dtype=torch.int8)
+
+        nz = torch.zeros(slots * num_kv_heads * packed, dtype=torch.int8)
+        for slot in range(slots):
+            for kv_head in range(num_kv_heads):
+                for column in range(packed):
+                    nz[self.nz_tiled_packed_byte(slot, kv_head, column, num_kv_heads, packed)] = row_major[
+                        slot, kv_head, column
+                    ]
+        # Every byte is present, so nothing was lost -- only permuted.
+        self.assertEqual(sorted(nz.tolist()), sorted(row_major.flatten().tolist()))
+
+        as_the_merge_reads_it = nz.view(slots, num_kv_heads, packed)
+        self.assertFalse(torch.equal(as_the_merge_reads_it, row_major))
+        # And the values it hands the softmax are a different set of levels entirely.
+        wrong = sink_module.turboquant_dequantize(as_the_merge_reads_it)
+        right = sink_module.turboquant_dequantize(row_major)
+        self.assertFalse(torch.allclose(wrong, right))
+
+    def test_the_lloyd_max_grid_is_not_the_affine_one_kv4fp8_reconstructs_on(self):
+        """The second mismatch, independent of the first: a code means a different number.
+
+        Compared after normalising both grids to [-1, 1], because each carries its own
+        per-vector scale and the absolute levels are not the claim. The claim is the shape:
+        Lloyd-Max levels are packed towards zero and spread at the tails, and kv4fp8's are
+        evenly spaced about ``affine_bias``. Reading one as the other is a nonlinear
+        distortion of every reconstructed component, not a gain error a scale absorbs.
+        """
+        sink_module = turboquant_sink()
+        codes = torch.arange(16, dtype=torch.int8)
+        # One nibble pair per byte, low nibble first, with the writer's -128 bias.
+        packed = (codes + 16 * codes - 128).to(torch.int8).view(1, 1, 16)
+        lloyd_max = sink_module.turboquant_dequantize(packed).flatten()[0::2]
+        affine = codes.to(torch.float32) - self.AFFINE_BIAS
+        self.assertEqual(lloyd_max.numel(), affine.numel())
+
+        def unit(levels):
+            return levels / levels.abs().max()
+
+        self.assertFalse(torch.allclose(unit(lloyd_max), unit(affine), atol=0.05))
+        # Evenly spaced against not: the gap between adjacent levels is constant for one
+        # grid and varies by more than 2x across the other.
+        affine_gaps = unit(affine).diff()
+        lloyd_gaps = unit(lloyd_max).diff()
+        self.assertLess(float(affine_gaps.max() / affine_gaps.min()), 1.0 + 1e-5)
+        self.assertGreater(float(lloyd_gaps.max() / lloyd_gaps.min()), 2.0)
+
+    def test_the_cube_backend_refuses_sinks_rather_than_scoring_a_misread_cache(self):
+        geometry = _geometry(BLOCK_SIZE)
+        shape = LayerShape(NUM_HEADS, NUM_KV_HEADS, HEAD_SIZE, HEAD_SIZE**-0.5)
+        with self.assertRaisesRegex(ValueError, "turboquant_cube"):
+            ops_module.TurboQuantCubeBackend(
+                geometry, shape, CPU, sink_tokens=SINK_TOKENS, activation_dtype=torch.float16
+            )
+
+    def test_the_run_is_refused_before_its_weights_load(self):
+        with self.assertRaisesRegex(ValueError, "NZ-tiled"):
+            RunnerConfig(model_path="/nowhere", backend="turboquant_cube", sink_tokens=SINK_TOKENS)
+        # And with sinks off, turboquant_cube is untouched: it is the authoritative path.
+        RunnerConfig(model_path="/nowhere", backend="turboquant_cube", sink_tokens=0)
+
+    def test_a_sweep_over_the_cube_backend_is_refused_up_front(self):
+        refuse_sinks_on_an_unreadable_cache(("turboquant_aiv",), (0, 4))
+        refuse_sinks_on_an_unreadable_cache(("turboquant_cube",), (0,))
+        with self.assertRaisesRegex(SystemExit, "turboquant_cube"):
+            refuse_sinks_on_an_unreadable_cache(("turboquant_aiv", "turboquant_cube"), (0, 4))
+
 class TestSinkRunnerConfig(unittest.TestCase):
     """What a run with sinks is and is not allowed to be."""
 
@@ -5491,6 +5610,12 @@ class TestSinkRunnerConfig(unittest.TestCase):
     def test_a_negative_count_is_refused(self):
         with self.assertRaisesRegex(ValueError, "cannot be negative"):
             self.config(sink_tokens=-1)
+
+    def test_the_incompatible_roster_is_the_one_the_constructor_enforces(self):
+        """The up-front refusal and the constructor's must name the same backends."""
+        for backend in SINK_INCOMPATIBLE_BACKENDS:
+            with self.subTest(backend=backend), self.assertRaises(ValueError):
+                RunnerConfig(model_path="/nowhere", backend=backend, sink_tokens=SINK_TOKENS)
 
 
 class TestRunLongBenchSinks(_LongBenchCorpus):

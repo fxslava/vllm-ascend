@@ -800,6 +800,32 @@ class TestTurboQuantSinkDecode(_TurboQuantSinkHarness):
         self.assertEqual(int(mass[1].count_nonzero()), 0)
         self.assertTrue(bool(torch.isfinite(running_max).all()))
 
+    def test_the_kv4fp8_cube_decode_is_refused_rather_than_misread(self):
+        """The merge reads row-major Lloyd-Max planes; the Cube writer leaves neither.
+
+        Its planes are NZ-tiled (``kStoresNzTiles<KV4_FP8>``) and its codes are affine
+        about 7.5 on an fp8 grid, so the merge would recompute the softmax denominator
+        from the wrong bytes on the wrong grid and return plausible wrong numbers. A real
+        ablation scored 57.6% at ``sink_tokens=0`` and 14.1% at 4 before this refusal.
+        """
+        impl = self._build_impl(2, SINK_TOKENS)
+        impl.cube_decode = True
+        for call in (
+            lambda: impl.process_weights_after_loading(DTYPE),
+            lambda: impl._ensure_sink_cache(self._allocate_kv_cache(2), DTYPE),
+        ):
+            with self.subTest(call=call), self.assertRaisesRegex(RuntimeError, "kv4fp8 Cube decode"):
+                call()
+        self.assertIsNone(impl.sink_cache)
+
+    def test_the_cube_decode_is_untouched_with_sinks_off(self):
+        """``sink_tokens=0`` is the authoritative path and must not have acquired a guard."""
+        impl = self._build_impl(2, 0)
+        impl.cube_decode = True
+        impl.process_weights_after_loading(DTYPE)
+        impl._ensure_sink_cache(self._allocate_kv_cache(2), DTYPE)
+        self.assertIsNone(impl.sink_cache)
+
     def test_a_folded_layer_leaves_the_merged_output_rotated(self):
         """With Pi folded into o_proj the merge is the last thing that touches the output."""
         prompts = (SHORT_PROMPT,)

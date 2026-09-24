@@ -268,6 +268,16 @@ class RunnerConfig:
                 "token. Prefill densely (which is what the plugin's backend does, and where the sinks are "
                 "already exact), or run with --sink-tokens 0."
             )
+        if self.sink_tokens and self.backend == "turboquant_cube":
+            # See TurboQuantCubeBackend: the merge reads the packed cache row-major on the
+            # Lloyd-Max grid, and the kv4fp8 writer leaves NZ-tiled affine fp8 planes.
+            # Refused here as well so a run fails before its weights load.
+            raise ValueError(
+                "sink_tokens cannot be combined with turboquant_cube: the uncompressed-sink merge reads the "
+                "packed cache row-major on the Lloyd-Max codebook grid, and the kv4fp8 Cube writer leaves "
+                "NZ-tiled planes of codes that are affine on an fp8 grid -- it would return plausible wrong "
+                "numbers rather than raise. Use the turboquant_aiv backend, or sink_tokens 0."
+            )
         if self.sink_tokens and self.backend in DENSE_BACKENDS:
             raise ValueError(
                 f"{self.backend} decodes out of the unquantised cache, so there is nothing for sink_tokens "
