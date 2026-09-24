@@ -44,6 +44,7 @@ using vllm_ascend::turboquant::SyncScalarToVector;
 using vllm_ascend::turboquant::SyncVectorToMte2;
 using vllm_ascend::turboquant::SyncVectorToMte3;
 using vllm_ascend::turboquant::TurboQuantCodec4;
+using vllm_ascend::turboquant::TurboQuantLseWriter;
 using vllm_ascend::turboquant::TurboQuantPartialReducer;
 using vllm_ascend::turboquant::TurboQuantTileBurst;
 using vllm_ascend::turboquant::WriteNormalizedHeads;
@@ -289,7 +290,7 @@ public:
                                 const uint32_t numTokens, const uint32_t numHeads, const uint32_t numKvHeads,
                                 const uint32_t headSize, const uint32_t blockSize, const uint32_t maxBlocksPerSeq,
                                 const uint32_t numSplits, const uint32_t fusedContextLimit, const float scale,
-                                const float invSqrtLen)
+                                const float invSqrtLen, __gm__ void *lse = nullptr)
     {
         numTokens_ = numTokens;
         numHeads_ = numHeads;
@@ -315,6 +316,7 @@ public:
         tablesGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(tables));
         workspaceGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(workspace));
         outputGm_.SetGlobalBuffer(reinterpret_cast<__gm__ scalar_t *>(output));
+        lseWriter_.Init(lse, numHeads);
 
         const uint32_t tileElems = kTileRows * headSize_;
         pipe_->InitBuffer(kvQueue_, 2, 2 * kTileRows * packedBytes_ * sizeof(int8_t));
@@ -469,6 +471,10 @@ private:
         }
 
         if (fused) {
+            // Before StageOutput, whose NormalizeHeads adds its epsilon to runSum in place. stateLanes is
+            // already the out-tensor's layout -- max lane, sum lane, every other lane zeroed at the top of
+            // this split -- which is the same sixteen words the split branch below leaves in the workspace.
+            lseWriter_.Write(stateLanes, token, head, 1);
             StageOutput(token, head, acc, state.runSum);
             return;
         }
@@ -677,6 +683,7 @@ private:
     AscendC::TBuf<AscendC::QuePosition::VECCALC> stateBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> scaleIndexBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> outBuf_;
+    TurboQuantLseWriter lseWriter_;
     AscendC::GlobalTensor<float> queryRotGm_;
     AscendC::GlobalTensor<int8_t> keyCacheGm_;
     AscendC::GlobalTensor<int8_t> valueCacheGm_;
@@ -723,18 +730,18 @@ private:
         GM_ADDR contextLens, GM_ADDR tables, GM_ADDR workspace, GM_ADDR output, uint32_t numTokens,                  \
         uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,     \
         uint32_t numSplits, uint32_t splitTasksPerCore, uint32_t reduceTasksPerCore, uint32_t fusedContextLimit,     \
-        float scale, float invSqrtLen)                                                                               \
+        float scale, float invSqrtLen, GM_ADDR lse)                                                                  \
     {                                                                                                                \
         AscendC::TPipe pipe;                                                                                         \
         TurboQuantPagedAttentionSplit<TYPE> split(&pipe);                                                            \
         split.Init(queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, tables, workspace, output,  \
                    numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,                 \
-                   fusedContextLimit, scale, invSqrtLen);                                                            \
+                   fusedContextLimit, scale, invSqrtLen, lse);                                                       \
         split.Process(splitTasksPerCore);                                                                            \
         if (split.NeedsReduction()) {                                                                                \
             AscendC::SyncAll<true>();                                                                                \
             TurboQuantPartialReducer<TYPE> reducer(&pipe);                                                           \
-            reducer.Init(workspace, output, numHeads, headSize, numSplits);                                          \
+            reducer.Init(workspace, output, numHeads, headSize, numSplits, lse);                                     \
             split.Reduce(reducer, reduceTasksPerCore);                                                               \
         }                                                                                                            \
     }
@@ -770,25 +777,28 @@ void turboquant_reshape_and_cache_impl(AscendType type, void *stream, uint32_t b
     }
 }
 
+// `lse` is the optional [numTokens, numHeads, kLseStride] fp32 softmax-statistics out-tensor, null on
+// every launch that does not merge a second attention stream into this one. It is last, and defaulted on
+// the declarations callers see, so that adding it left every existing call site of this function alone.
 void turboquant_paged_attention_impl(AscendType type, void *stream, uint32_t blockDim, void *queryRot,
                                      void *keyCache, void *valueCache, void *scaleCache, void *blockTables,
                                      void *contextLens, void *tables, void *workspace, void *output,
                                      uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize,
                                      uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits,
                                      uint32_t splitTasksPerCore, uint32_t reduceTasksPerCore,
-                                     uint32_t fusedContextLimit, float scale, float invSqrtLen)
+                                     uint32_t fusedContextLimit, float scale, float invSqrtLen, void *lse)
 {
     if (type == AscendType::FP16) {
         turboquant_paged_attention_fused_half<<<blockDim, nullptr, stream>>>(
             queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, tables, workspace, output,
             numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, splitTasksPerCore,
-            reduceTasksPerCore, fusedContextLimit, scale, invSqrtLen);
+            reduceTasksPerCore, fusedContextLimit, scale, invSqrtLen, lse);
 #if !defined(__CCE_AICORE__) || (__CCE_AICORE__ >= 220)
     } else if (type == AscendType::BF16) {
         turboquant_paged_attention_fused_bfloat16_t<<<blockDim, nullptr, stream>>>(
             queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, tables, workspace, output,
             numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, splitTasksPerCore,
-            reduceTasksPerCore, fusedContextLimit, scale, invSqrtLen);
+            reduceTasksPerCore, fusedContextLimit, scale, invSqrtLen, lse);
 #endif
     }
 }

@@ -134,6 +134,12 @@ def _ops_mock(workspace_floats: int = WORKSPACE_FLOATS) -> MagicMock:
     return ops
 
 
+#: Where ``out`` sits in each decode operator's positional arguments. Both take the
+#: optional softmax-statistics out-tensor after it, so neither is the last one any more.
+_PAGED_ATTENTION_OUT = 11
+_CUBE_DECODE_OUT = 16
+
+
 def _numeric_ops(rotated_output: torch.Tensor) -> MagicMock:
     """Operators that compute: rotate_q is Pi, and the decode writes a known
     rotated output. What the backend then leaves in ``output`` is the thing under
@@ -144,7 +150,9 @@ def _numeric_ops(rotated_output: torch.Tensor) -> MagicMock:
         out.copy_(apply_pi(x.to(torch.float32), signs))
 
     def paged_attention(*args):
-        args[-1].copy_(rotated_output)
+        # By position, not from the end: ``out`` is followed by the optional
+        # softmax-statistics tensor, which is None on a launch with sinks off.
+        args[_PAGED_ATTENTION_OUT].copy_(rotated_output)
 
     ops.npu_turboquant_rotate_q.side_effect = rotate_q
     ops.npu_turboquant_paged_attention.side_effect = paged_attention
@@ -416,9 +424,12 @@ class TestPureRuntimeContract(TestBase):
         ops.npu_turboquant_paged_attention.assert_called_once()
         args = ops.npu_turboquant_paged_attention.call_args.args
         # query_rot, k_cache, v_cache, scale_cache, block_tables, context_lens,
-        # codec_tables, workspace, num_kv_heads, num_heads, scale, out. No
+        # codec_tables, workspace, num_kv_heads, num_heads, scale, out, lse. No
         # pi_signs: neither kernel rotates, so nothing would read it.
-        self.assertEqual(len(args), 12)
+        self.assertEqual(len(args), 13)
+        # The softmax-statistics out-tensor is None with sinks off, which is what leaves
+        # the writer disabled inside the kernel and the feature costing a launch nothing.
+        self.assertIsNone(args[12])
         # The decode reads the rotation's output, not the model's query. Same
         # tensor object, so the two launches cannot disagree about the buffer.
         self.assertIs(args[0], rot_args[4])
@@ -1334,7 +1345,8 @@ def _cube_ops(stage_output: torch.Tensor | None = None) -> MagicMock:
     if stage_output is not None:
 
         def cube_decode(*args):
-            args[-1].copy_(stage_output)
+            # By position: ``out`` is followed by the optional statistics tensor.
+            args[_CUBE_DECODE_OUT].copy_(stage_output)
 
         ops.npu_turboquant_cube_decode.side_effect = cube_decode
     return ops
@@ -1386,8 +1398,10 @@ class TestCubeDecode(TestBase):
         ops.npu_turboquant_paged_attention.assert_not_called()
         args = ops.npu_turboquant_cube_decode.call_args.args
         # query, gate, pi_signs, codec_tables, hadamard16, k_cache, v_cache, scale_cache, block_tables,
-        # context_lens, workspace, query_rot, num_kv_heads, num_heads, scale, output_stage, out.
-        self.assertEqual(len(args), 17)
+        # context_lens, workspace, query_rot, num_kv_heads, num_heads, scale, output_stage, out, lse.
+        self.assertEqual(len(args), 18)
+        # None with sinks off: the decode writes no statistics unless something merges against them.
+        self.assertIsNone(args[17])
         # The raw query, not a rotation of it: the launch rotates it itself.
         torch.testing.assert_close(args[0], query)
         self.assertIsNone(args[1])

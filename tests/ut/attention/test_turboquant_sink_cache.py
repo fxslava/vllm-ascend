@@ -18,10 +18,15 @@
 
 :func:`~tests.ut.attention.turboquant_cpu_ops.turboquant_cpu_ops` serves the operators from
 the CPU, so what runs here is the code that ships: the side-car allocation, the ingestion
-that rides the packed write, the host-side softmax merge, and the un-rotation that follows
-it.  The point of the harness is that it can compare *numbers*: every run below is held
-against dense float64 attention over the same unquantised K and V, which is what an fp16
-baseline converges to.
+that rides the packed write, the scale rows it neutralises afterwards, the merge that
+appends the two streams from the decode's own ``lse`` out-tensor, and the un-rotation that
+follows it.  The point of the harness is that it can compare *numbers*: every run below is
+held against dense float64 attention over the same unquantised K and V, which is what an
+fp16 baseline converges to.
+
+The CPU ``npu_turboquant_paged_attention`` writes that out-tensor too, from the same online
+softmax it already computed, so the pair the merge consumes here is the pair the kernels
+write rather than a stand-in for it.
 
 The sequences are built so that the sinks matter.  Random K gives no token a dominant
 score, and then a 4-bit sink is no worse than a 4-bit anything else; a trained model's
@@ -45,17 +50,21 @@ from vllm_ascend.attention import turboquant_v1 as tq_module
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState, AscendMetadata
 from vllm_ascend.attention.turboquant_layout import (
     TURBOQUANT_LLOYD_MAX_CENTROIDS,
+    TURBOQUANT_LSE_STRIDE,
     TURBOQUANT_PACK_FACTOR,
     turboquant_dequantize,
     turboquant_scale_slot,
+    turboquant_split_lse,
 )
 from vllm_ascend.attention.turboquant_rotation import apply_pi, turboquant_pi_signs
 from vllm_ascend.attention.turboquant_sink import (
     TURBOQUANT_MAX_SINK_TOKENS,
+    TURBOQUANT_SINK_ALIGN_BYTES,
     TurboQuantSinkCache,
     TurboQuantSinkConfig,
     fuse_sink_stream,
     quantized_context_softmax_stats,
+    sink_plane_bytes,
     sink_validity_mask,
 )
 from vllm_ascend.attention.turboquant_v1 import AscendTurboQuantAttentionBackendImpl, activate_turboquant_backend
@@ -361,9 +370,35 @@ class TestTurboQuantSinkConfig(TestBase):
 
 
 class TestTurboQuantSinkFusionMath(TestBase):
-    """The merge on its own, against a softmax written out directly."""
+    """The merge on its own, against a softmax written out directly.
 
-    def test_replacing_the_quantized_sinks_reproduces_the_exact_softmax(self):
+    The decode it stands in for has had its sink rows neutralised in the scale plane, so
+    what it saw at those positions is a score of exactly zero and a value of exactly zero.
+    That is what the fixtures below reproduce: the "operator" attends over
+    ``[0, 0, ..., tail]`` and the merge has to turn its answer into attention over
+    ``[dense sinks, tail]``.
+    """
+
+    @staticmethod
+    def _neutralized_decode(tail_scores, tail_values, sinks):
+        """``(output, running_max, mass)`` of a decode whose first ``sinks`` rows are zeroed."""
+        tokens, _, heads = tail_scores.shape
+        head_size = tail_values.shape[-1]
+        scores = torch.cat((torch.zeros(tokens, sinks, heads), tail_scores), dim=1)
+        values = torch.cat((torch.zeros(tokens, sinks, heads, head_size), tail_values), dim=1)
+        running_max = scores.amax(dim=1)
+        mass = torch.exp(scores - running_max.unsqueeze(1)).sum(dim=1)
+        weights = torch.softmax(scores.to(torch.float64), dim=1)
+        return torch.einsum("tnh,tnhd->thd", weights, values.to(torch.float64)), running_max, mass
+
+    @staticmethod
+    def _exact_softmax(sink_scores, sink_values, tail_scores, tail_values):
+        """Dense float64 attention over the sinks followed by the tail."""
+        weights = torch.softmax(torch.cat((sink_scores, tail_scores), dim=1).to(torch.float64), dim=1)
+        values = torch.cat((sink_values, tail_values), dim=1).to(torch.float64)
+        return torch.einsum("tnh,tnhd->thd", weights, values)
+
+    def test_appending_the_exact_sinks_reproduces_the_exact_softmax(self):
         tokens, heads, sinks, context = 3, 4, 4, 64
         generator = torch.Generator().manual_seed(7)
 
@@ -373,34 +408,20 @@ class TestTurboQuantSinkFusionMath(TestBase):
         # The tail of the context, which the "operator" and the reference share verbatim.
         tail_scores = normal(tokens, context, heads)
         tail_values = normal(tokens, context, heads, HEAD_SIZE)
-        # The sinks, in the two versions the fusion has to swap between. The quantised
-        # scores are deliberately far above the tail's, so the mass really is concentrated
-        # there and the subtraction in the merge is the ill-conditioned one.
-        quant_scores = normal(tokens, sinks, heads) + 8.0
-        quant_values = normal(tokens, sinks, heads, HEAD_SIZE)
-        dense_scores = quant_scores + 0.05 * normal(tokens, sinks, heads)
-        dense_values = quant_values + 0.05 * normal(tokens, sinks, heads, HEAD_SIZE)
+        # The sinks as they really are. Their logits sit far above the tail's, which is the
+        # regime the feature exists for and the one where the rescaling has to be right.
+        dense_scores = normal(tokens, sinks, heads) + 8.0
+        dense_values = normal(tokens, sinks, heads, HEAD_SIZE)
         valid = torch.ones(tokens, sinks, dtype=torch.bool)
 
-        def softmax_attention(scores, values):
-            weights = torch.softmax(scores.to(torch.float64), dim=1)
-            return torch.einsum("tnh,tnhd->thd", weights, values.to(torch.float64))
+        operator_output, running_max, mass = self._neutralized_decode(tail_scores, tail_values, sinks)
+        expected = self._exact_softmax(dense_scores, dense_values, tail_scores, tail_values)
 
-        all_quant_scores = torch.cat((quant_scores, tail_scores), dim=1)
-        all_quant_values = torch.cat((quant_values, tail_values), dim=1)
-        operator_output = softmax_attention(all_quant_scores, all_quant_values)
-        expected = softmax_attention(
-            torch.cat((dense_scores, tail_scores), dim=1), torch.cat((dense_values, tail_values), dim=1)
-        )
-
-        running_max = all_quant_scores.amax(dim=1)
-        mass = torch.exp(all_quant_scores - running_max.unsqueeze(1)).sum(dim=1)
         fused = fuse_sink_stream(
             attention_output=operator_output.to(torch.float32),
             running_max=running_max,
             mass=mass,
-            quant_scores=quant_scores,
-            quant_values=quant_values,
+            neutralized=valid.sum(dim=1, keepdim=True),
             dense_scores=dense_scores,
             dense_values=dense_values,
             valid=valid,
@@ -412,6 +433,38 @@ class TestTurboQuantSinkFusionMath(TestBase):
         fused_error = (fused.to(torch.float64) - expected).abs().max().item()
         self.assertGreater(operator_error, 10 * fused_error)
 
+    def test_only_the_rows_the_decode_neutralized_are_subtracted(self):
+        """A sequence shorter than the slot count zeroed fewer cache rows than there are slots.
+
+        A merge that subtracted the slot count rather than the filled count would take mass
+        the decode never carried, and the residual would be short by ``exp(-m')`` per
+        unfilled slot -- small, silent, and in the denominator of every head.
+        """
+        heads, context = 2, 8
+        generator = torch.Generator().manual_seed(17)
+
+        def normal(*shape):
+            return torch.randn(*shape, generator=generator, dtype=torch.float32)
+
+        for filled in (1, 2, 4):
+            tail_scores = normal(1, context, heads)
+            tail_values = normal(1, context, heads, HEAD_SIZE)
+            dense_scores = normal(1, filled, heads) + 4.0
+            dense_values = normal(1, filled, heads, HEAD_SIZE)
+            output, running_max, mass = self._neutralized_decode(tail_scores, tail_values, filled)
+            fused = fuse_sink_stream(
+                attention_output=output.to(torch.float32),
+                running_max=running_max,
+                mass=mass,
+                neutralized=torch.tensor([[filled]]),
+                dense_scores=dense_scores,
+                dense_values=dense_values,
+                valid=torch.ones(1, filled, dtype=torch.bool),
+            )
+            expected = self._exact_softmax(dense_scores, dense_values, tail_scores, tail_values)
+            with self.subTest(filled=filled):
+                torch.testing.assert_close(fused.to(torch.float64), expected, rtol=2e-4, atol=2e-4)
+
     def test_a_token_with_no_valid_sink_is_left_alone(self):
         tokens, heads, sinks = 2, 2, 4
         output = torch.randn(tokens, heads, HEAD_SIZE)
@@ -421,33 +474,57 @@ class TestTurboQuantSinkFusionMath(TestBase):
             attention_output=output,
             running_max=torch.zeros(tokens, heads),
             mass=torch.ones(tokens, heads),
-            quant_scores=torch.zeros(tokens, sinks, heads),
-            quant_values=torch.zeros(tokens, sinks, heads, HEAD_SIZE),
+            neutralized=valid.sum(dim=1, keepdim=True),
             dense_scores=torch.zeros(tokens, sinks, heads),
             dense_values=torch.zeros(tokens, sinks, heads, HEAD_SIZE),
             valid=valid,
         )
         torch.testing.assert_close(fused[1], output[1])
 
-    def test_total_cancellation_falls_back_rather_than_flipping_sign(self):
-        """A context that is nothing but sinks leaves no residual mass to divide by."""
-        tokens, heads, sinks = 1, 1, 2
-        scores = torch.full((tokens, sinks, heads), 3.0)
-        values = torch.randn(tokens, sinks, heads, HEAD_SIZE)
-        running_max = scores.amax(dim=1)
-        mass = torch.exp(scores - running_max.unsqueeze(1)).sum(dim=1)
-        output = torch.einsum("tnh,tnhd->thd", torch.softmax(scores, dim=1), values)
+    def test_a_token_whose_decode_carried_no_mass_is_left_alone(self):
+        """An empty context: the max lane holds whatever the kernel initialised, not a logit.
+
+        The merge must branch on the mass and never on the max, or it would take the
+        accumulator's sentinel for a score and rescale everything else against it.
+        """
+        tokens, heads, sinks = 1, 2, 2
+        output = torch.randn(tokens, heads, HEAD_SIZE)
         fused = fuse_sink_stream(
             attention_output=output,
-            running_max=running_max,
-            mass=mass,
-            quant_scores=scores,
-            quant_values=values,
+            running_max=torch.full((tokens, heads), -3.0e38),
+            mass=torch.zeros(tokens, heads),
+            neutralized=torch.zeros(tokens, 1),
+            dense_scores=torch.zeros(tokens, sinks, heads),
+            dense_values=torch.randn(tokens, sinks, heads, HEAD_SIZE),
+            valid=torch.ones(tokens, sinks, dtype=torch.bool),
+        )
+        torch.testing.assert_close(fused, output)
+        self.assertTrue(bool(torch.isfinite(fused).all()))
+
+    def test_a_context_that_is_nothing_but_sinks_is_the_dense_sinks_alone(self):
+        """Every row the decode read was neutralised, so the residual is exactly zero.
+
+        The previous shape of this merge subtracted the quantised sinks from a mass they
+        dominated, and what was left had to be clamped rather than trusted.  Here the
+        subtracted term is ``n`` against a decode that summed ``n`` rows of ``exp(0)``, so
+        the residual is zero by construction and the answer is the dense sinks' own softmax.
+        """
+        tokens, heads, sinks = 1, 1, 2
+        scores = torch.tensor([[[3.0], [1.0]]])
+        values = torch.randn(tokens, sinks, heads, HEAD_SIZE)
+        # What a neutralised decode over nothing but sinks produces: every score 0, every
+        # value 0, and a mass of exactly one unit per row.
+        fused = fuse_sink_stream(
+            attention_output=torch.zeros(tokens, heads, HEAD_SIZE),
+            running_max=torch.zeros(tokens, heads),
+            mass=torch.full((tokens, heads), float(sinks)),
+            neutralized=torch.full((tokens, 1), float(sinks)),
             dense_scores=scores,
             dense_values=values,
             valid=torch.ones(tokens, sinks, dtype=torch.bool),
         )
-        torch.testing.assert_close(fused, output, rtol=1e-5, atol=1e-5)
+        expected = torch.einsum("tnh,tnhd->thd", torch.softmax(scores, dim=1), values)
+        torch.testing.assert_close(fused, expected, rtol=1e-5, atol=1e-5)
         self.assertTrue(bool(torch.isfinite(fused).all()))
 
 
@@ -569,10 +646,146 @@ class TestTurboQuantSinkCachePlane(TestBase):
         )
         # 2 planes * 4 sinks * 8 kv heads * 128 lanes * 2 bytes.
         self.assertEqual(cache.bytes_per_sequence, 16384)
-        self.assertEqual(cache.nbytes, 64 * cache.bytes_per_sequence)
-        # And what that is against the packed cache it accompanies: 4 * N / block_size.
+        payload = 64 * cache.bytes_per_sequence
+        # nbytes is what the arena paid, which is the payload plus the alignment slack.
+        self.assertEqual(cache.nbytes, payload + TURBOQUANT_SINK_ALIGN_BYTES)
+        self.assertEqual(
+            cache.nbytes,
+            sink_plane_bytes(
+                num_blocks=64,
+                num_sink_tokens=SINK_TOKENS,
+                num_kv_heads=8,
+                head_size=HEAD_SIZE,
+                element_size=2,
+            ),
+        )
+        # And what the payload is against the packed cache it accompanies: 4 * N / block_size.
         packed_bytes = 2 * 64 * BLOCK_SIZE * 8 * (HEAD_SIZE // TURBOQUANT_PACK_FACTOR)
-        self.assertAlmostEqual(cache.nbytes / packed_bytes, 4 * SINK_TOKENS / BLOCK_SIZE, places=6)
+        self.assertAlmostEqual(payload / packed_bytes, 4 * SINK_TOKENS / BLOCK_SIZE, places=6)
+
+    def test_the_plane_starts_on_a_whole_dma_line(self):
+        """The slack is there to be used: a view at the first aligned element, not at zero."""
+        for num_kv_heads, dtype in ((2, torch.float16), (8, torch.bfloat16), (1, torch.float32)):
+            cache = TurboQuantSinkCache(
+                num_blocks=3,
+                block_size=BLOCK_SIZE,
+                num_sink_tokens=SINK_TOKENS,
+                num_kv_heads=num_kv_heads,
+                head_size=HEAD_SIZE,
+                dtype=dtype,
+                device=CPU,
+            )
+            with self.subTest(num_kv_heads=num_kv_heads, dtype=dtype):
+                self.assertEqual(cache.planes.data_ptr() % TURBOQUANT_SINK_ALIGN_BYTES, 0)
+                self.assertTrue(cache.planes.is_contiguous())
+                self.assertEqual(int(cache.planes.count_nonzero()), 0)
+
+    def test_a_token_whose_rows_are_not_a_whole_group_is_refused(self):
+        """The base alignment says nothing about a row unless the row length carries it."""
+        with self.assertRaisesRegex(ValueError, "whole group"):
+            TurboQuantSinkCache(
+                num_blocks=1,
+                block_size=BLOCK_SIZE,
+                num_sink_tokens=1,
+                num_kv_heads=1,
+                head_size=48,
+                dtype=DTYPE,
+                device=CPU,
+            )
+
+    def test_neutralizing_zeroes_exactly_the_scale_rows_the_sinks_were_written_to(self):
+        """The quantised copies leave the decode's arithmetic through the scale plane.
+
+        Zeroing a token's K and V scale lanes makes its cached key exactly the zero vector
+        and its cached value contribute exactly nothing, on whichever codebook and byte
+        order the writer used -- which is what lets the merge be layout-independent.  The
+        selection has to be the one :meth:`ingest` made, to the row.
+        """
+        num_kv_heads, num_blocks = 2, 8
+        cache = TurboQuantSinkCache(
+            num_blocks=num_blocks,
+            block_size=BLOCK_SIZE,
+            num_sink_tokens=SINK_TOKENS,
+            num_kv_heads=num_kv_heads,
+            head_size=HEAD_SIZE,
+            dtype=DTYPE,
+            device=CPU,
+        )
+        slot_floats = turboquant_scale_slot(num_kv_heads)
+        scale_cache = torch.ones(num_blocks, BLOCK_SIZE, slot_floats, dtype=torch.float32)
+        anchors = torch.tensor([5, 2], dtype=torch.int32)
+        selection = {
+            "anchor_blocks": anchors,
+            "query_starts": [0, 6],
+            "query_lens": [6, 4],
+            "context_lens": [0, 0],
+        }
+
+        zeroed = cache.neutralize_scale_rows(scale_cache, **selection)
+        self.assertEqual(zeroed, 2 * SINK_TOKENS)
+        for block in (5, 2):
+            self.assertEqual(int(scale_cache[block, :SINK_TOKENS].count_nonzero()), 0)
+            self.assertEqual(int((scale_cache[block, SINK_TOKENS:] != 1.0).sum()), 0)
+        untouched = [block for block in range(num_blocks) if block not in (5, 2)]
+        self.assertEqual(int((scale_cache[untouched] != 1.0).sum()), 0)
+
+        # Idempotent: a prompt split across steps, and a prefix-cache hit, both re-run it.
+        scale_cache[5, :SINK_TOKENS] = 1.0
+        self.assertEqual(cache.neutralize_scale_rows(scale_cache, **selection), 2 * SINK_TOKENS)
+        self.assertEqual(int(scale_cache[5, :SINK_TOKENS].count_nonzero()), 0)
+
+    def test_neutralizing_a_step_with_no_sinks_left_touches_nothing(self):
+        cache = TurboQuantSinkCache(
+            num_blocks=2,
+            block_size=BLOCK_SIZE,
+            num_sink_tokens=SINK_TOKENS,
+            num_kv_heads=1,
+            head_size=HEAD_SIZE,
+            dtype=DTYPE,
+            device=CPU,
+        )
+        scale_cache = torch.ones(2, BLOCK_SIZE, turboquant_scale_slot(1), dtype=torch.float32)
+        zeroed = cache.neutralize_scale_rows(
+            scale_cache,
+            anchor_blocks=torch.tensor([1], dtype=torch.int32),
+            query_starts=[0],
+            query_lens=[1],
+            context_lens=[SINK_TOKENS],
+        )
+        self.assertEqual(zeroed, 0)
+        self.assertEqual(int((scale_cache != 1.0).sum()), 0)
+
+    def test_neutralizing_by_slot_agrees_with_neutralizing_by_request(self):
+        """The two selections have to name the same rows, or one harness measures another cache."""
+        num_kv_heads = 2
+        slot_floats = turboquant_scale_slot(num_kv_heads)
+
+        def fresh():
+            return TurboQuantSinkCache(
+                num_blocks=1,
+                block_size=BLOCK_SIZE,
+                num_sink_tokens=SINK_TOKENS,
+                num_kv_heads=num_kv_heads,
+                head_size=HEAD_SIZE,
+                dtype=DTYPE,
+                device=CPU,
+            )
+
+        by_request_scales = torch.ones(1, BLOCK_SIZE, slot_floats, dtype=torch.float32)
+        by_slot_scales = torch.ones(1, BLOCK_SIZE, slot_floats, dtype=torch.float32)
+        by_request, by_slot = fresh(), fresh()
+        for start, count in ((0, 3), (3, 13)):
+            by_request.neutralize_scale_rows(
+                by_request_scales,
+                anchor_blocks=torch.zeros(1, dtype=torch.int32),
+                query_starts=[0],
+                query_lens=[count],
+                context_lens=[start],
+            )
+            by_slot.neutralize_scale_rows_by_slot(by_slot_scales, block=0)
+        self.assertTrue(torch.equal(by_request_scales, by_slot_scales))
+        self.assertEqual(int(by_slot_scales[0, :SINK_TOKENS].count_nonzero()), 0)
+        self.assertEqual(int((by_slot_scales[0, SINK_TOKENS:] != 1.0).sum()), 0)
 
     def test_the_validity_mask_follows_the_sequence_length(self):
         mask, any_valid = sink_validity_mask(torch.tensor([0, 2, 9]), 4, SINK_TOKENS, CPU)
@@ -644,20 +857,45 @@ class TestTurboQuantSinkDecode(_TurboQuantSinkHarness):
         """The merge must not reintroduce a per-step allocation the capture path forbids."""
         run = self._run(prompt_lens=(SHORT_PROMPT,), num_kv_heads=2, sink_tokens=SINK_TOKENS)
         workspace, rotated_query = run.impl.decode_workspace, run.impl.rotated_query
-        plane = run.impl.sink_cache.planes
+        plane, lse = run.impl.sink_cache.planes, run.impl.sink_lse
+        self.assertIsNotNone(lse)
         again = self._run(prompt_lens=(SHORT_PROMPT,), num_kv_heads=2, sink_tokens=SINK_TOKENS, impl=run.impl)
         self.assertIs(again.impl.decode_workspace, workspace)
         self.assertIs(again.impl.rotated_query, rotated_query)
         self.assertIs(again.impl.sink_cache.planes, plane)
+        self.assertIs(again.impl.sink_lse, lse)
 
-    def test_the_recomputed_denominator_matches_the_decode_it_stands_in_for(self):
-        """The merge's weight comes from this; if it drifts, the subtraction removes the wrong mass."""
+    def test_no_statistics_buffer_is_allocated_with_sinks_off(self):
+        """The out-tensor is optional in the schema so that this costs a launch nothing."""
+        run = self._run(prompt_lens=(SHORT_PROMPT,), num_kv_heads=2, sink_tokens=0, plant=False)
+        self.assertIsNone(run.impl.sink_lse)
+        self.assertIsNone(run.impl._sink_lse(1, CPU))
+
+    def test_the_decodes_own_statistics_match_the_host_oracle(self):
+        """What the kernel wrote against an independent derivation of the same pair.
+
+        This is the whole of phase two: the merge's weight used to be recomputed on the
+        host at ``O(context)`` per step, and is now read out of the decode.  The two have to
+        agree, or the merge rescales against a denominator the operator never used -- which
+        does not raise, it just returns a plausible wrong answer.
+
+        The oracle reads the packed planes row-major on the Lloyd-Max grid, which is what
+        this harness's writer leaves; it is a test instrument, not a path.
+        """
         prompts = (SHORT_PROMPT,)
-        run = self._run(prompt_lens=prompts, num_kv_heads=2, sink_tokens=SINK_TOKENS)
-        impl = run.impl
+        # A folded layer, so that the rotated-query buffer still holds Pi q when this reads
+        # it: the un-rotation writes the output back through the same scratch.
+        impl = self._build_impl(2, SINK_TOKENS)
+        impl.output_rotation_folded = True
+        run = self._run(prompt_lens=prompts, num_kv_heads=2, sink_tokens=SINK_TOKENS, impl=impl)
         block_tables = torch.tensor(_block_table(prompts, 2), dtype=torch.int32)
         seq_lens = torch.tensor(prompts) + 1
-        running_max, mass = quantized_context_softmax_stats(
+
+        self.assertEqual(impl.sink_lse.numel() % (NUM_HEADS * TURBOQUANT_LSE_STRIDE), 0)
+        written = impl.sink_lse[: NUM_HEADS * TURBOQUANT_LSE_STRIDE].view(1, NUM_HEADS, TURBOQUANT_LSE_STRIDE)
+        kernel_max, kernel_mass = turboquant_split_lse(written)
+
+        oracle_max, oracle_mass = quantized_context_softmax_stats(
             rotated_query=impl.rotated_query[: NUM_HEADS * HEAD_SIZE].view(1, NUM_HEADS, HEAD_SIZE),
             key_cache=run.kv_cache[0],
             scale_cache=impl.scale_cache,
@@ -667,23 +905,141 @@ class TestTurboQuantSinkDecode(_TurboQuantSinkHarness):
             num_heads=NUM_HEADS,
             scale_value=HEAD_SIZE**-0.5,
         )
-        # The same scores, written out in one shot against the same dequantised cache.
-        length = int(seq_lens[0])
+        torch.testing.assert_close(kernel_max, oracle_max, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(kernel_mass, oracle_mass, rtol=1e-5, atol=1e-5)
+
+        # The sink rows were neutralised in the scale plane, so the decode scored each of
+        # them at exactly zero -- which is what the merge subtracts, as a known integer.
         rows = torch.tensor(
-            [_block_table(prompts, 2)[0][p // BLOCK_SIZE] * BLOCK_SIZE + p % BLOCK_SIZE for p in range(length)]
+            [_block_table(prompts, 2)[0][sink // BLOCK_SIZE] * BLOCK_SIZE + sink for sink in range(SINK_TOKENS)]
         )
-        packed = run.kv_cache[0].view(-1, 2, HEAD_SIZE // TURBOQUANT_PACK_FACTOR)[rows]
-        scales = impl.scale_cache.view(-1, turboquant_scale_slot(2))[rows, :2]
-        keys = turboquant_dequantize(packed) * scales.unsqueeze(-1)
-        keys = keys.repeat_interleave(NUM_HEADS // 2, dim=1)
-        query = impl.rotated_query[: NUM_HEADS * HEAD_SIZE].view(NUM_HEADS, HEAD_SIZE)
-        scores = torch.einsum("hd,lhd->lh", query, keys) * HEAD_SIZE**-0.5
-        torch.testing.assert_close(running_max[0], scores.amax(dim=0))
-        torch.testing.assert_close(mass[0], torch.exp(scores - scores.amax(dim=0)).sum(dim=0), rtol=1e-5, atol=1e-5)
-        # And the host dequantiser agrees with the one the CPU operators use, so the two
-        # sides of the subtraction are reading the same grid.
+        scales = impl.scale_cache.view(-1, turboquant_scale_slot(2))[rows]
+        self.assertEqual(int(scales.count_nonzero()), 0)
+        self.assertGreaterEqual(kernel_mass.min().item(), float(SINK_TOKENS))
+
+        # And the lanes the kernel does not use stay zero, so a reader that took the whole
+        # group for data would see nothing plausible in them.
+        for lane in range(TURBOQUANT_LSE_STRIDE):
+            if lane in (0, TURBOQUANT_LSE_STRIDE // 2):
+                continue
+            self.assertEqual(int(written[..., lane].count_nonzero()), 0)
+
+    def test_the_host_oracle_zero_extends_a_short_length_vector(self):
+        """Defensive: a metadata that describes fewer rows than it runs reads as no context."""
+        impl = self._build_impl(2, SINK_TOKENS)
+        run = self._run(prompt_lens=(SHORT_PROMPT,), num_kv_heads=2, sink_tokens=SINK_TOKENS, impl=impl)
+        running_max, mass = quantized_context_softmax_stats(
+            rotated_query=torch.zeros(2, NUM_HEADS, HEAD_SIZE),
+            key_cache=run.kv_cache[0],
+            scale_cache=impl.scale_cache,
+            block_tables=torch.tensor(_block_table((SHORT_PROMPT,), 2) * 2, dtype=torch.int32),
+            seq_lens=torch.tensor([SHORT_PROMPT]),
+            num_kv_heads=2,
+            num_heads=NUM_HEADS,
+            scale_value=HEAD_SIZE**-0.5,
+        )
+        self.assertGreater(mass[0].min().item(), 0.0)
+        self.assertEqual(int(mass[1].count_nonzero()), 0)
+        self.assertTrue(bool(torch.isfinite(running_max).all()))
+        # The host dequantiser agrees with the one the CPU operators use, so the oracle and
+        # the kernel it is checked against are reading the same grid.
+        packed = run.kv_cache[0].view(-1, 2, HEAD_SIZE // TURBOQUANT_PACK_FACTOR)[:4]
         centroids = torch.tensor(TURBOQUANT_LLOYD_MAX_CENTROIDS, dtype=torch.float32)
         torch.testing.assert_close(turboquant_dequantize(packed), dequantize(packed, centroids))
+
+    def test_the_build_check_reads_the_schema_that_is_actually_registered(self):
+        """Otherwise the guard below is a no-op, which is what it was at first.
+
+        The schema lives on the operator's *overload*. ``torch.ops`` hands out an
+        ``OpOverloadPacket``, which carries no ``_schema`` at all, so a guard that read one
+        off the packet passed on every build there has ever been -- including the ones it
+        exists to refuse.
+        """
+        for name in ("npu_turboquant_paged_attention",):
+            schema = tq_module._registered_schema(name)
+            with self.subTest(name=name):
+                self.assertIsNotNone(schema, f"{name} is registered, so its schema has to be readable")
+                self.assertIn(tq_module.TURBOQUANT_LSE_ARGUMENT, [a.name for a in schema.arguments])
+        # And a name nothing registered answers nothing rather than an empty argument list.
+        self.assertIsNone(tq_module._registered_schema("npu_turboquant_no_such_operator"))
+
+    def test_a_build_whose_decode_cannot_report_its_softmax_is_refused(self):
+        """Without the ``lse`` out-tensor there is nothing to merge against.
+
+        The pair cannot be recovered from the operator's output at any number of extra
+        launches -- the output is a convex combination of the values, so it is invariant to
+        a rescaling of the weights, and the mass is exactly what that rescaling destroys.
+        Left to the call it would be a TypeError about an argument count, raised from inside
+        a decode step on a configuration that had already allocated a plane per layer.
+        """
+        stale = SimpleNamespace(
+            _schema=torch._C.parse_schema(
+                "_C_ascend::npu_turboquant_paged_attention(Tensor query_rot, Tensor! out) -> ()"
+            )
+        )
+        impl = self._build_impl(2, SINK_TOKENS)
+        with patch.object(torch.ops._C_ascend, "npu_turboquant_paged_attention", stale):
+            for call in (
+                lambda: impl.process_weights_after_loading(DTYPE),
+                lambda: impl._ensure_sink_cache(self._allocate_kv_cache(2), DTYPE),
+            ):
+                with self.subTest(call=call), self.assertRaisesRegex(RuntimeError, "optional 'lse' out-tensor"):
+                    call()
+        self.assertIsNone(impl.sink_cache)
+
+    def test_the_build_check_is_skipped_with_sinks_off(self):
+        """``sink_tokens=0`` is the shipping path and must not have acquired a guard."""
+        stale = SimpleNamespace(_schema=torch._C.parse_schema("_C_ascend::whatever(Tensor a) -> ()"))
+        impl = self._build_impl(2, 0)
+        with patch.object(torch.ops._C_ascend, "npu_turboquant_paged_attention", stale):
+            impl.process_weights_after_loading(DTYPE)
+            impl._ensure_sink_cache(self._allocate_kv_cache(2), DTYPE)
+        self.assertIsNone(impl.sink_cache)
+
+    def test_the_cube_decode_is_no_longer_refused(self):
+        """The merge reads no packed byte, so the NZ-tiled affine kv4fp8 cache serves it too.
+
+        What used to make this combination wrong was a host reader of the packed planes:
+        the merge recomputed the softmax denominator by dequantising the context row-major
+        on the Lloyd-Max grid, and the Cube writer leaves neither layout nor codebook.  Both
+        halves of that are gone -- the statistics come out of the kernel and the quantised
+        sinks leave through the scale plane -- so the guard is now about the *build*, and
+        this build has the out-tensor.
+        """
+        impl = self._build_impl(2, SINK_TOKENS)
+        impl.cube_decode = True
+        impl.process_weights_after_loading(DTYPE)
+        impl._ensure_sink_cache(self._allocate_kv_cache(2), DTYPE)
+        self.assertIsNotNone(impl.sink_cache)
+        # And the build check follows the decode that will actually run.
+        stale = SimpleNamespace(_schema=torch._C.parse_schema("_C_ascend::whatever(Tensor a) -> ()"))
+        with (
+            patch.object(torch.ops._C_ascend, "npu_turboquant_cube_decode", stale, create=True),
+            self.assertRaisesRegex(RuntimeError, "npu_turboquant_cube_decode"),
+        ):
+            impl.process_weights_after_loading(DTYPE)
+
+    def test_a_sink_plane_the_arena_cannot_hold_is_refused_where_it_is_named(self):
+        """Out of memory several layers later names neither the plane nor the flag that asked."""
+        impl = self._build_impl(2, SINK_TOKENS)
+        kv_cache = self._allocate_kv_cache(2)
+        needed = sink_plane_bytes(
+            num_blocks=NUM_BLOCKS,
+            num_sink_tokens=SINK_TOKENS,
+            num_kv_heads=2,
+            head_size=HEAD_SIZE,
+            element_size=torch.empty((), dtype=DTYPE).element_size(),
+        )
+        with (
+            patch.object(tq_module, "_device_free_memory", return_value=needed),
+            self.assertRaisesRegex(RuntimeError, "uncompressed sink plane"),
+        ):
+            impl._ensure_sink_cache(kv_cache, DTYPE)
+        self.assertIsNone(impl.sink_cache)
+        # Room to spare is allowed, and a device that answers nothing is not second-guessed.
+        with patch.object(tq_module, "_device_free_memory", return_value=None):
+            impl._ensure_sink_cache(kv_cache, DTYPE)
+        self.assertIsNotNone(impl.sink_cache)
 
     def test_the_fusion_runs_before_the_output_un_rotation(self):
         """A merge applied after Pi would be a rescaling of the wrong basis.
@@ -732,6 +1088,8 @@ class TestTurboQuantSinkDecode(_TurboQuantSinkHarness):
             dtype=DTYPE,
             device=CPU,
         )
+        slot_floats = turboquant_scale_slot(2)
+        impl.scale_cache = torch.ones(NUM_BLOCKS, BLOCK_SIZE, slot_floats, dtype=torch.float32)
         generator = torch.Generator().manual_seed(21)
         key = torch.randn(12, 2, HEAD_SIZE, generator=generator).to(DTYPE)
         value = torch.randn(12, 2, HEAD_SIZE, generator=generator).to(DTYPE)
@@ -748,6 +1106,12 @@ class TestTurboQuantSinkDecode(_TurboQuantSinkHarness):
         torch.testing.assert_close(impl.sink_cache.planes[0, 7], key[:SINK_TOKENS])
         torch.testing.assert_close(impl.sink_cache.planes[0, 5], key[6 : 6 + SINK_TOKENS])
         self.assertEqual(int(impl.sink_cache.planes[:, 3].count_nonzero()), 0)
+        # The neutralisation follows the same rows, so the empty request cannot shift it
+        # either: the third sequence's block keeps its scales and the other two lose theirs.
+        for block in (7, 5):
+            self.assertEqual(int(impl.scale_cache[block, :SINK_TOKENS].count_nonzero()), 0)
+            self.assertEqual(int((impl.scale_cache[block, SINK_TOKENS:] != 1.0).sum()), 0)
+        self.assertEqual(int((impl.scale_cache[3] != 1.0).sum()), 0)
 
     def test_padding_rows_of_a_batch_are_left_alone(self):
         """A captured shape runs query rows the scheduler never filled.
@@ -781,50 +1145,6 @@ class TestTurboQuantSinkDecode(_TurboQuantSinkHarness):
         self.assertEqual(int(output[1:].count_nonzero()), 0)
         run.decode_output = output[:1]
         self.assertGreater(self._decode_cosine(run, (SHORT_PROMPT,), 2).min().item(), MIN_UNCOMPRESSED_SINK_COSINE)
-
-    def test_the_denominator_recompute_zero_extends_a_short_length_vector(self):
-        """Defensive: a metadata that describes fewer rows than it runs reads as no context."""
-        impl = self._build_impl(2, SINK_TOKENS)
-        run = self._run(prompt_lens=(SHORT_PROMPT,), num_kv_heads=2, sink_tokens=SINK_TOKENS, impl=impl)
-        running_max, mass = quantized_context_softmax_stats(
-            rotated_query=torch.zeros(2, NUM_HEADS, HEAD_SIZE),
-            key_cache=run.kv_cache[0],
-            scale_cache=impl.scale_cache,
-            block_tables=torch.tensor(_block_table((SHORT_PROMPT,), 2) * 2, dtype=torch.int32),
-            seq_lens=torch.tensor([SHORT_PROMPT]),
-            num_kv_heads=2,
-            num_heads=NUM_HEADS,
-            scale_value=HEAD_SIZE**-0.5,
-        )
-        self.assertGreater(mass[0].min().item(), 0.0)
-        self.assertEqual(int(mass[1].count_nonzero()), 0)
-        self.assertTrue(bool(torch.isfinite(running_max).all()))
-
-    def test_the_kv4fp8_cube_decode_is_refused_rather_than_misread(self):
-        """The merge reads row-major Lloyd-Max planes; the Cube writer leaves neither.
-
-        Its planes are NZ-tiled (``kStoresNzTiles<KV4_FP8>``) and its codes are affine
-        about 7.5 on an fp8 grid, so the merge would recompute the softmax denominator
-        from the wrong bytes on the wrong grid and return plausible wrong numbers. A real
-        ablation scored 57.6% at ``sink_tokens=0`` and 14.1% at 4 before this refusal.
-        """
-        impl = self._build_impl(2, SINK_TOKENS)
-        impl.cube_decode = True
-        for call in (
-            lambda: impl.process_weights_after_loading(DTYPE),
-            lambda: impl._ensure_sink_cache(self._allocate_kv_cache(2), DTYPE),
-        ):
-            with self.subTest(call=call), self.assertRaisesRegex(RuntimeError, "kv4fp8 Cube decode"):
-                call()
-        self.assertIsNone(impl.sink_cache)
-
-    def test_the_cube_decode_is_untouched_with_sinks_off(self):
-        """``sink_tokens=0`` is the authoritative path and must not have acquired a guard."""
-        impl = self._build_impl(2, 0)
-        impl.cube_decode = True
-        impl.process_weights_after_loading(DTYPE)
-        impl._ensure_sink_cache(self._allocate_kv_cache(2), DTYPE)
-        self.assertIsNone(impl.sink_cache)
 
     def test_a_folded_layer_leaves_the_merged_output_rotated(self):
         """With Pi folded into o_proj the merge is the last thing that touches the output."""

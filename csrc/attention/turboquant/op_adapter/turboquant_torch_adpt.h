@@ -45,7 +45,7 @@ extern void turboquant_paged_attention_impl(AscendType type, void *stream, uint3
                                             uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,
                                             uint32_t numSplits, uint32_t splitTasksPerCore,
                                             uint32_t reduceTasksPerCore, uint32_t fusedContextLimit, float scale,
-                                            float invSqrtLen);
+                                            float invSqrtLen, void *lse = nullptr);
 
 extern void turboquant_rotate_q_impl(AscendType type, void *stream, uint32_t blockDim, bool useCube, void *query,
                                      void *piSigns, void *h16, void *rotTables, void *queryRot, uint32_t numVectors,
@@ -67,7 +67,7 @@ extern void turboquant_mm_fused_decode_raw_query_impl(
     uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits,
     uint32_t headsPerTask, uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock, uint32_t prologueVectorsPerBlock,
     uint32_t prologueCubeChunkVectors, uint32_t outputStage, uint32_t fusedContextLimit, float scale,
-    float invSqrtLen);
+    float invSqrtLen, void *lse = nullptr);
 #endif
 
 namespace turboquant_adpt {
@@ -136,6 +136,31 @@ inline void CheckOnDevice(const at::Tensor &tensor, const char *name, const at::
                 " is on ", reference.device(),
                 "; the kernel reads it from global memory, so a host tensor reaches the AI core as an invalid "
                 "address rather than as a wrong answer");
+}
+
+// The decodes' optional softmax-statistics out-tensor: a strict [num_tokens, num_heads, kLseStride]
+// float32 block, checked to the element rather than to the byte count. The kernel addresses it by
+// (token * num_heads + head) * kLseStride with no bound of its own, so a tensor one rung short of the
+// batch is an out-of-range global write -- which reaches the host as whatever launch the runtime was
+// working on when the page fault landed, naming nothing. A shape check here is what names it.
+//
+// Returns the pointer to hand the launch, or nullptr when the caller passed nothing, which is what
+// leaves the writer disabled inside the kernel.
+inline void *CheckLse(const c10::optional<at::Tensor> &lse, const at::Tensor &reference, int64_t numTokens,
+                      int64_t numHeads)
+{
+    if (!lse.has_value() || !lse->defined()) {
+        return nullptr;
+    }
+    const int64_t stride = static_cast<int64_t>(tq::kLseStride);
+    TORCH_CHECK(lse->scalar_type() == at::ScalarType::Float, "lse must be float32, got ", lse->scalar_type());
+    TORCH_CHECK(lse->is_contiguous(), "lse must be contiguous");
+    TORCH_CHECK(lse->dim() == 3 && lse->size(0) == numTokens && lse->size(1) == numHeads &&
+                    lse->size(2) == stride,
+                "lse must be [", numTokens, ", ", numHeads, ", ", stride, "], got ", lse->sizes());
+    CheckOnDevice(*lse, "lse", reference, "the decode's query");
+    CheckGmBurstAligned(*lse, "lse");
+    return lse->data_ptr();
 }
 
 inline void CheckCodecTables(const at::Tensor &tables, int64_t headSize, int64_t batchRows)
@@ -303,7 +328,7 @@ inline void npu_turboquant_paged_attention(at::Tensor &query_rot, at::Tensor &ke
                                            at::Tensor &scale_cache, at::Tensor &block_tables,
                                            at::Tensor &context_lens, at::Tensor &codec_tables, at::Tensor &workspace,
                                            int64_t num_kv_heads, int64_t num_heads, double scale_value,
-                                           at::Tensor &out)
+                                           at::Tensor &out, const c10::optional<at::Tensor> &lse)
 {
     namespace adpt = turboquant_adpt;
 
@@ -375,6 +400,8 @@ inline void npu_turboquant_paged_attention(at::Tensor &query_rot, at::Tensor &ke
                 ", num_heads ", num_heads, ", head_size ", head_size, ", num_splits ", plan.num_splits,
                 "); size it with npu_turboquant_workspace_size");
 
+    void *lse_ptr = adpt::CheckLse(lse, query_rot, num_tokens, num_heads);
+
     const float inv_sqrt_len = 1.0f / std::sqrt(static_cast<float>(head_size));
     const float scale = static_cast<float>(scale_value);
 
@@ -386,7 +413,7 @@ inline void npu_turboquant_paged_attention(at::Tensor &query_rot, at::Tensor &ke
         static_cast<uint32_t>(num_tokens), static_cast<uint32_t>(num_heads), static_cast<uint32_t>(num_kv_heads),
         static_cast<uint32_t>(head_size), static_cast<uint32_t>(block_size),
         static_cast<uint32_t>(max_blocks_per_seq), static_cast<uint32_t>(plan.num_splits), plan.split_tasks_per_core,
-        plan.reduce_tasks_per_core, vllm_ascend::turboquant::kFusedContextLimit, scale, inv_sqrt_len);
+        plan.reduce_tasks_per_core, vllm_ascend::turboquant::kFusedContextLimit, scale, inv_sqrt_len, lse_ptr);
 }
 
 #ifdef VLLM_ENABLE_TURBOQUANT_CUBE
@@ -522,7 +549,8 @@ inline void npu_turboquant_cube_decode(at::Tensor &query, const c10::optional<at
                                        at::Tensor &key_cache, at::Tensor &value_cache, at::Tensor &scale_cache,
                                        at::Tensor &block_tables, at::Tensor &context_lens, at::Tensor &workspace,
                                        at::Tensor &query_rot, int64_t num_kv_heads, int64_t num_heads,
-                                       double scale_value, int64_t output_stage, at::Tensor &out)
+                                       double scale_value, int64_t output_stage, at::Tensor &out,
+                                       const c10::optional<at::Tensor> &lse)
 {
     namespace adpt = turboquant_adpt;
     namespace tq = vllm_ascend::turboquant;
@@ -591,6 +619,8 @@ inline void npu_turboquant_cube_decode(at::Tensor &query, const c10::optional<at
                 " float32 words but this launch needs ", workspace_floats, " (num_tokens ", num_tokens,
                 ", num_splits ", grid.num_splits, "); size it with npu_turboquant_cube_workspace_size");
 
+    void *lse_ptr = adpt::CheckLse(lse, query, num_tokens, num_heads);
+
     const float inv_sqrt_len = 1.0f / std::sqrt(static_cast<float>(head_size));
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     turboquant_mm_fused_decode_raw_query_impl(
@@ -603,7 +633,7 @@ inline void npu_turboquant_cube_decode(at::Tensor &query, const c10::optional<at
         static_cast<uint32_t>(max_blocks_per_seq), static_cast<uint32_t>(grid.num_splits), grid.heads_per_task,
         grid.tasks_per_block, grid.reduce_tasks_per_block, grid.prologue_vectors_per_block,
         grid.prologue_cube_chunk_vectors, static_cast<uint32_t>(output_stage), grid.fused_context_limit,
-        static_cast<float>(scale_value), inv_sqrt_len);
+        static_cast<float>(scale_value), inv_sqrt_len, lse_ptr);
 }
 #endif
 

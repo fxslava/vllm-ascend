@@ -47,6 +47,23 @@ constexpr uint32_t kPartialMaxLane = 0;
 constexpr uint32_t kPartialSumLane = kFp32PerBlock;
 constexpr uint32_t kMinBurstBytes = 128;
 
+// The optional softmax-statistics out-tensor both decodes can write: [numTokens, numHeads, kLseStride]
+// fp32, carrying the running max over the whole context in lane kPartialMaxLane and the mass
+// sum_i exp(s_i - max) in lane kPartialSumLane. Together they are what a second attention stream needs
+// to be merged into an already normalised output, which the output alone cannot give: the output is a
+// convex combination of the values, so it is invariant to a rescaling of the weights, and the mass is
+// exactly what that rescaling destroys.
+//
+// It is a whole kPartialTail per (token, head) rather than one float on purpose. Every DataCopy these
+// kernels make to global memory moves whole 32-byte bursts, and one float per head is not a burst: at
+// this stride the offset of any (token, head) is a multiple of 64 bytes whatever numHeads is, and the
+// pair is already laid out exactly as a split's partial tail, so both writers hand the same sixteen
+// words to the same copy. The padding costs 64 bytes per head per decode step.
+//
+// The pair is written rather than max + log(mass): an empty context leaves the mass at zero, and a log
+// of it would put a NaN in an out-tensor the kernel has no way to flag. The host reads the pair.
+constexpr uint32_t kLseStride = kPartialTail;
+
 // AIV decode.
 constexpr uint32_t kAivTileRows = 16;
 

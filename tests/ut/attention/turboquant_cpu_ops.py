@@ -44,6 +44,11 @@ from collections.abc import Iterator, Sequence
 import torch
 from torch.library import Library
 
+from vllm_ascend.attention.turboquant_layout import (
+    TURBOQUANT_LSE_MAX_LANE,
+    TURBOQUANT_LSE_STRIDE,
+    TURBOQUANT_LSE_SUM_LANE,
+)
 from vllm_ascend.attention.turboquant_rotation import apply_pi
 from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_LLOYD_MAX_THRESHOLDS
 
@@ -63,7 +68,7 @@ TURBOQUANT_OP_SCHEMAS = {
     "npu_turboquant_paged_attention": (
         "npu_turboquant_paged_attention(Tensor query_rot, Tensor key_cache, Tensor value_cache, "
         "Tensor scale_cache, Tensor block_tables, Tensor context_lens, Tensor codec_tables, Tensor! workspace, "
-        "int num_kv_heads, int num_heads, float scale_value, Tensor! out) -> ()"
+        "int num_kv_heads, int num_heads, float scale_value, Tensor! out, Tensor(a!)? lse=None) -> ()"
     ),
     "npu_turboquant_vector_core_num": "npu_turboquant_vector_core_num() -> int",
     "npu_turboquant_workspace_size": (
@@ -83,7 +88,7 @@ TURBOQUANT_CUBE_OP_SCHEMAS = {
         "npu_turboquant_cube_decode(Tensor query, Tensor? gate, Tensor pi_signs, Tensor codec_tables, "
         "Tensor hadamard16, Tensor key_cache, Tensor value_cache, Tensor scale_cache, Tensor block_tables, "
         "Tensor context_lens, Tensor! workspace, Tensor! query_rot, int num_kv_heads, int num_heads, "
-        "float scale_value, int output_stage, Tensor! out) -> ()"
+        "float scale_value, int output_stage, Tensor! out, Tensor(a!)? lse=None) -> ()"
     ),
     "npu_turboquant_cube_workspace_size": (
         "npu_turboquant_cube_workspace_size(int num_tokens, int num_heads, int num_kv_heads, int head_size, "
@@ -318,6 +323,7 @@ def _paged_attention(
     num_heads: int,
     scale_value: float,
     out: torch.Tensor,
+    lse: torch.Tensor | None = None,
     *,
     vector_cores: int,
 ) -> None:
@@ -412,6 +418,16 @@ def _paged_attention(
     token_scales = scale_cache.view(-1, slot_floats)
     kv_head_of = torch.arange(num_heads) // (num_heads // num_kv_heads)
 
+    if lse is not None:
+        _check(lse.dtype == torch.float32, "lse must be float32, got ", lse.dtype)
+        _check(lse.is_contiguous(), "lse must be contiguous")
+        _check(
+            tuple(lse.shape) == (num_tokens, num_heads, TURBOQUANT_LSE_STRIDE),
+            "lse must be [", num_tokens, ", ", num_heads, ", ", TURBOQUANT_LSE_STRIDE, "], got ",
+            tuple(lse.shape),
+        )  # fmt: skip
+        lse.zero_()
+
     for token in range(num_tokens):
         length = int(lengths[token])
         if length == 0:
@@ -431,6 +447,14 @@ def _paged_attention(
         scores = (k_levels * query_rot[token]).sum(dim=-1) * k_scale * scale_value
         weights = torch.softmax(scores, dim=0) * v_scale
         out[token] = torch.einsum("lh,lhd->hd", weights, v_levels).to(out.dtype)
+        if lse is not None:
+            # The same pair the online softmax leaves in its accumulator lanes: the running
+            # max over the whole context and sum_i exp(s_i - max). Computed in one pass here
+            # because the whole context is already materialised; the kernel reaches the same
+            # numbers tile by tile.
+            running_max = scores.amax(dim=0)
+            lse[token, :, TURBOQUANT_LSE_MAX_LANE] = running_max
+            lse[token, :, TURBOQUANT_LSE_SUM_LANE] = torch.exp(scores - running_max).sum(dim=0)
 
 
 def _workspace_size(
@@ -567,6 +591,7 @@ def _cube_decode_meta(
     scale_value,
     output_stage,
     out,
+    lse=None,
 ):
     torch._check(query.dim() == 3, lambda: "query must be [num_tokens, num_heads, head_size]")
     torch._check(out.shape == query.shape, lambda: "out must have the same shape as query")
@@ -577,6 +602,10 @@ def _cube_decode_meta(
     torch._check(key_cache.shape == value_cache.shape and key_cache.shape[2] == num_kv_heads, lambda: "cache heads")
     torch._check(block_tables.dim() == 2 and block_tables.shape[0] == query.shape[0], lambda: "one table row per token")
     torch._check(context_lens.numel() == query.shape[0], lambda: "one context length per query token")
+    torch._check(
+        lse is None or tuple(lse.shape) == (query.shape[0], num_heads, TURBOQUANT_LSE_STRIDE),
+        lambda: "lse must be [num_tokens, num_heads, TURBOQUANT_LSE_STRIDE]",
+    )
 
 
 @contextlib.contextmanager

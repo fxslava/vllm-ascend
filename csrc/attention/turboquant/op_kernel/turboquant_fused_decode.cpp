@@ -298,7 +298,8 @@ public:
                                 const uint32_t numTokens, const uint32_t numHeads, const uint32_t numKvHeads,
                                 const uint32_t headSize, const uint32_t blockSize, const uint32_t maxBlocksPerSeq,
                                 const uint32_t numSplits, const uint32_t headsPerTask,
-                                const uint32_t fusedContextLimit, const float scale, const float invSqrtLen)
+                                const uint32_t fusedContextLimit, const float scale, const float invSqrtLen,
+                                __gm__ void *lse = nullptr)
     {
         numTokens_ = numTokens;
         numHeads_ = numHeads;
@@ -323,7 +324,7 @@ public:
 
         mm_.Init(pipe_, headSize_, kCubeTileRows);
         vector_.Init(pipe_, queryRot, keyCache, valueCache, scaleCache, modeTables, workspace, output, numHeads,
-                     numKvHeads, headSize, blockSize, numSplits, scale, invSqrtLen);
+                     numKvHeads, headSize, blockSize, numSplits, scale, invSqrtLen, lse);
         // Init boundary: drains every pipe before the first task's GM reads and cross-core flags.
         AscendC::PipeBarrier<PIPE_ALL>();
     }
@@ -771,19 +772,19 @@ private:
         GM_ADDR contextLens, GM_ADDR modeTables, GM_ADDR workspace, GM_ADDR output, uint32_t numTokens,              \
         uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,     \
         uint32_t numSplits, uint32_t headsPerTask, uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,             \
-        uint32_t fusedContextLimit, float scale, float invSqrtLen)                                                   \
+        uint32_t fusedContextLimit, float scale, float invSqrtLen, GM_ADDR lse)                                      \
     {                                                                                                                \
         AscendC::TPipe pipe;                                                                                         \
         TurboQuantFusedDecode<MODE, TYPE, true, BYPASS_UNPACK> op(&pipe);                                            \
         op.Init(queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output, \
                 numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,      \
-                fusedContextLimit, scale, invSqrtLen);                                                               \
+                fusedContextLimit, scale, invSqrtLen, lse);                                                          \
         op.Process(tasksPerBlock);                                                                                   \
         if (op.NeedsReduction()) {                                                                                   \
             AscendC::SyncAll<false>();                                                                               \
             if ASCEND_IS_AIV {                                                                                       \
                 TurboQuantPartialReducer<TYPE> reducer(&pipe);                                                       \
-                reducer.Init(workspace, output, numHeads, headSize, numSplits);                                      \
+                reducer.Init(workspace, output, numHeads, headSize, numSplits, lse);                                 \
                 op.Reduce(reducer, reduceTasksPerBlock);                                                             \
             }                                                                                                        \
         }                                                                                                            \
@@ -800,13 +801,13 @@ private:
         uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits,    \
         uint32_t headsPerTask, uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,                                 \
         uint32_t prologueVectorsPerBlock, uint32_t prologueCubeChunkVectors, uint32_t outputStage,                   \
-        uint32_t fusedContextLimit, float scale, float invSqrtLen)                                                   \
+        uint32_t fusedContextLimit, float scale, float invSqrtLen, GM_ADDR lse)                                      \
     {                                                                                                                \
         AscendC::TPipe pipe;                                                                                         \
         TurboQuantFusedDecode<MODE, TYPE, false> op(&pipe);                                                          \
         op.Init(queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output, \
                 numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,      \
-                fusedContextLimit, scale, invSqrtLen);                                                               \
+                fusedContextLimit, scale, invSqrtLen, lse);                                                          \
         op.InitBasis(query, piSigns, rotTables, h16, gate, queryRot, prologueCubeChunkVectors, outputStage,          \
                      invSqrtLen);                                                                                    \
         op.RotateQuery(prologueVectorsPerBlock);                                                                     \
@@ -815,7 +816,7 @@ private:
             AscendC::SyncAll<false>();                                                                               \
             if ASCEND_IS_AIV {                                                                                       \
                 TurboQuantPartialReducer<TYPE> reducer(&pipe);                                                       \
-                reducer.Init(workspace, output, numHeads, headSize, numSplits);                                      \
+                reducer.Init(workspace, output, numHeads, headSize, numSplits, lse);                                 \
                 op.Reduce(reducer, reduceTasksPerBlock);                                                             \
             }                                                                                                        \
         }                                                                                                            \
@@ -897,7 +898,7 @@ void turboquant_mm_fused_decode_impl(int32_t mode, AscendType type, void *stream
                                     uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize,
                                     uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits,
                                     uint32_t headsPerTask, uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,
-                                    uint32_t fusedContextLimit, float scale, float invSqrtLen)
+                                    uint32_t fusedContextLimit, float scale, float invSqrtLen, void *lse)
 {
     if (type != AscendType::FP16 || blockDim == 0) {
         return;
@@ -907,20 +908,20 @@ void turboquant_mm_fused_decode_impl(int32_t mode, AscendType type, void *stream
             turboquant_mm_fused_decode_kv4fp8_half<<<blockDim, nullptr, stream>>>(
                 queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,
                 numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,
-                tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen);
+                tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen, lse);
             break;
 #if defined(VLLM_ASCEND_TQ_TEST_KERNELS)
         case turboquant::TurboQuantMode::KV3_FP4:
             turboquant_mm_fused_decode_kv3fp4_half<<<blockDim, nullptr, stream>>>(
                 queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,
                 numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,
-                tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen);
+                tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen, lse);
             break;
         case turboquant::TurboQuantMode::KV5_FP8:
             turboquant_mm_fused_decode_kv5fp8_half<<<blockDim, nullptr, stream>>>(
                 queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,
                 numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,
-                tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen);
+                tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen, lse);
             break;
 #endif
         default:
@@ -938,7 +939,8 @@ void turboquant_mm_fused_decode_nounpack_impl(int32_t mode, AscendType type, voi
                                              uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,
                                              uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t headsPerTask,
                                              uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,
-                                             uint32_t fusedContextLimit, float scale, float invSqrtLen)
+                                             uint32_t fusedContextLimit, float scale, float invSqrtLen,
+                                             void *lse)
 {
     if (type != AscendType::FP16 || blockDim == 0 ||
         static_cast<turboquant::TurboQuantMode>(mode) != turboquant::TurboQuantMode::KV4_FP8) {
@@ -947,7 +949,7 @@ void turboquant_mm_fused_decode_nounpack_impl(int32_t mode, AscendType type, voi
     turboquant_mm_fused_decode_nounpack_kv4fp8_half<<<blockDim, nullptr, stream>>>(
         queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,
         numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,
-        tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen);
+        tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen, lse);
 }
 #endif
 
@@ -961,7 +963,7 @@ void turboquant_mm_fused_decode_raw_query_impl(int32_t mode, AscendType type, vo
                                               uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,
                                               uint32_t prologueVectorsPerBlock, uint32_t prologueCubeChunkVectors,
                                               uint32_t outputStage, uint32_t fusedContextLimit, float scale,
-                                              float invSqrtLen)
+                                              float invSqrtLen, void *lse)
 {
     if (type != AscendType::FP16 || blockDim == 0 ||
         static_cast<turboquant::TurboQuantMode>(mode) != turboquant::TurboQuantMode::KV4_FP8) {
@@ -971,7 +973,7 @@ void turboquant_mm_fused_decode_raw_query_impl(int32_t mode, AscendType type, vo
         query, piSigns, rotTables, h16, gate, queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens,
         modeTables, workspace, output, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,
         headsPerTask, tasksPerBlock, reduceTasksPerBlock, prologueVectorsPerBlock, prologueCubeChunkVectors,
-        outputStage, fusedContextLimit, scale, invSqrtLen);
+        outputStage, fusedContextLimit, scale, invSqrtLen, lse);
 }
 
 #if defined(VLLM_ASCEND_TQ_TEST_KERNELS)

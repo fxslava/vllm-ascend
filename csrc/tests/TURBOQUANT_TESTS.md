@@ -4243,3 +4243,81 @@ rebuild with (h)'s goldens pinned (0 diagnostics, 37 targets unchanged) reproduc
 - Raw-query output stages at D = 128, in bf16, and with a Cube chunk on more than one block.
 - The Python Cube path and `patch_qwen3_5.py`'s gated branch have not run on a device.
 - No camodel launch spans were taken with `build/nz_profile.py`.
+
+### 13.37 The `lse` out-tensor, and uncompressed sinks on both decodes (2026-09-24)
+
+**What the decodes now return.** Both take an optional `lse` out-tensor, last and defaulted, so every existing
+call site was left alone: `[numTokens, numHeads, kLseStride]` fp32, carrying each (token, head)'s running
+softmax maximum in lane `kPartialMaxLane` and its mass `sum_i exp(s_i - max)` in lane `kPartialSumLane`.
+`turboquant_layout.h` owns the stride and the Python side mirrors it (`TURBOQUANT_LSE_STRIDE`).
+
+- **Why it cannot be recovered on the host.** An attention output is a convex combination of the values, so it
+  is invariant to a rescaling of the weights, and the mass is exactly what that rescaling destroys. No number of
+  extra launches over the operator's output gets it back. The kernels already had it.
+- **`TurboQuantLseWriter`** (`vector/turboquant_vector_service.h`) holds one `GlobalTensor` and an `enabled_`
+  launch constant. `enabled_` is identical on every core, so branching on it cannot desync the two halves of a
+  mixed Cube launch the way a per-task predicate would, and a null pointer costs a launch a branch.
+- **Three writers, one per path, and every (token, head) written exactly once.** The AIV split writes its state
+  lanes in the fused branch (`turboquant_paged_attention.cpp`); the Cube fused branch stages its pairs through
+  `StageLse` into the dead half of `scoreBuf_` (a `static_assert` pins that they fit); a split token's pair comes
+  out of `TurboQuantPartialReducer` instead. All three write *before* `NormalizeHeads`, which adds its epsilon to
+  the running sum in place.
+- **A whole `kPartialTail` per (token, head), not one float.** Every `DataCopy` these kernels make to global
+  memory moves whole 32-byte bursts. At this stride the offset of any (token, head) is a multiple of 64 bytes
+  whatever `numHeads` is, and the pair is already laid out exactly as a split's partial tail, so all three
+  writers hand the same sixteen words to the same copy. It costs 64 B per head per decode step.
+- **The pair, not `max + log(mass)`.** An empty context leaves the mass at zero and a log of it would put a NaN
+  in an out-tensor the kernel has no way to flag. An empty context writes `(kVectorNegInf, 0)` and every reader
+  branches on the mass, never on the max.
+
+**What it is for: uncompressed attention sinks, phase two.** Phase one kept the first N tokens of a sequence at
+activation precision in a side-car plane and merged them into the decode by recomputing the quantised context's
+softmax denominator on the host -- `O(context)` per decode step -- and by dequantising the sink rows to subtract
+what they had contributed. Both halves are gone:
+
+- **The weight comes out of the kernel.** `quantized_context_softmax_stats` is now a test oracle and nothing on a
+  serving path calls it.
+- **The quantised copies leave through the scale plane.** Every mode reconstructs a cached vector as code times
+  the token's scale, and both decodes apply that scale on the vector unit after the product. Zeroing a sink
+  token's K and V scale lanes (`TurboQuantSinkCache.neutralize_scale_rows`, run after the packed write) makes its
+  key exactly the zero vector and its value contribution exactly zero, on any codebook and in any byte order,
+  without a nibble being unpacked. The row then contributes exactly one unit of absolute mass -- a known integer
+  -- and nothing to the numerator, so the merge is `w_q O_q + sum_j w_j v_j` over
+  `(w_q - n exp(-m')) + sum_j w_j`: an append of two streams, not a subtraction of a measured one, and better
+  conditioned for it.
+- **So the kv4fp8 Cube decode is no longer refused.** 13.36's NZ-tiled affine planes were unreadable to a host
+  reader of the packed cache (LongBench 57.6% at 0 sinks against 14.1% at 4, which is what the refusal in
+  `0c4d9b3b2` was for). The merge reads no packed byte now, so both TurboQuant layouts serve it, and neither
+  `tools/tq_longbench` nor the plugin gives up static decode or graph capture for it. What the plugin still gives
+  up is the single-launch fusion: the merge has to see the raw rotated accumulator, so a sink layer decodes at
+  `kRotatedBasis` and re-applies the un-rotation and the gate afterwards.
+- **The guard moved to the build.** `_refuse_sinks_without_softmax_stats` refuses `VLLM_ASCEND_TQ_SINK_TOKENS`
+  against an extension whose decode schema has no `lse` argument, before a plane is allocated, rather than
+  leaving it a `TypeError` about an argument count inside a decode step.
+
+**Verification.**
+- **Tiers.** Host, sim and npu built clean under `-Werror`, 0 diagnostic lines, target sets unchanged (6 / 37 / 42
+  unique `Built target` lines, identical to the pre-port builds).
+- **Camodel** (`build/lse_sim_smoke.sh`, one process, one case). Fused case (a), kv4fp8, S = 64: its FNV-1a golden
+  and `cos vs fp32 0.999407` both match 13.36's recorded values, 0 B of exception dumps, 68.8 s host wall. Every
+  launch in `csrc/tests` passes `lse = nullptr`, so this is what says the added writer is inert when nobody asks
+  for the statistics. The S = 256 cases were not re-run: see the camodel run policy.
+- **Python** (`quay.io/ascend/vllm-ascend:v0.26.0rc1-a5`). `tests/ut/attention` plus `test_platform_turboquant.py`:
+  418 passed against 408 at HEAD, with an identical set of 152 failing ids (all pre-existing, sfa/mla/deepseek).
+  The five TurboQuant files give 241 passed. `tests/ut/_tools/test_tq_longbench.py`: 59 failed / 278 passed
+  against 59 / 279, the failing set identical (the pre-existing "vLLM leaked into the process" family).
+  `test_turboquant_sink_cache.py` drives the whole feature through the CPU operators, which now write the
+  out-tensor too, so the pair the merge consumes there is the pair the kernels write.
+- **The guard was a no-op when it was written.** `torch.ops` hands out an `OpOverloadPacket`, which carries no
+  `_schema` at all -- the schema is on the overload -- so reading one off the packet passed on every build there
+  has ever been. `_registered_schema` reads `default._schema` and insists on a real `FunctionSchema`;
+  `test_the_build_check_reads_the_schema_that_is_actually_registered` pins it.
+
+**Not covered.**
+- No silicon or camodel run has passed a non-null `lse`. The three in-kernel writers are exercised only by the
+  CPU stand-in, whose `npu_turboquant_paged_attention` computes the same pair in one pass rather than tile by
+  tile; the Cube `StageLse` and the reducer's write have never executed.
+- No camodel case covers the sink merge end to end, and nothing measures what the merge's extra launches cost.
+- The LongBench retrieval number that motivated the feature has not been re-taken with the phase-two merge, on
+  either backend.
+

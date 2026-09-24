@@ -52,9 +52,9 @@ runs the whole ladder twice in one pass, once on the 4-bit cache as it ships and
 with the first four tokens of each sequence kept at activation precision and folded back
 into every decode's softmax.  The count lands in every record, on both tables and in the
 banner, and it is published as ``VLLM_ASCEND_TQ_SINK_TOKENS`` before any runner is built.
-Read those rows for their **scores**: the merge recomputes the quantised context's softmax
-denominator on the host, because neither decode operator returns it, so a decode step also
-costs ``O(context)`` torch work and can be neither static nor captured.  It needs
+Read those rows for their **scores**: the merge is ``O(N)`` torch work on top of the decode
+launch and reads no packed byte -- the decode returns its own softmax maximum and mass in an
+``lse`` out-tensor -- but it is still extra launches per layer per step.  It needs
 ``dense_staging`` prefill, which is what the plugin's own backend does.
 
 ``--dry-run`` prints what each rung would provision, from ``config.json`` alone,
@@ -106,7 +106,6 @@ from tq_longbench.run_benchmark import (  # noqa: E402
     parse_sink_tokens,
     plan_for_backend,
     prefill_mode_for,
-    refuse_sinks_on_an_unreadable_cache,
     rung_prefill_mode,
     sink_banner,
     use_sink_tokens,
@@ -478,8 +477,8 @@ def arena_report(args: argparse.Namespace, contexts: tuple[int, ...], tasks: tup
         f"tasks: {', '.join(tasks)} (generation budget {budget} tokens, --max-context {args.max_context})",
         f"sink counts: {', '.join(str(count) for count in parse_sink_tokens(args.sink_tokens))} "
         "-- each runs the whole ladder above; a positive count adds an uncompressed side-car "
-        "(2 x N x num_kv_heads x head_size activation elements per layer) and a host-side "
-        "O(context) softmax recomputation per decode step.",
+        "(2 x N x num_kv_heads x head_size activation elements per layer), a softmax-statistics "
+        "out-tensor per decode, and an O(N) merge per decode step.",
         "Dense KV is what the same arena would cost unquantised, from the checkpoint geometry; the "
         "TurboQuant pool's own size is measured per run and reported as kv_cache_mb.",
     ]
@@ -497,11 +496,11 @@ def refuse_sinks_without_dense_prefill(
 ) -> None:
     """Refuse a sink sweep whose rungs would prefill through the quantised cache.
 
-    ``batched_decode`` presents a prefill chunk as a batch of per-position decodes, so
-    every prompt token would pay the sink merge's ``O(context)`` recomputation and the
-    prefill would be quadratic on the host. :class:`~tq_longbench.engine.RunnerConfig`
-    refuses it either way; this says so before the tokenizer loads and the corpus is
-    read, and names every rung rather than the first one to reach the constructor.
+    ``batched_decode`` prefills out of the 4-bit cache, which the thing being measured never
+    does: vllm-ascend's TurboQuant backend refuses chunked prefill and prefills densely, where
+    the sinks are exact anyway. :class:`~tq_longbench.engine.RunnerConfig` refuses it either
+    way; this says so before the tokenizer loads and the corpus is read, and names every rung
+    rather than the first one to reach the constructor.
 
     Only the family's own policy is consulted. The pre-flight can *also* downgrade a rung
     to ``batched_decode`` when the staging pool will not build on this device, and that
@@ -521,9 +520,9 @@ def refuse_sinks_without_dense_prefill(
     rungs = ", ".join(f"{backend}@{context}" for backend, context in refused)
     raise SystemExit(
         f"--sink-tokens {args.sink_tokens} needs every rung to prefill densely, and these would not: {rungs}. "
-        "The sink merge recomputes the softmax denominator per attending row, so a batched_decode prefill "
-        "pays it once per prompt token. Pass --prefill-mode dense_staging (and an arena that fits its "
-        "unquantised pool), drop the long rungs, or run with --sink-tokens 0."
+        "A batched_decode prefill attends through the 4-bit cache, which the plugin's TurboQuant backend "
+        "never does -- it prefills densely, where the sinks are exact. Pass --prefill-mode dense_staging "
+        "(and an arena that fits its unquantised pool), drop the long rungs, or run with --sink-tokens 0."
     )
 
 
@@ -756,7 +755,7 @@ def summarise(rungs: list[TaskRung]) -> str:
             "A block headed 'N uncompressed sinks' kept the sequence's first N tokens out of the 4-bit "
             "quantisation and folded their exact contribution back into every decode's softmax. Its scores "
             "are the measurement; its TTFT and Dec p50 are not comparable with the sink-free block above "
-            "it, because the merge recomputes the softmax denominator on the host at O(context) per step "
+            "it, because the merge adds launches to every decode step -- O(N) work, but not free "
             "(every record carries its own `sink_tokens` and `sink_cache_mb`)."
         )
     if any(rung.fidelity is not None for rung in rungs):
@@ -793,7 +792,6 @@ def main(argv: list[str] | None = None) -> int:
     args.budget_overrides = parse_budget_overrides(args.max_tokens_override)
     backends = parse_backends(args.backends)
     sink_counts = parse_sink_tokens(args.sink_tokens)
-    refuse_sinks_on_an_unreadable_cache(backends, sink_counts)
     # Published before the config read, the tokenizer and every runner: anything else in
     # this process, and any subprocess it spawns, has to see the number the backends are
     # running with. See run_benchmark.use_sink_tokens.

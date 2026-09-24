@@ -67,7 +67,8 @@ TORCH_LIBRARY_FRAGMENT(_C_ascend, ops)
         "                               int num_kv_heads, "
         "                               int num_heads, "
         "                               float scale_value, "
-        "                               Tensor! out) -> ()");
+        "                               Tensor! out, "
+        "                               Tensor(a!)? lse=None) -> ()");
     ops.impl("npu_turboquant_paged_attention", c10::kPrivateUse1,
              &vllm_ascend::npu_turboquant_paged_attention);
 
@@ -117,7 +118,8 @@ TORCH_LIBRARY_FRAGMENT(_C_ascend, ops)
         "                           int num_heads, "
         "                           float scale_value, "
         "                           int output_stage, "
-        "                           Tensor! out) -> ()");
+        "                           Tensor! out, "
+        "                           Tensor(a!)? lse=None) -> ()");
     ops.impl("npu_turboquant_cube_decode", c10::kPrivateUse1,
              &vllm_ascend::npu_turboquant_cube_decode);
 

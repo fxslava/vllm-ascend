@@ -255,38 +255,9 @@ def sink_banner(value: int) -> str:
         return "sinks: off (VLLM_ASCEND_TQ_SINK_TOKENS=0) -- the 4-bit cache as it ships"
     return (
         f"sinks: {value} uncompressed leading tokens ({SINK_TOKENS_ENV}={value}). "
-        "The merge recomputes the quantised context's softmax denominator on the host, because neither "
-        "decode operator returns it -- O(context) torch work per decode step per layer, on top of the "
-        "launch, and no static decode or graph capture. Accuracy work, not a latency measurement."
-    )
-
-
-#: The decode whose cache the uncompressed-sink merge cannot read. The merge reads the
-#: packed planes row-major on the Lloyd-Max codebook grid -- what the AIV writer leaves --
-#: and the kv4fp8 Cube writer leaves NZ-tiled planes of codes that are affine on an fp8
-#: grid. It returns plausible wrong numbers rather than raising, which a real ablation
-#: measured as LongBench 57.6% at 0 sinks against 14.1% at 4.
-SINK_INCOMPATIBLE_BACKENDS = ("turboquant_cube",)
-
-
-def refuse_sinks_on_an_unreadable_cache(backends: tuple[str, ...], sink_counts: tuple[int, ...]) -> None:
-    """Refuse a sink sweep over a backend whose cache layout the merge cannot read.
-
-    :class:`~tq_longbench.engine.RunnerConfig` refuses it too; this says so before the
-    corpus is read, and names every backend rather than the first one to reach the
-    constructor -- which for a sweep is several rungs in.
-    """
-    if not any(sink_counts):
-        return
-    refused = [backend for backend in backends if backend in SINK_INCOMPATIBLE_BACKENDS]
-    if not refused:
-        return
-    raise SystemExit(
-        f"--sink-tokens cannot be combined with {', '.join(refused)}: the uncompressed-sink merge reads the "
-        "packed cache on the host, row-major and on the Lloyd-Max codebook grid, and the kv4fp8 Cube writer "
-        "leaves NZ-tiled planes of codes that are affine on an fp8 grid. It would score a cache it had "
-        "misread rather than fail. Sweep --backends turboquant_aiv, which is the layout the merge reads, or "
-        "run with --sink-tokens 0."
+        "Their quantised copies are neutralised in the scale plane and the two streams are merged from the "
+        f"decode's own softmax statistics -- O({value}) torch work per decode step per layer, reading no "
+        "packed byte. Accuracy work; the merge's launches are still on top of the decode's."
     )
 
 
@@ -510,7 +481,7 @@ def summarise(rungs: list[Rung], depths: tuple[float, ...]) -> str:
     lines.append("ttft/p50/p99 are medians over the depths; peak MB is the allocator's high-water mark over them.")
     lines.append("The first decode step of a sequence pays first-touch costs no later step does: it lands in p99.")
     if any(rung.sink_tokens for rung in rungs):
-        lines.append("sinks > 0 rows carry a host-side O(context) softmax recomputation per step: read them")
+        lines.append("sinks > 0 rows carry the side-car merge's own launches on every decode step: read them")
         lines.append("for retrieval, not for p50/p99. sink MB is the side-car, on top of kv MB.")
     return "\n".join(lines)
 
@@ -522,7 +493,6 @@ def main(argv: list[str] | None = None) -> int:
     contexts = parse_int_list(args.contexts, "contexts")
     depths = parse_depths(args.depths)
     sink_counts = parse_sink_tokens(args.sink_tokens)
-    refuse_sinks_on_an_unreadable_cache(backends, sink_counts)
     # Published before the tokenizer, the config read or any runner: whatever else ends up
     # in this process or in a subprocess of it must not see a stale value.
     use_sink_tokens(sink_counts[0])

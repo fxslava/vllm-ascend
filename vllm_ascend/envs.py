@@ -167,20 +167,21 @@ env_variables: dict[str, Callable[[], Any]] = {
     # them at full precision (vllm_ascend/attention/turboquant_sink.py). 0 (default): off, and
     # every TurboQuant path below is byte-for-byte the one that ships. A value in
     # [1, TURBOQUANT_MAX_SINK_TOKENS] keeps that many *attention sink* tokens in an
-    # uncompressed fp16/bf16 side-car plane and folds their exact contribution back into the
-    # decode's softmax on the host. 4 is what the retrieval ablation used.
+    # uncompressed fp16/bf16 side-car plane, neutralises their quantised copies in the scale
+    # plane, and appends the two streams inside each decode step. 4 is what the retrieval
+    # ablation used.
     #
     # The side-car costs 2 * num_blocks * N * num_kv_heads * head_size activation elements per
     # layer -- about 8 KiB per sequence per layer at N=4, H_KV=8, D=128 -- and is carved
     # nowhere near the paged allocator: see TurboQuantSinkCache for why it is indexed by the
     # physical block that holds a sequence's logical block 0.
     #
-    # Host-side fusion, so it is a correctness and ergonomics vehicle rather than a serving
-    # default: the decode operators return a *normalised* attention output and no softmax
-    # denominator, and the denominator cannot be recovered from a normalised output, so the
-    # weight the sink stream has to be merged against is recomputed on the host at O(context)
-    # per decode step. The kernels already materialise it (kPartialSumLane in the split
-    # workspace); exposing it is what makes this free.
+    # The merge is O(N) per decode step and reads no packed byte: both decodes write their
+    # own softmax maximum and mass to an optional `lse` out-tensor, which is the one thing
+    # that cannot be recovered from a normalised attention output. Its cost is the merge's
+    # own launches per layer per step, and the single-launch Cube fusion, which is given up
+    # for as long as this is on because the merge has to see the raw rotated accumulator.
+    # A build whose decode operators predate that out-tensor refuses this flag outright.
     "VLLM_ASCEND_TQ_SINK_TOKENS": lambda: int(os.getenv("VLLM_ASCEND_TQ_SINK_TOKENS", "0")),
 }
 

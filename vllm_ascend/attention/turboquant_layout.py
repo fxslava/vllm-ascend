@@ -91,6 +91,47 @@ TURBOQUANT_ROTATE_TILE = 16
 # The Cube decode reads a block one 64-row tile at a time.
 TURBOQUANT_CUBE_TILE_ROWS = 64
 
+# The decodes' optional softmax-statistics out-tensor, mirroring ``kLseStride``,
+# ``kPartialMaxLane`` and ``kPartialSumLane`` in
+# ``csrc/attention/turboquant/op_kernel/common/turboquant_layout.h``. One whole
+# 64-byte group per ``(token, head)``, of which two lanes carry anything: the
+# running max over the whole context and the mass ``sum_i exp(s_i - max)``.
+#
+# The padding is the point. Every global-memory copy the kernels make moves whole
+# 32-byte bursts, and one float per head is not a burst; at this stride the offset
+# of any ``(token, head)`` is a whole 64 bytes whatever ``num_heads`` is, so the
+# write needs no unaligned-copy path and cannot start mid-burst.
+TURBOQUANT_LSE_STRIDE = 16
+TURBOQUANT_LSE_MAX_LANE = 0
+TURBOQUANT_LSE_SUM_LANE = 8
+
+
+def turboquant_lse_buffer(num_tokens: int, num_heads: int, device: torch.device) -> torch.Tensor:
+    """Allocate the ``[num_tokens, num_heads, TURBOQUANT_LSE_STRIDE]`` fp32 out-tensor.
+
+    Zeroed rather than empty: a decode writes every ``(token, head)`` it is given, but
+    a caller that hands one operator a buffer sized for a larger capture shape leaves
+    the tail unwritten, and a zeroed tail reads as ``max = 0, mass = 0`` -- the same
+    thing an empty context writes, which every reader of this already has to handle.
+    Uninitialised device memory would instead read as a plausible mass.
+    """
+    return torch.zeros((num_tokens, num_heads, TURBOQUANT_LSE_STRIDE), dtype=torch.float32, device=device)
+
+
+def turboquant_split_lse(lse: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the ``(running_max, mass)`` pair a decode wrote, each ``[num_tokens, num_heads]``.
+
+    Views, not copies. ``mass == 0`` is how a token whose context was empty is spelled,
+    and the accompanying max is then whatever the kernel initialised its accumulator to,
+    so a reader must branch on the mass and never on the max.
+    """
+    if lse.shape[-1] != TURBOQUANT_LSE_STRIDE:
+        raise ValueError(
+            f"[vllm-ascend/turboquant] the softmax-statistics tensor is {tuple(lse.shape)}; its last "
+            f"dimension must be TURBOQUANT_LSE_STRIDE = {TURBOQUANT_LSE_STRIDE}"
+        )
+    return lse[..., TURBOQUANT_LSE_MAX_LANE], lse[..., TURBOQUANT_LSE_SUM_LANE]
+
 
 class TurboQuantOutputStage(enum.IntEnum):
     """What the Cube decode writes; mirrors ``TurboQuantOutputStage`` in turboquant_layout.h."""

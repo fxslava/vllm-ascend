@@ -101,6 +101,7 @@ from vllm_ascend.attention.turboquant_layout import (  # noqa: F401  (re-export)
     TURBOQUANT_LEVELS,
     TURBOQUANT_LLOYD_MAX_CENTROIDS,
     TURBOQUANT_LLOYD_MAX_THRESHOLDS,
+    TURBOQUANT_LSE_STRIDE,
     TURBOQUANT_PACK_FACTOR,
     TURBOQUANT_ROTATE_TILE,
     TURBOQUANT_TILE_ROWS,
@@ -111,13 +112,14 @@ from vllm_ascend.attention.turboquant_layout import (  # noqa: F401  (re-export)
 )
 from vllm_ascend.attention.turboquant_rotation import output_rotation_is_folded, turboquant_pi_signs
 
-# Uncompressed attention sinks: the side-car plane, its ingestion, and the host-side
-# softmax merge that folds it back into a decode. Inert unless VLLM_ASCEND_TQ_SINK_TOKENS
-# is set -- see turboquant_sink for the layout and for what the merge still costs.
+# Uncompressed attention sinks: the side-car plane, its ingestion, and the device-side
+# softmax merge that appends it to a decode. Inert unless VLLM_ASCEND_TQ_SINK_TOKENS is
+# set -- see turboquant_sink for the layout and for why the merge reads no packed bytes.
 from vllm_ascend.attention.turboquant_sink import (
     TurboQuantSinkCache,
     TurboQuantSinkConfig,
     fuse_decode_sinks,
+    sink_plane_bytes,
 )
 
 # The diagnostic capture layer: what the operators were handed, appended to its own
@@ -145,6 +147,17 @@ TURBOQUANT_GM_BURST_BYTES = TURBOQUANT_BURST_FLOATS * 4
 # _device_index narrows them on the host before the transfer rather than across it.
 TURBOQUANT_INDEX_DTYPE = torch.int32
 
+# What the decodes call their optional softmax-statistics out-tensor. Named here rather
+# than spelled at each call site because it is also what the build check looks for in the
+# registered schema; the two must not be able to drift.
+TURBOQUANT_LSE_ARGUMENT = "lse"
+
+# What fraction of the device's free memory the side-car plane may not take. The plane is
+# allocated after the paged cache, out of whatever the profiler left over, so a plane that
+# fits exactly leaves nothing for activations and the run dies later and elsewhere. Raising
+# here names the plane; running out during the first long prefill does not.
+TURBOQUANT_SINK_ARENA_HEADROOM = 0.25
+
 
 def turboquant_cube_decode_available() -> bool:
     """Whether this build registered the kv4fp8 Cube kernels (Ascend 950 builds only)."""
@@ -164,6 +177,52 @@ def turboquant_cube_decode_selected(model_dtype: torch.dtype | None) -> bool:
         and model_dtype == torch.float16
         and turboquant_cube_decode_available()
     )
+
+
+def _device_free_memory(device: torch.device) -> int | None:
+    """Bytes the device reports free, or ``None`` where nothing can answer.
+
+    ``torch.npu.mem_get_info`` is the query on this platform and it mirrors CUDA's, so
+    the accessor is looked up by device type rather than hard-coded: the same backend runs
+    under a CUDA-shaped stub in some test setups, and a CPU device answers nothing at all.
+
+    Every failure mode returns ``None`` rather than raising. This exists to make an
+    allocation refusal legible, and a diagnostic that can itself fail the run is worse than
+    no diagnostic: a runtime that has no such query, a device index the accessor rejects,
+    and a stub that returns something other than a pair of integers all mean the same thing
+    here, which is that the caller must not invent a limit.
+    """
+    module = getattr(torch, device.type, None)
+    query = getattr(module, "mem_get_info", None)
+    if query is None:
+        return None
+    try:
+        free = query(device) if device.index is not None else query()
+    except Exception:  # noqa: BLE001 -- see the docstring: no query is an answer here
+        return None
+    if isinstance(free, (tuple, list)):
+        free = free[0] if free else None
+    return int(free) if isinstance(free, (int, float)) else None
+
+
+def _registered_schema(name: str):
+    """The schema a ``_C_ascend`` operator was registered with, or ``None`` where nothing answers.
+
+    The schema lives on the *overload*, not on the ``OpOverloadPacket`` that ``torch.ops``
+    hands out: a packet carries no ``_schema`` at all, so reading one off it is a check that
+    can only ever pass -- which is what the first version of the guard below did. ``default``
+    is the overload a schema with no overload name registers, which is all of these.
+
+    Anything that is not a real ``FunctionSchema`` comes back as ``None``: an operator this
+    build never registered, and the unit tests' mock of the namespace, whose attributes
+    answer to every name. ``None`` means "nothing here could answer", never "this build is
+    too old", so a caller has to treat it as a pass.
+    """
+    operator = getattr(torch.ops._C_ascend, name, None)
+    if operator is None:
+        return None
+    schema = getattr(getattr(operator, "default", operator), "_schema", None)
+    return schema if isinstance(schema, torch._C.FunctionSchema) else None
 
 
 def _is_capturing() -> bool:
@@ -315,6 +374,7 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
     # before __init__ would have set it. Sinks off is the shipping configuration.
     sink_config = TurboQuantSinkConfig()
     sink_cache = None
+    sink_lse = None
 
     # Which layer this is and how many times it has been entered, for the trace records.
     # Class-level for the same reason as above, and because everything downstream of
@@ -342,6 +402,7 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         self.cube_decode = turboquant_cube_decode_selected(_model_dtype(self))
         self.sink_config = TurboQuantSinkConfig.from_env()
         self.sink_cache: TurboQuantSinkCache | None = None
+        self.sink_lse: torch.Tensor | None = None
 
     @property
     def fuses_output_gate(self) -> bool:
@@ -357,7 +418,7 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         super().process_weights_after_loading(act_dtype)
         # Before the first cache write rather than at it: a configuration that cannot run
         # should fail while the message still names a layer being built, not a launch.
-        self._refuse_sinks_on_a_cube_cache()
+        self._refuse_sinks_without_softmax_stats()
         torch.ops._C_ascend.npu_turboquant_vector_core_num()
         logger.info_once(
             "[vllm-ascend/turboquant] 4-bit KV cache active; Pi is applied at runtime to K/V on the write path and "
@@ -447,36 +508,70 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             )
         self.scale_cache = torch.zeros(shape, dtype=torch.float32, device=kv_cache[0].device)
 
-    def _refuse_sinks_on_a_cube_cache(self) -> None:
-        """Refuse uncompressed sinks where the merge cannot read the cache.
+    def _refuse_sinks_without_softmax_stats(self) -> None:
+        """Refuse uncompressed sinks against a build whose decode cannot report ``(m, L)``.
 
-        The host-side merge in :mod:`vllm_ascend.attention.turboquant_sink` reads the
-        packed planes itself, to recompute the softmax denominator neither decode
-        operator returns and to subtract what the quantised sinks contributed. It reads
-        them **row-major, on the Lloyd-Max codebook grid**, which is what
-        ``npu_turboquant_reshape_and_cache`` writes and what the AIV decode reads back.
+        The merge appends the side-car's stream to the decode's, and the relative weight
+        of the two is the decode's own softmax maximum and mass. Those cannot be recovered
+        from its output at any number of extra launches: the output is a convex combination
+        of the values, so it is invariant to a rescaling of the weights, and the mass is
+        exactly what that rescaling destroys. A build whose operators predate the ``lse``
+        out-tensor therefore cannot serve this feature at all.
 
-        The kv4fp8 Cube writer produces neither: its planes are NZ-tiled
-        (``kStoresNzTiles<KV4_FP8>``) and its codes are affine about 7.5 on an fp8 e4m3
-        grid. The merge therefore reads the wrong bytes off the wrong grid, and nothing
-        raises -- the denominator comes back plausible and wrong and the output is noise.
-        Measured on a real ablation before this refusal existed: LongBench 57.6% at
-        ``sink_tokens=0`` against 14.1% at 4, with multifieldqa_en at 86.4% against 1.5%.
-
-        So the combination is an error rather than a silent 4x regression. A kv4fp8
-        reader is phase-two work beside the ``lse`` decode output that would make the
-        merge free in the first place, and it needs the camodel gate rather than a host
-        test, because what a host test would check is the header this already read.
+        Left to the call, it would be a ``TypeError`` about an argument count, from inside
+        a decode step, on a configuration that had already allocated a side-car plane per
+        layer. Raised here it names the build.
         """
-        if not (self.sink_config.enabled and self.cube_decode):
+        if not self.sink_config.enabled:
+            return
+        name = "npu_turboquant_cube_decode" if self.cube_decode else "npu_turboquant_paged_attention"
+        schema = _registered_schema(name)
+        if schema is None:
+            return
+        if any(argument.name == TURBOQUANT_LSE_ARGUMENT for argument in schema.arguments):
             return
         raise RuntimeError(
-            f"[vllm-ascend/turboquant] VLLM_ASCEND_TQ_SINK_TOKENS={self.sink_config.num_sink_tokens} cannot be "
-            "combined with the kv4fp8 Cube decode: the uncompressed-sink merge reads the packed cache on the "
-            "host, and it reads it row-major on the Lloyd-Max grid, where the Cube writer leaves NZ-tiled "
-            "planes of affine fp8 codes. It would return plausible wrong numbers rather than raise. Set "
-            "VLLM_ASCEND_TURBOQUANT_CUBE_DECODE=0 to decode this cache on the AIV path, which is the layout "
-            "the merge reads, or VLLM_ASCEND_TQ_SINK_TOKENS=0 for the path that ships."
+            f"[vllm-ascend/turboquant] VLLM_ASCEND_TQ_SINK_TOKENS={self.sink_config.num_sink_tokens} needs a "
+            f"build whose {name} takes the optional '{TURBOQUANT_LSE_ARGUMENT}' out-tensor: the sink merge "
+            "rescales the whole softmax, and the decode's own maximum and mass cannot be recovered from a "
+            f"normalised output. This build registered {schema}. Rebuild the extension, or set "
+            "VLLM_ASCEND_TQ_SINK_TOKENS=0."
+        )
+
+    def _refuse_a_sink_plane_the_arena_cannot_hold(self, needed: int, device: torch.device) -> None:
+        """Refuse a side-car plane that would not leave the device room to run.
+
+        The plane is one allocation per layer, sized from the paged cache it accompanies, and
+        it is made *after* the memory profiler has already sized that cache -- so it comes out
+        of the headroom the profiler left for activations rather than out of the cache budget.
+        At 256k of context and a 128-token block that is tens of megabytes per layer, and the
+        failure without this check is an out-of-memory raised from an unrelated allocation
+        several layers later, naming neither this plane nor the flag that asked for it.
+
+        Checked against what the device reports free *now*, times a margin, because what is
+        free at the first cache write is the best estimate available of what the rest of the
+        run has to live in. A device that reports nothing -- a CPU test, a stub -- is logged
+        and allowed: a check that cannot see the arena must not invent a limit for it.
+        """
+        free = _device_free_memory(device)
+        if free is None:
+            logger.debug(
+                "[vllm-ascend/turboquant] %s reports no free-memory query; the %.1f MiB sink plane is "
+                "allocated without an arena check.",
+                device,
+                needed / (1 << 20),
+            )
+            return
+        budget = free * (1.0 - TURBOQUANT_SINK_ARENA_HEADROOM)
+        if needed <= budget:
+            return
+        raise RuntimeError(
+            f"[vllm-ascend/turboquant] the uncompressed sink plane for this layer needs "
+            f"{needed / (1 << 20):.1f} MiB, and {device} has {free / (1 << 20):.1f} MiB free -- under the "
+            f"{TURBOQUANT_SINK_ARENA_HEADROOM:.0%} headroom this leaves nothing for the rest of the run, and "
+            "there is one such plane per layer. Lower VLLM_ASCEND_TQ_SINK_TOKENS "
+            f"(currently {self.sink_config.num_sink_tokens}), lower gpu_memory_utilization so the paged "
+            "cache reserves fewer blocks, or set VLLM_ASCEND_TQ_SINK_TOKENS=0."
         )
 
     def _ensure_sink_cache(self, kv_cache: tuple[torch.Tensor, ...], dtype: torch.dtype) -> None:
@@ -493,13 +588,23 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         """
         if not self.sink_config.enabled or self.sink_cache is not None:
             return
-        self._refuse_sinks_on_a_cube_cache()
+        self._refuse_sinks_without_softmax_stats()
         num_blocks, block_size, num_kv_heads, _ = kv_cache[0].shape
         if _is_capturing():
             raise RuntimeError(
                 "[vllm-ascend/turboquant] the uncompressed sink plane would have to be allocated during a "
                 "graph capture. Run this layer once outside capture, or unset VLLM_ASCEND_TQ_SINK_TOKENS."
             )
+        self._refuse_a_sink_plane_the_arena_cannot_hold(
+            sink_plane_bytes(
+                num_blocks=num_blocks,
+                num_kv_heads=num_kv_heads,
+                head_size=self.head_size,
+                num_sink_tokens=self.sink_config.num_sink_tokens,
+                element_size=torch.empty((), dtype=dtype).element_size(),
+            ),
+            kv_cache[0].device,
+        )
         self.sink_cache = TurboQuantSinkCache(
             num_blocks=num_blocks,
             block_size=block_size,
@@ -511,18 +616,18 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         )
         logger.info_once(
             "[vllm-ascend/turboquant] VLLM_ASCEND_TQ_SINK_TOKENS=%d: the first %d tokens of each sequence are "
-            "kept uncompressed in a %.1f MiB side-car plane (%d bytes per sequence per layer) and merged into "
-            "the decode's softmax on the host. The merge recomputes the quantised context's softmax denominator, "
-            "which neither decode operator returns, so it costs O(context) per step: diagnostic and accuracy "
-            "work, not a serving default.",
+            "kept uncompressed in a %.1f MiB side-car plane (%d bytes per sequence per layer), their quantised "
+            "copies are neutralised in the scale plane, and the two streams are merged from the decode's own "
+            "softmax statistics. The merge is O(%d) per decode step and reads no packed bytes.",
             self.sink_config.num_sink_tokens,
             self.sink_config.num_sink_tokens,
             self.sink_cache.nbytes / (1 << 20),
             self.sink_cache.bytes_per_sequence,
+            self.sink_config.num_sink_tokens,
         )
 
     def _ingest_sinks(self, key: torch.Tensor, value: torch.Tensor, attn_metadata: AscendMetadata) -> int:
-        """Store each sequence's leading tokens uncompressed, beside the write that packed them.
+        """Store each sequence's leading tokens uncompressed, and neutralise the packed copies.
 
         Runs on every cache write, not only on prefill: a sequence shorter than the sink
         count is still filling its sinks a decode token at a time, and the ingestion is
@@ -552,38 +657,85 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             context_lens.append(max(0, int(seq_lens[request]) - length) if described else 0)
         if not any(query_lens):
             return 0
-        return self.sink_cache.ingest(
+        anchor_blocks = attn_metadata.block_tables[: len(ends), 0]
+        stored = self.sink_cache.ingest(
             key,
             value,
-            anchor_blocks=attn_metadata.block_tables[: len(ends), 0],
+            anchor_blocks=anchor_blocks,
             query_starts=query_starts,
             query_lens=query_lens,
             context_lens=context_lens,
         )
+        # After the copy, and after the packed write that put the same tokens in the paged
+        # cache: zeroing a token's scale lanes makes its cached key exactly the zero vector
+        # and its cached value contribute exactly nothing, on whichever codebook and byte
+        # order this cache happens to use, without a single nibble being unpacked. That is
+        # what lets the merge be an append of a known weight rather than a subtraction of a
+        # measured one. See turboquant_sink for the arithmetic.
+        self.sink_cache.neutralize_scale_rows(
+            self.scale_cache,
+            anchor_blocks=anchor_blocks,
+            query_starts=query_starts,
+            query_lens=query_lens,
+            context_lens=context_lens,
+        )
+        return stored
+
+    def _sink_lse(self, num_tokens: int, device: torch.device) -> torch.Tensor | None:
+        """Return the ``[num_tokens, num_heads, TURBOQUANT_LSE_STRIDE]`` buffer a decode writes.
+
+        ``None`` when sinks are off, which is what leaves the writer disabled inside the
+        kernel and the feature costing nothing at all.
+
+        Persistent, sized to the largest decode the config allows, and refused inside a graph
+        capture, for exactly the reasons :meth:`_rotated_query` gives: a replay reads the
+        addresses it was captured against, so neither a fresh allocation nor a growth may
+        happen on a captured step.
+        """
+        if not self.sink_config.enabled:
+            return None
+        needed = num_tokens * self.num_heads * TURBOQUANT_LSE_STRIDE
+        buffer = self.sink_lse
+        if buffer is not None and buffer.numel() >= needed:
+            return buffer[:needed].view(num_tokens, self.num_heads, TURBOQUANT_LSE_STRIDE)
+
+        if _is_capturing():
+            raise RuntimeError(
+                "[vllm-ascend/turboquant] the sink merge's softmax-statistics buffer would have to grow to "
+                f"{needed} float32 words during a graph capture (num_tokens={num_tokens}). Run this shape "
+                "once outside capture so the buffer is sized first."
+            )
+        max_num_seqs, _ = self._decode_capacity()
+        reserved = max_num_seqs * self.num_heads * TURBOQUANT_LSE_STRIDE
+        # Zeroed for the reason the rotated-query buffer is, and for one more: a zeroed pair
+        # reads as mass 0, which every reader of it already treats as an empty context, so a
+        # row no launch wrote cannot be mistaken for a plausible one.
+        self.sink_lse = torch.zeros(max(needed, reserved), dtype=torch.float32, device=device)
+        return self.sink_lse[:needed].view(num_tokens, self.num_heads, TURBOQUANT_LSE_STRIDE)
 
     def _fuse_decode_sinks(
         self,
         attention_output: torch.Tensor,
         query: torch.Tensor,
-        rotated_query: torch.Tensor,
+        lse: torch.Tensor,
         attn_metadata: AscendMetadata,
     ) -> None:
-        """Replace the quantised sinks in a decode's output with the uncompressed ones.
+        """Append the uncompressed sinks to a decode's output, from the pair it just wrote.
 
         ``attention_output`` is still in the rotated basis here, which is what both decodes
         are asked to produce while this is on: the un-rotation and any output gate are
         linear in the output and are applied after the merge, not before it.
+
+        Reads the side-car, the query and ``lse``. No packed plane, no scale plane, no host
+        readback, and no arithmetic whose cost grows with the context.
         """
         if self.sink_cache is None:
             return
         fuse_decode_sinks(
             attention_output=attention_output,
             query=query,
-            rotated_query=rotated_query,
             sink_cache=self.sink_cache,
-            key_cache=self.key_cache,
-            value_cache=self.value_cache,
-            scale_cache=self.scale_cache,
+            lse=lse,
             block_tables=self._device_index(attn_metadata.block_tables, query.device, "block_tables"),
             seq_lens=attn_metadata.seq_lens,
             num_kv_heads=self.num_kv_heads,
@@ -846,9 +998,10 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             )
             if envs_ascend.VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS:
                 self._fence_cache_write(key.device)
-            # After the packed write, not instead of it: a sink is quantised into the paged
-            # cache exactly as before, and kept here as well, so the decode's context stays
-            # a contiguous prefix and only the merge below knows the difference.
+            # After the packed write, not instead of it: a sink still occupies its row of
+            # the paged cache, so the decode's context stays the contiguous prefix it always
+            # was. What changes is that the row's scale lanes are zeroed afterwards, which
+            # takes its quantised copy out of the decode's arithmetic exactly.
             if self.sink_config.enabled:
                 self._ingest_sinks(cached_key, cached_value, attn_metadata)
         # Announced either way: a dry run leaves the cache empty, but the rest of the
@@ -1135,6 +1288,7 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         block_tables = self._device_index(attn_metadata.block_tables, query.device, "block_tables")
         seq_lens = self._decode_seq_lens(attn_metadata, query.device)
         workspace = self._decode_workspace(num_tokens, block_tables.shape[1], self.key_cache.shape[1], query.device)
+        lse = self._sink_lse(num_tokens, query.device)
         attention_output = output[:num_tokens].view(num_tokens, self.num_heads, self.head_size)
 
         tracer = turboquant_tracer()
@@ -1179,9 +1333,10 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             self.num_heads,
             self.scale,
             attention_output,
+            lse,
         )
-        if self.sink_config.enabled:
-            self._fuse_decode_sinks(attention_output, query, rotated_query, attn_metadata)
+        if lse is not None:
+            self._fuse_decode_sinks(attention_output, query, lse, attn_metadata)
         if not self.output_rotation_folded:
             self._unrotate_output(attention_output, rotated_query)
         if envs_ascend.VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS:
@@ -1280,11 +1435,10 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
                 "the gate sits between attention and o_proj, where the output is still rotated"
             )
         if self.sink_config.enabled:
-            # Unreachable while _refuse_sinks_on_a_cube_cache stands: the merge cannot read
-            # an NZ-tiled kv4fp8 cache. Kept because the ordering is the part that is right
-            # and that a kv4fp8 reader would need unchanged -- the merge is a rescaling of
-            # the whole softmax, so it has to see the raw rotated accumulator, and both the
-            # un-rotation and the gate are linear and re-applied after it.
+            # The merge rescales the whole softmax, so it has to see the raw rotated
+            # accumulator; both the un-rotation and the gate are linear in the output and are
+            # re-applied to the merged answer. This gives up the single-launch fusion for as
+            # long as sinks are on, which is the feature's one structural cost on this path.
             return TurboQuantOutputStage.ROTATED_BASIS
         if self.output_rotation_folded:
             return TurboQuantOutputStage.ROTATED_BASIS
@@ -1321,6 +1475,7 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         seq_lens = self._decode_seq_lens(attn_metadata, device)
         workspace = self._decode_workspace(num_tokens, block_tables.shape[1], self.key_cache.shape[1], device)
         rotated_query = self._rotated_query(num_tokens, device)
+        lse = self._sink_lse(num_tokens, device)
         attention_output = output[:num_tokens].view(num_tokens, self.num_heads, self.head_size)
 
         tracer = turboquant_tracer()
@@ -1360,9 +1515,10 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             self.scale,
             int(stage),
             attention_output,
+            lse,
         )
-        if self.sink_config.enabled:
-            self._fuse_decode_sinks(attention_output, query, rotated_query, attn_metadata)
+        if lse is not None:
+            self._fuse_decode_sinks(attention_output, query, lse, attn_metadata)
             if not self.output_rotation_folded:
                 self._unrotate_output(attention_output, rotated_query)
             if gate is not None:
@@ -1576,6 +1732,7 @@ def activate_turboquant_backend(layer: torch.nn.Module) -> None:
         impl._device_index_buffers = None
         impl.sink_config = TurboQuantSinkConfig.from_env()
         impl.sink_cache = None
+        impl.sink_lse = None
         impl._trace_step = 0
         impl._trace_phase = "unknown"
         impl.cube_decode = turboquant_cube_decode_selected(_model_dtype(impl))

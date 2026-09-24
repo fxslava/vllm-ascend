@@ -32,13 +32,18 @@ void turboquant_reshape_and_cache_impl(AscendType type, void *stream, uint32_t b
                                        uint32_t headSize, uint32_t blockSize, uint32_t numBlocks,
                                        uint32_t tokensPerCore, float invSqrtLen);
 
+// `lse` is the optional [numTokens, numHeads, turboquant::kLseStride] fp32 out-tensor carrying each
+// (token, head)'s running max and softmax mass. It defaults to null, which is what every launch that is
+// not merging a second attention stream into this decode passes, and is last so that adding it left the
+// existing call sites here untouched.
 void turboquant_paged_attention_impl(AscendType type, void *stream, uint32_t blockDim, void *queryRot,
                                      void *keyCache, void *valueCache, void *scaleCache, void *blockTables,
                                      void *contextLens, void *tables, void *workspace, void *output,
                                      uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize,
                                      uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits,
                                      uint32_t splitTasksPerCore, uint32_t reduceTasksPerCore,
-                                     uint32_t fusedContextLimit, float scale, float invSqrtLen);
+                                     uint32_t fusedContextLimit, float scale, float invSqrtLen,
+                                     void *lse = nullptr);
 
 void turboquant_rotate_q_impl(AscendType type, void *stream, uint32_t blockDim, bool useCube, void *query,
                               void *piSigns, void *h16, void *rotTables, void *queryRot, uint32_t numVectors,
@@ -58,7 +63,8 @@ void turboquant_mm_fused_decode_impl(int32_t mode, AscendType type, void *stream
                                     uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize,
                                     uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits,
                                     uint32_t headsPerTask, uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,
-                                    uint32_t fusedContextLimit, float scale, float invSqrtLen);
+                                    uint32_t fusedContextLimit, float scale, float invSqrtLen,
+                                    void *lse = nullptr);
 
 // The fused decode handed the raw query: the launch rotates it into queryRot before the task loop (on the Cube
 // in chunks of prologueCubeChunkVectors, 0 for the vector cores alone), and outputStage
@@ -74,7 +80,7 @@ void turboquant_mm_fused_decode_raw_query_impl(int32_t mode, AscendType type, vo
                                               uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,
                                               uint32_t prologueVectorsPerBlock, uint32_t prologueCubeChunkVectors,
                                               uint32_t outputStage, uint32_t fusedContextLimit, float scale,
-                                              float invSqrtLen);
+                                              float invSqrtLen, void *lse = nullptr);
 
 // The unpack ablation of turboquant_mm_fused_decode_impl: the same launch with the codec expand dropped out
 // of the KV ingest and every byte of traffic left in place, so the difference between the two is the unpack
@@ -86,7 +92,8 @@ void turboquant_mm_fused_decode_nounpack_impl(int32_t mode, AscendType type, voi
                                              uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,
                                              uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t headsPerTask,
                                              uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,
-                                             uint32_t fusedContextLimit, float scale, float invSqrtLen);
+                                             uint32_t fusedContextLimit, float scale, float invSqrtLen,
+                                             void *lse = nullptr);
 
 // rightLayout is a turboquant::GemmLayout: 0 transposes the K x N right operand into L0B, 1 takes it as N x K.
 void turboquant_cube_gemm_probe_impl(void *stream, void *leftGm, void *rightGm, void *outGm, uint32_t m, uint32_t k,

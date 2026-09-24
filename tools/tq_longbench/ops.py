@@ -718,6 +718,10 @@ class _TurboQuantBackend(AttentionBackend):
         #: batch holds many; this arena holds exactly one sequence and slot *is* position,
         #: so every layer's plane is a single block and the anchor is always zero.
         self._sink_caches: list | None = None
+        #: The softmax statistics the decode writes when sinks are on, or None with the
+        #: feature off -- which is what leaves the writer disabled inside the kernel.
+        #: Sized and pinned beside the rotated query, for the same reason.
+        self._sink_lse: torch.Tensor | None = None
         if sink_tokens:
             sink = turboquant_sink()
             self._sink_caches = [
@@ -732,12 +736,12 @@ class _TurboQuantBackend(AttentionBackend):
                 )
                 for _ in range(geometry.num_layers)
             ]
-            # The merge reads the context lengths on the host -- it recomputes the
-            # softmax denominator the operators do not return -- so a step is no longer
-            # free of device-to-host copies, and a captured graph would freeze the
-            # lengths it saw. Both are declared off rather than left to fail later.
-            self.supports_static_decode = False
-            self.supports_graph_capture = False
+            # Static decode and capture stay at the class default. The merge takes the
+            # decode's own (max, mass) out-tensor rather than recomputing it, and every
+            # tensor it touches -- the side-car, the query, the block table, the context
+            # lengths -- is already on the device, so a step still asks the host nothing
+            # and a captured graph freezes no host-read value. What a capture does need
+            # is the statistics buffer sized first, which reserve_launch_buffers does.
         #: Set by :meth:`reserve_launch_buffers`; after it, growing either buffer
         #: is a bug rather than a resize, and raises instead of happening.
         self._buffers_pinned = False
@@ -765,13 +769,18 @@ class _TurboQuantBackend(AttentionBackend):
             self._write_tables,
         )
         if self._sink_caches is not None:
-            # Beside the packed write, not instead of it: the sink stays quantised in the
-            # paged cache, so the decode's context is the contiguous prefix it always was
-            # and only the merge below knows there is a better copy. Driven by the slots
-            # themselves, in one fixed-shape device operation, so a chunk still asks the
-            # host nothing -- and so a new prompt starting at slot 0 overwrites the last
-            # one's sinks with no bookkeeping about where the last one ended.
+            # Beside the packed write, not instead of it: the sink stays a row of the
+            # decode's contiguous context prefix, so context_lens is what it always was.
+            # Driven by the slots themselves, in one fixed-shape device operation, so a
+            # chunk still asks the host nothing -- and so a new prompt starting at slot 0
+            # overwrites the last one's sinks with no bookkeeping about where it ended.
             self._sink_caches[layer].ingest_by_slot(key, value, slots, block=0)
+            # Then take the quantised copies back out of the decode's arithmetic, by
+            # zeroing their scale lanes rather than by reading a single packed nibble:
+            # a zero scale makes the cached key exactly the zero vector and the cached
+            # value contribute exactly nothing, on whichever codebook and byte order this
+            # writer used. That is what lets the merge below serve the Cube path too.
+            self._sink_caches[layer].neutralize_scale_rows_by_slot(scale_plane, block=0)
 
     def sink_cache_bytes(self) -> int:
         """What the uncompressed side-car holds across every layer, for the memory report.
@@ -788,34 +797,28 @@ class _TurboQuantBackend(AttentionBackend):
         self,
         layer: int,
         query: torch.Tensor,
-        rotated: torch.Tensor,
+        lse: torch.Tensor,
         out: torch.Tensor,
         context_lens: torch.Tensor,
         block_tables: torch.Tensor,
     ) -> None:
-        """Replace the quantised sinks in ``out`` with the uncompressed ones, in place.
+        """Append the uncompressed sinks to ``out``, in place, from the pair the decode wrote.
 
         ``out`` is still in the rotated basis here, which is what both decodes are asked
         to produce while sinks are on: the un-rotation and any output gate are linear in
         the output, and the merge changes the denominator they would be applied against.
 
-        This is the ``O(context)`` host-side recomputation of the softmax denominator that
-        :mod:`vllm_ascend.attention.turboquant_sink` exists to explain -- neither decode
-        operator returns it, and it cannot be recovered from their normalised output. It
-        is measured in the decode percentiles the record carries, which is where the cost
-        of this phase is supposed to be visible.
+        ``O(sink_tokens)`` per step and no packed byte is read: ``lse`` carries the
+        decode's own softmax maximum and mass, which is the only thing the merge ever
+        needed the context for.
         """
         if self._sink_caches is None:
             return
-        key_plane, value_plane, scale_plane = self.cache.planes(layer)
         turboquant_sink().fuse_decode_sinks(
             attention_output=out,
             query=query,
-            rotated_query=rotated,
             sink_cache=self._sink_caches[layer],
-            key_cache=key_plane,
-            value_cache=value_plane,
-            scale_cache=scale_plane,
+            lse=lse,
             block_tables=block_tables,
             seq_lens=context_lens,
             num_kv_heads=self.shape.num_kv_heads,
@@ -853,8 +856,37 @@ class _TurboQuantBackend(AttentionBackend):
         self._rotated_query = None
         self._rotated_query_buffer(max_tokens)
         self._workspace = torch.empty(max(floats, 1), dtype=torch.float32, device=self.device)
+        if self._sink_caches is not None:
+            self._sink_lse = None
+            self._sink_lse_buffer(max_tokens)
         self._buffers_pinned = True
-        return sum(buffer.numel() * buffer.element_size() for buffer in (self._rotated_query, self._workspace))
+        reserved = (self._rotated_query, self._workspace, self._sink_lse)
+        return sum(buffer.numel() * buffer.element_size() for buffer in reserved if buffer is not None)
+
+    def _sink_lse_buffer(self, num_tokens: int) -> torch.Tensor | None:
+        """The ``[num_tokens, num_heads, TURBOQUANT_LSE_STRIDE]`` out-tensor a decode writes.
+
+        ``None`` with sinks off, which is what the operators take to mean "do not write
+        the statistics at all" and is why the feature costs a launch nothing when it is
+        not in use.
+
+        Reserved and pinned like the rotated query: a captured graph replays into the
+        addresses it saw, so a buffer that grew after capture is a replay into freed
+        device memory rather than a resize.
+        """
+        if self._sink_caches is None:
+            return None
+        lse_stride = turboquant_layout().TURBOQUANT_LSE_STRIDE
+        needed = num_tokens * self.shape.num_heads * lse_stride
+        buffer = self._sink_lse
+        if buffer is None or buffer.numel() < needed:
+            self._refuse_growth("sink softmax statistics", needed, 0 if buffer is None else buffer.numel())
+            # Zeroed rather than empty: a zeroed pair reads as mass 0, which every reader
+            # already treats as an empty context, so a row no launch has written yet
+            # cannot be mistaken for a plausible one.
+            self._sink_lse = torch.zeros(max(needed, 1), dtype=torch.float32, device=self.device)
+            buffer = self._sink_lse
+        return buffer[:needed].view(num_tokens, self.shape.num_heads, lse_stride)
 
     def _rotated_query_buffer(self, num_tokens: int) -> torch.Tensor:
         needed = num_tokens * self.shape.num_heads * self.shape.head_size
@@ -924,20 +956,6 @@ class TurboQuantCubeBackend(_TurboQuantBackend):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        if self.sink_tokens:
-            # The uncompressed-sink merge reads the packed cache on the host, row-major and
-            # on the Lloyd-Max codebook grid -- what npu_turboquant_reshape_and_cache writes
-            # and the AIV decode reads back. This writer leaves NZ-tiled planes
-            # (kStoresNzTiles<KV4_FP8>) of codes that are affine about 7.5 on an fp8 e4m3
-            # grid, so the merge would read the wrong bytes off the wrong grid and return
-            # plausible wrong numbers rather than raise. A real ablation measured it as
-            # LongBench 57.6% at 0 sinks against 14.1% at 4.
-            raise ValueError(
-                "sink_tokens cannot be combined with turboquant_cube: the merge reads the packed cache "
-                "row-major on the Lloyd-Max grid, and the kv4fp8 writer leaves NZ-tiled planes of affine "
-                "fp8 codes. Use --backends turboquant_aiv, which is the layout the merge reads, or "
-                "--sink-tokens 0."
-            )
         self.geometry.require_cube_tiling()
         # Only when the full extension has not registered it: a standalone build
         # (tools/tq_longbench/build_turboquant_ops.py), from $TURBOQUANT_LIB_PATH,
@@ -1002,6 +1020,7 @@ class TurboQuantCubeBackend(_TurboQuantBackend):
         key_plane, value_plane, scale_plane = self.cache.planes(layer)
         block_tables = self._block_tables(num_tokens, window if window is not None else longest_context(context_lens))
         rotated = self._rotated_query_buffer(num_tokens)
+        lse = self._sink_lse_buffer(num_tokens)
         ascend_ops().npu_turboquant_cube_decode(
             query.contiguous(),
             None if gate is None or self.sink_tokens else gate.contiguous(),
@@ -1020,11 +1039,12 @@ class TurboQuantCubeBackend(_TurboQuantBackend):
             self.shape.scale,
             int(self._output_stage(gate)),
             out,
+            lse,
         )
-        if self.sink_tokens:
+        if lse is not None:
             # The launch was asked for the rotated accumulator, so what it left behind is
             # what the merge needs and what still has to be un-rotated and gated.
-            self._fuse_sinks(layer, query, rotated, out, context_lens, block_tables)
+            self._fuse_sinks(layer, query, lse, out, context_lens, block_tables)
             if not self.output_rotation_folded:
                 ops = ascend_ops()
                 ops.npu_turboquant_rotate_q(out, self._pi_signs, self._write_tables, self._hadamard16, rotated)
@@ -1082,6 +1102,7 @@ class TurboQuantAivBackend(_TurboQuantBackend):
         ops.npu_turboquant_rotate_q(query.contiguous(), self._pi_signs, self._write_tables, self._hadamard16, rotated)
         key_plane, value_plane, scale_plane = self.cache.planes(layer)
         block_tables = self._block_tables(num_tokens, window if window is not None else longest_context(context_lens))
+        lse = self._sink_lse_buffer(num_tokens)
         ops.npu_turboquant_paged_attention(
             rotated,
             key_plane,
@@ -1095,9 +1116,10 @@ class TurboQuantAivBackend(_TurboQuantBackend):
             self.shape.num_heads,
             self.shape.scale,
             out,
+            lse,
         )
-        if self.sink_tokens:
-            self._fuse_sinks(layer, query, rotated, out, context_lens, block_tables)
+        if lse is not None:
+            self._fuse_sinks(layer, query, lse, out, context_lens, block_tables)
         if not self.output_rotation_folded:
             # The decode leaves O~ in the rotated basis; Pi is an involution, so
             # the same operator that rotates the query un-rotates the output.
@@ -1163,11 +1185,12 @@ def build_backend(
     (see :data:`DENSE_ATTENTION_APIS`); every other backend ignores it.
 
     ``sink_tokens`` keeps that many leading tokens of the sequence uncompressed in a
-    side-car plane beside the packed cache and folds their exact contribution back into
-    each decode's softmax; only the two TurboQuant backends have anything to do with it.
-    It turns a decode step into a host-side ``O(context)`` recomputation as well as a
-    launch -- see :mod:`vllm_ascend.attention.turboquant_sink` for why -- and therefore
-    also turns off static decode and graph capture for that backend.
+    side-car plane beside the packed cache, neutralises their quantised copies in the
+    scale plane, and merges the two streams from the decode's own softmax statistics;
+    only the two TurboQuant backends have anything to do with it. It adds ``O(N)`` torch
+    work per decode step and reads no packed byte -- see
+    :mod:`vllm_ascend.attention.turboquant_sink` -- so both TurboQuant layouts serve it
+    and neither static decode nor graph capture has to be given up for it.
 
     An Ascend backend asked for where its operators cannot run is **refused**
     rather than quietly substituted: the reference backends compute the same

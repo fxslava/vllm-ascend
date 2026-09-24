@@ -233,11 +233,11 @@ class RunnerConfig:
     weight_nz: str = "auto"
     #: How many leading tokens of the sequence bypass 4-bit quantisation and are
     #: attended to at activation precision (``VLLM_ASCEND_TQ_SINK_TOKENS``). 0 is
-    #: off, and every TurboQuant path is then the one that ships. Above 0 each
-    #: decode step also recomputes the quantised context's softmax denominator on
-    #: the host, because neither decode operator returns it, so a step costs
-    #: ``O(context)`` torch work on top of its launch and can be neither static
-    #: nor captured. Only the TurboQuant backends read it.
+    #: off, and every TurboQuant path is then the one that ships. Above 0 the
+    #: decode also writes its softmax maximum and mass to an ``lse`` out-tensor and
+    #: each step merges the side-car's stream into the answer from it -- ``O(N)``
+    #: torch work per step, reading no packed byte. Only the TurboQuant backends
+    #: read it.
     sink_tokens: int = 0
 
     def __post_init__(self) -> None:
@@ -257,26 +257,16 @@ class RunnerConfig:
         if self.sink_tokens < 0:
             raise ValueError(f"sink_tokens cannot be negative, got {self.sink_tokens}")
         if self.sink_tokens and self.prefill_mode == "batched_decode":
-            # batched_decode presents a whole chunk as a batch of per-position decodes, so
-            # every prefill row would pay the merge's O(context) recomputation and the
-            # prefill would be O(context^2) on the host. It is also the mode with no
-            # counterpart in the plugin: vllm-ascend's TurboQuant backend refuses chunked
-            # prefill outright and prefills densely, where the sinks are exact anyway.
+            # Not a cost argument any more -- the merge is O(sink_tokens) per row since the
+            # decodes started returning their own softmax statistics. It is that this mode
+            # has no counterpart in the thing being measured: vllm-ascend's TurboQuant
+            # backend refuses chunked prefill outright and prefills densely, so a sink score
+            # taken here would describe a prefill path the plugin never takes, and the
+            # sinks are exact in a dense prefill anyway.
             raise ValueError(
-                "sink_tokens needs --prefill-mode dense_staging: the sink merge recomputes the softmax "
-                "denominator per attending row, so a batched_decode prefill would pay it once per prompt "
-                "token. Prefill densely (which is what the plugin's backend does, and where the sinks are "
-                "already exact), or run with --sink-tokens 0."
-            )
-        if self.sink_tokens and self.backend == "turboquant_cube":
-            # See TurboQuantCubeBackend: the merge reads the packed cache row-major on the
-            # Lloyd-Max grid, and the kv4fp8 writer leaves NZ-tiled affine fp8 planes.
-            # Refused here as well so a run fails before its weights load.
-            raise ValueError(
-                "sink_tokens cannot be combined with turboquant_cube: the uncompressed-sink merge reads the "
-                "packed cache row-major on the Lloyd-Max codebook grid, and the kv4fp8 Cube writer leaves "
-                "NZ-tiled planes of codes that are affine on an fp8 grid -- it would return plausible wrong "
-                "numbers rather than raise. Use the turboquant_aiv backend, or sink_tokens 0."
+                "sink_tokens needs --prefill-mode dense_staging: batched_decode prefills out of the 4-bit "
+                "cache, which the plugin's TurboQuant backend never does -- it refuses chunked prefill and "
+                "prefills densely, where the sinks are exact. Prefill densely, or run with --sink-tokens 0."
             )
         if self.sink_tokens and self.backend in DENSE_BACKENDS:
             raise ValueError(

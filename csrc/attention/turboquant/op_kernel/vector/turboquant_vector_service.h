@@ -170,6 +170,54 @@ struct TurboQuantRotatedOutput {
 };
 
 // ----------------------------------------------------------------------------------------------------
+// The optional softmax-statistics out-tensor
+// ----------------------------------------------------------------------------------------------------
+
+// Writes the (running max, mass) pair of a finished (token, head) to the kLseStride-strided out-tensor
+// described in turboquant_layout.h. Both decodes own one; both leave it disabled when the caller passed
+// no tensor, which is every launch that is not merging a second attention stream.
+//
+// The pair is handed over as UB words already in the GM image's layout -- the same sixteen words a split
+// leaves in its partial tail -- so this adds no vector arithmetic to the write path, only the copy.
+//
+// `enabled_` is a launch constant, identical on every core, so branching on it cannot desync the two
+// halves of a mixed Cube launch the way a per-task predicate would.
+class TurboQuantLseWriter {
+public:
+    __aicore__ inline void Init(__gm__ void *lse, const uint32_t numHeads)
+    {
+        numHeads_ = numHeads;
+        enabled_ = lse != nullptr;
+        if (enabled_) {
+            lseGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(lse));
+        }
+    }
+
+    __aicore__ inline bool Enabled() const
+    {
+        return enabled_;
+    }
+
+    // `pairs` holds `heads` consecutive kLseStride-word groups, for heads `firstHead` upward.
+    __aicore__ inline void Write(const AscendC::LocalTensor<float> &pairs, const uint32_t token,
+                                 const uint32_t firstHead, const uint32_t heads)
+    {
+        if (!enabled_ || heads == 0) {
+            return;
+        }
+        SyncVectorToMte3();
+        AscendC::DataCopy(lseGm_[(static_cast<uint64_t>(token) * numHeads_ + firstHead) * kLseStride], pairs,
+                          heads * kLseStride);
+        SyncMte3ToVector();
+    }
+
+private:
+    AscendC::GlobalTensor<float> lseGm_;
+    uint32_t numHeads_ = 0;
+    bool enabled_ = false;
+};
+
+// ----------------------------------------------------------------------------------------------------
 // In-launch reduction of split partials
 // ----------------------------------------------------------------------------------------------------
 
@@ -183,7 +231,7 @@ public:
     __aicore__ inline explicit TurboQuantPartialReducer(AscendC::TPipe *pipe) : pipe_(pipe) {}
 
     __aicore__ inline void Init(__gm__ void *workspace, __gm__ void *output, const uint32_t numHeads,
-                                const uint32_t headSize, const uint32_t numSplits)
+                                const uint32_t headSize, const uint32_t numSplits, __gm__ void *lse = nullptr)
     {
         numHeads_ = numHeads;
         headSize_ = headSize;
@@ -192,6 +240,7 @@ public:
 
         workspaceGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(workspace));
         outputGm_.SetGlobalBuffer(reinterpret_cast<__gm__ scalar_t *>(output));
+        lseWriter_.Init(lse, numHeads);
 
         pipe_->InitBuffer(accBuf_, (2 * headSize_ + kPartialTail) * sizeof(float));
         pipe_->InitBuffer(stateBuf_, kStateLanes * kFp32PerBlock * sizeof(float));
@@ -258,6 +307,11 @@ public:
             AscendC::Adds(runMax, newMax, 0.0f, 1);
         }
 
+        // Before NormalizeHeads, which adds its epsilon to runSum in place: what goes out is the mass the
+        // splits actually summed, and state[0, kLseStride) is already (max lane, sum lane) in the out-tensor's
+        // own layout -- every other lane of the two blocks was zeroed at the top of this reduction.
+        lseWriter_.Write(state, token, head, 1);
+
         NormalizeHeads(acc, runSum, 1, headSize_, sums, invs);
         finisher.FinishHeads(acc, token, head, 1);
         WriteHeads<scalar_t>(acc, 1, headSize_, outBuf_.Get<scalar_t>(), outputGm_,
@@ -277,6 +331,7 @@ private:
     AscendC::TBuf<AscendC::QuePosition::VECCALC> stateBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> blockBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> outBuf_;
+    TurboQuantLseWriter lseWriter_;
     AscendC::GlobalTensor<float> workspaceGm_;
     AscendC::GlobalTensor<scalar_t> outputGm_;
     uint32_t numHeads_ = 0;
@@ -341,10 +396,12 @@ public:
                                 __gm__ void *valueCache, __gm__ void *scaleCache, __gm__ void *modeTables,
                                 __gm__ void *workspace, __gm__ void *output, const uint32_t numHeads,
                                 const uint32_t numKvHeads, const uint32_t headSize, const uint32_t blockSize,
-                                const uint32_t numSplits, const float scale, const float invSqrtLen)
+                                const uint32_t numSplits, const float scale, const float invSqrtLen,
+                                __gm__ void *lse = nullptr)
     {
         ComputeLayout(numHeads, numKvHeads, headSize, blockSize, numSplits, scale);
         InitGlobalTensors(queryRot, keyCache, valueCache, scaleCache, modeTables, workspace, output);
+        lseWriter_.Init(lse, numHeads);
         InitBuffers(pipe);
         codec_.Init(pipe, headSize_, Codec::kIsAffine ? kUnpackChunkRows : kCubeUnpackRows, invSqrtLen,
                     modeTablesGm_);
@@ -577,6 +634,10 @@ public:
         if (fused) {
             const AscendC::LocalTensor<float> acc = accBuf_.Get<float>();
             const uint32_t firstHead = heads.first + heads.base;
+            // Before NormalizeHeads, which adds its epsilon to the running sum in place. A split token's
+            // statistics come out of the reducer instead, so between the two branches every (token, head)
+            // of the launch is written exactly once.
+            StageLse(token, heads);
             NormalizeHeads(acc, StateField(kStateRunSum), heads.mine, headSize_, reduce[kReduceBlocks],
                            reduce[kReduceInv]);
             finisher.FinishHeads(acc, token, firstHead, heads.mine);
@@ -1035,6 +1096,30 @@ private:
         SyncMte3ToVector();
     }
 
+    // The same (max, sum) pair StagePartials leaves in the workspace, for a token the decode did not split.
+    // Shares scoreBuf_ with it, and for the same reason it is free there: this runs after the task's last
+    // tile has been accumulated, so the scores it held are dead. heads.mine is at most kCubeTileM / 2 per
+    // subcore, so heads.mine * kLseStride words fit the score half of that buffer with room to spare.
+    __aicore__ inline void StageLse(const uint32_t token, const TurboQuantTaskHeads &heads)
+    {
+        if (!lseWriter_.Enabled() || heads.mine == 0) {
+            return;
+        }
+        static_assert(kCubeTileM * kLseStride * sizeof(float) <= kScoreBytes,
+                      "the lse pairs of one task's heads have to fit the score buffer");
+        const AscendC::LocalTensor<float> runMax = StateField(kStateRunMax);
+        const AscendC::LocalTensor<float> runSum = StateField(kStateRunSum);
+        const AscendC::LocalTensor<float> pairs = scoreBuf_.Get<float>();
+        AscendC::Duplicate(pairs, 0.0f, heads.mine * kLseStride);
+        // Overlapping write: the lanes below lie inside the block the Duplicate above just zeroed.
+        AscendC::PipeBarrier<PIPE_V>();
+        for (uint32_t j = 0; j < heads.mine; ++j) {
+            AscendC::Adds(pairs[j * kLseStride + kPartialMaxLane], runMax[j * kFp32PerBlock], 0.0f, 1);
+            AscendC::Adds(pairs[j * kLseStride + kPartialSumLane], runSum[j * kFp32PerBlock], 0.0f, 1);
+        }
+        lseWriter_.Write(pairs, token, heads.first + heads.base, heads.mine);
+    }
+
     __aicore__ inline void StagePartials(const uint32_t token, const uint32_t split, const TurboQuantTaskHeads &heads)
     {
         const AscendC::LocalTensor<float> acc = accBuf_.Get<float>();
@@ -1057,6 +1142,7 @@ private:
 
     Codec codec_;
     TurboQuantTileBurst rowMajorBurst_;
+    TurboQuantLseWriter lseWriter_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> kvBuf_[kCubeSlots];
     AscendC::TBuf<AscendC::QuePosition::VECCALC> scaleTileBuf_[kCubeSlots];
     AscendC::TBuf<AscendC::QuePosition::VECCALC> bandOperandBuf_;

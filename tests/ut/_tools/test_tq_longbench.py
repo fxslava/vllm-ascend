@@ -154,11 +154,9 @@ from tq_longbench.probe import (  # noqa: E402
 from tq_longbench.reference import DenseReferenceBackend, TurboQuantReferenceBackend  # noqa: E402
 from tq_longbench.run_benchmark import (  # noqa: E402
     DEFAULT_SINK_TOKENS,
-    SINK_INCOMPATIBLE_BACKENDS,
     SINK_TOKENS_ENV,
     add_sink_arguments,
     parse_sink_tokens,
-    refuse_sinks_on_an_unreadable_cache,
     sink_banner,
     use_sink_tokens,
 )
@@ -5275,8 +5273,9 @@ class TestSinkTokenOption(unittest.TestCase):
     def test_the_banner_says_what_a_positive_count_costs(self):
         self.assertIn("off", sink_banner(0))
         banner = sink_banner(4)
-        self.assertIn("O(context)", banner)
-        self.assertIn("softmax denominator", banner)
+        self.assertIn("O(4)", banner)
+        self.assertIn("softmax statistics", banner)
+        self.assertIn("no packed byte", banner)
         self.assertIn(f"{SINK_TOKENS_ENV}=4", banner)
 
 
@@ -5356,15 +5355,43 @@ class TestTurboQuantSinkBackend(_TurboQuantCase):
             outputs.append(out)
         self.assertTrue(torch.equal(*outputs))
 
-    def test_a_positive_count_gives_up_static_decode_and_capture(self):
-        """The merge reads the context lengths on the host; a replay would freeze them."""
+    def test_a_positive_count_keeps_static_decode_and_capture(self):
+        """The merge asks the host nothing, so neither has to be given up for it.
+
+        It used to: recomputing the softmax denominator meant reading the context lengths
+        on the host, and a replay would have frozen the lengths the capture saw. The decode
+        returns its own statistics now and every tensor the merge touches is already on the
+        device, so the only thing a capture needs is the statistics buffer sized first --
+        which ``reserve_launch_buffers`` does, along with the rotated query and workspace.
+        """
         backend = self.sink_backend(256)
-        self.assertFalse(backend.supports_static_decode)
-        self.assertFalse(backend.supports_graph_capture)
-        self.assertEqual(
-            backend.sink_cache_bytes(),
-            backend.geometry.num_layers * 2 * SINK_TOKENS * NUM_KV_HEADS * HEAD_SIZE * DTYPE.itemsize,
-        )
+        self.assertTrue(backend.supports_static_decode)
+        self.assertTrue(backend.supports_graph_capture)
+        per_layer = 2 * SINK_TOKENS * NUM_KV_HEADS * HEAD_SIZE * DTYPE.itemsize
+        self.assertEqual(backend._sink_caches[0].bytes_per_sequence, per_layer)
+        # What the report carries is what the arena paid, which is every layer's plane
+        # including the slack that puts its base on a whole DMA line.
+        self.assertEqual(backend.sink_cache_bytes(), sum(cache.nbytes for cache in backend._sink_caches))
+        self.assertGreater(backend.sink_cache_bytes(), backend.geometry.num_layers * per_layer)
+
+    def test_the_statistics_buffer_is_reserved_with_the_rest_of_the_scratch(self):
+        """A buffer that grew after a capture is a replay into freed device memory."""
+        backend = self.sink_backend(256)
+        lse_stride = turboquant_layout().TURBOQUANT_LSE_STRIDE
+        reserved = backend.reserve_launch_buffers(4)
+        self.assertIsNotNone(backend._sink_lse)
+        self.assertGreaterEqual(backend._sink_lse.numel(), 4 * NUM_HEADS * lse_stride)
+        self.assertGreaterEqual(reserved, backend._sink_lse.numel() * 4)
+        # Within what was reserved it is a view, not an allocation.
+        self.assertEqual(backend._sink_lse_buffer(2).shape, torch.Size([2, NUM_HEADS, lse_stride]))
+        with self.assertRaisesRegex(RuntimeError, "sink softmax statistics"):
+            backend._sink_lse_buffer(8)
+
+    def test_no_statistics_buffer_is_asked_for_with_sinks_off(self):
+        backend = self.sink_backend(256, sink_tokens=0)
+        backend.reserve_launch_buffers(4)
+        self.assertIsNone(backend._sink_lse)
+        self.assertIsNone(backend._sink_lse_buffer(4))
 
     def test_the_side_car_holds_the_prefix_whatever_the_chunking(self):
         length = 512
@@ -5474,121 +5501,116 @@ class TestTurboQuantSinkBackend(_TurboQuantCase):
 
 
 
-class TestTheMergeCannotReadAKv4Fp8Cache(_TurboQuantCase):
-    """Why ``--sink-tokens`` is refused on turboquant_cube, demonstrated rather than asserted.
+class TestANeutralizedScaleIsAnExactExclusion(_TurboQuantCase):
+    """Why the merge now serves both TurboQuant layouts, demonstrated rather than asserted.
 
-    The merge reads the packed planes itself -- row-major, and through the Lloyd-Max
-    codebook -- to recompute the softmax denominator and subtract what the quantised sinks
-    contributed. The kv4fp8 Cube writer leaves neither: NZ-tiled planes
-    (``kStoresNzTiles<KV4_FP8>``) of codes that are affine about 7.5 on an fp8 e4m3 grid.
-    Reading one with the other's addressing returns plausible wrong numbers and raises
-    nothing, which on a real ablation was LongBench 57.6% at 0 sinks against 14.1% at 4.
+    It used to read the packed planes itself -- row-major, through the Lloyd-Max codebook --
+    to recompute the softmax denominator and to subtract what the quantised sinks
+    contributed, and the kv4fp8 Cube writer leaves neither layout nor codebook: NZ-tiled
+    planes (``kStoresNzTiles<KV4_FP8>``) of codes affine about 7.5 on an fp8 e4m3 grid.
+    That is what made the combination a silent misread rather than a failure, and it is why
+    ``--sink-tokens`` was refused on ``turboquant_cube``.
+
+    Both halves of it are gone.  The statistics come out of the decode, and the quantised
+    copies leave through the *scale* plane: every mode reconstructs a cached vector as code
+    times the token's scale, and both decodes apply that scale on the vector unit after the
+    product.  What follows is that this exclusion is exact whatever the bytes and whatever
+    the grid, which is the whole claim the layout independence rests on.
     """
 
-    #: csrc/attention/turboquant/op_kernel/common/turboquant_layout.h.
-    CUBE_TILE_ROWS = 64
-    OPERAND_C0 = 32
     #: TurboQuantModeConfigOf(KV4_FP8): is_affine, affine_bias.
     AFFINE_BIAS = 7.5
 
-    def nz_tiled_packed_byte(self, slot: int, kv_head: int, column: int, num_kv_heads: int, packed: int) -> int:
-        """``NzTiledPackedByte``, transcribed from the header the kernels compile against."""
-        tile_row = slot % self.CUBE_TILE_ROWS
-        return (
-            (slot - tile_row) * num_kv_heads * packed
-            + kv_head * self.CUBE_TILE_ROWS * packed
-            + ((column // self.OPERAND_C0) * self.CUBE_TILE_ROWS + tile_row) * self.OPERAND_C0
-            + column % self.OPERAND_C0
-        )
-
-    def test_the_header_and_the_row_major_reader_disagree_about_every_interesting_row(self):
-        """The addresses are the same only for the first tile row of the first kv head."""
-        num_kv_heads, packed, block_size = 2, HEAD_SIZE // 2, BLOCK_SIZE
-        agreed, disagreed = 0, 0
-        for slot in range(block_size):
-            for kv_head in range(num_kv_heads):
-                for column in range(0, packed, 7):
-                    row_major = (slot * num_kv_heads + kv_head) * packed + column
-                    nz = self.nz_tiled_packed_byte(slot, kv_head, column, num_kv_heads, packed)
-                    if row_major == nz:
-                        agreed += 1
-                    else:
-                        disagreed += 1
-        # A handful coincide -- the first tile row of the first kv head, below the first
-        # C0 group -- and everything else lands somewhere the other addressing never looks.
-        self.assertLess(agreed / (agreed + disagreed), 0.02)
-
-    def test_reading_an_nz_tiled_plane_row_major_recovers_nothing(self):
-        """Write a known plane the way the Cube writer does; read it the way the merge does."""
-        sink_module = turboquant_sink()
-        num_kv_heads, slots = 2, self.CUBE_TILE_ROWS
-        packed = HEAD_SIZE // 2
-        row_major = torch.randint(-128, 127, (slots, num_kv_heads, packed), dtype=torch.int8)
-
-        nz = torch.zeros(slots * num_kv_heads * packed, dtype=torch.int8)
-        for slot in range(slots):
-            for kv_head in range(num_kv_heads):
-                for column in range(packed):
-                    nz[self.nz_tiled_packed_byte(slot, kv_head, column, num_kv_heads, packed)] = row_major[
-                        slot, kv_head, column
-                    ]
-        # Every byte is present, so nothing was lost -- only permuted.
-        self.assertEqual(sorted(nz.tolist()), sorted(row_major.flatten().tolist()))
-
-        as_the_merge_reads_it = nz.view(slots, num_kv_heads, packed)
-        self.assertFalse(torch.equal(as_the_merge_reads_it, row_major))
-        # And the values it hands the softmax are a different set of levels entirely.
-        wrong = sink_module.turboquant_dequantize(as_the_merge_reads_it)
-        right = sink_module.turboquant_dequantize(row_major)
-        self.assertFalse(torch.allclose(wrong, right))
-
-    def test_the_lloyd_max_grid_is_not_the_affine_one_kv4fp8_reconstructs_on(self):
-        """The second mismatch, independent of the first: a code means a different number.
-
-        Compared after normalising both grids to [-1, 1], because each carries its own
-        per-vector scale and the absolute levels are not the claim. The claim is the shape:
-        Lloyd-Max levels are packed towards zero and spread at the tails, and kv4fp8's are
-        evenly spaced about ``affine_bias``. Reading one as the other is a nonlinear
-        distortion of every reconstructed component, not a gain error a scale absorbs.
-        """
+    def test_a_zeroed_scale_is_the_zero_vector_on_either_grid(self):
+        """Not approximately: the reconstruction is a product and one factor is exactly zero."""
         sink_module = turboquant_sink()
         codes = torch.arange(16, dtype=torch.int8)
         # One nibble pair per byte, low nibble first, with the writer's -128 bias.
         packed = (codes + 16 * codes - 128).to(torch.int8).view(1, 1, 16)
         lloyd_max = sink_module.turboquant_dequantize(packed).flatten()[0::2]
         affine = codes.to(torch.float32) - self.AFFINE_BIAS
-        self.assertEqual(lloyd_max.numel(), affine.numel())
 
+        # The two grids really are different: evenly spaced about the bias against packed
+        # towards zero. Reading one as the other is a nonlinear distortion of every
+        # component, which is what no scale could have absorbed.
         def unit(levels):
             return levels / levels.abs().max()
 
-        self.assertFalse(torch.allclose(unit(lloyd_max), unit(affine), atol=0.05))
-        # Evenly spaced against not: the gap between adjacent levels is constant for one
-        # grid and varies by more than 2x across the other.
         affine_gaps = unit(affine).diff()
         lloyd_gaps = unit(lloyd_max).diff()
         self.assertLess(float(affine_gaps.max() / affine_gaps.min()), 1.0 + 1e-5)
         self.assertGreater(float(lloyd_gaps.max() / lloyd_gaps.min()), 2.0)
 
-    def test_the_cube_backend_refuses_sinks_rather_than_scoring_a_misread_cache(self):
+        # And a zero scale collapses both to the same thing, bit for bit.
+        for levels in (lloyd_max, affine):
+            self.assertEqual(int((levels * torch.zeros(1)).count_nonzero()), 0)
+
+    def test_the_decode_scores_a_neutralized_row_at_exactly_zero(self):
+        """Through the operators, on whatever bytes the writer happened to leave behind.
+
+        The row keeps its packed nibbles and its slot; only its scale lanes are zeroed.  Its
+        logit then has to be exactly ``0`` -- so it contributes exactly one unit of absolute
+        mass, a known integer rather than a measured quantity -- and no value at all.
+        """
+        length = 4 * SINK_TOKENS
+        backend = self.backend(BLOCK_SIZE)
+        key = torch.randn(length, NUM_KV_HEADS, HEAD_SIZE, dtype=DTYPE)
+        value = torch.randn(length, NUM_KV_HEADS, HEAD_SIZE, dtype=DTYPE)
+        backend.write_kv(0, key, value, backend.cache.slot_mapping(0, length))
+
+        key_plane, _, scale_plane = backend.cache.planes(0)
+        packed_rows = key_plane.view(-1, NUM_KV_HEADS, HEAD_SIZE // 2)[:SINK_TOKENS]
+        # The bytes stay: nothing about the write path changes, and a reader of the packed
+        # planes would still find a perfectly ordinary quantised vector here.
+        self.assertGreater(int(packed_rows.count_nonzero()), 0)
+        scale_plane.view(-1, scale_plane.shape[-1])[:SINK_TOKENS].zero_()
+
+        query = torch.randn(1, NUM_HEADS, HEAD_SIZE, dtype=DTYPE)
+        scores = self._scores_over_the_cache(backend, query, length)
+        torch.testing.assert_close(scores[:, :SINK_TOKENS], torch.zeros(NUM_HEADS, SINK_TOKENS))
+        self.assertGreater(int(scores[:, SINK_TOKENS:].count_nonzero()), 0)
+
+        # And what the operator returns is attention over exactly that context.
+        out = torch.zeros(1, NUM_HEADS, HEAD_SIZE, dtype=DTYPE)
+        backend.decode(0, query, torch.full((1,), length, dtype=torch.int32), out)
+        self.assertGreater(cosine(out, self.attention_over_the_cache(backend, query, length)), EXACT_COSINE)
+
+    def test_the_backend_neutralizes_what_it_ingested(self):
+        """``write_kv`` stores the sinks and takes their quantised copies out, in that order."""
+        length = 4 * SINK_TOKENS
         geometry = _geometry(BLOCK_SIZE)
         shape = LayerShape(NUM_HEADS, NUM_KV_HEADS, HEAD_SIZE, HEAD_SIZE**-0.5)
-        with self.assertRaisesRegex(ValueError, "turboquant_cube"):
-            ops_module.TurboQuantCubeBackend(
-                geometry, shape, CPU, sink_tokens=SINK_TOKENS, activation_dtype=torch.float16
-            )
+        backend = ops_module.TurboQuantAivBackend(geometry, shape, CPU, sink_tokens=SINK_TOKENS, activation_dtype=DTYPE)
+        key = torch.randn(length, NUM_KV_HEADS, HEAD_SIZE, dtype=DTYPE)
+        value = torch.randn(length, NUM_KV_HEADS, HEAD_SIZE, dtype=DTYPE)
+        backend.write_kv(0, key, value, backend.cache.slot_mapping(0, length))
 
-    def test_the_run_is_refused_before_its_weights_load(self):
-        with self.assertRaisesRegex(ValueError, "NZ-tiled"):
-            RunnerConfig(model_path="/nowhere", backend="turboquant_cube", sink_tokens=SINK_TOKENS)
-        # And with sinks off, turboquant_cube is untouched: it is the authoritative path.
-        RunnerConfig(model_path="/nowhere", backend="turboquant_cube", sink_tokens=0)
+        _, _, scale_plane = backend.cache.planes(0)
+        flat = scale_plane.view(-1, scale_plane.shape[-1])
+        self.assertEqual(int(flat[:SINK_TOKENS].count_nonzero()), 0)
+        self.assertGreater(int(flat[SINK_TOKENS:length].count_nonzero()), 0)
+        # The side-car kept the exact copies the decode will be given instead.
+        self.assertTrue(torch.equal(backend._sink_caches[0].planes[0, 0], key[:SINK_TOKENS]))
+        # Every other layer is untouched: the ingestion is per layer, like the cache it rides.
+        for layer in range(1, backend.geometry.num_layers):
+            self.assertEqual(int(backend.cache.planes(layer)[2].count_nonzero()), 0)
+            self.assertEqual(int(backend._sink_caches[layer].planes.count_nonzero()), 0)
 
-    def test_a_sweep_over_the_cube_backend_is_refused_up_front(self):
-        refuse_sinks_on_an_unreadable_cache(("turboquant_aiv",), (0, 4))
-        refuse_sinks_on_an_unreadable_cache(("turboquant_cube",), (0,))
-        with self.assertRaisesRegex(SystemExit, "turboquant_cube"):
-            refuse_sinks_on_an_unreadable_cache(("turboquant_aiv", "turboquant_cube"), (0, 4))
+    def _scores_over_the_cache(self, backend, query: torch.Tensor, context_len: int) -> torch.Tensor:
+        """``[num_heads, context_len]`` logits, from what the cache actually holds."""
+        layout, rotation = turboquant_layout(), turboquant_rotation()
+        centroids = torch.tensor(layout.TURBOQUANT_LLOYD_MAX_CENTROIDS, dtype=torch.float32)
+        heads = backend.shape
+        key_plane, _, scale_plane = backend.cache.planes(0)
+        rows = torch.arange(context_len)
+        packed = (-1, heads.num_kv_heads, heads.head_size // 2)
+        scales = scale_plane.view(-1, scale_plane.shape[-1])[rows, : heads.num_kv_heads]
+        keys = self.stand_ins.dequantize(key_plane.view(packed)[rows], centroids) * scales.unsqueeze(-1)
+        keys = keys.repeat_interleave(heads.num_heads // heads.num_kv_heads, dim=1)
+        signs = rotation.turboquant_pi_signs(heads.head_size, CPU)
+        rotated = rotation.apply_pi(query.to(torch.float32), signs)
+        return torch.einsum("thd,lhd->hl", rotated, keys) * heads.scale
+
 
 class TestSinkRunnerConfig(unittest.TestCase):
     """What a run with sinks is and is not allowed to be."""
@@ -5611,10 +5633,14 @@ class TestSinkRunnerConfig(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot be negative"):
             self.config(sink_tokens=-1)
 
-    def test_the_incompatible_roster_is_the_one_the_constructor_enforces(self):
-        """The up-front refusal and the constructor's must name the same backends."""
-        for backend in SINK_INCOMPATIBLE_BACKENDS:
-            with self.subTest(backend=backend), self.assertRaises(ValueError):
+    def test_the_cube_backend_is_no_longer_refused(self):
+        """The merge reads no packed byte, so the NZ-tiled affine kv4fp8 cache serves it too.
+
+        Both TurboQuant backends take sinks now; what is still refused is a prefill that
+        would attend through the quantised cache, which is the axis above.
+        """
+        for backend in ("turboquant_cube", "turboquant_aiv"):
+            with self.subTest(backend=backend):
                 RunnerConfig(model_path="/nowhere", backend=backend, sink_tokens=SINK_TOKENS)
 
 
