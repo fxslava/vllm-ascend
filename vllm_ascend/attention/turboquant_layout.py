@@ -79,7 +79,11 @@ TURBOQUANT_LLOYD_MAX_THRESHOLDS = (
     2.4008033987632817,
 )
 
+# The writer stores each nibble pair as ``low + 16 * high - 128``; see turboquant_dequantize.
+_INT8_CODE_BIAS = 128
+
 _CODEC_TABLE_CACHE: dict[tuple[int, int, str], torch.Tensor] = {}
+_CENTROID_CACHE: dict[tuple[str, str], torch.Tensor] = {}
 _HADAMARD16_CACHE: dict[str, torch.Tensor] = {}
 
 TURBOQUANT_ROTATE_TILE = 16
@@ -195,3 +199,34 @@ def turboquant_codec_tables(head_size: int, batch_rows: int, device: torch.devic
         raise RuntimeError(f"codec table image is {tables.numel()} words, expected {expected}")
     _CODEC_TABLE_CACHE[key] = tables
     return tables
+
+
+def turboquant_dequantize(packed: torch.Tensor, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Expand packed 4-bit codes back to their Lloyd-Max levels, low nibble first.
+
+    ``packed`` is ``[..., head_size // 2]`` int8 straight out of a cache plane, and the
+    result is ``[..., head_size]`` bare reconstruction levels -- the per-vector scale in
+    the scale plane still has to be applied on top.  Mirrors ``Dequantize4Bit`` in
+    ``csrc/attention/turboquant/op_kernel/common/turboquant_codec_950.h``: the writer
+    stores ``low + 16 * high - 128``, so the bias comes off before the nibbles split.
+
+    This is the host's only reader of the packed format, and it lives here rather than
+    beside its caller for the reason the codec tables do: a second copy of the grid would
+    not raise, it would decode the cache against the wrong levels and return plausible
+    numbers.
+    """
+    if packed.dtype != torch.int8:
+        raise ValueError(f"the packed 4-bit cache is int8, got {packed.dtype}")
+    byte = packed.to(torch.int32) + _INT8_CODE_BIAS
+    codes = torch.stack((byte % TURBOQUANT_LEVELS, byte // TURBOQUANT_LEVELS), dim=-1).flatten(-2)
+    centroids = _centroid_table(packed.device, dtype)
+    return centroids[codes.to(torch.long)]
+
+
+def _centroid_table(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    key = (str(device), str(dtype))
+    cached = _CENTROID_CACHE.get(key)
+    if cached is None:
+        cached = torch.tensor(TURBOQUANT_LLOYD_MAX_CENTROIDS, dtype=dtype, device=device)
+        _CENTROID_CACHE[key] = cached
+    return cached

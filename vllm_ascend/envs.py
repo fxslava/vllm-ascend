@@ -163,6 +163,25 @@ env_variables: dict[str, Callable[[], Any]] = {
     # visits only a handful of distinct shapes, so the file stays small and is what an offline
     # unit test replays.
     "TURBOQUANT_RECORD_CASES": lambda: bool(int(os.getenv("TURBOQUANT_RECORD_CASES", "0"))),
+    # Keep the first N tokens of every sequence out of the 4-bit quantisation and attend to
+    # them at full precision (vllm_ascend/attention/turboquant_sink.py). 0 (default): off, and
+    # every TurboQuant path below is byte-for-byte the one that ships. A value in
+    # [1, TURBOQUANT_MAX_SINK_TOKENS] keeps that many *attention sink* tokens in an
+    # uncompressed fp16/bf16 side-car plane and folds their exact contribution back into the
+    # decode's softmax on the host. 4 is what the retrieval ablation used.
+    #
+    # The side-car costs 2 * num_blocks * N * num_kv_heads * head_size activation elements per
+    # layer -- about 8 KiB per sequence per layer at N=4, H_KV=8, D=128 -- and is carved
+    # nowhere near the paged allocator: see TurboQuantSinkCache for why it is indexed by the
+    # physical block that holds a sequence's logical block 0.
+    #
+    # Host-side fusion, so it is a correctness and ergonomics vehicle rather than a serving
+    # default: the decode operators return a *normalised* attention output and no softmax
+    # denominator, and the denominator cannot be recovered from a normalised output, so the
+    # weight the sink stream has to be merged against is recomputed on the host at O(context)
+    # per decode step. The kernels already materialise it (kPartialSumLane in the split
+    # workspace); exposing it is what makes this free.
+    "VLLM_ASCEND_TQ_SINK_TOKENS": lambda: int(os.getenv("VLLM_ASCEND_TQ_SINK_TOKENS", "0")),
 }
 
 # end-env-vars-definition

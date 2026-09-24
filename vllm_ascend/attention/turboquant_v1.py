@@ -111,6 +111,15 @@ from vllm_ascend.attention.turboquant_layout import (  # noqa: F401  (re-export)
 )
 from vllm_ascend.attention.turboquant_rotation import output_rotation_is_folded, turboquant_pi_signs
 
+# Uncompressed attention sinks: the side-car plane, its ingestion, and the host-side
+# softmax merge that folds it back into a decode. Inert unless VLLM_ASCEND_TQ_SINK_TOKENS
+# is set -- see turboquant_sink for the layout and for what the merge still costs.
+from vllm_ascend.attention.turboquant_sink import (
+    TurboQuantSinkCache,
+    TurboQuantSinkConfig,
+    fuse_decode_sinks,
+)
+
 # The diagnostic capture layer: what the operators were handed, appended to its own
 # line-buffered file, and the dry run that walks the engine past the launches so a
 # whole run's configuration can be recorded rather than the first faulting step's.
@@ -301,6 +310,12 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
     cube_decode = False
     output_rotation_folded = False
 
+    # Class-level for the same reason cube_decode is: activate_turboquant_backend swaps the
+    # class of an already-built impl, so every attribute the methods below read has to exist
+    # before __init__ would have set it. Sinks off is the shipping configuration.
+    sink_config = TurboQuantSinkConfig()
+    sink_cache = None
+
     # Which layer this is and how many times it has been entered, for the trace records.
     # Class-level for the same reason as above, and because everything downstream of
     # `forward` reads them: a record written from the cache writer has to name the layer
@@ -325,6 +340,8 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         self._hadamard16: torch.Tensor | None = None
         self.output_rotation_folded = False
         self.cube_decode = turboquant_cube_decode_selected(_model_dtype(self))
+        self.sink_config = TurboQuantSinkConfig.from_env()
+        self.sink_cache: TurboQuantSinkCache | None = None
 
     @property
     def fuses_output_gate(self) -> bool:
@@ -426,6 +443,129 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
                 "plane from the KV cache allocation so there is nothing left to allocate here."
             )
         self.scale_cache = torch.zeros(shape, dtype=torch.float32, device=kv_cache[0].device)
+
+    def _ensure_sink_cache(self, kv_cache: tuple[torch.Tensor, ...], dtype: torch.dtype) -> None:
+        """Bind the uncompressed sink plane, once, if the feature is on.
+
+        Sized from the packed cache it accompanies and indexed by the same physical block,
+        so it is allocated here rather than budgeted by the KV cache spec: the two packed
+        planes and the scale plane are what the paged allocator accounts for, and this one
+        is deliberately outside that accounting because it is not paged -- a block's sink
+        row is written once, when the sequence that anchors the block is ingested.
+
+        Refused during a graph capture for the reason :meth:`_ensure_scale_cache` refuses:
+        a replay owns the addresses it was captured against.
+        """
+        if not self.sink_config.enabled or self.sink_cache is not None:
+            return
+        num_blocks, block_size, num_kv_heads, _ = kv_cache[0].shape
+        if _is_capturing():
+            raise RuntimeError(
+                "[vllm-ascend/turboquant] the uncompressed sink plane would have to be allocated during a "
+                "graph capture. Run this layer once outside capture, or unset VLLM_ASCEND_TQ_SINK_TOKENS."
+            )
+        self.sink_cache = TurboQuantSinkCache(
+            num_blocks=num_blocks,
+            block_size=block_size,
+            num_sink_tokens=self.sink_config.num_sink_tokens,
+            num_kv_heads=num_kv_heads,
+            head_size=self.head_size,
+            dtype=dtype,
+            device=kv_cache[0].device,
+        )
+        logger.info_once(
+            "[vllm-ascend/turboquant] VLLM_ASCEND_TQ_SINK_TOKENS=%d: the first %d tokens of each sequence are "
+            "kept uncompressed in a %.1f MiB side-car plane (%d bytes per sequence per layer) and merged into "
+            "the decode's softmax on the host. The merge recomputes the quantised context's softmax denominator, "
+            "which neither decode operator returns, so it costs O(context) per step: diagnostic and accuracy "
+            "work, not a serving default.",
+            self.sink_config.num_sink_tokens,
+            self.sink_config.num_sink_tokens,
+            self.sink_cache.nbytes / (1 << 20),
+            self.sink_cache.bytes_per_sequence,
+        )
+
+    def _ingest_sinks(self, key: torch.Tensor, value: torch.Tensor, attn_metadata: AscendMetadata) -> int:
+        """Store each sequence's leading tokens uncompressed, beside the write that packed them.
+
+        Runs on every cache write, not only on prefill: a sequence shorter than the sink
+        count is still filling its sinks a decode token at a time, and the ingestion is
+        driven by each token's position in its *sequence*. Once every sequence in the batch
+        is past its sinks -- which is every steady-state decode step -- this finds nothing
+        to copy and returns without touching the device.
+        """
+        ends = list(attn_metadata.actual_seq_lengths_q or ())
+        if not ends or self.sink_cache is None:
+            return 0
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        starts = [0, *ends[:-1]]
+        # Host tensors on purpose (see _decode_seq_lens): reading them costs no
+        # synchronisation, and the ingestion is driven entirely by these indices.
+        seq_lens = attn_metadata.seq_lens_list or attn_metadata.seq_lens.tolist()
+        query_starts, query_lens, context_lens = [], [], []
+        for request, (start, end) in enumerate(zip(starts, ends)):
+            # A request that contributes nothing is described rather than dropped: the
+            # anchor blocks are handed over as one row per request, so a gap in these lists
+            # would shift every later request onto the wrong sequence's block. The FIA TND
+            # layout leaves exactly such a request -- a dummy past the last real token, which
+            # reshape_and_cache does not write and neither does this.
+            length = max(0, min(end, num_actual_tokens) - start)
+            described = request < len(seq_lens)
+            query_starts.append(start)
+            query_lens.append(length if described else 0)
+            context_lens.append(max(0, int(seq_lens[request]) - length) if described else 0)
+        if not any(query_lens):
+            return 0
+        return self.sink_cache.ingest(
+            key,
+            value,
+            anchor_blocks=attn_metadata.block_tables[: len(ends), 0],
+            query_starts=query_starts,
+            query_lens=query_lens,
+            context_lens=context_lens,
+        )
+
+    def _fuse_decode_sinks(
+        self,
+        attention_output: torch.Tensor,
+        query: torch.Tensor,
+        rotated_query: torch.Tensor,
+        attn_metadata: AscendMetadata,
+    ) -> None:
+        """Replace the quantised sinks in a decode's output with the uncompressed ones.
+
+        ``attention_output`` is still in the rotated basis here, which is what both decodes
+        are asked to produce while this is on: the un-rotation and any output gate are
+        linear in the output and are applied after the merge, not before it.
+        """
+        if self.sink_cache is None:
+            return
+        fuse_decode_sinks(
+            attention_output=attention_output,
+            query=query,
+            rotated_query=rotated_query,
+            sink_cache=self.sink_cache,
+            key_cache=self.key_cache,
+            value_cache=self.value_cache,
+            scale_cache=self.scale_cache,
+            block_tables=self._device_index(attn_metadata.block_tables, query.device, "block_tables"),
+            seq_lens=attn_metadata.seq_lens,
+            num_kv_heads=self.num_kv_heads,
+            num_heads=self.num_heads,
+            scale_value=self.scale,
+            pi_signs=self.pi_signs(query.device),
+        )
+
+    def _unrotate_output(self, attention_output: torch.Tensor, rotated_query: torch.Tensor) -> None:
+        """``O = Pi O~`` on the device, through the rotation operator and its scratch."""
+        torch.ops._C_ascend.npu_turboquant_rotate_q(
+            attention_output,
+            self.pi_signs(attention_output.device),
+            self.codec_tables(attention_output.device, 1),
+            self.hadamard16(attention_output.device),
+            rotated_query,
+        )
+        attention_output.copy_(rotated_query)
 
     def _validate_cache_write(self, key: torch.Tensor, value: torch.Tensor, slots: torch.Tensor) -> None:
         """Hold one cache write to what the kernels can address, before the launch.
@@ -590,6 +730,7 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             return query, key, value, output
 
         self._ensure_scale_cache(kv_cache)
+        self._ensure_sink_cache(kv_cache, key.dtype)
         num_actual_tokens = attn_metadata.num_actual_tokens
         encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
         slots = attn_metadata.slot_mapping if encoder_decoder else attn_metadata.slot_mapping[:num_actual_tokens]
@@ -669,6 +810,11 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             )
             if envs_ascend.VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS:
                 self._fence_cache_write(key.device)
+            # After the packed write, not instead of it: a sink is quantised into the paged
+            # cache exactly as before, and kept here as well, so the decode's context stays
+            # a contiguous prefix and only the merge below knows the difference.
+            if self.sink_config.enabled:
+                self._ingest_sinks(cached_key, cached_value, attn_metadata)
         # Announced either way: a dry run leaves the cache empty, but the rest of the
         # engine still has to be told the write path ran, or a KV connector waits for
         # an event that is never recorded and the run stops before it has traced anything.
@@ -998,15 +1144,10 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             self.scale,
             attention_output,
         )
+        if self.sink_config.enabled:
+            self._fuse_decode_sinks(attention_output, query, rotated_query, attn_metadata)
         if not self.output_rotation_folded:
-            torch.ops._C_ascend.npu_turboquant_rotate_q(
-                attention_output,
-                self.pi_signs(query.device),
-                self.codec_tables(query.device, 1),
-                self.hadamard16(query.device),
-                rotated_query,
-            )
-            attention_output.copy_(rotated_query)
+            self._unrotate_output(attention_output, rotated_query)
         if envs_ascend.VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS:
             self._fence_decode(query.device)
         return output
@@ -1097,12 +1238,20 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         )
 
     def _cube_output_stage(self, output_gate: torch.Tensor | None) -> TurboQuantOutputStage:
+        if self.output_rotation_folded and output_gate is not None:
+            raise ValueError(
+                "[vllm-ascend/turboquant] a layer with Pi folded into o_proj cannot carry an output gate: "
+                "the gate sits between attention and o_proj, where the output is still rotated"
+            )
+        if self.sink_config.enabled:
+            # The merge is a rescaling of the whole softmax, so it has to see the raw
+            # rotated accumulator: un-rotating or gating first would have the launch apply
+            # a transform to a numerator whose denominator is about to change. Both are
+            # linear, so both are re-applied on the host after the merge, at the cost of
+            # the launch fusion this stage exists to provide. Exposing the softmax
+            # denominator as a decode output is what would give it back.
+            return TurboQuantOutputStage.ROTATED_BASIS
         if self.output_rotation_folded:
-            if output_gate is not None:
-                raise ValueError(
-                    "[vllm-ascend/turboquant] a layer with Pi folded into o_proj cannot carry an output gate: "
-                    "the gate sits between attention and o_proj, where the output is still rotated"
-                )
             return TurboQuantOutputStage.ROTATED_BASIS
         return TurboQuantOutputStage.UNROTATED if output_gate is None else TurboQuantOutputStage.GATED
 
@@ -1126,6 +1275,9 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         device = query.device
         stage = self._cube_output_stage(output_gate)
         gate = None if output_gate is None else output_gate[:num_tokens].contiguous()
+        # Handed to the launch only where the launch is the one applying it; with sinks on
+        # the stage is ROTATED_BASIS and the gate is applied below, after the merge.
+        launch_gate = None if self.sink_config.enabled else gate
         # Staged onto the device for the reason forward_paged_attention stages them --
         # seq_lens reaches the backend on the host and this launch reads it from global
         # memory (see _device_index) -- and hoisted for the reason it hoists: the trace
@@ -1157,7 +1309,7 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
 
         torch.ops._C_ascend.npu_turboquant_cube_decode(
             query.contiguous(),
-            gate,
+            launch_gate,
             self.pi_signs(device),
             self.codec_tables(device, 1),
             self.hadamard16(device),
@@ -1174,6 +1326,12 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             int(stage),
             attention_output,
         )
+        if self.sink_config.enabled:
+            self._fuse_decode_sinks(attention_output, query, rotated_query, attn_metadata)
+            if not self.output_rotation_folded:
+                self._unrotate_output(attention_output, rotated_query)
+            if gate is not None:
+                attention_output.mul_(torch.sigmoid(gate).view_as(attention_output))
         if envs_ascend.VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS:
             self._fence_decode(device)
         return output
@@ -1381,6 +1539,8 @@ def activate_turboquant_backend(layer: torch.nn.Module) -> None:
         impl.rotated_query = None
         impl._hadamard16 = None
         impl._device_index_buffers = None
+        impl.sink_config = TurboQuantSinkConfig.from_env()
+        impl.sink_cache = None
         impl._trace_step = 0
         impl._trace_phase = "unknown"
         impl.cube_decode = turboquant_cube_decode_selected(_model_dtype(impl))
