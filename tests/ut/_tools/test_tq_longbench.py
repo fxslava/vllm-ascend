@@ -4545,17 +4545,62 @@ class TestStandaloneTurboQuantLibrary(unittest.TestCase):
         shape = LayerShape(NUM_HEADS, NUM_KV_HEADS, HEAD_SIZE, HEAD_SIZE**-0.5)
         return TurboQuantCubeBackend(_geometry(512), shape, CPU)
 
-    def test_the_default_search_is_the_build_script_output_then_build(self):
+    def test_the_default_search_is_the_build_script_output_then_the_test_tree(self):
         candidates = _ascend.turboquant_library_candidates()
         self.assertEqual(candidates[0], REPO_ROOT / "tools" / "tq_longbench" / "lib" / _ascend.TURBOQUANT_LIB_NAME)
-        self.assertEqual(candidates[1], REPO_ROOT / "build" / _ascend.TURBOQUANT_LIB_NAME)
+        # The RUN_MODE=npu csrc/tests tree, flat and under lib/, then the plain build dir.
+        self.assertEqual(
+            candidates[1:],
+            [
+                REPO_ROOT / _ascend.TURBOQUANT_TEST_BUILD_DIR / _ascend.TURBOQUANT_LIB_NAME,
+                REPO_ROOT / _ascend.TURBOQUANT_TEST_BUILD_DIR / "lib" / _ascend.TURBOQUANT_LIB_NAME,
+                REPO_ROOT / "build" / _ascend.TURBOQUANT_LIB_NAME,
+            ],
+        )
+
+    def test_a_build_dir_is_searched_first_and_in_both_spellings(self):
+        """``$ASCEND_TQ_BUILD_DIR`` adds candidates; it does not replace the search.
+
+        Both spellings because a CMake tree puts its shared libraries under ``lib/`` while a
+        staged directory usually holds them flat, and a host exporting the variable for the
+        dynamic linker should not have to know which of the two this is.
+        """
+        os.environ[_ascend.TURBOQUANT_BUILD_DIR_ENV] = str(self.library.parent)
+        candidates = _ascend.turboquant_library_candidates()
+        self.assertEqual(candidates[0], self.library)
+        self.assertEqual(candidates[1], self.library.parent / "lib" / _ascend.TURBOQUANT_LIB_NAME)
+        # And the defaults are still behind them, rather than displaced.
+        self.assertIn(REPO_ROOT / "tools" / "tq_longbench" / "lib" / _ascend.TURBOQUANT_LIB_NAME, candidates)
+        self.assertEqual(len(candidates), len(set(candidates)), "a repeated candidate would be reported twice")
+
+    def test_the_library_path_still_wins_over_a_build_dir(self):
+        """One variable asks for a specific file; the other only says where else to look."""
+        other = self.library.parent / "other"
+        other.mkdir()
+        os.environ[_ascend.TURBOQUANT_BUILD_DIR_ENV] = str(other)
+        os.environ[_ascend.TURBOQUANT_LIB_ENV] = str(self.library)
+        self.assertEqual(_ascend.turboquant_library_candidates(), [self.library])
+
+    def test_a_build_dir_is_searched_even_when_it_does_not_exist_yet(self):
+        """The report has to name a path that is missing; that is the whole point of it."""
+        missing = self.library.parent / "not-built-yet"
+        os.environ[_ascend.TURBOQUANT_BUILD_DIR_ENV] = str(missing)
+        candidates = _ascend.turboquant_library_candidates()
+        self.assertEqual(candidates[0], missing / _ascend.TURBOQUANT_LIB_NAME)
+        self.assertFalse(candidates[0].exists())
+
 
     def test_the_environment_replaces_the_search(self):
         os.environ[_ascend.TURBOQUANT_LIB_ENV] = str(self.library)
         self.assertEqual(_ascend.turboquant_library_candidates(), [self.library])
-        # A directory names the library inside it.
+        # A directory names the library inside it, in both spellings -- flat and under
+        # lib/ -- and still replaces the search rather than joining it: none of the
+        # defaults come back.
         os.environ[_ascend.TURBOQUANT_LIB_ENV] = str(self.library.parent)
-        self.assertEqual(_ascend.turboquant_library_candidates(), [self.library])
+        self.assertEqual(
+            _ascend.turboquant_library_candidates(),
+            [self.library, self.library.parent / "lib" / _ascend.TURBOQUANT_LIB_NAME],
+        )
 
     def test_the_cube_backend_loads_the_library_when_the_decode_is_missing(self):
         os.environ[_ascend.TURBOQUANT_LIB_ENV] = str(self.library)
@@ -4647,6 +4692,97 @@ class TestStandaloneTurboQuantLibrary(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, r"not registered.*\$TURBOQUANT_LIB_PATH"):
             self._cube_backend()
         loader.assert_not_called()
+
+
+class TestTurboQuantSchemaFreshness(unittest.TestCase):
+    """Refusing a registration that predates the ``lse`` out-tensor, before any launch.
+
+    This is the failure a shared container produces: an older extension reachable on the
+    Python path registers the operators first, and registration is global and permanent, so
+    no library loaded afterwards can replace it. The dispatcher's own complaint --
+    "expected at most 17 argument(s) but received 18" -- arrives from inside a decode step,
+    minutes after the weights loaded, and names neither the file nor the argument.
+    """
+
+    #: The paged decode as it was before 13.37: the same name, one argument short.
+    STALE_SCHEMA = (
+        "npu_turboquant_paged_attention(Tensor query_rot, Tensor key_cache, Tensor value_cache, "
+        "Tensor scale_cache, Tensor block_tables, Tensor context_lens, Tensor codec_tables, "
+        "Tensor! workspace, int num_kv_heads, int num_heads, float scale_value, Tensor! out) -> ()"
+    )
+
+    def setUp(self):
+        ops_module.forget_turboquant_schema_check()
+        self.addCleanup(ops_module.forget_turboquant_schema_check)
+
+    @contextlib.contextmanager
+    def _stale_registration(self):
+        """Register the pre-13.37 paged decode under its real name, and take it back down."""
+        library = torch.library.Library(ops_module._ASCEND_NAMESPACE, "FRAGMENT")
+        library.define(self.STALE_SCHEMA)
+        try:
+            yield
+        finally:
+            library._destroy()
+
+    def test_the_current_stand_ins_are_accepted(self):
+        with cpu_turboquant_ops() as stand_ins, stand_ins.turboquant_cube_meta_ops():
+            _ascend.assert_turboquant_schema_is_fresh()
+            report = _ascend.turboquant_schema_report()
+        self.assertTrue(all("lse = yes" in line for line in report), report)
+
+    def test_a_stale_registration_is_refused_with_the_schema_and_the_search(self):
+        with self._stale_registration():
+            with self.assertRaisesRegex(RuntimeError, "predate the 'lse'") as raised:
+                _ascend.assert_turboquant_schema_is_fresh()
+            message = str(raised.exception)
+        # The schema it actually found, so a reader can count the arguments themselves.
+        self.assertIn("npu_turboquant_paged_attention registered as:", message)
+        self.assertIn("float scale_value", message)
+        # That loading another library cannot fix it, which is the non-obvious part.
+        self.assertIn("global and permanent", message)
+        # And where a current one would be looked for.
+        self.assertIn(_ascend.TURBOQUANT_BUILD_DIR_ENV, message)
+        self.assertIn(_ascend.TURBOQUANT_LIB_NAME, message)
+
+    def test_an_unregistered_operator_is_not_mistaken_for_a_stale_one(self):
+        """Absent and stale are different problems with the same symptom at the call site."""
+        _ascend.assert_turboquant_schema_is_fresh()
+        self.assertTrue(all("not registered" in line for line in _ascend.turboquant_schema_report()))
+
+    def test_the_report_names_the_argument_count(self):
+        with self._stale_registration():
+            report = _ascend.turboquant_schema_report()
+        paged = next(line for line in report if line.startswith("npu_turboquant_paged_attention"))
+        self.assertIn("12 args", paged)
+        self.assertIn("'lse' is missing", paged)
+
+    def test_ascend_ops_refuses_a_stale_registration_before_a_launch(self):
+        """The check has to be on the path every backend takes, not beside it."""
+        with self._stale_registration(), cpu_turboquant_ops() as stand_ins:
+            del stand_ins
+            with self.assertRaisesRegex(RuntimeError, "predate the 'lse'"):
+                ascend_ops()
+
+    def test_the_check_runs_once_per_registration_not_once_per_process(self):
+        with cpu_turboquant_ops() as stand_ins, stand_ins.turboquant_cube_meta_ops():
+            ascend_ops()
+        ops_module.forget_turboquant_schema_check()
+        with self._stale_registration(), cpu_turboquant_ops() as stand_ins:
+            del stand_ins
+            with self.assertRaisesRegex(RuntimeError, "predate the 'lse'"):
+                ascend_ops()
+
+    def test_the_mapped_libraries_are_read_from_procfs_where_there_is_one(self):
+        """What names the file that won. Skipped off Linux, where there is nothing to read."""
+        if not Path("/proc/self/maps").is_file():
+            self.skipTest("no procfs on this host")
+        self.assertTrue(_ascend.loaded_library_paths("libtorch"), "torch itself must be mapped")
+        self.assertEqual(
+            _ascend.loaded_library_paths("a-name-nothing-is-called"),
+            [],
+            "a needle that matches nothing must come back empty rather than guessing",
+        )
 
 
 class TestBuildTurboQuantOps(unittest.TestCase):

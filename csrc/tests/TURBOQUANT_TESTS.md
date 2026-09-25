@@ -4423,3 +4423,61 @@ device tier and packages the hardware run so it needs no judgement at the consol
   compile gate.
 - Nothing prices the sink merge's extra launches, on the camodel or on silicon.
 
+
+**Addendum 2026-09-25: which library the harness launches, and refusing a stale one.**
+On a shared container with an older extension reachable on the Python path, stage 2 died
+with `_C_ascend::npu_turboquant_cube_decode() expected at most 17 argument(s) but received
+18` -- the pre-13.37 schema, registered by something else before the harness looked.
+
+**Two facts shape the fix, and the first one is not obvious.**
+
+1. **Registration is global and permanent.** Once any library has `def`-ed
+   `_C_ascend::npu_turboquant_cube_decode`, a second library defining the same name
+   *raises* rather than replacing it. Loading a fresh `.so` afterwards cannot correct a
+   stale schema. The only fix is to stop the stale library loading; the only useful thing
+   the harness can do is say which file it was, before a launch rather than during one.
+2. **A `csrc/tests` build tree contains no torch binding.** Its
+   `lib/libvllm_ascend_turboquant.so` is the Ascend C kernel library and nothing else --
+   `readelf -d` shows no `libc10` and no `libtorch_npu` among its `NEEDED` entries, because
+   that tier is configured without Python, PyTorch or torch_npu on purpose. Handing it to
+   `torch.ops.load_library` succeeds and registers nothing. The operators come only from
+   `libvllm_turboquant_cube.so`, which `tools/tq_longbench/build_turboquant_ops.py`
+   produces (and which does carry `libc10`, `libtorch_npu` and
+   `libvllm_turboquant_cube_kernels.so`). Neither path needs `setup.py` or `pip install`.
+
+**What changed.**
+- `turboquant_library_candidates()` searches `$ASCEND_TQ_BUILD_DIR` first, then the build
+  script's install directory, then `build/csrc-tests-npu/` and `build/`. A directory
+  candidate is tried both flat and under `lib/`, because a CMake tree puts its libraries in
+  the latter and a staged directory in the former. `$TURBOQUANT_LIB_PATH` still replaces
+  the search outright; `$ASCEND_TQ_BUILD_DIR` only adds to it.
+- `assert_turboquant_schema_is_fresh()` reads each decode's registered schema off its
+  *overload* -- an `OpOverloadPacket` carries no `_schema`, so reading one off the packet is
+  a check that can only ever pass -- and refuses a registration missing the `lse` argument.
+  The message carries the schema it found, every mapped file named `_C_ascend` or
+  `turboquant` from `/proc/self/maps` (the dispatcher records no provenance for a schema),
+  the note that loading another library will not help, and every path a current one would
+  be looked for at. `ascend_ops()` runs it once per registration, so it is on the path every
+  backend takes rather than beside it.
+- `tools/tq_longbench/check_turboquant_ops.py` is the same check as a CLI: seconds, no
+  checkpoint, no dataset, no device. Exit 0 fresh, 1 stale, 2 nothing registered.
+  `run_950pr_sink_lse_benchmark.sh` runs it before the sweep and stops on it, exports
+  `ASCEND_TQ_BUILD_DIR` and prepends the build tree to `LD_LIBRARY_PATH`, and keeps the
+  whole preflight output in the report as `turboquant_ops_check.log`.
+- **`npu-smi` is no longer fatal in either script.** It goes through DCMI, which returns
+  -8005 inside a shared container on hosts whose devices a run can still open; refusing
+  there blocks a working setup on the strength of a management interface. What decides
+  whether the operators can run is the runtime's own device open -- the test binaries refuse
+  a CAModel themselves, the benchmark exits 77, and a suite that quietly skipped is caught
+  by stage 2's SKIPPED count, which is a failure there.
+
+**Verification.** `tests/ut/_tools/test_tq_longbench.py` gained
+`TestTurboQuantSchemaFreshness` and three search-order cases: 59 failed / 288 passed
+against 59 / 278, the failing set unchanged (the pre-existing "vLLM leaked into the
+process" family) and the ten new cases green. The stale path is exercised by registering
+the real pre-13.37 schema under its own name and asserting on the refusal. On Linux,
+`loaded_library_paths` was confirmed against procfs to return real `libtorch` paths, so a
+stale file will be named. The CLI was run in the vendor image for the
+nothing-registered path (exit 2) and for a synthetic fresh registration (exit 0); the
+stale path has not been reproduced against a real older `_C_ascend`, because no host here
+has one installed.

@@ -78,6 +78,37 @@ TURBOQUANT_LIB_NAME = "libvllm_turboquant_cube.so"
 #: The Ascend C kernels the binding launches, installed beside it.
 TURBOQUANT_KERNELS_LIB_NAME = "libvllm_turboquant_cube_kernels.so"
 
+#: A build tree to take the standalone library from, searched after
+#: :data:`TURBOQUANT_LIB_ENV` and before the installed location. Unlike
+#: ``$TURBOQUANT_LIB_PATH`` this *adds* candidates rather than replacing them, so a host
+#: that exports it for the loader's kernel search can export it here too without
+#: narrowing the search to one directory.
+#:
+#: Note what a ``csrc/tests`` build tree does and does not hold. Its
+#: ``lib/libvllm_ascend_turboquant.so`` is the Ascend C kernel library and nothing else:
+#: ``csrc/tests`` is configured without Python, PyTorch or torch_npu on purpose, so that
+#: file links no ``libc10`` and registers no ``torch.ops`` schema at all -- handing it to
+#: ``torch.ops.load_library`` succeeds and registers nothing. The operators come only from
+#: :data:`TURBOQUANT_LIB_NAME`, which only ``build_turboquant_ops.py`` produces. No
+#: ``setup.py`` and no ``pip install`` anywhere on that path.
+TURBOQUANT_BUILD_DIR_ENV = "ASCEND_TQ_BUILD_DIR"
+
+#: The conventional name of the RUN_MODE=npu ``csrc/tests`` tree, relative to the
+#: checkout. Searched so that a host which staged the binding beside those binaries finds
+#: it without setting anything.
+TURBOQUANT_TEST_BUILD_DIR = Path("build") / "csrc-tests-npu"
+
+#: The operators whose schema is checked before a launch, and the argument each has to
+#: carry. ``lse`` is the softmax-statistics out-tensor both decodes grew for the
+#: uncompressed attention sinks (TURBOQUANT_TESTS.md 13.37). A library that predates it
+#: registers the same operator *names* one argument short, and the dispatcher then refuses
+#: the call with "expected at most N argument(s)" from inside a decode step -- minutes into
+#: a run, naming neither the stale file nor the feature that needs the new one.
+TURBOQUANT_SCHEMA_PROBES = {
+    "npu_turboquant_paged_attention": "lse",
+    "npu_turboquant_cube_decode": "lse",
+}
+
 _RELATIVE = Path("vllm_ascend") / "attention"
 
 
@@ -192,22 +223,166 @@ class LibraryLoad:
     detail: str
 
 
+def _library_in(directory: Path) -> list[Path]:
+    """``TURBOQUANT_LIB_NAME`` in ``directory`` and in its ``lib/``, in that order.
+
+    A CMake tree puts its shared libraries under ``lib/`` while a staged directory
+    usually holds them flat, and a caller pointing at a build tree should not have to
+    know which.
+    """
+    return [directory / TURBOQUANT_LIB_NAME, directory / "lib" / TURBOQUANT_LIB_NAME]
+
+
 def turboquant_library_candidates() -> list[Path]:
     """Where a standalone TurboQuant library may be, in the order they are tried.
 
     ``$TURBOQUANT_LIB_PATH`` (a file, or a directory holding
-    :data:`TURBOQUANT_LIB_NAME`) replaces the search rather than joining it.
-    Otherwise ``tools/tq_longbench/lib/``, where the build script installs, then
-    the checkout's ``build/``.
+    :data:`TURBOQUANT_LIB_NAME`, flat or under ``lib/``) replaces the search rather than
+    joining it: a run that asked for one build must not quietly get another.
+
+    Otherwise, in order: ``$ASCEND_TQ_BUILD_DIR``, ``tools/tq_longbench/lib/`` where the
+    build script installs, the checkout's ``build/csrc-tests-npu/``, and the checkout's
+    ``build/``. Duplicates are dropped so that a build dir which is already one of the
+    defaults is not reported twice.
     """
     override = os.environ.get(TURBOQUANT_LIB_ENV)
     if override:
         path = Path(override).expanduser()
-        return [path / TURBOQUANT_LIB_NAME if path.is_dir() else path]
-    return [
-        Path(__file__).resolve().parent / "lib" / TURBOQUANT_LIB_NAME,
-        source_root() / "build" / TURBOQUANT_LIB_NAME,
-    ]
+        return _library_in(path) if path.is_dir() else [path]
+
+    candidates: list[Path] = []
+    build_dir = os.environ.get(TURBOQUANT_BUILD_DIR_ENV)
+    if build_dir:
+        path = Path(build_dir).expanduser()
+        candidates += _library_in(path) if path.is_dir() or not path.suffix else [path]
+    candidates.append(Path(__file__).resolve().parent / "lib" / TURBOQUANT_LIB_NAME)
+    candidates += _library_in(source_root() / TURBOQUANT_TEST_BUILD_DIR)
+    candidates.append(source_root() / "build" / TURBOQUANT_LIB_NAME)
+
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for candidate in candidates:
+        if candidate not in seen:
+            seen.add(candidate)
+            unique.append(candidate)
+    return unique
+
+
+def turboquant_schema(name: str):
+    """The registered schema of ``_C_ascend::<name>``, or ``None`` if nothing answers.
+
+    The schema lives on the operator's *overload*, not on the ``OpOverloadPacket`` that
+    ``torch.ops`` hands out: a packet carries no ``_schema`` at all, so reading one off it
+    is a check that can only ever pass. ``default`` is the overload a schema with no
+    overload name registers, which is all of these.
+
+    ``None`` means "nothing here could answer" -- the operator is not registered, or what
+    stands in for it is a test double whose attributes answer to every name -- and never
+    "this library is stale", so a caller has to treat it as a pass.
+    """
+    import torch
+
+    namespace = getattr(torch.ops, "_C_ascend", None)
+    if namespace is None:
+        return None
+    operator = getattr(namespace, name, None)
+    if operator is None:
+        return None
+    schema = getattr(getattr(operator, "default", operator), "_schema", None)
+    return schema if isinstance(schema, torch._C.FunctionSchema) else None
+
+
+def loaded_library_paths(needle: str) -> list[str]:
+    """Every mapped file whose path contains ``needle``, from ``/proc/self/maps``.
+
+    This is what names the library that actually won the registration. The dispatcher
+    records no provenance for a schema, so without this a stale operator is a fact with
+    no file attached to it, and the operator cannot tell you which of several candidate
+    builds it came from. Silent where there is no procfs, which is not Linux's problem to
+    have but is worth not crashing over.
+    """
+    try:
+        with open("/proc/self/maps", encoding="utf-8") as maps:
+            lines = maps.read().splitlines()
+    except OSError:
+        return []
+    paths = {
+        line.split()[-1]
+        for line in lines
+        if len(line.split()) >= 6 and line.split()[-1].startswith("/") and needle in line.split()[-1]
+    }
+    return sorted(paths)
+
+
+def turboquant_mapped_libraries() -> list[str]:
+    """Every mapped file that could plausibly have registered the TurboQuant operators.
+
+    Both spellings, because the registration can come from the full extension (whose file
+    is named after the ``_C_ascend`` namespace) or from a standalone binding (named after
+    the kernels). An empty list means no mapped file is named after either -- not that the
+    operators are unregistered, and not that procfs is missing; the two are indistinguishable
+    from here and neither is worth guessing at in a message.
+    """
+    seen = dict.fromkeys(loaded_library_paths("_C_ascend") + loaded_library_paths("turboquant"))
+    return list(seen)
+
+
+def turboquant_schema_report() -> list[str]:
+    """One line per probed operator: its argument count, and whether it carries the probe.
+
+    For a banner and for the preflight. Operators this build never registered are
+    reported as such rather than skipped, because "the Cube decode is absent" and "the
+    Cube decode is stale" are different problems with the same symptom at the call site.
+    """
+    lines = []
+    for name, required in TURBOQUANT_SCHEMA_PROBES.items():
+        schema = turboquant_schema(name)
+        if schema is None:
+            lines.append(f"{name}: not registered")
+            continue
+        arguments = [argument.name for argument in schema.arguments]
+        carries = "yes" if required in arguments else f"NO -- '{required}' is missing"
+        lines.append(f"{name}: {len(arguments)} args, {required} = {carries}")
+    return lines
+
+
+def assert_turboquant_schema_is_fresh() -> None:
+    """Refuse a registration that predates the ``lse`` out-tensor, naming the file.
+
+    Raised here rather than left to the call because the dispatcher's own message --
+    "expected at most 17 argument(s) but received 18" -- arrives from inside a decode
+    step, after the weights have loaded, and names neither the file that registered the
+    old schema nor the argument that grew.
+
+    **A stale winner cannot be corrected from Python.** Operator registration is global
+    and permanent for the life of the process: once a library has ``def``-ed
+    ``_C_ascend::npu_turboquant_cube_decode``, loading another that defines the same name
+    raises rather than replacing it. So the only fix is to stop the stale library being
+    loaded at all, and the only useful thing to do here is to say which one it was.
+    """
+    stale = []
+    for name, required in TURBOQUANT_SCHEMA_PROBES.items():
+        schema = turboquant_schema(name)
+        if schema is None:
+            continue
+        if required not in [argument.name for argument in schema.arguments]:
+            stale.append((name, schema))
+    if not stale:
+        return
+
+    mapped = turboquant_mapped_libraries()
+    where = "\n".join(f"  loaded: {path}" for path in mapped) or "  (no mapped file is named after either)"
+    details = "\n".join(f"  {name} registered as: {schema}" for name, schema in stale)
+    raise RuntimeError(
+        "the TurboQuant operators in this process predate the 'lse' softmax-statistics out-tensor, so a "
+        f"decode would be refused mid-run with an argument count.\n{details}\n{where}\n"
+        "Operator registration is global and permanent: a second library defining the same names cannot "
+        "replace these, so loading a fresh one will not help. Stop the stale library from being loaded -- it "
+        "is one of the files above -- and let the loader find a current "
+        f"{TURBOQUANT_LIB_NAME}. Build one with tools/tq_longbench/build_turboquant_ops.py (no setup.py and "
+        f"no pip install), and point ${TURBOQUANT_LIB_ENV} or ${TURBOQUANT_BUILD_DIR_ENV} at it. Searched: "
+        + ", ".join(str(path) for path in turboquant_library_candidates())
+    )
 
 
 def load_turboquant_library(is_registered: Callable[[], bool]) -> LibraryLoad:
@@ -220,9 +395,18 @@ def load_turboquant_library(is_registered: Callable[[], bool]) -> LibraryLoad:
     repeated, so a library that loads but lacks the operator is reported as such.
     The detail names the path and the loader's own error, which is what a
     failure on the NPU host needs to be diagnosed from a log.
+
+    When the operators were already there, the detail names the mapped files that could
+    have registered them. "Already registered" on its own is the least useful thing this
+    can say on a host with more than one build of the extension installed, which is
+    exactly where it matters: a stale one that got in first cannot be replaced, and the
+    first question is then which file it was. :func:`assert_turboquant_schema_is_fresh` is
+    what turns that into a refusal.
     """
     if is_registered():
-        return LibraryLoad(True, "already registered")
+        mapped = turboquant_mapped_libraries()
+        where = f" (mapped: {', '.join(mapped)})" if mapped else ""
+        return LibraryLoad(True, f"already registered{where}")
     candidates = turboquant_library_candidates()
     present = [path for path in candidates if path.is_file()]
     if not present:

@@ -63,6 +63,7 @@ LONGBENCH_LIMIT="${TQ_LONGBENCH_LIMIT:-8}"
 DATASET_DIR="${TQ_DATASET_DIR:-datasets/longbench}"
 REUSE_RUNNER=0
 SKIP_PREFLIGHT=0
+SKIP_OPS_CHECK=0
 DRY_RUN=0
 
 usage() {
@@ -110,6 +111,10 @@ Options:
   --dataset-dir DIR    LongBench JSONL directory (default: datasets/longbench);
                        missing files fall back to synthetic stubs, which measure
                        the harness and not the model
+  --skip-ops-check     skip the TurboQuant operator preflight. It costs seconds and
+                       catches a stale extension winning the registration, which the
+                       dispatcher would otherwise report as an argument count from
+                       inside a decode step. Only skip it if it is itself wrong.
   --skip-preflight     skip the one-layer probe of every attention path. NOT
                        advised on a 950: the probe is what negotiates the
                        dense_staging pool's backend, because this part refuses
@@ -117,7 +122,8 @@ Options:
                        cann_dense.
   --out DIR            where the reports land
                        (default: reports/npu_950pr_sink_lse_<timestamp>)
-  --dry-run            print the commands and the environment, run nothing
+  --dry-run            print the commands and the environment, run nothing (the
+                       operator preflight is skipped too: it imports torch)
   -h, --help           this text
 
 Exit: 0 every rung completed. 1 a rung failed. 2 bad arguments.
@@ -145,6 +151,7 @@ while [ $# -gt 0 ]; do
     --longbench-limit) LONGBENCH_LIMIT="${2:?--longbench-limit needs a number}"; shift 2 ;;
     --dataset-dir) DATASET_DIR="${2:?--dataset-dir needs a directory}"; shift 2 ;;
     --skip-preflight) SKIP_PREFLIGHT=1; shift ;;
+    --skip-ops-check) SKIP_OPS_CHECK=1; shift ;;
     --out) OUT_DIR="${2:?--out needs a directory}"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -188,6 +195,21 @@ if [ -z "${ASCEND_HOME_PATH:-}" ]; then
   done
 fi
 
+# Where the RUN_MODE=npu csrc/tests tier was built. The loader searches it for the
+# standalone binding, and the dynamic linker searches it for the kernel library, so a run
+# consumes the test artifacts already on disk without anything being installed.
+#
+# What that tree does *not* hold is worth stating, because it is the thing that catches
+# people out: its lib/libvllm_ascend_turboquant.so is the Ascend C kernel library and
+# nothing else. csrc/tests is configured without Python, PyTorch or torch_npu on purpose,
+# so that file links no libc10 and registers no torch.ops schema -- handing it to
+# torch.ops.load_library succeeds and registers nothing. The operators come only from
+# libvllm_turboquant_cube.so, which tools/tq_longbench/build_turboquant_ops.py produces.
+# No setup.py and no pip install on either path.
+TEST_BUILD_DIR="${TQ_TEST_BUILD_DIR:-$REPO_ROOT/build/csrc-tests-npu}"
+export ASCEND_TQ_BUILD_DIR="$TEST_BUILD_DIR"
+export LD_LIBRARY_PATH="$TEST_BUILD_DIR:$TEST_BUILD_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
 # The caching allocator fragments badly across a ladder that grows its KV pool
 # per rung, and an unquantised dense_staging pool at 32k is the largest single
 # block a run asks for. Only set where the operator has not already chosen.
@@ -220,18 +242,52 @@ echo "preflight        : $([ "$SKIP_PREFLIGHT" -eq 1 ] && echo 'SKIPPED -- dense
 echo "longbench        : $([ "$RUN_LONGBENCH" -eq 1 ] && echo "$LONGBENCH_TASKS (limit $LONGBENCH_LIMIT)" || echo 'not run (--longbench)')"
 echo "output           : $OUT_DIR"
 echo "allocator        : PYTORCH_NPU_ALLOC_CONF=$PYTORCH_NPU_ALLOC_CONF"
+echo "test artifacts   : ASCEND_TQ_BUILD_DIR=$ASCEND_TQ_BUILD_DIR"
 echo
 echo "VLLM_ASCEND_TQ_SINK_TOKENS is published by the harness itself, once per rung,"
 echo "before each runner is built. Do not set it here; it would be overwritten."
 
+# Informational only, and deliberately never fatal. npu-smi goes through DCMI, which
+# fails inside a shared container (error -8005) on a host whose devices the run can still
+# open; refusing there would block a working setup. What decides whether the operators can
+# run is the ops preflight below and the runner's own device open, not this.
+echo
 if command -v npu-smi >/dev/null 2>&1; then
-  npu-smi info > "/tmp/npu-smi.$$" 2>&1 || true
-  echo
-  echo "--- npu-smi (first 12 lines) ---"
-  head -12 "/tmp/npu-smi.$$" || true
+  if npu-smi info > "/tmp/npu-smi.$$" 2>&1; then
+    echo "--- npu-smi (first 12 lines) ---"
+    head -12 "/tmp/npu-smi.$$" || true
+  else
+    echo "--- npu-smi exited non-zero; continuing ---"
+    echo "  Common inside a shared container: DCMI returns -8005 while the devices still open."
+    head -4 "/tmp/npu-smi.$$" 2>/dev/null | sed 's/^/  /' || true
+  fi
 else
+  echo "--- npu-smi is not on PATH; continuing ---"
+fi
+
+# The one check that is fatal, and the cheap one. A host with an older extension reachable
+# can have it win the registration -- which is global and permanent, so a fresh library
+# cannot replace it -- and the dispatcher would otherwise refuse a decode on an argument
+# count minutes into the run, naming neither the stale file nor the argument that grew.
+OPS_CHECK_LOG="/tmp/tq-ops-check.$$"
+if [ "$DRY_RUN" -eq 0 ] && [ "$SKIP_OPS_CHECK" -eq 0 ]; then
   echo
-  echo "WARNING: npu-smi is not on PATH. A --device npu run will fail."
+  echo "--- TurboQuant operator preflight (tools/tq_longbench/check_turboquant_ops.py) ---"
+  set +e
+  "$PYTHON" "$REPO_ROOT/tools/tq_longbench/check_turboquant_ops.py" > "$OPS_CHECK_LOG" 2>&1
+  OPS_RC=$?
+  set -e
+  if [ "$OPS_RC" -eq 0 ]; then
+    grep -E "^  (found|missing) |^  npu_turboquant|^RESULT" "$OPS_CHECK_LOG" | sed 's/^/  /' || true
+  else
+    sed 's/^/  /' "$OPS_CHECK_LOG"
+    echo
+    echo "The TurboQuant operators this process would launch are not the ones this checkout"
+    echo "builds (check exit $OPS_RC). Stopping here rather than after the weights load."
+    echo "Re-run with --skip-ops-check to proceed anyway."
+    rm -f "/tmp/npu-smi.$$"
+    exit 1
+  fi
 fi
 
 # ---------------------------------------------------------------------------- #
@@ -329,6 +385,10 @@ mkdir -p "$OUT_DIR"
   echo "alloc_conf=$PYTORCH_NPU_ALLOC_CONF"
 } > "$OUT_DIR/run_manifest.txt"
 [ -r "/tmp/npu-smi.$$" ] && mv "/tmp/npu-smi.$$" "$OUT_DIR/npu-smi.log"
+# The preflight's whole output, not only the lines the banner showed: it names every path
+# the loader tried and every mapped file that could have registered the operators, which
+# is what a later reader of this report needs to know which build produced these numbers.
+[ -r "$OPS_CHECK_LOG" ] && mv "$OPS_CHECK_LOG" "$OUT_DIR/turboquant_ops_check.log"
 
 FAILURES=0
 

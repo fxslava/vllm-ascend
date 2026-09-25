@@ -74,7 +74,9 @@ no checkpoint, no dataset -- just the CANN runtime and the part.
 
 What it measures, in order:
 
-  0  npu-smi preflight               the part is attached, and which one
+  0  npu-smi preflight               informational only, never fatal: DCMI fails
+                                     inside a shared container (-8005) on hosts
+                                     whose devices a run can still open
   1  binaries present                the RUN_MODE=npu tier was actually built
   2  AIV decode vs CPU reference     write path, packed cache bytes, decode
                                      fidelity, cache geometry, slot containment,
@@ -115,7 +117,8 @@ Options:
                        read as a pass.
   -h, --help           this text
 
-Exit: 0 all gates passed. 1 a gate failed or a binary is missing. 2 no NPU.
+Exit: 0 all gates passed. 1 a gate failed, a binary is missing, or a case was
+skipped (which exits 0 on its own and would otherwise read as a pass).
 EOF
 }
 
@@ -190,21 +193,24 @@ echo "ASCEND_HOME_PATH     : ${ASCEND_HOME_PATH:-<unset>}"
 # Stage 0: preflight
 # ---------------------------------------------------------------------------- #
 
-banner "stage 0: npu-smi preflight"
+# Informational, and never fatal. npu-smi goes through DCMI, which fails inside a shared
+# container (error -8005) on hosts whose devices a run can still open, so a refusal here
+# would block a working setup on the strength of a management interface. What actually
+# decides whether these binaries can run is the runtime's own device open: the test
+# binaries refuse a CAModel by themselves and the benchmark exits 77, and a suite that
+# quietly skipped is caught in stage 2 by the SKIPPED count, which is a failure there.
+banner "stage 0: npu-smi preflight (informational)"
 if ! command -v npu-smi >/dev/null 2>&1; then
-  echo "npu-smi is not on PATH. This stage measures silicon and there is none here."
-  echo "Source the CANN environment, or run with --allow-simulator if you really mean"
-  echo "to drive a CAModel (hours per case)."
-  [ "$ALLOW_SIMULATOR" -eq 1 ] || exit 2
+  echo "npu-smi is not on PATH. Continuing: the binaries below decide for themselves,"
+  echo "and stage 2 fails on a skipped case rather than reading it as a pass."
+elif npu-smi info > "$OUT_DIR/npu-smi.log" 2>&1; then
+  head -20 "$OUT_DIR/npu-smi.log"
+  CHIPS="$(grep -cE '^\| *[0-9]+ +[0-9]+ ' "$OUT_DIR/npu-smi.log" || true)"
+  echo "  npu-smi reports $CHIPS chip row(s); full output in $OUT_DIR/npu-smi.log"
 else
-  if npu-smi info > "$OUT_DIR/npu-smi.log" 2>&1; then
-    head -20 "$OUT_DIR/npu-smi.log"
-    CHIPS="$(grep -cE '^\| *[0-9]+ +[0-9]+ ' "$OUT_DIR/npu-smi.log" || true)"
-    echo "  npu-smi reports $CHIPS chip row(s); full output in $OUT_DIR/npu-smi.log"
-  else
-    echo "npu-smi exited non-zero; see $OUT_DIR/npu-smi.log"
-    [ "$ALLOW_SIMULATOR" -eq 1 ] || exit 2
-  fi
+  echo "npu-smi exited non-zero; continuing. See $OUT_DIR/npu-smi.log."
+  echo "  Common inside a shared container: DCMI returns -8005 while the devices still open."
+  head -4 "$OUT_DIR/npu-smi.log" 2>/dev/null | sed 's/^/  /' || true
 fi
 
 # ---------------------------------------------------------------------------- #

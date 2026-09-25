@@ -51,7 +51,13 @@ from dataclasses import dataclass
 
 import torch
 
-from tq_longbench._ascend import load_turboquant_library, turboquant_layout, turboquant_rotation, turboquant_sink
+from tq_longbench._ascend import (
+    assert_turboquant_schema_is_fresh,
+    load_turboquant_library,
+    turboquant_layout,
+    turboquant_rotation,
+    turboquant_sink,
+)
 from tq_longbench.kv_cache import CacheGeometry, DenseKVCache, TurboQuantKVCache
 
 # The codec table image is built for a batch of rows; the writer and the query
@@ -66,6 +72,22 @@ _ASCEND_NAMESPACE = "_C_ascend"
 _BOTTOM_RIGHT_CAUSAL_SPARSE_MODE = 3
 
 
+#: Whether the schema of the registered operators has been checked in this process.
+#: Reset by :func:`forget_turboquant_schema_check` when a test swaps the registrations
+#: underneath it; nothing on a run path should ever need to.
+_schema_checked = False
+
+
+def forget_turboquant_schema_check() -> None:
+    """Make the next :func:`ascend_ops` re-check the schema.
+
+    For the CPU stand-ins and the Meta doubles, which register and unregister the
+    operators inside a context manager: the check is per registration, not per process.
+    """
+    global _schema_checked
+    _schema_checked = False
+
+
 def ascend_ops():
     """The operator namespace the extension registers into.
 
@@ -74,7 +96,15 @@ def ascend_ops():
     the check is free once they are there. Raised on rather than returned as
     ``None``: every caller needs it, and an ``AttributeError`` from deep inside
     a launch says far less than this does.
+
+    Whatever ends up registered is then checked *once* for the ``lse`` out-tensor, before
+    any launch. A host with more than one build of the extension reachable can have a
+    stale one win the registration -- it is global and permanent, so a fresh library
+    cannot replace it -- and the dispatcher's own complaint about an argument count
+    arrives from inside a decode step with no file attached to it. See
+    :func:`~tq_longbench._ascend.assert_turboquant_schema_is_fresh`.
     """
+    global _schema_checked
     if not _operators_served():
         outcome = load_turboquant_library(_operators_served)
         if not outcome.registered:
@@ -85,6 +115,10 @@ def ascend_ops():
                 "tests.ut.attention.turboquant_cpu_ops.turboquant_cpu_ops() to serve them from the CPU. "
                 f"Standalone library: {outcome.detail}."
             )
+        _schema_checked = False
+    if not _schema_checked:
+        assert_turboquant_schema_is_fresh()
+        _schema_checked = True
     return getattr(torch.ops, _ASCEND_NAMESPACE)
 
 
