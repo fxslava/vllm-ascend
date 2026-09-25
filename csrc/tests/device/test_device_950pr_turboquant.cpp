@@ -60,6 +60,36 @@ constexpr double kScaleRelativeTolerance = 1e-5;
 constexpr double kMinDecodeCosine = 0.999;
 constexpr double kMaxDecodeRelativeL2 = 5e-3;
 
+// The softmax-statistics out-tensor. A value no logit and no mass can take, so a (token, head) the kernel
+// never wrote is distinguishable from one it wrote badly -- which an all-zero buffer would not be, because
+// zero is exactly what an empty context's mass is.
+constexpr float kLsePoison = -1.0e30f;
+
+// What the pair is held to. The meaningful quantity is the whole log-mass `m + log(L)`: `m` alone is not,
+// because two scores within fp rounding of each other can swap the argmax between the kernel's tile-wise
+// online reduction and the reference's one-pass loop, and `L` then compensates exactly. So the log-mass is
+// gated tightly and `m` only loosely, as a check that it is a score at all rather than a stray word.
+//
+// 0.02 of log-mass is 2% of the total softmax mass -- far tighter than anything a misread buffer or a
+// missing write could survive, and far looser than the fp32 reduction-order difference between a kernel
+// that accumulates tile by tile and a reference that does not.
+constexpr double kMaxLogMassDrift = 0.02;
+constexpr double kMaxRunningMaxDrift = 0.05;
+
+// One context above kFusedContextLimit, so the lse case reaches TurboQuantPartialReducer as well as
+// the fused writer. 8192 is two blocks past the limit and seconds on silicon; the camodel is the only
+// place a context this deep is expensive, and this is the device tier.
+int SplitContextLen() {
+  const char* override_value = std::getenv("ASCEND_TQ_LSE_SPLIT_CONTEXT");
+  if (override_value != nullptr && *override_value != '\0') {
+    const long parsed = std::strtol(override_value, nullptr, 10);
+    if (parsed > 0) {
+      return static_cast<int>(parsed);
+    }
+  }
+  return 2 * static_cast<int>(turboquant_host::kFusedContextLimit);
+}
+
 std::vector<int> ContextLens() {
   const char* override_value = std::getenv("ASCEND_TQ_BARE_METAL_CONTEXTS");
   if (override_value == nullptr || *override_value == '\0') {
@@ -212,10 +242,20 @@ class DeviceScenario {
     ACL_CHECK(aclrtSynchronizeStream(stream_));
   }
 
-  void RunDecode() {
+  // `with_lse` hands the launch the optional softmax-statistics out-tensor. It is poisoned first, with a
+  // value no logit and no mass can take, so a (token, head) the kernel never wrote reads as the poison
+  // rather than as a plausible pair -- which is the only failure mode an all-zero buffer would hide.
+  void RunDecode(bool with_lse = false) {
     const tqh::PagedAttentionGrid grid =
         tqh::PlanPagedAttention(kQueryTokens, kNumHeads, kHeadSize, scenario_.blocks_per_seq, kBlockSize, aiv_num_);
     workspace_ = DeviceBuffer::Empty<float>(grid.workspace_floats);
+    num_splits_ = grid.num_splits;
+
+    void* lse = nullptr;
+    if (with_lse) {
+      lse_ = DeviceBuffer::FromHost(std::vector<float>(LseFloats(), kLsePoison));
+      lse = lse_.get();
+    }
 
     rotate_plan_ =
         tqh::RotateQuery(stream_, AscendType::FP16, query_.get(), pi_signs_.get(), h16_.get(), write_tables_.get(),
@@ -228,9 +268,16 @@ class DeviceScenario {
         static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kBlockSize),
         static_cast<uint32_t>(scenario_.blocks_per_seq), static_cast<uint32_t>(grid.num_splits),
         grid.split_tasks_per_core, grid.reduce_tasks_per_core, static_cast<uint32_t>(tqh::kFusedContextLimit),
-        kAttentionScale, kInvSqrtHeadSize);
+        kAttentionScale, kInvSqrtHeadSize, lse);
     ACL_CHECK(aclrtSynchronizeStream(stream_));
   }
+
+  static size_t LseFloats() {
+    return static_cast<size_t>(kQueryTokens) * kNumHeads * vllm_ascend::turboquant::kLseStride;
+  }
+
+  std::vector<float> Lse() const { return lse_.ToHost<float>(); }
+  uint32_t num_splits() const { return num_splits_; }
 
   std::vector<int8_t> KeyCache() const { return key_cache_.ToHost<int8_t>(); }
   std::vector<int8_t> ValueCache() const { return value_cache_.ToHost<int8_t>(); }
@@ -255,7 +302,8 @@ class DeviceScenario {
   vllm_ascend::turboquant::RotateQPlan rotate_plan_;
   DeviceBuffer write_tables_, decode_tables_;
   DeviceBuffer key_cache_, value_cache_, scale_plane_;
-  DeviceBuffer block_tables_, context_lens_, workspace_, out_;
+  DeviceBuffer block_tables_, context_lens_, workspace_, out_, lse_;
+  uint32_t num_splits_ = 0;
   int64_t aiv_num_ = 0;
   bool aiv_queried_ = false;
 };
@@ -478,6 +526,150 @@ TEST_F(TurboQuantBareMetal, DecodeMatchesTheCpuReferenceAcrossContexts) {
         << ": the decode kernel and the CPU reference disagree in magnitude by more than fp16 output rounding "
            "allows";
   }
+}
+
+TEST_F(TurboQuantBareMetal, DecodeReportsItsSoftmaxStatisticsToTheLseOutTensor) {
+  REQUIRE_PHYSICAL_ASCEND_950PR();
+
+  namespace layout = vllm_ascend::turboquant;
+  const std::vector<int8_t> signs = tq::cpu_pi_sign_vector(kHeadSize);
+
+  // A fused token's pair comes out of the split kernel itself; a token the decode *splits* gets its
+  // pair from TurboQuantPartialReducer instead, and the two are different code. A token is only split
+  // past kFusedContextLimit, which the default ladder does not reach, so one context above it is swept
+  // as well -- otherwise this case would cover one of the two writers and say nothing about the other.
+  std::vector<int> contexts = ContextLens();
+  contexts.push_back(SplitContextLen());
+  bool covered_reducer = false;
+
+  for (const int context_len : contexts) {
+    const Scenario scenario = MakeScenario(context_len, 0x15E0u + static_cast<uint32_t>(context_len));
+    DeviceScenario device(scenario, Stream());
+    PrintHeader("lse", context_len, device);
+
+    device.RunWritePath();
+    device.RunDecode(/*with_lse=*/true);
+
+    const std::vector<int8_t> key_cache = device.KeyCache();
+    const std::vector<int8_t> value_cache = device.ValueCache();
+    const std::vector<float> scale_plane = device.ScalePlane();
+
+    std::vector<float> reference(static_cast<size_t>(kNumHeads) * kHeadSize, 0.0f);
+    std::vector<float> reference_max(static_cast<size_t>(kNumHeads), 0.0f);
+    std::vector<float> reference_mass(static_cast<size_t>(kNumHeads), 0.0f);
+    tq::cpu_paged_attention_turboquant(scenario.query.data(), key_cache.data(), value_cache.data(),
+                                       scale_plane.data(), scenario.table.data(), context_len, kNumHeads,
+                                       kNumKvHeads, kHeadSize, kBlockSize, kAttentionScale, signs.data(),
+                                       reference.data(), reference_max.data(), reference_mass.data());
+
+    const std::vector<float> lse = device.Lse();
+    ASSERT_EQ(lse.size(), DeviceScenario::LseFloats());
+
+    // Which writer this context reached, reported rather than inferred: the kernel's own IsFused is
+    // `numSplits <= 1 || contextLen <= fusedContextLimit`, so a long context whose plan did not split
+    // is still fused, and only the pair of conditions together names the reducer.
+    const bool split = device.num_splits() > 1 && context_len > static_cast<int>(tqh::kFusedContextLimit);
+    covered_reducer = covered_reducer || split;
+    std::printf("  lse    S=%5d  splits=%u  writer=%s\n", context_len, device.num_splits(),
+                split ? "reducer" : "fused");
+
+    double worst_log_mass = 0.0;
+    double worst_max = 0.0;
+    for (int head = 0; head < kNumHeads; ++head) {
+      const size_t base = static_cast<size_t>(head) * layout::kLseStride;
+      const float device_max = lse[base + layout::kPartialMaxLane];
+      const float device_mass = lse[base + layout::kPartialSumLane];
+
+      ASSERT_GT(device_max, kLsePoison * 0.5f)
+          << "S=" << context_len << " head=" << head
+          << ": the max lane still holds the poison, so no writer touched this (token, head)";
+      ASSERT_GT(device_mass, kLsePoison * 0.5f)
+          << "S=" << context_len << " head=" << head << ": the mass lane still holds the poison";
+
+      // Structural, and exact: the maximising element contributes exp(0) = 1, so a non-empty context's mass
+      // is at least 1. A mass below that is not a rounding, it is the wrong words.
+      EXPECT_GE(device_mass, 1.0f - 1e-3f)
+          << "S=" << context_len << " head=" << head
+          << ": a non-empty context's mass includes exp(max - max) = 1";
+      ASSERT_TRUE(std::isfinite(device_max) && std::isfinite(device_mass))
+          << "S=" << context_len << " head=" << head;
+
+      // Every other lane of the pair's two blocks is padding the kernels zero before they write, and nothing
+      // reads it. If one carries the poison the copy was short; if it carries anything else the write ran off
+      // its own group, which is the failure the kLseStride padding exists to make impossible.
+      for (uint32_t lane = 0; lane < layout::kLseStride; ++lane) {
+        if (lane == layout::kPartialMaxLane || lane == layout::kPartialSumLane) {
+          continue;
+        }
+        EXPECT_EQ(lse[base + lane], 0.0f)
+            << "S=" << context_len << " head=" << head << " lane=" << lane
+            << ": a padding lane of the pair is neither zero nor the kernel's business";
+      }
+
+      const double device_log_mass = static_cast<double>(device_max) + std::log(static_cast<double>(device_mass));
+      const double reference_log_mass = static_cast<double>(reference_max[static_cast<size_t>(head)]) +
+                                        std::log(static_cast<double>(reference_mass[static_cast<size_t>(head)]));
+      worst_log_mass = std::max(worst_log_mass, std::fabs(device_log_mass - reference_log_mass));
+      worst_max =
+          std::max(worst_max, std::fabs(static_cast<double>(device_max) -
+                                        static_cast<double>(reference_max[static_cast<size_t>(head)])));
+    }
+
+    std::printf("  lse    S=%5d  worst |d log-mass|=%.6f (bound %.3f)  worst |d max|=%.6f (bound %.3f)\n",
+                context_len, worst_log_mass, kMaxLogMassDrift, worst_max, kMaxRunningMaxDrift);
+    std::fflush(stdout);
+
+    EXPECT_LT(worst_log_mass, kMaxLogMassDrift)
+        << "S=" << context_len
+        << ": the total softmax mass the decode reports is not the mass it summed. The sink merge rescales "
+           "the whole softmax against this number, so a drift here is a wrong answer at every later token, "
+           "not a rounding";
+    EXPECT_LT(worst_max, kMaxRunningMaxDrift)
+        << "S=" << context_len << ": the max lane does not hold a score of this context";
+  }
+
+  // Non-fatal: every bound above still has to hold whatever this reports. But a run in which no
+  // context split covered only the fused writer, and should say so rather than be read as covering
+  // both -- TurboQuantPartialReducer's write is the other half of this contract.
+  EXPECT_TRUE(covered_reducer)
+      << "no context reached TurboQuantPartialReducer, so only the fused writer was checked. A split "
+         "token needs a context above kFusedContextLimit ("
+      << tqh::kFusedContextLimit << ") *and* a plan that splits it; this run swept up to "
+      << SplitContextLen() << ". Raise ASCEND_TQ_LSE_SPLIT_CONTEXT.";
+}
+
+TEST_F(TurboQuantBareMetal, DecodeWithNoLseTensorLeavesTheOutputUnchanged) {
+  REQUIRE_PHYSICAL_ASCEND_950PR();
+
+  // The out-tensor is optional so that a launch that does not merge a second attention stream pays nothing
+  // for it. "Pays nothing" has to include the answer: the writer is gated on a launch constant, and a
+  // constant every core agrees on cannot change what the rest of the kernel computes. Bit-identical, not
+  // close -- the two launches run the same arithmetic over the same bytes.
+  const int context_len = ContextLens().front();
+  const Scenario scenario = MakeScenario(context_len, 0x15E1u);
+
+  DeviceScenario without(scenario, Stream());
+  PrintHeader("lse-off", context_len, without);
+  without.RunWritePath();
+  without.RunDecode(/*with_lse=*/false);
+  const std::vector<Half> plain = without.RawOutput();
+
+  DeviceScenario with(scenario, Stream());
+  with.RunWritePath();
+  with.RunDecode(/*with_lse=*/true);
+  const std::vector<Half> reported = with.RawOutput();
+
+  ASSERT_EQ(plain.size(), reported.size());
+  size_t mismatches = 0;
+  for (size_t i = 0; i < plain.size(); ++i) {
+    if (plain[i].bits != reported[i].bits) {
+      ++mismatches;
+    }
+  }
+  std::printf("  lse-off S=%4d  output words differing with the out-tensor attached: %zu of %zu\n", context_len,
+              mismatches, plain.size());
+  std::fflush(stdout);
+  EXPECT_EQ(mismatches, 0u) << "attaching the softmax-statistics out-tensor changed the decode's own output";
 }
 
 TEST_F(TurboQuantBareMetal, CacheGeometryAndAlignmentMatchTheDocumentedLayout) {

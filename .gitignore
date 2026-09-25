@@ -257,3 +257,8 @@ out/
 
 # QEMU/process crash dumps from cross-arch simulator runs
 *.core
+
+# Where the 950PR hardware run-scripts put their logs, JSONL and CSVs
+# (scripts/run_950pr_baremetal_validation.sh, scripts/run_950pr_sink_lse_benchmark.sh).
+# One directory per run, timestamped; a measurement belongs in a report, not in git.
+/reports/

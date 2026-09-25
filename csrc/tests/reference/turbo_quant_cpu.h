@@ -156,10 +156,17 @@ inline void cpu_reshape_and_cache_one(const float* vec, int d, const int8_t* sig
   cpu_quantize_4bit(rotated.data(), d, cache + cache_off, scale_plane + scale_off);
 }
 
+// `softmax_max` and `softmax_mass`, when given, receive one float per head: the running maximum over the whole
+// context and the mass sum_i exp(s_i - max), which is what the decode's optional `lse` out-tensor carries
+// (turboquant_layout.h). They are reported *before* the kEps floor below, because the kernels write the pair
+// before NormalizeHeads adds theirs -- so a test that compares the two is comparing the same quantity.
+//
+// Trailing and defaulted, so adding them left every existing call site of this reference alone.
 inline void cpu_paged_attention_turboquant(const float* query, const int8_t* key_cache, const int8_t* value_cache,
                                            const float* scale_plane, const int32_t* block_table, int context_len,
                                            int num_heads, int num_kv_heads, int d, int block_size, float scale,
-                                           const int8_t* sign_vec, float* out) {
+                                           const int8_t* sign_vec, float* out, float* softmax_max = nullptr,
+                                           float* softmax_mass = nullptr) {
   const int group = num_heads / num_kv_heads;
   const size_t packed_stride = static_cast<size_t>(d / kPackFactor);
   const size_t slot_floats = cpu_scale_slot_floats(num_kv_heads);
@@ -196,6 +203,15 @@ inline void cpu_paged_attention_turboquant(const float* query, const int8_t* key
     for (int i = 0; i < context_len; ++i) {
       scores[static_cast<size_t>(i)] = std::exp(scores[static_cast<size_t>(i)] - running_max);
       denom += scores[static_cast<size_t>(i)];
+    }
+
+    if (softmax_max != nullptr) {
+      // An empty context leaves running_max at -inf here and the kernels leave it at their own
+      // sentinel; neither is a logit, and the mass beside it is 0, which is what a reader branches on.
+      softmax_max[static_cast<size_t>(head)] = context_len > 0 ? running_max : 0.0f;
+    }
+    if (softmax_mass != nullptr) {
+      softmax_mass[static_cast<size_t>(head)] = denom;
     }
 
     std::fill(acc.begin(), acc.end(), 0.0f);

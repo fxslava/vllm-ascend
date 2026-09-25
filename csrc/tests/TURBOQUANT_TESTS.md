@@ -4321,3 +4321,105 @@ what they had contributed. Both halves are gone:
 - The LongBench retrieval number that motivated the feature has not been re-taken with the phase-two merge, on
   either backend.
 
+
+### 13.38 The `lse` out-tensor on silicon: two device cases and the turnkey run-scripts (2026-09-25)
+
+13.37 shipped the out-tensor with one hole named in its own "Not covered": **no launch anywhere had
+ever passed a non-null `lse`.** Every `csrc/tests` call site passed `nullptr`, so what the camodel
+gate proved was only that the added writer is inert when disabled. This closes the hole on the
+device tier and packages the hardware run so it needs no judgement at the console.
+
+**Two new bare-metal cases** (`device/test_device_950pr_turboquant.cpp`, the AIV decode):
+
+- **`DecodeReportsItsSoftmaxStatisticsToTheLseOutTensor`.** Allocates the
+  `[numTokens, numHeads, kLseStride]` fp32 buffer, **poisons it with -1e30** so a `(token, head)`
+  no writer touched is distinguishable from one written badly -- which an all-zero buffer cannot be,
+  because zero is exactly an empty context's mass -- runs the decode with it, and compares against
+  an independent host derivation. `cpu_paged_attention_turboquant` gained two trailing defaulted
+  out-parameters, `softmax_max` and `softmax_mass`, reported **before** its `kEps` floor, because
+  the kernels write the pair before `NormalizeHeads` adds theirs.
+
+  What it gates, and why in this shape:
+  - the whole log-mass `m + log(L)` to 0.02, which is 2% of the total softmax mass. `m` alone is
+    *not* the meaningful quantity: two scores within fp rounding can swap the argmax between the
+    kernel's tile-wise online reduction and the reference's one-pass loop, and `L` then compensates
+    exactly. `m` is gated loosely (0.05) as a check that it is a score of this context at all;
+  - `L >= 1`, exactly and structurally: the maximising element contributes `exp(0)`;
+  - every padding lane of the pair's two blocks is exactly `0`. A poison there means the copy was
+    short; anything else means the write ran off its own group, which is the failure the
+    `kLseStride` padding exists to make impossible;
+  - which writer the context reached is *reported* (`writer=fused` or `writer=reducer`) rather than
+    inferred. This matters more than it looks: the kernel's `IsFused` is
+    `numSplits <= 1 || contextLen <= fusedContextLimit`, and the default ladder tops out at 2048
+    against a limit of 4096, so **the ladder alone reaches the fused writer only** and would have
+    said nothing about `TurboQuantPartialReducer`'s write. The case therefore sweeps one context
+    above the limit as well (`ASCEND_TQ_LSE_SPLIT_CONTEXT`, default 8192) and carries a non-fatal
+    expectation that at least one context actually split, so a run that covered one writer cannot
+    be read as covering both.
+- **`DecodeWithNoLseTensorLeavesTheOutputUnchanged`.** The same scenario decoded with and without
+  the out-tensor, compared **bit for bit** on the fp16 output. The writer is gated on a launch
+  constant every core agrees on, so attaching it cannot change what the rest of the kernel computes;
+  "optional costs nothing" has to include the answer, not just the time.
+
+**Two turnkey scripts**, both `set -euo pipefail` with `--help`:
+
+- **`scripts/run_950pr_baremetal_validation.sh`** -- stage 1, no Python and no checkpoint.
+  `npu-smi` preflight; binaries present (with the cmake line to fix it if not); the AIV decode and
+  both `lse` cases at `ASCEND_TQ_BARE_METAL_CONTEXTS`; the kv4fp8 Cube decode; the unpack ablation
+  under `ASCEND_BENCH_TQ_UNPACK=both`.
+
+  Three things it gets right that are easy to get wrong:
+  - **`REQUIRE_PHYSICAL_ASCEND_950PR` is a `GTEST_SKIP`, so a run with no part exits 0.** The
+    script treats any `SKIPPED` case as a failure; otherwise the gate is a false green.
+  - **two cosines, two different gates.** `test_device_950pr_turboquant`'s `cos` is the kernel
+    against a CPU reference running the same arithmetic over the same quantised cache -- a
+    correctness gate, and 0.999 is right. The multimode binary's "cos vs fp32 host reference" is the
+    4-bit cache's *own* quantisation error against exact fp32 over unquantised K/V, measured at
+    **0.98629** worst by `scripts/tq_multimode_calibration.py`. Gating that at 0.999 would fail
+    every correct build, so it is gated at 0.98 and the distinction is stated in-file.
+  - the decode-cosine and log-mass bounds are re-asserted in the script, not merely trusted to the
+    binary's own `EXPECT`s, so the run halts on them even if a later build loosens a constant.
+- **`scripts/run_950pr_sink_lse_benchmark.sh`** -- stage 2, the ablation. Sweeps
+  `--sink-tokens 0,4` over `--contexts 2048,8192,32768` through `run_benchmark.py`, optionally
+  `run_longbench.py` for task scores, into `reports/npu_950pr_sink_lse_<stamp>/` (JSONL, summary,
+  progress log, `run_manifest.txt` with the git head and the environment, `npu-smi.log`).
+  It pins `--prefill-mode dense_staging`, because the per-rung policy can choose `batched_decode` at
+  a long rung and `RunnerConfig` then refuses the run minutes in; it refuses that combination itself,
+  up front. It does *not* pass `--skip-preflight` by default: the probe is what negotiates the
+  staging pool's backend, and this part refuses op-plugin's FIA (EZ9903) and has to stage through
+  `cann_dense`. `VLLM_ASCEND_TQ_SINK_TOKENS` is left alone -- the harness publishes it per rung.
+
+  The banner says which numbers to read: the sinks>0 rows are for their **scores**. Their decode p50
+  is not comparable with the sinks=0 rows, because the merge adds launches to every step and a sink
+  layer gives up the single-launch Cube fusion.
+
+**Verification.**
+- **Tiers, from the `feat/tq-sink-lse-fusion` worktree.** host and npu built clean under `-Werror`,
+  0 diagnostic lines; 6 and 42 unique targets. `nm` confirms every TurboQuant symbol the three
+  device binaries import is exported by `libvllm_ascend_turboquant.so` -- 7, 3 and 3 imports, 0
+  unresolved -- and both new case names are in the correctness binary.
+- **The adapter and the schema.** `tools/tq_longbench/build_turboquant_ops.py --soc-version
+  Ascend950PR_9599` compiled and linked `turboquant_standalone_binding.cpp`, which is one of only
+  two files that include `turboquant_torch_adpt.h`. This is the **first time** `CheckLse` and the two
+  `lse` schema lines have been compiled at all: the three `-Werror` tiers never include that header.
+  The vendor image cannot *load* the result (no driver), so the registered schema text stays covered
+  by `test_schemas_match_the_compiled_extension`, which pins it to `turboquant_torch_ops.h`.
+- **The scripts.** `bash -n` clean. Exercised for: `--help`; an unknown flag; no `npu-smi` (exit 2);
+  a missing build tree (stage 1 names it and exits 1); a missing `--model-path`; a malformed sink
+  list; and `--sink-tokens 4` with `--prefill-mode batched_decode`, which is refused before anything
+  loads. A `--dry-run` of the full matrix emits both argv lists, and `build/lse_argv_check.py` feeds
+  them to `run_benchmark.build_parser()` and `run_longbench.build_parser()` -- 23 and 24 words,
+  both parsed -- then constructs `RunnerConfig` for all four (backend, sink count) pairs.
+  `turboquant_cube` with sinks is accepted, which is what 13.37 unlocked.
+
+**Not covered.**
+- **Nothing here has run on the part.** The two device cases have been compiled and linked, not
+  executed; the scripts have been argument-checked, not run against silicon. Their first execution
+  is the 950PR session they exist for, and the tolerances in the new cases are therefore predicted
+  rather than measured.
+- The camodel was not asked to run a non-null `lse` either: the sim tier's gate is the fused case
+  set, and widening it is a camodel-cost decision (see the camodel run policy).
+- The wheel's own CMake path still has not been built; the standalone binding is the adapter's only
+  compile gate.
+- Nothing prices the sink merge's extra launches, on the camodel or on silicon.
+
