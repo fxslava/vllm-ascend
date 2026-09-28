@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 
+#include "../../attention/turboquant/op_kernel/common/qjl_codec.h"
 #include "ascend950_shapes.hpp"
 #include "cpu_reference.hpp"
 #include "fp16.hpp"
@@ -843,6 +844,39 @@ TEST(TurboQuantEdgeCases, PartialBatchesMatchPerRowQuantisation) {
               << "a scale outside the live rows was written";
         }
       }
+    }
+  }
+}
+
+// The QJL "3 + 1" read of the shipped 4-bit word (qjl_codec.h). That header carries static_asserts over all 16
+// codes, but it restates the level tables in its own terms; this holds it to the tables the kernels actually
+// compile against, so the two cannot drift apart silently.
+TEST(TurboQuantQjlCodec, SignMagnitudeReadsTheShippedGrids) {
+  namespace qjl = vllm_ascend::turboquant::qjl;
+  using Kv4 = vllm_ascend::turboquant::TurboQuantModeTraits<vllm_ascend::turboquant::TurboQuantMode::KV4_FP8>;
+
+  for (uint32_t bin = 0; bin < qjl::kCodeLevels; ++bin) {
+    // The Cube writer stages n = bin - 8 through int4b_t, so the stored nibble is bin ^ 8.
+    const uint8_t nibble = static_cast<uint8_t>((bin ^ 0x8u) & 0xFu);
+    EXPECT_FLOAT_EQ(qjl::DecodeCubeLevel(nibble), Kv4::kCentroids[bin]) << "kv4fp8 bin " << bin;
+    // Mid-rise: no zero level, so every one of the 16 words carries a sign that survives into the dot product.
+    EXPECT_NE(qjl::DecodeCubeLevel(nibble), 0.0f);
+    EXPECT_EQ(qjl::IsNegative(nibble, qjl::SignPolarity::kSetMeansNegative), Kv4::kCentroids[bin] < 0.0f);
+    // The AIV word stores the raw bin, so its sign bit carries the opposite polarity.
+    const float aiv = qjl::DecodeAivLowLevel(static_cast<uint8_t>(bin));
+    EXPECT_FLOAT_EQ(aiv, tq::kLloydMaxCentroids[bin]) << "aiv bin " << bin;
+    EXPECT_EQ(qjl::IsNegative(static_cast<uint8_t>(bin), qjl::SignPolarity::kSetMeansPositive), aiv < 0.0f);
+  }
+
+  // Splitting a packed AIV byte back into its two bins: the -128 bias is confined to bit 7, which is the high
+  // nibble's sign bit and nothing else. A Phase-2 unpack that misses this decodes odd coordinates off by 8.
+  for (uint32_t low = 0; low < qjl::kCodeLevels; ++low) {
+    for (uint32_t high = 0; high < qjl::kCodeLevels; ++high) {
+      const int8_t packed = static_cast<int8_t>(static_cast<int32_t>(low) + 16 * static_cast<int32_t>(high) - 128);
+      EXPECT_EQ(static_cast<uint32_t>(qjl::AivLowNibble(packed)), low);
+      EXPECT_EQ(static_cast<uint32_t>(qjl::AivHighNibble(packed)), high);
+      EXPECT_FLOAT_EQ(qjl::DecodeAivLowLevel(qjl::AivLowNibble(packed)), tq::kLloydMaxCentroids[low]);
+      EXPECT_FLOAT_EQ(qjl::DecodeAivLowLevel(qjl::AivHighNibble(packed)), tq::kLloydMaxCentroids[high]);
     }
   }
 }
