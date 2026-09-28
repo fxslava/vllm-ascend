@@ -628,6 +628,16 @@ camodel from the part, so `REQUIRE_PHYSICAL_ASCEND_950PR` looks for
 found. `ASCEND_TEST_ALLOW_SIMULATOR=1` overrides that, and
 `ASCEND_TQ_BARE_METAL_CONTEXTS` shrinks the sweep, both for smoke-checking the
 binary rather than for producing results.
+
+Beside that context sweep it runs the target-model topologies - 32 query heads
+over 2 and 4 kv heads at `head_dim` 128 and 256, where a packed row is 64 and 128
+bytes - and the poisoned-tail guard. That one decodes context 1 / 65 / 129 twice:
+once over the cache as the write path left it, once with the rest of the last
+block filled with the codec's extreme levels at a scale of 1e4, one row per head
+aligned to that head's rotated query. The two have to agree bit for bit - the
+output, and the per-split `m` and `L` wherever the launch splits - because only
+the decode's tail mask keeps slots past the context length out of the softmax.
+
 `test_device_950pr_turboquant_multimode` is the Cube-native decode's validation
 matrix on the same part - batch `{1, 8}` by context `{64, 512, 1024, 2048}` at the
 production head count, gated on `cos > 0.90` per shape - and compiles the sim

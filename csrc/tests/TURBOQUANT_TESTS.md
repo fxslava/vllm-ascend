@@ -3495,6 +3495,9 @@ The goldens were recorded from b48ed2951 before any of the three changes, with (
 `fused_context_limit = 0`. That produces the same grid `kFillBlocks` does. (c) must also agree
 with (b) to cos >= 0.999999, and must stay within 1e-6 of (b)'s cos against fp32.
 
+> (b) and (c) run S = 128 since §13.37, with re-recorded goldens. The S = 256 row above is the shape they had
+> when this section was written, not the shape the suite runs.
+
 **Executed (camodel `Ascend950PR_9589`, aiv 64, `quay.io/ascend/vllm-ascend:v0.26.0rc1-a5`,
 one process per run, 32 `excp_log.dump` files, all 0 B):**
 
@@ -3965,7 +3968,7 @@ wider groups at D = 128; GLM-5.2's 8:1 group. Run with `build/nz_runs.sh <tag> <
   It is allocated after the decode's buffers, so the decode's UB layout does not move.
 
 **Case (g)** `RotatesARawQueryOnceAheadOfItsSplits` runs (c)'s grid (S 256, 4 splits, 8 blocks, fused limit 0,
-in-launch reduction) through the raw-query entry. Camodel, one process each, against a clean `-Werror` sim tier:
+in-launch reduction; S 128, 2 splits, 4 blocks since §13.37) through the raw-query entry. Camodel, one process each, against a clean `-Werror` sim tier:
 
 | case | golden | cos vs fp32 | notes |
 |---|---|---|---|
@@ -4243,3 +4246,100 @@ rebuild with (h)'s goldens pinned (0 diagnostics, 37 targets unchanged) reproduc
 - Raw-query output stages at D = 128, in bf16, and with a Cube chunk on more than one block.
 - The Python Cube path and `patch_qwen3_5.py`'s gated branch have not run on a device.
 - No camodel launch spans were taken with `build/nz_profile.py`.
+
+### 13.37 Target-model topologies and a poisoned tail on the device tier; the camodel cases trimmed (2026-09-28)
+
+Two test-only changes. Nothing under `op_kernel/` or `csrc/attention/` moved, and case (a) re-ran unchanged in
+the same camodel pass and reproduced its 2026-09-16 golden, which is the evidence for that.
+
+**Device tier (`test_device_950pr_turboquant`), parameterised by topology.** The suite's four scenario
+constants (`head_size`, `num_heads`, `num_kv_heads`, the attention scale) became a `Topology` struct carried on
+each `Scenario`, so every buffer the write path and the decode size is derived from the case rather than from
+`shapes950`. `ModelTopologies()` sweeps the target-model set - 32 query heads over 2 and 4 kv heads at
+`head_dim` 128 and 256 - and three tests now run over it:
+
+- `WriteAndDecodeMatchTheCpuReferenceOnTargetModelTopologies` (new) writes and decodes each topology at S = 320
+  (three blocks, the last one ragged) against the CPU reference, and asserts the re-derived scale at D = 256 is
+  still `shapes950::kAttentionScale` so the sweep and the rest of the suite cannot drift apart.
+- `CacheGeometryAndAlignmentMatchTheDocumentedLayout` checks packed row indexing per topology: a row is
+  `head_size / 2` bytes (64 at D = 128), the kv heads of a slot are adjacent, the next slot starts one row
+  after the last of them, the last row ends exactly on the allocation, a token's rows across all kv heads are
+  a whole number of 32-byte bursts, and the scale slot is a whole burst.
+- `WritePathTouchesNoByteOutsideItsSlotMapping` re-runs its unmapped-slot bounds check at every topology.
+
+**The poisoned tail: `PoisonedInactiveTailSlotsCannotReachTheSoftmax` (new).** A context that ends mid-block
+leaves the rest of that block unwritten, and the AIV decode reads whole 16-row tiles, so those slots *are*
+read; only `MaskTailLanes` (§13.20) keeps them out of the reduction. The test decodes S = 1, 65 and 129 twice
+over the same live context, once with the tail as the write path left it and once with the tail poisoned, and
+requires the two to agree bit for bit:
+
+- the poison fills every inactive row with the codec's extreme levels (`0x7F` is bins (15, 15), `0x80` is bins
+  (0, 0)) and drives both scale lanes to +-1e4, alternating the sign across slots;
+- then one row per query head is overwritten with the pattern aligned to *that head's* rotated query - level 15
+  where it is positive, level 0 where it is negative - with a positive key scale. A uniform row's dot is
+  `2.7326 * sum(Pi q)`, which a head whose query happens to sum to nearly zero shrugs off; an aligned row's is
+  `2.7326 * sum |Pi q|`, so every head sees a logit near 2e5 whatever the draw. `exp` of that overflows fp32,
+  so an unmasked lane does not perturb the answer, it turns the head into a NaN;
+- a teeth check computes those logits on the host, over the same two cache images the device decodes, and
+  refuses to accept a pass unless the poison beats every live logit by `kTailTeethScoreMargin` per head. Without
+  it, a mask that let the tail into the reduction at a harmless value would pass silently;
+- the assertions are: the fp16 output bit-identical between the two runs, no NaN or infinity in the output or
+  in the workspace, the per-split `m` (`kPartialMaxLane`) and `L` (`kPartialSumLane`) bit-identical, and the
+  whole partial image bit-identical. The zero-padded run is also held to the decode's own cosine and relative-L2
+  bounds against the CPU reference, which sums the live context only - so a tail slot admitted at logit 0,
+  `exp(0) = 1` in the denominator, fails there even though the two runs would agree.
+
+`m` and `L` only reach host memory when the launch splits, so `RunDecode` now takes the fused context limit it
+passes to the launch, and the test hands it 64. `PlanPagedAttention` caps the splits at the block count, so
+S = 1 and S = 65 stay fused whatever the limit says and only S = 129 compares the statistics; the other two
+compare the output alone.
+
+**Sim tier trimmed.** `kRingContext` 256 -> 128 for (b), (c) and (g), and `kSlicedSlotOffsets` `{1, 2, 3}` ->
+`{1}` for (j), two kernel-writer launches less. The goldens of (b), (c) and (g) are re-recorded below: a golden
+belongs to a shape, and the context is part of the shape.
+
+(j) is where the launch count mattered most, and it was already broken before this: a writer launch is about
+eight minutes on the camodel, so the aligned control plus three sliced offsets could not finish inside the
+1500 s `build/fused_sim_run.sh` allows a process. Run at `{1, 3}` it was killed at 1464 s having completed the
+control and offset +1 (0 of 65,536 key bytes, 0 of 65,536 value bytes, 0 of 2,048 scale lanes differ from the
+aligned write) - the assertion passes, the process does not return. One offset is the minimal valid set: the
+three differ only in how far into the burst they sit, which is what `EXPECT_NE(byte_offset % kGmBurstBytes, 0)`
+checks. Offsets 2 and 3 are no longer exercised anywhere.
+
+Camodel, one process per case (`build/nz_runs.sh trim28* /workspace/build_sim`):
+
+| case | K / blocks / heads per task / limit | golden | cos vs fp32 | launch | process |
+|---|---|---|---|---|---|
+| (a) S 64, unchanged | 1 / 2 / 2 / 4096 | `0x6176461416358ec1` | 0.999407 | 61.9 s | 91 s, 23,665 ticks |
+| (b) S 128 | 1 / 2 / 2 / 4096 | `0x55419cdf4456945d` | 0.999525 | 100.0 s | 225 s with (c), 56,396 ticks |
+| (c) S 128 | 2 / 4 / 2 / 0 | `0x55419cdf4456945d` | 0.999525 | 91.9 s | (same process) |
+| (g) S 128 | 2 / 4 / 2 / 0 | `0x55419cdf4456945d` | 0.999525 | 103.1 s | 124 s, 42,150 ticks |
+
+All three share one hash. Two splits of one tile each reduce to the unsplit launch's bits exactly - (c) vs (b)
+is cos 1.000000000 and the same cosine against fp32 to nine places - where four splits of four tiles at S = 256
+differed in the last places. (g)'s in-launch rotation is still 0 of 1,024 fp32 words off `rotate_q`'s. Every
+run left 32 exception dumps at 0 B.
+
+**Verification.** `test_sim_950pr_turboquant_fused` and `test_device_950pr_turboquant` both built clean with
+the goldens pinned - `-Wall -Wextra -Werror` on each test translation unit, 0 diagnostic lines - and (b), (c)
+and (g) were then re-run against the pinned values (`build/nz_runs.sh pin28*`): all three at
+`0x55419cdf4456945d` and cos 0.999525 as recorded, (c) vs (b) cos 1.000000000, (g)'s rotation 0 of 1,024 words
+off, 32 exception dumps at 0 B, 169 s and 126 s of process wall. Launch wall varies with host load across runs
+(b was 100.0 s then 63.3 s for identical bits), so these are not measurements of the kernel.
+
+The kernel preprocess prefixes have to be deleted before each build: `merge_{aic,aiv}_obj_text` links its
+per-source objects in place, so a second run of the step hands `ld.lld` its own `ET_EXEC` output and it fails
+with `unknown file type`.
+
+**Not covered.**
+- Nothing on the device tier has executed. This host has no `/dev/davinci*`, so the topology sweep and the
+  poisoned-tail guard are compile-checked only, and `REQUIRE_PHYSICAL_ASCEND_950PR` would skip them on the
+  camodel by design.
+- The L1 slot ring's free edge (`tile + kCubeSlots < numTiles`) is no longer reached on the camodel: it needs
+  `kSlotRingFreeEdgeContext` = 192 tokens of context at block 64, and (b) now runs 128. The test prints which
+  side of that line it is on.
+- `m` and `L` are unchecked at S = 1 and S = 65, where a single-block context cannot be split.
+- (j) has not been seen to return. Its assertion passed at the one offset that ran before the timeout, and the
+  trim to `{1}` is sized from that run's timings rather than from a completed process.
+- The 950PR's own tail-mask path is what these tests aim at; the Cube decode's `ComputeTailMask` is covered
+  only by fused case (d), as before.

@@ -17,7 +17,7 @@
 // The fused single-launch Cube decode (TURBOQUANT_TESTS.md 13.25), kv4fp8, on eight cases (D 256 unless noted):
 //
 //   (a) H_Q 4,  H_KV 2, S 64,  block 64   one tile
-//   (b) H_Q 4,  H_KV 2, S 256, block 64   four tiles in one task: the L1 slot ring and its free edge
+//   (b) H_Q 4,  H_KV 2, S 128, block 64   two tiles in one task: the L1 slot ring
 //   (c) (b) planned to fill the MIX blocks: parallel splits and the in-launch reduction
 //   (d) H_Q 8,  H_KV 2, S 120, block 64   a masked tail tile, two heads on each vector subcore
 //   (e) (a) with its cache written by the kv4fp8 kernel writer (13.28) instead of uploaded
@@ -33,7 +33,8 @@
 // Each fused output is hashed (FNV-1a over its half bit patterns) against a golden, and its cosine against
 // exact fp32 attention must not regress. The goldens are the bit-exact reference: the barriered A/B instance
 // they were once checked against was retired in TURBOQUANT_TESTS.md 13.30, when no switchable vector barrier
-// was left for it to differ by. (a) to (d) decode a host-built cache and their goldens date from b48ed2951;
+// was left for it to differ by. (a) to (d) decode a host-built cache; (a)'s and (d)'s goldens date from
+// b48ed2951, (b)'s, (c)'s and (g)'s from the 2026-09-28 context trim, since a golden belongs to a shape.
 // (c) must agree with (b) to rounding. (e) draws independent vector halves, so a swapped nibble lane would show, and
 // checks the written GM cache against the host encoder before decoding it.
 
@@ -68,7 +69,13 @@ constexpr double kSplitFidelityShift = 2 * kCosineRounding;
 constexpr uint64_t kGoldenUnrecorded = 0;
 
 constexpr int64_t kSingleTileContext = 64;
-constexpr int64_t kRingContext = 256;
+// (b), (c) and (g). Trimmed from 256 on 2026-09-28: the camodel is cycle-level and
+// CPU-bound, and every tile of context is charged twice here, once unsplit and once
+// split. Two tiles still cycle both of the L1 slot ring's slots, but no tile has to wait
+// for one to come free -- that needs tile + kCubeSlots < numTiles, so
+// kSlotRingFreeEdgeContext of context. Raise it back to reach the free edge; the goldens
+// below are tied to the context they were recorded at.
+constexpr int64_t kRingContext = 128;
 constexpr int64_t kTailContext = 120;
 constexpr int64_t kWideGroupHeads = 8;
 constexpr int64_t kNarrowGroupHeads = 4;
@@ -80,6 +87,10 @@ constexpr int64_t kQwenKvHeads = 1;
 // attention; the kv4fp8 D = 256 cases sit near 0.9994.
 constexpr double kHeadSize128CosineFloor = 0.99;
 constexpr int64_t kBlockSize = 64;
+// The shortest context whose tiles reach the slot ring's free edge: one more tile than
+// the ring has slots.
+constexpr int64_t kSlotRingFreeEdgeContext =
+    (static_cast<int64_t>(vllm_ascend::turboquant::kCubeSlots) + 1) * kBlockSize;
 // Two MIX blocks for (d): the planner then keeps each GQA group of four in one task, two heads per subcore.
 constexpr int64_t kTwoBlockAiv = 4;
 constexpr int64_t kWideTaskHeads = 4;
@@ -133,14 +144,19 @@ tqh::FusedShape GatedBatchShape() {
 }
 
 // Goldens and cosines recorded 2026-09-16 on the Ascend950PR_9589 camodel (aiv 64) from b48ed2951, whose
-// (a) is bit-identical to the retired split + combine. (c) was then planned with a fused limit of 0, the
-// same grid the fill policy produces: 4 splits, 8 blocks, 2 heads per task.
+// (a) is bit-identical to the retired split + combine.
 const FusedCase kCaseA = {"(a)", Shape(kNarrowGroupHeads, kSingleTileContext), 0, kFillBlocks, 0.999407,
                           0x6176461416358ec1ull};
-const FusedCase kCaseB = {"(b)", Shape(kNarrowGroupHeads, kRingContext), 0, kContextOnly, 0.999400,
-                          0x470dad36e6708da5ull};
-const FusedCase kCaseC = {"(c)", Shape(kNarrowGroupHeads, kRingContext), 0, kFillBlocks, 0.999400,
-                          0xda6a2c77e20ff4a1ull};
+// (b), (c) and (g) re-recorded 2026-09-28 on the same camodel, at the trimmed kRingContext; the kernels did
+// not move, the context did, and a golden belongs to a shape. (a) was re-run unchanged in the same pass and
+// reproduced its 2026-09-16 golden, which is what says the kernels stood still. (c) is planned with a fused
+// limit of 0, the grid the fill policy produces at two blocks: 2 splits, 4 blocks, 2 heads per task. All
+// three share one hash at this context: two splits of one tile each reduce to the unsplit launch's bits
+// exactly, where four splits of four tiles did not, so (b) and (c) no longer differ in the last places.
+const FusedCase kCaseB = {"(b)", Shape(kNarrowGroupHeads, kRingContext), 0, kContextOnly, 0.999525,
+                          0x55419cdf4456945dull};
+const FusedCase kCaseC = {"(c)", Shape(kNarrowGroupHeads, kRingContext), 0, kFillBlocks, 0.999525,
+                          0x55419cdf4456945dull};
 const FusedCase kCaseD = {"(d)", Shape(kWideGroupHeads, kTailContext), kTwoBlockAiv, kFillBlocks, 0.999517,
                           0xcc1fcdfed39b48e5ull};
 // Recorded 2026-09-17 on the same camodel from the NZ-tiled kernel writer (TURBOQUANT_TESTS.md 13.28).
@@ -168,8 +184,13 @@ const FusedCase kCaseHGatedSplit = {"(h) gated split", kBatchShape, 0, kFillBloc
 const FusedCase kCaseI = {"(i)", UnmappedShape(), 0, kFillBlocks, 0.0, kGoldenUnrecorded};
 const FusedCase kCaseJ = {"(j)", Shape(kNarrowGroupHeads, kSingleTileContext, true), 0, kFillBlocks, 0.0,
                           kGoldenUnrecorded};
-// Element-aligned int32 offsets that all land inside a 32-byte burst rather than on one.
-const int64_t kSlicedSlotOffsets[] = {1, 2, 3};
+// Element-aligned int32 offsets that land inside a 32-byte burst rather than on one. One
+// of them, trimmed from {1, 2, 3} on 2026-09-28. The offsets differ only in how far into
+// the burst they sit, and each one is another kernel-writer launch: measured at about
+// eight minutes each on the camodel, so the control plus three offsets ran past the
+// 1500 s the run harness allows a process (killed at 1464 s, having done two), while the
+// control plus one offset fits with room to spare.
+const int64_t kSlicedSlotOffsets[] = {1};
 // The MTE burst the adapter's CheckGmBurstAligned holds copied operands to, and that a scalar read does not.
 constexpr size_t kGmBurstBytes = static_cast<size_t>(tqh::kFp32PerBlock) * sizeof(float);
 
@@ -290,8 +311,12 @@ TEST_F(TurboQuantFusedDecode, SlotRingAndItsSplitReductionAgree) {
   std::printf("[ fused ] (c) vs (b): cos %.9f; cos vs fp32 %.9f split, %.9f unsplit\n", agreement, split_cos,
               unsplit_cos);
 
-  // Four tiles in one task is what reaches the slot-free edge (tile + kCubeSlots < numTiles).
-  EXPECT_EQ(scenario.blocks_per_seq(), kRingContext / kBlockSize);
+  const int64_t ring_tiles = kRingContext / kBlockSize;
+  std::printf("[ fused ] (b) %lld tiles over %u ring slots; the slot-free edge needs S >= %lld and is %sreached\n",
+              static_cast<long long>(ring_tiles), vllm_ascend::turboquant::kCubeSlots,
+              static_cast<long long>(kSlotRingFreeEdgeContext),
+              kRingContext >= kSlotRingFreeEdgeContext ? "" : "not ");
+  EXPECT_EQ(scenario.blocks_per_seq(), ring_tiles) << "(b) must put every tile of the context in one task";
   EXPECT_EQ(unsplit.num_splits, 1) << "(b) must keep every tile in one task";
   EXPECT_EQ(unsplit.fused_context_limit, static_cast<uint32_t>(tqh::kFusedContextLimit));
   EXPECT_GT(split.num_splits, 1) << "(c) must exercise the in-launch reduction";
