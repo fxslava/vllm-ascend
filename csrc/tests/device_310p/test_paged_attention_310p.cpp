@@ -77,8 +77,7 @@ PagedLayoutFixture BuildPagedLayout(const DecodeCase& test_case, DeterministicRa
   fixture.layout.num_kv_heads = test_case.num_kv_heads;
   fixture.layout.head_size = test_case.head_size;
 
-  const int64_t blocks_per_seq =
-      (test_case.max_context_len + test_case.block_size - 1) / test_case.block_size;
+  const int64_t blocks_per_seq = (test_case.max_context_len + test_case.block_size - 1) / test_case.block_size;
   fixture.shape.max_blocks_per_seq = blocks_per_seq;
   fixture.layout.num_blocks = test_case.num_seqs * blocks_per_seq + 4;
 
@@ -102,17 +101,14 @@ PagedLayoutFixture BuildPagedLayout(const DecodeCase& test_case, DeterministicRa
     fixture.context_lens[static_cast<size_t>(seq)] = static_cast<int32_t>(context_len);
 
     for (int64_t block = 0; block < blocks_per_seq; ++block) {
-      fixture.block_table[static_cast<size_t>(seq * blocks_per_seq + block)] =
-          pool[static_cast<size_t>(next_block++)];
+      fixture.block_table[static_cast<size_t>(seq * blocks_per_seq + block)] = pool[static_cast<size_t>(next_block++)];
     }
 
     for (int64_t position = 0; position < context_len; ++position) {
       const int64_t logical_block = position / test_case.block_size;
       const int64_t block_offset = position % test_case.block_size;
-      const int32_t physical_block =
-          fixture.block_table[static_cast<size_t>(seq * blocks_per_seq + logical_block)];
-      fixture.slot_mapping.push_back(
-          static_cast<int32_t>(physical_block * test_case.block_size + block_offset));
+      const int32_t physical_block = fixture.block_table[static_cast<size_t>(seq * blocks_per_seq + logical_block)];
+      fixture.slot_mapping.push_back(static_cast<int32_t>(physical_block * test_case.block_size + block_offset));
     }
   }
 
@@ -135,9 +131,8 @@ TEST(PagedKvLayout, MatchesGetKvCacheShapeOn310P) {
       EXPECT_EQ(layout.hidden() % shapes::kKvCacheFractalWidth, 0)
           << heads.label << ": num_kv_heads * head_size must be a multiple of 16";
       EXPECT_EQ(layout.fractal_rows(), layout.hidden() / shapes::kKvCacheFractalWidth) << heads.label;
-      EXPECT_EQ(layout.ElementCount(),
-                static_cast<size_t>(layout.num_blocks * layout.fractal_rows() * block_size *
-                                    shapes::kKvCacheFractalWidth))
+      EXPECT_EQ(layout.ElementCount(), static_cast<size_t>(layout.num_blocks * layout.fractal_rows() * block_size *
+                                                           shapes::kKvCacheFractalWidth))
           << heads.label;
     }
   }
@@ -158,9 +153,8 @@ TEST(PagedKvLayout, OffsetsAreUniqueAndInBounds) {
           const size_t index = reference::NzCacheOffset(layout, block, offset, head, dim);
           ASSERT_LT(index, layout.ElementCount())
               << "block=" << block << " offset=" << offset << " head=" << head << " dim=" << dim;
-          ASSERT_TRUE(seen.insert(index).second)
-              << "duplicate cache offset " << index << " at block=" << block << " offset=" << offset
-              << " head=" << head << " dim=" << dim;
+          ASSERT_TRUE(seen.insert(index).second) << "duplicate cache offset " << index << " at block=" << block
+                                                 << " offset=" << offset << " head=" << head << " dim=" << dim;
         }
       }
     }
@@ -178,14 +172,13 @@ TEST(PagedKvLayout, ReshapeAndCacheRoundTripsThroughTheReference) {
   DeterministicRandom random(0x4b564341u);
   const int64_t num_tokens = 100;
 
-  const std::vector<float> key = random.NormalHalfExact(
-      static_cast<size_t>(num_tokens * layout.num_kv_heads * layout.head_size), 0.0f, 1.0f);
-  const std::vector<float> value = random.NormalHalfExact(
-      static_cast<size_t>(num_tokens * layout.num_kv_heads * layout.head_size), 0.0f, 1.0f);
+  const std::vector<float> key =
+      random.NormalHalfExact(static_cast<size_t>(num_tokens * layout.num_kv_heads * layout.head_size), 0.0f, 1.0f);
+  const std::vector<float> value =
+      random.NormalHalfExact(static_cast<size_t>(num_tokens * layout.num_kv_heads * layout.head_size), 0.0f, 1.0f);
 
   std::vector<int32_t> slot_mapping(static_cast<size_t>(num_tokens));
-  const std::vector<int32_t> slots =
-      random.Permutation(static_cast<int32_t>(layout.num_blocks * layout.block_size));
+  const std::vector<int32_t> slots = random.Permutation(static_cast<int32_t>(layout.num_blocks * layout.block_size));
   for (int64_t i = 0; i < num_tokens; ++i) {
     slot_mapping[static_cast<size_t>(i)] = slots[static_cast<size_t>(i)];
   }
@@ -320,10 +313,8 @@ TEST_P(ReshapeAndCache310PTest, WritesTheSameBytesAsTheHostScatter) {
 
   aclrtStream stream = AscendTestEnvironment::Instance().stream();
 
-  DeviceTensor key_device =
-      DeviceTensor::Half({num_tokens, test_case.num_kv_heads, test_case.head_size}, key);
-  DeviceTensor value_device =
-      DeviceTensor::Half({num_tokens, test_case.num_kv_heads, test_case.head_size}, value);
+  DeviceTensor key_device = DeviceTensor::Half({num_tokens, test_case.num_kv_heads, test_case.head_size}, key);
+  DeviceTensor value_device = DeviceTensor::Half({num_tokens, test_case.num_kv_heads, test_case.head_size}, value);
   DeviceTensor slot_device = DeviceTensor::Int32({num_tokens}, fixture.slot_mapping);
 
   const std::vector<int64_t> cache_dims = KvCacheDims(fixture.layout);
@@ -331,11 +322,10 @@ TEST_P(ReshapeAndCache310PTest, WritesTheSameBytesAsTheHostScatter) {
   DeviceTensor value_cache_device = DeviceTensor::HalfEmpty(cache_dims, kKvCacheFormat);
 
   RunAclnn<ops::ScatterPaKvCacheWorkspaceFn>(
-      ScatterPaKvCacheOp(), stream, key_device.get(), key_cache_device.get(), slot_device.get(),
-      value_device.get(), value_cache_device.get(), static_cast<const aclTensor*>(nullptr),
-      static_cast<const aclTensor*>(nullptr), static_cast<const aclTensor*>(nullptr), kCacheModeNorm,
-      static_cast<char*>(nullptr), static_cast<const aclIntArray*>(nullptr),
-      static_cast<const aclIntArray*>(nullptr));
+      ScatterPaKvCacheOp(), stream, key_device.get(), key_cache_device.get(), slot_device.get(), value_device.get(),
+      value_cache_device.get(), static_cast<const aclTensor*>(nullptr), static_cast<const aclTensor*>(nullptr),
+      static_cast<const aclTensor*>(nullptr), kCacheModeNorm, static_cast<char*>(nullptr),
+      static_cast<const aclIntArray*>(nullptr), static_cast<const aclIntArray*>(nullptr));
 
   std::vector<float> expected_key_cache(fixture.layout.ElementCount(), 0.0f);
   std::vector<float> expected_value_cache(fixture.layout.ElementCount(), 0.0f);
@@ -378,6 +368,6 @@ const DecodeCase kDecodeCases[] = {
 INSTANTIATE_TEST_SUITE_P(Qwen35, ReshapeAndCache310PTest, ::testing::ValuesIn(kDecodeCases), DecodeTestName);
 INSTANTIATE_TEST_SUITE_P(Qwen35, PagedAttention310PTest, ::testing::ValuesIn(kDecodeCases), DecodeTestName);
 
-}
-}
-}
+}  // namespace
+}  // namespace test
+}  // namespace vllm_ascend

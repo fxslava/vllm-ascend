@@ -44,8 +44,7 @@ bool SelectPartialRotaryPath(int64_t head_dim, int64_t rotary_dim, PartialRotary
 
 PartialRotaryPath ApplyPartialRotaryQK(void* q_data, void* k_data, const std::vector<float>& cos_full,
                                        const std::vector<float>& sin_full, int64_t tokens, int64_t q_heads,
-                                       int64_t kv_heads, int64_t head_dim, int64_t rotary_dim,
-                                       aclrtStream stream);
+                                       int64_t kv_heads, int64_t head_dim, int64_t rotary_dim, aclrtStream stream);
 
-}
-}
+}  // namespace test
+}  // namespace vllm_ascend

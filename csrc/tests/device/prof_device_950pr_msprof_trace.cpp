@@ -38,11 +38,13 @@
 #include "ascend950_shapes.hpp"
 #include "benchmark.hpp"
 #include "device_buffer.hpp"
+#include "env_utils.hpp"
 #include "fp16.hpp"
 #include "random_data.hpp"
 #include "test_harness.hpp"
 #include "turbo_quant_cpu.h"
 #include "turboquant_audit_models.hpp"
+#include "turboquant_audit_scenario.hpp"
 #include "turboquant_launch.hpp"
 
 namespace vllm_ascend {
@@ -55,6 +57,10 @@ namespace tqh = turboquant_host;
 namespace tqm = vllm_ascend::turboquant;
 namespace s950 = shapes950;
 
+using tqa::kBlockSize;
+using tqa::kCausalMaskSide;
+using tqa::kPatternTokens;
+
 constexpr const char* kTag = "[tq-trace]";
 constexpr const char* kLegTurboQuant = "TQ_Pipeline";
 constexpr const char* kLegNative = "V5_Native";
@@ -62,15 +68,11 @@ constexpr const char* kStartSuffix = "_Start";
 constexpr const char* kEndSuffix = "_End";
 constexpr const char* kAbortSuffix = "_Aborted";
 
-constexpr int64_t kBlockSize = s950::kDefaultBlockSize;
-constexpr int64_t kCausalMaskSide = 2048;
 constexpr int64_t kFiaSparseModeRightDownCausal = 3;
 constexpr int64_t kFiaNoPaging = 0;
-constexpr int64_t kPatternTokens = 1024;
 constexpr int64_t kContextMultiple = 8;
 constexpr int64_t kAnyPositive = 1;
 constexpr size_t kMaxListDigits = 9;
-constexpr size_t kReadbackElements = 1u << 20;
 constexpr size_t kPathCapacity = 4096;
 constexpr uint32_t kSeed = 0x7AC3u;
 constexpr std::chrono::milliseconds kTimelineGap(10);
@@ -111,22 +113,8 @@ struct Options {
   std::string mode;
 };
 
-std::vector<std::string> SplitCsv(const std::string& raw) {
-  std::vector<std::string> fields;
-  std::istringstream stream(raw);
-  std::string field;
-  while (std::getline(stream, field, ',')) {
-    if (!field.empty()) {
-      fields.push_back(field);
-    }
-  }
-  return fields;
-}
-
-std::string EnvOr(const char* name, const char* fallback) {
-  const char* raw = std::getenv(name);
-  return raw == nullptr || *raw == '\0' ? std::string(fallback) : std::string(raw);
-}
+using env::Or;
+using env::SplitCsv;
 
 bool TakeFlag(const char* arg, const char* flag, std::string* value) {
   const size_t length = std::strlen(flag);
@@ -180,8 +168,7 @@ bool ParseCounts(const std::string& raw, int64_t multiple, std::vector<int64_t>*
     return false;
   }
   for (const std::string& field : fields) {
-    const bool digits =
-        field.size() <= kMaxListDigits && field.find_first_not_of("0123456789") == std::string::npos;
+    const bool digits = field.size() <= kMaxListDigits && field.find_first_not_of("0123456789") == std::string::npos;
     const int64_t value = digits ? static_cast<int64_t>(std::strtoll(field.c_str(), nullptr, 10)) : 0;
     if (value <= 0 || value % multiple != 0) {
       std::ostringstream why;
@@ -246,10 +233,10 @@ bool Reject(const char* what, const std::string& error, int* exit_code) {
 }
 
 bool ParseCommandLine(int argc, char** argv, Options* options, int* exit_code) {
-  std::string models = EnvOr(kModelsEnv, "");
-  std::string contexts = EnvOr(kContextsEnv, kDefaultContexts);
-  std::string batches = EnvOr(kBatchesEnv, kDefaultBatches);
-  std::string mode = EnvOr(kModeEnv, kDefaultMode);
+  std::string models = Or(kModelsEnv, "");
+  std::string contexts = Or(kContextsEnv, kDefaultContexts);
+  std::string batches = Or(kBatchesEnv, kDefaultBatches);
+  std::string mode = Or(kModeEnv, kDefaultMode);
   for (int index = 1; index < argc; ++index) {
     const char* arg = argv[index];
     if (TakeFlag(arg, kModelsFlag, &models) || TakeFlag(arg, kContextsFlag, &contexts) ||
@@ -324,41 +311,8 @@ std::vector<TraceConfig> BuildShapes(const Options& options) {
   return shapes;
 }
 
-size_t Elements(int64_t a, int64_t b, int64_t c) {
-  return static_cast<size_t>(a) * static_cast<size_t>(b) * static_cast<size_t>(c);
-}
-
-template <typename T>
-void TileToDevice(const DeviceBuffer& dst, const std::vector<T>& pattern) {
-  const size_t total = dst.size_bytes();
-  const size_t chunk = pattern.size() * sizeof(T);
-  if (chunk == 0) {
-    return;
-  }
-  for (size_t offset = 0; offset < total; offset += chunk) {
-    const size_t bytes = std::min(chunk, total - offset);
-    ACL_CHECK(aclrtMemcpy(static_cast<char*>(dst.get()) + offset, dst.capacity_bytes() - offset, pattern.data(),
-                          bytes, ACL_MEMCPY_HOST_TO_DEVICE));
-  }
-}
-
-std::vector<float> Rotated(std::vector<float> values, int64_t head_size) {
-  const std::vector<int8_t> signs = turboquant_ref::cpu_pi_sign_vector(static_cast<int>(head_size));
-  const size_t row = static_cast<size_t>(head_size);
-  for (size_t base = 0; base + row <= values.size(); base += row) {
-    turboquant_ref::cpu_apply_pi(values.data() + base, static_cast<int>(head_size), signs.data());
-  }
-  return values;
-}
-
-template <typename T>
-std::vector<T> Leading(const DeviceBuffer& buffer) {
-  std::vector<T> host(std::min(buffer.size_bytes() / sizeof(T), kReadbackElements));
-  if (!host.empty()) {
-    buffer.CopyToHost(host.data(), host.size() * sizeof(T));
-  }
-  return host;
-}
+using tqa::Elements;
+using tqa::TileToDevice;
 
 double Magnitude(const std::vector<float>& values) {
   double sum = 0.0;
@@ -368,8 +322,8 @@ double Magnitude(const std::vector<float>& values) {
   return sum;
 }
 
-double HalfMagnitude(const DeviceBuffer& buffer) { return Magnitude(HalfToFloat(Leading<Half>(buffer))); }
-double FloatMagnitude(const DeviceBuffer& buffer) { return Magnitude(Leading<float>(buffer)); }
+double HalfMagnitude(const DeviceBuffer& buffer) { return Magnitude(HalfToFloat(tqa::LeadingElements<Half>(buffer))); }
+double FloatMagnitude(const DeviceBuffer& buffer) { return Magnitude(tqa::LeadingElements<float>(buffer)); }
 
 using MstxMarkFn = void (*)(const char*, aclrtStream);
 using MstxRangeStartFn = uint64_t (*)(const char*, aclrtStream);
@@ -530,8 +484,8 @@ void PlanNative(const AclnnOp& op, NativeLaunch* launch, Args... args) {
   if (!op.available()) {
     throw AclError(op.unavailable_reason().c_str(), __FILE__, __LINE__, -1);
   }
-  const int status = reinterpret_cast<WorkspaceSizeFn>(op.get_workspace_size_fn())(
-      args..., &launch->workspace_size, &launch->executor);
+  const int status = reinterpret_cast<WorkspaceSizeFn>(op.get_workspace_size_fn())(args..., &launch->workspace_size,
+                                                                                   &launch->executor);
   if (status != 0) {
     const std::string label = op.name() + "GetWorkspaceSize";
     throw AclError(label.c_str(), __FILE__, __LINE__, status);
@@ -597,8 +551,7 @@ class DecodeScenario final : public Scenario {
     const int64_t pattern = std::min<int64_t>(context, kPatternTokens);
 
     const std::vector<Half> key_pattern = FloatToHalf(rng_.NormalHalfExact(Elements(pattern, hkv, d), 0.0f, 1.0f));
-    const std::vector<Half> value_pattern =
-        FloatToHalf(rng_.NormalHalfExact(Elements(pattern, hkv, d), 0.0f, 1.0f));
+    const std::vector<Half> value_pattern = FloatToHalf(rng_.NormalHalfExact(Elements(pattern, hkv, d), 0.0f, 1.0f));
     key_ctx_ = DeviceBuffer::Empty<Half>(Elements(context, hkv, d), kBenchmarkAlignBytes);
     value_ctx_ = DeviceBuffer::Empty<Half>(Elements(context, hkv, d), kBenchmarkAlignBytes);
     TileToDevice(key_ctx_, key_pattern);
@@ -636,13 +589,13 @@ class DecodeScenario final : public Scenario {
 
     size_t workspace_floats = 0;
     if (config.path == tqa::PathMode::kCube) {
-      key_cache_ = DeviceBuffer::Empty<int8_t>(
-          tqh::ModePackedCacheBytes(kCubeMode, pool_blocks, kBlockSize, hkv, d), kBenchmarkAlignBytes);
+      key_cache_ = DeviceBuffer::Empty<int8_t>(tqh::ModePackedCacheBytes(kCubeMode, pool_blocks, kBlockSize, hkv, d),
+                                               kBenchmarkAlignBytes);
       write_tables_ = DeviceBuffer::FromHost(tqh::ModeTables(kCubeMode, d, 1, 0), kBenchmarkAlignBytes);
-      decode_tables_ = DeviceBuffer::FromHost(
-          tqh::ModeTables(kCubeMode, d, tqh::kUnpackRows, tqh::kCubeTileRows), kBenchmarkAlignBytes);
-      cube_grid_ = tqh::PlanFusedDecode(batch, hq, hkv, d, blocks_per_seq, kBlockSize, aiv_num,
-                                        tqh::kFusedContextLimit, tqa::SplitPolicy());
+      decode_tables_ = DeviceBuffer::FromHost(tqh::ModeTables(kCubeMode, d, tqh::kUnpackRows, tqh::kCubeTileRows),
+                                              kBenchmarkAlignBytes);
+      cube_grid_ = tqh::PlanFusedDecode(batch, hq, hkv, d, blocks_per_seq, kBlockSize, aiv_num, tqh::kFusedContextLimit,
+                                        tqa::SplitPolicy());
       num_splits_ = cube_grid_.num_splits;
       workspace_floats = cube_grid_.workspace_floats;
     } else {
@@ -662,10 +615,10 @@ class DecodeScenario final : public Scenario {
     query_tensor_.reset(new AclnnTensor({batch, hq, d}, ACL_FLOAT16, query_.get()));
     out_v5_tensor_.reset(new AclnnTensor({batch, hq, d}, ACL_FLOAT16, out_v5_.get()));
     lse_v5_tensor_.reset(new AclnnTensor({1}, ACL_FLOAT16, lse_v5_.get()));
-    key_view_.reset(new AclnnTensor(s950::FiaKeyCacheView(pool_blocks, kBlockSize, hkv, d), ACL_FLOAT16,
-                                    fp16_key_cache_.get()));
-    value_view_.reset(new AclnnTensor(s950::FiaKeyCacheView(pool_blocks, kBlockSize, hkv, d), ACL_FLOAT16,
-                                      fp16_value_cache_.get()));
+    key_view_.reset(
+        new AclnnTensor(s950::FiaKeyCacheView(pool_blocks, kBlockSize, hkv, d), ACL_FLOAT16, fp16_key_cache_.get()));
+    value_view_.reset(
+        new AclnnTensor(s950::FiaKeyCacheView(pool_blocks, kBlockSize, hkv, d), ACL_FLOAT16, fp16_value_cache_.get()));
     block_table_tensor_.reset(new AclnnTensor({batch, blocks_per_seq}, ACL_INT32, block_tables_.get()));
     key_list_.reset(new AclnnTensorList({key_view_->get()}));
     value_list_.reset(new AclnnTensorList({value_view_->get()}));
@@ -721,18 +674,13 @@ class DecodeScenario final : public Scenario {
     {
       const TraceRange range(markers, "V5_GetWorkspaceSize", nullptr);
       PlanNative<ops950::FusedInferAttentionScoreV5WorkspaceFn>(
-          FiaV5(), &launch, query_tensor_->get(), key_list_->get(), value_list_->get(), nullptr, nullptr,
-          seq_q_->get(), seq_kv_->get(), nullptr,
-          nullptr, nullptr, nullptr, nullptr,
-          nullptr, nullptr, block_table_tensor_->get(),
-          nullptr, nullptr, nullptr, nullptr,
-          nullptr, nullptr, nullptr, nullptr,
-          nullptr, nullptr, nullptr, nullptr,
-          nullptr, nullptr, nullptr, nullptr,
-          hq, scale, s950::kFiaUnboundedTokens, s950::kFiaUnboundedTokens,
+          FiaV5(), &launch, query_tensor_->get(), key_list_->get(), value_list_->get(), nullptr, nullptr, seq_q_->get(),
+          seq_kv_->get(), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, block_table_tensor_->get(),
+          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+          nullptr, nullptr, nullptr, nullptr, hq, scale, s950::kFiaUnboundedTokens, s950::kFiaUnboundedTokens,
           const_cast<char*>(ops950::kFiaLayoutTnd), hkv, s950::kFiaSparseModeNone, s950::kFiaInnerPreciseDefault,
-          kBlockSize, 0, false, 0, 0, s950::kFiaQueryQuantModeNone, s950::kFiaPseTypeDefault,
-          out_v5_tensor_->get(), lse_v5_tensor_->get());
+          kBlockSize, 0, false, 0, 0, s950::kFiaQueryQuantModeNone, s950::kFiaPseTypeDefault, out_v5_tensor_->get(),
+          lse_v5_tensor_->get());
     }
     {
       const TraceRange range(markers, "V5_Launch", stream);
@@ -753,20 +701,17 @@ class DecodeScenario final : public Scenario {
     const uint32_t kv_heads = static_cast<uint32_t>(config_.model.num_kv_heads);
     const uint32_t head_size = static_cast<uint32_t>(config_.model.head_size);
     if (config_.path == tqa::PathMode::kCube) {
-      turboquant_mm_reshape_and_cache_impl(static_cast<int32_t>(kCubeMode), AscendType::FP16, stream, grid.block_dim,
-                                           key_ctx_.get(), value_ctx_.get(), key_cache_.get(), value_cache_.get(),
-                                           scale_plane_.get(), slots_.get(), pi_signs_.get(), rot_tables_.get(),
-                                           write_tables_.get(), tokens, kv_heads, head_size,
-                                           static_cast<uint32_t>(kBlockSize),
-                                           static_cast<uint32_t>(config_.pool_blocks()), grid.tokens_per_core,
-                                           config_.attention_scale());
+      turboquant_mm_reshape_and_cache_impl(
+          static_cast<int32_t>(kCubeMode), AscendType::FP16, stream, grid.block_dim, key_ctx_.get(), value_ctx_.get(),
+          key_cache_.get(), value_cache_.get(), scale_plane_.get(), slots_.get(), pi_signs_.get(), rot_tables_.get(),
+          write_tables_.get(), tokens, kv_heads, head_size, static_cast<uint32_t>(kBlockSize),
+          static_cast<uint32_t>(config_.pool_blocks()), grid.tokens_per_core, config_.attention_scale());
     } else {
       turboquant_reshape_and_cache_impl(AscendType::FP16, stream, grid.block_dim, key_ctx_.get(), value_ctx_.get(),
                                         key_cache_.get(), value_cache_.get(), scale_plane_.get(), slots_.get(),
                                         pi_signs_.get(), write_tables_.get(), tokens, kv_heads, head_size,
-                                        static_cast<uint32_t>(kBlockSize),
-                                        static_cast<uint32_t>(config_.pool_blocks()), grid.tokens_per_core,
-                                        config_.attention_scale());
+                                        static_cast<uint32_t>(kBlockSize), static_cast<uint32_t>(config_.pool_blocks()),
+                                        grid.tokens_per_core, config_.attention_scale());
     }
     ACL_CHECK(aclrtSynchronizeStream(stream));
   }
@@ -827,15 +772,15 @@ class PrefillScenario final : public Scenario {
     value_ctx_rot_ = DeviceBuffer::Empty<Half>(Elements(context, hkv, d), kBenchmarkAlignBytes);
     TileToDevice(key_ctx_, FloatToHalf(key_pattern));
     TileToDevice(value_ctx_, FloatToHalf(value_pattern));
-    TileToDevice(key_ctx_rot_, FloatToHalf(Rotated(key_pattern, d)));
-    TileToDevice(value_ctx_rot_, FloatToHalf(Rotated(value_pattern, d)));
+    TileToDevice(key_ctx_rot_, FloatToHalf(tqa::RotatePiRows(key_pattern, d)));
+    TileToDevice(value_ctx_rot_, FloatToHalf(tqa::RotatePiRows(value_pattern, d)));
 
     const int64_t query_pattern = std::min<int64_t>(chunk, kPatternTokens);
     const std::vector<float> query_host = rng_.NormalHalfExact(Elements(query_pattern, hq, d), 0.0f, 1.0f);
     query_ = DeviceBuffer::Empty<Half>(Elements(chunk, hq, d), kBenchmarkAlignBytes);
     query_rot_half_ = DeviceBuffer::Empty<Half>(Elements(chunk, hq, d), kBenchmarkAlignBytes);
     TileToDevice(query_, FloatToHalf(query_host));
-    TileToDevice(query_rot_half_, FloatToHalf(Rotated(query_host, d)));
+    TileToDevice(query_rot_half_, FloatToHalf(tqa::RotatePiRows(query_host, d)));
     query_rot_ = DeviceBuffer::Empty<float>(Elements(chunk, hq, d), kBenchmarkAlignBytes);
 
     out_tq_ = DeviceBuffer::Empty<Half>(Elements(chunk, hq, d), kBenchmarkAlignBytes);
@@ -929,13 +874,12 @@ class PrefillScenario final : public Scenario {
   double NativeMagnitude() const override { return HalfMagnitude(out_v5_); }
 
  private:
-  void PlanPrefill(NativeLaunch* launch, const aclTensor* query, const aclTensorList* key,
-                   const aclTensorList* value, const aclTensor* out, const aclTensor* lse) const {
+  void PlanPrefill(NativeLaunch* launch, const aclTensor* query, const aclTensorList* key, const aclTensorList* value,
+                   const aclTensor* out, const aclTensor* lse) const {
     PlanNative<ops950::FusedInferAttentionScoreV5WorkspaceFn>(
-        FiaV5(), launch, query, key, value, nullptr, mask_tensor_->get(), seq_q_->get(), seq_kv_->get(),
-        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        FiaV5(), launch, query, key, value, nullptr, mask_tensor_->get(), seq_q_->get(), seq_kv_->get(), nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
         config_.model.num_heads, static_cast<double>(config_.attention_scale()), s950::kFiaUnboundedTokens,
         s950::kFiaUnboundedTokens, const_cast<char*>(ops950::kFiaLayoutTnd), config_.model.num_kv_heads,
         kFiaSparseModeRightDownCausal, s950::kFiaInnerPreciseDefault, kFiaNoPaging, 0, false, 0, 0,
@@ -1065,10 +1009,11 @@ void PrintBanner(const Options& options, const std::vector<TraceConfig>& shapes,
               JoinCounts(options.batches).c_str(), options.mode.c_str());
   std::printf("%s   the first shape also carries each kernel's and the operator's first-launch cost\n", kTag);
   if (std::find(options.phases.begin(), options.phases.end(), Phase::kPrefill) != options.phases.end()) {
-    std::printf("%s   prefill: FIA reads a host-rotated fp16 query, because the fp32 -> fp16 narrowing after\n"
-                "%s   rotate_q has no header-verified operator; both prefill legs plan FIA V5, so the second\n"
-                "%s   may reuse operator state the first created\n",
-                kTag, kTag, kTag);
+    std::printf(
+        "%s   prefill: FIA reads a host-rotated fp16 query, because the fp32 -> fp16 narrowing after\n"
+        "%s   rotate_q has no header-verified operator; both prefill legs plan FIA V5, so the second\n"
+        "%s   may reuse operator state the first created\n",
+        kTag, kTag, kTag);
   }
   std::printf("%s collect the trace with:\n%s   %s\n", kTag, kTag, command.c_str());
   std::printf("%s then export it with:\n%s   msprof --export=on --output=%s\n", kTag, kTag, kMsprofOutput);
@@ -1096,8 +1041,8 @@ void PrintRuntime(const AscendDevice& device, int64_t aiv_num, bool aiv_queried,
     std::printf("%s markers: %s did not resolve; aclprofMarkEx point marks only, ranges become _Start/_End marks\n",
                 kTag, kMstxLibrary);
   } else {
-    std::printf("%s markers: NONE -- neither %s nor aclprofMarkEx resolved; the timeline will carry no labels\n",
-                kTag, kMstxLibrary);
+    std::printf("%s markers: NONE -- neither %s nor aclprofMarkEx resolved; the timeline will carry no labels\n", kTag,
+                kMstxLibrary);
   }
   std::fflush(stdout);
 }
@@ -1112,8 +1057,7 @@ int Run(int argc, char** argv) {
   PrintBanner(options, shapes, MsprofCommand(options, SelfExecutable(argv[0])));
 
   if (IsRunningOnSimulator()) {
-    std::printf("%s CAModel loaded (%s); this harness traces silicon, skipping\n", kTag,
-                SimulatorEvidence().c_str());
+    std::printf("%s CAModel loaded (%s); this harness traces silicon, skipping\n", kTag, SimulatorEvidence().c_str());
     return bench::kBenchmarkSkipExitCode;
   }
   std::unique_ptr<AscendDevice> device;
@@ -1148,9 +1092,9 @@ int Run(int argc, char** argv) {
   return failures == 0 ? kExitOk : kExitFailure;
 }
 
-}
-}
-}
-}
+}  // namespace
+}  // namespace trace
+}  // namespace test
+}  // namespace vllm_ascend
 
 int main(int argc, char** argv) { return ::vllm_ascend::test::trace::Run(argc, argv); }

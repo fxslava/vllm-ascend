@@ -727,12 +727,24 @@ if(VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE)
     # The Torch-free binding: the two _impl prototypes, the codec table builder
     # and the grid arithmetic that turboquant_torch_adpt.h would have done with
     # ATen. Carries the reference/ include directory because the Pi diagonal
-    # comes from the CPU reference rather than from a second generator.
-    add_library(vllm_ascend_test_turboquant STATIC common/turboquant_launch.cpp)
+    # comes from the CPU reference rather than from a second generator. The
+    # TurboQuant audit's data model and reporting
+    # (turboquant_audit_scenario / turboquant_audit_report) ride here too: they
+    # are host-side code, but only the binaries that link this library - the
+    # TurboQuant bench, the msprof trace and the kernel tests - consume them.
+    add_library(vllm_ascend_test_turboquant STATIC
+      common/turboquant_launch.cpp
+      common/turboquant_audit_scenario.cpp
+      common/turboquant_audit_report.cpp)
     target_link_libraries(vllm_ascend_test_turboquant PUBLIC vllm_ascend_turboquant_tiling)
 
     target_include_directories(vllm_ascend_test_turboquant
       PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/reference")
+
+    target_compile_options(vllm_ascend_test_turboquant PUBLIC -Wall -Wextra)
+    if(VLLM_ASCEND_TESTS_WERROR)
+      target_compile_options(vllm_ascend_test_turboquant PUBLIC -Werror)
+    endif()
 
     target_link_libraries(vllm_ascend_test_turboquant
       PUBLIC vllm_ascend_test_common_950pr vllm_ascend_turboquant)

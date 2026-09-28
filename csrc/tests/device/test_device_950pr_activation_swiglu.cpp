@@ -28,6 +28,7 @@
 #include "cpu_reference.hpp"
 #include "device_tensor.hpp"
 #include "fp16.hpp"
+#include "op_test_fixture.hpp"
 #include "random_data.hpp"
 #include "tensor_compare.hpp"
 #include "test_harness.hpp"
@@ -57,8 +58,7 @@ std::vector<float> RunSwiGluOnDevice(const std::vector<float>& x, int64_t num_to
 }
 
 TEST(SwiGlu950PrReference, MatchesClosedFormAtKnownPoints) {
-  const std::vector<float> x = {0.0f, 1.0f, -1.0f, 2.0f,
-                                3.0f, 2.0f, 5.0f, 0.0f};
+  const std::vector<float> x = {0.0f, 1.0f, -1.0f, 2.0f, 3.0f, 2.0f, 5.0f, 0.0f};
   std::vector<float> out;
   reference::SiluAndMul(x, 1, 4, &out);
 
@@ -98,7 +98,7 @@ TEST_P(SwiGlu950PrTest, MatchesCpuReference) {
   std::vector<float> expected;
   reference::SiluAndMul(x, num_tokens(), intermediate(), &expected);
 
-  EXPECT_TENSORS_ALLCLOSE(actual, QuantizeToHalf(expected), kFp16DefaultTolerance);
+  EXPECT_HALF_TENSORS_ALLCLOSE(actual, expected);
 }
 
 TEST_P(SwiGlu950PrTest, SplitsTheInputAtTheHalfwayPoint) {
@@ -153,17 +153,11 @@ TEST_P(SwiGlu950PrTest, SaturatesRatherThanOverflowsOnLargeGates) {
   }
 }
 
-std::string SwiGluTestName(const ::testing::TestParamInfo<std::tuple<int64_t, int64_t>>& info) {
-  std::ostringstream name;
-  name << "tokens" << std::get<0>(info.param) << "_intermediate" << std::get<1>(info.param);
-  return name.str();
-}
-
 INSTANTIATE_TEST_SUITE_P(Qwen35, SwiGlu950PrTest,
                          ::testing::Combine(::testing::ValuesIn(s::TokenCounts()),
                                             ::testing::ValuesIn(s::IntermediateSizes())),
-                         SwiGluTestName);
+                         op_case::TupleName("tokens", "intermediate"));
 
-}
-}
-}
+}  // namespace
+}  // namespace test
+}  // namespace vllm_ascend

@@ -145,29 +145,30 @@ tqh::FusedShape GatedBatchShape() {
 
 // Goldens and cosines recorded 2026-09-16 on the Ascend950PR_9589 camodel (aiv 64) from b48ed2951, whose
 // (a) is bit-identical to the retired split + combine.
-const FusedCase kCaseA = {"(a)", Shape(kNarrowGroupHeads, kSingleTileContext), 0, kFillBlocks, 0.999407,
-                          0x6176461416358ec1ull};
+const FusedCase kCaseA = {
+    "(a)", Shape(kNarrowGroupHeads, kSingleTileContext), 0, kFillBlocks, 0.999407, 0x6176461416358ec1ull};
 // (b), (c) and (g) re-recorded 2026-09-28 on the same camodel, at the trimmed kRingContext; the kernels did
 // not move, the context did, and a golden belongs to a shape. (a) was re-run unchanged in the same pass and
 // reproduced its 2026-09-16 golden, which is what says the kernels stood still. (c) is planned with a fused
 // limit of 0, the grid the fill policy produces at two blocks: 2 splits, 4 blocks, 2 heads per task. All
 // three share one hash at this context: two splits of one tile each reduce to the unsplit launch's bits
 // exactly, where four splits of four tiles did not, so (b) and (c) no longer differ in the last places.
-const FusedCase kCaseB = {"(b)", Shape(kNarrowGroupHeads, kRingContext), 0, kContextOnly, 0.999525,
-                          0x55419cdf4456945dull};
-const FusedCase kCaseC = {"(c)", Shape(kNarrowGroupHeads, kRingContext), 0, kFillBlocks, 0.999525,
-                          0x55419cdf4456945dull};
-const FusedCase kCaseD = {"(d)", Shape(kWideGroupHeads, kTailContext), kTwoBlockAiv, kFillBlocks, 0.999517,
-                          0xcc1fcdfed39b48e5ull};
+const FusedCase kCaseB = {
+    "(b)", Shape(kNarrowGroupHeads, kRingContext), 0, kContextOnly, 0.999525, 0x55419cdf4456945dull};
+const FusedCase kCaseC = {
+    "(c)", Shape(kNarrowGroupHeads, kRingContext), 0, kFillBlocks, 0.999525, 0x55419cdf4456945dull};
+const FusedCase kCaseD = {
+    "(d)", Shape(kWideGroupHeads, kTailContext), kTwoBlockAiv, kFillBlocks, 0.999517, 0xcc1fcdfed39b48e5ull};
 // Recorded 2026-09-17 on the same camodel from the NZ-tiled kernel writer (TURBOQUANT_TESTS.md 13.28).
-const FusedCase kCaseE = {"(e)", Shape(kNarrowGroupHeads, kSingleTileContext, true), 0, kFillBlocks, 0.999576,
-                          0x9ffe02efde1506cfull};
+const FusedCase kCaseE = {
+    "(e)", Shape(kNarrowGroupHeads, kSingleTileContext, true), 0, kFillBlocks, 0.999576, 0x9ffe02efde1506cfull};
 // Recorded 2026-09-17 on the same camodel from 539d4ab63 plus this case (TURBOQUANT_TESTS.md 13.32).
-const FusedCase kCaseF = {"(f)", Shape(kNarrowGroupHeads, kSingleTileContext, false, kQwenKvHeads, kQwenHeadSize), 0,
-                          kFillBlocks, 0.999543, 0xedc60ea1714295f1ull};
+const FusedCase kCaseF = {"(f)",    Shape(kNarrowGroupHeads, kSingleTileContext, false, kQwenKvHeads, kQwenHeadSize),
+                          0,        kFillBlocks,
+                          0.999543, 0xedc60ea1714295f1ull};
 // (c)'s grid and golden: the in-launch AIV rotation runs the same ApplyPi as rotate_q's AIV path, which is the
 // path rotate_q takes for four vectors, so nothing downstream of the query may move.
-const FusedCase kCaseG = {"(g)", kCaseC.shape, kCaseC.plan_aiv, kCaseC.split_policy, kCaseC.recorded_cosine,
+const FusedCase kCaseG = {"(g)",        kCaseC.shape, kCaseC.plan_aiv, kCaseC.split_policy, kCaseC.recorded_cosine,
                           kCaseC.golden};
 // Recorded 2026-09-17 on the same camodel from 2d516f529 plus the output stage (TURBOQUANT_TESTS.md 13.36). The
 // gated split shares the unsplit golden: the reduction's output stage is the fused path's, bit for bit.
@@ -182,8 +183,8 @@ const FusedCase kCaseHGatedSplit = {"(h) gated split", kBatchShape, 0, kFillBloc
 // worth of context on purpose -- the camodel charges by the launch, and these two assert reachability and
 // addressing, which the smallest shape shows as well as any.
 const FusedCase kCaseI = {"(i)", UnmappedShape(), 0, kFillBlocks, 0.0, kGoldenUnrecorded};
-const FusedCase kCaseJ = {"(j)", Shape(kNarrowGroupHeads, kSingleTileContext, true), 0, kFillBlocks, 0.0,
-                          kGoldenUnrecorded};
+const FusedCase kCaseJ = {
+    "(j)", Shape(kNarrowGroupHeads, kSingleTileContext, true), 0, kFillBlocks, 0.0, kGoldenUnrecorded};
 // Element-aligned int32 offsets that land inside a 32-byte burst rather than on one. One
 // of them, trimmed from {1, 2, 3} on 2026-09-28. The offsets differ only in how far into
 // the burst they sit, and each one is another kernel-writer launch: measured at about
@@ -196,22 +197,24 @@ constexpr size_t kGmBurstBytes = static_cast<size_t>(tqh::kFp32PerBlock) * sizeo
 
 void PrintShape(const FusedCase& fused_case, int64_t aiv_num, bool queried) {
   const tqh::FusedShape& shape = fused_case.shape;
-  std::printf("[ fused ] %s kv4fp8 B=%lld H_Q=%lld H_KV=%lld D=%lld block=%lld S=%lld aiv=%lld%s plan_aiv=%lld %s%s%s\n",
-              fused_case.tag, static_cast<long long>(shape.batch), static_cast<long long>(shape.num_heads),
-              static_cast<long long>(shape.num_kv_heads), static_cast<long long>(shape.head_size),
-              static_cast<long long>(shape.block_size), static_cast<long long>(shape.context_len),
-              static_cast<long long>(aiv_num), queried ? "" : " (fallback core count)",
-              static_cast<long long>(fused_case.plan_aiv > 0 ? fused_case.plan_aiv : aiv_num),
-              fused_case.split_policy == kFillBlocks ? "fill-blocks" : "context-only",
-              shape.kernel_writer ? " kernel-writer" : "", shape.gated ? " gated" : "");
+  std::printf(
+      "[ fused ] %s kv4fp8 B=%lld H_Q=%lld H_KV=%lld D=%lld block=%lld S=%lld aiv=%lld%s plan_aiv=%lld %s%s%s\n",
+      fused_case.tag, static_cast<long long>(shape.batch), static_cast<long long>(shape.num_heads),
+      static_cast<long long>(shape.num_kv_heads), static_cast<long long>(shape.head_size),
+      static_cast<long long>(shape.block_size), static_cast<long long>(shape.context_len),
+      static_cast<long long>(aiv_num), queried ? "" : " (fallback core count)",
+      static_cast<long long>(fused_case.plan_aiv > 0 ? fused_case.plan_aiv : aiv_num),
+      fused_case.split_policy == kFillBlocks ? "fill-blocks" : "context-only",
+      shape.kernel_writer ? " kernel-writer" : "", shape.gated ? " gated" : "");
 }
 
 void PrintRun(const char* tag, const char* label, const tqh::FusedRun& run, const std::vector<float>& reference) {
-  std::printf("  %s %-16s launches=%lld splits=%lld block_dim=%u heads/task=%u limit=%u untouched=%zu "
-              "fnv1a=0x%016llx cos_vs_fp32=%.6f %.1f s\n",
-              tag, label, static_cast<long long>(run.launches), static_cast<long long>(run.num_splits),
-              run.block_dim, run.heads_per_task, run.fused_context_limit, run.untouched,
-              static_cast<unsigned long long>(run.fnv1a), tqh::FusedCosine(run.output, reference), run.host_s);
+  std::printf(
+      "  %s %-16s launches=%lld splits=%lld block_dim=%u heads/task=%u limit=%u untouched=%zu "
+      "fnv1a=0x%016llx cos_vs_fp32=%.6f %.1f s\n",
+      tag, label, static_cast<long long>(run.launches), static_cast<long long>(run.num_splits), run.block_dim,
+      run.heads_per_task, run.fused_context_limit, run.untouched, static_cast<unsigned long long>(run.fnv1a),
+      tqh::FusedCosine(run.output, reference), run.host_s);
 }
 
 // Runs a case through the fused kernel (the raw-query entry, with output_stage, when raw_query) and checks what
@@ -223,8 +226,7 @@ tqh::FusedRun RunCase(tqh::FusedCubeScenario* scenario, const FusedCase& fused_c
   const std::string tag(fused_case.tag);
 
   watchdog->Arm(tag + (raw_query ? " turboquant_mm_fused_decode_raw_query_impl" : " turboquant_mm_fused_decode_impl"));
-  const tqh::FusedRun fused =
-      raw_query ? scenario->RunFusedRawQuery(grid, output_stage) : scenario->RunFused(grid);
+  const tqh::FusedRun fused = raw_query ? scenario->RunFusedRawQuery(grid, output_stage) : scenario->RunFused(grid);
   watchdog->Disarm();
   PrintRun(fused_case.tag, "fused", fused, reference);
 
@@ -234,8 +236,7 @@ tqh::FusedRun RunCase(tqh::FusedCubeScenario* scenario, const FusedCase& fused_c
                 static_cast<unsigned long long>(fused.fnv1a));
   }
   if (fused_case.recorded_cosine > 0.0) {
-    std::printf("[ fused ] %s cos vs fp32 %.6f (recorded %.6f)\n", fused_case.tag, cosine,
-                fused_case.recorded_cosine);
+    std::printf("[ fused ] %s cos vs fp32 %.6f (recorded %.6f)\n", fused_case.tag, cosine, fused_case.recorded_cosine);
   }
 
   EXPECT_EQ(fused.launches, 1) << tag;
@@ -264,8 +265,8 @@ size_t CountDiffs(const std::vector<T>& got, const std::vector<T>& want) {
 
 void ExpectNoExceptionDumps(const char* tag) {
   const DumpCensus dumps = ExceptionDumps();
-  std::printf("[ fused ] %s excp dumps in cwd: %zu files, %zu non-empty, %llu B\n", tag, dumps.files,
-              dumps.non_empty, static_cast<unsigned long long>(dumps.bytes));
+  std::printf("[ fused ] %s excp dumps in cwd: %zu files, %zu non-empty, %llu B\n", tag, dumps.files, dumps.non_empty,
+              static_cast<unsigned long long>(dumps.bytes));
   EXPECT_EQ(dumps.non_empty, 0u) << tag << ": the camodel wrote an exception dump";
 }
 
@@ -314,8 +315,7 @@ TEST_F(TurboQuantFusedDecode, SlotRingAndItsSplitReductionAgree) {
   const int64_t ring_tiles = kRingContext / kBlockSize;
   std::printf("[ fused ] (b) %lld tiles over %u ring slots; the slot-free edge needs S >= %lld and is %sreached\n",
               static_cast<long long>(ring_tiles), vllm_ascend::turboquant::kCubeSlots,
-              static_cast<long long>(kSlotRingFreeEdgeContext),
-              kRingContext >= kSlotRingFreeEdgeContext ? "" : "not ");
+              static_cast<long long>(kSlotRingFreeEdgeContext), kRingContext >= kSlotRingFreeEdgeContext ? "" : "not ");
   EXPECT_EQ(scenario.blocks_per_seq(), ring_tiles) << "(b) must put every tile of the context in one task";
   EXPECT_EQ(unsplit.num_splits, 1) << "(b) must keep every tile in one task";
   EXPECT_EQ(unsplit.fused_context_limit, static_cast<uint32_t>(tqh::kFusedContextLimit));
@@ -333,10 +333,11 @@ TEST_F(TurboQuantFusedDecode, DecodesTheCacheTheKernelWriterWrote) {
   watchdog_.Disarm();
 
   const tqh::WrittenCacheAgreement written = scenario.CompareWrittenCache();
-  std::printf("[ fused ] (e) written cache: %zu of %zu packed bytes differ from the host encoder (%zu with the "
-              "nibble lanes swapped); %zu scale lanes, %zu pad mismatches, max rel err %.3e\n",
-              written.packed_mismatches, written.packed_bytes, written.swapped_lane_mismatches, written.scale_lanes,
-              written.scale_pad_mismatches, written.max_scale_rel_err);
+  std::printf(
+      "[ fused ] (e) written cache: %zu of %zu packed bytes differ from the host encoder (%zu with the "
+      "nibble lanes swapped); %zu scale lanes, %zu pad mismatches, max rel err %.3e\n",
+      written.packed_mismatches, written.packed_bytes, written.swapped_lane_mismatches, written.scale_lanes,
+      written.scale_pad_mismatches, written.max_scale_rel_err);
   EXPECT_EQ(written.packed_mismatches, 0u) << "the kernel writer's NZ-tiled bytes differ from the host encoder";
   EXPECT_EQ(written.scale_pad_mismatches, 0u) << "the kernel writer touched a pad lane or an unwritten slot";
   EXPECT_LE(written.max_scale_rel_err, kWrittenScaleTolerance) << "a written scale is not the RMS it encodes";
@@ -416,10 +417,11 @@ TEST_F(TurboQuantFusedDecode, WritesTheCacheThroughASlicedSlotMapping) {
     const size_t key_diff = CountDiffs(sliced.key, aligned.key);
     const size_t value_diff = CountDiffs(sliced.value, aligned.value);
     const size_t scale_diff = CountDiffs(sliced.scales, aligned.scales);
-    std::printf("[ fused ] (j) slot_mapping +%lld int32 (%zu B into the burst): %zu of %zu key bytes, %zu of "
-                "%zu value bytes, %zu of %zu scale lanes differ from the aligned write\n",
-                static_cast<long long>(offset), byte_offset % kGmBurstBytes, key_diff, aligned.key.size(),
-                value_diff, aligned.value.size(), scale_diff, aligned.scales.size());
+    std::printf(
+        "[ fused ] (j) slot_mapping +%lld int32 (%zu B into the burst): %zu of %zu key bytes, %zu of "
+        "%zu value bytes, %zu of %zu scale lanes differ from the aligned write\n",
+        static_cast<long long>(offset), byte_offset % kGmBurstBytes, key_diff, aligned.key.size(), value_diff,
+        aligned.value.size(), scale_diff, aligned.scales.size());
     EXPECT_NE(byte_offset % kGmBurstBytes, 0u)
         << "(j): offset " << offset << " is still burst aligned, so it tests nothing";
     EXPECT_EQ(key_diff, 0u) << "(j): a slot_mapping at +" << offset << " int32 wrote a different key plane";
@@ -491,22 +493,22 @@ TEST_F(TurboQuantFusedDecode, UnrotatesAndGatesARawQueryBatch) {
 
   const tqh::FusedRun rotated = RunCase(&scenario, kCaseH, &watchdog_, rotated_reference, true, tqh::kRotatedBasis);
   std::printf("[ fused ] (h) in-launch rotation: %zu of %lld fp32 words differ from rotate_q, max |err| %.3e\n",
-              rotated.prologue_mismatches,
-              static_cast<long long>(kBatchTokens * kWideGroupHeads * kHeadSize), rotated.prologue_max_abs);
+              rotated.prologue_mismatches, static_cast<long long>(kBatchTokens * kWideGroupHeads * kHeadSize),
+              rotated.prologue_max_abs);
   EXPECT_LT(rotated.prologue_max_abs, kCubeRotationTolerance) << "the in-launch rotation differs from rotate_q's";
 
-  const tqh::FusedRun gated =
-      RunCase(&scenario, kCaseHGated, &watchdog_, model_reference, true, tqh::kGatedOutput);
+  const tqh::FusedRun gated = RunCase(&scenario, kCaseHGated, &watchdog_, model_reference, true, tqh::kGatedOutput);
   const tqh::FusedRun gated_split =
       RunCase(&scenario, kCaseHGatedSplit, &watchdog_, model_reference, true, tqh::kGatedOutput);
 
   const std::vector<float> host_stage = scenario.ModelBasis(rotated.output);
   const double stage_agreement = tqh::FusedCosine(gated.output, host_stage);
   const double split_agreement = tqh::FusedCosine(gated_split.output, gated.output);
-  std::printf("[ fused ] (h) output stage vs host stage on the rotated launch: cos %.9f; gated split vs unsplit: "
-              "cos %.9f; cos vs fp32 %.6f rotated, %.6f gated, %.6f gated split\n",
-              stage_agreement, split_agreement, tqh::FusedCosine(rotated.output, rotated_reference),
-              tqh::FusedCosine(gated.output, model_reference), tqh::FusedCosine(gated_split.output, model_reference));
+  std::printf(
+      "[ fused ] (h) output stage vs host stage on the rotated launch: cos %.9f; gated split vs unsplit: "
+      "cos %.9f; cos vs fp32 %.6f rotated, %.6f gated, %.6f gated split\n",
+      stage_agreement, split_agreement, tqh::FusedCosine(rotated.output, rotated_reference),
+      tqh::FusedCosine(gated.output, model_reference), tqh::FusedCosine(gated_split.output, model_reference));
 
   EXPECT_EQ(rotated.num_splits, 1) << "(h) must write the rotated basis from an unsplit launch";
   EXPECT_EQ(gated.num_splits, 1) << "(h) gated must finish its heads on the fused path";
@@ -516,6 +518,6 @@ TEST_F(TurboQuantFusedDecode, UnrotatesAndGatesARawQueryBatch) {
   ExpectNoExceptionDumps(kCaseH.tag);
 }
 
-}
-}
-}
+}  // namespace
+}  // namespace test
+}  // namespace vllm_ascend

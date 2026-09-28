@@ -85,6 +85,6 @@ void PrintAscend950OperatorInventory() {
   }
 }
 
-}
-}
-}
+}  // namespace ops950
+}  // namespace test
+}  // namespace vllm_ascend

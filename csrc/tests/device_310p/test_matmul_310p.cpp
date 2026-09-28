@@ -27,6 +27,7 @@
 #include "cpu_reference.hpp"
 #include "device_tensor.hpp"
 #include "fp16.hpp"
+#include "op_test_fixture.hpp"
 #include "qwen_shapes.hpp"
 #include "random_data.hpp"
 #include "tensor_compare.hpp"
@@ -41,8 +42,8 @@ const AclnnOp& MatmulOp() {
   return op;
 }
 
-std::vector<float> RunMatmulOnDevice(const std::vector<float>& a, const std::vector<float>& b_t, int64_t m,
-                                     int64_t k, int64_t n, const AclnnOp& op) {
+std::vector<float> RunMatmulOnDevice(const std::vector<float>& a, const std::vector<float>& b_t, int64_t m, int64_t k,
+                                     int64_t n, const AclnnOp& op) {
   aclrtStream stream = AscendTestEnvironment::Instance().stream();
 
   DeviceTensor a_device = DeviceTensor::Half({m, k}, a);
@@ -143,15 +144,14 @@ TEST_P(Matmul310PTest, MatchesCpuReference) {
   DeterministicRandom random(0x4d4d554cu);
 
   const std::vector<float> a = random.NormalHalfExact(static_cast<size_t>(m() * k()), 0.0f, 1.0f);
-  const std::vector<float> b_t =
-      random.NormalHalfExact(static_cast<size_t>(n() * k()), 0.0f, weight_stddev());
+  const std::vector<float> b_t = random.NormalHalfExact(static_cast<size_t>(n() * k()), 0.0f, weight_stddev());
 
   const std::vector<float> actual = RunMatmulOnDevice(a, b_t, m(), k(), n(), MatmulOp());
 
   std::vector<float> expected;
   reference::MatmulTransposedB(a, b_t, m(), k(), n(), &expected);
 
-  EXPECT_TENSORS_ALLCLOSE(actual, QuantizeToHalf(expected), kFp16DefaultTolerance);
+  EXPECT_HALF_TENSORS_ALLCLOSE(actual, expected);
 }
 
 TEST_P(Matmul310PTest, ZeroWeightsProduceZeroOutput) {
@@ -179,8 +179,7 @@ TEST_P(Matmul310PTest, IsLinearInTheInput) {
   DeterministicRandom random(0x4c494e32u);
 
   const std::vector<float> a = random.NormalHalfExact(static_cast<size_t>(m() * k()), 0.0f, 1.0f);
-  const std::vector<float> b_t =
-      random.NormalHalfExact(static_cast<size_t>(n() * k()), 0.0f, weight_stddev());
+  const std::vector<float> b_t = random.NormalHalfExact(static_cast<size_t>(n() * k()), 0.0f, weight_stddev());
 
   std::vector<float> doubled(a.size());
   for (size_t i = 0; i < a.size(); ++i) {
@@ -195,20 +194,14 @@ TEST_P(Matmul310PTest, IsLinearInTheInput) {
     expected[i] = base[i] * 2.0f;
   }
 
-  EXPECT_TENSORS_ALLCLOSE(scaled, QuantizeToHalf(expected), kFp16DefaultTolerance);
-}
-
-std::string MatmulTestName(const ::testing::TestParamInfo<std::tuple<int64_t, int64_t>>& info) {
-  std::ostringstream name;
-  name << "k" << std::get<0>(info.param) << "_n" << std::get<1>(info.param);
-  return name.str();
+  EXPECT_HALF_TENSORS_ALLCLOSE(scaled, expected);
 }
 
 INSTANTIATE_TEST_SUITE_P(Qwen35, Matmul310PTest,
                          ::testing::Combine(::testing::ValuesIn(shapes::LinearInputSizes()),
                                             ::testing::ValuesIn(shapes::LinearOutputSizes())),
-                         MatmulTestName);
+                         op_case::TupleName("k", "n"));
 
-}
-}
-}
+}  // namespace
+}  // namespace test
+}  // namespace vllm_ascend

@@ -130,8 +130,8 @@ class BenchmarkEnvironment : public ::testing::Test {
 
  private:
   static void ClearAll() {
-    for (const char* name : {"ASCEND_BENCH_WARMUP", "ASCEND_BENCH_ITERS", "ASCEND_BENCH_BATCH",
-                             "ASCEND_BENCH_MODES", "ASCEND_BENCH_CSV", "ASCEND_BENCH_REPEATABLE"}) {
+    for (const char* name : {"ASCEND_BENCH_WARMUP", "ASCEND_BENCH_ITERS", "ASCEND_BENCH_BATCH", "ASCEND_BENCH_MODES",
+                             "ASCEND_BENCH_CSV", "ASCEND_BENCH_REPEATABLE"}) {
       ::unsetenv(name);
     }
   }
@@ -233,7 +233,7 @@ TEST(Checksum, AccumulateInDoubleAndAreOrderStable) {
   EXPECT_GE(ChecksumSumOfSquares(values), 0.0);
 }
 
-}
-}
-}
-}
+}  // namespace
+}  // namespace bench
+}  // namespace test
+}  // namespace vllm_ascend

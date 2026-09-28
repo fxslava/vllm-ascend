@@ -20,17 +20,18 @@
 #include <string>
 #include <vector>
 
+#include "sweep_shapes.hpp"
+
 namespace vllm_ascend {
 namespace test {
 namespace shapes950 {
 
 inline const char* kSocNamePrefix = "Ascend950PR";
 
-inline bool IsAscend950PrSocName(const std::string& soc_name) {
-  return soc_name.rfind(kSocNamePrefix, 0) == 0;
-}
+inline bool IsAscend950PrSocName(const std::string& soc_name) { return soc_name.rfind(kSocNamePrefix, 0) == 0; }
 
-constexpr int64_t kFp16ElementsPerBurst = 16;
+// Shared with the 310P shape table; see sweep_shapes.hpp.
+constexpr int64_t kFp16ElementsPerBurst = sweeps::kFp16ElementsPerBurst;
 
 constexpr int64_t kMaxRotaryHeadDim = 1024;
 
@@ -63,7 +64,7 @@ constexpr int64_t kKvDim = kNumKvHeads * kHeadDim;
 
 constexpr int64_t kRotaryDim = 64;
 
-constexpr float kRmsNormEps = 1e-6f;
+constexpr float kRmsNormEps = sweeps::kRmsNormEpsilon;
 
 constexpr float kAttentionScale = 0.0625f;
 
@@ -73,24 +74,24 @@ constexpr int32_t kPhysicalBlock = 2;
 constexpr int64_t kContextLen = 1;
 constexpr int64_t kMaxBlocksPerSeq = 1;
 
-constexpr int64_t kDecodeTokenCount = 1;
+constexpr int64_t kDecodeTokenCount = sweeps::kDecodeTokenCount;
 
-inline std::vector<int64_t> TokenCounts() { return {1, 7, 32, 128}; }
+inline std::vector<int64_t> TokenCounts() { return sweeps::TokenCounts(); }
 
-inline std::vector<int64_t> RmsNormHiddenSizes() { return {1536, 2048, 4096, 8192}; }
+inline std::vector<int64_t> RmsNormHiddenSizes() { return sweeps::RmsNormHiddenSizes(); }
 
-inline std::vector<int64_t> IntermediateSizes() { return {4096, 8960, 11008, 14336}; }
+inline std::vector<int64_t> IntermediateSizes() { return sweeps::IntermediateSizes(); }
 
-inline std::vector<int64_t> LinearInputSizes() { return {2048, 4096}; }
+inline std::vector<int64_t> LinearInputSizes() { return sweeps::LinearInputSizes(); }
 
-inline std::vector<int64_t> LinearOutputSizes() { return {2048, 4096, 11008}; }
+inline std::vector<int64_t> LinearOutputSizes() { return sweeps::LinearOutputSizes(); }
 
 inline std::vector<int64_t> RotaryHeadDims() { return {64, 128, 256}; }
 
-constexpr double kRopeThetaDefault = 10000.0;
-constexpr double kRopeThetaExtended = 1000000.0;
-constexpr int64_t kMaxPositionEmbeddings = 4096;
+constexpr double kRopeThetaDefault = sweeps::kRopeThetaDefault;
+constexpr double kRopeThetaExtended = sweeps::kRopeThetaExtended;
+constexpr int64_t kMaxPositionEmbeddings = sweeps::kMaxPositionEmbeddings;
 
-}
-}
-}
+}  // namespace shapes950
+}  // namespace test
+}  // namespace vllm_ascend

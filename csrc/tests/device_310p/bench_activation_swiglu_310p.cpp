@@ -48,7 +48,7 @@ std::string CaseName(int64_t num_tokens, int64_t intermediate) {
   return name.str();
 }
 
-}
+}  // namespace
 
 void BuildSuite(BenchmarkRunner& runner) {
   const AclnnOp& op = SwiGluOp();
@@ -66,13 +66,12 @@ void BuildSuite(BenchmarkRunner& runner) {
         const std::vector<float> x =
             random.NormalHalfExact(static_cast<size_t>(num_tokens * intermediate * 2), 0.0f, 2.0f);
 
-        DeviceTensor x_device = DeviceTensor::Half({num_tokens, intermediate * 2}, x, ACL_FORMAT_ND,
-                                                   kBenchmarkAlignBytes);
+        DeviceTensor x_device =
+            DeviceTensor::Half({num_tokens, intermediate * 2}, x, ACL_FORMAT_ND, kBenchmarkAlignBytes);
         DeviceTensor out_device =
             DeviceTensor::HalfEmpty({num_tokens, intermediate}, ACL_FORMAT_ND, kBenchmarkAlignBytes);
 
-        PlannedOp planned = PlanAclnn<ops::SwiGluWorkspaceFn>(op, x_device.get(), kSwiGluSplitDim,
-                                                              out_device.get());
+        PlannedOp planned = PlanAclnn<ops::SwiGluWorkspaceFn>(op, x_device.get(), kSwiGluSplitDim, out_device.get());
 
         BenchmarkCase benchmark_case;
         benchmark_case.name = name;
@@ -89,6 +88,6 @@ void BuildSuite(BenchmarkRunner& runner) {
   }
 }
 
-}
-}
-}
+}  // namespace bench
+}  // namespace test
+}  // namespace vllm_ascend

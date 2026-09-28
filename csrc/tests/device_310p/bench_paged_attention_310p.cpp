@@ -72,7 +72,7 @@ std::string CaseName(const KvConfiguration& configuration, int64_t block_size, i
   return name.str();
 }
 
-}
+}  // namespace
 
 void BuildSuite(BenchmarkRunner& runner) {
   runner.Skip("paged attention decode",
@@ -108,20 +108,17 @@ void BuildSuite(BenchmarkRunner& runner) {
           const int64_t minimum_blocks = (num_tokens + block_size - 1) / block_size;
           layout.num_blocks = std::max<int64_t>(4, minimum_blocks * 4);
 
-          const size_t kv_elements = static_cast<size_t>(num_tokens) *
-                                     static_cast<size_t>(configuration.num_kv_heads) *
+          const size_t kv_elements = static_cast<size_t>(num_tokens) * static_cast<size_t>(configuration.num_kv_heads) *
                                      static_cast<size_t>(configuration.head_size);
           const std::vector<float> key = random.NormalHalfExact(kv_elements, 0.0f, 1.0f);
           const std::vector<float> value = random.NormalHalfExact(kv_elements, 0.0f, 1.0f);
 
-          const std::vector<int32_t> pool =
-              random.Permutation(static_cast<int32_t>(layout.num_blocks * block_size));
-          const std::vector<int32_t> slot_mapping(pool.begin(),
-                                                  pool.begin() + static_cast<size_t>(num_tokens));
+          const std::vector<int32_t> pool = random.Permutation(static_cast<int32_t>(layout.num_blocks * block_size));
+          const std::vector<int32_t> slot_mapping(pool.begin(), pool.begin() + static_cast<size_t>(num_tokens));
 
           DeviceTensor key_device =
-              DeviceTensor::Half({num_tokens, configuration.num_kv_heads, configuration.head_size}, key,
-                                 ACL_FORMAT_ND, kBenchmarkAlignBytes);
+              DeviceTensor::Half({num_tokens, configuration.num_kv_heads, configuration.head_size}, key, ACL_FORMAT_ND,
+                                 kBenchmarkAlignBytes);
           DeviceTensor value_device =
               DeviceTensor::Half({num_tokens, configuration.num_kv_heads, configuration.head_size}, value,
                                  ACL_FORMAT_ND, kBenchmarkAlignBytes);
@@ -129,26 +126,21 @@ void BuildSuite(BenchmarkRunner& runner) {
               DeviceTensor::Int32({num_tokens}, slot_mapping, ACL_FORMAT_ND, kBenchmarkAlignBytes);
 
           const std::vector<int64_t> cache_dims = KvCacheDims(layout);
-          DeviceTensor key_cache_device =
-              DeviceTensor::HalfEmpty(cache_dims, kKvCacheFormat, kBenchmarkAlignBytes);
-          DeviceTensor value_cache_device =
-              DeviceTensor::HalfEmpty(cache_dims, kKvCacheFormat, kBenchmarkAlignBytes);
+          DeviceTensor key_cache_device = DeviceTensor::HalfEmpty(cache_dims, kKvCacheFormat, kBenchmarkAlignBytes);
+          DeviceTensor value_cache_device = DeviceTensor::HalfEmpty(cache_dims, kKvCacheFormat, kBenchmarkAlignBytes);
 
           PlannedOp planned = PlanAclnn<ops::ScatterPaKvCacheWorkspaceFn>(
               op, key_device.get(), key_cache_device.get(), slot_device.get(), value_device.get(),
-              value_cache_device.get(), static_cast<const aclTensor*>(nullptr),
-              static_cast<const aclTensor*>(nullptr), static_cast<const aclTensor*>(nullptr), kCacheModeNorm,
-              static_cast<char*>(nullptr), static_cast<const aclIntArray*>(nullptr),
-              static_cast<const aclIntArray*>(nullptr));
+              value_cache_device.get(), static_cast<const aclTensor*>(nullptr), static_cast<const aclTensor*>(nullptr),
+              static_cast<const aclTensor*>(nullptr), kCacheModeNorm, static_cast<char*>(nullptr),
+              static_cast<const aclIntArray*>(nullptr), static_cast<const aclIntArray*>(nullptr));
 
           BenchmarkCase benchmark_case;
           benchmark_case.name = name;
           benchmark_case.bytes_per_iteration =
               2.0 * 2.0 * 2.0 * static_cast<double>(kv_elements) + 4.0 * static_cast<double>(num_tokens);
           benchmark_case.launch = [&planned](aclrtStream stream) { planned.Launch(stream); };
-          benchmark_case.checksum = [&key_cache_device]() {
-            return ChecksumSum(key_cache_device.ToFloatFromHalf());
-          };
+          benchmark_case.checksum = [&key_cache_device]() { return ChecksumSum(key_cache_device.ToFloatFromHalf()); };
 
           runner.Run(benchmark_case);
         } catch (const std::exception& error) {
@@ -159,6 +151,6 @@ void BuildSuite(BenchmarkRunner& runner) {
   }
 }
 
-}
-}
-}
+}  // namespace bench
+}  // namespace test
+}  // namespace vllm_ascend

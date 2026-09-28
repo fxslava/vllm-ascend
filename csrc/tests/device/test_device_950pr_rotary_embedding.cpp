@@ -63,13 +63,12 @@ RotaryResult RunPartialRotaryOnDevice(const std::vector<float>& query, const std
 
   DeviceTensor query_device =
       DeviceTensor::Half({test_case.num_tokens, test_case.num_q_heads, test_case.head_dim}, query);
-  DeviceTensor key_device =
-      DeviceTensor::Half({test_case.num_tokens, test_case.num_kv_heads, test_case.head_dim}, key);
+  DeviceTensor key_device = DeviceTensor::Half({test_case.num_tokens, test_case.num_kv_heads, test_case.head_dim}, key);
 
   RotaryResult result;
-  result.path = ApplyPartialRotaryQK(query_device.data(), key_device.data(), cos_full, sin_full,
-                                     test_case.num_tokens, test_case.num_q_heads, test_case.num_kv_heads,
-                                     test_case.head_dim, test_case.rotary_dim, stream);
+  result.path = ApplyPartialRotaryQK(query_device.data(), key_device.data(), cos_full, sin_full, test_case.num_tokens,
+                                     test_case.num_q_heads, test_case.num_kv_heads, test_case.head_dim,
+                                     test_case.rotary_dim, stream);
 
   result.query = query_device.ToFloatFromHalf();
   result.key = key_device.ToFloatFromHalf();
@@ -84,8 +83,8 @@ std::vector<int32_t> ScatteredPositions(int64_t num_tokens) {
   return positions;
 }
 
-void BuildDeviceAngles(const RotaryCase& test_case, const std::vector<int32_t>& positions,
-                       std::vector<float>* cos_full, std::vector<float>* sin_full) {
+void BuildDeviceAngles(const RotaryCase& test_case, const std::vector<int32_t>& positions, std::vector<float>* cos_full,
+                       std::vector<float>* sin_full) {
   const std::vector<float> cache =
       reference::BuildCosSinCache(s::kMaxPositionEmbeddings, test_case.rotary_dim, test_case.theta);
   reference::GatherFullCosSin(cache, positions, test_case.rotary_dim, kMode, cos_full, sin_full);
@@ -93,8 +92,8 @@ void BuildDeviceAngles(const RotaryCase& test_case, const std::vector<int32_t>& 
   *sin_full = QuantizeToHalf(*sin_full);
 }
 
-std::vector<float> RotaryPairNorms(const std::vector<float>& x, int64_t num_tokens, int64_t num_heads,
-                                   int64_t head_dim, int64_t rotary_dim) {
+std::vector<float> RotaryPairNorms(const std::vector<float>& x, int64_t num_tokens, int64_t num_heads, int64_t head_dim,
+                                   int64_t rotary_dim) {
   const int64_t half = rotary_dim / 2;
   std::vector<float> norms;
   norms.reserve(static_cast<size_t>(num_tokens * num_heads * half));
@@ -299,38 +298,37 @@ TEST_P(Rotary950PrTest, PreservesRotaryPairNorms) {
 
   const Tolerance norm_tolerance{5e-3, 5e-3, "pair norm through two fp16 roundings plus a square root"};
 
-  EXPECT_TENSORS_ALLCLOSE(RotaryPairNorms(actual.query, test_case.num_tokens, test_case.num_q_heads,
-                                          test_case.head_dim, test_case.rotary_dim),
-                          RotaryPairNorms(query, test_case.num_tokens, test_case.num_q_heads,
-                                          test_case.head_dim, test_case.rotary_dim),
-                          norm_tolerance);
-  EXPECT_TENSORS_ALLCLOSE(RotaryPairNorms(actual.key, test_case.num_tokens, test_case.num_kv_heads,
-                                          test_case.head_dim, test_case.rotary_dim),
-                          RotaryPairNorms(key, test_case.num_tokens, test_case.num_kv_heads,
-                                          test_case.head_dim, test_case.rotary_dim),
-                          norm_tolerance);
+  EXPECT_TENSORS_ALLCLOSE(
+      RotaryPairNorms(actual.query, test_case.num_tokens, test_case.num_q_heads, test_case.head_dim,
+                      test_case.rotary_dim),
+      RotaryPairNorms(query, test_case.num_tokens, test_case.num_q_heads, test_case.head_dim, test_case.rotary_dim),
+      norm_tolerance);
+  EXPECT_TENSORS_ALLCLOSE(
+      RotaryPairNorms(actual.key, test_case.num_tokens, test_case.num_kv_heads, test_case.head_dim,
+                      test_case.rotary_dim),
+      RotaryPairNorms(key, test_case.num_tokens, test_case.num_kv_heads, test_case.head_dim, test_case.rotary_dim),
+      norm_tolerance);
 }
 
 std::string RotaryTestName(const ::testing::TestParamInfo<RotaryCase>& info) {
   std::ostringstream name;
-  name << "tokens" << info.param.num_tokens << "_d" << info.param.head_dim << "_rot" << info.param.rotary_dim
-       << "_h" << info.param.num_q_heads << "_kv" << info.param.num_kv_heads << "_theta"
+  name << "tokens" << info.param.num_tokens << "_d" << info.param.head_dim << "_rot" << info.param.rotary_dim << "_h"
+       << info.param.num_q_heads << "_kv" << info.param.num_kv_heads << "_theta"
        << static_cast<int64_t>(info.param.theta);
   return name.str();
 }
 
 INSTANTIATE_TEST_SUITE_P(
     Qwen35, Rotary950PrTest,
-    ::testing::Values(
-        RotaryCase{1, s::kHeadDim, s::kRotaryDim, s::kNumHeads, s::kNumKvHeads, s::kRopeThetaExtended},
-        RotaryCase{32, s::kHeadDim, s::kRotaryDim, s::kNumHeads, s::kNumKvHeads, s::kRopeThetaExtended},
-        RotaryCase{128, s::kHeadDim, s::kRotaryDim, s::kNumHeads, s::kNumKvHeads, s::kRopeThetaDefault},
-        RotaryCase{16, s::kHeadDim, 128, s::kNumHeads, s::kNumKvHeads, s::kRopeThetaDefault},
-        RotaryCase{1, 128, 128, 28, 4, s::kRopeThetaDefault},
-        RotaryCase{16, 128, 128, 32, 8, s::kRopeThetaExtended},
-        RotaryCase{32, 64, 64, 16, 2, s::kRopeThetaDefault}),
+    ::testing::Values(RotaryCase{1, s::kHeadDim, s::kRotaryDim, s::kNumHeads, s::kNumKvHeads, s::kRopeThetaExtended},
+                      RotaryCase{32, s::kHeadDim, s::kRotaryDim, s::kNumHeads, s::kNumKvHeads, s::kRopeThetaExtended},
+                      RotaryCase{128, s::kHeadDim, s::kRotaryDim, s::kNumHeads, s::kNumKvHeads, s::kRopeThetaDefault},
+                      RotaryCase{16, s::kHeadDim, 128, s::kNumHeads, s::kNumKvHeads, s::kRopeThetaDefault},
+                      RotaryCase{1, 128, 128, 28, 4, s::kRopeThetaDefault},
+                      RotaryCase{16, 128, 128, 32, 8, s::kRopeThetaExtended},
+                      RotaryCase{32, 64, 64, 16, 2, s::kRopeThetaDefault}),
     RotaryTestName);
 
-}
-}
-}
+}  // namespace
+}  // namespace test
+}  // namespace vllm_ascend

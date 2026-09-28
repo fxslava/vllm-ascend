@@ -110,7 +110,7 @@ std::vector<std::string> CustomOpApiCandidatePaths() {
   return candidates;
 }
 
-}
+}  // namespace
 
 OpApiLibrary::OpApiLibrary() {
   for (const std::string& candidate : CustomOpApiCandidatePaths()) {
@@ -172,9 +172,8 @@ aclTensor* OpApiLibrary::CreateTensor(const std::vector<int64_t>& view_dims, con
   if (create == nullptr) {
     throw AclError("aclCreateTensor not found in libopapi.so / libnnopbase.so", __FILE__, __LINE__, -1);
   }
-  aclTensor* tensor =
-      create(view_dims.data(), static_cast<uint64_t>(view_dims.size()), dtype, strides.data(), offset, format,
-             storage_dims.data(), static_cast<uint64_t>(storage_dims.size()), data);
+  aclTensor* tensor = create(view_dims.data(), static_cast<uint64_t>(view_dims.size()), dtype, strides.data(), offset,
+                             format, storage_dims.data(), static_cast<uint64_t>(storage_dims.size()), data);
   if (tensor == nullptr) {
     throw AclError("aclCreateTensor returned nullptr", __FILE__, __LINE__, -1);
   }
@@ -314,9 +313,7 @@ AclnnIntArray::AclnnIntArray(std::vector<int64_t> values) : values_(std::move(va
 
 AclnnIntArray::~AclnnIntArray() { OpApiLibrary::Instance().DestroyIntArray(array_); }
 
-AclnnScalar::AclnnScalar(float value) {
-  scalar_ = OpApiLibrary::Instance().CreateScalar(&value, ACL_FLOAT);
-}
+AclnnScalar::AclnnScalar(float value) { scalar_ = OpApiLibrary::Instance().CreateScalar(&value, ACL_FLOAT); }
 
 AclnnScalar::~AclnnScalar() { OpApiLibrary::Instance().DestroyScalar(scalar_); }
 
@@ -362,5 +359,5 @@ std::string AclnnOp::unavailable_reason() const {
   return reason.str();
 }
 
-}
-}
+}  // namespace test
+}  // namespace vllm_ascend

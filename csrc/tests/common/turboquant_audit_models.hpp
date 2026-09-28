@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include "env_utils.hpp"
 #include "turboquant_launch.hpp"
 
 namespace vllm_ascend {
@@ -32,12 +33,7 @@ namespace turboquant_audit {
 constexpr int64_t kPrefillChunkTokens = 2048;
 
 inline int64_t EnvInt64(const char* name, int64_t fallback, int64_t minimum) {
-  const char* raw = std::getenv(name);
-  if (raw == nullptr || *raw == '\0') {
-    return fallback;
-  }
-  const long long parsed = std::strtoll(raw, nullptr, 10);
-  return parsed < minimum ? minimum : static_cast<int64_t>(parsed);
+  return env::Int64Clamped(name, fallback, minimum);
 }
 
 struct ModelSpec {
@@ -71,10 +67,8 @@ inline std::vector<ModelSpec> Models() {
                 "so W_o cannot absorb Pi and the O de-rotation is measured",
                 8, 4},
       ModelSpec{"dsv4", "DeepSeek-V4-Flash", 256, 16, 1, true,
-                "MLA, decoupled latent KV; one 16:1 group is one 16-row Cube task; W_o folded offline",
-                43, 1},
-      ModelSpec{"glm52", "GLM-5.2-744B", GlmHeadSize(), 8, 1, true,
-                "ultra-wide GQA; W_o folded offline", 78, 1},
+                "MLA, decoupled latent KV; one 16:1 group is one 16-row Cube task; W_o folded offline", 43, 1},
+      ModelSpec{"glm52", "GLM-5.2-744B", GlmHeadSize(), 8, 1, true, "ultra-wide GQA; W_o folded offline", 78, 1},
   };
 }
 
@@ -89,8 +83,7 @@ inline const char* PathLabel(PathMode path) { return path == PathMode::kCube ? "
 // for an A/B.
 inline PathMode SelectPath(const ModelSpec& model) {
   static_cast<void>(model);
-  const char* raw = std::getenv("ASCEND_BENCH_TQ_AUDIT_PATH");
-  const std::string forced = raw == nullptr ? std::string() : std::string(raw);
+  const std::string forced = env::String("ASCEND_BENCH_TQ_AUDIT_PATH");
   if (forced == "aiv") {
     return PathMode::kAiv;
   }
@@ -100,8 +93,7 @@ inline PathMode SelectPath(const ModelSpec& model) {
 // The Cube decode's split policy: adaptive (grid saturation) unless ASCEND_BENCH_TQ_AUDIT_SPLIT=fill or context
 // selects an older policy for an A/B in the same build.
 inline turboquant_host::FusedSplitPolicy SplitPolicy() {
-  const char* raw = std::getenv("ASCEND_BENCH_TQ_AUDIT_SPLIT");
-  const std::string forced = raw == nullptr ? std::string() : std::string(raw);
+  const std::string forced = env::String("ASCEND_BENCH_TQ_AUDIT_SPLIT");
   if (forced == "fill") {
     return turboquant_host::FusedSplitPolicy::kFillBlocks;
   }
@@ -126,6 +118,6 @@ inline int64_t PrefillChunkTokens() { return EnvInt64("ASCEND_BENCH_TQ_AUDIT_CHU
 
 inline int64_t PrefillChunk(int64_t seq_len) { return std::min(seq_len, PrefillChunkTokens()); }
 
-}
-}
-}
+}  // namespace turboquant_audit
+}  // namespace test
+}  // namespace vllm_ascend

@@ -22,7 +22,7 @@
 #include "test_harness.hpp"
 
 #ifndef VLLM_ASCEND_TEST_TIER
-#define VLLM_ASCEND_TEST_TIER "unspecified"
+  #define VLLM_ASCEND_TEST_TIER "unspecified"
 #endif
 
 int main(int argc, char** argv) {
@@ -31,10 +31,11 @@ int main(int argc, char** argv) {
   std::printf("[ascend-test] vllm-ascend bare-metal kernel tests, Ascend 950PR (no Python, no torch)\n");
   std::printf("[ascend-test] tier: %s\n", VLLM_ASCEND_TEST_TIER);
   if (::vllm_ascend::test::IsRunningOnSimulator()) {
-    std::printf("[ascend-test] CAModel loaded: %s\n"
-                "[ascend-test]   this process is running against the simulator. Functional results are\n"
-                "[ascend-test]   meaningful; every wall clock in it measures the simulator, not the part.\n",
-                ::vllm_ascend::test::SimulatorEvidence().c_str());
+    std::printf(
+        "[ascend-test] CAModel loaded: %s\n"
+        "[ascend-test]   this process is running against the simulator. Functional results are\n"
+        "[ascend-test]   meaningful; every wall clock in it measures the simulator, not the part.\n",
+        ::vllm_ascend::test::SimulatorEvidence().c_str());
   } else {
     std::printf("[ascend-test] CAModel loaded: no (physical runtime)\n");
   }

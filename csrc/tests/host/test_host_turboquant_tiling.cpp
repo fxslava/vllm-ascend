@@ -54,9 +54,9 @@ TEST(TurboQuantTiling, PagedAttentionIsOneLaunchWithoutWorkspaceInsideTheFusedLi
           for (const int64_t blocks : {0, 1, 3, 32, 64, 256}) {
             const tqt::PagedAttentionGrid grid =
                 tqt::PlanPagedAttention(tokens, heads, kHeadSize, blocks, block_size, aiv);
-            const std::string where = "aiv " + std::to_string(aiv) + " tokens " + std::to_string(tokens) +
-                                      " heads " + std::to_string(heads) + " blocks " + std::to_string(blocks) +
-                                      " block_size " + std::to_string(block_size);
+            const std::string where = "aiv " + std::to_string(aiv) + " tokens " + std::to_string(tokens) + " heads " +
+                                      std::to_string(heads) + " blocks " + std::to_string(blocks) + " block_size " +
+                                      std::to_string(block_size);
             const int64_t bound = std::max<int64_t>(blocks, 1) * block_size;
             ASSERT_GE(grid.num_splits, 1) << where;
             ASSERT_LE(grid.num_splits, static_cast<int64_t>(tqt::kMaxSequenceSplits)) << where;
@@ -94,10 +94,10 @@ TEST(TurboQuantTiling, FusedDecodeTasksCoverEveryHeadOnTheCubeFractal) {
               const tqt::FusedDecodeGrid grid =
                   tqt::PlanFusedDecode(tokens, heads, kv_heads, kHeadSize, blocks,
                                        static_cast<int64_t>(tqt::kCubeTileRows), aiv, tqt::kFusedContextLimit, policy);
-              const std::string where =
-                  "policy " + std::to_string(static_cast<int>(policy)) + " aiv " + std::to_string(aiv) + " tokens " +
-                  std::to_string(tokens) + " kv_heads " + std::to_string(kv_heads) + " group " +
-                  std::to_string(group) + " blocks " + std::to_string(blocks);
+              const std::string where = "policy " + std::to_string(static_cast<int>(policy)) + " aiv " +
+                                        std::to_string(aiv) + " tokens " + std::to_string(tokens) + " kv_heads " +
+                                        std::to_string(kv_heads) + " group " + std::to_string(group) + " blocks " +
+                                        std::to_string(blocks);
               ASSERT_GE(grid.heads_per_task, 1u) << where;
               ASSERT_LE(grid.heads_per_task, tqt::kCubeTileM) << where;
               ASSERT_LE(static_cast<int64_t>(grid.heads_per_task), group) << where;
@@ -115,8 +115,7 @@ TEST(TurboQuantTiling, FusedDecodeTasksCoverEveryHeadOnTheCubeFractal) {
                           static_cast<size_t>(tokens * heads * grid.num_splits *
                                               (kHeadSize + static_cast<int64_t>(tqt::kPartialTail))))
                     << where;
-                EXPECT_GE(static_cast<int64_t>(grid.block_dim) * grid.reduce_tasks_per_block, tokens * heads)
-                    << where;
+                EXPECT_GE(static_cast<int64_t>(grid.block_dim) * grid.reduce_tasks_per_block, tokens * heads) << where;
               } else {
                 EXPECT_EQ(grid.workspace_floats, 0u) << where;
                 EXPECT_EQ(grid.reduce_tasks_per_block, 0u) << where;
@@ -180,8 +179,8 @@ TEST(TurboQuantTiling, FusedDecodeFillsEveryMixBlockAtTheSingleTokenBaseline) {
   constexpr int64_t kBaselineKvHeads = 8;
   constexpr int64_t kContextBlocks = 32;
   constexpr int64_t kSplits = 4;
-  const tqt::FusedDecodeGrid grid = tqt::PlanFusedDecode(
-      1, kBaselineHeads, kBaselineKvHeads, kHeadSize, kContextBlocks, static_cast<int64_t>(tqt::kCubeTileRows), kAiv);
+  const tqt::FusedDecodeGrid grid = tqt::PlanFusedDecode(1, kBaselineHeads, kBaselineKvHeads, kHeadSize, kContextBlocks,
+                                                         static_cast<int64_t>(tqt::kCubeTileRows), kAiv);
   EXPECT_EQ(grid.num_splits, kSplits);
   EXPECT_EQ(grid.heads_per_task, 2u);
   EXPECT_EQ(grid.num_tasks, kMixBlocks);
@@ -190,10 +189,9 @@ TEST(TurboQuantTiling, FusedDecodeFillsEveryMixBlockAtTheSingleTokenBaseline) {
   EXPECT_EQ(grid.fused_context_limit, 0u);
   EXPECT_EQ(grid.reduce_tasks_per_block, 1u);
 
-  const tqt::FusedDecodeGrid unsplit =
-      tqt::PlanFusedDecode(1, kBaselineHeads, kBaselineKvHeads, kHeadSize, kContextBlocks,
-                           static_cast<int64_t>(tqt::kCubeTileRows), kAiv, tqt::kFusedContextLimit,
-                           tqt::FusedSplitPolicy::kContextOnly);
+  const tqt::FusedDecodeGrid unsplit = tqt::PlanFusedDecode(
+      1, kBaselineHeads, kBaselineKvHeads, kHeadSize, kContextBlocks, static_cast<int64_t>(tqt::kCubeTileRows), kAiv,
+      tqt::kFusedContextLimit, tqt::FusedSplitPolicy::kContextOnly);
   EXPECT_EQ(unsplit.num_splits, 1);
   EXPECT_EQ(unsplit.block_dim, static_cast<uint32_t>(kBaselineKvHeads));
   EXPECT_EQ(unsplit.fused_context_limit, tqt::kFusedContextLimit);
@@ -220,19 +218,16 @@ TEST(TurboQuantTiling, FusedDecodePlansAnEmptyGridForAShapeWithNoTask) {
        {tqt::FusedSplitPolicy::kContextOnly, tqt::FusedSplitPolicy::kFillBlocks, tqt::FusedSplitPolicy::kAdaptive}) {
     for (const int64_t aiv : kVectorCores) {
       // More kv heads than query heads: the GQA group truncates to zero, and every task count with it.
-      const tqt::FusedDecodeGrid degenerate =
-          tqt::PlanFusedDecode(1, 2, 4, kHeadSize, 64, static_cast<int64_t>(tqt::kCubeTileRows), aiv,
-                               tqt::kFusedContextLimit, policy);
-      const std::string where =
-          "policy " + std::to_string(static_cast<int>(policy)) + " aiv " + std::to_string(aiv);
+      const tqt::FusedDecodeGrid degenerate = tqt::PlanFusedDecode(
+          1, 2, 4, kHeadSize, 64, static_cast<int64_t>(tqt::kCubeTileRows), aiv, tqt::kFusedContextLimit, policy);
+      const std::string where = "policy " + std::to_string(static_cast<int>(policy)) + " aiv " + std::to_string(aiv);
       EXPECT_EQ(degenerate.num_tasks, 0) << where;
       EXPECT_EQ(degenerate.block_dim, 0u) << where;
       EXPECT_EQ(degenerate.tasks_per_block, 0u) << where;
       EXPECT_EQ(degenerate.workspace_floats, 0u) << where;
       // The zero-token grid is the shape of the answer the caller already knows how to read.
-      const tqt::FusedDecodeGrid empty =
-          tqt::PlanFusedDecode(0, 8, 2, kHeadSize, 64, static_cast<int64_t>(tqt::kCubeTileRows), aiv,
-                               tqt::kFusedContextLimit, policy);
+      const tqt::FusedDecodeGrid empty = tqt::PlanFusedDecode(
+          0, 8, 2, kHeadSize, 64, static_cast<int64_t>(tqt::kCubeTileRows), aiv, tqt::kFusedContextLimit, policy);
       EXPECT_EQ(degenerate.num_splits, empty.num_splits) << where;
       EXPECT_EQ(degenerate.heads_per_task, empty.heads_per_task) << where;
     }
@@ -262,10 +257,9 @@ TEST(TurboQuantTiling, PlannersNeverDivideByAShapeDerivedZero) {
             for (const int64_t block_size : block_size_set) {
               for (const int64_t aiv : aiv_set) {
                 const std::string where = "policy " + std::to_string(static_cast<int>(policy)) + " tokens " +
-                                          std::to_string(tokens) + " heads " + std::to_string(heads) +
-                                          " kv_heads " + std::to_string(kv_heads) + " blocks " +
-                                          std::to_string(blocks) + " block_size " + std::to_string(block_size) +
-                                          " aiv " + std::to_string(aiv);
+                                          std::to_string(tokens) + " heads " + std::to_string(heads) + " kv_heads " +
+                                          std::to_string(kv_heads) + " blocks " + std::to_string(blocks) +
+                                          " block_size " + std::to_string(block_size) + " aiv " + std::to_string(aiv);
 
                 const tqt::FusedDecodeGrid fused = tqt::PlanFusedDecode(
                     tokens, heads, kv_heads, kHeadSize, blocks, block_size, aiv, tqt::kFusedContextLimit, policy);
@@ -287,8 +281,8 @@ TEST(TurboQuantTiling, PlannersNeverDivideByAShapeDerivedZero) {
                   ASSERT_EQ(fused.reduce_tasks_per_block, 0u) << where;
                 }
 
-                const tqt::PagedAttentionGrid paged = tqt::PlanPagedAttention(
-                    tokens, heads, kHeadSize, blocks, block_size, aiv, tqt::kFusedContextLimit);
+                const tqt::PagedAttentionGrid paged =
+                    tqt::PlanPagedAttention(tokens, heads, kHeadSize, blocks, block_size, aiv, tqt::kFusedContextLimit);
                 ASSERT_GE(paged.num_splits, 1) << where;
                 if (tokens > 0 && heads > 0 && aiv > 0) {
                   ASSERT_GE(paged.block_dim, 1u) << where;
@@ -362,28 +356,28 @@ TEST(TurboQuantTiling, FusedDecodeAdaptivePinsTheBenchSchedule) {
     uint32_t blocks;
   };
   const Row rows[] = {
-      {&qwen, 2048, 1, 8, 16, 16},     {&qwen, 2048, 2, 8, 32, 32},     {&qwen, 2048, 4, 4, 32, 32},
-      {&qwen, 2048, 8, 2, 32, 32},     {&qwen, 32768, 1, 8, 16, 16},    {&qwen, 32768, 2, 8, 32, 32},
-      {&qwen, 32768, 4, 8, 32, 32},    {&qwen, 32768, 8, 8, 64, 32},    {&qwen, 262144, 1, 8, 16, 16},
-      {&qwen, 262144, 2, 8, 32, 32},   {&qwen, 262144, 4, 8, 32, 32},   {&qwen, 262144, 8, 8, 64, 32},
-      {&qwen, 1048576, 1, 8, 16, 16},  {&qwen, 1048576, 2, 8, 32, 32},  {&qwen, 1048576, 4, 8, 32, 32},
-      {&qwen, 1048576, 8, 8, 64, 32},  {&dsv4, 2048, 1, 4, 32, 32},     {&dsv4, 2048, 2, 2, 32, 32},
-      {&dsv4, 2048, 4, 1, 32, 32},     {&dsv4, 2048, 8, 1, 32, 32},     {&dsv4, 32768, 1, 8, 32, 32},
-      {&dsv4, 32768, 2, 8, 32, 32},    {&dsv4, 32768, 4, 8, 32, 32},    {&dsv4, 32768, 8, 8, 64, 32},
-      {&dsv4, 262144, 1, 8, 32, 32},   {&dsv4, 262144, 2, 8, 32, 32},   {&dsv4, 262144, 4, 8, 32, 32},
-      {&dsv4, 262144, 8, 8, 64, 32},   {&dsv4, 1048576, 1, 8, 32, 32},  {&dsv4, 1048576, 2, 8, 32, 32},
-      {&dsv4, 1048576, 4, 8, 32, 32},  {&dsv4, 1048576, 8, 8, 64, 32},  {&glm, 2048, 1, 8, 32, 32},
-      {&glm, 2048, 2, 4, 32, 32},      {&glm, 2048, 4, 2, 32, 32},      {&glm, 2048, 8, 1, 32, 32},
-      {&glm, 32768, 1, 8, 32, 32},     {&glm, 32768, 2, 8, 32, 32},     {&glm, 32768, 4, 8, 32, 32},
-      {&glm, 32768, 8, 8, 64, 32},     {&glm, 262144, 1, 8, 32, 32},    {&glm, 262144, 2, 8, 32, 32},
-      {&glm, 262144, 4, 8, 32, 32},    {&glm, 262144, 8, 8, 64, 32},    {&glm, 1048576, 1, 8, 32, 32},
-      {&glm, 1048576, 2, 8, 32, 32},   {&glm, 1048576, 4, 8, 32, 32},   {&glm, 1048576, 8, 8, 64, 32},
+      {&qwen, 2048, 1, 8, 16, 16},    {&qwen, 2048, 2, 8, 32, 32},    {&qwen, 2048, 4, 4, 32, 32},
+      {&qwen, 2048, 8, 2, 32, 32},    {&qwen, 32768, 1, 8, 16, 16},   {&qwen, 32768, 2, 8, 32, 32},
+      {&qwen, 32768, 4, 8, 32, 32},   {&qwen, 32768, 8, 8, 64, 32},   {&qwen, 262144, 1, 8, 16, 16},
+      {&qwen, 262144, 2, 8, 32, 32},  {&qwen, 262144, 4, 8, 32, 32},  {&qwen, 262144, 8, 8, 64, 32},
+      {&qwen, 1048576, 1, 8, 16, 16}, {&qwen, 1048576, 2, 8, 32, 32}, {&qwen, 1048576, 4, 8, 32, 32},
+      {&qwen, 1048576, 8, 8, 64, 32}, {&dsv4, 2048, 1, 4, 32, 32},    {&dsv4, 2048, 2, 2, 32, 32},
+      {&dsv4, 2048, 4, 1, 32, 32},    {&dsv4, 2048, 8, 1, 32, 32},    {&dsv4, 32768, 1, 8, 32, 32},
+      {&dsv4, 32768, 2, 8, 32, 32},   {&dsv4, 32768, 4, 8, 32, 32},   {&dsv4, 32768, 8, 8, 64, 32},
+      {&dsv4, 262144, 1, 8, 32, 32},  {&dsv4, 262144, 2, 8, 32, 32},  {&dsv4, 262144, 4, 8, 32, 32},
+      {&dsv4, 262144, 8, 8, 64, 32},  {&dsv4, 1048576, 1, 8, 32, 32}, {&dsv4, 1048576, 2, 8, 32, 32},
+      {&dsv4, 1048576, 4, 8, 32, 32}, {&dsv4, 1048576, 8, 8, 64, 32}, {&glm, 2048, 1, 8, 32, 32},
+      {&glm, 2048, 2, 4, 32, 32},     {&glm, 2048, 4, 2, 32, 32},     {&glm, 2048, 8, 1, 32, 32},
+      {&glm, 32768, 1, 8, 32, 32},    {&glm, 32768, 2, 8, 32, 32},    {&glm, 32768, 4, 8, 32, 32},
+      {&glm, 32768, 8, 8, 64, 32},    {&glm, 262144, 1, 8, 32, 32},   {&glm, 262144, 2, 8, 32, 32},
+      {&glm, 262144, 4, 8, 32, 32},   {&glm, 262144, 8, 8, 64, 32},   {&glm, 1048576, 1, 8, 32, 32},
+      {&glm, 1048576, 2, 8, 32, 32},  {&glm, 1048576, 4, 8, 32, 32},  {&glm, 1048576, 8, 8, 64, 32},
   };
   for (const Row& row : rows) {
     const Model& model = *row.model;
     const int64_t blocks = (row.context + kBlock - 1) / kBlock;
-    const std::string where = std::string(model.label) + " S " + std::to_string(row.context) + " B " +
-                              std::to_string(row.batch);
+    const std::string where =
+        std::string(model.label) + " S " + std::to_string(row.context) + " B " + std::to_string(row.batch);
     const tqt::FusedDecodeGrid adaptive =
         tqt::PlanFusedDecode(row.batch, model.heads, 1, model.head_size, blocks, kBlock, kAiv);
     EXPECT_EQ(adaptive.num_splits, row.splits) << where;
@@ -403,9 +397,9 @@ TEST(TurboQuantTiling, FusedDecodeAdaptivePinsTheBenchSchedule) {
 
     // On every bench row the adaptive grid is the fill policy's; only the launch limit differs, and a uniform
     // batch beyond it reduces either way.
-    const tqt::FusedDecodeGrid fill = tqt::PlanFusedDecode(row.batch, model.heads, 1, model.head_size, blocks, kBlock,
-                                                           kAiv, tqt::kFusedContextLimit,
-                                                           tqt::FusedSplitPolicy::kFillBlocks);
+    const tqt::FusedDecodeGrid fill =
+        tqt::PlanFusedDecode(row.batch, model.heads, 1, model.head_size, blocks, kBlock, kAiv, tqt::kFusedContextLimit,
+                             tqt::FusedSplitPolicy::kFillBlocks);
     EXPECT_EQ(adaptive.num_splits, fill.num_splits) << where;
     EXPECT_EQ(adaptive.num_tasks, fill.num_tasks) << where;
     EXPECT_EQ(adaptive.heads_per_task, fill.heads_per_task) << where;
@@ -429,14 +423,14 @@ TEST(TurboQuantTiling, FusedDecodeAdaptiveCrossesIntoTheBandwidthTier) {
     uint32_t blocks;
   };
   const Row rows[] = {
-      {16, 256, 8064, 4, 1, 32}, {16, 256, 8192, 4, 4, 32},  {16, 256, 8320, 4, 8, 32},
-      {16, 256, 8192, 1, 4, 32}, {8, 128, 8064, 8, 1, 32},   {8, 128, 8192, 8, 4, 32},
-      {4, 128, 8064, 8, 2, 32},  {4, 128, 8192, 8, 4, 32},   {4, 128, 12288, 4, 8, 32},
+      {16, 256, 8064, 4, 1, 32}, {16, 256, 8192, 4, 4, 32}, {16, 256, 8320, 4, 8, 32},
+      {16, 256, 8192, 1, 4, 32}, {8, 128, 8064, 8, 1, 32},  {8, 128, 8192, 8, 4, 32},
+      {4, 128, 8064, 8, 2, 32},  {4, 128, 8192, 8, 4, 32},  {4, 128, 12288, 4, 8, 32},
   };
   for (const Row& row : rows) {
     const int64_t blocks = (row.context + kBlock - 1) / kBlock;
-    const std::string where = "H_Q " + std::to_string(row.heads) + " S " + std::to_string(row.context) + " B " +
-                              std::to_string(row.batch);
+    const std::string where =
+        "H_Q " + std::to_string(row.heads) + " S " + std::to_string(row.context) + " B " + std::to_string(row.batch);
     const tqt::FusedDecodeGrid grid =
         tqt::PlanFusedDecode(row.batch, row.heads, 1, row.head_size, blocks, kBlock, kAiv);
     EXPECT_EQ(grid.num_splits, row.splits) << where;
@@ -458,8 +452,8 @@ TEST(TurboQuantTiling, FusedDecodeAdaptiveNeverDipsOrStrandsBlocks) {
         for (int64_t blocks = 1; blocks <= kMaxBlocks; ++blocks) {
           const tqt::FusedDecodeGrid grid =
               tqt::PlanFusedDecode(batch, kv_heads * group, kv_heads, kHeadSize, blocks, kBlock, kAiv);
-          const std::string where = "B " + std::to_string(batch) + " kv_heads " + std::to_string(kv_heads) +
-                                    " group " + std::to_string(group) + " S " + std::to_string(blocks * kBlock);
+          const std::string where = "B " + std::to_string(batch) + " kv_heads " + std::to_string(kv_heads) + " group " +
+                                    std::to_string(group) + " S " + std::to_string(blocks * kBlock);
           ASSERT_GE(grid.num_splits, previous) << where;
           previous = grid.num_splits;
           if (CeilPow2(batch) == batch) {
@@ -550,20 +544,21 @@ TEST(TurboQuantTiling, FusedDecodePrologueRoutesWholeChunksToTheCube) {
               tqt::PlanFusedDecode(tokens, heads, kv_heads, head_size, kBlocks, kBlock, aiv);
           const int64_t vectors = tokens * heads;
           const int64_t chunk = grid.prologue_cube_chunk_vectors;
-          const std::string where = "aiv " + std::to_string(aiv) + " tokens " + std::to_string(tokens) +
-                                    " heads " + std::to_string(heads) + " head_size " + std::to_string(head_size);
+          const std::string where = "aiv " + std::to_string(aiv) + " tokens " + std::to_string(tokens) + " heads " +
+                                    std::to_string(heads) + " head_size " + std::to_string(head_size);
           ASSERT_GE(static_cast<int64_t>(grid.block_dim) * grid.prologue_vectors_per_block, vectors) << where;
           EXPECT_EQ(chunk, tqt::QueryBasisCubeChunk(vectors, head_size)) << where;
           if (vectors < static_cast<int64_t>(tqt::kQueryBasisMinCubeVectors)) {
             EXPECT_EQ(chunk, 0) << where << ": too few vectors fill a Cube chunk";
-            EXPECT_EQ(grid.prologue_vectors_per_block, static_cast<uint32_t>((vectors + grid.block_dim - 1) /
-                                                                             grid.block_dim))
+            EXPECT_EQ(grid.prologue_vectors_per_block,
+                      static_cast<uint32_t>((vectors + grid.block_dim - 1) / grid.block_dim))
                 << where;
             continue;
           }
           ASSERT_GT(chunk, 0) << where;
           EXPECT_EQ(chunk % 2, 0) << where << ": the dual-destination Fixpipe splits a chunk in half";
-          EXPECT_LE(chunk / 2, static_cast<int64_t>(tqt::kCubeTileM / 2)) << where << ": half a chunk is kernel scratch";
+          EXPECT_LE(chunk / 2, static_cast<int64_t>(tqt::kCubeTileM / 2))
+              << where << ": half a chunk is kernel scratch";
           EXPECT_LE(chunk * head_size, static_cast<int64_t>(tqt::kRotateQMaxChunkElements)) << where;
           const int64_t rows = chunk * head_size / tqt::kRotateQTile;
           EXPECT_EQ((rows / 2) % tqt::kRotateQTile, 0) << where << ": each half has to fill whole 16-row fractals";
@@ -575,8 +570,8 @@ TEST(TurboQuantTiling, FusedDecodePrologueRoutesWholeChunksToTheCube) {
 
   // Fused case (h): three tokens of H_Q 8 / H_KV 2, D 256, S 128 on 64 vector cores, unsplit and filled.
   constexpr int64_t kAiv = 64;
-  const tqt::FusedDecodeGrid unsplit = tqt::PlanFusedDecode(3, 8, 2, 256, kBlocks, kBlock, kAiv, tqt::kFusedContextLimit,
-                                                            tqt::FusedSplitPolicy::kContextOnly);
+  const tqt::FusedDecodeGrid unsplit = tqt::PlanFusedDecode(
+      3, 8, 2, 256, kBlocks, kBlock, kAiv, tqt::kFusedContextLimit, tqt::FusedSplitPolicy::kContextOnly);
   EXPECT_EQ(unsplit.num_splits, 1);
   EXPECT_EQ(unsplit.block_dim, 12u);
   EXPECT_EQ(unsplit.prologue_vectors_per_block, 16u);
@@ -598,8 +593,8 @@ TEST(TurboQuantTiling, RotateQStagesTheCubeOnlyWithEvenDualDestinationChunks) {
         for (const int64_t head_size : {64, 128, 256}) {
           const int64_t vectors = tokens * heads;
           const tqt::RotateQPlan plan = tqt::PlanRotateQ(tokens, vectors, head_size, cores);
-          const std::string where = "aiv " + std::to_string(aiv) + " tokens " + std::to_string(tokens) +
-                                    " heads " + std::to_string(heads) + " head_size " + std::to_string(head_size);
+          const std::string where = "aiv " + std::to_string(aiv) + " tokens " + std::to_string(tokens) + " heads " +
+                                    std::to_string(heads) + " head_size " + std::to_string(head_size);
           ASSERT_GT(plan.block_dim, 0u) << where;
           ASSERT_GE(static_cast<int64_t>(plan.block_dim) * plan.vectors_per_block, vectors) << where;
           if (plan.use_cube) {
@@ -652,6 +647,6 @@ TEST(TurboQuantTiling, BufferSizesFollowTheLayout) {
   EXPECT_EQ(tqt::RotateQCoreNum(64), 32);
 }
 
-}
-}
-}
+}  // namespace
+}  // namespace test
+}  // namespace vllm_ascend

@@ -164,11 +164,10 @@ TEST(RotaryReference, HalfAndInterleaveDisagree) {
 
   std::vector<float> cos_interleave;
   std::vector<float> sin_interleave;
-  reference::GatherFullCosSin(cache, positions, head_dim, RotaryMode::kInterleave, &cos_interleave,
-                              &sin_interleave);
+  reference::GatherFullCosSin(cache, positions, head_dim, RotaryMode::kInterleave, &cos_interleave, &sin_interleave);
   std::vector<float> out_interleave;
-  reference::ApplyRotaryPosEmb(x, cos_interleave, sin_interleave, 1, 1, head_dim, head_dim,
-                               RotaryMode::kInterleave, &out_interleave);
+  reference::ApplyRotaryPosEmb(x, cos_interleave, sin_interleave, 1, 1, head_dim, head_dim, RotaryMode::kInterleave,
+                               &out_interleave);
 
   bool any_difference = false;
   for (size_t i = 0; i < out_half.size(); ++i) {
@@ -212,8 +211,7 @@ TEST_P(RotaryEmbedding310PTest, MatchesCpuReference) {
 
   std::vector<int32_t> positions(static_cast<size_t>(test_case.num_tokens));
   for (int64_t i = 0; i < test_case.num_tokens; ++i) {
-    positions[static_cast<size_t>(i)] =
-        static_cast<int32_t>((i * 37 + 11) % shapes::kMaxPositionEmbeddings);
+    positions[static_cast<size_t>(i)] = static_cast<int32_t>((i * 37 + 11) % shapes::kMaxPositionEmbeddings);
   }
 
   const std::vector<float> cache =
@@ -227,17 +225,15 @@ TEST_P(RotaryEmbedding310PTest, MatchesCpuReference) {
   const std::vector<float> sin_half_exact = QuantizeToHalf(sin_full);
 
   const RotaryResult actual = RunApplyRotaryPosEmbOnDevice(
-      query, key, cos_half_exact, sin_half_exact, test_case.num_tokens, test_case.num_q_heads,
-      test_case.num_kv_heads, test_case.head_dim, test_case.mode, ApplyRotaryPosEmbOp());
+      query, key, cos_half_exact, sin_half_exact, test_case.num_tokens, test_case.num_q_heads, test_case.num_kv_heads,
+      test_case.head_dim, test_case.mode, ApplyRotaryPosEmbOp());
 
   std::vector<float> expected_query;
-  reference::ApplyRotaryPosEmb(query, cos_half_exact, sin_half_exact, test_case.num_tokens,
-                               test_case.num_q_heads, test_case.head_dim, test_case.head_dim, test_case.mode,
-                               &expected_query);
+  reference::ApplyRotaryPosEmb(query, cos_half_exact, sin_half_exact, test_case.num_tokens, test_case.num_q_heads,
+                               test_case.head_dim, test_case.head_dim, test_case.mode, &expected_query);
   std::vector<float> expected_key;
-  reference::ApplyRotaryPosEmb(key, cos_half_exact, sin_half_exact, test_case.num_tokens,
-                               test_case.num_kv_heads, test_case.head_dim, test_case.head_dim, test_case.mode,
-                               &expected_key);
+  reference::ApplyRotaryPosEmb(key, cos_half_exact, sin_half_exact, test_case.num_tokens, test_case.num_kv_heads,
+                               test_case.head_dim, test_case.head_dim, test_case.mode, &expected_key);
 
   EXPECT_TENSORS_ALLCLOSE(actual.query, QuantizeToHalf(expected_query), kFp16DefaultTolerance);
   EXPECT_TENSORS_ALLCLOSE(actual.key, QuantizeToHalf(expected_key), kFp16DefaultTolerance);
@@ -263,9 +259,9 @@ TEST_P(RotaryEmbedding310PTest, PositionZeroLeavesTheInputUnchanged) {
   std::vector<float> sin_full;
   reference::GatherFullCosSin(cache, positions, test_case.head_dim, test_case.mode, &cos_full, &sin_full);
 
-  const RotaryResult actual = RunApplyRotaryPosEmbOnDevice(
-      query, key, cos_full, sin_full, test_case.num_tokens, test_case.num_q_heads, test_case.num_kv_heads,
-      test_case.head_dim, test_case.mode, ApplyRotaryPosEmbOp());
+  const RotaryResult actual =
+      RunApplyRotaryPosEmbOnDevice(query, key, cos_full, sin_full, test_case.num_tokens, test_case.num_q_heads,
+                                   test_case.num_kv_heads, test_case.head_dim, test_case.mode, ApplyRotaryPosEmbOp());
 
   EXPECT_TENSORS_ALLCLOSE(actual.query, query, kFp16DefaultTolerance);
   EXPECT_TENSORS_ALLCLOSE(actual.key, key, kFp16DefaultTolerance);
@@ -295,8 +291,8 @@ TEST_P(RotaryEmbedding310PTest, PreservesPairNormsOnDevice) {
   reference::GatherFullCosSin(cache, positions, test_case.head_dim, test_case.mode, &cos_full, &sin_full);
 
   const RotaryResult actual = RunApplyRotaryPosEmbOnDevice(
-      query, key, QuantizeToHalf(cos_full), QuantizeToHalf(sin_full), test_case.num_tokens,
-      test_case.num_q_heads, test_case.num_kv_heads, test_case.head_dim, test_case.mode, ApplyRotaryPosEmbOp());
+      query, key, QuantizeToHalf(cos_full), QuantizeToHalf(sin_full), test_case.num_tokens, test_case.num_q_heads,
+      test_case.num_kv_heads, test_case.head_dim, test_case.mode, ApplyRotaryPosEmbOp());
 
   const std::vector<float> before =
       PairNorms(query, test_case.num_tokens, test_case.num_q_heads, test_case.head_dim, test_case.mode);
@@ -310,26 +306,25 @@ TEST_P(RotaryEmbedding310PTest, PreservesPairNormsOnDevice) {
 
 std::string RotaryTestName(const ::testing::TestParamInfo<RotaryCase>& info) {
   std::ostringstream name;
-  name << "tokens" << info.param.num_tokens << "_d" << info.param.head_dim << "_q" << info.param.num_q_heads
-       << "_kv" << info.param.num_kv_heads << "_" << RotaryModeLabel(info.param.mode) << "_theta"
+  name << "tokens" << info.param.num_tokens << "_d" << info.param.head_dim << "_q" << info.param.num_q_heads << "_kv"
+       << info.param.num_kv_heads << "_" << RotaryModeLabel(info.param.mode) << "_theta"
        << static_cast<int64_t>(info.param.theta);
   return name.str();
 }
 
 INSTANTIATE_TEST_SUITE_P(
     Qwen35, RotaryEmbedding310PTest,
-    ::testing::Values(
-        RotaryCase{1, 128, 28, 4, RotaryMode::kHalf, shapes::kRopeThetaDefault},
-        RotaryCase{16, 128, 28, 4, RotaryMode::kHalf, shapes::kRopeThetaDefault},
-        RotaryCase{128, 128, 28, 4, RotaryMode::kHalf, shapes::kRopeThetaExtended},
-        RotaryCase{16, 128, 32, 8, RotaryMode::kHalf, shapes::kRopeThetaDefault},
-        RotaryCase{16, 128, 32, 8, RotaryMode::kInterleave, shapes::kRopeThetaDefault},
-        RotaryCase{128, 128, 32, 8, RotaryMode::kInterleave, shapes::kRopeThetaExtended},
-        RotaryCase{1, 64, 16, 2, RotaryMode::kHalf, shapes::kRopeThetaDefault},
-        RotaryCase{32, 64, 16, 2, RotaryMode::kHalf, shapes::kRopeThetaDefault},
-        RotaryCase{32, 64, 16, 2, RotaryMode::kInterleave, shapes::kRopeThetaDefault}),
+    ::testing::Values(RotaryCase{1, 128, 28, 4, RotaryMode::kHalf, shapes::kRopeThetaDefault},
+                      RotaryCase{16, 128, 28, 4, RotaryMode::kHalf, shapes::kRopeThetaDefault},
+                      RotaryCase{128, 128, 28, 4, RotaryMode::kHalf, shapes::kRopeThetaExtended},
+                      RotaryCase{16, 128, 32, 8, RotaryMode::kHalf, shapes::kRopeThetaDefault},
+                      RotaryCase{16, 128, 32, 8, RotaryMode::kInterleave, shapes::kRopeThetaDefault},
+                      RotaryCase{128, 128, 32, 8, RotaryMode::kInterleave, shapes::kRopeThetaExtended},
+                      RotaryCase{1, 64, 16, 2, RotaryMode::kHalf, shapes::kRopeThetaDefault},
+                      RotaryCase{32, 64, 16, 2, RotaryMode::kHalf, shapes::kRopeThetaDefault},
+                      RotaryCase{32, 64, 16, 2, RotaryMode::kInterleave, shapes::kRopeThetaDefault}),
     RotaryTestName);
 
-}
-}
-}
+}  // namespace
+}  // namespace test
+}  // namespace vllm_ascend

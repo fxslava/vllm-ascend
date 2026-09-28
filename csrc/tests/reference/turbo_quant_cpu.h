@@ -251,8 +251,8 @@ inline FidelityMetrics cpu_fidelity(const std::vector<float>& actual, const std:
   return m;
 }
 
-}
-}
-}
+}  // namespace turboquant_ref
+}  // namespace test
+}  // namespace vllm_ascend
 
 #endif

@@ -44,11 +44,10 @@ using FusedInferAttentionScoreV2WorkspaceFn = int (*)(
     const aclTensor* quant_scale2, const aclTensor* quant_offset2, const aclTensor* antiquant_scale,
     const aclTensor* antiquant_offset, const aclTensor* block_table, const aclTensor* query_padding_size,
     const aclTensor* kv_padding_size, const aclTensor* key_antiquant_scale, const aclTensor* key_antiquant_offset,
-    const aclTensor* value_antiquant_scale, const aclTensor* value_antiquant_offset,
-    const aclTensor* key_shared_prefix, const aclTensor* value_shared_prefix,
-    const aclIntArray* actual_shared_prefix_len, int64_t num_heads, double scale_value, int64_t pre_tokens,
-    int64_t next_tokens, char* input_layout, int64_t num_key_value_heads, int64_t sparse_mode,
-    int64_t inner_precise, int64_t block_size, int64_t antiquant_mode, bool softmax_lse_flag,
+    const aclTensor* value_antiquant_scale, const aclTensor* value_antiquant_offset, const aclTensor* key_shared_prefix,
+    const aclTensor* value_shared_prefix, const aclIntArray* actual_shared_prefix_len, int64_t num_heads,
+    double scale_value, int64_t pre_tokens, int64_t next_tokens, char* input_layout, int64_t num_key_value_heads,
+    int64_t sparse_mode, int64_t inner_precise, int64_t block_size, int64_t antiquant_mode, bool softmax_lse_flag,
     int64_t key_antiquant_mode, int64_t value_antiquant_mode, const aclTensor* attention_out,
     const aclTensor* softmax_lse, uint64_t* workspace_size, aclOpExecutor** executor);
 inline const char* kFusedInferAttentionScoreV2 = "aclnnFusedInferAttentionScoreV2";
@@ -60,16 +59,14 @@ using FusedInferAttentionScoreV5WorkspaceFn = int (*)(
     const aclTensor* quant_scale2, const aclTensor* quant_offset2, const aclTensor* antiquant_scale,
     const aclTensor* antiquant_offset, const aclTensor* block_table, const aclTensor* query_padding_size,
     const aclTensor* kv_padding_size, const aclTensor* key_antiquant_scale, const aclTensor* key_antiquant_offset,
-    const aclTensor* value_antiquant_scale, const aclTensor* value_antiquant_offset,
-    const aclTensor* key_shared_prefix, const aclTensor* value_shared_prefix,
-    const aclIntArray* actual_shared_prefix_len, const aclTensor* query_rope, const aclTensor* key_rope,
-    const aclTensor* key_rope_antiquant_scale, const aclTensor* dequant_scale_query,
-    const aclTensor* learnable_sink, const aclIntArray* q_start_idx, const aclIntArray* kv_start_idx,
-    int64_t num_heads, double scale_value, int64_t pre_tokens, int64_t next_tokens, char* input_layout,
-    int64_t num_key_value_heads, int64_t sparse_mode, int64_t inner_precise, int64_t block_size,
-    int64_t antiquant_mode, bool softmax_lse_flag, int64_t key_antiquant_mode, int64_t value_antiquant_mode,
-    int64_t query_quant_mode, int64_t pse_type, const aclTensor* attention_out, const aclTensor* softmax_lse,
-    uint64_t* workspace_size, aclOpExecutor** executor);
+    const aclTensor* value_antiquant_scale, const aclTensor* value_antiquant_offset, const aclTensor* key_shared_prefix,
+    const aclTensor* value_shared_prefix, const aclIntArray* actual_shared_prefix_len, const aclTensor* query_rope,
+    const aclTensor* key_rope, const aclTensor* key_rope_antiquant_scale, const aclTensor* dequant_scale_query,
+    const aclTensor* learnable_sink, const aclIntArray* q_start_idx, const aclIntArray* kv_start_idx, int64_t num_heads,
+    double scale_value, int64_t pre_tokens, int64_t next_tokens, char* input_layout, int64_t num_key_value_heads,
+    int64_t sparse_mode, int64_t inner_precise, int64_t block_size, int64_t antiquant_mode, bool softmax_lse_flag,
+    int64_t key_antiquant_mode, int64_t value_antiquant_mode, int64_t query_quant_mode, int64_t pse_type,
+    const aclTensor* attention_out, const aclTensor* softmax_lse, uint64_t* workspace_size, aclOpExecutor** executor);
 inline const char* kFusedInferAttentionScoreV5 = "aclnnFusedInferAttentionScoreV5";
 
 inline const char* kFiaLayoutTnd = "TND";
@@ -78,8 +75,8 @@ using SigmoidWorkspaceFn = int (*)(const aclTensor* self, aclTensor* out, uint64
                                    aclOpExecutor** executor);
 inline const char* kSigmoid = "aclnnSigmoid";
 
-using MulWorkspaceFn = int (*)(const aclTensor* self, const aclTensor* other, aclTensor* out,
-                               uint64_t* workspace_size, aclOpExecutor** executor);
+using MulWorkspaceFn = int (*)(const aclTensor* self, const aclTensor* other, aclTensor* out, uint64_t* workspace_size,
+                               aclOpExecutor** executor);
 inline const char* kMul = "aclnnMul";
 
 using InplaceAddWorkspaceFn = int (*)(const aclTensor* self_ref, const aclTensor* other, const aclScalar* alpha,
@@ -90,6 +87,6 @@ std::vector<ops::OpAvailability> ProbeAscend950Operators();
 
 void PrintAscend950OperatorInventory();
 
-}
-}
-}
+}  // namespace ops950
+}  // namespace test
+}  // namespace vllm_ascend

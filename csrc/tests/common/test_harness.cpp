@@ -61,8 +61,7 @@ std::string QuerySimulatorEvidence() {
   }
   std::string line;
   while (std::getline(maps, line)) {
-    if (line.find("libruntime_camodel") != std::string::npos ||
-        line.find("/tools/simulator/") != std::string::npos) {
+    if (line.find("libruntime_camodel") != std::string::npos || line.find("/tools/simulator/") != std::string::npos) {
       const size_t path_start = line.find('/');
       return path_start == std::string::npos ? line : line.substr(path_start);
     }
@@ -70,7 +69,7 @@ std::string QuerySimulatorEvidence() {
   return std::string();
 }
 
-}
+}  // namespace
 
 const std::string& SimulatorEvidence() {
   static const std::string evidence = QuerySimulatorEvidence();
@@ -171,9 +170,7 @@ bool AscendTestEnvironment::is_310p() const {
   return soc_name_.find("310P") != std::string::npos || soc_name_.find("310p") != std::string::npos;
 }
 
-bool AscendTestEnvironment::is_950pr() const {
-  return ::vllm_ascend::test::shapes950::IsAscend950PrSocName(soc_name_);
-}
+bool AscendTestEnvironment::is_950pr() const { return ::vllm_ascend::test::shapes950::IsAscend950PrSocName(soc_name_); }
 
 void RegisterAscendTestEnvironment() {
   class EnvironmentShim : public ::testing::Environment {
@@ -184,5 +181,5 @@ void RegisterAscendTestEnvironment() {
   ::testing::AddGlobalTestEnvironment(new EnvironmentShim());
 }
 
-}
-}
+}  // namespace test
+}  // namespace vllm_ascend

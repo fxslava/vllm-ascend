@@ -47,7 +47,7 @@ uint8_t Fp8Bits(float v) {
     uint8_t bits;
   };
   static const Entry kTable[] = {
-      {0.0f, 0x00},  {0.5f, 0x30},  {1.0f, 0x38},  {1.5f, 0x3C}, {2.0f, 0x40},
+      {0.0f, 0x00},  {0.5f, 0x30},  {1.0f, 0x38},  {1.5f, 0x3C},  {2.0f, 0x40},
       {-0.5f, 0xB0}, {-1.0f, 0xB8}, {-1.5f, 0xBC}, {-2.0f, 0xC0},
   };
   for (const Entry& e : kTable) {
@@ -181,11 +181,11 @@ double ProbeCase(const Case& c, aclrtStream stream) {
   DeviceBuffer c_dev = DeviceBuffer::Empty<float>(static_cast<size_t>(c.m * c.n));
   ACL_CHECK(aclrtMemset(c_dev.get(), c_dev.size_bytes(), 0, c_dev.size_bytes()));
 
-  turboquant_cube_gemm_probe_impl(
-      stream, a_dev.get(), b_dev.get(), c_dev.get(), static_cast<uint32_t>(c.m), static_cast<uint32_t>(c.k),
-      static_cast<uint32_t>(c.n), static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kTileRows),
-      static_cast<uint32_t>(NzElems(c.m, c.k)), static_cast<uint32_t>(NzElems(c.k, c.n)),
-      static_cast<uint32_t>(c.m * c.n), 0u, c.variant);
+  turboquant_cube_gemm_probe_impl(stream, a_dev.get(), b_dev.get(), c_dev.get(), static_cast<uint32_t>(c.m),
+                                  static_cast<uint32_t>(c.k), static_cast<uint32_t>(c.n),
+                                  static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kTileRows),
+                                  static_cast<uint32_t>(NzElems(c.m, c.k)), static_cast<uint32_t>(NzElems(c.k, c.n)),
+                                  static_cast<uint32_t>(c.m * c.n), 0u, c.variant);
   ACL_CHECK(aclrtSynchronizeStream(stream));
 
   const std::vector<float> got = c_dev.ToHost<float>();
@@ -255,6 +255,6 @@ TEST(CubeGemmContract, ContextGemmBStagedKn) {
   RunCase(c, AscendTestEnvironment::Instance().stream());
 }
 
-}
-}
-}
+}  // namespace
+}  // namespace test
+}  // namespace vllm_ascend

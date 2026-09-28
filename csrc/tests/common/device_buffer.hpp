@@ -33,17 +33,13 @@ constexpr size_t kDeviceAlignBytes = 32;
 
 constexpr size_t kBenchmarkAlignBytes = 512;
 
-constexpr size_t AlignUp(size_t value, size_t alignment) {
-  return ((value + alignment - 1) / alignment) * alignment;
-}
+constexpr size_t AlignUp(size_t value, size_t alignment) { return ((value + alignment - 1) / alignment) * alignment; }
 
 class DeviceBuffer {
  public:
   DeviceBuffer() = default;
 
-  explicit DeviceBuffer(size_t size_bytes, size_t alignment = kDeviceAlignBytes) {
-    Allocate(size_bytes, alignment);
-  }
+  explicit DeviceBuffer(size_t size_bytes, size_t alignment = kDeviceAlignBytes) { Allocate(size_bytes, alignment); }
 
   DeviceBuffer(const DeviceBuffer&) = delete;
   DeviceBuffer& operator=(const DeviceBuffer&) = delete;
@@ -100,8 +96,7 @@ class DeviceBuffer {
     const size_t data_address = AlignUp(base_address, alignment_);
     data_ = reinterpret_cast<void*>(data_address);
 
-    if ((data_address % alignment_) != 0 ||
-        (data_address - base_address) + capacity_bytes_ > request) {
+    if ((data_address % alignment_) != 0 || (data_address - base_address) + capacity_bytes_ > request) {
       throw AclError("device allocation could not be aligned as requested", __FILE__, __LINE__, -1);
     }
     ACL_CHECK(aclrtMemset(data_, capacity_bytes_, 0, capacity_bytes_));
@@ -162,5 +157,5 @@ class DeviceBuffer {
   size_t alignment_ = kDeviceAlignBytes;
 };
 
-}
-}
+}  // namespace test
+}  // namespace vllm_ascend

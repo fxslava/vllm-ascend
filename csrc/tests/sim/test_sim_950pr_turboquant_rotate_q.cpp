@@ -96,8 +96,8 @@ Deviation Compare(const std::vector<float>& got, const std::vector<float>& want)
   return d;
 }
 
-std::vector<float> RunRotation(const Batch& b, aclrtStream stream, bool force_aiv,
-                               tqr::RotateQPlan* plan_out = nullptr, int64_t core_num_override = 0) {
+std::vector<float> RunRotation(const Batch& b, aclrtStream stream, bool force_aiv, tqr::RotateQPlan* plan_out = nullptr,
+                               int64_t core_num_override = 0) {
   DeviceBuffer query = DeviceBuffer::FromHost(FloatToHalf(b.query));
   DeviceBuffer pi_signs = DeviceBuffer::FromHost(b.pi_signs);
   DeviceBuffer h16 = DeviceBuffer::FromHost(tqh::Hadamard16Half());
@@ -145,27 +145,16 @@ TEST(RotateQPlan, Dispatch) {
     bool use_cube;
   };
   const Expect cases[] = {
-      {1, 4, 256, 16, false},
-      {1, 8, 256, 16, false},
-      {3, 12, 256, 16, false},
-      {2, 16, 256, 16, true},
-      {4, 32, 256, 16, true},
-      {8, 64, 256, 16, true},
-      {32, 256, 256, 16, true},
-      {1, 1, 256, 16, false},
-      {2, 16, 128, 16, true},
-      {2, 16, 64, 16, true},
-      {1, 16, 256, 4, false},
-      {1, 256, 256, 16, false},
-      {2, 16, 256, 32, false},
-      {4, 32, 256, 32, true},
-      {0, 16, 256, 16, false},
+      {1, 4, 256, 16, false},  {1, 8, 256, 16, false}, {3, 12, 256, 16, false},  {2, 16, 256, 16, true},
+      {4, 32, 256, 16, true},  {8, 64, 256, 16, true}, {32, 256, 256, 16, true}, {1, 1, 256, 16, false},
+      {2, 16, 128, 16, true},  {2, 16, 64, 16, true},  {1, 16, 256, 4, false},   {1, 256, 256, 16, false},
+      {2, 16, 256, 32, false}, {4, 32, 256, 32, true}, {0, 16, 256, 16, false},
   };
 
   for (const Expect& e : cases) {
     const tqr::RotateQPlan plan = tqr::PlanRotateQ(e.num_tokens, e.num_vectors, e.head_size, e.core_num);
-    EXPECT_EQ(plan.use_cube, e.use_cube)
-        << "B=" << e.num_tokens << " N=" << e.num_vectors << " D=" << e.head_size << " cores=" << e.core_num;
+    EXPECT_EQ(plan.use_cube, e.use_cube) << "B=" << e.num_tokens << " N=" << e.num_vectors << " D=" << e.head_size
+                                         << " cores=" << e.core_num;
     if (e.num_tokens <= 0) {
       EXPECT_EQ(plan.block_dim, 0u) << "an empty batch must not launch";
       continue;
@@ -210,14 +199,13 @@ TEST(RotateQVector, SparseBatchIsBitIdenticalToTheReference) {
   ASSERT_EQ(b.num_vectors, kNumHeads);
 
   tqr::RotateQPlan plan;
-  const std::vector<float> got = RunRotation(b, AscendTestEnvironment::Instance().stream(), false,
-                                             &plan);
+  const std::vector<float> got = RunRotation(b, AscendTestEnvironment::Instance().stream(), false, &plan);
   ASSERT_FALSE(plan.use_cube) << "N=" << b.num_vectors << " should not select the Cube path";
 
   const Deviation d = Compare(got, b.reference);
   std::printf("[ rotate_q ] aiv  N=%lld D=%lld: %zu of %zu elements differ, max |err| %.3e\n",
-              static_cast<long long>(b.num_vectors), static_cast<long long>(kHeadSize), d.differing,
-              b.reference.size(), d.max_abs);
+              static_cast<long long>(b.num_vectors), static_cast<long long>(kHeadSize), d.differing, b.reference.size(),
+              d.max_abs);
   EXPECT_EQ(d.differing, 0u) << "first difference at element " << d.worst_at << ", max |err| " << d.max_abs;
 }
 
@@ -229,22 +217,20 @@ TEST_P(RotateQCube, MatchesTheReference) {
   const Batch b = MakeBatch(batch, 0x9E37u + static_cast<uint32_t>(batch));
 
   tqr::RotateQPlan plan;
-  const std::vector<float> got = RunRotation(b, AscendTestEnvironment::Instance().stream(), false,
-                                             &plan, kCubeCoreNum);
+  const std::vector<float> got = RunRotation(b, AscendTestEnvironment::Instance().stream(), false, &plan, kCubeCoreNum);
   ASSERT_TRUE(plan.use_cube) << "N=" << b.num_vectors << " should select the Cube path";
 
   const Deviation d = Compare(got, b.reference);
-  std::printf("[ rotate_q ] cube N=%lld D=%lld: %u blocks x %u vectors, chunk %u, variant 0x%x; "
-              "%zu of %zu elements differ, max |err| %.3e\n",
-              static_cast<long long>(b.num_vectors), static_cast<long long>(kHeadSize), plan.block_dim,
-              plan.vectors_per_block, plan.vectors_per_chunk, plan.variant, d.differing, b.reference.size(),
-              d.max_abs);
+  std::printf(
+      "[ rotate_q ] cube N=%lld D=%lld: %u blocks x %u vectors, chunk %u, variant 0x%x; "
+      "%zu of %zu elements differ, max |err| %.3e\n",
+      static_cast<long long>(b.num_vectors), static_cast<long long>(kHeadSize), plan.block_dim, plan.vectors_per_block,
+      plan.vectors_per_chunk, plan.variant, d.differing, b.reference.size(), d.max_abs);
 
   for (size_t i = 0; i < got.size(); ++i) {
     ASSERT_TRUE(std::isfinite(got[i])) << "non-finite output at element " << i;
   }
-  EXPECT_LT(d.max_abs, kCubeAbsTolerance)
-      << "worst element " << d.worst_at << " of " << b.reference.size();
+  EXPECT_LT(d.max_abs, kCubeAbsTolerance) << "worst element " << d.worst_at << " of " << b.reference.size();
 }
 
 INSTANTIATE_TEST_SUITE_P(DenseBatches, RotateQCube, ::testing::Values(int64_t{2}, int64_t{8}));
@@ -273,6 +259,6 @@ TEST(RotateQCube, AgreesWithTheVectorPathOnIdenticalInput) {
   EXPECT_EQ(ref.differing, 0u) << "the vector path drifted from the reference at element " << ref.worst_at;
 }
 
-}
-}
-}
+}  // namespace
+}  // namespace test
+}  // namespace vllm_ascend

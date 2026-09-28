@@ -19,13 +19,14 @@
 #include <cstdlib>
 #include <iterator>
 #include <memory>
-#include <sstream>
 #include <string>
 #include <vector>
 
 #include "acl_check.hpp"
 #include "benchmark.hpp"
 #include "device_buffer.hpp"
+#include "env_utils.hpp"
+#include "hadamard_harness.hpp"
 #include "hadamard_spike.hpp"
 
 namespace vllm_ascend {
@@ -36,32 +37,10 @@ const char* kSuiteName = "cube_hadamard_950pr (Walsh-Hadamard: Cube-factorised a
 
 namespace {
 
+namespace hh = hadamard_harness;
 namespace hs = hadamard_spike;
 
-const int64_t kDefaultDims[] = {64, 128, 256, 512};
-const int64_t kDefaultBatches[] = {1, 8, 16, 32};
-
 constexpr double kFloatBytes = 4.0;
-
-std::vector<int64_t> ParseList(const char* env_name, const int64_t* defaults, size_t default_count) {
-  const char* value = std::getenv(env_name);
-  if (value == nullptr || *value == '\0') {
-    return std::vector<int64_t>(defaults, defaults + default_count);
-  }
-  std::vector<int64_t> out;
-  std::istringstream stream(value);
-  std::string token;
-  while (std::getline(stream, token, ',')) {
-    if (token.empty()) {
-      continue;
-    }
-    out.push_back(std::strtoll(token.c_str(), nullptr, 10));
-  }
-  if (out.empty()) {
-    return std::vector<int64_t>(defaults, defaults + default_count);
-  }
-  return out;
-}
 
 class Shape {
  public:
@@ -80,8 +59,8 @@ class Shape {
 
   void EnqueueHybrid(aclrtStream stream, uint32_t variant) const {
     sim_hadamard_hybrid_impl(stream, input_.get(), h16_.get(), output_.get(), static_cast<uint32_t>(dim_),
-                             static_cast<uint32_t>(num_vectors_), static_cast<uint32_t>(vectors_per_chunk_),
-                             variant, inv_sqrt_dim_);
+                             static_cast<uint32_t>(num_vectors_), static_cast<uint32_t>(vectors_per_chunk_), variant,
+                             inv_sqrt_dim_);
   }
 
   void EnqueueAiv(aclrtStream stream) const {
@@ -109,19 +88,20 @@ class Shape {
   DeviceBuffer output_;
 };
 
-}
+}  // namespace
 
 void BuildSuite(BenchmarkRunner& runner) {
   const std::vector<int64_t> dims =
-      ParseList("ASCEND_BENCH_HADAMARD_DIMS", kDefaultDims, std::size(kDefaultDims));
+      env::IntList("ASCEND_BENCH_HADAMARD_DIMS", hh::kDefaultDims, std::size(hh::kDefaultDims));
   const std::vector<int64_t> batches =
-      ParseList("ASCEND_BENCH_HADAMARD_BATCHES", kDefaultBatches, std::size(kDefaultBatches));
+      env::IntList("ASCEND_BENCH_HADAMARD_BATCHES", hh::kDefaultBatches, std::size(hh::kDefaultBatches));
 
-  std::printf("[ascend-bench] Cube-factorised Walsh-Hadamard. Four legs per shape: aiv (all stages on the\n"
-              "[ascend-bench]   vector unit), single (lower four as one fp16 Mmad), hilo (two Mmads, the\n"
-              "[ascend-bench]   configuration that clears 1e-4) and dualdst (hilo with both subcores on the\n"
-              "[ascend-bench]   residual). Read aiv against dualdst; see this file's header for what the\n"
-              "[ascend-bench]   GM round trip does to that ratio.\n");
+  std::printf(
+      "[ascend-bench] Cube-factorised Walsh-Hadamard. Four legs per shape: aiv (all stages on the\n"
+      "[ascend-bench]   vector unit), single (lower four as one fp16 Mmad), hilo (two Mmads, the\n"
+      "[ascend-bench]   configuration that clears 1e-4) and dualdst (hilo with both subcores on the\n"
+      "[ascend-bench]   residual). Read aiv against dualdst; see this file's header for what the\n"
+      "[ascend-bench]   GM round trip does to that ratio.\n");
   std::fflush(stdout);
 
   std::vector<std::unique_ptr<Shape>> shapes;
@@ -162,8 +142,7 @@ void BuildSuite(BenchmarkRunner& runner) {
 
       for (const Leg& leg : legs) {
         const std::string name = hs::CaseLabel(dim, num_vectors, leg.label);
-        if (leg.variant == (hs::kHybridHiLo | hs::kHybridDualDst) &&
-            !hs::HadamardDualDstApplies(dim, num_vectors)) {
+        if (leg.variant == (hs::kHybridHiLo | hs::kHybridDualDst) && !hs::HadamardDualDstApplies(dim, num_vectors)) {
           runner.Skip(name, "chunk holds one vector; the dual-destination Fixpipe does not apply");
           continue;
         }
@@ -187,6 +166,6 @@ void BuildSuite(BenchmarkRunner& runner) {
   }
 }
 
-}
-}
-}
+}  // namespace bench
+}  // namespace test
+}  // namespace vllm_ascend

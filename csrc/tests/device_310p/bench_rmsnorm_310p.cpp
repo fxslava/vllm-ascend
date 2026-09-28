@@ -46,7 +46,7 @@ std::string CaseName(int64_t num_tokens, int64_t hidden) {
   return name.str();
 }
 
-}
+}  // namespace
 
 void BuildSuite(BenchmarkRunner& runner) {
   const AclnnOp& op = RmsNormOp();
@@ -61,30 +61,22 @@ void BuildSuite(BenchmarkRunner& runner) {
     for (int64_t hidden : shapes::RmsNormHiddenSizes()) {
       const std::string name = CaseName(num_tokens, hidden);
       try {
-        const std::vector<float> x =
-            random.NormalHalfExact(static_cast<size_t>(num_tokens * hidden), 0.0f, 1.0f);
-        const std::vector<float> gamma =
-            random.NormalHalfExact(static_cast<size_t>(hidden), 1.0f, 0.1f);
+        const std::vector<float> x = random.NormalHalfExact(static_cast<size_t>(num_tokens * hidden), 0.0f, 1.0f);
+        const std::vector<float> gamma = random.NormalHalfExact(static_cast<size_t>(hidden), 1.0f, 0.1f);
 
-        DeviceTensor x_device =
-            DeviceTensor::Half({num_tokens, hidden}, x, ACL_FORMAT_ND, kBenchmarkAlignBytes);
-        DeviceTensor gamma_device =
-            DeviceTensor::Half({hidden}, gamma, ACL_FORMAT_ND, kBenchmarkAlignBytes);
-        DeviceTensor y_device =
-            DeviceTensor::HalfEmpty({num_tokens, hidden}, ACL_FORMAT_ND, kBenchmarkAlignBytes);
-        DeviceTensor rstd_device =
-            DeviceTensor::FloatEmpty({num_tokens, 1}, ACL_FORMAT_ND, kBenchmarkAlignBytes);
+        DeviceTensor x_device = DeviceTensor::Half({num_tokens, hidden}, x, ACL_FORMAT_ND, kBenchmarkAlignBytes);
+        DeviceTensor gamma_device = DeviceTensor::Half({hidden}, gamma, ACL_FORMAT_ND, kBenchmarkAlignBytes);
+        DeviceTensor y_device = DeviceTensor::HalfEmpty({num_tokens, hidden}, ACL_FORMAT_ND, kBenchmarkAlignBytes);
+        DeviceTensor rstd_device = DeviceTensor::FloatEmpty({num_tokens, 1}, ACL_FORMAT_ND, kBenchmarkAlignBytes);
 
-        PlannedOp planned = PlanAclnn<ops::RmsNormWorkspaceFn>(
-            op, x_device.get(), gamma_device.get(), static_cast<double>(shapes::kRmsNormEpsilon),
-            y_device.get(), rstd_device.get());
+        PlannedOp planned = PlanAclnn<ops::RmsNormWorkspaceFn>(op, x_device.get(), gamma_device.get(),
+                                                               static_cast<double>(shapes::kRmsNormEpsilon),
+                                                               y_device.get(), rstd_device.get());
 
         BenchmarkCase benchmark_case;
         benchmark_case.name = name;
-        benchmark_case.bytes_per_iteration =
-            2.0 * static_cast<double>(num_tokens) * static_cast<double>(hidden) * 2.0
-            + 2.0 * static_cast<double>(hidden)
-            + 4.0 * static_cast<double>(num_tokens);
+        benchmark_case.bytes_per_iteration = 2.0 * static_cast<double>(num_tokens) * static_cast<double>(hidden) * 2.0 +
+                                             2.0 * static_cast<double>(hidden) + 4.0 * static_cast<double>(num_tokens);
         benchmark_case.launch = [&planned](aclrtStream stream) { planned.Launch(stream); };
         benchmark_case.checksum = [&y_device]() { return ChecksumSum(y_device.ToFloatFromHalf()); };
 
@@ -96,6 +88,6 @@ void BuildSuite(BenchmarkRunner& runner) {
   }
 }
 
-}
-}
-}
+}  // namespace bench
+}  // namespace test
+}  // namespace vllm_ascend

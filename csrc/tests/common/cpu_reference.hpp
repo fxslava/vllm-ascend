@@ -24,8 +24,8 @@ namespace vllm_ascend {
 namespace test {
 namespace reference {
 
-void MatmulTransposedB(const std::vector<float>& a, const std::vector<float>& b_t, int64_t m, int64_t k,
-                       int64_t n, std::vector<float>* out);
+void MatmulTransposedB(const std::vector<float>& a, const std::vector<float>& b_t, int64_t m, int64_t k, int64_t n,
+                       std::vector<float>* out);
 
 void RmsNorm(const std::vector<float>& x, const std::vector<float>& gamma, int64_t num_tokens, int64_t hidden,
              float epsilon, std::vector<float>* y, std::vector<float>* rstd);
@@ -40,8 +40,7 @@ enum class RotaryMode {
 std::vector<float> BuildCosSinCache(int64_t max_position, int64_t rotary_dim, double base);
 
 void GatherFullCosSin(const std::vector<float>& cos_sin_cache, const std::vector<int32_t>& positions,
-                      int64_t rotary_dim, RotaryMode mode, std::vector<float>* cos_full,
-                      std::vector<float>* sin_full);
+                      int64_t rotary_dim, RotaryMode mode, std::vector<float>* cos_full, std::vector<float>* sin_full);
 
 void ApplyRotaryPosEmb(const std::vector<float>& x, const std::vector<float>& cos_full,
                        const std::vector<float>& sin_full, int64_t num_tokens, int64_t num_heads, int64_t head_dim,
@@ -56,13 +55,12 @@ struct PagedKvLayout {
   int64_t hidden() const { return num_kv_heads * head_size; }
   int64_t fractal_rows() const { return hidden() / 16; }
   size_t ElementCount() const {
-    return static_cast<size_t>(num_blocks) * static_cast<size_t>(fractal_rows()) *
-           static_cast<size_t>(block_size) * 16u;
+    return static_cast<size_t>(num_blocks) * static_cast<size_t>(fractal_rows()) * static_cast<size_t>(block_size) *
+           16u;
   }
 };
 
-size_t NzCacheOffset(const PagedKvLayout& layout, int64_t block_id, int64_t block_offset, int64_t kv_head,
-                     int64_t dim);
+size_t NzCacheOffset(const PagedKvLayout& layout, int64_t block_id, int64_t block_offset, int64_t kv_head, int64_t dim);
 
 void ReshapeAndCache(const std::vector<float>& key, const std::vector<float>& value,
                      const std::vector<int32_t>& slot_mapping, const PagedKvLayout& layout,
@@ -83,6 +81,6 @@ void PagedAttentionDecode(const std::vector<float>& query, const std::vector<flo
                           const std::vector<int32_t>& context_lens, const PagedKvLayout& layout,
                           const PagedAttentionShape& shape, std::vector<float>* out);
 
-}
-}
-}
+}  // namespace reference
+}  // namespace test
+}  // namespace vllm_ascend

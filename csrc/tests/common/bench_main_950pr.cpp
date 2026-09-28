@@ -26,16 +26,17 @@ namespace bench {
 extern const char* kSuiteName;
 void BuildSuite(BenchmarkRunner& runner);
 
-}
-}
-}
+}  // namespace bench
+}  // namespace test
+}  // namespace vllm_ascend
 
 int main() {
   if (::vllm_ascend::test::IsRunningOnSimulator()) {
-    std::printf("[ascend-bench] CAModel loaded (%s).\n"
-                "[ascend-bench] This is a device-tier benchmark and the simulator's wall clock is not a\n"
-                "[ascend-bench] measurement of the part. Refusing to produce numbers; skipping.\n",
-                ::vllm_ascend::test::SimulatorEvidence().c_str());
+    std::printf(
+        "[ascend-bench] CAModel loaded (%s).\n"
+        "[ascend-bench] This is a device-tier benchmark and the simulator's wall clock is not a\n"
+        "[ascend-bench] measurement of the part. Refusing to produce numbers; skipping.\n",
+        ::vllm_ascend::test::SimulatorEvidence().c_str());
     return ::vllm_ascend::test::bench::kBenchmarkSkipExitCode;
   }
   return ::vllm_ascend::test::bench::RunBenchmarkSuite(::vllm_ascend::test::bench::kSuiteName,

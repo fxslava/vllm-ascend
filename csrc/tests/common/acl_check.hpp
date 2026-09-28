@@ -33,8 +33,8 @@ inline std::string AclRecentErrorMessage() {
 
 inline std::string FormatAclError(const char* expression, const char* file, int line, int status) {
   std::ostringstream stream;
-  stream << file << ":" << line << ": " << expression << " failed with status " << status << "\n  CANN: "
-         << AclRecentErrorMessage();
+  stream << file << ":" << line << ": " << expression << " failed with status " << status
+         << "\n  CANN: " << AclRecentErrorMessage();
   return stream.str();
 }
 
@@ -51,41 +51,37 @@ class AclError : public std::exception {
   int status_;
 };
 
-#define ACL_CHECK(expression)                                                     \
-  do {                                                                            \
-    const int vllm_ascend_acl_status = static_cast<int>(expression);               \
-    if (vllm_ascend_acl_status != ACL_SUCCESS) {                                  \
-      throw ::vllm_ascend::test::AclError(#expression, __FILE__, __LINE__,        \
-                                          vllm_ascend_acl_status);                \
-    }                                                                             \
+#define ACL_CHECK(expression)                                                                       \
+  do {                                                                                              \
+    const int vllm_ascend_acl_status = static_cast<int>(expression);                                \
+    if (vllm_ascend_acl_status != ACL_SUCCESS) {                                                    \
+      throw ::vllm_ascend::test::AclError(#expression, __FILE__, __LINE__, vllm_ascend_acl_status); \
+    }                                                                                               \
   } while (false)
 
-#define ACL_CHECK_NOTHROW(expression)                                             \
-  do {                                                                            \
-    const int vllm_ascend_acl_status = static_cast<int>(expression);               \
-    if (vllm_ascend_acl_status != ACL_SUCCESS) {                                  \
-      ::vllm_ascend::test::ReportIgnoredAclFailure(                               \
-          #expression, __FILE__, __LINE__, vllm_ascend_acl_status);               \
-    }                                                                             \
+#define ACL_CHECK_NOTHROW(expression)                                                                        \
+  do {                                                                                                       \
+    const int vllm_ascend_acl_status = static_cast<int>(expression);                                         \
+    if (vllm_ascend_acl_status != ACL_SUCCESS) {                                                             \
+      ::vllm_ascend::test::ReportIgnoredAclFailure(#expression, __FILE__, __LINE__, vllm_ascend_acl_status); \
+    }                                                                                                        \
   } while (false)
 
 void ReportIgnoredAclFailure(const char* expression, const char* file, int line, int status);
 
-#define ASSERT_ACL_OK(expression)                                                 \
-  do {                                                                            \
-    const int vllm_ascend_acl_status = static_cast<int>(expression);               \
-    ASSERT_EQ(vllm_ascend_acl_status, ACL_SUCCESS)                                \
-        << ::vllm_ascend::test::FormatAclError(#expression, __FILE__, __LINE__,   \
-                                               vllm_ascend_acl_status);           \
+#define ASSERT_ACL_OK(expression)                                                                        \
+  do {                                                                                                   \
+    const int vllm_ascend_acl_status = static_cast<int>(expression);                                     \
+    ASSERT_EQ(vllm_ascend_acl_status, ACL_SUCCESS)                                                       \
+        << ::vllm_ascend::test::FormatAclError(#expression, __FILE__, __LINE__, vllm_ascend_acl_status); \
   } while (false)
 
-#define EXPECT_ACL_OK(expression)                                                 \
-  do {                                                                            \
-    const int vllm_ascend_acl_status = static_cast<int>(expression);               \
-    EXPECT_EQ(vllm_ascend_acl_status, ACL_SUCCESS)                                \
-        << ::vllm_ascend::test::FormatAclError(#expression, __FILE__, __LINE__,   \
-                                               vllm_ascend_acl_status);           \
+#define EXPECT_ACL_OK(expression)                                                                        \
+  do {                                                                                                   \
+    const int vllm_ascend_acl_status = static_cast<int>(expression);                                     \
+    EXPECT_EQ(vllm_ascend_acl_status, ACL_SUCCESS)                                                       \
+        << ::vllm_ascend::test::FormatAclError(#expression, __FILE__, __LINE__, vllm_ascend_acl_status); \
   } while (false)
 
-}
-}
+}  // namespace test
+}  // namespace vllm_ascend

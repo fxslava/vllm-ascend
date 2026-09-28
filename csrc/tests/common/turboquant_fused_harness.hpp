@@ -214,14 +214,14 @@ class FusedCubeScenario {
     FusedRun run = Launch(grid, [&](void* workspace, float inv_sqrt_len) {
       turboquant_mm_fused_decode_raw_query_impl(
           static_cast<int32_t>(kFusedMode), AscendType::FP16, stream_, grid.block_dim, query_.get(), pi_signs_.get(),
-          rot_tables_.get(), h16_.get(), gate, rotated.get(), key_cache_.get(), value_cache_.get(),
-          scale_plane_.get(), block_tables_.get(), context_lens_.get(), mode_tables_.get(), workspace, out_.get(),
+          rot_tables_.get(), h16_.get(), gate, rotated.get(), key_cache_.get(), value_cache_.get(), scale_plane_.get(),
+          block_tables_.get(), context_lens_.get(), mode_tables_.get(), workspace, out_.get(),
           static_cast<uint32_t>(shape_.batch), static_cast<uint32_t>(shape_.num_heads),
           static_cast<uint32_t>(shape_.num_kv_heads), static_cast<uint32_t>(shape_.head_size),
           static_cast<uint32_t>(shape_.block_size), static_cast<uint32_t>(blocks_per_seq_),
           static_cast<uint32_t>(grid.num_splits), grid.heads_per_task, grid.tasks_per_block,
-          grid.reduce_tasks_per_block, grid.prologue_vectors_per_block, grid.prologue_cube_chunk_vectors,
-          output_stage, grid.fused_context_limit, scale_, inv_sqrt_len);
+          grid.reduce_tasks_per_block, grid.prologue_vectors_per_block, grid.prologue_cube_chunk_vectors, output_stage,
+          grid.fused_context_limit, scale_, inv_sqrt_len);
     });
     const std::vector<float> in_launch = rotated.ToHost<float>();
     for (size_t i = 0; i < query_rot_host_.size(); ++i) {
@@ -332,8 +332,7 @@ class FusedCubeScenario {
         agreement.scale_pad_mismatches += (written_scales_[i] != 0.0f) ? 1u : 0u;
         continue;
       }
-      const double rel =
-          std::fabs(static_cast<double>(written_scales_[i]) - expected_scales_[i]) / expected_scales_[i];
+      const double rel = std::fabs(static_cast<double>(written_scales_[i]) - expected_scales_[i]) / expected_scales_[i];
       agreement.max_scale_rel_err = std::max(agreement.max_scale_rel_err, rel);
     }
     if (written_scales_.size() != expected_scales_.size()) {
@@ -367,8 +366,7 @@ class FusedCubeScenario {
           }
           const size_t lane = slot * slot_floats + (plane == 0 ? kv : kv_heads + kv);
           expected_scales_[lane] = std::sqrt(energy / static_cast<double>(head));
-          const double factor =
-              static_cast<double>(written_scales_[lane]) / static_cast<double>(cache_.scales[lane]);
+          const double factor = static_cast<double>(written_scales_[lane]) / static_cast<double>(cache_.scales[lane]);
           for (size_t c = 0; c < head; ++c) {
             dense[row + c] = static_cast<float>(static_cast<double>(dense[row + c]) * factor);
           }
@@ -388,9 +386,9 @@ class FusedCubeScenario {
 
     std::vector<int32_t> slots(static_cast<size_t>(tokens));
     for (int64_t t = 0; t < tokens; ++t) {
-      slots[static_cast<size_t>(t)] = block_table_[static_cast<size_t>(t / block_size)] *
-                                          static_cast<int32_t>(block_size) +
-                                      static_cast<int32_t>(t % block_size);
+      slots[static_cast<size_t>(t)] =
+          block_table_[static_cast<size_t>(t / block_size)] * static_cast<int32_t>(block_size) +
+          static_cast<int32_t>(t % block_size);
     }
     DeviceBuffer key_fp16 = DeviceBuffer::FromHost(FloatToHalf(UnrotateHeads(cache_.key, d)));
     DeviceBuffer value_fp16 = DeviceBuffer::FromHost(FloatToHalf(UnrotateHeads(cache_.value, d)));
@@ -407,11 +405,10 @@ class FusedCubeScenario {
     const ReshapeAndCacheGrid grid = PlanReshapeAndCache(tokens, aiv_num_);
     turboquant_mm_reshape_and_cache_impl(
         static_cast<int32_t>(kFusedMode), AscendType::FP16, stream_, grid.block_dim, key_fp16.get(), value_fp16.get(),
-        key_cache_.get(), value_cache_.get(), scale_plane_.get(), slot_arg, pi_signs_.get(),
-        rot_tables_.get(), write_tables.get(), static_cast<uint32_t>(tokens), static_cast<uint32_t>(kv_heads),
-        static_cast<uint32_t>(d), static_cast<uint32_t>(block_size),
-        static_cast<uint32_t>(blocks_per_seq_ * shape_.pool_factor), grid.tokens_per_core,
-        1.0f / std::sqrt(static_cast<float>(d)));
+        key_cache_.get(), value_cache_.get(), scale_plane_.get(), slot_arg, pi_signs_.get(), rot_tables_.get(),
+        write_tables.get(), static_cast<uint32_t>(tokens), static_cast<uint32_t>(kv_heads), static_cast<uint32_t>(d),
+        static_cast<uint32_t>(block_size), static_cast<uint32_t>(blocks_per_seq_ * shape_.pool_factor),
+        grid.tokens_per_core, 1.0f / std::sqrt(static_cast<float>(d)));
     ACL_CHECK(aclrtSynchronizeStream(stream_));
     written_key_ = key_cache_.ToHost<int8_t>();
     written_value_ = value_cache_.ToHost<int8_t>();
@@ -470,6 +467,6 @@ class FusedCubeScenario {
   DeviceBuffer gate_;
 };
 
-}
-}
-}
+}  // namespace turboquant_host
+}  // namespace test
+}  // namespace vllm_ascend

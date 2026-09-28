@@ -29,8 +29,8 @@ namespace ops {
 
 AclnnOp ResolveFirstAvailable(std::initializer_list<const char*> candidate_names);
 
-using MatmulWorkspaceFn = int (*)(const aclTensor* self, const aclTensor* mat2, aclTensor* out,
-                                  int8_t cube_math_type, uint64_t* workspace_size, aclOpExecutor** executor);
+using MatmulWorkspaceFn = int (*)(const aclTensor* self, const aclTensor* mat2, aclTensor* out, int8_t cube_math_type,
+                                  uint64_t* workspace_size, aclOpExecutor** executor);
 inline const char* kMatmul = "aclnnMatmul";
 
 inline constexpr int8_t kCubeMathTypeKeepDtype = 0;
@@ -69,14 +69,14 @@ inline const char* kScatterCacheModeNorm = "Norm";
 
 inline const char* kPagedAttention = "aclnnPagedAttention";
 
-using IncreFlashAttentionV4WorkspaceFn = int (*)(
-    const aclTensor* query, const aclTensorList* key, const aclTensorList* value, const aclTensor* pse_shift,
-    const aclTensor* atten_mask, const aclIntArray* actual_seq_lengths, const aclTensor* dequant_scale1,
-    const aclTensor* quant_scale1, const aclTensor* dequant_scale2, const aclTensor* quant_scale2,
-    const aclTensor* quant_offset2, const aclTensor* antiquant_scale, const aclTensor* antiquant_offset,
-    const aclTensor* blocktable, const aclTensor* kv_padding_size, int64_t num_heads, double scale_value,
-    char* input_layout, int64_t num_key_value_heads, int64_t block_size, int64_t inner_precise,
-    const aclTensor* attention_out, uint64_t* workspace_size, aclOpExecutor** executor);
+using IncreFlashAttentionV4WorkspaceFn =
+    int (*)(const aclTensor* query, const aclTensorList* key, const aclTensorList* value, const aclTensor* pse_shift,
+            const aclTensor* atten_mask, const aclIntArray* actual_seq_lengths, const aclTensor* dequant_scale1,
+            const aclTensor* quant_scale1, const aclTensor* dequant_scale2, const aclTensor* quant_scale2,
+            const aclTensor* quant_offset2, const aclTensor* antiquant_scale, const aclTensor* antiquant_offset,
+            const aclTensor* blocktable, const aclTensor* kv_padding_size, int64_t num_heads, double scale_value,
+            char* input_layout, int64_t num_key_value_heads, int64_t block_size, int64_t inner_precise,
+            const aclTensor* attention_out, uint64_t* workspace_size, aclOpExecutor** executor);
 inline const char* kIncreFlashAttentionV4 = "aclnnIncreFlashAttentionV4";
 
 struct OpAvailability {
@@ -89,6 +89,6 @@ std::vector<OpAvailability> ProbeAllOperators();
 
 void PrintOperatorInventory();
 
-}
-}
-}
+}  // namespace ops
+}  // namespace test
+}  // namespace vllm_ascend

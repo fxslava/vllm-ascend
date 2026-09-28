@@ -47,9 +47,9 @@ class OpApiLibrary {
 
   void* Resolve(const char* symbol, std::string* source = nullptr) const;
 
-  aclTensor* CreateTensor(const std::vector<int64_t>& view_dims, const std::vector<int64_t>& strides,
-                          int64_t offset, aclDataType dtype, aclFormat format,
-                          const std::vector<int64_t>& storage_dims, void* data) const;
+  aclTensor* CreateTensor(const std::vector<int64_t>& view_dims, const std::vector<int64_t>& strides, int64_t offset,
+                          aclDataType dtype, aclFormat format, const std::vector<int64_t>& storage_dims,
+                          void* data) const;
   void DestroyTensor(const aclTensor* tensor) const;
 
   aclIntArray* CreateIntArray(const int64_t* values, uint64_t size) const;
@@ -171,8 +171,7 @@ class AclnnOp {
   void* launch_ = nullptr;
 };
 
-using AclnnLaunchFn = int (*)(void* workspace, uint64_t workspace_size, aclOpExecutor* executor,
-                              aclrtStream stream);
+using AclnnLaunchFn = int (*)(void* workspace, uint64_t workspace_size, aclOpExecutor* executor, aclrtStream stream);
 
 template <typename WorkspaceSizeFn, typename... Args>
 void RunAclnn(const AclnnOp& op, aclrtStream stream, Args... args) {
@@ -211,5 +210,5 @@ void RunAclnn(const AclnnOp& op, aclrtStream stream, Args... args) {
     }                                            \
   } while (false)
 
-}
-}
+}  // namespace test
+}  // namespace vllm_ascend

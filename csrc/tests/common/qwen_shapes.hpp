@@ -19,11 +19,14 @@
 #include <cstdint>
 #include <vector>
 
+#include "sweep_shapes.hpp"
+
 namespace vllm_ascend {
 namespace test {
 namespace shapes {
 
-constexpr int64_t kFp16ElementsPerBurst = 16;
+// Shared with the 950PR shape table; see sweep_shapes.hpp.
+constexpr int64_t kFp16ElementsPerBurst = sweeps::kFp16ElementsPerBurst;
 
 constexpr int64_t kSwiGluLastDimMultiple = 32;
 
@@ -37,30 +40,30 @@ inline bool IsValid310PBlockSize(int64_t block_size, int64_t head_size) {
   return block_size * head_size <= kAttentionBlockSizeLimit;
 }
 
-constexpr int64_t kDecodeTokenCount = 1;
+constexpr int64_t kDecodeTokenCount = sweeps::kDecodeTokenCount;
 
 inline std::vector<int64_t> PrefillTokenCounts() { return {32, 128, 512}; }
 
-inline std::vector<int64_t> LinearInputSizes() { return {2048, 4096}; }
+inline std::vector<int64_t> LinearInputSizes() { return sweeps::LinearInputSizes(); }
 
-inline std::vector<int64_t> LinearOutputSizes() { return {2048, 4096, 11008}; }
+inline std::vector<int64_t> LinearOutputSizes() { return sweeps::LinearOutputSizes(); }
 
-inline std::vector<int64_t> RmsNormHiddenSizes() { return {1536, 2048, 4096, 8192}; }
+inline std::vector<int64_t> RmsNormHiddenSizes() { return sweeps::RmsNormHiddenSizes(); }
 
-inline std::vector<int64_t> TokenCounts() { return {1, 7, 32, 128}; }
+inline std::vector<int64_t> TokenCounts() { return sweeps::TokenCounts(); }
 
 inline std::vector<int64_t> BenchmarkTokenCounts() { return {1, 7, 32, 128, 512}; }
 
-constexpr float kRmsNormEpsilon = 1e-6f;
+constexpr float kRmsNormEpsilon = sweeps::kRmsNormEpsilon;
 
-inline std::vector<int64_t> IntermediateSizes() { return {4096, 8960, 11008, 14336}; }
+inline std::vector<int64_t> IntermediateSizes() { return sweeps::IntermediateSizes(); }
 
 inline std::vector<int64_t> RotaryHeadDims() { return {64, 128}; }
 
-constexpr double kRopeThetaDefault = 10000.0;
-constexpr double kRopeThetaExtended = 1000000.0;
+constexpr double kRopeThetaDefault = sweeps::kRopeThetaDefault;
+constexpr double kRopeThetaExtended = sweeps::kRopeThetaExtended;
 
-constexpr int64_t kMaxPositionEmbeddings = 4096;
+constexpr int64_t kMaxPositionEmbeddings = sweeps::kMaxPositionEmbeddings;
 
 struct AttentionHeads {
   const char* label;
@@ -78,6 +81,6 @@ inline std::vector<AttentionHeads> GqaConfigurations() {
   };
 }
 
-}
-}
-}
+}  // namespace shapes
+}  // namespace test
+}  // namespace vllm_ascend

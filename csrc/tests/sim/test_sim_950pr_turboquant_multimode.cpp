@@ -81,9 +81,8 @@ std::vector<int64_t> Int64ListFromEnv(const char* name, const int64_t* fallback,
 }
 
 const std::vector<int64_t>& ContextLens() {
-  static const std::vector<int64_t> value =
-      Int64ListFromEnv("ASCEND_TQ_SIM_CONTEXT", kDefaultContextLens,
-                       sizeof(kDefaultContextLens) / sizeof(kDefaultContextLens[0]));
+  static const std::vector<int64_t> value = Int64ListFromEnv(
+      "ASCEND_TQ_SIM_CONTEXT", kDefaultContextLens, sizeof(kDefaultContextLens) / sizeof(kDefaultContextLens[0]));
   return value;
 }
 
@@ -207,8 +206,8 @@ ModeRun RunMode(tqm::TurboQuantMode mode, const Shape& shape, aclrtStream stream
   bool queried = false;
   const int64_t aiv_num = tqh::VectorCoreNum(&queried);
   const tqh::ReshapeAndCacheGrid write_grid = tqh::PlanReshapeAndCache(batch * context_len, aiv_num);
-  const tqh::FusedDecodeGrid decode_grid = tqh::PlanFusedDecode(batch, kNumHeads, kNumKvHeads, kHeadSize,
-                                                                shape.blocks_per_seq, kBlockSize, aiv_num);
+  const tqh::FusedDecodeGrid decode_grid =
+      tqh::PlanFusedDecode(batch, kNumHeads, kNumKvHeads, kHeadSize, shape.blocks_per_seq, kBlockSize, aiv_num);
   run.num_splits = decode_grid.num_splits;
 
   DeviceBuffer workspace = DeviceBuffer::Empty<float>(decode_grid.workspace_floats);
@@ -217,8 +216,8 @@ ModeRun RunMode(tqm::TurboQuantMode mode, const Shape& shape, aclrtStream stream
       static_cast<int32_t>(mode), AscendType::FP16, stream, write_grid.block_dim, key_dev.get(), value_dev.get(),
       key_cache.get(), value_cache.get(), scale_plane.get(), slots_dev.get(), pi_signs.get(), rot_tables.get(),
       write_tables.get(), static_cast<uint32_t>(batch * context_len), static_cast<uint32_t>(kNumKvHeads),
-      static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kBlockSize),
-      static_cast<uint32_t>(shape.num_blocks), write_grid.tokens_per_core, kInvSqrtHeadSize);
+      static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kBlockSize), static_cast<uint32_t>(shape.num_blocks),
+      write_grid.tokens_per_core, kInvSqrtHeadSize);
   ACL_CHECK(aclrtSynchronizeStream(stream));
 
   run.rotate_plan = tqh::RotateQuery(stream, AscendType::FP16, query_dev.get(), pi_signs.get(), h16.get(),
@@ -306,9 +305,9 @@ TEST(TurboQuantMultiMode, DispatchAndFidelityAcrossShapes) {
       {tqm::TurboQuantMode::KV3_FP4, "kv3fp4", false, true},
   };
 
-  std::printf("[ multimode ] tier=%s head_size=%lld heads=%lld kv_heads=%lld block=%lld\n",
-              VLLM_ASCEND_TEST_TIER, static_cast<long long>(kHeadSize), static_cast<long long>(kNumHeads),
-              static_cast<long long>(kNumKvHeads), static_cast<long long>(kBlockSize));
+  std::printf("[ multimode ] tier=%s head_size=%lld heads=%lld kv_heads=%lld block=%lld\n", VLLM_ASCEND_TEST_TIER,
+              static_cast<long long>(kHeadSize), static_cast<long long>(kNumHeads), static_cast<long long>(kNumKvHeads),
+              static_cast<long long>(kBlockSize));
   std::printf("[ multimode ] sweep: batch x context = %zu x %zu = %zu shape(s)\n", BatchSizes().size(),
               ContextLens().size(), BatchSizes().size() * ContextLens().size());
 
@@ -318,9 +317,9 @@ TEST(TurboQuantMultiMode, DispatchAndFidelityAcrossShapes) {
       const Shape shape = MakeShape(batch, context_len, &rng);
       const std::vector<float> reference = HostAttention(batch, context_len, shape.query, shape.key, shape.value);
 
-      std::printf("\n[ multimode ] shape: B=%lld S=%lld pool=%lld blocks/seq=%lld\n",
-                  static_cast<long long>(batch), static_cast<long long>(context_len),
-                  static_cast<long long>(shape.num_blocks), static_cast<long long>(shape.blocks_per_seq));
+      std::printf("\n[ multimode ] shape: B=%lld S=%lld pool=%lld blocks/seq=%lld\n", static_cast<long long>(batch),
+                  static_cast<long long>(context_len), static_cast<long long>(shape.num_blocks),
+                  static_cast<long long>(shape.blocks_per_seq));
 
       for (const ModeCase& mode_case : cases) {
         if (!ModeSelected(mode_case.name)) {
@@ -328,17 +327,18 @@ TEST(TurboQuantMultiMode, DispatchAndFidelityAcrossShapes) {
           continue;
         }
         if (mode_case.provisional && !CubeWipOptedIn()) {
-          std::printf("[ multimode ] %s: still provisional, not re-measured through the corrected staging; "
-                      "set VLLM_ASCEND_TQ_CUBE_WIP=1 to run it\n",
-                      mode_case.name);
+          std::printf(
+              "[ multimode ] %s: still provisional, not re-measured through the corrected staging; "
+              "set VLLM_ASCEND_TQ_CUBE_WIP=1 to run it\n",
+              mode_case.name);
           continue;
         }
         const tqm::TurboQuantModeConfig cfg = tqm::TurboQuantModeConfigOf(mode_case.mode);
-        std::printf("[ multimode ] %s: %d bits, %d levels, %lld packed bytes/vector, %s, %s\n", mode_case.name,
-                    cfg.bits, cfg.levels, static_cast<long long>(cfg.PackedBytes(kHeadSize)),
-                    cfg.operand == tqm::TurboQuantOperand::kFp4E2m1 ? "Cube mad_mx (fp4 e2m1)"
-                                                                    : "Cube mad (fp8 e4m3fn)",
-                    cfg.is_affine ? "affine INT4" : "Lloyd-Max index");
+        std::printf(
+            "[ multimode ] %s: %d bits, %d levels, %lld packed bytes/vector, %s, %s\n", mode_case.name, cfg.bits,
+            cfg.levels, static_cast<long long>(cfg.PackedBytes(kHeadSize)),
+            cfg.operand == tqm::TurboQuantOperand::kFp4E2m1 ? "Cube mad_mx (fp4 e2m1)" : "Cube mad (fp8 e4m3fn)",
+            cfg.is_affine ? "affine INT4" : "Lloyd-Max index");
         ASSERT_TRUE(cfg.IsBurstAligned(kHeadSize))
             << mode_case.name << " slot is not a whole 32-byte burst; every DMA on this path assumes it is";
         ASSERT_EQ(kBlockSize % 64, 0) << "block_size must be a multiple of kCubeTileRows (64): CopyInTile issues "
@@ -399,6 +399,6 @@ TEST(TurboQuantMultiMode, DispatchAndFidelityAcrossShapes) {
   }
 }
 
-}
-}
-}
+}  // namespace
+}  // namespace test
+}  // namespace vllm_ascend

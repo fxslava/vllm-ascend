@@ -30,8 +30,8 @@ constexpr size_t kHalfBytes = sizeof(uint16_t);
 
 char kRotaryModeHalfString[] = "half";
 
-void CopyRotarySlices(void* strided, void* packed, int64_t tokens, int64_t heads, int64_t head_dim,
-                      int64_t rotary_dim, bool pack, aclrtStream stream) {
+void CopyRotarySlices(void* strided, void* packed, int64_t tokens, int64_t heads, int64_t head_dim, int64_t rotary_dim,
+                      bool pack, aclrtStream stream) {
   auto* strided_bytes = static_cast<uint8_t*>(strided);
   auto* packed_bytes = static_cast<uint8_t*>(packed);
   const size_t slice_bytes = static_cast<size_t>(rotary_dim) * kHalfBytes;
@@ -51,13 +51,11 @@ void RunStockRotary(void* q_data, void* k_data, const DeviceTensor& cos, const D
   AclnnTensor key({1, tokens, kv_heads, width}, ACL_FLOAT16, k_data);
 
   RunAclnn<ops::ApplyRotaryPosEmbWorkspaceFn>(PartialRotaryStockOp(), stream, query.get(), key.get(), cos.get(),
-                                              sin.get(), ops::kApplyRotaryPosEmbLayoutBsnd,
-                                              kRotaryModeHalfString);
+                                              sin.get(), ops::kApplyRotaryPosEmbLayoutBsnd, kRotaryModeHalfString);
 }
 
 void RunCustomRotary(void* q_data, void* k_data, const DeviceTensor& cos, const DeviceTensor& sin, int64_t tokens,
-                     int64_t q_heads, int64_t kv_heads, int64_t head_dim, int64_t rotary_dim,
-                     aclrtStream stream) {
+                     int64_t q_heads, int64_t kv_heads, int64_t head_dim, int64_t rotary_dim, aclrtStream stream) {
   AclnnIntArray partial_slice(std::vector<int64_t>{0, rotary_dim});
 
   AclnnTensor query({1, tokens, q_heads, head_dim}, ACL_FLOAT16, q_data);
@@ -65,11 +63,11 @@ void RunCustomRotary(void* q_data, void* k_data, const DeviceTensor& cos, const 
                                                        sin.get(), ops950::kRotaryModeHalf, partial_slice.get());
 
   AclnnTensor key({1, tokens, kv_heads, head_dim}, ACL_FLOAT16, k_data);
-  RunAclnn<ops950::InplacePartialRotaryMulWorkspaceFn>(PartialRotaryCustomOp(), stream, key.get(), cos.get(),
-                                                       sin.get(), ops950::kRotaryModeHalf, partial_slice.get());
+  RunAclnn<ops950::InplacePartialRotaryMulWorkspaceFn>(PartialRotaryCustomOp(), stream, key.get(), cos.get(), sin.get(),
+                                                       ops950::kRotaryModeHalf, partial_slice.get());
 }
 
-}
+}  // namespace
 
 const char* PartialRotaryPathName(PartialRotaryPath path) {
   switch (path) {
@@ -120,8 +118,7 @@ bool SelectPartialRotaryPath(int64_t head_dim, int64_t rotary_dim, PartialRotary
 
 PartialRotaryPath ApplyPartialRotaryQK(void* q_data, void* k_data, const std::vector<float>& cos_full,
                                        const std::vector<float>& sin_full, int64_t tokens, int64_t q_heads,
-                                       int64_t kv_heads, int64_t head_dim, int64_t rotary_dim,
-                                       aclrtStream stream) {
+                                       int64_t kv_heads, int64_t head_dim, int64_t rotary_dim, aclrtStream stream) {
   PartialRotaryPath path = PartialRotaryPath::kPackedApplyRotary;
   std::string reason;
   if (!SelectPartialRotaryPath(head_dim, rotary_dim, &path, &reason)) {
@@ -160,5 +157,5 @@ PartialRotaryPath ApplyPartialRotaryQK(void* q_data, void* k_data, const std::ve
   return path;
 }
 
-}
-}
+}  // namespace test
+}  // namespace vllm_ascend

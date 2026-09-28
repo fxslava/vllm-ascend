@@ -26,6 +26,7 @@
 #include "aclnn_runtime.hpp"
 #include "cpu_reference.hpp"
 #include "device_tensor.hpp"
+#include "op_test_fixture.hpp"
 #include "qwen_shapes.hpp"
 #include "random_data.hpp"
 #include "tensor_compare.hpp"
@@ -49,8 +50,8 @@ RmsNormResult RunRmsNormOnDevice(const std::vector<float>& x, const std::vector<
   DeviceTensor y_device = DeviceTensor::HalfEmpty({num_tokens, hidden});
   DeviceTensor rstd_device = DeviceTensor::FloatEmpty({num_tokens, 1});
 
-  RunAclnn<ops::RmsNormWorkspaceFn>(op, stream, x_device.get(), gamma_device.get(),
-                                    static_cast<double>(epsilon), y_device.get(), rstd_device.get());
+  RunAclnn<ops::RmsNormWorkspaceFn>(op, stream, x_device.get(), gamma_device.get(), static_cast<double>(epsilon),
+                                    y_device.get(), rstd_device.get());
 
   RmsNormResult result;
   result.y = y_device.ToFloatFromHalf();
@@ -115,8 +116,7 @@ TEST_P(RmsNorm310PTest, MatchesCpuReference) {
 
   DeterministicRandom random(0x5157454eu);
 
-  const std::vector<float> x =
-      random.NormalHalfExact(static_cast<size_t>(num_tokens() * hidden()), 0.0f, 1.0f);
+  const std::vector<float> x = random.NormalHalfExact(static_cast<size_t>(num_tokens() * hidden()), 0.0f, 1.0f);
   const std::vector<float> gamma = random.NormalHalfExact(static_cast<size_t>(hidden()), 1.0f, 0.1f);
 
   const RmsNormResult actual =
@@ -126,8 +126,8 @@ TEST_P(RmsNorm310PTest, MatchesCpuReference) {
   std::vector<float> expected_rstd;
   reference::RmsNorm(x, gamma, num_tokens(), hidden(), shapes::kRmsNormEpsilon, &expected_y, &expected_rstd);
 
-  EXPECT_TENSORS_ALLCLOSE(actual.y, QuantizeToHalf(expected_y), kFp16DefaultTolerance);
-  EXPECT_TENSORS_ALLCLOSE(actual.rstd, expected_rstd, kFp16DefaultTolerance);
+  EXPECT_HALF_TENSORS_ALLCLOSE(actual.y, expected_y);
+  EXPECT_HALF_TENSORS_ALLCLOSE(actual.rstd, expected_rstd);
 }
 
 TEST_P(RmsNorm310PTest, IsInvariantToRowScaling) {
@@ -136,8 +136,7 @@ TEST_P(RmsNorm310PTest, IsInvariantToRowScaling) {
 
   DeterministicRandom random(0x524d534eu);
 
-  const std::vector<float> x =
-      random.NormalHalfExact(static_cast<size_t>(num_tokens() * hidden()), 0.0f, 1.0f);
+  const std::vector<float> x = random.NormalHalfExact(static_cast<size_t>(num_tokens() * hidden()), 0.0f, 1.0f);
   const std::vector<float> gamma(static_cast<size_t>(hidden()), 1.0f);
 
   std::vector<float> scaled(x.size());
@@ -145,8 +144,7 @@ TEST_P(RmsNorm310PTest, IsInvariantToRowScaling) {
     scaled[i] = HalfBitsToFloat(FloatToHalfBits(x[i] * 4.0f));
   }
 
-  const RmsNormResult base =
-      RunRmsNormOnDevice(x, gamma, num_tokens(), hidden(), shapes::kRmsNormEpsilon, RmsNormOp());
+  const RmsNormResult base = RunRmsNormOnDevice(x, gamma, num_tokens(), hidden(), shapes::kRmsNormEpsilon, RmsNormOp());
   const RmsNormResult scaled_result =
       RunRmsNormOnDevice(scaled, gamma, num_tokens(), hidden(), shapes::kRmsNormEpsilon, RmsNormOp());
 
@@ -172,17 +170,11 @@ TEST_P(RmsNorm310PTest, HandlesNearZeroRowsWithoutBlowingUp) {
   }
 }
 
-std::string RmsNormTestName(const ::testing::TestParamInfo<std::tuple<int64_t, int64_t>>& info) {
-  std::ostringstream name;
-  name << "tokens" << std::get<0>(info.param) << "_hidden" << std::get<1>(info.param);
-  return name.str();
-}
-
 INSTANTIATE_TEST_SUITE_P(Qwen35, RmsNorm310PTest,
                          ::testing::Combine(::testing::ValuesIn(shapes::TokenCounts()),
                                             ::testing::ValuesIn(shapes::RmsNormHiddenSizes())),
-                         RmsNormTestName);
+                         op_case::TupleName("tokens", "hidden"));
 
-}
-}
-}
+}  // namespace
+}  // namespace test
+}  // namespace vllm_ascend

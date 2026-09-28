@@ -142,8 +142,7 @@ std::vector<float> LayerTailFromContext(const GoldenLayer3& golden, const std::v
   reference::RmsNorm(x, golden.post_attn_norm_gamma, s::kTokens, s::kHidden, s::kRmsNormEps, &norm2, &rstd);
   norm2 = RoundToHalf(norm2);
 
-  const std::vector<float> mlp_gate =
-      ProjectOnCpu(norm2, golden.w_gate, s::kTokens, s::kHidden, s::kIntermediate);
+  const std::vector<float> mlp_gate = ProjectOnCpu(norm2, golden.w_gate, s::kTokens, s::kHidden, s::kIntermediate);
   const std::vector<float> mlp_up = ProjectOnCpu(norm2, golden.w_up, s::kTokens, s::kHidden, s::kIntermediate);
 
   std::vector<float> gate_up;
@@ -155,8 +154,7 @@ std::vector<float> LayerTailFromContext(const GoldenLayer3& golden, const std::v
   reference::SiluAndMul(gate_up, s::kTokens, s::kIntermediate, &swiglu);
   swiglu = RoundToHalf(swiglu);
 
-  const std::vector<float> mlp_out =
-      ProjectOnCpu(swiglu, golden.w_down, s::kTokens, s::kIntermediate, s::kHidden);
+  const std::vector<float> mlp_out = ProjectOnCpu(swiglu, golden.w_down, s::kTokens, s::kIntermediate, s::kHidden);
 
   for (size_t i = 0; i < x.size(); ++i) {
     x[i] += mlp_out[i];
@@ -178,8 +176,8 @@ TEST(TurboQuantCodecInvariants, PiIsAnInvolution) {
 
   double worst = 0.0;
   for (int i = 0; i < d; ++i) {
-    worst = std::max(worst, std::fabs(static_cast<double>(x[static_cast<size_t>(i)]) -
-                                      original[static_cast<size_t>(i)]));
+    worst =
+        std::max(worst, std::fabs(static_cast<double>(x[static_cast<size_t>(i)]) - original[static_cast<size_t>(i)]));
   }
   std::printf("[turboquant] Pi(Pi(x)) - x max abs error: %.3e\n", worst);
   EXPECT_LT(worst, 1e-4);
@@ -233,8 +231,8 @@ TEST(TurboQuantCodecInvariants, NibblePackRoundTripsExactly) {
     levels[static_cast<size_t>(i)] = static_cast<float>(i % tq::kLevels);
   }
   for (int c = 0; c < d / tq::kPackFactor; ++c) {
-    const float byte = levels[static_cast<size_t>(2 * c)] +
-                       tq::kPackHigh * levels[static_cast<size_t>(2 * c + 1)] - tq::kInt8Bias;
+    const float byte =
+        levels[static_cast<size_t>(2 * c)] + tq::kPackHigh * levels[static_cast<size_t>(2 * c + 1)] - tq::kInt8Bias;
     packed[static_cast<size_t>(c)] = static_cast<int8_t>(std::lrint(byte));
   }
   std::vector<float> out(static_cast<size_t>(d));
@@ -369,8 +367,7 @@ TEST(TurboQuantPoison, QuantizeIgnoresPoisonedDestinationAndPadding) {
     for (size_t i = 0; i < expected_tail.size(); ++i) {
       const size_t absolute = packed_stride + i;
       const bool even = (absolute % 2) == 0;
-      const int8_t want = (variant == 0) ? (even ? kPoisonInt8A : kPoisonInt8B)
-                                         : (even ? kPoisonInt8B : kPoisonInt8A);
+      const int8_t want = (variant == 0) ? (even ? kPoisonInt8A : kPoisonInt8B) : (even ? kPoisonInt8B : kPoisonInt8A);
       ASSERT_EQ(packed[absolute], want) << "quantise wrote into padding at " << absolute;
     }
     for (size_t i = 1; i < scale_slot.size(); ++i) {
@@ -694,8 +691,7 @@ TEST(TurboQuantEdgeCases, SingleDominantOutlier) {
     float step = 0.0f;
     tq::cpu_quantize_4bit(vec.data(), d, packed.data(), &step);
 
-    EXPECT_NEAR(step, std::fabs(magnitude) / std::sqrt(static_cast<float>(d)),
-                std::fabs(magnitude) * 1e-6f);
+    EXPECT_NEAR(step, std::fabs(magnitude) / std::sqrt(static_cast<float>(d)), std::fabs(magnitude) * 1e-6f);
     ASSERT_TRUE(std::isfinite(step));
 
     std::vector<float> levels(static_cast<size_t>(d));
@@ -715,8 +711,7 @@ TEST(TurboQuantEdgeCases, SingleDominantOutlier) {
 
     std::vector<float> recon(static_cast<size_t>(d));
     tq::cpu_dequantize_4bit(packed.data(), d, step, recon.data());
-    const float clipped =
-        magnitude * tq::kLloydMaxCentroids[tq::kLevels - 1] / std::sqrt(static_cast<float>(d));
+    const float clipped = magnitude * tq::kLloydMaxCentroids[tq::kLevels - 1] / std::sqrt(static_cast<float>(d));
     EXPECT_NEAR(recon[0], clipped, std::fabs(clipped) * 1e-5f);
     EXPECT_LT(std::fabs(recon[0]), std::fabs(magnitude)) << "a clipped outlier cannot grow";
   }
@@ -840,8 +835,7 @@ TEST(TurboQuantEdgeCases, PartialBatchesMatchPerRowQuantisation) {
           }
         }
         for (int row = rows; row < batch_rows; ++row) {
-          EXPECT_TRUE(IsPoisonFloat(scales[static_cast<size_t>(row)]))
-              << "a scale outside the live rows was written";
+          EXPECT_TRUE(IsPoisonFloat(scales[static_cast<size_t>(row)])) << "a scale outside the live rows was written";
         }
       }
     }
@@ -1057,23 +1051,20 @@ TEST(TurboQuantEdgeCases, InvolutionOnCanonicalBasisVectors) {
 
       tq::cpu_apply_pi(rotated.data(), d, signs.data());
       for (int i = 0; i < d; ++i) {
-        worst_involution = std::max(
-            worst_involution, std::fabs(static_cast<double>(rotated[static_cast<size_t>(i)]) -
-                                        basis[static_cast<size_t>(i)]));
+        worst_involution = std::max(worst_involution, std::fabs(static_cast<double>(rotated[static_cast<size_t>(i)]) -
+                                                                basis[static_cast<size_t>(i)]));
       }
     }
     EXPECT_LT(worst_norm, 1e-6) << "||Pi e_i|| drifted from 1, d=" << d;
     EXPECT_LT(worst_involution, 1e-6) << "Pi(Pi(e_i)) drifted from e_i, d=" << d;
-    std::printf("[turboquant] d=%3d canonical basis: max |norm-1| = %.3e, max |Pi^2 e_i - e_i| = %.3e\n", d,
-                worst_norm, worst_involution);
+    std::printf("[turboquant] d=%3d canonical basis: max |norm-1| = %.3e, max |Pi^2 e_i - e_i| = %.3e\n", d, worst_norm,
+                worst_involution);
   }
 }
 
 class TurboQuantGoldenFidelity : public ::testing::Test {
  protected:
-  static void SetUpTestSuite() {
-    loaded_ = LoadGoldenLayer3(&golden_, &error_);
-  }
+  static void SetUpTestSuite() { loaded_ = LoadGoldenLayer3(&golden_, &error_); }
 
   static GoldenLayer3 golden_;
   static std::string error_;
@@ -1109,16 +1100,14 @@ TEST_F(TurboQuantGoldenFidelity, Qwen35Layer3DecodeReport) {
                       &exact_context);
 
   std::vector<float> tq_context;
-  RunTurboQuantDecode(rope_q, rope_k, value, context_len, num_heads, num_kv_heads, d, block_size,
-                      s::kAttentionScale, &tq_context);
+  RunTurboQuantDecode(rope_q, rope_k, value, context_len, num_heads, num_kv_heads, d, block_size, s::kAttentionScale,
+                      &tq_context);
 
   std::vector<float> norm1;
   std::vector<float> rstd;
-  reference::RmsNorm(golden_.input_x, golden_.input_norm_gamma, s::kTokens, s::kHidden, s::kRmsNormEps, &norm1,
-                     &rstd);
+  reference::RmsNorm(golden_.input_x, golden_.input_norm_gamma, s::kTokens, s::kHidden, s::kRmsNormEps, &norm1, &rstd);
   norm1 = RoundToHalf(norm1);
-  const std::vector<float> attn_gate =
-      ProjectOnCpu(norm1, golden_.w_gate_attn, s::kTokens, s::kHidden, s::kQDim);
+  const std::vector<float> attn_gate = ProjectOnCpu(norm1, golden_.w_gate_attn, s::kTokens, s::kHidden, s::kQDim);
 
   const std::vector<float> exact_layer = LayerTailFromContext(golden_, exact_context, attn_gate);
   const std::vector<float> tq_layer = LayerTailFromContext(golden_, tq_context, attn_gate);
@@ -1176,13 +1165,13 @@ TEST(TurboQuantSyntheticFidelity, LongContextDecodeReport) {
   RunTurboQuantDecode(query, key, value_cache, context_len, num_heads, num_kv_heads, d, block_size, scale, &approx);
 
   std::printf("\n[turboquant] synthetic long-context fidelity\n");
-  std::printf("  head_dim=%d heads=%d kv_heads=%d context_len=%d block_size=%d (outlier channel in K)\n", d,
-              num_heads, num_kv_heads, context_len, block_size);
+  std::printf("  head_dim=%d heads=%d kv_heads=%d context_len=%d block_size=%d (outlier channel in K)\n", d, num_heads,
+              num_kv_heads, context_len, block_size);
   PrintMetrics("attention output vs exact fp32", tq::cpu_fidelity(approx, exact));
 
   SUCCEED();
 }
 
-}
-}
-}
+}  // namespace
+}  // namespace test
+}  // namespace vllm_ascend

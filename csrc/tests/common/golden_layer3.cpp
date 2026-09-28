@@ -25,7 +25,7 @@
 #include "fp16.hpp"
 
 #ifndef VLLM_ASCEND_GOLDEN_LAYER3_DIR
-#define VLLM_ASCEND_GOLDEN_LAYER3_DIR ""
+  #define VLLM_ASCEND_GOLDEN_LAYER3_DIR ""
 #endif
 
 namespace vllm_ascend {
@@ -50,7 +50,7 @@ std::string EnvOrEmpty(const char* name) {
 #endif
 }
 
-}
+}  // namespace
 
 std::string GoldenLayer3Dir() {
   const std::string env = EnvOrEmpty("QWEN_GOLDEN_LAYER3_DIR");
@@ -60,8 +60,7 @@ std::string GoldenLayer3Dir() {
   return VLLM_ASCEND_GOLDEN_LAYER3_DIR;
 }
 
-bool ReadHalfFile(const std::string& path, size_t expected_elements, std::vector<float>* out,
-                  std::string* error) {
+bool ReadHalfFile(const std::string& path, size_t expected_elements, std::vector<float>* out, std::string* error) {
   std::ifstream file(path.c_str(), std::ios::binary | std::ios::ate);
   if (!file) {
     *error = "cannot open " + path;
@@ -145,5 +144,5 @@ bool LoadGoldenLayer3(GoldenLayer3* golden, std::string* error) {
   return true;
 }
 
-}
-}
+}  // namespace test
+}  // namespace vllm_ascend

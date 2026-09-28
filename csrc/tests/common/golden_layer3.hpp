@@ -37,10 +37,9 @@ struct GoldenLayer3 {
 
 std::string GoldenLayer3Dir();
 
-bool ReadHalfFile(const std::string& path, size_t expected_elements, std::vector<float>* out,
-                  std::string* error);
+bool ReadHalfFile(const std::string& path, size_t expected_elements, std::vector<float>* out, std::string* error);
 
 bool LoadGoldenLayer3(GoldenLayer3* golden, std::string* error);
 
-}
-}
+}  // namespace test
+}  // namespace vllm_ascend

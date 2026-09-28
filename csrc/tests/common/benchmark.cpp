@@ -32,6 +32,7 @@
 
 #include "aclnn_ops.hpp"
 #include "ascend950_shapes.hpp"
+#include "env_utils.hpp"
 #include "test_harness.hpp"
 
 namespace vllm_ascend {
@@ -40,41 +41,9 @@ namespace bench {
 
 namespace {
 
-std::string EnvironmentString(const char* name) {
-  const char* raw = std::getenv(name);
-  return (raw != nullptr) ? std::string(raw) : std::string();
-}
-
-int EnvironmentInt(const char* name, int fallback, int minimum, int maximum) {
-  const std::string raw = EnvironmentString(name);
-  if (raw.empty()) {
-    return fallback;
-  }
-  char* end = nullptr;
-  errno = 0;
-  const long parsed = std::strtol(raw.c_str(), &end, 10);
-  const bool parsed_cleanly = (end != nullptr) && (end != raw.c_str()) && (*end == '\0') && (errno == 0);
-  if (!parsed_cleanly || parsed < static_cast<long>(minimum) || parsed > static_cast<long>(maximum)) {
-    std::fprintf(stderr, "[ascend-bench] %s=%s is not an integer in [%d, %d], using %d\n", name,
-                 raw.c_str(), minimum, maximum, fallback);
-    return fallback;
-  }
-  return static_cast<int>(parsed);
-}
-
-std::vector<std::string> SplitOnCommas(const std::string& value) {
-  std::vector<std::string> parts;
-  std::string current;
-  std::istringstream stream(value);
-  while (std::getline(stream, current, ',')) {
-    const size_t first = current.find_first_not_of(" \t");
-    const size_t last = current.find_last_not_of(" \t");
-    if (first != std::string::npos) {
-      parts.push_back(current.substr(first, last - first + 1));
-    }
-  }
-  return parts;
-}
+using env::Int;
+using env::SplitCsv;
+using env::String;
 
 using SetExecutorRepeatableFn = int (*)(aclOpExecutor*);
 using DestroyExecutorFn = int (*)(aclOpExecutor*);
@@ -87,8 +56,7 @@ struct ExecutorApi {
     static const ExecutorApi instance = [] {
       ExecutorApi api;
       const OpApiLibrary& library = OpApiLibrary::Instance();
-      api.set_repeatable =
-          reinterpret_cast<SetExecutorRepeatableFn>(library.Resolve("aclSetAclOpExecutorRepeatable"));
+      api.set_repeatable = reinterpret_cast<SetExecutorRepeatableFn>(library.Resolve("aclSetAclOpExecutorRepeatable"));
       api.destroy = reinterpret_cast<DestroyExecutorFn>(library.Resolve("aclDestroyAclOpExecutor"));
       return api;
     }();
@@ -114,10 +82,8 @@ struct HugeMemScope {
 
   HugeMemScope() {
     const OpApiLibrary& library = OpApiLibrary::Instance();
-    auto* initialise =
-        reinterpret_cast<InitHugeMemThreadLocalFn>(library.Resolve("InitHugeMemThreadLocal"));
-    uninitialise =
-        reinterpret_cast<UnInitHugeMemThreadLocalFn>(library.Resolve("UnInitHugeMemThreadLocal"));
+    auto* initialise = reinterpret_cast<InitHugeMemThreadLocalFn>(library.Resolve("InitHugeMemThreadLocal"));
+    uninitialise = reinterpret_cast<UnInitHugeMemThreadLocalFn>(library.Resolve("UnInitHugeMemThreadLocal"));
     if (initialise != nullptr) {
       initialise(nullptr, false);
     }
@@ -241,14 +207,13 @@ void CheckChecksum(const BenchmarkCase& benchmark_case, double after_warmup, dou
   if (difference > allowed) {
     std::ostringstream message;
     message << benchmark_case.name << ": output checksum moved by more than the case allows across the timed "
-            << "loop (" << after_warmup << " -> " << after_timing << ", rtol="
-            << benchmark_case.checksum_rtol
+            << "loop (" << after_warmup << " -> " << after_timing << ", rtol=" << benchmark_case.checksum_rtol
             << "). The launches are not all computing the same thing, which makes the timings meaningless.";
     throw std::runtime_error(message.str());
   }
 }
 
-}
+}  // namespace
 
 const char* TimingModeLabel(TimingMode mode) {
   switch (mode) {
@@ -277,22 +242,19 @@ const char* EventTimingSourceLabel() {
 BenchmarkOptions BenchmarkOptions::FromEnvironment() {
   BenchmarkOptions options;
   constexpr int kMaxIterationCount = 1000000;
-  options.warmup_iterations =
-      EnvironmentInt("ASCEND_BENCH_WARMUP", options.warmup_iterations, 0, kMaxIterationCount);
-  options.timed_iterations =
-      EnvironmentInt("ASCEND_BENCH_ITERS", options.timed_iterations, 1, kMaxIterationCount);
-  options.pipeline_batch =
-      EnvironmentInt("ASCEND_BENCH_BATCH", options.pipeline_batch, 1, kMaxPipelineBatch);
-  options.csv_path = EnvironmentString("ASCEND_BENCH_CSV");
+  options.warmup_iterations = Int("ASCEND_BENCH_WARMUP", options.warmup_iterations, 0, kMaxIterationCount);
+  options.timed_iterations = Int("ASCEND_BENCH_ITERS", options.timed_iterations, 1, kMaxIterationCount);
+  options.pipeline_batch = Int("ASCEND_BENCH_BATCH", options.pipeline_batch, 1, kMaxPipelineBatch);
+  options.csv_path = String("ASCEND_BENCH_CSV");
 
-  const std::string repeatable = EnvironmentString("ASCEND_BENCH_REPEATABLE");
+  const std::string repeatable = String("ASCEND_BENCH_REPEATABLE");
   options.allow_repeatable_executor = !(repeatable == "0" || repeatable == "off" || repeatable == "false");
 
-  const std::string requested_modes = EnvironmentString("ASCEND_BENCH_MODES");
+  const std::string requested_modes = String("ASCEND_BENCH_MODES");
   if (requested_modes.empty()) {
     options.modes = {TimingMode::kPipelined, TimingMode::kDeviceEvents, TimingMode::kHostWallClock};
   } else {
-    for (const std::string& name : SplitOnCommas(requested_modes)) {
+    for (const std::string& name : SplitCsv(requested_modes)) {
       if (name == "pipelined") {
         options.modes.push_back(TimingMode::kPipelined);
       } else if (name == "device") {
@@ -300,8 +262,9 @@ BenchmarkOptions BenchmarkOptions::FromEnvironment() {
       } else if (name == "host") {
         options.modes.push_back(TimingMode::kHostWallClock);
       } else {
-        std::fprintf(stderr, "[ascend-bench] unknown mode '%s' in ASCEND_BENCH_MODES, expected one of "
-                             "pipelined,device,host\n",
+        std::fprintf(stderr,
+                     "[ascend-bench] unknown mode '%s' in ASCEND_BENCH_MODES, expected one of "
+                     "pipelined,device,host\n",
                      name.c_str());
       }
     }
@@ -330,8 +293,8 @@ LatencyStatistics LatencyStatistics::From(std::vector<double> samples_us) {
   statistics.min_us = samples_us.front();
   statistics.max_us = samples_us.back();
 
-  statistics.median_us = (count % 2 == 1) ? samples_us[count / 2]
-                                          : 0.5 * (samples_us[count / 2 - 1] + samples_us[count / 2]);
+  statistics.median_us =
+      (count % 2 == 1) ? samples_us[count / 2] : 0.5 * (samples_us[count / 2 - 1] + samples_us[count / 2]);
 
   double sum = 0.0;
   for (double sample : samples_us) {
@@ -485,8 +448,7 @@ void PlannedOp::Launch(aclrtStream stream) {
   }
 
   using LaunchFn = int (*)(void*, uint64_t, aclOpExecutor*, aclrtStream);
-  const int status =
-      reinterpret_cast<LaunchFn>(launch_fn_)(workspace_.get(), workspace_size_, executor, stream);
+  const int status = reinterpret_cast<LaunchFn>(launch_fn_)(workspace_.get(), workspace_size_, executor, stream);
   if (status != 0) {
     if (replanned) {
       DestroyOrphanedExecutor(executor);
@@ -503,9 +465,10 @@ BenchmarkRunner::BenchmarkRunner(std::string suite_name, const BenchmarkOptions&
 
 void BenchmarkRunner::set_options(const BenchmarkOptions& options) {
   if (!results_.empty()) {
-    throw AclError("BenchmarkRunner::set_options after a case has run: the report header states one option "
-                   "set for the whole table",
-                   __FILE__, __LINE__, -1);
+    throw AclError(
+        "BenchmarkRunner::set_options after a case has run: the report header states one option "
+        "set for the whole table",
+        __FILE__, __LINE__, -1);
   }
   options_ = options;
 }
@@ -608,8 +571,7 @@ LatencySamples BenchmarkRunner::TimeHostWallClock(const BenchmarkCase& benchmark
     benchmark_case.launch(stream_);
     ACL_CHECK(aclrtSynchronizeStream(stream_));
     const auto finished = std::chrono::steady_clock::now();
-    const int64_t elapsed_ns =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(finished - started).count();
+    const int64_t elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(finished - started).count();
     result.microseconds.push_back(static_cast<double>(elapsed_ns) / 1000.0);
   }
   return result;
@@ -664,8 +626,7 @@ void BenchmarkRunner::RunOrThrow(const BenchmarkCase& benchmark_case) {
       throw std::runtime_error(message.str());
     }
     if (latency.discarded_count > 0) {
-      std::fprintf(stderr,
-                   "[ascend-bench] %s/%s: discarded %zu of %zu samples that were not a usable duration\n",
+      std::fprintf(stderr, "[ascend-bench] %s/%s: discarded %zu of %zu samples that were not a usable duration\n",
                    benchmark_case.name.c_str(), TimingModeLabel(mode), latency.discarded_count, attempted);
     }
 
@@ -688,17 +649,17 @@ void BenchmarkRunner::PrintTable() const {
   table << std::fixed;
 
   table << "\n[ascend-bench] " << suite_name_ << "\n";
-  table << "[ascend-bench]   warmup=" << options_.warmup_iterations
-        << " iterations=" << options_.timed_iterations << " pipeline_batch=" << options_.pipeline_batch << "\n";
+  table << "[ascend-bench]   warmup=" << options_.warmup_iterations << " iterations=" << options_.timed_iterations
+        << " pipeline_batch=" << options_.pipeline_batch << "\n";
   table << "[ascend-bench]   launch path: " << PlannedOp::LaunchPathLabel() << "\n";
   table << "[ascend-bench]   device timing events: " << EventTimingSourceLabel() << "\n";
   table << "[ascend-bench]   times are microseconds per operator launch; percentiles are nearest-rank\n\n";
 
   const int name_width = 34;
   table << "  " << std::left << std::setw(name_width) << "case" << std::setw(11) << "mode" << std::right
-        << std::setw(10) << "min" << std::setw(10) << "median" << std::setw(10) << "mean" << std::setw(10)
-        << "p95" << std::setw(10) << "p99" << std::setw(10) << "stddev" << std::setw(12) << "TFLOP/s"
-        << std::setw(10) << "GB/s" << "\n";
+        << std::setw(10) << "min" << std::setw(10) << "median" << std::setw(10) << "mean" << std::setw(10) << "p95"
+        << std::setw(10) << "p99" << std::setw(10) << "stddev" << std::setw(12) << "TFLOP/s" << std::setw(10) << "GB/s"
+        << "\n";
   table << "  " << std::string(name_width + 11 + 10 * 6 + 12, '-') << "\n";
 
   std::string previous_case;
@@ -711,8 +672,8 @@ void BenchmarkRunner::PrintTable() const {
     table << "  " << std::left << std::setw(name_width) << result.case_name << std::setw(11)
           << TimingModeLabel(result.mode) << std::right << std::setprecision(2) << std::setw(10)
           << result.latency.min_us << std::setw(10) << result.latency.median_us << std::setw(10)
-          << result.latency.mean_us << std::setw(10) << result.latency.p95_us << std::setw(10)
-          << result.latency.p99_us << std::setw(10) << result.latency.stddev_us;
+          << result.latency.mean_us << std::setw(10) << result.latency.p95_us << std::setw(10) << result.latency.p99_us
+          << std::setw(10) << result.latency.stddev_us;
 
     if (result.flops_per_iteration > 0.0) {
       table << std::setw(12) << std::setprecision(3) << result.tflops();
@@ -768,8 +729,7 @@ void BenchmarkRunner::WriteCsv() const {
   }
   std::ofstream csv(options_.csv_path);
   if (!csv) {
-    std::fprintf(stderr, "[ascend-bench] could not open ASCEND_BENCH_CSV=%s for writing\n",
-                 options_.csv_path.c_str());
+    std::fprintf(stderr, "[ascend-bench] could not open ASCEND_BENCH_CSV=%s for writing\n", options_.csv_path.c_str());
     return;
   }
   csv << "suite,case,mode,samples,discarded,min_us,median_us,mean_us,p95_us,p99_us,max_us,stddev_us,tflops,"
@@ -777,13 +737,12 @@ void BenchmarkRunner::WriteCsv() const {
   csv << std::setprecision(9);
   for (const BenchmarkResult& result : results_) {
     csv << suite_name_ << "," << result.case_name << "," << TimingModeLabel(result.mode) << ","
-        << result.latency.sample_count << "," << result.latency.discarded_count << ","
-        << result.latency.min_us << "," << result.latency.median_us << ","
-        << result.latency.mean_us << "," << result.latency.p95_us << "," << result.latency.p99_us << ","
-        << result.latency.max_us << "," << result.latency.stddev_us << "," << result.tflops() << ","
-        << result.gigabytes_per_second() << "," << result.flops_per_iteration << ","
-        << result.bytes_per_iteration << ",\"" << PlannedOp::LaunchPathLabel() << "\",\""
-        << EventTimingSourceLabel() << "\"\n";
+        << result.latency.sample_count << "," << result.latency.discarded_count << "," << result.latency.min_us << ","
+        << result.latency.median_us << "," << result.latency.mean_us << "," << result.latency.p95_us << ","
+        << result.latency.p99_us << "," << result.latency.max_us << "," << result.latency.stddev_us << ","
+        << result.tflops() << "," << result.gigabytes_per_second() << "," << result.flops_per_iteration << ","
+        << result.bytes_per_iteration << ",\"" << PlannedOp::LaunchPathLabel() << "\",\"" << EventTimingSourceLabel()
+        << "\"\n";
   }
   std::fprintf(stdout, "[ascend-bench] wrote %s\n", options_.csv_path.c_str());
 }
@@ -809,7 +768,7 @@ const char* TargetPartLabel(BenchmarkTargetPart part) {
   return part == BenchmarkTargetPart::kAscend310P ? "Ascend 310P" : "Ascend 950PR";
 }
 
-}
+}  // namespace
 
 int RunBenchmarkSuite(const char* suite_name, const std::function<void(BenchmarkRunner&)>& build) {
   return RunBenchmarkSuite(suite_name, BenchmarkTargetPart::kAscend310P, build);
@@ -817,8 +776,7 @@ int RunBenchmarkSuite(const char* suite_name, const std::function<void(Benchmark
 
 int RunBenchmarkSuite(const char* suite_name, BenchmarkTargetPart part,
                       const std::function<void(BenchmarkRunner&)>& build) {
-  std::printf("[ascend-bench] vllm-ascend %s kernel microbenchmarks (no Python, no torch)\n",
-              TargetPartLabel(part));
+  std::printf("[ascend-bench] vllm-ascend %s kernel microbenchmarks (no Python, no torch)\n", TargetPartLabel(part));
   if (part == BenchmarkTargetPart::kAscend310P) {
     ops::PrintOperatorInventory();
   }
@@ -870,6 +828,6 @@ int RunBenchmarkSuite(const char* suite_name, BenchmarkTargetPart part,
   return exit_code;
 }
 
-}
-}
-}
+}  // namespace bench
+}  // namespace test
+}  // namespace vllm_ascend

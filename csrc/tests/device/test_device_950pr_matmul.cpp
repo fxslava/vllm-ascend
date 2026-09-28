@@ -28,6 +28,7 @@
 #include "cpu_reference.hpp"
 #include "device_tensor.hpp"
 #include "fp16.hpp"
+#include "op_test_fixture.hpp"
 #include "random_data.hpp"
 #include "tensor_compare.hpp"
 #include "test_harness.hpp"
@@ -43,8 +44,8 @@ const AclnnOp& MatmulOp() {
   return op;
 }
 
-std::vector<float> RunMatmulOnDevice(const std::vector<float>& a, const std::vector<float>& b_t, int64_t m,
-                                     int64_t k, int64_t n) {
+std::vector<float> RunMatmulOnDevice(const std::vector<float>& a, const std::vector<float>& b_t, int64_t m, int64_t k,
+                                     int64_t n) {
   aclrtStream stream = AscendTestEnvironment::Instance().stream();
 
   DeviceTensor a_device = DeviceTensor::Half({m, k}, a);
@@ -64,8 +65,8 @@ TEST(Matmul950PrShapes, LayerProjectionsAreCoveredByTheSweep) {
     int64_t n;
   };
   const Projection projections[] = {
-      {"q / attn_gate", s::kHidden, s::kQDim},        {"k / v", s::kHidden, s::kKvDim},
-      {"o_proj", s::kQDim, s::kHidden},               {"gate / up", s::kHidden, s::kIntermediate},
+      {"q / attn_gate", s::kHidden, s::kQDim}, {"k / v", s::kHidden, s::kKvDim},
+      {"o_proj", s::kQDim, s::kHidden},        {"gate / up", s::kHidden, s::kIntermediate},
       {"down", s::kIntermediate, s::kHidden},
   };
 
@@ -110,7 +111,7 @@ TEST_P(Matmul950PrTest, MatchesCpuReference) {
   std::vector<float> expected;
   reference::MatmulTransposedB(a, b_t, m(), k(), n(), &expected);
 
-  EXPECT_TENSORS_ALLCLOSE(actual, QuantizeToHalf(expected), kFp16DefaultTolerance);
+  EXPECT_HALF_TENSORS_ALLCLOSE(actual, expected);
 }
 
 TEST_P(Matmul950PrTest, ZeroWeightsProduceZeroOutput) {
@@ -153,20 +154,14 @@ TEST_P(Matmul950PrTest, IsLinearInTheInput) {
     expected[i] = base[i] * 2.0f;
   }
 
-  EXPECT_TENSORS_ALLCLOSE(scaled, QuantizeToHalf(expected), kFp16DefaultTolerance);
-}
-
-std::string MatmulTestName(const ::testing::TestParamInfo<std::tuple<int64_t, int64_t>>& info) {
-  std::ostringstream name;
-  name << "k" << std::get<0>(info.param) << "_n" << std::get<1>(info.param);
-  return name.str();
+  EXPECT_HALF_TENSORS_ALLCLOSE(scaled, expected);
 }
 
 INSTANTIATE_TEST_SUITE_P(Qwen35, Matmul950PrTest,
                          ::testing::Combine(::testing::ValuesIn(s::LinearInputSizes()),
                                             ::testing::ValuesIn(s::LinearOutputSizes())),
-                         MatmulTestName);
+                         op_case::TupleName("k", "n"));
 
-}
-}
-}
+}  // namespace
+}  // namespace test
+}  // namespace vllm_ascend

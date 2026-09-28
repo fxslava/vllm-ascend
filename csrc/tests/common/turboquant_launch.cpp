@@ -39,7 +39,7 @@ int32_t FloatBits(float value) {
   return bits;
 }
 
-}
+}  // namespace
 
 std::vector<float> PiSigns(int64_t head_size) {
   const std::vector<int8_t> signs = tq::cpu_pi_sign_vector(static_cast<int>(head_size));
@@ -88,7 +88,7 @@ std::vector<int32_t> CodecTables(int64_t head_size, int64_t batch_rows) {
   return tables;
 }
 
-int64_t VectorCoreNum(bool *queried) {
+int64_t VectorCoreNum(bool* queried) {
   int64_t aiv_num = 0;
   const bool ok = aclGetDeviceCapability(0, ACL_DEVICE_INFO_VECTOR_CORE_NUM, &aiv_num) == ACL_SUCCESS && aiv_num > 0;
   if (queried != nullptr) {
@@ -119,7 +119,7 @@ ModePlanes PlanesOf(tqm::TurboQuantMode mode) {
   }
 }
 
-const float *CentroidsOf(tqm::TurboQuantMode mode) {
+const float* CentroidsOf(tqm::TurboQuantMode mode) {
   switch (mode) {
     case tqm::TurboQuantMode::KV3_FP4:
       return tqm::TurboQuantModeTraits<tqm::TurboQuantMode::KV3_FP4>::kCentroids;
@@ -138,7 +138,7 @@ int64_t Shift(int32_t digits_per_byte) {
   return shift;
 }
 
-}
+}  // namespace
 
 int64_t ModePackedBytes(tqm::TurboQuantMode mode, int64_t head_size) {
   return tqm::TurboQuantModeConfigOf(mode).PackedBytes(head_size);
@@ -166,7 +166,7 @@ std::vector<int32_t> ModeTables(tqm::TurboQuantMode mode, int64_t head_size, int
   if (cfg.is_affine) {
     std::vector<int32_t> levels;
     levels.reserve(static_cast<size_t>(cfg.levels));
-    const float *affine_centroids = CentroidsOf(mode);
+    const float* affine_centroids = CentroidsOf(mode);
     for (int64_t level = 0; level < cfg.levels; ++level) {
       levels.push_back(FloatBits(affine_centroids[level]));
     }
@@ -192,8 +192,7 @@ std::vector<int32_t> ModeTables(tqm::TurboQuantMode mode, int64_t head_size, int
         r = rem / kOperandC0;
         c = b * kOperandC0 + (rem % kOperandC0);
       }
-      const int64_t byte = plane == 0 ? r * packed_bytes + (c >> low_shift)
-                                      : r * packed_bytes + low_bytes + (c >> 3);
+      const int64_t byte = plane == 0 ? r * packed_bytes + (c >> low_shift) : r * packed_bytes + low_bytes + (c >> 3);
       tables.push_back(static_cast<int32_t>(kWord * byte));
     }
   }
@@ -218,7 +217,7 @@ std::vector<int32_t> ModeTables(tqm::TurboQuantMode mode, int64_t head_size, int
     }
   }
 
-  const float *centroids = CentroidsOf(mode);
+  const float* centroids = CentroidsOf(mode);
   for (int64_t level = 0; level < cfg.levels; ++level) {
     tables.push_back(FloatBits(centroids[level]));
   }
@@ -241,8 +240,8 @@ std::vector<uint16_t> Hadamard16Half() {
   return h;
 }
 
-vllm_ascend::turboquant::RotateQPlan RotateQuery(void *stream, AscendType type, void *query, void *pi_signs,
-                                                 void *h16, void *rot_tables, void *query_rot, int64_t num_tokens,
+vllm_ascend::turboquant::RotateQPlan RotateQuery(void* stream, AscendType type, void* query, void* pi_signs, void* h16,
+                                                 void* rot_tables, void* query_rot, int64_t num_tokens,
                                                  int64_t num_heads, int64_t head_size, int64_t aiv_num,
                                                  vllm_ascend::turboquant::RotateQPrecision precision) {
   const int64_t num_vectors = num_tokens * num_heads;
@@ -250,11 +249,11 @@ vllm_ascend::turboquant::RotateQPlan RotateQuery(void *stream, AscendType type, 
       num_tokens, num_vectors, head_size, vllm_ascend::turboquant::RotateQCoreNum(aiv_num), precision);
   const float inv_sqrt_len = 1.0f / std::sqrt(static_cast<float>(head_size));
   turboquant_rotate_q_impl(type, stream, plan.block_dim, plan.use_cube, query, pi_signs, h16, rot_tables, query_rot,
-                           static_cast<uint32_t>(num_vectors), static_cast<uint32_t>(head_size),
-                           plan.vectors_per_block, plan.vectors_per_chunk, plan.variant, inv_sqrt_len);
+                           static_cast<uint32_t>(num_vectors), static_cast<uint32_t>(head_size), plan.vectors_per_block,
+                           plan.vectors_per_chunk, plan.variant, inv_sqrt_len);
   return plan;
 }
 
-}
-}
-}
+}  // namespace turboquant_host
+}  // namespace test
+}  // namespace vllm_ascend

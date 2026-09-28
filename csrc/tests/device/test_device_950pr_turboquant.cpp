@@ -201,11 +201,10 @@ void ReferenceWritePath(const Scenario& s, int8_t fill, std::vector<int8_t>* key
     }
     for (int kv_head = 0; kv_head < topo.num_kv_heads; ++kv_head) {
       const size_t base = (static_cast<size_t>(pos) * topo.num_kv_heads + kv_head) * topo.head_size;
-      tq::cpu_reshape_and_cache_one(s.key.data() + base, topo.head_size, signs.data(), slot, topo.num_kv_heads,
-                                    kv_head, kv_head, key_cache->data(), scale_plane->data());
+      tq::cpu_reshape_and_cache_one(s.key.data() + base, topo.head_size, signs.data(), slot, topo.num_kv_heads, kv_head,
+                                    kv_head, key_cache->data(), scale_plane->data());
       tq::cpu_reshape_and_cache_one(s.value.data() + base, topo.head_size, signs.data(), slot, topo.num_kv_heads,
-                                    kv_head, topo.num_kv_heads + kv_head, value_cache->data(),
-                                    scale_plane->data());
+                                    kv_head, topo.num_kv_heads + kv_head, value_cache->data(), scale_plane->data());
     }
   }
 }
@@ -343,9 +342,9 @@ class DeviceScenario {
   bool aiv_queried() const { return aiv_queried_; }
 
   std::vector<const void*> DeviceBases() const {
-    return {key_.get(),        value_.get(),       query_.get(),      slots_.get(),      pi_signs_.get(),
-            write_tables_.get(), decode_tables_.get(), key_cache_.get(), value_cache_.get(),
-            scale_plane_.get(), block_tables_.get(), context_lens_.get(), out_.get()};
+    return {key_.get(),          value_.get(),         query_.get(),     slots_.get(),       pi_signs_.get(),
+            write_tables_.get(), decode_tables_.get(), key_cache_.get(), value_cache_.get(), scale_plane_.get(),
+            block_tables_.get(), context_lens_.get(),  out_.get()};
   }
 
  private:
@@ -462,8 +461,7 @@ void PoisonInactiveTail(const Scenario& s, const std::vector<int32_t>& tail_slot
 float CachedLogit(const std::vector<int8_t>& key_cache, const std::vector<float>& scale_plane, const Topology& topo,
                   const std::vector<float>& query_rot, int32_t slot, int kv_head) {
   std::vector<float> levels(static_cast<size_t>(topo.head_size));
-  tq::cpu_dequantize_4bit(key_cache.data() + PackedRowOffset(topo, slot, kv_head), topo.head_size, 1.0f,
-                          levels.data());
+  tq::cpu_dequantize_4bit(key_cache.data() + PackedRowOffset(topo, slot, kv_head), topo.head_size, 1.0f, levels.data());
   float dot = 0.0f;
   for (int c = 0; c < topo.head_size; ++c) {
     dot += query_rot[static_cast<size_t>(c)] * levels[static_cast<size_t>(c)];
@@ -518,8 +516,7 @@ tq::FidelityMetrics DecodeAgainstReference(const Scenario& scenario, const Devic
   std::vector<float> reference(static_cast<size_t>(topo.num_heads) * topo.head_size, 0.0f);
   tq::cpu_paged_attention_turboquant(scenario.query.data(), key_cache.data(), value_cache.data(), scale_plane.data(),
                                      scenario.table.data(), scenario.context_len, topo.num_heads, topo.num_kv_heads,
-                                     topo.head_size, kBlockSize, topo.attention_scale, signs.data(),
-                                     reference.data());
+                                     topo.head_size, kBlockSize, topo.attention_scale, signs.data(), reference.data());
   return tq::cpu_fidelity(device.Output(), reference);
 }
 
@@ -540,14 +537,13 @@ class TurboQuantBareMetal : public ::testing::Test {
 
   static void PrintHeader(const char* label, int context_len, const DeviceScenario& device) {
     const Topology& topo = device.topo();
-    std::printf("\n[turboquant/bare-metal] %s: S=%d head=%d heads=%d kv=%d block=%d aiv=%lld%s\n", label,
-                context_len, topo.head_size, topo.num_heads, topo.num_kv_heads, kBlockSize,
-                static_cast<long long>(device.aiv_num()),
+    std::printf("\n[turboquant/bare-metal] %s: S=%d head=%d heads=%d kv=%d block=%d aiv=%lld%s\n", label, context_len,
+                topo.head_size, topo.num_heads, topo.num_kv_heads, kBlockSize, static_cast<long long>(device.aiv_num()),
                 device.aiv_queried() ? "" : " (assumed, runtime declined)");
   }
 };
 
-}
+}  // namespace
 
 TEST_F(TurboQuantBareMetal, DeviceIsPhysicalSiliconAndReportsItsTopology) {
   REQUIRE_PHYSICAL_ASCEND_950PR();
@@ -607,9 +603,8 @@ TEST_F(TurboQuantBareMetal, WritePathMatchesTheCpuReferenceAcrossContexts) {
       const BinAgreement agreement =
           ComparePackedCaches(*actual_planes[plane], *expected_planes[plane], scenario.slots, scenario.topo);
       ASSERT_GT(agreement.examined, 0u) << plane_names[plane] << ": the scenario wrote no live rows";
-      std::printf("  %-6s S=%4d  max bin drift %d, %zu/%zu channels differ (%.4f%%)\n", plane_names[plane],
-                  context_len, agreement.max_drift, agreement.differing, agreement.examined,
-                  100.0 * agreement.differing_fraction());
+      std::printf("  %-6s S=%4d  max bin drift %d, %zu/%zu channels differ (%.4f%%)\n", plane_names[plane], context_len,
+                  agreement.max_drift, agreement.differing, agreement.examined, 100.0 * agreement.differing_fraction());
       EXPECT_LE(agreement.max_drift, kMaxLevelDrift)
           << plane_names[plane] << " at S=" << context_len
           << ": a channel is off by more than one 4-bit bin, which a coordinate landing either side of a "
@@ -634,8 +629,9 @@ TEST_F(TurboQuantBareMetal, WritePathMatchesTheCpuReferenceAcrossContexts) {
     }
     std::printf("  scales S=%4d  worst relative error %.3e\n", context_len, worst_scale_error);
     EXPECT_LE(worst_scale_error, kScaleRelativeTolerance)
-        << "scale plane at S=" << context_len << ": the sum-of-squares reduction disagrees with the host by more "
-                                                 "than fp32 rounding allows";
+        << "scale plane at S=" << context_len
+        << ": the sum-of-squares reduction disagrees with the host by more "
+           "than fp32 rounding allows";
     std::fflush(stdout);
   }
 }
@@ -652,8 +648,9 @@ TEST_F(TurboQuantBareMetal, PackedCacheIsByteIdenticalOnRotationExactInputs) {
   for (int c = 0; c < topo.head_size; ++c) {
     ASSERT_FLOAT_EQ(HalfBitsToFloat(FloatToHalfBits(vector_k[static_cast<size_t>(c)])),
                     vector_k[static_cast<size_t>(c)])
-        << "channel " << c << " of the Pi-preimage is not exactly representable in fp16; the construction in "
-                              "PiPreimageOfSignVector assumes 1/sqrt(head_size) is a power of two";
+        << "channel " << c
+        << " of the Pi-preimage is not exactly representable in fp16; the construction in "
+           "PiPreimageOfSignVector assumes 1/sqrt(head_size) is a power of two";
   }
 
   const size_t kv_elems = static_cast<size_t>(context_len) * topo.num_kv_heads * topo.head_size;
@@ -761,10 +758,8 @@ TEST_F(TurboQuantBareMetal, WriteAndDecodeMatchTheCpuReferenceOnTargetModelTopol
     ReferenceWritePath(scenario, 0, &expected_key, &expected_value, &expected_scales);
     ASSERT_EQ(device.KeyCache().size(), expected_key.size()) << label;
 
-    const BinAgreement key_agreement =
-        ComparePackedCaches(device.KeyCache(), expected_key, scenario.slots, topo);
-    const BinAgreement value_agreement =
-        ComparePackedCaches(device.ValueCache(), expected_value, scenario.slots, topo);
+    const BinAgreement key_agreement = ComparePackedCaches(device.KeyCache(), expected_key, scenario.slots, topo);
+    const BinAgreement value_agreement = ComparePackedCaches(device.ValueCache(), expected_value, scenario.slots, topo);
     ASSERT_GT(key_agreement.examined, 0u) << label << ": the scenario wrote no live rows";
     std::printf("  %s write  key %zu/%zu channels differ (drift %d), value %zu/%zu (drift %d)\n", label.c_str(),
                 key_agreement.differing, key_agreement.examined, key_agreement.max_drift, value_agreement.differing,
@@ -805,8 +800,9 @@ TEST_F(TurboQuantBareMetal, CacheGeometryAndAlignmentMatchTheDocumentedLayout) {
     EXPECT_EQ(scale_slot % (kBurstBytes / sizeof(float)), 0u)
         << label << ": a token's scale slot is not a whole 32-byte burst";
     EXPECT_EQ((static_cast<size_t>(topo.num_kv_heads) * packed_stride) % kBurstBytes, 0u)
-        << label << ": a token's packed bytes across all kv heads are not a whole number of 32-byte bursts, so the "
-                    "scatter cannot be one aligned DataCopy";
+        << label
+        << ": a token's packed bytes across all kv heads are not a whole number of 32-byte bursts, so the "
+           "scatter cannot be one aligned DataCopy";
     EXPECT_EQ(static_cast<size_t>(tqh::ScaleSlotFloats(topo.num_kv_heads)), scale_slot)
         << label << ": the launch shim and the CPU reference disagree about the scale slot";
     EXPECT_EQ(packed_stride * tq::kPackFactor, static_cast<size_t>(topo.head_size))
@@ -832,8 +828,7 @@ TEST_F(TurboQuantBareMetal, CacheGeometryAndAlignmentMatchTheDocumentedLayout) {
     // exactly on the allocation. At D = 128 that row is 64 bytes.
     EXPECT_EQ(PackedRowOffset(topo, 0, 1) - PackedRowOffset(topo, 0, 0), packed_stride) << label;
     EXPECT_EQ(PackedRowOffset(topo, 1, 0) - PackedRowOffset(topo, 0, topo.num_kv_heads - 1), packed_stride) << label;
-    EXPECT_EQ(PackedRowOffset(topo, static_cast<int64_t>(scenario.num_blocks) * kBlockSize - 1,
-                              topo.num_kv_heads - 1) +
+    EXPECT_EQ(PackedRowOffset(topo, static_cast<int64_t>(scenario.num_blocks) * kBlockSize - 1, topo.num_kv_heads - 1) +
                   packed_stride,
               packed_bytes)
         << label << ": the last packed row does not end on the allocation";
@@ -848,13 +843,13 @@ TEST_F(TurboQuantBareMetal, CacheGeometryAndAlignmentMatchTheDocumentedLayout) {
     const double scale_bytes = static_cast<double>(context_len) * static_cast<double>(scale_slot) * sizeof(float);
     const double tq4_bytes =
         2.0 * static_cast<double>(context_len) * topo.num_kv_heads * static_cast<double>(packed_stride) + scale_bytes;
-    std::printf("  %s S=%d: row %zu B, fp16 KV %.1f KiB, 4-bit KV %.1f KiB (%.2fx smaller, scale plane is %.1f%% "
-                "of it)\n",
-                label.c_str(), context_len, packed_stride, fp16_bytes / 1024.0, tq4_bytes / 1024.0,
-                fp16_bytes / tq4_bytes, 100.0 * scale_bytes / tq4_bytes);
+    std::printf(
+        "  %s S=%d: row %zu B, fp16 KV %.1f KiB, 4-bit KV %.1f KiB (%.2fx smaller, scale plane is %.1f%% "
+        "of it)\n",
+        label.c_str(), context_len, packed_stride, fp16_bytes / 1024.0, tq4_bytes / 1024.0, fp16_bytes / tq4_bytes,
+        100.0 * scale_bytes / tq4_bytes);
     std::fflush(stdout);
-    EXPECT_GT(fp16_bytes / tq4_bytes, 3.0)
-        << label << ": the 4-bit cache is not saving what its layout says it should";
+    EXPECT_GT(fp16_bytes / tq4_bytes, 3.0) << label << ": the 4-bit cache is not saving what its layout says it should";
   }
 }
 
@@ -903,11 +898,11 @@ TEST_F(TurboQuantBareMetal, WritePathTouchesNoByteOutsideItsSlotMapping) {
         ++poisoned_rows;
         for (size_t byte = 0; byte < packed_stride; ++byte) {
           ASSERT_EQ(key_cache[off + byte], kPoison)
-              << label << ": the key cache was written at slot " << slot << " kv_head " << kv_head << " byte "
-              << byte << ", which no slot in the mapping names";
+              << label << ": the key cache was written at slot " << slot << " kv_head " << kv_head << " byte " << byte
+              << ", which no slot in the mapping names";
           ASSERT_EQ(value_cache[off + byte], kPoison)
-              << label << ": the value cache was written at slot " << slot << " kv_head " << kv_head << " byte "
-              << byte << ", which no slot in the mapping names";
+              << label << ": the value cache was written at slot " << slot << " kv_head " << kv_head << " byte " << byte
+              << ", which no slot in the mapping names";
         }
       }
     }
@@ -1003,8 +998,8 @@ TEST_F(TurboQuantBareMetal, PoisonedInactiveTailSlotsCannotReachTheSoftmax) {
         }
         double poisoned_max = -std::numeric_limits<double>::infinity();
         for (const int32_t slot : tail_slots) {
-          poisoned_max = std::max<double>(
-              poisoned_max, CachedLogit(poisoned_key, poisoned_scales, topo, rotated, slot, kv_head));
+          poisoned_max =
+              std::max<double>(poisoned_max, CachedLogit(poisoned_key, poisoned_scales, topo, rotated, slot, kv_head));
         }
         worst_margin = std::min(worst_margin, poisoned_max - live_max);
       }
@@ -1042,10 +1037,9 @@ TEST_F(TurboQuantBareMetal, PoisonedInactiveTailSlotsCannotReachTheSoftmax) {
           ++differing;
         }
       }
-      EXPECT_EQ(differing, 0u)
-          << label << " at S=" << context_len << ": " << differing << " of " << clean_out.size()
-          << " output elements moved when the inactive tail was poisoned, first at " << first_difference
-          << "; logits from past the context length reached the softmax";
+      EXPECT_EQ(differing, 0u) << label << " at S=" << context_len << ": " << differing << " of " << clean_out.size()
+                               << " output elements moved when the inactive tail was poisoned, first at "
+                               << first_difference << "; logits from past the context length reached the softmax";
 
       EXPECT_EQ(CountNonFiniteHalves(poisoned_out), 0u)
           << label << " at S=" << context_len << ": the output holds a NaN or an infinity";
@@ -1070,9 +1064,8 @@ TEST_F(TurboQuantBareMetal, PoisonedInactiveTailSlotsCannotReachTheSoftmax) {
                 (std::memcmp(&clean_partials[off], &poisoned_partials[off], sizeof(float)) != 0) ? 1u : 0u;
           }
         }
-        EXPECT_EQ(differing_stats, 0u)
-            << label << " at S=" << context_len << ": " << differing_stats
-            << " running statistics (m, L) moved when the inactive tail was poisoned";
+        EXPECT_EQ(differing_stats, 0u) << label << " at S=" << context_len << ": " << differing_stats
+                                       << " running statistics (m, L) moved when the inactive tail was poisoned";
         EXPECT_EQ(CountDifferingFloats(clean_partials, poisoned_partials), 0u)
             << label << " at S=" << context_len << ": a split partial moved when the inactive tail was poisoned";
       } else {
@@ -1114,5 +1107,5 @@ TEST_F(TurboQuantBareMetal, RepeatedDecodeLaunchesAreBitIdentical) {
   std::fflush(stdout);
 }
 
-}
-}
+}  // namespace test
+}  // namespace vllm_ascend

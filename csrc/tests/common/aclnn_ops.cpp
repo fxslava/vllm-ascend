@@ -78,6 +78,6 @@ void PrintOperatorInventory() {
   }
 }
 
-}
-}
-}
+}  // namespace ops
+}  // namespace test
+}  // namespace vllm_ascend

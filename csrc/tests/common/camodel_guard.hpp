@@ -131,5 +131,5 @@ inline DumpCensus ExceptionDumps() {
   return census;
 }
 
-}
-}
+}  // namespace test
+}  // namespace vllm_ascend

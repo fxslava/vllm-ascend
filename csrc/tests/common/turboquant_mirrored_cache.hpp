@@ -24,11 +24,24 @@
 
 #include "../../attention/turboquant/op_kernel/common/turboquant_layout.h"
 #include "../../attention/turboquant/op_kernel/common/turboquant_mode.h"
+#include "fp8_e4m3.hpp"
 #include "random_data.hpp"
 
 namespace vllm_ascend {
 namespace test {
 namespace turboquant_host {
+
+using fp8::E4m3fnBits;
+using fp8::E4m3fnValue;
+
+// Historical names for the shared E4M3Fn converters in fp8_e4m3.hpp.
+constexpr int kFp8E4m3fnExponentBias = fp8::kE4m3fnExponentBias;
+constexpr int kFp8E4m3fnMantissaBits = fp8::kE4m3fnMantissaBits;
+constexpr uint32_t kFp8E4m3fnExponentMask = fp8::kE4m3fnExponentMask;
+constexpr uint32_t kFp8E4m3fnMantissaMask = fp8::kE4m3fnMantissaMask;
+constexpr uint32_t kFp8E4m3fnSignBit = fp8::kE4m3fnSignBit;
+inline uint8_t Fp8E4m3fnBits(float value) { return fp8::E4m3fnBits(value); }
+inline float Fp8E4m3fnValue(uint8_t bits) { return fp8::E4m3fnValue(bits); }
 
 using MirroredTraits = vllm_ascend::turboquant::TurboQuantModeTraits<vllm_ascend::turboquant::TurboQuantMode::KV4_FP8>;
 
@@ -40,31 +53,6 @@ constexpr uint32_t kMirroredNibbleMask = 0x0F;
 constexpr int kMirroredNibbleBits = 4;
 constexpr int64_t kMirroredScaleLanes = 8;
 
-constexpr int kFp8E4m3fnExponentBias = 7;
-constexpr int kFp8E4m3fnMantissaBits = 3;
-constexpr uint32_t kFp8E4m3fnExponentMask = 0x0F;
-constexpr uint32_t kFp8E4m3fnMantissaMask = 0x07;
-constexpr uint32_t kFp8E4m3fnSignBit = 0x80;
-
-inline uint8_t Fp8E4m3fnBits(float value) {
-  const uint32_t sign = std::signbit(value) ? kFp8E4m3fnSignBit : 0u;
-  int exponent = 0;
-  const float fraction = std::frexp(std::fabs(value), &exponent);
-  const uint32_t biased = static_cast<uint32_t>(exponent - 1 + kFp8E4m3fnExponentBias);
-  const uint32_t mantissa = static_cast<uint32_t>(
-      std::lround((2.0f * fraction - 1.0f) * static_cast<float>(1 << kFp8E4m3fnMantissaBits)));
-  return static_cast<uint8_t>(sign | (biased << kFp8E4m3fnMantissaBits) | mantissa);
-}
-
-inline float Fp8E4m3fnValue(uint8_t bits) {
-  const int biased =
-      static_cast<int>((static_cast<uint32_t>(bits) >> kFp8E4m3fnMantissaBits) & kFp8E4m3fnExponentMask);
-  const float mantissa =
-      1.0f + static_cast<float>(bits & kFp8E4m3fnMantissaMask) / static_cast<float>(1 << kFp8E4m3fnMantissaBits);
-  const float magnitude = std::ldexp(mantissa, biased - kFp8E4m3fnExponentBias);
-  return (bits & kFp8E4m3fnSignBit) != 0u ? -magnitude : magnitude;
-}
-
 inline float MirroredLevel(int32_t index) { return static_cast<float>(index) - kMirroredAffineBias; }
 
 inline int64_t MirroredScaleSlotFloats(int64_t num_kv_heads) {
@@ -72,8 +60,7 @@ inline int64_t MirroredScaleSlotFloats(int64_t num_kv_heads) {
 }
 
 // The byte of packed column `column` of (slot, kv head) in kv4fp8's NZ-tiled cache.
-inline size_t MirroredPackedByte(size_t slot, size_t kv_head, size_t column, size_t num_kv_heads,
-                                 size_t packed_bytes) {
+inline size_t MirroredPackedByte(size_t slot, size_t kv_head, size_t column, size_t num_kv_heads, size_t packed_bytes) {
   return static_cast<size_t>(
       vllm_ascend::turboquant::NzTiledPackedByte(slot, kv_head, column, num_kv_heads, packed_bytes));
 }
@@ -124,9 +111,9 @@ inline MirroredKvCache BuildMirroredKvCache(DeterministicRandom& rng, int64_t co
   cache.value.assign(cache.key.size(), 0.0f);
 
   for (int64_t t = 0; t < context_len; ++t) {
-    const size_t slot = static_cast<size_t>(block_table[static_cast<size_t>(t / block_size)]) *
-                            static_cast<size_t>(block_size) +
-                        static_cast<size_t>(t % block_size);
+    const size_t slot =
+        static_cast<size_t>(block_table[static_cast<size_t>(t / block_size)]) * static_cast<size_t>(block_size) +
+        static_cast<size_t>(t % block_size);
     for (size_t kv = 0; kv < kv_heads; ++kv) {
       for (int plane = 0; plane < 2; ++plane) {
         std::vector<int8_t>& packed = plane == 0 ? cache.key_packed : cache.value_packed;
@@ -144,8 +131,8 @@ inline MirroredKvCache BuildMirroredKvCache(DeterministicRandom& rng, int64_t co
         const size_t row = slot * kv_heads + kv;
         const size_t dense_row = (static_cast<size_t>(t) * kv_heads + kv) * head;
         const auto index_of = [&](float x) {
-          return std::clamp(static_cast<int32_t>(std::floor(x / scale * kMirroredGain + kMirroredAffineBias + 0.5f)),
-                            0, kMirroredLevels - 1);
+          return std::clamp(static_cast<int32_t>(std::floor(x / scale * kMirroredGain + kMirroredAffineBias + 0.5f)), 0,
+                            kMirroredLevels - 1);
         };
         for (size_t j = 0; j < half; ++j) {
           const int32_t low_index = index_of(source[j]);
@@ -164,6 +151,6 @@ inline MirroredKvCache BuildMirroredKvCache(DeterministicRandom& rng, int64_t co
   return cache;
 }
 
-}
-}
-}
+}  // namespace turboquant_host
+}  // namespace test
+}  // namespace vllm_ascend

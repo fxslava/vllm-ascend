@@ -126,5 +126,5 @@ inline std::vector<float> QuantizeToHalf(const std::vector<float>& src) {
   return out;
 }
 
-}
-}
+}  // namespace test
+}  // namespace vllm_ascend

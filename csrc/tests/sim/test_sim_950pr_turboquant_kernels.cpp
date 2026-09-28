@@ -142,12 +142,13 @@ void ExpectPackedCachesAgree(const char* label, const std::vector<int8_t>& actua
 
   ASSERT_GT(examined, 0u) << label << ": the scenario wrote no live rows";
   const double differing_fraction = static_cast<double>(differing) / static_cast<double>(examined);
-  std::printf("  %-12s max bin drift %d, %zu/%zu channels differ (%.3f%%)\n", label, max_drift, differing,
-              examined, 100.0 * differing_fraction);
+  std::printf("  %-12s max bin drift %d, %zu/%zu channels differ (%.3f%%)\n", label, max_drift, differing, examined,
+              100.0 * differing_fraction);
 
-  EXPECT_LE(max_drift, kMaxLevelDrift) << label << ": a channel is off by more than one 4-bit bin, which a "
-                                                  "coordinate landing either side of a decision boundary cannot "
-                                                  "explain";
+  EXPECT_LE(max_drift, kMaxLevelDrift) << label
+                                       << ": a channel is off by more than one 4-bit bin, which a "
+                                          "coordinate landing either side of a decision boundary cannot "
+                                          "explain";
   EXPECT_LE(differing_fraction, kMaxDifferingChannelFraction)
       << label << ": " << differing << " of " << examined << " channels landed on a different level";
 }
@@ -205,12 +206,11 @@ class DeviceScenario {
 
   void RunWritePath() {
     const tqh::ReshapeAndCacheGrid grid = tqh::PlanReshapeAndCache(kContextLen, aiv_num_);
-    turboquant_reshape_and_cache_impl(AscendType::FP16, stream_, grid.block_dim, key_.get(), value_.get(),
-                                      key_cache_.get(), value_cache_.get(), scale_plane_.get(), slots_.get(),
-                                      pi_signs_.get(), write_tables_.get(), static_cast<uint32_t>(kContextLen),
-                                      static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize),
-                                      static_cast<uint32_t>(kBlockSize), static_cast<uint32_t>(kNumBlocks),
-                                      grid.tokens_per_core, kInvSqrtHeadSize);
+    turboquant_reshape_and_cache_impl(
+        AscendType::FP16, stream_, grid.block_dim, key_.get(), value_.get(), key_cache_.get(), value_cache_.get(),
+        scale_plane_.get(), slots_.get(), pi_signs_.get(), write_tables_.get(), static_cast<uint32_t>(kContextLen),
+        static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kBlockSize),
+        static_cast<uint32_t>(kNumBlocks), grid.tokens_per_core, kInvSqrtHeadSize);
     ACL_CHECK(aclrtSynchronizeStream(stream_));
   }
 
@@ -254,7 +254,7 @@ class DeviceScenario {
   bool aiv_queried_ = false;
 };
 
-}
+}  // namespace
 
 TEST(TurboQuantLaunchContract, ScaleSlotMatchesTheCpuReference) {
   for (int heads = 1; heads <= 16; ++heads) {
@@ -273,8 +273,7 @@ TEST(TurboQuantLaunchContract, CodecTableWordsMatchTheLayoutContract) {
       EXPECT_EQ(words, 7 * head_size + 2 * head_size * batch_rows + tq::kLevels);
       EXPECT_EQ(static_cast<int64_t>(tqh::CodecTables(head_size, batch_rows).size()), words)
           << "head_size " << head_size << ", batch_rows " << batch_rows;
-      EXPECT_EQ(words % tqh::kFp32PerBlock, 0)
-          << "head_size " << head_size << ", batch_rows " << batch_rows;
+      EXPECT_EQ(words % tqh::kFp32PerBlock, 0) << "head_size " << head_size << ", batch_rows " << batch_rows;
     }
   }
 }
@@ -444,8 +443,7 @@ TEST(TurboQuantKernels, ReshapeAndCacheMatchesTheCpuReference) {
   std::vector<float> reference_scales;
   ReferenceWritePath(scenario, &reference_key, &reference_value, &reference_scales);
 
-  std::printf("[turboquant] write path, %d tokens x %d kv heads x %d channels\n", kContextLen, kNumKvHeads,
-              kHeadSize);
+  std::printf("[turboquant] write path, %d tokens x %d kv heads x %d channels\n", kContextLen, kNumKvHeads, kHeadSize);
   ExpectPackedCachesAgree("key cache", device.KeyCache(), reference_key, scenario.slots);
   ExpectPackedCachesAgree("value cache", device.ValueCache(), reference_value, scenario.slots);
   ExpectScalePlanesAgree(device.ScalePlane(), reference_scales, scenario.slots);
@@ -496,11 +494,11 @@ TEST(TurboQuantKernels, PagedAttentionMatchesTheCpuReference) {
 
   std::vector<float> reference(static_cast<size_t>(kQueryTokens) * kNumHeads * kHeadSize, 0.0f);
   for (int token = 0; token < kQueryTokens; ++token) {
-    tq::cpu_paged_attention_turboquant(
-        scenario.query.data() + static_cast<size_t>(token) * kNumHeads * kHeadSize, key_cache.data(),
-        value_cache.data(), scale_plane.data(), scenario.table.data(), kContextLen, kNumHeads, kNumKvHeads,
-        kHeadSize, kBlockSize, kAttentionScale, signs.data(),
-        reference.data() + static_cast<size_t>(token) * kNumHeads * kHeadSize);
+    tq::cpu_paged_attention_turboquant(scenario.query.data() + static_cast<size_t>(token) * kNumHeads * kHeadSize,
+                                       key_cache.data(), value_cache.data(), scale_plane.data(), scenario.table.data(),
+                                       kContextLen, kNumHeads, kNumKvHeads, kHeadSize, kBlockSize, kAttentionScale,
+                                       signs.data(),
+                                       reference.data() + static_cast<size_t>(token) * kNumHeads * kHeadSize);
   }
 
   const std::vector<float> actual = device.Output();
@@ -508,13 +506,13 @@ TEST(TurboQuantKernels, PagedAttentionMatchesTheCpuReference) {
 
   const tq::FidelityMetrics metrics = tq::cpu_fidelity(actual, reference);
   std::printf("[turboquant] decode vs CPU reference: cos=%.6f snr=%.2f dB relL2=%.6f (aiv=%lld%s)\n",
-              metrics.cosine_similarity, metrics.snr_db, metrics.relative_l2,
-              static_cast<long long>(device.aiv_num()), device.aiv_queried() ? "" : ", assumed");
+              metrics.cosine_similarity, metrics.snr_db, metrics.relative_l2, static_cast<long long>(device.aiv_num()),
+              device.aiv_queried() ? "" : ", assumed");
 
   EXPECT_GT(metrics.cosine_similarity, 0.9995) << "the decode kernel disagrees with the reference in direction, "
                                                   "which fp16 rounding of the output cannot cause";
   EXPECT_LT(metrics.relative_l2, 5e-3) << "the decode kernel disagrees with the reference in magnitude";
 }
 
-}
-}
+}  // namespace test
+}  // namespace vllm_ascend

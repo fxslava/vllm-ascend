@@ -24,11 +24,11 @@
 
 namespace vllm_ascend {
 
-void sim_hadamard_hybrid_impl(void *stream, void *input, void *h16, void *output, uint32_t headDim,
-                              uint32_t numVectors, uint32_t vectorsPerChunk, uint32_t variant, float invSqrtDim);
+void sim_hadamard_hybrid_impl(void* stream, void* input, void* h16, void* output, uint32_t headDim, uint32_t numVectors,
+                              uint32_t vectorsPerChunk, uint32_t variant, float invSqrtDim);
 
-void sim_hadamard_aiv_impl(void *stream, void *input, void *tables, void *output, uint32_t headDim,
-                           uint32_t numVectors, float invSqrtDim);
+void sim_hadamard_aiv_impl(void* stream, void* input, void* tables, void* output, uint32_t headDim, uint32_t numVectors,
+                           float invSqrtDim);
 
 namespace test {
 namespace hadamard_spike {
@@ -96,9 +96,7 @@ inline bool HadamardDualDstApplies(int64_t dim, int64_t num_vectors) {
   return HadamardVectorsPerChunk(dim, num_vectors) % 2 == 0;
 }
 
-inline float InvSqrtDim(int64_t dim) {
-  return 1.0f / std::sqrt(static_cast<float>(dim));
-}
+inline float InvSqrtDim(int64_t dim) { return 1.0f / std::sqrt(static_cast<float>(dim)); }
 
 inline std::vector<float> SyntheticBatch(int64_t dim, int64_t num_vectors, uint32_t seed = 0x9E3779B9u) {
   std::vector<float> x(static_cast<size_t>(dim * num_vectors));
@@ -135,6 +133,6 @@ inline std::string CaseLabel(int64_t dim, int64_t num_vectors, const char* varia
   return "d" + std::to_string(dim) + "_v" + std::to_string(num_vectors) + "_" + variant;
 }
 
-}
-}
-}
+}  // namespace hadamard_spike
+}  // namespace test
+}  // namespace vllm_ascend

@@ -24,8 +24,8 @@ namespace vllm_ascend {
 namespace test {
 namespace reference {
 
-void MatmulTransposedB(const std::vector<float>& a, const std::vector<float>& b_t, int64_t m, int64_t k,
-                       int64_t n, std::vector<float>* out) {
+void MatmulTransposedB(const std::vector<float>& a, const std::vector<float>& b_t, int64_t m, int64_t k, int64_t n,
+                       std::vector<float>* out) {
   assert(a.size() == static_cast<size_t>(m * k));
   assert(b_t.size() == static_cast<size_t>(n * k));
 
@@ -107,8 +107,7 @@ std::vector<float> BuildCosSinCache(int64_t max_position, int64_t rotary_dim, do
 }
 
 void GatherFullCosSin(const std::vector<float>& cos_sin_cache, const std::vector<int32_t>& positions,
-                      int64_t rotary_dim, RotaryMode mode, std::vector<float>* cos_full,
-                      std::vector<float>* sin_full) {
+                      int64_t rotary_dim, RotaryMode mode, std::vector<float>* cos_full, std::vector<float>* sin_full) {
   const int64_t half = rotary_dim / 2;
   const size_t num_tokens = positions.size();
 
@@ -167,9 +166,8 @@ void ApplyRotaryPosEmb(const std::vector<float>& x, const std::vector<float>& co
 
         const float value = x[base + static_cast<size_t>(i)];
         const float partner_value = x[base + static_cast<size_t>(partner)];
-        (*out)[base + static_cast<size_t>(i)] =
-            value * cos_full[angle_row + static_cast<size_t>(i)] +
-            sign * partner_value * sin_full[angle_row + static_cast<size_t>(i)];
+        (*out)[base + static_cast<size_t>(i)] = value * cos_full[angle_row + static_cast<size_t>(i)] +
+                                                sign * partner_value * sin_full[angle_row + static_cast<size_t>(i)];
       }
 
       for (int64_t i = rotary_dim; i < head_dim; ++i) {
@@ -286,6 +284,6 @@ void PagedAttentionDecode(const std::vector<float>& query, const std::vector<flo
   }
 }
 
-}
-}
-}
+}  // namespace reference
+}  // namespace test
+}  // namespace vllm_ascend

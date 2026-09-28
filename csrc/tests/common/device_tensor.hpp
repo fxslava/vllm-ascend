@@ -73,8 +73,8 @@ class DeviceTensor {
   size_t element_count_ = 0;
 };
 
-inline DeviceTensor::DeviceTensor(std::vector<int64_t> dims, aclDataType dtype, aclFormat format,
-                                  size_t element_size, const void* host_data, size_t alignment)
+inline DeviceTensor::DeviceTensor(std::vector<int64_t> dims, aclDataType dtype, aclFormat format, size_t element_size,
+                                  const void* host_data, size_t alignment)
     : dims_(std::move(dims)) {
   element_count_ = ElementCount(dims_);
   buffer_.Allocate(element_count_ * element_size, alignment);
@@ -96,8 +96,7 @@ inline DeviceTensor DeviceTensor::Half(const std::vector<int64_t>& dims, const s
   return DeviceTensor(dims, ACL_FLOAT16, format, sizeof(uint16_t), bits.data(), alignment);
 }
 
-inline DeviceTensor DeviceTensor::HalfEmpty(const std::vector<int64_t>& dims, aclFormat format,
-                                            size_t alignment) {
+inline DeviceTensor DeviceTensor::HalfEmpty(const std::vector<int64_t>& dims, aclFormat format, size_t alignment) {
   return DeviceTensor(dims, ACL_FLOAT16, format, sizeof(uint16_t), nullptr, alignment);
 }
 
@@ -116,8 +115,7 @@ inline DeviceTensor DeviceTensor::HalfTransposed2D(int64_t n, int64_t k, const s
   tensor.element_count_ = count;
   tensor.buffer_.Allocate(count * sizeof(uint16_t), alignment);
   tensor.buffer_.CopyFromHost(bits.data(), bits.size() * sizeof(uint16_t));
-  tensor.tensor_ = AclnnTensor({k, n}, {1, k}, 0, ACL_FLOAT16, ACL_FORMAT_ND,
-                               {n, k}, tensor.buffer_.get());
+  tensor.tensor_ = AclnnTensor({k, n}, {1, k}, 0, ACL_FLOAT16, ACL_FORMAT_ND, {n, k}, tensor.buffer_.get());
   return tensor;
 }
 
@@ -138,8 +136,7 @@ inline DeviceTensor DeviceTensor::Float(const std::vector<int64_t>& dims, const 
   return DeviceTensor(dims, ACL_FLOAT, format, sizeof(float), values.data(), alignment);
 }
 
-inline DeviceTensor DeviceTensor::FloatEmpty(const std::vector<int64_t>& dims, aclFormat format,
-                                             size_t alignment) {
+inline DeviceTensor DeviceTensor::FloatEmpty(const std::vector<int64_t>& dims, aclFormat format, size_t alignment) {
   return DeviceTensor(dims, ACL_FLOAT, format, sizeof(float), nullptr, alignment);
 }
 
@@ -164,5 +161,5 @@ inline std::vector<int32_t> DeviceTensor::ToInt32() const {
   return values;
 }
 
-}
-}
+}  // namespace test
+}  // namespace vllm_ascend

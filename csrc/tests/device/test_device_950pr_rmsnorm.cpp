@@ -27,6 +27,7 @@
 #include "ascend950_shapes.hpp"
 #include "cpu_reference.hpp"
 #include "device_tensor.hpp"
+#include "op_test_fixture.hpp"
 #include "random_data.hpp"
 #include "tensor_compare.hpp"
 #include "test_harness.hpp"
@@ -96,8 +97,7 @@ TEST_P(RmsNorm950PrTest, MatchesCpuReference) {
 
   DeterministicRandom random(0x5157454eu);
 
-  const std::vector<float> x =
-      random.NormalHalfExact(static_cast<size_t>(num_tokens() * hidden()), 0.0f, 1.0f);
+  const std::vector<float> x = random.NormalHalfExact(static_cast<size_t>(num_tokens() * hidden()), 0.0f, 1.0f);
   const std::vector<float> gamma = random.NormalHalfExact(static_cast<size_t>(hidden()), 1.0f, 0.1f);
 
   const RmsNormResult actual = RunRmsNormOnDevice(x, gamma, num_tokens(), hidden(), s::kRmsNormEps);
@@ -106,8 +106,8 @@ TEST_P(RmsNorm950PrTest, MatchesCpuReference) {
   std::vector<float> expected_rstd;
   reference::RmsNorm(x, gamma, num_tokens(), hidden(), s::kRmsNormEps, &expected_y, &expected_rstd);
 
-  EXPECT_TENSORS_ALLCLOSE(actual.y, QuantizeToHalf(expected_y), kFp16DefaultTolerance);
-  EXPECT_TENSORS_ALLCLOSE(actual.rstd, expected_rstd, kFp16DefaultTolerance);
+  EXPECT_HALF_TENSORS_ALLCLOSE(actual.y, expected_y);
+  EXPECT_HALF_TENSORS_ALLCLOSE(actual.rstd, expected_rstd);
 }
 
 TEST_P(RmsNorm950PrTest, IsInvariantToRowScaling) {
@@ -116,8 +116,7 @@ TEST_P(RmsNorm950PrTest, IsInvariantToRowScaling) {
 
   DeterministicRandom random(0x524d534eu);
 
-  const std::vector<float> x =
-      random.NormalHalfExact(static_cast<size_t>(num_tokens() * hidden()), 0.0f, 1.0f);
+  const std::vector<float> x = random.NormalHalfExact(static_cast<size_t>(num_tokens() * hidden()), 0.0f, 1.0f);
   const std::vector<float> gamma(static_cast<size_t>(hidden()), 1.0f);
 
   std::vector<float> scaled(x.size());
@@ -149,17 +148,11 @@ TEST_P(RmsNorm950PrTest, HandlesNearZeroRowsWithoutBlowingUp) {
   }
 }
 
-std::string RmsNormTestName(const ::testing::TestParamInfo<std::tuple<int64_t, int64_t>>& info) {
-  std::ostringstream name;
-  name << "tokens" << std::get<0>(info.param) << "_hidden" << std::get<1>(info.param);
-  return name.str();
-}
-
 INSTANTIATE_TEST_SUITE_P(Qwen35, RmsNorm950PrTest,
                          ::testing::Combine(::testing::ValuesIn(s::TokenCounts()),
                                             ::testing::ValuesIn(s::RmsNormHiddenSizes())),
-                         RmsNormTestName);
+                         op_case::TupleName("tokens", "hidden"));
 
-}
-}
-}
+}  // namespace
+}  // namespace test
+}  // namespace vllm_ascend

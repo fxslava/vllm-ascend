@@ -89,7 +89,7 @@ std::vector<ProjectionCase> BuildCaseList() {
   return cases;
 }
 
-}
+}  // namespace
 
 void BuildSuite(BenchmarkRunner& runner) {
   const AclnnOp& op = MatmulOp();
@@ -108,23 +108,21 @@ void BuildSuite(BenchmarkRunner& runner) {
     try {
       const float weight_stddev = 1.0f / std::sqrt(static_cast<float>(k));
       const std::vector<float> a = random.NormalHalfExact(static_cast<size_t>(m * k), 0.0f, 1.0f);
-      const std::vector<float> b_t =
-          random.NormalHalfExact(static_cast<size_t>(n * k), 0.0f, weight_stddev);
+      const std::vector<float> b_t = random.NormalHalfExact(static_cast<size_t>(n * k), 0.0f, weight_stddev);
 
       DeviceTensor a_device = DeviceTensor::Half({m, k}, a, ACL_FORMAT_ND, kBenchmarkAlignBytes);
       DeviceTensor b_device = DeviceTensor::HalfTransposed2D(n, k, b_t, kBenchmarkAlignBytes);
       DeviceTensor out_device = DeviceTensor::HalfEmpty({m, n}, ACL_FORMAT_ND, kBenchmarkAlignBytes);
 
-      PlannedOp planned = PlanAclnn<ops::MatmulWorkspaceFn>(
-          op, a_device.get(), b_device.get(), out_device.get(), ops::kCubeMathTypeKeepDtype);
+      PlannedOp planned = PlanAclnn<ops::MatmulWorkspaceFn>(op, a_device.get(), b_device.get(), out_device.get(),
+                                                            ops::kCubeMathTypeKeepDtype);
 
       BenchmarkCase benchmark_case;
       benchmark_case.name = name;
       benchmark_case.flops_per_iteration =
           2.0 * static_cast<double>(m) * static_cast<double>(n) * static_cast<double>(k);
       benchmark_case.bytes_per_iteration =
-          2.0 * (static_cast<double>(m) * static_cast<double>(k) +
-                 static_cast<double>(k) * static_cast<double>(n) +
+          2.0 * (static_cast<double>(m) * static_cast<double>(k) + static_cast<double>(k) * static_cast<double>(n) +
                  static_cast<double>(m) * static_cast<double>(n));
       benchmark_case.launch = [&planned](aclrtStream stream) { planned.Launch(stream); };
       benchmark_case.checksum = [&out_device]() { return ChecksumSum(out_device.ToFloatFromHalf()); };
@@ -136,6 +134,6 @@ void BuildSuite(BenchmarkRunner& runner) {
   }
 }
 
-}
-}
-}
+}  // namespace bench
+}  // namespace test
+}  // namespace vllm_ascend

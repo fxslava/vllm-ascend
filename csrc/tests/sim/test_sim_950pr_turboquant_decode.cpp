@@ -153,7 +153,7 @@ double TimeMs(Fn&& fn) {
 
 class TurboQuantSimulatorFidelity : public ::testing::Test {};
 
-}
+}  // namespace
 
 TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
   REQUIRE_ASCEND_950PR();
@@ -164,25 +164,22 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
   bool aiv_queried = false;
   const int64_t aiv_num = tqh::VectorCoreNum(&aiv_queried);
 
-  std::printf("\n[turboquant/sim] single decode pass on '%s'\n",
-              AscendTestEnvironment::Instance().soc_name().c_str());
+  std::printf("\n[turboquant/sim] single decode pass on '%s'\n", AscendTestEnvironment::Instance().soc_name().c_str());
   std::printf("  head_size=%lld heads=%lld kv_heads=%lld block_size=%lld context=%lld blocks=%lld aiv=%lld%s\n",
-              static_cast<long long>(kHeadSize), static_cast<long long>(kNumHeads),
-              static_cast<long long>(kNumKvHeads), static_cast<long long>(kBlockSize),
-              static_cast<long long>(kContextLen), static_cast<long long>(kNumBlocks),
-              static_cast<long long>(aiv_num), aiv_queried ? "" : " (assumed, runtime declined)");
+              static_cast<long long>(kHeadSize), static_cast<long long>(kNumHeads), static_cast<long long>(kNumKvHeads),
+              static_cast<long long>(kBlockSize), static_cast<long long>(kContextLen),
+              static_cast<long long>(kNumBlocks), static_cast<long long>(aiv_num),
+              aiv_queried ? "" : " (assumed, runtime declined)");
 
   DeviceBuffer key_dev = DeviceBuffer::FromHost(FloatToHalf(in.key));
   DeviceBuffer value_dev = DeviceBuffer::FromHost(FloatToHalf(in.value));
   DeviceBuffer query_dev = DeviceBuffer::FromHost(FloatToHalf(in.query));
   DeviceBuffer slots_dev = DeviceBuffer::FromHost(in.slots);
   DeviceBuffer block_table_dev = DeviceBuffer::FromHost(in.block_table);
-  DeviceBuffer context_lens_dev =
-      DeviceBuffer::FromHost(std::vector<int32_t>{static_cast<int32_t>(kContextLen)});
+  DeviceBuffer context_lens_dev = DeviceBuffer::FromHost(std::vector<int32_t>{static_cast<int32_t>(kContextLen)});
   DeviceBuffer pi_signs_dev = DeviceBuffer::FromHost(tqh::PiSigns(kHeadSize));
   DeviceBuffer h16_dev = DeviceBuffer::FromHost(tqh::Hadamard16Half());
-  DeviceBuffer query_rot_dev =
-      DeviceBuffer::Empty<float>(static_cast<size_t>(kQueryTokens * kNumHeads * kHeadSize));
+  DeviceBuffer query_rot_dev = DeviceBuffer::Empty<float>(static_cast<size_t>(kQueryTokens * kNumHeads * kHeadSize));
 
   DeviceBuffer write_tables_dev = DeviceBuffer::FromHost(tqh::CodecTables(kHeadSize, 1));
   DeviceBuffer decode_tables_dev = DeviceBuffer::FromHost(tqh::CodecTables(kHeadSize, tqh::kTileRows));
@@ -190,39 +187,37 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
   DeviceBuffer key_cache_dev =
       DeviceBuffer::Empty<int8_t>(tqh::PackedCacheBytes(kNumBlocks, kBlockSize, kNumKvHeads, kHeadSize));
   DeviceBuffer value_cache_dev = DeviceBuffer::Empty<int8_t>(key_cache_dev.size_bytes());
-  DeviceBuffer scale_plane_dev =
-      DeviceBuffer::Empty<float>(tqh::ScalePlaneFloats(kNumBlocks, kBlockSize, kNumKvHeads));
+  DeviceBuffer scale_plane_dev = DeviceBuffer::Empty<float>(tqh::ScalePlaneFloats(kNumBlocks, kBlockSize, kNumKvHeads));
   DeviceBuffer quantised_out_dev = DeviceBuffer::Empty<Half>(static_cast<size_t>(kQueryTokens * kNumHeads * kHeadSize));
 
-  const tqh::PagedAttentionGrid decode_grid =
-      tqh::PlanPagedAttention(kQueryTokens, kNumHeads, kHeadSize, kBlocksPerSeq, kBlockSize, aiv_num,
-                              kSplitEveryContext);
+  const tqh::PagedAttentionGrid decode_grid = tqh::PlanPagedAttention(kQueryTokens, kNumHeads, kHeadSize, kBlocksPerSeq,
+                                                                      kBlockSize, aiv_num, kSplitEveryContext);
   ASSERT_GT(decode_grid.num_splits, 1) << "this case exists to run the in-launch reduction";
   DeviceBuffer workspace_dev = DeviceBuffer::Empty<float>(decode_grid.workspace_floats);
 
   const tqh::ReshapeAndCacheGrid write_grid = tqh::PlanReshapeAndCache(kContextLen, aiv_num);
   const double write_ms = TimeMs([&] {
-    turboquant_reshape_and_cache_impl(
-        AscendType::FP16, stream, write_grid.block_dim, key_dev.get(), value_dev.get(), key_cache_dev.get(),
-        value_cache_dev.get(), scale_plane_dev.get(), slots_dev.get(), pi_signs_dev.get(), write_tables_dev.get(),
-        static_cast<uint32_t>(kContextLen), static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize),
-        static_cast<uint32_t>(kBlockSize), static_cast<uint32_t>(kNumBlocks), write_grid.tokens_per_core,
-        kInvSqrtHeadSize);
+    turboquant_reshape_and_cache_impl(AscendType::FP16, stream, write_grid.block_dim, key_dev.get(), value_dev.get(),
+                                      key_cache_dev.get(), value_cache_dev.get(), scale_plane_dev.get(),
+                                      slots_dev.get(), pi_signs_dev.get(), write_tables_dev.get(),
+                                      static_cast<uint32_t>(kContextLen), static_cast<uint32_t>(kNumKvHeads),
+                                      static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kBlockSize),
+                                      static_cast<uint32_t>(kNumBlocks), write_grid.tokens_per_core, kInvSqrtHeadSize);
     ACL_CHECK(aclrtSynchronizeStream(stream));
   });
 
   const double decode_ms = TimeMs([&] {
     tqh::RotateQuery(stream, AscendType::FP16, query_dev.get(), pi_signs_dev.get(), h16_dev.get(),
                      write_tables_dev.get(), query_rot_dev.get(), kQueryTokens, kNumHeads, kHeadSize, aiv_num);
-    turboquant_paged_attention_impl(
-        AscendType::FP16, stream, decode_grid.block_dim, query_rot_dev.get(), key_cache_dev.get(),
-        value_cache_dev.get(), scale_plane_dev.get(), block_table_dev.get(), context_lens_dev.get(),
-        decode_tables_dev.get(), workspace_dev.get(), quantised_out_dev.get(), static_cast<uint32_t>(kQueryTokens),
-        static_cast<uint32_t>(kNumHeads), static_cast<uint32_t>(kNumKvHeads), static_cast<uint32_t>(kHeadSize),
-        static_cast<uint32_t>(kBlockSize), static_cast<uint32_t>(kBlocksPerSeq),
-        static_cast<uint32_t>(decode_grid.num_splits), decode_grid.split_tasks_per_core,
-        decode_grid.reduce_tasks_per_core, static_cast<uint32_t>(kSplitEveryContext), kAttentionScale,
-        kInvSqrtHeadSize);
+    turboquant_paged_attention_impl(AscendType::FP16, stream, decode_grid.block_dim, query_rot_dev.get(),
+                                    key_cache_dev.get(), value_cache_dev.get(), scale_plane_dev.get(),
+                                    block_table_dev.get(), context_lens_dev.get(), decode_tables_dev.get(),
+                                    workspace_dev.get(), quantised_out_dev.get(), static_cast<uint32_t>(kQueryTokens),
+                                    static_cast<uint32_t>(kNumHeads), static_cast<uint32_t>(kNumKvHeads),
+                                    static_cast<uint32_t>(kHeadSize), static_cast<uint32_t>(kBlockSize),
+                                    static_cast<uint32_t>(kBlocksPerSeq), static_cast<uint32_t>(decode_grid.num_splits),
+                                    decode_grid.split_tasks_per_core, decode_grid.reduce_tasks_per_core,
+                                    static_cast<uint32_t>(kSplitEveryContext), kAttentionScale, kInvSqrtHeadSize);
     ACL_CHECK(aclrtSynchronizeStream(stream));
   });
 
@@ -235,15 +230,14 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
   if (!FusedInferAttentionOp().available()) {
     control_note = "not run: " + FusedInferAttentionOp().unavailable_reason();
   } else {
-    std::vector<float> fp16_key_cache(
-        static_cast<size_t>(kNumBlocks * kBlockSize * kNumKvHeads * kHeadSize), 0.0f);
+    std::vector<float> fp16_key_cache(static_cast<size_t>(kNumBlocks * kBlockSize * kNumKvHeads * kHeadSize), 0.0f);
     std::vector<float> fp16_value_cache(fp16_key_cache.size(), 0.0f);
     for (int64_t pos = 0; pos < kContextLen; ++pos) {
       const size_t slot = static_cast<size_t>(in.slots[static_cast<size_t>(pos)]);
       for (int64_t kv_head = 0; kv_head < kNumKvHeads; ++kv_head) {
         const size_t src = static_cast<size_t>((pos * kNumKvHeads + kv_head) * kHeadSize);
-        const size_t dst = (slot * static_cast<size_t>(kNumKvHeads) + static_cast<size_t>(kv_head)) *
-                           static_cast<size_t>(kHeadSize);
+        const size_t dst =
+            (slot * static_cast<size_t>(kNumKvHeads) + static_cast<size_t>(kv_head)) * static_cast<size_t>(kHeadSize);
         std::copy(in.key.begin() + static_cast<std::ptrdiff_t>(src),
                   in.key.begin() + static_cast<std::ptrdiff_t>(src + kHeadSize),
                   fp16_key_cache.begin() + static_cast<std::ptrdiff_t>(dst));
@@ -274,18 +268,12 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
     try {
       control_ms = TimeMs([&] {
         RunAclnn<ops950::FusedInferAttentionScoreV2WorkspaceFn>(
-            FusedInferAttentionOp(), stream, query_tnd.get(), key_list.get(), value_list.get(),
-            nullptr, nullptr, actual_seq_lengths.get(), actual_seq_lengths_kv.get(),
-            nullptr, nullptr, nullptr, nullptr,
-            nullptr, nullptr, nullptr,
-            block_table_tensor.get(), nullptr, nullptr,
-            nullptr, nullptr, nullptr,
-            nullptr, nullptr, nullptr,
-            nullptr, kNumHeads, static_cast<double>(kAttentionScale),
-            s::kFiaUnboundedTokens, s::kFiaUnboundedTokens, const_cast<char*>(ops950::kFiaLayoutTnd), kNumKvHeads,
-            s::kFiaSparseModeNone, s::kFiaInnerPreciseDefault, kBlockSize, 0,
-            false, 0, 0, context_tensor.get(),
-            lse_tensor.get());
+            FusedInferAttentionOp(), stream, query_tnd.get(), key_list.get(), value_list.get(), nullptr, nullptr,
+            actual_seq_lengths.get(), actual_seq_lengths_kv.get(), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+            nullptr, block_table_tensor.get(), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+            nullptr, kNumHeads, static_cast<double>(kAttentionScale), s::kFiaUnboundedTokens, s::kFiaUnboundedTokens,
+            const_cast<char*>(ops950::kFiaLayoutTnd), kNumKvHeads, s::kFiaSparseModeNone, s::kFiaInnerPreciseDefault,
+            kBlockSize, 0, false, 0, 0, context_tensor.get(), lse_tensor.get());
       });
       control = HalfToFloat(control_out.ToHost<Half>());
     } catch (const AclError& error) {
@@ -303,11 +291,10 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
   const std::vector<int8_t> signs = tq::cpu_pi_sign_vector(static_cast<int>(kHeadSize));
 
   std::vector<float> reference(static_cast<size_t>(kNumHeads * kHeadSize), 0.0f);
-  tq::cpu_paged_attention_turboquant(in.query.data(), device_key_cache.data(), device_value_cache.data(),
-                                     device_scale_plane.data(), in.block_table.data(),
-                                     static_cast<int>(kContextLen), static_cast<int>(kNumHeads),
-                                     static_cast<int>(kNumKvHeads), static_cast<int>(kHeadSize),
-                                     static_cast<int>(kBlockSize), kAttentionScale, signs.data(), reference.data());
+  tq::cpu_paged_attention_turboquant(
+      in.query.data(), device_key_cache.data(), device_value_cache.data(), device_scale_plane.data(),
+      in.block_table.data(), static_cast<int>(kContextLen), static_cast<int>(kNumHeads), static_cast<int>(kNumKvHeads),
+      static_cast<int>(kHeadSize), static_cast<int>(kBlockSize), kAttentionScale, signs.data(), reference.data());
 
   const tq::FidelityMetrics vs_exact = tq::cpu_fidelity(quantised, exact);
   const tq::FidelityMetrics vs_reference = tq::cpu_fidelity(quantised, reference);
@@ -329,8 +316,9 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
            "the unverified one from aclnn_ops_950pr.hpp and is the first thing to doubt";
   } else {
     std::printf("  unquantised fp16 control: %s\n", control_note.c_str());
-    std::printf("    the exact fp32 path below is the reference either way; the control only adds the device's\n"
-                "    own fp16 error floor to the report.\n");
+    std::printf(
+        "    the exact fp32 path below is the reference either way; the control only adds the device's\n"
+        "    own fp16 error floor to the report.\n");
   }
   std::fflush(stdout);
 
@@ -348,5 +336,5 @@ TEST_F(TurboQuantSimulatorFidelity, SingleDecodePassQuantisedVersusExact) {
   EXPECT_LT(vs_exact.relative_l2, kMaxRelativeL2) << "4-bit TurboQuant relative L2 error has grown past its floor";
 }
 
-}
-}
+}  // namespace test
+}  // namespace vllm_ascend

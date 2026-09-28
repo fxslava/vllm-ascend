@@ -87,47 +87,44 @@ void RegisterAscendTestEnvironment();
 bool IsRunningOnSimulator();
 const std::string& SimulatorEvidence();
 
-#define REQUIRE_ASCEND_DEVICE()                                                            \
-  do {                                                                                     \
-    if (!::vllm_ascend::test::AscendTestEnvironment::Instance().available()) {             \
-      GTEST_SKIP() << "No usable Ascend device: "                                          \
-                   << ::vllm_ascend::test::AscendTestEnvironment::Instance()               \
-                          .unavailable_reason();                                           \
-    }                                                                                      \
+#define REQUIRE_ASCEND_DEVICE()                                                                    \
+  do {                                                                                             \
+    if (!::vllm_ascend::test::AscendTestEnvironment::Instance().available()) {                     \
+      GTEST_SKIP() << "No usable Ascend device: "                                                  \
+                   << ::vllm_ascend::test::AscendTestEnvironment::Instance().unavailable_reason(); \
+    }                                                                                              \
   } while (false)
 
-#define REQUIRE_ASCEND_310P()                                                              \
-  do {                                                                                     \
-    REQUIRE_ASCEND_DEVICE();                                                               \
-    if (!::vllm_ascend::test::AscendTestEnvironment::Instance().is_310p()) {               \
-      GTEST_SKIP() << "Test targets Ascend 310P; attached device reports '"                \
-                   << ::vllm_ascend::test::AscendTestEnvironment::Instance().soc_name()    \
-                   << "'";                                                                 \
-    }                                                                                      \
+#define REQUIRE_ASCEND_310P()                                                                   \
+  do {                                                                                          \
+    REQUIRE_ASCEND_DEVICE();                                                                    \
+    if (!::vllm_ascend::test::AscendTestEnvironment::Instance().is_310p()) {                    \
+      GTEST_SKIP() << "Test targets Ascend 310P; attached device reports '"                     \
+                   << ::vllm_ascend::test::AscendTestEnvironment::Instance().soc_name() << "'"; \
+    }                                                                                           \
   } while (false)
 
-#define REQUIRE_ASCEND_950PR()                                                             \
-  do {                                                                                     \
-    REQUIRE_ASCEND_DEVICE();                                                               \
-    if (!::vllm_ascend::test::AscendTestEnvironment::Instance().is_950pr()) {              \
-      GTEST_SKIP() << "Test targets Ascend 950PR; attached device reports '"               \
-                   << ::vllm_ascend::test::AscendTestEnvironment::Instance().soc_name()    \
-                   << "'";                                                                 \
-    }                                                                                      \
+#define REQUIRE_ASCEND_950PR()                                                                  \
+  do {                                                                                          \
+    REQUIRE_ASCEND_DEVICE();                                                                    \
+    if (!::vllm_ascend::test::AscendTestEnvironment::Instance().is_950pr()) {                   \
+      GTEST_SKIP() << "Test targets Ascend 950PR; attached device reports '"                    \
+                   << ::vllm_ascend::test::AscendTestEnvironment::Instance().soc_name() << "'"; \
+    }                                                                                           \
   } while (false)
 
-#define REQUIRE_PHYSICAL_ASCEND_950PR()                                                    \
-  do {                                                                                     \
-    REQUIRE_ASCEND_950PR();                                                                \
+#define REQUIRE_PHYSICAL_ASCEND_950PR()                                                     \
+  do {                                                                                      \
+    REQUIRE_ASCEND_950PR();                                                                 \
     const char* allow_simulator = std::getenv("ASCEND_TEST_ALLOW_SIMULATOR");               \
     const bool simulator_allowed = allow_simulator != nullptr && allow_simulator[0] == '1'; \
-    if (::vllm_ascend::test::IsRunningOnSimulator() && !simulator_allowed) {               \
+    if (::vllm_ascend::test::IsRunningOnSimulator() && !simulator_allowed) {                \
       GTEST_SKIP() << "Test targets a physical Ascend 950PR and this process has the CANN " \
-                      "camodel loaded ("                                                   \
+                      "camodel loaded ("                                                    \
                    << ::vllm_ascend::test::SimulatorEvidence()                              \
                    << "). Rebuild with -DRUN_MODE=npu and run on the part, or set "         \
                       "ASCEND_TEST_ALLOW_SIMULATOR=1 to run it here anyway (hours).";       \
-    }                                                                                      \
+    }                                                                                       \
   } while (false)
 
 #if defined(VLLM_ASCEND_TQ_CUBE_WIP_DEFAULT_ON)
@@ -144,14 +141,14 @@ inline bool CubeWipOptedIn() {
   return wip[0] != '0';
 }
 
-#define REQUIRE_CUBE_WIP_OPT_IN(what, why)                                                 \
-  do {                                                                                     \
-    if (!::vllm_ascend::test::CubeWipOptedIn()) {                                          \
-      GTEST_SKIP() << (what) << " is work in progress and does not pass: " << (why)        \
-                   << " Set VLLM_ASCEND_TQ_CUBE_WIP=1 to run it anyway. See "              \
-                      "csrc/tests/TURBOQUANT_TESTS.md section 13.8.";                      \
-    }                                                                                      \
+#define REQUIRE_CUBE_WIP_OPT_IN(what, why)                                          \
+  do {                                                                              \
+    if (!::vllm_ascend::test::CubeWipOptedIn()) {                                   \
+      GTEST_SKIP() << (what) << " is work in progress and does not pass: " << (why) \
+                   << " Set VLLM_ASCEND_TQ_CUBE_WIP=1 to run it anyway. See "       \
+                      "csrc/tests/TURBOQUANT_TESTS.md section 13.8.";               \
+    }                                                                               \
   } while (false)
 
-}
-}
+}  // namespace test
+}  // namespace vllm_ascend

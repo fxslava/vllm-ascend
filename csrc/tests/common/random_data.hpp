@@ -86,5 +86,5 @@ class DeterministicRandom {
   bool has_spare_ = false;
 };
 
-}
-}
+}  // namespace test
+}  // namespace vllm_ascend

@@ -131,14 +131,13 @@ inline ComparisonReport CompareAllClose(const std::vector<float>& actual, const 
   return report;
 }
 
-#define EXPECT_TENSORS_ALLCLOSE(actual, expected, tolerance)                                    \
-  do {                                                                                          \
-    const ::vllm_ascend::test::ComparisonReport vllm_ascend_report =                            \
-        ::vllm_ascend::test::CompareAllClose((actual), (expected), (tolerance));                \
-    EXPECT_TRUE(vllm_ascend_report.passed)                                                      \
-        << "NPU result does not match the CPU reference:"                                       \
-        << vllm_ascend_report.Describe(tolerance);                                              \
+#define EXPECT_TENSORS_ALLCLOSE(actual, expected, tolerance)                                         \
+  do {                                                                                               \
+    const ::vllm_ascend::test::ComparisonReport vllm_ascend_report =                                 \
+        ::vllm_ascend::test::CompareAllClose((actual), (expected), (tolerance));                     \
+    EXPECT_TRUE(vllm_ascend_report.passed)                                                           \
+        << "NPU result does not match the CPU reference:" << vllm_ascend_report.Describe(tolerance); \
   } while (false)
 
-}
-}
+}  // namespace test
+}  // namespace vllm_ascend

@@ -61,10 +61,8 @@ struct HeadConfiguration {
 };
 
 const HeadConfiguration kHeadConfigurations[] = {
-    HeadConfiguration{128, 28, 4, RotaryMode::kHalf},
-    HeadConfiguration{128, 32, 8, RotaryMode::kHalf},
-    HeadConfiguration{128, 32, 8, RotaryMode::kInterleave},
-    HeadConfiguration{64, 16, 2, RotaryMode::kHalf},
+    HeadConfiguration{128, 28, 4, RotaryMode::kHalf},       HeadConfiguration{128, 32, 8, RotaryMode::kHalf},
+    HeadConfiguration{128, 32, 8, RotaryMode::kInterleave}, HeadConfiguration{64, 16, 2, RotaryMode::kHalf},
     HeadConfiguration{64, 16, 2, RotaryMode::kInterleave},
 };
 
@@ -75,7 +73,7 @@ std::string CaseName(int64_t num_tokens, const HeadConfiguration& configuration)
   return name.str();
 }
 
-}
+}  // namespace
 
 void BuildSuite(BenchmarkRunner& runner) {
   const AclnnOp& op = ApplyRotaryPosEmbOp();
@@ -91,29 +89,26 @@ void BuildSuite(BenchmarkRunner& runner) {
       const std::string name = CaseName(num_tokens, configuration);
       try {
         const int64_t head_dim = configuration.head_dim;
-        const std::vector<float> query = random.NormalHalfExact(
-            static_cast<size_t>(num_tokens * configuration.num_q_heads * head_dim), 0.0f, 1.0f);
-        const std::vector<float> key = random.NormalHalfExact(
-            static_cast<size_t>(num_tokens * configuration.num_kv_heads * head_dim), 0.0f, 1.0f);
+        const std::vector<float> query =
+            random.NormalHalfExact(static_cast<size_t>(num_tokens * configuration.num_q_heads * head_dim), 0.0f, 1.0f);
+        const std::vector<float> key =
+            random.NormalHalfExact(static_cast<size_t>(num_tokens * configuration.num_kv_heads * head_dim), 0.0f, 1.0f);
 
         std::vector<int32_t> positions(static_cast<size_t>(num_tokens));
         for (int64_t i = 0; i < num_tokens; ++i) {
-          positions[static_cast<size_t>(i)] =
-              static_cast<int32_t>((i * 37 + 11) % shapes::kMaxPositionEmbeddings);
+          positions[static_cast<size_t>(i)] = static_cast<int32_t>((i * 37 + 11) % shapes::kMaxPositionEmbeddings);
         }
 
-        const std::vector<float> cache = reference::BuildCosSinCache(shapes::kMaxPositionEmbeddings, head_dim,
-                                                                    shapes::kRopeThetaDefault);
+        const std::vector<float> cache =
+            reference::BuildCosSinCache(shapes::kMaxPositionEmbeddings, head_dim, shapes::kRopeThetaDefault);
         std::vector<float> cos_full;
         std::vector<float> sin_full;
         reference::GatherFullCosSin(cache, positions, head_dim, configuration.mode, &cos_full, &sin_full);
 
-        DeviceTensor query_device =
-            DeviceTensor::Half({1, num_tokens, configuration.num_q_heads, head_dim}, query, ACL_FORMAT_ND,
-                               kBenchmarkAlignBytes);
-        DeviceTensor key_device =
-            DeviceTensor::Half({1, num_tokens, configuration.num_kv_heads, head_dim}, key, ACL_FORMAT_ND,
-                               kBenchmarkAlignBytes);
+        DeviceTensor query_device = DeviceTensor::Half({1, num_tokens, configuration.num_q_heads, head_dim}, query,
+                                                       ACL_FORMAT_ND, kBenchmarkAlignBytes);
+        DeviceTensor key_device = DeviceTensor::Half({1, num_tokens, configuration.num_kv_heads, head_dim}, key,
+                                                     ACL_FORMAT_ND, kBenchmarkAlignBytes);
         DeviceTensor cos_device = DeviceTensor::Half({1, num_tokens, 1, head_dim}, QuantizeToHalf(cos_full),
                                                      ACL_FORMAT_ND, kBenchmarkAlignBytes);
         DeviceTensor sin_device = DeviceTensor::Half({1, num_tokens, 1, head_dim}, QuantizeToHalf(sin_full),
@@ -125,12 +120,10 @@ void BuildSuite(BenchmarkRunner& runner) {
 
         BenchmarkCase benchmark_case;
         benchmark_case.name = name;
-        const double q_elements =
-            static_cast<double>(num_tokens) * static_cast<double>(configuration.num_q_heads) *
-            static_cast<double>(head_dim);
-        const double k_elements =
-            static_cast<double>(num_tokens) * static_cast<double>(configuration.num_kv_heads) *
-            static_cast<double>(head_dim);
+        const double q_elements = static_cast<double>(num_tokens) * static_cast<double>(configuration.num_q_heads) *
+                                  static_cast<double>(head_dim);
+        const double k_elements = static_cast<double>(num_tokens) * static_cast<double>(configuration.num_kv_heads) *
+                                  static_cast<double>(head_dim);
         const double cos_sin_elements = 2.0 * static_cast<double>(num_tokens) * static_cast<double>(head_dim);
         benchmark_case.bytes_per_iteration = 2.0 * (2.0 * (q_elements + k_elements) + cos_sin_elements);
         benchmark_case.launch = [&planned](aclrtStream stream) { planned.Launch(stream); };
@@ -148,6 +141,6 @@ void BuildSuite(BenchmarkRunner& runner) {
   }
 }
 
-}
-}
-}
+}  // namespace bench
+}  // namespace test
+}  // namespace vllm_ascend

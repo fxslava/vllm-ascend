@@ -23,9 +23,9 @@ namespace bench {
 extern const char* kSuiteName;
 void BuildSuite(BenchmarkRunner& runner);
 
-}
-}
-}
+}  // namespace bench
+}  // namespace test
+}  // namespace vllm_ascend
 
 int main() {
   return ::vllm_ascend::test::bench::RunBenchmarkSuite(::vllm_ascend::test::bench::kSuiteName,
