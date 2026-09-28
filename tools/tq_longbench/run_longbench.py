@@ -634,32 +634,38 @@ def load_items(task: str, dataset_dir: Path, limit: int, offset: int = 0) -> tup
     return list(islice(synthetic_items(task, dataset_dir, STUB_ITEMS), offset, offset + limit)), "stub"
 
 
-def resume_offset(path: Path, tasks: Sequence[str]) -> tuple[int, list[str]]:
-    """``(offset, what was found)``: how far an interrupted run's ``--out-file`` got.
+def rung_key(backend: str, sinks: int, context: int, task: str) -> tuple:
+    """What makes one piece of work its own: a record's own ``backend``/``sink_tokens``/``context_requested``/``task``.
 
-    The offset is the **lowest** point any planned piece of work still has to
-    start from, not the highest index in the file, and the difference matters as
-    soon as a file holds more than one of anything. A sweep writes a record per
-    (backend, sinks, rung, task, item); taking the maximum index over all of them
-    would read one task's completed twenty as everybody's, and silently skip the
-    nineteen items the other three tasks never ran. So the highest index is taken
-    per group, and the offset is the smallest of those -- with a task that has no
-    record at all pinning it to zero, because nothing has been done for it.
+    The unit :func:`completed_indices` counts in, and the unit the item loop skips
+    against. It is not the task alone, because a sweep runs the same item once per
+    (backend, sinks, rung): a file where the 4096 rung finished and the 65536 rung
+    got two items in holds index 19 for the first and index 1 for the second, and
+    a set keyed by task alone would read the first rung's twenty as the second's
+    and skip eighteen items nobody ran.
+    """
+    return (backend, sinks, context, task)
 
-    The cost of that choice is duplicated work rather than missing work: a file
-    whose groups disagree re-runs the items between the smallest and the largest,
-    and those items then appear twice. It is said out loud in the returned lines,
-    because a duplicate is recoverable from the records and an omission is not.
 
-    A line that does not parse is counted and skipped: the usual reason a run has
-    an ``--out-file`` to resume from is that it was killed, and being killed
-    halfway through a ``write`` is how the last line ends up truncated.
+def completed_indices(path: Path, tasks: Sequence[str]) -> tuple[dict[tuple, set[int]], list[str]]:
+    """``(rung key -> the item indices already in the file, what was found)``.
+
+    Indices rather than a high-water mark, so a file with a hole in it is read as
+    a file with a hole in it. An interrupted sweep usually has none, but a
+    hand-merged one does, and ``max(index) + 1`` would skip every item in the gap
+    without saying so.
+
+    A line that does not parse is counted and skipped rather than raising. The
+    usual reason there is a file to resume from is that the run was killed, and
+    being killed halfway through a ``write`` is exactly how the last line ends up
+    truncated; a trailing newline, a blank line and a half-written one all mean
+    the same thing here, which is that there is nothing to read on that line.
     """
     if not path.is_file():
-        return 0, [f"--resume: {path} does not exist yet, so there is nothing to skip"]
+        return {}, [f"--resume: {path} does not exist yet, so nothing is skipped"]
 
-    highest: dict[tuple, int] = {}
-    read = malformed = 0
+    done: dict[tuple, set[int]] = {}
+    read = malformed = foreign = 0
     with path.open(encoding="utf-8") as handle:
         for line in handle:
             if not line.strip():
@@ -672,36 +678,22 @@ def resume_offset(path: Path, tasks: Sequence[str]) -> tuple[int, list[str]]:
                 continue
             index, task = record.get("index"), record.get("task")
             if task not in tasks or not isinstance(index, int) or isinstance(index, bool):
+                foreign += 1
                 continue
-            group = (record.get("backend"), record.get("sink_tokens"), record.get("context_requested"), task)
-            highest[group] = max(highest.get(group, -1), index)
+            key = rung_key(record.get("backend"), record.get("sink_tokens"), record.get("context_requested"), task)
+            done.setdefault(key, set()).add(index)
 
-    notes = [f"--resume: read {read} records from {path}"]
+    notes = [f"--resume: read {read} record(s) from {path}"]
     if malformed:
         notes.append(f"  {malformed} line(s) did not parse and were ignored (an interrupted write looks like this)")
-    if not highest:
-        notes.append("  none of them carry an index for a task in this run; starting from the first item")
-        return 0, notes
-
-    reached: dict[str, int] = {}
-    for (backend, sinks, context, task), index in sorted(highest.items(), key=lambda pair: str(pair[0])):
-        notes.append(f"  {task} on {backend} at {context} (sinks {sinks}): through index {index}")
-        reached[task] = min(reached.get(task, index + 1), index + 1)
-    missing = [task for task in tasks if task not in reached]
-    if missing:
-        notes.append(
-            f"  no records for {', '.join(sorted(missing))}, so nothing can be skipped for any task: this run "
-            "starts from index 0 and the records already in the file will have duplicates appended beside them"
-        )
-        return 0, notes
-
-    offset = min(reached.values())
-    if len(set(reached.values())) > 1:
-        notes.append(
-            f"  the tasks are not equally far along ({reached}); resuming at the earliest, {offset}, so no "
-            "item is skipped -- the ones already done past it will be run again and appear twice"
-        )
-    return offset, notes
+    if foreign:
+        notes.append(f"  {foreign} record(s) are for a task or without an index this run does not use")
+    for key in sorted(done, key=str):
+        backend, sinks, context, task = key
+        notes.append(f"  {task} on {backend} at {context} (sinks {sinks}): {len(done[key])} done")
+    if not done:
+        notes.append("  nothing in it belongs to this run, so every item will be evaluated")
+    return done, notes
 
 
 def synthetic_items(task: str, dataset_dir: Path, limit: int) -> Iterator[EvalItem]:
@@ -737,6 +729,10 @@ class TaskRung:
     #: backend, because a score measured with sinks and one measured without are
     #: answers to different questions and must not share a block.
     sink_tokens: int = 0
+    #: Items ``--resume`` found already in the ``--out-file`` and did not re-run.
+    #: They are not in :attr:`records`, so this rung's score is over the items this
+    #: process evaluated and the table has to say so.
+    skipped: int = 0
     records: list[dict] = field(default_factory=list)
 
     @property
@@ -959,6 +955,13 @@ def summarise(rungs: list[TaskRung]) -> str:
             f"{FIDELITY_REFERENCE_BACKEND} prefill of the same prompt -- the drift at the vector the first "
             "generated token is chosen from, not whether the answer was right."
         )
+    if any(rung.skipped for rung in rungs):
+        skipped = sum(rung.skipped for rung in rungs)
+        notes.append(
+            f"--resume skipped {skipped} item(s) that were already in the --out-file, so every number above is "
+            "over the items *this* process evaluated and not over the whole rung. The file holds both halves: "
+            "score the run from it rather than from this table."
+        )
     if any(rung.source == "stub" for rung in rungs):
         notes.append("* no JSONL on disk for this task: it ran on synthetic stubs and measures the harness only.")
     if any(record.get("truncated") for rung in rungs for record in rung.records):
@@ -989,11 +992,6 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"--offset cannot be negative, got {args.offset}")
     if args.resume and args.out_file is None:
         raise SystemExit("--resume reads the results of the interrupted run, so it needs --out-file")
-    if args.resume and args.offset:
-        raise SystemExit(
-            f"--resume works out the offset for itself and --offset {args.offset} states one; pass whichever "
-            "of the two you meant, not both"
-        )
     args.device = resolve_device(args.device)
     args.budget_overrides = parse_budget_overrides(args.max_tokens_override)
     backends = parse_backends(args.backends)
@@ -1029,8 +1027,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"prompts: {config_source(args.dataset_dir)}", file=sys.stderr)
     print(f"chinese segmentation: {segmentation_backend()}", file=sys.stderr)
 
+    done: dict[tuple, set[int]] = {}
     if args.resume:
-        args.offset, found = resume_offset(args.out_file, tasks)
+        done, found = completed_indices(args.out_file, tasks)
         for line in found:
             print(line, file=sys.stderr)
 
@@ -1046,23 +1045,36 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
     if args.offset:
-        remaining = sum(len(task_items) for task_items in items.values())
+        print(f"--offset {args.offset}: each task starts at its item {args.offset}", file=sys.stderr)
+    if done:
+        # Counted over every piece of work the sweep plans, because that is what
+        # is left to pay for: the same item at two rungs is two prefills.
+        finished = sum(len(indices) for indices in done.values())
+        remaining = sum(
+            1
+            for backend in backends
+            for sinks in sink_counts
+            for context in contexts
+            for task in tasks
+            for item in items[task]
+            if item.extra.get("index") not in done.get(rung_key(backend, sinks, context, task), ())
+        )
         print(
-            f"Resuming benchmark: skipping first {args.offset} items, starting from item {args.offset} "
-            f"({remaining} remaining).",
+            f"Resuming from {args.out_file}: found {finished} completed samples. Skipping to next unprocessed "
+            f"item ({remaining} remaining).",
             file=sys.stderr,
         )
         if not remaining:
             print(
-                f"nothing left to run: every task is exhausted at or before index {args.offset}. The offset is "
-                "past the end of the corpus, or the interrupted run had already finished.",
+                "nothing left to run: every planned item is already in the file. The run had finished, or "
+                "--limit and --offset describe a window it already covered.",
                 file=sys.stderr,
             )
 
-    # Appended wherever an offset is in play, and truncating otherwise: the whole
-    # point of resuming is that the records already in the file are the run's.
+    # Appended whenever some of the file's records are this run's, and truncating
+    # otherwise: the whole point of resuming is that they are not to be lost.
     sink = (
-        args.out_file.open("a" if args.offset or args.resume else "w", encoding="utf-8")
+        args.out_file.open("a" if args.resume or args.offset else "w", encoding="utf-8")
         if args.out_file
         else sys.stdout
     )
@@ -1089,7 +1101,14 @@ def main(argv: list[str] | None = None) -> int:
                     keep = max_seq_len - CONTEXT_HEADROOM_TOKENS - _largest_budget(args, tasks)
                     for task in tasks:
                         rung = TaskRung(backend, context, task, metric_label(task), sources[task], sinks)
-                        for position, item in enumerate(items[task]):
+                        already = done.get(rung_key(backend, sinks, context, task), frozenset())
+                        rung.skipped = sum(1 for item in items[task] if item.extra.get("index") in already)
+                        # The first item *run*, not items[task][0]: a resumed rung
+                        # whose first item is already done still deserves a probe.
+                        probed = False
+                        for item in items[task]:
+                            if item.extra.get("index") in already:
+                                continue
                             record, prompt_ids = run_item(args, runner, tokenizer, eos_ids, item, keep, family)
                             record.update(context_requested=context, prefill_mode=mode)
                             if args.eval_fidelity:
@@ -1105,13 +1124,16 @@ def main(argv: list[str] | None = None) -> int:
                             rung.records.append(record)
                             sink.write(json.dumps(record, ensure_ascii=False) + "\n")
                             sink.flush()
-                            if args.profile_layers and position == 0:
-                                print(f"    layer probe, {task} item 0 at {context}:", file=sys.stderr)
+                            if args.profile_layers and not probed:
+                                probed = True
+                                index = item.extra.get("index")
+                                print(f"    layer probe, {task} item {index} at {context}:", file=sys.stderr)
                                 print(profile_item(args, runner, tokenizer, prompt_ids, item, plan), file=sys.stderr)
                         rungs.append(rung)
+                        resumed = f", {rung.skipped} already done" if rung.skipped else ""
                         print(
                             f"    {task:17s} {rung.mean_score:.4f} over {len(rung.records)} items "
-                            f"({rung.truncated} cut), ttft {rung.median('ttft_ms'):.0f} ms",
+                            f"({rung.truncated} cut{resumed}), ttft {rung.median('ttft_ms'):.0f} ms",
                             file=sys.stderr,
                         )
                 runner = None

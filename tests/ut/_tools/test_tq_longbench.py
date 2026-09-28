@@ -4056,9 +4056,13 @@ class TestResume(_LongBenchCorpus):
     """Picking a 15-hour sweep back up where it stopped, without re-running or losing an item.
 
     The corpus is three items per task, so ``--limit 2`` then ``--resume`` is the
-    whole question in miniature: does the second run start at index 2, does it
+    whole question in miniature: does the second run evaluate only index 2, does it
     leave the first two lines alone, and do the three records that end up in the
     file carry 0, 1, 2 exactly once each.
+
+    The skipping is per index and not per offset, which is what the gapped-file
+    tests below are for: a file missing index 1 has to come back with index 1 run
+    and nothing else re-run.
     """
 
     def test_offset_skips_items_and_keeps_their_dataset_index(self):
@@ -4070,10 +4074,9 @@ class TestResume(_LongBenchCorpus):
         records, _, _ = self._run("--limit", "2", "--offset", "1", tasks=("trec",))
         self.assertEqual([record["index"] for record in records], [1, 2])
 
-    def test_an_offset_past_the_corpus_runs_nothing_and_says_so(self):
-        records, _, logged = self._run("--offset", "99", tasks=("trec",))
+    def test_an_offset_past_the_corpus_runs_nothing(self):
+        records, _, _ = self._run("--offset", "99", tasks=("trec",))
         self.assertEqual(records, [])
-        self.assertIn("nothing left to run", logged)
 
     def test_a_negative_offset_is_refused(self):
         with self.assertRaisesRegex(SystemExit, "--offset cannot be negative"):
@@ -4085,11 +4088,35 @@ class TestResume(_LongBenchCorpus):
         self.assertEqual([record["index"] for record in first], [0, 1])
 
         every, _, logged = self._run("--resume", tasks=("trec",))
-        self.assertIn("through index 1", logged)
-        self.assertIn("skipping first 2 items, starting from item 2", logged)
+        self.assertIn("found 2 completed samples", logged)
+        self.assertIn("(1 remaining)", logged)
         # The file holds both runs: the first two lines were not rewritten.
         self.assertEqual([record["index"] for record in every], [0, 1, 2])
         self.assertEqual(len({record["index"] for record in every}), 3)
+
+    def test_the_five_item_sequence_the_objective_describes(self):
+        """``--limit 5``, stopped after 2, resumed: five unique records, 0 to 4, no duplicates."""
+        corpus = self.dataset_dir / "trec.jsonl"
+        rows = [json.loads(line) for line in corpus.read_text(encoding="utf-8").splitlines()]
+        corpus.write_text("\n".join(json.dumps(rows[0]) for _ in range(5)) + "\n", encoding="utf-8")
+
+        stopped, _, _ = self._run("--limit", "2", tasks=("trec",))
+        self.assertEqual([record["index"] for record in stopped], [0, 1])
+        every, _, _ = self._run("--limit", "5", "--resume", tasks=("trec",))
+        self.assertEqual([record["index"] for record in every], [0, 1, 2, 3, 4])
+        self.assertEqual(len(every), len({record["index"] for record in every}))
+
+    def test_a_hole_in_the_file_is_filled_rather_than_skipped_past(self):
+        """The reason this skips indices and not a prefix: index 1 is missing, so index 1 runs."""
+        every, _, _ = self._run(tasks=("trec",))
+        out_file = self.root / "longbench.jsonl"
+        kept = [line for line in out_file.read_text(encoding="utf-8").splitlines() if '"index": 1' not in line]
+        out_file.write_text("\n".join(kept) + "\n", encoding="utf-8")
+
+        after, _, logged = self._run("--resume", tasks=("trec",))
+        self.assertIn("found 2 completed samples", logged)
+        self.assertEqual(sorted(record["index"] for record in after), [0, 1, 2])
+        self.assertEqual(len(after), 3)
 
     def test_resume_on_a_finished_run_adds_nothing(self):
         done, _, _ = self._run(tasks=("trec",))
@@ -4098,16 +4125,17 @@ class TestResume(_LongBenchCorpus):
         self.assertEqual([record["index"] for record in again], [0, 1, 2])
         self.assertIn("nothing left to run", logged)
 
-    def test_resume_survives_the_truncated_line_a_kill_leaves_behind(self):
-        """Being killed halfway through a write is how an interrupted run ends."""
-        from tq_longbench.run_longbench import resume_offset
+    def test_resume_composes_with_an_offset(self):
+        """They answer different questions: the offset picks the window, resume skips what is done."""
+        first, _, _ = self._run("--limit", "1", "--offset", "1", tasks=("trec",))
+        self.assertEqual([record["index"] for record in first], [1])
+        every, _, _ = self._run("--limit", "2", "--offset", "1", "--resume", tasks=("trec",))
+        self.assertEqual([record["index"] for record in every], [1, 2])
 
-        out_file = self.root / "killed.jsonl"
-        good = "\n".join(json.dumps({"task": "trec", "index": index}) for index in range(2))
-        out_file.write_text(good + '\n{"task": "trec", "index": 2, "score"', encoding="utf-8")
-        offset, notes = resume_offset(out_file, ("trec",))
-        self.assertEqual(offset, 2)
-        self.assertTrue(any("did not parse" in note for note in notes))
+    def test_a_missing_out_file_resumes_from_the_start(self):
+        records, _, logged = self._run("--resume", tasks=("trec",))
+        self.assertIn("does not exist yet", logged)
+        self.assertEqual([record["index"] for record in records], [0, 1, 2])
 
     def test_resume_without_an_out_file_is_refused(self):
         from tq_longbench import run_longbench
@@ -4115,51 +4143,81 @@ class TestResume(_LongBenchCorpus):
         with self.assertRaisesRegex(SystemExit, "needs --out-file"):
             run_longbench.main(["--model-path", str(self.model_path), "--device", "cpu", "--resume"])
 
-    def test_resume_and_an_explicit_offset_are_not_both_answers(self):
-        with self.assertRaisesRegex(SystemExit, "pass whichever of the two you meant"):
-            self._run("--resume", "--offset", "1", tasks=("trec",))
+    def test_the_table_says_the_score_is_only_over_what_this_process_ran(self):
+        self._run("--limit", "2", tasks=("trec",))
+        _, table, _ = self._run("--resume", tasks=("trec",))
+        self.assertIn("--resume skipped 2 item(s)", table)
 
-    def test_a_missing_out_file_resumes_from_the_start(self):
-        records, _, logged = self._run("--resume", tasks=("trec",))
-        self.assertIn("does not exist yet", logged)
-        self.assertEqual([record["index"] for record in records], [0, 1, 2])
 
-    def test_a_task_with_no_records_pins_the_offset_to_zero(self):
-        """One task finished and another never started is not 'both are done'."""
-        from tq_longbench.run_longbench import resume_offset
+class TestCompletedIndices(unittest.TestCase):
+    """Reading an interrupted run's ``--out-file``, which is the only input resuming has."""
 
-        out_file = self.root / "partial.jsonl"
-        out_file.write_text(
-            "\n".join(json.dumps({"task": "trec", "index": index, "backend": "dense_reference"}) for index in range(3))
-            + "\n",
-            encoding="utf-8",
-        )
-        self.assertEqual(resume_offset(out_file, ("trec",))[0], 3)
-        offset, notes = resume_offset(out_file, ("trec", "lcc"))
-        self.assertEqual(offset, 0)
-        self.assertTrue(any("no records for lcc" in note for note in notes))
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
 
-    def test_the_offset_is_the_earliest_group_not_the_highest_index(self):
-        """A file whose groups disagree must not read one task's progress as everyone's."""
-        from tq_longbench.run_longbench import resume_offset
+    def _write(self, name: str, rows: list, tail: str = "") -> Path:
+        path = self.root / name
+        path.write_text("\n".join(json.dumps(row) for row in rows) + "\n" + tail, encoding="utf-8")
+        return path
 
-        out_file = self.root / "uneven.jsonl"
-        rows = [{"task": "trec", "index": index, "backend": "a"} for index in range(5)]
-        rows += [{"task": "lcc", "index": index, "backend": "a"} for index in range(2)]
-        out_file.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
-        offset, notes = resume_offset(out_file, ("trec", "lcc"))
-        self.assertEqual(offset, 2)
-        self.assertTrue(any("not equally far along" in note for note in notes))
+    def test_the_indices_come_back_keyed_by_rung(self):
+        from tq_longbench.run_longbench import completed_indices, rung_key
 
-    def test_a_rung_that_only_half_ran_pins_the_offset_to_its_own_progress(self):
-        """Two rungs of the same task: the offset is the one that got less far."""
-        from tq_longbench.run_longbench import resume_offset
+        rows = [
+            {"task": "trec", "index": i, "backend": "a", "sink_tokens": 0, "context_requested": 4096} for i in (0, 1, 2)
+        ]
+        done, _ = completed_indices(self._write("one.jsonl", rows), ("trec",))
+        self.assertEqual(done, {rung_key("a", 0, 4096, "trec"): {0, 1, 2}})
 
-        out_file = self.root / "rungs.jsonl"
-        rows = [{"task": "trec", "index": i, "backend": "a", "context_requested": 4096} for i in range(5)]
-        rows += [{"task": "trec", "index": i, "backend": "a", "context_requested": 8192} for i in range(2)]
-        out_file.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
-        self.assertEqual(resume_offset(out_file, ("trec",))[0], 2)
+    def test_a_second_rung_of_the_same_task_is_its_own_progress(self):
+        """A set keyed by task alone would read the finished rung's twenty as the other's."""
+        from tq_longbench.run_longbench import completed_indices, rung_key
+
+        rows = [
+            {"task": "trec", "index": i, "backend": "a", "sink_tokens": 0, "context_requested": 4096} for i in range(5)
+        ]
+        rows += [
+            {"task": "trec", "index": i, "backend": "a", "sink_tokens": 0, "context_requested": 8192} for i in range(2)
+        ]
+        done, _ = completed_indices(self._write("rungs.jsonl", rows), ("trec",))
+        self.assertEqual(done[rung_key("a", 0, 4096, "trec")], {0, 1, 2, 3, 4})
+        self.assertEqual(done[rung_key("a", 0, 8192, "trec")], {0, 1})
+
+    def test_a_truncated_last_line_is_counted_and_skipped(self):
+        """Being killed halfway through a write is how an interrupted run ends."""
+        from tq_longbench.run_longbench import completed_indices
+
+        rows = [{"task": "trec", "index": index} for index in range(2)]
+        path = self._write("killed.jsonl", rows, tail='{"task": "trec", "index": 2, "score"')
+        done, notes = completed_indices(path, ("trec",))
+        self.assertEqual(set().union(*done.values()), {0, 1})
+        self.assertTrue(any("did not parse" in note for note in notes))
+
+    def test_blank_and_trailing_lines_are_not_records(self):
+        from tq_longbench.run_longbench import completed_indices
+
+        path = self.root / "gappy.jsonl"
+        path.write_text('\n{"task": "trec", "index": 0}\n\n\n', encoding="utf-8")
+        done, notes = completed_indices(path, ("trec",))
+        self.assertEqual(set().union(*done.values()), {0})
+        self.assertIn("read 1 record(s)", notes[0])
+
+    def test_another_tasks_records_are_left_alone(self):
+        from tq_longbench.run_longbench import completed_indices
+
+        rows = [{"task": "lcc", "index": 0}, {"task": "trec", "index": 0}, {"task": "trec"}]
+        done, notes = completed_indices(self._write("mixed.jsonl", rows), ("trec",))
+        self.assertEqual(set().union(*done.values()), {0})
+        self.assertTrue(any("2 record(s) are for a task or without an index" in note for note in notes))
+
+    def test_a_file_that_is_not_there_yet(self):
+        from tq_longbench.run_longbench import completed_indices
+
+        done, notes = completed_indices(self.root / "absent.jsonl", ("trec",))
+        self.assertEqual(done, {})
+        self.assertTrue(any("does not exist yet" in note for note in notes))
 
 
 class TestContextTiers(unittest.TestCase):
