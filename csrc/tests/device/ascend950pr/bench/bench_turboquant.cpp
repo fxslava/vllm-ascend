@@ -45,10 +45,10 @@
 #include "fp16.hpp"
 #include "random_data.hpp"
 #include "turbo_quant_cpu.h"
-#include "turboquant_launch.hpp"
-#include "turboquant_audit_models.hpp"
-#include "turboquant_audit_scenario.hpp"
-#include "turboquant_audit_report.hpp"
+#include "turboquant/turboquant_launch.hpp"
+#include "turboquant/turboquant_audit_models.hpp"
+#include "turboquant/turboquant_audit_scenario.hpp"
+#include "turboquant/turboquant_audit_report.hpp"
 
 namespace vllm_ascend {
 namespace test {

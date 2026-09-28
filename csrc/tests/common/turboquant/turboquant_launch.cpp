@@ -22,7 +22,7 @@
 #include <cmath>
 #include <cstring>
 
-#include "../reference/turbo_quant_cpu.h"
+#include "../../reference/turbo_quant_cpu.h"
 
 namespace vllm_ascend {
 namespace test {

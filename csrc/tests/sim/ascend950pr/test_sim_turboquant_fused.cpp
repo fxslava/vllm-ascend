@@ -49,8 +49,8 @@
 
 #include "camodel_guard.hpp"
 #include "test_harness.hpp"
-#include "turboquant_fused_harness.hpp"
-#include "turboquant_launch.hpp"
+#include "turboquant/turboquant_fused_harness.hpp"
+#include "turboquant/turboquant_launch.hpp"
 
 namespace vllm_ascend {
 namespace test {

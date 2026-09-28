@@ -41,7 +41,7 @@
 #                                          including -DVLLM_ASCEND_TESTS_HOST_ONLY=ON
 #                                          on a machine with no toolkit at all.
 #
-#   sim/           test_sim_950pr_*        CAModel only. Functional validation of
+#   sim/ascend950pr/   test_sim_950pr_*    CAModel only. Functional validation of
 #                                          the Ascend C kernels against the CPU
 #                                          reference, at shapes small enough for
 #                                          a cycle-level simulator to finish.
@@ -49,13 +49,20 @@
 #                                          $ASCEND_HOME_PATH/tools/simulator, and
 #                                          therefore CANNOT run on silicon.
 #
-#   device/        test_device_950pr_*     Physical 950PR silicon. Production
-#                  bench_device_950pr_*    shapes and every timing measurement.
+#   device/ascend950pr/  test_device_950pr_*  Physical 950PR silicon. Production
+#                        bench_device_950pr_* shapes and every timing measurement.
 #                                          Links the real libruntime.so and
 #                                          libascendcl.so, with no simulator on
 #                                          the link line and none on the RUNPATH,
 #                                          so there is no CAModel fallback to
 #                                          accidentally take.
+#                        prof_device_950pr_*  msprof trace harness, not a ctest
+#                                          entry.
+#
+# Source FILES carry no part or tier in their name inside a leg directory
+# (device/ascend950pr/correctness/test_matmul.cpp); the binaries and ctest
+# entries keep their historical names, which the documentation and external
+# drivers reference.
 #
 # sim/ and device/ are selected by RUN_MODE and are never configured together:
 # ascendc_library() builds one kernel library per RUN_MODE, so a tree cannot hold
@@ -72,14 +79,14 @@
 #
 # SOC_VERSION selects the part, and the two legs are exclusive:
 #
-#   SOC_VERSION=Ascend950PR_*   the three tiers above. device_310p/ is not
+#   SOC_VERSION=Ascend950PR_*   the three tiers above. device/ascend310p/ is not
 #                               configured, not compiled, and contributes no
 #                               target - a `*310*` binary cannot exist in a
 #                               950PR build tree.
-#   anything else               device_310p/ alone, plus host/. The 950PR tiers
-#                               are not configured.
+#   anything else               device/ascend310p/ alone, plus host/. The 950PR
+#                               tiers are not configured.
 #
-# device_310p/ keeps its historical binary names (test_matmul_310p and friends)
+# device/ascend310p/ keeps its historical binary names (test_matmul_310p and friends)
 # on purpose: .agents/skills/ascend-310p-csrc-tests/SKILL.md and the shipped
 # dist/ascend310p3-aarch64-tests/run_tests.sh both drive them by name, they
 # already carry their part in the name, and they are unreachable from a 950PR
@@ -594,7 +601,7 @@ if(NOT VLLM_ASCEND_TESTS_HOST_ONLY)
 # suite's whole operator prototype table, and the 950PR tests read it too -
 # ops::kMatmul, ops::kRmsNorm, ops::kSwiGlu, ops::kScatterPaKvCache and
 # ops::kApplyRotaryPosEmbV2 are all resolved through it. It stays shared; what
-# the architecture isolation excludes is the 310P *targets*, in device_310p/.
+# the architecture isolation excludes is the 310P *targets*, in device/ascend310p/.
 
 add_library(vllm_ascend_test_common STATIC
   common/test_harness.cpp
@@ -733,9 +740,9 @@ if(VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE)
     # are host-side code, but only the binaries that link this library - the
     # TurboQuant bench, the msprof trace and the kernel tests - consume them.
     add_library(vllm_ascend_test_turboquant STATIC
-      common/turboquant_launch.cpp
-      common/turboquant_audit_scenario.cpp
-      common/turboquant_audit_report.cpp)
+      common/turboquant/turboquant_launch.cpp
+      common/turboquant/turboquant_audit_scenario.cpp
+      common/turboquant/turboquant_audit_report.cpp)
     target_link_libraries(vllm_ascend_test_turboquant PUBLIC vllm_ascend_turboquant_tiling)
 
     target_include_directories(vllm_ascend_test_turboquant
@@ -765,12 +772,10 @@ if(VLLM_ASCEND_TESTS_TIER_SIM)
   add_subdirectory(sim)
 endif()
 
-if(VLLM_ASCEND_TESTS_TIER_DEVICE)
+# The device/ directory holds both silicon legs, dispatched by SoC family:
+# ascend950pr/ is configured for a 950PR SoC, ascend310p/ for anything else.
+if(VLLM_ASCEND_TESTS_TIER_DEVICE OR VLLM_ASCEND_TESTS_TIER_DEVICE310)
   add_subdirectory(device)
-endif()
-
-if(VLLM_ASCEND_TESTS_TIER_DEVICE310)
-  add_subdirectory(device_310p)
 endif()
 
 endif()  # NOT VLLM_ASCEND_TESTS_HOST_ONLY

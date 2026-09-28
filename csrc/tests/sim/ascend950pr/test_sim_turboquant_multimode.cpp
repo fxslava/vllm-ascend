@@ -30,7 +30,7 @@
 #include "random_data.hpp"
 #include "test_harness.hpp"
 #include "turbo_quant_cpu.h"
-#include "turboquant_launch.hpp"
+#include "turboquant/turboquant_launch.hpp"
 
 namespace vllm_ascend {
 namespace test {

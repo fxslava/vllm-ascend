@@ -55,31 +55,35 @@ csrc/tests/
 |   |-- test_host_turboquant_fidelity.cpp
 |   `-- test_host_turboquant_tiling.cpp           the adapter's block and buffer plans
 |
-|-- sim/                    TIER 2 -- CAModel only; links libruntime_camodel.so
-|   |-- test_sim_950pr_turboquant_rotate_q.cpp    the standalone query rotation, both paths
-|   |-- test_sim_950pr_turboquant_kernels.cpp
-|   |-- test_sim_950pr_turboquant_decode.cpp
-|   |-- test_sim_950pr_turboquant_fused.cpp       the fused Cube decode, seven cases (D 256 and 128, raw query), vs goldens and the kernel writer
-|   |-- test_sim_950pr_turboquant_multimode.cpp   the fused Cube decode, all three modes
-|   `-- test_sim_950pr_cube_hadamard.cpp          spike: one shape of the sweep below
+|-- sim/ascend950pr/        TIER 2 -- CAModel only; links libruntime_camodel.so
+|   |-- test_sim_turboquant_rotate_q.cpp          the standalone query rotation, both paths
+|   |-- test_sim_turboquant_kernels.cpp
+|   |-- test_sim_turboquant_decode.cpp
+|   |-- test_sim_turboquant_fused.cpp             the fused Cube decode, seven cases (D 256 and 128, raw query), vs goldens and the kernel writer
+|   |-- test_sim_turboquant_multimode.cpp         the fused Cube decode, all three modes
+|   |-- test_sim_cube_hadamard.cpp                spike: one shape of the sweep below
+|   `-- test_sim_cube_gemm.cpp                    spike: the fp8 Cube fractal contract
 |
-|-- device/                 TIER 3 -- physical 950PR silicon; every timing
-|   |-- test_device_950pr_turboquant.cpp          production shapes, camodel refused
-|   |-- test_device_950pr_matmul.cpp
-|   |-- test_device_950pr_rmsnorm.cpp
-|   |-- test_device_950pr_rotary_embedding.cpp
-|   |-- test_device_950pr_activation_swiglu.cpp
-|   |-- test_device_950pr_qwen_layer_golden.cpp
-|   |-- test_device_950pr_benchmark_harness.cpp   needs no device; links acl.h
-|   |-- test_device_950pr_cube_hadamard.cpp       spike: D x V sweep against the CPU golden
-|   |-- bench_950pr_cube_hadamard.cpp             spike: the same sweep, timed, --csv=
-|   |-- bench_main_950pr_hadamard.cpp             its entry point; only it takes argv
-|   |-- bench_device_950pr_turboquant.cpp         decode legs, then the prefill sweep against FIA V5
-|   `-- prof_device_950pr_msprof_trace.cpp        one launch per leg under mstx ranges, for msprof; own main()
+|-- device/ascend950pr/     TIER 3 -- physical 950PR silicon; every timing
+|   |-- correctness/                              the binary keeps its historical name
+|   |   |-- test_turboquant.cpp                   production shapes, camodel refused
+|   |   |-- test_matmul.cpp                       (test_device_950pr_matmul), so do all
+|   |   |-- test_rmsnorm.cpp                      its siblings: test_device_950pr_rmsnorm,
+|   |   |-- test_rotary_embedding.cpp             test_device_950pr_rotary_embedding,
+|   |   |-- test_activation_swiglu.cpp            test_device_950pr_activation_swiglu,
+|   |   |-- test_qwen_layer_golden.cpp            test_device_950pr_qwen_layer_golden,
+|   |   |-- test_benchmark_harness.cpp            needs no device; links acl.h
+|   |   `-- test_cube_hadamard.cpp                spike: D x V sweep against the CPU golden
+|   |-- bench/
+|   |   |-- bench_main_hadamard.cpp               the hadamard sweep's entry point; only it takes argv
+|   |   |-- bench_cube_hadamard.cpp               spike: the same sweep, timed, --csv=
+|   |   `-- bench_turboquant.cpp                  decode legs, then the prefill sweep against FIA V5
+|   `-- profile/
+|       `-- prof_msprof_trace.cpp                 one launch per leg under mstx ranges, for msprof; own main()
 |
-`-- device_310p/            the 310P leg -- NOT configured under a 950PR SoC
-    |-- test_*_310p.cpp
-    `-- bench_*_310p.cpp
+`-- device/ascend310p/      the 310P leg -- NOT configured under a 950PR SoC
+    |-- correctness/        test_*.cpp   (binaries keep their *_310p names)
+    `-- bench/              bench_*.cpp
 ```
 
 | `common/` | |
@@ -122,9 +126,9 @@ tier's "no CAModel fallback" structural rather than aspirational.
 | `-DVLLM_ASCEND_TESTS_HOST_ONLY=ON` | `host/` |
 | `-DSOC_VERSION=Ascend950PR_9599` (RUN_MODE defaults to `npu`) | `host/` + `device/` |
 | `-DSOC_VERSION=Ascend950PR_9599 -DRUN_MODE=sim` | `host/` + `sim/` |
-| `-DSOC_VERSION=Ascend310P3` | `host/` + `device_310p/` |
+| `-DSOC_VERSION=Ascend310P3` | `host/` + `device/ascend310p/` |
 
-**A 950PR build excludes the 310P targets entirely** -- `device_310p/` is never
+**A 950PR build excludes the 310P targets entirely** -- `device/ascend310p/` is never
 configured, so no `*310*` binary exists in the tree and `ctest -N` has none to
 list. Configure output says so:
 

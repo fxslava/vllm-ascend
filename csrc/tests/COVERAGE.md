@@ -17,7 +17,7 @@ handling in the slot mapping.
 
 ## 1. What each suite actually runs
 
-### C++ (`csrc/tests/device_310p/`)
+### C++ (`csrc/tests/device/ascend310p/`)
 
 | Operator | Binary | Device parity cases | Host-only cases | Shape matrix |
 | --- | --- | ---: | ---: | --- |

@@ -22,8 +22,8 @@
 #include <cstdint>
 #include <vector>
 
-#include "../../attention/turboquant/op_kernel/common/turboquant_layout.h"
-#include "../../attention/turboquant/op_kernel/common/turboquant_mode.h"
+#include "../../../attention/turboquant/op_kernel/common/turboquant_layout.h"
+#include "../../../attention/turboquant/op_kernel/common/turboquant_mode.h"
 #include "fp8_e4m3.hpp"
 #include "random_data.hpp"
 

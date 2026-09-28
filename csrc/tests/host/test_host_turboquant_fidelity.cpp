@@ -32,7 +32,7 @@
 #include "golden_layer3.hpp"
 #include "random_data.hpp"
 #include "turbo_quant_cpu.h"
-#include "turboquant_mirrored_cache.hpp"
+#include "turboquant/turboquant_mirrored_cache.hpp"
 
 namespace vllm_ascend {
 namespace test {

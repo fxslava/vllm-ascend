@@ -42,13 +42,16 @@ lines — not just different runtime gates. Each is a subdirectory with its own
 | Tier | Directory | Binaries | Target hardware | Links |
 | --- | --- | --- | --- | --- |
 | **1. host** | `host/` | `test_host_*` | none — any CPU | no CANN, no NPU runtime |
-| **2. sim** | `sim/` | `test_sim_950pr_*` | CAModel emulator | `libruntime_camodel.so` |
-| **3. device** | `device/` | `test_device_950pr_*`, `bench_device_950pr_*` | physical Ascend 950PR | real `libruntime.so` + `libascendcl.so` |
+| **2. sim** | `sim/ascend950pr/` | `test_sim_950pr_*` | CAModel emulator | `libruntime_camodel.so` |
+| **3. device** | `device/ascend950pr/` | `test_device_950pr_*`, `bench_device_950pr_*` | physical Ascend 950PR | real `libruntime.so` + `libascendcl.so` |
 
 ```
 csrc/tests/
 ├── CMakeLists.txt          tier dispatch, SoC gating, shared helpers
 ├── common/                 shared infrastructure (runtime, operators, harness)
+│   └── turboquant/         the TurboQuant host side: launch + tiling glue,
+│                           the mirrored-cache model, the audit's sweep,
+│                           traffic and reporting modules
 ├── reference/              the CPU oracle
 ├── data/golden_layer3/     the Qwen3.5 layer-3 dump (Git LFS)
 ├── turboquant/             ascendc_library() for the Ascend C kernels
@@ -56,25 +59,25 @@ csrc/tests/
 ├── host/                   TIER 1  ── no CANN at all
 │   └── test_host_turboquant_fidelity.cpp
 │
-├── sim/                    TIER 2  ── CAModel only
-│   ├── test_sim_950pr_turboquant_kernels.cpp
-│   └── test_sim_950pr_turboquant_decode.cpp
+├── sim/ascend950pr/        TIER 2  ── CAModel only; sources drop the tier
+│   ├── test_sim_turboquant_kernels.cpp     (binaries keep their
+│   └── test_sim_turboquant_decode.cpp       test_sim_950pr_* names)
 │
-├── device/                 TIER 3  ── physical 950PR silicon
-│   ├── test_device_950pr_turboquant.cpp
-│   ├── test_device_950pr_matmul.cpp
-│   ├── test_device_950pr_rmsnorm.cpp
-│   ├── test_device_950pr_rotary_embedding.cpp
-│   ├── test_device_950pr_activation_swiglu.cpp
-│   ├── test_device_950pr_qwen_layer_golden.cpp
-│   ├── test_device_950pr_benchmark_harness.cpp
-│   ├── bench_device_950pr_turboquant.cpp
-│   ├── bench_device_950pr_turboquant_ablation.cpp
-│   └── prof_device_950pr_msprof_trace.cpp
+├── device/                 TIER 3  ── dispatched by SoC family
+│   ├── ascend950pr/correctness/   test_turboquant.cpp, test_matmul.cpp,
+│   │                              test_rmsnorm.cpp, test_rotary_embedding.cpp,
+│   │                              test_activation_swiglu.cpp,
+│   │                              test_qwen_layer_golden.cpp,
+│   │                              test_benchmark_harness.cpp,
+│   │                              test_cube_hadamard.cpp
+│   ├── ascend950pr/bench/         bench_turboquant.cpp,
+│   │                              bench_cube_hadamard.cpp
+│   ├── ascend950pr/profile/       prof_msprof_trace.cpp
+│   └── ascend310p/                correctness/ + bench/ (NOT configured
+│                                  under a 950PR SoC)
 │
-└── device_310p/            the 310P leg — a different part, not a tier
-    ├── test_*_310p.cpp
-    └── bench_*_310p.cpp
+(_binaries and ctest entries keep their historical test_device_950pr_* /
+ test_sim_950pr_* / *_310p names; only the source files are unprefixed.)
 ```
 
 **The exclusivity is structural, not a naming convention.** `ascendc_library()`
@@ -104,7 +107,7 @@ result can never be misattributed after the fact:
 
 ## 2. Architecture isolation: 310P under a 950PR build
 
-**When `SOC_VERSION` names a 950PR, `device_310p/` is not configured, not
+**When `SOC_VERSION` names a 950PR, `device/ascend310p/` is not configured, not
 compiled, and contributes no target.** The parent `CMakeLists.txt` never calls
 `add_subdirectory()` on it, so a `*310*` binary cannot exist in a 950PR build
 tree — `ctest -N` there has nothing to list. Configure output says so
@@ -131,7 +134,7 @@ Two deliberate decisions inside that isolation:
   `ops::kSwiGlu`, `ops::kScatterPaKvCache` and `ops::kApplyRotaryPosEmbV2` all
   resolve through it. What the isolation excludes is the 310P *targets*.
   The one genuinely v200-specific thing it carried, the `ASCEND_PLATFORM_310P`
-  define, now lives in `device_310p/CMakeLists.txt` so a 950PR tree never
+  define, now lives in `device/ascend310p/CMakeLists.txt` so a 950PR tree never
   carries a define claiming it is a 310P.
 
 ---
@@ -1126,7 +1129,7 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 | host only | `cmake -S csrc/tests -B build/host -DVLLM_ASCEND_TESTS_HOST_ONLY=ON` | `host/` |
 | 950PR silicon | `cmake -S csrc/tests -B build/dev -G "Unix Makefiles" -DSOC_VERSION=Ascend950PR_9599` | `host/` + `device/` |
 | 950PR camodel | `cmake -S csrc/tests -B build/sim -G "Unix Makefiles" -DSOC_VERSION=Ascend950PR_9599 -DRUN_MODE=sim` | `host/` + `sim/` |
-| 310P | `cmake -S csrc/tests -B build/310p -DSOC_VERSION=Ascend310P3` | `host/` + `device_310p/` |
+| 310P | `cmake -S csrc/tests -B build/310p -DSOC_VERSION=Ascend310P3` | `host/` + `device/ascend310p/` |
 
 Running:
 
@@ -2507,7 +2510,7 @@ reason forward from the share.
 |---|---|
 | `csrc/tests/common/hadamard_spike.hpp` | host helpers: `Hadamard16Half`, `EarlyStageTables`, chunk sizing, `HadamardDualDstApplies` |
 | `csrc/tests/common/hadamard_spike_kernels.cpp` | 954 lines. AIV-batched butterfly **and** Cube-factorised variants, double-buffered across kSlots |
-| `csrc/tests/device/bench_950pr_cube_hadamard.cpp` | the silicon benchmark |
+| `csrc/tests/device/ascend950pr/bench/bench_cube_hadamard.cpp` | the silicon benchmark |
 | `hadamard_benchmark_results.csv` | 181 rows of real 950PR device measurements, 100 samples per case |
 | `csrc/attention/turboquant/turboquant_codec_950.h` | the shipping `ApplyPi` / `FastWalshHadamardTransform`, at `batchRows = 1` |
 

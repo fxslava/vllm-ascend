@@ -43,9 +43,9 @@
 #include "random_data.hpp"
 #include "test_harness.hpp"
 #include "turbo_quant_cpu.h"
-#include "turboquant_audit_models.hpp"
-#include "turboquant_audit_scenario.hpp"
-#include "turboquant_launch.hpp"
+#include "turboquant/turboquant_audit_models.hpp"
+#include "turboquant/turboquant_audit_scenario.hpp"
+#include "turboquant/turboquant_launch.hpp"
 
 namespace vllm_ascend {
 namespace test {

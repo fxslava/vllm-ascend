@@ -20,9 +20,9 @@
 #include <cstdint>
 #include <vector>
 
-#include "../../attention/turboquant/op_host/turboquant_tiling.h"
-#include "../../attention/turboquant/op_kernel/common/turboquant_mode.h"
-#include "../../kernels/types.h"
+#include "../../../attention/turboquant/op_host/turboquant_tiling.h"
+#include "../../../attention/turboquant/op_kernel/common/turboquant_mode.h"
+#include "../../../kernels/types.h"
 
 namespace vllm_ascend {
 

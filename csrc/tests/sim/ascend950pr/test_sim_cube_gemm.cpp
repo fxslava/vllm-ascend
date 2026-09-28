@@ -25,7 +25,7 @@
 #include "acl_check.hpp"
 #include "device_buffer.hpp"
 #include "test_harness.hpp"
-#include "turboquant_launch.hpp"
+#include "turboquant/turboquant_launch.hpp"
 
 namespace vllm_ascend {
 namespace test {

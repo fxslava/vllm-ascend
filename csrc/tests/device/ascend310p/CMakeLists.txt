@@ -14,12 +14,13 @@
 # limitations under the License.
 # -----------------------------------------------------------------------------
 #
-# The Ascend 310P (v200) leg. A different part, not a tier.
+# The Ascend 310P (v200) leg of tier 3. A different part, not a tier.
 #
-# NOT CONFIGURED AT ALL when SOC_VERSION names a 950PR: the parent CMakeLists.txt
-# never calls add_subdirectory() on this file, so none of these targets exists,
-# none of these sources is compiled, and `ctest -N` in a 950PR tree cannot list
-# a `*310*` binary because there is not one to list.
+# NOT CONFIGURED AT ALL when SOC_VERSION names a 950PR: neither the root
+# CMakeLists.txt nor device/CMakeLists.txt calls add_subdirectory() on this
+# file, so none of these targets exists, none of these sources is compiled, and
+# `ctest -N` in a 950PR tree cannot list a `*310*` binary because there is not
+# one to list.
 #
 # The binary names are unchanged from before the restructure - test_matmul_310p,
 # bench_matmul_310p and so on - and that is deliberate rather than an oversight:
@@ -32,6 +33,9 @@
 #
 # What the isolation needed was a directory of their own and a configure-time
 # gate. A rename would have bought nothing and broken two external consumers.
+# The source FILES, unlike the binaries, drop the redundant _310p suffix
+# (correctness/test_matmul.cpp); correctness/ and bench/ split the leg by
+# purpose the same way the 950PR leg does.
 #
 # Everything here encodes v200 rules that are simply false on a 950PR - the 5-D
 # FRACTAL_NZ KV cache, the 32-element SwiGLU gate, rotary head dims limited to
@@ -47,15 +51,19 @@ set(VLLM_ASCEND_TEST_TIER_LABEL "device_310p")
 # never carries a define that claims it is a 310P.
 add_compile_definitions(ASCEND_PLATFORM_310P)
 
+# <binary name>:<source file under this directory, without the extension>.
 set(VLLM_ASCEND_310P_TESTS
-  test_matmul_310p
-  test_rmsnorm_310p
-  test_rotary_embedding_310p
-  test_activation_swiglu_310p
-  test_paged_attention_310p)
+  test_matmul_310p:correctness/test_matmul
+  test_rmsnorm_310p:correctness/test_rmsnorm
+  test_rotary_embedding_310p:correctness/test_rotary_embedding
+  test_activation_swiglu_310p:correctness/test_activation_swiglu
+  test_paged_attention_310p:correctness/test_paged_attention)
 
-foreach(test_name ${VLLM_ASCEND_310P_TESTS})
-  vllm_ascend_add_device_executable(${test_name} "${test_name}.cpp" ../common/main.cpp)
+foreach(entry ${VLLM_ASCEND_310P_TESTS})
+  string(REPLACE ":" ";" name_and_source "${entry}")
+  list(GET name_and_source 0 test_name)
+  list(GET name_and_source 1 source_name)
+  vllm_ascend_add_device_executable(${test_name} "${source_name}.cpp" ../../common/main.cpp)
   vllm_ascend_register_correctness_test(${test_name})
 endforeach()
 
@@ -63,16 +71,19 @@ message(STATUS "vllm-ascend tests: [device_310p] ${VLLM_ASCEND_310P_TESTS}")
 
 if(VLLM_ASCEND_TESTS_BUILD_BENCHMARKS)
   set(VLLM_ASCEND_310P_BENCHMARKS
-    bench_matmul_310p
-    bench_rmsnorm_310p
-    bench_rotary_embedding_310p
-    bench_activation_swiglu_310p
-    bench_paged_attention_310p)
+    bench_matmul_310p:bench/bench_matmul
+    bench_rmsnorm_310p:bench/bench_rmsnorm
+    bench_rotary_embedding_310p:bench/bench_rotary_embedding
+    bench_activation_swiglu_310p:bench/bench_activation_swiglu
+    bench_paged_attention_310p:bench/bench_paged_attention)
 
   add_custom_target(benchmarks COMMENT "Building the vllm-ascend 310P microbenchmarks")
 
-  foreach(bench_name ${VLLM_ASCEND_310P_BENCHMARKS})
-    vllm_ascend_add_device_executable(${bench_name} "${bench_name}.cpp" ../common/bench_main.cpp)
+  foreach(entry ${VLLM_ASCEND_310P_BENCHMARKS})
+    string(REPLACE ":" ";" name_and_source "${entry}")
+    list(GET name_and_source 0 bench_name)
+    list(GET name_and_source 1 source_name)
+    vllm_ascend_add_device_executable(${bench_name} "${source_name}.cpp" ../../common/bench_main.cpp)
     add_dependencies(benchmarks ${bench_name})
 
     add_test(NAME ${bench_name} COMMAND ${bench_name})
