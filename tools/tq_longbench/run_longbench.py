@@ -92,8 +92,9 @@ import argparse  # noqa: E402  (after the path bootstrap above)
 import json  # noqa: E402
 import statistics  # noqa: E402
 import time  # noqa: E402
-from collections.abc import Iterator  # noqa: E402
+from collections.abc import Iterator, Sequence  # noqa: E402
 from dataclasses import dataclass, field  # noqa: E402
+from itertools import islice  # noqa: E402
 
 import torch  # noqa: E402
 
@@ -263,6 +264,21 @@ def build_parser() -> argparse.ArgumentParser:
         "stubs where a file is missing",
     )
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT, help="items per task per rung")
+    parser.add_argument(
+        "--offset",
+        "--start-index",
+        dest="offset",
+        type=int,
+        default=0,
+        help="skip the first N items of each task, keeping the dataset index they came with: --offset 242 "
+        "--limit 100 evaluates items 242 to 341 and records them under those numbers",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="read --out-file, work out how far the interrupted run got, and set --offset to the next "
+        "unprocessed item; the file is then appended to rather than truncated",
+    )
     parser.add_argument(
         "--max-new-tokens",
         type=int,
@@ -593,17 +609,99 @@ def refuse_sinks_without_dense_prefill(
     )
 
 
-def load_items(task: str, dataset_dir: Path, limit: int) -> tuple[list[EvalItem], str]:
+def load_items(task: str, dataset_dir: Path, limit: int, offset: int = 0) -> tuple[list[EvalItem], str]:
     """``(items, where they came from)``: the local JSONL if it is there, else a stub.
 
     Falling back rather than failing, because the ladder is useful before the
     corpus arrives -- but the source travels into every record and onto the
     table, because a score computed over three synthetic items is not a LongBench
     score and the two must never be read as the same number.
+
+    ``offset`` skips that many items and ``limit`` counts from there, so
+    ``offset=242, limit=100`` is items 242 to 341. The index does not move with
+    them: it is assigned by the loader from the row's position in the file, so a
+    resumed run records the numbers the interrupted one would have, and two
+    halves of a sweep concatenate without colliding.
+
+    :func:`itertools.islice` over the stream rather than a slice of a list: the
+    skipped items are built and dropped one at a time, so an offset of 242 does
+    not hold 242 quarter-million-token prompts in memory to throw them away. They
+    are still *rendered*, which is the cost of the loader assigning the index;
+    for a 15-hour run it is a second.
     """
     if local_task_path(task, dataset_dir) is not None:
-        return list(load_longbench_jsonl(task, dataset_dir, limit=limit)), "jsonl"
-    return list(synthetic_items(task, dataset_dir, limit=min(limit, STUB_ITEMS))), "stub"
+        return list(islice(load_longbench_jsonl(task, dataset_dir), offset, offset + limit)), "jsonl"
+    return list(islice(synthetic_items(task, dataset_dir, STUB_ITEMS), offset, offset + limit)), "stub"
+
+
+def resume_offset(path: Path, tasks: Sequence[str]) -> tuple[int, list[str]]:
+    """``(offset, what was found)``: how far an interrupted run's ``--out-file`` got.
+
+    The offset is the **lowest** point any planned piece of work still has to
+    start from, not the highest index in the file, and the difference matters as
+    soon as a file holds more than one of anything. A sweep writes a record per
+    (backend, sinks, rung, task, item); taking the maximum index over all of them
+    would read one task's completed twenty as everybody's, and silently skip the
+    nineteen items the other three tasks never ran. So the highest index is taken
+    per group, and the offset is the smallest of those -- with a task that has no
+    record at all pinning it to zero, because nothing has been done for it.
+
+    The cost of that choice is duplicated work rather than missing work: a file
+    whose groups disagree re-runs the items between the smallest and the largest,
+    and those items then appear twice. It is said out loud in the returned lines,
+    because a duplicate is recoverable from the records and an omission is not.
+
+    A line that does not parse is counted and skipped: the usual reason a run has
+    an ``--out-file`` to resume from is that it was killed, and being killed
+    halfway through a ``write`` is how the last line ends up truncated.
+    """
+    if not path.is_file():
+        return 0, [f"--resume: {path} does not exist yet, so there is nothing to skip"]
+
+    highest: dict[tuple, int] = {}
+    read = malformed = 0
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            read += 1
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                malformed += 1
+                continue
+            index, task = record.get("index"), record.get("task")
+            if task not in tasks or not isinstance(index, int) or isinstance(index, bool):
+                continue
+            group = (record.get("backend"), record.get("sink_tokens"), record.get("context_requested"), task)
+            highest[group] = max(highest.get(group, -1), index)
+
+    notes = [f"--resume: read {read} records from {path}"]
+    if malformed:
+        notes.append(f"  {malformed} line(s) did not parse and were ignored (an interrupted write looks like this)")
+    if not highest:
+        notes.append("  none of them carry an index for a task in this run; starting from the first item")
+        return 0, notes
+
+    reached: dict[str, int] = {}
+    for (backend, sinks, context, task), index in sorted(highest.items(), key=lambda pair: str(pair[0])):
+        notes.append(f"  {task} on {backend} at {context} (sinks {sinks}): through index {index}")
+        reached[task] = min(reached.get(task, index + 1), index + 1)
+    missing = [task for task in tasks if task not in reached]
+    if missing:
+        notes.append(
+            f"  no records for {', '.join(sorted(missing))}, so nothing can be skipped for any task: this run "
+            "starts from index 0 and the records already in the file will have duplicates appended beside them"
+        )
+        return 0, notes
+
+    offset = min(reached.values())
+    if len(set(reached.values())) > 1:
+        notes.append(
+            f"  the tasks are not equally far along ({reached}); resuming at the earliest, {offset}, so no "
+            "item is skipped -- the ones already done past it will be run again and appear twice"
+        )
+    return offset, notes
 
 
 def synthetic_items(task: str, dataset_dir: Path, limit: int) -> Iterator[EvalItem]:
@@ -885,6 +983,17 @@ def _grouped(rungs: list[TaskRung]):
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    # Checked before the device is resolved, which imports a driver: a flag that
+    # contradicts another one is worth saying so about on a host that has none.
+    if args.offset < 0:
+        raise SystemExit(f"--offset cannot be negative, got {args.offset}")
+    if args.resume and args.out_file is None:
+        raise SystemExit("--resume reads the results of the interrupted run, so it needs --out-file")
+    if args.resume and args.offset:
+        raise SystemExit(
+            f"--resume works out the offset for itself and --offset {args.offset} states one; pass whichever "
+            "of the two you meant, not both"
+        )
     args.device = resolve_device(args.device)
     args.budget_overrides = parse_budget_overrides(args.max_tokens_override)
     backends = parse_backends(args.backends)
@@ -920,10 +1029,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"prompts: {config_source(args.dataset_dir)}", file=sys.stderr)
     print(f"chinese segmentation: {segmentation_backend()}", file=sys.stderr)
 
+    if args.resume:
+        args.offset, found = resume_offset(args.out_file, tasks)
+        for line in found:
+            print(line, file=sys.stderr)
+
     # Loaded once and reused at every rung: the rung truncates the same items.
     items, sources = {}, {}
     for task in tasks:
-        items[task], sources[task] = load_items(task, args.dataset_dir, args.limit)
+        items[task], sources[task] = load_items(task, args.dataset_dir, args.limit, args.offset)
         where = str(args.dataset_dir / f"{task}.jsonl") if sources[task] == "jsonl" else "SYNTHETIC STUBS"
         print(f"{task}: {len(items[task])} items from {where}", file=sys.stderr)
     if any(source == "stub" for source in sources.values()):
@@ -931,8 +1045,27 @@ def main(argv: list[str] | None = None) -> int:
             "warning: some tasks fell back to stubs -- those rows measure the harness, not the model",
             file=sys.stderr,
         )
+    if args.offset:
+        remaining = sum(len(task_items) for task_items in items.values())
+        print(
+            f"Resuming benchmark: skipping first {args.offset} items, starting from item {args.offset} "
+            f"({remaining} remaining).",
+            file=sys.stderr,
+        )
+        if not remaining:
+            print(
+                f"nothing left to run: every task is exhausted at or before index {args.offset}. The offset is "
+                "past the end of the corpus, or the interrupted run had already finished.",
+                file=sys.stderr,
+            )
 
-    sink = args.out_file.open("w", encoding="utf-8") if args.out_file else sys.stdout
+    # Appended wherever an offset is in play, and truncating otherwise: the whole
+    # point of resuming is that the records already in the file are the run's.
+    sink = (
+        args.out_file.open("a" if args.offset or args.resume else "w", encoding="utf-8")
+        if args.out_file
+        else sys.stdout
+    )
     rungs: list[TaskRung] = []
     try:
         for backend in backends:

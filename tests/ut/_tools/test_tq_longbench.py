@@ -3026,9 +3026,7 @@ class TestKvDumpContents(unittest.TestCase):
         packed = (self.LAYERS, blocks, BLOCK_SIZE, self.KV_HEADS, self.HEAD_SIZE // 2)
         self.assertEqual(tuple(blob["key_planes"].shape), packed)
         self.assertEqual(tuple(blob["value_planes"].shape), packed)
-        self.assertEqual(
-            tuple(blob["scale_planes"].shape), (self.LAYERS, blocks, BLOCK_SIZE, self.geometry.scale_slot)
-        )
+        self.assertEqual(tuple(blob["scale_planes"].shape), (self.LAYERS, blocks, BLOCK_SIZE, self.geometry.scale_slot))
         # The pool is four blocks; only the one the context reached was written out.
         self.assertLess(blocks, self.geometry.num_blocks)
 
@@ -4052,6 +4050,116 @@ class TestRunLongBench(_LongBenchCorpus):
         self.assertEqual(set(parse_tasks("all")), set(TASK_METRICS))
         with self.assertRaisesRegex(ValueError, "no LongBench metric"):
             parse_tasks("narrativeqa,not_a_task")
+
+
+class TestResume(_LongBenchCorpus):
+    """Picking a 15-hour sweep back up where it stopped, without re-running or losing an item.
+
+    The corpus is three items per task, so ``--limit 2`` then ``--resume`` is the
+    whole question in miniature: does the second run start at index 2, does it
+    leave the first two lines alone, and do the three records that end up in the
+    file carry 0, 1, 2 exactly once each.
+    """
+
+    def test_offset_skips_items_and_keeps_their_dataset_index(self):
+        """The index is the row's position in the corpus, not the position in this run."""
+        records, _, _ = self._run("--limit", "1", "--offset", "2", tasks=("trec",))
+        self.assertEqual([record["index"] for record in records], [2])
+
+    def test_offset_and_limit_are_a_window_not_a_count(self):
+        records, _, _ = self._run("--limit", "2", "--offset", "1", tasks=("trec",))
+        self.assertEqual([record["index"] for record in records], [1, 2])
+
+    def test_an_offset_past_the_corpus_runs_nothing_and_says_so(self):
+        records, _, logged = self._run("--offset", "99", tasks=("trec",))
+        self.assertEqual(records, [])
+        self.assertIn("nothing left to run", logged)
+
+    def test_a_negative_offset_is_refused(self):
+        with self.assertRaisesRegex(SystemExit, "--offset cannot be negative"):
+            self._run("--offset", "-1", tasks=("trec",))
+
+    def test_resume_continues_where_the_out_file_stopped(self):
+        """The objective, end to end: two items, then resume, then a contiguous file."""
+        first, _, _ = self._run("--limit", "2", tasks=("trec",))
+        self.assertEqual([record["index"] for record in first], [0, 1])
+
+        every, _, logged = self._run("--resume", tasks=("trec",))
+        self.assertIn("through index 1", logged)
+        self.assertIn("skipping first 2 items, starting from item 2", logged)
+        # The file holds both runs: the first two lines were not rewritten.
+        self.assertEqual([record["index"] for record in every], [0, 1, 2])
+        self.assertEqual(len({record["index"] for record in every}), 3)
+
+    def test_resume_on_a_finished_run_adds_nothing(self):
+        done, _, _ = self._run(tasks=("trec",))
+        self.assertEqual(len(done), self.ITEMS)
+        again, _, logged = self._run("--resume", tasks=("trec",))
+        self.assertEqual([record["index"] for record in again], [0, 1, 2])
+        self.assertIn("nothing left to run", logged)
+
+    def test_resume_survives_the_truncated_line_a_kill_leaves_behind(self):
+        """Being killed halfway through a write is how an interrupted run ends."""
+        from tq_longbench.run_longbench import resume_offset
+
+        out_file = self.root / "killed.jsonl"
+        good = "\n".join(json.dumps({"task": "trec", "index": index}) for index in range(2))
+        out_file.write_text(good + '\n{"task": "trec", "index": 2, "score"', encoding="utf-8")
+        offset, notes = resume_offset(out_file, ("trec",))
+        self.assertEqual(offset, 2)
+        self.assertTrue(any("did not parse" in note for note in notes))
+
+    def test_resume_without_an_out_file_is_refused(self):
+        from tq_longbench import run_longbench
+
+        with self.assertRaisesRegex(SystemExit, "needs --out-file"):
+            run_longbench.main(["--model-path", str(self.model_path), "--device", "cpu", "--resume"])
+
+    def test_resume_and_an_explicit_offset_are_not_both_answers(self):
+        with self.assertRaisesRegex(SystemExit, "pass whichever of the two you meant"):
+            self._run("--resume", "--offset", "1", tasks=("trec",))
+
+    def test_a_missing_out_file_resumes_from_the_start(self):
+        records, _, logged = self._run("--resume", tasks=("trec",))
+        self.assertIn("does not exist yet", logged)
+        self.assertEqual([record["index"] for record in records], [0, 1, 2])
+
+    def test_a_task_with_no_records_pins_the_offset_to_zero(self):
+        """One task finished and another never started is not 'both are done'."""
+        from tq_longbench.run_longbench import resume_offset
+
+        out_file = self.root / "partial.jsonl"
+        out_file.write_text(
+            "\n".join(json.dumps({"task": "trec", "index": index, "backend": "dense_reference"}) for index in range(3))
+            + "\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(resume_offset(out_file, ("trec",))[0], 3)
+        offset, notes = resume_offset(out_file, ("trec", "lcc"))
+        self.assertEqual(offset, 0)
+        self.assertTrue(any("no records for lcc" in note for note in notes))
+
+    def test_the_offset_is_the_earliest_group_not_the_highest_index(self):
+        """A file whose groups disagree must not read one task's progress as everyone's."""
+        from tq_longbench.run_longbench import resume_offset
+
+        out_file = self.root / "uneven.jsonl"
+        rows = [{"task": "trec", "index": index, "backend": "a"} for index in range(5)]
+        rows += [{"task": "lcc", "index": index, "backend": "a"} for index in range(2)]
+        out_file.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+        offset, notes = resume_offset(out_file, ("trec", "lcc"))
+        self.assertEqual(offset, 2)
+        self.assertTrue(any("not equally far along" in note for note in notes))
+
+    def test_a_rung_that_only_half_ran_pins_the_offset_to_its_own_progress(self):
+        """Two rungs of the same task: the offset is the one that got less far."""
+        from tq_longbench.run_longbench import resume_offset
+
+        out_file = self.root / "rungs.jsonl"
+        rows = [{"task": "trec", "index": i, "backend": "a", "context_requested": 4096} for i in range(5)]
+        rows += [{"task": "trec", "index": i, "backend": "a", "context_requested": 8192} for i in range(2)]
+        out_file.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+        self.assertEqual(resume_offset(out_file, ("trec",))[0], 2)
 
 
 class TestContextTiers(unittest.TestCase):
@@ -5233,7 +5341,6 @@ class TestSmokeGlmPreflight(unittest.TestCase):
         self.assertTrue(any("cann_dense" in note for note in plan.notes), plan.notes)
 
 
-
 # --------------------------------------------------------------- attention sinks
 
 
@@ -5414,9 +5521,9 @@ class TestTurboQuantSinkBackend(_TurboQuantCase):
         packed = (-1, NUM_KV_HEADS, HEAD_SIZE // 2)
         scales = scale_plane.view(-1, scale_plane.shape[-1])[rows]
         signs = rotation.turboquant_pi_signs(HEAD_SIZE, CPU)
-        keys = self.stand_ins.dequantize(key_plane.view(packed)[rows], centroids) * scales[
-            :, :NUM_KV_HEADS
-        ].unsqueeze(-1)
+        keys = self.stand_ins.dequantize(key_plane.view(packed)[rows], centroids) * scales[:, :NUM_KV_HEADS].unsqueeze(
+            -1
+        )
         values = self.stand_ins.dequantize(value_plane.view(packed)[rows], centroids) * scales[
             :, NUM_KV_HEADS : 2 * NUM_KV_HEADS
         ].unsqueeze(-1)
@@ -5471,7 +5578,6 @@ class TestTurboQuantSinkBackend(_TurboQuantCase):
         self.assertTrue(bool(torch.isfinite(out.to(torch.float32)).all()))
         expected = self._mixed_reference(backend, query, key, value, length)
         self.assertGreater(cosine(out, expected), EXACT_COSINE)
-
 
 
 class TestTheMergeCannotReadAKv4Fp8Cache(_TurboQuantCase):
@@ -5589,6 +5695,7 @@ class TestTheMergeCannotReadAKv4Fp8Cache(_TurboQuantCase):
         refuse_sinks_on_an_unreadable_cache(("turboquant_cube",), (0,))
         with self.assertRaisesRegex(SystemExit, "turboquant_cube"):
             refuse_sinks_on_an_unreadable_cache(("turboquant_aiv", "turboquant_cube"), (0, 4))
+
 
 class TestSinkRunnerConfig(unittest.TestCase):
     """What a run with sinks is and is not allowed to be."""
@@ -5715,6 +5822,7 @@ class TestRunLongBenchSinks(_LongBenchCorpus):
             self.assertRaisesRegex(SystemExit, "prefill densely"),
         ):
             run_longbench.main(argv)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
