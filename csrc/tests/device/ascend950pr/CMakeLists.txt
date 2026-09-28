@@ -50,24 +50,38 @@
 
 set(VLLM_ASCEND_TEST_TIER_LABEL "device")
 
-# <binary name>:<source file under this directory, without the extension>.
+# <binary name>:<source file under this directory, without the extension>
+# [:<shared sweep source under common/testing, without the extension>].
+#
+# The third field names the SoC-neutral parameterised sweep (the fixture, the
+# launch helper and the TEST_P cases) that this binary shares with its 310P
+# counterpart; the leg file keeps only what is genuinely 950PR-specific. The
+# sweep source picks its REQUIRE_ASCEND_* gate from ASCEND_PLATFORM_310P, which
+# this leg deliberately does not define.
 
 # --- correctness --------------------------------------------------------------
 
 # Stock-operator and end-to-end tests. These call operators CANN already built,
 # so they link the 950PR operator audit but not the Ascend C kernels.
 set(VLLM_ASCEND_DEVICE_OPERATOR_TESTS
-  test_device_950pr_matmul:correctness/test_matmul
-  test_device_950pr_rmsnorm:correctness/test_rmsnorm
+  test_device_950pr_matmul:correctness/test_matmul:test_matmul_sweep
+  test_device_950pr_rmsnorm:correctness/test_rmsnorm:test_rmsnorm_sweep
   test_device_950pr_rotary_embedding:correctness/test_rotary_embedding
-  test_device_950pr_activation_swiglu:correctness/test_activation_swiglu
+  test_device_950pr_activation_swiglu:correctness/test_activation_swiglu:test_swiglu_sweep
   test_device_950pr_qwen_layer_golden:correctness/test_qwen_layer_golden)
 
 foreach(entry ${VLLM_ASCEND_DEVICE_OPERATOR_TESTS})
   string(REPLACE ":" ";" name_and_source "${entry}")
   list(GET name_and_source 0 test_name)
   list(GET name_and_source 1 source_name)
-  vllm_ascend_add_device_executable(${test_name} "${source_name}.cpp" ../../common/main_950pr.cpp)
+  set(extra_sources)
+  list(LENGTH name_and_source entry_field_count)
+  if(entry_field_count GREATER 2)
+    list(GET name_and_source 2 shared_source)
+    list(APPEND extra_sources "../../common/testing/${shared_source}.cpp")
+  endif()
+  vllm_ascend_add_device_executable(${test_name} "${source_name}.cpp" ../../common/testing/main_950pr.cpp
+                                    ${extra_sources})
   target_link_libraries(${test_name} PRIVATE vllm_ascend_test_common_950pr)
   target_compile_definitions(${test_name} PRIVATE VLLM_ASCEND_TEST_TIER="device")
   vllm_ascend_register_correctness_test(${test_name})
@@ -82,7 +96,7 @@ endforeach()
 # links libascendcl.so, which the host tier's entry criterion forbids.
 vllm_ascend_add_device_executable(test_device_950pr_benchmark_harness
                                   correctness/test_benchmark_harness.cpp
-                                  ../../common/main_950pr.cpp)
+                                  ../../common/testing/main_950pr.cpp)
 target_link_libraries(test_device_950pr_benchmark_harness PRIVATE vllm_ascend_test_common_950pr)
 target_compile_definitions(test_device_950pr_benchmark_harness
   PRIVATE VLLM_ASCEND_TEST_TIER="device_harness")
@@ -98,7 +112,7 @@ set(VLLM_ASCEND_DEVICE_TESTS
 if(VLLM_ASCEND_TESTS_HAVE_TURBOQUANT)
   vllm_ascend_add_device_executable(test_device_950pr_turboquant
                                     correctness/test_turboquant.cpp
-                                    ../../common/main_950pr.cpp)
+                                    ../../common/testing/main_950pr.cpp)
   target_link_libraries(test_device_950pr_turboquant PRIVATE vllm_ascend_test_turboquant)
   target_compile_definitions(test_device_950pr_turboquant
     PRIVATE VLLM_ASCEND_TEST_TIER="device")
@@ -121,7 +135,7 @@ if(VLLM_ASCEND_TESTS_HAVE_TURBOQUANT)
   # is what lets a single binary cover S=64 and S=512 in separate runs.
   vllm_ascend_add_device_executable(test_device_950pr_turboquant_multimode
                                     ../../sim/ascend950pr/test_sim_turboquant_multimode.cpp
-                                    ../../common/main_950pr.cpp)
+                                    ../../common/testing/main_950pr.cpp)
   target_link_libraries(test_device_950pr_turboquant_multimode PRIVATE vllm_ascend_test_turboquant)
   # VLLM_ASCEND_TEST_TIER_DEVICE, on top of the string label every device target
   # gets, is what the shared source switches its DEFAULT SWEEP on: one batch and
@@ -135,7 +149,7 @@ if(VLLM_ASCEND_TESTS_HAVE_TURBOQUANT)
 
   # The Cube-Hadamard spike's shape sweep: D in {64, 128, 256, 512} by V in
   # {1, 8, 16, 32}, three hybrid variants and an AIV-only baseline, all against
-  # the CPU golden. It drives a test-owned kernel (common/hadamard_spike_kernels.cpp,
+  # the CPU golden. It drives a test-owned kernel (common/models/hadamard/hadamard_spike_kernels.cpp,
   # carried by the same ascendc_library) and touches nothing on the decode path.
   #
   # It lives in the device tier because of arithmetic, not preference: the sim
@@ -143,7 +157,7 @@ if(VLLM_ASCEND_TESTS_HAVE_TURBOQUANT)
   # camodel, and 64 of them is most of a day. See the header of the sim file.
   vllm_ascend_add_device_executable(test_device_950pr_cube_hadamard
                                     correctness/test_cube_hadamard.cpp
-                                    ../../common/main_950pr.cpp)
+                                    ../../common/testing/main_950pr.cpp)
   target_link_libraries(test_device_950pr_cube_hadamard PRIVATE vllm_ascend_test_turboquant)
   target_compile_definitions(test_device_950pr_cube_hadamard PRIVATE VLLM_ASCEND_TEST_TIER="device")
   vllm_ascend_register_correctness_test(test_device_950pr_cube_hadamard 900 TRUE)
@@ -173,7 +187,7 @@ if(VLLM_ASCEND_TESTS_BUILD_BENCHMARKS AND VLLM_ASCEND_TESTS_HAVE_TURBOQUANT)
     string(REPLACE ":" ";" name_and_source "${entry}")
     list(GET name_and_source 0 bench_name)
     list(GET name_and_source 1 source_name)
-    vllm_ascend_add_device_executable(${bench_name} "${source_name}.cpp" ../../common/bench_main_950pr.cpp)
+    vllm_ascend_add_device_executable(${bench_name} "${source_name}.cpp" ../../common/bench/bench_main_950pr.cpp)
     target_link_libraries(${bench_name} PRIVATE vllm_ascend_test_turboquant)
     target_compile_definitions(${bench_name} PRIVATE VLLM_ASCEND_TEST_TIER="device")
     add_dependencies(benchmarks ${bench_name})
@@ -188,7 +202,7 @@ if(VLLM_ASCEND_TESTS_BUILD_BENCHMARKS AND VLLM_ASCEND_TESTS_HAVE_TURBOQUANT)
   endforeach()
 
   # The Cube-Hadamard sweep. It takes its own entry point rather than
-  # ../../common/bench_main_950pr.cpp because it accepts --csv=<path> on the
+  # ../../common/bench/bench_main_950pr.cpp because it accepts --csv=<path> on the
   # command line and writes a CSV by default: the sweep is 16 shapes by 4 legs
   # and is meant to be plotted, not read off a terminal. Everything else about
   # the run - the SoC check, the camodel refusal, the ASCEND_BENCH_* parses - is

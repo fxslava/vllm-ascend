@@ -45,10 +45,6 @@ std::vector<OpAvailability> ProbeAllOperators() {
       kApplyRotaryPosEmbV2,
       kApplyRotaryPosEmb,
       kScatterPaKvCache,
-      kIncreFlashAttentionV4,
-      kRotaryMul,
-      kReshapeAndCache,
-      kPagedAttention,
   };
 
   std::vector<OpAvailability> results;

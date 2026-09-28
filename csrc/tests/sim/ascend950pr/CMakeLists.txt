@@ -58,7 +58,7 @@ set(VLLM_ASCEND_SIM_TESTS
   test_sim_950pr_cube_gemm:test_sim_cube_gemm
   # Exploratory spike, isolated from the decode: a D = 256 Walsh-Hadamard whose
   # lower four butterfly stages are one Cube Mmad. Drives its own kernel source
-  # (common/hadamard_spike_kernels.cpp, shared with the device tier), not the decode's.
+  # (common/models/hadamard/hadamard_spike_kernels.cpp, shared with the device tier), not the decode's.
   test_sim_950pr_cube_hadamard:test_sim_cube_hadamard
   # The standalone query rotation, both dispatch paths, against the CPU
   # reference. No decode in it, so it is seconds to a minute -- and it is the
@@ -78,7 +78,7 @@ foreach(entry ${VLLM_ASCEND_SIM_TESTS})
   string(REPLACE ":" ";" name_and_source "${entry}")
   list(GET name_and_source 0 test_name)
   list(GET name_and_source 1 source_name)
-  vllm_ascend_add_device_executable(${test_name} "${source_name}.cpp" ../../common/main_950pr.cpp)
+  vllm_ascend_add_device_executable(${test_name} "${source_name}.cpp" ../../common/testing/main_950pr.cpp)
   target_link_libraries(${test_name} PRIVATE vllm_ascend_test_turboquant)
   target_compile_definitions(${test_name} PRIVATE VLLM_ASCEND_TEST_TIER="simulator")
 

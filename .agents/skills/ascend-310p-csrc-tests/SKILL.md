@@ -252,7 +252,7 @@ The aclnn routes to the same results are `aclnnScatterPaKvCache` (the KV write,
 which `BaseDeviceAdaptor.reshape_and_cache` uses via
 `npu_scatter_pa_kv_cache`) and `aclnnIncreFlashAttentionV4` (paged decode, with
 `blocktable` + `blockSize`). Both are declared with header-verified prototypes
-in `csrc/tests/common/aclnn_ops.hpp`.
+in `csrc/tests/common/runtime/aclnn_ops.hpp`.
 
 **Still open, do not guess:** IFA V4 takes key/value as `aclTensorList` and
 expects a paged KV layout that is not the 310P 5-D NZ shape the plugin
@@ -265,7 +265,7 @@ names or install anything. Report it and hand back control.
 
 ## Operator prototypes are hand-declared
 
-`csrc/tests/common/aclnn_ops.hpp` is the only version-sensitive file. Because
+`csrc/tests/common/runtime/aclnn_ops.hpp` is the only version-sensitive file. Because
 operators are resolved with `dlsym`, the compiler cannot check their argument
 lists. Each declaration names the CANN header to verify against and the
 `torch_npu` entry point plus vllm-ascend call site it mirrors.

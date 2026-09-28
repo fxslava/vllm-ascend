@@ -51,10 +51,6 @@ inline const char* kApplyRotaryPosEmb = "aclnnApplyRotaryPosEmb";
 
 inline constexpr int64_t kApplyRotaryPosEmbLayoutBsnd = 1;
 
-inline const char* kRotaryMul = "aclnnRotaryMul";
-
-inline const char* kReshapeAndCache = "aclnnReshapeAndCache";
-
 using ScatterPaKvCacheWorkspaceFn = int (*)(const aclTensor* key, aclTensor* key_cache_ref,
                                             const aclTensor* slot_mapping, const aclTensor* value,
                                             aclTensor* value_cache_ref, const aclTensor* compress_lens_optional,
@@ -66,18 +62,6 @@ using ScatterPaKvCacheWorkspaceFn = int (*)(const aclTensor* key, aclTensor* key
 inline const char* kScatterPaKvCache = "aclnnScatterPaKvCache";
 
 inline const char* kScatterCacheModeNorm = "Norm";
-
-inline const char* kPagedAttention = "aclnnPagedAttention";
-
-using IncreFlashAttentionV4WorkspaceFn =
-    int (*)(const aclTensor* query, const aclTensorList* key, const aclTensorList* value, const aclTensor* pse_shift,
-            const aclTensor* atten_mask, const aclIntArray* actual_seq_lengths, const aclTensor* dequant_scale1,
-            const aclTensor* quant_scale1, const aclTensor* dequant_scale2, const aclTensor* quant_scale2,
-            const aclTensor* quant_offset2, const aclTensor* antiquant_scale, const aclTensor* antiquant_offset,
-            const aclTensor* blocktable, const aclTensor* kv_padding_size, int64_t num_heads, double scale_value,
-            char* input_layout, int64_t num_key_value_heads, int64_t block_size, int64_t inner_precise,
-            const aclTensor* attention_out, uint64_t* workspace_size, aclOpExecutor** executor);
-inline const char* kIncreFlashAttentionV4 = "aclnnIncreFlashAttentionV4";
 
 struct OpAvailability {
   std::string name;

@@ -17,8 +17,9 @@
 #pragma once
 
 // The boilerplate behind the stock-operator tests: the fp16-quantised allclose
-// against a float CPU reference, and the parameter-name generator for the
-// (int64, int64) shape sweeps both tiers run.
+// against a float CPU reference, the parameter-name generator for the
+// (int64, int64) shape sweeps both tiers run, and the SoC gate for the shared
+// sweep sources.
 
 #include <gtest/gtest.h>
 
@@ -29,6 +30,20 @@
 
 #include "fp16.hpp"
 #include "tensor_compare.hpp"
+#include "test_harness.hpp"
+
+// The parameterised sweeps in test_matmul_sweep.cpp and friends are compiled
+// into both silicon legs - the 950PR binaries and their *_310p twins - from one
+// source. The legs are mutually exclusive in any one build tree, and the 310P
+// leg defines ASCEND_PLATFORM_310P for everything it builds (see its
+// CMakeLists.txt), so that macro alone picks the matching REQUIRE_ASCEND_*
+// gate. GTEST_SKIP must fire from the test body itself, which is why this is a
+// macro rather than a helper function.
+#if defined(ASCEND_PLATFORM_310P)
+#define REQUIRE_OPERATOR_TARGET_SOC() REQUIRE_ASCEND_310P()
+#else
+#define REQUIRE_OPERATOR_TARGET_SOC() REQUIRE_ASCEND_950PR()
+#endif
 
 namespace vllm_ascend {
 namespace test {

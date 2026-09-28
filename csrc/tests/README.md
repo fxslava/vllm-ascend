@@ -44,9 +44,10 @@ csrc/tests/
 |-- COVERAGE.md             C++ vs Python coverage and parity audit
 |-- TURBOQUANT_TESTS.md     the tier map and every TurboQuant case, reviewed
 |
-|-- common/                 shared infrastructure (see the table below), including
-|                           hadamard_spike_kernels.cpp -- test-owned Ascend C both
-|                           the sim and device spike binaries link, not the decode
+|-- common/                 shared infrastructure, by function (see the tables
+|                           below); models/hadamard/ carries the spike's Ascend C
+|                           kernels, which both the sim and device spike binaries
+|                           link and the decode does not
 |-- reference/              turbo_quant_cpu.h, the CPU oracle
 |-- data/golden_layer3/     Git LFS: weights, taps and output of one Qwen3.5 layer
 |-- turboquant/             ascendc_library() for the Ascend C kernels
@@ -86,29 +87,66 @@ csrc/tests/
     `-- bench/              bench_*.cpp
 ```
 
-| `common/` | |
+`common/` is organised by function. The flat `#include "aclnn_ops.hpp"` style
+every tier uses keeps working: every subdirectory is on the include path, so a
+header's directory says what it is for, not how it is named.
+
+#### `common/runtime/` — NPU/AscendCL low-level runtime abstractions
+
+| | |
 | --- | --- |
 | `acl_check.hpp` | `ACL_CHECK` / `ASSERT_ACL_OK`, with `aclGetRecentErrMsg` attached |
 | `aclnn_ops.hpp` / `.cpp` | the version-sensitive aclnn prototypes -- read this first. Shared by both parts, despite the history |
 | `aclnn_ops_950pr.hpp` / `.cpp` | the 950PR operator audit and its extra prototypes, including FIA V5 |
 | `aclnn_runtime.hpp` / `.cpp` | dlopen/dlsym loader, aclTensor RAII, two-phase launch |
-| `ascend950_shapes.hpp` | Qwen3.5-2B layer 3 and the arch35 platform rules |
-| `bench_main.cpp` / `bench_main_950pr.cpp` | benchmark entry points; the 950PR one names the part and refuses a camodel |
-| `benchmark.hpp` / `.cpp` | plan-once launch, event timing, statistics, reporting |
-| `camodel_guard.hpp` | a watchdog the sim tier arms around a launch, so a hung camodel exits naming the case instead of running to the ctest timeout |
-| `cpu_reference.hpp` / `.cpp` | naive fp32 references for all five kernels |
 | `device_buffer.hpp` | RAII device allocation, 32-byte default, 512 for benchmarks |
 | `device_tensor.hpp` | device buffer + aclTensor descriptor, with host conversions |
+
+#### `common/reference/` — pure CPU references, bit converters, RNG
+
+| | |
+| --- | --- |
+| `cpu_reference.hpp` / `.cpp` | naive fp32 references for all five kernels |
 | `fp16.hpp` | IEEE-754 binary16 conversion, round-to-nearest-even |
-| `golden_layer3.hpp` / `.cpp` | LFS-aware loader for the layer-3 dump |
-| `hadamard_spike.hpp` | the Cube-Hadamard spike's constant images, chunk planning and launchers. Exploratory; not on the decode path |
-| `hadamard_spike_kernels.cpp` | the spike's Ascend C kernels themselves. Test-owned device code, compiled into the same `ascendc_library` as the decode kernels because a `<<<>>>` call site can only reach a launcher in its own library. Linked by the sim and the device spike binaries alike |
-| `main.cpp` / `main_950pr.cpp` | test entry points; the 950PR one prints its tier and whether a camodel is loaded |
-| `partial_rotary_950pr.hpp` / `.cpp` | partial RoPE: custom operator, else packed stock operator |
-| `qwen_shapes.hpp` | Qwen3.5 shapes and the 310P alignment rules |
+| `fp8_e4m3.hpp` | E4M3Fn (OCP FP8) bit conversions, header-only, no ACL dependency |
 | `random_data.hpp` | deterministic, platform-independent test data |
-| `tensor_compare.hpp` | allclose with a diagnostic report |
+
+#### `common/testing/` — GTest harness, fixtures, comparisons, environment
+
+| | |
+| --- | --- |
 | `test_harness.hpp` / `.cpp` | `AscendTestEnvironment`, and the camodel detection the device tier gates on |
+| `tensor_compare.hpp` | allclose with a diagnostic report |
+| `op_test_fixture.hpp` | the stock-operator tests' shared fixture: the fp16 allclose macro, the sweep parameter namer, the SoC gate |
+| `test_matmul_sweep.cpp`, `test_rmsnorm_sweep.cpp`, `test_swiglu_sweep.cpp` | the parameterised operator sweeps both silicon legs compile into their binaries; the leg files keep only the per-part checks |
+| `camodel_guard.hpp` | a watchdog the sim tier arms around a launch, so a hung camodel exits naming the case instead of running to the ctest timeout |
+| `env_utils.hpp` | the one home for the ad-hoc environment/CSV parsing (EnvInt, EnvString, SplitCsv, ...); no ACL or gtest dependency |
+| `main.cpp` / `main_950pr.cpp` | test entry points; the 950PR one prints its tier and whether a camodel is loaded |
+
+#### `common/bench/` — microbenchmark engine and runners
+
+| | |
+| --- | --- |
+| `benchmark.hpp` / `.cpp` | plan-once launch, event timing, statistics, reporting |
+| `bench_main.cpp` / `bench_main_950pr.cpp` | benchmark entry points; the 950PR one names the part and refuses a camodel |
+
+#### `common/models/` — model-specific shapes, goldens and spike kernels
+
+| | |
+| --- | --- |
+| `shapes/ascend950_shapes.hpp` | Qwen3.5-2B layer 3 and the arch35 platform rules |
+| `shapes/qwen_shapes.hpp` | Qwen3.5 shapes and the 310P alignment rules |
+| `shapes/sweep_shapes.hpp` | the sweep widths both part headers alias |
+| `qwen/golden_layer3.hpp` / `.cpp` | LFS-aware loader for the layer-3 dump |
+| `qwen/partial_rotary_950pr.hpp` / `.cpp` | partial RoPE: custom operator, else packed stock operator |
+| `hadamard/hadamard_spike.hpp` | the Cube-Hadamard spike's constant images, chunk planning and launchers. Exploratory; not on the decode path |
+| `hadamard/hadamard_spike_kernels.cpp` | the spike's Ascend C kernels themselves. Test-owned device code, compiled into the same `ascendc_library` as the decode kernels because a `<<<>>>` call site can only reach a launcher in its own library. Linked by the sim and the device spike binaries alike |
+| `hadamard/hadamard_harness.hpp` | the spike's shared driver: CPU golden, upload -> launch -> readback -> compare over the spike kernels |
+
+#### `common/turboquant/` — the TurboQuant audit's shared modules
+
+| | |
+| --- | --- |
 | `turboquant_launch.hpp` / `.cpp` | torch-free binding for the TurboQuant kernels: the two `_impl` prototypes, the codec table image, the grid maths |
 | `turboquant_audit_models.hpp` | the model geometries the device benchmark and the msprof trace sweep, and the `ASCEND_BENCH_TQ_AUDIT_*` overrides |
 | `turboquant_fused_harness.hpp` | the fused-decode cases' shared fixture: shape, staging, the FNV-1a golden over the raw output, and the output poisoning that catches a kernel that never wrote |
@@ -223,8 +261,8 @@ Useful GTest flags: `--gtest_list_tests`, `--gtest_repeat=10`,
 
 `test_benchmark_harness` is the exception to all of the above: it covers the
 benchmark harness rather than a kernel, needs no device, and passes on the build
-host. It is the fastest check that a change to `common/benchmark.*` or
-`common/device_buffer.hpp` did not move what a report says.
+host. It is the fastest check that a change to `common/bench/benchmark.*` or
+`common/runtime/device_buffer.hpp` did not move what a report says.
 
 ```bash
 ./build/csrc-tests/test_benchmark_harness
@@ -236,7 +274,7 @@ host. It is the fastest check that a change to `common/benchmark.*` or
 
 The `bench_*` binaries are a separate suite with the same plumbing and a
 different question: not "is the answer right" but "how long does it take". They
-link `common/bench_main.cpp` instead of `common/main.cpp`, so there is no GTest
+link `common/bench/bench_main.cpp` instead of `common/testing/main.cpp`, so there is no GTest
 in them at all.
 
 ```bash
@@ -263,8 +301,8 @@ which ctest reports as a skip rather than a failure.
 `-DVLLM_ASCEND_TESTS_BUILD_BENCHMARKS=OFF` leaves them out of the build
 entirely.
 
-Which part that is comes from the entry point: `common/bench_main.cpp` for the
-five 310P suites, `common/bench_main_950pr.cpp` for `bench_device_950pr_turboquant`,
+Which part that is comes from the entry point: `common/bench/bench_main.cpp` for the
+five 310P suites, `common/bench/bench_main_950pr.cpp` for `bench_device_950pr_turboquant`,
 which appears only in a 950PR device-tier build alongside the TurboQuant
 kernels. It is the one benchmark in the suite that times kernels built here
 rather than a stock aclnn operator, and the only one that reports an analytic
@@ -388,7 +426,7 @@ matter for performance are not the ones that matter for correctness:
   overhead is still a visible share of a bandwidth figure.
 - The paged suite benchmarks `aclnnScatterPaKvCache` with a shuffled slot
   mapping. Decode attention is registered as an explicit skip, for the reason in
-  `common/aclnn_ops.hpp`.
+  `common/runtime/aclnn_ops.hpp`.
 - `bench_device_950pr_turboquant` sweeps context 512 / 1024 / 2048 at Qwen3.5-2B's
   `head_dim` 256, timing the 4-bit cache write and the fused single-launch decode
   (the AIV-only path, or the Cube path at H_Q/H_KV >= 16) head to head against an
@@ -411,7 +449,7 @@ linking `libopapi.so` directly, the same way
 becomes a skip naming the symbol instead of a link error that takes out the
 whole binary.
 
-The trade-off is that the argument lists in `common/aclnn_ops.hpp` are declared
+The trade-off is that the argument lists in `common/runtime/aclnn_ops.hpp` are declared
 by hand and are **not** checked by the compiler. Before trusting the first run
 on a CANN version this suite has not seen, confirm each prototype:
 
@@ -562,7 +600,7 @@ saying so rather than silently building the wrong leg.
 | `bench_device_950pr_turboquant` | 5 — the fused decode (AIV-only or Cube), timed | ditto, head to head with `aclnnFusedInferAttentionScoreV5` (V2 fallback) as the fp16 baseline |
 | `prof_device_950pr_msprof_trace` | 5 — the attention chain and FIA V5, one launch each, for an msprof timeline | the TurboQuant kernels and `aclnnFusedInferAttentionScoreV5`, bracketed by mstx ranges. Not a ctest entry |
 
-`common/aclnn_ops_950pr.hpp` carries the operator audit: which stage runs on a
+`common/runtime/aclnn_ops_950pr.hpp` carries the operator audit: which stage runs on a
 stock CANN operator, which on a kernel built out of `csrc/`, and the CANN header
 each prototype was verified against.
 
@@ -618,7 +656,7 @@ rather than skip. Three things are worth knowing before you try it:
   rather than failing; the exact fp32 host path is what its assertions compare
   against. `bench_device_950pr_turboquant` hits the same wall for its fp16 baseline and
   registers a ctest-visible skip with the reason.
-  `common/aclnn_ops_950pr.hpp` records the measurement.
+  `common/runtime/aclnn_ops_950pr.hpp` records the measurement.
 
 The same binaries run unchanged on silicon: configure without `RUN_MODE=sim`
 (or with `-DRUN_MODE=npu`) and they link the real runtime.
@@ -663,7 +701,7 @@ Qwen3.5 sets `partial_rotary_factor` 0.25 against `head_dim` 256, so channels
 `rotary_dim in (64, 128)`), and `aclnnApplyRotaryPosEmbV2` cannot express it
 either — it rotates the whole trailing dimension.
 
-`common/partial_rotary_950pr.hpp` resolves that at run time, preferring
+`common/models/qwen/partial_rotary_950pr.hpp` resolves that at run time, preferring
 `aclnnInplacePartialRotaryMul` — the vllm-ascend custom operator from
 `csrc/attention/inplace_partial_rotary_mul`, which has an `ascend950` AICore
 config — and falling back to packing the rotary slice of every head into a
@@ -674,7 +712,7 @@ the same hardware.
 The custom operator is **not part of CANN**: it only resolves once the
 vllm-ascend custom op package is installed, and it lives in `libcust_opapi.so`
 under `$ASCEND_CUSTOM_OPP_PATH` or an `$ASCEND_OPP_PATH/vendors` entry rather
-than in `libopapi.so`. `common/aclnn_runtime.cpp` searches those first, in the
+than in `libopapi.so`. `common/runtime/aclnn_runtime.cpp` searches those first, in the
 same order `csrc/aclnn_torch_adapter/op_api_common.h` does, so a symbol resolves
 here to the implementation `torch_npu` would have called.
 
@@ -736,10 +774,10 @@ brief scoped. [COVERAGE.md](COVERAGE.md) has the full gap list.
 
 ## Adding a kernel
 
-1. Declare the operator in `common/aclnn_ops.hpp` with a `mirrors:` comment
+1. Declare the operator in `common/runtime/aclnn_ops.hpp` with a `mirrors:` comment
    naming the `torch_npu` entry point and the vllm-ascend call site, and add it
    to `ProbeAllOperators`.
-2. Add a reference to `common/cpu_reference.{hpp,cpp}`.
+2. Add a reference to `common/reference/cpu_reference.{hpp,cpp}`.
 3. Add `kernels/test_<name>_310p.cpp` with host-only reference tests plus the
    device parity tests.
 4. Append the binary name to `VLLM_ASCEND_KERNEL_TESTS` in `CMakeLists.txt`.

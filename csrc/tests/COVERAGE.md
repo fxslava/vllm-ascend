@@ -29,7 +29,7 @@ handling in the slot mapping.
 | Paged attention decode | `test_paged_attention_310p` | 14, **all skipped** | — | — |
 
 Every device case compares against a naive fp32 CPU reference in
-`common/cpu_reference.cpp`, on inputs pre-rounded to fp16 so the device and the
+`common/reference/cpu_reference.cpp`, on inputs pre-rounded to fp16 so the device and the
 reference start from bit-identical values.
 
 The 14 paged-attention decode cases are unconditional `GTEST_SKIP`s:
@@ -255,7 +255,7 @@ computes the right answer*. Neither substitutes for the other.
 ## 6. Recommended next steps, in priority order
 
 1. **Decode attention.** Wire `aclnnIncreFlashAttentionV4` (the verified
-   prototype is in `common/aclnn_ops.hpp`) or link `libatb.so` for
+   prototype is in `common/runtime/aclnn_ops.hpp`) or link `libatb.so` for
    `atb::PagedAttentionOperation`. 14 skipped cases and the most arithmetically
    complex kernel in the path.
 2. **`slot_mapping = -1`.** One additional C++ case, mirroring
@@ -308,7 +308,7 @@ What the 950PR leg adds that has no 310P counterpart at all:
   silicon, and the AIV-only performance baseline. Nothing on the 310P leg is
   comparable, and the whole leg is reviewed in
   [TURBOQUANT_TESTS.md](TURBOQUANT_TESTS.md) rather than summarised here.
-- **Custom operator resolution.** `common/aclnn_runtime.cpp` now searches
+- **Custom operator resolution.** `common/runtime/aclnn_runtime.cpp` now searches
   `libcust_opapi.so` under `$ASCEND_CUSTOM_OPP_PATH` and the
   `$ASCEND_OPP_PATH/vendors` entries before `libopapi.so`, in the same order
   `csrc/aclnn_torch_adapter/op_api_common.h` does. Without it none of the

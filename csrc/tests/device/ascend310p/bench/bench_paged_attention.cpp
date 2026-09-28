@@ -77,7 +77,7 @@ std::string CaseName(const KvConfiguration& configuration, int64_t block_size, i
 void BuildSuite(BenchmarkRunner& runner) {
   runner.Skip("paged attention decode",
               "aclnnPagedAttention is not provided by CANN 9.1.0; torch_npu._npu_paged_attention is backed by "
-              "ATB (libatb.so), which the aclnn launch path cannot drive. See csrc/tests/common/aclnn_ops.hpp "
+              "ATB (libatb.so), which the aclnn launch path cannot drive. See csrc/tests/common/runtime/aclnn_ops.hpp "
               "for the verified aclnnIncreFlashAttentionV4 prototype and what wiring it would take.");
 
   const AclnnOp& op = ScatterPaKvCacheOp();

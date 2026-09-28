@@ -14,57 +14,25 @@
  * limitations under the License.
  */
 
+// The 950PR-specific RMSNorm checks. The parameterised aclnnRmsNorm sweep and
+// the CPU-reference checks are shared with the 310P leg - this binary also
+// compiles common/testing/test_rmsnorm_sweep.cpp (see CMakeLists.txt); this
+// file keeps only what is specific to this part: the layer widths this
+// pipeline launches, and the SoC-name gate the harness skips on.
+
 #include <gtest/gtest.h>
 
-#include <cmath>
-#include <sstream>
+#include <cstdint>
 #include <string>
-#include <tuple>
 #include <vector>
 
-#include "aclnn_ops.hpp"
-#include "aclnn_runtime.hpp"
 #include "ascend950_shapes.hpp"
-#include "cpu_reference.hpp"
-#include "device_tensor.hpp"
-#include "op_test_fixture.hpp"
-#include "random_data.hpp"
-#include "tensor_compare.hpp"
-#include "test_harness.hpp"
 
 namespace vllm_ascend {
 namespace test {
 namespace {
 
 namespace s = shapes950;
-
-struct RmsNormResult {
-  std::vector<float> y;
-  std::vector<float> rstd;
-};
-
-const AclnnOp& RmsNormOp() {
-  static const AclnnOp op(ops::kRmsNorm);
-  return op;
-}
-
-RmsNormResult RunRmsNormOnDevice(const std::vector<float>& x, const std::vector<float>& gamma, int64_t num_tokens,
-                                 int64_t hidden, float epsilon) {
-  aclrtStream stream = AscendTestEnvironment::Instance().stream();
-
-  DeviceTensor x_device = DeviceTensor::Half({num_tokens, hidden}, x);
-  DeviceTensor gamma_device = DeviceTensor::Half({hidden}, gamma);
-  DeviceTensor y_device = DeviceTensor::HalfEmpty({num_tokens, hidden});
-  DeviceTensor rstd_device = DeviceTensor::FloatEmpty({num_tokens, 1});
-
-  RunAclnn<ops::RmsNormWorkspaceFn>(RmsNormOp(), stream, x_device.get(), gamma_device.get(),
-                                    static_cast<double>(epsilon), y_device.get(), rstd_device.get());
-
-  RmsNormResult result;
-  result.y = y_device.ToFloatFromHalf();
-  result.rstd = rstd_device.ToFloat();
-  return result;
-}
 
 TEST(RmsNorm950PrShapes, LayerWidthsAreBurstAligned) {
   EXPECT_EQ(s::kHidden % s::kFp16ElementsPerBurst, 0);
@@ -84,74 +52,6 @@ TEST(RmsNorm950PrSocGate, AcceptsEvery950PrBinAndNothingElse) {
   EXPECT_FALSE(s::IsAscend950PrSocName("Ascend950"));
   EXPECT_FALSE(s::IsAscend950PrSocName(""));
 }
-
-class RmsNorm950PrTest : public ::testing::TestWithParam<std::tuple<int64_t, int64_t>> {
- protected:
-  int64_t num_tokens() const { return std::get<0>(GetParam()); }
-  int64_t hidden() const { return std::get<1>(GetParam()); }
-};
-
-TEST_P(RmsNorm950PrTest, MatchesCpuReference) {
-  REQUIRE_ASCEND_950PR();
-  REQUIRE_ACLNN_OP(RmsNormOp());
-
-  DeterministicRandom random(0x5157454eu);
-
-  const std::vector<float> x = random.NormalHalfExact(static_cast<size_t>(num_tokens() * hidden()), 0.0f, 1.0f);
-  const std::vector<float> gamma = random.NormalHalfExact(static_cast<size_t>(hidden()), 1.0f, 0.1f);
-
-  const RmsNormResult actual = RunRmsNormOnDevice(x, gamma, num_tokens(), hidden(), s::kRmsNormEps);
-
-  std::vector<float> expected_y;
-  std::vector<float> expected_rstd;
-  reference::RmsNorm(x, gamma, num_tokens(), hidden(), s::kRmsNormEps, &expected_y, &expected_rstd);
-
-  EXPECT_HALF_TENSORS_ALLCLOSE(actual.y, expected_y);
-  EXPECT_HALF_TENSORS_ALLCLOSE(actual.rstd, expected_rstd);
-}
-
-TEST_P(RmsNorm950PrTest, IsInvariantToRowScaling) {
-  REQUIRE_ASCEND_950PR();
-  REQUIRE_ACLNN_OP(RmsNormOp());
-
-  DeterministicRandom random(0x524d534eu);
-
-  const std::vector<float> x = random.NormalHalfExact(static_cast<size_t>(num_tokens() * hidden()), 0.0f, 1.0f);
-  const std::vector<float> gamma(static_cast<size_t>(hidden()), 1.0f);
-
-  std::vector<float> scaled(x.size());
-  for (size_t i = 0; i < x.size(); ++i) {
-    scaled[i] = HalfBitsToFloat(FloatToHalfBits(x[i] * 4.0f));
-  }
-
-  const RmsNormResult base = RunRmsNormOnDevice(x, gamma, num_tokens(), hidden(), s::kRmsNormEps);
-  const RmsNormResult scaled_result = RunRmsNormOnDevice(scaled, gamma, num_tokens(), hidden(), s::kRmsNormEps);
-
-  EXPECT_TENSORS_ALLCLOSE(scaled_result.y, base.y, kFp16DefaultTolerance);
-}
-
-TEST_P(RmsNorm950PrTest, HandlesNearZeroRowsWithoutBlowingUp) {
-  REQUIRE_ASCEND_950PR();
-  REQUIRE_ACLNN_OP(RmsNormOp());
-
-  const std::vector<float> x(static_cast<size_t>(num_tokens() * hidden()), 0.0f);
-  const std::vector<float> gamma(static_cast<size_t>(hidden()), 1.0f);
-
-  const RmsNormResult actual = RunRmsNormOnDevice(x, gamma, num_tokens(), hidden(), s::kRmsNormEps);
-
-  for (size_t i = 0; i < actual.y.size(); ++i) {
-    ASSERT_TRUE(std::isfinite(actual.y[i])) << "non-finite output at index " << i;
-    EXPECT_NEAR(actual.y[i], 0.0f, 1e-6f) << "at index " << i;
-  }
-  for (size_t i = 0; i < actual.rstd.size(); ++i) {
-    ASSERT_TRUE(std::isfinite(actual.rstd[i])) << "non-finite rstd at index " << i;
-  }
-}
-
-INSTANTIATE_TEST_SUITE_P(Qwen35, RmsNorm950PrTest,
-                         ::testing::Combine(::testing::ValuesIn(s::TokenCounts()),
-                                            ::testing::ValuesIn(s::RmsNormHiddenSizes())),
-                         op_case::TupleName("tokens", "hidden"));
 
 }  // namespace
 }  // namespace test

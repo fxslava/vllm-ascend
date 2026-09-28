@@ -37,6 +37,9 @@ inline constexpr int64_t kRotaryModeInterleave = 1;
 inline constexpr int64_t kRotaryModeQuarter = 2;
 inline constexpr int64_t kRotaryModeInterleaveHalf = 3;
 
+// Withdrawn on Ascend950 and deliberately absent from ProbeAscend950Operators();
+// still declared because the sim decode's control leg and the end-to-end golden
+// layer test launch it and compare against it.
 using FusedInferAttentionScoreV2WorkspaceFn = int (*)(
     const aclTensor* query, const aclTensorList* key, const aclTensorList* value, const aclTensor* pse_shift,
     const aclTensor* atten_mask, const aclIntArray* actual_seq_lengths, const aclIntArray* actual_seq_lengths_kv,

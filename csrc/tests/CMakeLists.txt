@@ -299,7 +299,7 @@ set(ASCEND_LIB_DIRS
 
 # ascendcl is the only hard link-time dependency: aclInit, aclrtMalloc, the
 # stream API. Everything in the aclnn op-api is resolved with dlopen/dlsym at
-# runtime (see common/aclnn_runtime.cpp), which keeps a CANN release that
+# runtime (see common/runtime/aclnn_runtime.cpp), which keeps a CANN release that
 # renamed an operator from breaking the whole binary.
 find_library(ASCEND_CL_LIBRARY NAMES ascendcl PATHS ${ASCEND_LIB_DIRS} NO_DEFAULT_PATH)
 if(NOT ASCEND_CL_LIBRARY)
@@ -310,7 +310,7 @@ endif()
 # CANN install is reported at configure time rather than from inside a test, but
 # nothing here calls into them directly: libopapi.so (and the constructors it
 # re-exports from libnnopbase.so) is opened with dlopen/dlsym at runtime by
-# common/aclnn_runtime.cpp, and libacl_op_compiler.so is only needed by the
+# common/runtime/aclnn_runtime.cpp, and libacl_op_compiler.so is only needed by the
 # graph-compile path this suite does not use.
 #
 # Keeping them off the link line means the binaries carry one CANN DT_NEEDED
@@ -394,24 +394,33 @@ enable_testing()
 #
 # Sources that touch neither acl.h nor any CANN library, collected into their own
 # library so the binaries built from them carry no DT_NEEDED entry for
-# libascendcl.so and link on a machine with no toolkit. common/cpu_reference.cpp
-# and common/golden_layer3.cpp are already pure host code; keeping them out of
+# libascendcl.so and link on a machine with no toolkit. common/reference/ and
+# common/models/ are already pure host code; keeping them out of
 # vllm_ascend_test_common here rather than reusing that target is what makes the
 # independence real instead of accidental.
 
 # The dump the golden tests read. Defined before the 950PR block because the
 # host-only fidelity report needs it too; QWEN_GOLDEN_LAYER3_DIR overrides it at
 # run time. The files are tracked with Git LFS and the loader recognises an
-# unfetched pointer and skips - see common/golden_layer3.cpp.
+# unfetched pointer and skips - see common/models/qwen/golden_layer3.cpp.
 set(VLLM_ASCEND_GOLDEN_LAYER3_DIR "${CMAKE_CURRENT_SOURCE_DIR}/data/golden_layer3")
 
 add_library(vllm_ascend_test_host STATIC
-  common/cpu_reference.cpp
-  common/golden_layer3.cpp)
+  common/reference/cpu_reference.cpp
+  common/models/qwen/golden_layer3.cpp)
 
+# common/ stays on the path so common/turboquant/ headers resolve; the
+# subdirectories carry the reorganised flat headers (common/runtime/... and
+# friends), so `#include "device_buffer.hpp"` keeps working from anywhere.
 target_include_directories(vllm_ascend_test_host
   PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/common"
+    "${CMAKE_CURRENT_SOURCE_DIR}/common/reference"
+    "${CMAKE_CURRENT_SOURCE_DIR}/common/testing"
+    "${CMAKE_CURRENT_SOURCE_DIR}/common/bench"
+    "${CMAKE_CURRENT_SOURCE_DIR}/common/models/shapes"
+    "${CMAKE_CURRENT_SOURCE_DIR}/common/models/qwen"
+    "${CMAKE_CURRENT_SOURCE_DIR}/common/models/hadamard"
     "${CMAKE_CURRENT_SOURCE_DIR}/reference")
 
 target_compile_definitions(vllm_ascend_test_host
@@ -597,22 +606,32 @@ if(NOT VLLM_ASCEND_TESTS_HOST_ONLY)
 # dlopen/dlsym operator loader, the hand-declared aclnn prototypes and the
 # benchmark harness.
 #
-# common/aclnn_ops.{hpp,cpp} is NOT a 310P file despite its history. It is the
-# suite's whole operator prototype table, and the 950PR tests read it too -
+# common/runtime/aclnn_ops.{hpp,cpp} is NOT a 310P file despite its history. It is
+# the suite's whole operator prototype table, and the 950PR tests read it too -
 # ops::kMatmul, ops::kRmsNorm, ops::kSwiGlu, ops::kScatterPaKvCache and
 # ops::kApplyRotaryPosEmbV2 are all resolved through it. It stays shared; what
 # the architecture isolation excludes is the 310P *targets*, in device/ascend310p/.
 
 add_library(vllm_ascend_test_common STATIC
-  common/test_harness.cpp
-  common/aclnn_runtime.cpp
-  common/aclnn_ops.cpp
-  common/cpu_reference.cpp
-  common/benchmark.cpp)
+  common/testing/test_harness.cpp
+  common/runtime/aclnn_runtime.cpp
+  common/runtime/aclnn_ops.cpp
+  common/reference/cpu_reference.cpp
+  common/bench/benchmark.cpp)
 
+# Every reorganised subdirectory is on the path, so the flat
+# `#include "aclnn_ops.hpp"` style used throughout the tiers keeps resolving
+# without a single callsite edit.
 target_include_directories(vllm_ascend_test_common
   PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/common"
+    "${CMAKE_CURRENT_SOURCE_DIR}/common/runtime"
+    "${CMAKE_CURRENT_SOURCE_DIR}/common/reference"
+    "${CMAKE_CURRENT_SOURCE_DIR}/common/testing"
+    "${CMAKE_CURRENT_SOURCE_DIR}/common/bench"
+    "${CMAKE_CURRENT_SOURCE_DIR}/common/models/shapes"
+    "${CMAKE_CURRENT_SOURCE_DIR}/common/models/qwen"
+    "${CMAKE_CURRENT_SOURCE_DIR}/common/models/hadamard"
     "${ASCEND_HOME_PATH}/include")
 
 target_link_directories(vllm_ascend_test_common PUBLIC ${ASCEND_LIB_DIRS})
@@ -647,9 +666,9 @@ target_link_options(vllm_ascend_test_common PUBLIC -Wl,--gc-sections -Wl,--as-ne
 
 if(VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE)
   add_library(vllm_ascend_test_common_950pr STATIC
-    common/aclnn_ops_950pr.cpp
-    common/golden_layer3.cpp
-    common/partial_rotary_950pr.cpp)
+    common/runtime/aclnn_ops_950pr.cpp
+    common/models/qwen/golden_layer3.cpp
+    common/models/qwen/partial_rotary_950pr.cpp)
 
   target_link_libraries(vllm_ascend_test_common_950pr PUBLIC vllm_ascend_test_common)
 
@@ -657,7 +676,7 @@ if(VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE)
     PUBLIC VLLM_ASCEND_GOLDEN_LAYER3_DIR="${VLLM_ASCEND_GOLDEN_LAYER3_DIR}")
 
   # libcust_opapi.so, where the kernels built out of csrc/ live, is opened with
-  # dlopen at run time by common/aclnn_runtime.cpp - it is found through
+  # dlopen at run time by common/runtime/aclnn_runtime.cpp - it is found through
   # ASCEND_CUSTOM_OPP_PATH or the vendors config, not through a link line, so
   # there is deliberately nothing to link here. The lookup below only reports
   # whether one is visible at configure time, so a run that skips the custom
@@ -704,10 +723,10 @@ if(VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE)
         # and it rides in this library rather than one of its own because a
         # <<<>>> call site can only reach a kernel whose generated launcher is
         # in the same ascendc_library. Nothing in csrc/attention/ includes it.
-        # It lives in common/ because both tiers drive it - sim/ at one shape,
-        # device/ over the whole sweep - beside the common/hadamard_spike.hpp
-        # that declares its launchers.
-        "${CMAKE_CURRENT_SOURCE_DIR}/common/hadamard_spike_kernels.cpp")
+        # It lives in common/models/hadamard/ because both tiers drive it -
+        # sim/ at one shape, device/ over the whole sweep - beside the
+        # hadamard_spike.hpp that declares its launchers.
+        "${CMAKE_CURRENT_SOURCE_DIR}/common/models/hadamard/hadamard_spike_kernels.cpp")
 
     foreach(kernel_source ${VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE})
       if(NOT EXISTS "${kernel_source}")

@@ -14,20 +14,16 @@
  * limitations under the License.
  */
 
-// WHAT IS STILL NOT PRICED: the fp32 -> fp16 narrowing between
-// npu_turboquant_rotate_q and the native FIA, whose modelled bytes the CSV
-// carries as untimed_cast_bytes; and the kUnwrittenSentinel poisoning of
-// query_dec_prologue_rot_ between rotation-mode agreement runs, which is what
-// lets CompareRotationModes count untouched words.
-//
 // The sweep, traffic and leg model lives in common/turboquant_audit_scenario,
 // the tables and CSV exporters in common/turboquant_audit_report; this file is
 // the device side: buffers, planned native operators, launches, timing.
+// Correctness is the correctness tier's job - this file measures throughput and
+// latency, and the only equality it checks between launches is the gather
+// expand's, which primes its own legs.
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <functional>
 #include <memory>
 #include <sstream>
@@ -44,7 +40,6 @@
 #include "device_buffer.hpp"
 #include "fp16.hpp"
 #include "random_data.hpp"
-#include "turbo_quant_cpu.h"
 #include "turboquant/turboquant_launch.hpp"
 #include "turboquant/turboquant_audit_models.hpp"
 #include "turboquant/turboquant_audit_scenario.hpp"
@@ -118,20 +113,10 @@ constexpr double kHbmBudget = 0.85;
 
 constexpr size_t kExactContextElements = 1u << 22;
 
-constexpr double kRotatedBasisMinCosine = 0.999;
-constexpr double kDecodeTiePointMinCosine = 0.99;
-// The two rotation modes decode the same cache; only rotate_q's Cube rounding (B >= 2) may separate them.
-constexpr double kRotationModeMinCosine = 0.9999;
-constexpr float kUnwrittenSentinel = -1234.5f;
-
 constexpr int kPipelineBatch = 1;
 
 const AclnnOp& FiaV5() {
   static const AclnnOp op(ops950::kFusedInferAttentionScoreV5);
-  return op;
-}
-const AclnnOp& FiaV2() {
-  static const AclnnOp op(ops950::kFusedInferAttentionScoreV2);
   return op;
 }
 const AclnnOp& ScatterPaKvCacheOp() {
@@ -152,7 +137,7 @@ class Scenario {
       return static_cast<size_t>(a) * static_cast<size_t>(b) * static_cast<size_t>(c);
     };
 
-    exact_context_ = elems(context, hkv, d) <= kExactContextElements;
+    const bool exact_context = elems(context, hkv, d) <= kExactContextElements;
 
     DeterministicRandom rng(0xA53Du +
                             static_cast<uint32_t>(config.seq_len + 7 * config.batch + 31 * d + 127 * hq + 509 * hkv));
@@ -274,7 +259,7 @@ class Scenario {
     const size_t cache_elements = elems(pool_blocks * kBlockSize, hkv, d);
     fp16_key_cache_ = DeviceBuffer::Empty<Half>(cache_elements, kBenchmarkAlignBytes);
     fp16_value_cache_ = DeviceBuffer::Empty<Half>(cache_elements, kBenchmarkAlignBytes);
-    if (exact_context_) {
+    if (exact_context) {
       const size_t row = static_cast<size_t>(hkv * d);
       const std::vector<float> key_host = HostTiled(key_pattern, elems(context, hkv, d));
       const std::vector<float> value_host = HostTiled(value_pattern, elems(context, hkv, d));
@@ -425,38 +410,6 @@ class Scenario {
   // One launch: the in-launch output stage leaves nothing to follow it.
   void EnqueueDecodeFusedQE2E(aclrtStream stream) const { EnqueueDecodeFusedQ(stream); }
 
-  // Both rotation modes over the same cache: the in-launch rotation against rotate_q's word for word, and the
-  // two decode outputs in the basis the step hands on (after rotate_o, unfolded) against each other. The two
-  // rotations stage the Cube under different rules, so only the outputs are held to a bound.
-  struct RotationAgreement {
-    size_t rotated_words = 0;
-    size_t word_mismatches = 0;
-    double output_cosine = 0.0;
-  };
-
-  RotationAgreement CompareRotationModes(aclrtStream stream) {
-    EnqueueDecodeE2E(stream);
-    ACL_CHECK(aclrtSynchronizeStream(stream));
-    const std::vector<float> separate_rot = query_dec_rot_.ToHost<float>();
-    const std::vector<float> separate_out =
-        config_.model.folds_output ? DecodeTqOutput() : out_dec_rot_.ToHost<float>();
-
-    const std::vector<float> unwritten(separate_rot.size(), kUnwrittenSentinel);
-    query_dec_prologue_rot_.CopyFromHost(unwritten.data(), unwritten.size() * sizeof(float));
-    EnqueueDecodeFusedQ(stream);
-    ACL_CHECK(aclrtSynchronizeStream(stream));
-    const std::vector<float> fused_rot = query_dec_prologue_rot_.ToHost<float>();
-
-    RotationAgreement agreement;
-    agreement.rotated_words = separate_rot.size();
-    for (size_t i = 0; i < separate_rot.size(); ++i) {
-      agreement.word_mismatches +=
-          (i >= fused_rot.size() || std::memcmp(&separate_rot[i], &fused_rot[i], sizeof(float)) != 0) ? 1u : 0u;
-    }
-    agreement.output_cosine = turboquant_ref::cpu_fidelity(DecodeTqOutput(), separate_out).cosine_similarity;
-    return agreement;
-  }
-
   void EnqueueDecodeAttnCore(aclrtStream stream) const {
     if (config_.path == PathMode::kCube) {
       EnqueueDecodeFusedCube(stream);
@@ -516,7 +469,6 @@ class Scenario {
   bool prefill_available() const { return fia_prefill_rotated_ != nullptr && fia_prefill_native_ != nullptr; }
   bool decode_available() const { return fia_decode_native_ != nullptr; }
   bool native_write_available() const { return native_write_ != nullptr; }
-  bool exact_context() const { return exact_context_; }
   const std::string& fia_operator() const { return fia_operator_; }
   const std::string& fia_note() const { return fia_note_; }
   const std::string& native_write_note() const { return native_write_note_; }
@@ -542,11 +494,6 @@ class Scenario {
   double DecodePipelineChecksum() const {
     return config_.model.folds_output ? DecodeTqChecksum() : DecodeRotatedOutChecksum();
   }
-
-  std::vector<float> PrefillTqOutput() const { return HalfToFloat(out_pf_tq_.ToHost<Half>()); }
-  std::vector<float> PrefillNativeOutput() const { return HalfToFloat(out_pf_v5_.ToHost<Half>()); }
-  std::vector<float> DecodeTqOutput() const { return HalfToFloat(out_dec_tq_.ToHost<Half>()); }
-  std::vector<float> DecodeNativeOutput() const { return HalfToFloat(out_dec_v5_.ToHost<Half>()); }
 
  private:
   static constexpr tqm::TurboQuantMode kCubeMode = tqm::TurboQuantMode::KV4_FP8;
@@ -678,18 +625,6 @@ class Scenario {
     } catch (const AclError& error) {
       AppendNote(std::string(ops950::kFusedInferAttentionScoreV5) + " (prompt role): " + error.what());
     }
-    try {
-      std::unique_ptr<PlannedOp> planned(new PlannedOp(PlanAclnn<ops950::FusedInferAttentionScoreV2WorkspaceFn>(
-          FiaV2(), query, key_list, value_list, nullptr, mask_tensor_->get(), prefill_seq_q_->get(),
-          prefill_seq_kv_->get(), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-          nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, hq, scale, s950::kFiaUnboundedTokens,
-          s950::kFiaUnboundedTokens, const_cast<char*>(ops950::kFiaLayoutTnd), hkv, kFiaSparseModeRightDownCausal,
-          s950::kFiaInnerPreciseDefault, kFiaNoPaging, 0, false, 0, 0, out, lse)));
-      RecordOperator(ops950::kFusedInferAttentionScoreV2);
-      return planned;
-    } catch (const AclError& error) {
-      AppendNote(std::string(ops950::kFusedInferAttentionScoreV2) + " (prompt role): " + error.what());
-    }
     return nullptr;
   }
 
@@ -711,19 +646,6 @@ class Scenario {
     } catch (const AclError& error) {
       AppendNote(std::string(ops950::kFusedInferAttentionScoreV5) + " (incremental role): " + error.what());
     }
-    try {
-      std::unique_ptr<PlannedOp> planned(new PlannedOp(PlanAclnn<ops950::FusedInferAttentionScoreV2WorkspaceFn>(
-          FiaV2(), query_dec_tnd_->get(), fp16_key_list_->get(), fp16_value_list_->get(), nullptr, nullptr,
-          decode_seq_q_->get(), decode_seq_kv_->get(), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-          block_table_tensor_->get(), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-          hq, scale, s950::kFiaUnboundedTokens, s950::kFiaUnboundedTokens, const_cast<char*>(ops950::kFiaLayoutTnd),
-          hkv, s950::kFiaSparseModeNone, s950::kFiaInnerPreciseDefault, kBlockSize, 0, false, 0, 0,
-          out_dec_v5_tensor_->get(), lse_dec_tensor_->get())));
-      RecordOperator(ops950::kFusedInferAttentionScoreV2);
-      return planned;
-    } catch (const AclError& error) {
-      AppendNote(std::string(ops950::kFusedInferAttentionScoreV2) + " (incremental role): " + error.what());
-    }
     return nullptr;
   }
 
@@ -741,7 +663,6 @@ class Scenario {
 
   Config config_;
   int64_t aiv_num_ = 0;
-  bool exact_context_ = false;
   int64_t num_splits_ = 1;
   size_t workspace_floats_ = 0;
 
@@ -841,24 +762,6 @@ class RunnerSet {
   std::vector<BenchmarkRunner*> runners_;
 };
 
-double RotatedBasisCosine(const Scenario& scenario, const Config& config, aclrtStream stream) {
-  scenario.EnqueuePrefillAttnCore(stream);
-  scenario.EnqueuePrefillNative(stream);
-  ACL_CHECK(aclrtSynchronizeStream(stream));
-  const std::vector<float> plain = scenario.PrefillNativeOutput();
-  const std::vector<float> folded = tqh::UnrotateHeads(scenario.PrefillTqOutput(), config.model.head_size);
-  return turboquant_ref::cpu_fidelity(folded, plain).cosine_similarity;
-}
-
-double DecodeTiePointCosine(const Scenario& scenario, const Config& config, aclrtStream stream) {
-  scenario.EnqueueDecodeE2E(stream);
-  scenario.EnqueueDecodeNative(stream);
-  ACL_CHECK(aclrtSynchronizeStream(stream));
-  const std::vector<float> native = scenario.DecodeNativeOutput();
-  const std::vector<float> folded = tqh::UnrotateHeads(scenario.DecodeTqOutput(), config.model.head_size);
-  return turboquant_ref::cpu_fidelity(folded, native).cosine_similarity;
-}
-
 }  // namespace
 
 void BuildSuite(BenchmarkRunner& primary) {
@@ -886,23 +789,6 @@ void BuildSuite(BenchmarkRunner& primary) {
 
   const bool run_prefill = PhaseEnabled("prefill");
   const bool run_decode = PhaseEnabled("decode");
-
-  size_t basis_check = sweep.size();
-  size_t tie_point_check = sweep.size();
-  for (size_t index = 0; index < sweep.size(); ++index) {
-    const auto weight = [](const Config& config) {
-      return config.chunk_tokens() * config.model.num_heads * config.model.head_size;
-    };
-    if (basis_check == sweep.size() || weight(sweep[index]) < weight(sweep[basis_check])) {
-      basis_check = index;
-    }
-    const bool exact = static_cast<size_t>(sweep[index].context_tokens() * sweep[index].model.num_kv_heads *
-                                           sweep[index].model.head_size) <= kExactContextElements;
-    if (exact &&
-        (tie_point_check == sweep.size() || sweep[index].context_tokens() < sweep[tie_point_check].context_tokens())) {
-      tie_point_check = index;
-    }
-  }
 
   std::vector<tqa::Traffic> traffic;
   traffic.reserve(sweep.size());
@@ -968,54 +854,6 @@ void BuildSuite(BenchmarkRunner& primary) {
     } catch (const std::exception& error) {
       runners.Fail(CaseName("fill", config), error.what());
       continue;
-    }
-
-    if (index == basis_check && scenario->prefill_available()) {
-      try {
-        const double cosine = RotatedBasisCosine(*scenario, config, runner.stream());
-        std::printf(
-            "[ascend-bench]   rotated-basis identity: FIA(Q~,K~,V~) un-rotated vs FIA(Q,K,V), "
-            "cos = %.9f (bound %.4f)\n",
-            cosine, kRotatedBasisMinCosine);
-        if (!(cosine > kRotatedBasisMinCosine)) {
-          runners.Fail(CaseName("rotated_basis_identity", config),
-                       "attention in the rotated basis does not un-rotate to attention in the plain one");
-        }
-      } catch (const std::exception& error) {
-        runners.Fail(CaseName("rotated_basis_identity", config), error.what());
-      }
-    }
-    if (index == tie_point_check && scenario->decode_available() && scenario->exact_context()) {
-      try {
-        const double cosine = DecodeTiePointCosine(*scenario, config, runner.stream());
-        std::printf(
-            "[ascend-bench]   decode tie-point: TurboQuant un-rotated vs native V5 over the same "
-            "context, cos = %.6f (bound %.2f)\n",
-            cosine, kDecodeTiePointMinCosine);
-        if (!(cosine > kDecodeTiePointMinCosine)) {
-          runners.Fail(CaseName("decode_tie_point", config),
-                       "the TurboQuant decode and the native decode are not attending over the same context");
-        }
-      } catch (const std::exception& error) {
-        runners.Fail(CaseName("decode_tie_point", config), error.what());
-      }
-    }
-    // Every configuration that times the raw-query decode first checks it against the pre-rotated one: the
-    // raw entry had executed on the camodel at B = 1, D = 256 only.
-    if (run_decode && config.decodes_in_mode(RotationMode::kFusedPrologue)) {
-      try {
-        const Scenario::RotationAgreement agreement = scenario->CompareRotationModes(runner.stream());
-        std::printf(
-            "[ascend-bench]   rotation modes: the in-launch rotation differs from rotate_q in %zu of %zu "
-            "fp32 words; decode outputs agree to cos = %.9f (bound %.4f)\n",
-            agreement.word_mismatches, agreement.rotated_words, agreement.output_cosine, kRotationModeMinCosine);
-        if (!(agreement.output_cosine > kRotationModeMinCosine)) {
-          runners.Fail(CaseName("rotation_mode_agreement", config),
-                       "the raw-query decode does not reproduce the pre-rotated decode");
-        }
-      } catch (const std::exception& error) {
-        runners.Fail(CaseName("rotation_mode_agreement", config), error.what());
-      }
     }
     std::fflush(stdout);
 

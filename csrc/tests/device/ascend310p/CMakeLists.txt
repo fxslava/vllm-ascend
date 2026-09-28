@@ -45,25 +45,38 @@
 
 set(VLLM_ASCEND_TEST_TIER_LABEL "device_310p")
 
-# Mirrors the root build's convention for v200 sources. Nothing in this suite
-# reads it today - csrc/torch_binding.cpp does, and that is not built here - but
-# it is scoped to this leg rather than to the shared library so a 950PR tree
-# never carries a define that claims it is a 310P.
+# Mirrors the root build's convention for v200 sources. The shared operator
+# sweep sources (common/testing/test_*_sweep.cpp) read it to pick their
+# REQUIRE_ASCEND_* gate; everything else in the suite ignores it, and it is
+# scoped to this leg so a 950PR tree never carries a define that claims it is a
+# 310P.
 add_compile_definitions(ASCEND_PLATFORM_310P)
 
-# <binary name>:<source file under this directory, without the extension>.
+# <binary name>:<source file under this directory, without the extension>
+# [:<shared sweep source under common/testing, without the extension>].
+#
+# The third field names the SoC-neutral parameterised sweep (the launch helper,
+# the fixture and the TEST_P cases) this binary shares with its 950PR
+# counterpart; the leg file keeps only what is genuinely 310P-specific.
 set(VLLM_ASCEND_310P_TESTS
-  test_matmul_310p:correctness/test_matmul
-  test_rmsnorm_310p:correctness/test_rmsnorm
+  test_matmul_310p:correctness/test_matmul:test_matmul_sweep
+  test_rmsnorm_310p:correctness/test_rmsnorm:test_rmsnorm_sweep
   test_rotary_embedding_310p:correctness/test_rotary_embedding
-  test_activation_swiglu_310p:correctness/test_activation_swiglu
+  test_activation_swiglu_310p:correctness/test_activation_swiglu:test_swiglu_sweep
   test_paged_attention_310p:correctness/test_paged_attention)
 
 foreach(entry ${VLLM_ASCEND_310P_TESTS})
   string(REPLACE ":" ";" name_and_source "${entry}")
   list(GET name_and_source 0 test_name)
   list(GET name_and_source 1 source_name)
-  vllm_ascend_add_device_executable(${test_name} "${source_name}.cpp" ../../common/main.cpp)
+  set(extra_sources)
+  list(LENGTH name_and_source entry_field_count)
+  if(entry_field_count GREATER 2)
+    list(GET name_and_source 2 shared_source)
+    list(APPEND extra_sources "../../common/testing/${shared_source}.cpp")
+  endif()
+  vllm_ascend_add_device_executable(${test_name} "${source_name}.cpp" ../../common/testing/main.cpp
+                                    ${extra_sources})
   vllm_ascend_register_correctness_test(${test_name})
 endforeach()
 
@@ -83,7 +96,7 @@ if(VLLM_ASCEND_TESTS_BUILD_BENCHMARKS)
     string(REPLACE ":" ";" name_and_source "${entry}")
     list(GET name_and_source 0 bench_name)
     list(GET name_and_source 1 source_name)
-    vllm_ascend_add_device_executable(${bench_name} "${source_name}.cpp" ../../common/bench_main.cpp)
+    vllm_ascend_add_device_executable(${bench_name} "${source_name}.cpp" ../../common/bench/bench_main.cpp)
     add_dependencies(benchmarks ${bench_name})
 
     add_test(NAME ${bench_name} COMMAND ${bench_name})

@@ -342,14 +342,14 @@ class PagedAttention310PTest : public ::testing::TestWithParam<DecodeCase> {};
 TEST_P(PagedAttention310PTest, MatchesCpuReference) {
   GTEST_SKIP() << "aclnnPagedAttention is not provided by CANN 9.1.0; "
                   "torch_npu._npu_paged_attention is backed by ATB (libatb.so). "
-                  "See csrc/tests/common/aclnn_ops.hpp for the verified "
+                  "See csrc/tests/common/runtime/aclnn_ops.hpp for the verified "
                   "aclnnIncreFlashAttentionV4 prototype and what it would take.";
 }
 
 TEST_P(PagedAttention310PTest, AttendsOnlyWithinTheContextLength) {
   GTEST_SKIP() << "aclnnPagedAttention is not provided by CANN 9.1.0; "
                   "torch_npu._npu_paged_attention is backed by ATB (libatb.so). "
-                  "See csrc/tests/common/aclnn_ops.hpp for the verified "
+                  "See csrc/tests/common/runtime/aclnn_ops.hpp for the verified "
                   "aclnnIncreFlashAttentionV4 prototype and what it would take.";
 }
 

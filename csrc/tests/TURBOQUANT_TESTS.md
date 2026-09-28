@@ -128,7 +128,7 @@ Two deliberate decisions inside that isolation:
   name; they already carry their part in the name; and they are unreachable from
   a 950PR build, so nothing can collide. What the isolation needed was a
   directory and a configure-time gate, not a rename.
-- **`common/aclnn_ops.{hpp,cpp}` is *not* a 310P file** despite its history and
+- **`common/runtime/aclnn_ops.{hpp,cpp}` is *not* a 310P file** despite its history and
   is deliberately still shared. It is the suite's whole operator prototype
   table, and the 950PR tests read it too — `ops::kMatmul`, `ops::kRmsNorm`,
   `ops::kSwiGlu`, `ops::kScatterPaKvCache` and `ops::kApplyRotaryPosEmbV2` all
@@ -487,15 +487,15 @@ argument list:
 | **prompt** | 3 (right-down causal) | 2048×2048 compressed `int8` | contiguous TND | 0 — no paging | cumulative over `C` / cumulative over `S` |
 | **incremental** | 0 | none | paged pool as a 1-entry `aclTensorList` + block table | 128 | cumulative query tokens / context length **per sequence** |
 
-`aclnnFusedInferAttentionScoreV2` remains the fallback, and every table names the
-operator that actually planned.
+The V2 fallback the leg once carried is gone: the planner asks only for V5, and every
+table names the operator that actually planned.
 
 Guessing a prototype for the two symbols that were asked for was considered and
 rejected. A hand-declared argument list behind `dlsym` that does not match the
 operator is undefined behaviour **at launch**, not a planning refusal — it takes
 the stream down and every case queued behind it. This suite's rule is that every
 `aclnn` prototype is transcribed from a header it can point at; see §8 and
-`common/aclnn_ops_950pr.hpp`.
+`common/runtime/aclnn_ops_950pr.hpp`.
 
 #### The accounting
 
@@ -740,7 +740,7 @@ read without its banner.
 | `ASCEND_BENCH_TQ_AUDIT_DECODE_CSV` | unset | Table B as a CSV |
 | `ASCEND_BENCH_TQ_FIA` | on | `0` drops every native V5 leg |
 
-plus the shared `ASCEND_BENCH_*` set (`common/benchmark.hpp`). Note that
+plus the shared `ASCEND_BENCH_*` set (`common/bench/benchmark.hpp`). Note that
 `ASCEND_BENCH_MODES` selects **three** timing modes by default and each is a full
 warmup-plus-iterations run: on the ultra-long rows that is the difference between
 minutes and tens of minutes. `pipeline_batch` is pinned to 1 regardless of
@@ -1070,10 +1070,14 @@ The whole V1..V4 family is withdrawn on this part, so every `fp16_decode_s*` cas
 skipped and the `fp16 us` and `speedup` columns came out empty.
 
 **The fix.** `aclnnFusedInferAttentionScoreV5` is what replaces the family. The
-benchmark now resolves **V5 first and keeps V2 as the fallback**, so the same
-source works on a CANN release that predates V5 and on any part where V2 still
-exists; the report names whichever one it used, and prints why the column is
-empty when neither resolves.
+benchmark first resolved **V5 and kept V2 as the fallback**, so the same source
+worked on a CANN release that predates V5 and on any part where V2 still
+exists; the report named whichever one it used, and printed why the column is
+empty when neither resolves. (The V2 fallback leg has since been deleted: on
+every part this suite targets, V2 is exactly the withdrawn interface described
+above, so the fallback existed only to plan a refusal. The sim decode's control
+leg and the end-to-end golden test still launch V2 and compare against it, so
+its declaration stays in `common/runtime/aclnn_ops_950pr.hpp`.)
 
 **What V5 adds over V2** — seven optional inputs after
 `actualSharedPrefixLenOptional`, and two `int64_t` scalars after
@@ -1095,7 +1099,7 @@ two legs' numbers comparable at all.
 
 The prototype is transcribed from
 `$ASCEND_TOOLKIT_HOME/include/aclnnop/aclnn_fused_infer_attention_score_v5.h`
-into `common/aclnn_ops_950pr.hpp` and, like every declaration in that file, is
+into `common/runtime/aclnn_ops_950pr.hpp` and, like every declaration in that file, is
 resolved with `dlsym` rather than linked — **so the compiler cannot check it**.
 A mismatch surfaces as a non-zero planning status with the CANN diagnostic
 attached, not as corruption.
@@ -2508,8 +2512,8 @@ reason forward from the share.
 
 | artefact | what it is |
 |---|---|
-| `csrc/tests/common/hadamard_spike.hpp` | host helpers: `Hadamard16Half`, `EarlyStageTables`, chunk sizing, `HadamardDualDstApplies` |
-| `csrc/tests/common/hadamard_spike_kernels.cpp` | 954 lines. AIV-batched butterfly **and** Cube-factorised variants, double-buffered across kSlots |
+| `csrc/tests/common/models/hadamard/hadamard_spike.hpp` | host helpers: `Hadamard16Half`, `EarlyStageTables`, chunk sizing, `HadamardDualDstApplies` |
+| `csrc/tests/common/models/hadamard/hadamard_spike_kernels.cpp` | 954 lines. AIV-batched butterfly **and** Cube-factorised variants, double-buffered across kSlots |
 | `csrc/tests/device/ascend950pr/bench/bench_cube_hadamard.cpp` | the silicon benchmark |
 | `hadamard_benchmark_results.csv` | 181 rows of real 950PR device measurements, 100 samples per case |
 | `csrc/attention/turboquant/turboquant_codec_950.h` | the shipping `ApplyPi` / `FastWalshHadamardTransform`, at `batchRows = 1` |
@@ -2569,7 +2573,7 @@ vectors of length L contiguously as `[B][L]`:
   must test the *per-vector* length, not the batched one.
 
 So: two loop bounds, a `batchRows` parameter threaded through `ApplyPi`, and
-longer tables. `common/hadamard_spike_kernels.cpp` already runs a batched butterfly
+longer tables. `common/models/hadamard/hadamard_spike_kernels.cpp` already runs a batched butterfly
 of this shape on both CAModel and silicon, so this is porting a proven form
 rather than inventing one.
 
