@@ -153,7 +153,9 @@ size_t ModePackedCacheBytes(tqm::TurboQuantMode mode, int64_t num_blocks, int64_
 int64_t ModeTableWords(tqm::TurboQuantMode mode, int64_t head_size, int64_t batch_rows) {
   const tqm::TurboQuantModeConfig cfg = tqm::TurboQuantModeConfigOf(mode);
   if (cfg.is_affine) {
-    return kFp32PerBlock;
+    // The shipping affine expand reads no table (ConstTableWords is 0 for it); the gather expand reads the
+    // levels and nothing else. Emitting them unconditionally keeps one image for both and costs 64 B.
+    return cfg.levels;
   }
   return 2 * head_size * batch_rows + 3 * kFp32PerBlock + head_size + cfg.levels;
 }
@@ -162,7 +164,13 @@ std::vector<int32_t> ModeTables(tqm::TurboQuantMode mode, int64_t head_size, int
   const ModePlanes planes = PlanesOf(mode);
   const tqm::TurboQuantModeConfig cfg = tqm::TurboQuantModeConfigOf(mode);
   if (cfg.is_affine) {
-    return std::vector<int32_t>(static_cast<size_t>(kFp32PerBlock), 0);
+    std::vector<int32_t> levels;
+    levels.reserve(static_cast<size_t>(cfg.levels));
+    const float *affine_centroids = CentroidsOf(mode);
+    for (int64_t level = 0; level < cfg.levels; ++level) {
+      levels.push_back(FloatBits(affine_centroids[level]));
+    }
+    return levels;
   }
   const int64_t d = head_size;
   const int64_t batch = d * batch_rows;

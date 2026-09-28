@@ -320,19 +320,25 @@ struct TurboQuantTaskHeads {
 // one wide op advances all heads, the same field is the block operand of a row op, and lane j * 8 still
 // holds head j's value for the per-task readers the two decodes share.
 //
-// BYPASS_UNPACK is the unpack ablation, and it is a measurement instrument, not a mode. It drops the
+// UNPACK selects the expand, and the two non-default variants are measurement instruments, not modes.
+// DecodeUnpack::kGatherLut swaps the per-plane Adds for a 16-entry UB Gather at identical traffic and
+// identical output (its table is the uniform grid), which prices Option C of
+// tests/research/QJL_3PLUS1_PHASE1.md. DecodeUnpack::kBypass is the ablation. It drops the
 // codec expand out of the ingest and stages the (zeroed, once, in Init) operand buffer into L1 instead.
 // Every other byte still moves: the MTE2 read of the packed plane, the MTE3 burst into L1, the Cube's
 // loads and MACs, and the whole softmax. What disappears is exactly the vector-pipe expand, so the delta
 // against the unablated leg is the unpack's cycle cost with its memory traffic held fixed. The output is
 // deterministic (all-zero scores) and numerically meaningless; nothing but a benchmark may instantiate it.
-template <TurboQuantMode MODE, typename scalar_t, typename Mm, typename Codec, bool BYPASS_UNPACK = false>
+template <TurboQuantMode MODE, typename scalar_t, typename Mm, typename Codec,
+          DecodeUnpack UNPACK = DecodeUnpack::kNative>
 class TurboQuantVectorDecodeService {
 public:
     using OperandT = typename Mm::OperandT;
     static constexpr bool kBatched = kBatchedCubeDecode<MODE>;
     static constexpr bool kNzTiled = kStoresNzTiles<MODE>;
-    static constexpr bool kBypassUnpack = BYPASS_UNPACK;
+    static constexpr bool kBypassUnpack = UNPACK == DecodeUnpack::kBypass;
+    static constexpr bool kGatherUnpack = UNPACK == DecodeUnpack::kGatherLut;
+    static_assert(kGatherUnpack == Codec::kGatherLut, "the service and its codec disagree on the expand");
     static_assert(kNzTiled == Codec::kIsAffine, "only the byte-wise affine expand streams an NZ-tiled plane");
     // Ring slots of the tile ingest. Tile t reads into slot t % kCubeSlots, the slot of its L1 operands.
     static constexpr uint32_t kIngestSlots = kBatched ? kCubeSlots : 1;
@@ -1007,8 +1013,13 @@ private:
         if constexpr (!kBypassUnpack) {
             const AscendC::LocalTensor<OperandT> nzHigh = nzLow[tilePlaneBytes_];
             for (uint32_t base = 0; base < tilePlaneBytes_; base += unpackChunkBytes_) {
-                codec_.template UnpackAffine<OperandT>(nzLow[base], nzHigh[base], packed[base],
-                                                                     unpackChunkBytes_);
+                if constexpr (kGatherUnpack) {
+                    codec_.template UnpackAffineGather<OperandT>(nzLow[base], nzHigh[base], packed[base],
+                                                                 unpackChunkBytes_);
+                } else {
+                    codec_.template UnpackAffine<OperandT>(nzLow[base], nzHigh[base], packed[base],
+                                                           unpackChunkBytes_);
+                }
             }
         } else {
             (void)packed;
@@ -1021,6 +1032,7 @@ private:
     __aicore__ inline void StageBandsToL1(const AscendC::LocalTensor<int8_t> &packed,
                                           const AscendC::LocalTensor<OperandT> &l1Dst)
     {
+        static_assert(!kGatherUnpack, "the gather expand is affine-only, and an affine mode streams NZ tiles");
         const AscendC::LocalTensor<OperandT> unpacked = bandOperandBuf_.Get<OperandT>();
         const uint32_t bandElems = kCubeUnpackRows * kOperandC0;
         for (uint32_t band = 0; band < kCubeTileRows / kCubeUnpackRows; ++band) {

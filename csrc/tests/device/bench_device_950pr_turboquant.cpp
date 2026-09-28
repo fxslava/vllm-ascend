@@ -195,34 +195,57 @@ bool RotationModeEnabled(RotationMode mode) {
 //
 // and the pair's Eff GB/s columns say whether the phase is on the critical path or hidden behind MTE2.
 //
-// ASCEND_BENCH_TQ_UNPACK=on|off|both, on by default. "on" is the shipping decode alone; "off" runs the
-// ablated launch in its place; "both" runs the pair. The ablated launch stages zeros, so its output is
-// all-zero by construction and its checksum means nothing -- which is why a plain run never reaches it.
+// ASCEND_BENCH_TQ_UNPACK=on|off|both|gather|all, on by default. Three expands of the same decode share
+// one launch shape and one traffic model, so their rows differ in the KV expand and nothing else:
+//
+//   on      the shipping affine expand alone (kLegDecAttnCore).
+//   off     the ablation in its place (kLegDecNoUnpack): no expand at all. Its output is all-zero by
+//           construction and its checksum means nothing.
+//   both    the pair above, which is the measurement T(dec_nounpack) - T(dec_attn_core).
+//   gather  Option C in place of the shipping expand (kLegDecGather): the per-plane Adds replaced by a
+//           16-entry UB Gather. Its table is the uniform grid, so unlike the ablation it computes the
+//           right answer and its checksum must match the unablated decode's.
+//   all     all three, which is what prices Option C against both the shipping expand and the floor.
 constexpr const char* kUnpackEnv = "ASCEND_BENCH_TQ_UNPACK";
 constexpr const char* kUnpackOn = "on";
 constexpr const char* kUnpackOff = "off";
 constexpr const char* kUnpackBoth = "both";
+constexpr const char* kUnpackGather = "gather";
+constexpr const char* kUnpackAll = "all";
 
 bool UnpackModeValid() {
   const std::string raw = EnvString(kUnpackEnv);
-  return raw.empty() || raw == kUnpackOn || raw == kUnpackOff || raw == kUnpackBoth;
+  return raw.empty() || raw == kUnpackOn || raw == kUnpackOff || raw == kUnpackBoth || raw == kUnpackGather ||
+         raw == kUnpackAll;
 }
 
-// The unablated legs, which an "off" run replaces with the ablated one.
-bool UnpackStandardEnabled() { return EnvString(kUnpackEnv) != kUnpackOff; }
+// The unablated legs. Both replacements ("off" and "gather") stand in for them rather than joining them.
+bool UnpackStandardEnabled() {
+  const std::string raw = EnvString(kUnpackEnv);
+  return raw != kUnpackOff && raw != kUnpackGather;
+}
 
 // The ablated leg. Off unless asked for by name.
 bool UnpackAblationEnabled() {
   const std::string raw = EnvString(kUnpackEnv);
-  return raw == kUnpackOff || raw == kUnpackBoth;
+  return raw == kUnpackOff || raw == kUnpackBoth || raw == kUnpackAll;
 }
 
+// The gather-expand leg. Off unless asked for by name.
+bool UnpackGatherEnabled() {
+  const std::string raw = EnvString(kUnpackEnv);
+  return raw == kUnpackGather || raw == kUnpackAll;
+}
+
+// Anything the parser does not recognise reads back as "on", which is the mode such a run actually times.
 const char* UnpackModeLabel() {
   const std::string raw = EnvString(kUnpackEnv);
-  if (raw == kUnpackOff) {
-    return kUnpackOff;
+  for (const char* mode : {kUnpackOff, kUnpackBoth, kUnpackGather, kUnpackAll}) {
+    if (raw == mode) {
+      return mode;
+    }
   }
-  return raw == kUnpackBoth ? kUnpackBoth : kUnpackOn;
+  return kUnpackOn;
 }
 
 struct Regime {
@@ -350,11 +373,14 @@ constexpr const char* kLegDecFusedQAttnCore = "dec_fq_attn_core";
 constexpr const char* kLegDecFusedQE2E = "dec_fq_e2e";
 // The unpack ablation's counterpart to kLegDecAttnCore; see kUnpackEnv.
 constexpr const char* kLegDecNoUnpack = "dec_nounpack";
+// Option C's counterpart to kLegDecAttnCore: the same decode expanding through a UB Gather.
+constexpr const char* kLegDecGather = "dec_gather";
 
 const char* const kPrefillLegs[] = {kLegPfIngest, kLegPfRotQ, kLegPfAttnCore, kLegPfRotO,
                                     kLegPfE2E,    kLegPfV5,   kLegPfV5Ingest};
-const char* const kDecodeLegs[] = {kLegDecRotQ, kLegDecAttnCore,       kLegDecRotO,      kLegDecE2E,
-                                   kLegDecV5,   kLegDecFusedQAttnCore, kLegDecFusedQE2E, kLegDecNoUnpack};
+const char* const kDecodeLegs[] = {kLegDecRotQ,      kLegDecAttnCore, kLegDecRotO,           kLegDecE2E,
+                                   kLegDecV5,        kLegDecFusedQAttnCore, kLegDecFusedQE2E,
+                                   kLegDecNoUnpack,  kLegDecGather};
 
 std::string CaseName(const char* leg, const Config& config) {
   return std::string(leg) + "_" + config.id();
@@ -817,6 +843,39 @@ class Scenario {
         cube_grid_.fused_context_limit, config_.attention_scale(), config_.attention_scale());
   }
 
+  // Option C of tests/research/QJL_3PLUS1_PHASE1.md: byte-for-byte the same launch on the same buffers,
+  // with the KV ingest's per-plane Adds replaced by a 16-entry UB Gather. Cube path only, for the same
+  // reason the ablation is -- the AIV paged decode has no separate unpack phase.
+  void EnqueueDecodeGather(aclrtStream stream) const {
+    turboquant_mm_fused_decode_gather_impl(
+        static_cast<int32_t>(kCubeMode), AscendType::FP16, stream, cube_grid_.block_dim, query_dec_rot_.get(),
+        key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
+        decode_tables_.get(), workspace_.get(), out_dec_tq_.get(), static_cast<uint32_t>(config_.batch),
+        static_cast<uint32_t>(config_.model.num_heads), static_cast<uint32_t>(config_.model.num_kv_heads),
+        static_cast<uint32_t>(config_.model.head_size), static_cast<uint32_t>(kBlockSize),
+        static_cast<uint32_t>(config_.blocks_per_seq()), static_cast<uint32_t>(cube_grid_.num_splits),
+        cube_grid_.heads_per_task, cube_grid_.tasks_per_block, cube_grid_.reduce_tasks_per_block,
+        cube_grid_.fused_context_limit, config_.attention_scale(), config_.attention_scale());
+  }
+
+  // The gather expand is a correct variant, not an ablation: its table is the uniform grid, so its operands
+  // are the bits the affine expand produces and its output must match the unablated decode exactly. The
+  // harness's own checksum only pins a leg against itself across its timed run, so the two are compared
+  // here, once per configuration, while the launches are being primed.
+  void CheckGatherAgainstBaseline(aclrtStream stream) const {
+    EnqueueDecodeAttnCore(stream);
+    ACL_CHECK(aclrtSynchronizeStream(stream));
+    gather_baseline_checksum_ = DecodeTqChecksum();
+    EnqueueDecodeGather(stream);
+    ACL_CHECK(aclrtSynchronizeStream(stream));
+    gather_checksum_ = DecodeTqChecksum();
+    gather_checked_ = true;
+  }
+
+  bool gather_checked() const { return gather_checked_; }
+  double gather_baseline_checksum() const { return gather_baseline_checksum_; }
+  double gather_checksum() const { return gather_checksum_; }
+
   // The same grid handed the raw fp16 query: the launch rotates every (token, head) into
   // query_dec_prologue_rot_ ahead of its split tasks (on the Cube from 16 vectors), so no rotate_q launch
   // precedes it, and for an unfolded W_o it writes out_dec_tq_ un-rotated, so no rotate_o launch follows.
@@ -915,6 +974,10 @@ class Scenario {
     if (config_.path == PathMode::kCube && UnpackAblationEnabled()) {
       EnqueueDecodeNoUnpack(stream);
     }
+    if (config_.path == PathMode::kCube && UnpackGatherEnabled()) {
+      EnqueueDecodeGather(stream);
+      CheckGatherAgainstBaseline(stream);
+    }
     if (prefill_available()) {
       EnqueuePrefillAttnCore(stream);
       EnqueuePrefillNative(stream);
@@ -959,6 +1022,11 @@ class Scenario {
 
  private:
   static constexpr tqm::TurboQuantMode kCubeMode = tqm::TurboQuantMode::KV4_FP8;
+
+  // Written by CheckGatherAgainstBaseline, which runs from the const Prime.
+  mutable double gather_baseline_checksum_ = 0.0;
+  mutable double gather_checksum_ = 0.0;
+  mutable bool gather_checked_ = false;
 
   void EnqueueCacheWrite(aclrtStream stream, void* key, void* value, void* slots, int64_t tokens,
                          const tqh::ReshapeAndCacheGrid& grid) const {
@@ -1872,6 +1940,14 @@ void PrintBanner(const std::vector<Config>& sweep, int64_t aiv_num, bool aiv_que
                 "[ascend-bench]   time %s would take without the expand.\n",
                 kUnpackEnv, UnpackModeLabel(), kLegDecNoUnpack, kLegDecAttnCore);
   }
+  if (UnpackGatherEnabled()) {
+    std::printf("[ascend-bench]   %s=%s: the %s leg is the same decode expanding through a 16-entry UB\n"
+                "[ascend-bench]   Gather instead of a per-plane Adds. Traffic is identical, so %s minus\n"
+                "[ascend-bench]   %s is Option C's instruction cost, and its Eff GB/s against %s's says\n"
+                "[ascend-bench]   whether the expand is on the critical path at all. Its table is the\n"
+                "[ascend-bench]   uniform grid, so its checksum must equal the unablated decode's.\n",
+                kUnpackEnv, UnpackModeLabel(), kLegDecGather, kLegDecGather, kLegDecAttnCore, kLegDecAttnCore);
+  }
   std::printf("[ascend-bench]\n");
 
   if (sweep.empty()) {
@@ -2122,6 +2198,31 @@ void BuildSuite(BenchmarkRunner& primary) {
       } else {
         run_leg(kLegDecNoUnpack, model.dec_flops, model.dec_attn_core, 1,
                 [sc](aclrtStream s) { sc->EnqueueDecodeNoUnpack(s); },
+                [sc]() { return sc->DecodeTqChecksum(); });
+      }
+
+      // Option C's twin of kLegDecAttnCore. Same rotation mode, same traffic model, same launch shape, so
+      // the rows differ in the expand's instruction sequence and nothing else. Unlike the ablation its
+      // output is the real one, and the equality against the unablated decode is reported before it runs.
+      if (!UnpackGatherEnabled()) {
+        runner.Skip(CaseName(kLegDecGather, config),
+                    std::string("the gather expand is not selected by ") + kUnpackEnv);
+      } else if (config.path != PathMode::kCube) {
+        runner.Skip(CaseName(kLegDecGather, config), "the gather expand exists on the Cube path only");
+      } else if (!separate) {
+        runner.Skip(CaseName(kLegDecGather, config), separate_off);
+      } else {
+        if (sc->gather_checked()) {
+          const double baseline = sc->gather_baseline_checksum();
+          const double gathered = sc->gather_checksum();
+          std::printf("[ascend-bench]   %s: checksum %.9g against the unablated decode's %.9g -- %s\n",
+                      CaseName(kLegDecGather, config).c_str(), gathered, baseline,
+                      gathered == baseline ? "equal, as the uniform table requires"
+                                           : "DIFFERENT, so the gather expand is not decoding the same grid");
+          std::fflush(stdout);
+        }
+        run_leg(kLegDecGather, model.dec_flops, model.dec_attn_core, 1,
+                [sc](aclrtStream s) { sc->EnqueueDecodeGather(s); },
                 [sc]() { return sc->DecodeTqChecksum(); });
       }
 

@@ -53,7 +53,10 @@ struct TurboQuantPlanes<TurboQuantMode::KV5_FP8> {
 
 constexpr int32_t kMsbPerByte = 8;
 
-template <TurboQuantMode MODE>
+// GATHER_LUT swaps the affine expand's per-plane Adds for a 16-entry UB Gather -- the instruction
+// sequence a non-uniform codebook would need (DecodeUnpack::kGatherLut). It is off by default, so the
+// shipping instantiation allocates no constant buffer and reads no table, exactly as before.
+template <TurboQuantMode MODE, bool GATHER_LUT = false>
 class TurboQuantModeCodec {
 public:
     using Traits = TurboQuantModeTraits<MODE>;
@@ -67,6 +70,8 @@ public:
     static constexpr int kBinLanes = TurboQuantCodec4::kBinLanes;
     static constexpr bool kIsAffine = Traits::kIsAffine;
     static constexpr float kAffineBias = Traits::kAffineBias;
+    static constexpr bool kGatherLut = GATHER_LUT;
+    static_assert(!kGatherLut || kIsAffine, "the gather expand replaces the affine Adds; codebook modes already gather");
 
     __aicore__ static constexpr uint32_t LowPlaneBytes(uint32_t vecLen)
     {
@@ -89,7 +94,7 @@ public:
     __aicore__ static inline uint32_t ConstTableWords(uint32_t vecLen, uint32_t batchRows)
     {
         if constexpr (kIsAffine) {
-            return 0u;
+            return kGatherLut ? static_cast<uint32_t>(kLevels) : 0u;
         } else {
             return 2u * vecLen * batchRows + kPeriodicWords + vecLen + static_cast<uint32_t>(kLevels);
         }
@@ -141,6 +146,15 @@ public:
             packOffset_ = pool[constOffset].template ReinterpretCast<uint32_t>();
             constOffset += len_;
             centroid_ = poolFloat[constOffset];
+        } else if constexpr (kGatherLut) {
+            // kLevels floats is 64 B, two whole 32 B bursts, and the affine table image holds nothing else.
+            const uint32_t constWords = ConstTableWords(vecLen, batchRows);
+            pipe->InitBuffer(constBuf_, constWords * sizeof(int32_t));
+            const AscendC::LocalTensor<int32_t> pool = constBuf_.Get<int32_t>();
+            AscendC::DataCopy(pool, tablesGm, constWords);
+            // Init hand-off: the GM table lands in UB before any vector op reads it.
+            AscendC::PipeBarrier<PIPE_ALL>();
+            centroid_ = pool.template ReinterpretCast<float>();
         }
 
         const AscendC::LocalTensor<float> work = workBuf_.Get<float>();
@@ -256,6 +270,32 @@ public:
         ComputeNibbleOperands(dstHigh, planes[bytes], bytes);
     }
 
+    // UnpackAffine with the per-plane Adds replaced by a 16-entry UB Gather: the same nibble widen, the
+    // same two planes, the same fp8 operands, and the same GM traffic. What differs is only the arithmetic
+    // between the DeInterleave and the operand cast, which is the quantity the benchmark leg exists to
+    // price. The table is the uniform grid, so the operands are bit-identical to UnpackAffine's; swapping
+    // in a Lloyd-Max table would change the numbers without changing one instruction.
+    template <typename OperandT>
+    __aicore__ inline void UnpackAffineGather(const AscendC::LocalTensor<OperandT> &dstLow,
+                                              const AscendC::LocalTensor<OperandT> &dstHigh,
+                                              const AscendC::LocalTensor<int8_t> &srcPacked, const uint32_t bytes)
+    {
+        static_assert(kGatherLut, "the gather expand needs its centroid table; instantiate with GATHER_LUT");
+        static_assert(kIsAffine, "UnpackAffineGather mirrors UnpackAffine and shares its plane split");
+        static_assert(!kHasMsbPlane, "an affine mode stores one plane; there is no msb digit to fold in");
+        static_assert(Planes::kLowPerByte == 2, "the plane split assumes two nibbles per byte");
+        const uint32_t elems = 2u * bytes;
+
+        const AscendC::LocalTensor<half> nibbles = msb_.ReinterpretCast<half>();
+        AscendC::Cast(nibbles, srcPacked.ReinterpretCast<int4b_t>(), AscendC::RoundMode::CAST_NONE, elems);
+
+        const AscendC::LocalTensor<half> planes = expand_.ReinterpretCast<half>();
+        AscendC::DeInterleave(planes, planes[bytes], nibbles, static_cast<int32_t>(elems));
+
+        ComputeNibbleOperandsGather(dstLow, planes, bytes);
+        ComputeNibbleOperandsGather(dstHigh, planes[bytes], bytes);
+    }
+
     template <typename OperandT>
     __aicore__ inline void CastToOperand(const AscendC::LocalTensor<OperandT> &dst,
                                          const AscendC::LocalTensor<float> &src, const uint32_t n)
@@ -281,6 +321,8 @@ private:
     static constexpr uint32_t kSignBitShift = 31;
     static constexpr float kNibbleSignShift = static_cast<float>(Planes::kLowRadix / 2);
     static constexpr float kSignedLevelOffset = kNibbleSignShift - kAffineBias;
+    // Byte offset of bin 0 in the fp32 centroid table, so a signed nibble n lands on (n + 8) * 4.
+    static constexpr float kCentroidOrigin = kNibbleSignShift * kCentroidStride;
 
     // scaleOut = RMS(src) + eps, and broadcast_[kBrcbDstLanes] = -1 / scaleOut as one block.
     __aicore__ inline void ComputeInverseScale(const AscendC::LocalTensor<float> &src,
@@ -346,6 +388,38 @@ private:
     {
         AscendC::Cast(msb_, plane, AscendC::RoundMode::CAST_NONE, bytes);
         AscendC::Adds(msb_, msb_, kSignedLevelOffset, bytes);
+        CastToOperand(dst, msb_, bytes);
+    }
+
+    // The same plane, resolved through a table instead of an offset. The widened nibble is the signed
+    // int4 n in [-8, 7], so bin b = n + 8 and its byte offset into the fp32 table is n * 4 + 32.
+    //
+    // Gather wants uint32 offsets, and the decode's buffer plan has no scratch of `bytes` int32 left, so
+    // the plane is walked in chunks sized to the encoder's bin lanes. Those lanes are dead here -- a
+    // decode never calls ComputeLevelBins -- which is what keeps this off the UB budget, already the
+    // binding constraint at D = 512. bytes is kUnpackChunkRows * len_ / 2 and the lanes hold
+    // kBinLanes * len_, so this is two passes at every head size, not a per-element loop.
+    template <typename OperandT>
+    __aicore__ inline void ComputeNibbleOperandsGather(const AscendC::LocalTensor<OperandT> &dst,
+                                                       const AscendC::LocalTensor<half> &plane,
+                                                       const uint32_t bytes)
+    {
+        const AscendC::LocalTensor<int32_t> offsets = binLane_[0].ReinterpretCast<int32_t>();
+        const uint32_t chunk = static_cast<uint32_t>(kBinLanes) * len_;
+        for (uint32_t base = 0; base < bytes; base += chunk) {
+            const uint32_t count = (bytes - base) < chunk ? (bytes - base) : chunk;
+            AscendC::Cast(msb_[base], plane[base], AscendC::RoundMode::CAST_NONE, count);
+            AscendC::Muls(msb_[base], msb_[base], kCentroidStride, count);
+            AscendC::Adds(msb_[base], msb_[base], kCentroidOrigin, count);
+            // Reinterpretation: the bin lanes are written as int32 offsets and the Gather reads them as uint32.
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(offsets, msb_[base], AscendC::RoundMode::CAST_RINT, count);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Gather(msb_[base], centroid_, offsets.template ReinterpretCast<uint32_t>(), kGatherSrcBase,
+                            count);
+            // Reinterpretation: the lanes were read as uint32 offsets and the next pass writes them as int32.
+            AscendC::PipeBarrier<PIPE_V>();
+        }
         CastToOperand(dst, msb_, bytes);
     }
 

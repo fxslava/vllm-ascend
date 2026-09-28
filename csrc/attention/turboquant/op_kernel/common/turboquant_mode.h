@@ -162,6 +162,24 @@ struct TurboQuantModeTraits<TurboQuantMode::KV5_FP8> {
 template <TurboQuantMode MODE>
 constexpr bool kStoresNzTiles = MODE == TurboQuantMode::KV4_FP8;
 
+// How the Cube decode's vector half expands a packed 4-bit plane into Cube operands. This selects an
+// instruction sequence, never a stored format: every variant reads the same bytes at the same addresses
+// and moves the same GM traffic, which is what makes the benchmark legs comparable.
+//
+//   kNative     the shipping affine expand -- int4b_t Cast, DeInterleave, then one Adds per plane, because
+//               the operand carries the code b - 7.5 and the step folds into the score scale (kGain).
+//   kBypass     a timing instrument: no expand at all, the zeroed staging buffer goes to L1 instead. Its
+//               output is all-zero by construction and numerically meaningless.
+//   kGatherLut  Option C: the Adds replaced by a 16-entry UB Gather, the sequence a non-uniform codebook
+//               (Lloyd-Max) would need. The table it gathers is the uniform grid itself, so the result is
+//               bit-identical to kNative and the leg prices the instruction sequence alone, with the
+//               codebook question held out. See tests/research/QJL_3PLUS1_PHASE1.md.
+enum class DecodeUnpack : uint32_t {
+    kNative = 0,
+    kBypass = 1,
+    kGatherLut = 2,
+};
+
 constexpr TurboQuantModeConfig TurboQuantModeConfigOf(TurboQuantMode mode)
 {
     return mode == TurboQuantMode::KV3_FP4

@@ -28,6 +28,7 @@
 #include "vector/turboquant_vector_service.h"
 
 using vllm_ascend::turboquant::CeilDiv;
+using vllm_ascend::turboquant::DecodeUnpack;
 using vllm_ascend::turboquant::GemmLayout;
 using vllm_ascend::turboquant::kCubeLoadDoubleOperandsWait;
 using vllm_ascend::turboquant::kCubeSlots;
@@ -280,12 +281,13 @@ private:
 // BYPASS_UNPACK is the unpack ablation described on TurboQuantVectorDecodeService: a timing-only build of
 // the same decode with the codec expand removed from the ingest and nothing else changed. Its output is
 // all-zero by construction, so only a benchmark instantiates it and only under VLLM_ASCEND_TQ_TEST_KERNELS.
-template <TurboQuantMode MODE, typename scalar_t, bool PRE_ROTATED = true, bool BYPASS_UNPACK = false>
+template <TurboQuantMode MODE, typename scalar_t, bool PRE_ROTATED = true,
+          DecodeUnpack UNPACK = DecodeUnpack::kNative>
 class TurboQuantFusedDecode {
 public:
     using Mm = TurboQuantCubeMm<MODE>;
-    using Codec = TurboQuantModeCodec<MODE>;
-    using Vector = TurboQuantVectorDecodeService<MODE, scalar_t, Mm, Codec, BYPASS_UNPACK>;
+    using Codec = TurboQuantModeCodec<MODE, UNPACK == DecodeUnpack::kGatherLut>;
+    using Vector = TurboQuantVectorDecodeService<MODE, scalar_t, Mm, Codec, UNPACK>;
     using Cube = TurboQuantCubeDecodeService<MODE>;
     using Reducer = TurboQuantPartialReducer<scalar_t>;
     using Basis = TurboQuantQueryBasis<scalar_t, !PRE_ROTATED>;
@@ -761,11 +763,11 @@ private:
     }
 
 #define ASCEND_TQ_DECLARE_MM_FUSED_DECODE(NAME, MODE, TYPE)                                                          \
-    ASCEND_TQ_DECLARE_MM_FUSED_DECODE_ABLATED(NAME, MODE, TYPE, false)
+    ASCEND_TQ_DECLARE_MM_FUSED_DECODE_ABLATED(NAME, MODE, TYPE, DecodeUnpack::kNative)
 
-// BYPASS_UNPACK selects the unpack ablation of the same kernel; see TurboQuantFusedDecode. The argument list
-// and the launch are identical, so the two entries are interchangeable to a benchmark and to msprof.
-#define ASCEND_TQ_DECLARE_MM_FUSED_DECODE_ABLATED(NAME, MODE, TYPE, BYPASS_UNPACK)                                   \
+// UNPACK selects which expand this instantiation of the same kernel carries; see DecodeUnpack. The argument
+// list and the launch are identical, so the entries are interchangeable to a benchmark and to msprof.
+#define ASCEND_TQ_DECLARE_MM_FUSED_DECODE_ABLATED(NAME, MODE, TYPE, UNPACK)                                          \
     extern "C" __global__ __aicore__ void NAME(                                                                      \
         GM_ADDR queryRot, GM_ADDR keyCache, GM_ADDR valueCache, GM_ADDR scaleCache, GM_ADDR blockTables,             \
         GM_ADDR contextLens, GM_ADDR modeTables, GM_ADDR workspace, GM_ADDR output, uint32_t numTokens,              \
@@ -774,7 +776,7 @@ private:
         uint32_t fusedContextLimit, float scale, float invSqrtLen)                                                   \
     {                                                                                                                \
         AscendC::TPipe pipe;                                                                                         \
-        TurboQuantFusedDecode<MODE, TYPE, true, BYPASS_UNPACK> op(&pipe);                                            \
+        TurboQuantFusedDecode<MODE, TYPE, true, UNPACK> op(&pipe);                                                   \
         op.Init(queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output, \
                 numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,      \
                 fusedContextLimit, scale, invSqrtLen);                                                               \
@@ -836,7 +838,14 @@ ASCEND_TQ_DECLARE_MM_MODE(kv5fp8, TurboQuantMode::KV5_FP8)
 
 // The unpack ablation of the shipping decode: same launch, same traffic, no codec expand, zero output.
 ASCEND_TQ_DECLARE_MM_FUSED_DECODE_ABLATED(turboquant_mm_fused_decode_nounpack_kv4fp8_half,
-                                          TurboQuantMode::KV4_FP8, half, true)
+                                          TurboQuantMode::KV4_FP8, half, DecodeUnpack::kBypass)
+
+// Option C of tests/research/QJL_3PLUS1_PHASE1.md: the same decode with the expand's per-plane Adds replaced
+// by a 16-entry UB Gather. Same launch, same traffic, and -- because the table it gathers is the uniform grid
+// -- the same output, so this leg is a pure A/B on the instruction sequence and its checksum must match the
+// unablated decode's exactly.
+ASCEND_TQ_DECLARE_MM_FUSED_DECODE_ABLATED(turboquant_mm_fused_decode_gather_kv4fp8_half,
+                                          TurboQuantMode::KV4_FP8, half, DecodeUnpack::kGatherLut)
 
 // rightLayout is a GemmLayout: 0 transposes the K x N right operand into L0B, 1 takes it as N x K.
 extern "C" __global__ __aicore__ void turboquant_cube_gemm_probe_fp8(
@@ -945,6 +954,27 @@ void turboquant_mm_fused_decode_nounpack_impl(int32_t mode, AscendType type, voi
         return;
     }
     turboquant_mm_fused_decode_nounpack_kv4fp8_half<<<blockDim, nullptr, stream>>>(
+        queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,
+        numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,
+        tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen);
+}
+
+// The gather expand's launch. Unlike the ablation this one computes the right answer, so a benchmark checks
+// its output against the unablated decode rather than skipping the comparison.
+void turboquant_mm_fused_decode_gather_impl(int32_t mode, AscendType type, void *stream, uint32_t blockDim,
+                                            void *queryRot, void *keyCache, void *valueCache, void *scaleCache,
+                                            void *blockTables, void *contextLens, void *modeTables,
+                                            void *workspace, void *output, uint32_t numTokens, uint32_t numHeads,
+                                            uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,
+                                            uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t headsPerTask,
+                                            uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,
+                                            uint32_t fusedContextLimit, float scale, float invSqrtLen)
+{
+    if (type != AscendType::FP16 || blockDim == 0 ||
+        static_cast<turboquant::TurboQuantMode>(mode) != turboquant::TurboQuantMode::KV4_FP8) {
+        return;
+    }
+    turboquant_mm_fused_decode_gather_kv4fp8_half<<<blockDim, nullptr, stream>>>(
         queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,
         numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,
         tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen);
