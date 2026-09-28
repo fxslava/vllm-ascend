@@ -4306,10 +4306,6 @@ aligned write) - the assertion passes, the process does not return. One offset i
 three differ only in how far into the burst they sit, which is what `EXPECT_NE(byte_offset % kGmBurstBytes, 0)`
 checks. Offsets 2 and 3 are no longer exercised anywhere.
 
-At `{1}` it returns: exit 0, 1,156 s, the same 0 of 65,536 / 0 of 65,536 / 0 of 2,048 agreement, 32 exception
-dumps at 0 B, 93,400 ticks. That is the first completed run of (j) on record, and it leaves 344 s of the
-harness budget unused.
-
 Camodel, one process per case (`build/nz_runs.sh trim28* /workspace/build_sim`):
 
 | case | K / blocks / heads per task / limit | golden | cos vs fp32 | launch | process |
@@ -4343,7 +4339,7 @@ with `unknown file type`.
   `kSlotRingFreeEdgeContext` = 192 tokens of context at block 64, and (b) now runs 128. The test prints which
   side of that line it is on.
 - `m` and `L` are unchecked at S = 1 and S = 65, where a single-block context cannot be split.
-- (j) is not in `build/nz_runs.sh`'s selectors, so it is reached only by naming its filter directly. Nothing
-  else runs it, which is why it went so long without anyone noticing it could not finish.
+- (j) has not been seen to return. Its assertion passed at the one offset that ran before the timeout, and the
+  trim to `{1}` is sized from that run's timings rather than from a completed process.
 - The 950PR's own tail-mask path is what these tests aim at; the Cube decode's `ComputeTailMask` is covered
   only by fused case (d), as before.
