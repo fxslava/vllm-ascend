@@ -26,9 +26,11 @@ Memory contracts (enforced by ``test_pilot_memory.py``):
 3. Transactional step locking -- the ``top_k`` slots requested for a step are
    locked before any eviction decision is taken; a step either commits fully
    or raises ``SlotExhaustionError`` with the pool state untouched.
-4. "Lazy loading" is strictly ``slot_view.copy_(pinned_cpu_weight,
-   non_blocking=False)`` into fixed-address views -- never module construction,
-   never re-slicing, never reallocation.
+4. "Lazy loading" is strictly ``slot_view.copy_(host_weight)`` into
+   fixed-address views -- never module construction, never re-slicing, never
+   reallocation. Blocking vs non-blocking transport is a *provider* property:
+   DMA-capable host storage implements ``SlotFillProviderProtocol`` and fills
+   the very same pre-sliced views itself on its own copy stream.
 
 Device-notes for the NPU bring-up: the residency bookkeeping (LRU, locks) is
 host-side control state; the ``expert_slot_table`` is a device-resident
@@ -320,6 +322,30 @@ class WeightProviderProtocol(Protocol):
     def pinned_cpu_weight(self, layer_idx: int, expert_id: int, param_key: str) -> torch.Tensor: ...
 
 
+@runtime_checkable
+class SlotFillProviderProtocol(Protocol):
+    """Extended provider interface for streamed DMA transports (DIP).
+
+    Host-pinned-DDR-to-NPU-HBM staging (``copy_(..., non_blocking=True)`` on a
+    dedicated copy stream) owns its stream and sync semantics, so such providers
+    write the pool's pre-sliced slot views themselves and report the bytes
+    moved. Refines :class:`WeightProviderProtocol` -- implementations must
+    satisfy both; declared standalone (not protocol-inherited) so it stays
+    runtime-checkable across Python versions. Contracts:
+
+    * ``ensure_staged`` must raise (e.g. ``KeyError``) *before* any byte moves,
+      which lets the pool keep acquisition transactional;
+    * ``fill_slot_params`` fills the given views strictly in place (never
+      resizes or replaces them) and returns the number of bytes staged.
+    """
+
+    def pinned_cpu_weight(self, layer_idx: int, expert_id: int, param_key: str) -> torch.Tensor: ...
+
+    def ensure_staged(self, layer_idx: int, expert_id: int) -> None: ...
+
+    def fill_slot_params(self, layer_idx: int, expert_id: int, views: Mapping[str, torch.Tensor]) -> int: ...
+
+
 @dataclass
 class SlotPoolStats:
     """Live diagnostics counters (mutated in place by the pool)."""
@@ -327,6 +353,7 @@ class SlotPoolStats:
     hits: int = 0
     loads: int = 0
     evictions: int = 0
+    bytes_staged: int = 0
 
 
 @dataclass
@@ -383,10 +410,16 @@ class StaticExpertSlotPool:
         # --- AOT view slicing: no slicing happens in the hot loop. ---
         self._weight_views: list[dict[str, torch.Tensor]] = []
         self._scale_views: list[dict[str, torch.Tensor]] = []
+        self._param_views: list[dict[str, torch.Tensor]] = []
         for slot_id in range(num_slots):
             weights, scales = self._layout.slice_slot_views(self._slot_arena, slot_id)
             self._weight_views.append(weights)
             self._scale_views.append(scales)
+            views_by_key: dict[str, torch.Tensor] = {}
+            for spec in self._layout.specs:
+                source_dict = weights if spec.kind == "packed_fp4" else scales
+                views_by_key[spec.param_key] = source_dict[spec.name]
+            self._param_views.append(views_by_key)
 
         # --- Host-side control state (no device memory). ---
         self._ledger = _SlotResidencyLedger(num_slots, config.num_routed_experts)
@@ -424,6 +457,10 @@ class StaticExpertSlotPool:
 
     def scale_views(self, slot_id: int) -> Mapping[str, torch.Tensor]:
         return self._scale_views[slot_id]
+
+    def param_views(self, slot_id: int) -> Mapping[str, torch.Tensor]:
+        """Pre-sliced views keyed by provider param key ("w1", "w1_scale", ...)."""
+        return self._param_views[slot_id]
 
     def slot_of(self, layer_idx: int, expert_id: int) -> int:
         """Test/debug accessor (``Tensor.item()``); hot paths read the table on device."""
@@ -507,20 +544,26 @@ class StaticExpertSlotPool:
         plan: _AdmissionPlan,
         host_pinned_storage: WeightProviderProtocol,
     ) -> None:
-        # 1. Fetch and validate every source buffer *before* mutating any state,
-        #    so a misbehaving provider cannot leave the pool half-committed.
+        # 1. Reserve and validate every source *before* mutating any state, so a
+        #    misbehaving provider cannot leave the pool half-committed.
+        uses_streamed_fill = isinstance(host_pinned_storage, SlotFillProviderProtocol)
         pending_fills: list[tuple[int, int, list[torch.Tensor]]] = []  # (expert_id, slot, sources)
-        for key, slot in plan.admissions:
-            _admitted_layer, expert_id = _SlotResidencyLedger.split_key(key, self._config.num_routed_experts)
-            sources = []
-            for spec in self._layout.specs:
-                source = host_pinned_storage.pinned_cpu_weight(layer_idx, expert_id, spec.param_key)
-                self._assert_transfer_compatible(spec.param_key, source)
-                sources.append(source)
-            pending_fills.append((expert_id, slot, sources))
+        if uses_streamed_fill:
+            for key, _slot in plan.admissions:
+                _admitted_layer, expert_id = _SlotResidencyLedger.split_key(key, self._config.num_routed_experts)
+                host_pinned_storage.ensure_staged(layer_idx, expert_id)
+        else:
+            for key, slot in plan.admissions:
+                _admitted_layer, expert_id = _SlotResidencyLedger.split_key(key, self._config.num_routed_experts)
+                sources = []
+                for spec in self._layout.specs:
+                    source = host_pinned_storage.pinned_cpu_weight(layer_idx, expert_id, spec.param_key)
+                    self._assert_transfer_compatible(spec.param_key, source)
+                    sources.append(source)
+                pending_fills.append((expert_id, slot, sources))
 
         # 2. Bookkeeping (ledger + device table), then bytes. Copies cannot fail
-        #    here: shapes/dtypes were validated above.
+        #    here: staging/shapes/dtypes were validated above.
         self._ledger.commit(plan)
         for victim_key, _slot in plan.evictions:
             victim_layer, victim_expert = _SlotResidencyLedger.split_key(victim_key, self._config.num_routed_experts)
@@ -530,12 +573,23 @@ class StaticExpertSlotPool:
             _hit_layer, expert_id = _SlotResidencyLedger.split_key(key, self._config.num_routed_experts)
             self._expert_slot_table[layer_idx, expert_id] = slot
             self.stats.hits += 1
-        for expert_id, slot, sources in pending_fills:
-            self._expert_slot_table[layer_idx, expert_id] = slot
-            for spec, source in zip(self._layout.specs, sources):
-                destination = (self._weight_views if spec.kind == "packed_fp4" else self._scale_views)[slot][spec.name]
-                destination.copy_(source, non_blocking=False)
-            self.stats.loads += 1
+        if uses_streamed_fill:
+            for key, slot in plan.admissions:
+                _admitted_layer, expert_id = _SlotResidencyLedger.split_key(key, self._config.num_routed_experts)
+                self._expert_slot_table[layer_idx, expert_id] = slot
+                self.stats.bytes_staged += host_pinned_storage.fill_slot_params(
+                    layer_idx, expert_id, self._param_views[slot]
+                )
+                self.stats.loads += 1
+        else:
+            for expert_id, slot, sources in pending_fills:
+                self._expert_slot_table[layer_idx, expert_id] = slot
+                for spec, source in zip(self._layout.specs, sources):
+                    view_map = self._weight_views if spec.kind == "packed_fp4" else self._scale_views
+                    destination = view_map[slot][spec.name]
+                    destination.copy_(source, non_blocking=False)
+                    self.stats.bytes_staged += source.numel()
+                self.stats.loads += 1
 
     def _assert_transfer_compatible(self, param_key: str, source: torch.Tensor) -> None:
         spec = self._layout.spec_for(param_key)
