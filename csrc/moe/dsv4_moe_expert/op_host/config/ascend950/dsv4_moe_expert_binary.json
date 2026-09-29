@@ -1,0 +1,24 @@
+{
+  "op_type": "Dsv4MoeExpert",
+  "op_list": [
+    {
+      "bin_filename": "Dsv4MoeExpert_bf16",
+      "inputs": [
+        {"name": "x", "index": 0, "dtype": "bfloat16", "format": "ND", "paramType": "required", "shape": [-2], "format_match_mode": "FormatAgnostic"},
+        {"name": "w1", "index": 1, "dtype": "uint8", "format": "ND", "paramType": "required", "shape": [-2], "format_match_mode": "FormatAgnostic"},
+        {"name": "w2", "index": 2, "dtype": "uint8", "format": "ND", "paramType": "required", "shape": [-2], "format_match_mode": "FormatAgnostic"},
+        {"name": "w3", "index": 3, "dtype": "uint8", "format": "ND", "paramType": "required", "shape": [-2], "format_match_mode": "FormatAgnostic"},
+        {"name": "w1_scale", "index": 4, "dtype": "uint8", "format": "ND", "paramType": "required", "shape": [-2], "format_match_mode": "FormatAgnostic"},
+        {"name": "w2_scale", "index": 5, "dtype": "uint8", "format": "ND", "paramType": "required", "shape": [-2], "format_match_mode": "FormatAgnostic"},
+        {"name": "w3_scale", "index": 6, "dtype": "uint8", "format": "ND", "paramType": "required", "shape": [-2], "format_match_mode": "FormatAgnostic"}
+      ],
+      "outputs": [
+        {"name": "gate_out", "index": 0, "dtype": "bfloat16", "format": "ND", "paramType": "required", "shape": [-2], "format_match_mode": "FormatAgnostic"},
+        {"name": "up_out", "index": 1, "dtype": "bfloat16", "format": "ND", "paramType": "required", "shape": [-2], "format_match_mode": "FormatAgnostic"},
+        {"name": "activated", "index": 2, "dtype": "bfloat16", "format": "ND", "paramType": "required", "shape": [-2], "format_match_mode": "FormatAgnostic"},
+        {"name": "down_out", "index": 3, "dtype": "bfloat16", "format": "ND", "paramType": "required", "shape": [-2], "format_match_mode": "FormatAgnostic"}
+      ],
+      "attrs": []
+    }
+  ]
+}
