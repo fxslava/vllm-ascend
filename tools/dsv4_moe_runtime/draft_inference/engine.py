@@ -18,6 +18,7 @@ from dsv4_moe_runtime.core.slot_pool import StaticExpertSlotPool
 from dsv4_moe_runtime.draft_inference.backends import DraftBackend
 from dsv4_moe_runtime.draft_inference.layer_runner import MoELayerRunner
 from dsv4_moe_runtime.draft_inference.scratchpad import DecodeScratchpad, ScratchpadShapes
+from dsv4_moe_runtime.hardware.dummy_kernel import DummyExpertKernelRunner, ExpertKernelRunner
 from dsv4_moe_runtime.protocols.provider import WeightProviderProtocol
 from dsv4_moe_runtime.routing.hash_router import HashRouteResolver
 from dsv4_moe_runtime.routing.score_router import ScoreRouteResolver
@@ -52,6 +53,8 @@ class DraftInferenceEngine:
         num_slots: int,
         device: str,
         attention_heads: int = 8,
+        expert_kernel: ExpertKernelRunner | None = None,
+        expert_latency_us: float = 0.0,
     ):
         self._config = config
         self._layout = layout
@@ -59,6 +62,9 @@ class DraftInferenceEngine:
         self._backend = backend
         self._device = device
         self._attention_heads = attention_heads
+        self._expert_kernel = expert_kernel or DummyExpertKernelRunner(
+            layout, device=device, latency_us=expert_latency_us
+        )
 
         # AOT tables: synthetic tid2eid stack (unique experts per token row --
         # the pool rejects duplicate top-k), gate bias, gate scores, embedding.
@@ -84,7 +90,7 @@ class DraftInferenceEngine:
             layout=layout,
             pool=self._pool,
             scratchpad=self._scratchpad,
-            backend=backend,
+            expert_kernel=self._expert_kernel,
             hash_resolver=HashRouteResolver(config, self._tid2eid),
             score_resolver=ScoreRouteResolver(config, self._gate_bias, max_batch_tokens=1),
         )
@@ -95,6 +101,14 @@ class DraftInferenceEngine:
     @property
     def pool(self) -> StaticExpertSlotPool:
         return self._pool
+
+    @property
+    def backend(self) -> DraftBackend:
+        return self._backend
+
+    @property
+    def expert_kernel(self) -> ExpertKernelRunner:
+        return self._expert_kernel
 
     def arena_fingerprint(self) -> list[int]:
         """data_ptr of scratchpad buffers + pool arena (must never move)."""

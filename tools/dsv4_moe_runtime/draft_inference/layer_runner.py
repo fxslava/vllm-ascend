@@ -6,20 +6,21 @@ Per-layer flow (single token, top-k routed experts):
    layers 3+ through ``ScoreRouteResolver`` (bias-shifted top-k);
 2. acquire -- ``StaticExpertSlotPool.acquire_for_step`` locks and refreshes
    the k slots (streamed DMA fills from the host-pinned provider);
-3. project -- per expert: w1/w3 GEMMs from the slot's FP4 views into the
-   scratchpad, in-place SwiGLU, w2 GEMM back to the hidden dim;
+3. project -- per expert: one ``ExpertKernelRunner.execute_expert`` call
+   handing the slot's FP4 weight/scale views plus the scratchpad rows
+   (gate/up projections, in-place SwiGLU, down projection) to the kernel
+   seam -- today the safe surrogate in ``hardware/dummy_kernel.py``, later
+   the native vllm-ascend kernel with the identical signature;
 4. accumulate -- routing-weighted sum into the fp32 accumulator, all in place.
 """
 
 from __future__ import annotations
 
-import torch
-
 from dsv4_moe_runtime.core.config import DeepSeekV4MoEConfig
 from dsv4_moe_runtime.core.layout import ExpertTensorLayout
 from dsv4_moe_runtime.core.slot_pool import StaticExpertSlotPool
-from dsv4_moe_runtime.draft_inference.backends import DraftBackend
 from dsv4_moe_runtime.draft_inference.scratchpad import DecodeScratchpad
+from dsv4_moe_runtime.hardware.dummy_kernel import ExpertKernelRunner
 from dsv4_moe_runtime.protocols.provider import WeightProviderProtocol
 from dsv4_moe_runtime.routing.hash_router import HashRouteResolver
 from dsv4_moe_runtime.routing.score_router import ScoreRouteResolver
@@ -34,7 +35,7 @@ class MoELayerRunner:
         layout: ExpertTensorLayout,
         pool: StaticExpertSlotPool,
         scratchpad: DecodeScratchpad,
-        backend: DraftBackend,
+        expert_kernel: ExpertKernelRunner,
         hash_resolver: HashRouteResolver,
         score_resolver: ScoreRouteResolver,
     ):
@@ -42,7 +43,7 @@ class MoELayerRunner:
         self._layout = layout
         self._pool = pool
         self._scratchpad = scratchpad
-        self._backend = backend
+        self._expert_kernel = expert_kernel
         self._hash = hash_resolver
         self._score = score_resolver
 
@@ -94,26 +95,28 @@ class MoELayerRunner:
         weights.div_(weights.sum())
 
     def _project_one_expert(self, position: int, slot_id: int) -> None:
+        """One fused expert projection through the kernel seam, all in place.
+
+        Hands the kernel exactly the operands the native vllm-ascend kernel
+        will receive: the hidden row, the slot's packed FP4 weights and E8M0
+        scales, and the four scratchpad rows (gate/up/activated/down).
+        """
         weight_views = self._pool.weight_views(slot_id)
         scale_views = self._pool.scale_views(slot_id)
-        hidden_row = self._scratchpad["gathered_x"][position : position + 1]
-        gate_row = self._scratchpad["gate_out"][position : position + 1]
-        up_row = self._scratchpad["up_out"][position : position + 1]
-        activated_row = self._scratchpad["activated"][position : position + 1]
-        down_row = self._scratchpad["down_out"][position : position + 1]
-        # gate/up consume the hidden row; down consumes the activated row.
-        self._backend.quant_gemm(hidden_row, weight_views["w1"], scale_views["w1"], gate_row, f"slot{slot_id}/w1")
-        self._backend.quant_gemm(hidden_row, weight_views["w3"], scale_views["w3"], up_row, f"slot{slot_id}/w3")
-        self._apply_swiglu(position)
-        self._backend.quant_gemm(activated_row, weight_views["w2"], scale_views["w2"], down_row, f"slot{slot_id}/w2")
-
-    def _apply_swiglu(self, position: int) -> None:
-        """silu(gate) * up, entirely in place (torch.sigmoid with out=)."""
-        gate = self._scratchpad["gate_out"][position]
-        activated = self._scratchpad["activated"][position]
-        torch.sigmoid(gate, out=activated)
-        activated.mul_(gate)
-        activated.mul_(self._scratchpad["up_out"][position])
+        self._expert_kernel.execute_expert(
+            x=self._scratchpad["gathered_x"][position : position + 1],
+            w1=weight_views["w1"],
+            w2=weight_views["w2"],
+            w3=weight_views["w3"],
+            w1_scale=scale_views["w1"],
+            w2_scale=scale_views["w2"],
+            w3_scale=scale_views["w3"],
+            gate_out=self._scratchpad["gate_out"][position : position + 1],
+            up_out=self._scratchpad["up_out"][position : position + 1],
+            activated=self._scratchpad["activated"][position : position + 1],
+            down_out=self._scratchpad["down_out"][position : position + 1],
+            label=f"slot{slot_id}",
+        )
 
     def _accumulate_expert(self, position: int, weight: float) -> None:
         down_row = self._scratchpad["down_row_f32"][position]

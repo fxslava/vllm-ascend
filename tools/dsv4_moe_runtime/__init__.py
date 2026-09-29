@@ -32,6 +32,13 @@ from .core.slot_pool import (
     StaticExpertSlotPool,
     StepReservation,
 )
+from .hardware.dummy_kernel import (
+    DEFAULT_EXPERT_LATENCY_US,
+    DIGEST_MASK,
+    DummyExpertKernelRunner,
+    ExpertKernelRunner,
+)
+from .hardware.lifecycle import RuntimeLifecycleManager, TeardownReport, TeardownStep
 from .hardware.pinned_storage import AscendPinnedHostStorage
 from .hardware.runtime import CpuRuntime, DeviceRuntime, NpuRuntime, make_runtime
 from .protocols.provider import SlotFillProviderProtocol, WeightProviderProtocol
@@ -40,6 +47,8 @@ from .routing.hash_router import HashRouteResolver
 from .routing.score_router import ScoreRouteResolver
 
 __all__ = [
+    "DEFAULT_EXPERT_LATENCY_US",
+    "DIGEST_MASK",
     "EXPERT_PARAM_NAMES",
     "FP4_BLOCK_SIZE",
     "FP4_ELEMS_PER_BYTE",
@@ -51,6 +60,8 @@ __all__ = [
     "CpuRuntime",
     "DeepSeekV4MoEConfig",
     "DeviceRuntime",
+    "DummyExpertKernelRunner",
+    "ExpertKernelRunner",
     "ExpertTensorLayout",
     "ExpertTensorSpec",
     "HashRouteResolver",
@@ -58,12 +69,15 @@ __all__ = [
     "OffloadStressHarness",
     "RouteResolverProtocol",
     "RouterTraceSimulator",
+    "RuntimeLifecycleManager",
     "ScoreRouteResolver",
     "SlotExhaustionError",
     "SlotFillProviderProtocol",
     "SlotPoolStats",
     "StaticExpertSlotPool",
     "StepReservation",
+    "TeardownReport",
+    "TeardownStep",
     "TraceStep",
     "UNRESIDENT_SLOT_ID",
     "WeightProviderProtocol",

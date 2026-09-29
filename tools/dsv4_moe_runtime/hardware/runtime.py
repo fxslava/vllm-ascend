@@ -35,6 +35,9 @@ class DeviceRuntime(Protocol):
     def release_cache(self) -> None:
         """Best-effort release of cached allocator blocks (used after OOM)."""
 
+    def reset_device(self) -> None:
+        """Post-teardown device cleanup (allocator stats reset; no-op on cpu)."""
+
 
 class NpuRuntime:
     """Ascend 950PR runtime: torch_npu allocator stats + dedicated DMA stream."""
@@ -74,6 +77,15 @@ class NpuRuntime:
     def release_cache(self) -> None:
         torch.npu.empty_cache()
 
+    def reset_device(self) -> None:
+        # Final device pass after every owner is gone: flush the cache again
+        # and clear accumulated allocator statistics. A hard aclrtResetDevice
+        # would tear the device out from under torch_npu's runtime state, so
+        # the lifecycle manager stops at these public entry points.
+        torch.npu.empty_cache()
+        if hasattr(torch.npu, "reset_accumulated_memory_stats"):
+            torch.npu.reset_accumulated_memory_stats(self.device)
+
 
 class CpuRuntime:
     """Workstation runtime: no device allocator accounting, no copy stream."""
@@ -104,6 +116,9 @@ class CpuRuntime:
         pass
 
     def release_cache(self) -> None:
+        pass
+
+    def reset_device(self) -> None:
         pass
 
 
