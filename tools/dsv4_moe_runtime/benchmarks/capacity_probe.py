@@ -32,16 +32,20 @@ import math
 import random
 import sys
 import time
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import torch
 
+from ..benchmarks.capacity_report import (  # re-exported for callers
+    CapacityProbeReport,
+    ThrashStats,
+    render_capacity_report,
+)
 from ..core.config import SANITY_GEOMETRY, DeepSeekV4MoEConfig
 from ..core.layout import ExpertTensorLayout
 from ..core.slot_pool import UNRESIDENT_SLOT_ID, StaticExpertSlotPool
 from ..hardware.runtime import DeviceRuntime, make_runtime
-from .telemetry import human_bytes
 
 GIB = 1024**3
 MIB = 1024**2
@@ -56,6 +60,46 @@ LOOPBACK_VERIFY_SAMPLES = 8
 VERIFY_SEED_SALT = 0xC1A0
 
 SlotAllocator = Callable[[int, str], torch.Tensor]
+
+__all__ = [
+    "CapacityProbeConfig",
+    "CapacityProbeReport",
+    "DummyLoopbackWeightProvider",
+    "ThrashStats",
+    "main",
+    "render_capacity_report",
+    "run_capacity_probe",
+]
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="DeepSeek-V4 NPU capacity & residency probe.")
+    parser.add_argument("--device", default="npu:0", help="torch device (default npu:0)")
+    parser.add_argument("--backbone-mib", type=int, default=None, help="override backbone workspace size in MiB")
+    parser.add_argument("--probe-slot-batch", type=int, default=DEFAULT_PROBE_SLOT_BATCH)
+    parser.add_argument("--probe-max-slots", type=int, default=None, help="cap growth (recommended on cpu)")
+    parser.add_argument("--thrash-cycles", type=int, default=DEFAULT_THRASH_CYCLES)
+    parser.add_argument("--slots-swept-per-cycle", type=int, default=DEFAULT_SLOTS_SWEPT_PER_CYCLE)
+    parser.add_argument("--safety-margin", type=float, default=DEFAULT_SAFETY_MARGIN)
+    parser.add_argument("--small-geometry", action="store_true", help="~13 KiB/slot sanity geometry")
+    args = parser.parse_args(argv)
+    if not 0.0 < args.safety_margin < 1.0:
+        parser.error("--safety-margin must be within (0, 1)")
+    if args.probe_slot_batch < 1 or args.thrash_cycles < 1 or args.slots_swept_per_cycle < 1:
+        parser.error("batch/cycle/sweep counts must be >= 1")
+    config = CapacityProbeConfig(
+        device=args.device,
+        backbone_bytes=None if args.backbone_mib is None else args.backbone_mib * MIB,
+        probe_slot_batch=args.probe_slot_batch,
+        probe_max_slots=args.probe_max_slots,
+        thrash_cycles=args.thrash_cycles,
+        slots_swept_per_cycle=args.slots_swept_per_cycle,
+        safety_margin=args.safety_margin,
+        small_geometry=args.small_geometry,
+    )
+    report = run_capacity_probe(config)
+    print(render_capacity_report(report), flush=True)
+    return 0 if report.passed else 1
 
 
 @dataclass(frozen=True)
@@ -132,48 +176,6 @@ class DummyLoopbackWeightProvider:
         self._runtime.synchronize_stream(self._dma_stream)
 
 
-@dataclass
-class ThrashStats:
-    cycles: int
-    steps: int
-    fills: int
-    hits: int
-    bytes_moved: int
-    wall_time_s: float
-
-
-@dataclass
-class CapacityProbeReport:
-    """Aggregate outcome of one probe run (stages 1-3)."""
-
-    device: str
-    slot_num_bytes: int
-    backbone_bytes: int
-    probe_slot_batch: int
-    max_contiguous_slots: int
-    oom_detected: bool
-    oom_error: str | None
-    oom_recovered: bool
-    ceiling_slots: int
-    ceiling_pool_bytes: int
-    thrash: ThrashStats | None
-    allocation_violation_cycles: list[int] = field(default_factory=list)
-    fingerprints_stable: bool = True
-    loopback_verified: tuple[bool, int] | None = None
-    allocated_delta_bytes: int | None = None  # None when the runtime has no allocator accounting
-    notes: list[str] = field(default_factory=list)
-
-    @property
-    def passed(self) -> bool:
-        if self.oom_detected and not self.oom_recovered:
-            return False
-        if self.allocation_violation_cycles or not self.fingerprints_stable:
-            return False
-        if self.loopback_verified is not None and not self.loopback_verified[0]:
-            return False
-        return self.allocated_delta_bytes in (None, 0)
-
-
 def _default_allocator(num_bytes: int, device: str) -> torch.Tensor:
     return torch.empty(num_bytes, dtype=torch.uint8, device=device)
 
@@ -188,6 +190,8 @@ def _probe_contiguous_capacity(
 ) -> tuple[int, bool, str | None]:
     """Grow a monolithic allocation by ``batch`` slots until the allocator OOMs."""
     allocated_slots = 0
+    if max_slots is not None and batch > max_slots:
+        batch = max_slots  # a cap below one batch still probes the first batch
     while max_slots is None or allocated_slots + batch <= max_slots:
         try:
             candidate = allocate((allocated_slots + batch) * slot_bytes, runtime.device)
@@ -363,82 +367,6 @@ def run_capacity_probe(config: CapacityProbeConfig, allocator: SlotAllocator | N
         allocated_delta_bytes=allocated_delta,
         notes=notes,
     )
-
-
-def render_capacity_report(report: CapacityProbeReport) -> str:
-    separator = "=" * 78
-    lines = [
-        separator,
-        "DeepSeek-V4 capacity & residency probe report",
-        separator,
-        f"device {report.device} | slot {human_bytes(report.slot_num_bytes)} | "
-        f"backbone {human_bytes(report.backbone_bytes)} resident",
-        (
-            f"probe: +{report.probe_slot_batch} slots/step -> max contiguous {report.max_contiguous_slots} slots "
-            f"({human_bytes(report.max_contiguous_slots * report.slot_num_bytes)}) | "
-            f"OOM {'reached (' + report.oom_error + ')' if report.oom_detected else 'not reached (capped)'}"
-        ),
-        (
-            f"recovery: {'OK' if report.oom_recovered else 'FAILED'} | safe ceiling "
-            f"{report.ceiling_slots} slots ({human_bytes(report.ceiling_pool_bytes)})"
-        ),
-    ]
-    if report.thrash is None:
-        lines.append("thrash: skipped")
-    else:
-        lines.append(
-            f"thrash: {report.thrash.cycles} cycles, {report.thrash.steps} steps, {report.thrash.fills} fills "
-            f"({report.thrash.hits} hits), {human_bytes(report.thrash.bytes_moved)} moved, "
-            f"{report.thrash.wall_time_s:.2f}s"
-        )
-    allocator_line = (
-        f"allocator delta {report.allocated_delta_bytes} bytes"
-        if report.allocated_delta_bytes is not None
-        else "allocator n/a on this runtime (cpu); data_ptr fingerprints carry the invariant"
-    )
-    lines.append(
-        f"zero-allocation: {allocator_line} | fingerprints: {'OK' if report.fingerprints_stable else 'VIOLATED'}"
-    )
-    if report.loopback_verified is None:
-        lines.append("loopback verification: skipped")
-    else:
-        ok, checked = report.loopback_verified
-        lines.append(f"loopback verification: {'OK' if ok else 'FAILED'} ({checked} slot views byte-checked)")
-    for note in report.notes:
-        lines.append(f"note: {note}")
-    lines.append(f"VERDICT: {'PASS' if report.passed else 'FAIL'}")
-    lines.append(separator)
-    return "\n".join(lines)
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="DeepSeek-V4 NPU capacity & residency probe.")
-    parser.add_argument("--device", default="npu:0", help="torch device (default npu:0)")
-    parser.add_argument("--backbone-mib", type=int, default=None, help="override backbone workspace size in MiB")
-    parser.add_argument("--probe-slot-batch", type=int, default=DEFAULT_PROBE_SLOT_BATCH)
-    parser.add_argument("--probe-max-slots", type=int, default=None, help="cap growth (recommended on cpu)")
-    parser.add_argument("--thrash-cycles", type=int, default=DEFAULT_THRASH_CYCLES)
-    parser.add_argument("--slots-swept-per-cycle", type=int, default=DEFAULT_SLOTS_SWEPT_PER_CYCLE)
-    parser.add_argument("--safety-margin", type=float, default=DEFAULT_SAFETY_MARGIN)
-    parser.add_argument("--small-geometry", action="store_true", help="~13 KiB/slot sanity geometry")
-    args = parser.parse_args(argv)
-    if not 0.0 < args.safety_margin < 1.0:
-        parser.error("--safety-margin must be within (0, 1)")
-    if args.probe_slot_batch < 1 or args.thrash_cycles < 1 or args.slots_swept_per_cycle < 1:
-        parser.error("batch/cycle/sweep counts must be >= 1")
-    config = CapacityProbeConfig(
-        device=args.device,
-        backbone_bytes=None if args.backbone_mib is None else args.backbone_mib * MIB,
-        probe_slot_batch=args.probe_slot_batch,
-        probe_max_slots=args.probe_max_slots,
-        thrash_cycles=args.thrash_cycles,
-        slots_swept_per_cycle=args.slots_swept_per_cycle,
-        safety_margin=args.safety_margin,
-        small_geometry=args.small_geometry,
-    )
-    report = run_capacity_probe(config)
-    print(render_capacity_report(report), flush=True)
-    return 0 if report.passed else 1
 
 
 if __name__ == "__main__":
