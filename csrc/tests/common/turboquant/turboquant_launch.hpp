@@ -97,6 +97,34 @@ void turboquant_mm_fused_decode_gather_impl(int32_t mode, AscendType type, void*
                                             uint32_t reduceTasksPerBlock, uint32_t fusedContextLimit, float scale,
                                             float invSqrtLen);
 
+// The Lloyd-Max codebook (DecodeUnpack::kLloydMaxLut): the gather expand above, instruction for
+// instruction, over a table holding the e4m3-rounded non-uniform levels instead of the uniform grid. Its
+// latency is therefore the gather leg's and its numbers are not -- the two together separate the expand's
+// cost from the codebook's fidelity.
+//
+// Unlike every other decode variant this one is only correct against a cache the matching writer wrote,
+// because the encoder's thresholds move with the levels. modeTables must be built with
+// ModeTables(..., lloyd_max = true). Nothing on the device checks either, and getting one wrong decodes a
+// plausible wrong answer. kv4fp8 only.
+void turboquant_mm_fused_decode_lloydmax_impl(int32_t mode, AscendType type, void* stream, uint32_t blockDim,
+                                              void* queryRot, void* keyCache, void* valueCache, void* scaleCache,
+                                              void* blockTables, void* contextLens, void* modeTables, void* workspace,
+                                              void* output, uint32_t numTokens, uint32_t numHeads,
+                                              uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,
+                                              uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t headsPerTask,
+                                              uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,
+                                              uint32_t fusedContextLimit, float scale, float invSqrtLen);
+
+// The encoder half of the pair above: turboquant_mm_reshape_and_cache_impl quantising onto the Lloyd-Max
+// thresholds. Same packed nibble, same NZ tiling, same scale plane, so the cache is layout-identical and
+// only its codes differ. kv4fp8 only.
+void turboquant_mm_reshape_and_cache_lloydmax_impl(int32_t mode, AscendType type, void* stream, uint32_t blockDim,
+                                                   void* key, void* value, void* keyCache, void* valueCache,
+                                                   void* scaleCache, void* slotMapping, void* piSigns,
+                                                   void* rotTables, void* modeTables, uint32_t numTokens,
+                                                   uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,
+                                                   uint32_t numBlocks, uint32_t tokensPerCore, float invSqrtLen);
+
 // rightLayout is a turboquant::GemmLayout: 0 transposes the K x N right operand into L0B, 1 takes it as N x K.
 void turboquant_cube_gemm_probe_impl(void* stream, void* leftGm, void* rightGm, void* outGm, uint32_t m, uint32_t k,
                                      uint32_t n, uint32_t headSize, uint32_t tileRows, uint32_t leftElems,
@@ -155,8 +183,11 @@ size_t ModePackedCacheBytes(vllm_ascend::turboquant::TurboQuantMode mode, int64_
 
 int64_t ModeTableWords(vllm_ascend::turboquant::TurboQuantMode mode, int64_t head_size, int64_t batch_rows);
 
+// lloyd_max fills the level image with the e4m3-rounded non-uniform codebook instead of the mode's own
+// grid. It changes no word count -- an affine mode's table is its 16 levels either way -- so a buffer
+// built for one decode is the right size for the other and only its contents select the codec.
 std::vector<int32_t> ModeTables(vllm_ascend::turboquant::TurboQuantMode mode, int64_t head_size, int64_t batch_rows,
-                                int64_t nz_rows);
+                                int64_t nz_rows, bool lloyd_max = false);
 
 inline int64_t NzOffset(int64_t r, int64_t c, int64_t rows) {
   return (c / kOperandC0) * rows * kOperandC0 + r * kOperandC0 + (c % kOperandC0);

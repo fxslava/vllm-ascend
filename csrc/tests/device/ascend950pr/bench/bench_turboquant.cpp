@@ -73,6 +73,7 @@ using tqa::kLegDecE2E;
 using tqa::kLegDecFusedQAttnCore;
 using tqa::kLegDecFusedQE2E;
 using tqa::kLegDecGather;
+using tqa::kLegDecLloydMax;
 using tqa::kLegDecNoUnpack;
 using tqa::kLegDecRotO;
 using tqa::kLegDecRotQ;
@@ -104,6 +105,7 @@ using tqa::SplitPolicy;
 using tqa::TileToDevice;
 using tqa::UnpackAblationEnabled;
 using tqa::UnpackGatherEnabled;
+using tqa::UnpackLloydMaxEnabled;
 using tqa::UnpackStandardEnabled;
 
 constexpr int64_t kFiaSparseModeRightDownCausal = 3;
@@ -235,6 +237,11 @@ class Scenario {
       write_tables_ = DeviceBuffer::FromHost(tqh::ModeTables(kCubeMode, d, 1, 0), kBenchmarkAlignBytes);
       decode_tables_ = DeviceBuffer::FromHost(tqh::ModeTables(kCubeMode, d, tqh::kUnpackRows, tqh::kCubeTileRows),
                                               kBenchmarkAlignBytes);
+      // The same 16 words, holding the non-uniform codebook instead of the uniform grid. 64 B, allocated
+      // whether or not the leg runs, so the two decodes differ in nothing but which buffer they are handed.
+      lloydmax_tables_ = DeviceBuffer::FromHost(
+          tqh::ModeTables(kCubeMode, d, tqh::kUnpackRows, tqh::kCubeTileRows, /*lloyd_max=*/true),
+          kBenchmarkAlignBytes);
       cube_grid_ = tqh::PlanFusedDecode(config.batch, hq, hkv, d, blocks_per_seq, kBlockSize, aiv_num,
                                         tqh::kFusedContextLimit, SplitPolicy());
       num_splits_ = cube_grid_.num_splits;
@@ -372,6 +379,31 @@ class Scenario {
         cube_grid_.fused_context_limit, config_.attention_scale(), config_.attention_scale());
   }
 
+  // The Lloyd-Max codebook (DecodeUnpack::kLloydMaxLut): byte-for-byte the same launch on the same buffers
+  // as EnqueueDecodeGather, handed the 64 B table that holds the e4m3-rounded non-uniform levels instead of
+  // the uniform grid.
+  //
+  // This is a latency leg and only a latency leg, and it is deliberately run against the shared,
+  // uniformly-written cache rather than an LLOYD_MAX_LUT-written one. Two reasons, and they point the same
+  // way: a second cache would double the KV allocation at contexts this sweep takes to a million tokens,
+  // and the quantity being measured -- which instructions the expand issues -- does not depend on what the
+  // codes mean, so holding the data fixed is the cleaner experiment. Its output is therefore the wrong
+  // codebook's reading of the right bits: valid-looking, numerically meaningless, and never a fidelity
+  // result. The codebook's fidelity is earned on the simulator tier
+  // (test_sim_950pr_turboquant_fused, cases (k) and (l)) and on the host tier, where the cache is written
+  // by the matching writer.
+  void EnqueueDecodeLloydMax(aclrtStream stream) const {
+    turboquant_mm_fused_decode_lloydmax_impl(
+        static_cast<int32_t>(kCubeMode), AscendType::FP16, stream, cube_grid_.block_dim, query_dec_rot_.get(),
+        key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
+        lloydmax_tables_.get(), workspace_.get(), out_dec_tq_.get(), static_cast<uint32_t>(config_.batch),
+        static_cast<uint32_t>(config_.model.num_heads), static_cast<uint32_t>(config_.model.num_kv_heads),
+        static_cast<uint32_t>(config_.model.head_size), static_cast<uint32_t>(kBlockSize),
+        static_cast<uint32_t>(config_.blocks_per_seq()), static_cast<uint32_t>(cube_grid_.num_splits),
+        cube_grid_.heads_per_task, cube_grid_.tasks_per_block, cube_grid_.reduce_tasks_per_block,
+        cube_grid_.fused_context_limit, config_.attention_scale(), config_.attention_scale());
+  }
+
   // The gather expand is a correct variant, not an ablation: its table is the uniform grid, so its operands
   // are the bits the affine expand produces and its output must match the unablated decode exactly. The
   // harness's own checksum only pins a leg against itself across its timed run, so the two are compared
@@ -386,9 +418,26 @@ class Scenario {
     gather_checked_ = true;
   }
 
+  // The same comparison for the codebook leg, read the other way round: the table is a different 16 levels,
+  // so a checksum EQUAL to the baseline's would mean the table never reached the expand. It is a liveness
+  // check on the toggle, not a fidelity number -- see EnqueueDecodeLloydMax.
+  void CheckLloydMaxAgainstBaseline(aclrtStream stream) const {
+    EnqueueDecodeAttnCore(stream);
+    ACL_CHECK(aclrtSynchronizeStream(stream));
+    lloydmax_baseline_checksum_ = DecodeTqChecksum();
+    EnqueueDecodeLloydMax(stream);
+    ACL_CHECK(aclrtSynchronizeStream(stream));
+    lloydmax_checksum_ = DecodeTqChecksum();
+    lloydmax_checked_ = true;
+  }
+
   bool gather_checked() const { return gather_checked_; }
   double gather_baseline_checksum() const { return gather_baseline_checksum_; }
   double gather_checksum() const { return gather_checksum_; }
+
+  bool lloydmax_checked() const { return lloydmax_checked_; }
+  double lloydmax_baseline_checksum() const { return lloydmax_baseline_checksum_; }
+  double lloydmax_checksum() const { return lloydmax_checksum_; }
 
   // The same grid handed the raw fp16 query: the launch rotates every (token, head) into
   // query_dec_prologue_rot_ ahead of its split tasks (on the Cube from 16 vectors), so no rotate_q launch
@@ -459,6 +508,10 @@ class Scenario {
       EnqueueDecodeGather(stream);
       CheckGatherAgainstBaseline(stream);
     }
+    if (config_.path == PathMode::kCube && UnpackLloydMaxEnabled()) {
+      EnqueueDecodeLloydMax(stream);
+      CheckLloydMaxAgainstBaseline(stream);
+    }
     if (prefill_available()) {
       EnqueuePrefillAttnCore(stream);
       EnqueuePrefillNative(stream);
@@ -498,10 +551,13 @@ class Scenario {
  private:
   static constexpr tqm::TurboQuantMode kCubeMode = tqm::TurboQuantMode::KV4_FP8;
 
-  // Written by CheckGatherAgainstBaseline, which runs from the const Prime.
+  // Written by CheckGatherAgainstBaseline and CheckLloydMaxAgainstBaseline, which run from the const Prime.
   mutable double gather_baseline_checksum_ = 0.0;
   mutable double gather_checksum_ = 0.0;
   mutable bool gather_checked_ = false;
+  mutable double lloydmax_baseline_checksum_ = 0.0;
+  mutable double lloydmax_checksum_ = 0.0;
+  mutable bool lloydmax_checked_ = false;
 
   void EnqueueCacheWrite(aclrtStream stream, void* key, void* value, void* slots, int64_t tokens,
                          const tqh::ReshapeAndCacheGrid& grid) const {
@@ -678,7 +734,7 @@ class Scenario {
   DeviceBuffer query_dec_, query_dec_rot_, query_dec_prologue_rot_;
   DeviceBuffer out_dec_tq_, out_dec_v5_, out_dec_rot_, lse_dec_;
   DeviceBuffer slots_full_, slots_chunk_, block_tables_, context_lens_;
-  DeviceBuffer pi_signs_, h16_, rot_tables_, write_tables_, decode_tables_;
+  DeviceBuffer pi_signs_, h16_, rot_tables_, write_tables_, decode_tables_, lloydmax_tables_;
   DeviceBuffer key_cache_, value_cache_, scale_plane_, workspace_;
   DeviceBuffer fp16_key_cache_, fp16_value_cache_;
   DeviceBuffer mask_;
@@ -946,6 +1002,35 @@ void BuildSuite(BenchmarkRunner& primary) {
         run_leg(
             kLegDecGather, model.dec_flops, model.dec_attn_core, 1, [sc](aclrtStream s) { sc->EnqueueDecodeGather(s); },
             [sc]() { return sc->DecodeTqChecksum(); });
+      }
+
+      // Cube Uniform (kLegDecAttnCore) against Cube Lloyd-Max LUT. Same rotation mode, same launch shape,
+      // same traffic model, so the two rows are a like-for-like read of what the non-uniform codebook costs
+      // on the vector pipe -- and kLegDecGather beside them says how much of any delta is the Gather rather
+      // than the table. The effective GB/s and the per-phase median/p95 come out of the shared traffic
+      // model exactly as the other decode legs' do.
+      if (!UnpackLloydMaxEnabled()) {
+        runner.Skip(CaseName(kLegDecLloydMax, config),
+                    std::string("the Lloyd-Max codebook is not selected by ") + kUnpackEnv);
+      } else if (config.path != PathMode::kCube) {
+        runner.Skip(CaseName(kLegDecLloydMax, config), "the Lloyd-Max expand exists on the Cube path only");
+      } else if (!separate) {
+        runner.Skip(CaseName(kLegDecLloydMax, config), separate_off);
+      } else {
+        if (sc->lloydmax_checked()) {
+          const double baseline = sc->lloydmax_baseline_checksum();
+          const double lloydmax = sc->lloydmax_checksum();
+          std::printf(
+              "[ascend-bench]   %s: checksum %.9g against the uniform decode's %.9g -- %s (timing leg only; "
+              "this cache is uniformly written, so neither number is a fidelity result)\n",
+              CaseName(kLegDecLloydMax, config).c_str(), lloydmax, baseline,
+              lloydmax != baseline ? "different, as a different codebook requires"
+                                   : "EQUAL, so the Lloyd-Max table never reached the expand");
+          std::fflush(stdout);
+        }
+        run_leg(
+            kLegDecLloydMax, model.dec_flops, model.dec_attn_core, 1,
+            [sc](aclrtStream s) { sc->EnqueueDecodeLloydMax(s); }, [sc]() { return sc->DecodeTqChecksum(); });
       }
 
       if (fused_q) {

@@ -63,10 +63,16 @@ using vllm_ascend::turboquant::TurboQuantVectorDecodeService;
 
 namespace {
 
-template <TurboQuantMode MODE, typename scalar_t>
+// LLOYD_MAX_LUT quantises onto the non-uniform codebook instead of the mode's uniform grid: different
+// thresholds, the same packed nibble, the same NZ tiling, the same scale plane. A cache written this way
+// only decodes correctly through a DecodeUnpack::kLloydMaxLut decode, and vice versa -- the two halves of
+// the toggle have to be set together, which is why the launchers for them are a matched pair.
+template <TurboQuantMode MODE, typename scalar_t, bool LLOYD_MAX_LUT = false>
 class TurboQuantModeReshapeAndCache {
 public:
-    using Codec = TurboQuantModeCodec<MODE>;
+    // The writer never expands a nibble, so it needs the codebook's thresholds and no centroid table:
+    // GATHER_LUT stays off and its constant buffer is never allocated.
+    using Codec = TurboQuantModeCodec<MODE, false, LLOYD_MAX_LUT>;
 
     __aicore__ inline explicit TurboQuantModeReshapeAndCache(AscendC::TPipe *pipe) : pipe_(pipe) {}
 
@@ -286,7 +292,7 @@ template <TurboQuantMode MODE, typename scalar_t, bool PRE_ROTATED = true,
 class TurboQuantFusedDecode {
 public:
     using Mm = TurboQuantCubeMm<MODE>;
-    using Codec = TurboQuantModeCodec<MODE, UNPACK == DecodeUnpack::kGatherLut>;
+    using Codec = TurboQuantModeCodec<MODE, DecodeUnpackGathers(UNPACK), DecodeUnpackIsLloydMax(UNPACK)>;
     using Vector = TurboQuantVectorDecodeService<MODE, scalar_t, Mm, Codec, UNPACK>;
     using Cube = TurboQuantCubeDecodeService<MODE>;
     using Reducer = TurboQuantPartialReducer<scalar_t>;
@@ -750,13 +756,19 @@ private:
 }
 
 #define ASCEND_TQ_DECLARE_MM_RESHAPE_AND_CACHE(MODE_NAME, MODE, TYPE)                                                \
-    extern "C" __global__ __aicore__ void turboquant_mm_reshape_and_cache_##MODE_NAME##_##TYPE(                      \
+    ASCEND_TQ_DECLARE_MM_RESHAPE_AND_CACHE_CODEBOOK(turboquant_mm_reshape_and_cache_##MODE_NAME##_##TYPE, MODE,      \
+                                                    TYPE, false)
+
+// LLOYD_MAX selects the codebook this writer quantises on; the argument list and the launch are identical,
+// so the entries are interchangeable to a caller that knows which decode will read the cache.
+#define ASCEND_TQ_DECLARE_MM_RESHAPE_AND_CACHE_CODEBOOK(NAME, MODE, TYPE, LLOYD_MAX)                                 \
+    extern "C" __global__ __aicore__ void NAME(                                                                      \
         GM_ADDR key, GM_ADDR value, GM_ADDR keyCache, GM_ADDR valueCache, GM_ADDR scaleCache, GM_ADDR slotMapping,   \
         GM_ADDR piSigns, GM_ADDR rotTables, GM_ADDR modeTables, uint32_t numTokens, uint32_t numKvHeads,             \
         uint32_t headSize, uint32_t blockSize, uint32_t numBlocks, uint32_t tokensPerCore, float invSqrtLen)          \
     {                                                                                                                \
         AscendC::TPipe pipe;                                                                                         \
-        TurboQuantModeReshapeAndCache<MODE, TYPE> op(&pipe);                                                         \
+        TurboQuantModeReshapeAndCache<MODE, TYPE, LLOYD_MAX> op(&pipe);                                              \
         op.Init(key, value, keyCache, valueCache, scaleCache, slotMapping, piSigns, rotTables, modeTables,           \
                 numTokens, numKvHeads, headSize, blockSize, numBlocks, tokensPerCore, invSqrtLen);                   \
         op.Process();                                                                                                \
@@ -847,6 +859,19 @@ ASCEND_TQ_DECLARE_MM_FUSED_DECODE_ABLATED(turboquant_mm_fused_decode_nounpack_kv
 ASCEND_TQ_DECLARE_MM_FUSED_DECODE_ABLATED(turboquant_mm_fused_decode_gather_kv4fp8_half,
                                           TurboQuantMode::KV4_FP8, half, DecodeUnpack::kGatherLut)
 
+// The same Gather carrying the codebook it exists for: the e4m3-rounded Lloyd-Max levels of
+// TurboQuantLloydMaxTraits in place of the uniform grid. Instruction for instruction and byte for byte of
+// traffic this is the leg above, so the pair prices the codebook at zero marginal cost -- but its
+// reconstruction is a different one, so its cache must come from the matching writer below and its output
+// must NOT match the unablated decode's.
+ASCEND_TQ_DECLARE_MM_FUSED_DECODE_ABLATED(turboquant_mm_fused_decode_lloydmax_kv4fp8_half,
+                                          TurboQuantMode::KV4_FP8, half, DecodeUnpack::kLloydMaxLut)
+
+// The writer half of the same toggle: the encoder on the Lloyd-Max thresholds, writing the same NZ-tiled
+// nibbles into the same cache layout.
+ASCEND_TQ_DECLARE_MM_RESHAPE_AND_CACHE_CODEBOOK(turboquant_mm_reshape_and_cache_lloydmax_kv4fp8_half,
+                                                TurboQuantMode::KV4_FP8, half, true)
+
 // rightLayout is a GemmLayout: 0 transposes the K x N right operand into L0B, 1 takes it as N x K.
 extern "C" __global__ __aicore__ void turboquant_cube_gemm_probe_fp8(
     GM_ADDR leftGm, GM_ADDR rightGm, GM_ADDR outGm, uint32_t m, uint32_t k, uint32_t n, uint32_t headSize,
@@ -864,6 +889,7 @@ extern "C" __global__ __aicore__ void turboquant_cube_gemm_probe_fp8(
 #undef ASCEND_TQ_DECLARE_MM_FUSED_DECODE_RAW_QUERY
 #undef ASCEND_TQ_DECLARE_MM_FUSED_DECODE
 #undef ASCEND_TQ_DECLARE_MM_RESHAPE_AND_CACHE
+#undef ASCEND_TQ_DECLARE_MM_RESHAPE_AND_CACHE_CODEBOOK
 
 namespace vllm_ascend {
 
@@ -978,6 +1004,46 @@ void turboquant_mm_fused_decode_gather_impl(int32_t mode, AscendType type, void 
         queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,
         numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,
         tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen);
+}
+
+// The Lloyd-Max codebook's decode. modeTables has to carry the Lloyd-Max centroid image
+// (turboquant_launch.hpp ModeTables with lloyd_max set), and the cache has to have been written by
+// turboquant_mm_reshape_and_cache_lloydmax_impl; neither is checkable from here, and mismatching either
+// decodes a valid-looking wrong answer rather than failing.
+void turboquant_mm_fused_decode_lloydmax_impl(int32_t mode, AscendType type, void *stream, uint32_t blockDim,
+                                              void *queryRot, void *keyCache, void *valueCache, void *scaleCache,
+                                              void *blockTables, void *contextLens, void *modeTables,
+                                              void *workspace, void *output, uint32_t numTokens, uint32_t numHeads,
+                                              uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,
+                                              uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t headsPerTask,
+                                              uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,
+                                              uint32_t fusedContextLimit, float scale, float invSqrtLen)
+{
+    if (type != AscendType::FP16 || blockDim == 0 ||
+        static_cast<turboquant::TurboQuantMode>(mode) != turboquant::TurboQuantMode::KV4_FP8) {
+        return;
+    }
+    turboquant_mm_fused_decode_lloydmax_kv4fp8_half<<<blockDim, nullptr, stream>>>(
+        queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,
+        numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,
+        tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen);
+}
+
+// The Lloyd-Max codebook's cache writer, the encoder half of the pair above.
+void turboquant_mm_reshape_and_cache_lloydmax_impl(int32_t mode, AscendType type, void *stream, uint32_t blockDim,
+                                                   void *key, void *value, void *keyCache, void *valueCache,
+                                                   void *scaleCache, void *slotMapping, void *piSigns,
+                                                   void *rotTables, void *modeTables, uint32_t numTokens,
+                                                   uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,
+                                                   uint32_t numBlocks, uint32_t tokensPerCore, float invSqrtLen)
+{
+    if (type != AscendType::FP16 ||
+        static_cast<turboquant::TurboQuantMode>(mode) != turboquant::TurboQuantMode::KV4_FP8) {
+        return;
+    }
+    turboquant_mm_reshape_and_cache_lloydmax_kv4fp8_half<<<blockDim, nullptr, stream>>>(
+        key, value, keyCache, valueCache, scaleCache, slotMapping, piSigns, rotTables, modeTables, numTokens,
+        numKvHeads, headSize, blockSize, numBlocks, tokensPerCore, invSqrtLen);
 }
 #endif
 

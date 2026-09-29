@@ -224,6 +224,14 @@ consequences, both measured here (D=256, 4096 rotated Gaussian vectors):
   Gather's throughput (every other one uses a host-built constant offset table), and that
   unmeasured cost is already flagged against the Lloyd-Max decode itself.
 
+  > **Update 2026-09-29.** Option C's Gather is now a shipped-in-tests instruction sequence and it
+  > has *executed*: `LLOYD_MAX_LUT` (`turboquant_codec_mx.h`) puts the e4m3-rounded Lloyd-Max
+  > codebook into the Cube decode's 16-entry UB table, and fused cases (k) and (l) run it on the
+  > arch35 camodel — correct output, 0 B of exception dumps. So the first data-dependent Gather in
+  > this tree works. Its **throughput is still unmeasured**: the camodel is functional and this
+  > host has no 950PR part. The device benchmark's `dec_attn_core` / `dec_gather` / `dec_lloydmax`
+  > legs (`ASCEND_BENCH_TQ_UNPACK`) are the measurement, and they have never run.
+
 On the **uniform mid-rise** grid neither problem exists: the probability is just `t − floor(t)`,
 no Gather, and an `absmax/7.5` scale clips nothing by construction. That is a real argument for
 prototyping on the Cube path first even though it is test-only.

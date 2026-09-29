@@ -60,6 +60,11 @@ struct FusedShape {
   // the AIC on a flag nothing will set. The cache is still built and uploaded, so a decode that read one
   // of these rows anyway would not read zeros.
   bool unmapped_block_table = false;
+  // Quantise on the e4m3-rounded Lloyd-Max codebook instead of the uniform mid-rise grid
+  // (DecodeUnpack::kLloydMaxLut). The whole scenario moves together: the host cache, the mode-table image,
+  // the kernel writer and the decode entry point, because a cache and a decode on different codebooks
+  // produce a plausible wrong answer rather than an error. Not available through the raw-query entry.
+  bool lloyd_max = false;
 };
 
 // The raw GM image one cache-writer launch produced, copied out of device memory.
@@ -144,7 +149,7 @@ class FusedCubeScenario {
     const std::vector<int32_t> permutation = rng.Permutation(static_cast<int32_t>(num_blocks));
     block_table_.assign(permutation.begin(), permutation.begin() + static_cast<std::ptrdiff_t>(blocks_per_seq_));
     cache_ = BuildMirroredKvCache(rng, shape.context_len, num_blocks, shape.block_size, shape.num_kv_heads, d,
-                                  block_table_, !shape.kernel_writer);
+                                  block_table_, !shape.kernel_writer, codebook());
     const size_t query_elems = static_cast<size_t>(shape.batch * shape.num_heads * d);
     const std::vector<float> query = rng.NormalHalfExact(query_elems, 0.0f, 1.0f);
     if (shape.gated) {
@@ -157,7 +162,7 @@ class FusedCubeScenario {
     pi_signs_ = DeviceBuffer::FromHost(PiSigns(d));
     h16_ = DeviceBuffer::FromHost(Hadamard16Half());
     rot_tables_ = DeviceBuffer::FromHost(CodecTables(d, 1));
-    mode_tables_ = DeviceBuffer::FromHost(ModeTables(kFusedMode, d, kUnpackRows, kCubeTileRows));
+    mode_tables_ = DeviceBuffer::FromHost(ModeTables(kFusedMode, d, kUnpackRows, kCubeTileRows, shape.lloyd_max));
     if (shape.kernel_writer) {
       WriteThroughKernel();
     } else {
@@ -192,16 +197,19 @@ class FusedCubeScenario {
                            shape_.block_size, plan_aiv > 0 ? plan_aiv : aiv_num_, kFusedContextLimit, split_policy);
   }
 
+  // The shape's codebook picks the entry point: the two take the same arguments and differ only in which
+  // 16 levels their expand gathers, which is the same 16 the cache above was written with.
   FusedRun RunFused(const FusedDecodeGrid& grid) {
+    const bool lloyd_max = shape_.lloyd_max;
     return Launch(grid, [&](void* workspace, float inv_sqrt_len) {
-      turboquant_mm_fused_decode_impl(
-          static_cast<int32_t>(kFusedMode), AscendType::FP16, stream_, grid.block_dim, query_rot_.get(),
-          key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
-          mode_tables_.get(), workspace, out_.get(), static_cast<uint32_t>(shape_.batch),
-          static_cast<uint32_t>(shape_.num_heads), static_cast<uint32_t>(shape_.num_kv_heads),
-          static_cast<uint32_t>(shape_.head_size), static_cast<uint32_t>(shape_.block_size),
-          static_cast<uint32_t>(blocks_per_seq_), static_cast<uint32_t>(grid.num_splits), grid.heads_per_task,
-          grid.tasks_per_block, grid.reduce_tasks_per_block, grid.fused_context_limit, scale_, inv_sqrt_len);
+      const auto launch = lloyd_max ? &turboquant_mm_fused_decode_lloydmax_impl : &turboquant_mm_fused_decode_impl;
+      launch(static_cast<int32_t>(kFusedMode), AscendType::FP16, stream_, grid.block_dim, query_rot_.get(),
+             key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
+             mode_tables_.get(), workspace, out_.get(), static_cast<uint32_t>(shape_.batch),
+             static_cast<uint32_t>(shape_.num_heads), static_cast<uint32_t>(shape_.num_kv_heads),
+             static_cast<uint32_t>(shape_.head_size), static_cast<uint32_t>(shape_.block_size),
+             static_cast<uint32_t>(blocks_per_seq_), static_cast<uint32_t>(grid.num_splits), grid.heads_per_task,
+             grid.tasks_per_block, grid.reduce_tasks_per_block, grid.fused_context_limit, scale_, inv_sqrt_len);
     });
   }
 
@@ -209,6 +217,13 @@ class FusedCubeScenario {
   // into a fresh buffer that is then compared word for word with what rotate_q wrote at setup. output_stage is a
   // TurboQuantOutputStage; kGatedOutput needs a gated shape.
   FusedRun RunFusedRawQuery(const FusedDecodeGrid& grid, uint32_t output_stage = kRotatedBasis) {
+    // There is no Lloyd-Max raw-query entry point, and running the uniform one over a Lloyd-Max cache
+    // would decode a plausible wrong answer instead of failing. Report nothing launched; every caller
+    // asserts on launches == 1.
+    if (shape_.lloyd_max) {
+      std::printf("[ fused ] the raw-query decode has no Lloyd-Max entry point; not launched\n");
+      return FusedRun{};
+    }
     DeviceBuffer rotated = DeviceBuffer::FromHost(std::vector<float>(query_rot_host_.size(), kFusedOutputSentinel));
     void* gate = output_stage == kGatedOutput ? gate_.get() : nullptr;
     FusedRun run = Launch(grid, [&](void* workspace, float inv_sqrt_len) {
@@ -280,6 +295,10 @@ class FusedCubeScenario {
 
   int64_t blocks_per_seq() const { return blocks_per_seq_; }
 
+  MirroredCodebook codebook() const {
+    return shape_.lloyd_max ? MirroredCodebook::kLloydMax : MirroredCodebook::kUniform;
+  }
+
   // The GM image the last cache-writer launch produced. Note that the construction-time launch was fed the
   // original dense cache and every launch after it is fed the rescaled one (see WriteThroughKernel), so a
   // caller comparing images across launches has to take its own control rather than use the constructor's.
@@ -343,9 +362,11 @@ class FusedCubeScenario {
 
  private:
   // The writer is given the unrotated fp16 of the host's dequantised vectors. It rotates them back and
-  // quantises each coordinate onto the level it came from, since a dequantised coordinate sits half a step
-  // from both neighbouring thresholds. Its scale is the RMS of those vectors rather than of the draw, so
-  // the exact-attention reference is rescaled to the scales the writer stored.
+  // quantises each coordinate onto the level it came from, because a level always sits strictly inside its
+  // own decision cell -- centred there on the uniform grid, off-centre but never within 0.125 scale units
+  // of a boundary on the Lloyd-Max one, which is orders of magnitude more slack than the fp16 cast and the
+  // rotation round trip consume. Its scale is the RMS of those vectors rather than of the draw, so the
+  // exact-attention reference is rescaled to the scales the writer stored.
   void WriteThroughKernel() {
     const std::vector<int32_t> slots = LaunchWriter(0);
     const int64_t tokens = shape_.context_len;
@@ -397,18 +418,21 @@ class FusedCubeScenario {
     slot_storage.insert(slot_storage.end(), slots.begin(), slots.end());
     DeviceBuffer slot_mapping = DeviceBuffer::FromHost(slot_storage);
     void* slot_arg = static_cast<void*>(static_cast<int32_t*>(slot_mapping.get()) + slot_offset_elems);
-    DeviceBuffer write_tables = DeviceBuffer::FromHost(ModeTables(kFusedMode, d, 1, 0));
+    DeviceBuffer write_tables = DeviceBuffer::FromHost(ModeTables(kFusedMode, d, 1, 0, shape_.lloyd_max));
     key_cache_ = DeviceBuffer::FromHost(std::vector<int8_t>(cache_.key_packed.size(), 0));
     value_cache_ = DeviceBuffer::FromHost(std::vector<int8_t>(cache_.value_packed.size(), 0));
     scale_plane_ = DeviceBuffer::FromHost(std::vector<float>(cache_.scales.size(), 0.0f));
 
     const ReshapeAndCacheGrid grid = PlanReshapeAndCache(tokens, aiv_num_);
-    turboquant_mm_reshape_and_cache_impl(
-        static_cast<int32_t>(kFusedMode), AscendType::FP16, stream_, grid.block_dim, key_fp16.get(), value_fp16.get(),
-        key_cache_.get(), value_cache_.get(), scale_plane_.get(), slot_arg, pi_signs_.get(), rot_tables_.get(),
-        write_tables.get(), static_cast<uint32_t>(tokens), static_cast<uint32_t>(kv_heads), static_cast<uint32_t>(d),
-        static_cast<uint32_t>(block_size), static_cast<uint32_t>(blocks_per_seq_ * shape_.pool_factor),
-        grid.tokens_per_core, 1.0f / std::sqrt(static_cast<float>(d)));
+    // Same argument list, same layout written; the codebook decides only which thresholds bin a coordinate.
+    const auto write = shape_.lloyd_max ? &turboquant_mm_reshape_and_cache_lloydmax_impl
+                                        : &turboquant_mm_reshape_and_cache_impl;
+    write(static_cast<int32_t>(kFusedMode), AscendType::FP16, stream_, grid.block_dim, key_fp16.get(),
+          value_fp16.get(), key_cache_.get(), value_cache_.get(), scale_plane_.get(), slot_arg, pi_signs_.get(),
+          rot_tables_.get(), write_tables.get(), static_cast<uint32_t>(tokens), static_cast<uint32_t>(kv_heads),
+          static_cast<uint32_t>(d), static_cast<uint32_t>(block_size),
+          static_cast<uint32_t>(blocks_per_seq_ * shape_.pool_factor), grid.tokens_per_core,
+          1.0f / std::sqrt(static_cast<float>(d)));
     ACL_CHECK(aclrtSynchronizeStream(stream_));
     written_key_ = key_cache_.ToHost<int8_t>();
     written_value_ = value_cache_.ToHost<int8_t>();

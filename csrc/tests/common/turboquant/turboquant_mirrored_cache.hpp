@@ -44,6 +44,8 @@ inline uint8_t Fp8E4m3fnBits(float value) { return fp8::E4m3fnBits(value); }
 inline float Fp8E4m3fnValue(uint8_t bits) { return fp8::E4m3fnValue(bits); }
 
 using MirroredTraits = vllm_ascend::turboquant::TurboQuantModeTraits<vllm_ascend::turboquant::TurboQuantMode::KV4_FP8>;
+using MirroredLloydMax =
+    vllm_ascend::turboquant::TurboQuantLloydMaxTraits<vllm_ascend::turboquant::TurboQuantMode::KV4_FP8>;
 
 constexpr int32_t kMirroredLevels = MirroredTraits::kLevels;
 constexpr float kMirroredGain = MirroredTraits::kGain;
@@ -53,7 +55,43 @@ constexpr uint32_t kMirroredNibbleMask = 0x0F;
 constexpr int kMirroredNibbleBits = 4;
 constexpr int64_t kMirroredScaleLanes = 8;
 
-inline float MirroredLevel(int32_t index) { return static_cast<float>(index) - kMirroredAffineBias; }
+// Which codebook the cache is quantised on. Both write the same nibble into the same NZ-tiled byte and
+// the same RMS into the same scale lane; what differs is the level a bin means, and therefore the
+// thresholds that choose the bin and the gain the decode divides out. kLloydMax mirrors the kernel's
+// LLOYD_MAX_LUT instantiation (turboquant_codec_mx.h) and nothing else about the cache moves.
+enum class MirroredCodebook { kUniform, kLloydMax };
+
+constexpr float MirroredGainOf(MirroredCodebook codebook) {
+  return codebook == MirroredCodebook::kLloydMax ? MirroredLloydMax::kGain : kMirroredGain;
+}
+
+// The level bin `index` reconstructs to, in units of the per-vector scale divided by the codebook's gain.
+// This is exactly the fp8 operand the Cube decode's expand produces for that bin.
+inline float MirroredLevelOf(MirroredCodebook codebook, int32_t index) {
+  return codebook == MirroredCodebook::kLloydMax ? MirroredLloydMax::kCentroids[index]
+                                                 : static_cast<float>(index) - kMirroredAffineBias;
+}
+
+// The bin a scaled coordinate falls in. The Lloyd-Max arm counts decision thresholds the way the kernel's
+// ComputeLevelBins does -- the number strictly below u, since the kernel reads a sign bit and +0.0 is
+// positive, so a coordinate exactly on a threshold takes the lower bin. The uniform arm keeps the
+// round-half-up form it has always used rather than the equivalent threshold count: the two agree on
+// every input except one exactly on a boundary, where this one rounds up, and it is what the recorded
+// fused goldens were built with. TurboQuantMirroredCache.UniformBinningIsTheKernelsThresholdCount holds
+// the pair to that one difference.
+inline int32_t MirroredBinOf(MirroredCodebook codebook, float u) {
+  if (codebook == MirroredCodebook::kUniform) {
+    return std::clamp(static_cast<int32_t>(std::floor(u * kMirroredGain + kMirroredAffineBias + 0.5f)), 0,
+                      kMirroredLevels - 1);
+  }
+  int32_t bin = 0;
+  for (int32_t i = 0; i < kMirroredLevels - 1; ++i) {
+    bin += (u > MirroredLloydMax::kThresholds[i]) ? 1 : 0;
+  }
+  return bin;
+}
+
+inline float MirroredLevel(int32_t index) { return MirroredLevelOf(MirroredCodebook::kUniform, index); }
 
 inline int64_t MirroredScaleSlotFloats(int64_t num_kv_heads) {
   return (2 * num_kv_heads + kMirroredScaleLanes - 1) / kMirroredScaleLanes * kMirroredScaleLanes;
@@ -88,10 +126,12 @@ inline int8_t MirroredPackedPair(int32_t low_index, int32_t high_index) {
 
 // block_size must be a multiple of kCubeTileRows, as the NZ-tiled cache requires. With mirror_halves every
 // vector's second half repeats its first, which is what the fused goldens were recorded on; without it the
-// halves are drawn independently, so a swapped nibble lane changes the data.
+// halves are drawn independently, so a swapped nibble lane changes the data. codebook selects the grid the
+// coordinates are quantised on and must match the decode the cache is handed to.
 inline MirroredKvCache BuildMirroredKvCache(DeterministicRandom& rng, int64_t context_len, int64_t num_blocks,
                                             int64_t block_size, int64_t num_kv_heads, int64_t head_size,
-                                            const std::vector<int32_t>& block_table, bool mirror_halves = true) {
+                                            const std::vector<int32_t>& block_table, bool mirror_halves = true,
+                                            MirroredCodebook codebook = MirroredCodebook::kUniform) {
   const size_t half = static_cast<size_t>(head_size / 2);
   const size_t head = static_cast<size_t>(head_size);
   const size_t packed_bytes =
@@ -99,7 +139,9 @@ inline MirroredKvCache BuildMirroredKvCache(DeterministicRandom& rng, int64_t co
   const size_t slot_floats = static_cast<size_t>(MirroredScaleSlotFloats(num_kv_heads));
   const size_t kv_heads = static_cast<size_t>(num_kv_heads);
   const size_t slots = static_cast<size_t>(num_blocks * block_size);
-  const int8_t zero_byte_operand = static_cast<int8_t>(Fp8E4m3fnBits(MirroredLevel(kMirroredNibbleSignShift)));
+  const float gain = MirroredGainOf(codebook);
+  const int8_t zero_byte_operand =
+      static_cast<int8_t>(Fp8E4m3fnBits(MirroredLevelOf(codebook, kMirroredNibbleSignShift)));
 
   MirroredKvCache cache;
   cache.key_packed.assign(slots * kv_heads * packed_bytes, 0);
@@ -130,20 +172,17 @@ inline MirroredKvCache BuildMirroredKvCache(DeterministicRandom& rng, int64_t co
 
         const size_t row = slot * kv_heads + kv;
         const size_t dense_row = (static_cast<size_t>(t) * kv_heads + kv) * head;
-        const auto index_of = [&](float x) {
-          return std::clamp(static_cast<int32_t>(std::floor(x / scale * kMirroredGain + kMirroredAffineBias + 0.5f)), 0,
-                            kMirroredLevels - 1);
-        };
+        const auto index_of = [&](float x) { return MirroredBinOf(codebook, x / scale); };
         for (size_t j = 0; j < half; ++j) {
           const int32_t low_index = index_of(source[j]);
           const int32_t high_index = mirror_halves ? low_index : index_of(source[half + j]);
           packed[MirroredPackedByte(slot, kv, j, kv_heads, packed_bytes)] = MirroredPackedPair(low_index, high_index);
-          const float low_level = MirroredLevel(low_index);
-          const float high_level = MirroredLevel(high_index);
+          const float low_level = MirroredLevelOf(codebook, low_index);
+          const float high_level = MirroredLevelOf(codebook, high_index);
           operands[row * head + j] = static_cast<int8_t>(Fp8E4m3fnBits(low_level));
           operands[row * head + half + j] = static_cast<int8_t>(Fp8E4m3fnBits(high_level));
-          dense[dense_row + j] = low_level * scale / kMirroredGain;
-          dense[dense_row + half + j] = high_level * scale / kMirroredGain;
+          dense[dense_row + j] = low_level * scale / gain;
+          dense[dense_row + half + j] = high_level * scale / gain;
         }
       }
     }

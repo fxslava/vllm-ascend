@@ -60,7 +60,7 @@ csrc/tests/
 |   |-- test_sim_turboquant_rotate_q.cpp          the standalone query rotation, both paths
 |   |-- test_sim_turboquant_kernels.cpp
 |   |-- test_sim_turboquant_decode.cpp
-|   |-- test_sim_turboquant_fused.cpp             the fused Cube decode, seven cases (D 256 and 128, raw query), vs goldens and the kernel writer
+|   |-- test_sim_turboquant_fused.cpp             the fused Cube decode, cases (a)-(l) (D 256 and 128, raw query, Lloyd-Max codebook), vs goldens and the kernel writer
 |   |-- test_sim_turboquant_multimode.cpp         the fused Cube decode, all three modes
 |   |-- test_sim_cube_hadamard.cpp                spike: one shape of the sweep below
 |   `-- test_sim_cube_gemm.cpp                    spike: the fp8 Cube fractal contract
@@ -400,6 +400,7 @@ warmup.
 | `ASCEND_BENCH_TQ_AUDIT_PATH` | `cube` | `aiv` forces the AIV-only decode; every model takes the Cube decode otherwise |
 | `ASCEND_BENCH_TQ_AUDIT_SPLIT` | `adaptive` | the Cube decode's split policy: `adaptive` (two tiers: grid saturation below 8192 tokens, at least one split per 2048 rows from there), `fill` or `context` for an A/B |
 | `ASCEND_BENCH_TQ_ROTATION_MODE` | `both` | `bench_device_950pr_turboquant` only: `separate` times rotate_q as its own launch ahead of the decode, `fused_prologue` hands the Cube decode the raw query to rotate in the same launch (Table B path `Cube-FusedQ`, `T_rot_q` 0.00), `both` times each |
+| `ASCEND_BENCH_TQ_UNPACK` | `on` | `bench_device_950pr_turboquant` only, Cube path only: which KV expand the decode legs time. `on` the shipping per-plane Adds (`dec_attn_core`, "Cube Uniform"); `off` the ablation with the expand compiled out (`dec_nounpack`, all-zero output, timing only); `gather` the same expand through a 16-entry UB Gather over the uniform grid (`dec_gather`, bit-identical output); `lloydmax` that Gather over the e4m3-rounded Lloyd-Max codebook (`dec_lloydmax`, "Cube Lloyd-Max LUT", different output by construction); `both` runs `on` + `off` + `lloydmax`, `all` runs every leg. Every leg shares one launch shape and one traffic model, so the rows are directly comparable |
 | `ASCEND_BENCH_TQ_AUDIT_GLM_D` | 128 | GLM-5.2's head size; it is specified at 128 **or** 256 |
 | `ASCEND_BENCH_TQ_AUDIT_WARMUP` / `_ITERS` | 5 / 20 | the `S <= 32K` budget. The shared `ASCEND_BENCH_WARMUP` / `_ITERS` do not apply, and `pipeline_batch` is pinned to 1 |
 | `ASCEND_BENCH_TQ_AUDIT_ULTRA_WARMUP` / `_ULTRA_ITERS` | 1 / 3 | the `S >= 262K` budget, which gets its own runner and its own report table |

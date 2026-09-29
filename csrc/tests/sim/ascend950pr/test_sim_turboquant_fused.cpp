@@ -14,7 +14,8 @@
  * limitations under the License.
  */
 
-// The fused single-launch Cube decode (TURBOQUANT_TESTS.md 13.25), kv4fp8, on eight cases (D 256 unless noted):
+// The fused single-launch Cube decode (TURBOQUANT_TESTS.md 13.25), kv4fp8, on ten fidelity cases (D 256
+// unless noted; (k) and (l) on the Lloyd-Max codebook of 13.38, the rest on the uniform grid):
 //
 //   (a) H_Q 4,  H_KV 2, S 64,  block 64   one tile
 //   (b) H_Q 4,  H_KV 2, S 128, block 64   two tiles in one task: the L1 slot ring
@@ -29,6 +30,14 @@
 //   (h) H_Q 8,  H_KV 2, S 128, block 64, three tokens, through the raw-query entry (13.36): 24 query vectors,
 //       so the prologue rotates one 16-vector H16 chunk on the Cube and the other 8 on the vector cores; the
 //       output is written in the rotated basis, then un-rotated and gated unsplit, then over two splits
+//   (k) (a)'s shape on the Lloyd-Max codebook (LLOYD_MAX_LUT): host-built cache, decoded through the
+//       DecodeUnpack::kLloydMaxLut entry. It is (a)'s numbers that make it worth having -- the reference is
+//       exact fp32 attention over the levels the cache HOLDS, so the codebook cancels out of the cosine and
+//       what is left is whether the gathered table decodes the bins the host wrote. A table that was stale,
+//       mis-indexed, or still the uniform grid would collapse it.
+//   (l) (e)'s shape on the Lloyd-Max codebook: the cache written by the matching kernel writer and then
+//       decoded. This is the only case that runs the Lloyd-Max thresholds, so it is the encoder half of the
+//       toggle; the byte compare against the host encoder is where it is actually checked.
 //
 // Each fused output is hashed (FNV-1a over its half bit patterns) against a golden, and its cosine against
 // exact fp32 attention must not regress. The goldens are the bit-exact reference: the barriered A/B instance
@@ -99,6 +108,10 @@ constexpr tqh::FusedSplitPolicy kContextOnly = tqh::FusedSplitPolicy::kContextOn
 // The writer's scales are float RMS values of vectors that went through fp16 and back through the rotation;
 // the host's are double RMS values of the vectors before either.
 constexpr double kWrittenScaleTolerance = 2e-3;
+// (k) and (l) against exact fp32 attention over the levels their own cache holds. The kv4fp8 D = 256 cases
+// sit near 0.9994 and the codebook cancels out of this comparison, so a decode that reached for the uniform
+// table -- wrong levels, and a score scale 2.983x off -- lands nowhere near this.
+constexpr double kLloydMaxCosineFloor = 0.999;
 constexpr int64_t kBatchContext = 128;
 constexpr int64_t kBatchTokens = 3;
 constexpr uint32_t kBatchCubeChunk = 16;
@@ -127,6 +140,15 @@ tqh::FusedShape Shape(int64_t num_heads, int64_t context_len, bool kernel_writer
   shape.block_size = kBlockSize;
   shape.context_len = context_len;
   shape.kernel_writer = kernel_writer;
+  return shape;
+}
+
+// The same shape on the non-uniform codebook. Everything the scenario touches moves together -- the host
+// cache, the mode-table image, the kernel writer and the decode entry -- because a cache and a decode on
+// different codebooks agree on every byte of layout and disagree only on what the bytes mean.
+tqh::FusedShape LloydMaxShape(int64_t num_heads, int64_t context_len, bool kernel_writer = false) {
+  tqh::FusedShape shape = Shape(num_heads, context_len, kernel_writer);
+  shape.lloyd_max = true;
   return shape;
 }
 
@@ -185,6 +207,19 @@ const FusedCase kCaseHGatedSplit = {"(h) gated split", kBatchShape, 0, kFillBloc
 const FusedCase kCaseI = {"(i)", UnmappedShape(), 0, kFillBlocks, 0.0, kGoldenUnrecorded};
 const FusedCase kCaseJ = {
     "(j)", Shape(kNarrowGroupHeads, kSingleTileContext, true), 0, kFillBlocks, 0.0, kGoldenUnrecorded};
+// (k) and (l): the Lloyd-Max codebook at (a)'s and (e)'s shapes. Their goldens and cosines belong to the
+// codebook as much as to the shape -- the cache holds different levels, so the decode's bits differ from
+// (a)'s and (e)'s by construction and neither golden is shared with them. Recorded 2026-09-29 on the
+// Ascend950PR_9589 camodel (aiv 64), in the pass where (a) and (e) both reproduced their 2026-09-16 and
+// 2026-09-17 goldens unchanged.
+const FusedCase kCaseK = {
+    "(k)", LloydMaxShape(kNarrowGroupHeads, kSingleTileContext), 0, kFillBlocks, 0.999143, 0x434fe707d97abef9ull};
+const FusedCase kCaseL = {"(l)",
+                          LloydMaxShape(kNarrowGroupHeads, kSingleTileContext, true),
+                          0,
+                          kFillBlocks,
+                          0.999493,
+                          0xb937fc50dafc55d6ull};
 // Element-aligned int32 offsets that land inside a 32-byte burst rather than on one. One
 // of them, trimmed from {1, 2, 3} on 2026-09-28. The offsets differ only in how far into
 // the burst they sit, and each one is another kernel-writer launch: measured at about
@@ -345,6 +380,61 @@ TEST_F(TurboQuantFusedDecode, DecodesTheCacheTheKernelWriterWrote) {
   const tqh::FusedRun fused = RunCase(&scenario, kCaseE, &watchdog_, scenario.Reference());
   EXPECT_EQ(fused.num_splits, 1) << "a context inside the fused limit is never split";
   ExpectNoExceptionDumps(kCaseE.tag);
+}
+
+// (k) The Lloyd-Max codebook over a host-built cache. What this can and cannot see is worth being precise
+// about: Reference() is exact fp32 attention over the dequantised levels the cache holds, so the codebook
+// divides out of the cosine entirely and this is NOT a fidelity measurement -- the codebook's SNR is earned
+// on the host tier (TurboQuantLloydMaxCodebook), where the comparison is against unquantised vectors. What
+// it does see is everything that could go wrong in the kernel: the gathered table's contents and indexing,
+// the score and value scales now that Codec::kGain is 1 rather than 2.983, and the fp8 operand cast of
+// levels whose magnitudes are a third of the uniform grid's. Decoding this cache with the uniform table
+// would miss on all three at once.
+TEST_F(TurboQuantFusedDecode, DecodesTheLloydMaxCodebookToItsGolden) {
+  PrintShape(kCaseK, aiv_num_, queried_);
+  watchdog_.Arm("(k) Lloyd-Max scenario setup and query rotation");
+  tqh::FusedCubeScenario scenario(kCaseK.shape, stream_, aiv_num_);
+  watchdog_.Disarm();
+
+  const std::vector<float> reference = scenario.Reference();
+  const tqh::FusedRun fused = RunCase(&scenario, kCaseK, &watchdog_, reference);
+  const double cosine = tqh::FusedCosine(fused.output, reference);
+  std::printf("[ fused ] (k) Lloyd-Max cos vs fp32 over its own levels %.6f (floor %.6f)\n", cosine,
+              kLloydMaxCosineFloor);
+  EXPECT_GE(cosine, kLloydMaxCosineFloor)
+      << "(k): the decode does not reproduce the levels the Lloyd-Max cache holds";
+  EXPECT_EQ(fused.num_splits, 1) << "a context inside the fused limit is never split";
+  ExpectNoExceptionDumps(kCaseK.tag);
+}
+
+// (l) The encoder half. The kernel writer quantises on the Lloyd-Max thresholds and the byte compare
+// against the host encoder is the assertion that matters -- it is exact, over every packed nibble, and it
+// is the only place the thresholds are checked at all. The decode after it closes the round trip.
+TEST_F(TurboQuantFusedDecode, WritesAndDecodesTheLloydMaxCodebook) {
+  PrintShape(kCaseL, aiv_num_, queried_);
+  watchdog_.Arm("(l) Lloyd-Max kernel cache write and query rotation");
+  tqh::FusedCubeScenario scenario(kCaseL.shape, stream_, aiv_num_);
+  watchdog_.Disarm();
+
+  const tqh::WrittenCacheAgreement written = scenario.CompareWrittenCache();
+  std::printf(
+      "[ fused ] (l) written Lloyd-Max cache: %zu of %zu packed bytes differ from the host encoder (%zu with "
+      "the nibble lanes swapped); %zu scale lanes, %zu pad mismatches, max rel err %.3e\n",
+      written.packed_mismatches, written.packed_bytes, written.swapped_lane_mismatches, written.scale_lanes,
+      written.scale_pad_mismatches, written.max_scale_rel_err);
+  EXPECT_EQ(written.packed_mismatches, 0u)
+      << "the kernel writer's Lloyd-Max bins differ from the host encoder's; the thresholds disagree";
+  EXPECT_EQ(written.scale_pad_mismatches, 0u) << "the kernel writer touched a pad lane or an unwritten slot";
+  EXPECT_LE(written.max_scale_rel_err, kWrittenScaleTolerance) << "a written scale is not the RMS it encodes";
+
+  const std::vector<float> reference = scenario.Reference();
+  const tqh::FusedRun fused = RunCase(&scenario, kCaseL, &watchdog_, reference);
+  const double cosine = tqh::FusedCosine(fused.output, reference);
+  std::printf("[ fused ] (l) Lloyd-Max round trip cos vs fp32 over its own levels %.6f (floor %.6f)\n", cosine,
+              kLloydMaxCosineFloor);
+  EXPECT_GE(cosine, kLloydMaxCosineFloor) << "(l): the Lloyd-Max round trip does not close";
+  EXPECT_EQ(fused.num_splits, 1) << "a context inside the fused limit is never split";
+  ExpectNoExceptionDumps(kCaseL.tag);
 }
 
 // (i) The numTiles == 0 path. Every block-table entry is -1, so every task has a non-empty block range that

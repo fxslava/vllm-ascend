@@ -119,12 +119,16 @@ ModePlanes PlanesOf(tqm::TurboQuantMode mode) {
   }
 }
 
-const float* CentroidsOf(tqm::TurboQuantMode mode) {
+// The image the decode's centroid table is filled from: entry b is bin b's operand. lloyd_max picks the
+// e4m3-rounded non-uniform codebook, which only kv4fp8 has; for any other mode it is the mode's own grid,
+// because no other mode can be instantiated with LLOYD_MAX_LUT.
+const float* CentroidsOf(tqm::TurboQuantMode mode, bool lloyd_max) {
   switch (mode) {
     case tqm::TurboQuantMode::KV3_FP4:
       return tqm::TurboQuantModeTraits<tqm::TurboQuantMode::KV3_FP4>::kCentroids;
     case tqm::TurboQuantMode::KV4_FP8:
-      return tqm::TurboQuantModeTraits<tqm::TurboQuantMode::KV4_FP8>::kCentroids;
+      return lloyd_max ? tqm::TurboQuantLloydMaxTraits<tqm::TurboQuantMode::KV4_FP8>::kCentroids
+                       : tqm::TurboQuantModeTraits<tqm::TurboQuantMode::KV4_FP8>::kCentroids;
     default:
       return tqm::TurboQuantModeTraits<tqm::TurboQuantMode::KV5_FP8>::kCentroids;
   }
@@ -160,13 +164,14 @@ int64_t ModeTableWords(tqm::TurboQuantMode mode, int64_t head_size, int64_t batc
   return 2 * head_size * batch_rows + 3 * kFp32PerBlock + head_size + cfg.levels;
 }
 
-std::vector<int32_t> ModeTables(tqm::TurboQuantMode mode, int64_t head_size, int64_t batch_rows, int64_t nz_rows) {
+std::vector<int32_t> ModeTables(tqm::TurboQuantMode mode, int64_t head_size, int64_t batch_rows, int64_t nz_rows,
+                                bool lloyd_max) {
   const ModePlanes planes = PlanesOf(mode);
   const tqm::TurboQuantModeConfig cfg = tqm::TurboQuantModeConfigOf(mode);
   if (cfg.is_affine) {
     std::vector<int32_t> levels;
     levels.reserve(static_cast<size_t>(cfg.levels));
-    const float* affine_centroids = CentroidsOf(mode);
+    const float* affine_centroids = CentroidsOf(mode, lloyd_max);
     for (int64_t level = 0; level < cfg.levels; ++level) {
       levels.push_back(FloatBits(affine_centroids[level]));
     }
@@ -217,7 +222,7 @@ std::vector<int32_t> ModeTables(tqm::TurboQuantMode mode, int64_t head_size, int
     }
   }
 
-  const float* centroids = CentroidsOf(mode);
+  const float* centroids = CentroidsOf(mode, lloyd_max);
   for (int64_t level = 0; level < cfg.levels; ++level) {
     tables.push_back(FloatBits(centroids[level]));
   }

@@ -123,17 +123,27 @@ std::string RotationModesLabel();
 //
 //     T(dec_nounpack) - T(dec_attn_core) = the unpack phase, at fixed traffic.
 //
-// ASCEND_BENCH_TQ_UNPACK=on|off|both|gather|all, on by default. Three expands of
-// the same decode share one launch shape and one traffic model:
+// ASCEND_BENCH_TQ_UNPACK=on|off|both|gather|lloydmax|all, on by default. Four
+// expands of the same decode share one launch shape and one traffic model:
 //
-//   on      the shipping affine expand alone (kLegDecAttnCore).
-//   off     the ablation in its place (kLegDecNoUnpack): no expand at all. Its
-//           output is all-zero by construction and its checksum means nothing.
-//   both    the pair above, which is the measurement above.
-//   gather  the 16-entry UB Gather expand in place of the shipping expand
-//           (kLegDecGather): a correct variant, whose checksum must match the
-//           unablated decode's.
-//   all     all three, which is what prices Option C against both.
+//   on        the shipping affine expand alone (kLegDecAttnCore).
+//   off       the ablation in its place (kLegDecNoUnpack): no expand at all. Its
+//             output is all-zero by construction and its checksum means nothing.
+//   both      the shipping expand, the ablation, and the Lloyd-Max codebook
+//             (kLegDecLloydMax) -- the unpack-phase measurement above plus the
+//             Cube Uniform / Cube Lloyd-Max LUT comparison the toggle exists for.
+//   gather    the 16-entry UB Gather expand in place of the shipping expand
+//             (kLegDecGather): a correct variant, whose checksum must match the
+//             unablated decode's.
+//   lloydmax  that same Gather over the non-uniform codebook, against the
+//             shipping expand. This is the pair to read for the codebook's
+//             latency cost, because kLegDecGather and kLegDecLloydMax run
+//             identical instructions and differ only in 64 B of table.
+//   all       every leg, which prices Option C against both the ablation and
+//             the codebook.
+//
+// Only "on" is a claim about the shipping decode. "off" is an instrument;
+// "gather" and "lloydmax" are variants the wheel does not build.
 // -----------------------------------------------------------------------------
 
 inline constexpr const char* kUnpackEnv = "ASCEND_BENCH_TQ_UNPACK";
@@ -141,15 +151,17 @@ inline constexpr const char* kUnpackOn = "on";
 inline constexpr const char* kUnpackOff = "off";
 inline constexpr const char* kUnpackBoth = "both";
 inline constexpr const char* kUnpackGather = "gather";
+inline constexpr const char* kUnpackLloydMax = "lloydmax";
 inline constexpr const char* kUnpackAll = "all";
 
 inline bool UnpackModeValid() {
   const std::string raw = env::String(kUnpackEnv);
   return raw.empty() || raw == kUnpackOn || raw == kUnpackOff || raw == kUnpackBoth || raw == kUnpackGather ||
-         raw == kUnpackAll;
+         raw == kUnpackLloydMax || raw == kUnpackAll;
 }
 
-// The unablated legs. Both replacements ("off" and "gather") stand in for them rather than joining them.
+// The unablated legs. The two replacements that stand in for them rather than joining them are "off" and
+// "gather"; "lloydmax" is a comparison against the shipping expand, so it keeps it.
 inline bool UnpackStandardEnabled() {
   const std::string raw = env::String(kUnpackEnv);
   return raw != kUnpackOff && raw != kUnpackGather;
@@ -165,6 +177,12 @@ inline bool UnpackAblationEnabled() {
 inline bool UnpackGatherEnabled() {
   const std::string raw = env::String(kUnpackEnv);
   return raw == kUnpackGather || raw == kUnpackAll;
+}
+
+// The Lloyd-Max codebook's leg. Off unless asked for by name.
+inline bool UnpackLloydMaxEnabled() {
+  const std::string raw = env::String(kUnpackEnv);
+  return raw == kUnpackLloydMax || raw == kUnpackBoth || raw == kUnpackAll;
 }
 
 // Anything the parser does not recognise reads back as "on", which is the mode such a run actually times.
@@ -193,6 +211,11 @@ inline constexpr const char* kLegDecFusedQE2E = "dec_fq_e2e";
 inline constexpr const char* kLegDecNoUnpack = "dec_nounpack";
 // Option C's counterpart to kLegDecAttnCore: the same decode expanding through a UB Gather.
 inline constexpr const char* kLegDecGather = "dec_gather";
+// The same UB Gather over the non-uniform codebook: Cube Lloyd-Max LUT against kLegDecAttnCore's Cube
+// Uniform. A different 16 levels over the same bits, so where kLegDecGather's checksum must MATCH the
+// unablated decode's, this one's must differ -- and, because the sweep's cache is uniformly written, that
+// is a liveness check on the table and not a fidelity result. Timing leg only; see EnqueueDecodeLloydMax.
+inline constexpr const char* kLegDecLloydMax = "dec_lloydmax";
 
 const std::vector<const char*>& PrefillLegs();
 const std::vector<const char*>& DecodeLegs();

@@ -56,7 +56,22 @@ constexpr int32_t kMsbPerByte = 8;
 // GATHER_LUT swaps the affine expand's per-plane Adds for a 16-entry UB Gather -- the instruction
 // sequence a non-uniform codebook would need (DecodeUnpack::kGatherLut). It is off by default, so the
 // shipping instantiation allocates no constant buffer and reads no table, exactly as before.
-template <TurboQuantMode MODE, bool GATHER_LUT = false>
+//
+// LLOYD_MAX_LUT swaps the codebook the affine mode quantises on: the e4m3-rounded Lloyd-Max levels of
+// TurboQuantLloydMaxTraits in place of the uniform mid-rise grid. It changes three things and no others.
+//
+//   encode   Threshold() returns the rounded grid's midpoints, so ComputeLevelBins assigns nearest
+//            neighbour on the codebook that will actually reconstruct. StageAffinePlane is untouched:
+//            bin b still stores as the signed nibble b - 8, which is why the cache layout does not move.
+//   decode   the gathered table holds the centroids instead of the grid, so the operand a nibble expands
+//            to is the reconstruction itself. This needs GATHER_LUT -- there is no Adds that produces a
+//            non-uniform level -- and the decode asserts that below.
+//   gain     kGain is 1, because nothing is left factored out of the operand. The score scale and the
+//            value scale read it from here (turboquant_vector_service.h), never from the mode traits.
+//
+// The two are separable on purpose: a writer needs the codebook and no table, so it instantiates
+// <MODE, false, true> and allocates no constant buffer at all.
+template <TurboQuantMode MODE, bool GATHER_LUT = false, bool LLOYD_MAX_LUT = false>
 class TurboQuantModeCodec {
 public:
     using Traits = TurboQuantModeTraits<MODE>;
@@ -71,7 +86,16 @@ public:
     static constexpr bool kIsAffine = Traits::kIsAffine;
     static constexpr float kAffineBias = Traits::kAffineBias;
     static constexpr bool kGatherLut = GATHER_LUT;
+    static constexpr bool kLloydMaxLut = LLOYD_MAX_LUT;
+    // What the decode divides into the per-vector scale: the mode's uniform step, or 1 when the
+    // centroids carry the reconstruction themselves.
+    static constexpr float kGain = TurboQuantCodebookGain<MODE, LLOYD_MAX_LUT>();
     static_assert(!kGatherLut || kIsAffine, "the gather expand replaces the affine Adds; codebook modes already gather");
+    static_assert(!kLloydMaxLut || kIsAffine, "the Lloyd-Max toggle replaces an affine mode's uniform grid");
+    static_assert(!kLloydMaxLut || MODE == TurboQuantMode::KV4_FP8,
+                  "kv4fp8 is the only mode with a TurboQuantLloydMaxTraits codebook");
+    static_assert(TurboQuantCodebookCoversMode<MODE, LLOYD_MAX_LUT>(),
+                  "the codebook has to cover exactly the mode's levels, or the packed nibble means something else");
 
     __aicore__ static constexpr uint32_t LowPlaneBytes(uint32_t vecLen)
     {
@@ -110,7 +134,17 @@ public:
         }
     }
 
-    __aicore__ static inline float Threshold(int i) { return Traits::kThresholds[i]; }
+    // The decision boundaries ComputeLevelBins counts against. With the non-uniform codebook these are
+    // the midpoints of its rounded centroids, so encode and decode agree on the same nearest-neighbour
+    // partition; the level a bin stores as is unchanged either way.
+    __aicore__ static inline float Threshold(int i)
+    {
+        if constexpr (kLloydMaxLut) {
+            return TurboQuantLloydMaxTraits<MODE>::kThresholds[i];
+        } else {
+            return Traits::kThresholds[i];
+        }
+    }
 
     __aicore__ inline void Init(AscendC::TPipe *pipe, const uint32_t vecLen, const uint32_t batchRows,
                                 const float invSqrtLen, const AscendC::GlobalTensor<int32_t> &tablesGm)
@@ -256,6 +290,9 @@ public:
                                         const AscendC::LocalTensor<int8_t> &srcPacked, const uint32_t bytes)
     {
         static_assert(kIsAffine, "UnpackAffine is only defined for a mode with uniform levels");
+        static_assert(!kLloydMaxLut,
+                      "the Adds expand can only produce a uniform level; a Lloyd-Max codec decodes through "
+                      "UnpackAffineGather");
         static_assert(!kHasMsbPlane, "an affine mode stores one plane; there is no msb digit to fold in");
         static_assert(Planes::kLowPerByte == 2, "the plane split assumes two nibbles per byte");
         const uint32_t elems = 2u * bytes;
@@ -273,8 +310,13 @@ public:
     // UnpackAffine with the per-plane Adds replaced by a 16-entry UB Gather: the same nibble widen, the
     // same two planes, the same fp8 operands, and the same GM traffic. What differs is only the arithmetic
     // between the DeInterleave and the operand cast, which is the quantity the benchmark leg exists to
-    // price. The table is the uniform grid, so the operands are bit-identical to UnpackAffine's; swapping
-    // in a Lloyd-Max table would change the numbers without changing one instruction.
+    // price.
+    //
+    // Which table is in UB decides what the same instructions compute. Without LLOYD_MAX_LUT it is the
+    // uniform grid and the operands are bit-identical to UnpackAffine's, which is what makes that leg a
+    // pure A/B on the instruction sequence. With it the table is the Lloyd-Max codebook and the operands
+    // are a different, better-conditioned reconstruction at the same cost -- the one case where this
+    // routine and UnpackAffine legitimately disagree.
     template <typename OperandT>
     __aicore__ inline void UnpackAffineGather(const AscendC::LocalTensor<OperandT> &dstLow,
                                               const AscendC::LocalTensor<OperandT> &dstHigh,
@@ -392,7 +434,9 @@ private:
     }
 
     // The same plane, resolved through a table instead of an offset. The widened nibble is the signed
-    // int4 n in [-8, 7], so bin b = n + 8 and its byte offset into the fp32 table is n * 4 + 32.
+    // int4 n in [-8, 7], so bin b = n + 8 and its byte offset into the fp32 table is n * 4 + 32. The
+    // addressing is the codebook's only contract with the table: entry b is bin b's operand, uniform or
+    // not, which is why LLOYD_MAX_LUT costs no instruction here.
     //
     // Gather wants uint32 offsets, and the decode's buffer plan has no scratch of `bytes` int32 left, so
     // the plane is walked in chunks sized to the encoder's bin lanes. Those lanes are dead here -- a
@@ -530,6 +574,9 @@ private:
 using TurboQuantCodecKv3Fp4 = TurboQuantModeCodec<TurboQuantMode::KV3_FP4>;
 using TurboQuantCodecKv4Fp8 = TurboQuantModeCodec<TurboQuantMode::KV4_FP8>;
 using TurboQuantCodecKv5Fp8 = TurboQuantModeCodec<TurboQuantMode::KV5_FP8>;
+// kv4fp8 on the non-uniform codebook: the encoder's half needs no table, the decoder's gathers one.
+using TurboQuantCodecKv4Fp8LloydMaxEncode = TurboQuantModeCodec<TurboQuantMode::KV4_FP8, false, true>;
+using TurboQuantCodecKv4Fp8LloydMaxDecode = TurboQuantModeCodec<TurboQuantMode::KV4_FP8, true, true>;
 
 }
 }

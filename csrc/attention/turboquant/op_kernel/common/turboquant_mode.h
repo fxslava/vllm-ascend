@@ -157,6 +157,80 @@ struct TurboQuantModeTraits<TurboQuantMode::KV5_FP8> {
     };
 };
 
+// The non-uniform codebook a mode can be quantised on instead of its own grid, declared here and defined
+// for kv4fp8 alone. It is what the LLOYD_MAX_LUT toggle substitutes: the 16 Lloyd-Max levels of a unit
+// Gaussian in place of kv4fp8's uniform mid-rise grid, at the same 4 bits, the same two nibbles per byte
+// and the same NZ tiling, so nothing about the cache layout moves.
+//
+// The two differences from TurboQuantModeTraits are deliberate and paired:
+//
+//   * the centroids are rounded into fp8 e4m3, because here they ARE the Cube operand. The uniform grid
+//     can carry the exact code b - 7.5 (every one of those sixteen values is an e4m3 number) and leave
+//     the step to kGain, which the decode divides into the per-vector scale. A non-uniform codebook has
+//     no single step to factor out, so the reconstruction has to survive the operand cast intact -- and
+//     e4m3 keeps only 3 mantissa bits, so the table is the rounded grid or the grid is not what decodes.
+//   * the thresholds are the exact midpoints of those ROUNDED centroids, not of the unrounded ones. The
+//     encoder's job is nearest-neighbour assignment on the codebook that actually reconstructs; using
+//     Lloyd-Max's own thresholds here would mis-assign every coordinate near a boundary the rounding moved.
+//
+// Consequently kGain is 1: the centroid is the reconstruction and there is no step left to divide out.
+template <TurboQuantMode MODE>
+struct TurboQuantLloydMaxTraits;
+
+template <>
+struct TurboQuantLloydMaxTraits<TurboQuantMode::KV4_FP8> {
+    static constexpr int32_t kLevels = 16;
+    static constexpr int32_t kThresholdCount = kLevels - 1;
+    // The levels are the reconstruction, so nothing is factored out of the operand.
+    static constexpr float kGain = 1.0f;
+    // E[(x - q(x))^2] over N(0, 1) on the rounded grid below: 0.0098195, i.e. 20.079 dB, against the
+    // unrounded Lloyd-Max optimum's 0.0095010 (20.222 dB) and the uniform grid's 0.0115429 (19.377 dB).
+    // The e4m3 rounding costs 0.14 dB of the 0.85 dB the codebook is worth.
+    static constexpr float kDistortion = 0.0098195019f;
+
+    // Max's 16-level table for N(0, 1), each entry rounded to nearest fp8 e4m3.
+    static constexpr float kCentroids[kLevels] = {
+        -2.7500000000f, -2.0000000000f, -1.6250000000f, -1.2500000000f,
+        -0.9375000000f, -0.6875000000f, -0.3750000000f, -0.1250000000f,
+        +0.1250000000f, +0.3750000000f, +0.6875000000f, +0.9375000000f,
+        +1.2500000000f, +1.6250000000f, +2.0000000000f, +2.7500000000f,
+    };
+    // Exact midpoints of the rounded centroids above; every one is representable in fp32 without error.
+    static constexpr float kThresholds[kThresholdCount] = {
+        -2.3750000000f, -1.8125000000f, -1.4375000000f, -1.0937500000f,
+        -0.8125000000f, -0.5312500000f, -0.2500000000f, +0.0000000000f,
+        +0.2500000000f, +0.5312500000f, +0.8125000000f, +1.0937500000f,
+        +1.4375000000f, +1.8125000000f, +2.3750000000f,
+    };
+};
+
+// The gain the decode divides into the per-vector scale, for a codec instantiated with or without the
+// non-uniform codebook. A free template so the arm that is not taken is never instantiated, which is what
+// lets a mode with no TurboQuantLloydMaxTraits specialisation still name this.
+template <TurboQuantMode MODE, bool LLOYD_MAX>
+constexpr float TurboQuantCodebookGain()
+{
+    if constexpr (LLOYD_MAX) {
+        return TurboQuantLloydMaxTraits<MODE>::kGain;
+    } else {
+        return TurboQuantModeTraits<MODE>::kGain;
+    }
+}
+
+// Whether the codebook covers exactly the mode's levels, which it must: the packed nibble is an index
+// into it. Written as a function rather than inline in a static_assert because `||` does not stop a
+// static_assert's operand from being instantiated, and TurboQuantLloydMaxTraits has no definition for a
+// mode that has no codebook.
+template <TurboQuantMode MODE, bool LLOYD_MAX>
+constexpr bool TurboQuantCodebookCoversMode()
+{
+    if constexpr (LLOYD_MAX) {
+        return TurboQuantModeTraits<MODE>::kLevels == TurboQuantLloydMaxTraits<MODE>::kLevels;
+    } else {
+        return true;
+    }
+}
+
 // kv4fp8 writes its packed planes NZ-tiled (turboquant_layout.h, NzTiledPackedByte); the codebook modes
 // keep row-major slots. The cache writer and the Cube decode both key on this.
 template <TurboQuantMode MODE>
@@ -174,11 +248,31 @@ constexpr bool kStoresNzTiles = MODE == TurboQuantMode::KV4_FP8;
 //               (Lloyd-Max) would need. The table it gathers is the uniform grid itself, so the result is
 //               bit-identical to kNative and the leg prices the instruction sequence alone, with the
 //               codebook question held out. See tests/research/QJL_3PLUS1_PHASE1.md.
+//   kLloydMaxLut  kGatherLut's instruction sequence carrying the codebook it was built for: the same
+//               Gather over the same 16-entry table at the same UB cost, filled with
+//               TurboQuantLloydMaxTraits' e4m3-rounded Lloyd-Max levels instead of the uniform grid. It
+//               is therefore the one variant whose output legitimately differs from kNative's, and the
+//               only one whose cache has to be written by an encoder on the same codebook -- the
+//               thresholds move with the levels. The pair (kGatherLut, kLloydMaxLut) separates the
+//               expand's latency from the codebook's fidelity: identical instructions, different table.
 enum class DecodeUnpack : uint32_t {
     kNative = 0,
     kBypass = 1,
     kGatherLut = 2,
+    kLloydMaxLut = 3,
 };
+
+// Whether an expand resolves its operands through the UB centroid table, and whether that table holds the
+// non-uniform codebook. kLloydMaxLut is a kGatherLut with different bytes in the same 64 B.
+constexpr bool DecodeUnpackGathers(DecodeUnpack unpack)
+{
+    return unpack == DecodeUnpack::kGatherLut || unpack == DecodeUnpack::kLloydMaxLut;
+}
+
+constexpr bool DecodeUnpackIsLloydMax(DecodeUnpack unpack)
+{
+    return unpack == DecodeUnpack::kLloydMaxLut;
+}
 
 constexpr TurboQuantModeConfig TurboQuantModeConfigOf(TurboQuantMode mode)
 {

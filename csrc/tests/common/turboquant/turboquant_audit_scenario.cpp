@@ -38,7 +38,7 @@ std::string RotationModesLabel() {
 
 const char* UnpackModeLabel() {
   const std::string raw = env::String(kUnpackEnv);
-  for (const char* mode : {kUnpackOff, kUnpackBoth, kUnpackGather, kUnpackAll}) {
+  for (const char* mode : {kUnpackOff, kUnpackBoth, kUnpackGather, kUnpackLloydMax, kUnpackAll}) {
     if (raw == mode) {
       return mode;
     }
@@ -55,7 +55,8 @@ const std::vector<const char*>& PrefillLegs() {
 const std::vector<const char*>& DecodeLegs() {
   static const std::vector<const char*> legs = {kLegDecRotQ,      kLegDecAttnCore, kLegDecRotO,
                                                 kLegDecE2E,       kLegDecV5,       kLegDecFusedQAttnCore,
-                                                kLegDecFusedQE2E, kLegDecNoUnpack, kLegDecGather};
+                                                kLegDecFusedQE2E, kLegDecNoUnpack, kLegDecGather,
+                                                kLegDecLloydMax};
   return legs;
 }
 

@@ -579,8 +579,8 @@ void PrintBanner(const std::vector<Config>& sweep, int64_t aiv_num, bool aiv_que
                 env::String(kRotationModeEnv).c_str());
   }
   if (!UnpackModeValid()) {
-    std::printf("[ascend-bench]   %s='%s' is not on, off or both; timing the unablated decode\n", kUnpackEnv,
-                env::String(kUnpackEnv).c_str());
+    std::printf("[ascend-bench]   %s='%s' is not on, off, both, gather, lloydmax or all; timing the unablated decode\n",
+                kUnpackEnv, env::String(kUnpackEnv).c_str());
   }
   if (UnpackAblationEnabled()) {
     std::printf(
@@ -597,6 +597,18 @@ void PrintBanner(const std::vector<Config>& sweep, int64_t aiv_num, bool aiv_que
         "[ascend-bench]   whether the expand is on the critical path at all. Its table is the\n"
         "[ascend-bench]   uniform grid, so its checksum must equal the unablated decode's.\n",
         kUnpackEnv, UnpackModeLabel(), kLegDecGather, kLegDecGather, kLegDecAttnCore, kLegDecAttnCore);
+  }
+  if (UnpackLloydMaxEnabled()) {
+    std::printf(
+        "[ascend-bench]   %s=%s: the %s leg is Cube Lloyd-Max LUT against %s's Cube\n"
+        "[ascend-bench]   Uniform -- the same launch and the same traffic, expanding through the\n"
+        "[ascend-bench]   e4m3-rounded non-uniform codebook instead of the grid. %s minus\n"
+        "[ascend-bench]   %s is what the codebook costs, and next to %s it says how much\n"
+        "[ascend-bench]   of that is the Gather rather than the table. This cache is uniformly\n"
+        "[ascend-bench]   written, so its checksum must DIFFER and is not a fidelity result; the\n"
+        "[ascend-bench]   codebook's SNR is measured on the simulator and host tiers.\n",
+        kUnpackEnv, UnpackModeLabel(), kLegDecLloydMax, kLegDecAttnCore, kLegDecLloydMax, kLegDecAttnCore,
+        kLegDecGather);
   }
   std::printf("[ascend-bench]\n");
 

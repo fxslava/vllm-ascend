@@ -1024,6 +1024,168 @@ TEST(TurboQuantMirroredCache, PackedBytesAndFp8OperandsDescribeTheSameLevels) {
   EXPECT_EQ(pad_mismatches, 0u) << "an unwritten slot's operands must be the expansion of a zero packed byte";
 }
 
+// The Lloyd-Max codebook the LLOYD_MAX_LUT toggle substitutes (turboquant_mode.h). Three properties, and
+// each of them is load-bearing somewhere the kernel cannot check:
+//
+//   * every centroid is exactly representable in fp8 e4m3. This is the whole reason the table is the
+//     ROUNDED Lloyd-Max grid rather than Max's own numbers: the centroid is the Cube operand, so a value
+//     the operand cast moves is a value the decode does not produce.
+//   * the thresholds are the exact midpoints of those centroids, so the encoder's bin is the nearest
+//     centroid. Using Max's own thresholds here would mis-assign coordinates near every boundary the
+//     rounding moved, and nothing downstream would report it.
+//   * the codebook is strictly monotone. The packed nibble is an index into it, so a non-monotone table
+//     would make the stored code non-monotone in the value and break the encoder's threshold count.
+TEST(TurboQuantLloydMaxCodebook, CentroidsAreE4m3ExactAndThresholdsAreTheirMidpoints) {
+  namespace tqh = turboquant_host;
+  using LloydMax = tqh::MirroredLloydMax;
+
+  ASSERT_EQ(LloydMax::kLevels, tqh::kMirroredLevels) << "the codebook must cover exactly the mode's levels";
+  EXPECT_FLOAT_EQ(LloydMax::kGain, 1.0f) << "a non-uniform codebook has no step to factor out of the operand";
+
+  for (int32_t level = 0; level < LloydMax::kLevels; ++level) {
+    const float centroid = LloydMax::kCentroids[level];
+    EXPECT_EQ(tqh::Fp8E4m3fnValue(tqh::Fp8E4m3fnBits(centroid)), centroid)
+        << "centroid " << level << " = " << centroid << " is not an fp8 e4m3 value";
+    if (level > 0) {
+      EXPECT_LT(LloydMax::kCentroids[level - 1], centroid) << "centroid " << level;
+    }
+  }
+  for (int32_t i = 0; i < LloydMax::kThresholdCount; ++i) {
+    const float midpoint = 0.5f * (LloydMax::kCentroids[i] + LloydMax::kCentroids[i + 1]);
+    EXPECT_FLOAT_EQ(LloydMax::kThresholds[i], midpoint) << "threshold " << i;
+  }
+  // Symmetric about zero, like the Gaussian it is fitted to; the middle threshold is therefore exactly 0.
+  EXPECT_FLOAT_EQ(LloydMax::kThresholds[LloydMax::kThresholdCount / 2], 0.0f);
+  for (int32_t level = 0; level < LloydMax::kLevels / 2; ++level) {
+    EXPECT_FLOAT_EQ(LloydMax::kCentroids[level], -LloydMax::kCentroids[LloydMax::kLevels - 1 - level]);
+  }
+
+  // And the table is Max's, not a new one: every centroid is the e4m3 rounding of the corresponding entry
+  // in the 16-level table the AIV codec's CPU reference has carried since that codec shipped
+  // (turbo_quant_cpu.h, kLloydMaxCentroids). The two codecs are otherwise unrelated -- that one dequantises
+  // in fp32 on the vector pipe and needs no representable grid -- so this is the only thing that keeps the
+  // Cube's table from drifting into a different codebook with the same name.
+  ASSERT_EQ(LloydMax::kLevels, tq::kLevels);
+  for (int32_t level = 0; level < LloydMax::kLevels; ++level) {
+    const float rounded = tqh::Fp8E4m3fnValue(tqh::Fp8E4m3fnBits(tq::kLloydMaxCentroids[level]));
+    EXPECT_FLOAT_EQ(LloydMax::kCentroids[level], rounded)
+        << "centroid " << level << " is not the e4m3 rounding of " << tq::kLloydMaxCentroids[level];
+  }
+}
+
+// What the toggle is for, measured rather than asserted from the table: the distortion each codebook
+// achieves on the distribution the rotation produces. Pi = D H D Gaussianises the coordinates (confirmed at
+// every layer of real activations), so a unit Gaussian is the right model and the Lloyd-Max grid is the
+// scalar optimum on it.
+//
+// The recorded numbers are the closed-form distortions: uniform 0.0115429 (19.377 dB), unrounded Lloyd-Max
+// 0.0095010 (20.222 dB), and the e4m3-rounded table this ships 0.0098195 (20.079 dB) -- so the codebook is
+// worth 0.70 dB and the operand cast takes 0.14 dB of the 0.85 dB available. Read this as reconstruction
+// SNR and nothing more: about a third of a per-vector gain survives the softmax onto the attention output
+// (see the KV-quant ablation work), so it does not license a claim about O.
+TEST(TurboQuantLloydMaxCodebook, ReconstructsAGaussianBetterThanTheUniformGrid) {
+  namespace tqh = turboquant_host;
+  constexpr int64_t kVectors = 4096;
+  constexpr int64_t kHead = 256;
+  // The two closed-form distortions, and the margin the sample is allowed to miss them by.
+  constexpr double kUniformSnrDb = 19.377;
+  constexpr double kLloydMaxSnrDb = 20.079;
+  constexpr double kSnrTolerance = 0.15;
+
+  DeterministicRandom rng(0x4C4Du);
+  const std::vector<float> draw = rng.NormalHalfExact(static_cast<size_t>(kVectors * kHead), 0.0f, 1.0f);
+
+  const auto measure = [&](tqh::MirroredCodebook codebook) {
+    const float gain = tqh::MirroredGainOf(codebook);
+    std::vector<float> reconstructed(draw.size());
+    for (int64_t v = 0; v < kVectors; ++v) {
+      const size_t row = static_cast<size_t>(v * kHead);
+      double energy = 0.0;
+      for (int64_t c = 0; c < kHead; ++c) {
+        energy += static_cast<double>(draw[row + c]) * static_cast<double>(draw[row + c]);
+      }
+      const float scale = static_cast<float>(std::sqrt(energy / static_cast<double>(kHead)));
+      for (int64_t c = 0; c < kHead; ++c) {
+        const int32_t bin = tqh::MirroredBinOf(codebook, draw[row + c] / scale);
+        reconstructed[row + static_cast<size_t>(c)] = tqh::MirroredLevelOf(codebook, bin) * scale / gain;
+      }
+    }
+    return tq::cpu_fidelity(reconstructed, draw);
+  };
+
+  const tq::FidelityMetrics uniform = measure(tqh::MirroredCodebook::kUniform);
+  const tq::FidelityMetrics lloyd_max = measure(tqh::MirroredCodebook::kLloydMax);
+  std::printf("[ codebook ] D=%lld over %lld unit-Gaussian vectors\n", static_cast<long long>(kHead),
+              static_cast<long long>(kVectors));
+  PrintMetrics("uniform mid-rise (shipping)", uniform);
+  PrintMetrics("lloyd-max, e4m3-rounded (LLOYD_MAX_LUT)", lloyd_max);
+  std::printf("  %-38s %+.3f dB\n", "codebook gain", lloyd_max.snr_db - uniform.snr_db);
+
+  EXPECT_NEAR(uniform.snr_db, kUniformSnrDb, kSnrTolerance) << "the uniform grid moved off its closed-form SNR";
+  EXPECT_NEAR(lloyd_max.snr_db, kLloydMaxSnrDb, kSnrTolerance)
+      << "the rounded Lloyd-Max table moved off its closed-form SNR";
+  EXPECT_GT(lloyd_max.snr_db, uniform.snr_db)
+      << "the non-uniform codebook has to beat the grid it replaces, or the toggle buys nothing";
+}
+
+// The uniform arm of MirroredBinOf rounds half up; the kernel's ComputeLevelBins counts thresholds
+// strictly below the coordinate. They are the same partition everywhere except exactly on a boundary,
+// which is the one place the host model and the kernel have always disagreed and the reason the recorded
+// fused goldens are tied to the round-half-up form. The Lloyd-Max arm has no such split -- it IS the
+// threshold count -- so this pins the difference to the ties it is, rather than leaving it unstated.
+TEST(TurboQuantMirroredCache, UniformBinningIsTheKernelsThresholdCount) {
+  namespace tqh = turboquant_host;
+  using Traits = tqh::MirroredTraits;
+  constexpr int kSamples = 200001;
+  constexpr float kSpan = 4.0f;
+
+  const auto threshold_count = [](float u) {
+    int32_t bin = 0;
+    for (int32_t i = 0; i < tqh::kMirroredLevels - 1; ++i) {
+      bin += (u > Traits::kThresholds[i]) ? 1 : 0;
+    }
+    return bin;
+  };
+
+  const auto on_boundary = [](float u) {
+    for (int32_t i = 0; i < tqh::kMirroredLevels - 1; ++i) {
+      if (u == Traits::kThresholds[i]) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  size_t disagreements = 0;
+  size_t boundary_samples = 0;
+  for (int i = 0; i < kSamples; ++i) {
+    const float u = -kSpan + 2.0f * kSpan * static_cast<float>(i) / static_cast<float>(kSamples - 1);
+    // An odd sample count puts one sample on u = 0, which IS threshold 7. The ties are the next loop's
+    // subject, not this one's.
+    if (on_boundary(u)) {
+      ++boundary_samples;
+      continue;
+    }
+    disagreements += (tqh::MirroredBinOf(tqh::MirroredCodebook::kUniform, u) != threshold_count(u)) ? 1u : 0u;
+  }
+  EXPECT_EQ(disagreements, 0u) << "the host model and the kernel disagree away from a decision boundary";
+  EXPECT_EQ(boundary_samples, 1u) << "the sweep should land on exactly one threshold, u = 0";
+
+  // On a boundary they differ by exactly one bin, and only there.
+  for (int32_t i = 0; i < tqh::kMirroredLevels - 1; ++i) {
+    const float on_boundary = Traits::kThresholds[i];
+    EXPECT_EQ(threshold_count(on_boundary), i) << "threshold " << i << " must not count itself";
+    EXPECT_EQ(tqh::MirroredBinOf(tqh::MirroredCodebook::kUniform, on_boundary), i + 1)
+        << "the host model rounds a tie up; threshold " << i;
+  }
+
+  // The Lloyd-Max arm is the kernel's rule by construction, ties included.
+  for (int32_t i = 0; i < tqh::MirroredLloydMax::kThresholdCount; ++i) {
+    EXPECT_EQ(tqh::MirroredBinOf(tqh::MirroredCodebook::kLloydMax, tqh::MirroredLloydMax::kThresholds[i]), i)
+        << "Lloyd-Max threshold " << i;
+  }
+}
+
 TEST(TurboQuantEdgeCases, InvolutionOnCanonicalBasisVectors) {
   for (int d : {64, 128, 256}) {
     const std::vector<int8_t> signs = tq::cpu_pi_sign_vector(d);

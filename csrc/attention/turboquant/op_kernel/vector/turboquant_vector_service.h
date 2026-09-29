@@ -320,10 +320,13 @@ struct TurboQuantTaskHeads {
 // one wide op advances all heads, the same field is the block operand of a row op, and lane j * 8 still
 // holds head j's value for the per-task readers the two decodes share.
 //
-// UNPACK selects the expand, and the two non-default variants are measurement instruments, not modes.
-// DecodeUnpack::kGatherLut swaps the per-plane Adds for a 16-entry UB Gather at identical traffic and
-// identical output (its table is the uniform grid), which prices Option C of
-// tests/research/QJL_3PLUS1_PHASE1.md. DecodeUnpack::kBypass is the ablation. It drops the
+// UNPACK selects the expand. Two of the three non-default variants are measurement instruments and one
+// is a codec. DecodeUnpack::kGatherLut swaps the per-plane Adds for a 16-entry UB Gather at identical
+// traffic and identical output (its table is the uniform grid), which prices Option C of
+// tests/research/QJL_3PLUS1_PHASE1.md. DecodeUnpack::kLloydMaxLut is that same sequence over the
+// e4m3-rounded Lloyd-Max table: same traffic, same instructions, a different and better reconstruction,
+// so it is the one variant whose output is meant to differ, and the one whose cache has to be written by
+// a writer on the same codebook. DecodeUnpack::kBypass is the ablation. It drops the
 // codec expand out of the ingest and stages the (zeroed, once, in Init) operand buffer into L1 instead.
 // Every other byte still moves: the MTE2 read of the packed plane, the MTE3 burst into L1, the Cube's
 // loads and MACs, and the whole softmax. What disappears is exactly the vector-pipe expand, so the delta
@@ -337,8 +340,10 @@ public:
     static constexpr bool kBatched = kBatchedCubeDecode<MODE>;
     static constexpr bool kNzTiled = kStoresNzTiles<MODE>;
     static constexpr bool kBypassUnpack = UNPACK == DecodeUnpack::kBypass;
-    static constexpr bool kGatherUnpack = UNPACK == DecodeUnpack::kGatherLut;
+    static constexpr bool kGatherUnpack = DecodeUnpackGathers(UNPACK);
+    static constexpr bool kLloydMaxUnpack = DecodeUnpackIsLloydMax(UNPACK);
     static_assert(kGatherUnpack == Codec::kGatherLut, "the service and its codec disagree on the expand");
+    static_assert(kLloydMaxUnpack == Codec::kLloydMaxLut, "the service and its codec disagree on the codebook");
     static_assert(kNzTiled == Codec::kIsAffine, "only the byte-wise affine expand streams an NZ-tiled plane");
     // Ring slots of the tile ingest. Tile t reads into slot t % kCubeSlots, the slot of its L1 operands.
     static constexpr uint32_t kIngestSlots = kBatched ? kCubeSlots : 1;
@@ -660,8 +665,11 @@ private:
         rowRepeatParams_ = AscendC::BinaryRepeatParams{1, 1, 0, rowBlocks, rowBlocks, 1};
         tileByBlockParams_ = AscendC::BinaryRepeatParams{1, 1, 0, kTileBlocks, kTileBlocks, 1};
         tileByVectorParams_ = AscendC::BinaryRepeatParams{1, 1, 1, kTileBlocks, kTileBlocks, 0};
-        scoreScale_ = scale / TurboQuantModeTraits<MODE>::kGain;
-        invGain_ = 1.0f / TurboQuantModeTraits<MODE>::kGain;
+        // The codec's gain, not the mode's: a non-uniform codebook carries its reconstruction in the
+        // operand and leaves nothing to divide out, so Codec::kGain is 1 there and these two collapse to
+        // the bare attention scale and to unity.
+        scoreScale_ = scale / Codec::kGain;
+        invGain_ = 1.0f / Codec::kGain;
     }
 
     __aicore__ inline void InitGlobalTensors(__gm__ void *queryRot, __gm__ void *keyCache, __gm__ void *valueCache,

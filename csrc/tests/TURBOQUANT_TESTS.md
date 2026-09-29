@@ -4350,3 +4350,150 @@ with `unknown file type`.
   trim to `{1}` is sized from that run's timings rather than from a completed process.
 - The 950PR's own tail-mask path is what these tests aim at; the Cube decode's `ComputeTailMask` is covered
   only by fused case (d), as before.
+
+### 13.38 LLOYD_MAX_LUT: the non-uniform codebook on the Cube operand path (2026-09-29)
+
+The Cube decode reconstructs a KV coordinate as a **uniform** mid-rise level. The operand it hands the Cube
+is the signed code `b - 7.5`, and the step is factored out into `kGain = 2.9833`, which the decode divides
+into the per-vector scale. That is what makes the expand three vector instructions: widen the nibble,
+de-interleave the two planes, `Adds(+0.5)`.
+
+On post-rotation coordinates - which are Gaussian at every layer, already established - the scalar optimum
+is not that grid. `LLOYD_MAX_LUT` makes the codebook a compile-time choice, at **zero layout drift**: same
+4 bits, same two nibbles per byte, same NZ tiling, same scale plane, same packed byte for the same bin.
+
+**What the toggle changes, and nothing else.**
+
+| | uniform (shipping) | `LLOYD_MAX_LUT` |
+|---|---|---|
+| level of bin `b` | `b - 7.5` | `TurboQuantLloydMaxTraits::kCentroids[b]` |
+| thresholds | `(i - 7) / kGain` | exact midpoints of the centroids above |
+| `Codec::kGain` | 2.9832882881 | **1.0** |
+| decode expand | `Cast` + `DeInterleave` + `Adds` | `Cast` + `DeInterleave` + 16-entry UB `Gather` |
+| UB constant buffer | 0 B | 64 B (`ConstTableWords` = `kLevels`) |
+| packed cache bytes | identical | identical |
+
+`kGain = 1` is forced, not chosen: a non-uniform codebook has no single step to factor out, so the centroid
+*is* the reconstruction. `turboquant_vector_service.h` therefore reads `Codec::kGain` rather than
+`TurboQuantModeTraits<MODE>::kGain`, and `scoreScale_` / `invGain_` collapse to the bare attention scale and
+to unity.
+
+**Two table properties that are load-bearing.** The centroids are Max's 16-level table for `N(0, 1)`
+**rounded into fp8 e4m3**, because here the centroid is the Cube operand and e4m3 keeps three mantissa bits -
+an unrounded table is not what would decode. The thresholds are then the exact midpoints of those *rounded*
+centroids, so the encoder assigns nearest-neighbour on the codebook that actually reconstructs; Max's own
+thresholds would mis-assign every coordinate near a boundary the rounding moved.
+
+The cost of the rounding is priced: `E[(x - q(x))^2]` over `N(0, 1)` is **0.0098195 (20.079 dB)** for the
+rounded table, against **0.0095010 (20.222 dB)** for the unrounded Lloyd-Max optimum and **0.0115429
+(19.377 dB)** for the uniform grid. So the codebook is worth **0.70 dB** of reconstruction SNR and the
+operand cast gives back 0.14 dB of the 0.85 dB available.
+
+**Encoder and decoder are a matched pair.** A cache written on one codebook and decoded on the other agrees
+on every byte of layout and disagrees on what the bytes mean, so it produces a plausible wrong answer rather
+than an error. The two halves are therefore separate entry points -
+`turboquant_mm_reshape_and_cache_lloydmax_impl` and `turboquant_mm_fused_decode_lloydmax_impl`, both
+`VLLM_ASCEND_TQ_TEST_KERNELS` only - and `FusedShape::lloyd_max` moves the host cache, the mode-table image,
+the writer and the decode together. The raw-query entry has no Lloyd-Max variant and the harness refuses to
+launch it rather than decode the wrong grid.
+
+**Device benchmark (`ASCEND_BENCH_TQ_UNPACK`).** A fourth expand joins the three:
+
+- `on` -> `dec_attn_core`, the shipping `Adds` expand ("Cube Uniform");
+- `off` -> `dec_nounpack`, the ablation, all-zero output, timing only;
+- `gather` -> `dec_gather`, the UB `Gather` over the *uniform* grid, output bit-identical to `on`;
+- `lloydmax` -> `dec_lloydmax`, the same `Gather` over the codebook ("Cube Lloyd-Max LUT");
+- `both` now runs `on` + `off` + `lloydmax`; `all` runs every leg.
+
+`dec_lloydmax` minus `dec_attn_core` is what the codebook costs; `dec_gather` beside them says how much of
+any delta is the `Gather` rather than the table, since those two differ in 64 B of UB and nothing else. Every
+leg shares one launch shape and one traffic model, so Effective GB/s and the median/p95 per-phase latencies
+are directly comparable. **`dec_lloydmax` is a timing leg only**: it runs against the sweep's shared,
+uniformly-written cache, deliberately - a second cache would double the KV allocation at a million tokens of
+context, and holding the data fixed is the cleaner experiment for a quantity that does not depend on what the
+codes mean. Its checksum is compared against the uniform decode's once per configuration and must **differ**
+(equality would mean the table never reached the expand); that is a liveness check on the toggle, not a
+fidelity result.
+
+**Where the fidelity is actually earned.**
+
+- Host tier, `TurboQuantLloydMaxCodebook` (2 new cases). `CentroidsAreE4m3ExactAndThresholdsAreTheirMidpoints`
+  holds every centroid to being an exact e4m3 value, every threshold to being the midpoint of its neighbours,
+  the table to being strictly monotone and symmetric, and - the one that stops the table drifting into a
+  different codebook with the same name - every centroid to being the e4m3 rounding of the corresponding
+  entry in `turbo_quant_cpu.h`'s `kLloydMaxCentroids`, which the AIV codec's CPU reference has carried since
+  that codec shipped. `ReconstructsAGaussianBetterThanTheUniformGrid` measures both codebooks over 4096
+  unit-Gaussian D = 256 vectors: uniform `cos 0.994296 / 19.44 dB`, Lloyd-Max `cos 0.995129 / 20.12 dB`,
+  **+0.683 dB**, both within 0.15 dB of their closed forms. Read it as reconstruction SNR only - about a
+  third of a per-vector gain reaches `O`.
+- Host tier, `TurboQuantMirroredCache.UniformBinningIsTheKernelsThresholdCount` (new). The host model's
+  uniform arm rounds half up; the kernel's `ComputeLevelBins` counts thresholds strictly below the
+  coordinate. The two agree on 200,000 samples across `[-4, 4]` and differ by exactly one bin on a boundary
+  and nowhere else. The uniform arm keeps the round-half-up form on purpose - it is what the recorded fused
+  goldens were built with - and the Lloyd-Max arm *is* the threshold count, ties included.
+- Simulator tier, fused cases **(k)** and **(l)** (new, `test_sim_950pr_turboquant_fused`). `Reference()` is
+  exact fp32 attention over the levels the cache holds, so the codebook divides out of the cosine and these
+  are not fidelity measurements. What they do see is everything that could go wrong in the kernel: the
+  gathered table's contents and indexing, the score and value scales now that `Codec::kGain` is 1, and the
+  fp8 cast of levels a third of the uniform grid's magnitude. (k) decodes a host-built Lloyd-Max cache at
+  (a)'s shape; (l) has the kernel writer produce the cache and compares it to the host encoder byte for byte
+  before decoding it, which is the only place the Lloyd-Max thresholds are checked at all.
+
+Camodel (Ascend950PR_9589, aiv 64, one process per case, `build/lmlut_sim_run.sh`):
+
+| case | codebook | cache | golden | cos vs fp32 | launch | test |
+|---|---|---|---|---|---|---|
+| (a) | uniform | host | `0x6176461416358ec1` | 0.999407 | 44.9 s | 70.9 s |
+| (e) | uniform | kernel writer | `0x9ffe02efde1506cf` | 0.999576 | 50.9 s | 462.1 s |
+| (k) | Lloyd-Max | host | `0x434fe707d97abef9` | 0.999143 | 81.7 s | 81.7 s |
+| (l) | Lloyd-Max | kernel writer | `0xb937fc50dafc55d6` | 0.999493 | 73.9 s | 470.3 s |
+
+(a) and (e) reproduced their 2026-09-16 and 2026-09-17 goldens **exactly**, which is what says the shipping
+path did not move: the toggle is `false` by default, `TurboQuantModeReshapeAndCache`'s new template
+parameter defaults to `false`, and `MirroredBinOf`'s uniform arm keeps the expression it always had. Both
+Lloyd-Max cases wrote 32 exception dumps at 0 B.
+
+(l) is the gate on the encoder: **0 of 131,072 packed bytes differ from the host encoder** (30,205 differ
+with the nibble lanes swapped, so the comparison has teeth), 0 pad mismatches, max scale relative error
+1.928e-04. The device's Lloyd-Max thresholds and the CPU reference's agree on every nibble of a 64-token,
+2-kv-head, D = 256 cache.
+
+The Lloyd-Max cosines sit a little below their uniform twins - (k) 0.999143 against (a)'s 0.999407, (l)
+0.999493 against (e)'s 0.999576 - and that is **not** a fidelity regression, because the codebook divides
+out of this comparison entirely. What is left is kernel arithmetic, and the dominant term in it is the fp8
+probability operand (three mantissa bits, renormalised per head to `OperandMax` = 448). A different
+codebook produces a different logit spread, so the softmax it feeds takes a slightly different amount of
+that error. Against *unquantised* vectors the codebook is 0.683 dB ahead, which is the comparison that
+means something.
+
+**This is the first data-dependent `Gather` in the tree to have executed at all.** Every other `Gather` in
+the TurboQuant kernels reads a host-built constant offset table; `ComputeNibbleOperandsGather` computes its
+offsets from the nibble values. It was added as Option C's instruction-sequence instrument and had never
+run - the gather leg lives on the device tier and no 950PR part has been available. (k) and (l) run it, and
+it is correct. Its *throughput* is still unmeasured.
+
+**Verification.** Five configurations built clean under `-O3 -Wall -Wextra -Werror`, zero diagnostic lines
+each (`build/lmlut_tier_build.sh`, `build/lmlut_config_matrix.sh`): host-only (6 targets), 950PR
+`RUN_MODE=sim` (37), 950PR `RUN_MODE=npu` (42), the 310P default (17), and 950PR npu with
+`-DVLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS=OFF` (14). Every kernel build starts from an empty tree, so
+`merge_{aic,aiv}_obj_text` never re-links its own `ET_EXEC` output. Both new launchers and both new kernel
+entry points are in `libvllm_ascend_turboquant.so` in the sim and npu trees. The host tier's TurboQuant
+cases pass 8/8. (k) and (l) were then re-run against their pinned goldens
+(`build/lmlut_pin_verify.sh`).
+
+**Not covered.**
+- Nothing has run on silicon. `bench_device_950pr_turboquant` links and the `dec_lloydmax` leg is reachable,
+  but this host has no `/dev/davinci*` and the binary cannot load `libascend_hal.so`. **Every latency claim
+  the toggle exists to test is unmeasured**, including whether the `Gather` costs anything at all.
+- The codebook is **test-only**. The wheel builds neither `*_lloydmax_*` entry point
+  (`VLLM_ASCEND_TQ_TEST_KERNELS`), and no Python or adapter path can select it. Nothing about the shipping
+  decode changed.
+- The raw-query entry (`PRE_ROTATED = false`) has no Lloyd-Max variant. `FusedCubeScenario::RunFusedRawQuery`
+  refuses to launch on a Lloyd-Max shape rather than decode the wrong grid.
+- kv3fp4 and kv5fp8 have no `TurboQuantLloydMaxTraits` and a `static_assert` refuses them. They already
+  quantise on codebooks of their own.
+- Only D = 256 and one shape per half of the toggle. (k) and (l) are (a)'s and (e)'s shapes; nothing
+  exercises the codebook at D = 128, across a tile boundary, over a split, or through the tail mask.
+- The 0.683 dB is measured on i.i.d. unit Gaussians, which is what the rotation produces and what Lloyd-Max
+  is fitted to. It is reconstruction SNR, not an `O` result, and this tree's repeated finding is that about
+  a third of a per-vector gain survives the softmax.
