@@ -45,7 +45,15 @@ namespace Dsv4MoeExpertOp {
 constexpr int64_t FP4_BLOCK = 32;       // E8M0 scale span (logical elements)
 constexpr int64_t FP4_PER_BYTE = 2;     // two E2M1 nibbles per storage byte
 constexpr int64_t BYTES_ALIGN = 32;     // MTE 32-byte granularity
-constexpr uint8_t SIGMOID_EVENT_ID = 7; // vector-Exp <-> scalar sync event
+constexpr int64_t OUT_ROW_COUNT = 3;    // gate/up/activated share one staging block
+
+// The op compiles with --cce-auto-sync=off (op_host/CMakeLists.txt), so the
+// compiler inserts no pipe synchronisation at all: every cross-pipe dependency
+// below is hand-written. Each HardEvent pair owns its own flag namespace, so
+// the ids only have to be unique within a pair.
+constexpr uint8_t SIGMOID_EVENT_ID = 7; // vector-Exp <-> scalar (S_V / V_S)
+constexpr uint8_t LOAD_EVENT_ID = 0;    // GM->UB load <-> scalar (MTE2_S / S_MTE2)
+constexpr uint8_t STORE_EVENT_ID = 1;   // scalar <-> UB->GM store (S_MTE3)
 
 // E2M1 nibble decode: bit3=sign, bits2..1=exponent (bias 1), bit0=mantissa.
 // Subnormal code 0x1 is +/-(1/2); codes 0x0/0x8 are +/-(1/4 * 2) = 0.
@@ -147,9 +155,15 @@ private:
         const int64_t weightBytes = AlignUpBytes(inter_ * hidden_ / FP4_PER_BYTE);
         const int64_t weightScaleBytes = AlignUpBytes(inter_ * hidden_ / FP4_BLOCK);
         const int64_t downScaleBytes = AlignUpBytes(hidden_ * inter_ / FP4_BLOCK);
-        const int64_t floatHiddenBytes = AlignUpBytes(hidden_ * static_cast<int64_t>(sizeof(float)));
+        // xFloatBuf_ is reused as the SwiGLU exp() scratch, which holds inter_
+        // floats -- size it for the larger of the two so a geometry with
+        // inter > hidden cannot walk off the end of the allocation.
+        const int64_t scratchElems = hidden_ > inter_ ? hidden_ : inter_;
+        const int64_t floatHiddenBytes = AlignUpBytes(scratchElems * static_cast<int64_t>(sizeof(float)));
         const int64_t floatInterBytes = AlignUpBytes(inter_ * static_cast<int64_t>(sizeof(float)));
-        const int64_t interRowBytes = AlignUpBytes(inter_ * 2);   // bf16 bits via uint16 views
+        // gate/up/activated stage side by side so the three stores need one
+        // scalar->MTE3 handshake instead of a read-after-write round trip each.
+        const int64_t interRowBytes = AlignUpBytes(OUT_ROW_COUNT * inter_ * 2); // bf16 bits via uint16 views
         const int64_t hiddenRowBytes = AlignUpBytes(hidden_ * 2);
 
         pipe_->InitBuffer(xBuf_, xBytes);
@@ -164,10 +178,34 @@ private:
         pipe_->InitBuffer(hiddenRowBuf_, hiddenRowBytes);
     }
 
+    // MTE2 (GM->UB) finished -> the scalar pipe may read the staging buffer.
+    __aicore__ void WaitLoad()
+    {
+        SetFlag<HardEvent::MTE2_S>(LOAD_EVENT_ID);
+        WaitFlag<HardEvent::MTE2_S>(LOAD_EVENT_ID);
+    }
+
+    // Scalar pipe finished reading the staging buffer -> the next MTE2 load may
+    // overwrite it. Without this the gate/up/down legs, which all share
+    // weightBuf_, race write-after-read.
+    __aicore__ void ReleaseLoadBuffers()
+    {
+        SetFlag<HardEvent::S_MTE2>(LOAD_EVENT_ID);
+        WaitFlag<HardEvent::S_MTE2>(LOAD_EVENT_ID);
+    }
+
+    // Scalar pipe finished filling an output row -> MTE3 (UB->GM) may read it.
+    __aicore__ void ReleaseStoreBuffers()
+    {
+        SetFlag<HardEvent::S_MTE3>(STORE_EVENT_ID);
+        WaitFlag<HardEvent::S_MTE3>(STORE_EVENT_ID);
+    }
+
     __aicore__ void CopyInX()
     {
         LocalTensor<uint16_t> xBits = xBuf_.Get<uint16_t>();
         DataCopy(xBits, xGmU16_, hidden_);
+        WaitLoad(); // MTE2 drain: the scalar reads below must see the loaded row
         LocalTensor<float> xFloat = xFloatBuf_.Get<float>();
         for (int64_t c = 0; c < hidden_; ++c) {
             xFloat.SetValue(c, Bf16BitsToFloat(xBits.GetValue(c)));
@@ -180,16 +218,27 @@ private:
     {
         const int64_t packedPerRow = cols / FP4_PER_BYTE;
         const int64_t scalesPerRow = cols / FP4_BLOCK;
+        const int64_t bytesPerBlock = FP4_BLOCK / FP4_PER_BYTE;
         for (int64_t row = 0; row < rows; ++row) {
             const int64_t packedBase = row * packedPerRow;
             const int64_t scaleBase = row * scalesPerRow;
             float acc = 0.0f;
-            for (int64_t col = 0; col < cols; ++col) {
-                const uint8_t byte = packed.GetValue(packedBase + (col >> 1));
-                const uint32_t nibble = (col & 1) != 0 ? (byte >> 4) : (byte & 0x0F);
-                const float weight = E2M1_TABLE[nibble];
-                const float scale = E8M0ToScale(scales.GetValue(scaleBase + (col / FP4_BLOCK)));
-                acc += xF.GetValue(col) * (weight * scale);
+            // Block-major walk: the E8M0 byte is decoded once per 32 columns
+            // instead of once per column, and each packed byte is fetched once
+            // for both of its nibbles. Columns are still consumed in ascending
+            // order and the accumulate expression is unchanged, so the fp32
+            // summation sequence -- and the output bit pattern -- is identical
+            // to the column-major form.
+            for (int64_t block = 0; block < scalesPerRow; ++block) {
+                const float scale = E8M0ToScale(scales.GetValue(scaleBase + block));
+                const int64_t byteBase = packedBase + block * bytesPerBlock;
+                const int64_t colBase = block * FP4_BLOCK;
+                for (int64_t pair = 0; pair < bytesPerBlock; ++pair) {
+                    const uint8_t byte = packed.GetValue(byteBase + pair);
+                    const int64_t col = colBase + pair * FP4_PER_BYTE;
+                    acc += xF.GetValue(col) * (E2M1_TABLE[byte & 0x0Fu] * scale);
+                    acc += xF.GetValue(col + 1) * (E2M1_TABLE[byte >> 4] * scale);
+                }
             }
             out.SetValue(row, acc);
         }
@@ -205,10 +254,14 @@ private:
         // gate leg (w1): inter rows, hidden reduction cols.
         DataCopy(packed, wqGm_[0], inter_ * hidden_ / FP4_PER_BYTE);
         DataCopy(scales, wqScaleGm_[0], inter_ * hidden_ / FP4_BLOCK);
+        WaitLoad();
         Project(packed, scales, xFloat, gate, inter_, hidden_);
-        // up leg (w3): reuses the staging buffers.
+        // up leg (w3): reuses the staging buffers, so the refill must wait for
+        // the gate leg's scalar reads to retire before MTE2 overwrites them.
+        ReleaseLoadBuffers();
         DataCopy(packed, wqGm_[2], inter_ * hidden_ / FP4_PER_BYTE);
         DataCopy(scales, wqScaleGm_[2], inter_ * hidden_ / FP4_BLOCK);
+        WaitLoad();
         Project(packed, scales, xFloat, up, inter_, hidden_);
     }
 
@@ -219,8 +272,9 @@ private:
         LocalTensor<float> activated = activatedBuf_.Get<float>();
         // Device code has no scalar expf: exp(-g) runs through the vector Exp
         // API (mirroring chunk_kda_fwd's RunExp2 event pattern), then the
-        // sigmoid combines scalarly. negExp stages in xFloatBuf_ (hidden >=
-        // inter floats, x is no longer needed once the projections ran).
+        // sigmoid combines scalarly. negExp stages in xFloatBuf_, which is sized
+        // max(hidden, inter) floats and whose x contents are dead once both
+        // projections have run.
         LocalTensor<float> negExp = xFloatBuf_.Get<float>();
         for (int64_t j = 0; j < inter_; ++j) {
             negExp.SetValue(j, -gate.GetValue(j));
@@ -242,27 +296,21 @@ private:
     {
         LocalTensor<uint8_t> packed = weightBuf_.Get<uint8_t>();
         LocalTensor<uint8_t> scales = downScaleBuf_.Get<uint8_t>();
-        // down leg (w2): hidden rows, inter reduction cols. Accumulation stays
-        // in a scalar register per row; results land straight in the bf16
-        // staging row (hidden fp32 floats need not be materialized).
+        // down leg (w2): hidden rows, inter reduction cols. weightBuf_ still
+        // carries the up leg's matrix, so release it before MTE2 refills it.
+        ReleaseLoadBuffers();
         DataCopy(packed, wqGm_[1], hidden_ * inter_ / FP4_PER_BYTE);
         DataCopy(scales, wqScaleGm_[1], hidden_ * inter_ / FP4_BLOCK);
+        WaitLoad();
         LocalTensor<float> activated = activatedBuf_.Get<float>();
+        // The SwiGLU scratch is dead once ApplySwiGLU has run, so it doubles as
+        // the fp32 down-projection accumulator (hidden_ floats, guaranteed to
+        // fit by the InitBuffers sizing).
+        LocalTensor<float> downFloat = xFloatBuf_.Get<float>();
+        Project(packed, scales, activated, downFloat, hidden_, inter_);
         LocalTensor<uint16_t> downRow = hiddenRowBuf_.Get<uint16_t>();
-        const int64_t packedPerRow = inter_ / FP4_PER_BYTE;
-        const int64_t scalesPerRow = inter_ / FP4_BLOCK;
         for (int64_t row = 0; row < hidden_; ++row) {
-            const int64_t packedBase = row * packedPerRow;
-            const int64_t scaleBase = row * scalesPerRow;
-            float acc = 0.0f;
-            for (int64_t col = 0; col < inter_; ++col) {
-                const uint8_t byte = packed.GetValue(packedBase + (col >> 1));
-                const uint32_t nibble = (col & 1) != 0 ? (byte >> 4) : (byte & 0x0F);
-                const float weight = E2M1_TABLE[nibble];
-                const float scale = E8M0ToScale(scales.GetValue(scaleBase + (col / FP4_BLOCK)));
-                acc += activated.GetValue(col) * (weight * scale);
-            }
-            downRow.SetValue(row, FloatToBf16Bits(acc));
+            downRow.SetValue(row, FloatToBf16Bits(downFloat.GetValue(row)));
         }
     }
 
@@ -271,22 +319,27 @@ private:
         LocalTensor<float> gate = gateBuf_.Get<float>();
         LocalTensor<float> up = upBuf_.Get<float>();
         LocalTensor<float> activated = activatedBuf_.Get<float>();
-        LocalTensor<uint16_t> interRow = interRowBuf_.Get<uint16_t>();
+        LocalTensor<uint16_t> interRows = interRowBuf_.Get<uint16_t>();
         LocalTensor<uint16_t> downRow = hiddenRowBuf_.Get<uint16_t>();
+        // The three [1, inter] outputs stage side by side rather than reusing
+        // one row: sharing a row would need an MTE3_S drain between every store
+        // and the next scalar refill, and getting that wrong corrupts the
+        // in-flight copy. inter_ is a multiple of 64, so every row offset is
+        // 32-byte aligned.
+        LocalTensor<uint16_t> gateRow = interRows;
+        LocalTensor<uint16_t> upRow = interRows[static_cast<uint32_t>(inter_)];
+        LocalTensor<uint16_t> activatedRow = interRows[static_cast<uint32_t>(2 * inter_)];
 
         for (int64_t j = 0; j < inter_; ++j) {
-            interRow.SetValue(j, FloatToBf16Bits(gate.GetValue(j)));
+            gateRow.SetValue(j, FloatToBf16Bits(gate.GetValue(j)));
+            upRow.SetValue(j, FloatToBf16Bits(up.GetValue(j)));
+            activatedRow.SetValue(j, FloatToBf16Bits(activated.GetValue(j)));
         }
-        DataCopy(gateGmU16_, interRow, inter_);
-        for (int64_t j = 0; j < inter_; ++j) {
-            interRow.SetValue(j, FloatToBf16Bits(up.GetValue(j)));
-        }
-        DataCopy(upGmU16_, interRow, inter_);
-        for (int64_t j = 0; j < inter_; ++j) {
-            interRow.SetValue(j, FloatToBf16Bits(activated.GetValue(j)));
-        }
-        DataCopy(activatedGmU16_, interRow, inter_);
-        // downRow was already filled bf16 by DownLeg.
+        // downRow was filled by ProjectDown; one handshake covers all four rows.
+        ReleaseStoreBuffers();
+        DataCopy(gateGmU16_, gateRow, inter_);
+        DataCopy(upGmU16_, upRow, inter_);
+        DataCopy(activatedGmU16_, activatedRow, inter_);
         DataCopy(downGmU16_, downRow, hidden_);
     }
 

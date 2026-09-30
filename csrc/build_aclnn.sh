@@ -8,6 +8,20 @@ log() {
     echo "[build_aclnn] $*"
 }
 
+# Captured before the per-SoC branches below assign their default op lists,
+# which would otherwise clobber it. Set CUSTOM_OPS in the environment to build a
+# single operator (CUSTOM_OPS=dsv4_moe_expert bash csrc/build_aclnn.sh ...) --
+# a full custom-op build is several times longer and regenerates artifacts the
+# caller did not ask for.
+CUSTOM_OPS_OVERRIDE="${CUSTOM_OPS:-}"
+
+apply_custom_ops_override() {
+    [[ -n "${CUSTOM_OPS_OVERRIDE}" ]] || return 0
+    IFS=';' read -r -a CUSTOM_OPS_ARRAY <<< "${CUSTOM_OPS_OVERRIDE}"
+    CUSTOM_OPS="${CUSTOM_OPS_OVERRIDE}"
+    log "CUSTOM_OPS overridden from the environment: ${CUSTOM_OPS}"
+}
+
 setup_catlass_dependency() {
     local catlass_path="${ROOT_DIR}/csrc/third_party/catlass/include"
     local catlass_commit
@@ -228,6 +242,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "store_kv_block_metadata"
         "sparse_attention_score"
         "mla_prolog_v3"
+        "dsv4_moe_expert"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
@@ -238,6 +253,8 @@ else
     log "no custom ACLNN ops configured for SOC_VERSION=${SOC_VERSION}; skip build_aclnn"
     exit 0
 fi
+
+apply_custom_ops_override
 
 log_selected_ops
 

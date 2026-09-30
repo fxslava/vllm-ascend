@@ -49,6 +49,7 @@
 #include "attention/store_kv_block/store_kv_block_torch_adpt.h"
 #include "attention/store_kv_block_metadata/store_kv_block_metadata_torch_adpt.cpp"
 #include "moe/dequant_situ_quant/dequant_situ_quant_torch_adpt.h"
+#include "moe/dsv4_moe_expert/dsv4_moe_expert_torch_adpt.h"
 #include "moe/situ_mx_quant/situ_mx_quant_torch_adpt.h"
 #include "attention/mla_prolog_v3/mla_prolog_v3_torch_adpt.h"
 #ifdef VLLM_ENABLE_TURBOQUANT
@@ -2489,6 +2490,23 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "              bool activate_left=False, "
         "              int dst_type=36) -> (Tensor y, Tensor mxscale)");
     ops.impl("situ_mx_quant", torch::kPrivateUse1, &vllm_ascend::situ_mx_quant);
+
+    // One DeepSeek-V4 routed expert: gate/up FP4 GEMM + SwiGLU + down FP4 GEMM.
+    // Every output is caller-allocated and written in place, mirroring the
+    // zero-allocation ExpertKernelRunner seam in tools/dsv4_moe_runtime.
+    ops.def(
+        "dsv4_moe_expert(Tensor x, "
+        "                Tensor w1, "
+        "                Tensor w2, "
+        "                Tensor w3, "
+        "                Tensor w1_scale, "
+        "                Tensor w2_scale, "
+        "                Tensor w3_scale, "
+        "                Tensor! gate_out, "
+        "                Tensor! up_out, "
+        "                Tensor! activated, "
+        "                Tensor! down_out) -> ()");
+    ops.impl("dsv4_moe_expert", torch::kPrivateUse1, &vllm_ascend::dsv4_moe_expert);
 
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
     // Direct kernel custom ops
