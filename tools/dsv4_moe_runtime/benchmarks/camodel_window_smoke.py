@@ -20,12 +20,12 @@ Run inside the vLLM-Ascend container (repo mounted at /work)::
 
 from __future__ import annotations
 
-import resource
+import os
 import sys
 
 import torch
 
-from ..core.config import SANITY_GEOMETRY
+from ..core.config import SANITY_GEOMETRY, DeepSeekV4MoEConfig
 from ..core.layout import ExpertTensorLayout
 from ..hardware.exchange_buffer import TransitExchangeBuffer
 from ..hardware.exclusive_staging import ExclusiveStagingProvider
@@ -35,12 +35,18 @@ from .synthetic_source import SyntheticExpertSource
 VERIFY_EVERY = 5
 PATTERN_STRIDE = 64
 PATTERN_BYTE = 0x5A
-# CAModel-sized: device ops are emulated (seconds each), so keep the DMA count
-# at ~40 while still crossing the window capacity (fills + evictions > slots)
-# to exercise drop-oldest recycling and the post-loop window-hit promotion.
+# CAModel-sized: device ops are emulated and each slot DMA costs minutes of
+# simulation, so keep the DMA count low (~25) while still crossing the window
+# capacity (fills + evictions > slots) to exercise drop-oldest recycling and
+# the post-loop window-hit promotion. CAMODEL_SMOKE_GEOMETRY=micro shrinks the
+# slot ~4.7x (hidden=64/inter=32: every param span stays 64-byte divisible).
 WINDOW_SLOTS = 8
 STEPS = 3
 NUM_REGIONS = 1
+_GEOMETRIES = {
+    "sanity": SANITY_GEOMETRY,
+    "micro": DeepSeekV4MoEConfig(hidden_size=64, moe_intermediate_size=32, vocab_size=4096),
+}
 
 
 def _slot_views(region: torch.Tensor, layout: ExpertTensorLayout) -> dict[str, torch.Tensor]:
@@ -63,10 +69,13 @@ def _region_matches_source(
 
 
 def main() -> int:
-    layout = ExpertTensorLayout.for_deepseek_v4_flash(SANITY_GEOMETRY)
+    geometry = _GEOMETRIES[os.environ.get("CAMODEL_SMOKE_GEOMETRY", "sanity")]
+    layout = ExpertTensorLayout.for_deepseek_v4_flash(geometry)
     runtime = NpuRuntime("npu:0")
     window = TransitExchangeBuffer(runtime, layout, host_slots=WINDOW_SLOTS, overflow="drop_oldest")
-    source = SyntheticExpertSource(layout, num_layers=SANITY_GEOMETRY.num_layers, num_experts=256, seed=42)
+    source = SyntheticExpertSource(
+        layout, num_layers=geometry.num_layers, num_experts=geometry.num_routed_experts, seed=42
+    )
     provider = ExclusiveStagingProvider(runtime, layout, window, source)
     print(
         f"window: {window.capacity} slots x {layout.slot_num_bytes} B = "
@@ -77,12 +86,12 @@ def main() -> int:
     slot_regions = [torch.empty(layout.slot_num_bytes, dtype=torch.uint8, device="npu:0") for _ in range(NUM_REGIONS)]
     resident: dict[int, tuple[int, int]] = {}  # slot region -> key of the bytes it currently holds
     last_evicted: tuple[int, int] | None = None
-    top_k = SANITY_GEOMETRY.top_k
+    top_k = geometry.top_k
     steps = STEPS
     for step in range(steps):
         region_index = step % len(slot_regions)
-        layer, expert_base = step % SANITY_GEOMETRY.num_layers, (step * 7) % 200
-        expert_ids = [(expert_base + offset) % 256 for offset in range(top_k)]
+        layer, expert_base = step % geometry.num_layers, (step * 7) % 200
+        expert_ids = [(expert_base + offset) % geometry.num_routed_experts for offset in range(top_k)]
         if region_index in resident:  # exclusive exchange: stage the victim before overwrite
             window.stage_eviction(slot_regions[region_index], key=resident[region_index])
             last_evicted = resident[region_index]
@@ -129,6 +138,8 @@ def main() -> int:
         f"{window.dropped_entries} (window never exceeded {window.capacity} slots)",
         flush=True,
     )
+    import resource
+
     print(f"peak host RSS: {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024 / 2**20:.0f} MiB", flush=True)
     print("CAMODEL WINDOW SMOKE PASS", flush=True)
     return 0
