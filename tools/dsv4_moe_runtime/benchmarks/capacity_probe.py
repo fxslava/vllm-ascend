@@ -153,7 +153,7 @@ class DummyLoopbackWeightProvider:
         weights, scales = layout.slice_slot_views(self._arena, 0)
         self._views: dict[str, torch.Tensor] = {}
         for spec in layout.specs:
-            source_dict = weights if spec.kind == "packed_fp4" else scales
+            source_dict = scales if spec.is_scale else weights
             self._views[spec.param_key] = source_dict[spec.name]
 
     def ensure_staged(self, layer_idx: int, expert_id: int) -> None:

@@ -48,9 +48,12 @@ class RouterTraceSimulator:
         seed: int,
         num_layers: int | None = None,
         num_hash_layers: int | None = None,
+        first_layer_idx: int = 0,
     ):
         num_layers = model_config.num_layers if num_layers is None else num_layers
         num_hash_layers = model_config.num_hash_layers if num_hash_layers is None else num_hash_layers
+        if first_layer_idx < 0:
+            raise ValueError(f"first_layer_idx must be >= 0, got {first_layer_idx}")
         if not 1 <= hot_experts < num_experts_available:
             raise ValueError(f"hot_experts {hot_experts} outside [1, {num_experts_available})")
         if not 0.0 <= hot_ratio <= 1.0:
@@ -60,6 +63,7 @@ class RouterTraceSimulator:
         self._model_config = model_config
         self._num_layers = num_layers
         self._num_hash_layers = num_hash_layers
+        self._first_layer_idx = first_layer_idx
         self._hot_ratio = hot_ratio
 
         rng = random.Random(seed ^ _SEED_SALT_UNIVERSE)
@@ -125,7 +129,11 @@ class RouterTraceSimulator:
         }
         trace: list[TraceStep] = []
         for step in range(num_steps):
-            layer_idx = step % self._num_layers
+            # Layer ids are absolute model indices: a dense prefix (DeepSeek-V2-Lite
+            # replaces layer 0 with a plain MLP) shifts the traced window, while the
+            # hash-routed layers stay the absolute [0, num_hash_layers) window the
+            # residency policy pins.
+            layer_idx = self._first_layer_idx + step % self._num_layers
             token = step // self._num_layers
             if layer_idx < self._num_hash_layers:
                 trace.append(TraceStep(layer_idx, hash_tables[layer_idx][token], "hash"))

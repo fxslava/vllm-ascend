@@ -87,6 +87,7 @@ class _RawFileReader:
         self._fd: int | None = None
         self._win_handle: int | None = None
         self._kernel32 = None
+        self._mmap_fd: int | None = None
         self._tail_fd: int | None = None
         self._tail_handle: int | None = None
         self._kernel32_tail = None
@@ -146,6 +147,19 @@ class _RawFileReader:
             view = memoryview(chunk.numpy())[:aligned_length]
             os.preadv(self._fd, [view], aligned_offset)
 
+    def _mapping_fd(self) -> int:
+        """Descriptor usable for ``mmap``.
+
+        The Windows unbuffered backend owns a raw ``HANDLE`` and no descriptor
+        at all, so mapping needs its own buffered fd (opened once, lazily);
+        mapping ``None`` would silently map the pagefile instead of the file.
+        """
+        if self._fd is not None:
+            return self._fd
+        if self._mmap_fd is None:
+            self._mmap_fd = os.open(self._path, os.O_RDONLY)
+        return self._mmap_fd
+
     def mmap_view(self, file_offset: int, num_bytes: int) -> torch.Tensor:
         """Zero-copy read-only tensor view over the file bytes (kept alive)."""
         aligned_offset = align_down(file_offset, mmap.ALLOCATIONGRANULARITY)
@@ -155,7 +169,7 @@ class _RawFileReader:
         )
         if mapped_len < num_bytes:
             raise OSError(f"mmap window short: need {num_bytes} bytes at {file_offset}")
-        window = mmap.mmap(self._fd, length=mapped_len, access=mmap.ACCESS_READ, offset=aligned_offset)
+        window = mmap.mmap(self._mapping_fd(), length=mapped_len, access=mmap.ACCESS_READ, offset=aligned_offset)
         skip = file_offset - aligned_offset
         view = torch.frombuffer(window, dtype=torch.uint8)[skip : skip + num_bytes]
         view._owning_window = window  # type: ignore[attr-defined]  # pins the mapping
@@ -211,6 +225,9 @@ class _RawFileReader:
         if self._tail_fd is not None:
             os.close(self._tail_fd)
             self._tail_fd = None
+        if self._mmap_fd is not None:
+            os.close(self._mmap_fd)
+            self._mmap_fd = None
         if self._fd is not None:
             os.close(self._fd)
             self._fd = None
@@ -309,34 +326,39 @@ class StreamingWeightLoader:
         flat = destination.view(-1)[:num_bytes]
         moved = 0
         offset = file_offset
-        while moved < num_bytes:
-            remaining = num_bytes - moved
-            aligned_offset = align_down(offset)
-            skip = offset - aligned_offset
-            # Unbuffered reads deliver whole 4096-byte sectors in file space;
-            # boundary sectors are re-read by the next window, the sub-sector
-            # EOF remainder falls back to the buffered tail path.
-            chunk = self._chunks[self._in_flight % len(self._chunks)]
-            self._in_flight += 1
-            if self._in_flight > len(self._chunks):
-                self._runtime.synchronize_stream(self._stream)  # ring wrap: recycle
-            valid = min(remaining, self._chunk_bytes - skip)
-            read_len = align_down(skip + valid, IO_ALIGNMENT)
-            if read_len > 0:
-                self._reader.read_into(chunk, aligned_offset, read_len)
-                covered = read_len - skip  # valid bytes inside the full sectors
-                flat[moved : moved + covered].copy_(chunk[skip : skip + covered], non_blocking=True)
-                moved += covered
-                offset += covered
-                self.bytes_read += covered
-                self.window_count += 1
-            else:  # sub-sector remainder: buffered tail path (page-cached)
-                tail_len = min(remaining, max(self._reader.size - offset, 0))
-                self._reader.read_tail_into(chunk, offset, tail_len)
-                flat[moved : moved + tail_len].copy_(chunk[:tail_len], non_blocking=True)
-                moved += tail_len
-                offset += tail_len
-                self.bytes_read += tail_len
+        # Every copy is issued on this loader's own stream, which is also the
+        # stream the ring wrap and the final sync wait on. Issuing them on the
+        # caller's current stream instead would leave a chunk free to be
+        # overwritten by the next host read while its H2D DMA is still running.
+        with self._runtime.stream_context(self._stream):
+            while moved < num_bytes:
+                remaining = num_bytes - moved
+                aligned_offset = align_down(offset)
+                skip = offset - aligned_offset
+                # Unbuffered reads deliver whole 4096-byte sectors in file space;
+                # boundary sectors are re-read by the next window, the sub-sector
+                # EOF remainder falls back to the buffered tail path.
+                chunk = self._chunks[self._in_flight % len(self._chunks)]
+                self._in_flight += 1
+                if self._in_flight > len(self._chunks):
+                    self._runtime.synchronize_stream(self._stream)  # ring wrap: recycle
+                valid = min(remaining, self._chunk_bytes - skip)
+                read_len = align_down(skip + valid, IO_ALIGNMENT)
+                if read_len > 0:
+                    self._reader.read_into(chunk, aligned_offset, read_len)
+                    covered = read_len - skip  # valid bytes inside the full sectors
+                    flat[moved : moved + covered].copy_(chunk[skip : skip + covered], non_blocking=True)
+                    moved += covered
+                    offset += covered
+                    self.bytes_read += covered
+                    self.window_count += 1
+                else:  # sub-sector remainder: buffered tail path (page-cached)
+                    tail_len = min(remaining, max(self._reader.size - offset, 0))
+                    self._reader.read_tail_into(chunk, offset, tail_len)
+                    flat[moved : moved + tail_len].copy_(chunk[:tail_len], non_blocking=True)
+                    moved += tail_len
+                    offset += tail_len
+                    self.bytes_read += tail_len
         self._runtime.synchronize_stream(self._stream)
         return moved
 

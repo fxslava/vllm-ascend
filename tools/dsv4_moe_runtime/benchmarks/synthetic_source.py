@@ -22,7 +22,14 @@ SYNTHETIC_TILE_BYTES = 64
 class SyntheticExpertSource:
     """Seeded per-expert tile broadcast over the slot region (WeightByteSource)."""
 
-    def __init__(self, layout: ExpertTensorLayout, num_layers: int, num_experts: int, seed: int = 0):
+    def __init__(
+        self,
+        layout: ExpertTensorLayout,
+        num_layers: int,
+        num_experts: int,
+        seed: int = 0,
+        first_layer: int = 0,
+    ):
         for spec in layout.specs:
             if spec.num_bytes % SYNTHETIC_TILE_BYTES:
                 raise ValueError(
@@ -32,13 +39,16 @@ class SyntheticExpertSource:
         self._layout = layout
         self._num_layers = num_layers
         self._num_experts = num_experts
+        self._first_layer = first_layer  # absolute index of the first MoE layer
         generator = torch.Generator().manual_seed(seed)
         self._tiles = torch.randint(
             0, 256, (num_layers * num_experts, SYNTHETIC_TILE_BYTES), dtype=torch.uint8, generator=generator
         )
 
     def contains(self, layer_idx: int, expert_id: int) -> bool:
-        return 0 <= layer_idx < self._num_layers and 0 <= expert_id < self._num_experts
+        return (
+            self._first_layer <= layer_idx < self._first_layer + self._num_layers and 0 <= expert_id < self._num_experts
+        )
 
     def fill_slot(self, destination: torch.Tensor, layer_idx: int, expert_id: int) -> None:
         if not self.contains(layer_idx, expert_id):
@@ -57,4 +67,4 @@ class SyntheticExpertSource:
         return self._tile(layer_idx, expert_id).repeat(repeats).view(spec.view_shape)
 
     def _tile(self, layer_idx: int, expert_id: int) -> torch.Tensor:
-        return self._tiles[layer_idx * self._num_experts + expert_id]
+        return self._tiles[(layer_idx - self._first_layer) * self._num_experts + expert_id]

@@ -54,7 +54,7 @@ class AscendPinnedHostStorage:
                 weights, scales = layout.slice_slot_views(self._arena, host_slot * experts_per_layer + expert_id)
                 views: dict[str, torch.Tensor] = {}
                 for spec in layout.specs:
-                    source_dict = weights if spec.kind == "packed_fp4" else scales
+                    source_dict = scales if spec.is_scale else weights
                     views[spec.param_key] = source_dict[spec.name]
                 self._params[(layer_idx, expert_id)] = views
 

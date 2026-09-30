@@ -5,10 +5,16 @@ length, JSON header, contiguous byte payload) -- no third-party dependency --
 and binds every routed-expert tensor to the exact slot layout:
 
 * per-parameter byte spans must match ``ExpertTensorLayout`` exactly
-  (w1/w3: 4,194,304 packed-FP4 bytes + 262,144 E8M0 scale bytes; w2:
-  4,194,304 + 262,144), summing to the 13,369,344-byte expert slot;
+  (DeepSeek-V4 Flash w1/w3: 4,194,304 packed-FP4 bytes + 262,144 E8M0 scale
+  bytes; w2: 4,194,304 + 262,144, summing to the 13,369,344-byte expert slot --
+  DeepSeek-V2-Lite instead binds three 5,767,168-byte BF16 projections into a
+  17,301,504-byte slot and has no scale regions);
 * every span offset must be 128-byte aligned (strict mode, the packing
-  contract of this runtime).
+  contract of this runtime). Upstream Hugging Face checkpoints only guarantee
+  8-byte alignment, so ``strict_alignment=False`` is the right setting for them;
+* tensor names come from a :class:`ExpertNamingScheme`, which is what makes the
+  same binder serve this runtime's flat ``layers.N.ffn.experts.E.w1.weight``
+  keys and Hugging Face's ``model.layers.N.mlp.experts.E.gate_proj.weight``.
 
 Serving paths (``SlotFillProviderProtocol``): ``fill_slot_params`` streams
 the file spans through the :class:`StreamingWeightLoader` chunk pool straight
@@ -25,10 +31,12 @@ import json
 import os
 import struct
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 import torch
 
-from ..core.layout import SLOT_REGION_ALIGN_BYTES, ExpertTensorLayout
+from ..core.layout import SLOT_REGION_ALIGN_BYTES, ExpertTensorLayout, ExpertTensorSpec
+from ..core.profiles import NAMING_DSV4_FLAT, NAMING_HF_DEEPSEEK
 from .runtime import DeviceRuntime
 from .weight_loader import (
     DEFAULT_EXPERT_CHUNK_BYTES,
@@ -42,6 +50,62 @@ DENSE_SECTION = "__dense__"
 
 class WeightLayoutMismatchError(RuntimeError):
     """Raised when checkpoint byte spans do not bind to the expert slot layout."""
+
+
+@dataclass(frozen=True)
+class ExpertNamingScheme:
+    """How one checkpoint family names an expert's projection tensors."""
+
+    name: str
+    template: str  # formatted with layer, expert, projection, suffix
+    projections: Mapping[str, str]  # layout spec name -> checkpoint projection name
+    weight_suffix: str
+    scale_suffix: str
+
+    def tensor_name(self, layer_idx: int, expert_id: int, spec: ExpertTensorSpec) -> str:
+        try:
+            projection = self.projections[spec.name]
+        except KeyError:
+            raise WeightLayoutMismatchError(
+                f"naming scheme {self.name!r} has no projection for layout tensor {spec.name!r}"
+            ) from None
+        return self.template.format(
+            layer=layer_idx,
+            expert=expert_id,
+            projection=projection,
+            suffix=self.scale_suffix if spec.is_scale else self.weight_suffix,
+        )
+
+
+DSV4_FLAT_NAMING = ExpertNamingScheme(
+    name=NAMING_DSV4_FLAT,
+    template="layers.{layer}.ffn.experts.{expert}.{projection}.{suffix}",
+    projections={"w1": "w1", "w2": "w2", "w3": "w3"},
+    weight_suffix="weight",
+    scale_suffix="scale",
+)
+#: Hugging Face DeepSeek MoE naming (V2/V2-Lite/V3): gate/up/down projections
+#: under ``model.layers.N.mlp.experts.E``, block scales as ``weight_scale_inv``.
+HF_DEEPSEEK_NAMING = ExpertNamingScheme(
+    name=NAMING_HF_DEEPSEEK,
+    template="model.layers.{layer}.mlp.experts.{expert}.{projection}.{suffix}",
+    projections={"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"},
+    weight_suffix="weight",
+    scale_suffix="weight_scale_inv",
+)
+NAMING_SCHEMES: dict[str, ExpertNamingScheme] = {
+    DSV4_FLAT_NAMING.name: DSV4_FLAT_NAMING,
+    HF_DEEPSEEK_NAMING.name: HF_DEEPSEEK_NAMING,
+}
+
+
+def naming_scheme(naming: str | ExpertNamingScheme) -> ExpertNamingScheme:
+    if isinstance(naming, ExpertNamingScheme):
+        return naming
+    try:
+        return NAMING_SCHEMES[naming]
+    except KeyError:
+        raise KeyError(f"unknown naming scheme {naming!r}; known: {list(NAMING_SCHEMES)}") from None
 
 
 def parse_safetensors_header(path: str) -> tuple[dict, int, int]:
@@ -72,6 +136,30 @@ def _span(header: Mapping[str, Mapping[str, object]], name: str, data_start: int
         raise WeightLayoutMismatchError(f"checkpoint is missing tensor {name!r}") from exc
 
 
+def validate_expert_span(
+    spec: ExpertTensorSpec,
+    name: str,
+    begin: int,
+    size: int,
+    strict_alignment: bool = True,
+    file_size: int | None = None,
+) -> None:
+    """Byte-level admissibility of one checkpoint span against the slot layout.
+
+    Shared by the single-file and sharded binders so both enforce the identical
+    contract: exact span size, in-file span end and (strict mode) 128-byte
+    aligned start.
+    """
+    if size != spec.num_bytes:
+        raise WeightLayoutMismatchError(f"{name}: span is {size} bytes, layout requires {spec.num_bytes}")
+    if file_size is not None and begin + size > file_size:
+        raise WeightLayoutMismatchError(
+            f"{name}: span ends at {begin + size}, beyond the {file_size}-byte file (truncated payload?)"
+        )
+    if strict_alignment and begin % SLOT_REGION_ALIGN_BYTES:
+        raise WeightLayoutMismatchError(f"{name}: span offset {begin} is not {SLOT_REGION_ALIGN_BYTES}-byte aligned")
+
+
 def bind_expert_spans(
     header: Mapping[str, Mapping[str, object]],
     data_start: int,
@@ -80,38 +168,33 @@ def bind_expert_spans(
     num_experts: int,
     strict_alignment: bool = True,
     file_size: int | None = None,
+    naming: str | ExpertNamingScheme = NAMING_DSV4_FLAT,
+    expert_ids: Sequence[int] | None = None,
 ) -> dict[tuple[int, int], dict[str, tuple[int, int]]]:
-    """Bind every routed expert's six tensor spans to the slot layout.
+    """Bind every routed expert's tensor spans to the slot layout.
 
     Enforces the byte-exact contract: each parameter span matches its
-    ``ExpertTensorSpec`` size, every expert's spans sum to the 13,369,344-byte
-    slot, and (strict mode) every span starts 128-byte aligned.
+    ``ExpertTensorSpec`` size, every expert's spans sum to exactly one slot, and
+    (strict mode) every span starts 128-byte aligned. ``expert_ids`` overrides
+    the default ``range(num_experts)`` when a shard holds a subset.
     """
+    scheme = naming_scheme(naming)
+    ids = range(num_experts) if expert_ids is None else expert_ids
     spans: dict[tuple[int, int], dict[str, tuple[int, int]]] = {}
     for layer_idx in layer_ids:
-        for expert_id in range(num_experts):
+        for expert_id in ids:
             params: dict[str, tuple[int, int]] = {}
             total = 0
             for spec in layout.specs:
-                kind = "weight" if spec.kind == "packed_fp4" else "scale"
-                name = f"layers.{layer_idx}.ffn.experts.{expert_id}.{spec.name}.{kind}"
+                name = scheme.tensor_name(layer_idx, expert_id, spec)
                 begin, end = _span(header, name, data_start)
                 size = end - begin
-                if size != spec.num_bytes:
-                    raise WeightLayoutMismatchError(f"{name}: span is {size} bytes, layout requires {spec.num_bytes}")
-                if file_size is not None and end > file_size:
-                    raise WeightLayoutMismatchError(
-                        f"{name}: span ends at {end}, beyond the {file_size}-byte file (truncated payload?)"
-                    )
-                if strict_alignment and begin % SLOT_REGION_ALIGN_BYTES:
-                    raise WeightLayoutMismatchError(
-                        f"{name}: span offset {begin} is not {SLOT_REGION_ALIGN_BYTES}-byte aligned"
-                    )
+                validate_expert_span(spec, name, begin, size, strict_alignment, file_size)
                 params[spec.param_key] = (begin, size)
                 total += size
             if total != layout.slot_num_bytes:
                 raise WeightLayoutMismatchError(
-                    f"layers.{layer_idx}.ffn.experts.{expert_id}: spans total {total} bytes, "
+                    f"layer {layer_idx} expert {expert_id} ({scheme.name}): spans total {total} bytes, "
                     f"slot layout is {layout.slot_num_bytes}"
                 )
             spans[(layer_idx, expert_id)] = params
@@ -157,9 +240,11 @@ class SafetensorsExpertProvider:
         loader: StreamingWeightLoader | None = None,
         dense_names: Sequence[str] = (),
         strict_alignment: bool = True,
+        naming: str | ExpertNamingScheme = NAMING_DSV4_FLAT,
     ):
         self._runtime = runtime
         self._layout = layout
+        self._naming = naming_scheme(naming)
         header, data_start, file_size = parse_safetensors_header(file_path)
         self.expert_spans = bind_expert_spans(
             header,
@@ -169,6 +254,7 @@ class SafetensorsExpertProvider:
             num_experts=num_experts,
             strict_alignment=strict_alignment,
             file_size=file_size,
+            naming=self._naming,
         )
         self.dense_spans = bind_dense_spans(header, data_start, dense_names, strict_alignment)
         self._loader = loader or StreamingWeightLoader(

@@ -133,7 +133,7 @@ class StaticExpertSlotPool:
             self._scale_views.append(scales)
             views_by_key: dict[str, torch.Tensor] = {}
             for spec in self._layout.specs:
-                source_dict = weights if spec.kind == "packed_fp4" else scales
+                source_dict = scales if spec.is_scale else weights
                 views_by_key[spec.param_key] = source_dict[spec.name]
             self._param_views.append(views_by_key)
 
@@ -334,7 +334,7 @@ class StaticExpertSlotPool:
                 self._residents[key] = slot
                 for spec in self._layout.specs:
                     source = host_pinned_storage.pinned_cpu_weight(layer_idx, key[1], spec.param_key)
-                    view_map = self._weight_views if spec.kind == "packed_fp4" else self._scale_views
+                    view_map = self._scale_views if spec.is_scale else self._weight_views
                     destination = view_map[slot][spec.name]
                     destination.copy_(source, non_blocking=False)
                     self.stats.bytes_staged += source.numel()

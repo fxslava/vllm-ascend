@@ -135,6 +135,38 @@ def test_exclusive_provider_streams_through_window_and_consumes(sanity_layout: E
     assert buffer.in_flight == 0  # the failed ensure_staged mutated nothing
 
 
+def test_reclaimed_entry_is_refilled_from_the_source(sanity_layout: ExpertTensorLayout) -> None:
+    """A step whose staged entry the ring drops must still promote correct bytes.
+
+    Regression: with ``drop_oldest``, the evictions a step stages *after*
+    ``ensure_staged`` can reclaim the very entry that step is about to promote
+    (the common case is a window hit on a long-evicted expert, which sits at the
+    ring head). The fill used to raise mid-admission; it now re-reads the
+    authoritative source, which is what makes window entries droppable caches.
+    """
+    runtime = CpuRuntime()
+    buffer = TransitExchangeBuffer(runtime, sanity_layout, host_slots=2, overflow="drop_oldest")
+    source = _make_source(sanity_layout)
+    provider = ExclusiveStagingProvider(runtime, sanity_layout, buffer, source)
+
+    provider.ensure_staged(0, 1)  # the promotee lands at the ring head
+    victim = torch.full((sanity_layout.slot_num_bytes,), 0x5A, dtype=torch.uint8)
+    buffer.stage_eviction(victim, key=(0, 6))
+    buffer.stage_eviction(victim, key=(0, 7))  # ring full -> drops the oldest entry
+    assert buffer.lookup((0, 1)) is None and buffer.dropped_entries == 1
+
+    views = _zero_views(sanity_layout)
+    moved = provider.fill_slot_params(0, 1, views)
+    assert moved == sanity_layout.slot_num_bytes
+    assert provider.window_refills == 1
+    for param_key, view in views.items():
+        assert torch.equal(view, source.read_param(0, 1, param_key))
+
+    provider.synchronize()
+    with pytest.raises(KeyError):  # a key no step prepared is still a hard error
+        provider.fill_slot_params(0, 1, views)
+
+
 def test_pool_window_hit_avoids_source_refill(sanity_config, sanity_layout: ExpertTensorLayout) -> None:
     runtime = CpuRuntime()
     buffer = TransitExchangeBuffer(runtime, sanity_layout, host_slots=2 * sanity_config.top_k, overflow="drop_oldest")

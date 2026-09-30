@@ -1,8 +1,11 @@
-"""Hardware-facing runtime seam: the identical harness runs on npu:0 and cpu.
+"""Hardware-facing runtime seam: one harness runs on npu:0, cuda:0 and cpu.
 
-``DeviceRuntime`` is the only place that knows about ``torch.npu`` vs plain
-CPU semantics (allocator accounting, copy streams, cache release); every other
-module depends on this seam, never on the hardware directly (DIP).
+``DeviceRuntime`` is the only place that knows about ``torch.npu`` vs
+``torch.cuda`` vs plain CPU semantics (allocator accounting, copy streams,
+cache release, capacity probes); every other module depends on this seam, never
+on the hardware directly (DIP). The CUDA runtime exists so the exact same
+offload harness can be validated on a workstation GPU (RTX 5070, 12 GiB) before
+it runs on Ascend HBM.
 """
 
 from __future__ import annotations
@@ -12,9 +15,13 @@ from typing import Protocol
 
 import torch
 
+CUDA_DEVICE_PREFIX = "cuda"
+NPU_DEVICE_PREFIX = "npu"
+CPU_DEVICE = "cpu"
+
 
 class DeviceRuntime(Protocol):
-    """Hardware-facing seam (allocator accounting, copy stream, sync)."""
+    """Hardware-facing seam (allocator accounting, copy stream, sync, capacity)."""
 
     device: str
     has_allocator_accounting: bool
@@ -23,6 +30,12 @@ class DeviceRuntime(Protocol):
     def memory_allocated(self) -> int: ...
 
     def memory_reserved(self) -> int: ...
+
+    def device_total_memory(self) -> int | None:
+        """Physical device memory in bytes; ``None`` where unavailable."""
+
+    def device_free_memory(self) -> int | None:
+        """Currently free device memory in bytes; ``None`` where unavailable."""
 
     def synchronize_device(self) -> None: ...
 
@@ -50,7 +63,8 @@ class NpuRuntime:
                 f"device {device!r} requires torch_npu (CANN 8.x/9.x, aclnn V5); "
                 "run on the Ascend host, or use --device cpu / --dry-run on a workstation"
             ) from exc
-        torch.npu.set_device(int(device.rsplit(":", 1)[-1]))
+        self._device_index = _device_index(device)
+        torch.npu.set_device(self._device_index)
         self.device = device
         self.has_allocator_accounting = True
         self.supports_pinned_host_memory = True
@@ -60,6 +74,12 @@ class NpuRuntime:
 
     def memory_reserved(self) -> int:
         return int(torch.npu.memory_reserved(self.device))
+
+    def device_total_memory(self) -> int | None:
+        return _capacity_from(torch.npu, self._device_index)[1]
+
+    def device_free_memory(self) -> int | None:
+        return _capacity_from(torch.npu, self._device_index)[0]
 
     def synchronize_device(self) -> None:
         torch.npu.synchronize(self.device)
@@ -87,13 +107,78 @@ class NpuRuntime:
             torch.npu.reset_accumulated_memory_stats(self.device)
 
 
+class CudaRuntime:
+    """RTX 5070 / CUDA runtime: caching-allocator stats + dedicated copy stream.
+
+    The hardware-identical validation target for the Ascend path: allocator
+    accounting carries the zero-allocation invariant exactly as ``torch.npu``
+    does, pinned host staging comes from ``cudaHostAlloc`` (page-aligned, which
+    the unbuffered DirectStorage reads require) and H2D DMA rides a dedicated
+    ``torch.cuda.Stream``.
+    """
+
+    def __init__(self, device: str):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"device {device!r} requires a CUDA build of torch with a visible GPU; "
+                "use --device cpu / --dry-run on a machine without one"
+            )
+        self._device_index = _device_index(device)
+        device_count = torch.cuda.device_count()
+        if not 0 <= self._device_index < device_count:
+            raise ValueError(f"{device!r}: CUDA device index out of range (visible devices: {device_count})")
+        torch.cuda.set_device(self._device_index)
+        self.device = f"{CUDA_DEVICE_PREFIX}:{self._device_index}"
+        self.has_allocator_accounting = True
+        self.supports_pinned_host_memory = True
+
+    @property
+    def device_name(self) -> str:
+        return torch.cuda.get_device_name(self._device_index)
+
+    def memory_allocated(self) -> int:
+        return int(torch.cuda.memory_allocated(self.device))
+
+    def memory_reserved(self) -> int:
+        return int(torch.cuda.memory_reserved(self.device))
+
+    def device_total_memory(self) -> int | None:
+        return _capacity_from(torch.cuda, self._device_index)[1]
+
+    def device_free_memory(self) -> int | None:
+        return _capacity_from(torch.cuda, self._device_index)[0]
+
+    def synchronize_device(self) -> None:
+        torch.cuda.synchronize(self.device)
+
+    def make_stream(self) -> object:
+        return torch.cuda.Stream(device=self.device)
+
+    def stream_context(self, stream: object | None) -> AbstractContextManager[None]:
+        return torch.cuda.stream(stream)
+
+    def synchronize_stream(self, stream: object | None) -> None:
+        if stream is not None:
+            stream.synchronize()
+
+    def release_cache(self) -> None:
+        torch.cuda.empty_cache()
+
+    def reset_device(self) -> None:
+        # Mirrors NpuRuntime: flush the cache and clear accumulated allocator
+        # statistics. A hard device reset would invalidate torch's own CUDA
+        # context, so teardown stops at these public entry points.
+        torch.cuda.empty_cache()
+        torch.cuda.reset_accumulated_memory_stats(self._device_index)
+
+
 class CpuRuntime:
     """Workstation runtime: no device allocator accounting, no copy stream."""
 
-    def __init__(self, device: str = "cpu"):
-        if device != "cpu":
+    def __init__(self, device: str = CPU_DEVICE):
+        if device != CPU_DEVICE:
             raise ValueError(f"CpuRuntime serves only 'cpu', got {device!r}")
-        self.device = "cpu"
+        self.device = CPU_DEVICE
         self.has_allocator_accounting = False
         self.supports_pinned_host_memory = torch.cuda.is_available()
 
@@ -102,6 +187,12 @@ class CpuRuntime:
 
     def memory_reserved(self) -> int:
         return 0
+
+    def device_total_memory(self) -> int | None:
+        return None
+
+    def device_free_memory(self) -> int | None:
+        return None
 
     def synchronize_device(self) -> None:
         pass
@@ -122,7 +213,41 @@ class CpuRuntime:
         pass
 
 
+def _device_index(device: str) -> int:
+    """Index of ``<backend>[:<index>]``; a bare backend name means device 0."""
+    _backend, _, index = device.partition(":")
+    if not index:
+        return 0
+    if not index.isdigit():
+        raise ValueError(f"device {device!r}: expected '<backend>:<index>'")
+    return int(index)
+
+
+def _capacity_from(namespace: object, index: int) -> tuple[int | None, int | None]:
+    """``(free, total)`` device bytes via ``mem_get_info``, with a total-only fallback."""
+    mem_get_info = getattr(namespace, "mem_get_info", None)
+    if mem_get_info is not None:
+        try:
+            free, total = mem_get_info(index)
+            return int(free), int(total)
+        except (RuntimeError, AssertionError, TypeError):  # older/partial backends
+            pass
+    properties = getattr(namespace, "get_device_properties", None)
+    if properties is None:
+        return None, None
+    try:
+        return None, int(properties(index).total_memory)
+    except (RuntimeError, AssertionError, AttributeError):
+        return None, None
+
+
 def make_runtime(device: str) -> DeviceRuntime:
-    if device == "cpu":
+    """Build the runtime seam for ``cpu``, ``cuda[:i]`` or ``npu[:i]``."""
+    backend = device.partition(":")[0]
+    if backend == CPU_DEVICE:
         return CpuRuntime()
-    return NpuRuntime(device)
+    if backend == CUDA_DEVICE_PREFIX:
+        return CudaRuntime(device)
+    if backend == NPU_DEVICE_PREFIX:
+        return NpuRuntime(device)
+    raise ValueError(f"unsupported device {device!r}; expected cpu, cuda[:i] or npu[:i]")

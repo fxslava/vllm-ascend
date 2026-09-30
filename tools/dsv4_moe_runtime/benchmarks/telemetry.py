@@ -13,6 +13,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from ..core.slot_pool import StaticExpertSlotPool
+from ..hardware.vram_budget import DeviceMemoryBudget
 from .stress_config import MAX_TRANSIT_WINDOW_BYTES
 
 GIB = 1024**3
@@ -67,12 +68,16 @@ class StressReport:
     """Aggregate result of one exclusive-staging offload stress run."""
 
     config: object  # BenchConfig (kept untyped here to avoid an import cycle)
+    layout_name: str
+    weight_source: str
+    budget: DeviceMemoryBudget
     slot_num_bytes: int
     transit_slots: int
     host_window_bytes: int
     transit_peak_in_flight: int
     window_source_fills: int
     window_hits: int
+    window_refills: int
     evictions_staged: int
     window_dropped: int
     pool_bytes: int
@@ -106,6 +111,11 @@ class StressReport:
         """The exclusive staging guarantee: bounded pinned host DDR."""
         return self.host_window_bytes <= MAX_TRANSIT_WINDOW_BYTES
 
+    @property
+    def device_budget_ok(self) -> bool:
+        """The plan stayed inside the target's device memory (unknown counts as OK)."""
+        return self.budget.fits is not False
+
     def invariants_ok(self) -> bool:
         verification_ok = self.verification is None or self.verification[0]
         return (
@@ -113,6 +123,7 @@ class StressReport:
             and self.fingerprints_stable
             and verification_ok
             and self.window_cap_ok
+            and self.device_budget_ok
         )
 
 
@@ -165,15 +176,18 @@ def render_report(report: StressReport) -> str:
     lines: list[str] = []
     separator = "=" * 78
     lines.append(separator)
-    lines.append("DeepSeek-V4 NPU offload stress report (exclusive staging)")
+    lines.append(f"{report.layout_name} offload stress report (exclusive staging)")
     lines.append(separator)
     lines.append(
         f"device {config.device} | slots {config.pool_slots} x {human_bytes(report.slot_num_bytes)} "
-        f"= {human_bytes(report.pool_bytes)} HBM | exclusive transit window {report.transit_slots} slots "
+        f"= {human_bytes(report.pool_bytes)} device memory | exclusive transit window {report.transit_slots} slots "
         f"= {human_bytes(report.host_window_bytes)} pinned host DDR"
     )
+    lines.append(f"weights: {report.weight_source}")
+    lines.append(report.budget.render())
     lines.append(
-        f"window traffic: {report.window_source_fills} source fills, {report.window_hits} window hits | "
+        f"window traffic: {report.window_source_fills} source fills, {report.window_hits} window hits "
+        f"({report.window_refills} reclaimed before promotion, re-read from source) | "
         f"{report.evictions_staged} evictions staged, {report.window_dropped} dropped | "
         f"peak occupancy {report.transit_peak_in_flight}/{report.transit_slots} slots"
     )
@@ -247,6 +261,7 @@ def report_to_dict(report: StressReport) -> dict[str, object]:
     return {
         "config": {
             "device": config.device,
+            "layout": report.layout_name,
             "steps": report.steps,
             "pool_slots": config.pool_slots,
             "transit_slots": report.transit_slots,
@@ -255,7 +270,9 @@ def report_to_dict(report: StressReport) -> dict[str, object]:
             "zipf_exponent": config.zipf_exponent,
             "seed": config.seed,
             "small_geometry": config.small_geometry,
+            "weight_source": report.weight_source,
         },
+        "device_budget": report.budget.to_dict(),
         "slot_num_bytes": report.slot_num_bytes,
         "exclusive_staging": {
             "transit_slots": report.transit_slots,
@@ -263,6 +280,7 @@ def report_to_dict(report: StressReport) -> dict[str, object]:
             "window_cap_ok": report.window_cap_ok,
             "window_source_fills": report.window_source_fills,
             "window_hits": report.window_hits,
+            "window_refills": report.window_refills,
             "evictions_staged": report.evictions_staged,
             "window_dropped": report.window_dropped,
             "transit_peak_in_flight": report.transit_peak_in_flight,
