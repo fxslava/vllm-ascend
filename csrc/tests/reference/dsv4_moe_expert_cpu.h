@@ -125,11 +125,15 @@ inline void Project(const float* x, const uint8_t* packed, const uint8_t* scales
   }
 }
 
-// silu(g) * u, evaluated as (g * sigmoid(g)) * u to match the kernel's
-// left-to-right expression. `clamp <= 0` disables clamping, which is the
-// shipping behaviour; a positive value bounds the exponential's input the way
-// grouped_matmul_swiglu_quant does.
-inline float SwiGluElement(float gate, float up, float clamp = 0.0f) {
+// DeepSeek-V4 architectural constant: the gate is clamped symmetrically to
+// +/- 10.0 before the activation. Part of the model definition, so the kernel,
+// this reference and the goldens must all apply it. `clamp <= 0` disables it,
+// which is only useful for characterising what the clamp changes.
+constexpr float kSwigluLimit = 10.0f;
+
+// silu(clamp(g)) * u, evaluated as (g * sigmoid(g)) * u to match the kernel's
+// expression.
+inline float SwiGluElement(float gate, float up, float clamp = kSwigluLimit) {
   float g = gate;
   if (clamp > 0.0f) {
     if (g > clamp) g = clamp;
@@ -168,7 +172,7 @@ struct ExpertInputs {
 
 // The full expert pipeline: gate/up FP4 GEMM, SwiGLU, down FP4 GEMM.
 inline ExpertOutputs ReferenceExpert(const ExpertInputs& in, int64_t hidden,
-                                     int64_t inter, float clamp = 0.0f) {
+                                     int64_t inter, float clamp = kSwigluLimit) {
   std::vector<float> x_f32(static_cast<size_t>(hidden));
   for (int64_t c = 0; c < hidden; ++c) {
     x_f32[static_cast<size_t>(c)] = Bf16BitsToFloat(in.x[c]);

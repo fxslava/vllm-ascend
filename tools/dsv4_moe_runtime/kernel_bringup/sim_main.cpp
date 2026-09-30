@@ -42,7 +42,21 @@ namespace {
 
 constexpr int64_t FP4_BLOCK = 32;
 constexpr int64_t FP4_PER_BYTE = 2;
-constexpr size_t TILING_FIELDS = 3; // hiddenSize, interSize, blockSize
+// DeepSeek-V4 architectural constant; must match the host tiling function and
+// gen_golden.py's SWIGLU_LIMIT.
+constexpr float SWIGLU_LIMIT = 10.0f;
+
+// Mirrors op_kernel/dsv4_moe_expert_tiling_data.h field for field. The host
+// tiling path is not driven here, so the buffer is built by hand -- and it has
+// to match the kernel's struct exactly, because GET_TILING_DATA_WITH_STRUCT
+// copies sizeof(struct) bytes out of it.
+struct TilingLayout {
+    int64_t hiddenSize;
+    int64_t interSize;
+    int64_t blockSize;
+    float swigluLimit;
+    float tilingReserved;
+};
 
 bool ReadFile(const std::string &path, std::vector<uint8_t> &out)
 {
@@ -143,14 +157,13 @@ int main(int argc, char **argv)
     uint8_t *downGm = DeviceBuffer(hiddenOutBytes);
     uint8_t *workspaceGm = DeviceBuffer(FP4_BLOCK); // tiling reports 0; keep a valid pointer
 
-    // The host tiling path is not driven here, so the 24-byte tiling buffer is
-    // built by hand in the field order of Dsv4MoeExpertTilingData.
-    std::vector<int64_t> tiling(TILING_FIELDS);
-    tiling[0] = hidden;
-    tiling[1] = inter;
-    tiling[2] = FP4_BLOCK;
-    uint8_t *tilingGm = DeviceBuffer(tiling.size() * sizeof(int64_t),
-                                     reinterpret_cast<const uint8_t *>(tiling.data()));
+    TilingLayout tiling{};
+    tiling.hiddenSize = hidden;
+    tiling.interSize = inter;
+    tiling.blockSize = FP4_BLOCK;
+    tiling.swigluLimit = SWIGLU_LIMIT;
+    tiling.tilingReserved = 0.0f;
+    uint8_t *tilingGm = DeviceBuffer(sizeof(tiling), reinterpret_cast<const uint8_t *>(&tiling));
 
     if (tilingGm == nullptr || downGm == nullptr) {
         std::fprintf(stderr, "GmAlloc failed\n");

@@ -36,13 +36,17 @@ void dsv4_moe_expert_impl(void *stream, uint32_t blockDim, void *x, void *w1, vo
 namespace test {
 namespace dsv4 {
 
-// The kernel's tiling struct, in the field order of
+// The kernel's tiling struct, field for field with
 // op_kernel/dsv4_moe_expert_tiling_data.h. The tests build it by hand rather
-// than driving the host tiling path.
+// than driving the host tiling path, so it has to match exactly:
+// GET_TILING_DATA_WITH_STRUCT copies sizeof(struct) bytes out of the buffer,
+// and a short one is an out-of-bounds read that segfaults the CPU interpreter.
 struct TilingBuffer {
   int64_t hidden_size;
   int64_t inter_size;
   int64_t block_size;
+  float swiglu_limit;
+  float reserved;
 };
 
 // One generated problem, laid out exactly as the kernel's argument order.
@@ -62,7 +66,9 @@ struct Problem {
                         w1_scale.data(), w2_scale.data(), w3_scale.data()};
   }
 
-  TilingBuffer Tiling() const { return TilingBuffer{hidden, inter, kFp4Block}; }
+  TilingBuffer Tiling() const {
+    return TilingBuffer{hidden, inter, kFp4Block, kSwigluLimit, 0.0f};
+  }
 };
 
 // `scale_span` bounds the E8M0 exponents to 127 +/- span. The specials (0x00

@@ -35,6 +35,7 @@ namespace {
 
 constexpr int64_t FP4_BLOCK = 32;
 constexpr int64_t FP4_PER_BYTE = 2;
+constexpr float SWIGLU_LIMIT = 10.0f; // DeepSeek-V4 architectural constant
 
 #define ACL_OK(expr)                                                                       \
     do {                                                                                   \
@@ -130,8 +131,17 @@ int main(int argc, char **argv)
     void *downDev = devAlloc(hiddenOutBytes, nullptr);
     void *workspaceDev = devAlloc(static_cast<size_t>(FP4_BLOCK), nullptr);
 
-    int64_t tiling[3] = {hidden, inter, FP4_BLOCK};
-    void *tilingDev = devAlloc(sizeof(tiling), tiling);
+    // Mirrors op_kernel/dsv4_moe_expert_tiling_data.h field for field:
+    // GET_TILING_DATA_WITH_STRUCT copies sizeof(struct) bytes out of this
+    // buffer, so a short one is an out-of-bounds read.
+    struct TilingLayout {
+        int64_t hiddenSize;
+        int64_t interSize;
+        int64_t blockSize;
+        float swigluLimit;
+        float tilingReserved;
+    } tiling{hidden, inter, FP4_BLOCK, SWIGLU_LIMIT, 0.0f};
+    void *tilingDev = devAlloc(sizeof(tiling), &tiling);
 
     if (tilingDev == nullptr || downDev == nullptr) {
         std::fprintf(stderr, "device allocation failed\n");

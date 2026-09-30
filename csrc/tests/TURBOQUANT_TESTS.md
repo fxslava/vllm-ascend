@@ -896,7 +896,7 @@ invalid environment value falls back to its default, with a message.
 
 **Build:** the stage 0–4 entry points exist only under
 `VLLM_ASCEND_TQ_DECODE_ABLATION`, which the wheel's library does not define.
-`csrc/tests/turboquant/CMakeLists.txt` has to set it twice, because
+`csrc/tests/ascendc/CMakeLists.txt` has to set it twice, because
 `ascendc_library` compiles the source twice: `ascendc_compile_definitions` for
 the device precompile, and `ascendc_compile_options(...
 -forward-options-to-host-compiler ...)` for the host stub. With only the first,

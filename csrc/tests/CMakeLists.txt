@@ -139,13 +139,13 @@ option(VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS
 # The DSV4 MoE expert kernel (csrc/moe/dsv4_moe_expert), compiled from the
 # shipping source and driven by the simulator tier.
 #
-# It is declared inside turboquant/CMakeLists.txt rather than a directory of
-# its own, because ascendc.cmake creates several bare unguarded targets
-# (host_intf_pub, device_intf_pub, ...) and so cannot be included twice in one
-# project. That is also why this option currently implies
+# It is declared in ascendc/CMakeLists.txt alongside the TurboQuant kernels,
+# because ascendc.cmake creates several bare unguarded targets (host_intf_pub,
+# device_intf_pub, ...) and so cannot be included twice in one project. That is
+# also why this option currently implies
 # VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS: the scope that includes
 # ascendc.cmake is reached only when that one is ON. See the note in
-# turboquant/CMakeLists.txt.
+# ascendc/CMakeLists.txt.
 option(VLLM_ASCEND_TESTS_BUILD_DSV4_KERNELS
        "Compile the DSV4 MoE expert Ascend C kernel and build the tests that drive it" ON)
 
@@ -734,9 +734,12 @@ if(VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE)
       message(STATUS "vllm-ascend tests: camodel libs at ${VLLM_ASCEND_SIMULATOR_LIB_DIR}")
     endif()
 
-    # Defines the vllm_ascend_turboquant target. Kept in a subdirectory so
-    # ascendc.cmake's side effects stay out of this scope; see the note there.
-    add_subdirectory(turboquant)
+    # Every Ascend C kernel library in the suite: vllm_ascend_turboquant and
+    # vllm_ascend_dsv4_moe_expert. Kept in one subdirectory for two reasons,
+    # both explained in full there: ascendc.cmake's side effects stay out of
+    # this scope, and it cannot be included twice in one project because it
+    # creates several bare unguarded targets.
+    add_subdirectory(ascendc)
 
     # The Torch-free binding: the two _impl prototypes, the codec table builder
     # and the grid arithmetic that turboquant_torch_adpt.h would have done with

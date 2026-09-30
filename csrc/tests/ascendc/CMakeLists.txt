@@ -14,20 +14,30 @@
 # limitations under the License.
 # -----------------------------------------------------------------------------
 #
-# The TurboQuant Ascend C kernels, compiled for the tests out of exactly the
-# sources the wheel builds: csrc/attention/turboquant/op_kernel/.
-# There is no second copy and no test-only variant - a kernel the suite passes
+# EVERY Ascend C kernel library the suite builds, compiled out of exactly the
+# sources the wheel builds - csrc/attention/turboquant/op_kernel/ for
+# TurboQuant, csrc/moe/dsv4_moe_expert/op_kernel/ for the DSV4 expert. There is
+# no second copy and no test-only variant of either: a kernel the suite passes
 # on and the kernel that ships have to be the same object code, or the suite is
 # testing something nobody runs.
 #
-# This lives in its own directory rather than inline in ../../../CMakeLists.txt
-# for two reasons, both of which are about containment:
+# Everything that compiles device code lives in this one directory, for three
+# reasons:
 #
-#   * ascendc.cmake is not a well-behaved include. It sets CMAKE_SKIP_RPATH,
-#     pulls in ExternalProject, and defines a dozen ASCENDC_* variables in
-#     whatever scope includes it. Keeping it in a leaf directory keeps all of
-#     that off the 310P and host-only targets, which must stay buildable with no
-#     kernel toolchain at all.
+#   * ascendc.cmake CANNOT be included twice in one project. Its
+#     legacy_modules/host_intf.cmake creates `host_intf_pub` and
+#     bisheng_intf.cmake creates `device_intf_pub`, `c310_aiv_intf_pub` and
+#     others, all with bare unguarded add_library() calls. A second
+#     subdirectory that included it would fail at configure time with "another
+#     target with the same name already exists". ascendc_library() itself is
+#     safe to call repeatedly: every target it creates derives from the target
+#     name it is given.
+#
+#   * ascendc.cmake is not a well-behaved include in general. It sets
+#     CMAKE_SKIP_RPATH, pulls in ExternalProject, and defines a dozen ASCENDC_*
+#     variables in whatever scope includes it. Keeping it in a leaf directory
+#     keeps all of that off the 310P and host-only targets, which must stay
+#     buildable with no kernel toolchain at all.
 #
 #   * the generator override below has to be scoped, and a subdirectory is the
 #     only scope CMake offers.
@@ -97,18 +107,6 @@ ascendc_compile_options(vllm_ascend_turboquant PRIVATE
 # ---------------------------------------------------------------------------
 # The DSV4 MoE expert kernel
 # ---------------------------------------------------------------------------
-#
-# It lives in a directory named after TurboQuant, which needs explaining:
-# ascendc.cmake CANNOT be included twice in one project. Its
-# legacy_modules/host_intf.cmake creates `host_intf_pub`, and
-# bisheng_intf.cmake creates `device_intf_pub`, `c310_aiv_intf_pub` and the
-# rest, all with bare unguarded add_library() calls. A second subdirectory that
-# included ascendc.cmake would fail at configure time with "another target with
-# the same name already exists". So every ascendc_library() in this suite has
-# to be declared in this one scope, whatever it builds.
-#
-# ascendc_library() itself is safe to call more than once: every target it
-# creates is derived from the target name it is given.
 #
 # One source, not two. common/dsv4_moe_expert_kernels.cpp includes the shipping
 # kernel verbatim and defines the <<<>>> launcher beside it; listing the kernel

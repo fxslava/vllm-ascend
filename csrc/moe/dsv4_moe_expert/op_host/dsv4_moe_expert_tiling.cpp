@@ -37,6 +37,11 @@ constexpr size_t INDEX_W3_SCALE = 6;
 
 constexpr int64_t FP4_BLOCK = 32;
 constexpr int64_t FP4_PER_BYTE = 2;
+// DeepSeek-V4 architectural constant: the gate activation is clamped to
+// +/- 10.0 before the activation. Not a tunable and not an overflow guard --
+// it is part of the model definition, so the kernel, the CPU reference and the
+// goldens all have to apply it or they implement different functions.
+constexpr float SWIGLU_LIMIT = 10.0f;
 // Milestone budget: packed weight matrix + scales + activations must fit the
 // AIV unified buffer in one load (196 KB classic UB, half reserved for
 // staging/queues -> 96 KiB for the packed matrix).
@@ -106,6 +111,8 @@ ge::graphStatus Tiling4Dsv4MoeExpert(gert::TilingContext *context)
     tilingData.set_hiddenSize(hiddenSize);
     tilingData.set_interSize(interSize);
     tilingData.set_blockSize(FP4_BLOCK);
+    tilingData.set_swigluLimit(SWIGLU_LIMIT);
+    tilingData.set_tilingReserved(0.0f);
     tilingData.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
     context->GetRawTilingData()->SetDataSize(tilingData.GetDataSize());
 

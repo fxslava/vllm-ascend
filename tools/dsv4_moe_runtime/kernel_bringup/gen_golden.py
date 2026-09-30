@@ -40,6 +40,11 @@ import numpy as np
 FP4_BLOCK = 32
 FP4_PER_BYTE = 2
 
+# DeepSeek-V4 architectural constant: the gate activation is clamped
+# symmetrically to +/- 10.0 before SwiGLU. The kernel carries the same value in
+# its tiling struct; the two must agree or they compute different functions.
+SWIGLU_LIMIT = np.float32(10.0)
+
 # E2M1 nibble decode: bit3 sign, bits2..1 exponent (bias 1), bit0 mantissa.
 E2M1_TABLE = np.array(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
@@ -133,11 +138,18 @@ def reference_expert(
     gate = project(x_f32, w1, w1_scale, inter, hidden)
     up = project(x_f32, w3, w3_scale, inter, hidden)
 
-    # silu(g) * u, evaluated as (g * sigmoid(g)) * u to match the kernel's
-    # left-to-right scalar expression.
-    neg_exp = np.exp((-gate).astype(np.float32)).astype(np.float32)
+    # DeepSeek-V4 clamps the gate symmetrically to +/- swiglu_limit before the
+    # activation. This is part of the model definition, not an overflow guard:
+    # at +/-10 the exponential stays far inside fp32 range, so the inf path an
+    # unclamped implementation relies on never arises.
+    #
+    # The clamp goes to a separate array: `gate_out` is the RAW projection, so
+    # that output keeps meaning "the gate GEMM's result".
+    gate_clamped = np.clip(gate, -SWIGLU_LIMIT, SWIGLU_LIMIT).astype(np.float32)
+    # silu(g) * u, evaluated as (g * sigmoid(g)) * u to match the kernel.
+    neg_exp = np.exp((-gate_clamped).astype(np.float32)).astype(np.float32)
     sigmoid = (np.float32(1.0) / (np.float32(1.0) + neg_exp)).astype(np.float32)
-    activated = ((gate * sigmoid).astype(np.float32) * up).astype(np.float32)
+    activated = ((gate_clamped * sigmoid).astype(np.float32) * up).astype(np.float32)
 
     down = project(activated, w2, w2_scale, hidden, inter)
 

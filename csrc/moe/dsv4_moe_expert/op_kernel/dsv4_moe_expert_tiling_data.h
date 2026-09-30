@@ -18,9 +18,11 @@
 #define DSV4_MOE_EXPERT_TILING_DATA_H
 
 struct Dsv4MoeExpertTilingData {
-    int64_t hiddenSize; // reduction dim of the gate/up leg
-    int64_t interSize;  // reduction dim of the down leg
-    int64_t blockSize;  // E8M0 scale span, always 32
+    int64_t hiddenSize;    // reduction dim of the gate/up leg
+    int64_t interSize;     // reduction dim of the down leg
+    int64_t blockSize;     // E8M0 scale span, always 32
+    float swigluLimit;     // DeepSeek-V4 architectural clamp, 10.0
+    float tilingReserved;  // keeps the struct 8-byte aligned
 };
 
 #endif // DSV4_MOE_EXPERT_TILING_DATA_H

@@ -32,6 +32,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <string>
@@ -97,9 +98,13 @@ Outputs Launch(const Problem& p, aclrtStream stream, const char* tag) {
     ACL_CHECK(aclrtMemset(b->get(), b->size_bytes(), 0xA5, b->size_bytes()));
   }
 
+  // Copied as raw bytes, not as a field list: the kernel's
+  // GET_TILING_DATA_WITH_STRUCT reads sizeof(struct) bytes, so the buffer has
+  // to be the struct, padding and all.
   const TilingBuffer tiling = p.Tiling();
+  const auto* tiling_bytes = reinterpret_cast<const uint8_t*>(&tiling);
   DeviceBuffer tiling_dev = DeviceBuffer::FromHost(
-      std::vector<int64_t>{tiling.hidden_size, tiling.inter_size, tiling.block_size});
+      std::vector<uint8_t>(tiling_bytes, tiling_bytes + sizeof(tiling)));
 
   dsv4_moe_expert_impl(stream, /*blockDim=*/1, x.get(), w1.get(), w2.get(), w3.get(), w1s.get(), w2s.get(),
                        w3s.get(), gate.get(), up.get(), activated.get(), down.get(), workspace.get(),
@@ -212,23 +217,29 @@ TEST(Dsv4MoeExpertSim, BackToBackLaunchesOnOneStreamDoNotLeakState) {
 // SwiGLU boundary
 // ---------------------------------------------------------------------------
 
-TEST(Dsv4MoeExpertSim, SaturatedGateMatchesReference) {
-  // Every gate element is driven far enough negative that exp(-gate)
-  // overflows. The kernel has no clamp, so this is the inf path the camodel
-  // reports as `check_fp_status instr input data inf`. The result is still
-  // correct -- 1/(1+inf) is exactly 0 -- and this test is what pins that
-  // behaviour down, so a future clamp cannot change it silently.
+TEST(Dsv4MoeExpertSim, SaturatedGateLandsOnTheClampNotOnZero) {
+  // Every gate element is driven far past the DeepSeek-V4 limit. Two things
+  // have to hold, and together they are the clamp's whole observable effect:
+  //
+  //   * the kernel matches the reference, which clamps to -10 and evaluates
+  //     silu(-10) * up -- a small non-zero, NOT zero;
+  //   * nothing in the path reaches inf. An unclamped kernel would return
+  //     exactly zero here, via 1/(1+inf), and the camodel would log
+  //     `check_fp_status instr input data inf` for every element.
   aclrtStream stream = AscendTestEnvironment::Instance().stream();
   const Problem p = MakeSaturatingProblem(kHidden, kInter, /*seed=*/5);
   const Outputs got = Launch(p, stream, "dsv4_moe_expert/saturated");
 
   ExpectMatchesReference(p, got);
 
-  // The activation saturates to zero, so the down projection of it is zero too.
   const auto want = ReferenceExpert(p.View(), p.hidden, p.inter);
-  EXPECT_TRUE(std::all_of(want.activated_f32.begin(), want.activated_f32.end(),
-                          [](float v) { return v == 0.0f; }))
+  ASSERT_FALSE(want.gate_f32.empty());
+  EXPECT_TRUE(std::all_of(want.gate_f32.begin(), want.gate_f32.end(),
+                          [](float v) { return v < -dsv4::kSwigluLimit; }))
       << "the saturating problem no longer saturates; re-tune MakeSaturatingProblem";
+  EXPECT_TRUE(std::all_of(want.activated_f32.begin(), want.activated_f32.end(),
+                          [](float v) { return std::isfinite(v) && v != 0.0f; }))
+      << "a clamped gate must give a finite non-zero activation";
 }
 
 }  // namespace

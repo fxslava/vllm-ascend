@@ -49,7 +49,7 @@ csrc/tests/
 |                           the sim and device spike binaries link, not the decode
 |-- reference/              turbo_quant_cpu.h and dsv4_moe_expert_cpu.h, the CPU oracles
 |-- data/golden_layer3/     Git LFS: weights, taps and output of one Qwen3.5 layer
-|-- turboquant/             ascendc_library() for EVERY Ascend C kernel in the suite,
+|-- ascendc/                ascendc_library() for EVERY Ascend C kernel in the suite,
 |                           TurboQuant and DSV4 alike: ascendc.cmake creates bare
 |                           unguarded targets and cannot be included twice
 |

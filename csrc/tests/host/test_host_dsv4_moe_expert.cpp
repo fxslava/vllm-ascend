@@ -30,6 +30,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -49,6 +50,7 @@ using vllm_ascend::test::dsv4::FloatToBf16Bits;
 using vllm_ascend::test::dsv4::GeometryIsAccepted;
 using vllm_ascend::test::dsv4::kFp4Block;
 using vllm_ascend::test::dsv4::kFp4PerByte;
+using vllm_ascend::test::dsv4::kSwigluLimit;
 using vllm_ascend::test::dsv4::ReferenceExpert;
 using vllm_ascend::test::dsv4::SwiGluElement;
 using vllm_ascend::test::dsv4::UnpackFp4;
@@ -150,51 +152,43 @@ TEST(Dsv4Codec, Bf16SpecialsTruncate) {
 // SwiGLU boundary behaviour
 // ---------------------------------------------------------------------------
 
-TEST(Dsv4SwiGlu, LargeNegativeGateProducesZeroThroughInf) {
-  // This is the path the camodel flags as `check_fp_status instr input data
-  // inf`: exp(-gate) overflows, and the result is correct only because
-  // 1/(1+inf) is exactly 0. The kernel currently relies on that.
-  const float gate = -100.0f;  // exp(100) overflows fp32 (threshold ~88.7)
-  EXPECT_TRUE(std::isinf(std::exp(-gate)));
-  const float activated = SwiGluElement(gate, 2.0f);
-  EXPECT_EQ(activated, 0.0f) << "silu saturates to zero on the negative tail";
-  EXPECT_FALSE(std::isnan(activated));
-}
-
-TEST(Dsv4SwiGlu, ClampIsNotBitNeutralAndThatIsTheCostOfAdoptingIt) {
-  // Measured, and it contradicts the intuition that a clamp is free: on the
-  // far negative tail the unclamped path returns exactly zero (sigmoid
-  // underflows to 0 through inf), while a clamp at 80 returns a tiny non-zero.
-  // Both are negligible in magnitude, but they are DIFFERENT bf16 values.
-  //
-  // The consequence is concrete: adopting the clamp requires re-baselining
-  // every golden that contains a saturated element. It is not a drop-in.
-  bool observed_difference = false;
-  for (float gate : {-100.0f, -120.0f, -1e6f}) {
-    for (float up : {1.0f, -3.5f, 0.25f}) {
-      const float unclamped = SwiGluElement(gate, up, 0.0f);
-      const float clamped = SwiGluElement(gate, up, 80.0f);
-
-      // The unclamped path goes through inf; the clamped one does not.
-      EXPECT_TRUE(std::isinf(std::exp(-gate))) << "gate=" << gate;
-      EXPECT_FALSE(std::isinf(std::exp(80.0f)));
-
-      EXPECT_EQ(unclamped, 0.0f) << "gate=" << gate << " up=" << up;
-      EXPECT_NEAR(clamped, 0.0f, 1e-30f) << "gate=" << gate << " up=" << up;
-      if (FloatToBf16Bits(unclamped) != FloatToBf16Bits(clamped)) {
-        observed_difference = true;
-      }
-    }
+TEST(Dsv4SwiGlu, ClampKeepsTheExponentialInRange) {
+  // With the DeepSeek-V4 limit the exponential never approaches overflow:
+  // exp(10) is ~2.2e4 against an fp32 ceiling at ~3.4e38. The `inf` path an
+  // unclamped implementation depends on -- 1/(1+inf) evaluating to exactly 0,
+  // which the camodel reports as `check_fp_status instr input data inf` --
+  // cannot arise.
+  EXPECT_FLOAT_EQ(kSwigluLimit, 10.0f) << "DeepSeek-V4 architectural constant";
+  for (float gate : {-1e6f, -100.0f, -10.0f, 10.0f, 100.0f, 1e6f}) {
+    const float activated = SwiGluElement(gate, 2.0f);
+    EXPECT_TRUE(std::isfinite(activated)) << "gate=" << gate;
+    EXPECT_FALSE(std::isinf(std::exp(-std::max(-kSwigluLimit, std::min(kSwigluLimit, gate)))));
   }
-  EXPECT_TRUE(observed_difference)
-      << "if this ever stops being true the clamp became bit-neutral and the "
-         "re-baselining caveat can be dropped";
 }
 
-TEST(Dsv4SwiGlu, LargePositiveGateApproachesGateTimesUp) {
-  const float gate = 100.0f;
+TEST(Dsv4SwiGlu, SaturatesToTheClampedValueNotToZero) {
+  // The clamp's whole observable effect. Unclamped, a far-negative gate gives
+  // exactly zero; clamped, it gives silu(-10) * up, which is small but NOT
+  // zero. Every golden containing a saturated element moves, which is why
+  // adopting the limit is a re-baseline rather than a drop-in.
+  const float up = 2.0f;
+  const float clamped = SwiGluElement(-1e6f, up);
+  const float unclamped = SwiGluElement(-1e6f, up, 0.0f);
+
+  EXPECT_EQ(unclamped, 0.0f) << "unclamped saturates through inf to exactly 0";
+  EXPECT_NE(clamped, 0.0f) << "clamped must not reach 0";
+  EXPECT_FLOAT_EQ(clamped, SwiGluElement(-kSwigluLimit, up))
+      << "a far-negative gate must land exactly on the clamped value";
+  EXPECT_NE(FloatToBf16Bits(clamped), FloatToBf16Bits(unclamped))
+      << "the two differ in bf16: that is the re-baseline cost";
+}
+
+TEST(Dsv4SwiGlu, LargePositiveGateApproachesClampTimesUp) {
+  // Clamped at +10, silu(10) = 10 * sigmoid(10) ~= 9.9995, so the product
+  // approaches 10*up rather than gate*up.
   const float up = 3.0f;
-  EXPECT_FLOAT_EQ(SwiGluElement(gate, up), gate * up);
+  EXPECT_FLOAT_EQ(SwiGluElement(1e6f, up), SwiGluElement(kSwigluLimit, up));
+  EXPECT_NEAR(SwiGluElement(1e6f, up), kSwigluLimit * up, 1e-2f);
 }
 
 TEST(Dsv4SwiGlu, ZeroesPropagate) {
@@ -291,7 +285,11 @@ std::vector<uint16_t> Fp64DownOut(const Problem& p) {
   const std::vector<double> up = project(x, p.w3, p.w3s, inter, hidden);
   std::vector<double> activated(static_cast<size_t>(inter));
   for (int64_t j = 0; j < inter; ++j) {
-    const double g = gate[static_cast<size_t>(j)];
+    // The DeepSeek-V4 clamp is part of the function, so the oracle applies it
+    // too -- otherwise the two implementations differ by construction rather
+    // than by rounding.
+    double g = gate[static_cast<size_t>(j)];
+    g = std::min(static_cast<double>(kSwigluLimit), std::max(-static_cast<double>(kSwigluLimit), g));
     const double sig = 1.0 / (1.0 + std::exp(-g));
     activated[static_cast<size_t>(j)] = (g * sig) * up[static_cast<size_t>(j)];
   }
@@ -348,27 +346,30 @@ TEST(Dsv4Reference, ActivatedIsSwiGluOfTheFp32GateAndUp) {
   }
 }
 
-TEST(Dsv4Reference, ActivatedCannotBeReconstructedFromTheBf16Outputs) {
-  // Measured: recomputing the activation from the ROUNDED gate/up diverges by
-  // tens of bf16 ULPs, because silu's relative sensitivity to its gate input
-  // grows like |gate| on the negative tail -- a 0.4% perturbation of gate
-  // (one bf16 step) moves exp(-gate) by a double-digit percentage.
+TEST(Dsv4Reference, ClampMakesTheOutputsMutuallyConsistent) {
+  // A measured side effect of the DeepSeek-V4 clamp, and a good one.
   //
-  // This is why a consumer of these three outputs must not cross-validate them
-  // against each other, and why the kernel writes `activated` rather than
-  // leaving the caller to derive it.
-  const Problem p = MakeProblem(128, 64, 3);
-  const auto out = ReferenceExpert(p.View(), p.hidden, p.inter);
-  int64_t worst = 0;
-  for (int64_t j = 0; j < p.inter; ++j) {
-    const size_t i = static_cast<size_t>(j);
-    const float g = Bf16BitsToFloat(out.gate_out[i]);
-    const float u = Bf16BitsToFloat(out.up_out[i]);
-    worst = std::max(worst, Bf16UlpDistance(out.activated[i], FloatToBf16Bits(SwiGluElement(g, u))));
+  // Unclamped, recomputing the activation from the ROUNDED gate/up diverged by
+  // tens of bf16 ULPs: silu's relative sensitivity to its gate grows like
+  // |gate| on the negative tail, so one bf16 step in gate (0.4%) moved
+  // exp(-gate) by a double-digit percentage. Bounding the gate to +/-10 bounds
+  // that sensitivity, and the three outputs become mutually consistent.
+  //
+  // Practically: a consumer can now cross-check activated against gate_out and
+  // up_out. Measured worst case 2 ULP; the bound below leaves headroom.
+  constexpr int64_t kReconstructionUlp = 4;
+  for (uint32_t seed = 0; seed < 4; ++seed) {
+    const Problem p = MakeProblem(128, 64, seed);
+    const auto out = ReferenceExpert(p.View(), p.hidden, p.inter);
+    int64_t worst = 0;
+    for (int64_t j = 0; j < p.inter; ++j) {
+      const size_t i = static_cast<size_t>(j);
+      const float g = Bf16BitsToFloat(out.gate_out[i]);
+      const float u = Bf16BitsToFloat(out.up_out[i]);
+      worst = std::max(worst, Bf16UlpDistance(out.activated[i], FloatToBf16Bits(SwiGluElement(g, u))));
+    }
+    EXPECT_LE(worst, kReconstructionUlp) << "seed " << seed << ": " << worst << " ULP";
   }
-  EXPECT_GT(worst, kMaxUlp)
-      << "reconstruction from rounded inputs agreed to " << worst
-      << " ULP; if this holds generally the caveat above can be relaxed";
 }
 
 // ---------------------------------------------------------------------------
