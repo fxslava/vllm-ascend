@@ -16,16 +16,15 @@ from contextlib import AbstractContextManager
 import pytest
 import torch
 
-from dsv4_moe_runtime.benchmarks.capacity_probe import (
+from ..benchmarks.capacity_probe import (
     CapacityProbeConfig,
     run_capacity_probe,
 )
-from dsv4_moe_runtime.draft_inference.backends import MockV5Backend
-from dsv4_moe_runtime.draft_inference.engine import DraftInferenceEngine
-
 from ..core.config import DeepSeekV4MoEConfig
 from ..core.layout import ExpertTensorLayout
 from ..core.slot_pool import StaticExpertSlotPool
+from ..draft_inference.backends import MockV5Backend
+from ..draft_inference.engine import DraftInferenceEngine
 from ..protocols.provider import WeightProviderProtocol
 
 NUM_DECODE_STEPS = 50
@@ -177,7 +176,7 @@ def test_probe_skips_ceiling_below_one_topk() -> None:
 
 @pytest.mark.parametrize("margin", [0.0, 1.0, -0.5])
 def test_probe_cli_rejects_invalid_margin(margin: float) -> None:
-    from dsv4_moe_runtime.benchmarks.capacity_probe import main
+    from ..benchmarks.capacity_probe import main
 
     with pytest.raises(SystemExit) as excinfo:
         main(["--device", "cpu", "--small-geometry", "--safety-margin", str(margin)])

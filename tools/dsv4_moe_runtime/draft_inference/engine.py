@@ -12,16 +12,16 @@ from dataclasses import dataclass
 
 import torch
 
-from dsv4_moe_runtime.core.config import DeepSeekV4MoEConfig
-from dsv4_moe_runtime.core.layout import ExpertTensorLayout
-from dsv4_moe_runtime.core.slot_pool import StaticExpertSlotPool
-from dsv4_moe_runtime.draft_inference.backends import DraftBackend
-from dsv4_moe_runtime.draft_inference.layer_runner import MoELayerRunner
-from dsv4_moe_runtime.draft_inference.scratchpad import DecodeScratchpad, ScratchpadShapes
-from dsv4_moe_runtime.hardware.dummy_kernel import DummyExpertKernelRunner, ExpertKernelRunner
-from dsv4_moe_runtime.protocols.provider import WeightProviderProtocol
-from dsv4_moe_runtime.routing.hash_router import HashRouteResolver
-from dsv4_moe_runtime.routing.score_router import ScoreRouteResolver
+from ..core.config import DeepSeekV4MoEConfig
+from ..core.layout import ExpertTensorLayout
+from ..core.slot_pool import StaticExpertSlotPool
+from ..draft_inference.backends import DraftBackend
+from ..draft_inference.layer_runner import MoELayerRunner
+from ..draft_inference.scratchpad import DecodeScratchpad, ScratchpadShapes
+from ..hardware.dummy_kernel import DummyExpertKernelRunner, ExpertKernelRunner
+from ..protocols.provider import WeightProviderProtocol
+from ..routing.hash_router import HashRouteResolver
+from ..routing.score_router import ScoreRouteResolver
 
 SCORE_TABLE_ROWS = 64
 

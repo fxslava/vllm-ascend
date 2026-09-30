@@ -16,14 +16,14 @@ Per-layer flow (single token, top-k routed experts):
 
 from __future__ import annotations
 
-from dsv4_moe_runtime.core.config import DeepSeekV4MoEConfig
-from dsv4_moe_runtime.core.layout import ExpertTensorLayout
-from dsv4_moe_runtime.core.slot_pool import StaticExpertSlotPool
-from dsv4_moe_runtime.draft_inference.scratchpad import DecodeScratchpad
-from dsv4_moe_runtime.hardware.dummy_kernel import ExpertKernelRunner
-from dsv4_moe_runtime.protocols.provider import WeightProviderProtocol
-from dsv4_moe_runtime.routing.hash_router import HashRouteResolver
-from dsv4_moe_runtime.routing.score_router import ScoreRouteResolver
+from ..core.config import DeepSeekV4MoEConfig
+from ..core.layout import ExpertTensorLayout
+from ..core.slot_pool import StaticExpertSlotPool
+from ..draft_inference.scratchpad import DecodeScratchpad
+from ..hardware.dummy_kernel import ExpertKernelRunner
+from ..protocols.provider import WeightProviderProtocol
+from ..routing.hash_router import HashRouteResolver
+from ..routing.score_router import ScoreRouteResolver
 
 
 class MoELayerRunner:

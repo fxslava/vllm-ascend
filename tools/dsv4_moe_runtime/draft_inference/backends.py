@@ -16,9 +16,9 @@ from typing import Protocol
 
 import torch
 
-from dsv4_moe_runtime.hardware.aclnn_binding import AclnnLibrary
-from dsv4_moe_runtime.hardware.runtime import DeviceRuntime
-from dsv4_moe_runtime.hardware.v5_ops import (
+from ..hardware.aclnn_binding import AclnnLibrary
+from ..hardware.runtime import DeviceRuntime
+from ..hardware.v5_ops import (
     FiaV5DecodeConfig,
     FusedInferAttentionScoreV5,
     WeightQuantBatchMatmulOp,

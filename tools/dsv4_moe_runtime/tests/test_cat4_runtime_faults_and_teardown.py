@@ -18,14 +18,14 @@ from contextlib import AbstractContextManager
 import pytest
 import torch
 
-from dsv4_moe_runtime.benchmarks.capacity_probe import DummyLoopbackWeightProvider
-from dsv4_moe_runtime.core.config import SANITY_GEOMETRY
-from dsv4_moe_runtime.core.layout import ExpertTensorLayout
-from dsv4_moe_runtime.core.slot_pool import StaticExpertSlotPool
-from dsv4_moe_runtime.draft_inference.backends import MockV5Backend
-from dsv4_moe_runtime.draft_inference.dry_run import DryRunConfig, parse_dry_run_config, run_draft_dry_run
-from dsv4_moe_runtime.draft_inference.engine import DraftInferenceEngine
-from dsv4_moe_runtime.hardware.dummy_kernel import (
+from ..benchmarks.capacity_probe import DummyLoopbackWeightProvider
+from ..core.config import SANITY_GEOMETRY
+from ..core.layout import ExpertTensorLayout
+from ..core.slot_pool import StaticExpertSlotPool
+from ..draft_inference.backends import MockV5Backend
+from ..draft_inference.dry_run import DryRunConfig, parse_dry_run_config, run_draft_dry_run
+from ..draft_inference.engine import DraftInferenceEngine
+from ..hardware.dummy_kernel import (
     DEFAULT_EXPERT_LATENCY_US,
     DIGEST_MASK,
     INPUT_CLAMP_MAGNITUDE,
@@ -33,9 +33,9 @@ from dsv4_moe_runtime.hardware.dummy_kernel import (
     MIN_REPRESENTATIVE_LATENCY_US,
     DummyExpertKernelRunner,
 )
-from dsv4_moe_runtime.hardware.lifecycle import RuntimeLifecycleManager
-from dsv4_moe_runtime.hardware.runtime import CpuRuntime
-from dsv4_moe_runtime.protocols.provider import WeightProviderProtocol
+from ..hardware.lifecycle import RuntimeLifecycleManager
+from ..hardware.runtime import CpuRuntime
+from ..protocols.provider import WeightProviderProtocol
 
 # --------------------------------------------------------------------- helpers
 

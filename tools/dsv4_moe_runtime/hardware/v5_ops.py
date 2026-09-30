@@ -25,7 +25,7 @@ from dataclasses import dataclass
 
 import torch
 
-from dsv4_moe_runtime.hardware.aclnn_binding import (
+from ..hardware.aclnn_binding import (
     AclIntArrayHandle,
     AclnnLibrary,
     AclTensorHandle,

@@ -19,15 +19,15 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from dsv4_moe_runtime.core.config import SANITY_GEOMETRY, DeepSeekV4MoEConfig
-from dsv4_moe_runtime.core.layout import ExpertTensorLayout
-from dsv4_moe_runtime.core.slot_pool import StaticExpertSlotPool
-from dsv4_moe_runtime.draft_inference.backends import AclnnV5Backend, MockV5Backend
-from dsv4_moe_runtime.draft_inference.engine import DraftInferenceEngine
-from dsv4_moe_runtime.hardware.dummy_kernel import DEFAULT_EXPERT_LATENCY_US
-from dsv4_moe_runtime.hardware.lifecycle import RuntimeLifecycleManager
-from dsv4_moe_runtime.hardware.runtime import make_runtime
-from dsv4_moe_runtime.protocols.provider import WeightProviderProtocol
+from ..core.config import SANITY_GEOMETRY, DeepSeekV4MoEConfig
+from ..core.layout import ExpertTensorLayout
+from ..core.slot_pool import StaticExpertSlotPool
+from ..draft_inference.backends import AclnnV5Backend, MockV5Backend
+from ..draft_inference.engine import DraftInferenceEngine
+from ..hardware.dummy_kernel import DEFAULT_EXPERT_LATENCY_US
+from ..hardware.lifecycle import RuntimeLifecycleManager
+from ..hardware.runtime import make_runtime
+from ..protocols.provider import WeightProviderProtocol
 
 DEFAULT_STEPS = 50
 DEFAULT_POOL_SLOTS = 32
@@ -183,7 +183,7 @@ def _pool_fingerprint(pool: StaticExpertSlotPool) -> list[int]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     config = parse_dry_run_config(argv)
-    from dsv4_moe_runtime.hardware.pinned_storage import AscendPinnedHostStorage
+    from ..hardware.pinned_storage import AscendPinnedHostStorage
 
     runtime = make_runtime(config.device)
     model_config: DeepSeekV4MoEConfig = SANITY_GEOMETRY if config.small_geometry else DeepSeekV4MoEConfig()

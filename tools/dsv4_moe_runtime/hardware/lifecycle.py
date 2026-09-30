@@ -33,7 +33,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
-from dsv4_moe_runtime.hardware.runtime import DeviceRuntime
+from ..hardware.runtime import DeviceRuntime
 
 TRAPPED_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 TeardownCallback = Callable[[], None]

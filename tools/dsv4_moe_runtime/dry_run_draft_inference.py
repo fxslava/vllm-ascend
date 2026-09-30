@@ -1,7 +1,13 @@
-"""Thin CLI entrypoint wrapping :mod:`dsv4_moe_runtime.draft_inference.dry_run`.
+"""Thin CLI entrypoint wrapping :mod:`tools.dsv4_moe_runtime.draft_inference.dry_run`.
 
-Runnable as a script from any working directory or via
-``python -m tools.dsv4_moe_runtime.dry_run_draft_inference``.
+Runnable both as a script (``python dry_run_draft_inference.py --device cpu``,
+from any working directory) and as a package module
+(``python -m tools.dsv4_moe_runtime.dry_run_draft_inference``).
+
+Import hygiene: script mode adjusts ``sys.path`` with the *repository root*
+only. ``tools/`` itself must never appear on ``sys.path`` -- it contains
+stdlib-shadowing directories (e.g. ``tools/bisect/``, which would break
+``random``'s ``from bisect import bisect``).
 """
 
 from __future__ import annotations
@@ -9,11 +15,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-if __package__ in (None, ""):  # direct script execution: make the package importable
-    # NOTE: append, never prepend -- tools/ contains stdlib-shadowing
-    # directories (e.g. tools/bisect/).
-    sys.path.append(str(Path(__file__).resolve().parents[1]))
-    from dsv4_moe_runtime.draft_inference.dry_run import main  # noqa: E402
+if __package__ in (None, ""):  # direct script execution: resolve via the repo root
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from tools.dsv4_moe_runtime.draft_inference.dry_run import main  # noqa: E402
 else:
     from .draft_inference.dry_run import main  # noqa: E402
 

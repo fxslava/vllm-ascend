@@ -34,7 +34,7 @@ from typing import Protocol
 
 import torch
 
-from dsv4_moe_runtime.core.layout import FP4_BLOCK_SIZE, FP4_ELEMS_PER_BYTE, ExpertTensorLayout
+from ..core.layout import FP4_BLOCK_SIZE, FP4_ELEMS_PER_BYTE, ExpertTensorLayout
 
 MIN_REPRESENTATIVE_LATENCY_US = 150.0
 MAX_REPRESENTATIVE_LATENCY_US = 250.0

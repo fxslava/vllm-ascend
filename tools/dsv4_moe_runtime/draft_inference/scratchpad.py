@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 import torch
 
-from dsv4_moe_runtime.core.config import DeepSeekV4MoEConfig
+from ..core.config import DeepSeekV4MoEConfig
 
 ACTIVATION_DTYPE = torch.bfloat16
 ACCUMULATOR_DTYPE = torch.float32
