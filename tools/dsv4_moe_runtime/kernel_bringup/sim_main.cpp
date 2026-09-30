@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -155,6 +156,13 @@ int main(int argc, char **argv)
     uint8_t *upGm = DeviceBuffer(interOutBytes);
     uint8_t *activatedGm = DeviceBuffer(interOutBytes);
     uint8_t *downGm = DeviceBuffer(hiddenOutBytes);
+    // Poison, so "the kernel wrote zero" and "the kernel never wrote" are
+    // distinguishable. 0xA5A5 is a normal negative bf16, so it also survives
+    // any finite-value check that a zero would pass.
+    for (auto &out : {std::make_pair(gateGm, interOutBytes), std::make_pair(upGm, interOutBytes),
+                      std::make_pair(activatedGm, interOutBytes), std::make_pair(downGm, hiddenOutBytes)}) {
+        std::memset(out.first, 0xA5, out.second);
+    }
     uint8_t *workspaceGm = DeviceBuffer(FP4_BLOCK); // tiling reports 0; keep a valid pointer
 
     TilingLayout tiling{};

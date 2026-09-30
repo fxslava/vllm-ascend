@@ -46,6 +46,13 @@ constexpr float SWIGLU_LIMIT = 10.0f;
 // AIV unified buffer in one load (196 KB classic UB, half reserved for
 // staging/queues -> 96 KiB for the packed matrix).
 constexpr int64_t MAX_PACKED_WEIGHT_BYTES = 96 * 1024;
+// The vector-chunk kernel dequantises ceil(rows/8)-row chunks (see
+// op_kernel/dsv4_moe_expert.cpp, MIN_CHUNK_ROWS): 8-row chunks are the floor
+// because every accumulator slice a chunk writes must start on a 32-byte
+// boundary. The working set is capped at 4096 fp32 products per chunk, so the
+// reduction dim is bounded by 4096 / 8. Column-chunked tiling is the
+// production follow-up that lifts this.
+constexpr int64_t MAX_REDUCTION_DIM = 512;
 
 int64_t DimOr(const gert::Shape *shape, size_t index, int64_t fallback = 1)
 {
@@ -104,6 +111,13 @@ ge::graphStatus Tiling4Dsv4MoeExpert(gert::TilingContext *context)
                 "dsv4_moe_expert: packed weight %ld KiB exceeds the single-load milestone budget %ld KiB; "
                 "chunked multi-core tiling is the production follow-up",
                 packedWeightBytes / 1024, MAX_PACKED_WEIGHT_BYTES / 1024);
+        return ge::GRAPH_FAILED;
+    }
+    if (hiddenSize > MAX_REDUCTION_DIM || interSize > MAX_REDUCTION_DIM) {
+        OPS_LOG_E(context,
+                "dsv4_moe_expert: reduction dims hidden=%ld inter=%ld exceed the vector-chunk milestone bound %ld; "
+                "column-chunked tiling is the production follow-up",
+                hiddenSize, interSize, MAX_REDUCTION_DIM);
         return ge::GRAPH_FAILED;
     }
 
