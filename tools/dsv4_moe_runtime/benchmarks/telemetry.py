@@ -8,10 +8,12 @@ and no hardware access lives here.
 from __future__ import annotations
 
 import math
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 from ..core.slot_pool import StaticExpertSlotPool
+from .stress_config import MAX_TRANSIT_WINDOW_BYTES
 
 GIB = 1024**3
 GB = 10**9
@@ -24,6 +26,16 @@ def human_bytes(num_bytes: float) -> str:
     if num_bytes >= 2**20:
         return f"{num_bytes / 2**20:.2f} MiB"
     return f"{num_bytes / 1024:.1f} KiB"
+
+
+def peak_host_rss_bytes() -> int | None:
+    """Peak host RSS of this process so far; None where unsupported."""
+    try:
+        import resource
+    except ImportError:  # pragma: no cover - Windows has no resource module
+        return None
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak if sys.platform == "darwin" else peak * 1024  # darwin reports bytes, Linux KiB
 
 
 def percentile(values: Sequence[float], pct: float) -> float:
@@ -52,12 +64,17 @@ class StepMetric:
 
 @dataclass
 class StressReport:
-    """Aggregate result of one offload stress run."""
+    """Aggregate result of one exclusive-staging offload stress run."""
 
     config: object  # BenchConfig (kept untyped here to avoid an import cycle)
     slot_num_bytes: int
-    experts_staged: int
-    host_staged_bytes: int
+    transit_slots: int
+    host_window_bytes: int
+    transit_peak_in_flight: int
+    window_source_fills: int
+    window_hits: int
+    evictions_staged: int
+    window_dropped: int
     pool_bytes: int
     steps: int
     top_k: int
@@ -69,6 +86,7 @@ class StressReport:
     fingerprints_stable: bool
     verification: tuple[bool, int] | None  # (ok, views checked) or None when skipped
     metrics: list[StepMetric]
+    host_peak_rss_bytes: int | None
     wall_time_s: float
 
     @property
@@ -83,9 +101,19 @@ class StressReport:
         hits = sum(self.top_k - metric.loads for metric in self.metrics)
         return hits / activations
 
+    @property
+    def window_cap_ok(self) -> bool:
+        """The exclusive staging guarantee: bounded pinned host DDR."""
+        return self.host_window_bytes <= MAX_TRANSIT_WINDOW_BYTES
+
     def invariants_ok(self) -> bool:
         verification_ok = self.verification is None or self.verification[0]
-        return bool(self.allocator_invariant_ok is not False) and self.fingerprints_stable and verification_ok
+        return (
+            bool(self.allocator_invariant_ok is not False)
+            and self.fingerprints_stable
+            and verification_ok
+            and self.window_cap_ok
+        )
 
 
 def base_fingerprints(pool: StaticExpertSlotPool) -> list[int]:
@@ -137,12 +165,17 @@ def render_report(report: StressReport) -> str:
     lines: list[str] = []
     separator = "=" * 78
     lines.append(separator)
-    lines.append("DeepSeek-V4 NPU offload stress report")
+    lines.append("DeepSeek-V4 NPU offload stress report (exclusive staging)")
     lines.append(separator)
     lines.append(
         f"device {config.device} | slots {config.pool_slots} x {human_bytes(report.slot_num_bytes)} "
-        f"= {human_bytes(report.pool_bytes)} HBM | staged {report.experts_staged} experts "
-        f"({human_bytes(report.host_staged_bytes)}, {'pinned' if config.device != 'cpu' else 'host'})"
+        f"= {human_bytes(report.pool_bytes)} HBM | exclusive transit window {report.transit_slots} slots "
+        f"= {human_bytes(report.host_window_bytes)} pinned host DDR"
+    )
+    lines.append(
+        f"window traffic: {report.window_source_fills} source fills, {report.window_hits} window hits | "
+        f"{report.evictions_staged} evictions staged, {report.window_dropped} dropped | "
+        f"peak occupancy {report.transit_peak_in_flight}/{report.transit_slots} slots"
     )
     lines.append(f"steps {report.steps} (top-{report.top_k}) | wall {report.wall_time_s:.2f}s")
 
@@ -191,6 +224,12 @@ def render_report(report: StressReport) -> str:
             f" -> {human_bytes(report.final_reserved)}"
         )
     lines.append(f"  fingerprints: {'OK (all data_ptr stable)' if report.fingerprints_stable else 'VIOLATED'}")
+    rss = "" if report.host_peak_rss_bytes is None else f" | peak process RSS {human_bytes(report.host_peak_rss_bytes)}"
+    lines.append(
+        f"  host staging: {human_bytes(report.host_window_bytes)} pinned window "
+        f"({'within' if report.window_cap_ok else 'OVER'} the "
+        f"{human_bytes(MAX_TRANSIT_WINDOW_BYTES)} cap){rss}"
+    )
     if report.verification is None:
         lines.append("  verification: skipped (--verify-samples 0)")
     else:
@@ -210,17 +249,25 @@ def report_to_dict(report: StressReport) -> dict[str, object]:
             "device": config.device,
             "steps": report.steps,
             "pool_slots": config.pool_slots,
+            "transit_slots": report.transit_slots,
             "hot_experts": config.hot_experts,
             "hot_ratio": config.hot_ratio,
             "zipf_exponent": config.zipf_exponent,
             "seed": config.seed,
             "small_geometry": config.small_geometry,
-            "pinned_layers": config.pinned_layers,
-            "pinned_experts_per_layer": config.pinned_experts_per_layer,
         },
         "slot_num_bytes": report.slot_num_bytes,
-        "experts_staged": report.experts_staged,
-        "host_staged_bytes": report.host_staged_bytes,
+        "exclusive_staging": {
+            "transit_slots": report.transit_slots,
+            "host_window_bytes": report.host_window_bytes,
+            "window_cap_ok": report.window_cap_ok,
+            "window_source_fills": report.window_source_fills,
+            "window_hits": report.window_hits,
+            "evictions_staged": report.evictions_staged,
+            "window_dropped": report.window_dropped,
+            "transit_peak_in_flight": report.transit_peak_in_flight,
+            "host_peak_rss_bytes": report.host_peak_rss_bytes,
+        },
         "pool_bytes": report.pool_bytes,
         "hit_rate_overall": report.hit_rate_overall,
         "warmup_curve": [{"steps": label, "hit_rate": rate} for label, rate in warmup_curve(report, config.buckets)],

@@ -49,3 +49,28 @@ class SlotFillProviderProtocol(Protocol):
     def ensure_staged(self, layer_idx: int, expert_id: int) -> None: ...
 
     def fill_slot_params(self, layer_idx: int, expert_id: int, views: Mapping[str, torch.Tensor]) -> int: ...
+
+
+@runtime_checkable
+class WeightByteSource(Protocol):
+    """Authoritative expert byte source for exclusive staging windows.
+
+    A bounded transit window streams experts through on demand: on a window
+    miss it reserves a pinned slot and asks the source to materialize the
+    expert's bytes into it (``fill_slot``), and post-run byte verification
+    re-materializes single parameters (``read_param``). The source is
+    authoritative by definition -- window entries are droppable caches of it,
+    never the only copy -- which is what makes bounded ring eviction safe.
+    """
+
+    def contains(self, layer_idx: int, expert_id: int) -> bool:
+        """Whether the source can serve this expert (cheap, mutation-free)."""
+        ...
+
+    def fill_slot(self, destination: torch.Tensor, layer_idx: int, expert_id: int) -> None:
+        """Write the full ``slot_num_bytes`` expert slot into the pinned region."""
+        ...
+
+    def read_param(self, layer_idx: int, expert_id: int, param_key: str) -> torch.Tensor:
+        """Materialize one parameter's expected bytes (verification path)."""
+        ...

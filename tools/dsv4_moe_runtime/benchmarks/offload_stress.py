@@ -1,8 +1,11 @@
 """Offload stress harness: config, synthetic-run orchestration and CLI main.
 
-Orchestrates one end-to-end measurement over the memory subsystem only:
-acquire -> streamed DMA fill -> stream sync -> release, with a per-step
-hardware zero-allocation check. No GEMMs, no attention, no LLM forward.
+Orchestrates one end-to-end measurement of the *exclusive staging* memory
+subsystem: acquire -> transit-window stage (streamed on a window miss) ->
+DMA fill -> stream sync -> release, with a per-step hardware zero-allocation
+check. No GEMMs, no attention, no LLM forward -- and no monolithic host copy:
+the only pinned host allocation is the bounded transit window, regardless of
+how many layers or steps are simulated.
 """
 
 from __future__ import annotations
@@ -15,19 +18,24 @@ from dataclasses import dataclass
 
 import torch
 
-from ..benchmarks.stress_config import BenchConfig, parse_config, print_plan  # re-exported
-from ..benchmarks.telemetry import (
+from ..benchmarks.telemetry import (  # re-exported
     StepMetric,
     StressReport,
     base_fingerprints,
     full_fingerprints,
+    human_bytes,
+    peak_host_rss_bytes,
     render_report,
     report_to_dict,
 )
 from ..benchmarks.trace_simulator import RouterTraceSimulator, TraceStep
 from ..core.slot_pool import UNRESIDENT_SLOT_ID, StaticExpertSlotPool
-from ..hardware.pinned_storage import AscendPinnedHostStorage
+from ..hardware.exchange_buffer import TransitExchangeBuffer
+from ..hardware.exclusive_staging import ExclusiveStagingProvider
 from ..hardware.runtime import DeviceRuntime, make_runtime
+from ..protocols.provider import WeightByteSource
+from .stress_config import BenchConfig, parse_config, print_plan  # re-exported
+from .synthetic_source import SyntheticExpertSource
 
 
 class OffloadStressHarness:
@@ -44,14 +52,16 @@ class OffloadStressHarness:
         traced_layers, addressable_experts, hash_layers = config.trace_plan()
 
         runtime = make_runtime(config.device)
-        storage = AscendPinnedHostStorage(
-            runtime,
-            layout,
-            layer_ids=range(traced_layers),
-            experts_per_layer=config.pinned_experts_per_layer,
-            pin=config.pin_host_memory,
+        exchange_buffer = TransitExchangeBuffer(
+            runtime, layout, host_slots=config.transit_slots, pin=config.pin_host_memory, overflow="drop_oldest"
         )
-        pool = StaticExpertSlotPool(model_config, config.pool_slots, layout=layout, device=runtime.device)
+        source = SyntheticExpertSource(
+            layout, num_layers=traced_layers, num_experts=addressable_experts, seed=config.seed
+        )
+        provider = ExclusiveStagingProvider(runtime, layout, exchange_buffer, source)
+        pool = StaticExpertSlotPool(
+            model_config, config.pool_slots, layout=layout, device=runtime.device, exchange_buffer=exchange_buffer
+        )
         simulator = RouterTraceSimulator(
             model_config,
             num_experts_available=addressable_experts,
@@ -64,24 +74,29 @@ class OffloadStressHarness:
         )
         trace = simulator.generate_trace(config.steps)
         print(
-            f"run: staged {storage.staged_expert_count} experts "
-            f"({storage.staged_bytes() / 2**30:.2f} GiB, {'pinned' if storage.pinned else 'pageable'}), "
-            f"pool {pool.num_slots} slots, trace {len(trace)} steps generated",
+            f"run: exclusive staging -- transit window {config.transit_slots} slots "
+            f"({human_bytes(exchange_buffer.capacity_bytes)} pinned cap), pool {pool.num_slots} slots, "
+            f"trace {len(trace)} steps over {traced_layers}x{addressable_experts} streamable experts",
             flush=True,
         )
 
         runtime.synchronize_device()
-        loop = _execute_trace_loop(pool, storage, runtime, trace, config.steps, traced_layers)
+        loop = _execute_trace_loop(pool, provider, exchange_buffer, runtime, trace, config.steps, traced_layers)
 
         verification = None
         if config.verify_samples:
-            verification = _verify_sampled_slots(pool, storage, trace, config.verify_samples, config.seed)
+            verification = _verify_sampled_slots(pool, source, trace, config.verify_samples, config.seed)
 
         return StressReport(
             config=config,
             slot_num_bytes=layout.slot_num_bytes,
-            experts_staged=storage.staged_expert_count,
-            host_staged_bytes=storage.staged_bytes(),
+            transit_slots=exchange_buffer.capacity,
+            host_window_bytes=exchange_buffer.capacity_bytes,
+            transit_peak_in_flight=loop.peak_in_flight,
+            window_source_fills=provider.window_source_fills,
+            window_hits=provider.window_hits,
+            evictions_staged=exchange_buffer.staged_evictions,
+            window_dropped=exchange_buffer.dropped_entries,
             pool_bytes=config.pool_slots * layout.slot_num_bytes,
             steps=config.steps,
             top_k=model_config.top_k,
@@ -93,6 +108,7 @@ class OffloadStressHarness:
             fingerprints_stable=loop.fingerprints_stable,
             verification=verification,
             metrics=loop.metrics,
+            host_peak_rss_bytes=peak_host_rss_bytes(),
             wall_time_s=time.perf_counter() - started,
         )
 
@@ -104,6 +120,7 @@ class _TraceRunResult:
     metrics: list[StepMetric]
     allocation_violation_steps: list[int]
     fingerprints_stable: bool
+    peak_in_flight: int
     baseline_allocated: int | None
     baseline_reserved: int | None
     final_allocated: int | None
@@ -112,44 +129,51 @@ class _TraceRunResult:
 
 def _execute_trace_loop(
     pool: StaticExpertSlotPool,
-    storage: AscendPinnedHostStorage,
+    provider: ExclusiveStagingProvider,
+    exchange_buffer: TransitExchangeBuffer,
     runtime: DeviceRuntime,
     trace: Sequence[TraceStep],
     total_steps: int,
     layers_per_token: int,
 ) -> _TraceRunResult:
-    """Measured section: acquire -> DMA sync -> release, with invariant checks.
+    """Measured section: acquire -> window stage -> DMA sync -> release.
 
     Zero-allocation is enforced per step via the runtime allocator (when the
-    hardware provides accounting) and via data_ptr fingerprint sweeps (light
-    sweep per step, full view sweep every ``total_steps // 20`` steps).
+    hardware provides accounting) and via data_ptr fingerprint sweeps over the
+    pool AND the transit window (light sweep per step, full view sweep every
+    ``total_steps // 20`` steps).
     """
     allocator = runtime.has_allocator_accounting
     baseline_allocated = runtime.memory_allocated() if allocator else None
     baseline_reserved = runtime.memory_reserved() if allocator else None
-    base_fingerprint = base_fingerprints(pool)
-    full_fingerprint = full_fingerprints(pool)
+    window_arena_ptr = exchange_buffer.fingerprint()[0]
+    base_fingerprint = base_fingerprints(pool) + [window_arena_ptr]
+    full_fingerprint = full_fingerprints(pool) + exchange_buffer.fingerprint()
     sweep_interval = max(1, total_steps // 20)
 
     metrics: list[StepMetric] = []
     violations: list[int] = []
     fingerprints_stable = True
+    peak_in_flight = 0
     for step_index, trace_step in enumerate(trace):
         if step_index and step_index % layers_per_token == 0:
             pool.advance_generation(step_index // layers_per_token - 1)  # token boundary
         loads_before = pool.stats.loads
         bytes_before = pool.stats.bytes_staged
         started_step = time.perf_counter()
-        reservation = pool.acquire_for_step(trace_step.layer_idx, trace_step.expert_ids, storage)
-        storage.synchronize()
+        reservation = pool.acquire_for_step(trace_step.layer_idx, trace_step.expert_ids, provider)
+        provider.synchronize()
         elapsed = time.perf_counter() - started_step
         pool.release_step(reservation)
+        peak_in_flight = max(peak_in_flight, exchange_buffer.in_flight)
 
         if allocator and runtime.memory_allocated() != baseline_allocated:
             violations.append(step_index)
-        if base_fingerprints(pool) != base_fingerprint:
+        if base_fingerprints(pool) + [window_arena_ptr] != base_fingerprint:
             fingerprints_stable = False
-        if (step_index + 1) % sweep_interval == 0 and full_fingerprints(pool) != full_fingerprint:
+        if (step_index + 1) % sweep_interval == 0 and (
+            full_fingerprints(pool) + exchange_buffer.fingerprint() != full_fingerprint
+        ):
             fingerprints_stable = False
         metrics.append(
             StepMetric(
@@ -162,12 +186,13 @@ def _execute_trace_loop(
             )
         )
 
-    if full_fingerprints(pool) != full_fingerprint:
+    if full_fingerprints(pool) + exchange_buffer.fingerprint() != full_fingerprint:
         fingerprints_stable = False
     return _TraceRunResult(
         metrics=metrics,
         allocation_violation_steps=violations,
         fingerprints_stable=fingerprints_stable,
+        peak_in_flight=peak_in_flight,
         baseline_allocated=baseline_allocated,
         baseline_reserved=baseline_reserved,
         final_allocated=runtime.memory_allocated() if allocator else None,
@@ -177,13 +202,17 @@ def _execute_trace_loop(
 
 def _verify_sampled_slots(
     pool: StaticExpertSlotPool,
-    storage: AscendPinnedHostStorage,
+    source: WeightByteSource,
     trace: Sequence[TraceStep],
     samples: int,
     seed: int,
 ) -> tuple[bool, int]:
-    """Post-loop byte verification (allocates transient device copies on purpose:
-    runs strictly after the zero-allocation window has been closed)."""
+    """Post-loop byte verification against the authoritative byte source.
+
+    Exclusive staging keeps no host copy, so expected bytes are re-materialized
+    from the source (allocates transient copies on purpose: runs strictly after
+    the zero-allocation window has been closed).
+    """
     rng = random.Random(seed ^ 0xBEEF)
     ok = True
     checked = 0
@@ -193,8 +222,8 @@ def _verify_sampled_slots(
             if slot == UNRESIDENT_SLOT_ID:
                 continue  # valid: a cold long-tail expert may already be evicted
             for param_key, view in pool.param_views(slot).items():
-                source = storage.pinned_cpu_weight(trace_step.layer_idx, expert_id, param_key)
-                same_device_source = source if source.device == view.device else source.to(view.device)
+                expected = source.read_param(trace_step.layer_idx, expert_id, param_key)
+                same_device_source = expected if expected.device == view.device else expected.to(view.device)
                 if not torch.equal(view, same_device_source):
                     ok = False
                     print(

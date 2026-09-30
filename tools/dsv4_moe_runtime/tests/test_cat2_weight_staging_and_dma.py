@@ -86,8 +86,9 @@ def test_dummy_loopback_provider_fills_pattern(sanity_layout: ExpertTensorLayout
     [
         ["--steps", "0"],
         ["--pool-slots", "4"],
-        ["--pinned-layers", "50"],
-        ["--pinned-experts-per-layer", "0"],
+        ["--transit-slots", "0"],
+        ["--transit-slots", "8"],
+        ["--transit-slots", "100000"],
         ["--hot-ratio", "1.5"],
         ["--zipf-exponent", "-1"],
         ["--hot-experts", "256"],
@@ -104,12 +105,12 @@ def test_argument_parsing_presets_and_overrides() -> None:
     npu_config = parse_config([])
     assert npu_config.device == "npu:0"
     assert npu_config.steps == 2000 and npu_config.pool_slots == 3200
-    assert npu_config.small_geometry is False and npu_config.pinned_layers == 43
+    assert npu_config.small_geometry is False and npu_config.transit_slots == 2048
 
     dry_config = parse_config(["--dry-run"])
     assert dry_config.device == "cpu"
     assert dry_config.steps == 50 and dry_config.pool_slots == 16
-    assert dry_config.small_geometry is True and dry_config.pinned_layers == 2
+    assert dry_config.small_geometry is True and dry_config.transit_slots == 64
     assert dry_config.verify_samples == 8
 
     overridden = parse_config(["--dry-run", "--steps", "10", "--seed", "3"])

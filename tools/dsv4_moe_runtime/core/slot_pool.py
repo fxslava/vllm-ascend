@@ -301,10 +301,11 @@ class StaticExpertSlotPool:
         host_pinned_storage: WeightProviderProtocol,
     ) -> None:
         # 1. Transit staging: evicted slot bytes go to the pinned-DDR ring
-        #    before the incoming expert overwrites the slot.
+        #    before the incoming expert overwrites the slot. The victim key is
+        #    recorded so a re-request can hit the window instead of the source.
         if self._exchange_buffer is not None:
-            for _key, victim_slot in decision.evictions:
-                self._exchange_buffer.stage_eviction(self.slot_region(victim_slot))
+            for victim_key, victim_slot in decision.evictions:
+                self._exchange_buffer.stage_eviction(self.slot_region(victim_slot), key=victim_key)
 
         # 2. Physical residency bookkeeping (residents, free list, device table).
         for key, victim_slot in decision.evictions:

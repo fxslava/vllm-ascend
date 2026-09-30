@@ -11,6 +11,7 @@ from .benchmarks.offload_stress import (
     OffloadStressHarness,
     parse_config,
 )
+from .benchmarks.synthetic_source import SyntheticExpertSource
 from .benchmarks.trace_simulator import RouterTraceSimulator, TraceStep
 from .core.config import (
     EXPERT_PARAM_NAMES,
@@ -41,10 +42,11 @@ from .hardware.dummy_kernel import (
     ExpertKernelRunner,
 )
 from .hardware.exchange_buffer import TransitExchangeBuffer
+from .hardware.exclusive_staging import ExclusiveStagingProvider
 from .hardware.lifecycle import RuntimeLifecycleManager, TeardownReport, TeardownStep
 from .hardware.pinned_storage import AscendPinnedHostStorage
 from .hardware.runtime import CpuRuntime, DeviceRuntime, NpuRuntime, make_runtime
-from .protocols.provider import SlotFillProviderProtocol, WeightProviderProtocol
+from .protocols.provider import SlotFillProviderProtocol, WeightByteSource, WeightProviderProtocol
 from .protocols.residency_policy import AdmissionDecision, EvictionPolicyProtocol
 from .protocols.router import RouteResolverProtocol
 from .routing.hash_router import HashRouteResolver
@@ -70,6 +72,7 @@ __all__ = [
     "ExpertKernelRunner",
     "ExpertTensorLayout",
     "ExpertTensorSpec",
+    "ExclusiveStagingProvider",
     "GenerationalRadixPolicy",
     "HashRouteResolver",
     "LegacyLruPolicy",
@@ -84,11 +87,13 @@ __all__ = [
     "SlotPoolStats",
     "StaticExpertSlotPool",
     "StepReservation",
+    "SyntheticExpertSource",
     "TransitExchangeBuffer",
     "TeardownReport",
     "TeardownStep",
     "TraceStep",
     "UNRESIDENT_SLOT_ID",
+    "WeightByteSource",
     "WeightProviderProtocol",
     "make_runtime",
     "parse_config",
