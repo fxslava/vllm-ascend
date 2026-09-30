@@ -47,13 +47,16 @@ csrc/tests/
 |-- common/                 shared infrastructure (see the table below), including
 |                           hadamard_spike_kernels.cpp -- test-owned Ascend C both
 |                           the sim and device spike binaries link, not the decode
-|-- reference/              turbo_quant_cpu.h, the CPU oracle
+|-- reference/              turbo_quant_cpu.h and dsv4_moe_expert_cpu.h, the CPU oracles
 |-- data/golden_layer3/     Git LFS: weights, taps and output of one Qwen3.5 layer
-|-- turboquant/             ascendc_library() for the Ascend C kernels
+|-- turboquant/             ascendc_library() for EVERY Ascend C kernel in the suite,
+|                           TurboQuant and DSV4 alike: ascendc.cmake creates bare
+|                           unguarded targets and cannot be included twice
 |
 |-- host/                   TIER 1 -- no CANN at all, no NPU, runs anywhere
 |   |-- test_host_turboquant_fidelity.cpp
-|   `-- test_host_turboquant_tiling.cpp           the adapter's block and buffer plans
+|   |-- test_host_turboquant_tiling.cpp           the adapter's block and buffer plans
+|   `-- test_host_dsv4_moe_expert.cpp             FP4/E8M0/bf16 codecs, the expert vs an fp64 oracle, SwiGLU boundaries, tiling rules
 |
 |-- sim/                    TIER 2 -- CAModel only; links libruntime_camodel.so
 |   |-- test_sim_950pr_turboquant_rotate_q.cpp    the standalone query rotation, both paths
@@ -61,7 +64,8 @@ csrc/tests/
 |   |-- test_sim_950pr_turboquant_decode.cpp
 |   |-- test_sim_950pr_turboquant_fused.cpp       the fused Cube decode, seven cases (D 256 and 128, raw query), vs goldens and the kernel writer
 |   |-- test_sim_950pr_turboquant_multimode.cpp   the fused Cube decode, all three modes
-|   `-- test_sim_950pr_cube_hadamard.cpp          spike: one shape of the sweep below
+|   |-- test_sim_950pr_cube_hadamard.cpp          spike: one shape of the sweep below
+|   `-- test_sim_950pr_dsv4_moe_expert.cpp        the DSV4 expert: numerics, and the repeat-launch cases that are the only check on its hand-written pipe sync
 |
 |-- device/                 TIER 3 -- physical 950PR silicon; every timing
 |   |-- test_device_950pr_turboquant.cpp          production shapes, camodel refused

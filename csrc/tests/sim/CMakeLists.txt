@@ -97,3 +97,40 @@ foreach(test_name ${VLLM_ASCEND_SIM_TESTS})
 endforeach()
 
 message(STATUS "vllm-ascend tests: [simulator] ${VLLM_ASCEND_SIM_TESTS}")
+
+# -----------------------------------------------------------------------------
+# The DSV4 MoE expert
+# -----------------------------------------------------------------------------
+#
+# Separate from the loop above because it links a different kernel library.
+#
+# This is the only tier that says anything about the kernel's synchronisation.
+# It compiles with --cce-auto-sync=off and stages everything in TBuf rather
+# than TQue, so every cross-pipe dependency is hand-written; a serial execution
+# cannot expose a missing one. Measured: the kernel with every SetFlag/WaitFlag
+# deleted passes the CPU interpreter byte-identically.
+#
+# The timeout is the suite's camodel budget rather than the correctness
+# default: the kernel is a scalar reduction, so a launch costs what its MAC
+# count costs, and the repeat cases launch several times over.
+if(VLLM_ASCEND_TESTS_HAVE_DSV4)
+  vllm_ascend_add_device_executable(test_sim_950pr_dsv4_moe_expert
+    "test_sim_950pr_dsv4_moe_expert.cpp" ../common/main_950pr.cpp)
+  target_link_libraries(test_sim_950pr_dsv4_moe_expert PRIVATE vllm_ascend_test_dsv4)
+  target_compile_definitions(test_sim_950pr_dsv4_moe_expert
+    PRIVATE VLLM_ASCEND_TEST_TIER="simulator")
+
+  set_target_properties(test_sim_950pr_dsv4_moe_expert PROPERTIES
+    INSTALL_RPATH
+      "$ORIGIN;${CMAKE_BINARY_DIR}/lib;${VLLM_ASCEND_SIMULATOR_LIB_DIR};${ASCEND_LIB_DIRS}")
+
+  vllm_ascend_register_correctness_test(test_sim_950pr_dsv4_moe_expert 5400 TRUE)
+
+  if(TEST test_sim_950pr_dsv4_moe_expert)
+    set_tests_properties(test_sim_950pr_dsv4_moe_expert PROPERTIES
+      ENVIRONMENT
+        "LD_LIBRARY_PATH=${VLLM_ASCEND_SIMULATOR_LIB_DIR}:${VLLM_ASCEND_TEST_LIBRARY_PATH};ASCEND_HOME_PATH=${ASCEND_HOME_PATH}")
+  endif()
+
+  message(STATUS "vllm-ascend tests: [simulator] test_sim_950pr_dsv4_moe_expert")
+endif()

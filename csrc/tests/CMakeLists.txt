@@ -136,6 +136,19 @@ option(VLLM_ASCEND_TESTS_HOST_ONLY "Build only the targets that need no CANN too
 option(VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS
        "Compile the TurboQuant Ascend C kernels and build the tests that drive them" ON)
 
+# The DSV4 MoE expert kernel (csrc/moe/dsv4_moe_expert), compiled from the
+# shipping source and driven by the simulator tier.
+#
+# It is declared inside turboquant/CMakeLists.txt rather than a directory of
+# its own, because ascendc.cmake creates several bare unguarded targets
+# (host_intf_pub, device_intf_pub, ...) and so cannot be included twice in one
+# project. That is also why this option currently implies
+# VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS: the scope that includes
+# ascendc.cmake is reached only when that one is ON. See the note in
+# turboquant/CMakeLists.txt.
+option(VLLM_ASCEND_TESTS_BUILD_DSV4_KERNELS
+       "Compile the DSV4 MoE expert Ascend C kernel and build the tests that drive it" ON)
+
 # The Cube-native multi-mode decode (op_kernel/turboquant_fused_decode.cpp) is work in
 # progress and does not pass: the score GEMM's [n, k] B form does not reproduce
 # the host product, and TurboQuantCubeMm::Init allocates L0 on both halves of
@@ -679,6 +692,7 @@ if(VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE)
   # they would need two different builds of this one target.
 
   set(VLLM_ASCEND_TESTS_HAVE_TURBOQUANT FALSE)
+  set(VLLM_ASCEND_TESTS_HAVE_DSV4 FALSE)
 
   if(VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS)
     # One library for every kernel source: a <<<>>> call site can only reach a
@@ -738,6 +752,22 @@ if(VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE)
       PUBLIC vllm_ascend_test_common_950pr vllm_ascend_turboquant)
 
     set(VLLM_ASCEND_TESTS_HAVE_TURBOQUANT TRUE)
+
+    # The DSV4 MoE expert's host-side support: the problem generator and the
+    # launcher declaration. The kernel library itself
+    # (vllm_ascend_dsv4_moe_expert) is declared in turboquant/CMakeLists.txt --
+    # see the option's comment for why it cannot have its own subdirectory.
+    # Header-only apart from the kernel library, so this is an INTERFACE target.
+    if(VLLM_ASCEND_TESTS_BUILD_DSV4_KERNELS)
+      add_library(vllm_ascend_test_dsv4 INTERFACE)
+      target_include_directories(vllm_ascend_test_dsv4
+        INTERFACE
+          "${CMAKE_CURRENT_SOURCE_DIR}/common"
+          "${CMAKE_CURRENT_SOURCE_DIR}/reference")
+      target_link_libraries(vllm_ascend_test_dsv4
+        INTERFACE vllm_ascend_test_common_950pr vllm_ascend_dsv4_moe_expert)
+      set(VLLM_ASCEND_TESTS_HAVE_DSV4 TRUE)
+    endif()
   else()
     message(STATUS
       "vllm-ascend tests: VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS=OFF; no Ascend C kernels, "

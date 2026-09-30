@@ -93,3 +93,30 @@ ascendc_library(vllm_ascend_turboquant SHARED
 ascendc_compile_definitions(vllm_ascend_turboquant PRIVATE VLLM_ASCEND_TQ_TEST_KERNELS)
 ascendc_compile_options(vllm_ascend_turboquant PRIVATE
   -forward-options-to-host-compiler -DVLLM_ASCEND_TQ_TEST_KERNELS)
+
+# ---------------------------------------------------------------------------
+# The DSV4 MoE expert kernel
+# ---------------------------------------------------------------------------
+#
+# It lives in a directory named after TurboQuant, which needs explaining:
+# ascendc.cmake CANNOT be included twice in one project. Its
+# legacy_modules/host_intf.cmake creates `host_intf_pub`, and
+# bisheng_intf.cmake creates `device_intf_pub`, `c310_aiv_intf_pub` and the
+# rest, all with bare unguarded add_library() calls. A second subdirectory that
+# included ascendc.cmake would fail at configure time with "another target with
+# the same name already exists". So every ascendc_library() in this suite has
+# to be declared in this one scope, whatever it builds.
+#
+# ascendc_library() itself is safe to call more than once: every target it
+# creates is derived from the target name it is given.
+#
+# One source, not two. common/dsv4_moe_expert_kernels.cpp includes the shipping
+# kernel verbatim and defines the <<<>>> launcher beside it; listing the kernel
+# separately as well would make the launcher generator emit two stubs for one
+# kernel name and the merge link would fail on an undefined
+# `dsv4_moe_expert_origin`. The header comment in that file has the detail.
+if(VLLM_ASCEND_TESTS_BUILD_DSV4_KERNELS)
+  ascendc_library(vllm_ascend_dsv4_moe_expert SHARED
+    "${CMAKE_CURRENT_SOURCE_DIR}/../common/dsv4_moe_expert_kernels.cpp")
+  message(STATUS "vllm-ascend tests: DSV4 MoE expert kernel RUN_MODE=${RUN_MODE}, SOC_VERSION=${SOC_VERSION}")
+endif()

@@ -64,4 +64,22 @@ set_tests_properties(test_host_turboquant_tiling PROPERTIES
 
 vllm_ascend_record_binary(test_host_turboquant_tiling)
 
-message(STATUS "vllm-ascend tests: [host] test_host_turboquant_fidelity test_host_turboquant_tiling")
+# The DSV4 routed expert's arithmetic: the FP4/E8M0/bf16 codecs exhaustively,
+# the reference expert against an independent fp64 oracle, the SwiGLU boundary
+# cases (including the inf path the camodel flags), and the geometry rules the
+# host tiling function enforces. Header-only reference, so nothing but the
+# suite's own host library is needed.
+add_executable(test_host_dsv4_moe_expert test_host_dsv4_moe_expert.cpp)
+
+target_link_libraries(test_host_dsv4_moe_expert
+  PRIVATE vllm_ascend_test_host ${VLLM_ASCEND_TEST_GTEST_MAIN_TARGET})
+
+add_test(NAME test_host_dsv4_moe_expert COMMAND test_host_dsv4_moe_expert)
+set_tests_properties(test_host_dsv4_moe_expert PROPERTIES
+  LABELS "correctness;${VLLM_ASCEND_TEST_TIER_LABEL}"
+  TIMEOUT 300)
+
+vllm_ascend_record_binary(test_host_dsv4_moe_expert)
+
+message(STATUS "vllm-ascend tests: [host] test_host_turboquant_fidelity test_host_turboquant_tiling "
+               "test_host_dsv4_moe_expert")

@@ -1,0 +1,236 @@
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// TIER 2 (simulator) - the DSV4 routed expert kernel on the CANN camodel.
+//
+// This tier exists for one reason the host tier cannot serve: the camodel
+// models the pipes. The kernel compiles with --cce-auto-sync=off and stages
+// everything in TBuf rather than TQue, so every cross-pipe dependency in it is
+// hand-written, and a missing flag is invisible to any serial execution. A CPU
+// interpreter run of this kernel with every SetFlag/WaitFlag deleted passes
+// byte-identically; that is measured, not supposed.
+//
+// Geometry note: the camodel is a cycle-level model and this kernel is a
+// scalar reduction, so cost scales with the MAC count and nothing hides it.
+// hidden=64 inter=64 is 12,288 MACs and completes; hidden=256 inter=128 is
+// 98,304 and has been measured at over 19 minutes without finishing. Keep the
+// default small and treat anything larger as opt-in.
+
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+#include "acl_check.hpp"
+#include "camodel_guard.hpp"
+#include "device_buffer.hpp"
+#include "dsv4_moe_expert_launch.hpp"
+#include "test_harness.hpp"
+
+namespace vllm_ascend {
+namespace test {
+namespace {
+
+using dsv4::Bf16UlpDistance;
+using dsv4::MakeProblem;
+using dsv4::MakeSaturatingProblem;
+using dsv4::Problem;
+using dsv4::ReferenceExpert;
+using dsv4::TilingBuffer;
+
+// The Gate B criterion, in bf16 ULPs.
+constexpr int64_t kMaxUlp = 2;
+
+// A single camodel launch of this kernel is minutes. The watchdog turns a hang
+// into a named failure instead of a ctest timeout with no attribution.
+constexpr int64_t kLaunchBudgetSeconds = 1200;
+
+constexpr int64_t kHidden = 64;
+constexpr int64_t kInter = 64;
+
+struct Outputs {
+  std::vector<uint16_t> gate, up, activated, down;
+
+  bool operator==(const Outputs& o) const {
+    return gate == o.gate && up == o.up && activated == o.activated && down == o.down;
+  }
+};
+
+// One launch. Every buffer is fresh, so a run cannot inherit state from the
+// previous one -- which is what makes the repeat test below meaningful.
+Outputs Launch(const Problem& p, aclrtStream stream, const char* tag) {
+  LaunchWatchdog watchdog(kLaunchBudgetSeconds, tag);
+
+  DeviceBuffer x = DeviceBuffer::FromHost(p.x);
+  DeviceBuffer w1 = DeviceBuffer::FromHost(p.w1);
+  DeviceBuffer w2 = DeviceBuffer::FromHost(p.w2);
+  DeviceBuffer w3 = DeviceBuffer::FromHost(p.w3);
+  DeviceBuffer w1s = DeviceBuffer::FromHost(p.w1_scale);
+  DeviceBuffer w2s = DeviceBuffer::FromHost(p.w2_scale);
+  DeviceBuffer w3s = DeviceBuffer::FromHost(p.w3_scale);
+
+  DeviceBuffer gate = DeviceBuffer::Empty<uint16_t>(static_cast<size_t>(p.inter));
+  DeviceBuffer up = DeviceBuffer::Empty<uint16_t>(static_cast<size_t>(p.inter));
+  DeviceBuffer activated = DeviceBuffer::Empty<uint16_t>(static_cast<size_t>(p.inter));
+  DeviceBuffer down = DeviceBuffer::Empty<uint16_t>(static_cast<size_t>(p.hidden));
+  DeviceBuffer workspace = DeviceBuffer::Empty<uint8_t>(32);
+
+  // Poison the outputs: a kernel that fails to write a buffer must fail the
+  // comparison rather than inherit a plausible zero.
+  for (DeviceBuffer* b : {&gate, &up, &activated, &down}) {
+    ACL_CHECK(aclrtMemset(b->get(), b->size_bytes(), 0xA5, b->size_bytes()));
+  }
+
+  const TilingBuffer tiling = p.Tiling();
+  DeviceBuffer tiling_dev = DeviceBuffer::FromHost(
+      std::vector<int64_t>{tiling.hidden_size, tiling.inter_size, tiling.block_size});
+
+  dsv4_moe_expert_impl(stream, /*blockDim=*/1, x.get(), w1.get(), w2.get(), w3.get(), w1s.get(), w2s.get(),
+                       w3s.get(), gate.get(), up.get(), activated.get(), down.get(), workspace.get(),
+                       tiling_dev.get());
+  ACL_CHECK(aclrtSynchronizeStream(stream));
+
+  Outputs out;
+  out.gate = gate.ToHost<uint16_t>();
+  out.up = up.ToHost<uint16_t>();
+  out.activated = activated.ToHost<uint16_t>();
+  out.down = down.ToHost<uint16_t>();
+  return out;
+}
+
+int64_t WorstUlp(const std::vector<uint16_t>& actual, const std::vector<uint16_t>& expected) {
+  int64_t worst = 0;
+  for (size_t i = 0; i < actual.size(); ++i) {
+    worst = std::max(worst, Bf16UlpDistance(actual[i], expected[i]));
+  }
+  return worst;
+}
+
+void ExpectMatchesReference(const Problem& p, const Outputs& got) {
+  const auto want = ReferenceExpert(p.View(), p.hidden, p.inter);
+  EXPECT_LE(WorstUlp(got.gate, want.gate_out), kMaxUlp) << "gate_out";
+  EXPECT_LE(WorstUlp(got.up, want.up_out), kMaxUlp) << "up_out";
+  EXPECT_LE(WorstUlp(got.activated, want.activated), kMaxUlp) << "activated";
+  EXPECT_LE(WorstUlp(got.down, want.down_out), kMaxUlp) << "down_out";
+}
+
+// ---------------------------------------------------------------------------
+// Numerical verification
+// ---------------------------------------------------------------------------
+
+TEST(Dsv4MoeExpertSim, MatchesCpuReference) {
+  aclrtStream stream = AscendTestEnvironment::Instance().stream();
+  const Problem p = MakeProblem(kHidden, kInter, /*seed=*/0);
+  const Outputs got = Launch(p, stream, "dsv4_moe_expert/reference");
+  ExpectMatchesReference(p, got);
+}
+
+TEST(Dsv4MoeExpertSim, WritesEveryOutputBuffer) {
+  // The outputs are poisoned to 0xA5 before the launch. 0xA5A5 as bf16 is a
+  // normal negative number, so a buffer the kernel never touched would sail
+  // through a NaN check but cannot survive this one.
+  aclrtStream stream = AscendTestEnvironment::Instance().stream();
+  const Problem p = MakeProblem(kHidden, kInter, /*seed=*/1);
+  const Outputs got = Launch(p, stream, "dsv4_moe_expert/writes");
+
+  auto untouched = [](const std::vector<uint16_t>& v) {
+    return std::all_of(v.begin(), v.end(), [](uint16_t b) { return b == 0xA5A5u; });
+  };
+  EXPECT_FALSE(untouched(got.gate)) << "gate_out was never written";
+  EXPECT_FALSE(untouched(got.up)) << "up_out was never written";
+  EXPECT_FALSE(untouched(got.activated)) << "activated was never written";
+  EXPECT_FALSE(untouched(got.down)) << "down_out was never written";
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline synchronisation
+// ---------------------------------------------------------------------------
+
+TEST(Dsv4MoeExpertSim, RepeatedLaunchesAreBitIdentical) {
+  // THE sync test. A missing cross-pipe flag does not usually corrupt a result
+  // outright; it makes the result depend on how the pipes happened to
+  // interleave. Correctness against a reference cannot see that -- only
+  // repetition can.
+  //
+  // Concretely, this kernel reuses one staging buffer for all three projection
+  // legs. Without the S_MTE2 write-after-read flags, the up leg's DataCopy can
+  // overwrite the buffer while the gate leg's scalar reads are still retiring,
+  // and the damage depends on timing.
+  aclrtStream stream = AscendTestEnvironment::Instance().stream();
+  const Problem p = MakeProblem(kHidden, kInter, /*seed=*/2);
+
+  const int repeats = std::getenv("ASCEND_DSV4_SYNC_REPEATS")
+                          ? std::atoi(std::getenv("ASCEND_DSV4_SYNC_REPEATS"))
+                          : 3;
+  ASSERT_GE(repeats, 2) << "a single launch proves nothing about synchronisation";
+
+  const Outputs first = Launch(p, stream, "dsv4_moe_expert/sync[0]");
+  for (int i = 1; i < repeats; ++i) {
+    const Outputs again = Launch(p, stream, ("dsv4_moe_expert/sync[" + std::to_string(i) + "]").c_str());
+    EXPECT_TRUE(first == again)
+        << "launch " << i << " differs from launch 0 on identical input: a "
+        << "cross-pipe flag is missing (the kernel compiles with "
+        << "--cce-auto-sync=off, so nothing inserts them implicitly)";
+  }
+  // The runs agreeing is necessary but not sufficient, so still check the value.
+  ExpectMatchesReference(p, first);
+}
+
+TEST(Dsv4MoeExpertSim, BackToBackLaunchesOnOneStreamDoNotLeakState) {
+  // Two different problems submitted back to back. If the kernel leaves a
+  // hardware event set -- a SetFlag without its WaitFlag on some path -- the
+  // second launch inherits it and either hangs or reads stale UB.
+  aclrtStream stream = AscendTestEnvironment::Instance().stream();
+  const Problem a = MakeProblem(kHidden, kInter, /*seed=*/3);
+  const Problem b = MakeProblem(kHidden, kInter, /*seed=*/4);
+
+  const Outputs got_a = Launch(a, stream, "dsv4_moe_expert/leak[a]");
+  const Outputs got_b = Launch(b, stream, "dsv4_moe_expert/leak[b]");
+
+  ExpectMatchesReference(a, got_a);
+  ExpectMatchesReference(b, got_b);
+  EXPECT_FALSE(got_a == got_b) << "two different problems produced identical output";
+}
+
+// ---------------------------------------------------------------------------
+// SwiGLU boundary
+// ---------------------------------------------------------------------------
+
+TEST(Dsv4MoeExpertSim, SaturatedGateMatchesReference) {
+  // Every gate element is driven far enough negative that exp(-gate)
+  // overflows. The kernel has no clamp, so this is the inf path the camodel
+  // reports as `check_fp_status instr input data inf`. The result is still
+  // correct -- 1/(1+inf) is exactly 0 -- and this test is what pins that
+  // behaviour down, so a future clamp cannot change it silently.
+  aclrtStream stream = AscendTestEnvironment::Instance().stream();
+  const Problem p = MakeSaturatingProblem(kHidden, kInter, /*seed=*/5);
+  const Outputs got = Launch(p, stream, "dsv4_moe_expert/saturated");
+
+  ExpectMatchesReference(p, got);
+
+  // The activation saturates to zero, so the down projection of it is zero too.
+  const auto want = ReferenceExpert(p.View(), p.hidden, p.inter);
+  EXPECT_TRUE(std::all_of(want.activated_f32.begin(), want.activated_f32.end(),
+                          [](float v) { return v == 0.0f; }))
+      << "the saturating problem no longer saturates; re-tune MakeSaturatingProblem";
+}
+
+}  // namespace
+}  // namespace test
+}  // namespace vllm_ascend
