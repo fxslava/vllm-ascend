@@ -71,7 +71,7 @@ class OffloadStressHarness:
         )
 
         runtime.synchronize_device()
-        loop = _execute_trace_loop(pool, storage, runtime, trace, config.steps)
+        loop = _execute_trace_loop(pool, storage, runtime, trace, config.steps, traced_layers)
 
         verification = None
         if config.verify_samples:
@@ -116,6 +116,7 @@ def _execute_trace_loop(
     runtime: DeviceRuntime,
     trace: Sequence[TraceStep],
     total_steps: int,
+    layers_per_token: int,
 ) -> _TraceRunResult:
     """Measured section: acquire -> DMA sync -> release, with invariant checks.
 
@@ -134,6 +135,8 @@ def _execute_trace_loop(
     violations: list[int] = []
     fingerprints_stable = True
     for step_index, trace_step in enumerate(trace):
+        if step_index and step_index % layers_per_token == 0:
+            pool.advance_generation(step_index // layers_per_token - 1)  # token boundary
         loads_before = pool.stats.loads
         bytes_before = pool.stats.bytes_staged
         started_step = time.perf_counter()

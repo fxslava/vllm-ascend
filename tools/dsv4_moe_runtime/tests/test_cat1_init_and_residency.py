@@ -19,6 +19,7 @@ import torch
 from ..core.config import EXPERT_PARAM_NAMES, DeepSeekV4MoEConfig
 from ..core.layout import SLOT_REGION_ALIGN_BYTES, ExpertTensorLayout
 from ..core.ledger import SlotExhaustionError
+from ..core.legacy_lru_policy import LegacyLruPolicy
 from ..core.slot_pool import UNRESIDENT_SLOT_ID, StaticExpertSlotPool
 from ..protocols.router import RouteResolverProtocol
 from ..routing.hash_router import HashRouteResolver
@@ -142,7 +143,14 @@ def test_step_lock_prevents_eviction_collision(
     sanity_layout: ExpertTensorLayout,
     mock_provider_factory,
 ) -> None:
-    pool = StaticExpertSlotPool(sanity_config, num_slots=sanity_config.top_k, layout=sanity_layout)
+    """LRU baseline: victim identity assertions run on the legacy flat-LRU policy."""
+
+    def lru_pool(num_slots: int) -> StaticExpertSlotPool:
+        return StaticExpertSlotPool(
+            sanity_config, num_slots=num_slots, layout=sanity_layout, policy=LegacyLruPolicy(sanity_config, num_slots)
+        )
+
+    pool = lru_pool(sanity_config.top_k)
     provider = mock_provider_factory(sanity_layout, layer_ids=(0,), num_experts=sanity_config.num_routed_experts)
 
     first_ids = [10, 11, 12, 13, 14, 15]
@@ -182,7 +190,7 @@ def test_step_lock_prevents_eviction_collision(
     pool.release_step(second)
 
     # --- Free slots do not weaken the lock: 8 slots, 6 locked, 2 free. ---
-    wide_pool = StaticExpertSlotPool(sanity_config, num_slots=8, layout=sanity_layout)
+    wide_pool = lru_pool(8)
     held = wide_pool.acquire_for_step(0, [0, 1, 2, 3, 4, 5], provider)
     assert wide_pool.resident_expert_count == 6
     with pytest.raises(SlotExhaustionError):
@@ -197,7 +205,7 @@ def test_step_lock_prevents_eviction_collision(
     wide_pool.release_step(evicting)
 
     # --- Resident hits are never evicted to make room for co-requested misses. ---
-    hit_pool = StaticExpertSlotPool(sanity_config, num_slots=sanity_config.top_k, layout=sanity_layout)
+    hit_pool = lru_pool(sanity_config.top_k)
     warmup = hit_pool.acquire_for_step(0, [0, 1, 2, 3, 4, 5], provider)
     hit_pool.release_step(warmup)
     mixed = hit_pool.acquire_for_step(0, [2, 3, 4, 5, 6, 7], provider)

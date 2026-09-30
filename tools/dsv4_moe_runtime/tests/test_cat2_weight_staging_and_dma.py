@@ -16,8 +16,11 @@ import torch
 from ..benchmarks.capacity_probe import DummyLoopbackWeightProvider
 from ..benchmarks.offload_stress import OffloadStressHarness, RouterTraceSimulator, parse_config
 from ..core.config import SANITY_GEOMETRY
+from ..core.generational_policy import GenerationalRadixPolicy
 from ..core.layout import ExpertTensorLayout
+from ..core.legacy_lru_policy import LegacyLruPolicy
 from ..core.slot_pool import StaticExpertSlotPool
+from ..hardware.exchange_buffer import ExchangeBufferFullError, TransitExchangeBuffer
 from ..hardware.pinned_storage import AscendPinnedHostStorage
 from ..hardware.runtime import CpuRuntime
 from ..protocols.provider import SlotFillProviderProtocol
@@ -200,3 +203,64 @@ def test_harness_small_run_matches_report() -> None:
         20 * SANITY_GEOMETRY.top_k
     )
     assert report.hit_rate_overall == pytest.approx(expected_hit_rate)
+
+
+def test_policy_swap_preserves_dma_staging(sanity_config, sanity_layout: ExpertTensorLayout) -> None:
+    """Swapping eviction policies must not change slot slicing or DMA transfers."""
+    storage = AscendPinnedHostStorage(CpuRuntime(), sanity_layout, layer_ids=[0], experts_per_layer=8)
+    baseline = None
+    for policy in (LegacyLruPolicy(sanity_config, num_slots=6), GenerationalRadixPolicy(sanity_config, 6)):
+        pool = StaticExpertSlotPool(sanity_config, num_slots=6, layout=sanity_layout, policy=policy)
+        reservation = pool.acquire_for_step(0, [0, 1, 2, 3, 4, 5], storage)
+        resident = {expert: pool.slot_of(0, expert) for expert in range(6)}
+        for expert, slot in resident.items():
+            for param_key, view in pool.param_views(slot).items():
+                assert torch.equal(view, storage.pinned_cpu_weight(0, expert, param_key))
+        if baseline is None:
+            baseline = resident
+        assert resident == baseline  # identical slot slicing and identical staged bytes
+        pool.release_step(reservation)
+
+
+def test_transit_ring_stages_promotes_and_wraps(sanity_layout: ExpertTensorLayout) -> None:
+    buffer = TransitExchangeBuffer(CpuRuntime(), sanity_layout, host_slots=2)
+    fingerprint = buffer.fingerprint()
+    source_a = torch.arange(sanity_layout.slot_num_bytes, dtype=torch.uint8) % 251
+    source_b = (torch.arange(sanity_layout.slot_num_bytes, dtype=torch.uint8) + 7) % 253
+
+    assert buffer.stage_eviction(source_a) == 0
+    assert buffer.in_flight == 1 and buffer.state_of(0) == 1
+    buffer.stage_eviction(source_b)
+    assert buffer.in_flight == 2
+    with pytest.raises(ExchangeBufferFullError):
+        buffer.stage_eviction(source_a)  # bounded ring: back-pressure, never growth
+
+    promoted_a = torch.zeros(sanity_layout.slot_num_bytes, dtype=torch.uint8)
+    assert buffer.promote_oldest(promoted_a) == 0  # FIFO: the oldest eviction first
+    assert torch.equal(promoted_a, source_a)
+    buffer.stage_eviction(source_a)  # freed slot is reused (ring wraps)
+    assert buffer.in_flight == 2
+    assert buffer.fingerprint() == fingerprint  # host arena never moved
+
+
+def test_pool_stages_victim_bytes_into_transit_ring(
+    sanity_config, sanity_layout: ExpertTensorLayout, mock_provider_factory
+) -> None:
+    provider = mock_provider_factory(sanity_layout, layer_ids=(0,), num_experts=sanity_config.num_routed_experts)
+    buffer = TransitExchangeBuffer(CpuRuntime(), sanity_layout, host_slots=sanity_config.top_k)
+    pool = StaticExpertSlotPool(sanity_config, num_slots=6, layout=sanity_layout, exchange_buffer=buffer)
+
+    first = pool.acquire_for_step(0, [0, 1, 2, 3, 4, 5], provider)
+    pool.release_step(first)
+    second = pool.acquire_for_step(0, [100, 101, 102, 103, 104, 105], provider)
+    pool.release_step(second)
+
+    assert buffer.in_flight == 6  # every evicted expert was staged before its slot was reused
+    for host_slot, evicted_expert in enumerate(range(6)):
+        for spec in sanity_layout.specs:
+            staged = buffer.host_region(host_slot)
+            region = staged[spec.offset_bytes : spec.offset_bytes + spec.num_bytes].view(spec.view_shape)
+            assert torch.equal(region, provider.pinned_cpu_weight(0, evicted_expert, spec.param_key)), (
+                host_slot,
+                spec.param_key,
+            )

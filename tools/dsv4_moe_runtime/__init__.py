@@ -18,6 +18,7 @@ from .core.config import (
     SCALE_PARAM_SUFFIX,
     DeepSeekV4MoEConfig,
 )
+from .core.generational_policy import GenerationalRadixPolicy
 from .core.layout import (
     FP4_BLOCK_SIZE,
     FP4_ELEMS_PER_BYTE,
@@ -26,6 +27,7 @@ from .core.layout import (
     ExpertTensorSpec,
 )
 from .core.ledger import SlotExhaustionError
+from .core.legacy_lru_policy import LegacyLruPolicy
 from .core.slot_pool import (
     UNRESIDENT_SLOT_ID,
     SlotPoolStats,
@@ -38,10 +40,12 @@ from .hardware.dummy_kernel import (
     DummyExpertKernelRunner,
     ExpertKernelRunner,
 )
+from .hardware.exchange_buffer import TransitExchangeBuffer
 from .hardware.lifecycle import RuntimeLifecycleManager, TeardownReport, TeardownStep
 from .hardware.pinned_storage import AscendPinnedHostStorage
 from .hardware.runtime import CpuRuntime, DeviceRuntime, NpuRuntime, make_runtime
 from .protocols.provider import SlotFillProviderProtocol, WeightProviderProtocol
+from .protocols.residency_policy import AdmissionDecision, EvictionPolicyProtocol
 from .protocols.router import RouteResolverProtocol
 from .routing.hash_router import HashRouteResolver
 from .routing.score_router import ScoreRouteResolver
@@ -55,16 +59,20 @@ __all__ = [
     "SANITY_GEOMETRY",
     "SLOT_REGION_ALIGN_BYTES",
     "SCALE_PARAM_SUFFIX",
+    "AdmissionDecision",
     "AscendPinnedHostStorage",
     "BenchConfig",
     "CpuRuntime",
     "DeepSeekV4MoEConfig",
     "DeviceRuntime",
+    "EvictionPolicyProtocol",
     "DummyExpertKernelRunner",
     "ExpertKernelRunner",
     "ExpertTensorLayout",
     "ExpertTensorSpec",
+    "GenerationalRadixPolicy",
     "HashRouteResolver",
+    "LegacyLruPolicy",
     "NpuRuntime",
     "OffloadStressHarness",
     "RouteResolverProtocol",
@@ -76,6 +84,7 @@ __all__ = [
     "SlotPoolStats",
     "StaticExpertSlotPool",
     "StepReservation",
+    "TransitExchangeBuffer",
     "TeardownReport",
     "TeardownStep",
     "TraceStep",

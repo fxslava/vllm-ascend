@@ -1,5 +1,15 @@
 """Static expert slot pool: AOT HBM arena with pre-sliced isomorphic views.
 
+Responsibility split (SRP): this class owns *physical* memory mechanics only
+-- arena allocation, view slicing, slot indexing, step locking and DMA fills.
+*Which* resident expert to evict and how priorities are computed belong to the
+injected
+:class:`~tools.dsv4_moe_runtime.protocols.residency_policy.EvictionPolicyProtocol`
+(default:
+:class:`~tools.dsv4_moe_runtime.core.generational_policy.GenerationalRadixPolicy`;
+the historical flat-LRU behaviour remains available as
+:class:`~tools.dsv4_moe_runtime.core.legacy_lru_policy.LegacyLruPolicy`).
+
 Memory contracts (enforced by the test suite):
 
 1. Strict AOT residency -- every byte of device memory is allocated once in
@@ -10,20 +20,16 @@ Memory contracts (enforced by the test suite):
    every slot is pre-sliced into per-parameter views at init so the hot loop
    never slices.
 3. Transactional step locking -- the ``top_k`` slots requested for a step are
-   locked before any eviction decision is taken; a step either commits fully
-   or raises ``SlotExhaustionError`` with the pool state untouched.
+   locked before any state mutates; a step either commits fully or raises
+   ``SlotExhaustionError`` with the pool and policy untouched.
 4. "Lazy loading" is strictly ``slot_view.copy_(host_weight)`` into
-   fixed-address views -- never module construction, never re-slicing, never
-   reallocation. Blocking vs non-blocking transport is a *provider* property:
-   DMA-capable host storage implements ``SlotFillProviderProtocol`` and fills
-   the very same pre-sliced views itself on its own copy stream.
+   fixed-address views. Blocking vs non-blocking transport is a *provider*
+   property: DMA-capable host storage implements ``SlotFillProviderProtocol``
+   and fills the very same pre-sliced views itself on its own copy stream.
 
-Device-notes for the NPU bring-up: the residency bookkeeping (LRU, locks) is
-host-side control state; the ``expert_slot_table`` is a device-resident
-``int32`` ``[num_layers, num_experts]`` tensor that attention/FFN kernels can
-index directly. ``StaticExpertSlotPool.slot_of`` uses ``Tensor.item()`` and is
-a *test/debug* accessor only -- hot paths must consume the table row on
-device (AGENTS.md: no ``item()`` syncs in hot paths).
+Device-notes for the NPU bring-up: ``expert_slot_table`` is a device-resident
+``int32`` ``[num_layers, num_experts]`` tensor that kernels index directly;
+``slot_of`` uses ``Tensor.item()`` and is a *test/debug* accessor only.
 """
 
 from __future__ import annotations
@@ -35,14 +41,15 @@ from dataclasses import dataclass
 import torch
 
 from ..core.config import DeepSeekV4MoEConfig
+from ..core.generational_policy import GenerationalRadixPolicy
 from ..core.layout import ExpertTensorLayout
-from ..core.ledger import SlotExhaustionError, _AdmissionPlan, _SlotResidencyLedger
+from ..hardware.exchange_buffer import TransitExchangeBuffer
 from ..protocols.provider import SlotFillProviderProtocol, WeightProviderProtocol
+from ..protocols.residency_policy import EvictionPolicyProtocol
 
 UNRESIDENT_SLOT_ID = -1
 
 __all__ = [
-    "SlotExhaustionError",
     "SlotPoolStats",
     "StepReservation",
     "StaticExpertSlotPool",
@@ -80,11 +87,11 @@ class StepReservation:
 class StaticExpertSlotPool:
     """AOT-allocated, zero-allocation residency manager for routed experts.
 
-    Device-side consumers read ``expert_slot_table[layer_idx]`` (int32,
-    -1 = miss) directly on device; ``weight_views(slot_id)`` /
-    ``scale_views(slot_id)`` are the pre-sliced, fixed-address compute
-    operands, and ``param_views(slot_id)`` is the same set keyed by provider
-    param key for streamed DMA fills.
+    Eviction strategy is injected via ``policy``; the pool applies the returned
+    :class:`~tools.dsv4_moe_runtime.protocols.residency_policy.AdmissionDecision`
+    to physical state (locks, residency table, DMA fills, free list). An
+    optional ``exchange_buffer`` stages evicted slot bytes into the pinned-DDR
+    transit ring before the incoming expert overwrites the slot.
     """
 
     def __init__(
@@ -93,6 +100,8 @@ class StaticExpertSlotPool:
         num_slots: int,
         layout: ExpertTensorLayout | None = None,
         device: str = "cpu",
+        policy: EvictionPolicyProtocol | None = None,
+        exchange_buffer: TransitExchangeBuffer | None = None,
     ):
         if num_slots < config.top_k:
             raise ValueError(f"num_slots {num_slots} must hold a full top-k of {config.top_k}")
@@ -100,6 +109,8 @@ class StaticExpertSlotPool:
         self._layout = layout or ExpertTensorLayout.for_deepseek_v4_flash(config)
         self._num_slots = num_slots
         self._device = torch.device(device)
+        self._policy = policy or GenerationalRadixPolicy(config, num_slots, device=device)
+        self._exchange_buffer = exchange_buffer
 
         # --- AOT physical allocation: the only allocating statements in this class. ---
         self._slot_arena = torch.empty(num_slots * self._layout.slot_num_bytes, dtype=torch.uint8, device=self._device)
@@ -126,8 +137,11 @@ class StaticExpertSlotPool:
                 views_by_key[spec.param_key] = source_dict[spec.name]
             self._param_views.append(views_by_key)
 
-        # --- Host-side control state (no device memory). ---
-        self._ledger = _SlotResidencyLedger(num_slots, config.num_routed_experts)
+        # --- Physical residency bookkeeping (no device memory). ---
+        self._residents: dict[tuple[int, int], int] = {}
+        self._lock_counts: list[int] = [0] * num_slots
+        self._free_slots: list[int] = list(range(num_slots))
+        self._current_token = 0
         self.stats = SlotPoolStats()
 
     # ------------------------------------------------------------------ views
@@ -150,8 +164,13 @@ class StaticExpertSlotPool:
         return self._num_slots
 
     @property
+    def policy(self) -> EvictionPolicyProtocol:
+        """The injected eviction strategy (swappable at construction, OCP/DIP)."""
+        return self._policy
+
+    @property
     def resident_expert_count(self) -> int:
-        return self._ledger.resident_count()
+        return len(self._residents)
 
     @property
     def layout(self) -> ExpertTensorLayout:
@@ -167,9 +186,20 @@ class StaticExpertSlotPool:
         """Pre-sliced views keyed by provider param key ("w1", "w1_scale", ...)."""
         return self._param_views[slot_id]
 
+    def slot_region(self, slot_id: int) -> torch.Tensor:
+        """The whole raw ``slot_num_bytes`` region of one slot (transit staging)."""
+        return self._slot_arena.narrow(0, slot_id * self._layout.slot_num_bytes, self._layout.slot_num_bytes)
+
     def slot_of(self, layer_idx: int, expert_id: int) -> int:
         """Test/debug accessor (``Tensor.item()``); hot paths read the table on device."""
         return int(self._expert_slot_table[layer_idx, expert_id].item())
+
+    # ------------------------------------------------------- token boundaries
+
+    def advance_generation(self, completed_token_idx: int) -> None:
+        """Close out a token (idempotent); ages the policy's generational state."""
+        self._policy.advance_generation(completed_token_idx)
+        self._current_token = completed_token_idx + 1
 
     # ------------------------------------------------------- step acquisition
 
@@ -181,33 +211,38 @@ class StaticExpertSlotPool:
     ) -> StepReservation:
         """Lock the step's top-k slots and make them resident, in place.
 
-        Transactional: the full plan (hits, free reuse, evictions) is computed
-        before any state mutates, so ``SlotExhaustionError`` leaves the pool
-        untouched. Fills are strictly in-place ``copy_`` into pre-sliced views.
+        Transactional: the policy plans the full decision (hits, free reuse,
+        evictions) before any state mutates, and provider sources are validated
+        before the policy commits -- a failure leaves everything untouched.
         """
         self._validate_request(layer_idx, expert_ids)
-        keys = [
-            _SlotResidencyLedger.expert_key(layer_idx, expert_id, self._config.num_routed_experts)
-            for expert_id in expert_ids
-        ]
-        plan = self._ledger.plan_admission(keys)
+        requested_pairs = [(layer_idx, expert_id) for expert_id in expert_ids]
+        for pair in requested_pairs:
+            self._policy.register_access(pair[0], pair[1], self._current_token)
 
-        locked_slots = tuple(dict.fromkeys([slot for _, slot in plan.hits] + [slot for _, slot in plan.admissions]))
-        self._ledger.lock_slots(locked_slots)
+        locked_slots = [slot for slot, count in enumerate(self._lock_counts) if count]
+        decision = self._policy.plan_admissions(
+            requested_pairs, self._residents, self._free_slots, locked_slots=locked_slots
+        )
+        self._validate_admission_sources(layer_idx, decision, host_pinned_storage)
+
+        self._policy.commit_decision(decision)
+        locked = tuple(dict.fromkeys([slot for _, slot in decision.hits] + [slot for _, slot in decision.admissions]))
+        self._lock_slots(locked)
         try:
-            self._apply_plan(layer_idx, plan, host_pinned_storage)
+            self._apply_decision(layer_idx, decision, host_pinned_storage)
         except Exception:
-            self._ledger.unlock_slots(locked_slots)
+            self._unlock_slots(locked)
             raise
 
-        slot_ids = tuple(plan.slot_for(key) for key in plan.request_order)
+        slot_ids = tuple(decision.slot_for(pair) for pair in requested_pairs)
         for index, slot in enumerate(slot_ids):
             self._step_slot_ids[index] = slot
         return StepReservation(
             layer_idx=layer_idx,
             expert_ids=tuple(expert_ids),
             slot_ids=slot_ids,
-            locked_slots=locked_slots,
+            locked_slots=locked,
             device_slot_ids=self._step_slot_ids,
         )
 
@@ -228,7 +263,7 @@ class StaticExpertSlotPool:
         if reservation.released:
             raise ValueError("step reservation released twice")
         reservation.released = True
-        self._ledger.unlock_slots(reservation.locked_slots)
+        self._unlock_slots(reservation.locked_slots)
 
     # -------------------------------------------------------------- internals
 
@@ -243,58 +278,76 @@ class StaticExpertSlotPool:
             if not 0 <= expert_id < self._config.num_routed_experts:
                 raise ValueError(f"expert_id {expert_id} outside [0, {self._config.num_routed_experts})")
 
-    def _apply_plan(
+    def _validate_admission_sources(
         self,
         layer_idx: int,
-        plan: _AdmissionPlan,
+        decision,
         host_pinned_storage: WeightProviderProtocol,
     ) -> None:
-        # 1. Reserve and validate every source *before* mutating any state, so a
-        #    misbehaving provider cannot leave the pool half-committed.
-        uses_streamed_fill = isinstance(host_pinned_storage, SlotFillProviderProtocol)
-        pending_fills: list[tuple[int, int, list[torch.Tensor]]] = []  # (expert_id, slot, sources)
-        if uses_streamed_fill:
-            for key, _slot in plan.admissions:
-                _admitted_layer, expert_id = _SlotResidencyLedger.split_key(key, self._config.num_routed_experts)
-                host_pinned_storage.ensure_staged(layer_idx, expert_id)
-        else:
-            for key, slot in plan.admissions:
-                _admitted_layer, expert_id = _SlotResidencyLedger.split_key(key, self._config.num_routed_experts)
-                sources = []
-                for spec in self._layout.specs:
-                    source = host_pinned_storage.pinned_cpu_weight(layer_idx, expert_id, spec.param_key)
-                    self._assert_transfer_compatible(spec.param_key, source)
-                    sources.append(source)
-                pending_fills.append((expert_id, slot, sources))
+        """Fetch/validate (or reserve) every source before any state mutates."""
+        if isinstance(host_pinned_storage, SlotFillProviderProtocol):
+            for key, _slot in decision.admissions:
+                host_pinned_storage.ensure_staged(layer_idx, key[1])
+            return
+        for key, _slot in decision.admissions:
+            for spec in self._layout.specs:
+                source = host_pinned_storage.pinned_cpu_weight(layer_idx, key[1], spec.param_key)
+                self._assert_transfer_compatible(spec.param_key, source)
 
-        # 2. Bookkeeping (ledger + device table), then bytes. Copies cannot fail
-        #    here: staging/shapes/dtypes were validated above.
-        self._ledger.commit(plan)
-        for victim_key, _slot in plan.evictions:
-            victim_layer, victim_expert = _SlotResidencyLedger.split_key(victim_key, self._config.num_routed_experts)
-            self._expert_slot_table[victim_layer, victim_expert] = UNRESIDENT_SLOT_ID
+    def _apply_decision(
+        self,
+        layer_idx: int,
+        decision,
+        host_pinned_storage: WeightProviderProtocol,
+    ) -> None:
+        # 1. Transit staging: evicted slot bytes go to the pinned-DDR ring
+        #    before the incoming expert overwrites the slot.
+        if self._exchange_buffer is not None:
+            for _key, victim_slot in decision.evictions:
+                self._exchange_buffer.stage_eviction(self.slot_region(victim_slot))
+
+        # 2. Physical residency bookkeeping (residents, free list, device table).
+        for key, victim_slot in decision.evictions:
+            del self._residents[key]
+            self._expert_slot_table[key[0], key[1]] = UNRESIDENT_SLOT_ID
             self.stats.evictions += 1
-        for key, slot in plan.hits:
-            _hit_layer, expert_id = _SlotResidencyLedger.split_key(key, self._config.num_routed_experts)
-            self._expert_slot_table[layer_idx, expert_id] = slot
+        for key, slot in decision.hits:
+            self._residents[key] = slot
+            self._expert_slot_table[key[0], key[1]] = slot
             self.stats.hits += 1
-        if uses_streamed_fill:
-            for key, slot in plan.admissions:
-                _admitted_layer, expert_id = _SlotResidencyLedger.split_key(key, self._config.num_routed_experts)
-                self._expert_slot_table[layer_idx, expert_id] = slot
+        if decision.free_slot_count:
+            del self._free_slots[-decision.free_slot_count :]
+
+        # 3. Bytes: schema-driven fills, no per-projection duplication.
+        if isinstance(host_pinned_storage, SlotFillProviderProtocol):
+            for key, slot in decision.admissions:
+                self._expert_slot_table[layer_idx, key[1]] = slot
+                self._residents[key] = slot
                 self.stats.bytes_staged += host_pinned_storage.fill_slot_params(
-                    layer_idx, expert_id, self._param_views[slot]
+                    layer_idx, key[1], self._param_views[slot]
                 )
                 self.stats.loads += 1
         else:
-            for expert_id, slot, sources in pending_fills:
-                self._expert_slot_table[layer_idx, expert_id] = slot
-                for spec, source in zip(self._layout.specs, sources):
+            for key, slot in decision.admissions:
+                self._expert_slot_table[layer_idx, key[1]] = slot
+                self._residents[key] = slot
+                for spec in self._layout.specs:
+                    source = host_pinned_storage.pinned_cpu_weight(layer_idx, key[1], spec.param_key)
                     view_map = self._weight_views if spec.kind == "packed_fp4" else self._scale_views
                     destination = view_map[slot][spec.name]
                     destination.copy_(source, non_blocking=False)
                     self.stats.bytes_staged += source.numel()
                 self.stats.loads += 1
+
+    def _lock_slots(self, slots: Sequence[int]) -> None:
+        for slot in slots:
+            self._lock_counts[slot] += 1
+
+    def _unlock_slots(self, slots: Sequence[int]) -> None:
+        for slot in slots:
+            if self._lock_counts[slot] <= 0:
+                raise ValueError(f"slot {slot} unlocked too often")
+            self._lock_counts[slot] -= 1
 
     def _assert_transfer_compatible(self, param_key: str, source: torch.Tensor) -> None:
         spec = self._layout.spec_for(param_key)

@@ -79,6 +79,7 @@ class DraftInferenceEngine:
         self._final_norm = torch.ones(config.hidden_size, dtype=torch.float32, device=device)
         self._final_norm_bf16 = self._final_norm.to(torch.bfloat16)
 
+        self._token_counter = 0
         self._pool = StaticExpertSlotPool(config, num_slots, layout=layout, device=device)
         self._scratchpad = DecodeScratchpad(
             config,
@@ -139,6 +140,8 @@ class DraftInferenceEngine:
             misses += layer_misses
             self._attend(layer_idx)
         self._scratchpad["hidden"][0].mul_(self._final_norm_bf16)
+        self._pool.advance_generation(self._token_counter)
+        self._token_counter += 1
         return StepReport(layer_hits=hits, layer_misses=misses, layers_executed=self._config.num_layers)
 
     def _attend(self, layer_idx: int) -> None:

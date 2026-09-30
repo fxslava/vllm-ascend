@@ -245,6 +245,7 @@ def _thrash_loop(
     steps = 0
     started = time.perf_counter()
     for cycle in range(config.thrash_cycles):
+        pool.advance_generation(cycle)  # each cycle models one decode token
         for step in range(steps_per_cycle):
             layer_idx = (cycle + step) % model_config.num_layers
             key_index = (cycle * steps_per_cycle + step) * top_k
