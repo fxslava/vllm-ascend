@@ -1,0 +1,166 @@
+{
+  "config": {
+    "device": "cuda:0",
+    "layout": "dsv2-lite",
+    "steps": 500,
+    "pool_slots": 384,
+    "transit_slots": 256,
+    "hot_experts": 16,
+    "hot_ratio": 0.35,
+    "zipf_exponent": 1.2,
+    "seed": 42,
+    "small_geometry": false,
+    "weight_source": "synthetic expert bytes"
+  },
+  "device_budget": {
+    "device": "cuda:0",
+    "slot_num_bytes": 17301504,
+    "pool_slots": 384,
+    "pool_bytes": 6643777536,
+    "backbone_bytes": 2616197120,
+    "backbone_modeled": true,
+    "transit_host_bytes": 4429185024,
+    "reserve_bytes": 536870912,
+    "deployment_device_bytes": 9259974656,
+    "device_total_bytes": 12820480000,
+    "device_free_bytes": 11569987584,
+    "fits": true,
+    "headroom_bytes": 1773142016,
+    "max_pool_slots": 486
+  },
+  "slot_num_bytes": 17301504,
+  "exclusive_staging": {
+    "transit_slots": 256,
+    "host_window_bytes": 4429185024,
+    "window_cap_ok": true,
+    "window_source_fills": 1865,
+    "window_hits": 384,
+    "window_refills": 15,
+    "evictions_staged": 1865,
+    "window_dropped": 1367,
+    "transit_peak_in_flight": 256,
+    "host_peak_rss_bytes": null
+  },
+  "pool_bytes": 6643777536,
+  "hit_rate_overall": 0.25033333333333335,
+  "warmup_curve": [
+    {
+      "steps": "    0-   24",
+      "hit_rate": 0.0
+    },
+    {
+      "steps": "   25-   49",
+      "hit_rate": 0.12666666666666668
+    },
+    {
+      "steps": "   50-   74",
+      "hit_rate": 0.24666666666666667
+    },
+    {
+      "steps": "   75-   99",
+      "hit_rate": 0.24666666666666667
+    },
+    {
+      "steps": "  100-  124",
+      "hit_rate": 0.31333333333333335
+    },
+    {
+      "steps": "  125-  149",
+      "hit_rate": 0.26
+    },
+    {
+      "steps": "  150-  174",
+      "hit_rate": 0.2733333333333333
+    },
+    {
+      "steps": "  175-  199",
+      "hit_rate": 0.24
+    },
+    {
+      "steps": "  200-  224",
+      "hit_rate": 0.24
+    },
+    {
+      "steps": "  225-  249",
+      "hit_rate": 0.29333333333333333
+    },
+    {
+      "steps": "  250-  274",
+      "hit_rate": 0.26
+    },
+    {
+      "steps": "  275-  299",
+      "hit_rate": 0.25333333333333335
+    },
+    {
+      "steps": "  300-  324",
+      "hit_rate": 0.28
+    },
+    {
+      "steps": "  325-  349",
+      "hit_rate": 0.32666666666666666
+    },
+    {
+      "steps": "  350-  374",
+      "hit_rate": 0.26666666666666666
+    },
+    {
+      "steps": "  375-  399",
+      "hit_rate": 0.26
+    },
+    {
+      "steps": "  400-  424",
+      "hit_rate": 0.2733333333333333
+    },
+    {
+      "steps": "  425-  449",
+      "hit_rate": 0.26
+    },
+    {
+      "steps": "  450-  474",
+      "hit_rate": 0.31333333333333335
+    },
+    {
+      "steps": "  475-  499",
+      "hit_rate": 0.2733333333333333
+    }
+  ],
+  "latency_ms": {
+    "all": {
+      "p50": 9.676399999989371,
+      "p95": 13.373804999673666,
+      "p99": 14.459863000092808
+    },
+    "miss": {
+      "p50": 9.676399999989371,
+      "p95": 13.373804999673666,
+      "p99": 14.459863000092808
+    },
+    "hit": {
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.0
+    }
+  },
+  "bandwidth_gbps": {
+    "aggregate_gbps": 7.983518687522714,
+    "p50_gbps": 7.80788907028905,
+    "p95_gbps": 10.679138863847635
+  },
+  "total_bytes_moved": 38911082496,
+  "zero_allocation": {
+    "allocator_invariant_ok": true,
+    "baseline_allocated": 6643785216,
+    "final_allocated": 6643785216,
+    "baseline_reserved": 6645874688,
+    "final_reserved": 6645874688,
+    "violation_steps": [],
+    "fingerprints_stable": true,
+    "verification": {
+      "ok": true,
+      "views": 60
+    }
+  },
+  "wall_time_s": 5.780902100000276,
+  "verdict": "PASS"
+}
