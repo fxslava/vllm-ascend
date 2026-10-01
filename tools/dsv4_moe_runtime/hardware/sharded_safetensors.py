@@ -205,11 +205,19 @@ class ShardedSafetensorsExpertSource:
         num_chunks: int = DEFAULT_EXPERT_CHUNKS,
         io_mode: str = MODE_AUTO,
         check_dtypes: bool = True,
+        shared_layout: ExpertTensorLayout | None = None,
     ):
         self._runtime = runtime
         self._layout = layout
         self._index = index
         self._naming = naming_scheme(naming)
+        # Shared experts are bound lazily: a run may reserve them for a subset
+        # of layers, and binding all 26 up front would check spans nothing asks
+        # for. The layout is held because the fill needs it and it must not be
+        # the routed one -- see bind_shared_expert.
+        self._shared_layout = shared_layout
+        self._shared_spans: dict[int, dict[str, TensorSpan]] = {}
+        self.shared_fills = 0
         self.expert_spans = bind_sharded_expert_spans(
             index,
             layout,
@@ -304,6 +312,57 @@ class ShardedSafetensorsExpertSource:
 
     def pinned_cpu_weight(self, layer_idx: int, expert_id: int, param_key: str) -> torch.Tensor:
         return self.read_param(layer_idx, expert_id, param_key)
+
+    # -------------------------------------------------------- shared experts
+
+    def bind_shared_expert(self, layer_idx: int, shared_layout: ExpertTensorLayout) -> dict[str, TensorSpan]:
+        """Bind one layer's shared-expert projections, checked like a routed slot.
+
+        Memoized, because the dispatcher asks per layer and the answer is a
+        property of the checkpoint. The dtype and shape checks are the routed
+        ones: a shared expert bound against the *routed* layout would ask for
+        5,767,168-byte spans out of 11,534,336-byte tensors and quietly load a
+        third of each projection.
+        """
+        cached = self._shared_spans.get(layer_idx)
+        if cached is not None:
+            return cached
+        spans: dict[str, TensorSpan] = {}
+        total = 0
+        for spec in shared_layout.specs:
+            name = self._naming.shared_tensor_name(layer_idx, spec)
+            span = self._index.span(name)
+            validate_expert_span(spec, name, span.begin, span.num_bytes, False)
+            _validate_dtype_and_shape(spec, name, span)
+            spans[spec.param_key] = span
+            total += span.num_bytes
+        if total != shared_layout.slot_num_bytes:
+            raise WeightLayoutMismatchError(
+                f"layer {layer_idx} shared expert: spans total {total} bytes, shared layout is "
+                f"{shared_layout.slot_num_bytes}"
+            )
+        self._shared_spans[layer_idx] = spans
+        return spans
+
+    def fill_shared_expert(self, layer_idx: int, views: Mapping[str, torch.Tensor]) -> int:
+        """Stream one layer's shared expert into its reserved views; returns bytes."""
+        if self._shared_layout is None:
+            raise WeightLayoutMismatchError(
+                "this source was built without a shared_layout, so it cannot bind shared experts"
+            )
+        spans = self.bind_shared_expert(layer_idx, self._shared_layout)
+        moved = 0
+        for param_key, destination in views.items():
+            span = spans[param_key]
+            if destination.numel() != span.num_bytes:
+                raise ValueError(
+                    f"layer {layer_idx} shared {param_key}: view holds {destination.numel()} bytes, "
+                    f"span is {span.num_bytes}"
+                )
+            moved += self._loader_for(span).stream_into(destination.view(-1), span.begin, span.num_bytes)
+        self.bytes_streamed += moved
+        self.shared_fills += 1
+        return moved
 
     def synchronize(self) -> None:
         for loader in self._loaders.values():

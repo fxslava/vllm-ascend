@@ -151,6 +151,59 @@ class ExpertTensorLayout:
         """Unquantized BF16 expert slot (DeepSeek-V2-Lite and friends)."""
         return cls.for_expert_geometry(config.hidden_size, config.moe_intermediate_size, DENSE_BF16_KINDS)
 
+    @classmethod
+    def for_shared_expert(
+        cls,
+        config: DeepSeekV4MoEConfig,
+        num_shared_experts: int,
+        kinds: Sequence[str] = DENSE_BF16_KINDS,
+    ) -> ExpertTensorLayout:
+        """The shared-expert module: one expert of ``n x moe_intermediate_size`` width.
+
+        DeepSeek exports ``n_shared_experts`` as a *single* fused module rather
+        than n separate ones, so DeepSeek-V2-Lite's two shared experts ship as
+        one set of ``(2816, 2048)`` / ``(2048, 2816)`` projections -- 2816 being
+        ``2 x 1408``. The layout is therefore the routed geometry with a wider
+        intermediate, which is what makes :meth:`slots_per_region` come out to a
+        whole number and lets the shared expert live in paired routed slots
+        instead of a second, differently-sized pool.
+        """
+        if num_shared_experts <= 0:
+            raise ValueError(f"num_shared_experts must be positive, got {num_shared_experts}")
+        return cls.for_expert_geometry(config.hidden_size, config.moe_intermediate_size * num_shared_experts, kinds)
+
+    def slots_per_region(self, slot_layout: ExpertTensorLayout) -> int:
+        """How many ``slot_layout`` slots this layout occupies, exactly.
+
+        Refuses a non-integral ratio rather than rounding up. A shared expert
+        that did not tile the routed slot size would leave a partial slot whose
+        tail belongs to neither region -- reachable from both the routed free
+        list and the shared views, which is silent corruption rather than a
+        wasted page.
+        """
+        if self.slot_num_bytes % slot_layout.slot_num_bytes:
+            raise ValueError(
+                f"a {self.slot_num_bytes}-byte region does not tile the {slot_layout.slot_num_bytes}-byte slot "
+                f"({self.slot_num_bytes / slot_layout.slot_num_bytes:.4f} slots); paired reservation needs a "
+                "whole-number ratio"
+            )
+        return self.slot_num_bytes // slot_layout.slot_num_bytes
+
+    def slice_region_views(self, arena: torch.Tensor, byte_offset: int) -> dict[str, torch.Tensor]:
+        """Pre-slice this layout's parameter views at an arbitrary arena offset.
+
+        ``slice_slot_views`` indexes by slot id, which assumes the region *is* a
+        slot. A shared expert spans several, so it is placed by byte offset and
+        keyed by ``param_key`` -- the same keys the provider fills.
+        """
+        if byte_offset % SLOT_REGION_ALIGN_BYTES:
+            raise ValueError(f"region offset {byte_offset} is not {SLOT_REGION_ALIGN_BYTES}-byte aligned")
+        base = arena.narrow(0, byte_offset, self.slot_num_bytes)
+        return {
+            spec.param_key: base.narrow(0, spec.offset_bytes, spec.num_bytes).view(spec.view_shape)
+            for spec in self.specs
+        }
+
     def spec_for(self, param_key: str) -> ExpertTensorSpec:
         for spec in self.specs:
             if spec.param_key == param_key:

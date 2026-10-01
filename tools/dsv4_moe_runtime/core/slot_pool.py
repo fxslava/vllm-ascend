@@ -102,6 +102,8 @@ class StaticExpertSlotPool:
         device: str = "cpu",
         policy: EvictionPolicyProtocol | None = None,
         exchange_buffer: TransitExchangeBuffer | None = None,
+        shared_layout: ExpertTensorLayout | None = None,
+        shared_layers: Sequence[int] = (),
     ):
         if num_slots < config.top_k:
             raise ValueError(f"num_slots {num_slots} must hold a full top-k of {config.top_k}")
@@ -112,8 +114,31 @@ class StaticExpertSlotPool:
         self._policy = policy or GenerationalRadixPolicy(config, num_slots, device=device)
         self._exchange_buffer = exchange_buffer
 
+        # --- Shared-expert reservation, sized before the arena is allocated. ---
+        # A shared expert is not routed: every token at every MoE layer uses it,
+        # so it is reserved rather than admitted. Letting the eviction policy
+        # see it would be strictly wasted work -- it can never be the right
+        # victim, and it would be re-admitted on the very next layer. The
+        # reservation sits *above* the routed slots, so routed ids stay
+        # 0..num_slots-1 and the policy's view of the pool is unchanged.
+        self._shared_layout = shared_layout
+        self._shared_layers = tuple(dict.fromkeys(shared_layers))
+        if self._shared_layout is None:
+            if self._shared_layers:
+                raise ValueError("shared_layers given without a shared_layout to place them with")
+            self._slots_per_shared = 0
+        else:
+            self._slots_per_shared = self._shared_layout.slots_per_region(self._layout)
+            for layer_idx in self._shared_layers:
+                if not 0 <= layer_idx < config.num_layers:
+                    raise ValueError(f"shared layer {layer_idx} outside [0, {config.num_layers})")
+        self._reserved_slots = len(self._shared_layers) * self._slots_per_shared
+        total_slots = num_slots + self._reserved_slots
+
         # --- AOT physical allocation: the only allocating statements in this class. ---
-        self._slot_arena = torch.empty(num_slots * self._layout.slot_num_bytes, dtype=torch.uint8, device=self._device)
+        self._slot_arena = torch.empty(
+            total_slots * self._layout.slot_num_bytes, dtype=torch.uint8, device=self._device
+        )
         self._slot_arena.zero_()
         self._expert_slot_table = torch.full(
             (config.num_layers, config.num_routed_experts),
@@ -137,9 +162,24 @@ class StaticExpertSlotPool:
                 views_by_key[spec.param_key] = source_dict[spec.name]
             self._param_views.append(views_by_key)
 
+        # --- Shared-expert views: one paired region per layer, sliced AOT. ---
+        self._shared_slot_ids: dict[int, tuple[int, ...]] = {}
+        self._shared_views: dict[int, dict[str, torch.Tensor]] = {}
+        self._shared_filled: set[int] = set()
+        for index, layer_idx in enumerate(self._shared_layers):
+            first = num_slots + index * self._slots_per_shared
+            self._shared_slot_ids[layer_idx] = tuple(range(first, first + self._slots_per_shared))
+            assert self._shared_layout is not None  # guarded above
+            self._shared_views[layer_idx] = self._shared_layout.slice_region_views(
+                self._slot_arena, first * self._layout.slot_num_bytes
+            )
+
         # --- Physical residency bookkeeping (no device memory). ---
+        # Lock counts cover the reserved slots too, so a stray unlock of one is
+        # an error rather than an index out of range; the free list does not,
+        # which is what keeps a reserved slot from ever being admitted into.
         self._residents: dict[tuple[int, int], int] = {}
-        self._lock_counts: list[int] = [0] * num_slots
+        self._lock_counts: list[int] = [0] * total_slots
         self._free_slots: list[int] = list(range(num_slots))
         self._current_token = 0
         self.stats = SlotPoolStats()
@@ -189,6 +229,77 @@ class StaticExpertSlotPool:
     def slot_region(self, slot_id: int) -> torch.Tensor:
         """The whole raw ``slot_num_bytes`` region of one slot (transit staging)."""
         return self._slot_arena.narrow(0, slot_id * self._layout.slot_num_bytes, self._layout.slot_num_bytes)
+
+    # ------------------------------------------------------- shared experts
+
+    @property
+    def shared_layout(self) -> ExpertTensorLayout | None:
+        return self._shared_layout
+
+    @property
+    def shared_layers(self) -> tuple[int, ...]:
+        """MoE layers whose shared expert has a reserved slot pair."""
+        return self._shared_layers
+
+    @property
+    def slots_per_shared_expert(self) -> int:
+        """Routed slots one shared expert occupies (2 on DeepSeek-V2-Lite)."""
+        return self._slots_per_shared
+
+    @property
+    def reserved_slot_count(self) -> int:
+        return self._reserved_slots
+
+    @property
+    def total_slot_count(self) -> int:
+        """Routed plus reserved; what the arena is actually sized for."""
+        return self._num_slots + self._reserved_slots
+
+    def shared_slot_ids(self, layer_idx: int) -> tuple[int, ...]:
+        """The consecutive slot ids backing one layer's shared expert."""
+        try:
+            return self._shared_slot_ids[layer_idx]
+        except KeyError:
+            raise KeyError(
+                f"layer {layer_idx} has no shared-expert reservation; reserved layers: {list(self._shared_slot_ids)}"
+            ) from None
+
+    def shared_param_views(self, layer_idx: int) -> Mapping[str, torch.Tensor]:
+        """Pre-sliced shared-expert views, keyed as the provider fills them."""
+        self.shared_slot_ids(layer_idx)  # raises with the helpful message
+        return self._shared_views[layer_idx]
+
+    def shared_region(self, layer_idx: int) -> torch.Tensor:
+        """The whole raw byte region of one layer's shared expert."""
+        first = self.shared_slot_ids(layer_idx)[0]
+        assert self._shared_layout is not None
+        return self._slot_arena.narrow(0, first * self._layout.slot_num_bytes, self._shared_layout.slot_num_bytes)
+
+    def shared_expert_is_resident(self, layer_idx: int) -> bool:
+        return layer_idx in self._shared_filled
+
+    def fill_shared_experts(self, provider: object) -> int:
+        """Stream every reserved layer's shared expert in, once, and report bytes.
+
+        Called at warm-up rather than per step: the reservation is permanent, so
+        the fill is too. Re-filling is allowed (a provider swap) but tracked, so
+        a dispatcher can refuse to compute against a region nothing has written
+        -- zeroed BF16 is a silent wrong answer, not a crash.
+        """
+        if self._shared_layout is None:
+            return 0
+        filler = getattr(provider, "fill_shared_expert", None)
+        if filler is None:
+            raise TypeError(
+                f"{type(provider).__name__} cannot serve shared experts: no fill_shared_expert method. "
+                "Construct the pool without shared_layers, or use a provider that implements it."
+            )
+        staged = 0
+        for layer_idx in self._shared_layers:
+            staged += int(filler(layer_idx, self._shared_views[layer_idx]))
+            self._shared_filled.add(layer_idx)
+        self.stats.bytes_staged += staged
+        return staged
 
     def slot_of(self, layer_idx: int, expert_id: int) -> int:
         """Test/debug accessor (``Tensor.item()``); hot paths read the table on device."""

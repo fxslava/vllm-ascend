@@ -265,3 +265,59 @@ def test_pool_stages_victim_bytes_into_transit_ring(
                 host_slot,
                 spec.param_key,
             )
+
+
+class _StreamOrderRecordingRuntime(CpuRuntime):
+    """A CPU runtime that records whether the copy stream adopted the caller's.
+
+    The hazard is device-only, but the *contract* is not: a loader that issues
+    copies on a side stream without first waiting on the caller's has a race
+    whatever the backend. Asserting the call order here keeps the fix from being
+    quietly dropped on a host with no GPU to reproduce it on.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[str] = []
+        self.has_allocator_accounting = False
+        self.supports_pinned_host_memory = False
+        self.device = "cpu"
+
+    def make_stream(self) -> object:
+        return object()  # a token, so the loader has something to adopt
+
+    def adopt_current_stream(self, stream: object | None) -> None:
+        self.events.append("adopt")
+
+    def synchronize_stream(self, stream: object | None) -> None:
+        self.events.append("sync")
+
+
+def test_the_copy_stream_adopts_the_callers_before_any_transfer(tmp_path) -> None:
+    """Regression: the arena is zeroed on the default stream at construction.
+
+    ``StaticExpertSlotPool.__init__`` zeroes its whole arena, and an H2D copy
+    issued on an unsynchronized side stream races that fill. When the zero won,
+    the destination was left zeroed while ``stream_into`` returned the full byte
+    count -- a wrong answer that reported success. Found by streaming a shared
+    expert immediately after building the pool, where the window is widest.
+    """
+    from ..hardware.weight_loader import MODE_MMAP, StreamingWeightLoader
+
+    payload = bytes(range(256)) * 64
+    path = tmp_path / "shard.bin"
+    path.write_bytes(payload)
+
+    runtime = _StreamOrderRecordingRuntime()
+    loader = StreamingWeightLoader(runtime, str(path), chunk_bytes=8192, num_chunks=2, io_mode=MODE_MMAP, pinned=False)
+    destination = torch.zeros(len(payload), dtype=torch.uint8)
+    try:
+        moved = loader.stream_into(destination, 0, len(payload))
+    finally:
+        loader.close()
+
+    assert moved == len(payload)
+    assert bytes(destination.numpy()) == payload
+    # The adoption must come first; a sync afterwards is what publishes it.
+    assert runtime.events, "the loader never touched its stream"
+    assert runtime.events[0] == "adopt", runtime.events
+    assert runtime.events[-1] == "sync", runtime.events

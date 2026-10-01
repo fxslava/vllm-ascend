@@ -61,18 +61,34 @@ class ExpertNamingScheme:
     projections: Mapping[str, str]  # layout spec name -> checkpoint projection name
     weight_suffix: str
     scale_suffix: str
+    #: Shared experts are addressed by layer alone -- there is one fused module
+    #: per layer, not one per expert id -- so they need their own template.
+    #: ``None`` means this checkpoint family has no shared experts to name.
+    shared_template: str | None = None
 
-    def tensor_name(self, layer_idx: int, expert_id: int, spec: ExpertTensorSpec) -> str:
+    def _projection(self, spec: ExpertTensorSpec) -> str:
         try:
-            projection = self.projections[spec.name]
+            return self.projections[spec.name]
         except KeyError:
             raise WeightLayoutMismatchError(
                 f"naming scheme {self.name!r} has no projection for layout tensor {spec.name!r}"
             ) from None
+
+    def tensor_name(self, layer_idx: int, expert_id: int, spec: ExpertTensorSpec) -> str:
         return self.template.format(
             layer=layer_idx,
             expert=expert_id,
-            projection=projection,
+            projection=self._projection(spec),
+            suffix=self.scale_suffix if spec.is_scale else self.weight_suffix,
+        )
+
+    def shared_tensor_name(self, layer_idx: int, spec: ExpertTensorSpec) -> str:
+        """Name of one projection of ``layer_idx``'s shared-expert module."""
+        if self.shared_template is None:
+            raise WeightLayoutMismatchError(f"naming scheme {self.name!r} does not name shared experts")
+        return self.shared_template.format(
+            layer=layer_idx,
+            projection=self._projection(spec),
             suffix=self.scale_suffix if spec.is_scale else self.weight_suffix,
         )
 
@@ -92,6 +108,7 @@ HF_DEEPSEEK_NAMING = ExpertNamingScheme(
     projections={"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"},
     weight_suffix="weight",
     scale_suffix="weight_scale_inv",
+    shared_template="model.layers.{layer}.mlp.shared_experts.{projection}.{suffix}",
 )
 NAMING_SCHEMES: dict[str, ExpertNamingScheme] = {
     DSV4_FLAT_NAMING.name: DSV4_FLAT_NAMING,

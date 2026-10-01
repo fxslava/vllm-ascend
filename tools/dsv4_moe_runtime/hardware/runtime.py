@@ -45,6 +45,16 @@ class DeviceRuntime(Protocol):
 
     def synchronize_stream(self, stream: object | None) -> None: ...
 
+    def adopt_current_stream(self, stream: object | None) -> None:
+        """Make ``stream`` wait for whatever is already queued on the caller's stream.
+
+        A copy stream that never waits is only safe if nothing on the default
+        stream touches the same memory -- and something does: the slot arena is
+        zeroed at construction, on the default stream. Issuing an H2D copy on an
+        unsynchronized side stream races that fill, and the losing order leaves
+        the destination zeroed with every byte count reporting success.
+        """
+
     def release_cache(self) -> None:
         """Best-effort release of cached allocator blocks (used after OOM)."""
 
@@ -93,6 +103,10 @@ class NpuRuntime:
     def synchronize_stream(self, stream: object | None) -> None:
         if stream is not None:
             stream.synchronize()
+
+    def adopt_current_stream(self, stream: object | None) -> None:
+        if stream is not None:
+            stream.wait_stream(torch.npu.current_stream(self.device))
 
     def release_cache(self) -> None:
         torch.npu.empty_cache()
@@ -161,6 +175,10 @@ class CudaRuntime:
         if stream is not None:
             stream.synchronize()
 
+    def adopt_current_stream(self, stream: object | None) -> None:
+        if stream is not None:
+            stream.wait_stream(torch.cuda.current_stream(self.device))
+
     def release_cache(self) -> None:
         torch.cuda.empty_cache()
 
@@ -204,6 +222,9 @@ class CpuRuntime:
         return nullcontext()
 
     def synchronize_stream(self, stream: object | None) -> None:
+        pass
+
+    def adopt_current_stream(self, stream: object | None) -> None:
         pass
 
     def release_cache(self) -> None:

@@ -385,6 +385,13 @@ class StreamingWeightLoader:
         # stream the ring wrap and the final sync wait on. Issuing them on the
         # caller's current stream instead would leave a chunk free to be
         # overwritten by the next host read while its H2D DMA is still running.
+        #
+        # The side stream first adopts the caller's: work already queued there
+        # may touch this destination, and the slot arena's construction-time
+        # zero_() does. Without this the copy races that fill, and when the
+        # zero wins the destination is left zeroed with every byte count
+        # reporting success -- a silent wrong answer rather than an error.
+        self._runtime.adopt_current_stream(self._stream)
         with self._runtime.stream_context(self._stream):
             while moved < num_bytes:
                 remaining = num_bytes - moved
