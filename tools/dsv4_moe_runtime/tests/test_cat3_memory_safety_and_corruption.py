@@ -10,6 +10,7 @@ level.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 
@@ -214,3 +215,76 @@ def test_draft_engine_zero_allocation_50_steps(
 
     assert report.layer_misses >= 0
     assert engine.arena_fingerprint() == fingerprint
+
+
+def test_the_descriptor_read_path_works_without_preadv(tmp_path) -> None:
+    """The mmap fallback must stream on every platform, not just POSIX ones.
+
+    ``os.preadv`` does not exist on Windows, and the descriptor path is what the
+    documented *degrade to mmap, never to dynamic allocation* fallback runs on.
+    While it rested on ``preadv`` the fallback raised ``AttributeError`` the
+    moment a filesystem refused unbuffered IO -- the one case it exists for.
+    """
+    from ..hardware.weight_loader import IO_ALIGNMENT, MODE_MMAP, _RawFileReader
+
+    payload = bytes(range(256)) * (4 * IO_ALIGNMENT // 256)
+    path = tmp_path / "shard.bin"
+    path.write_bytes(payload)
+    reader = _RawFileReader(str(path), MODE_MMAP)  # descriptor branch, no Windows HANDLE
+    chunk = torch.empty(2 * IO_ALIGNMENT, dtype=torch.uint8)
+    try:
+        reader.read_into(chunk, IO_ALIGNMENT, IO_ALIGNMENT)
+        got = bytes(chunk[:IO_ALIGNMENT].numpy())
+        assert got == payload[IO_ALIGNMENT : 2 * IO_ALIGNMENT]
+
+        reader.read_tail_into(chunk, 7, 1234)  # sub-sector tail, buffered
+        assert bytes(chunk[:1234].numpy()) == payload[7 : 7 + 1234]
+
+        # The tail opens its own byte source, and on Windows that is a HANDLE,
+        # so the descriptor tail branch needs the fd supplied to be reached.
+        reader._tail_handle = None
+        reader._tail_fd = os.open(str(path), os.O_RDONLY)
+        reader.read_tail_into(chunk, 11, 999)
+        assert bytes(chunk[:999].numpy()) == payload[11 : 11 + 999]
+    finally:
+        reader.close()
+
+
+@pytest.mark.parametrize(
+    ("call", "message", "via_descriptor_tail"),
+    [
+        (lambda r, c: r.read_into(c, 0, 4096), "positional read short", False),
+        (lambda r, c: r.read_tail_into(c, 0, 3000), "tail positional read short", True),
+    ],
+)
+def test_a_short_positional_read_is_refused(tmp_path, monkeypatch, call, message, via_descriptor_tail) -> None:
+    """A read that returns short must raise, not leave the last expert's bytes behind.
+
+    Nothing downstream notices otherwise. The chunk is recycled across fills, so
+    a span only partly read hands the pool an expert whose tail is whatever the
+    previous one left there -- plausible BF16, finite, and wrong. The Windows
+    ``ReadFile`` branch has always checked its transfer count; this holds the
+    descriptor branch to the same contract on both platforms.
+    """
+    from ..hardware.weight_loader import MODE_MMAP, _RawFileReader
+
+    path = tmp_path / "shard.bin"
+    path.write_bytes(bytes([0xAB]) * 8192)
+    reader = _RawFileReader(str(path), MODE_MMAP)
+    chunk = torch.empty(8192, dtype=torch.uint8)
+    if via_descriptor_tail:
+        reader._tail_handle = None
+        reader._tail_fd = os.open(str(path), os.O_RDONLY)
+    try:
+        call(reader, chunk)  # the honest read succeeds
+
+        real_read_at = type(reader)._read_at
+        monkeypatch.setattr(
+            type(reader),
+            "_read_at",
+            lambda self, fd, view, offset: real_read_at(self, fd, view[: len(view) // 2], offset),
+        )
+        with pytest.raises(OSError, match=message):
+            call(reader, chunk)
+    finally:
+        reader.close()

@@ -9,20 +9,30 @@ bytes through a *fixed* pool of pinned host chunks into device (HBM) views:
   chunk's ``data_ptr``. Both require 4096-byte-aligned file offsets, transfer
   lengths and chunk base addresses.
 * **Mmap backend** -- portable ``mmap`` windows aligned to the allocation
-  granularity; the copy still lands in pinned chunks.
+  granularity; the copy still lands in pinned chunks. Its positional reads go
+  through ``_read_at``, which uses ``os.preadv`` where it exists and
+  ``io.FileIO.readinto`` where it does not -- Windows has no ``preadv`` at all,
+  and this is the backend the degrade-on-probe-failure path runs on.
+
+Upstream safetensors exporters align tensor spans to 8 bytes, so in practice
+*no* span begins on a 4096-byte sector: every unbuffered read is widened down
+to the enclosing sector and the valid bytes are sliced out of the chunk. A read
+that comes back short is an error rather than a partial fill, because the bytes
+it did not write are whatever the recycled chunk last held.
 
 Allocation contract: the chunk pool is allocated once in ``__init__``
 (optionally supplied from outside -- e.g. ``AscendPinnedHostStorage`` or
 ``ExchangeBuffer`` pages -- provided every chunk base is 4096-aligned for the
 unbuffered backend). ``stream_into`` performs only positional reads into
 chunk memory and in-place ``copy_`` into the destination view; no tensor is
-created after construction. A mis-probed backend degrades to mmap, never to
-dynamic allocation.
+created after construction. A backend that fails its probe degrades to mmap,
+never to dynamic allocation.
 """
 
 from __future__ import annotations
 
 import ctypes
+import io
 import mmap
 import os
 import platform
@@ -41,6 +51,9 @@ DEFAULT_EXPERT_CHUNKS = 4
 MODE_AUTO = "auto"
 MODE_UNBUFFERED = "unbuffered"
 MODE_MMAP = "mmap"
+
+#: ``os.preadv`` is POSIX-only; Windows has no positional-read syscall binding.
+_HAS_PREADV = hasattr(os, "preadv")
 
 _WIN32_GENERIC_READ = 0x80000000
 _WIN32_SHARE_READ = 1
@@ -91,6 +104,7 @@ class _RawFileReader:
         self._tail_fd: int | None = None
         self._tail_handle: int | None = None
         self._kernel32_tail = None
+        self._seek_streams: dict[int, io.FileIO] = {}
         self._size = os.path.getsize(path)
         self._open()
 
@@ -122,6 +136,39 @@ class _RawFileReader:
         else:
             self._fd = os.open(self._path, os.O_RDONLY)
 
+    def _read_at(self, fd: int, view: memoryview, offset: int) -> int:
+        """Fill ``view`` from ``offset``, allocating nothing, and report the count.
+
+        ``os.preadv`` is POSIX-only -- it does not exist on Windows at all -- so
+        the descriptor path cannot rest on it. That matters beyond tidiness: the
+        Windows ``FILE_FLAG_NO_BUFFERING`` handle is a separate branch, and this
+        one is what the documented *degrade to mmap, never to dynamic
+        allocation* fallback runs on. Without a portable implementation the
+        fallback raised ``AttributeError`` on Windows the moment a filesystem
+        refused unbuffered IO, which is the one situation it exists to cover.
+
+        ``readinto`` over an ``io.FileIO`` wrapper is the portable equivalent and
+        writes straight into the chunk. The loop is there because both backends
+        may return short; the caller still checks the total against what the
+        file can supply, because a short read leaves the rest of the chunk
+        holding the *previous* expert's bytes.
+        """
+        if _HAS_PREADV:
+            return os.preadv(fd, [view], offset)
+        stream = self._seek_streams.get(fd)
+        if stream is None:
+            # closefd=False: the descriptor's owner is close(), not this wrapper.
+            stream = io.FileIO(fd, mode="rb", closefd=False)
+            self._seek_streams[fd] = stream
+        stream.seek(offset)
+        total = 0
+        while total < len(view):
+            got = stream.readinto(view[total:])
+            if not got:
+                break
+            total += got
+        return total
+
     def read_into(self, chunk: torch.Tensor, aligned_offset: int, aligned_length: int) -> None:
         """Aligned positional read filling ``chunk[:aligned_length]``.
 
@@ -145,7 +192,10 @@ class _RawFileReader:
                 raise OSError(f"ReadFile short read at {aligned_offset}: {read.value}/{expected}")
         elif self._fd is not None:
             view = memoryview(chunk.numpy())[:aligned_length]
-            os.preadv(self._fd, [view], aligned_offset)
+            read = self._read_at(self._fd, view, aligned_offset)
+            expected = min(aligned_length, max(self._size - aligned_offset, 0))
+            if read < expected:
+                raise OSError(f"positional read short at {aligned_offset}: {read}/{expected}")
 
     def _mapping_fd(self) -> int:
         """Descriptor usable for ``mmap``.
@@ -213,9 +263,14 @@ class _RawFileReader:
                 raise OSError(f"tail ReadFile short at {file_offset}: {read.value}/{num_bytes}")
         else:
             view = memoryview(chunk.numpy())[:num_bytes]
-            os.preadv(self._tail_fd, [view], file_offset)
+            read = self._read_at(self._tail_fd, view, file_offset)
+            if read != num_bytes:
+                raise OSError(f"tail positional read short at {file_offset}: {read}/{num_bytes}")
 
     def close(self) -> None:
+        for stream in self._seek_streams.values():
+            stream.close()  # closefd=False, so the descriptor itself survives to below
+        self._seek_streams.clear()
         if self._win_handle is not None:
             self._kernel32.CloseHandle(ctypes.c_void_p(self._win_handle))
             self._win_handle = None
