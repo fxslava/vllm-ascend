@@ -109,7 +109,10 @@ def benchmark(directory, slots, tokens, tokenizer, new_tokens):
             for loader in disk._loaders.values()
         )
         result = {
-            "slots": slots,
+            "slots": decoder.pool.num_slots,
+            "expert_precision": decoder.audit["expert_precision"],
+            "slot_bytes": decoder.pool.layout.slot_num_bytes,
+            "transfer_chunk_bytes": provider.chunk_bytes,
             "host_slots": provider.host_slots,
             "host_bytes": provider.host_bytes,
             "host_pinned": all(block.is_pinned() for block in provider.host_arenas),
@@ -150,6 +153,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--weights-dir", type=Path, default=Path("F:/AI/models/DeepSeek-V2-Lite-Chat"))
     parser.add_argument("--slots", type=int, nargs="+", default=[64, 156])
+    parser.add_argument("--auto-slots", action="store_true")
     parser.add_argument("--prompt", default="Hello")
     parser.add_argument("--new-tokens", type=int, default=8)
     parser.add_argument("--report", type=Path, required=True)
@@ -167,7 +171,7 @@ def main():
         "prompt_ids": tokens,
         "timing": "CUDA event durations for PCIe directions; synchronized wall time for swap service",
     }
-    for slots in args.slots:
+    for slots in [None] if args.auto_slots else args.slots:
         print(f"Bootstrapping all 1664 experts with {slots} VRAM slots...", flush=True)
         report["configurations"].append(benchmark(args.weights_dir, slots, tokens, tokenizer, args.new_tokens))
         args.report.write_text(json.dumps(report, indent=2) + "\n")

@@ -37,7 +37,7 @@ from pathlib import Path
 
 import torch
 
-from ..core.layout import DENSE_BF16_KIND, ExpertTensorLayout, ExpertTensorSpec
+from ..core.layout import DENSE_BF16_KIND, FP8_KIND, FP32_SCALE_KIND, ExpertTensorLayout, ExpertTensorSpec
 from ..core.profiles import NAMING_HF_DEEPSEEK
 from .runtime import DeviceRuntime
 from .safetensors_provider import (
@@ -170,7 +170,7 @@ def bind_sharded_expert_spans(
                     _validate_dtype_and_shape(spec, name, span)
                 params[spec.param_key] = span
                 total += span.num_bytes
-            if total != layout.slot_num_bytes:
+            if total != sum(spec.num_bytes for spec in layout.specs):
                 raise WeightLayoutMismatchError(
                     f"layer {layer_idx} expert {expert_id} ({scheme.name}): spans total {total} bytes, "
                     f"slot layout is {layout.slot_num_bytes}"
@@ -180,6 +180,9 @@ def bind_sharded_expert_spans(
 
 
 def _validate_dtype_and_shape(spec: ExpertTensorSpec, name: str, span: TensorSpan) -> None:
+    required = {FP8_KIND: "F8_E4M3", FP32_SCALE_KIND: "F32"}
+    if spec.kind in required and span.dtype != required[spec.kind]:
+        raise WeightLayoutMismatchError(f"{name}: expected {required[spec.kind]}, got {span.dtype}")
     if spec.kind == DENSE_BF16_KIND and span.dtype not in BF16_HEADER_DTYPES:
         raise WeightLayoutMismatchError(
             f"{name}: checkpoint dtype {span.dtype!r} is not BF16, but the slot layout is dense BF16"

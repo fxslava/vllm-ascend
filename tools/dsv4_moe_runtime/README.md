@@ -145,6 +145,25 @@ RTX 5070 results.
 python -m tools.dsv4_moe_runtime.inference.dsv2_lite --weights-dir F:/AI/models/DeepSeek-V2-Lite-Chat --device cuda:0 --slots 64 --max-new-tokens 8 --report generation.json
 ```
 
+## Routed FP8 checkpoint
+
+The V2-Lite CUDA decoder detects the harness FP8 manifest and executes
+routed experts through native FP8 Tensor Core GEMMs with FP32 accumulation.
+Backbone and shared experts remain BF16. Expert slots include FP32 scales,
+128-byte region alignment and a 512-byte stride. The disk-free exclusive
+partition and persistent chat cache also apply to FP8.
+
+```powershell
+python -m tools.dsv4_moe_runtime.quantize_fp8 --source F:/AI/models/DeepSeek-V2-Lite-Chat --output F:/AI/models/DeepSeek-V2-Lite-Chat-FP8
+python -m tools.dsv4_moe_runtime.chat --weights-dir F:/AI/models/DeepSeek-V2-Lite-Chat-FP8 --auto-slots
+```
+
+Conversion requires an empty output directory; use `--resume` to validate
+completed shards after an interruption. The output is a harness-specific
+format and retains the source config verbatim. See the
+[FP8 report](benchmarks/FP8_REPORT.md) for measured 971-slot capacity,
+100% warm hits on the repeated test prompt, and quality/capacity limits.
+
 ## Runtime tests
 
 For persistent-pool cold/warm generation measurements, activation footprints

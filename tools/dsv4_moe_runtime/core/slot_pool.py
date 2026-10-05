@@ -42,7 +42,7 @@ import torch
 
 from ..core.config import DeepSeekV4MoEConfig
 from ..core.generational_policy import GenerationalRadixPolicy
-from ..core.layout import ExpertTensorLayout
+from ..core.layout import FP8_KIND, ExpertTensorLayout
 from ..hardware.exchange_buffer import TransitExchangeBuffer
 from ..protocols.provider import ExclusiveSwapProviderProtocol, SlotFillProviderProtocol, WeightProviderProtocol
 from ..protocols.residency_policy import AdmissionDecision, EvictionPolicyProtocol
@@ -128,7 +128,12 @@ class StaticExpertSlotPool:
                 raise ValueError("shared_layers given without a shared_layout to place them with")
             self._slots_per_shared = 0
         else:
-            self._slots_per_shared = self._shared_layout.slots_per_region(self._layout)
+            if any(spec.kind == FP8_KIND for spec in self._layout.specs):
+                self._slots_per_shared = (
+                    self._shared_layout.slot_num_bytes + self._layout.slot_num_bytes - 1
+                ) // self._layout.slot_num_bytes
+            else:
+                self._slots_per_shared = self._shared_layout.slots_per_region(self._layout)
             for layer_idx in self._shared_layers:
                 if not 0 <= layer_idx < config.num_layers:
                     raise ValueError(f"shared layer {layer_idx} outside [0, {config.num_layers})")

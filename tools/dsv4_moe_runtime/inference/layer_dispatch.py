@@ -47,12 +47,13 @@ from dataclasses import dataclass
 import torch
 
 from ..core.config import DeepSeekV4MoEConfig
-from ..core.layout import ExpertTensorLayout
+from ..core.layout import FP8_KIND, ExpertTensorLayout
 from ..core.slot_pool import StaticExpertSlotPool
 from ..protocols.provider import WeightProviderProtocol
 
 #: The activation dtype a dense BF16 checkpoint's slots reinterpret to.
 COMPUTE_DTYPE = torch.bfloat16
+FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
 
 __all__ = ["MoELayerScratch", "MoELayerResult", "execute_moe_layer", "swiglu_into"]
 
@@ -127,6 +128,19 @@ class MoELayerScratch:
         self.shared_up = None if shared_inter is None else buffer(num_tokens, shared_inter)
         self.shared_out = buffer(num_tokens, hidden)
         self.y = buffer(num_tokens, hidden)
+        self.fp8_enabled = routed_layout.spec_for("w1").kind == FP8_KIND
+        if self.fp8_enabled:
+            if self._device.type != "cuda":
+                raise ValueError("native FP8 scratch requires CUDA")
+            self.fp8_input = buffer(num_tokens, hidden, buffer_dtype=torch.float8_e4m3fn)
+            self.fp8_down_input = buffer(num_tokens, routed_inter, buffer_dtype=torch.float8_e4m3fn)
+            self.fp8_input_scale = buffer(1, 1, buffer_dtype=torch.float32)
+            self.fp8_down_scale = buffer(1, 1, buffer_dtype=torch.float32)
+            self.fp8_work = buffer(num_tokens, hidden, buffer_dtype=torch.float32)
+            self.fp8_down_work = buffer(num_tokens, routed_inter, buffer_dtype=torch.float32)
+            self.fp8_gate_out = buffer(num_tokens, routed_inter, buffer_dtype=torch.float32)
+            self.fp8_up_out = buffer(num_tokens, routed_inter, buffer_dtype=torch.float32)
+            self.fp8_down_out = buffer(num_tokens, hidden, buffer_dtype=torch.float32)
 
     @property
     def device(self) -> torch.device:
@@ -175,6 +189,43 @@ def swiglu_into(
     torch.nn.functional.silu(gate_buffer, inplace=True)
     gate_buffer.mul_(up_buffer)
     return torch.mm(gate_buffer, down_weight.t(), out=out)
+
+
+def quantize_activation_into(x, output, work, scale):
+    """Dynamic tensorwise FP8 activation conversion without a host sync."""
+    work.copy_(x)
+    torch.abs(work, out=work)
+    torch.amax(work, dim=(0, 1), keepdim=True, out=scale)
+    scale.div_(FP8_MAX).clamp_(min=torch.finfo(torch.float32).tiny)
+    work.copy_(x).div_(scale).clamp_(-FP8_MAX, FP8_MAX)
+    output.copy_(work)
+
+
+def fp8_swiglu_into(x, views, scratch):
+    """Native FP8 Tensor Core GEMMs with FP32 accumulation and BF16 SwiGLU."""
+    quantize_activation_into(x, scratch.fp8_input, scratch.fp8_work, scratch.fp8_input_scale)
+
+    def gemm(activation, scale, name, output):
+        torch.ops.aten._scaled_mm.out(
+            activation,
+            views[name].view(torch.float8_e4m3fn).t(),
+            scale,
+            views[name + "_scale"].view(torch.float32),
+            out_dtype=torch.float32,
+            use_fast_accum=False,
+            out=output,
+        )
+
+    gemm(scratch.fp8_input, scratch.fp8_input_scale, "w1", scratch.fp8_gate_out)
+    gemm(scratch.fp8_input, scratch.fp8_input_scale, "w3", scratch.fp8_up_out)
+    scratch.routed_gate.copy_(scratch.fp8_gate_out)
+    scratch.routed_up.copy_(scratch.fp8_up_out)
+    torch.nn.functional.silu(scratch.routed_gate, inplace=True)
+    scratch.routed_gate.mul_(scratch.routed_up)
+    quantize_activation_into(scratch.routed_gate, scratch.fp8_down_input, scratch.fp8_down_work, scratch.fp8_down_scale)
+    gemm(scratch.fp8_down_input, scratch.fp8_down_scale, "w2", scratch.fp8_down_out)
+    scratch.routed_out.copy_(scratch.fp8_down_out)
+    return scratch.routed_out
 
 
 def execute_moe_layer(
@@ -265,15 +316,18 @@ def execute_moe_layer(
         # --- 4. Routed experts, scaled by their router weights.
         for position, slot_id in enumerate(reservation.slot_ids):
             views = pool.param_views(slot_id)
-            swiglu_into(
-                x,
-                _as_weight(views["w1"], routed_layout.spec_for("w1").logical_shape, scratch.dtype),
-                _as_weight(views["w3"], routed_layout.spec_for("w3").logical_shape, scratch.dtype),
-                _as_weight(views["w2"], routed_layout.spec_for("w2").logical_shape, scratch.dtype),
-                scratch.routed_gate,
-                scratch.routed_up,
-                scratch.routed_out,
-            )
+            if scratch.fp8_enabled:
+                fp8_swiglu_into(x, views, scratch)
+            else:
+                swiglu_into(
+                    x,
+                    _as_weight(views["w1"], routed_layout.spec_for("w1").logical_shape, scratch.dtype),
+                    _as_weight(views["w3"], routed_layout.spec_for("w3").logical_shape, scratch.dtype),
+                    _as_weight(views["w2"], routed_layout.spec_for("w2").logical_shape, scratch.dtype),
+                    scratch.routed_gate,
+                    scratch.routed_up,
+                    scratch.routed_out,
+                )
             # Kept on device: reading the weight to the host would add a sync
             # per expert on top of the one the routing already costs.
             # norm_topk_prob is false for this architecture, so the raw

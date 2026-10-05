@@ -98,20 +98,29 @@ def audit_checkpoint(directory: Path) -> tuple[dict, SafetensorsShardIndex, dict
     config = json.loads((directory / "config.json").read_text())
     shapes = expected_shapes(config)
     index = SafetensorsShardIndex.from_directory(directory)
-    if set(index.tensor_names) != set(shapes):
+    fp8 = (directory / "runtime_fp8.json").exists()
+    scales = {name + "_scale_inv" for name in shapes if ".experts." in name} if fp8 else set()
+    if set(index.tensor_names) != set(shapes) | scales:
         raise ValueError("checkpoint keys differ from the complete V2-Lite schema")
     for name, shape in shapes.items():
         span = index.span(name)
-        if span.shape != shape or span.dtype != "BF16" or span.num_bytes != math.prod(shape) * 2:
+        quantized = fp8 and ".experts." in name
+        dtype, size = ("F8_E4M3", 1) if quantized else ("BF16", 2)
+        if span.shape != shape or span.dtype != dtype or span.num_bytes != math.prod(shape) * size:
             raise ValueError(f"invalid tensor {name}: {span}")
-    routed = sum(index.span(name).num_bytes for name in shapes if ".experts." in name)
+    for name in scales:
+        span = index.span(name)
+        if span.dtype != "F32" or span.shape != (1, 1) or span.num_bytes != 4:
+            raise ValueError(f"invalid FP8 scale: {name}")
+    routed = sum(index.span(name).num_bytes for name in index.tensor_names if ".experts." in name)
     shared = sum(index.span(name).num_bytes for name in shapes if ".shared_experts." in name)
     return (
         config,
         index,
         {
             "tensors": len(shapes),
-            "parameters": index.total_bytes // 2,
+            "parameters": sum(math.prod(shape) for shape in shapes.values()),
+            "expert_precision": "fp8" if fp8 else "bf16",
             "checkpoint_bytes": index.total_bytes,
             "routed_bytes": routed,
             "shared_bytes": shared,
@@ -173,10 +182,20 @@ class V2LiteDecoder:
         self.capacity = capacity
         self.position = 0
         self.completed_tokens = 0
-        layout = ExpertTensorLayout.for_dense_bf16(DSV2_LITE_GEOMETRY)
+        fp8 = self.audit["expert_precision"] == "fp8"
+        if fp8 and not device.startswith("cuda"):
+            raise ValueError("native FP8 execution requires CUDA")
+        layout = (
+            ExpertTensorLayout.for_fp8(DSV2_LITE_GEOMETRY)
+            if fp8
+            else ExpertTensorLayout.for_dense_bf16(DSV2_LITE_GEOMETRY)
+        )
         shared = ExpertTensorLayout.for_shared_expert(DSV2_LITE_GEOMETRY, 2)
         kv_bytes = 27 * 16 * capacity * (192 + 128) * 2
-        fixed = self.audit["backbone_bytes"] + self.audit["shared_bytes"] + kv_bytes
+        shared_region = (
+            (shared.slot_num_bytes + layout.slot_num_bytes - 1) // layout.slot_num_bytes * layout.slot_num_bytes
+        )
+        fixed = self.audit["backbone_bytes"] + 26 * shared_region + kv_bytes
         free = self.runtime.device_free_memory()
         reserve = 512 * 1024**2
         total_experts = (self.config["num_hidden_layers"] - self.config["first_k_dense_replace"]) * self.config[
@@ -216,7 +235,12 @@ class V2LiteDecoder:
             disk_source = self.source
             try:
                 self.source = ExclusiveExpertPartition(
-                    self.runtime, layout, self.pool, sorted(disk_source.expert_spans), disk_source
+                    self.runtime,
+                    layout,
+                    self.pool,
+                    sorted(disk_source.expert_spans),
+                    disk_source,
+                    chunk_bytes=2 * 1024**2 if fp8 else 4 * 1024**2,
                 )
             except Exception:
                 disk_source.close()

@@ -2,13 +2,15 @@
 
 Memory invariant: every tensor region inside a slot starts at a 128-byte
 aligned offset and ``ExpertTensorLayout.slot_num_bytes`` is the aligned total.
-Two storage families are supported, one ``kind`` per region:
+Three storage families are supported, one ``kind`` per region:
 
 * **block-32 FP4 + E8M0 scales** -- the production DeepSeek-V4 Flash geometry
   (13,369,344 bytes = 12.75 MiB per slot at hidden 4096 / intermediate 2048);
 * **dense BF16** -- unquantized checkpoints such as DeepSeek-V2-Lite
   (17,301,504 bytes = 16.50 MiB per slot at hidden 2048 / intermediate 1408),
   where an expert owns three projections and no scale regions at all.
+* **FP8 E4M3FN + FP32 tensor scales** -- routed V2-Lite projections
+  (8,651,264 bytes per slot, including aligned scale regions and padding).
 
 Slot views are always ``uint8`` byte windows; ``ExpertTensorSpec.view_shape``
 is that byte shape and ``logical_shape`` is the element shape a compute layer
@@ -33,9 +35,11 @@ SLOT_REGION_ALIGN_BYTES = 128
 PACKED_FP4_KIND = "packed_fp4"
 E8M0_SCALE_KIND = "e8m0_scale"
 DENSE_BF16_KIND = "dense_bf16"
+FP8_KIND = "fp8_e4m3fn"
+FP32_SCALE_KIND = "fp32_scale"
 FP4_BLOCK32_KINDS: tuple[str, ...] = (PACKED_FP4_KIND, E8M0_SCALE_KIND)
 DENSE_BF16_KINDS: tuple[str, ...] = (DENSE_BF16_KIND,)
-KNOWN_TENSOR_KINDS: tuple[str, ...] = (PACKED_FP4_KIND, E8M0_SCALE_KIND, DENSE_BF16_KIND)
+KNOWN_TENSOR_KINDS: tuple[str, ...] = (PACKED_FP4_KIND, E8M0_SCALE_KIND, DENSE_BF16_KIND, FP8_KIND, FP32_SCALE_KIND)
 
 
 @dataclass(frozen=True)
@@ -67,6 +71,10 @@ class ExpertTensorSpec:
             return self.cols // FP4_BLOCK_SIZE * E8M0_SCALE_NUM_BYTES
         if self.kind == DENSE_BF16_KIND:
             return self.cols * BF16_NUM_BYTES
+        if self.kind == FP8_KIND:
+            return self.cols
+        if self.kind == FP32_SCALE_KIND:
+            return self.cols * 4
         raise ValueError(f"unknown tensor kind: {self.kind}")
 
     @property
@@ -81,14 +89,14 @@ class ExpertTensorSpec:
     @property
     def logical_shape(self) -> tuple[int, int]:
         """Element shape after ``Tensor.view(dtype)`` at compute bind time."""
-        if self.kind == DENSE_BF16_KIND:
+        if self.kind in (DENSE_BF16_KIND, FP8_KIND, FP32_SCALE_KIND):
             return (self.rows, self.cols)
         return self.view_shape  # FP4 nibble pairs and E8M0 bytes stay byte-shaped
 
     @property
     def is_scale(self) -> bool:
         """Whether the region holds block scales rather than weight storage."""
-        return self.kind == E8M0_SCALE_KIND
+        return self.kind in (E8M0_SCALE_KIND, FP32_SCALE_KIND)
 
     @property
     def param_key(self) -> str:
@@ -150,6 +158,20 @@ class ExpertTensorLayout:
     def for_dense_bf16(cls, config: DeepSeekV4MoEConfig) -> ExpertTensorLayout:
         """Unquantized BF16 expert slot (DeepSeek-V2-Lite and friends)."""
         return cls.for_expert_geometry(config.hidden_size, config.moe_intermediate_size, DENSE_BF16_KINDS)
+
+    @classmethod
+    def for_fp8(cls, config: DeepSeekV4MoEConfig) -> ExpertTensorLayout:
+        """E4M3FN projections and scalar FP32 decoding scales, 512-byte slots."""
+        dense = cls.for_dense_bf16(config)
+        specs = []
+        cursor = 0
+        for weight in dense.specs:
+            spec = ExpertTensorSpec(weight.name, FP8_KIND, weight.rows, weight.cols, _align_up(cursor))
+            specs.append(spec)
+            scale = ExpertTensorSpec(weight.name, FP32_SCALE_KIND, 1, 1, _align_up(spec.offset_bytes + spec.num_bytes))
+            specs.append(scale)
+            cursor = scale.offset_bytes + scale.num_bytes
+        return cls(tuple(specs), _align_up(cursor, 512))
 
     @classmethod
     def for_shared_expert(
