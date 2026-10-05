@@ -96,8 +96,7 @@ TEST_P(RmsNorm950PrTest, MatchesCpuReference) {
 
   DeterministicRandom random(0x5157454eu);
 
-  const std::vector<float> x =
-      random.NormalHalfExact(static_cast<size_t>(num_tokens() * hidden()), 0.0f, 1.0f);
+  const std::vector<float> x = random.NormalHalfExact(static_cast<size_t>(num_tokens() * hidden()), 0.0f, 1.0f);
   const std::vector<float> gamma = random.NormalHalfExact(static_cast<size_t>(hidden()), 1.0f, 0.1f);
 
   const RmsNormResult actual = RunRmsNormOnDevice(x, gamma, num_tokens(), hidden(), s::kRmsNormEps);
@@ -116,8 +115,7 @@ TEST_P(RmsNorm950PrTest, IsInvariantToRowScaling) {
 
   DeterministicRandom random(0x524d534eu);
 
-  const std::vector<float> x =
-      random.NormalHalfExact(static_cast<size_t>(num_tokens() * hidden()), 0.0f, 1.0f);
+  const std::vector<float> x = random.NormalHalfExact(static_cast<size_t>(num_tokens() * hidden()), 0.0f, 1.0f);
   const std::vector<float> gamma(static_cast<size_t>(hidden()), 1.0f);
 
   std::vector<float> scaled(x.size());
@@ -160,6 +158,6 @@ INSTANTIATE_TEST_SUITE_P(Qwen35, RmsNorm950PrTest,
                                             ::testing::ValuesIn(s::RmsNormHiddenSizes())),
                          RmsNormTestName);
 
-}
-}
-}
+}  // namespace
+}  // namespace test
+}  // namespace vllm_ascend

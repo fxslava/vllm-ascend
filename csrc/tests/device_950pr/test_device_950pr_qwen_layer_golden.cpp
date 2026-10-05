@@ -84,8 +84,7 @@ const AclnnOp& InplaceAddOp() {
 }
 
 void Project(const DeviceTensor& a, const DeviceTensor& w_view, const DeviceTensor& out, aclrtStream stream) {
-  RunAclnn<ops::MatmulWorkspaceFn>(MatmulOp(), stream, a.get(), w_view.get(), out.get(),
-                                   ops::kCubeMathTypeKeepDtype);
+  RunAclnn<ops::MatmulWorkspaceFn>(MatmulOp(), stream, a.get(), w_view.get(), out.get(), ops::kCubeMathTypeKeepDtype);
 }
 
 void ResidualAdd(const DeviceTensor& x_ref, const DeviceTensor& y, aclrtStream stream) {
@@ -107,8 +106,8 @@ struct Stages {
 };
 
 bool AllOperatorsAvailable(std::string* reason) {
-  const AclnnOp* required[] = {&RmsNormOp(), &MatmulOp(),  &SwiGluOp(),      &ScatterPaKvCacheOp(),
-                               &SigmoidOp(), &MulOp(),     &InplaceAddOp(),  &FusedInferAttentionOp()};
+  const AclnnOp* required[] = {&RmsNormOp(), &MatmulOp(), &SwiGluOp(),     &ScatterPaKvCacheOp(),
+                               &SigmoidOp(), &MulOp(),    &InplaceAddOp(), &FusedInferAttentionOp()};
   for (const AclnnOp* op : required) {
     if (!op->available()) {
       *reason = op->unavailable_reason();
@@ -154,30 +153,28 @@ Stages RunLayerOnDevice(const GoldenLayer3& golden) {
   DeviceTensor context = DeviceTensor::HalfEmpty({s::kTokens, s::kNumHeads, s::kHeadDim});
   DeviceTensor softmax_lse = DeviceTensor::HalfEmpty({1});
 
-  RunAclnn<ops::RmsNormWorkspaceFn>(RmsNormOp(), stream, x.get(), gamma1.get(),
-                                    static_cast<double>(s::kRmsNormEps), norm1.get(), rstd.get());
+  RunAclnn<ops::RmsNormWorkspaceFn>(RmsNormOp(), stream, x.get(), gamma1.get(), static_cast<double>(s::kRmsNormEps),
+                                    norm1.get(), rstd.get());
 
   Project(norm1, w_q, q, stream);
   Project(norm1, w_k, k, stream);
   Project(norm1, w_v, v, stream);
   Project(norm1, w_gate_attn, attn_gate, stream);
 
-  ACL_CHECK(aclrtMemcpyAsync(q_pre_rope.data(), static_cast<size_t>(s::kTokens * s::kQDim) * kHalfBytes,
-                             q.data(), static_cast<size_t>(s::kTokens * s::kQDim) * kHalfBytes,
-                             ACL_MEMCPY_DEVICE_TO_DEVICE, stream));
-  ACL_CHECK(aclrtMemcpyAsync(k_pre_rope.data(), static_cast<size_t>(s::kTokens * s::kKvDim) * kHalfBytes,
-                             k.data(), static_cast<size_t>(s::kTokens * s::kKvDim) * kHalfBytes,
-                             ACL_MEMCPY_DEVICE_TO_DEVICE, stream));
+  ACL_CHECK(aclrtMemcpyAsync(q_pre_rope.data(), static_cast<size_t>(s::kTokens * s::kQDim) * kHalfBytes, q.data(),
+                             static_cast<size_t>(s::kTokens * s::kQDim) * kHalfBytes, ACL_MEMCPY_DEVICE_TO_DEVICE,
+                             stream));
+  ACL_CHECK(aclrtMemcpyAsync(k_pre_rope.data(), static_cast<size_t>(s::kTokens * s::kKvDim) * kHalfBytes, k.data(),
+                             static_cast<size_t>(s::kTokens * s::kKvDim) * kHalfBytes, ACL_MEMCPY_DEVICE_TO_DEVICE,
+                             stream));
   ACL_CHECK(aclrtSynchronizeStream(stream));
 
   Stages stages;
   stages.rotary_path = ApplyPartialRotaryQK(q.data(), k.data(), golden.cos_tab, golden.sin_tab, s::kTokens,
                                             s::kNumHeads, s::kNumKvHeads, s::kHeadDim, s::kRotaryDim, stream);
 
-  DeviceTensor key_cache =
-      DeviceTensor::HalfEmpty({s::kNumBlocks, s::kBlockSize, s::kNumKvHeads, s::kHeadDim});
-  DeviceTensor value_cache =
-      DeviceTensor::HalfEmpty({s::kNumBlocks, s::kBlockSize, s::kNumKvHeads, s::kHeadDim});
+  DeviceTensor key_cache = DeviceTensor::HalfEmpty({s::kNumBlocks, s::kBlockSize, s::kNumKvHeads, s::kHeadDim});
+  DeviceTensor value_cache = DeviceTensor::HalfEmpty({s::kNumBlocks, s::kBlockSize, s::kNumKvHeads, s::kHeadDim});
 
   const std::vector<int32_t> slot_host{s::kPhysicalBlock * static_cast<int32_t>(s::kBlockSize)};
   const std::vector<int32_t> block_table_host{s::kPhysicalBlock};
@@ -187,13 +184,11 @@ Stages RunLayerOnDevice(const GoldenLayer3& golden) {
   AclnnTensor k_bnd({s::kTokens, s::kNumKvHeads, s::kHeadDim}, ACL_FLOAT16, k.data());
   AclnnTensor v_bnd({s::kTokens, s::kNumKvHeads, s::kHeadDim}, ACL_FLOAT16, v.data());
 
-  RunAclnn<ops::ScatterPaKvCacheWorkspaceFn>(
-      ScatterPaKvCacheOp(), stream, k_bnd.get(), key_cache.get(), slot_mapping.get(), v_bnd.get(),
-      value_cache.get(), nullptr, nullptr, nullptr,
-      kScatterCacheMode, nullptr, nullptr, nullptr);
+  RunAclnn<ops::ScatterPaKvCacheWorkspaceFn>(ScatterPaKvCacheOp(), stream, k_bnd.get(), key_cache.get(),
+                                             slot_mapping.get(), v_bnd.get(), value_cache.get(), nullptr, nullptr,
+                                             nullptr, kScatterCacheMode, nullptr, nullptr, nullptr);
 
-  const std::vector<int64_t> cache_view =
-      s::FiaKeyCacheView(s::kNumBlocks, s::kBlockSize, s::kNumKvHeads, s::kHeadDim);
+  const std::vector<int64_t> cache_view = s::FiaKeyCacheView(s::kNumBlocks, s::kBlockSize, s::kNumKvHeads, s::kHeadDim);
   AclnnTensor key_cache_flat(cache_view, ACL_FLOAT16, key_cache.data());
   AclnnTensor value_cache_flat(cache_view, ACL_FLOAT16, value_cache.data());
   AclnnTensorList key_list({key_cache_flat.get()});
@@ -204,17 +199,12 @@ Stages RunLayerOnDevice(const GoldenLayer3& golden) {
   AclnnIntArray actual_seq_lengths_kv(std::vector<int64_t>{s::kContextLen});
 
   RunAclnn<ops950::FusedInferAttentionScoreV2WorkspaceFn>(
-      FusedInferAttentionOp(), stream, query_tnd.get(), key_list.get(), value_list.get(),
-      nullptr, nullptr, actual_seq_lengths.get(), actual_seq_lengths_kv.get(),
-      nullptr, nullptr, nullptr, nullptr,
-      nullptr, nullptr, nullptr, block_table.get(),
-      nullptr, nullptr, nullptr,
-      nullptr, nullptr, nullptr,
-      nullptr, nullptr, nullptr,
-      s::kNumHeads, static_cast<double>(s::kAttentionScale), s::kFiaUnboundedTokens, s::kFiaUnboundedTokens,
-      kFiaLayout, s::kNumKvHeads, s::kFiaSparseModeNone, s::kFiaInnerPreciseDefault, s::kBlockSize,
-      0, false, 0, 0,
-      context.get(), softmax_lse.get());
+      FusedInferAttentionOp(), stream, query_tnd.get(), key_list.get(), value_list.get(), nullptr, nullptr,
+      actual_seq_lengths.get(), actual_seq_lengths_kv.get(), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+      nullptr, block_table.get(), nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+      s::kNumHeads, static_cast<double>(s::kAttentionScale), s::kFiaUnboundedTokens, s::kFiaUnboundedTokens, kFiaLayout,
+      s::kNumKvHeads, s::kFiaSparseModeNone, s::kFiaInnerPreciseDefault, s::kBlockSize, 0, false, 0, 0, context.get(),
+      softmax_lse.get());
 
   RunAclnn<ops950::SigmoidWorkspaceFn>(SigmoidOp(), stream, attn_gate.get(), gate_sigmoid.get());
 
@@ -224,8 +214,8 @@ Stages RunLayerOnDevice(const GoldenLayer3& golden) {
   Project(gated, w_out, attn_out, stream);
   ResidualAdd(x, attn_out, stream);
 
-  RunAclnn<ops::RmsNormWorkspaceFn>(RmsNormOp(), stream, x.get(), gamma2.get(),
-                                    static_cast<double>(s::kRmsNormEps), norm2.get(), rstd.get());
+  RunAclnn<ops::RmsNormWorkspaceFn>(RmsNormOp(), stream, x.get(), gamma2.get(), static_cast<double>(s::kRmsNormEps),
+                                    norm2.get(), rstd.get());
 
   static_assert(s::kTokens == 1, "gate/up share one buffer, which only works for a single row");
   static_assert((s::kIntermediate * 2 * static_cast<int64_t>(kHalfBytes)) % 32 == 0,
@@ -284,15 +274,13 @@ Stages RunLayerOnCpu(const GoldenLayer3& golden) {
 
   std::vector<float> norm1;
   std::vector<float> rstd;
-  reference::RmsNorm(golden.input_x, golden.input_norm_gamma, s::kTokens, s::kHidden, s::kRmsNormEps, &norm1,
-                     &rstd);
+  reference::RmsNorm(golden.input_x, golden.input_norm_gamma, s::kTokens, s::kHidden, s::kRmsNormEps, &norm1, &rstd);
   cpu.norm1 = RoundToHalf(norm1);
 
   const std::vector<float> q = ProjectOnCpu(cpu.norm1, golden.w_q, s::kTokens, s::kHidden, s::kQDim);
   const std::vector<float> k = ProjectOnCpu(cpu.norm1, golden.w_k, s::kTokens, s::kHidden, s::kKvDim);
   const std::vector<float> v = ProjectOnCpu(cpu.norm1, golden.w_v, s::kTokens, s::kHidden, s::kKvDim);
-  const std::vector<float> attn_gate =
-      ProjectOnCpu(cpu.norm1, golden.w_gate_attn, s::kTokens, s::kHidden, s::kQDim);
+  const std::vector<float> attn_gate = ProjectOnCpu(cpu.norm1, golden.w_gate_attn, s::kTokens, s::kHidden, s::kQDim);
 
   cpu.qkv.reserve(q.size() + k.size() + v.size());
   cpu.qkv.insert(cpu.qkv.end(), q.begin(), q.end());
@@ -300,8 +288,8 @@ Stages RunLayerOnCpu(const GoldenLayer3& golden) {
   cpu.qkv.insert(cpu.qkv.end(), v.begin(), v.end());
 
   std::vector<float> rope_q;
-  reference::ApplyRotaryPosEmb(q, golden.cos_tab, golden.sin_tab, s::kTokens, s::kNumHeads, s::kHeadDim,
-                               s::kRotaryDim, reference::RotaryMode::kHalf, &rope_q);
+  reference::ApplyRotaryPosEmb(q, golden.cos_tab, golden.sin_tab, s::kTokens, s::kNumHeads, s::kHeadDim, s::kRotaryDim,
+                               reference::RotaryMode::kHalf, &rope_q);
   cpu.rope_q = RoundToHalf(rope_q);
 
   std::vector<float> rope_k;
@@ -339,10 +327,8 @@ Stages RunLayerOnCpu(const GoldenLayer3& golden) {
   reference::RmsNorm(x, golden.post_attn_norm_gamma, s::kTokens, s::kHidden, s::kRmsNormEps, &norm2, &rstd);
   cpu.norm2 = RoundToHalf(norm2);
 
-  const std::vector<float> mlp_gate =
-      ProjectOnCpu(cpu.norm2, golden.w_gate, s::kTokens, s::kHidden, s::kIntermediate);
-  const std::vector<float> mlp_up =
-      ProjectOnCpu(cpu.norm2, golden.w_up, s::kTokens, s::kHidden, s::kIntermediate);
+  const std::vector<float> mlp_gate = ProjectOnCpu(cpu.norm2, golden.w_gate, s::kTokens, s::kHidden, s::kIntermediate);
+  const std::vector<float> mlp_up = ProjectOnCpu(cpu.norm2, golden.w_up, s::kTokens, s::kHidden, s::kIntermediate);
 
   std::vector<float> gate_up;
   gate_up.reserve(mlp_gate.size() + mlp_up.size());
@@ -353,8 +339,7 @@ Stages RunLayerOnCpu(const GoldenLayer3& golden) {
   reference::SiluAndMul(gate_up, s::kTokens, s::kIntermediate, &swiglu);
   cpu.swiglu = RoundToHalf(swiglu);
 
-  const std::vector<float> mlp_out =
-      ProjectOnCpu(cpu.swiglu, golden.w_down, s::kTokens, s::kIntermediate, s::kHidden);
+  const std::vector<float> mlp_out = ProjectOnCpu(cpu.swiglu, golden.w_down, s::kTokens, s::kIntermediate, s::kHidden);
 
   for (size_t i = 0; i < x.size(); ++i) {
     x[i] += mlp_out[i];
@@ -608,6 +593,6 @@ TEST_F(QwenLayer3Golden950PrTest, Stage9LayerOutputMatchesGolden) {
   EXPECT_TENSORS_ALLCLOSE(stages_.output, golden_.golden_output, kFp16DefaultTolerance);
 }
 
-}
-}
-}
+}  // namespace
+}  // namespace test
+}  // namespace vllm_ascend

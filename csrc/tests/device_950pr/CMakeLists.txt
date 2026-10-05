@@ -51,7 +51,7 @@ if(VLLM_ASCEND_TESTS_HAVE_DSV4)
   add_custom_target(dsv4_device_targets DEPENDS test_device_950pr_dsv4_moe_expert)
   if(VLLM_ASCEND_TESTS_BUILD_BENCHMARKS)
     vllm_ascend_add_device_executable(bench_device_950pr_dsv4_moe_expert
-      bench_device_950pr_dsv4_moe_expert.cpp)
+      bench_device_950pr_dsv4_moe_expert.cpp ../common/dsv4_benchmark_suite.cpp)
     target_link_libraries(bench_device_950pr_dsv4_moe_expert PRIVATE vllm_ascend_test_dsv4)
     add_dependencies(dsv4_device_targets bench_device_950pr_dsv4_moe_expert)
     target_compile_definitions(bench_device_950pr_dsv4_moe_expert PRIVATE VLLM_ASCEND_TEST_TIER="device")

@@ -89,6 +89,7 @@ include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 
 # Unquoted on purpose: VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE is a list of
 # sources, and quoting it would hand ascendc_library one semicolon-joined path.
+if(VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS)
 ascendc_library(vllm_ascend_turboquant SHARED
   ${VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE})
 
@@ -102,7 +103,9 @@ ascendc_library(vllm_ascend_turboquant SHARED
 # host_intf_pub, which only ascendc_compile_options feeds, through -forward-options-to-host-compiler.
 ascendc_compile_definitions(vllm_ascend_turboquant PRIVATE VLLM_ASCEND_TQ_TEST_KERNELS)
 ascendc_compile_options(vllm_ascend_turboquant PRIVATE
+  --cce-auto-sync=off -Werror
   -forward-options-to-host-compiler -DVLLM_ASCEND_TQ_TEST_KERNELS)
+endif()
 
 # ---------------------------------------------------------------------------
 # The DSV4 MoE expert kernel
@@ -116,9 +119,6 @@ ascendc_compile_options(vllm_ascend_turboquant PRIVATE
 if(VLLM_ASCEND_TESTS_BUILD_DSV4_KERNELS)
   ascendc_library(vllm_ascend_dsv4_moe_expert SHARED
     "${CMAKE_CURRENT_SOURCE_DIR}/../common/dsv4_moe_expert_kernels.cpp")
-  ascendc_compile_options(vllm_ascend_dsv4_moe_expert PRIVATE --cce-auto-sync=off)
-  if(VLLM_ASCEND_TESTS_WERROR)
-    ascendc_compile_options(vllm_ascend_dsv4_moe_expert PRIVATE -Werror)
-  endif()
+  ascendc_compile_options(vllm_ascend_dsv4_moe_expert PRIVATE --cce-auto-sync=off -Werror)
   message(STATUS "vllm-ascend tests: DSV4 MoE expert kernel RUN_MODE=${RUN_MODE}, SOC_VERSION=${SOC_VERSION}")
 endif()

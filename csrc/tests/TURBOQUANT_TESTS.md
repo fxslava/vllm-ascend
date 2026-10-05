@@ -19,7 +19,7 @@ Companion documents: [README.md](README.md) for how to build and run the suite,
 - [4. The oracle, and what it is not](#4-the-oracle-and-what-it-is-not)
 - [5. Tier 1 — `host/`](#5-tier-1--host)
 - [6. Tier 2 — `sim/`](#6-tier-2--sim)
-- [7. Tier 3 — `device/`](#7-tier-3--device)
+- [7. Tier 3 — `device_950pr/`](#7-tier-3--device)
 - [8. The fp16 baseline, and the V2 → V5 migration](#8-the-fp16-baseline-and-the-v2--v5-migration)
 - [9. Build and run matrix](#9-build-and-run-matrix)
 - [10. Bounds, and where each number came from](#10-bounds-and-where-each-number-came-from)
@@ -43,7 +43,7 @@ lines — not just different runtime gates. Each is a subdirectory with its own
 | --- | --- | --- | --- | --- |
 | **1. host** | `host/` | `test_host_*` | none — any CPU | no CANN, no NPU runtime |
 | **2. sim** | `sim/` | `test_sim_950pr_*` | CAModel emulator | `libruntime_camodel.so` |
-| **3. device** | `device/` | `test_device_950pr_*`, `bench_device_950pr_*` | physical Ascend 950PR | real `libruntime.so` + `libascendcl.so` |
+| **3. device** | `device_950pr/` | `test_device_950pr_*`, `bench_device_950pr_*` | physical Ascend 950PR | real `libruntime.so` + `libascendcl.so` |
 
 ```
 csrc/tests/
@@ -60,7 +60,7 @@ csrc/tests/
 │   ├── test_sim_950pr_turboquant_kernels.cpp
 │   └── test_sim_950pr_turboquant_decode.cpp
 │
-├── device/                 TIER 3  ── physical 950PR silicon
+├── device_950pr/                 TIER 3  ── physical 950PR silicon
 │   ├── test_device_950pr_turboquant.cpp
 │   ├── test_device_950pr_matmul.cpp
 │   ├── test_device_950pr_rmsnorm.cpp
@@ -80,11 +80,11 @@ csrc/tests/
 **The exclusivity is structural, not a naming convention.** `ascendc_library()`
 builds one kernel library per `RUN_MODE`, so a single tree cannot hold both a
 camodel and a silicon build of it. `RUN_MODE` therefore selects which of `sim/`
-and `device/` is configured at all:
+and `device_950pr/` is configured at all:
 
 | Configuration | Tiers configured |
 | --- | --- |
-| `-DRUN_MODE=npu` (default) | `host/` + `device/` |
+| `-DRUN_MODE=npu` (default) | `host/` + `device_950pr/` |
 | `-DRUN_MODE=sim` | `host/` + `sim/` |
 | `-DVLLM_ASCEND_TESTS_HOST_ONLY=ON` | `host/` alone |
 
@@ -350,7 +350,7 @@ it is printed and never asserted.
 
 ---
 
-## 7. Tier 3 — `device/`
+## 7. Tier 3 — `device_950pr/`
 
 | | |
 | --- | --- |
@@ -886,7 +886,7 @@ stage 2 should read flat.
 
 **Knobs:** `--stage=<list>` (stages 0..5, in order) and
 `--sync-timeout-ms=<ms>` (default 30000; 0 waits forever) on the command line,
-from `device/bench_main_950pr_ablation.cpp`, which rejects a malformed value
+from `device_950pr/bench_main_950pr_ablation.cpp`, which rejects a malformed value
 rather than falling back -- `--stage=4x` silently running all six would relaunch
 the stage it meant to isolate. Each flag sets `ASCEND_BENCH_TQ_ABLATION_STAGES` /
 `ASCEND_BENCH_TQ_ABLATION_SYNC_TIMEOUT_MS`. Plus the shared `ASCEND_BENCH_*` set,
@@ -1021,7 +1021,7 @@ loads, and every range becomes a `_Start`/`_End` pair of marks. Either way it is
 `msprof --msproftx=on` that records them:
 
 ```bash
-msprof --output=./prof/tq_trace --msproftx=on --task-time=l1 --runtime-api=on ./build/dev/device/prof_device_950pr_msprof_trace --models=DeepSeek-V4-Flash,Qwen3.5-9B,GLM-5.2-744B --contexts=2048,32768 --batches=1,4 --mode=decode
+msprof --output=./prof/tq_trace --msproftx=on --task-time=l1 --runtime-api=on ./build/dev/device_950pr/prof_device_950pr_msprof_trace --models=DeepSeek-V4-Flash,Qwen3.5-9B,GLM-5.2-744B --contexts=2048,32768 --batches=1,4 --mode=decode
 ```
 
 The binary prints that line for its own flags before it touches the device.
@@ -1124,7 +1124,7 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 | Configuration | Command | Tiers |
 | --- | --- | --- |
 | host only | `cmake -S csrc/tests -B build/host -DVLLM_ASCEND_TESTS_HOST_ONLY=ON` | `host/` |
-| 950PR silicon | `cmake -S csrc/tests -B build/dev -G "Unix Makefiles" -DSOC_VERSION=Ascend950PR_9599` | `host/` + `device/` |
+| 950PR silicon | `cmake -S csrc/tests -B build/dev -G "Unix Makefiles" -DSOC_VERSION=Ascend950PR_9599` | `host/` + `device_950pr/` |
 | 950PR camodel | `cmake -S csrc/tests -B build/sim -G "Unix Makefiles" -DSOC_VERSION=Ascend950PR_9599 -DRUN_MODE=sim` | `host/` + `sim/` |
 | 310P | `cmake -S csrc/tests -B build/310p -DSOC_VERSION=Ascend310P3` | `host/` + `device_310p/` |
 
@@ -2507,7 +2507,7 @@ reason forward from the share.
 |---|---|
 | `csrc/tests/common/hadamard_spike.hpp` | host helpers: `Hadamard16Half`, `EarlyStageTables`, chunk sizing, `HadamardDualDstApplies` |
 | `csrc/tests/common/hadamard_spike_kernels.cpp` | 954 lines. AIV-batched butterfly **and** Cube-factorised variants, double-buffered across kSlots |
-| `csrc/tests/device/bench_950pr_cube_hadamard.cpp` | the silicon benchmark |
+| `csrc/tests/device_950pr/bench_950pr_cube_hadamard.cpp` | the silicon benchmark |
 | `hadamard_benchmark_results.csv` | 181 rows of real 950PR device measurements, 100 samples per case |
 | `csrc/attention/turboquant/turboquant_codec_950.h` | the shipping `ApplyPi` / `FastWalshHadamardTransform`, at `batchRows = 1` |
 

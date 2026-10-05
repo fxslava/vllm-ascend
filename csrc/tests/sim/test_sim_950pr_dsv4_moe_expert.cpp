@@ -40,7 +40,8 @@
 
 #include "acl_check.hpp"
 #include "camodel_guard.hpp"
-#include "device_buffer.hpp"
+#include "dsv4_device_case.hpp"
+#include "dsv4_test_checks.hpp"
 #include "dsv4_moe_expert_launch.hpp"
 #include "test_harness.hpp"
 
@@ -54,9 +55,6 @@ using dsv4::MakeSaturatingProblem;
 using dsv4::Problem;
 using dsv4::ReferenceExpert;
 using dsv4::TilingBuffer;
-
-// The Gate B criterion, in bf16 ULPs.
-constexpr int64_t kMaxUlp = 2;
 
 // A single camodel launch of this kernel is minutes. The watchdog turns a hang
 // into a named failure instead of a ctest timeout with no attribution.
@@ -73,66 +71,18 @@ struct Outputs {
   }
 };
 
-// One launch. Every buffer is fresh, so a run cannot inherit state from the
-// previous one -- which is what makes the repeat test below meaningful.
+// A fresh expert owner per launch keeps every output poisoned and drains before
+// release, exactly as in the physical suite. The watchdog remains sim-specific.
 Outputs Launch(const Problem& p, aclrtStream stream, const char* tag) {
   LaunchWatchdog watchdog(kLaunchBudgetSeconds, tag);
-
-  DeviceBuffer x = DeviceBuffer::FromHost(p.x);
-  DeviceBuffer w1 = DeviceBuffer::FromHost(p.w1);
-  DeviceBuffer w2 = DeviceBuffer::FromHost(p.w2);
-  DeviceBuffer w3 = DeviceBuffer::FromHost(p.w3);
-  DeviceBuffer w1s = DeviceBuffer::FromHost(p.w1_scale);
-  DeviceBuffer w2s = DeviceBuffer::FromHost(p.w2_scale);
-  DeviceBuffer w3s = DeviceBuffer::FromHost(p.w3_scale);
-
-  DeviceBuffer gate = DeviceBuffer::Empty<uint16_t>(static_cast<size_t>(p.inter));
-  DeviceBuffer up = DeviceBuffer::Empty<uint16_t>(static_cast<size_t>(p.inter));
-  DeviceBuffer activated = DeviceBuffer::Empty<uint16_t>(static_cast<size_t>(p.inter));
-  DeviceBuffer down = DeviceBuffer::Empty<uint16_t>(static_cast<size_t>(p.hidden));
-  DeviceBuffer workspace = DeviceBuffer::Empty<uint8_t>(32);
-
-  // Poison the outputs: a kernel that fails to write a buffer must fail the
-  // comparison rather than inherit a plausible zero.
-  for (DeviceBuffer* b : {&gate, &up, &activated, &down}) {
-    ACL_CHECK(aclrtMemset(b->get(), b->size_bytes(), 0xA5, b->size_bytes()));
-  }
-
-  // Copied as raw bytes, not as a field list: the kernel's
-  // GET_TILING_DATA_WITH_STRUCT reads sizeof(struct) bytes, so the buffer has
-  // to be the struct, padding and all.
-  const TilingBuffer tiling = p.Tiling();
-  const auto* tiling_bytes = reinterpret_cast<const uint8_t*>(&tiling);
-  DeviceBuffer tiling_dev = DeviceBuffer::FromHost(
-      std::vector<uint8_t>(tiling_bytes, tiling_bytes + sizeof(tiling)));
-
-  dsv4_moe_expert_impl(stream, /*blockDim=*/1, x.get(), w1.get(), w2.get(), w3.get(), w1s.get(), w2s.get(),
-                       w3s.get(), gate.get(), up.get(), activated.get(), down.get(), workspace.get(),
-                       tiling_dev.get());
-  ACL_CHECK(aclrtSynchronizeStream(stream));
-
-  Outputs out;
-  out.gate = gate.ToHost<uint16_t>();
-  out.up = up.ToHost<uint16_t>();
-  out.activated = activated.ToHost<uint16_t>();
-  out.down = down.ToHost<uint16_t>();
-  return out;
-}
-
-int64_t WorstUlp(const std::vector<uint16_t>& actual, const std::vector<uint16_t>& expected) {
-  int64_t worst = 0;
-  for (size_t i = 0; i < actual.size(); ++i) {
-    worst = std::max(worst, Bf16UlpDistance(actual[i], expected[i]));
-  }
-  return worst;
+  dsv4::DeviceExpert expert(p, stream);
+  expert.Enqueue();
+  auto values = expert.Read();
+  return Outputs{std::move(values[0]), std::move(values[1]), std::move(values[2]), std::move(values[3])};
 }
 
 void ExpectMatchesReference(const Problem& p, const Outputs& got) {
-  const auto want = ReferenceExpert(p.View(), p.hidden, p.inter);
-  EXPECT_LE(WorstUlp(got.gate, want.gate_out), kMaxUlp) << "gate_out";
-  EXPECT_LE(WorstUlp(got.up, want.up_out), kMaxUlp) << "up_out";
-  EXPECT_LE(WorstUlp(got.activated, want.activated), kMaxUlp) << "activated";
-  EXPECT_LE(WorstUlp(got.down, want.down_out), kMaxUlp) << "down_out";
+  ExpectParity(dsv4::DeviceOutputs{got.gate, got.up, got.activated, got.down}, dsv4::Golden(p));
 }
 
 // ---------------------------------------------------------------------------
@@ -180,18 +130,15 @@ TEST(Dsv4MoeExpertSim, RepeatedLaunchesAreBitIdentical) {
   aclrtStream stream = AscendTestEnvironment::Instance().stream();
   const Problem p = MakeProblem(kHidden, kInter, /*seed=*/2);
 
-  const int repeats = std::getenv("ASCEND_DSV4_SYNC_REPEATS")
-                          ? std::atoi(std::getenv("ASCEND_DSV4_SYNC_REPEATS"))
-                          : 3;
+  const int repeats = std::getenv("ASCEND_DSV4_SYNC_REPEATS") ? std::atoi(std::getenv("ASCEND_DSV4_SYNC_REPEATS")) : 3;
   ASSERT_GE(repeats, 2) << "a single launch proves nothing about synchronisation";
 
   const Outputs first = Launch(p, stream, "dsv4_moe_expert/sync[0]");
   for (int i = 1; i < repeats; ++i) {
     const Outputs again = Launch(p, stream, ("dsv4_moe_expert/sync[" + std::to_string(i) + "]").c_str());
-    EXPECT_TRUE(first == again)
-        << "launch " << i << " differs from launch 0 on identical input: a "
-        << "cross-pipe flag is missing (the kernel compiles with "
-        << "--cce-auto-sync=off, so nothing inserts them implicitly)";
+    EXPECT_TRUE(first == again) << "launch " << i << " differs from launch 0 on identical input: a "
+                                << "cross-pipe flag is missing (the kernel compiles with "
+                                << "--cce-auto-sync=off, so nothing inserts them implicitly)";
   }
   // The runs agreeing is necessary but not sufficient, so still check the value.
   ExpectMatchesReference(p, first);
@@ -234,12 +181,11 @@ TEST(Dsv4MoeExpertSim, SaturatedGateLandsOnTheClampNotOnZero) {
 
   const auto want = ReferenceExpert(p.View(), p.hidden, p.inter);
   ASSERT_FALSE(want.gate_f32.empty());
-  EXPECT_TRUE(std::all_of(want.gate_f32.begin(), want.gate_f32.end(),
-                          [](float v) { return v < -dsv4::kSwigluLimit; }))
+  EXPECT_TRUE(std::all_of(want.gate_f32.begin(), want.gate_f32.end(), [](float v) { return v < -dsv4::kSwigluLimit; }))
       << "the saturating problem no longer saturates; re-tune MakeSaturatingProblem";
-  EXPECT_TRUE(std::all_of(want.activated_f32.begin(), want.activated_f32.end(),
-                          [](float v) { return std::isfinite(v) && v != 0.0f; }))
-      << "a clamped gate must give a finite non-zero activation";
+  EXPECT_TRUE(std::all_of(want.activated_f32.begin(), want.activated_f32.end(), [](float v) {
+    return std::isfinite(v) && v != 0.0f;
+  })) << "a clamped gate must give a finite non-zero activation";
 }
 
 }  // namespace

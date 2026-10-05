@@ -49,7 +49,7 @@
 #                                          $ASCEND_HOME_PATH/tools/simulator, and
 #                                          therefore CANNOT run on silicon.
 #
-#   device/        test_device_950pr_*     Physical 950PR silicon. Production
+#   device_950pr/ test_device_950pr_*     Physical 950PR silicon. Production
 #                  bench_device_950pr_*    shapes and every timing measurement.
 #                                          Links the real libruntime.so and
 #                                          libascendcl.so, with no simulator on
@@ -57,12 +57,12 @@
 #                                          so there is no CAModel fallback to
 #                                          accidentally take.
 #
-# sim/ and device/ are selected by RUN_MODE and are never configured together:
+# sim/ and device_950pr/ are selected by RUN_MODE and are never configured together:
 # ascendc_library() builds one kernel library per RUN_MODE, so a tree cannot hold
 # both a camodel and a silicon build of it. That is what makes the exclusivity
 # structural rather than a naming convention.
 #
-#   -DRUN_MODE=npu   (default)  host/ + device/
+#   -DRUN_MODE=npu   (default)  host/ + device_950pr/
 #   -DRUN_MODE=sim              host/ + sim/
 #   -DVLLM_ASCEND_TESTS_HOST_ONLY=ON   host/ alone
 #
@@ -76,8 +76,10 @@
 #                               configured, not compiled, and contributes no
 #                               target - a `*310*` binary cannot exist in a
 #                               950PR build tree.
-#   anything else               device_310p/ alone, plus host/. The 950PR tiers
-#                               are not configured.
+#   SOC_VERSION=Ascend910B[1-4]  host/ + dedicated DSV4 device target (npu only).
+#                               TurboQuant and 310P device targets are excluded.
+#   SOC_VERSION=Ascend310P*    device_310p/ + host/ in npu mode.
+#   unknown SoCs               rejected; never silently routed to 310P.
 #
 # device_310p/ keeps its historical binary names (test_matmul_310p and friends)
 # on purpose: .agents/skills/ascend-310p-csrc-tests/SKILL.md and the shipped
@@ -144,10 +146,8 @@ option(VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS
 # It is declared in ascendc/CMakeLists.txt alongside the TurboQuant kernels,
 # because ascendc.cmake creates several bare unguarded targets (host_intf_pub,
 # device_intf_pub, ...) and so cannot be included twice in one project. That is
-# also why this option currently implies
-# VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS: the scope that includes
-# ascendc.cmake is reached only when that one is ON. See the note in
-# ascendc/CMakeLists.txt.
+# This option is independent of VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS.
+# Both libraries share one ascendc.cmake inclusion; 910B builds DSV4 alone.
 option(VLLM_ASCEND_TESTS_BUILD_DSV4_KERNELS
        "Compile the DSV4 MoE expert Ascend C kernel and build the tests that drive it" ON)
 
@@ -217,6 +217,10 @@ endif()
 # same answer. See the tier and isolation notes at the top of this file.
 
 string(TOLOWER "${SOC_VERSION}" VLLM_ASCEND_SOC_LOWER)
+set(VLLM_ASCEND_TESTS_SOC_IS_910B FALSE)
+if(VLLM_ASCEND_SOC_LOWER MATCHES "^ascend910b[1-4]$")
+  set(VLLM_ASCEND_TESTS_SOC_IS_910B TRUE)
+endif()
 if(VLLM_ASCEND_SOC_LOWER MATCHES "^ascend950")
   set(VLLM_ASCEND_TESTS_SOC_IS_950PR TRUE)
 else()
@@ -239,6 +243,7 @@ set(VLLM_ASCEND_TESTS_TIER_HOST      TRUE)
 set(VLLM_ASCEND_TESTS_TIER_SIM       FALSE)
 set(VLLM_ASCEND_TESTS_TIER_DEVICE    FALSE)
 set(VLLM_ASCEND_TESTS_TIER_DEVICE310 FALSE)
+set(VLLM_ASCEND_TESTS_TIER_DEVICE910 FALSE)
 
 if(NOT VLLM_ASCEND_TESTS_HOST_ONLY)
   if(VLLM_ASCEND_TESTS_SOC_IS_950PR)
@@ -247,21 +252,30 @@ if(NOT VLLM_ASCEND_TESTS_HOST_ONLY)
     else()
       set(VLLM_ASCEND_TESTS_TIER_DEVICE TRUE)
     endif()
-  else()
-    set(VLLM_ASCEND_TESTS_TIER_DEVICE310 TRUE)
+  elseif(VLLM_ASCEND_TESTS_SOC_IS_910B)
+    if(NOT RUN_MODE STREQUAL "npu")
+      message(FATAL_ERROR "The 910B DSV4 verification suite requires RUN_MODE=npu")
+    endif()
+    set(VLLM_ASCEND_TESTS_TIER_DEVICE910 TRUE)
+  elseif(VLLM_ASCEND_SOC_LOWER MATCHES "^ascend310p")
+    if(RUN_MODE STREQUAL "npu")
+      set(VLLM_ASCEND_TESTS_TIER_DEVICE310 TRUE)
+    endif()
     if(RUN_MODE STREQUAL "sim")
-      message(WARNING
+      message(STATUS
         "RUN_MODE=sim has no effect on SOC_VERSION '${SOC_VERSION}': the camodel tier exists only "
         "for the 950PR, whose Ascend C kernels this suite builds itself. The 310P tests call "
-        "operators CANN already shipped and need real hardware.")
+        "operators CANN already shipped and need real hardware; only host targets are configured.")
     endif()
+  else()
+    message(FATAL_ERROR "Unsupported SOC_VERSION: ${SOC_VERSION}")
   endif()
 endif()
 
 message(STATUS "vllm-ascend tests: SoC ${SOC_VERSION}, RUN_MODE ${RUN_MODE}")
 message(STATUS "vllm-ascend tests: tiers -> host=${VLLM_ASCEND_TESTS_TIER_HOST} "
                "sim=${VLLM_ASCEND_TESTS_TIER_SIM} device=${VLLM_ASCEND_TESTS_TIER_DEVICE} "
-               "device_310p=${VLLM_ASCEND_TESTS_TIER_DEVICE310}")
+               "device_310p=${VLLM_ASCEND_TESTS_TIER_DEVICE310} device_910b=${VLLM_ASCEND_TESTS_TIER_DEVICE910}")
 if(VLLM_ASCEND_TESTS_SOC_IS_950PR)
   message(STATUS "vllm-ascend tests: 310P targets are excluded from this build entirely")
 endif()
@@ -653,16 +667,23 @@ target_link_options(vllm_ascend_test_common PUBLIC -Wl,--gc-sections -Wl,--as-ne
 # Built for the sim and device tiers only, so a 310P tree carries neither the
 # 950PR operator audit nor the golden-dump path define.
 
-if(VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE)
-  add_library(vllm_ascend_test_common_950pr STATIC
-    common/aclnn_ops_950pr.cpp
-    common/golden_layer3.cpp
-    common/partial_rotary_950pr.cpp)
+if(VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE OR VLLM_ASCEND_TESTS_SOC_IS_910B)
+  if(VLLM_ASCEND_TESTS_SOC_IS_910B)
+    # The arch35 TurboQuant probes must not enter an arch220 build.
+    set(VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS OFF)
+  endif()
+  if(VLLM_ASCEND_TESTS_SOC_IS_950PR)
+    add_library(vllm_ascend_test_common_950pr STATIC
+      common/aclnn_ops_950pr.cpp
+      common/golden_layer3.cpp
+      common/partial_rotary_950pr.cpp)
 
-  target_link_libraries(vllm_ascend_test_common_950pr PUBLIC vllm_ascend_test_common)
+    target_link_libraries(vllm_ascend_test_common_950pr PUBLIC vllm_ascend_test_common)
 
-  target_compile_definitions(vllm_ascend_test_common_950pr
-    PUBLIC VLLM_ASCEND_GOLDEN_LAYER3_DIR="${VLLM_ASCEND_GOLDEN_LAYER3_DIR}")
+    target_compile_definitions(vllm_ascend_test_common_950pr
+      PUBLIC VLLM_ASCEND_GOLDEN_LAYER3_DIR="${VLLM_ASCEND_GOLDEN_LAYER3_DIR}")
+
+  endif()
 
   # libcust_opapi.so, where the kernels built out of csrc/ live, is opened with
   # dlopen at run time by common/aclnn_runtime.cpp - it is found through
@@ -690,13 +711,13 @@ if(VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE)
   # not copies.
   #
   # One library per tree, built for whichever RUN_MODE this configuration
-  # selected. That is precisely why sim/ and device/ cannot both be configured:
+  # selected. That is precisely why sim/ and device_950pr/ cannot both be configured:
   # they would need two different builds of this one target.
 
   set(VLLM_ASCEND_TESTS_HAVE_TURBOQUANT FALSE)
   set(VLLM_ASCEND_TESTS_HAVE_DSV4 FALSE)
 
-  if(VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS)
+  if(VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS OR VLLM_ASCEND_TESTS_BUILD_DSV4_KERNELS)
     # One library for every kernel source: a <<<>>> call site can only reach a
     # kernel whose generated launcher is in the same ascendc_library.
     #   op_kernel/turboquant_paged_attention.cpp  the shipping AIV-only 4-bit path
@@ -714,7 +735,7 @@ if(VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE)
         # <<<>>> call site can only reach a kernel whose generated launcher is
         # in the same ascendc_library. Nothing in csrc/attention/ includes it.
         # It lives in common/ because both tiers drive it - sim/ at one shape,
-        # device/ over the whole sweep - beside the common/hadamard_spike.hpp
+        # device_950pr/ over the whole sweep - beside the common/hadamard_spike.hpp
         # that declares its launchers.
         "${CMAKE_CURRENT_SOURCE_DIR}/common/hadamard_spike_kernels.cpp")
 
@@ -741,26 +762,31 @@ if(VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE)
     # both explained in full there: ascendc.cmake's side effects stay out of
     # this scope, and it cannot be included twice in one project because it
     # creates several bare unguarded targets.
+    if(NOT VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS)
+      set(VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE "")
+    endif()
     add_subdirectory(ascendc)
 
     # The Torch-free binding: the two _impl prototypes, the codec table builder
     # and the grid arithmetic that turboquant_torch_adpt.h would have done with
     # ATen. Carries the reference/ include directory because the Pi diagonal
     # comes from the CPU reference rather than from a second generator.
-    add_library(vllm_ascend_test_turboquant STATIC common/turboquant_launch.cpp)
-    target_link_libraries(vllm_ascend_test_turboquant PUBLIC vllm_ascend_turboquant_tiling)
+    if(VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS)
+      add_library(vllm_ascend_test_turboquant STATIC common/turboquant_launch.cpp)
+      target_link_libraries(vllm_ascend_test_turboquant PUBLIC vllm_ascend_turboquant_tiling)
 
-    target_include_directories(vllm_ascend_test_turboquant
-      PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/reference")
+      target_include_directories(vllm_ascend_test_turboquant
+        PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/reference")
 
-    target_link_libraries(vllm_ascend_test_turboquant
-      PUBLIC vllm_ascend_test_common_950pr vllm_ascend_turboquant)
+      target_link_libraries(vllm_ascend_test_turboquant
+        PUBLIC vllm_ascend_test_common_950pr vllm_ascend_turboquant)
 
-    set(VLLM_ASCEND_TESTS_HAVE_TURBOQUANT TRUE)
+      set(VLLM_ASCEND_TESTS_HAVE_TURBOQUANT TRUE)
+    endif()
 
     # The DSV4 MoE expert's host-side support: the problem generator and the
     # launcher declaration. The kernel library itself
-    # (vllm_ascend_dsv4_moe_expert) is declared in turboquant/CMakeLists.txt --
+    # (vllm_ascend_dsv4_moe_expert) is declared in ascendc/CMakeLists.txt --
     # see the option's comment for why it cannot have its own subdirectory.
     # Header-only apart from the kernel library, so this is an INTERFACE target.
     if(VLLM_ASCEND_TESTS_BUILD_DSV4_KERNELS)
@@ -770,7 +796,10 @@ if(VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE)
           "${CMAKE_CURRENT_SOURCE_DIR}/common"
           "${CMAKE_CURRENT_SOURCE_DIR}/reference")
       target_link_libraries(vllm_ascend_test_dsv4
-        INTERFACE vllm_ascend_test_common_950pr vllm_ascend_dsv4_moe_expert)
+        INTERFACE vllm_ascend_test_common vllm_ascend_dsv4_moe_expert)
+      if(NOT VLLM_ASCEND_TESTS_SOC_IS_910B)
+        target_link_libraries(vllm_ascend_test_dsv4 INTERFACE vllm_ascend_test_common_950pr)
+      endif()
       set(VLLM_ASCEND_TESTS_HAVE_DSV4 TRUE)
     endif()
   else()
@@ -789,11 +818,15 @@ if(VLLM_ASCEND_TESTS_TIER_SIM)
 endif()
 
 if(VLLM_ASCEND_TESTS_TIER_DEVICE)
-  add_subdirectory(device)
+  add_subdirectory(device_950pr)
 endif()
 
 if(VLLM_ASCEND_TESTS_TIER_DEVICE310)
   add_subdirectory(device_310p)
+endif()
+
+if(VLLM_ASCEND_TESTS_TIER_DEVICE910)
+  add_subdirectory(device_910b)
 endif()
 
 endif()  # NOT VLLM_ASCEND_TESTS_HOST_ONLY

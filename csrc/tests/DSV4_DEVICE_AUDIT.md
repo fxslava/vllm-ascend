@@ -8,8 +8,8 @@ latency, and bandwidth remain unmeasured.
 
 ## Changes and numerical contract
 
-- Production correctness suite: `device/test_device_950pr_dsv4_moe_expert.cpp`.
-- Benchmark: `device/bench_device_950pr_dsv4_moe_expert.cpp`.
+- Production correctness suite: `device_950pr/test_device_950pr_dsv4_moe_expert.cpp`.
+- Benchmark: `device_950pr/bench_device_950pr_dsv4_moe_expert.cpp`.
 - Shared deterministic synthetic generator, dedicated streams, HBM allocations,
   pinned asynchronous D2H copies, and resident launch resources:
   `common/dsv4_device_case.hpp`.

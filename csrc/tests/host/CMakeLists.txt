@@ -81,5 +81,12 @@ set_tests_properties(test_host_dsv4_moe_expert PROPERTIES
 
 vllm_ascend_record_binary(test_host_dsv4_moe_expert)
 
+add_executable(test_host_dsv4_common test_host_dsv4_common.cpp)
+target_link_libraries(test_host_dsv4_common
+  PRIVATE vllm_ascend_test_host ${VLLM_ASCEND_TEST_GTEST_MAIN_TARGET})
+add_test(NAME test_host_dsv4_common COMMAND test_host_dsv4_common)
+set_tests_properties(test_host_dsv4_common PROPERTIES LABELS "correctness;host" TIMEOUT 300)
+vllm_ascend_record_binary(test_host_dsv4_common)
+
 message(STATUS "vllm-ascend tests: [host] test_host_turboquant_fidelity test_host_turboquant_tiling "
                "test_host_dsv4_moe_expert")

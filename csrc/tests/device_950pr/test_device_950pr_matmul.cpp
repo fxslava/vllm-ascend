@@ -43,8 +43,8 @@ const AclnnOp& MatmulOp() {
   return op;
 }
 
-std::vector<float> RunMatmulOnDevice(const std::vector<float>& a, const std::vector<float>& b_t, int64_t m,
-                                     int64_t k, int64_t n) {
+std::vector<float> RunMatmulOnDevice(const std::vector<float>& a, const std::vector<float>& b_t, int64_t m, int64_t k,
+                                     int64_t n) {
   aclrtStream stream = AscendTestEnvironment::Instance().stream();
 
   DeviceTensor a_device = DeviceTensor::Half({m, k}, a);
@@ -64,8 +64,8 @@ TEST(Matmul950PrShapes, LayerProjectionsAreCoveredByTheSweep) {
     int64_t n;
   };
   const Projection projections[] = {
-      {"q / attn_gate", s::kHidden, s::kQDim},        {"k / v", s::kHidden, s::kKvDim},
-      {"o_proj", s::kQDim, s::kHidden},               {"gate / up", s::kHidden, s::kIntermediate},
+      {"q / attn_gate", s::kHidden, s::kQDim}, {"k / v", s::kHidden, s::kKvDim},
+      {"o_proj", s::kQDim, s::kHidden},        {"gate / up", s::kHidden, s::kIntermediate},
       {"down", s::kIntermediate, s::kHidden},
   };
 
@@ -167,6 +167,6 @@ INSTANTIATE_TEST_SUITE_P(Qwen35, Matmul950PrTest,
                                             ::testing::ValuesIn(s::LinearOutputSizes())),
                          MatmulTestName);
 
-}
-}
-}
+}  // namespace
+}  // namespace test
+}  // namespace vllm_ascend

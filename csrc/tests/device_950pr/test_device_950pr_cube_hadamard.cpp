@@ -74,10 +74,9 @@ hs::Deviation RunHybrid(int64_t dim, int64_t num_vectors, uint32_t variant, cons
   DeviceBuffer out_dev = DeviceBuffer::Empty<float>(input.size());
   FillSentinel(out_dev, input.size());
 
-  sim_hadamard_hybrid_impl(stream, in_dev.get(), h_dev.get(), out_dev.get(), static_cast<uint32_t>(dim),
-                           static_cast<uint32_t>(num_vectors),
-                           static_cast<uint32_t>(hs::HadamardVectorsPerChunk(dim, num_vectors)), variant,
-                           hs::InvSqrtDim(dim));
+  sim_hadamard_hybrid_impl(
+      stream, in_dev.get(), h_dev.get(), out_dev.get(), static_cast<uint32_t>(dim), static_cast<uint32_t>(num_vectors),
+      static_cast<uint32_t>(hs::HadamardVectorsPerChunk(dim, num_vectors)), variant, hs::InvSqrtDim(dim));
   ACL_CHECK(aclrtSynchronizeStream(stream));
 
   const std::vector<float> got = out_dev.ToHost<float>();
@@ -108,8 +107,8 @@ TEST(CubeHadamardSweep, AivBaseline) {
       const std::vector<float> got = out_dev.ToHost<float>();
       const hs::Deviation d = hs::Compare(got, golden);
       Report(hs::CaseLabel(dim, num_vectors, "aiv"), d, got, golden);
-      EXPECT_LT(d.max_abs, kAivCeiling)
-          << "the AIV-only fp32 transform does not reproduce cpu_fwht at D=" << dim << ", V=" << num_vectors;
+      EXPECT_LT(d.max_abs, kAivCeiling) << "the AIV-only fp32 transform does not reproduce cpu_fwht at D=" << dim
+                                        << ", V=" << num_vectors;
     }
   }
 }
@@ -155,8 +154,7 @@ TEST(CubeHadamardSweep, HybridHiLoDualDst) {
                     hs::CaseLabel(dim, num_vectors, "dualdst").c_str());
         continue;
       }
-      const hs::Deviation d =
-          RunHybrid(dim, num_vectors, hs::kHybridHiLo | hs::kHybridDualDst, "dualdst", stream);
+      const hs::Deviation d = RunHybrid(dim, num_vectors, hs::kHybridHiLo | hs::kHybridDualDst, "dualdst", stream);
       EXPECT_LT(d.max_abs, kMaxAbsError)
           << "Fixpipe's dual-destination mode did not put half the product in each subcore's UB at D=" << dim
           << ", V=" << num_vectors << "; if the worst lane is at " << (num_vectors / 2) * dim
@@ -165,6 +163,6 @@ TEST(CubeHadamardSweep, HybridHiLoDualDst) {
   }
 }
 
-}
-}
-}
+}  // namespace
+}  // namespace test
+}  // namespace vllm_ascend

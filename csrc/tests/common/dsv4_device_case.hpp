@@ -8,79 +8,20 @@
 #include <stdexcept>
 #include <vector>
 
-#include "device_buffer.hpp"
+#include "ascend_device_context.hpp"
+#include "dsv4_metrics.hpp"
 #include "dsv4_moe_expert_launch.hpp"
 
 namespace vllm_ascend::test::dsv4 {
-constexpr int64_t kProductionHidden = 7168;
-constexpr int64_t kProductionInter = 2048;
-constexpr int64_t kDeviceMaxUlp = 2;
-constexpr double kDeviceMaxRate = 1e-2;
-using DeviceOutputs = std::array<std::vector<uint16_t>, 4>;
-
-// Integer-only generator: identical data across host standard libraries.
-inline Problem MakeDeviceProblem(int64_t hidden, int64_t inter, uint32_t seed) {
-  if (!GeometryIsAccepted(hidden, inter)) throw std::invalid_argument("unsupported DSV4 geometry");
-  uint32_t state = seed | 1u;
-  auto next = [&state]() {
-    state ^= state << 13;
-    state ^= state >> 17;
-    state ^= state << 5;
-    return state;
-  };
-  Problem p;
-  p.hidden = hidden;
-  p.inter = inter;
-  p.x.resize(static_cast<size_t>(hidden));
-  for (auto& v : p.x) v = FloatToBf16Bits((static_cast<int>(next() % 513) - 256) / 128.0f);
-  for (auto* w : {&p.w1, &p.w2, &p.w3}) {
-    w->resize(static_cast<size_t>(hidden * inter / kFp4PerByte));
-    for (auto& b : *w) b = static_cast<uint8_t>(next());
-    for (size_t j = 0; j < w->size() && j < 256; ++j) (*w)[j] = static_cast<uint8_t>(j);
-  }
-  for (auto* s : {&p.w1_scale, &p.w2_scale, &p.w3_scale}) {
-    s->resize(static_cast<size_t>(hidden * inter / kFp4Block));
-    for (auto& b : *s) b = static_cast<uint8_t>(120 + next() % 5);
-  }
-  return p;
-}
-
-inline DeviceOutputs Golden(const Problem& p) {
-  auto g = ReferenceExpert(p.View(), p.hidden, p.inter);
-  return {std::move(g.gate_out), std::move(g.up_out), std::move(g.activated), std::move(g.down_out)};
-}
-
-class ExpertStream {
- public:
-  ExpertStream() { ACL_CHECK(aclrtCreateStream(&stream_)); }
-  ~ExpertStream() {
-    ACL_CHECK_NOTHROW(aclrtSynchronizeStream(stream_));
-    ACL_CHECK_NOTHROW(aclrtDestroyStream(stream_));
-  }
-  ExpertStream(const ExpertStream&) = delete;
-  ExpertStream& operator=(const ExpertStream&) = delete;
-  aclrtStream get() const { return stream_; }
-
- private:
-  aclrtStream stream_ = nullptr;
-};
-
-class PinnedOutput {
- public:
-  explicit PinnedOutput(size_t bytes) { ACL_CHECK(aclrtMallocHost(&data_, bytes)); }
-  ~PinnedOutput() { ACL_CHECK_NOTHROW(aclrtFreeHost(data_)); }
-  PinnedOutput(const PinnedOutput&) = delete;
-  PinnedOutput& operator=(const PinnedOutput&) = delete;
-  void* get() const { return data_; }
-
- private:
-  void* data_ = nullptr;
-};
+using ExpertStream = AscendStream;
+using PinnedOutput = PinnedHostBuffer;
 
 class DeviceExpert {
  public:
-  explicit DeviceExpert(const Problem& p)
-      : hidden_(p.hidden),
+  explicit DeviceExpert(const Problem& p, aclrtStream external_stream = nullptr)
+      : stream_(external_stream == nullptr),
+        external_stream_(external_stream),
+        hidden_(p.hidden),
         inter_(p.inter),
         x_(DeviceBuffer::FromHost(p.x)),
         w1_(DeviceBuffer::FromHost(p.w1)),
@@ -99,10 +40,10 @@ class DeviceExpert {
       ACL_CHECK(aclrtMemset(output_[i].get(), output_[i].size_bytes(), 0xA5, output_[i].size_bytes()));
     }
   }
-  ~DeviceExpert() { ACL_CHECK_NOTHROW(aclrtSynchronizeStream(stream_.get())); }
+  ~DeviceExpert() { ACL_CHECK_NOTHROW(aclrtSynchronizeStream(stream())); }
   DeviceExpert(const DeviceExpert&) = delete;
   DeviceExpert& operator=(const DeviceExpert&) = delete;
-  aclrtStream stream() const { return stream_.get(); }
+  aclrtStream stream() const { return external_stream_ == nullptr ? stream_.get() : external_stream_; }
   void Enqueue() {
     dsv4_moe_expert_impl(stream(), 1, x_.get(), w1_.get(), w2_.get(), w3_.get(), s1_.get(), s2_.get(), s3_.get(),
                          output_[0].get(), output_[1].get(), output_[2].get(), output_[3].get(), workspace_.get(),
@@ -110,14 +51,7 @@ class DeviceExpert {
   }
   DeviceOutputs Read() {
     DeviceOutputs result;
-    for (size_t i = 0; i < result.size(); ++i) {
-      const size_t bytes = output_[i].size_bytes();
-      PinnedOutput pinned(bytes);
-      ACL_CHECK(aclrtMemcpyAsync(pinned.get(), bytes, output_[i].get(), bytes, ACL_MEMCPY_DEVICE_TO_HOST, stream()));
-      ACL_CHECK(aclrtSynchronizeStream(stream()));
-      result[i].resize(bytes / sizeof(uint16_t));
-      std::memcpy(result[i].data(), pinned.get(), bytes);
-    }
+    for (size_t i = 0; i < result.size(); ++i) result[i] = CopyToHostAsync<uint16_t>(output_[i], stream());
     return result;
   }
   size_t AllocatedBytes() const {
@@ -129,7 +63,8 @@ class DeviceExpert {
   }
 
  private:
-  ExpertStream stream_;  // destroyed after buffers; destructor drains before their release
+  ExpertStream stream_;                    // destroyed after buffers; destructor drains before their release
+  aclrtStream external_stream_ = nullptr;  // borrowed; caller keeps it alive through expert destruction
   int64_t hidden_, inter_;
   DeviceBuffer x_, w1_, w2_, w3_, s1_, s2_, s3_, workspace_, tiling_;
   std::array<DeviceBuffer, 4> output_;

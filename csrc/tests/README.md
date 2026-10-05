@@ -47,7 +47,7 @@ csrc/tests/
 |-- common/                 shared infrastructure (see the table below), including
 |                           hadamard_spike_kernels.cpp -- test-owned Ascend C both
 |                           the sim and device spike binaries link, not the decode
-|-- reference/              turbo_quant_cpu.h and dsv4_moe_expert_cpu.h, the CPU oracles
+|-- reference/              turbo_quant_cpu.h; DSV4 oracle lives in common/dsv4_test_oracle.hpp
 |-- data/golden_layer3/     Git LFS: weights, taps and output of one Qwen3.5 layer
 |-- ascendc/                ascendc_library() for EVERY Ascend C kernel in the suite,
 |                           TurboQuant and DSV4 alike: ascendc.cmake creates bare
@@ -67,7 +67,9 @@ csrc/tests/
 |   |-- test_sim_950pr_cube_hadamard.cpp          spike: one shape of the sweep below
 |   `-- test_sim_950pr_dsv4_moe_expert.cpp        the DSV4 expert: numerics, and the repeat-launch cases that are the only check on its hand-written pipe sync
 |
-|-- device/                 TIER 3 -- physical 950PR silicon; every timing
+|-- device_950pr/                 TIER 3 -- physical 950PR silicon; every timing
+|   |-- test_device_950pr_dsv4_moe_expert.cpp   shared production expert suite
+|   |-- bench_device_950pr_dsv4_moe_expert.cpp  CANN V5 comparison via common pipeline
 |   |-- test_device_950pr_turboquant.cpp          production shapes, camodel refused
 |   |-- test_device_950pr_matmul.cpp
 |   |-- test_device_950pr_rmsnorm.cpp
@@ -80,6 +82,9 @@ csrc/tests/
 |   |-- bench_main_950pr_hadamard.cpp             its entry point; only it takes argv
 |   |-- bench_device_950pr_turboquant.cpp         decode legs, then the prefill sweep against FIA V5
 |   `-- prof_device_950pr_msprof_trace.cpp        one launch per leg under mstx ranges, for msprof; own main()
+|
+|-- device_910b/            physical 910B; shared DSV4 production suite
+|   `-- test_device_910b_dsv4_moe_expert.cpp
 |
 `-- device_310p/            the 310P leg -- NOT configured under a 950PR SoC
     |-- test_*_310p.cpp
@@ -97,6 +102,9 @@ csrc/tests/
 | `benchmark.hpp` / `.cpp` | plan-once launch, event timing, statistics, reporting |
 | `camodel_guard.hpp` | a watchdog the sim tier arms around a launch, so a hung camodel exits naming the case instead of running to the ctest timeout |
 | `cpu_reference.hpp` / `.cpp` | naive fp32 references for all five kernels |
+| `dsv4_test_oracle.hpp`, `dsv4_metrics.hpp`, `dsv4_synthetic_data.hpp` | runtime-free DSV4 arithmetic, metrics and deterministic cases |
+| `dsv4_production_suite.hpp`, `dsv4_benchmark_suite.cpp` | shared DSV4 correctness and CANN V5 comparison pipelines |
+| `ascend_device_context.hpp`, `ascend_benchmark_runner.hpp` | shared device/stream/HBM/pinned-copy owners and prepared-launch event timing |
 | `device_buffer.hpp` | RAII device allocation, 32-byte default, 512 for benchmarks |
 | `device_tensor.hpp` | device buffer + aclTensor descriptor, with host conversions |
 | `fp16.hpp` | IEEE-754 binary16 conversion, round-to-nearest-even |
@@ -124,8 +132,9 @@ tier's "no CAModel fallback" structural rather than aspirational.
 | Configuration | Tiers |
 | --- | --- |
 | `-DVLLM_ASCEND_TESTS_HOST_ONLY=ON` | `host/` |
-| `-DSOC_VERSION=Ascend950PR_9599` (RUN_MODE defaults to `npu`) | `host/` + `device/` |
+| `-DSOC_VERSION=Ascend950PR_9599` (RUN_MODE defaults to `npu`) | `host/` + `device_950pr/` |
 | `-DSOC_VERSION=Ascend950PR_9599 -DRUN_MODE=sim` | `host/` + `sim/` |
+| `-DSOC_VERSION=Ascend910B1 -DRUN_MODE=npu` | `host/` + `device_910b/` |
 | `-DSOC_VERSION=Ascend310P3` | `host/` + `device_310p/` |
 
 **A 950PR build excludes the 310P targets entirely** -- `device_310p/` is never
@@ -497,7 +506,7 @@ stream-bound mstx range, so each sub-kernel's host enqueue and device execution
 sit side by side:
 
 ```bash
-msprof --output=./prof/tq_trace --msproftx=on --task-time=l1 --runtime-api=on ./build/dev/device/prof_device_950pr_msprof_trace --models=DeepSeek-V4-Flash --contexts=2048 --batches=1 --mode=decode
+msprof --output=./prof/tq_trace --msproftx=on --task-time=l1 --runtime-api=on ./build/dev/device_950pr/prof_device_950pr_msprof_trace --models=DeepSeek-V4-Flash --contexts=2048 --batches=1 --mode=decode
 ```
 
 Without `--msproftx=on` the markers are not collected. The binary prints this

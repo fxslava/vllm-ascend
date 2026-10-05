@@ -80,8 +80,8 @@ class Shape {
 
   void EnqueueHybrid(aclrtStream stream, uint32_t variant) const {
     sim_hadamard_hybrid_impl(stream, input_.get(), h16_.get(), output_.get(), static_cast<uint32_t>(dim_),
-                             static_cast<uint32_t>(num_vectors_), static_cast<uint32_t>(vectors_per_chunk_),
-                             variant, inv_sqrt_dim_);
+                             static_cast<uint32_t>(num_vectors_), static_cast<uint32_t>(vectors_per_chunk_), variant,
+                             inv_sqrt_dim_);
   }
 
   void EnqueueAiv(aclrtStream stream) const {
@@ -109,19 +109,19 @@ class Shape {
   DeviceBuffer output_;
 };
 
-}
+}  // namespace
 
 void BuildSuite(BenchmarkRunner& runner) {
-  const std::vector<int64_t> dims =
-      ParseList("ASCEND_BENCH_HADAMARD_DIMS", kDefaultDims, std::size(kDefaultDims));
+  const std::vector<int64_t> dims = ParseList("ASCEND_BENCH_HADAMARD_DIMS", kDefaultDims, std::size(kDefaultDims));
   const std::vector<int64_t> batches =
       ParseList("ASCEND_BENCH_HADAMARD_BATCHES", kDefaultBatches, std::size(kDefaultBatches));
 
-  std::printf("[ascend-bench] Cube-factorised Walsh-Hadamard. Four legs per shape: aiv (all stages on the\n"
-              "[ascend-bench]   vector unit), single (lower four as one fp16 Mmad), hilo (two Mmads, the\n"
-              "[ascend-bench]   configuration that clears 1e-4) and dualdst (hilo with both subcores on the\n"
-              "[ascend-bench]   residual). Read aiv against dualdst; see this file's header for what the\n"
-              "[ascend-bench]   GM round trip does to that ratio.\n");
+  std::printf(
+      "[ascend-bench] Cube-factorised Walsh-Hadamard. Four legs per shape: aiv (all stages on the\n"
+      "[ascend-bench]   vector unit), single (lower four as one fp16 Mmad), hilo (two Mmads, the\n"
+      "[ascend-bench]   configuration that clears 1e-4) and dualdst (hilo with both subcores on the\n"
+      "[ascend-bench]   residual). Read aiv against dualdst; see this file's header for what the\n"
+      "[ascend-bench]   GM round trip does to that ratio.\n");
   std::fflush(stdout);
 
   std::vector<std::unique_ptr<Shape>> shapes;
@@ -162,8 +162,7 @@ void BuildSuite(BenchmarkRunner& runner) {
 
       for (const Leg& leg : legs) {
         const std::string name = hs::CaseLabel(dim, num_vectors, leg.label);
-        if (leg.variant == (hs::kHybridHiLo | hs::kHybridDualDst) &&
-            !hs::HadamardDualDstApplies(dim, num_vectors)) {
+        if (leg.variant == (hs::kHybridHiLo | hs::kHybridDualDst) && !hs::HadamardDualDstApplies(dim, num_vectors)) {
           runner.Skip(name, "chunk holds one vector; the dual-destination Fixpipe does not apply");
           continue;
         }
@@ -187,6 +186,6 @@ void BuildSuite(BenchmarkRunner& runner) {
   }
 }
 
-}
-}
-}
+}  // namespace bench
+}  // namespace test
+}  // namespace vllm_ascend

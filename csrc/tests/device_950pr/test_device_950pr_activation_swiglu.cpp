@@ -57,8 +57,7 @@ std::vector<float> RunSwiGluOnDevice(const std::vector<float>& x, int64_t num_to
 }
 
 TEST(SwiGlu950PrReference, MatchesClosedFormAtKnownPoints) {
-  const std::vector<float> x = {0.0f, 1.0f, -1.0f, 2.0f,
-                                3.0f, 2.0f, 5.0f, 0.0f};
+  const std::vector<float> x = {0.0f, 1.0f, -1.0f, 2.0f, 3.0f, 2.0f, 5.0f, 0.0f};
   std::vector<float> out;
   reference::SiluAndMul(x, 1, 4, &out);
 
@@ -164,6 +163,6 @@ INSTANTIATE_TEST_SUITE_P(Qwen35, SwiGlu950PrTest,
                                             ::testing::ValuesIn(s::IntermediateSizes())),
                          SwiGluTestName);
 
-}
-}
-}
+}  // namespace
+}  // namespace test
+}  // namespace vllm_ascend

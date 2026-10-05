@@ -1,0 +1,67 @@
+{
+  "950pr": [
+    "test_host_turboquant_fidelity",
+    "test_host_turboquant_tiling",
+    "test_host_dsv4_moe_expert",
+    "test_host_dsv4_common",
+    "test_device_950pr_dsv4_moe_expert",
+    "bench_device_950pr_dsv4_moe_expert",
+    "test_device_950pr_matmul",
+    "test_device_950pr_rmsnorm",
+    "test_device_950pr_rotary_embedding",
+    "test_device_950pr_activation_swiglu",
+    "test_device_950pr_qwen_layer_golden",
+    "test_device_950pr_benchmark_harness",
+    "test_device_950pr_turboquant",
+    "test_device_950pr_turboquant_multimode",
+    "test_device_950pr_cube_hadamard",
+    "bench_device_950pr_turboquant",
+    "bench_950pr_cube_hadamard",
+    "prof_device_950pr_msprof_trace"
+  ],
+  "910b": [
+    "test_host_turboquant_fidelity",
+    "test_host_turboquant_tiling",
+    "test_host_dsv4_moe_expert",
+    "test_host_dsv4_common",
+    "test_device_910b_dsv4_moe_expert"
+  ],
+  "310p": [
+    "test_host_turboquant_fidelity",
+    "test_host_turboquant_tiling",
+    "test_host_dsv4_moe_expert",
+    "test_host_dsv4_common",
+    "test_matmul_310p",
+    "test_rmsnorm_310p",
+    "test_rotary_embedding_310p",
+    "test_activation_swiglu_310p",
+    "test_paged_attention_310p",
+    "bench_matmul_310p",
+    "bench_rmsnorm_310p",
+    "bench_rotary_embedding_310p",
+    "bench_activation_swiglu_310p",
+    "bench_paged_attention_310p"
+  ],
+  "sim": [
+    "test_host_turboquant_fidelity",
+    "test_host_turboquant_tiling",
+    "test_host_dsv4_moe_expert",
+    "test_host_dsv4_common",
+    "test_sim_950pr_cube_gemm",
+    "test_sim_950pr_cube_hadamard",
+    "test_sim_950pr_turboquant_rotate_q",
+    "test_sim_950pr_turboquant_kernels",
+    "test_sim_950pr_turboquant_decode",
+    "test_sim_950pr_turboquant_fused",
+    "test_sim_950pr_turboquant_multimode",
+    "test_sim_950pr_dsv4_moe_expert_production",
+    "test_sim_950pr_dsv4_moe_expert",
+    "bench_sim_950pr_dsv4_moe_expert"
+  ],
+  "host": [
+    "test_host_turboquant_fidelity",
+    "test_host_turboquant_tiling",
+    "test_host_dsv4_moe_expert",
+    "test_host_dsv4_common"
+  ]
+}

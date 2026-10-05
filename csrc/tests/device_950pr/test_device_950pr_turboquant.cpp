@@ -126,8 +126,8 @@ void ReferenceWritePath(const Scenario& s, int8_t fill, std::vector<int8_t>* key
     }
     for (int kv_head = 0; kv_head < kNumKvHeads; ++kv_head) {
       const size_t base = (static_cast<size_t>(pos) * kNumKvHeads + kv_head) * kHeadSize;
-      tq::cpu_reshape_and_cache_one(s.key.data() + base, kHeadSize, signs.data(), slot, kNumKvHeads, kv_head,
-                                    kv_head, key_cache->data(), scale_plane->data());
+      tq::cpu_reshape_and_cache_one(s.key.data() + base, kHeadSize, signs.data(), slot, kNumKvHeads, kv_head, kv_head,
+                                    key_cache->data(), scale_plane->data());
       tq::cpu_reshape_and_cache_one(s.value.data() + base, kHeadSize, signs.data(), slot, kNumKvHeads, kv_head,
                                     kNumKvHeads + kv_head, value_cache->data(), scale_plane->data());
     }
@@ -242,9 +242,9 @@ class DeviceScenario {
   bool aiv_queried() const { return aiv_queried_; }
 
   std::vector<const void*> DeviceBases() const {
-    return {key_.get(),        value_.get(),       query_.get(),      slots_.get(),      pi_signs_.get(),
-            write_tables_.get(), decode_tables_.get(), key_cache_.get(), value_cache_.get(),
-            scale_plane_.get(), block_tables_.get(), context_lens_.get(), out_.get()};
+    return {key_.get(),          value_.get(),         query_.get(),     slots_.get(),       pi_signs_.get(),
+            write_tables_.get(), decode_tables_.get(), key_cache_.get(), value_cache_.get(), scale_plane_.get(),
+            block_tables_.get(), context_lens_.get(),  out_.get()};
   }
 
  private:
@@ -276,14 +276,13 @@ class TurboQuantBareMetal : public ::testing::Test {
   static aclrtStream Stream() { return AscendTestEnvironment::Instance().stream(); }
 
   static void PrintHeader(const char* label, int context_len, const DeviceScenario& device) {
-    std::printf("\n[turboquant/bare-metal] %s: S=%d head=%d heads=%d kv=%d block=%d aiv=%lld%s\n", label,
-                context_len, kHeadSize, kNumHeads, kNumKvHeads, kBlockSize,
-                static_cast<long long>(device.aiv_num()),
+    std::printf("\n[turboquant/bare-metal] %s: S=%d head=%d heads=%d kv=%d block=%d aiv=%lld%s\n", label, context_len,
+                kHeadSize, kNumHeads, kNumKvHeads, kBlockSize, static_cast<long long>(device.aiv_num()),
                 device.aiv_queried() ? "" : " (assumed, runtime declined)");
   }
 };
 
-}
+}  // namespace
 
 TEST_F(TurboQuantBareMetal, DeviceIsPhysicalSiliconAndReportsItsTopology) {
   REQUIRE_PHYSICAL_ASCEND_950PR();
@@ -343,9 +342,8 @@ TEST_F(TurboQuantBareMetal, WritePathMatchesTheCpuReferenceAcrossContexts) {
       const BinAgreement agreement =
           ComparePackedCaches(*actual_planes[plane], *expected_planes[plane], scenario.slots);
       ASSERT_GT(agreement.examined, 0u) << plane_names[plane] << ": the scenario wrote no live rows";
-      std::printf("  %-6s S=%4d  max bin drift %d, %zu/%zu channels differ (%.4f%%)\n", plane_names[plane],
-                  context_len, agreement.max_drift, agreement.differing, agreement.examined,
-                  100.0 * agreement.differing_fraction());
+      std::printf("  %-6s S=%4d  max bin drift %d, %zu/%zu channels differ (%.4f%%)\n", plane_names[plane], context_len,
+                  agreement.max_drift, agreement.differing, agreement.examined, 100.0 * agreement.differing_fraction());
       EXPECT_LE(agreement.max_drift, kMaxLevelDrift)
           << plane_names[plane] << " at S=" << context_len
           << ": a channel is off by more than one 4-bit bin, which a coordinate landing either side of a "
@@ -370,8 +368,9 @@ TEST_F(TurboQuantBareMetal, WritePathMatchesTheCpuReferenceAcrossContexts) {
     }
     std::printf("  scales S=%4d  worst relative error %.3e\n", context_len, worst_scale_error);
     EXPECT_LE(worst_scale_error, kScaleRelativeTolerance)
-        << "scale plane at S=" << context_len << ": the sum-of-squares reduction disagrees with the host by more "
-                                                 "than fp32 rounding allows";
+        << "scale plane at S=" << context_len
+        << ": the sum-of-squares reduction disagrees with the host by more "
+           "than fp32 rounding allows";
     std::fflush(stdout);
   }
 }
@@ -387,8 +386,9 @@ TEST_F(TurboQuantBareMetal, PackedCacheIsByteIdenticalOnRotationExactInputs) {
   for (int c = 0; c < kHeadSize; ++c) {
     ASSERT_FLOAT_EQ(HalfBitsToFloat(FloatToHalfBits(vector_k[static_cast<size_t>(c)])),
                     vector_k[static_cast<size_t>(c)])
-        << "channel " << c << " of the Pi-preimage is not exactly representable in fp16; the construction in "
-                              "PiPreimageOfSignVector assumes 1/sqrt(head_size) is a power of two";
+        << "channel " << c
+        << " of the Pi-preimage is not exactly representable in fp16; the construction in "
+           "PiPreimageOfSignVector assumes 1/sqrt(head_size) is a power of two";
   }
 
   const size_t kv_elems = static_cast<size_t>(context_len) * kNumKvHeads * kHeadSize;
@@ -459,10 +459,9 @@ TEST_F(TurboQuantBareMetal, DecodeMatchesTheCpuReferenceAcrossContexts) {
     const std::vector<float> scale_plane = device.ScalePlane();
 
     std::vector<float> reference(static_cast<size_t>(kNumHeads) * kHeadSize, 0.0f);
-    tq::cpu_paged_attention_turboquant(scenario.query.data(), key_cache.data(), value_cache.data(),
-                                       scale_plane.data(), scenario.table.data(), context_len, kNumHeads,
-                                       kNumKvHeads, kHeadSize, kBlockSize, kAttentionScale, signs.data(),
-                                       reference.data());
+    tq::cpu_paged_attention_turboquant(scenario.query.data(), key_cache.data(), value_cache.data(), scale_plane.data(),
+                                       scenario.table.data(), context_len, kNumHeads, kNumKvHeads, kHeadSize,
+                                       kBlockSize, kAttentionScale, signs.data(), reference.data());
 
     const tq::FidelityMetrics metrics = tq::cpu_fidelity(device.Output(), reference);
     std::printf("  decode S=%4d  cos=%.6f  snr=%7.2f dB  relL2=%.6f\n", context_len, metrics.cosine_similarity,
@@ -485,8 +484,7 @@ TEST_F(TurboQuantBareMetal, CacheGeometryAndAlignmentMatchTheDocumentedLayout) {
 
   constexpr size_t kBurstBytes = 32;
   const size_t scale_slot = tq::cpu_scale_slot_floats(kNumKvHeads);
-  EXPECT_EQ(scale_slot % (kBurstBytes / sizeof(float)), 0u)
-      << "a token's scale slot is not a whole 32-byte burst";
+  EXPECT_EQ(scale_slot % (kBurstBytes / sizeof(float)), 0u) << "a token's scale slot is not a whole 32-byte burst";
   EXPECT_EQ((static_cast<size_t>(kNumKvHeads) * (kHeadSize / tq::kPackFactor)) % kBurstBytes, 0u)
       << "a token's packed bytes across all kv heads are not a whole number of 32-byte bursts, so the scatter "
          "cannot be one aligned DataCopy";
@@ -500,8 +498,8 @@ TEST_F(TurboQuantBareMetal, CacheGeometryAndAlignmentMatchTheDocumentedLayout) {
 
   const size_t packed_bytes = tqh::PackedCacheBytes(scenario.num_blocks, kBlockSize, kNumKvHeads, kHeadSize);
   const size_t scale_floats = tqh::ScalePlaneFloats(scenario.num_blocks, kBlockSize, kNumKvHeads);
-  EXPECT_EQ(packed_bytes, static_cast<size_t>(scenario.num_blocks) * kBlockSize * kNumKvHeads *
-                              (kHeadSize / tq::kPackFactor));
+  EXPECT_EQ(packed_bytes,
+            static_cast<size_t>(scenario.num_blocks) * kBlockSize * kNumKvHeads * (kHeadSize / tq::kPackFactor));
   EXPECT_EQ(scale_floats, static_cast<size_t>(scenario.num_blocks) * kBlockSize * scale_slot);
   EXPECT_EQ(device.KeyCache().size(), packed_bytes);
   EXPECT_EQ(device.ValueCache().size(), packed_bytes);
@@ -515,10 +513,9 @@ TEST_F(TurboQuantBareMetal, CacheGeometryAndAlignmentMatchTheDocumentedLayout) {
   const double fp16_bytes = 2.0 * static_cast<double>(context_len) * kNumKvHeads * kHeadSize * sizeof(uint16_t);
   const double tq4_bytes = 2.0 * static_cast<double>(context_len) * kNumKvHeads * (kHeadSize / tq::kPackFactor) +
                            static_cast<double>(context_len) * static_cast<double>(scale_slot) * sizeof(float);
-  std::printf("  S=%d: fp16 KV %.1f KiB, 4-bit KV %.1f KiB (%.2fx smaller, scale plane is %.1f%% of it)\n",
-              context_len, fp16_bytes / 1024.0, tq4_bytes / 1024.0, fp16_bytes / tq4_bytes,
-              100.0 * (static_cast<double>(context_len) * static_cast<double>(scale_slot) * sizeof(float)) /
-                  tq4_bytes);
+  std::printf("  S=%d: fp16 KV %.1f KiB, 4-bit KV %.1f KiB (%.2fx smaller, scale plane is %.1f%% of it)\n", context_len,
+              fp16_bytes / 1024.0, tq4_bytes / 1024.0, fp16_bytes / tq4_bytes,
+              100.0 * (static_cast<double>(context_len) * static_cast<double>(scale_slot) * sizeof(float)) / tq4_bytes);
   std::fflush(stdout);
   EXPECT_GT(fp16_bytes / tq4_bytes, 3.0) << "the 4-bit cache is not saving what its layout says it should";
 }
@@ -587,8 +584,8 @@ TEST_F(TurboQuantBareMetal, WritePathTouchesNoByteOutsideItsSlotMapping) {
     }
   }
 
-  std::printf("  %zu poisoned rows survived, %zu live rows written, %zu live rows still all-poison\n",
-              poisoned_rows, written_rows, untouched_live_rows);
+  std::printf("  %zu poisoned rows survived, %zu live rows written, %zu live rows still all-poison\n", poisoned_rows,
+              written_rows, untouched_live_rows);
   std::fflush(stdout);
   EXPECT_EQ(untouched_live_rows, 0u)
       << "rows the slot mapping names came back unwritten; the scatter did not reach them";
@@ -625,5 +622,5 @@ TEST_F(TurboQuantBareMetal, RepeatedDecodeLaunchesAreBitIdentical) {
   std::fflush(stdout);
 }
 
-}
-}
+}  // namespace test
+}  // namespace vllm_ascend

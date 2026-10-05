@@ -31,6 +31,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cmath>
 #include <cstring>
@@ -40,14 +42,22 @@ namespace vllm_ascend {
 namespace test {
 namespace dsv4 {
 
-constexpr int64_t kFp4Block = 32;    // E8M0 scale span, in logical elements
-constexpr int64_t kFp4PerByte = 2;   // two E2M1 nibbles per storage byte
+using DeviceOutputs = std::array<std::vector<uint16_t>, 4>;
+
+// Explicit TBuf payload of the shipping 8x512 streaming kernel. TPipe stack
+// overhead is additional; no allocation or offset here assumes 256 KiB UB.
+constexpr size_t kExpertStreamingScratchBytes = 93696;
+constexpr size_t ExpertUbBytes(int64_t hidden, int64_t inter) {
+  return kExpertStreamingScratchBytes + static_cast<size_t>(2 * hidden + 4 * std::max(hidden, inter) + 18 * inter);
+}
+
+constexpr int64_t kFp4Block = 32;   // E8M0 scale span, in logical elements
+constexpr int64_t kFp4PerByte = 2;  // two E2M1 nibbles per storage byte
 
 // E2M1: bit3 sign, bits2..1 exponent (bias 1), bit0 mantissa.
 inline const float* E2m1Table() {
   static const float kTable[16] = {
-      0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-      -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+      0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f, -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
   };
   return kTable;
 }
@@ -109,8 +119,8 @@ inline float UnpackFp4(const uint8_t* packed_row, int64_t col) {
 //
 // Ascending column order and a single fp32 accumulator. The device uses
 // block reductions and column tiles; its reassociation must pass the ULP gate.
-inline void Project(const float* x, const uint8_t* packed, const uint8_t* scales,
-                    int64_t rows, int64_t cols, float* out) {
+inline void Project(const float* x, const uint8_t* packed, const uint8_t* scales, int64_t rows, int64_t cols,
+                    float* out) {
   const int64_t packed_per_row = cols / kFp4PerByte;
   const int64_t scales_per_row = cols / kFp4Block;
   for (int64_t row = 0; row < rows; ++row) {
@@ -131,13 +141,13 @@ inline void Project(const float* x, const uint8_t* packed, const uint8_t* scales
 // which is only useful for characterising what the clamp changes.
 constexpr float kSwigluLimit = 10.0f;
 
+// Canonical operands: src0=up, src1=gate; src0 * swish(src1).
 // silu(clamp(g)) * u, evaluated as (g * sigmoid(g)) * u to match the kernel's
 // expression.
 inline float SwiGluElement(float gate, float up, float clamp = kSwigluLimit) {
   float g = gate;
   if (clamp > 0.0f) {
-    if (g > clamp) g = clamp;
-    if (g < -clamp) g = -clamp;
+    g = std::clamp(g, -clamp, clamp);
   }
   const float neg_exp = std::exp(-g);
   const float sigmoid = 1.0f / (1.0f + neg_exp);
@@ -161,18 +171,18 @@ struct ExpertOutputs {
 };
 
 struct ExpertInputs {
-  const uint16_t* x;         // [hidden] bf16 bits
-  const uint8_t* w1;         // [inter, hidden/2]
-  const uint8_t* w2;         // [hidden, inter/2]
-  const uint8_t* w3;         // [inter, hidden/2]
-  const uint8_t* w1_scale;   // [inter, hidden/32]
-  const uint8_t* w2_scale;   // [hidden, inter/32]
-  const uint8_t* w3_scale;   // [inter, hidden/32]
+  const uint16_t* x;        // [hidden] bf16 bits
+  const uint8_t* w1;        // [inter, hidden/2]
+  const uint8_t* w2;        // [hidden, inter/2]
+  const uint8_t* w3;        // [inter, hidden/2]
+  const uint8_t* w1_scale;  // [inter, hidden/32]
+  const uint8_t* w2_scale;  // [hidden, inter/32]
+  const uint8_t* w3_scale;  // [inter, hidden/32]
 };
 
 // The full expert pipeline: gate/up FP4 GEMM, SwiGLU, down FP4 GEMM.
-inline ExpertOutputs ReferenceExpert(const ExpertInputs& in, int64_t hidden,
-                                     int64_t inter, float clamp = kSwigluLimit) {
+inline ExpertOutputs ReferenceExpert(const ExpertInputs& in, int64_t hidden, int64_t inter,
+                                     float clamp = kSwigluLimit) {
   std::vector<float> x_f32(static_cast<size_t>(hidden));
   for (int64_t c = 0; c < hidden; ++c) {
     x_f32[static_cast<size_t>(c)] = Bf16BitsToFloat(in.x[c]);
@@ -185,8 +195,7 @@ inline ExpertOutputs ReferenceExpert(const ExpertInputs& in, int64_t hidden,
 
   std::vector<float> activated(static_cast<size_t>(inter));
   for (int64_t j = 0; j < inter; ++j) {
-    activated[static_cast<size_t>(j)] =
-        SwiGluElement(gate[static_cast<size_t>(j)], up[static_cast<size_t>(j)], clamp);
+    activated[static_cast<size_t>(j)] = SwiGluElement(gate[static_cast<size_t>(j)], up[static_cast<size_t>(j)], clamp);
   }
 
   std::vector<float> down(static_cast<size_t>(hidden));

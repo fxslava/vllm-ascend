@@ -37,7 +37,7 @@
 #include <random>
 #include <vector>
 
-#include "dsv4_moe_expert_cpu.h"
+#include "dsv4_test_oracle.hpp"
 
 namespace {
 
@@ -220,8 +220,7 @@ struct Problem {
   std::vector<uint8_t> w1, w2, w3, w1s, w2s, w3s;
 
   ExpertInputs View() const {
-    return ExpertInputs{x.data(), w1.data(), w2.data(), w3.data(),
-                        w1s.data(), w2s.data(), w3s.data()};
+    return ExpertInputs{x.data(), w1.data(), w2.data(), w3.data(), w1s.data(), w2s.data(), w3s.data()};
   }
 };
 
@@ -262,8 +261,8 @@ std::vector<uint16_t> Fp64DownOut(const Problem& p) {
   std::vector<double> x(static_cast<size_t>(hidden));
   for (int64_t c = 0; c < hidden; ++c) x[static_cast<size_t>(c)] = Bf16BitsToFloat(p.x[c]);
 
-  auto project = [&](const std::vector<double>& in, const std::vector<uint8_t>& w,
-                     const std::vector<uint8_t>& s, int64_t rows, int64_t cols) {
+  auto project = [&](const std::vector<double>& in, const std::vector<uint8_t>& w, const std::vector<uint8_t>& s,
+                     int64_t rows, int64_t cols) {
     std::vector<double> out(static_cast<size_t>(rows), 0.0);
     for (int64_t r = 0; r < rows; ++r) {
       double acc = 0.0;
@@ -273,8 +272,7 @@ std::vector<uint16_t> Fp64DownOut(const Problem& p) {
         const uint8_t sb = s[static_cast<size_t>(r * (cols / kFp4Block) + c / kFp4Block)];
         acc += x.empty() ? 0.0
                          : in[static_cast<size_t>(c)] *
-                               (static_cast<double>(E2m1Table()[nib]) *
-                                std::ldexp(1.0, static_cast<int>(sb) - 127));
+                               (static_cast<double>(E2m1Table()[nib]) * std::ldexp(1.0, static_cast<int>(sb) - 127));
       }
       out[static_cast<size_t>(r)] = acc;
     }
@@ -291,8 +289,8 @@ std::vector<uint16_t> Fp64DownOut(const Problem& p) {
     double g = gate[static_cast<size_t>(j)];
     g = std::min(static_cast<double>(kSwigluLimit), std::max(-static_cast<double>(kSwigluLimit), g));
     const double sig = 1.0 / (1.0 + std::exp(-g));
-    activated[static_cast<size_t>(j)] = Bf16BitsToFloat(
-        FloatToBf16Bits(static_cast<float>((g * sig) * up[static_cast<size_t>(j)])));
+    activated[static_cast<size_t>(j)] =
+        Bf16BitsToFloat(FloatToBf16Bits(static_cast<float>((g * sig) * up[static_cast<size_t>(j)])));
   }
   const std::vector<double> down = project(activated, p.w2, p.w2s, hidden, inter);
 

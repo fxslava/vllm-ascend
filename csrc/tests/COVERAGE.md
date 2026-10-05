@@ -274,7 +274,7 @@ computes the right answer*. Neither substitutes for the other.
 ## 7. The Ascend 950PR leg
 
 `-DSOC_VERSION=Ascend950PR_9599` selects a second set of binaries targeting the
-A5 part, split across the `host/`, `sim/` and `device/` tiers and excluding the
+A5 part, split across the `host/`, `sim/` and `device_950pr/` tiers and excluding the
 310P leg entirely. It is a different part, not a second opinion on the same one,
 so it does not close a 310P gap — but two of the items above are
 covered *there* for the first time, and the reason each was open on the 310P is

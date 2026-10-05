@@ -13,15 +13,16 @@
 #endif
 
 #include "aclnn_ops.hpp"
+#include "ascend_benchmark_runner.hpp"
+#include "dsv4_metrics.hpp"
+#include "dsv4_benchmark_suite.hpp"
 #include "device_tensor.hpp"
 #include "dsv4_device_case.hpp"
 #include "test_harness.hpp"
 
 namespace vllm_ascend::test {
-namespace {
+namespace dsv4_benchmark {
 namespace d = dsv4;
-constexpr int kWarmup = 50;
-constexpr int kIterations = 200;
 constexpr size_t kOperations = 7;
 // Signature matches the CANN 9.2 official aclnn_grouped_matmul_v5.h.
 // Some 9.1 toolkit bundles ship libopapi without individual operator headers.
@@ -37,37 +38,6 @@ using GmmV5Fn = int (*)(const aclTensorList*, const aclTensorList*, const aclTen
 using CatFn = int (*)(const aclTensorList*, int64_t, aclTensor*, uint64_t*, aclOpExecutor**);
 using ClampFn = int (*)(const aclTensor*, const aclScalar*, const aclScalar*, aclTensor*, uint64_t*, aclOpExecutor**);
 using CastFn = int (*)(const aclTensor*, aclDataType, aclTensor*, uint64_t*, aclOpExecutor**);
-
-class Events {
- public:
-  Events() {
-    ACL_CHECK(aclrtCreateEvent(&start_));
-    try {
-      ACL_CHECK(aclrtCreateEvent(&stop_));
-    } catch (...) {
-      ACL_CHECK_NOTHROW(aclrtDestroyEvent(start_));
-      throw;
-    }
-  }
-  ~Events() {
-    ACL_CHECK_NOTHROW(aclrtDestroyEvent(start_));
-    ACL_CHECK_NOTHROW(aclrtDestroyEvent(stop_));
-  }
-  template <typename Launch>
-  double Measure(aclrtStream stream, Launch launch) {
-    ACL_CHECK(aclrtRecordEvent(start_, stream));
-    launch();
-    ACL_CHECK(aclrtRecordEvent(stop_, stream));
-    ACL_CHECK(aclrtSynchronizeEvent(stop_));
-    float milliseconds = 0;
-    ACL_CHECK(aclrtEventElapsedTime(&milliseconds, start_, stop_));
-    if (!(milliseconds > 0) || !std::isfinite(milliseconds)) throw std::runtime_error("invalid event time");
-    return milliseconds * 1000.0;
-  }
-
- private:
-  aclrtEvent start_ = nullptr, stop_ = nullptr;
-};
 
 std::vector<float> DequantTransposed(const std::vector<uint8_t>& w, const std::vector<uint8_t>& s, int64_t rows,
                                      int64_t cols) {
@@ -178,11 +148,7 @@ class AclnnBaseline {
       got[1][j] = d::FloatToBf16Bits(combined[static_cast<size_t>(i_) + j]);
     }
     for (size_t j = 0; j < down.size(); ++j) got[3][j] = d::FloatToBf16Bits(down[j]);
-    for (size_t t = 0; t < got.size(); ++t)
-      for (size_t j = 0; j < got[t].size(); ++j)
-        if (!std::isfinite(d::Bf16BitsToFloat(got[t][j])) ||
-            d::Bf16UlpDistance(got[t][j], want[t][j]) > d::kDeviceMaxUlp)
-          throw std::runtime_error("ACLNN baseline failed golden parity; refusing timings");
+    d::RequireOutputParity(got, want);
   }
   size_t AllocatedBytes() const {
     // Owned tensor payload + alignment/allocator slack + shared peak workspace.
@@ -221,23 +187,6 @@ class AclnnBaseline {
   std::array<aclOpExecutor*, kOperations> executors_{};
 };
 
-template <typename Prepare, typename Launch>
-double Time(aclrtStream stream, Prepare prepare, Launch launch) {
-  for (int j = 0; j < kWarmup; ++j) {
-    prepare();
-    launch();
-    ACL_CHECK(aclrtSynchronizeStream(stream));
-  }
-  Events events;
-  std::vector<double> samples;
-  for (int j = 0; j < kIterations; ++j) {
-    prepare();
-    samples.push_back(events.Measure(stream, launch));
-  }
-  std::sort(samples.begin(), samples.end());
-  return (samples[kIterations / 2 - 1] + samples[kIterations / 2]) / 2;
-}
-
 void Run() {
   for (int64_t hidden : {int64_t{4096}, d::kProductionHidden}) {
     const auto p = d::MakeDeviceProblem(hidden, d::kProductionInter, 0xD540);
@@ -245,33 +194,34 @@ void Run() {
     d::DeviceExpert custom(p);
     custom.Enqueue();
     const auto got = custom.Read();
-    for (size_t t = 0; t < got.size(); ++t)
-      for (size_t j = 0; j < got[t].size(); ++j)
-        if (!std::isfinite(d::Bf16BitsToFloat(got[t][j])) ||
-            d::Bf16UlpDistance(got[t][j], want[t][j]) > d::kDeviceMaxUlp)
-          throw std::runtime_error("custom failed parity; refusing timings");
+    d::RequireOutputParity(got, want);
     AclnnBaseline baseline(p);
     baseline.Prepare();
     baseline.Enqueue();
     baseline.Check(want);
-    const double custom_us = Time(custom.stream(), [] {}, [&] { custom.Enqueue(); });
-    const double baseline_us = Time(baseline.stream(), [&] { baseline.Prepare(); }, [&] { baseline.Enqueue(); });
-    if (custom.Read() != got) throw std::runtime_error("custom changed bits during timing");
-    baseline.Check(want);
-    const double flops = 6.0 * hidden * p.inter;
     const double custom_bytes = 3.0 * hidden * p.inter * (0.5 + 1.0 / d::kFp4Block) + 4.0 * hidden + 6.0 * p.inter;
     const double baseline_bytes = 6.0 * hidden * p.inter;
+    const auto custom_timing =
+        MeasureExpert(custom.stream(), [] {}, [&] { custom.Enqueue(); }, hidden, p.inter, custom_bytes);
+    const auto baseline_timing = MeasureExpert(
+        baseline.stream(), [&] { baseline.Prepare(); }, [&] { baseline.Enqueue(); }, hidden, p.inter, baseline_bytes);
+    const double custom_us = custom_timing.latency.median_us;
+    const double baseline_us = baseline_timing.latency.median_us;
+    if (custom.Read() != got) throw std::runtime_error("custom changed bits during timing");
+    baseline.Check(want);
+
     std::printf("\nH=%lld I=%lld warmup=%d samples=%d median ACL event time\n", static_cast<long long>(hidden),
-                static_cast<long long>(p.inter), kWarmup, kIterations);
+                static_cast<long long>(p.inter), kExpertWarmupIterations, kExpertMeasuredIterations);
     std::printf(
         "+------------------------+-----------+---------+----------+-----------+--------------+\n"
         "| implementation         | us        | speedup | TFLOP/s  | eff GB/s  | owned HBM MiB|\n"
         "+------------------------+-----------+---------+----------+-----------+--------------+\n");
     std::printf("| custom packed FP4      | %9.3f | %7.3f | %8.4f | %9.3f | %12.3f |\n", custom_us,
-                baseline_us / custom_us, flops / custom_us / 1e6, custom_bytes / custom_us / 1e3,
+                baseline_us / custom_us, custom_timing.tflops(), custom_timing.gigabytes_per_second(),
                 custom.AllocatedBytes() / 1048576.0);
     std::printf("| ACLNN V5 dense BF16    | %9.3f |   1.000 | %8.4f | %9.3f | %12.3f |\n", baseline_us,
-                flops / baseline_us / 1e6, baseline_bytes / baseline_us / 1e3, baseline.AllocatedBytes() / 1048576.0);
+                baseline_timing.tflops(), baseline_timing.gigabytes_per_second(),
+                baseline.AllocatedBytes() / 1048576.0);
     std::puts(
         "+------------------------+-----------+---------+----------+-----------+--------------+\n"
         "ACLNN V5 uses pre-dequantized resident BF16 weights; dequantization/upload excluded.\n"
@@ -279,30 +229,5 @@ void Run() {
         "Owned HBM excludes CANN internal caches. Peak utilization/saturation needs SKU peaks and msprof.");
   }
 }
-}  // namespace
+}  // namespace dsv4_benchmark
 }  // namespace vllm_ascend::test
-
-int main() {
-  using namespace vllm_ascend::test;
-  if (IsRunningOnSimulator()) {
-    std::puts("Refusing simulator timings");
-    return 77;
-  }
-  auto& env = AscendTestEnvironment::Instance();
-  env.SetUp();
-  int status = 0;
-  try {
-    if (!env.available() || !env.is_950pr()) {
-      std::printf("No physical Ascend950PR: %s\n", env.unavailable_reason().c_str());
-      status = 77;
-    } else {
-      if (env.device().device_id() != 0) throw std::runtime_error("benchmark requires npu:0");
-      Run();
-    }
-  } catch (const std::exception& e) {
-    std::fprintf(stderr, "%s\n", e.what());
-    status = 1;
-  }
-  env.TearDown();
-  return status;
-}

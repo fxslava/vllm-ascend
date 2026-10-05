@@ -237,7 +237,7 @@ private:
                 const int64_t activeHalfCols = activeCols / FP4_PER_BYTE;
                 const int64_t activeBlocks = activeCols / FP4_BLOCK;
                 const int64_t activeBytes = chunkRows * activeHalfCols;
-                DeInterleave(xEven, xOdd, xFull[static_cast<uint32_t>(col0)], static_cast<int32_t>(activeCols));
+                SplitColumns(xEven, xOdd, xFull[static_cast<uint32_t>(col0)], static_cast<uint32_t>(activeCols));
                 WaitFlag<HardEvent::V_MTE2>(STAGING_EVENT_ID);  // staging free for refill
                 for (int64_t r = 0; r < chunkRows; ++r)
                 {
@@ -317,11 +317,11 @@ private:
                 LocalTensor<float> cur = partRaw;
                 while (mergeLen > 2 * chunkRows)
                 {
-                    DeInterleave(merge1, merge2, cur, static_cast<int32_t>(mergeLen));
+                    SplitColumns(merge1, merge2, cur, static_cast<uint32_t>(mergeLen));
                     Add(cur, merge1, merge2, static_cast<uint32_t>(mergeLen / 2));
                     mergeLen /= 2;
                 }
-                DeInterleave(merge1, merge2, cur, static_cast<int32_t>(mergeLen));
+                SplitColumns(merge1, merge2, cur, static_cast<uint32_t>(mergeLen));
                 Add(merge1, merge1, merge2, static_cast<uint32_t>(chunkRows));
                 Add(accRow, accRow, merge1, static_cast<uint32_t>(chunkRows));
             }
@@ -337,6 +337,44 @@ private:
         WaitFlag<HardEvent::MTE3_V>(ROW_EVENT_ID);      // drain: row ring closed
     }
 
+    __aicore__ void BitAnd(const LocalTensor<int32_t>& dst, const LocalTensor<int32_t>& lhs,
+                          const LocalTensor<int32_t>& rhs, uint32_t count)
+    {
+#if __CCE_AICORE__ == 220
+        // CANN arch220 calcount And reinterprets i32 as i16 without doubling count.
+        And(dst.ReinterpretCast<uint16_t>(), lhs.ReinterpretCast<uint16_t>(),
+            rhs.ReinterpretCast<uint16_t>(), count * 2);
+#else
+        And(dst, lhs, rhs, count);
+#endif
+    }
+
+    __aicore__ void BitOr(const LocalTensor<int32_t>& dst, const LocalTensor<int32_t>& lhs,
+                         const LocalTensor<int32_t>& rhs, uint32_t count)
+    {
+#if __CCE_AICORE__ == 220
+        Or(dst.ReinterpretCast<uint16_t>(), lhs.ReinterpretCast<uint16_t>(),
+           rhs.ReinterpretCast<uint16_t>(), count * 2);
+#else
+        Or(dst, lhs, rhs, count);
+#endif
+    }
+    __aicore__ void SplitColumns(const LocalTensor<float>& even, const LocalTensor<float>& odd,
+                                const LocalTensor<float>& src, uint32_t count)
+    {
+#if __CCE_AICORE__ == 220
+        // arch220 has no DeInterleave; stageA is dead at both split call sites.
+        LocalTensor<int32_t> offsets = stageABuf_.Get<int32_t>();
+        const uint32_t halfCount = count / FP4_PER_BYTE;
+        CreateVecIndex(offsets, 0, halfCount);
+        ShiftLeft(offsets, offsets, 3, halfCount);
+        Gather(even, src, offsets.ReinterpretCast<uint32_t>(), 0, halfCount);
+        Adds(offsets, offsets, static_cast<int32_t>(sizeof(float)), halfCount);
+        Gather(odd, src, offsets.ReinterpretCast<uint32_t>(), 0, halfCount);
+#else
+        DeInterleave(even, odd, src, static_cast<int32_t>(count));
+#endif
+    }
     // Packed FP4 bytes -> E2M1 fp32 values, in natural column order, written
     // through the int32 view of the products buffer (bit patterns).
     //
@@ -371,9 +409,17 @@ private:
         // decoded code came out zero. Only the u8 -> u16 step is trustworthy.
         //
         // stageB's uint16 alias is the staging area; it is not live yet.
+#if __CCE_AICORE__ == 220
+        // All byte values are exactly representable in both floating formats.
+        Cast(stageB.template ReinterpretCast<half>(), packed, RoundMode::CAST_NONE, byteCount);
+        Cast(stageC.template ReinterpretCast<float>(), stageB.template ReinterpretCast<half>(),
+             RoundMode::CAST_NONE, byteCount);
+        Cast(stageA, stageC.template ReinterpretCast<float>(), RoundMode::CAST_RINT, byteCount);
+#else
         LocalTensor<uint16_t> wide = stageB.template ReinterpretCast<uint16_t>();
         Cast(wide, packed, RoundMode::CAST_NONE, byteCount);
         Cast(stageA.template ReinterpretCast<uint32_t>(), wide, RoundMode::CAST_NONE, byteCount);
+#endif
 
         // Split the nibbles. Byte i holds element 2i in the low nibble and
         // 2i+1 in the high one, so the two halves are the even and the odd
@@ -383,7 +429,7 @@ private:
         // 32-byte blocks, not by elements. ProjectLeg pairs each half with the
         // matching half of x instead.
         Duplicate(stageB, 0x0F, byteCount);
-        And(codes, stageA, stageB, byteCount);                     // low nibbles
+        BitAnd(codes, stageA, stageB, byteCount);                     // low nibbles
         ShiftRight(codes[byteCount], stageA, 4, byteCount);        // high nibbles (byte < 256)
 
         // Everything below keys on the MAGNITUDE code c & 7, not on c: codes
@@ -391,7 +437,7 @@ private:
         // path. Keying on c sends code 9 down the normal branch and decodes it
         // to 0.75 instead of -0.5.
         Duplicate(stageC, 7, count);
-        And(stageB, codes, stageC, count);                         // stageB = magnitude code
+        BitAnd(stageB, codes, stageC, count);                         // stageB = magnitude code
 
         // Normal magnitudes (>= 2): bits = ((e + 126) << 23) | (m << 22),
         // e = mag >> 1 (already in [0, 3], no mask needed), m = mag & 1.
@@ -399,9 +445,9 @@ private:
         Adds(stageA, stageA, 126, count);
         ShiftLeft(stageA, stageA, 23, count);
         Duplicate(stageC, 1, count);
-        And(stageC, stageB, stageC, count);                        // m -- must be masked:
+        BitAnd(stageC, stageB, stageC, count);                        // m -- must be masked:
         ShiftLeft(stageC, stageC, 22, count);                      // shifting the whole code
-        Or(stageA, stageA, stageC, count);                         // corrupts the exponent
+        BitOr(stageA, stageA, stageC, count);                         // corrupts the exponent
 
         // Magnitude 1 -> +0.5, magnitude 0 -> +0.0. Tensor-TENSOR selects: the
         // else-branch has to preserve stageA. With a scalar else-branch every
@@ -409,18 +455,28 @@ private:
         // block above and leaves the output all but zero.
         Duplicate(stageC, E2M1_HALF_BITS, count);
         Compares(decMask, stageB, 1, CMPMODE::EQ, count);
+#if __CCE_AICORE__ == 220
+        Select(stageA.template ReinterpretCast<float>(), decMask, stageC.template ReinterpretCast<float>(),
+               stageA.template ReinterpretCast<float>(), SELMODE::VSEL_TENSOR_TENSOR_MODE, count);
+#else
         Select(stageA, decMask, stageC, stageA, SELMODE::VSEL_TENSOR_TENSOR_MODE, count);
+#endif
         Duplicate(stageC, E2M1_ZERO_BITS, count);
         Compares(decMask, stageB, 0, CMPMODE::EQ, count);
+#if __CCE_AICORE__ == 220
+        Select(stageA.template ReinterpretCast<float>(), decMask, stageC.template ReinterpretCast<float>(),
+               stageA.template ReinterpretCast<float>(), SELMODE::VSEL_TENSOR_TENSOR_MODE, count);
+#else
         Select(stageA, decMask, stageC, stageA, SELMODE::VSEL_TENSOR_TENSOR_MODE, count);
+#endif
 
         // Sign: bit 3 of the original code into bit 31, which also turns code 8
         // into -0.0. The result lands in `codes` -- the int32 alias of the
         // products buffer -- so the float view downstream sees these patterns.
         Duplicate(stageC, 8, count);
-        And(stageC, codes, stageC, count);
+        BitAnd(stageC, codes, stageC, count);
         ShiftLeft(stageC, stageC, 28, count);
-        Or(codes, stageA, stageC, count);
+        BitOr(codes, stageA, stageC, count);
     }
 
     // E8M0 byte vector -> fp32 power-of-two vector, in place via the i32 view:
@@ -437,18 +493,30 @@ private:
         // The merge ping-pong buffers are still idle at decode time, so they
         // host the widen staging and the wraparound predicate; scratch
         // alternates mask / delta duty.
-        LocalTensor<uint32_t> bitsU32 = scalesF32Buf_.Get<uint32_t>();
         LocalTensor<int32_t> bits = scalesF32Buf_.Get<int32_t>();
-        LocalTensor<uint16_t> wide = mergeBuf2_.Get<uint16_t>();
         LocalTensor<int32_t> wrap = mergeBuf2_.Get<int32_t>();
         LocalTensor<int32_t> scratch = mergeBuf1_.Get<int32_t>();
         LocalTensor<uint8_t> special = decMaskBuf_.Get<uint8_t>();
+#if __CCE_AICORE__ == 220
+        Cast(mergeBuf2_.Get<half>(), scales, RoundMode::CAST_NONE, count);
+        Cast(mergeBuf1_.Get<float>(), mergeBuf2_.Get<half>(), RoundMode::CAST_NONE, count);
+        Cast(bits, mergeBuf1_.Get<float>(), RoundMode::CAST_RINT, count);
+#else
+        LocalTensor<uint32_t> bitsU32 = scalesF32Buf_.Get<uint32_t>();
+        LocalTensor<uint16_t> wide = mergeBuf2_.Get<uint16_t>();
         Cast(wide, scales, RoundMode::CAST_NONE, count);
         Cast(bitsU32, wide, RoundMode::CAST_NONE, count);
+#endif
         Adds(wrap, bits, 1, count);                      // b + 1 (1..256)
         Duplicate(scratch, 0xFF, count);
-        And(wrap, wrap, scratch, count);                 // wrap to the u8 domain
+        BitAnd(wrap, wrap, scratch, count);                 // wrap to the u8 domain
+#if __CCE_AICORE__ == 220
+        // arch220 integer compares support EQ only; [0,255] converts exactly.
+        Cast(scratch.ReinterpretCast<float>(), wrap, RoundMode::CAST_NONE, count);
+        Compares(special, scratch.ReinterpretCast<float>(), 2.0f, CMPMODE::LT, count);
+#else
         Compares(special, wrap, 2, CMPMODE::LT, count);
+#endif
         ShiftLeft(bits, bits, 23, count);                // exact power-of-two bits
 
         // Build the fixup DELTA, then add it. The Select's destination is the
@@ -461,8 +529,13 @@ private:
         //   b = 0x00: 0            + 0x00400000 = 2^-127, the fp32 subnormal
         //   b = 0xFF: 0x7F800000   + 0x00400000 = 0x7FC00000, the OCP MX NaN
         Duplicate(scratch, static_cast<int32_t>(SUBNORMAL_BITS), count);
+#if __CCE_AICORE__ == 220
+        Select(scratch.ReinterpretCast<float>(), special, scratch.ReinterpretCast<float>(), 0.0f,
+               SELMODE::VSEL_TENSOR_SCALAR_MODE, count);
+#else
         Select(scratch, special, scratch, static_cast<int32_t>(ZERO_BITS), SELMODE::VSEL_TENSOR_SCALAR_MODE,
                count);
+#endif
         Add(bits, bits, scratch, count);
     }
 

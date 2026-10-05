@@ -30,6 +30,27 @@ namespace test {
 namespace bench {
 namespace {
 
+TEST(BenchmarkPreparation, RejectsPipelinedOneShotPlansBeforeAnyCallback) {
+  BenchmarkOptions options;
+  options.modes = {TimingMode::kPipelined};
+  BenchmarkCase sample;
+  int callbacks = 0;
+  sample.prepare = [&callbacks] { ++callbacks; };
+  EXPECT_THROW(ValidateBenchmarkPreparation(sample, options), std::invalid_argument);
+  EXPECT_EQ(callbacks, 0);
+}
+
+TEST(BenchmarkPreparation, AllowsPreparedSerialSamplesAndUnpreparedPipeline) {
+  BenchmarkOptions options;
+  options.modes = {TimingMode::kDeviceEvents, TimingMode::kHostWallClock};
+  BenchmarkCase sample;
+  sample.prepare = [] {};
+  EXPECT_NO_THROW(ValidateBenchmarkPreparation(sample, options));
+  sample.prepare = nullptr;
+  options.modes = {TimingMode::kPipelined};
+  EXPECT_NO_THROW(ValidateBenchmarkPreparation(sample, options));
+}
+
 TEST(LatencyStatistics, DropsNonPositiveSamples) {
   const LatencyStatistics statistics = LatencyStatistics::From({10.0, -5.0, 20.0, 0.0, 30.0});
 
@@ -130,8 +151,8 @@ class BenchmarkEnvironment : public ::testing::Test {
 
  private:
   static void ClearAll() {
-    for (const char* name : {"ASCEND_BENCH_WARMUP", "ASCEND_BENCH_ITERS", "ASCEND_BENCH_BATCH",
-                             "ASCEND_BENCH_MODES", "ASCEND_BENCH_CSV", "ASCEND_BENCH_REPEATABLE"}) {
+    for (const char* name : {"ASCEND_BENCH_WARMUP", "ASCEND_BENCH_ITERS", "ASCEND_BENCH_BATCH", "ASCEND_BENCH_MODES",
+                             "ASCEND_BENCH_CSV", "ASCEND_BENCH_REPEATABLE"}) {
       ::unsetenv(name);
     }
   }
@@ -233,7 +254,7 @@ TEST(Checksum, AccumulateInDoubleAndAreOrderStable) {
   EXPECT_GE(ChecksumSumOfSquares(values), 0.0);
 }
 
-}
-}
-}
-}
+}  // namespace
+}  // namespace bench
+}  // namespace test
+}  // namespace vllm_ascend

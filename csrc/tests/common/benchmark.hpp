@@ -111,8 +111,7 @@ PlannedOp PlanAclnn(const AclnnOp& op, Args... args) {
     throw AclError(op.unavailable_reason().c_str(), __FILE__, __LINE__, -1);
   }
   void* workspace_size_fn = op.get_workspace_size_fn();
-  PlannedOp::Planner planner = [workspace_size_fn, args...](uint64_t* workspace_size,
-                                                            aclOpExecutor** executor) -> int {
+  PlannedOp::Planner planner = [workspace_size_fn, args...](uint64_t* workspace_size, aclOpExecutor** executor) -> int {
     return reinterpret_cast<WorkspaceSizeFn>(workspace_size_fn)(args..., workspace_size, executor);
   };
   return PlannedOp(op.name(), op.launch_fn(), std::move(planner));
@@ -131,7 +130,12 @@ struct BenchmarkCase {
   std::function<double()> checksum;
 
   double checksum_rtol = 0.0;
+
+  // Optional one-shot plan preparation, excluded from event timing.
+  std::function<void()> prepare;
 };
+
+void ValidateBenchmarkPreparation(const BenchmarkCase& benchmark_case, const BenchmarkOptions& options);
 
 double ChecksumSum(const std::vector<float>& values);
 double ChecksumSumOfSquares(const std::vector<float>& values);
@@ -208,6 +212,6 @@ int RunBenchmarkSuite(const char* suite_name, const std::function<void(Benchmark
 
 constexpr int kBenchmarkSkipExitCode = 77;
 
-}
-}
-}
+}  // namespace bench
+}  // namespace test
+}  // namespace vllm_ascend
