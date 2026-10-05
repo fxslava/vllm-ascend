@@ -126,4 +126,6 @@ class AclnnV5Backend:
         )
 
     def _stream(self) -> int | None:
-        return resolve_stream_pointer(self._runtime.make_stream())
+        # Launch on the same stream as the tensor producers and consumers.
+        # A fresh stream per launch races both and discards its lifetime owner.
+        return resolve_stream_pointer(self._runtime.current_stream())

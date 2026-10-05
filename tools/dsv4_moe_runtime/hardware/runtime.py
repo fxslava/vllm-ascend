@@ -41,6 +41,9 @@ class DeviceRuntime(Protocol):
 
     def make_stream(self) -> object | None: ...
 
+    def current_stream(self) -> object | None:
+        """Stream owning the caller's tensor producers and consumers."""
+
     def stream_context(self, stream: object | None) -> AbstractContextManager[None]: ...
 
     def synchronize_stream(self, stream: object | None) -> None: ...
@@ -96,6 +99,9 @@ class NpuRuntime:
 
     def make_stream(self) -> object:
         return torch.npu.Stream()
+
+    def current_stream(self) -> object:
+        return torch.npu.current_stream(self.device)
 
     def stream_context(self, stream: object | None) -> AbstractContextManager[None]:
         return torch.npu.stream(stream)
@@ -168,6 +174,9 @@ class CudaRuntime:
     def make_stream(self) -> object:
         return torch.cuda.Stream(device=self.device)
 
+    def current_stream(self) -> object:
+        return torch.cuda.current_stream(self.device)
+
     def stream_context(self, stream: object | None) -> AbstractContextManager[None]:
         return torch.cuda.stream(stream)
 
@@ -216,6 +225,9 @@ class CpuRuntime:
         pass
 
     def make_stream(self) -> object | None:
+        return None
+
+    def current_stream(self) -> object | None:
         return None
 
     def stream_context(self, stream: object | None) -> AbstractContextManager[None]:

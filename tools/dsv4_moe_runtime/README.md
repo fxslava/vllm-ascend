@@ -82,7 +82,22 @@ PYTHONPATH=. python tools/dsv4_moe_runtime/bench_npu_offload_stress.py \
     --weights-dir /path/to/DeepSeek-V2-Lite --verify-samples 8
 ```
 
-## Tests
+## Real model generation
+
+The BF16 V2-Lite decoder loads backbone weights into a fixed arena, reserves
+shared experts and KV storage, and executes routed experts through the slot pool.
+Attention uses an eager reference path with temporary allocations. See
+[the inference audit](INFERENCE_AUDIT.md) for operator boundaries and measured
+RTX 5070 results.
+
+```powershell
+python -m tools.dsv4_moe_runtime.inference.dsv2_lite --weights-dir F:/AI/models/DeepSeek-V2-Lite-Chat --device cuda:0 --slots 64 --max-new-tokens 8 --report generation.json
+```
+
+## Runtime tests
+
+For persistent-pool cold/warm generation measurements, activation footprints
+and eviction analysis, see [the cache benchmark report](benchmarks/CACHE_REPORT.md).
 
 ```bash
 pytest tools/dsv4_moe_runtime/tests/ -v

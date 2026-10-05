@@ -115,7 +115,9 @@ class MoELayerScratch:
         self.probabilities = buffer(num_tokens, experts, buffer_dtype=torch.float32)
         self.topk_values = buffer(num_tokens, config.top_k, buffer_dtype=torch.float32)
         self.topk_indices = torch.zeros(num_tokens, config.top_k, dtype=torch.int64, device=self._device)
-        self.route_weight = buffer(num_tokens, 1)
+        self.route_weight = buffer(num_tokens, 1, buffer_dtype=torch.float32)
+        self.weighted_routed = buffer(num_tokens, hidden, buffer_dtype=torch.float32)
+        self.routed_sum = buffer(num_tokens, hidden, buffer_dtype=torch.float32)
 
         # Compute.
         self.routed_gate = buffer(num_tokens, routed_inter)
@@ -123,6 +125,7 @@ class MoELayerScratch:
         self.routed_out = buffer(num_tokens, hidden)
         self.shared_gate = None if shared_inter is None else buffer(num_tokens, shared_inter)
         self.shared_up = None if shared_inter is None else buffer(num_tokens, shared_inter)
+        self.shared_out = buffer(num_tokens, hidden)
         self.y = buffer(num_tokens, hidden)
 
     @property
@@ -252,10 +255,12 @@ def execute_moe_layer(
                 _as_weight(shared["w2"], shared_layout.spec_for("w2").logical_shape, scratch.dtype),
                 scratch.shared_gate,
                 scratch.shared_up,
-                scratch.y,
+                scratch.shared_out,
             )
         else:
-            scratch.y.zero_()
+            scratch.shared_out.zero_()
+
+        scratch.routed_sum.zero_()
 
         # --- 4. Routed experts, scaled by their router weights.
         for position, slot_id in enumerate(reservation.slot_ids):
@@ -274,8 +279,14 @@ def execute_moe_layer(
             # norm_topk_prob is false for this architecture, so the raw
             # softmax probability is the weight -- no renormalisation.
             scratch.route_weight.copy_(scratch.topk_values[:, position : position + 1])
-            scratch.routed_out.mul_(scratch.route_weight)
-            scratch.y.add_(scratch.routed_out)
+            # Match the checkpoint: weight and reduce routed outputs in fp32,
+            # cast once to BF16, then add the shared expert in BF16.
+            scratch.weighted_routed.copy_(scratch.routed_out)
+            scratch.weighted_routed.mul_(scratch.route_weight)
+            scratch.routed_sum.add_(scratch.weighted_routed)
+
+        scratch.y.copy_(scratch.routed_sum)
+        scratch.y.add_(scratch.shared_out)
 
         return MoELayerResult(
             layer_idx=layer_idx,

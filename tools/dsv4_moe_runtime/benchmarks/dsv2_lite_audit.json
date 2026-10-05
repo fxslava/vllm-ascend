@@ -1,0 +1,8 @@
+{
+  "tensors": 5291,
+  "parameters": 15706484224,
+  "checkpoint_bytes": 31412968448,
+  "routed_bytes": 28789702656,
+  "shared_bytes": 899678208,
+  "backbone_bytes": 1723587584
+}

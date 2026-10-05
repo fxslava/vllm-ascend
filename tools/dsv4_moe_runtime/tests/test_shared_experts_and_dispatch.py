@@ -463,5 +463,28 @@ class TestRealCheckpoint:
             want = reference.flatten().double()
             cosine = float(torch.dot(got, want) / (got.norm() * want.norm()))
             assert cosine > DISPATCH_COSINE, f"cos {cosine} -- the slot views are not the matrices they should be"
+
+            # The checkpoint reduces routed experts in fp32 before the one
+            # BF16 cast; weighting each expert in BF16 loses information.
+            def checkpoint_expert(module: str) -> torch.Tensor:
+                width = 2816 if module == "shared_experts" else 1408
+                weights = [
+                    host_weight(f"{prefix}.{module}.{name}_proj.weight", shape).to(device=x.device, dtype=x.dtype)
+                    for name, shape in (("gate", (width, 2048)), ("up", (width, 2048)), ("down", (2048, width)))
+                ]
+                return torch.nn.functional.linear(
+                    torch.nn.functional.silu(torch.nn.functional.linear(x, weights[0]))
+                    * torch.nn.functional.linear(x, weights[1]),
+                    weights[2],
+                )
+
+            routed_outputs = torch.stack(
+                [checkpoint_expert(f"experts.{expert}") for expert in result.expert_ids], dim=1
+            )
+            router_probs = torch.softmax(x.float() @ router.float().t(), dim=-1)
+            route_weights = router_probs[:, list(result.expert_ids)]
+            expected = (routed_outputs.float() * route_weights.unsqueeze(-1)).sum(1).bfloat16()
+            expected += checkpoint_expert("shared_experts")
+            torch.testing.assert_close(result.output, expected, rtol=0, atol=2e-5)
         finally:
             source.close()
