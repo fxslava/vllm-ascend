@@ -149,3 +149,13 @@ if(VLLM_ASCEND_TESTS_TIER_SIM AND SOC_VERSION STREQUAL "Ascend950PR_9599")
   ascendc_compile_options(vllm_ascend_moe_unpack_probe PRIVATE
     --cce-auto-sync=off -Werror -include "${probe_epoch}")
 endif()
+
+# Ascend C's ExternalProject compilations do not inherit the parent directory's
+# definitions. Feed both device precompilation and the host launcher compiler.
+foreach(kernel_target vllm_ascend_dsv4_moe_expert vllm_ascend_turboquant vllm_ascend_moe_unpack_probe)
+  if(TARGET ${kernel_target})
+    ascendc_compile_definitions(${kernel_target} PRIVATE CANN_VERSION_MAJOR=${CANN_VERSION_MAJOR})
+    ascendc_compile_options(${kernel_target} PRIVATE
+      -forward-options-to-host-compiler -DCANN_VERSION_MAJOR=${CANN_VERSION_MAJOR})
+  endif()
+endforeach()

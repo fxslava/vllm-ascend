@@ -48,6 +48,20 @@ GTest package. `VLLM_ASCEND_TESTS_FETCH_GTEST=OFF` prevents network access.
 remain available. DSV4 compilation always uses `--cce-auto-sync=off -Werror`;
 GoogleTest compilation does not inherit those flags.
 
+CANN major detection reads toolkit version metadata, including
+`compiler/version.info`, then tries the toolkit path and its resolved symlink
+target. On CANN 8.0, `version_dir=8.0.0` takes precedence over the internal
+component `Version=7.6.0.1.220`. An unknown version produces an error with the
+checked paths. Override detection with `-DCANN_VERSION_MAJOR=8` when needed.
+
+The major definition reaches device precompilation, device compilation and
+host launcher compilation. CANN 8 uses `WholeReduceSum` and `CompareScalar`;
+CANN 9 uses `ReduceRepeat<ReduceType::SUM>` and `Compares`. The legacy reduction
+writes directly to UB and introduces no scalar UB reads, work buffers or event
+changes. See Huawei's CANN 8.0 references for
+[WholeReduceSum](https://www.hiascend.com/doc_center/source/en/canncommercial/800/apiref/ascendcopapi/atlasascendc_api_07_0081.html)
+and [CompareScalar](https://www.hiascend.com/doc_center/source/en/canncommercial/800/apiref/ascendcopapi/atlasascendc_api_07_0068.html).
+
 Link-time driver stubs are searched in the toolkit's stub/devlib directories,
 after installed driver directories. Stubs and simulator directories are never
 placed on device executable RUNPATH. Stub linkage permits compilation on a

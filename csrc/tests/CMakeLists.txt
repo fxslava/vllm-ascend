@@ -299,6 +299,8 @@ endif()
 if(NOT VLLM_ASCEND_TESTS_HOST_ONLY)
 
 include(cmake/CannToolkit.cmake)
+include(cmake/CannVersion.cmake)
+add_compile_definitions(CANN_VERSION_MAJOR=${CANN_VERSION_MAJOR})
 
 message(STATUS "vllm-ascend tests: CANN at ${ASCEND_HOME_PATH}")
 message(STATUS "vllm-ascend tests: target SoC ${SOC_VERSION}")

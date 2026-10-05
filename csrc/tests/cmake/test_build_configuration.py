@@ -24,6 +24,7 @@ class ConfigurationTests(unittest.TestCase):
             "project(configuration NONE)\n"
             f'include("{(MODULES / module).as_posix()}")\n'
             'file(WRITE "${CMAKE_BINARY_DIR}/resolved.txt" "${ASCEND_HOME_PATH}")\n'
+            'file(WRITE "${CMAKE_BINARY_DIR}/major.txt" "${CANN_VERSION_MAJOR}")\n'
         )
         env = os.environ.copy()
         env.pop("ASCEND_HOME_PATH", None)
@@ -87,6 +88,47 @@ class ConfigurationTests(unittest.TestCase):
         ])
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Invalid offline GoogleTest source", result.stderr)
+
+    def assert_major(self, root, expected, extra=()):
+        result = self.configure("CannVersion.cmake", [f"-DASCEND_HOME_PATH={root}", *extra])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "build/major.txt").read_text(), str(expected))
+
+    def test_cann8_product_version_precedes_component_version(self):
+        root = self.toolkit("latest")
+        (root / "version.info").write_text("Version=7.6.0.1.220\nversion_dir=8.0.0\n")
+        self.assert_major(root, 8)
+
+    def test_cann9_compiler_metadata(self):
+        root = self.toolkit("latest")
+        (root / "compiler").mkdir()
+        (root / "compiler/version.info").write_text("Version=9.2.0-beta.2\nversion_dir=cann\n")
+        self.assert_major(root, 9)
+
+    def test_cann_version_path_fallback(self):
+        self.assert_major(self.toolkit("8.0.0"), 8)
+
+    @unittest.skipIf(os.name == "nt", "Directory symlink creation may require administrator rights")
+    def test_latest_symlink_resolves_version_path(self):
+        root = self.toolkit("9.1.0")
+        latest = self.root / "latest"
+        latest.symlink_to(root, target_is_directory=True)
+        self.assert_major(latest, 9)
+
+    def test_manual_cann_version_overrides_metadata(self):
+        root = self.toolkit("latest")
+        (root / "version.info").write_text("Version=9.2.0-beta.2\n")
+        self.assert_major(root, 8, ["-DCANN_VERSION_MAJOR=8"])
+
+    def test_unknown_cann_version_requests_override(self):
+        result = self.configure("CannVersion.cmake", [f"-DASCEND_HOME_PATH={self.toolkit('latest')}"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Pass -DCANN_VERSION_MAJOR=8 or 9", " ".join(result.stderr.split()))
+
+    def test_invalid_cann_major_is_rejected(self):
+        result = self.configure("CannVersion.cmake", ["-DCANN_VERSION_MAJOR=banana"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("CANN_VERSION_MAJOR must be an integer", result.stderr)
 
 
 if __name__ == "__main__":

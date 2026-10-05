@@ -16,10 +16,10 @@
  * Hardware numerical parity is required: compilation is not validation.
  *
  * All staging uses TBuf with explicit sync (--cce-auto-sync=off):
- * id 0: MTE2_V / V_MTE2 weight ring, primed, re-armed per column tile, drained.
- * id 1: V_MTE3 / MTE3_V output-row ring, primed, re-armed per row tile, drained.
- * id 2: V_MTE3 output handoff and MTE3_V final output drain.
- * id 3: MTE2_V input handoff. IDs are distinct within each event namespace;
+ * id 3: MTE2_V / V_MTE2 weight ring, primed, re-armed per column tile, drained.
+ * id 3: V_MTE3 / MTE3_V output-row ring, primed, re-armed per row tile, drained.
+ * id 4: V_MTE3 output handoff and MTE3_V final output drain.
+ * id 4: MTE2_V input handoff. IDs are distinct within each event namespace;
  * no helper calls an external event-using kernel. There are no scalar UB
  * data accesses and no S_* events. Vector arithmetic follows PIPE_V order.
  * E8M0 255 is NaN, not infinity; 0 is the subnormal 2^-127.
@@ -29,9 +29,38 @@
 #include "kernel_operator.h"
 #include "dsv4_moe_expert_tiling_data.h"
 
+// Builds outside the standalone test project can use the legacy API names,
+// which remain available in CANN 9. The tests always supply the detected major.
+#ifndef CANN_VERSION_MAJOR
+#define CANN_VERSION_MAJOR 8
+#endif
+
 using namespace AscendC;
 
 namespace Dsv4MoeExpertOp {
+__aicore__ inline void ReduceHalfBlock(const LocalTensor<float>& dst,
+                                      const LocalTensor<float>& src, int32_t count)
+{
+#if (CANN_VERSION_MAJOR >= 9)
+    ReduceRepeat<ReduceType::SUM>(dst, src, count, 1, 1, 1, 8, ReduceOrder::ORDER_ONLY_VALUE);
+#else
+    // One repeat, one FP32 result at dst[0]. Avoid ReduceSum's scalar UB read
+    // and extra work buffer; the caller preserves its aligned result slots.
+    WholeReduceSum(dst, src, count, 1, 1, 1, 8);
+#endif
+}
+
+template <typename T>
+__aicore__ inline void CompareScalarCompat(const LocalTensor<uint8_t>& dst,
+                                         const LocalTensor<T>& src, T value,
+                                         CMPMODE mode, uint32_t count)
+{
+#if (CANN_VERSION_MAJOR >= 9)
+    Compares(dst, src, value, mode, count);
+#else
+    CompareScalar(dst, src, value, mode, count);
+#endif
+}
 constexpr int64_t FP4_BLOCK = 32;       // E8M0 scale span (logical elements)
 constexpr int64_t FP4_PER_BYTE = 2;     // two E2M1 nibbles per storage byte
 constexpr int64_t BYTES_ALIGN = 32;     // MTE 32-byte granularity
@@ -57,10 +86,12 @@ constexpr int32_t REDUCE_SLOT_BYTE_SHIFT = 5;
 // swish(x) = x / (1 + e^(-beta*x)); DeepSeek-V4 uses beta = 1.
 constexpr float SWIGLU_BETA = 1.0f;
 
-constexpr uint8_t STAGING_EVENT_ID = 0; // MTE2_V / V_MTE2 weight-staging ring
-constexpr uint8_t ROW_EVENT_ID = 1;     // V_MTE3 / MTE3_V bf16-row ring
-constexpr uint8_t OUT_EVENT_ID = 2;     // V_MTE3 one-shot before CopyOut
-constexpr uint8_t X_EVENT_ID = 3;       // MTE2_V one-shot after the x load
+// IDs 3 and 4 are outside both 910B (6,7) and 950PR (0..2)
+// reservations. Weight and output rings use distinct HardEvent namespaces.
+constexpr uint8_t STAGING_EVENT_ID = 3; // MTE2_V / V_MTE2 weight-staging ring
+constexpr uint8_t ROW_EVENT_ID = 3;     // V_MTE3 / MTE3_V bf16-row ring
+constexpr uint8_t OUT_EVENT_ID = 4;     // V_MTE3 one-shot before CopyOut
+constexpr uint8_t X_EVENT_ID = 4;       // MTE2_V one-shot after the x load
 
 __aicore__ inline int64_t AlignUpBytes(int64_t bytes)
 {
@@ -269,7 +300,7 @@ private:
 
                 // Zero first so the pow2 pad slots the merge tree pairs with are
                 // exact zero terms; the reduces then fill the real slots. The
-                // ReduceRepeat writes one value per aligned 32-byte slot. This avoids
+                // repeat reduction writes one value per aligned 32-byte slot. This avoids
                 // the level-2 ReduceSum wrapper's implicit V_S/scalar read.
                 //
                 // A block of 32 columns is 16 even plus 16 odd, so it takes two
@@ -286,10 +317,10 @@ private:
                     for (int64_t b = 0; b < activeBlocks; ++b)
                     {
                         const uint32_t slot = static_cast<uint32_t>((r * pow2Blocks + b) * REDUCE_SLOT_ELEMS);
-                        ReduceRepeat<ReduceType::SUM>(partRaw[slot], lowRow[static_cast<uint32_t>(b * halfBlock)],
-                            static_cast<int32_t>(halfBlock), 1, 1, 1, 8, ReduceOrder::ORDER_ONLY_VALUE);
-                        ReduceRepeat<ReduceType::SUM>(partHi[slot], highRow[static_cast<uint32_t>(b * halfBlock)],
-                            static_cast<int32_t>(halfBlock), 1, 1, 1, 8, ReduceOrder::ORDER_ONLY_VALUE);
+                        ReduceHalfBlock(partRaw[slot], lowRow[static_cast<uint32_t>(b * halfBlock)],
+                                        static_cast<int32_t>(halfBlock));
+                        ReduceHalfBlock(partHi[slot], highRow[static_cast<uint32_t>(b * halfBlock)],
+                                        static_cast<int32_t>(halfBlock));
                     }
                 }
                 // Gather only the first float of each aligned 32-byte reduction slot.
@@ -454,7 +485,7 @@ private:
         // normal code is overwritten by that scalar, which erases the whole
         // block above and leaves the output all but zero.
         Duplicate(stageC, E2M1_HALF_BITS, count);
-        Compares(decMask, stageB, 1, CMPMODE::EQ, count);
+        CompareScalarCompat(decMask, stageB, int32_t{1}, CMPMODE::EQ, count);
 #if __CCE_AICORE__ == 220
         Select(stageA.template ReinterpretCast<float>(), decMask, stageC.template ReinterpretCast<float>(),
                stageA.template ReinterpretCast<float>(), SELMODE::VSEL_TENSOR_TENSOR_MODE, count);
@@ -462,7 +493,7 @@ private:
         Select(stageA, decMask, stageC, stageA, SELMODE::VSEL_TENSOR_TENSOR_MODE, count);
 #endif
         Duplicate(stageC, E2M1_ZERO_BITS, count);
-        Compares(decMask, stageB, 0, CMPMODE::EQ, count);
+        CompareScalarCompat(decMask, stageB, int32_t{0}, CMPMODE::EQ, count);
 #if __CCE_AICORE__ == 220
         Select(stageA.template ReinterpretCast<float>(), decMask, stageC.template ReinterpretCast<float>(),
                stageA.template ReinterpretCast<float>(), SELMODE::VSEL_TENSOR_TENSOR_MODE, count);
@@ -513,9 +544,9 @@ private:
 #if __CCE_AICORE__ == 220
         // arch220 integer compares support EQ only; [0,255] converts exactly.
         Cast(scratch.ReinterpretCast<float>(), wrap, RoundMode::CAST_NONE, count);
-        Compares(special, scratch.ReinterpretCast<float>(), 2.0f, CMPMODE::LT, count);
+        CompareScalarCompat(special, scratch.ReinterpretCast<float>(), 2.0f, CMPMODE::LT, count);
 #else
-        Compares(special, wrap, 2, CMPMODE::LT, count);
+        CompareScalarCompat(special, wrap, int32_t{2}, CMPMODE::LT, count);
 #endif
         ShiftLeft(bits, bits, 23, count);                // exact power-of-two bits
 
