@@ -1,4 +1,7 @@
-# Bare-metal kernel tests and benchmarks (Ascend 310P3 and 950PR)
+# Bare-metal kernel tests and benchmarks (Ascend 310P3, 910B and 950PR)
+
+For the offline 910B configure, correctness target and comparative benchmark,
+see [910B_BUILD.md](910B_BUILD.md).
 
 A standalone suite for the five operator families a **Qwen3.5** forward pass
 needs, driven straight through the CANN runtime. No Python, no PyTorch, no
@@ -84,7 +87,8 @@ csrc/tests/
 |   `-- prof_device_950pr_msprof_trace.cpp        one launch per leg under mstx ranges, for msprof; own main()
 |
 |-- device_910b/            physical 910B; shared DSV4 production suite
-|   `-- test_device_910b_dsv4_moe_expert.cpp
+|   |-- test_device_910b_dsv4_moe_expert.cpp
+|   `-- bench_device_910b_dsv4_moe_expert.cpp
 |
 `-- device_310p/            the 310P leg -- NOT configured under a 950PR SoC
     |-- test_*_310p.cpp

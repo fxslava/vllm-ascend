@@ -66,6 +66,16 @@ set(VLLM_ASCEND_TESTS_ASCENDC_GENERATOR "Unix Makefiles"
 set(CMAKE_GENERATOR "${VLLM_ASCEND_TESTS_ASCENDC_GENERATOR}")
 
 set(ASCEND_CANN_PACKAGE_PATH ${ASCEND_HOME_PATH})
+find_program(VLLM_ASCEND_DEVICE_COMPILER NAMES bisheng ccec
+  PATHS "${ASCEND_HOME_PATH}/tools/ccec_compiler/bin"
+        "${ASCEND_HOME_PATH}/compiler/ccec_compiler/bin"
+        "${ASCEND_HOME_PATH}/tools/bisheng_compiler/bin" NO_DEFAULT_PATH)
+if(NOT VLLM_ASCEND_DEVICE_COMPILER)
+  message(FATAL_ERROR "Ascend C compiler (bisheng/ccec) not found under ${ASCEND_HOME_PATH}/tools or compiler. Install the CANN compiler package.")
+endif()
+get_filename_component(ascend_compiler_bin "${VLLM_ASCEND_DEVICE_COMPILER}" DIRECTORY)
+set(ENV{PATH} "${ascend_compiler_bin}:$ENV{PATH}")
+message(STATUS "vllm-ascend tests: device compiler ${VLLM_ASCEND_DEVICE_COMPILER}")
 
 # The same three-way lookup the repository root CMakeLists.txt does; which one
 # exists depends on how the toolkit was laid out, not on its version.
@@ -78,12 +88,11 @@ elseif(EXISTS ${ASCEND_HOME_PATH}/ascendc_devkit/tikcpp/samples/cmake)
 else()
   message(FATAL_ERROR
     "ascendc_kernel_cmake not found under ${ASCEND_HOME_PATH}.\n"
-    "The TurboQuant kernels need the Ascend C kernel toolchain. Install it, or configure with "
-    "-DVLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS=OFF to build the rest of the 950PR leg without them.")
+    "DSV4 and TurboQuant kernels need the Ascend C compiler package. Install it, or disable both kernel build options.")
 endif()
 
 message(STATUS "vllm-ascend tests: ascendc kernel cmake at ${ASCENDC_CMAKE_DIR}")
-message(STATUS "vllm-ascend tests: TurboQuant kernels RUN_MODE=${RUN_MODE}, SOC_VERSION=${SOC_VERSION}")
+message(STATUS "vllm-ascend tests: Ascend C RUN_MODE=${RUN_MODE}, SOC_VERSION=${SOC_VERSION}")
 
 include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 

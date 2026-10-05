@@ -88,5 +88,12 @@ add_test(NAME test_host_dsv4_common COMMAND test_host_dsv4_common)
 set_tests_properties(test_host_dsv4_common PROPERTIES LABELS "correctness;host" TIMEOUT 300)
 vllm_ascend_record_binary(test_host_dsv4_common)
 
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND AND NOT CMAKE_CROSSCOMPILING)
+  add_test(NAME test_host_build_configuration
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/test_build_configuration.py" -v)
+  set_tests_properties(test_host_build_configuration PROPERTIES LABELS "correctness;host" TIMEOUT 120)
+endif()
+
 message(STATUS "vllm-ascend tests: [host] test_host_turboquant_fidelity test_host_turboquant_tiling "
                "test_host_dsv4_moe_expert")

@@ -257,9 +257,13 @@ if(NOT VLLM_ASCEND_TESTS_HOST_ONLY)
       message(FATAL_ERROR "The 910B DSV4 verification suite requires RUN_MODE=npu")
     endif()
     set(VLLM_ASCEND_TESTS_TIER_DEVICE910 TRUE)
+    set(VLLM_ASCEND_TESTS_TIER_DEVICE TRUE)
+    set(VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS OFF CACHE BOOL
+        "TurboQuant kernels are unavailable on 910B" FORCE)
   elseif(VLLM_ASCEND_SOC_LOWER MATCHES "^ascend310p")
     if(RUN_MODE STREQUAL "npu")
       set(VLLM_ASCEND_TESTS_TIER_DEVICE310 TRUE)
+      set(VLLM_ASCEND_TESTS_TIER_DEVICE TRUE)
     endif()
     if(RUN_MODE STREQUAL "sim")
       message(STATUS
@@ -272,6 +276,8 @@ if(NOT VLLM_ASCEND_TESTS_HOST_ONLY)
   endif()
 endif()
 
+set(ENABLE_DEVICE_TESTS ${VLLM_ASCEND_TESTS_TIER_DEVICE} CACHE BOOL
+    "Physical device tier selected by SOC_VERSION and RUN_MODE" FORCE)
 message(STATUS "vllm-ascend tests: SoC ${SOC_VERSION}, RUN_MODE ${RUN_MODE}")
 message(STATUS "vllm-ascend tests: tiers -> host=${VLLM_ASCEND_TESTS_TIER_HOST} "
                "sim=${VLLM_ASCEND_TESTS_TIER_SIM} device=${VLLM_ASCEND_TESTS_TIER_DEVICE} "
@@ -292,24 +298,7 @@ endif()
 
 if(NOT VLLM_ASCEND_TESTS_HOST_ONLY)
 
-if(NOT DEFINED ASCEND_HOME_PATH OR ASCEND_HOME_PATH STREQUAL "")
-  if(DEFINED ENV{ASCEND_HOME_PATH})
-    set(ASCEND_HOME_PATH $ENV{ASCEND_HOME_PATH})
-  elseif(DEFINED ENV{ASCEND_TOOLKIT_HOME})
-    set(ASCEND_HOME_PATH $ENV{ASCEND_TOOLKIT_HOME})
-  else()
-    set(ASCEND_HOME_PATH "/usr/local/Ascend/ascend-toolkit/latest")
-  endif()
-endif()
-set(ASCEND_HOME_PATH ${ASCEND_HOME_PATH} CACHE PATH "CANN toolkit install root" FORCE)
-
-if(NOT EXISTS "${ASCEND_HOME_PATH}/include/acl/acl.h")
-  message(FATAL_ERROR
-    "CANN not found at ASCEND_HOME_PATH=${ASCEND_HOME_PATH}\n"
-    "Source the toolkit environment first:\n"
-    "  source /usr/local/Ascend/ascend-toolkit/set_env.sh\n"
-    "or configure with -DASCEND_HOME_PATH=/path/to/ascend-toolkit/latest")
-endif()
+include(cmake/CannToolkit.cmake)
 
 message(STATUS "vllm-ascend tests: CANN at ${ASCEND_HOME_PATH}")
 message(STATUS "vllm-ascend tests: target SoC ${SOC_VERSION}")
@@ -318,6 +307,7 @@ set(ASCEND_LIB_DIRS
   "${ASCEND_HOME_PATH}/lib64"
   "${ASCEND_HOME_PATH}/runtime/lib64"
   "${ASCEND_HOME_PATH}/acllib/lib64")
+set(ASCEND_LINK_DIRS ${ASCEND_LIB_DIRS} ${VLLM_ASCEND_DRIVER_LINK_DIRS})
 
 # ascendcl is the only hard link-time dependency: aclInit, aclrtMalloc, the
 # stream API. Everything in the aclnn op-api is resolved with dlopen/dlsym at
@@ -341,15 +331,28 @@ endif()
 find_library(ASCEND_OP_COMPILER_LIBRARY NAMES acl_op_compiler PATHS ${ASCEND_LIB_DIRS} NO_DEFAULT_PATH)
 find_library(ASCEND_NNOPBASE_LIBRARY NAMES nnopbase PATHS ${ASCEND_LIB_DIRS} NO_DEFAULT_PATH)
 find_library(ASCEND_OPAPI_LIBRARY NAMES opapi PATHS ${ASCEND_LIB_DIRS} NO_DEFAULT_PATH)
+if(VLLM_ASCEND_TESTS_SOC_IS_910B)
+  find_library(ASCEND_RUNTIME_LIBRARY NAMES runtime PATHS ${ASCEND_LIB_DIRS} NO_DEFAULT_PATH)
+  foreach(required ASCEND_OP_COMPILER_LIBRARY ASCEND_NNOPBASE_LIBRARY ASCEND_OPAPI_LIBRARY ASCEND_RUNTIME_LIBRARY)
+    if(NOT ${required})
+      message(FATAL_ERROR "910B requires ${required}; searched: ${ASCEND_LIB_DIRS}")
+    endif()
+  endforeach()
+endif()
 
-# ascendcl is the one hard link-time dependency; see the comment above it.
+# 910B links its required runtime/opapi set explicitly; other tiers retain
+# the lazy operator loader and their historical ascendcl-only direct dependency.
 set(VLLM_ASCEND_TEST_CANN_LIBS ${ASCEND_CL_LIBRARY})
+if(VLLM_ASCEND_TESTS_SOC_IS_910B)
+  list(APPEND VLLM_ASCEND_TEST_CANN_LIBS ${ASCEND_OP_COMPILER_LIBRARY}
+    ${ASCEND_NNOPBASE_LIBRARY} ${ASCEND_OPAPI_LIBRARY} ${ASCEND_RUNTIME_LIBRARY})
+endif()
 foreach(runtime_lib
         ASCEND_OP_COMPILER_LIBRARY
         ASCEND_NNOPBASE_LIBRARY
         ASCEND_OPAPI_LIBRARY)
   if(${runtime_lib})
-    message(STATUS "vllm-ascend tests: found ${${runtime_lib}} (resolved at runtime, not linked)")
+    message(STATUS "vllm-ascend tests: found ${${runtime_lib}}")
   else()
     message(STATUS "vllm-ascend tests: ${runtime_lib} not found, resolving those symbols at runtime")
   endif()
@@ -367,7 +370,7 @@ find_library(VLLM_ASCEND_KERNELS_LIBRARY
     "${CMAKE_CURRENT_SOURCE_DIR}/../../out"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../vllm_ascend"
   NO_DEFAULT_PATH)
-if(VLLM_ASCEND_KERNELS_LIBRARY)
+if(VLLM_ASCEND_KERNELS_LIBRARY AND NOT VLLM_ASCEND_TESTS_SOC_IS_910B)
   list(APPEND VLLM_ASCEND_TEST_CANN_LIBS ${VLLM_ASCEND_KERNELS_LIBRARY})
   message(STATUS "vllm-ascend tests: linking ${VLLM_ASCEND_KERNELS_LIBRARY}")
 else()
@@ -380,33 +383,11 @@ endif()  # NOT VLLM_ASCEND_TESTS_HOST_ONLY
 # googletest
 # -----------------------------------------------------------------------------
 
-if(VLLM_ASCEND_TESTS_FETCH_GTEST)
-  include(FetchContent)
-  # An offline 310P host can point FETCHCONTENT_SOURCE_DIR_GOOGLETEST at an
-  # unpacked tarball, or configure with -DVLLM_ASCEND_TESTS_FETCH_GTEST=OFF to
-  # use a system install instead.
-  FetchContent_Declare(
-    googletest
-    GIT_REPOSITORY https://github.com/google/googletest.git
-    GIT_TAG        v1.14.0
-    GIT_SHALLOW    TRUE)
-  set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
-  set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
-  FetchContent_MakeAvailable(googletest)
-  set(VLLM_ASCEND_TEST_GTEST_TARGET gtest)
-else()
-  find_package(GTest REQUIRED)
-  set(VLLM_ASCEND_TEST_GTEST_TARGET GTest::gtest)
-endif()
+include(cmake/GoogleTestProvider.cmake)
 
 # Provides gtest_discover_tests.
 include(GoogleTest)
 
-if(VLLM_ASCEND_TESTS_FETCH_GTEST)
-  set(VLLM_ASCEND_TEST_GTEST_MAIN_TARGET gtest_main)
-else()
-  set(VLLM_ASCEND_TEST_GTEST_MAIN_TARGET GTest::gtest_main)
-endif()
 
 enable_testing()
 
@@ -635,9 +616,15 @@ add_library(vllm_ascend_test_common STATIC
 target_include_directories(vllm_ascend_test_common
   PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/common"
-    "${ASCEND_HOME_PATH}/include")
+    "${ASCEND_HOME_PATH}/include"
+    "${ASCEND_HOME_PATH}/include/experiment/kernel")
 
-target_link_directories(vllm_ascend_test_common PUBLIC ${ASCEND_LIB_DIRS})
+target_link_directories(vllm_ascend_test_common PUBLIC ${ASCEND_LINK_DIRS})
+if(RUN_MODE STREQUAL "npu")
+  foreach(link_dir IN LISTS ASCEND_LINK_DIRS)
+    target_link_options(vllm_ascend_test_common PUBLIC "-Wl,-rpath-link,${link_dir}")
+  endforeach()
+endif()
 
 target_link_libraries(vllm_ascend_test_common
   PUBLIC
@@ -667,7 +654,8 @@ target_link_options(vllm_ascend_test_common PUBLIC -Wl,--gc-sections -Wl,--as-ne
 # Built for the sim and device tiers only, so a 310P tree carries neither the
 # 950PR operator audit nor the golden-dump path define.
 
-if(VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE OR VLLM_ASCEND_TESTS_SOC_IS_910B)
+if((VLLM_ASCEND_TESTS_SOC_IS_950PR AND (VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE))
+    OR VLLM_ASCEND_TESTS_TIER_DEVICE910)
   if(VLLM_ASCEND_TESTS_SOC_IS_910B)
     # The arch35 TurboQuant probes must not enter an arch220 build.
     set(VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS OFF)
@@ -817,7 +805,7 @@ if(VLLM_ASCEND_TESTS_TIER_SIM)
   add_subdirectory(sim)
 endif()
 
-if(VLLM_ASCEND_TESTS_TIER_DEVICE)
+if(VLLM_ASCEND_TESTS_TIER_DEVICE AND VLLM_ASCEND_TESTS_SOC_IS_950PR)
   add_subdirectory(device_950pr)
 endif()
 
