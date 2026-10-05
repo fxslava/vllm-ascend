@@ -25,8 +25,8 @@
 # What it is for: functional validation of the Ascend C kernels against the CPU
 # reference. The camodel is a cycle-level functional model, so what it proves is
 # that the kernel computes the right thing - and what it cannot say anything
-# about is how long that takes. Nothing in this tier is timed, and nothing in it
-# may ever be presented as a performance number.
+# about is physical-device elapsed time. The unpack study below extracts modeled
+# cycles from npusim reports; simulator wall time is never a performance number.
 #
 # Shapes are deliberately the smallest that still exercise the feature under
 # test (head_size 64, block_size 16, context 32), because a single decode pass
@@ -41,10 +41,9 @@ set(VLLM_ASCEND_TEST_TIER_LABEL "simulator")
 
 if(NOT VLLM_ASCEND_TESTS_HAVE_TURBOQUANT)
   message(STATUS
-    "vllm-ascend tests: [simulator] empty - every binary in this tier drives the TurboQuant "
+    "vllm-ascend tests: [simulator] TurboQuant targets skipped; "
     "Ascend C kernels and VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS is OFF")
-  return()
-endif()
+else()
 
 set(VLLM_ASCEND_SIM_TESTS
   # The fp8 Cube fractal contract: NZ layout, LoadData step units, Mmad
@@ -97,6 +96,8 @@ foreach(test_name ${VLLM_ASCEND_SIM_TESTS})
 endforeach()
 
 message(STATUS "vllm-ascend tests: [simulator] ${VLLM_ASCEND_SIM_TESTS}")
+
+endif()  # VLLM_ASCEND_TESTS_HAVE_TURBOQUANT
 
 # -----------------------------------------------------------------------------
 # The DSV4 MoE expert
@@ -154,4 +155,24 @@ if(VLLM_ASCEND_TESTS_HAVE_DSV4)
   endif()
 
   message(STATUS "vllm-ascend tests: [simulator] test_sim_950pr_dsv4_moe_expert")
+endif()
+
+if(TARGET vllm_ascend_moe_unpack_probe)
+  vllm_ascend_add_device_executable(test_sim_950pr_moe_simt_unpack
+    test_sim_950pr_moe_simt_unpack.cpp ../common/main_950pr.cpp)
+  vllm_ascend_add_device_executable(bench_sim_950pr_moe_simt_vs_simd
+    bench_sim_950pr_moe_simt_vs_simd.cpp)
+  foreach(probe test_sim_950pr_moe_simt_unpack bench_sim_950pr_moe_simt_vs_simd)
+    target_link_libraries(${probe} PRIVATE vllm_ascend_moe_unpack_probe vllm_ascend_test_common_950pr)
+    target_compile_definitions(${probe} PRIVATE VLLM_ASCEND_TEST_TIER="simulator")
+    set_target_properties(${probe} PROPERTIES INSTALL_RPATH
+      "$ORIGIN;${CMAKE_BINARY_DIR}/lib;${VLLM_ASCEND_SIMULATOR_LIB_DIR};${ASCEND_LIB_DIRS}")
+  endforeach()
+  vllm_ascend_register_correctness_test(test_sim_950pr_moe_simt_unpack 5400 TRUE)
+  if(TEST test_sim_950pr_moe_simt_unpack)
+    set_tests_properties(test_sim_950pr_moe_simt_unpack PROPERTIES ENVIRONMENT
+      "LD_LIBRARY_PATH=${VLLM_ASCEND_SIMULATOR_LIB_DIR}:${VLLM_ASCEND_TEST_LIBRARY_PATH};ASCEND_HOME_PATH=${ASCEND_HOME_PATH}")
+  endif()
+  add_custom_target(moe_simt_targets DEPENDS
+    test_sim_950pr_moe_simt_unpack bench_sim_950pr_moe_simt_vs_simd)
 endif()

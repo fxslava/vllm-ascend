@@ -1,0 +1,4812 @@
+{
+  "toolchain": "CANN 9.2.0-beta.2",
+  "soc": "Ascend950PR_9599",
+  "npusim_alias": "Ascend950DT",
+  "geometry": {
+    "hidden": 256,
+    "inter": 4,
+    "elements": 1024,
+    "math": false
+  },
+  "results": {
+    "simd": {
+      "summary": "/tmp/dsv4_runs/small_simd/npusim_20261005174637_bench_sim_950pr_moe_simt_vs_simd/report/results/kernel_0_reports/summary.json",
+      "elements": 1024,
+      "kernel_info": {
+        "ai_core_active": 1,
+        "kernel_total_clocks": 7055,
+        "kernel_instructions_executed": 2882
+      },
+      "vf_kernel_info": {
+        "name": "kernel",
+        "arch": "v100",
+        "frequency_ghz": 1.65,
+        "active_cores": 1,
+        "exec_time_ns": 4275.76,
+        "exec_time_ticks": 7055,
+        "total_instrs_executed": 2882,
+        "scalar_ipc_overall": 0.12
+      },
+      "cache_report": {
+        "icache_refill_count": 0,
+        "icache_refill_ticks": null
+      },
+      "bandwidth_report": {},
+      "pipeline_overlap": {
+        "AIC_MTE2_vs_AIC_CUBE": null,
+        "AIC_MTE1_vs_AIC_CUBE": null,
+        "AIC_FIXP_vs_AIC_CUBE": null,
+        "AIC_SCALAR_vs_AIC_CUBE": null,
+        "AIV0_MTE2_vs_AIV0_VEC": 0.0258,
+        "AIV0_SCALAR_vs_AIV0_VEC": 0.0153,
+        "AIV0_MTE3_vs_AIV0_VEC": 0.0024,
+        "AIV1_MTE2_vs_AIV1_VEC": null,
+        "AIV1_SCALAR_vs_AIV0_VEC": null,
+        "AIV1_MTE3_vs_AIV1_VEC": null,
+        "AIC_CUBE_vs_AIV0_VEC": null,
+        "AIC_CUBE_vs_AIV1_VEC": null
+      },
+      "scalar_instructions": {
+        "AIV0": {
+          "total_count": 714,
+          "load_count": 60,
+          "store_count": 100,
+          "load_store_ratio": 0.22
+        }
+      },
+      "modeled_cycles": 7055,
+      "cycles_per_element_end_to_end": 6.8896484375,
+      "pipeline_utilization": {
+        "pipeline_util_summary": {
+          "AIV0_SIMD": {
+            "mean": 0.2611,
+            "max": 0.2611,
+            "min": 0.2611
+          },
+          "AIV0_SCALAR": {
+            "mean": 0.5814,
+            "max": 0.5814,
+            "min": 0.5814
+          },
+          "AIV0_MTE2": {
+            "mean": 0.1403,
+            "max": 0.1403,
+            "min": 0.1403
+          },
+          "AIV0_MTE3": {
+            "mean": 0.0517,
+            "max": 0.0517,
+            "min": 0.0517
+          }
+        }
+      },
+      "vector_instruction_report": {
+        "RVECEX_count": 946,
+        "RVECLD_count": 525,
+        "RVECST_count": 514,
+        "ub_traffic_ratio": 1.0983086680761098,
+        "SIMD_ScalarIPC": 0.031242384850817893,
+        "SIMD_ExecIPC": 0.5450892852185781,
+        "SIMD_LdStIPC": 0.5734283644774468
+      },
+      "trace_event_counts": {
+        "LDP_XI_XJ_XN": 3,
+        "ST_XD_XN_IMM": 73,
+        "LD_XD_XN_IMM": 57,
+        "STI_XN_IMM": 20,
+        "STP_XI_XJ_XN": 7,
+        "MOV_XD_SPR": 27,
+        "MOVK": 49,
+        "ADD_IMM": 19,
+        "SHR": 14,
+        "MADD": 3,
+        "MOV_XD_IMM": 133,
+        "SUB_IMM": 12,
+        "AND": 21,
+        "SFF": 1,
+        "INSERT_XD_XN": 66,
+        "CMP": 6,
+        "MOV_XD_XN": 54,
+        "ADD": 35,
+        "OR": 10,
+        "SHL": 61,
+        "ZEROEXT": 15,
+        "SBITSET": 7,
+        "SUB": 5,
+        "CMPN": 4,
+        "SIGNEXT": 1,
+        "NEG": 4,
+        "DC_PRELOAD_XN_IMM": 1,
+        "MOV_SPR_XN": 4,
+        "MIN": 1,
+        "TICK_START_EVENT": 1,
+        "MOV_SRC_TO_DST_ALIGNv2": 3,
+        "BAR": 2,
+        "DCI": 1,
+        "DCCI": 1,
+        "RV_PLT": 443,
+        "RV_VCVT_I2I": 14,
+        "RV_PSET": 14,
+        "RV_VDUPS": 9,
+        "RV_VAND": 73,
+        "RV_VSHRI": 88,
+        "RV_VADDS": 19,
+        "RV_VSHLS": 81,
+        "RV_VOR": 32,
+        "RV_VCMPS_EQ": 32,
+        "RV_PINTLV": 16,
+        "RV_VSEL": 33,
+        "RV_PUNPACK": 1,
+        "RV_VADD": 49,
+        "RV_VMULS": 20,
+        "RV_VMUL": 16,
+        "RV_VCMPS_LT": 1,
+        "RV_VCI": 2,
+        "RV_VBR": 3,
+        "RV_VST": 427,
+        "RV_SMEM_BAR": 36,
+        "RV_SEND": 14,
+        "RV_PSTU": 33,
+        "RV_VSTI": 1,
+        "RV_VSTAI": 3,
+        "RV_VLD": 475,
+        "RV_PLD": 16,
+        "RV_PLDI": 1,
+        "RV_VGATHER2": 32,
+        "RV_VLDI": 1,
+        "MOVEMASK": 2,
+        "VF": 14,
+        "PUSH_PB": 22
+      },
+      "vector_functions": [
+        {
+          "id": 0,
+          "type": "simd",
+          "function_pc": "0x2124",
+          "call_sites": [
+            "0xc58"
+          ],
+          "executions": 1,
+          "timing": {
+            "avg_cycles": 36,
+            "min_cycles": 36,
+            "max_cycles": 36,
+            "variance_ratio": 1.0
+          },
+          "ipc": {
+            "scalar": 0.074,
+            "exec": 0.074,
+            "ldst": 0.148,
+            "total": 0.296
+          },
+          "instr_profile": {
+            "total_count": 9,
+            "by_pipe": [
+              {
+                "pipe": "RVECST",
+                "count": 3,
+                "pct": 33.3,
+                "ticks": 26
+              },
+              {
+                "pipe": "RVECSU",
+                "count": 2,
+                "pct": 22.2,
+                "ticks": 2
+              },
+              {
+                "pipe": "RVECEX",
+                "count": 2,
+                "pct": 22.2,
+                "ticks": 12
+              },
+              {
+                "pipe": "RVECLP",
+                "count": 1,
+                "pct": 11.1,
+                "ticks": 0
+              },
+              {
+                "pipe": "RVECLD",
+                "count": 1,
+                "pct": 11.1,
+                "ticks": 9
+              }
+            ]
+          }
+        },
+        {
+          "id": 1,
+          "type": "simd",
+          "function_pc": "0x2220",
+          "call_sites": [
+            "0xd18"
+          ],
+          "executions": 1,
+          "timing": {
+            "avg_cycles": 87,
+            "min_cycles": 87,
+            "max_cycles": 87,
+            "variance_ratio": 1.0
+          },
+          "ipc": {
+            "scalar": 0.052,
+            "exec": 0.143,
+            "ldst": 0.156,
+            "total": 0.351
+          },
+          "instr_profile": {
+            "total_count": 30,
+            "by_pipe": [
+              {
+                "pipe": "RVECEX",
+                "count": 11,
+                "pct": 36.7,
+                "ticks": 72
+              },
+              {
+                "pipe": "RVECST",
+                "count": 7,
+                "pct": 23.3,
+                "ticks": 63
+              },
+              {
+                "pipe": "RVECLD",
+                "count": 5,
+                "pct": 16.7,
+                "ticks": 80
+              },
+              {
+                "pipe": "RVECSU",
+                "count": 4,
+                "pct": 13.3,
+                "ticks": 4
+              },
+              {
+                "pipe": "RVECLP",
+                "count": 3,
+                "pct": 10.0,
+                "ticks": 0
+              }
+            ]
+          }
+        },
+        {
+          "id": 2,
+          "type": "simd",
+          "function_pc": "0x1f20",
+          "call_sites": [
+            "0xc00"
+          ],
+          "executions": 1,
+          "timing": {
+            "avg_cycles": 559,
+            "min_cycles": 559,
+            "max_cycles": 559,
+            "variance_ratio": 1.0
+          },
+          "ipc": {
+            "scalar": 0.015,
+            "exec": 0.239,
+            "ldst": 0.299,
+            "total": 0.552
+          },
+          "instr_profile": {
+            "total_count": 309,
+            "by_pipe": [
+              {
+                "pipe": "RVECEX",
+                "count": 131,
+                "pct": 42.4,
+                "ticks": 829
+              },
+              {
+                "pipe": "RVECLD",
+                "count": 91,
+                "pct": 29.4,
+                "ticks": 1243
+              },
+              {
+                "pipe": "RVECST",
+                "count": 73,
+                "pct": 23.6,
+                "ticks": 685
+              },
+              {
+                "pipe": "RVECSU",
+                "count": 8,
+                "pct": 2.6,
+                "ticks": 8
+              },
+              {
+                "pipe": "RVECLP",
+                "count": 6,
+                "pct": 1.9,
+                "ticks": 0
+              }
+            ]
+          }
+        },
+        {
+          "id": 3,
+          "type": "simd",
+          "function_pc": "0x2344",
+          "call_sites": [
+            "0xdf4"
+          ],
+          "executions": 1,
+          "timing": {
+            "avg_cycles": 116,
+            "min_cycles": 116,
+            "max_cycles": 116,
+            "variance_ratio": 1.0
+          },
+          "ipc": {
+            "scalar": 0.009,
+            "exec": 0.308,
+            "ldst": 0.458,
+            "total": 0.776
+          },
+          "instr_profile": {
+            "total_count": 84,
+            "by_pipe": [
+              {
+                "pipe": "RVECEX",
+                "count": 33,
+                "pct": 39.3,
+                "ticks": 198
+              },
+              {
+                "pipe": "RVECLD",
+                "count": 32,
+                "pct": 38.1,
+                "ticks": 687
+              },
+              {
+                "pipe": "RVECST",
+                "count": 17,
+                "pct": 20.2,
+                "ticks": 437
+              },
+              {
+                "pipe": "RVECLP",
+                "count": 1,
+                "pct": 1.2,
+                "ticks": 0
+              },
+              {
+                "pipe": "RVECSU",
+                "count": 1,
+                "pct": 1.2,
+                "ticks": 1
+              }
+            ]
+          }
+        },
+        {
+          "id": 4,
+          "type": "simd",
+          "function_pc": "0x2524",
+          "call_sites": [
+            "0xe7c"
+          ],
+          "executions": 1,
+          "timing": {
+            "avg_cycles": 84,
+            "min_cycles": 84,
+            "max_cycles": 84,
+            "variance_ratio": 1.0
+          },
+          "ipc": {
+            "scalar": 0.013,
+            "exec": 0.44,
+            "ldst": 0.653,
+            "total": 1.107
+          },
+          "instr_profile": {
+            "total_count": 84,
+            "by_pipe": [
+              {
+                "pipe": "RVECEX",
+                "count": 33,
+                "pct": 39.3,
+                "ticks": 198
+              },
+              {
+                "pipe": "RVECLD",
+                "count": 32,
+                "pct": 38.1,
+                "ticks": 515
+              },
+              {
+                "pipe": "RVECST",
+                "count": 17,
+                "pct": 20.2,
+                "ticks": 253
+              },
+              {
+                "pipe": "RVECLP",
+                "count": 1,
+                "pct": 1.2,
+                "ticks": 0
+              },
+              {
+                "pipe": "RVECSU",
+                "count": 1,
+                "pct": 1.2,
+                "ticks": 1
+              }
+            ]
+          }
+        },
+        {
+          "id": 5,
+          "type": "simd",
+          "function_pc": "0x2320",
+          "call_sites": [
+            "0xd54",
+            "0xe18"
+          ],
+          "executions": 2,
+          "timing": {
+            "avg_cycles": 83,
+            "min_cycles": 83,
+            "max_cycles": 83,
+            "variance_ratio": 1.0
+          },
+          "ipc": {
+            "scalar": 0.014,
+            "exec": 0.534,
+            "ldst": 0.233,
+            "total": 0.781
+          },
+          "instr_profile": {
+            "total_count": 57,
+            "by_pipe": [
+              {
+                "pipe": "RVECEX",
+                "count": 39,
+                "pct": 68.4,
+                "ticks": 256
+              },
+              {
+                "pipe": "RVECST",
+                "count": 17,
+                "pct": 29.8,
+                "ticks": 153
+              },
+              {
+                "pipe": "RVECSU",
+                "count": 1,
+                "pct": 1.8,
+                "ticks": 1
+              }
+            ]
+          }
+        },
+        {
+          "id": 6,
+          "type": "simd",
+          "function_pc": "0x2724",
+          "call_sites": [
+            "0xea8"
+          ],
+          "executions": 1,
+          "timing": {
+            "avg_cycles": 57,
+            "min_cycles": 57,
+            "max_cycles": 57,
+            "variance_ratio": 1.0
+          },
+          "ipc": {
+            "scalar": 0.021,
+            "exec": 0.667,
+            "ldst": 1.021,
+            "total": 1.708
+          },
+          "instr_profile": {
+            "total_count": 82,
+            "by_pipe": [
+              {
+                "pipe": "RVECLD",
+                "count": 32,
+                "pct": 39.0,
+                "ticks": 309
+              },
+              {
+                "pipe": "RVECEX",
+                "count": 32,
+                "pct": 39.0,
+                "ticks": 224
+              },
+              {
+                "pipe": "RVECST",
+                "count": 17,
+                "pct": 20.7,
+                "ticks": 178
+              },
+              {
+                "pipe": "RVECSU",
+                "count": 1,
+                "pct": 1.2,
+                "ticks": 1
+              }
+            ]
+          }
+        },
+        {
+          "id": 7,
+          "type": "simd",
+          "function_pc": "0x1d20",
+          "call_sites": [
+            "0xaec"
+          ],
+          "executions": 1,
+          "timing": {
+            "avg_cycles": 95,
+            "min_cycles": 95,
+            "max_cycles": 95,
+            "variance_ratio": 1.0
+          },
+          "ipc": {
+            "scalar": 0.035,
+            "exec": 0.694,
+            "ldst": 0.859,
+            "total": 1.588
+          },
+          "instr_profile": {
+            "total_count": 137,
+            "by_pipe": [
+              {
+                "pipe": "RVECEX",
+                "count": 59,
+                "pct": 43.1,
+                "ticks": 394
+              },
+              {
+                "pipe": "RVECLD",
+                "count": 40,
+                "pct": 29.2,
+                "ticks": 379
+              },
+              {
+                "pipe": "RVECST",
+                "count": 33,
+                "pct": 24.1,
+                "ticks": 318
+              },
+              {
+                "pipe": "RVECSU",
+                "count": 3,
+                "pct": 2.2,
+                "ticks": 3
+              },
+              {
+                "pipe": "RVECLP",
+                "count": 2,
+                "pct": 1.5,
+                "ticks": 0
+              }
+            ]
+          }
+        },
+        {
+          "id": 8,
+          "type": "simd",
+          "function_pc": "0x1a28",
+          "call_sites": [
+            "0x9c0"
+          ],
+          "executions": 1,
+          "timing": {
+            "avg_cycles": 419,
+            "min_cycles": 419,
+            "max_cycles": 419,
+            "variance_ratio": 1.0
+          },
+          "ipc": {
+            "scalar": 0.036,
+            "exec": 0.71,
+            "ldst": 0.744,
+            "total": 1.49
+          },
+          "instr_profile": {
+            "total_count": 593,
+            "by_pipe": [
+              {
+                "pipe": "RVECEX",
+                "count": 277,
+                "pct": 46.7,
+                "ticks": 1690
+              },
+              {
+                "pipe": "RVECST",
+                "count": 158,
+                "pct": 26.6,
+                "ticks": 1433
+              },
+              {
+                "pipe": "RVECLD",
+                "count": 132,
+                "pct": 22.3,
+                "ticks": 1433
+              },
+              {
+                "pipe": "RVECSU",
+                "count": 14,
+                "pct": 2.4,
+                "ticks": 14
+              },
+              {
+                "pipe": "RVECLP",
+                "count": 12,
+                "pct": 2.0,
+                "ticks": 0
+              }
+            ]
+          }
+        },
+        {
+          "id": 9,
+          "type": "simd",
+          "function_pc": "0x1c24",
+          "call_sites": [
+            "0xa20"
+          ],
+          "executions": 1,
+          "timing": {
+            "avg_cycles": 51,
+            "min_cycles": 51,
+            "max_cycles": 51,
+            "variance_ratio": 1.0
+          },
+          "ipc": {
+            "scalar": 0.048,
+            "exec": 0.762,
+            "ldst": 0.81,
+            "total": 1.619
+          },
+          "instr_profile": {
+            "total_count": 69,
+            "by_pipe": [
+              {
+                "pipe": "RVECEX",
+                "count": 32,
+                "pct": 46.4,
+                "ticks": 192
+              },
+              {
+                "pipe": "RVECST",
+                "count": 18,
+                "pct": 26.1,
+                "ticks": 149
+              },
+              {
+                "pipe": "RVECLD",
+                "count": 16,
+                "pct": 23.2,
+                "ticks": 144
+              },
+              {
+                "pipe": "RVECSU",
+                "count": 2,
+                "pct": 2.9,
+                "ticks": 2
+              },
+              {
+                "pipe": "RVECLP",
+                "count": 1,
+                "pct": 1.4,
+                "ticks": 0
+              }
+            ]
+          }
+        },
+        {
+          "id": 10,
+          "type": "simd",
+          "function_pc": "0x1e24",
+          "call_sites": [
+            "0xb20"
+          ],
+          "executions": 1,
+          "timing": {
+            "avg_cycles": 51,
+            "min_cycles": 51,
+            "max_cycles": 51,
+            "variance_ratio": 1.0
+          },
+          "ipc": {
+            "scalar": 0.048,
+            "exec": 0.762,
+            "ldst": 0.81,
+            "total": 1.619
+          },
+          "instr_profile": {
+            "total_count": 69,
+            "by_pipe": [
+              {
+                "pipe": "RVECEX",
+                "count": 32,
+                "pct": 46.4,
+                "ticks": 192
+              },
+              {
+                "pipe": "RVECST",
+                "count": 18,
+                "pct": 26.1,
+                "ticks": 149
+              },
+              {
+                "pipe": "RVECLD",
+                "count": 16,
+                "pct": 23.2,
+                "ticks": 144
+              },
+              {
+                "pipe": "RVECSU",
+                "count": 2,
+                "pct": 2.9,
+                "ticks": 2
+              },
+              {
+                "pipe": "RVECLP",
+                "count": 1,
+                "pct": 1.4,
+                "ticks": 0
+              }
+            ]
+          }
+        },
+        {
+          "id": 11,
+          "type": "simd",
+          "function_pc": "0x2420",
+          "call_sites": [
+            "0xdbc"
+          ],
+          "executions": 1,
+          "timing": {
+            "avg_cycles": 241,
+            "min_cycles": 241,
+            "max_cycles": 241,
+            "variance_ratio": 1.0
+          },
+          "ipc": {
+            "scalar": 0.039,
+            "exec": 0.764,
+            "ldst": 0.918,
+            "total": 1.721
+          },
+          "instr_profile": {
+            "total_count": 408,
+            "by_pipe": [
+              {
+                "pipe": "RVECEX",
+                "count": 178,
+                "pct": 43.6,
+                "ticks": 1116
+              },
+              {
+                "pipe": "RVECLD",
+                "count": 112,
+                "pct": 27.5,
+                "ticks": 1113
+              },
+              {
+                "pipe": "RVECST",
+                "count": 102,
+                "pct": 25.0,
+                "ticks": 918
+              },
+              {
+                "pipe": "RVECSU",
+                "count": 9,
+                "pct": 2.2,
+                "ticks": 9
+              },
+              {
+                "pipe": "RVECLP",
+                "count": 7,
+                "pct": 1.7,
+                "ticks": 0
+              }
+            ]
+          }
+        },
+        {
+          "id": 12,
+          "type": "simd",
+          "function_pc": "0x252c",
+          "call_sites": [
+            "0xe48"
+          ],
+          "executions": 1,
+          "timing": {
+            "avg_cycles": 57,
+            "min_cycles": 57,
+            "max_cycles": 57,
+            "variance_ratio": 1.0
+          },
+          "ipc": {
+            "scalar": 0.021,
+            "exec": 1.0,
+            "ldst": 0.688,
+            "total": 1.708
+          },
+          "instr_profile": {
+            "total_count": 83,
+            "by_pipe": [
+              {
+                "pipe": "RVECEX",
+                "count": 48,
+                "pct": 57.8,
+                "ticks": 288
+              },
+              {
+                "pipe": "RVECST",
+                "count": 17,
+                "pct": 20.5,
+                "ticks": 153
+              },
+              {
+                "pipe": "RVECLD",
+                "count": 16,
+                "pct": 19.3,
+                "ticks": 144
+              },
+              {
+                "pipe": "RVECLP",
+                "count": 1,
+                "pct": 1.2,
+                "ticks": 0
+              },
+              {
+                "pipe": "RVECSU",
+                "count": 1,
+                "pct": 1.2,
+                "ticks": 1
+              }
+            ]
+          }
+        }
+      ],
+      "simt_vfs": [],
+      "exclusive_stall_cycles": null,
+      "data_cache_hit_rate": null,
+      "gm_bandwidth_bytes_per_cycle": null,
+      "isolated_mode_switch_cycles": null,
+      "notes": [
+        "Pipeline utilizations overlap: do not add them to derive total cycles.",
+        "VF duration includes work and is not isolated mode-switch latency.",
+        "Logical byte counts are not measured bus traffic."
+      ]
+    },
+    "simt": {
+      "summary": "/tmp/dsv4_runs/small_cached_result/npusim_20261005180151_bench_sim_950pr_moe_simt_vs_simd/report/results/kernel_0_reports/summary.json",
+      "elements": 1024,
+      "kernel_info": {
+        "ai_core_active": 1,
+        "kernel_total_clocks": 6688,
+        "kernel_instructions_executed": 2338
+      },
+      "vf_kernel_info": {
+        "name": "kernel",
+        "arch": "v100",
+        "frequency_ghz": 1.65,
+        "active_cores": 1,
+        "exec_time_ns": 4053.33,
+        "exec_time_ticks": 6688,
+        "total_instrs_executed": 2338,
+        "scalar_ipc_overall": 0.06
+      },
+      "cache_report": {
+        "icache_refill_count": 0,
+        "icache_refill_ticks": null
+      },
+      "bandwidth_report": {},
+      "pipeline_overlap": {
+        "AIC_MTE2_vs_AIC_CUBE": null,
+        "AIC_MTE1_vs_AIC_CUBE": null,
+        "AIC_FIXP_vs_AIC_CUBE": null,
+        "AIC_SCALAR_vs_AIC_CUBE": null,
+        "AIV0_MTE2_vs_AIV0_VEC": 0.0019,
+        "AIV0_SCALAR_vs_AIV0_VEC": 0.0051,
+        "AIV0_MTE3_vs_AIV0_VEC": 0.0016,
+        "AIV1_MTE2_vs_AIV1_VEC": null,
+        "AIV1_SCALAR_vs_AIV0_VEC": null,
+        "AIV1_MTE3_vs_AIV1_VEC": null,
+        "AIC_CUBE_vs_AIV0_VEC": null,
+        "AIC_CUBE_vs_AIV1_VEC": null
+      },
+      "scalar_instructions": {
+        "AIV0": {
+          "total_count": 337,
+          "load_count": 23,
+          "store_count": 74,
+          "load_store_ratio": 0.29
+        }
+      },
+      "modeled_cycles": 6688,
+      "cycles_per_element_end_to_end": 6.53125,
+      "pipeline_utilization": {
+        "pipeline_util_summary": {
+          "AIV0_SCALAR": {
+            "mean": 0.5493,
+            "max": 0.5493,
+            "min": 0.5493
+          },
+          "AIV0_MTE2": {
+            "mean": 0.0007,
+            "max": 0.0007,
+            "min": 0.0007
+          },
+          "AIV0_MTE3": {
+            "mean": 0.0815,
+            "max": 0.0815,
+            "min": 0.0815
+          },
+          "AIV0_SIMT": {
+            "mean": 0.34,
+            "max": 0.34,
+            "min": 0.34
+          }
+        }
+      },
+      "vector_instruction_report": {
+        "RVECEX_count": 1456,
+        "RVECLD_count": 32,
+        "RVECST_count": 32,
+        "ub_traffic_ratio": 0.04395604395604396,
+        "SIMT_ExecIPC": 0.6140868831716575,
+        "SIMT_LdStIPC": 0.026992830029523407,
+        "SIMT_BranchIPC": 0.17545339519190215
+      },
+      "trace_event_counts": {
+        "LDP_XI_XJ_XN": 3,
+        "ST_XD_XN_IMM": 51,
+        "LD_XD_XN_IMM": 20,
+        "STI_XN_IMM": 16,
+        "STP_XI_XJ_XN": 7,
+        "MOV_XD_SPR": 14,
+        "MOVK": 32,
+        "ADD_IMM": 13,
+        "SHR": 4,
+        "MADD": 3,
+        "MOV_XD_IMM": 68,
+        "SUB_IMM": 12,
+        "CMP": 6,
+        "AND": 13,
+        "CMPN": 4,
+        "ZEROEXT": 5,
+        "INSERT_XD_XN": 15,
+        "SHL": 12,
+        "SBITSET": 7,
+        "SUB": 4,
+        "ADD": 8,
+        "OR": 4,
+        "DC_PRELOAD_XN_IMM": 1,
+        "NEG": 2,
+        "MOV_XD_XN": 5,
+        "SFF": 1,
+        "MOV_SPR_XN": 4,
+        "SIGNEXT": 1,
+        "MIN": 1,
+        "TICK_START_EVENT": 1,
+        "MOV_SRC_TO_DST_ALIGNv2": 1,
+        "BAR": 4,
+        "DCI": 1,
+        "DCCI": 1,
+        "MOVEMASK": 2,
+        "VF_SIMT": 1,
+        "PUSH_PB": 2
+      },
+      "vector_functions": [
+        {
+          "id": 0,
+          "type": "simt",
+          "function_pc": "0x1360",
+          "call_sites": [
+            "0x768"
+          ],
+          "executions": 1,
+          "timing": {
+            "avg_cycles": 2543,
+            "min_cycles": 2543,
+            "max_cycles": 2543,
+            "variance_ratio": 1.0
+          },
+          "ipc": {
+            "branch": 0.175,
+            "exec": 0.614,
+            "ldst": 0.027,
+            "total": 0.817
+          },
+          "instr_profile": {
+            "total_count": 1968,
+            "by_pipe": [
+              {
+                "pipe": "RVECEX",
+                "count": 1456,
+                "pct": 74.0,
+                "ticks": 10960
+              },
+              {
+                "pipe": "RVECLP",
+                "count": 448,
+                "pct": 22.8,
+                "ticks": 2112
+              },
+              {
+                "pipe": "RVECST",
+                "count": 32,
+                "pct": 1.6,
+                "ticks": 862
+              },
+              {
+                "pipe": "RVECLD",
+                "count": 32,
+                "pct": 1.6,
+                "ticks": 20840
+              }
+            ]
+          }
+        }
+      ],
+      "simt_vfs": [
+        {
+          "id": 0,
+          "type": "simt",
+          "function_pc": "0x1360",
+          "call_sites": [
+            "0x768"
+          ],
+          "executions": 1,
+          "timing": {
+            "avg_cycles": 2543,
+            "min_cycles": 2543,
+            "max_cycles": 2543,
+            "variance_ratio": 1.0
+          },
+          "ipc": {
+            "branch": 0.175,
+            "exec": 0.614,
+            "ldst": 0.027,
+            "total": 0.817
+          },
+          "instr_profile": {
+            "total_count": 1968,
+            "by_pipe": [
+              {
+                "pipe": "RVECEX",
+                "count": 1456,
+                "pct": 74.0,
+                "ticks": 10960
+              },
+              {
+                "pipe": "RVECLP",
+                "count": 448,
+                "pct": 22.8,
+                "ticks": 2112
+              },
+              {
+                "pipe": "RVECST",
+                "count": 32,
+                "pct": 1.6,
+                "ticks": 862
+              },
+              {
+                "pipe": "RVECLD",
+                "count": 32,
+                "pct": 1.6,
+                "ticks": 20840
+              }
+            ]
+          }
+        }
+      ],
+      "exclusive_stall_cycles": null,
+      "data_cache_hit_rate": null,
+      "gm_bandwidth_bytes_per_cycle": null,
+      "isolated_mode_switch_cycles": null,
+      "notes": [
+        "Pipeline utilizations overlap: do not add them to derive total cycles.",
+        "VF duration includes work and is not isolated mode-switch latency.",
+        "Logical byte counts are not measured bus traffic."
+      ]
+    },
+    "simt-cg": {
+      "summary": "/tmp/dsv4_runs/small_cg/npusim_20261005174635_bench_sim_950pr_moe_simt_vs_simd/report/results/kernel_0_reports/summary.json",
+      "elements": 1024,
+      "kernel_info": {
+        "ai_core_active": 1,
+        "kernel_total_clocks": 8668,
+        "kernel_instructions_executed": 2338
+      },
+      "vf_kernel_info": {
+        "name": "kernel",
+        "arch": "v100",
+        "frequency_ghz": 1.65,
+        "active_cores": 1,
+        "exec_time_ns": 5253.33,
+        "exec_time_ticks": 8668,
+        "total_instrs_executed": 2338,
+        "scalar_ipc_overall": 0.04
+      },
+      "cache_report": {
+        "icache_refill_count": 0,
+        "icache_refill_ticks": null
+      },
+      "bandwidth_report": {},
+      "pipeline_overlap": {
+        "AIC_MTE2_vs_AIC_CUBE": null,
+        "AIC_MTE1_vs_AIC_CUBE": null,
+        "AIC_FIXP_vs_AIC_CUBE": null,
+        "AIC_SCALAR_vs_AIC_CUBE": null,
+        "AIV0_MTE2_vs_AIV0_VEC": 0.0011,
+        "AIV0_SCALAR_vs_AIV0_VEC": 0.0039,
+        "AIV0_MTE3_vs_AIV0_VEC": 0.001,
+        "AIV1_MTE2_vs_AIV1_VEC": null,
+        "AIV1_SCALAR_vs_AIV0_VEC": null,
+        "AIV1_MTE3_vs_AIV1_VEC": null,
+        "AIC_CUBE_vs_AIV0_VEC": null,
+        "AIC_CUBE_vs_AIV1_VEC": null
+      },
+      "scalar_instructions": {
+        "AIV0": {
+          "total_count": 337,
+          "load_count": 23,
+          "store_count": 74,
+          "load_store_ratio": 0.29
+        }
+      },
+      "modeled_cycles": 8668,
+      "cycles_per_element_end_to_end": 8.46484375,
+      "pipeline_utilization": {
+        "pipeline_util_summary": {
+          "AIV0_SCALAR": {
+            "mean": 0.4234,
+            "max": 0.4234,
+            "min": 0.4234
+          },
+          "AIV0_MTE2": {
+            "mean": 0.0006,
+            "max": 0.0006,
+            "min": 0.0006
+          },
+          "AIV0_MTE3": {
+            "mean": 0.0617,
+            "max": 0.0617,
+            "min": 0.0617
+          },
+          "AIV0_SIMT": {
+            "mean": 0.4893,
+            "max": 0.4893,
+            "min": 0.4893
+          }
+        }
+      },
+      "vector_instruction_report": {
+        "RVECEX_count": 1456,
+        "RVECLD_count": 32,
+        "RVECST_count": 32,
+        "ub_traffic_ratio": 0.04395604395604396,
+        "SIMT_ExecIPC": 0.33386837881219905,
+        "SIMT_LdStIPC": 0.014675533134602155,
+        "SIMT_BranchIPC": 0.09539096537491401
+      },
+      "trace_event_counts": {
+        "LDP_XI_XJ_XN": 3,
+        "ST_XD_XN_IMM": 51,
+        "LD_XD_XN_IMM": 20,
+        "STI_XN_IMM": 16,
+        "STP_XI_XJ_XN": 7,
+        "MOV_XD_SPR": 14,
+        "MOVK": 32,
+        "ADD_IMM": 13,
+        "SHR": 4,
+        "MADD": 3,
+        "MOV_XD_IMM": 68,
+        "SUB_IMM": 12,
+        "CMP": 6,
+        "AND": 13,
+        "CMPN": 4,
+        "ZEROEXT": 5,
+        "INSERT_XD_XN": 15,
+        "SHL": 12,
+        "SBITSET": 7,
+        "SUB": 4,
+        "ADD": 8,
+        "OR": 4,
+        "DC_PRELOAD_XN_IMM": 1,
+        "NEG": 2,
+        "MOV_XD_XN": 5,
+        "SFF": 1,
+        "MOV_SPR_XN": 4,
+        "SIGNEXT": 1,
+        "MIN": 1,
+        "TICK_START_EVENT": 1,
+        "MOV_SRC_TO_DST_ALIGNv2": 1,
+        "BAR": 4,
+        "DCI": 1,
+        "DCCI": 1,
+        "MOVEMASK": 2,
+        "VF_SIMT": 1,
+        "PUSH_PB": 2
+      },
+      "vector_functions": [
+        {
+          "id": 0,
+          "type": "simt",
+          "function_pc": "0x1360",
+          "call_sites": [
+            "0x768"
+          ],
+          "executions": 1,
+          "timing": {
+            "avg_cycles": 4537,
+            "min_cycles": 4537,
+            "max_cycles": 4537,
+            "variance_ratio": 1.0
+          },
+          "ipc": {
+            "branch": 0.095,
+            "exec": 0.334,
+            "ldst": 0.015,
+            "total": 0.444
+          },
+          "instr_profile": {
+            "total_count": 1968,
+            "by_pipe": [
+              {
+                "pipe": "RVECEX",
+                "count": 1456,
+                "pct": 74.0,
+                "ticks": 10976
+              },
+              {
+                "pipe": "RVECLP",
+                "count": 448,
+                "pct": 22.8,
+                "ticks": 2112
+              },
+              {
+                "pipe": "RVECST",
+                "count": 32,
+                "pct": 1.6,
+                "ticks": 674
+              },
+              {
+                "pipe": "RVECLD",
+                "count": 32,
+                "pct": 1.6,
+                "ticks": 38241
+              }
+            ]
+          }
+        }
+      ],
+      "simt_vfs": [
+        {
+          "id": 0,
+          "type": "simt",
+          "function_pc": "0x1360",
+          "call_sites": [
+            "0x768"
+          ],
+          "executions": 1,
+          "timing": {
+            "avg_cycles": 4537,
+            "min_cycles": 4537,
+            "max_cycles": 4537,
+            "variance_ratio": 1.0
+          },
+          "ipc": {
+            "branch": 0.095,
+            "exec": 0.334,
+            "ldst": 0.015,
+            "total": 0.444
+          },
+          "instr_profile": {
+            "total_count": 1968,
+            "by_pipe": [
+              {
+                "pipe": "RVECEX",
+                "count": 1456,
+                "pct": 74.0,
+                "ticks": 10976
+              },
+              {
+                "pipe": "RVECLP",
+                "count": 448,
+                "pct": 22.8,
+                "ticks": 2112
+              },
+              {
+                "pipe": "RVECST",
+                "count": 32,
+                "pct": 1.6,
+                "ticks": 674
+              },
+              {
+                "pipe": "RVECLD",
+                "count": 32,
+                "pct": 1.6,
+                "ticks": 38241
+              }
+            ]
+          }
+        }
+      ],
+      "exclusive_stall_cycles": null,
+      "data_cache_hit_rate": null,
+      "gm_bandwidth_bytes_per_cycle": null,
+      "isolated_mode_switch_cycles": null,
+      "notes": [
+        "Pipeline utilizations overlap: do not add them to derive total cycles.",
+        "VF duration includes work and is not isolated mode-switch latency.",
+        "Logical byte counts are not measured bus traffic."
+      ]
+    },
+    "simt-lut": {
+      "summary": "/tmp/dsv4_runs/small_lut/npusim_20261005174639_bench_sim_950pr_moe_simt_vs_simd/report/results/kernel_0_reports/summary.json",
+      "elements": 1024,
+      "kernel_info": {
+        "ai_core_active": 1,
+        "kernel_total_clocks": 6685,
+        "kernel_instructions_executed": 2338
+      },
+      "vf_kernel_info": {
+        "name": "kernel",
+        "arch": "v100",
+        "frequency_ghz": 1.65,
+        "active_cores": 1,
+        "exec_time_ns": 4051.52,
+        "exec_time_ticks": 6685,
+        "total_instrs_executed": 2338,
+        "scalar_ipc_overall": 0.06
+      },
+      "cache_report": {
+        "icache_refill_count": 0,
+        "icache_refill_ticks": null
+      },
+      "bandwidth_report": {},
+      "pipeline_overlap": {
+        "AIC_MTE2_vs_AIC_CUBE": null,
+        "AIC_MTE1_vs_AIC_CUBE": null,
+        "AIC_FIXP_vs_AIC_CUBE": null,
+        "AIC_SCALAR_vs_AIC_CUBE": null,
+        "AIV0_MTE2_vs_AIV0_VEC": 0.0019,
+        "AIV0_SCALAR_vs_AIV0_VEC": 0.0051,
+        "AIV0_MTE3_vs_AIV0_VEC": 0.0016,
+        "AIV1_MTE2_vs_AIV1_VEC": null,
+        "AIV1_SCALAR_vs_AIV0_VEC": null,
+        "AIV1_MTE3_vs_AIV1_VEC": null,
+        "AIC_CUBE_vs_AIV0_VEC": null,
+        "AIC_CUBE_vs_AIV1_VEC": null
+      },
+      "scalar_instructions": {
+        "AIV0": {
+          "total_count": 337,
+          "load_count": 23,
+          "store_count": 74,
+          "load_store_ratio": 0.29
+        }
+      },
+      "modeled_cycles": 6685,
+      "cycles_per_element_end_to_end": 6.5283203125,
+      "pipeline_utilization": {
+        "pipeline_util_summary": {
+          "AIV0_SCALAR": {
+            "mean": 0.5503,
+            "max": 0.5503,
+            "min": 0.5503
+          },
+          "AIV0_MTE2": {
+            "mean": 0.0007,
+            "max": 0.0007,
+            "min": 0.0007
+          },
+          "AIV0_MTE3": {
+            "mean": 0.0797,
+            "max": 0.0797,
+            "min": 0.0797
+          },
+          "AIV0_SIMT": {
+            "mean": 0.3409,
+            "max": 0.3409,
+            "min": 0.3409
+          }
+        }
+      },
+      "vector_instruction_report": {
+        "RVECEX_count": 1456,
+        "RVECLD_count": 32,
+        "RVECST_count": 32,
+        "ub_traffic_ratio": 0.04395604395604396,
+        "SIMT_ExecIPC": 0.6130526315789474,
+        "SIMT_LdStIPC": 0.026947368421052633,
+        "SIMT_BranchIPC": 0.1751578947368421
+      },
+      "trace_event_counts": {
+        "LDP_XI_XJ_XN": 3,
+        "ST_XD_XN_IMM": 51,
+        "LD_XD_XN_IMM": 20,
+        "STI_XN_IMM": 16,
+        "STP_XI_XJ_XN": 7,
+        "MOV_XD_SPR": 14,
+        "MOVK": 32,
+        "ADD_IMM": 13,
+        "SHR": 4,
+        "MADD": 3,
+        "MOV_XD_IMM": 68,
+        "SUB_IMM": 12,
+        "CMP": 6,
+        "AND": 13,
+        "CMPN": 4,
+        "ZEROEXT": 5,
+        "INSERT_XD_XN": 15,
+        "SHL": 12,
+        "SBITSET": 7,
+        "SUB": 4,
+        "ADD": 8,
+        "OR": 4,
+        "DC_PRELOAD_XN_IMM": 1,
+        "NEG": 2,
+        "MOV_XD_XN": 5,
+        "SFF": 1,
+        "MOV_SPR_XN": 4,
+        "SIGNEXT": 1,
+        "MIN": 1,
+        "TICK_START_EVENT": 1,
+        "MOV_SRC_TO_DST_ALIGNv2": 1,
+        "BAR": 4,
+        "DCI": 1,
+        "DCCI": 1,
+        "MOVEMASK": 2,
+        "VF_SIMT": 1,
+        "PUSH_PB": 2
+      },
+      "vector_functions": [
+        {
+          "id": 0,
+          "type": "simt",
+          "function_pc": "0x1360",
+          "call_sites": [
+            "0x768"
+          ],
+          "executions": 1,
+          "timing": {
+            "avg_cycles": 2547,
+            "min_cycles": 2547,
+            "max_cycles": 2547,
+            "variance_ratio": 1.0
+          },
+          "ipc": {
+            "branch": 0.175,
+            "exec": 0.613,
+            "ldst": 0.027,
+            "total": 0.815
+          },
+          "instr_profile": {
+            "total_count": 1968,
+            "by_pipe": [
+              {
+                "pipe": "RVECEX",
+                "count": 1456,
+                "pct": 74.0,
+                "ticks": 10960
+              },
+              {
+                "pipe": "RVECLP",
+                "count": 448,
+                "pct": 22.8,
+                "ticks": 2112
+              },
+              {
+                "pipe": "RVECST",
+                "count": 32,
+                "pct": 1.6,
+                "ticks": 862
+              },
+              {
+                "pipe": "RVECLD",
+                "count": 32,
+                "pct": 1.6,
+                "ticks": 20923
+              }
+            ]
+          }
+        }
+      ],
+      "simt_vfs": [
+        {
+          "id": 0,
+          "type": "simt",
+          "function_pc": "0x1360",
+          "call_sites": [
+            "0x768"
+          ],
+          "executions": 1,
+          "timing": {
+            "avg_cycles": 2547,
+            "min_cycles": 2547,
+            "max_cycles": 2547,
+            "variance_ratio": 1.0
+          },
+          "ipc": {
+            "branch": 0.175,
+            "exec": 0.613,
+            "ldst": 0.027,
+            "total": 0.815
+          },
+          "instr_profile": {
+            "total_count": 1968,
+            "by_pipe": [
+              {
+                "pipe": "RVECEX",
+                "count": 1456,
+                "pct": 74.0,
+                "ticks": 10960
+              },
+              {
+                "pipe": "RVECLP",
+                "count": 448,
+                "pct": 22.8,
+                "ticks": 2112
+              },
+              {
+                "pipe": "RVECST",
+                "count": 32,
+                "pct": 1.6,
+                "ticks": 862
+              },
+              {
+                "pipe": "RVECLD",
+                "count": 32,
+                "pct": 1.6,
+                "ticks": 20923
+              }
+            ]
+          }
+        }
+      ],
+      "exclusive_stall_cycles": null,
+      "data_cache_hit_rate": null,
+      "gm_bandwidth_bytes_per_cycle": null,
+      "isolated_mode_switch_cycles": null,
+      "notes": [
+        "Pipeline utilizations overlap: do not add them to derive total cycles.",
+        "VF duration includes work and is not isolated mode-switch latency.",
+        "Logical byte counts are not measured bus traffic."
+      ]
+    }
+  },
+  "projection_tile": {
+    "hidden": 512,
+    "inter": 8,
+    "elements": 4096,
+    "results": {
+      "simd": {
+        "summary": "/tmp/dsv4_runs/math512_simd/npusim_20261005180356_bench_sim_950pr_moe_simt_vs_simd/report/results/kernel_0_reports/summary.json",
+        "elements": 4096,
+        "kernel_info": {
+          "ai_core_active": 1,
+          "kernel_total_clocks": 12646,
+          "kernel_instructions_executed": 9915
+        },
+        "vf_kernel_info": {
+          "name": "kernel",
+          "arch": "v100",
+          "frequency_ghz": 1.65,
+          "active_cores": 1,
+          "exec_time_ns": 7664.24,
+          "exec_time_ticks": 12646,
+          "total_instrs_executed": 9915,
+          "scalar_ipc_overall": 0.12
+        },
+        "cache_report": {
+          "icache_refill_count": 0,
+          "icache_refill_ticks": null
+        },
+        "bandwidth_report": {},
+        "pipeline_overlap": {
+          "AIC_MTE2_vs_AIC_CUBE": null,
+          "AIC_MTE1_vs_AIC_CUBE": null,
+          "AIC_FIXP_vs_AIC_CUBE": null,
+          "AIC_SCALAR_vs_AIC_CUBE": null,
+          "AIV0_MTE2_vs_AIV0_VEC": 0.0102,
+          "AIV0_SCALAR_vs_AIV0_VEC": 0.064,
+          "AIV0_MTE3_vs_AIV0_VEC": 0.0008,
+          "AIV1_MTE2_vs_AIV1_VEC": null,
+          "AIV1_SCALAR_vs_AIV0_VEC": null,
+          "AIV1_MTE3_vs_AIV1_VEC": null,
+          "AIC_CUBE_vs_AIV0_VEC": null,
+          "AIC_CUBE_vs_AIV1_VEC": null
+        },
+        "scalar_instructions": {
+          "AIV0": {
+            "total_count": 1286,
+            "load_count": 119,
+            "store_count": 118,
+            "load_store_ratio": 0.18
+          }
+        },
+        "modeled_cycles": 12646,
+        "cycles_per_element_end_to_end": 3.08740234375,
+        "pipeline_utilization": {
+          "pipeline_util_summary": {
+            "AIV0_SIMD": {
+              "mean": 0.4951,
+              "max": 0.4951,
+              "min": 0.4951
+            },
+            "AIV0_SCALAR": {
+              "mean": 0.3872,
+              "max": 0.3872,
+              "min": 0.3872
+            },
+            "AIV0_MTE2": {
+              "mean": 0.0912,
+              "max": 0.0912,
+              "min": 0.0912
+            },
+            "AIV0_MTE3": {
+              "mean": 0.03,
+              "max": 0.03,
+              "min": 0.03
+            }
+          }
+        },
+        "vector_instruction_report": {
+          "RVECEX_count": 3940,
+          "RVECLD_count": 2219,
+          "RVECST_count": 2104,
+          "ub_traffic_ratio": 1.0972081218274112,
+          "SIMD_ScalarIPC": 0.03256224276485881,
+          "SIMD_ExecIPC": 0.5648183164891106,
+          "SIMD_LdStIPC": 0.5841154554019199
+        },
+        "trace_event_counts": {
+          "LDP_XI_XJ_XN": 3,
+          "ST_XD_XN_IMM": 91,
+          "LD_XD_XN_IMM": 116,
+          "STI_XN_IMM": 20,
+          "STP_XI_XJ_XN": 7,
+          "MOV_XD_SPR": 39,
+          "MOVK": 65,
+          "ADD_IMM": 44,
+          "SHR": 14,
+          "MADD": 11,
+          "MOV_XD_IMM": 217,
+          "SUB_IMM": 28,
+          "AND": 34,
+          "SFF": 9,
+          "INSERT_XD_XN": 120,
+          "CMP": 55,
+          "MOV_XD_XN": 93,
+          "ADD": 79,
+          "OR": 12,
+          "SHL": 128,
+          "ZEROEXT": 36,
+          "DIV": 3,
+          "SBITSET": 24,
+          "SUB": 5,
+          "CMPN": 4,
+          "SIGNEXT": 9,
+          "NEG": 4,
+          "DC_PRELOAD_XN_IMM": 1,
+          "MIN": 2,
+          "MOV_SPR_XN": 4,
+          "TICK_START_EVENT": 1,
+          "MOV_SRC_TO_DST_ALIGNv2": 4,
+          "BAR": 2,
+          "DCI": 1,
+          "DCCI": 1,
+          "RV_PLT": 1896,
+          "RV_VCVT_I2I": 51,
+          "RV_VAND": 290,
+          "RV_VSHRI": 353,
+          "RV_VADDS": 70,
+          "RV_VSHLS": 322,
+          "RV_VDUPS": 9,
+          "RV_VOR": 128,
+          "RV_VCMPS_EQ": 128,
+          "RV_PSET": 17,
+          "RV_PINTLV": 65,
+          "RV_VSEL": 130,
+          "RV_VADD": 195,
+          "RV_VMULS": 135,
+          "RV_VMUL": 65,
+          "RV_VCADD": 72,
+          "RV_VCI": 3,
+          "RV_VMINS": 1,
+          "RV_VEXP": 1,
+          "RV_VDIV": 1,
+          "RV_VCVT_F2F": 1,
+          "RV_VCMPS_LT": 2,
+          "RV_VMAXS": 1,
+          "RV_VBR": 4,
+          "RV_VST": 1764,
+          "RV_SMEM_BAR": 93,
+          "RV_PSTU": 130,
+          "RV_SEND": 26,
+          "RV_VSTUI": 72,
+          "RV_VSTAI": 19,
+          "RV_VLD": 1953,
+          "RV_PLD": 65,
+          "RV_VGATHER2": 129,
+          "RV_VLDI": 72,
+          "MOVEMASK": 2,
+          "VF": 26,
+          "PUSH_PB": 35
+        },
+        "vector_functions": [
+          {
+            "id": 0,
+            "type": "simd",
+            "function_pc": "0x2f28",
+            "call_sites": [
+              "0x5b8"
+            ],
+            "executions": 1,
+            "timing": {
+              "avg_cycles": 590,
+              "min_cycles": 590,
+              "max_cycles": 590,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.014,
+              "exec": 0.129,
+              "ldst": 0.071,
+              "total": 0.214
+            },
+            "instr_profile": {
+              "total_count": 16,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 9,
+                  "pct": 56.2,
+                  "ticks": 81
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 4,
+                  "pct": 25.0,
+                  "ticks": 36
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1,
+                  "pct": 6.2,
+                  "ticks": 0
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 1,
+                  "pct": 6.2,
+                  "ticks": 9
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 1,
+                  "pct": 6.2,
+                  "ticks": 1
+                }
+              ]
+            }
+          },
+          {
+            "id": 1,
+            "type": "simd",
+            "function_pc": "0x2124",
+            "call_sites": [
+              "0xc58"
+            ],
+            "executions": 1,
+            "timing": {
+              "avg_cycles": 37,
+              "min_cycles": 37,
+              "max_cycles": 37,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.071,
+              "exec": 0.143,
+              "ldst": 0.214,
+              "total": 0.429
+            },
+            "instr_profile": {
+              "total_count": 13,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 4,
+                  "pct": 30.8,
+                  "ticks": 24
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 4,
+                  "pct": 30.8,
+                  "ticks": 34
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 2,
+                  "pct": 15.4,
+                  "ticks": 18
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 2,
+                  "pct": 15.4,
+                  "ticks": 2
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1,
+                  "pct": 7.7,
+                  "ticks": 0
+                }
+              ]
+            }
+          },
+          {
+            "id": 2,
+            "type": "simd",
+            "function_pc": "0x2a20",
+            "call_sites": [
+              "0x11c8"
+            ],
+            "executions": 8,
+            "timing": {
+              "avg_cycles": 117,
+              "min_cycles": 100,
+              "max_cycles": 119,
+              "variance_ratio": 1.2
+            },
+            "ipc": {
+              "scalar": 0.065,
+              "exec": 0.196,
+              "ldst": 0.239,
+              "total": 0.5
+            },
+            "instr_profile": {
+              "total_count": 47,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 18,
+                  "pct": 38.3,
+                  "ticks": 252
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 13,
+                  "pct": 27.7,
+                  "ticks": 108
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 9,
+                  "pct": 19.1,
+                  "ticks": 117
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 6,
+                  "pct": 12.8,
+                  "ticks": 6
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1,
+                  "pct": 2.1,
+                  "ticks": 0
+                }
+              ]
+            }
+          },
+          {
+            "id": 3,
+            "type": "simd",
+            "function_pc": "0x2220",
+            "call_sites": [
+              "0xd18"
+            ],
+            "executions": 1,
+            "timing": {
+              "avg_cycles": 90,
+              "min_cycles": 90,
+              "max_cycles": 90,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.05,
+              "exec": 0.212,
+              "ldst": 0.25,
+              "total": 0.512
+            },
+            "instr_profile": {
+              "total_count": 44,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 17,
+                  "pct": 38.6,
+                  "ticks": 109
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 11,
+                  "pct": 25.0,
+                  "ticks": 99
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 9,
+                  "pct": 20.5,
+                  "ticks": 125
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 4,
+                  "pct": 9.1,
+                  "ticks": 4
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 3,
+                  "pct": 6.8,
+                  "ticks": 0
+                }
+              ]
+            }
+          },
+          {
+            "id": 4,
+            "type": "simd",
+            "function_pc": "0x1f20",
+            "call_sites": [
+              "0xc00"
+            ],
+            "executions": 1,
+            "timing": {
+              "avg_cycles": 1893,
+              "min_cycles": 1893,
+              "max_cycles": 1893,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.004,
+              "exec": 0.263,
+              "ldst": 0.332,
+              "total": 0.6
+            },
+            "instr_profile": {
+              "total_count": 1136,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 496,
+                  "pct": 43.7,
+                  "ticks": 3141
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 357,
+                  "pct": 31.4,
+                  "ticks": 4784
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 269,
+                  "pct": 23.7,
+                  "ticks": 3244
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 8,
+                  "pct": 0.7,
+                  "ticks": 8
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 6,
+                  "pct": 0.5,
+                  "ticks": 0
+                }
+              ]
+            }
+          },
+          {
+            "id": 5,
+            "type": "simd",
+            "function_pc": "0x2524",
+            "call_sites": [
+              "0x544",
+              "0xe7c"
+            ],
+            "executions": 2,
+            "timing": {
+              "avg_cycles": 156,
+              "min_cycles": 54,
+              "max_cycles": 258,
+              "variance_ratio": 4.8
+            },
+            "ipc": {
+              "scalar": 0.013,
+              "exec": 0.292,
+              "ldst": 0.432,
+              "total": 0.737
+            },
+            "instr_profile": {
+              "total_count": 324,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 129,
+                  "pct": 39.8,
+                  "ticks": 774
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 128,
+                  "pct": 39.5,
+                  "ticks": 2459
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 65,
+                  "pct": 20.1,
+                  "ticks": 1602
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1,
+                  "pct": 0.3,
+                  "ticks": 0
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 1,
+                  "pct": 0.3,
+                  "ticks": 1
+                }
+              ]
+            }
+          },
+          {
+            "id": 6,
+            "type": "simd",
+            "function_pc": "0x2344",
+            "call_sites": [
+              "0xdf4"
+            ],
+            "executions": 1,
+            "timing": {
+              "avg_cycles": 387,
+              "min_cycles": 387,
+              "max_cycles": 387,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.003,
+              "exec": 0.341,
+              "ldst": 0.511,
+              "total": 0.854
+            },
+            "instr_profile": {
+              "total_count": 324,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 129,
+                  "pct": 39.8,
+                  "ticks": 774
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 128,
+                  "pct": 39.5,
+                  "ticks": 3604
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 65,
+                  "pct": 20.1,
+                  "ticks": 2565
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1,
+                  "pct": 0.3,
+                  "ticks": 0
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 1,
+                  "pct": 0.3,
+                  "ticks": 1
+                }
+              ]
+            }
+          },
+          {
+            "id": 7,
+            "type": "simd",
+            "function_pc": "0x2320",
+            "call_sites": [
+              "0x514",
+              "0xd54",
+              "0xe18"
+            ],
+            "executions": 3,
+            "timing": {
+              "avg_cycles": 170,
+              "min_cycles": 57,
+              "max_cycles": 227,
+              "variance_ratio": 4.0
+            },
+            "ipc": {
+              "scalar": 0.015,
+              "exec": 0.522,
+              "ldst": 0.224,
+              "total": 0.76
+            },
+            "instr_profile": {
+              "total_count": 201,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 135,
+                  "pct": 67.2,
+                  "ticks": 880
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 65,
+                  "pct": 32.3,
+                  "ticks": 585
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 1,
+                  "pct": 0.5,
+                  "ticks": 1
+                }
+              ]
+            }
+          },
+          {
+            "id": 8,
+            "type": "simd",
+            "function_pc": "0x2724",
+            "call_sites": [
+              "0xea8"
+            ],
+            "executions": 1,
+            "timing": {
+              "avg_cycles": 156,
+              "min_cycles": 156,
+              "max_cycles": 156,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.007,
+              "exec": 0.871,
+              "ldst": 1.313,
+              "total": 2.19
+            },
+            "instr_profile": {
+              "total_count": 323,
+              "by_pipe": [
+                {
+                  "pipe": "RVECLD",
+                  "count": 128,
+                  "pct": 39.6,
+                  "ticks": 1231
+                },
+                {
+                  "pipe": "RVECEX",
+                  "count": 128,
+                  "pct": 39.6,
+                  "ticks": 896
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 65,
+                  "pct": 20.1,
+                  "ticks": 1026
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1,
+                  "pct": 0.3,
+                  "ticks": 0
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 1,
+                  "pct": 0.3,
+                  "ticks": 1
+                }
+              ]
+            }
+          },
+          {
+            "id": 9,
+            "type": "simd",
+            "function_pc": "0x1d20",
+            "call_sites": [
+              "0xaec"
+            ],
+            "executions": 1,
+            "timing": {
+              "avg_cycles": 249,
+              "min_cycles": 249,
+              "max_cycles": 249,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.013,
+              "exec": 0.95,
+              "ldst": 1.209,
+              "total": 2.172
+            },
+            "instr_profile": {
+              "total_count": 521,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 227,
+                  "pct": 43.6,
+                  "ticks": 1522
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 160,
+                  "pct": 30.7,
+                  "ticks": 1506
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 129,
+                  "pct": 24.8,
+                  "ticks": 1683
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 3,
+                  "pct": 0.6,
+                  "ticks": 3
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 2,
+                  "pct": 0.4,
+                  "ticks": 0
+                }
+              ]
+            }
+          },
+          {
+            "id": 10,
+            "type": "simd",
+            "function_pc": "0x2420",
+            "call_sites": [
+              "0xdbc"
+            ],
+            "executions": 1,
+            "timing": {
+              "avg_cycles": 636,
+              "min_cycles": 636,
+              "max_cycles": 636,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.014,
+              "exec": 1.124,
+              "ldst": 1.334,
+              "total": 2.473
+            },
+            "instr_profile": {
+              "total_count": 1560,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 706,
+                  "pct": 45.3,
+                  "ticks": 4428
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 448,
+                  "pct": 28.7,
+                  "ticks": 4189
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 390,
+                  "pct": 25.0,
+                  "ticks": 4366
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 9,
+                  "pct": 0.6,
+                  "ticks": 9
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 7,
+                  "pct": 0.4,
+                  "ticks": 0
+                }
+              ]
+            }
+          },
+          {
+            "id": 11,
+            "type": "simd",
+            "function_pc": "0x1a28",
+            "call_sites": [
+              "0x9c0"
+            ],
+            "executions": 1,
+            "timing": {
+              "avg_cycles": 995,
+              "min_cycles": 995,
+              "max_cycles": 995,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.014,
+              "exec": 1.131,
+              "ldst": 1.17,
+              "total": 2.316
+            },
+            "instr_profile": {
+              "total_count": 2249,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 1093,
+                  "pct": 48.6,
+                  "ticks": 6670
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 602,
+                  "pct": 26.8,
+                  "ticks": 6163
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 528,
+                  "pct": 23.5,
+                  "ticks": 5054
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 14,
+                  "pct": 0.6,
+                  "ticks": 14
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 12,
+                  "pct": 0.5,
+                  "ticks": 0
+                }
+              ]
+            }
+          },
+          {
+            "id": 12,
+            "type": "simd",
+            "function_pc": "0x1c24",
+            "call_sites": [
+              "0xa20"
+            ],
+            "executions": 1,
+            "timing": {
+              "avg_cycles": 101,
+              "min_cycles": 101,
+              "max_cycles": 101,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.022,
+              "exec": 1.391,
+              "ldst": 1.413,
+              "total": 2.826
+            },
+            "instr_profile": {
+              "total_count": 261,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 128,
+                  "pct": 49.0,
+                  "ticks": 768
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 66,
+                  "pct": 25.3,
+                  "ticks": 561
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 64,
+                  "pct": 24.5,
+                  "ticks": 576
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 2,
+                  "pct": 0.8,
+                  "ticks": 2
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1,
+                  "pct": 0.4,
+                  "ticks": 0
+                }
+              ]
+            }
+          },
+          {
+            "id": 13,
+            "type": "simd",
+            "function_pc": "0x1e24",
+            "call_sites": [
+              "0xb20"
+            ],
+            "executions": 1,
+            "timing": {
+              "avg_cycles": 101,
+              "min_cycles": 101,
+              "max_cycles": 101,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.022,
+              "exec": 1.391,
+              "ldst": 1.413,
+              "total": 2.826
+            },
+            "instr_profile": {
+              "total_count": 261,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 128,
+                  "pct": 49.0,
+                  "ticks": 768
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 66,
+                  "pct": 25.3,
+                  "ticks": 561
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 64,
+                  "pct": 24.5,
+                  "ticks": 576
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 2,
+                  "pct": 0.8,
+                  "ticks": 2
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1,
+                  "pct": 0.4,
+                  "ticks": 0
+                }
+              ]
+            }
+          },
+          {
+            "id": 14,
+            "type": "simd",
+            "function_pc": "0x2824",
+            "call_sites": [
+              "0xf40"
+            ],
+            "executions": 1,
+            "timing": {
+              "avg_cycles": 99,
+              "min_cycles": 99,
+              "max_cycles": 99,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.011,
+              "exec": 1.422,
+              "ldst": 1.433,
+              "total": 2.867
+            },
+            "instr_profile": {
+              "total_count": 259,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 128,
+                  "pct": 49.4,
+                  "ticks": 896
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 65,
+                  "pct": 25.1,
+                  "ticks": 585
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 64,
+                  "pct": 24.7,
+                  "ticks": 576
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1,
+                  "pct": 0.4,
+                  "ticks": 0
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 1,
+                  "pct": 0.4,
+                  "ticks": 1
+                }
+              ]
+            }
+          },
+          {
+            "id": 15,
+            "type": "simd",
+            "function_pc": "0x252c",
+            "call_sites": [
+              "0xe48"
+            ],
+            "executions": 1,
+            "timing": {
+              "avg_cycles": 129,
+              "min_cycles": 129,
+              "max_cycles": 129,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.008,
+              "exec": 1.6,
+              "ldst": 1.075,
+              "total": 2.683
+            },
+            "instr_profile": {
+              "total_count": 323,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 192,
+                  "pct": 59.4,
+                  "ticks": 1152
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 65,
+                  "pct": 20.1,
+                  "ticks": 625
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 64,
+                  "pct": 19.8,
+                  "ticks": 576
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1,
+                  "pct": 0.3,
+                  "ticks": 0
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 1,
+                  "pct": 0.3,
+                  "ticks": 1
+                }
+              ]
+            }
+          }
+        ],
+        "simt_vfs": [],
+        "exclusive_stall_cycles": null,
+        "data_cache_hit_rate": null,
+        "gm_bandwidth_bytes_per_cycle": null,
+        "isolated_mode_switch_cycles": null,
+        "notes": [
+          "Pipeline utilizations overlap: do not add them to derive total cycles.",
+          "VF duration includes work and is not isolated mode-switch latency.",
+          "Logical byte counts are not measured bus traffic."
+        ]
+      },
+      "simt": {
+        "summary": "/tmp/dsv4_runs/math512_simt/npusim_20261005180627_bench_sim_950pr_moe_simt_vs_simd/report/results/kernel_0_reports/summary.json",
+        "elements": 4096,
+        "kernel_info": {
+          "ai_core_active": 1,
+          "kernel_total_clocks": 11853,
+          "kernel_instructions_executed": 8103
+        },
+        "vf_kernel_info": {
+          "name": "kernel",
+          "arch": "v100",
+          "frequency_ghz": 1.65,
+          "active_cores": 1,
+          "exec_time_ns": 7183.64,
+          "exec_time_ticks": 11853,
+          "total_instrs_executed": 8103,
+          "scalar_ipc_overall": 0.09
+        },
+        "cache_report": {
+          "icache_refill_count": 0,
+          "icache_refill_ticks": null
+        },
+        "bandwidth_report": {},
+        "pipeline_overlap": {
+          "AIC_MTE2_vs_AIC_CUBE": null,
+          "AIC_MTE1_vs_AIC_CUBE": null,
+          "AIC_FIXP_vs_AIC_CUBE": null,
+          "AIC_SCALAR_vs_AIC_CUBE": null,
+          "AIV0_MTE2_vs_AIV0_VEC": 0.0007,
+          "AIV0_SCALAR_vs_AIV0_VEC": 0.0647,
+          "AIV0_MTE3_vs_AIV0_VEC": 0.0007,
+          "AIV1_MTE2_vs_AIV1_VEC": null,
+          "AIV1_SCALAR_vs_AIV0_VEC": null,
+          "AIV1_MTE3_vs_AIV1_VEC": null,
+          "AIC_CUBE_vs_AIV0_VEC": null,
+          "AIC_CUBE_vs_AIV1_VEC": null
+        },
+        "scalar_instructions": {
+          "AIV0": {
+            "total_count": 909,
+            "load_count": 82,
+            "store_count": 92,
+            "load_store_ratio": 0.19
+          }
+        },
+        "modeled_cycles": 11853,
+        "cycles_per_element_end_to_end": 2.893798828125,
+        "pipeline_utilization": {
+          "pipeline_util_summary": {
+            "AIV0_SIMD": {
+              "mean": 0.0818,
+              "max": 0.0818,
+              "min": 0.0818
+            },
+            "AIV0_SCALAR": {
+              "mean": 0.3786,
+              "max": 0.3786,
+              "min": 0.3786
+            },
+            "AIV0_MTE2": {
+              "mean": 0.0004,
+              "max": 0.0004,
+              "min": 0.0004
+            },
+            "AIV0_MTE3": {
+              "mean": 0.047,
+              "max": 0.047,
+              "min": 0.047
+            },
+            "AIV0_SIMT": {
+              "mean": 0.3741,
+              "max": 0.3741,
+              "min": 0.3741
+            }
+          }
+        },
+        "vector_instruction_report": {
+          "RVECEX_count": 5093,
+          "RVECLD_count": 267,
+          "RVECST_count": 305,
+          "ub_traffic_ratio": 0.11231101511879049,
+          "SIMD_ScalarIPC": 0.050372272654881346,
+          "SIMD_ExecIPC": 0.2905856824335085,
+          "SIMD_LdStIPC": 0.2967032967032968,
+          "SIMT_ExecIPC": 1.0652463382157125,
+          "SIMT_LdStIPC": 0.056813138038171326,
+          "SIMT_BranchIPC": 0.28406569019085665
+        },
+        "trace_event_counts": {
+          "LDP_XI_XJ_XN": 3,
+          "ST_XD_XN_IMM": 69,
+          "LD_XD_XN_IMM": 79,
+          "STI_XN_IMM": 16,
+          "STP_XI_XJ_XN": 7,
+          "MOV_XD_SPR": 26,
+          "MOVK": 48,
+          "ADD_IMM": 38,
+          "SHR": 4,
+          "MADD": 11,
+          "MOV_XD_IMM": 152,
+          "SUB_IMM": 28,
+          "CMP": 55,
+          "AND": 26,
+          "CMPN": 4,
+          "ZEROEXT": 26,
+          "INSERT_XD_XN": 69,
+          "SHL": 79,
+          "DIV": 3,
+          "MOV_XD_XN": 44,
+          "ADD": 52,
+          "SFF": 9,
+          "SBITSET": 24,
+          "SUB": 4,
+          "OR": 6,
+          "DC_PRELOAD_XN_IMM": 1,
+          "NEG": 2,
+          "MIN": 2,
+          "SIGNEXT": 9,
+          "MOV_SPR_XN": 4,
+          "TICK_START_EVENT": 1,
+          "MOV_SRC_TO_DST_ALIGNv2": 2,
+          "BAR": 4,
+          "DCI": 1,
+          "DCCI": 1,
+          "RV_PLT": 139,
+          "RV_VMULS": 67,
+          "RV_VCADD": 72,
+          "RV_PSET": 3,
+          "RV_VADDS": 2,
+          "RV_VMUL": 1,
+          "RV_VCI": 1,
+          "RV_VADD": 1,
+          "RV_VMINS": 1,
+          "RV_VEXP": 1,
+          "RV_VDIV": 1,
+          "RV_VCVT_F2F": 1,
+          "RV_VSHRI": 1,
+          "RV_VMAXS": 1,
+          "RV_VBR": 1,
+          "RV_VST": 69,
+          "RV_VSTUI": 72,
+          "RV_VSTAI": 16,
+          "RV_SEND": 12,
+          "RV_SMEM_BAR": 8,
+          "RV_VLD": 66,
+          "RV_VLDI": 72,
+          "RV_VGATHER2": 1,
+          "MOVEMASK": 2,
+          "VF_SIMT": 1,
+          "VF": 12,
+          "PUSH_PB": 15
+        },
+        "vector_functions": [
+          {
+            "id": 0,
+            "type": "simd",
+            "function_pc": "0x2524",
+            "call_sites": [
+              "0x544"
+            ],
+            "executions": 1,
+            "timing": {
+              "avg_cycles": 323,
+              "min_cycles": 323,
+              "max_cycles": 323,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.022,
+              "exec": 0.065,
+              "ldst": 0.087,
+              "total": 0.174
+            },
+            "instr_profile": {
+              "total_count": 10,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 3,
+                  "pct": 30.0,
+                  "ticks": 18
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 2,
+                  "pct": 20.0,
+                  "ticks": 0
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 2,
+                  "pct": 20.0,
+                  "ticks": 18
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 2,
+                  "pct": 20.0,
+                  "ticks": 31
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 1,
+                  "pct": 10.0,
+                  "ticks": 1
+                }
+              ]
+            }
+          },
+          {
+            "id": 1,
+            "type": "simd",
+            "function_pc": "0x2f28",
+            "call_sites": [
+              "0x5b8"
+            ],
+            "executions": 1,
+            "timing": {
+              "avg_cycles": 80,
+              "min_cycles": 80,
+              "max_cycles": 80,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.014,
+              "exec": 0.129,
+              "ldst": 0.071,
+              "total": 0.214
+            },
+            "instr_profile": {
+              "total_count": 15,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 9,
+                  "pct": 60.0,
+                  "ticks": 81
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 4,
+                  "pct": 26.7,
+                  "ticks": 36
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 1,
+                  "pct": 6.7,
+                  "ticks": 9
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 1,
+                  "pct": 6.7,
+                  "ticks": 1
+                }
+              ]
+            }
+          },
+          {
+            "id": 2,
+            "type": "simd",
+            "function_pc": "0x2a20",
+            "call_sites": [
+              "0x11c8"
+            ],
+            "executions": 8,
+            "timing": {
+              "avg_cycles": 166,
+              "min_cycles": 119,
+              "max_cycles": 497,
+              "variance_ratio": 4.2
+            },
+            "ipc": {
+              "scalar": 0.065,
+              "exec": 0.196,
+              "ldst": 0.239,
+              "total": 0.5
+            },
+            "instr_profile": {
+              "total_count": 47,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 18,
+                  "pct": 38.3,
+                  "ticks": 252
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 13,
+                  "pct": 27.7,
+                  "ticks": 108
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 9,
+                  "pct": 19.1,
+                  "ticks": 117
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 6,
+                  "pct": 12.8,
+                  "ticks": 6
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1,
+                  "pct": 2.1,
+                  "ticks": 0
+                }
+              ]
+            }
+          },
+          {
+            "id": 3,
+            "type": "simd",
+            "function_pc": "0x2320",
+            "call_sites": [
+              "0x514"
+            ],
+            "executions": 1,
+            "timing": {
+              "avg_cycles": 361,
+              "min_cycles": 361,
+              "max_cycles": 361,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.036,
+              "exec": 0.321,
+              "ldst": 0.071,
+              "total": 0.429
+            },
+            "instr_profile": {
+              "total_count": 13,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 9,
+                  "pct": 69.2,
+                  "ticks": 61
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 2,
+                  "pct": 15.4,
+                  "ticks": 18
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1,
+                  "pct": 7.7,
+                  "ticks": 0
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 1,
+                  "pct": 7.7,
+                  "ticks": 1
+                }
+              ]
+            }
+          },
+          {
+            "id": 4,
+            "type": "simt",
+            "function_pc": "0x1360",
+            "call_sites": [
+              "0x768"
+            ],
+            "executions": 1,
+            "timing": {
+              "avg_cycles": 4679,
+              "min_cycles": 4679,
+              "max_cycles": 4679,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "branch": 0.284,
+              "exec": 1.065,
+              "ldst": 0.057,
+              "total": 1.406
+            },
+            "instr_profile": {
+              "total_count": 6368,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 4800,
+                  "pct": 75.4,
+                  "ticks": 35840
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1312,
+                  "pct": 20.6,
+                  "ticks": 6048
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 128,
+                  "pct": 2.0,
+                  "ticks": 2979
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 128,
+                  "pct": 2.0,
+                  "ticks": 70850
+                }
+              ]
+            }
+          },
+          {
+            "id": 5,
+            "type": "simd",
+            "function_pc": "0x2824",
+            "call_sites": [
+              "0xf40"
+            ],
+            "executions": 1,
+            "timing": {
+              "avg_cycles": 674,
+              "min_cycles": 674,
+              "max_cycles": 674,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.011,
+              "exec": 1.407,
+              "ldst": 1.418,
+              "total": 2.835
+            },
+            "instr_profile": {
+              "total_count": 259,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 128,
+                  "pct": 49.4,
+                  "ticks": 896
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 65,
+                  "pct": 25.1,
+                  "ticks": 585
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 64,
+                  "pct": 24.7,
+                  "ticks": 576
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1,
+                  "pct": 0.4,
+                  "ticks": 0
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 1,
+                  "pct": 0.4,
+                  "ticks": 1
+                }
+              ]
+            }
+          }
+        ],
+        "simt_vfs": [
+          {
+            "id": 4,
+            "type": "simt",
+            "function_pc": "0x1360",
+            "call_sites": [
+              "0x768"
+            ],
+            "executions": 1,
+            "timing": {
+              "avg_cycles": 4679,
+              "min_cycles": 4679,
+              "max_cycles": 4679,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "branch": 0.284,
+              "exec": 1.065,
+              "ldst": 0.057,
+              "total": 1.406
+            },
+            "instr_profile": {
+              "total_count": 6368,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 4800,
+                  "pct": 75.4,
+                  "ticks": 35840
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1312,
+                  "pct": 20.6,
+                  "ticks": 6048
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 128,
+                  "pct": 2.0,
+                  "ticks": 2979
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 128,
+                  "pct": 2.0,
+                  "ticks": 70850
+                }
+              ]
+            }
+          }
+        ],
+        "exclusive_stall_cycles": null,
+        "data_cache_hit_rate": null,
+        "gm_bandwidth_bytes_per_cycle": null,
+        "isolated_mode_switch_cycles": null,
+        "notes": [
+          "Pipeline utilizations overlap: do not add them to derive total cycles.",
+          "VF duration includes work and is not isolated mode-switch latency.",
+          "Logical byte counts are not measured bus traffic."
+        ]
+      }
+    },
+    "math": true
+  },
+  "functional_validation": {
+    "exhaustive_codec": {
+      "status": "passed",
+      "elements_per_path": 8192,
+      "paths": [
+        "simd",
+        "simt",
+        "simt-cg",
+        "simt-lut"
+      ],
+      "scales": "all 256 E8M0 bytes",
+      "nibbles": "all 16 in both positions"
+    },
+    "switch_controls_and_invalid_geometry": {
+      "status": "passed",
+      "tests": 2
+    },
+    "host_oracle": {
+      "status": "passed",
+      "tests": 20
+    },
+    "metric_parser": {
+      "status": "passed",
+      "tests": 2
+    },
+    "contraction_and_swiglu": {
+      "status": "passed",
+      "elements_per_path": 4096,
+      "columns": 256,
+      "paths": [
+        "simd",
+        "simt",
+        "simt-cg",
+        "simt-lut"
+      ],
+      "max_bf16_ulp_allowed": 2,
+      "rate_diff_above_tolerance": 0
+    }
+  },
+  "full_projection": {
+    "hidden": 256,
+    "inter": 128,
+    "elements": 32768,
+    "results": {
+      "simd": {
+        "summary": "/tmp/dsv4_runs/full256_simd/npusim_20261005181100_bench_sim_950pr_moe_simt_vs_simd/report/results/kernel_0_reports/summary.json",
+        "elements": 32768,
+        "kernel_info": {
+          "ai_core_active": 1,
+          "kernel_total_clocks": 72207,
+          "kernel_instructions_executed": 80201
+        },
+        "vf_kernel_info": {
+          "name": "kernel",
+          "arch": "v100",
+          "frequency_ghz": 1.65,
+          "active_cores": 1,
+          "exec_time_ns": 43761.82,
+          "exec_time_ticks": 72207,
+          "total_instrs_executed": 80201,
+          "scalar_ipc_overall": 0.19
+        },
+        "cache_report": {
+          "icache_refill_count": 0,
+          "icache_refill_ticks": null
+        },
+        "bandwidth_report": {},
+        "pipeline_overlap": {
+          "AIC_MTE2_vs_AIC_CUBE": null,
+          "AIC_MTE1_vs_AIC_CUBE": null,
+          "AIC_FIXP_vs_AIC_CUBE": null,
+          "AIC_SCALAR_vs_AIC_CUBE": null,
+          "AIV0_MTE2_vs_AIV0_VEC": 0.0014,
+          "AIV0_SCALAR_vs_AIV0_VEC": 0.1516,
+          "AIV0_MTE3_vs_AIV0_VEC": 0.0071,
+          "AIV1_MTE2_vs_AIV1_VEC": null,
+          "AIV1_SCALAR_vs_AIV0_VEC": null,
+          "AIV1_MTE3_vs_AIV1_VEC": null,
+          "AIC_CUBE_vs_AIV0_VEC": null,
+          "AIC_CUBE_vs_AIV1_VEC": null
+        },
+        "scalar_instructions": {
+          "AIV0": {
+            "total_count": 11743,
+            "load_count": 1131,
+            "store_count": 505,
+            "load_store_ratio": 0.14
+          }
+        },
+        "modeled_cycles": 72207,
+        "cycles_per_element_end_to_end": 2.203582763671875,
+        "pipeline_utilization": {
+          "pipeline_util_summary": {
+            "AIV0_SIMD": {
+              "mean": 0.6989,
+              "max": 0.6989,
+              "min": 0.6989
+            },
+            "AIV0_SCALAR": {
+              "mean": 0.2476,
+              "max": 0.2476,
+              "min": 0.2476
+            },
+            "AIV0_MTE2": {
+              "mean": 0.0782,
+              "max": 0.0782,
+              "min": 0.0782
+            },
+            "AIV0_MTE3": {
+              "mean": 0.0418,
+              "max": 0.0418,
+              "min": 0.0418
+            }
+          }
+        },
+        "vector_instruction_report": {
+          "RVECEX_count": 31392,
+          "RVECLD_count": 17688,
+          "RVECST_count": 16256,
+          "ub_traffic_ratio": 1.0812945973496433,
+          "SIMD_ScalarIPC": 0.019132241660970148,
+          "SIMD_ExecIPC": 0.4627154495917795,
+          "SIMD_LdStIPC": 0.4480321682728872
+        },
+        "trace_event_counts": {
+          "LDP_XI_XJ_XN": 3,
+          "ST_XD_XN_IMM": 478,
+          "LD_XD_XN_IMM": 1128,
+          "STI_XN_IMM": 20,
+          "STP_XI_XJ_XN": 7,
+          "MOV_XD_SPR": 292,
+          "MOVK": 495,
+          "ADD_IMM": 709,
+          "SHR": 84,
+          "MADD": 131,
+          "MOV_XD_IMM": 1836,
+          "SUB_IMM": 268,
+          "AND": 280,
+          "SFF": 129,
+          "INSERT_XD_XN": 1082,
+          "CMP": 675,
+          "MOV_XD_XN": 673,
+          "ADD": 981,
+          "OR": 82,
+          "SHL": 1117,
+          "ZEROEXT": 658,
+          "DIV": 24,
+          "SBITSET": 278,
+          "SUB": 19,
+          "CMPN": 4,
+          "SIGNEXT": 129,
+          "NEG": 11,
+          "DC_PRELOAD_XN_IMM": 1,
+          "MIN": 16,
+          "MOV_SPR_XN": 4,
+          "TICK_START_EVENT": 1,
+          "MOV_SRC_TO_DST_ALIGNv2": 32,
+          "BAR": 2,
+          "DCI": 1,
+          "DCCI": 1,
+          "RV_PLT": 14720,
+          "RV_VCVT_I2I": 408,
+          "RV_VAND": 2320,
+          "RV_VSHRI": 2824,
+          "RV_VADDS": 560,
+          "RV_VSHLS": 2576,
+          "RV_VDUPS": 72,
+          "RV_VOR": 1024,
+          "RV_VCMPS_EQ": 1024,
+          "RV_PSET": 392,
+          "RV_PINTLV": 520,
+          "RV_VSEL": 1168,
+          "RV_VADD": 1944,
+          "RV_VMULS": 1080,
+          "RV_VMUL": 520,
+          "RV_VCI": 24,
+          "RV_VMINS": 8,
+          "RV_VEXP": 8,
+          "RV_VDIV": 8,
+          "RV_VCVT_F2F": 8,
+          "RV_VCMPS_LT": 16,
+          "RV_VCADD": 128,
+          "RV_VMAXS": 8,
+          "RV_VBR": 32,
+          "RV_VST": 14112,
+          "RV_SMEM_BAR": 680,
+          "RV_PSTU": 1040,
+          "RV_SEND": 272,
+          "RV_VSTI": 128,
+          "RV_VSTAI": 24,
+          "RV_VLD": 15624,
+          "RV_PLD": 520,
+          "RV_VGATHER2": 1032,
+          "RV_VLDI": 512,
+          "MOVEMASK": 2,
+          "VF": 272,
+          "PUSH_PB": 344
+        },
+        "vector_functions": [
+          {
+            "id": 0,
+            "type": "simd",
+            "function_pc": "0x2f28",
+            "call_sites": [
+              "0x5b8"
+            ],
+            "executions": 8,
+            "timing": {
+              "avg_cycles": 143,
+              "min_cycles": 80,
+              "max_cycles": 582,
+              "variance_ratio": 7.3
+            },
+            "ipc": {
+              "scalar": 0.014,
+              "exec": 0.129,
+              "ldst": 0.071,
+              "total": 0.214
+            },
+            "instr_profile": {
+              "total_count": 16,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 9,
+                  "pct": 56.2,
+                  "ticks": 81
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 4,
+                  "pct": 25.0,
+                  "ticks": 36
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1,
+                  "pct": 6.2,
+                  "ticks": 0
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 1,
+                  "pct": 6.2,
+                  "ticks": 9
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 1,
+                  "pct": 6.2,
+                  "ticks": 1
+                }
+              ]
+            }
+          },
+          {
+            "id": 1,
+            "type": "simd",
+            "function_pc": "0x2124",
+            "call_sites": [
+              "0xc58"
+            ],
+            "executions": 8,
+            "timing": {
+              "avg_cycles": 37,
+              "min_cycles": 37,
+              "max_cycles": 37,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.071,
+              "exec": 0.143,
+              "ldst": 0.214,
+              "total": 0.429
+            },
+            "instr_profile": {
+              "total_count": 13,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 4,
+                  "pct": 30.8,
+                  "ticks": 24
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 4,
+                  "pct": 30.8,
+                  "ticks": 34
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 2,
+                  "pct": 15.4,
+                  "ticks": 18
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 2,
+                  "pct": 15.4,
+                  "ticks": 2
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1,
+                  "pct": 7.7,
+                  "ticks": 0
+                }
+              ]
+            }
+          },
+          {
+            "id": 2,
+            "type": "simd",
+            "function_pc": "0x2b20",
+            "call_sites": [
+              "0x1154"
+            ],
+            "executions": 128,
+            "timing": {
+              "avg_cycles": 75,
+              "min_cycles": 57,
+              "max_cycles": 76,
+              "variance_ratio": 1.3
+            },
+            "ipc": {
+              "scalar": 0.02,
+              "exec": 0.163,
+              "ldst": 0.122,
+              "total": 0.306
+            },
+            "instr_profile": {
+              "total_count": 15,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 8,
+                  "pct": 53.3,
+                  "ticks": 67
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 4,
+                  "pct": 26.7,
+                  "ticks": 36
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 2,
+                  "pct": 13.3,
+                  "ticks": 18
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 1,
+                  "pct": 6.7,
+                  "ticks": 1
+                }
+              ]
+            }
+          },
+          {
+            "id": 3,
+            "type": "simd",
+            "function_pc": "0x2220",
+            "call_sites": [
+              "0xd18"
+            ],
+            "executions": 8,
+            "timing": {
+              "avg_cycles": 90,
+              "min_cycles": 90,
+              "max_cycles": 90,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.05,
+              "exec": 0.212,
+              "ldst": 0.25,
+              "total": 0.512
+            },
+            "instr_profile": {
+              "total_count": 44,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 17,
+                  "pct": 38.6,
+                  "ticks": 109
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 11,
+                  "pct": 25.0,
+                  "ticks": 99
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 9,
+                  "pct": 20.5,
+                  "ticks": 125
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 4,
+                  "pct": 9.1,
+                  "ticks": 4
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 3,
+                  "pct": 6.8,
+                  "ticks": 0
+                }
+              ]
+            }
+          },
+          {
+            "id": 4,
+            "type": "simd",
+            "function_pc": "0x1f20",
+            "call_sites": [
+              "0xc00"
+            ],
+            "executions": 8,
+            "timing": {
+              "avg_cycles": 1891,
+              "min_cycles": 1891,
+              "max_cycles": 1893,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.004,
+              "exec": 0.264,
+              "ldst": 0.333,
+              "total": 0.601
+            },
+            "instr_profile": {
+              "total_count": 1136,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 496,
+                  "pct": 43.7,
+                  "ticks": 3141
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 357,
+                  "pct": 31.4,
+                  "ticks": 4784
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 269,
+                  "pct": 23.7,
+                  "ticks": 3244
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 8,
+                  "pct": 0.7,
+                  "ticks": 8
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 6,
+                  "pct": 0.5,
+                  "ticks": 0
+                }
+              ]
+            }
+          },
+          {
+            "id": 5,
+            "type": "simd",
+            "function_pc": "0x2524",
+            "call_sites": [
+              "0x544",
+              "0xe7c"
+            ],
+            "executions": 16,
+            "timing": {
+              "avg_cycles": 157,
+              "min_cycles": 56,
+              "max_cycles": 258,
+              "variance_ratio": 4.6
+            },
+            "ipc": {
+              "scalar": 0.013,
+              "exec": 0.291,
+              "ldst": 0.431,
+              "total": 0.735
+            },
+            "instr_profile": {
+              "total_count": 324,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 129,
+                  "pct": 39.8,
+                  "ticks": 774
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 128,
+                  "pct": 39.5,
+                  "ticks": 2459
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 65,
+                  "pct": 20.1,
+                  "ticks": 1602
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1,
+                  "pct": 0.3,
+                  "ticks": 0
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 1,
+                  "pct": 0.3,
+                  "ticks": 1
+                }
+              ]
+            }
+          },
+          {
+            "id": 6,
+            "type": "simd",
+            "function_pc": "0x2344",
+            "call_sites": [
+              "0xdf4"
+            ],
+            "executions": 8,
+            "timing": {
+              "avg_cycles": 387,
+              "min_cycles": 387,
+              "max_cycles": 387,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.003,
+              "exec": 0.341,
+              "ldst": 0.511,
+              "total": 0.854
+            },
+            "instr_profile": {
+              "total_count": 324,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 129,
+                  "pct": 39.8,
+                  "ticks": 774
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 128,
+                  "pct": 39.5,
+                  "ticks": 3604
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 65,
+                  "pct": 20.1,
+                  "ticks": 2565
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1,
+                  "pct": 0.3,
+                  "ticks": 0
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 1,
+                  "pct": 0.3,
+                  "ticks": 1
+                }
+              ]
+            }
+          },
+          {
+            "id": 7,
+            "type": "simd",
+            "function_pc": "0x2320",
+            "call_sites": [
+              "0x514",
+              "0xd54",
+              "0xe18"
+            ],
+            "executions": 24,
+            "timing": {
+              "avg_cycles": 170,
+              "min_cycles": 57,
+              "max_cycles": 227,
+              "variance_ratio": 4.0
+            },
+            "ipc": {
+              "scalar": 0.015,
+              "exec": 0.522,
+              "ldst": 0.224,
+              "total": 0.76
+            },
+            "instr_profile": {
+              "total_count": 201,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 135,
+                  "pct": 67.2,
+                  "ticks": 880
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 65,
+                  "pct": 32.3,
+                  "ticks": 585
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 1,
+                  "pct": 0.5,
+                  "ticks": 1
+                }
+              ]
+            }
+          },
+          {
+            "id": 8,
+            "type": "simd",
+            "function_pc": "0x2724",
+            "call_sites": [
+              "0xea8"
+            ],
+            "executions": 8,
+            "timing": {
+              "avg_cycles": 156,
+              "min_cycles": 156,
+              "max_cycles": 156,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.007,
+              "exec": 0.871,
+              "ldst": 1.313,
+              "total": 2.19
+            },
+            "instr_profile": {
+              "total_count": 323,
+              "by_pipe": [
+                {
+                  "pipe": "RVECLD",
+                  "count": 128,
+                  "pct": 39.6,
+                  "ticks": 1231
+                },
+                {
+                  "pipe": "RVECEX",
+                  "count": 128,
+                  "pct": 39.6,
+                  "ticks": 896
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 65,
+                  "pct": 20.1,
+                  "ticks": 1026
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1,
+                  "pct": 0.3,
+                  "ticks": 0
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 1,
+                  "pct": 0.3,
+                  "ticks": 1
+                }
+              ]
+            }
+          },
+          {
+            "id": 9,
+            "type": "simd",
+            "function_pc": "0x1d20",
+            "call_sites": [
+              "0xaec"
+            ],
+            "executions": 8,
+            "timing": {
+              "avg_cycles": 249,
+              "min_cycles": 249,
+              "max_cycles": 249,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.013,
+              "exec": 0.95,
+              "ldst": 1.209,
+              "total": 2.172
+            },
+            "instr_profile": {
+              "total_count": 521,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 227,
+                  "pct": 43.6,
+                  "ticks": 1522
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 160,
+                  "pct": 30.7,
+                  "ticks": 1506
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 129,
+                  "pct": 24.8,
+                  "ticks": 1683
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 3,
+                  "pct": 0.6,
+                  "ticks": 3
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 2,
+                  "pct": 0.4,
+                  "ticks": 0
+                }
+              ]
+            }
+          },
+          {
+            "id": 10,
+            "type": "simd",
+            "function_pc": "0x2420",
+            "call_sites": [
+              "0xdbc"
+            ],
+            "executions": 8,
+            "timing": {
+              "avg_cycles": 635,
+              "min_cycles": 635,
+              "max_cycles": 636,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.014,
+              "exec": 1.126,
+              "ldst": 1.336,
+              "total": 2.476
+            },
+            "instr_profile": {
+              "total_count": 1560,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 706,
+                  "pct": 45.3,
+                  "ticks": 4428
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 448,
+                  "pct": 28.7,
+                  "ticks": 4189
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 390,
+                  "pct": 25.0,
+                  "ticks": 4366
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 9,
+                  "pct": 0.6,
+                  "ticks": 9
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 7,
+                  "pct": 0.4,
+                  "ticks": 0
+                }
+              ]
+            }
+          },
+          {
+            "id": 11,
+            "type": "simd",
+            "function_pc": "0x1a28",
+            "call_sites": [
+              "0x9c0"
+            ],
+            "executions": 8,
+            "timing": {
+              "avg_cycles": 995,
+              "min_cycles": 995,
+              "max_cycles": 995,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.014,
+              "exec": 1.131,
+              "ldst": 1.17,
+              "total": 2.316
+            },
+            "instr_profile": {
+              "total_count": 2249,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 1093,
+                  "pct": 48.6,
+                  "ticks": 6670
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 602,
+                  "pct": 26.8,
+                  "ticks": 6163
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 528,
+                  "pct": 23.5,
+                  "ticks": 5054
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 14,
+                  "pct": 0.6,
+                  "ticks": 14
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 12,
+                  "pct": 0.5,
+                  "ticks": 0
+                }
+              ]
+            }
+          },
+          {
+            "id": 12,
+            "type": "simd",
+            "function_pc": "0x1c24",
+            "call_sites": [
+              "0xa20"
+            ],
+            "executions": 8,
+            "timing": {
+              "avg_cycles": 101,
+              "min_cycles": 101,
+              "max_cycles": 101,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.022,
+              "exec": 1.391,
+              "ldst": 1.413,
+              "total": 2.826
+            },
+            "instr_profile": {
+              "total_count": 261,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 128,
+                  "pct": 49.0,
+                  "ticks": 768
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 66,
+                  "pct": 25.3,
+                  "ticks": 561
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 64,
+                  "pct": 24.5,
+                  "ticks": 576
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 2,
+                  "pct": 0.8,
+                  "ticks": 2
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1,
+                  "pct": 0.4,
+                  "ticks": 0
+                }
+              ]
+            }
+          },
+          {
+            "id": 13,
+            "type": "simd",
+            "function_pc": "0x1e24",
+            "call_sites": [
+              "0xb20"
+            ],
+            "executions": 8,
+            "timing": {
+              "avg_cycles": 101,
+              "min_cycles": 101,
+              "max_cycles": 101,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.022,
+              "exec": 1.391,
+              "ldst": 1.413,
+              "total": 2.826
+            },
+            "instr_profile": {
+              "total_count": 261,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 128,
+                  "pct": 49.0,
+                  "ticks": 768
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 66,
+                  "pct": 25.3,
+                  "ticks": 561
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 64,
+                  "pct": 24.5,
+                  "ticks": 576
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 2,
+                  "pct": 0.8,
+                  "ticks": 2
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1,
+                  "pct": 0.4,
+                  "ticks": 0
+                }
+              ]
+            }
+          },
+          {
+            "id": 14,
+            "type": "simd",
+            "function_pc": "0x2824",
+            "call_sites": [
+              "0xf40"
+            ],
+            "executions": 8,
+            "timing": {
+              "avg_cycles": 99,
+              "min_cycles": 99,
+              "max_cycles": 99,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.011,
+              "exec": 1.422,
+              "ldst": 1.433,
+              "total": 2.867
+            },
+            "instr_profile": {
+              "total_count": 258,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 128,
+                  "pct": 49.6,
+                  "ticks": 896
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 65,
+                  "pct": 25.2,
+                  "ticks": 585
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 64,
+                  "pct": 24.8,
+                  "ticks": 576
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 1,
+                  "pct": 0.4,
+                  "ticks": 1
+                }
+              ]
+            }
+          },
+          {
+            "id": 15,
+            "type": "simd",
+            "function_pc": "0x252c",
+            "call_sites": [
+              "0xe48"
+            ],
+            "executions": 8,
+            "timing": {
+              "avg_cycles": 129,
+              "min_cycles": 129,
+              "max_cycles": 129,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.008,
+              "exec": 1.6,
+              "ldst": 1.075,
+              "total": 2.683
+            },
+            "instr_profile": {
+              "total_count": 323,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 192,
+                  "pct": 59.4,
+                  "ticks": 1152
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 65,
+                  "pct": 20.1,
+                  "ticks": 625
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 64,
+                  "pct": 19.8,
+                  "ticks": 576
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1,
+                  "pct": 0.3,
+                  "ticks": 0
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 1,
+                  "pct": 0.3,
+                  "ticks": 1
+                }
+              ]
+            }
+          }
+        ],
+        "simt_vfs": [],
+        "exclusive_stall_cycles": null,
+        "data_cache_hit_rate": null,
+        "gm_bandwidth_bytes_per_cycle": null,
+        "isolated_mode_switch_cycles": null,
+        "notes": [
+          "Pipeline utilizations overlap: do not add them to derive total cycles.",
+          "VF duration includes work and is not isolated mode-switch latency.",
+          "Logical byte counts are not measured bus traffic."
+        ]
+      },
+      "simt": {
+        "summary": "/tmp/dsv4_runs/full256_simt/npusim_20261005182006_bench_sim_950pr_moe_simt_vs_simd/report/results/kernel_0_reports/summary.json",
+        "elements": 32768,
+        "kernel_info": {
+          "ai_core_active": 1,
+          "kernel_total_clocks": 55235,
+          "kernel_instructions_executed": 65880
+        },
+        "vf_kernel_info": {
+          "name": "kernel",
+          "arch": "v100",
+          "frequency_ghz": 1.65,
+          "active_cores": 1,
+          "exec_time_ns": 33475.76,
+          "exec_time_ticks": 55235,
+          "total_instrs_executed": 65880,
+          "scalar_ipc_overall": 0.19
+        },
+        "cache_report": {
+          "icache_refill_count": 0,
+          "icache_refill_ticks": null
+        },
+        "bandwidth_report": {},
+        "pipeline_overlap": {
+          "AIC_MTE2_vs_AIC_CUBE": null,
+          "AIC_MTE1_vs_AIC_CUBE": null,
+          "AIC_FIXP_vs_AIC_CUBE": null,
+          "AIC_SCALAR_vs_AIC_CUBE": null,
+          "AIV0_MTE2_vs_AIV0_VEC": 0.0001,
+          "AIV0_SCALAR_vs_AIV0_VEC": 0.1813,
+          "AIV0_MTE3_vs_AIV0_VEC": 0.0003,
+          "AIV1_MTE2_vs_AIV1_VEC": null,
+          "AIV1_SCALAR_vs_AIV0_VEC": null,
+          "AIV1_MTE3_vs_AIV1_VEC": null,
+          "AIC_CUBE_vs_AIV0_VEC": null,
+          "AIC_CUBE_vs_AIV1_VEC": null
+        },
+        "scalar_instructions": {
+          "AIV0": {
+            "total_count": 8902,
+            "load_count": 835,
+            "store_count": 374,
+            "load_store_ratio": 0.14
+          }
+        },
+        "modeled_cycles": 55235,
+        "cycles_per_element_end_to_end": 1.685638427734375,
+        "pipeline_utilization": {
+          "pipeline_util_summary": {
+            "AIV0_SIMD": {
+              "mean": 0.1476,
+              "max": 0.1476,
+              "min": 0.1476
+            },
+            "AIV0_SCALAR": {
+              "mean": 0.3112,
+              "max": 0.3112,
+              "min": 0.3112
+            },
+            "AIV0_MTE2": {
+              "mean": 0.0001,
+              "max": 0.0001,
+              "min": 0.0001
+            },
+            "AIV0_MTE3": {
+              "mean": 0.0583,
+              "max": 0.0583,
+              "min": 0.0583
+            },
+            "AIV0_SIMT": {
+              "mean": 0.5293,
+              "max": 0.5293,
+              "min": 0.5293
+            }
+          }
+        },
+        "vector_instruction_report": {
+          "RVECEX_count": 40616,
+          "RVECLD_count": 2072,
+          "RVECST_count": 1864,
+          "ub_traffic_ratio": 0.09690762261177861,
+          "SIMD_ScalarIPC": 0.020437040558858515,
+          "SIMD_ExecIPC": 0.2266250934191182,
+          "SIMD_LdStIPC": 0.18022539928410025,
+          "SIMT_ExecIPC": 1.3254315403802392,
+          "SIMT_LdStIPC": 0.07068968215361275,
+          "SIMT_BranchIPC": 0.35344841076806377
+        },
+        "trace_event_counts": {
+          "LDP_XI_XJ_XN": 3,
+          "ST_XD_XN_IMM": 351,
+          "LD_XD_XN_IMM": 832,
+          "STI_XN_IMM": 16,
+          "STP_XI_XJ_XN": 7,
+          "MOV_XD_SPR": 188,
+          "MOVK": 394,
+          "ADD_IMM": 661,
+          "SHR": 4,
+          "MADD": 131,
+          "MOV_XD_IMM": 1365,
+          "SUB_IMM": 268,
+          "CMP": 675,
+          "AND": 216,
+          "CMPN": 4,
+          "ZEROEXT": 578,
+          "INSERT_XD_XN": 674,
+          "SHL": 725,
+          "DIV": 24,
+          "MOV_XD_XN": 281,
+          "ADD": 765,
+          "SFF": 129,
+          "SBITSET": 278,
+          "SUB": 18,
+          "OR": 34,
+          "DC_PRELOAD_XN_IMM": 1,
+          "NEG": 2,
+          "MIN": 16,
+          "SIGNEXT": 129,
+          "MOV_SPR_XN": 4,
+          "TICK_START_EVENT": 1,
+          "MOV_SRC_TO_DST_ALIGNv2": 16,
+          "BAR": 18,
+          "DCI": 1,
+          "DCCI": 1,
+          "RV_PLT": 664,
+          "RV_VMULS": 536,
+          "RV_VSEL": 128,
+          "RV_PSET": 280,
+          "RV_VADDS": 16,
+          "RV_VMUL": 8,
+          "RV_VADD": 392,
+          "RV_VCI": 8,
+          "RV_VMINS": 8,
+          "RV_VEXP": 8,
+          "RV_VDIV": 8,
+          "RV_VCVT_F2F": 8,
+          "RV_VCADD": 128,
+          "RV_VSHRI": 8,
+          "RV_VMAXS": 8,
+          "RV_VBR": 8,
+          "RV_VST": 552,
+          "RV_VSTI": 128,
+          "RV_SEND": 160,
+          "RV_VLD": 528,
+          "RV_VLDI": 512,
+          "RV_VGATHER2": 8,
+          "MOVEMASK": 2,
+          "VF_SIMT": 8,
+          "VF": 160,
+          "PUSH_PB": 184
+        },
+        "vector_functions": [
+          {
+            "id": 0,
+            "type": "simd",
+            "function_pc": "0x2524",
+            "call_sites": [
+              "0x544"
+            ],
+            "executions": 8,
+            "timing": {
+              "avg_cycles": 87,
+              "min_cycles": 56,
+              "max_cycles": 303,
+              "variance_ratio": 5.4
+            },
+            "ipc": {
+              "scalar": 0.021,
+              "exec": 0.064,
+              "ldst": 0.085,
+              "total": 0.17
+            },
+            "instr_profile": {
+              "total_count": 10,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 3,
+                  "pct": 30.0,
+                  "ticks": 18
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 2,
+                  "pct": 20.0,
+                  "ticks": 0
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 2,
+                  "pct": 20.0,
+                  "ticks": 18
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 2,
+                  "pct": 20.0,
+                  "ticks": 33
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 1,
+                  "pct": 10.0,
+                  "ticks": 1
+                }
+              ]
+            }
+          },
+          {
+            "id": 1,
+            "type": "simd",
+            "function_pc": "0x2f28",
+            "call_sites": [
+              "0x5b8"
+            ],
+            "executions": 8,
+            "timing": {
+              "avg_cycles": 80,
+              "min_cycles": 80,
+              "max_cycles": 80,
+              "variance_ratio": 1.0
+            },
+            "ipc": {
+              "scalar": 0.014,
+              "exec": 0.129,
+              "ldst": 0.071,
+              "total": 0.214
+            },
+            "instr_profile": {
+              "total_count": 15,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 9,
+                  "pct": 60.0,
+                  "ticks": 81
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 4,
+                  "pct": 26.7,
+                  "ticks": 36
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 1,
+                  "pct": 6.7,
+                  "ticks": 9
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 1,
+                  "pct": 6.7,
+                  "ticks": 1
+                }
+              ]
+            }
+          },
+          {
+            "id": 2,
+            "type": "simd",
+            "function_pc": "0x2b20",
+            "call_sites": [
+              "0x1154"
+            ],
+            "executions": 128,
+            "timing": {
+              "avg_cycles": 78,
+              "min_cycles": 57,
+              "max_cycles": 447,
+              "variance_ratio": 7.8
+            },
+            "ipc": {
+              "scalar": 0.02,
+              "exec": 0.163,
+              "ldst": 0.122,
+              "total": 0.306
+            },
+            "instr_profile": {
+              "total_count": 15,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 8,
+                  "pct": 53.3,
+                  "ticks": 67
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 4,
+                  "pct": 26.7,
+                  "ticks": 36
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 2,
+                  "pct": 13.3,
+                  "ticks": 18
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 1,
+                  "pct": 6.7,
+                  "ticks": 1
+                }
+              ]
+            }
+          },
+          {
+            "id": 3,
+            "type": "simd",
+            "function_pc": "0x2320",
+            "call_sites": [
+              "0x514"
+            ],
+            "executions": 8,
+            "timing": {
+              "avg_cycles": 95,
+              "min_cycles": 57,
+              "max_cycles": 363,
+              "variance_ratio": 6.4
+            },
+            "ipc": {
+              "scalar": 0.036,
+              "exec": 0.321,
+              "ldst": 0.071,
+              "total": 0.429
+            },
+            "instr_profile": {
+              "total_count": 13,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 9,
+                  "pct": 69.2,
+                  "ticks": 61
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 2,
+                  "pct": 15.4,
+                  "ticks": 18
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1,
+                  "pct": 7.7,
+                  "ticks": 0
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 1,
+                  "pct": 7.7,
+                  "ticks": 1
+                }
+              ]
+            }
+          },
+          {
+            "id": 4,
+            "type": "simt",
+            "function_pc": "0x1360",
+            "call_sites": [
+              "0x768"
+            ],
+            "executions": 8,
+            "timing": {
+              "avg_cycles": 3713,
+              "min_cycles": 3225,
+              "max_cycles": 4253,
+              "variance_ratio": 1.3
+            },
+            "ipc": {
+              "branch": 0.353,
+              "exec": 1.325,
+              "ldst": 0.071,
+              "total": 1.75
+            },
+            "instr_profile": {
+              "total_count": 6368,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 4800,
+                  "pct": 75.4,
+                  "ticks": 35840
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1312,
+                  "pct": 20.6,
+                  "ticks": 6048
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 128,
+                  "pct": 2.0,
+                  "ticks": 3009
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 128,
+                  "pct": 2.0,
+                  "ticks": 58116
+                }
+              ]
+            }
+          },
+          {
+            "id": 5,
+            "type": "simd",
+            "function_pc": "0x2824",
+            "call_sites": [
+              "0xf40"
+            ],
+            "executions": 8,
+            "timing": {
+              "avg_cycles": 190,
+              "min_cycles": 119,
+              "max_cycles": 684,
+              "variance_ratio": 5.7
+            },
+            "ipc": {
+              "scalar": 0.011,
+              "exec": 1.407,
+              "ldst": 1.418,
+              "total": 2.835
+            },
+            "instr_profile": {
+              "total_count": 259,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 128,
+                  "pct": 49.4,
+                  "ticks": 896
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 65,
+                  "pct": 25.1,
+                  "ticks": 585
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 64,
+                  "pct": 24.7,
+                  "ticks": 576
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1,
+                  "pct": 0.4,
+                  "ticks": 0
+                },
+                {
+                  "pipe": "RVECSU",
+                  "count": 1,
+                  "pct": 0.4,
+                  "ticks": 1
+                }
+              ]
+            }
+          }
+        ],
+        "simt_vfs": [
+          {
+            "id": 4,
+            "type": "simt",
+            "function_pc": "0x1360",
+            "call_sites": [
+              "0x768"
+            ],
+            "executions": 8,
+            "timing": {
+              "avg_cycles": 3713,
+              "min_cycles": 3225,
+              "max_cycles": 4253,
+              "variance_ratio": 1.3
+            },
+            "ipc": {
+              "branch": 0.353,
+              "exec": 1.325,
+              "ldst": 0.071,
+              "total": 1.75
+            },
+            "instr_profile": {
+              "total_count": 6368,
+              "by_pipe": [
+                {
+                  "pipe": "RVECEX",
+                  "count": 4800,
+                  "pct": 75.4,
+                  "ticks": 35840
+                },
+                {
+                  "pipe": "RVECLP",
+                  "count": 1312,
+                  "pct": 20.6,
+                  "ticks": 6048
+                },
+                {
+                  "pipe": "RVECST",
+                  "count": 128,
+                  "pct": 2.0,
+                  "ticks": 3009
+                },
+                {
+                  "pipe": "RVECLD",
+                  "count": 128,
+                  "pct": 2.0,
+                  "ticks": 58116
+                }
+              ]
+            }
+          }
+        ],
+        "exclusive_stall_cycles": null,
+        "data_cache_hit_rate": null,
+        "gm_bandwidth_bytes_per_cycle": null,
+        "isolated_mode_switch_cycles": null,
+        "notes": [
+          "Pipeline utilizations overlap: do not add them to derive total cycles.",
+          "VF duration includes work and is not isolated mode-switch latency.",
+          "Logical byte counts are not measured bus traffic."
+        ]
+      }
+    },
+    "math": true
+  },
+  "build_flags": [
+    "--cce-auto-sync=off",
+    "-Werror"
+  ],
+  "dynamic_ub_bytes": 0,
+  "explicit_ub_payload_bytes": {
+    "simd": 102016,
+    "simt": 34304
+  },
+  "peak_register_count": null,
+  "register_spill_bytes": null,
+  "stopped_at_user_request": {
+    "pending_cache_bypass_tile": "terminated; no result used",
+    "dispatch_controls": "excluded from final study scope"
+  }
+}

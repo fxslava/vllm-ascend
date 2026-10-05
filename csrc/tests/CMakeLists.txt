@@ -801,6 +801,8 @@ endif()
 # Tiers 2 and 3, and the isolated 310P leg
 # -----------------------------------------------------------------------------
 
+# The sim subdirectory registers the 9599-only SIMT unpack correctness and
+# modeled-cycle study targets. Device-code compilation stays in ascendc/.
 if(VLLM_ASCEND_TESTS_TIER_SIM)
   add_subdirectory(sim)
 endif()

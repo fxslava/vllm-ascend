@@ -131,3 +131,21 @@ if(VLLM_ASCEND_TESTS_BUILD_DSV4_KERNELS)
   ascendc_compile_options(vllm_ascend_dsv4_moe_expert PRIVATE --cce-auto-sync=off -Werror)
   message(STATUS "vllm-ascend tests: DSV4 MoE expert kernel RUN_MODE=${RUN_MODE}, SOC_VERSION=${SOC_VERSION}")
 endif()
+
+# Test-owned E2M1/E8M0 hybrid probe; never enters a production/device build.
+if(VLLM_ASCEND_TESTS_TIER_SIM AND SOC_VERSION STREQUAL "Ascend950PR_9599")
+  ascendc_library(vllm_ascend_moe_unpack_probe SHARED
+    "${CMAKE_CURRENT_SOURCE_DIR}/../sim/moe_unpack_probe_kernels.cpp")
+  # CANN 9.2 recognizes __simt_vf__ in Ascend C hybrid language mode.
+  # -fsimt is not a supported flag in this installed toolchain.
+  # The legacy preprocess linker overwrites its compiler object with raw text.
+  # An empty generated include refreshed once per build forces that object to
+  # be recreated before relinking, without touching any source file.
+  set(probe_epoch "${CMAKE_CURRENT_BINARY_DIR}/moe_unpack_probe_epoch.h")
+  file(WRITE "${probe_epoch}" "// Generated build dependency.\n")
+  add_custom_target(moe_unpack_probe_epoch
+    COMMAND "${CMAKE_COMMAND}" -E touch "${probe_epoch}")
+  add_dependencies(vllm_ascend_moe_unpack_probe_precompile moe_unpack_probe_epoch)
+  ascendc_compile_options(vllm_ascend_moe_unpack_probe PRIVATE
+    --cce-auto-sync=off -Werror -include "${probe_epoch}")
+endif()
