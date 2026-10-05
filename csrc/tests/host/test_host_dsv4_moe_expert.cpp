@@ -291,7 +291,8 @@ std::vector<uint16_t> Fp64DownOut(const Problem& p) {
     double g = gate[static_cast<size_t>(j)];
     g = std::min(static_cast<double>(kSwigluLimit), std::max(-static_cast<double>(kSwigluLimit), g));
     const double sig = 1.0 / (1.0 + std::exp(-g));
-    activated[static_cast<size_t>(j)] = (g * sig) * up[static_cast<size_t>(j)];
+    activated[static_cast<size_t>(j)] = Bf16BitsToFloat(
+        FloatToBf16Bits(static_cast<float>((g * sig) * up[static_cast<size_t>(j)])));
   }
   const std::vector<double> down = project(activated, p.w2, p.w2s, hidden, inter);
 
@@ -346,6 +347,16 @@ TEST(Dsv4Reference, ActivatedIsSwiGluOfTheFp32GateAndUp) {
   }
 }
 
+TEST(Dsv4Reference, DownConsumesRoundedBf16Activation) {
+  const Problem p = MakeProblem(256, 128, 17);
+  const auto out = ReferenceExpert(p.View(), p.hidden, p.inter);
+  std::vector<float> input(out.activated.size());
+  for (size_t i = 0; i < input.size(); ++i) input[i] = Bf16BitsToFloat(out.activated[i]);
+  std::vector<float> down(static_cast<size_t>(p.hidden));
+  vllm_ascend::test::dsv4::Project(input.data(), p.w2.data(), p.w2s.data(), p.hidden, p.inter, down.data());
+  for (size_t i = 0; i < down.size(); ++i) EXPECT_EQ(out.down_out[i], FloatToBf16Bits(down[i]));
+}
+
 TEST(Dsv4Reference, ClampMakesTheOutputsMutuallyConsistent) {
   // A measured side effect of the DeepSeek-V4 clamp, and a good one.
   //
@@ -376,15 +387,16 @@ TEST(Dsv4Reference, ClampMakesTheOutputsMutuallyConsistent) {
 // Tiling geometry rules
 // ---------------------------------------------------------------------------
 
-TEST(Dsv4Tiling, AcceptsTheBringUpAndRejectsProduction) {
+TEST(Dsv4Tiling, AcceptsBringUpAndProductionWithinUbBudget) {
   EXPECT_TRUE(GeometryIsAccepted(256, 128)) << "the reduced bring-up geometry";
   EXPECT_TRUE(GeometryIsAccepted(512, 256));
   EXPECT_TRUE(GeometryIsAccepted(64, 64));
 
-  // Production DeepSeek-V4 needs 4 MiB of packed weight per projection against
-  // a 96 KiB single-load budget. Tiling must refuse it rather than silently
-  // overflow UB; this is the assertion that the milestone's scope is enforced.
-  EXPECT_FALSE(GeometryIsAccepted(4096, 2048));
+  // Production weights stream through UB; activation buffers set the limits.
+  EXPECT_TRUE(GeometryIsAccepted(4096, 2048));
+  EXPECT_TRUE(GeometryIsAccepted(7168, 2048));
+  EXPECT_FALSE(GeometryIsAccepted(7232, 2048));
+  EXPECT_FALSE(GeometryIsAccepted(7168, 2112));
 }
 
 TEST(Dsv4Tiling, RequiresMultiplesOfSixtyFour) {

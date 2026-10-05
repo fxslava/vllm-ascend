@@ -114,9 +114,30 @@ message(STATUS "vllm-ascend tests: [simulator] ${VLLM_ASCEND_SIM_TESTS}")
 # default: the kernel is a scalar reduction, so a launch costs what its MAC
 # count costs, and the repeat cases launch several times over.
 if(VLLM_ASCEND_TESTS_HAVE_DSV4)
+  # Same production suite and shipping kernel, linked against camodel. Full
+  # geometry runs are opt-in; this target is not part of the default ctest run.
+  vllm_ascend_add_device_executable(test_sim_950pr_dsv4_moe_expert_production
+    ../device/test_device_950pr_dsv4_moe_expert.cpp ../common/main_950pr.cpp)
+  target_link_libraries(test_sim_950pr_dsv4_moe_expert_production PRIVATE vllm_ascend_test_dsv4)
+  target_compile_definitions(test_sim_950pr_dsv4_moe_expert_production
+    PRIVATE VLLM_ASCEND_TEST_TIER="simulator" VLLM_ASCEND_DSV4_SIM_SUITE=1)
+  set_target_properties(test_sim_950pr_dsv4_moe_expert_production PROPERTIES INSTALL_RPATH
+    "$ORIGIN;${CMAKE_BINARY_DIR}/lib;${VLLM_ASCEND_SIMULATOR_LIB_DIR};${ASCEND_LIB_DIRS}")
   vllm_ascend_add_device_executable(test_sim_950pr_dsv4_moe_expert
     "test_sim_950pr_dsv4_moe_expert.cpp" ../common/main_950pr.cpp)
   target_link_libraries(test_sim_950pr_dsv4_moe_expert PRIVATE vllm_ascend_test_dsv4)
+  add_custom_target(dsv4_sim_targets DEPENDS test_sim_950pr_dsv4_moe_expert
+    test_sim_950pr_dsv4_moe_expert_production)
+  if(VLLM_ASCEND_TESTS_BUILD_BENCHMARKS)
+    # Compile-check the benchmark against the sim toolchain. Its entry point
+    # refuses camodel timings, and it is deliberately not registered with ctest.
+    vllm_ascend_add_device_executable(bench_sim_950pr_dsv4_moe_expert
+      ../device/bench_device_950pr_dsv4_moe_expert.cpp)
+    target_link_libraries(bench_sim_950pr_dsv4_moe_expert PRIVATE vllm_ascend_test_dsv4)
+    set_target_properties(bench_sim_950pr_dsv4_moe_expert PROPERTIES INSTALL_RPATH
+      "$ORIGIN;${CMAKE_BINARY_DIR}/lib;${VLLM_ASCEND_SIMULATOR_LIB_DIR};${ASCEND_LIB_DIRS}")
+    add_dependencies(dsv4_sim_targets bench_sim_950pr_dsv4_moe_expert)
+  endif()
   target_compile_definitions(test_sim_950pr_dsv4_moe_expert
     PRIVATE VLLM_ASCEND_TEST_TIER="simulator")
 

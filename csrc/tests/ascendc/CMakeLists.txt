@@ -116,5 +116,9 @@ ascendc_compile_options(vllm_ascend_turboquant PRIVATE
 if(VLLM_ASCEND_TESTS_BUILD_DSV4_KERNELS)
   ascendc_library(vllm_ascend_dsv4_moe_expert SHARED
     "${CMAKE_CURRENT_SOURCE_DIR}/../common/dsv4_moe_expert_kernels.cpp")
+  ascendc_compile_options(vllm_ascend_dsv4_moe_expert PRIVATE --cce-auto-sync=off)
+  if(VLLM_ASCEND_TESTS_WERROR)
+    ascendc_compile_options(vllm_ascend_dsv4_moe_expert PRIVATE -Werror)
+  endif()
   message(STATUS "vllm-ascend tests: DSV4 MoE expert kernel RUN_MODE=${RUN_MODE}, SOC_VERSION=${SOC_VERSION}")
 endif()

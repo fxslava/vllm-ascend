@@ -156,7 +156,8 @@ def reference_expert(
     sigmoid = (np.float32(1.0) / (np.float32(1.0) + neg_exp)).astype(np.float32)
     activated = ((gate_clamped * sigmoid).astype(np.float32) * up).astype(np.float32)
 
-    down = project(activated, w2, w2_scale, hidden, inter)
+    down_input = bf16_bits_to_float(float_to_bf16_bits(activated))
+    down = project(down_input, w2, w2_scale, hidden, inter)
 
     return {
         "gate_out": float_to_bf16_bits(gate),

@@ -137,7 +137,9 @@ option(VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS
        "Compile the TurboQuant Ascend C kernels and build the tests that drive them" ON)
 
 # The DSV4 MoE expert kernel (csrc/moe/dsv4_moe_expert), compiled from the
-# shipping source and driven by the simulator tier.
+# shipping source and driven by the simulator/device correctness tiers and
+# the device benchmark. dsv4_sim_targets compile-checks both suites and the
+# benchmark; dsv4_device_targets builds the physical-runtime binaries.
 #
 # It is declared in ascendc/CMakeLists.txt alongside the TurboQuant kernels,
 # because ascendc.cmake creates several bare unguarded targets (host_intf_pub,

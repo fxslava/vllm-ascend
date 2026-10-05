@@ -107,8 +107,8 @@ inline float UnpackFp4(const uint8_t* packed_row, int64_t col) {
 
 // out[r] = sum_c x[c] * (E2M1(w[r,c]) * E8M0(scale[r, c/32])).
 //
-// Ascending column order and a single fp32 accumulator, matching the kernel's
-// summation sequence element for element.
+// Ascending column order and a single fp32 accumulator. The device uses
+// block reductions and column tiles; its reassociation must pass the ULP gate.
 inline void Project(const float* x, const uint8_t* packed, const uint8_t* scales,
                     int64_t rows, int64_t cols, float* out) {
   const int64_t packed_per_row = cols / kFp4PerByte;
@@ -190,7 +190,11 @@ inline ExpertOutputs ReferenceExpert(const ExpertInputs& in, int64_t hidden,
   }
 
   std::vector<float> down(static_cast<size_t>(hidden));
-  Project(activated.data(), in.w2, in.w2_scale, hidden, inter, down.data());
+  std::vector<float> down_input(activated.size());
+  for (size_t j = 0; j < activated.size(); ++j) {
+    down_input[j] = Bf16BitsToFloat(FloatToBf16Bits(activated[j]));
+  }
+  Project(down_input.data(), in.w2, in.w2_scale, hidden, inter, down.data());
 
   ExpertOutputs out;
   out.gate_out.resize(static_cast<size_t>(inter));
@@ -214,13 +218,14 @@ inline ExpertOutputs ReferenceExpert(const ExpertInputs& in, int64_t hidden,
 // The geometry rules the host tiling function enforces
 // (op_host/dsv4_moe_expert_tiling.cpp). Kept here so the host tier can assert
 // them without a CANN toolkit.
-constexpr int64_t kMaxPackedWeightBytes = 96 * 1024;
+constexpr int64_t kMaxHiddenSize = 7168;
+constexpr int64_t kMaxInterSize = 2048;
 
 inline bool GeometryIsAccepted(int64_t hidden, int64_t inter) {
   if (hidden % (kFp4PerByte * kFp4Block) != 0) return false;
   if (inter % (kFp4PerByte * kFp4Block) != 0) return false;
   if (hidden <= 0 || inter <= 0) return false;
-  return inter * hidden / kFp4PerByte <= kMaxPackedWeightBytes;
+  return hidden <= kMaxHiddenSize && inter <= kMaxInterSize;
 }
 
 }  // namespace dsv4

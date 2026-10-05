@@ -42,6 +42,26 @@
 
 set(VLLM_ASCEND_TEST_TIER_LABEL "device")
 
+if(VLLM_ASCEND_TESTS_HAVE_DSV4)
+  vllm_ascend_add_device_executable(test_device_950pr_dsv4_moe_expert
+    test_device_950pr_dsv4_moe_expert.cpp ../common/main_950pr.cpp)
+  target_link_libraries(test_device_950pr_dsv4_moe_expert PRIVATE vllm_ascend_test_dsv4)
+  target_compile_definitions(test_device_950pr_dsv4_moe_expert PRIVATE VLLM_ASCEND_TEST_TIER="device")
+  vllm_ascend_register_correctness_test(test_device_950pr_dsv4_moe_expert 1800 TRUE)
+  add_custom_target(dsv4_device_targets DEPENDS test_device_950pr_dsv4_moe_expert)
+  if(VLLM_ASCEND_TESTS_BUILD_BENCHMARKS)
+    vllm_ascend_add_device_executable(bench_device_950pr_dsv4_moe_expert
+      bench_device_950pr_dsv4_moe_expert.cpp)
+    target_link_libraries(bench_device_950pr_dsv4_moe_expert PRIVATE vllm_ascend_test_dsv4)
+    add_dependencies(dsv4_device_targets bench_device_950pr_dsv4_moe_expert)
+    target_compile_definitions(bench_device_950pr_dsv4_moe_expert PRIVATE VLLM_ASCEND_TEST_TIER="device")
+    add_test(NAME bench_device_950pr_dsv4_moe_expert COMMAND bench_device_950pr_dsv4_moe_expert)
+    set_tests_properties(bench_device_950pr_dsv4_moe_expert PROPERTIES
+      LABELS "benchmark;device" SKIP_RETURN_CODE 77 TIMEOUT 1800
+      ENVIRONMENT "LD_LIBRARY_PATH=${VLLM_ASCEND_TEST_LIBRARY_PATH};ASCEND_HOME_PATH=${ASCEND_HOME_PATH}")
+  endif()
+endif()
+
 # --- correctness --------------------------------------------------------------
 
 # Stock-operator and end-to-end tests. These call operators CANN already built,
@@ -212,4 +232,8 @@ if(VLLM_ASCEND_TESTS_HAVE_TURBOQUANT)
   vllm_ascend_add_device_executable(prof_device_950pr_msprof_trace prof_device_950pr_msprof_trace.cpp)
   target_link_libraries(prof_device_950pr_msprof_trace PRIVATE vllm_ascend_test_turboquant)
   message(STATUS "vllm-ascend tests: [device] prof_device_950pr_msprof_trace (not a ctest entry)")
+endif()
+
+if(TARGET benchmarks AND TARGET bench_device_950pr_dsv4_moe_expert)
+  add_dependencies(benchmarks bench_device_950pr_dsv4_moe_expert)
 endif()

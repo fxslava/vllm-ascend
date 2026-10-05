@@ -6,78 +6,23 @@
  */
 
 /*!
- * \file dsv4_moe_expert.cpp
- * \brief DeepSeek-V4 Flash MoE expert projection kernel (reduced-geometry milestone).
+ * DeepSeek-V4 routed expert: BF16 x, E2M1 packed FP4 weights, block-32
+ * E8M0 scales, FP32 accumulators, symmetric gate clamp at +/-10, BF16
+ * round-to-nearest-even activation before the down projection.
  *
- * One kernel launch computes the full per-expert pipeline of the DSV4 routed
- * expert, exactly matching the operand set the PyTorch draft runtime hands
- * to DummyExpertKernelRunner:
+ * One AIV processes eight rows by <=512 columns at a time. Weight/scale
+ * loads, vector decode and reductions are streamed; there is no Cube work.
+ * FP32 reductions are reassociated relative to the ascending CPU oracle.
+ * Hardware numerical parity is required: compilation is not validation.
  *
- *   1. gate/up leg  -- x[1, hidden] (bf16) x w1/w3[inter, hidden] (packed FP4,
- *                      block-32 E8M0 scales) -> gate_out/up_out[1, inter] bf16
- *   2. SwiGLU       -- activated = silu(gate) * up -> activated[1, inter] bf16
- *   3. down leg     -- activated[1, inter] x w2[hidden, inter] (packed FP4,
- *                      block-32 E8M0 scales) -> down_out[1, hidden] bf16
- *
- * Numerics contract (mirrored by tools/dsv4_moe_runtime/kernel_bringup/
- * gen_golden.py):
- *   - packed FP4 (2 values per byte): byte i holds element 2i in the low
- *     nibble and element 2i+1 in the high nibble; E2M1 decode, exact in bf16;
- *   - E8M0 block scales: one byte per 32 logical elements along the reduction
- *     dim, value 2^(byte-127), byte 0xFF decodes to NaN (OCP MX semantics),
- *     byte 0x00 to the fp32 subnormal 2^-127; exact power-of-two assembly;
- *   - accumulation in fp32 over the reduction dim in ascending order; outputs
- *     rounded to bf16 round-to-nearest-even.
- *
- * Execution model (this file replaces the scalar milestone kernel):
- *   - No scalar execution loops and no GetValue/SetValue in the math path.
- *     Every datum moves through the vector pipe: nibbles are decoded by
- *     assembling IEEE bit patterns from the codes (ShiftRight/And/Or on
- *     int32, one Select per special case), E8M0 scales by exponent assembly,
- *     bf16/fp32 conversions by vector Casts, and the reduction by a level-2
- *     ReduceSum per 32-element block (this CANN ships ReduceSum; the older
- *     WholeReduceSum name does not exist in these headers).
- *
- *   Why bit assembly and not a LUT Gather or the native fp4x2_e2m1 Cast:
- *   both were tried and are unusable under ASCENDC_CPU_DEBUG -- the tikicpulib
- *   Gather stub masks the byte offset down to 16 bytes (4 reachable codes),
- *   and the fp4x2_e2m1 Cast silently produces zeros, which is exactly the
- *   "an unsupported op compiles to nothing" trap. Bit assembly uses only
- *   primitives the CPU interpreter implements, is deterministic on silicon,
- *   and is verified end-to-end against the golden.
- *
- *   - Weights stream through UB in row chunks, so the vector working set is a
- *     constant ~60 KiB regardless of the accepted geometry; the host tiling
- *     budget (op_host/dsv4_moe_expert_tiling.cpp) is unchanged and still
- *     bounds the milestone.
- *
- * Reduction-order deviation, by design and within the gate: the golden adds
- * all products of a row sequentially. Splitting the reduction at block
- * boundaries preserves that order ACROSS blocks (ascending, one vector add
- * per block), but the sum WITHIN a 32-element block and the <= 8-way merge of
- * block partials follow the reduce instruction's / a balanced tree's internal
- * order. Every product term is exact in fp32 (bf16 x E2M1 x power-of-two has
- * at most a 10-bit significand), so the deviation is pure addition
- * reassociation -- a few fp32 ULPs before the bf16 rounding, i.e. at most a
- * 1-ULP flip on elements sitting within a few fp32 ULPs of a bf16 rounding
- * boundary. The Gate B / hardware gate (FpDiff <= 2 bf16 ULP, RateDiff <=
- * 1e-2) is sized for exactly this.
- *   The E8M0 scale is applied AFTER the block reduce instead of per element:
- *   s * sum(p_i) == sum(s * p_i) exactly for a power-of-two s, so this neither
- *   adds nor removes a rounding step -- it only removes a broadcast.
- *
- * Synchronisation (the op compiles with --cce-auto-sync=off, so the compiler
- * inserts nothing): PIPE_V is in-order, so consecutive vector instructions --
- * including dependent ones -- carry no barriers. Flag ids are numbered:
- *   id 0: MTE2_V + V_MTE2 ring around the shared weight/scale staging buffers
- *         (primed before each leg's chunk loop, drained after);
- *   id 1: MTE3_V + V_MTE3 ring around the per-chunk bf16 row staging (the
- *         MTE3_V wait before the next Cast is the write-after-read guard for
- *         the in-flight row store);
- *   id 2: V_MTE3 one-shot ordering the three staged inter rows before CopyOut;
- *   id 3: MTE2_V one-shot ordering the x load before its vector cast.
- * The SwiGLU stage needs no flags at all: gate/up/activated are produced and
- * consumed entirely on PIPE_V.
+ * All staging uses TBuf with explicit sync (--cce-auto-sync=off):
+ * id 0: MTE2_V / V_MTE2 weight ring, primed, re-armed per column tile, drained.
+ * id 1: V_MTE3 / MTE3_V output-row ring, primed, re-armed per row tile, drained.
+ * id 2: V_MTE3 output handoff and MTE3_V final output drain.
+ * id 3: MTE2_V input handoff. IDs are distinct within each event namespace;
+ * no helper calls an external event-using kernel. There are no scalar UB
+ * data accesses and no S_* events. Vector arithmetic follows PIPE_V order.
+ * E8M0 255 is NaN, not infinity; 0 is the subnormal 2^-127.
  */
 
 #include "kernel_tiling/kernel_tiling.h"
@@ -96,12 +41,14 @@ constexpr int64_t OUT_ROW_COUNT = 3;    // gate/up/activated share one staging b
 // CHUNK_FLAT_ELEMS, so its UB cost is geometry-independent.
 constexpr int64_t CHUNK_FLAT_ELEMS = 4096;
 // Chunk row counts are multiples of 8 so every accumulator slice they write
-// starts on a 32-byte boundary; the tiling bound (cols <= 512) keeps the
-// pre-rounding count at or above this.
+// starts on a 32-byte boundary; column tiling keeps eight rows in the working set.
 constexpr int64_t MIN_CHUNK_ROWS = 8;
+constexpr int64_t MAX_CHUNK_COLS = CHUNK_FLAT_ELEMS / MIN_CHUNK_ROWS;
 // Reduce-partial merge buffers hold chunkRows * pow2(blocksPerRow) floats;
 // pow2 at most doubles blocksPerRow = CHUNK_FLAT_ELEMS / FP4_BLOCK.
 constexpr int64_t MAX_MERGE_ELEMS = 2 * CHUNK_FLAT_ELEMS / FP4_BLOCK;
+constexpr int64_t REDUCE_SLOT_ELEMS = BYTES_ALIGN / sizeof(float);
+constexpr int32_t REDUCE_SLOT_BYTE_SHIFT = 5;
 
 // The op compiles with --cce-auto-sync=off (op_host/CMakeLists.txt), so the
 // compiler inserts no pipe synchronisation at all: every cross-pipe dependency
@@ -118,15 +65,6 @@ constexpr uint8_t X_EVENT_ID = 3;       // MTE2_V one-shot after the x load
 __aicore__ inline int64_t AlignUpBytes(int64_t bytes)
 {
     return (bytes + BYTES_ALIGN - 1) / BYTES_ALIGN * BYTES_ALIGN;
-}
-
-__aicore__ inline int64_t NextPow2(int64_t v)
-{
-    int64_t p = 1;
-    while (p < v) {
-        p <<= 1;
-    }
-    return p;
 }
 
 class Dsv4MoeExpertKernel {
@@ -213,22 +151,20 @@ private:
         pipe_->InitBuffer(stageBBuf_, AlignUpBytes(CHUNK_FLAT_ELEMS * 4));
         pipe_->InitBuffer(stageCBuf_, AlignUpBytes(CHUNK_FLAT_ELEMS * 4));
         pipe_->InitBuffer(prodBuf_, CHUNK_FLAT_ELEMS * 4);
-        // x split into its even and odd columns once per leg: the decode emits
+        // x split into its even and odd columns once per column tile: the decode emits
         // all low nibbles then all high nibbles, so the low half pairs with the
         // even columns and the high half with the odd ones. See ProjectLeg.
-        pipe_->InitBuffer(xEvenBuf_, AlignUpBytes(maxCols / FP4_PER_BYTE * 4));
-        pipe_->InitBuffer(xOddBuf_, AlignUpBytes(maxCols / FP4_PER_BYTE * 4));
-        pipe_->InitBuffer(partHiBuf_, MAX_MERGE_ELEMS * 4 + BYTES_ALIGN * 8);
-        // Reduce destinations sit one float apart (the level-2 wrapper retires
-        // its sum at destination element 0); the tail slack absorbs any writes
-        // a wrapper may leave past the last destination.
-        pipe_->InitBuffer(partRawBuf_, MAX_MERGE_ELEMS * 4 + BYTES_ALIGN * 8);
+        pipe_->InitBuffer(xEvenBuf_, MAX_CHUNK_COLS / FP4_PER_BYTE * 4);
+        pipe_->InitBuffer(xOddBuf_, MAX_CHUNK_COLS / FP4_PER_BYTE * 4);
+        pipe_->InitBuffer(partHiBuf_, MAX_MERGE_ELEMS * REDUCE_SLOT_ELEMS * 4);
+        // Every reduction destination starts on a 32-byte boundary. The slots
+        // are compacted with vector Gather after the reduction stage.
+        pipe_->InitBuffer(partRawBuf_, MAX_MERGE_ELEMS * REDUCE_SLOT_ELEMS * 4);
         pipe_->InitBuffer(mergeBuf1_, MAX_MERGE_ELEMS * 4);
         pipe_->InitBuffer(mergeBuf2_, MAX_MERGE_ELEMS * 4);
         pipe_->InitBuffer(scalesF32Buf_, MAX_MERGE_ELEMS * 4);
         pipe_->InitBuffer(decMaskBuf_, AlignUpBytes(CHUNK_FLAT_ELEMS / FP4_PER_BYTE * 2));
         pipe_->InitBuffer(rowBf16Buf_, MAX_MERGE_ELEMS);
-        pipe_->InitBuffer(reduceTmpBuf_, FP4_BLOCK * 4);
     }
 
     // MTE2 (GM->UB) finished -> the vector pipe may read the staging buffer.
@@ -251,25 +187,6 @@ private:
         Cast(xFloat_, xBits.ReinterpretCast<bfloat16_t>(), RoundMode::CAST_NONE, static_cast<uint32_t>(hidden_));
     }
 
-    // Chunk row count: the largest multiple of 8 that keeps the chunk's
-    // products at or under CHUNK_FLAT_ELEMS and divides the leg's row count.
-    // The multiple of 8 is not a tuning choice -- every accumulator slice the
-    // chunk writes (legAcc[row0]) must start on a 32-byte boundary, which
-    // needs row0 to be a multiple of 8 elements. cols <= 512 (the tiling
-    // bound) keeps the pre-rounding count at >= 8.
-    __aicore__ int64_t ChunkRows(int64_t cols, int64_t rows) const
-    {
-        int64_t chunkRows = CHUNK_FLAT_ELEMS / cols;
-        if (chunkRows > rows) {
-            chunkRows = rows;
-        }
-        chunkRows -= chunkRows % MIN_CHUNK_ROWS;
-        while (rows % chunkRows != 0) {
-            chunkRows -= MIN_CHUNK_ROWS;
-        }
-        return chunkRows;
-    }
-
     // One projection leg: out[r] = sum_c x[c] * E2M1(w[r, c]) * scale[r, c/32],
     // streamed in row chunks. Each chunk:
     //   MTE2 the packed bytes + scale bytes into the shared staging buffers;
@@ -280,20 +197,18 @@ private:
     //   vector Cast to bf16 and a padded store of the [chunkRows] row.
     __aicore__ void ProjectLeg(int32_t legIndex, const LocalTensor<float> &xFull, LocalTensor<float> &legAcc)
     {
-        const int64_t cols = (legIndex == LEG_W2) ? inter_ : hidden_;
+        const int64_t fullCols = (legIndex == LEG_W2) ? inter_ : hidden_;
+        const int64_t cols = fullCols < MAX_CHUNK_COLS ? fullCols : MAX_CHUNK_COLS;
         const int64_t rows = (legIndex == LEG_W2) ? hidden_ : inter_;
-        const int64_t chunkRows = ChunkRows(cols, rows);
-        const int64_t blocksPerRow = cols / FP4_BLOCK;
-        const int64_t pow2Blocks = NextPow2(blocksPerRow);
-        const int64_t chunkElems = chunkRows * cols;
-        const int64_t chunkBytes = chunkElems / FP4_PER_BYTE;
-        const int64_t chunkScales = chunkRows * blocksPerRow;
-        const int64_t halfCols = cols / FP4_PER_BYTE;
+        const int64_t chunkRows = MIN_CHUNK_ROWS;
+        // Each scale DMA row occupies a 32-byte UB block, including its pad.
+        const int64_t pow2Blocks = BYTES_ALIGN;
+        const int64_t chunkScales = chunkRows * pow2Blocks;
 
         LocalTensor<uint8_t> packed = wStagingBuf_.Get<uint8_t>();
         LocalTensor<uint8_t> scales = sStagingBuf_.Get<uint8_t>();
         LocalTensor<float> products = prodBuf_.Get<float>();
-        LocalTensor<int32_t> codes = prodBuf_.Get<int32_t>(); // bit-assembly stage, dies before the row Muls
+        LocalTensor<int32_t> codes = prodBuf_.Get<int32_t>();  // bit-assembly stage, dies before the row Muls
         LocalTensor<int32_t> stageA = stageABuf_.Get<int32_t>();
         LocalTensor<int32_t> stageB = stageBBuf_.Get<int32_t>();
         LocalTensor<int32_t> stageC = stageCBuf_.Get<int32_t>();
@@ -302,99 +217,124 @@ private:
         LocalTensor<float> xEven = xEvenBuf_.Get<float>();
         LocalTensor<float> xOdd = xOddBuf_.Get<float>();
 
-        // Split this leg's input vector into its even and odd columns once;
+        // Split each column tile into even and odd input columns;
         // the decode's two halves pair with these. DeInterleave writes
         // halfCols elements to each destination.
-        DeInterleave(xEven, xOdd, xFull, static_cast<int32_t>(cols));
         LocalTensor<float> partRaw = partRawBuf_.Get<float>();
         LocalTensor<float> merge1 = mergeBuf1_.Get<float>();
         LocalTensor<float> merge2 = mergeBuf2_.Get<float>();
-        LocalTensor<float> reduceTmp = reduceTmpBuf_.Get<float>();
         LocalTensor<uint16_t> rowBf16 = rowBf16Buf_.Get<uint16_t>();
 
-        SetFlag<HardEvent::V_MTE2>(STAGING_EVENT_ID); // prime: staging starts free
-        SetFlag<HardEvent::MTE3_V>(ROW_EVENT_ID);     // prime: bf16 row starts free
-        for (int64_t row0 = 0; row0 < rows; row0 += chunkRows) {
-            WaitFlag<HardEvent::V_MTE2>(STAGING_EVENT_ID); // staging free for refill
-            DataCopy(packed, wqGm_[legIndex][row0 * cols / FP4_PER_BYTE], chunkBytes);
-            DataCopyPad(scales, wqScaleGm_[legIndex][row0 * blocksPerRow],
-                        DataCopyParams{1, static_cast<uint16_t>(chunkScales), 0, 0}, DataCopyPadParams{});
-            WaitLoad(); // MTE2 drain: the vector reads below must see the load
-
-            DecodeCodes(packed, codes, stageA, stageB, stageC, decMask, static_cast<uint32_t>(chunkBytes));
-
-            // Fold x in row-wise. The decode emitted all low nibbles (the even
-            // columns) in [0, chunkBytes) and all high nibbles (the odd ones)
-            // in [chunkBytes, 2*chunkBytes), each row-major with halfCols per
-            // row -- so each half multiplies against the matching half of x.
-            // Both operands are exact short-significand floats; nothing rounds.
-            // Row starts are multiples of halfCols floats, and halfCols >= 32,
-            // so every slice is 32-byte aligned.
-            for (int64_t r = 0; r < chunkRows; ++r) {
-                const uint32_t lowOff = static_cast<uint32_t>(r * halfCols);
-                const uint32_t highOff = static_cast<uint32_t>(chunkBytes + r * halfCols);
-                Mul(products[lowOff], products[lowOff], xEven, static_cast<uint32_t>(halfCols));
-                Mul(products[highOff], products[highOff], xOdd, static_cast<uint32_t>(halfCols));
-            }
-
-            // Zero first so the pow2 pad slots the merge tree pairs with are
-            // exact zero terms; the reduces then fill the real slots. The
-            // level-2 ReduceSum retires its sum at destination element 0, so
-            // one-float spacing keeps the partials compact.
-            //
-            // A block of 32 columns is 16 even plus 16 odd, so it takes two
-            // reduces -- one per half -- summed at the end. That reassociates
-            // the block sum relative to the golden's ascending walk, which is
-            // fp32-exact to well under a bf16 ULP.
-            Duplicate(partRaw, 0.0f, static_cast<uint32_t>(MAX_MERGE_ELEMS));
-            Duplicate(partHi, 0.0f, static_cast<uint32_t>(MAX_MERGE_ELEMS));
-            const int64_t halfBlock = FP4_BLOCK / FP4_PER_BYTE;
-            for (int64_t r = 0; r < chunkRows; ++r) {
-                const LocalTensor<float> lowRow = products[static_cast<uint32_t>(r * halfCols)];
-                const LocalTensor<float> highRow = products[static_cast<uint32_t>(chunkBytes + r * halfCols)];
-                for (int64_t b = 0; b < blocksPerRow; ++b) {
-                    ReduceSum(partRaw[static_cast<uint32_t>(r * pow2Blocks + b)],
-                              lowRow[static_cast<uint32_t>(b * halfBlock)], reduceTmp,
-                              static_cast<int32_t>(halfBlock));
-                    ReduceSum(partHi[static_cast<uint32_t>(r * pow2Blocks + b)],
-                              highRow[static_cast<uint32_t>(b * halfBlock)], reduceTmp,
-                              static_cast<int32_t>(halfBlock));
-                }
-            }
-            Add(partRaw, partRaw, partHi, static_cast<uint32_t>(MAX_MERGE_ELEMS));
-
-            // Apply the E8M0 scale to the compact partials. Post-reduce is
-            // exact: the scale is a power of two, so s * sum(p) == sum(s * p)
-            // bit-for-bit -- the golden's per-element scaling and this
-            // per-block scaling agree exactly.
-            DecodeScales(scales, static_cast<uint32_t>(chunkScales));
-            const LocalTensor<float> scaleF32 = scalesF32Buf_.Get<float>();
-            Mul(partRaw, partRaw, scaleF32, static_cast<uint32_t>(chunkScales));
-
-            // Balanced merge of the per-block partials; the final level lands
-            // in the leg accumulator's row slice.
-            int64_t mergeLen = chunkRows * pow2Blocks;
-            LocalTensor<float> cur = partRaw;
-            while (mergeLen > 2 * chunkRows) {
-                DeInterleave(merge1, merge2, cur, static_cast<int32_t>(mergeLen));
-                Add(cur, merge1, merge2, static_cast<uint32_t>(mergeLen / 2));
-                mergeLen /= 2;
-            }
-            DeInterleave(merge1, merge2, cur, static_cast<int32_t>(mergeLen));
+        SetFlag<HardEvent::V_MTE2>(STAGING_EVENT_ID);  // prime: staging starts free
+        SetFlag<HardEvent::MTE3_V>(ROW_EVENT_ID);      // prime: bf16 row starts free
+        for (int64_t row0 = 0; row0 < rows; row0 += chunkRows)
+        {
             LocalTensor<float> accRow = legAcc[static_cast<uint32_t>(row0)];
-            Add(accRow, merge1, merge2, static_cast<uint32_t>(chunkRows));
+            Duplicate(accRow, 0.0f, static_cast<uint32_t>(chunkRows));
+            for (int64_t col0 = 0; col0 < fullCols; col0 += cols)
+            {
+                const int64_t activeCols = fullCols - col0 < cols ? fullCols - col0 : cols;
+                const int64_t activeHalfCols = activeCols / FP4_PER_BYTE;
+                const int64_t activeBlocks = activeCols / FP4_BLOCK;
+                const int64_t activeBytes = chunkRows * activeHalfCols;
+                DeInterleave(xEven, xOdd, xFull[static_cast<uint32_t>(col0)], static_cast<int32_t>(activeCols));
+                WaitFlag<HardEvent::V_MTE2>(STAGING_EVENT_ID);  // staging free for refill
+                for (int64_t r = 0; r < chunkRows; ++r)
+                {
+                    DataCopy(packed[static_cast<uint32_t>(r * activeHalfCols)],
+                             wqGm_[legIndex][((row0 + r) * fullCols + col0) / FP4_PER_BYTE], activeHalfCols);
+                    DataCopyPad(scales[static_cast<uint32_t>(r * pow2Blocks)],
+                                wqScaleGm_[legIndex][((row0 + r) * fullCols + col0) / FP4_BLOCK],
+                                DataCopyParams{1, static_cast<uint16_t>(activeBlocks), 0, 0},
+                                DataCopyPadParams{true, 0, static_cast<uint8_t>(pow2Blocks - activeBlocks), 0});
+                }
+                WaitLoad();  // MTE2 drain: the vector reads below must see the load
 
-            WaitFlag<HardEvent::MTE3_V>(ROW_EVENT_ID); // previous row store retired
-            Cast(rowBf16.ReinterpretCast<bfloat16_t>(), accRow, RoundMode::CAST_ROUND,
-                 static_cast<uint32_t>(chunkRows));
+                DecodeCodes(packed, codes, stageA, stageB, stageC, decMask, static_cast<uint32_t>(activeBytes));
+
+                // Fold x in row-wise. The decode emitted all low nibbles (the even
+                // columns) in [0, chunkBytes) and all high nibbles (the odd ones)
+                // in [chunkBytes, 2*chunkBytes), each row-major with halfCols per
+                // row -- so each half multiplies against the matching half of x.
+                // Both operands are exact short-significand floats; nothing rounds.
+                // Row starts are multiples of halfCols floats, and halfCols >= 32,
+                // so every slice is 32-byte aligned.
+                for (int64_t r = 0; r < chunkRows; ++r)
+                {
+                    const uint32_t lowOff = static_cast<uint32_t>(r * activeHalfCols);
+                    const uint32_t highOff = static_cast<uint32_t>(activeBytes + r * activeHalfCols);
+                    Mul(products[lowOff], products[lowOff], xEven, static_cast<uint32_t>(activeHalfCols));
+                    Mul(products[highOff], products[highOff], xOdd, static_cast<uint32_t>(activeHalfCols));
+                }
+
+                // Zero first so the pow2 pad slots the merge tree pairs with are
+                // exact zero terms; the reduces then fill the real slots. The
+                // ReduceRepeat writes one value per aligned 32-byte slot. This avoids
+                // the level-2 ReduceSum wrapper's implicit V_S/scalar read.
+                //
+                // A block of 32 columns is 16 even plus 16 odd, so it takes two
+                // reduces -- one per half -- summed at the end. That reassociates
+                // the block sum relative to the golden's ascending walk, which is
+                // fp32-exact to well under a bf16 ULP.
+                Duplicate(partRaw, 0.0f, static_cast<uint32_t>(MAX_MERGE_ELEMS * REDUCE_SLOT_ELEMS));
+                Duplicate(partHi, 0.0f, static_cast<uint32_t>(MAX_MERGE_ELEMS * REDUCE_SLOT_ELEMS));
+                const int64_t halfBlock = FP4_BLOCK / FP4_PER_BYTE;
+                for (int64_t r = 0; r < chunkRows; ++r)
+                {
+                    const LocalTensor<float> lowRow = products[static_cast<uint32_t>(r * activeHalfCols)];
+                    const LocalTensor<float> highRow = products[static_cast<uint32_t>(activeBytes + r * activeHalfCols)];
+                    for (int64_t b = 0; b < activeBlocks; ++b)
+                    {
+                        const uint32_t slot = static_cast<uint32_t>((r * pow2Blocks + b) * REDUCE_SLOT_ELEMS);
+                        ReduceRepeat<ReduceType::SUM>(partRaw[slot], lowRow[static_cast<uint32_t>(b * halfBlock)],
+                            static_cast<int32_t>(halfBlock), 1, 1, 1, 8, ReduceOrder::ORDER_ONLY_VALUE);
+                        ReduceRepeat<ReduceType::SUM>(partHi[slot], highRow[static_cast<uint32_t>(b * halfBlock)],
+                            static_cast<int32_t>(halfBlock), 1, 1, 1, 8, ReduceOrder::ORDER_ONLY_VALUE);
+                    }
+                }
+                // Gather only the first float of each aligned 32-byte reduction slot.
+                LocalTensor<int32_t> offsets = scalesF32Buf_.Get<int32_t>();
+                CreateVecIndex(offsets, static_cast<int32_t>(0), static_cast<uint32_t>(MAX_MERGE_ELEMS));
+                ShiftLeft(offsets, offsets, REDUCE_SLOT_BYTE_SHIFT, static_cast<uint32_t>(MAX_MERGE_ELEMS));
+                Gather(merge1, partRaw, offsets.ReinterpretCast<uint32_t>(), 0,
+                       static_cast<uint32_t>(MAX_MERGE_ELEMS));
+                Gather(merge2, partHi, offsets.ReinterpretCast<uint32_t>(), 0,
+                       static_cast<uint32_t>(MAX_MERGE_ELEMS));
+                Add(partRaw, merge1, merge2, static_cast<uint32_t>(MAX_MERGE_ELEMS));
+
+                // Apply the E8M0 scale to the compact partials. Post-reduce is
+                // For finite, normal-range operands the scale is a power of two, so
+                // scaling commutes with the reduction; the golden's per-element scaling and this
+                // per-block scaling agree exactly.
+                DecodeScales(scales, static_cast<uint32_t>(chunkScales));
+                SetFlag<HardEvent::V_MTE2>(STAGING_EVENT_ID);  // re-arm after the last staging-buffer read
+                const LocalTensor<float> scaleF32 = scalesF32Buf_.Get<float>();
+                Mul(partRaw, partRaw, scaleF32, static_cast<uint32_t>(chunkScales));
+
+                // Balanced merge of the per-block partials; the final level lands
+                // in the leg accumulator's row slice.
+                int64_t mergeLen = chunkRows * pow2Blocks;
+                LocalTensor<float> cur = partRaw;
+                while (mergeLen > 2 * chunkRows)
+                {
+                    DeInterleave(merge1, merge2, cur, static_cast<int32_t>(mergeLen));
+                    Add(cur, merge1, merge2, static_cast<uint32_t>(mergeLen / 2));
+                    mergeLen /= 2;
+                }
+                DeInterleave(merge1, merge2, cur, static_cast<int32_t>(mergeLen));
+                Add(merge1, merge1, merge2, static_cast<uint32_t>(chunkRows));
+                Add(accRow, accRow, merge1, static_cast<uint32_t>(chunkRows));
+            }
+
+            WaitFlag<HardEvent::MTE3_V>(ROW_EVENT_ID);  // previous row store retired
+            Cast(rowBf16.ReinterpretCast<bfloat16_t>(), accRow, RoundMode::CAST_ROUND, static_cast<uint32_t>(chunkRows));
             SetFlag<HardEvent::V_MTE3>(ROW_EVENT_ID);
-            WaitFlag<HardEvent::V_MTE3>(ROW_EVENT_ID); // MTE3 may read the row
-            DataCopyPad(legOutGm_[legIndex][row0], rowBf16,
-                        DataCopyParams{1, static_cast<uint16_t>(chunkRows * 2), 0, 0});
-            SetFlag<HardEvent::MTE3_V>(ROW_EVENT_ID); // re-arm: row consumed by MTE3
+            WaitFlag<HardEvent::V_MTE3>(ROW_EVENT_ID);  // MTE3 may read the row
+            DataCopyPad(legOutGm_[legIndex][row0], rowBf16, DataCopyParams{1, static_cast<uint16_t>(chunkRows * 2), 0, 0});
+            SetFlag<HardEvent::MTE3_V>(ROW_EVENT_ID);  // re-arm: row consumed by MTE3
         }
-        WaitFlag<HardEvent::V_MTE2>(STAGING_EVENT_ID); // drain: staging ring closed
-        WaitFlag<HardEvent::MTE3_V>(ROW_EVENT_ID);     // drain: row ring closed
+        WaitFlag<HardEvent::V_MTE2>(STAGING_EVENT_ID);  // drain: staging ring closed
+        WaitFlag<HardEvent::MTE3_V>(ROW_EVENT_ID);      // drain: row ring closed
     }
 
     // Packed FP4 bytes -> E2M1 fp32 values, in natural column order, written
@@ -556,6 +496,10 @@ private:
         // pattern suggests: SwiGLU(dst, s0, s1, beta, n) computes
         // s0 * swish(s1) -- the swish is applied to the SECOND source.
         SwiGLU<float, false>(activated_, upAcc_, clampedGate, SWIGLU_BETA, count);
+        // Preserve FP32 gate/up until activation, then round the down operand to BF16.
+        LocalTensor<bfloat16_t> rounded = interRowBuf_.Get<bfloat16_t>(count);
+        Cast(rounded, activated_, RoundMode::CAST_ROUND, count);
+        Cast(activated_, rounded, RoundMode::CAST_NONE, count);
     }
 
     __aicore__ void CopyOut()
@@ -579,6 +523,8 @@ private:
         DataCopy(legOutGm_[LEG_W1], gateRow, inter_);
         DataCopy(legOutGm_[LEG_W3], upRow, inter_);
         DataCopy(activatedGmU16_, activatedRow, inter_);
+        SetFlag<HardEvent::MTE3_V>(OUT_EVENT_ID);
+        WaitFlag<HardEvent::MTE3_V>(OUT_EVENT_ID); // retire output reads before UB destruction
     }
 
     static constexpr int32_t SUBNORMAL_BITS = 0x00400000; // 2^-127 (E8M0 byte 0x00)
@@ -622,7 +568,6 @@ private:
     TBuf<TPosition::VECCALC> scalesF32Buf_;
     TBuf<TPosition::VECCALC> decMaskBuf_;
     TBuf<TPosition::VECCALC> rowBf16Buf_;
-    TBuf<TPosition::VECCALC> reduceTmpBuf_;
 };
 } // namespace Dsv4MoeExpertOp
 
