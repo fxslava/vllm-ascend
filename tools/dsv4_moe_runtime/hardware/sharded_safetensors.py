@@ -28,6 +28,7 @@ before returning.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 from collections.abc import Mapping, Sequence
@@ -248,6 +249,8 @@ class ShardedSafetensorsExpertSource:
         self.bytes_streamed = 0
         self.experts_served = 0
         self.slot_fills = 0
+        self._closed = False
+        self.closed_read_attempts = 0
 
     # ------------------------------------------------------------- inspection
 
@@ -275,6 +278,7 @@ class ShardedSafetensorsExpertSource:
 
     def fill_slot(self, destination: torch.Tensor, layer_idx: int, expert_id: int) -> None:
         """Materialize one expert's whole slot region (disk -> pinned window)."""
+        self._require_open()
         spans = self._spans_of(layer_idx, expert_id)
         if destination.numel() != self._layout.slot_num_bytes:
             raise ValueError(
@@ -289,6 +293,7 @@ class ShardedSafetensorsExpertSource:
 
     def read_param(self, layer_idx: int, expert_id: int, param_key: str) -> torch.Tensor:
         """Zero-copy host view of one parameter's authoritative bytes."""
+        self._require_open()
         span = self._spans_of(layer_idx, expert_id)[param_key]
         spec = self._layout.spec_for(param_key)
         return self._loader_for(span).mmap_view(span.begin, span.num_bytes).view(spec.view_shape)
@@ -301,6 +306,7 @@ class ShardedSafetensorsExpertSource:
 
     def fill_slot_params(self, layer_idx: int, expert_id: int, views: Mapping[str, torch.Tensor]) -> int:
         """DirectStorage fill: disk -> pinned chunks -> non-blocking device copies."""
+        self._require_open()
         spans = self._spans_of(layer_idx, expert_id)
         moved = 0
         for param_key, destination in views.items():
@@ -346,6 +352,7 @@ class ShardedSafetensorsExpertSource:
 
     def fill_shared_expert(self, layer_idx: int, views: Mapping[str, torch.Tensor]) -> int:
         """Stream one layer's shared expert into its reserved views; returns bytes."""
+        self._require_open()
         if self._shared_layout is None:
             raise WeightLayoutMismatchError(
                 "this source was built without a shared_layout, so it cannot bind shared experts"
@@ -369,8 +376,19 @@ class ShardedSafetensorsExpertSource:
             loader.synchronize()
 
     def close(self) -> None:
+        self._closed = True
+        self.synchronize()
+        for chunk in self._chunks:
+            ctypes.memset(chunk.data_ptr(), 0, chunk.numel())
         for loader in self._loaders.values():
             loader.close()
+            loader._chunks.clear()
+        self._chunks.clear()
+
+    def _require_open(self) -> None:
+        if self._closed:
+            self.closed_read_attempts += 1
+            raise RuntimeError("runtime disk reads are forbidden after checkpoint source shutdown")
 
     # ------------------------------------------------------------- internals
 

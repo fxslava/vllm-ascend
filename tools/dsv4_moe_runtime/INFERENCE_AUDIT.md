@@ -1,5 +1,8 @@
 # DeepSeek-V2-Lite real-weight validation
 
+These are historical disk-backed measurements. The decoder now defaults to
+the [complete exclusive RAM/VRAM hierarchy](benchmarks/EXCLUSIVE_REPORT.md).
+
 Validated on 2026-10-05 on the user-selected NVIDIA RTX 5070, with PyTorch
 2.13.0.dev20260516+cu130 and Transformers 5.8.1. No Ascend execution occurred.
 

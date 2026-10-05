@@ -135,6 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weights-dir", type=Path, default=DEFAULT_WEIGHTS)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--slots", type=int, default=DEFAULT_SLOTS)
+    parser.add_argument("--auto-slots", action="store_true", help="use the available VRAM budget for routed slots")
     parser.add_argument("--context-tokens", type=int, default=DEFAULT_CONTEXT_TOKENS)
     parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     parser.add_argument("--prompt", action="append", help="non-interactive prompt; repeat for multiple turns")
@@ -150,11 +151,15 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--max-new-tokens must be positive and smaller than --context-tokens")
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    print(f"Loading {args.weights_dir} on {args.device} with {args.slots} routed slots...", flush=True)
+    slot_plan = "automatic VRAM sizing" if args.auto_slots else f"{args.slots} routed slots"
+    print(f"Loading {args.weights_dir} on {args.device} with {slot_plan}...", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(args.weights_dir, local_files_only=True)
-    decoder = V2LiteDecoder(args.weights_dir, args.device, args.slots, args.context_tokens)
+    decoder = V2LiteDecoder(args.weights_dir, args.device, None if args.auto_slots else args.slots, args.context_tokens)
     session = ChatSession(decoder, tokenizer, args.max_new_tokens)
-    print("Ready. /reset clears history; /stats shows the cache; /exit quits.", flush=True)
+    print(
+        f"Ready ({decoder.pool.num_slots} VRAM slots). /reset clears history; /stats shows the cache; /exit quits.",
+        flush=True,
+    )
     try:
 
         def respond(text: str) -> None:

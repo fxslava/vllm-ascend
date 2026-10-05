@@ -1,0 +1,42 @@
+{
+  "tensors": 5291,
+  "parameters": 15706484224,
+  "checkpoint_bytes": 31412968448,
+  "routed_bytes": 28789702656,
+  "shared_bytes": 899678208,
+  "backbone_bytes": 1723587584,
+  "device": "cuda:0",
+  "load_seconds": 15.076058699996793,
+  "prompt_ids": [
+    100000,
+    5726,
+    25,
+    37727,
+    185,
+    185,
+    77398,
+    25
+  ],
+  "generated_ids": [
+    37727,
+    0,
+    1724
+  ],
+  "generated_text": " Hello! How",
+  "prefill_seconds": 4.805057800003851,
+  "decode_seconds": [
+    0.5215352000013809,
+    0.4777544000025955
+  ],
+  "static_weight_and_kv_bytes": 3733603328,
+  "expert_arena_bytes": 2006974464,
+  "allocated_bytes": 3772421632,
+  "reserved_bytes": 3787456512,
+  "finite_logits": true,
+  "arena_pointers_stable": true,
+  "expert_loads": 1437,
+  "expert_hits": 123,
+  "bytes_streamed": 0,
+  "storage": "exclusive",
+  "execution": "eager attention + static BF16 expert dispatch; custom V4 FP4 kernel disabled"
+}

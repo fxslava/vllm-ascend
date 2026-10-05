@@ -1,0 +1,239 @@
+{
+  "configurations": [
+    {
+      "slots": 64,
+      "host_slots": 1600,
+      "host_bytes": 27682406400,
+      "host_pinned": true,
+      "startup_seconds": 14.755446700000903,
+      "startup_routed_bytes": 28789702656,
+      "disk_read_bytes": 0,
+      "runtime_reader_requests": 0,
+      "runtime_source_read_attempts": 0,
+      "disk_guard_probes_passed": 2,
+      "file_descriptors_closed": true,
+      "partition_disjoint": true,
+      "partition_total_experts": 1664,
+      "arena_pointers_stable": true,
+      "device_allocated_bytes": 3773805056,
+      "runs": [
+        {
+          "run": 1,
+          "summary": {
+            "swap_seconds": 6.742011900169018,
+            "h2d_seconds": 1.2844555209149935,
+            "d2h_seconds": 1.2894944517948317,
+            "duplex_seconds": 3.6484942998577026,
+            "h2d_bytes": 36194746368,
+            "d2h_bytes": 36194746368,
+            "swaps": 2092,
+            "seconds": 8.266450100003567,
+            "hits": 248,
+            "misses": 2092,
+            "mean_decode_seconds": 0.5045410571432772,
+            "mean_decode_swap_seconds": 0.4222498571512655,
+            "mean_decode_h2d_seconds": 0.07958138517158611,
+            "mean_decode_d2h_seconds": 0.07985521766650756,
+            "mean_decode_duplex_seconds": 0.22723631428068206
+          },
+          "generated_ids": [
+            37727,
+            0,
+            1724,
+            481,
+            304,
+            1345,
+            340,
+            3571
+          ],
+          "generated_text": " Hello! How can I help you today"
+        },
+        {
+          "run": 2,
+          "summary": {
+            "swap_seconds": 7.232178499813017,
+            "h2d_seconds": 1.2571173135917035,
+            "d2h_seconds": 1.2612400512621642,
+            "duplex_seconds": 3.7712940997589612,
+            "h2d_bytes": 35866017792,
+            "d2h_bytes": 35866017792,
+            "swaps": 2073,
+            "seconds": 8.661215299995092,
+            "hits": 267,
+            "misses": 2073,
+            "mean_decode_seconds": 0.5150970857149721,
+            "mean_decode_swap_seconds": 0.4303198714146025,
+            "mean_decode_h2d_seconds": 0.07958916578545686,
+            "mean_decode_d2h_seconds": 0.0798282734637178,
+            "mean_decode_duplex_seconds": 0.22939324285835028
+          },
+          "generated_ids": [
+            37727,
+            0,
+            1724,
+            481,
+            304,
+            1345,
+            340,
+            3571
+          ],
+          "generated_text": " Hello! How can I help you today"
+        },
+        {
+          "run": 3,
+          "summary": {
+            "swap_seconds": 6.6933607001265045,
+            "h2d_seconds": 1.256612672986047,
+            "d2h_seconds": 1.26018357070327,
+            "duplex_seconds": 3.591273999576515,
+            "h2d_bytes": 35866017792,
+            "d2h_bytes": 35866017792,
+            "swaps": 2073,
+            "seconds": 7.929658099994413,
+            "hits": 267,
+            "misses": 2073,
+            "mean_decode_seconds": 0.5152555999988441,
+            "mean_decode_swap_seconds": 0.4309911428551589,
+            "mean_decode_h2d_seconds": 0.07956837952001587,
+            "mean_decode_d2h_seconds": 0.07981633288332222,
+            "mean_decode_duplex_seconds": 0.2295899142471691
+          },
+          "generated_ids": [
+            37727,
+            0,
+            1724,
+            481,
+            304,
+            1345,
+            340,
+            3571
+          ],
+          "generated_text": " Hello! How can I help you today"
+        }
+      ]
+    },
+    {
+      "slots": 156,
+      "host_slots": 1508,
+      "host_bytes": 26090668032,
+      "host_pinned": true,
+      "startup_seconds": 14.611500300001353,
+      "startup_routed_bytes": 28789702656,
+      "disk_read_bytes": 0,
+      "runtime_reader_requests": 0,
+      "runtime_source_read_attempts": 0,
+      "disk_guard_probes_passed": 2,
+      "file_descriptors_closed": true,
+      "partition_disjoint": true,
+      "partition_total_experts": 1664,
+      "arena_pointers_stable": true,
+      "device_allocated_bytes": 5365543424,
+      "runs": [
+        {
+          "run": 1,
+          "summary": {
+            "swap_seconds": 6.266349400000763,
+            "h2d_seconds": 1.1890336025320996,
+            "d2h_seconds": 1.1936617512293428,
+            "duplex_seconds": 3.351343300535518,
+            "h2d_bytes": 33945550848,
+            "d2h_bytes": 33945550848,
+            "swaps": 1962,
+            "seconds": 7.645918299996993,
+            "hits": 378,
+            "misses": 1962,
+            "mean_decode_seconds": 0.44740357142810744,
+            "mean_decode_swap_seconds": 0.3736122857153532,
+            "mean_decode_h2d_seconds": 0.07332444364817978,
+            "mean_decode_d2h_seconds": 0.0736396431470596,
+            "mean_decode_duplex_seconds": 0.20345762862208566
+          },
+          "generated_ids": [
+            37727,
+            0,
+            1724,
+            481,
+            304,
+            1345,
+            340,
+            3571
+          ],
+          "generated_text": " Hello! How can I help you today"
+        },
+        {
+          "run": 2,
+          "summary": {
+            "swap_seconds": 6.117574000090826,
+            "h2d_seconds": 1.2001057946476728,
+            "d2h_seconds": 1.2047475424856198,
+            "duplex_seconds": 3.3358597999613266,
+            "h2d_bytes": 34274279424,
+            "d2h_bytes": 34274279424,
+            "swaps": 1981,
+            "seconds": 7.248524900045595,
+            "hits": 359,
+            "misses": 1981,
+            "mean_decode_seconds": 0.44852522857503835,
+            "mean_decode_swap_seconds": 0.37370532860118794,
+            "mean_decode_h2d_seconds": 0.07330262412979884,
+            "mean_decode_d2h_seconds": 0.07354185065519493,
+            "mean_decode_duplex_seconds": 0.20371092857073694
+          },
+          "generated_ids": [
+            37727,
+            0,
+            1724,
+            481,
+            304,
+            1345,
+            340,
+            3571
+          ],
+          "generated_text": " Hello! How can I help you today"
+        },
+        {
+          "run": 3,
+          "summary": {
+            "swap_seconds": 6.234620400122367,
+            "h2d_seconds": 1.2004973781512893,
+            "d2h_seconds": 1.2043299714640465,
+            "duplex_seconds": 3.3700444002315635,
+            "h2d_bytes": 34274279424,
+            "d2h_bytes": 34274279424,
+            "swaps": 1981,
+            "seconds": 7.439702500007115,
+            "hits": 359,
+            "misses": 1981,
+            "mean_decode_seconds": 0.45886515714248943,
+            "mean_decode_swap_seconds": 0.3799730428654584,
+            "mean_decode_h2d_seconds": 0.07335382872443841,
+            "mean_decode_d2h_seconds": 0.07356828265608772,
+            "mean_decode_duplex_seconds": 0.2058557428795861
+          },
+          "generated_ids": [
+            37727,
+            0,
+            1724,
+            481,
+            304,
+            1345,
+            340,
+            3571
+          ],
+          "generated_text": " Hello! How can I help you today"
+        }
+      ]
+    }
+  ],
+  "prompt_ids": [
+    100000,
+    5726,
+    25,
+    37727,
+    185,
+    185,
+    77398,
+    25
+  ],
+  "timing": "CUDA event durations for PCIe directions; synchronized wall time for swap service"
+}

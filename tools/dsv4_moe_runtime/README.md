@@ -98,6 +98,15 @@ Defaults are the local `F:/AI/models/DeepSeek-V2-Lite-Chat` checkpoint, `cuda:0`
 answer. Override these with `--weights-dir`, `--device`, `--slots`,
 `--context-tokens` and `--max-new-tokens`.
 
+The validated decoder now uses a complete exclusive RAM/VRAM partition by
+default: all routed experts are loaded at startup, with 384 experts in VRAM
+and the remaining 1,280 experts in pinned host RAM. Generation never reopens
+checkpoint files. Use `--auto-slots` to size VRAM from the available device
+budget after backbone, shared experts, KV storage, transfer scratch and reserve.
+Insufficient combined memory fails at startup rather than falling back to disk.
+See [the exclusive hierarchy report](benchmarks/EXCLUSIVE_REPORT.md) for details,
+the bounded transfer-scratch exception and measured PCIe swap timings.
+
 The model backbone, shared weights and expert pool stay loaded for the whole
 session. History uses the checkpoint's native tokenizer template (`User:` and
 `Assistant:` in this checkpoint), including BOS and assistant EOS markers.

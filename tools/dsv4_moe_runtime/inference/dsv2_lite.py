@@ -21,6 +21,7 @@ from transformers import AutoTokenizer
 from ..core.config import DSV2_LITE_GEOMETRY
 from ..core.layout import ExpertTensorLayout
 from ..core.slot_pool import StaticExpertSlotPool
+from ..hardware.exclusive_partition import ExclusiveExpertPartition, plan_vram_slots
 from ..hardware.runtime import make_runtime
 from ..hardware.sharded_safetensors import SafetensorsShardIndex, ShardedSafetensorsExpertSource
 from .layer_dispatch import MoELayerScratch, execute_moe_layer
@@ -155,9 +156,18 @@ class V2LiteDecoder:
     """Fixed weight arenas with bounded expert offload and static expanded KV."""
 
     @torch.inference_mode()
-    def __init__(self, directory: Path, device: str = "cuda:0", slots: int = 64, capacity: int = 128):
+    def __init__(
+        self,
+        directory: Path,
+        device: str = "cuda:0",
+        slots: int | None = 64,
+        capacity: int = 128,
+        storage: str = "exclusive",
+    ):
         self.config, index, self.audit = audit_checkpoint(directory)
-        if capacity < 1 or slots < DSV2_LITE_GEOMETRY.top_k:
+        if storage not in ("exclusive", "disk"):
+            raise ValueError("storage must be exclusive or disk")
+        if capacity < 1 or (slots is not None and slots < DSV2_LITE_GEOMETRY.top_k):
             raise ValueError("capacity must be positive and slots must hold top-k")
         self.runtime = make_runtime(device)
         self.capacity = capacity
@@ -166,9 +176,17 @@ class V2LiteDecoder:
         layout = ExpertTensorLayout.for_dense_bf16(DSV2_LITE_GEOMETRY)
         shared = ExpertTensorLayout.for_shared_expert(DSV2_LITE_GEOMETRY, 2)
         kv_bytes = 27 * 16 * capacity * (192 + 128) * 2
-        needed = self.audit["backbone_bytes"] + self.audit["shared_bytes"] + slots * layout.slot_num_bytes + kv_bytes
+        fixed = self.audit["backbone_bytes"] + self.audit["shared_bytes"] + kv_bytes
         free = self.runtime.device_free_memory()
         reserve = 512 * 1024**2
+        total_experts = (self.config["num_hidden_layers"] - self.config["first_k_dense_replace"]) * self.config[
+            "n_routed_experts"
+        ]
+        if free is not None:
+            slots = plan_vram_slots(free, fixed, layout.slot_num_bytes, total_experts, reserve, slots)
+        elif slots is None:
+            raise ValueError("automatic VRAM sizing requires a device capacity query")
+        needed = fixed + slots * layout.slot_num_bytes
         if free is not None and needed + reserve > free:
             raise MemoryError(f"static plan {needed} bytes + {reserve} reserve exceeds free {free}")
         self.pool = StaticExpertSlotPool(
@@ -194,18 +212,31 @@ class V2LiteDecoder:
         self.keys = torch.empty(27, 16, capacity, 192, device=device, dtype=torch.bfloat16)
         self.values = torch.empty(27, 16, capacity, 128, device=device, dtype=torch.bfloat16)
         self.cos, self.sin, self.scale = yarn_tables(self.config, capacity, device)
+        if storage == "exclusive":
+            disk_source = self.source
+            try:
+                self.source = ExclusiveExpertPartition(
+                    self.runtime, layout, self.pool, sorted(disk_source.expert_spans), disk_source
+                )
+            except Exception:
+                disk_source.close()
+                raise
+        self.storage = storage
         self.runtime.synchronize_device()
         self.fingerprint = self.pointers()
         self.static_bytes = needed
 
     def pointers(self) -> tuple[int, ...]:
-        return (
+        pointers = (
             self.backbone.data_ptr(),
             self.pool.slot_arena.data_ptr(),
             self.keys.data_ptr(),
             self.values.data_ptr(),
             *self.scratch.fingerprint(),
         )
+        if isinstance(self.source, ExclusiveExpertPartition):
+            pointers += self.source.pointers()
+        return pointers
 
     def norm(self, x: torch.Tensor, name: str) -> torch.Tensor:
         weight = self.weights[name]
@@ -277,6 +308,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--weights-dir", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--storage", choices=("exclusive", "disk"), default="exclusive")
     parser.add_argument("--slots", type=int, default=64)
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--prompt", default="Hello")
@@ -297,7 +329,9 @@ def main() -> None:
     if hasattr(prompt, "keys"):
         prompt = prompt["input_ids"]
     started = time.perf_counter()
-    decoder = V2LiteDecoder(args.weights_dir, args.device, args.slots, len(prompt) + args.max_new_tokens)
+    decoder = V2LiteDecoder(
+        args.weights_dir, args.device, args.slots, len(prompt) + args.max_new_tokens, storage=args.storage
+    )
     load_seconds = time.perf_counter() - started
     try:
         latencies, generated = [], []
@@ -334,7 +368,10 @@ def main() -> None:
             "arena_pointers_stable": decoder.pointers() == decoder.fingerprint,
             "expert_loads": decoder.pool.stats.loads,
             "expert_hits": decoder.pool.stats.hits,
-            "bytes_streamed": decoder.source.bytes_streamed,
+            "bytes_streamed": (
+                decoder.source.bytes_streamed if args.storage == "disk" else decoder.source.disk_read_bytes
+            ),
+            "storage": args.storage,
             "execution": "eager attention + static BF16 expert dispatch; custom V4 FP4 kernel disabled",
         }
         args.report.write_text(json.dumps(report, indent=2))

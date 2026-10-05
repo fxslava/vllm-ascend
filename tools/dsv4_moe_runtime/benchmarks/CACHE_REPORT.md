@@ -1,5 +1,8 @@
 # Expert cache benchmark
 
+This report measures the legacy on-demand disk provider. The validated decoder
+now defaults to the [exclusive RAM/VRAM hierarchy](EXCLUSIVE_REPORT.md).
+
 Measured on the RTX 5070 using the real DeepSeek-V2-Lite-Chat BF16 checkpoint
 on the Samsung SSD 970 EVO Plus 1TB NVMe drive mounted as F:.
 Each configuration keeps one decoder and expert pool alive for three identical

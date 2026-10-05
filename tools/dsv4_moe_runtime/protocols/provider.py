@@ -12,6 +12,8 @@ from typing import Protocol, runtime_checkable
 
 import torch
 
+from .residency_policy import AdmissionDecision
+
 
 @runtime_checkable
 class WeightProviderProtocol(Protocol):
@@ -74,3 +76,12 @@ class WeightByteSource(Protocol):
     def read_param(self, layer_idx: int, expert_id: int, param_key: str) -> torch.Tensor:
         """Materialize one parameter's expected bytes (verification path)."""
         ...
+
+
+@runtime_checkable
+class ExclusiveSwapProviderProtocol(Protocol):
+    """Own the RAM partition and exchange the policy-selected VRAM victims."""
+
+    def exchange_admissions(self, decision: AdmissionDecision, pool: object) -> int: ...
+
+    def validate_residency(self, pool: object) -> None: ...

@@ -44,8 +44,8 @@ from ..core.config import DeepSeekV4MoEConfig
 from ..core.generational_policy import GenerationalRadixPolicy
 from ..core.layout import ExpertTensorLayout
 from ..hardware.exchange_buffer import TransitExchangeBuffer
-from ..protocols.provider import SlotFillProviderProtocol, WeightProviderProtocol
-from ..protocols.residency_policy import EvictionPolicyProtocol
+from ..protocols.provider import ExclusiveSwapProviderProtocol, SlotFillProviderProtocol, WeightProviderProtocol
+from ..protocols.residency_policy import AdmissionDecision, EvictionPolicyProtocol
 
 UNRESIDENT_SLOT_ID = -1
 
@@ -312,6 +312,24 @@ class StaticExpertSlotPool:
         self._policy.advance_generation(completed_token_idx)
         self._current_token = completed_token_idx + 1
 
+    def initialize_residency(self, keys: Sequence[tuple[int, int]]) -> None:
+        """Publish startup-filled slots without counting them as runtime misses."""
+        if self._residents or len(keys) != self._num_slots or len(set(keys)) != len(keys):
+            raise ValueError("startup residency must fill every empty routed slot with a unique key")
+        for layer, expert in keys:
+            if not 0 <= layer < self._config.num_layers or not 0 <= expert < self._config.num_routed_experts:
+                raise ValueError("startup expert key outside pool geometry")
+        admissions = tuple((key, slot) for slot, key in enumerate(keys))
+        self._policy.commit_decision(AdmissionDecision((), admissions, (), (), len(keys)))
+        self._free_slots.clear()
+        for key, slot in admissions:
+            self._residents[key] = slot
+            self._expert_slot_table[key[0], key[1]] = slot
+
+    def resident_keys(self) -> frozenset[tuple[int, int]]:
+        """Host residency snapshot for hierarchy integrity checks."""
+        return frozenset(self._residents)
+
     # ------------------------------------------------------- step acquisition
 
     def acquire_for_step(
@@ -411,6 +429,13 @@ class StaticExpertSlotPool:
         decision,
         host_pinned_storage: WeightProviderProtocol,
     ) -> None:
+        exclusive = isinstance(host_pinned_storage, ExclusiveSwapProviderProtocol)
+        exchanged_bytes = 0
+        if exclusive:
+            if self._exchange_buffer is not None:
+                raise ValueError("exclusive partition cannot also use a disk-backed transit cache")
+            exchanged_bytes = host_pinned_storage.exchange_admissions(decision, self)
+
         # 1. Transit staging: evicted slot bytes go to the pinned-DDR ring
         #    before the incoming expert overwrites the slot. The victim key is
         #    recorded so a re-request can hit the window instead of the source.
@@ -431,7 +456,14 @@ class StaticExpertSlotPool:
             del self._free_slots[-decision.free_slot_count :]
 
         # 3. Bytes: schema-driven fills, no per-projection duplication.
-        if isinstance(host_pinned_storage, SlotFillProviderProtocol):
+        if exclusive:
+            for key, slot in decision.admissions:
+                self._expert_slot_table[key[0], key[1]] = slot
+                self._residents[key] = slot
+            self.stats.bytes_staged += exchanged_bytes
+            self.stats.loads += len(decision.admissions)
+            host_pinned_storage.validate_residency(self)
+        elif isinstance(host_pinned_storage, SlotFillProviderProtocol):
             for key, slot in decision.admissions:
                 self._expert_slot_table[layer_idx, key[1]] = slot
                 self._residents[key] = slot

@@ -95,6 +95,7 @@ class _RawFileReader:
     """Positional byte-source abstraction over the three IO backends."""
 
     def __init__(self, path: str, mode: str):
+        self._closed = False
         self._path = path
         self._mode = mode
         self._fd: int | None = None
@@ -175,6 +176,8 @@ class _RawFileReader:
         The chunk must hold ``aligned_length`` bytes; the caller slices the
         valid head out of the chunk after the read (alignment head stays).
         """
+        if self._closed:
+            raise RuntimeError("disk reads are forbidden after reader shutdown")
         if aligned_length > chunk.numel():
             raise StreamingBackpressureError(f"chunk capacity {chunk.numel()} < aligned transfer {aligned_length}")
         if self._win_handle is not None:
@@ -212,6 +215,8 @@ class _RawFileReader:
 
     def mmap_view(self, file_offset: int, num_bytes: int) -> torch.Tensor:
         """Zero-copy read-only tensor view over the file bytes (kept alive)."""
+        if self._closed:
+            raise RuntimeError("disk mappings are forbidden after reader shutdown")
         aligned_offset = align_down(file_offset, mmap.ALLOCATIONGRANULARITY)
         mapped_len = min(
             align_up(file_offset - aligned_offset + num_bytes),
@@ -232,6 +237,8 @@ class _RawFileReader:
         tail falls back to a small page-cached read into chunk memory (a few
         KiB once per stream end, never a pool resize).
         """
+        if self._closed:
+            raise RuntimeError("disk reads are forbidden after reader shutdown")
         if self._tail_fd is None and self._tail_handle is None:
             if platform.system() == "Windows":
                 self._kernel32_tail = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -268,6 +275,7 @@ class _RawFileReader:
                 raise OSError(f"tail positional read short at {file_offset}: {read}/{num_bytes}")
 
     def close(self) -> None:
+        self._closed = True
         for stream in self._seek_streams.values():
             stream.close()  # closefd=False, so the descriptor itself survives to below
         self._seek_streams.clear()
@@ -376,6 +384,10 @@ class StreamingWeightLoader:
         Pipelined: up to ``len(chunks)`` read+copy windows are outstanding
         before the ring forces a stream synchronization. Returns bytes moved.
         """
+        if self._reader._closed:
+            raise RuntimeError("runtime disk reads are forbidden after loader shutdown")
+        if destination.dtype != torch.uint8 or not destination.is_contiguous():
+            raise ValueError("stream destination must be contiguous raw uint8 storage")
         if destination.numel() < num_bytes:
             raise ValueError(f"destination holds {destination.numel()} bytes < {num_bytes}")
         flat = destination.view(-1)[:num_bytes]
@@ -409,7 +421,7 @@ class StreamingWeightLoader:
                 if read_len > 0:
                     self._reader.read_into(chunk, aligned_offset, read_len)
                     covered = read_len - skip  # valid bytes inside the full sectors
-                    flat[moved : moved + covered].copy_(chunk[skip : skip + covered], non_blocking=True)
+                    self._copy_chunk(flat, moved, chunk, skip, covered)
                     moved += covered
                     offset += covered
                     self.bytes_read += covered
@@ -417,12 +429,19 @@ class StreamingWeightLoader:
                 else:  # sub-sector remainder: buffered tail path (page-cached)
                     tail_len = min(remaining, max(self._reader.size - offset, 0))
                     self._reader.read_tail_into(chunk, offset, tail_len)
-                    flat[moved : moved + tail_len].copy_(chunk[:tail_len], non_blocking=True)
+                    self._copy_chunk(flat, moved, chunk, 0, tail_len)
                     moved += tail_len
                     offset += tail_len
                     self.bytes_read += tail_len
         self._runtime.synchronize_stream(self._stream)
         return moved
+
+    @staticmethod
+    def _copy_chunk(destination, offset, chunk, skip, length) -> None:
+        if destination.device.type == "cpu":
+            ctypes.memmove(destination.data_ptr() + offset, chunk.data_ptr() + skip, length)
+        else:
+            destination[offset : offset + length].copy_(chunk[skip : skip + length], non_blocking=True)
 
     def synchronize(self) -> None:
         self._runtime.synchronize_stream(self._stream)

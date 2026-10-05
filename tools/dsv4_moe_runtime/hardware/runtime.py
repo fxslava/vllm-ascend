@@ -190,6 +190,11 @@ class CudaRuntime:
 
     def release_cache(self) -> None:
         torch.cuda.empty_cache()
+        # Cached page-locked blocks still count against physical host memory.
+        # Release unused blocks between complete hierarchy benchmark instances.
+        empty_host_cache = getattr(getattr(torch, "accelerator", None), "empty_host_cache", None)
+        if empty_host_cache is not None:
+            empty_host_cache()
 
     def reset_device(self) -> None:
         # Mirrors NpuRuntime: flush the cache and clear accumulated allocator

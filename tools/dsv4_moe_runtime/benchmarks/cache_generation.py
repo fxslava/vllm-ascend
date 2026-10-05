@@ -28,10 +28,13 @@ class CacheTrace:
         self.fill_seconds = 0.0
         self.acquisition_seconds = 0.0
         self.read_request_bytes = 0
+        self.read_seconds = 0.0
 
     def counted_read(self, original):
         def read(chunk, offset, length):
+            started = time.perf_counter()
             original(chunk, offset, length)
+            self.read_seconds += time.perf_counter() - started
             self.read_request_bytes += length
 
         return read
@@ -66,6 +69,7 @@ class CacheTrace:
             self.read_request_bytes,
         )
         self.requests = []
+        read_seconds_before = self.read_seconds
         self.fill_seconds = self.acquisition_seconds = 0.0
         decoder.runtime.synchronize_device()
         started = time.perf_counter()
@@ -92,6 +96,7 @@ class CacheTrace:
             pool_overhead_seconds=self.acquisition_seconds - self.fill_seconds,
             execution_and_host_seconds=elapsed - self.acquisition_seconds,
             hit_rate=delta[1] / (delta[0] + delta[1]),
+            read_service_seconds=self.read_seconds - read_seconds_before,
             experts=[list(key) for key in self.requests],
             resident_count=decoder.pool.resident_expert_count,
             allocated_bytes=decoder.runtime.memory_allocated(),
@@ -113,11 +118,12 @@ def summarize(rows):
         "payload_bytes": sum(row["payload_bytes"] for row in rows),
         "file_read_bytes": sum(row["file_read_bytes"] for row in rows),
         "read_request_bytes": sum(row["read_request_bytes"] for row in rows),
+        "read_service_seconds": sum(row["read_service_seconds"] for row in rows),
     }
 
 
 def benchmark(directory, slots, prompt, tokenizer, new_tokens):
-    decoder = V2LiteDecoder(directory, "cuda:0", slots, len(prompt) + new_tokens)
+    decoder = V2LiteDecoder(directory, "cuda:0", slots, len(prompt) + new_tokens, storage="disk")
     trace = CacheTrace(decoder)
     cold_allocated = decoder.runtime.memory_allocated()
     runs, frequency = [], Counter()
