@@ -84,6 +84,48 @@ PYTHONPATH=. python tools/dsv4_moe_runtime/bench_npu_offload_stress.py \
 
 ## Real model generation
 
+### Interactive chat
+
+From the repository root, launch the persistent RTX 5070 chat application:
+
+```powershell
+python -m tools.dsv4_moe_runtime.chat --slots 384
+```
+
+Direct execution with `python tools/dsv4_moe_runtime/chat.py` also works.
+Defaults are the local `F:/AI/models/DeepSeek-V2-Lite-Chat` checkpoint, `cuda:0`,
+384 routed slots, a 512-token context capacity and at most 64 new tokens per
+answer. Override these with `--weights-dir`, `--device`, `--slots`,
+`--context-tokens` and `--max-new-tokens`.
+
+The model backbone, shared weights and expert pool stay loaded for the whole
+session. History uses the checkpoint's native tokenizer template (`User:` and
+`Assistant:` in this checkpoint), including BOS and assistant EOS markers.
+Each turn resets KV visibility and replays retained history while the expert
+cache and monotonic eviction clock persist. Complete oldest conversation turns
+are discarded when history would exceed the context capacity; an oversized
+single prompt is rejected. Generation uses greedy decoding and streams text,
+stopping at the checkpoint EOS token or the configured output limit.
+
+Commands: `/reset` clears history while retaining expert weights; `/stats`
+prints routed pool occupancy and cumulative cache counters; `/exit` quits.
+Ctrl+C during generation cancels that answer without adding it to history.
+Per-answer stats count the full replayed prompt and emitted tokens (including
+EOS), wall time including prompt processing, generated tokens/sec over that
+wall time, and the turn's routed expert hit rate.
+
+For a non-interactive smoke test:
+
+```powershell
+python -m tools.dsv4_moe_runtime.chat --prompt Hello --max-new-tokens 8
+```
+
+Repeat `--prompt` to run several conversation turns in one process. The smoke
+test on RTX 5070 produced `Hello! How can I help you today`, with 8 prompt
+tokens, 8 generated tokens, 9.69 seconds elapsed and a 49.3% routed hit rate.
+
+### Single generation validation
+
 The BF16 V2-Lite decoder loads backbone weights into a fixed arena, reserves
 shared experts and KV storage, and executes routed experts through the slot pool.
 Attention uses an eager reference path with temporary allocations. See
