@@ -101,7 +101,7 @@ constexpr float SWIGLU_BETA = 1.0f;
 
 constexpr uint8_t STAGING_EVENT_ID = 3; // MTE2_V / V_MTE2 weight-staging ring
 constexpr uint8_t OUT_EVENT_ID = 4;     // V_MTE3 one-shot before CopyOut
-constexpr uint8_t X_EVENT_ID = 4;       // MTE2_V one-shot after the x load
+constexpr uint8_t X_EVENT_ID = 5;       // MTE2_V one-shot after the x load
 
 __aicore__ inline int64_t AlignUpBytes(int64_t bytes)
 {
@@ -184,6 +184,7 @@ private:
         pipe_->InitBuffer(mergeBuf2_, MAX_MERGE_ELEMS * 4);
         pipe_->InitBuffer(scalesF32Buf_, MAX_MERGE_ELEMS * 4);
         pipe_->InitBuffer(decMaskBuf_, AlignUpBytes(CHUNK_FLAT_ELEMS / FP4_PER_BYTE * 2));
+        pipe_->InitBuffer(downRowBuf_, AlignUpBytes(hidden_ * 2));
     }
 
     __aicore__ void WaitLoad()
@@ -538,7 +539,7 @@ private:
         LocalTensor<uint16_t> upRow = interRows[static_cast<uint32_t>(inter_)];
         LocalTensor<uint16_t> activatedRow = interRows[static_cast<uint32_t>(2 * inter_)];
         
-        LocalTensor<uint16_t> xBits = xBitsBuf_.Get<uint16_t>(); // Переиспользуем отработанный буфер
+        LocalTensor<uint16_t> downRow = downRowBuf_.Get<uint16_t>(); 
 
         CastBf16Boundary(gateRow.ReinterpretCast<bfloat16_t>(), gateAcc_, BF16_ROUND_MODE,
                          static_cast<uint32_t>(inter_));
@@ -547,7 +548,7 @@ private:
         CastBf16Boundary(activatedRow.ReinterpretCast<bfloat16_t>(), activated_, BF16_ROUND_MODE,
                          static_cast<uint32_t>(inter_));
                          
-        CastBf16Boundary(xBits.ReinterpretCast<bfloat16_t>(), downAcc_, BF16_ROUND_MODE,
+        CastBf16Boundary(downRow.ReinterpretCast<bfloat16_t>(), downAcc_, BF16_ROUND_MODE,
                          static_cast<uint32_t>(hidden_));
 
         SetFlag<HardEvent::V_MTE3>(OUT_EVENT_ID);
@@ -556,7 +557,7 @@ private:
         DataCopy(legOutGm_[LEG_W1], gateRow, inter_);
         DataCopy(legOutGm_[LEG_W3], upRow, inter_);
         DataCopy(activatedGmU16_, activatedRow, inter_);
-        DataCopy(legOutGm_[LEG_W2], xBits, hidden_);
+        DataCopy(legOutGm_[LEG_W2], downRow, hidden_);
 
         SetFlag<HardEvent::MTE3_V>(OUT_EVENT_ID);
         WaitFlag<HardEvent::MTE3_V>(OUT_EVENT_ID);
@@ -602,6 +603,7 @@ private:
     TBuf<TPosition::VECCALC> mergeBuf2_;
     TBuf<TPosition::VECCALC> scalesF32Buf_;
     TBuf<TPosition::VECCALC> decMaskBuf_;
+    TBuf<TPosition::VECCALC> downRowBuf_;
 };
 } // namespace Dsv4MoeExpertOp
 
