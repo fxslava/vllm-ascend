@@ -21,13 +21,14 @@
  * id 4: V_MTE3 output handoff and MTE3_V final output drain.
  * id 4: MTE2_V input handoff. IDs are distinct within each event namespace;
  * no helper calls an external event-using kernel. There are no scalar UB
- * data accesses and no S_* events. Vector arithmetic follows PIPE_V order.
+ * data accesses and no S_* events. Dependent arch220 vector operations have explicit PIPE_V barriers.
  * E8M0 255 is NaN, not infinity; 0 is the subnormal 2^-127.
  */
 
 #include "kernel_tiling/kernel_tiling.h"
 #include "kernel_operator.h"
 #include "dsv4_moe_expert_tiling_data.h"
+#include "dsv4_moe_expert_vector_compat.h"
 
 // Builds outside the standalone test project can use the legacy API names,
 // which remain available in CANN 9. The tests always supply the detected major.
@@ -38,6 +39,56 @@
 using namespace AscendC;
 
 namespace Dsv4MoeExpertOp {
+// A vector instruction may overlap its predecessor on arch220. With automatic
+// synchronization disabled, fence dependent RAW/WAR/WAW buffer accesses.
+__aicore__ inline void VectorDependencyBarrier()
+{
+#if __CCE_AICORE__ == 220
+    PipeBarrier<PIPE_V>();
+#endif
+}
+
+// Projection calls reuse staging buffers and event IDs. Drain every pipe at
+// arch220 phase boundaries before the next projection or activation starts.
+__aicore__ inline void PhaseDependencyBarrier()
+{
+#if __CCE_AICORE__ == 220
+    PipeBarrier<PIPE_ALL>();
+    SetMaskNorm();
+    ResetMask();
+    PipeBarrier<PIPE_ALL>();
+#endif
+}
+
+#if __CCE_AICORE__ == 220
+constexpr RoundMode BF16_ROUND_MODE = RoundMode::CAST_RINT;
+#else
+constexpr RoundMode BF16_ROUND_MODE = RoundMode::CAST_ROUND;
+#endif
+
+__aicore__ inline void CastToBf16(const LocalTensor<bfloat16_t>& dst,
+                                const LocalTensor<float>& src, uint32_t count)
+{
+#if __CCE_AICORE__ == 220
+    constexpr uint32_t FLOAT_LANES = 64;
+    const uint8_t repeats = static_cast<uint8_t>(count / FLOAT_LANES);
+    const uint32_t tail = count % FLOAT_LANES;
+    SetMaskNorm();
+    if (repeats != 0) {
+        Cast(dst, src, BF16_ROUND_MODE, static_cast<uint64_t>(FLOAT_LANES), repeats, {1, 1, 4, 8});
+        PipeBarrier<PIPE_V>();
+    }
+    if (tail != 0) {
+        const uint32_t base = repeats * FLOAT_LANES;
+        Cast(dst[base], src[base], BF16_ROUND_MODE, static_cast<uint64_t>(tail), 1, {1, 1, 4, 8});
+        PipeBarrier<PIPE_V>();
+    }
+    ResetMask();
+#else
+    Cast(dst, src, BF16_ROUND_MODE, count);
+#endif
+}
+
 __aicore__ inline void ReduceHalfBlock(const LocalTensor<float>& dst,
                                       const LocalTensor<float>& src, int32_t count)
 {
@@ -133,10 +184,15 @@ public:
     __aicore__ void Process()
     {
         CopyInX();
+        PhaseDependencyBarrier();
         ProjectLeg(LEG_W1, xFloat_, gateAcc_);    // unpack + gate GEMM
+        PhaseDependencyBarrier();
         ProjectLeg(LEG_W3, xFloat_, upAcc_);      // unpack + up GEMM
+        PhaseDependencyBarrier();
         ApplySwiGLU();
+        PhaseDependencyBarrier();
         ProjectLeg(LEG_W2, activated_, downAcc_); // unpack + down GEMM
+        PhaseDependencyBarrier();
         CopyOut();
     }
 
@@ -298,6 +354,7 @@ private:
                     Mul(products[highOff], products[highOff], xOdd, static_cast<uint32_t>(activeHalfCols));
                 }
 
+                VectorDependencyBarrier(); // all product rows are ready for reduction
                 // Zero first so the pow2 pad slots the merge tree pairs with are
                 // exact zero terms; the reduces then fill the real slots. The
                 // repeat reduction writes one value per aligned 32-byte slot. This avoids
@@ -309,6 +366,7 @@ private:
                 // fp32-exact to well under a bf16 ULP.
                 Duplicate(partRaw, 0.0f, static_cast<uint32_t>(MAX_MERGE_ELEMS * REDUCE_SLOT_ELEMS));
                 Duplicate(partHi, 0.0f, static_cast<uint32_t>(MAX_MERGE_ELEMS * REDUCE_SLOT_ELEMS));
+                VectorDependencyBarrier(); // initialisation must precede slot writes
                 const int64_t halfBlock = FP4_BLOCK / FP4_PER_BYTE;
                 for (int64_t r = 0; r < chunkRows; ++r)
                 {
@@ -323,15 +381,22 @@ private:
                                         static_cast<int32_t>(halfBlock));
                     }
                 }
+                VectorDependencyBarrier(); // all aligned reduction slots are ready
                 // Gather only the first float of each aligned 32-byte reduction slot.
                 LocalTensor<int32_t> offsets = scalesF32Buf_.Get<int32_t>();
-                CreateVecIndex(offsets, static_cast<int32_t>(0), static_cast<uint32_t>(MAX_MERGE_ELEMS));
+                CreateGatherIndices(offsets, static_cast<uint32_t>(MAX_MERGE_ELEMS));
+                // Gather offsets are bytes: one 32-byte slot, not eight bytes.
                 ShiftLeft(offsets, offsets, REDUCE_SLOT_BYTE_SHIFT, static_cast<uint32_t>(MAX_MERGE_ELEMS));
+#if __CCE_AICORE__ == 220
+                PipeBarrier<PIPE_V>();
+#endif
                 Gather(merge1, partRaw, offsets.ReinterpretCast<uint32_t>(), 0,
                        static_cast<uint32_t>(MAX_MERGE_ELEMS));
                 Gather(merge2, partHi, offsets.ReinterpretCast<uint32_t>(), 0,
                        static_cast<uint32_t>(MAX_MERGE_ELEMS));
+                VectorDependencyBarrier(); // Gather must finish before reusing partRaw
                 Add(partRaw, merge1, merge2, static_cast<uint32_t>(MAX_MERGE_ELEMS));
+                VectorDependencyBarrier(); // DecodeScales reuses both merge inputs
 
                 // Apply the E8M0 scale to the compact partials. Post-reduce is
                 // For finite, normal-range operands the scale is a power of two, so
@@ -341,6 +406,7 @@ private:
                 SetFlag<HardEvent::V_MTE2>(STAGING_EVENT_ID);  // re-arm after the last staging-buffer read
                 const LocalTensor<float> scaleF32 = scalesF32Buf_.Get<float>();
                 Mul(partRaw, partRaw, scaleF32, static_cast<uint32_t>(chunkScales));
+                VectorDependencyBarrier();
 
                 // Balanced merge of the per-block partials; the final level lands
                 // in the leg accumulator's row slice.
@@ -350,15 +416,18 @@ private:
                 {
                     SplitColumns(merge1, merge2, cur, static_cast<uint32_t>(mergeLen));
                     Add(cur, merge1, merge2, static_cast<uint32_t>(mergeLen / 2));
+                    VectorDependencyBarrier();
                     mergeLen /= 2;
                 }
                 SplitColumns(merge1, merge2, cur, static_cast<uint32_t>(mergeLen));
                 Add(merge1, merge1, merge2, static_cast<uint32_t>(chunkRows));
+                VectorDependencyBarrier();
                 Add(accRow, accRow, merge1, static_cast<uint32_t>(chunkRows));
+                VectorDependencyBarrier();
             }
 
             WaitFlag<HardEvent::MTE3_V>(ROW_EVENT_ID);  // previous row store retired
-            Cast(rowBf16.ReinterpretCast<bfloat16_t>(), accRow, RoundMode::CAST_ROUND, static_cast<uint32_t>(chunkRows));
+            CastToBf16(rowBf16.ReinterpretCast<bfloat16_t>(), accRow, static_cast<uint32_t>(chunkRows));
             SetFlag<HardEvent::V_MTE3>(ROW_EVENT_ID);
             WaitFlag<HardEvent::V_MTE3>(ROW_EVENT_ID);  // MTE3 may read the row
             DataCopyPad(legOutGm_[legIndex][row0], rowBf16, DataCopyParams{1, static_cast<uint16_t>(chunkRows * 2), 0, 0});
@@ -397,11 +466,16 @@ private:
         // arch220 has no DeInterleave; stageA is dead at both split call sites.
         LocalTensor<int32_t> offsets = stageABuf_.Get<int32_t>();
         const uint32_t halfCount = count / FP4_PER_BYTE;
-        CreateVecIndex(offsets, 0, halfCount);
+        CreateGatherIndices(offsets, halfCount);
+        // Gather uses byte offsets: 2*i*sizeof(float), then one float later.
         ShiftLeft(offsets, offsets, 3, halfCount);
+        PipeBarrier<PIPE_V>();
         Gather(even, src, offsets.ReinterpretCast<uint32_t>(), 0, halfCount);
+        PipeBarrier<PIPE_V>();
         Adds(offsets, offsets, static_cast<int32_t>(sizeof(float)), halfCount);
+        PipeBarrier<PIPE_V>();
         Gather(odd, src, offsets.ReinterpretCast<uint32_t>(), 0, halfCount);
+        PipeBarrier<PIPE_V>();
 #else
         DeInterleave(even, odd, src, static_cast<int32_t>(count));
 #endif
@@ -416,7 +490,7 @@ private:
     //                  = float bits ((e+126)<<23) | (m<<22)
     //   sign bit 3 OR-ed in last -- orthogonal to the magnitude bits, and it
     //   turns code 8 into -0.0 exactly as the table demands.
-    // Every op below is PIPE_V; no barriers (in-order pipe).
+    // Every op below is PIPE_V; arch220 dependencies are fenced explicitly.
     __aicore__ void DecodeCodes(const LocalTensor<uint8_t> &packed, const LocalTensor<int32_t> &codes,
                                 const LocalTensor<int32_t> &stageA, const LocalTensor<int32_t> &stageB,
                                 const LocalTensor<int32_t> &stageC, const LocalTensor<uint8_t> &decMask,
@@ -443,13 +517,18 @@ private:
 #if __CCE_AICORE__ == 220
         // All byte values are exactly representable in both floating formats.
         Cast(stageB.template ReinterpretCast<half>(), packed, RoundMode::CAST_NONE, byteCount);
+        VectorDependencyBarrier();
         Cast(stageC.template ReinterpretCast<float>(), stageB.template ReinterpretCast<half>(),
              RoundMode::CAST_NONE, byteCount);
+        VectorDependencyBarrier();
         Cast(stageA, stageC.template ReinterpretCast<float>(), RoundMode::CAST_RINT, byteCount);
+        VectorDependencyBarrier();
 #else
         LocalTensor<uint16_t> wide = stageB.template ReinterpretCast<uint16_t>();
         Cast(wide, packed, RoundMode::CAST_NONE, byteCount);
+        VectorDependencyBarrier();
         Cast(stageA.template ReinterpretCast<uint32_t>(), wide, RoundMode::CAST_NONE, byteCount);
+        VectorDependencyBarrier();
 #endif
 
         // Split the nibbles. Byte i holds element 2i in the low nibble and
@@ -460,54 +539,78 @@ private:
         // 32-byte blocks, not by elements. ProjectLeg pairs each half with the
         // matching half of x instead.
         Duplicate(stageB, 0x0F, byteCount);
+        VectorDependencyBarrier();
         BitAnd(codes, stageA, stageB, byteCount);                     // low nibbles
+        VectorDependencyBarrier();
         ShiftRight(codes[byteCount], stageA, 4, byteCount);        // high nibbles (byte < 256)
+        VectorDependencyBarrier();
 
         // Everything below keys on the MAGNITUDE code c & 7, not on c: codes
         // 8..15 are the negatives of 0..7 and must take the same magnitude
         // path. Keying on c sends code 9 down the normal branch and decodes it
         // to 0.75 instead of -0.5.
         Duplicate(stageC, 7, count);
+        VectorDependencyBarrier();
         BitAnd(stageB, codes, stageC, count);                         // stageB = magnitude code
+        VectorDependencyBarrier();
 
         // Normal magnitudes (>= 2): bits = ((e + 126) << 23) | (m << 22),
         // e = mag >> 1 (already in [0, 3], no mask needed), m = mag & 1.
         ShiftRight(stageA, stageB, 1, count);
+        VectorDependencyBarrier();
         Adds(stageA, stageA, 126, count);
+        VectorDependencyBarrier();
         ShiftLeft(stageA, stageA, 23, count);
+        VectorDependencyBarrier();
         Duplicate(stageC, 1, count);
+        VectorDependencyBarrier();
         BitAnd(stageC, stageB, stageC, count);                        // m -- must be masked:
+        VectorDependencyBarrier();
         ShiftLeft(stageC, stageC, 22, count);                      // shifting the whole code
+        VectorDependencyBarrier();
         BitOr(stageA, stageA, stageC, count);                         // corrupts the exponent
+        VectorDependencyBarrier();
 
         // Magnitude 1 -> +0.5, magnitude 0 -> +0.0. Tensor-TENSOR selects: the
         // else-branch has to preserve stageA. With a scalar else-branch every
         // normal code is overwritten by that scalar, which erases the whole
         // block above and leaves the output all but zero.
         Duplicate(stageC, E2M1_HALF_BITS, count);
+        VectorDependencyBarrier();
         CompareScalarCompat(decMask, stageB, int32_t{1}, CMPMODE::EQ, count);
+        VectorDependencyBarrier();
 #if __CCE_AICORE__ == 220
         Select(stageA.template ReinterpretCast<float>(), decMask, stageC.template ReinterpretCast<float>(),
                stageA.template ReinterpretCast<float>(), SELMODE::VSEL_TENSOR_TENSOR_MODE, count);
+        VectorDependencyBarrier();
 #else
         Select(stageA, decMask, stageC, stageA, SELMODE::VSEL_TENSOR_TENSOR_MODE, count);
+        VectorDependencyBarrier();
 #endif
         Duplicate(stageC, E2M1_ZERO_BITS, count);
+        VectorDependencyBarrier();
         CompareScalarCompat(decMask, stageB, int32_t{0}, CMPMODE::EQ, count);
+        VectorDependencyBarrier();
 #if __CCE_AICORE__ == 220
         Select(stageA.template ReinterpretCast<float>(), decMask, stageC.template ReinterpretCast<float>(),
                stageA.template ReinterpretCast<float>(), SELMODE::VSEL_TENSOR_TENSOR_MODE, count);
+        VectorDependencyBarrier();
 #else
         Select(stageA, decMask, stageC, stageA, SELMODE::VSEL_TENSOR_TENSOR_MODE, count);
+        VectorDependencyBarrier();
 #endif
 
         // Sign: bit 3 of the original code into bit 31, which also turns code 8
         // into -0.0. The result lands in `codes` -- the int32 alias of the
         // products buffer -- so the float view downstream sees these patterns.
         Duplicate(stageC, 8, count);
+        VectorDependencyBarrier();
         BitAnd(stageC, codes, stageC, count);
+        VectorDependencyBarrier();
         ShiftLeft(stageC, stageC, 28, count);
+        VectorDependencyBarrier();
         BitOr(codes, stageA, stageC, count);
+        VectorDependencyBarrier();
     }
 
     // E8M0 byte vector -> fp32 power-of-two vector, in place via the i32 view:
@@ -530,25 +633,37 @@ private:
         LocalTensor<uint8_t> special = decMaskBuf_.Get<uint8_t>();
 #if __CCE_AICORE__ == 220
         Cast(mergeBuf2_.Get<half>(), scales, RoundMode::CAST_NONE, count);
+        VectorDependencyBarrier();
         Cast(mergeBuf1_.Get<float>(), mergeBuf2_.Get<half>(), RoundMode::CAST_NONE, count);
+        VectorDependencyBarrier();
         Cast(bits, mergeBuf1_.Get<float>(), RoundMode::CAST_RINT, count);
+        VectorDependencyBarrier();
 #else
         LocalTensor<uint32_t> bitsU32 = scalesF32Buf_.Get<uint32_t>();
         LocalTensor<uint16_t> wide = mergeBuf2_.Get<uint16_t>();
         Cast(wide, scales, RoundMode::CAST_NONE, count);
+        VectorDependencyBarrier();
         Cast(bitsU32, wide, RoundMode::CAST_NONE, count);
+        VectorDependencyBarrier();
 #endif
         Adds(wrap, bits, 1, count);                      // b + 1 (1..256)
+        VectorDependencyBarrier();
         Duplicate(scratch, 0xFF, count);
+        VectorDependencyBarrier();
         BitAnd(wrap, wrap, scratch, count);                 // wrap to the u8 domain
+        VectorDependencyBarrier();
 #if __CCE_AICORE__ == 220
         // arch220 integer compares support EQ only; [0,255] converts exactly.
         Cast(scratch.ReinterpretCast<float>(), wrap, RoundMode::CAST_NONE, count);
+        VectorDependencyBarrier();
         CompareScalarCompat(special, scratch.ReinterpretCast<float>(), 2.0f, CMPMODE::LT, count);
+        VectorDependencyBarrier();
 #else
         CompareScalarCompat(special, wrap, int32_t{2}, CMPMODE::LT, count);
+        VectorDependencyBarrier();
 #endif
         ShiftLeft(bits, bits, 23, count);                // exact power-of-two bits
+        VectorDependencyBarrier();
 
         // Build the fixup DELTA, then add it. The Select's destination is the
         // scratch, not `bits`: selecting straight into `bits` with a scalar
@@ -560,14 +675,18 @@ private:
         //   b = 0x00: 0            + 0x00400000 = 2^-127, the fp32 subnormal
         //   b = 0xFF: 0x7F800000   + 0x00400000 = 0x7FC00000, the OCP MX NaN
         Duplicate(scratch, static_cast<int32_t>(SUBNORMAL_BITS), count);
+        VectorDependencyBarrier();
 #if __CCE_AICORE__ == 220
         Select(scratch.ReinterpretCast<float>(), special, scratch.ReinterpretCast<float>(), 0.0f,
                SELMODE::VSEL_TENSOR_SCALAR_MODE, count);
+        VectorDependencyBarrier();
 #else
         Select(scratch, special, scratch, static_cast<int32_t>(ZERO_BITS), SELMODE::VSEL_TENSOR_SCALAR_MODE,
                count);
+        VectorDependencyBarrier();
 #endif
         Add(bits, bits, scratch, count);
+        VectorDependencyBarrier();
     }
 
     // activated = silu(clamp(gate)) * up, entirely on PIPE_V.
@@ -577,10 +696,9 @@ private:
     // range, so the inf path an unclamped kernel relies on -- 1/(1+inf)
     // evaluating to exactly 0 -- never arises.
     //
-    // No PipeBarrier between the three calls: PIPE_V is in-order, and a
-    // barrier between consecutive vector instructions only flushes the pipe.
-    // No flags either: gate/up are vector-produced and activated is
-    // vector-consumed, so there is no heterogeneous boundary in this stage.
+    // arch220 needs barriers along the clamp/activation/rounding dependency
+    // chain when automatic synchronization is off. Cross-pipe flags are not
+    // needed here because both producers and consumers use PIPE_V.
     __aicore__ void ApplySwiGLU()
     {
         const uint32_t count = static_cast<uint32_t>(inter_);
@@ -595,15 +713,20 @@ private:
         // whenever hidden > inter.
         LocalTensor<float> clampedGate = xFloatBuf_.Get<float>(count);
         Mins(clampedGate, gateAcc_, swigluLimit_, count);
+        VectorDependencyBarrier();
         Maxs(clampedGate, clampedGate, -swigluLimit_, count);
+        VectorDependencyBarrier();
         // MEASURED, and it is the opposite of what the reference's clamping
         // pattern suggests: SwiGLU(dst, s0, s1, beta, n) computes
         // s0 * swish(s1) -- the swish is applied to the SECOND source.
         SwiGLU<float, false>(activated_, upAcc_, clampedGate, SWIGLU_BETA, count);
+        VectorDependencyBarrier();
         // Preserve FP32 gate/up until activation, then round the down operand to BF16.
         LocalTensor<bfloat16_t> rounded = interRowBuf_.Get<bfloat16_t>(count);
-        Cast(rounded, activated_, RoundMode::CAST_ROUND, count);
+        CastToBf16(rounded, activated_, count);
+        VectorDependencyBarrier();
         Cast(activated_, rounded, RoundMode::CAST_NONE, count);
+        VectorDependencyBarrier();
     }
 
     __aicore__ void CopyOut()
@@ -617,10 +740,9 @@ private:
         LocalTensor<uint16_t> gateRow = interRows;
         LocalTensor<uint16_t> upRow = interRows[static_cast<uint32_t>(inter_)];
         LocalTensor<uint16_t> activatedRow = interRows[static_cast<uint32_t>(2 * inter_)];
-        Cast(gateRow.ReinterpretCast<bfloat16_t>(), gateAcc_, RoundMode::CAST_ROUND, static_cast<uint32_t>(inter_));
-        Cast(upRow.ReinterpretCast<bfloat16_t>(), upAcc_, RoundMode::CAST_ROUND, static_cast<uint32_t>(inter_));
-        Cast(activatedRow.ReinterpretCast<bfloat16_t>(), activated_, RoundMode::CAST_ROUND,
-             static_cast<uint32_t>(inter_));
+        CastToBf16(gateRow.ReinterpretCast<bfloat16_t>(), gateAcc_, static_cast<uint32_t>(inter_));
+        CastToBf16(upRow.ReinterpretCast<bfloat16_t>(), upAcc_, static_cast<uint32_t>(inter_));
+        CastToBf16(activatedRow.ReinterpretCast<bfloat16_t>(), activated_, static_cast<uint32_t>(inter_));
         // One handshake covers all three rows (down_out left per-chunk).
         SetFlag<HardEvent::V_MTE3>(OUT_EVENT_ID);
         WaitFlag<HardEvent::V_MTE3>(OUT_EVENT_ID);
