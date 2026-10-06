@@ -43,6 +43,20 @@ build_out/
 # (Docker volume mount points at /workspace/build_sim and /workspace/build_npu).
 /build_sim/
 /build_npu/
+# dsv4_moe_expert 910B bring-up trees: cross-compiled sim/npu builds, CAModel
+# traces and the static-analyzer scratch artifacts (CANN 8.0.0 aarch64).
+/build_910b_test/
+/build_sim_910b/
+# CMake/Ninja scratch output, wherever a configure drops it.
+CMakeCache.txt
+CMakeFiles/
+CMakeScratch/
+cmake_install.cmake
+CTestTestfile.cmake
+DartConfiguration.tcl
+.ninja_deps
+.ninja_log
+*.o
 # tools/tq_longbench/build_turboquant_ops.py output (built per host and SoC).
 /tools/tq_longbench/lib/
 !csrc/cmake/third_party/build/
