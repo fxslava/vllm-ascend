@@ -10,9 +10,10 @@ extern "C" __global__ __aicore__ void dsv4_gather_index_probe(GM_ADDR input, GM_
     TBuf<TPosition::VECCALC> sourceBuf, offsetsBuf, gatheredBuf;
     constexpr uint32_t SOURCE_COUNT = 2048;
     constexpr uint32_t MAX_COUNT = 256;
+    constexpr uint32_t MAX_BYTE_COUNT = 2048;
     pipe.InitBuffer(sourceBuf, SOURCE_COUNT * sizeof(float));
-    pipe.InitBuffer(offsetsBuf, MAX_COUNT * sizeof(int32_t));
-    pipe.InitBuffer(gatheredBuf, MAX_COUNT * sizeof(float));
+    pipe.InitBuffer(offsetsBuf, MAX_BYTE_COUNT * sizeof(int32_t));
+    pipe.InitBuffer(gatheredBuf, MAX_BYTE_COUNT * sizeof(float));
     auto source = sourceBuf.Get<float>();
     auto offsets = offsetsBuf.Get<int32_t>();
     auto gathered = gatheredBuf.Get<float>();
@@ -56,6 +57,28 @@ extern "C" __global__ __aicore__ void dsv4_gather_index_probe(GM_ADDR input, GM_
     DataCopy(outputGm[outputBase + MAX_COUNT], gathered.ReinterpretCast<uint32_t>(), MAX_COUNT);
     SetFlag<HardEvent::MTE3_V>(reuseEvent);
     WaitFlag<HardEvent::MTE3_V>(reuseEvent);
+    outputBase += 2 * MAX_COUNT;
+
+    // All 256 byte values, in each packed-word position, including high-bit
+    // patterns that would become NaNs if widening used floating arithmetic.
+    const auto refillEvent = pipe.FetchEventID(HardEvent::V_MTE2);
+    SetFlag<HardEvent::V_MTE2>(refillEvent);
+    WaitFlag<HardEvent::V_MTE2>(refillEvent);
+    DataCopy(source, inputGm[SOURCE_COUNT], MAX_BYTE_COUNT / sizeof(float));
+    SetFlag<HardEvent::MTE2_V>(loadEvent);
+    WaitFlag<HardEvent::MTE2_V>(loadEvent);
+    for (uint32_t count = 8; count <= MAX_BYTE_COUNT; count *= 2) {
+        Duplicate(gathered.ReinterpretCast<int32_t>(), int32_t{0x7FC00000}, MAX_BYTE_COUNT);
+        PipeBarrier<PIPE_V>();
+        Dsv4MoeExpertOp::WidenBytes32(gathered.ReinterpretCast<int32_t>(),
+                                     source.ReinterpretCast<uint8_t>(), offsets, count);
+        SetFlag<HardEvent::V_MTE3>(storeEvent);
+        WaitFlag<HardEvent::V_MTE3>(storeEvent);
+        DataCopy(outputGm[outputBase], gathered.ReinterpretCast<uint32_t>(), count);
+        outputBase += count;
+        SetFlag<HardEvent::MTE3_V>(reuseEvent);
+        WaitFlag<HardEvent::MTE3_V>(reuseEvent);
+    }
 }
 
 #ifndef ASCENDC_CPU_DEBUG

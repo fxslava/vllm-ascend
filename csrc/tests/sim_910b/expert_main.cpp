@@ -66,6 +66,14 @@ int main()
         std::printf("%s FpDiff=%lld BF16_ULP Mismatch=%zu Specials=%zu SpecialMismatch=%zu\n",
             NAMES[k], static_cast<long long>(metrics.fp_diff), metrics.mismatch, specials,
             metrics.special_mismatch);
+        if (metrics.mismatch != 0) {
+            constexpr size_t DIAGNOSTIC_COUNT = 8;
+            for (size_t i = 0; i < actual.size() && i < DIAGNOSTIC_COUNT; ++i) {
+                std::printf("  %s[%zu] actual=0x%04x (%g) expected=0x%04x (%g)\n",
+                    NAMES[k], i, static_cast<unsigned>(actual[i]), dsv4::Bf16BitsToFloat(actual[i]),
+                    static_cast<unsigned>(golden[k][i]), dsv4::Bf16BitsToFloat(golden[k][i]));
+            }
+        }
         failures += metrics.fp_diff > dsv4::kDeviceMaxUlp || metrics.mismatch != 0 || specials != 0;
     }
     for (auto buffer : buffers) {

@@ -31,11 +31,25 @@ Both kernels compile with `-Werror --cce-auto-sync=off`; host tests also use
 `-Wall -Wextra -Werror`. CTest applies a 900-second timeout to each test.
 Use separate log directories so CAModel traces do not overwrite one another.
 
+When running the ARM64 toolkit through QEMU in an x86 container, include the
+installed ARM64 runtime libraries in `LD_LIBRARY_PATH` for both compilation
+and simulation. Also include the build directory's `lib` subdirectory when
+launching the executables from a separate log directory.
+
 The index test poisons scratch before generating lengths 8, 16, 32, 64, 128 and
 256. It checks exact integer offsets and gathered float bits for 32-byte
 reduction slots and odd-column addresses. Gather's offset tensor contains
 **bytes**, including for `LocalTensor<float>`; see the
 [CANN 8.0.0 Gather contract](https://www.hiascend.com/document/detail/en/canncommercial/800/apiref/ascendcopapi/atlasascendc_api_07_0092.html).
+
+The same test checks integer byte widening at lengths 8 through 2048, including
+every byte value in every packed-word position. The destination is poisoned
+before each call. The arch220 decoder widens with integer Gather and masked
+shifts; it uses no intermediate FP16 conversion. Integer predicates expand to
+full-word masks before masking FP32 encodings. CANN 8's 16-bit And/Or backend
+is invoked for both halves of each 32-bit word to avoid partial-word updates.
+Decode predicates reuse the full-sized decode stages, not the smaller packed
+predicate buffer.
 
 The expert test uses hidden=64, inter=64 and seed=704 with finite inputs. It
 compares all four BF16 outputs to the CPU oracle and requires at most two ULP,

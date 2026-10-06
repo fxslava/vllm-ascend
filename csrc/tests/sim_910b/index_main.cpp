@@ -19,11 +19,16 @@ extern "C" void dsv4_gather_index_probe_launch(void* stream, void* input, void* 
 int main()
 {
     constexpr size_t SOURCE_COUNT = 2048;
-    constexpr size_t OUTPUT_COUNT = 1520;
-    std::array<float, SOURCE_COUNT> input{};
+    constexpr size_t MAX_BYTE_COUNT = 2048;
+    constexpr size_t OUTPUT_COUNT = 1520 + 2 * MAX_BYTE_COUNT - 8;
+    std::array<float, SOURCE_COUNT + MAX_BYTE_COUNT / sizeof(float)> input{};
     std::array<uint32_t, OUTPUT_COUNT> output{};
-    for (size_t i = 0; i < input.size(); ++i) {
+    for (size_t i = 0; i < SOURCE_COUNT; ++i) {
         input[i] = static_cast<float>(i) + 0.25f;
+    }
+    auto* packedBytes = reinterpret_cast<uint8_t*>(input.data() + SOURCE_COUNT);
+    for (size_t i = 0; i < MAX_BYTE_COUNT; ++i) {
+        packedBytes[i] = static_cast<uint8_t>((i / 4 + 67 * (i % 4)) & 0xFF);
     }
     ACL_CHECK(aclInit(nullptr));
     ACL_CHECK(aclrtSetDevice(0));
@@ -60,6 +65,15 @@ int main()
     }
     check(256, 2 * sizeof(float), sizeof(float));
     std::printf("Gather indices (8..256): Mismatch=%u Specials=%u\n", mismatches, specials);
+    unsigned wideningMismatches = 0;
+    for (size_t count = 8; count <= MAX_BYTE_COUNT; count *= 2) {
+        for (size_t i = 0; i < count; ++i) {
+            wideningMismatches += output[base + i] != packedBytes[i];
+        }
+        base += count;
+    }
+    mismatches += wideningMismatches;
+    std::printf("Integer byte widening (8..2048): Mismatch=%u\n", wideningMismatches);
     ACL_CHECK(aclrtFree(deviceInput));
     ACL_CHECK(aclrtFree(deviceOutput));
     ACL_CHECK(aclrtDestroyStream(stream));

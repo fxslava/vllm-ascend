@@ -51,4 +51,75 @@ __aicore__ inline void CreateGatherIndices(const AscendC::LocalTensor<int32_t>& 
 #endif
 }
 
+// CANN 8 arch220 calcount And/Or issue 16-bit instructions even for int32
+// tensors. Cover BOTH halves of every word; no floating-point conversion.
+__aicore__ inline void BitAnd32(const AscendC::LocalTensor<int32_t>& dst,
+                              const AscendC::LocalTensor<int32_t>& lhs,
+                              const AscendC::LocalTensor<int32_t>& rhs, uint32_t count)
+{
+#if __CCE_AICORE__ == 220
+    AscendC::And(dst.ReinterpretCast<uint16_t>(), lhs.ReinterpretCast<uint16_t>(),
+                 rhs.ReinterpretCast<uint16_t>(), count * 2);
+#else
+    AscendC::And(dst, lhs, rhs, count);
+#endif
+}
+
+__aicore__ inline void BitOr32(const AscendC::LocalTensor<int32_t>& dst,
+                             const AscendC::LocalTensor<int32_t>& lhs,
+                             const AscendC::LocalTensor<int32_t>& rhs, uint32_t count)
+{
+#if __CCE_AICORE__ == 220
+    AscendC::Or(dst.ReinterpretCast<uint16_t>(), lhs.ReinterpretCast<uint16_t>(),
+                rhs.ReinterpretCast<uint16_t>(), count * 2);
+#else
+    AscendC::Or(dst, lhs, rhs, count);
+#endif
+}
+
+#if __CCE_AICORE__ == 220
+// Expand bytes using only integer lanes. Gather duplicates each packed word
+// four times, then masked shifts align its four bytes with their output lanes.
+// Callers provide separate dst/scratch tensors, count divisible by eight,
+// and a 32-byte-aligned source containing at least count bytes.
+__aicore__ inline void WidenBytes32(const AscendC::LocalTensor<int32_t>& dst,
+                                  const AscendC::LocalTensor<uint8_t>& src,
+                                  const AscendC::LocalTensor<int32_t>& scratch, uint32_t count)
+{
+    using namespace AscendC;
+    constexpr uint32_t LANES_PER_REPEAT = 64;
+    constexpr uint32_t BYTE_BITS = 8;
+    constexpr uint32_t WORD_BYTES = sizeof(int32_t);
+    constexpr uint64_t BYTE_LANE_MASKS[WORD_BYTES - 1] = {
+        0x2222222222222222ULL, 0x4444444444444444ULL, 0x8888888888888888ULL
+    };
+    CreateGatherIndices(scratch, count);
+    ShiftRight(scratch, scratch, 2, count);
+    PipeBarrier<PIPE_V>();
+    ShiftLeft(scratch, scratch, 2, count);
+    PipeBarrier<PIPE_V>();
+    Gather(dst, src.ReinterpretCast<int32_t>(), scratch.ReinterpretCast<uint32_t>(), 0, count);
+    PipeBarrier<PIPE_V>();
+    const uint8_t repeats = static_cast<uint8_t>(count / LANES_PER_REPEAT);
+    const uint32_t tail = count % LANES_PER_REPEAT;
+    for (uint32_t byte = 1; byte < WORD_BYTES; ++byte) {
+        uint64_t mask[2] = {BYTE_LANE_MASKS[byte - 1], 0};
+        uint64_t tailMask[2] = {mask[0] & ((uint64_t{1} << tail) - 1), 0};
+        const int32_t shift = static_cast<int32_t>(byte * BYTE_BITS);
+        if (repeats != 0) {
+            ShiftRight(dst, dst, shift, mask, repeats, {1, 1, 8, 8});
+        }
+        if (tailMask[0] != 0) {
+            const uint32_t base = repeats * LANES_PER_REPEAT;
+            ShiftRight(dst[base], dst[base], shift, tailMask, 1, {1, 1, 8, 8});
+        }
+        PipeBarrier<PIPE_V>();
+    }
+    Duplicate(scratch, int32_t{0xFF}, count);
+    PipeBarrier<PIPE_V>();
+    BitAnd32(dst, dst, scratch, count);
+    PipeBarrier<PIPE_V>();
+}
+#endif
+
 } // namespace Dsv4MoeExpertOp

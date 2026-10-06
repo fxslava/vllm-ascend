@@ -56,13 +56,14 @@ arch35; the shipping kernel now selects these paths with `__CCE_AICORE__ == 220`
 
 - DeInterleave is replaced by vector Gather with byte offsets for even/odd
   FP32 lanes, including every reduction-tree level.
-- Byte widening uses uint8 to half to float to int32. All values in [0,255]
-  are exact through these conversions; unsupported unsigned integer casts
-  are excluded.
-- Select operates on FP32 views of bit-pattern buffers, because arch220 Select
-  supports half/float rather than INT32 data operands.
-- INT32 equality predicates remain supported. The scale-special less-than
-  predicate converts [0,255] exactly to FP32 before comparison.
+- Byte widening uses integer Gather to repeat packed 32-bit words, masked
+  right shifts to align each byte, and a full-word AND with 255. No intermediate
+  half-precision or floating-point conversion is used.
+- E2M1 and E8M0 predicates use INT32 bounds, subtraction, and bitwise masks.
+  Boolean values expand to all-zero or all-one words before masking IEEE-754
+  fields. The arch220 decoder does not use Select or FP32 predicate views.
+- E2M1 mask scratch reuses full-sized decode stages. The packed predicate
+  buffer is too small to hold an INT32 predicate for every decoded weight.
 - And/Or use UINT16 views with twice the INT32 element count. The installed
   arch220 calcount implementation reinterprets INT32 as 16-bit lanes without
   doubling the mask count, which otherwise leaves half the buffer untouched.
