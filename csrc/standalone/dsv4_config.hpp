@@ -224,6 +224,14 @@ inline constexpr size_t kSlotRegionAlignBytes = 128;
 // 64-byte on-chip D2D copy requirement and the FP4 / E8M0 block strides.
 inline constexpr size_t kArenaAlignBytes = 512;
 
+// Alignment the simulated device allocation hands out. aclrtMalloc with
+// ACL_MEM_MALLOC_HUGE_FIRST serves page-aligned (in practice huge-page-aligned)
+// memory, and the arena contract is stated on ABSOLUTE descriptor addresses, so
+// the simulator must guarantee at least the finest alignment any reservation
+// asks for -- the smoke test checks a 4096-byte reservation on its absolute
+// address, not just its offset.
+inline constexpr size_t kSimDeviceAllocAlignBytes = 4096;
+
 // ---------------------------------------------------------------------------
 // MoE execution path
 // ---------------------------------------------------------------------------

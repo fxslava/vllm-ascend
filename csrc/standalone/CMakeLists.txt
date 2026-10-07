@@ -202,8 +202,14 @@ if(DSV4_WERROR)
   target_compile_options(dsv4_core PRIVATE -Werror)
 endif()
 
-foreach(_devlib IN LISTS DSV4_CANN_DEVLIB_DIRS)
-  target_link_options(dsv4_core PUBLIC "LINKER:-rpath-link,${_devlib}")
+# The toolkit lib64 dirs go on -rpath-link too: the linker must walk the full
+# DT_NEEDED closure (libnnopbase -> libgraph_base -> libge_common_base ->
+# libascend_protobuf, libruntime -> liberror_manager, ...) to verify that every
+# symbol the CANN shared libraries reference is defined somewhere. Without it
+# the link fails with hundreds of undefined ge::/protobuf symbols that all live
+# in sibling lib64 .so files.
+foreach(_dir IN LISTS DSV4_CANN_LIB_DIRS DSV4_CANN_DEVLIB_DIRS)
+  target_link_options(dsv4_core PUBLIC "LINKER:-rpath-link,${_dir}")
 endforeach()
 
 # -----------------------------------------------------------------------------

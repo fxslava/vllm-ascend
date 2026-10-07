@@ -41,9 +41,10 @@ aclrtMemcpyKind ToAclKind(MemcpyKind kind) {
   }
 }
 
-void* AlignedHostAlloc(size_t bytes) {
-  const size_t rounded = ((bytes + kArenaAlignBytes - 1) / kArenaAlignBytes) * kArenaAlignBytes;
-  return std::aligned_alloc(kArenaAlignBytes, rounded);
+// std::aligned_alloc demands a size that is a multiple of the alignment.
+void* AlignedHostAlloc(size_t bytes, size_t alignment = kArenaAlignBytes) {
+  const size_t rounded = ((bytes + alignment - 1) / alignment) * alignment;
+  return std::aligned_alloc(alignment, rounded);
 }
 
 }  // namespace
@@ -221,8 +222,10 @@ void* SimulatedDeviceOps::DeviceMalloc(size_t bytes) {
   DSV4_REQUIRE(device_memory_used_ + bytes <= device_memory_bytes_,
                "simulated device memory exhausted: requested "
                    << bytes << " with " << (device_memory_bytes_ - device_memory_used_) << " free");
-  void* pointer = AlignedHostAlloc(bytes);
+  void* pointer = AlignedHostAlloc(bytes, kSimDeviceAllocAlignBytes);
   DSV4_REQUIRE(pointer != nullptr, "simulated device allocation of " << bytes << " bytes failed");
+  DSV4_REQUIRE(reinterpret_cast<uintptr_t>(pointer) % kSimDeviceAllocAlignBytes == 0,
+               "simulated device allocation is not page-aligned");
   device_memory_used_ += bytes;
   device_blocks_.emplace_back(static_cast<const char*>(pointer), bytes);
   ++counters_.device_allocations;

@@ -742,7 +742,8 @@ void Dsv4Pipeline::CreateDescriptors() {
 // ---------------------------------------------------------------------------
 
 PipelineStage& Dsv4Pipeline::stage(const char* name) {
-  for (PipelineStage& entry : stages_) {
+  for (size_t i = 0; i < stage_count_; ++i) {
+    PipelineStage& entry = stages_[i];
     if (std::strcmp(entry.name, name) == 0) {
       return entry;
     }
@@ -751,7 +752,8 @@ PipelineStage& Dsv4Pipeline::stage(const char* name) {
 }
 
 const PipelineStage& Dsv4Pipeline::stage(const char* name) const {
-  for (const PipelineStage& entry : stages_) {
+  for (size_t i = 0; i < stage_count_; ++i) {
+    const PipelineStage& entry = stages_[i];
     if (std::strcmp(entry.name, name) == 0) {
       return entry;
     }
@@ -779,14 +781,14 @@ void Dsv4Pipeline::PlanStages() {
   }
   ops_.RequireAll(required);
 
-  // StaticOpSlot is not movable, so the vector must never reallocate.
-  stages_.reserve(32);
+  // The stage vector is born at full capacity (StaticOpSlot is not movable,
+  // see stages_ in the header); planning only fills slots in place.
   auto add = [&](const char* name, OpId op) -> PipelineStage& {
-    DSV4_REQUIRE(stages_.size() < stages_.capacity(), "pipeline stage capacity exceeded at " << name);
-    stages_.emplace_back();
-    stages_.back().name = name;
-    stages_.back().op = op;
-    return stages_.back();
+    DSV4_REQUIRE(stage_count_ < kMaxPipelineStages, "pipeline stage capacity exceeded at " << name);
+    PipelineStage& entry = stages_[stage_count_++];
+    entry.name = name;
+    entry.op = op;
+    return entry;
   };
   auto adopt = [&](PipelineStage& entry, uint64_t workspace, aclOpExecutor* executor) {
     arena_.NoteWorkspace(workspace);
@@ -1291,11 +1293,12 @@ int32_t Dsv4Pipeline::ReadArgmaxToken() {
 
 std::string Dsv4Pipeline::DescribeStages() const {
   std::ostringstream out;
-  out << "pipeline: " << stages_.size() << " planned stages, replayed " << kNumLayers
+  out << "pipeline: " << stage_count_ << " planned stages, replayed " << kNumLayers
       << " times with address swaps (MoE path: "
       << (config_.moe_path == MoePath::kFused ? "fused" : "decomposed") << ")\n";
   uint64_t high_water = 0;
-  for (const PipelineStage& entry : stages_) {
+  for (size_t i = 0; i < stage_count_; ++i) {
+    const PipelineStage& entry = stages_[i];
     out << "  " << std::left << std::setw(20) << entry.name << std::right << std::setw(40) << OpName(entry.op)
         << "  workspace=" << std::setw(10) << entry.slot.workspace_size() << "\n";
     high_water = std::max(high_water, entry.slot.workspace_size());

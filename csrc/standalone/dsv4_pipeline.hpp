@@ -231,9 +231,14 @@ class Dsv4Pipeline {
   DeviceStream readback_stream_ = nullptr;
   DeviceEvent compute_done_ = nullptr;
 
-  // `stages_` holds StaticOpSlot, which is move-disabled, so the vector is
-  // reserved once and never reallocates.
-  std::vector<PipelineStage> stages_;
+  // `stages_` holds StaticOpSlot, which is move-disabled -- not even
+  // std::vector::reserve compiles for it, because libstdc++'s reallocation path
+  // move-empties a zero-size vector. The vector is therefore born at full
+  // capacity and only the first `stage_count_` entries are live; it is never
+  // resized or copied again.
+  static constexpr size_t kMaxPipelineStages = 32;
+  std::vector<PipelineStage> stages_ = std::vector<PipelineStage>(kMaxPipelineStages);
+  size_t stage_count_ = 0;
   StepCounters counters_;
 
   // Shapes, fixed at construction from the config.

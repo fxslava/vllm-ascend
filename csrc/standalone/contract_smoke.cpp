@@ -94,8 +94,8 @@ void TestExpertLayout() {
   // The number the Python layout's docstring states for this geometry.
   Check(layout.slot_num_bytes() == 13369344,
         "DSV4-Flash slot is 13,369,344 bytes (12.75 MiB), matching core/layout.py");
-  Check(layout.slot_num_bytes() * kTotalRoutedExperts == 147170156544ull,
-        "the whole routed set is 147,170,156,544 bytes (137.07 GiB) over 11,008 experts");
+  Check(layout.slot_num_bytes() * kTotalRoutedExperts == 147169738752ull,
+        "the whole routed set is 147,169,738,752 bytes (137.07 GiB) over 11,008 experts");
 
   size_t covered = 0;
   bool aligned = true;
