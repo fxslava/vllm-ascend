@@ -23,12 +23,20 @@
 // ---------------------------------------------------------------------------
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
 #define DSV4_ARCH_C220 1
-#elif defined(__CCE_AICORE__) && __CCE_AICORE__ != 310 && \
-    !(defined(ASCENDC_CPU_DEBUG) && ASCENDC_CPU_DEBUG == 1)
+#define DSV4_ARCH_C310 0
+#elif defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+#define DSV4_ARCH_C220 0
+#define DSV4_ARCH_C310 1
+#elif defined(__CCE_AICORE__) && !(defined(ASCENDC_CPU_DEBUG) && ASCENDC_CPU_DEBUG == 1)
 #error "dsv4_moe_expert supports __CCE_AICORE__ 220 (Ascend910B) and 310 (Ascend950) only"
 #endif
+// Both stay 0 on a pass that names no core generation, so such a pass takes
+// the regbase code path and the conservative toolkit default below.
 #ifndef DSV4_ARCH_C220
 #define DSV4_ARCH_C220 0
+#endif
+#ifndef DSV4_ARCH_C310
+#define DSV4_ARCH_C310 0
 #endif
 
 namespace Dsv4MoeExpertOp {

@@ -19,17 +19,22 @@
 #include "dsv4_moe_expert_vector_compat.h"
 
 // WholeReduceSum/CompareScalar (CANN 8) versus ReduceRepeat/Compares (CANN 9)
-// is a toolkit difference, not a hardware one, so the build passes the major
-// version in and csrc/tests/cmake/CannVersion.cmake detects it. The regbase
-// core ships no CANN 8 toolkit, so a dav-c220 build is the only one that can
-// still be CANN 8: the fallback follows the target rather than assuming the
-// older toolkit everywhere. Without this an op-package build that forgets the
-// macro would compile the CANN 8 reduction path for the Ascend950.
+// is a toolkit difference, not a hardware one, so every build should pass the
+// major version to BOTH compilations ascendc_library does;
+// csrc/tests/cmake/CannVersion.cmake detects it and
+// csrc/tests/ascendc/CMakeLists.txt forwards it.
+//
+// The fallback below is for a build that does not. The regbase core ships no
+// CANN 8 toolkit, so naming dav-c310 settles it at 9. Everything else -- a
+// dav-c220 target, or a pass that names no core generation at all, such as the
+// host stub -- takes 8, because the CANN 8 spellings also exist in CANN 9.2
+// while the CANN 9 ones do not exist in CANN 8. Guessing 9 for a pass that
+// cannot tell would break the CANN 8.0.0 build in csrc/tests/sim_910b.
 #ifndef CANN_VERSION_MAJOR
-#if DSV4_ARCH_C220
-#define CANN_VERSION_MAJOR 8
-#else
+#if DSV4_ARCH_C310
 #define CANN_VERSION_MAJOR 9
+#else
+#define CANN_VERSION_MAJOR 8
 #endif
 #endif
 

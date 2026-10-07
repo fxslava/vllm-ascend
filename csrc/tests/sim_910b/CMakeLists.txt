@@ -18,8 +18,16 @@ include("${ASCEND_CANN_PACKAGE_PATH}/tikcpp/ascendc_kernel_cmake/ascendc.cmake")
 
 ascendc_library(dsv4_expert SHARED ../common/dsv4_moe_expert_kernels.cpp)
 ascendc_library(dsv4_indices SHARED index_kernel.cpp)
+# CANN_VERSION_MAJOR has to reach both compilations ascendc_library does, not
+# just the device precompile: the host stub parses the same headers and picks
+# ReduceRepeat or WholeReduceSum on it. ascendc_compile_definitions feeds the
+# device side only, so the host side needs the forwarded -D as well -- and both
+# must come from ONE ascendc_compile_options call, because a second call
+# overwrites rather than appends the host half. See the note in
+# ../ascendc/CMakeLists.txt.
 foreach(kernel dsv4_expert dsv4_indices)
-    ascendc_compile_options(${kernel} PRIVATE --cce-auto-sync=off -Werror)
+    ascendc_compile_options(${kernel} PRIVATE --cce-auto-sync=off -Werror
+        -forward-options-to-host-compiler -DCANN_VERSION_MAJOR=8)
     ascendc_compile_definitions(${kernel} PRIVATE CANN_VERSION_MAJOR=8)
 endforeach()
 

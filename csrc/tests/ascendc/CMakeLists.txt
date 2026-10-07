@@ -96,24 +96,85 @@ message(STATUS "vllm-ascend tests: Ascend C RUN_MODE=${RUN_MODE}, SOC_VERSION=${
 
 include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 
+# -----------------------------------------------------------------------------
+# One ascendc_compile_options call per target, enforced by going through here
+# -----------------------------------------------------------------------------
+#
+# ascendc_compile_options does not treat its two halves alike
+# (legacy_modules/function.cmake). Device options accumulate:
+#
+#   get_target_property(CUSTOM_OPTIONS ${target}_interface OPTIONS)
+#   list(APPEND CUSTOM_OPTIONS ${CUSTOM_KERNEL_OPTIONS_LIST})
+#
+# while the host half is assigned:
+#
+#   set_target_properties(${target}_interface PROPERTIES
+#                         HOST_COMPILE_OPTIONS "${HOST_COMPILE_OPTIONS_LIST}")
+#
+# so a SECOND call drops whatever the first one forwarded with
+# -forward-options-to-host-compiler, and nothing says so. ascendc_library
+# compiles each source twice, and the device half is fed separately by
+# ascendc_compile_definitions, which does accumulate -- so the two halves end
+# up disagreeing about which macros are defined. That produced a library whose
+# device kernel and launcher were both present
+# (aclrtlaunch_turboquant_mm_fused_decode_nounpack_kv4fp8_half) while the
+# host-side entry point that calls them had been preprocessed away, and
+# bench_device_950pr_turboquant failed with `undefined reference to
+# vllm_ascend::turboquant_mm_fused_decode_nounpack_impl` after the whole suite
+# had compiled clean.
+#
+# DEFINITIONS are therefore given to both compilations, which is what a kernel
+# source sharing headers with its host launcher always wants. DEVICE_OPTIONS
+# are device-only extras. Call this exactly once per target and never call
+# ascendc_compile_options or ascendc_compile_definitions directly.
+function(vllm_ascend_ascendc_target_flags target)
+  cmake_parse_arguments(FLAGS "" "" "DEVICE_OPTIONS;DEFINITIONS" ${ARGN})
+  if(FLAGS_UNPARSED_ARGUMENTS)
+    message(FATAL_ERROR
+      "vllm_ascend_ascendc_target_flags(${target}): unexpected ${FLAGS_UNPARSED_ARGUMENTS}; "
+      "use DEFINITIONS for macros both compilations need and DEVICE_OPTIONS for device-only flags")
+  endif()
+
+  # The whole point of routing through here is that there is one call. Say so
+  # at configure time rather than leaving a link error for whoever adds the
+  # second one.
+  get_property(already_set GLOBAL PROPERTY vllm_ascend_ascendc_flags_${target})
+  if(already_set)
+    message(FATAL_ERROR
+      "vllm_ascend_ascendc_target_flags(${target}) called twice. The second call would "
+      "discard the first one's host-forwarded defines and leave the device and host "
+      "compilations disagreeing about which macros are set. Add to the single call instead.")
+  endif()
+  set_property(GLOBAL PROPERTY vllm_ascend_ascendc_flags_${target} TRUE)
+
+  set(host_defines -DCANN_VERSION_MAJOR=${CANN_VERSION_MAJOR})
+  foreach(definition ${FLAGS_DEFINITIONS})
+    list(APPEND host_defines "-D${definition}")
+  endforeach()
+
+  ascendc_compile_definitions(${target} PRIVATE
+    CANN_VERSION_MAJOR=${CANN_VERSION_MAJOR} ${FLAGS_DEFINITIONS})
+  ascendc_compile_options(${target} PRIVATE
+    --cce-auto-sync=off -Werror ${FLAGS_DEVICE_OPTIONS}
+    -forward-options-to-host-compiler ${host_defines})
+endfunction()
+
 # Unquoted on purpose: VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE is a list of
 # sources, and quoting it would hand ascendc_library one semicolon-joined path.
 if(VLLM_ASCEND_TESTS_BUILD_TURBOQUANT_KERNELS)
 ascendc_library(vllm_ascend_turboquant SHARED
   ${VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE})
 
-# The Cube kernels only the suite launches: the kv3fp4 / kv5fp8 fused decode and cache write, and the fp8
-# GEMM probe (op_kernel/turboquant_fused_decode.cpp). The root CMakeLists.txt does not set this, so the
-# wheel ships the kv4fp8 kernels alone; those compile identically either way.
+# VLLM_ASCEND_TQ_TEST_KERNELS gates the Cube kernels only the suite launches: the kv3fp4 / kv5fp8 fused
+# decode and cache write, and the fp8 GEMM probe (op_kernel/turboquant_fused_decode.cpp). The root
+# CMakeLists.txt does not set it, so the wheel ships the kv4fp8 kernels alone; those compile identically
+# either way.
 #
-# It takes two calls because ascendc_library compiles the source twice. ascendc_compile_definitions reaches
-# the device precompile only -- alone, it builds the kernels and their launchers but not the host-side
-# *_impl functions that call them, and the tests fail to link. The host stub's flags come from
-# host_intf_pub, which only ascendc_compile_options feeds, through -forward-options-to-host-compiler.
-ascendc_compile_definitions(vllm_ascend_turboquant PRIVATE VLLM_ASCEND_TQ_TEST_KERNELS)
-ascendc_compile_options(vllm_ascend_turboquant PRIVATE
-  --cce-auto-sync=off -Werror
-  -forward-options-to-host-compiler -DVLLM_ASCEND_TQ_TEST_KERNELS)
+# It has to reach BOTH compilations ascendc_library does. The device precompile needs it for the kernels
+# and their launchers; the host stub needs it for the *_impl entry points that call them, which are inside
+# the same guard. Passing it as DEFINITIONS is what covers both -- see the note on
+# vllm_ascend_ascendc_target_flags above for what happens when only one side gets it.
+vllm_ascend_ascendc_target_flags(vllm_ascend_turboquant DEFINITIONS VLLM_ASCEND_TQ_TEST_KERNELS)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -128,7 +189,7 @@ endif()
 if(VLLM_ASCEND_TESTS_BUILD_DSV4_KERNELS)
   ascendc_library(vllm_ascend_dsv4_moe_expert SHARED
     "${CMAKE_CURRENT_SOURCE_DIR}/../common/dsv4_moe_expert_kernels.cpp")
-  ascendc_compile_options(vllm_ascend_dsv4_moe_expert PRIVATE --cce-auto-sync=off -Werror)
+  vllm_ascend_ascendc_target_flags(vllm_ascend_dsv4_moe_expert)
   message(STATUS "vllm-ascend tests: DSV4 MoE expert kernel RUN_MODE=${RUN_MODE}, SOC_VERSION=${SOC_VERSION}")
 endif()
 
@@ -146,16 +207,6 @@ if(VLLM_ASCEND_TESTS_TIER_SIM AND SOC_VERSION STREQUAL "Ascend950PR_9599")
   add_custom_target(moe_unpack_probe_epoch
     COMMAND "${CMAKE_COMMAND}" -E touch "${probe_epoch}")
   add_dependencies(vllm_ascend_moe_unpack_probe_precompile moe_unpack_probe_epoch)
-  ascendc_compile_options(vllm_ascend_moe_unpack_probe PRIVATE
-    --cce-auto-sync=off -Werror -include "${probe_epoch}")
+  vllm_ascend_ascendc_target_flags(vllm_ascend_moe_unpack_probe
+    DEVICE_OPTIONS -include "${probe_epoch}")
 endif()
-
-# Ascend C's ExternalProject compilations do not inherit the parent directory's
-# definitions. Feed both device precompilation and the host launcher compiler.
-foreach(kernel_target vllm_ascend_dsv4_moe_expert vllm_ascend_turboquant vllm_ascend_moe_unpack_probe)
-  if(TARGET ${kernel_target})
-    ascendc_compile_definitions(${kernel_target} PRIVATE CANN_VERSION_MAJOR=${CANN_VERSION_MAJOR})
-    ascendc_compile_options(${kernel_target} PRIVATE
-      -forward-options-to-host-compiler -DCANN_VERSION_MAJOR=${CANN_VERSION_MAJOR})
-  endif()
-endforeach()

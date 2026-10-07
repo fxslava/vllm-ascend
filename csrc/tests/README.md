@@ -450,6 +450,43 @@ The inventory printed at start-up tells you what resolved:
 ...
 ```
 
+### Kernel-library macros reach two compilations, and only one of them accumulates
+
+`ascendc_library` compiles each kernel source twice -- once for the device and
+once for the host stub that holds the `*_impl` launchers -- and CANN's
+`ascendc_compile_options` treats the two halves differently
+(`legacy_modules/function.cmake`). Device options are appended to the target's
+`OPTIONS` property; the host half is **assigned** to `HOST_COMPILE_OPTIONS`. So
+a second `ascendc_compile_options` call on the same target silently drops
+whatever the first forwarded with `-forward-options-to-host-compiler`, and the
+two compilations end up disagreeing about which macros are defined.
+
+The failure does not look like a macro problem. The device kernel and its
+launcher are both present in the `.so`, the whole suite compiles clean, and
+then one binary fails to link:
+
+```
+undefined reference to `vllm_ascend::turboquant_mm_fused_decode_nounpack_impl(...)'
+```
+
+with `nm -DC lib/libvllm_ascend_turboquant.so | grep nounpack` showing
+`aclrtlaunch_turboquant_mm_fused_decode_nounpack_kv4fp8_half` defined and the
+host entry point that calls it absent.
+
+Every kernel target therefore goes through `vllm_ascend_ascendc_target_flags`
+in `ascendc/CMakeLists.txt`, which issues exactly one call and refuses a second
+at configure time. Pass a macro both compilations need as `DEFINITIONS`;
+`DEVICE_OPTIONS` is for device-only flags. `sim_910b/CMakeLists.txt` is a
+separate project and forwards `CANN_VERSION_MAJOR` by hand for the same reason.
+
+To check a kernel library by hand after a toolkit change:
+
+```bash
+nm -DC lib/libvllm_ascend_turboquant.so | grep -E "vllm_ascend::turboquant_.*_impl" | sort
+```
+
+Every `*_impl` declared in `common/turboquant_launch.hpp` should appear as `T`.
+
 ---
 
 ## Profiling with msprof
