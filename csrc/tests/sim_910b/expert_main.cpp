@@ -3,6 +3,7 @@
 #include <acl/acl.h>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #include "dsv4_moe_expert_launch.hpp"
@@ -16,13 +17,18 @@
     } \
 } while (0)
 
-int main()
+int main(int argc, char **argv)
 {
     namespace dsv4 = vllm_ascend::test::dsv4;
-    constexpr int64_t HIDDEN = 64;
-    constexpr int64_t INTER = 64;
-    constexpr uint32_t SEED = 704;
-    const auto problem = dsv4::MakeDeviceProblem(HIDDEN, INTER, SEED);
+    // Defaults keep the committed micro regression; the CLI arguments let the
+    // CAModel suite climb toward the production geometries (hidden 704..7168,
+    // inter 2048) that the physical-device gtest tier targets.
+    const int64_t hidden = argc > 1 ? std::atoll(argv[1]) : 64;
+    const int64_t inter = argc > 2 ? std::atoll(argv[2]) : 64;
+    const uint32_t seed = argc > 3 ? static_cast<uint32_t>(std::atoll(argv[3])) : 704;
+    std::printf("geometry hidden=%lld inter=%lld seed=%u\n",
+        static_cast<long long>(hidden), static_cast<long long>(inter), seed);
+    const auto problem = dsv4::MakeDeviceProblem(hidden, inter, seed);
     const auto tiling = problem.Tiling();
     const auto golden = dsv4::Golden(problem);
     const std::array<const void*, 7> inputs = {
@@ -32,8 +38,8 @@ int main()
     const std::array<size_t, 13> sizes = {
         problem.x.size() * sizeof(uint16_t), problem.w1.size(), problem.w2.size(), problem.w3.size(),
         problem.w1_scale.size(), problem.w2_scale.size(), problem.w3_scale.size(),
-        INTER * sizeof(uint16_t), INTER * sizeof(uint16_t), INTER * sizeof(uint16_t),
-        HIDDEN * sizeof(uint16_t), 32, sizeof(tiling)
+        inter * sizeof(uint16_t), inter * sizeof(uint16_t), inter * sizeof(uint16_t),
+        hidden * sizeof(uint16_t), 32, sizeof(tiling)
     };
     std::array<void*, 13> buffers{};
     ACL_CHECK(aclInit(nullptr));
@@ -60,8 +66,15 @@ int main()
                              ACL_MEMCPY_DEVICE_TO_HOST));
         const auto metrics = dsv4::CompareBf16(actual, golden[k]);
         size_t specials = 0;
-        for (auto bits : actual) {
-            specials += !std::isfinite(dsv4::Bf16BitsToFloat(bits));
+        size_t worstIdx = 0;
+        long long worstUlp = 0;
+        for (size_t i = 0; i < actual.size(); ++i) {
+            specials += !std::isfinite(dsv4::Bf16BitsToFloat(actual[i]));
+            const long long ulp = dsv4::Bf16UlpDistance(actual[i], golden[k][i]);
+            if (ulp > worstUlp) {
+                worstUlp = ulp;
+                worstIdx = i;
+            }
         }
         std::printf("%s FpDiff=%lld BF16_ULP Mismatch=%zu Specials=%zu SpecialMismatch=%zu\n",
             NAMES[k], static_cast<long long>(metrics.fp_diff), metrics.mismatch, specials,
@@ -73,6 +86,10 @@ int main()
                     NAMES[k], i, static_cast<unsigned>(actual[i]), dsv4::Bf16BitsToFloat(actual[i]),
                     static_cast<unsigned>(golden[k][i]), dsv4::Bf16BitsToFloat(golden[k][i]));
             }
+            std::printf("  %s worst[%zu] actual=0x%04x (%g) expected=0x%04x (%g) ulp=%lld\n",
+                NAMES[k], worstIdx, static_cast<unsigned>(actual[worstIdx]),
+                dsv4::Bf16BitsToFloat(actual[worstIdx]), static_cast<unsigned>(golden[k][worstIdx]),
+                dsv4::Bf16BitsToFloat(golden[k][worstIdx]), worstUlp);
         }
         failures += metrics.fp_diff > dsv4::kDeviceMaxUlp || metrics.mismatch != 0 || specials != 0;
     }

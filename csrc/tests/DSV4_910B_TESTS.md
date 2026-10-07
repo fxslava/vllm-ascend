@@ -87,6 +87,35 @@ inter=2048. It reports FpDiff (maximum BF16 ULP distance) and RateDiff (fraction
 exceeding 2 ULP) for all four buffers, requiring <=2 ULP and <=0.01 respectively.
 NaN/Inf results are compared by classification and infinity sign.
 
+### CAModel full-size validation (2026-10-07)
+
+The standalone `test_dsv4_expert` binary accepts `hidden inter seed` arguments
+(defaults 64 64 704) so the CAModel can run production geometries directly; the
+pass gates are FpDiff <= 2, zero mismatches, zero non-finite outputs. Measured
+under CAModel (CANN 8.0.0, Ascend910B1 sim):
+
+- hidden=64/inter=64: all four buffers FpDiff=0, exact parity (~3 min).
+- hidden=704/inter=2048: all four buffers FpDiff=0, exact parity (~5 h).
+- The exact-parity path is a chain-accumulator reduction: each 64-row pass
+  decodes one four-column block and accumulates the columns sequentially
+  (even 2k then odd 2k+1) in ping-pong fp32 sums, reproducing the host
+  oracle's accumulation order bit-for-bit. The down row leaves through one
+  bulk cast+copy in CopyOut (the chain leg no longer stores per-chunk).
+  Bring-up on the CANN 8.0.0 arch220 calcount backend exposed toolchain
+  hazards that shaped the design, all now encoded in the op's structure:
+  plain 1D DataCopy GM->UB no-ops at blockLen 1 and 16 while DataCopyPad
+  blockLen 2/16 work; Gather mis-executes with unaligned byte offsets and
+  self-tramples when its destination aliases its offset tensor; calcount
+  ops at counts outside the verified envelope (below 8, or above 256 for
+  the decode/ALU ops) silently mis-execute, so every op above runs at a
+  count the tree kernel already verified; long-lived UB views must be
+  rebuilt per block because interposed gathers trample them.
+- 576/4096/7168 geometries: pending CAModel runs (hours to days each).
+
+Per-geometry runs need separate CAMODEL_LOG_PATH directories. The runtime
+LD_LIBRARY_PATH must include /opt/arm64-libs:/usr/aarch64-linux-gnu/lib for
+the aarch64 bisheng and simulator under QEMU.
+
 Cases cover 20 repeated launches, six distinct streams with private HBM storage
 over ten rounds, both gate saturation signs beyond +/-100, isolated exhaustive
 packed-byte decoding in both nibble positions, a finite scale sweep including
