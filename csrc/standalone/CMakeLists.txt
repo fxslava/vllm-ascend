@@ -55,6 +55,10 @@
 cmake_minimum_required(VERSION 3.16)
 
 option(DSV4_USE_BISHENG "Compile the host C++ with CANN's BiSheng (clang) instead of the default compiler" OFF)
+# ENABLE_MOCK_RUNTIME: build the zero-NPU symbolic mock runtime (libopapi_mock)
+# plus the dsv4_mock_runner / dsv4_mock_test targets -- no CANN toolkit, no
+# Docker, and no physical memory behind any weight, slot or arena.
+option(ENABLE_MOCK_RUNTIME "Build the zero-NPU symbolic mock runtime and mock test targets" OFF)
 
 # The compiler has to be chosen before project(), so this block runs first.
 if(DSV4_USE_BISHENG AND NOT CMAKE_CXX_COMPILER)
@@ -87,6 +91,10 @@ option(DSV4_WERROR "Treat compiler warnings as errors" OFF)
 # -----------------------------------------------------------------------------
 # The CANN toolkit
 # -----------------------------------------------------------------------------
+# Everything from here to the linkage-verification block is the physical
+# (device) build; the mock build skips all of it and jumps to the
+# ENABLE_MOCK_RUNTIME section at the bottom.
+if(NOT ENABLE_MOCK_RUNTIME)
 # ASCEND_HOME_PATH / ASCEND_TOOLKIT_HOME is set by the toolkit's set_env.sh, and
 # the aarch64 toolchain file forces it at the aarch64 copy.
 if(NOT ASCEND_HOME_PATH)
@@ -258,3 +266,70 @@ add_custom_target(dsv4_verify_linkage
 
 enable_testing()
 add_test(NAME dsv4_contract_smoke COMMAND dsv4_contract_smoke)
+
+endif()  # NOT ENABLE_MOCK_RUNTIME (physical build)
+
+# -----------------------------------------------------------------------------
+# The symbolic mock runtime (ENABLE_MOCK_RUNTIME=ON)
+# -----------------------------------------------------------------------------
+# A second consumer of the same dsv4 sources that links libopapi_mock instead
+# of the CANN toolkit: no device, no Docker, and no physical memory behind any
+# weight, slot or arena -- the mock allocator hands out fake 4096-aligned
+# addresses tracked in an interval registry, every DMA and aclSetTensorAddr is
+# validated against it, and the aclnn GetWorkspaceSize stubs assert the
+# DeepSeek-V4 Flash shape/dtype/flag contracts. Compile and run natively on an
+# x86 WSL host.
+if(ENABLE_MOCK_RUNTIME)
+  set(DSV4_MOCK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/mock_runtime")
+
+  # The mock "toolkit" headers come FIRST, so <acl/acl.h> and <aclnn/acl_meta.h>
+  # resolve to the mock declarations for every dsv4 translation unit.
+  add_library(opapi_mock SHARED
+    "${DSV4_MOCK_DIR}/mock_allocator.cpp"
+    "${DSV4_MOCK_DIR}/mock_descriptor.cpp"
+    "${DSV4_MOCK_DIR}/mock_ops.cpp"
+  )
+  target_include_directories(opapi_mock PUBLIC "${DSV4_MOCK_DIR}" "${DSV4_MOCK_DIR}/include")
+  target_compile_options(opapi_mock PRIVATE -Wall -Wextra)
+  find_package(Threads REQUIRED)
+  target_link_libraries(opapi_mock PUBLIC Threads::Threads)
+
+  # The dsv4 core against the mock headers. dsv4_aclnn_signature_check.cpp is
+  # excluded: it static_asserts the hand-written prototypes against the REAL
+  # CANN headers, which is meaningless against a mock and needs the toolkit.
+  add_library(dsv4_core_mock STATIC
+    dsv4_device_ops.cpp
+    dsv4_expert_layout.cpp
+    dsv4_weight_source.cpp
+    dsv4_exclusive_staging.cpp
+    dsv4_aclnn_v5.cpp
+    dsv4_static_arena.cpp
+    dsv4_pipeline.cpp
+  )
+  target_include_directories(dsv4_core_mock PUBLIC
+    "${DSV4_MOCK_DIR}/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+  )
+  target_link_libraries(dsv4_core_mock PUBLIC opapi_mock ${CMAKE_DL_LIBS})
+  target_compile_options(dsv4_core_mock PRIVATE -Wall -Wextra)
+
+  add_executable(dsv4_mock_runner main.cpp)
+  target_link_libraries(dsv4_mock_runner PRIVATE dsv4_core_mock)
+  target_compile_options(dsv4_mock_runner PRIVATE -Wall -Wextra)
+
+  add_executable(dsv4_mock_test "${DSV4_MOCK_DIR}/dsv4_mock_test.cpp")
+  target_link_libraries(dsv4_mock_test PRIVATE dsv4_core_mock)
+  target_compile_options(dsv4_mock_test PRIVATE -Wall -Wextra)
+
+  # $ORIGIN rpath so the test finds libopapi_mock.so next to itself; the
+  # dlsym(RTLD_DEFAULT, ...) operator table needs the mock loaded and its
+  # symbols exported.
+  foreach(_target dsv4_mock_runner dsv4_mock_test)
+    set_target_properties(${_target} PROPERTIES
+      BUILD_RPATH "$ORIGIN"
+      INSTALL_RPATH "$ORIGIN"
+    )
+  endforeach()
+
+  add_test(NAME dsv4_mock_test COMMAND dsv4_mock_test)
+endif()

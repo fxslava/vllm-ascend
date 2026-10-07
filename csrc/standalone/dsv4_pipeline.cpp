@@ -467,10 +467,13 @@ void Dsv4Pipeline::IngestBackbone(WeightByteSource& source) {
     const char* pattern;
   };
 
-  // Streamed through a bounded host staging buffer. Coupling this to the expert
-  // manager's pinned transit chunk would give that chunk two owners; this is
-  // init-only work, so a plain heap buffer is the right trade.
-  std::vector<uint8_t> staging(kTransferChunkBytes);
+  // Streamed through a bounded pinned staging buffer, not a plain heap vector:
+  // it is the DMA source for every backbone transfer, and page-locked staging
+  // is what the transfer path can validate end to end (the exclusive
+  // hierarchy's transit scratch takes the same stance). Init-only work, freed
+  // before this function returns.
+  uint8_t* staging = static_cast<uint8_t*>(device_.HostPinnedMalloc(kTransferChunkBytes));
+  DSV4_REQUIRE(staging != nullptr, "the backbone staging buffer could not be pinned");
 
   auto ingest = [&](ArenaHandle handle, const std::string& name, bool required) -> bool {
     const size_t bytes = arena_.Bytes(handle);
@@ -490,8 +493,8 @@ void Dsv4Pipeline::IngestBackbone(WeightByteSource& source) {
     uint8_t* destination = arena_.AddressAs<uint8_t>(handle);
     for (size_t offset = 0; offset < bytes; offset += kTransferChunkBytes) {
       const size_t count = std::min(kTransferChunkBytes, bytes - offset);
-      source.ReadNamed(name, staging.data(), staging.size(), offset, count);
-      device_.MemcpySync(destination + offset, bytes - offset, staging.data(), count, MemcpyKind::kHostToDevice);
+      source.ReadNamed(name, staging, kTransferChunkBytes, offset, count);
+      device_.MemcpySync(destination + offset, bytes - offset, staging, count, MemcpyKind::kHostToDevice);
     }
     return true;
   };
@@ -534,6 +537,8 @@ void Dsv4Pipeline::IngestBackbone(WeightByteSource& source) {
   const bool cos = ingest(backbone_->rope_cos, "model.rotary_emb.cos_cached", false);
   const bool sin = ingest(backbone_->rope_sin, "model.rotary_emb.sin_cached", false);
   backbone_->rope_tables_populated = cos && sin;
+
+  device_.HostPinnedFree(staging);
 }
 
 // ---------------------------------------------------------------------------

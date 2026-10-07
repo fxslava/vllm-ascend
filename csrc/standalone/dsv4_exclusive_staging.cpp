@@ -178,7 +178,9 @@ void ExclusiveExpertManager::AllocateHostArena() {
   const size_t slot_bytes = layout_.slot_num_bytes();
   host_arena_bytes_ = static_cast<size_t>(host_slot_count_) * slot_bytes;
 
-  const size_t available = QueryHostAvailableBytes();
+  const size_t available = options_.host_available_bytes > 0
+                               ? static_cast<size_t>(options_.host_available_bytes)
+                               : QueryHostAvailableBytes();
   if (available != 0) {
     DSV4_REQUIRE(host_arena_bytes_ + options_.transfer_chunk_bytes + kHostReserveBytes <= available,
                  "exclusive partition needs " << host_arena_bytes_ << " pinned bytes for " << host_slot_count_

@@ -126,6 +126,11 @@ class ExclusiveExpertManager {
     size_t transfer_chunk_bytes = kTransferChunkBytes;
     size_t host_block_bytes = kHostBlockBytes;
     int64_t top_k = kNumExpertsPerTok;
+    // 0 = consult /proc/meminfo before pinning the host half (production). A
+    // positive value overrides that check, for hosts whose pinned memory is
+    // symbolic rather than physical -- the mock runtime's interval registry,
+    // which carries the full 137 GiB routed set as spans, not bytes.
+    int64_t host_available_bytes = 0;
   };
 
   ExclusiveExpertManager(DeviceOps& device, const ExpertSlotLayout& layout, const Options& options);
