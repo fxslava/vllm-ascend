@@ -34,7 +34,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import torch
+try:
+    import torch
+except ImportError:  # pure-ctypes bring-up (sim containers ship no torch)
+    torch = None
 
 LIBOPAPI_NAME = "libopapi.so"
 LIBASCENDCL_NAME = "libascendcl.so"
@@ -42,9 +45,10 @@ LIBASCENDCL_NAME = "libascendcl.so"
 # aclFormat (acl_base.h): ACL_FORMAT_ND
 ACL_FORMAT_ND = 2
 
-# aclDataType (acl_base.h / ge::DataType): subset used by the V5 decode path.
-# FP8/FP4 codes confirmed against csrc/moe/dequant_swiglu_quant op proto
-# (dst_type 35/36 = fp8, 40/41 = fp4x2 on Ascend 950).
+# aclDataType (CANN acl_base_rt.h, verified against 9.2.0-beta.2): codes used by
+# the V5 decode/MoE path. FP8 codes 35/36 and the UE8M0 block-scale code 37 are
+# fixed by the toolkit ABI (GroupedDynamicMxQuant doc: {35: FLOAT8_E5M2,
+# 36: FLOAT8_E4M3FN}); 40/41 are the packed FP4 pairs.
 ACL_DT_FLOAT32 = 0
 ACL_DT_FLOAT16 = 1
 ACL_DT_INT8 = 2
@@ -52,25 +56,52 @@ ACL_DT_INT32 = 3
 ACL_DT_UINT8 = 4
 ACL_DT_INT64 = 9
 ACL_DT_BF16 = 27
-ACL_DT_FLOAT8_E4M3FN = 35
-ACL_DT_FLOAT8_E5M2 = 36
+ACL_DT_FLOAT8_E5M2 = 35
+ACL_DT_FLOAT8_E4M3FN = 36
+ACL_DT_FLOAT8_E8M0 = 37
 ACL_DT_FP4X2_E2M1 = 40
 ACL_DT_FP4X2_E1M2 = 41
 
-_TORCH_TO_ACL_DTYPE: dict[torch.dtype, int] = {
-    torch.float32: ACL_DT_FLOAT32,
-    torch.float16: ACL_DT_FLOAT16,
-    torch.bfloat16: ACL_DT_BF16,
-    torch.int8: ACL_DT_INT8,
-    torch.int32: ACL_DT_INT32,
-    torch.uint8: ACL_DT_UINT8,
-    torch.int64: ACL_DT_INT64,
-    torch.float8_e4m3fn: ACL_DT_FLOAT8_E4M3FN,
-    torch.float8_e5m2: ACL_DT_FLOAT8_E5M2,
-    torch.float4_e2m1fn_x2: ACL_DT_FP4X2_E2M1,
-}
+# Built lazily: keys live on torch.dtype, and bring-up hosts may have no torch.
+_TORCH_TO_ACL_DTYPE: dict[object, int] = {}
+
+
+def _build_torch_dtype_map() -> None:
+    if _TORCH_TO_ACL_DTYPE or torch is None:
+        return
+    mapping = {
+        torch.float32: ACL_DT_FLOAT32,
+        torch.float16: ACL_DT_FLOAT16,
+        torch.bfloat16: ACL_DT_BF16,
+        torch.int8: ACL_DT_INT8,
+        torch.int32: ACL_DT_INT32,
+        torch.uint8: ACL_DT_UINT8,
+        torch.int64: ACL_DT_INT64,
+    }
+    for attr, code in (
+        ("float8_e4m3fn", ACL_DT_FLOAT8_E4M3FN),
+        ("float8_e5m2", ACL_DT_FLOAT8_E5M2),
+        ("float8_e8m0fnu", ACL_DT_FLOAT8_E8M0),
+        ("float4_e2m1fn_x2", ACL_DT_FP4X2_E2M1),
+    ):
+        dtype = getattr(torch, attr, None)
+        if dtype is not None:
+            mapping[dtype] = code
+    _TORCH_TO_ACL_DTYPE.update(mapping)
 
 _ACL_STATUS_OK = 0
+
+
+def _contiguous_strides(dims: Sequence[int]) -> tuple[int, ...]:
+    """Row-major element strides for ``dims`` (a 0-dim tensor has none)."""
+    if not dims:
+        return ()
+    strides = [0] * len(dims)
+    running = 1
+    for axis in range(len(dims) - 1, -1, -1):
+        strides[axis] = running
+        running *= dims[axis]
+    return tuple(strides)
 
 # The FIA family on Ascend 950: only the V5 plan/launch symbols may exist and
 # may ever be bound (EZ9903 avoidance). Probing records -- never wraps -- them.
@@ -86,6 +117,19 @@ LEGACY_FIA_PROBE_SYMBOLS = (
 QUANT_MATMUL_PLAN_CANDIDATES = (
     "aclnnWeightQuantBatchMatmulV2GetWorkspaceSize",
     "aclnnWeightQuantBatchMatmulGetWorkspaceSize",
+)
+
+# DeepSeek-V4 Flash MoE stack (V5 generation, 950PR): gating -> dispatch ->
+# FP4 grouped expert GEMM. Probed with the attention/quant entries at bring-up.
+MOE_V5_PLAN_SYMBOLS = (
+    "aclnnMoeGatingTopKV2GetWorkspaceSize",
+    "aclnnMoeInitRoutingV4GetWorkspaceSize",
+    "aclnnGroupedMatmulV5GetWorkspaceSize",
+)
+MOE_V5_LAUNCH_SYMBOLS = (
+    "aclnnMoeGatingTopKV2",
+    "aclnnMoeInitRoutingV4",
+    "aclnnGroupedMatmulV5",
 )
 
 
@@ -122,6 +166,15 @@ class AclIntArrayHandle:
 
     pointer: ctypes.c_void_p
     values: ctypes.Array
+
+
+@dataclass
+class AclTensorListHandle:
+    """Keeps a C ``aclTensorList*`` alive together with the descriptors it wraps."""
+
+    pointer: ctypes.c_void_p
+    pointers: ctypes.Array
+    handles: list[AclTensorHandle]
 
 
 @dataclass
@@ -232,10 +285,10 @@ class AclnnLibrary:
         if not self.loaded:
             report.load_error = "libopapi.so could not be loaded on this host"
             return report
-        for symbol in (FIA_V5_PLAN_SYMBOL, *QUANT_MATMUL_PLAN_CANDIDATES):
+        for symbol in (FIA_V5_PLAN_SYMBOL, *QUANT_MATMUL_PLAN_CANDIDATES, *MOE_V5_PLAN_SYMBOLS):
             found = self.resolve(symbol) is not None
             report.entries.append(InventoryEntry(symbol=symbol, found=found))
-        for launch in FIA_V5_LAUNCH_CANDIDATES:
+        for launch in (*FIA_V5_LAUNCH_CANDIDATES, *MOE_V5_LAUNCH_SYMBOLS):
             report.entries.append(InventoryEntry(symbol=launch, found=self.resolve(launch) is not None))
         # Probe-only: legacy FIA V1-V4 must be absent on 950PR (EZ9903). We
         # record presence and never bind/invoke them.
@@ -247,6 +300,7 @@ class AclnnLibrary:
     # ---------------------------------------------------------- descriptors
 
     def acl_dtype(self, torch_dtype: torch.dtype) -> int:
+        _build_torch_dtype_map()
         try:
             return _TORCH_TO_ACL_DTYPE[torch_dtype]
         except KeyError as exc:
@@ -261,23 +315,64 @@ class AclnnLibrary:
         """
         if not tensor.is_contiguous():
             raise ValueError("aclTensor descriptors require contiguous tensors")
-        view_dims = (ctypes.c_int64 * len(tensor.shape))(*tensor.shape)
-        strides = (ctypes.c_int64 * len(tensor.stride()))(*tensor.stride())
-        storage_dims = (ctypes.c_int64 * len(tensor.shape))(*tensor.shape)
+        return self.create_tensor_raw(
+            tensor.data_ptr(),
+            tuple(tensor.shape),
+            self.acl_dtype(tensor.dtype),
+            strides=tuple(tensor.stride()),
+        )
+
+    def create_tensor_raw(
+        self,
+        data_pointer: int,
+        dims: Sequence[int],
+        acl_dtype_code: int,
+        strides: Sequence[int] | None = None,
+    ) -> AclTensorHandle:
+        """Descriptor over raw device memory (torch-free bring-up path).
+
+        Packed dtypes (FP4 pairs) and host-filled scale buffers (UE8M0 carried
+        in uint8 bytes) pass their ``aclDataType`` code directly; ``dims`` count
+        elements, and the memory must hold ``prod(dims) * itemsize`` bytes.
+        """
+        if strides is None:
+            strides = _contiguous_strides(dims)
+        # Accept raw ints, c_void_p instances (device buffers) and None (NULL).
+        address = getattr(data_pointer, "value", data_pointer)
+        view_dims = (ctypes.c_int64 * len(dims))(*dims)
+        stride_dims = (ctypes.c_int64 * len(strides))(*strides)
+        storage_dims = (ctypes.c_int64 * len(dims))(*dims)
         pointer = self._opapi.aclCreateTensor(
             view_dims,
-            len(tensor.shape),
-            self.acl_dtype(tensor.dtype),
-            strides,
+            len(dims),
+            acl_dtype_code,
+            stride_dims,
             0,
             ACL_FORMAT_ND,
             storage_dims,
-            len(tensor.shape),
-            ctypes.c_void_p(tensor.data_ptr()),
+            len(dims),
+            ctypes.c_void_p(address),
         )
         if not pointer:
             raise RuntimeError("aclCreateTensor returned nullptr")
-        return AclTensorHandle(pointer=pointer, view_dims=view_dims, strides=strides, storage_dims=storage_dims)
+        return AclTensorHandle(
+            pointer=pointer, view_dims=view_dims, strides=stride_dims, storage_dims=storage_dims
+        )
+
+    def create_tensor_list(self, handles: Sequence[AclTensorHandle]) -> AclTensorListHandle:
+        """Wrap already-created descriptors into an ``aclTensorList*``."""
+        if not handles:
+            raise ValueError("aclCreateTensorList requires at least one tensor")
+        pointers = (ctypes.c_void_p * len(handles))(*(h.pointer for h in handles))
+        pointer = self._opapi.aclCreateTensorList(pointers, len(handles))
+        if not pointer:
+            raise RuntimeError("aclCreateTensorList returned nullptr")
+        return AclTensorListHandle(pointer=pointer, pointers=pointers, handles=list(handles))
+
+    def destroy_tensor_list(self, handle: AclTensorListHandle) -> None:
+        if handle.pointer:
+            self._opapi.aclDestroyTensorList(handle.pointer)
+            handle.pointer = ctypes.c_void_p(0)
 
     def destroy_tensor(self, handle: AclTensorHandle) -> None:
         if handle.pointer:

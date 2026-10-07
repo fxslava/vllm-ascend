@@ -40,6 +40,9 @@ std::vector<ops::OpAvailability> ProbeAscend950Operators() {
       {kMul, "stage 6 - attention output gate"},
       {ops::kSwiGlu, "stage 8 - SwiGLU activation"},
       {kInplaceAdd, "stage 6 and 9 - residual adds"},
+      {kMoeGatingTopKV2, "dsv4 stage 9 - noaux_tc gating, top-6 of 256, scaling 1.5"},
+      {kMoeInitRoutingV4, "dsv4 stage 9 - dropless dispatch, device cumsum for the GMM groupList"},
+      {kGroupedMatmulV5, "dsv4 stage 10 - M-grouped FP4/UE8M0-32 expert GEMM, 256 experts"},
   };
 
   std::vector<ops::OpAvailability> results;

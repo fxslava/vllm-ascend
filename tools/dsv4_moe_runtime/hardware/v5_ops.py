@@ -23,7 +23,10 @@ from __future__ import annotations
 import ctypes
 from dataclasses import dataclass
 
-import torch
+try:
+    import torch
+except ImportError:  # torch-free bring-up hosts: only plan-arg helpers are consumed there
+    torch = None
 
 from ..hardware.aclnn_binding import (
     AclIntArrayHandle,
@@ -119,6 +122,11 @@ class _V5OpBase:
             raise RuntimeError(
                 "libopapi.so is not loaded; V5 operators require the CANN runtime "
                 "(bring up on the Ascend host, or use the CPU mock backend)"
+            )
+        if torch is None:
+            raise RuntimeError(
+                "torch is unavailable; the AOT workspace reservation needs device tensors "
+                "(torch-free bring-up drives the plan-arg helpers against raw aclrt memory)"
             )
         self._library = library
         self._device = device
