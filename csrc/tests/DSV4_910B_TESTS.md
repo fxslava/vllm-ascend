@@ -88,9 +88,15 @@ arch35; the shipping kernel now selects these paths with `__CCE_AICORE__ == 220`
 
 - DeInterleave is replaced by vector Gather with byte offsets for even/odd
   FP32 lanes, including every reduction-tree level.
-- Byte widening uses integer Gather to repeat packed 32-bit words, masked
-  right shifts to align each byte, and a full-word AND with 255. No intermediate
-  half-precision or floating-point conversion is used.
+- Byte widening casts uint8 -> half (`vconv_u82f16`) and half -> int32
+  (`vconv_f162s32r`); 0..255 is exact in half, so the pair is lossless. It
+  replaces a Gather over the packed buffer, which was wrong: Gather bounds its
+  source by the extent of the tensor it is handed, and a uint8 staging buffer
+  reinterpreted as int32 declares a quarter of the bytes it holds, so byte
+  offsets at or past that quarter read undefined data. With the 2 KiB weight
+  staging that cut in at byte 512 -- under three of the eight rows in a chunk
+  at the production column tiling -- and the 256-byte scale staging was past
+  its 64-byte limit from the first block.
 - E2M1 and E8M0 predicates use INT32 bounds, subtraction, and bitwise masks.
   Boolean values expand to all-zero or all-one words before masking IEEE-754
   fields. The arch220 decoder does not use Select or FP32 predicate views.

@@ -77,6 +77,21 @@ TEST_P(Dsv4Production, PositiveAndNegativeGateClamp) {
   }
 }
 
+// Random weights hide a row that decodes the wrong staged bytes: the result is
+// just another plausible dot product. Under MakeSawtoothProblem every element
+// is a small signed integer whose sign is fixed by its row's phase, so an
+// aliased or short-read row flips a sign. That is the shape the arch220 byte
+// widening failed in -- a Gather bounded by its source tensor's extent read
+// undefined data past the first 512 staged bytes, so from the third row of
+// every eight-row chunk onwards the decode was garbage while
+// GoldenAndRepeatedBitParity still reported a plausible miss.
+TEST_P(Dsv4Production, SawtoothRowPhaseParity) {
+  const auto p = d::MakeSawtoothProblem(GetParam().hidden, GetParam().inter, 0xD543);
+  d::DeviceExpert expert(p);
+  expert.Enqueue();
+  ExpectParity(expert.Read(), d::Golden(p));
+}
+
 TEST_P(Dsv4Production, SixConcurrentExpertsHavePrivateStorage) {
   std::vector<std::unique_ptr<d::DeviceExpert>> experts;
   std::vector<d::DeviceOutputs> goldens;

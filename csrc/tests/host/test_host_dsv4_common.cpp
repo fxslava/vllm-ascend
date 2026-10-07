@@ -68,6 +68,26 @@ TEST(Dsv4CommonData, ScaleSweepIncludesSubnormalAndNaN) {
   EXPECT_TRUE(std::isnan(d::E8m0ToScale(p.w1_scale[255 * 2])));
 }
 
+// The sawtooth input is only a useful regression probe while its gold keeps
+// the structure the device test leans on: a magnitude that alternates and a
+// sign that turns over every four rows, so a row decoded from the wrong staged
+// bytes cannot pass by looking like its neighbour. At hidden=192 each row spans
+// six 16-byte groups, which puts the four phases at these exact values.
+TEST(Dsv4CommonData, SawtoothGoldAlternatesMagnitudeAndSignByRowPhase) {
+  constexpr int64_t kHidden = 192;
+  constexpr int64_t kInter = 64;
+  constexpr float kPhase[4] = {240.0f, 48.0f, -240.0f, -48.0f};
+  const auto p = d::MakeSawtoothProblem(kHidden, kInter, 0xD543);
+  for (uint16_t bits : p.x) EXPECT_EQ(d::Bf16BitsToFloat(bits), 1.0f);
+  for (const auto* scales : {&p.w1_scale, &p.w2_scale, &p.w3_scale})
+    for (uint8_t scale : *scales) EXPECT_EQ(d::E8m0ToScale(scale), 1.0f);
+  const auto oracle = d::ReferenceExpert(p.View(), kHidden, kInter);
+  // Exact equality: every partial sum here is a small integer or half-integer.
+  for (int64_t row = 0; row < kInter; ++row)
+    EXPECT_EQ(oracle.gate_f32[static_cast<size_t>(row)], kPhase[row % 4]) << "row " << row;
+  EXPECT_EQ(oracle.up_f32, oracle.gate_f32);
+}
+
 TEST(Dsv4CommonData, SaturationIsSignedAndActivationFinite) {
   for (bool positive : {false, true}) {
     const auto p = d::MakeSaturatingProblem(64, 64, 3, positive);

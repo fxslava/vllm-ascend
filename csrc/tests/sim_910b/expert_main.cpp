@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 #include "dsv4_moe_expert_launch.hpp"
@@ -26,9 +27,16 @@ int main(int argc, char **argv)
     const int64_t hidden = argc > 1 ? std::atoll(argv[1]) : 64;
     const int64_t inter = argc > 2 ? std::atoll(argv[2]) : 64;
     const uint32_t seed = argc > 3 ? static_cast<uint32_t>(std::atoll(argv[3])) : 704;
-    std::printf("geometry hidden=%lld inter=%lld seed=%u\n",
-        static_cast<long long>(hidden), static_cast<long long>(inter), seed);
-    const auto problem = dsv4::MakeDeviceProblem(hidden, inter, seed);
+    // A fourth argument of "sawtooth" swaps the random problem for the
+    // row-phase one. Random weights turn a row decoded from the wrong staged
+    // bytes into just another plausible dot product; the sawtooth turns it
+    // into a flipped sign, which is what the diagnostic dump below can name.
+    const bool sawtooth = argc > 4 && std::string(argv[4]) == "sawtooth";
+    std::printf("geometry hidden=%lld inter=%lld seed=%u data=%s\n",
+        static_cast<long long>(hidden), static_cast<long long>(inter), seed,
+        sawtooth ? "sawtooth" : "random");
+    const auto problem = sawtooth ? dsv4::MakeSawtoothProblem(hidden, inter, seed)
+                                  : dsv4::MakeDeviceProblem(hidden, inter, seed);
     const auto tiling = problem.Tiling();
     const auto golden = dsv4::Golden(problem);
     const std::array<const void*, 7> inputs = {

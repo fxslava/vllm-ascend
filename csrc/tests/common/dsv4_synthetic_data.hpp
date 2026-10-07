@@ -13,6 +13,11 @@
 namespace vllm_ascend::test::dsv4 {
 constexpr int64_t kProductionHidden = 7168;
 constexpr int64_t kProductionInter = 2048;
+// E8M0 byte that decodes to 2^0; see E8m0ToScale.
+constexpr uint8_t kE8m0UnitExponent = 127;
+// MakeSawtoothProblem's run length: one nibble pair per 16 packed bytes.
+constexpr size_t kSawtoothGroupBytes = 16;
+constexpr size_t kFp4CodeCount = 16;
 // The kernel's tiling struct, field for field with
 // op_kernel/dsv4_moe_expert_tiling_data.h. The tests build it by hand rather
 // than driving the host tiling path, so it has to match exactly:
@@ -77,15 +82,42 @@ inline Problem MakeDeviceProblem(int64_t hidden, int64_t inter, uint32_t seed, u
 
 inline Problem MakeProblem(int64_t hidden, int64_t inter, uint32_t seed, int scale_span = 6) {
   if (scale_span < 0 || scale_span > 126) throw std::invalid_argument("invalid scale span");
-  return MakeDeviceProblem(hidden, inter, seed, static_cast<uint8_t>(127 - scale_span),
-                           static_cast<uint8_t>(127 + scale_span));
+  return MakeDeviceProblem(hidden, inter, seed, static_cast<uint8_t>(kE8m0UnitExponent - scale_span),
+                           static_cast<uint8_t>(kE8m0UnitExponent + scale_span));
 }
 
 inline Problem MakeSaturatingProblem(int64_t hidden, int64_t inter, uint32_t seed, bool positive = false) {
   auto p = MakeDeviceProblem(hidden, inter, seed);
   std::fill(p.x.begin(), p.x.end(), FloatToBf16Bits(2.0f));
   std::fill(p.w1.begin(), p.w1.end(), positive ? 0x77 : 0xFF);
-  std::fill(p.w1_scale.begin(), p.w1_scale.end(), 127);
+  std::fill(p.w1_scale.begin(), p.w1_scale.end(), kE8m0UnitExponent);
+  return p;
+}
+
+// Per-row sawtooth. Byte i of every packed weight carries the nibble pair
+// ((2 * (i / 16)) % 16, (2 * (i / 16) + 1) % 16), so each aligned 16-byte
+// group holds one E2M1 magnitude at one sign and the sign turns over every
+// four groups; x and all E8M0 scales are 1.
+//
+// Every output element is then a small signed integer fixed by the 16-byte
+// groups its row covers, and its sign is fixed by that row's phase. A decode
+// that reads the wrong staged bytes for a row -- a staging window that stops
+// short, a row offset that aliases its neighbour -- therefore flips a sign or
+// repeats a row instead of drifting a few ULPs. Regression input for the
+// arch220 byte widening that read undefined data past the first 512 staged
+// bytes, which left every row after the second decoding garbage.
+inline Problem MakeSawtoothProblem(int64_t hidden, int64_t inter, uint32_t seed) {
+  Problem p = MakeDeviceProblem(hidden, inter, seed);
+  std::fill(p.x.begin(), p.x.end(), FloatToBf16Bits(1.0f));
+  for (auto* w : {&p.w1, &p.w2, &p.w3}) {
+    for (size_t i = 0; i < w->size(); ++i) {
+      const size_t group = i / kSawtoothGroupBytes;
+      const uint8_t low = static_cast<uint8_t>((2 * group) % kFp4CodeCount);
+      const uint8_t high = static_cast<uint8_t>((2 * group + 1) % kFp4CodeCount);
+      (*w)[i] = static_cast<uint8_t>((high << 4) | low);
+    }
+  }
+  for (auto* s : {&p.w1_scale, &p.w2_scale, &p.w3_scale}) std::fill(s->begin(), s->end(), kE8m0UnitExponent);
   return p;
 }
 
@@ -95,7 +127,7 @@ inline Problem MakeScaleSweepProblem(int64_t hidden, int64_t inter, uint32_t see
   auto p = MakeDeviceProblem(hidden, inter, seed);
   std::fill(p.x.begin(), p.x.end(), FloatToBf16Bits(1.0f));
   std::fill(p.w1.begin(), p.w1.end(), 0);
-  std::fill(p.w1_scale.begin(), p.w1_scale.end(), 127);
+  std::fill(p.w1_scale.begin(), p.w1_scale.end(), kE8m0UnitExponent);
   for (int64_t row = 0; row < inter; ++row) {
     p.w1_scale[static_cast<size_t>(row * hidden / kFp4Block)] = static_cast<uint8_t>(row % 256);
     p.w1[static_cast<size_t>(row * hidden / kFp4PerByte)] = 0x07;
