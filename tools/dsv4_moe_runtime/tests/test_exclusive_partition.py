@@ -1,5 +1,7 @@
 """Exclusive coverage, byte preservation, stream ordering and reader sealing."""
 
+from __future__ import annotations
+
 from pathlib import Path
 
 import pytest

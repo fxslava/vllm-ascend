@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """Four-way probe dump: read the output slots as raw fp32."""
+
+from __future__ import annotations
+
 import struct
 
 d = open("/tmp/dsv4_gateb/actual.bin", "rb").read()

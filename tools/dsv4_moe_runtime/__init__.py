@@ -4,15 +4,17 @@ pinned-DDR offload transports and NPU memory stress tooling.
 Public API (backwards-compatible import surface)::
 
     from tools.dsv4_moe_runtime import StaticExpertSlotPool, ExpertTensorLayout
+
+The benchmark modules are **not** imported eagerly: importing the base package
+(or collecting ``tests/``) must not pay for the stress tooling. The benchmark
+re-exports below resolve lazily through module ``__getattr__`` on first
+attribute access.
 """
 
-from .benchmarks.offload_stress import (
-    BenchConfig,
-    OffloadStressHarness,
-    parse_config,
-)
-from .benchmarks.synthetic_source import SyntheticExpertSource
-from .benchmarks.trace_simulator import RouterTraceSimulator, TraceStep
+from __future__ import annotations
+
+import importlib
+
 from .core.config import (
     DSV2_LITE_GEOMETRY,
     EXPERT_PARAM_NAMES,
@@ -89,6 +91,27 @@ from .protocols.residency_policy import AdmissionDecision, EvictionPolicyProtoco
 from .protocols.router import RouteResolverProtocol
 from .routing.hash_router import HashRouteResolver
 from .routing.score_router import ScoreRouteResolver
+
+# Benchmark re-exports resolve lazily: name -> providing module (relative).
+_BENCHMARK_EXPORTS = {
+    "BenchConfig": ".benchmarks.offload_stress",
+    "OffloadStressHarness": ".benchmarks.offload_stress",
+    "parse_config": ".benchmarks.offload_stress",
+    "SyntheticExpertSource": ".benchmarks.synthetic_source",
+    "RouterTraceSimulator": ".benchmarks.trace_simulator",
+    "TraceStep": ".benchmarks.trace_simulator",
+}
+
+
+def __getattr__(name: str):
+    """PEP 562 lazy re-exports for the benchmark surface (no eager import)."""
+    module_path = _BENCHMARK_EXPORTS.get(name)
+    if module_path is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(importlib.import_module(module_path, __name__), name)
+    globals()[name] = value  # cache so later lookups skip the hook
+    return value
+
 
 __all__ = [
     "AdmissionDecision",

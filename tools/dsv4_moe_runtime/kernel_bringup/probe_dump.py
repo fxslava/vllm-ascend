@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Probe analyzer: decode actual.bin down_out slot as raw fp32 products and
 compare against the expected x*E2M1 (scale-less) values from input.bin."""
+
+from __future__ import annotations
+
 import json
 import struct
 

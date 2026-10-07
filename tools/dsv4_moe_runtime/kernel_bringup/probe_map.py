@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """Map the kernel's effective gather codes against the packed nibbles."""
+
+from __future__ import annotations
+
 import struct
 
 import numpy as np

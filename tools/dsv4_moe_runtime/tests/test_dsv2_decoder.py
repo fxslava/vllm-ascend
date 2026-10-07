@@ -1,5 +1,7 @@
 """Schema, rotary convention and aclnn stream regression checks."""
 
+from __future__ import annotations
+
 import json
 from pathlib import Path
 from types import SimpleNamespace

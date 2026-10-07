@@ -1,5 +1,7 @@
 """FP8 serialization, padded slot geometry and native CUDA expert execution."""
 
+from __future__ import annotations
+
 import json
 
 import pytest
