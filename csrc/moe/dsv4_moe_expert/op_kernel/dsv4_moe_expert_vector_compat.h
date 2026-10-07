@@ -81,6 +81,10 @@ __aicore__ inline void CreateGatherIndices(const AscendC::LocalTensor<int32_t>& 
         const uint32_t active = remaining < LANES_PER_REPEAT ? remaining : LANES_PER_REPEAT;
         Adds(offsets[base], offsets[base], static_cast<int32_t>(base), active);
     }
+    // Every caller reads `offsets` straight away, and with --cce-auto-sync=off
+    // that RAW is this kernel's own responsibility. Without this the lanes the
+    // loop above just wrote -- everything from lane 64 up -- are read stale.
+    PipeBarrier<PIPE_V>();
 #else
     CreateVecIndex(offsets, static_cast<int32_t>(0), count);
 #endif
@@ -113,46 +117,32 @@ __aicore__ inline void BitOr32(const AscendC::LocalTensor<int32_t>& dst,
 }
 
 #if DSV4_ARCH_C220
-// Expand bytes using only integer lanes. Gather duplicates each packed word
-// four times, then masked shifts align its four bytes with their output lanes.
-// Callers provide separate dst/scratch tensors, count divisible by eight,
-// and a 32-byte-aligned source containing at least count bytes.
+// Expand bytes into 32-bit integer lanes.
+//
+// This cannot be a Gather over the packed buffer, which is what it used to be.
+// Gather bounds its source by the extent of the tensor it is handed, and a
+// uint8 staging buffer reinterpreted as int32 declares a quarter of the bytes
+// it actually holds, so every byte offset at or past that quarter reads
+// outside the declared source and comes back undefined. With the 2 KiB weight
+// staging that cut in at byte 512 -- fewer than three of the eight rows in a
+// chunk at the production column tiling -- and the scale staging, 256 bytes,
+// was over its 64-byte limit from the very first block.
+//
+// dav-c220 converts uint8 -> half (vconv_u82f16) and half -> int32
+// (vconv_f162s32r) directly, and 0..255 is exact in half, so the pair is
+// lossless, carries no source-extent constraint, and needs no index vector at
+// all. It mirrors the two-step widening the regbase path already uses.
+// Callers provide a dst of at least 4 * count bytes and a separate scratch
+// tensor of at least 2 * count bytes.
 __aicore__ inline void WidenBytes32(const AscendC::LocalTensor<int32_t>& dst,
                                   const AscendC::LocalTensor<uint8_t>& src,
                                   const AscendC::LocalTensor<int32_t>& scratch, uint32_t count)
 {
     using namespace AscendC;
-    constexpr uint32_t LANES_PER_REPEAT = 64;
-    constexpr uint32_t BYTE_BITS = 8;
-    constexpr uint32_t WORD_BYTES = sizeof(int32_t);
-    constexpr uint64_t BYTE_LANE_MASKS[WORD_BYTES - 1] = {
-        0x2222222222222222ULL, 0x4444444444444444ULL, 0x8888888888888888ULL
-    };
-    CreateGatherIndices(scratch, count);
-    ShiftRight(scratch, scratch, 2, count);
+    const LocalTensor<half> wide = scratch.ReinterpretCast<half>();
+    Cast(wide, src, RoundMode::CAST_NONE, count);
     PipeBarrier<PIPE_V>();
-    ShiftLeft(scratch, scratch, 2, count);
-    PipeBarrier<PIPE_V>();
-    Gather(dst, src.ReinterpretCast<int32_t>(), scratch.ReinterpretCast<uint32_t>(), 0, count);
-    PipeBarrier<PIPE_V>();
-    const uint8_t repeats = static_cast<uint8_t>(count / LANES_PER_REPEAT);
-    const uint32_t tail = count % LANES_PER_REPEAT;
-    for (uint32_t byte = 1; byte < WORD_BYTES; ++byte) {
-        uint64_t mask[2] = {BYTE_LANE_MASKS[byte - 1], 0};
-        uint64_t tailMask[2] = {mask[0] & ((uint64_t{1} << tail) - 1), 0};
-        const int32_t shift = static_cast<int32_t>(byte * BYTE_BITS);
-        if (repeats != 0) {
-            ShiftRight(dst, dst, shift, mask, repeats, {1, 1, 8, 8});
-        }
-        if (tailMask[0] != 0) {
-            const uint32_t base = repeats * LANES_PER_REPEAT;
-            ShiftRight(dst[base], dst[base], shift, tailMask, 1, {1, 1, 8, 8});
-        }
-        PipeBarrier<PIPE_V>();
-    }
-    Duplicate(scratch, int32_t{0xFF}, count);
-    PipeBarrier<PIPE_V>();
-    BitAnd32(dst, dst, scratch, count);
+    Cast(dst, wide, RoundMode::CAST_RINT, count);
     PipeBarrier<PIPE_V>();
 }
 #endif
