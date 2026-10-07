@@ -46,13 +46,45 @@ using DeviceOutputs = std::array<std::vector<uint16_t>, 4>;
 
 // Explicit TBuf payload of the shipping 8x512 streaming kernel. TPipe stack
 // overhead is additional; no allocation or offset here assumes 256 KiB UB.
+// op_host/dsv4_moe_expert_tiling.cpp computes the same total from the chunk
+// constants and checks it against the UB the platform reports.
 constexpr size_t kExpertStreamingScratchBytes = 93696;
 constexpr size_t ExpertUbBytes(int64_t hidden, int64_t inter) {
   return kExpertStreamingScratchBytes + static_cast<size_t>(2 * hidden + 4 * std::max(hidden, inter) + 18 * inter);
 }
 
+// UB per core on the two parts the operator is registered for. 192 KiB is the
+// Ascend910B figure; the 256 KiB for the Ascend950 regbase core is the
+// provisional number DSV4_DEVICE_AUDIT.md works from, and nothing here needs
+// it to be exact -- only to be the roomier of the two. A geometry that fits
+// the 910B therefore fits both, and that is the bound the rules below enforce.
+// The tiling function does not use either: it asks the platform.
+constexpr size_t kUbBytesAscend910B = 192 * 1024;
+constexpr size_t kUbBytesAscend950 = 256 * 1024;
+
 constexpr int64_t kFp4Block = 32;   // E8M0 scale span, in logical elements
 constexpr int64_t kFp4PerByte = 2;  // two E2M1 nibbles per storage byte
+
+// The kernel's column tiling, mirrored from BalancedChunkCols in
+// op_kernel/dsv4_moe_expert.cpp. Kept here for the same reason
+// GeometryIsAccepted is: the host tier has no CANN toolkit, and these
+// invariants are cheap to check by enumeration and expensive to check on a
+// simulator. kColTileGrain is the MTE2 constraint -- activeCols / kFp4PerByte
+// is the packed-weight burst and offset, which needs 32-byte granularity.
+constexpr int64_t kChunkFlatElems = 4096;
+constexpr int64_t kMinChunkRows = 8;
+constexpr int64_t kMaxChunkCols = kChunkFlatElems / kMinChunkRows;  // 512
+constexpr int64_t kColTileGrain = kFp4PerByte * kFp4Block;          // 64
+// Blocks a padded scale staging row holds, the kernel's pow2Blocks.
+constexpr int64_t kPaddedBlocksPerRow = 32;
+
+constexpr int64_t ExpertChunkCols(int64_t full_cols) {
+  if (full_cols <= kMaxChunkCols) return full_cols;
+  const int64_t tiles = (full_cols + kMaxChunkCols - 1) / kMaxChunkCols;
+  const int64_t even = (full_cols + tiles - 1) / tiles;
+  const int64_t cols = (even + kColTileGrain - 1) / kColTileGrain * kColTileGrain;
+  return cols < kMaxChunkCols ? cols : kMaxChunkCols;
+}
 
 // E2M1: bit3 sign, bits2..1 exponent (bias 1), bit0 mantissa.
 inline const float* E2m1Table() {
@@ -234,7 +266,10 @@ inline bool GeometryIsAccepted(int64_t hidden, int64_t inter) {
   if (hidden % (kFp4PerByte * kFp4Block) != 0) return false;
   if (inter % (kFp4PerByte * kFp4Block) != 0) return false;
   if (hidden <= 0 || inter <= 0) return false;
-  return hidden <= kMaxHiddenSize && inter <= kMaxInterSize;
+  if (hidden > kMaxHiddenSize || inter > kMaxInterSize) return false;
+  // The tiling function takes the UB size from the platform; the smaller of
+  // the two supported parts is what makes a geometry portable between them.
+  return ExpertUbBytes(hidden, inter) <= kUbBytesAscend910B;
 }
 
 }  // namespace dsv4

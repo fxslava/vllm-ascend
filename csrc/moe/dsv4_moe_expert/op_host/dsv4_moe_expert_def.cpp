@@ -71,14 +71,17 @@ public:
             .Format({ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND});
 
-        // Ascend 950 (arch35) configuration using Regbase, mirroring the
-        // proven registration pattern of the other ascend950 MoE ops.
-        OpAICoreConfig regbaseCfg;
-        regbaseCfg.DynamicCompileStaticFlag(true)
+        // One kernel source serves both core generations: op_kernel selects the
+        // dav-c220 or the dav-c310 vector path on __CCE_AICORE__, so the two
+        // SoCs share this configuration and differ only in which branch the
+        // kernel compiles. ascend910b covers Ascend910B1 through B4.
+        OpAICoreConfig aicoreCfg;
+        aicoreCfg.DynamicCompileStaticFlag(true)
             .DynamicRankSupportFlag(true)
             .DynamicShapeSupportFlag(true)
             .ExtendCfgInfo("opFile.value", "dsv4_moe_expert");
-        this->AICore().AddConfig("ascend950", regbaseCfg);
+        this->AICore().AddConfig("ascend910b", aicoreCfg);
+        this->AICore().AddConfig("ascend950", aicoreCfg);
     }
 };
 

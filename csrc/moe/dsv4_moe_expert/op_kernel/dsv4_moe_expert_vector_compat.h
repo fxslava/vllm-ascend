@@ -4,6 +4,33 @@
 
 #include "kernel_operator.h"
 
+// ---------------------------------------------------------------------------
+// Target classification, shared by this header and the kernel beside it.
+//
+// Ascend C predefines __CCE_AICORE__ from --cce-aicore-arch: 220 for the
+// Ascend910B1..B4 / 910_93 vector core (dav-c220) and 310 for the Ascend950
+// regbase core (dav-c310). Those are the only two core generations this
+// operator is registered for, and they do not expose the same vector
+// primitives, so the choice is named once here. Every arch-dependent branch
+// keys off DSV4_ARCH_C220; its complement is the regbase path.
+//
+// A third generation must not silently inherit the regbase path, so an
+// unexpected __CCE_AICORE__ is a build error rather than a wrong code path.
+// Two builds of this source are not device builds and are exempt: the
+// host-stub pass, which sees no __CCE_AICORE__ at all, and tikicpulib's CPU
+// interpreter under tools/dsv4_moe_runtime/kernel_bringup. Neither emits
+// vector code, so both take the regbase branch.
+// ---------------------------------------------------------------------------
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 220
+#define DSV4_ARCH_C220 1
+#elif defined(__CCE_AICORE__) && __CCE_AICORE__ != 310 && \
+    !(defined(ASCENDC_CPU_DEBUG) && ASCENDC_CPU_DEBUG == 1)
+#error "dsv4_moe_expert supports __CCE_AICORE__ 220 (Ascend910B) and 310 (Ascend950) only"
+#endif
+#ifndef DSV4_ARCH_C220
+#define DSV4_ARCH_C220 0
+#endif
+
 namespace Dsv4MoeExpertOp {
 
 // Generate 0..count-1 in integer lanes. The callers use 8..256 lanes in
@@ -14,7 +41,7 @@ namespace Dsv4MoeExpertOp {
 __aicore__ inline void CreateGatherIndices(const AscendC::LocalTensor<int32_t>& offsets, uint32_t count)
 {
     using namespace AscendC;
-#if __CCE_AICORE__ == 220
+#if DSV4_ARCH_C220
     constexpr uint32_t LANES_PER_REPEAT = 64;
     constexpr uint32_t INDEX_BITS = 6;
     constexpr uint64_t BIT_MASKS[INDEX_BITS] = {
@@ -57,7 +84,7 @@ __aicore__ inline void BitAnd32(const AscendC::LocalTensor<int32_t>& dst,
                               const AscendC::LocalTensor<int32_t>& lhs,
                               const AscendC::LocalTensor<int32_t>& rhs, uint32_t count)
 {
-#if __CCE_AICORE__ == 220
+#if DSV4_ARCH_C220
     AscendC::And(dst.ReinterpretCast<uint16_t>(), lhs.ReinterpretCast<uint16_t>(),
                  rhs.ReinterpretCast<uint16_t>(), count * 2);
 #else
@@ -69,7 +96,7 @@ __aicore__ inline void BitOr32(const AscendC::LocalTensor<int32_t>& dst,
                              const AscendC::LocalTensor<int32_t>& lhs,
                              const AscendC::LocalTensor<int32_t>& rhs, uint32_t count)
 {
-#if __CCE_AICORE__ == 220
+#if DSV4_ARCH_C220
     AscendC::Or(dst.ReinterpretCast<uint16_t>(), lhs.ReinterpretCast<uint16_t>(),
                 rhs.ReinterpretCast<uint16_t>(), count * 2);
 #else
@@ -77,7 +104,7 @@ __aicore__ inline void BitOr32(const AscendC::LocalTensor<int32_t>& dst,
 #endif
 }
 
-#if __CCE_AICORE__ == 220
+#if DSV4_ARCH_C220
 // Expand bytes using only integer lanes. Gather duplicates each packed word
 // four times, then masked shifts align its four bytes with their output lanes.
 // Callers provide separate dst/scratch tensors, count divisible by eight,

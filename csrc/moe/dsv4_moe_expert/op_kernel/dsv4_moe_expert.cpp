@@ -14,19 +14,36 @@
 #include "kernel_tiling/kernel_tiling.h"
 #include "kernel_operator.h"
 #include "dsv4_moe_expert_tiling_data.h"
+// Also classifies the target core generation into DSV4_ARCH_C220; see the
+// comment there. Must precede every arch-dependent branch in this file.
 #include "dsv4_moe_expert_vector_compat.h"
 
+// WholeReduceSum/CompareScalar (CANN 8) versus ReduceRepeat/Compares (CANN 9)
+// is a toolkit difference, not a hardware one, so the build passes the major
+// version in and csrc/tests/cmake/CannVersion.cmake detects it. The regbase
+// core ships no CANN 8 toolkit, so a dav-c220 build is the only one that can
+// still be CANN 8: the fallback follows the target rather than assuming the
+// older toolkit everywhere. Without this an op-package build that forgets the
+// macro would compile the CANN 8 reduction path for the Ascend950.
 #ifndef CANN_VERSION_MAJOR
+#if DSV4_ARCH_C220
 #define CANN_VERSION_MAJOR 8
+#else
+#define CANN_VERSION_MAJOR 9
+#endif
 #endif
 
 using namespace AscendC;
 
 namespace Dsv4MoeExpertOp {
 
+// The build compiles with --cce-auto-sync=off, so vector RAW dependencies are
+// the kernel's own responsibility on dav-c220. The regbase core orders
+// same-pipe vector accesses in hardware and needs no barrier, which is why
+// this is a no-op there rather than an unconditional PipeBarrier.
 __aicore__ inline void VectorDependencyBarrier()
 {
-#if __CCE_AICORE__ == 220
+#if DSV4_ARCH_C220
     PipeBarrier<PIPE_V>();
 #endif
 }
@@ -37,7 +54,7 @@ template <typename Dst, typename Src>
 __aicore__ inline void CastBf16Boundary(const LocalTensor<Dst>& dst,
                                       const LocalTensor<Src>& src, RoundMode mode, uint32_t count)
 {
-#if __CCE_AICORE__ == 220
+#if DSV4_ARCH_C220
     constexpr uint32_t FLOAT_LANES = 64;
     constexpr uint8_t FLOAT_BLOCKS = 8;
     constexpr uint8_t BF16_BLOCKS = 4;
@@ -58,7 +75,7 @@ __aicore__ inline void CastBf16Boundary(const LocalTensor<Dst>& dst,
 #endif
 }
 
-#if __CCE_AICORE__ == 220
+#if DSV4_ARCH_C220
 constexpr RoundMode BF16_ROUND_MODE = RoundMode::CAST_RINT;
 #else
 constexpr RoundMode BF16_ROUND_MODE = RoundMode::CAST_ROUND;
@@ -93,6 +110,15 @@ constexpr int64_t OUT_ROW_COUNT = 3;    // gate/up/activated share one staging b
 constexpr int64_t CHUNK_FLAT_ELEMS = 4096;
 constexpr int64_t MIN_CHUNK_ROWS = 8;
 constexpr int64_t MAX_CHUNK_COLS = CHUNK_FLAT_ELEMS / MIN_CHUNK_ROWS;
+// Column-tile granularity. activeCols / FP4_BLOCK has to be an exact block
+// count, and activeCols / FP4_PER_BYTE is both the packed-weight DataCopy's
+// burst length and - through col0 - its UB and GM offsets, all of which MTE2
+// needs at 32-byte granularity. Those two together make 2 * FP4_BLOCK the
+// smallest legal step: a width that is a multiple of 32 but not of 64, say
+// 352, gives a 176-byte burst (5.5 blocks, so it over-reads 16 bytes past the
+// tile) landing at a 176-byte stride (so every odd staging row starts
+// off a 32-byte boundary).
+constexpr int64_t COL_TILE_GRAIN = FP4_PER_BYTE * FP4_BLOCK;
 constexpr int64_t MAX_MERGE_ELEMS = 2 * CHUNK_FLAT_ELEMS / FP4_BLOCK;
 constexpr int64_t REDUCE_SLOT_ELEMS = BYTES_ALIGN / sizeof(float);
 constexpr int32_t REDUCE_SLOT_BYTE_SHIFT = 5;
@@ -107,6 +133,38 @@ constexpr uint8_t X_EVENT_ID = 4;       // MTE2_V one-shot after the x load
 __aicore__ inline int64_t AlignUpBytes(int64_t bytes)
 {
     return (bytes + BYTES_ALIGN - 1) / BYTES_ALIGN * BYTES_ALIGN;
+}
+
+// Width of one column tile of a projection's reduction dimension.
+//
+// MAX_CHUNK_COLS is the widest tile the staging buffers hold, but claiming it
+// greedily leaves the remainder as a stub tile: a 704-column leg splits
+// 512 + 192, and that second tile carries six of sixteen blocks while paying
+// a whole tile's fixed reduction cost -- the zeroing of the slot buffers, the
+// 32-block scale decode, the slot gather and the power-of-two merge tree are
+// all sized by pow2Blocks, never by activeBlocks. Spreading the columns over
+// the same number of tiles retires that shape: 704 becomes 384 + 320.
+//
+// The tile count is deliberately unchanged, so this does not reduce the total
+// fixed cost -- it stops one tile from carrying almost none of the work that
+// cost buys. It does change how the per-block partials group in the fp32
+// merge tree, so results move within the <= 2 ULP contract rather than
+// staying bit-identical to the greedy split.
+//
+// 704 / 2 = 352 is a multiple of FP4_BLOCK but not of COL_TILE_GRAIN, which
+// is why the even split is 384 + 320 and not 352 + 352.
+__aicore__ inline int64_t BalancedChunkCols(int64_t fullCols)
+{
+    if (fullCols <= MAX_CHUNK_COLS) {
+        return fullCols;
+    }
+    const int64_t tiles = (fullCols + MAX_CHUNK_COLS - 1) / MAX_CHUNK_COLS;
+    const int64_t even = (fullCols + tiles - 1) / tiles;
+    const int64_t cols = (even + COL_TILE_GRAIN - 1) / COL_TILE_GRAIN * COL_TILE_GRAIN;
+    // tiles is the minimum, so even <= MAX_CHUNK_COLS and the rounding cannot
+    // cross it; the clamp keeps the staging bound true by construction rather
+    // than by that argument.
+    return cols < MAX_CHUNK_COLS ? cols : MAX_CHUNK_COLS;
 }
 
 class Dsv4MoeExpertKernel {
@@ -207,7 +265,7 @@ private:
     __aicore__ void ProjectLeg(int32_t legIndex, const LocalTensor<float> &xFull, LocalTensor<float> &legAcc)
     {
         const int64_t fullCols = (legIndex == LEG_W2) ? inter_ : hidden_;
-        const int64_t cols = fullCols < MAX_CHUNK_COLS ? fullCols : MAX_CHUNK_COLS;
+        const int64_t cols = BalancedChunkCols(fullCols);
         const int64_t rows = (legIndex == LEG_W2) ? hidden_ : inter_;
         const int64_t chunkRows = MIN_CHUNK_ROWS;
         const int64_t pow2Blocks = BYTES_ALIGN;
@@ -345,7 +403,7 @@ private:
     __aicore__ void SplitColumns(const LocalTensor<float>& even, const LocalTensor<float>& odd,
                                 const LocalTensor<float>& src, uint32_t count)
     {
-#if __CCE_AICORE__ == 220
+#if DSV4_ARCH_C220
         LocalTensor<int32_t> offsets = stageABuf_.Get<int32_t>();
         const uint32_t halfCount = count / FP4_PER_BYTE;
         CreateGatherIndices(offsets, halfCount);
@@ -369,7 +427,7 @@ private:
     {
         const uint32_t count = byteCount * FP4_PER_BYTE;
 
-#if __CCE_AICORE__ == 220
+#if DSV4_ARCH_C220
         WidenBytes32(stageA, packed, stageB, byteCount);
 #else
         LocalTensor<uint16_t> wide = stageB.template ReinterpretCast<uint16_t>();
@@ -398,7 +456,7 @@ private:
         ShiftLeft(stageA, stageA, 23, count); // (e + 126) << 23
         VectorDependencyBarrier();
 
-#if __CCE_AICORE__ == 220
+#if DSV4_ARCH_C220
         // The low mantissa bit is active only for normal magnitudes (mag >= 2).
         Duplicate(stageC, 1, count);
         VectorDependencyBarrier();
@@ -472,7 +530,7 @@ private:
         LocalTensor<int32_t> scratch = mergeBuf1_.Get<int32_t>();
         LocalTensor<uint8_t> special = decMaskBuf_.Get<uint8_t>();
 
-#if __CCE_AICORE__ == 220
+#if DSV4_ARCH_C220
         WidenBytes32(bits, scales, wrap, count);
 #else
         LocalTensor<uint32_t> bitsU32 = scalesF32Buf_.Get<uint32_t>();
@@ -493,7 +551,7 @@ private:
         ShiftLeft(bits, bits, 23, count);   // b << 23
         VectorDependencyBarrier();
 
-#if __CCE_AICORE__ == 220
+#if DSV4_ARCH_C220
         // Find special condition: wrap in {0, 1}
         ShiftRight(scratch, wrap, 1, count);
         VectorDependencyBarrier();

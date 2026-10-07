@@ -5,7 +5,11 @@
 # See the License for details.
 # ----------------------------------------------------------------------------
 
-if(NOT "ascend950" IN_LIST ASCEND_COMPUTE_UNIT)
+# The kernel carries an AICore config for the dav-c310 regbase core
+# (ascend950) and the dav-c220 vector core (ascend910b, i.e. Ascend910B1..B4).
+# Any other compute unit has no code path in op_kernel and is skipped here
+# rather than failing the kernel compile on an unsupported core generation.
+if(NOT "ascend950" IN_LIST ASCEND_COMPUTE_UNIT AND NOT "ascend910b" IN_LIST ASCEND_COMPUTE_UNIT)
     return()
 endif()
 

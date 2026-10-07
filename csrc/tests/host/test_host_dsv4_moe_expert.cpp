@@ -45,12 +45,24 @@ using vllm_ascend::test::dsv4::Bf16BitsToFloat;
 using vllm_ascend::test::dsv4::Bf16UlpDistance;
 using vllm_ascend::test::dsv4::E2m1Table;
 using vllm_ascend::test::dsv4::E8m0ToScale;
+using vllm_ascend::test::dsv4::ExpertChunkCols;
 using vllm_ascend::test::dsv4::ExpertInputs;
+using vllm_ascend::test::dsv4::ExpertUbBytes;
 using vllm_ascend::test::dsv4::FloatToBf16Bits;
 using vllm_ascend::test::dsv4::GeometryIsAccepted;
+using vllm_ascend::test::dsv4::kChunkFlatElems;
+using vllm_ascend::test::dsv4::kColTileGrain;
+using vllm_ascend::test::dsv4::kExpertStreamingScratchBytes;
 using vllm_ascend::test::dsv4::kFp4Block;
 using vllm_ascend::test::dsv4::kFp4PerByte;
+using vllm_ascend::test::dsv4::kMaxChunkCols;
+using vllm_ascend::test::dsv4::kMaxHiddenSize;
+using vllm_ascend::test::dsv4::kMaxInterSize;
+using vllm_ascend::test::dsv4::kMinChunkRows;
+using vllm_ascend::test::dsv4::kPaddedBlocksPerRow;
 using vllm_ascend::test::dsv4::kSwigluLimit;
+using vllm_ascend::test::dsv4::kUbBytesAscend910B;
+using vllm_ascend::test::dsv4::kUbBytesAscend950;
 using vllm_ascend::test::dsv4::ReferenceExpert;
 using vllm_ascend::test::dsv4::SwiGluElement;
 using vllm_ascend::test::dsv4::UnpackFp4;
@@ -395,6 +407,120 @@ TEST(Dsv4Tiling, AcceptsBringUpAndProductionWithinUbBudget) {
   EXPECT_TRUE(GeometryIsAccepted(7168, 2048));
   EXPECT_FALSE(GeometryIsAccepted(7232, 2048));
   EXPECT_FALSE(GeometryIsAccepted(7168, 2112));
+}
+
+TEST(Dsv4Tiling, ProductionFitsTheSmallerSupportedPart) {
+  // op_host/dsv4_moe_expert_tiling.cpp computes this same total from the chunk
+  // constants and rejects a geometry the device's own UB cannot hold. The
+  // operator is registered for the Ascend910B (192 KiB of UB per core) and the
+  // Ascend950 (more), so the 910B is the binding constraint and production has
+  // to clear it -- the geometry limits alone were chosen against the 950.
+  EXPECT_EQ(ExpertUbBytes(7168, 2048), static_cast<size_t>(173568));
+  EXPECT_LE(ExpertUbBytes(7168, 2048), kUbBytesAscend910B);
+  EXPECT_LE(ExpertUbBytes(7168, 2048), kUbBytesAscend950);
+
+  // The fixed chunk payload is geometry-independent, and the rest is linear in
+  // the two dimensions with max(hidden, inter) priced once for the aliased
+  // fp32 input/down accumulator.
+  EXPECT_EQ(ExpertUbBytes(64, 64), kExpertStreamingScratchBytes + static_cast<size_t>(64 * (2 + 4 + 18)));
+  EXPECT_EQ(ExpertUbBytes(64, 2048), ExpertUbBytes(2048, 2048) - static_cast<size_t>(2 * 2048 - 2 * 64));
+}
+
+TEST(Dsv4Tiling, ColumnTilesCoverEveryLegWithLegalWidths) {
+  // Every width the kernel's column tiling produces has to be a legal MTE2
+  // shape, fit the staging buffers, and the tiles have to cover the leg
+  // exactly -- for every reduction dimension the tiling function accepts, not
+  // for a sample of them. Enumerating is what makes this checkable without a
+  // simulator.
+  for (int64_t full = kColTileGrain; full <= kMaxHiddenSize; full += kColTileGrain) {
+    const int64_t cols = ExpertChunkCols(full);
+    ASSERT_GT(cols, 0) << "fullCols=" << full;
+    EXPECT_LE(cols, kMaxChunkCols) << "fullCols=" << full;
+    // activeCols/2 is the packed burst, so the width must be a multiple of 64,
+    // not merely of the 32-element scale block.
+    EXPECT_EQ(cols % kColTileGrain, 0) << "fullCols=" << full << " cols=" << cols;
+
+    // Same minimum tile count as claiming kMaxChunkCols greedily: balancing
+    // must not buy uniformity by adding a tile.
+    const int64_t greedy_tiles = (full + kMaxChunkCols - 1) / kMaxChunkCols;
+    EXPECT_EQ((full + cols - 1) / cols, greedy_tiles) << "fullCols=" << full << " cols=" << cols;
+
+    // cols is the NARROWEST legal width that still covers the leg in that many
+    // tiles, which is what makes the last tile as wide as the grain allows.
+    // One grain narrower must need another tile.
+    if (cols > kColTileGrain) {
+      const int64_t narrower = cols - kColTileGrain;
+      EXPECT_GT((full + narrower - 1) / narrower, greedy_tiles)
+          << "fullCols=" << full << " cols=" << cols << " is not minimal";
+    }
+
+    int64_t covered = 0;
+    int64_t narrowest = cols;
+    for (int64_t col0 = 0; col0 < full; col0 += cols) {
+      const int64_t active = std::min(full - col0, cols);
+      EXPECT_EQ(col0 % kColTileGrain, 0) << "fullCols=" << full << " col0=" << col0;
+      EXPECT_EQ(active % kColTileGrain, 0) << "fullCols=" << full << " active=" << active;
+      EXPECT_LE(kMinChunkRows * (active / kFp4PerByte), kChunkFlatElems / kFp4PerByte)
+          << "packed staging overflow at fullCols=" << full;
+      EXPECT_LE(kMinChunkRows * (active / kFp4PerByte) * 2, kChunkFlatElems)
+          << "decoded-code buffer overflow at fullCols=" << full;
+      EXPECT_LE(active / kFp4Block, kPaddedBlocksPerRow)
+          << "more blocks than a padded scale row holds at fullCols=" << full;
+      narrowest = std::min(narrowest, active);
+      covered += active;
+    }
+    EXPECT_EQ(covered, full) << "fullCols=" << full << " cols=" << cols;
+
+    // The last tile is never narrower than the greedy split would have left
+    // it. A 64-column grain cannot always reach an even split -- fullCols=4160
+    // needs nine tiles and ceil(4160/9)=463 rounds back up to 512 -- so this,
+    // not an evenness bound, is what holds for every geometry.
+    const int64_t greedy_last = full - (greedy_tiles - 1) * kMaxChunkCols;
+    EXPECT_GE(narrowest, greedy_last) << "fullCols=" << full << " cols=" << cols;
+  }
+}
+
+TEST(Dsv4Tiling, SevenHundredFourNoLongerLeavesAStubTile) {
+  // 704 is the bring-up geometry that exposed this: greedy 512 left 192, a
+  // tile carrying six of sixteen blocks that still paid a full tile's fixed
+  // reduction cost. 704/2 = 352 is a multiple of kFp4Block but not of
+  // kColTileGrain, so the closest legal balance is 384 + 320, not 352 + 352.
+  EXPECT_EQ(ExpertChunkCols(704), 384);
+  EXPECT_EQ(704 - 384, 320);
+  EXPECT_NE(352 % kColTileGrain, 0) << "352 would have been the even split";
+
+  // 576 was the other unbalanced case: 512 + 64 becomes 320 + 256.
+  EXPECT_EQ(ExpertChunkCols(576), 320);
+
+  // Legs that already divide evenly must not move, production included.
+  EXPECT_EQ(ExpertChunkCols(1024), kMaxChunkCols);
+  EXPECT_EQ(ExpertChunkCols(2048), kMaxChunkCols);
+  EXPECT_EQ(ExpertChunkCols(4096), kMaxChunkCols);
+  EXPECT_EQ(ExpertChunkCols(7168), kMaxChunkCols);
+
+  // A leg that fits one tile is returned whole.
+  EXPECT_EQ(ExpertChunkCols(64), 64);
+  EXPECT_EQ(ExpertChunkCols(kMaxChunkCols), kMaxChunkCols);
+}
+
+TEST(Dsv4Tiling, TheSmallerPartIsTheBindingUbConstraint) {
+  // A geometry can fit the Ascend950's UB and not the Ascend910B's. That split
+  // is why op_host/dsv4_moe_expert_tiling.cpp takes the size from the platform
+  // rather than assuming the part it was built for, and it is not visible
+  // inside the validated envelope -- so walk the formula out to it. Both
+  // dimensions stay legal multiples of 64.
+  int64_t hidden = kMaxHiddenSize;
+  while (ExpertUbBytes(hidden, kMaxInterSize) <= kUbBytesAscend910B) {
+    hidden += kFp4PerByte * kFp4Block;
+  }
+  EXPECT_GT(ExpertUbBytes(hidden, kMaxInterSize), kUbBytesAscend910B);
+  EXPECT_LE(ExpertUbBytes(hidden, kMaxInterSize), kUbBytesAscend950)
+      << "hidden " << hidden << " overflows both parts, so it says nothing about the split";
+
+  // Inside the envelope the dimension limits bind first on both parts, so
+  // production is accepted and the UB rule is headroom rather than the gate.
+  EXPECT_TRUE(GeometryIsAccepted(kMaxHiddenSize, kMaxInterSize));
+  EXPECT_FALSE(GeometryIsAccepted(hidden, kMaxInterSize)) << "past the dimension limit as well";
 }
 
 TEST(Dsv4Tiling, RequiresMultiplesOfSixtyFour) {
