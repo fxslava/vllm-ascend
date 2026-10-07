@@ -42,7 +42,15 @@ aclrtMemcpyKind ToAclKind(MemcpyKind kind) {
 }
 
 // std::aligned_alloc demands a size that is a multiple of the alignment.
-void* AlignedHostAlloc(size_t bytes, size_t alignment = kArenaAlignBytes) {
+//
+// The default is the hardware page (4096), not kArenaAlignBytes: the simulated
+// backend models what aclrtMalloc(..., ACL_MEM_MALLOC_HUGE_FIRST) and
+// aclrtMallocHost actually serve -- page-aligned, huge-page-friendly memory --
+// and the arena's contract is stated on ABSOLUTE descriptor addresses, so the
+// simulator must hand out at least the finest alignment any reservation asks
+// for (dsv4_contract_smoke checks a 4096-byte reservation on its absolute
+// address, not just its offset).
+void* AlignedHostAlloc(size_t bytes, size_t alignment = kSimDeviceAllocAlignBytes) {
   const size_t rounded = ((bytes + alignment - 1) / alignment) * alignment;
   return std::aligned_alloc(alignment, rounded);
 }
@@ -250,6 +258,11 @@ void SimulatedDeviceOps::DeviceFree(void* pointer) {
 void* SimulatedDeviceOps::HostPinnedMalloc(size_t bytes) {
   void* pointer = AlignedHostAlloc(bytes);
   DSV4_REQUIRE(pointer != nullptr, "simulated pinned host allocation of " << bytes << " bytes failed");
+  // Same absolute-address rule as DeviceMalloc: page-locked memory that a DMA
+  // sources must not start mid-page in the simulator when the physical backend
+  // would not.
+  DSV4_REQUIRE(reinterpret_cast<uintptr_t>(pointer) % kSimDeviceAllocAlignBytes == 0,
+               "simulated pinned host allocation is not page-aligned");
   ++counters_.host_pinned_allocations;
   return pointer;
 }

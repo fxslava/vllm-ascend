@@ -134,6 +134,16 @@ inline constexpr size_t kQuantMmX1Scale = 2;
 inline constexpr size_t kQuantMmX2Scale = 3;
 inline constexpr size_t kQuantMmOut = 9;
 
+// aclnnSoftplus(x, beta, threshold, out) and aclnnSqrt(x, out): the two host
+// scalars are skipped by the IR numbering, so both unary stages have out at
+// tensor index 1. Neither address is ever swapped -- the scoring buffers are
+// step-static activations -- but the indices are recorded so a bring-up can
+// check them like every other stage.
+inline constexpr size_t kSoftplusX = 0;
+inline constexpr size_t kSoftplusOut = 1;
+inline constexpr size_t kSqrtX = 0;
+inline constexpr size_t kSqrtOut = 1;
+
 // aclnnMoeGatingTopKV2(x, bias, inputIds, tid2eid, ..., yOut, expertIdxOut,
 //                      outOut)
 inline constexpr size_t kGatingX = 0;
@@ -236,7 +246,7 @@ class Dsv4Pipeline {
   // move-empties a zero-size vector. The vector is therefore born at full
   // capacity and only the first `stage_count_` entries are live; it is never
   // resized or copied again.
-  static constexpr size_t kMaxPipelineStages = 32;
+  static constexpr size_t kMaxPipelineStages = 40;
   std::vector<PipelineStage> stages_ = std::vector<PipelineStage>(kMaxPipelineStages);
   size_t stage_count_ = 0;
   StepCounters counters_;

@@ -79,6 +79,9 @@ enum class OpId {
   kInplaceAdd,
   kSwiGlu,
   kArgMax,
+  // Decomposed sqrtsoftplus router scoring (DSV4 `scoring_func`)
+  kSoftplus,
+  kSqrt,
   // MoE
   kMoeGatingTopKV2,
   kMoeInitRoutingV4,
@@ -179,7 +182,14 @@ using SwiGluPlanFn = int (*)(const aclTensor* x, int64_t dim, const aclTensor* o
                              aclOpExecutor** executor);
 
 using ArgMaxPlanFn = int (*)(const aclTensor* self, int64_t dim, bool keepdim, aclTensor* out,
-                             uint64_t* workspace_size, aclOpExecutor** executor);
+                              uint64_t* workspace_size, aclOpExecutor** executor);
+
+// aclnnSoftplus: stage 1 of the decomposed sqrtsoftplus router scoring. beta
+// and threshold are HOST aclScalars (FP32, created once by the arena); the
+// elementwise result feeds aclnnSqrt (UnaryPlanFn) and then the pre-normalized
+// gating stage. SoftplusConfig in v5_ops_moe.py pins the same two values.
+using SoftplusPlanFn = int (*)(const aclTensor* self, const aclScalar* beta, const aclScalar* threshold,
+                               aclTensor* out, uint64_t* workspace_size, aclOpExecutor** executor);
 
 using MoeGatingTopKV2PlanFn = int (*)(const aclTensor* x, const aclTensor* bias_optional,
                                       const aclTensor* input_ids_optional, const aclTensor* tid2eid_optional,

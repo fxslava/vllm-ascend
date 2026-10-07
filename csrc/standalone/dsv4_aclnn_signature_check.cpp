@@ -53,6 +53,16 @@
 #include <aclnnop/aclnn_swi_glu.h>
 #include <aclnnop/aclnn_swiglu_mx_quant.h>
 
+#if __has_include(<aclnnop/aclnn_softplus.h>)
+#include <aclnnop/aclnn_softplus.h>
+#define DSV4_HAS_SOFTPLUS 1
+#endif
+
+#if __has_include(<aclnnop/aclnn_sqrt.h>)
+#include <aclnnop/aclnn_sqrt.h>
+#define DSV4_HAS_SQRT 1
+#endif
+
 #if __has_include(<aclnnop/aclnn_moe_gating_top_k_v2.h>)
 #include <aclnnop/aclnn_moe_gating_top_k_v2.h>
 #define DSV4_HAS_MOE_GATING_TOP_K_V2 1
@@ -96,6 +106,13 @@ DSV4_ASSERT_SIGNATURE(aclnnSwigluMxQuantGetWorkspaceSize, SwigluMxQuantPlanFn);
 DSV4_ASSERT_SIGNATURE(aclnnMoeTokenUnpermuteGetWorkspaceSize, MoeTokenUnpermutePlanFn);
 DSV4_ASSERT_SIGNATURE(aclnnGroupedMatmulSwigluQuantV2GetWorkspaceSize, GroupedMatmulSwigluQuantV2PlanFn);
 DSV4_ASSERT_SIGNATURE(aclnnGroupedMatmulFinalizeRoutingV3GetWorkspaceSize, GroupedMatmulFinalizeRoutingV3PlanFn);
+
+#ifdef DSV4_HAS_SOFTPLUS
+DSV4_ASSERT_SIGNATURE(aclnnSoftplusGetWorkspaceSize, SoftplusPlanFn);
+#endif
+#ifdef DSV4_HAS_SQRT
+DSV4_ASSERT_SIGNATURE(aclnnSqrtGetWorkspaceSize, UnaryPlanFn);
+#endif
 
 #ifdef DSV4_HAS_MOE_GATING_TOP_K_V2
 DSV4_ASSERT_SIGNATURE(aclnnMoeGatingTopKV2GetWorkspaceSize, MoeGatingTopKV2PlanFn);

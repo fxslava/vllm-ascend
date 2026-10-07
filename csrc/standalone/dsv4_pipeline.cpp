@@ -153,6 +153,10 @@ struct Dsv4Pipeline::Tensors {
 
   // routing
   aclTensor* router_logits = nullptr;         // [1, 256] fp32
+  aclTensor* router_softplus = nullptr;       // [1, 256] fp32, softplus(logits)
+  aclTensor* router_scores = nullptr;         // [1, 256] fp32, sqrt(softplus(logits))
+  aclScalar* softplus_beta = nullptr;         // host scalar, kSoftplusBeta as fp32
+  aclScalar* softplus_threshold = nullptr;    // host scalar, kSoftplusThreshold as fp32
   aclTensor* gating_weights = nullptr;        // [1, 6] fp32
   aclTensor* gating_indices = nullptr;        // [1, 6] int32
   aclTensor* local_indices = nullptr;         // [1, 6] int32 (0..5, host-written)
@@ -383,6 +387,8 @@ void Dsv4Pipeline::ReserveBuffers() {
   arena_.Reserve("act.proj_out", Bf16Bytes(kTokensPerStep * kHiddenSize));
 
   arena_.Reserve("moe.router_logits", Fp32Bytes(kTokensPerStep * kNumRoutedExperts));
+  arena_.Reserve("moe.router_softplus", Fp32Bytes(kTokensPerStep * kNumRoutedExperts));
+  arena_.Reserve("moe.router_scores", Fp32Bytes(kTokensPerStep * kNumRoutedExperts));
   arena_.Reserve("moe.gating_weights", Fp32Bytes(kTokensPerStep * kNumExpertsPerTok));
   t.h_gating_indices = arena_.Reserve("moe.gating_indices", Int32Bytes(kTokensPerStep * kNumExpertsPerTok));
   t.h_local_indices = arena_.Reserve("moe.local_indices", Int32Bytes(kTokensPerStep * kNumExpertsPerTok));
@@ -596,6 +602,19 @@ void Dsv4Pipeline::CreateDescriptors() {
   // --- routing -----------------------------------------------------------
   t.router_logits = arena_.CreateTensor("router_logits", {kTokensPerStep, kNumRoutedExperts}, kAclFloat32,
                                         address("moe.router_logits"));
+  t.router_softplus = arena_.CreateTensor("router_softplus", {kTokensPerStep, kNumRoutedExperts}, kAclFloat32,
+                                          address("moe.router_softplus"));
+  t.router_scores = arena_.CreateTensor("router_scores", {kTokensPerStep, kNumRoutedExperts}, kAclFloat32,
+                                        address("moe.router_scores"));
+  {
+    // The host scalars must carry fp32 bytes: the constants are double, and
+    // passing a double's bit pattern as an ACL_FLOAT scalar would silently
+    // change softplus's beta/threshold.
+    const float beta = static_cast<float>(kSoftplusBeta);
+    const float threshold = static_cast<float>(kSoftplusThreshold);
+    t.softplus_beta = arena_.CreateScalar("softplus_beta", kAclFloat32, &beta);
+    t.softplus_threshold = arena_.CreateScalar("softplus_threshold", kAclFloat32, &threshold);
+  }
   t.gating_weights = arena_.CreateTensor("gating_weights", {kTokensPerStep, kNumExpertsPerTok}, kAclFloat32,
                                          address("moe.gating_weights"));
   t.gating_indices = arena_.CreateTensor("gating_indices", {kTokensPerStep, kNumExpertsPerTok}, kAclInt32,
@@ -771,7 +790,8 @@ void Dsv4Pipeline::PlanStages() {
       OpId::kRmsNorm,       OpId::kRmsNormDynamicMxQuant, OpId::kDynamicMxQuant,
       OpId::kMatmul,        OpId::kQuantMatmulV5,         OpId::kApplyRotaryPosEmbV2,
       OpId::kScatterPaKvCache, OpId::kFusedInferAttentionScoreV5, OpId::kInplaceAdd,
-      OpId::kSwiGlu,        OpId::kArgMax,                OpId::kMoeGatingTopKV2,
+      OpId::kSwiGlu,        OpId::kArgMax,                OpId::kSoftplus,
+      OpId::kSqrt,          OpId::kMoeGatingTopKV2,
       OpId::kMoeInitRoutingV4, OpId::kGroupedMatmulV5,
   };
   if (config_.moe_path == MoePath::kFused) {
@@ -941,16 +961,37 @@ void Dsv4Pipeline::PlanStages() {
                                                          t.router_logits, kCubeMathTypeKeepDtype);
     adopt(entry, workspace, executor);
   }
-  // 16. noaux_tc gating: bias shifts selection only, scaling 1.5 applied here.
+  // 16-17. the DSV4 sqrtsoftplus scoring, decomposed onto the same stream.
+  //     The stock gating operator's normType only offers softmax / sigmoid
+  //     (the older aclnnMoeGatingTopK's two modes), so scores =
+  //     sqrt(softplus(logits)) is computed by two elementwise stages and the
+  //     gating stage below receives pre-normalized scores. Mirrors
+  //     SqrtSoftplusRouter in tools/dsv4_moe_runtime/hardware/v5_ops_moe.py.
+  {
+    PipelineStage& entry = add("router_softplus", OpId::kSoftplus);
+    const uint64_t workspace =
+        PlanAclnnOp<SoftplusPlanFn>(ops_, entry.op, &executor, t.router_logits, t.softplus_beta,
+                                    t.softplus_threshold, t.router_softplus);
+    adopt(entry, workspace, executor);
+  }
+  {
+    PipelineStage& entry = add("router_sqrt", OpId::kSqrt);
+    const uint64_t workspace =
+        PlanAclnnOp<UnaryPlanFn>(ops_, entry.op, &executor, t.router_softplus, t.router_scores);
+    adopt(entry, workspace, executor);
+  }
+  // 18. noaux_tc gating over the pre-normalized scores: bias shifts selection
+  //     only, renorm=1 L1-renormalizes the top-6 scores to sum 1.0 (eps-
+  //     guarded) and scaling 1.5 is applied here.
   {
     PipelineStage& entry = add("gating", OpId::kMoeGatingTopKV2);
     const uint64_t workspace = PlanAclnnOp<MoeGatingTopKV2PlanFn>(
-        ops_, entry.op, &executor, t.router_logits, t.w_router_bias, nullptr, nullptr, kNumExpertsPerTok,
-        kGatingKGroup, kGatingGroupCount, kGatingGroupSelectMode, kGatingRenormOff, config_.gating_norm_type,
+        ops_, entry.op, &executor, t.router_scores, t.w_router_bias, nullptr, nullptr, kNumExpertsPerTok,
+        kGatingKGroup, kGatingGroupCount, kGatingGroupSelectMode, kGatingRenormL1, config_.gating_norm_type,
         false, kRoutedScalingFactor, kGatingEps, t.gating_weights, t.gating_indices, nullptr);
     adopt(entry, workspace, executor);
   }
-  // 17. dropless dispatch over the SIX locally renumbered experts. The expert
+  // 19. dropless dispatch over the SIX locally renumbered experts. The expert
   //     ids fed in are 0..5, not the global 0..255: the weight list has six
   //     entries, so the device cumsum must have six groups to match it. The
   //     renumbering is free -- the host already holds the global ids, because
@@ -964,7 +1005,7 @@ void Dsv4Pipeline::PlanStages() {
         t.expanded_scale, t.expanded_weights);
     adopt(entry, workspace, executor);
   }
-  // 18. expert GEMM 1. Fused path: GEMM + clamped SwiGLU (limit 10.0) + MX
+  // 20. expert GEMM 1. Fused path: GEMM + clamped SwiGLU (limit 10.0) + MX
   //     requant in one op.
   if (config_.moe_path == MoePath::kFused) {
     PipelineStage& entry = add("expert_gemm1", OpId::kGroupedMatmulSwigluQuantV2);
@@ -991,7 +1032,7 @@ void Dsv4Pipeline::PlanStages() {
         t.gemm1_out, t.gemm1_scale);
     adopt(activation, act_workspace, executor);
   }
-  // 19. expert GEMM 2. A tensor-LIST weight, which is what lets the six experts
+  // 21. expert GEMM 2. A tensor-LIST weight, which is what lets the six experts
   //     sit in six scattered HBM slots. `aclnnGroupedMatmulFinalizeRoutingV3`
   //     would fuse the combine, but its x2 is a single tensor, i.e. the experts
   //     must be contiguous -- which an exclusive LRU slot pool cannot promise.
@@ -1003,7 +1044,7 @@ void Dsv4Pipeline::PlanStages() {
         kGmmGroupTypeM, kGmmGroupListTypeCumsum, kGmmActTypeNone, nullptr, t.gemm2_out_list, nullptr, nullptr);
     adopt(entry, workspace, executor);
   }
-  // 20. routing combine. For a single-token step the six expanded rows are the
+  // 22. routing combine. For a single-token step the six expanded rows are the
   //     same token, so the weighted sum IS a [1, 6] x [6, hidden] matmul over
   //     the permuted routing weights the dispatch emitted. Exact, and both ops
   //     have an ascend950 kernel. This is the one stage that does not
@@ -1015,7 +1056,7 @@ void Dsv4Pipeline::PlanStages() {
                                                          t.gemm2_out, t.routed_out, kCubeMathTypeKeepDtype);
     adopt(entry, workspace, executor);
   }
-  // 21-24. the shared expert: every token uses it, so it is never routed.
+  // 23-26. the shared expert: every token uses it, so it is never routed.
   {
     PipelineStage& entry = add("shared_gate_up", OpId::kQuantMatmulV5);
     const uint64_t workspace = PlanAclnnOp<QuantMatmulV5PlanFn>(
@@ -1044,7 +1085,7 @@ void Dsv4Pipeline::PlanStages() {
         nullptr, nullptr, nullptr, nullptr, nullptr, false, true, config_.dense_group_size, t.shared_out);
     adopt(entry, workspace, executor);
   }
-  // 25-26. routed + shared, then the MoE residual.
+  // 27-28. routed + shared, then the MoE residual.
   {
     PipelineStage& entry = add("add_shared", OpId::kInplaceAdd);
     const uint64_t workspace =
@@ -1057,7 +1098,7 @@ void Dsv4Pipeline::PlanStages() {
         PlanAclnnOp<InplaceAddPlanFn>(ops_, entry.op, &executor, t.hidden, t.routed_out, nullptr);
     adopt(entry, workspace, executor);
   }
-  // 27-29. the head.
+  // 29-31. the head.
   {
     PipelineStage& entry = add("final_norm", OpId::kRmsNorm);
     const uint64_t workspace = PlanAclnnOp<RmsNormPlanFn>(ops_, entry.op, &executor, t.hidden, t.w_final_norm,
@@ -1201,6 +1242,8 @@ void Dsv4Pipeline::RunMoe(int32_t layer) {
   Launch(stage("post_norm_quant"));
   Launch(stage("post_norm"));
   Launch(stage("router"));
+  Launch(stage("router_softplus"));
+  Launch(stage("router_sqrt"));
   Launch(stage("gating"));
 
   FetchRouting(layer);
@@ -1307,9 +1350,13 @@ std::string Dsv4Pipeline::DescribeStages() const {
   out << "  NOT APPLIED: the Lightning Indexer (index_topk=" << kIndexTopK
       << "). The specified attention op is the dense paged MLA decode; the sparse\n"
          "               selection belongs to aclnnSparseFlashMla, which the brief's mapping does not list.\n";
-  out << "  UNVERIFIED: the router scoring function. aclnnMoeGatingTopKV2 normType=" << config_.gating_norm_type
-      << ", and no header\n              documents which value is sqrtsoftplus. Needs a device A/B against a host "
-         "reference.\n";
+  out << "  DECOMPOSED SCORING: the router scoring is sqrt(softplus(logits)) -- aclnnSoftplus (beta="
+      << kSoftplusBeta << ",\n               threshold=" << kSoftplusThreshold << ") then aclnnSqrt -- because the "
+         "stock gating\n               operator's normType offers softmax/sigmoid only. aclnnMoeGatingTopKV2 receives "
+         "the\n               pre-normalized scores (normType="
+      << config_.gating_norm_type << ", renorm=" << kGatingRenormL1 << ", eps=" << kGatingEps
+      << ").\n               The pass-through normType value still needs a device A/B against the host reference in\n"
+         "               v5_ops_moe.py (sqrt_softplus_routing); --gating-norm-type overrides it.\n";
   out << "  UNVERIFIED: aclnnQuantMatmulV5 groupSize=" << config_.dense_group_size
       << " (the block-128 dense scale encoding).\n";
   if (!backbone_->rope_tables_populated) {
@@ -1331,6 +1378,9 @@ std::string Dsv4Pipeline::DescribeSlotIndexMap() const {
   out << "  QuantMatmulV5           x1=" << slot::kQuantMmX1 << " x2=" << slot::kQuantMmX2
       << " x1Scale=" << slot::kQuantMmX1Scale << " x2Scale=" << slot::kQuantMmX2Scale
       << " out=" << slot::kQuantMmOut << "\n";
+  out << "  Softplus                x=" << slot::kSoftplusX << " out=" << slot::kSoftplusOut
+      << " (beta/threshold are scalars, skipped by the IR numbering)\n";
+  out << "  Sqrt                    x=" << slot::kSqrtX << " out=" << slot::kSqrtOut << "\n";
   out << "  MoeGatingTopKV2         x=" << slot::kGatingX << " bias=" << slot::kGatingBias
       << " y=" << slot::kGatingY << " expertIdx=" << slot::kGatingExpertIdx << "\n";
   out << "  ApplyRotaryPosEmbV2     cos=" << slot::kRotaryCos << " sin=" << slot::kRotarySin << "\n";

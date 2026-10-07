@@ -57,6 +57,9 @@ DSV4StaticMemoryArena::~DSV4StaticMemoryArena() {
   for (aclIntArray* array : owned_int_arrays_) {
     aclDestroyIntArray(array);
   }
+  for (aclScalar* scalar : owned_scalars_) {
+    aclDestroyScalar(scalar);
+  }
   if (workspace_ != nullptr) {
     device_.DeviceFree(workspace_);
   }
@@ -195,6 +198,38 @@ aclIntArray* DSV4StaticMemoryArena::CreateIntArray(const char* label, const std:
   record.element_count = static_cast<int64_t>(values.size());
   descriptors_.push_back(record);
   return array;
+}
+
+aclScalar* DSV4StaticMemoryArena::CreateScalar(const char* label, int32_t dtype, const void* value) {
+  RefuseIfSealed("CreateScalar");
+  size_t width = 0;
+  switch (dtype) {
+    case kAclFloat32:
+    case kAclInt32:
+      width = 4;
+      break;
+    case kAclInt64:
+      width = 8;
+      break;
+    default:
+      throw Dsv4Error(std::string(label) + ": scalar dtype " + std::to_string(dtype) +
+                     " is not one the arena knows the width of; extend CreateScalar rather than guessing");
+  }
+  scalar_values_.emplace_back(static_cast<const uint8_t*>(value), static_cast<const uint8_t*>(value) + width);
+  const std::vector<uint8_t>& bytes = scalar_values_.back();
+  aclScalar* scalar = aclCreateScalar(const_cast<void*>(static_cast<const void*>(bytes.data())),
+                                      static_cast<aclDataType>(dtype));
+  DSV4_REQUIRE(scalar != nullptr, label << ": aclCreateScalar returned null");
+  owned_scalars_.push_back(scalar);
+
+  DescriptorRecord record;
+  record.label = label;
+  record.kind = DescriptorRecord::Kind::kScalar;
+  record.dtype = dtype;
+  record.element_count = 1;
+  record.address = bytes.data();
+  descriptors_.push_back(record);
+  return scalar;
 }
 
 void DSV4StaticMemoryArena::NoteWorkspace(uint64_t bytes) {

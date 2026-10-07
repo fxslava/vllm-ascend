@@ -71,7 +71,7 @@ struct ArenaReservation {
 
 struct DescriptorRecord {
   const char* label = nullptr;
-  enum class Kind { kTensor, kTensorList, kIntArray } kind = Kind::kTensor;
+  enum class Kind { kTensor, kTensorList, kIntArray, kScalar } kind = Kind::kTensor;
   int32_t dtype = 0;
   int64_t element_count = 0;
   const void* address = nullptr;
@@ -112,6 +112,12 @@ class DSV4StaticMemoryArena {
   aclTensor* CreateFp4Tensor(const char* label, const std::vector<int64_t>& dims, void* data);
   aclTensorList* CreateTensorList(const char* label, const std::vector<aclTensor*>& tensors);
   aclIntArray* CreateIntArray(const char* label, const std::vector<int64_t>& values);
+  // A host aclScalar whose backing bytes the arena owns for its lifetime
+  // (`aclCreateScalar` keeps reading `value`, so the copy below is what the
+  // handle points at). `value` is copied; `dtype` decides how many bytes are
+  // read. Used for the aclnnSoftplus beta / threshold scalars, which must be
+  // planned once and never rebuilt inside the decode loop.
+  aclScalar* CreateScalar(const char* label, int32_t dtype, const void* value);
 
   // ACLNN workspace high-water mark, collected while planning.
   void NoteWorkspace(uint64_t bytes);
@@ -157,6 +163,10 @@ class DSV4StaticMemoryArena {
   std::vector<aclTensor*> owned_tensors_;
   std::vector<aclTensorList*> owned_lists_;
   std::vector<aclIntArray*> owned_int_arrays_;
+  std::vector<aclScalar*> owned_scalars_;
+  // Backing bytes of every owned scalar, kept alive for the arena's lifetime
+  // (a deque, like descriptor_shapes_: push_back must not move earlier elements).
+  std::deque<std::vector<uint8_t>> scalar_values_;
   // Dim / stride / value vectors handed to aclCreateTensor and
   // aclCreateIntArray are kept alive for the arena's lifetime, matching the
   // caution `AclnnIntArray` in csrc/tests/common/aclnn_runtime.hpp already

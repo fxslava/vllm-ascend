@@ -148,6 +148,108 @@ void TestHeaderParsing() {
 }
 
 // ---------------------------------------------------------------------------
+// 2b. The FP4 / E8M0 unpack mapping, checked against a real (tiny) file
+// ---------------------------------------------------------------------------
+
+// Writes a one-expert checkpoint for ExpertSlotLayout::ForGeometry(64, 32):
+// w1/w3 weight 1024 bytes each (shape [32, 32] in the packed-FP4 byte view),
+// w1/w3 scale 64 bytes each ([32, 2]), w2 weight 1024 ([64, 16]), w2 scale 64
+// ([64, 1]) -- 3264 payload bytes, exactly one slot. `weight_dtype` /
+// `scale_dtype` land in every header so a wrong-dtype checkpoint can be
+// expressed; `w1_bytes` resizes the first span for the wrong-size case.
+bool WriteExpertCheckpoint(const char* path, const char* weight_dtype, const char* scale_dtype, size_t w1_bytes) {
+  const size_t scale_bytes = 64;
+  const size_t w3_bytes = 1024;
+  const size_t w2_bytes = 1024;
+  const size_t total = w1_bytes + scale_bytes + w3_bytes + scale_bytes + w2_bytes + scale_bytes;
+
+  size_t cursor = 0;
+  std::string json;
+  const auto add_tensor = [&](const char* leaf, const char* dtype, const char* shape, size_t bytes) {
+    const size_t begin = cursor;
+    cursor += bytes;
+    json += ",\"layers.0.ffn.experts.0.";
+    json += leaf;
+    json += "\":{\"dtype\":\"";
+    json += dtype;
+    json += "\",\"shape\":";
+    json += shape;
+    json += ",\"data_offsets\":[";
+    json += std::to_string(begin);
+    json += ",";
+    json += std::to_string(cursor);
+    json += "]}";
+  };
+  add_tensor("w1.weight", weight_dtype, "[32,32]", w1_bytes);
+  add_tensor("w1.scale", scale_dtype, "[32,2]", scale_bytes);
+  add_tensor("w3.weight", weight_dtype, "[32,32]", w3_bytes);
+  add_tensor("w3.scale", scale_dtype, "[32,2]", scale_bytes);
+  add_tensor("w2.weight", weight_dtype, "[64,16]", w2_bytes);
+  add_tensor("w2.scale", scale_dtype, "[64,1]", scale_bytes);
+  json += "}";
+
+  std::FILE* file = std::fopen(path, "wb");
+  if (file == nullptr) {
+    return false;
+  }
+  const std::vector<char> payload(total, '\0');
+  const uint64_t header_length = json.size();
+  const bool wrote = std::fwrite(&header_length, sizeof(header_length), 1, file) == 1 &&
+                     std::fwrite(json.data(), 1, json.size(), file) == json.size() &&
+                     std::fwrite(payload.data(), 1, payload.size(), file) == payload.size();
+  std::fclose(file);
+  return wrote;
+}
+
+void TestExpertBindingValidation() {
+  Section("safetensors expert binding: the FP4 / E8M0 unpack mapping");
+  const ExpertSlotLayout layout = ExpertSlotLayout::ForGeometry(64, 32);
+  Check(layout.slot_num_bytes() == 3264, "the 64x32 test geometry packs into a 3,264-byte slot");
+
+  const char* path = "/tmp/dsv4_contract_smoke_experts.safetensors";
+  std::vector<uint8_t> slot(layout.slot_num_bytes());
+
+  // The admissible checkpoint: packed-FP4 weights and UE8M0 block scales.
+  Check(WriteExpertCheckpoint(path, "MOE_F4", "MOE_F4_SCALE", 1024), "the admissible checkpoint was written");
+  {
+    SafetensorsWeightSource source(path, layout, CheckpointNaming::kDsv4Flat, 1, 1);
+    Check(source.Contains(0, 0), "the flat naming scheme finds expert (0, 0)");
+    source.ReadExpertSlotRange(slot.data(), slot.size(), 0, slot.size(), 0, 0);
+    Check(true, "an FP4 + E8M0 checkpoint with exact span sizes reads into the slot");
+  }
+
+  // An FP8 checkpoint bound against the FP4 slot layout: same byte count would
+  // not catch it, the dtype string does.
+  Check(WriteExpertCheckpoint(path, "F8_E4M3", "MOE_F4_SCALE", 1024), "the FP8 checkpoint was written");
+  CheckRefuses(
+      [&] {
+        SafetensorsWeightSource source(path, layout, CheckpointNaming::kDsv4Flat, 1, 1);
+        source.ReadExpertSlotRange(slot.data(), slot.size(), 0, slot.size(), 0, 0);
+      },
+      "an FP8-E4M3 weight tensor bound against the packed-FP4 slot layout");
+
+  // A per-element scale dtype is not the block-32 E8M0 mapping either.
+  Check(WriteExpertCheckpoint(path, "MOE_F4", "U8", 1024), "the U8-scale checkpoint was written");
+  CheckRefuses(
+      [&] {
+        SafetensorsWeightSource source(path, layout, CheckpointNaming::kDsv4Flat, 1, 1);
+        source.ReadExpertSlotRange(slot.data(), slot.size(), 0, slot.size(), 0, 0);
+      },
+      "a per-element U8 scale tensor bound against the E8M0 block-32 scale region");
+
+  // A resized first span: the byte-exact slot total no longer tiles.
+  Check(WriteExpertCheckpoint(path, "MOE_F4", "MOE_F4_SCALE", 512), "the resized checkpoint was written");
+  CheckRefuses(
+      [&] {
+        SafetensorsWeightSource source(path, layout, CheckpointNaming::kDsv4Flat, 1, 1);
+        source.ReadExpertSlotRange(slot.data(), slot.size(), 0, slot.size(), 0, 0);
+      },
+      "a weight span that no longer matches the slot region size");
+
+  std::remove(path);
+}
+
+// ---------------------------------------------------------------------------
 // 3. The exclusive hierarchy, running for real on the simulated backend
 // ---------------------------------------------------------------------------
 
@@ -421,6 +523,20 @@ void TestHierarchyRefusals() {
 void TestStaticArena() {
   Section("static arena: alignment and the sealed-for-decode latch");
   SimulatedDeviceOps device(1ull << 30);
+
+  // The simulated allocators must honor the hardware page on ABSOLUTE
+  // addresses: aclrtMalloc(..., ACL_MEM_MALLOC_HUGE_FIRST) and aclrtMallocHost
+  // serve page-aligned memory, and the arena's alignment contract is stated on
+  // absolute descriptor addresses, not offsets.
+  void* device_block = device.DeviceMalloc(100);
+  void* pinned_block = device.HostPinnedMalloc(100);
+  Check(reinterpret_cast<uintptr_t>(device_block) % kSimDeviceAllocAlignBytes == 0,
+        "the simulated device allocator hands out 4096-aligned blocks (aclrtMalloc HUGE_FIRST parity)");
+  Check(reinterpret_cast<uintptr_t>(pinned_block) % kSimDeviceAllocAlignBytes == 0,
+        "the simulated pinned allocator hands out 4096-aligned blocks (aclrtMallocHost parity)");
+  device.HostPinnedFree(pinned_block);
+  device.DeviceFree(device_block);
+
   DSV4StaticMemoryArena arena(device);
 
   const ArenaHandle first = arena.Reserve("a.small", 100);
@@ -483,6 +599,8 @@ void TestOperatorTable() {
   Check(ops.available(OpId::kRmsNorm), "aclnnRmsNorm resolved from the linked libraries");
   Check(ops.available(OpId::kFusedInferAttentionScoreV5), "aclnnFusedInferAttentionScoreV5 resolved");
   Check(ops.available(OpId::kGroupedMatmulV5), "aclnnGroupedMatmulV5 resolved");
+  Check(ops.available(OpId::kSoftplus), "aclnnSoftplus resolved (sqrtsoftplus router scoring, stage 1)");
+  Check(ops.available(OpId::kSqrt), "aclnnSqrt resolved (sqrtsoftplus router scoring, stage 2)");
   Check(ops.available(OpId::kMoeGatingTopKV2), "aclnnMoeGatingTopKV2 resolved (CANN 9.2.0 and later)");
   Check(ops.available(OpId::kMoeInitRoutingV4), "aclnnMoeInitRoutingV4 resolved (CANN 9.2.0 and later)");
   CheckRefuses([&] { ops.RequireAll({OpId::kOpCount}); }, "a request for an out-of-range operator id");
@@ -498,6 +616,7 @@ int main() {
   try {
     TestExpertLayout();
     TestHeaderParsing();
+    TestExpertBindingValidation();
     TestHierarchyInvariants();
     TestLayerPlanning();
     TestSwapRoundTrip();
