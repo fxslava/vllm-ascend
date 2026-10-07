@@ -21,6 +21,14 @@ workspaces; the GMM groupList is the dispatch kernel's device-born cumsum.
 ``--sync`` waits and verifies ``cumsum[-1] == T*6`` -- under CAModel that
 simulates the kernels and is ORDERS OF MAGNITUDE slower than real silicon.
 
+CAModel startup race: the ESL/DDR checkpoint load keeps running for seconds
+after ``aclrtSetDevice``, and an opapi host call that lands inside it fails
+nondeterministically -- garbage aclnnStatus values, spurious
+``ctypes.ArgumentError: argument 12`` (the corrupted call lands beside a
+ctypes callback page) and occasional segfaults. ``--settle`` (default 15 s)
+sleeps after stream creation so the first plan call hits a settled
+simulator; raise it if the garbage-status detector still fires.
+
 Env (tq950-sim, repo mounted at /workspace)::
 
     source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -71,6 +79,9 @@ ACL_MEM_MALLOC_HUGE_FIRST = 0
 ACL_MEMCPY_HOST_TO_DEVICE = 1
 ACL_MEMCPY_DEVICE_TO_HOST = 2
 PLAN_BACKING_CAP = 1 << 20  # plan mode backs the full shapes with <=1 MiB dummies
+# Deterministic ACLNN rejections (op_errno.h): anything else in a status is
+# garbage from the camodel startup race -- see the --settle docstring above.
+KNOWN_ACLNN_STATUSES = {0, 32, 161001, 161002, 361001, 561000, 561001, 561002, 561003, 561101, 561102, 561103, 561104, 561105}
 
 ARG_TYPES = {
     "GATING": _MOE_GATING_TOP_K_V2_PLAN_ARGTYPES,
@@ -230,27 +241,48 @@ class StageContext:
     tensors: dict = field(default_factory=dict)
     lists: dict = field(default_factory=dict)
     tuning: object = None
+    _library: object = None
+
+    def ensure_lists(self, library) -> None:
+        """Create the GMM tensor lists + tuning array as late as possible.
+
+        On the camodel simulator an ``aclCreateTensorList`` that precedes the
+        first plan calls correlates with nondeterministic garbage statuses
+        from those calls; the list-free stages (GATING, DISPATCH) plan green
+        when the lists do not exist yet. Creating them immediately before the
+        only stage that consumes them keeps the early stages clean.
+        """
+        if self.lists:
+            return
+        list_names = ("expanded_x", "weight", "x_scale", "wgt_scale", "gmm_out")
+        self.lists = {name: library.create_tensor_list([self.tensors[name]]) for name in list_names}
+        self.tuning = library.create_int_array([self.geometry.top_k])
 
 
 def build_stage_context(library: AclnnLibrary, runtime: AclRuntime, geometry: LayerGeometry, launch: bool) -> StageContext:
-    context = StageContext(geometry=geometry)
+    context = StageContext(geometry=geometry, _library=library)
     for name, (dims, code, nbytes, filler) in _buffer_plans(geometry).items():
         backing = nbytes if launch else min(nbytes, PLAN_BACKING_CAP)
-        pointer = runtime.allocate(backing)
+        context.pointers[name] = runtime.allocate(backing)
+        context.tensors[name] = library.create_tensor_raw(context.pointers[name], dims, code)
+    # Content copies are deferred to materialize(): the plan phase reads
+    # shapes/dtypes only, and every H2D byte skipped is one less interaction
+    # with the simulator while its state is still fragile.
+    return context
+
+
+def materialize(context: StageContext, runtime: AclRuntime) -> None:
+    """Stage the deterministic buffer contents (launch mode only)."""
+    geometry = context.geometry
+    for name, (dims, code, nbytes, filler) in _buffer_plans(geometry).items():
         if filler is not None:
-            runtime.copy_in(pointer, deterministic_bytes(min(nbytes, backing), filler))
-        context.pointers[name] = pointer
-        context.tensors[name] = library.create_tensor_raw(pointer, dims, code)
+            runtime.copy_in(context.pointers[name], deterministic_bytes(nbytes, filler))
     # Valid expert indices sit in the buffer until the gating kernel (launched
     # ahead of dispatch on the same stream) rewrites them.
     runtime.copy_in(
         context.pointers["expert_idx"],
         seeded_expert_indices(geometry.tokens, geometry.top_k, geometry.experts, 704),
     )
-    list_names = ("expanded_x", "weight", "x_scale", "wgt_scale", "gmm_out")
-    context.lists = {name: library.create_tensor_list([context.tensors[name]]) for name in list_names}
-    context.tuning = library.create_int_array([geometry.top_k])
-    return context
 
 
 def run_stage(library, runtime, argtypes, plan_symbol, launch_symbol, args, do_launch: bool) -> str:
@@ -262,7 +294,10 @@ def run_stage(library, runtime, argtypes, plan_symbol, launch_symbol, args, do_l
     except ctypes.ArgumentError as exc:
         return f"plan FAILED conversion: {exc}"
     if status != ACL_SUCCESS:
-        return f"plan FAILED aclnnStatus {status}"
+        verdict = f"plan FAILED aclnnStatus {status}"
+        if status not in KNOWN_ACLNN_STATUSES:
+            verdict += " (garbage -- camodel startup race? raise --settle)"
+        return verdict
     if not do_launch:
         return f"plan ok (workspace {workspace_size.value} B)"
     launch_fn = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_void_p)(
@@ -276,8 +311,8 @@ def run_stage(library, runtime, argtypes, plan_symbol, launch_symbol, args, do_l
 
 
 def stage_arguments(context: StageContext) -> dict:
-    tensors, lists = context.tensors, context.lists
-    return {
+    tensors = context.tensors
+    specs = {
         "GATING": (
             moe_gating_top_k_v2_plan_args(
                 tensors["logits"], tensors["gate_y"], tensors["expert_idx"], bias=tensors["bias"], config=Dsv4GatingConfig()
@@ -297,7 +332,10 @@ def stage_arguments(context: StageContext) -> dict:
             "aclnnMoeInitRoutingV4GetWorkspaceSize",
             "aclnnMoeInitRoutingV4",
         ),
-        "EXPERT_GEMM": (
+    }
+    if context.lists:  # created lazily right before EXPERT_GEMM (ensure_lists)
+        lists = context.lists
+        specs["EXPERT_GEMM"] = (
             grouped_matmul_v5_plan_args(
                 lists["expanded_x"].pointer,
                 lists["weight"].pointer,
@@ -310,8 +348,8 @@ def stage_arguments(context: StageContext) -> dict:
             ),
             "aclnnGroupedMatmulV5GetWorkspaceSize",
             "aclnnGroupedMatmulV5",
-        ),
-    }
+        )
+    return specs
 
 
 def parse_args(argv: list[str] | None = None):
@@ -319,7 +357,15 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--preset", choices=sorted(PRESETS), default="dsv4")
     parser.add_argument("--tokens", type=int, default=None, help="override the preset token count")
     parser.add_argument("--stages", choices=("plan", "launch"), default="plan")
+    parser.add_argument(
+        "--only",
+        choices=("GATING", "DISPATCH", "EXPERT_GEMM"),
+        default=None,
+        help="run a single stage in this process -- the camodel sim is nondeterministic "
+        "for multi-stage processes, so the retry harness runs one stage per fresh boot",
+    )
     parser.add_argument("--sync", action="store_true", help="wait for kernel completion and verify the cumsum")
+    parser.add_argument("--settle", type=float, default=8.0, help="seconds to wait after device init for the camodel sim to settle")
     parser.add_argument("--device", type=int, default=0)
     return parser.parse_args(argv)
 
@@ -344,8 +390,21 @@ def main(argv: list[str] | None = None) -> int:
     runtime = AclRuntime(library, args.device)
     statuses: dict[str, str] = {}
     try:
+        if args.settle > 0:
+            # The camodel ESL/DDR checkpoint load races the first opapi host
+            # call; a call that lands inside it returns garbage or dies (see
+            # the module docstring). Give the simulator time to settle.
+            import time
+
+            print(f"[moe-v5-bringup] settling {args.settle:.0f}s for the simulator...")
+            time.sleep(args.settle)
         context = build_stage_context(library, runtime, geometry, launch)
-        for name in ("GATING", "DISPATCH", "EXPERT_GEMM"):
+        if launch:
+            materialize(context, runtime)
+        order = ("GATING", "DISPATCH", "EXPERT_GEMM") if args.only is None else (args.only,)
+        for name in order:
+            if name == "EXPERT_GEMM":
+                context.ensure_lists(library)
             stage_args, plan_symbol, launch_symbol = stage_arguments(context)[name]
             statuses[name] = run_stage(
                 library, runtime, ARG_TYPES[name], plan_symbol, launch_symbol, stage_args, launch
