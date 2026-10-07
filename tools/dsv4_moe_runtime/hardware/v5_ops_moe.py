@@ -27,7 +27,12 @@ from __future__ import annotations
 import ctypes
 from dataclasses import dataclass
 
-from ..hardware.aclnn_binding import ACL_DT_FLOAT8_E4M3FN, ACL_DT_FLOAT8_E8M0, ACL_DT_FP4X2_E2M1
+from ..hardware.aclnn_binding import (
+    ACL_DT_FLOAT32,
+    ACL_DT_FLOAT8_E4M3FN,
+    ACL_DT_FLOAT8_E8M0,
+    ACL_DT_FP4X2_E2M1,
+)
 from ..hardware.v5_ops import _V5OpBase
 
 # aclnnGroupedMatmulV5GetWorkspaceSize (22 protocol args): 12 tensor(-list)
@@ -96,6 +101,30 @@ class Dsv4MoeProfile:
 DSV4_MOE_PROFILE = Dsv4MoeProfile()
 
 
+_MOE_GATING_NORM_TYPE_PRE_NORMALIZED = -1
+
+# aclnnSoftplusGetWorkspaceSize (5 protocol args): self, beta (host aclScalar),
+# threshold (host aclScalar), out, then the trailing pair.
+_SOFTPLUS_PLAN_ARGTYPES: list[object] = [ctypes.c_void_p] * 3 + [
+    ctypes.POINTER(ctypes.c_uint64),
+    ctypes.POINTER(ctypes.c_void_p),
+]
+
+# aclnnSqrtGetWorkspaceSize (4 protocol args): self, out, then the trailing pair.
+_SQRT_PLAN_ARGTYPES: list[object] = [ctypes.c_void_p] * 2 + [
+    ctypes.POINTER(ctypes.c_uint64),
+    ctypes.POINTER(ctypes.c_void_p),
+]
+
+
+@dataclass(frozen=True)
+class SoftplusConfig:
+    """aclnnSoftplus scalars: softplus(x) = ln(1 + exp(beta*x)) below threshold."""
+
+    beta: float = 1.0
+    threshold: float = 20.0
+
+
 @dataclass(frozen=True)
 class GroupedMatmulV5Config:
     """aclnnGroupedMatmulV5 scalars for the M-grouped expert GEMM."""
@@ -109,24 +138,31 @@ class GroupedMatmulV5Config:
 
 @dataclass(frozen=True)
 class Dsv4GatingConfig:
-    """aclnnMoeGatingTopKV2 scalars for noaux_tc routing (routed scaling 1.5).
+    """aclnnMoeGatingTopKV2 scalars for noaux_tc routing on pre-normalized scores.
 
-    Bias shifts *selection only*; routing weights stay the raw scores (the
-    harness reference is ``routing.score_router.ScoreRouteResolver``). Header
-    docs do not enumerate the supported scoring functions -- whether the stock
-    kernel implements sqrtsoftplus scoring natively must be settled against
-    the host reference at device bring-up.
+    The DSV4 scoring function (sqrt(softplus(logits))) is NOT expressible in
+    the stock operator -- its normType only offers softmax(0)/sigmoid(1) -- so
+    the scores arrive pre-normalized from the decomposed Softplus+Sqrt stages
+    (see :class:`SqrtSoftplusRouter`). The gating stage performs bias-shifted
+    selection (noaux_tc: bias shifts *selection only*; weights keep their raw
+    scores, cf. ``routing.score_router.ScoreRouteResolver``), L1-renormalizes
+    the selected top-k scores (renorm=1, guarded by eps) and applies the
+    routed scaling factor.
+
+    norm_type is the pre-normalized/identity mode: stock docs enumerate only
+    softmax(0)/sigmoid(1), so the bypass value must be confirmed against the
+    deployed kernel at device bring-up (fallback: L1 renorm outside the op).
     """
 
     k: int = 6
     k_group: int = 1
     group_count: int = 1  # noaux_tc: selection is not group-constrained
     group_select_mode: int = 0
-    renorm: int = 0
-    norm_type: int = 0
+    renorm: int = 1  # top-k weights renormalized to sum 1.0 before scaling
+    norm_type: int = _MOE_GATING_NORM_TYPE_PRE_NORMALIZED
     out_flag: bool = False
     routed_scaling_factor: float = 1.5
-    eps: float = 1e-10
+    eps: float = 1e-20
 
 
 def _pointer(value: object) -> object:
@@ -354,6 +390,137 @@ class MoeInitRoutingV4Op(_V5OpBase):
         result = self._plan(*self._args(x, expert_idx, expanded_x, expanded_row_idx, expert_tokens, expanded_scale))
         self._assert_reserved(result.workspace_size)
         self._launch(result.workspace_size, result.executor, stream_pointer)
+
+
+class SoftplusOp(_V5OpBase):
+    """aclnnSoftplus: the first stage of the decomposed sqrtsoftplus scoring."""
+
+    plan_symbol = "aclnnSoftplusGetWorkspaceSize"
+    launch_candidates = ("aclnnSoftplus",)
+    plan_argtypes = _SOFTPLUS_PLAN_ARGTYPES
+
+    def __init__(self, library, device, workspace_bytes: int = 0, config=SoftplusConfig()):
+        super().__init__(library, device, workspace_bytes)
+        self._config = config
+        self._beta = library.create_scalar(config.beta, ACL_DT_FLOAT32)
+        self._threshold = library.create_scalar(config.threshold, ACL_DT_FLOAT32)
+
+    def _args(self, x, out):
+        return (x.pointer, self._beta.pointer, self._threshold.pointer, out.pointer)
+
+    def plan_static(self, x, out):
+        result = self._plan(*self._args(x, out))
+        self._reserve_workspace(result.workspace_size)
+        return result
+
+    def execute(self, x, out, stream_pointer):
+        result = self._plan(*self._args(x, out))
+        self._assert_reserved(result.workspace_size)
+        self._launch(result.workspace_size, result.executor, stream_pointer)
+
+
+class SqrtOp(_V5OpBase):
+    """aclnnSqrt: the second stage of the decomposed sqrtsoftplus scoring."""
+
+    plan_symbol = "aclnnSqrtGetWorkspaceSize"
+    launch_candidates = ("aclnnSqrt",)
+    plan_argtypes = _SQRT_PLAN_ARGTYPES
+
+    def plan_static(self, x, out):
+        result = self._plan(x.pointer, out.pointer)
+        self._reserve_workspace(result.workspace_size)
+        return result
+
+    def execute(self, x, out, stream_pointer):
+        result = self._plan(x.pointer, out.pointer)
+        self._assert_reserved(result.workspace_size)
+        self._launch(result.workspace_size, result.executor, stream_pointer)
+
+
+class SqrtSoftplusRouter:
+    """Zero-alloc DSV4 router: aclnnSoftplus -> aclnnSqrt -> aclnnMoeGatingTopKV2.
+
+    The stock gating operator cannot express sqrt(softplus(logits)) (normType
+    is softmax/sigmoid only), so the scoring runs as an explicit elementwise
+    sequence on the caller's stream and the gating stage receives
+    pre-normalized scores (renorm=1, eps=1e-20, routed scaling 1.5). Selection
+    bias (noaux_tc) stays inside the gating op via its bias input. The two
+    intermediate buffers are allocated once here (AOT); everything the caller
+    owns is written in place, and expertIdxOut/yOut feed aclnnMoeInitRoutingV4
+    -> aclnnGroupedMatmulV5 on the same stream without host round-trips.
+    """
+
+    def __init__(self, library, device, num_tokens: int, num_experts: int, workspace_bytes: int = 0):
+        import torch  # lazy: device intermediates need torch tensors
+
+        self._library = library
+        self._softplus_buffer = torch.empty(num_tokens, num_experts, dtype=torch.float32, device=device)
+        self._scores_buffer = torch.empty(num_tokens, num_experts, dtype=torch.float32, device=device)
+        self._softplus = SoftplusOp(library, device, workspace_bytes)
+        self._sqrt = SqrtOp(library, device, workspace_bytes)
+        self._gating = MoeGatingTopKV2Op(library, device, workspace_bytes)
+
+    def _handles(self, logits, y_out, expert_idx_out, bias):
+        lib = self._library
+        handles = [lib.create_tensor(t) for t in (logits, self._softplus_buffer, self._scores_buffer, y_out, expert_idx_out)]
+        if bias is not None:
+            handles.append(lib.create_tensor(bias))
+        return handles
+
+    def plan_static(self, logits, y_out, expert_idx_out, bias=None):
+        handles = self._handles(logits, y_out, expert_idx_out, bias)
+        try:
+            for op, x, out in (
+                (self._softplus, handles[0], handles[1]),
+                (self._sqrt, handles[1], handles[2]),
+            ):
+                op._reserve_workspace(op._plan(x.pointer, *op._args(x, out)[1:]).workspace_size)
+            result = self._gating.plan_static(handles[2], handles[3], handles[4], bias=bias and handles[5])
+            return result
+        finally:
+            for handle in handles:
+                self._library.destroy_tensor(handle)
+
+    def execute(self, logits, y_out, expert_idx_out, stream_pointer, bias=None):
+        handles = self._handles(logits, y_out, expert_idx_out, bias)
+        try:
+            self._softplus.execute(handles[0], handles[1], stream_pointer)
+            self._sqrt.execute(handles[1], handles[2], stream_pointer)
+            self._gating.execute(handles[2], handles[3], handles[4], stream_pointer, bias=bias and handles[5])
+        finally:
+            for handle in handles:
+                self._library.destroy_tensor(handle)
+
+
+def sqrt_softplus_routing(
+    logits,
+    *,
+    top_k: int = DSV4_MOE_PROFILE.num_experts_per_tok,
+    routed_scaling_factor: float = DSV4_MOE_PROFILE.routed_scaling_factor,
+    beta: float = 1.0,
+    threshold: float = 20.0,
+    eps: float = 1e-20,
+):
+    """CPU reference of the decomposed DSV4 router (torch, fp32 in/out).
+
+    scores = sqrt(softplus(logits)); top-k selection; L1 renorm of the
+    selected scores to sum 1.0 (eps-guarded denominator); routed scaling.
+    Returns ``(expert_idx int32 [T, k], weights float32 [T, k])`` with
+    ``weights.sum(-1) == routed_scaling_factor``.
+    """
+    import torch  # lazy: CPU reference only (bring-up hosts may lack torch)
+
+    linear = beta * logits.to(torch.float32)
+    softplus = torch.where(
+        linear > threshold,
+        linear / beta,
+        (torch.log1p(torch.exp(linear.to(torch.float64))) / beta).to(torch.float32),
+    )
+    scores = softplus.sqrt()
+    top_scores, top_idx = torch.topk(scores, top_k, dim=-1)
+    denom = top_scores.sum(dim=-1, keepdim=True).clamp_min(eps)
+    weights = top_scores / denom * routed_scaling_factor
+    return top_idx.to(torch.int32), weights.to(torch.float32)
 
 
 def cumsum_group_list(topk_indices: "object", num_experts: int) -> "object":

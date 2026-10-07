@@ -22,6 +22,7 @@ from ..hardware.aclnn_binding import (
     ACL_DT_FP4X2_E2M1,
 )
 from ..hardware.v5_ops_moe import (
+    _MOE_GATING_NORM_TYPE_PRE_NORMALIZED,
     DSV4_MOE_PROFILE,
     Dsv4GatingConfig,
     GroupedMatmulV5Config,
@@ -76,7 +77,9 @@ def test_gating_config_defaults():
     assert config.k == DSV4_MOE_PROFILE.num_experts_per_tok
     assert config.routed_scaling_factor == DSV4_MOE_PROFILE.routed_scaling_factor
     assert config.group_count == 1  # noaux_tc: no group-constrained selection
-    assert config.renorm == 0  # weights keep their raw scores
+    assert config.renorm == 1  # L1 renorm of the top-6 scores (sum 1.0 pre-scaling)
+    assert config.norm_type == _MOE_GATING_NORM_TYPE_PRE_NORMALIZED  # scores pre-normalized
+    assert config.eps == 1e-20  # renorm denominator guard
     assert config.out_flag is False
 
 

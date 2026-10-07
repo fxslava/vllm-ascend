@@ -61,6 +61,7 @@ ACL_DT_FLOAT8_E4M3FN = 36
 ACL_DT_FLOAT8_E8M0 = 37
 ACL_DT_FP4X2_E2M1 = 40
 ACL_DT_FP4X2_E1M2 = 41
+ACL_DT_FLOAT64 = 11
 
 # Built lazily: keys live on torch.dtype, and bring-up hosts may have no torch.
 _TORCH_TO_ACL_DTYPE: dict[object, int] = {}
@@ -132,6 +133,14 @@ MOE_V5_LAUNCH_SYMBOLS = (
     "aclnnGroupedMatmulV5",
 )
 
+# Decomposed sqrtsoftplus scoring: the stock gating operator's normType only
+# offers softmax/sigmoid, so DSV4 runs Softplus -> Sqrt ahead of it.
+ROUTER_V5_PLAN_SYMBOLS = (
+    "aclnnSoftplusGetWorkspaceSize",
+    "aclnnSqrtGetWorkspaceSize",
+)
+ROUTER_V5_LAUNCH_SYMBOLS = ("aclnnSoftplus", "aclnnSqrt")
+
 
 def opapi_candidate_paths() -> list[str]:
     """Load candidates mirroring ``OpApiCandidatePaths`` in the C++ harness."""
@@ -175,6 +184,14 @@ class AclTensorListHandle:
     pointer: ctypes.c_void_p
     pointers: ctypes.Array
     handles: list[AclTensorHandle]
+
+
+@dataclass
+class AclScalarHandle:
+    """Keeps a C ``aclScalar*`` alive together with its backing host buffer."""
+
+    pointer: ctypes.c_void_p
+    buffer: ctypes.Array
 
 
 @dataclass
@@ -285,10 +302,15 @@ class AclnnLibrary:
         if not self.loaded:
             report.load_error = "libopapi.so could not be loaded on this host"
             return report
-        for symbol in (FIA_V5_PLAN_SYMBOL, *QUANT_MATMUL_PLAN_CANDIDATES, *MOE_V5_PLAN_SYMBOLS):
+        for symbol in (
+            FIA_V5_PLAN_SYMBOL,
+            *QUANT_MATMUL_PLAN_CANDIDATES,
+            *MOE_V5_PLAN_SYMBOLS,
+            *ROUTER_V5_PLAN_SYMBOLS,
+        ):
             found = self.resolve(symbol) is not None
             report.entries.append(InventoryEntry(symbol=symbol, found=found))
-        for launch in (*FIA_V5_LAUNCH_CANDIDATES, *MOE_V5_LAUNCH_SYMBOLS):
+        for launch in (*FIA_V5_LAUNCH_CANDIDATES, *MOE_V5_LAUNCH_SYMBOLS, *ROUTER_V5_LAUNCH_SYMBOLS):
             report.entries.append(InventoryEntry(symbol=launch, found=self.resolve(launch) is not None))
         # Probe-only: legacy FIA V1-V4 must be absent on 950PR (EZ9903). We
         # record presence and never bind/invoke them.
@@ -389,6 +411,24 @@ class AclnnLibrary:
     def destroy_int_array(self, handle: AclIntArrayHandle) -> None:
         if handle.pointer:
             self._opapi.aclDestroyIntArray(handle.pointer)
+            handle.pointer = ctypes.c_void_p(0)
+
+    def create_scalar(self, value: float, acl_dtype_code: int) -> AclScalarHandle:
+        """Host ``aclScalar*`` over a kept-alive buffer (Softplus beta/threshold)."""
+        if acl_dtype_code == ACL_DT_FLOAT32:
+            buffer = (ctypes.c_float * 1)(value)
+        elif acl_dtype_code == ACL_DT_FLOAT64:
+            buffer = (ctypes.c_double * 1)(value)
+        else:
+            raise ValueError(f"create_scalar: unsupported scalar dtype code {acl_dtype_code}")
+        pointer = self._opapi.aclCreateScalar(buffer, acl_dtype_code)
+        if not pointer:
+            raise RuntimeError("aclCreateScalar returned nullptr")
+        return AclScalarHandle(pointer=pointer, buffer=buffer)
+
+    def destroy_scalar(self, handle: AclScalarHandle) -> None:
+        if handle.pointer:
+            self._opapi.aclDestroyScalar(handle.pointer)
             handle.pointer = ctypes.c_void_p(0)
 
     def raw_ascendcl(self) -> ctypes.CDLL | None:
