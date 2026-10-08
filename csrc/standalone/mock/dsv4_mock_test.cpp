@@ -37,11 +37,13 @@
 #include "mock_ops_api.hpp"
 
 #include "moe/core/error.hpp"
+#include "moe/core/model_config.hpp"
 #include "moe/core/op_table.hpp"
 #include "moe/core/config.hpp"
 #include "moe/core/device_ops.hpp"
 #include "moe/memory/exclusive_staging.hpp"
 #include "moe/memory/expert_layout.hpp"
+#include "moe/pipeline/lattice_moe_block.hpp"
 #include "moe/pipeline/pipeline.hpp"
 #include "moe/core/weight_source.hpp"
 
@@ -348,7 +350,146 @@ void TestOperatorContracts() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. The 43-layer decode graph, end to end, at full coverage
+// 4. ModelConfig: config.json parsing and the DSV4 contract asserts
+// ---------------------------------------------------------------------------
+
+// The published DeepSeek-V4 Flash configuration, reduced to the fields the
+// runner consumes (structure and values preserved, including the nested
+// quantization object and the array inside it).
+const char* kDsv4FlashConfigJson =
+    "{\n"
+    "  \"architectures\": [\"DeepseekV4ForCausalLM\"],\n"
+    "  \"expert_dtype\": \"fp4\",\n"
+    "  \"hidden_size\": 4096,\n"
+    "  \"index_n_heads\": 64,\n"
+    "  \"index_topk\": 512,\n"
+    "  \"moe_intermediate_size\": 2048,\n"
+    "  \"n_routed_experts\": 256,\n"
+    "  \"n_shared_experts\": 1,\n"
+    "  \"norm_topk_prob\": true,\n"
+    "  \"num_attention_heads\": 64,\n"
+    "  \"num_experts_per_tok\": 6,\n"
+    "  \"num_hidden_layers\": 43,\n"
+    "  \"q_lora_rank\": 1024,\n"
+    "  \"qk_rope_head_dim\": 64,\n"
+    "  \"quantization_config\": {\n"
+    "    \"activation_scheme\": \"dynamic\",\n"
+    "    \"quant_method\": \"fp8\",\n"
+    "    \"scale_fmt\": \"ue8m0\",\n"
+    "    \"weight_block_size\": [128, 128]\n"
+    "  },\n"
+    "  \"routed_scaling_factor\": 1.5,\n"
+    "  \"rms_norm_eps\": 1e-06,\n"
+    "  \"rope_theta\": 10000,\n"
+    "  \"scoring_func\": \"sqrtsoftplus\",\n"
+    "  \"swiglu_limit\": 10.0,\n"
+    "  \"topk_method\": \"noaux_tc\",\n"
+    "  \"vocab_size\": 129280\n"
+    "}\n";
+
+std::string WithReplaced(const std::string& text, const std::string& from, const std::string& to) {
+  const size_t at = text.find(from);
+  DSV4_REQUIRE(at != std::string::npos, "test fixture lost its anchor: " << from);
+  return text.substr(0, at) + to + text.substr(at + from.size());
+}
+
+void TestModelConfig() {
+  Section("model config: config.json parsing, router asserts, binary-contract match");
+  const ModelConfig model = ModelConfig::FromJsonText(kDsv4FlashConfigJson, "fixture config.json");
+  Check(model.num_hidden_layers == 43 && model.n_routed_experts == 256 && model.num_experts_per_tok == 6 &&
+            model.hidden_size == 4096 && model.moe_intermediate_size == 2048 &&
+            model.routed_scaling_factor == 1.5,
+        "the DSV4-Flash topology parses to the documented values");
+  Check(model.topk_method == "noaux_tc" && model.scoring_func == "sqrtsoftplus" && model.norm_topk_prob,
+        "the three router contract fields parse");
+  Check(model.mla.provenance == GeometryProvenance::kCheckpointConfig && model.mla.qk_rope_head_dim == 64 &&
+            model.mla.kv_lora_rank == kDefaultKvLoraRank,
+        "qk_rope_head_dim comes from the checkpoint; kv_lora_rank keeps the family default "
+        "(the checkpoint does not publish it)");
+  Check(model.dense_weight_block == 128 && model.scale_fmt == "ue8m0",
+        "the nested quantization_config object is read (block 128, ue8m0 scales)");
+  model.AssertMatchesBinaryContract();
+  Check(true, "the parsed topology matches the compiled graph geometry exactly");
+
+  // Escape and number grammar, on fields that must survive to the assert.
+  const std::string escaped = WithReplaced(std::string(kDsv4FlashConfigJson), "\"noaux_tc\"",
+                                           "\"noaux_\\u0074c\"");  // \u0074 = 't'
+  Check(ModelConfig::FromJsonText(escaped, "escaped").contains("topk_method"),
+        "\\uXXXX escapes decode before the contract asserts see them");
+  const std::string exponent =
+      WithReplaced(std::string(kDsv4FlashConfigJson), "\"routed_scaling_factor\": 1.5",
+                   "\"routed_scaling_factor\": 15e-1");
+  Check(ModelConfig::FromJsonText(exponent, "exponent").routed_scaling_factor == 1.5,
+        "exponent-notation numbers parse");
+
+  // Every refusal names its field; a silently-defaulted wrong router would
+  // reach the device.
+  CheckRefuses([] { ModelConfig::FromJsonText(WithReplaced(std::string(kDsv4FlashConfigJson),
+                                                            "\"scoring_func\": \"sqrtsoftplus\"",
+                                                            "\"scoring_func\": \"sigmoid\""), "t"); },
+               "scoring_func sigmoid: the decomposed chain computes sqrt(softplus)");
+  CheckRefuses([] { ModelConfig::FromJsonText(WithReplaced(std::string(kDsv4FlashConfigJson),
+                                                            "\"topk_method\": \"noaux_tc\"",
+                                                            "\"topk_method\": \"group_limited_greedy\""), "t"); },
+               "topk_method group_limited_greedy: the gating stage plans no group constraint");
+  CheckRefuses([] { ModelConfig::FromJsonText(WithReplaced(std::string(kDsv4FlashConfigJson),
+                                                            "\"norm_topk_prob\": true",
+                                                            "\"norm_topk_prob\": false"), "t"); },
+               "norm_topk_prob false: the gating stage renorm=1");
+  CheckRefuses([] { ModelConfig::FromJsonText(WithReplaced(std::string(kDsv4FlashConfigJson),
+                                                            "\"num_hidden_layers\": 43", "\"vocab_size\": 129280"),
+                                              "t"); },
+               "a missing required field (num_hidden_layers) does not silently default");
+  CheckRefuses([] { ModelConfig::FromJsonText(WithReplaced(std::string(kDsv4FlashConfigJson),
+                                                            "\"num_hidden_layers\": 43",
+                                                            "\"num_hidden_layers\": \"43\""), "t"); },
+               "a string where a number belongs is a hard type error");
+  CheckRefuses([] { ModelConfig::FromJsonText(WithReplaced(std::string(kDsv4FlashConfigJson),
+                                                            "\"hidden_size\": 4096",
+                                                            "\"hidden_size\": 4097"), "t"); },
+               "hidden_size 4097 does not tile the block-32 microscale");
+  CheckRefuses([] { ModelConfig::FromJsonText("{not json", "t"); }, "a malformed document is a parse error");
+
+  // Topology that is structurally valid but not what this binary compiled
+  // for: refused with the divergence named, before any reservation.
+  CheckRefuses([] {
+    const ModelConfig other = ModelConfig::FromJsonText(WithReplaced(std::string(kDsv4FlashConfigJson),
+                                                                     "\"hidden_size\": 4096",
+                                                                     "\"hidden_size\": 2048"), "t");
+    other.AssertMatchesBinaryContract();
+  }, "a structurally valid but divergent topology is refused by the binary-contract check");
+
+  // A default-constructed ModelConfig IS the compiled contract.
+  ModelConfig{}.AssertMatchesBinaryContract();
+  Check(true, "the default-constructed contract (no config.json anywhere) matches the binary");
+}
+
+// ---------------------------------------------------------------------------
+// 5. The MoE block seam: slot contracts and the lattice skeleton
+// ---------------------------------------------------------------------------
+
+void TestMoeBlockSeam(IDeviceAllocator& allocator, IStreamEngine& streams, const RuntimeConfig& config) {
+  Section("IRoutedMoeBlock: the slot byte contract and the lattice skeleton");
+  const ExpertSlotLayout layout = ExpertSlotLayout::ForDeepSeekV4Flash();
+  Check(Lattice24MoeBlock::SlotBytes() == 7077888,
+        "the 2-bit Leech slot is exactly 7,077,888 bytes (6.75 MiB): weights halve, E8M0 scales do not");
+  Check(Lattice24MoeBlock::SlotBytes() * 2 > layout.slot_num_bytes() &&
+            static_cast<double>(Lattice24MoeBlock::SlotBytes()) / static_cast<double>(layout.slot_num_bytes()) < 0.55,
+        "the lattice slot is ~50% of the FP4 slot (weights halve, the 0.75 MiB of scales do not)");
+
+  Lattice24MoeBlock lattice;
+  CheckRefuses([&] {
+    StaticOpSlotTable table(8, "lattice-test");
+    StaticArenaManager probe(allocator, streams, config);
+    ExpertSlotAddresses addresses;
+    lattice.PlanStages(table, probe, addresses);
+  }, "planning the lattice skeleton names the missing aclnnLatticeUnpackAndGroupedMatmul");
+  Check(lattice.DescribeBackend().find("SKELETON") != std::string::npos,
+        "the lattice backend describes itself as a skeleton");
+}
+
+// ---------------------------------------------------------------------------
+// 6. The 43-layer decode graph, end to end, at full coverage
 // ---------------------------------------------------------------------------
 
 // A weight source that moves no byte: the mock's transfers are interval
@@ -441,6 +582,11 @@ void TestFullPipeline() {
   Check(std::string(device.soc_name()).find("Mock") != std::string::npos,
         "the device backend reports the mock SoC");
 
+  RuntimeConfig seam_config;
+  seam_config.block_size = 128;
+  seam_config.max_context_len = 256;
+  TestMoeBlockSeam(device, device, seam_config);
+
   const ExpertSlotLayout layout = ExpertSlotLayout::ForDeepSeekV4Flash();
   const size_t backbone_bytes = Dsv4Pipeline::BackboneDeviceBytes(MlaGeometry(), 128, 256);
   const int64_t slots = ExclusiveExpertManager::PlanDeviceSlots(
@@ -464,12 +610,22 @@ void TestFullPipeline() {
   config.synthetic_weights = true;
   config.block_size = 128;
   config.max_context_len = 256;
-  Dsv4Pipeline pipeline(device, device, ops, experts, config);
+  // The router is the runner's shared dependency now: the pipeline and the
+  // injected MoE block both consume it.
+  MoeRouterEngine router(device, device);
+  Dsv4Pipeline pipeline(device, device, ops, experts, router, config);
   pipeline.Build(source);  // reserves, ingests, descriptors, PLANS EVERY STAGE
   experts.Ingest(source, {});
 
   Check(pipeline.arena_manager().arena().sealed(), "the arena is sealed after Build");
   Check(pipeline.arena_manager().arena().workspace_bytes() > 0, "the shared workspace holds the plan high-water mark");
+  Check(pipeline.moe_block().GetExpertSlotBytes() == layout.slot_num_bytes(),
+        "the injected standard block carries the exact 13,369,344-byte FP4/E8M0 slot contract");
+  const std::string stage_report = pipeline.DescribeStages();
+  Check(stage_report.find("expert_gemm1") != std::string::npos && stage_report.find("expert_combine") != std::string::npos,
+        "the MoE block planned its expert stages into the pipeline's shared stage table");
+  Check(stage_report.find("GroupedMatmulSwigluQuantV2") != std::string::npos,
+        "the fused grouped-GEMM entry point appears in the planned stage list (fused default path)");
   const size_t planned_stages = [&] {
     const std::string report = pipeline.DescribeStages();
     return report.size();  // non-empty iff the stages planned
@@ -525,6 +681,7 @@ int main() {
     TestIntervalRegistry();
     TestDescriptorEngine();
     TestOperatorContracts();
+    TestModelConfig();
     TestFullPipeline();
   } catch (const std::exception& error) {
     std::printf("\nunexpected exception: %s\n", error.what());

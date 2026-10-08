@@ -96,12 +96,14 @@ option(DSV4_WERROR "Treat compiler warnings as errors" OFF)
 set(MOE_ENGINE_SOURCES
   src/device_ops.cpp
   src/expert_layout.cpp
+  src/model_config.cpp
   src/weight_source.cpp
   src/exclusive_staging.cpp
   src/op_table.cpp
   src/static_arena.cpp
   src/static_arena_manager.cpp
   src/moe_router_engine.cpp
+  src/standard_aclnn_moe_block.cpp
   src/pipeline.cpp
 )
 

@@ -78,6 +78,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -89,7 +90,9 @@
 #include "moe/core/weight_source.hpp"
 #include "moe/memory/exclusive_staging.hpp"
 #include "moe/pipeline/moe_router_engine.hpp"
+#include "moe/pipeline/routed_moe_block.hpp"
 #include "moe/pipeline/static_arena_manager.hpp"
+#include "moe/pipeline/static_op_slot_table.hpp"
 
 namespace ascend_moe {
 
@@ -189,11 +192,18 @@ inline constexpr size_t kGmmSwigluScaleList = 2;
 
 // The orchestrator. Allocation lives in StaticArenaManager, router scoring and
 // dispatch in MoeRouterEngine, expert residency in the ExclusiveExpertManager
-// passed in; this class sequences the 43-layer replay over all of them.
+// passed in, and the EXPERT EXECUTION ITSELF in the injected IRoutedMoeBlock
+// (default StandardAclnnMoeBlock); this class sequences the 43-layer replay
+// over all of them, owning attention, the shared expert and the head.
 class Dsv4Pipeline {
  public:
+  // `router` is constructed by the owner and shared with the MoE block, which
+  // consumes its dispatch output; `moe_block` defaults to the stock
+  // StandardAclnnMoeBlock constructed here. The pipeline references all
+  // services and outlives none of them.
   Dsv4Pipeline(IDeviceAllocator& allocator, IStreamEngine& streams, const OpTable& ops,
-               ExclusiveExpertManager& experts, const RuntimeConfig& config);
+               ExclusiveExpertManager& experts, MoeRouterEngine& router, const RuntimeConfig& config,
+               std::unique_ptr<IRoutedMoeBlock> moe_block = nullptr);
   ~Dsv4Pipeline();
 
   Dsv4Pipeline(const Dsv4Pipeline&) = delete;
@@ -216,6 +226,7 @@ class Dsv4Pipeline {
   const StepCounters& counters() const { return counters_; }
   const StaticArenaManager& arena_manager() const { return arena_manager_; }
   const MoeRouterEngine& router() const { return router_; }
+  const IRoutedMoeBlock& moe_block() const { return *moe_block_; }
   std::string DescribeStages() const;
   std::string DescribeSlotIndexMap() const;
 
@@ -232,11 +243,7 @@ class Dsv4Pipeline {
   void RunAttention(int32_t layer, int64_t position);
   void RunMoe(int32_t layer);
   void RunSharedExpert(int32_t layer);
-  void BindExpertWeights(const LayerSwapPlan& plan);
   void Launch(PipelineStage& stage_entry);
-
-  PipelineStage& stage(const char* name);
-  const PipelineStage& stage(const char* name) const;
 
   IDeviceAllocator& allocator_;
   IStreamEngine& streams_;
@@ -245,20 +252,25 @@ class Dsv4Pipeline {
   RuntimeConfig config_;
 
   StaticArenaManager arena_manager_;
-  MoeRouterEngine router_;
+  MoeRouterEngine& router_;
+  // The expert-execution seam. Never null after construction: a null
+  // injection becomes the stock StandardAclnnMoeBlock.
+  std::unique_ptr<IRoutedMoeBlock> moe_block_;
 
   DeviceStream compute_stream_ = nullptr;
   DeviceEvent compute_done_ = nullptr;
 
-  // `stages_` holds StaticOpSlot, which is move-disabled -- not even
-  // std::vector::reserve compiles for it, because libstdc++'s reallocation path
-  // move-empties a zero-size vector. The vector is therefore born at full
-  // capacity and only the first `stage_count_` entries are live; it is never
-  // resized or copied again.
+  // The orchestrator's planned stages, born at full capacity (StaticOpSlot
+  // is not movable, see StaticOpSlotTable); the injected MoE block plans its
+  // expert stages into the same table, so one DescribeStages covers the
+  // whole graph.
   static constexpr size_t kMaxPipelineStages = 40;
-  std::vector<PipelineStage> stages_ = std::vector<PipelineStage>(kMaxPipelineStages);
-  size_t stage_count_ = 0;
+  StaticOpSlotTable stages_ = StaticOpSlotTable(kMaxPipelineStages, "pipeline");
   StepCounters counters_;
+
+  // The six active experts' region addresses at descriptor time; the MoE
+  // block plans against the same map.
+  ExpertSlotAddresses slot_addrs_;
 
   // Shapes, fixed at construction from the config.
   int64_t heads_ = kNumAttentionHeads;

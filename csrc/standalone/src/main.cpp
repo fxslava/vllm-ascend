@@ -17,6 +17,7 @@
 // dsv4_runner -- standalone DeepSeek-V4 Flash decode on Ascend 950PR.
 //
 //   ./dsv4_runner --weights <path> --prompt "..." --max-new-tokens 512 --vram-slots <K>
+//   ./dsv4_runner --config /mnt/c/models/DeepSeek-V4-Flash/config.json --dry-run
 //
 // No Python, no PyTorch: `ldd` on this binary carries libascendcl, libnnopbase
 // and the libopapi family, and nothing else from a framework.
@@ -32,22 +33,38 @@
 #include <vector>
 
 #include "moe/core/error.hpp"
+#include "moe/core/model_config.hpp"
 #include "moe/core/op_table.hpp"
 #include "moe/core/config.hpp"
 #include "moe/core/device_ops.hpp"
 #include "moe/memory/exclusive_staging.hpp"
 #include "moe/memory/expert_layout.hpp"
+#include "moe/pipeline/lattice_moe_block.hpp"
 #include "moe/pipeline/pipeline.hpp"
+#include "moe/pipeline/standard_aclnn_moe_block.hpp"
 #include "moe/core/weight_source.hpp"
 
 namespace ascend_moe {
 namespace {
+
+// The checkpoint configuration read when neither --config nor a config.json
+// beside the weights names a file. WSL keeps the Windows model directory
+// under /mnt/c.
+#if defined(_WIN32) || defined(__CYGWIN__)
+constexpr const char* kDefaultModelConfigPath = "C:/models/DeepSeek-V4-Flash/config.json";
+#else
+constexpr const char* kDefaultModelConfigPath = "/mnt/c/models/DeepSeek-V4-Flash/config.json";
+#endif
 
 void PrintUsage() {
   std::printf(
       "dsv4_runner -- DeepSeek-V4 Flash decode, Ascend 950PR, ACLNN V5\n"
       "\n"
       "  --weights <path>          checkpoint directory or .safetensors file\n"
+      "  --config <path>           model config.json to parse and validate (default: try the weights\n"
+      "                            directory, then %s; a missing file falls back to the\n"
+      "                            compiled DeepSeek-V4 Flash contract, an unreadable EXPLICIT path is\n"
+      "                            an error)\n"
       "  --prompt \"...\"            prompt text (token ids are read from --prompt-ids)\n"
       "  --prompt-ids a,b,c        explicit prompt token ids; this runner embeds no tokenizer\n"
       "  --max-new-tokens <n>      tokens to generate (default 512)\n"
@@ -59,19 +76,22 @@ void PrintUsage() {
       "  --qk-rope-head-dim <n>    MLA rope slice width (default %lld, family default)\n"
       "  --qk-nope-head-dim <n>    MLA nope head width (default %lld, family default)\n"
       "  --v-head-dim <n>          MLA value head width (default %lld, family default)\n"
-      "  --moe-path fused|decomposed   expert GEMM chain (default fused; see README)\n"
+      "  --moe-path fused|decomposed   expert GEMM chain inside the standard aclnn block (default fused)\n"
+      "  --moe-backend standard|lattice  IRoutedMoeBlock selection (default standard; the 2-bit\n"
+      "                            Leech-lattice backend is a skeleton and refuses at plan time)\n"
       "  --gating-norm-type <n>    aclnnMoeGatingTopKV2 normType (default -1: scores arrive pre-normalized\n"
       "                            from the decomposed aclnnSoftplus -> aclnnSqrt sqrtsoftplus chain)\n"
       "  --dense-group-size <n>    aclnnQuantMatmulV5 groupSize (default 0, UNVERIFIED)\n"
       "  --routed-coverage <n>     |Set_Device| + |Set_Host|, default %lld (bring-up subset below that)\n"
       "  --synthetic-weights       deterministic in-memory weights; no files are opened\n"
-      "  --dry-run                 build, plan, report and exit without decoding\n"
+      "  --dry-run                 build, plan, report and exit without decoding; with no weights\n"
+      "                            given, parse and validate the model configuration only\n"
       "  --report <path>           write the full report there as well as to stdout\n"
       "  --verbose                 print the arena ledger and operator inventory\n"
       "  --help\n",
-      static_cast<long long>(kDefaultKvLoraRank), static_cast<long long>(kDefaultQkRopeHeadDim),
-      static_cast<long long>(kDefaultQkNopeHeadDim), static_cast<long long>(kDefaultVHeadDim),
-      static_cast<long long>(kTotalRoutedExperts));
+      kDefaultModelConfigPath, static_cast<long long>(kDefaultKvLoraRank),
+      static_cast<long long>(kDefaultQkRopeHeadDim), static_cast<long long>(kDefaultQkNopeHeadDim),
+      static_cast<long long>(kDefaultVHeadDim), static_cast<long long>(kTotalRoutedExperts));
 }
 
 int64_t ParseInt(const char* text, const char* flag) {
@@ -96,6 +116,7 @@ std::vector<int32_t> ParseIdList(const std::string& text) {
 struct Arguments {
   RuntimeConfig config;
   std::vector<int32_t> prompt_ids;
+  std::string model_config_path;  // empty = no --config flag given
   bool help = false;
 };
 
@@ -113,6 +134,8 @@ Arguments ParseArguments(int argc, char** argv) {
       arguments.help = true;
     } else if (flag == "--weights") {
       config.weights_path = next("--weights");
+    } else if (flag == "--config") {
+      arguments.model_config_path = next("--config");
     } else if (flag == "--prompt") {
       config.prompt = next("--prompt");
     } else if (flag == "--prompt-ids") {
@@ -144,6 +167,11 @@ Arguments ParseArguments(int argc, char** argv) {
       DSV4_REQUIRE(value == "fused" || value == "decomposed",
                    "--moe-path expects 'fused' or 'decomposed', got '" << value << "'");
       config.moe_path = value == "fused" ? MoePath::kFused : MoePath::kDecomposed;
+    } else if (flag == "--moe-backend") {
+      const std::string value = next("--moe-backend");
+      DSV4_REQUIRE(value == "standard" || value == "lattice",
+                   "--moe-backend expects 'standard' or 'lattice', got '" << value << "'");
+      config.moe_backend = value == "lattice" ? MoeBackend::kLattice24 : MoeBackend::kStandardAclnn;
     } else if (flag == "--gating-norm-type") {
       config.gating_norm_type = ParseInt(next("--gating-norm-type"), "--gating-norm-type");
     } else if (flag == "--dense-group-size") {
@@ -168,59 +196,47 @@ Arguments ParseArguments(int argc, char** argv) {
   return arguments;
 }
 
-// A checkpoint's config.json, when present, is authoritative for the MLA
-// geometry. Only the four fields this runner cannot otherwise know are read; a
-// missing file leaves the family defaults in place and the report says so.
-void LoadGeometryFromCheckpoint(const std::string& weights_path, MlaGeometry* mla) {
-  if (weights_path.empty() || mla->provenance == GeometryProvenance::kCommandLine) {
-    return;
+// The model configuration, in priority order: an explicit --config, a
+// config.json beside the weights, the platform default path, compiled
+// defaults. Explicit-but-missing is an error; implicit-but-missing falls
+// back silently, and the report says which happened.
+ModelConfig LoadModelConfig(const Arguments& arguments, const RuntimeConfig& config, std::string* source_path) {
+  if (!arguments.model_config_path.empty()) {
+    *source_path = arguments.model_config_path;
+    return ModelConfig::FromJsonFile(arguments.model_config_path);
   }
-  const std::string path = weights_path + "/config.json";
-  std::ifstream file(path);
-  if (!file.is_open()) {
-    return;
-  }
-  std::stringstream buffer;
-  buffer << file.rdbuf();
-  const std::string text = buffer.str();
-  bool found_any = false;
-  auto read_field = [&](const char* key, int64_t* destination) {
-    const std::string needle = std::string("\"") + key + "\"";
-    const size_t at = text.find(needle);
-    if (at == std::string::npos) {
-      return;
+  if (!config.weights_path.empty()) {
+    const std::string beside_weights = config.weights_path + "/config.json";
+    std::ifstream probe(beside_weights);
+    if (probe.is_open()) {
+      probe.close();
+      *source_path = beside_weights;
+      return ModelConfig::FromJsonFile(beside_weights);
     }
-    const size_t colon = text.find(':', at + needle.size());
-    if (colon == std::string::npos) {
-      return;
-    }
-    *destination = std::strtoll(text.c_str() + colon + 1, nullptr, 10);
-    found_any = true;
-  };
-  read_field("kv_lora_rank", &mla->kv_lora_rank);
-  read_field("qk_rope_head_dim", &mla->qk_rope_head_dim);
-  read_field("qk_nope_head_dim", &mla->qk_nope_head_dim);
-  read_field("v_head_dim", &mla->v_head_dim);
-  if (found_any) {
-    mla->provenance = GeometryProvenance::kCheckpointConfig;
   }
+  {
+    std::ifstream probe(kDefaultModelConfigPath);
+    if (probe.is_open()) {
+      probe.close();
+      *source_path = kDefaultModelConfigPath;
+      return ModelConfig::FromJsonFile(kDefaultModelConfigPath);
+    }
+  }
+  source_path->clear();
+  return ModelConfig{};  // the compiled DSV4-Flash contract
 }
 
-std::string DescribeConfiguration(const RuntimeConfig& config, const ExpertSlotLayout& layout) {
+std::string DescribeConfiguration(const RuntimeConfig& config, const ModelConfig& model,
+                                  const std::string& model_source, const std::string& moe_backend_description,
+                                  const ExpertSlotLayout& layout) {
   std::ostringstream out;
   out << "DeepSeek-V4 Flash standalone runner\n";
-  out << "  topology      " << kNumLayers << " layers, hidden " << kHiddenSize << ", moe_intermediate "
-      << kMoeIntermediateSize << "\n";
-  out << "  experts       " << kNumRoutedExperts << " routed + " << kNumSharedExperts << " shared, top-"
-      << kNumExpertsPerTok << ", scaling " << kRoutedScalingFactor << "\n";
-  out << "  attention     MLA, " << kNumAttentionHeads << " heads, q_lora " << kQLoraRank << ", kv_lora "
-      << config.mla.kv_lora_rank << " + rope " << config.mla.qk_rope_head_dim << " = row "
-      << config.mla.kv_row_elements() << "\n";
-  out << "  MLA geometry  from " << config.mla.provenance_name() << "\n";
+  out << model.DescribeSummary(model_source);
+  out << "  MLA geometry  provenance: " << config.mla.provenance_name() << "\n";
   out << "  precision     dense FP8 E4M3 (" << kAclFloat8E4m3Fn << ") block-" << kDenseScaleBlock
       << " scales; routed FP4 E2M1 (" << kAclFloat4E2m1 << ") + E8M0 (" << kAclFloat8E8m0 << ") block-"
       << kRoutedScaleBlock << "\n";
-  out << "  activation    SwiGLU, clamp " << kSwigluLimit << "\n";
+  out << "  moe backend   " << moe_backend_description << "\n";
   out << "  paged KV      block " << config.block_size << ", context " << config.max_context_len << "\n";
   out << layout.DescribeTable();
   return out.str();
@@ -233,14 +249,47 @@ int Run(int argc, char** argv) {
     return 0;
   }
   RuntimeConfig& config = arguments.config;
-  DSV4_REQUIRE(!config.weights_path.empty() || config.synthetic_weights,
-               "--weights is required unless --synthetic-weights is given");
 
-  LoadGeometryFromCheckpoint(config.weights_path, &config.mla);
-  const ExpertSlotLayout layout = ExpertSlotLayout::ForDeepSeekV4Flash();
+  // ---- the model configuration (Task: parse, assert, then plan) ---------
+  std::string model_source;
+  const ModelConfig model = LoadModelConfig(arguments, config, &model_source);
+  model.Validate();
+  model.AssertMatchesBinaryContract();
+  // The checkpoint's MLA geometry is authoritative unless the command line
+  // overrode it (all-or-nothing, like the reader it replaces).
+  if (config.mla.provenance != GeometryProvenance::kCommandLine) {
+    config.mla = model.mla;
+  }
+
+  // The slot planner runs from the PARSED geometry, not the compiled
+  // constants (they agree: AssertMatchesBinaryContract just proved it).
+  const ExpertSlotLayout layout = ExpertSlotLayout::ForGeometry(model.hidden_size, model.moe_intermediate_size);
 
   std::ostringstream report;
-  report << DescribeConfiguration(config, layout);
+  report << DescribeConfiguration(
+      config, model, model_source,
+      config.moe_backend == MoeBackend::kLattice24 ? Lattice24MoeBlock().DescribeBackend()
+                                                   : "standard aclnn (pipeline default): GroupedMatmulV5 family "
+                                                     "over FP4/E8M0 slots",
+      layout);
+
+  // A --dry-run with no weights is a configuration check: parse, validate,
+  // report, exit -- no aclnn runtime, no device, no weight source.
+  if (config.dry_run && config.weights_path.empty() && !config.synthetic_weights) {
+    report << "\n--dry-run --config: model configuration parsed and validated; no device, no weights, "
+              "no decode.\n";
+    const std::string text = report.str();
+    std::fputs(text.c_str(), stdout);
+    if (!config.report_path.empty()) {
+      std::ofstream file(config.report_path);
+      DSV4_REQUIRE(file.is_open(), "cannot write the report to " << config.report_path);
+      file << text;
+    }
+    return 0;
+  }
+
+  DSV4_REQUIRE(!config.weights_path.empty() || config.synthetic_weights,
+               "--weights is required unless --synthetic-weights is given");
 
   OpTable ops;
   if (config.verbose) {
@@ -261,25 +310,44 @@ int Run(int argc, char** argv) {
       Dsv4Pipeline::BackboneDeviceBytes(config.mla, config.block_size, config.max_context_len);
   const int64_t slots = ExclusiveExpertManager::PlanDeviceSlots(
       free_hbm, backbone_bytes, layout.slot_num_bytes(), config.routed_coverage, kDeviceReserveBytes,
-      kTransferChunkBytes, kNumExpertsPerTok, config.vram_slots);
+      kTransferChunkBytes, model.num_experts_per_tok, config.vram_slots);
   report << "  HBM           " << (free_hbm >> 20) << " MiB free of " << (total_hbm >> 20) << " MiB; backbone "
          << (backbone_bytes >> 20) << " MiB; K = " << slots << " routed slots\n";
 
   ExclusiveExpertManager::Options options;
+  options.num_layers = model.num_hidden_layers;
+  options.num_experts = model.n_routed_experts;
+  options.top_k = model.num_experts_per_tok;
   options.routed_coverage = config.routed_coverage;
   options.device_slots = slots;
   ExclusiveExpertManager experts(device, device, layout, options);
   report << experts.DescribeHierarchy();
 
-  std::unique_ptr<WeightByteSource> source;
-  if (config.synthetic_weights) {
-    source = std::make_unique<SyntheticWeightSource>(layout, kNumLayers, kNumRoutedExperts);
+  // The router is constructed by the runner and shared by the pipeline and
+  // the MoE block (the block consumes its dispatch output).
+  MoeRouterEngine router(device, device);
+
+  std::unique_ptr<IRoutedMoeBlock> moe_block;
+  if (config.moe_backend == MoeBackend::kLattice24) {
+    moe_block = std::make_unique<Lattice24MoeBlock>();
   } else {
-    source = std::make_unique<SafetensorsWeightSource>(config.weights_path, layout, CheckpointNaming::kDsv4Flat,
-                                                       kNumLayers, kNumRoutedExperts);
+    moe_block = std::make_unique<StandardAclnnMoeBlock>(ops, router, experts, config);
+    // The block owns the slot byte contract for the hierarchy it runs on.
+    DSV4_REQUIRE(moe_block->GetExpertSlotBytes() == layout.slot_num_bytes(),
+                 "the MoE block's slot contract (" << moe_block->GetExpertSlotBytes()
+                                                   << " B) disagrees with the planned slot layout ("
+                                                   << layout.slot_num_bytes() << " B)");
   }
 
-  Dsv4Pipeline pipeline(device, device, ops, experts, config);
+  std::unique_ptr<WeightByteSource> source;
+  if (config.synthetic_weights) {
+    source = std::make_unique<SyntheticWeightSource>(layout, model.num_hidden_layers, model.n_routed_experts);
+  } else {
+    source = std::make_unique<SafetensorsWeightSource>(config.weights_path, layout, CheckpointNaming::kDsv4Flat,
+                                                       model.num_hidden_layers, model.n_routed_experts);
+  }
+
+  Dsv4Pipeline pipeline(device, device, ops, experts, router, config, std::move(moe_block));
   // Order matters: the pipeline takes the backbone tensors first, then the
   // expert manager takes the routed slots and seals the source. Exactly one
   // owner closes it, and after that the hierarchy is the only copy.
@@ -326,7 +394,7 @@ int Run(int argc, char** argv) {
     report << "expert residency: " << counters.expert_slot_hits << " hits, " << counters.expert_slot_misses
            << " misses\n";
     report << "host synchronizations " << counters.host_synchronizations << " (expected "
-           << counters.steps * (kNumLayers + 1) << ": one per MoE layer plus one per step readback)\n";
+           << counters.steps * (model.num_hidden_layers + 1) << ": one per MoE layer plus one per step readback)\n";
     report << "allocations inside a step " << counters.device_allocations_in_step << " (must be 0); descriptors "
            << counters.descriptors_built_in_step << " (must be 0)\n";
     DSV4_REQUIRE(counters.device_allocations_in_step == 0,

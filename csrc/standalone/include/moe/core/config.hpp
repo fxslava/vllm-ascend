@@ -258,6 +258,12 @@ inline constexpr size_t kSimDeviceAllocAlignBytes = 4096;
 // toolkit that does ship it, and `OpTable` reports which ops resolved.
 enum class MoePath { kFused, kDecomposed };
 
+// Which IRoutedMoeBlock the pipeline runs. kStandardAclnn is the stock
+// GroupedMatmulV5 family over FP4/E8M0 slots; kLattice24 selects the 2-bit
+// Leech-lattice skeleton, which refuses at plan time until its custom
+// unpack-and-grouped-GEMM kernel exists (see lattice_moe_block.hpp).
+enum class MoeBackend { kStandardAclnn, kLattice24 };
+
 // ---------------------------------------------------------------------------
 // Runtime configuration (populated by the CLI)
 // ---------------------------------------------------------------------------
@@ -279,6 +285,7 @@ struct RuntimeConfig {
 
   MlaGeometry mla;
   MoePath moe_path = MoePath::kFused;
+  MoeBackend moe_backend = MoeBackend::kStandardAclnn;
   int64_t gating_norm_type = kGatingNormTypePreNormalized;
 
   // aclnnQuantMatmulV5's `groupSize` packs the per-axis block sizes of the two

@@ -24,12 +24,12 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstring>
 #include <iomanip>
 #include <sstream>
 
 #include "moe/core/error.hpp"
 #include "moe/memory/expert_layout.hpp"
+#include "moe/pipeline/standard_aclnn_moe_block.hpp"
 
 namespace ascend_moe {
 namespace {
@@ -58,14 +58,21 @@ char kScatterCacheMode[] = "Norm";
 // ---------------------------------------------------------------------------
 
 Dsv4Pipeline::Dsv4Pipeline(IDeviceAllocator& allocator, IStreamEngine& streams, const OpTable& ops,
-                           ExclusiveExpertManager& experts, const RuntimeConfig& config)
+                           ExclusiveExpertManager& experts, MoeRouterEngine& router, const RuntimeConfig& config,
+                           std::unique_ptr<IRoutedMoeBlock> moe_block)
     : allocator_(allocator),
       streams_(streams),
       ops_(ops),
       experts_(experts),
       config_(config),
       arena_manager_(allocator, streams, config),
-      router_(allocator, streams) {
+      router_(router),
+      moe_block_(std::move(moe_block)) {
+  // The default backend: the stock ACLNN V5 expert path. An explicit
+  // injection (the lattice skeleton, a bring-up fork) is taken as given.
+  if (moe_block_ == nullptr) {
+    moe_block_ = std::make_unique<StandardAclnnMoeBlock>(ops_, router_, experts_, config_);
+  }
   compute_stream_ = streams_.CreateStream();
   compute_done_ = streams_.CreateEvent();
   // Primed for the same reason the staging engine primes its events: the first
@@ -80,9 +87,10 @@ Dsv4Pipeline::Dsv4Pipeline(IDeviceAllocator& allocator, IStreamEngine& streams, 
 }
 
 Dsv4Pipeline::~Dsv4Pipeline() {
-  // The stages own repeatable executors; destroy them before the arena frees
-  // the memory their descriptors point at.
-  stages_.clear();
+  // The stages own repeatable executors. They are released by the member
+  // destruction that follows this body: `stages_` is declared after
+  // `arena_manager_`, so reverse-order destruction destroys the executors
+  // BEFORE the arena frees the memory their descriptors point at.
   if (token_mailbox_ != nullptr) {
     allocator_.HostPinnedFree(token_mailbox_);
   }
@@ -108,17 +116,18 @@ size_t Dsv4Pipeline::BackboneDeviceBytes(const MlaGeometry& mla, int64_t block_s
 ExpertSlotAddresses Dsv4Pipeline::CollectExpertSlotAddresses() {
   // The six experts start in slots 0..5 so the plan phase sees real, resident
   // addresses; every layer afterwards repoints them via
-  // aclSetDynamicTensorAddr.
-  ExpertSlotAddresses addresses;
+  // aclSetDynamicTensorAddr. Kept in `slot_addrs_`: the MoE block's planning
+  // consumes the same map.
+  slot_addrs_ = ExpertSlotAddresses{};
   for (int64_t index = 0; index < kNumExpertsPerTok; ++index) {
     const int32_t slot = static_cast<int32_t>(index);
     const size_t at = static_cast<size_t>(index);
-    addresses.gate_up_weight[at] = experts_.RegionAddress(slot, ExpertRegionId::kGateUpWeight);
-    addresses.gate_up_scale[at] = experts_.RegionAddress(slot, ExpertRegionId::kGateUpScale);
-    addresses.down_weight[at] = experts_.RegionAddress(slot, ExpertRegionId::kDownWeight);
-    addresses.down_scale[at] = experts_.RegionAddress(slot, ExpertRegionId::kDownScale);
+    slot_addrs_.gate_up_weight[at] = experts_.RegionAddress(slot, ExpertRegionId::kGateUpWeight);
+    slot_addrs_.gate_up_scale[at] = experts_.RegionAddress(slot, ExpertRegionId::kGateUpScale);
+    slot_addrs_.down_weight[at] = experts_.RegionAddress(slot, ExpertRegionId::kDownWeight);
+    slot_addrs_.down_scale[at] = experts_.RegionAddress(slot, ExpertRegionId::kDownScale);
   }
-  return addresses;
+  return slot_addrs_;
 }
 
 void Dsv4Pipeline::Build(WeightByteSource& source) {
@@ -135,28 +144,9 @@ void Dsv4Pipeline::Build(WeightByteSource& source) {
 
 // ---------------------------------------------------------------------------
 // Planning (the orchestrator's stages; the router's five live in
-// MoeRouterEngine::PlanStages)
+// MoeRouterEngine::PlanStages, the expert GEMM stages in the injected
+// IRoutedMoeBlock -- all into ONE StaticOpSlotTable)
 // ---------------------------------------------------------------------------
-
-PipelineStage& Dsv4Pipeline::stage(const char* name) {
-  for (size_t i = 0; i < stage_count_; ++i) {
-    PipelineStage& entry = stages_[i];
-    if (std::strcmp(entry.name, name) == 0) {
-      return entry;
-    }
-  }
-  throw Dsv4Error(std::string("no pipeline stage named ") + name);
-}
-
-const PipelineStage& Dsv4Pipeline::stage(const char* name) const {
-  for (size_t i = 0; i < stage_count_; ++i) {
-    const PipelineStage& entry = stages_[i];
-    if (std::strcmp(entry.name, name) == 0) {
-      return entry;
-    }
-  }
-  throw Dsv4Error(std::string("no pipeline stage named ") + name);
-}
 
 void Dsv4Pipeline::PlanStages() {
   const MlaGeometry& mla = config_.mla;
@@ -165,29 +155,18 @@ void Dsv4Pipeline::PlanStages() {
 
   // Every required op must exist before anything is planned, so a toolkit gap
   // is one clear message rather than a failure part-way through the graph.
+  // The MoE block checks its own grouped-GEMM surface in its PlanStages.
   std::vector<OpId> required = {
-      OpId::kRmsNorm,       OpId::kRmsNormDynamicMxQuant, OpId::kDynamicMxQuant,
-      OpId::kQuantMatmulV5, OpId::kApplyRotaryPosEmbV2,
-      OpId::kScatterPaKvCache, OpId::kFusedInferAttentionScoreV5, OpId::kInplaceAdd,
-      OpId::kSwiGlu,        OpId::kArgMax,
-      OpId::kGroupedMatmulV5,
+      OpId::kRmsNorm,          OpId::kRmsNormDynamicMxQuant, OpId::kDynamicMxQuant,
+      OpId::kQuantMatmulV5,    OpId::kApplyRotaryPosEmbV2,   OpId::kScatterPaKvCache,
+      OpId::kFusedInferAttentionScoreV5, OpId::kInplaceAdd,  OpId::kSwiGlu,
+      OpId::kArgMax,
   };
-  if (config_.moe_path == MoePath::kFused) {
-    required.push_back(OpId::kGroupedMatmulSwigluQuantV2);
-  } else {
-    required.push_back(OpId::kSwigluMxQuant);
-  }
   ops_.RequireAll(required);
 
-  // The stage vector is born at full capacity (StaticOpSlot is not movable,
+  // The stage table is born at full capacity (StaticOpSlot is not movable,
   // see stages_ in the header); planning only fills slots in place.
-  auto add = [&](const char* name, OpId op) -> PipelineStage& {
-    DSV4_REQUIRE(stage_count_ < kMaxPipelineStages, "pipeline stage capacity exceeded at " << name);
-    PipelineStage& entry = stages_[stage_count_++];
-    entry.name = name;
-    entry.op = op;
-    return entry;
-  };
+  auto add = [&](const char* name, OpId op) -> PipelineStage& { return stages_.Add(name, op); };
   auto adopt = [&](PipelineStage& entry, uint64_t workspace, aclOpExecutor* executor) {
     arena.NoteWorkspace(workspace);
     entry.slot.Adopt(entry.op, entry.name, workspace, executor);
@@ -335,57 +314,11 @@ void Dsv4Pipeline::PlanStages() {
   // 15.-18. live in MoeRouterEngine (router matmul, sqrtsoftplus scoring,
   //     gating, dropless dispatch).
   //
-  // 19. expert GEMM 1. Fused path: GEMM + clamped SwiGLU (limit 10.0) + MX
-  //     requant in one op.
-  if (config_.moe_path == MoePath::kFused) {
-    PipelineStage& entry = add("expert_gemm1", OpId::kGroupedMatmulSwigluQuantV2);
-    const uint64_t workspace = PlanAclnnOp<GroupedMatmulSwigluQuantV2PlanFn>(
-        ops_, entry.op, &executor, t.expanded_x, t.expert_gate_up_list, t.expert_gate_up_scale_list, nullptr,
-        nullptr, t.expanded_scale, nullptr, t.group_list, kGmmDequantModeMx,
-        static_cast<int64_t>(kAclFloat8E4m3Fn), kGmmDequantModeMx, kGmmGroupListTypeCumsum, nullptr, t.gemm1_out,
-        t.gemm1_scale);
-    adopt(entry, workspace, executor);
-  } else {
-    PipelineStage& entry = add("expert_gemm1", OpId::kGroupedMatmulV5);
-    const uint64_t workspace = PlanAclnnOp<GroupedMatmulV5PlanFn>(
-        ops_, entry.op, &executor, t.gemm1_x_list, t.expert_gate_up_list, nullptr, t.expert_gate_up_scale_list,
-        nullptr, nullptr, nullptr, t.gemm1_x_scale_list, t.group_list, nullptr, nullptr, nullptr,
-        kGmmSplitItemSingleOut, kGmmGroupTypeM, kGmmGroupListTypeCumsum, kGmmActTypeNone, nullptr,
-        t.gemm1_raw_out_list, nullptr, nullptr);
-    adopt(entry, workspace, executor);
-
-    PipelineStage& activation = add("expert_swiglu", OpId::kSwigluMxQuant);
-    const uint64_t act_workspace = PlanAclnnOp<SwigluMxQuantPlanFn>(
-        ops_, activation.op, &executor, t.gemm1_raw, nullptr, kSwigluActivateDimLast, true, kSwigluModeDefault,
-        kSwigluLimit, kSwigluGluAlpha, kSwigluGluBias, kSwigluGroupModeNone, kSwigluAxisLast,
-        static_cast<int64_t>(kAclFloat8E4m3Fn), kMxRoundModeRint, kSwigluScaleAlgOcp, kSwigluMaxDtypeValue,
-        t.gemm1_out, t.gemm1_scale);
-    adopt(activation, act_workspace, executor);
-  }
-  // 20. expert GEMM 2. A tensor-LIST weight, which is what lets the six experts
-  //     sit in six scattered HBM slots. `aclnnGroupedMatmulFinalizeRoutingV3`
-  //     would fuse the combine, but its x2 is a single tensor, i.e. the experts
-  //     must be contiguous -- which an exclusive LRU slot pool cannot promise.
-  {
-    PipelineStage& entry = add("expert_gemm2", OpId::kGroupedMatmulV5);
-    const uint64_t workspace = PlanAclnnOp<GroupedMatmulV5PlanFn>(
-        ops_, entry.op, &executor, t.gemm2_x_list, t.expert_down_list, nullptr, t.expert_down_scale_list, nullptr,
-        nullptr, nullptr, t.gemm2_x_scale_list, t.group_list, nullptr, nullptr, nullptr, kGmmSplitItemSingleOut,
-        kGmmGroupTypeM, kGmmGroupListTypeCumsum, kGmmActTypeNone, nullptr, t.gemm2_out_list, nullptr, nullptr);
-    adopt(entry, workspace, executor);
-  }
-  // 21. routing combine. For a single-token step the six expanded rows are the
-  //     same token, so the weighted sum IS a [1, 6] x [6, hidden] matmul over
-  //     the permuted routing weights the dispatch emitted. Exact, and both ops
-  //     have an ascend950 kernel. This is the one stage that does not
-  //     generalize past kTokensPerStep == 1: a batched decode needs a
-  //     scatter-add by `expanded_row_idx`.
-  {
-    PipelineStage& entry = add("expert_combine", OpId::kMatmul);
-    const uint64_t workspace = PlanAclnnOp<MatmulPlanFn>(ops_, entry.op, &executor, t.expanded_weights_row,
-                                                         t.gemm2_out, t.routed_out, kCubeMathTypeKeepDtype);
-    adopt(entry, workspace, executor);
-  }
+  // 19.-21. the routed experts: planned by the injected IRoutedMoeBlock into
+  //     this same table -- expert_gemm1 (+ expert_swiglu on the decomposed
+  //     path), expert_gemm2 and expert_combine. The orchestrator no longer
+  //     names a single grouped-GEMM entry point; the backend decides.
+  moe_block_->PlanStages(stages_, arena_manager_, slot_addrs_);
   // 22-25. the shared expert: every token uses it, so it is never routed.
   {
     PipelineStage& entry = add("shared_gate_up", OpId::kQuantMatmulV5);
@@ -466,18 +399,18 @@ void Dsv4Pipeline::RunAttention(int32_t layer, int64_t position) {
 
   // Repoint this layer's weights. The descriptors and the executors are the
   // ones planned at init; only the addresses move.
-  stage("input_norm_quant")
+  stages_.stage("input_norm_quant")
       .slot.SetAddress(slot::kMxQuantGamma, t.w_input_norm, arena.Address(layer_weights.input_norm));
-  stage("q_a_proj").slot.SetAddress(slot::kQuantMmX2, t.w_q_a, arena.Address(layer_weights.q_a_weight));
-  stage("q_a_proj").slot.SetAddress(slot::kQuantMmX2Scale, t.w_q_a_scale, arena.Address(layer_weights.q_a_scale));
-  stage("q_a_norm_quant").slot.SetAddress(slot::kMxQuantGamma, t.w_q_a_norm, arena.Address(layer_weights.q_a_norm));
-  stage("q_b_proj").slot.SetAddress(slot::kQuantMmX2, t.w_q_b, arena.Address(layer_weights.q_b_weight));
-  stage("q_b_proj").slot.SetAddress(slot::kQuantMmX2Scale, t.w_q_b_scale, arena.Address(layer_weights.q_b_scale));
-  stage("kv_a_proj").slot.SetAddress(slot::kQuantMmX2, t.w_kv_a, arena.Address(layer_weights.kv_a_weight));
-  stage("kv_a_proj").slot.SetAddress(slot::kQuantMmX2Scale, t.w_kv_a_scale, arena.Address(layer_weights.kv_a_scale));
-  stage("kv_a_norm").slot.SetAddress(slot::kRmsNormGamma, t.w_kv_a_norm, arena.Address(layer_weights.kv_a_norm));
-  stage("o_proj").slot.SetAddress(slot::kQuantMmX2, t.w_o, arena.Address(layer_weights.o_weight));
-  stage("o_proj").slot.SetAddress(slot::kQuantMmX2Scale, t.w_o_scale, arena.Address(layer_weights.o_scale));
+  stages_.stage("q_a_proj").slot.SetAddress(slot::kQuantMmX2, t.w_q_a, arena.Address(layer_weights.q_a_weight));
+  stages_.stage("q_a_proj").slot.SetAddress(slot::kQuantMmX2Scale, t.w_q_a_scale, arena.Address(layer_weights.q_a_scale));
+  stages_.stage("q_a_norm_quant").slot.SetAddress(slot::kMxQuantGamma, t.w_q_a_norm, arena.Address(layer_weights.q_a_norm));
+  stages_.stage("q_b_proj").slot.SetAddress(slot::kQuantMmX2, t.w_q_b, arena.Address(layer_weights.q_b_weight));
+  stages_.stage("q_b_proj").slot.SetAddress(slot::kQuantMmX2Scale, t.w_q_b_scale, arena.Address(layer_weights.q_b_scale));
+  stages_.stage("kv_a_proj").slot.SetAddress(slot::kQuantMmX2, t.w_kv_a, arena.Address(layer_weights.kv_a_weight));
+  stages_.stage("kv_a_proj").slot.SetAddress(slot::kQuantMmX2Scale, t.w_kv_a_scale, arena.Address(layer_weights.kv_a_scale));
+  stages_.stage("kv_a_norm").slot.SetAddress(slot::kRmsNormGamma, t.w_kv_a_norm, arena.Address(layer_weights.kv_a_norm));
+  stages_.stage("o_proj").slot.SetAddress(slot::kQuantMmX2, t.w_o, arena.Address(layer_weights.o_weight));
+  stages_.stage("o_proj").slot.SetAddress(slot::kQuantMmX2Scale, t.w_o_scale, arena.Address(layer_weights.o_scale));
 
   // This layer's slice of the paged cache.
   const size_t latent_stride = Bf16Bytes(arena_manager_.num_blocks() * config_.block_size * mla.kv_lora_rank);
@@ -485,69 +418,49 @@ void Dsv4Pipeline::RunAttention(int32_t layer, int64_t position) {
   uint8_t* latent =
       arena.AddressAs<uint8_t>(weights.kv_latent_cache) + latent_stride * static_cast<size_t>(layer);
   uint8_t* rope = arena.AddressAs<uint8_t>(weights.kv_rope_cache) + rope_stride * static_cast<size_t>(layer);
-  stage("kv_cache_write").slot.SetAddress(slot::kScatterKeyCache, t.kv_latent_cache, latent);
-  stage("kv_cache_write").slot.SetAddress(slot::kScatterValueCache, t.kv_rope_cache, rope);
-  stage("attention").slot.SetTensorListAddress(slot::kFiaKeyList, 0, t.key_list, latent);
-  stage("attention").slot.SetTensorListAddress(slot::kFiaValueList, 0, t.value_list, latent);
-  stage("attention").slot.SetAddress(slot::kFiaKeyRope, t.key_rope_cache_view, rope);
+  stages_.stage("kv_cache_write").slot.SetAddress(slot::kScatterKeyCache, t.kv_latent_cache, latent);
+  stages_.stage("kv_cache_write").slot.SetAddress(slot::kScatterValueCache, t.kv_rope_cache, rope);
+  stages_.stage("attention").slot.SetTensorListAddress(slot::kFiaKeyList, 0, t.key_list, latent);
+  stages_.stage("attention").slot.SetTensorListAddress(slot::kFiaValueList, 0, t.value_list, latent);
+  stages_.stage("attention").slot.SetAddress(slot::kFiaKeyRope, t.key_rope_cache_view, rope);
 
   // The rope table row for this position.
   uint8_t* cos_row = arena.AddressAs<uint8_t>(weights.rope_cos) + Bf16Bytes(position * mla.qk_rope_head_dim);
   uint8_t* sin_row = arena.AddressAs<uint8_t>(weights.rope_sin) + Bf16Bytes(position * mla.qk_rope_head_dim);
-  stage("rope").slot.SetAddress(slot::kRotaryCos, t.rope_cos, cos_row);
-  stage("rope").slot.SetAddress(slot::kRotarySin, t.rope_sin, sin_row);
+  stages_.stage("rope").slot.SetAddress(slot::kRotaryCos, t.rope_cos, cos_row);
+  stages_.stage("rope").slot.SetAddress(slot::kRotarySin, t.rope_sin, sin_row);
 
-  Launch(stage("input_norm_quant"));
-  Launch(stage("q_a_proj"));
-  Launch(stage("q_a_norm_quant"));
-  Launch(stage("q_b_proj"));
-  Launch(stage("kv_a_proj"));
-  Launch(stage("kv_a_norm"));
-  Launch(stage("rope"));
-  Launch(stage("kv_cache_write"));
-  Launch(stage("attention"));
-  Launch(stage("attn_quant"));
-  Launch(stage("o_proj"));
-  Launch(stage("residual_attn"));
-}
-
-void Dsv4Pipeline::BindExpertWeights(const LayerSwapPlan& plan) {
-  ArenaTensors& t = arena_manager_.tensors();
-  PipelineStage& gemm1 = stage("expert_gemm1");
-  PipelineStage& gemm2 = stage("expert_gemm2");
-  const size_t gemm1_scale_index =
-      config_.moe_path == MoePath::kFused ? slot::kGmmSwigluScaleList : slot::kGmmV5ScaleList;
-  for (int32_t index = 0; index < plan.count; ++index) {
-    const int32_t slot_id = plan.device_slots[index];
-    void* gate_up = experts_.RegionAddress(slot_id, ExpertRegionId::kGateUpWeight);
-    void* gate_up_scale = experts_.RegionAddress(slot_id, ExpertRegionId::kGateUpScale);
-    void* down = experts_.RegionAddress(slot_id, ExpertRegionId::kDownWeight);
-    void* down_scale = experts_.RegionAddress(slot_id, ExpertRegionId::kDownScale);
-    const size_t relative = static_cast<size_t>(index);
-    gemm1.slot.SetTensorListAddress(slot::kGmmWeightList, relative, t.expert_gate_up_list, gate_up);
-    gemm1.slot.SetTensorListAddress(gemm1_scale_index, relative, t.expert_gate_up_scale_list, gate_up_scale);
-    gemm2.slot.SetTensorListAddress(slot::kGmmWeightList, relative, t.expert_down_list, down);
-    gemm2.slot.SetTensorListAddress(slot::kGmmV5ScaleList, relative, t.expert_down_scale_list, down_scale);
-  }
+  Launch(stages_.stage("input_norm_quant"));
+  Launch(stages_.stage("q_a_proj"));
+  Launch(stages_.stage("q_a_norm_quant"));
+  Launch(stages_.stage("q_b_proj"));
+  Launch(stages_.stage("kv_a_proj"));
+  Launch(stages_.stage("kv_a_norm"));
+  Launch(stages_.stage("rope"));
+  Launch(stages_.stage("kv_cache_write"));
+  Launch(stages_.stage("attention"));
+  Launch(stages_.stage("attn_quant"));
+  Launch(stages_.stage("o_proj"));
+  Launch(stages_.stage("residual_attn"));
 }
 
 void Dsv4Pipeline::RunSharedExpert(int32_t layer) {
   ArenaTensors& t = arena_manager_.tensors();
   StaticMemoryArena& arena = arena_manager_.arena();
   const BackboneWeights::Layer& weights = arena_manager_.backbone().layers[static_cast<size_t>(layer)];
-  stage("shared_gate_up")
+  stages_.stage("shared_gate_up")
       .slot.SetAddress(slot::kQuantMmX2, t.w_shared_gate_up, arena.Address(weights.shared_gate_up_weight));
-  stage("shared_gate_up")
+  stages_.stage("shared_gate_up")
       .slot.SetAddress(slot::kQuantMmX2Scale, t.w_shared_gate_up_scale,
                        arena.Address(weights.shared_gate_up_scale));
-  stage("shared_down")
+  stages_.stage("shared_down")
       .slot.SetAddress(slot::kQuantMmX2, t.w_shared_down, arena.Address(weights.shared_down_weight));
-  stage("shared_down")
+  stages_.stage("shared_down")
       .slot.SetAddress(slot::kQuantMmX2Scale, t.w_shared_down_scale, arena.Address(weights.shared_down_scale));
-  Launch(stage("shared_gate_up"));
-  Launch(stage("shared_act"));
-  Launch(stage("shared_act_quant"));
-  Launch(stage("shared_down"));
+  Launch(stages_.stage("shared_gate_up"));
+  Launch(stages_.stage("shared_act"));
+  Launch(stages_.stage("shared_act_quant"));
+  Launch(stages_.stage("shared_down"));
 }
 
 void Dsv4Pipeline::RunMoe(int32_t layer) {
@@ -555,11 +468,11 @@ void Dsv4Pipeline::RunMoe(int32_t layer) {
   StaticMemoryArena& arena = arena_manager_.arena();
   const BackboneWeights::Layer& weights = arena_manager_.backbone().layers[static_cast<size_t>(layer)];
 
-  stage("post_norm_quant").slot.SetAddress(slot::kMxQuantGamma, t.w_post_norm, arena.Address(weights.post_norm));
-  stage("post_norm").slot.SetAddress(slot::kRmsNormGamma, t.w_post_norm, arena.Address(weights.post_norm));
+  stages_.stage("post_norm_quant").slot.SetAddress(slot::kMxQuantGamma, t.w_post_norm, arena.Address(weights.post_norm));
+  stages_.stage("post_norm").slot.SetAddress(slot::kRmsNormGamma, t.w_post_norm, arena.Address(weights.post_norm));
 
-  Launch(stage("post_norm_quant"));
-  Launch(stage("post_norm"));
+  Launch(stages_.stage("post_norm_quant"));
+  Launch(stages_.stage("post_norm"));
 
   // Score, select, and read the top-6 back (deviation 1: the one forced host
   // round trip per MoE layer).
@@ -568,25 +481,36 @@ void Dsv4Pipeline::RunMoe(int32_t layer) {
   ++counters_.host_synchronizations;
 
   // The exclusive hierarchy makes the six chosen experts resident, batching
-  // every miss into one event-ordered duplex exchange before the GEMM.
+  // every miss into one event-ordered duplex exchange before the GEMM. The
+  // residency plan travels into the dispatch context: binding the weight
+  // lists is the backend's job now.
   const LayerSwapPlan plan = experts_.PrepareLayer(layer, expert_ids, static_cast<int32_t>(kNumExpertsPerTok),
                                                    compute_stream_, compute_done_);
   counters_.expert_slot_hits += static_cast<uint64_t>(plan.hit_count);
   counters_.expert_slot_misses += static_cast<uint64_t>(plan.miss_count);
-  BindExpertWeights(plan);
 
-  // Renumber to local ids and launch the dropless dispatch.
-  router_.Dispatch(arena_manager_, ops_, compute_stream_);
+  MoeDispatchContext dispatch;
+  dispatch.layer = layer;
+  dispatch.token_count = kTokensPerStep;
+  dispatch.top_k = kNumExpertsPerTok;
+  dispatch.expanded_x = t.expanded_x;
+  dispatch.expanded_scale = t.expanded_scale;
+  dispatch.group_list = t.group_list;
+  dispatch.gemm1_out = t.gemm1_out;
+  dispatch.gemm1_scale = t.gemm1_scale;
+  dispatch.gemm2_out = t.gemm2_out;
+  dispatch.expanded_weights_row = t.expanded_weights_row;
+  dispatch.routed_out = t.routed_out;
+  dispatch.swap_plan = &plan;
+  dispatch.compute_stream = compute_stream_;
 
-  Launch(stage("expert_gemm1"));
-  if (config_.moe_path == MoePath::kDecomposed) {
-    Launch(stage("expert_swiglu"));
-  }
-  Launch(stage("expert_gemm2"));
-  Launch(stage("expert_combine"));
+  const uint64_t block_launches_before = moe_block_->launches();
+  moe_block_->ExecuteMoe(dispatch, streams_);
+  counters_.launches += moe_block_->launches() - block_launches_before;
+
   RunSharedExpert(layer);
-  Launch(stage("add_shared"));
-  Launch(stage("residual_moe"));
+  Launch(stages_.stage("add_shared"));
+  Launch(stages_.stage("residual_moe"));
 
   // Publish the compute boundary: the next layer's swap batch waits on it
   // before overwriting any slot this layer's GEMMs read.
@@ -623,9 +547,9 @@ void Dsv4Pipeline::DecodeStep(int32_t token_id, int64_t position) {
     RunAttention(layer, position);
     RunMoe(layer);
   }
-  Launch(stage("final_norm"));
-  Launch(stage("lm_head"));
-  Launch(stage("argmax"));
+  Launch(stages_.stage("final_norm"));
+  Launch(stages_.stage("lm_head"));
+  Launch(stages_.stage("argmax"));
 
   ++counters_.steps;
   counters_.device_allocations_in_step += allocator_.DeviceAllocationCount() - allocations_before;
@@ -651,18 +575,18 @@ int32_t Dsv4Pipeline::ReadArgmaxToken() {
 
 std::string Dsv4Pipeline::DescribeStages() const {
   std::ostringstream out;
-  const size_t total_stages = stage_count_ + router_.stages().size();
-  out << "pipeline: " << total_stages << " planned stages (" << stage_count_ << " in the orchestrator, "
-      << router_.stages().size() << " in the router engine), replayed " << kNumLayers
-      << " times with address swaps (MoE path: "
-      << (config_.moe_path == MoePath::kFused ? "fused" : "decomposed") << ")\n";
+  const size_t total_stages = stages_.size() + router_.stages().size();
+  out << "pipeline: " << total_stages << " planned stages (" << stages_.size()
+      << " in the orchestrator table, " << router_.stages().size()
+      << " in the router engine), replayed " << kNumLayers << " times with address swaps\n";
+  out << "  moe block:    " << moe_block_->DescribeBackend() << "\n";
   uint64_t high_water = 0;
   const auto describe_stage = [&out, &high_water](const PipelineStage& entry) {
     out << "  " << std::left << std::setw(20) << entry.name << std::right << std::setw(40) << OpName(entry.op)
         << "  workspace=" << std::setw(10) << entry.slot.workspace_size() << "\n";
     high_water = std::max(high_water, entry.slot.workspace_size());
   };
-  for (size_t i = 0; i < stage_count_; ++i) {
+  for (size_t i = 0; i < stages_.size(); ++i) {
     describe_stage(stages_[i]);
   }
   for (const PipelineStage& entry : router_.stages()) {

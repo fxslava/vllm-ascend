@@ -23,9 +23,10 @@
 //     137 GiB routed-expert hierarchy exists as bookkeeping.
 //   * The ONE exception is bounded: host allocations at or below
 //     kMockRealHostMaxBytes get real memory, because product code
-//     dereferences a few small pinned mailboxes directly (std::memset,
-//     `*slot_mailbox_ = position`). Everything the process actually touches
-//     stays within a few hundred KiB; "essentially zero" holds.
+//     dereferences a few small pinned buffers directly (std::memset,
+//     `*slot_mailbox_ = position`, the 4 MiB transfer-chunk staging).
+//     Everything the process actually touches stays within a few MiB;
+//     "essentially zero" holds.
 //   * aclrtMemcpyAsync / aclrtMemcpy / aclrtMemset validate intervals and move
 //     nothing: [addr, addr + count) must sit strictly inside ONE registered
 //     span, and a partially overlapping source/destination pair is refused as
@@ -47,8 +48,13 @@ namespace ascend_moe {
 namespace mock {
 
 // Host allocations this size or smaller are real (mailboxes, transit
-// scratch); anything larger is symbolic.
-inline constexpr size_t kMockRealHostMaxBytes = 1ull << 20;  // 1 MiB
+// scratch); anything larger is symbolic. The bound is sized by the pinned
+// transit scratch product code writes through directly: the exclusive
+// hierarchy memsets and stages its transfers across the DEFAULT
+// kTransferChunkBytes (4 MiB) chunk on the host, so the real tier has to
+// cover it or moe_runner crashes in mock mode where dsv4_mock_test (which
+// lowers its chunk to 512 KiB) does not.
+inline constexpr size_t kMockRealHostMaxBytes = 8ull << 20;  // 8 MiB
 
 // Alignment every fake base address carries, mirroring
 // aclrtMalloc(..., ACL_MEM_MALLOC_HUGE_FIRST) page alignment.

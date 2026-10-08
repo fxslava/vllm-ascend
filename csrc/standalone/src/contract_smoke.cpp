@@ -39,8 +39,10 @@
 #include "moe/core/op_table.hpp"
 #include "moe/core/config.hpp"
 #include "moe/core/device_ops.hpp"
+#include "moe/core/model_config.hpp"
 #include "moe/memory/exclusive_staging.hpp"
 #include "moe/memory/expert_layout.hpp"
+#include "moe/pipeline/lattice_moe_block.hpp"
 #include "moe/pipeline/pipeline.hpp"
 #include "moe/core/weight_source.hpp"
 
@@ -607,6 +609,69 @@ void TestOperatorTable() {
   CheckRefuses([&] { ops.RequireAll({OpId::kOpCount}); }, "a request for an out-of-range operator id");
 }
 
+// ---------------------------------------------------------------------------
+// 6. ModelConfig and the MoE block seam
+// ---------------------------------------------------------------------------
+
+void TestModelConfigContract() {
+  Section("model config: the checkpoint contract the runner validates at startup");
+  // The published DeepSeek-V4 Flash fields, verbatim structure.
+  const char* config_json =
+      "{\"architectures\":[\"DeepseekV4ForCausalLM\"],\"hidden_size\":4096,"
+      "\"moe_intermediate_size\":2048,\"index_topk\":512,\"n_routed_experts\":256,"
+      "\"n_shared_experts\":1,\"norm_topk_prob\":true,\"num_attention_heads\":64,"
+      "\"num_experts_per_tok\":6,\"num_hidden_layers\":43,\"q_lora_rank\":1024,"
+      "\"qk_rope_head_dim\":64,"
+      "\"quantization_config\":{\"quant_method\":\"fp8\",\"scale_fmt\":\"ue8m0\","
+      "\"weight_block_size\":[128,128]},"
+      "\"routed_scaling_factor\":1.5,\"rms_norm_eps\":1e-06,"
+      "\"scoring_func\":\"sqrtsoftplus\",\"swiglu_limit\":10.0,"
+      "\"topk_method\":\"noaux_tc\",\"vocab_size\":129280}";
+  const ModelConfig model = ModelConfig::FromJsonText(config_json, "fixture config.json");
+  Check(model.num_hidden_layers == 43 && model.n_routed_experts == 256 && model.num_experts_per_tok == 6 &&
+            model.hidden_size == 4096 && model.moe_intermediate_size == 2048 &&
+            model.routed_scaling_factor == 1.5 && model.topk_method == "noaux_tc" &&
+            model.scoring_func == "sqrtsoftplus" && model.norm_topk_prob,
+        "the nine contracted fields parse to the documented DSV4-Flash values");
+  model.AssertMatchesBinaryContract();
+  Check(true, "the parsed topology matches the compiled graph geometry");
+
+  CheckRefuses([] {
+    ModelConfig::FromJsonText("{\"num_hidden_layers\":43,\"n_routed_experts\":256,"
+                              "\"num_experts_per_tok\":6,\"hidden_size\":4096,"
+                              "\"moe_intermediate_size\":2048,\"routed_scaling_factor\":1.5,"
+                              "\"topk_method\":\"noaux_tc\",\"scoring_func\":\"softmax\","
+                              "\"norm_topk_prob\":true}",
+                              "t");
+  }, "scoring_func softmax is refused: the router chain computes sqrt(softplus)");
+  CheckRefuses([] { ModelConfig::FromJsonText("{\"broken\"", "t"); }, "a truncated document is a parse error");
+
+  // The slot planner runs from the parsed geometry.
+  const ExpertSlotLayout from_config = ExpertSlotLayout::ForGeometry(model.hidden_size, model.moe_intermediate_size);
+  Check(from_config.slot_num_bytes() == ExpertSlotLayout::ForDeepSeekV4Flash().slot_num_bytes(),
+        "the slot layout computed from the PARSED geometry equals the compiled one");
+}
+
+void TestMoeBlockSlotContract() {
+  Section("IRoutedMoeBlock: slot byte contracts");
+  const ExpertSlotLayout layout = ExpertSlotLayout::ForDeepSeekV4Flash();
+  Check(Lattice24MoeBlock::SlotBytes() == 7077888,
+        "the 2-bit Leech slot is 7,077,888 bytes (6.75 MiB) at the DSV4-Flash geometry");
+  Check(Lattice24MoeBlock::SlotBytes() < layout.slot_num_bytes(),
+        "the lattice slot is smaller than the 13,369,344-byte FP4 slot");
+  Lattice24MoeBlock lattice;
+  CheckRefuses([&] {
+    StaticOpSlotTable table(8, "lattice-test");
+    RuntimeConfig config;
+    config.block_size = 128;
+    config.max_context_len = 256;
+    SimulatedDeviceOps device(64ull * 1024 * 1024);
+    StaticArenaManager probe(device, device, config);
+    ExpertSlotAddresses addresses;
+    lattice.PlanStages(table, probe, addresses);
+  }, "the lattice skeleton refuses to plan, naming aclnnLatticeUnpackAndGroupedMatmul");
+}
+
 }  // namespace
 }  // namespace ascend_moe
 
@@ -623,6 +688,8 @@ int main() {
     TestHierarchyRefusals();
     TestStaticArena();
     TestBackboneSizing();
+    TestModelConfigContract();
+    TestMoeBlockSlotContract();
     TestOperatorTable();
   } catch (const std::exception& error) {
     std::printf("\nunexpected exception: %s\n", error.what());
