@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "dsv4_static_arena.hpp"
+#include "moe/memory/static_arena.hpp"
 
 #include <acl/acl_base.h>
 #include <aclnn/acl_meta.h>
@@ -23,11 +23,10 @@
 #include <iomanip>
 #include <sstream>
 
-#include "dsv4_acl_check.hpp"
-#include "dsv4_expert_layout.hpp"
+#include "moe/core/error.hpp"
+#include "moe/memory/expert_layout.hpp"
 
-namespace vllm_ascend {
-namespace dsv4 {
+namespace ascend_moe {
 
 std::vector<int64_t> ContiguousStrides(const std::vector<int64_t>& dims) {
   std::vector<int64_t> strides(dims.size(), 1);
@@ -45,9 +44,9 @@ int64_t ElementCount(const std::vector<int64_t>& dims) {
   return count;
 }
 
-DSV4StaticMemoryArena::DSV4StaticMemoryArena(DeviceOps& device) : device_(device) {}
+StaticMemoryArena::StaticMemoryArena(IDeviceAllocator& allocator) : allocator_(allocator) {}
 
-DSV4StaticMemoryArena::~DSV4StaticMemoryArena() {
+StaticMemoryArena::~StaticMemoryArena() {
   for (aclTensorList* list : owned_lists_) {
     aclDestroyTensorList(list);
   }
@@ -57,11 +56,14 @@ DSV4StaticMemoryArena::~DSV4StaticMemoryArena() {
   for (aclIntArray* array : owned_int_arrays_) {
     aclDestroyIntArray(array);
   }
+  for (aclScalar* scalar : owned_scalars_) {
+    aclDestroyScalar(scalar);
+  }
   if (workspace_ != nullptr) {
-    device_.DeviceFree(workspace_);
+    allocator_.DeviceFree(workspace_);
   }
   if (arena_ != nullptr) {
-    device_.DeviceFree(arena_);
+    allocator_.DeviceFree(arena_);
   }
 }
 
@@ -69,12 +71,12 @@ DSV4StaticMemoryArena::~DSV4StaticMemoryArena() {
 // Phase guards
 // ---------------------------------------------------------------------------
 
-void DSV4StaticMemoryArena::RefuseIfSealed(const char* what) const {
+void StaticMemoryArena::RefuseIfSealed(const char* what) const {
   DSV4_REQUIRE(!sealed_, "the static arena is sealed for decoding; "
                              << what << " would allocate or build a descriptor inside the 43-layer loop");
 }
 
-void DSV4StaticMemoryArena::RequireCommitted(const char* what) const {
+void StaticMemoryArena::RequireCommitted(const char* what) const {
   DSV4_REQUIRE(arena_ != nullptr, what << " needs the arena to be committed first (one aclrtMalloc for all of it)");
 }
 
@@ -82,7 +84,7 @@ void DSV4StaticMemoryArena::RequireCommitted(const char* what) const {
 // Phase 1: RESERVE
 // ---------------------------------------------------------------------------
 
-ArenaHandle DSV4StaticMemoryArena::Reserve(const char* name, size_t bytes, size_t align) {
+ArenaHandle StaticMemoryArena::Reserve(const char* name, size_t bytes, size_t align) {
   RefuseIfSealed("Reserve");
   DSV4_REQUIRE(arena_ == nullptr, "Reserve(" << name << ") after Commit: the arena's size is already fixed");
   DSV4_REQUIRE(bytes > 0, "reservation " << name << " is empty");
@@ -102,30 +104,30 @@ ArenaHandle DSV4StaticMemoryArena::Reserve(const char* name, size_t bytes, size_
 // Phase 2: BUILD
 // ---------------------------------------------------------------------------
 
-void DSV4StaticMemoryArena::Commit() {
+void StaticMemoryArena::Commit() {
   RefuseIfSealed("Commit");
   DSV4_REQUIRE(arena_ == nullptr, "the arena is already committed");
   DSV4_REQUIRE(!reservations_.empty(), "nothing was reserved");
   arena_bytes_ = AlignUp(cursor_, kArenaAlignBytes);
-  arena_ = device_.DeviceMalloc(arena_bytes_);
+  arena_ = allocator_.DeviceMalloc(arena_bytes_);
   // Zeroing matters for the KV cache and the routing buffers: an unwritten
   // block read as stale HBM is a wrong answer with no symptom.
-  device_.DeviceMemset(arena_, arena_bytes_, 0, arena_bytes_);
+  allocator_.DeviceMemset(arena_, arena_bytes_, 0, arena_bytes_);
   ValidateAlignment();
 }
 
-void* DSV4StaticMemoryArena::Address(ArenaHandle handle) const {
+void* StaticMemoryArena::Address(ArenaHandle handle) const {
   RequireCommitted("Address");
   DSV4_REQUIRE(handle < reservations_.size(), "arena handle " << handle << " out of range");
   return static_cast<uint8_t*>(arena_) + reservations_[handle].offset;
 }
 
-size_t DSV4StaticMemoryArena::Bytes(ArenaHandle handle) const {
+size_t StaticMemoryArena::Bytes(ArenaHandle handle) const {
   DSV4_REQUIRE(handle < reservations_.size(), "arena handle " << handle << " out of range");
   return reservations_[handle].bytes;
 }
 
-aclTensor* DSV4StaticMemoryArena::CreateTensorInternal(const char* label, const std::vector<int64_t>& view_dims,
+aclTensor* StaticMemoryArena::CreateTensorInternal(const char* label, const std::vector<int64_t>& view_dims,
                                                        int32_t dtype, void* data,
                                                        const std::vector<int64_t>& storage_dims) {
   RefuseIfSealed("CreateTensor");
@@ -152,19 +154,19 @@ aclTensor* DSV4StaticMemoryArena::CreateTensorInternal(const char* label, const 
   return tensor;
 }
 
-aclTensor* DSV4StaticMemoryArena::CreateTensor(const char* label, const std::vector<int64_t>& dims, int32_t dtype,
+aclTensor* StaticMemoryArena::CreateTensor(const char* label, const std::vector<int64_t>& dims, int32_t dtype,
                                                void* data) {
   return CreateTensorInternal(label, dims, dtype, data, dims);
 }
 
-aclTensor* DSV4StaticMemoryArena::CreateFp4Tensor(const char* label, const std::vector<int64_t>& dims, void* data) {
+aclTensor* StaticMemoryArena::CreateFp4Tensor(const char* label, const std::vector<int64_t>& dims, void* data) {
   DSV4_REQUIRE(dims.back() % kFp4ElementsPerByte == 0,
                label << ": an FP4 view's last dimension (" << dims.back()
                      << " elements) must be even, because two E2M1 values share a byte");
   return CreateTensorInternal(label, dims, kAclFloat4E2m1, data, dims);
 }
 
-aclTensorList* DSV4StaticMemoryArena::CreateTensorList(const char* label, const std::vector<aclTensor*>& tensors) {
+aclTensorList* StaticMemoryArena::CreateTensorList(const char* label, const std::vector<aclTensor*>& tensors) {
   RefuseIfSealed("CreateTensorList");
   DSV4_REQUIRE(!tensors.empty(), label << ": an empty tensor list has no meaning to any aclnn op");
   std::vector<const aclTensor*> handles(tensors.begin(), tensors.end());
@@ -180,7 +182,7 @@ aclTensorList* DSV4StaticMemoryArena::CreateTensorList(const char* label, const 
   return list;
 }
 
-aclIntArray* DSV4StaticMemoryArena::CreateIntArray(const char* label, const std::vector<int64_t>& values) {
+aclIntArray* StaticMemoryArena::CreateIntArray(const char* label, const std::vector<int64_t>& values) {
   RefuseIfSealed("CreateIntArray");
   DSV4_REQUIRE(!values.empty(), label << ": an empty int array has no meaning to any aclnn op");
   descriptor_shapes_.push_back(values);
@@ -197,12 +199,44 @@ aclIntArray* DSV4StaticMemoryArena::CreateIntArray(const char* label, const std:
   return array;
 }
 
-void DSV4StaticMemoryArena::NoteWorkspace(uint64_t bytes) {
+aclScalar* StaticMemoryArena::CreateScalar(const char* label, int32_t dtype, const void* value) {
+  RefuseIfSealed("CreateScalar");
+  size_t width = 0;
+  switch (dtype) {
+    case kAclFloat32:
+    case kAclInt32:
+      width = 4;
+      break;
+    case kAclInt64:
+      width = 8;
+      break;
+    default:
+      throw Dsv4Error(std::string(label) + ": scalar dtype " + std::to_string(dtype) +
+                     " is not one the arena knows the width of; extend CreateScalar rather than guessing");
+  }
+  scalar_values_.emplace_back(static_cast<const uint8_t*>(value), static_cast<const uint8_t*>(value) + width);
+  const std::vector<uint8_t>& bytes = scalar_values_.back();
+  aclScalar* scalar = aclCreateScalar(const_cast<void*>(static_cast<const void*>(bytes.data())),
+                                      static_cast<aclDataType>(dtype));
+  DSV4_REQUIRE(scalar != nullptr, label << ": aclCreateScalar returned null");
+  owned_scalars_.push_back(scalar);
+
+  DescriptorRecord record;
+  record.label = label;
+  record.kind = DescriptorRecord::Kind::kScalar;
+  record.dtype = dtype;
+  record.element_count = 1;
+  record.address = bytes.data();
+  descriptors_.push_back(record);
+  return scalar;
+}
+
+void StaticMemoryArena::NoteWorkspace(uint64_t bytes) {
   RefuseIfSealed("NoteWorkspace");
   workspace_high_water_ = std::max(workspace_high_water_, bytes);
 }
 
-void DSV4StaticMemoryArena::CommitWorkspace() {
+void StaticMemoryArena::CommitWorkspace() {
   RefuseIfSealed("CommitWorkspace");
   DSV4_REQUIRE(workspace_ == nullptr, "the ACLNN workspace is already committed");
   // One shared workspace sized by the high-water mark across every planned op.
@@ -213,11 +247,11 @@ void DSV4StaticMemoryArena::CommitWorkspace() {
   if (workspace_bytes_ == 0) {
     return;  // every planned op asked for zero; nothing to allocate
   }
-  workspace_ = device_.DeviceMalloc(static_cast<size_t>(workspace_bytes_));
-  device_.DeviceMemset(workspace_, static_cast<size_t>(workspace_bytes_), 0, static_cast<size_t>(workspace_bytes_));
+  workspace_ = allocator_.DeviceMalloc(static_cast<size_t>(workspace_bytes_));
+  allocator_.DeviceMemset(workspace_, static_cast<size_t>(workspace_bytes_), 0, static_cast<size_t>(workspace_bytes_));
 }
 
-void DSV4StaticMemoryArena::AssertWorkspaceFits(uint64_t bytes, const char* what) const {
+void StaticMemoryArena::AssertWorkspaceFits(uint64_t bytes, const char* what) const {
   DSV4_REQUIRE(bytes <= workspace_bytes_,
                what << " plans " << bytes << " workspace bytes but only " << workspace_bytes_
                     << " were reserved at init; the decode shapes changed -- rebuild the pipeline, never grow the "
@@ -228,7 +262,7 @@ void DSV4StaticMemoryArena::AssertWorkspaceFits(uint64_t bytes, const char* what
 // Phase 3: SEALED
 // ---------------------------------------------------------------------------
 
-void DSV4StaticMemoryArena::Seal() {
+void StaticMemoryArena::Seal() {
   RequireCommitted("Seal");
   sealed_ = true;
 }
@@ -237,7 +271,7 @@ void DSV4StaticMemoryArena::Seal() {
 // Verification and reporting
 // ---------------------------------------------------------------------------
 
-void DSV4StaticMemoryArena::ValidateAlignment() const {
+void StaticMemoryArena::ValidateAlignment() const {
   size_t previous_end = 0;
   const char* previous_name = "<start>";
   for (const ArenaReservation& reservation : reservations_) {
@@ -261,7 +295,7 @@ void DSV4StaticMemoryArena::ValidateAlignment() const {
                "the committed arena base is not " << kArenaAlignBytes << "-byte aligned");
 }
 
-std::string DSV4StaticMemoryArena::DescribeLedger() const {
+std::string StaticMemoryArena::DescribeLedger() const {
   const double mib = 1024.0 * 1024.0;
   std::ostringstream out;
   out << std::fixed << std::setprecision(3);
@@ -277,5 +311,4 @@ std::string DSV4StaticMemoryArena::DescribeLedger() const {
   return out.str();
 }
 
-}  // namespace dsv4
-}  // namespace vllm_ascend
+}  // namespace ascend_moe

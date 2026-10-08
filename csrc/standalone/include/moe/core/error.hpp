@@ -29,8 +29,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace vllm_ascend {
-namespace dsv4 {
+namespace ascend_moe {
 
 class Dsv4Error : public std::runtime_error {
  public:
@@ -58,7 +57,7 @@ class AclError : public Dsv4Error {
   do {                                                                         \
     const auto dsv4_status_ = (expr);                                          \
     if (dsv4_status_ != 0) {                                                   \
-      throw ::vllm_ascend::dsv4::AclError(#expr, __FILE__, __LINE__,           \
+      throw ::ascend_moe::AclError(#expr, __FILE__, __LINE__,           \
                                           static_cast<int64_t>(dsv4_status_)); \
     }                                                                          \
   } while (false)
@@ -69,9 +68,8 @@ class AclError : public Dsv4Error {
       std::ostringstream dsv4_msg_;                                            \
       dsv4_msg_ << message << " [" << #condition << " at " << __FILE__ << ":"   \
                 << __LINE__ << "]";                                            \
-      throw ::vllm_ascend::dsv4::Dsv4Error(dsv4_msg_.str());                   \
+      throw ::ascend_moe::Dsv4Error(dsv4_msg_.str());                   \
     }                                                                          \
   } while (false)
 
-}  // namespace dsv4
-}  // namespace vllm_ascend
+}  // namespace ascend_moe

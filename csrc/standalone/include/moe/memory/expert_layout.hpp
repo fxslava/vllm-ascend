@@ -47,8 +47,7 @@
 #include <string>
 #include <vector>
 
-namespace vllm_ascend {
-namespace dsv4 {
+namespace ascend_moe {
 
 enum class ExpertRegionKind {
   kPackedFp4,  // 2 E2M1 nibbles per stored byte
@@ -117,5 +116,4 @@ class ExpertSlotLayout {
 // Round `value` up to `alignment`, which must be a power of two.
 size_t AlignUp(size_t value, size_t alignment);
 
-}  // namespace dsv4
-}  // namespace vllm_ascend
+}  // namespace ascend_moe

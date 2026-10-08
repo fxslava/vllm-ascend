@@ -31,17 +31,16 @@
 #include <string>
 #include <vector>
 
-#include "dsv4_acl_check.hpp"
-#include "dsv4_aclnn_v5.hpp"
-#include "dsv4_config.hpp"
-#include "dsv4_device_ops.hpp"
-#include "dsv4_exclusive_staging.hpp"
-#include "dsv4_expert_layout.hpp"
-#include "dsv4_pipeline.hpp"
-#include "dsv4_weight_source.hpp"
+#include "moe/core/error.hpp"
+#include "moe/core/op_table.hpp"
+#include "moe/core/config.hpp"
+#include "moe/core/device_ops.hpp"
+#include "moe/memory/exclusive_staging.hpp"
+#include "moe/memory/expert_layout.hpp"
+#include "moe/pipeline/pipeline.hpp"
+#include "moe/core/weight_source.hpp"
 
-namespace vllm_ascend {
-namespace dsv4 {
+namespace ascend_moe {
 namespace {
 
 void PrintUsage() {
@@ -61,7 +60,8 @@ void PrintUsage() {
       "  --qk-nope-head-dim <n>    MLA nope head width (default %lld, family default)\n"
       "  --v-head-dim <n>          MLA value head width (default %lld, family default)\n"
       "  --moe-path fused|decomposed   expert GEMM chain (default fused; see README)\n"
-      "  --gating-norm-type <n>    aclnnMoeGatingTopKV2 normType (default 0, UNVERIFIED)\n"
+      "  --gating-norm-type <n>    aclnnMoeGatingTopKV2 normType (default -1: scores arrive pre-normalized\n"
+      "                            from the decomposed aclnnSoftplus -> aclnnSqrt sqrtsoftplus chain)\n"
       "  --dense-group-size <n>    aclnnQuantMatmulV5 groupSize (default 0, UNVERIFIED)\n"
       "  --routed-coverage <n>     |Set_Device| + |Set_Host|, default %lld (bring-up subset below that)\n"
       "  --synthetic-weights       deterministic in-memory weights; no files are opened\n"
@@ -268,7 +268,7 @@ int Run(int argc, char** argv) {
   ExclusiveExpertManager::Options options;
   options.routed_coverage = config.routed_coverage;
   options.device_slots = slots;
-  ExclusiveExpertManager experts(device, layout, options);
+  ExclusiveExpertManager experts(device, device, layout, options);
   report << experts.DescribeHierarchy();
 
   std::unique_ptr<WeightByteSource> source;
@@ -279,7 +279,7 @@ int Run(int argc, char** argv) {
                                                        kNumLayers, kNumRoutedExperts);
   }
 
-  Dsv4Pipeline pipeline(device, ops, experts, config);
+  Dsv4Pipeline pipeline(device, device, ops, experts, config);
   // Order matters: the pipeline takes the backbone tensors first, then the
   // expert manager takes the routed slots and seals the source. Exactly one
   // owner closes it, and after that the hierarchy is the only copy.
@@ -292,7 +292,7 @@ int Run(int argc, char** argv) {
   report << pipeline.DescribeStages();
   report << pipeline.DescribeSlotIndexMap();
   if (config.verbose) {
-    report << pipeline.arena().DescribeLedger();
+    report << pipeline.arena_manager().arena().DescribeLedger();
   }
 
   if (config.dry_run) {
@@ -350,12 +350,11 @@ int Run(int argc, char** argv) {
 }
 
 }  // namespace
-}  // namespace dsv4
-}  // namespace vllm_ascend
+}  // namespace ascend_moe
 
 int main(int argc, char** argv) {
   try {
-    return vllm_ascend::dsv4::Run(argc, argv);
+    return ascend_moe::Run(argc, argv);
   } catch (const std::exception& error) {
     std::fprintf(stderr, "dsv4_runner: %s\n", error.what());
     return 1;

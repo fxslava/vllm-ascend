@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "dsv4_weight_source.hpp"
+#include "moe/core/weight_source.hpp"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -26,11 +26,10 @@
 #include <cstring>
 #include <sstream>
 
-#include "dsv4_acl_check.hpp"
-#include "dsv4_config.hpp"
+#include "moe/core/error.hpp"
+#include "moe/core/config.hpp"
 
-namespace vllm_ascend {
-namespace dsv4 {
+namespace ascend_moe {
 namespace {
 
 constexpr size_t kSafetensorsHeaderLengthBytes = 8;
@@ -531,19 +530,39 @@ void SafetensorsWeightSource::ValidateExpertBinding(int32_t layer, int32_t exper
   const ExpertRegionSpec& down = layout_.region(ExpertRegionId::kDownWeight);
   const ExpertRegionSpec& down_scale = layout_.region(ExpertRegionId::kDownScale);
 
+  // Header dtype strings accepted for the two routed storage kinds. Byte counts
+  // alone cannot tell FP4-packed weights (ACL_FLOAT4_E2M1, 2 nibbles/byte) from
+  // a half-width dense tensor of another dtype, nor an E8M0 block-32 scale
+  // (ACL_FLOAT8_E8M0, 1 byte per 32 elements) from a per-element UINT8 scale,
+  // so the unpack mapping is only provably right when the dtype string says
+  // the checkpoint really is FP4 + UE8M0. Mirrors the dtype gate in
+  // hardware/sharded_safetensors.py (_validate_dtype_and_shape).
+  static const char* const kFp4WeightDtypes[] = {"MOE_F4", "F4_E2M1"};
+  static const char* const kE8m0ScaleDtypes[] = {"MOE_F4_SCALE", "F8_E8M0", "UE8M0"};
+
   struct Binding {
     ExpertProjection projection;
     bool is_scale;
     uint64_t expected_bytes;
+    int64_t expected_rows;
+    int64_t expected_stored_cols;
   };
-  // gate and up each contribute half of the fused w13 region.
+  // gate and up each contribute half of the fused w13 region. Shapes are the
+  // BYTE view (rows x stored_cols): FP4 nibble pairs and E8M0 scale bytes stay
+  // byte-shaped in the checkpoint, exactly as core/layout.py's logical_shape
+  // defines it for these two kinds.
   const Binding bindings[] = {
-      {ExpertProjection::kGate, false, gate_up.num_bytes() / 2},
-      {ExpertProjection::kUp, false, gate_up.num_bytes() / 2},
-      {ExpertProjection::kGate, true, gate_up_scale.num_bytes() / 2},
-      {ExpertProjection::kUp, true, gate_up_scale.num_bytes() / 2},
-      {ExpertProjection::kDown, false, down.num_bytes()},
-      {ExpertProjection::kDown, true, down_scale.num_bytes()},
+      {ExpertProjection::kGate, false, gate_up.num_bytes() / 2, gate_up.rows / 2,
+       static_cast<int64_t>(gate_up.stored_cols())},
+      {ExpertProjection::kUp, false, gate_up.num_bytes() / 2, gate_up.rows / 2,
+       static_cast<int64_t>(gate_up.stored_cols())},
+      {ExpertProjection::kGate, true, gate_up_scale.num_bytes() / 2, gate_up_scale.rows / 2,
+       static_cast<int64_t>(gate_up_scale.stored_cols())},
+      {ExpertProjection::kUp, true, gate_up_scale.num_bytes() / 2, gate_up_scale.rows / 2,
+       static_cast<int64_t>(gate_up_scale.stored_cols())},
+      {ExpertProjection::kDown, false, down.num_bytes(), down.rows, static_cast<int64_t>(down.stored_cols())},
+      {ExpertProjection::kDown, true, down_scale.num_bytes(), down_scale.rows,
+       static_cast<int64_t>(down_scale.stored_cols())},
   };
   for (const Binding& binding : bindings) {
     const std::string name = ExpertTensorName(layer, expert, binding.projection, binding.is_scale);
@@ -551,6 +570,25 @@ void SafetensorsWeightSource::ValidateExpertBinding(int32_t layer, int32_t exper
     DSV4_REQUIRE(tensor.num_bytes() == binding.expected_bytes,
                  "tensor " << name << " holds " << tensor.num_bytes() << " bytes, the expert slot layout needs "
                            << binding.expected_bytes);
+    const char* const* accepted = binding.is_scale ? kE8m0ScaleDtypes : kFp4WeightDtypes;
+    const size_t accepted_count = binding.is_scale ? sizeof(kE8m0ScaleDtypes) / sizeof(kE8m0ScaleDtypes[0])
+                                                   : sizeof(kFp4WeightDtypes) / sizeof(kFp4WeightDtypes[0]);
+    bool dtype_ok = false;
+    for (size_t index = 0; index < accepted_count; ++index) {
+      dtype_ok = dtype_ok || tensor.dtype == accepted[index];
+    }
+    DSV4_REQUIRE(dtype_ok,
+                 "tensor " << name << " has safetensors dtype '" << tensor.dtype
+                           << "', but the slot layout is packed FP4 E2M1 weights with E8M0 block-"
+                           << kRoutedScaleBlock << " scales; expected one of '"
+                           << (binding.is_scale ? "MOE_F4_SCALE/F8_E8M0/UE8M0" : "MOE_F4/F4_E2M1") << "'");
+    if (tensor.shape.size() == 2) {
+      DSV4_REQUIRE(tensor.shape[0] == binding.expected_rows &&
+                       tensor.shape[1] == binding.expected_stored_cols,
+                   "tensor " << name << " has shape [" << tensor.shape[0] << ", " << tensor.shape[1]
+                             << "], the byte view of its slot region is [" << binding.expected_rows << ", "
+                             << binding.expected_stored_cols << "]");
+    }
   }
 }
 
@@ -601,6 +639,12 @@ void SafetensorsWeightSource::ReadRegionWindow(const ExpertRegionSpec& spec, uin
 void SafetensorsWeightSource::ReadExpertSlotRange(uint8_t* destination, size_t destination_capacity,
                                                   size_t slot_offset, size_t count, int32_t layer, int32_t expert) {
   RefuseIfClosed("ReadExpertSlotRange");
+  // The unpack mapping is checked BEFORE any byte moves, on every window, so an
+  // FP8 / BF16 / reshaped checkpoint bound against the packed-FP4 slot layout
+  // is refused here rather than silently reinterpreted (byte counts alone
+  // cannot tell the difference). FillExpertSlot -- the host-resident path --
+  // funnels through here too, so both ingestion paths are covered.
+  ValidateExpertBinding(layer, expert);
   DSV4_REQUIRE(count <= destination_capacity,
                "slot read of " << count << " bytes exceeds destination capacity " << destination_capacity);
   DSV4_REQUIRE(slot_offset + count <= layout_.slot_num_bytes(),
@@ -630,5 +674,4 @@ void SafetensorsWeightSource::Close() {
   closed_ = true;
 }
 
-}  // namespace dsv4
-}  // namespace vllm_ascend
+}  // namespace ascend_moe

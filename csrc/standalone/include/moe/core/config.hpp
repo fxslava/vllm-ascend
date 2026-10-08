@@ -29,8 +29,7 @@
 #include <cstdint>
 #include <string>
 
-namespace vllm_ascend {
-namespace dsv4 {
+namespace ascend_moe {
 
 // ---------------------------------------------------------------------------
 // Topology (DeepSeek-V4 Flash)
@@ -149,24 +148,37 @@ inline constexpr int64_t kRoutingTokensNumCumsum = 0;  // expertTokensNumType
 inline constexpr int64_t kRoutingQuantModeNone = 0;
 inline constexpr int64_t kRoutingRowIdxGather = 0;
 
-// aclnnMoeGatingTopKV2 -- noaux_tc: the bias shifts *selection only*, routing
-// weights stay the raw scores, and selection is not group-constrained.
+// aclnnSoftplus -- stage 1 of the decomposed sqrtsoftplus router scoring:
+// softplus(x) = (1/beta) log(1 + exp(beta * x)) below `threshold`, x above it.
+// Matches SoftplusConfig in tools/dsv4_moe_runtime/hardware/v5_ops_moe.py.
+inline constexpr double kSoftplusBeta = 1.0;
+inline constexpr double kSoftplusThreshold = 20.0;
+
+// aclnnMoeGatingTopKV2 -- noaux_tc over PRE-NORMALIZED sqrtsoftplus scores:
+// the bias shifts *selection only*, routing weights keep the raw scores, and
+// selection is not group-constrained.
 //
-// `normType` selects the scoring function and the header ships no enumeration
-// of its values (checked against CANN 9.2.0-beta.2: aclnn_moe_gating_top_k_v2.h
-// documents neither the attribute nor its range). DSV4 Flash specifies
-// `scoring_func = "sqrtsoftplus"`, which is not one of the two values the older
-// `aclnnMoeGatingTopK` documents (softmax / sigmoid). The value is therefore a
-// CLI knob (`--gating-norm-type`) that defaults to 0, and the pipeline records
-// in its report that the scoring function is UNVERIFIED against a host
-// reference. Settling it needs a device A/B, which README.md names as a
-// bring-up item rather than papering over here.
-inline constexpr int64_t kGatingNormTypeUnverifiedDefault = 0;
+// The stock operator cannot express DSV4 Flash's `scoring_func =
+// "sqrtsoftplus"` itself: its normType only enumerates the softmax(0) /
+// sigmoid(1) of the older aclnnMoeGatingTopK (checked against CANN
+// 9.2.0-beta.2: aclnn_moe_gating_top_k_v2.h documents neither the attribute
+// nor its range). The scoring therefore runs as the decomposed
+// aclnnSoftplus -> aclnnSqrt chain on the same stream (dsv4_pipeline.cpp
+// stages `router_softplus` / `router_sqrt`), and the gating stage receives
+// scores that are already computed: normType -1 is the pre-normalized /
+// pass-through mode, renorm 1 L1-renormalizes the selected top-6 scores to
+// sum 1.0 (denominator guarded by eps) before routedScalingFactor is applied.
+//
+// The exact pass-through value of normType remains a CLI knob
+// (`--gating-norm-type`) because no header enumerates it; the device A/B
+// against the host reference in v5_ops_moe.py is the bring-up item that
+// settles it, and the pipeline's report says so.
+inline constexpr int64_t kGatingNormTypePreNormalized = -1;
 inline constexpr int64_t kGatingKGroup = 1;
 inline constexpr int64_t kGatingGroupCount = 1;
 inline constexpr int64_t kGatingGroupSelectMode = 0;
-inline constexpr int64_t kGatingRenormOff = 0;
-inline constexpr double kGatingEps = 1e-10;
+inline constexpr int64_t kGatingRenormL1 = 1;
+inline constexpr double kGatingEps = 1e-20;
 
 // aclnnSwigluMxQuant
 inline constexpr int64_t kSwigluActivateDimLast = -1;
@@ -267,7 +279,7 @@ struct RuntimeConfig {
 
   MlaGeometry mla;
   MoePath moe_path = MoePath::kFused;
-  int64_t gating_norm_type = kGatingNormTypeUnverifiedDefault;
+  int64_t gating_norm_type = kGatingNormTypePreNormalized;
 
   // aclnnQuantMatmulV5's `groupSize` packs the per-axis block sizes of the two
   // scale tensors. CANN 9.2.0-beta.2's header declares the argument and
@@ -288,5 +300,4 @@ struct RuntimeConfig {
   std::string report_path;
 };
 
-}  // namespace dsv4
-}  // namespace vllm_ascend
+}  // namespace ascend_moe

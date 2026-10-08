@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "dsv4_exclusive_staging.hpp"
+#include "moe/memory/exclusive_staging.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -22,14 +22,14 @@
 #include <iomanip>
 #include <sstream>
 
-#include "dsv4_acl_check.hpp"
+#include "moe/core/error.hpp"
 
-namespace vllm_ascend {
-namespace dsv4 {
+namespace ascend_moe {
 
-ExclusiveExpertManager::ExclusiveExpertManager(DeviceOps& device, const ExpertSlotLayout& layout,
+ExclusiveExpertManager::ExclusiveExpertManager(IDeviceAllocator& allocator, IStreamEngine& streams,
+                                               const ExpertSlotLayout& layout,
                                                const Options& options)
-    : device_(device), layout_(layout), options_(options) {
+    : allocator_(allocator), streams_(streams), layout_(layout), options_(options) {
   DSV4_REQUIRE(options_.num_layers > 0 && options_.num_experts > 0,
                "routed geometry needs positive layers/experts, got " << options_.num_layers << "/"
                                                                      << options_.num_experts);
@@ -64,11 +64,11 @@ ExclusiveExpertManager::ExclusiveExpertManager(DeviceOps& device, const ExpertSl
   slot_last_touch_.assign(static_cast<size_t>(options_.device_slots), 0ull);
   claim_scratch_.assign(static_cast<size_t>(options_.device_slots), 0u);
 
-  h2d_stream_ = device_.CreateStream();
-  d2h_stream_ = device_.CreateStream();
-  stage_stream_ = device_.CreateStream();
-  h2d_batch_done_ = device_.CreateEvent();
-  d2h_batch_done_ = device_.CreateEvent();
+  h2d_stream_ = streams_.CreateStream();
+  d2h_stream_ = streams_.CreateStream();
+  stage_stream_ = streams_.CreateStream();
+  h2d_batch_done_ = streams_.CreateEvent();
+  d2h_batch_done_ = streams_.CreateEvent();
   PrimeEvents();
 }
 
@@ -80,41 +80,41 @@ ExclusiveExpertManager::~ExclusiveExpertManager() {
   }
   for (TransitHalf& half : transit_) {
     if (half.device_scratch != nullptr) {
-      device_.DeviceFree(half.device_scratch);
+      allocator_.DeviceFree(half.device_scratch);
     }
     if (half.parked != nullptr) {
-      device_.DestroyEvent(half.parked);
+      streams_.DestroyEvent(half.parked);
     }
     if (half.promoted != nullptr) {
-      device_.DestroyEvent(half.promoted);
+      streams_.DestroyEvent(half.promoted);
     }
     if (half.landed != nullptr) {
-      device_.DestroyEvent(half.landed);
+      streams_.DestroyEvent(half.landed);
     }
   }
   if (host_transit_scratch_ != nullptr) {
-    device_.HostPinnedFree(host_transit_scratch_);
+    allocator_.HostPinnedFree(host_transit_scratch_);
   }
   if (h2d_batch_done_ != nullptr) {
-    device_.DestroyEvent(h2d_batch_done_);
+    streams_.DestroyEvent(h2d_batch_done_);
   }
   if (d2h_batch_done_ != nullptr) {
-    device_.DestroyEvent(d2h_batch_done_);
+    streams_.DestroyEvent(d2h_batch_done_);
   }
   if (h2d_stream_ != nullptr) {
-    device_.DestroyStream(h2d_stream_);
+    streams_.DestroyStream(h2d_stream_);
   }
   if (d2h_stream_ != nullptr) {
-    device_.DestroyStream(d2h_stream_);
+    streams_.DestroyStream(d2h_stream_);
   }
   if (stage_stream_ != nullptr) {
-    device_.DestroyStream(stage_stream_);
+    streams_.DestroyStream(stage_stream_);
   }
   for (void* block : host_blocks_) {
-    device_.HostPinnedFree(block);
+    allocator_.HostPinnedFree(block);
   }
   if (device_arena_ != nullptr) {
-    device_.DeviceFree(device_arena_);
+    allocator_.DeviceFree(device_arena_);
   }
 }
 
@@ -164,11 +164,11 @@ size_t ExclusiveExpertManager::QueryHostAvailableBytes() {
 
 void ExclusiveExpertManager::AllocateDeviceArena() {
   device_arena_bytes_ = static_cast<size_t>(options_.device_slots) * layout_.slot_num_bytes();
-  device_arena_ = device_.DeviceMalloc(device_arena_bytes_);
+  device_arena_ = allocator_.DeviceMalloc(device_arena_bytes_);
   // Zeroed so a slot nothing has written reads as zeros rather than as whatever
   // the previous tenant of that HBM page left, which would be a silent wrong
   // answer instead of an obvious one.
-  device_.DeviceMemset(device_arena_, device_arena_bytes_, 0, device_arena_bytes_);
+  allocator_.DeviceMemset(device_arena_, device_arena_bytes_, 0, device_arena_bytes_);
 }
 
 void ExclusiveExpertManager::AllocateHostArena() {
@@ -178,7 +178,9 @@ void ExclusiveExpertManager::AllocateHostArena() {
   const size_t slot_bytes = layout_.slot_num_bytes();
   host_arena_bytes_ = static_cast<size_t>(host_slot_count_) * slot_bytes;
 
-  const size_t available = QueryHostAvailableBytes();
+  const size_t available = options_.host_available_bytes > 0
+                               ? static_cast<size_t>(options_.host_available_bytes)
+                               : QueryHostAvailableBytes();
   if (available != 0) {
     DSV4_REQUIRE(host_arena_bytes_ + options_.transfer_chunk_bytes + kHostReserveBytes <= available,
                  "exclusive partition needs " << host_arena_bytes_ << " pinned bytes for " << host_slot_count_
@@ -196,19 +198,19 @@ void ExclusiveExpertManager::AllocateHostArena() {
                                            static_cast<int64_t>(host_slots_per_block_)));
   for (int64_t first = 0; first < host_slot_count_; first += static_cast<int64_t>(host_slots_per_block_)) {
     const size_t slots_here = std::min<size_t>(host_slots_per_block_, static_cast<size_t>(host_slot_count_ - first));
-    host_blocks_.push_back(device_.HostPinnedMalloc(slots_here * slot_bytes));
+    host_blocks_.push_back(allocator_.HostPinnedMalloc(slots_here * slot_bytes));
   }
 }
 
 void ExclusiveExpertManager::AllocateTransit() {
   for (TransitHalf& half : transit_) {
-    half.device_scratch = device_.DeviceMalloc(transit_chunk_bytes_);
-    device_.DeviceMemset(half.device_scratch, transit_chunk_bytes_, 0, transit_chunk_bytes_);
-    half.parked = device_.CreateEvent();
-    half.promoted = device_.CreateEvent();
-    half.landed = device_.CreateEvent();
+    half.device_scratch = allocator_.DeviceMalloc(transit_chunk_bytes_);
+    allocator_.DeviceMemset(half.device_scratch, transit_chunk_bytes_, 0, transit_chunk_bytes_);
+    half.parked = streams_.CreateEvent();
+    half.promoted = streams_.CreateEvent();
+    half.landed = streams_.CreateEvent();
   }
-  host_transit_scratch_ = device_.HostPinnedMalloc(transit_chunk_bytes_);
+  host_transit_scratch_ = allocator_.HostPinnedMalloc(transit_chunk_bytes_);
   std::memset(host_transit_scratch_, 0, transit_chunk_bytes_);
 }
 
@@ -218,19 +220,19 @@ void ExclusiveExpertManager::PrimeEvents() {
   // such an event. Record each one once on the stream that will own it and
   // drain, so every wait in the steady state refers to a real recording.
   for (TransitHalf& half : transit_) {
-    device_.RecordEvent(half.parked, stage_stream_);
-    device_.RecordEvent(half.promoted, h2d_stream_);
-    device_.RecordEvent(half.landed, d2h_stream_);
+    streams_.RecordEvent(half.parked, stage_stream_);
+    streams_.RecordEvent(half.promoted, h2d_stream_);
+    streams_.RecordEvent(half.landed, d2h_stream_);
   }
-  device_.RecordEvent(h2d_batch_done_, h2d_stream_);
-  device_.RecordEvent(d2h_batch_done_, d2h_stream_);
+  streams_.RecordEvent(h2d_batch_done_, h2d_stream_);
+  streams_.RecordEvent(d2h_batch_done_, d2h_stream_);
   Synchronize();
 }
 
 void ExclusiveExpertManager::Synchronize() {
-  device_.SynchronizeStream(stage_stream_);
-  device_.SynchronizeStream(h2d_stream_);
-  device_.SynchronizeStream(d2h_stream_);
+  streams_.SynchronizeStream(stage_stream_);
+  streams_.SynchronizeStream(h2d_stream_);
+  streams_.SynchronizeStream(d2h_stream_);
 }
 
 // ---------------------------------------------------------------------------
@@ -309,11 +311,11 @@ void ExclusiveExpertManager::Ingest(WeightByteSource& source, const std::vector<
       for (size_t offset = 0; offset < slot_bytes; offset += transit_chunk_bytes_) {
         const size_t count = std::min(transit_chunk_bytes_, slot_bytes - offset);
         source.ReadExpertSlotRange(staging, transit_chunk_bytes_, offset, count, layer, expert);
-        device_.MemcpyAsync(destination + offset, slot_bytes - offset, staging, count, MemcpyKind::kHostToDevice,
+        streams_.MemcpyAsync(destination + offset, slot_bytes - offset, staging, count, MemcpyKind::kHostToDevice,
                             h2d_stream_);
         // Ingestion is the one place a host synchronization is correct: the
         // next read overwrites the staging chunk the DMA is sourcing from.
-        device_.SynchronizeStream(h2d_stream_);
+        streams_.SynchronizeStream(h2d_stream_);
       }
       device_slot_of_[static_cast<size_t>(key)] = slot;
       slot_owner_[static_cast<size_t>(slot)] = static_cast<int32_t>(key);
@@ -450,23 +452,23 @@ void ExclusiveExpertManager::ExchangeSlot(int32_t device_slot, int32_t host_slot
 
     // 1. Park the victim's chunk on the device. Must not start until the
     //    previous user of this half has finished reading it out (`landed`).
-    device_.StreamWaitEvent(stage_stream_, half.landed);
-    device_.MemcpyAsync(half.device_scratch, transit_chunk_bytes_, device_base + offset, count,
+    streams_.StreamWaitEvent(stage_stream_, half.landed);
+    streams_.MemcpyAsync(half.device_scratch, transit_chunk_bytes_, device_base + offset, count,
                         MemcpyKind::kDeviceToDevice, stage_stream_);
-    device_.RecordEvent(half.parked, stage_stream_);
+    streams_.RecordEvent(half.parked, stage_stream_);
 
     // 2. Promote the incoming chunk into the now-backed-up device slot.
-    device_.StreamWaitEvent(h2d_stream_, half.parked);
-    device_.MemcpyAsync(device_base + offset, slot_bytes - offset, host_base + offset, count,
+    streams_.StreamWaitEvent(h2d_stream_, half.parked);
+    streams_.MemcpyAsync(device_base + offset, slot_bytes - offset, host_base + offset, count,
                         MemcpyKind::kHostToDevice, h2d_stream_);
-    device_.RecordEvent(half.promoted, h2d_stream_);
+    streams_.RecordEvent(half.promoted, h2d_stream_);
 
     // 3. Land the victim in the host slot the promotee just vacated. Reading
     //    and writing the same host bytes is why this waits on `promoted`.
-    device_.StreamWaitEvent(d2h_stream_, half.promoted);
-    device_.MemcpyAsync(host_base + offset, slot_bytes - offset, half.device_scratch, count,
+    streams_.StreamWaitEvent(d2h_stream_, half.promoted);
+    streams_.MemcpyAsync(host_base + offset, slot_bytes - offset, half.device_scratch, count,
                         MemcpyKind::kDeviceToHost, d2h_stream_);
-    device_.RecordEvent(half.landed, d2h_stream_);
+    streams_.RecordEvent(half.landed, d2h_stream_);
 
     half_index = (half_index + 1) % kTransitHalves;
     ++stats_.swap_chunks;
@@ -506,10 +508,10 @@ void ExclusiveExpertManager::ExecutePlan(const LayerSwapPlan& plan, DeviceStream
   // synchronization: the previous layer's expert GEMM may still be reading a
   // device slot this batch overwrites, and the previous batch's D2H may still
   // be writing a host slot this batch reads.
-  device_.StreamWaitEvent(stage_stream_, compute_done);
-  device_.StreamWaitEvent(h2d_stream_, compute_done);
+  streams_.StreamWaitEvent(stage_stream_, compute_done);
+  streams_.StreamWaitEvent(h2d_stream_, compute_done);
   if (!first_batch_) {
-    device_.StreamWaitEvent(h2d_stream_, d2h_batch_done_);
+    streams_.StreamWaitEvent(h2d_stream_, d2h_batch_done_);
   }
 
   // Enqueue every exchange of the batch, publishing each expert's residency
@@ -545,10 +547,10 @@ void ExclusiveExpertManager::ExecutePlan(const LayerSwapPlan& plan, DeviceStream
 
   // One gate for the whole batch: the compute stream waits on the promotions,
   // and the next batch's H2D waits on this batch's landings.
-  device_.RecordEvent(h2d_batch_done_, h2d_stream_);
-  device_.RecordEvent(d2h_batch_done_, d2h_stream_);
+  streams_.RecordEvent(h2d_batch_done_, h2d_stream_);
+  streams_.RecordEvent(d2h_batch_done_, d2h_stream_);
   if (compute_stream != nullptr) {
-    device_.StreamWaitEvent(compute_stream, h2d_batch_done_);
+    streams_.StreamWaitEvent(compute_stream, h2d_batch_done_);
   }
   first_batch_ = false;
 }
@@ -628,7 +630,7 @@ std::string ExclusiveExpertManager::DescribeHierarchy() const {
   const double gib = mib * 1024.0;
   std::ostringstream out;
   out << std::fixed << std::setprecision(2);
-  out << "exclusive routed-expert hierarchy (" << device_.backend_name() << " backend)\n";
+  out << "exclusive routed-expert hierarchy (" << allocator_.backend_name() << " backend)\n";
   out << "  coverage      " << options_.routed_coverage << " experts = " << options_.num_layers << " layers x "
       << options_.num_experts << " routed";
   if (options_.routed_coverage != options_.num_layers * options_.num_experts) {
@@ -646,5 +648,4 @@ std::string ExclusiveExpertManager::DescribeHierarchy() const {
   return out.str();
 }
 
-}  // namespace dsv4
-}  // namespace vllm_ascend
+}  // namespace ascend_moe

@@ -14,16 +14,15 @@
  * limitations under the License.
  */
 
-#include "dsv4_expert_layout.hpp"
+#include "moe/memory/expert_layout.hpp"
 
 #include <iomanip>
 #include <sstream>
 
-#include "dsv4_acl_check.hpp"
-#include "dsv4_config.hpp"
+#include "moe/core/error.hpp"
+#include "moe/core/config.hpp"
 
-namespace vllm_ascend {
-namespace dsv4 {
+namespace ascend_moe {
 
 size_t AlignUp(size_t value, size_t alignment) { return (value + alignment - 1) & ~(alignment - 1); }
 
@@ -159,5 +158,4 @@ std::string ExpertSlotLayout::DescribeTable() const {
   return out.str();
 }
 
-}  // namespace dsv4
-}  // namespace vllm_ascend
+}  // namespace ascend_moe

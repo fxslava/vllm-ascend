@@ -49,8 +49,8 @@
 #include <string>
 #include <vector>
 
-#include "dsv4_acl_check.hpp"
-#include "dsv4_device_ops.hpp"
+#include "moe/core/error.hpp"
+#include "moe/core/device_ops.hpp"
 
 // Forward declarations matching acl/aclnn/acl_meta.h, so this header does not
 // drag the whole toolkit into every translation unit.
@@ -60,8 +60,7 @@ typedef struct aclScalar aclScalar;
 typedef struct aclIntArray aclIntArray;
 typedef struct aclTensorList aclTensorList;
 
-namespace vllm_ascend {
-namespace dsv4 {
+namespace ascend_moe {
 
 enum class OpId {
   // Dense / backbone
@@ -79,6 +78,9 @@ enum class OpId {
   kInplaceAdd,
   kSwiGlu,
   kArgMax,
+  // Decomposed sqrtsoftplus router scoring (DSV4 `scoring_func`)
+  kSoftplus,
+  kSqrt,
   // MoE
   kMoeGatingTopKV2,
   kMoeInitRoutingV4,
@@ -179,7 +181,14 @@ using SwiGluPlanFn = int (*)(const aclTensor* x, int64_t dim, const aclTensor* o
                              aclOpExecutor** executor);
 
 using ArgMaxPlanFn = int (*)(const aclTensor* self, int64_t dim, bool keepdim, aclTensor* out,
-                             uint64_t* workspace_size, aclOpExecutor** executor);
+                              uint64_t* workspace_size, aclOpExecutor** executor);
+
+// aclnnSoftplus: stage 1 of the decomposed sqrtsoftplus router scoring. beta
+// and threshold are HOST aclScalars (FP32, created once by the arena); the
+// elementwise result feeds aclnnSqrt (UnaryPlanFn) and then the pre-normalized
+// gating stage. SoftplusConfig in v5_ops_moe.py pins the same two values.
+using SoftplusPlanFn = int (*)(const aclTensor* self, const aclScalar* beta, const aclScalar* threshold,
+                               aclTensor* out, uint64_t* workspace_size, aclOpExecutor** executor);
 
 using MoeGatingTopKV2PlanFn = int (*)(const aclTensor* x, const aclTensor* bias_optional,
                                       const aclTensor* input_ids_optional, const aclTensor* tid2eid_optional,
@@ -349,5 +358,13 @@ uint64_t PlanAclnnOp(const OpTable& table, OpId id, aclOpExecutor** executor, Ar
   return workspace_size;
 }
 
-}  // namespace dsv4
-}  // namespace vllm_ascend
+// One planned, address-swappable operator invocation. Shared by the pipeline
+// orchestrator and the router engine; the stage vector holding these is born
+// at full capacity because StaticOpSlot is not movable.
+struct PipelineStage {
+  const char* name = nullptr;
+  OpId op = OpId::kOpCount;
+  StaticOpSlot slot;
+};
+
+}  // namespace ascend_moe

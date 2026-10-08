@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "dsv4_aclnn_v5.hpp"
+#include "moe/core/op_table.hpp"
 
 #include <dlfcn.h>
 
@@ -28,8 +28,7 @@
 // toolkit without them cannot run this design at all.
 #include <aclnn/acl_meta.h>
 
-namespace vllm_ascend {
-namespace dsv4 {
+namespace ascend_moe {
 namespace {
 
 struct OpDeclaration {
@@ -63,7 +62,11 @@ const OpDeclaration kDeclarations[] = {
     {OpId::kInplaceAdd, "aclnnInplaceAdd", "attention and MoE residual adds", true, false},
     {OpId::kSwiGlu, "aclnnSwiGlu", "shared-expert activation", true, false},
     {OpId::kArgMax, "aclnnArgMax", "greedy token selection on the LM head", true, false},
-    {OpId::kMoeGatingTopKV2, "aclnnMoeGatingTopKV2", "noaux_tc router, top-6 of 256, scaling 1.5", true, false},
+    {OpId::kSoftplus, "aclnnSoftplus", "sqrtsoftplus router scoring, stage 1 (host-scalar beta/threshold)", true,
+     false},
+    {OpId::kSqrt, "aclnnSqrt", "sqrtsoftplus router scoring, stage 2", true, false},
+    {OpId::kMoeGatingTopKV2, "aclnnMoeGatingTopKV2",
+     "noaux_tc router over pre-normalized scores, top-6 of 256, scaling 1.5", true, false},
     {OpId::kMoeInitRoutingV4, "aclnnMoeInitRoutingV4", "dropless dispatch, device cumsum groupList", true, false},
     {OpId::kGroupedMatmulV5, "aclnnGroupedMatmulV5", "FP8xFP4 M-grouped expert GEMM", true, false},
     {OpId::kSwigluMxQuant, "aclnnSwigluMxQuant", "clamped SwiGLU + MX requant (decomposed path)", false, false},
@@ -251,5 +254,4 @@ void StaticOpSlot::Launch(const OpTable& table, void* workspace, void* stream) c
   }
 }
 
-}  // namespace dsv4
-}  // namespace vllm_ascend
+}  // namespace ascend_moe

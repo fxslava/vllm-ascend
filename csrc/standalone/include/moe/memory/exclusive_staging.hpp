@@ -67,13 +67,13 @@
 #include <string>
 #include <vector>
 
-#include "dsv4_config.hpp"
-#include "dsv4_device_ops.hpp"
-#include "dsv4_expert_layout.hpp"
-#include "dsv4_weight_source.hpp"
+#include "moe/core/config.hpp"
+#include "moe/core/device_allocator.hpp"
+#include "moe/core/stream_engine.hpp"
+#include "moe/memory/expert_layout.hpp"
+#include "moe/core/weight_source.hpp"
 
-namespace vllm_ascend {
-namespace dsv4 {
+namespace ascend_moe {
 
 inline constexpr int32_t kNoSlot = -1;
 inline constexpr int32_t kTransitHalves = 2;
@@ -126,9 +126,15 @@ class ExclusiveExpertManager {
     size_t transfer_chunk_bytes = kTransferChunkBytes;
     size_t host_block_bytes = kHostBlockBytes;
     int64_t top_k = kNumExpertsPerTok;
+    // 0 = consult /proc/meminfo before pinning the host half (production). A
+    // positive value overrides that check, for hosts whose pinned memory is
+    // symbolic rather than physical -- the mock runtime's interval registry,
+    // which carries the full 137 GiB routed set as spans, not bytes.
+    int64_t host_available_bytes = 0;
   };
 
-  ExclusiveExpertManager(DeviceOps& device, const ExpertSlotLayout& layout, const Options& options);
+  ExclusiveExpertManager(IDeviceAllocator& allocator, IStreamEngine& streams,
+                                               const ExpertSlotLayout& layout, const Options& options);
   ~ExclusiveExpertManager();
 
   ExclusiveExpertManager(const ExclusiveExpertManager&) = delete;
@@ -228,7 +234,8 @@ class ExclusiveExpertManager {
   void ExchangeSlot(int32_t device_slot, int32_t host_slot);
   void RefuseIfPoisoned() const;
 
-  DeviceOps& device_;
+  IDeviceAllocator& allocator_;
+  IStreamEngine& streams_;
   ExpertSlotLayout layout_;
   Options options_;
 
@@ -272,5 +279,4 @@ class ExclusiveExpertManager {
   ExclusiveStagingStats stats_;
 };
 
-}  // namespace dsv4
-}  // namespace vllm_ascend
+}  // namespace ascend_moe

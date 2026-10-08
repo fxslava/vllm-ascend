@@ -39,10 +39,9 @@
 #include <string>
 #include <vector>
 
-#include "dsv4_expert_layout.hpp"
+#include "moe/memory/expert_layout.hpp"
 
-namespace vllm_ascend {
-namespace dsv4 {
+namespace ascend_moe {
 
 // How one checkpoint family names an expert's projections. Mirrors
 // `hardware/safetensors_provider.py`'s ExpertNamingScheme.
@@ -212,5 +211,4 @@ class SafetensorsWeightSource : public WeightByteSource {
 // anything else.
 std::map<std::string, SafetensorsTensor> ParseSafetensorsHeaderJson(const char* text, size_t length);
 
-}  // namespace dsv4
-}  // namespace vllm_ascend
+}  // namespace ascend_moe

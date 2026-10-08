@@ -14,18 +14,17 @@
  * limitations under the License.
  */
 
-#include "dsv4_device_ops.hpp"
+#include "moe/core/device_ops.hpp"
 
 #include <acl/acl.h>
 
 #include <cstdlib>
 #include <cstring>
 
-#include "dsv4_acl_check.hpp"
-#include "dsv4_config.hpp"
+#include "moe/core/config.hpp"
+#include "moe/core/error.hpp"
 
-namespace vllm_ascend {
-namespace dsv4 {
+namespace ascend_moe {
 namespace {
 
 aclrtMemcpyKind ToAclKind(MemcpyKind kind) {
@@ -42,7 +41,15 @@ aclrtMemcpyKind ToAclKind(MemcpyKind kind) {
 }
 
 // std::aligned_alloc demands a size that is a multiple of the alignment.
-void* AlignedHostAlloc(size_t bytes, size_t alignment = kArenaAlignBytes) {
+//
+// The default is the hardware page (4096), not kArenaAlignBytes: the simulated
+// backend models what aclrtMalloc(..., ACL_MEM_MALLOC_HUGE_FIRST) and
+// aclrtMallocHost actually serve -- page-aligned, huge-page-friendly memory --
+// and the arena's contract is stated on ABSOLUTE descriptor addresses, so the
+// simulator must hand out at least the finest alignment any reservation asks
+// for (moe_contract_smoke checks a 4096-byte reservation on its absolute
+// address, not just its offset).
+void* AlignedHostAlloc(size_t bytes, size_t alignment = kSimDeviceAllocAlignBytes) {
   const size_t rounded = ((bytes + alignment - 1) / alignment) * alignment;
   return std::aligned_alloc(alignment, rounded);
 }
@@ -59,22 +66,6 @@ const char* MemcpyKindName(MemcpyKind kind) {
       return "D2H";
     default:
       return "D2D";
-  }
-}
-
-void DeviceOps::AccountCopy(MemcpyKind kind, size_t count) {
-  switch (kind) {
-    case MemcpyKind::kHostToDevice:
-      counters_.host_to_device_bytes += count;
-      break;
-    case MemcpyKind::kDeviceToHost:
-      counters_.device_to_host_bytes += count;
-      break;
-    case MemcpyKind::kDeviceToDevice:
-      counters_.device_to_device_bytes += count;
-      break;
-    default:
-      break;
   }
 }
 
@@ -177,6 +168,22 @@ void AclDeviceOps::SynchronizeStream(DeviceStream stream) {
   ++counters_.stream_synchronizations;
 }
 
+void AclDeviceOps::AccountCopy(MemcpyKind kind, size_t count) {
+  switch (kind) {
+    case MemcpyKind::kHostToDevice:
+      counters_.host_to_device_bytes += count;
+      break;
+    case MemcpyKind::kDeviceToHost:
+      counters_.device_to_host_bytes += count;
+      break;
+    case MemcpyKind::kDeviceToDevice:
+      counters_.device_to_device_bytes += count;
+      break;
+    default:
+      break;
+  }
+}
+
 void AclDeviceOps::MemcpyAsync(void* destination, size_t destination_capacity, const void* source, size_t count,
                                MemcpyKind kind, DeviceStream stream) {
   DSV4_ACL_CHECK(aclrtMemcpyAsync(destination, destination_capacity, source, count, ToAclKind(kind),
@@ -250,6 +257,11 @@ void SimulatedDeviceOps::DeviceFree(void* pointer) {
 void* SimulatedDeviceOps::HostPinnedMalloc(size_t bytes) {
   void* pointer = AlignedHostAlloc(bytes);
   DSV4_REQUIRE(pointer != nullptr, "simulated pinned host allocation of " << bytes << " bytes failed");
+  // Same absolute-address rule as DeviceMalloc: page-locked memory that a DMA
+  // sources must not start mid-page in the simulator when the physical backend
+  // would not.
+  DSV4_REQUIRE(reinterpret_cast<uintptr_t>(pointer) % kSimDeviceAllocAlignBytes == 0,
+               "simulated pinned host allocation is not page-aligned");
   ++counters_.host_pinned_allocations;
   return pointer;
 }
@@ -299,8 +311,24 @@ void SimulatedDeviceOps::SynchronizeStream(DeviceStream stream) {
   ++counters_.stream_synchronizations;
 }
 
-void SimulatedDeviceOps::MemcpyAsync(void* destination, size_t destination_capacity, const void* source, size_t count,
-                                     MemcpyKind kind, DeviceStream stream) {
+void SimulatedDeviceOps::AccountCopy(MemcpyKind kind, size_t count) {
+  switch (kind) {
+    case MemcpyKind::kHostToDevice:
+      counters_.host_to_device_bytes += count;
+      break;
+    case MemcpyKind::kDeviceToHost:
+      counters_.device_to_host_bytes += count;
+      break;
+    case MemcpyKind::kDeviceToDevice:
+      counters_.device_to_device_bytes += count;
+      break;
+    default:
+      break;
+  }
+}
+
+void SimulatedDeviceOps::MemcpyAsync(void* destination, size_t destination_capacity, const void* source,
+                                     size_t count, MemcpyKind kind, DeviceStream stream) {
   DSV4_REQUIRE(count <= destination_capacity, "simulated " << MemcpyKindName(kind) << " copy of " << count
                                                            << " bytes exceeds destination capacity "
                                                            << destination_capacity);
@@ -364,5 +392,4 @@ void SimulatedDeviceOps::Record(const DmaTraceEntry& entry) {
   trace_.push_back(entry);
 }
 
-}  // namespace dsv4
-}  // namespace vllm_ascend
+}  // namespace ascend_moe

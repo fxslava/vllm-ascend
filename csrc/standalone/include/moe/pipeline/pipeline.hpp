@@ -14,15 +14,26 @@
  * limitations under the License.
  */
 
-// The 43-layer DeepSeek-V4 Flash decode graph on ACLNN V5.
+// The 43-layer DeepSeek-V4 Flash decode graph on ACLNN V5, as an ORCHESTRATOR.
+//
+// Dsv4Pipeline no longer does everything itself; it wires the pieces together
+// and owns the per-layer replay:
+//
+//   StaticArenaManager       what is allocated and which descriptors cover it
+//   MoeRouterEngine          scoring -> selection -> dropless dispatch
+//   ExclusiveExpertManager   routed-expert residency (passed in)
+//   IDeviceAllocator / IStreamEngine   the backend contract (passed in)
+//
+// What remains here is WHEN things run: the attention half of every layer, the
+// expert GEMMs and the shared expert, the head, and the step boundaries.
 //
 // ONE EXECUTOR PER STAGE, NOT PER LAYER
 // -------------------------------------
 // All 43 layers have identical shapes, so each stage is planned exactly once
 // and replayed 43 times with `aclSetTensorAddr` / `aclSetDynamicTensorAddr`
 // swapping that layer's weights and the step's activations into the retained,
-// repeatable executor. That is ~28 planned executors for the whole model
-// instead of 28 x 43, and it is what the brief's "all descriptors created ONCE
+// repeatable executor. That is ~26 planned executors for the whole model
+// instead of 26 x 43, and it is what the brief's "all descriptors created ONCE
 // during initialization, dynamic addresses swapped via aclSetTensorAddr"
 // describes.
 //
@@ -36,11 +47,12 @@
 //    the engine has to know which six experts the router chose before it can
 //    decide what to promote and what to evict, and the router runs on the
 //    device. So each MoE layer copies the 24-byte top-6 index vector D2H and
-//    synchronizes. `StepCounters::host_synchronizations` counts them and the
-//    report prints the expected total, so the cost is visible rather than
-//    hidden. Removing it needs either a device-side residency table the GEMM
-//    indexes itself -- which means a custom Ascend C kernel, excluded by 3 --
-//    or routing the next layer one layer early. Both are named in README.md.
+//    synchronizes (MoeRouterEngine::ScoreAndSelect). `StepCounters` counts
+//    them and the report prints the expected total, so the cost is visible
+//    rather than hidden. Removing it needs either a device-side residency
+//    table the GEMM indexes itself -- which means a custom Ascend C kernel,
+//    excluded by 3 -- or routing the next layer one layer early. Both are
+//    named in README.md.
 //
 // 2. THE LIGHTNING INDEXER IS NOT APPLIED.
 //
@@ -69,15 +81,17 @@
 #include <string>
 #include <vector>
 
-#include "dsv4_aclnn_v5.hpp"
-#include "dsv4_config.hpp"
-#include "dsv4_device_ops.hpp"
-#include "dsv4_exclusive_staging.hpp"
-#include "dsv4_static_arena.hpp"
-#include "dsv4_weight_source.hpp"
+#include "moe/core/config.hpp"
+#include "moe/core/device_allocator.hpp"
+#include "moe/core/device_types.hpp"
+#include "moe/core/op_table.hpp"
+#include "moe/core/stream_engine.hpp"
+#include "moe/core/weight_source.hpp"
+#include "moe/memory/exclusive_staging.hpp"
+#include "moe/pipeline/moe_router_engine.hpp"
+#include "moe/pipeline/static_arena_manager.hpp"
 
-namespace vllm_ascend {
-namespace dsv4 {
+namespace ascend_moe {
 
 struct StepCounters {
   uint64_t steps = 0;
@@ -96,7 +110,7 @@ struct StepCounters {
 // occupies. ACLNN numbers an executor's tensors in IR order -- every input in
 // declaration order, then every output -- counting only tensor and tensor-list
 // arguments and skipping the scalars. Each constant below is derived that way
-// from the signature in dsv4_aclnn_v5.hpp, with the argument it refers to
+// from the signature in op_table.hpp, with the argument it refers to
 // named.
 //
 // This derivation is the one part of the design the plan phase cannot confirm:
@@ -134,6 +148,16 @@ inline constexpr size_t kQuantMmX1Scale = 2;
 inline constexpr size_t kQuantMmX2Scale = 3;
 inline constexpr size_t kQuantMmOut = 9;
 
+// aclnnSoftplus(x, beta, threshold, out) and aclnnSqrt(x, out): the two host
+// scalars are skipped by the IR numbering, so both unary stages have out at
+// tensor index 1. Neither address is ever swapped -- the scoring buffers are
+// step-static activations -- but the indices are recorded so a bring-up can
+// check them like every other stage.
+inline constexpr size_t kSoftplusX = 0;
+inline constexpr size_t kSoftplusOut = 1;
+inline constexpr size_t kSqrtX = 0;
+inline constexpr size_t kSqrtOut = 1;
+
 // aclnnMoeGatingTopKV2(x, bias, inputIds, tid2eid, ..., yOut, expertIdxOut,
 //                      outOut)
 inline constexpr size_t kGatingX = 0;
@@ -163,16 +187,13 @@ inline constexpr size_t kGmmSwigluScaleList = 2;
 
 }  // namespace slot
 
-// One planned stage: the executor plus the label the report prints.
-struct PipelineStage {
-  const char* name = nullptr;
-  OpId op = OpId::kOpCount;
-  StaticOpSlot slot;
-};
-
+// The orchestrator. Allocation lives in StaticArenaManager, router scoring and
+// dispatch in MoeRouterEngine, expert residency in the ExclusiveExpertManager
+// passed in; this class sequences the 43-layer replay over all of them.
 class Dsv4Pipeline {
  public:
-  Dsv4Pipeline(DeviceOps& device, const OpTable& ops, ExclusiveExpertManager& experts, const RuntimeConfig& config);
+  Dsv4Pipeline(IDeviceAllocator& allocator, IStreamEngine& streams, const OpTable& ops,
+               ExclusiveExpertManager& experts, const RuntimeConfig& config);
   ~Dsv4Pipeline();
 
   Dsv4Pipeline(const Dsv4Pipeline&) = delete;
@@ -193,7 +214,8 @@ class Dsv4Pipeline {
   int32_t ReadArgmaxToken();
 
   const StepCounters& counters() const { return counters_; }
-  const DSV4StaticMemoryArena& arena() const { return arena_; }
+  const StaticArenaManager& arena_manager() const { return arena_manager_; }
+  const MoeRouterEngine& router() const { return router_; }
   std::string DescribeStages() const;
   std::string DescribeSlotIndexMap() const;
 
@@ -203,32 +225,29 @@ class Dsv4Pipeline {
 
  private:
   // ---- build helpers ----
-  void ReserveBuffers();
-  void ReserveBackbone();
-  void IngestBackbone(WeightByteSource& source);
-  void CreateDescriptors();
   void PlanStages();
+  ExpertSlotAddresses CollectExpertSlotAddresses();
 
   // ---- per-layer helpers ----
   void RunAttention(int32_t layer, int64_t position);
   void RunMoe(int32_t layer);
   void RunSharedExpert(int32_t layer);
-  // The forced host read: top-6 global expert ids for `layer`.
-  void FetchRouting(int32_t layer);
   void BindExpertWeights(const LayerSwapPlan& plan);
+  void Launch(PipelineStage& stage_entry);
 
-  void Launch(PipelineStage& stage);
   PipelineStage& stage(const char* name);
   const PipelineStage& stage(const char* name) const;
 
-  DeviceOps& device_;
+  IDeviceAllocator& allocator_;
+  IStreamEngine& streams_;
   const OpTable& ops_;
   ExclusiveExpertManager& experts_;
   RuntimeConfig config_;
-  DSV4StaticMemoryArena arena_;
+
+  StaticArenaManager arena_manager_;
+  MoeRouterEngine router_;
 
   DeviceStream compute_stream_ = nullptr;
-  DeviceStream readback_stream_ = nullptr;
   DeviceEvent compute_done_ = nullptr;
 
   // `stages_` holds StaticOpSlot, which is move-disabled -- not even
@@ -236,28 +255,17 @@ class Dsv4Pipeline {
   // move-empties a zero-size vector. The vector is therefore born at full
   // capacity and only the first `stage_count_` entries are live; it is never
   // resized or copied again.
-  static constexpr size_t kMaxPipelineStages = 32;
+  static constexpr size_t kMaxPipelineStages = 40;
   std::vector<PipelineStage> stages_ = std::vector<PipelineStage>(kMaxPipelineStages);
   size_t stage_count_ = 0;
   StepCounters counters_;
 
   // Shapes, fixed at construction from the config.
-  int64_t num_blocks_ = 0;
   int64_t heads_ = kNumAttentionHeads;
 
-  // The pinned host mailboxes for the one forced round trip per MoE layer.
-  int32_t* routing_mailbox_ = nullptr;      // [top_k] global expert ids, D2H
-  int32_t* local_index_mailbox_ = nullptr;  // [top_k] local 0..top_k-1, H2D
-  int64_t* token_mailbox_ = nullptr;        // [1] greedy token, D2H
-  int32_t* slot_mailbox_ = nullptr;         // [1] paged cache slot, H2D
-
-  // Opaque handles: declared in the .cpp so this header stays free of acl types
-  // beyond the forward declarations dsv4_aclnn_v5.hpp already makes.
-  struct Tensors;
-  struct Backbone;
-  Tensors* tensors_ = nullptr;
-  Backbone* backbone_ = nullptr;
+  // The pinned host mailboxes for the per-step embedding and cache-slot writes.
+  int64_t* token_mailbox_ = nullptr;  // [1] greedy token, D2H
+  int32_t* slot_mailbox_ = nullptr;   // [1] paged cache slot, H2D
 };
 
-}  // namespace dsv4
-}  // namespace vllm_ascend
+}  // namespace ascend_moe
