@@ -109,9 +109,9 @@ TEST(Dsv4CommonData, InvalidGeometryAndScaleRangeFail) {
 }
 
 TEST(Dsv4CommonData, ProductionFitsConservativeUbAndAliasUsesLargestDimension) {
-  EXPECT_EQ(d::ExpertUbBytes(7168, 2048), 173568u);
+  EXPECT_EQ(d::ExpertUbBytes(7168, 2048), 181760u);
   EXPECT_LT(d::ExpertUbBytes(7168, 2048), 192u * 1024);
-  EXPECT_EQ(d::ExpertUbBytes(64, 128), d::kExpertStreamingScratchBytes + 128u + 512u + 2304u);
+  EXPECT_EQ(d::ExpertUbBytes(64, 128), d::kExpertStreamingScratchBytes + 128u + 512u + 2816u);
 }
 
 struct FakeExpert {

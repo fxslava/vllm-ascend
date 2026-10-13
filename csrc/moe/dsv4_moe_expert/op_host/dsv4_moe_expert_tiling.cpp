@@ -67,13 +67,20 @@ constexpr int64_t UB_CHUNK_BYTES = CHUNK_FLAT_ELEMS / FP4_PER_BYTE + MAX_MERGE_E
 // it. This is what stops the two mirrors drifting apart.
 static_assert(UB_CHUNK_BYTES == 93696, "chunk payload changed; update dsv4_test_oracle.hpp to match");
 
-// bf16 input, the fp32 input that doubles as the down accumulator, the three
+// bf16 input, the fp32 input that doubles as the down accumulator, the FOUR
 // fp32 leg buffers, and the three bf16 output rows. Both dimensions are
 // multiples of 64, so every term is already a multiple of UB_ALIGN.
+//
+// The fourth leg buffer is the clamped-up scratch the asymmetric SwiGLU needs.
+// It cannot share xFloatBuf_ with clampedGate (that is 4*max(hidden, inter)
+// bytes, so two inter-wide fp32 arrays only fit when hidden >= 2*inter, which
+// nothing here requires) and it cannot be activatedBuf_ (SwiGLU's output).
+constexpr int64_t FP32_LEG_BUFFERS = 4;  // gateBuf, upBuf, activatedBuf, clampedUpBuf
 uint64_t UbFootprintBytes(int64_t hiddenSize, int64_t interSize)
 {
     const int64_t maxCols = hiddenSize > interSize ? hiddenSize : interSize;
-    const int64_t geometry = 2 * hiddenSize + 4 * maxCols + (3 * 4 + OUT_ROW_COUNT * 2) * interSize;
+    const int64_t geometry =
+        2 * hiddenSize + 4 * maxCols + (FP32_LEG_BUFFERS * 4 + OUT_ROW_COUNT * 2) * interSize;
     return static_cast<uint64_t>(UB_CHUNK_BYTES + geometry);
 }
 

@@ -22,7 +22,8 @@ latency, and bandwidth remain unmeasured.
   the final partial column tile; production cases use 4096/2048 and 7168/2048.
 - The original staging event ring lacked its per-iteration re-arm. This is
   repaired, and the final output DMA is explicitly drained before UB release.
-- Gate/up accumulate in FP32. The gate is clamped symmetrically to +/-10 before
+- Gate/up accumulate in FP32. The gate is clamped ABOVE at +10 and `up` is
+  clamped two-sided at +/-10 before
   SwiGLU. Activation is rounded to BF16 with `CAST_ROUND`, then widened exactly
   for the down projection. The C++ oracle and Python golden generator use the
   same BF16 boundary. Existing golden files need regeneration for this contract.
@@ -122,7 +123,7 @@ device flags contain both `--cce-auto-sync=off` and `-Werror`.
 
 ### UB layout, alignment, and remaining bottlenecks
 
-At 7168/2048 the explicit InitBuffer allocations total **173568 bytes
+At 7168/2048 the explicit InitBuffer allocations total **181760 bytes
 (169.5 KiB)**. This excludes compiler reservation and any high-level API scratch.
 The provisional 256 KiB profile leaves 86576 bytes before those reservations;
 the explicit footprint is also below its 216 KiB SIMT tensor limit. This kernel

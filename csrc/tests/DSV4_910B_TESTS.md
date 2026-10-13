@@ -31,7 +31,7 @@ correctness made it dispatchable. It is now registered and built for both:
   the 950). `Tiling4Dsv4MoeExpert` now computes the kernel's own InitBuffers
   total and checks it against `GetCoreMemSize(UB)`, falling back to 192 KiB
   when the platform cannot be queried. At hidden=7168/inter=2048 that total is
-  173568 bytes, so production clears the 910B with 23040 bytes to spare; the
+  181760 bytes, so production clears the 910B with 14848 bytes to spare; the
   dimension limits, which were picked against the 950, are no longer the only
   guard. `csrc/tests/common/dsv4_test_oracle.hpp` computes the same total for
   the host tier and `test_host_dsv4_moe_expert.cpp` asserts it.
@@ -72,7 +72,7 @@ explicit TBuf allocations are:
 | Two merge buffers and decoded scales | 3072 |
 | Predicate scratch | 4096 |
 | BF16 chunk output | 256 |
-| **Total** | **173568** |
+| **Total** | **181760** |
 
 This is 169.5 KiB, leaving 23040 bytes within a conservative 192 KiB UB budget.
 Every allocation is a multiple of 32 bytes. The 8x512 working set remains
@@ -109,7 +109,8 @@ arch35; the shipping kernel now selects these paths with `__CCE_AICORE__ == 220`
 ReduceRepeat SUM uses FP32; Gather, integer shifts and bitwise operations compile
 for arch220. BF16 widening and CAST_ROUND narrowing remain in place. The installed
 SwiGLU implementation applies swish to its second operand, preserving the
-symmetric gate clamp at +/-10 and FP32 gate/up inputs. FP32 reduction is
+asymmetric clamp (gate bounded above at +10, up two-sided at +/-10) and
+FP32 gate/up inputs. FP32 reduction is
 reassociated relative to the ascending oracle; it is not bit-exact accumulation
 in real arithmetic. The BF16 ULP tests determine acceptable numerical error.
 

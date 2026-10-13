@@ -20,7 +20,7 @@ FP64 expectations in host tests remain independent of that oracle.
 
 | Common abstraction | Responsibility |
 | --- | --- |
-| `dsv4_test_oracle.hpp` | E2M1/E8M0 decoding, ascending FP32 accumulation, symmetric `std::clamp`, `up * swish(gate)`, BF16 round-to-even/widening, geometry and explicit UB payload |
+| `dsv4_test_oracle.hpp` | E2M1/E8M0 decoding, ascending FP32 accumulation, asymmetric clamp (gate above-only, up two-sided), `up * swish(gate)`, BF16 round-to-even/widening, geometry and explicit UB payload |
 | `dsv4_metrics.hpp` | maximum finite BF16 ULP distance, strictly-over-tolerance mismatch rate/count, separate NaN/signed-infinity classification mismatches |
 | `dsv4_synthetic_data.hpp` | deterministic integer generator, exhaustive packed bytes, configurable E8M0 range, all-byte scale sweep and both saturation signs |
 | `ascend_device_context.hpp` | existing device/HBM owners, shared stream and pinned staging owners, synchronized asynchronous H2D/D2H transfers |

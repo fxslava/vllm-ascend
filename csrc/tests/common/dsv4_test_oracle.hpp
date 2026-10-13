@@ -49,8 +49,12 @@ using DeviceOutputs = std::array<std::vector<uint16_t>, 4>;
 // op_host/dsv4_moe_expert_tiling.cpp computes the same total from the chunk
 // constants and checks it against the UB the platform reports.
 constexpr size_t kExpertStreamingScratchBytes = 93696;
+// 2*hidden bf16 input, 4*max(hidden,inter) fp32 input/down accumulator, then
+// per inter element: four fp32 leg buffers (gate, up, activated, and the
+// clamped-up scratch the asymmetric SwiGLU needs) plus three bf16 output rows,
+// i.e. 4*4 + 3*2 = 22.
 constexpr size_t ExpertUbBytes(int64_t hidden, int64_t inter) {
-  return kExpertStreamingScratchBytes + static_cast<size_t>(2 * hidden + 4 * std::max(hidden, inter) + 18 * inter);
+  return kExpertStreamingScratchBytes + static_cast<size_t>(2 * hidden + 4 * std::max(hidden, inter) + 22 * inter);
 }
 
 // UB per core on the two parts the operator is registered for. 192 KiB is the
@@ -167,23 +171,34 @@ inline void Project(const float* x, const uint8_t* packed, const uint8_t* scales
   }
 }
 
-// DeepSeek-V4 architectural constant: the gate is clamped symmetrically to
-// +/- 10.0 before the activation. Part of the model definition, so the kernel,
-// this reference and the goldens must all apply it. `clamp <= 0` disables it,
-// which is only useful for characterising what the clamp changes.
+// DeepSeek-V4 architectural constant: the SwiGLU clamp, at 10.0. It is part of
+// the model definition, so the kernel, this reference and the goldens must all
+// apply it. `clamp <= 0` disables it, which is only useful for characterising
+// what the clamp changes.
+//
+// The clamp is ASYMMETRIC -- see AscendSiluAndMulWithClamp in
+// vllm_ascend/models/deepseek_v4.py:
+//
+//     gate = min(gate, +limit)                upper bound ONLY
+//     up   = min(+limit, max(-limit, up))     two-sided
+//
+// This file previously clamped the gate symmetrically and left `up` alone,
+// which inverts the reference on both halves.
 constexpr float kSwigluLimit = 10.0f;
 
 // Canonical operands: src0=up, src1=gate; src0 * swish(src1).
-// silu(clamp(g)) * u, evaluated as (g * sigmoid(g)) * u to match the kernel's
-// expression.
+// silu(clamp_above(g)) * clamp_both(u), evaluated as (g * sigmoid(g)) * u to
+// match the kernel's expression.
 inline float SwiGluElement(float gate, float up, float clamp = kSwigluLimit) {
   float g = gate;
+  float u = up;
   if (clamp > 0.0f) {
-    g = std::clamp(g, -clamp, clamp);
+    g = std::min(g, clamp);
+    u = std::clamp(u, -clamp, clamp);
   }
   const float neg_exp = std::exp(-g);
   const float sigmoid = 1.0f / (1.0f + neg_exp);
-  return (g * sigmoid) * up;
+  return (g * sigmoid) * u;
 }
 
 struct ExpertOutputs {

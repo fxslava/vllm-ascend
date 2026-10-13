@@ -7,7 +7,8 @@
 
 /*!
  * DeepSeek-V4 routed expert: BF16 x, E2M1 packed FP4 weights, block-32
- * E8M0 scales, FP32 accumulators, symmetric gate clamp at +/-10, BF16
+ * E8M0 scales, FP32 accumulators, the model's ASYMMETRIC SwiGLU clamp
+ * (gate bounded above at +10, up bounded two-sided at +/-10), BF16
  * round-to-nearest-even activation before the down projection.
  */
 
@@ -128,7 +129,22 @@ constexpr int64_t MAX_MERGE_ELEMS = 2 * CHUNK_FLAT_ELEMS / FP4_BLOCK;
 constexpr int64_t REDUCE_SLOT_ELEMS = BYTES_ALIGN / sizeof(float);
 constexpr int32_t REDUCE_SLOT_BYTE_SHIFT = 5;
 
-constexpr float SWIGLU_BETA = 1.0f;
+// AscendC::SwiGLU computes `src0 * (src1 / (1 + e^{beta * src1}))` -- see
+// asc/impl/adv_api/detail/activation/swiglu/swiglu_3510_impl.h:
+//   Muls(tmp0, src1, beta); Exp(tmp1, tmp0); Adds(tmp1, tmp1, 1);
+//   Div(tmp1, src1, tmp1);  Mul(dst, src0, tmp1);
+// Standard silu is `x * sigmoid(x) = x / (1 + e^{-x})`, so the scalar this API
+// wants is NEGATIVE one. The sign convention is the opposite of the `beta` in
+// swiglu.h's own `swish(x) = x / (1 + e^{-beta*x})` comment, which is why this
+// is easy to get wrong; CANN's own callers pass -1.0f (ops_nn/ascendc/
+// dequant_swiglu_quant/dequant_swiglu_quant_{dynamic,static}_base.hpp).
+//
+// With +1.0f this computed `gate * sigmoid(-gate)`, which is not silu and
+// diverges hardest exactly where the clamp puts the gate: at gate = +10 silu
+// is 9.9995 while that expression gives 4.5e-4. dsv4_test_oracle.hpp's
+// SwiGluElement has always used `g * sigmoid(g)`, so the kernel disagreed with
+// its own reference.
+constexpr float SWIGLU_BETA = -1.0f;
 
 constexpr uint8_t STAGING_EVENT_ID = 3; // MTE2_V / V_MTE2 weight-staging ring
 constexpr uint8_t ROW_EVENT_ID = 3;     // V_MTE3 / MTE3_V bf16-row ring
@@ -232,6 +248,12 @@ private:
         pipe_->InitBuffer(gateBuf_, AlignUpBytes(inter_ * static_cast<int64_t>(sizeof(float))));
         pipe_->InitBuffer(upBuf_, AlignUpBytes(inter_ * static_cast<int64_t>(sizeof(float))));
         pipe_->InitBuffer(activatedBuf_, AlignUpBytes(inter_ * static_cast<int64_t>(sizeof(float))));
+        // Holds the two-sided-clamped `up` for ApplySwiGLU. It cannot share
+        // xFloatBuf_ with clampedGate: that buffer is 4*max(hidden, inter)
+        // bytes, so two inter-wide fp32 arrays only fit when hidden >= 2*inter,
+        // which the host guards do not require. It cannot be activatedBuf_
+        // either, because that is SwiGLU's destination.
+        pipe_->InitBuffer(clampedUpBuf_, AlignUpBytes(inter_ * static_cast<int64_t>(sizeof(float))));
         pipe_->InitBuffer(interRowBuf_, AlignUpBytes(OUT_ROW_COUNT * inter_ * 2));
 
         pipe_->InitBuffer(wStagingBuf_, AlignUpBytes(CHUNK_FLAT_ELEMS / FP4_PER_BYTE));
@@ -590,15 +612,37 @@ private:
 #endif
     }
 
+    // DeepSeek-V4's clamp is ASYMMETRIC, matching AscendSiluAndMulWithClamp in
+    // vllm_ascend/models/deepseek_v4.py:
+    //
+    //     gate = min(gate, +limit)                 upper bound ONLY
+    //     up   = min(+limit, max(-limit, up))      two-sided
+    //     out  = silu(gate) * up
+    //
+    // The previous form clamped the gate symmetrically and left `up` alone,
+    // which is the reference's shape on both halves inverted. The missing `up`
+    // clamp was the material half: `up` is a raw 4096-wide FP4 GEMV output, so
+    // it exceeds the limit readily and the error was unbounded. The spurious
+    // gate lower bound was nearly harmless by comparison -- it only bites for
+    // gate < -limit, where silu is already within 4.6e-4 of zero -- but it is
+    // still not the model's function.
+    //
+    // gateAcc_ and upAcc_ stay UNTOUCHED: CopyOut publishes them as the
+    // gate_out / up_out diagnostics, and dsv4_test_oracle.hpp's ExpertOutputs
+    // defines those as the raw projections. Both clamps therefore go to
+    // scratch.
     __aicore__ void ApplySwiGLU()
     {
         const uint32_t count = static_cast<uint32_t>(inter_);
         LocalTensor<float> clampedGate = xFloatBuf_.Get<float>(count);
+        LocalTensor<float> clampedUp = clampedUpBuf_.Get<float>(count);
         Mins(clampedGate, gateAcc_, swigluLimit_, count);
         VectorDependencyBarrier();
-        Maxs(clampedGate, clampedGate, -swigluLimit_, count);
+        Mins(clampedUp, upAcc_, swigluLimit_, count);
         VectorDependencyBarrier();
-        SwiGLU<float, false>(activated_, upAcc_, clampedGate, SWIGLU_BETA, count);
+        Maxs(clampedUp, clampedUp, -swigluLimit_, count);
+        VectorDependencyBarrier();
+        SwiGLU<float, false>(activated_, clampedUp, clampedGate, SWIGLU_BETA, count);
         VectorDependencyBarrier();
         LocalTensor<bfloat16_t> rounded = interRowBuf_.Get<bfloat16_t>(count);
         CastBf16Boundary(rounded, activated_, BF16_ROUND_MODE, count);
@@ -653,6 +697,7 @@ private:
     TBuf<TPosition::VECCALC> gateBuf_;
     TBuf<TPosition::VECCALC> upBuf_;
     TBuf<TPosition::VECCALC> activatedBuf_;
+    TBuf<TPosition::VECCALC> clampedUpBuf_;
     TBuf<TPosition::VECCALC> interRowBuf_;
     TBuf<TPosition::VECCALC> wStagingBuf_;
     TBuf<TPosition::VECCALC> sStagingBuf_;

@@ -178,21 +178,39 @@ TEST(Dsv4SwiGlu, ClampKeepsTheExponentialInRange) {
   }
 }
 
-TEST(Dsv4SwiGlu, SaturatesToTheClampedValueNotToZero) {
-  // The clamp's whole observable effect. Unclamped, a far-negative gate gives
-  // exactly zero; clamped, it gives silu(-10) * up, which is small but NOT
-  // zero. Every golden containing a saturated element moves, which is why
-  // adopting the limit is a re-baseline rather than a drop-in.
+TEST(Dsv4SwiGlu, GateIsBoundedAboveOnlyAndUpIsBoundedBothWays) {
+  // The shape of the DeepSeek-V4 clamp, which is ASYMMETRIC
+  // (AscendSiluAndMulWithClamp in vllm_ascend/models/deepseek_v4.py):
+  //
+  //     gate = min(gate, +limit)              upper bound ONLY
+  //     up   = clamp(up, -limit, +limit)      two-sided
+  //
+  // An earlier revision of this file clamped the gate symmetrically and left
+  // `up` alone, i.e. the reference inverted on both halves, so each half gets
+  // its own assertion here.
   const float up = 2.0f;
-  const float clamped = SwiGluElement(-1e6f, up);
-  const float unclamped = SwiGluElement(-1e6f, up, 0.0f);
 
-  EXPECT_EQ(unclamped, 0.0f) << "unclamped saturates through inf to exactly 0";
-  EXPECT_NE(clamped, 0.0f) << "clamped must not reach 0";
-  EXPECT_FLOAT_EQ(clamped, SwiGluElement(-kSwigluLimit, up))
-      << "a far-negative gate must land exactly on the clamped value";
-  EXPECT_NE(FloatToBf16Bits(clamped), FloatToBf16Bits(unclamped))
-      << "the two differ in bf16: that is the re-baseline cost";
+  // The gate has NO lower bound: a far-negative gate still saturates silu to
+  // zero exactly as an unclamped one does.
+  EXPECT_EQ(SwiGluElement(-1e6f, up), SwiGluElement(-1e6f, up, 0.0f))
+      << "the gate must not be bounded below; silu already saturates there";
+
+  // The gate's upper bound is the half that bites: silu(10) ~= 9.9995 rather
+  // than growing with the gate.
+  EXPECT_FLOAT_EQ(SwiGluElement(1e6f, up), SwiGluElement(kSwigluLimit, up))
+      << "a far-positive gate must land exactly on the clamped value";
+  EXPECT_NE(FloatToBf16Bits(SwiGluElement(1e6f, up)), FloatToBf16Bits(SwiGluElement(1e6f, up, 0.0f)))
+      << "the gate's upper clamp must be observable in bf16";
+
+  // `up` is bounded on both sides, so an out-of-range up of either sign lands
+  // on the limit. This is the half the kernel used to omit entirely.
+  const float gate = 1.0f;
+  EXPECT_FLOAT_EQ(SwiGluElement(gate, 1e6f), SwiGluElement(gate, kSwigluLimit))
+      << "a far-positive up must be clamped to +limit";
+  EXPECT_FLOAT_EQ(SwiGluElement(gate, -1e6f), SwiGluElement(gate, -kSwigluLimit))
+      << "a far-negative up must be clamped to -limit";
+  EXPECT_NE(FloatToBf16Bits(SwiGluElement(gate, 1e6f)), FloatToBf16Bits(SwiGluElement(gate, 1e6f, 0.0f)))
+      << "the up clamp must be observable in bf16";
 }
 
 TEST(Dsv4SwiGlu, LargePositiveGateApproachesClampTimesUp) {
@@ -297,12 +315,13 @@ std::vector<uint16_t> Fp64DownOut(const Problem& p) {
   for (int64_t j = 0; j < inter; ++j) {
     // The DeepSeek-V4 clamp is part of the function, so the oracle applies it
     // too -- otherwise the two implementations differ by construction rather
-    // than by rounding.
-    double g = gate[static_cast<size_t>(j)];
-    g = std::min(static_cast<double>(kSwigluLimit), std::max(-static_cast<double>(kSwigluLimit), g));
+    // than by rounding. It is ASYMMETRIC: the gate is bounded above only, the
+    // up is bounded two-sided.
+    const double limit = static_cast<double>(kSwigluLimit);
+    const double g = std::min(limit, gate[static_cast<size_t>(j)]);
+    const double u = std::min(limit, std::max(-limit, up[static_cast<size_t>(j)]));
     const double sig = 1.0 / (1.0 + std::exp(-g));
-    activated[static_cast<size_t>(j)] =
-        Bf16BitsToFloat(FloatToBf16Bits(static_cast<float>((g * sig) * up[static_cast<size_t>(j)])));
+    activated[static_cast<size_t>(j)] = Bf16BitsToFloat(FloatToBf16Bits(static_cast<float>((g * sig) * u)));
   }
   const std::vector<double> down = project(activated, p.w2, p.w2s, hidden, inter);
 
@@ -367,18 +386,25 @@ TEST(Dsv4Reference, DownConsumesRoundedBf16Activation) {
   for (size_t i = 0; i < down.size(); ++i) EXPECT_EQ(out.down_out[i], FloatToBf16Bits(down[i]));
 }
 
-TEST(Dsv4Reference, ClampMakesTheOutputsMutuallyConsistent) {
-  // A measured side effect of the DeepSeek-V4 clamp, and a good one.
+TEST(Dsv4Reference, OutputsAreMutuallyConsistentOutsideTheSaturatingGateTail) {
+  // How far a consumer can cross-check `activated` against the rounded
+  // gate_out / up_out, under the model's ASYMMETRIC clamp.
   //
-  // Unclamped, recomputing the activation from the ROUNDED gate/up diverged by
-  // tens of bf16 ULPs: silu's relative sensitivity to its gate grows like
-  // |gate| on the negative tail, so one bf16 step in gate (0.4%) moved
-  // exp(-gate) by a double-digit percentage. Bounding the gate to +/-10 bounds
-  // that sensitivity, and the three outputs become mutually consistent.
+  // An earlier revision of this file clamped the gate symmetrically and
+  // claimed the resulting +/-10 bound made the three outputs mutually
+  // consistent to 2 ULP everywhere. That claim died with the lower bound, and
+  // correctly so: DeepSeek-V4 does not bound the gate below. Where the gate is
+  // deeply negative, silu(g) = g*sigmoid(g) ~ g*e^g, so one bf16 step in g
+  // (0.4% relative) scales the result by e^(0.004*|g|) -- at g = -20 that is
+  // 8%, i.e. tens of ULP. The measured worst case across these seeds is ~40.
   //
-  // Practically: a consumer can now cross-check activated against gate_out and
-  // up_out. Measured worst case 2 ULP; the bound below leaves headroom.
+  // That tail is not a defect: both values there are ~0 in absolute terms
+  // (|silu(g)| < 4.6e-4 for g < -10, and |up| <= 10 after its own clamp, so
+  // |activated| < 4.6e-3). So the assertion is ULP-tight where the gate is in
+  // the well-conditioned range and absolute-tight where it is not.
   constexpr int64_t kReconstructionUlp = 4;
+  constexpr float kTailGate = -10.0f;      // below this, silu is saturating
+  constexpr float kTailAbsTolerance = 1e-2f;
   for (uint32_t seed = 0; seed < 4; ++seed) {
     const Problem p = MakeProblem(128, 64, seed);
     const auto out = ReferenceExpert(p.View(), p.hidden, p.inter);
@@ -387,7 +413,14 @@ TEST(Dsv4Reference, ClampMakesTheOutputsMutuallyConsistent) {
       const size_t i = static_cast<size_t>(j);
       const float g = Bf16BitsToFloat(out.gate_out[i]);
       const float u = Bf16BitsToFloat(out.up_out[i]);
-      worst = std::max(worst, Bf16UlpDistance(out.activated[i], FloatToBf16Bits(SwiGluElement(g, u))));
+      const uint16_t want = FloatToBf16Bits(SwiGluElement(g, u));
+      if (g < kTailGate) {
+        EXPECT_NEAR(Bf16BitsToFloat(out.activated[i]), Bf16BitsToFloat(want), kTailAbsTolerance)
+            << "seed " << seed << " lane " << j << ": saturating gate " << g
+            << " must still agree in absolute terms";
+        continue;
+      }
+      worst = std::max(worst, Bf16UlpDistance(out.activated[i], want));
     }
     EXPECT_LE(worst, kReconstructionUlp) << "seed " << seed << ": " << worst << " ULP";
   }
@@ -415,14 +448,14 @@ TEST(Dsv4Tiling, ProductionFitsTheSmallerSupportedPart) {
   // operator is registered for the Ascend910B (192 KiB of UB per core) and the
   // Ascend950 (more), so the 910B is the binding constraint and production has
   // to clear it -- the geometry limits alone were chosen against the 950.
-  EXPECT_EQ(ExpertUbBytes(7168, 2048), static_cast<size_t>(173568));
+  EXPECT_EQ(ExpertUbBytes(7168, 2048), static_cast<size_t>(181760));
   EXPECT_LE(ExpertUbBytes(7168, 2048), kUbBytesAscend910B);
   EXPECT_LE(ExpertUbBytes(7168, 2048), kUbBytesAscend950);
 
   // The fixed chunk payload is geometry-independent, and the rest is linear in
   // the two dimensions with max(hidden, inter) priced once for the aliased
   // fp32 input/down accumulator.
-  EXPECT_EQ(ExpertUbBytes(64, 64), kExpertStreamingScratchBytes + static_cast<size_t>(64 * (2 + 4 + 18)));
+  EXPECT_EQ(ExpertUbBytes(64, 64), kExpertStreamingScratchBytes + static_cast<size_t>(64 * (2 + 4 + 22)));
   EXPECT_EQ(ExpertUbBytes(64, 2048), ExpertUbBytes(2048, 2048) - static_cast<size_t>(2 * 2048 - 2 * 64));
 }
 
