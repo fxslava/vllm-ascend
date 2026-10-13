@@ -129,22 +129,13 @@ constexpr int64_t MAX_MERGE_ELEMS = 2 * CHUNK_FLAT_ELEMS / FP4_BLOCK;
 constexpr int64_t REDUCE_SLOT_ELEMS = BYTES_ALIGN / sizeof(float);
 constexpr int32_t REDUCE_SLOT_BYTE_SHIFT = 5;
 
-// AscendC::SwiGLU computes `src0 * (src1 / (1 + e^{beta * src1}))` -- see
-// asc/impl/adv_api/detail/activation/swiglu/swiglu_3510_impl.h:
-//   Muls(tmp0, src1, beta); Exp(tmp1, tmp0); Adds(tmp1, tmp1, 1);
-//   Div(tmp1, src1, tmp1);  Mul(dst, src0, tmp1);
-// Standard silu is `x * sigmoid(x) = x / (1 + e^{-x})`, so the scalar this API
-// wants is NEGATIVE one. The sign convention is the opposite of the `beta` in
-// swiglu.h's own `swish(x) = x / (1 + e^{-beta*x})` comment, which is why this
-// is easy to get wrong; CANN's own callers pass -1.0f (ops_nn/ascendc/
-// dequant_swiglu_quant/dequant_swiglu_quant_{dynamic,static}_base.hpp).
-//
-// With +1.0f this computed `gate * sigmoid(-gate)`, which is not silu and
-// diverges hardest exactly where the clamp puts the gate: at gate = +10 silu
-// is 9.9995 while that expression gives 4.5e-4. dsv4_test_oracle.hpp's
-// SwiGluElement has always used `g * sigmoid(g)`, so the kernel disagreed with
-// its own reference.
-constexpr float SWIGLU_BETA = -1.0f;
+// Both AscendC SwiGLU implementations used here negate beta in their outer
+// wrapper before evaluating exp: the common path sets scalar = -beta in
+// SwiGLUImpl, and the 3510 path does the same before SwiGLUImplVF. The inner
+// implementation therefore computes src0 * src1 / (1 + exp(-beta * src1)),
+// despite the apparent positive-beta exponent in its Muls instruction. The
+// standard SiLU expression requires beta = +1.0f at the public API.
+constexpr float SWIGLU_BETA = 1.0f;
 
 constexpr uint8_t STAGING_EVENT_ID = 3; // MTE2_V / V_MTE2 weight-staging ring
 constexpr uint8_t ROW_EVENT_ID = 3;     // V_MTE3 / MTE3_V bf16-row ring
