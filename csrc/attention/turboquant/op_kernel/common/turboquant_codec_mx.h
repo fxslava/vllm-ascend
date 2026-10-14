@@ -515,11 +515,13 @@ private:
         float weight = 1.0f;
         for (int32_t digit = 1; digit < kDigitsPerByte; ++digit) {
             weight *= static_cast<float>(Planes::kLowRadix);
-            AscendC::Gather(low_, digits, packOffset_[static_cast<uint32_t>(digit) * bytes], kGatherSrcBase, bytes);
-            // Overlapping write: digits is low_, so this Gather rewrites the lanes the next digit gathers from.
+            // Keep the source digits intact: the output range overlaps its first `bytes` elements.
+            AscendC::Gather(scratch_, digits, packOffset_[static_cast<uint32_t>(digit) * bytes], kGatherSrcBase,
+                            bytes);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Muls(low_, low_, weight, bytes);
-            AscendC::Add(expand_, expand_, low_, bytes);
+            AscendC::Muls(scratch_, scratch_, weight, bytes);
+            AscendC::Add(expand_, expand_, scratch_, bytes);
+            AscendC::PipeBarrier<PIPE_V>();
         }
         StageBytes(dst, bytes);
     }
