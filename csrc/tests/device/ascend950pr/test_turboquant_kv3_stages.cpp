@@ -104,7 +104,7 @@ ReferenceImage BuildReference(const std::vector<float>& key, const std::vector<f
   return ref;
 }
 
-void RunStage(Stage stage, size_t kv_heads, size_t plane) {
+void RunStage(Stage stage, size_t kv_heads, size_t plane, const char* test_case_name) {
   REQUIRE_PHYSICAL_ASCEND_950PR();
   ASSERT_EQ(static_cast<size_t>(tqh::ModePackedBytes(TurboQuantMode::KV3_FP4, kHeadSize)), kPackedBytes);
   ASSERT_TRUE(kv_heads == 1 || kv_heads == 2);
@@ -157,33 +157,35 @@ void RunStage(Stage stage, size_t kv_heads, size_t plane) {
   size_t mismatches = 0;
   if (stage == Stage::kFlat) {
     mismatches =
-        dump::DumpPackedStage(stage_label.c_str(), flat_debug_gm, plane == 0 ? expected.flat_key : expected.flat_value,
-                              rows, kv_heads, kPackedBytes, false, plane * kv_heads * kPackedBytes);
+        dump::DumpPackedStage(test_case_name, stage_label.c_str(), flat_debug_gm,
+                              plane == 0 ? expected.flat_key : expected.flat_value, rows, kv_heads, kPackedBytes,
+                              false, plane * kv_heads * kPackedBytes);
   } else if (stage == Stage::kNz) {
     mismatches =
-        dump::DumpPackedStage(stage_label.c_str(), plane == 0 ? key_cache : value_cache,
-                              plane == 0 ? expected.nz_key : expected.nz_value, rows, kv_heads, kPackedBytes, true, 0,
-                              kBlockSize);
+        dump::DumpPackedStage(test_case_name, stage_label.c_str(), plane == 0 ? key_cache : value_cache,
+                              plane == 0 ? expected.nz_key : expected.nz_value, rows, kv_heads, kPackedBytes, true,
+                              0, kBlockSize);
   } else {
-    mismatches = dump::DumpScaleStage(stage_label.c_str(), scale_cache, expected.scales, rows, kv_heads, plane);
+    mismatches =
+        dump::DumpScaleStage(test_case_name, stage_label.c_str(), scale_cache, expected.scales, rows, kv_heads, plane);
   }
-  EXPECT_EQ(mismatches, 0u) << "Compact diff: " << VLLM_ASCEND_TQ_STAGE_DUMP_PATH;
+  EXPECT_EQ(mismatches, 0u) << "Compact diff: " << dump::DumpFilePath(test_case_name).string();
 }
 
 // Run one case with --gtest_filter=TurboQuantKv3Stages.<case>; every invocation
-// writes only csrc/tests/dev_dumps/stage_output.txt for easy remote transfer.
-TEST(TurboQuantKv3Stages, Stage1FlatKeyH1) { RunStage(Stage::kFlat, 1, 0); }
-TEST(TurboQuantKv3Stages, Stage1FlatValueH1) { RunStage(Stage::kFlat, 1, 1); }
-TEST(TurboQuantKv3Stages, Stage1FlatKeyH2) { RunStage(Stage::kFlat, 2, 0); }
-TEST(TurboQuantKv3Stages, Stage1FlatValueH2) { RunStage(Stage::kFlat, 2, 1); }
-TEST(TurboQuantKv3Stages, Stage2NzKeyH1) { RunStage(Stage::kNz, 1, 0); }
-TEST(TurboQuantKv3Stages, Stage2NzValueH1) { RunStage(Stage::kNz, 1, 1); }
-TEST(TurboQuantKv3Stages, Stage2NzKeyH2) { RunStage(Stage::kNz, 2, 0); }
-TEST(TurboQuantKv3Stages, Stage2NzValueH2) { RunStage(Stage::kNz, 2, 1); }
-TEST(TurboQuantKv3Stages, Stage3ScaleKeyH1) { RunStage(Stage::kScale, 1, 0); }
-TEST(TurboQuantKv3Stages, Stage3ScaleValueH1) { RunStage(Stage::kScale, 1, 1); }
-TEST(TurboQuantKv3Stages, Stage3ScaleKeyH2) { RunStage(Stage::kScale, 2, 0); }
-TEST(TurboQuantKv3Stages, Stage3ScaleValueH2) { RunStage(Stage::kScale, 2, 1); }
+// writes only csrc/tests/dev_dumps/<case>.txt for easy remote transfer.
+TEST(TurboQuantKv3Stages, Stage1FlatKeyH1) { RunStage(Stage::kFlat, 1, 0, "Stage1FlatKeyH1"); }
+TEST(TurboQuantKv3Stages, Stage1FlatValueH1) { RunStage(Stage::kFlat, 1, 1, "Stage1FlatValueH1"); }
+TEST(TurboQuantKv3Stages, Stage1FlatKeyH2) { RunStage(Stage::kFlat, 2, 0, "Stage1FlatKeyH2"); }
+TEST(TurboQuantKv3Stages, Stage1FlatValueH2) { RunStage(Stage::kFlat, 2, 1, "Stage1FlatValueH2"); }
+TEST(TurboQuantKv3Stages, Stage2NzKeyH1) { RunStage(Stage::kNz, 1, 0, "Stage2NzKeyH1"); }
+TEST(TurboQuantKv3Stages, Stage2NzValueH1) { RunStage(Stage::kNz, 1, 1, "Stage2NzValueH1"); }
+TEST(TurboQuantKv3Stages, Stage2NzKeyH2) { RunStage(Stage::kNz, 2, 0, "Stage2NzKeyH2"); }
+TEST(TurboQuantKv3Stages, Stage2NzValueH2) { RunStage(Stage::kNz, 2, 1, "Stage2NzValueH2"); }
+TEST(TurboQuantKv3Stages, Stage3ScaleKeyH1) { RunStage(Stage::kScale, 1, 0, "Stage3ScaleKeyH1"); }
+TEST(TurboQuantKv3Stages, Stage3ScaleValueH1) { RunStage(Stage::kScale, 1, 1, "Stage3ScaleValueH1"); }
+TEST(TurboQuantKv3Stages, Stage3ScaleKeyH2) { RunStage(Stage::kScale, 2, 0, "Stage3ScaleKeyH2"); }
+TEST(TurboQuantKv3Stages, Stage3ScaleValueH2) { RunStage(Stage::kScale, 2, 1, "Stage3ScaleValueH2"); }
 
 }  // namespace
 }  // namespace test

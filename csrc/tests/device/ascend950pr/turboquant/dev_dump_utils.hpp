@@ -20,8 +20,8 @@
 #include "device_buffer.hpp"
 #include "turboquant/turboquant_launch.hpp"
 
-#ifndef VLLM_ASCEND_TQ_STAGE_DUMP_PATH
-  #error "The KV3 stage dump target must be set by the device test CMake target"
+#ifndef VLLM_ASCEND_TQ_STAGE_DUMP_DIR
+  #error "The KV3 stage dump directory must be set by the device test CMake target"
 #endif
 
 namespace vllm_ascend::test::turboquant_dump {
@@ -38,8 +38,19 @@ inline uint32_t Crc32(const uint8_t* bytes, size_t count) {
   return ~crc;
 }
 
-inline std::ofstream OpenDump() {
-  const std::filesystem::path path(VLLM_ASCEND_TQ_STAGE_DUMP_PATH);
+inline std::filesystem::path DumpFilePath(const char* test_case_name) {
+  const std::string name(test_case_name);
+  const bool valid_name = !name.empty() && std::all_of(name.begin(), name.end(), [](char ch) {
+    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_';
+  });
+  if (!valid_name) {
+    throw std::invalid_argument("KV3 dump test case name must contain only letters, digits, and underscores");
+  }
+  return std::filesystem::path(VLLM_ASCEND_TQ_STAGE_DUMP_DIR) / (name + ".txt");
+}
+
+inline std::ofstream OpenDump(const char* test_case_name) {
+  const std::filesystem::path path = DumpFilePath(test_case_name);
   std::filesystem::create_directories(path.parent_path());
   std::ofstream out(path, std::ios::trunc);
   if (!out) {
@@ -61,9 +72,9 @@ inline uint32_t WordAt(const std::vector<int8_t>& bytes, size_t row, size_t kv_h
   return result;
 }
 
-inline size_t DumpPackedStage(const char* stage, const DeviceBuffer& debug_gm, const std::vector<int8_t>& expected,
-                              size_t rows, size_t kv_heads, size_t packed_bytes, bool nz_tiled,
-                              size_t actual_offset_bytes = 0, size_t storage_rows = 0) {
+inline size_t DumpPackedStage(const char* test_case_name, const char* stage, const DeviceBuffer& debug_gm,
+                              const std::vector<int8_t>& expected, size_t rows, size_t kv_heads, size_t packed_bytes,
+                              bool nz_tiled, size_t actual_offset_bytes = 0, size_t storage_rows = 0) {
   const std::vector<int8_t> all_actual = debug_gm.ToHost<int8_t>();
   const size_t plane_bytes = rows * kv_heads * packed_bytes;
   const size_t physical_rows = nz_tiled ? storage_rows : rows;
@@ -109,7 +120,7 @@ inline size_t DumpPackedStage(const char* stage, const DeviceBuffer& debug_gm, c
   }
   const uint32_t actual_crc = Crc32(actual_logical.data(), actual_logical.size());
   const uint32_t expected_crc = Crc32(expected_logical.data(), expected_logical.size());
-  std::ofstream out = OpenDump();
+  std::ofstream out = OpenDump(test_case_name);
   if (mismatches == 0) {
     std::snprintf(line, sizeof(line), "[%s] ALL %zu WORDS MATCH (CRC=0x%08X) PASS\n", stage, total_words, actual_crc);
     out << line;
@@ -127,8 +138,9 @@ inline size_t DumpPackedStage(const char* stage, const DeviceBuffer& debug_gm, c
   return mismatches;
 }
 
-inline size_t DumpScaleStage(const char* stage, const DeviceBuffer& debug_gm, const std::vector<float>& expected,
-                             size_t rows, size_t kv_heads, size_t plane, double relative_tolerance = 1.0e-3) {
+inline size_t DumpScaleStage(const char* test_case_name, const char* stage, const DeviceBuffer& debug_gm,
+                             const std::vector<float>& expected, size_t rows, size_t kv_heads, size_t plane,
+                             double relative_tolerance = 1.0e-3) {
   const std::vector<float> actual = debug_gm.ToHost<float>();
   const size_t stride = static_cast<size_t>(turboquant_host::ScaleSlotFloats(kv_heads));
   if (actual.size() < rows * stride || expected.size() < rows * stride || plane > 1) {
@@ -163,7 +175,7 @@ inline size_t DumpScaleStage(const char* stage, const DeviceBuffer& debug_gm, co
   const uint32_t actual_crc = Crc32(actual_bits.data(), actual_bits.size());
   const uint32_t expected_crc = Crc32(expected_bits.data(), expected_bits.size());
   const size_t total = rows * kv_heads;
-  std::ofstream out = OpenDump();
+  std::ofstream out = OpenDump(test_case_name);
   if (mismatches == 0) {
     std::snprintf(line, sizeof(line), "[%s] ALL %zu SCALE LANES MATCH (CRC=0x%08X) PASS\n", stage, total, actual_crc);
     out << line;

@@ -117,15 +117,14 @@ if(VLLM_ASCEND_TESTS_HAVE_TURBOQUANT)
   vllm_ascend_register_correctness_test(test_device_950pr_turboquant 900 TRUE)
   list(APPEND VLLM_ASCEND_DEVICE_TESTS test_device_950pr_turboquant)
 
-  # One selected stage/case per run writes a compact host-only diff to this
-  # single source-tree file. Keep the path fixed for remote git/chat transfer.
+  # Each selected stage/case writes a compact host-only diff to its own file.
   vllm_ascend_add_device_executable(test_device_950pr_turboquant_kv3_stages
                                     test_turboquant_kv3_stages.cpp
                                     ../../common/testing/main_950pr.cpp)
   target_link_libraries(test_device_950pr_turboquant_kv3_stages PRIVATE vllm_ascend_test_turboquant)
   target_compile_definitions(test_device_950pr_turboquant_kv3_stages PRIVATE
     VLLM_ASCEND_TEST_TIER="device"
-    VLLM_ASCEND_TQ_STAGE_DUMP_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../dev_dumps/stage_output.txt")
+    VLLM_ASCEND_TQ_STAGE_DUMP_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../../dev_dumps")
   vllm_ascend_register_correctness_test(test_device_950pr_turboquant_kv3_stages 900 TRUE)
   list(APPEND VLLM_ASCEND_DEVICE_TESTS test_device_950pr_turboquant_kv3_stages)
 
