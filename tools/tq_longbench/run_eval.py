@@ -98,6 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-seq-len", type=int, default=32768)
     parser.add_argument("--chunk-size", type=int, default=2048)
     parser.add_argument("--block-size", type=int, default=128)
+    parser.add_argument("--cache-mode", default="kv4fp8", choices=("kv4fp8", "kv3fp4"))
     parser.add_argument("--dtype", default="float16", choices=sorted(_DTYPES))
     parser.add_argument("--device", default=None, help="default: npu:0, else cuda:0, else cpu")
     parser.add_argument("--limit", type=int, default=None, help="evaluate at most this many items")
@@ -180,6 +181,7 @@ def main(argv: list[str] | None = None) -> int:
     config = RunnerConfig(
         model_path=args.model_path,
         backend=backend,
+        cache_mode=args.cache_mode,
         prefill_mode=prefill_mode,
         max_seq_len=args.max_seq_len,
         chunk_size=args.chunk_size,

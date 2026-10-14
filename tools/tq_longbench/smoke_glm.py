@@ -200,6 +200,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--block-size", type=int, default=128)
+    parser.add_argument("--cache-mode", default="kv4fp8", choices=("kv4fp8", "kv3fp4"))
     parser.add_argument("--dtype", default="float16", choices=sorted(_DTYPES))
     parser.add_argument(
         "--no-fold-output-rotation",
@@ -639,6 +640,7 @@ def build_runner(
         RunnerConfig(
             model_path=args.model_path,
             backend=backend,
+            cache_mode=getattr(args, "cache_mode", "kv4fp8"),
             prefill_mode=prefill_mode,
             max_seq_len=max_seq_len,
             chunk_size=args.chunk_size,
@@ -727,7 +729,10 @@ def plan_attention(args, shape, prefill_mode: str) -> AttentionPlan:
         dense_decode(args.backend)
     else:
         # prefill_chunk as well as decode: that is batched_decode's prefill path.
-        decode = probe_backend(args.backend, layer, **probe, output_rotation_folded=folded)
+        decode = probe_backend(
+            args.backend, layer, **probe, output_rotation_folded=folded,
+            cache_mode=getattr(args, "cache_mode", "kv4fp8"),
+        )
         plan.results.append(decode)
         need(decode.passed, f"the {args.backend} decode does not run here", "see the error on its line above")
         if prefill_mode == "dense_staging":

@@ -677,6 +677,13 @@ at each.
 python tools/tq_longbench/run_benchmark.py --model-path /models/glm-4-9b-chat-1m --backends turboquant_cube,cann_dense --contexts 4096,8192,16384,32768,65536 --out-file bench.jsonl
 ```
 
+Use `--cache-mode kv3fp4` on a Cube run to select the 3-bit cache; the default
+is `kv4fp8`. At head size 256, each KV head stores 96 packed bytes in KV3_FP4
+versus 128 in KV4_FP8. The scale plane is the same size in both modes. KV4_FP8
+stores NZ tiles, while KV3_FP4 stores row-major slots. The JSONL records include
+`cache_mode`, and the memory columns use the selected packed stride. The same
+flag is available in `run_longbench.py`, `run_eval.py`, and `smoke_glm.py`.
+
 One line per (backend, context):
 
 | column | what it is |

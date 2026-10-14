@@ -119,13 +119,13 @@ def turboquant_mode_tables(head_size: int, batch_rows: int, device: torch.device
 
     Mirrors ``ModeTables(KV3_FP4, ..., nz_rows=64)`` in
     ``csrc/tests/common/turboquant/turboquant_launch.cpp``. The writer uses one
-    row; the fused decode expands eight rows in an NZ tile.
+    row; the fused decode expands eight rows from row-major packed cache data.
     """
     if batch_rows not in (1, TURBOQUANT_CUBE_UNPACK_ROWS):
         raise ValueError(f"KV3_FP4 mode tables require 1 or {TURBOQUANT_CUBE_UNPACK_ROWS} rows")
     packed_bytes = turboquant_packed_bytes(head_size, TurboQuantMode.KV3_FP4)
     if packed_bytes % TURBOQUANT_CUBE_COLUMN_BYTES:
-        raise ValueError("KV3_FP4 Cube NZ layout requires packed bytes to be a multiple of 32")
+        raise ValueError("KV3_FP4 Cube cache requires packed bytes to be a multiple of 32")
     word = 4
     lanes = 8
     columns = torch.arange(head_size * batch_rows, dtype=torch.int64)

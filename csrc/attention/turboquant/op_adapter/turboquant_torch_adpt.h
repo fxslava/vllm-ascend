@@ -400,8 +400,8 @@ inline void npu_turboquant_paged_attention(at::Tensor &query_rot, at::Tensor &ke
 
 #ifdef VLLM_ENABLE_TURBOQUANT_CUBE
 // The FP16 Cube path (950 only): KV4_FP8 rotates the raw query and applies the output stage in one launch;
-// KV3_FP4 uses the existing pre-rotated fused decode and mode-table image. Both store NZ-tiled packed planes,
-// whose byte order differs from the AIV cache. A cache must be written and read by the same path.
+// KV3_FP4 uses the existing pre-rotated fused decode and mode-table image. KV4_FP8 stores NZ-tiled packed
+// planes; KV3_FP4 stores row-major packed planes. A cache must be written and read in the same mode.
 
 namespace turboquant_adpt {
 
@@ -439,7 +439,7 @@ inline void CheckCubeCache(const at::Tensor &key_cache, const at::Tensor &value_
     TORCH_CHECK(key_cache.size(3) == packed_bytes, "packed cache head dim must be ", packed_bytes,
                 ", got ", key_cache.size(3));
     TORCH_CHECK(packed_bytes % tq::kOperandC0 == 0,
-                "TurboQuant Cube NZ layout requires packed bytes per head to be a multiple of ", tq::kOperandC0,
+                "TurboQuant Cube cache requires packed bytes per head to be a multiple of ", tq::kOperandC0,
                 ", got ", packed_bytes);
     TORCH_CHECK(key_cache.size(1) % tq::kCubeTileRows == 0, "the TurboQuant Cube path requires block_size to be a ",
                 "multiple of ", tq::kCubeTileRows, ", got ", key_cache.size(1));

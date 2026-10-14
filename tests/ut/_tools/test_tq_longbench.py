@@ -269,6 +269,15 @@ class TestSharedLayout(unittest.TestCase):
 
 
 class TestStaticKVCache(unittest.TestCase):
+    def test_cube_cache_modes_use_their_actual_packed_stride(self):
+        for cache_mode, packed_bytes in (("kv4fp8", 128), ("kv3fp4", 96)):
+            with self.subTest(cache_mode=cache_mode):
+                geometry = CacheGeometry(1, 4, 256, 128, 2048, cache_mode)
+                cache = TurboQuantKVCache(geometry, CPU)
+                self.assertEqual(geometry.packed_bytes, packed_bytes)
+                self.assertEqual(cache.key_planes[0].shape, (16, 128, 4, packed_bytes))
+                self.assertEqual(cache.bytes_per_token_per_layer(), 2 * 4 * packed_bytes + 8 * 4)
+
     def test_the_packed_pool_is_shaped_as_the_backend_budgets_it(self):
         geometry = _geometry(4096)
         cache = TurboQuantKVCache(geometry, CPU)
@@ -306,6 +315,8 @@ class TestStaticKVCache(unittest.TestCase):
             CacheGeometry(1, NUM_KV_HEADS, HEAD_SIZE, 24, 128)
         with self.assertRaisesRegex(ValueError, "64-row tiles"):
             CacheGeometry(1, NUM_KV_HEADS, HEAD_SIZE, 32, 128).require_cube_tiling()
+        with self.assertRaisesRegex(ValueError, "packed bytes per head"):
+            CacheGeometry(1, NUM_KV_HEADS, 128, 128, 128, "kv3fp4").require_cube_tiling()
         cache = TurboQuantKVCache(_geometry(256), CPU)
         with self.assertRaisesRegex(ValueError, "outside"):
             cache.slot_mapping(0, 300)
@@ -630,6 +641,65 @@ class TestCubeDispatch(unittest.TestCase):
         shape = LayerShape(NUM_HEADS, NUM_KV_HEADS, HEAD_SIZE, HEAD_SIZE**-0.5)
         with self.assertRaisesRegex(ValueError, "float16 only"):
             build_backend("turboquant_cube", geometry, shape, CPU, torch.bfloat16)
+
+    def test_kv3_dispatch_passes_mode_tables_and_unrotates_the_result(self):
+        head_size = 256
+        geometry = CacheGeometry(1, NUM_KV_HEADS, head_size, BLOCK_SIZE, 512, "kv3fp4")
+        shape = LayerShape(NUM_HEADS, NUM_KV_HEADS, head_size, head_size**-0.5)
+        kernel = mock.Mock()
+        kernel.npu_turboquant_cube_workspace_size.return_value = 0
+        kernel.npu_turboquant_rotate_q.side_effect = lambda src, _signs, _tables, _hadamard, dst: dst.copy_(src)
+        with mock.patch.object(ops_module, "load_turboquant_library", return_value=mock.Mock(registered=True)):
+            with mock.patch.object(ops_module, "ascend_ops", return_value=kernel):
+                backend = TurboQuantCubeBackend(geometry, shape, CPU)
+                key = torch.zeros(1, NUM_KV_HEADS, head_size, dtype=torch.float16)
+                backend.write_kv(0, key, key, torch.zeros(1, dtype=torch.int32))
+                write_args = kernel.npu_turboquant_cube_reshape_and_cache.call_args.args
+                self.assertEqual(write_args[-1], 3)
+                self.assertEqual(write_args[-2].dtype, torch.int32)
+                self.assertEqual(write_args[2].shape[-1], 3 * head_size // 8)
+                query = torch.zeros(1, NUM_HEADS, head_size, dtype=torch.float16)
+                out = torch.zeros_like(query)
+                backend.decode(0, query, torch.ones(1, dtype=torch.int32), out, window=1)
+                decode_args = kernel.npu_turboquant_cube_decode.call_args.args
+                self.assertEqual(decode_args[-1], 3)
+                self.assertEqual(decode_args[-2].dtype, torch.int32)
+                self.assertEqual(decode_args[-3].shape, out.shape)
+                self.assertEqual(decode_args[-4], 0)  # ROTATED_BASIS
+                self.assertIsNone(decode_args[1])
+                kernel.npu_turboquant_rotate_q.assert_called_once()
+                self.assertFalse(backend.fuses_output_gate)
+                folded = TurboQuantCubeBackend(geometry, shape, CPU, output_rotation_folded=True)
+                folded.decode(0, query, torch.ones(1, dtype=torch.int32), out, window=1)
+                self.assertEqual(kernel.npu_turboquant_cube_decode.call_args.args[-4], 0)
+                kernel.npu_turboquant_rotate_q.assert_called_once()
+
+    def test_kv4_dispatch_keeps_the_fused_output_stage(self):
+        geometry = _geometry(512)
+        shape = LayerShape(NUM_HEADS, NUM_KV_HEADS, HEAD_SIZE, HEAD_SIZE**-0.5)
+        kernel = mock.Mock()
+        kernel.npu_turboquant_cube_workspace_size.return_value = 0
+        with mock.patch.object(ops_module, "load_turboquant_library", return_value=mock.Mock(registered=True)):
+            with mock.patch.object(ops_module, "ascend_ops", return_value=kernel):
+                backend = TurboQuantCubeBackend(geometry, shape, CPU)
+                key = torch.zeros(1, NUM_KV_HEADS, HEAD_SIZE, dtype=torch.float16)
+                backend.write_kv(0, key, key, torch.zeros(1, dtype=torch.int32))
+                write_args = kernel.npu_turboquant_cube_reshape_and_cache.call_args.args
+                self.assertIsNone(write_args[-2])
+                self.assertEqual(write_args[-1], 4)
+                query = torch.zeros(1, NUM_HEADS, HEAD_SIZE, dtype=torch.float16)
+                gate = torch.zeros_like(query)
+                backend.decode(0, query, torch.ones(1, dtype=torch.int32), torch.zeros_like(query), gate, window=1)
+                decode_args = kernel.npu_turboquant_cube_decode.call_args.args
+                self.assertIs(decode_args[1], gate)
+                self.assertEqual(decode_args[-4], 2)  # GATED
+                self.assertIsNone(decode_args[-2])
+                self.assertEqual(decode_args[-1], 4)
+                kernel.npu_turboquant_rotate_q.assert_not_called()
+
+    def test_kv3_requires_cube_or_dense_backend(self):
+        with self.assertRaisesRegex(ValueError, "requires the turboquant_cube"):
+            RunnerConfig(model_path="/none", backend="turboquant_aiv", cache_mode="kv3fp4")
 
     def test_an_unbuilt_cube_decode_says_so(self):
         geometry = _geometry(512)
@@ -4170,6 +4240,18 @@ class TestCompletedIndices(unittest.TestCase):
         ]
         done, _ = completed_indices(self._write("one.jsonl", rows), ("trec",))
         self.assertEqual(done, {rung_key("a", 0, 4096, "trec"): {0, 1, 2}})
+
+    def test_resume_separates_three_and_four_bit_cache_runs(self):
+        from tq_longbench.run_longbench import completed_indices, rung_key
+
+        rows = [
+            {"task": "trec", "index": 0, "backend": "turboquant_cube", "sink_tokens": 0,
+             "context_requested": 2048, "cache_mode": mode}
+            for mode in ("kv4fp8", "kv3fp4")
+        ]
+        done, _ = completed_indices(self._write("modes.jsonl", rows), ("trec",))
+        self.assertEqual(done[rung_key("turboquant_cube", 0, 2048, "trec", "kv4fp8")], {0})
+        self.assertEqual(done[rung_key("turboquant_cube", 0, 2048, "trec", "kv3fp4")], {0})
 
     def test_a_second_rung_of_the_same_task_is_its_own_progress(self):
         """A set keyed by task alone would read the finished rung's twenty as the other's."""

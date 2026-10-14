@@ -28,10 +28,9 @@ it is driving.  What differs is underneath:
   at all: matmul, softmax, matmul, each a CANN operator torch_npu launches.
   Slower, and the unquantised baseline that survives where op-plugin's FIA does
   not -- which on Ascend 950 is everywhere (``EZ9903``).
-* :class:`TurboQuantCubeBackend` -- one ``npu_turboquant_cube_decode`` launch
-  per step.  It takes the **raw** query (the ``PRE_ROTATED = false`` entry),
-  rotates it in its own prologue, and its output stage un-rotates the result and
-  applies ``sigmoid(gate)`` before the fp16 write.  kv4fp8, float16 only.
+* :class:`TurboQuantCubeBackend` -- the float16 Cube decode. KV4_FP8 handles
+  output rotation and gating in the decode launch; KV3_FP4 returns the rotated
+  basis, which the harness un-rotates when the output projection is not folded.
 * :class:`TurboQuantAivBackend` -- ``npu_turboquant_rotate_q`` then
   ``npu_turboquant_paged_attention``, then the rotation again over the output
   unless the layer's ``o_proj`` is folded.  Every other build and dtype, and the
@@ -752,6 +751,9 @@ class _TurboQuantBackend(AttentionBackend):
         raise -- it decodes one layout as the other.
         """
 
+    def _writer_mode_args(self) -> tuple:
+        return ()
+
     def write_kv(self, layer: int, key: torch.Tensor, value: torch.Tensor, slots: torch.Tensor) -> None:
         key_plane, value_plane, scale_plane = self.cache.planes(layer)
         self._writer(
@@ -763,6 +765,7 @@ class _TurboQuantBackend(AttentionBackend):
             slots.to(torch.int32).contiguous(),
             self._pi_signs,
             self._write_tables,
+            *self._writer_mode_args(),
         )
         if self._sink_caches is not None:
             # Beside the packed write, not instead of it: the sink stays quantised in the
@@ -906,12 +909,7 @@ class _TurboQuantBackend(AttentionBackend):
 
 
 class TurboQuantCubeBackend(_TurboQuantBackend):
-    """One kv4fp8 Cube launch per step: rotate, attend, un-rotate, gate, write.
-
-    The launch is handed the raw fp16 query and changes basis itself, so nothing
-    precedes it and nothing follows it -- which is the point, and what the
-    output stage exists to make true for a gated layer as well.
-    """
+    """Cube decode for an NZ-tiled KV4_FP8 or row-major KV3_FP4 cache."""
 
     name = "turboquant_cube"
     # The kernel takes the context lengths as a device tensor and the writer
@@ -939,13 +937,21 @@ class TurboQuantCubeBackend(_TurboQuantBackend):
                 "--sink-tokens 0."
             )
         self.geometry.require_cube_tiling()
+        self._mode_write_tables = None
+        self._mode_decode_tables = None
+        if self.geometry.cache_mode == "kv3fp4":
+            layout = turboquant_layout()
+            self._mode_write_tables = layout.turboquant_mode_tables(self.shape.head_size, 1, self.device)
+            self._mode_decode_tables = layout.turboquant_mode_tables(
+                self.shape.head_size, layout.TURBOQUANT_CUBE_UNPACK_ROWS, self.device
+            )
         # Only when the full extension has not registered it: a standalone build
         # (tools/tq_longbench/build_turboquant_ops.py), from $TURBOQUANT_LIB_PATH,
         # tools/tq_longbench/lib/ or build/.
         outcome = load_turboquant_library(cube_decode_available)
         if not outcome.registered:
             raise RuntimeError(
-                "npu_turboquant_cube_decode is not registered: this build has no kv4fp8 Cube kernels. "
+                "npu_turboquant_cube_decode is not registered: this build has no Cube kernels. "
                 "Use --backend turboquant_aiv, build with VLLM_ENABLE_TURBOQUANT_CUBE on an Ascend 950 target, or "
                 f"build the standalone library with tools/tq_longbench/build_turboquant_ops.py. {outcome.detail}."
             )
@@ -953,11 +959,14 @@ class TurboQuantCubeBackend(_TurboQuantBackend):
     @property
     def fuses_output_gate(self) -> bool:
         """Only an unfolded layer can carry a gate: the gate sits where the output is still rotated."""
-        return not self.output_rotation_folded
+        return not self.output_rotation_folded and self.geometry.cache_mode == "kv4fp8"
 
     @property
     def _writer(self):
         return ascend_ops().npu_turboquant_cube_reshape_and_cache
+
+    def _writer_mode_args(self) -> tuple:
+        return self._mode_write_tables, int(self.geometry.mode)
 
     def _workspace_size(self, num_tokens: int, max_blocks_per_seq: int) -> int:
         return int(
@@ -978,6 +987,8 @@ class TurboQuantCubeBackend(_TurboQuantBackend):
                 "a layer with Pi folded into o_proj cannot carry an output gate: the gate sits between "
                 "attention and o_proj, where the output is still rotated"
             )
+        if self.geometry.cache_mode == "kv3fp4":
+            return layout.TurboQuantOutputStage.ROTATED_BASIS
         if self.sink_tokens:
             # The merge rescales the whole softmax, so it has to see the raw rotated
             # accumulator; both the un-rotation and the gate are re-applied after it, at
@@ -1002,9 +1013,10 @@ class TurboQuantCubeBackend(_TurboQuantBackend):
         key_plane, value_plane, scale_plane = self.cache.planes(layer)
         block_tables = self._block_tables(num_tokens, window if window is not None else longest_context(context_lens))
         rotated = self._rotated_query_buffer(num_tokens)
+        is_kv3 = self._mode_decode_tables is not None
         ascend_ops().npu_turboquant_cube_decode(
             query.contiguous(),
-            None if gate is None or self.sink_tokens else gate.contiguous(),
+            None if gate is None or self.sink_tokens or is_kv3 else gate.contiguous(),
             self._pi_signs,
             self._write_tables,
             self._hadamard16,
@@ -1020,7 +1032,15 @@ class TurboQuantCubeBackend(_TurboQuantBackend):
             self.shape.scale,
             int(self._output_stage(gate)),
             out,
+            self._mode_decode_tables,
+            int(self.geometry.mode),
         )
+        if is_kv3:
+            if not self.output_rotation_folded:
+                ascend_ops().npu_turboquant_rotate_q(out, self._pi_signs, self._write_tables, self._hadamard16, rotated)
+                out.copy_(rotated.to(out.dtype))
+            if gate is not None:
+                out.mul_(torch.sigmoid(gate).view_as(out))
         if self.sink_tokens:
             # The launch was asked for the rotated accumulator, so what it left behind is
             # what the merge needs and what still has to be un-rotated and gated.
@@ -1185,6 +1205,9 @@ def build_backend(
     only in the sense that on an NPU those are the operators torch_npu launches.
     """
     from tq_longbench.reference import REFERENCE_BACKENDS
+
+    if geometry.cache_mode == "kv3fp4" and name not in (*DENSE_BACKENDS, TurboQuantCubeBackend.name):
+        raise ValueError("kv3fp4 cache mode requires the turboquant_cube or a dense backend")
 
     if name in REFERENCE_BACKENDS:
         if name == "dense_reference":

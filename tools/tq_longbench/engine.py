@@ -194,6 +194,7 @@ def _soc_version() -> int | None:
 class RunnerConfig:
     model_path: str
     backend: str = "turboquant_cube"
+    cache_mode: str = "kv4fp8"
     prefill_mode: str = "dense_staging"
     max_seq_len: int = 32768
     chunk_size: int = DEFAULT_CHUNK_SIZE
@@ -241,6 +242,10 @@ class RunnerConfig:
     sink_tokens: int = 0
 
     def __post_init__(self) -> None:
+        if self.cache_mode not in ("kv4fp8", "kv3fp4"):
+            raise ValueError(f"unknown cache_mode {self.cache_mode!r}; choose kv4fp8 or kv3fp4")
+        if self.cache_mode == "kv3fp4" and self.backend not in (*DENSE_BACKENDS, "turboquant_cube"):
+            raise ValueError("kv3fp4 cache mode requires the turboquant_cube or a dense backend")
         if self.decode_graph not in DECODE_GRAPH_MODES:
             raise ValueError(f"unknown decode_graph {self.decode_graph!r}; choose one of {list(DECODE_GRAPH_MODES)}")
         if self.weight_nz not in WEIGHT_NZ_MODES:
@@ -650,6 +655,7 @@ class StandaloneModelRunner:
             head_size=self.shape.head_size,
             block_size=config.block_size,
             max_seq_len=config.max_seq_len,
+            cache_mode=config.cache_mode,
         )
         layer_shape = LayerShape(
             num_heads=self.shape.num_heads,

@@ -332,6 +332,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefill-mode", default=None, choices=list(PREFILL_MODES))
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--block-size", type=int, default=128)
+    parser.add_argument("--cache-mode", default="kv4fp8", choices=("kv4fp8", "kv3fp4"))
     parser.add_argument("--dtype", default="float16", choices=sorted(_DTYPES))
     parser.add_argument("--no-fold-output-rotation", action="store_true")
     parser.add_argument("--raw-prompt", action="store_true", help="skip the chat template")
@@ -535,13 +536,14 @@ def arena_report(args: argparse.Namespace, contexts: tuple[int, ...], tasks: tup
     tokenizer -- because the point is to answer "will this fit" before paying
     for the run that would otherwise answer it. The dense figure is exact
     arithmetic over the geometry; what the TurboQuant pool actually holds is
-    measured per item and lands in the records as ``kv_cache_mb``.
+    measured per item and lands in the records as ``kv_cache_mb``. The packed
+    estimate uses the selected cache mode's bytes per head.
     """
     shape = read_checkpoint_shape(args.model_path)
     budget = _largest_budget(args, tasks)
     lines = [
-        f"{'Rung':>9} {'Arena':>9} {'Dense KV (MB)':>14} {'Guard':>9}",
-        "-" * 45,
+        f"{'Rung':>9} {'Arena':>9} {'Dense KV (MB)':>14} {'Packed KV (MB)':>15} {'Guard':>9}",
+        "-" * 61,
     ]
     for context in contexts:
         max_seq_len = context + budget + CONTEXT_HEADROOM_TOKENS
@@ -551,13 +553,19 @@ def arena_report(args: argparse.Namespace, contexts: tuple[int, ...], tasks: tup
             head_size=shape.head_size,
             block_size=args.block_size,
             max_seq_len=max_seq_len,
+            cache_mode=args.cache_mode,
         )
         dense_mb = dense_equivalent_bytes(geometry, _DTYPES[args.dtype]) / (1024 * 1024)
+        packed_bytes_per_token = 2 * shape.num_kv_heads * geometry.packed_bytes + 4 * geometry.scale_slot
+        packed_mb = (
+            geometry.num_layers * geometry.num_blocks * geometry.block_size * packed_bytes_per_token / (1024 * 1024)
+        )
         verdict = "ok" if context <= args.max_context else "REFUSED"
-        lines.append(f"{context:>9} {max_seq_len:>9} {dense_mb:>14.0f} {verdict:>9}")
+        lines.append(f"{context:>9} {max_seq_len:>9} {dense_mb:>14.0f} {packed_mb:>15.1f} {verdict:>9}")
     lines += [
         "",
         f"tasks: {', '.join(tasks)} (generation budget {budget} tokens, --max-context {args.max_context})",
+        f"cache mode: {args.cache_mode} ({geometry.packed_bytes} packed bytes per head)",
         f"sink counts: {', '.join(str(count) for count in parse_sink_tokens(args.sink_tokens))} "
         "-- each runs the whole ladder above; a positive count adds an uncompressed side-car "
         "(2 x N x num_kv_heads x head_size activation elements per layer) and a host-side "
@@ -634,8 +642,8 @@ def load_items(task: str, dataset_dir: Path, limit: int, offset: int = 0) -> tup
     return list(islice(synthetic_items(task, dataset_dir, STUB_ITEMS), offset, offset + limit)), "stub"
 
 
-def rung_key(backend: str, sinks: int, context: int, task: str) -> tuple:
-    """What makes one piece of work its own: a record's own ``backend``/``sink_tokens``/``context_requested``/``task``.
+def rung_key(backend: str, sinks: int, context: int, task: str, cache_mode: str = "kv4fp8") -> tuple:
+    """Identify work by backend, cache mode, sinks, context, and task.
 
     The unit :func:`completed_indices` counts in, and the unit the item loop skips
     against. It is not the task alone, because a sweep runs the same item once per
@@ -644,7 +652,7 @@ def rung_key(backend: str, sinks: int, context: int, task: str) -> tuple:
     a set keyed by task alone would read the first rung's twenty as the second's
     and skip eighteen items nobody ran.
     """
-    return (backend, sinks, context, task)
+    return (backend, sinks, context, task, cache_mode)
 
 
 def completed_indices(path: Path, tasks: Sequence[str]) -> tuple[dict[tuple, set[int]], list[str]]:
@@ -680,7 +688,10 @@ def completed_indices(path: Path, tasks: Sequence[str]) -> tuple[dict[tuple, set
             if task not in tasks or not isinstance(index, int) or isinstance(index, bool):
                 foreign += 1
                 continue
-            key = rung_key(record.get("backend"), record.get("sink_tokens"), record.get("context_requested"), task)
+            key = rung_key(
+                record.get("backend"), record.get("sink_tokens"), record.get("context_requested"), task,
+                record.get("cache_mode", "kv4fp8"),
+            )
             done.setdefault(key, set()).add(index)
 
     notes = [f"--resume: read {read} record(s) from {path}"]
@@ -689,8 +700,8 @@ def completed_indices(path: Path, tasks: Sequence[str]) -> tuple[dict[tuple, set
     if foreign:
         notes.append(f"  {foreign} record(s) are for a task or without an index this run does not use")
     for key in sorted(done, key=str):
-        backend, sinks, context, task = key
-        notes.append(f"  {task} on {backend} at {context} (sinks {sinks}): {len(done[key])} done")
+        backend, sinks, context, task, cache_mode = key
+        notes.append(f"  {task} on {backend} at {context} ({cache_mode}, sinks {sinks}): {len(done[key])} done")
     if not done:
         notes.append("  nothing in it belongs to this run, so every item will be evaluated")
     return done, notes
@@ -790,6 +801,7 @@ def run_item(args, runner, tokenizer, eos_ids, item, keep: int, family: ModelFam
     text, failure = decode_text(tokenizer, stop_at_eos(produced, eos_ids))
     record = {
         "backend": runner.config.backend,
+        "cache_mode": runner.config.cache_mode,
         "sink_tokens": runner.config.sink_tokens,
         "task": task,
         "index": item.extra.get("index"),
@@ -1049,7 +1061,13 @@ def main(argv: list[str] | None = None) -> int:
     if done:
         # Counted over every piece of work the sweep plans, because that is what
         # is left to pay for: the same item at two rungs is two prefills.
-        finished = sum(len(indices) for indices in done.values())
+        finished = sum(
+            len(done.get(rung_key(backend, sinks, context, task, args.cache_mode), ()))
+            for backend in backends
+            for sinks in sink_counts
+            for context in contexts
+            for task in tasks
+        )
         remaining = sum(
             1
             for backend in backends
@@ -1057,7 +1075,7 @@ def main(argv: list[str] | None = None) -> int:
             for context in contexts
             for task in tasks
             for item in items[task]
-            if item.extra.get("index") not in done.get(rung_key(backend, sinks, context, task), ())
+            if item.extra.get("index") not in done.get(rung_key(backend, sinks, context, task, args.cache_mode), ())
         )
         print(
             f"Resuming from {args.out_file}: found {finished} completed samples. Skipping to next unprocessed "
@@ -1101,7 +1119,7 @@ def main(argv: list[str] | None = None) -> int:
                     keep = max_seq_len - CONTEXT_HEADROOM_TOKENS - _largest_budget(args, tasks)
                     for task in tasks:
                         rung = TaskRung(backend, context, task, metric_label(task), sources[task], sinks)
-                        already = done.get(rung_key(backend, sinks, context, task), frozenset())
+                        already = done.get(rung_key(backend, sinks, context, task, args.cache_mode), frozenset())
                         rung.skipped = sum(1 for item in items[task] if item.extra.get("index") in already)
                         # The first item *run*, not items[task][0]: a resumed rung
                         # whose first item is already done still deserves a probe.

@@ -125,6 +125,7 @@ def probe_backend(
     prefill: bool = True,
     decode: bool = True,
     seed: int = 0,
+    cache_mode: str = "kv4fp8",
 ) -> ProbeResult:
     """Write, prefill and decode :data:`PROBE_TOKENS` synthetic tokens through one backend.
 
@@ -141,6 +142,7 @@ def probe_backend(
             head_size=shape.head_size,
             block_size=block_size,
             max_seq_len=max(block_size, PROBE_TOKENS),
+            cache_mode=cache_mode,
         )
         backend = build_backend(
             name, geometry, shape, device, dtype, output_rotation_folded, dense_attention_api=dense_attention_api
