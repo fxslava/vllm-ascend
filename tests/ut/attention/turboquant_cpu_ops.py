@@ -44,6 +44,7 @@ from collections.abc import Iterator, Sequence
 import torch
 from torch.library import Library
 
+from vllm_ascend.attention.turboquant_layout import TurboQuantMode, turboquant_packed_bytes
 from vllm_ascend.attention.turboquant_rotation import apply_pi
 from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_LLOYD_MAX_THRESHOLDS
 
@@ -77,13 +78,14 @@ TURBOQUANT_OP_SCHEMAS = {
 TURBOQUANT_CUBE_OP_SCHEMAS = {
     "npu_turboquant_cube_reshape_and_cache": (
         "npu_turboquant_cube_reshape_and_cache(Tensor key, Tensor value, Tensor! key_cache, Tensor! value_cache, "
-        "Tensor! scale_cache, Tensor slot_mapping, Tensor pi_signs, Tensor codec_tables) -> ()"
+        "Tensor! scale_cache, Tensor slot_mapping, Tensor pi_signs, Tensor codec_tables, "
+        "Tensor? mode_tables=None, int mode=4) -> ()"
     ),
     "npu_turboquant_cube_decode": (
         "npu_turboquant_cube_decode(Tensor query, Tensor? gate, Tensor pi_signs, Tensor codec_tables, "
         "Tensor hadamard16, Tensor key_cache, Tensor value_cache, Tensor scale_cache, Tensor block_tables, "
         "Tensor context_lens, Tensor! workspace, Tensor! query_rot, int num_kv_heads, int num_heads, "
-        "float scale_value, int output_stage, Tensor! out) -> ()"
+        "float scale_value, int output_stage, Tensor! out, Tensor? mode_tables=None, int mode=4) -> ()"
     ),
     "npu_turboquant_cube_workspace_size": (
         "npu_turboquant_cube_workspace_size(int num_tokens, int num_heads, int num_kv_heads, int head_size, "
@@ -152,9 +154,7 @@ def paged_attention_workspace_floats(
 
 
 def _check_head_size(head_size: int) -> None:
-    _check(
-        _MIN_HEAD_SIZE <= head_size <= _MAX_HEAD_SIZE, "TurboQuant requires 64 <= head_size <= 256, got ", head_size
-    )
+    _check(_MIN_HEAD_SIZE <= head_size <= _MAX_HEAD_SIZE, "TurboQuant requires 64 <= head_size <= 256, got ", head_size)
     _check(
         head_size & (head_size - 1) == 0,
         "TurboQuant needs a power-of-two head_size for the Walsh-Hadamard transform, got ",
@@ -212,9 +212,7 @@ def _reshape_and_cache(
         "kv cache must be [num_blocks, block_size, num_kv_heads, head_size / 2]",
     )
     _check(key_cache.shape == value_cache.shape, "key and value caches must have the same shape")
-    _check(
-        key_cache.dtype == torch.int8 and value_cache.dtype == torch.int8, "the packed 4-bit kv cache must be int8"
-    )
+    _check(key_cache.dtype == torch.int8 and value_cache.dtype == torch.int8, "the packed 4-bit kv cache must be int8")
     _check(scale_cache.dtype == torch.float32, "the kv cache scale plane must be float32")
     _check(scale_cache.dim() == 3, "scale cache must be [num_blocks, block_size, scale_slot]")
     _check(slot_mapping.dtype == torch.int32, "slot_mapping must be int32")
@@ -229,8 +227,12 @@ def _reshape_and_cache(
     num_blocks, block_size = key_cache.shape[:2]
     _check_head_size(head_size)
     _check_codec_tables(codec_tables, head_size, 1)
-    _check(key_cache.shape[2] == num_kv_heads, "cache num_kv_heads mismatch: ", key_cache.shape[2], " vs ", num_kv_heads)
-    _check(key_cache.shape[3] == head_size // 2, "packed cache head dim must be head_size / 2, got ", key_cache.shape[3])
+    _check(
+        key_cache.shape[2] == num_kv_heads, "cache num_kv_heads mismatch: ", key_cache.shape[2], " vs ", num_kv_heads
+    )
+    _check(
+        key_cache.shape[3] == head_size // 2, "packed cache head dim must be head_size / 2, got ", key_cache.shape[3]
+    )
     _check(block_size % _TILE_ROWS == 0, "TurboQuant requires block_size to be a multiple of 16, got ", block_size)
     _check(slot_mapping.numel() == num_tokens, "slot_mapping must hold one slot per token")
     _check(pi_signs.numel() == head_size, "pi_signs must hold one sign per channel")
@@ -329,9 +331,7 @@ def _paged_attention(
         key_cache.dim() == 4 and value_cache.dim() == 4,
         "kv cache must be [num_blocks, block_size, num_kv_heads, head_size / 2]",
     )
-    _check(
-        key_cache.dtype == torch.int8 and value_cache.dtype == torch.int8, "the packed 4-bit kv cache must be int8"
-    )
+    _check(key_cache.dtype == torch.int8 and value_cache.dtype == torch.int8, "the packed 4-bit kv cache must be int8")
     _check(
         scale_cache.dtype == torch.float32 and scale_cache.dim() == 3,
         "the scale plane must be a float32 [num_blocks, block_size, scale_slot] tensor",
@@ -360,8 +360,12 @@ def _paged_attention(
         num_kv_heads > 0 and num_heads % num_kv_heads == 0,
         "num_heads ", num_heads, " must be a multiple of num_kv_heads ", num_kv_heads,
     )  # fmt: skip
-    _check(key_cache.shape[2] == num_kv_heads, "cache num_kv_heads mismatch: ", key_cache.shape[2], " vs ", num_kv_heads)
-    _check(key_cache.shape[3] == head_size // 2, "packed cache head dim must be head_size / 2, got ", key_cache.shape[3])
+    _check(
+        key_cache.shape[2] == num_kv_heads, "cache num_kv_heads mismatch: ", key_cache.shape[2], " vs ", num_kv_heads
+    )
+    _check(
+        key_cache.shape[3] == head_size // 2, "packed cache head dim must be head_size / 2, got ", key_cache.shape[3]
+    )
     _check(
         block_size % _TILE_ROWS == 0,
         "TurboQuant requires block_size to be a multiple of ", _TILE_ROWS, ", got ", block_size,
@@ -401,7 +405,9 @@ def _paged_attention(
     capacity = max_blocks_per_seq * block_size
     _check(
         bool(((lengths >= 0) & (lengths <= capacity)).all()),
-        "context_lens must lie in [0, max_blocks_per_seq * block_size = ", capacity, "]",
+        "context_lens must lie in [0, max_blocks_per_seq * block_size = ",
+        capacity,
+        "]",
     )
 
     centroid_start = codec_table_words(head_size, _TILE_ROWS) - _CODEC_LEVELS
@@ -539,11 +545,21 @@ def turboquant_cpu_ops(vector_cores: int = CPU_VECTOR_CORES) -> Iterator[None]:
 META_CUBE_WORKSPACE_FLOATS = 0
 
 
-def _cube_reshape_and_cache_meta(key, value, key_cache, value_cache, scale_cache, slot_mapping, pi_signs, codec_tables):
+def _cube_reshape_and_cache_meta(
+    key, value, key_cache, value_cache, scale_cache, slot_mapping, pi_signs, codec_tables, mode_tables=None, mode=4
+):
     torch._check(key.dim() == 3 and key.shape == value.shape, lambda: "key and value must be [num_tokens, H_KV, D]")
     torch._check(key_cache.dim() == 4 and key_cache.shape == value_cache.shape, lambda: "K and V caches differ")
     torch._check(key_cache.shape[2] == key.shape[1], lambda: "cache num_kv_heads mismatch")
-    torch._check(key_cache.shape[3] * 2 == key.shape[2], lambda: "packed cache head dim must be head_size / 2")
+    torch._check(
+        key_cache.shape[3] == turboquant_packed_bytes(key.shape[2], TurboQuantMode(mode)),
+        lambda: "packed cache head dim mismatch",
+    )
+    if mode == int(TurboQuantMode.KV3_FP4):
+        torch._check(
+            mode_tables is not None and mode_tables.dtype == torch.int32,
+            lambda: "KV3_FP4 requires int32 mode tables",
+        )
     torch._check(scale_cache.shape[:2] == key_cache.shape[:2], lambda: "scale plane must match the cache blocks")
     torch._check(slot_mapping.numel() == key.shape[0], lambda: "slot_mapping must hold one slot per token")
     torch._check(pi_signs.numel() == key.shape[2], lambda: "pi_signs must hold head_size signs")
@@ -567,6 +583,8 @@ def _cube_decode_meta(
     scale_value,
     output_stage,
     out,
+    mode_tables=None,
+    mode=4,
 ):
     torch._check(query.dim() == 3, lambda: "query must be [num_tokens, num_heads, head_size]")
     torch._check(out.shape == query.shape, lambda: "out must have the same shape as query")
@@ -575,6 +593,14 @@ def _cube_decode_meta(
     torch._check(gate is None or gate.numel() == query.numel(), lambda: "gate must hold one logit per query element")
     torch._check(query.shape[1] == num_heads and num_heads % num_kv_heads == 0, lambda: "head counts mismatch")
     torch._check(key_cache.shape == value_cache.shape and key_cache.shape[2] == num_kv_heads, lambda: "cache heads")
+    torch._check(
+        key_cache.shape[3] == turboquant_packed_bytes(query.shape[2], TurboQuantMode(mode)),
+        lambda: "packed cache head dim mismatch",
+    )
+    if mode == int(TurboQuantMode.KV3_FP4):
+        torch._check(
+            mode_tables is not None and mode_tables.dtype == torch.int32, lambda: "KV3_FP4 requires int32 mode tables"
+        )
     torch._check(block_tables.dim() == 2 and block_tables.shape[0] == query.shape[0], lambda: "one table row per token")
     torch._check(context_lens.numel() == query.shape[0], lambda: "one context length per query token")
 

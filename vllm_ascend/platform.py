@@ -33,6 +33,7 @@ os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+from vllm_ascend import envs as envs_ascend
 from vllm_ascend.ascend_config import init_ascend_config
 
 # isort: off
@@ -56,6 +57,7 @@ from vllm_ascend.utils import (
     TURBOQUANT_CACHE_DTYPE_PREFIX,
     TURBOQUANT_GATED_ATTENTION_OP,
     TURBOQUANT_KV_CACHE_DTYPE,
+    TURBOQUANT_KV3_CACHE_DTYPES,
     turboquant_enabled,
 )
 
@@ -370,8 +372,26 @@ class NPUPlatform(Platform):
             return
 
         cache_config = vllm_config.cache_config
+        cache_dtype = getattr(cache_config, "cache_dtype", None)
+        kv3 = cache_dtype in TURBOQUANT_KV3_CACHE_DTYPES if isinstance(cache_dtype, str) else False
         scheduler_config = vllm_config.scheduler_config
         unsupported: list[str] = []
+
+        if kv3:
+            if envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
+                unsupported.append("KV3_FP4 is supported only by the v1 model runner")
+            model_config = getattr(vllm_config, "model_config", None)
+            if getattr(model_config, "dtype", None) != torch.float16:
+                unsupported.append("KV3_FP4 Cube decode requires float16 model activations")
+            if not envs_ascend.VLLM_ASCEND_TURBOQUANT_CUBE_DECODE:
+                unsupported.append("KV3_FP4 requires VLLM_ASCEND_TURBOQUANT_CUBE_DECODE=1")
+            get_head_size = getattr(model_config, "get_head_size", None)
+            head_size = get_head_size() if callable(get_head_size) else getattr(model_config, "head_size", None)
+            if head_size is not None and head_size != 256:
+                unsupported.append("KV3_FP4 Cube NZ layout requires head_size 256")
+            block_size = getattr(cache_config, "block_size", None)
+            if block_size is not None and block_size % 64:
+                unsupported.append("KV3_FP4 Cube decode requires block_size to be a multiple of 64")
 
         if scheduler_config is not None and getattr(scheduler_config, "enable_chunked_prefill", False):
             unsupported.append(
@@ -395,7 +415,7 @@ class NPUPlatform(Platform):
 
         if unsupported:
             raise ValueError(
-                "The TurboQuant 4-bit KV cache implements two attention states, PrefillNoCache and "
+                "The TurboQuant KV cache implements two attention states, PrefillNoCache and "
                 "DecodeOnly. These options need states it does not implement yet:\n  - "
                 + "\n  - ".join(unsupported)
                 + "\nSee vllm_ascend/attention/turboquant_v1.py for the states the backend serves."
@@ -409,8 +429,11 @@ class NPUPlatform(Platform):
                     f"{TURBOQUANT_BLOCK_SIZE_MULTIPLE}, got --block-size {block_size}."
                 )
 
-            cache_dtype = getattr(cache_config, "cache_dtype", None)
-            if isinstance(cache_dtype, str) and cache_dtype.startswith(TURBOQUANT_CACHE_DTYPE_PREFIX):
+            if (
+                isinstance(cache_dtype, str)
+                and cache_dtype.startswith(TURBOQUANT_CACHE_DTYPE_PREFIX)
+                and cache_dtype not in TURBOQUANT_KV3_CACHE_DTYPES
+            ):
                 raise ValueError(
                     f"--kv-cache-dtype {cache_dtype} names one of vLLM's own TurboQuant presets, whose "
                     "slot packs each head's key, value and fp16 scales into one interleaved slot. The "

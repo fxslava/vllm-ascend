@@ -12,6 +12,7 @@ from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, Slid
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec, SlidingWindowMLASpec
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
+from vllm_ascend.attention.turboquant_layout import TurboQuantMode, turboquant_packed_bytes
 from vllm_ascend.core.single_type_kv_cache_manager import CompressAttentionManager
 
 
@@ -219,7 +220,7 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
 
 @dataclass(frozen=True, kw_only=True)
 class AscendTurboQuantAttentionSpec(FullAttentionSpec):
-    """Full-attention cache spec for the TurboQuant 4-bit KV cache.
+    """Full-attention cache spec for the TurboQuant KV cache.
 
     The stock :class:`FullAttentionSpec` sizes a page from the *unpacked* head
     size and the model dtype, which over-allocates this layout roughly fourfold
@@ -229,7 +230,7 @@ class AscendTurboQuantAttentionSpec(FullAttentionSpec):
 
     A TurboQuant page holds three things, and this spec budgets all of them:
 
-    * the packed key plane, ``block_size * num_kv_heads * head_size // 2`` int8
+    * the packed key plane, ``block_size * num_kv_heads * packed_bytes`` int8
     * the packed value plane, the same again
     * the scale plane, ``block_size * scale_slot`` fp32, where ``scale_slot``
       is ``round_up(2 * num_kv_heads, 8)``
@@ -245,6 +246,7 @@ class AscendTurboQuantAttentionSpec(FullAttentionSpec):
 
     # Two 4-bit codes share a byte.
     pack_factor: int = 2
+    mode: int = int(TurboQuantMode.KV4_FP8)
     # fp32 lanes in one aligned scale burst.
     burst_floats: int = 8
 
@@ -259,9 +261,13 @@ class AscendTurboQuantAttentionSpec(FullAttentionSpec):
         return cdiv(lanes, self.burst_floats) * self.burst_floats
 
     @property
+    def packed_bytes(self) -> int:
+        return turboquant_packed_bytes(self.head_size, TurboQuantMode(self.mode))
+
+    @property
     def payload_bytes(self) -> int:
-        """Bytes of packed 4-bit key and value in one page."""
-        return 2 * self.block_size * self.num_kv_heads * (self.head_size // self.pack_factor)
+        """Bytes of packed key and value in one page."""
+        return 2 * self.block_size * self.num_kv_heads * self.packed_bytes
 
     @property
     def scale_plane_bytes(self) -> int:
@@ -288,9 +294,10 @@ class AscendTurboQuantAttentionSpec(FullAttentionSpec):
         merged = super().merge(specs)
         first = specs[0]
         assert all(
-            (spec.pack_factor, spec.burst_floats) == (first.pack_factor, first.burst_floats) for spec in specs
+            (spec.pack_factor, spec.burst_floats, spec.mode) == (first.pack_factor, first.burst_floats, first.mode)
+            for spec in specs
         ), "All TurboQuant layers in the same KV cache group must use the same packing."
-        return replace(merged, pack_factor=first.pack_factor, burst_floats=first.burst_floats)
+        return replace(merged, pack_factor=first.pack_factor, burst_floats=first.burst_floats, mode=first.mode)
 
 
 def register_ascend_kv_cache_specs() -> None:

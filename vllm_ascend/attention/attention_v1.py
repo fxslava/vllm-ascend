@@ -118,9 +118,11 @@ class AscendAttentionBackend(AttentionBackend):
         cache_dtype_str: str = "",
     ) -> tuple[int, ...]:
         if envs_ascend.ENABLE_TURBOQUANT or is_turboquant_cache_dtype(cache_dtype_str):
-            from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_PACK_FACTOR
+            from vllm_ascend.attention.turboquant_layout import TurboQuantMode, turboquant_packed_bytes
+            from vllm_ascend.utils import turboquant_cache_mode
 
-            return (2, num_blocks, block_size, num_kv_heads, head_size // TURBOQUANT_PACK_FACTOR)
+            mode = TurboQuantMode(turboquant_cache_mode(cache_dtype_str))
+            return (2, num_blocks, block_size, num_kv_heads, turboquant_packed_bytes(head_size, mode))
         return (2, num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod

@@ -90,6 +90,67 @@ TURBOQUANT_ROTATE_TILE = 16
 
 # The Cube decode reads a block one 64-row tile at a time.
 TURBOQUANT_CUBE_TILE_ROWS = 64
+TURBOQUANT_CUBE_UNPACK_ROWS = 8
+TURBOQUANT_CUBE_COLUMN_BYTES = 32
+
+
+class TurboQuantMode(enum.IntEnum):
+    """Mode IDs in ``op_kernel/common/turboquant_mode.h``."""
+
+    KV3_FP4 = 3
+    KV4_FP8 = 4
+
+
+def turboquant_packed_bytes(head_size: int, mode: TurboQuantMode = TurboQuantMode.KV4_FP8) -> int:
+    """Mirror ``TurboQuantModeConfig::PackedBytes`` for the supported Cube modes."""
+    if mode == TurboQuantMode.KV3_FP4:
+        if head_size % 8:
+            raise ValueError("KV3_FP4 head_size must be a multiple of 8")
+        return 3 * (head_size // 8)
+    if mode == TurboQuantMode.KV4_FP8:
+        if head_size % 2:
+            raise ValueError("KV4_FP8 head_size must be even")
+        return head_size // 2
+    raise ValueError(f"unsupported TurboQuant mode: {mode}")
+
+
+def turboquant_mode_tables(head_size: int, batch_rows: int, device: torch.device) -> torch.Tensor:
+    """KV3_FP4 table image used by the in-tree mode codec.
+
+    Mirrors ``ModeTables(KV3_FP4, ..., nz_rows=64)`` in
+    ``csrc/tests/common/turboquant/turboquant_launch.cpp``. The writer uses one
+    row; the fused decode expands eight rows in an NZ tile.
+    """
+    if batch_rows not in (1, TURBOQUANT_CUBE_UNPACK_ROWS):
+        raise ValueError(f"KV3_FP4 mode tables require 1 or {TURBOQUANT_CUBE_UNPACK_ROWS} rows")
+    packed_bytes = turboquant_packed_bytes(head_size, TurboQuantMode.KV3_FP4)
+    if packed_bytes % TURBOQUANT_CUBE_COLUMN_BYTES:
+        raise ValueError("KV3_FP4 Cube NZ layout requires packed bytes to be a multiple of 32")
+    word = 4
+    lanes = 8
+    columns = torch.arange(head_size * batch_rows, dtype=torch.int64)
+    band = batch_rows * TURBOQUANT_CUBE_COLUMN_BYTES
+    row = (columns % band) // TURBOQUANT_CUBE_COLUMN_BYTES
+    col = (columns // band) * TURBOQUANT_CUBE_COLUMN_BYTES + columns % TURBOQUANT_CUBE_COLUMN_BYTES
+    low_bytes = head_size // 4
+    low = word * (row * packed_bytes + col // 4)
+    msb = word * (row * packed_bytes + low_bytes + col // 8)
+    lane = torch.arange(lanes, dtype=torch.int64)
+    periodic = [
+        (4.0 ** -(lane % 4)).to(torch.float32).view(torch.int32),
+        (2.0**-lane).to(torch.float32).view(torch.int32),
+        (2.0**lane).to(torch.float32).view(torch.int32),
+    ]
+    gather = torch.cat([word * (torch.arange(low_bytes) * 4 + j) for j in range(4)])
+    centroids = torch.tensor((-6.0, -4.0, -2.0, -0.5, 0.5, 2.0, 4.0, 6.0), dtype=torch.float32)
+    tables = (
+        torch.cat(
+            [low.to(torch.int32), msb.to(torch.int32), *periodic, gather.to(torch.int32), centroids.view(torch.int32)]
+        )
+        .contiguous()
+        .to(device)
+    )
+    return tables
 
 
 class TurboQuantOutputStage(enum.IntEnum):

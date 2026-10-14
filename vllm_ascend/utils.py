@@ -1605,7 +1605,7 @@ def get_c_env(name: str, encoding: str = "utf-8") -> str | None:
     return raw.decode(encoding)
 
 
-# TurboQuant's packed 4-bit KV cache is reachable three ways: the
+# TurboQuant's packed KV cache is reachable three ways: the
 # ENABLE_TURBOQUANT env var, a ``--kv-cache-dtype`` naming one of vLLM's
 # TurboQuant presets, and the per-layer ``TurboQuant`` quantization scheme.
 # Every site that has to agree on the cache layout reads it from here, so the
@@ -1616,6 +1616,7 @@ TURBOQUANT_CACHE_DTYPE_PREFIX = "turboquant_"
 # payload plus ``2 * num_kv_heads`` fp32 scale lanes -- is the one upstream mode
 # that matches the Ascend layout, exactly so when ``num_kv_heads % 4 == 0``.
 TURBOQUANT_KV_CACHE_DTYPE = "int4_per_token_head"
+TURBOQUANT_KV3_CACHE_DTYPES = frozenset({"turboquant_int3", "kv3fp4"})
 
 # Both TurboQuant C++ adapters require ``block_size % 16 == 0``: 16 is the
 # codec's tile height, so a block has to be a whole number of tiles.
@@ -1630,11 +1631,20 @@ def is_turboquant_cache_dtype(cache_dtype: object) -> bool:
     """Whether ``cache_dtype`` names a TurboQuant KV cache."""
     if not isinstance(cache_dtype, str):
         return False
-    return cache_dtype == TURBOQUANT_KV_CACHE_DTYPE or cache_dtype.startswith(TURBOQUANT_CACHE_DTYPE_PREFIX)
+    return (
+        cache_dtype == TURBOQUANT_KV_CACHE_DTYPE
+        or cache_dtype in TURBOQUANT_KV3_CACHE_DTYPES
+        or cache_dtype.startswith(TURBOQUANT_CACHE_DTYPE_PREFIX)
+    )
+
+
+def turboquant_cache_mode(cache_dtype: object) -> int:
+    """Return the in-tree Cube mode ID for the selected TurboQuant cache."""
+    return 3 if isinstance(cache_dtype, str) and cache_dtype in TURBOQUANT_KV3_CACHE_DTYPES else 4
 
 
 def turboquant_enabled(vllm_config=None) -> bool:
-    """Whether the TurboQuant 4-bit KV cache is active for this run.
+    """Whether a TurboQuant KV cache is active for this run.
 
     Reads, in order: the ``ENABLE_TURBOQUANT`` env var, then the configured
     ``cache_config.cache_dtype``. The per-layer quantization scheme activates a

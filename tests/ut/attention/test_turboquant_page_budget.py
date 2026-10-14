@@ -34,8 +34,8 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
 from tests.ut.base import TestBase
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
 from vllm_ascend.attention.turboquant_v1 import (
-    AscendTurboQuantAttentionBackend,
     TURBOQUANT_PACK_FACTOR,
+    AscendTurboQuantAttentionBackend,
     turboquant_scale_slot,
 )
 from vllm_ascend.core.kv_cache_interface import AscendTurboQuantAttentionSpec
@@ -83,9 +83,7 @@ class TestTurboQuantScaleSlot(TestBase):
             slot = turboquant_scale_slot(num_kv_heads)
             self.assertEqual(slot, expected, f"num_kv_heads={num_kv_heads}")
             self.assertEqual(slot % 8, 0, f"num_kv_heads={num_kv_heads} is not burst-aligned")
-            self.assertGreaterEqual(
-                slot, 2 * num_kv_heads, f"num_kv_heads={num_kv_heads} loses scale lanes"
-            )
+            self.assertGreaterEqual(slot, 2 * num_kv_heads, f"num_kv_heads={num_kv_heads} loses scale lanes")
 
 
 class TestTurboQuantPageSize(TestBase):
@@ -98,9 +96,7 @@ class TestTurboQuantPageSize(TestBase):
         """
         for num_kv_heads in KV_HEAD_COUNTS:
             spec = _spec(num_kv_heads)
-            packed = AscendTurboQuantAttentionBackend.get_kv_cache_shape(
-                1, BLOCK_SIZE, num_kv_heads, HEAD_SIZE
-            )
+            packed = AscendTurboQuantAttentionBackend.get_kv_cache_shape(1, BLOCK_SIZE, num_kv_heads, HEAD_SIZE)
             # shape is (2, num_blocks, block_size, num_kv_heads, head_size // 2) int8
             payload = 1
             for dim in packed:
@@ -129,9 +125,7 @@ class TestTurboQuantPageSize(TestBase):
 
     def test_it_beats_the_stock_unpacked_page(self):
         """The point of the feature: a bf16 FullAttentionSpec page is ~3.8x larger."""
-        stock = FullAttentionSpec(
-            block_size=BLOCK_SIZE, num_kv_heads=8, head_size=HEAD_SIZE, dtype=torch.bfloat16
-        )
+        stock = FullAttentionSpec(block_size=BLOCK_SIZE, num_kv_heads=8, head_size=HEAD_SIZE, dtype=torch.bfloat16)
         packed = _spec(8)
         self.assertEqual(stock.page_size_bytes, 512 * 1024)
         self.assertLess(packed.page_size_bytes, stock.page_size_bytes)
@@ -188,7 +182,7 @@ class TestPagePadding(TestBase):
     def test_a_padded_page_below_the_real_one_is_refused(self):
         spec = _spec(8, page_size_padded=64 * 1024)
         with self.assertRaises(AssertionError):
-            spec.page_size_bytes
+            _ = spec.page_size_bytes
 
     def test_merge_keeps_the_packing(self):
         merged = AscendTurboQuantAttentionSpec.merge([_spec(8), _spec(8)])
@@ -283,3 +277,58 @@ class TestPackedShapeFollowsEveryRoute(TestBase):
             patch("vllm_ascend.attention.attention_v1.enable_dcp", return_value=False),
         ):
             self.assertIs(AscendAttentionBackend.get_impl_cls(), AscendAttentionBackendImpl)
+
+
+class TestKV3PageAndRunnerView(TestBase):
+    def test_kv3_mode_table_matches_in_tree_host_layout(self):
+        from vllm_ascend.attention.turboquant_layout import turboquant_mode_tables
+
+        writer = turboquant_mode_tables(256, 1, torch.device("cpu"))
+        decoder = turboquant_mode_tables(256, 8, torch.device("cpu"))
+        self.assertEqual(writer.numel(), 3 * 256 + 32)
+        self.assertEqual(decoder.numel(), 17 * 256 + 32)
+        torch.testing.assert_close(writer[:4], torch.tensor([0, 0, 0, 0], dtype=torch.int32))
+        torch.testing.assert_close(writer[256:260], torch.tensor([256, 256, 256, 256], dtype=torch.int32))
+        with self.assertRaisesRegex(ValueError, "multiple of 32"):
+            turboquant_mode_tables(128, 8, torch.device("cpu"))
+
+    def test_kv3_page_uses_three_bytes_per_eight_channels(self):
+        from vllm_ascend.attention.turboquant_layout import TurboQuantMode, turboquant_packed_bytes
+
+        head_size = 256
+        packed_bytes = turboquant_packed_bytes(head_size, TurboQuantMode.KV3_FP4)
+        self.assertEqual(packed_bytes, 96)
+        spec = _spec(8, head_size=head_size, mode=int(TurboQuantMode.KV3_FP4))
+        shape = AscendAttentionBackend.get_kv_cache_shape(2, BLOCK_SIZE, 8, head_size, "turboquant_int3")
+        self.assertEqual(shape, (2, 2, BLOCK_SIZE, 8, packed_bytes))
+        self.assertEqual(spec.payload_bytes, 2 * BLOCK_SIZE * 8 * packed_bytes)
+        self.assertEqual(spec.real_page_size_bytes, spec.payload_bytes + BLOCK_SIZE * turboquant_scale_slot(8) * 4)
+        merged = AscendTurboQuantAttentionSpec.merge([spec, spec])
+        self.assertEqual(merged.mode, int(TurboQuantMode.KV3_FP4))
+
+    def test_model_runner_views_all_three_kv3_planes(self):
+        from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
+        num_blocks = 2
+        head_size = 256
+        heads = 2
+        packed_bytes = 96
+        spec = _spec(heads, head_size=head_size, mode=3)
+        raw = (
+            torch.empty(num_blocks * BLOCK_SIZE * heads * packed_bytes, dtype=torch.int8),
+            torch.empty(num_blocks * BLOCK_SIZE * heads * packed_bytes, dtype=torch.int8),
+            torch.empty(num_blocks * BLOCK_SIZE * spec.scale_slot_floats * 4, dtype=torch.uint8),
+        )
+        group = SimpleNamespace(backend=AscendAttentionBackend, kv_cache_spec=spec, layer_names=["layer"])
+        runner = SimpleNamespace(
+            _get_layer_kv_cache_specs=lambda _: {"layer": spec},
+            _kv_cache_spec_attn_group_iterator=lambda: iter([group]),
+            runner_only_attn_layers=set(),
+            cache_config=SimpleNamespace(cache_dtype="kv3fp4"),
+        )
+        viewed = NPUModelRunner._reshape_kv_cache_tensors(
+            runner, SimpleNamespace(num_blocks=num_blocks), {"layer": raw}
+        )["layer"]
+        self.assertEqual(viewed[0].shape, (num_blocks, BLOCK_SIZE, heads, packed_bytes))
+        self.assertEqual(viewed[1].shape, viewed[0].shape)
+        self.assertEqual(viewed[2].shape, (num_blocks, BLOCK_SIZE, spec.scale_slot_floats))

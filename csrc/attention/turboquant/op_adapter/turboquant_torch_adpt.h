@@ -60,6 +60,15 @@ extern void turboquant_mm_reshape_and_cache_impl(int32_t mode, AscendType type, 
                                                  uint32_t headSize, uint32_t blockSize, uint32_t numBlocks,
                                                  uint32_t tokensPerCore, float invSqrtLen);
 
+extern void turboquant_mm_fused_decode_impl(int32_t mode, AscendType type, void *stream, uint32_t blockDim,
+                                            void *queryRot, void *keyCache, void *valueCache, void *scaleCache,
+                                            void *blockTables, void *contextLens, void *modeTables, void *workspace,
+                                            void *output, uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads,
+                                            uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,
+                                            uint32_t numSplits, uint32_t headsPerTask, uint32_t tasksPerBlock,
+                                            uint32_t reduceTasksPerBlock, uint32_t fusedContextLimit, float scale,
+                                            float invSqrtLen);
+
 extern void turboquant_mm_fused_decode_raw_query_impl(
     int32_t mode, AscendType type, void *stream, uint32_t blockDim, void *query, void *piSigns, void *rotTables,
     void *h16, void *gate, void *queryRot, void *keyCache, void *valueCache, void *scaleCache, void *blockTables,
@@ -390,14 +399,20 @@ inline void npu_turboquant_paged_attention(at::Tensor &query_rot, at::Tensor &ke
 }
 
 #ifdef VLLM_ENABLE_TURBOQUANT_CUBE
-// The kv4fp8 Cube path (950 only): an NZ-tiled cache written by npu_turboquant_cube_reshape_and_cache and read
-// by npu_turboquant_cube_decode, which rotates the raw query and runs the output stage in the same launch
-// (csrc/tests/TURBOQUANT_TESTS.md 13.36). The packed planes have the AIV layout's shapes and scale plane but
-// not its byte order, so a cache is written and read by one path only. float16 activations only.
+// The FP16 Cube path (950 only): KV4_FP8 rotates the raw query and applies the output stage in one launch;
+// KV3_FP4 uses the existing pre-rotated fused decode and mode-table image. Both store NZ-tiled packed planes,
+// whose byte order differs from the AIV cache. A cache must be written and read by the same path.
 
 namespace turboquant_adpt {
 
 constexpr int32_t kCubeMode = static_cast<int32_t>(vllm_ascend::turboquant::TurboQuantMode::KV4_FP8);
+
+inline tq::TurboQuantMode CheckCubeMode(int64_t mode)
+{
+    TORCH_CHECK(mode == static_cast<int64_t>(tq::TurboQuantMode::KV3_FP4) || mode == kCubeMode,
+                "TurboQuant Cube supports only KV3_FP4 and KV4_FP8, got mode ", mode);
+    return static_cast<tq::TurboQuantMode>(mode);
+}
 
 inline void CheckCubeActivation(const at::Tensor &tensor, const char *name)
 {
@@ -406,22 +421,26 @@ inline void CheckCubeActivation(const at::Tensor &tensor, const char *name)
     TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
 }
 
-// [num_blocks, block_size, num_kv_heads, head_size / 2] int8 planes, block_size a whole number of Cube tiles, and
+// [num_blocks, block_size, num_kv_heads, mode.PackedBytes(head_size)] int8 planes, whole Cube tiles, and
 // the [num_blocks, block_size, scale_slot] fp32 scale plane.
 inline void CheckCubeCache(const at::Tensor &key_cache, const at::Tensor &value_cache, const at::Tensor &scale_cache,
-                           int64_t num_kv_heads, int64_t head_size)
+                           int64_t num_kv_heads, int64_t head_size, tq::TurboQuantMode mode)
 {
     namespace tq = vllm_ascend::turboquant;
+    const int64_t packed_bytes = tq::TurboQuantModeConfigOf(mode).PackedBytes(head_size);
     TORCH_CHECK(key_cache.dim() == 4 && key_cache.sizes() == value_cache.sizes(),
-                "kv cache must be two [num_blocks, block_size, num_kv_heads, head_size / 2] tensors");
+                "kv cache must be two [num_blocks, block_size, num_kv_heads, packed_bytes] tensors");
     TORCH_CHECK(key_cache.scalar_type() == at::ScalarType::Char && value_cache.scalar_type() == at::ScalarType::Char,
-                "the packed 4-bit kv cache must be int8");
+                "the packed TurboQuant kv cache must be int8");
     TORCH_CHECK(key_cache.is_contiguous() && value_cache.is_contiguous() && scale_cache.is_contiguous(),
                 "the kv cache and its scale plane must be contiguous");
     TORCH_CHECK(key_cache.size(2) == num_kv_heads, "cache num_kv_heads mismatch: ", key_cache.size(2), " vs ",
                 num_kv_heads);
-    TORCH_CHECK(key_cache.size(3) == head_size / 2, "packed cache head dim must be head_size / 2, got ",
-                key_cache.size(3));
+    TORCH_CHECK(key_cache.size(3) == packed_bytes, "packed cache head dim must be ", packed_bytes,
+                ", got ", key_cache.size(3));
+    TORCH_CHECK(packed_bytes % tq::kOperandC0 == 0,
+                "TurboQuant Cube NZ layout requires packed bytes per head to be a multiple of ", tq::kOperandC0,
+                ", got ", packed_bytes);
     TORCH_CHECK(key_cache.size(1) % tq::kCubeTileRows == 0, "the TurboQuant Cube path requires block_size to be a ",
                 "multiple of ", tq::kCubeTileRows, ", got ", key_cache.size(1));
     TORCH_CHECK(scale_cache.scalar_type() == at::ScalarType::Float && scale_cache.dim() == 3,
@@ -463,7 +482,8 @@ inline int64_t npu_turboquant_cube_workspace_size(int64_t num_tokens, int64_t nu
 inline void npu_turboquant_cube_reshape_and_cache(at::Tensor &key, at::Tensor &value, at::Tensor &key_cache,
                                                   at::Tensor &value_cache, at::Tensor &scale_cache,
                                                   at::Tensor &slot_mapping, at::Tensor &pi_signs,
-                                                  at::Tensor &codec_tables)
+                                                  at::Tensor &codec_tables,
+                                                  const c10::optional<at::Tensor> &mode_tables, int64_t mode)
 {
     namespace adpt = turboquant_adpt;
     namespace tq = vllm_ascend::turboquant;
@@ -478,9 +498,20 @@ inline void npu_turboquant_cube_reshape_and_cache(at::Tensor &key, at::Tensor &v
     const int64_t num_tokens = key.size(0);
     const int64_t num_kv_heads = key.size(1);
     const int64_t head_size = key.size(2);
+    const tq::TurboQuantMode cube_mode = adpt::CheckCubeMode(mode);
     adpt::CheckHeadSize(head_size);
-    adpt::CheckCubeCache(key_cache, value_cache, scale_cache, num_kv_heads, head_size);
+    adpt::CheckCubeCache(key_cache, value_cache, scale_cache, num_kv_heads, head_size, cube_mode);
     adpt::CheckRotationTables(pi_signs, codec_tables, head_size);
+    TORCH_CHECK(cube_mode != tq::TurboQuantMode::KV3_FP4 ||
+                    (mode_tables.has_value() && mode_tables->scalar_type() == at::ScalarType::Int &&
+                     mode_tables->is_contiguous()), "KV3_FP4 requires contiguous int32 mode tables");
+    TORCH_CHECK(cube_mode != tq::TurboQuantMode::KV3_FP4 ||
+                    mode_tables->numel() >= 3 * head_size + 3 * tq::kFp32PerBlock + 8,
+                "KV3_FP4 writer mode table is too short");
+    if (mode_tables.has_value()) {
+        adpt::CheckOnDevice(*mode_tables, "mode_tables", key, "key");
+        adpt::CheckGmBurstAligned(*mode_tables, "mode_tables");
+    }
     TORCH_CHECK(slot_mapping.numel() == num_tokens, "slot_mapping must hold one slot per token");
     adpt::CheckGmBurstAligned(key, "key");
     adpt::CheckGmBurstAligned(value, "value");
@@ -504,28 +535,32 @@ inline void npu_turboquant_cube_reshape_and_cache(at::Tensor &key, at::Tensor &v
     const tq::ReshapeAndCacheGrid grid = tq::PlanReshapeAndCache(num_tokens, adpt::VectorCoreNum());
     const float inv_sqrt_len = 1.0f / std::sqrt(static_cast<float>(head_size));
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
-    // kv4fp8's affine codec reads no mode table; the rotation tables stand in for the unused address.
+    // KV4_FP8 reads no mode table; its rotation table is a safe unused address.
     turboquant_mm_reshape_and_cache_impl(
-        adpt::kCubeMode, AscendType::FP16, stream, grid.block_dim, key.data_ptr(), value.data_ptr(),
+        static_cast<int32_t>(cube_mode), AscendType::FP16, stream, grid.block_dim, key.data_ptr(), value.data_ptr(),
         key_cache.data_ptr(), value_cache.data_ptr(), scale_cache.data_ptr(), slot_mapping.data_ptr(),
-        pi_signs.data_ptr(), codec_tables.data_ptr(), codec_tables.data_ptr(), static_cast<uint32_t>(num_tokens),
+        pi_signs.data_ptr(), codec_tables.data_ptr(),
+        mode_tables.has_value() ? mode_tables->data_ptr() : codec_tables.data_ptr(),
+        static_cast<uint32_t>(num_tokens),
         static_cast<uint32_t>(num_kv_heads), static_cast<uint32_t>(head_size),
         static_cast<uint32_t>(key_cache.size(1)), static_cast<uint32_t>(key_cache.size(0)), grid.tokens_per_core,
         inv_sqrt_len);
 }
 
-// One decode launch over the raw query. output_stage is a TurboQuantOutputStage: 0 leaves the output rotated
-// (a Pi-folded o_proj), 1 un-rotates it, 2 also multiplies it by sigmoid(gate). query_rot is the launch's fp32
-// scratch for the rotated query; workspace is sized by npu_turboquant_cube_workspace_size.
+// KV4_FP8 decodes the raw query in one launch. KV3_FP4 rotates into query_rot first, then uses the
+// pre-rotated fused decode and returns the rotated basis. output_stage controls the KV4 output only;
+// workspace is sized by npu_turboquant_cube_workspace_size.
 inline void npu_turboquant_cube_decode(at::Tensor &query, const c10::optional<at::Tensor> &gate,
                                        at::Tensor &pi_signs, at::Tensor &codec_tables, at::Tensor &hadamard16,
                                        at::Tensor &key_cache, at::Tensor &value_cache, at::Tensor &scale_cache,
                                        at::Tensor &block_tables, at::Tensor &context_lens, at::Tensor &workspace,
                                        at::Tensor &query_rot, int64_t num_kv_heads, int64_t num_heads,
-                                       double scale_value, int64_t output_stage, at::Tensor &out)
+                                       double scale_value, int64_t output_stage, at::Tensor &out,
+                                       const c10::optional<at::Tensor> &mode_tables, int64_t mode)
 {
     namespace adpt = turboquant_adpt;
     namespace tq = vllm_ascend::turboquant;
+    const tq::TurboQuantMode cube_mode = adpt::CheckCubeMode(mode);
 
     TORCH_CHECK(query.dim() == 3, "query must be [num_tokens, num_heads, head_size]");
     adpt::CheckCubeActivation(query, "query");
@@ -571,8 +606,18 @@ inline void npu_turboquant_cube_decode(at::Tensor &query, const c10::optional<at
                 num_heads);
     TORCH_CHECK(num_kv_heads > 0 && num_heads % num_kv_heads == 0, "num_heads ", num_heads,
                 " must be a multiple of num_kv_heads ", num_kv_heads);
-    adpt::CheckCubeCache(key_cache, value_cache, scale_cache, num_kv_heads, head_size);
+    adpt::CheckCubeCache(key_cache, value_cache, scale_cache, num_kv_heads, head_size, cube_mode);
     adpt::CheckRotationTables(pi_signs, codec_tables, head_size);
+    TORCH_CHECK(cube_mode != tq::TurboQuantMode::KV3_FP4 ||
+                    (mode_tables.has_value() && mode_tables->scalar_type() == at::ScalarType::Int &&
+                     mode_tables->is_contiguous()), "KV3_FP4 requires contiguous int32 mode tables");
+    TORCH_CHECK(cube_mode != tq::TurboQuantMode::KV3_FP4 ||
+                    mode_tables->numel() >= 17 * head_size + 3 * tq::kFp32PerBlock + 8,
+                "KV3_FP4 decode mode table is too short");
+    if (mode_tables.has_value()) {
+        adpt::CheckOnDevice(*mode_tables, "mode_tables", query, "query");
+        adpt::CheckGmBurstAligned(*mode_tables, "mode_tables");
+    }
     TORCH_CHECK(block_tables.size(0) == num_tokens, "block_tables must hold one row per query token");
     TORCH_CHECK(context_lens.numel() == num_tokens, "context_lens must hold one length per query token");
 
@@ -593,6 +638,28 @@ inline void npu_turboquant_cube_decode(at::Tensor &query, const c10::optional<at
 
     const float inv_sqrt_len = 1.0f / std::sqrt(static_cast<float>(head_size));
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    if (cube_mode == tq::TurboQuantMode::KV3_FP4) {
+        TORCH_CHECK(output_stage == static_cast<int64_t>(tq::TurboQuantOutputStage::kRotatedBasis) && !gate.has_value(),
+                    "KV3_FP4 decode returns the rotated basis; apply output rotation and gate in the caller");
+        const tq::RotateQPlan rotation =
+            tq::PlanRotateQ(num_tokens, num_tokens * num_heads, head_size, adpt::VectorCoreNum());
+        turboquant_rotate_q_impl(AscendType::FP16, stream, rotation.block_dim, rotation.use_cube,
+                                 query.data_ptr(), pi_signs.data_ptr(), hadamard16.data_ptr(),
+                                 codec_tables.data_ptr(), query_rot.data_ptr(),
+                                 static_cast<uint32_t>(num_tokens * num_heads), static_cast<uint32_t>(head_size),
+                                 rotation.vectors_per_block, rotation.vectors_per_chunk, rotation.variant,
+                                 inv_sqrt_len);
+        turboquant_mm_fused_decode_impl(
+            static_cast<int32_t>(cube_mode), AscendType::FP16, stream, grid.block_dim, query_rot.data_ptr(),
+            key_cache.data_ptr(), value_cache.data_ptr(), scale_cache.data_ptr(), block_tables.data_ptr(),
+            context_lens.data_ptr(), mode_tables->data_ptr(), workspace_floats > 0 ? workspace.data_ptr() : nullptr,
+            out.data_ptr(), static_cast<uint32_t>(num_tokens), static_cast<uint32_t>(num_heads),
+            static_cast<uint32_t>(num_kv_heads), static_cast<uint32_t>(head_size), static_cast<uint32_t>(block_size),
+            static_cast<uint32_t>(max_blocks_per_seq), static_cast<uint32_t>(grid.num_splits), grid.heads_per_task,
+            grid.tasks_per_block, grid.reduce_tasks_per_block, grid.fused_context_limit,
+            static_cast<float>(scale_value), inv_sqrt_len);
+        return;
+    }
     turboquant_mm_fused_decode_raw_query_impl(
         adpt::kCubeMode, AscendType::FP16, stream, grid.block_dim, query.data_ptr(), pi_signs.data_ptr(),
         codec_tables.data_ptr(), hadamard16.data_ptr(), gated ? gate->data_ptr() : nullptr, query_rot.data_ptr(),

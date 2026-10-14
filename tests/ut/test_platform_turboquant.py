@@ -69,9 +69,7 @@ class TestTurboQuantStartupGating(TestBase):
 
     def test_speculative_decoding_is_refused(self):
         with self.assertRaises(ValueError) as caught:
-            NPUPlatform._validate_turboquant_config(
-                _config(speculative=SimpleNamespace(method="mtp"))
-            )
+            NPUPlatform._validate_turboquant_config(_config(speculative=SimpleNamespace(method="mtp")))
         self.assertIn("speculative decoding", str(caught.exception))
 
     def test_every_unsupported_option_is_named_at_once(self):
@@ -106,6 +104,39 @@ class TestTurboQuantStartupGating(TestBase):
         self.assertIn("turboquant_4bit_nc", message)
         self.assertIn("int4_per_token_head", message)
 
+    def test_kv3_requires_float16_cube_and_aligned_head(self):
+        import torch
+
+        config = _config(cache_dtype="turboquant_int3")
+        config.model_config = SimpleNamespace(dtype=torch.float16, get_head_size=lambda: 256)
+        with (
+            patch("vllm_ascend.envs.VLLM_ASCEND_TURBOQUANT_CUBE_DECODE", True),
+            patch("vllm_ascend.platform.envs_vllm.VLLM_USE_V2_MODEL_RUNNER", False),
+        ):
+            NPUPlatform._validate_turboquant_config(config)
+            config.model_config.get_head_size = lambda: 128
+            with self.assertRaisesRegex(ValueError, "head_size 256"):
+                NPUPlatform._validate_turboquant_config(config)
+            config.model_config.get_head_size = lambda: 256
+            config.model_config.dtype = torch.bfloat16
+            with self.assertRaisesRegex(ValueError, "float16"):
+                NPUPlatform._validate_turboquant_config(config)
+
+        with (
+            patch("vllm_ascend.envs.VLLM_ASCEND_TURBOQUANT_CUBE_DECODE", False),
+            patch("vllm_ascend.platform.envs_vllm.VLLM_USE_V2_MODEL_RUNNER", False),
+            self.assertRaisesRegex(ValueError, "CUBE_DECODE=1"),
+        ):
+            NPUPlatform._validate_turboquant_config(config)
+
+        config.model_config.dtype = torch.float16
+        with (
+            patch("vllm_ascend.envs.VLLM_ASCEND_TURBOQUANT_CUBE_DECODE", True),
+            patch("vllm_ascend.platform.envs_vllm.VLLM_USE_V2_MODEL_RUNNER", True),
+            self.assertRaisesRegex(ValueError, "v1 model runner"),
+        ):
+            NPUPlatform._validate_turboquant_config(config)
+
 
 class TestGatingOnlyAppliesToTurboQuant(TestBase):
     def test_an_unrelated_run_is_untouched(self):
@@ -124,9 +155,7 @@ class TestGatingOnlyAppliesToTurboQuant(TestBase):
         """ENABLE_TURBOQUANT=1 activates the backend whatever the cache dtype."""
         with patch("vllm_ascend.envs.ENABLE_TURBOQUANT", True):
             with self.assertRaises(ValueError) as caught:
-                NPUPlatform._validate_turboquant_config(
-                    _config(cache_dtype="auto", chunked_prefill=True)
-                )
+                NPUPlatform._validate_turboquant_config(_config(cache_dtype="auto", chunked_prefill=True))
             self.assertIn("chunked prefill", str(caught.exception))
 
 

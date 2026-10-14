@@ -14,10 +14,12 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
-"""TurboQuant 4-bit KV cache attention backend for Ascend 950PR and 910B.
+"""TurboQuant KV cache attention backend for Ascend 950PR and 910B.
 
-The cache is plain contiguous ND -- ``(2, num_blocks, block_size, num_kv_heads,
-head_size // 2)`` int8, two 4-bit codes per byte.
+The AIV cache is contiguous ND with ``head_size // 2`` bytes per head. The
+Cube cache uses NZ tiles and either KV4_FP8 (``head_size // 2`` bytes) or
+KV3_FP4 (``3 * head_size // 8`` bytes); both expose the same logical tensor
+shape with their own packed-byte last dimension.
 
 ``q``, ``k`` and ``v`` reach the operators holding exactly the values the
 projections and RoPE produced -- packed contiguous, because the adapter refuses
@@ -49,12 +51,14 @@ Two decodes serve the cache, and a layer picks one when its impl is built,
 because they write different byte layouts into the same packed planes:
 
 * the Cube decode (:attr:`AscendTurboQuantAttentionBackendImpl.cube_decode`;
-  Ascend 950, float16, ``VLLM_ASCEND_TURBOQUANT_CUBE_DECODE``) -- a kv4fp8
+  Ascend 950, float16, ``VLLM_ASCEND_TURBOQUANT_CUBE_DECODE``) -- a KV4_FP8
   NZ-tiled cache, and ONE launch per step that rotates the raw query and runs
   the output stage (:class:`TurboQuantOutputStage`) before its fp16 write.  An
   unfolded layer's output is un-rotated there, and a gated layer's is also
   multiplied by ``sigmoid(gate)`` when the model hands the gate over through
   ``vllm::turboquant_gated_attention`` (:attr:`fuses_output_gate`);
+  KV3_FP4 uses the existing pre-rotated fused decode after a query rotation
+  launch, with output rotation and gate applied afterward;
 * the AIV decode -- every other build and dtype: ``npu_turboquant_rotate_q``,
   the paged decode, and ``npu_turboquant_rotate_q`` again over the output
   unless the layer is folded; a gate handed over is applied in torch.
@@ -98,15 +102,19 @@ from vllm_ascend.attention.attention_v1 import (
 from vllm_ascend.attention.turboquant_layout import (  # noqa: F401  (re-export)
     TURBOQUANT_BURST_FLOATS,
     TURBOQUANT_CUBE_TILE_ROWS,
+    TURBOQUANT_CUBE_UNPACK_ROWS,
     TURBOQUANT_LEVELS,
     TURBOQUANT_LLOYD_MAX_CENTROIDS,
     TURBOQUANT_LLOYD_MAX_THRESHOLDS,
     TURBOQUANT_PACK_FACTOR,
     TURBOQUANT_ROTATE_TILE,
     TURBOQUANT_TILE_ROWS,
+    TurboQuantMode,
     TurboQuantOutputStage,
     turboquant_codec_tables,
     turboquant_hadamard16,
+    turboquant_mode_tables,
+    turboquant_packed_bytes,
     turboquant_scale_slot,
 )
 from vllm_ascend.attention.turboquant_rotation import output_rotation_is_folded, turboquant_pi_signs
@@ -130,6 +138,7 @@ from vllm_ascend.attention.turboquant_trace import (
     turboquant_tracer,
 )
 from vllm_ascend.attention.utils import notify_kv_cache_written
+from vllm_ascend.utils import turboquant_cache_mode
 
 _WORKSPACE_MEMO_LIMIT = 1024
 
@@ -147,7 +156,7 @@ TURBOQUANT_INDEX_DTYPE = torch.int32
 
 
 def turboquant_cube_decode_available() -> bool:
-    """Whether this build registered the kv4fp8 Cube kernels (Ascend 950 builds only)."""
+    """Whether this build registered the Cube kernels (Ascend 950 builds only)."""
     return hasattr(torch.ops._C_ascend, "npu_turboquant_cube_decode")
 
 
@@ -155,6 +164,11 @@ def _model_dtype(impl: object) -> torch.dtype | None:
     vllm_config = getattr(impl, "vllm_config", None)
     model_config = getattr(vllm_config, "model_config", None)
     return getattr(model_config, "dtype", None)
+
+
+def _cache_mode(impl: object) -> TurboQuantMode:
+    cache_config = getattr(getattr(impl, "vllm_config", None), "cache_config", None)
+    return TurboQuantMode(turboquant_cache_mode(getattr(cache_config, "cache_dtype", None)))
 
 
 def turboquant_cube_decode_selected(model_dtype: torch.dtype | None) -> bool:
@@ -224,7 +238,7 @@ def _attention_phase(attn_metadata: AscendMetadata | None) -> str:
 
 
 class AscendTurboQuantAttentionBackend(AscendAttentionBackend):
-    """Backend descriptor for the 4-bit TurboQuant KV cache."""
+    """Backend descriptor for the packed TurboQuant KV cache."""
 
     @staticmethod
     def get_name() -> str:
@@ -246,7 +260,8 @@ class AscendTurboQuantAttentionBackend(AscendAttentionBackend):
         head_size: int,
         cache_dtype_str: str = "",
     ) -> tuple[int, ...]:
-        return (2, num_blocks, block_size, num_kv_heads, head_size // TURBOQUANT_PACK_FACTOR)
+        mode = TurboQuantMode(turboquant_cache_mode(cache_dtype_str))
+        return (2, num_blocks, block_size, num_kv_heads, turboquant_packed_bytes(head_size, mode))
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int]:
@@ -293,7 +308,7 @@ class AscendTurboQuantAttentionBackend(AscendAttentionBackend):
 
 
 class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
-    """Attention over a 4-bit TurboQuant KV cache.
+    """Attention over a packed TurboQuant KV cache.
 
     Activate it on an existing layer with :func:`activate_turboquant_backend`,
     which swaps the impl class the same way the C8 KV cache scheme does.
@@ -308,6 +323,8 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
     # Class-level defaults, so an impl whose class was swapped in after construction
     # (activate_turboquant_backend) starts on the AIV decode until it is told otherwise.
     cube_decode = False
+    mode = TurboQuantMode.KV4_FP8
+    _mode_tables = None
     output_rotation_folded = False
 
     # Class-level for the same reason cube_decode is: activate_turboquant_backend swaps the
@@ -338,8 +355,12 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         self._workspace_floats: dict[tuple[int, int], int] = {}
         self.rotated_query: torch.Tensor | None = None
         self._hadamard16: torch.Tensor | None = None
+        self._mode_tables: dict[tuple[int, str], torch.Tensor] = {}
         self.output_rotation_folded = False
+        self.mode = _cache_mode(self)
         self.cube_decode = turboquant_cube_decode_selected(_model_dtype(self))
+        if self.mode == TurboQuantMode.KV3_FP4 and not self.cube_decode:
+            raise ValueError("KV3_FP4 requires the float16 TurboQuant Cube decoder")
         self.sink_config = TurboQuantSinkConfig.from_env()
         self.sink_cache: TurboQuantSinkCache | None = None
 
@@ -360,11 +381,12 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         self._refuse_sinks_on_a_cube_cache()
         torch.ops._C_ascend.npu_turboquant_vector_core_num()
         logger.info_once(
-            "[vllm-ascend/turboquant] 4-bit KV cache active; Pi is applied at runtime to K/V on the write path and "
+            "[vllm-ascend/turboquant] %s KV cache active; Pi is applied at runtime to K/V on the write path and "
             "to Q before each decode. The decode output stays rotated for a folded o_proj and is un-rotated on "
-            "the device otherwise."
+            "the device otherwise.",
+            self.mode.name,
         )
-        if self.cube_decode:
+        if self.cube_decode and self.mode == TurboQuantMode.KV4_FP8:
             logger.info_once(
                 "[vllm-ascend/turboquant] kv4fp8 Cube decode: the query rotation, the output un-rotation and any "
                 "attn_output_gate run inside the decode launch."
@@ -389,6 +411,14 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
 
     def codec_tables(self, device: torch.device, batch_rows: int) -> torch.Tensor:
         return turboquant_codec_tables(self.head_size, batch_rows, device)
+
+    def mode_tables(self, device: torch.device, batch_rows: int) -> torch.Tensor:
+        if self._mode_tables is None:
+            self._mode_tables = {}
+        key = (batch_rows, str(device))
+        if key not in self._mode_tables:
+            self._mode_tables[key] = turboquant_mode_tables(self.head_size, batch_rows, device)
+        return self._mode_tables[key]
 
     def hadamard16(self, device: torch.device) -> torch.Tensor:
         if self._hadamard16 is None:
@@ -834,7 +864,7 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
                 bypassed=tracer.dry_run,
             )
         if not tracer.dry_run:
-            write(
+            writer_args = (
                 cached_key,
                 cached_value,
                 self.key_cache,
@@ -844,6 +874,10 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
                 self.pi_signs(key.device),
                 self.codec_tables(key.device, 1),
             )
+            if self.mode == TurboQuantMode.KV3_FP4:
+                write(*writer_args, self.mode_tables(key.device, 1), int(self.mode))
+            else:
+                write(*writer_args)
             if envs_ascend.VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS:
                 self._fence_cache_write(key.device)
             # After the packed write, not instead of it: a sink is quantised into the paged
@@ -1297,14 +1331,12 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         output: torch.Tensor,
         output_gate: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """One kv4fp8 Cube launch per step: rotate, attend, and write what o_proj reads.
+        """Decode a Cube cache and write what o_proj reads.
 
         The launch is handed the raw query and rotates it into the persistent
-        ``rotated_query`` buffer itself, ahead of its split tasks. Its output
-        stage then leaves the result rotated for a folded layer, and otherwise
-        un-rotates it in fp32 before the fp16 write -- and for a gated layer
-        also multiplies it by ``sigmoid(output_gate)``. No other launch or copy
-        follows.
+        ``rotated_query`` buffer itself in KV4_FP8. KV3_FP4 rotates the query
+        before its in-tree pre-rotated fused decode and applies output rotation
+        and gate afterward. Both leave the result rotated for a folded layer.
         """
         num_tokens = query.shape[0]
         device = query.device
@@ -1342,9 +1374,9 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
                 attention_output.zero_()
                 return output
 
-        torch.ops._C_ascend.npu_turboquant_cube_decode(
+        decode_args = (
             query.contiguous(),
-            launch_gate,
+            None if self.mode == TurboQuantMode.KV3_FP4 else launch_gate,
             self.pi_signs(device),
             self.codec_tables(device, 1),
             self.hadamard16(device),
@@ -1358,9 +1390,19 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
             self.num_kv_heads,
             self.num_heads,
             self.scale,
-            int(stage),
+            int(TurboQuantOutputStage.ROTATED_BASIS) if self.mode == TurboQuantMode.KV3_FP4 else int(stage),
             attention_output,
         )
+        if self.mode == TurboQuantMode.KV3_FP4:
+            torch.ops._C_ascend.npu_turboquant_cube_decode(
+                *decode_args, self.mode_tables(device, TURBOQUANT_CUBE_UNPACK_ROWS), int(self.mode)
+            )
+            if not self.output_rotation_folded:
+                self._unrotate_output(attention_output, rotated_query)
+            if gate is not None:
+                attention_output.mul_(torch.sigmoid(gate).view_as(attention_output))
+        else:
+            torch.ops._C_ascend.npu_turboquant_cube_decode(*decode_args)
         if self.sink_config.enabled:
             self._fuse_decode_sinks(attention_output, query, rotated_query, attn_metadata)
             if not self.output_rotation_folded:
@@ -1573,12 +1615,16 @@ def activate_turboquant_backend(layer: torch.nn.Module) -> None:
         impl._workspace_floats = {}
         impl.rotated_query = None
         impl._hadamard16 = None
+        impl._mode_tables = {}
         impl._device_index_buffers = None
         impl.sink_config = TurboQuantSinkConfig.from_env()
         impl.sink_cache = None
         impl._trace_step = 0
         impl._trace_phase = "unknown"
+        impl.mode = _cache_mode(impl)
         impl.cube_decode = turboquant_cube_decode_selected(_model_dtype(impl))
+        if impl.mode == TurboQuantMode.KV3_FP4 and not impl.cube_decode:
+            raise ValueError("KV3_FP4 requires the float16 TurboQuant Cube decoder")
         vllm_config = getattr(impl, "vllm_config", None)
         hf_config = None if vllm_config is None else vllm_config.model_config.hf_config
         layer_name = getattr(layer, "layer_name", "")

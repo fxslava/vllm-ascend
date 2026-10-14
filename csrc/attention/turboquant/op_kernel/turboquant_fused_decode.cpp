@@ -16,8 +16,8 @@
 
 // The Cube-native multi-mode TurboQuant kernels: the mode-parameterised cache write, the fused
 // single-launch decode, and the fp8 GEMM probe the Cube contract test drives. The wheel builds this file
-// for arch35 and ships kv4fp8 only: the other modes and the probe are compiled under
-// VLLM_ASCEND_TQ_TEST_KERNELS, which only csrc/tests defines.
+// for arch35 and ships kv4fp8 plus the pre-rotated kv3fp4 pair. The kv5fp8,
+// Lloyd-Max, ablation and probe variants remain under VLLM_ASCEND_TQ_TEST_KERNELS.
 
 #include "kernel_operator.h"
 
@@ -840,12 +840,12 @@ private:
     ASCEND_TQ_DECLARE_MM_FUSED_DECODE(turboquant_mm_fused_decode_##MODE_NAME##_half, MODE, half)
 
 ASCEND_TQ_DECLARE_MM_MODE(kv4fp8, TurboQuantMode::KV4_FP8)
+ASCEND_TQ_DECLARE_MM_MODE(kv3fp4, TurboQuantMode::KV3_FP4)
 // kv4fp8 only: the one mode the fused decode is validated in (TURBOQUANT_TESTS.md 13.25).
 ASCEND_TQ_DECLARE_MM_FUSED_DECODE_RAW_QUERY(turboquant_mm_fused_decode_raw_query_kv4fp8_half, TurboQuantMode::KV4_FP8,
                                             half)
 #if defined(VLLM_ASCEND_TQ_TEST_KERNELS)
-// The codebook modes have never executed through the fused decode, so only the test library builds them.
-ASCEND_TQ_DECLARE_MM_MODE(kv3fp4, TurboQuantMode::KV3_FP4)
+// The remaining codebook mode is retained for the test library.
 ASCEND_TQ_DECLARE_MM_MODE(kv5fp8, TurboQuantMode::KV5_FP8)
 
 // The unpack ablation of the shipping decode: same launch, same traffic, no codec expand, zero output.
@@ -909,12 +909,12 @@ void turboquant_mm_reshape_and_cache_impl(int32_t mode, AscendType type, void *s
                 key, value, keyCache, valueCache, scaleCache, slotMapping, piSigns, rotTables, modeTables, numTokens,
                 numKvHeads, headSize, blockSize, numBlocks, tokensPerCore, invSqrtLen);
             break;
-#if defined(VLLM_ASCEND_TQ_TEST_KERNELS)
         case turboquant::TurboQuantMode::KV3_FP4:
             turboquant_mm_reshape_and_cache_kv3fp4_half<<<blockDim, nullptr, stream>>>(
                 key, value, keyCache, valueCache, scaleCache, slotMapping, piSigns, rotTables, modeTables, numTokens,
                 numKvHeads, headSize, blockSize, numBlocks, tokensPerCore, invSqrtLen);
             break;
+#if defined(VLLM_ASCEND_TQ_TEST_KERNELS)
         case turboquant::TurboQuantMode::KV5_FP8:
             turboquant_mm_reshape_and_cache_kv5fp8_half<<<blockDim, nullptr, stream>>>(
                 key, value, keyCache, valueCache, scaleCache, slotMapping, piSigns, rotTables, modeTables, numTokens,
@@ -944,13 +944,13 @@ void turboquant_mm_fused_decode_impl(int32_t mode, AscendType type, void *stream
                 numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,
                 tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen);
             break;
-#if defined(VLLM_ASCEND_TQ_TEST_KERNELS)
         case turboquant::TurboQuantMode::KV3_FP4:
             turboquant_mm_fused_decode_kv3fp4_half<<<blockDim, nullptr, stream>>>(
                 queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,
                 numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,
                 tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen);
             break;
+#if defined(VLLM_ASCEND_TQ_TEST_KERNELS)
         case turboquant::TurboQuantMode::KV5_FP8:
             turboquant_mm_fused_decode_kv5fp8_half<<<blockDim, nullptr, stream>>>(
                 queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,

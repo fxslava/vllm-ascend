@@ -59,14 +59,17 @@ from vllm_ascend.attention.turboquant_trace import (
     TURBOQUANT_TRACE_PREVIEW,
     cache_planes,
     compact_tensor,
-    host_seq_lengths,
     describe_indices,
     describe_tensor,
+    host_seq_lengths,
     reset_turboquant_tracer,
     turboquant_tracer,
 )
 from vllm_ascend.attention.turboquant_v1 import (
     TURBOQUANT_BURST_FLOATS,
+    TURBOQUANT_LEVELS,
+    TURBOQUANT_LLOYD_MAX_CENTROIDS,
+    TURBOQUANT_LLOYD_MAX_THRESHOLDS,
     TURBOQUANT_PACK_FACTOR,
     TURBOQUANT_TILE_ROWS,
     AscendTurboQuantAttentionBackend,
@@ -74,11 +77,6 @@ from vllm_ascend.attention.turboquant_v1 import (
     turboquant_codec_tables,
     turboquant_hadamard16,
     turboquant_scale_slot,
-)
-from vllm_ascend.attention.turboquant_v1 import (
-    TURBOQUANT_LEVELS,
-    TURBOQUANT_LLOYD_MAX_CENTROIDS,
-    TURBOQUANT_LLOYD_MAX_THRESHOLDS,
 )
 
 HEAD_SIZE = 128
@@ -149,6 +147,7 @@ def _numeric_ops(rotated_output: torch.Tensor) -> MagicMock:
     ops.npu_turboquant_rotate_q.side_effect = rotate_q
     ops.npu_turboquant_paged_attention.side_effect = paged_attention
     return ops
+
 
 # The first eight channels of the shared LCG sign vector. Hard-coded so this
 # test and csrc/tests/reference/turbo_quant_cpu.h pin the same constant from
@@ -873,9 +872,7 @@ class TestNumericalEdgeCases(TestBase):
             # reconstruction is numerically zero.
             levels = _dequantize_levels(packed)
             self.assertTrue(torch.isfinite(levels).all())
-            torch.testing.assert_close(
-                levels, torch.full_like(levels, CENTROIDS[ZERO_BIN].item()), atol=0, rtol=0
-            )
+            torch.testing.assert_close(levels, torch.full_like(levels, CENTROIDS[ZERO_BIN].item()), atol=0, rtol=0)
 
             recon = levels * step
             self.assertTrue(torch.isfinite(recon).all())
@@ -894,9 +891,7 @@ class TestNumericalEdgeCases(TestBase):
             # every other channel, where the RMS scale keeps the bulk resolved
             # and clips the outlier instead.
             self.assertTrue(torch.isfinite(step).all())
-            self.assertAlmostEqual(
-                step.item(), abs(magnitude) / math.sqrt(head_size), delta=abs(magnitude) * 1e-9
-            )
+            self.assertAlmostEqual(step.item(), abs(magnitude) / math.sqrt(head_size), delta=abs(magnitude) * 1e-9)
 
             levels = _dequantize_levels(packed)
             extreme_bin = TURBOQUANT_LEVELS - 1 if magnitude > 0 else 0
@@ -1162,9 +1157,7 @@ class TestCodecTables(TestBase):
                 tables = turboquant_codec_tables(head_size, batch_rows, CPU)
                 self.assertEqual(tables.dtype, torch.int32)
                 self.assertTrue(tables.is_contiguous())
-                self.assertEqual(
-                    tables.numel(), 7 * head_size + 2 * head_size * batch_rows + TURBOQUANT_LEVELS
-                )
+                self.assertEqual(tables.numel(), 7 * head_size + 2 * head_size * batch_rows + TURBOQUANT_LEVELS)
                 # One DataCopy moves the image, so it must be a whole burst.
                 self.assertEqual(tables.numel() % 8, 0)
 
@@ -1195,9 +1188,7 @@ class TestCodecTables(TestBase):
         # is merely close still decodes, it just stops being the quantiser the
         # thresholds were derived for.
         _, _, _, _, _, _, centroids = self._split(128, TURBOQUANT_TILE_ROWS)
-        torch.testing.assert_close(
-            centroids, CENTROIDS.to(torch.float32), atol=0, rtol=0
-        )
+        torch.testing.assert_close(centroids, CENTROIDS.to(torch.float32), atol=0, rtol=0)
         # Strictly increasing, or the threshold scan's bin index would not
         # select the nearest centroid.
         self.assertTrue(bool((centroids[1:] > centroids[:-1]).all()))
@@ -1406,6 +1397,44 @@ class TestCubeDecode(TestBase):
         self.assertEqual(args[13], impl.num_heads)
         self.assertEqual(args[15], int(tq_module.TurboQuantOutputStage.UNROTATED))
         self.assertEqual(args[16].data_ptr(), output.data_ptr())
+
+    def test_kv3_dispatch_passes_mode_tables_and_rotated_output_stage(self):
+        impl = self._make_impl(folded=True)
+        impl.mode = tq_module.TurboQuantMode.KV3_FP4
+        impl.head_size = 256
+        impl.scale = 256**-0.5
+        impl.key_cache = torch.zeros(1, DECODE_BLOCK_SIZE, 2, 96, dtype=torch.int8)
+        impl.value_cache = torch.zeros_like(impl.key_cache)
+        query = torch.randn(2, impl.num_heads, 256)
+        output = torch.zeros_like(query)
+        metadata = MagicMock(
+            block_tables=torch.zeros(2, 2, dtype=torch.int64),
+            seq_lens=torch.ones(2, dtype=torch.int64),
+        )
+        ops = _cube_ops()
+        with patch.object(torch.ops, "_C_ascend", ops, create=True):
+            impl.forward_cube_decode(query, metadata, output)
+        args = ops.npu_turboquant_cube_decode.call_args.args
+        self.assertEqual(args[15], int(tq_module.TurboQuantOutputStage.ROTATED_BASIS))
+        self.assertEqual(args[-1], int(tq_module.TurboQuantMode.KV3_FP4))
+        self.assertEqual(args[-2].dtype, torch.int32)
+        self.assertEqual(args[-2].numel(), 17 * 256 + 32)
+        ops.npu_turboquant_rotate_q.assert_not_called()
+
+    def test_kv3_writer_passes_mode_tables(self):
+        impl = self._make_impl()
+        impl.mode = tq_module.TurboQuantMode.KV3_FP4
+        impl.head_size = 256
+        impl.key_cache = None
+        key = torch.randn(2, impl.num_kv_heads, 256)
+        cache = torch.zeros(1, DECODE_BLOCK_SIZE, impl.num_kv_heads, 96, dtype=torch.int8)
+        metadata = MagicMock(num_actual_tokens=2, slot_mapping=torch.arange(2, dtype=torch.int64))
+        ops = _cube_ops()
+        with patch.object(torch.ops, "_C_ascend", ops, create=True):
+            impl.reshape_and_cache(None, key, torch.randn_like(key), (cache, cache), metadata, None)
+        args = ops.npu_turboquant_cube_reshape_and_cache.call_args.args
+        self.assertEqual(args[-1], int(tq_module.TurboQuantMode.KV3_FP4))
+        self.assertEqual(args[-2].numel(), 3 * 256 + 32)
 
     def test_the_workspace_is_sized_by_the_cube_planner(self):
         impl = self._make_impl()
@@ -1688,14 +1717,18 @@ class TestOutputProjectionFold(TestBase):
         name = "model.layers.0.self_attn.attn"
         marker = output_rotation_marker(["model.layers.0.self_attn"], HEAD_SIZE)
         self.assertEqual(marker["pi_seed"], TURBOQUANT_PI_SEED)
-        self.assertTrue(output_rotation_is_folded(SimpleNamespace(**{TURBOQUANT_OUTPUT_ROTATION_CONFIG_KEY: marker}),
-                                                  name, HEAD_SIZE))
+        self.assertTrue(
+            output_rotation_is_folded(
+                SimpleNamespace(**{TURBOQUANT_OUTPUT_ROTATION_CONFIG_KEY: marker}), name, HEAD_SIZE
+            )
+        )
         self.assertFalse(output_rotation_is_folded(SimpleNamespace(), name, HEAD_SIZE))
         for field, value in (("pi_seed", TURBOQUANT_PI_SEED + 1), ("head_size", 2 * HEAD_SIZE), ("format_version", 0)):
             broken = dict(marker, **{field: value})
             with self.assertRaises(ValueError, msg=field):
-                output_rotation_is_folded(SimpleNamespace(**{TURBOQUANT_OUTPUT_ROTATION_CONFIG_KEY: broken}),
-                                          name, HEAD_SIZE)
+                output_rotation_is_folded(
+                    SimpleNamespace(**{TURBOQUANT_OUTPUT_ROTATION_CONFIG_KEY: broken}), name, HEAD_SIZE
+                )
 
 
 class TestDiagnosticCapture(TestBase):
@@ -2181,9 +2214,7 @@ class TestDecodeIndexOperandDevice(TestBase):
         cache_shape = (self.NUM_BLOCKS, DECODE_BLOCK_SIZE, 2, HEAD_SIZE // TURBOQUANT_PACK_FACTOR)
         impl.key_cache = torch.empty(cache_shape, dtype=torch.int8, device=device)
         impl.value_cache = torch.empty(cache_shape, dtype=torch.int8, device=device)
-        impl.scale_cache = torch.empty(
-            self.NUM_BLOCKS, DECODE_BLOCK_SIZE, turboquant_scale_slot(2), device=device
-        )
+        impl.scale_cache = torch.empty(self.NUM_BLOCKS, DECODE_BLOCK_SIZE, turboquant_scale_slot(2), device=device)
         impl._pi_signs = None
         impl.decode_workspace = None
         impl._workspace_floats = {}

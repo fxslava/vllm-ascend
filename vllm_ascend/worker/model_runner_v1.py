@@ -175,7 +175,6 @@ from vllm_ascend.spec_decode.utils import (
 from vllm_ascend.utils import (
     AscendDeviceType,
     calc_split_factor,
-    turboquant_enabled,
     check_gdn_layer,
     embedding_tp_enable,
     enable_sfa_dcp_replicated_indexer,
@@ -190,6 +189,8 @@ from vllm_ascend.utils import (
     oproj_tp_enable,
     set_potential_max_tokens,
     should_skip_allreduce_across_dp_group,
+    turboquant_cache_mode,
+    turboquant_enabled,
 )
 from vllm_ascend.worker.dcp_utils import DCPAsyncSpecDecodeRebuildResult, DCPManager
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
@@ -4170,8 +4171,8 @@ class NPUModelRunner(GPUModelRunner):
                         # tensor the block accounting cannot see.
                         spec = current_kv_cache_spec
                         per_token = [
-                            spec.num_kv_heads * (spec.head_size // spec.pack_factor),
-                            spec.num_kv_heads * (spec.head_size // spec.pack_factor),
+                            spec.num_kv_heads * spec.packed_bytes,
+                            spec.num_kv_heads * spec.packed_bytes,
                             spec.scale_slot_floats * get_dtype_size(torch.float32),
                         ]
                         # Integer arithmetic rather than calc_split_factor's float
@@ -4321,6 +4322,7 @@ class NPUModelRunner(GPUModelRunner):
             head_size_v=spec.head_size_v,
             dtype=spec.dtype,
             kv_quant_mode=KVQuantMode.INT4_PER_TOKEN_HEAD,
+            mode=turboquant_cache_mode(self.cache_config.cache_dtype),
             attention_chunk_size=spec.attention_chunk_size,
             non_causal=spec.non_causal,
         )

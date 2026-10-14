@@ -82,9 +82,9 @@ include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 ascendc_library(vllm_ascend_turboquant SHARED
   ${VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE})
 
-# The Cube kernels only the suite launches: the kv3fp4 / kv5fp8 fused decode and cache write, and the fp8
-# GEMM probe (op_kernel/turboquant_fused_decode.cpp). The root CMakeLists.txt does not set this, so the
-# wheel ships the kv4fp8 kernels alone; those compile identically either way.
+# The Cube kernels only the suite launches: kv5fp8, Lloyd-Max and ablation
+# variants, plus the fp8 GEMM probe (op_kernel/turboquant_fused_decode.cpp).
+# The root build ships kv4fp8 and the pre-rotated kv3fp4 pair.
 #
 # It takes two calls because ascendc_library compiles the source twice. ascendc_compile_definitions reaches
 # the device precompile only -- alone, it builds the kernels and their launchers but not the host-side

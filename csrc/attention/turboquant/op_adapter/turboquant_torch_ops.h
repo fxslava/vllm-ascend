@@ -96,7 +96,8 @@ TORCH_LIBRARY_FRAGMENT(_C_ascend, ops)
         "                                      Tensor! scale_cache, "
         "                                      Tensor slot_mapping, "
         "                                      Tensor pi_signs, "
-        "                                      Tensor codec_tables) -> ()");
+        "                                      Tensor codec_tables, "
+        "                                      Tensor? mode_tables=None, int mode=4) -> ()");
     ops.impl("npu_turboquant_cube_reshape_and_cache", c10::kPrivateUse1,
              &vllm_ascend::npu_turboquant_cube_reshape_and_cache);
 
@@ -117,7 +118,7 @@ TORCH_LIBRARY_FRAGMENT(_C_ascend, ops)
         "                           int num_heads, "
         "                           float scale_value, "
         "                           int output_stage, "
-        "                           Tensor! out) -> ()");
+        "                           Tensor! out, Tensor? mode_tables=None, int mode=4) -> ()");
     ops.impl("npu_turboquant_cube_decode", c10::kPrivateUse1,
              &vllm_ascend::npu_turboquant_cube_decode);
 
