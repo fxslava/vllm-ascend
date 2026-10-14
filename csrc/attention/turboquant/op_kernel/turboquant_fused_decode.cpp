@@ -152,6 +152,16 @@ public:
         StageTokenOut(total - 1);
     }
 
+#if defined(VLLM_ASCEND_TQ_TEST_KERNELS)
+    // Stage-1 diagnostic only: the packed UB image is copied before NZ scatter.
+    // The device never formats or prints it; the test reads debugGm on the host.
+    __aicore__ inline void InitFlatDebug(__gm__ void *debugGm)
+    {
+        flatDebugGm_.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(debugGm));
+        flatDebug_ = true;
+    }
+#endif
+
 private:
     static constexpr uint32_t kSlotRing = 4;
 
@@ -215,15 +225,23 @@ private:
         AscendC::LocalTensor<float> scaleOut = outScale_.template DeQue<float>();
         const int32_t slot = slotRing_[step % kSlotRing];
         if (slot >= 0) {
-            const uint64_t row = static_cast<uint64_t>(slot);
-            if constexpr (kStoresNzTiles<MODE>) {
-                StageNzTiledPlane(keyCacheGm_, packed, row);
-                StageNzTiledPlane(valueCacheGm_, packed[packedPlane_], row);
-            } else {
-                AscendC::DataCopy(keyCacheGm_[row * packedPlane_], packed, packedPlane_);
-                AscendC::DataCopy(valueCacheGm_[row * packedPlane_], packed[packedPlane_], packedPlane_);
+#if defined(VLLM_ASCEND_TQ_TEST_KERNELS)
+            if (flatDebug_) {
+                // This stage deliberately does not execute StageNzTiledPlane.
+                AscendC::DataCopy(flatDebugGm_, packed, 2 * packedPlane_);
+            } else
+#endif
+            {
+                const uint64_t row = static_cast<uint64_t>(slot);
+                if constexpr (kStoresNzTiles<MODE>) {
+                    StageNzTiledPlane(keyCacheGm_, packed, row);
+                    StageNzTiledPlane(valueCacheGm_, packed[packedPlane_], row);
+                } else {
+                    AscendC::DataCopy(keyCacheGm_[row * packedPlane_], packed, packedPlane_);
+                    AscendC::DataCopy(valueCacheGm_[row * packedPlane_], packed[packedPlane_], packedPlane_);
+                }
+                AscendC::DataCopy(scaleCacheGm_[row * scaleSlot_], scaleOut, scaleSlot_);
             }
-            AscendC::DataCopy(scaleCacheGm_[row * scaleSlot_], scaleOut, scaleSlot_);
         }
         outPacked_.FreeTensor(packed);
         outScale_.FreeTensor(scaleOut);
@@ -257,6 +275,10 @@ private:
     AscendC::GlobalTensor<float> piSignsGm_;
     AscendC::GlobalTensor<int32_t> rotTablesGm_;
     AscendC::GlobalTensor<int32_t> modeTablesGm_;
+#if defined(VLLM_ASCEND_TQ_TEST_KERNELS)
+    AscendC::GlobalTensor<int8_t> flatDebugGm_;
+    bool flatDebug_ = false;
+#endif
     AscendC::DataCopyParams nzTileRowParams_;
     int32_t slotRing_[kSlotRing] = {-1, -1, -1, -1};
     uint64_t numSlots_ = 0;
@@ -845,6 +867,20 @@ ASCEND_TQ_DECLARE_MM_MODE(kv3fp4, TurboQuantMode::KV3_FP4)
 ASCEND_TQ_DECLARE_MM_FUSED_DECODE_RAW_QUERY(turboquant_mm_fused_decode_raw_query_kv4fp8_half, TurboQuantMode::KV4_FP8,
                                             half)
 #if defined(VLLM_ASCEND_TQ_TEST_KERNELS)
+// Copies one token's flat encoded key/value planes to GM. No NZ scatter or scale write.
+extern "C" __global__ __aicore__ void turboquant_mm_debug_flat_kv3fp4_half(
+    GM_ADDR key, GM_ADDR value, GM_ADDR keyCache, GM_ADDR valueCache, GM_ADDR scaleCache, GM_ADDR slotMapping,
+    GM_ADDR piSigns, GM_ADDR rotTables, GM_ADDR modeTables, GM_ADDR debugGm, uint32_t numKvHeads,
+    uint32_t headSize, uint32_t blockSize, float invSqrtLen)
+{
+    AscendC::TPipe pipe;
+    TurboQuantModeReshapeAndCache<TurboQuantMode::KV3_FP4, half> op(&pipe);
+    op.Init(key, value, keyCache, valueCache, scaleCache, slotMapping, piSigns, rotTables, modeTables,
+            1, numKvHeads, headSize, blockSize, 1, 1, invSqrtLen);
+    op.InitFlatDebug(debugGm);
+    op.Process();
+}
+
 // The remaining codebook mode is retained for the test library.
 ASCEND_TQ_DECLARE_MM_MODE(kv5fp8, TurboQuantMode::KV5_FP8)
 
@@ -892,6 +928,18 @@ extern "C" __global__ __aicore__ void turboquant_cube_gemm_probe_fp8(
 #undef ASCEND_TQ_DECLARE_MM_RESHAPE_AND_CACHE_CODEBOOK
 
 namespace vllm_ascend {
+
+#if defined(VLLM_ASCEND_TQ_TEST_KERNELS)
+void turboquant_mm_debug_flat_kv3fp4_impl(void *stream, void *key, void *value, void *keyCache,
+                                          void *valueCache, void *scaleCache, void *slotMapping, void *piSigns,
+                                          void *rotTables, void *modeTables, void *debugGm, uint32_t numKvHeads,
+                                          uint32_t headSize, uint32_t blockSize, float invSqrtLen)
+{
+    turboquant_mm_debug_flat_kv3fp4_half<<<1, nullptr, stream>>>(
+        key, value, keyCache, valueCache, scaleCache, slotMapping, piSigns, rotTables, modeTables, debugGm,
+        numKvHeads, headSize, blockSize, invSqrtLen);
+}
+#endif
 
 void turboquant_mm_reshape_and_cache_impl(int32_t mode, AscendType type, void *stream, uint32_t blockDim, void *key,
                                           void *value, void *keyCache, void *valueCache, void *scaleCache,
