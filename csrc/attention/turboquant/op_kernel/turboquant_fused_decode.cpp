@@ -92,9 +92,6 @@ public:
         headPlane_ = numKvHeads_ * headSize_;
         packedPlane_ = numKvHeads_ * packedBytes_;
         scaleSlot_ = ScaleSlotFloats(numKvHeads_);
-        // Consecutive (kv head, group) cells of one tile row are a tile apart.
-        nzTileRowParams_ = AscendC::DataCopyParams{static_cast<uint16_t>(packedPlane_ / kOperandC0), 1, 0,
-                                                   static_cast<uint16_t>(kCubeTileRows - 1)};
 
         keyGm_.SetGlobalBuffer(reinterpret_cast<__gm__ scalar_t *>(key));
         valueGm_.SetGlobalBuffer(reinterpret_cast<__gm__ scalar_t *>(value));
@@ -248,12 +245,17 @@ private:
     }
 
     // Scatters one token's row-major plane into its NZ-tiled cells (turboquant_layout.h,
-    // NzTiledPackedByte) in a single strided burst, so the decode never permutes.
+    // NzTiledPackedByte) in contiguous C0-byte chunks, so the decode never permutes.
     __aicore__ inline void StageNzTiledPlane(AscendC::GlobalTensor<int8_t> &cacheGm,
                                              const AscendC::LocalTensor<int8_t> &plane, const uint64_t slot)
     {
         const uint64_t tileRow = slot % kCubeTileRows;
-        AscendC::DataCopy(cacheGm[(slot - tileRow) * packedPlane_ + tileRow * kOperandC0], plane, nzTileRowParams_);
+        const uint64_t tileBase = (slot - tileRow) * packedPlane_ + tileRow * kOperandC0;
+        const uint32_t chunks = packedPlane_ / kOperandC0;
+        for (uint32_t chunk = 0; chunk < chunks; ++chunk) {
+            const uint64_t columnGroupOffset = static_cast<uint64_t>(chunk) * kCubeTileRows * kOperandC0;
+            AscendC::DataCopy(cacheGm[tileBase + columnGroupOffset], plane[chunk * kOperandC0], kOperandC0);
+        }
     }
 
     AscendC::TPipe *pipe_;
@@ -279,7 +281,6 @@ private:
     AscendC::GlobalTensor<int8_t> flatDebugGm_;
     bool flatDebug_ = false;
 #endif
-    AscendC::DataCopyParams nzTileRowParams_;
     int32_t slotRing_[kSlotRing] = {-1, -1, -1, -1};
     uint64_t numSlots_ = 0;
     uint32_t numTokens_ = 0;
