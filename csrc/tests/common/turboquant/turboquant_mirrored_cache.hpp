@@ -25,6 +25,7 @@
 #include "../../../attention/turboquant/op_kernel/common/turboquant_layout.h"
 #include "../../../attention/turboquant/op_kernel/common/turboquant_mode.h"
 #include "fp8_e4m3.hpp"
+#include "turbo_quant_cpu.h"
 #include "random_data.hpp"
 
 namespace vllm_ascend {
@@ -44,6 +45,8 @@ inline uint8_t Fp8E4m3fnBits(float value) { return fp8::E4m3fnBits(value); }
 inline float Fp8E4m3fnValue(uint8_t bits) { return fp8::E4m3fnValue(bits); }
 
 using MirroredTraits = vllm_ascend::turboquant::TurboQuantModeTraits<vllm_ascend::turboquant::TurboQuantMode::KV4_FP8>;
+using MirroredKv3Traits =
+    vllm_ascend::turboquant::TurboQuantModeTraits<vllm_ascend::turboquant::TurboQuantMode::KV3_FP4>;
 using MirroredLloydMax =
     vllm_ascend::turboquant::TurboQuantLloydMaxTraits<vllm_ascend::turboquant::TurboQuantMode::KV4_FP8>;
 
@@ -128,14 +131,16 @@ inline int8_t MirroredPackedPair(int32_t low_index, int32_t high_index) {
 // vector's second half repeats its first, which is what the fused goldens were recorded on; without it the
 // halves are drawn independently, so a swapped nibble lane changes the data. codebook selects the grid the
 // coordinates are quantised on and must match the decode the cache is handed to.
-inline MirroredKvCache BuildMirroredKvCache(DeterministicRandom& rng, int64_t context_len, int64_t num_blocks,
-                                            int64_t block_size, int64_t num_kv_heads, int64_t head_size,
-                                            const std::vector<int32_t>& block_table, bool mirror_halves = true,
-                                            MirroredCodebook codebook = MirroredCodebook::kUniform) {
+inline MirroredKvCache BuildMirroredKvCache(
+    DeterministicRandom& rng, int64_t context_len, int64_t num_blocks, int64_t block_size, int64_t num_kv_heads,
+    int64_t head_size, const std::vector<int32_t>& block_table, bool mirror_halves = true,
+    MirroredCodebook codebook = MirroredCodebook::kUniform,
+    vllm_ascend::turboquant::TurboQuantMode mode = vllm_ascend::turboquant::TurboQuantMode::KV4_FP8) {
+  const bool kv3 = mode == vllm_ascend::turboquant::TurboQuantMode::KV3_FP4;
   const size_t half = static_cast<size_t>(head_size / 2);
   const size_t head = static_cast<size_t>(head_size);
   const size_t packed_bytes =
-      static_cast<size_t>(head_size * MirroredTraits::kBytesPerGroup / MirroredTraits::kElemsPerGroup);
+      static_cast<size_t>(vllm_ascend::turboquant::TurboQuantModeConfigOf(mode).PackedBytes(head_size));
   const size_t slot_floats = static_cast<size_t>(MirroredScaleSlotFloats(num_kv_heads));
   const size_t kv_heads = static_cast<size_t>(num_kv_heads);
   const size_t slots = static_cast<size_t>(num_blocks * block_size);
@@ -172,7 +177,29 @@ inline MirroredKvCache BuildMirroredKvCache(DeterministicRandom& rng, int64_t co
 
         const size_t row = slot * kv_heads + kv;
         const size_t dense_row = (static_cast<size_t>(t) * kv_heads + kv) * head;
-        const auto index_of = [&](float x) { return MirroredBinOf(codebook, x / scale); };
+        const auto index_of = [&](float x) {
+          if (!kv3) {
+            return MirroredBinOf(codebook, x / scale);
+          }
+          int32_t bin = 0;
+          for (const float threshold : MirroredKv3Traits::kThresholds) {
+            bin += (x / scale > threshold) ? 1 : 0;
+          }
+          return bin;
+        };
+        if (kv3) {
+          std::vector<int32_t> bins(head);
+          for (size_t c = 0; c < head; ++c) {
+            const int32_t bin = index_of(source[mirror_halves ? c % half : c]);
+            bins[c] = bin;
+            dense[dense_row + c] = MirroredKv3Traits::kCentroids[bin] * scale / MirroredKv3Traits::kGain;
+          }
+          const std::vector<int8_t> row_bytes = turboquant_ref::cpu_pack_kv3_bins(bins);
+          for (size_t byte = 0; byte < packed_bytes; ++byte) {
+            packed[MirroredPackedByte(slot, kv, byte, kv_heads, packed_bytes)] = row_bytes[byte];
+          }
+          continue;
+        }
         for (size_t j = 0; j < half; ++j) {
           const int32_t low_index = index_of(source[j]);
           const int32_t high_index = mirror_halves ? low_index : index_of(source[half + j]);

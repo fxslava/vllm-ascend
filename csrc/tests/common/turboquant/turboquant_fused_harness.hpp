@@ -36,18 +36,18 @@ namespace vllm_ascend {
 namespace test {
 namespace turboquant_host {
 
-constexpr vllm_ascend::turboquant::TurboQuantMode kFusedMode = vllm_ascend::turboquant::TurboQuantMode::KV4_FP8;
 constexpr uint32_t kFusedSeed = 0xF05Eu;
 constexpr float kFusedOutputSentinel = -1234.5f;
 
 struct FusedShape {
+  vllm_ascend::turboquant::TurboQuantMode mode = vllm_ascend::turboquant::TurboQuantMode::KV4_FP8;
   int64_t num_heads = 4;
   int64_t num_kv_heads = 2;
   int64_t head_size = 256;
   int64_t block_size = kCubeTileRows;
   int64_t context_len = kCubeTileRows;
   int64_t pool_factor = 4;
-  // Draw independent vector halves and write the cache through the kv4fp8 kernel writer
+  // Draw independent vector halves and write the cache through the selected Cube kernel writer
   // (turboquant_mm_reshape_and_cache_impl) instead of uploading the host-built image.
   bool kernel_writer = false;
   // Decode tokens. Every token reads the same sequence through its own block-table row, with its own query.
@@ -149,7 +149,7 @@ class FusedCubeScenario {
     const std::vector<int32_t> permutation = rng.Permutation(static_cast<int32_t>(num_blocks));
     block_table_.assign(permutation.begin(), permutation.begin() + static_cast<std::ptrdiff_t>(blocks_per_seq_));
     cache_ = BuildMirroredKvCache(rng, shape.context_len, num_blocks, shape.block_size, shape.num_kv_heads, d,
-                                  block_table_, !shape.kernel_writer, codebook());
+                                  block_table_, !shape.kernel_writer, codebook(), shape.mode);
     const size_t query_elems = static_cast<size_t>(shape.batch * shape.num_heads * d);
     const std::vector<float> query = rng.NormalHalfExact(query_elems, 0.0f, 1.0f);
     if (shape.gated) {
@@ -162,7 +162,7 @@ class FusedCubeScenario {
     pi_signs_ = DeviceBuffer::FromHost(PiSigns(d));
     h16_ = DeviceBuffer::FromHost(Hadamard16Half());
     rot_tables_ = DeviceBuffer::FromHost(CodecTables(d, 1));
-    mode_tables_ = DeviceBuffer::FromHost(ModeTables(kFusedMode, d, kUnpackRows, kCubeTileRows, shape.lloyd_max));
+    mode_tables_ = DeviceBuffer::FromHost(ModeTables(shape.mode, d, kUnpackRows, kCubeTileRows, shape.lloyd_max));
     if (shape.kernel_writer) {
       WriteThroughKernel();
     } else {
@@ -203,7 +203,7 @@ class FusedCubeScenario {
     const bool lloyd_max = shape_.lloyd_max;
     return Launch(grid, [&](void* workspace, float inv_sqrt_len) {
       const auto launch = lloyd_max ? &turboquant_mm_fused_decode_lloydmax_impl : &turboquant_mm_fused_decode_impl;
-      launch(static_cast<int32_t>(kFusedMode), AscendType::FP16, stream_, grid.block_dim, query_rot_.get(),
+      launch(static_cast<int32_t>(shape_.mode), AscendType::FP16, stream_, grid.block_dim, query_rot_.get(),
              key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
              mode_tables_.get(), workspace, out_.get(), static_cast<uint32_t>(shape_.batch),
              static_cast<uint32_t>(shape_.num_heads), static_cast<uint32_t>(shape_.num_kv_heads),
@@ -220,15 +220,15 @@ class FusedCubeScenario {
     // There is no Lloyd-Max raw-query entry point, and running the uniform one over a Lloyd-Max cache
     // would decode a plausible wrong answer instead of failing. Report nothing launched; every caller
     // asserts on launches == 1.
-    if (shape_.lloyd_max) {
-      std::printf("[ fused ] the raw-query decode has no Lloyd-Max entry point; not launched\n");
+    if (shape_.lloyd_max || shape_.mode != vllm_ascend::turboquant::TurboQuantMode::KV4_FP8) {
+      std::printf("[ fused ] the raw-query decode requires uniform KV4_FP8; not launched\n");
       return FusedRun{};
     }
     DeviceBuffer rotated = DeviceBuffer::FromHost(std::vector<float>(query_rot_host_.size(), kFusedOutputSentinel));
     void* gate = output_stage == kGatedOutput ? gate_.get() : nullptr;
     FusedRun run = Launch(grid, [&](void* workspace, float inv_sqrt_len) {
       turboquant_mm_fused_decode_raw_query_impl(
-          static_cast<int32_t>(kFusedMode), AscendType::FP16, stream_, grid.block_dim, query_.get(), pi_signs_.get(),
+          static_cast<int32_t>(shape_.mode), AscendType::FP16, stream_, grid.block_dim, query_.get(), pi_signs_.get(),
           rot_tables_.get(), h16_.get(), gate, rotated.get(), key_cache_.get(), value_cache_.get(), scale_plane_.get(),
           block_tables_.get(), context_lens_.get(), mode_tables_.get(), workspace, out_.get(),
           static_cast<uint32_t>(shape_.batch), static_cast<uint32_t>(shape_.num_heads),
@@ -304,7 +304,43 @@ class FusedCubeScenario {
   // caller comparing images across launches has to take its own control rather than use the constructor's.
   WrittenImage CaptureWrittenImage() const { return {written_key_, written_value_, written_scales_}; }
 
-  // Re-runs the kv4fp8 cache writer with slot_mapping handed in `offset_elems` int32s into its allocation,
+  size_t ExpectedPackedPlaneBytes() const { return cache_.key_packed.size(); }
+  size_t ExpectedScalePlaneFloats() const { return cache_.scales.size(); }
+  int64_t PoolSlots() const { return blocks_per_seq_ * shape_.pool_factor * shape_.block_size; }
+
+  // Fill only the inactive suffix of the last mapped block with extreme values.
+  // A correctly masked decode must produce the same half bits as before poisoning.
+  void PoisonInactiveTail() {
+    const int64_t tail = shape_.context_len % shape_.block_size;
+    if (tail == 0) {
+      return;
+    }
+    std::vector<int8_t> key = key_cache_.ToHost<int8_t>();
+    std::vector<int8_t> value = value_cache_.ToHost<int8_t>();
+    std::vector<float> scales = scale_plane_.ToHost<float>();
+    const size_t packed_bytes = static_cast<size_t>(ModePackedBytes(shape_.mode, shape_.head_size));
+    const size_t scale_stride = static_cast<size_t>(MirroredScaleSlotFloats(shape_.num_kv_heads));
+    const int64_t block = block_table_.back();
+    for (int64_t row = tail; row < shape_.block_size; ++row) {
+      const size_t slot = static_cast<size_t>(block * shape_.block_size + row);
+      for (int64_t kv = 0; kv < shape_.num_kv_heads; ++kv) {
+        for (size_t byte = 0; byte < packed_bytes; ++byte) {
+          const size_t offset = MirroredPackedByte(slot, static_cast<size_t>(kv), byte,
+                                                   static_cast<size_t>(shape_.num_kv_heads), packed_bytes);
+          const int8_t poison = row % 2 == 0 ? static_cast<int8_t>(0xff) : static_cast<int8_t>(0x00);
+          key[offset] = poison;
+          value[offset] = poison;
+        }
+        scales[slot * scale_stride + static_cast<size_t>(kv)] = 1.0e4f;
+        scales[slot * scale_stride + static_cast<size_t>(shape_.num_kv_heads + kv)] = 1.0e4f;
+      }
+    }
+    key_cache_ = DeviceBuffer::FromHost(key);
+    value_cache_ = DeviceBuffer::FromHost(value);
+    scale_plane_ = DeviceBuffer::FromHost(scales);
+  }
+
+  // Re-runs the selected Cube cache writer with slot_mapping handed in `offset_elems` int32s into its allocation,
   // which is what a PyTorch sub-slice of a slot-mapping tensor looks like: contiguous, element aligned, and
   // at offset 1, 2 or 3 NOT on a 32-byte burst boundary. The kernel reads slot_mapping only with
   // GlobalTensor::GetValue, one int32 at a time, so nothing about it needs burst alignment -- this is the
@@ -418,16 +454,16 @@ class FusedCubeScenario {
     slot_storage.insert(slot_storage.end(), slots.begin(), slots.end());
     DeviceBuffer slot_mapping = DeviceBuffer::FromHost(slot_storage);
     void* slot_arg = static_cast<void*>(static_cast<int32_t*>(slot_mapping.get()) + slot_offset_elems);
-    DeviceBuffer write_tables = DeviceBuffer::FromHost(ModeTables(kFusedMode, d, 1, 0, shape_.lloyd_max));
+    DeviceBuffer write_tables = DeviceBuffer::FromHost(ModeTables(shape_.mode, d, 1, 0, shape_.lloyd_max));
     key_cache_ = DeviceBuffer::FromHost(std::vector<int8_t>(cache_.key_packed.size(), 0));
     value_cache_ = DeviceBuffer::FromHost(std::vector<int8_t>(cache_.value_packed.size(), 0));
     scale_plane_ = DeviceBuffer::FromHost(std::vector<float>(cache_.scales.size(), 0.0f));
 
     const ReshapeAndCacheGrid grid = PlanReshapeAndCache(tokens, aiv_num_);
     // Same argument list, same layout written; the codebook decides only which thresholds bin a coordinate.
-    const auto write = shape_.lloyd_max ? &turboquant_mm_reshape_and_cache_lloydmax_impl
-                                        : &turboquant_mm_reshape_and_cache_impl;
-    write(static_cast<int32_t>(kFusedMode), AscendType::FP16, stream_, grid.block_dim, key_fp16.get(),
+    const auto write =
+        shape_.lloyd_max ? &turboquant_mm_reshape_and_cache_lloydmax_impl : &turboquant_mm_reshape_and_cache_impl;
+    write(static_cast<int32_t>(shape_.mode), AscendType::FP16, stream_, grid.block_dim, key_fp16.get(),
           value_fp16.get(), key_cache_.get(), value_cache_.get(), scale_plane_.get(), slot_arg, pi_signs_.get(),
           rot_tables_.get(), write_tables.get(), static_cast<uint32_t>(tokens), static_cast<uint32_t>(kv_heads),
           static_cast<uint32_t>(d), static_cast<uint32_t>(block_size),

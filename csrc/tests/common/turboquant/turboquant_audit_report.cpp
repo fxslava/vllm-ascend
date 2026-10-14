@@ -123,6 +123,38 @@ void PrintDouble(double value, int width, int precision) {
   }
 }
 
+constexpr int kModelColumn = 17;
+constexpr int kSeqColumn = 23;
+constexpr int kBatchColumn = 9;
+constexpr int kHeadDimColumn = 11;
+constexpr int kHeadsColumn = 9;
+constexpr int kChunkColumn = 20;
+constexpr int kModeColumn = 7;
+constexpr int kMemoryColumn = 28;
+
+void PrintConfigColumns(const Config& config) {
+  std::printf("  %-*s %*lld %*lld %*lld %*lld %*lld %*lld %-*s", kModelColumn, config.model.label, kSeqColumn,
+              static_cast<long long>(config.seq_len), kBatchColumn, static_cast<long long>(config.batch),
+              kHeadDimColumn, static_cast<long long>(config.model.head_size), kHeadsColumn,
+              static_cast<long long>(config.model.num_heads), kHeadsColumn,
+              static_cast<long long>(config.model.num_kv_heads), kChunkColumn, static_cast<long long>(config.chunk),
+              kModeColumn, AuditModeLabel(config.mode));
+}
+
+void PrintMemoryColumns(const Config& config, const Traffic& traffic) {
+  PrintDouble(FullModelSavedMib(config, traffic), kMemoryColumn, 1);
+  PrintDouble(traffic.fp16_kv_bytes / kMiB, kMemoryColumn, 1);
+  PrintDouble(traffic.tq_kv_bytes / kMiB, kMemoryColumn, 1);
+  PrintRatio(traffic.compression_ratio(), kMemoryColumn);
+}
+
+void PrintMemoryNote() {
+  std::printf(
+      "[ascend-bench]   Full-Model KV Saved (MiB) accounts for checkpoint residency: "
+      "kv_layers x model_kv_heads, including scale planes. Per-Layer footprint reflects "
+      "the single-layer attention working set.\n");
+}
+
 PrefillRow ReadPrefillRow(const std::vector<BenchmarkRunner*>& runners, const Config& config, const Traffic& traffic) {
   PrefillRow row;
   row.ingest = SampleFor(runners, kLegPfIngest, config);
@@ -194,11 +226,13 @@ void PrintTableA(const std::vector<BenchmarkRunner*>& runners, const std::vector
       "against it (ASCEND_BENCH_TQ_AUDIT_CHUNK)\n\n",
       static_cast<long long>(PrefillChunkTokens()));
 
-  char header[512];
-  const int header_width =
-      std::snprintf(header, sizeof(header), "  %-17s %13s %3s %9s %4s | %11s %10s %12s %10s %11s %11s | %8s %10s %12s",
-                    "Model", "Context", "B", "H_Q/H_KV", "D", "TQ Ingest", "T_rot_q", "T_attn_core", "T_rot_o",
-                    "TQ_E2E", "V5_Native", "Speedup", "HBM GB/s", "KV Saved MB");
+  char header[1024];
+  const int header_width = std::snprintf(
+      header, sizeof(header),
+      "  %-17s %23s %9s %11s %9s %9s %20s %-7s | %11s %10s %12s %10s %11s %11s | %8s %10s %28s %28s %28s %28s", "Model",
+      "SeqLen (Context Tokens)", "BatchSize", "HeadDim (D)", "Q_Heads", "KV_Heads", "PrefillChunkTokens", "Mode",
+      "TQ Ingest", "T_rot_q", "T_attn_core", "T_rot_o", "TQ_E2E", "V5_Native", "Speedup", "HBM GB/s",
+      "Full-Model KV Saved (MiB)", "Per-Layer FP16 KV (MiB)", "Per-Layer TQ KV (MiB)", "Per-Layer Savings (x-fold)");
   PrintHeaderAndRule(header, header_width);
 
   bool any = false;
@@ -211,11 +245,8 @@ void PrintTableA(const std::vector<BenchmarkRunner*>& runners, const std::vector
       continue;
     }
     any = true;
-    std::ostringstream heads;
-    heads << config.model.num_heads << '/' << config.model.num_kv_heads;
-    std::printf("  %-17s %13lld %3lld %9s %4lld |", config.model.label, static_cast<long long>(config.seq_len),
-                static_cast<long long>(config.batch), heads.str().c_str(),
-                static_cast<long long>(config.model.head_size));
+    PrintConfigColumns(config);
+    std::printf(" |");
     PrintUs(row.ingest, 11);
     PrintUs(row.rot_q, 10);
     PrintUs(row.attn_core, 12);
@@ -225,7 +256,7 @@ void PrintTableA(const std::vector<BenchmarkRunner*>& runners, const std::vector
     std::printf(" |");
     PrintRatio(row.speedup, 8);
     PrintDouble(row.gigabytes_per_second, 10, 1);
-    PrintDouble(FullModelSavedMib(config, traffic[index]), 12, 1);
+    PrintMemoryColumns(config, traffic[index]);
     std::printf("\n");
 
     if (row.e2e.present && row.sum_of_parts_us > 0.0) {
@@ -247,13 +278,15 @@ void PrintTableA(const std::vector<BenchmarkRunner*>& runners, const std::vector
       "[ascend-bench]   between attention and o_proj -- so its column is a measured kernel.\n");
   std::printf(
       "[ascend-bench]   HBM GB/s is the pipeline's compulsory traffic over its measured composite time.\n"
-      "[ascend-bench]   KV Saved MB is the whole batch's context over the whole model: fp16 residency minus\n"
+      "[ascend-bench]   Full-Model KV Saved (MiB) is the whole batch's context over the whole model: fp16 residency "
+      "minus\n"
       "[ascend-bench]   TurboQuant's for the benchmarked kv head, times KV layers x cached heads per layer\n"
       "[ascend-bench]   (config.json; hybrid linear-attention layers keep no KV, an MLA latent is one slot):\n");
   for (const ModelSpec& model : Models()) {
     std::printf("[ascend-bench]     %-17s %lld KV layers x %lld kv heads\n", model.label,
                 static_cast<long long>(model.kv_layers), static_cast<long long>(model.model_kv_heads));
   }
+  PrintMemoryNote();
   if (!residuals.empty()) {
     std::printf(
         "[ascend-bench]   composite vs sum-of-parts: median gap %.1f%% over %zu rows. That gap is the\n"
@@ -276,15 +309,19 @@ void PrintTableB(const std::vector<BenchmarkRunner*>& runners, const std::vector
   std::printf("[ascend-bench] device time from ACL events, median us per decode step; native operator: %s\n",
               fia_operator.c_str());
   std::printf(
-      "[ascend-bench] one decode token per sequence; B is the batch of sequences; split policy %s\n"
+      "[ascend-bench] one decode token per sequence; BatchSize is the batch of sequences; split policy %s\n"
       "[ascend-bench] (ASCEND_BENCH_TQ_AUDIT_SPLIT); rotation modes %s (%s)\n\n",
       SplitPolicyLabel(SplitPolicy()), RotationModesLabel().c_str(), kRotationModeEnv);
 
-  char header[512];
+  char header[1024];
   const int header_width =
-      std::snprintf(header, sizeof(header), "  %-17s %9s %3s %-11s %-19s | %10s %14s %8s %10s %11s %11s | %8s %10s",
-                    "Model", "Context", "B", "Path", "Cfg [K/Tsk/Blk/Red]", "T_rot_q", "T_FusedDecode", "Launches",
-                    "T_rot_o", "TQ_E2E", "V5_Decode", "Speedup", "Eff GB/s");
+      std::snprintf(header, sizeof(header),
+                    "  %-17s %23s %9s %11s %9s %9s %20s %-7s | %-11s %-19s %10s %14s %8s %10s %11s %11s | %8s %10s "
+                    "%28s %28s %28s %28s",
+                    "Model", "SeqLen (Context Tokens)", "BatchSize", "HeadDim (D)", "Q_Heads", "KV_Heads",
+                    "PrefillChunkTokens", "Mode", "Path", "Cfg [K/Tsk/Blk/Red]", "T_rot_q", "T_FusedDecode", "Launches",
+                    "T_rot_o", "TQ_E2E", "V5_Decode", "Speedup", "Eff GB/s", "Full-Model KV Saved (MiB)",
+                    "Per-Layer FP16 KV (MiB)", "Per-Layer TQ KV (MiB)", "Per-Layer Savings (x-fold)");
   PrintHeaderAndRule(header, header_width);
 
   bool any = false;
@@ -309,8 +346,8 @@ void PrintTableB(const std::vector<BenchmarkRunner*>& runners, const std::vector
         continue;
       }
       any = true;
-      std::printf("  %-17s %9lld %3lld %-11s %-19s |", config.model.label, static_cast<long long>(config.seq_len),
-                  static_cast<long long>(config.batch), config.path_tag(mode).c_str(), model.dispatch.label().c_str());
+      PrintConfigColumns(config);
+      std::printf(" | %-11s %-19s", config.path_tag(mode).c_str(), model.dispatch.label().c_str());
       PrintUs(row.rot_q, 10);
       PrintUs(row.attn_core, 14);
       std::printf(" %8d", config.decode_launches(mode));
@@ -320,6 +357,7 @@ void PrintTableB(const std::vector<BenchmarkRunner*>& runners, const std::vector
       std::printf(" |");
       PrintRatio(row.speedup, 8);
       PrintDouble(row.gigabytes_per_second, 10, 1);
+      PrintMemoryColumns(config, model);
       std::printf("\n");
 
       if (row.e2e.present && row.sum_of_parts_us > 0.0) {
@@ -365,10 +403,12 @@ void PrintTableB(const std::vector<BenchmarkRunner*>& runners, const std::vector
       static_cast<long long>(mix_blocks), static_cast<long long>(aiv_num));
   std::printf(
       "[ascend-bench]   Every model takes the Cube decode, whatever its GQA group or head size;\n"
-      "[ascend-bench]   ASCEND_BENCH_TQ_AUDIT_PATH=aiv forces the vector-only path for an A/B.\n");
+      "[ascend-bench]   ASCEND_BENCH_TQ_AUDIT_PATH=aiv forces the vector-only path for a KV4 A/B.\n"
+      "[ascend-bench]   KV3 uses the Cube path and the separate rotate-q launch.\n");
   std::printf(
       "[ascend-bench]   Eff GB/s is the step's compulsory traffic over its measured composite time.\n"
       "[ascend-bench]   KV compression (fp16 over TurboQuant residency) is in the decode CSV.\n");
+  PrintMemoryNote();
   if (!residuals.empty()) {
     std::printf("[ascend-bench]   composite vs sum-of-parts: median gap %.1f%% over %zu rows.\n",
                 100.0 * MedianResidual(residuals), residuals.size());
@@ -391,12 +431,13 @@ void WritePrefillCsv(const std::vector<BenchmarkRunner*>& runners, const std::ve
     std::printf("[ascend-bench] could not open ASCEND_BENCH_TQ_AUDIT_PREFILL_CSV='%s' for writing\n", path.c_str());
     return;
   }
-  csv << "model,regime,seq_len,chunk_tokens,batch,num_heads,num_kv_heads,head_dim,path,native_operator,"
+  csv << "model,regime,seq_len,chunk_tokens,batch,num_heads,num_kv_heads,head_dim,mode,path,native_operator,"
       << "tq_ingest_us,t_rot_q_us,t_attn_core_us,t_rot_o_us,rot_o_is_structural_zero,"
       << "tq_e2e_us,tq_e2e_sum_of_parts_us,tq_e2e_with_ingest_us,"
       << "v5_native_us,v5_native_ingest_us,net_speedup,net_speedup_with_ingest,"
       << "hbm_gbps,attn_core_gbps,v5_gbps,attn_core_tflops,v5_tflops,"
-      << "fp16_kv_bytes,tq_kv_bytes,kv_saved_mib,compression_ratio,"
+      << "per_layer_fp16_kv_bytes,per_layer_tq_kv_bytes,per_layer_kv_saved_mib,full_model_kv_saved_mib,per_layer_"
+         "savings_x_fold,"
       << "e2e_bytes,attention_flops,untimed_cast_bytes,warmup,iterations,timing_mode\n";
 
   for (size_t index = 0; index < sweep.size(); ++index) {
@@ -406,7 +447,8 @@ void WritePrefillCsv(const std::vector<BenchmarkRunner*>& runners, const std::ve
 
     csv << config.model.key << ',' << config.regime << ',' << config.seq_len << ',' << config.chunk << ','
         << config.batch << ',' << config.model.num_heads << ',' << config.model.num_kv_heads << ','
-        << config.model.head_size << ',' << PathLabel(config.path) << ',' << fia_operator;
+        << config.model.head_size << ',' << AuditModeLabel(config.mode) << ',' << PathLabel(config.path) << ','
+        << fia_operator;
     WriteCell(csv, row.ingest);
     WriteCell(csv, row.rot_q);
     WriteCell(csv, row.attn_core);
@@ -455,8 +497,9 @@ void WritePrefillCsv(const std::vector<BenchmarkRunner*>& runners, const std::ve
       csv << row.native.tflops;
     }
     csv << ',' << model.fp16_kv_bytes << ',' << model.tq_kv_bytes << ',' << model.saved_mib() << ','
-        << model.compression_ratio() << ',' << model.pf_e2e << ',' << model.pf_flops << ',' << model.pf_untimed_cast
-        << ',' << config.budget.warmup << ',' << config.budget.iterations << ',' << row.e2e.mode << '\n';
+        << FullModelSavedMib(config, model) << ',' << model.compression_ratio() << ',' << model.pf_e2e << ','
+        << model.pf_flops << ',' << model.pf_untimed_cast << ',' << config.budget.warmup << ','
+        << config.budget.iterations << ',' << row.e2e.mode << '\n';
   }
   std::printf("[ascend-bench] Table A written to %s\n", path.c_str());
 }
@@ -502,8 +545,8 @@ void WriteDecodeCsvTimings(std::ofstream& csv, const Config& config, const Traff
     csv << row.native.tflops;
   }
   csv << ',' << model.fp16_kv_bytes << ',' << model.tq_kv_bytes << ',' << model.saved_mib() << ','
-      << model.compression_ratio() << ',' << (mode == RotationMode::kSeparate ? model.dec_e2e : model.dec_fused_q_e2e)
-      << ',' << model.dec_flops << ',';
+      << FullModelSavedMib(config, model) << ',' << model.compression_ratio() << ','
+      << (mode == RotationMode::kSeparate ? model.dec_e2e : model.dec_fused_q_e2e) << ',' << model.dec_flops << ',';
   if (row.e2e.present) {
     csv << row.e2e.p95_us;
   }
@@ -524,12 +567,13 @@ void WriteDecodeCsv(const std::vector<BenchmarkRunner*>& runners, const std::vec
     std::printf("[ascend-bench] could not open ASCEND_BENCH_TQ_AUDIT_DECODE_CSV='%s' for writing\n", path.c_str());
     return;
   }
-  csv << "model,regime,seq_len,batch,num_heads,num_kv_heads,head_dim,path,rotation_mode,"
+  csv << "model,regime,seq_len,batch,num_heads,num_kv_heads,head_dim,mode,path,rotation_mode,"
       << "split_k,total_tasks,active_blocks,device_blocks,needs_reduction,native_operator,"
       << "t_rot_q_us,t_fused_decode_us,decode_launches,t_rot_o_us,rot_o_is_structural_zero,"
       << "tq_e2e_us,tq_e2e_sum_of_parts_us,v5_decode_us,net_speedup,"
       << "effective_gbps,attn_core_gbps,v5_gbps,attn_core_tflops,v5_tflops,"
-      << "fp16_kv_bytes,tq_kv_bytes,kv_saved_mib,compression_ratio,"
+      << "per_layer_fp16_kv_bytes,per_layer_tq_kv_bytes,per_layer_kv_saved_mib,full_model_kv_saved_mib,per_layer_"
+         "savings_x_fold,"
       << "e2e_bytes,attention_flops,tq_e2e_p95_us,v5_p95_us,warmup,iterations,timing_mode,split_policy\n";
 
   // One row per (configuration, rotation mode) the sweep decodes in.
@@ -545,9 +589,9 @@ void WriteDecodeCsv(const std::vector<BenchmarkRunner*>& runners, const std::vec
 
       csv << config.model.key << ',' << config.regime << ',' << config.seq_len << ',' << config.batch << ','
           << config.model.num_heads << ',' << config.model.num_kv_heads << ',' << config.model.head_size << ','
-          << PathLabel(config.path) << ',' << RotationModeKey(mode) << ',' << dispatch.split_k << ','
-          << dispatch.total_tasks << ',' << dispatch.active_blocks << ',' << dispatch.device_blocks << ','
-          << (dispatch.needs_reduction ? 1 : 0) << ',' << fia_operator;
+          << AuditModeLabel(config.mode) << ',' << PathLabel(config.path) << ',' << RotationModeKey(mode) << ','
+          << dispatch.split_k << ',' << dispatch.total_tasks << ',' << dispatch.active_blocks << ','
+          << dispatch.device_blocks << ',' << (dispatch.needs_reduction ? 1 : 0) << ',' << fia_operator;
       WriteDecodeCsvTimings(csv, config, model, row, mode);
     }
   }
@@ -574,6 +618,11 @@ void PrintBanner(const std::vector<Config>& sweep, int64_t aiv_num, bool aiv_que
   std::printf("[ascend-bench]\n");
   std::printf("[ascend-bench]   decode: split policy %s (ASCEND_BENCH_TQ_AUDIT_SPLIT), rotation modes %s (%s)\n",
               SplitPolicyLabel(SplitPolicy()), RotationModesLabel().c_str(), kRotationModeEnv);
+  std::printf("[ascend-bench]   KV mode: %s (%s; default kv4fp8)\n", AuditModeLabel(AuditMode()), kAuditModeEnv);
+  if (!AuditModeValid()) {
+    std::printf("[ascend-bench]   %s='%s' is not kv4fp8 or kv3fp4; timing kv4fp8\n", kAuditModeEnv,
+                env::String(kAuditModeEnv).c_str());
+  }
   if (!RotationModeValid()) {
     std::printf("[ascend-bench]   %s='%s' is not separate, fused_prologue or both; timing both\n", kRotationModeEnv,
                 env::String(kRotationModeEnv).c_str());
@@ -625,10 +674,10 @@ void PrintBanner(const std::vector<Config>& sweep, int64_t aiv_num, bool aiv_que
   for (const Config& config : sweep) {
     if (previous_model != config.model.key) {
       previous_model = config.model.key;
-      std::printf("[ascend-bench]     %-17s D=%-4lld H_Q=%-3lld H_KV=%-2lld  %-6s  %s\n", config.model.label,
-                  static_cast<long long>(config.model.head_size), static_cast<long long>(config.model.num_heads),
-                  static_cast<long long>(config.model.num_kv_heads), config.model.folds_output ? "folded" : "UNFOLD",
-                  PathLabel(config.path));
+      std::printf("[ascend-bench]     %-17s HeadDim (D)=%-4lld Q_Heads=%-3lld KV_Heads=%-2lld  %-6s  %s\n",
+                  config.model.label, static_cast<long long>(config.model.head_size),
+                  static_cast<long long>(config.model.num_heads), static_cast<long long>(config.model.num_kv_heads),
+                  config.model.folds_output ? "folded" : "UNFOLD", PathLabel(config.path));
       std::printf("[ascend-bench]       %s\n", config.model.note);
     }
   }

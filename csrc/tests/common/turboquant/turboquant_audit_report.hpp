@@ -18,8 +18,10 @@
 
 // The TurboQuant audit's reporting: the banner, the two ASCII tables and the
 // two CSV exporters of bench_device_950pr_turboquant.cpp. Everything here reads
-// finished BenchmarkRunner results plus the sweep's traffic model
+// finished BenchmarkRunner results plus the sweep's per-layer traffic model
 // (turboquant_audit_scenario.hpp) and changes no output byte.
+// Both tables and CSVs distinguish the benchmarked layer's FP16/TQ KV footprint
+// from Full-Model KV Saved (MiB), extrapolated over checkpoint KV layers and heads.
 
 #include <cstdint>
 #include <string>

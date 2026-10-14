@@ -53,14 +53,45 @@ const std::vector<const char*>& PrefillLegs() {
 }
 
 const std::vector<const char*>& DecodeLegs() {
-  static const std::vector<const char*> legs = {kLegDecRotQ,      kLegDecAttnCore, kLegDecRotO,
-                                                kLegDecE2E,       kLegDecV5,       kLegDecFusedQAttnCore,
-                                                kLegDecFusedQE2E, kLegDecNoUnpack, kLegDecGather,
-                                                kLegDecLloydMax};
+  static const std::vector<const char*> legs = {kLegDecRotQ,   kLegDecAttnCore,       kLegDecRotO,      kLegDecE2E,
+                                                kLegDecV5,     kLegDecFusedQAttnCore, kLegDecFusedQE2E, kLegDecNoUnpack,
+                                                kLegDecGather, kLegDecLloydMax};
   return legs;
 }
 
-std::string CaseName(const char* leg, const Config& config) { return std::string(leg) + "_" + config.id(); }
+vllm_ascend::turboquant::TurboQuantMode AuditMode() {
+  return env::String(kAuditModeEnv) == "kv3fp4" ? vllm_ascend::turboquant::TurboQuantMode::KV3_FP4
+                                                : vllm_ascend::turboquant::TurboQuantMode::KV4_FP8;
+}
+
+bool AuditModeValid() {
+  const std::string value = env::String(kAuditModeEnv);
+  return value.empty() || value == "kv4fp8" || value == "kv3fp4";
+}
+
+const char* AuditModeLabel(vllm_ascend::turboquant::TurboQuantMode mode) {
+  return mode == vllm_ascend::turboquant::TurboQuantMode::KV3_FP4 ? "kv3fp4" : "kv4fp8";
+}
+
+std::string CaseName(const char* leg, const Config& config) {
+  const std::string suffix(leg);
+  if (suffix == "setup" || suffix == "dispatch" || suffix == "fill") {
+    const std::string stage = suffix == "setup" ? "Setup" : (suffix == "dispatch" ? "Dispatch" : "Fill");
+    return "bench_MIXTurboQuant" +
+           std::string(config.mode == vllm_ascend::turboquant::TurboQuantMode::KV3_FP4 ? "3b_" : "4b_") + stage + "_" +
+           config.id();
+  }
+  const bool native = suffix.find("Native") != std::string::npos;
+  const bool vector = suffix.find("Rotate") != std::string::npos ||
+                      (suffix == kLegPfIngest && config.mode == vllm_ascend::turboquant::TurboQuantMode::KV4_FP8);
+  const bool cube = config.path == PathMode::kCube && !vector;
+  const std::string engine = native ? "AIC" : (cube ? "MIX" : "AIV");
+  const std::string codebook = suffix == kLegDecLloydMax ? "Lloyd" : "";
+  const std::string testcase = suffix == kLegDecLloydMax ? "DecodeAttnCore" : suffix;
+  return "bench_" + engine + "TurboQuant" +
+         (config.mode == vllm_ascend::turboquant::TurboQuantMode::KV3_FP4 ? "3b" : "4b") + codebook + "_" + testcase +
+         "_" + config.id();
+}
 
 bool LegEnabled(const char* leg) { return env::Selects("ASCEND_BENCH_TQ_AUDIT_LEGS", leg); }
 bool PhaseEnabled(const char* phase) { return env::Selects("ASCEND_BENCH_TQ_AUDIT_PHASES", phase); }
@@ -124,10 +155,18 @@ std::vector<Config> BuildSweep() {
         }
         Config config;
         config.model = model;
+        config.mode = AuditMode();
+        if (config.mode == vllm_ascend::turboquant::TurboQuantMode::KV3_FP4 &&
+            !vllm_ascend::turboquant::TurboQuantModeConfigOf(config.mode).IsBurstAligned(model.head_size)) {
+          continue;
+        }
         config.seq_len = regime.seq_len;
         config.batch = batch;
         config.chunk = PrefillChunk(regime.seq_len);
         config.path = SelectPath(model);
+        if (config.mode == vllm_ascend::turboquant::TurboQuantMode::KV3_FP4) {
+          config.path = PathMode::kCube;
+        }
         config.budget = BudgetFor(regime.seq_len);
         config.regime = regime.label;
         sweep.push_back(config);
@@ -141,7 +180,7 @@ Traffic ModelTraffic(const Config& config, const DecodeDispatch& dispatch) {
   const double d = static_cast<double>(config.model.head_size);
   const double hq = static_cast<double>(config.model.num_heads);
   const double hkv = static_cast<double>(config.model.num_kv_heads);
-  const double packed_slot = d / static_cast<double>(tqh::kPackFactor);
+  const double packed_slot = static_cast<double>(tqh::ModePackedBytes(config.mode, config.model.head_size));
   const double scale_slot = static_cast<double>(tqh::ScaleSlotFloats(config.model.num_kv_heads)) * kFloatBytes;
   const double context = static_cast<double>(config.context_tokens());
   const double chunk = static_cast<double>(config.chunk_tokens());
@@ -205,7 +244,9 @@ double ScenarioBytes(const Config& config) {
 
   const double contiguous_kv = 4.0 * context * hkv * d * kHalfBytes;
   const double chunk_kv = 2.0 * chunk * hkv * d * kHalfBytes;
-  const double tq_cache = 2.0 * pool_rows * hkv * (d / static_cast<double>(tqh::kPackFactor)) + pool_rows * scale_slot;
+  const double tq_cache =
+      2.0 * pool_rows * hkv * static_cast<double>(tqh::ModePackedBytes(config.mode, config.model.head_size)) +
+      pool_rows * scale_slot;
   const double fp16_cache = 2.0 * pool_rows * hkv * d * kHalfBytes;
   const double prefill_activations = chunk * hq * d * (4.0 * kHalfBytes + 2.0 * kFloatBytes);
   const double decode_activations = static_cast<double>(config.batch) * hq * d * (4.0 * kHalfBytes + 2.0 * kFloatBytes);

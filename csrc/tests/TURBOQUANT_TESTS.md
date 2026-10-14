@@ -64,9 +64,8 @@ csrc/tests/
 │   └── test_sim_turboquant_decode.cpp       test_sim_950pr_* names)
 │
 ├── device/                 TIER 3  ── dispatched by SoC family
-│   ├── ascend950pr/correctness/   test_turboquant.cpp, test_matmul.cpp,
-│   │                              test_rmsnorm.cpp, test_rotary_embedding.cpp,
-│   │                              test_activation_swiglu.cpp,
+│   ├── ascend950pr/correctness/   test_turboquant.cpp,
+│   │                              test_rotary_embedding.cpp,
 │   │                              test_qwen_layer_golden.cpp,
 │   │                              test_benchmark_harness.cpp,
 │   │                              test_cube_hadamard.cpp
@@ -202,7 +201,7 @@ Two consequences to internalise before reading any bound below:
    two-bin slip at the centre of the table would reject a legitimate tie-break
    at its edge.
 2. **Except where the test removes the tie-break.**
-   `PackedCacheIsByteIdenticalOnRotationExactInputs` constructs inputs on which
+   `test_AIVTurboQuant4b_WriteByteExactPreimage` constructs inputs on which
    no rounding difference is possible at all, and then demands byte equality
    with no tolerance. See §7.3.
 
@@ -410,13 +409,13 @@ for producing results:
 
 | # | Case | Purpose | Validation target |
 | --- | --- | --- | --- |
-| 1 | `DeviceIsPhysicalSiliconAndReportsItsTopology` | The case that says "these numbers came from a part". | `aclGetDeviceCapability(ACL_DEVICE_INFO_VECTOR_CORE_NUM)` answers, the count is positive, and `aclrtGetMemInfo(ACL_HBM_MEM, ...)` reports free HBM. The core-count check is an `EXPECT`, not an `ASSERT`: a grid is only a work split, so a wrong count changes how many blocks launch and not what they compute — that should be loud, not fatal. |
-| 2 | `WritePathMatchesTheCpuReferenceAcrossContexts` | The write path at every context in the sweep. | Bin drift `<= 1` and differing channels `<= 2%` per plane, plus worst scale relative error `<= 1e-5`. Bounds are **not** relaxed for the larger shape: nothing about a longer context makes a bin slip more likely, because quantisation is per vector. |
-| 3 | `PackedCacheIsByteIdenticalOnRotationExactInputs` | The strict test the one-bin tolerance has to exist without. | Byte-for-byte `memcmp` equality of every written cache row against the CPU reference, and a scale of exactly `1.0`. No tolerance, no drift count, no statistics. See §7.3. |
-| 4 | `DecodeMatchesTheCpuReferenceAcrossContexts` | The split/combine pipeline at production context lengths, reading back the cache the device itself wrote. | `cos > 0.999`, `relL2 < 5e-3`. |
-| 5 | `CacheGeometryAndAlignmentMatchTheDocumentedLayout` | The memory-layout contract, on the device. | `scale_slot` is a whole 32-byte burst; a token's packed bytes across all kv heads are a whole number of bursts (the claim that makes the scatter one aligned `DataCopy`); the shim and the reference agree; allocation sizes match the production host's arithmetic; **every device base the kernels are handed is 32-byte aligned**; and the fp16-to-4-bit footprint ratio is above 3x, stated in bytes rather than as a ratio to be trusted. |
-| 6 | `WritePathTouchesNoByteOutsideItsSlotMapping` | Addressing, at scale, on real hardware. | Both caches are pre-filled with `0x5A`. Every eighth token is marked `-1`. Afterwards: every byte of every row the mapping does not name still reads `0x5A`, **and** no row the mapping does name is still all-poison — so a kernel that wrote nothing at all cannot pass by leaving the poison intact everywhere. |
-| 7 | `RepeatedDecodeLaunchesAreBitIdentical` | Determinism, at the longest context in the sweep, where the grid uses the most sequence splits and the combine stage has the most partials to reduce. | Eight decode launches from one filled cache, compared on the raw fp16 bit patterns. A difference is a race or an uninitialised workspace, not rounding. This is a regression test for a class of defect that was invisible at one launch. |
+| 1 | `test_AIVTurboQuant_DeviceTopology` | The case that says "these numbers came from a part". | `aclGetDeviceCapability(ACL_DEVICE_INFO_VECTOR_CORE_NUM)` answers, the count is positive, and `aclrtGetMemInfo(ACL_HBM_MEM, ...)` reports free HBM. The core-count check is an `EXPECT`, not an `ASSERT`: a grid is only a work split, so a wrong count changes how many blocks launch and not what they compute — that should be loud, not fatal. |
+| 2 | `test_AIVTurboQuant4b_WriteMatchesCpuRef` | The write path at every context in the sweep. | Bin drift `<= 1` and differing channels `<= 2%` per plane, plus worst scale relative error `<= 1e-5`. Bounds are **not** relaxed for the larger shape: nothing about a longer context makes a bin slip more likely, because quantisation is per vector. |
+| 3 | `test_AIVTurboQuant4b_WriteByteExactPreimage` | The strict test the one-bin tolerance has to exist without. | Byte-for-byte `memcmp` equality of every written cache row against the CPU reference, and a scale of exactly `1.0`. No tolerance, no drift count, no statistics. See §7.3. |
+| 4 | `test_AIVTurboQuant4b_DecodeMatchesCpuRef` | The split/combine pipeline at production context lengths, reading back the cache the device itself wrote. | `cos > 0.999`, `relL2 < 5e-3`. |
+| 5 | `test_AIVTurboQuant4b_CacheLayoutAndAlignment` | The memory-layout contract, on the device. | `scale_slot` is a whole 32-byte burst; a token's packed bytes across all kv heads are a whole number of bursts (the claim that makes the scatter one aligned `DataCopy`); the shim and the reference agree; allocation sizes match the production host's arithmetic; **every device base the kernels are handed is 32-byte aligned**; and the fp16-to-4-bit footprint ratio is above 3x, stated in bytes rather than as a ratio to be trusted. |
+| 6 | `test_AIVTurboQuant4b_WriteIgnoresUnmappedSlots` | Addressing, at scale, on real hardware. | Both caches are pre-filled with `0x5A`. Every eighth token is marked `-1`. Afterwards: every byte of every row the mapping does not name still reads `0x5A`, **and** no row the mapping does name is still all-poison — so a kernel that wrote nothing at all cannot pass by leaving the poison intact everywhere. |
+| 7 | `test_AIVTurboQuant4b_DecodeDeterminism` | Determinism, at the longest context in the sweep, where the grid uses the most sequence splits and the combine stage has the most partials to reduce. | Eight decode launches from one filled cache, compared on the raw fp16 bit patterns. A difference is a race or an uninitialised workspace, not rounding. This is a regression test for a class of defect that was invisible at one launch. |
 
 ### 7.3 How case 3 gets to be bit-exact
 
@@ -442,11 +441,21 @@ and `D = 256` and is stated as such at the construction site.
 
 | Binary | Purpose | Notes |
 | --- | --- | --- |
-| `test_device_950pr_matmul`, `_rmsnorm`, `_rotary_embedding`, `_activation_swiglu` | Stock CANN operators for the four non-attention stages of a Qwen3.5 layer. | No camodel path exists for these at all — the simulator ships no binary kernels for them — so silicon is their first run anywhere. |
+| `test_device_950pr_rotary_embedding` | Stock CANN rotary operator used by a Qwen3.5 layer. | No camodel path exists for this operator. |
 | `test_device_950pr_qwen_layer_golden` | End-to-end parity: nine stages of a real decoder layer against seven intermediate taps plus the final output. | Also carries 13 host-only cases that need no NPU, which check the dump, the loader and the CPU references. Needs `data/golden_layer3`; `QWEN_GOLDEN_LAYER3_DIR` overrides the baked-in path. |
 | `test_device_950pr_benchmark_harness` | The arithmetic a benchmark run does *around* its launches: sample validation, the `ASCEND_BENCH_*` parses, the alignment rules, the checksum comparison. | **Needs no device attached.** It lives in this tier rather than in `host/` because it includes `acl.h` and links `libascendcl.so`, which the host tier's entry criterion forbids. Every failure it covers produced wrong numbers on healthy hardware. |
 
 ### 7.5 `bench_device_950pr_turboquant`
+
+Set `ASCEND_BENCH_TQ_AUDIT_MODE=kv3fp4` to benchmark the existing Cube
+`KV3_FP4` writer and pre-rotated fused decode. The default is `kv4fp8`. KV3
+requires a 32-byte aligned packed row, so the sweep omits model head dimensions
+that fail that condition. Raw-query, no-unpack, gather, and Lloyd-Max decode
+legs remain KV4-only. The `test_MIXTurboQuant3b_*` silicon cases cover packed
+NZ bytes and scales against the CPU reference, decode fidelity, layout, and
+ragged-tail masking. Table A and Table B report per-layer FP16/TQ footprint
+beside full-model KV savings; the latter scales by checkpoint KV layers and
+model KV heads, including scale planes.
 
 This binary is an **end-to-end audit**, not a kernel microbenchmark. It asks one
 question, twice — once for prefill and once for decode:
@@ -525,7 +534,7 @@ column is a measured kernel on the critical path.
 
 Neither side's KV-cache **write** is inside its E2E figure, and both are visible:
 TurboQuant's is Table A's `TQ Ingest / Reshape` column, and the native write
-(`aclnnScatterPaKvCache`) is timed as `pf_v5_ingest` and carried in the prefill
+(`aclnnScatterPaKvCache`) is timed as `PrefillNativeV5Ingest` and carried in the prefill
 CSV alongside a `net_speedup_with_ingest` column that includes both.
 
 #### Why prefill is chunked
@@ -604,24 +613,24 @@ failures when they miss.
 
 | leg | what is timed |
 | --- | --- |
-| `pf_ingest` | the TurboQuant cache write over the chunk — the Cube-native codec on the Cube path, the Lloyd-Max one on the AIV path |
-| `pf_rot_q` | `npu_turboquant_rotate_q` over the chunk's query |
-| `pf_attn_core` | FIA V5 over `(Q~, K~, V~)` |
-| `pf_rot_o` | the O de-rotation — skipped with a reason on a folded layer |
-| `pf_e2e` | the composite: rot-q, core, and rot-o when the layer needs it |
-| `pf_v5` | FIA V5 over `(Q, K, V)`, native uncompressed tensors |
-| `pf_v5_ingest` | `aclnnScatterPaKvCache`, the baseline's own cache write |
-| `dec_rot_q` | `npu_turboquant_rotate_q` over the step's query |
+| `PrefillIngest` | the TurboQuant cache write over the chunk — the Cube-native codec on the Cube path, the Lloyd-Max one on the AIV path |
+| `PrefillRotateQ` | `npu_turboquant_rotate_q` over the chunk's query |
+| `PrefillAttnCore` | FIA V5 over `(Q~, K~, V~)` |
+| `PrefillRotateO` | the O de-rotation — skipped with a reason on a folded layer |
+| `PrefillE2E` | the composite: rot-q, core, and rot-o when the layer needs it |
+| `PrefillNativeV5` | FIA V5 over `(Q, K, V)`, native uncompressed tensors |
+| `PrefillNativeV5Ingest` | `aclnnScatterPaKvCache`, the baseline's own cache write |
+| `DecodeRotateQ` | `npu_turboquant_rotate_q` over the step's query |
 | `dec_split` | `TurboQuantCubeDecodeSplit` — Cube path only; skipped with a reason on the AIV path |
 | `dec_combine` | `TurboQuantPagedAttentionCombine`, on both paths |
-| `dec_attn_core` | split + combine, or the AIV launcher |
-| `dec_rot_o` | the O de-rotation — skipped with a reason on a folded layer |
-| `dec_e2e` | the composite |
-| `dec_v5` | FIA V5 paged decode over the fp16 pool |
+| `DecodeAttnCore` | split + combine, or the AIV launcher |
+| `DecodeRotateO` | the O de-rotation — skipped with a reason on a folded layer |
+| `DecodeE2E` | the composite |
+| `DecodeNativeV5` | FIA V5 paged decode over the fp16 pool |
 
 **Decode legs run before prefill legs, per configuration, and the order is load
-bearing.** `pf_ingest` rewrites the tail of the TurboQuant cache from the chunk's
-own K/V and `pf_v5_ingest` rewrites part of the fp16 pool; running them first
+bearing.** `PrefillIngest` rewrites the tail of the TurboQuant cache from the chunk's
+own K/V and `PrefillNativeV5Ingest` rewrites part of the fp16 pool; running them first
 would leave the decode legs reading a cache the setup phase did not build. Neither
 rewrite changes any latency — both write the same bytes to the same slots every
 launch — but the order keeps the decode measuring a cache whose provenance is the
@@ -701,14 +710,14 @@ one (a folded `T_rot_o`).
 | `H_Q / H_KV` | A | query and kv heads on one NPU at TP=8 |
 | `D` | A | head size |
 | `Path Mode` | B | `Cube` or `AIV`, chosen by `H_Q/H_KV ≥ 16` |
-| `TQ Ingest / Reshape` | A | `pf_ingest`: rotate, quantise and scatter the chunk. **Not inside `TQ_E2E`** |
-| `T_rot_q` | A, B | `pf_rot_q` / `dec_rot_q` |
-| `T_attn_core` | A | `pf_attn_core`: FIA V5 over the rotated basis |
+| `TQ Ingest / Reshape` | A | `PrefillIngest`: rotate, quantise and scatter the chunk. **Not inside `TQ_E2E`** |
+| `T_rot_q` | A, B | `PrefillRotateQ` / `DecodeRotateQ` |
+| `T_attn_core` | A | `PrefillAttnCore`: FIA V5 over the rotated basis |
 | `T_DecodeSplit` | B | `dec_split` on the Cube path; core − combine, marked `~`, on the AIV path |
 | `T_Combine` | B | `dec_combine`, measured directly on both paths |
-| `T_rot_o` | A, B | `pf_rot_o` / `dec_rot_o`; exactly `0.00` on a folded layer |
-| `TQ_E2E` | A, B | `pf_e2e` / `dec_e2e`, **one composite ACL-event region**, not a sum |
-| `V5_Native` / `V5_Decode` | A, B | `pf_v5` / `dec_v5` on native uncompressed tensors |
+| `T_rot_o` | A, B | `PrefillRotateO` / `DecodeRotateO`; exactly `0.00` on a folded layer |
+| `TQ_E2E` | A, B | `PrefillE2E` / `DecodeE2E`, **one composite ACL-event region**, not a sum |
+| `V5_Native` / `V5_Decode` | A, B | `PrefillNativeV5` / `DecodeNativeV5` on native uncompressed tensors |
 | `Net Speedup` | A, B | `V5 / TQ_E2E` |
 | `HBM Bandwidth` / `Effective BW` | A, B | compulsory E2E traffic ÷ measured composite time |
 | `KV Cache Memory Saved` | A | `(fp16 residency − TurboQuant residency)` for `B·S` tokens, MiB |
@@ -1278,7 +1287,7 @@ configurations: host-only, 310P, 950PR device, 950PR sim.
 | `test_sim_950pr_turboquant_ablation` | camodel, B=1, 8/2 heads, head_size 256, block 64, S=256 (one split, 4 tiles), `ASCEND_TQ_ABLATION_HOST_FILL=1`, stages 0–4 in one process | **Pass**, exit 0, 726 s. Every stage returned -- 43 / 143 / 183 / 160 / 197 s -- with the workspace sentinel intact after each, and all 32 exception dumps at 0 bytes after exit. Before the §7.6 fix the same shape hung in stage 4, the AIC spinning on flag 6 and both vector subcores on flag 4. |
 | `test_sim_950pr_turboquant_ablation` | camodel, same shape, cache written on device, stages 4 and 5 in one process | **Pass**, exit 0, 1,843 s. Write 1,400 s. Stage 4 180 s with the workspace sentinel intact; stage 5 230 s with every partial written, output 2048/2048 finite, `cos 0.989226` against the fp32 host attention; all 32 exception dumps at 0 bytes after exit. The first execution anywhere of the shipping kernel's `kFlagSlotFree` path. |
 
-**Not executed:** `RepeatedDecodeLaunchesAreBitIdentical` (nine decode passes is
+**Not executed:** `test_AIVTurboQuant4b_DecodeDeterminism` (nine decode passes is
 hours under the camodel); every case at `S = 512 / 1024 / 2048`; and every
 timing. All wait on silicon, which is what the device tier is for.
 
@@ -1548,7 +1557,7 @@ the full specification — workload, accounting, checks, columns and knobs — i
 | --- | --- |
 | `fp16_decode_s<S>` — `turboquant_fp16_decode`, the Cube decode with the codec removed | It measured the **codec** against a physical fp16 cache nobody would deploy. That is an ablation, not a competitive claim, and a reader seeing `vs fp16` beside `vs fia` in one table has no way to know only the second is a product statement. |
 | `tq4_write_s<S>` / `tq4_decode_s<S>` beside `kv4fp8_*` | The AIV-vs-Cube ratio is a kernel comparison. Since §13.9 it also moved the *quantiser* and the *compute unit* together — Lloyd-Max on one side, affine INT4 on the other — so it had stopped isolating anything. The path is now **chosen** per model by the GQA group (§7.5) and only the chosen one is timed. |
-| `pf_fp16_write` / `pf_fp16_pipeline` | Same reason: a pipeline built on an unquantised write is not what the comparison is against. `aclnnScatterPaKvCache` survives as `pf_v5_ingest`, which is the **native baseline's own** cache write and therefore a real cost on the other side of the ledger. |
+| `pf_fp16_write` / `pf_fp16_pipeline` | Same reason: a pipeline built on an unquantised write is not what the comparison is against. `aclnnScatterPaKvCache` survives as `PrefillNativeV5Ingest`, which is the **native baseline's own** cache write and therefore a real cost on the other side of the ledger. |
 | the 270-shape prefill sweep (`S`×`B`×`D`×`H_Q`×`H_KV`) | A dense cartesian product of head counts produces hundreds of shapes nobody deploys and buries the ones that matter. Replaced by 27 serving ranks across three flagship families at TP=8. |
 | the standalone traffic-model tables | Folded into the two summary tables as the `KV Cache Memory Saved` and `Memory Compression Ratio` columns, and into the CSVs as raw byte counts. |
 
@@ -4110,7 +4119,7 @@ Two changes to the directive's literal formula, both from the planner's own arit
 (default `both`).
 - **`fused_prologue`.** Path `Cube-FusedQ` feeds the raw fp16 query, the Pi signs and `CodecTables(D, 1)` to
   `turboquant_mm_fused_decode_raw_query_impl` over the same grid, and passes `prologue_vectors_per_block`.
-- **New legs.** `dec_fq_attn_core` and `dec_fq_e2e`. T_rot_q is a structural 0.00 ("in-launch").
+- **New legs.** `DecodeFusedQAttnCore` and `DecodeFusedQE2E`. T_rot_q is a structural 0.00 ("in-launch").
   T_FusedDecode includes the rotation. Launches is one fewer than `Cube-Sep`.
 - **Shared with `-Sep`.** T_rot_o, V5 and Cfg.
 - **Delta block.** After the legend, one line per configuration gives TQ_E2E(-FusedQ) - TQ_E2E(-Sep), and the
@@ -4265,16 +4274,16 @@ each `Scenario`, so every buffer the write path and the decode size is derived f
 `shapes950`. `ModelTopologies()` sweeps the target-model set - 32 query heads over 2 and 4 kv heads at
 `head_dim` 128 and 256 - and three tests now run over it:
 
-- `WriteAndDecodeMatchTheCpuReferenceOnTargetModelTopologies` (new) writes and decodes each topology at S = 320
+- `test_AIVTurboQuant4b_EndToEndGqaTopologies` (new) writes and decodes each topology at S = 320
   (three blocks, the last one ragged) against the CPU reference, and asserts the re-derived scale at D = 256 is
   still `shapes950::kAttentionScale` so the sweep and the rest of the suite cannot drift apart.
-- `CacheGeometryAndAlignmentMatchTheDocumentedLayout` checks packed row indexing per topology: a row is
+- `test_AIVTurboQuant4b_CacheLayoutAndAlignment` checks packed row indexing per topology: a row is
   `head_size / 2` bytes (64 at D = 128), the kv heads of a slot are adjacent, the next slot starts one row
   after the last of them, the last row ends exactly on the allocation, a token's rows across all kv heads are
   a whole number of 32-byte bursts, and the scale slot is a whole burst.
-- `WritePathTouchesNoByteOutsideItsSlotMapping` re-runs its unmapped-slot bounds check at every topology.
+- `test_AIVTurboQuant4b_WriteIgnoresUnmappedSlots` re-runs its unmapped-slot bounds check at every topology.
 
-**The poisoned tail: `PoisonedInactiveTailSlotsCannotReachTheSoftmax` (new).** A context that ends mid-block
+**The poisoned tail: `test_AIVTurboQuant4b_TailMaskSuppressesBleed` (new).** A context that ends mid-block
 leaves the rest of that block unwritten, and the AIV decode reads whole 16-row tiles, so those slots *are*
 read; only `MaskTailLanes` (§13.20) keeps them out of the reduction. The test decodes S = 1, 65 and 129 twice
 over the same live context, once with the tail as the write path left it and once with the tail poisoned, and
@@ -4399,16 +4408,16 @@ launch it rather than decode the wrong grid.
 
 **Device benchmark (`ASCEND_BENCH_TQ_UNPACK`).** A fourth expand joins the three:
 
-- `on` -> `dec_attn_core`, the shipping `Adds` expand ("Cube Uniform");
-- `off` -> `dec_nounpack`, the ablation, all-zero output, timing only;
-- `gather` -> `dec_gather`, the UB `Gather` over the *uniform* grid, output bit-identical to `on`;
-- `lloydmax` -> `dec_lloydmax`, the same `Gather` over the codebook ("Cube Lloyd-Max LUT");
+- `on` -> `DecodeAttnCore`, the shipping `Adds` expand ("Cube Uniform");
+- `off` -> `DecodeNoUnpack`, the ablation, all-zero output, timing only;
+- `gather` -> `DecodeGather`, the UB `Gather` over the *uniform* grid, output bit-identical to `on`;
+- `lloydmax` -> `DecodeAttnCoreLloyd`, the same `Gather` over the codebook ("Cube Lloyd-Max LUT");
 - `both` now runs `on` + `off` + `lloydmax`; `all` runs every leg.
 
-`dec_lloydmax` minus `dec_attn_core` is what the codebook costs; `dec_gather` beside them says how much of
+`DecodeAttnCoreLloyd` minus `DecodeAttnCore` is what the codebook costs; `DecodeGather` beside them says how much of
 any delta is the `Gather` rather than the table, since those two differ in 64 B of UB and nothing else. Every
 leg shares one launch shape and one traffic model, so Effective GB/s and the median/p95 per-phase latencies
-are directly comparable. **`dec_lloydmax` is a timing leg only**: it runs against the sweep's shared,
+are directly comparable. **`DecodeAttnCoreLloyd` is a timing leg only**: it runs against the sweep's shared,
 uniformly-written cache, deliberately - a second cache would double the KV allocation at a million tokens of
 context, and holding the data fixed is the cleaner experiment for a quantity that does not depend on what the
 codes mean. Its checksum is compared against the uniform decode's once per configuration and must **differ**
@@ -4482,7 +4491,7 @@ cases pass 8/8. (k) and (l) were then re-run against their pinned goldens
 (`build/lmlut_pin_verify.sh`).
 
 **Not covered.**
-- Nothing has run on silicon. `bench_device_950pr_turboquant` links and the `dec_lloydmax` leg is reachable,
+- Nothing has run on silicon. `bench_device_950pr_turboquant` links and the `DecodeAttnCoreLloyd` leg is reachable,
   but this host has no `/dev/davinci*` and the binary cannot load `libascend_hal.so`. **Every latency claim
   the toggle exists to test is unmeasured**, including whether the `Gather` costs anything at all.
 - The codebook is **test-only**. The wheel builds neither `*_lloydmax_*` entry point

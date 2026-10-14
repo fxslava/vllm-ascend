@@ -38,6 +38,21 @@ constexpr float kPackHigh = kLevels;
 constexpr float kInt8Bias = 128.0f;
 constexpr float kEps = 1e-20f;
 
+// KV3_FP4 stores two low bits per coordinate followed by one high-bit plane.
+// Both planes use the kernel's signed-byte bias before NZ tiling.
+inline std::vector<int8_t> cpu_pack_kv3_bins(const std::vector<int32_t>& bins) {
+  const size_t low_bytes = bins.size() / 4;
+  std::vector<int8_t> packed(low_bytes + bins.size() / 8, static_cast<int8_t>(-128));
+  for (size_t c = 0; c < bins.size(); ++c) {
+    const size_t low = c / 4;
+    const size_t high = low_bytes + c / 8;
+    packed[low] = static_cast<int8_t>(((static_cast<int>(packed[low]) + 128) | ((bins[c] & 3) << (2 * (c % 4)))) - 128);
+    packed[high] =
+        static_cast<int8_t>(((static_cast<int>(packed[high]) + 128) | (((bins[c] >> 2) & 1) << (c % 8))) - 128);
+  }
+  return packed;
+}
+
 constexpr float kLloydMaxCentroids[kLevels] = {
     -2.7325895709951710f, -2.0690172265313920f, -1.6180463860218863f, -1.2562311973471796f,
     -0.9423404564869651f, -0.6567591185324659f, -0.3880482994902919f, -0.1283950298511473f,

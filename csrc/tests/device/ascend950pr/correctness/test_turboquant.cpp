@@ -35,6 +35,8 @@
 #include "test_harness.hpp"
 #include "turbo_quant_cpu.h"
 #include "turboquant/turboquant_launch.hpp"
+#include "turboquant/turboquant_fused_harness.hpp"
+#include "turboquant/turboquant_audit_scenario.hpp"
 
 namespace vllm_ascend {
 namespace test {
@@ -545,7 +547,7 @@ class TurboQuantBareMetal : public ::testing::Test {
 
 }  // namespace
 
-TEST_F(TurboQuantBareMetal, DeviceIsPhysicalSiliconAndReportsItsTopology) {
+TEST_F(TurboQuantBareMetal, test_AIVTurboQuant_DeviceTopology) {
   REQUIRE_PHYSICAL_ASCEND_950PR();
 
   const std::string& soc = AscendTestEnvironment::Instance().soc_name();
@@ -573,7 +575,7 @@ TEST_F(TurboQuantBareMetal, DeviceIsPhysicalSiliconAndReportsItsTopology) {
   }
 }
 
-TEST_F(TurboQuantBareMetal, WritePathMatchesTheCpuReferenceAcrossContexts) {
+TEST_F(TurboQuantBareMetal, test_AIVTurboQuant4b_WriteMatchesCpuRef) {
   REQUIRE_PHYSICAL_ASCEND_950PR();
 
   for (const int context_len : ContextLens()) {
@@ -636,7 +638,7 @@ TEST_F(TurboQuantBareMetal, WritePathMatchesTheCpuReferenceAcrossContexts) {
   }
 }
 
-TEST_F(TurboQuantBareMetal, PackedCacheIsByteIdenticalOnRotationExactInputs) {
+TEST_F(TurboQuantBareMetal, test_AIVTurboQuant4b_WriteByteExactPreimage) {
   REQUIRE_PHYSICAL_ASCEND_950PR();
 
   const Topology topo;
@@ -703,7 +705,7 @@ TEST_F(TurboQuantBareMetal, PackedCacheIsByteIdenticalOnRotationExactInputs) {
   std::fflush(stdout);
 }
 
-TEST_F(TurboQuantBareMetal, DecodeMatchesTheCpuReferenceAcrossContexts) {
+TEST_F(TurboQuantBareMetal, test_AIVTurboQuant4b_DecodeMatchesCpuRef) {
   REQUIRE_PHYSICAL_ASCEND_950PR();
 
   for (const int context_len : ContextLens()) {
@@ -734,7 +736,7 @@ TEST_F(TurboQuantBareMetal, DecodeMatchesTheCpuReferenceAcrossContexts) {
 // Qwen2.5, 64 packed bytes per token per kv head) and at D = 256. Every buffer in the
 // launch is sized from the topology, so a head dim the tiling rounded differently or a
 // group size the decode indexed wrongly lands off the reference here.
-TEST_F(TurboQuantBareMetal, WriteAndDecodeMatchTheCpuReferenceOnTargetModelTopologies) {
+TEST_F(TurboQuantBareMetal, test_AIVTurboQuant4b_EndToEndGqaTopologies) {
   REQUIRE_PHYSICAL_ASCEND_950PR();
 
   // The one topology shapes950 states directly: the sweep's re-derived scale must be the
@@ -783,7 +785,7 @@ TEST_F(TurboQuantBareMetal, WriteAndDecodeMatchTheCpuReferenceOnTargetModelTopol
   }
 }
 
-TEST_F(TurboQuantBareMetal, CacheGeometryAndAlignmentMatchTheDocumentedLayout) {
+TEST_F(TurboQuantBareMetal, test_AIVTurboQuant4b_CacheLayoutAndAlignment) {
   REQUIRE_PHYSICAL_ASCEND_950PR();
 
   constexpr size_t kBurstBytes = 32;
@@ -853,7 +855,7 @@ TEST_F(TurboQuantBareMetal, CacheGeometryAndAlignmentMatchTheDocumentedLayout) {
   }
 }
 
-TEST_F(TurboQuantBareMetal, WritePathTouchesNoByteOutsideItsSlotMapping) {
+TEST_F(TurboQuantBareMetal, test_AIVTurboQuant4b_WriteIgnoresUnmappedSlots) {
   REQUIRE_PHYSICAL_ASCEND_950PR();
 
   constexpr int8_t kPoison = static_cast<int8_t>(0x5A);
@@ -945,7 +947,7 @@ TEST_F(TurboQuantBareMetal, WritePathTouchesNoByteOutsideItsSlotMapping) {
 // pass unless that logit beats every live logit by kTailTeethScoreMargin for every head.
 // Without it a mask that dropped the tail into the reduction at a harmless value would
 // pass this test silently.
-TEST_F(TurboQuantBareMetal, PoisonedInactiveTailSlotsCannotReachTheSoftmax) {
+TEST_F(TurboQuantBareMetal, test_AIVTurboQuant4b_TailMaskSuppressesBleed) {
   REQUIRE_PHYSICAL_ASCEND_950PR();
 
   for (const Topology& topo : TailMaskTopologies()) {
@@ -1076,7 +1078,7 @@ TEST_F(TurboQuantBareMetal, PoisonedInactiveTailSlotsCannotReachTheSoftmax) {
   }
 }
 
-TEST_F(TurboQuantBareMetal, RepeatedDecodeLaunchesAreBitIdentical) {
+TEST_F(TurboQuantBareMetal, test_AIVTurboQuant4b_DecodeDeterminism) {
   REQUIRE_PHYSICAL_ASCEND_950PR();
 
   const std::vector<int> contexts = ContextLens();
@@ -1105,6 +1107,113 @@ TEST_F(TurboQuantBareMetal, RepeatedDecodeLaunchesAreBitIdentical) {
 
   std::printf("  %d decode launches bit-identical over %zu fp16 outputs\n", kRepeats, first.size());
   std::fflush(stdout);
+}
+
+TEST(TurboQuantAuditModel, test_MIXTurboQuant3b_PackedTrafficAndNames) {
+  namespace tqa = turboquant_audit;
+  tqa::Config config;
+  config.model = tqa::Models()[1];  // D = 256, so the KV3 packed row is burst aligned.
+  config.mode = vllm_ascend::turboquant::TurboQuantMode::KV3_FP4;
+  config.seq_len = 128;
+  config.batch = 1;
+  config.chunk = 16;
+  config.path = tqa::PathMode::kCube;
+
+  const tqa::Traffic kv3 = tqa::ModelTraffic(config, tqa::DecodeDispatch{});
+  EXPECT_EQ(tqh::ModePackedBytes(config.mode, config.model.head_size), 96);
+  EXPECT_EQ(tq::cpu_pack_kv3_bins({0, 1, 2, 3, 4, 5, 6, 7}), (std::vector<int8_t>{100, 100, 112}));
+  EXPECT_DOUBLE_EQ(kv3.tq_kv_bytes,
+                   2.0 * config.seq_len * config.model.num_kv_heads * 96 +
+                       config.seq_len * tqh::ScaleSlotFloats(config.model.num_kv_heads) * sizeof(float));
+  EXPECT_EQ(tqa::CaseName(tqa::kLegDecAttnCore, config), "bench_MIXTurboQuant3b_DecodeAttnCore_dsv4_s128_b1");
+  EXPECT_EQ(tqa::CaseName(tqa::kLegPfIngest, config), "bench_MIXTurboQuant3b_PrefillIngest_dsv4_s128_b1");
+
+  tqa::Config kv4_config = config;
+  kv4_config.mode = vllm_ascend::turboquant::TurboQuantMode::KV4_FP8;
+  const tqa::Traffic kv4 = tqa::ModelTraffic(kv4_config, tqa::DecodeDispatch{});
+  EXPECT_LT(kv3.tq_kv_bytes, kv4.tq_kv_bytes);
+  EXPECT_LT(tqa::ScenarioBytes(config), tqa::ScenarioBytes(kv4_config));
+  EXPECT_GT(tqa::FullModelSavedMib(config, kv3), kv3.saved_mib());
+  EXPECT_EQ(tqa::CaseName(tqa::kLegDecLloydMax, kv4_config), "bench_MIXTurboQuant4bLloyd_DecodeAttnCore_dsv4_s128_b1");
+  EXPECT_EQ(tqa::CaseName(tqa::kLegPfIngest, kv4_config), "bench_AIVTurboQuant4b_PrefillIngest_dsv4_s128_b1");
+}
+
+TEST_F(TurboQuantBareMetal, test_MIXTurboQuant3b_WriteMatchesCpuRef) {
+  REQUIRE_PHYSICAL_ASCEND_950PR();
+  tqh::FusedShape shape;
+  shape.mode = vllm_ascend::turboquant::TurboQuantMode::KV3_FP4;
+  shape.kernel_writer = true;
+  shape.context_len = 64;
+  tqh::FusedCubeScenario scenario(shape, Stream(), tqh::VectorCoreNum(nullptr));
+  const tqh::WrittenCacheAgreement agreement = scenario.CompareWrittenCache();
+  EXPECT_GT(agreement.packed_bytes, 0u);
+  EXPECT_EQ(agreement.packed_mismatches, 0u);
+  EXPECT_EQ(agreement.scale_pad_mismatches, 0u);
+  EXPECT_LT(agreement.max_scale_rel_err, 1.0e-4);
+}
+
+TEST_F(TurboQuantBareMetal, test_MIXTurboQuant3b_DecodeMatchesCpuRef) {
+  REQUIRE_PHYSICAL_ASCEND_950PR();
+  tqh::FusedShape shape;
+  shape.mode = vllm_ascend::turboquant::TurboQuantMode::KV3_FP4;
+  shape.kernel_writer = true;
+  shape.context_len = 129;
+  tqh::FusedCubeScenario scenario(shape, Stream(), tqh::VectorCoreNum(nullptr));
+  const tqh::FusedRun run = scenario.RunFused(scenario.Plan());
+  const std::vector<float> reference = scenario.Reference();
+  ASSERT_EQ(run.launches, 1);
+  ASSERT_EQ(run.untouched, 0u);
+  ASSERT_EQ(run.output.size(), reference.size());
+  double error_sq = 0.0;
+  double reference_sq = 0.0;
+  for (size_t i = 0; i < reference.size(); ++i) {
+    const double error = static_cast<double>(run.output[i]) - reference[i];
+    error_sq += error * error;
+    reference_sq += static_cast<double>(reference[i]) * reference[i];
+  }
+  ASSERT_GT(reference_sq, 0.0);
+  EXPECT_GT(tqh::FusedCosine(run.output, reference), 0.99);
+  EXPECT_LT(std::sqrt(error_sq / reference_sq), 0.15);
+}
+
+TEST_F(TurboQuantBareMetal, test_MIXTurboQuant3b_CacheLayoutAndAlignment) {
+  REQUIRE_PHYSICAL_ASCEND_950PR();
+  tqh::FusedShape shape;
+  shape.mode = vllm_ascend::turboquant::TurboQuantMode::KV3_FP4;
+  shape.context_len = 129;
+  tqh::FusedCubeScenario scenario(shape, Stream(), tqh::VectorCoreNum(nullptr));
+  const size_t packed_row = static_cast<size_t>(tqh::ModePackedBytes(shape.mode, shape.head_size));
+  ASSERT_EQ(packed_row, static_cast<size_t>(3 * shape.head_size / 8));
+  EXPECT_EQ(packed_row % 32, 0u);
+  EXPECT_EQ(scenario.ExpectedPackedPlaneBytes(),
+            static_cast<size_t>(scenario.PoolSlots() * shape.num_kv_heads) * packed_row);
+  EXPECT_EQ(scenario.ExpectedScalePlaneFloats(),
+            static_cast<size_t>(scenario.PoolSlots() * tqh::ScaleSlotFloats(shape.num_kv_heads)));
+  const size_t first_head = tqh::MirroredPackedByte(0, 1, 0, shape.num_kv_heads, packed_row);
+  const size_t next_tile = tqh::MirroredPackedByte(tqh::kCubeTileRows, 0, 0, shape.num_kv_heads, packed_row);
+  EXPECT_EQ(first_head, static_cast<size_t>(tqh::kCubeTileRows) * packed_row);
+  EXPECT_EQ(next_tile, static_cast<size_t>(tqh::kCubeTileRows * shape.num_kv_heads) * packed_row);
+}
+
+TEST_F(TurboQuantBareMetal, test_MIXTurboQuant3b_TailMaskSuppressesBleed) {
+  REQUIRE_PHYSICAL_ASCEND_950PR();
+  tqh::FusedShape shape;
+  shape.mode = vllm_ascend::turboquant::TurboQuantMode::KV3_FP4;
+  shape.kernel_writer = true;
+  shape.context_len = 129;
+  tqh::FusedCubeScenario scenario(shape, Stream(), tqh::VectorCoreNum(nullptr));
+  const tqh::FusedDecodeGrid grid = scenario.Plan();
+  const tqh::FusedRun clean = scenario.RunFused(grid);
+  ASSERT_EQ(clean.untouched, 0u);
+  ASSERT_GT(tqh::FusedCosine(clean.output, scenario.Reference()), 0.99);
+  scenario.PoisonInactiveTail();
+  const tqh::FusedRun poisoned = scenario.RunFused(grid);
+  ASSERT_EQ(poisoned.untouched, 0u);
+  ASSERT_EQ(clean.raw.size(), poisoned.raw.size());
+  ASSERT_GT(clean.raw.size(), 0u);
+  for (size_t i = 0; i < clean.raw.size(); ++i) {
+    EXPECT_EQ(clean.raw[i].bits, poisoned.raw[i].bits) << "tail poison reached output element " << i;
+  }
 }
 
 }  // namespace test

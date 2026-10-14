@@ -232,15 +232,15 @@ class Scenario {
 
     const int64_t pool_blocks = config.pool_blocks();
     if (config.path == PathMode::kCube) {
-      key_cache_ = DeviceBuffer::Empty<int8_t>(tqh::ModePackedCacheBytes(kCubeMode, pool_blocks, kBlockSize, hkv, d),
+      key_cache_ = DeviceBuffer::Empty<int8_t>(tqh::ModePackedCacheBytes(config_.mode, pool_blocks, kBlockSize, hkv, d),
                                                kBenchmarkAlignBytes);
-      write_tables_ = DeviceBuffer::FromHost(tqh::ModeTables(kCubeMode, d, 1, 0), kBenchmarkAlignBytes);
-      decode_tables_ = DeviceBuffer::FromHost(tqh::ModeTables(kCubeMode, d, tqh::kUnpackRows, tqh::kCubeTileRows),
+      write_tables_ = DeviceBuffer::FromHost(tqh::ModeTables(config_.mode, d, 1, 0), kBenchmarkAlignBytes);
+      decode_tables_ = DeviceBuffer::FromHost(tqh::ModeTables(config_.mode, d, tqh::kUnpackRows, tqh::kCubeTileRows),
                                               kBenchmarkAlignBytes);
       // The same 16 words, holding the non-uniform codebook instead of the uniform grid. 64 B, allocated
       // whether or not the leg runs, so the two decodes differ in nothing but which buffer they are handed.
       lloydmax_tables_ = DeviceBuffer::FromHost(
-          tqh::ModeTables(kCubeMode, d, tqh::kUnpackRows, tqh::kCubeTileRows, /*lloyd_max=*/true),
+          tqh::ModeTables(config_.mode, d, tqh::kUnpackRows, tqh::kCubeTileRows, /*lloyd_max=*/true),
           kBenchmarkAlignBytes);
       cube_grid_ = tqh::PlanFusedDecode(config.batch, hq, hkv, d, blocks_per_seq, kBlockSize, aiv_num,
                                         tqh::kFusedContextLimit, SplitPolicy());
@@ -339,7 +339,7 @@ class Scenario {
 
   void EnqueueDecodeFusedCube(aclrtStream stream) const {
     turboquant_mm_fused_decode_impl(
-        static_cast<int32_t>(kCubeMode), AscendType::FP16, stream, cube_grid_.block_dim, query_dec_rot_.get(),
+        static_cast<int32_t>(config_.mode), AscendType::FP16, stream, cube_grid_.block_dim, query_dec_rot_.get(),
         key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
         decode_tables_.get(), workspace_.get(), out_dec_tq_.get(), static_cast<uint32_t>(config_.batch),
         static_cast<uint32_t>(config_.model.num_heads), static_cast<uint32_t>(config_.model.num_kv_heads),
@@ -354,7 +354,7 @@ class Scenario {
   // unpack phase to remove, its expand and its dot product are the same instruction stream.
   void EnqueueDecodeNoUnpack(aclrtStream stream) const {
     turboquant_mm_fused_decode_nounpack_impl(
-        static_cast<int32_t>(kCubeMode), AscendType::FP16, stream, cube_grid_.block_dim, query_dec_rot_.get(),
+        static_cast<int32_t>(config_.mode), AscendType::FP16, stream, cube_grid_.block_dim, query_dec_rot_.get(),
         key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
         decode_tables_.get(), workspace_.get(), out_dec_tq_.get(), static_cast<uint32_t>(config_.batch),
         static_cast<uint32_t>(config_.model.num_heads), static_cast<uint32_t>(config_.model.num_kv_heads),
@@ -369,7 +369,7 @@ class Scenario {
   // reason the ablation is -- the AIV paged decode has no separate unpack phase.
   void EnqueueDecodeGather(aclrtStream stream) const {
     turboquant_mm_fused_decode_gather_impl(
-        static_cast<int32_t>(kCubeMode), AscendType::FP16, stream, cube_grid_.block_dim, query_dec_rot_.get(),
+        static_cast<int32_t>(config_.mode), AscendType::FP16, stream, cube_grid_.block_dim, query_dec_rot_.get(),
         key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
         decode_tables_.get(), workspace_.get(), out_dec_tq_.get(), static_cast<uint32_t>(config_.batch),
         static_cast<uint32_t>(config_.model.num_heads), static_cast<uint32_t>(config_.model.num_kv_heads),
@@ -394,7 +394,7 @@ class Scenario {
   // by the matching writer.
   void EnqueueDecodeLloydMax(aclrtStream stream) const {
     turboquant_mm_fused_decode_lloydmax_impl(
-        static_cast<int32_t>(kCubeMode), AscendType::FP16, stream, cube_grid_.block_dim, query_dec_rot_.get(),
+        static_cast<int32_t>(config_.mode), AscendType::FP16, stream, cube_grid_.block_dim, query_dec_rot_.get(),
         key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
         lloydmax_tables_.get(), workspace_.get(), out_dec_tq_.get(), static_cast<uint32_t>(config_.batch),
         static_cast<uint32_t>(config_.model.num_heads), static_cast<uint32_t>(config_.model.num_kv_heads),
@@ -444,7 +444,7 @@ class Scenario {
   // precedes it, and for an unfolded W_o it writes out_dec_tq_ un-rotated, so no rotate_o launch follows.
   void EnqueueDecodeFusedQ(aclrtStream stream) const {
     turboquant_mm_fused_decode_raw_query_impl(
-        static_cast<int32_t>(kCubeMode), AscendType::FP16, stream, cube_grid_.block_dim, query_dec_.get(),
+        static_cast<int32_t>(config_.mode), AscendType::FP16, stream, cube_grid_.block_dim, query_dec_.get(),
         pi_signs_.get(), rot_tables_.get(), h16_.get(), nullptr, query_dec_prologue_rot_.get(), key_cache_.get(),
         value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(), decode_tables_.get(),
         workspace_.get(), out_dec_tq_.get(), static_cast<uint32_t>(config_.batch),
@@ -501,14 +501,14 @@ class Scenario {
     if (config_.decodes_in_mode(RotationMode::kFusedPrologue)) {
       EnqueueDecodeFusedQ(stream);
     }
-    if (config_.path == PathMode::kCube && UnpackAblationEnabled()) {
+    if (config_.mode == tqm::TurboQuantMode::KV4_FP8 && config_.path == PathMode::kCube && UnpackAblationEnabled()) {
       EnqueueDecodeNoUnpack(stream);
     }
-    if (config_.path == PathMode::kCube && UnpackGatherEnabled()) {
+    if (config_.mode == tqm::TurboQuantMode::KV4_FP8 && config_.path == PathMode::kCube && UnpackGatherEnabled()) {
       EnqueueDecodeGather(stream);
       CheckGatherAgainstBaseline(stream);
     }
-    if (config_.path == PathMode::kCube && UnpackLloydMaxEnabled()) {
+    if (config_.mode == tqm::TurboQuantMode::KV4_FP8 && config_.path == PathMode::kCube && UnpackLloydMaxEnabled()) {
       EnqueueDecodeLloydMax(stream);
       CheckLloydMaxAgainstBaseline(stream);
     }
@@ -549,8 +549,6 @@ class Scenario {
   }
 
  private:
-  static constexpr tqm::TurboQuantMode kCubeMode = tqm::TurboQuantMode::KV4_FP8;
-
   // Written by CheckGatherAgainstBaseline and CheckLloydMaxAgainstBaseline, which run from the const Prime.
   mutable double gather_baseline_checksum_ = 0.0;
   mutable double gather_checksum_ = 0.0;
@@ -566,7 +564,7 @@ class Scenario {
     const uint32_t head_size = static_cast<uint32_t>(config_.model.head_size);
     if (config_.path == PathMode::kCube) {
       turboquant_mm_reshape_and_cache_impl(
-          static_cast<int32_t>(kCubeMode), AscendType::FP16, stream, grid.block_dim, key, value, key_cache_.get(),
+          static_cast<int32_t>(config_.mode), AscendType::FP16, stream, grid.block_dim, key, value, key_cache_.get(),
           value_cache_.get(), scale_plane_.get(), slots, pi_signs_.get(), rot_tables_.get(), write_tables_.get(),
           token_count, kv_heads, head_size, static_cast<uint32_t>(kBlockSize),
           static_cast<uint32_t>(config_.pool_blocks()), grid.tokens_per_core, config_.attention_scale());
@@ -887,7 +885,8 @@ void BuildSuite(BenchmarkRunner& primary) {
       fia_operator = scenario->fia_operator();
     }
     std::printf(
-        "\n[ascend-bench] %-17s S=%lld B=%lld D=%lld H_Q=%lld H_KV=%lld | %s path, chunk %lld, "
+        "\n[ascend-bench] %-17s SeqLen (Context Tokens)=%lld BatchSize=%lld HeadDim (D)=%lld Q_Heads=%lld "
+        "KV_Heads=%lld | %s path, PrefillChunkTokens=%lld, "
         "blocks/seq %lld, pool %lld, Cfg [K/Tsk/Blk/Red] %s of %lld blocks | native: %s\n",
         config.model.label, static_cast<long long>(config.seq_len), static_cast<long long>(config.batch),
         static_cast<long long>(config.model.head_size), static_cast<long long>(config.model.num_heads),
@@ -943,7 +942,8 @@ void BuildSuite(BenchmarkRunner& primary) {
       const bool fused_q = config.decodes_in_mode(RotationMode::kFusedPrologue);
       const std::string separate_off = std::string("rotation mode separate is not selected by ") + kRotationModeEnv;
       const std::string fused_q_off =
-          config.path != PathMode::kCube
+          config.mode == tqm::TurboQuantMode::KV3_FP4 ? std::string("the raw-query decode supports kv4fp8 only")
+          : config.path != PathMode::kCube
               ? std::string("the raw-query decode exists on the Cube path only")
               : std::string("rotation mode fused_prologue is not selected by ") + kRotationModeEnv;
 
@@ -951,7 +951,7 @@ void BuildSuite(BenchmarkRunner& primary) {
         run_leg(
             kLegDecRotQ, 0.0, model.dec_rot_q, 1, [sc](aclrtStream s) { sc->EnqueueDecodeRotateQ(s); },
             [sc]() { return sc->DecodeRotatedQueryChecksum(); });
-        if (UnpackStandardEnabled()) {
+        if (UnpackStandardEnabled() || config.mode == tqm::TurboQuantMode::KV3_FP4) {
           run_leg(
               kLegDecAttnCore, model.dec_flops, model.dec_attn_core, 1,
               [sc](aclrtStream s) { sc->EnqueueDecodeAttnCore(s); }, [sc]() { return sc->DecodeTqChecksum(); });
@@ -970,8 +970,8 @@ void BuildSuite(BenchmarkRunner& primary) {
       if (!UnpackAblationEnabled()) {
         runner.Skip(CaseName(kLegDecNoUnpack, config),
                     std::string("the unpack ablation is not selected by ") + kUnpackEnv);
-      } else if (config.path != PathMode::kCube) {
-        runner.Skip(CaseName(kLegDecNoUnpack, config), "the unpack ablation exists on the Cube path only");
+      } else if (config.path != PathMode::kCube || config.mode != tqm::TurboQuantMode::KV4_FP8) {
+        runner.Skip(CaseName(kLegDecNoUnpack, config), "the unpack ablation exists on the KV4 Cube path only");
       } else if (!separate) {
         runner.Skip(CaseName(kLegDecNoUnpack, config), separate_off);
       } else {
@@ -985,8 +985,8 @@ void BuildSuite(BenchmarkRunner& primary) {
       // output is the real one, and the equality against the unablated decode is reported before it runs.
       if (!UnpackGatherEnabled()) {
         runner.Skip(CaseName(kLegDecGather, config), std::string("the gather expand is not selected by ") + kUnpackEnv);
-      } else if (config.path != PathMode::kCube) {
-        runner.Skip(CaseName(kLegDecGather, config), "the gather expand exists on the Cube path only");
+      } else if (config.path != PathMode::kCube || config.mode != tqm::TurboQuantMode::KV4_FP8) {
+        runner.Skip(CaseName(kLegDecGather, config), "the gather expand exists on the KV4 Cube path only");
       } else if (!separate) {
         runner.Skip(CaseName(kLegDecGather, config), separate_off);
       } else {
@@ -1012,8 +1012,8 @@ void BuildSuite(BenchmarkRunner& primary) {
       if (!UnpackLloydMaxEnabled()) {
         runner.Skip(CaseName(kLegDecLloydMax, config),
                     std::string("the Lloyd-Max codebook is not selected by ") + kUnpackEnv);
-      } else if (config.path != PathMode::kCube) {
-        runner.Skip(CaseName(kLegDecLloydMax, config), "the Lloyd-Max expand exists on the Cube path only");
+      } else if (config.path != PathMode::kCube || config.mode != tqm::TurboQuantMode::KV4_FP8) {
+        runner.Skip(CaseName(kLegDecLloydMax, config), "the Lloyd-Max expand exists on the KV4 Cube path only");
       } else if (!separate) {
         runner.Skip(CaseName(kLegDecLloydMax, config), separate_off);
       } else {

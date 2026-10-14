@@ -60,7 +60,7 @@
 #                                          entry.
 #
 # Source FILES carry no part or tier in their name inside a leg directory
-# (device/ascend950pr/correctness/test_matmul.cpp); the binaries and ctest
+# (device/ascend950pr/correctness/test_rotary_embedding.cpp); the binaries and ctest
 # entries keep their historical names, which the documentation and external
 # drivers reference.
 #
@@ -550,7 +550,7 @@ endfunction()
 #   because one failed discovery ends the whole enumeration. `ctest -N` on a
 #   build host becomes useless.
 #
-#   It is not this suite's bug: test_device_950pr_matmul, which links no kernel
+#   It is not this suite's bug: test_device_950pr_rotary_embedding, which links no kernel
 #   library, enumerates fine in the same tree, and the same binaries enumerate
 #   fine in the sim tier where the camodel runtime is present. It is what a
 #   silicon-mode kernel library does when the driver is absent, and the cost of

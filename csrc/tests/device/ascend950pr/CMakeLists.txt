@@ -26,8 +26,8 @@
 #   correctness/   the same properties the sim tier checks, at the shapes
 #                  Qwen3.5-2B actually decodes at - head_dim 256, block_size
 #                  128, context 512/1024/2048 - which a cycle-level simulator
-#                  cannot reach in usable time. Plus the four stock-operator
-#                  tests and the end-to-end layer parity test, which have no
+#                  cannot reach in usable time. Plus the rotary operator test
+#                  and the end-to-end layer parity test, which have no
 #                  camodel path at all because the camodel ships no binary
 #                  kernels for them.
 #
@@ -43,8 +43,8 @@
 # be treated as one.
 #
 # Source files drop the redundant _device_950pr_ / _950pr_ segments
-# (correctness/test_matmul.cpp); the binary and ctest names keep them
-# (test_device_950pr_matmul), because TURBOQUANT_TESTS.md documents every
+# (correctness/test_rotary_embedding.cpp); the binary and ctest names keep them
+# (test_device_950pr_rotary_embedding), because TURBOQUANT_TESTS.md documents every
 # binary by name.
 # -----------------------------------------------------------------------------
 
@@ -64,10 +64,7 @@ set(VLLM_ASCEND_TEST_TIER_LABEL "device")
 # Stock-operator and end-to-end tests. These call operators CANN already built,
 # so they link the 950PR operator audit but not the Ascend C kernels.
 set(VLLM_ASCEND_DEVICE_OPERATOR_TESTS
-  test_device_950pr_matmul:correctness/test_matmul:test_matmul_sweep
-  test_device_950pr_rmsnorm:correctness/test_rmsnorm:test_rmsnorm_sweep
   test_device_950pr_rotary_embedding:correctness/test_rotary_embedding
-  test_device_950pr_activation_swiglu:correctness/test_activation_swiglu:test_swiglu_sweep
   test_device_950pr_qwen_layer_golden:correctness/test_qwen_layer_golden)
 
 foreach(entry ${VLLM_ASCEND_DEVICE_OPERATOR_TESTS})

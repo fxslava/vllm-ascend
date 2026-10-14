@@ -192,33 +192,38 @@ const char* UnpackModeLabel();
 // Legs
 // -----------------------------------------------------------------------------
 
-inline constexpr const char* kLegPfIngest = "pf_ingest";
-inline constexpr const char* kLegPfRotQ = "pf_rot_q";
-inline constexpr const char* kLegPfAttnCore = "pf_attn_core";
-inline constexpr const char* kLegPfRotO = "pf_rot_o";
-inline constexpr const char* kLegPfE2E = "pf_e2e";
-inline constexpr const char* kLegPfV5 = "pf_v5";
-inline constexpr const char* kLegPfV5Ingest = "pf_v5_ingest";
+inline constexpr const char* kLegPfIngest = "PrefillIngest";
+inline constexpr const char* kLegPfRotQ = "PrefillRotateQ";
+inline constexpr const char* kLegPfAttnCore = "PrefillAttnCore";
+inline constexpr const char* kLegPfRotO = "PrefillRotateO";
+inline constexpr const char* kLegPfE2E = "PrefillE2E";
+inline constexpr const char* kLegPfV5 = "PrefillNativeV5";
+inline constexpr const char* kLegPfV5Ingest = "PrefillNativeV5Ingest";
 
-inline constexpr const char* kLegDecRotQ = "dec_rot_q";
-inline constexpr const char* kLegDecAttnCore = "dec_attn_core";
-inline constexpr const char* kLegDecRotO = "dec_rot_o";
-inline constexpr const char* kLegDecE2E = "dec_e2e";
-inline constexpr const char* kLegDecV5 = "dec_v5";
-inline constexpr const char* kLegDecFusedQAttnCore = "dec_fq_attn_core";
-inline constexpr const char* kLegDecFusedQE2E = "dec_fq_e2e";
+inline constexpr const char* kLegDecRotQ = "DecodeRotateQ";
+inline constexpr const char* kLegDecAttnCore = "DecodeAttnCore";
+inline constexpr const char* kLegDecRotO = "DecodeRotateO";
+inline constexpr const char* kLegDecE2E = "DecodeE2E";
+inline constexpr const char* kLegDecV5 = "DecodeNativeV5";
+inline constexpr const char* kLegDecFusedQAttnCore = "DecodeFusedQAttnCore";
+inline constexpr const char* kLegDecFusedQE2E = "DecodeFusedQE2E";
 // The unpack ablation's counterpart to kLegDecAttnCore; see kUnpackEnv.
-inline constexpr const char* kLegDecNoUnpack = "dec_nounpack";
+inline constexpr const char* kLegDecNoUnpack = "DecodeNoUnpack";
 // Option C's counterpart to kLegDecAttnCore: the same decode expanding through a UB Gather.
-inline constexpr const char* kLegDecGather = "dec_gather";
+inline constexpr const char* kLegDecGather = "DecodeGather";
 // The same UB Gather over the non-uniform codebook: Cube Lloyd-Max LUT against kLegDecAttnCore's Cube
 // Uniform. A different 16 levels over the same bits, so where kLegDecGather's checksum must MATCH the
 // unablated decode's, this one's must differ -- and, because the sweep's cache is uniformly written, that
 // is a liveness check on the table and not a fidelity result. Timing leg only; see EnqueueDecodeLloydMax.
-inline constexpr const char* kLegDecLloydMax = "dec_lloydmax";
+inline constexpr const char* kLegDecLloydMax = "DecodeAttnCoreLloyd";
 
 const std::vector<const char*>& PrefillLegs();
 const std::vector<const char*>& DecodeLegs();
+
+inline constexpr const char* kAuditModeEnv = "ASCEND_BENCH_TQ_AUDIT_MODE";
+vllm_ascend::turboquant::TurboQuantMode AuditMode();
+bool AuditModeValid();
+const char* AuditModeLabel(vllm_ascend::turboquant::TurboQuantMode mode);
 
 std::string CaseName(const char* leg, const Config& config);
 
@@ -249,6 +254,7 @@ std::vector<Regime> Regimes();
 
 struct Config {
   ModelSpec model;
+  vllm_ascend::turboquant::TurboQuantMode mode = vllm_ascend::turboquant::TurboQuantMode::KV4_FP8;
   int64_t seq_len = 0;
   int64_t batch = 0;
   int64_t chunk = 0;
@@ -273,7 +279,9 @@ struct Config {
 
   // The raw-query decode entry exists for the Cube decode alone.
   bool decodes_in_mode(RotationMode mode) const {
-    return RotationModeEnabled(mode) && (mode == RotationMode::kSeparate || path == PathMode::kCube);
+    return RotationModeEnabled(mode) &&
+           (mode == RotationMode::kSeparate ||
+            (path == PathMode::kCube && this->mode == vllm_ascend::turboquant::TurboQuantMode::KV4_FP8));
   }
 
   std::string path_tag(RotationMode mode) const {
