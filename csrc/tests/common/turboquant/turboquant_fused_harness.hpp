@@ -326,7 +326,7 @@ class FusedCubeScenario {
       for (int64_t kv = 0; kv < shape_.num_kv_heads; ++kv) {
         for (size_t byte = 0; byte < packed_bytes; ++byte) {
           const size_t offset = MirroredPackedByte(slot, static_cast<size_t>(kv), byte,
-                                                   static_cast<size_t>(shape_.num_kv_heads), packed_bytes);
+                                                   static_cast<size_t>(shape_.num_kv_heads), packed_bytes, shape_.mode);
           const int8_t poison = row % 2 == 0 ? static_cast<int8_t>(0xff) : static_cast<int8_t>(0x00);
           key[offset] = poison;
           value[offset] = poison;

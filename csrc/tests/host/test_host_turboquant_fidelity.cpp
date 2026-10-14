@@ -939,6 +939,49 @@ TEST(TurboQuantNzTiledCache, TilesAreContiguousNzImagesAndTheWriterBurstHitsThem
   }
 }
 
+TEST(TurboQuantMirroredCache, Kv3PackedPlanesUseRowMajorSlots) {
+  namespace tqh = turboquant_host;
+  using vllm_ascend::turboquant::TurboQuantMode;
+  constexpr int64_t kHead = 256;
+  constexpr int64_t kKvHeads = 2;
+  constexpr int64_t kContext = 2;
+  constexpr int64_t kBlock = 128;
+  constexpr int64_t kBlocks = 1;
+  constexpr TurboQuantMode kMode = TurboQuantMode::KV3_FP4;
+  const size_t packed_bytes = static_cast<size_t>(
+      vllm_ascend::turboquant::TurboQuantModeConfigOf(kMode).PackedBytes(kHead));
+  const size_t scale_stride = static_cast<size_t>(tqh::MirroredScaleSlotFloats(kKvHeads));
+  DeterministicRandom rng(0x3B17u);
+  const tqh::MirroredKvCache cache = tqh::BuildMirroredKvCache(
+      rng, kContext, kBlocks, kBlock, kKvHeads, kHead, {0}, false, tqh::MirroredCodebook::kUniform, kMode);
+
+  EXPECT_EQ(tqh::MirroredPackedByte(0, 1, 0, kKvHeads, packed_bytes, kMode), packed_bytes);
+  EXPECT_EQ(tqh::MirroredPackedByte(1, 0, 0, kKvHeads, packed_bytes, kMode), kKvHeads * packed_bytes);
+  for (int64_t token = 0; token < kContext; ++token) {
+    for (int64_t kv = 0; kv < kKvHeads; ++kv) {
+      for (int plane = 0; plane < 2; ++plane) {
+        const std::vector<float>& dense = plane == 0 ? cache.key : cache.value;
+        const std::vector<int8_t>& packed = plane == 0 ? cache.key_packed : cache.value_packed;
+        const size_t row = static_cast<size_t>(token * kKvHeads + kv);
+        const float scale = cache.scales[static_cast<size_t>(token) * scale_stride +
+                                         static_cast<size_t>(plane * kKvHeads + kv)];
+        ASSERT_GT(scale, 0.0f);
+        std::vector<int32_t> bins(static_cast<size_t>(kHead));
+        for (int64_t column = 0; column < kHead; ++column) {
+          const float scaled = dense[row * kHead + static_cast<size_t>(column)] / scale;
+          for (const float threshold : tqh::MirroredKv3Traits::kThresholds) {
+            bins[static_cast<size_t>(column)] += scaled > threshold ? 1 : 0;
+          }
+        }
+        const std::vector<int8_t> expected = tq::cpu_pack_kv3_bins(bins);
+        const size_t offset = row * packed_bytes;
+        ASSERT_LE(offset + expected.size(), packed.size());
+        EXPECT_TRUE(std::equal(expected.begin(), expected.end(), packed.begin() + offset));
+      }
+    }
+  }
+}
+
 TEST(TurboQuantMirroredCache, PackedBytesAndFp8OperandsDescribeTheSameLevels) {
   namespace tqh = turboquant_host;
   // Two tiles per block and two column groups per head, with the context crossing a tile and a block.

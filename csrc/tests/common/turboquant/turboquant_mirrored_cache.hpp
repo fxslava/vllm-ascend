@@ -100,14 +100,19 @@ inline int64_t MirroredScaleSlotFloats(int64_t num_kv_heads) {
   return (2 * num_kv_heads + kMirroredScaleLanes - 1) / kMirroredScaleLanes * kMirroredScaleLanes;
 }
 
-// The byte of packed column `column` of (slot, kv head) in kv4fp8's NZ-tiled cache.
-inline size_t MirroredPackedByte(size_t slot, size_t kv_head, size_t column, size_t num_kv_heads, size_t packed_bytes) {
-  return static_cast<size_t>(
-      vllm_ascend::turboquant::NzTiledPackedByte(slot, kv_head, column, num_kv_heads, packed_bytes));
+// KV4 stores NZ tiles; KV3 stores row-major [slot][kv head][packed byte].
+inline size_t MirroredPackedByte(
+    size_t slot, size_t kv_head, size_t column, size_t num_kv_heads, size_t packed_bytes,
+    vllm_ascend::turboquant::TurboQuantMode mode = vllm_ascend::turboquant::TurboQuantMode::KV4_FP8) {
+  if (mode == vllm_ascend::turboquant::TurboQuantMode::KV4_FP8) {
+    return static_cast<size_t>(
+        vllm_ascend::turboquant::NzTiledPackedByte(slot, kv_head, column, num_kv_heads, packed_bytes));
+  }
+  return slot * num_kv_heads * packed_bytes + kv_head * packed_bytes + column;
 }
 
-// key_packed / value_packed are NZ-tiled like the kernel writer's; key_operands / value_operands, key and
-// value stay row-major, [slot][kv head][column] and [token][kv head][column].
+// key_packed / value_packed follow the mode's cache layout. The operand and dense planes stay row-major:
+// [slot][kv head][column] and [token][kv head][column], respectively.
 struct MirroredKvCache {
   std::vector<int8_t> key_packed;
   std::vector<int8_t> value_packed;
@@ -127,7 +132,7 @@ inline int8_t MirroredPackedPair(int32_t low_index, int32_t high_index) {
   return static_cast<int8_t>(low | (high << kMirroredNibbleBits));
 }
 
-// block_size must be a multiple of kCubeTileRows, as the NZ-tiled cache requires. With mirror_halves every
+// block_size must be a multiple of kCubeTileRows, as the Cube decode requires. With mirror_halves every
 // vector's second half repeats its first, which is what the fused goldens were recorded on; without it the
 // halves are drawn independently, so a swapped nibble lane changes the data. codebook selects the grid the
 // coordinates are quantised on and must match the decode the cache is handed to.
@@ -196,14 +201,15 @@ inline MirroredKvCache BuildMirroredKvCache(
           }
           const std::vector<int8_t> row_bytes = turboquant_ref::cpu_pack_kv3_bins(bins);
           for (size_t byte = 0; byte < packed_bytes; ++byte) {
-            packed[MirroredPackedByte(slot, kv, byte, kv_heads, packed_bytes)] = row_bytes[byte];
+            packed[MirroredPackedByte(slot, kv, byte, kv_heads, packed_bytes, mode)] = row_bytes[byte];
           }
           continue;
         }
         for (size_t j = 0; j < half; ++j) {
           const int32_t low_index = index_of(source[j]);
           const int32_t high_index = mirror_halves ? low_index : index_of(source[half + j]);
-          packed[MirroredPackedByte(slot, kv, j, kv_heads, packed_bytes)] = MirroredPackedPair(low_index, high_index);
+          packed[MirroredPackedByte(slot, kv, j, kv_heads, packed_bytes, mode)] =
+              MirroredPackedPair(low_index, high_index);
           const float low_level = MirroredLevelOf(codebook, low_index);
           const float high_level = MirroredLevelOf(codebook, high_index);
           operands[row * head + j] = static_cast<int8_t>(Fp8E4m3fnBits(low_level));

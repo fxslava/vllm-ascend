@@ -39,17 +39,15 @@ using turboquant::TurboQuantMode;
 constexpr size_t kHeadSize = 256;
 constexpr size_t kPackedBytes = 96;
 constexpr size_t kContextLen = 16;
-// The logical test covers 16 rows; NZ storage still needs the full Cube tile.
+// The logical test covers 16 rows; cache allocation still reserves a full Cube tile.
 constexpr size_t kBlockSize = static_cast<size_t>(tqh::kCubeTileRows);
 constexpr uint32_t kInputSeed = 0x3B17u;
 
-enum class Stage { kFlat, kNz, kScale };
+enum class Stage { kFlat, kCache, kScale };
 
 struct ReferenceImage {
   std::vector<int8_t> flat_key;
   std::vector<int8_t> flat_value;
-  std::vector<int8_t> nz_key;
-  std::vector<int8_t> nz_value;
   std::vector<float> scales;
 };
 
@@ -57,20 +55,15 @@ ReferenceImage BuildReference(const std::vector<float>& key, const std::vector<f
                               size_t kv_heads) {
   const std::vector<int8_t> signs = tq::cpu_pi_sign_vector(static_cast<int>(kHeadSize));
   const size_t plane_bytes = rows * kv_heads * kPackedBytes;
-  const size_t nz_storage_rows = rows == kContextLen ? kBlockSize : rows;
-  const size_t nz_plane_bytes = nz_storage_rows * kv_heads * kPackedBytes;
   ReferenceImage ref;
   ref.flat_key.assign(plane_bytes, 0);
   ref.flat_value.assign(plane_bytes, 0);
-  ref.nz_key.assign(nz_plane_bytes, 0);
-  ref.nz_value.assign(nz_plane_bytes, 0);
   const size_t scale_stride = static_cast<size_t>(tqh::ScaleSlotFloats(kv_heads));
   ref.scales.assign(rows * scale_stride, 0.0f);
 
   for (size_t plane = 0; plane < 2; ++plane) {
     const std::vector<float>& input = plane == 0 ? key : value;
     std::vector<int8_t>& flat = plane == 0 ? ref.flat_key : ref.flat_value;
-    std::vector<int8_t>& nz = plane == 0 ? ref.nz_key : ref.nz_value;
     for (size_t token = 0; token < rows; ++token) {
       for (size_t head = 0; head < kv_heads; ++head) {
         const size_t vector_base = (token * kv_heads + head) * kHeadSize;
@@ -92,11 +85,6 @@ ReferenceImage BuildReference(const std::vector<float>& key, const std::vector<f
         const std::vector<int8_t> encoded = tq::cpu_pack_kv3_bins(bins);
         for (size_t byte = 0; byte < kPackedBytes; ++byte) {
           flat[(token * kv_heads + head) * kPackedBytes + byte] = encoded[byte];
-          if (rows == kContextLen) {
-            const size_t nz_offset =
-                static_cast<size_t>(turboquant::NzTiledPackedByte(token, head, byte, kv_heads, kPackedBytes));
-            nz[nz_offset] = encoded[byte];
-          }
         }
       }
     }
@@ -152,7 +140,7 @@ void RunStage(Stage stage, size_t kv_heads, size_t plane, const char* test_case_
 
   const char* plane_label = plane == 0 ? "KEY" : "VALUE";
   const std::string stage_label = stage == Stage::kFlat ? "STAGE_1_FLAT_" + std::string(plane_label)
-                                  : stage == Stage::kNz ? "STAGE_2_NZ_" + std::string(plane_label)
+                                  : stage == Stage::kCache ? "STAGE_2_CACHE_" + std::string(plane_label)
                                                         : "STAGE_3_SCALE_" + std::string(plane_label);
   size_t mismatches = 0;
   if (stage == Stage::kFlat) {
@@ -160,11 +148,12 @@ void RunStage(Stage stage, size_t kv_heads, size_t plane, const char* test_case_
         dump::DumpPackedStage(test_case_name, stage_label.c_str(), flat_debug_gm,
                               plane == 0 ? expected.flat_key : expected.flat_value, rows, kv_heads, kPackedBytes,
                               false, plane * kv_heads * kPackedBytes);
-  } else if (stage == Stage::kNz) {
+  } else if (stage == Stage::kCache) {
+    // KV3 cache bytes use slot * (kv_heads * packed_bytes) + head * packed_bytes + byte.
     mismatches =
         dump::DumpPackedStage(test_case_name, stage_label.c_str(), plane == 0 ? key_cache : value_cache,
-                              plane == 0 ? expected.nz_key : expected.nz_value, rows, kv_heads, kPackedBytes, true,
-                              0, kBlockSize);
+                              plane == 0 ? expected.flat_key : expected.flat_value, rows, kv_heads, kPackedBytes,
+                              false);
   } else {
     mismatches =
         dump::DumpScaleStage(test_case_name, stage_label.c_str(), scale_cache, expected.scales, rows, kv_heads, plane);
@@ -178,10 +167,10 @@ TEST(TurboQuantKv3Stages, Stage1FlatKeyH1) { RunStage(Stage::kFlat, 1, 0, "Stage
 TEST(TurboQuantKv3Stages, Stage1FlatValueH1) { RunStage(Stage::kFlat, 1, 1, "Stage1FlatValueH1"); }
 TEST(TurboQuantKv3Stages, Stage1FlatKeyH2) { RunStage(Stage::kFlat, 2, 0, "Stage1FlatKeyH2"); }
 TEST(TurboQuantKv3Stages, Stage1FlatValueH2) { RunStage(Stage::kFlat, 2, 1, "Stage1FlatValueH2"); }
-TEST(TurboQuantKv3Stages, Stage2NzKeyH1) { RunStage(Stage::kNz, 1, 0, "Stage2NzKeyH1"); }
-TEST(TurboQuantKv3Stages, Stage2NzValueH1) { RunStage(Stage::kNz, 1, 1, "Stage2NzValueH1"); }
-TEST(TurboQuantKv3Stages, Stage2NzKeyH2) { RunStage(Stage::kNz, 2, 0, "Stage2NzKeyH2"); }
-TEST(TurboQuantKv3Stages, Stage2NzValueH2) { RunStage(Stage::kNz, 2, 1, "Stage2NzValueH2"); }
+TEST(TurboQuantKv3Stages, Stage2CacheWriteKeyH1) { RunStage(Stage::kCache, 1, 0, "Stage2CacheWriteKeyH1"); }
+TEST(TurboQuantKv3Stages, Stage2CacheWriteValueH1) { RunStage(Stage::kCache, 1, 1, "Stage2CacheWriteValueH1"); }
+TEST(TurboQuantKv3Stages, Stage2CacheWriteKeyH2) { RunStage(Stage::kCache, 2, 0, "Stage2CacheWriteKeyH2"); }
+TEST(TurboQuantKv3Stages, Stage2CacheWriteValueH2) { RunStage(Stage::kCache, 2, 1, "Stage2CacheWriteValueH2"); }
 TEST(TurboQuantKv3Stages, Stage3ScaleKeyH1) { RunStage(Stage::kScale, 1, 0, "Stage3ScaleKeyH1"); }
 TEST(TurboQuantKv3Stages, Stage3ScaleValueH1) { RunStage(Stage::kScale, 1, 1, "Stage3ScaleValueH1"); }
 TEST(TurboQuantKv3Stages, Stage3ScaleKeyH2) { RunStage(Stage::kScale, 2, 0, "Stage3ScaleKeyH2"); }

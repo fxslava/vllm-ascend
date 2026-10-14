@@ -1189,9 +1189,12 @@ TEST_F(TurboQuantBareMetal, test_MIXTurboQuant3b_CacheLayoutAndAlignment) {
             static_cast<size_t>(scenario.PoolSlots() * shape.num_kv_heads) * packed_row);
   EXPECT_EQ(scenario.ExpectedScalePlaneFloats(),
             static_cast<size_t>(scenario.PoolSlots() * tqh::ScaleSlotFloats(shape.num_kv_heads)));
-  const size_t first_head = tqh::MirroredPackedByte(0, 1, 0, shape.num_kv_heads, packed_row);
-  const size_t next_tile = tqh::MirroredPackedByte(tqh::kCubeTileRows, 0, 0, shape.num_kv_heads, packed_row);
-  EXPECT_EQ(first_head, static_cast<size_t>(tqh::kCubeTileRows) * packed_row);
+  const size_t first_head = tqh::MirroredPackedByte(0, 1, 0, shape.num_kv_heads, packed_row, shape.mode);
+  const size_t next_row = tqh::MirroredPackedByte(1, 0, 0, shape.num_kv_heads, packed_row, shape.mode);
+  const size_t next_tile =
+      tqh::MirroredPackedByte(tqh::kCubeTileRows, 0, 0, shape.num_kv_heads, packed_row, shape.mode);
+  EXPECT_EQ(first_head, packed_row);
+  EXPECT_EQ(next_row, static_cast<size_t>(shape.num_kv_heads) * packed_row);
   EXPECT_EQ(next_tile, static_cast<size_t>(tqh::kCubeTileRows * shape.num_kv_heads) * packed_row);
 }
 
