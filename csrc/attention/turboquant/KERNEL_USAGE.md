@@ -33,8 +33,11 @@ the benchmark harness.
 
 For KV3, `TurboQuantModeConfig::PackedBytes(D)` is `3 * D / 8` (low two-bit
 plane followed by one-bit plane), matching `TurboQuantModeCodec<KV3_FP4>`.
-The current NZ address calculation requires that byte count to fill 32-byte
-column groups. With the adapter's existing 64 to 256 power-of-two head-size
-range, the preliminary v1 Cube path therefore accepts head size **256** and
-blocks divisible by 64. A 128-wide KV3 head would pack to 48 bytes and is
-rejected rather than read through an overlapping NZ layout.
+The KV3 Cube cache stores each token as a row-major plane of
+`AlignUp(num_kv_heads * PackedBytes(D), 32)` bytes. A 128-wide head packs to
+48 bytes: two heads occupy a 96-byte plane, while one head uses a 64-byte
+plane with 16 bytes of row padding. Cache tensors expose the plane as
+`[num_blocks, block_size, 1, packed_plane]`; head offsets within the row are
+still `kv_head * PackedBytes(D)`. The decoder reads aligned whole-token rows
+from GM and selects heads in UB. Blocks remain divisible by 64. NZ-tiled
+storage is used by the affine KV4-FP8 Cube path.

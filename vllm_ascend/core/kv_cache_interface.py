@@ -12,7 +12,11 @@ from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, Slid
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec, SlidingWindowMLASpec
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
-from vllm_ascend.attention.turboquant_layout import TurboQuantMode, turboquant_packed_bytes
+from vllm_ascend.attention.turboquant_layout import (
+    TurboQuantMode,
+    turboquant_packed_bytes,
+    turboquant_packed_plane_bytes,
+)
 from vllm_ascend.core.single_type_kv_cache_manager import CompressAttentionManager
 
 
@@ -267,7 +271,11 @@ class AscendTurboQuantAttentionSpec(FullAttentionSpec):
     @property
     def payload_bytes(self) -> int:
         """Bytes of packed key and value in one page."""
-        return 2 * self.block_size * self.num_kv_heads * self.packed_bytes
+        return (
+            2
+            * self.block_size
+            * turboquant_packed_plane_bytes(self.head_size, self.num_kv_heads, TurboQuantMode(self.mode))
+        )
 
     @property
     def scale_plane_bytes(self) -> int:

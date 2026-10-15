@@ -556,7 +556,7 @@ def arena_report(args: argparse.Namespace, contexts: tuple[int, ...], tasks: tup
             cache_mode=args.cache_mode,
         )
         dense_mb = dense_equivalent_bytes(geometry, _DTYPES[args.dtype]) / (1024 * 1024)
-        packed_bytes_per_token = 2 * shape.num_kv_heads * geometry.packed_bytes + 4 * geometry.scale_slot
+        packed_bytes_per_token = 2 * geometry.packed_plane_bytes + 4 * geometry.scale_slot
         packed_mb = (
             geometry.num_layers * geometry.num_blocks * geometry.block_size * packed_bytes_per_token / (1024 * 1024)
         )
@@ -689,7 +689,10 @@ def completed_indices(path: Path, tasks: Sequence[str]) -> tuple[dict[tuple, set
                 foreign += 1
                 continue
             key = rung_key(
-                record.get("backend"), record.get("sink_tokens"), record.get("context_requested"), task,
+                record.get("backend"),
+                record.get("sink_tokens"),
+                record.get("context_requested"),
+                task,
                 record.get("cache_mode", "kv4fp8"),
             )
             done.setdefault(key, set()).add(index)

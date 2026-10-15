@@ -261,6 +261,10 @@ class AscendTurboQuantAttentionBackend(AscendAttentionBackend):
         cache_dtype_str: str = "",
     ) -> tuple[int, ...]:
         mode = TurboQuantMode(turboquant_cache_mode(cache_dtype_str))
+        if mode == TurboQuantMode.KV3_FP4:
+            from vllm_ascend.attention.turboquant_layout import turboquant_packed_plane_bytes
+
+            return (2, num_blocks, block_size, 1, turboquant_packed_plane_bytes(head_size, num_kv_heads, mode))
         return (2, num_blocks, block_size, num_kv_heads, turboquant_packed_bytes(head_size, mode))
 
     @staticmethod
@@ -448,7 +452,8 @@ class AscendTurboQuantAttentionBackendImpl(AscendAttentionBackendImpl):
         if self.scale_cache is not None:
             return
 
-        num_blocks, block_size, num_kv_heads, _ = kv_cache[0].shape
+        num_blocks, block_size = kv_cache[0].shape[:2]
+        num_kv_heads = self.num_kv_heads
         if self.cube_decode and block_size % TURBOQUANT_CUBE_TILE_ROWS != 0:
             raise ValueError(
                 f"[vllm-ascend/turboquant] the Cube decode reads {TURBOQUANT_CUBE_TILE_ROWS}-row tiles, so the "

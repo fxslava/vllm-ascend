@@ -549,6 +549,29 @@ TEST_F(TurboQuantFusedDecode, DecodesHeadSize128OnAQwenGroup) {
   ExpectNoExceptionDumps(kCaseF.tag);
 }
 
+TEST_F(TurboQuantFusedDecode, Kv3D128WritesAndDecodesAlignedAndPaddedPlanes) {
+  for (const int64_t kv_heads : {2, 1}) {
+    tqh::FusedShape shape;
+    shape.mode = vllm_ascend::turboquant::TurboQuantMode::KV3_FP4;
+    shape.head_size = 128;
+    shape.num_kv_heads = kv_heads;
+    shape.kernel_writer = true;
+    shape.context_len = 64;
+    watchdog_.Arm("KV3 D128 cache write and query rotation");
+    tqh::FusedCubeScenario scenario(shape, stream_, aiv_num_);
+    watchdog_.Disarm();
+    const tqh::WrittenCacheAgreement written = scenario.CompareWrittenCache();
+    EXPECT_EQ(written.packed_mismatches, 0u);
+    EXPECT_EQ(written.scale_pad_mismatches, 0u);
+    watchdog_.Arm("KV3 D128 fused decode");
+    const tqh::FusedRun fused = scenario.RunFused(scenario.Plan());
+    watchdog_.Disarm();
+    EXPECT_EQ(fused.untouched, 0u);
+    EXPECT_GT(tqh::FusedCosine(fused.output, scenario.Reference()), 0.99);
+    ExpectNoExceptionDumps("KV3 D128");
+  }
+}
+
 TEST_F(TurboQuantFusedDecode, RotatesARawQueryOnceAheadOfItsSplits) {
   PrintShape(kCaseG, aiv_num_, queried_);
   watchdog_.Arm("(g) scenario setup and query rotation");

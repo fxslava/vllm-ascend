@@ -108,7 +108,8 @@ inline size_t MirroredPackedByte(
     return static_cast<size_t>(
         vllm_ascend::turboquant::NzTiledPackedByte(slot, kv_head, column, num_kv_heads, packed_bytes));
   }
-  return slot * num_kv_heads * packed_bytes + kv_head * packed_bytes + column;
+  const size_t plane = (num_kv_heads * packed_bytes + 31) / 32 * 32;
+  return slot * plane + kv_head * packed_bytes + column;
 }
 
 // key_packed / value_packed follow the mode's cache layout. The operand and dense planes stay row-major:
@@ -154,7 +155,9 @@ inline MirroredKvCache BuildMirroredKvCache(
       static_cast<int8_t>(Fp8E4m3fnBits(MirroredLevelOf(codebook, kMirroredNibbleSignShift)));
 
   MirroredKvCache cache;
-  cache.key_packed.assign(slots * kv_heads * packed_bytes, 0);
+  const size_t packed_plane = static_cast<size_t>(
+      vllm_ascend::turboquant::TurboQuantModeConfigOf(mode).PackedPlaneBytes(head_size, num_kv_heads));
+  cache.key_packed.assign(slots * packed_plane, 0);
   cache.value_packed.assign(cache.key_packed.size(), 0);
   cache.key_operands.assign(slots * kv_heads * head, zero_byte_operand);
   cache.value_operands.assign(cache.key_operands.size(), zero_byte_operand);

@@ -1198,6 +1198,39 @@ TEST_F(TurboQuantBareMetal, test_MIXTurboQuant3b_CacheLayoutAndAlignment) {
   EXPECT_EQ(next_tile, static_cast<size_t>(tqh::kCubeTileRows * shape.num_kv_heads) * packed_row);
 }
 
+TEST_F(TurboQuantBareMetal, test_MIXTurboQuant3b_D128EvenHeadsWriteAndDecode) {
+  REQUIRE_PHYSICAL_ASCEND_950PR();
+  tqh::FusedShape shape;
+  shape.mode = vllm_ascend::turboquant::TurboQuantMode::KV3_FP4;
+  shape.head_size = 128;
+  shape.num_kv_heads = 2;
+  shape.kernel_writer = true;
+  shape.context_len = 65;
+  tqh::FusedCubeScenario scenario(shape, Stream(), tqh::VectorCoreNum(nullptr));
+  const tqh::WrittenCacheAgreement agreement = scenario.CompareWrittenCache();
+  EXPECT_EQ(agreement.packed_mismatches, 0u);
+  const tqh::FusedRun run = scenario.RunFused(scenario.Plan());
+  const std::vector<float> reference = scenario.Reference();
+  EXPECT_GT(tqh::FusedCosine(run.output, reference), 0.99);
+}
+
+TEST_F(TurboQuantBareMetal, test_MIXTurboQuant3b_D128OddHeadPaddedWriteAndDecode) {
+  REQUIRE_PHYSICAL_ASCEND_950PR();
+  tqh::FusedShape shape;
+  shape.mode = vllm_ascend::turboquant::TurboQuantMode::KV3_FP4;
+  shape.head_size = 128;
+  shape.num_kv_heads = 1;
+  shape.kernel_writer = true;
+  shape.context_len = 65;
+  tqh::FusedCubeScenario scenario(shape, Stream(), tqh::VectorCoreNum(nullptr));
+  EXPECT_EQ(scenario.ExpectedPackedPlaneBytes(), static_cast<size_t>(scenario.PoolSlots() * 64));
+  const tqh::WrittenCacheAgreement agreement = scenario.CompareWrittenCache();
+  EXPECT_EQ(agreement.packed_mismatches, 0u);
+  const tqh::FusedRun run = scenario.RunFused(scenario.Plan());
+  const std::vector<float> reference = scenario.Reference();
+  EXPECT_GT(tqh::FusedCosine(run.output, reference), 0.99);
+}
+
 TEST_F(TurboQuantBareMetal, test_MIXTurboQuant3b_TailMaskSuppressesBleed) {
   REQUIRE_PHYSICAL_ASCEND_950PR();
   tqh::FusedShape shape;

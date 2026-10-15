@@ -102,6 +102,10 @@ class CacheGeometry:
         return turboquant_layout().turboquant_packed_bytes(self.head_size, self.mode)
 
     @property
+    def packed_plane_bytes(self) -> int:
+        return turboquant_layout().turboquant_packed_plane_bytes(self.head_size, self.num_kv_heads, self.mode)
+
+    @property
     def num_blocks(self) -> int:
         """Blocks reserved for the one sequence, rounded up to cover ``max_seq_len``."""
         return -(-self.max_seq_len // self.block_size)
@@ -125,11 +129,13 @@ class CacheGeometry:
                 f"the Cube decode reads {tile}-row tiles, so block_size must be a multiple of {tile}, "
                 f"got {self.block_size}. Use --backend turboquant_aiv to decode this cache on the vector path."
             )
-        if self.packed_bytes % turboquant_layout().TURBOQUANT_CUBE_COLUMN_BYTES:
+        if self.packed_plane_bytes % turboquant_layout().TURBOQUANT_CUBE_COLUMN_BYTES:
             raise ValueError(
-                f"{self.cache_mode} Cube cache needs packed bytes per head divisible by "
-                f"{turboquant_layout().TURBOQUANT_CUBE_COLUMN_BYTES}, got {self.packed_bytes}"
+                f"{self.cache_mode} Cube cache needs packed plane divisible by "
+                f"{turboquant_layout().TURBOQUANT_CUBE_COLUMN_BYTES}, got {self.packed_plane_bytes}"
             )
+        if self.cache_mode == "kv3fp4" and self.packed_bytes % 16:
+            raise ValueError("kv3fp4 Cube cache needs packed bytes per head divisible by 16")
 
 
 class StaticKVCache(abc.ABC):
@@ -246,8 +252,9 @@ class TurboQuantKVCache(StaticKVCache):
     Three planes per layer, shaped as ``AscendTurboQuantAttentionBackend``
     budgets them:
 
-    * ``key`` / ``value``: ``(num_blocks, block_size, num_kv_heads, packed_bytes)``
-      int8, NZ-tiled for KV4_FP8 and row-major for KV3_FP4;
+    * ``key`` / ``value``: int8, ``(num_blocks, block_size, num_kv_heads, packed_bytes)``
+      and NZ-tiled for KV4_FP8; ``(num_blocks, block_size, 1, packed_plane_bytes)``
+      and row-major for KV3_FP4;
     * ``scale``: ``(num_blocks, block_size, scale_slot)`` fp32, token-major --
       a token's K scales for every kv head, then its V scales, padded to a whole
       32-byte burst so the kernel scatters them with one aligned copy.
@@ -268,8 +275,8 @@ class TurboQuantKVCache(StaticKVCache):
         packed_shape = (
             self.geometry.num_blocks,
             self.geometry.block_size,
-            self.geometry.num_kv_heads,
-            self.geometry.packed_bytes,
+            1 if self.geometry.cache_mode == "kv3fp4" else self.geometry.num_kv_heads,
+            self.geometry.packed_plane_bytes if self.geometry.cache_mode == "kv3fp4" else self.geometry.packed_bytes,
         )
         scale_shape = (self.geometry.num_blocks, self.geometry.block_size, self.geometry.scale_slot)
         layers = range(self.geometry.num_layers)

@@ -49,7 +49,7 @@ constexpr float kVectorNegInf = -3.4028235e38f;
 // per descriptor. Three layouts:
 //   one kv head          one contiguous tileRows * packedBytes read
 //   packedBytes >= 128   one head's packedBytes per row, strided over the other heads
-//   packedBytes <  128   the whole row plane into a UB bank, then a UB -> UB strided block move
+//   packedBytes <  128   the whole row plane into a UB bank, then select the head in UB
 // ReadTileRows() is the MTE2 half and SelectKvHeadRows() the vector half of the last layout; the caller
 // owns the MTE2 -> V event between them.
 class TurboQuantTileBurst {
@@ -57,16 +57,37 @@ public:
     __aicore__ inline void Init(AscendC::TPipe *pipe, const uint32_t numKvHeads, const uint32_t packedBytes,
                                 const uint32_t tileRows, const uint32_t planes)
     {
+        Init(pipe, numKvHeads, packedBytes, numKvHeads * packedBytes, tileRows, planes);
+    }
+
+    __aicore__ inline void Init(AscendC::TPipe *pipe, const uint32_t numKvHeads, const uint32_t packedBytes,
+                                const uint32_t packedPlane, const uint32_t tileRows, const uint32_t planes)
+    {
         numKvHeads_ = numKvHeads;
         packedBytes_ = packedBytes;
         tileRows_ = tileRows;
-        planeBytes_ = tileRows * numKvHeads * packedBytes;
-        readsWholeRows_ = (numKvHeads > 1 && packedBytes < kMinBurstBytes) ? 1u : 0u;
+        planeBytes_ = tileRows * packedPlane;
+        gatherHeadRows_ = packedBytes % kOperandC0 != 0;
+        readsWholeRows_ = (gatherHeadRows_ || (numKvHeads > 1 && packedBytes < kMinBurstBytes)) ? 1u : 0u;
         kvHeadRowParams_ =
             AscendC::DataCopyParams{static_cast<uint16_t>(tileRows), static_cast<uint16_t>(packedBytes / kOperandC0),
                                     static_cast<uint16_t>((numKvHeads - 1) * packedBytes / kOperandC0), 0};
         if (readsWholeRows_ != 0) {
             pipe->InitBuffer(rowBankBuf_, planes * planeBytes_ * sizeof(int8_t));
+        }
+        if (gatherHeadRows_) {
+            const uint32_t wordsPerHead = tileRows * packedBytes / sizeof(uint32_t);
+            pipe->InitBuffer(headGatherOffsetBuf_, numKvHeads * wordsPerHead * sizeof(uint32_t));
+            const AscendC::LocalTensor<uint32_t> offsets = headGatherOffsetBuf_.Get<uint32_t>();
+            for (uint32_t head = 0; head < numKvHeads; ++head) {
+                for (uint32_t row = 0; row < tileRows; ++row) {
+                    for (uint32_t word = 0; word < packedBytes / sizeof(uint32_t); ++word) {
+                        offsets.SetValue(head * wordsPerHead + row * packedBytes / sizeof(uint32_t) + word,
+                                         row * packedPlane + head * packedBytes + word * sizeof(uint32_t));
+                    }
+                }
+            }
+            SyncScalarToVector();
         }
     }
 
@@ -75,13 +96,13 @@ public:
     __aicore__ inline void ReadTileRows(const AscendC::LocalTensor<int8_t> &dst, AscendC::GlobalTensor<int8_t> &cacheGm,
                                         const uint64_t rowOffset, const uint32_t kvHead, const uint32_t plane)
     {
-        if (numKvHeads_ == 1) {
+        if (readsWholeRows_ != 0) {
+            AscendC::DataCopy(rowBankBuf_.Get<int8_t>()[plane * planeBytes_], cacheGm[rowOffset], planeBytes_);
+        } else if (numKvHeads_ == 1) {
             AscendC::DataCopy(dst, cacheGm[rowOffset], tileRows_ * packedBytes_);
-        } else if (readsWholeRows_ == 0) {
+        } else {
             AscendC::DataCopy(dst, cacheGm[rowOffset + static_cast<uint64_t>(kvHead) * packedBytes_],
                               kvHeadRowParams_);
-        } else {
-            AscendC::DataCopy(rowBankBuf_.Get<int8_t>()[plane * planeBytes_], cacheGm[rowOffset], planeBytes_);
         }
     }
 
@@ -89,19 +110,30 @@ public:
                                             const uint32_t plane)
     {
         if (readsWholeRows_ != 0) {
-            AscendC::DataCopy(dst, rowBankBuf_.Get<int8_t>()[plane * planeBytes_ + kvHead * packedBytes_],
-                              kvHeadRowParams_);
+            if (gatherHeadRows_) {
+                const uint32_t wordsPerHead = tileRows_ * packedBytes_ / sizeof(uint32_t);
+                AscendC::Gather(dst.ReinterpretCast<float>(),
+                                rowBankBuf_.Get<int8_t>()[plane * planeBytes_].ReinterpretCast<float>(),
+                                headGatherOffsetBuf_.Get<uint32_t>()[kvHead * wordsPerHead], kGatherSrcBase,
+                                wordsPerHead);
+                AscendC::PipeBarrier<PIPE_V>();
+            } else {
+                AscendC::DataCopy(dst, rowBankBuf_.Get<int8_t>()[plane * planeBytes_ + kvHead * packedBytes_],
+                                  kvHeadRowParams_);
+            }
         }
     }
 
 private:
     AscendC::TBuf<AscendC::QuePosition::VECCALC> rowBankBuf_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> headGatherOffsetBuf_;
     AscendC::DataCopyParams kvHeadRowParams_;
     uint32_t numKvHeads_ = 0;
     uint32_t packedBytes_ = 0;
     uint32_t tileRows_ = 0;
     uint32_t planeBytes_ = 0;
     uint32_t readsWholeRows_ = 0;
+    bool gatherHeadRows_ = false;
 };
 
 // ----------------------------------------------------------------------------------------------------
@@ -645,7 +677,9 @@ private:
         blockSize_ = blockSize;
         numSplits_ = numSplits;
         packedBytes_ = Codec::PackedBytes(headSize);
-        packedPlane_ = numKvHeads_ * packedBytes_;
+        const uint32_t payload = numKvHeads_ * packedBytes_;
+        packedPlane_ = MODE == TurboQuantMode::KV3_FP4 ? (payload + kOperandC0 - 1) / kOperandC0 * kOperandC0
+                                                       : payload;
         scaleSlot_ = ScaleSlotFloats(numKvHeads_);
         partialStride_ = headSize + kPartialTail;
         operandElems_ = Mm::OperandElems(headSize_);
@@ -724,7 +758,7 @@ private:
         pipe->InitBuffer(outBuf_, kHalfRows * headSize_ * sizeof(scalar_t));
         pipe->InitBuffer(maskBuf_, 2 * kCubeTileRows * sizeof(float));
         if constexpr (!kNzTiled) {
-            rowMajorBurst_.Init(pipe, numKvHeads_, packedBytes_, kCubeTileRows, kIngestSlots);
+            rowMajorBurst_.Init(pipe, numKvHeads_, packedBytes_, packedPlane_, kCubeTileRows, kIngestSlots);
         }
     }
 

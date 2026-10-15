@@ -62,7 +62,8 @@ struct TurboQuantModeConfig {
 
     constexpr int64_t PackedPlaneBytes(int64_t head_size, int64_t num_kv_heads) const
     {
-        return PackedBytes(head_size) * num_kv_heads;
+        const int64_t payload = PackedBytes(head_size) * num_kv_heads;
+        return mode == TurboQuantMode::KV3_FP4 ? (payload + kBurstBytes - 1) / kBurstBytes * kBurstBytes : payload;
     }
 
     static constexpr int64_t kBurstBytes = 32;

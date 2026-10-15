@@ -156,8 +156,10 @@ std::vector<Config> BuildSweep() {
         Config config;
         config.model = model;
         config.mode = AuditMode();
+        const auto mode_config = vllm_ascend::turboquant::TurboQuantModeConfigOf(config.mode);
         if (config.mode == vllm_ascend::turboquant::TurboQuantMode::KV3_FP4 &&
-            !vllm_ascend::turboquant::TurboQuantModeConfigOf(config.mode).IsBurstAligned(model.head_size)) {
+            (mode_config.PackedBytes(model.head_size) % 16 != 0 ||
+             mode_config.PackedPlaneBytes(model.head_size, model.num_kv_heads) % 32 != 0)) {
           continue;
         }
         config.seq_len = regime.seq_len;
@@ -180,7 +182,9 @@ Traffic ModelTraffic(const Config& config, const DecodeDispatch& dispatch) {
   const double d = static_cast<double>(config.model.head_size);
   const double hq = static_cast<double>(config.model.num_heads);
   const double hkv = static_cast<double>(config.model.num_kv_heads);
-  const double packed_slot = static_cast<double>(tqh::ModePackedBytes(config.mode, config.model.head_size));
+  const double packed_slot = static_cast<double>(
+      vllm_ascend::turboquant::TurboQuantModeConfigOf(config.mode).PackedPlaneBytes(config.model.head_size,
+                                                                                    config.model.num_kv_heads));
   const double scale_slot = static_cast<double>(tqh::ScaleSlotFloats(config.model.num_kv_heads)) * kFloatBytes;
   const double context = static_cast<double>(config.context_tokens());
   const double chunk = static_cast<double>(config.chunk_tokens());
@@ -189,10 +193,10 @@ Traffic ModelTraffic(const Config& config, const DecodeDispatch& dispatch) {
 
   Traffic traffic;
   traffic.fp16_kv_bytes = 2.0 * context * hkv * d * kHalfBytes;
-  traffic.tq_kv_bytes = 2.0 * context * hkv * packed_slot + context * scale_slot;
+  traffic.tq_kv_bytes = 2.0 * context * packed_slot + context * scale_slot;
 
   const double chunk_kv_fp16 = 2.0 * chunk * hkv * d * kHalfBytes;
-  const double chunk_kv_tq = 2.0 * chunk * hkv * packed_slot + chunk * scale_slot;
+  const double chunk_kv_tq = 2.0 * chunk * packed_slot + chunk * scale_slot;
   const double chunk_query = chunk * hq * d * kHalfBytes;
   const double mask = static_cast<double>(kCausalMaskSide * kCausalMaskSide);
 
@@ -245,7 +249,8 @@ double ScenarioBytes(const Config& config) {
   const double contiguous_kv = 4.0 * context * hkv * d * kHalfBytes;
   const double chunk_kv = 2.0 * chunk * hkv * d * kHalfBytes;
   const double tq_cache =
-      2.0 * pool_rows * hkv * static_cast<double>(tqh::ModePackedBytes(config.mode, config.model.head_size)) +
+      2.0 * pool_rows * static_cast<double>(vllm_ascend::turboquant::TurboQuantModeConfigOf(config.mode)
+                                               .PackedPlaneBytes(config.model.head_size, config.model.num_kv_heads)) +
       pool_rows * scale_slot;
   const double fp16_cache = 2.0 * pool_rows * hkv * d * kHalfBytes;
   const double prefill_activations = chunk * hq * d * (4.0 * kHalfBytes + 2.0 * kFloatBytes);

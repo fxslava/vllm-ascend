@@ -50,6 +50,7 @@ using vllm_ascend::turboquant::kVectorSubcoresPerBlock;
 using vllm_ascend::turboquant::MixBlockIdx;
 using vllm_ascend::turboquant::ScaleSlotFloats;
 using vllm_ascend::turboquant::SyncMte2ToVector;
+using vllm_ascend::turboquant::SyncScalarToVector;
 using vllm_ascend::turboquant::SyncVectorToMte2;
 using vllm_ascend::turboquant::TurboQuantCodec4;
 using vllm_ascend::turboquant::TurboQuantCubeDecodeService;
@@ -90,7 +91,10 @@ public:
         tokensPerCore_ = tokensPerCore;
         packedBytes_ = Codec::PackedBytes(headSize);
         headPlane_ = numKvHeads_ * headSize_;
-        packedPlane_ = numKvHeads_ * packedBytes_;
+        const uint32_t payload = numKvHeads_ * packedBytes_;
+        packedPlane_ = MODE == TurboQuantMode::KV3_FP4 ? (payload + kOperandC0 - 1) / kOperandC0 * kOperandC0
+                                                       : payload;
+        alignedHeadBytes_ = (packedBytes_ + kOperandC0 - 1) / kOperandC0 * kOperandC0;
         scaleSlot_ = ScaleSlotFloats(numKvHeads_);
 
         keyGm_.SetGlobalBuffer(reinterpret_cast<__gm__ scalar_t *>(key));
@@ -110,6 +114,22 @@ public:
         pipe_->InitBuffer(signBuf_, headSize_ * sizeof(float));
         pipe_->InitBuffer(stepBuf_, 2 * numKvHeads_ * kFp32PerBlock * sizeof(float));
         pipe_->InitBuffer(scaleIndexBuf_, 2 * numKvHeads_ * sizeof(int32_t));
+        if (alignedHeadBytes_ != packedBytes_) {
+            pipe_->InitBuffer(alignedPackedBuf_, 2 * numKvHeads_ * alignedHeadBytes_);
+            pipe_->InitBuffer(packedGatherOffsetBuf_, 2 * packedPlane_);
+            const AscendC::LocalTensor<uint32_t> offsets = packedGatherOffsetBuf_.Get<uint32_t>();
+            const uint32_t scratchPlane = numKvHeads_ * alignedHeadBytes_;
+            const uint32_t payload = numKvHeads_ * packedBytes_;
+            for (uint32_t plane = 0; plane < 2; ++plane) {
+                for (uint32_t byte = 0; byte < packedPlane_; byte += sizeof(uint32_t)) {
+                    const uint32_t head = byte < payload ? byte / packedBytes_ : numKvHeads_ - 1;
+                    const uint32_t column = byte < payload ? byte % packedBytes_ : packedBytes_ + byte - payload;
+                    offsets.SetValue(plane * packedPlane_ / sizeof(uint32_t) + byte / sizeof(uint32_t),
+                                     plane * scratchPlane + head * alignedHeadBytes_ + column);
+                }
+            }
+            SyncScalarToVector();
+        }
 
         rotation_.Init(pipe_, headSize_, 1, invSqrtLen, rotTablesGm_);
         codec_.Init(pipe_, headSize_, 1, invSqrtLen, modeTablesGm_);
@@ -187,6 +207,12 @@ private:
     {
         AscendC::LocalTensor<scalar_t> in = inQueue_.template DeQue<scalar_t>();
         const AscendC::LocalTensor<int8_t> packed = outPacked_.template AllocTensor<int8_t>();
+        const bool repack = alignedHeadBytes_ != packedBytes_;
+        const AscendC::LocalTensor<int8_t> headPacked = repack ? alignedPackedBuf_.Get<int8_t>() : packed;
+        if (repack) {
+            AscendC::Duplicate(headPacked, static_cast<int8_t>(0), 2 * numKvHeads_ * alignedHeadBytes_);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
         const AscendC::LocalTensor<float> scaleOut = outScale_.template AllocTensor<float>();
 
         const AscendC::LocalTensor<float> work = workBuf_.Get<float>();
@@ -200,9 +226,17 @@ private:
                 const uint32_t src = plane * headPlane_ + head * headSize_;
                 AscendC::Cast(vec, in[src], AscendC::RoundMode::CAST_NONE, headSize_);
                 rotation_.ApplyPi(vec, tmp, signs, headSize_);
-                codec_.Encode(packed[plane * packedPlane_ + head * packedBytes_], vec,
+                const uint32_t offset = repack ? (plane * numKvHeads_ + head) * alignedHeadBytes_
+                                               : plane * packedPlane_ + head * packedBytes_;
+                codec_.Encode(headPacked[offset], vec,
                               steps[(plane * numKvHeads_ + head) * kFp32PerBlock], headSize_);
             }
+        }
+        if (repack) {
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Gather(packed.ReinterpretCast<float>(), headPacked.ReinterpretCast<float>(),
+                            packedGatherOffsetBuf_.Get<uint32_t>(), kGatherSrcBase,
+                            2 * packedPlane_ / sizeof(uint32_t));
         }
         inQueue_.FreeTensor(in);
 
@@ -289,8 +323,11 @@ private:
     uint32_t blockSize_ = 0;
     uint32_t tokensPerCore_ = 0;
     uint32_t packedBytes_ = 0;
+    uint32_t alignedHeadBytes_ = 0;
     uint32_t headPlane_ = 0;
     uint32_t packedPlane_ = 0;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> alignedPackedBuf_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> packedGatherOffsetBuf_;
     uint32_t scaleSlot_ = 0;
 };
 

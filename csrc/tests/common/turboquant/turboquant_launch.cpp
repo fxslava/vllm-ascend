@@ -150,8 +150,8 @@ int64_t ModePackedBytes(tqm::TurboQuantMode mode, int64_t head_size) {
 
 size_t ModePackedCacheBytes(tqm::TurboQuantMode mode, int64_t num_blocks, int64_t block_size, int64_t num_kv_heads,
                             int64_t head_size) {
-  return static_cast<size_t>(num_blocks) * static_cast<size_t>(block_size) * static_cast<size_t>(num_kv_heads) *
-         static_cast<size_t>(ModePackedBytes(mode, head_size));
+  return static_cast<size_t>(num_blocks) * static_cast<size_t>(block_size) *
+         static_cast<size_t>(tqm::TurboQuantModeConfigOf(mode).PackedPlaneBytes(head_size, num_kv_heads));
 }
 
 int64_t ModeTableWords(tqm::TurboQuantMode mode, int64_t head_size, int64_t batch_rows) {

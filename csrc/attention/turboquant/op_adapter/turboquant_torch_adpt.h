@@ -421,26 +421,31 @@ inline void CheckCubeActivation(const at::Tensor &tensor, const char *name)
     TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
 }
 
-// [num_blocks, block_size, num_kv_heads, mode.PackedBytes(head_size)] int8 planes, whole Cube tiles, and
+// KV4: [num_blocks, block_size, num_kv_heads, packed_bytes]; KV3: [num_blocks, block_size, 1, packed_plane]
+// int8 planes, whole Cube tiles, and
 // the [num_blocks, block_size, scale_slot] fp32 scale plane.
 inline void CheckCubeCache(const at::Tensor &key_cache, const at::Tensor &value_cache, const at::Tensor &scale_cache,
                            int64_t num_kv_heads, int64_t head_size, tq::TurboQuantMode mode)
 {
     namespace tq = vllm_ascend::turboquant;
     const int64_t packed_bytes = tq::TurboQuantModeConfigOf(mode).PackedBytes(head_size);
+    const int64_t packed_plane = tq::TurboQuantModeConfigOf(mode).PackedPlaneBytes(head_size, num_kv_heads);
+    const bool row_major = mode == tq::TurboQuantMode::KV3_FP4;
     TORCH_CHECK(key_cache.dim() == 4 && key_cache.sizes() == value_cache.sizes(),
-                "kv cache must be two [num_blocks, block_size, num_kv_heads, packed_bytes] tensors");
+                "kv cache must be two contiguous four-dimensional packed tensors");
     TORCH_CHECK(key_cache.scalar_type() == at::ScalarType::Char && value_cache.scalar_type() == at::ScalarType::Char,
                 "the packed TurboQuant kv cache must be int8");
     TORCH_CHECK(key_cache.is_contiguous() && value_cache.is_contiguous() && scale_cache.is_contiguous(),
                 "the kv cache and its scale plane must be contiguous");
-    TORCH_CHECK(key_cache.size(2) == num_kv_heads, "cache num_kv_heads mismatch: ", key_cache.size(2), " vs ",
-                num_kv_heads);
-    TORCH_CHECK(key_cache.size(3) == packed_bytes, "packed cache head dim must be ", packed_bytes,
+    TORCH_CHECK(key_cache.size(2) == (row_major ? 1 : num_kv_heads), "packed cache head axis mismatch");
+    TORCH_CHECK(key_cache.size(3) == (row_major ? packed_plane : packed_bytes),
+                "packed cache row width mismatch: expected ", row_major ? packed_plane : packed_bytes,
                 ", got ", key_cache.size(3));
-    TORCH_CHECK(packed_bytes % tq::kOperandC0 == 0,
-                "TurboQuant Cube cache requires packed bytes per head to be a multiple of ", tq::kOperandC0,
-                ", got ", packed_bytes);
+    TORCH_CHECK(packed_plane % tq::kOperandC0 == 0,
+                "TurboQuant Cube cache needs packed plane divisible by ", tq::kOperandC0,
+                ", got ", packed_plane);
+    TORCH_CHECK(!row_major || packed_bytes % 16 == 0,
+                "KV3_FP4 packed bytes per head must be divisible by 16, got ", packed_bytes);
     TORCH_CHECK(key_cache.size(1) % tq::kCubeTileRows == 0, "the TurboQuant Cube path requires block_size to be a ",
                 "multiple of ", tq::kCubeTileRows, ", got ", key_cache.size(1));
     TORCH_CHECK(scale_cache.scalar_type() == at::ScalarType::Float && scale_cache.dim() == 3,

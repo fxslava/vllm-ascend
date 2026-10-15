@@ -114,6 +114,17 @@ def turboquant_packed_bytes(head_size: int, mode: TurboQuantMode = TurboQuantMod
     raise ValueError(f"unsupported TurboQuant mode: {mode}")
 
 
+def turboquant_packed_plane_bytes(head_size: int, num_kv_heads: int, mode: TurboQuantMode) -> int:
+    """Bytes per token, including the KV3 row padding needed for 32-byte GM bursts."""
+    if num_kv_heads <= 0:
+        raise ValueError("num_kv_heads must be positive")
+    payload = num_kv_heads * turboquant_packed_bytes(head_size, mode)
+    if mode == TurboQuantMode.KV3_FP4:
+        alignment = TURBOQUANT_CUBE_COLUMN_BYTES
+        return -(-payload // alignment) * alignment
+    return payload
+
+
 def turboquant_mode_tables(head_size: int, batch_rows: int, device: torch.device) -> torch.Tensor:
     """KV3_FP4 table image used by the in-tree mode codec.
 
@@ -124,8 +135,8 @@ def turboquant_mode_tables(head_size: int, batch_rows: int, device: torch.device
     if batch_rows not in (1, TURBOQUANT_CUBE_UNPACK_ROWS):
         raise ValueError(f"KV3_FP4 mode tables require 1 or {TURBOQUANT_CUBE_UNPACK_ROWS} rows")
     packed_bytes = turboquant_packed_bytes(head_size, TurboQuantMode.KV3_FP4)
-    if packed_bytes % TURBOQUANT_CUBE_COLUMN_BYTES:
-        raise ValueError("KV3_FP4 Cube cache requires packed bytes to be a multiple of 32")
+    if packed_bytes % 16:
+        raise ValueError("KV3_FP4 Cube cache requires packed bytes divisible by 16")
     word = 4
     lanes = 8
     columns = torch.arange(head_size * batch_rows, dtype=torch.int64)

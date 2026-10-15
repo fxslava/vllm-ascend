@@ -289,8 +289,8 @@ class TestKV3PageAndRunnerView(TestBase):
         self.assertEqual(decoder.numel(), 17 * 256 + 32)
         torch.testing.assert_close(writer[:4], torch.tensor([0, 0, 0, 0], dtype=torch.int32))
         torch.testing.assert_close(writer[256:260], torch.tensor([256, 256, 256, 256], dtype=torch.int32))
-        with self.assertRaisesRegex(ValueError, "multiple of 32"):
-            turboquant_mode_tables(128, 8, torch.device("cpu"))
+        narrow = turboquant_mode_tables(128, 8, torch.device("cpu"))
+        self.assertEqual(narrow.numel(), 17 * 128 + 32)
 
     def test_kv3_page_uses_three_bytes_per_eight_channels(self):
         from vllm_ascend.attention.turboquant_layout import TurboQuantMode, turboquant_packed_bytes
@@ -300,11 +300,23 @@ class TestKV3PageAndRunnerView(TestBase):
         self.assertEqual(packed_bytes, 96)
         spec = _spec(8, head_size=head_size, mode=int(TurboQuantMode.KV3_FP4))
         shape = AscendAttentionBackend.get_kv_cache_shape(2, BLOCK_SIZE, 8, head_size, "turboquant_int3")
-        self.assertEqual(shape, (2, 2, BLOCK_SIZE, 8, packed_bytes))
+        self.assertEqual(shape, (2, 2, BLOCK_SIZE, 1, 8 * packed_bytes))
         self.assertEqual(spec.payload_bytes, 2 * BLOCK_SIZE * 8 * packed_bytes)
         self.assertEqual(spec.real_page_size_bytes, spec.payload_bytes + BLOCK_SIZE * turboquant_scale_slot(8) * 4)
         merged = AscendTurboQuantAttentionSpec.merge([spec, spec])
         self.assertEqual(merged.mode, int(TurboQuantMode.KV3_FP4))
+
+    def test_kv3_128_pads_odd_head_planes(self):
+        from vllm_ascend.attention.turboquant_layout import TurboQuantMode, turboquant_packed_plane_bytes
+
+        mode = TurboQuantMode.KV3_FP4
+        self.assertEqual(turboquant_packed_plane_bytes(128, 1, mode), 64)
+        self.assertEqual(turboquant_packed_plane_bytes(128, 2, mode), 96)
+        for heads, plane in ((1, 64), (2, 96), (3, 160)):
+            spec = _spec(heads, head_size=128, mode=int(mode))
+            shape = AscendAttentionBackend.get_kv_cache_shape(2, BLOCK_SIZE, heads, 128, "turboquant_int3")
+            self.assertEqual(shape, (2, 2, BLOCK_SIZE, 1, plane))
+            self.assertEqual(spec.payload_bytes, 2 * BLOCK_SIZE * plane)
 
     def test_model_runner_views_all_three_kv3_planes(self):
         from vllm_ascend.worker.model_runner_v1 import NPUModelRunner

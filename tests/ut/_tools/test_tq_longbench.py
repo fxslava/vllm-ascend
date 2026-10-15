@@ -275,7 +275,10 @@ class TestStaticKVCache(unittest.TestCase):
                 geometry = CacheGeometry(1, 4, 256, 128, 2048, cache_mode)
                 cache = TurboQuantKVCache(geometry, CPU)
                 self.assertEqual(geometry.packed_bytes, packed_bytes)
-                self.assertEqual(cache.key_planes[0].shape, (16, 128, 4, packed_bytes))
+                expected_shape = (
+                    (16, 128, 1, 4 * packed_bytes) if cache_mode == "kv3fp4" else (16, 128, 4, packed_bytes)
+                )
+                self.assertEqual(cache.key_planes[0].shape, expected_shape)
                 self.assertEqual(cache.bytes_per_token_per_layer(), 2 * 4 * packed_bytes + 8 * 4)
 
     def test_the_packed_pool_is_shaped_as_the_backend_budgets_it(self):
@@ -315,8 +318,11 @@ class TestStaticKVCache(unittest.TestCase):
             CacheGeometry(1, NUM_KV_HEADS, HEAD_SIZE, 24, 128)
         with self.assertRaisesRegex(ValueError, "64-row tiles"):
             CacheGeometry(1, NUM_KV_HEADS, HEAD_SIZE, 32, 128).require_cube_tiling()
-        with self.assertRaisesRegex(ValueError, "packed bytes per head"):
-            CacheGeometry(1, NUM_KV_HEADS, 128, 128, 128, "kv3fp4").require_cube_tiling()
+        for heads, plane in ((1, 64), (2, 96), (3, 160)):
+            geometry = CacheGeometry(1, heads, 128, 128, 128, "kv3fp4")
+            geometry.require_cube_tiling()
+            self.assertEqual(geometry.packed_plane_bytes, plane)
+            self.assertEqual(TurboQuantKVCache(geometry, CPU).key_planes[0].shape, (1, 128, 1, plane))
         cache = TurboQuantKVCache(_geometry(256), CPU)
         with self.assertRaisesRegex(ValueError, "outside"):
             cache.slot_mapping(0, 300)
@@ -657,7 +663,7 @@ class TestCubeDispatch(unittest.TestCase):
                 write_args = kernel.npu_turboquant_cube_reshape_and_cache.call_args.args
                 self.assertEqual(write_args[-1], 3)
                 self.assertEqual(write_args[-2].dtype, torch.int32)
-                self.assertEqual(write_args[2].shape[-1], 3 * head_size // 8)
+                self.assertEqual(write_args[2].shape[-1], NUM_KV_HEADS * 3 * head_size // 8)
                 query = torch.zeros(1, NUM_HEADS, head_size, dtype=torch.float16)
                 out = torch.zeros_like(query)
                 backend.decode(0, query, torch.ones(1, dtype=torch.int32), out, window=1)
@@ -4245,8 +4251,14 @@ class TestCompletedIndices(unittest.TestCase):
         from tq_longbench.run_longbench import completed_indices, rung_key
 
         rows = [
-            {"task": "trec", "index": 0, "backend": "turboquant_cube", "sink_tokens": 0,
-             "context_requested": 2048, "cache_mode": mode}
+            {
+                "task": "trec",
+                "index": 0,
+                "backend": "turboquant_cube",
+                "sink_tokens": 0,
+                "context_requested": 2048,
+                "cache_mode": mode,
+            }
             for mode in ("kv4fp8", "kv3fp4")
         ]
         done, _ = completed_indices(self._write("modes.jsonl", rows), ("trec",))

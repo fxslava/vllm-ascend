@@ -44,7 +44,11 @@ from collections.abc import Iterator, Sequence
 import torch
 from torch.library import Library
 
-from vllm_ascend.attention.turboquant_layout import TurboQuantMode, turboquant_packed_bytes
+from vllm_ascend.attention.turboquant_layout import (
+    TurboQuantMode,
+    turboquant_packed_bytes,
+    turboquant_packed_plane_bytes,
+)
 from vllm_ascend.attention.turboquant_rotation import apply_pi
 from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_LLOYD_MAX_THRESHOLDS
 
@@ -550,10 +554,16 @@ def _cube_reshape_and_cache_meta(
 ):
     torch._check(key.dim() == 3 and key.shape == value.shape, lambda: "key and value must be [num_tokens, H_KV, D]")
     torch._check(key_cache.dim() == 4 and key_cache.shape == value_cache.shape, lambda: "K and V caches differ")
-    torch._check(key_cache.shape[2] == key.shape[1], lambda: "cache num_kv_heads mismatch")
+    kv3 = mode == int(TurboQuantMode.KV3_FP4)
+    torch._check(key_cache.shape[2] == (1 if kv3 else key.shape[1]), lambda: "cache head axis mismatch")
     torch._check(
-        key_cache.shape[3] == turboquant_packed_bytes(key.shape[2], TurboQuantMode(mode)),
-        lambda: "packed cache head dim mismatch",
+        key_cache.shape[3]
+        == (
+            turboquant_packed_plane_bytes(key.shape[2], key.shape[1], TurboQuantMode(mode))
+            if kv3
+            else turboquant_packed_bytes(key.shape[2], TurboQuantMode(mode))
+        ),
+        lambda: "packed cache row width mismatch",
     )
     if mode == int(TurboQuantMode.KV3_FP4):
         torch._check(
@@ -592,10 +602,19 @@ def _cube_decode_meta(
     torch._check(query_rot.numel() == query.numel(), lambda: "query_rot must hold one fp32 word per query element")
     torch._check(gate is None or gate.numel() == query.numel(), lambda: "gate must hold one logit per query element")
     torch._check(query.shape[1] == num_heads and num_heads % num_kv_heads == 0, lambda: "head counts mismatch")
-    torch._check(key_cache.shape == value_cache.shape and key_cache.shape[2] == num_kv_heads, lambda: "cache heads")
+    kv3 = mode == int(TurboQuantMode.KV3_FP4)
     torch._check(
-        key_cache.shape[3] == turboquant_packed_bytes(query.shape[2], TurboQuantMode(mode)),
-        lambda: "packed cache head dim mismatch",
+        key_cache.shape == value_cache.shape and key_cache.shape[2] == (1 if kv3 else num_kv_heads),
+        lambda: "cache heads",
+    )
+    torch._check(
+        key_cache.shape[3]
+        == (
+            turboquant_packed_plane_bytes(query.shape[2], num_kv_heads, TurboQuantMode(mode))
+            if kv3
+            else turboquant_packed_bytes(query.shape[2], TurboQuantMode(mode))
+        ),
+        lambda: "packed cache row width mismatch",
     )
     if mode == int(TurboQuantMode.KV3_FP4):
         torch._check(
