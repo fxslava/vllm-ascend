@@ -455,7 +455,8 @@ public:
 
         SyncVectorToMte3();
         for (uint32_t j = 0; j < heads.mine; ++j) {
-            AscendC::DataCopy(queryL1[(heads.base + j) * kOperandC0], queryOperand[j * operandElems_],
+            AscendC::DataCopy(queryL1[OperandIndex((heads.base + j) * kOperandC0)],
+                              queryOperand[OperandIndex(j * operandElems_)],
                               queryRowToL1Params_);
         }
 
@@ -551,7 +552,8 @@ public:
         const AscendC::LocalTensor<OperandT> probsL1 = mm.L1Probs();
         SyncVectorToMte3();
         for (uint32_t j = 0; j < heads.mine; ++j) {
-            AscendC::DataCopy(probsL1[(heads.base + j) * kOperandC0], probOperand[j * probElems], probRowToL1Params_);
+            AscendC::DataCopy(probsL1[OperandIndex((heads.base + j) * kOperandC0)],
+                              probOperand[OperandIndex(j * probElems)], probRowToL1Params_);
         }
         SyncMte3ToVector();
     }
@@ -690,7 +692,7 @@ private:
         bandToL1Params_ = AscendC::DataCopyParams{static_cast<uint16_t>(operandElems_ / kOperandC0),
                                                   static_cast<uint16_t>(kCubeUnpackRows), 0,
                                                   static_cast<uint16_t>(kCubeTileRows - kCubeUnpackRows)};
-        queryRowToL1Params_ = AscendC::DataCopyParams{static_cast<uint16_t>(headSize_ / kOperandC0), 1, 0,
+        queryRowToL1Params_ = AscendC::DataCopyParams{static_cast<uint16_t>(operandElems_ / kOperandC0), 1, 0,
                                                       static_cast<uint16_t>(kCubeTileM - 1)};
         probRowToL1Params_ = AscendC::DataCopyParams{
             static_cast<uint16_t>(Mm::OperandElems(kCubeTileRows) / kOperandC0), 1, 0,
@@ -704,6 +706,13 @@ private:
         // the bare attention scale and to unity.
         scoreScale_ = scale / Codec::kGain;
         invGain_ = 1.0f / Codec::kGain;
+    }
+
+    // LocalTensor<fp4x2> indexes individual 4-bit values, while all operand sizes and DMA
+    // strides above are measured in bytes. Convert byte offsets before slicing FP4 tensors.
+    __aicore__ static constexpr uint32_t OperandIndex(const uint32_t byteOffset)
+    {
+        return Mm::kIsFp4 ? byteOffset * 2 : byteOffset;
     }
 
     __aicore__ inline void InitGlobalTensors(__gm__ void *queryRot, __gm__ void *keyCache, __gm__ void *valueCache,
@@ -900,7 +909,7 @@ private:
             AscendC::Div(qScale[lane], qScale[lane], amax[lane], 1);
             BroadcastScalar(qScaleBlock, qScale[lane]);
             TurboQuantCodec4::BroadcastMul(query, query, qScaleBlock, headSize_);
-            codec_.template CastToOperand<OperandT>(queryOperand[j * operandElems_], query, headSize_);
+            codec_.template CastToOperand<OperandT>(queryOperand[OperandIndex(j * operandElems_)], query, headSize_);
         }
         // Vector -> scalar hand-off: GetValue reads qScale lanes the vector pipe has just written.
         AscendC::PipeBarrier<PIPE_V>();
@@ -987,7 +996,7 @@ private:
             BroadcastScalar(scalarBlock, probScale[lane]);
             TurboQuantCodec4::BroadcastMul(row, row, scalarBlock, kCubeTileRows);
 
-            codec_.template CastToOperand<OperandT>(probOperand[j * probElems], row, kCubeTileRows);
+            codec_.template CastToOperand<OperandT>(probOperand[OperandIndex(j * probElems)], row, kCubeTileRows);
         }
     }
 
@@ -1084,7 +1093,7 @@ private:
                 (void)packed;
             }
             SyncVectorToMte3();
-            AscendC::DataCopy(l1Dst[band * bandElems], unpacked, bandToL1Params_);
+            AscendC::DataCopy(l1Dst[OperandIndex(band * bandElems)], unpacked, bandToL1Params_);
         }
         SyncMte3ToVector();
     }

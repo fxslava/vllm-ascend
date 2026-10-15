@@ -17,17 +17,20 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "../../attention/turboquant/op_kernel/common/qjl_codec.h"
 #include "ascend950_shapes.hpp"
 #include "cpu_reference.hpp"
+#include "fp4_e2m1.hpp"
 #include "fp16.hpp"
 #include "golden_layer3.hpp"
 #include "random_data.hpp"
@@ -948,12 +951,12 @@ TEST(TurboQuantMirroredCache, Kv3PackedPlanesUseRowMajorSlots) {
   constexpr int64_t kBlock = 128;
   constexpr int64_t kBlocks = 1;
   constexpr TurboQuantMode kMode = TurboQuantMode::KV3_FP4;
-  const size_t packed_bytes = static_cast<size_t>(
-      vllm_ascend::turboquant::TurboQuantModeConfigOf(kMode).PackedBytes(kHead));
+  const size_t packed_bytes =
+      static_cast<size_t>(vllm_ascend::turboquant::TurboQuantModeConfigOf(kMode).PackedBytes(kHead));
   const size_t scale_stride = static_cast<size_t>(tqh::MirroredScaleSlotFloats(kKvHeads));
   DeterministicRandom rng(0x3B17u);
-  const tqh::MirroredKvCache cache = tqh::BuildMirroredKvCache(
-      rng, kContext, kBlocks, kBlock, kKvHeads, kHead, {0}, false, tqh::MirroredCodebook::kUniform, kMode);
+  const tqh::MirroredKvCache cache = tqh::BuildMirroredKvCache(rng, kContext, kBlocks, kBlock, kKvHeads, kHead, {0},
+                                                               false, tqh::MirroredCodebook::kUniform, kMode);
 
   EXPECT_EQ(tqh::MirroredPackedByte(0, 1, 0, kKvHeads, packed_bytes, kMode), packed_bytes);
   EXPECT_EQ(tqh::MirroredPackedByte(1, 0, 0, kKvHeads, packed_bytes, kMode), kKvHeads * packed_bytes);
@@ -963,8 +966,8 @@ TEST(TurboQuantMirroredCache, Kv3PackedPlanesUseRowMajorSlots) {
         const std::vector<float>& dense = plane == 0 ? cache.key : cache.value;
         const std::vector<int8_t>& packed = plane == 0 ? cache.key_packed : cache.value_packed;
         const size_t row = static_cast<size_t>(token * kKvHeads + kv);
-        const float scale = cache.scales[static_cast<size_t>(token) * scale_stride +
-                                         static_cast<size_t>(plane * kKvHeads + kv)];
+        const float scale =
+            cache.scales[static_cast<size_t>(token) * scale_stride + static_cast<size_t>(plane * kKvHeads + kv)];
         ASSERT_GT(scale, 0.0f);
         std::vector<int32_t> bins(static_cast<size_t>(kHead));
         for (int64_t column = 0; column < kHead; ++column) {
@@ -979,6 +982,194 @@ TEST(TurboQuantMirroredCache, Kv3PackedPlanesUseRowMajorSlots) {
         EXPECT_TRUE(std::equal(expected.begin(), expected.end(), packed.begin() + offset));
       }
     }
+  }
+}
+
+TEST(TurboQuantMirroredCache, Kv3D128RowsAndTailPoisonStayWithinTheirSlots) {
+  namespace tqh = turboquant_host;
+  constexpr int64_t kHead = 128;
+  constexpr int64_t kBlock = 64;
+  constexpr int64_t kContext = 65;
+  constexpr auto kMode = vllm_ascend::turboquant::TurboQuantMode::KV3_FP4;
+  for (const int64_t kv_heads : {int64_t{1}, int64_t{2}}) {
+    const size_t packed_bytes =
+        static_cast<size_t>(vllm_ascend::turboquant::TurboQuantModeConfigOf(kMode).PackedBytes(kHead));
+    const size_t row_stride =
+        static_cast<size_t>(vllm_ascend::turboquant::TurboQuantModeConfigOf(kMode).PackedPlaneBytes(kHead, kv_heads));
+    const size_t scale_stride = static_cast<size_t>(tqh::MirroredScaleSlotFloats(kv_heads));
+    ASSERT_EQ(packed_bytes, 48u);
+    ASSERT_EQ(row_stride, kv_heads == 1 ? 64u : 96u);
+    DeterministicRandom rng(static_cast<uint32_t>(0x3B17 + kv_heads));
+    const std::vector<int32_t> block_table = {1, 0};
+    const tqh::MirroredKvCache cache = tqh::BuildMirroredKvCache(rng, kContext, 2, kBlock, kv_heads, kHead, block_table,
+                                                                 false, tqh::MirroredCodebook::kUniform, kMode);
+    ASSERT_EQ(cache.key_packed.size(), static_cast<size_t>(2 * kBlock) * row_stride);
+    for (int64_t token = 0; token < kContext; ++token) {
+      const size_t slot =
+          static_cast<size_t>(block_table[static_cast<size_t>(token / kBlock)] * kBlock + token % kBlock);
+      for (int64_t kv = 0; kv < kv_heads; ++kv) {
+        const size_t offset = slot * row_stride + static_cast<size_t>(kv) * packed_bytes;
+        EXPECT_EQ(tqh::MirroredPackedByte(slot, static_cast<size_t>(kv), 0, static_cast<size_t>(kv_heads), packed_bytes,
+                                          kMode),
+                  offset);
+        EXPECT_NE(cache.scales[slot * scale_stride + static_cast<size_t>(kv)], 0.0f);
+        EXPECT_NE(cache.scales[slot * scale_stride + static_cast<size_t>(kv_heads + kv)], 0.0f);
+      }
+      for (size_t pad = static_cast<size_t>(kv_heads) * packed_bytes; pad < row_stride; ++pad) {
+        EXPECT_EQ(cache.key_packed[slot * row_stride + pad], 0);
+        EXPECT_EQ(cache.value_packed[slot * row_stride + pad], 0);
+      }
+    }
+
+    // The final mapped block has one active row. Poison every later slot and
+    // confirm the active row, including its optional 16-byte pad, is unchanged.
+    std::vector<int8_t> poisoned = cache.key_packed;
+    const size_t active_slot = static_cast<size_t>(block_table.back() * kBlock);
+    for (size_t slot = active_slot + 1; slot < active_slot + kBlock; ++slot) {
+      std::fill_n(poisoned.begin() + static_cast<std::ptrdiff_t>(slot * row_stride), row_stride,
+                  static_cast<int8_t>(0x5a));
+    }
+    EXPECT_TRUE(std::equal(cache.key_packed.begin() + static_cast<std::ptrdiff_t>(active_slot * row_stride),
+                           cache.key_packed.begin() + static_cast<std::ptrdiff_t>((active_slot + 1) * row_stride),
+                           poisoned.begin() + static_cast<std::ptrdiff_t>(active_slot * row_stride)));
+    EXPECT_EQ(poisoned[(active_slot + 1) * row_stride], static_cast<int8_t>(0x5a));
+  }
+}
+
+// ReferenceOnOperandGrid stands or falls on this rounding: it is the one step where the oracle has
+// to reproduce the hardware rather than compute the right answer, and a cosine gate of 0.999 has no
+// room for a grid that is off by a level. CAST_RINT is round-to-nearest-even, and the e2m1 magnitude
+// field's low bit is its mantissa, so every tie resolves to the even index.
+TEST(TurboQuantFp4Operand, E2m1RoundsToNearestEvenAndSaturates) {
+  namespace fp4 = vllm_ascend::test::fp4;
+  // Every grid point is its own nearest neighbour, with both signs.
+  for (const float level : fp4::kE2m1Grid) {
+    EXPECT_EQ(fp4::E2m1RoundNearest(level), level) << level;
+    EXPECT_EQ(fp4::E2m1RoundNearest(-level), -level) << level;
+  }
+  // The seven midpoints, each to the neighbour whose mantissa bit is zero.
+  const std::vector<std::pair<float, float>> ties = {{0.25f, 0.0f},  {0.75f, 1.0f}, {1.25f, 1.0f}, {1.75f, 2.0f},
+                                                     {2.5f, 2.0f},  {3.5f, 4.0f},  {5.0f, 4.0f}};
+  for (const auto& tie : ties) {
+    EXPECT_EQ(fp4::E2m1RoundNearest(tie.first), tie.second) << tie.first;
+    EXPECT_EQ(fp4::E2m1RoundNearest(-tie.first), -tie.second) << tie.first;
+  }
+  // Either side of a midpoint, and saturation above the top level.
+  EXPECT_EQ(fp4::E2m1RoundNearest(0.3f), 0.5f);
+  EXPECT_EQ(fp4::E2m1RoundNearest(0.2f), 0.0f);
+  EXPECT_EQ(fp4::E2m1RoundNearest(2.6f), 3.0f);
+  EXPECT_EQ(fp4::E2m1RoundNearest(2.4f), 2.0f);
+  EXPECT_EQ(fp4::E2m1RoundNearest(6.5f), fp4::kE2m1Max);
+  EXPECT_EQ(fp4::E2m1RoundNearest(1.0e30f), fp4::kE2m1Max);
+  EXPECT_EQ(fp4::E2m1RoundNearest(-1.0e30f), -fp4::kE2m1Max);
+
+  // Every kv3 centroid is exactly representable, which is what lets the reference multiply the bare
+  // level and apply the slot scale afterwards. If this ever fails the cache levels need rounding too.
+  for (const float centroid : turboquant_host::MirroredKv3Traits::kCentroids) {
+    EXPECT_EQ(fp4::E2m1Operand(centroid), centroid) << centroid;
+  }
+
+  // bfloat16 keeps the top 16 bits, which is 7 explicit mantissa bits, so one step at exponent 0 is
+  // 2^-7 and anything already on that lattice is a fixed point. Half a step is an exact tie and goes
+  // to the even significand, which is why 1 + 2^-8 rounds down to 1 rather than up.
+  EXPECT_EQ(fp4::Bf16RoundNearest(1.0f), 1.0f);
+  EXPECT_EQ(fp4::Bf16RoundNearest(-0.5f), -0.5f);
+  EXPECT_EQ(fp4::Bf16RoundNearest(0.0f), 0.0f);
+  const float bf16_step = std::ldexp(1.0f, -7);
+  EXPECT_EQ(fp4::Bf16RoundNearest(1.0f + bf16_step), 1.0f + bf16_step);
+  EXPECT_EQ(fp4::Bf16RoundNearest(1.0f + 0.25f * bf16_step), 1.0f);
+  EXPECT_EQ(fp4::Bf16RoundNearest(1.0f + 0.5f * bf16_step), 1.0f);
+  EXPECT_EQ(fp4::Bf16RoundNearest(1.0f + 1.5f * bf16_step), 1.0f + 2.0f * bf16_step);
+  EXPECT_EQ(fp4::Bf16RoundNearest(1.0f + 0.75f * bf16_step), 1.0f + bf16_step);
+}
+
+TEST(TurboQuantMirroredCache, SparseBoundarySamplingPreservesCanariesAndCpuReference) {
+  namespace tqh = turboquant_host;
+  constexpr int64_t kTileRows = 64;
+  constexpr int64_t kContext = 128 * 64 + 1;
+  constexpr int64_t kHead = 128;
+  constexpr int64_t kRepeats = 32;
+  constexpr int8_t kCanary = static_cast<int8_t>(0x5a);
+  const int64_t tiles = (kContext + kTileRows - 1) / kTileRows;
+  const std::vector<int64_t> selected = tqh::SparseBoundaryTiles(tiles);
+  ASSERT_EQ(selected, (std::vector<int64_t>{0, 1, tiles / 2, tiles - 1}));
+  ASSERT_GT(tiles / static_cast<int64_t>(selected.size()), 10);
+
+  std::vector<int8_t> cache(static_cast<size_t>(tiles * kTileRows * kHead), kCanary);
+  std::vector<float> query(static_cast<size_t>(kHead), 0.0f);
+  for (int64_t c = 0; c < kHead; ++c) {
+    query[static_cast<size_t>(c)] = static_cast<float>((c % 11) - 5) / 11.0f;
+  }
+  for (const int64_t tile : selected) {
+    for (int64_t row = tile * kTileRows; row < std::min(kContext, (tile + 1) * kTileRows); ++row) {
+      for (int64_t c = 0; c < kHead; ++c) {
+        cache[static_cast<size_t>(row * kHead + c)] = static_cast<int8_t>((row + c) % 17 - 8);
+      }
+    }
+  }
+  const auto is_selected = [&](int64_t row) {
+    return std::binary_search(selected.begin(), selected.end(), row / kTileRows);
+  };
+  const auto reference = [&](bool sparse) {
+    std::vector<double> logits;
+    std::vector<int64_t> active_rows;
+    for (int64_t row = 0; row < kContext; ++row) {
+      if (sparse && !is_selected(row)) {
+        continue;
+      }
+      double dot = 0.0;
+      for (int64_t c = 0; c < kHead; ++c) {
+        dot += static_cast<double>(query[static_cast<size_t>(c)]) *
+               static_cast<double>(cache[static_cast<size_t>(row * kHead + c)]);
+      }
+      if (is_selected(row)) {
+        logits.push_back(dot / std::sqrt(static_cast<double>(kHead)));
+        active_rows.push_back(row);
+      }
+    }
+    const double max_logit = *std::max_element(logits.begin(), logits.end());
+    double sum = 0.0;
+    for (double& logit : logits) {
+      logit = std::exp(logit - max_logit);
+      sum += logit;
+    }
+    std::vector<double> output(static_cast<size_t>(kHead), 0.0);
+    for (size_t i = 0; i < active_rows.size(); ++i) {
+      const double weight = logits[i] / sum;
+      for (int64_t c = 0; c < kHead; ++c) {
+        output[static_cast<size_t>(c)] +=
+            weight * static_cast<double>(cache[static_cast<size_t>(active_rows[i] * kHead + c)]);
+      }
+    }
+    return output;
+  };
+
+  const std::vector<double> dense_output = reference(false);
+  const std::vector<double> sparse_output = reference(true);
+  ASSERT_EQ(dense_output.size(), sparse_output.size());
+  for (size_t i = 0; i < dense_output.size(); ++i) {
+    EXPECT_DOUBLE_EQ(dense_output[i], sparse_output[i]);
+  }
+  const auto time_reference = [&](bool sparse) {
+    const auto start = std::chrono::steady_clock::now();
+    double checksum = 0.0;
+    for (int64_t repeat = 0; repeat < kRepeats; ++repeat) {
+      checksum += reference(sparse).front();
+    }
+    EXPECT_TRUE(std::isfinite(checksum));
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  };
+  const double dense_seconds = time_reference(false);
+  const double sparse_seconds = time_reference(true);
+  std::printf("[ sparse ] host dense %.6f s, sparse %.6f s, speedup %.2fx\n", dense_seconds, sparse_seconds,
+              dense_seconds / sparse_seconds);
+
+  for (int64_t row = 0; row < tiles * kTileRows; ++row) {
+    if (is_selected(row)) {
+      continue;
+    }
+    const auto first = cache.begin() + static_cast<std::ptrdiff_t>(row * kHead);
+    EXPECT_TRUE(std::all_of(first, first + kHead, [](int8_t byte) { return byte == kCanary; })) << row;
   }
 }
 

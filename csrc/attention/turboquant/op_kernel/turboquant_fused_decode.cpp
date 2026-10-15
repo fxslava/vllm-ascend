@@ -286,6 +286,7 @@ private:
         const uint64_t tileRow = slot % kCubeTileRows;
         const uint64_t tileBase = (slot - tileRow) * packedPlane_ + tileRow * kOperandC0;
         const uint32_t chunks = packedPlane_ / kOperandC0;
+        // The source plane is KV-head-major, then column-group-major, matching the NZ chunk order.
         for (uint32_t chunk = 0; chunk < chunks; ++chunk) {
             const uint64_t columnGroupOffset = static_cast<uint64_t>(chunk) * kCubeTileRows * kOperandC0;
             AscendC::DataCopy(cacheGm[tileBase + columnGroupOffset], plane[chunk * kOperandC0], kOperandC0);
@@ -392,6 +393,7 @@ public:
         mm_.Init(pipe_, headSize_, kCubeTileRows);
         vector_.Init(pipe_, queryRot, keyCache, valueCache, scaleCache, modeTables, workspace, output, numHeads,
                      numKvHeads, headSize, blockSize, numSplits, scale, invSqrtLen);
+        mm_.InitUnitScales(pipe_);
         // Init boundary: drains every pipe before the first task's GM reads and cross-core flags.
         AscendC::PipeBarrier<PIPE_ALL>();
     }

@@ -1146,6 +1146,7 @@ TEST_F(TurboQuantBareMetal, test_MIXTurboQuant3b_WriteMatchesCpuRef) {
   shape.context_len = 64;
   tqh::FusedCubeScenario scenario(shape, Stream(), tqh::VectorCoreNum(nullptr));
   const tqh::WrittenCacheAgreement agreement = scenario.CompareWrittenCache();
+  EXPECT_EQ(agreement.packed_bytes, 2 * scenario.ExpectedPackedPlaneBytes());
   EXPECT_GT(agreement.packed_bytes, 0u);
   EXPECT_EQ(agreement.packed_mismatches, 0u);
   EXPECT_EQ(agreement.scale_pad_mismatches, 0u);
@@ -1208,6 +1209,7 @@ TEST_F(TurboQuantBareMetal, test_MIXTurboQuant3b_D128EvenHeadsWriteAndDecode) {
   shape.context_len = 65;
   tqh::FusedCubeScenario scenario(shape, Stream(), tqh::VectorCoreNum(nullptr));
   const tqh::WrittenCacheAgreement agreement = scenario.CompareWrittenCache();
+  EXPECT_EQ(agreement.packed_bytes, 2 * scenario.ExpectedPackedPlaneBytes());
   EXPECT_EQ(agreement.packed_mismatches, 0u);
   const tqh::FusedRun run = scenario.RunFused(scenario.Plan());
   const std::vector<float> reference = scenario.Reference();
@@ -1225,6 +1227,7 @@ TEST_F(TurboQuantBareMetal, test_MIXTurboQuant3b_D128OddHeadPaddedWriteAndDecode
   tqh::FusedCubeScenario scenario(shape, Stream(), tqh::VectorCoreNum(nullptr));
   EXPECT_EQ(scenario.ExpectedPackedPlaneBytes(), static_cast<size_t>(scenario.PoolSlots() * 64));
   const tqh::WrittenCacheAgreement agreement = scenario.CompareWrittenCache();
+  EXPECT_EQ(agreement.packed_bytes, 2 * scenario.ExpectedPackedPlaneBytes());
   EXPECT_EQ(agreement.packed_mismatches, 0u);
   const tqh::FusedRun run = scenario.RunFused(scenario.Plan());
   const std::vector<float> reference = scenario.Reference();

@@ -112,8 +112,27 @@ inline size_t MirroredPackedByte(
   return slot * plane + kv_head * packed_bytes + column;
 }
 
+// One tile at each loop boundary. With a block size of one Cube tile, a negative
+// block-table entry bypasses the tile in both the AIV and AIC pipelines.
+inline std::vector<int64_t> SparseBoundaryTiles(int64_t tiles) {
+  std::vector<int64_t> selected;
+  for (const int64_t tile : {int64_t{0}, int64_t{1}, tiles / 2, tiles - 1}) {
+    if (tile >= 0 && tile < tiles && std::find(selected.begin(), selected.end(), tile) == selected.end()) {
+      selected.push_back(tile);
+    }
+  }
+  std::sort(selected.begin(), selected.end());
+  return selected;
+}
+
 // key_packed / value_packed follow the mode's cache layout. The operand and dense planes stay row-major:
 // [slot][kv head][column] and [token][kv head][column], respectively.
+//
+// key / value are the dequantised vectors: the level a coordinate quantised onto, times the slot's
+// scale over the codebook gain. key_levels / value_levels are the bare level, which for KV3 is the
+// number the Cube multiplies -- every kv3 centroid is exactly representable in e2m1, so the cast to
+// the operand grid is lossless on this side and the scale is applied after the Mmad instead. They
+// share the dense planes' [token][kv head][column] layout and are filled for KV3 only.
 struct MirroredKvCache {
   std::vector<int8_t> key_packed;
   std::vector<int8_t> value_packed;
@@ -122,6 +141,8 @@ struct MirroredKvCache {
   std::vector<float> scales;
   std::vector<float> key;
   std::vector<float> value;
+  std::vector<float> key_levels;
+  std::vector<float> value_levels;
 };
 
 // The packed byte of kv4fp8 pairs coordinate j (nibble lane 0) with coordinate j + head_size / 2 (lane 1).
@@ -164,6 +185,10 @@ inline MirroredKvCache BuildMirroredKvCache(
   cache.scales.assign(slots * slot_floats, 0.0f);
   cache.key.assign(static_cast<size_t>(context_len) * kv_heads * head, 0.0f);
   cache.value.assign(cache.key.size(), 0.0f);
+  if (kv3) {
+    cache.key_levels.assign(cache.key.size(), 0.0f);
+    cache.value_levels.assign(cache.key.size(), 0.0f);
+  }
 
   for (int64_t t = 0; t < context_len; ++t) {
     const size_t slot =
@@ -196,15 +221,17 @@ inline MirroredKvCache BuildMirroredKvCache(
           return bin;
         };
         if (kv3) {
+          std::vector<float>& levels = plane == 0 ? cache.key_levels : cache.value_levels;
           std::vector<int32_t> bins(head);
           for (size_t c = 0; c < head; ++c) {
             const int32_t bin = index_of(source[mirror_halves ? c % half : c]);
             bins[c] = bin;
+            levels[dense_row + c] = MirroredKv3Traits::kCentroids[bin];
             dense[dense_row + c] = MirroredKv3Traits::kCentroids[bin] * scale / MirroredKv3Traits::kGain;
           }
           const std::vector<int8_t> row_bytes = turboquant_ref::cpu_pack_kv3_bins(bins);
           for (size_t byte = 0; byte < packed_bytes; ++byte) {
-            packed[MirroredPackedByte(slot, kv, byte, kv_heads, packed_bytes, mode)] = row_bytes[byte];
+            packed[slot * packed_plane + kv * packed_bytes + byte] = row_bytes[byte];
           }
           continue;
         }

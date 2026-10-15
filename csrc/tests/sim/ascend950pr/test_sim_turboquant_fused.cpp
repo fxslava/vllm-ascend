@@ -112,6 +112,13 @@ constexpr double kWrittenScaleTolerance = 2e-3;
 // sit near 0.9994 and the codebook cancels out of this comparison, so a decode that reached for the uniform
 // table -- wrong levels, and a score scale 2.983x off -- lands nowhere near this.
 constexpr double kLloydMaxCosineFloor = 0.999;
+// kv3fp4 is checked against ReferenceOnOperandGrid, not Reference: the key and value centroids
+// {+-0.5, +-2, +-4, +-6} all sit exactly on the e2m1 grid, but the query and the per-tile
+// probability rows are cast onto that same 8-magnitude grid, so an fp32 oracle measures the
+// operand cast (0.98893 here) and leaves a hundredth of a cosine for an indexing bug to hide in.
+// Against an oracle that takes the same casts, only the Cube's fp32 accumulation order and the
+// fp16 output cast are left. A wrong NZ column grouping or fractal stride lands near 0.37.
+constexpr double kKv3CosineFloor = 0.999;
 constexpr int64_t kBatchContext = 128;
 constexpr int64_t kBatchTokens = 3;
 constexpr uint32_t kBatchCubeChunk = 16;
@@ -214,12 +221,8 @@ const FusedCase kCaseJ = {
 // 2026-09-17 goldens unchanged.
 const FusedCase kCaseK = {
     "(k)", LloydMaxShape(kNarrowGroupHeads, kSingleTileContext), 0, kFillBlocks, 0.999143, 0x434fe707d97abef9ull};
-const FusedCase kCaseL = {"(l)",
-                          LloydMaxShape(kNarrowGroupHeads, kSingleTileContext, true),
-                          0,
-                          kFillBlocks,
-                          0.999493,
-                          0xb937fc50dafc55d6ull};
+const FusedCase kCaseL = {
+    "(l)", LloydMaxShape(kNarrowGroupHeads, kSingleTileContext, true), 0, kFillBlocks, 0.999493, 0xb937fc50dafc55d6ull};
 // Element-aligned int32 offsets that land inside a 32-byte burst rather than on one. One
 // of them, trimmed from {1, 2, 3} on 2026-09-28. The offsets differ only in how far into
 // the burst they sit, and each one is another kernel-writer launch: measured at about
@@ -401,8 +404,7 @@ TEST_F(TurboQuantFusedDecode, DecodesTheLloydMaxCodebookToItsGolden) {
   const double cosine = tqh::FusedCosine(fused.output, reference);
   std::printf("[ fused ] (k) Lloyd-Max cos vs fp32 over its own levels %.6f (floor %.6f)\n", cosine,
               kLloydMaxCosineFloor);
-  EXPECT_GE(cosine, kLloydMaxCosineFloor)
-      << "(k): the decode does not reproduce the levels the Lloyd-Max cache holds";
+  EXPECT_GE(cosine, kLloydMaxCosineFloor) << "(k): the decode does not reproduce the levels the Lloyd-Max cache holds";
   EXPECT_EQ(fused.num_splits, 1) << "a context inside the fused limit is never split";
   ExpectNoExceptionDumps(kCaseK.tag);
 }
@@ -570,6 +572,44 @@ TEST_F(TurboQuantFusedDecode, Kv3D128WritesAndDecodesAlignedAndPaddedPlanes) {
     EXPECT_GT(tqh::FusedCosine(fused.output, scenario.Reference()), 0.99);
     ExpectNoExceptionDumps("KV3 D128");
   }
+}
+
+// Five logical tiles are the shortest shape with a skipped tile and distinct
+// first, second, steady-state and ragged-tail tiles. The -1 block entry makes
+// CountTiles/NextTile bypass the skipped tile without changing the kernel.
+TEST_F(TurboQuantFusedDecode, Kv3SparseBoundaryCanariesAndRaggedTail) {
+  tqh::FusedShape shape;
+  shape.mode = vllm_ascend::turboquant::TurboQuantMode::KV3_FP4;
+  shape.head_size = kQwenHeadSize;
+  shape.num_heads = 4;
+  shape.num_kv_heads = 2;
+  shape.context_len = 4 * kBlockSize + 1;
+  shape.sparse_boundary = true;
+  watchdog_.Arm("KV3 sparse boundary setup");
+  tqh::FusedCubeScenario scenario(shape, stream_, aiv_num_);
+  watchdog_.Disarm();
+  ASSERT_EQ(scenario.sparse_tile_count(), 4u);
+  const std::vector<float> reference = scenario.ReferenceOnOperandGrid();
+  watchdog_.Arm("KV3 sparse boundary decode");
+  const tqh::FusedRun fused = scenario.RunFused(scenario.Plan(0, kContextOnly));
+  watchdog_.Disarm();
+  ASSERT_EQ(fused.launches, 1);
+  ASSERT_EQ(fused.untouched, 0u);
+  const double cosine = tqh::FusedCosine(fused.output, reference);
+  std::printf("[ fused ] KV3 sparse boundary cos vs the e2m1 operand grid %.6f (floor %.6f)\n", cosine,
+              kKv3CosineFloor);
+  ASSERT_GE(cosine, kKv3CosineFloor) << "the sparse-boundary decode does not match the operands it multiplies";
+  ASSERT_EQ(scenario.SparseCanaryMismatches(), 0u);
+  scenario.PoisonInactiveTail();
+  watchdog_.Arm("KV3 sparse ragged-tail poison decode");
+  const tqh::FusedRun poisoned = scenario.RunFused(scenario.Plan(0, kContextOnly));
+  watchdog_.Disarm();
+  ASSERT_EQ(fused.raw.size(), poisoned.raw.size());
+  for (size_t i = 0; i < fused.raw.size(); ++i) {
+    EXPECT_EQ(fused.raw[i].bits, poisoned.raw[i].bits) << "tail poison reached output element " << i;
+  }
+  EXPECT_EQ(scenario.SparseCanaryMismatches(), 0u);
+  ExpectNoExceptionDumps("KV3 sparse boundary");
 }
 
 TEST_F(TurboQuantFusedDecode, RotatesARawQueryOnceAheadOfItsSplits) {

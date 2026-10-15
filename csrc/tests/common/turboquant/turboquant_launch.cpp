@@ -183,6 +183,12 @@ std::vector<int32_t> ModeTables(tqm::TurboQuantMode mode, int64_t head_size, int
   const int64_t low_bytes = d / planes.low_per_byte;
   const int64_t low_shift = Shift(planes.low_per_byte);
 
+  // One NZ fractal row is kOperandC0 bytes wide, which is kOperandC0 operand values for an fp8 mode but
+  // twice that for an fp4 one. A gathered value's column group is counted in values, so the band the
+  // permutation below folds holds batch_rows of these, not batch_rows of bytes.
+  const int64_t fractal_columns =
+      cfg.operand == vllm_ascend::turboquant::TurboQuantOperand::kFp4E2m1 ? 2 * kOperandC0 : kOperandC0;
+
   std::vector<int32_t> tables;
   tables.reserve(static_cast<size_t>(ModeTableWords(mode, d, batch_rows)));
 
@@ -191,11 +197,11 @@ std::vector<int32_t> ModeTables(tqm::TurboQuantMode mode, int64_t head_size, int
       int64_t r = p / d;
       int64_t c = p % d;
       if (nz_rows > 0) {
-        const int64_t band = batch_rows * kOperandC0;
+        const int64_t band = batch_rows * fractal_columns;
         const int64_t b = p / band;
         const int64_t rem = p % band;
-        r = rem / kOperandC0;
-        c = b * kOperandC0 + (rem % kOperandC0);
+        r = rem / fractal_columns;
+        c = b * fractal_columns + (rem % fractal_columns);
       }
       const int64_t byte = plane == 0 ? r * packed_bytes + (c >> low_shift) : r * packed_bytes + low_bytes + (c >> 3);
       tables.push_back(static_cast<int32_t>(kWord * byte));

@@ -257,3 +257,9 @@ out/
 
 # QEMU/process crash dumps from cross-arch simulator runs
 *.core
+
+# CAModel trace files. A simulator run writes ~400 of these per process into its cwd, and the
+# Django block above already covers the *.log half of the set.
+*.dump
+*.vcd
+dump/

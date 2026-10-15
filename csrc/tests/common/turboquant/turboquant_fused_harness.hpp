@@ -23,10 +23,13 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
 #include <vector>
 
 #include "acl_check.hpp"
 #include "device_buffer.hpp"
+#include "fp4_e2m1.hpp"
 #include "fp16.hpp"
 #include "random_data.hpp"
 #include "turboquant_launch.hpp"
@@ -37,7 +40,14 @@ namespace test {
 namespace turboquant_host {
 
 constexpr uint32_t kFusedSeed = 0xF05Eu;
+// TurboQuantCodec<BITS>::kEps, duplicated rather than included: turboquant_codec_950.h is an
+// Ascend C header and does not compile on the host. It guards a divide, and at double precision
+// over these magnitudes it changes nothing -- it is here so the reference divides by the same
+// denominator the kernel does rather than by one that happens to be close.
+constexpr double kOperandGridEps = 1e-20;
 constexpr float kFusedOutputSentinel = -1234.5f;
+constexpr int8_t kSparsePackedCanary = static_cast<int8_t>(0x5a);
+constexpr float kSparseScaleCanary = 12345.0f;
 
 struct FusedShape {
   vllm_ascend::turboquant::TurboQuantMode mode = vllm_ascend::turboquant::TurboQuantMode::KV4_FP8;
@@ -65,6 +75,8 @@ struct FusedShape {
   // the kernel writer and the decode entry point, because a cache and a decode on different codebooks
   // produce a plausible wrong answer rather than an error. Not available through the raw-query entry.
   bool lloyd_max = false;
+  // Skip all but the first, second, middle and last Cube tiles. Requires one tile per block.
+  bool sparse_boundary = false;
 };
 
 // The raw GM image one cache-writer launch produced, copied out of device memory.
@@ -141,6 +153,9 @@ class FusedCubeScenario {
  public:
   FusedCubeScenario(const FusedShape& shape, aclrtStream stream, int64_t aiv_num)
       : shape_(shape), stream_(stream), aiv_num_(aiv_num) {
+    if (shape.sparse_boundary && shape.block_size != kCubeTileRows) {
+      throw std::invalid_argument("sparse boundary verification needs one Cube tile per block");
+    }
     const int64_t d = shape.head_size;
     blocks_per_seq_ = CeilDiv(shape.context_len, shape.block_size);
     const int64_t num_blocks = blocks_per_seq_ * shape.pool_factor;
@@ -150,6 +165,28 @@ class FusedCubeScenario {
     block_table_.assign(permutation.begin(), permutation.begin() + static_cast<std::ptrdiff_t>(blocks_per_seq_));
     cache_ = BuildMirroredKvCache(rng, shape.context_len, num_blocks, shape.block_size, shape.num_kv_heads, d,
                                   block_table_, !shape.kernel_writer, codebook(), shape.mode);
+    if (shape.sparse_boundary) {
+      if (shape.kernel_writer) {
+        throw std::invalid_argument("sparse boundary verification requires a host-uploaded cache");
+      }
+      sparse_tiles_ = SparseBoundaryTiles(blocks_per_seq_);
+      const size_t packed_stride = static_cast<size_t>(
+          vllm_ascend::turboquant::TurboQuantModeConfigOf(shape.mode).PackedPlaneBytes(d, shape.num_kv_heads));
+      const size_t scale_stride = static_cast<size_t>(MirroredScaleSlotFloats(shape.num_kv_heads));
+      for (int64_t tile = 0; tile < blocks_per_seq_; ++tile) {
+        if (IsSparseTile(tile)) {
+          continue;
+        }
+        const size_t first_slot = static_cast<size_t>(block_table_[static_cast<size_t>(tile)] * shape.block_size);
+        const size_t last_slot = first_slot + static_cast<size_t>(shape.block_size);
+        std::fill(cache_.key_packed.begin() + first_slot * packed_stride,
+                  cache_.key_packed.begin() + last_slot * packed_stride, kSparsePackedCanary);
+        std::fill(cache_.value_packed.begin() + first_slot * packed_stride,
+                  cache_.value_packed.begin() + last_slot * packed_stride, kSparsePackedCanary);
+        std::fill(cache_.scales.begin() + first_slot * scale_stride, cache_.scales.begin() + last_slot * scale_stride,
+                  kSparseScaleCanary);
+      }
+    }
     const size_t query_elems = static_cast<size_t>(shape.batch * shape.num_heads * d);
     const std::vector<float> query = rng.NormalHalfExact(query_elems, 0.0f, 1.0f);
     if (shape.gated) {
@@ -175,7 +212,10 @@ class FusedCubeScenario {
       if (shape.unmapped_block_table) {
         block_rows.insert(block_rows.end(), static_cast<size_t>(blocks_per_seq_), -1);
       } else {
-        block_rows.insert(block_rows.end(), block_table_.begin(), block_table_.end());
+        for (int64_t tile = 0; tile < blocks_per_seq_; ++tile) {
+          block_rows.push_back(shape.sparse_boundary && !IsSparseTile(tile) ? -1
+                                                                            : block_table_[static_cast<size_t>(tile)]);
+        }
       }
     }
     block_tables_ = DeviceBuffer::FromHost(block_rows);
@@ -263,27 +303,35 @@ class FusedCubeScenario {
     const int64_t d = shape_.head_size;
     const int64_t heads_per_kv = shape_.num_heads / shape_.num_kv_heads;
     std::vector<float> out(static_cast<size_t>(shape_.batch * shape_.num_heads * d), 0.0f);
-    std::vector<double> logits(static_cast<size_t>(shape_.context_len), 0.0);
+    std::vector<int64_t> active_tokens;
+    for (int64_t t = 0; t < shape_.context_len; ++t) {
+      if (!shape_.sparse_boundary || IsSparseTile(t / shape_.block_size)) {
+        active_tokens.push_back(t);
+      }
+    }
+    std::vector<double> logits(active_tokens.size(), 0.0);
     // h is a (token, head) row; every token attends to the same sequence.
     for (int64_t h = 0; h < shape_.batch * shape_.num_heads; ++h) {
       const int64_t kv = (h % shape_.num_heads) / heads_per_kv;
       double max_logit = -1e30;
-      for (int64_t t = 0; t < shape_.context_len; ++t) {
+      for (size_t i = 0; i < active_tokens.size(); ++i) {
+        const int64_t t = active_tokens[i];
         double dot = 0.0;
         for (int64_t c = 0; c < d; ++c) {
           dot += static_cast<double>(query_rot_host_[static_cast<size_t>(h * d + c)]) *
                  static_cast<double>(cache_.key[static_cast<size_t>((t * shape_.num_kv_heads + kv) * d + c)]);
         }
-        logits[static_cast<size_t>(t)] = dot * static_cast<double>(scale_);
-        max_logit = std::max(max_logit, logits[static_cast<size_t>(t)]);
+        logits[i] = dot * static_cast<double>(scale_);
+        max_logit = std::max(max_logit, logits[i]);
       }
       double denom = 0.0;
-      for (int64_t t = 0; t < shape_.context_len; ++t) {
-        logits[static_cast<size_t>(t)] = std::exp(logits[static_cast<size_t>(t)] - max_logit);
-        denom += logits[static_cast<size_t>(t)];
+      for (double& logit : logits) {
+        logit = std::exp(logit - max_logit);
+        denom += logit;
       }
-      for (int64_t t = 0; t < shape_.context_len; ++t) {
-        const double weight = logits[static_cast<size_t>(t)] / denom;
+      for (size_t i = 0; i < active_tokens.size(); ++i) {
+        const int64_t t = active_tokens[i];
+        const double weight = logits[i] / denom;
         for (int64_t c = 0; c < d; ++c) {
           out[static_cast<size_t>(h * d + c)] += static_cast<float>(
               weight * static_cast<double>(cache_.value[static_cast<size_t>((t * shape_.num_kv_heads + kv) * d + c)]));
@@ -293,7 +341,159 @@ class FusedCubeScenario {
     return out;
   }
 
+  // Reference() in fp32 over the levels the cache holds answers "did the quantiser lose anything",
+  // which for an fp4 mode is about a hundredth of a cosine -- enough slack to hide a transposed
+  // column group, a tail row off by one or a single corrupted lane. This one answers "did the kernel
+  // compute what it set out to" instead, by taking every step the KV3 decode takes on the numbers it
+  // takes them on: the query and the per-tile probability rows land on the e2m1 grid here too, the
+  // online softmax runs tile by tile in the kernel's order over the kernel's mapped tiles, and the
+  // per-slot scales are applied where the kernel applies them -- the key's after the score Mmad, the
+  // value's folded into the probability row before its cast. What is left over is fp32 accumulation
+  // order in the Cube against double here, and the fp16 output cast, so the gate is 0.999, not 0.95.
+  //
+  // KV3 only: it reads the bare levels, which an fp8 mode does not keep.
+  std::vector<float> ReferenceOnOperandGrid() const {
+    const int64_t d = shape_.head_size;
+    const int64_t heads_per_kv = shape_.num_heads / shape_.num_kv_heads;
+    const int64_t scale_stride = MirroredScaleSlotFloats(shape_.num_kv_heads);
+    const double gain = static_cast<double>(MirroredKv3Traits::kGain);
+    const double eps = kOperandGridEps;
+    const double operand_max = static_cast<double>(vllm_ascend::test::fp4::kE2m1Max);
+    std::vector<float> out(static_cast<size_t>(shape_.batch * shape_.num_heads * d), 0.0f);
+
+    std::vector<double> query_operand(static_cast<size_t>(d), 0.0);
+    std::vector<double> logits(static_cast<size_t>(kCubeTileRows), 0.0);
+    std::vector<double> probs(static_cast<size_t>(kCubeTileRows), 0.0);
+    std::vector<double> acc(static_cast<size_t>(d), 0.0);
+    std::vector<double> context(static_cast<size_t>(d), 0.0);
+
+    for (int64_t h = 0; h < shape_.batch * shape_.num_heads; ++h) {
+      const int64_t kv = (h % shape_.num_heads) / heads_per_kv;
+
+      // ComputeQueryOperandHeads: amax over the head, then the whole row onto the operand grid.
+      double amax = 0.0;
+      for (int64_t c = 0; c < d; ++c) {
+        amax = std::max(amax, std::fabs(static_cast<double>(query_rot_host_[static_cast<size_t>(h * d + c)])));
+      }
+      const double q_scale = operand_max / (amax + eps);
+      for (int64_t c = 0; c < d; ++c) {
+        query_operand[static_cast<size_t>(c)] = static_cast<double>(vllm_ascend::test::fp4::E2m1Operand(
+            static_cast<float>(static_cast<double>(query_rot_host_[static_cast<size_t>(h * d + c)]) * q_scale)));
+      }
+      const double q_scale_inv = 1.0 / q_scale;
+
+      std::fill(acc.begin(), acc.end(), 0.0);
+      double run_max = -std::numeric_limits<double>::infinity();
+      double run_sum = 0.0;
+
+      for (int64_t tile = 0; tile < blocks_per_seq_; ++tile) {
+        if (shape_.sparse_boundary && !IsSparseTile(tile)) {
+          continue;  // NextTile walks past an unmapped block without touching the accumulators
+        }
+        const int64_t first = tile * kCubeTileRows;
+        const int64_t valid = std::min<int64_t>(kCubeTileRows, shape_.context_len - first);
+        if (valid <= 0) {
+          continue;
+        }
+        const int64_t slot_base = block_table_[static_cast<size_t>(tile)] * shape_.block_size;
+
+        // The score Mmad, then keyScale = slot scale * (softmax scale / gain) and 1 / qScale.
+        double tile_max = -std::numeric_limits<double>::infinity();
+        for (int64_t i = 0; i < valid; ++i) {
+          const size_t row = static_cast<size_t>(((first + i) * shape_.num_kv_heads + kv) * d);
+          double dot = 0.0;
+          for (int64_t c = 0; c < d; ++c) {
+            dot += query_operand[static_cast<size_t>(c)] *
+                   static_cast<double>(cache_.key_levels[row + static_cast<size_t>(c)]);
+          }
+          const double key_scale =
+              static_cast<double>(cache_.scales[static_cast<size_t>((slot_base + i) * scale_stride + kv)]);
+          logits[static_cast<size_t>(i)] = dot * key_scale * (static_cast<double>(scale_) / gain) * q_scale_inv;
+          tile_max = std::max(tile_max, logits[static_cast<size_t>(i)]);
+        }
+
+        // One online-softmax step. The masked tail rows exp() to exactly zero, so they are simply absent.
+        const double new_max = std::max(run_max, tile_max);
+        const double alpha = std::isinf(run_max) ? 0.0 : std::exp(run_max - new_max);
+        double tile_sum = 0.0;
+        for (int64_t i = 0; i < valid; ++i) {
+          probs[static_cast<size_t>(i)] = std::exp(logits[static_cast<size_t>(i)] - new_max);
+          tile_sum += probs[static_cast<size_t>(i)];
+        }
+        run_sum = run_sum * alpha + tile_sum;
+
+        // The value's slot scale rides in the probability row, so the row's own max sets probScale.
+        double prob_max = 0.0;
+        for (int64_t i = 0; i < valid; ++i) {
+          const double value_scale =
+              static_cast<double>(
+                  cache_.scales[static_cast<size_t>((slot_base + i) * scale_stride + shape_.num_kv_heads + kv)]) /
+              gain;
+          probs[static_cast<size_t>(i)] *= value_scale;
+          prob_max = std::max(prob_max, probs[static_cast<size_t>(i)]);
+        }
+        const double prob_scale = operand_max / (prob_max + eps);
+        for (int64_t i = 0; i < valid; ++i) {
+          probs[static_cast<size_t>(i)] = static_cast<double>(vllm_ascend::test::fp4::E2m1Operand(
+              static_cast<float>(probs[static_cast<size_t>(i)] * prob_scale)));
+        }
+
+        // The context Mmad, its prob scale undone, onto the decayed accumulator.
+        std::fill(context.begin(), context.end(), 0.0);
+        for (int64_t i = 0; i < valid; ++i) {
+          const size_t row = static_cast<size_t>(((first + i) * shape_.num_kv_heads + kv) * d);
+          const double weight = probs[static_cast<size_t>(i)];
+          for (int64_t c = 0; c < d; ++c) {
+            context[static_cast<size_t>(c)] +=
+                weight * static_cast<double>(cache_.value_levels[row + static_cast<size_t>(c)]);
+          }
+        }
+        for (int64_t c = 0; c < d; ++c) {
+          acc[static_cast<size_t>(c)] =
+              acc[static_cast<size_t>(c)] * alpha + context[static_cast<size_t>(c)] / prob_scale;
+        }
+        run_max = new_max;
+      }
+
+      const double inv_sum = 1.0 / (run_sum + eps);
+      for (int64_t c = 0; c < d; ++c) {
+        out[static_cast<size_t>(h * d + c)] = static_cast<float>(acc[static_cast<size_t>(c)] * inv_sum);
+      }
+    }
+    return out;
+  }
+
   int64_t blocks_per_seq() const { return blocks_per_seq_; }
+  size_t sparse_tile_count() const { return sparse_tiles_.size(); }
+
+  // Cache planes are read-only inputs to decode. Inspect the skipped physical slots after the launch.
+  size_t SparseCanaryMismatches() const {
+    if (!shape_.sparse_boundary) {
+      return 0;
+    }
+    const std::vector<int8_t> key = key_cache_.ToHost<int8_t>();
+    const std::vector<int8_t> value = value_cache_.ToHost<int8_t>();
+    const std::vector<float> scales = scale_plane_.ToHost<float>();
+    const size_t packed_stride = static_cast<size_t>(vllm_ascend::turboquant::TurboQuantModeConfigOf(shape_.mode)
+                                                         .PackedPlaneBytes(shape_.head_size, shape_.num_kv_heads));
+    const size_t scale_stride = static_cast<size_t>(MirroredScaleSlotFloats(shape_.num_kv_heads));
+    size_t mismatches = 0;
+    for (int64_t tile = 0; tile < blocks_per_seq_; ++tile) {
+      if (IsSparseTile(tile)) {
+        continue;
+      }
+      const size_t first_slot = static_cast<size_t>(block_table_[static_cast<size_t>(tile)] * shape_.block_size);
+      const size_t last_slot = first_slot + static_cast<size_t>(shape_.block_size);
+      for (size_t i = first_slot * packed_stride; i < last_slot * packed_stride; ++i) {
+        mismatches += key[i] != kSparsePackedCanary;
+        mismatches += value[i] != kSparsePackedCanary;
+      }
+      for (size_t i = first_slot * scale_stride; i < last_slot * scale_stride; ++i) {
+        mismatches += scales[i] != kSparseScaleCanary;
+      }
+    }
+    return mismatches;
+  }
 
   MirroredCodebook codebook() const {
     return shape_.lloyd_max ? MirroredCodebook::kLloydMax : MirroredCodebook::kUniform;
@@ -319,14 +519,19 @@ class FusedCubeScenario {
     std::vector<int8_t> value = value_cache_.ToHost<int8_t>();
     std::vector<float> scales = scale_plane_.ToHost<float>();
     const size_t packed_bytes = static_cast<size_t>(ModePackedBytes(shape_.mode, shape_.head_size));
+    const size_t token_row_stride = static_cast<size_t>(vllm_ascend::turboquant::TurboQuantModeConfigOf(shape_.mode)
+                                                            .PackedPlaneBytes(shape_.head_size, shape_.num_kv_heads));
     const size_t scale_stride = static_cast<size_t>(MirroredScaleSlotFloats(shape_.num_kv_heads));
     const int64_t block = block_table_.back();
     for (int64_t row = tail; row < shape_.block_size; ++row) {
       const size_t slot = static_cast<size_t>(block * shape_.block_size + row);
       for (int64_t kv = 0; kv < shape_.num_kv_heads; ++kv) {
         for (size_t byte = 0; byte < packed_bytes; ++byte) {
-          const size_t offset = MirroredPackedByte(slot, static_cast<size_t>(kv), byte,
-                                                   static_cast<size_t>(shape_.num_kv_heads), packed_bytes, shape_.mode);
+          const size_t offset =
+              shape_.mode == vllm_ascend::turboquant::TurboQuantMode::KV3_FP4
+                  ? slot * token_row_stride + static_cast<size_t>(kv) * packed_bytes + byte
+                  : MirroredPackedByte(slot, static_cast<size_t>(kv), byte, static_cast<size_t>(shape_.num_kv_heads),
+                                       packed_bytes, shape_.mode);
           const int8_t poison = row % 2 == 0 ? static_cast<int8_t>(0xff) : static_cast<int8_t>(0x00);
           key[offset] = poison;
           value[offset] = poison;
@@ -376,6 +581,8 @@ class FusedCubeScenario {
         agreement.swapped_lane_mismatches += want.size();
         continue;
       }
+      // Compare GM and CPU images at the same linear byte offset. For KV3 each
+      // slot is one row of PackedPlaneBytes, including the 16-byte D128/HKV1 pad.
       for (size_t i = 0; i < want.size(); ++i) {
         agreement.packed_mismatches += (got[i] != want[i]) ? 1u : 0u;
         agreement.swapped_lane_mismatches += (got[i] != swap_lanes(want[i])) ? 1u : 0u;
@@ -397,6 +604,9 @@ class FusedCubeScenario {
   }
 
  private:
+  bool IsSparseTile(int64_t tile) const {
+    return std::find(sparse_tiles_.begin(), sparse_tiles_.end(), tile) != sparse_tiles_.end();
+  }
   // The writer is given the unrotated fp16 of the host's dequantised vectors. It rotates them back and
   // quantises each coordinate onto the level it came from, because a level always sits strictly inside its
   // own decision cell -- centred there on the uniform grid, off-centre but never within 0.125 scale units
@@ -520,6 +730,7 @@ class FusedCubeScenario {
   std::vector<int8_t> written_value_;
   std::vector<float> written_scales_;
   std::vector<double> expected_scales_;
+  std::vector<int64_t> sparse_tiles_;
   DeviceBuffer query_, pi_signs_, h16_, rot_tables_, mode_tables_;
   DeviceBuffer key_cache_, value_cache_, scale_plane_, block_tables_, context_lens_;
   DeviceBuffer query_rot_, out_;

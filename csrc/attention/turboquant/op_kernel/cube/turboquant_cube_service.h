@@ -85,11 +85,32 @@ public:
             pipe->InitBuffer(keyL1Buf_[slot], tileBytes);
             pipe->InitBuffer(valueL1Buf_[slot], tileBytes);
         }
+        if constexpr (kIsFp4) {
+            // An FP4 Mmad is an MX Mmad. Every 32 K values need an E8M0 scale;
+            // the codec already supplies the physical values, so all scales are one.
+            unitScaleBytes_ = ((tileRows_ * headSize_ / 32 + 511) / 512) * 512;
+            pipe->InitBuffer(unitScaleL1Buf_, unitScaleBytes_);
+        }
 
         if ASCEND_IS_AIC {
             pipe->InitBuffer(operandL0aBuf_, queryBytes > probsBytes ? queryBytes : probsBytes);
             pipe->InitBuffer(operandL0bBuf_, tileBytes);
             pipe->InitBuffer(productL0cBuf_, kCubeTileM * headSize_ * sizeof(float));
+        }
+    }
+
+    // Called after the vector service reserves its fixed Fixpipe UB windows.
+    __aicore__ inline void InitUnitScales(AscendC::TPipe *pipe)
+    {
+        if constexpr (kIsFp4) {
+            pipe->InitBuffer(unitScaleUbBuf_, unitScaleBytes_);
+            if ASCEND_IS_AIV {
+                const auto ones = unitScaleUbBuf_.template Get<uint8_t>();
+                AscendC::Duplicate(ones, static_cast<uint8_t>(127), unitScaleBytes_);
+                SyncVectorToMte3();
+                AscendC::DataCopy(unitScaleL1Buf_.template Get<uint8_t>(), ones, unitScaleBytes_);
+                AscendC::PipeBarrier<PIPE_MTE3>();
+            }
         }
     }
 
@@ -134,9 +155,10 @@ public:
 
 private:
     static constexpr uint16_t kFractalRows = 16;
-    static constexpr uint16_t kC0 = 32;
-    // The K x N load issues its fractal rows two at a time.
-    static constexpr uint16_t kKnBandRows = 2;
+    // One B4 fractal row holds 64 values (32 bytes); B8 rows hold 32 values.
+    static constexpr uint16_t kC0 = kIsFp4 ? 64 : 32;
+    // Transposed B4 loads require mStep divisible by four; B8 requires two.
+    static constexpr uint16_t kKnBandRows = kIsFp4 ? 4 : 2;
     static constexpr uint32_t kDualDstSubcores = 2;
     static constexpr uint8_t kDualDstSplitM = 1;
 
@@ -152,7 +174,14 @@ private:
         params.srcStride = CeilDivU16(m, kFractalRows);
         params.dstStride = CeilDivU16(m, kFractalRows);
         params.ifTranspose = false;
-        AscendC::LoadData(dstL0a, srcL1, params);
+        if constexpr (kIsFp4) {
+            const uint8_t xStep = CeilDivU16(m, kFractalRows);
+            const uint8_t yStep = CeilDivU16(k, kC0);
+            const AscendC::LoadData2DMxParams mxParams{0, 0, xStep, yStep, yStep, yStep};
+            AscendC::LoadData(dstL0a, srcL1, unitScaleL1Buf_.template Get<fp8_e8m0_t>(), params, mxParams);
+        } else {
+            AscendC::LoadData(dstL0a, srcL1, params);
+        }
     }
 
     __aicore__ inline void StageRightToL0bFromNk(uint32_t k, uint32_t n)
@@ -167,7 +196,14 @@ private:
         params.srcStride = CeilDivU16(n, kFractalRows);
         params.dstStride = CeilDivU16(n, kFractalRows);
         params.ifTranspose = false;
-        AscendC::LoadData(dstL0b, srcL1, params);
+        if constexpr (kIsFp4) {
+            const uint8_t xStep = CeilDivU16(n, kFractalRows);
+            const uint8_t yStep = CeilDivU16(k, kC0);
+            const AscendC::LoadData2DMxParams mxParams{0, 0, xStep, yStep, yStep, yStep};
+            AscendC::LoadData(dstL0b, srcL1, unitScaleL1Buf_.template Get<fp8_e8m0_t>(), params, mxParams);
+        } else {
+            AscendC::LoadData(dstL0b, srcL1, params);
+        }
     }
 
     __aicore__ inline void StageRightToL0bFromKn(uint32_t k, uint32_t n, uint32_t variant = kCubeLoadDefault)
@@ -190,7 +226,8 @@ private:
             return;
         }
 
-        uint32_t bandStrideElems = static_cast<uint32_t>(CeilDivU16(n, kFractalRows)) * kFractalRows * kC0;
+        uint32_t bandStrideElems =
+            static_cast<uint32_t>(kKnBandRows) * CeilDivU16(n, kC0) * kFractalRows * kC0;
         if (variant == kCubeLoadBandStrideC0Elems) {
             bandStrideElems /= kC0;
         } else if (variant == kCubeLoadBandStrideRowElems) {
@@ -202,7 +239,15 @@ private:
         uint32_t dstOffset = 0;
         for (uint16_t band = 0; band < bands; ++band) {
             params.mStartPosition = static_cast<uint32_t>(kKnBandRows) * band;
-            AscendC::LoadData(dstL0b[dstOffset], srcL1, params);
+            if constexpr (kIsFp4) {
+                const uint8_t xStep = CeilDivU16(n, kFractalRows);
+                const uint8_t yStep = CeilDivU16(k, kC0);
+                const AscendC::LoadData2DMxParams mxParams{0, 0, xStep, yStep, yStep, yStep};
+                AscendC::LoadData(dstL0b[dstOffset], srcL1, unitScaleL1Buf_.template Get<fp8_e8m0_t>(), params,
+                                  mxParams);
+            } else {
+                AscendC::LoadData(dstL0b[dstOffset], srcL1, params);
+            }
             if (variant != kCubeLoadNoMte1EventPerBand) {
                 SyncMte1ToMatrix();
             }
@@ -256,11 +301,14 @@ private:
     AscendC::TBuf<AscendC::TPosition::A1> probsL1Buf_;
     AscendC::TBuf<AscendC::TPosition::B1> keyL1Buf_[kCubeSlots];
     AscendC::TBuf<AscendC::TPosition::B1> valueL1Buf_[kCubeSlots];
+    AscendC::TBuf<AscendC::TPosition::B1> unitScaleL1Buf_;
+    AscendC::TBuf<AscendC::TPosition::VECCALC> unitScaleUbBuf_;
     AscendC::TBuf<AscendC::TPosition::A2> operandL0aBuf_;
     AscendC::TBuf<AscendC::TPosition::B2> operandL0bBuf_;
     AscendC::TBuf<AscendC::TPosition::CO1> productL0cBuf_;
     uint32_t headSize_ = 0;
     uint32_t tileRows_ = 0;
+    uint32_t unitScaleBytes_ = 0;
 };
 
 // The Cube half of the fused decode. For every tile the AIV subcores stage, the AIC runs the score
