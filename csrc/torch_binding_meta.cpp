@@ -1932,14 +1932,15 @@ void npu_turboquant_paged_attention_meta(at::Tensor &, at::Tensor &, at::Tensor 
 
 #ifdef VLLM_ENABLE_TURBOQUANT_CUBE
 void npu_turboquant_cube_reshape_and_cache_meta(at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &,
-                                                at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &)
+                                                at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &,
+                                                const c10::optional<at::Tensor> &, int64_t)
 {
 }
 
 void npu_turboquant_cube_decode_meta(at::Tensor &, const c10::optional<at::Tensor> &, at::Tensor &, at::Tensor &,
                                      at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &,
                                      at::Tensor &, at::Tensor &, at::Tensor &, int64_t, int64_t, double, int64_t,
-                                     at::Tensor &)
+                                     at::Tensor &, const c10::optional<at::Tensor> &, int64_t)
 {
 }
 #endif
