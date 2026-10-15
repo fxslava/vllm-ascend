@@ -253,6 +253,28 @@ class FusedCubeScenario {
     });
   }
 
+  // The same grid through the modulo-scheduled decode (turboquant_fused_decode_opt.cpp). Same arguments,
+  // same output buffer, same sentinel accounting, so a caller can run both over one scenario and compare
+  // bits. kv4fp8 on the uniform grid only -- the opt kernel has no Lloyd-Max or kv3fp4 entry, and running
+  // the uniform one over another codebook's cache would decode a plausible wrong answer instead of
+  // failing, so report nothing launched and let the caller's launches == 1 assertion catch it.
+  FusedRun RunFusedOpt(const FusedDecodeGrid& grid) {
+    if (shape_.lloyd_max || shape_.mode != vllm_ascend::turboquant::TurboQuantMode::KV4_FP8) {
+      std::printf("[ fused ] the modulo-scheduled decode requires uniform KV4_FP8; not launched\n");
+      return FusedRun{};
+    }
+    return Launch(grid, [&](void* workspace, float inv_sqrt_len) {
+      turboquant_mm_fused_decode_opt_impl(
+          static_cast<int32_t>(shape_.mode), AscendType::FP16, stream_, grid.block_dim, query_rot_.get(),
+          key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
+          mode_tables_.get(), workspace, out_.get(), static_cast<uint32_t>(shape_.batch),
+          static_cast<uint32_t>(shape_.num_heads), static_cast<uint32_t>(shape_.num_kv_heads),
+          static_cast<uint32_t>(shape_.head_size), static_cast<uint32_t>(shape_.block_size),
+          static_cast<uint32_t>(blocks_per_seq_), static_cast<uint32_t>(grid.num_splits), grid.heads_per_task,
+          grid.tasks_per_block, grid.reduce_tasks_per_block, grid.fused_context_limit, scale_, inv_sqrt_len);
+    });
+  }
+
   // The same grid through the raw-query decode: the launch is handed the fp16 query and rotates it itself,
   // into a fresh buffer that is then compared word for word with what rotate_q wrote at setup. output_stage is a
   // TurboQuantOutputStage; kGatedOutput needs a gated shape.

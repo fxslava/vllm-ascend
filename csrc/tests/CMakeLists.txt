@@ -716,6 +716,14 @@ if(VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE)
     set(VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE
         "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/op_kernel/turboquant_paged_attention.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/op_kernel/turboquant_fused_decode.cpp"
+        # op_kernel/turboquant_fused_decode_opt.cpp  the modulo-scheduled decode, also
+        #                                            test-only, and in this library for the
+        #                                            same reason: test_sim_950pr_turboquant_fused_opt
+        #                                            calls both it and the lock-step decode
+        #                                            from one process, and a <<<>>> call site
+        #                                            reaches neither unless both launchers
+        #                                            are generated here.
+        "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/op_kernel/turboquant_fused_decode_opt.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/op_kernel/turboquant_rotate_q.cpp"
         # Test-owned device code, and the one source in this list the wheel does
         # not build - the root CMakeLists.txt names only the first and third. It is an

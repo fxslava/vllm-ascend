@@ -4506,3 +4506,87 @@ cases pass 8/8. (k) and (l) were then re-run against their pinned goldens
 - The 0.683 dB is measured on i.i.d. unit Gaussians, which is what the rotation produces and what Lloyd-Max
   is fitted to. It is reconstruction SNR, not an `O` result, and this tree's repeated finding is that about
   a third of a per-vector gain survives the softmax.
+### 13.39 The modulo-scheduled decode on the camodel: a sparse boundary grid against the kernel it reschedules (2026-10-15)
+
+`op_kernel/turboquant_fused_decode_opt.cpp` is a reschedule of the kv4fp8 fused decode, not a new one: a
+three-slot ingest ring instead of two, two Fixpipe score windows instead of one, a loop unrolled by
+`lcm(3, 2) = 6` so every ring index is a template parameter, and no launch-boundary
+`PipeBarrier<PIPE_ALL>`. The arithmetic -- query quantisation, online softmax, both GEMMs, the accumulate
+-- is untouched and in the same order.
+
+**So the oracle is the lock-step kernel, not a recorded golden.** `test_sim_950pr_turboquant_fused_opt`
+builds one scenario per rung and launches BOTH kernels over it in the same process, then requires their
+fp16 outputs to be bit-identical. A cosine against exact fp32 attention is checked too, but only as a
+backstop against both kernels being wrong together. Two rungs double as a cross-check on the harness
+itself: S = 64 reproduces 13.25 case (a)'s golden `0x6176461416358ec1` at cos 0.999407 and S = 128
+reproduces case (b)'s `0x55419cdf4456945d` at cos 0.999525, both exactly.
+
+**The grid.** Tiles per task is `ceil(S / 64)`; `kContextOnly` keeps the whole context in one task so the
+rung is the tile count. 1 tile has no steady phase at all; 2 primes both prologue L1 slots and never
+stages from the loop; 3 fills the ring; 4 is the first slot reuse and the first `kOptFlagSlotFree` token;
+6 is exactly one unroll period with an empty tail; 7 is one period plus a tail phase, the only arrangement
+where a phase's compile-time indices meet a tile index from outside its own unrolled copy. The ragged
+rungs put a partial last tile on each side of a tile edge.
+
+| S | tiles | bit diffs vs lock-step | cos vs fp32 | fnv1a (both) |
+| --- | --- | --- | --- | --- |
+| 63 | 1 | 0 | 0.999515 | `0x3a89e856824f0b71` |
+| 64 | 1 | 0 | 0.999407 | `0x6176461416358ec1` |
+| 65 | 2 | 0 | 0.999488 | `0x56119581204bde9d` |
+| 127 | 2 | 0 | 0.999453 | `0x9e8b329ff159df6d` |
+| 128 | 2 | 0 | 0.999525 | `0x55419cdf4456945d` |
+| 129 | 3 | 0 | 0.999399 | `0x779302c0c5ee526d` |
+| 192 | 3 | 0 | 0.999508 | `0x3a92fedadff9f2c1` |
+| 256 | 4 | 0 | 0.999400 | `0x470dad36e6708da5` |
+| 320 | 5 | 0 | 0.999523 | `0xca34bb9c8644ce81` |
+| 383 | 6 | 0 | 0.999144 | `0x5e46c398ffde39ed` |
+| 384 | 6 | 0 | 0.999349 | `0x7ca9bafb23d98a11` |
+| 385 | 7 | 0 | 0.999437 | `0x502ee9a02aeb3471` |
+| 448 | 7 | 0 | 0.999538 | `0xf01b577dfdb1e119` |
+
+Every rung also asserts `untouched == 0` (no output sentinel survived), no NaN or infinity, and no
+camodel exception dump. 15/15 pass, 3164 s wall on the Ascend950PR_9599 camodel.
+
+**Token balance, as far as a camodel can show it.** There is no counter to read, and the simulator is not
+probed for its internals. What an imbalance produces is observable instead: a flag waited more often than
+set strands a core and the launch never returns, and a flag set more often than waited leaves a residual
+token that the NEXT launch in the same process consumes early.
+`LeavesNoResidualTokenAcrossBackToBackLaunches` runs the kernel three times back to back over one
+scenario at seven tiles -- the rung that posts the most tokens -- with nothing cleaning the event state
+between them. All three launches returned and hashed `0xf01b577dfdb1e119` at cos 0.999538.
+
+**Guard bands.** `HoldsItsGuardBandsOnASparseRaggedContext` runs the sparse plan (every skipped tile's
+block-table entry `-1`, the GM behind it poisoned) at a ragged `4 * 64 + 1` context:
+`SparseCanaryMismatches() == 0` both before and after re-poisoning the inactive tail, and the second
+decode is bit-identical to the first, so nothing the plan does not map was read or written.
+
+**Wall-clock on the camodel is not a result.** The opt launch is 5-15 % SLOWER than the lock-step one in
+host seconds at every rung past two tiles (147.9 s against 129.5 s at S = 448). That is the simulator
+costing the extra concurrency it has to model, not the part; the camodel charges host time per simulated
+event. **The schedule's whole claim is unmeasured** and stays that way until it runs on silicon.
+
+**Not covered.**
+- **Nothing has run on hardware.** A pass here means "executes on the cycle-accurate model over this grid
+  and is bit-identical to the kernel it reschedules".
+- **Error accrual.** The sparse grid cannot see it, by construction: the online softmax rescales once per
+  tile and the distance from exact attention grows with the tile count. The `DISABLED_LongRungs`
+  instantiation exists for exactly this and WAS run once, 3/3, 3940 s:
+
+  | S | tiles | bit diffs | cos vs fp32 | fnv1a (both) | lock / opt |
+  | --- | --- | --- | --- | --- | --- |
+  | 1023 | 16 | 0 | 0.999399 | `0x4c4334eb9e88c7b5` | 294.5 s / 359.3 s |
+  | 1024 | 16 | 0 | 0.999405 | `0xa48d4b7761af8559` | 296.6 s / 367.6 s |
+  | 4096 | 64 | 0 | 0.999437 | `0x47ba7dbe25f7d8b1` | 1159.0 s / 1459.1 s |
+
+  The cosine is FLAT from 1 tile to 64 -- 0.9994 either end, and the lowest number anywhere in either
+  table is S = 383's 0.999144. Whatever the fp32 accumulator loses per rescale does not compound over 64
+  of them at this shape. The rungs stay disabled because they are priced, not because they are
+  uninformative: a launch costs about `28 + 20 * tiles` seconds here, so S = 4096 is ~44 minutes for its
+  pair against ~110 s for a grid rung. Run with `--gtest_also_run_disabled_tests`.
+- **Contexts past `kFusedContextLimit`.** S >= 4097 stops being one task and becomes the split-and-reduce
+  path, which is a different code path and needs its own case. At 512 tiles one launch extrapolates to
+  over two hours on this camodel.
+- **One shape.** H_Q 4, H_KV 2, D 256, block 64, one token, unsplit, uniform grid. The grid varies the
+  tile count and nothing else: no D = 128, no split, no kernel-writer cache, no raw-query entry, no
+  Lloyd-Max. The opt kernel's raw-query launcher is built and reachable but no case drives it.
+- **The wheel does not build this kernel.** It is in the test kernel library only.

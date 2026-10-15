@@ -71,6 +71,12 @@ set(VLLM_ASCEND_SIM_TESTS
   # Lloyd-Max codebook: goldens, cos vs fp32, the kernel writer's cache bytes, no sentinel left,
   # no exception dump.
   test_sim_950pr_turboquant_fused:test_sim_turboquant_fused
+  # The modulo-scheduled decode (op_kernel/turboquant_fused_decode_opt.cpp) over the sparse
+  # boundary grid: tile counts 1..7 and the ragged remainders either side of a tile edge, each
+  # run through BOTH kernels in one process and required to agree bit for bit, plus the
+  # back-to-back re-entrancy case and the sparse guard band. The oracle is the lock-step decode,
+  # not a recorded golden, so nothing in it has to be re-recorded when a shape moves.
+  test_sim_950pr_turboquant_fused_opt:test_sim_turboquant_fused_opt
   # Single-shot dispatch + fidelity smoke of the Cube-native multi-mode decode.
   # One pass per mode at S = 16; see the file header for why it must stay one.
   test_sim_950pr_turboquant_multimode:test_sim_turboquant_multimode)
