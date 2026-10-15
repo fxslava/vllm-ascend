@@ -63,10 +63,16 @@ enum CubeLoadVariant : uint32_t {
     kCubeLoadDoubleOperandsWait = 10,
 };
 
-template <TurboQuantMode MODE>
+// KV_SLOTS is the depth of the key/value ring in L1: one slot per tile the schedule keeps in flight. The
+// default is the lock-step decode's two; the modulo-scheduled decode asks for kCubePipelineSlots. Nothing
+// else in the class depends on it -- the GEMMs take the slot's operand as an argument -- so the only cost
+// of a deeper ring is L1 (2 * tileRows * OperandElems(headSize) bytes per slot).
+template <TurboQuantMode MODE, uint32_t KV_SLOTS = kCubeSlots>
 class TurboQuantCubeMm {
 public:
     using OperandT = typename TurboQuantOperandType<MODE>::Type;
+    static constexpr uint32_t kSlots = KV_SLOTS;
+    static_assert(KV_SLOTS >= 2, "a ring the Cube can overlap at all needs two slots");
     static constexpr bool kIsFp4 = TurboQuantModeTraits<MODE>::kOperand == TurboQuantOperand::kFp4E2m1;
 
     __aicore__ static constexpr uint32_t OperandElems(uint32_t n) { return kIsFp4 ? n / 2 : n; }
@@ -81,7 +87,7 @@ public:
         const uint32_t tileBytes = tileRows_ * OperandElems(headSize_);
         pipe->InitBuffer(queryL1Buf_, queryBytes);
         pipe->InitBuffer(probsL1Buf_, probsBytes);
-        for (uint32_t slot = 0; slot < kCubeSlots; ++slot) {
+        for (uint32_t slot = 0; slot < KV_SLOTS; ++slot) {
             pipe->InitBuffer(keyL1Buf_[slot], tileBytes);
             pipe->InitBuffer(valueL1Buf_[slot], tileBytes);
         }
@@ -299,8 +305,8 @@ private:
 
     AscendC::TBuf<AscendC::TPosition::A1> queryL1Buf_;
     AscendC::TBuf<AscendC::TPosition::A1> probsL1Buf_;
-    AscendC::TBuf<AscendC::TPosition::B1> keyL1Buf_[kCubeSlots];
-    AscendC::TBuf<AscendC::TPosition::B1> valueL1Buf_[kCubeSlots];
+    AscendC::TBuf<AscendC::TPosition::B1> keyL1Buf_[KV_SLOTS];
+    AscendC::TBuf<AscendC::TPosition::B1> valueL1Buf_[KV_SLOTS];
     AscendC::TBuf<AscendC::TPosition::B1> unitScaleL1Buf_;
     AscendC::TBuf<AscendC::TPosition::VECCALC> unitScaleUbBuf_;
     AscendC::TBuf<AscendC::TPosition::A2> operandL0aBuf_;

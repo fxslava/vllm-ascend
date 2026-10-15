@@ -1,0 +1,591 @@
+# turboquant_fused_decode_gantt.yaml
+#
+# The execution schedule of turboquant_fused_decode_opt.cpp, in the
+# ascend_gantt_builder.py DSL:
+#
+#   python C:\gant_ascend\ascend_gantt_builder.py \
+#          -i turboquant_fused_decode_gantt.yaml \
+#          -o turboquant_fused_decode_gantt.png --strict
+#
+# One task of the kv4fp8 fused decode -- one (token, kv head, head chunk) -- on the
+# three-stage modulo pipeline. In steady-state column k:
+#
+#   MTE2        reads tile k+3 into ingest ring slot k % 3
+#   AIC Cube    GemmScores(tile k+1) into score window (k+1) % 2, then GemmContext(tile k)
+#   AIV Vector  softmax(tile k) out of window k % 2, decay, the L1 stage of tile k+2,
+#               and the accumulate of tile k
+#
+# Three ring slots, two score windows: the indices are a permutation that repeats every
+# six tiles, which is why the kernel's loop is unrolled by six and carries no runtime
+# modulo at all.
+#
+# WHAT THIS CHART CLAIMS, AND WHAT IT DOES NOT
+#
+# The steady-state region declares `verify_channels: [aiv]` and no more, because the AIV
+# row is the only one that is honestly saturated at this operating point. The cost model
+# below puts the vector column at {VEC_CYC} cyc against {MTE2_CYC} cyc of MTE2 and
+# {CUBE_CYC} cyc of Cube, so the schedule is VECTOR-BOUND and the other two rows carry
+# real, drawn bubbles -- {MTE2_DUTY:.0f} % and {CUBE_DUTY:.0f} % duty. Claiming otherwise
+# would need the Cube and MTE2 rows padded with `inflight` blocks for time they spend
+# waiting on a flag, and a picture that says an engine is busy when it is blocked is
+# worse than no picture.
+#
+# That is also the finding, not a disappointment: of the {VEC_CYC} cyc on the critical
+# path, {UNPACK_CYC} are the 4-bit expand ({UNPACK_PCT:.0f} %). The remaining headroom in
+# this kernel is not in its schedule -- it is in not expanding nibbles on the vector unit
+# at all, which is a cache-format question (the Cube's native MXFP4 operand path) and not
+# a scheduling one.
+#
+# Every cycle figure is DERIVED in `model:` from one first-order cost model -- bytes over
+# bandwidth against MACs over throughput, plus fixed issue overheads -- anchored on the
+# published 950PR numbers (1.6 TB/s HBM, 128 MB L2, 432 TFLOPS fp16 Cube over 32 Cube
+# cores, 512 KB L1, 512 KB UB per AI Core). It is a CAModel-style estimate of a kernel
+# that HAS NOT RUN. Nothing here is measured silicon.
+
+meta:
+  title: "turboquant_fused_decode_opt.cpp — 3-stage modulo pipeline (950PR, arch35)"
+  subtitle: "kv4fp8 · MTE2(k+{SLOTS}) || AIC(k+1 scores, k context) || AIV(k softmax, k+2 stage, k acc) · unrolled by {PHASES}, no runtime modulo · zero PipeBarrier<PIPE_ALL>"
+  note: "column {OPT_COL} cyc at {CLK_GHZ:.2f} GHz ({COL_NS:.0f} ns) · widths are TO SCALE within a steady-state column · `idle` = engine blocked on a flag, drawn because it is real · first-order estimate of a kernel that has not run"
+  output: turboquant_fused_decode_gantt.png
+  dpi: 200
+  figure: {width: auto, height: 11.2, units_per_inch: 1.05}
+  ledger:
+    title: "per tile, one (token, kv head, head chunk) task, headSize {D} / kv heads {KVH}"
+    lines:
+      - "lock-step ring    {LOCK_COL} cyc   AIV {LOCK_VDUTY:.1f} % duty   2 slots, 1 window"
+      - "THIS SCHEDULE     {OPT_COL} cyc   AIV {VDUTY:.1f} % duty   {SLOTS} slots, {WINDOWS} windows"
+      - "speedup           {SPEEDUP:.3f}x   ({STALL} cyc of score stall removed)"
+      - ""
+      - "vector roof       {VEC_CYC} cyc   = softmax {SOFTMAX_CYC} + expand {UNPACK_CYC} + L1 {L1_STAGE_CYC} + decay {DECAY_CYC} + acc {ACC_CYC}"
+      - "MTE2, L2-warm     {MTE2_CYC} cyc   {MTE2_DUTY:.0f} % duty   ({TILE_B:,} B/tile/subcore)"
+      - "MTE2, HBM-cold    {MTE2_HBM} cyc   would be the roof instead"
+      - "AIC Cube          {CUBE_CYC} cyc   {CUBE_DUTY:.0f} % duty   (scores {GEMM_S_CYC} + context {GEMM_C_CYC})"
+      - ""
+      - "PipeBarrier<PIPE_ALL>   1 -> 0 per launch"
+      - "queue depth             1 -> 2 -> {SLOTS} tiles in flight"
+      - "runtime `% {SLOTS}`     every one, to zero (unrolled by {PHASES})"
+      - "UB ring                 {UB_RING_KIB:.0f} KiB of the {UB_KIB} KiB partition"
+      - "L1 ring                 {L1_RING_KIB:.0f} KiB of the {L1_KIB} KiB buffer"
+      - "flag ids                {FLAGS_USED} of {FLAGS_FREE} usable (4-bit id, 11..14 reserved)"
+  model_table:
+    - {name: "MTE2 tile ingest (per AIV subcore)", value: "{MTE2_CYC}", note: "2 x {DMA_SETUP} descriptor setup + {TILE_B:,} B / {L2_BPC} B/cyc -- one NZ-tiled packed plane ({PLANE_B:,} B, contiguous) plus the tile's scale lanes ({SCALE_B:,} B). At S = 4096 the whole kv4fp8 cache for this layer is {KV_MIB:.1f} MiB and sits inside the {L2_MB} MB L2, so the L2 rate is the right one; HBM-cold the same read is {MTE2_HBM} cyc and becomes the roof"}
+    - {name: "AIV 4-bit expand -> NZ operand", value: "{UNPACK_CYC}", note: "{UNPACK_PASSES} passes (int4 Cast, DeInterleave, per-plane Adds) over {TILE} x {D} = {UNPACK_ELEMS:,} values at {VEC_PC} fp32 lanes/cyc -- {UNPACK_PCT:.0f} % of the critical path, and the single largest item in this kernel"}
+    - {name: "AIV online softmax ({MROWS} heads x {TILE})", value: "{SOFTMAX_CYC}", note: "{SOFTMAX_PASSES} row passes over {SOFTMAX_ELEMS:,} elements + {SOFTMAX_FIX} cyc of reduce, Brcb and Div that do not vectorise over the tile"}
+    - {name: "AIV L1 stage (MTE3, UB -> L1)", value: "{L1_STAGE_CYC}", note: "{TILE_PLANE_B:,} B in ONE burst / {MTE3_BPC} B/cyc -- one burst because the expand lands in NZ order already (write-time NZ tiling)"}
+    - {name: "AIC GemmScores (q k^T)", value: "{GEMM_S_CYC}", note: "L1->L0 {LOAD_Q_CYC} + {LOAD_KV_CYC} + Mmad {MMAD_S_CYC} ({HEADS} x {D} x {TILE} / {FP8_MACS_PC} fp8 MAC/cyc) + dual-dst Fixpipe {FIX_S_CYC}"}
+    - {name: "AIC GemmContext (p v)", value: "{GEMM_C_CYC}", note: "L1->L0 {LOAD_KV_CYC} + Mmad {MMAD_C_CYC} + Fixpipe {FIX_C_CYC} -- the Fixpipe dominates, {HEADS} x {D} fp32 out against {HEADS} x {TILE} for the scores"}
+    - {name: "STEADY-STATE COLUMN", value: "{OPT_COL}", note: "max(MTE2 {MTE2_CYC}, AIV {VEC_CYC}, AIC {CUBE_CYC}) -- vector-bound, so the column IS the vector chain and the schedule's whole job is to leave nothing else on it"}
+    - {name: "lock-step column, for comparison", value: "{LOCK_COL}", note: "the same {VEC_CYC} cyc of vector work plus {STALL} cyc the AIV spends blocked on ScoresReady: one score window means GemmScores(k) cannot start until softmax(k-1) has freed the window, so it lands {GEMM_S_CYC} cyc after a SlotReady the AIV can only cover {ACC_CYC} cyc of"}
+    - {name: "what the second window buys", value: "{STALL}", note: "{SPEEDUP:.3f}x. Small, and it is the honest number: the Cube was never the bottleneck here, so decoupling it recovers a stall, not an engine"}
+    - {name: "what a deeper ring buys", value: "0", note: "nothing at this operating point. Depth hides LATENCY, and MTE2 at {MTE2_DUTY:.0f} % duty has none to hide; HBM-cold it would be short of BANDWIDTH, which no depth fixes. Three slots is what the flag space affords and more would be dead weight"}
+    - {name: "where the next 1.5x is", value: "{NO_UNPACK_COL}", note: "drop the expand and the column falls to max({MTE2_CYC}, {VEC_NO_UNPACK}, {CUBE_CYC}) = {NO_UNPACK_COL} cyc, {SPEEDUP_NO_UNPACK:.2f}x this schedule. That is the BYPASS_UNPACK ablation's territory and it is a CACHE FORMAT change (feed the Cube packed MXFP4 operands directly), not a schedule change"}
+
+# ---------------------------------------------------------------------------
+# cost model -- evaluated in order; later entries may use earlier names
+# ---------------------------------------------------------------------------
+model:
+  # ---- shape -------------------------------------------------------------
+  D: 256                 # headSize
+  TILE: 64               # kCubeTileRows
+  HEADS: 16              # kCubeTileM, query rows per Cube GEMM
+  MROWS: 8               # kHalfRows, heads this AIV subcore owns
+  KVH: 4                 # kv heads
+  SLOTS: 3               # kCubePipelineSlots
+  WINDOWS: 2             # kCubeScoreWindows
+  PHASES: 6              # lcm(SLOTS, WINDOWS) -- the unroll factor
+  SEQ: 4096              # the context this chart's L2 argument is made at
+
+  # ---- published 950PR numbers -------------------------------------------
+  CUBE_CORES: 32         # Ascend 950PR, Table 3-1
+  AIV_CORES: 64
+  CUBE_FP16_TFLOPS: 432
+  HBM_TBS: 1.6
+  L2_MB: 128
+  L1_KIB: 512            # per AI Core
+  UB_KIB: 256            # per AIV subcore (512 KB per AI Core, two vector cores)
+
+  # ---- derived machine parameters ----------------------------------------
+  CUBE_FLOPS_PC: 8192    # 16x16x16 fp16 MAC array, 2 flops per MAC
+  CLK_GHZ: "CUBE_FP16_TFLOPS * 1e12 / CUBE_CORES / CUBE_FLOPS_PC / 1e9"
+  FP8_MACS_PC: 8192      # fp8 Mmad is 2x the fp16 rate
+  L2_BPC: 128            # B/cyc per AIV subcore, L2-resident read
+  HBM_BPC: "HBM_TBS * 1e12 / AIV_CORES / (CLK_GHZ * 1e9)"
+  MTE1_BPC: 512          # L1 -> L0
+  MTE3_BPC: 512          # UB -> L1
+  FIX_BPC: 128           # L0C -> UB, dual destination
+  VEC_PC: 128            # fp32 elements/cyc per AIV subcore
+  DMA_SETUP: 60          # per MTE descriptor
+  FLAG: 12               # CrossCore set + wait turnaround
+
+  # ---- per-tile traffic --------------------------------------------------
+  PACKED: "D // 2"                       # kv4fp8: 4 bits per value
+  PLANE_B: "TILE * PACKED"               # one NZ-tiled (tile, kv head) plane
+  TILE_PLANE_B: "TILE * D"               # the same plane expanded to fp8 operands
+  SCALE_B: "TILE * 8 * 4"                # scale slot, ceil(2*KVH/8)*8 floats per row
+  TILE_B: "PLANE_B + SCALE_B"
+  KV_MIB: "2 * SEQ * KVH * PACKED / 1048576"
+  MTE2_CYC: "int(2 * DMA_SETUP + TILE_B / L2_BPC)"
+  MTE2_HBM: "int(2 * DMA_SETUP + TILE_B / HBM_BPC)"
+
+  # ---- the AIV chain, which is the critical path -------------------------
+  UNPACK_PASSES: 3                       # int4 Cast, DeInterleave, per-plane Adds
+  UNPACK_ELEMS: "TILE * D"
+  UNPACK_CYC: "int(UNPACK_PASSES * UNPACK_ELEMS / VEC_PC)"
+  L1_STAGE_CYC: "int(TILE_PLANE_B / MTE3_BPC)"
+  SOFTMAX_PASSES: 18                     # Mul, Mul, Min, Sub, Exp, Mul, Mul, Cast, ...
+  SOFTMAX_ELEMS: "MROWS * TILE"
+  SOFTMAX_FIX: 90                        # ReduceTileRows, Brcb, Div: per-head, not per-lane
+  SOFTMAX_CYC: "int(SOFTMAX_PASSES * SOFTMAX_ELEMS / VEC_PC + SOFTMAX_FIX)"
+  DECAY_CYC: "int(MROWS * D / VEC_PC)"
+  ACC_CYC: "int(3 * MROWS * D / VEC_PC)"
+  VEC_CYC: "SOFTMAX_CYC + UNPACK_CYC + L1_STAGE_CYC + DECAY_CYC + ACC_CYC"
+  VEC_NO_UNPACK: "VEC_CYC - UNPACK_CYC"
+
+  # ---- the AIC chain -----------------------------------------------------
+  LOAD_Q_CYC: "int(HEADS * D / MTE1_BPC)"
+  LOAD_KV_CYC: "int(TILE * D / MTE1_BPC)"
+  MMAD_S_CYC: "int(HEADS * D * TILE / FP8_MACS_PC)"
+  MMAD_C_CYC: "int(HEADS * TILE * D / FP8_MACS_PC)"
+  FIX_S_CYC: "int(HEADS * TILE * 4 / FIX_BPC)"
+  FIX_C_CYC: "int(HEADS * D * 4 / FIX_BPC)"
+  GEMM_S_CYC: "LOAD_Q_CYC + LOAD_KV_CYC + MMAD_S_CYC + FIX_S_CYC"
+  GEMM_C_CYC: "LOAD_KV_CYC + MMAD_C_CYC + FIX_C_CYC"
+  CUBE_CYC: "GEMM_S_CYC + GEMM_C_CYC"
+
+  # ---- the two columns ---------------------------------------------------
+  OPT_COL: "max(MTE2_CYC, VEC_CYC, CUBE_CYC)"
+  # Lock-step: the AIV additionally waits for GemmScores(k), which can only start once
+  # softmax(k-1) has released the single score window. Between that release and the
+  # wait, the AIV has only the accumulate to cover it with.
+  STALL: "max(0, GEMM_S_CYC - ACC_CYC)"
+  LOCK_COL: "max(MTE2_CYC, VEC_CYC + STALL, CUBE_CYC)"
+  SPEEDUP: "LOCK_COL / OPT_COL"
+  NO_UNPACK_COL: "max(MTE2_CYC, VEC_NO_UNPACK, CUBE_CYC)"
+  SPEEDUP_NO_UNPACK: "OPT_COL / NO_UNPACK_COL"
+  COL_NS: "OPT_COL / CLK_GHZ"
+
+  VDUTY: "100.0 * VEC_CYC / OPT_COL"
+  LOCK_VDUTY: "100.0 * VEC_CYC / LOCK_COL"
+  MTE2_DUTY: "100.0 * MTE2_CYC / OPT_COL"
+  CUBE_DUTY: "100.0 * CUBE_CYC / OPT_COL"
+  UNPACK_PCT: "100.0 * UNPACK_CYC / VEC_CYC"
+  MTE2_IDLE_PCT: "100.0 - MTE2_DUTY"
+  CUBE_IDLE_PCT: "100.0 - CUBE_DUTY"
+
+  # ---- footprint and flags ----------------------------------------------
+  UB_RING_KIB: "SLOTS * TILE_B / 1024"
+  L1_RING_KIB: "SLOTS * 2 * TILE_PLANE_B / 1024"
+  FLAGS_USED: "2 * SLOTS + WINDOWS + 2"
+  FLAGS_FREE: 11
+
+  # ---- schematic widths: TO SCALE within a steady-state column -----------
+  COLW: 2.40
+  W_MTE2: "COLW * MTE2_CYC / OPT_COL"
+  W_MTE2_IDLE: "COLW - W_MTE2"
+  W_GS: "COLW * GEMM_S_CYC / OPT_COL"
+  W_GC: "COLW * GEMM_C_CYC / OPT_COL"
+  W_CUBE_IDLE: "COLW - W_GS - W_GC"
+  W_SM: "COLW * SOFTMAX_CYC / OPT_COL"
+  W_DEC: "COLW * DECAY_CYC / OPT_COL"
+  W_UP: "COLW * (UNPACK_CYC + L1_STAGE_CYC) / OPT_COL"
+  W_AC: "COLW * ACC_CYC / OPT_COL"
+  W_STALL: "COLW * STALL / OPT_COL"
+  COLUMNS: 24
+  EL_COLS: "COLUMNS - 6"
+  W_EL: "2.45"
+  EL_CYC: "EL_COLS * OPT_COL"
+  TASK_CYC: "COLUMNS * OPT_COL"
+
+style:
+  row_spacing: 1.62
+  block_height: 0.46
+  gap: 0.0                 # the steady state is back to back: a drawn gap is a drawn bubble
+  barrier_gap: 0.17
+  legend_cols: 3
+  axes_rect: [0.150, 0.150, 0.838, 0.690]
+  left_margin: -16.2    # NEGATIVE on purpose: clips the mandatory ghost iteration
+                        # so the opaque one gets the frame
+  right_margin: 2.2
+  bottom_margin: 2.0
+  width: {w0: 0.26, k: 0.74, c: 60.0}
+  spline: angle3           # 0/180 out of a vertical edge, 90/270 into a horizontal one
+  callout_face: "#ffffff"  # fully opaque: a callout masks every spline beneath it
+  region_face: "#4a3aa7"
+  region_alpha: 0.075
+  depth_face: "#4a3aa7"
+
+# ---------------------------------------------------------------------------
+# channel topography. ONE AIV row: the two vector subcores run the same program on
+# different planes and different heads, so drawing them apart would suggest they can
+# diverge. The UB row is the ring itself -- three ingest slots and two score windows.
+channels:
+  - id: scalar
+    label: "Scalar Core\n(Async Run-Ahead Issue)"
+    color: "#008300"
+  - id: mte2
+    label: "MTE2 / AIV Subcore 0\n(KV Inflow to L1)"
+    color: "#1baf7a"
+  - id: aic
+    label: "AIC Cube Core\n(GemmScores & GemmContext)"
+    color: "#2a78d6"
+  - id: aiv
+    label: "AIV Vector Core\n(Online Softmax & Acc)"
+    color: "#d55181"
+  - id: ub
+    label: "UB Buffer Residency\n(Ping-Pong Ring Slots)"
+    color: "#1baf7a"
+    height: 2.6
+    lanes:
+      - {id: s0, dy:  1.50, h: 0.26}
+      - {id: s1, dy:  0.90, h: 0.26}
+      - {id: s2, dy:  0.30, h: 0.26}
+      - {id: w0, dy: -0.44, h: 0.26}
+      - {id: w1, dy: -1.04, h: 0.26}
+      - {id: ac, dy: -1.62, h: 0.26}
+  - id: mte3
+    label: "MTE3\n(Fused Output Store)"
+    color: "#eda100"
+
+timeline:
+  iterations: 1            # one task; the structure worth seeing is inside it
+  stride: auto
+  current_label: "one (token, kv head, head chunk) task"
+
+# ---------------------------------------------------------------------------
+blocks:
+  # =========================================================================
+  # RAMP-UP (PROLOGUE) -- prime the ingest ring, then stage tiles 0 and 1 into L1
+  # =========================================================================
+  - {id: s_pro, channel: scalar, cycles: 140, fontsize: 5.8, place: {at: 0.9},
+     label: "task prologue\ncontextLen, CountTiles,\nblock table"}
+  - {id: s_d0, channel: scalar, cycles: DMA_SETUP, rotate: true, fontsize: 5.4,
+     place: {after: s_pro, gap: 0.05}, label: "desc"}
+  - {id: s_d1, channel: scalar, cycles: DMA_SETUP, rotate: true, fontsize: 5.4,
+     place: {after: s_d0, gap: 0.05}, label: "desc"}
+  - {id: s_d2, channel: scalar, cycles: DMA_SETUP, rotate: true, fontsize: 5.4,
+     place: {after: s_d1, gap: 0.05}, label: "desc"}
+
+  - {id: r0, channel: mte2, cycles: MTE2_CYC, fontsize: 5.8, place: {after: s_pro},
+     label: "tile 0\n-> slot 0"}
+  - {id: r1, channel: mte2, cycles: MTE2_CYC, fontsize: 5.8, place: {after: r0},
+     label: "tile 1\n-> slot 1"}
+  - {id: r2, channel: mte2, cycles: MTE2_CYC, fontsize: 5.8, place: {after: r1},
+     label: "tile 2\n-> slot 2"}
+
+  - {id: v_q, channel: aiv, cycles: 180, fontsize: 5.8, place: {align: r0},
+     label: "StageQuery\nquantise + L1\n+ tail mask"}
+  - {id: v_u0, channel: aiv, cycles: "UNPACK_CYC + L1_STAGE_CYC", fontsize: 5.8,
+     place: {after: r0}, label: "expand tile 0\n-> L1 kv[0]"}
+  - {id: v_u1, channel: aiv, cycles: "UNPACK_CYC + L1_STAGE_CYC", fontsize: 5.8,
+     place: {after: v_u0}, label: "expand tile 1\n-> L1 kv[1]"}
+
+  - {id: a_idle0, channel: aic, cycles: 0, kind: idle, fontsize: 6.0,
+     place: {span: {from: {block: r0, edge: left}, to: {block: v_u0, edge: right}}},
+     label: "no tile in L1 yet"}
+  - {id: a_gs0, channel: aic, cycles: GEMM_S_CYC, fontsize: 5.6, place: {after: v_u0},
+     label: "Scores\ntile 0\n-> win 0"}
+  - {id: a_idle1, channel: aic, cycles: 0, kind: idle, fontsize: 5.4,
+     place: {span: {from: {block: a_gs0, edge: right}, to: {block: v_u1, edge: right}}},
+     label: "waits ProbsReady(0)"}
+
+  - {id: m3_pro, channel: mte3, cycles: 0, kind: idle, fontsize: 6.0,
+     place: {span: {from: {block: r0, edge: left}, to: {block: v_u1, edge: right}}},
+     label: "the fused store is a once-per-task epilogue, not a per-tile one: the accumulator stays in UB for the whole context"
+     }
+
+  # =========================================================================
+  # STEADY STATE -- six phases is one full period; four are drawn, the rest elided
+  # =========================================================================
+  # ---- column k = 0 : slot 0, window 0 -----------------------------------
+  - {id: v_sm0, channel: aiv, cycles: SOFTMAX_CYC, width: W_SM, fontsize: 5.4,
+     place: {after: v_u1}, label: "softmax 0\nwin 0"}
+  - {id: v_dc0, channel: aiv, cycles: DECAY_CYC, width: W_DEC, rotate: true, fontsize: 5.0,
+     place: {after: v_sm0}, label: "decay"}
+  - {id: v_st0, channel: aiv, cycles: "UNPACK_CYC + L1_STAGE_CYC", width: W_UP, fontsize: 5.4,
+     place: {after: v_dc0}, label: "expand tile 2 -> L1 kv[2]"}
+  - {id: v_ac0, channel: aiv, cycles: ACC_CYC, width: W_AC, rotate: true, fontsize: 5.0,
+     place: {after: v_st0}, label: "acc 0"}
+
+  - {id: m_r3, channel: mte2, cycles: MTE2_CYC, width: W_MTE2, fontsize: 5.4,
+     place: {align: v_sm0}, label: "tile 3\n-> slot 0"}
+  - {id: m_i0, channel: mte2, cycles: 0, kind: idle, fontsize: 5.2,
+     place: {span: {from: {block: m_r3, edge: right}, to: {block: v_ac0, edge: right}}},
+     label: "MTE2 idle {MTE2_IDLE_PCT:.0f} % — L2-resident KV"}
+
+  - {id: a_gs1, channel: aic, cycles: GEMM_S_CYC, width: W_GS, fontsize: 5.2,
+     place: {align: v_sm0}, label: "Scores 1\n-> win 1"}
+  - {id: a_gc0, channel: aic, cycles: GEMM_C_CYC, width: W_GC, fontsize: 5.2,
+     place: {after: a_gs1}, label: "Context 0"}
+  - {id: a_i0, channel: aic, cycles: 0, kind: idle, fontsize: 5.2,
+     place: {span: {from: {block: a_gc0, edge: right}, to: {block: v_ac0, edge: right}}},
+     label: "Cube idle {CUBE_IDLE_PCT:.0f} %"}
+
+  # ---- column k = 1 : slot 1, window 1 -----------------------------------
+  - {id: v_sm1, channel: aiv, cycles: SOFTMAX_CYC, width: W_SM, fontsize: 5.4,
+     place: {after: v_ac0}, label: "softmax 1\nwin 1"}
+  - {id: v_dc1, channel: aiv, cycles: DECAY_CYC, width: W_DEC, rotate: true, fontsize: 5.0,
+     place: {after: v_sm1}, label: "decay"}
+  - {id: v_st1, channel: aiv, cycles: "UNPACK_CYC + L1_STAGE_CYC", width: W_UP, fontsize: 5.4,
+     place: {after: v_dc1}, label: "expand tile 3 -> L1 kv[0]"}
+  - {id: v_ac1, channel: aiv, cycles: ACC_CYC, width: W_AC, rotate: true, fontsize: 5.0,
+     place: {after: v_st1}, label: "acc 1"}
+
+  - {id: m_r4, channel: mte2, cycles: MTE2_CYC, width: W_MTE2, fontsize: 5.4,
+     place: {align: v_sm1}, label: "tile 4\n-> slot 1"}
+  - {id: m_i1, channel: mte2, cycles: 0, kind: idle, fontsize: 5.2,
+     place: {span: {from: {block: m_r4, edge: right}, to: {block: v_ac1, edge: right}}},
+     label: ""}
+
+  - {id: a_gs2, channel: aic, cycles: GEMM_S_CYC, width: W_GS, fontsize: 5.2,
+     place: {align: v_sm1}, label: "Scores 2\n-> win 0"}
+  - {id: a_gc1, channel: aic, cycles: GEMM_C_CYC, width: W_GC, fontsize: 5.2,
+     place: {after: a_gs2}, label: "Context 1"}
+  - {id: a_i1, channel: aic, cycles: 0, kind: idle, fontsize: 5.2,
+     place: {span: {from: {block: a_gc1, edge: right}, to: {block: v_ac1, edge: right}}},
+     label: ""}
+
+  # ---- column k = 2 : slot 2, window 0 -- the ring has completed a period -
+  - {id: v_sm2, channel: aiv, cycles: SOFTMAX_CYC, width: W_SM, fontsize: 5.4,
+     place: {after: v_ac1}, label: "softmax 2\nwin 0"}
+  - {id: v_dc2, channel: aiv, cycles: DECAY_CYC, width: W_DEC, rotate: true, fontsize: 5.0,
+     place: {after: v_sm2}, label: "decay"}
+  - {id: v_st2, channel: aiv, cycles: "UNPACK_CYC + L1_STAGE_CYC", width: W_UP, fontsize: 5.4,
+     place: {after: v_dc2}, label: "expand tile 4 -> L1 kv[1]"}
+  - {id: v_ac2, channel: aiv, cycles: ACC_CYC, width: W_AC, rotate: true, fontsize: 5.0,
+     place: {after: v_st2}, label: "acc 2"}
+
+  - {id: m_r5, channel: mte2, cycles: MTE2_CYC, width: W_MTE2, fontsize: 5.4,
+     place: {align: v_sm2}, label: "tile 5\n-> slot 2"}
+  - {id: m_i2, channel: mte2, cycles: 0, kind: idle, fontsize: 5.2,
+     place: {span: {from: {block: m_r5, edge: right}, to: {block: v_ac2, edge: right}}},
+     label: ""}
+
+  - {id: a_gs3, channel: aic, cycles: GEMM_S_CYC, width: W_GS, fontsize: 5.2,
+     place: {align: v_sm2}, label: "Scores 3\n-> win 1"}
+  - {id: a_gc2, channel: aic, cycles: GEMM_C_CYC, width: W_GC, fontsize: 5.2,
+     place: {after: a_gs3}, label: "Context 2"}
+  - {id: a_i2, channel: aic, cycles: 0, kind: idle, fontsize: 5.2,
+     place: {span: {from: {block: a_gc2, edge: right}, to: {block: v_ac2, edge: right}}},
+     label: ""}
+
+  # ---- column k = 3 : slot 0 again, window 1 -----------------------------
+  - {id: v_sm3, channel: aiv, cycles: SOFTMAX_CYC, width: W_SM, fontsize: 5.4,
+     place: {after: v_ac2}, label: "softmax 3\nwin 1"}
+  - {id: v_dc3, channel: aiv, cycles: DECAY_CYC, width: W_DEC, rotate: true, fontsize: 5.0,
+     place: {after: v_sm3}, label: "decay"}
+  - {id: v_st3, channel: aiv, cycles: "UNPACK_CYC + L1_STAGE_CYC", width: W_UP, fontsize: 5.4,
+     place: {after: v_dc3}, label: "expand tile 5 -> L1 kv[2]"}
+  - {id: v_ac3, channel: aiv, cycles: ACC_CYC, width: W_AC, rotate: true, fontsize: 5.0,
+     place: {after: v_st3}, label: "acc 3"}
+
+  - {id: m_r6, channel: mte2, cycles: MTE2_CYC, width: W_MTE2, fontsize: 5.4,
+     place: {align: v_sm3}, label: "tile 6\n-> slot 0"}
+  - {id: m_i3, channel: mte2, cycles: 0, kind: idle, fontsize: 5.2,
+     place: {span: {from: {block: m_r6, edge: right}, to: {block: v_ac3, edge: right}}},
+     label: ""}
+
+  - {id: a_gs4, channel: aic, cycles: GEMM_S_CYC, width: W_GS, fontsize: 5.2,
+     place: {align: v_sm3}, label: "Scores 4\n-> win 0"}
+  - {id: a_gc3, channel: aic, cycles: GEMM_C_CYC, width: W_GC, fontsize: 5.2,
+     place: {after: a_gs4}, label: "Context 3"}
+  - {id: a_i3, channel: aic, cycles: 0, kind: idle, fontsize: 5.2,
+     place: {span: {from: {block: a_gc3, edge: right}, to: {block: v_ac3, edge: right}}},
+     label: ""}
+
+  # ---- the elided run ----------------------------------------------------
+  - {id: v_el, channel: aiv, cycles: EL_CYC, kind: elided, width: W_EL, fontsize: 6.2,
+     place: {after: v_ac3},
+     label: "columns 4 .. {EL_COLS} — {EL_COLS} x {OPT_COL} cyc\nthe phase pattern repeats every {PHASES} tiles and the kernel's loop body is unrolled by {PHASES},\nso every slot and window index in it is a template parameter: no runtime `% {SLOTS}`, no `if (k >= 2)`"}
+  - {id: m_el, channel: mte2, cycles: EL_CYC, kind: elided, width: W_EL, fontsize: 5.6,
+     place: {align: v_el}, label: "tiles 7 .. {COLUMNS}, one read per column, slot (k + {SLOTS}) % {SLOTS}"}
+  - {id: a_el, channel: aic, cycles: EL_CYC, kind: elided, width: W_EL, fontsize: 5.6,
+     place: {align: v_el}, label: "Scores(k+1) into window (k+1) % {WINDOWS}, then Context(k)"}
+
+  # ---- the last column ---------------------------------------------------
+  - {id: v_sml, channel: aiv, cycles: SOFTMAX_CYC, width: W_SM, fontsize: 5.4,
+     place: {after: v_el}, label: "softmax\nlast"}
+  - {id: v_dcl, channel: aiv, cycles: DECAY_CYC, width: W_DEC, rotate: true, fontsize: 5.0,
+     place: {after: v_sml}, label: "decay"}
+  - {id: v_acl, channel: aiv, cycles: ACC_CYC, width: W_AC, rotate: true, fontsize: 5.0,
+     place: {after: v_dcl}, label: "acc"}
+
+  - {id: m_drain, channel: mte2, cycles: 0, kind: idle, fontsize: 5.4,
+     place: {span: {from: {block: v_sml, edge: left}, to: {block: v_acl, edge: right}}},
+     label: "no read: tile + {SLOTS} past the end"}
+  - {id: a_gcl, channel: aic, cycles: GEMM_C_CYC, width: W_GC, fontsize: 5.2,
+     place: {align: v_sml}, label: "Context\nlast"}
+  - {id: a_drain, channel: aic, cycles: 0, kind: idle, fontsize: 5.2,
+     place: {span: {from: {block: a_gcl, edge: right}, to: {block: v_acl, edge: right}}},
+     label: "no Scores: no tile + 1"}
+
+  # ---- the epilogue ------------------------------------------------------
+  - {id: v_out, channel: aiv, cycles: 160, fontsize: 5.6, place: {after: v_acl},
+     label: "normalise\n+ output stage"}
+  - {id: m3_out, channel: mte3, cycles: 120, fontsize: 5.6, place: {after: v_out},
+     label: "WriteHeads\n{MROWS} x {D}\n-> GM"}
+  - {id: m_post, channel: mte2, cycles: 0, kind: idle, fontsize: 5.4,
+     place: {span: {from: {block: v_acl, edge: right}, to: {block: m3_out, edge: right}}},
+     label: ""}
+  - {id: a_post, channel: aic, cycles: 0, kind: idle, fontsize: 5.4,
+     place: {span: {from: {block: v_acl, edge: right}, to: {block: m3_out, edge: right}}},
+     label: "every flag balanced: the task leaves zero residual tokens"}
+  - {id: v_post, channel: aiv, cycles: 0, kind: idle, fontsize: 5.4,
+     place: {span: {from: {block: v_out, edge: right}, to: {block: m3_out, edge: right}}},
+     label: ""}
+
+  # ---- UB residency ------------------------------------------------------
+  - {id: ub_s0, channel: ub, lane: s0, cycles: 0, kind: buffer, fontsize: 5.4,
+     place: {span: {from: {block: r0, edge: left}, to: {block: v_st3, edge: right}}},
+     label: "ingest slot 0 — tiles 0, 3, 6, ... ({TILE_B:,} B)"}
+  - {id: ub_s1, channel: ub, lane: s1, cycles: 0, kind: buffer, fontsize: 5.4,
+     place: {span: {from: {block: r1, edge: left}, to: {block: v_st3, edge: right}}},
+     label: "ingest slot 1 — tiles 1, 4, 7, ..."}
+  - {id: ub_s2, channel: ub, lane: s2, cycles: 0, kind: buffer, fontsize: 5.4,
+     place: {span: {from: {block: r2, edge: left}, to: {block: v_st3, edge: right}}},
+     label: "ingest slot 2 — tiles 2, 5, 8, ...   (three slots, {UB_RING_KIB:.0f} KiB of {UB_KIB} KiB)"}
+  - {id: ub_w0, channel: ub, lane: w0, cycles: 0, kind: buffer, fontsize: 5.4,
+     place: {span: {from: {block: a_gs0, edge: left}, to: {block: v_acl, edge: right}}},
+     label: "score window 0 — Fixpipe destination for even tiles, overwritten in place by their softmax"}
+  - {id: ub_w1, channel: ub, lane: w1, cycles: 0, kind: buffer, fontsize: 5.4,
+     place: {span: {from: {block: a_gs1, edge: left}, to: {block: v_acl, edge: right}}},
+     label: "score window 1 — odd tiles. TWO windows is the whole change: one Fixpipe target free at all times"}
+  - {id: ub_ac, channel: ub, lane: ac, cycles: 0, kind: buffer, fontsize: 5.4,
+     place: {span: {from: {block: v_q, edge: left}, to: {block: m3_out, edge: right}}},
+     label: "fp32 accumulator + online-softmax state — resident for the whole task, single-buffered because the accumulate stays in its own column"}
+
+# ---------------------------------------------------------------------------
+regions:
+  - span: {from: {block: r0, edge: left}, to: {block: v_u1, edge: right}}
+    label: "RAMP-UP (PROLOGUE)"
+    channels: [mte2, aic, aiv]
+    fontsize: 8.2
+    color: "#1baf7a"
+  - span: {from: {block: v_sm0, edge: left}, to: {block: v_acl, edge: right}}
+    label: "STEADY STATE — MTE2(k+{SLOTS}) || AIC(k+1, k) || AIV(k) EVERY COLUMN · VECTOR-BOUND, AIV {VDUTY:.0f} % DUTY, ZERO BUBBLES"
+    channels: [mte2, aic, aiv]
+    verify_channels: [aiv]
+    fontsize: 8.8
+    color: "#4a3aa7"
+  - span: {from: {block: v_out, edge: left}, to: {block: m3_out, edge: right}}
+    label: "RAMP-DOWN (DRAIN)"
+    channels: [mte2, aic, aiv, mte3]
+    fontsize: 8.0
+    color: "#d55181"
+
+# ---------------------------------------------------------------------------
+depth_track:
+  label: "tiles\nin flight"
+  max_depth: 3
+  height: 0.56
+  pad: 0.50
+  steps:
+    - span: {from: {block: r0, edge: left}, to: {block: r1, edge: left}}
+      depth: 1
+      label: "prime 0"
+    - span: {from: {block: r1, edge: left}, to: {block: r2, edge: left}}
+      depth: 2
+      label: "prime 1"
+    - span: {from: {block: r2, edge: left}, to: {block: v_el, edge: right}}
+      depth: 3
+      label: "SATURATED · {COLUMNS} columns, {SLOTS} tiles in flight in every one — a read, a GEMM pair and a softmax on three different slots"
+    - span: {from: {block: v_sml, edge: left}, to: {block: v_acl, edge: left}}
+      depth: 2
+      label: "drain"
+    - span: {from: {block: v_acl, edge: left}, to: {block: m3_out, edge: right}}
+      depth: 1
+      label: "drain\nstore"
+
+# ---------------------------------------------------------------------------
+# There is no barrier corridor on this chart, and that is the point: the kernel body
+# holds no PipeBarrier<PIPE_ALL> and no DataSyncBarrier at all. Every edge below is a
+# point-to-point CrossCore flag between one producer step and one consumer step.
+barriers: []
+
+# ---------------------------------------------------------------------------
+events:
+  # ---- scalar issue ------------------------------------------------------
+  - {kind: dispatch, from: {block: s_d0, edge: right}, to: {block: r0, edge: top, frac: 0.2}}
+  - {kind: dispatch, from: {block: s_d1, edge: right}, to: {block: r1, edge: top, frac: 0.2}}
+  - {kind: dispatch, from: {block: s_d2, edge: right}, to: {block: r2, edge: top, frac: 0.2}}
+
+  # ---- the prologue's two L1 stages, and why there are two ---------------
+  - kind: hardevent
+    from: {block: v_u1, edge: right}
+    to: {block: a_gs1, edge: top, frac: 0.25}
+    callout:
+      fontsize: 6.4
+      lane: {between: [aiv, ub]}
+      x: {block: v_u0, edge: center, offset: -0.4}
+      text: "RAMP-UP PRIMES TWO L1 SLOTS, NOT ONE. kOptFlagSlotReady[0] and [1]: the Cube's first steady-state\nphase runs GemmScores(tile 1), so tile 1 has to be in L1 before the loop starts or the very first column\nstalls. The three MTE2 reads ahead of them cost {MTE2_CYC} cyc each on an engine with nothing else to do --\nthe ring reaches depth {SLOTS} before the first softmax, which is what makes the steady state immediately flat."
+
+  # ---- the score handshake, the one this schedule changes ----------------
+  - kind: hardevent
+    from: {block: a_gs1, edge: right}
+    to: {block: v_sm1, edge: top, frac: 0.3}
+    callout:
+      fontsize: 6.4
+      lane: {between: [mte2, aic]}
+      x: {block: v_sm1, edge: left, offset: 1.4}
+      text: "THE CHANGE, IN ONE EDGE. kOptFlagScoresReady[(k+1) % {WINDOWS}]: the Cube computes tile k+1's scores into the window\ntile k is NOT in, so it starts the moment tile k+1's L1 slot is staged instead of waiting for tile k's softmax to\nvacate the only window there was. In the lock-step ring that wait cost the AIV {STALL} cyc every column ({GEMM_S_CYC} cyc of score\nGEMM against {ACC_CYC} cyc of accumulate to cover it with); here the GEMM is already finished when the softmax asks for it.\nThe WAR edge back the other way needs no flag: the Cube cannot write window (k+1) % {WINDOWS} before SlotReady(k+1),\nwhich the AIV posts after softmax(k-1) -- the last read of that window -- so program order on the AIV carries it."
+
+  # ---- the probability handshake -----------------------------------------
+  - {kind: hardevent, from: {block: v_sm0, edge: right}, to: {block: a_gc0, edge: top, frac: 0.4}}
+  - kind: hardevent
+    from: {block: v_sm1, edge: right}
+    to: {block: a_gc1, edge: top, frac: 0.4}
+    callout:
+      fontsize: 6.4
+      lane: {between: [aic, aiv]}
+      x: {block: v_st1, edge: center, offset: 1.1}
+      text: "kOptFlagProbsReady, and why the probability buffer stays SINGLE. The AIV writes probs(k+1) only after\nits kOptFlagContextReady wait of column k, and the Cube loads probs(k) into L0A before it posts that flag --\nso the anti-dependency is already carried and a second L1 probability slot would buy nothing but a flag id."
+
+  # ---- the context handshake ---------------------------------------------
+  - {kind: hardevent, from: {block: a_gc0, edge: right}, to: {block: v_ac0, edge: top, frac: 0.5}}
+  - {kind: hardevent, from: {block: a_gc1, edge: right}, to: {block: v_ac1, edge: top, frac: 0.5}}
+  - {kind: hardevent, from: {block: a_gc2, edge: right}, to: {block: v_ac2, edge: top, frac: 0.5}}
+
+  # ---- the slot WAR edge -------------------------------------------------
+  - kind: hardevent
+    from: {block: a_gc0, edge: right}
+    to: {block: v_st2, edge: bottom, frac: 0.25}
+    callout:
+      fontsize: 6.4
+      lane: {between: [ub, mte3]}
+      x: {block: v_st2, edge: center, offset: 0.5}
+      text: "kOptFlagSlotFree[k % {SLOTS}] -- the WAR edge on the L1 ring, with one whole column of slack. The Cube releases\nslot k % {SLOTS} once BOTH its operands are in L0, and the AIV waits for it one column later, before staging tile k+2.\nThe token is posted only when a later tile will actually consume it (tile + {SLOTS} < numTiles), so the task ends with\nevery flag balanced and nothing left for the next launch to trip over. The same rule retires the score, context and\nprobability tokens: the epilogue's balance is a hand proof over this graph, which is what a CAModel run has to confirm."
+
+  # ---- the MTE2 run-ahead ------------------------------------------------
+  - kind: hardevent
+    from: {block: v_sm2, edge: right}
+    to: {block: m_r5, edge: top, frac: 0.35}
+    callout:
+      fontsize: 6.4
+      lane: {below: mte3}
+      x: {block: v_st1, edge: left, offset: 0.2}
+      text: "MTE2 RUN-AHEAD, AND THE DUTY NOBODY SHOULD HIDE. The read of tile k+{SLOTS} is issued into slot k % {SLOTS} right after the softmax\nthat was the slot's last reader -- one V -> MTE2 event, no cross-core flag -- so it has {SLOTS} columns to retire in. At this operating\npoint it needs none of them: the kv4fp8 cache for a {SEQ}-token context is {KV_MIB:.1f} MiB and lives in the {L2_MB} MB L2, so a tile's\n{TILE_B:,} B costs {MTE2_CYC} cyc against a {OPT_COL}-cyc column and MTE2 runs at {MTE2_DUTY:.0f} % duty. HBM-cold the same read is {MTE2_HBM} cyc and\nBECOMES the roof -- and no ring depth fixes that, because depth hides latency and that is a bandwidth limit."
+
+# ---------------------------------------------------------------------------
+callouts:
+  - lane: {above: scalar}
+    fontsize: 6.8
+    x: {block: v_st1, edge: center, offset: 0.4}
+    anchor: {block: v_el, edge: top}
+    text: "WHAT BOUNDS THIS KERNEL IS THE 4-BIT EXPAND, NOT THE SCHEDULE. Of the {VEC_CYC} cyc on the AIV's critical path, {UNPACK_CYC} ({UNPACK_PCT:.0f} %) are\nthe int4 Cast, the DeInterleave and the per-plane Adds that turn {TILE} x {D} packed nibbles into fp8 Cube operands. The softmax is {SOFTMAX_CYC},\nthe accumulate {ACC_CYC}. Delete the expand and the column falls to {NO_UNPACK_COL} cyc ({SPEEDUP_NO_UNPACK:.2f}x), which is the BYPASS_UNPACK ablation's territory\nand a CACHE FORMAT question -- feed the Cube packed MXFP4 operands and let the MX scale plane carry the reconstruction -- not a\nscheduling one. This schedule's job was to make sure nothing ELSE is on that path, and that is what the AIV row above shows."
+
+  - lane: {below: mte3}
+    fontsize: 6.6
+    x: {block: v_sm3, edge: center, offset: 1.6}
+    anchor: {block: a_i2, edge: bottom}
+    text: "WHY THE RING IS {SLOTS} SLOTS AND NOT 4. Not UB and not L1: {SLOTS} slots are {UB_RING_KIB:.0f} KiB of the {UB_KIB} KiB partition and {L1_RING_KIB:.0f} KiB of the {L1_KIB} KiB L1,\nand a fourth would fit twice over. The limit is the cross-core flag space. GetffstMsg masks a flag id to FOUR BITS and the toolkit\nreserves 11..14 for its own barriers, so ids 0..10 are usable, and one id per slot and per window spends {FLAGS_USED} of them:\n{SLOTS} SlotReady + {SLOTS} SlotFree + {WINDOWS} ScoresReady + ContextReady + ProbsReady. A fourth slot needs 12. Going deeper means collapsing\nSlotReady and SlotFree into counting flags -- correct only if a cross-core wait really consumes exactly one set per subcore,\nwhich is a hardware semantic this work has not verified, so it is not done here."
+
+# ---------------------------------------------------------------------------
+legend:
+  extra:
+    - {kind: patch, label: "UB ring / score windows (residency bars)", color: "#1baf7a",
+       alpha: 0.15, edgecolor: "#13805a"}
+    - {kind: patch, label: "elided columns (true cost in the label)", color: "#e1e0d9",
+       edgecolor: "#898781", hatch: "///"}
+    - {kind: patch, label: "engine blocked on a flag (drawn, not hidden)", color: "#fcfcfb",
+       edgecolor: "#c3c2b7", hatch: "...."}
+    - {kind: patch, label: "steady-state region (slice-verified on AIV)", color: "#4a3aa7",
+       alpha: 0.2, edgecolor: "#372a7d"}

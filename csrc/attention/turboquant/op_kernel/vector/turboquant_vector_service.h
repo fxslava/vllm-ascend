@@ -364,8 +364,16 @@ struct TurboQuantTaskHeads {
 // loads and MACs, and the whole softmax. What disappears is exactly the vector-pipe expand, so the delta
 // against the unablated leg is the unpack's cycle cost with its memory traffic held fixed. The output is
 // deterministic (all-zero scores) and numerically meaningless; nothing but a benchmark may instantiate it.
+//
+// RING_SLOTS, SCORE_WINDOWS and BANK_SKEW are the pipeline's shape, and their defaults are the lock-step
+// decode exactly as it shipped: a two-slot ingest ring, one score window, no skew. The modulo-scheduled
+// decode (turboquant_fused_decode_opt.cpp) deepens the ring to kCubePipelineSlots, takes kCubeScoreWindows
+// score windows so the Cube's next score GEMM does not wait on this tile's softmax, and asks for
+// kBankSkewBytes between the ingest buffers. Everything that is per-slot was already indexed by slot;
+// what the window count adds is a second Fixpipe destination for the scores.
 template <TurboQuantMode MODE, typename scalar_t, typename Mm, typename Codec,
-          DecodeUnpack UNPACK = DecodeUnpack::kNative>
+          DecodeUnpack UNPACK = DecodeUnpack::kNative, uint32_t RING_SLOTS = kCubeSlots,
+          uint32_t SCORE_WINDOWS = 1, uint32_t BANK_SKEW = 0>
 class TurboQuantVectorDecodeService {
 public:
     using OperandT = typename Mm::OperandT;
@@ -377,8 +385,15 @@ public:
     static_assert(kGatherUnpack == Codec::kGatherLut, "the service and its codec disagree on the expand");
     static_assert(kLloydMaxUnpack == Codec::kLloydMaxLut, "the service and its codec disagree on the codebook");
     static_assert(kNzTiled == Codec::kIsAffine, "only the byte-wise affine expand streams an NZ-tiled plane");
-    // Ring slots of the tile ingest. Tile t reads into slot t % kCubeSlots, the slot of its L1 operands.
-    static constexpr uint32_t kIngestSlots = kBatched ? kCubeSlots : 1;
+    // Ring slots of the tile ingest. Tile t reads into slot t % kIngestSlots, the slot of its L1 operands.
+    static constexpr uint32_t kIngestSlots = kBatched ? RING_SLOTS : 1;
+    // Fixpipe score windows. Tile t's scores land in window t % kScoreWindows.
+    static constexpr uint32_t kScoreWindows = kBatched ? SCORE_WINDOWS : 1;
+    static constexpr uint32_t kBankSkew = BANK_SKEW;
+    static_assert(RING_SLOTS >= kCubeSlots, "the ingest ring cannot be shallower than the L1 ring");
+    static_assert(SCORE_WINDOWS >= 1, "the Cube needs somewhere to put the scores");
+    static_assert(BANK_SKEW % (kFp32PerBlock * sizeof(float)) == 0,
+                  "a skew that is not a whole UB block would misalign every buffer behind it");
 
     __aicore__ inline void Init(AscendC::TPipe *pipe, __gm__ void *queryRot, __gm__ void *keyCache,
                                 __gm__ void *valueCache, __gm__ void *scaleCache, __gm__ void *modeTables,
@@ -397,7 +412,12 @@ public:
         }
     }
 
-    __aicore__ inline AscendC::LocalTensor<float> Scores() { return scoreBuf_.Get<float>(); }
+    // The Cube's two Fixpipe destinations. The AIC names them by the offsets its own TPipe handed out, so
+    // both halves of the launch have to allocate the same list in the same order -- see InitBuffers.
+    __aicore__ inline AscendC::LocalTensor<float> Scores(const uint32_t window = 0)
+    {
+        return scoreBuf_[window].template Get<float>();
+    }
     __aicore__ inline AscendC::LocalTensor<float> Context() { return contextBuf_.Get<float>(); }
 
     // Which of the task's heads this subcore owns. On the AIC every row is "rows" and nothing is mine.
@@ -491,7 +511,7 @@ public:
             SyncVectorToMte2();
         }
 
-        const AscendC::LocalTensor<int8_t> packed = kvBuf_[0].Get<int8_t>();
+        const AscendC::LocalTensor<int8_t> packed = kvBuf_[0].template Get<int8_t>();
         ReadPlane(physical, rowBase, kvHead, 0);
         SyncMte2ToVector();
         SelectKvHeadRows(packed, kvHead, 0);
@@ -515,7 +535,7 @@ public:
         const AscendC::LocalTensor<OperandT> l1Dst = PlaneOperand(mm, slot);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(readEvents_[slot]);
 
-        const AscendC::LocalTensor<int8_t> packed = kvBuf_[slot].Get<int8_t>();
+        const AscendC::LocalTensor<int8_t> packed = kvBuf_[slot].template Get<int8_t>();
         SelectKvHeadRows(packed, kvHead, slot);
         StageUnpackedToL1(packed, l1Dst);
     }
@@ -525,12 +545,13 @@ public:
     // ingest slot holding this tile's scale lanes. One body on purpose: split into helpers, the per-tile
     // tensor views are re-derived in each and the AIV issues more scalar instructions per tile.
     __aicore__ inline void ComputeSoftmaxAndStageProbs(Mm &mm, const uint32_t valid, const TurboQuantTaskHeads &heads,
-                                                       const uint32_t slot)
+                                                       const uint32_t slot, const uint32_t window = 0)
     {
         if (heads.mine == 0) {
             return;
         }
-        const AscendC::LocalTensor<float> scaleTile = scaleTileBuf_[slot].Get<float>();
+        const AscendC::LocalTensor<float> scores = Scores(window);
+        const AscendC::LocalTensor<float> scaleTile = scaleTileBuf_[slot].template Get<float>();
         const AscendC::LocalTensor<float> reduce = reduceBuf_.Get<float>();
         const AscendC::LocalTensor<float> keyScale = reduce;
         const AscendC::LocalTensor<float> valueScale = reduce[kCubeTileRows];
@@ -544,9 +565,9 @@ public:
         AscendC::Muls(valueScale, valueScale, invGain_, kCubeTileRows);
 
         if constexpr (kBatched) {
-            ComputeSoftmaxRows(valid, heads.mine, keyScale, valueScale);
+            ComputeSoftmaxRows(scores, valid, heads.mine, keyScale, valueScale);
         } else {
-            ComputeSoftmaxHeads(valid, heads.mine, keyScale, valueScale);
+            ComputeSoftmaxHeads(scores, valid, heads.mine, keyScale, valueScale);
         }
 
         const AscendC::LocalTensor<OperandT> probsL1 = mm.L1Probs();
@@ -740,15 +761,27 @@ private:
     // whatever else the list below grows, so the contract narrows to one rule: this service's InitBuffers
     // is the first UB allocation the pipe sees (TurboQuantCubeMm::Init runs before it but allocates in the
     // L1 and L0 pools only), and these two lines stay at the top of it.
+    // The score windows are allocated as one run, so window w sits at UB offset w * kScoreBytes and the
+    // context window right behind them, on both cores, whatever the window count is.
+    //
+    // AKA3003, the second rule of this list: with BANK_SKEW set, every buffer of the tile ingest is
+    // followed by a kBankSkewBytes pad, so no two ring slots start on the same UB bank. MTE2 is filling
+    // one slot while the vector ALU reads another throughout the steady state, and two slots that are an
+    // exact multiple of the bank stride apart present the same bank to both ports. The pads sit after the
+    // Fixpipe windows, never between them, so the dual-destination contract above is untouched.
     __aicore__ inline void InitBuffers(AscendC::TPipe *pipe)
     {
-        pipe->InitBuffer(scoreBuf_, kScoreBytes);
+        for (uint32_t window = 0; window < kScoreWindows; ++window) {
+            pipe->InitBuffer(scoreBuf_[window], kScoreBytes);
+        }
         pipe->InitBuffer(contextBuf_, kHalfRows * headSize_ * sizeof(float));
         for (uint32_t slot = 0; slot < kIngestSlots; ++slot) {
             pipe->InitBuffer(kvBuf_[slot], kCubeTileRows * packedBytes_);
+            SkewBank(pipe, slot);
         }
         for (uint32_t slot = 0; slot < kIngestSlots; ++slot) {
             pipe->InitBuffer(scaleTileBuf_[slot], kCubeTileRows * scaleSlot_ * sizeof(float));
+            SkewBank(pipe, kIngestSlots + slot);
         }
         if constexpr (kNzTiled) {
             pipe->InitBuffer(nzOperandBuf_, kCubeTileRows * operandElems_);
@@ -768,6 +801,13 @@ private:
         pipe->InitBuffer(maskBuf_, 2 * kCubeTileRows * sizeof(float));
         if constexpr (!kNzTiled) {
             rowMajorBurst_.Init(pipe, numKvHeads_, packedBytes_, packedPlane_, kCubeTileRows, kIngestSlots);
+        }
+    }
+
+    __aicore__ inline void SkewBank(AscendC::TPipe *pipe, const uint32_t pad)
+    {
+        if constexpr (BANK_SKEW > 0) {
+            pipe->InitBuffer(bankSkewBuf_[pad], BANK_SKEW);
         }
     }
 
@@ -813,11 +853,11 @@ private:
         AscendC::GlobalTensor<int8_t> &cacheGm = Plane() == kKeyPlane ? keyCacheGm_ : valueCacheGm_;
         if constexpr (kNzTiled) {
             const uint64_t tile = (row * numKvHeads_ + static_cast<uint64_t>(kvHead) * kCubeTileRows) * packedBytes_;
-            AscendC::DataCopy(kvBuf_[slot].Get<int8_t>(), cacheGm[tile], tilePlaneBytes_);
+            AscendC::DataCopy(kvBuf_[slot].template Get<int8_t>(), cacheGm[tile], tilePlaneBytes_);
         } else {
-            rowMajorBurst_.ReadTileRows(kvBuf_[slot].Get<int8_t>(), cacheGm, row * packedPlane_, kvHead, slot);
+            rowMajorBurst_.ReadTileRows(kvBuf_[slot].template Get<int8_t>(), cacheGm, row * packedPlane_, kvHead, slot);
         }
-        AscendC::DataCopy(scaleTileBuf_[slot].Get<float>(), scaleCacheGm_[row * scaleSlot_],
+        AscendC::DataCopy(scaleTileBuf_[slot].template Get<float>(), scaleCacheGm_[row * scaleSlot_],
                           kCubeTileRows * scaleSlot_);
     }
 
@@ -947,11 +987,11 @@ private:
         codec_.template CastToOperand<OperandT>(queryOperand, queryIn, heads * headSize_);
     }
 
-    __aicore__ inline void ComputeSoftmaxHeads(const uint32_t valid, const uint32_t heads,
+    __aicore__ inline void ComputeSoftmaxHeads(const AscendC::LocalTensor<float> &scores, const uint32_t valid,
+                                               const uint32_t heads,
                                                const AscendC::LocalTensor<float> &keyScale,
                                                const AscendC::LocalTensor<float> &valueScale)
     {
-        const AscendC::LocalTensor<float> scores = scoreBuf_.Get<float>();
         const AscendC::LocalTensor<float> runMax = StateField(kStateRunMax);
         const AscendC::LocalTensor<float> runSum = StateField(kStateRunSum);
         const AscendC::LocalTensor<float> tileMax = StateField(kStateTileMax);
@@ -1003,11 +1043,11 @@ private:
     // The same recurrence over every row at once: a row op repeats over the heads, a per-head scalar is a
     // head block, and the row sums and maxima are whole-row reduces with no scalar readback. Logits, one
     // online-softmax step (newMax, alpha, runSum), then the probability rows on the operand grid.
-    __aicore__ inline void ComputeSoftmaxRows(const uint32_t valid, const uint32_t heads,
+    __aicore__ inline void ComputeSoftmaxRows(const AscendC::LocalTensor<float> &scores, const uint32_t valid,
+                                              const uint32_t heads,
                                               const AscendC::LocalTensor<float> &keyScale,
                                               const AscendC::LocalTensor<float> &valueScale)
     {
-        const AscendC::LocalTensor<float> scores = scoreBuf_.Get<float>();
         const AscendC::LocalTensor<float> runMax = StateField(kStateRunMax);
         const AscendC::LocalTensor<float> runSum = StateField(kStateRunSum);
         const AscendC::LocalTensor<float> tileMax = StateField(kStateTileMax);
@@ -1103,7 +1143,9 @@ private:
         const AscendC::LocalTensor<float> acc = accBuf_.Get<float>();
         const AscendC::LocalTensor<float> runMax = StateField(kStateRunMax);
         const AscendC::LocalTensor<float> runSum = StateField(kStateRunSum);
-        const AscendC::LocalTensor<float> tails = scoreBuf_.Get<float>();
+        // The partial tails borrow score window 0 as scratch. The task's tile loop is over, so every
+        // window's rows are dead; window 0 is the one that exists whatever kScoreWindows is.
+        const AscendC::LocalTensor<float> tails = Scores(0);
         AscendC::Duplicate(tails, 0.0f, heads.mine * kPartialTail);
         for (uint32_t j = 0; j < heads.mine; ++j) {
             AscendC::Adds(tails[j * kPartialTail + kPartialMaxLane], runMax[j * kFp32PerBlock], 0.0f, 1);
@@ -1120,15 +1162,16 @@ private:
 
     Codec codec_;
     TurboQuantTileBurst rowMajorBurst_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> kvBuf_[kCubeSlots];
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> scaleTileBuf_[kCubeSlots];
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> kvBuf_[kIngestSlots];
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> scaleTileBuf_[kIngestSlots];
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> bankSkewBuf_[BANK_SKEW > 0 ? 2 * kIngestSlots : 1];
     AscendC::TBuf<AscendC::QuePosition::VECCALC> bandOperandBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> nzOperandBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> accBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> queryWorkBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> queryInBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> queryOperandBuf_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> scoreBuf_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> scoreBuf_[kScoreWindows];
     AscendC::TBuf<AscendC::QuePosition::VECCALC> probOperandBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> contextBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> stateBuf_;
@@ -1151,7 +1194,7 @@ private:
     AscendC::BinaryRepeatParams rowRepeatParams_;
     AscendC::BinaryRepeatParams tileByBlockParams_;
     AscendC::BinaryRepeatParams tileByVectorParams_;
-    AscendC::TEventID readEvents_[kCubeSlots] = {};
+    AscendC::TEventID readEvents_[kIngestSlots] = {};
     float qScaleInv_[kHalfRows] = {};
     float scoreScale_ = 0.0f;
     float invGain_ = 1.0f;

@@ -57,6 +57,26 @@ constexpr uint32_t kOperandC0 = 32;
 constexpr uint32_t kCubeTileM = 16;
 constexpr uint32_t kCubeSlots = 2;
 
+// The modulo-scheduled fused decode (turboquant_fused_decode_opt.cpp) keeps a deeper ring than the
+// lock-step one: kCubePipelineSlots tiles in flight, so the MTE2 read of tile k + kCubePipelineSlots is
+// issued inside the very iteration whose Cube and Vector work it hides behind. Three is what the
+// cross-core flag space affords at one id per slot. GetffstMsg masks a flag id to four bits and the
+// toolkit reserves 11..14 for its own barriers (asc/impl/basic_api/dav_3510/kernel_operator_sync_impl.h:
+// SYNC_AIC_FLAG, SYNC_AIV_FLAG, SYNC_AIC_AIV_FLAG, SYNC_AIV_ONLY_ALL), which leaves ids 0..10, and the
+// schedule spends 3 + 3 + 2 + 1 + 1 of them. Neither buffer is the limit: a slot costs about 10 KB of the
+// 256 KB UB partition and 32 KB of the 512 KB L1 at headSize 256. The flag space is.
+constexpr uint32_t kCubePipelineSlots = 3;
+
+// Score Fixpipe windows of the modulo schedule. Two, so the Cube's score GEMM for tile k + 1 fills one
+// window while the vector unit still owns tile k's -- the overlap a single window cannot have, because
+// the online softmax rewrites the score rows in place. The context window stays single: a tile's context
+// is accumulated in the same iteration that produced it, before the next GEMM pair can start.
+constexpr uint32_t kCubeScoreWindows = 2;
+
+// AKA3003. Consecutive UB buffers of the tile ingest are offset by this much, so the slot MTE2 is filling
+// and the slot the vector ALU is reading do not present the same bank to both ports in the same cycle.
+constexpr uint32_t kBankSkewBytes = 32;
+
 // An NZ-tiled packed cache (kv4fp8) lays a physical block out as [kCubeTileRows-row tile][kv head]
 // [kOperandC0-byte column group][tile row][byte], so the packed plane of one (tile, kv head) is a single
 // contiguous [groups, kCubeTileRows, kOperandC0] fractal image. The decode reads it in one burst, and
@@ -78,6 +98,18 @@ constexpr uint16_t kFlagSlotFree = 2;
 constexpr uint16_t kFlagScoresReady = 4;
 constexpr uint16_t kFlagContextReady = 5;
 constexpr uint16_t kFlagProbsReady = 6;
+
+// The modulo-scheduled decode's flags, one id per ring slot and per score window so that neither core can
+// ever be released by a token another tile's handshake posted. Both cores derive the same index from the
+// same compile-time constant, so every flag is a point-to-point edge between one producer step and one
+// consumer step. Ids 0..10; see kCubePipelineSlots for why that is the whole budget.
+constexpr uint16_t kOptFlagSlotReady = 0;
+constexpr uint16_t kOptFlagSlotFree = kOptFlagSlotReady + static_cast<uint16_t>(kCubePipelineSlots);
+constexpr uint16_t kOptFlagScoresReady = kOptFlagSlotFree + static_cast<uint16_t>(kCubePipelineSlots);
+constexpr uint16_t kOptFlagContextReady = kOptFlagScoresReady + static_cast<uint16_t>(kCubeScoreWindows);
+constexpr uint16_t kOptFlagProbsReady = kOptFlagContextReady + 1;
+// The first id the toolkit keeps for its own barriers; every id above belongs to the schedule.
+constexpr uint16_t kOptFlagReservedFirst = 11;
 
 // Query rotation.
 constexpr uint32_t kRotateQTile = 16;
