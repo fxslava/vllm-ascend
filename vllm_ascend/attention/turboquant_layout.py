@@ -93,6 +93,14 @@ TURBOQUANT_CUBE_TILE_ROWS = 64
 TURBOQUANT_CUBE_UNPACK_ROWS = 8
 TURBOQUANT_CUBE_COLUMN_BYTES = 32
 
+# Operand values in one NZ fractal row. The row is TURBOQUANT_CUBE_COLUMN_BYTES wide either
+# way, but an fp4 operand is half a byte, so the row that holds 32 fp8 values holds 64 fp4
+# ones. KV3_FP4 is an fp4-operand mode, so its gather table -- which is indexed by value,
+# not by byte -- folds a band of 64 columns per row. Mirrors ``fractal_columns`` in
+# ``ModeTables`` (csrc/tests/common/turboquant/turboquant_launch.cpp), where it is
+# ``2 * kOperandC0`` for TurboQuantOperand::kFp4E2m1.
+TURBOQUANT_CUBE_FP4_COLUMN_VALUES = 2 * TURBOQUANT_CUBE_COLUMN_BYTES
+
 
 class TurboQuantMode(enum.IntEnum):
     """Mode IDs in ``op_kernel/common/turboquant_mode.h``."""
@@ -131,6 +139,13 @@ def turboquant_mode_tables(head_size: int, batch_rows: int, device: torch.device
     Mirrors ``ModeTables(KV3_FP4, ..., nz_rows=64)`` in
     ``csrc/tests/common/turboquant/turboquant_launch.cpp``. The writer uses one
     row; the fused decode expands eight rows from row-major packed cache data.
+
+    The two have to stay bit-identical, and nothing at runtime notices when they
+    do not: a table built on the wrong band is still a valid permutation, so the
+    decode reads the right cache bytes into the wrong fractal columns and returns
+    an attention output rather than an error. What pins them is
+    ``tests/ut/attention/test_turboquant_page_budget.py``, which restates the band
+    from the DMA contract that consumes it.
     """
     if batch_rows not in (1, TURBOQUANT_CUBE_UNPACK_ROWS):
         raise ValueError(f"KV3_FP4 mode tables require 1 or {TURBOQUANT_CUBE_UNPACK_ROWS} rows")
@@ -140,9 +155,16 @@ def turboquant_mode_tables(head_size: int, batch_rows: int, device: torch.device
     word = 4
     lanes = 8
     columns = torch.arange(head_size * batch_rows, dtype=torch.int64)
-    band = batch_rows * TURBOQUANT_CUBE_COLUMN_BYTES
-    row = (columns % band) // TURBOQUANT_CUBE_COLUMN_BYTES
-    col = (columns // band) * TURBOQUANT_CUBE_COLUMN_BYTES + columns % TURBOQUANT_CUBE_COLUMN_BYTES
+    # The fp4 fractal row, counted in values and not in bytes: see
+    # TURBOQUANT_CUBE_FP4_COLUMN_VALUES. A band is ``batch_rows`` of these rows, which is
+    # what one ``DataCopy`` lifts into a column group of the 64-row L1 fractal. Folding it
+    # in bytes instead halves the band and transposes the expanded tile against what the
+    # Cube reads -- which does not raise, it decodes the right bytes into the wrong columns
+    # and returns an attention output at cosine ~0.33.
+    fractal_columns = TURBOQUANT_CUBE_FP4_COLUMN_VALUES
+    band = batch_rows * fractal_columns
+    row = (columns % band) // fractal_columns
+    col = (columns // band) * fractal_columns + columns % fractal_columns
     low_bytes = head_size // 4
     low = word * (row * packed_bytes + col // 4)
     msb = word * (row * packed_bytes + low_bytes + col // 8)

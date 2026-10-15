@@ -292,6 +292,53 @@ class TestKV3PageAndRunnerView(TestBase):
         narrow = turboquant_mode_tables(128, 8, torch.device("cpu"))
         self.assertEqual(narrow.numel(), 17 * 128 + 32)
 
+    def test_kv3_decode_table_folds_the_fp4_fractal_row_in_values(self):
+        """The decode table's band is 64 columns per row, not 32.
+
+        ``StageBandsToL1`` expands eight rows at a time and lifts them with one
+        ``DataCopy`` of ``operandElems_ / 32`` bursts of ``kCubeUnpackRows`` blocks, so the
+        expanded band has to sit in UB as ``[column group][row][one 32-byte fractal row]``.
+        An fp4 operand is half a byte, so that fractal row is 64 values wide -- the band
+        the gather table folds is ``batch_rows x 64`` values, and counting it in bytes
+        instead halves it. Nothing on the device checks: the wrong table decodes the right
+        cache bytes into the wrong fractal columns and returns attention at cosine ~0.33.
+        """
+        from vllm_ascend.attention.turboquant_layout import (
+            TURBOQUANT_CUBE_UNPACK_ROWS,
+            turboquant_mode_tables,
+        )
+
+        fractal_columns = 64
+        for head_size in (128, 256):
+            with self.subTest(head_size=head_size):
+                rows = TURBOQUANT_CUBE_UNPACK_ROWS
+                packed_bytes = 3 * (head_size // 8)
+                low_plane_bytes = head_size // 4
+                tables = turboquant_mode_tables(head_size, rows, torch.device("cpu"))
+                low, msb = [], []
+                for position in range(head_size * rows):
+                    band = rows * fractal_columns
+                    group, within = divmod(position, band)
+                    row, column_in_row = divmod(within, fractal_columns)
+                    column = group * fractal_columns + column_in_row
+                    low.append(4 * (row * packed_bytes + column // 4))
+                    msb.append(4 * (row * packed_bytes + low_plane_bytes + column // 8))
+                expected = torch.tensor(low + msb, dtype=torch.int32)
+                torch.testing.assert_close(tables[: 2 * head_size * rows], expected)
+
+    def test_kv3_writer_table_is_the_identity_permutation(self):
+        """One row is one token's packed bytes in order, whatever the band is folded in."""
+        from vllm_ascend.attention.turboquant_layout import turboquant_mode_tables
+
+        head_size = 256
+        tables = turboquant_mode_tables(head_size, 1, torch.device("cpu"))
+        channels = torch.arange(head_size)
+        torch.testing.assert_close(tables[:head_size], (4 * (channels // 4)).to(torch.int32))
+        torch.testing.assert_close(
+            tables[head_size : 2 * head_size],
+            (4 * (head_size // 4 + channels // 8)).to(torch.int32),
+        )
+
     def test_kv3_page_uses_three_bytes_per_eight_channels(self):
         from vllm_ascend.attention.turboquant_layout import TurboQuantMode, turboquant_packed_bytes
 
