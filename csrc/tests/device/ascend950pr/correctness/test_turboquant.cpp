@@ -1138,6 +1138,15 @@ TEST(TurboQuantAuditModel, test_MIXTurboQuant3b_PackedTrafficAndNames) {
   EXPECT_EQ(tqa::CaseName(tqa::kLegPfIngest, kv4_config), "bench_AIVTurboQuant4b_PrefillIngest_dsv4_s128_b1");
 }
 
+// The kv3fp4 MIX tests' contract with the silicon, matching the simulator's kKv3CosineFloor and
+// kWrittenScaleTolerance (test_sim_turboquant_fused.cpp). A KV3 decode is judged against
+// ReferenceOnOperandGrid(): against the fp32 Reference() oracle the operand casts alone sit near
+// 0.9889, under the 0.99 gate these tests used to fail on. The writer's scales are float RMS of
+// vectors that went through fp16 and back through the rotation; the host's are double RMS of the
+// vectors before either. The 950PR measures 1.738e-4 against that oracle, an order under the bound.
+constexpr double kKv3OperandGridCosineFloor = 0.999;
+constexpr double kWrittenScaleTolerance = 2e-3;
+
 TEST_F(TurboQuantBareMetal, test_MIXTurboQuant3b_WriteMatchesCpuRef) {
   REQUIRE_PHYSICAL_ASCEND_950PR();
   tqh::FusedShape shape;
@@ -1150,7 +1159,7 @@ TEST_F(TurboQuantBareMetal, test_MIXTurboQuant3b_WriteMatchesCpuRef) {
   EXPECT_GT(agreement.packed_bytes, 0u);
   EXPECT_EQ(agreement.packed_mismatches, 0u);
   EXPECT_EQ(agreement.scale_pad_mismatches, 0u);
-  EXPECT_LT(agreement.max_scale_rel_err, 1.0e-4);
+  EXPECT_LT(agreement.max_scale_rel_err, kWrittenScaleTolerance);
 }
 
 TEST_F(TurboQuantBareMetal, test_MIXTurboQuant3b_DecodeMatchesCpuRef) {
@@ -1161,7 +1170,7 @@ TEST_F(TurboQuantBareMetal, test_MIXTurboQuant3b_DecodeMatchesCpuRef) {
   shape.context_len = 129;
   tqh::FusedCubeScenario scenario(shape, Stream(), tqh::VectorCoreNum(nullptr));
   const tqh::FusedRun run = scenario.RunFused(scenario.Plan());
-  const std::vector<float> reference = scenario.Reference();
+  const std::vector<float> reference = scenario.ReferenceOnOperandGrid();
   ASSERT_EQ(run.launches, 1);
   ASSERT_EQ(run.untouched, 0u);
   ASSERT_EQ(run.output.size(), reference.size());
@@ -1173,7 +1182,7 @@ TEST_F(TurboQuantBareMetal, test_MIXTurboQuant3b_DecodeMatchesCpuRef) {
     reference_sq += static_cast<double>(reference[i]) * reference[i];
   }
   ASSERT_GT(reference_sq, 0.0);
-  EXPECT_GT(tqh::FusedCosine(run.output, reference), 0.99);
+  EXPECT_GE(tqh::FusedCosine(run.output, reference), kKv3OperandGridCosineFloor);
   EXPECT_LT(std::sqrt(error_sq / reference_sq), 0.15);
 }
 
@@ -1212,8 +1221,8 @@ TEST_F(TurboQuantBareMetal, test_MIXTurboQuant3b_D128EvenHeadsWriteAndDecode) {
   EXPECT_EQ(agreement.packed_bytes, 2 * scenario.ExpectedPackedPlaneBytes());
   EXPECT_EQ(agreement.packed_mismatches, 0u);
   const tqh::FusedRun run = scenario.RunFused(scenario.Plan());
-  const std::vector<float> reference = scenario.Reference();
-  EXPECT_GT(tqh::FusedCosine(run.output, reference), 0.99);
+  const std::vector<float> reference = scenario.ReferenceOnOperandGrid();
+  EXPECT_GE(tqh::FusedCosine(run.output, reference), kKv3OperandGridCosineFloor);
 }
 
 TEST_F(TurboQuantBareMetal, test_MIXTurboQuant3b_D128OddHeadPaddedWriteAndDecode) {
@@ -1230,8 +1239,8 @@ TEST_F(TurboQuantBareMetal, test_MIXTurboQuant3b_D128OddHeadPaddedWriteAndDecode
   EXPECT_EQ(agreement.packed_bytes, 2 * scenario.ExpectedPackedPlaneBytes());
   EXPECT_EQ(agreement.packed_mismatches, 0u);
   const tqh::FusedRun run = scenario.RunFused(scenario.Plan());
-  const std::vector<float> reference = scenario.Reference();
-  EXPECT_GT(tqh::FusedCosine(run.output, reference), 0.99);
+  const std::vector<float> reference = scenario.ReferenceOnOperandGrid();
+  EXPECT_GE(tqh::FusedCosine(run.output, reference), kKv3OperandGridCosineFloor);
 }
 
 TEST_F(TurboQuantBareMetal, test_MIXTurboQuant3b_TailMaskSuppressesBleed) {
@@ -1244,7 +1253,7 @@ TEST_F(TurboQuantBareMetal, test_MIXTurboQuant3b_TailMaskSuppressesBleed) {
   const tqh::FusedDecodeGrid grid = scenario.Plan();
   const tqh::FusedRun clean = scenario.RunFused(grid);
   ASSERT_EQ(clean.untouched, 0u);
-  ASSERT_GT(tqh::FusedCosine(clean.output, scenario.Reference()), 0.99);
+  ASSERT_GE(tqh::FusedCosine(clean.output, scenario.ReferenceOnOperandGrid()), kKv3OperandGridCosineFloor);
   scenario.PoisonInactiveTail();
   const tqh::FusedRun poisoned = scenario.RunFused(grid);
   ASSERT_EQ(poisoned.untouched, 0u);
