@@ -109,6 +109,7 @@ from tq_longbench.ops import (  # noqa: E402
     DENSE_ATTENTION_APIS,
     DENSE_BACKENDS,
     LayerShape,
+    expand_kv_heads,
     reference_equivalent,
 )
 from tq_longbench.preflight import select_dense_backend  # noqa: E402
@@ -568,7 +569,7 @@ def attention_scores(
     if keys is None:
         return None, None, None, None
     group = query.shape[1] // keys.shape[1]
-    expanded = keys.repeat_interleave(group, dim=1)[:context]
+    expanded = expand_kv_heads(keys, group)[:context]
     scores = torch.einsum("qhd,khd->hk", query[-1:].to(torch.float32), expanded) * scale
     weights = torch.softmax(scores, dim=-1)
     entropy = float(-(weights * weights.clamp_min(1e-30).log()).sum(-1).mean())

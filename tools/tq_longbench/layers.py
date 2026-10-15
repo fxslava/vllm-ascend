@@ -386,7 +386,15 @@ class RotaryEmbedding:
         inv_freq = 1.0 / (theta ** (torch.arange(0, span, 2, dtype=torch.float32, device=device) / span))
         positions = torch.arange(max_seq_len, dtype=torch.float32, device=device)
         angles = torch.outer(positions, inv_freq)
-        emb = angles.repeat_interleave(2, dim=-1) if interleaved else torch.cat((angles, angles), dim=-1)
+        # ``stack(...).flatten(-2)`` rather than ``repeat_interleave(2, dim=-1)``: CANN 9.2 on
+        # Ascend 950PR has no dynamic kernel for aclnnRepeatInterleaveIntWithDim (error 561103),
+        # so the interleaved table could only be built on a non-NPU device. This is the same
+        # duplication by construction -- and the same expression :meth:`_rotate_pairs` already
+        # uses for the interleaved rotation itself.
+        if interleaved:
+            emb = torch.stack((angles, angles), dim=-1).flatten(-2)
+        else:
+            emb = torch.cat((angles, angles), dim=-1)
         self.cos = emb.cos().to(dtype)
         self.sin = emb.sin().to(dtype)
 

@@ -58,6 +58,7 @@ import torch
 
 from tq_longbench._ascend import turboquant_layout, turboquant_rotation
 from tq_longbench.kv_cache import DenseKVCache, TurboQuantKVCache
+from tq_longbench.ops import expand_kv_heads
 
 #: Below this, a layer's hidden state has stopped tracking the dense baseline.
 #: Quantisation noise at 4 bits sits around 0.99 through a whole stack; a layer
@@ -350,7 +351,7 @@ def _attention_metrics(
     """
     heads = query.shape[1]
     group = heads // keys.shape[1]
-    expanded = keys.repeat_interleave(group, dim=1)[:context]
+    expanded = expand_kv_heads(keys, group)[:context]
     scores = torch.einsum("qhd,khd->hk", query, expanded) * scale
     weights = torch.softmax(scores.to(torch.float32), dim=-1)
     entropy = float(-(weights * weights.clamp_min(1e-30).log()).sum(-1).mean())

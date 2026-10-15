@@ -49,7 +49,7 @@ import torch
 
 from tq_longbench._ascend import turboquant_layout, turboquant_rotation
 from tq_longbench.kv_cache import CacheGeometry, DenseKVCache, TurboQuantKVCache
-from tq_longbench.ops import AttentionBackend, LayerShape, longest_context
+from tq_longbench.ops import AttentionBackend, LayerShape, expand_kv_heads, longest_context
 
 # TurboQuantCodec<4>: two 4-bit codes per byte, stored biased into int8.
 _NIBBLE_RADIX = 16
@@ -283,7 +283,7 @@ class TurboQuantReferenceBackend(AttentionBackend):
         keys = dequantize(key_plane.view(shape)[rows], self._centroids) * scales[:, :heads].unsqueeze(-1)
         values = dequantize(value_plane.view(shape)[rows], self._centroids) * scales[:, heads : 2 * heads].unsqueeze(-1)
         group = self.shape.num_heads // heads
-        return keys.repeat_interleave(group, dim=1), values.repeat_interleave(group, dim=1)
+        return expand_kv_heads(keys, group), expand_kv_heads(values, group)
 
     def decode(
         self,

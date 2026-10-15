@@ -137,6 +137,7 @@ from tq_longbench.ops import (  # noqa: E402
     ascend_ops,
     build_backend,
     cube_decode_available,
+    expand_kv_heads,
     reference_equivalent,
 )
 from tq_longbench.preflight import (  # noqa: E402
@@ -1388,6 +1389,56 @@ class TestGlm4Config(unittest.TestCase):
             is_glm4_config({"model_type": "glm4"})
 
 
+class TestGqaHeadExpansion(unittest.TestCase):
+    """``expand_kv_heads`` against the operator CANN 9.2 will not run for us.
+
+    ``repeat_interleave(group, dim=1)`` is the definition, and it is still perfectly
+    good on the host -- it is only the Ascend 950PR device kernel that is missing
+    (``aclnnRepeatInterleaveIntWithDim``, 561103). So the oracle here is the operator
+    itself, on CPU, which is what makes this a real equivalence and not a restatement.
+    """
+
+    def test_it_is_repeat_interleave_along_the_head_axis(self):
+        for tokens, kv_heads, head_size in ((5, 2, 8), (1, 4, 16), (3, 1, 4), (2, 8, 64)):
+            for group in (1, 2, 3, 7):
+                with self.subTest(tokens=tokens, kv_heads=kv_heads, head_size=head_size, group=group):
+                    kv = torch.randn(tokens, kv_heads, head_size)
+                    expanded = expand_kv_heads(kv, group)
+                    self.assertTrue(torch.equal(expanded, kv.repeat_interleave(group, dim=1)))
+
+    def test_it_hands_back_a_contiguous_copy(self):
+        """A single kv head is where expand's zero stride would otherwise survive."""
+        for kv_heads in (1, 2):
+            with self.subTest(kv_heads=kv_heads):
+                kv = torch.randn(3, kv_heads, 8)
+                expanded = expand_kv_heads(kv, 4)
+                self.assertTrue(expanded.is_contiguous())
+                self.assertEqual(expanded.shape, (3, kv_heads * 4, 8))
+                expanded[...] = 0.0
+                self.assertTrue(bool(kv.any()))
+
+    def test_every_query_head_lands_on_its_own_groups_keys(self):
+        """Getting the order wrong scores each head against the wrong keys and raises nothing."""
+        kv = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
+        expanded = expand_kv_heads(kv, 2)
+        for kv_head in range(3):
+            for offset in range(2):
+                torch.testing.assert_close(expanded[:, kv_head * 2 + offset], kv[:, kv_head])
+
+    def test_no_module_that_reads_a_cache_plane_calls_it_on_a_tensor(self):
+        """The three callers that broke, pinned where the next one would be added.
+
+        ``preflight.exact_attention`` is deliberately not here: it is the float32
+        oracle, it is only ever handed host tensors, and leaving the operator in it
+        is what keeps it an independent check of this helper's callers.
+        """
+        harness = Path(ops_module.__file__).parent
+        for name in ("ops.py", "reference.py", "probe.py", "diagnose.py"):
+            with self.subTest(module=name):
+                source = (harness / name).read_text(encoding="utf-8")
+                self.assertNotIn(".repeat_interleave(", source)
+
+
 class TestGlm4Rope(unittest.TestCase):
     """Half the head, adjacent pairs: checked against both upstream formulations."""
 
@@ -1410,6 +1461,26 @@ class TestGlm4Rope(unittest.TestCase):
         positions = torch.tensor([5, 900])
         x = torch.randn(2, 3, 128)
         self.assertTrue(torch.equal(self._rope(128, 1.0e8).apply(x, positions)[..., 64:], x[..., 64:]))
+
+    def test_the_table_is_built_without_repeat_interleave(self):
+        """CANN 9.2 on Ascend 950PR has no dynamic aclnnRepeatInterleaveIntWithDim (561103).
+
+        The interleaved cos/sin table is built on the layer's own device, so the one
+        ``repeat_interleave`` that used to duplicate each angle took the whole run down
+        before the first prefill chunk. Nothing else in the constructor may reach for it.
+        """
+
+        def refused(*_args, **_kwargs):
+            raise RuntimeError("EZ9999: aclnnRepeatInterleaveIntWithDim is not registered (561103)")
+
+        with mock.patch.object(torch.Tensor, "repeat_interleave", refused):
+            rope = self._rope(128, 5.0e6)
+        self.assertTrue(rope.cos.is_contiguous())
+        self.assertEqual(rope.cos.shape, (4096, 64))
+        self.assertEqual(rope.cos.dtype, torch.float32)
+        # Adjacent channels share an angle: that is what the duplication is for.
+        torch.testing.assert_close(rope.cos[:, 0::2], rope.cos[:, 1::2])
+        torch.testing.assert_close(rope.sin[:, 0::2], rope.sin[:, 1::2])
 
     def test_the_neox_default_is_unchanged(self):
         """Qwen's full-width rotate_half, restated independently of layers.py."""

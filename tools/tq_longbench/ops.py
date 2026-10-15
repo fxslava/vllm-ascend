@@ -118,6 +118,31 @@ def longest_context(context_lens: torch.Tensor) -> int:
     return int(context_lens.max()) if context_lens.numel() else 0
 
 
+def expand_kv_heads(kv: torch.Tensor, group: int) -> torch.Tensor:
+    """``[tokens, kv_heads, head_size]`` to ``[tokens, kv_heads * group, head_size]``.
+
+    The GQA head expansion a reference or a diagnostic needs before it can score a
+    query against a cached key, written as unsqueeze/expand/reshape rather than as
+    ``repeat_interleave(group, dim=1)``: **CANN 9.2 on Ascend 950PR has no dynamic
+    kernel for aclnnRepeatInterleaveIntWithDim (error 561103)**, and every caller
+    here reads its keys straight out of a cache plane that lives on the device.
+    ``tq_longbench.layers.RotaryEmbedding`` avoids the same operator the same way.
+
+    Head ``h`` lands at destinations ``h * group`` through ``(h + 1) * group``,
+    which is what repeat_interleave along the head axis means -- and the order the
+    query's heads are laid out in, so getting it wrong silently scores each query
+    head against the wrong group's keys.
+
+    ``contiguous()`` is what makes this a drop-in rather than merely an equal
+    tensor: at ``kv_heads == 1`` the expand's zero stride survives the reshape as a
+    broadcast view, where ``repeat_interleave`` always returns a fresh copy. It
+    costs nothing above one kv head, where the reshape has already copied.
+    """
+    tokens, heads, head_size = kv.shape
+    expanded = kv.unsqueeze(2).expand(tokens, heads, group, head_size)
+    return expanded.reshape(tokens, heads * group, head_size).contiguous()
+
+
 class AttentionBackend(abc.ABC):
     """One decode path, bound to one cache pool, serving every layer of the model."""
 
