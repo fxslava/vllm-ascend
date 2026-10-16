@@ -711,22 +711,16 @@ if(VLLM_ASCEND_TESTS_TIER_SIM OR VLLM_ASCEND_TESTS_TIER_DEVICE)
     # kernel whose generated launcher is in the same ascendc_library.
     #   op_kernel/turboquant_paged_attention.cpp  the shipping AIV-only 4-bit path
     #   op_kernel/turboquant_rotate_q.cpp         the query rotation (also shipping)
-    #   op_kernel/turboquant_fused_decode.cpp     the multi-mode Cube-native path,
-    #                                             test-only: the wheel builds the two above
+    #   op_kernel/turboquant_fused_decode.cpp     the multi-mode Cube-native path
     set(VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCE
         "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/op_kernel/turboquant_paged_attention.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/op_kernel/turboquant_fused_decode.cpp"
-        # op_kernel/turboquant_fused_decode_opt.cpp  the modulo-scheduled decode, also
-        #                                            test-only, and in this library for the
-        #                                            same reason: test_sim_950pr_turboquant_fused_opt
-        #                                            calls both it and the lock-step decode
-        #                                            from one process, and a <<<>>> call site
-        #                                            reaches neither unless both launchers
-        #                                            are generated here.
+        # The modulo-scheduled decode shares this library with the baseline so
+        # both generated launchers are available to the same test process.
         "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/op_kernel/turboquant_fused_decode_opt.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/../attention/turboquant/op_kernel/turboquant_rotate_q.cpp"
         # Test-owned device code, and the one source in this list the wheel does
-        # not build - the root CMakeLists.txt names only the first and third. It is an
+        # not build. It is an
         # exploratory spike (a Cube-factorised Walsh-Hadamard, see its header)
         # and it rides in this library rather than one of its own because a
         # <<<>>> call site can only reach a kernel whose generated launcher is

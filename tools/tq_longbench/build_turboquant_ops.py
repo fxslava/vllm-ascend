@@ -18,7 +18,7 @@
 
     python tools/tq_longbench/build_turboquant_ops.py --soc-version Ascend950PR_9599
 
-Configures ``csrc/attention/turboquant/standalone/CMakeLists.txt`` -- the three
+Configures ``csrc/attention/turboquant/standalone/CMakeLists.txt`` -- the four
 TurboQuant kernel sources, the host tiling and one binding file -- and installs
 
     tools/tq_longbench/lib/libvllm_turboquant_cube.so

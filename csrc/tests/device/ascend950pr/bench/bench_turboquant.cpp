@@ -18,15 +18,17 @@
 // the tables and CSV exporters in common/turboquant_audit_report; this file is
 // the device side: buffers, planned native operators, launches, timing.
 // Correctness is the correctness tier's job - this file measures throughput and
-// latency, and the only equality it checks between launches is the gather
-// expand's, which primes its own legs.
+// latency. It also checks the gather and optimized variants against the baseline
+// before timing their legs.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -75,6 +77,8 @@ using tqa::kLegDecFusedQE2E;
 using tqa::kLegDecGather;
 using tqa::kLegDecLloydMax;
 using tqa::kLegDecNoUnpack;
+using tqa::kLegDecOptAttnCore;
+using tqa::kLegDecOptFusedQAttnCore;
 using tqa::kLegDecRotO;
 using tqa::kLegDecRotQ;
 using tqa::kLegDecV5;
@@ -112,6 +116,7 @@ constexpr int64_t kFiaSparseModeRightDownCausal = 3;
 constexpr int64_t kFiaNoPaging = 0;
 
 constexpr double kHbmBudget = 0.85;
+constexpr double kOptAgreementFloor = 0.999;
 
 constexpr size_t kExactContextElements = 1u << 22;
 
@@ -349,6 +354,19 @@ class Scenario {
         cube_grid_.fused_context_limit, config_.attention_scale(), config_.attention_scale());
   }
 
+  // Same buffers and grid as EnqueueDecodeFusedCube; only the modulo schedule changes.
+  void EnqueueDecodeFusedCubeOpt(aclrtStream stream) const {
+    turboquant_mm_fused_decode_opt_impl(
+        static_cast<int32_t>(config_.mode), AscendType::FP16, stream, cube_grid_.block_dim, query_dec_rot_.get(),
+        key_cache_.get(), value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(),
+        decode_tables_.get(), workspace_.get(), out_dec_tq_.get(), static_cast<uint32_t>(config_.batch),
+        static_cast<uint32_t>(config_.model.num_heads), static_cast<uint32_t>(config_.model.num_kv_heads),
+        static_cast<uint32_t>(config_.model.head_size), static_cast<uint32_t>(kBlockSize),
+        static_cast<uint32_t>(config_.blocks_per_seq()), static_cast<uint32_t>(cube_grid_.num_splits),
+        cube_grid_.heads_per_task, cube_grid_.tasks_per_block, cube_grid_.reduce_tasks_per_block,
+        cube_grid_.fused_context_limit, config_.attention_scale(), config_.attention_scale());
+  }
+
   // The unpack ablation of EnqueueDecodeFusedCube: byte-for-byte the same launch on the same buffers, with
   // the KV ingest's codec expand compiled out. Cube path only -- the AIV paged decode has no separate
   // unpack phase to remove, its expand and its dot product are the same instruction stream.
@@ -456,6 +474,67 @@ class Scenario {
         cube_grid_.fused_context_limit, config_.attention_scale(), config_.attention_scale());
   }
 
+  void EnqueueDecodeFusedQOpt(aclrtStream stream) const {
+    turboquant_mm_fused_decode_opt_raw_query_impl(
+        static_cast<int32_t>(config_.mode), AscendType::FP16, stream, cube_grid_.block_dim, query_dec_.get(),
+        pi_signs_.get(), rot_tables_.get(), h16_.get(), nullptr, query_dec_prologue_rot_.get(), key_cache_.get(),
+        value_cache_.get(), scale_plane_.get(), block_tables_.get(), context_lens_.get(), decode_tables_.get(),
+        workspace_.get(), out_dec_tq_.get(), static_cast<uint32_t>(config_.batch),
+        static_cast<uint32_t>(config_.model.num_heads), static_cast<uint32_t>(config_.model.num_kv_heads),
+        static_cast<uint32_t>(config_.model.head_size), static_cast<uint32_t>(kBlockSize),
+        static_cast<uint32_t>(config_.blocks_per_seq()), static_cast<uint32_t>(cube_grid_.num_splits),
+        cube_grid_.heads_per_task, cube_grid_.tasks_per_block, cube_grid_.reduce_tasks_per_block,
+        cube_grid_.prologue_vectors_per_block, cube_grid_.prologue_cube_chunk_vectors, config_.fused_q_output_stage(),
+        cube_grid_.fused_context_limit, config_.attention_scale(), config_.attention_scale());
+  }
+
+  void CheckOptAgainstBaseline(aclrtStream stream, bool raw_query) const {
+    if (raw_query) {
+      EnqueueDecodeFusedQ(stream);
+    } else {
+      EnqueueDecodeFusedCube(stream);
+    }
+    ACL_CHECK(aclrtSynchronizeStream(stream));
+    const std::vector<Half> baseline = LeadingElements<Half>(out_dec_tq_);
+    if (raw_query) {
+      EnqueueDecodeFusedQOpt(stream);
+    } else {
+      EnqueueDecodeFusedCubeOpt(stream);
+    }
+    ACL_CHECK(aclrtSynchronizeStream(stream));
+    const std::vector<Half> optimized = LeadingElements<Half>(out_dec_tq_);
+    if (baseline.size() != optimized.size() || baseline.empty()) {
+      throw std::runtime_error("optimized decode output size differs from baseline");
+    }
+    size_t bit_diffs = 0;
+    double dot = 0.0;
+    double baseline_norm = 0.0;
+    double optimized_norm = 0.0;
+    const std::vector<float> baseline_float = HalfToFloat(baseline);
+    const std::vector<float> optimized_float = HalfToFloat(optimized);
+    for (size_t i = 0; i < baseline.size(); ++i) {
+      bit_diffs += baseline[i].bits != optimized[i].bits ? 1u : 0u;
+      const double a = baseline_float[i];
+      const double b = optimized_float[i];
+      if (!std::isfinite(a) || !std::isfinite(b)) {
+        throw std::runtime_error("optimized decode comparison contains non-finite output");
+      }
+      dot += a * b;
+      baseline_norm += a * a;
+      optimized_norm += b * b;
+    }
+    const double cosine = baseline_norm > 0.0 && optimized_norm > 0.0
+                              ? dot / std::sqrt(baseline_norm * optimized_norm)
+                              : 0.0;
+    std::printf("[ascend-bench] opt %s S=%lld B=%lld: %zu bit diffs, cosine %.9f\n",
+                raw_query ? "raw-query" : "pre-rotated", static_cast<long long>(config_.seq_len),
+                static_cast<long long>(config_.batch), bit_diffs, cosine);
+    std::fflush(stdout);
+    if (bit_diffs != 0 && cosine < kOptAgreementFloor) {
+      throw std::runtime_error("optimized decode disagrees with baseline");
+    }
+  }
+
   // One launch: the in-launch output stage leaves nothing to follow it.
   void EnqueueDecodeFusedQE2E(aclrtStream stream) const { EnqueueDecodeFusedQ(stream); }
 
@@ -500,6 +579,14 @@ class Scenario {
     EnqueueDecodeAttnCore(stream);
     if (config_.decodes_in_mode(RotationMode::kFusedPrologue)) {
       EnqueueDecodeFusedQ(stream);
+    }
+    if (config_.path == PathMode::kCube && config_.mode == tqm::TurboQuantMode::KV4_FP8) {
+      if (config_.decodes_in_mode(RotationMode::kSeparate) && LegEnabled(kLegDecOptAttnCore)) {
+        CheckOptAgainstBaseline(stream, false);
+      }
+      if (config_.decodes_in_mode(RotationMode::kFusedPrologue) && LegEnabled(kLegDecOptFusedQAttnCore)) {
+        CheckOptAgainstBaseline(stream, true);
+      }
     }
     if (config_.mode == tqm::TurboQuantMode::KV4_FP8 && config_.path == PathMode::kCube && UnpackAblationEnabled()) {
       EnqueueDecodeNoUnpack(stream);
@@ -964,6 +1051,16 @@ void BuildSuite(BenchmarkRunner& primary) {
         runner.Skip(CaseName(kLegDecAttnCore, config), separate_off);
       }
 
+      if (config.path != PathMode::kCube || config.mode != tqm::TurboQuantMode::KV4_FP8) {
+        runner.Skip(CaseName(kLegDecOptAttnCore, config), "optimized decode supports KV4 Cube only");
+      } else if (!separate) {
+        runner.Skip(CaseName(kLegDecOptAttnCore, config), separate_off);
+      } else {
+        run_leg(kLegDecOptAttnCore, model.dec_flops, model.dec_attn_core, 1,
+                [sc](aclrtStream s) { sc->EnqueueDecodeFusedCubeOpt(s); },
+                [sc]() { return sc->DecodeTqChecksum(); });
+      }
+
       // The ablated twin of kLegDecAttnCore. It runs under the same rotation mode and the same traffic
       // model, so the two rows differ in the unpack phase and nothing else. Its checksum is recorded like
       // any other leg's and is meaningless on purpose: the launch stages zeros.
@@ -1037,8 +1134,12 @@ void BuildSuite(BenchmarkRunner& primary) {
         run_leg(
             kLegDecFusedQAttnCore, model.dec_flops, model.dec_fused_q_attn_core, 1,
             [sc](aclrtStream s) { sc->EnqueueDecodeFusedQ(s); }, [sc]() { return sc->DecodeTqChecksum(); });
+        run_leg(kLegDecOptFusedQAttnCore, model.dec_flops, model.dec_fused_q_attn_core, 1,
+                [sc](aclrtStream s) { sc->EnqueueDecodeFusedQOpt(s); },
+                [sc]() { return sc->DecodeTqChecksum(); });
       } else {
         runner.Skip(CaseName(kLegDecFusedQAttnCore, config), fused_q_off);
+        runner.Skip(CaseName(kLegDecOptFusedQAttnCore, config), fused_q_off);
       }
 
       if (config.model.folds_output) {

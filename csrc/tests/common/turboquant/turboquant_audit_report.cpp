@@ -612,9 +612,7 @@ void PrintBanner(const std::vector<Config>& sweep, int64_t aiv_num, bool aiv_que
       "[ascend-bench]   prompt role and the incremental role through its argument list. V2 is the\n"
       "[ascend-bench]   fallback; every table says which one actually planned.\n");
   std::printf("[ascend-bench]\n");
-  std::printf(
-      "[ascend-bench]   NO NUMBER BELOW HAS EVER BEEN TAKEN ON SILICON. No Ascend 950PR part has been\n"
-      "[ascend-bench]   available to this project; the kernels are verified on the arch35 camodel.\n");
+  std::printf("[ascend-bench]   Timing rows below require a physical Ascend 950PR; simulator results are not timings.\n");
   std::printf("[ascend-bench]\n");
   std::printf("[ascend-bench]   decode: split policy %s (ASCEND_BENCH_TQ_AUDIT_SPLIT), rotation modes %s (%s)\n",
               SplitPolicyLabel(SplitPolicy()), RotationModesLabel().c_str(), kRotationModeEnv);

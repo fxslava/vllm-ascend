@@ -55,7 +55,8 @@ const std::vector<const char*>& PrefillLegs() {
 const std::vector<const char*>& DecodeLegs() {
   static const std::vector<const char*> legs = {kLegDecRotQ,   kLegDecAttnCore,       kLegDecRotO,      kLegDecE2E,
                                                 kLegDecV5,     kLegDecFusedQAttnCore, kLegDecFusedQE2E, kLegDecNoUnpack,
-                                                kLegDecGather, kLegDecLloydMax};
+                                                kLegDecGather, kLegDecLloydMax, kLegDecOptAttnCore,
+                                                kLegDecOptFusedQAttnCore};
   return legs;
 }
 

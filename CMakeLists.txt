@@ -94,7 +94,8 @@ if(SOC_VERSION MATCHES "ascend910b.*|ascend910_93|ascend950")
     if(SOC_VERSION MATCHES "ascend950")
         set(VLLM_ASCEND_BUILD_TURBOQUANT_CUBE ON)
         list(APPEND VLLM_ASCEND_TURBOQUANT_KERNEL_SOURCES
-            ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/op_kernel/turboquant_fused_decode.cpp)
+            ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/op_kernel/turboquant_fused_decode.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/op_kernel/turboquant_fused_decode_opt.cpp)
         message(STATUS "Hardware ${SOC_VERSION} detected: building the TurboQuant Cube decode")
     else()
         set(VLLM_ASCEND_BUILD_TURBOQUANT_CUBE OFF)

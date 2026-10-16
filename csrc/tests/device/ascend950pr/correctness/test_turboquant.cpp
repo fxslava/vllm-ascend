@@ -547,6 +547,54 @@ class TurboQuantBareMetal : public ::testing::Test {
 
 }  // namespace
 
+TEST_F(TurboQuantBareMetal, test_MIXTurboQuant4b_OptDecodeMatchesBaseline) {
+  REQUIRE_PHYSICAL_ASCEND_950PR();
+
+  // Short contexts exercise ring reuse and a ragged tail; 2048 is a production
+  // decode length, and 8192 forces the split/reduction path above the fused limit.
+  constexpr int64_t kSplitOptContext = 8192;
+  constexpr int64_t kOptContexts[] = {256, 385, 2048, kSplitOptContext};
+  constexpr double kOptAgreementFloor = 0.999;
+  const int64_t aiv_num = tqh::VectorCoreNum(nullptr);
+  for (const int64_t context_len : kOptContexts) {
+    tqh::FusedShape shape;
+    shape.num_heads = kGqaQueryHeads;
+    shape.num_kv_heads = kGqaKvHeadChoices[1];
+    shape.head_size = kTopologyHeadDims[1];
+    shape.block_size = tqh::kCubeTileRows;
+    shape.context_len = context_len;
+    tqh::FusedCubeScenario scenario(shape, Stream(), aiv_num);
+    const tqh::FusedDecodeGrid grid = context_len < kSplitOptContext
+                                          ? scenario.Plan(0, tqh::FusedSplitPolicy::kContextOnly)
+                                          : scenario.Plan();
+    if (context_len < kSplitOptContext) {
+      ASSERT_EQ(grid.num_splits, 1) << "the unsplit case must traverse its full tile count";
+    } else {
+      ASSERT_GT(grid.num_splits, 1) << "the long case must exercise split reduction";
+    }
+
+    const tqh::FusedRun baseline = scenario.RunFused(grid);
+    const tqh::FusedRun optimized = scenario.RunFusedOpt(grid);
+    ASSERT_EQ(baseline.launches, 1) << "S=" << context_len;
+    ASSERT_EQ(optimized.launches, 1) << "S=" << context_len;
+    ASSERT_EQ(baseline.raw.size(), optimized.raw.size()) << "S=" << context_len;
+    ASSERT_EQ(baseline.untouched, 0u) << "S=" << context_len;
+    ASSERT_EQ(optimized.untouched, 0u) << "S=" << context_len;
+
+    size_t bit_diffs = 0;
+    for (size_t i = 0; i < baseline.raw.size(); ++i) {
+      bit_diffs += baseline.raw[i].bits != optimized.raw[i].bits ? 1u : 0u;
+    }
+    const double cosine = tqh::FusedCosine(optimized.output, baseline.output);
+    std::printf("[turboquant/bare-metal] opt decode S=%lld splits=%lld bit_diffs=%zu cosine=%.9f\n",
+                static_cast<long long>(context_len), static_cast<long long>(grid.num_splits), bit_diffs, cosine);
+    std::fflush(stdout);
+    EXPECT_EQ(CountNonFiniteHalves(optimized.raw), 0u) << "S=" << context_len;
+    EXPECT_TRUE(bit_diffs == 0 || cosine >= kOptAgreementFloor)
+        << "S=" << context_len << ": optimized decode differs from the baseline";
+  }
+}
+
 TEST_F(TurboQuantBareMetal, test_AIVTurboQuant_DeviceTopology) {
   REQUIRE_PHYSICAL_ASCEND_950PR();
 

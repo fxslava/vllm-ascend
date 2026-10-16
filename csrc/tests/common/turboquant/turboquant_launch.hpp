@@ -76,7 +76,7 @@ void turboquant_mm_fused_decode_raw_query_impl(
 // turboquant_mm_fused_decode_impl on a three-stage pipeline -- a kCubePipelineSlots-deep ingest ring and
 // kCubeScoreWindows Fixpipe score windows instead of two slots and one window. Argument for argument the
 // same call, so a test or a bench can swap one for the other without touching its grid. kv4fp8 only, and
-// unvalidated: this is what test_sim_950pr_turboquant_fused_opt exists to find out.
+// exercised by simulator and device-tier comparison tests before selection for inference.
 void turboquant_mm_fused_decode_opt_impl(int32_t mode, AscendType type, void* stream, uint32_t blockDim,
                                          void* queryRot, void* keyCache, void* valueCache, void* scaleCache,
                                          void* blockTables, void* contextLens, void* modeTables, void* workspace,

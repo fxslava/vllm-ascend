@@ -1,4 +1,4 @@
-# Standalone build of the TurboQuant operators for Ascend 950: the three kernel sources
+# Standalone build of the TurboQuant operators for Ascend 950: the kernel sources
 # vllm_ascend_C's TurboQuant library is made of, the host tiling, and a binding that
 # registers the same torch.ops._C_ascend schemas -- without configuring, compiling or
 # linking anything else of the package.
@@ -55,6 +55,7 @@ ascendc_library(vllm_turboquant_cube_kernels SHARED
   ${VLLM_TQ_DIR}/op_kernel/turboquant_paged_attention.cpp
   ${VLLM_TQ_DIR}/op_kernel/turboquant_rotate_q.cpp
   ${VLLM_TQ_DIR}/op_kernel/turboquant_fused_decode.cpp
+  ${VLLM_TQ_DIR}/op_kernel/turboquant_fused_decode_opt.cpp
 )
 
 find_package(Torch REQUIRED)

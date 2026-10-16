@@ -207,6 +207,8 @@ inline constexpr const char* kLegDecE2E = "DecodeE2E";
 inline constexpr const char* kLegDecV5 = "DecodeNativeV5";
 inline constexpr const char* kLegDecFusedQAttnCore = "DecodeFusedQAttnCore";
 inline constexpr const char* kLegDecFusedQE2E = "DecodeFusedQE2E";
+inline constexpr const char* kLegDecOptAttnCore = "DecodeOptAttnCore";
+inline constexpr const char* kLegDecOptFusedQAttnCore = "DecodeOptFusedQAttnCore";
 // The unpack ablation's counterpart to kLegDecAttnCore; see kUnpackEnv.
 inline constexpr const char* kLegDecNoUnpack = "DecodeNoUnpack";
 // Option C's counterpart to kLegDecAttnCore: the same decode expanding through a UB Gather.

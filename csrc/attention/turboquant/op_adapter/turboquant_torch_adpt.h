@@ -77,6 +77,26 @@ extern void turboquant_mm_fused_decode_raw_query_impl(
     uint32_t headsPerTask, uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock, uint32_t prologueVectorsPerBlock,
     uint32_t prologueCubeChunkVectors, uint32_t outputStage, uint32_t fusedContextLimit, float scale,
     float invSqrtLen);
+
+// KV4_FP8/FP16 modulo-scheduled launchers. Keep the signatures aligned with
+// the baseline entries so host callers can benchmark the same tiling directly.
+extern void turboquant_mm_fused_decode_opt_impl(
+    int32_t mode, AscendType type, void *stream, uint32_t blockDim, void *queryRot, void *keyCache,
+    void *valueCache, void *scaleCache, void *blockTables, void *contextLens, void *modeTables,
+    void *workspace, void *output, uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads,
+    uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits,
+    uint32_t headsPerTask, uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,
+    uint32_t fusedContextLimit, float scale, float invSqrtLen);
+
+extern void turboquant_mm_fused_decode_opt_raw_query_impl(
+    int32_t mode, AscendType type, void *stream, uint32_t blockDim, void *query, void *piSigns,
+    void *rotTables, void *h16, void *gate, void *queryRot, void *keyCache, void *valueCache,
+    void *scaleCache, void *blockTables, void *contextLens, void *modeTables, void *workspace,
+    void *output, uint32_t numTokens, uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize,
+    uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits, uint32_t headsPerTask,
+    uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock, uint32_t prologueVectorsPerBlock,
+    uint32_t prologueCubeChunkVectors, uint32_t outputStage, uint32_t fusedContextLimit,
+    float scale, float invSqrtLen);
 #endif
 
 namespace turboquant_adpt {
