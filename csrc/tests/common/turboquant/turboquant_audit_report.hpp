@@ -75,6 +75,9 @@ void PrintTableA(const std::vector<bench::BenchmarkRunner*>& runners, const std:
 void PrintTableB(const std::vector<bench::BenchmarkRunner*>& runners, const std::vector<Config>& sweep,
                  const std::vector<Traffic>& traffic, const std::string& fia_operator, int64_t aiv_num);
 
+void PrintOptDecodeComparison(const std::vector<bench::BenchmarkRunner*>& runners, const std::vector<Config>& sweep,
+                              const std::vector<Traffic>& traffic);
+
 void WritePrefillCsv(const std::vector<bench::BenchmarkRunner*>& runners, const std::vector<Config>& sweep,
                      const std::vector<Traffic>& traffic, const std::string& path, const std::string& fia_operator);
 

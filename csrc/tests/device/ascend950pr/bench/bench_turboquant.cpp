@@ -1234,6 +1234,7 @@ void BuildSuite(BenchmarkRunner& primary) {
   }
   if (run_decode) {
     tqa::PrintTableB(runners.all(), sweep, traffic, fia_operator, aiv_num);
+    tqa::PrintOptDecodeComparison(runners.all(), sweep, traffic);
     const std::string path = env::String("ASCEND_BENCH_TQ_AUDIT_DECODE_CSV");
     if (!path.empty()) {
       tqa::WriteDecodeCsv(runners.all(), sweep, traffic, path, fia_operator);

@@ -92,9 +92,28 @@ double Speedup(const Sample& baseline, const Sample& candidate) {
   return baseline.median_us / candidate.median_us;
 }
 
+Sample OptDecodeSample(const std::vector<BenchmarkRunner*>& runners, const Config& config, RotationMode mode) {
+  return SampleFor(runners, mode == RotationMode::kSeparate ? kLegDecOptAttnCore : kLegDecOptFusedQAttnCore, config);
+}
+
+double OptDecodeSpeedup(const Sample& baseline, const Sample& opt) {
+  if (std::string(baseline.mode) != opt.mode) {
+    return 0.0;
+  }
+  return Speedup(baseline, opt);
+}
+
 void PrintUs(const Sample& sample, int width) {
   if (sample.present) {
     std::printf(" %*.2f", width, sample.median_us);
+  } else {
+    std::printf(" %*s", width, "-");
+  }
+}
+
+void PrintP95(const Sample& sample, int width) {
+  if (sample.present) {
+    std::printf(" %*.2f", width, sample.p95_us);
   } else {
     std::printf(" %*s", width, "-");
   }
@@ -424,6 +443,54 @@ void PrintTableB(const std::vector<BenchmarkRunner*>& runners, const std::vector
   std::fflush(stdout);
 }
 
+void PrintOptDecodeComparison(const std::vector<BenchmarkRunner*>& runners, const std::vector<Config>& sweep,
+                              const std::vector<Traffic>& traffic) {
+  std::printf("\n[ascend-bench] OPTIMIZED CUBE DECODE VS BASELINE (KV4 FP8, one core launch)\n");
+  std::printf("[ascend-bench] Opt - Base below zero means the optimized kernel is faster; Speedup = Base / Opt.\n");
+  std::printf("  %-17s %23s %9s %11s %9s %9s %20s %-7s | %-11s %-19s %12s %12s %12s %12s %14s %10s %13s\n", "Model",
+              "SeqLen (Context Tokens)", "BatchSize", "HeadDim (D)", "Q_Heads", "KV_Heads", "PrefillChunkTokens",
+              "Mode", "Path", "Cfg [K/Tsk/Blk/Red]", "Base us", "Opt us", "Base p95", "Opt p95", "Opt - Base us",
+              "Speedup", "Timing mode");
+  bool any = false;
+  for (size_t index = 0; index < sweep.size(); ++index) {
+    const Config& config = sweep[index];
+    if (config.path != PathMode::kCube || config.mode != vllm_ascend::turboquant::TurboQuantMode::KV4_FP8) {
+      continue;
+    }
+    for (const RotationMode mode : kRotationModes) {
+      if (!config.decodes_in_mode(mode)) {
+        continue;
+      }
+      const Sample baseline =
+          SampleFor(runners, mode == RotationMode::kSeparate ? kLegDecAttnCore : kLegDecFusedQAttnCore, config);
+      const Sample opt = OptDecodeSample(runners, config, mode);
+      if (!baseline.present && !opt.present) {
+        continue;
+      }
+      any = true;
+      PrintConfigColumns(config);
+      std::printf(" | %-11s %-19s", config.path_tag(mode).c_str(), traffic[index].dispatch.label().c_str());
+      PrintUs(baseline, 12);
+      PrintUs(opt, 12);
+      PrintP95(baseline, 12);
+      PrintP95(opt, 12);
+      const double speedup = OptDecodeSpeedup(baseline, opt);
+      if (speedup > 0.0) {
+        std::printf(" %+14.2f", opt.median_us - baseline.median_us);
+      } else {
+        std::printf(" %14s", "-");
+      }
+      PrintRatio(speedup, 10);
+      std::printf(" %13s", speedup > 0.0 ? baseline.mode : "-");
+      std::printf("\n");
+    }
+  }
+  if (!any) {
+    std::printf("  (no optimized Cube decode sample)\n");
+  }
+  std::fflush(stdout);
+}
+
 void WritePrefillCsv(const std::vector<BenchmarkRunner*>& runners, const std::vector<Config>& sweep,
                      const std::vector<Traffic>& traffic, const std::string& path, const std::string& fia_operator) {
   std::ofstream csv(path, std::ios::trunc);
@@ -508,7 +575,7 @@ namespace {
 
 // The timed columns of one decode CSV row, from t_rot_q_us on.
 void WriteDecodeCsvTimings(std::ofstream& csv, const Config& config, const Traffic& model, const DecodeRow& row,
-                           RotationMode mode) {
+                           const Sample& opt, RotationMode mode) {
   WriteCell(csv, row.rot_q);
   WriteCell(csv, row.attn_core);
   csv << ',' << config.decode_launches(mode);
@@ -555,7 +622,22 @@ void WriteDecodeCsvTimings(std::ofstream& csv, const Config& config, const Traff
     csv << row.native.p95_us;
   }
   csv << ',' << config.budget.warmup << ',' << config.budget.iterations << ',' << row.e2e.mode << ','
-      << SplitPolicyLabel(SplitPolicy()) << '\n';
+      << SplitPolicyLabel(SplitPolicy());
+  WriteCell(csv, opt);
+  csv << ',';
+  if (opt.present) {
+    csv << opt.p95_us;
+  }
+  const double opt_speedup = OptDecodeSpeedup(row.attn_core, opt);
+  csv << ',';
+  if (opt_speedup > 0.0) {
+    csv << opt.median_us - row.attn_core.median_us;
+  }
+  csv << ',';
+  if (opt_speedup > 0.0) {
+    csv << opt_speedup;
+  }
+  csv << ',' << opt.mode << '\n';
 }
 
 }  // namespace
@@ -574,7 +656,9 @@ void WriteDecodeCsv(const std::vector<BenchmarkRunner*>& runners, const std::vec
       << "effective_gbps,attn_core_gbps,v5_gbps,attn_core_tflops,v5_tflops,"
       << "per_layer_fp16_kv_bytes,per_layer_tq_kv_bytes,per_layer_kv_saved_mib,full_model_kv_saved_mib,per_layer_"
          "savings_x_fold,"
-      << "e2e_bytes,attention_flops,tq_e2e_p95_us,v5_p95_us,warmup,iterations,timing_mode,split_policy\n";
+      << "e2e_bytes,attention_flops,tq_e2e_p95_us,v5_p95_us,warmup,iterations,timing_mode,split_policy,"
+      << "opt_fused_decode_us,opt_fused_decode_p95_us,opt_minus_baseline_us,opt_vs_baseline_speedup,"
+      << "opt_timing_mode\n";
 
   // One row per (configuration, rotation mode) the sweep decodes in.
   for (size_t index = 0; index < sweep.size(); ++index) {
@@ -592,7 +676,7 @@ void WriteDecodeCsv(const std::vector<BenchmarkRunner*>& runners, const std::vec
           << AuditModeLabel(config.mode) << ',' << PathLabel(config.path) << ',' << RotationModeKey(mode) << ','
           << dispatch.split_k << ',' << dispatch.total_tasks << ',' << dispatch.active_blocks << ','
           << dispatch.device_blocks << ',' << (dispatch.needs_reduction ? 1 : 0) << ',' << fia_operator;
-      WriteDecodeCsvTimings(csv, config, model, row, mode);
+      WriteDecodeCsvTimings(csv, config, model, row, OptDecodeSample(runners, config, mode), mode);
     }
   }
   std::printf("[ascend-bench] Table B written to %s\n", path.c_str());
@@ -612,7 +696,8 @@ void PrintBanner(const std::vector<Config>& sweep, int64_t aiv_num, bool aiv_que
       "[ascend-bench]   prompt role and the incremental role through its argument list. V2 is the\n"
       "[ascend-bench]   fallback; every table says which one actually planned.\n");
   std::printf("[ascend-bench]\n");
-  std::printf("[ascend-bench]   Timing rows below require a physical Ascend 950PR; simulator results are not timings.\n");
+  std::printf(
+      "[ascend-bench]   Timing rows below require a physical Ascend 950PR; simulator results are not timings.\n");
   std::printf("[ascend-bench]\n");
   std::printf("[ascend-bench]   decode: split policy %s (ASCEND_BENCH_TQ_AUDIT_SPLIT), rotation modes %s (%s)\n",
               SplitPolicyLabel(SplitPolicy()), RotationModesLabel().c_str(), kRotationModeEnv);
