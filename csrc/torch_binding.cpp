@@ -52,6 +52,9 @@
 #include "attention/store_kv_block/store_kv_block_torch_adpt.h"
 #include "attention/store_kv_block_metadata/store_kv_block_metadata_torch_adpt.cpp"
 #include "attention/fused_gdn_gating/fused_gdn_gating_torch_adpt.h"
+#ifdef VLLM_ENABLE_TURBOQUANT
+#include "attention/turboquant/op_adapter/turboquant_torch_adpt.h"
+#endif
 #include <c10/core/Device.h>
 #include <c10/core/Scalar.h>
 #include <c10/util/Exception.h>
@@ -2957,4 +2960,10 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                     float threshold=20.0) -> (Tensor g, Tensor beta_output)");
     ops.impl("npu_fused_gdn_gating", torch::kPrivateUse1, &vllm_ascend::npu_fused_gdn_gating);
 }
+#endif
+
+#ifdef VLLM_ENABLE_TURBOQUANT
+// The TurboQuant schemas and their NPU implementations, as a TORCH_LIBRARY_FRAGMENT
+// so they register beside the _C_ascend ops above rather than redefining the library.
+#include "attention/turboquant/op_adapter/turboquant_torch_ops.h"
 #endif
