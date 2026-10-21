@@ -44,6 +44,7 @@ from .base import (
 )
 from .kv_cache import AscendFAQuantAttentionMethod
 from .registry import get_scheme_class, register_scheme
+from .turboquant_v1 import AscendTurboQuantKVCacheAttentionMethod
 from .w4a4 import (
     AscendW4A4FlatQuantDynamicLinearMethod,
     AscendW4A4LaosDynamicLinearMethod,
@@ -119,6 +120,7 @@ __all__ = [
     "AscendW4A4FlatQuantDynamicLinearMethod",
     "AscendW4A4LaosDynamicLinearMethod",
     "AscendFAQuantAttentionMethod",
+    "AscendTurboQuantKVCacheAttentionMethod",
     "AscendW4A4MXFP4DynamicLinearMethod",
     "AscendW4A4MXFP4DynamicFusedMoEMethod",
     "AscendW4A4MXFP4FlatQuantDynamicLinearMethod",

@@ -1583,3 +1583,63 @@ def get_rotation_matrix(rotation_path: Path | None) -> torch.Tensor:
             rotation_path,
         )
         raise e
+
+
+# TurboQuant's packed KV cache is reachable three ways: the
+# ENABLE_TURBOQUANT env var, a ``--kv-cache-dtype`` naming one of vLLM's
+# TurboQuant presets, and the per-layer ``TurboQuant`` quantization scheme.
+# Every site that has to agree on the cache layout reads it from here, so the
+# routes cannot drift apart the way they did when each tested the env var alone.
+TURBOQUANT_CACHE_DTYPE_PREFIX = "turboquant_"
+
+# vLLM's own per-token-head int4 mode. Its page arithmetic -- ``head_size // 2``
+# payload plus ``2 * num_kv_heads`` fp32 scale lanes -- is the one upstream mode
+# that matches the Ascend layout, exactly so when ``num_kv_heads % 4 == 0``.
+TURBOQUANT_KV_CACHE_DTYPE = "int4_per_token_head"
+TURBOQUANT_KV3_CACHE_DTYPES = frozenset({"turboquant_int3", "kv3fp4"})
+
+# Both TurboQuant C++ adapters require ``block_size % 16 == 0``: 16 is the
+# codec's tile height, so a block has to be a whole number of tiles.
+TURBOQUANT_BLOCK_SIZE_MULTIPLE = 16
+
+# The attention op of a gated layer whose TurboQuant decode gates in its own launch
+# (vllm_ascend/ops/turboquant_attention.py); a graph splitting op like vLLM's unified one.
+TURBOQUANT_GATED_ATTENTION_OP = "vllm::turboquant_gated_attention"
+
+
+def is_turboquant_cache_dtype(cache_dtype: object) -> bool:
+    """Whether ``cache_dtype`` names a TurboQuant KV cache."""
+    if not isinstance(cache_dtype, str):
+        return False
+    return (
+        cache_dtype == TURBOQUANT_KV_CACHE_DTYPE
+        or cache_dtype in TURBOQUANT_KV3_CACHE_DTYPES
+        or cache_dtype.startswith(TURBOQUANT_CACHE_DTYPE_PREFIX)
+    )
+
+
+def turboquant_cache_mode(cache_dtype: object) -> int:
+    """Return the in-tree Cube mode ID for the selected TurboQuant cache."""
+    return 3 if isinstance(cache_dtype, str) and cache_dtype in TURBOQUANT_KV3_CACHE_DTYPES else 4
+
+
+def turboquant_enabled(vllm_config=None) -> bool:
+    """Whether a TurboQuant KV cache is active for this run.
+
+    Reads, in order: the ``ENABLE_TURBOQUANT`` env var, then the configured
+    ``cache_config.cache_dtype``. The per-layer quantization scheme activates a
+    layer by swapping its impl class and cannot be seen from the config, so a
+    checkpoint that requests TurboQuant per layer must also carry a TurboQuant
+    ``cache_dtype`` for the cache layout to follow -- which is what
+    :meth:`NPUPlatform._validate_turboquant_config` checks at startup.
+    """
+    import vllm_ascend.envs as envs_ascend
+
+    if envs_ascend.ENABLE_TURBOQUANT:
+        return True
+    if vllm_config is None:
+        return False
+    cache_config = getattr(vllm_config, "cache_config", None)
+    if cache_config is None:
+        return False
+    return is_turboquant_cache_dtype(getattr(cache_config, "cache_dtype", None))

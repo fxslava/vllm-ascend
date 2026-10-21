@@ -71,6 +71,84 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Route AscendAttentionBackend to the TurboQuant 4-bit KV cache implementation
+    # (vllm_ascend/attention/turboquant_v1.py) and pack its KV cache to
+    # head_size // 2 int8 elements. 0 (default): off. 1: on. It applies to every
+    # layer on AscendAttentionBackend, so enable it only for dense-attention models
+    # the TurboQuant kernels support; it cannot be combined with decode context
+    # parallel.
+    "ENABLE_TURBOQUANT": lambda: bool(int(os.getenv("ENABLE_TURBOQUANT", "0"))),
+    # Decode the TurboQuant 4-bit KV cache with the kv4fp8 Cube kernels: one launch per step
+    # that rotates the raw query and, for an o_proj without Pi folded in, un-rotates the output
+    # and applies an attn_output_gate itself (vllm_ascend/attention/turboquant_v1.py).
+    # 1 (default): on wherever the build has the Cube kernels (Ascend 950) and the model runs
+    # in float16; everywhere else the AIV decode is used regardless. 0: always the AIV decode,
+    # with separate query and output rotation launches. The two write different cache layouts,
+    # so the value is read once per layer, when its attention impl is built.
+    "VLLM_ASCEND_TURBOQUANT_CUBE_DECODE": lambda: bool(int(os.getenv("VLLM_ASCEND_TURBOQUANT_CUBE_DECODE", "1"))),
+    # Check every slot the TurboQuant writer is handed against the cache it writes into, before
+    # the launch, and drain the launch afterwards (vllm_ascend/attention/turboquant_v1.py).
+    # 0 (default): off. 1: on. The values live on the device, so the check costs a device-to-host
+    # copy and a synchronisation on every cache write of every layer -- diagnostic only, never a
+    # serving default. The kernels drop an unusable slot either way; this is what turns that silent
+    # drop into a named error, and the two synchronisations bracket the write so an asynchronous
+    # fault is attributed to the right side of it rather than to a later operator.
+    "VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS": lambda: bool(int(os.getenv("VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS", "0"))),
+    # Append every TurboQuant operator invocation -- its tensor signatures, pointer
+    # alignments, slot/block index ranges and scalar launch arguments -- as one JSON
+    # record per line to TURBOQUANT_TRACE_PATH
+    # (vllm_ascend/attention/turboquant_trace.py). 0 (default): off. 1: on. Diagnostic
+    # only, never a serving default: summarising the index tensors costs a
+    # device-to-host copy per call site, and the file is line-buffered so a record
+    # survives the process abort an asynchronous kernel fault causes. The file is
+    # written directly rather than through `logger`, because a worker process's log
+    # output is redirected somewhere that may never be flushed.
+    "TURBOQUANT_CAPTURE_SIGNATURES": lambda: bool(int(os.getenv("TURBOQUANT_CAPTURE_SIGNATURES", "0"))),
+    # Skip every TurboQuant kernel launch and leave the destination tensors zeroed
+    # (vllm_ascend/attention/turboquant_trace.py). 0 (default): off. 1: on. The engine
+    # then walks through prefill and every decode step of every layer without ever
+    # reaching an AI core, so TURBOQUANT_CAPTURE_SIGNATURES can record the real
+    # production configuration of a run that otherwise aborts at its first faulting
+    # launch. The outputs are meaningless: this produces no tokens worth reading.
+    "TURBOQUANT_DRY_RUN": lambda: bool(int(os.getenv("TURBOQUANT_DRY_RUN", "0"))),
+    # Where TURBOQUANT_CAPTURE_SIGNATURES appends its records. Defaults to
+    # /workspace/turboquant_trace.log, which is the container's bind mount. A path that
+    # cannot be opened falls back to stderr rather than losing the capture.
+    "TURBOQUANT_TRACE_PATH": lambda: os.getenv("TURBOQUANT_TRACE_PATH", ""),
+    # Keep the last TURBOQUANT_FLIGHT_RECORDER dispatches in an in-memory ring and write them
+    # to turboquant_last_crash.jsonl if the process leaves through a Python exception or a
+    # normal exit (vllm_ascend/attention/turboquant_trace.py). 0 (default): off. A positive
+    # integer is the ring's capacity; 1 means "on" and is read as the 128-entry default.
+    # Much cheaper than TURBOQUANT_CAPTURE_SIGNATURES -- nothing is written per dispatch and
+    # no index tensor is summarised, so it costs no device-to-host copy -- but it only
+    # survives a *Python-level* failure. An AI core fault aborts the process, and neither
+    # atexit nor sys.excepthook runs then; the line-buffered trace log is what survives that.
+    "TURBOQUANT_FLIGHT_RECORDER": lambda: int(os.getenv("TURBOQUANT_FLIGHT_RECORDER", "0")),
+    # Append one JSON line per *distinct* launch configuration to turboquant_unique_cases.jsonl,
+    # deduplicated in memory by operator, ragged tail, token and head counts, shapes and strides
+    # (vllm_ascend/attention/turboquant_trace.py). 0 (default): off. 1: on. A long serving run
+    # visits only a handful of distinct shapes, so the file stays small and is what an offline
+    # unit test replays.
+    "TURBOQUANT_RECORD_CASES": lambda: bool(int(os.getenv("TURBOQUANT_RECORD_CASES", "0"))),
+    # Keep the first N tokens of every sequence out of the 4-bit quantisation and attend to
+    # them at full precision (vllm_ascend/attention/turboquant_sink.py). 0 (default): off, and
+    # every TurboQuant path below is byte-for-byte the one that ships. A value in
+    # [1, TURBOQUANT_MAX_SINK_TOKENS] keeps that many *attention sink* tokens in an
+    # uncompressed fp16/bf16 side-car plane and folds their exact contribution back into the
+    # decode's softmax on the host. 4 is what the retrieval ablation used.
+    #
+    # The side-car costs 2 * num_blocks * N * num_kv_heads * head_size activation elements per
+    # layer -- about 8 KiB per sequence per layer at N=4, H_KV=8, D=128 -- and is carved
+    # nowhere near the paged allocator: see TurboQuantSinkCache for why it is indexed by the
+    # physical block that holds a sequence's logical block 0.
+    #
+    # Host-side fusion, so it is a correctness and ergonomics vehicle rather than a serving
+    # default: the decode operators return a *normalised* attention output and no softmax
+    # denominator, and the denominator cannot be recovered from a normalised output, so the
+    # weight the sink stream has to be merged against is recomputed on the host at O(context)
+    # per decode step. The kernels already materialise it (kPartialSumLane in the split
+    # workspace); exposing it is what makes this free.
+    "VLLM_ASCEND_TQ_SINK_TOKENS": lambda: int(os.getenv("VLLM_ASCEND_TQ_SINK_TOKENS", "0")),
 }
 
 # end-env-vars-definition
