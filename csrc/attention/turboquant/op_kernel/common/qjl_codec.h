@@ -32,8 +32,9 @@
 // The one thing the layout does NOT give you is an unbiased inner-product estimator. Any
 // deterministic quantizer Q has E[k_hat | k] = Q(k) != k, whatever its bit layout. Unbiasedness
 // comes from *stochastic rounding* of the level index, which is a change to the encoder only and
-// is orthogonal to this file; see kStochasticRoundingIsExact below and
-// vllm_ascend/attention/qjl_reference.py for the reference implementation and its proof test.
+// is orthogonal to this file; see kStochasticRoundingIsExact below. The reference
+// implementation and its proof test live in the main development tree, not on this
+// inference-only branch.
 //
 // Dependency-free on purpose, like turboquant_layout.h: the Torch-free host tests and
 // op_host/turboquant_tiling.h include it without a kernel toolchain.

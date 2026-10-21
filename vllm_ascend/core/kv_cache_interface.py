@@ -1,17 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import torch
 from typing_extensions import Self
 from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
-from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, SlidingWindowManager
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec, SlidingWindowMLASpec
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
+from vllm_ascend.attention.turboquant_layout import (
+    TurboQuantMode,
+    turboquant_packed_bytes,
+    turboquant_packed_plane_bytes,
+)
 from vllm_ascend.core.single_type_kv_cache_manager import CompressAttentionManager
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
@@ -302,6 +307,92 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
         )
 
 
+@dataclass(frozen=True, kw_only=True)
+class AscendTurboQuantAttentionSpec(FullAttentionSpec):
+    """Full-attention cache spec for the TurboQuant KV cache.
+
+    The stock :class:`FullAttentionSpec` sizes a page from the *unpacked* head
+    size and the model dtype, which over-allocates this layout roughly fourfold
+    and leaves the 4-bit cache with no capacity gain at all. It also has no
+    concept of the fp32 scale plane, so the scales ended up in a side
+    allocation the block allocator could not see.
+
+    A TurboQuant page holds three things, and this spec budgets all of them:
+
+    * the packed key plane, ``block_size * num_kv_heads * packed_bytes`` int8
+    * the packed value plane, the same again
+    * the scale plane, ``block_size * scale_slot`` fp32, where ``scale_slot``
+      is ``round_up(2 * num_kv_heads, 8)``
+
+    That rounding is the reason this spec exists rather than
+    ``kv_quant_mode=INT4_PER_TOKEN_HEAD`` alone. vLLM budgets ``2 *
+    num_kv_heads`` fp32 lanes per token, unpadded. The kernels scatter a
+    token's scales in one aligned 32-byte burst, so they need the count rounded
+    up to a whole burst -- identical when ``num_kv_heads`` is a multiple of 4,
+    and short by up to 24 bytes per token below that. Budgeting the unpadded
+    count would put the tail of the scale plane past the end of the page.
+    """
+
+    # Two 4-bit codes share a byte.
+    pack_factor: int = 2
+    mode: int = int(TurboQuantMode.KV4_FP8)
+    # fp32 lanes in one aligned scale burst.
+    burst_floats: int = 8
+
+    @property
+    def scale_slot_floats(self) -> int:
+        """fp32 lanes one token occupies in the scale plane, burst-aligned.
+
+        Mirrors ``turboquant_scale_slot``; kept in sync by
+        ``tests/ut/attention/test_turboquant_page_budget.py``.
+        """
+        lanes = 2 * self.num_kv_heads
+        return cdiv(lanes, self.burst_floats) * self.burst_floats
+
+    @property
+    def packed_bytes(self) -> int:
+        return turboquant_packed_bytes(self.head_size, TurboQuantMode(self.mode))
+
+    @property
+    def payload_bytes(self) -> int:
+        """Bytes of packed key and value in one page."""
+        return (
+            2
+            * self.block_size
+            * turboquant_packed_plane_bytes(self.head_size, self.num_kv_heads, TurboQuantMode(self.mode))
+        )
+
+    @property
+    def scale_plane_bytes(self) -> int:
+        """Bytes of fp32 scale plane in one page."""
+        return self.block_size * self.scale_slot_floats * get_dtype_size(torch.float32)
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        return self.payload_bytes + self.scale_plane_bytes
+
+    @property
+    def unpadded_page_size_bytes(self) -> int:
+        # FullAttentionSpec would add a second scale budget here for any
+        # per-token-head quant mode. This spec has already counted the scale
+        # plane, with the burst padding vLLM's formula omits, so the page is
+        # taken as computed.
+        if self.page_size_padded is not None:
+            assert self.page_size_padded >= self.real_page_size_bytes
+            return self.page_size_padded
+        return self.real_page_size_bytes
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        merged = super().merge(specs)
+        first = specs[0]
+        assert all(
+            (spec.pack_factor, spec.burst_floats, spec.mode) == (first.pack_factor, first.burst_floats, first.mode)
+            for spec in specs
+        ), "All TurboQuant layers in the same KV cache group must use the same packing."
+        return replace(merged, pack_factor=first.pack_factor, burst_floats=first.burst_floats, mode=first.mode)
+
+
 def register_ascend_kv_cache_specs() -> None:
     KVCacheSpecRegistry.register(
         kvcache_spec_cls=AscendMLAAttentionSpec,
@@ -312,4 +403,9 @@ def register_ascend_kv_cache_specs() -> None:
         kvcache_spec_cls=AscendSlidingWindowMLASpec,
         manager_class=SlidingWindowManager,
         uniform_type_base_spec=SlidingWindowMLASpec,
+    )
+    KVCacheSpecRegistry.register(
+        kvcache_spec_cls=AscendTurboQuantAttentionSpec,
+        manager_class=FullAttentionManager,
+        uniform_type_base_spec=FullAttentionSpec,
     )

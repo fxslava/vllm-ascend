@@ -50,9 +50,27 @@ turboquant_rotate_q_impl                       turboquant_mm_fused_decode_raw_qu
 turboquant_mm_fused_decode_opt_impl            turboquant_mm_fused_decode_opt_raw_query_impl
 ```
 
-`npu_turboquant_cube_decode` reaches the kv4fp8 cache through `turboquant_mm_fused_decode_raw_query_impl`,
-which rotates the query inside the launch. The two `_opt_` entries are the modulo-scheduled decode: built,
-but not selected by the adapter.
+Six of the eight are dispatched during inference. The Python backend
+(`vllm_ascend/attention/turboquant_v1.py`) reaches them like this:
+
+| `torch.ops._C_ascend` op | Launcher | When |
+| --- | --- | --- |
+| `npu_turboquant_rotate_q` | `turboquant_rotate_q_impl` | AIV decode query, `_unrotate_output`, prefill V rotation |
+| `npu_turboquant_reshape_and_cache` | `turboquant_reshape_and_cache_impl` | cache writer, AIV path |
+| `npu_turboquant_paged_attention` | `turboquant_paged_attention_impl` | AIV decode |
+| `npu_turboquant_cube_reshape_and_cache` | `turboquant_mm_reshape_and_cache_impl` | cache writer, Cube path |
+| `npu_turboquant_cube_decode` (kv4fp8) | `turboquant_mm_fused_decode_raw_query_impl` | the shipping Cube decode |
+| `npu_turboquant_cube_decode` (kv3fp4) | `turboquant_rotate_q_impl` + `turboquant_mm_fused_decode_impl` | `--kv-cache-dtype` selects KV3 |
+
+`npu_turboquant_vector_core_num` and the two `*_workspace_size` operators are host helpers that launch
+no kernel. The decode path is chosen by `AscendTurboQuantAttentionBackendImpl.forward`: the Cube branch
+needs `VLLM_ASCEND_TURBOQUANT_CUBE_DECODE`, float16 activations, a registered
+`npu_turboquant_cube_decode` and a decode-only step; everything else takes the AIV pair.
+
+The remaining two, `turboquant_mm_fused_decode_opt_impl` and
+`turboquant_mm_fused_decode_opt_raw_query_impl`, are the modulo-scheduled decode. They are built and
+exported, the adapter declares them, and **nothing calls them** — there is no call site in the adapter
+and no reference in Python. Reaching them needs a new dispatch, not a flag.
 
 The Lloyd-Max codebook, the KV5_FP8 mode, the unpack ablations and the GEMM probes stay behind
 `VLLM_ASCEND_TQ_TEST_KERNELS`, which no build here defines, so none of them is in the library.
@@ -70,3 +88,13 @@ underestimate.
 
 At the head sizes `CheckHeadSize` accepts (64 to 256, powers of two) the decode peaks at about 67% of
 the partition, so today the check is a regression guard rather than an active limit.
+
+## Stale cross-references in the ported Python
+
+The Python modules under `vllm_ascend/attention/` were ported byte-identical from the development
+tree, so a few of their comments and docstrings still point at paths this branch does not carry:
+`tools/tq_longbench` (the benchmark harness), `csrc/tests/...` (the C++ suite) and
+`vllm_ascend/attention/qjl_reference.py` (the QJL reference model, used only by a unit test). The
+statements around them still describe the design correctly -- `turboquant_layout.py` really is free of
+vLLM imports, for instance -- only the referenced tree is elsewhere. They were left as they are so the
+modules stay diffable against the development branch.
