@@ -57,6 +57,9 @@
 #include "moe/dequant_situ_quant/dequant_situ_quant_torch_adpt.h"
 #include "moe/situ_mx_quant/situ_mx_quant_torch_adpt.h"
 #include "attention/mla_prolog_v3/mla_prolog_v3_torch_adpt.h"
+#ifdef VLLM_ENABLE_TURBOQUANT
+#include "attention/turboquant/op_adapter/turboquant_torch_adpt.h"
+#endif
 #include <c10/core/Device.h>
 #include <c10/core/Scalar.h>
 #include <c10/util/Exception.h>
@@ -2704,4 +2707,10 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("npu_msa_index_score", torch::kPrivateUse1,
              &vllm_ascend::npu_msa_index_score);
 }
+#endif
+
+#ifdef VLLM_ENABLE_TURBOQUANT
+// The TurboQuant schemas and their NPU implementations, as a TORCH_LIBRARY_FRAGMENT
+// so they register beside the _C_ascend ops above rather than redefining the library.
+#include "attention/turboquant/op_adapter/turboquant_torch_ops.h"
 #endif
