@@ -32,6 +32,7 @@ from vllm.platforms import Platform, PlatformEnum
 os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 
 
+from vllm_ascend import envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.device.hardware_profile import (
     AttentionBackendFamily,
@@ -42,6 +43,12 @@ from vllm_ascend.device.hardware_profile import (
 
 # isort: off
 from vllm_ascend.utils import (
+    TURBOQUANT_BLOCK_SIZE_MULTIPLE,
+    TURBOQUANT_CACHE_DTYPE_PREFIX,
+    TURBOQUANT_GATED_ATTENTION_OP,
+    TURBOQUANT_KV3_CACHE_DTYPES,
+    TURBOQUANT_KV_CACHE_DTYPE,
+    turboquant_enabled,
     ASCEND_QUANTIZATION_METHOD,
     COMPILATION_PASS_KEY,
     COMPRESSED_TENSORS_METHOD,
@@ -438,6 +445,175 @@ class NPUPlatform(Platform):
                     )
 
     @classmethod
+    def _validate_turboquant_config(cls, vllm_config: VllmConfig) -> None:
+        """Refuse TurboQuant configurations its kernels cannot serve.
+
+        The TurboQuant paged operator takes one block-table row and one context
+        length per query token and carries no mask or query-extent argument, so
+        it can only answer a batch of single-token queries -- ``DecodeOnly`` --
+        and a dense prefill that reads nothing back from the cache. Anything
+        that puts more than one query position per sequence in front of it, or
+        that expects a prefill to read the quantised cache, needs a paged
+        prefill kernel that does not exist yet.
+
+        Those states are chosen per batch by the scheduler, so without this
+        check the engine starts, serves homogeneous batches, and raises from
+        inside ``forward_impl`` the first time a prefill and a decode are
+        co-scheduled. That is a crash under load standing in for what is really
+        a configuration error, which is why it is rejected here instead.
+        """
+        if not turboquant_enabled(vllm_config):
+            return
+
+        cache_config = vllm_config.cache_config
+        cache_dtype = getattr(cache_config, "cache_dtype", None)
+        kv3 = cache_dtype in TURBOQUANT_KV3_CACHE_DTYPES if isinstance(cache_dtype, str) else False
+        scheduler_config = vllm_config.scheduler_config
+        unsupported: list[str] = []
+
+        if kv3:
+            if envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
+                unsupported.append("KV3_FP4 is supported only by the v1 model runner")
+            model_config = getattr(vllm_config, "model_config", None)
+            if getattr(model_config, "dtype", None) != torch.float16:
+                unsupported.append("KV3_FP4 Cube decode requires float16 model activations")
+            if not envs_ascend.VLLM_ASCEND_TURBOQUANT_CUBE_DECODE:
+                unsupported.append("KV3_FP4 requires VLLM_ASCEND_TURBOQUANT_CUBE_DECODE=1")
+            get_head_size = getattr(model_config, "get_head_size", None)
+            head_size = get_head_size() if callable(get_head_size) else getattr(model_config, "head_size", None)
+            if head_size is not None and head_size != 256:
+                unsupported.append("KV3_FP4 Cube NZ layout requires head_size 256")
+            block_size = getattr(cache_config, "block_size", None)
+            if block_size is not None and block_size % 64:
+                unsupported.append("KV3_FP4 Cube decode requires block_size to be a multiple of 64")
+
+        # NPUModelRunner.get_kv_cache_spec branches on self.use_compress -- set when the
+        # model's hf_config carries compress_ratios -- *before* the dense Attention branch
+        # that converts a layer to AscendTurboQuantAttentionSpec, and that branch passes the
+        # upstream spec through unchanged. get_impl_cls does not consult use_compress, so the
+        # layer would get the TurboQuant impl over a page budget sized for an unpacked cache,
+        # with nothing reporting it. The two compress along different axes anyway: that path
+        # divides block_size by compress_ratio, while TurboQuant packs the head dimension.
+        hf_config = getattr(getattr(vllm_config, "model_config", None), "hf_config", None)
+        if hf_config is not None and hasattr(hf_config, "compress_ratios"):
+            unsupported.append(
+                "a model with hf_config.compress_ratios: the model runner routes those layers "
+                "through its own compressed-cache branch, which never applies the TurboQuant "
+                "cache spec"
+            )
+
+        if scheduler_config is not None and getattr(scheduler_config, "enable_chunked_prefill", False):
+            unsupported.append(
+                "chunked prefill (--enable-chunked-prefill): a chunk puts several query positions "
+                "per sequence in front of the paged operator, which has nowhere to apply the causal "
+                "mask. Pass --no-enable-chunked-prefill"
+            )
+
+        if cache_config is not None and getattr(cache_config, "enable_prefix_caching", False):
+            unsupported.append(
+                "prefix caching (--enable-prefix-caching): a cache hit makes prefill read keys back "
+                "out of the 4-bit cache, which needs the paged prefill kernel. "
+                "Pass --no-enable-prefix-caching"
+            )
+
+        if vllm_config.speculative_config is not None:
+            unsupported.append(
+                "speculative decoding: draft tokens give a sequence more than one query position "
+                "per step, which the operator cannot express. Remove --speculative-config"
+            )
+
+        if unsupported:
+            raise ValueError(
+                "The TurboQuant KV cache implements two attention states, PrefillNoCache and "
+                "DecodeOnly. These options need states it does not implement yet:\n  - "
+                + "\n  - ".join(unsupported)
+                + "\nSee vllm_ascend/attention/turboquant_v1.py for the states the backend serves."
+            )
+
+        if cache_config is not None:
+            block_size = getattr(cache_config, "block_size", None)
+            if block_size is not None and block_size % TURBOQUANT_BLOCK_SIZE_MULTIPLE != 0:
+                raise ValueError(
+                    f"The TurboQuant KV cache requires a block size that is a multiple of "
+                    f"{TURBOQUANT_BLOCK_SIZE_MULTIPLE}, got --block-size {block_size}."
+                )
+
+            if (
+                isinstance(cache_dtype, str)
+                and cache_dtype.startswith(TURBOQUANT_CACHE_DTYPE_PREFIX)
+                and cache_dtype not in TURBOQUANT_KV3_CACHE_DTYPES
+            ):
+                raise ValueError(
+                    f"--kv-cache-dtype {cache_dtype} names one of vLLM's own TurboQuant presets, whose "
+                    "slot packs each head's key, value and fp16 scales into one interleaved slot. The "
+                    "Ascend kernels read two separate int8 planes plus a burst-aligned fp32 scale "
+                    "plane, so that preset budgets fewer bytes per block than this layout writes. "
+                    f"Use --kv-cache-dtype {TURBOQUANT_KV_CACHE_DTYPE} instead, whose page arithmetic "
+                    "matches."
+                )
+
+    @classmethod
+    def _apply_turboquant_graph_mode(cls, vllm_config: VllmConfig) -> None:
+        """Hold a TurboQuant run to the ACL graph mode its decode can be replayed under.
+
+        TurboQuant runs compiled: both of its attention entry points --
+        ``vllm::unified_attention_with_output`` and ``vllm::turboquant_gated_attention``
+        -- are graph splitting ops, so under ``PIECEWISE`` the model around attention is
+        captured and replayed while the TurboQuant kernels are launched eagerly between
+        the pieces. That is the whole point of a splitting op and it needs nothing from
+        this backend.
+
+        A *full* graph captures the attention layers too. That used to be impossible
+        for this backend: the decode staged the host-side ``AscendMetadata.seq_lens``
+        onto the device on every step, and captured, that copy replays the host address
+        it saw at capture time -- a per-step tensor gone by the first replay, so the
+        replays would attend over whatever that freed page holds. The decode now reads
+        the model runner's own persistent int32 device buffer instead
+        (``AscendMetadata.seq_lens_device``), and every other operand it touches is
+        either that runner's or one of this backend's own persistent buffers.
+
+        So the barrier is gone and the fallback is no longer a statement about what the
+        decode can express -- it is a statement about what has been run. Nothing here
+        has been captured full on hardware, and a full graph that is subtly wrong is
+        silently wrong output rather than a crash. Lifting this is a verification task:
+        capture full, compare against piecewise on the same prompts, and drop the
+        fallback when they agree.
+
+        Declined, not refused: ``FULL_DECODE_ONLY`` is the platform's own default for a
+        decode-heavy run, so raising would mean ``ENABLE_TURBOQUANT=1`` could not start
+        without the user also naming a graph mode. Serving the mode that does work, and
+        saying so once, is the useful answer.
+
+        """
+        if not turboquant_enabled(vllm_config):
+            return
+
+        from vllm.config.compilation import CUDAGraphMode
+
+        compilation_config = vllm_config.compilation_config
+        if not compilation_config.cudagraph_mode.has_full_cudagraphs():
+            return
+
+        from vllm.config import CompilationMode
+
+        # PIECEWISE needs the piecewise compilation that only VLLM_COMPILE does; without
+        # it there is nothing to split, so the honest fallback is no graph at all.
+        if compilation_config.mode == CompilationMode.VLLM_COMPILE:
+            downgraded = CUDAGraphMode.PIECEWISE
+        else:
+            downgraded = CUDAGraphMode.NONE
+        logger.warning(
+            "The TurboQuant 4-bit KV cache has not been verified under %s, where the decode launches are "
+            "captured rather than run between the captured pieces. Falling back to %s.%s",
+            compilation_config.cudagraph_mode.name,
+            downgraded.name,
+            " Attention is split out of the graph there; the rest of the model is still captured."
+            if downgraded == CUDAGraphMode.PIECEWISE
+            else " Pass a compiled mode to keep graph capture for the rest of the model.",
+        )
+        compilation_config.cudagraph_mode = downgraded
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         # Lazy import vllm/vllm-ascend to avoid circular import
         from vllm_ascend.quantization.utils import maybe_auto_detect_quantization
@@ -461,6 +637,7 @@ class NPUPlatform(Platform):
 
         _validate_draft_decode_context_parallel_config(vllm_config)
         _validate_parallel_config(vllm_config)
+        cls._validate_turboquant_config(vllm_config)
 
         # 3.Auto detect quantization method
         maybe_auto_detect_quantization(vllm_config)
@@ -476,6 +653,9 @@ class NPUPlatform(Platform):
 
         # 6.Update compilation / cudagraph modes (ascend_config -> vllm_config).
         _update_compilation_modes(vllm_config, ascend_config)
+
+        # TurboQuant's decode cannot be replayed from a full graph; hold it to piecewise.
+        cls._apply_turboquant_graph_mode(vllm_config)
 
         # 7.Recompute cudagraph sizes and setup compile backend (vllm_config).
         _setup_compile_backend(
@@ -1195,6 +1375,7 @@ def _setup_compile_backend(
         compilation_config.splitting_ops.extend(
             [
                 "vllm::mla_forward",
+                TURBOQUANT_GATED_ATTENTION_OP,
                 "vllm::dsa_forward",
             ]
         )
