@@ -96,6 +96,17 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (torch.ops._C_ascend.npu_turboquant_reshape_and_cache) exists only in an
     # Ascend 950 build; this flag does not conjure it on other hardware.
     "ENABLE_TURBOQUANT": lambda: bool(int(os.getenv("ENABLE_TURBOQUANT", "0"))),
+    # Check every slot the TurboQuant writer is handed before the launch: that
+    # each 16-token strip starts on a 16-aligned slot and is consecutive, which
+    # is what lets the kernel derive a strip's page and in-page offset from its
+    # first slot alone. 0 (default): off. 1: on. The values live on the device,
+    # so the check costs a device-to-host copy and a synchronisation on every
+    # cache write of every layer -- diagnostic only, never a serving default.
+    # Read in C++ by validate_slots() in
+    # csrc/attention/turboquant/op_adapter/turboquant_torch_adpt.h, so it takes
+    # effect in the worker process without any Python plumbing; it is listed
+    # here to keep it discoverable with the rest of the environment.
+    "VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS": lambda: bool(int(os.getenv("VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS", "0"))),
 }
 
 # end-env-vars-definition
