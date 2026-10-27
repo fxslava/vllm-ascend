@@ -51,6 +51,44 @@ endif()
 
 include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 
+# -----------------------------------------------------------------------------
+# TurboQuant BF16 ingestion kernel: Ascend 950PR / arch35 / dav-3510 only.
+#
+# The kernel is a MIX_AIC_1_2 launch that puts one Cube core and BOTH Vector
+# cores of a block in one four-stage pipeline, and it depends on facilities only
+# dav-3510 has: a Fixpipe that picks a sub-block's Unified Buffer as its
+# destination, mode-4 intra-block flags between the Cube and each Vector core,
+# and a 16-bit Cube fractal with C0 = 16. There is no 910B form of it, so the
+# library is simply absent from every other build and VLLM_ENABLE_TURBOQUANT
+# stays undefined there -- torch_binding.cpp then registers no TurboQuant op
+# rather than registering one with nothing behind it.
+#
+# CANN 9.2 drives these through the ASC language toolchain: asc-config.cmake
+# registers ASC as a CMake language whose compiler is bisheng, and
+# CMAKE_ASC_ARCHITECTURES becomes --npu-arch=. FindASC.cmake re-reads that
+# variable on every configure while CMake would otherwise set it on the first
+# only, so it is pinned in the cache here.
+set(VLLM_ASCEND_BUILD_TURBOQUANT OFF)
+if(SOC_VERSION MATCHES "ascend950")
+    if(NOT EXISTS ${ASCENDC_CMAKE_DIR}/asc-config.cmake)
+        message(FATAL_ERROR
+            "ASC language toolchain not found at ${ASCENDC_CMAKE_DIR}/asc-config.cmake. "
+            "An ascend950 build of the TurboQuant kernel needs CANN 9.2 or newer.")
+    endif()
+    set(CMAKE_ASC_ARCHITECTURES "dav-3510" CACHE STRING "ASC --npu-arch target" FORCE)
+    include(${ASCENDC_CMAKE_DIR}/asc-config.cmake)
+    enable_language(ASC)
+    message(STATUS "ASC language toolchain enabled: --npu-arch=${CMAKE_ASC_ARCHITECTURES}")
+
+    set(VLLM_ASCEND_BUILD_TURBOQUANT ON)
+    # One translation unit. The ASC toolchain compiles it twice -- a device leg
+    # with __CCE_AICORE__ defined and a host leg that holds the triple-chevron
+    # launcher -- so the kernel and the launcher it exports stay in one file.
+    ascendc_library(vllm_ascend_turboquant SHARED
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/kernels/turboquant_reshape_and_cache_bf16.cpp
+    )
+endif()
+
 file(GLOB KERNEL_FILES
 ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/*.cpp)
 
@@ -169,6 +207,12 @@ if(NOT (SOC_VERSION MATCHES "ascend310p.*|ascend950"))
     target_compile_definitions(vllm_ascend_C PRIVATE -DVLLM_ENABLE_ATB_AND_DIRECT_KERNELS)
 endif()
 
+# Gates both the adapter include and the TORCH_LIBRARY_FRAGMENT in
+# csrc/torch_binding.cpp, and the meta kernel in csrc/torch_binding_meta.cpp.
+if(VLLM_ASCEND_BUILD_TURBOQUANT)
+    target_compile_definitions(vllm_ascend_C PRIVATE -DVLLM_ENABLE_TURBOQUANT)
+endif()
+
 target_link_directories(
   vllm_ascend_C
   PRIVATE
@@ -204,10 +248,18 @@ else()
   )
 endif()
 
+if(VLLM_ASCEND_BUILD_TURBOQUANT)
+  target_link_libraries(vllm_ascend_C PUBLIC vllm_ascend_turboquant)
+endif()
+
 target_link_options(vllm_ascend_C PRIVATE "-Wl,-rpath,$ORIGIN:$ORIGIN/lib:$ORIGIN/_cann_ops_custom/vendors/custom_transformer/op_api/lib")
 
 if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
   install(TARGETS vllm_ascend_C DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
 else()
   install(TARGETS vllm_ascend_C vllm_ascend_kernels DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
+endif()
+
+if(VLLM_ASCEND_BUILD_TURBOQUANT)
+  install(TARGETS vllm_ascend_turboquant DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
 endif()

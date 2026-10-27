@@ -1910,3 +1910,33 @@ def _is_glm_model(model_config) -> bool:
     hf_text_config = getattr(model_config, "hf_text_config", None)
     model_type = getattr(hf_text_config, "model_type", "") or ""
     return "glm" in str(model_type).lower()
+
+
+# vLLM's own per-token-head int4 mode. Its page arithmetic -- head_size // 2
+# payload plus 2 * num_kv_heads fp32 scale lanes -- is the upstream mode that
+# matches the Ascend TurboQuant layout, exactly so when num_kv_heads % 4 == 0.
+TURBOQUANT_KV_CACHE_DTYPE = "int4_per_token_head"
+
+# The C++ adapter requires block_size % 16 == 0: 16 is the kernel's strip
+# height (the DaVinci M0 fractal), so a page must be a whole number of strips.
+TURBOQUANT_BLOCK_SIZE_MULTIPLE = 16
+
+
+def turboquant_enabled(vllm_config=None) -> bool:
+    """Whether the TurboQuant 4-bit KV cache layout is active for this run.
+
+    Reads the ``ENABLE_TURBOQUANT`` env var first, then the configured
+    ``cache_config.cache_dtype``. Both routes have to agree with the cache spec,
+    the page budget and the allocator, so every site that needs to know reads it
+    from here rather than testing the env var on its own.
+    """
+    import vllm_ascend.envs as envs_ascend
+
+    if envs_ascend.ENABLE_TURBOQUANT:
+        return True
+    if vllm_config is None:
+        return False
+    cache_config = getattr(vllm_config, "cache_config", None)
+    if cache_config is None:
+        return False
+    return getattr(cache_config, "cache_dtype", None) == TURBOQUANT_KV_CACHE_DTYPE

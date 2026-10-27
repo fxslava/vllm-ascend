@@ -64,6 +64,9 @@
 #include "moe/situ_mx_quant/situ_mx_quant_torch_adpt.h"
 #include "gmm/gmm_dequant_situ_quant/gmm_dequant_situ_quant_torch_adpt.h"
 #include "moe/grouped_matmul_situ_quant/grouped_matmul_situ_quant_torch_adpt.h"
+#ifdef VLLM_ENABLE_TURBOQUANT
+#include "attention/turboquant/op_adapter/turboquant_torch_adpt.h"
+#endif
 #include <c10/core/Device.h>
 #include <c10/core/Scalar.h>
 #include <c10/util/Exception.h>
@@ -3716,4 +3719,11 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("npu_fused_sparse_attention_overlap", torch::kPrivateUse1,
              &vllm_ascend::npu_fused_sparse_attention_overlap);
 }
+#endif
+
+#ifdef VLLM_ENABLE_TURBOQUANT
+// The TurboQuant BF16 ingestion schema and its NPU implementation, as a
+// TORCH_LIBRARY_FRAGMENT so it registers beside the _C_ascend ops above rather
+// than redefining the library.
+#include "attention/turboquant/op_adapter/turboquant_torch_ops.h"
 #endif

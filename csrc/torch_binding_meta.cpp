@@ -1830,6 +1830,16 @@ void npu_fused_quant_lightning_indexer_manage_meta(
     return;
 }
 
+#ifdef VLLM_ENABLE_TURBOQUANT
+// The ingestion op returns nothing and writes the three cache planes in place,
+// so the meta kernel has no shape to compute: it exists so FakeTensor tracing
+// and torch.export can walk the op instead of trying to run it.
+void npu_turboquant_reshape_and_cache_meta(at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &,
+                                           at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &)
+{
+}
+#endif
+
 } // namespace meta
 } // namespace vllm_ascend
 
@@ -1884,6 +1894,10 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("sgmv_expand", &vllm_ascend::meta::sgmv_expand_meta);
     // MLA preprocess
     ops.impl("mla_preprocess", &vllm_ascend::meta::mla_preprocess);
+#endif
+#ifdef VLLM_ENABLE_TURBOQUANT
+    // TurboQuant BF16 ingestion
+    ops.impl("npu_turboquant_reshape_and_cache", &vllm_ascend::meta::npu_turboquant_reshape_and_cache_meta);
 #endif
     // grouped_matmul_swiglu_quant_weight_nz meta implementation
     ops.impl("grouped_matmul_swiglu_quant_weight_nz", &vllm_ascend::meta::grouped_matmul_swiglu_quant);

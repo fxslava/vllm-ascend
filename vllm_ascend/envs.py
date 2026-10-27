@@ -87,6 +87,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (safe for Ascend 910B/A3). Set to a positive value to override when
     # auto-detection is unavailable or for debugging UB overflow issues.
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
+    # Size the full-attention KV cache for the TurboQuant 4-bit layout: three
+    # planes out of one page budget (packed keys, packed values, burst-aligned
+    # fp32 scales) instead of two unpacked activation-dtype planes. 0 (default):
+    # off. 1: on. On a hybrid model this also keeps the full-attention layers
+    # out of the Mamba shared KVCacheTensor -- see
+    # vllm_ascend/patch/platform/patch_mamba_config.py. The ingestion operator
+    # (torch.ops._C_ascend.npu_turboquant_reshape_and_cache) exists only in an
+    # Ascend 950 build; this flag does not conjure it on other hardware.
+    "ENABLE_TURBOQUANT": lambda: bool(int(os.getenv("ENABLE_TURBOQUANT", "0"))),
 }
 
 # end-env-vars-definition

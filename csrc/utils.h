@@ -14,6 +14,12 @@
 // could be a macro instead of a literal token.
 #define TORCH_LIBRARY_EXPAND(NAME, MODULE) TORCH_LIBRARY(NAME, MODULE)
 
+// A version of the TORCH_LIBRARY_FRAGMENT macro that expands the NAME, i.e. so
+// NAME could be a macro instead of a literal token. A fragment adds to a
+// library another translation unit already defines, which is what an optional
+// operator set needs: TORCH_LIBRARY may claim a library name only once.
+#define TORCH_LIBRARY_FRAGMENT_EXPAND(NAME, MODULE) TORCH_LIBRARY_FRAGMENT(NAME, MODULE)
+
 // A version of the TORCH_LIBRARY_IMPL macro that expands the NAME, i.e. so NAME
 // could be a macro instead of a literal token.
 #define TORCH_LIBRARY_IMPL_EXPAND(NAME, DEVICE, MODULE) \

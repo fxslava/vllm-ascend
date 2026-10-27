@@ -170,6 +170,50 @@ def verify_and_update_config(cls, vllm_config) -> None:
             assert cache_config.mamba_cache_mode == "align", (
                 "mamba_cache_mode only support 'align' when kv_transfer enabled now!"
             )
+
+    # TurboQuant hybrid isolation (Option A).
+    #
+    # "align" is what makes a hybrid model's full-attention and Mamba layers
+    # share one physical KVCacheTensor: it pins the attention page size to the
+    # recurrent-state page size so a single flat int8 buffer can back both, laid
+    # out [conv | ssm | padding | K | V]. A TurboQuant full-attention layer
+    # cannot live in that buffer. Its page is three planes -- packed keys,
+    # packed values and a burst-aligned fp32 scale plane
+    # (AscendTurboQuantAttentionSpec) -- and the hybrid carve knows one dtype
+    # and two planes, so the run reaches cache-init and dies there rather than
+    # failing validation.
+    #
+    # Option A keeps those layers out of the shared tensor instead of teaching
+    # the carve a third plane: leaving the mode un-aligned means the hybrid
+    # allocator groups the full-attention layers into their own attn-only
+    # KVCacheTensor, where the three-plane page is carved from a budget the
+    # block allocator sized for it. What the 16 full-attention layers give up is
+    # block sharing with the 48 GDN layers, which they never had meaningfully --
+    # the two run through different allocators and GDN indexes its state by
+    # block_table[:, 0] rather than by token slot.
+    #
+    # This is decided here, at config time, because "align" is decided here, and
+    # it is keyed on the run rather than on per-layer specs: specs do not exist
+    # yet when ModelConfig verification runs. turboquant_enabled() reads the
+    # same env var and cache_dtype the spec and the allocator read, so the three
+    # cannot drift apart.
+    from vllm_ascend.utils import turboquant_enabled
+
+    if turboquant_enabled(vllm_config) and cache_config.mamba_cache_mode == "align":
+        if using_kv_store_with_hybrid and not is_extract_hidden_states:
+            raise ValueError(
+                "The TurboQuant KV cache cannot share a KVCacheTensor with the Mamba "
+                "state, and kv_transfer on a hybrid model requires mamba_cache_mode="
+                "'align', which is exactly that sharing. Disable TurboQuant for this "
+                "run or run it without the AscendStore/Mooncake hybrid connector."
+            )
+        logger.info(
+            "TurboQuant is active: leaving mamba_cache_mode un-aligned so the "
+            "full-attention layers get their own three-plane KVCacheTensor "
+            "instead of sharing the Mamba buffer."
+        )
+        cache_config.mamba_cache_mode = "none"
+
     if cache_config.enable_prefix_caching and cache_config.mamba_cache_mode == "align":
         cache_config.mamba_block_size = cache_config.block_size
     else:
