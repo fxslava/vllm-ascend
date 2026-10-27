@@ -381,18 +381,33 @@ class AscendTurboQuantAttentionSpec(FullAttentionSpec):
 
     A TurboQuant page holds three things and this spec budgets all of them:
 
-    * the packed key plane, ``block_size * num_kv_heads * head_size // 2`` int8
+    * the packed key plane, ``[block_size, num_kv_heads, head_size // 2]`` int8
     * the packed value plane, the same again
-    * the scale plane, ``block_size * scale_slot_floats`` fp32
+    * the scale plane, ``[2, num_kv_heads, block_size]`` fp32
 
-    ``scale_slot_floats`` is ``2 * num_kv_heads`` rounded up to one 32-byte
-    burst of fp32 lanes, and that rounding is the reason this spec exists rather
-    than ``kv_quant_mode=INT4_PER_TOKEN_HEAD`` alone. vLLM budgets ``2 *
-    num_kv_heads`` lanes unpadded; the writer scatters a token's scales as one
-    aligned 32-byte burst, so it needs the count rounded up to a whole burst --
-    identical when ``num_kv_heads`` is a multiple of 4, and short by up to 24
-    bytes per token below that. Budgeting the unpadded count would put the tail
-    of the scale plane past the end of the page.
+    The scale plane is **planar, not token-interleaved**, and that is a kernel
+    constraint rather than a preference. The writer emits one scale per token
+    for one (kv, head) chunk, so a chunk's ``block_size``-strided run of
+    ``block_size`` fp32 lanes leaves as a single aligned burst -- 64 bytes for a
+    16-token strip. Interleaving a token's lanes instead, as
+    ``[block_size, 2 * num_kv_heads]``, would put all ``2 * num_kv_heads``
+    chunks of one token inside one 32-byte word: eight separate 4-byte writes
+    from chunks that run on different Vector cores at different times, tearing
+    each other, and each a sub-burst scatter on a 32-byte stride. That is the
+    same hazard the value payload plane avoids by strip blocking.
+
+    The flat index the kernel writes, and therefore the only ordering a reader
+    may assume, is::
+
+        ((kv * num_blocks + block) * num_kv_heads + head) * block_size + token
+
+    with ``kv`` 0 for key scales and 1 for value scales -- so the two halves are
+    separate planes over the whole cache, not two fields of a page. The page
+    budget below counts ``2 * num_kv_heads * block_size`` lanes, which is what
+    that index space needs and is exact for every head count. No burst rounding
+    is applied or needed: a head's run is ``4 * block_size`` bytes and the C++
+    adapter already requires ``block_size % 16 == 0``, so every run starts and
+    ends on a 32-byte boundary.
 
     This is the type :file:`vllm_ascend/patch/platform/patch_mamba_config.py`
     keeps out of the Mamba shared ``KVCacheTensor``: a three-plane page cannot
@@ -401,13 +416,6 @@ class AscendTurboQuantAttentionSpec(FullAttentionSpec):
 
     # Two 4-bit codes share a byte.
     pack_factor: int = 2
-    # fp32 lanes in one aligned scale burst.
-    burst_floats: int = 8
-
-    @property
-    def scale_slot_floats(self) -> int:
-        """fp32 lanes one token occupies in the scale plane, burst-aligned."""
-        return cdiv(2 * self.num_kv_heads, self.burst_floats) * self.burst_floats
 
     @property
     def packed_bytes(self) -> int:
@@ -420,9 +428,19 @@ class AscendTurboQuantAttentionSpec(FullAttentionSpec):
         return 2 * self.block_size * self.num_kv_heads * self.packed_bytes
 
     @property
+    def scale_plane_floats(self) -> int:
+        """fp32 lanes one page contributes to the scale plane.
+
+        ``2 * num_kv_heads`` runs of ``block_size``: see the planar index in the
+        class docstring. Mirrored by ``scale_floats_needed`` in
+        csrc/attention/turboquant/op_adapter/turboquant_torch_adpt.h.
+        """
+        return 2 * self.num_kv_heads * self.block_size
+
+    @property
     def scale_plane_bytes(self) -> int:
         """Bytes of fp32 scale plane in one page."""
-        return self.block_size * self.scale_slot_floats * get_dtype_size(torch.float32)
+        return self.scale_plane_floats * get_dtype_size(torch.float32)
 
     @property
     def real_page_size_bytes(self) -> int:
@@ -432,8 +450,8 @@ class AscendTurboQuantAttentionSpec(FullAttentionSpec):
     def unpadded_page_size_bytes(self) -> int:
         # FullAttentionSpec would add a second scale budget here for any
         # per-token-head quant mode. This spec has already counted the scale
-        # plane, with the burst padding vLLM's formula omits, so the page is
-        # taken as computed.
+        # plane in the planar geometry the kernel writes, so the page is taken
+        # as computed.
         if self.page_size_padded is not None:
             assert self.page_size_padded >= self.real_page_size_bytes
             return self.page_size_padded
@@ -443,10 +461,10 @@ class AscendTurboQuantAttentionSpec(FullAttentionSpec):
     def merge(cls, specs: list[Self]) -> Self:
         merged = super().merge(specs)
         first = specs[0]
-        assert all(
-            (spec.pack_factor, spec.burst_floats) == (first.pack_factor, first.burst_floats) for spec in specs
-        ), "All TurboQuant layers in the same KV cache group must use the same packing."
-        return replace(merged, pack_factor=first.pack_factor, burst_floats=first.burst_floats)
+        assert all(spec.pack_factor == first.pack_factor for spec in specs), (
+            "All TurboQuant layers in the same KV cache group must use the same packing."
+        )
+        return replace(merged, pack_factor=first.pack_factor)
 
 
 def register_ascend_kv_cache_specs() -> None:

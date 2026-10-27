@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 
 namespace vllm_ascend {
 
@@ -46,6 +47,20 @@ constexpr std::int64_t kStripsPerLaunch = 32;
 // violation surfaces from CANN as error 264 rather than as an alignment report,
 // so it is worth naming here.
 constexpr std::int64_t kGmBurstBytes = 32;
+
+// VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS, read once per process. The slot values
+// live on the device, so validating them costs a device-to-host copy and a
+// synchronisation on every cache write of every layer -- diagnostic only, never
+// a serving default, which is why it is opt-in rather than unconditional. A
+// host-side read of the device pointer would be a bus error, not a check.
+inline bool validate_slots()
+{
+    static const bool enabled = [] {
+        const char *value = std::getenv("VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS");
+        return value != nullptr && value[0] == '1' && value[1] == 0;
+    }();
+    return enabled;
+}
 
 inline void check_burst_aligned(const at::Tensor &t, const char *name)
 {
@@ -140,15 +155,54 @@ inline void npu_turboquant_reshape_and_cache(at::Tensor &key, at::Tensor &value,
                 "npu_turboquant_reshape_and_cache: slot_mapping must be a contiguous int32 "
                 "[num_tokens]");
 
-    // The scale plane is [num_blocks, block_size, scale_slot], scale_slot being
-    // 2 * num_kv_heads rounded up to one 32-byte burst of fp32 lanes. The
-    // kernel indexes it as ((kv * num_blocks + block) * num_kv_heads + head) *
-    // block_size + key, so what it needs from the host is that the plane is at
-    // least that large.
+    // The scale plane is PLANAR, [2, num_blocks, num_kv_heads, block_size] fp32:
+    // the kernel indexes it as
+    //
+    //   ((kv * num_blocks + block) * num_kv_heads + head) * block_size + token
+    //
+    // with kv 0 for key scales and 1 for value scales, so the two halves are
+    // separate planes over the whole cache rather than two fields of a page.
+    // That is a kernel constraint: one chunk's block_size lanes then leave as a
+    // single aligned burst, where a token-interleaved [block_size,
+    // 2 * num_kv_heads] plane would put all 2 * num_kv_heads chunks of a token
+    // in one 32-byte word and have them tear each other. The highest lane this
+    // writes is scale_floats_needed - 1, so the bound below is exact rather
+    // than conservative, and it mirrors
+    // AscendTurboQuantAttentionSpec.scale_plane_floats summed over blocks.
     const std::int64_t scale_floats_needed = 2 * num_blocks * num_kv_heads * block_size;
     TORCH_CHECK(scale_cache.numel() >= scale_floats_needed,
                 "npu_turboquant_reshape_and_cache: scale plane holds ", scale_cache.numel(),
                 " floats, needs at least ", scale_floats_needed);
+
+    // ---- slot mapping contract (opt-in) -------------------------------------
+    // Each strip's first slot is read on the scalar unit and the page and the
+    // in-page offset are derived from it, so a strip whose slots are not
+    // kTokensPerStrip-aligned and consecutive silently writes the wrong place
+    // rather than failing. Note that alignment is also what keeps a strip
+    // inside one page: `first % kTokensPerStrip == 0` and
+    // `block_size % kTokensPerStrip == 0` together mean the strip's 16 tokens
+    // cannot straddle a block boundary, so no separate crossing check is
+    // needed. Off by default -- see validate_slots() for the cost.
+    if (validate_slots()) {
+        const at::Tensor host_slots = slot_mapping.to(at::kCPU);
+        const auto *slots = static_cast<const std::int32_t *>(host_slots.data_ptr());
+        for (std::int64_t strip = 0; strip < num_tokens / kTokensPerStrip; ++strip) {
+            const std::int64_t base = strip * kTokensPerStrip;
+            const std::int32_t first = slots[base];
+            TORCH_CHECK(first >= 0, "npu_turboquant_reshape_and_cache: slot_mapping[", base,
+                        "] is ", first, "; this writer cannot skip a padded strip");
+            TORCH_CHECK(first % kTokensPerStrip == 0,
+                        "npu_turboquant_reshape_and_cache: strip ", strip, " starts at slot ",
+                        first, ", which is not ", kTokensPerStrip, "-aligned");
+            for (std::int64_t i = 1; i < kTokensPerStrip; ++i) {
+                const std::int32_t want = first + static_cast<std::int32_t>(i);
+                TORCH_CHECK(slots[base + i] == want,
+                            "npu_turboquant_reshape_and_cache: strip ", strip,
+                            " is not consecutive: slot_mapping[", base + i, "] is ",
+                            slots[base + i], ", expected ", want);
+            }
+        }
+    }
 
     // ---- rotation tables -----------------------------------------------------
     // 16 row-major 32 x 32 blocks: T[s][g] of the kernel's equation (2), the
