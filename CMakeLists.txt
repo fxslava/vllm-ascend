@@ -84,8 +84,15 @@ if(SOC_VERSION MATCHES "ascend950")
     # One translation unit. The ASC toolchain compiles it twice -- a device leg
     # with __CCE_AICORE__ defined and a host leg that holds the triple-chevron
     # launcher -- so the kernel and the launcher it exports stay in one file.
+    # turboquant_paged_attention_opt.cpp is built but deliberately NOT
+    # registered as an operator: it is a CAModel pipeline probe whose head
+    # dimension is 16 and whose dequant scales are compile-time constants, so it
+    # cannot read the cache the ingestion kernel writes. It is here so the
+    # schedule keeps compiling beside the writer rather than drifting. The file
+    # header carries the full accounting.
     ascendc_library(vllm_ascend_turboquant SHARED
         ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/kernels/turboquant_reshape_and_cache_bf16.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/kernels/turboquant_paged_attention_opt.cpp
     )
 endif()
 
