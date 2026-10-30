@@ -8,10 +8,8 @@
 // registers beside the other _C_ascend ops rather than redefining the library.
 // Included exactly once, from csrc/torch_binding.cpp.
 //
-// One operator. The decode side of TurboQuant is not part of this branch: the
-// cache this writes is read by nothing in-tree yet, so adding rotate_q, paged
-// attention or a Cube decode schema here would register entry points with no
-// implementation behind them.
+// The writer is registered with Torch. The fused decode's low-level C++
+// launchers are declared separately in turboquant_fused_decode.h.
 
 TORCH_LIBRARY_FRAGMENT_EXPAND(CONCAT(_C, _ascend), ops)
 {
