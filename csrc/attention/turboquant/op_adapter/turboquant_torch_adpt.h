@@ -6,7 +6,6 @@
 #ifndef TURBOQUANT_TORCH_ADPT_H
 #define TURBOQUANT_TORCH_ADPT_H
 
-#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -14,8 +13,8 @@
 namespace vllm_ascend {
 
 // The BF16 Cube ingestion kernel, built into libvllm_ascend_turboquant by the
-// ASC toolchain for dav-3510. One launch of `block_dim` strips; the window loop
-// below owns the grid.
+// ASC toolchain for dav-3510. One launch of `block_dim` strips, including grids
+// spanning multiple execution waves.
 extern "C" void turboquant_reshape_and_cache_bf16_impl(
     void *stream, std::uint32_t block_dim, const std::uint16_t *key, const std::uint16_t *value,
     std::int8_t *key_cache, std::int8_t *value_cache, float *scale_cache,
@@ -31,17 +30,6 @@ namespace turboquant {
 // M0 = 16, so a strip is 16 tokens and the whole four-stage schedule is
 // specialised to it. Everything else below is a runtime contract.
 constexpr std::int64_t kTokensPerStrip = 16;
-
-// Strips per launch. A strip's Cube core and its two Vector cores hand each
-// other ten mode-4 intra-block flag ids, and those ids are a per-sub-block
-// resource (0..15 for AIV0, 16..31 for AIV1, with 11..14 library reserved), not
-// a queue that drains: a launch that puts more strips in flight than the id
-// space holds has two strips announcing on one id, where the second
-// announcement is released by the first wait and the scheduler then spins on a
-// token nobody will set. 32 strips is the measured ceiling the harness ran
-// clean (reports: verified on CAModel at 2 and 32 strips), so a wide context is
-// driven as several launches of at most this many rather than one wide grid.
-constexpr std::int64_t kStripsPerLaunch = 32;
 
 // Every TurboQuant GM operand base must sit on a 32-byte burst boundary. A
 // violation surfaces from CANN as error 264 rather than as an alignment report,
@@ -239,35 +227,21 @@ inline void npu_turboquant_reshape_and_cache(at::Tensor &key, at::Tensor &value,
     const float *pi_signs_ptr =
         pi_signs.numel() > 0 ? static_cast<const float *>(pi_signs.data_ptr()) : nullptr;
 
-    // ---- the window-32 loop --------------------------------------------------
-    // Strips per launch is capped at kStripsPerLaunch so the mode-4 flag ids
-    // cannot be exhausted. Between launches the three per-token bases advance
-    // together: key and value by whole strips of num_kv_heads * head_size
-    // elements (the pointers are typed, so this is element arithmetic), and
-    // slot_mapping by the token count. The cache planes and the tables do not
-    // move -- the cache is addressed from the strip's own first slot, and the
-    // tables are page invariant.
+    // Each block drains its engine queues and cross-core flags before retiring,
+    // so later execution waves can safely reuse the same local memory. Dispatch
+    // the complete context in one grid; every block advances its own input and
+    // slot-mapping bases and addresses the cache from its strip's first slot.
     const std::int64_t total_strips = num_tokens / kTokensPerStrip;
-    const std::int64_t tokens_per_strip_row = num_kv_heads * head_size;
-
-    for (std::int64_t strip = 0; strip < total_strips; strip += kStripsPerLaunch) {
-        const std::int64_t strips_this_launch = std::min(kStripsPerLaunch, total_strips - strip);
-        const std::int64_t tokens_this_launch = strips_this_launch * kTokensPerStrip;
-        const std::int64_t token_offset = strip * kTokensPerStrip;
-
-        turboquant_reshape_and_cache_bf16_impl(
-            stream, static_cast<std::uint32_t>(strips_this_launch),
-            key_base + token_offset * tokens_per_strip_row,
-            value_base + token_offset * tokens_per_strip_row,
-            static_cast<std::int8_t *>(key_cache.data_ptr()),
-            static_cast<std::int8_t *>(value_cache.data_ptr()),
-            static_cast<float *>(scale_cache.data_ptr()), slot_base + token_offset,
-            pi_signs_ptr, static_cast<const std::int32_t *>(tables.data_ptr()),
-            static_cast<std::uint32_t>(tokens_this_launch),
-            static_cast<std::uint32_t>(num_kv_heads), static_cast<std::uint32_t>(head_size),
-            static_cast<std::uint32_t>(block_size), static_cast<std::uint32_t>(num_blocks),
-            static_cast<std::uint32_t>(kTokensPerStrip), inv_sqrt_len);
-    }
+    turboquant_reshape_and_cache_bf16_impl(
+        stream, static_cast<std::uint32_t>(total_strips), key_base, value_base,
+        static_cast<std::int8_t *>(key_cache.data_ptr()),
+        static_cast<std::int8_t *>(value_cache.data_ptr()),
+        static_cast<float *>(scale_cache.data_ptr()), slot_base, pi_signs_ptr,
+        static_cast<const std::int32_t *>(tables.data_ptr()),
+        static_cast<std::uint32_t>(num_tokens),
+        static_cast<std::uint32_t>(num_kv_heads), static_cast<std::uint32_t>(head_size),
+        static_cast<std::uint32_t>(block_size), static_cast<std::uint32_t>(num_blocks),
+        static_cast<std::uint32_t>(kTokensPerStrip), inv_sqrt_len);
 }
 
 } // namespace vllm_ascend

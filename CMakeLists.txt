@@ -52,7 +52,7 @@ endif()
 include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 
 # -----------------------------------------------------------------------------
-# TurboQuant BF16 ingestion kernel: Ascend 950PR / arch35 / dav-3510 only.
+# TurboQuant BF16 ingestion and fused decode: Ascend 950PR / arch35 / dav-3510 only.
 #
 # The kernel is a MIX_AIC_1_2 launch that puts one Cube core and BOTH Vector
 # cores of a block in one four-stage pipeline, and it depends on facilities only
@@ -81,18 +81,12 @@ if(SOC_VERSION MATCHES "ascend950")
     message(STATUS "ASC language toolchain enabled: --npu-arch=${CMAKE_ASC_ARCHITECTURES}")
 
     set(VLLM_ASCEND_BUILD_TURBOQUANT ON)
-    # One translation unit. The ASC toolchain compiles it twice -- a device leg
-    # with __CCE_AICORE__ defined and a host leg that holds the triple-chevron
-    # launcher -- so the kernel and the launcher it exports stay in one file.
-    # turboquant_paged_attention_opt.cpp is built but deliberately NOT
-    # registered as an operator: it is a CAModel pipeline probe whose head
-    # dimension is 16 and whose dequant scales are compile-time constants, so it
-    # cannot read the cache the ingestion kernel writes. It is here so the
-    # schedule keeps compiling beside the writer rather than drifting. The file
-    # header carries the full accounting.
+    # The ASC toolchain compiles each source's device kernel and host launcher
+    # together. Keep the optimized pre-rotated and raw-query decode launchers in
+    # this library alongside the BF16 cache writer.
     ascendc_library(vllm_ascend_turboquant SHARED
         ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/kernels/turboquant_reshape_and_cache_bf16.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/kernels/turboquant_paged_attention_opt.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/op_kernel/turboquant_fused_decode_opt.cpp
     )
 endif()
 

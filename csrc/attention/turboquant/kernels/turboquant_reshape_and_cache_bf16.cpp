@@ -239,7 +239,30 @@
 // Every cross-core event also gets its own flag id, set once and waited once:
 // a mode-4 flag is not a token a wait consumes, so an id per ring slot lets
 // the second announcement on that id be released by the first. See "cross-core
-// flag ids" below for the trace that forced that.
+// flag ids" below for the two CAModel traces that forced that, and
+// turboquant_wave_protocol.hpp for the budget assert that bounds it.
+//
+// Waves, and why the epilogue is not optional
+// -------------------------------------------
+// A MIX_AIC_1_2 grid wider than the physical block count runs in waves: with
+// 32 blocks of silicon, blocks 0..31 are wave 0 and 32..63 wave 1, and each
+// physical block executes its wave-1 block after its wave-0 one. The scheduler
+// does not drain the block in between, and every address this kernel uses is a
+// compile-time constant - the L1 page ring, the landing panels, the packed
+// egress ring - so wave 1 reuses the *same* L1, UB and L0 addresses wave 0 was
+// still writing. Three rules answer that (guidelines section 6.5):
+//
+//   1. a boundary guard. Every role computes total_strips = numTokens /
+//      tokensPerCore and returns before InitSocState if its block is past it,
+//      so no block reads metadata it does not own and no partially initialised
+//      block leaves a flag set;
+//   2. bounded, compile-time-checked flag ids, so the schedule cannot
+//      silently renumber a channel into the library's reserved range;
+//   3. a mandatory epilogue drain. Each role moves every asynchronous queue it
+//      owns into the scalar stream, and the Cube then tells both Vector cores
+//      so on kFlagPageDrained, which they wait for before draining their own.
+//      When the block retires, every queue is empty and every event bit and
+//      intra-block flag is back at zero.
 //
 // Forward edges:
 //   AIC  intra   MTE2_MTE1     page staged into L1
@@ -264,6 +287,12 @@
 //                              id, so the ring's two slots cost six ids per
 //                              core rather than two.
 //   AIVk intra   MTE3_V        packed page slot free, after the MTE3 burst
+//
+// Inter-wave edges, issued once per block after every ring credit is drained:
+//   AIC  intra   MTE2_S, M_S, FIX_S   every Cube queue into the scalar stream
+//   AIC -> AIVk  kFlagPageDrained     the strip is retired on the Cube side
+//   AIVk intra   V_S, MTE2_S, MTE3_S  every Vector-core queue into the scalar
+//                              stream, after that announcement
 
 #include <cstdint>
 #include <utility>
@@ -278,17 +307,18 @@
 #include "routines/routine_stage_page_zn_bf16.hpp"
 #endif
 
-// The sparse-sampling predicate the CAModel probe used (ASCEND_MICRO_SPARSE_SAMPLING)
-// is not carried into this tree. It exists so a verification harness and the device
-// agree, block for block, about which blocks execute, and there is no such harness
-// here; this is a production build only, so the branch and its include are gone
-// rather than guarded. The kernel body is otherwise the file the CAModel runs
-// verified, with the in-page addressing generalisation noted at run_vector_core.
+// After kernel_operator.h on purpose: this header's TQ_WAVE_FN marks every
+// function in it `__aicore__ inline` for a device pass, and `__aicore__` is
+// defined by kernel_operator.h. Including it earlier is what left
+// turboquant_wave::TotalStrips host-attributed in the device object and
+// failed the device link.
+#include "turboquant_wave_protocol.hpp"
+
 
 namespace turboquant_bf16 {
 
 // ------------------------------------------------------------ strip geometry
-constexpr std::uint32_t kTokens = 16;   // tokens per strip == blockSize
+constexpr std::uint32_t kTokens = turboquant_wave::kReshapeTokensPerStrip;
 constexpr std::uint32_t kHeads = 4;     // numKvHeads
 constexpr std::uint32_t kHeadSize = 256;
 constexpr std::uint32_t kGroup = 32;    // channels per Cube group == INT8 K0
@@ -400,20 +430,17 @@ constexpr std::uint32_t kSignBlock = ParityOf(C1 & G) * kGroups + G;
 // operand because a level-2 vector op reads a whole vector register per source
 // unmasked. One map serves both Vector cores, and the Cube forms its Fixpipe
 // destination from the same constants.
-constexpr std::uint32_t kBlock = 32u;
-constexpr std::uint32_t kBankSkewBytes = 32u;
-constexpr std::uint32_t kReadPadBytes = 256u;  // VECTOR_REG_WIDTH on dav-3510
-constexpr std::uint32_t kUbWindow = 192u * 1024u;
+// The constants and both helpers come from turboquant_wave_protocol.hpp, so
+// the arena algebra the device build uses is the same declaration the host
+// gate in tests/cpu/test_wave_protocol_header.cpp compiles and checks, rather
+// than a second copy of it that can drift.
+using turboquant_wave::kBankSkewBytes;
+using turboquant_wave::kBlock;
+using turboquant_wave::kReadPadBytes;
+using turboquant_wave::kUbWindow;
+using turboquant_wave::NextSlot;
+using turboquant_wave::RoundUpBlock;
 constexpr std::uint32_t kLanesPerBlock = kBlock / sizeof(float);  // 8
-
-constexpr std::uint32_t RoundUpBlock(std::uint32_t bytes)
-{
-    return (bytes + kBlock - 1u) / kBlock * kBlock;
-}
-constexpr std::uint32_t NextSlot(std::uint32_t prev_base, std::uint32_t prev_bytes)
-{
-    return RoundUpBlock(prev_base + prev_bytes) + kBankSkewBytes;
-}
 
 constexpr std::uint32_t kPanelBytes = kPanel * 4u;        // 16384, FP32 or INT32
 constexpr std::uint32_t kLandSlotBytes = kPanelBytes + kBankSkewBytes;
@@ -555,56 +582,117 @@ static_assert(kBlockElems * kElemBytes % 512u == 0u,
 static_assert(kL0Elems * kElemBytes <= 64u * 1024u, "L0A/L0B hold 64 KiB on arch35");
 
 // ------------------------------------------------- cross-core flag ids
+// The algebra itself is in turboquant_wave_protocol.hpp: the channel map, the
+// disjointness of the three roles, the pairing of each release with the wait
+// that consumes it, and the budget assert that refuses a schedule needing id
+// 11. Both instances include that header and a host translation unit compiles
+// it, so this block is only the mapping from the schedule's chunk index onto
+// it. Guidelines section 6.5 carries the protocol.
+//
 // Mode 4 ids are per sub block: 0..15 belong to AIV0 and 16..31 to AIV1, which
 // is how a participant names the *other* sub block's channel in both
 // directions. 13, 14 and their +16 images are library reserved.
 //
-// **One id per cross-core event, never reused.** The first revision used one
-// id per ring slot - Owner * 16 + Slot for "panel ready" - so each id carried
-// two announcements over the eight chunks. That is not a token a wait
-// consumes: the trace caught AIV1's *second* wait on its slot-1 id passing
-// 2179 cycles before the announcement it was waiting for, released by the set
-// its *first* wait had supposedly taken, and the panel it then read was 87%
-// the previous occupant of that landing slot. The mechanism is untested -
-// whether the flag is a level bit a wait tests without clearing, or something
-// subtler - so this revision stops depending on it and labels every event
-// uniquely instead. Guidelines section 6.2c.
+// **A bounded bilateral ring, recycled, and the fence that makes it sound.**
+// The default policy gives each sub block two READY ids, two FREE ids and a
+// pageDrained id, cycled through a strict bilateral SET, WAIT, SET, WAIT
+// handshake: five ids whatever the schedule length. It was synthesised and
+// exhaustively checked 1-safe and deadlock free over 41,844,109 modulo states
+// under an explicit consuming-latch semantics, and that premise is now
+// measured rather than assumed -- tests/research/kernel_cluster_sync_probe.cpp
+// ran the cyclic handshake over recycled ids on physical silicon and on
+// CAModel with no early wait retirement.
 //
-// The first revision passed anyway, twice, because its Cube finished all eight
-// chunks by cycle 6121 of a 19331-cycle run: a stale "ready" always pointed at
-// a panel that had in fact been written long before. Balancing the pipeline is
-// what made the bug reachable.
+// It took a diagnosis to get there. Two earlier CAModel runs of this operator
+// measured a second wait on a recycled id retiring before its announcement: id
+// 16 set at cycle 4906, waited at 4916, waited AGAIN at 7589 and only set for
+// the second chunk at 8621 (1032 cycles early, safe_pipeline.md), and 2179
+// cycles early with a landing panel 87% identical to the slot's previous
+// occupant on an earlier revision (guidelines section 6.2c). Both were read as
+// "a mode-4 flag does not consume". The probe says otherwise: the hazard is
+// section 6.2a's, an announcement issued on the scalar unit overtaking the
+// pipeline work it reports, and recycling an id converts that reordering into
+// a stale release instead of a harmless duplicate. **So every cross-core set
+// below is behind its SetFlag/WaitFlag<HardEvent::x_S> pair, and that is a
+// correctness precondition of the default policy, not a tuning choice.**
+// scripts/audit_cross_core_fences.py is the gate; a priming set, which reports
+// no earlier work, is the only exemption.
 //
-// Per Vector core, over its four chunks j = Chunk / 2:
+// Both revisions had also *passed* numerically before the pipeline was
+// balanced enough to reach a stale token -- the Cube finished all eight chunks
+// by cycle 6121 of a 19331-cycle run, so every stale "ready" happened to point
+// at a panel written long before. A green run is not the gate here; the trace
+// audit is.
+//
+// The single-shot policy stays compiled as the regression fallback, reachable
+// through the second entry point below and `--mode4-single-shot`. Per Vector
+// core, over its four chunks j = Chunk / 2, it allocates:
 //   productReady  Owner*16 + j            4 ids, j = 0..3, one per chunk
 //   panelFree     Owner*16 + 4 + j        the Cube's wait for chunk j
 //   panelFree     Owner*16 + 4 + j + 2    the AIV's release after chunk j
+//   pageDrained   Owner*16 + 10           the inter-wave epilogue join
 // so ids 4 and 5 are the two priming tokens, 6 and 7 the releases the Cube
-// consumes for its last two chunks, and 8 and 9 the releases the epilogue
-// drains. Ten ids per core, every one set exactly once and waited exactly
-// once, all clear of 11..14.
-template <std::uint32_t Chunk>
-constexpr std::uint16_t kFlagProductReady =
-    static_cast<std::uint16_t>(kOwner<Chunk> * 16u + Chunk / 2u);
-template <std::uint32_t Owner, std::uint32_t Index>
-constexpr std::uint16_t kFlagPanelFree =
-    static_cast<std::uint16_t>(Owner * 16u + 4u + Index);
-template <std::uint32_t Chunk>
-constexpr std::uint16_t kFlagPanelFreeWait = kFlagPanelFree<kOwner<Chunk>, Chunk / 2u>;
-template <std::uint32_t Chunk>
-constexpr std::uint16_t kFlagPanelFreeSet =
-    kFlagPanelFree<kOwner<Chunk>, Chunk / 2u + kLandDepth>;
+// consumes for its last two chunks, 8 and 9 the releases the epilogue drains,
+// and 10 carries the Cube's "every queue of mine has reached the scalar
+// stream". Eleven ids per core, every one set exactly once and waited exactly
+// once, all clear of the library's reserved 11..14 - and *exactly* saturating
+// the legal space, which is why the budget is a static_assert in the shared
+// header rather than a sentence here. A ninth chunk or a second temporal
+// segment does not fit, and must not be made to fit by renumbering: that is
+// what the recycled default is for, and it costs five ids at any length.
+// `Reuse` is the non-type template parameter the two kernel entry points
+// instantiate, and the ONLY thing it changes is which physical id each event
+// gets. Every schedule column, every wait placement, every priming set and the
+// whole epilogue below are emitted identically for both values, so a
+// difference in behaviour between the two entry points on silicon isolates id
+// recycling and nothing else -- which is the only reason to ship both.
+template <bool Reuse>
+using Flags = turboquant_wave::ChannelPolicy<Reuse, kChunks, kLandDepth>;
 
-static_assert(4u + kChunks / 2u + kLandDepth <= 11u,
-              "every mode-4 flag id must stay below the library's reserved 11");
-static_assert(kFlagPanelFreeSet<0u> == kFlagPanelFreeWait<2u * kLandDepth>,
-              "the release after a chunk must be the token the Cube waits for "
-              "when that landing slot comes round again");
+template <bool Reuse, std::uint32_t Chunk>
+constexpr std::uint16_t kFlagProductReady =
+    Flags<Reuse>::ProductReady(kOwner<Chunk>, Chunk);
+template <bool Reuse, std::uint32_t Chunk>
+constexpr std::uint16_t kFlagPanelFreeWait =
+    Flags<Reuse>::PanelFreeWait(kOwner<Chunk>, Chunk);
+template <bool Reuse, std::uint32_t Chunk>
+constexpr std::uint16_t kFlagPanelFreeSet =
+    Flags<Reuse>::PanelFreeSet(kOwner<Chunk>, Chunk);
+template <bool Reuse, std::uint32_t Owner, std::uint32_t Slot>
+constexpr std::uint16_t kFlagPanelFreePrime = Flags<Reuse>::PanelFreePrime(Owner, Slot);
+template <bool Reuse, std::uint32_t Owner, std::uint32_t K>
+constexpr std::uint16_t kFlagEpilogueDrain = Flags<Reuse>::EpilogueDrain(Owner, K);
+template <bool Reuse, std::uint32_t Owner>
+constexpr std::uint16_t kFlagPageDrained = Flags<Reuse>::PageDrained(Owner);
+
+// Both policies have to pair a release with the wait that consumes it, and
+// both have to keep the drain channel legal. Asserted for each, because the
+// two reach it by different arithmetic: the single-shot policy shifts the
+// index by the ring depth, the recycled one lets a modulo close the ring.
+static_assert(kFlagPanelFreeSet<false, 0u> == kFlagPanelFreeWait<false, 2u * kLandDepth>,
+              "the single-shot release after a chunk must be the token the Cube "
+              "waits for when that landing slot comes round again");
+static_assert(kFlagPanelFreeSet<true, 0u> == kFlagPanelFreeWait<true, 2u * kLandDepth>,
+              "the recycled release after a chunk must be the token the Cube "
+              "waits for when that landing slot comes round again");
+static_assert(turboquant_wave::LegalIntraId(kFlagPageDrained<false, 0u>) &&
+                  turboquant_wave::LegalIntraId(kFlagPageDrained<false, 1u>) &&
+                  turboquant_wave::LegalIntraId(kFlagPageDrained<true, 0u>) &&
+                  turboquant_wave::LegalIntraId(kFlagPageDrained<true, 1u>),
+              "the inter-wave drain channel must stay clear of the reserved ids");
+// The recycled policy exists to buy id headroom; if it ever stops doing that,
+// there is no reason to carry a second variant.
+static_assert(Flags<true>::kMaxLocalId < Flags<false>::kMaxLocalId,
+              "the recycled policy must cost fewer ids than the single-shot one");
 
 // Intra-core HardEvent ids. The table-copy barriers finish before slot 0 is
 // primed, so their route-local ID 0 cannot collide with the ring's slot 0.
 constexpr std::int32_t kEvtL0 = 0;
 constexpr std::int32_t kEvtEpilogue = 0;
+// The inter-wave epilogue drain rides route-local id 0 on every x_S route.
+// Nothing else is live on those routes by then: the epilogue is the last thing
+// each core issues, after every ring credit has reached a terminal sink.
+constexpr std::int32_t kEvtDrain = 0;
 
 // ------------------------------------------------- compile-time column list
 using ChunkSeq = std::make_integer_sequence<std::uint32_t, kChunks>;
@@ -781,7 +869,7 @@ __aicore__ inline void GemmBlockRows(__ca__ bfloat16_t* l0a, __cb__ bfloat16_t* 
     (GemmBlockRow<Chunk, C1s>(l0a, l0b, l0c, GroupSeq{}), ...);
 }
 
-template <std::uint32_t Chunk>
+template <bool Reuse, std::uint32_t Chunk>
 __aicore__ inline void GemmChunk(__ca__ bfloat16_t* l0a, __cb__ bfloat16_t* l0b,
                                  __cc__ float* l0c)
 {
@@ -807,7 +895,7 @@ __aicore__ inline void GemmChunk(__ca__ bfloat16_t* l0a, __cb__ bfloat16_t* l0b,
     // while the owning Vector core is still finishing the previous one. A
     // cross-core wait stalls the scalar stream, so everything issued *after*
     // it is behind the flag and everything before it is not.
-    AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagPanelFreeWait<Chunk>);
+    AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagPanelFreeWait<Reuse, Chunk>);
     AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(kEvtL0);
     FixpipeChunk<Chunk>(l0c);
     AscendC::SetFlag<AscendC::HardEvent::FIX_M>(kEvtL0);
@@ -817,28 +905,61 @@ __aicore__ inline void GemmChunk(__ca__ bfloat16_t* l0a, __cb__ bfloat16_t* l0b,
     // (guidelines section 6.2a).
     AscendC::SetFlag<AscendC::HardEvent::FIX_S>(kEvtL0);
     AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(kEvtL0);
-    AscendC::CrossCoreSetFlag<4, PIPE_FIX>(kFlagProductReady<Chunk>);
+    AscendC::CrossCoreSetFlag<4, PIPE_FIX>(kFlagProductReady<Reuse, Chunk>);
 }
 
+// How far MTE2 ingress runs ahead of the Cube, in chunks. Column j stages
+// chunk j and multiplies chunk j - kIngressLookahead, so at 1 the two are
+// adjacent and at kStageDepth the L1 ring is full before the first Mmad.
+//
+// It is 1 less than the ring depth, and both bounds are load bearing:
+//
+//   * below kStageDepth, because StagePage(c) waits the MTE1_MTE2 credit that
+//     GemmChunk(c - kStageDepth) releases, and that Gemm is issued in column
+//     c - kStageDepth + kIngressLookahead. The credit therefore exists by the
+//     time StagePage(c) issues only while kIngressLookahead <= kStageDepth,
+//     and the prologue's kStageDepth primed credits cover the first wrap;
+//   * above 1, because that is the whole point. GemmChunk contains a
+//     CrossCoreWaitFlag, which stalls the SCALAR stream, which is what
+//     dispatches into the MTE2 queue. At a lookahead of 1 the ingress of
+//     chunk j + 1 sat behind the Cube's wait for a landing panel for chunk
+//     j - 1: MTE2 could not run ahead even though three L1 slots were free
+//     and its own credits were sitting there unconsumed. At 3 the scalar
+//     stream issues three pages before it can be stalled by a Vector core,
+//     and MTE2 is limited by its own back edge again rather than by the
+//     slowest consumer two stages downstream.
+//
+// This changes the marked graph's slot lifetimes, so it is re-proved rather
+// than asserted: tests/cpu/test_reshape_wave_model.py explores the schedule at
+// both lookaheads. What is NOT established here is the wall-clock claim --
+// that needs a CAModel trace with intersecting MTE2/Cube intervals, and
+// REFINEMENT_OF_COMBAT_KERNELS.md section 5 is explicit that source order and
+// balanced events do not establish overlap.
+constexpr std::uint32_t kIngressLookahead = kStageDepth - 1u;
+static_assert(kIngressLookahead >= 1u && kIngressLookahead <= kStageDepth,
+              "ingress may not run further ahead than the L1 ring is deep");
+
 // Column j of the schedule: MTE2 stages chunk j while the Cube multiplies
-// chunk j - 1. Neither depends on the other, so MTE2, MTE1, Cube and Fixpipe
-// are all free to be in flight together.
-template <std::uint32_t Column>
+// chunk j - kIngressLookahead. Neither depends on the other, so MTE2, MTE1,
+// Cube and Fixpipe are all free to be in flight together.
+template <bool Reuse, std::uint32_t Column>
 __aicore__ inline void StepColumnCube(CubeEngine& engine, __ca__ bfloat16_t* l0a,
                                       __cb__ bfloat16_t* l0b, __cc__ float* l0c)
 {
     if constexpr (Column < kChunks) StagePage<Column>(engine);
-    if constexpr (Column >= 1u) GemmChunk<Column - 1u>(l0a, l0b, l0c);
+    if constexpr (Column >= kIngressLookahead)
+        GemmChunk<Reuse, Column - kIngressLookahead>(l0a, l0b, l0c);
 }
 
-template <std::uint32_t... Columns>
+template <bool Reuse, std::uint32_t... Columns>
 __aicore__ inline void StepColumnsCube(CubeEngine& engine, __ca__ bfloat16_t* l0a,
                                        __cb__ bfloat16_t* l0b, __cc__ float* l0c,
                                        std::integer_sequence<std::uint32_t, Columns...>)
 {
-    (StepColumnCube<Columns>(engine, l0a, l0b, l0c), ...);
+    (StepColumnCube<Reuse, Columns>(engine, l0a, l0b, l0c), ...);
 }
 
+template <bool Reuse>
 __aicore__ inline void run_cube_core(__gm__ const bfloat16_t* key,
                                      __gm__ const bfloat16_t* value,
                                      __gm__ const std::int32_t* tables,
@@ -911,8 +1032,9 @@ __aicore__ inline void run_cube_core(__gm__ const bfloat16_t* key,
     AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(kEvtL0);
     AscendC::SetFlag<AscendC::HardEvent::FIX_M>(kEvtL0);
 
-    StepColumnsCube(engine, l0_a, l0_b, l0_c,
-                    std::make_integer_sequence<std::uint32_t, kChunks + 1u>{});
+    StepColumnsCube<Reuse>(
+        engine, l0_a, l0_b, l0_c,
+        std::make_integer_sequence<std::uint32_t, kChunks + kIngressLookahead>{});
 
     // Drain every primed token and every panel-free token the Vector cores
     // handed back, so no event bit and no intra-block flag leaks into the next
@@ -923,10 +1045,37 @@ __aicore__ inline void run_cube_core(__gm__ const bfloat16_t* key,
     AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(3);
     AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(kEvtL0);
     AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(kEvtL0);
-    AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagPanelFree<0u, kChunks / 2u>);
-    AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagPanelFree<0u, kChunks / 2u + 1u>);
-    AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagPanelFree<1u, kChunks / 2u>);
-    AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagPanelFree<1u, kChunks / 2u + 1u>);
+    AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagEpilogueDrain<Reuse, 0u, 0u>);
+    AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagEpilogueDrain<Reuse, 0u, 1u>);
+    AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagEpilogueDrain<Reuse, 1u, 0u>);
+    AscendC::CrossCoreWaitFlag<4, PIPE_FIX>(kFlagEpilogueDrain<Reuse, 1u, 1u>);
+
+    // ---- the mandatory inter-wave epilogue drain --------------------------
+    // Guidelines section 6.5, rule 3. The waits above retire this core's event
+    // bits; they do not retire its *transfers*. Above the physical block count
+    // the scheduler hands this block straight to the next wave's block without
+    // draining anything, so an MTE2 burst still in flight would land in wave
+    // 1's L1 ring slot and a Fixpipe still in flight in wave 1's landing
+    // panel - and both are addressed from compile-time constants, so they are
+    // the *same* addresses. Each route is drained into the scalar stream with
+    // one SET/WAIT pair, which is two instructions against a whole-pipeline
+    // stall for PipeBarrier<PIPE_ALL>. MTE1 has no scalar route (section
+    // 6.2a); it is covered by the M_MTE1 wait above, which sits behind the
+    // Mmads that consumed its loads.
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(kEvtDrain);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(kEvtDrain);
+    AscendC::SetFlag<AscendC::HardEvent::M_S>(kEvtDrain);
+    AscendC::WaitFlag<AscendC::HardEvent::M_S>(kEvtDrain);
+    AscendC::SetFlag<AscendC::HardEvent::FIX_S>(kEvtDrain);
+    AscendC::WaitFlag<AscendC::HardEvent::FIX_S>(kEvtDrain);
+    // Only now is "the strip is retired" true, so now both Vector cores are
+    // told. A mode-4 set issues on the scalar stream, which the three drains
+    // above have just emptied, so this announcement cannot overtake the work
+    // it reports. Back-to-back sets on different ids have no guaranteed order
+    // between them (section 6.2a); neither consumer depends on the other's, so
+    // none is needed.
+    AscendC::CrossCoreSetFlag<4, PIPE_FIX>(kFlagPageDrained<Reuse, 0u>);
+    AscendC::CrossCoreSetFlag<4, PIPE_FIX>(kFlagPageDrained<Reuse, 1u>);
 }
 
 // ======================================================= AIV: Vector cores
@@ -946,8 +1095,8 @@ struct VectorEngine {
     // See run_vector_core for the derivation.
     std::uint32_t key_token_bytes;    // keyCache:   token-major, kTokens * headSize / 2 per strip
     std::uint32_t value_token_bytes;  // valueCache: strip-blocked, kPackedBytes per strip
-    std::uint32_t key_scale;     // float base of (kv 0, block, head 0) + token offset
-    std::uint32_t value_scale;   // float base of (kv 1, block, head 0) + token offset
+    std::uint32_t key_scale;     // float base of (kv 0, block, head 0)
+    std::uint32_t value_scale;   // float base of (kv 1, block, head 0)
     std::uint32_t head_scale;    // blockSize
     float inv_sqrt_len;
 };
@@ -1024,7 +1173,7 @@ __aicore__ inline void KeyQuantiseEmit(const AscendC::LocalTensor<float>& dst,
 }
 
 // --- the Vector stage --------------------------------------------------------
-template <std::uint32_t Chunk>
+template <bool Reuse, std::uint32_t Chunk>
 __aicore__ inline void RotateAndQuantise(VectorEngine& engine)
 {
     constexpr std::uint32_t land = kLandSlot<Chunk>;
@@ -1036,7 +1185,7 @@ __aicore__ inline void RotateAndQuantise(VectorEngine& engine)
     auto cast = View<float>(kUbCast, kPanel);
     auto work = View<float>(kUbWork, kPanel);
 
-    AscendC::CrossCoreWaitFlag<4, PIPE_V>(kFlagProductReady<Chunk>);
+    AscendC::CrossCoreWaitFlag<4, PIPE_V>(kFlagProductReady<Reuse, Chunk>);
     // BF16 x BF16 accumulates to FP32 in L0C, so the panel lands as FP32 and
     // the INT8 kernel's INT32 -> FP32 cast is not needed. What is still needed
     // is to get the panel *out* of the landing ring slot in one pass, so the
@@ -1056,7 +1205,7 @@ __aicore__ inline void RotateAndQuantise(VectorEngine& engine)
     // the scalar-stream set wait for the Vector queue to retire the copy.
     AscendC::SetFlag<AscendC::HardEvent::V_S>(pack_evt);
     AscendC::WaitFlag<AscendC::HardEvent::V_S>(pack_evt);
-    AscendC::CrossCoreSetFlag<4, PIPE_V>(kFlagPanelFreeSet<Chunk>);
+    AscendC::CrossCoreSetFlag<4, PIPE_V>(kFlagPanelFreeSet<Reuse, Chunk>);
 
     // Row-wise absolute maximum, one value per token, left contiguous so the
     // scale slice is a single 64-byte MTE3 burst.
@@ -1207,12 +1356,12 @@ __aicore__ inline void StoreChunk(VectorEngine& engine)
 // and the egress of chunk j - 3, each only if core k owns that chunk. Both are
 // emitted at compile time, so a core's instruction stream contains only its
 // own chunks and no predicate.
-template <std::uint32_t Column, std::uint32_t Core>
+template <bool Reuse, std::uint32_t Column, std::uint32_t Core>
 __aicore__ inline void StepColumnVector(VectorEngine& engine)
 {
     if constexpr (Column >= 2u && Column - 2u < kChunks &&
                   kOwner<(Column >= 2u ? Column - 2u : 0u)> == Core) {
-        RotateAndQuantise<Column - 2u>(engine);
+        RotateAndQuantise<Reuse, Column - 2u>(engine);
     }
     if constexpr (Column >= 3u && Column - 3u < kChunks &&
                   kOwner<(Column >= 3u ? Column - 3u : 0u)> == Core) {
@@ -1220,14 +1369,14 @@ __aicore__ inline void StepColumnVector(VectorEngine& engine)
     }
 }
 
-template <std::uint32_t Core, std::uint32_t... Columns>
+template <bool Reuse, std::uint32_t Core, std::uint32_t... Columns>
 __aicore__ inline void StepColumnsVector(VectorEngine& engine,
                                          std::integer_sequence<std::uint32_t, Columns...>)
 {
-    (StepColumnVector<Columns, Core>(engine), ...);
+    (StepColumnVector<Reuse, Columns, Core>(engine), ...);
 }
 
-template <std::uint32_t Core>
+template <bool Reuse, std::uint32_t Core>
 __aicore__ inline void run_vector_core(__gm__ std::int8_t* key_cache,
                                        __gm__ std::int8_t* value_cache,
                                        __gm__ float* scale_cache,
@@ -1322,16 +1471,49 @@ __aicore__ inline void run_vector_core(__gm__ std::int8_t* key_cache,
     // landing panels are free for the Cube to write.
     AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(0);
     AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(1);
-    AscendC::CrossCoreSetFlag<4, PIPE_V>(kFlagPanelFree<Core, 0u>);
-    AscendC::CrossCoreSetFlag<4, PIPE_V>(kFlagPanelFree<Core, 1u>);
+    AscendC::CrossCoreSetFlag<4, PIPE_V>(kFlagPanelFreePrime<Reuse, Core, 0u>);
+    AscendC::CrossCoreSetFlag<4, PIPE_V>(kFlagPanelFreePrime<Reuse, Core, 1u>);
 
-    StepColumnsVector<Core>(
+    StepColumnsVector<Reuse, Core>(
         engine, std::make_integer_sequence<std::uint32_t, kChunks + 3u>{});
 
     // Drain the primed tokens. These waits also retire the last MTE3 bursts
     // before the kernel returns, so Global Memory is visible to the host.
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(0);
     AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(1);
+
+    // ---- the mandatory inter-wave epilogue drain --------------------------
+    // Guidelines section 6.5, rule 3. Await the Cube's drain first: the Cube
+    // is the only core that writes this core's landing ring, and until it
+    // reports every queue retired, a Fixpipe of *this* wave could still be in
+    // flight against a panel wave 1 is about to allocate at the same UB
+    // address. Then empty this core's own queues into the scalar stream.
+    //
+    // The two cores drain the same three routes in different orders, each
+    // leading with the pipe it is most likely to still have work on - AIV0 the
+    // Vector queue it has just finished casting on, AIV1 the MTE3 queue
+    // carrying its last two cache bursts - so neither spends its first drain
+    // on the other's busiest engine. MTE2 is idle on both cores in this
+    // kernel: no Vector-side stage reads Global Memory. The pair is issued
+    // anyway, because "this queue is empty" is exactly what the wave boundary
+    // needs established, and an empty queue retires it immediately.
+    if constexpr (Core == 0u) {
+        AscendC::CrossCoreWaitFlag<4, PIPE_V>(kFlagPageDrained<Reuse, Core>);
+        AscendC::SetFlag<AscendC::HardEvent::V_S>(kEvtDrain);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>(kEvtDrain);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(kEvtDrain);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(kEvtDrain);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(kEvtDrain);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(kEvtDrain);
+    } else {
+        AscendC::CrossCoreWaitFlag<4, PIPE_MTE3>(kFlagPageDrained<Reuse, Core>);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(kEvtDrain);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(kEvtDrain);
+        AscendC::SetFlag<AscendC::HardEvent::V_S>(kEvtDrain);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>(kEvtDrain);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(kEvtDrain);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(kEvtDrain);
+    }
 }
 
 }  // namespace turboquant_bf16
@@ -1343,7 +1525,16 @@ __aicore__ inline void run_vector_core(__gm__ std::int8_t* key_cache,
 // on the five lines below is the only way to keep the published argument order
 // and types; every device-side function still takes `__gm__ const`, so nothing
 // inside the kernel can write an input.
-extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_bf16(
+// The kernel body, once, parameterised by the mode-4 channel policy.
+// Both __global__ entry points below are this function; they differ in
+// nothing but the template argument, which selects the id allocation.
+namespace turboquant_bf16 {
+// The default comes from the shared header, so the kernel, the harnesses
+// and the trace analyser cannot disagree about which policy ships. Both entry
+// points below name their policy explicitly; this default is for any future
+// in-file caller.
+template <bool Reuse = turboquant_wave::kReshapeDefaultReuse>
+__aicore__ inline void KernelBody(
     // The activations are bfloat16_t; the caches stay INT8, because they hold
     // packed INT4 nibbles and the output contract does not move with the input
     // precision. `key += strip * numKvHeads * headSize` below therefore still
@@ -1366,8 +1557,6 @@ extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_bf16(
     uint32_t blockSize, uint32_t numBlocks, uint32_t tokensPerCore,
     float invSqrtLen)
 {
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
-    AscendC::InitSocState();
     // The pipeline is specialised to one 16-token strip per physical AI Core.
     // Input and metadata bases advance together, while cache addresses come
     // from the strip's first slot.
@@ -1392,10 +1581,29 @@ extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_bf16(
     // one strip passed on CAModel and on silicon while 32 strips did not.
     const uint32_t block = static_cast<uint32_t>(AscendC::GetBlockIdx() /
                                                  AscendC::GetSubBlockNum());
-    // numTokens reaches the device only so the host and the kernel agree about
-    // the grid: the launcher derives blockDim from numTokens / tokensPerCore and
-    // nothing inside a block needs the total.
-    (void)numTokens;
+    // ---- boundary and guard isolation -------------------------------------
+    // The true task boundary, taken before there is anything to leak.
+    // Guidelines section 6.5, rule 1. A grid may be wider than the context --
+    // a caller rounding up to the physical block count, a ladder rung that is
+    // not a multiple of the wave width, or a launcher that pads to a whole
+    // wave -- and a block past the end owns no strip, no physical page and no
+    // slotMapping entry. Reading slotMapping[block] there is an invalid load:
+    // it kills that AIV, and the Cube then sits on its next CrossCoreWaitFlag
+    // for the rest of the launch, which is a hang rather than a wrong answer.
+    //
+    // The return is therefore taken here: before InitSocState, before a tensor
+    // or any SOC state exists, before a feedback cycle is primed and before
+    // any Global Memory address is formed. All three roles derive `block` from
+    // the same two hardware registers and the same two host scalars, so they
+    // reach the same decision, and a guarded group announces nothing its peers
+    // could wait for.
+    //
+    // One scalar divide for the whole kernel, and TotalStrips absorbs a zero
+    // tokensPerCore rather than faulting the scalar unit on it.
+    const uint32_t total_strips =
+        turboquant_wave::TotalStrips(numTokens, tokensPerCore);
+    if (turboquant_wave::BlockOutOfStrips(block, total_strips)) return;
+    AscendC::InitSocState();
     const uint32_t strip = block * tokensPerCore;
     key += strip * numKvHeads * headSize;
     value += strip * numKvHeads * headSize;
@@ -1408,19 +1616,98 @@ extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_bf16(
     (void)piSigns;
     // The only role dispatch in the kernel, outside every pipeline stage.
     if ASCEND_IS_AIC {
-        turboquant_bf16::run_cube_core(key, value, tables, numKvHeads, headSize);
+        run_cube_core<Reuse>(key, value, tables, numKvHeads, headSize);
     } else if (AscendC::GetSubBlockIdx() == 0) {
-        turboquant_bf16::run_vector_core<0u>(keyCache, valueCache, scaleCache, slotMapping,
-                                           numKvHeads, headSize, blockSize,
-                                           numBlocks, invSqrtLen);
+        run_vector_core<Reuse, 0u>(keyCache, valueCache, scaleCache, slotMapping,
+                                   numKvHeads, headSize, blockSize, numBlocks,
+                                   invSqrtLen);
     } else {
-        turboquant_bf16::run_vector_core<1u>(keyCache, valueCache, scaleCache, slotMapping,
-                                           numKvHeads, headSize, blockSize,
-                                           numBlocks, invSqrtLen);
+        run_vector_core<Reuse, 1u>(keyCache, valueCache, scaleCache, slotMapping,
+                                   numKvHeads, headSize, blockSize, numBlocks,
+                                   invSqrtLen);
     }
+}
+}  // namespace turboquant_bf16
+
+// Entry point A, the default: the recycled bilateral two-slot mode-4 ring.
+// Five channels per sub block whatever the schedule length, sound because
+// every announcement in the body above is behind its x_S drain
+// (scripts/audit_cross_core_fences.py), and because
+// tests/research/kernel_cluster_sync_probe.cpp measured the consuming
+// semantics it needs on silicon and on CAModel. This is what every
+// regression, benchmark and production launch dispatches.
+extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_bf16(
+    // The activations are bfloat16_t; the caches stay INT8, because they hold
+    // packed INT4 nibbles and the output contract does not move with the input
+    // precision. `key += strip * numKvHeads * headSize` below therefore still
+    // advances exactly one strip: the pointer is typed, so the arithmetic is in
+    // elements either way.
+    __gm__ bfloat16_t* __restrict__ key,
+    __gm__ bfloat16_t* __restrict__ value,
+    __gm__ std::int8_t* __restrict__ keyCache,
+    __gm__ std::int8_t* __restrict__ valueCache,
+    __gm__ float* __restrict__ scaleCache,
+    __gm__ std::int32_t* __restrict__ slotMapping,
+    __gm__ float* __restrict__ piSigns,
+    __gm__ std::int32_t* __restrict__ tables,
+    // Unqualified uint32_t, not std::uint32_t: CANN copies this parameter list
+    // verbatim into aclrtlaunch_triple_chevrons_func.h, which has no
+    // using-declaration for std, so a qualified scalar type breaks the host leg
+    // of the build while the device legs compile cleanly. Pointer parameters
+    // are rewritten to void* and are unaffected.
+    uint32_t numTokens, uint32_t numKvHeads, uint32_t headSize,
+    uint32_t blockSize, uint32_t numBlocks, uint32_t tokensPerCore,
+    float invSqrtLen)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    turboquant_bf16::KernelBody<true>(
+        key, value, keyCache, valueCache,
+        scaleCache, slotMapping, piSigns, tables,
+        numTokens, numKvHeads, headSize, blockSize,
+        numBlocks, tokensPerCore, invSqrtLen);
+}
+
+// Entry point B: single-shot channels, one id per cross-core event. Byte
+// for byte the same schedule, drain and priming; only the physical ids
+// differ. It is the regression fallback and the bisection control -- no id
+// carries two announcements, so no reading of the flag mechanism can make a
+// second wait pass early, at the cost of saturating the legal id space at
+// eight chunks. Keeping it dispatchable is what makes a future divergence on
+// silicon attributable to id recycling and nothing else.
+extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_bf16_mode4_single_shot(
+    // The activations are bfloat16_t; the caches stay INT8, because they hold
+    // packed INT4 nibbles and the output contract does not move with the input
+    // precision. `key += strip * numKvHeads * headSize` below therefore still
+    // advances exactly one strip: the pointer is typed, so the arithmetic is in
+    // elements either way.
+    __gm__ bfloat16_t* __restrict__ key,
+    __gm__ bfloat16_t* __restrict__ value,
+    __gm__ std::int8_t* __restrict__ keyCache,
+    __gm__ std::int8_t* __restrict__ valueCache,
+    __gm__ float* __restrict__ scaleCache,
+    __gm__ std::int32_t* __restrict__ slotMapping,
+    __gm__ float* __restrict__ piSigns,
+    __gm__ std::int32_t* __restrict__ tables,
+    // Unqualified uint32_t, not std::uint32_t: CANN copies this parameter list
+    // verbatim into aclrtlaunch_triple_chevrons_func.h, which has no
+    // using-declaration for std, so a qualified scalar type breaks the host leg
+    // of the build while the device legs compile cleanly. Pointer parameters
+    // are rewritten to void* and are unaffected.
+    uint32_t numTokens, uint32_t numKvHeads, uint32_t headSize,
+    uint32_t blockSize, uint32_t numBlocks, uint32_t tokensPerCore,
+    float invSqrtLen)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+    turboquant_bf16::KernelBody<false>(
+        key, value, keyCache, valueCache,
+        scaleCache, slotMapping, piSigns, tables,
+        numTokens, numKvHeads, headSize, blockSize,
+        numBlocks, tokensPerCore, invSqrtLen);
 }
 
 #else  // host leg of the same ASC translation unit
+
+#include <stdexcept>
 
 // The activations are 2-byte here, and this leg has no CANN device headers --
 // they live behind `#if defined(__CCE_AICORE__)` -- so `bfloat16_t` is not
@@ -1432,15 +1719,14 @@ extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_bf16(
     __gm__ std::uint16_t*, __gm__ std::uint16_t*, __gm__ std::int8_t*,
     __gm__ std::int8_t*, __gm__ float*, __gm__ std::int32_t*,
     __gm__ float*, __gm__ std::int32_t*, uint32_t, uint32_t,
-    uint32_t, uint32_t, uint32_t, uint32_t, float);
+    uint32_t, uint32_t, uint32_t, uint32_t, float)
+{
+    // ASC emits the host launch stub only for a definition. The device pass
+    // uses KernelBody above; a declaration here leaves an unresolved symbol.
+}
 
-// One launch of `block_dim` strips. The grid is NOT derived here: the window
-// loop in op_adapter/turboquant_torch_adpt.h owns how many strips a launch
-// carries and advances the input bases between launches, so this wrapper is
-// exactly the triple-chevron call plus the const strip the generated argument
-// block forces. `num_tokens` is the token count of THIS launch, so
-// num_tokens / tokens_per_core == block_dim; it is passed for the kernel's own
-// grid bookkeeping and is otherwise unread.
+// One grid over all strips; each block drains its queues before reuse in
+// another execution wave. Keep the established C launcher ABI.
 extern "C" void turboquant_reshape_and_cache_bf16_impl(
     void* stream, std::uint32_t block_dim, const std::uint16_t* key,
     const std::uint16_t* value, std::int8_t* key_cache, std::int8_t* value_cache,
@@ -1449,6 +1735,12 @@ extern "C" void turboquant_reshape_and_cache_bf16_impl(
     std::uint32_t head_size, std::uint32_t block_size, std::uint32_t num_blocks,
     std::uint32_t tokens_per_core, float inv_sqrt_len)
 {
+    if (tokens_per_core != turboquant_wave::kReshapeTokensPerStrip ||
+        !turboquant_wave::WholeStrips(num_tokens, tokens_per_core) ||
+        block_dim != turboquant_wave::TotalStrips(num_tokens, tokens_per_core)) {
+        throw std::invalid_argument("reshape_and_cache_bf16: expected one block per whole 16-token strip");
+    }
+    if (block_dim == 0u) return;
     turboquant_reshape_and_cache_bf16<<<block_dim, nullptr, stream>>>(
         const_cast<std::uint16_t*>(key), const_cast<std::uint16_t*>(value), key_cache,
         value_cache, scale_cache, const_cast<std::int32_t*>(slot_mapping),
