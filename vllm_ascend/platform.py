@@ -542,6 +542,10 @@ class NPUPlatform(Platform):
         # 6.Update compilation / cudagraph modes (ascend_config -> vllm_config).
         _update_compilation_modes(vllm_config, ascend_config)
 
+        # The TurboQuant dry run cannot be captured into a full graph; hold it
+        # to the modes where its attention launches stay eager.
+        _apply_turboquant_graph_mode(vllm_config)
+
         # 7.Recompute cudagraph sizes and setup compile backend (vllm_config).
         _setup_compile_backend(
             vllm_config,
@@ -1232,6 +1236,61 @@ def _validate_turboquant_dry_run_config(vllm_config: VllmConfig) -> None:
             "pages. Their page stays padded to the hybrid common page size, so the 4-bit "
             "cache changes the layout but not the capacity of this model."
         )
+
+
+def _apply_turboquant_graph_mode(vllm_config: VllmConfig) -> None:
+    """Hold an ``ENABLE_TURBOQUANT=1`` run to a graph mode its attention survives.
+
+    Both of this backend's entry points go through
+    ``vllm::unified_attention_with_output``, a graph splitting op, so under
+    ``PIECEWISE`` the model around attention is captured and replayed while the
+    TurboQuant path is launched eagerly between the pieces. That needs nothing
+    from this function.
+
+    A *full* graph captures the attention layers themselves, and the dry run is
+    not capturable there -- by construction, not by accident. It is a PyTorch
+    model of kernels that do not exist yet: the ingestion reads host-side
+    ``seq_lens_list`` to size its own work, and the codec is ordinary torch ops,
+    any one of which may have no NPU kernel and fall back to the CPU. A fallback
+    is a device-to-host copy, and ``aclrtMemcpy`` on a capturing stream fails
+    with 107030 ("Stream during the capture stage is not supported"). The known
+    offenders in the codec are gone (see ``_exp2_fp32``), but "no op in this
+    emulator ever synchronises" is not a property a PyTorch model can promise,
+    so the mode stays out of reach until a real kernel replaces the emulation.
+
+    Declined, not refused: ``FULL_DECODE_ONLY`` is the platform's own default
+    for a decode-heavy run, so raising here would mean ``ENABLE_TURBOQUANT=1``
+    could not start without the user also naming a graph mode. Serving the mode
+    that does work, and saying so once, is the useful answer.
+    """
+    from vllm_ascend.attention.turboquant_layout import turboquant_enabled
+
+    if not turboquant_enabled():
+        return
+
+    from vllm.config import CompilationMode
+    from vllm.config.compilation import CUDAGraphMode
+
+    compilation_config = vllm_config.compilation_config
+    if not compilation_config.cudagraph_mode.has_full_cudagraphs():
+        return
+
+    # PIECEWISE needs the piecewise compilation that only VLLM_COMPILE does;
+    # without it there is nothing to split, so the honest fallback is no graph.
+    if compilation_config.mode == CompilationMode.VLLM_COMPILE:
+        downgraded = CUDAGraphMode.PIECEWISE
+    else:
+        downgraded = CUDAGraphMode.NONE
+    logger.warning(
+        "The TurboQuant dry run cannot be captured under %s, where the attention launches are "
+        "captured rather than run between the captured pieces. Falling back to %s.%s",
+        compilation_config.cudagraph_mode.name,
+        downgraded.name,
+        " Attention is split out of the graph there; the rest of the model is still captured."
+        if downgraded == CUDAGraphMode.PIECEWISE
+        else " Pass a compiled mode to keep graph capture for the rest of the model.",
+    )
+    compilation_config.cudagraph_mode = downgraded
 
 
 def _validate_kv_load_failure_policy(vllm_config: VllmConfig) -> None:
