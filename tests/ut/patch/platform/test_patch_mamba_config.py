@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -312,5 +313,69 @@ def test_kv_store_rejects_non_align_explicit_mode():
     with (
         patch.object(MambaModelConfig, "verify_and_update_config"),
         pytest.raises(AssertionError, match="only support 'align'"),
+    ):
+        HybridAttentionMambaModelConfig.verify_and_update_config(config)
+
+
+def _turboquant_on():
+    return patch.dict(os.environ, {"ENABLE_TURBOQUANT": "1"})
+
+
+def _turboquant_off():
+    return patch.dict(os.environ, {"ENABLE_TURBOQUANT": "0"})
+
+
+def test_turboquant_unaligns_the_mamba_mode_and_stops_prefix_caching():
+    """Prefix caching on an un-aligned hybrid model aborts cache init."""
+    config = _config(prefix_caching=True, mamba_cache_mode="align")
+
+    with _turboquant_on():
+        _run(config)
+
+    assert config.cache_config.mamba_cache_mode == "none"
+    # Keeping it on gives the two groups unrelated block sizes, and
+    # resolve_kv_cache_block_sizes then backs hash_block_size off to
+    # lcm(block_size, max_model_len), which the attention group does not divide:
+    # AscendHybridKVCacheCoordinator asserts that and the engine dies.
+    assert config.cache_config.enable_prefix_caching is False
+    assert config.cache_config.mamba_block_size == config.model_config.max_model_len
+
+
+@pytest.mark.parametrize("prefix_caching", [True, None])
+def test_turboquant_stops_prefix_caching_on_an_already_unaligned_run(prefix_caching):
+    """Also when vLLM derived the mode itself, and when the flag is still unresolved."""
+    config = _config(prefix_caching=prefix_caching, mamba_cache_mode="none")
+
+    with _turboquant_on():
+        _run(config)
+
+    assert config.cache_config.mamba_cache_mode == "none"
+    assert config.cache_config.enable_prefix_caching is False
+    assert config.cache_config.mamba_block_size == config.model_config.max_model_len
+
+
+def test_turboquant_is_inert_without_the_env_switch():
+    config = _config(prefix_caching=True, mamba_cache_mode="align")
+
+    with _turboquant_off():
+        _run(config)
+
+    assert config.cache_config.mamba_cache_mode == "align"
+    assert config.cache_config.enable_prefix_caching is True
+    assert config.cache_config.mamba_block_size == config.cache_config.block_size
+
+
+def test_turboquant_still_refuses_the_hybrid_kv_store():
+    """The connector needs the sharing TurboQuant cannot do; refuse, do not downgrade."""
+    config = _config(
+        connector=SimpleNamespace(kv_connector="AscendStoreConnector"),
+        prefix_caching=True,
+        mamba_cache_mode="align",
+    )
+
+    with (
+        _turboquant_on(),
+        patch.object(MambaModelConfig, "verify_and_update_config"),
+        pytest.raises(ValueError, match="cannot share a KVCacheTensor"),
     ):
         HybridAttentionMambaModelConfig.verify_and_update_config(config)
