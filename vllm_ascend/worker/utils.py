@@ -9,6 +9,7 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.worker.utils import AttentionGroup, KVBlockZeroer
 
+from vllm_ascend.core.kv_cache_interface import AscendTurboQuantAttentionSpec
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 
 
@@ -187,6 +188,16 @@ class AscendKVBlockZeroer(KVBlockZeroer):
                     # V scales are checkpoint constants, initialized before
                     # capture. Clearing a recycled block must preserve them.
                     kv_tuple = kv_tuple[:3]
+                elif isinstance(spec, AscendTurboQuantAttentionSpec):
+                    # (packed K, packed V, scales), and the scale plane is
+                    # plane-major: its block dimension is 1, not 0. Split it
+                    # into its two block-major planes so the loop below sees
+                    # only block-major tensors. A recycled block must lose its
+                    # scales along with its codes -- a stale scale over zeroed
+                    # codes is still zero, but a page half-cleared is not a
+                    # state worth keeping.
+                    assert len(kv_tuple) == 3, "TurboQuant stores packed K, packed V and the scale plane"
+                    kv_tuple = (kv_tuple[0], kv_tuple[1], *kv_tuple[2])
                 else:
                     assert len(kv_tuple) == 2, "K and V are not stored separately"
                 for kv in kv_tuple:

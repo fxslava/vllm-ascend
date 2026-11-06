@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 
 import torch
 from typing_extensions import Self
@@ -21,6 +21,17 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+
+from vllm_ascend.attention.turboquant_layout import (
+    TURBOQUANT_GM_BURST_BYTES,
+    TURBOQUANT_PACK_FACTOR,
+    TURBOQUANT_PLANES,
+    TURBOQUANT_SCALE_DTYPE,
+    turboquant_packed_bytes,
+    turboquant_packed_plane_bytes,
+    turboquant_page_size_bytes,
+    turboquant_scale_plane_bytes,
+)
 
 
 def get_kv_cache_compression_ratio(kv_cache_spec: KVCacheSpec) -> int:
@@ -362,6 +373,123 @@ class AscendIndexerKPoolTailSpec(SlidingWindowSpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class AscendTurboQuantAttentionSpec(FullAttentionSpec):
+    """Full-attention cache spec for the TurboQuant three-plane KV cache.
+
+    The stock :class:`FullAttentionSpec` sizes a page from the *unpacked* head
+    size and the model dtype, which over-allocates this layout roughly fourfold
+    and leaves the 4-bit cache with no capacity gain at all. It also has no
+    concept of the fp32 scale plane, so the scales ended up in a side allocation
+    that the block allocator could not see (the backend's own fallback, see
+    ``AscendTurboQuantDryRunBackendImpl._ensure_scale_cache``).
+
+    A TurboQuant page holds three things, and this spec budgets all of them:
+
+    * the packed key plane, ``block_size * num_kv_heads * head_size/2`` INT8,
+    * the packed value plane, the same again,
+    * the fp32 scale plane, ``2 * num_kv_heads * block_size`` floats.
+
+    The arithmetic itself lives in
+    :mod:`vllm_ascend.attention.turboquant_layout` so the page this spec asks
+    the allocator for and the bytes the backend writes into it are the same
+    numbers. The type is what the runner recognizes: a layer described by this
+    spec gets the three-plane carve
+    (:meth:`NPUModelRunner._carve_turboquant_planes`) rather than the dense
+    K/V split or the hybrid flat buffer, which is how a TurboQuant layer stays
+    out of a Gated DeltaNet model's shared layout.
+    """
+
+    # Declared defaults of the shared layout contract, so a group merge can
+    # assert that two layers pack alike; pinned against turboquant_layout by
+    # tests/ut/worker/test_turboquant_hybrid_alloc.py.
+    pack_factor: int = TURBOQUANT_PACK_FACTOR
+    num_planes: int = TURBOQUANT_PLANES
+    scale_dtype: torch.dtype = TURBOQUANT_SCALE_DTYPE
+
+    @property
+    def packed_bytes(self) -> int:
+        """Bytes one (token, head) of one packed plane occupies."""
+        return turboquant_packed_bytes(self.head_size)
+
+    @property
+    def packed_plane_bytes(self) -> int:
+        """Bytes one page of one packed plane occupies."""
+        return turboquant_packed_plane_bytes(self.block_size, self.num_kv_heads, self.head_size)
+
+    @property
+    def payload_bytes(self) -> int:
+        """Bytes of packed key and value in one page."""
+        return self.num_planes * self.packed_plane_bytes
+
+    @property
+    def scale_plane_bytes(self) -> int:
+        """Bytes of fp32 scale plane in one page."""
+        return turboquant_scale_plane_bytes(self.block_size, self.num_kv_heads)
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        return turboquant_page_size_bytes(self.block_size, self.num_kv_heads, self.head_size)
+
+    @property
+    def unpadded_page_size_bytes(self) -> int:
+        # FullAttentionSpec would size the page from the unpacked head size and
+        # add a second scale budget for a per-token-head quant mode. Both planes
+        # and the scales are already counted here, and ``page_size_bytes``
+        # applies ``page_size_padded`` on top of this number.
+        return self.real_page_size_bytes
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert all(isinstance(spec, AscendTurboQuantAttentionSpec) for spec in specs), (
+            "All attention layers in the same KV cache group must be AscendTurboQuantAttentionSpec."
+        )
+        first = specs[0]
+        assert all(
+            (spec.pack_factor, spec.num_planes, spec.scale_dtype)
+            == (first.pack_factor, first.num_planes, first.scale_dtype)
+            for spec in specs
+        ), "All TurboQuant layers in the same KV cache group must use the same packing."
+        merged = super().merge(specs)
+        return replace(
+            merged,
+            pack_factor=first.pack_factor,
+            num_planes=first.num_planes,
+            scale_dtype=first.scale_dtype,
+        )
+
+
+def turboquant_cache_spec(
+    spec: FullAttentionSpec,
+    *,
+    page_size_padded: int | None = None,
+) -> AscendTurboQuantAttentionSpec:
+    """Re-describe a dense full-attention layer for the packed three-plane cache.
+
+    Every field of the source spec is carried over, so the layer keeps its block
+    size, head counts, dtype and scheduler-visible attributes and only its page
+    budget changes. ``page_size_padded`` pads the page back up to a larger common
+    size, which a hybrid model needs: see
+    :meth:`NPUModelRunner._as_turboquant_spec` for why.
+    """
+    converted = AscendTurboQuantAttentionSpec(
+        **{field.name: getattr(spec, field.name) for field in fields(spec) if field.init}
+    )
+    if page_size_padded is not None:
+        if page_size_padded < converted.real_page_size_bytes:
+            raise ValueError(
+                f"a TurboQuant page padded to {page_size_padded} bytes is smaller than its "
+                f"{converted.real_page_size_bytes}-byte three-plane payload"
+            )
+        if page_size_padded % TURBOQUANT_GM_BURST_BYTES:
+            raise ValueError(
+                f"a TurboQuant page padded to {page_size_padded} bytes is not a whole number of "
+                f"{TURBOQUANT_GM_BURST_BYTES}-byte GM bursts"
+            )
+        converted = replace(converted, page_size_padded=page_size_padded)
+    return converted
+
+
+@dataclass(frozen=True, kw_only=True)
 class AscendCircularBufferSpec(CircularBufferSpec):
     """Circular state whose physical pages participate in Ascend KV zeroing."""
 
@@ -393,6 +521,12 @@ def register_ascend_kv_cache_specs() -> None:
         kvcache_spec_cls=AscendSlidingWindowMLASpec,
         manager_class=SlidingWindowManager,
         uniform_type_base_spec=SlidingWindowMLASpec,
+    )
+
+    KVCacheSpecRegistry.register(
+        kvcache_spec_cls=AscendTurboQuantAttentionSpec,
+        manager_class=FullAttentionManager,
+        uniform_type_base_spec=FullAttentionSpec,
     )
 
     KVCacheSpecRegistry.register(
