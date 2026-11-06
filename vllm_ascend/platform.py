@@ -251,6 +251,23 @@ class NPUPlatform(Platform):
         key = (use_mla, use_sparse)
         backend_key = (*key, use_compress)
 
+        # TurboQuant 4-bit KV cache. Opt-in by environment because it is a
+        # bring-up path, not a served configuration: the dry-run backend models
+        # the Ascend C kernels in PyTorch while they are under development.
+        # Imported lazily so that the TurboQuant module (and its rotation
+        # constants) are only built when the feature is actually selected.
+        from vllm_ascend.attention.turboquant_dry_run import turboquant_enabled
+
+        if turboquant_enabled():
+            if backend_key != (False, False, False):
+                raise NotImplementedError(
+                    "ENABLE_TURBOQUANT=1 selects the TurboQuant GQA backend, which has no MLA, "
+                    f"sparse or compressed variant (use_mla, use_sparse, use_compress) = {backend_key}."
+                )
+            if attn_selector_config.use_pcp:
+                raise NotImplementedError("ENABLE_TURBOQUANT=1 is incompatible with prefill context parallel.")
+            return "vllm_ascend.attention.turboquant_dry_run.AscendTurboQuantDryRunBackend"
+
         if not attn_selector_config.use_pcp and _validate_fa3_backend(key, attn_selector_config):
             return "vllm_ascend.attention.fa3_v1.AscendFABackend"
 
