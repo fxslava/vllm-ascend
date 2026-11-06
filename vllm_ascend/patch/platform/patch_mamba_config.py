@@ -214,6 +214,37 @@ def verify_and_update_config(cls, vllm_config) -> None:
         )
         cache_config.mamba_cache_mode = "none"
 
+    # An un-aligned Mamba group makes prefix caching unserviceable, and leaving
+    # it on does not merely waste work -- it aborts cache init.
+    #
+    # Unserviceable: outside "align" the recurrent state is not checkpointed at
+    # block boundaries, so there is no state to resume a matched prefix from.
+    # vLLM intersects the per-group hits, the Mamba group reports none, and the
+    # intersection is zero for every request.
+    #
+    # Fatal: with the mode un-aligned, mamba_block_size becomes max_model_len
+    # just below, so the two KV cache groups carry unrelated block sizes. vLLM's
+    # resolve_kv_cache_block_sizes sees a non-align Mamba spec and backs
+    # hash_block_size off to the *scheduler* block size, lcm(block_size,
+    # max_model_len) -- which the attention group's own block size does not
+    # divide. AscendHybridKVCacheCoordinator asserts exactly that
+    # ("block_size must be divisible by hash_block_size") and the engine dies
+    # before the first forward.
+    #
+    # Turning prefix caching off is what keeps those two block sizes from being
+    # hashed against each other at all: the coordinator skips the assertion, and
+    # nothing that could have hit is lost. A dense (non-hybrid) TurboQuant model
+    # never reaches this hook and keeps prefix caching.
+    if turboquant_enabled(vllm_config) and cache_config.mamba_cache_mode != "align":
+        if cache_config.enable_prefix_caching is not False:
+            logger.info(
+                "TurboQuant on a hybrid model: disabling prefix caching. The Mamba "
+                "state is not block-checkpointed outside mamba_cache_mode='align', "
+                "so no prefix hit can be served, and hashing an un-aligned Mamba "
+                "group against the attention group is what makes cache init fail."
+            )
+        cache_config.enable_prefix_caching = False
+
     if cache_config.enable_prefix_caching and cache_config.mamba_cache_mode == "align":
         cache_config.mamba_block_size = cache_config.block_size
     else:
