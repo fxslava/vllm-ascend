@@ -251,6 +251,24 @@ class NPUPlatform(Platform):
         key = (use_mla, use_sparse)
         backend_key = (*key, use_compress)
 
+        # TurboQuant 4-bit KV cache. Opt-in by environment because it is a
+        # bring-up path, not a served configuration: the dry-run backend models
+        # the Ascend C kernels in PyTorch while they are under development.
+        # The switch lives in the leaf layout module, so selecting a different
+        # backend never imports the TurboQuant backend (and its rotation
+        # constants) at all.
+        from vllm_ascend.attention.turboquant_layout import turboquant_enabled
+
+        if turboquant_enabled():
+            if backend_key != (False, False, False):
+                raise NotImplementedError(
+                    "ENABLE_TURBOQUANT=1 selects the TurboQuant GQA backend, which has no MLA, "
+                    f"sparse or compressed variant (use_mla, use_sparse, use_compress) = {backend_key}."
+                )
+            if attn_selector_config.use_pcp:
+                raise NotImplementedError("ENABLE_TURBOQUANT=1 is incompatible with prefill context parallel.")
+            return "vllm_ascend.attention.turboquant_dry_run.AscendTurboQuantDryRunBackend"
+
         if not attn_selector_config.use_pcp and _validate_fa3_backend(key, attn_selector_config):
             return "vllm_ascend.attention.fa3_v1.AscendFABackend"
 
@@ -508,6 +526,7 @@ class NPUPlatform(Platform):
         from vllm_ascend.quantization.methods.kv_cache.turboquant.config import validate_turboquant
 
         validate_turboquant(vllm_config)
+        _validate_turboquant_dry_run_config(vllm_config)
         if vllm_config.cache_config.cache_dtype == "fp8" or vllm_config.attention_config.indexer_kv_dtype == "fp8":
             assert get_current_hardware_profile().supports(HardwareCapability.FP8_ATTENTION)
 
@@ -1148,6 +1167,70 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
             "oproj_tensor_parallel_size / mlp_tensor_parallel_size require PreemptOffloadConnector "
             "(via MultiConnector): a preempted request must not return to the prefill node, "
             "whose recomputed KV loses precision."
+        )
+
+
+def _validate_turboquant_dry_run_config(vllm_config: VllmConfig) -> None:
+    """Constraints of the ``ENABLE_TURBOQUANT`` three-plane GQA KV cache.
+
+    This is the packed 4-bit bring-up path selected by ``ENABLE_TURBOQUANT=1``
+    in :meth:`NPUPlatform.get_attn_backend_cls`, not the
+    ``turboquant_4bit_nc`` cache dtype that ``validate_turboquant`` above
+    checks: the two are unrelated features that share a name.
+
+    The geometry is checked here rather than at cache-init time so a
+    configuration the carve cannot serve fails while the message can still name
+    the reason.
+
+    Hybrid models (full attention plus Gated DeltaNet, e.g. Qwen3.5) are
+    *supported*: their full-attention layers are described by
+    ``AscendTurboQuantAttentionSpec`` and allocated as their own three planes,
+    while the recurrent layers keep the Mamba allocator and the Mamba page
+    untouched. Nothing is interleaved, so nothing has to be rejected.
+    """
+    from vllm_ascend.attention.turboquant_layout import (
+        TURBOQUANT_GROUP,
+        TURBOQUANT_PACK_FACTOR,
+        turboquant_enabled,
+    )
+
+    if not turboquant_enabled():
+        return
+
+    model_config = vllm_config.model_config
+    head_size = model_config.get_head_size()
+    if head_size <= 0 or head_size % TURBOQUANT_GROUP:
+        raise ValueError(
+            f"ENABLE_TURBOQUANT=1 needs head_size to be a positive multiple of {TURBOQUANT_GROUP} "
+            f"(the INT8 K0 of one Hadamard factor), but this model has head_size={head_size}."
+        )
+
+    # block_size is still None here when vLLM derives it later (hybrid models
+    # take it from the Mamba page); the carve re-checks what it gets.
+    block_size = vllm_config.cache_config.block_size
+    if block_size is not None and block_size % TURBOQUANT_PACK_FACTOR:
+        raise ValueError(
+            f"ENABLE_TURBOQUANT=1 packs {TURBOQUANT_PACK_FACTOR} INT4 codes per byte, so block_size "
+            f"must be even, got {block_size}."
+        )
+
+    if vllm_config.kv_transfer_config is not None:
+        # The hybrid connectors (ascend_store, mooncake hybrid/layerwise) move
+        # pages shaped `conv | ssm | padding | K | V`. A TurboQuant page is
+        # `K_packed | V_packed | scales`, which those movers would transfer as
+        # if it were dense K/V: wrong numbers on the consumer, not an error.
+        raise ValueError(
+            "ENABLE_TURBOQUANT=1 does not support KV transfer / disaggregated prefill: the "
+            "connectors assume the dense (or hybrid conv/ssm + K/V) page layout, not the packed "
+            "three-plane one."
+        )
+
+    if getattr(model_config, "is_hybrid", False):
+        logger.info(
+            "TurboQuant on a hybrid model: full-attention layers are allocated as their own "
+            "three planes (packed K, packed V, fp32 scales) and are kept out of the Mamba "
+            "pages. Their page stays padded to the hybrid common page size, so the 4-bit "
+            "cache changes the layout but not the capacity of this model."
         )
 
 

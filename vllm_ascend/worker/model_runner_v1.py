@@ -133,6 +133,11 @@ from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBui
 from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadataBuilder
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
+from vllm_ascend.attention.turboquant_layout import (
+    turboquant_carve_planes,
+    turboquant_enabled,
+    turboquant_plane_views,
+)
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     get_sfa_qsfa_packed_head_dim,
@@ -275,9 +280,11 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
     AscendSFAIndexerCacheSpec,
     AscendSlidingWindowMLASpec,
+    AscendTurboQuantAttentionSpec,
     get_kv_cache_compression_ratio,
     get_storage_block_size,
     requires_padded_page_layout,
+    turboquant_cache_spec,
 )
 from vllm_ascend.core.profiling_chunk_predictor import (
     _finish_profiling_chunk_timing,
@@ -375,6 +382,9 @@ class NPUModelRunner(GPUModelRunner):
         self.use_compress = (
             hf_config is not None and hasattr(hf_config, "compress_ratios")
         )
+        # TurboQuant's plane-major fp32 scale planes, by data pointer. Set here
+        # for the same reason: the parent init may reshape the KV cache.
+        self._turboquant_scale_planes: dict[int, torch.Tensor] = {}
 
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
@@ -983,7 +993,7 @@ class NPUModelRunner(GPUModelRunner):
             if scheduler_output.new_block_ids_to_zero:
                 self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
             copy_kv_cache_blocks_inplace(
-                self.kv_caches,
+                self._block_major_kv_caches(),
                 self.kv_cache_config.num_blocks,
                 scheduler_output.kv_cache_block_copies,
             )
@@ -4707,6 +4717,118 @@ class NPUModelRunner(GPUModelRunner):
     def _is_c8_mxfp_kv_cache(self, spec: AttentionSpec) -> bool:
         return type(spec) is FullAttentionSpec and is_c8_mxfp_kv_quant(self.vllm_config)
 
+    def _as_turboquant_spec(self, layer_name: str, spec: KVCacheSpec) -> KVCacheSpec:
+        """Re-describe a dense full-attention layer's cache for the 4-bit layout.
+
+        vLLM hands dense layers a ``FullAttentionSpec`` sized from the unpacked
+        head size, which over-allocates the packed cache about fourfold and has
+        no concept of the fp32 scale plane at all.
+        :class:`AscendTurboQuantAttentionSpec` budgets both packed planes and
+        the scales, so the block allocator sizes pages from what the backend
+        actually writes -- and the spec *type* is what routes the layer to the
+        three-plane carve instead of the dense K/V split or a hybrid flat
+        buffer.
+
+        Anything that is not a plain full-attention layer is returned
+        unchanged: TurboQuant has no MLA, sparse or compressed variant (the
+        backend selection in ``NPUPlatform.get_attn_backend_cls`` refuses those
+        outright) and it refuses sliding-window attention.
+
+        Hybrid models keep one page size across every KV cache group:
+        ``patch_mamba_config`` pads the Mamba page to the dense attention page
+        and vLLM's uniform-page-size grouping requires the two to stay equal.
+        A packed page is about four times smaller, so in a hybrid model the
+        TurboQuant page is padded back up to the dense page: the three planes
+        are carved from the head of it and the tail is unused. That is the
+        price of isolation -- the Gated DeltaNet layers keep their own pages and
+        their own allocator, the TurboQuant layers keep their own three planes,
+        and nothing has to interleave a packed plane with a recurrent state.
+        A dense (non-hybrid) model is not padded and keeps the full capacity
+        gain. Making the hybrid page smaller as well means deriving
+        ``attn_block_size`` / ``mamba_page_size_padded`` from the packed page in
+        ``patch/platform/patch_mamba_config.py``, which changes the scheduler's
+        block size for the whole model and is deliberately not done here.
+        """
+        if not turboquant_enabled():
+            return spec
+        if type(spec) is not FullAttentionSpec:
+            return spec
+        if getattr(spec, "sliding_window", None) is not None:
+            return spec
+
+        dense_page_size_bytes = spec.page_size_bytes
+        converted = turboquant_cache_spec(
+            spec,
+            page_size_padded=dense_page_size_bytes if self.model_config.is_hybrid else None,
+        )
+        logger.debug(
+            "[vllm-ascend/turboquant] %s: page %d B -> %d B (%d B payload + %d B scale plane%s)",
+            layer_name,
+            dense_page_size_bytes,
+            converted.page_size_bytes,
+            converted.payload_bytes,
+            converted.scale_plane_bytes,
+            ", padded to the hybrid common page" if self.model_config.is_hybrid else "",
+        )
+        return converted
+
+    def _block_major_kv_caches(self) -> list[Any]:
+        """``self.kv_caches`` with TurboQuant's scale plane split by plane.
+
+        ``copy_kv_cache_blocks_inplace`` indexes dimension 0 of every cache
+        tensor as blocks. TurboQuant's fp32 scale plane is plane-major --
+        ``(2, num_blocks, num_kv_heads, block_size)``, the staged kernels'
+        layout -- so its two planes are handed over as separate block-major
+        views. They are recognized by identity (the tensors the reshape
+        created), not by shape, so no other cache can be mistaken for one.
+        """
+        scale_planes = getattr(self, "_turboquant_scale_planes", None)
+        if not scale_planes:
+            return self.kv_caches
+        normalized: list[Any] = []
+        for entry in self.kv_caches:
+            if isinstance(entry, (tuple, list)) and any(
+                isinstance(tensor, torch.Tensor) and tensor.data_ptr() in scale_planes for tensor in entry
+            ):
+                planes: list[Any] = []
+                for tensor in entry:
+                    if isinstance(tensor, torch.Tensor) and tensor.data_ptr() in scale_planes:
+                        planes.extend(tensor.unbind(0))
+                    else:
+                        planes.append(tensor)
+                normalized.append(tuple(planes))
+            else:
+                normalized.append(entry)
+        return normalized
+
+    def _carve_turboquant_planes(
+        self,
+        layer_name: str,
+        spec: AscendTurboQuantAttentionSpec,
+        buffer: torch.Tensor,
+        num_blocks: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Three planes out of one layer's page budget.
+
+        The packed keys, the packed values and the fp32 scales come out of the
+        allocation the cache manager already sized for this layer, so the scale
+        plane is inside the block accounting rather than a side tensor the
+        allocator cannot see. Nothing extra is allocated and no other layer's
+        bytes are touched: this is what keeps a TurboQuant layer out of the
+        hybrid flat buffer (one Gated DeltaNet page cannot host a packed plane
+        plus a scale plane) without changing how Mamba layers are allocated.
+        """
+        try:
+            return turboquant_carve_planes(
+                buffer,
+                num_blocks,
+                spec.block_size,
+                spec.num_kv_heads,
+                spec.head_size,
+            )
+        except ValueError as error:
+            raise ValueError(f"{layer_name}: {error}") from error
+
     def _fill_c8_mxfp_v_scale_caches(self, kv_caches: dict[str, Any]) -> None:
         """Initialize V scales and retain views for physical-page reassignment.
 
@@ -5135,7 +5257,19 @@ class NPUModelRunner(GPUModelRunner):
                         alignment,
                     )
                     for layer_name, start, layer_size in regions:
-                        kv_cache_raw_tensors[layer_name] = backing[start : start + layer_size]
+                        region = backing[start : start + layer_size]
+                        region_spec = layer_kv_cache_spec[layer_name]
+                        if isinstance(region_spec, AscendTurboQuantAttentionSpec):
+                            # A TurboQuant layer owns its region of the shared
+                            # backing and carves it into three planes. It is
+                            # never handed a Mamba layer's page, so a packed
+                            # plane and a recurrent state are never interleaved
+                            # and the Mamba allocation is untouched.
+                            kv_cache_raw_tensors[layer_name] = self._carve_turboquant_planes(
+                                layer_name, region_spec, region, kv_cache_config.num_blocks
+                            )
+                        else:
+                            kv_cache_raw_tensors[layer_name] = region
 
         layerwise_reuse = get_layerwise_reuse_config(self.vllm_config.kv_transfer_config) is not None
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
@@ -5186,7 +5320,18 @@ class NPUModelRunner(GPUModelRunner):
                             cache_size_aligned = layer_size + alignment
                             tensor = torch.zeros(cache_size_aligned, dtype=torch.int8, device=self.device)
                             tensor = self._align_memory(tensor, alignment)[: layer_size]
-                        kv_cache_raw_tensors[layer_name_inner] = tensor
+                        inner_spec = layer_kv_cache_spec[layer_name_inner]
+                        if isinstance(inner_spec, AscendTurboQuantAttentionSpec):
+                            # Same isolation as the shared-backing path above:
+                            # the hybrid flat layout (conv | ssm | padding |
+                            # K | V) has no room for a scale plane, so a
+                            # TurboQuant layer takes its own page budget as
+                            # three planes instead.
+                            kv_cache_raw_tensors[layer_name_inner] = self._carve_turboquant_planes(
+                                layer_name_inner, inner_spec, tensor, kv_cache_config.num_blocks
+                            )
+                        else:
+                            kv_cache_raw_tensors[layer_name_inner] = tensor
 
                 elif use_compressed_cache and layer_name not in kv_cache_raw_tensors:
                     if self.vllm_config.kv_transfer_config is None:
@@ -5249,6 +5394,24 @@ class NPUModelRunner(GPUModelRunner):
                     # and rope head dim.
                     current_kv_cache_spec = layer_kv_cache_spec[layer_name]
                     assert isinstance(current_kv_cache_spec, AttentionSpec)
+                    if isinstance(current_kv_cache_spec, AscendTurboQuantAttentionSpec):
+                        # Three planes out of one page budget: packed keys,
+                        # packed values and the fp32 scale plane. The scales
+                        # stay inside the allocation the cache manager sized,
+                        # so they are no longer a side tensor the block
+                        # accounting cannot see.
+                        planes = self._carve_turboquant_planes(
+                            layer_name,
+                            current_kv_cache_spec,
+                            self._allocate_int8_cache_tensor(
+                                kv_cache_config.num_blocks * current_kv_cache_spec.page_size_bytes,
+                                alignment,
+                            ),
+                            kv_cache_config.num_blocks,
+                        )
+                        for layer_name_inner in allocation_layers:
+                            kv_cache_raw_tensors[layer_name_inner] = planes
+                        continue
                     current_packed_sfa_main_cache = kv_cache_spec_uses_packed_sfa_main_cache(current_kv_cache_spec)
 
                     # vLLM #51718 packs every layer of a group into a single
@@ -5419,6 +5582,41 @@ class NPUModelRunner(GPUModelRunner):
                     if not isinstance(raw, torch.Tensor):
                         raise ValueError("C8_MXFP requires one combined raw allocation per layer.")
                     kv_caches[layer_name] = mxfp_cache_views_for_spec(raw, current_kv_cache_spec, kernel_block_size)
+                    continue
+
+                if isinstance(current_kv_cache_spec, AscendTurboQuantAttentionSpec):
+                    # The three planes carved in _allocate_kv_cache_tensors,
+                    # viewed as the backend reads them: two packed int8 planes
+                    # and the fp32 scale plane, all in kernel blocks like every
+                    # other attention cache on this lane. This is the branch
+                    # that replaces both the dense K/V split and the hybrid
+                    # tail carve for a TurboQuant layer, so neither of those
+                    # has to learn about a third plane.
+                    raw_planes = kv_cache_raw_tensors[layer_name]
+                    if not isinstance(raw_planes, tuple) or len(raw_planes) != 3:
+                        raise ValueError(
+                            f"{layer_name}: TurboQuant expects three raw planes, got "
+                            f"{type(raw_planes).__name__} of length "
+                            f"{len(raw_planes) if isinstance(raw_planes, (tuple, list)) else 1}"
+                        )
+                    try:
+                        views = turboquant_plane_views(
+                            raw_planes,
+                            kernel_block_size,
+                            current_kv_cache_spec.num_kv_heads,
+                            current_kv_cache_spec.head_size,
+                        )
+                    except ValueError as error:
+                        raise ValueError(f"{layer_name}: {error}") from error
+                    kv_caches[layer_name] = views
+                    # The scale plane is the one cache tensor on this lane whose
+                    # dimension 0 is not blocks; remember it by identity so the
+                    # generic block copier can be handed its two block-major
+                    # planes instead (_block_major_kv_caches).
+                    scale_planes = getattr(self, "_turboquant_scale_planes", None)
+                    if scale_planes is None:
+                        scale_planes = self._turboquant_scale_planes = {}
+                    scale_planes[views[-1].data_ptr()] = views[-1]
                     continue
 
                 if layer_name in layer_tuple_strides:
@@ -6183,6 +6381,8 @@ class NPUModelRunner(GPUModelRunner):
                 if spec := attn_module.get_kv_cache_spec(self.vllm_config):
                     if self._is_c8_mxfp_kv_cache(spec):
                         spec = mxfp_cache_spec(spec)
+                    else:
+                        spec = self._as_turboquant_spec(layer_name, spec)
                     kv_cache_spec[layer_name] = spec
                     attn_layer_names.add(layer_name)
             elif isinstance(attn_module, MLAAttention):
