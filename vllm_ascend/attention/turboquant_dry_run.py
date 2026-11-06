@@ -96,6 +96,10 @@ import torch
 import torch_npu
 from vllm.logger import logger
 from vllm.v1.attention.backend import AttentionLayer, AttentionType  # type: ignore
+from vllm.v1.attention.backends.registry import (  # type: ignore
+    AttentionBackendEnum,
+    register_backend,
+)
 
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
@@ -144,6 +148,15 @@ TURBOQUANT_NIBBLE_LEVELS: Final[int] = 16
 # scale = 2^(e - TURBOQUANT_HEADROOM_BITS): three bits of INT4 magnitude plus
 # the sign, so the largest channel of a row lands on +-4.
 TURBOQUANT_HEADROOM_BITS: Final[int] = 2
+
+# The IEEE-754 binary32 fields the quantiser reads and writes directly. Both
+# of its powers of two come out of the exponent field, which is how the
+# kernel does it (`bits & 0x7F800000`) and what keeps the dry run's nibbles
+# bit-comparable rather than tolerance-comparable.
+_FP32_MANTISSA_BITS: Final[int] = 23
+_FP32_EXPONENT_MASK: Final[int] = 0xFF
+_FP32_EXPONENT_BIAS: Final[int] = 127
+_FP32_MAX_BIASED_EXPONENT: Final[int] = 254
 
 # Environment switches. ENABLE_TURBOQUANT routes the backend and the cache
 # spec, and lives in turboquant_layout with the rest of the shared contract so
@@ -247,6 +260,23 @@ class TurboQuantOpsConfig:
 # ---------------------------------------------------------------------------
 # The PyTorch fallback math.
 # ---------------------------------------------------------------------------
+
+
+def _exp2_fp32(exponent: torch.Tensor) -> torch.Tensor:
+    """``2^exponent`` as fp32, assembled from the exponent field.
+
+    Exact for every exponent a normal binary32 can hold, and -- unlike
+    ``torch.ldexp`` -- an integer shift and a bitcast, both of which have NPU
+    kernels. The biased exponent is clamped into the normal range rather than
+    allowed to wrap into a denormal, an infinity or a NaN. Only two kinds of row
+    reach a clamp: a zero row, whose scale
+    :meth:`TurboQuantEmulator.quantize` overwrites from its explicit branch, and
+    a row whose ``absmax`` is itself denormal, which saturates at the smallest
+    normal power of two instead of underflowing to zero -- a row that small
+    quantises to zero codes either way.
+    """
+    biased = torch.clamp(exponent.to(torch.int32) + _FP32_EXPONENT_BIAS, 1, _FP32_MAX_BIASED_EXPONENT)
+    return (biased << _FP32_MANTISSA_BITS).contiguous().view(torch.float32)
 
 
 def _sylvester_hadamard(order: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -360,19 +390,27 @@ class TurboQuantEmulator:
         in ``[-8, 7]`` shaped like the input, ``scales`` fp32 shaped ``[...]`` --
         one per row, which is one per ``(token, head)`` of a K or V plane.
 
-        The exponent comes from ``torch.frexp``, the same ``frexp`` the kernel
-        emulates with ``bits & 0x7F800000``: for ``absmax = m * 2^f`` with ``m``
-        in ``[0.5, 1)``, ``2^e <= absmax < 2^(e+1)`` means ``e = f - 1``.
+        The exponent is read straight out of the fp32 exponent field, which is
+        what the kernel does (``bits & 0x7F800000``): for a normal
+        ``absmax = 1.f * 2^(biased - 127)``, ``2^e <= absmax < 2^(e+1)`` means
+        ``e = biased - 127``. ``torch.frexp`` and ``torch.ldexp`` state the same
+        thing and were what this used to read, but neither has an NPU kernel:
+        they fall back to the CPU, a fallback is a device-to-host copy, and that
+        copy is illegal while an ACL graph stream is capturing (``aclrtMemcpy``
+        107030, "Stream during the capture stage is not supported"). An integer
+        shift and a bitcast run on the device in every mode. Denormal rows are
+        the one input the two spellings disagree on, and on those the field is
+        the authority: the kernel reads the field too.
         """
         rotated_fp32 = rotated.to(torch.float32)
-        absmax = rotated_fp32.abs().amax(dim=-1, keepdim=True)
+        absmax = rotated_fp32.abs().amax(dim=-1, keepdim=True).contiguous()
         zero_row = absmax == 0.0
-        _, frexp_exponent = torch.frexp(absmax)
-        exponent = frexp_exponent.to(torch.int32) - 1
+        biased_exponent = (absmax.view(torch.int32) >> _FP32_MANTISSA_BITS) & _FP32_EXPONENT_MASK
+        exponent = biased_exponent - _FP32_EXPONENT_BIAS
         ones = torch.ones_like(absmax)
         # 2^(e-2) and its exact reciprocal 2^(2-e): no divide, no reciprocal.
-        pow_scale = torch.ldexp(ones, exponent - TURBOQUANT_HEADROOM_BITS)
-        inv_scale = torch.ldexp(ones, TURBOQUANT_HEADROOM_BITS - exponent)
+        pow_scale = _exp2_fp32(exponent - TURBOQUANT_HEADROOM_BITS)
+        inv_scale = _exp2_fp32(TURBOQUANT_HEADROOM_BITS - exponent)
         # torch.round is round-half-to-even, matching the kernel's CAST_RINT.
         codes = torch.round(rotated_fp32 * inv_scale)
         codes = torch.clamp(codes, TURBOQUANT_NIBBLE_MIN, TURBOQUANT_NIBBLE_MAX)
@@ -840,6 +878,14 @@ def _codec_tables(emulator: TurboQuantEmulator) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
+# vLLM resolves a backend both ways: by the class path this platform's
+# `get_attn_backend_cls` returns, and by looking the name `get_name` reports up
+# in `AttentionBackendEnum`. Registering the class against the member whose
+# name it reports is what keeps those two answers the same object. The second
+# argument is deliberately left out: in vLLM 0.30 it is `class_path`, not a
+# device, so passing "ASCEND" here would register the string "ASCEND" as this
+# backend's import path and skip the decoration entirely.
+@register_backend(AttentionBackendEnum.TURBOQUANT)
 class AscendTurboQuantDryRunBackend(AscendAttentionBackend):
     """Backend descriptor for the TurboQuant dry run.
 
@@ -853,7 +899,9 @@ class AscendTurboQuantDryRunBackend(AscendAttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "ASCEND_TURBOQUANT_DRY_RUN"
+        # Must be an AttentionBackendEnum member name: vLLM indexes the enum
+        # with this string, and the lookup raises on anything else.
+        return "TURBOQUANT"
 
     @staticmethod
     def get_impl_cls() -> type[AscendTurboQuantDryRunBackendImpl]:
@@ -1020,9 +1068,12 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
         self.scale_cache: torch.Tensor | None = None
         self._use_fia_v2: bool | None = None
         self._warned_scale_carve = False
+        # info_once caches on its arguments, so every one of them has to be
+        # hashable: a list of stage names raises TypeError before it is logged.
+        staged = ", ".join(sorted(stage.value for stage in self.adapter.config.kernel_stages))
         logger.info_once(
             "TurboQuant dry run active: packed INT4 KV cache, kernel stages=%s, ops namespace=%s",
-            sorted(stage.value for stage in self.adapter.config.kernel_stages) or ["none (all emulated)"],
+            staged or "none (all emulated)",
             self.adapter.config.ops_namespace,
         )
 
