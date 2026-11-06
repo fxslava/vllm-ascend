@@ -104,6 +104,15 @@ from vllm_ascend.attention.attention_v1 import (
     AscendAttentionState,
     AscendMetadata,
 )
+from vllm_ascend.attention.turboquant_layout import (
+    TURBOQUANT_GROUP,
+    TURBOQUANT_KEY_PLANE,
+    TURBOQUANT_PACK_FACTOR,
+    TURBOQUANT_PLANES,
+    TURBOQUANT_VALUE_PLANE,
+    turboquant_packed_cache_shape,
+    turboquant_scale_cache_shape,
+)
 from vllm_ascend.attention.utils import notify_kv_cache_written
 
 # ---------------------------------------------------------------------------
@@ -124,30 +133,22 @@ _LCG_INCREMENT: Final[int] = 1013904223
 _LCG_MODULUS_MASK: Final[int] = 0xFFFFFFFF
 _LCG_SIGN_BIT: Final[int] = 16
 
-# Two signed INT4 codes per byte, low nibble first.
-TURBOQUANT_PACK_FACTOR: Final[int] = 2
+# The signed INT4 grid. The packing itself (TURBOQUANT_PACK_FACTOR), the plane
+# count and indices, and the group width live in turboquant_layout: the KV
+# cache spec budgets a page from the same numbers this module writes into it.
 TURBOQUANT_NIBBLE_MIN: Final[int] = -8
 TURBOQUANT_NIBBLE_MAX: Final[int] = 7
 TURBOQUANT_NIBBLE_MASK: Final[int] = 0xF
 TURBOQUANT_NIBBLE_LEVELS: Final[int] = 16
 
-# The INT8 K0 of the arch-3510 fractal: the inner Hadamard factor is 32 wide
-# because one Cube contraction is exactly one K fractal.
-TURBOQUANT_GROUP: Final[int] = 32
-
 # scale = 2^(e - TURBOQUANT_HEADROOM_BITS): three bits of INT4 magnitude plus
 # the sign, so the largest channel of a row lands on +-4.
 TURBOQUANT_HEADROOM_BITS: Final[int] = 2
 
-# Plane 0 is the key tensor, plane 1 the value tensor, in the packed cache and
-# in the scale cache alike.
-TURBOQUANT_PLANES: Final[int] = 2
-TURBOQUANT_KEY_PLANE: Final[int] = 0
-TURBOQUANT_VALUE_PLANE: Final[int] = 1
-
-# Environment switches. ENABLE_TURBOQUANT routes the backend (read by
-# vllm_ascend/platform.py); the other two steer this module only.
-TURBOQUANT_ENABLE_ENV: Final[str] = "ENABLE_TURBOQUANT"
+# Environment switches. ENABLE_TURBOQUANT routes the backend and the cache
+# spec, and lives in turboquant_layout with the rest of the shared contract so
+# that reading it does not import this module; the two below steer this module
+# only.
 TURBOQUANT_STAGES_ENV: Final[str] = "TURBOQUANT_KERNEL_STAGES"
 TURBOQUANT_NAMESPACE_ENV: Final[str] = "TURBOQUANT_OPS_NAMESPACE"
 
@@ -156,11 +157,6 @@ TURBOQUANT_NAMESPACE_ENV: Final[str] = "TURBOQUANT_OPS_NAMESPACE"
 # subtree registers nothing yet (op_adapter/turboquant_torch_ops.h is a symbol
 # inventory), so the name is configurable rather than hardcoded.
 TURBOQUANT_DEFAULT_NAMESPACE: Final[str] = "turboquant_ops"
-
-
-def turboquant_enabled() -> bool:
-    """Whether ``ENABLE_TURBOQUANT=1`` selected this backend."""
-    return os.getenv(TURBOQUANT_ENABLE_ENV, "0") == "1"
 
 
 class TurboQuantKernelStage(str, Enum):
@@ -844,18 +840,6 @@ def _codec_tables(emulator: TurboQuantEmulator) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-def turboquant_scale_cache_shape(num_blocks: int, block_size: int, num_kv_heads: int) -> tuple[int, ...]:
-    """Shape of the fp32 scale plane: ``(2, num_blocks, num_kv_heads, block_size)``.
-
-    Plane-major, then page, then head, then token -- the staged kernels' layout
-    (``tq_oracle::Reference::scale_offset``). A token's scales for one head are
-    therefore *not* contiguous; the AIV scatter writer uses a burst-padded
-    per-token slot instead, and that difference is one of the things a kernel
-    bring-up has to reconcile.
-    """
-    return (TURBOQUANT_PLANES, num_blocks, num_kv_heads, block_size)
-
-
 class AscendTurboQuantDryRunBackend(AscendAttentionBackend):
     """Backend descriptor for the TurboQuant dry run.
 
@@ -897,25 +881,58 @@ class AscendTurboQuantDryRunBackend(AscendAttentionBackend):
 
         Two signed INT4 codes per byte, token-major inside a ``(page, head)``
         panel. The fp32 scale plane is *not* part of this shape: vLLM's KV cache
-        spec describes one tensor per layer, so the third plane is carved
-        separately (see
-        :meth:`AscendTurboQuantDryRunBackendImpl._ensure_scale_cache`).
+        spec describes one shape per layer, so the third plane is carved from
+        the same page budget by the model runner
+        (``AscendTurboQuantAttentionSpec`` and
+        :meth:`NPUModelRunner._carve_turboquant_planes`) and shaped by
+        :func:`turboquant_scale_cache_shape`. When it is absent the backend
+        still falls back to a private scale plane, see
+        :meth:`AscendTurboQuantDryRunBackendImpl._ensure_scale_cache`.
         """
-        if head_size % TURBOQUANT_GROUP:
-            raise ValueError(
-                f"TurboQuant needs head_size to be a multiple of {TURBOQUANT_GROUP}, got {head_size}"
-            )
-        return (
-            TURBOQUANT_PLANES,
-            num_blocks,
-            block_size,
-            num_kv_heads,
-            head_size // TURBOQUANT_PACK_FACTOR,
-        )
+        return turboquant_packed_cache_shape(num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod
     def get_scale_cache_shape(num_blocks: int, block_size: int, num_kv_heads: int) -> tuple[int, ...]:
         return turboquant_scale_cache_shape(num_blocks, block_size, num_kv_heads)
+
+    # The block movers below exist because the scale plane is plane-major:
+    # ``(2, num_blocks, num_kv_heads, block_size)``, so its block dimension is
+    # 1 and not 0. The stock movers index dimension 0 of every tensor in the
+    # layer's tuple, which for this plane would move *planes* instead of blocks
+    # -- a copy that silently leaves a page's scales behind, which turns a
+    # preemption or a prefix-cache copy into wrong numbers rather than an
+    # error. All three planes move together here.
+    _SCALE_PLANE_INDEX: int = 2
+
+    @classmethod
+    def swap_blocks(
+        cls,
+        src_kv_cache: list[torch.Tensor],
+        dst_kv_cache: list[torch.Tensor],
+        src_to_dst: torch.Tensor,
+    ) -> None:
+        src_indices = src_to_dst[:, 0]
+        dst_indices = src_to_dst[:, 1]
+        for index, (src_cache, dst_cache) in enumerate(zip(src_kv_cache, dst_kv_cache)):
+            if index == cls._SCALE_PLANE_INDEX:
+                dst_cache[:, dst_indices] = src_cache[:, src_indices].to(dst_cache.device)
+            else:
+                dst_cache[dst_indices] = src_cache[src_indices].to(dst_cache.device)
+
+    @classmethod
+    def copy_blocks(
+        cls,
+        kv_caches: list[torch.Tensor],
+        src_to_dists: torch.Tensor,
+    ) -> None:
+        src_indices = src_to_dists[:, 0]
+        dst_indices = src_to_dists[:, 1]
+        for kv_cache in kv_caches:
+            for index, cache in enumerate(kv_cache):
+                if index == cls._SCALE_PLANE_INDEX:
+                    cache[:, dst_indices] = cache[:, src_indices]
+                else:
+                    cache[dst_indices] = cache[src_indices]
 
 
 # ---------------------------------------------------------------------------

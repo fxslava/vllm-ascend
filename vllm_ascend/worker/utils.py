@@ -10,6 +10,7 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec
 from vllm.v1.worker.utils import AttentionGroup, KVBlockZeroer
 
+from vllm_ascend.core.kv_cache_interface import AscendTurboQuantAttentionSpec
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
 
 
@@ -285,6 +286,16 @@ class AscendKVBlockZeroer(KVBlockZeroer):
                     kv_tensors = (kv_cache[0],)
                 elif isinstance(kv_cache, torch.Tensor):
                     kv_tensors = (kv_cache,)
+                elif isinstance(spec, AscendTurboQuantAttentionSpec):
+                    # (packed K, packed V, scales), and the scale plane is
+                    # plane-major: its block dimension is 1, not 0. Split it
+                    # into its two block-major planes so the loop below sees
+                    # only block-major tensors. A recycled block must lose its
+                    # scales along with its codes -- a stale scale over zeroed
+                    # codes is still zero, but a page half-cleared is not a
+                    # state worth keeping.
+                    assert len(kv_cache) == 3, "TurboQuant stores packed K, packed V and the scale plane"
+                    kv_tensors = (kv_cache[0], kv_cache[1], *kv_cache[2])
                 else:
                     kv_tensors = kv_cache
                     if cache_dtype == "mxfp8" and len(kv_tensors) == 4:
