@@ -33,6 +33,7 @@ from vllm_ascend.attention.turboquant_dry_run import (
     TURBOQUANT_OP_RESHAPE_AND_CACHE,
     TURBOQUANT_OP_RESHAPE_SCATTER,
     TURBOQUANT_STAGES_ENV,
+    TURBOQUANT_STRIP_TOKENS,
     TurboQuantEmulator,
     TurboQuantKernelStage,
     TurboQuantOpsAdapter,
@@ -157,23 +158,28 @@ def _write_strip_cache(
     key_pages = key_cache.view(num_blocks, num_kv_heads, block_size, packed_bytes)
     packed_key = emulator.pack(key_codes)
 
-    # The value plane: build each page's [D, S] code matrix, then pack along the
-    # token axis, which is what makes tokens 2t and 2t+1 share a byte.
-    value_matrix = torch.zeros((num_blocks, num_kv_heads, head_size, block_size), dtype=torch.int8)
+    # The value plane is channel-major INSIDE a 16-token strip, so a page's
+    # nibbles are [strip, channel, token % 16]. Building that array and packing
+    # along its last axis is the writers' formula, term for term.
+    strips_per_page = block_size // TURBOQUANT_STRIP_TOKENS
+    value_nibbles = torch.zeros(
+        (num_blocks, num_kv_heads, strips_per_page, head_size, TURBOQUANT_STRIP_TOKENS), dtype=torch.int8
+    )
 
     for token, slot in enumerate(slot_mapping.tolist()):
         if slot < 0:
             continue
         page, offset = divmod(slot, block_size)
+        strip, lane = divmod(offset, TURBOQUANT_STRIP_TOKENS)
         for head in range(num_kv_heads):
             key_pages[page, head, offset] = packed_key[token, head]
-            value_matrix[page, head, :, offset] = value_codes[token, head]
+            value_nibbles[page, head, strip, :, lane] = value_codes[token, head]
             scale_cache[TURBOQUANT_KEY_PLANE, page, head, offset] = key_scales[token, head]
             scale_cache[TURBOQUANT_VALUE_PLANE, page, head, offset] = value_scales[token, head]
 
-    value_cache.view(num_blocks, num_kv_heads, head_size, block_size // TURBOQUANT_PACK_FACTOR)[:] = emulator.pack(
-        value_matrix
-    )
+    value_cache.view(
+        num_blocks, num_kv_heads, strips_per_page, head_size, TURBOQUANT_STRIP_TOKENS // TURBOQUANT_PACK_FACTOR
+    )[:] = emulator.pack(value_nibbles)
 
 
 # ---------------------------------------------------------------------------
@@ -226,11 +232,19 @@ def test_an_unregistered_writer_leaves_the_golden_layout(monkeypatch: pytest.Mon
 # ---------------------------------------------------------------------------
 
 
-def test_the_golden_writer_still_refuses_the_channel_major_rmw(emulator: TurboQuantEmulator) -> None:
+def test_the_golden_writer_now_does_the_channel_major_rmw(emulator: TurboQuantEmulator) -> None:
+    """It used to refuse this layout; it writes it now, one token at a time.
+
+    The read-modify-write is what makes a single-token decode write safe in a
+    plane where token t shares a byte with t ^ 1. tests/ut/attention/
+    test_turboquant_strip_cache.py pins it against the kernels' nibble formula;
+    this only checks that the refusal is gone and that one token lands.
+    """
     adapter = _adapter(value_layout=TurboQuantValueLayout.CHANNEL_MAJOR)
     key, value = _activations(1)
-    with pytest.raises(NotImplementedError, match="read-modify-write"):
-        adapter.reshape_scatter_decode(key, value, *_caches(), torch.zeros(1, dtype=torch.int32), emulator)
+    caches = _caches()
+    adapter.reshape_scatter_decode(key, value, *caches, torch.zeros(1, dtype=torch.int32), emulator)
+    assert not torch.equal(caches[TURBOQUANT_VALUE_PLANE], torch.zeros_like(caches[TURBOQUANT_VALUE_PLANE]))
 
 
 @pytest.mark.parametrize(

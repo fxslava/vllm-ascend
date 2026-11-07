@@ -150,6 +150,13 @@ TURBOQUANT_NIBBLE_MAX: Final[int] = 7
 TURBOQUANT_NIBBLE_MASK: Final[int] = 0xF
 TURBOQUANT_NIBBLE_LEVELS: Final[int] = 16
 
+# The strip the audited writers work in: `kTokens` in
+# op_kernel/turboquant_reshape_batch.cpp and `kStripHeight` in
+# op_kernel/turboquant_reshape_scatter.cpp, a compile-time constant of both
+# schedules. It is the unit the channel-major value plane is channel-major
+# *inside*, and the granularity of its read-modify-write.
+TURBOQUANT_STRIP_TOKENS: Final[int] = 16
+
 # scale = 2^(e - TURBOQUANT_HEADROOM_BITS): three bits of INT4 magnitude plus
 # the sign, so the largest channel of a row lands on +-4.
 TURBOQUANT_HEADROOM_BITS: Final[int] = 2
@@ -217,17 +224,31 @@ class TurboQuantValueLayout(str, Enum):
 
     * the page axis order is ``(num_blocks, num_kv_heads, block_size,
       head_size / 2)`` -- head before token -- because a ``(block, head)`` page
-      has to be one contiguous 2048-byte MTE3 burst;
-    * the value plane's nibble index inside that page is
-      ``channel * block_size + token``. That pairs tokens ``2t`` and ``2t+1``
-      inside one byte, so a per-token write is a read-modify-write of the whole
-      strip. The kernel does it with register bitwise masks; PyTorch cannot do
-      it safely, which is why :meth:`TurboQuantOpsAdapter._write_slots` refuses
-      this layout. The key plane stays token-major in both.
+      has to be one contiguous MTE3 burst. The key plane is token-major inside
+      it, nibble ``token * head_size + channel``
+      (``turboquant_reshape_scatter.cpp``, the ``key_base`` burst).
+    * the value plane is channel-major **inside a 16-token strip**, not across
+      the page::
 
-    ``block_size`` is 16 in the strip cache: it is ``kTokens`` in the batch
-    writer, a compile-time constant of its four-stage schedule, and a prefill
-    strip fills one whole physical page.
+          nibble = (token // 16) * (16 * head_size)
+                 + channel * 16
+                 + (token % 16)
+
+      which is ``StripWordOffset`` plus the within-strip index of
+      ``turboquant_reshape_scatter.cpp``. A channel owns 16 consecutive nibbles,
+      one per token, so a channel is 8 bytes and a strip is 2048 of them at
+      ``head_size`` 256. Token ``t`` lands in the low nibble of its byte when
+      ``t`` is even and the high nibble when it is odd, so a per-token write is
+      a read-modify-write of the strip; the kernel splices it in with register
+      bitwise masks and :meth:`TurboQuantOpsAdapter._write_slots` does it as a
+      tensor read-modify-write of the touched strips.
+
+    ``block_size`` is a multiple of 16 in this layout, and the two writers do
+    not agree on which multiples: the scatter writer carries a strip index
+    inside the page and takes any of them, while the batch writer writes one
+    strip at the page base with no in-page offset and therefore needs
+    ``block_size == 16``. See the note in
+    csrc/attention/turboquant/torch_bindings.cpp.
     """
 
     TOKEN_MAJOR = "token_major"
@@ -975,33 +996,24 @@ class TurboQuantOpsAdapter:
         phases differ in which kernel owns the write, not in what lands: both
         produce the same nibbles and the same fp32 scales.
 
-        Reached only when the golden model owns the page. When either NPU writer
-        is engaged, :meth:`value_layout` reports ``CHANNEL_MAJOR`` because the
-        kernel put the cache in the strip layout, and the two
-        ``reshape_*`` entry points above never arrive here -- so the refusal
-        below cannot fire for a kernel-engaged run, and still fires for a golden
-        one that was configured into a layout PyTorch cannot write.
+        In the strip layout the value plane's write is a read-modify-write: a
+        channel owns 16 consecutive nibbles, one per token, so token ``t`` shares
+        a byte with ``t ^ 1`` and writing one token without the other's nibble
+        would corrupt it. Only the touched ``(page, head, strip)`` panels are
+        read back, modified and written, so every untouched lane survives --
+        which is what makes this safe for a decode step that writes one token
+        into a strip the previous step filled.
         """
-        if self.value_layout() is TurboQuantValueLayout.CHANNEL_MAJOR:
-            # Checked before the key plane is touched: a half-written step is
-            # worse than a refused one.
-            raise NotImplementedError(
-                "the channel-major value plane pairs tokens 2t and 2t+1 inside one byte, so a per-token "
-                "scatter needs a read-modify-write that belongs to the kernel; run the dry run with "
-                "TurboQuantValueLayout.TOKEN_MAJOR, or switch the scatter stage on so the kernel owns "
-                "the page"
-            )
-
-        packed_key, key_scales = self.quantize_and_pack(self.rotate(key, emulator), emulator)
-        packed_value, value_scales = self.quantize_and_pack(self.rotate(value, emulator), emulator)
+        codes_key, key_scales = emulator.quantize(self.rotate(key, emulator))
+        codes_value, value_scales = emulator.quantize(self.rotate(value, emulator))
 
         block_size = key_cache.shape[1]
         slots = slot_mapping.to(torch.int64)
         valid = slots >= 0
         if not bool(valid.all()):
             slots = slots[valid]
-            packed_key = packed_key[valid]
-            packed_value = packed_value[valid]
+            codes_key = codes_key[valid]
+            codes_value = codes_value[valid]
             key_scales = key_scales[valid]
             value_scales = value_scales[valid]
         if slots.numel() == 0:
@@ -1009,14 +1021,71 @@ class TurboQuantOpsAdapter:
 
         pages = torch.div(slots, block_size, rounding_mode="floor")
         offsets = slots - pages * block_size
-        for plane, packed, scales, cache in (
-            (TURBOQUANT_KEY_PLANE, packed_key, key_scales, key_cache),
-            (TURBOQUANT_VALUE_PLANE, packed_value, value_scales, value_cache),
+
+        if self.value_layout() is TurboQuantValueLayout.CHANNEL_MAJOR:
+            self._write_strip_planes(codes_key, codes_value, key_cache, value_cache, pages, offsets)
+        else:
+            for packed, cache in (
+                (emulator.pack(codes_key), key_cache),
+                (emulator.pack(codes_value), value_cache),
+            ):
+                _flat_slot_view(cache)[slots] = packed
+
+        # The scale plane is the one thing both layouts index identically:
+        # ((kv * num_blocks + page) * num_kv_heads + head) * block_size + token,
+        # which is scale_cache[plane][page, :, token].
+        for plane, scales in (
+            (TURBOQUANT_KEY_PLANE, key_scales),
+            (TURBOQUANT_VALUE_PLANE, value_scales),
         ):
-            _flat_slot_view(cache)[slots] = packed
-            # scale_cache[plane] is (num_blocks, num_kv_heads, block_size), so
-            # the pair of index tensors lands one (page, token) column per token.
             scale_cache[plane][pages, :, offsets] = scales.to(scale_cache.dtype)
+
+    def _write_strip_planes(
+        self,
+        codes_key: torch.Tensor,
+        codes_value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        pages: torch.Tensor,
+        offsets: torch.Tensor,
+    ) -> None:
+        """Write both planes of the audited strip cache, values read-modify-write.
+
+        ``codes_*`` are ``[T, H, D]`` INT8 in ``[-8, 7]``; ``pages`` and
+        ``offsets`` are ``[T]`` int64 of the page and the token's index inside
+        it. The planes are the same buffers as always -- what changes is how
+        they are addressed: ``(num_blocks, num_kv_heads, block_size, D/2)`` for
+        the token-major key plane and
+        ``(num_blocks, num_kv_heads, block_size/16, D, 8)`` for the value
+        plane's ``[strip, channel, token % 16]`` nibbles.
+        """
+        num_blocks, block_size, num_kv_heads, packed_bytes = key_cache.shape
+        head_size = packed_bytes * TURBOQUANT_PACK_FACTOR
+        if block_size % TURBOQUANT_STRIP_TOKENS:
+            raise ValueError(
+                f"the strip cache is written 16 tokens at a time, so block_size {block_size} must be a "
+                f"multiple of {TURBOQUANT_STRIP_TOKENS}"
+            )
+        strips_per_page = block_size // TURBOQUANT_STRIP_TOKENS
+
+        # The key plane is token-major inside the page, so one token's bytes are
+        # a contiguous run and no read-modify-write is needed.
+        key_pages = _require_contiguous(key_cache, "key").view(num_blocks, num_kv_heads, block_size, packed_bytes)
+        key_pages[pages, :, offsets] = TurboQuantEmulator.pack(codes_key)
+
+        # The value plane: unpack only the pages this step touches, set the one
+        # token lane of every channel, and pack them back.
+        strips = torch.div(offsets, TURBOQUANT_STRIP_TOKENS, rounding_mode="floor")
+        lanes = offsets - strips * TURBOQUANT_STRIP_TOKENS
+        value_pages = _require_contiguous(value_cache, "value").view(
+            num_blocks, num_kv_heads, strips_per_page, head_size, TURBOQUANT_STRIP_TOKENS // TURBOQUANT_PACK_FACTOR
+        )
+        touched, inverse = torch.unique(pages, return_inverse=True)
+        panel = TurboQuantEmulator.unpack(value_pages[touched])
+        # [U, H, strips, D, 16] indexed [page, head, strip, channel, token % 16];
+        # one token is one lane of every channel, which is codes_value[t].
+        panel[inverse, :, strips, :, lanes] = codes_value
+        value_pages[touched] = TurboQuantEmulator.pack(panel)
 
     # -- the cache read ----------------------------------------------------
 
@@ -1104,11 +1173,10 @@ class TurboQuantOpsAdapter:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Read a cache an NPU writer wrote, into the same four panels as above.
 
-        The strip layout differs from the golden one twice over -- the page axis
-        order is ``(num_blocks, num_kv_heads, block_size, D/2)`` and the value
-        plane's nibble index inside a page is ``channel * block_size + token``
-        -- so both differences are undone here, and only here. The buffer is the
-        same bytes either way; what changes is how they are read.
+        Inverts both differences the strip layout has from the golden one: the
+        page axis order, and the value plane's channel-major-inside-a-strip
+        nibble index. The buffer is the same bytes either way; what changes is
+        how they are read.
 
         ``block_tables`` is ``[B, max_blocks]`` int32. The returned panels are
         ``[B, S_pad, H, D/2]`` INT8 and ``[B, S_pad, H]`` fp32, token-major, so
@@ -1116,44 +1184,35 @@ class TurboQuantOpsAdapter:
         """
         num_blocks, block_size, num_kv_heads, packed_bytes = key_cache.shape
         head_size = packed_bytes * TURBOQUANT_PACK_FACTOR
-        if block_size % TURBOQUANT_PACK_FACTOR:
-            raise ValueError(f"the strip value plane pairs two tokens per byte, so block_size {block_size} is odd")
+        if block_size % TURBOQUANT_STRIP_TOKENS:
+            raise ValueError(
+                f"the strip cache is laid out 16 tokens at a time, so block_size {block_size} must be a "
+                f"multiple of {TURBOQUANT_STRIP_TOKENS}"
+            )
+        strips_per_page = block_size // TURBOQUANT_STRIP_TOKENS
         pages = block_tables.to(torch.int64)
         batch_size = pages.shape[0]
 
-        def require_contiguous(cache: torch.Tensor) -> torch.Tensor:
-            if not cache.is_contiguous():
-                raise RuntimeError(
-                    "a strip-layout TurboQuant cache plane must be contiguous to be re-read by page; "
-                    f"got strides {tuple(cache.stride())} for shape {tuple(cache.shape)}"
-                )
-            return cache
+        # The key plane is token-major inside the page: only the page axis order
+        # differs, so lift the token axis back out in front of the head axis.
+        key_pages = _require_contiguous(key_cache, "key").view(num_blocks, num_kv_heads, block_size, packed_bytes)
+        packed_key = key_pages[pages].permute(0, 1, 3, 2, 4).reshape(batch_size, -1, num_kv_heads, packed_bytes)
 
-        # [B, max_blocks, H, block_size, D/2] -> [B, S_pad, H, D/2]: lift the
-        # token axis back out in front of the head axis.
-        def to_token_major(gathered: torch.Tensor) -> torch.Tensor:
-            return gathered.permute(0, 1, 3, 2, 4).reshape(batch_size, -1, num_kv_heads, packed_bytes)
-
-        # The key plane is token-major inside the page, so only the page axis
-        # order differs from the golden cache.
-        key_pages = require_contiguous(key_cache).view(num_blocks, num_kv_heads, block_size, packed_bytes)
-        packed_key = to_token_major(key_pages[pages])
-
-        # The value plane's page is `head_size` channel rows of `block_size / 2`
-        # bytes, which is the same byte count read the other way round. Undo it
-        # on CODES rather than on bytes: tokens 2t and 2t+1 share a byte, so a
+        # The value plane is [strip, channel, token % 16] nibbles. Undo it on
+        # CODES rather than on bytes: tokens 2t and 2t+1 share a byte, so a
         # byte-level transpose would have to split nibble pairs, while unpacking
-        # first makes it an ordinary axis swap.
-        value_pages = require_contiguous(value_cache).view(
-            num_blocks, num_kv_heads, head_size, block_size // TURBOQUANT_PACK_FACTOR
+        # first makes it an ordinary axis permutation.
+        value_pages = _require_contiguous(value_cache, "value").view(
+            num_blocks, num_kv_heads, strips_per_page, head_size, TURBOQUANT_STRIP_TOKENS // TURBOQUANT_PACK_FACTOR
         )
-        channel_major_codes = TurboQuantEmulator.unpack(value_pages[pages])
-        token_major_codes = channel_major_codes.transpose(-1, -2).contiguous()
-        packed_value = to_token_major(TurboQuantEmulator.pack(token_major_codes))
+        # [B, max_blocks, H, strips, D, 16] -> [B, max_blocks, strips, 16, H, D],
+        # so flattening (strips, 16) gives token = strip * 16 + lane.
+        codes = TurboQuantEmulator.unpack(value_pages[pages])
+        token_major = codes.permute(0, 1, 3, 5, 2, 4).reshape(batch_size, -1, num_kv_heads, head_size)
+        packed_value = TurboQuantEmulator.pack(token_major.contiguous())
 
-        # The scale plane is (2, num_blocks, num_kv_heads, block_size) in both
-        # layouts -- the writers index it the same way the golden model does --
-        # so only the token axis has to come forward.
+        # The scale plane is indexed identically in both layouts, so only the
+        # token axis has to come forward.
         def gathered_scales(plane: int) -> torch.Tensor:
             return scale_cache[plane][pages].transpose(-1, -2).reshape(batch_size, -1, num_kv_heads)
 
@@ -1308,6 +1367,20 @@ def _flat_slot_view(cache: torch.Tensor) -> torch.Tensor:
             f"got strides {tuple(cache.stride())} for shape {tuple(cache.shape)}"
         )
     return cache.view(cache.shape[0] * cache.shape[1], *cache.shape[2:])
+
+
+def _require_contiguous(cache: torch.Tensor, name: str) -> torch.Tensor:
+    """A cache plane that is about to be re-viewed by page, or an error.
+
+    A view of a non-contiguous plane would be a copy, and a scatter into a copy
+    is silently dropped -- so this is an error rather than a slow path.
+    """
+    if not cache.is_contiguous():
+        raise RuntimeError(
+            f"the TurboQuant {name} plane must be contiguous to be addressed by page; "
+            f"got strides {tuple(cache.stride())} for shape {tuple(cache.shape)}"
+        )
+    return cache
 
 
 def _codec_tables(emulator: TurboQuantEmulator) -> torch.Tensor:
