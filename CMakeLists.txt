@@ -59,9 +59,12 @@ include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 # dav-3510 has: a Fixpipe that picks a sub-block's Unified Buffer as its
 # destination, mode-4 intra-block flags between the Cube and each Vector core,
 # and a 16-bit Cube fractal with C0 = 16. There is no 910B form of it, so the
-# library is simply absent from every other build and VLLM_ENABLE_TURBOQUANT
-# stays undefined there -- torch_binding.cpp then registers no TurboQuant op
-# rather than registering one with nothing behind it.
+# library is simply absent from every other build, and so is
+# csrc/attention/turboquant/torch_bindings.cpp -- so torch.ops.turboquant_ops
+# does not exist there rather than existing with nothing behind it. That absence
+# is the Python side's fallback signal: the adapter in
+# vllm_ascend/attention/turboquant_dry_run.py warns once and runs its golden
+# model when a stage is switched on and its op is unregistered.
 #
 # CANN 9.2 drives these through the ASC language toolchain: asc-config.cmake
 # registers ASC as a CMake language whose compiler is bisheng, and
@@ -81,13 +84,36 @@ if(SOC_VERSION MATCHES "ascend950")
     message(STATUS "ASC language toolchain enabled: --npu-arch=${CMAKE_ASC_ARCHITECTURES}")
 
     set(VLLM_ASCEND_BUILD_TURBOQUANT ON)
-    # The ASC toolchain compiles each source's device kernel and host launcher
-    # together. Keep the optimized pre-rotated and raw-query decode launchers in
-    # this library alongside the BF16 cache writer.
+    # The three audited kernel translation units, mirrored verbatim from
+    # kernels/ops/turboquant/vllm_integration_layer of the ascend-micro-harness.
+    # The ASC toolchain compiles each source's device kernel and its host
+    # launcher together, so this one library carries both halves of all three
+    # paths: the prefill batch writer, the decode scatter writer and the fused
+    # raw-query decode. torch_bindings.cpp below links against these launchers.
+    #
+    # One library, not three: the fused decode's Split-K reducer and the two
+    # writers share op_kernel/common, and ascendc_library has no incremental
+    # rebuild (its preprocess step feeds ld.lld its own previous output), so a
+    # source change means one clean rebuild either way.
     ascendc_library(vllm_ascend_turboquant SHARED
-        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/kernels/turboquant_reshape_and_cache_bf16.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/op_kernel/turboquant_fused_decode_opt.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/op_kernel/turboquant_reshape_batch.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/op_kernel/turboquant_reshape_scatter.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/op_kernel/turboquant_fused_decode.cpp
     )
+    # TQ_GEMM_REDUCE selects the decode operator's reduction phase and is ON in
+    # the harness build and in its standalone project alike, so a wheel build
+    # compiles the same operator the harness verifies under that file name.
+    #
+    # Two calls, and only ONE of them may be ascendc_compile_options: the device
+    # half of CANN's legacy module set APPENDS its options while the host half
+    # ASSIGNS them, so a second ascendc_compile_options on this target would
+    # silently discard the first call's -forward-options-to-host-compiler
+    # defines and leave the two compilations disagreeing about which macros are
+    # defined. The failure mode is an undefined reference to a host launcher
+    # whose aclrtlaunch_* symbol is present in the same .so.
+    ascendc_compile_definitions(vllm_ascend_turboquant PRIVATE TQ_GEMM_REDUCE=1)
+    ascendc_compile_options(vllm_ascend_turboquant PRIVATE
+        -forward-options-to-host-compiler -DTQ_GEMM_REDUCE=1)
 endif()
 
 file(GLOB KERNEL_FILES
@@ -115,6 +141,19 @@ else()
     file(GLOB VLLM_ASCEND_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/*.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/aclnn_torch_adapter/*.cpp)
+endif()
+
+# The TurboQuant Torch bindings are a translation unit of their own and the glob
+# above only reaches csrc/*.cpp, so they are named here. They must NOT be folded
+# into csrc/torch_binding.cpp: the audited
+# op_kernel/common/types.h and csrc/kernels/types.h both declare
+# vllm_ascend::AscendType behind their own #pragma once, so a TU that reaches
+# both fails to compile. Adding the file only on the ascend950 branch is also
+# what keeps torch.ops.turboquant_ops absent -- rather than registered with
+# nothing behind it -- on every other SoC.
+if(VLLM_ASCEND_BUILD_TURBOQUANT)
+    list(APPEND VLLM_ASCEND_SRC
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/torch_bindings.cpp)
 endif()
 
 # Sparse KV cache offloading is currently supported on Atlas A3 only.
@@ -208,8 +247,10 @@ if(NOT (SOC_VERSION MATCHES "ascend310p.*|ascend950"))
     target_compile_definitions(vllm_ascend_C PRIVATE -DVLLM_ENABLE_ATB_AND_DIRECT_KERNELS)
 endif()
 
-# Gates both the adapter include and the TORCH_LIBRARY_FRAGMENT in
-# csrc/torch_binding.cpp, and the meta kernel in csrc/torch_binding_meta.cpp.
+# The TurboQuant ops are now a translation unit of their own, added to
+# VLLM_ASCEND_SRC above, so nothing in csrc/torch_binding.cpp is #ifdef'd on
+# this any more. It stays as the flag Python-visible build introspection and any
+# future host-side gate read.
 if(VLLM_ASCEND_BUILD_TURBOQUANT)
     target_compile_definitions(vllm_ascend_C PRIVATE -DVLLM_ENABLE_TURBOQUANT)
 endif()

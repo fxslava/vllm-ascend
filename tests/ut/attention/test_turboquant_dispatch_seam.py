@@ -22,9 +22,7 @@ import pytest
 import torch
 
 from vllm_ascend.attention.turboquant_dry_run import (
-    TURBOQUANT_ELEMENT_BF16,
-    TURBOQUANT_ELEMENT_FP16,
-    TURBOQUANT_MODE_KV4_FP8,
+    TURBOQUANT_DECODE_SPLITS,
     TURBOQUANT_OP_FUSED_DECODE,
     TURBOQUANT_OP_GATHER_PAGES,
     TURBOQUANT_OP_QUANTIZE_PACK,
@@ -32,6 +30,7 @@ from vllm_ascend.attention.turboquant_dry_run import (
     TURBOQUANT_OP_RESHAPE_SCATTER,
     TURBOQUANT_OP_ROTATE,
     TURBOQUANT_OP_UNPACK_DEQUANT,
+    TURBOQUANT_REUSE_MODE4_FLAGS,
     TURBOQUANT_STAGE_ROTATED_BASIS,
     TURBOQUANT_STAGE_UNROTATED,
     AscendTurboQuantDryRunBackendImpl,
@@ -327,15 +326,18 @@ def test_the_prefill_entry_point_takes_the_batch_writer_abi(
         key, value, *caches, slot_mapping, emulator
     )
 
+    # The schema's order: key, value, the three planes, slot_mapping, pi_signs,
+    # tables, inv_sqrt_len, reuse_mode4_flags. Every scalar the C launcher also
+    # takes is derived in torch_bindings.cpp from these tensors.
     args = entry.args
+    assert len(args) == 10
     assert (args[0], args[1]) == (key, value)
     assert (args[2], args[3], args[4], args[5]) == (*caches, slot_mapping)
     assert torch.equal(args[6], emulator.pi_signs)
     assert args[7].dtype is torch.int8
-    # num_tokens, num_kv_heads, head_size, block_size, num_blocks, tokens_per_core
-    assert args[8:14] == (BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE, BLOCK_SIZE, NUM_BLOCKS, None)
-    assert args[14] == pytest.approx(emulator.inv_sqrt_len)
-    assert args[15] is True
+    assert args[7].numel() == 2 * (HEAD_SIZE // 32) * 32 * 32
+    assert args[8] == pytest.approx(emulator.inv_sqrt_len)
+    assert args[9] is TURBOQUANT_REUSE_MODE4_FLAGS
     # The kernel owns the write, so the golden model must not have run.
     assert torch.equal(caches[0], torch.zeros_like(caches[0]))
 
@@ -351,16 +353,15 @@ def test_the_decode_entry_point_takes_the_scatter_writer_abi(
 
     _adapter(TurboQuantKernelStage.SCATTER).reshape_scatter_decode(key, value, *caches, slot_mapping, emulator)
 
+    # The work split (block_dim, item_begin, item_count), the canary probe and
+    # the cu_seqlens prefix sum are all the binding's, so the schema is tensors
+    # plus the scale fold.
     args = entry.args
-    assert args[0] is None  # block_dim, the host's work split
-    assert (args[1], args[2]) == (key, value)
-    assert (args[3], args[4], args[5], args[6]) == (*caches, slot_mapping)
-    assert torch.equal(args[7], emulator.pi_signs)
-    assert (args[8], args[9]) == (None, None)  # cu_seqlens, launch_probe
-    # num_requests, num_kv_heads, head_size, block_size, num_blocks
-    assert args[10:15] == (2, NUM_KV_HEADS, HEAD_SIZE, BLOCK_SIZE, NUM_BLOCKS)
-    assert (args[15], args[16]) == (None, None)  # item_begin, item_count
-    assert args[17] == pytest.approx(emulator.inv_sqrt_len)
+    assert len(args) == 8
+    assert (args[0], args[1]) == (key, value)
+    assert (args[2], args[3], args[4], args[5]) == (*caches, slot_mapping)
+    assert torch.equal(args[6], emulator.pi_signs)
+    assert args[7] == pytest.approx(emulator.inv_sqrt_len)
     assert torch.equal(caches[0], torch.zeros_like(caches[0]))
 
 
@@ -421,63 +422,82 @@ def test_fused_decode_returns_none_without_a_kernel(
     assert _fused_decode(_adapter(), emulator) is None
 
 
-def test_fused_decode_takes_the_seam_and_still_returns_none(
+def test_fused_decode_launches_and_returns_its_output(
     monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
 ) -> None:
-    """The entry point exists, is selected, and declines: the golden path runs."""
-    entry = _Recorder(torch.ones(1))
+    """With the op registered the seam is taken and `output` comes back, not None.
+
+    `None` is reserved for "the golden gather, dequantise and attend path has to
+    run", so a launched decode must be distinguishable from it.
+    """
+    entry = _Recorder()
     _register(monkeypatch, npu_turboquant_fused_decode=entry)
     adapter = _adapter(TurboQuantKernelStage.DECODE)
+    caches = _caches()
+    output = torch.zeros(1, 2, HEAD_SIZE)
 
     assert adapter._has_kernel(TURBOQUANT_OP_FUSED_DECODE) is True
-    assert _fused_decode(adapter, emulator) is None
-    assert entry.calls == []
+    returned = adapter.fused_decode(
+        query=torch.randn(1, 2, HEAD_SIZE),
+        key_cache=caches[0],
+        value_cache=caches[1],
+        scale_cache=caches[2],
+        block_tables=torch.zeros(1, 3, dtype=torch.int32),
+        context_lens=torch.ones(1, dtype=torch.int32),
+        emulator=emulator,
+        num_heads=2,
+        num_kv_heads=NUM_KV_HEADS,
+        scale=0.125,
+        output=output,
+    )
+    assert returned is output
+    assert len(entry.calls) == 1
 
 
-@pytest.mark.parametrize(
-    ("dtype", "element_type"),
-    [(torch.float16, TURBOQUANT_ELEMENT_FP16), (torch.bfloat16, TURBOQUANT_ELEMENT_BF16)],
-)
-def test_fused_decode_names_the_output_element_type(
-    monkeypatch: pytest.MonkeyPatch,
-    emulator: TurboQuantEmulator,
-    dtype: torch.dtype,
-    element_type: int,
+def test_fused_decode_passes_the_schema_the_binding_declares(
+    monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
 ) -> None:
-    seen: dict[str, Any] = {}
+    """The 18 arguments of npu_turboquant_fused_decode, in the schema's order.
 
-    class _Observed(TurboQuantOpsAdapter):
-        def _kernel_fused_decode(self, **kwargs: Any) -> torch.Tensor | None:
-            seen.update(kwargs)
-            return None
-
-    _register(monkeypatch, npu_turboquant_fused_decode=_Recorder())
-    adapter = _Observed(
-        TurboQuantOpsConfig(ops_namespace=NAMESPACE, kernel_stages=frozenset({TurboQuantKernelStage.DECODE}))
-    )
+    The mode, the element type, the host tiling descriptors, the Split-K
+    workspace and the fp32 rotated query image are all the binding's: the schema
+    does not take them, so none of them appears here.
+    """
+    entry = _Recorder()
+    _register(monkeypatch, npu_turboquant_fused_decode=entry)
     caches = _caches()
-    assert (
-        adapter.fused_decode(
-            query=torch.randn(1, 2, HEAD_SIZE).to(dtype),
-            key_cache=caches[0],
-            value_cache=caches[1],
-            scale_cache=caches[2],
-            block_tables=torch.zeros(1, 3, dtype=torch.int32),
-            context_lens=torch.ones(1, dtype=torch.int32),
-            emulator=emulator,
-            num_heads=2,
-            num_kv_heads=NUM_KV_HEADS,
-            scale=0.125,
-            output=torch.zeros(1, 2, HEAD_SIZE, dtype=dtype),
-        )
-        is None
+    query = torch.randn(1, 12, HEAD_SIZE)
+    output = torch.zeros_like(query)
+    block_tables = torch.zeros(1, 3, dtype=torch.int32)
+    context_lens = torch.ones(1, dtype=torch.int32)
+
+    _adapter(TurboQuantKernelStage.DECODE).fused_decode(
+        query=query,
+        key_cache=caches[0],
+        value_cache=caches[1],
+        scale_cache=caches[2],
+        block_tables=block_tables,
+        context_lens=context_lens,
+        emulator=emulator,
+        num_heads=12,
+        num_kv_heads=NUM_KV_HEADS,
+        scale=0.125,
+        output=output,
     )
-    assert seen["element_type"] == element_type
-    assert seen["mode"] == TURBOQUANT_MODE_KV4_FP8
-    assert seen["output_stage"] == TURBOQUANT_STAGE_UNROTATED
-    assert (seen["head_size"], seen["block_size"], seen["max_blocks_per_seq"]) == (HEAD_SIZE, BLOCK_SIZE, 3)
-    assert seen["tiling"] is None
-    assert seen["workspace"] is None
+
+    args = entry.args
+    assert len(args) == 18
+    assert args[0] is query
+    assert torch.equal(args[1], emulator.pi_signs)
+    assert args[2].dtype is torch.int8  # rot_tables
+    assert args[3].shape == (16, 16) and args[3].dtype is torch.float16  # h16
+    assert args[4] is None  # gate, read only at output_stage 2
+    assert (args[5], args[6], args[7]) == caches
+    assert (args[8], args[9], args[10]) == (block_tables, context_lens, output)
+    # num_heads, num_kv_heads, num_splits, heads_per_task, output_stage
+    assert args[11:16] == (12, NUM_KV_HEADS, TURBOQUANT_DECODE_SPLITS, 6, TURBOQUANT_STAGE_UNROTATED)
+    assert args[16] == pytest.approx(0.125)
+    assert args[17] == pytest.approx(emulator.inv_sqrt_len)
 
 
 # ---------------------------------------------------------------------------

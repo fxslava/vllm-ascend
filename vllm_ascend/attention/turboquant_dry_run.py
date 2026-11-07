@@ -196,18 +196,38 @@ class TurboQuantKernelStage(str, Enum):
 
 
 class TurboQuantValueLayout(str, Enum):
-    """Nibble order of the value plane inside one ``(page, head)`` panel.
+    """The cache layout a page is in, which is a property of whoever wrote it.
 
-    ``TOKEN_MAJOR``   -- nibble index ``token * head_size + channel``, the same
-    as the key plane. A token's nibbles are then a contiguous run that a
-    per-token scatter can write without touching another token's bytes.
+    This is not a tuning knob and not a global the golden path has to be told
+    about: :meth:`TurboQuantOpsAdapter.value_layout` derives it from which
+    writer owns the page, and the readers below follow it. Two writers means two
+    layouts, and the one the cache is in is the one the last writer used.
 
-    ``CHANNEL_MAJOR`` -- nibble index ``channel * block_size + token``, the
-    harness's BF16 signed-int4 strip ABI (``tq_oracle::nibble_index``). It pairs
-    token ``2t`` with token ``2t+1`` inside one byte, so a per-token write is a
-    read-modify-write and only a whole-page prefill strip can be written without
-    one. The PyTorch fallback refuses it for that reason -- the RMW belongs to
-    the kernel, which owns the page.
+    ``TOKEN_MAJOR`` -- the golden model's own cache. Planes are
+    ``(num_blocks, block_size, num_kv_heads, head_size / 2)`` and both of them
+    are token-major inside a ``(page, head)`` panel: nibble index
+    ``token * head_size + channel``. A token's nibbles are a contiguous run, so
+    a per-token scatter writes them without touching another token's bytes,
+    which is what lets PyTorch write this layout at all.
+
+    ``CHANNEL_MAJOR`` -- the audited strip cache that both NPU writers write
+    (``op_kernel/turboquant_reshape_batch.cpp``, ``..._scatter.cpp``). It
+    differs from ``TOKEN_MAJOR`` in two ways at once, and both matter to a
+    reader:
+
+    * the page axis order is ``(num_blocks, num_kv_heads, block_size,
+      head_size / 2)`` -- head before token -- because a ``(block, head)`` page
+      has to be one contiguous 2048-byte MTE3 burst;
+    * the value plane's nibble index inside that page is
+      ``channel * block_size + token``. That pairs tokens ``2t`` and ``2t+1``
+      inside one byte, so a per-token write is a read-modify-write of the whole
+      strip. The kernel does it with register bitwise masks; PyTorch cannot do
+      it safely, which is why :meth:`TurboQuantOpsAdapter._write_slots` refuses
+      this layout. The key plane stays token-major in both.
+
+    ``block_size`` is 16 in the strip cache: it is ``kTokens`` in the batch
+    writer, a compile-time constant of its four-stage schedule, and a prefill
+    strip fills one whole physical page.
     """
 
     TOKEN_MAJOR = "token_major"
@@ -488,15 +508,10 @@ class TurboQuantEmulator:
 # The kernel entry points and their golden models.
 # ---------------------------------------------------------------------------
 
-# ``TurboQuantMode`` (op_kernel/common/turboquant_mode.h). KV4_FP8 is the only
-# mode the staged fused decode is validated in.
-TURBOQUANT_MODE_KV4_FP8: Final[int] = 4
-
-# ``vllm_ascend::AscendType``, which ``Launch::element_type`` carries: the QUERY
-# and OUTPUT element type, never the cache format.
-TURBOQUANT_ELEMENT_FP16: Final[int] = 0
-TURBOQUANT_ELEMENT_BF16: Final[int] = 1
-
+# ``TurboQuantMode`` and the ``AscendType`` of the query and output are not
+# here: the fused decode's binding fixes the mode to KV4_FP8, the only mode the
+# operator is validated in, and reads the element type off the output dtype.
+#
 # ``TurboQuantOutputStage`` (op_kernel/common/turboquant_layout.h): where a
 # rotation leaves its result. 0 is the rotated basis (ingress, ``Pi``), 1 is the
 # model's own basis (egress, ``Pi^T / sqrt(D)``), 2 also divides by
@@ -523,6 +538,16 @@ TURBOQUANT_OP_FUSED_DECODE: Final[str] = "npu_turboquant_fused_decode"
 # Which stage switch gates each entry point. The two ingestion entries are
 # gated apart because they are two kernels: the batch writer owns whole
 # physical pages and the AIV scatter writer owns one token.
+#
+# Three of these seven are registered by
+# csrc/attention/turboquant/torch_bindings.cpp on an ascend950 build:
+# RESHAPE_AND_CACHE, RESHAPE_SCATTER and FUSED_DECODE. The other four have no
+# kernel in the audited subtree -- the rotation and the codec live inside the
+# fused decode's prologue and inside both writers rather than as standalone
+# operators, and nothing materialises a gathered page in production -- so their
+# stages resolve to nothing and always run golden. Switching one on is not an
+# error: it warns once and falls back, which is the same path a build without
+# the extension takes.
 TURBOQUANT_KERNEL_OPS: Final[dict[str, TurboQuantKernelStage]] = {
     TURBOQUANT_OP_ROTATE: TurboQuantKernelStage.ROTATE,
     TURBOQUANT_OP_QUANTIZE_PACK: TurboQuantKernelStage.QUANTIZE,
@@ -532,6 +557,24 @@ TURBOQUANT_KERNEL_OPS: Final[dict[str, TurboQuantKernelStage]] = {
     TURBOQUANT_OP_GATHER_PAGES: TurboQuantKernelStage.GATHER,
     TURBOQUANT_OP_FUSED_DECODE: TurboQuantKernelStage.DECODE,
 }
+
+# The batch writer's mode-4 channel policy: True is the recycled bilateral
+# two-slot ring, which is what every regression and benchmark dispatches. False
+# is the single-shot allocation kept as the regression fallback and bisection
+# control -- one flag id per announcement, which saturates the legal id space at
+# eight chunks.
+TURBOQUANT_REUSE_MODE4_FLAGS: Final[bool] = True
+
+# The fused decode's Split-K width. One split is the fused path: it emits its
+# context straight out of the decode pass and never reaches
+# ``AscendC::SyncAll<false>()``, which on dav-3510 only completes when every
+# launched block is co-resident -- so a wider launch is also a grid capped at the
+# physical block count. Widening this is a tuning decision that needs a device.
+TURBOQUANT_DECODE_SPLITS: Final[int] = 1
+
+# ``heads_per_task`` is clamped to the GQA group width, and the operator refuses
+# more than this many (``valid_launch`` in include/turboquant_fused_decode_opt.hpp).
+TURBOQUANT_DECODE_MAX_HEADS_PER_TASK: Final[int] = 16
 
 
 class TurboQuantOpsAdapter:
@@ -608,6 +651,23 @@ class TurboQuantOpsAdapter:
         if kernel is None:
             raise RuntimeError(f"torch.ops.{self.config.ops_namespace}.{op_name} is not registered")
         return kernel
+
+    def value_layout(self) -> TurboQuantValueLayout:
+        """The layout the cache is in, which is whichever writer owns the page.
+
+        Either NPU writer puts the cache in the audited strip layout
+        (:class:`TurboQuantValueLayout`), so this is derived rather than
+        configured: a run that switches an ingestion stage on does not also have
+        to be told what that stage writes, and the golden reader follows without
+        a second switch to keep in step.
+
+        ``config.value_layout`` is consulted only when both writers are golden,
+        which is how a dry run can still ask the golden writer to refuse the
+        channel-major read-modify-write it cannot do.
+        """
+        if self._has_kernel(TURBOQUANT_OP_RESHAPE_AND_CACHE) or self._has_kernel(TURBOQUANT_OP_RESHAPE_SCATTER):
+            return TurboQuantValueLayout.CHANNEL_MAJOR
+        return self.config.value_layout
 
     # -- rotation ----------------------------------------------------------
 
@@ -746,14 +806,8 @@ class TurboQuantOpsAdapter:
                 slot_mapping=slot_mapping,
                 pi_signs=emulator.pi_signs,
                 tables=_codec_tables(emulator),
-                num_tokens=key.shape[0],
-                num_kv_heads=key.shape[1],
-                head_size=key.shape[2],
-                block_size=key_cache.shape[1],
-                num_blocks=key_cache.shape[0],
-                tokens_per_core=None,
                 inv_sqrt_len=emulator.inv_sqrt_len,
-                reuse_mode4_flags=True,
+                reuse_mode4_flags=TURBOQUANT_REUSE_MODE4_FLAGS,
             )
             return
         self._golden_reshape_and_cache_prefill(key, value, key_cache, value_cache, scale_cache, slot_mapping, emulator)
@@ -768,26 +822,27 @@ class TurboQuantOpsAdapter:
         slot_mapping: torch.Tensor,
         pi_signs: torch.Tensor,
         tables: torch.Tensor,
-        num_tokens: int,
-        num_kv_heads: int,
-        head_size: int,
-        block_size: int,
-        num_blocks: int,
-        tokens_per_core: int | None,
         inv_sqrt_len: float,
         reuse_mode4_flags: bool,
     ) -> None:
         """The batch writer: rotate, quantise, pack and write whole pages.
 
-        Parameter for parameter ``launch_turboquant_reshape_and_cache_bf16``
-        (op_kernel/turboquant_reshape_batch.cpp) without its stream. ``key`` and
-        ``value`` are ``[T, H, D]`` activations; ``key_cache`` and
-        ``value_cache`` are ``(num_blocks, block_size, H, D/2)`` INT8 and
-        ``scale_cache`` is ``(2, num_blocks, H, block_size)`` fp32.
-        ``tokens_per_core`` is ``None`` until the Torch schema lands with the
-        host-side work split that reads the device's core count.
-        ``reuse_mode4_flags`` picks the recycled bilateral two-slot ring over the
-        single-shot bisection control.
+        ``key`` and ``value`` are ``[T, H, D]`` bf16; ``key_cache`` and
+        ``value_cache`` are ``(num_blocks, 16, H, D/2)`` INT8 in the strip
+        layout and ``scale_cache`` is ``(2, num_blocks, H, 16)`` fp32.
+        ``tables`` is the Cube's resident INT8 operand and ``pi_signs`` is
+        folded into it, so the device does not read it; an empty tensor says so.
+        ``reuse_mode4_flags`` picks the recycled bilateral two-slot mode-4 ring
+        over the single-shot bisection control.
+
+        The C launcher (``launch_turboquant_reshape_and_cache_bf16``,
+        op_kernel/turboquant_reshape_batch.cpp) also takes ``num_tokens``,
+        ``num_kv_heads``, ``head_size``, ``block_size``, ``num_blocks`` and
+        ``tokens_per_core``. The schema does not: the first five come off the
+        tensor shapes in csrc/attention/turboquant/torch_bindings.cpp, and
+        ``tokens_per_core`` is the kernel's own compile-time 16-token strip,
+        which the host derives rather than accepts -- a caller that could choose
+        it could contradict the schedule the kernel is specialised to.
         """
         self._require_kernel(TURBOQUANT_OP_RESHAPE_AND_CACHE)(
             key,
@@ -798,12 +853,6 @@ class TurboQuantOpsAdapter:
             slot_mapping,
             pi_signs,
             tables,
-            num_tokens,
-            num_kv_heads,
-            head_size,
-            block_size,
-            num_blocks,
-            tokens_per_core,
             inv_sqrt_len,
             reuse_mode4_flags,
         )
@@ -841,7 +890,6 @@ class TurboQuantOpsAdapter:
         """
         if self._has_kernel(TURBOQUANT_OP_RESHAPE_SCATTER):
             self._kernel_reshape_scatter_aiv(
-                block_dim=None,
                 key=key,
                 value=value,
                 key_cache=key_cache,
@@ -849,15 +897,6 @@ class TurboQuantOpsAdapter:
                 scale_cache=scale_cache,
                 slot_mapping=slot_mapping,
                 pi_signs=emulator.pi_signs,
-                cu_seqlens=None,
-                launch_probe=None,
-                num_requests=key.shape[0],
-                num_kv_heads=key.shape[1],
-                head_size=key.shape[2],
-                block_size=key_cache.shape[1],
-                num_blocks=key_cache.shape[0],
-                item_begin=None,
-                item_count=None,
                 inv_sqrt_len=emulator.inv_sqrt_len,
             )
             return
@@ -865,7 +904,6 @@ class TurboQuantOpsAdapter:
 
     def _kernel_reshape_scatter_aiv(
         self,
-        block_dim: int | None,
         key: torch.Tensor,
         value: torch.Tensor,
         key_cache: torch.Tensor,
@@ -873,29 +911,30 @@ class TurboQuantOpsAdapter:
         scale_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
         pi_signs: torch.Tensor,
-        cu_seqlens: torch.Tensor | None,
-        launch_probe: torch.Tensor | None,
-        num_requests: int,
-        num_kv_heads: int,
-        head_size: int,
-        block_size: int,
-        num_blocks: int,
-        item_begin: int | None,
-        item_count: int | None,
         inv_sqrt_len: float,
     ) -> None:
         """The AIV scatter writer: one token per request, rotated and packed in UB.
 
-        Parameter for parameter ``launch_turboquant_reshape_scatter_aiv``
-        (op_kernel/turboquant_reshape_scatter.cpp) without its stream.
-        ``block_dim``, ``item_begin`` and ``item_count`` are the host's work
-        split and ``launch_probe`` is its int32 canary; all four are ``None``
-        until the Torch schema lands with the launcher helper that builds them.
-        ``cu_seqlens`` is the int32 prefix sum the writer uses to find a
-        request's own token, and is ``None`` for a one-token-per-request decode.
+        Same tensors and same strip cache as
+        :meth:`_kernel_reshape_and_cache_a8`, with no contiguity contract on
+        ``slot_mapping``: the value plane's write is a read-modify-write of one
+        2048-byte strip, spliced in by register bitwise masks, which is the whole
+        reason this kernel exists.
+
+        The C launcher (``launch_turboquant_reshape_scatter_aiv``,
+        op_kernel/turboquant_reshape_scatter.cpp) also takes ``block_dim``,
+        ``cu_seqlens``, ``launch_probe``, ``num_requests``, ``num_kv_heads``,
+        ``head_size``, ``block_size``, ``num_blocks``, ``item_begin`` and
+        ``item_count``. The schema takes none of them:
+        csrc/attention/turboquant/torch_bindings.cpp derives the geometry from
+        the tensor shapes and the work split from the device
+        (``total_items = num_requests * num_kv_heads``, ``item_begin = 0``,
+        ``item_count = total_items``, ``block_dim = min(total_items,
+        aiv_core_num)``), and passes ``cu_seqlens`` and ``launch_probe`` as null
+        -- the first is the prefix sum a multi-token-per-request step would need,
+        the second the canary runner's probe.
         """
         self._require_kernel(TURBOQUANT_OP_RESHAPE_SCATTER)(
-            block_dim,
             key,
             value,
             key_cache,
@@ -903,15 +942,6 @@ class TurboQuantOpsAdapter:
             scale_cache,
             slot_mapping,
             pi_signs,
-            cu_seqlens,
-            launch_probe,
-            num_requests,
-            num_kv_heads,
-            head_size,
-            block_size,
-            num_blocks,
-            item_begin,
-            item_count,
             inv_sqrt_len,
         )
 
@@ -944,14 +974,22 @@ class TurboQuantOpsAdapter:
         int32 of ``page * block_size + token``, negative for padding. The two
         phases differ in which kernel owns the write, not in what lands: both
         produce the same nibbles and the same fp32 scales.
+
+        Reached only when the golden model owns the page. When either NPU writer
+        is engaged, :meth:`value_layout` reports ``CHANNEL_MAJOR`` because the
+        kernel put the cache in the strip layout, and the two
+        ``reshape_*`` entry points above never arrive here -- so the refusal
+        below cannot fire for a kernel-engaged run, and still fires for a golden
+        one that was configured into a layout PyTorch cannot write.
         """
-        if self.config.value_layout is TurboQuantValueLayout.CHANNEL_MAJOR:
+        if self.value_layout() is TurboQuantValueLayout.CHANNEL_MAJOR:
             # Checked before the key plane is touched: a half-written step is
             # worse than a refused one.
             raise NotImplementedError(
                 "the channel-major value plane pairs tokens 2t and 2t+1 inside one byte, so a per-token "
                 "scatter needs a read-modify-write that belongs to the kernel; run the dry run with "
-                "TurboQuantValueLayout.TOKEN_MAJOR"
+                "TurboQuantValueLayout.TOKEN_MAJOR, or switch the scatter stage on so the kernel owns "
+                "the page"
             )
 
         packed_key, key_scales = self.quantize_and_pack(self.rotate(key, emulator), emulator)
@@ -996,6 +1034,11 @@ class TurboQuantOpsAdapter:
         fp32, where ``S_pad = max_blocks_per_seq * block_size``. Positions past a
         request's context length are whatever the allocator last left there; the
         caller masks them.
+
+        The return shape is the same whichever layout the cache is in: this is
+        where a mixed configuration -- an NPU writer and a golden reader -- is
+        reconciled, so the un-packing and un-rotation above it never learn which
+        writer ran.
         """
         if self._has_kernel(TURBOQUANT_OP_GATHER_PAGES):
             return self._kernel_gather_pages(
@@ -1004,6 +1047,8 @@ class TurboQuantOpsAdapter:
                 scale_cache=scale_cache,
                 block_tables=block_tables,
             )
+        if self.value_layout() is TurboQuantValueLayout.CHANNEL_MAJOR:
+            return self._golden_gather_pages_strip(key_cache, value_cache, scale_cache, block_tables)
         return self._golden_gather_pages(key_cache, value_cache, scale_cache, block_tables)
 
     def _kernel_gather_pages(
@@ -1050,6 +1095,75 @@ class TurboQuantOpsAdapter:
             gathered_scales(TURBOQUANT_VALUE_PLANE),
         )
 
+    def _golden_gather_pages_strip(
+        self,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        scale_cache: torch.Tensor,
+        block_tables: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Read a cache an NPU writer wrote, into the same four panels as above.
+
+        The strip layout differs from the golden one twice over -- the page axis
+        order is ``(num_blocks, num_kv_heads, block_size, D/2)`` and the value
+        plane's nibble index inside a page is ``channel * block_size + token``
+        -- so both differences are undone here, and only here. The buffer is the
+        same bytes either way; what changes is how they are read.
+
+        ``block_tables`` is ``[B, max_blocks]`` int32. The returned panels are
+        ``[B, S_pad, H, D/2]`` INT8 and ``[B, S_pad, H]`` fp32, token-major, so
+        the caller's unpack and un-rotation are unchanged.
+        """
+        num_blocks, block_size, num_kv_heads, packed_bytes = key_cache.shape
+        head_size = packed_bytes * TURBOQUANT_PACK_FACTOR
+        if block_size % TURBOQUANT_PACK_FACTOR:
+            raise ValueError(f"the strip value plane pairs two tokens per byte, so block_size {block_size} is odd")
+        pages = block_tables.to(torch.int64)
+        batch_size = pages.shape[0]
+
+        def require_contiguous(cache: torch.Tensor) -> torch.Tensor:
+            if not cache.is_contiguous():
+                raise RuntimeError(
+                    "a strip-layout TurboQuant cache plane must be contiguous to be re-read by page; "
+                    f"got strides {tuple(cache.stride())} for shape {tuple(cache.shape)}"
+                )
+            return cache
+
+        # [B, max_blocks, H, block_size, D/2] -> [B, S_pad, H, D/2]: lift the
+        # token axis back out in front of the head axis.
+        def to_token_major(gathered: torch.Tensor) -> torch.Tensor:
+            return gathered.permute(0, 1, 3, 2, 4).reshape(batch_size, -1, num_kv_heads, packed_bytes)
+
+        # The key plane is token-major inside the page, so only the page axis
+        # order differs from the golden cache.
+        key_pages = require_contiguous(key_cache).view(num_blocks, num_kv_heads, block_size, packed_bytes)
+        packed_key = to_token_major(key_pages[pages])
+
+        # The value plane's page is `head_size` channel rows of `block_size / 2`
+        # bytes, which is the same byte count read the other way round. Undo it
+        # on CODES rather than on bytes: tokens 2t and 2t+1 share a byte, so a
+        # byte-level transpose would have to split nibble pairs, while unpacking
+        # first makes it an ordinary axis swap.
+        value_pages = require_contiguous(value_cache).view(
+            num_blocks, num_kv_heads, head_size, block_size // TURBOQUANT_PACK_FACTOR
+        )
+        channel_major_codes = TurboQuantEmulator.unpack(value_pages[pages])
+        token_major_codes = channel_major_codes.transpose(-1, -2).contiguous()
+        packed_value = to_token_major(TurboQuantEmulator.pack(token_major_codes))
+
+        # The scale plane is (2, num_blocks, num_kv_heads, block_size) in both
+        # layouts -- the writers index it the same way the golden model does --
+        # so only the token axis has to come forward.
+        def gathered_scales(plane: int) -> torch.Tensor:
+            return scale_cache[plane][pages].transpose(-1, -2).reshape(batch_size, -1, num_kv_heads)
+
+        return (
+            packed_key,
+            gathered_scales(TURBOQUANT_KEY_PLANE),
+            packed_value,
+            gathered_scales(TURBOQUANT_VALUE_PLANE),
+        )
+
     def dequantize_cache(
         self,
         packed: torch.Tensor,
@@ -1086,100 +1200,100 @@ class TurboQuantOpsAdapter:
         """
         if not self._has_kernel(TURBOQUANT_OP_FUSED_DECODE):
             return None
-        element_type = TURBOQUANT_ELEMENT_BF16 if output.dtype is torch.bfloat16 else TURBOQUANT_ELEMENT_FP16
+        group_heads = num_heads // num_kv_heads if num_kv_heads else num_heads
         return self._kernel_fused_decode(
-            mode=TURBOQUANT_MODE_KV4_FP8,
-            element_type=element_type,
-            block_dim=None,
             query=query,
             pi_signs=emulator.pi_signs,
             rot_tables=_codec_tables(emulator),
             h16=_h16_operand(emulator.device),
             gate=None,
-            query_rot=None,
             key_cache=key_cache,
             value_cache=value_cache,
             scale_cache=scale_cache,
             block_tables=block_tables,
             context_lens=context_lens,
-            mode_tables=None,
-            workspace=None,
             output=output,
-            tiling=None,
-            num_tokens=query.shape[0],
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
-            head_size=emulator.head_size,
-            block_size=key_cache.shape[1],
-            max_blocks_per_seq=block_tables.shape[1],
-            num_splits=None,
-            heads_per_task=None,
-            tasks_per_block=None,
-            reduce_tasks_per_block=None,
-            prologue_vectors_per_block=None,
-            prologue_cube_chunk_vectors=None,
+            num_splits=TURBOQUANT_DECODE_SPLITS,
+            heads_per_task=min(TURBOQUANT_DECODE_MAX_HEADS_PER_TASK, max(group_heads, 1)),
             output_stage=TURBOQUANT_STAGE_UNROTATED,
-            fused_context_limit=None,
             scale=scale,
             inv_sqrt_len=emulator.inv_sqrt_len,
         )
 
     def _kernel_fused_decode(
         self,
-        mode: int,
-        element_type: int,
-        block_dim: int | None,
         query: torch.Tensor,
         pi_signs: torch.Tensor,
         rot_tables: torch.Tensor,
         h16: torch.Tensor,
         gate: torch.Tensor | None,
-        query_rot: torch.Tensor | None,
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         scale_cache: torch.Tensor,
         block_tables: torch.Tensor,
         context_lens: torch.Tensor,
-        mode_tables: torch.Tensor | None,
-        workspace: torch.Tensor | None,
         output: torch.Tensor,
-        tiling: torch.Tensor | None,
-        num_tokens: int,
         num_heads: int,
         num_kv_heads: int,
-        head_size: int,
-        block_size: int,
-        max_blocks_per_seq: int,
-        num_splits: int | None,
-        heads_per_task: int | None,
-        tasks_per_block: int | None,
-        reduce_tasks_per_block: int | None,
-        prologue_vectors_per_block: int | None,
-        prologue_cube_chunk_vectors: int | None,
+        num_splits: int,
+        heads_per_task: int,
         output_stage: int,
-        fused_context_limit: int | None,
         scale: float,
         inv_sqrt_len: float,
-    ) -> torch.Tensor | None:
-        """The raw-query fused decode, which returns ``None`` until it can launch.
+    ) -> torch.Tensor:
+        """The raw-query fused decode, writing through ``output``.
 
-        Parameter for parameter
-        ``vllm_ascend::turboquant_mm_fused_decode_opt_raw_query_impl``
-        (op_adapter/turboquant_torch_adpt.h) without its stream, so ``mode`` is a
-        ``TurboQuantMode`` and ``element_type`` is the ``AscendType`` of the query
-        and the output. The prologue rotates the raw query into the cache's basis
-        and writes ``query_rot``, which is the fp32 rotated image and is not
-        interchangeable with ``query``, before the split loop.
+        ``query`` and ``output`` are ``[B, N, 256]`` fp16 or bf16, ``block_tables``
+        ``[B, max_blocks]`` int32 and ``context_lens`` ``[B]`` int32.
+        ``rot_tables`` is the Cube's resident INT8 operand and ``h16`` the 16x16
+        fp16 sign matrix; ``gate`` is read only at ``output_stage`` 2.
+        ``output_stage`` names a ``TurboQuantOutputStage``, and the decode path
+        here wants its context back in the model's own basis, so it passes 1.
 
-        It returns ``None``, which routes the caller to the golden gather,
-        dequantise and attend path, because three of its inputs are the caller's
-        to build and upload and nothing on the Python side builds them yet: the
-        host tiling descriptors, without which the launcher refuses the launch;
-        the Split-K ``workspace``; and the work split that ``num_splits`` through
-        ``prologue_cube_chunk_vectors`` is drawn from. This seam grows a tiling
-        helper when the Torch schema lands, and only then can this call be made.
+        Returns ``output`` so the caller can tell a launch from the ``None`` of a
+        golden fallback. The op itself returns nothing: like the two writers it
+        writes through its ``Tensor!`` argument.
+
+        Four of the launcher's inputs are built inside the op rather than passed:
+        ``mode`` is fixed to ``TurboQuantMode::KV4_FP8``, the only mode the fused
+        decode is validated in; ``element_type`` is read off the output dtype;
+        and the host tiling descriptors, the Split-K workspace and the fp32
+        rotated query image ``query_rot`` are allocated and filled in
+        csrc/attention/turboquant/torch_bindings.cpp, because each is derived
+        from the launch geometry and a caller that got one wrong would get a hang
+        rather than an error. ``query_rot`` is what the prologue writes and the
+        decode then reads; it is not ``query`` and the two are not
+        interchangeable.
+
+        THIS OP CANNOT READ A CACHE EITHER WRITER WROTE. The writers produce the
+        strip layout at ``block_size`` 16; this reads the NZ-tiled layout at a
+        ``block_size`` that is a power-of-two multiple of 64. The binding
+        TORCH_CHECKs both, so the mismatch is a refused launch naming the
+        conflict rather than an attention over bytes in the wrong order.
         """
-        return None
+        self._require_kernel(TURBOQUANT_OP_FUSED_DECODE)(
+            query,
+            pi_signs,
+            rot_tables,
+            h16,
+            gate,
+            key_cache,
+            value_cache,
+            scale_cache,
+            block_tables,
+            context_lens,
+            output,
+            num_heads,
+            num_kv_heads,
+            num_splits,
+            heads_per_task,
+            output_stage,
+            scale,
+            inv_sqrt_len,
+        )
+        return output
 
 
 def _flat_slot_view(cache: torch.Tensor) -> torch.Tensor:

@@ -92,9 +92,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # fp32 scales) instead of two unpacked activation-dtype planes. 0 (default):
     # off. 1: on. On a hybrid model this also keeps the full-attention layers
     # out of the Mamba shared KVCacheTensor -- see
-    # vllm_ascend/patch/platform/patch_mamba_config.py. The ingestion operator
-    # (torch.ops._C_ascend.npu_turboquant_reshape_and_cache) exists only in an
-    # Ascend 950 build; this flag does not conjure it on other hardware.
+    # vllm_ascend/patch/platform/patch_mamba_config.py. The ingestion operators
+    # (torch.ops.turboquant_ops.npu_turboquant_reshape_and_cache_a8 and
+    # ..._reshape_scatter_aiv) exist only in an Ascend 950 build; this flag does
+    # not conjure them on other hardware, and the dry-run backend falls back to
+    # its PyTorch golden model when they are absent.
     "ENABLE_TURBOQUANT": lambda: bool(int(os.getenv("ENABLE_TURBOQUANT", "0"))),
     # Check every slot the TurboQuant writer is handed before the launch: that
     # each 16-token strip starts on a 16-aligned slot and is consecutive, which
@@ -103,9 +105,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # so the check costs a device-to-host copy and a synchronisation on every
     # cache write of every layer -- diagnostic only, never a serving default.
     # Read in C++ by validate_slots() in
-    # csrc/attention/turboquant/op_adapter/turboquant_torch_adpt.h, so it takes
-    # effect in the worker process without any Python plumbing; it is listed
-    # here to keep it discoverable with the rest of the environment.
+    # csrc/attention/turboquant/torch_bindings.cpp, so it takes effect in the
+    # worker process without any Python plumbing; it is listed here to keep it
+    # discoverable with the rest of the environment. It guards the prefill batch
+    # writer only -- the decode scatter writer takes arbitrary slots by design.
     "VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS": lambda: bool(int(os.getenv("VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS", "0"))),
 }
 

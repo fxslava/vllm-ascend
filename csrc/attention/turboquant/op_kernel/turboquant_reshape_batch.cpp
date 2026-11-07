@@ -18,14 +18,11 @@
 // --------------------------
 //   * ragged multi-core tiling. Each block owns one aligned 16-token strip;
 //     the launcher uses numTokens / tokensPerCore blocks.
-//   * ragged shapes. The strip height (kTokens == 16), headSize == 256 and
+//   * ragged shapes. numTokens == blockSize == 16, headSize == 256 and
 //     numKvHeads == 4 are compile-time constants (kTokens, kHeadSize,
 //     kHeads); the scalar arguments drive the physical cache addressing only.
-//     blockSize is a genuine runtime value and may be any multiple of kTokens,
-//     128 included; numTokens must be a multiple of kTokens.
-//   * a slot mapping that is not kTokens-aligned and consecutive within a
-//     strip (see "Slot mapping contract" below). The strip need not start a
-//     page: blockSize may be any multiple of kTokens.
+//   * a non-page-aligned slot mapping: the strip must occupy one whole
+//     physical page (see "Slot mapping contract" below).
 //
 // Target: Ascend950PR_9599 CAModel, __NPU_ARCH__ == 3510, CANN 9.2.0-beta.2.
 // Grid:   8 chunks over a depth-4 L1 ring and depth-2 per-core UB rings, so
@@ -61,7 +58,6 @@
 // cores applied diag(piSigns) and then the outer factor H8 (x) I32 as three
 // radix-2 butterfly stages. That is the cheap factorisation in multiply-adds
 // and the expensive one in wall clock. Measured on this probe
-// (reports/reshape_and_cache_a8.md):
 //
 //   * the Cube spent 33.6% of its attributed cycles in WAIT_INTRA_BLOCK
 //     waiting for a Vector core to release a landing panel, against 2.8% in
@@ -137,7 +133,6 @@
 // G*32 + k1*16 + k0. In both readings the only fractal-grid axis is the
 // channel axis and the group's two sub-fractals are adjacent along it, so the
 // bytes coincide. The value chunks need no new load path, and
-// tests/camodel/test_micro_layout_bf16.cpp measures that rather than assuming
 // it.
 //
 // A second symmetry covers the resident blocks, and ONE HALF OF IT DOES NOT
@@ -164,16 +159,8 @@
 // ----------------
 //   keyCache   key-major. Within the (block, head) page the nibble index is
 //              key * headSize + d, so one chunk is 2048 contiguous bytes.
-//   valueCache channel-major within a kTokens strip, strips laid end to end.
-//              Within the (block, head) page the nibble index is
-//                (key / kTokens) * headSize * kTokens + ch * kTokens
-//                  + (key % kTokens),
-//              so one chunk is 2048 contiguous bytes. At blockSize == kTokens
-//              this is identical to plain channel-major (ch * blockSize + key),
-//              which is the form the CAModel probe verified; strip blocking is
-//              what keeps the chunk a single aligned burst once a page holds
-//              more than one strip. See run_vector_core for why the literal
-//              channel-major reading cannot be written safely then.
+//   valueCache channel-major. Within the (block, head) page the nibble index
+//              is ch * blockSize + key, so one chunk is 2048 contiguous bytes.
 //   scaleCache per (kv, block, head) a contiguous run of blockSize FP32, one
 //              scale per token: index
 //              ((kv * numBlocks + block) * numKvHeads + head) * blockSize + key
@@ -214,11 +201,8 @@
 //
 // Slot mapping contract
 // ---------------------
-// A prefill strip is kTokens consecutive slots aligned to kTokens:
-// slotMapping[i] must equal slotMapping[0] + i, and slotMapping[0] must be a
-// multiple of kTokens. blockSize must be a multiple of kTokens, which the
-// launcher enforces; a strip then lies wholly inside one page, at the in-page
-// offset derived in run_vector_core, and need not start one. The
+// A prefill strip fills one whole physical page: slotMapping[i] must equal
+// slotMapping[0] + i and slotMapping[0] must be a multiple of blockSize. The
 // kernel reads slotMapping[0] once, on the scalar unit, before the pipeline
 // starts; that is a scalar read of caller-supplied Global Memory metadata, the
 // same category as the online-softmax leaf's GM-resident index vector, and not
@@ -303,8 +287,7 @@
 // The resident-block ingress. At 16 bits a row-major 32 x 32 block is no
 // longer its own Nz image, so the blocks are converted on the way into L1
 // rather than copied flat; see the prologue of run_cube_core and
-// reports/micro_layout_bf16.md.
-#include "routines/routine_stage_page_zn_bf16.hpp"
+#include "cube/routine_stage_page_zn_bf16.hpp"
 #endif
 
 // After kernel_operator.h on purpose: this header's TQ_WAVE_FN marks every
@@ -312,13 +295,24 @@
 // defined by kernel_operator.h. Including it earlier is what left
 // turboquant_wave::TotalStrips host-attributed in the device object and
 // failed the device link.
-#include "turboquant_wave_protocol.hpp"
+#include "common/turboquant_wave_protocol.hpp"
 
+// Verification-only, and absent from every build that does not ask for it.
+// ASCEND_MICRO_SPARSE_SAMPLING is set on the CAModel probe's kernel library
+// and on its runner, never on the physical-device library, so a production
+// build of this file contains no sampling predicate, no extra branch and no
+// duplicated here because the harness has to agree, block for block, about
+// which blocks execute: if it disagreed, the pages it expects to be canary and
+// the pages the device leaves canary would differ, and the failure would say
+// nothing about the kernel.
+#if defined(ASCEND_MICRO_SPARSE_SAMPLING)
+#include "common/turboquant_sampling.hpp"
+#endif
 
 namespace turboquant_bf16 {
 
 // ------------------------------------------------------------ strip geometry
-constexpr std::uint32_t kTokens = turboquant_wave::kReshapeTokensPerStrip;
+constexpr std::uint32_t kTokens = 16;   // tokens per strip == blockSize
 constexpr std::uint32_t kHeads = 4;     // numKvHeads
 constexpr std::uint32_t kHeadSize = 256;
 constexpr std::uint32_t kGroup = 32;    // channels per Cube group == INT8 K0
@@ -432,7 +426,6 @@ constexpr std::uint32_t kSignBlock = ParityOf(C1 & G) * kGroups + G;
 // destination from the same constants.
 // The constants and both helpers come from turboquant_wave_protocol.hpp, so
 // the arena algebra the device build uses is the same declaration the host
-// gate in tests/cpu/test_wave_protocol_header.cpp compiles and checks, rather
 // than a second copy of it that can drift.
 using turboquant_wave::kBankSkewBytes;
 using turboquant_wave::kBlock;
@@ -599,7 +592,6 @@ static_assert(kL0Elems * kElemBytes <= 64u * 1024u, "L0A/L0B hold 64 KiB on arch
 // handshake: five ids whatever the schedule length. It was synthesised and
 // exhaustively checked 1-safe and deadlock free over 41,844,109 modulo states
 // under an explicit consuming-latch semantics, and that premise is now
-// measured rather than assumed -- tests/research/kernel_cluster_sync_probe.cpp
 // ran the cyclic handshake over recycled ids on physical silicon and on
 // CAModel with no early wait retirement.
 //
@@ -615,7 +607,6 @@ static_assert(kL0Elems * kElemBytes <= 64u * 1024u, "L0A/L0B hold 64 KiB on arch
 // a stale release instead of a harmless duplicate. **So every cross-core set
 // below is behind its SetFlag/WaitFlag<HardEvent::x_S> pair, and that is a
 // correctness precondition of the default policy, not a tuning choice.**
-// scripts/audit_cross_core_fences.py is the gate; a priming set, which reports
 // no earlier work, is the only exemption.
 //
 // Both revisions had also *passed* numerically before the pipeline was
@@ -930,7 +921,6 @@ __aicore__ inline void GemmChunk(__ca__ bfloat16_t* l0a, __cb__ bfloat16_t* l0b,
 //     slowest consumer two stages downstream.
 //
 // This changes the marked graph's slot lifetimes, so it is re-proved rather
-// than asserted: tests/cpu/test_reshape_wave_model.py explores the schedule at
 // both lookaheads. What is NOT established here is the wall-clock claim --
 // that needs a CAModel trace with intersecting MTE2/Cube intervals, and
 // REFINEMENT_OF_COMBAT_KERNELS.md section 5 is explicit that source order and
@@ -987,7 +977,6 @@ __aicore__ inline void run_cube_core(__gm__ const bfloat16_t* key,
     // -- four 16 x 16 sub-blocks, each row-major, ordered column-block major --
     // against row-major's r*32 + c. A flat ingress therefore hands the Cube a
     // permuted operand in BOTH roles, so the key chunks are as wrong as the
-    // value chunks. tests/camodel/test_micro_layout_bf16.cpp reproduces that
     // misread bit-exactly from the index map and then shows this ingress
     // removing it.
     //
@@ -1089,12 +1078,6 @@ struct VectorEngine {
     AscendC::GlobalTensor<float> scale_cache;
     std::uint32_t page_bytes;    // byte base of (block, head 0) in either cache
     std::uint32_t head_bytes;    // blockSize * headSize / 2
-    // Byte offset of this strip *inside* its (block, head) page. Zero when a
-    // strip is the whole page (blockSize == kTokens); otherwise the two cache
-    // layouts place the strip differently, so each plane carries its own offset.
-    // See run_vector_core for the derivation.
-    std::uint32_t key_token_bytes;    // keyCache:   token-major, kTokens * headSize / 2 per strip
-    std::uint32_t value_token_bytes;  // valueCache: strip-blocked, kPackedBytes per strip
     std::uint32_t key_scale;     // float base of (kv 0, block, head 0)
     std::uint32_t value_scale;   // float base of (kv 1, block, head 0)
     std::uint32_t head_scale;    // blockSize
@@ -1338,8 +1321,7 @@ __aicore__ inline void StoreChunk(VectorEngine& engine)
     auto scale = View<float>(kScaleBase<pack>, kScaleFloats);
 
     AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(pack_evt);
-    const std::uint32_t page = engine.page_bytes + kChunkHead<Chunk> * engine.head_bytes +
-                               (kIsKey<Chunk> ? engine.key_token_bytes : engine.value_token_bytes);
+    const std::uint32_t page = engine.page_bytes + kChunkHead<Chunk> * engine.head_bytes;
     const std::uint32_t slice =
         (kIsKey<Chunk> ? engine.key_scale : engine.value_scale) +
         kChunkHead<Chunk> * engine.head_scale;
@@ -1388,54 +1370,10 @@ __aicore__ inline void run_vector_core(__gm__ std::int8_t* key_cache,
                                        float inv_sqrt_len)
 {
     // One scalar read of caller-supplied Global Memory metadata, before the
-    // pipeline. A strip is kTokens consecutive slots, so its page index and its
-    // offset within that page are all the schedule needs and no stage reads the
-    // mapping again.
-    //
-    // Where the strip sits inside its page
-    // ------------------------------------
-    // The CAModel probe ran blockSize == kTokens == 16, where a strip *is* a
-    // whole page and every in-page offset is zero. A vLLM page is blockSize 128
-    // (any multiple of 16), so one page holds blockSize / kTokens strips and
-    // each plane needs the strip's offset inside it. The three planes place it
-    // differently, because their in-page index functions differ:
-    //
-    //   keyCache    nibble index = key * headSize + d. The strip's kTokens rows
-    //               are adjacent, so it is ONE run of kPackedBytes at byte
-    //               offset t0 * headSize / 2.
-    //
-    //   valueCache  channel-major. Taken literally as ch * blockSize + key, a
-    //               strip owns kTokens of each channel's blockSize nibbles --
-    //               256 runs of 8 bytes on a blockSize / 2 byte stride. Those
-    //               runs are neither 32-byte bursts nor 32-byte aligned, and
-    //               two strips of one page would share a 32-byte word, so
-    //               concurrent strips would tear each other's writes. The plane
-    //               is therefore strip-blocked:
-    //
-    //                 nibble index = (key / kTokens) * headSize * kTokens
-    //                              + ch * kTokens + (key % kTokens)
-    //
-    //               channel-major *within* a strip, strips laid end to end. The
-    //               strip is again ONE run of kPackedBytes, at byte offset
-    //               (t0 / kTokens) * kPackedBytes. This is not a new packing
-    //               step: the Vector stage already folds a value chunk into
-    //               exactly (ch, key-within-strip) order, which is why the old
-    //               store was a single DataCopy at all -- at blockSize ==
-    //               kTokens the two readings coincide byte for byte, so the
-    //               verified behaviour is unchanged and this only fixes where
-    //               the run lands when a page holds more than one strip.
-    //
-    //   scaleCache  one fp32 per token in a blockSize run, so the strip is
-    //               kTokens contiguous floats at offset t0.
-    //
-    // All three offsets are multiples of kTokens, so every burst stays 32-byte
-    // aligned (2048 B for the packed planes, 64 B for the scale slice) and no
-    // two strips of a page touch the same 32-byte word. The launcher enforces
-    // blockSize % kTokens == 0; a slot0 that is not kTokens-aligned would put a
-    // strip across two of these runs, which is the caller's contract.
+    // pipeline. A prefill strip fills one whole page, so the page index is all
+    // the schedule needs and no stage reads the mapping again.
     const std::uint32_t slot0 = static_cast<std::uint32_t>(slot_mapping[0]);
     const std::uint32_t block = slot0 / block_size;
-    const std::uint32_t token_offset = slot0 % block_size;
     const std::uint32_t head_bytes = block_size * head_size / 2u;
 
     VectorEngine engine;
@@ -1444,10 +1382,8 @@ __aicore__ inline void run_vector_core(__gm__ std::int8_t* key_cache,
     engine.scale_cache.SetGlobalBuffer(scale_cache);
     engine.page_bytes = block * num_kv_heads * head_bytes;
     engine.head_bytes = head_bytes;
-    engine.key_token_bytes = token_offset * head_size / 2u;
-    engine.value_token_bytes = (token_offset / kTokens) * kPackedBytes;
-    engine.key_scale = block * num_kv_heads * block_size + token_offset;
-    engine.value_scale = (num_blocks + block) * num_kv_heads * block_size + token_offset;
+    engine.key_scale = block * num_kv_heads * block_size;
+    engine.value_scale = (num_blocks + block) * num_kv_heads * block_size;
     engine.head_scale = block_size;
     engine.inv_sqrt_len = inv_sqrt_len;
 
@@ -1599,11 +1535,25 @@ __aicore__ inline void KernelBody(
     // could wait for.
     //
     // One scalar divide for the whole kernel, and TotalStrips absorbs a zero
-    // tokensPerCore rather than faulting the scalar unit on it.
+    // tokensPerCore rather than faulting the scalar unit on it. The guard and
+    // the sampling predicate below are its only two readers.
     const uint32_t total_strips =
         turboquant_wave::TotalStrips(numTokens, tokensPerCore);
     if (turboquant_wave::BlockOutOfStrips(block, total_strips)) return;
     AscendC::InitSocState();
+#if defined(ASCEND_MICRO_SPARSE_SAMPLING)
+    // Sparse boundary sampling, CAModel builds only. The skip is taken before
+    // anything is read, written, primed or announced, so a skipped block leaves
+    // no state at all: no HardEvent token, no mode-4 flag, no Global Memory
+    // write. That is also what makes it deadlock-free in a MIX launch -- the
+    // predicate is a function of the grid block index and of two host scalars,
+    // so a block's Cube and both of its Vector cores always reach the same
+    // decision, and a skipping group sets no flag its peers would wait on.
+    if (!tq_sampling::is_sampled(static_cast<int>(block),
+                                 static_cast<int>(total_strips))) {
+        return;
+    }
+#endif
     const uint32_t strip = block * tokensPerCore;
     key += strip * numKvHeads * headSize;
     value += strip * numKvHeads * headSize;
@@ -1632,8 +1582,6 @@ __aicore__ inline void KernelBody(
 // Entry point A, the default: the recycled bilateral two-slot mode-4 ring.
 // Five channels per sub block whatever the schedule length, sound because
 // every announcement in the body above is behind its x_S drain
-// (scripts/audit_cross_core_fences.py), and because
-// tests/research/kernel_cluster_sync_probe.cpp measured the consuming
 // semantics it needs on silicon and on CAModel. This is what every
 // regression, benchmark and production launch dispatches.
 extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_bf16(
@@ -1705,43 +1653,78 @@ extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_bf16_mode4_si
         numBlocks, tokensPerCore, invSqrtLen);
 }
 
-#else  // host leg of the same ASC translation unit
+#elif defined(ASCEND_MICRO_CANN_LAUNCH)
 
 #include <stdexcept>
 
-// The activations are 2-byte here, and this leg has no CANN device headers --
-// they live behind `#if defined(__CCE_AICORE__)` -- so `bfloat16_t` is not
-// available. std::uint16_t stands in for it: every pointer becomes void* in the
-// generated argument block, and the host side holds BF16 as bit patterns
-// anyway. The `tables` parameter keeps the std::int32_t* spelling the kernel
-// publishes and is reinterpreted device side.
+// The activations are 2-byte here, and this leg has no CANN headers -- the
+// device types live behind `#if defined(__CCE_AICORE__)` -- so `bfloat16_t` is
+// not available. std::uint16_t stands in for it: the two legs are separate
+// translation units, every pointer becomes void* in the generated argument
+// block, and the host side naturally holds BF16 as bit patterns anyway. The
+// `tables` parameter keeps the std::int32_t* spelling the INT8 kernel published
+// and is reinterpreted device side, exactly as it was there.
 extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_bf16(
     __gm__ std::uint16_t*, __gm__ std::uint16_t*, __gm__ std::int8_t*,
     __gm__ std::int8_t*, __gm__ float*, __gm__ std::int32_t*,
     __gm__ float*, __gm__ std::int32_t*, uint32_t, uint32_t,
-    uint32_t, uint32_t, uint32_t, uint32_t, float)
-{
-    // ASC emits the host launch stub only for a definition. The device pass
-    // uses KernelBody above; a declaration here leaves an unresolved symbol.
-}
+    uint32_t, uint32_t, uint32_t, uint32_t, float);
 
-// One grid over all strips; each block drains its queues before reuse in
-// another execution wave. Keep the established C launcher ABI.
-extern "C" void turboquant_reshape_and_cache_bf16_impl(
-    void* stream, std::uint32_t block_dim, const std::uint16_t* key,
-    const std::uint16_t* value, std::int8_t* key_cache, std::int8_t* value_cache,
-    float* scale_cache, const std::int32_t* slot_mapping, const float* pi_signs,
+// The single-shot variant is a second __global__ symbol with the same
+// argument block; the launcher below picks between them.
+extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_bf16_mode4_single_shot(
+    __gm__ std::uint16_t*, __gm__ std::uint16_t*, __gm__ std::int8_t*,
+    __gm__ std::int8_t*, __gm__ float*, __gm__ std::int32_t*,
+    __gm__ float*, __gm__ std::int32_t*, uint32_t, uint32_t,
+    uint32_t, uint32_t, uint32_t, uint32_t, float);
+
+// The launcher keeps the const-correct interface the caller sees and strips it
+// at the triple-chevron call, which is where the generated argument block
+// forces a non-const pointer.
+extern "C" void launch_turboquant_reshape_and_cache_bf16(
+    void* stream, const std::uint16_t* key, const std::uint16_t* value,
+    std::int8_t* key_cache, std::int8_t* value_cache, float* scale_cache,
+    const std::int32_t* slot_mapping, const float* pi_signs,
     const std::int32_t* tables, std::uint32_t num_tokens, std::uint32_t num_kv_heads,
     std::uint32_t head_size, std::uint32_t block_size, std::uint32_t num_blocks,
-    std::uint32_t tokens_per_core, float inv_sqrt_len)
+    std::uint32_t tokens_per_core, float inv_sqrt_len,
+    bool reuse_mode4_flags)
 {
-    if (tokens_per_core != turboquant_wave::kReshapeTokensPerStrip ||
-        !turboquant_wave::WholeStrips(num_tokens, tokens_per_core) ||
-        block_dim != turboquant_wave::TotalStrips(num_tokens, tokens_per_core)) {
-        throw std::invalid_argument("reshape_and_cache_bf16: expected one block per whole 16-token strip");
+    // One monolithic grid, however many waves it spans. The kernel's boundary
+    // guard and inter-wave epilogue drain are what make that safe, so there is
+    // no launch window here and no staggered sub-launch: a 128-strip context
+    // is one dispatch of 128 blocks.
+    // `reuse_mode4_flags` picks the entry point, and so the mode-4 channel
+    // policy: true, the default, is the recycled bilateral two-slot ring;
+    // false the single-shot allocation kept as the regression fallback and
+    // bisection control. Two __global__ symbols rather than a device-side
+    // branch, because the policy is a compile-time parameter and a runtime
+    // branch inside a MIX kernel would have to be taken identically by three
+    // cores.
+    //
+    // Arbitrary context length means any number of strips, over any number of
+    // waves. It does not mean a partial strip: a strip is one 16-token page,
+    // and TotalStrips rounds down, so dispatching 1000 tokens at 16 per strip
+    // would run 62 blocks and silently never write tokens 992..999 -- a short
+    // cache with every canary intact and every other token bit-exact, which is
+    // the hardest kind of wrong answer to notice. There is no partial-page
+    // path to add in the kernel, so the launcher refuses the geometry instead.
+    if (!turboquant_wave::WholeStrips(num_tokens, tokens_per_core))
+        throw std::invalid_argument(
+            "reshape_and_cache_bf16: numTokens must be a whole number of "
+            "tokensPerCore strips; a partial trailing strip would be dropped");
+    const std::uint32_t grid =
+        turboquant_wave::TotalStrips(num_tokens, tokens_per_core);
+    if (!reuse_mode4_flags) {
+        turboquant_reshape_and_cache_bf16_mode4_single_shot<<<grid, nullptr, stream>>>(
+            const_cast<std::uint16_t*>(key), const_cast<std::uint16_t*>(value), key_cache,
+            value_cache, scale_cache, const_cast<std::int32_t*>(slot_mapping),
+            const_cast<float*>(pi_signs), const_cast<std::int32_t*>(tables), num_tokens,
+            num_kv_heads, head_size, block_size, num_blocks, tokens_per_core,
+            inv_sqrt_len);
+        return;
     }
-    if (block_dim == 0u) return;
-    turboquant_reshape_and_cache_bf16<<<block_dim, nullptr, stream>>>(
+    turboquant_reshape_and_cache_bf16<<<grid, nullptr, stream>>>(
         const_cast<std::uint16_t*>(key), const_cast<std::uint16_t*>(value), key_cache,
         value_cache, scale_cache, const_cast<std::int32_t*>(slot_mapping),
         const_cast<float*>(pi_signs), const_cast<std::int32_t*>(tables), num_tokens,
