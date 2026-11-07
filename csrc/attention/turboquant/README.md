@@ -107,14 +107,59 @@ ascendc_library(tq_gate SHARED op_kernel/turboquant_reshape_batch.cpp op_kernel/
 ```
 
 configured with `-DSOC_VERSION=Ascend950PR_9599`, the `Unix Makefiles`
-generator, and `TQ_GEMM_REDUCE=1` through both `ascendc_compile_definitions` and
-one `ascendc_compile_options -forward-options-to-host-compiler`. Three things
-make it work: `$ASCEND_HOME_PATH/tools/ccec_compiler/bin` has to be on `PATH`
-(the preprocess step shells out to `llvm-objdump` by bare name), the build
-directory must not contain a dot-component (CANN's object glob never descends
-into one, and the failure names a missing file that exists), and it must be
-fresh every time — `ascendc_library` has no incremental rebuild, because its
-preprocess step feeds `ld.lld` its own previous output.
+generator, and the same two defines the root `CMakeLists.txt` passes. Five
+things make it work:
+
+- `ASCEND_MICRO_CANN_LAUNCH` and `ASCEND_TQ_FUSED_DECODE_GEMM_REDUCE=1` have to
+  be defined, through **both** `ascendc_compile_definitions` and a single
+  `ascendc_compile_options -forward-options-to-host-compiler -D...` — see "The
+  define you cannot omit" below. Only one `ascendc_compile_options` call per
+  target: the device half appends its options while the host half assigns them,
+  so a second call silently discards the first's host-forwarded defines.
+- `$ASCEND_HOME_PATH/tools/ccec_compiler/bin` has to be on `PATH`. The
+  preprocess step shells out to `llvm-objdump` by bare name and dies late
+  without it.
+- `CMAKE_BUILD_TYPE` has to be set. CANN's `merge_mix_obj.sh` runs under
+  `set -e` and the generated recipe interpolates `${CMAKE_BUILD_TYPE}` after a
+  bare `--build-type`; with it empty the option has no argument, the script's
+  last `shift 2` runs off the end and returns non-zero, and `set -e` kills it
+  with no message. The build then dies at `<target>_merge_obj` with nothing but
+  `Error 1`, at 95%, after every kernel compiled clean. This repo's root
+  `CMakeLists.txt` defaults it, so only a throwaway project hits it.
+- The build directory must not contain a dot-component. CANN's object glob never
+  descends into one, and the failure names a missing file that exists.
+- It must be fresh every time. `ascendc_library` has no incremental rebuild,
+  because its preprocess step feeds `ld.lld` its own previous output.
+
+The target carries both kernel types: `device.o` holds the two `MIX_AIC_1_2`
+kernels and `device_aiv.o` the `AIV_ONLY` scatter writer, which is why one
+`ascendc_library` is enough for all three sources.
+
+### The define you cannot omit
+
+Each of the three sources is shaped
+
+```c++
+#if defined(__CCE_AICORE__)              // the device kernels
+#elif defined(ASCEND_MICRO_CANN_LAUNCH)  // the host launchers
+#endif
+```
+
+`ascendc_library` compiles each translation unit several times, and the **host**
+pass is the one with `__CCE_AICORE__` undefined. Without
+`ASCEND_MICRO_CANN_LAUNCH` that pass compiles to nothing, and the three entry
+points `torch_bindings.cpp` calls —
+`launch_turboquant_reshape_and_cache_bf16`,
+`launch_turboquant_reshape_scatter_aiv` and
+`vllm_ascend::turboquant_mm_fused_decode_opt_raw_query_impl` — are simply absent.
+
+Nothing about the library looks wrong when that happens. It builds, the device
+merge succeeds, every kernel is present, and the generated
+`aclrtlaunch_turboquant_*` stubs are there too. The only symptom is an undefined
+reference at the *consumer's* link. A substring search does not catch it either,
+because `aclrtlaunch_turboquant_reshape_and_cache_bf16` contains
+`launch_turboquant_reshape_and_cache_bf16` — so check these symbols with an
+exact match, and demangle for the C++ one.
 
 Anything that launches a kernel needs a device, and the differential against the
 golden model for ingestion and decode numerics needs one too.
