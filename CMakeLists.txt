@@ -100,20 +100,40 @@ if(SOC_VERSION MATCHES "ascend950")
         ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/op_kernel/turboquant_reshape_scatter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/op_kernel/turboquant_fused_decode.cpp
     )
-    # TQ_GEMM_REDUCE selects the decode operator's reduction phase and is ON in
-    # the harness build and in its standalone project alike, so a wheel build
-    # compiles the same operator the harness verifies under that file name.
+    # ASCEND_MICRO_CANN_LAUNCH is NOT optional. Each of the three sources is
     #
-    # Two calls, and only ONE of them may be ascendc_compile_options: the device
-    # half of CANN's legacy module set APPENDS its options while the host half
+    #     #if defined(__CCE_AICORE__)      ... the device kernels ...
+    #     #elif defined(ASCEND_MICRO_CANN_LAUNCH)   ... the host launchers ...
+    #     #endif
+    #
+    # so the host compilation of the TU, which is the one that defines
+    # launch_turboquant_reshape_and_cache_bf16,
+    # launch_turboquant_reshape_scatter_aiv and
+    # turboquant_mm_fused_decode_opt_raw_query_impl, compiles to NOTHING without
+    # it. The library then still looks complete -- every device kernel is there
+    # and so is every generated aclrtlaunch_* stub, whose names contain the
+    # launcher names as substrings -- and torch_bindings.cpp fails to link with
+    # an undefined reference. Taken from the harness's own
+    # standalone/CMakeLists.txt, which is the authority on these flags.
+    #
+    # ASCEND_TQ_FUSED_DECODE_GEMM_REDUCE drives the decode's reduction with the
+    # Cube GEMM reducer (op_kernel/cube/turboquant_gemm_reduce_service.h) rather
+    # than TurboQuantPartialReducer. ON in the harness build and in its
+    # standalone project alike, so a wheel build compiles the same operator the
+    # harness verifies under that file name. The other two sources never
+    # reference it.
+    #
+    # TWO calls, and only ONE of them may be ascendc_compile_options: in CANN's
+    # legacy module set the device half APPENDS its options while the host half
     # ASSIGNS them, so a second ascendc_compile_options on this target would
     # silently discard the first call's -forward-options-to-host-compiler
-    # defines and leave the two compilations disagreeing about which macros are
-    # defined. The failure mode is an undefined reference to a host launcher
-    # whose aclrtlaunch_* symbol is present in the same .so.
-    ascendc_compile_definitions(vllm_ascend_turboquant PRIVATE TQ_GEMM_REDUCE=1)
+    # defines. Both defines therefore go in this one call.
+    ascendc_compile_definitions(vllm_ascend_turboquant PRIVATE
+        ASCEND_MICRO_CANN_LAUNCH ASCEND_TQ_FUSED_DECODE_GEMM_REDUCE=1)
     ascendc_compile_options(vllm_ascend_turboquant PRIVATE
-        -forward-options-to-host-compiler -DTQ_GEMM_REDUCE=1)
+        -forward-options-to-host-compiler
+        -DASCEND_MICRO_CANN_LAUNCH
+        -DASCEND_TQ_FUSED_DECODE_GEMM_REDUCE=1)
 endif()
 
 file(GLOB KERNEL_FILES
