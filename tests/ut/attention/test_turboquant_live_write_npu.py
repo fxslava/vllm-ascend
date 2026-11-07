@@ -21,11 +21,13 @@ or under pytest::
 
     pytest -sv tests/ut/attention/test_turboquant_live_write_npu.py
 
-The geometry is not negotiable. Both writers are specialised at compile time to
-``head_size == 256``; the batch writer additionally to 4 KV heads and to a
-16-token strip that fills one whole physical page, so it runs at
-``block_size == 16``. The scatter writer carries an in-page strip index and runs
-at any multiple of 16, so it is exercised at ``block_size == 64``.
+The geometry is only partly negotiable. Both writers are specialised at compile
+time to ``head_size == 256`` and to a 16-token strip, and the batch writer
+additionally to 4 KV heads. Neither is pinned to a page size any more: the batch
+writer gained an in-page strip offset, so both now take any ``block_size`` that
+is a multiple of 16, and both are exercised here at ``block_size == 64`` -- four
+strips to a page, which is the arrangement that would have silently overwritten
+itself before that offset existed.
 """
 
 from __future__ import annotations
@@ -40,7 +42,7 @@ import torch
 HEAD_SIZE = 256
 NUM_KV_HEADS = 4
 STRIP = 16
-PREFILL_BLOCK_SIZE = 16
+PREFILL_BLOCK_SIZE = 64
 DECODE_BLOCK_SIZE = 64
 NUM_BLOCKS = 8
 NAMESPACE = "turboquant_ops"
@@ -157,16 +159,22 @@ def _adapters(stage, layout):
 
 
 def _slot_mapping_prefill(num_strips: int, generator: torch.Generator) -> torch.Tensor:
-    """Whole 16-token strips on random distinct pages, consecutive within a strip.
+    """Whole 16-token strips at random distinct STRIP slots, consecutive within a strip.
 
-    The batch writer reads one slot per strip on the scalar unit and derives the
-    page from it, so within a strip the slots must be ``slot_mapping[0] + i``
-    with ``slot_mapping[0]`` a multiple of ``block_size``. Which page each strip
-    lands on is free, and is randomised here.
+    The batch writer reads one slot per strip on the scalar unit and derives both
+    the page and the strip inside it from that slot, so within a strip the slots
+    must be ``slot_mapping[0] + i`` with ``slot_mapping[0]`` a multiple of 16.
+    Which strip of which page it lands on is free.
+
+    Randomising over strips rather than over pages is the point at
+    ``block_size 64``: several strips of one page get picked, which is exactly
+    what the old writer got wrong -- every strip of a page computed the same
+    base and overwrote the others.
     """
-    pages = torch.randperm(NUM_BLOCKS, generator=generator)[:num_strips]
+    total_strips = NUM_BLOCKS * PREFILL_BLOCK_SIZE // STRIP
+    chosen = torch.randperm(total_strips, generator=generator)[:num_strips]
     within = torch.arange(STRIP, dtype=torch.int32)
-    return (pages.to(torch.int32).unsqueeze(1) * PREFILL_BLOCK_SIZE + within).reshape(-1)
+    return (chosen.to(torch.int32).unsqueeze(1) * STRIP + within).reshape(-1)
 
 
 def _slot_mapping_decode(num_tokens: int, generator: torch.Generator) -> torch.Tensor:
@@ -195,6 +203,41 @@ def _compare(kernel_caches, golden_caches) -> None:
 # ---------------------------------------------------------------------------
 # 1. The prefill batch writer, block_size 16
 # ---------------------------------------------------------------------------
+
+
+@requires_npu
+@_requires_op(PREFILL_OP)
+def test_the_batch_writer_fills_every_strip_of_one_page() -> None:
+    """All four strips of a single page, which is the in-page offset's regression.
+
+    Before `run_vector_core` derived `strip_in_block`, every one of these four
+    blocks computed the same page base and wrote over the previous one: the cache
+    came out holding only the last strip, with every other byte of the page
+    still zero and no check anywhere failing.
+    """
+    TurboQuantEmulator, TurboQuantKernelStage, _, _, _ = _import_backend()
+    emulator = TurboQuantEmulator(head_size=HEAD_SIZE, device=DEVICE)
+    kernel_adapter, golden_adapter = _adapters(TurboQuantKernelStage.RESHAPE_AND_CACHE, None)
+
+    strips_per_page = PREFILL_BLOCK_SIZE // STRIP
+    key, value = _activations(PREFILL_BLOCK_SIZE, DEVICE, seed=1500)
+    # Page 3, every strip of it, in order.
+    slot_mapping = (3 * PREFILL_BLOCK_SIZE + torch.arange(PREFILL_BLOCK_SIZE, dtype=torch.int32)).to(DEVICE)
+
+    on_npu = _caches(PREFILL_BLOCK_SIZE, DEVICE)
+    on_golden = _caches(PREFILL_BLOCK_SIZE, DEVICE)
+    kernel_adapter.reshape_and_cache_prefill(key, value, *on_npu, slot_mapping, emulator)
+    golden_adapter.reshape_and_cache_prefill(key, value, *on_golden, slot_mapping, emulator)
+    torch.npu.synchronize()
+    _compare(on_npu, on_golden)
+
+    # And the whole page really was written, not just one strip of it.
+    page = on_npu[0][3].cpu()
+    for strip in range(strips_per_page):
+        rows = page[strip * STRIP : (strip + 1) * STRIP]
+        assert not torch.equal(rows, torch.zeros_like(rows)), (
+            f"strip {strip} of the page is still zero: the in-page offset did not take effect"
+        )
 
 
 @requires_npu

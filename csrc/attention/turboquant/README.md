@@ -74,19 +74,26 @@ the harness's Phase 1 position rather than anything introduced here.
 
 * The **two writers** produce the strip cache: page axis
   `(num_blocks, num_kv_heads, block_size, head_size / 2)`, key nibble
-  `token * head_size + channel`, value nibble `channel * block_size + token`,
-  and `block_size == 16` because a prefill strip fills one whole physical page.
+  `token * head_size + channel`, value nibble
+  `(token / 16) * (16 * head_size) + channel * 16 + (token % 16)` —
+  channel-major *inside a 16-token strip*. Both take any `block_size` that is a
+  multiple of 16.
 * The **fused decode** reads the NZ-tiled cache of
   `NzTiledPackedByte()` in `op_kernel/common/turboquant_layout.h`:
   `[64-row tile][kv head][32-byte column group][tile row][byte]`, and its
   closed-form tile cursor needs `block_size` to be a power-of-two multiple of
   64.
 
-There is no `block_size` satisfying both, so no single vLLM KV cache can be
-written by these writers and read by this decode. Each op `TORCH_CHECK`s its own
-`block_size` with a message naming the conflict, so the mismatch is a refused
-launch rather than an attention over bytes in the wrong order. Merging the
-formats is kernel work in the harness.
+So the two can now share a `block_size` — 64 or 128 — but not a layout, and the
+obstacle is numerical rather than dimensional. A byte of the strip plane holds
+ONE channel at TWO tokens; a byte of the NZ plane holds ONE token at channels
+`col` and `col + 128`. That is a different pairing of nibbles into bytes, not a
+permutation of bytes, so no reordering reconciles them: at `block_size` 64 both
+occupy the same 8192 bytes per (tile, kv head) and zero of those bytes hold the
+same pair. Each op therefore `TORCH_CHECK`s its own addressing and the mismatch
+cannot be expressed as a shape check at all — switching on both ingestion and
+decode kernels over one cache would pass every check and attend over the wrong
+tokens. Merging the formats is kernel work in the harness.
 
 The Python side knows about the writers' layout: `TurboQuantValueLayout` and
 `TurboQuantOpsAdapter.value_layout()` derive it from which writer owns the page,

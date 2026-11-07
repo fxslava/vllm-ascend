@@ -246,12 +246,13 @@ inline bool validate_slots()
 
 // The batch writer's slot contract, checked only under the env above.
 //
-// Each strip's first slot is read on the scalar unit and the page and in-page
-// offset are derived from it, so a strip whose slots are not strip-aligned and
-// consecutive silently writes the wrong place rather than failing. Alignment is
-// also what keeps a strip inside one page: with `first % kTokensPerStrip == 0`
-// and `block_size % kTokensPerStrip == 0` the strip's 16 tokens cannot straddle
-// a block boundary, so no separate crossing check is needed.
+// Each strip's first slot is read on the scalar unit and both the page and the
+// strip inside it are derived from it, so a strip whose slots are not
+// strip-aligned and consecutive silently writes the wrong place rather than
+// failing. Alignment is also what keeps a strip inside one page: with
+// `first % kTokensPerStrip == 0` and `block_size % kTokensPerStrip == 0` the
+// strip's 16 tokens cannot straddle a block boundary, so no separate crossing
+// check is needed.
 inline void check_strip_slots(const at::Tensor &slot_mapping, const std::int64_t num_tokens, const char *op)
 {
     if (!validate_slots()) {
@@ -314,18 +315,16 @@ void npu_turboquant_reshape_and_cache_a8(at::Tensor &key, at::Tensor &value, at:
     // kTokens == blockSize in the kernel: a prefill strip fills one whole
     // physical page, and the value plane's channel-major nibble index
     // `channel * block_size + token` is what makes that a 2048-byte burst.
-    // This writer, unlike the scatter writer, has NO in-page row offset. Its
-    // only address is a page base -- `page_bytes = (slot0 / block_size) *
-    // num_kv_heads * head_bytes` with `head_bytes = block_size * head_size / 2`
-    // -- and `StoreChunk` writes its 2048-byte strip at
-    // `page_bytes + head * head_bytes`
-    // (op_kernel/turboquant_reshape_batch.cpp, the VectorEngine setup and
-    // StoreChunk). So at block_size 64 all four strips of a page would compute
-    // the same base and overwrite each other. The strip has to BE the page.
-    TORCH_CHECK(c.block_size == kTokensPerStrip, op, ": this writer places a strip at the page base with no "
-                "in-page offset, so block_size must be ", kTokensPerStrip, ", got ", c.block_size,
-                ". Use npu_turboquant_reshape_scatter_aiv for a larger page: it carries an in-page strip "
-                "index and this kernel does not.");
+    // Any whole number of strips per page, same as the scatter writer. This one
+    // used to need block_size == 16: its only address was a page base, so at
+    // block_size 64 all four strips of a page computed the same base and
+    // overwrote each other. `run_vector_core` derives `strip_in_block =
+    // (slot0 % block_size) / kTokens` now and offsets both the packed base and
+    // the two scale bases by it, so a page may hold as many strips as it likes
+    // (op_kernel/turboquant_reshape_batch.cpp, the VectorEngine setup).
+    TORCH_CHECK(c.block_size % kTokensPerStrip == 0, op, ": the strip cache is written ", kTokensPerStrip,
+                " tokens at a time, so block_size must be a multiple of ", kTokensPerStrip, ", got ",
+                c.block_size);
 
     check_burst_aligned(key, op, "key");
     check_burst_aligned(value, op, "value");

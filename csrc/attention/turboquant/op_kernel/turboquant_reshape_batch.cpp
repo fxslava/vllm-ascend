@@ -18,7 +18,7 @@
 // --------------------------
 //   * ragged multi-core tiling. Each block owns one aligned 16-token strip;
 //     the launcher uses numTokens / tokensPerCore blocks.
-//   * ragged shapes. numTokens == blockSize == 16, headSize == 256 and
+//   * ragged shapes. headSize == 256 and
 //     numKvHeads == 4 are compile-time constants (kTokens, kHeadSize,
 //     kHeads); the scalar arguments drive the physical cache addressing only.
 //   * a non-page-aligned slot mapping: the strip must occupy one whole
@@ -159,8 +159,13 @@
 // ----------------
 //   keyCache   key-major. Within the (block, head) page the nibble index is
 //              key * headSize + d, so one chunk is 2048 contiguous bytes.
-//   valueCache channel-major. Within the (block, head) page the nibble index
-//              is ch * blockSize + key, so one chunk is 2048 contiguous bytes.
+//   valueCache channel-major INSIDE A STRIP. Within the (block, head) page the
+//              nibble index is (key / kTokens) * (kTokens * headSize)
+//              + ch * kTokens + (key % kTokens), so one chunk is 2048
+//              contiguous bytes. At blockSize == kTokens that is the
+//              ch * blockSize + key this file used to state; the general form
+//              is what turboquant_reshape_scatter.cpp writes, and the two
+//              writers agree at every blockSize.
 //   scaleCache per (kv, block, head) a contiguous run of blockSize FP32, one
 //              scale per token: index
 //              ((kv * numBlocks + block) * numKvHeads + head) * blockSize + key
@@ -201,8 +206,10 @@
 //
 // Slot mapping contract
 // ---------------------
-// A prefill strip fills one whole physical page: slotMapping[i] must equal
-// slotMapping[0] + i and slotMapping[0] must be a multiple of blockSize. The
+// A prefill strip fills one whole STRIP of a physical page: slotMapping[i] must
+// equal slotMapping[0] + i and slotMapping[0] must be a multiple of kTokens.
+// It used to have to be a multiple of blockSize, because the write had no
+// in-page offset; run_vector_core derives one from slotMapping[0] now. The
 // kernel reads slotMapping[0] once, on the scalar unit, before the pipeline
 // starts; that is a scalar read of caller-supplied Global Memory metadata, the
 // same category as the online-softmax leaf's GM-resident index vector, and not
@@ -312,7 +319,7 @@
 namespace turboquant_bf16 {
 
 // ------------------------------------------------------------ strip geometry
-constexpr std::uint32_t kTokens = 16;   // tokens per strip == blockSize
+constexpr std::uint32_t kTokens = 16;   // tokens per strip; blockSize is a multiple of it
 constexpr std::uint32_t kHeads = 4;     // numKvHeads
 constexpr std::uint32_t kHeadSize = 256;
 constexpr std::uint32_t kGroup = 32;    // channels per Cube group == INT8 K0
@@ -1370,20 +1377,33 @@ __aicore__ inline void run_vector_core(__gm__ std::int8_t* key_cache,
                                        float inv_sqrt_len)
 {
     // One scalar read of caller-supplied Global Memory metadata, before the
-    // pipeline. A prefill strip fills one whole page, so the page index is all
-    // the schedule needs and no stage reads the mapping again.
+    // pipeline. The page index and the strip inside it both come out of that
+    // one slot, so no stage reads the mapping again.
     const std::uint32_t slot0 = static_cast<std::uint32_t>(slot_mapping[0]);
     const std::uint32_t block = slot0 / block_size;
     const std::uint32_t head_bytes = block_size * head_size / 2u;
+    // Which strip of the page this block owns. A page holds block_size /
+    // kTokens strips, and before this existed every one of them computed the
+    // same base and overwrote the others -- so the writer only ever worked at
+    // block_size == kTokens. The offset is kPackedBytes for BOTH planes, which
+    // is the part worth knowing: the key plane is token-major, so tokens
+    // 16s..16s+15 start at byte s * kPackedBytes of the (block, head) region,
+    // and the value plane's strip base (strip * kTokens * headSize nibbles) is
+    // the same byte. One expression serves both.
+    const std::uint32_t strip_in_block = (slot0 % block_size) / kTokens;
 
     VectorEngine engine;
     engine.key_cache.SetGlobalBuffer(key_cache);
     engine.value_cache.SetGlobalBuffer(value_cache);
     engine.scale_cache.SetGlobalBuffer(scale_cache);
-    engine.page_bytes = block * num_kv_heads * head_bytes;
+    engine.page_bytes = block * num_kv_heads * head_bytes + strip_in_block * kPackedBytes;
     engine.head_bytes = head_bytes;
-    engine.key_scale = block * num_kv_heads * block_size;
-    engine.value_scale = (num_blocks + block) * num_kv_heads * block_size;
+    // StoreChunk lands kScaleFloats == kTokens floats at `*_scale + head *
+    // head_scale`, so the strip's own tokens are at + strip_in_block * kTokens:
+    // ((kv * numBlocks + block) * numKvHeads + head) * blockSize + key.
+    engine.key_scale = block * num_kv_heads * block_size + strip_in_block * kTokens;
+    engine.value_scale =
+        (num_blocks + block) * num_kv_heads * block_size + strip_in_block * kTokens;
     engine.head_scale = block_size;
     engine.inv_sqrt_len = inv_sqrt_len;
 
