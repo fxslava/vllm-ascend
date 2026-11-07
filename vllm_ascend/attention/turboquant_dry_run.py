@@ -27,12 +27,17 @@ kernel's *arithmetic contract* -- the same rotation, the same power-of-two
 scale, the same nibble packing, the same cache byte layout -- so a dry run
 exercises the real quantisation error and the real cache geometry, just slowly.
 
-It is deliberately **not** a monolith. Every stage goes through
-:class:`TurboQuantOpsAdapter`, which per stage either calls the C++ binding
-(once it exists and the stage is switched on) or falls back to
-:class:`TurboQuantEmulator`. Progressive replacement is therefore one stage at
-a time, with the remaining stages still emulated -- which is also how a newly
-landed kernel gets differentially diffed against its own model.
+It is deliberately **not** a monolith. Every operation goes through
+:class:`TurboQuantOpsAdapter`, which dispatches it either to a ``_kernel_*``
+entry point -- whose parameter list is the staged C launcher's, and which is a
+stub until the ``TORCH_LIBRARY_FRAGMENT`` lands -- or to the ``_golden_*``
+PyTorch reference built on :class:`TurboQuantEmulator`. Progressive replacement
+is therefore one stage at a time, with the rest still golden, which is also how
+a newly landed kernel gets differentially diffed against its own model.
+
+Ingestion is two kernels, not one, and the phase decides which: a prefill step
+hands whole page strips to the batch writer, a decode step hands one token per
+request to the AIV scatter writer.
 
 The arithmetic contract
 -----------------------
@@ -209,6 +214,23 @@ class TurboQuantValueLayout(str, Enum):
     CHANNEL_MAJOR = "channel_major"
 
 
+class TurboQuantIngestionPhase(str, Enum):
+    """Which of the two cache writers owns a step's K/V.
+
+    ``PREFILL`` -- more tokens than requests, so a request contributes a run of
+    tokens. The staged batch writer takes whole physical pages and is the only
+    writer that may assume ``slot_mapping`` is one page-aligned contiguous
+    strip.
+
+    ``DECODE``  -- one token per request. The staged AIV scatter writer takes
+    arbitrary slots, one token at a time, and is the only one a per-token write
+    is sound in.
+    """
+
+    PREFILL = "prefill"
+    DECODE = "decode"
+
+
 @dataclass(frozen=True)
 class TurboQuantOpsConfig:
     """Which stages are kernel-backed, and where the kernels live."""
@@ -223,7 +245,7 @@ class TurboQuantOpsConfig:
 
         ``TURBOQUANT_KERNEL_STAGES`` is a comma-separated list of
         :class:`TurboQuantKernelStage` values, or ``all``, or ``none`` -- the
-        default, because no kernel is registered yet, so everything is emulated.
+        default, because no kernel is registered yet, so every operation is golden.
         """
         raw = os.getenv(TURBOQUANT_STAGES_ENV, "none").strip().lower()
         if raw in ("", "none", "0", "off"):
@@ -463,23 +485,69 @@ class TurboQuantEmulator:
 
 
 # ---------------------------------------------------------------------------
-# The adapter: one seam per kernel.
+# The kernel entry points and their golden models.
 # ---------------------------------------------------------------------------
+
+# ``TurboQuantMode`` (op_kernel/common/turboquant_mode.h). KV4_FP8 is the only
+# mode the staged fused decode is validated in.
+TURBOQUANT_MODE_KV4_FP8: Final[int] = 4
+
+# ``vllm_ascend::AscendType``, which ``Launch::element_type`` carries: the QUERY
+# and OUTPUT element type, never the cache format.
+TURBOQUANT_ELEMENT_FP16: Final[int] = 0
+TURBOQUANT_ELEMENT_BF16: Final[int] = 1
+
+# ``TurboQuantOutputStage`` (op_kernel/common/turboquant_layout.h): where a
+# rotation leaves its result. 0 is the rotated basis (ingress, ``Pi``), 1 is the
+# model's own basis (egress, ``Pi^T / sqrt(D)``), 2 also divides by
+# ``1 + exp(-gate)`` and is the only stage besides 1 that reads the gate buffer.
+TURBOQUANT_STAGE_ROTATED_BASIS: Final[int] = 0
+TURBOQUANT_STAGE_UNROTATED: Final[int] = 1
+TURBOQUANT_STAGE_GATED: Final[int] = 2
+
+# The order of the Cube's resident ``h16`` sign matrix, the product of four
+# Sylvester butterfly factors (routines/routine_cube_hadamard16.hpp). It is fp16
+# for both element types: its entries are +-1 and the kernel converts it on
+# ingest where the Cube chunk operand is not fp16.
+TURBOQUANT_H16_ORDER: Final[int] = 16
+
+# The kernel entry points, as op_adapter/turboquant_torch_adpt.h declares them.
+TURBOQUANT_OP_ROTATE: Final[str] = "npu_turboquant_rotate"
+TURBOQUANT_OP_QUANTIZE_PACK: Final[str] = "npu_turboquant_quantize_pack"
+TURBOQUANT_OP_UNPACK_DEQUANT: Final[str] = "npu_turboquant_unpack_dequant"
+TURBOQUANT_OP_RESHAPE_AND_CACHE: Final[str] = "npu_turboquant_reshape_and_cache_a8"
+TURBOQUANT_OP_RESHAPE_SCATTER: Final[str] = "npu_turboquant_reshape_scatter_aiv"
+TURBOQUANT_OP_GATHER_PAGES: Final[str] = "npu_turboquant_gather_pages"
+TURBOQUANT_OP_FUSED_DECODE: Final[str] = "npu_turboquant_fused_decode"
+
+# Which stage switch gates each entry point. The two ingestion entries are
+# gated apart because they are two kernels: the batch writer owns whole
+# physical pages and the AIV scatter writer owns one token.
+TURBOQUANT_KERNEL_OPS: Final[dict[str, TurboQuantKernelStage]] = {
+    TURBOQUANT_OP_ROTATE: TurboQuantKernelStage.ROTATE,
+    TURBOQUANT_OP_QUANTIZE_PACK: TurboQuantKernelStage.QUANTIZE,
+    TURBOQUANT_OP_UNPACK_DEQUANT: TurboQuantKernelStage.DEQUANTIZE,
+    TURBOQUANT_OP_RESHAPE_AND_CACHE: TurboQuantKernelStage.RESHAPE_AND_CACHE,
+    TURBOQUANT_OP_RESHAPE_SCATTER: TurboQuantKernelStage.SCATTER,
+    TURBOQUANT_OP_GATHER_PAGES: TurboQuantKernelStage.GATHER,
+    TURBOQUANT_OP_FUSED_DECODE: TurboQuantKernelStage.DECODE,
+}
 
 
 class TurboQuantOpsAdapter:
-    """Per-stage dispatch between the C++ kernels and the PyTorch fallback.
+    """The seam between the TurboQuant NPU kernels and their PyTorch reference.
 
-    Every stage of the TurboQuant path is a method here, and every method has
-    the same shape: look the kernel up for this stage; if it is switched on and
-    registered, call it; otherwise run the emulation. A kernel is therefore
-    adopted by flipping one stage in :class:`TurboQuantOpsConfig` -- no backend
-    code changes -- and a suspect kernel is bisected by flipping it back.
+    Every operation is a two-branch method: :meth:`_has_kernel` decides, and the
+    branches are a ``_kernel_*`` entry point whose parameter list is the staged
+    C launcher's, and a ``_golden_*`` PyTorch implementation that is the only
+    path a dry run takes today. Adopting a kernel is one stage flip in
+    :class:`TurboQuantOpsConfig`; bisecting a suspect one is the flip back.
 
-    The expected kernel signatures below are the staging subtree's C ABIs
-    (``op_adapter/turboquant_torch_adpt.h``) lifted to Torch schemas. They are
-    provisional until the ``TORCH_LIBRARY_FRAGMENT`` lands, which is what every
-    ``TODO: Replace with C++ binding`` marks.
+    The entry points are the declaration surface of
+    ``kernels/ops/turboquant/vllm_integration_layer/op_adapter`` in the
+    ascend-micro-harness. Nothing registers them yet -- that subtree is a symbol
+    inventory -- so every ``_kernel_*`` body here is the call it will make, and
+    the arguments nothing on the Python side builds yet are passed as ``None``.
     """
 
     def __init__(
@@ -506,138 +574,377 @@ class TurboQuantOpsAdapter:
             self._emulators[key] = emulator
         return emulator
 
-    def _kernel(self, stage: TurboQuantKernelStage, name: str) -> Callable[..., Any] | None:
-        """The registered kernel for ``stage``, or ``None`` to emulate it.
+    def _resolve_kernel(self, op_name: str) -> Callable[..., Any] | None:
+        """The registered entry point for ``op_name``, or ``None`` to run golden.
 
         A stage switched on whose kernel is not registered is a configuration
-        error the caller can survive, so it warns once and emulates rather than
-        raising: a dry run that dies on a missing kernel tells you nothing you
-        did not already know.
+        error the caller can survive, so it warns once and falls back: a dry run
+        that dies on a missing kernel tells you nothing you did not know.
         """
-        if not self.config.enables(stage):
+        if not self.config.enables(TURBOQUANT_KERNEL_OPS[op_name]):
             return None
         namespace = getattr(torch.ops, self.config.ops_namespace, None)
-        kernel = getattr(namespace, name, None) if namespace is not None else None
+        kernel = getattr(namespace, op_name, None) if namespace is not None else None
         if kernel is None:
-            if name not in self._missing_kernels:
-                self._missing_kernels.add(name)
+            if op_name not in self._missing_kernels:
+                self._missing_kernels.add(op_name)
                 logger.warning(
                     "TurboQuant stage %s is switched on but torch.ops.%s.%s is not registered; "
-                    "falling back to the PyTorch emulation.",
-                    stage.value,
+                    "falling back to the PyTorch golden model.",
+                    TURBOQUANT_KERNEL_OPS[op_name].value,
                     self.config.ops_namespace,
-                    name,
+                    op_name,
                 )
             return None
         return kernel
 
-    # -- stage: rotation ---------------------------------------------------
+    def _has_kernel(self, op_name: str) -> bool:
+        """Whether ``op_name`` runs on the NPU for this configuration."""
+        return self._resolve_kernel(op_name) is not None
+
+    def _require_kernel(self, op_name: str) -> Callable[..., Any]:
+        """The entry point, for a ``_kernel_*`` body :meth:`_has_kernel` cleared."""
+        kernel = self._resolve_kernel(op_name)
+        if kernel is None:
+            raise RuntimeError(f"torch.ops.{self.config.ops_namespace}.{op_name} is not registered")
+        return kernel
+
+    # -- rotation ----------------------------------------------------------
 
     def rotate(self, x: torch.Tensor, emulator: TurboQuantEmulator) -> torch.Tensor:
-        """Ingress rotation of an activation panel: ``[..., D] -> [..., D]`` fp32."""
-        kernel = self._kernel(TurboQuantKernelStage.ROTATE, "npu_turboquant_rotate")
-        if kernel is not None:
-            # TODO: Replace with C++ binding once the staging subtree registers
-            # its Torch schema. Expected:
-            #   npu_turboquant_rotate(Tensor x, Tensor pi_signs, Tensor rot_tables,
-            #                         Tensor h16, int direction, float scale) -> Tensor
-            # direction 0 = Egress (Pi^T), 1 = Ingress (Pi); see
-            # rot_oracle::Direction in tests/common/rotate_butterfly_oracle.hpp.
-            return kernel(x, emulator.pi_signs, direction=1, scale=1.0)
-        return emulator.rotate(x)
+        """Ingress rotation ``y = Pi x`` over the last axis: ``[..., D] -> [..., D]`` fp32."""
+        if self._has_kernel(TURBOQUANT_OP_ROTATE):
+            return self._kernel_rotate(
+                x=x,
+                pi_signs=emulator.pi_signs,
+                rot_tables=_codec_tables(emulator),
+                h16=_h16_operand(emulator.device),
+                output_stage=TURBOQUANT_STAGE_ROTATED_BASIS,
+                inv_sqrt_len=1.0,
+            )
+        return self._golden_rotate(x, emulator)
 
     def inverse_rotate(self, y: torch.Tensor, emulator: TurboQuantEmulator) -> torch.Tensor:
-        """Egress rotation, ``Pi^T y / sqrt(D)``: the un-rotation of a dequantised panel."""
-        kernel = self._kernel(TurboQuantKernelStage.ROTATE, "npu_turboquant_rotate")
-        if kernel is not None:
-            # TODO: Replace with C++ binding (same schema, direction 0). The
-            # kernel carries 1/sqrt(D) in its scale argument.
-            return kernel(y, emulator.pi_signs, direction=0, scale=emulator.inv_sqrt_len)
+        """Egress rotation ``x = Pi^T y / sqrt(D)``: ``[..., D] -> [..., D]`` fp32."""
+        if self._has_kernel(TURBOQUANT_OP_ROTATE):
+            return self._kernel_rotate(
+                x=y,
+                pi_signs=emulator.pi_signs,
+                rot_tables=_codec_tables(emulator),
+                h16=_h16_operand(emulator.device),
+                output_stage=TURBOQUANT_STAGE_UNROTATED,
+                inv_sqrt_len=emulator.inv_sqrt_len,
+            )
+        return self._golden_inverse_rotate(y, emulator)
+
+    def _kernel_rotate(
+        self,
+        x: torch.Tensor,
+        pi_signs: torch.Tensor,
+        rot_tables: torch.Tensor,
+        h16: torch.Tensor,
+        output_stage: int,
+        inv_sqrt_len: float,
+    ) -> torch.Tensor:
+        """The butterfly cascade: ``[..., D]`` in, ``[..., D]`` fp32 out.
+
+        No standalone C launcher stages the rotation. It is the fused decode's
+        prologue -- ``RawQueryBuffers::{pi_signs, rot_tables, h16}`` plus
+        ``Launch::output_stage``, over
+        op_kernel/vector/routine_vector_rotate_butterfly.hpp -- and it is inside
+        both cache writers. ``output_stage`` picks the stage order, which is what
+        makes the pair ``Pi`` and ``Pi^T`` rather than an involution;
+        ``inv_sqrt_len`` is applied by the egress direction only.
+        """
+        return self._require_kernel(TURBOQUANT_OP_ROTATE)(x, pi_signs, rot_tables, h16, output_stage, inv_sqrt_len)
+
+    def _golden_rotate(self, x: torch.Tensor, emulator: TurboQuantEmulator) -> torch.Tensor:
+        """``y = Pi x``, unnormalised fp32: the quantiser reads this exponent."""
+        return emulator.rotate(x)
+
+    def _golden_inverse_rotate(self, y: torch.Tensor, emulator: TurboQuantEmulator) -> torch.Tensor:
+        """``x = Pi^T y / sqrt(D)``, fp32: with the stored scale's fold, ``Pi^T Pi / D == I``."""
         return emulator.inverse_rotate(y)
 
-    def rotate_query(self, query: torch.Tensor, emulator: TurboQuantEmulator) -> torch.Tensor:
-        """Rotate the decode query into the cache's basis, fp32.
-
-        Unused by the dequantising dry-run decode, which stays in the model's
-        basis. It exists because the fused decode kernel takes a *raw* query and
-        rotates it in its prologue, so a staged bring-up wants the two bases
-        side by side: ``Pi q . Pi k == D q . k``.
-        """
-        kernel = self._kernel(TurboQuantKernelStage.ROTATE, "npu_turboquant_rotate_q")
-        if kernel is not None:
-            # TODO: Replace with C++ binding. Expected:
-            #   npu_turboquant_rotate_q(Tensor query, Tensor pi_signs, Tensor rot_tables,
-            #                           Tensor h16) -> Tensor   # fp32 out
-            return kernel(query, emulator.pi_signs)
-        return emulator.rotate(query)
-
-    # -- stage: quantisation ----------------------------------------------
+    # -- quantisation and packing ------------------------------------------
 
     def quantize_and_pack(
         self, rotated: torch.Tensor, emulator: TurboQuantEmulator
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """``[..., D]`` rotated fp32 -> ``([..., D/2]`` INT8 bytes, ``[...]`` fp32 scales)."""
-        kernel = self._kernel(TurboQuantKernelStage.QUANTIZE, "npu_turboquant_quantize_pack")
-        if kernel is not None:
-            # TODO: Replace with C++ binding. Expected:
-            #   npu_turboquant_quantize_pack(Tensor rotated, float inv_sqrt_len)
-            #       -> (Tensor packed_int8, Tensor scales_fp32)
-            return kernel(rotated, emulator.inv_sqrt_len)
-        codes, scales = emulator.quantize(rotated)
-        return emulator.pack(codes), scales
+        """``[..., D]`` rotated fp32 -> (``[..., D/2]`` INT8 bytes, ``[...]`` fp32 scales)."""
+        if self._has_kernel(TURBOQUANT_OP_QUANTIZE_PACK):
+            return self._kernel_quantize_pack(rotated=rotated, inv_sqrt_len=emulator.inv_sqrt_len)
+        return self._golden_quantize_pack(rotated, emulator)
 
     def unpack_and_dequantize(
         self, packed: torch.Tensor, scales: torch.Tensor, emulator: TurboQuantEmulator
     ) -> torch.Tensor:
-        """``([..., D/2]`` bytes, ``[...]`` scales) -> ``[..., D]`` fp32, still rotated."""
-        kernel = self._kernel(TurboQuantKernelStage.DEQUANTIZE, "npu_turboquant_unpack_dequant")
-        if kernel is not None:
-            # TODO: Replace with C++ binding. Expected:
-            #   npu_turboquant_unpack_dequant(Tensor packed, Tensor scales) -> Tensor
-            return kernel(packed, scales)
+        """(``[..., D/2]`` bytes, ``[...]`` fp32 scales) -> ``[..., D]`` fp32, still rotated."""
+        if self._has_kernel(TURBOQUANT_OP_UNPACK_DEQUANT):
+            return self._kernel_unpack_dequant(packed=packed, scales=scales)
+        return self._golden_unpack_dequant(packed, scales, emulator)
+
+    def _kernel_quantize_pack(self, rotated: torch.Tensor, inv_sqrt_len: float) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-row INT4 quantisation and nibble packing of a rotated panel.
+
+        No standalone C launcher: the codec is inside both cache writers
+        (op_kernel/common/turboquant_codec.h). ``inv_sqrt_len`` is the fold the
+        stored fp32 scale carries, so the egress un-rotation does not repeat it.
+        """
+        return self._require_kernel(TURBOQUANT_OP_QUANTIZE_PACK)(rotated, inv_sqrt_len)
+
+    def _kernel_unpack_dequant(self, packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+        """Nibble unpack and dequantisation: ``[..., D/2]`` bytes -> ``[..., D]`` fp32.
+
+        No standalone C launcher: the decoder is
+        op_kernel/common/routine_turboquant_dequant4.hpp, which the fused decode
+        reads through UB rather than materialising.
+        """
+        return self._require_kernel(TURBOQUANT_OP_UNPACK_DEQUANT)(packed, scales)
+
+    def _golden_quantize_pack(
+        self, rotated: torch.Tensor, emulator: TurboQuantEmulator
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``[..., D]`` fp32 -> (``[..., D/2]`` INT8, ``[...]`` fp32), one scale per row."""
+        codes, scales = emulator.quantize(rotated)
+        return emulator.pack(codes), scales
+
+    def _golden_unpack_dequant(
+        self, packed: torch.Tensor, scales: torch.Tensor, emulator: TurboQuantEmulator
+    ) -> torch.Tensor:
+        """(``[..., D/2]`` INT8, ``[...]`` fp32) -> ``[..., D]`` fp32, in the rotated basis."""
         return emulator.dequantize(emulator.unpack(packed), scales)
 
-    # -- stage: the cache write -------------------------------------------
+    # -- ingestion: the prefill batch writer -------------------------------
 
-    def scatter(
+    def reshape_and_cache_prefill(
         self,
-        packed_key: torch.Tensor,
-        key_scales: torch.Tensor,
-        packed_value: torch.Tensor,
-        value_scales: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
         scale_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
+        emulator: TurboQuantEmulator,
     ) -> None:
-        """Scatter packed nibbles and fp32 scales into the physical block cache.
+        """Ingest a contiguous batch of ``[T, H, D]`` K/V into whole cache pages.
 
-        ``packed_*`` are ``[T, H, D/2]`` INT8, ``*_scales`` ``[T, H]`` fp32, and
-        ``slot_mapping`` ``[T]`` int32 of ``page * block_size + token``. Negative
-        slots are padding and are skipped, which is what a graph-capture dummy
-        run feeds.
+        The prefill phase. ``slot_mapping`` is ``[T]`` int32 of
+        ``page * block_size + token``, and the staged batch writer additionally
+        requires ``slot_mapping[i] == slot_mapping[0] + i`` with
+        ``slot_mapping[0]`` a multiple of ``block_size``, so that one strip fills
+        one physical page. The golden model does not enforce that: it is the
+        kernel's precondition, not the codec's.
         """
-        kernel = self._kernel(TurboQuantKernelStage.SCATTER, "npu_turboquant_reshape_scatter_aiv")
-        if kernel is not None:
-            # TODO: Replace with C++ binding. The staged C launcher is
-            #   launch_turboquant_reshape_scatter_aiv(stream, block_dim, key, value,
-            #       key_cache, value_cache, scale_cache, slot_mapping, pi_signs,
-            #       cu_seqlens, launch_probe, num_requests, num_kv_heads, head_size,
-            #       block_size, num_blocks, item_begin, item_count, inv_sqrt_len)
-            # i.e. the kernel rotates and quantises inside the scatter; this seam
-            # therefore disappears into reshape_and_cache() once it lands.
-            kernel(
-                packed_key,
-                key_scales,
-                packed_value,
-                value_scales,
-                key_cache,
-                value_cache,
-                scale_cache,
-                slot_mapping,
+        if self._has_kernel(TURBOQUANT_OP_RESHAPE_AND_CACHE):
+            self._kernel_reshape_and_cache_a8(
+                key=key,
+                value=value,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                scale_cache=scale_cache,
+                slot_mapping=slot_mapping,
+                pi_signs=emulator.pi_signs,
+                tables=_codec_tables(emulator),
+                num_tokens=key.shape[0],
+                num_kv_heads=key.shape[1],
+                head_size=key.shape[2],
+                block_size=key_cache.shape[1],
+                num_blocks=key_cache.shape[0],
+                tokens_per_core=None,
+                inv_sqrt_len=emulator.inv_sqrt_len,
+                reuse_mode4_flags=True,
             )
             return
+        self._golden_reshape_and_cache_prefill(key, value, key_cache, value_cache, scale_cache, slot_mapping, emulator)
 
+    def _kernel_reshape_and_cache_a8(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        scale_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        pi_signs: torch.Tensor,
+        tables: torch.Tensor,
+        num_tokens: int,
+        num_kv_heads: int,
+        head_size: int,
+        block_size: int,
+        num_blocks: int,
+        tokens_per_core: int | None,
+        inv_sqrt_len: float,
+        reuse_mode4_flags: bool,
+    ) -> None:
+        """The batch writer: rotate, quantise, pack and write whole pages.
+
+        Parameter for parameter ``launch_turboquant_reshape_and_cache_bf16``
+        (op_kernel/turboquant_reshape_batch.cpp) without its stream. ``key`` and
+        ``value`` are ``[T, H, D]`` activations; ``key_cache`` and
+        ``value_cache`` are ``(num_blocks, block_size, H, D/2)`` INT8 and
+        ``scale_cache`` is ``(2, num_blocks, H, block_size)`` fp32.
+        ``tokens_per_core`` is ``None`` until the Torch schema lands with the
+        host-side work split that reads the device's core count.
+        ``reuse_mode4_flags`` picks the recycled bilateral two-slot ring over the
+        single-shot bisection control.
+        """
+        self._require_kernel(TURBOQUANT_OP_RESHAPE_AND_CACHE)(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            scale_cache,
+            slot_mapping,
+            pi_signs,
+            tables,
+            num_tokens,
+            num_kv_heads,
+            head_size,
+            block_size,
+            num_blocks,
+            tokens_per_core,
+            inv_sqrt_len,
+            reuse_mode4_flags,
+        )
+
+    def _golden_reshape_and_cache_prefill(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        scale_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        emulator: TurboQuantEmulator,
+    ) -> None:
+        """Rotate, quantise and write ``[T, H, D]`` K/V at the slots given."""
+        self._write_slots(key, value, key_cache, value_cache, scale_cache, slot_mapping, emulator)
+
+    # -- ingestion: the decode scatter writer ------------------------------
+
+    def reshape_scatter_decode(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        scale_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        emulator: TurboQuantEmulator,
+    ) -> None:
+        """Ingest one ``[T, H, D]`` token per request, scattered by slot.
+
+        The decode phase. ``T`` is the batch size and ``slot_mapping`` is ``[T]``
+        int32 with no contiguity of any kind. Negative slots are padding and are
+        skipped, which is what a graph-capture dummy run feeds.
+        """
+        if self._has_kernel(TURBOQUANT_OP_RESHAPE_SCATTER):
+            self._kernel_reshape_scatter_aiv(
+                block_dim=None,
+                key=key,
+                value=value,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                scale_cache=scale_cache,
+                slot_mapping=slot_mapping,
+                pi_signs=emulator.pi_signs,
+                cu_seqlens=None,
+                launch_probe=None,
+                num_requests=key.shape[0],
+                num_kv_heads=key.shape[1],
+                head_size=key.shape[2],
+                block_size=key_cache.shape[1],
+                num_blocks=key_cache.shape[0],
+                item_begin=None,
+                item_count=None,
+                inv_sqrt_len=emulator.inv_sqrt_len,
+            )
+            return
+        self._golden_reshape_scatter_decode(key, value, key_cache, value_cache, scale_cache, slot_mapping, emulator)
+
+    def _kernel_reshape_scatter_aiv(
+        self,
+        block_dim: int | None,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        scale_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        pi_signs: torch.Tensor,
+        cu_seqlens: torch.Tensor | None,
+        launch_probe: torch.Tensor | None,
+        num_requests: int,
+        num_kv_heads: int,
+        head_size: int,
+        block_size: int,
+        num_blocks: int,
+        item_begin: int | None,
+        item_count: int | None,
+        inv_sqrt_len: float,
+    ) -> None:
+        """The AIV scatter writer: one token per request, rotated and packed in UB.
+
+        Parameter for parameter ``launch_turboquant_reshape_scatter_aiv``
+        (op_kernel/turboquant_reshape_scatter.cpp) without its stream.
+        ``block_dim``, ``item_begin`` and ``item_count`` are the host's work
+        split and ``launch_probe`` is its int32 canary; all four are ``None``
+        until the Torch schema lands with the launcher helper that builds them.
+        ``cu_seqlens`` is the int32 prefix sum the writer uses to find a
+        request's own token, and is ``None`` for a one-token-per-request decode.
+        """
+        self._require_kernel(TURBOQUANT_OP_RESHAPE_SCATTER)(
+            block_dim,
+            key,
+            value,
+            key_cache,
+            value_cache,
+            scale_cache,
+            slot_mapping,
+            pi_signs,
+            cu_seqlens,
+            launch_probe,
+            num_requests,
+            num_kv_heads,
+            head_size,
+            block_size,
+            num_blocks,
+            item_begin,
+            item_count,
+            inv_sqrt_len,
+        )
+
+    def _golden_reshape_scatter_decode(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        scale_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        emulator: TurboQuantEmulator,
+    ) -> None:
+        """Rotate, quantise and scatter one token per request by slot."""
+        self._write_slots(key, value, key_cache, value_cache, scale_cache, slot_mapping, emulator)
+
+    def _write_slots(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        scale_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        emulator: TurboQuantEmulator,
+    ) -> None:
+        """The codec and the slot write both golden ingestion phases share.
+
+        ``key`` and ``value`` are ``[T, H, D]``; ``slot_mapping`` is ``[T]``
+        int32 of ``page * block_size + token``, negative for padding. The two
+        phases differ in which kernel owns the write, not in what lands: both
+        produce the same nibbles and the same fp32 scales.
+        """
         if self.config.value_layout is TurboQuantValueLayout.CHANNEL_MAJOR:
             # Checked before the key plane is touched: a half-written step is
             # worse than a refused one.
@@ -646,6 +953,9 @@ class TurboQuantOpsAdapter:
                 "scatter needs a read-modify-write that belongs to the kernel; run the dry run with "
                 "TurboQuantValueLayout.TOKEN_MAJOR"
             )
+
+        packed_key, key_scales = self.quantize_and_pack(self.rotate(key, emulator), emulator)
+        packed_value, value_scales = self.quantize_and_pack(self.rotate(value, emulator), emulator)
 
         block_size = key_cache.shape[1]
         slots = slot_mapping.to(torch.int64)
@@ -670,58 +980,7 @@ class TurboQuantOpsAdapter:
             # the pair of index tensors lands one (page, token) column per token.
             scale_cache[plane][pages, :, offsets] = scales.to(scale_cache.dtype)
 
-    def reshape_and_cache(
-        self,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
-        scale_cache: torch.Tensor,
-        slot_mapping: torch.Tensor,
-        emulator: TurboQuantEmulator,
-    ) -> None:
-        """The fused ingestion: rotate, quantise, pack and scatter ``[T, H, D]`` K/V.
-
-        This is the one entry point the production kernel occupies as a whole;
-        the composition below is what it replaces, stage by stage.
-        """
-        kernel = self._kernel(TurboQuantKernelStage.RESHAPE_AND_CACHE, "npu_turboquant_reshape_and_cache_a8")
-        if kernel is not None:
-            # TODO: Replace with C++ binding. Expected (the task's named entry,
-            # over the staged launch_turboquant_reshape_and_cache_bf16 ABI):
-            #   npu_turboquant_reshape_and_cache_a8(Tensor key, Tensor value,
-            #       Tensor(a!) key_cache, Tensor(b!) value_cache, Tensor(c!) scale_cache,
-            #       Tensor slot_mapping, Tensor pi_signs, Tensor tables) -> ()
-            # The staged writer additionally takes tokens_per_core and
-            # inv_sqrt_len, and requires slot_mapping[i] == slot_mapping[0] + i
-            # with slot_mapping[0] a multiple of block_size: one strip fills one
-            # whole physical page.
-            kernel(
-                key,
-                value,
-                key_cache,
-                value_cache,
-                scale_cache,
-                slot_mapping,
-                emulator.pi_signs,
-                _codec_tables(emulator),
-            )
-            return
-
-        packed_key, key_scales = self.quantize_and_pack(self.rotate(key, emulator), emulator)
-        packed_value, value_scales = self.quantize_and_pack(self.rotate(value, emulator), emulator)
-        self.scatter(
-            packed_key,
-            key_scales,
-            packed_value,
-            value_scales,
-            key_cache,
-            value_cache,
-            scale_cache,
-            slot_mapping,
-        )
-
-    # -- stage: the cache read --------------------------------------------
+    # -- the cache read ----------------------------------------------------
 
     def gather(
         self,
@@ -738,17 +997,37 @@ class TurboQuantOpsAdapter:
         request's context length are whatever the allocator last left there; the
         caller masks them.
         """
-        kernel = self._kernel(TurboQuantKernelStage.GATHER, "npu_turboquant_gather_pages")
-        if kernel is not None:
-            # TODO: Replace with C++ binding. Expected:
-            #   npu_turboquant_gather_pages(Tensor key_cache, Tensor value_cache,
-            #       Tensor scale_cache, Tensor block_tables)
-            #       -> (Tensor, Tensor, Tensor, Tensor)
-            # A production decode never materialises this -- the fused decode
-            # streams pages through UB instead (see fused_decode()). It exists so
-            # a gather kernel can be validated against the model in isolation.
-            return kernel(key_cache, value_cache, scale_cache, block_tables)
+        if self._has_kernel(TURBOQUANT_OP_GATHER_PAGES):
+            return self._kernel_gather_pages(
+                key_cache=key_cache,
+                value_cache=value_cache,
+                scale_cache=scale_cache,
+                block_tables=block_tables,
+            )
+        return self._golden_gather_pages(key_cache, value_cache, scale_cache, block_tables)
 
+    def _kernel_gather_pages(
+        self,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        scale_cache: torch.Tensor,
+        block_tables: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Materialise a batch's packed pages, for validating a gather in isolation.
+
+        No standalone C launcher and no production caller: the fused decode
+        streams pages through UB instead of materialising them.
+        """
+        return self._require_kernel(TURBOQUANT_OP_GATHER_PAGES)(key_cache, value_cache, scale_cache, block_tables)
+
+    def _golden_gather_pages(
+        self,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        scale_cache: torch.Tensor,
+        block_tables: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``block_tables`` ``[B, max_blocks]`` int32 -> the four ``[B, S_pad, ...]`` panels."""
         block_size = key_cache.shape[1]
         pages = block_tables.to(torch.int64)
         batch_size, max_blocks = pages.shape
@@ -778,15 +1057,11 @@ class TurboQuantOpsAdapter:
         emulator: TurboQuantEmulator,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Gathered packed pages -> dense activations in ``dtype``.
-
-        Unpack, dequantise, un-rotate: the composition that takes a cache panel
-        back to the basis the model's own K and V live in.
-        """
+        """Gathered packed pages -> dense activations in ``dtype``, in the model's basis."""
         rotated = self.unpack_and_dequantize(packed, scales, emulator)
         return self.inverse_rotate(rotated, emulator).to(dtype)
 
-    # -- stage: the fused decode ------------------------------------------
+    # -- the fused decode --------------------------------------------------
 
     def fused_decode(
         self,
@@ -802,43 +1077,109 @@ class TurboQuantOpsAdapter:
         scale: float,
         output: torch.Tensor,
     ) -> torch.Tensor | None:
-        """The one-launch decode, or ``None`` when it is not available.
+        """The one-launch decode, or ``None`` when it did not run.
 
-        ``None`` is the dry run's signal to gather, dequantise and call FIA
-        instead -- the fallback is a whole attention, not a single operation, so
-        it lives in the backend rather than here.
+        ``query`` is ``[B, N, D]`` and ``output`` is ``[B, N, D]`` in the model's
+        element type. ``None`` is the caller's signal to gather, dequantise and
+        attend instead: that fallback is a whole attention rather than one
+        operation, so it lives in the backend.
         """
-        kernel = self._kernel(TurboQuantKernelStage.DECODE, "npu_turboquant_fused_decode")
-        if kernel is None:
+        if not self._has_kernel(TURBOQUANT_OP_FUSED_DECODE):
             return None
-        # TODO: Replace with C++ binding. The staged launcher is
-        #   turboquant_mm_fused_decode_opt_raw_query_impl(mode, type, stream, block_dim,
-        #       query, pi_signs, rot_tables, h16, gate, query_rot, key_cache, value_cache,
-        #       scale_cache, block_tables, context_lens, mode_tables, workspace, output,
-        #       tiling, num_tokens, num_heads, num_kv_heads, head_size, block_size,
-        #       max_blocks_per_seq, num_splits, heads_per_task, tasks_per_block,
-        #       reduce_tasks_per_block, prologue_vectors_per_block,
-        #       prologue_cube_chunk_vectors, output_stage, fused_context_limit, scale,
-        #       inv_sqrt_len)
-        # The host tiling descriptors (include/turboquant_fused_decode.hpp) and the
-        # split workspace are the caller's to build and upload; the launcher
-        # refuses the launch without them, so this seam grows a tiling helper
-        # when the schema lands rather than passing shapes alone.
-        kernel(
-            query,
-            emulator.pi_signs,
-            key_cache,
-            value_cache,
-            scale_cache,
-            block_tables,
-            context_lens,
-            num_heads,
-            num_kv_heads,
-            scale,
-            emulator.inv_sqrt_len,
-            output,
+        element_type = TURBOQUANT_ELEMENT_BF16 if output.dtype is torch.bfloat16 else TURBOQUANT_ELEMENT_FP16
+        return self._kernel_fused_decode(
+            mode=TURBOQUANT_MODE_KV4_FP8,
+            element_type=element_type,
+            block_dim=None,
+            query=query,
+            pi_signs=emulator.pi_signs,
+            rot_tables=_codec_tables(emulator),
+            h16=_h16_operand(emulator.device),
+            gate=None,
+            query_rot=None,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            scale_cache=scale_cache,
+            block_tables=block_tables,
+            context_lens=context_lens,
+            mode_tables=None,
+            workspace=None,
+            output=output,
+            tiling=None,
+            num_tokens=query.shape[0],
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_size=emulator.head_size,
+            block_size=key_cache.shape[1],
+            max_blocks_per_seq=block_tables.shape[1],
+            num_splits=None,
+            heads_per_task=None,
+            tasks_per_block=None,
+            reduce_tasks_per_block=None,
+            prologue_vectors_per_block=None,
+            prologue_cube_chunk_vectors=None,
+            output_stage=TURBOQUANT_STAGE_UNROTATED,
+            fused_context_limit=None,
+            scale=scale,
+            inv_sqrt_len=emulator.inv_sqrt_len,
         )
-        return output
+
+    def _kernel_fused_decode(
+        self,
+        mode: int,
+        element_type: int,
+        block_dim: int | None,
+        query: torch.Tensor,
+        pi_signs: torch.Tensor,
+        rot_tables: torch.Tensor,
+        h16: torch.Tensor,
+        gate: torch.Tensor | None,
+        query_rot: torch.Tensor | None,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        scale_cache: torch.Tensor,
+        block_tables: torch.Tensor,
+        context_lens: torch.Tensor,
+        mode_tables: torch.Tensor | None,
+        workspace: torch.Tensor | None,
+        output: torch.Tensor,
+        tiling: torch.Tensor | None,
+        num_tokens: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_size: int,
+        block_size: int,
+        max_blocks_per_seq: int,
+        num_splits: int | None,
+        heads_per_task: int | None,
+        tasks_per_block: int | None,
+        reduce_tasks_per_block: int | None,
+        prologue_vectors_per_block: int | None,
+        prologue_cube_chunk_vectors: int | None,
+        output_stage: int,
+        fused_context_limit: int | None,
+        scale: float,
+        inv_sqrt_len: float,
+    ) -> torch.Tensor | None:
+        """The raw-query fused decode, which returns ``None`` until it can launch.
+
+        Parameter for parameter
+        ``vllm_ascend::turboquant_mm_fused_decode_opt_raw_query_impl``
+        (op_adapter/turboquant_torch_adpt.h) without its stream, so ``mode`` is a
+        ``TurboQuantMode`` and ``element_type`` is the ``AscendType`` of the query
+        and the output. The prologue rotates the raw query into the cache's basis
+        and writes ``query_rot``, which is the fp32 rotated image and is not
+        interchangeable with ``query``, before the split loop.
+
+        It returns ``None``, which routes the caller to the golden gather,
+        dequantise and attend path, because three of its inputs are the caller's
+        to build and upload and nothing on the Python side builds them yet: the
+        host tiling descriptors, without which the launcher refuses the launch;
+        the Split-K ``workspace``; and the work split that ``num_splits`` through
+        ``prologue_cube_chunk_vectors`` is drawn from. This seam grows a tiling
+        helper when the Torch schema lands, and only then can this call be made.
+        """
+        return None
 
 
 def _flat_slot_view(cache: torch.Tensor) -> torch.Tensor:
@@ -871,6 +1212,18 @@ def _codec_tables(emulator: TurboQuantEmulator) -> torch.Tensor:
     positive = signs.unsqueeze(-1) * h_inner.unsqueeze(0)
     tables = torch.stack((positive, -positive), dim=0)
     return tables.reshape(TURBOQUANT_PLANES * emulator.groups, emulator.group, emulator.group).to(torch.int8)
+
+
+def _h16_operand(device: torch.device) -> torch.Tensor:
+    """The Cube's resident ``h16`` operand, a ``[16, 16]`` fp16 matrix of ``+-1``.
+
+    The product of four Sylvester butterfly factors, which is the unnormalised
+    Sylvester Hadamard of order 16 (``routines/routine_cube_hadamard16.hpp``:
+    the caller supplies the sign matrix, the AIC generates no coefficients).
+    fp16 for both query element types -- the kernel converts it on ingest where
+    the Cube chunk operand is not fp16.
+    """
+    return _sylvester_hadamard(TURBOQUANT_H16_ORDER, device, torch.float16)
 
 
 # ---------------------------------------------------------------------------
@@ -1073,7 +1426,7 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
         staged = ", ".join(sorted(stage.value for stage in self.adapter.config.kernel_stages))
         logger.info_once(
             "TurboQuant dry run active: packed INT4 KV cache, kernel stages=%s, ops namespace=%s",
-            staged or "none (all emulated)",
+            staged or "none (all golden)",
             self.adapter.config.ops_namespace,
         )
 
@@ -1083,7 +1436,7 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
         """Bind the rotation's constants, once per layer.
 
         They live on the layer rather than on ``self`` so that a kernel-backed
-        stage and its emulation read the same objects, and so that a layer dump
+        stage and its golden model read the same objects, and so that a layer dump
         carries the rotation that produced its cache.
         """
         emulator = self.adapter.emulator_for(self.head_size, device)
@@ -1149,10 +1502,13 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
         attn_metadata: AscendMetadata,
         output: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Rotate, quantise and scatter this step's K/V into the packed cache.
+        """Rotate, quantise and write this step's K/V into the packed cache.
 
         The signature is the base class's, including the four-tuple return, so
-        the stock ``forward`` drives this without knowing it is quantising.
+        the stock ``forward`` drives this without knowing it is quantising. The
+        ingestion phase is picked by :meth:`_ingestion_phase`: the two kernels
+        that own the write are different kernels, and only the prefill one may
+        assume a contiguous page strip.
         """
         if self.attn_type == AttentionType.ENCODER_ONLY:
             return query, key, value, output
@@ -1177,7 +1533,12 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
             raise RuntimeError("TurboQuant statics were never bound; forward() must run _ensure_statics first.")
         scale_cache = self._ensure_scale_cache(kv_cache)
 
-        self.adapter.reshape_and_cache(
+        ingest = (
+            self.adapter.reshape_and_cache_prefill
+            if self._ingestion_phase(attn_metadata, num_actual_tokens) is TurboQuantIngestionPhase.PREFILL
+            else self.adapter.reshape_scatter_decode
+        )
+        ingest(
             key=key[:num_actual_tokens].contiguous(),
             value=value[:num_actual_tokens].contiguous(),
             key_cache=self.key_cache,
@@ -1188,6 +1549,24 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
         )
         notify_kv_cache_written()
         return query, key, value, output
+
+    @staticmethod
+    def _ingestion_phase(attn_metadata: AscendMetadata, num_actual_tokens: int) -> TurboQuantIngestionPhase:
+        """Which writer owns this step: more tokens than requests means prefill.
+
+        A decode step ingests exactly one token per request, so the token count
+        equals the batch size; anything longer is carrying prefill. The batch
+        size is read off ``seq_lens_list``, which is a host list on purpose (the
+        metadata keeps it off the device). A metadata object that does not carry
+        it, or carries ``None`` -- a dummy capture run, or a builder that has not
+        filled it -- reads as zero requests and therefore as prefill, which is
+        the writer that assumes the least about the slots it is given.
+        """
+        seq_lens_list = getattr(attn_metadata, "seq_lens_list", None)
+        num_requests = len(seq_lens_list) if seq_lens_list is not None else 0
+        if num_actual_tokens > num_requests:
+            return TurboQuantIngestionPhase.PREFILL
+        return TurboQuantIngestionPhase.DECODE
 
     # -- the cache read ----------------------------------------------------
 
