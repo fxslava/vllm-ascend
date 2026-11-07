@@ -1168,6 +1168,28 @@ extern "C" __global__ __aicore__ void turboquant_mm_fused_decode_opt_raw_query_k
 
 namespace vllm_ascend {
 
+// A void* cannot reach a GM_ADDR parameter, and the obvious cast does not work
+// either. Measured with bisheng --asc-aicore-lang --npu-arch=dav-3510 on
+// CANN 9.2.0-beta.2, against a kernel declared exactly as the ones below:
+//
+//   void* straight through            error: cannot initialize a parameter of
+//                                     type '__gm__ uint8_t *' with an lvalue of
+//                                     type 'void *'
+//   reinterpret_cast<GM_ADDR>(p)      error: reinterpret_cast from 'void *' to
+//                                     '__gm__ uint8_t *' is not allowed
+//                                     (an address-space cast)
+//   static_cast<uint8_t *>(p)         accepted; promoted into __gm__ at the call
+//
+// So the launchers keep their void* signatures -- the Torch adapter is built by
+// the host compiler, which has no __gm__ -- and narrow here, at the call. This
+// is also correct where the chevron is rewritten into a generated void*-taking
+// aclrtlaunch_* stub instead of being type-checked, because uint8_t* converts
+// to void* implicitly. One spelling for both toolchain paths.
+__attribute__((unused)) static inline uint8_t *AsGmAddr(void *pointer)
+{
+    return static_cast<uint8_t *>(pointer);
+}
+
 void turboquant_mm_fused_decode_opt_impl(int32_t mode, AscendType type, void *stream, uint32_t blockDim,
                                          void *queryRot, void *keyCache, void *valueCache, void *scaleCache,
                                          void *blockTables, void *contextLens, void *modeTables, void *workspace,
@@ -1194,14 +1216,18 @@ void turboquant_mm_fused_decode_opt_impl(int32_t mode, AscendType type, void *st
     // guards above and the cache format are shared; only the kernel symbol differs.
     if (type == AscendType::FP16) {
         turboquant_mm_fused_decode_opt_kv4fp8_half<<<blockDim, nullptr, stream>>>(
-            queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,
-            tiling, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,
-            tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen);
+            AsGmAddr(queryRot), AsGmAddr(keyCache), AsGmAddr(valueCache), AsGmAddr(scaleCache),
+            AsGmAddr(blockTables), AsGmAddr(contextLens), AsGmAddr(modeTables), AsGmAddr(workspace),
+            AsGmAddr(output), AsGmAddr(tiling), numTokens, numHeads, numKvHeads, headSize, blockSize,
+            maxBlocksPerSeq, numSplits, headsPerTask, tasksPerBlock, reduceTasksPerBlock,
+            fusedContextLimit, scale, invSqrtLen);
     } else if (type == AscendType::BF16) {
         turboquant_mm_fused_decode_opt_kv4fp8_bf16<<<blockDim, nullptr, stream>>>(
-            queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,
-            tiling, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits, headsPerTask,
-            tasksPerBlock, reduceTasksPerBlock, fusedContextLimit, scale, invSqrtLen);
+            AsGmAddr(queryRot), AsGmAddr(keyCache), AsGmAddr(valueCache), AsGmAddr(scaleCache),
+            AsGmAddr(blockTables), AsGmAddr(contextLens), AsGmAddr(modeTables), AsGmAddr(workspace),
+            AsGmAddr(output), AsGmAddr(tiling), numTokens, numHeads, numKvHeads, headSize, blockSize,
+            maxBlocksPerSeq, numSplits, headsPerTask, tasksPerBlock, reduceTasksPerBlock,
+            fusedContextLimit, scale, invSqrtLen);
     }
 }
 
@@ -1232,16 +1258,22 @@ void turboquant_mm_fused_decode_opt_raw_query_impl(
     // fp16 for both, so the raw-query ABI is element-type agnostic apart from the query and gate buffers.
     if (type == AscendType::FP16) {
         turboquant_mm_fused_decode_opt_raw_query_kv4fp8_half<<<blockDim, nullptr, stream>>>(
-            query, piSigns, rotTables, h16, gate, queryRot, keyCache, valueCache, scaleCache, blockTables,
-            contextLens, modeTables, workspace, output, tiling, numTokens, numHeads, numKvHeads, headSize,
+            AsGmAddr(query), AsGmAddr(piSigns), AsGmAddr(rotTables), AsGmAddr(h16), AsGmAddr(gate),
+            AsGmAddr(queryRot), AsGmAddr(keyCache), AsGmAddr(valueCache), AsGmAddr(scaleCache),
+            AsGmAddr(blockTables), AsGmAddr(contextLens), AsGmAddr(modeTables), AsGmAddr(workspace),
+            AsGmAddr(output), AsGmAddr(tiling), numTokens, numHeads, numKvHeads, headSize,
             blockSize, maxBlocksPerSeq, numSplits, headsPerTask, tasksPerBlock, reduceTasksPerBlock,
-            prologueVectorsPerBlock, prologueCubeChunkVectors, outputStage, fusedContextLimit, scale, invSqrtLen);
+            prologueVectorsPerBlock, prologueCubeChunkVectors, outputStage, fusedContextLimit, scale,
+            invSqrtLen);
     } else if (type == AscendType::BF16) {
         turboquant_mm_fused_decode_opt_raw_query_kv4fp8_bf16<<<blockDim, nullptr, stream>>>(
-            query, piSigns, rotTables, h16, gate, queryRot, keyCache, valueCache, scaleCache, blockTables,
-            contextLens, modeTables, workspace, output, tiling, numTokens, numHeads, numKvHeads, headSize,
+            AsGmAddr(query), AsGmAddr(piSigns), AsGmAddr(rotTables), AsGmAddr(h16), AsGmAddr(gate),
+            AsGmAddr(queryRot), AsGmAddr(keyCache), AsGmAddr(valueCache), AsGmAddr(scaleCache),
+            AsGmAddr(blockTables), AsGmAddr(contextLens), AsGmAddr(modeTables), AsGmAddr(workspace),
+            AsGmAddr(output), AsGmAddr(tiling), numTokens, numHeads, numKvHeads, headSize,
             blockSize, maxBlocksPerSeq, numSplits, headsPerTask, tasksPerBlock, reduceTasksPerBlock,
-            prologueVectorsPerBlock, prologueCubeChunkVectors, outputStage, fusedContextLimit, scale, invSqrtLen);
+            prologueVectorsPerBlock, prologueCubeChunkVectors, outputStage, fusedContextLimit, scale,
+            invSqrtLen);
     }
 }
 
