@@ -1,5 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// SPDX-FileCopyrightText: Copyright contributors to the vllm-ascend project
 #pragma once
 // The MIX_AIC_1_2 inter-wave protocol, shared by both reshape-and-cache
 // instances. Pure C++17: <cstdint> and nothing else, no CCE intrinsic and no
@@ -55,7 +53,6 @@
 // Both were read as "a mode-4 flag is not a consuming latch", and the single-
 // shot allocation below was adopted because it is correct under either reading.
 //
-// `tests/research/kernel_cluster_sync_probe.cpp` isolated the question: one
 // physical block, 1 Cube + 2 Vector cores, no data, a cyclic bilateral
 // handshake over recycled ids 0, 1, 16 and 17, and an `x_S` drain in front of
 // every announcement -- `V_S` on each Vector core, `MTE1_M` then `M_S` on the
@@ -70,7 +67,6 @@
 //
 // So mode-4 flags do consume, and recycling is sound when every announcement
 // is behind its `SetFlag`/`WaitFlag<HardEvent::x_S>` pair.
-// `scripts/audit_cross_core_fences.py` checks that property over both kernels
 // and the probe, with negative controls, because it is invisible to every
 // other gate here: set and wait counts balance without it, the id census
 // passes, and the numbers can come out bit-exact while a panel is read one
@@ -113,7 +109,6 @@
 // Marking every function, not just the two that are called at runtime today:
 // the rest are consumed in constant expressions only, where the attribute is
 // inert, and a future runtime call to any of them would otherwise reintroduce
-// exactly this link error. `scripts/audit_device_symbols.sh` checks that the
 // device objects define and reference no `turboquant_wave` symbol at all.
 //
 // `__aicore__` is a macro the CCE compiler and kernel_operator.h provide; both
@@ -134,8 +129,6 @@
 #endif
 
 namespace turboquant_wave {
-
-constexpr std::uint32_t kReshapeTokensPerStrip = 16u;
 
 // =========================================================== strip boundary
 // The true task boundary, computed identically by all three core roles so that
@@ -283,14 +276,12 @@ TQ_WAVE_FN constexpr std::uint16_t IntraId(std::uint32_t owner, std::uint32_t lo
 // one-bit latch* semantics.
 //
 // That premise is settled for this SoC and toolkit, in the direction the
-// proof assumed. `tests/research/kernel_cluster_sync_probe.cpp` ran the
 // recycled handshake on physical silicon and on CAModel with `x_S` drains in
 // front of every announcement and measured no early retirement; the two
 // earlier CAModel counterexamples (1032 cycles in safe_pipeline.md, 2179 in
 // guidelines section 6.2c) are now attributed to section 6.2a's scalar-unit
 // reordering, which recycling exposes and single-shot allocation masks. The
 // fence is the precondition, not an optimisation:
-// `scripts/audit_cross_core_fences.py` is the gate that keeps it true, and a
 // revision that drops a drain must be expected to reproduce the stale release
 // rather than to disprove this paragraph.
 template <std::uint32_t Chunks, std::uint32_t LandDepth>

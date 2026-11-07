@@ -28,11 +28,19 @@ constexpr std::uint32_t kBroadcastLanes = 64;
 // All state and scratch operands are UB resident. The four phases only issue
 // vector instructions; the caller owns input readiness and output visibility.
 template <class Engine>
-ASCEND_MICRO_ONLINE_INLINE void vector_online_softmax(Engine& engine)
+ASCEND_MICRO_ONLINE_INLINE void vector_online_softmax_probabilities(Engine& engine)
 {
     engine.update_max_and_alpha();
     engine.exponentiate_scores();
     engine.update_denominator();
+}
+
+// Cube attention stages these probabilities into L1 before the context GEMM.
+// Keep the same recurrence phases for Vector-only and Cube-backed attention.
+template <class Engine>
+ASCEND_MICRO_ONLINE_INLINE void vector_online_softmax(Engine& engine)
+{
+    vector_online_softmax_probabilities(engine);
     engine.update_accumulator();
 }
 

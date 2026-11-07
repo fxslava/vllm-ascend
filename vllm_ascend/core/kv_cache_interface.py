@@ -561,7 +561,7 @@ class AscendTurboQuantAttentionSpec(FullAttentionSpec):
 
         ``2 * num_kv_heads`` runs of ``block_size``: see the planar index in the
         class docstring. Mirrored by ``scale_floats_needed`` in
-        csrc/attention/turboquant/op_adapter/turboquant_torch_adpt.h.
+        csrc/attention/turboquant/torch_bindings.cpp.
         """
         return 2 * self.num_kv_heads * self.block_size
 

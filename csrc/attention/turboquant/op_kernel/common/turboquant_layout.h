@@ -84,10 +84,11 @@ constexpr uint32_t kBankSkewBytes = 32;
 // size must be a multiple of kCubeTileRows. This is the byte that holds packed column `column` of
 // (slot, kv head); the kernels issue the same arithmetic as strided DMA.
 constexpr uint64_t NzTiledPackedByte(uint64_t slot, uint64_t kvHead, uint64_t column, uint64_t numKvHeads,
-                                     uint64_t packedBytes) {
-  const uint64_t tileRow = slot % kCubeTileRows;
-  return (slot - tileRow) * numKvHeads * packedBytes + kvHead * kCubeTileRows * packedBytes +
-         ((column / kOperandC0) * kCubeTileRows + tileRow) * kOperandC0 + column % kOperandC0;
+                                     uint64_t packedBytes)
+{
+    const uint64_t tileRow = slot % kCubeTileRows;
+    return (slot - tileRow) * numKvHeads * packedBytes + kvHead * kCubeTileRows * packedBytes +
+           ((column / kOperandC0) * kCubeTileRows + tileRow) * kOperandC0 + column % kOperandC0;
 }
 
 constexpr uint16_t kFlagOperandsReady = 0;
@@ -119,13 +120,13 @@ constexpr uint16_t kRotateQHalfOne = 0x3C00;
 constexpr uint16_t kRotateQHalfMinusOne = 0xBC00;
 
 enum RotateQVariant : uint32_t {
-  kHiLo = 0x1u,
-  kDualDst = 0x2u,
+    kHiLo = 0x1u,
+    kDualDst = 0x2u,
 };
 
 enum class RotateQPrecision : uint32_t {
-  kSinglePassRint = 0,
-  kHiLoResidual = 1,
+    kSinglePassRint = 0,
+    kHiLoResidual = 1,
 };
 
 // The raw-query Cube decode's query prologue. A block whose share holds kQueryBasisMinCubeVectors or more
@@ -140,15 +141,15 @@ constexpr uint32_t kQueryBasisMinCubeVectors = 16;
 //   kUnrotated     Pi applied once more to the fp32 accumulator before the output cast (Pi^2 = I)
 //   kGated         kUnrotated, then divided by 1 + exp(-gate): an attn_output_gate layer's sigmoid gate
 enum class TurboQuantOutputStage : uint32_t {
-  kRotatedBasis = 0,
-  kUnrotated = 1,
-  kGated = 2,
+    kRotatedBasis = 0,
+    kUnrotated = 1,
+    kGated = 2,
 };
 
 // Gate logits are clamped from below before exp(-gate), so the denominator stays finite in fp32.
 constexpr float kGateLogitFloor = -80.0f;
 
-}  // namespace turboquant
-}  // namespace vllm_ascend
+}
+}
 
 #endif

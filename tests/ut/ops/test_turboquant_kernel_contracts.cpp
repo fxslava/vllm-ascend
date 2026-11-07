@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vllm-ascend project
 
-#include "csrc/attention/turboquant/kernels/turboquant_wave_protocol.hpp"
+#include "csrc/attention/turboquant/op_kernel/common/turboquant_wave_protocol.hpp"
 #include "csrc/attention/turboquant/op_kernel/common/turboquant_layout.h"
 #include "csrc/attention/turboquant/op_kernel/common/turboquant_strip_layout.h"
 
@@ -49,6 +49,11 @@ void CheckChannels() {
 
 void CheckWaves() {
   using namespace turboquant_wave;
+  // The audited wave protocol does not publish the strip height; the legacy one
+  // did, as turboquant_wave::kReshapeTokensPerStrip. It is now stated once, in
+  // turboquant_strip_layout.h, which is also what the decode contract below
+  // checks the cache addressing against.
+  constexpr uint32_t kReshapeTokensPerStrip = vllm_ascend::turboquant::kCacheStripRows;
   CheckChannels<ReshapeRecycled>();
   CheckChannels<ReshapeSingleShot>();
   Check(kReshapeDefaultReuse, "the recycled policy must remain the default");
