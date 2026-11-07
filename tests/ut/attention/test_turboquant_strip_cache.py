@@ -271,3 +271,77 @@ def test_the_golden_gather_reads_a_kernel_written_cache(monkeypatch, block_size)
     assert torch.equal(
         adapter.dequantize_cache(pv, vs, emulator, torch.float32)[0], emulator.decode(*emulator.encode(value))
     )
+
+
+def test_stages_scatter_writes_through_the_kernel_and_reads_back_golden(monkeypatch):
+    """TURBOQUANT_KERNEL_STAGES=scatter: NPU writes, golden decode, no exception.
+
+    The host-side half of the configuration the integration ships. It drives the
+    stage set from the environment, so the env parsing and the derived layout are
+    covered too, and it checks the four things that have to hold together:
+
+    * the scatter op is really called -- the write is not silently golden;
+    * nothing raises on the way, which is what the old CHANNEL_MAJOR refusal
+      used to do;
+    * `fused_decode` declines, because the decode stage is off;
+    * the gather still reads the strip layout, so a cache the kernel wrote comes
+      back correctly.
+
+    The device half -- that the kernel's bytes equal the golden model's -- is
+    tests/ut/attention/test_turboquant_live_write_npu.py and needs an NPU.
+    """
+    calls = []
+
+    class _Entry:
+        def __call__(self, *args, **kwargs):
+            calls.append(args)
+            return None
+
+    monkeypatch.setenv("TURBOQUANT_KERNEL_STAGES", "scatter")
+    monkeypatch.setenv("TURBOQUANT_OPS_NAMESPACE", "turboquant_ops")
+    monkeypatch.setattr(
+        torch,
+        "ops",
+        types.SimpleNamespace(turboquant_ops=types.SimpleNamespace(npu_turboquant_reshape_scatter_aiv=_Entry())),
+    )
+
+    adapter = TurboQuantOpsAdapter()
+    assert adapter.value_layout() is TurboQuantValueLayout.CHANNEL_MAJOR
+
+    emulator = TurboQuantEmulator(head_size=HEAD_SIZE, device=torch.device("cpu"))
+    block_size = 64
+    key, value = _acts(block_size, 31)
+    slots = torch.arange(block_size, dtype=torch.int32)
+
+    # The kernel owns the write, so the planes stay as the (stubbed) op left
+    # them -- untouched. That the op was reached is the assertion.
+    kernel_caches = _caches(block_size)
+    adapter.reshape_scatter_decode(key, value, *kernel_caches, slots, emulator)
+    assert len(calls) == 1, "the scatter stage did not reach the kernel"
+    assert all(torch.equal(c, torch.zeros_like(c)) for c in kernel_caches)
+
+    # The decode stage is off, so the fused decode has to decline and let the
+    # backend fall through to the golden gather plus FIA.
+    assert (
+        adapter.fused_decode(
+            query=torch.randn(1, 2, HEAD_SIZE),
+            key_cache=kernel_caches[0],
+            value_cache=kernel_caches[1],
+            scale_cache=kernel_caches[2],
+            block_tables=torch.zeros(1, 1, dtype=torch.int32),
+            context_lens=torch.ones(1, dtype=torch.int32),
+            emulator=emulator,
+            num_heads=2,
+            num_kv_heads=NUM_KV_HEADS,
+            scale=0.125,
+            output=torch.zeros(1, 2, HEAD_SIZE),
+        )
+        is None
+    )
+
+    # And the reader this configuration leans on still inverts the strip layout.
+    written = _caches(block_size)
+    _oracle_strip_cache(key, value, written, slots, emulator)
+    packed_key, key_scales, _, _ = adapter.gather(*written, torch.zeros(1, 1, dtype=torch.int32))
+    dense = adapter.dequantize_cache(packed_key, key_scales, emulator, torch.float32)
+    assert torch.equal(dense[0], emulator.decode(*emulator.encode(key)))
