@@ -21,12 +21,15 @@ the formula; a byte-for-byte differential against the compiled kernels needs an
 NPU.
 """
 
+import types
+
 import pytest
 import torch
 
 from vllm_ascend.attention.turboquant_dry_run import (
     TURBOQUANT_STRIP_TOKENS,
     TurboQuantEmulator,
+    TurboQuantKernelStage,
     TurboQuantOpsAdapter,
     TurboQuantOpsConfig,
     TurboQuantValueLayout,
@@ -177,3 +180,94 @@ def test_token_major_is_untouched_by_all_this():
         for t in range(16):
             assert torch.equal(cache[0, t], packed[t]), (plane, t)
             assert torch.equal(caches[2][plane, 0, :, t], scales[t])
+
+
+# ---------------------------------------------------------------------------
+# A kernel-written cache, read back by the golden gather
+# ---------------------------------------------------------------------------
+
+
+def _oracle_strip_cache(key, value, caches, slot_mapping, emulator):
+    """Fill the three planes from the writers' nibble formula, scalar by scalar.
+
+    Shares no code with the adapter: this is what an NPU writer would leave
+    behind, transcribed from `turboquant_reshape_scatter.cpp`. It is the stand-in
+    for the real kernels, which cannot run on a host with no NPU.
+    """
+    key_cache, value_cache, scale_cache = caches
+    _, block_size, num_kv_heads, packed_bytes = key_cache.shape
+    head_size = packed_bytes * 2
+    key_flat = key_cache.reshape(-1)
+    value_flat = value_cache.reshape(-1)
+    codes_key, key_scales = emulator.quantize(emulator.rotate(key))
+    codes_value, value_scales = emulator.quantize(emulator.rotate(value))
+
+    def put(flat, idx, code):
+        byte, half = idx // 2, idx % 2
+        raw = int(flat[byte]) & 0xFF
+        nib = int(code) & 0xF
+        raw = (raw & ~(0xF << (4 * half))) | (nib << (4 * half))
+        flat[byte] = torch.tensor(raw, dtype=torch.uint8).view(torch.int8)
+
+    for t, slot in enumerate(slot_mapping.tolist()):
+        if slot < 0:
+            continue
+        block, token = divmod(slot, block_size)
+        for head in range(num_kv_heads):
+            page = (block * num_kv_heads + head) * block_size
+            for channel in range(head_size):
+                put(key_flat, page * head_size + token * head_size + channel, codes_key[t, head, channel])
+                put(
+                    value_flat,
+                    page * head_size + (token // R) * (R * head_size) + channel * R + (token % R),
+                    codes_value[t, head, channel],
+                )
+            scale_cache[TURBOQUANT_KEY_PLANE, block, head, token] = key_scales[t, head]
+            scale_cache[TURBOQUANT_VALUE_PLANE, block, head, token] = value_scales[t, head]
+
+
+@pytest.mark.parametrize("block_size", [16, 64])
+def test_the_golden_gather_reads_a_kernel_written_cache(monkeypatch, block_size):
+    """Item 3: an NPU-written strip cache, read back with no numerical drift.
+
+    The cache is filled by the scalar oracle above -- the writers' formula, not
+    the adapter's code -- and then read with the scatter stage engaged, which is
+    what makes `value_layout()` report CHANNEL_MAJOR and select the strip
+    reader. The configuration is TURBOQUANT_KERNEL_STAGES=scatter with the
+    decode still in golden fallback.
+
+    NOT a differential against the compiled kernels: that needs an NPU. What it
+    establishes is that the golden reader inverts the writers' documented
+    formula exactly.
+    """
+
+    class _Entry:
+        def __call__(self, *a, **k):
+            return None
+
+    monkeypatch.setattr(
+        torch,
+        "ops",
+        types.SimpleNamespace(turboquant_ops=types.SimpleNamespace(npu_turboquant_reshape_scatter_aiv=_Entry())),
+    )
+    adapter = TurboQuantOpsAdapter(
+        TurboQuantOpsConfig(
+            ops_namespace="turboquant_ops",
+            kernel_stages=frozenset({TurboQuantKernelStage.SCATTER}),
+        )
+    )
+    assert adapter.value_layout() is TurboQuantValueLayout.CHANNEL_MAJOR
+
+    emulator = TurboQuantEmulator(head_size=HEAD_SIZE, device=torch.device("cpu"))
+    num_tokens = 2 * block_size
+    key, value = _acts(num_tokens, 21)
+    caches = _caches(block_size)
+    _oracle_strip_cache(key, value, caches, torch.arange(num_tokens, dtype=torch.int32), emulator)
+
+    pk, ks, pv, vs = adapter.gather(*caches, torch.tensor([[0, 1]], dtype=torch.int32))
+    assert torch.equal(
+        adapter.dequantize_cache(pk, ks, emulator, torch.float32)[0], emulator.decode(*emulator.encode(key))
+    )
+    assert torch.equal(
+        adapter.dequantize_cache(pv, vs, emulator, torch.float32)[0], emulator.decode(*emulator.encode(value))
+    )
