@@ -34,23 +34,53 @@
 // signed-int4 strip cache ... Phase 1 does not merge these formats or alter
 // their interfaces").
 //
-//   * the two WRITERS use the strip cache. The key plane's nibble index inside
-//     a (block, head) page is `token * head_size + channel`; the value plane's
-//     is `channel * block_size + token`, channel-major, and the batch writer is
-//     specialised at compile time to a 16-token strip that fills one whole
-//     physical page -- so `block_size == 16`.
-//   * the FUSED DECODE reads the NZ-tiled cache of
-//     op_kernel/common/turboquant_layout.h's NzTiledPackedByte(), laid out as
-//     [64-row tile][kv head][32-byte column group][tile row][byte], and its
-//     closed-form tile cursor needs `block_size` to be a power-of-two multiple
-//     of 64 -- so `block_size >= 64`.
+// The difference is NOT a byte ordering that a reordering could fix. It is a
+// different PAIRING OF NIBBLES INTO BYTES, which no permutation of bytes can
+// undo:
 //
-// Those two requirements have no common solution, so no single vLLM KV cache
-// can be written by these writers and read by this decode. Rather than let a
-// run silently attend over bytes in the wrong order, each op TORCH_CHECKs its
-// own block_size, and a configuration that switches on both ingestion and
-// decode kernels fails at the first launch with a message naming the conflict.
-// Merging the formats is kernel work, not binding work.
+//   * the two WRITERS: the key plane's nibble index inside a (block, head) page
+//     is `token * head_size + channel`; the value plane's is
+//     `(token / 16) * (16 * head_size) + channel * 16 + (token % 16)`
+//     (op_kernel/turboquant_reshape_scatter.cpp's StripWordOffset plus its
+//     within-strip index; the batch writer's "Layout contracts" block states
+//     the same thing as `ch * blockSize + key` for its one-strip page).
+//     Consecutive nibbles are the SAME CHANNEL at TWO TOKENS, so a byte holds
+//     one channel of tokens 2p and 2p+1.
+//   * the FUSED DECODE reads the NZ-tiled plane of
+//     op_kernel/common/turboquant_layout.h's NzTiledPackedByte(), laid out as
+//     [64-row tile][kv head][32-byte column group][tile row][byte]. A byte
+//     holds ONE TOKEN at channels `col` and `col + 128` -- the two halves of
+//     the channel axis. The harness's own reference writer for this plane is
+//     tests/common/fused_decode_opt_fixture.hpp, which fills it as
+//     `value[NzTiledPackedByte(row, head, col, h, 128)] =
+//      level(col) | (level(col + 128) << 4)`.
+//
+// At block_size 64 both layouts occupy the same 8192 bytes per (tile, kv head)
+// and ZERO of those 8192 bytes hold the same pair of nibbles; the multisets of
+// pairs differ, so a pure byte permutation between them does not exist. At
+// block_size 16 the NZ plane does not even fit: its tile row stride is 64, so a
+// 16-token page would address 6656 bytes to store 2048.
+//
+// Why that is fatal rather than cosmetic: StageNzTileToL1 nibble-expands with
+// DeInterleave (op_kernel/common/turboquant_codec_mx.h, UnpackAffine), which
+// sends every byte's low nibble to one contiguous L1 plane and every high
+// nibble to another. Under the NZ plane the low plane is channels 0..127 of all
+// 64 tokens -- a fractal-ordered K x N tile, which is what the context GEMM's
+// L0B load then transposes (turboquant_cube_service.h: "the context GEMM's
+// value tile is K x N and the load transposes it", ifTranspose = true). Under
+// the strip plane the low plane is instead ALL THE EVEN TOKENS. The ZN
+// orientation the Cube needs is imposed at that L1 -> L0B load, so GM does not
+// have to be "already ZN" -- but it does have to deposit the right K x N tile
+// in L1, and a channel-major strip deposits a token-parity permutation of it.
+// The decode would contract probabilities of token t against the value of a
+// different token: a wrong answer with every shape check satisfied.
+//
+// So no single vLLM KV cache can be written by these writers and read by this
+// decode, and the obstacle is numerical rather than dimensional. Each op
+// therefore TORCH_CHECKs its own hardware contract -- not a cross-format
+// refusal, just what its own addressing admits -- and those contracts happen to
+// have no common block_size. Merging the formats is kernel work in the harness.
+// The evidence above is reproducible: see the tabulation in the hand-over note.
 
 #include <algorithm>
 #include <cmath>
@@ -284,10 +314,18 @@ void npu_turboquant_reshape_and_cache_a8(at::Tensor &key, at::Tensor &value, at:
     // kTokens == blockSize in the kernel: a prefill strip fills one whole
     // physical page, and the value plane's channel-major nibble index
     // `channel * block_size + token` is what makes that a 2048-byte burst.
-    TORCH_CHECK(c.block_size == kTokensPerStrip, op, ": the batch writer's strip fills one whole physical page, so "
-                "block_size must be ", kTokensPerStrip, ", got ", c.block_size,
-                ". A cache sized for the fused decode (block_size a multiple of 64, NZ-tiled) cannot be "
-                "written by this kernel: see the format note at the top of this file.");
+    // This writer, unlike the scatter writer, has NO in-page row offset. Its
+    // only address is a page base -- `page_bytes = (slot0 / block_size) *
+    // num_kv_heads * head_bytes` with `head_bytes = block_size * head_size / 2`
+    // -- and `StoreChunk` writes its 2048-byte strip at
+    // `page_bytes + head * head_bytes`
+    // (op_kernel/turboquant_reshape_batch.cpp, the VectorEngine setup and
+    // StoreChunk). So at block_size 64 all four strips of a page would compute
+    // the same base and overwrite each other. The strip has to BE the page.
+    TORCH_CHECK(c.block_size == kTokensPerStrip, op, ": this writer places a strip at the page base with no "
+                "in-page offset, so block_size must be ", kTokensPerStrip, ", got ", c.block_size,
+                ". Use npu_turboquant_reshape_scatter_aiv for a larger page: it carries an in-page strip "
+                "index and this kernel does not.");
 
     check_burst_aligned(key, op, "key");
     check_burst_aligned(value, op, "value");
@@ -322,7 +360,9 @@ void npu_turboquant_reshape_and_cache_a8(at::Tensor &key, at::Tensor &value, at:
 // The value plane is a read-modify-write: channel-major inside the strip pairs
 // tokens 2t and 2t+1 in one byte, so a per-token write has to read the strip,
 // splice its own nibbles in by register masks and write the strip back. That is
-// why this kernel exists and why the PyTorch golden model refuses the layout.
+// why this kernel exists. The PyTorch golden model does the same thing a strip
+// at a time (_write_strip_planes in turboquant_dry_run.py), so the two agree on
+// what lands; only this one does it without reading the strip back to host.
 //
 // Host derivation, as the brief pins it: total_items = num_requests *
 // num_kv_heads, item_begin = 0, item_count = total_items, block_dim =
@@ -342,11 +382,14 @@ void npu_turboquant_reshape_scatter_aiv(at::Tensor &key, at::Tensor &value, at::
 
     TORCH_CHECK(a.head_size == kDecodeHeadSize, op, ": the scatter writer is specialised to head_size ",
                 kDecodeHeadSize, ", got ", a.head_size);
-    TORCH_CHECK(c.block_size == kTokensPerStrip, op,
-                ": this writer's strip cache is the batch writer's, so block_size must be ", kTokensPerStrip,
-                ", got ", c.block_size,
-                ". See the format note at the top of this file for why the fused decode's cache is a "
-                "different geometry.");
+    // Any whole number of strips per page. Unlike the batch writer this one
+    // carries an in-page strip index -- `item.strip` in `StripWordOffset` and
+    // `item.token_in_block` in the key burst
+    // (op_kernel/turboquant_reshape_scatter.cpp) -- so a page may hold as many
+    // 16-token strips as it likes.
+    TORCH_CHECK(c.block_size % kTokensPerStrip == 0, op, ": the strip cache is written ", kTokensPerStrip,
+                " tokens at a time, so block_size must be a multiple of ", kTokensPerStrip, ", got ",
+                c.block_size);
 
     check_burst_aligned(key, op, "key");
     check_burst_aligned(value, op, "value");
@@ -480,8 +523,8 @@ void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Te
                     (block_size & (block_size - 1)) == 0,
                 op, ": the closed-form tile cursor needs block_size to be a power-of-two multiple of ",
                 layout::kCubeTileRows, ", got ", block_size,
-                ". A cache written by the strip writers (block_size 16, channel-major value plane) is not "
-                "readable here: see the format note at the top of this file.");
+                ". The NZ-tiled plane this operator reads strides its tile rows by ", layout::kCubeTileRows,
+                ", so a smaller page cannot address it at all.");
 
     TORCH_CHECK(block_tables.dim() == 2 && block_tables.scalar_type() == at::kInt, op,
                 ": block_tables must be an int32 [num_tokens, max_blocks_per_seq]");
