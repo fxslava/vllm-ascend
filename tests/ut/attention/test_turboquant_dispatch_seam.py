@@ -300,7 +300,14 @@ def test_the_decode_writer_skips_padding_slots(emulator: TurboQuantEmulator) -> 
         assert torch.equal(key_cache[page, offset], emulator.encode(key[token])[0])
 
 
-def test_a_channel_major_value_plane_is_refused(emulator: TurboQuantEmulator) -> None:
+def test_a_strip_layout_refuses_a_block_size_it_cannot_hold(emulator: TurboQuantEmulator) -> None:
+    """The strip cache is written 16 tokens at a time, so the page must hold whole strips.
+
+    The golden writer used to refuse the channel-major layout outright, because
+    the value plane's read-modify-write was the kernel's to do. It does the
+    read-modify-write itself now, so the only thing left to refuse is a page
+    geometry the layout cannot express -- and this suite's BLOCK_SIZE is 8.
+    """
     adapter = TurboQuantOpsAdapter(
         TurboQuantOpsConfig(
             ops_namespace=NAMESPACE,
@@ -309,7 +316,7 @@ def test_a_channel_major_value_plane_is_refused(emulator: TurboQuantEmulator) ->
         )
     )
     key, value = _activations(1)
-    with pytest.raises(NotImplementedError, match="channel-major"):
+    with pytest.raises(ValueError, match="multiple of 16"):
         adapter.reshape_and_cache_prefill(key, value, *_caches(), torch.zeros(1, dtype=torch.int32), emulator)
 
 
