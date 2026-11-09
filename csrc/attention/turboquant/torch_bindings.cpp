@@ -305,6 +305,14 @@ void npu_turboquant_reshape_and_cache_a8(at::Tensor &key, at::Tensor &value, at:
     // op_kernel/turboquant_reshape_batch.cpp). The scalar arguments drive the
     // physical cache addressing only, so a geometry outside these is not a slow
     // path -- it is a wrong answer with every canary intact.
+    //
+    // A scheduler step is not a whole number of strips -- a 220-token prompt is
+    // 13 of them plus 12 tokens, and a batch of several requests has boundaries
+    // inside a strip -- so the caller plans the step across both writers rather
+    // than handing an arbitrary count over here:
+    // `turboquant_plan_strip_ingestion` in
+    // vllm_ascend/attention/turboquant_dry_run.py. This check stays a hard
+    // refusal because what it refuses has no safe behaviour, only a silent one.
     TORCH_CHECK(a.num_tokens % kTokensPerStrip == 0, op, ": num_tokens (", a.num_tokens,
                 ") must be a whole number of ", kTokensPerStrip,
                 "-token strips; the launcher drops a partial trailing strip rather than writing it");
