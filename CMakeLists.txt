@@ -84,12 +84,25 @@ if(SOC_VERSION MATCHES "ascend950")
     message(STATUS "ASC language toolchain enabled: --npu-arch=${CMAKE_ASC_ARCHITECTURES}")
 
     set(VLLM_ASCEND_BUILD_TURBOQUANT ON)
-    # The three audited kernel translation units, mirrored verbatim from
+    # The three audited kernel translation units, mirrored from
     # kernels/ops/turboquant/vllm_integration_layer of the ascend-micro-harness.
-    # The ASC toolchain compiles each source's device kernel and its host
-    # launcher together, so this one library carries both halves of all three
-    # paths: the prefill batch writer, the decode scatter writer and the fused
-    # raw-query decode. torch_bindings.cpp below links against these launchers.
+    # The ASC toolchain compiles each source's device kernels and its host
+    # launcher together -- one bisheng invocation per source runs a host pass and
+    # two device passes over the same text -- so this one library carries both
+    # halves of all three paths: the prefill batch writer, the decode scatter
+    # writer and the fused raw-query decode. torch_bindings.cpp below links
+    # against these launchers.
+    #
+    # Single-source is also why the sources keep their `__global__` entry-point
+    # *definitions* outside `#if defined(__CCE_AICORE__)`, with only the bodies
+    # inside it: the host-side launch stub of a `__global__` function is emitted
+    # by the host pass from the definition, and the legacy ascendc_library's
+    # generated host_stub.cpp -- which is what supplies those stubs in the
+    # harness's own build -- does not exist on this path. With the definitions
+    # hidden from the host pass this library still links, with every launch_*
+    # entry present and every kernel it calls undefined. See
+    # csrc/attention/turboquant/README.md, "Why the entry points are outside the
+    # device guard".
     #
     # One library, not three: the fused decode's Split-K reducer and the two
     # writers share op_kernel/common, and ascendc_library has no incremental
@@ -109,12 +122,13 @@ if(SOC_VERSION MATCHES "ascend950")
     # so the host compilation of the TU, which is the one that defines
     # launch_turboquant_reshape_and_cache_bf16,
     # launch_turboquant_reshape_scatter_aiv and
-    # turboquant_mm_fused_decode_opt_raw_query_impl, compiles to NOTHING without
-    # it. The library then still looks complete -- every device kernel is there
-    # and so is every generated aclrtlaunch_* stub, whose names contain the
-    # launcher names as substrings -- and torch_bindings.cpp fails to link with
-    # an undefined reference. Taken from the harness's own
-    # standalone/CMakeLists.txt, which is the authority on these flags.
+    # turboquant_mm_fused_decode_opt_raw_query_impl, compiles to NOTHING past the
+    # entry points without it. The library then still looks complete -- every
+    # device kernel is there, and under the legacy module set so is every
+    # generated aclrtlaunch_* stub, whose names contain the launcher names as
+    # substrings -- and torch_bindings.cpp fails to link with an undefined
+    # reference. Taken from the harness's own standalone/CMakeLists.txt, which is
+    # the authority on these flags.
     #
     # ASCEND_TQ_FUSED_DECODE_GEMM_REDUCE drives the decode's reduction with the
     # Cube GEMM reducer (op_kernel/cube/turboquant_gemm_reduce_service.h) rather
@@ -128,6 +142,13 @@ if(SOC_VERSION MATCHES "ascend950")
     # ASSIGNS them, so a second ascendc_compile_options on this target would
     # silently discard the first call's -forward-options-to-host-compiler
     # defines. Both defines therefore go in this one call.
+    #
+    # On the ASC path the second call is redundant rather than required:
+    # ascendc_compile_definitions is a plain target_compile_definitions there, so
+    # its -D reaches every pass including the host one. It stays because it costs
+    # nothing and it is what makes this block work unchanged if a standalone gate
+    # builds the same sources through the legacy ascendc_library, where the
+    # host-forwarded copy IS the only one the host pass sees.
     ascendc_compile_definitions(vllm_ascend_turboquant PRIVATE
         ASCEND_MICRO_CANN_LAUNCH ASCEND_TQ_FUSED_DECODE_GEMM_REDUCE=1)
     ascendc_compile_options(vllm_ascend_turboquant PRIVATE

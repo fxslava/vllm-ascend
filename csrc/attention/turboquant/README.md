@@ -14,6 +14,16 @@ re-run its own gates, and re-mirror — the Ascend C vector and cube logic, the
 pipeline depth, the mode-4 event pairings, the cross-core flag budget and the
 UB alignments are all load-bearing and audited there.
 
+There is **one** standing exception, and it is build integration rather than
+kernel logic: in the three kernel translation units the `__global__` entry-point
+*definitions* sit outside `#if defined(__CCE_AICORE__)`, with only their bodies
+inside it. The harness builds them with CANN's legacy `ascendc_library`, which
+generates the host launch stubs itself; this repo builds them with the ASC
+language toolchain, which does not. See "Why the entry points are outside the
+device guard" below, and do not let a re-mirror undo it — it is the difference
+between a loadable `libvllm_ascend_turboquant.so` and one whose every kernel
+symbol is undefined.
+
 ## What is mirrored
 
 | Path | What it is |
@@ -142,16 +152,34 @@ configuration — NPU writer, PyTorch reader — still reads back correctly.
 pytest --noconftest tests/ut/ops/test_turboquant_kernel_contracts.py
 ```
 
-The three kernel translation units also compile-check for `dav-3510` with no
-Torch and no driver, through a throwaway CMake project whose only target is
+The three kernel translation units also build for `dav-3510` with no Torch and
+no driver, through a throwaway CMake project whose only target is
 
 ```cmake
 ascendc_library(tq_gate SHARED op_kernel/turboquant_reshape_batch.cpp op_kernel/turboquant_reshape_scatter.cpp op_kernel/turboquant_fused_decode.cpp)
 ```
 
 configured with `-DSOC_VERSION=Ascend950PR_9599`, the `Unix Makefiles`
-generator, and the same two defines the root `CMakeLists.txt` passes. Five
-things make it work:
+generator, and the same two defines the root `CMakeLists.txt` passes.
+
+**Which `ascendc_library` you get decides everything else here.** CANN 9.2 ships
+two, and the name is rebound by whichever module set was included last:
+
+| include | implementation | what it does |
+| --- | --- | --- |
+| `ascendc_kernel_cmake/ascendc.cmake` | `legacy_modules/function.cmake` | compiles each TU several times through `ExternalProject_Add`, then generates `auto_gen/<target>/host_stub.cpp` and the `aclrtlaunch_*` stubs from the device objects |
+| `ascendc_kernel_cmake/asc-config.cmake` + `enable_language(ASC)` | `asc_modules/FindASC.cmake` | `set_source_files_properties(LANGUAGE ASC)` plus a plain `add_library`; one `bisheng` invocation per TU does the host pass and both device passes, and generates nothing |
+
+The root `CMakeLists.txt` takes the **ASC** path on `ascend950` and fails the
+configure if `asc-config.cmake` is absent, so that is the one the wheel builds
+with. A standalone gate that includes only `ascendc.cmake` gets the legacy one
+and hits all five traps below; the ASC path hits none of them — it is an ordinary
+`add_library`, so it rebuilds incrementally, needs no `llvm-objdump` on `PATH`,
+runs no merge script and does not glob objects. Both toolchains link these
+sources, so either makes a usable gate; just do not read a trap list written for
+one as if it applied to the other.
+
+Five things make the legacy gate work:
 
 - `ASCEND_MICRO_CANN_LAUNCH` and `ASCEND_TQ_FUSED_DECODE_GEMM_REDUCE=1` have to
   be defined, through **both** `ascendc_compile_definitions` and a single
@@ -174,24 +202,27 @@ things make it work:
 - It must be fresh every time. `ascendc_library` has no incremental rebuild,
   because its preprocess step feeds `ld.lld` its own previous output.
 
-The target carries both kernel types: `device.o` holds the two `MIX_AIC_1_2`
-kernels and `device_aiv.o` the `AIV_ONLY` scatter writer, which is why one
-`ascendc_library` is enough for all three sources.
+Under the legacy path the target carries both kernel types: `device.o` holds the
+two `MIX_AIC_1_2` kernels and `device_aiv.o` the `AIV_ONLY` scatter writer, which
+is why one `ascendc_library` is enough for all three sources.
 
 ### The define you cannot omit
 
 Each of the three sources is shaped
 
 ```c++
-#if defined(__CCE_AICORE__)              // the device kernels
-#elif defined(ASCEND_MICRO_CANN_LAUNCH)  // the host launchers
+#if defined(__CCE_AICORE__)                        // the device bodies
 #endif
+extern "C" __global__ __aicore__ void kernel(...)  // the entry points
+{ #if defined(__CCE_AICORE__) ... #endif }
+#if defined(ASCEND_MICRO_CANN_LAUNCH) && !defined(__CCE_AICORE__)
+#endif                                             // the host launchers
 ```
 
-`ascendc_library` compiles each translation unit several times, and the **host**
-pass is the one with `__CCE_AICORE__` undefined. Without
-`ASCEND_MICRO_CANN_LAUNCH` that pass compiles to nothing, and the three entry
-points `torch_bindings.cpp` calls —
+Every `ascendc_library` compiles each translation unit several times, and the
+**host** pass is the one with `__CCE_AICORE__` undefined. Without
+`ASCEND_MICRO_CANN_LAUNCH` that pass compiles to nothing past the entry points,
+and the three entry points `torch_bindings.cpp` calls —
 `launch_turboquant_reshape_and_cache_bf16`,
 `launch_turboquant_reshape_scatter_aiv` and
 `vllm_ascend::turboquant_mm_fused_decode_opt_raw_query_impl` — are simply absent.
@@ -203,6 +234,46 @@ reference at the *consumer's* link. A substring search does not catch it either,
 because `aclrtlaunch_turboquant_reshape_and_cache_bf16` contains
 `launch_turboquant_reshape_and_cache_bf16` — so check these symbols with an
 exact match, and demangle for the C++ one.
+
+### Why the entry points are outside the device guard
+
+Under the ASC language toolchain a translation unit is single-source: `bisheng`
+runs one host pass and two device passes (`__DAV_C310_CUBE__`, `__DAV_C310_VEC__`)
+over the same text, and the host-side launch stub of a `__global__` function is
+emitted by the **host pass from that function's definition**. A prototype is not
+enough, and nothing generates the stub for you the way `host_stub.cpp` does on
+the legacy path.
+
+So the entry-point definitions have to be visible in the host pass, with only
+their bodies behind `__CCE_AICORE__`. `__global__`, `__aicore__`, `__gm__`,
+`bfloat16_t` and `half` are all available there with no CANN header — they come
+from `bisheng`'s force-included `__clang_cce_types.h` — while `GM_ADDR` needs
+`kernel_operator.h`, which `turboquant_fused_decode.cpp` therefore includes
+unconditionally. Nothing is lost by emptying the body in the host pass: the
+kernel *type* is a device-link property (`KERNEL_TASK_TYPE_DEFAULT` lowers to
+`__builtin_cce_kernel_type_set`, and omitting it fails the device link with "the
+type of kernel function ... auto derivate failed"), not something the host stub
+carries.
+
+With the definitions inside the device-only region the build still succeeds and
+every `launch_*` is present, so the failure is invisible until Python `dlopen()`s
+the extension:
+
+```
+undefined symbol: turboquant_reshape_and_cache_bf16
+```
+
+Measured on CANN 9.2.0-beta.2: all seven `__global__` symbols came out `U` in
+`libvllm_ascend_turboquant.so` with the definitions inside the guard, and `T`
+with them outside it. So gate on the **kernels** as well as the launchers, and
+remember that plain `nm` is not enough on the legacy path, which strips the
+symbol table — use `nm -D`:
+
+```bash
+nm -DC libvllm_ascend_turboquant.so | grep -E "^ *U +(turboquant|launch)"
+```
+
+must print nothing.
 
 Anything that launches a kernel needs a device, and the differential against the
 golden model for ingestion and decode numerics needs one too.
