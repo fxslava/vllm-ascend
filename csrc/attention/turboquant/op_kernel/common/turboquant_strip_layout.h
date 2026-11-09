@@ -2,12 +2,21 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vllm-ascend project
 #pragma once
 
-// NOT PART OF THE AUDITED KERNEL TREE. Every other file in this directory is a
+// NOT PART OF THE AUDITED KERNEL TREE. The other files in this directory are a
 // verbatim mirror of kernels/ops/turboquant/vllm_integration_layer in the
-// ascend-micro-harness; this one is the repo's own host-side restatement of the
-// strip cache's addressing, kept because it is the only place that arithmetic
-// is stated for a host reader and because tests/ut/ops/test_turboquant_kernel_contracts.cpp
-// is a device-free gate that checks the restatement against the layout headers.
+// ascend-micro-harness -- with one exception, turboquant_layout.h, whose four
+// ingress helpers (NzTiledChannelByte, NzTiledChannelNibble, NzScaleSlotFloats,
+// NzTiledScaleIndex) are deliberately absent because they state a woven
+// (c, c + headSize/2) nibble pairing and a per-slot scale index, and this file
+// plus both writers state the adjacent-element pairing and the plane-major
+// scale plane that the kernels here actually produce. The README's "What is not
+// mirrored" section has the full reasoning; do not reconcile the two by copying
+// the harness file over this one.
+//
+// This one is the repo's own host-side restatement of the strip cache's
+// addressing, kept because it is the only place that arithmetic is stated for a
+// host reader and because tests/ut/ops/test_turboquant_kernel_contracts.cpp is a
+// device-free gate that checks the restatement against the layout headers.
 //
 // The audited writers carry the same arithmetic inline:
 // op_kernel/turboquant_reshape_batch.cpp's "Layout contracts" block and
