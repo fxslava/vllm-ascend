@@ -37,7 +37,11 @@ a newly landed kernel gets differentially diffed against its own model.
 
 Ingestion is two kernels, not one, and the phase decides which: a prefill step
 hands whole page strips to the batch writer, a decode step hands one token per
-request to the AIV scatter writer.
+request to the AIV scatter writer. The phase picks the *owner*, not the whole
+dispatch -- a real prefill step is 220 tokens of one prompt or several requests
+concatenated, which is not a whole number of the batch writer's 16-token
+strips, so the prefill path plans its step across both writers
+(``turboquant_plan_strip_ingestion``).
 
 The arithmetic contract
 -----------------------
@@ -92,7 +96,7 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Final
@@ -972,13 +976,74 @@ class TurboQuantOpsAdapter:
         """Ingest a contiguous batch of ``[T, H, D]`` K/V into whole cache pages.
 
         The prefill phase. ``slot_mapping`` is ``[T]`` int32 of
-        ``page * block_size + token``, and the staged batch writer additionally
-        requires ``slot_mapping[i] == slot_mapping[0] + i`` with
-        ``slot_mapping[0]`` a multiple of ``block_size``, so that one strip fills
-        one physical page. The golden model does not enforce that: it is the
-        kernel's precondition, not the codec's.
+        ``page * block_size + token``. ``T`` is whatever the scheduler handed
+        this step -- 220 tokens of one prompt, or several requests concatenated
+        -- while the batch writer only takes whole 16-token strips whose slots
+        are strip-aligned and consecutive. Reconciling the two is
+        :meth:`_kernel_ingest_prefill`, which plans the step and dispatches it
+        across both audited writers. The golden model needs no plan: it writes
+        the slots it is given, one token at a time.
         """
         if self._has_kernel(TURBOQUANT_OP_RESHAPE_AND_CACHE):
+            self._kernel_ingest_prefill(
+                key=key,
+                value=value,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                scale_cache=scale_cache,
+                slot_mapping=slot_mapping,
+                emulator=emulator,
+            )
+            return
+        self._golden_reshape_and_cache_prefill(key, value, key_cache, value_cache, scale_cache, slot_mapping, emulator)
+
+    def _kernel_ingest_prefill(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        scale_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        emulator: TurboQuantEmulator,
+    ) -> None:
+        """Ingest an arbitrary token count through the two audited writers.
+
+        The batch writer is specialised to whole 16-token strips whose slots are
+        strip-aligned and consecutive, and refuses any other token count
+        outright::
+
+            npu_turboquant_reshape_and_cache_a8: num_tokens (220) must be a
+            whole number of 16-token strips
+
+        A real prompt is 220 tokens, and a real batch is several requests whose
+        boundaries fall inside a strip, so the step is planned
+        (:func:`turboquant_plan_strip_ingestion`) and dispatched piecewise:
+        whole strips to the batch writer, a strip-aligned partial strip to the
+        batch writer with its last token replicated into the slots the request
+        already owns past its own length, and anything else to the scatter
+        writer, whose read-modify-write is the only thing allowed to touch a
+        strip that already holds an earlier step's tokens.
+
+        Every token this step was given lands exactly once, through the same
+        codec, at the slot it was given -- so a step that already conformed is
+        byte-for-byte what it was before this split existed, and takes its own
+        tensors through untouched rather than a slice of them.
+
+        The plan needs the slot values on the host, so this costs one
+        device-to-host copy of an int32 ``[T]`` and one Python pass over it per
+        ingestion call -- the pass itself measures 0.3 ms at 2048 tokens and
+        1.1 ms at 8192, per layer. The copy is the one
+        ``VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS``
+        pays in csrc/attention/turboquant/torch_bindings.cpp, where that
+        validation is opt-in precisely because it is a synchronisation. This
+        backend is for metadata and accuracy rather than latency, and the
+        alternative is a writer that silently lands a strip in the wrong page.
+        """
+        plan = turboquant_plan_strip_ingestion(slot_mapping.tolist(), int(key_cache.shape[1]))
+        tables = _codec_tables(emulator)
+
+        if plan.is_whole_batch:
             self._kernel_reshape_and_cache_a8(
                 key=key,
                 value=value,
@@ -987,12 +1052,41 @@ class TurboQuantOpsAdapter:
                 scale_cache=scale_cache,
                 slot_mapping=slot_mapping,
                 pi_signs=emulator.pi_signs,
-                tables=_codec_tables(emulator),
+                tables=tables,
                 inv_sqrt_len=emulator.inv_sqrt_len,
                 reuse_mode4_flags=TURBOQUANT_REUSE_MODE4_FLAGS,
             )
             return
-        self._golden_reshape_and_cache_prefill(key, value, key_cache, value_cache, scale_cache, slot_mapping, emulator)
+
+        for run in plan.runs:
+            self._kernel_reshape_and_cache_a8(
+                key=_strip_run_rows(key, run),
+                value=_strip_run_rows(value, run),
+                key_cache=key_cache,
+                value_cache=value_cache,
+                scale_cache=scale_cache,
+                slot_mapping=_strip_run_slots(slot_mapping, run),
+                pi_signs=emulator.pi_signs,
+                tables=tables,
+                inv_sqrt_len=emulator.inv_sqrt_len,
+                reuse_mode4_flags=TURBOQUANT_REUSE_MODE4_FLAGS,
+            )
+
+        # One launch per wave, and the public decode entry rather than the
+        # scatter shim: a build that staged the batch writer on without the
+        # scatter writer still has to land these tokens, and the golden writer
+        # is what this file falls back to everywhere else.
+        for wave in plan.waves:
+            rows = torch.as_tensor(wave, dtype=torch.long, device=slot_mapping.device)
+            self.reshape_scatter_decode(
+                key=key.index_select(0, rows).contiguous(),
+                value=value.index_select(0, rows).contiguous(),
+                key_cache=key_cache,
+                value_cache=value_cache,
+                scale_cache=scale_cache,
+                slot_mapping=slot_mapping.index_select(0, rows).contiguous(),
+                emulator=emulator,
+            )
 
     def _kernel_reshape_and_cache_a8(
         self,
@@ -1516,6 +1610,202 @@ class TurboQuantOpsAdapter:
         return output
 
 
+# ---------------------------------------------------------------------------
+# Meeting the batch writer's strip contract from an arbitrary prefill step
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TurboQuantStripRun:
+    """One batch-writer launch: tokens ``[start, stop)`` plus ``pad`` replicas.
+
+    ``pad`` is how many copies of token ``stop - 1`` complete a trailing partial
+    strip to :data:`TURBOQUANT_STRIP_TOKENS`. Their slots are the ones that
+    follow ``slot_mapping[stop - 1]`` inside the same physical page -- a page the
+    request owns and has not filled yet -- and nothing reads them: a reader stops
+    at the sequence length, and the next step overwrites them, whether that is
+    the next prefill chunk or a decode token spliced in by the scatter writer.
+    """
+
+    start: int
+    stop: int
+    pad: int
+
+
+@dataclass(frozen=True)
+class TurboQuantStripPlan:
+    """How one ingestion step is split between the two cache writers.
+
+    ``runs`` go to the batch writer in order, ``waves`` to the scatter writer,
+    one launch each. A wave never holds two tokens of one ``(page, strip)``: the
+    scatter writer's value-plane write is a read-modify-write of the whole
+    16-token strip, so two tokens of one strip in one launch would race and lose
+    an update.
+    """
+
+    runs: tuple
+    waves: tuple
+    num_tokens: int
+
+    @property
+    def is_whole_batch(self) -> bool:
+        """True when one unpadded batch-writer launch covers every token.
+
+        The caller then passes its own tensors straight through, which is what
+        keeps an already-conforming step byte-for-byte what it was before the
+        split existed.
+        """
+        return not self.waves and self.runs == (TurboQuantStripRun(0, self.num_tokens, 0),)
+
+    @property
+    def num_launches(self) -> int:
+        """Kernel launches this plan costs, over both writers."""
+        return len(self.runs) + len(self.waves)
+
+
+def turboquant_plan_strip_ingestion(
+    slots: Sequence[int], block_size: int, strip: int = TURBOQUANT_STRIP_TOKENS
+) -> TurboQuantStripPlan:
+    """Split one step's ``slot_mapping`` between the batch and scatter writers.
+
+    ``slots`` is ``slot_mapping`` as host ints -- ``page * block_size + token``,
+    negative for padding. The batch writer reads one slot per strip on the
+    scalar unit and derives both the page and the strip inside it from that slot
+    alone, so a strip it writes must be 16 tokens whose slots are strip-aligned
+    and consecutive. That is also what keeps a strip inside one page, given
+    ``block_size % 16 == 0``, and it is a per-strip contract rather than a
+    per-step one: strips may jump between pages freely, which is what lets one
+    run cover a prefill spanning several non-adjacent blocks.
+
+    Three shapes come out of a real step:
+
+    * **Whole strips.** The bulk of a prefill, coalesced into as few runs as
+      possible, across page boundaries included.
+    * **A strip-aligned partial strip.** The last ``T % 16`` tokens of a request,
+      at the end of the batch or at a request boundary inside it. Completed to a
+      whole strip by replicating its last token, so the batch writer can take it
+      as one more strip -- see :class:`TurboQuantStripRun` for why the replicas
+      are harmless, and note that the pad is refused outright unless every
+      padded slot is free of a token this very step writes.
+    * **Anything else.** A chunked-prefill continuation that does not start on a
+      strip, a decode token carried in a mixed batch, a padding slot from a dummy
+      capture run. Its strip may already hold another step's tokens, which only a
+      read-modify-write may touch, so these go to the scatter writer -- one launch
+      per token of a shared strip, which is the price of not corrupting the rest
+      of the strip around them.
+
+    Replication rather than zeros is deliberate: an all-zero row has no finite
+    power-of-two scale, and a NaN parked in the scale plane would survive into a
+    gathered page and out through the dequantisation before any mask reached it.
+    """
+    num_tokens = len(slots)
+    runs: list[TurboQuantStripRun] = []
+    scatter: list[int] = []
+    # Only a pad candidate needs this, and a conforming step has none, so it is
+    # built on the first one rather than on every call.
+    written: set[int] | None = None
+
+    def run_length(start: int, limit: int) -> int:
+        """Consecutive non-negative slots from ``start``, capped at ``limit``."""
+        if start >= num_tokens or slots[start] < 0:
+            return 0
+        length = 1
+        while length < limit and start + length < num_tokens and slots[start + length] == slots[start] + length:
+            length += 1
+        return length
+
+    def aligned(start: int) -> bool:
+        return start < num_tokens and slots[start] >= 0 and slots[start] % strip == 0
+
+    def whole_strip(start: int) -> bool:
+        return aligned(start) and run_length(start, strip) == strip
+
+    def pad_for_partial_strip(start: int) -> int:
+        """Replicas that complete a strip-aligned partial strip at ``start``, or 0."""
+        if not aligned(start):
+            return 0
+        tail = run_length(start, strip)
+        if not 0 < tail < strip:
+            return 0
+        pad = strip - tail
+        last = slots[start] + tail - 1
+        # Implied by ``slots[start] % strip == 0`` and ``block_size % strip == 0``,
+        # and checked anyway: a page geometry that broke it would put the pad in
+        # the next page, which belongs to someone else.
+        if block_size <= 0 or (last + pad) // block_size != last // block_size:
+            return 0
+        # The pad must not land on a slot this step writes for real. It cannot,
+        # for a request whose tail this is -- but a caller that repeated a slot,
+        # or ordered one out of sequence, would otherwise have a replica
+        # silently beat the real token to it.
+        nonlocal written
+        if written is None:
+            written = {slot for slot in slots if slot >= 0}
+        if any(slots[start] + offset in written for offset in range(tail, strip)):
+            return 0
+        return pad
+
+    index = 0
+    while index < num_tokens:
+        if whole_strip(index):
+            stop = index + strip
+            while whole_strip(stop):
+                stop += strip
+            runs.append(TurboQuantStripRun(index, stop, 0))
+            index = stop
+            continue
+        pad = pad_for_partial_strip(index)
+        if pad:
+            stop = index + (strip - pad)
+            runs.append(TurboQuantStripRun(index, stop, pad))
+            index = stop
+            continue
+        scatter.append(index)
+        index += 1
+
+    return TurboQuantStripPlan(
+        runs=tuple(runs),
+        waves=_strip_scatter_waves(slots, scatter, strip),
+        num_tokens=num_tokens,
+    )
+
+
+def _strip_scatter_waves(slots: Sequence[int], tokens: Sequence[int], strip: int) -> tuple:
+    """Group scatter-writer tokens so that no wave holds two tokens of one strip."""
+    waves: list[list[int]] = []
+    depth: dict[int, int] = {}
+    for token in tokens:
+        slot = slots[token]
+        if slot < 0:
+            # The writer skips a negative slot, so it reads and writes nothing
+            # and cannot collide with anything.
+            wave = 0
+        else:
+            wave = depth.get(slot // strip, 0)
+            depth[slot // strip] = wave + 1
+        while len(waves) <= wave:
+            waves.append([])
+        waves[wave].append(token)
+    return tuple(tuple(wave) for wave in waves)
+
+
+def _strip_run_rows(activations: torch.Tensor, run: TurboQuantStripRun) -> torch.Tensor:
+    """``[T, H, D]`` -> the run's rows, its trailing partial strip replicated out."""
+    window = activations[run.start : run.stop]
+    if not run.pad:
+        return window
+    return torch.cat((window, window[-1:].expand(run.pad, *window.shape[1:]))).contiguous()
+
+
+def _strip_run_slots(slot_mapping: torch.Tensor, run: TurboQuantStripRun) -> torch.Tensor:
+    """``[T]`` int32 -> the run's slots, continued through its replicated tail."""
+    window = slot_mapping[run.start : run.stop]
+    if not run.pad:
+        return window
+    pad = torch.arange(1, run.pad + 1, dtype=window.dtype, device=window.device) + window[-1]
+    return torch.cat((window, pad)).contiguous()
+
+
 def _flat_slot_view(cache: torch.Tensor) -> torch.Tensor:
     """``(num_blocks, block_size, H, D/2)`` -> ``(num_blocks * block_size, H, D/2)``.
 
@@ -1908,7 +2198,10 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
         metadata keeps it off the device). A metadata object that does not carry
         it, or carries ``None`` -- a dummy capture run, or a builder that has not
         filled it -- reads as zero requests and therefore as prefill, which is
-        the writer that assumes the least about the slots it is given.
+        the branch that plans its own dispatch and so assumes nothing about the
+        slots it is given: a dummy run's all-negative slot mapping reaches the
+        scatter writer, which skips it, rather than the batch writer, which
+        refuses it.
         """
         seq_lens_list = getattr(attn_metadata, "seq_lens_list", None)
         num_requests = len(seq_lens_list) if seq_lens_list is not None else 0
