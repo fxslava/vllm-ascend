@@ -730,6 +730,16 @@ __aicore__ inline void Run_(__gm__ bfloat16_t* key_gm, __gm__ bfloat16_t* value_
 
 }  // namespace turboquant_scatter
 
+#endif  // __CCE_AICORE__ -- everything above is the device-side body
+
+// ------------------------------------------------------------- entry point
+// Compiled in EVERY pass of this translation unit, host and device alike; only
+// the body stays behind __CCE_AICORE__. Under the CANN 9.2 ASC language
+// toolchain the host-side launch stub of a `__global__` function is emitted by
+// the host pass from the function's DEFINITION, so a definition hidden behind
+// __CCE_AICORE__ leaves the triple-chevron launch below referring to a symbol
+// nothing in libvllm_ascend_turboquant.so defines. See the longer note in
+// turboquant_reshape_batch.cpp.
 extern "C" __global__ __aicore__ void turboquant_reshape_scatter_aiv(
     __gm__ bfloat16_t* __restrict__ key, __gm__ bfloat16_t* __restrict__ value,
     __gm__ std::int8_t* __restrict__ keyCache, __gm__ std::int8_t* __restrict__ valueCache,
@@ -739,22 +749,21 @@ extern "C" __global__ __aicore__ void turboquant_reshape_scatter_aiv(
     uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize, uint32_t numBlocks,
     uint32_t itemBegin, uint32_t itemCount, float invSqrtLen)
 {
+#if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     AscendC::InitSocState();
     turboquant_scatter::Run_(key, value, keyCache, valueCache, scaleCache, slotMapping,
                              piSigns, cuSeqlens, launchProbe, numRequests, numKvHeads,
                              headSize, blockSize, numBlocks, itemBegin, itemCount,
                              invSqrtLen);
+#endif
 }
 
-#elif defined(ASCEND_MICRO_CANN_LAUNCH)
+#if defined(ASCEND_MICRO_CANN_LAUNCH) && !defined(__CCE_AICORE__)
 
-extern "C" __global__ __aicore__ void turboquant_reshape_scatter_aiv(
-    __gm__ bfloat16_t*, __gm__ bfloat16_t*, __gm__ std::int8_t*, __gm__ std::int8_t*,
-    __gm__ float*, __gm__ std::int32_t*, __gm__ float*, __gm__ std::int32_t*,
-    __gm__ std::int32_t*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
-    uint32_t, float);
-
+// No prototype for the kernel here any more: its definition above is visible in
+// this pass, which is what makes the host launch stub exist at all, and the one
+// argument block is now written once rather than twice.
 extern "C" void launch_turboquant_reshape_scatter_aiv(
     void* stream, std::uint32_t block_dim, std::uint16_t* key, std::uint16_t* value,
     std::int8_t* key_cache, std::int8_t* value_cache, float* scale_cache,

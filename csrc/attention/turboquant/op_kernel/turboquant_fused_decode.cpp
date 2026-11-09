@@ -1063,15 +1063,33 @@ static_assert(!ascend_micro::fused_decode_opt::valid_launch(
     } while (0)
 #endif
 
-#define ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT(NAME, MODE, TYPE)                                                      \
-    extern "C" __global__ __aicore__ void NAME(                                                                      \
-        GM_ADDR queryRot, GM_ADDR keyCache, GM_ADDR valueCache, GM_ADDR scaleCache, GM_ADDR blockTables,             \
-        GM_ADDR contextLens, GM_ADDR modeTables, GM_ADDR workspace, GM_ADDR output, GM_ADDR tiling,                  \
-        uint32_t numTokens,                                                                                          \
-        uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,      \
-        uint32_t numSplits, uint32_t headsPerTask, uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,              \
-        uint32_t fusedContextLimit, float scale, float invSqrtLen)                                                   \
-    {                                                                                                                \
+#endif  // __CCE_AICORE__ -- everything above is the device-side body
+
+// ------------------------------------------------------------------------- entry points
+// The four `__global__` entry points this file publishes are instantiated in EVERY pass of
+// this translation unit, host and device alike; only their *bodies* stay behind
+// __CCE_AICORE__, which is what the two BODY macros below are for.
+//
+// That is not a style choice. CANN 9.2 builds this file with the ASC language toolchain
+// (bisheng, --npu-arch=dav-3510, see the root CMakeLists), which is single-source: one
+// driver invocation runs a host pass and two device passes over the same text, and the
+// host-side launch stub of a `__global__` function is emitted by the host pass from that
+// function's DEFINITION. A prototype is not enough. With the definitions inside the
+// device-only region -- which is where the legacy ascendc_library wanted them, because
+// there a generated host_stub.cpp supplied the stubs instead -- the host pass sees only a
+// prototype, emits no stub, and the triple-chevron launches at the bottom of this file
+// leave all four kernels UNDEFINED in libvllm_ascend_turboquant.so itself. The library
+// still links and every launch_* entry is present, so the only symptom is an undefined
+// symbol when Python dlopen()s the extension. See the longer note in
+// turboquant_reshape_batch.cpp.
+//
+// GM_ADDR is part of the published signature, so kernel_operator.h has to be reachable in
+// the host pass too; the include is a no-op in the device passes, which already have it.
+#include "kernel_operator.h"
+
+#if defined(__CCE_AICORE__)
+
+#define ASCEND_TQ_FUSED_DECODE_OPT_BODY(MODE, TYPE) \
         KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2); \
         AscendC::InitSocState(); \
         AscendC::TPipe pipe;                                                                                         \
@@ -1084,22 +1102,9 @@ static_assert(!ascend_micro::fused_decode_opt::valid_launch(
             AscendC::SyncAll<false>();                                                                                \
             ASCEND_TQ_FUSED_DECODE_REDUCE_PHASE(TYPE);                                                                 \
         }                                                                                                             \
-        DrainFusedDecodeTask(); \
-    }
+        DrainFusedDecodeTask();
 
-// The raw-query entry, argument for argument the same as the lock-step decode's, so a benchmark or an
-// msprof run can swap one launcher for the other without touching its tiling.
-#define ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT_RAW_QUERY(NAME, MODE, TYPE)                                            \
-    extern "C" __global__ __aicore__ void NAME(                                                                      \
-        GM_ADDR query, GM_ADDR piSigns, GM_ADDR rotTables, GM_ADDR h16, GM_ADDR gate, GM_ADDR queryRot,              \
-        GM_ADDR keyCache, GM_ADDR valueCache, GM_ADDR scaleCache, GM_ADDR blockTables, GM_ADDR contextLens,          \
-        GM_ADDR modeTables, GM_ADDR workspace, GM_ADDR output, GM_ADDR tiling,                                       \
-        uint32_t numTokens, uint32_t numHeads,                                                                       \
-        uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits,     \
-        uint32_t headsPerTask, uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,                                 \
-        uint32_t prologueVectorsPerBlock, uint32_t prologueCubeChunkVectors, uint32_t outputStage,                   \
-        uint32_t fusedContextLimit, float scale, float invSqrtLen)                                                   \
-    {                                                                                                                \
+#define ASCEND_TQ_FUSED_DECODE_OPT_RAW_QUERY_BODY(MODE, TYPE) \
         KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2); \
         AscendC::InitSocState(); \
         AscendC::TPipe pipe;                                                                                         \
@@ -1115,7 +1120,41 @@ static_assert(!ascend_micro::fused_decode_opt::valid_launch(
             AscendC::SyncAll<false>();                                                                                  \
             ASCEND_TQ_FUSED_DECODE_REDUCE_PHASE(TYPE);                                                                  \
         }                                                                                                              \
-        DrainFusedDecodeTask(); \
+        DrainFusedDecodeTask();
+
+#else   // the host pass: the launch stub needs the signature, not the schedule
+
+#define ASCEND_TQ_FUSED_DECODE_OPT_BODY(MODE, TYPE)
+#define ASCEND_TQ_FUSED_DECODE_OPT_RAW_QUERY_BODY(MODE, TYPE)
+
+#endif  // __CCE_AICORE__
+
+#define ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT(NAME, MODE, TYPE)                                                      \
+    extern "C" __global__ __aicore__ void NAME(                                                                      \
+        GM_ADDR queryRot, GM_ADDR keyCache, GM_ADDR valueCache, GM_ADDR scaleCache, GM_ADDR blockTables,             \
+        GM_ADDR contextLens, GM_ADDR modeTables, GM_ADDR workspace, GM_ADDR output, GM_ADDR tiling,                  \
+        uint32_t numTokens,                                                                                          \
+        uint32_t numHeads, uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,      \
+        uint32_t numSplits, uint32_t headsPerTask, uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,              \
+        uint32_t fusedContextLimit, float scale, float invSqrtLen)                                                   \
+    {                                                                                                                \
+        ASCEND_TQ_FUSED_DECODE_OPT_BODY(MODE, TYPE)                                                        \
+    }
+
+// The raw-query entry, argument for argument the same as the lock-step decode's, so a benchmark or an
+// msprof run can swap one launcher for the other without touching its tiling.
+#define ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT_RAW_QUERY(NAME, MODE, TYPE)                                            \
+    extern "C" __global__ __aicore__ void NAME(                                                                      \
+        GM_ADDR query, GM_ADDR piSigns, GM_ADDR rotTables, GM_ADDR h16, GM_ADDR gate, GM_ADDR queryRot,              \
+        GM_ADDR keyCache, GM_ADDR valueCache, GM_ADDR scaleCache, GM_ADDR blockTables, GM_ADDR contextLens,          \
+        GM_ADDR modeTables, GM_ADDR workspace, GM_ADDR output, GM_ADDR tiling,                                       \
+        uint32_t numTokens, uint32_t numHeads,                                                                       \
+        uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits,     \
+        uint32_t headsPerTask, uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,                                 \
+        uint32_t prologueVectorsPerBlock, uint32_t prologueCubeChunkVectors, uint32_t outputStage,                   \
+        uint32_t fusedContextLimit, float scale, float invSqrtLen)                                                   \
+    {                                                                                                                \
+        ASCEND_TQ_FUSED_DECODE_OPT_RAW_QUERY_BODY(MODE, TYPE)                                                        \
     }
 
 // kv4fp8 only: the NZ-tiled ring ingest the schedule is built on, and the one mode the fused decode is
@@ -1142,29 +1181,12 @@ ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT(turboquant_mm_fused_decode_opt_kv4fp8_bf16
 ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT_RAW_QUERY(turboquant_mm_fused_decode_opt_raw_query_kv4fp8_bf16,
                                                 TurboQuantMode::KV4_FP8, bfloat16_t)
 
-#elif defined(ASCEND_MICRO_CANN_LAUNCH)
-#include "kernel_operator.h"
+#if defined(ASCEND_MICRO_CANN_LAUNCH) && !defined(__CCE_AICORE__)
 #include <stdexcept>
-extern "C" __global__ __aicore__ void turboquant_mm_fused_decode_opt_kv4fp8_half(
-    GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR,
-    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
-    uint32_t, uint32_t, uint32_t, float, float);
-extern "C" __global__ __aicore__ void turboquant_mm_fused_decode_opt_raw_query_kv4fp8_half(
-    GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR,
-    GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR,
-    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
-    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, float);
-// The bf16 instances. Same signature, same tiling, same cache format: only the query/output
-// element type differs, so a caller swaps one symbol for the other and changes nothing else.
-extern "C" __global__ __aicore__ void turboquant_mm_fused_decode_opt_kv4fp8_bf16(
-    GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR,
-    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
-    uint32_t, uint32_t, uint32_t, float, float);
-extern "C" __global__ __aicore__ void turboquant_mm_fused_decode_opt_raw_query_kv4fp8_bf16(
-    GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR,
-    GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR, GM_ADDR,
-    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
-    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, float);
+
+// No prototypes for the four kernels here any more: their definitions above are visible in
+// this pass, which is what makes the host launch stubs exist at all, and the argument
+// blocks are now written once -- in the two entry-point macros -- rather than twice.
 
 namespace vllm_ascend {
 

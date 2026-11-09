@@ -1599,6 +1599,28 @@ __aicore__ inline void KernelBody(
 }
 }  // namespace turboquant_bf16
 
+#endif  // __CCE_AICORE__ -- everything above is the device-side body
+
+// ------------------------------------------------------------- entry points
+// The two `__global__` entry points below are compiled in EVERY pass of this
+// translation unit, host and device alike; only their *bodies* stay behind
+// __CCE_AICORE__.
+//
+// That is not a style choice. CANN 9.2 builds this file with the ASC language
+// toolchain (bisheng, --npu-arch=dav-3510, see the root CMakeLists), which is
+// single-source: one driver invocation runs a host pass and two device passes
+// over the same text, and the host-side launch stub of a `__global__` function
+// is emitted by the host pass from that function's DEFINITION. A prototype is
+// not enough. With the definitions inside the device-only region -- which is
+// where the legacy ascendc_library wanted them, because there a generated
+// host_stub.cpp supplied the stubs instead -- the host pass sees only a
+// prototype, emits no stub, and the triple-chevron launch at the bottom of this
+// file leaves `turboquant_reshape_and_cache_bf16` UNDEFINED in
+// libvllm_ascend_turboquant.so itself. The library still links and every
+// launch_* entry is present, so the only symptom is an undefined symbol when
+// Python dlopen()s the extension; `nm -D` on the library is what shows it, with
+// the kernels marked U beside the T launchers that call them.
+//
 // Entry point A, the default: the recycled bilateral two-slot mode-4 ring.
 // Five channels per sub block whatever the schedule length, sound because
 // every announcement in the body above is behind its x_S drain
@@ -1627,12 +1649,14 @@ extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_bf16(
     uint32_t blockSize, uint32_t numBlocks, uint32_t tokensPerCore,
     float invSqrtLen)
 {
+#if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     turboquant_bf16::KernelBody<true>(
         key, value, keyCache, valueCache,
         scaleCache, slotMapping, piSigns, tables,
         numTokens, numKvHeads, headSize, blockSize,
         numBlocks, tokensPerCore, invSqrtLen);
+#endif
 }
 
 // Entry point B: single-shot channels, one id per cross-core event. Byte
@@ -1665,38 +1689,34 @@ extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_bf16_mode4_si
     uint32_t blockSize, uint32_t numBlocks, uint32_t tokensPerCore,
     float invSqrtLen)
 {
+#if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     turboquant_bf16::KernelBody<false>(
         key, value, keyCache, valueCache,
         scaleCache, slotMapping, piSigns, tables,
         numTokens, numKvHeads, headSize, blockSize,
         numBlocks, tokensPerCore, invSqrtLen);
+#endif
 }
 
-#elif defined(ASCEND_MICRO_CANN_LAUNCH)
+#if defined(ASCEND_MICRO_CANN_LAUNCH) && !defined(__CCE_AICORE__)
 
 #include <stdexcept>
 
-// The activations are 2-byte here, and this leg has no CANN headers -- the
-// device types live behind `#if defined(__CCE_AICORE__)` -- so `bfloat16_t` is
-// not available. std::uint16_t stands in for it: the two legs are separate
-// translation units, every pointer becomes void* in the generated argument
-// block, and the host side naturally holds BF16 as bit patterns anyway. The
-// `tables` parameter keeps the std::int32_t* spelling the INT8 kernel published
-// and is reinterpreted device side, exactly as it was there.
-extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_bf16(
-    __gm__ std::uint16_t*, __gm__ std::uint16_t*, __gm__ std::int8_t*,
-    __gm__ std::int8_t*, __gm__ float*, __gm__ std::int32_t*,
-    __gm__ float*, __gm__ std::int32_t*, uint32_t, uint32_t,
-    uint32_t, uint32_t, uint32_t, uint32_t, float);
-
-// The single-shot variant is a second __global__ symbol with the same
-// argument block; the launcher below picks between them.
-extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_bf16_mode4_single_shot(
-    __gm__ std::uint16_t*, __gm__ std::uint16_t*, __gm__ std::int8_t*,
-    __gm__ std::int8_t*, __gm__ float*, __gm__ std::int32_t*,
-    __gm__ float*, __gm__ std::int32_t*, uint32_t, uint32_t,
-    uint32_t, uint32_t, uint32_t, uint32_t, float);
+// No prototypes for the two kernels here any more: their definitions above are
+// visible in this pass, which is both what makes the host launch stub exist at
+// all (see the entry-point note) and what removes the second spelling of the
+// argument block that used to live here and could drift from the kernel's.
+//
+// The activations are 2-byte and the Torch adapter that calls the launcher is
+// built by the ordinary host compiler, which has no CANN types, so the
+// launcher's own interface stays std::uint16_t* and reinterprets at the
+// triple-chevron call. `bfloat16_t` is a bisheng builtin -- it comes from
+// __clang_cce_types.h, force-included in every pass, not from
+// kernel_operator.h -- so the kernels' bfloat16_t parameters are as available
+// in this pass as they are in the device ones. The `tables` parameter keeps the
+// std::int32_t* spelling the INT8 kernel published and is reinterpreted device
+// side, exactly as it was there.
 
 // The launcher keeps the const-correct interface the caller sees and strips it
 // at the triple-chevron call, which is where the generated argument block
@@ -1737,7 +1757,8 @@ extern "C" void launch_turboquant_reshape_and_cache_bf16(
         turboquant_wave::TotalStrips(num_tokens, tokens_per_core);
     if (!reuse_mode4_flags) {
         turboquant_reshape_and_cache_bf16_mode4_single_shot<<<grid, nullptr, stream>>>(
-            const_cast<std::uint16_t*>(key), const_cast<std::uint16_t*>(value), key_cache,
+            reinterpret_cast<bfloat16_t*>(const_cast<std::uint16_t*>(key)),
+            reinterpret_cast<bfloat16_t*>(const_cast<std::uint16_t*>(value)), key_cache,
             value_cache, scale_cache, const_cast<std::int32_t*>(slot_mapping),
             const_cast<float*>(pi_signs), const_cast<std::int32_t*>(tables), num_tokens,
             num_kv_heads, head_size, block_size, num_blocks, tokens_per_core,
@@ -1745,7 +1766,8 @@ extern "C" void launch_turboquant_reshape_and_cache_bf16(
         return;
     }
     turboquant_reshape_and_cache_bf16<<<grid, nullptr, stream>>>(
-        const_cast<std::uint16_t*>(key), const_cast<std::uint16_t*>(value), key_cache,
+        reinterpret_cast<bfloat16_t*>(const_cast<std::uint16_t*>(key)),
+        reinterpret_cast<bfloat16_t*>(const_cast<std::uint16_t*>(value)), key_cache,
         value_cache, scale_cache, const_cast<std::int32_t*>(slot_mapping),
         const_cast<float*>(pi_signs), const_cast<std::int32_t*>(tables), num_tokens,
         num_kv_heads, head_size, block_size, num_blocks, tokens_per_core,
