@@ -1,7 +1,8 @@
 # TurboQuant kernels and Torch bindings
 
-Everything in this directory except `torch_bindings.cpp` and
-`op_kernel/common/turboquant_strip_layout.h` is a **verbatim mirror** of
+Everything in this directory except `torch_bindings.cpp`,
+`op_kernel/common/turboquant_strip_layout.h` and the tail of
+`op_kernel/common/turboquant_layout.h` is a **verbatim mirror** of
 `kernels/ops/turboquant/vllm_integration_layer` in the ascend-micro-harness.
 The mirror is byte-for-byte and needed **no include-path edits**: every include
 in the audited tree is either a CANN system header (`kernel_operator.h`,
@@ -36,6 +37,41 @@ UB alignments are all load-bearing and audited there.
   replaced: its include moved with the wave protocol, and `kCacheStripRows` is
   now a literal 16 because the audited wave protocol no longer publishes
   `kReshapeTokensPerStrip`.
+* `op_kernel/common/turboquant_layout.h` — mirrored except for the four
+  ingress helpers the harness added in its `00cf08c`: `NzTiledChannelByte`,
+  `NzTiledChannelNibble`, `NzScaleSlotFloats` and `NzTiledScaleIndex`. They are
+  **deliberately not here**, and re-mirroring them is a mistake rather than a
+  tidy-up, because each states a contract this repo's writers do not implement:
+
+    * they pair nibbles **woven**, channel `c` with channel `c + headSize/2` in
+      one byte. Both writers here pair **adjacent elements**, low nibble even —
+      the "Layout contracts" block of `op_kernel/turboquant_reshape_batch.cpp`
+      and the nibble-index comment in
+      `op_kernel/turboquant_reshape_scatter.cpp`. The harness file says so
+      itself: the woven pairing is "NOT the RFC 3.1 strip contract's two
+      adjacent channels per byte".
+    * `NzTiledScaleIndex` indexes scales per slot, `slot * NzScaleSlotFloats(H)
+      + kv * H + kvHead`. The scale plane here is plane-major over pages,
+      `((kv * numBlocks + block) * numKvHeads + head) * blockSize + key`.
+
+  `NzTiledPackedByte`, which **is** mirrored and is used by
+  `op_kernel/vector/turboquant_vector_service.h` and `op_kernel/common/turboquant_mode.h`,
+  is a different thing: it addresses the tile a byte lives in, which kv4fp8 does
+  store NZ-tiled (`kStoresNzTiles`). Tile addressing and nibble pairing are
+  orthogonal; only the latter is in dispute.
+
+  The adjacent-element pairing is gated by
+  `tests/ut/attention/test_turboquant_strip_cache.py::test_strip_write_matches_the_kernel_nibble_formula`
+  (its `_nibble` helper, at `block_size` 16, 32 and 64), so adopting the woven
+  pairing fails there rather than silently writing a cache the decode misreads.
+  The harness's own NZ-ingress work — `TURBOQUANT_INGRESS_NZ`, the mode-2
+  rendezvous prefill and the `(c, c + 128)` weave — lives in its **standalone**
+  `kernels/ops/turboquant/turboquant_reshape_and_cache_bf16.cpp`, a different and
+  larger kernel over a different include graph (`baseline/common/`, the harness
+  `routines/` and `tests/common/`), with `block_size` meaning the 16-token strip
+  height rather than vLLM's page size. None of it has reached
+  `vllm_integration_layer`, so there is nothing to mirror yet and a hand-port is
+  a reviewed porting job, not a file copy.
 * The harness's `tests/`, `standalone/` and `sim_micro_testbed.hpp` consumers.
   Their gates run in the harness checkout, not here.
 
