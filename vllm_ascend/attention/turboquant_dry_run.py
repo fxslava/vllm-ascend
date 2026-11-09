@@ -177,10 +177,12 @@ _FP32_MAX_BIASED_EXPONENT: Final[int] = 254
 TURBOQUANT_STAGES_ENV: Final[str] = "TURBOQUANT_KERNEL_STAGES"
 TURBOQUANT_NAMESPACE_ENV: Final[str] = "TURBOQUANT_OPS_NAMESPACE"
 
-# torch.ops namespace the kernels register into once their TORCH_LIBRARY
-# fragment lands. The in-tree AscendC operators use "_C_ascend"; the staging
-# subtree registers nothing yet (op_adapter/turboquant_torch_ops.h is a symbol
-# inventory), so the name is configurable rather than hardcoded.
+# torch.ops namespace the kernels register into. The in-tree AscendC operators
+# use "_C_ascend"; these have their own, defined by the TORCH_LIBRARY_FRAGMENT in
+# csrc/attention/turboquant/torch_bindings.cpp, which registers the two cache
+# writers and the fused decode. The remaining four entry points below are still
+# unregistered, and the name stays configurable so a staging build can park the
+# fragment elsewhere without a code change.
 TURBOQUANT_DEFAULT_NAMESPACE: Final[str] = "turboquant_ops"
 
 
@@ -285,8 +287,9 @@ class TurboQuantOpsConfig:
         """Read the configuration out of the environment.
 
         ``TURBOQUANT_KERNEL_STAGES`` is a comma-separated list of
-        :class:`TurboQuantKernelStage` values, or ``all``, or ``none`` -- the
-        default, because no kernel is registered yet, so every operation is golden.
+        :class:`TurboQuantKernelStage` values, or ``all``, or ``none``. ``none``
+        is the default: the kernels exist only on an ``ascend950`` build, and a
+        run has to ask for them before any stage leaves the golden model.
         """
         raw = os.getenv(TURBOQUANT_STAGES_ENV, "none").strip().lower()
         if raw in ("", "none", "0", "off"):
@@ -598,6 +601,119 @@ TURBOQUANT_DECODE_SPLITS: Final[int] = 1
 TURBOQUANT_DECODE_MAX_HEADS_PER_TASK: Final[int] = 16
 
 
+# ---------------------------------------------------------------------------
+# Loading the translation unit that carries the registrations.
+# ---------------------------------------------------------------------------
+
+# The three the fragment in csrc/attention/turboquant/torch_bindings.cpp
+# registers. The other four entry points above have no kernel behind them yet,
+# so their absence is not worth reporting.
+TURBOQUANT_REGISTERED_OPS: Final[tuple[str, ...]] = (
+    TURBOQUANT_OP_RESHAPE_AND_CACHE,
+    TURBOQUANT_OP_RESHAPE_SCATTER,
+    TURBOQUANT_OP_FUSED_DECODE,
+)
+
+# Tri-state so the import is attempted once per process: True it landed, False
+# it did not, None not tried yet.
+_TURBOQUANT_EXTENSION_LOADED: bool | None = None
+
+
+def _is_op_registered(namespace: str, op_name: str) -> bool:
+    """Whether ``namespace::op_name`` has a kernel in the dispatcher.
+
+    Deliberately NOT ``getattr(torch.ops, namespace, None) is not None``:
+    ``torch.ops.__getattr__`` manufactures an ``_OpNamespace`` for whatever name
+    it is handed and never raises, so that test passes for a namespace nothing
+    ever registered. Worse, the manufactured object is cached, so the namespace
+    then shows up in ``dir(torch.ops)`` -- which :meth:`_resolve_kernel` causes
+    on its first call -- and a diagnostic built on either would claim these
+    kernels are present on a build that has none of them.
+
+    ``torch._C._dispatch_has_kernel`` asks the dispatcher, which is what a
+    ``TORCH_LIBRARY_FRAGMENT`` actually writes into. It is private, hence the
+    fallback onto the same resolution ``_resolve_kernel`` performs -- where
+    ``_OpNamespace.__getattr__`` does raise for an operator it cannot find.
+    """
+    try:
+        return bool(torch._C._dispatch_has_kernel(f"{namespace}::{op_name}"))
+    except (AttributeError, RuntimeError):
+        try:
+            getattr(getattr(torch.ops, namespace), op_name)
+        except (AttributeError, RuntimeError):
+            return False
+        return True
+
+
+def load_turboquant_extension() -> bool:
+    """Import the extension whose static initialisers define the ops.
+
+    ``TORCH_LIBRARY_FRAGMENT(turboquant_ops, ops)`` in
+    ``csrc/attention/turboquant/torch_bindings.cpp`` runs when
+    ``vllm_ascend.vllm_ascend_C`` is imported and not before, so
+    ``torch.ops.turboquant_ops`` does not exist until something imports that
+    module. CMakeLists.txt adds the binding TU only on an ``ascend950`` build,
+    so on every other part the namespace is absent by construction and that
+    absence is the intended fallback signal -- there is nothing to load and this
+    returns False without complaint.
+
+    On an ascend950 build the module has to be imported from here, because the
+    usual loader never will. :func:`vllm_ascend.utils.enable_custom_op` is that
+    loader, and on this part it returns False at its capability check *without
+    importing anything*: the A5 hardware profile deliberately withholds
+    ``HardwareCapability.RUNTIME_CUSTOM_OPS`` while the other AscendC operators
+    are only partially available there (vllm-ascend issue #7157). The TurboQuant
+    ops are gated by ``TURBOQUANT_KERNEL_STAGES`` instead, so they do not want
+    that switch -- and since every consumer of the ops it does disable asks
+    ``enable_custom_op()`` rather than ``torch.ops``, registering their schemas
+    as a side effect of this import leaves them exactly as unreachable as
+    before. Registering a schema is not executing it.
+
+    ``bootstrap_custom_op_env()`` and then the explicit import is the pattern the
+    A5 operator tests already use -- see
+    ``tests/e2e/nightly/single_node/ops/singlecard_ops/test_scatter_nd_update_sk.py``
+    and ``test_add_rms_norm_bias_a5.py``, whose comments name this same
+    capability gap.
+
+    This is deliberately NOT done from ``vllm_ascend/__init__.py``. That module
+    is imported in every process on every part, and importing the extension at
+    interpreter start is the one thing ``enable_custom_op``'s laziness exists to
+    prevent: it initialises CANN's RTS component while
+    ``ASCEND_RT_VISIBLE_DEVICES`` can still be changed before
+    ``torch.npu.set_device()``. Doing it here keeps the cost on the runs that
+    asked for a kernel stage.
+    """
+    global _TURBOQUANT_EXTENSION_LOADED
+    if _TURBOQUANT_EXTENSION_LOADED is not None:
+        return _TURBOQUANT_EXTENSION_LOADED
+
+    # Two steps, two handlers: the bootstrap only prepends the vendor op_api
+    # search paths, so losing it must not stop the import that actually carries
+    # the registrations. Collapsing these would let an unrelated failure here
+    # look exactly like a build with no kernels in it.
+    try:
+        from vllm_ascend.utils import bootstrap_custom_op_env  # noqa: PLC0415
+
+        if not torch.compiler.is_compiling():
+            bootstrap_custom_op_env()
+    except ImportError as exc:
+        logger.debug("TurboQuant: bootstrap_custom_op_env is unavailable (%s); importing anyway.", exc)
+
+    try:
+        import vllm_ascend.vllm_ascend_C  # type: ignore[import-untyped]  # noqa: F401, PLC0415
+
+        _TURBOQUANT_EXTENSION_LOADED = True
+    except (ImportError, OSError) as exc:
+        # Not a failure in itself: a build for any other SoC has no binding TU
+        # and a source checkout has no extension at all. OSError as well as
+        # ImportError because a built extension that cannot dlopen its CANN
+        # dependencies raises that instead. The caller reports the consequence
+        # -- the missing operators -- once, with the stages that wanted them.
+        _TURBOQUANT_EXTENSION_LOADED = False
+        logger.debug("TurboQuant: vllm_ascend.vllm_ascend_C did not import (%s).", exc)
+    return _TURBOQUANT_EXTENSION_LOADED
+
+
 class TurboQuantOpsAdapter:
     """The seam between the TurboQuant NPU kernels and their PyTorch reference.
 
@@ -609,9 +725,14 @@ class TurboQuantOpsAdapter:
 
     The entry points are the declaration surface of
     ``kernels/ops/turboquant/vllm_integration_layer/op_adapter`` in the
-    ascend-micro-harness. Nothing registers them yet -- that subtree is a symbol
-    inventory -- so every ``_kernel_*`` body here is the call it will make, and
-    the arguments nothing on the Python side builds yet are passed as ``None``.
+    ascend-micro-harness. Three of them are registered on an ``ascend950`` build
+    -- ``npu_turboquant_reshape_and_cache_a8``,
+    ``npu_turboquant_reshape_scatter_aiv`` and ``npu_turboquant_fused_decode``,
+    by the fragment in ``csrc/attention/turboquant/torch_bindings.cpp``, whose
+    schemas these ``_kernel_*`` parameter lists match argument for argument. The
+    other four (``rotate``, ``quantize_pack``, ``unpack_dequant``,
+    ``gather_pages``) have no kernel behind them yet, so their bodies are the
+    call they will make and they always fall back.
     """
 
     def __init__(
@@ -621,6 +742,46 @@ class TurboQuantOpsAdapter:
         self.config: TurboQuantOpsConfig = config if config is not None else TurboQuantOpsConfig.from_env()
         self._emulators: dict[tuple[int, str], TurboQuantEmulator] = {}
         self._missing_kernels: set[str] = set()
+        if self.config.kernel_stages:
+            # Only a run that asked for a kernel stage pays for the import, and
+            # only such a run is entitled to complain that it is missing.
+            load_turboquant_extension()
+            self._report_namespace()
+
+    def _report_namespace(self) -> None:
+        """Say once which of the registered ops arrived, and what to look at if not.
+
+        :meth:`_resolve_kernel` already warns per operation as each is first
+        reached, but it cannot distinguish a build that registered nothing from
+        one whose kernels are there and simply lacks the stage being asked for.
+        This separates them up front, while the distinction is still cheap to
+        act on: nothing registered points at the extension or at the ascend950
+        build of it, a partial set points at the fragment.
+        """
+        stages = sorted(stage.value for stage in self.config.kernel_stages)
+        namespace = self.config.ops_namespace
+        missing = [op for op in TURBOQUANT_REGISTERED_OPS if not _is_op_registered(namespace, op)]
+        if not missing:
+            logger.debug(
+                "TurboQuant: torch.ops.%s carries %s for stages %s.",
+                namespace,
+                list(TURBOQUANT_REGISTERED_OPS),
+                stages,
+            )
+            return
+        logger.warning(
+            "TurboQuant stages %s are switched on but torch.ops.%s is missing %s, which will "
+            "run the PyTorch golden model instead. These registrations are static initialisers "
+            "of vllm_ascend.vllm_ascend_C (import of it %s here), and CMakeLists.txt compiles "
+            "csrc/attention/turboquant/torch_bindings.cpp only when SOC_VERSION matches "
+            "ascend950 -- so on any other part they are absent by construction. Operators the "
+            "dispatcher does have under this namespace: %s",
+            stages,
+            namespace,
+            missing,
+            "succeeded" if _TURBOQUANT_EXTENSION_LOADED else "failed",
+            [op for op in TURBOQUANT_REGISTERED_OPS if op not in missing] or "none",
+        )
 
     # -- plumbing ----------------------------------------------------------
 

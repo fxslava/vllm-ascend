@@ -15,12 +15,14 @@ Three properties are pinned here:
   decode to the golden gather, dequantise and attend path.
 """
 
+import logging
 import types
 from typing import Any
 
 import pytest
 import torch
 
+from vllm_ascend.attention import turboquant_dry_run
 from vllm_ascend.attention.turboquant_dry_run import (
     TURBOQUANT_DECODE_SPLITS,
     TURBOQUANT_OP_FUSED_DECODE,
@@ -30,6 +32,7 @@ from vllm_ascend.attention.turboquant_dry_run import (
     TURBOQUANT_OP_RESHAPE_SCATTER,
     TURBOQUANT_OP_ROTATE,
     TURBOQUANT_OP_UNPACK_DEQUANT,
+    TURBOQUANT_REGISTERED_OPS,
     TURBOQUANT_REUSE_MODE4_FLAGS,
     TURBOQUANT_STAGE_ROTATED_BASIS,
     TURBOQUANT_STAGE_UNROTATED,
@@ -40,6 +43,8 @@ from vllm_ascend.attention.turboquant_dry_run import (
     TurboQuantOpsAdapter,
     TurboQuantOpsConfig,
     TurboQuantValueLayout,
+    _is_op_registered,
+    load_turboquant_extension,
 )
 from vllm_ascend.attention.turboquant_layout import (
     TURBOQUANT_KEY_PLANE,
@@ -602,3 +607,89 @@ def test_no_tokens_writes_nothing(emulator: TurboQuantEmulator) -> None:
     empty = torch.zeros(0, NUM_KV_HEADS, HEAD_SIZE)
     impl.reshape_and_cache(empty, empty, empty, kv_cache, _metadata(0, []), empty)
     assert impl.adapter.phases == []
+
+
+# ---------------------------------------------------------------------------
+# Loading the extension that carries the registrations
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def unloaded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Put the one-shot loader back to "not tried yet" for this test."""
+    monkeypatch.setattr(turboquant_dry_run, "_TURBOQUANT_EXTENSION_LOADED", None)
+
+
+def test_a_phantom_namespace_is_not_mistaken_for_a_registration() -> None:
+    """``getattr(torch.ops, ns)`` is not evidence, and must not be used as it.
+
+    ``torch.ops.__getattr__`` manufactures an ``_OpNamespace`` for any name and
+    caches it, so it never raises and the name then appears in
+    ``dir(torch.ops)``. A presence check written either way would report these
+    kernels as registered on a host that has none of them -- which is the whole
+    failure this seam exists to report -- so the trap is pinned here.
+    """
+    phantom = "turboquant_ops_nothing_registers_this"
+    assert getattr(torch.ops, phantom, None) is not None
+    assert phantom in dir(torch.ops)
+    assert _is_op_registered(phantom, "npu_turboquant_fused_decode") is False
+
+
+def test_a_real_operator_is_reported_as_registered() -> None:
+    """The same probe answers yes for something the dispatcher really has."""
+    assert _is_op_registered("aten", "mm") is True
+
+
+def test_no_stage_switched_on_does_not_touch_the_extension(unloaded: None) -> None:
+    """A golden-only run must not pay for the import, nor warn about it."""
+    _adapter()
+    assert turboquant_dry_run._TURBOQUANT_EXTENSION_LOADED is None
+
+
+def test_a_stage_switched_on_attempts_the_import_once(unloaded: None) -> None:
+    _adapter(*TurboQuantKernelStage)
+    first = turboquant_dry_run._TURBOQUANT_EXTENSION_LOADED
+    assert first is not None, "a stage-on adapter must have tried the import"
+
+    calls: list[int] = []
+    monkey = pytest.MonkeyPatch()
+    try:
+        # Anything the loader would do on a second attempt lands here instead.
+        monkey.setattr(turboquant_dry_run.torch.compiler, "is_compiling", lambda: calls.append(1) or False)
+        assert load_turboquant_extension() is first
+    finally:
+        monkey.undo()
+    assert calls == [], "the loader must be one-shot per process"
+
+
+def test_missing_operators_are_reported_with_the_stages_that_wanted_them(
+    unloaded: None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        _adapter(TurboQuantKernelStage.SCATTER)
+    assert any(
+        "are switched on but torch.ops" in record.message and "ascend950" in record.message for record in caplog.records
+    ), f"expected one actionable warning, got {[r.message for r in caplog.records]}"
+
+
+def test_a_fully_registered_namespace_is_quiet(
+    unloaded: None,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """With every registered op present, construction says nothing at WARNING."""
+    monkeypatch.setattr(turboquant_dry_run, "_is_op_registered", lambda namespace, op_name: True)
+    with caplog.at_level(logging.WARNING):
+        _adapter(*TurboQuantKernelStage)
+    assert caplog.records == []
+
+
+def test_every_reported_operator_is_one_the_bindings_declare() -> None:
+    """``TURBOQUANT_REGISTERED_OPS`` must not drift from the three real schemas."""
+    assert set(TURBOQUANT_REGISTERED_OPS) == {
+        TURBOQUANT_OP_RESHAPE_AND_CACHE,
+        TURBOQUANT_OP_RESHAPE_SCATTER,
+        TURBOQUANT_OP_FUSED_DECODE,
+    }
+    assert set(TURBOQUANT_REGISTERED_OPS) <= set(ALL_OPS)
