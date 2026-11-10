@@ -1,9 +1,24 @@
-#include <cstdint>
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 // turboquant_reshape_scatter_aiv -- sub-strip BF16 KV ingestion, AIV only.
-// Roadmap kernel No.1. Ascend 950PR / arch35 / dav-3510 / CANN 9.2,
-// KERNEL_TYPE_AIV_ONLY.
-//
+// Ascend 950PR / arch35 / dav-3510 / CANN 9.2, KERNEL_TYPE_AIV_ONLY.
+
+#include <cstdint>
+
 // What it is for
 // --------------
 // Every decode step writes B x (1 + k) tokens into B different pages at
@@ -27,28 +42,12 @@
 //
 // Why Vector and not Cube
 // -----------------------
-// This is the one place the Cube-centric verdict inverts. At M = 1 the Cube
-// prologue would stage 32 KiB of rotation tables to transform 512 bytes of
-// payload, and GEMV.md records that an M = 1 Mmad leaves only 32-64 bytes
-// valid in each 1024-byte L0C sub-vector -- a 16:1 waste. So Pi . x runs as
-// the Vector butterfly: eight radix-2 stages over 256 lanes with the sign
-// diagonal between them.
-//
-// Which butterfly, and why that one
-// ---------------------------------
-// `RotateImpl::RegGather` from routines/routine_vector_rotate_butterfly.hpp,
-// selected by measurement rather than preference. All three implementations
-// are bit-identical; on the CAModel micro-benchmark over 16 rows
-//
-//   variant     vector instr   RVECEX   RV_VLD   RV_VST   vector span (ticks)
-//   Blocked           11250      2512     3072     1728                 30215
-//   RegShuffle         1981      1834       64       64                  1965
-//   RegGather          1203      1057       64       64                  1850
-//
-// 4 loads and 4 stores per row and not one more, for both register-resident
-// variants: that is the zero-UB-spill invariant as a measured number rather
-// than an intention. Approach A spills 1664 extra registers over the same
-// work and runs 16.3x longer.
+// At M = 1 the Cube prologue would stage 32 KiB of rotation tables to transform 512 bytes of
+// payload, and an M = 1 Mmad leaves only 32-64 bytes valid in each 1024-byte L0C sub-vector. So
+// Pi . x runs as the Vector butterfly: eight radix-2 stages over 256 lanes with the sign
+// diagonal between them, as RotateImpl::RegGather from routine_vector_rotate_butterfly.hpp --
+// the in-register variant, 4 loads and 4 stores per row and not one more, which is the
+// zero-UB-spill invariant.
 //
 // The layout contract (RFC section 3.1, normative)
 // ------------------------------------------------
@@ -91,7 +90,7 @@
 //
 // Synchronisation: intra-core HardEvents only
 // -------------------------------------------
-// No Cube, no L1, no cross-core flag, no mode-4 id, no modulo ring. Straight
+// No Cube, no L1, no cross-core flag, no modulo ring. Straight
 // line per work item, one buffer set, with the four WAR back edges a single
 // buffer set needs:
 //
@@ -151,16 +150,12 @@ constexpr std::uint32_t kUbSign = NextSlot(kUbStrip, kStripBytes);
 // VL1-masked store writes exactly four bytes, and the slot keeps every row's
 // scale 32-byte aligned so MTE3 can read it without a gather.
 constexpr std::uint32_t kUbScale = NextSlot(kUbSign, kHeadSize * 4u);
-// The launch probe: four DataBlocks, one broadcast scalar each.
-constexpr std::uint32_t kProbeLanes = 32;
-constexpr std::uint32_t kUbProbe = NextSlot(kUbScale, kMaxRun * kVecLanes * 4u);
-constexpr std::uint32_t kArenaEnd = kUbProbe + kProbeLanes * 4u;
+constexpr std::uint32_t kArenaEnd = kUbScale + kMaxRun * kVecLanes * 4u;
 
 static_assert(kUbRaw % kBlock == 0u && kUbAct % kBlock == 0u && kUbQ % kBlock == 0u &&
                   kUbQuant % kBlock == 0u && kUbHalf % kBlock == 0u &&
                   kUbPacked % kBlock == 0u && kUbStrip % kBlock == 0u &&
-                  kUbSign % kBlock == 0u && kUbScale % kBlock == 0u &&
-                  kUbProbe % kBlock == 0u,
+                  kUbSign % kBlock == 0u && kUbScale % kBlock == 0u,
               "every UB operand base must be 32-byte aligned");
 // Rule A3: level-2 continuous ops read a whole 256-byte vector register from
 // each source base, unmasked, so the arena needs that much pad behind it.
@@ -597,19 +592,17 @@ __aicore__ inline void Run_(__gm__ bfloat16_t* key_gm, __gm__ bfloat16_t* value_
                             __gm__ std::int8_t* key_cache_gm,
                             __gm__ std::int8_t* value_cache_gm, __gm__ float* scale_cache_gm,
                             __gm__ std::int32_t* slot_gm, __gm__ float* pi_signs_gm,
-                            __gm__ std::int32_t* cu_seqlens_gm, __gm__ std::int32_t* probe_gm,
-                            std::uint32_t num_requests, std::uint32_t num_kv_heads,
-                            std::uint32_t head_size, std::uint32_t block_size,
+                            __gm__ std::int32_t* cu_seqlens_gm, std::uint32_t num_requests,
+                            std::uint32_t num_kv_heads, std::uint32_t head_size,
+                            std::uint32_t block_size,
                             std::uint32_t num_blocks, std::uint32_t item_begin,
                             std::uint32_t item_count, float inv_sqrt_len)
 {
-    // `headSize` is a runtime operand and `kHeadSize` is the butterfly's
-    // compile-time width, so the kernel is only defined where they agree: the
-    // leaf's four resident registers, the 2048-byte strip geometry and the
-    // merge's (word, bit) derivation are all 256 channels by construction. The
-    // adapter checks `head_size == 256` on the host; this is the device half of
-    // the same contract, because a silently wrong head size would read one
-    // head's rows and write another head's slice.
+    // `headSize` is a runtime operand and `kHeadSize` is the butterfly's compile-time width, so
+    // the kernel is only defined where they agree: the leaf's four resident registers, the
+    // 2048-byte strip geometry and the merge's (word, bit) derivation are all 256 channels by
+    // construction. A silently wrong head size would read one head's rows and write another
+    // head's slice, so this is checked on the device as well as by the caller.
     if (head_size != kHeadSize) return;
     if (block_size % kStripHeight != 0u) return;
 
@@ -636,33 +629,6 @@ __aicore__ inline void Run_(__gm__ bfloat16_t* key_gm, __gm__ bfloat16_t* value_
 
     const std::uint32_t block_idx = static_cast<std::uint32_t>(AscendC::GetBlockIdx());
     const std::uint32_t block_num = static_cast<std::uint32_t>(AscendC::GetBlockNum());
-
-    // The roadmap's open item: what GetBlockIdx / GetBlockNum /
-    // GetSubBlockNum report under KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY)
-    // is OBSERVED here rather than assumed, because the safe MIX idiom
-    // (GetBlockIdx() / GetSubBlockNum()) and the AIV-only one differ by
-    // exactly this. Block 0 of every launch publishes all four.
-    //
-    // Four DataBlocks rather than four lanes: a scalar reaches Unified Buffer
-    // through `Duplicate`, which writes a whole 32-byte block from a
-    // vector-pipe broadcast, and that avoids both a LocalTensor::SetValue and
-    // the V_S fence a scalar UB write would need. The runner reads lanes 0, 8,
-    // 16 and 24.
-    if (probe_gm != nullptr && block_idx == 0u) {
-        AscendC::GlobalTensor<std::int32_t> probe;
-        probe.SetGlobalBuffer(probe_gm);
-        auto probe_ub = View<std::int32_t>(kUbProbe, kProbeLanes);
-        AscendC::Duplicate(probe_ub, static_cast<std::int32_t>(block_idx), 8);
-        AscendC::Duplicate(probe_ub[8], static_cast<std::int32_t>(block_num), 8);
-        AscendC::Duplicate(probe_ub[16], static_cast<std::int32_t>(AscendC::GetSubBlockNum()),
-                           8);
-        AscendC::Duplicate(probe_ub[24], static_cast<std::int32_t>(item_count), 8);
-        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(kEvtPackReady);
-        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(kEvtPackReady);
-        AscendC::DataCopy(probe[0], probe_ub, kProbeLanes);
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(kEvtDrain);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(kEvtDrain);
-    }
 
     // Pi's sign diagonal, once per launch: 256 FP32 read by the butterfly's
     // own sign stage. `pi_signs` is live for this operator, unlike for the
@@ -734,49 +700,63 @@ __aicore__ inline void Run_(__gm__ bfloat16_t* key_gm, __gm__ bfloat16_t* value_
 
 // ------------------------------------------------------------- entry point
 // Compiled in EVERY pass of this translation unit, host and device alike; only
-// the body stays behind __CCE_AICORE__. Under the CANN 9.2 ASC language
-// toolchain the host-side launch stub of a `__global__` function is emitted by
-// the host pass from the function's DEFINITION, so a definition hidden behind
-// __CCE_AICORE__ leaves the triple-chevron launch below referring to a symbol
-// nothing in libvllm_ascend_turboquant.so defines. See the longer note in
-// turboquant_reshape_batch.cpp.
+// the body stays behind __CCE_AICORE__. This is the mirror's one standing
+// exception -- see the longer note in turboquant_reshape_batch.cpp. Under the
+// ASC language toolchain the host-side launch stub of a `__global__` function
+// is emitted by the host pass from the function's DEFINITION, so a definition
+// hidden behind __CCE_AICORE__ leaves the triple-chevron launch below referring
+// to a symbol nothing in libvllm_ascend_turboquant.so defines.
+// Guarded for BOTH passes of the kernel build and NEITHER pass of a plain host
+// compiler. ASCEND_MICRO_CANN_LAUNCH is set by the root CMakeLists on every pass
+// of this translation unit (once in ascendc_compile_definitions, once behind
+// -forward-options-to-host-compiler), so the ASC host pass reaches this
+// definition and emits the launch stub, while the device pass reaches it through
+// __CCE_AICORE__. A device-free gate that `#include`s this file with g++ --
+// tests/ut/ops/turboquant/test_contract_gates.cpp does, for the arena
+// static_asserts -- defines neither, and so never sees `__global__`,
+// `__aicore__`, `__gm__` or `bfloat16_t`, none of which a plain compiler has.
+#if defined(__CCE_AICORE__) || defined(ASCEND_MICRO_CANN_LAUNCH)
 extern "C" __global__ __aicore__ void turboquant_reshape_scatter_aiv(
     __gm__ bfloat16_t* __restrict__ key, __gm__ bfloat16_t* __restrict__ value,
     __gm__ std::int8_t* __restrict__ keyCache, __gm__ std::int8_t* __restrict__ valueCache,
     __gm__ float* __restrict__ scaleCache, __gm__ std::int32_t* __restrict__ slotMapping,
     __gm__ float* __restrict__ piSigns, __gm__ std::int32_t* __restrict__ cuSeqlens,
-    __gm__ std::int32_t* __restrict__ launchProbe, uint32_t numRequests,
-    uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize, uint32_t numBlocks,
-    uint32_t itemBegin, uint32_t itemCount, float invSqrtLen)
+    uint32_t numRequests, uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,
+    uint32_t numBlocks, uint32_t itemBegin, uint32_t itemCount, float invSqrtLen)
 {
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     AscendC::InitSocState();
     turboquant_scatter::Run_(key, value, keyCache, valueCache, scaleCache, slotMapping,
-                             piSigns, cuSeqlens, launchProbe, numRequests, numKvHeads,
-                             headSize, blockSize, numBlocks, itemBegin, itemCount,
-                             invSqrtLen);
+                             piSigns, cuSeqlens, numRequests, numKvHeads, headSize, blockSize,
+                             numBlocks, itemBegin, itemCount, invSqrtLen);
+#else
+    (void)key; (void)value; (void)keyCache; (void)valueCache; (void)scaleCache;
+    (void)slotMapping; (void)piSigns; (void)cuSeqlens; (void)numRequests; (void)numKvHeads;
+    (void)headSize; (void)blockSize; (void)numBlocks; (void)itemBegin; (void)itemCount;
+    (void)invSqrtLen;
 #endif
 }
 
-#if defined(ASCEND_MICRO_CANN_LAUNCH) && !defined(__CCE_AICORE__)
+#endif  // the entry point
 
-// No prototype for the kernel here any more: its definition above is visible in
-// this pass, which is what makes the host launch stub exist at all, and the one
-// argument block is now written once rather than twice.
+#if defined(ASCEND_MICRO_CANN_LAUNCH) && !defined(__CCE_AICORE__)
+// No prototype for the kernel here: its definition above is visible in this
+// pass, which is what makes the host launch stub exist at all.
+
 extern "C" void launch_turboquant_reshape_scatter_aiv(
     void* stream, std::uint32_t block_dim, std::uint16_t* key, std::uint16_t* value,
     std::int8_t* key_cache, std::int8_t* value_cache, float* scale_cache,
     std::int32_t* slot_mapping, float* pi_signs, std::int32_t* cu_seqlens,
-    std::int32_t* launch_probe, std::uint32_t num_requests, std::uint32_t num_kv_heads,
+    std::uint32_t num_requests, std::uint32_t num_kv_heads,
     std::uint32_t head_size, std::uint32_t block_size, std::uint32_t num_blocks,
     std::uint32_t item_begin, std::uint32_t item_count, float inv_sqrt_len)
 {
     turboquant_reshape_scatter_aiv<<<block_dim, nullptr, stream>>>(
         reinterpret_cast<bfloat16_t*>(key), reinterpret_cast<bfloat16_t*>(value), key_cache,
-        value_cache, scale_cache, slot_mapping, pi_signs, cu_seqlens, launch_probe,
-        num_requests, num_kv_heads, head_size, block_size, num_blocks, item_begin,
-        item_count, inv_sqrt_len);
+        value_cache, scale_cache, slot_mapping, pi_signs, cu_seqlens, num_requests,
+        num_kv_heads, head_size, block_size, num_blocks, item_begin, item_count,
+        inv_sqrt_len);
 }
 
 #endif

@@ -586,13 +586,6 @@ TURBOQUANT_KERNEL_OPS: Final[dict[str, TurboQuantKernelStage]] = {
     TURBOQUANT_OP_FUSED_DECODE: TurboQuantKernelStage.DECODE,
 }
 
-# The batch writer's mode-4 channel policy: True is the recycled bilateral
-# two-slot ring, which is what every regression and benchmark dispatches. False
-# is the single-shot allocation kept as the regression fallback and bisection
-# control -- one flag id per announcement, which saturates the legal id space at
-# eight chunks.
-TURBOQUANT_REUSE_MODE4_FLAGS: Final[bool] = True
-
 # The fused decode's Split-K width. One split is the fused path: it emits its
 # context straight out of the decode pass and never reaches
 # ``AscendC::SyncAll<false>()``, which on dav-3510 only completes when every
@@ -934,7 +927,7 @@ class TurboQuantOpsAdapter:
         """Per-row INT4 quantisation and nibble packing of a rotated panel.
 
         No standalone C launcher: the codec is inside both cache writers
-        (op_kernel/common/turboquant_codec.h). ``inv_sqrt_len`` is the fold the
+        (op_kernel/common/turboquant_codec_mx.h). ``inv_sqrt_len`` is the fold the
         stored fp32 scale carries, so the egress un-rotation does not repeat it.
         """
         return self._require_kernel(TURBOQUANT_OP_QUANTIZE_PACK)(rotated, inv_sqrt_len)
@@ -1054,7 +1047,6 @@ class TurboQuantOpsAdapter:
                 pi_signs=emulator.pi_signs,
                 tables=tables,
                 inv_sqrt_len=emulator.inv_sqrt_len,
-                reuse_mode4_flags=TURBOQUANT_REUSE_MODE4_FLAGS,
             )
             return
 
@@ -1069,7 +1061,6 @@ class TurboQuantOpsAdapter:
                 pi_signs=emulator.pi_signs,
                 tables=tables,
                 inv_sqrt_len=emulator.inv_sqrt_len,
-                reuse_mode4_flags=TURBOQUANT_REUSE_MODE4_FLAGS,
             )
 
         # One launch per wave, and the public decode entry rather than the
@@ -1099,7 +1090,6 @@ class TurboQuantOpsAdapter:
         pi_signs: torch.Tensor,
         tables: torch.Tensor,
         inv_sqrt_len: float,
-        reuse_mode4_flags: bool,
     ) -> None:
         """The batch writer: rotate, quantise, pack and write whole pages.
 
@@ -1108,8 +1098,14 @@ class TurboQuantOpsAdapter:
         layout and ``scale_cache`` is ``(2, num_blocks, H, 16)`` fp32.
         ``tables`` is the Cube's resident INT8 operand and ``pi_signs`` is
         folded into it, so the device does not read it; an empty tensor says so.
-        ``reuse_mode4_flags`` picks the recycled bilateral two-slot mode-4 ring
-        over the single-shot bisection control.
+
+        There is no mode-4 channel-policy argument any more. The audited writer
+        is mode-2 only -- its three cross-core channels are counters that bank
+        unconsumed announcements, so recycling an id across pipeline generations
+        is sound by construction and needs no single-shot fallback to bisect
+        against. The ``reuse_mode4_flags`` flag and the
+        ``..._mode4_single_shot`` entry point it selected are both gone from the
+        kernel, so the schema no longer advertises the knob.
 
         The C launcher (``launch_turboquant_reshape_and_cache_bf16``,
         op_kernel/turboquant_reshape_batch.cpp) also takes ``num_tokens``,
@@ -1130,7 +1126,6 @@ class TurboQuantOpsAdapter:
             pi_signs,
             tables,
             inv_sqrt_len,
-            reuse_mode4_flags,
         )
 
     def _golden_reshape_and_cache_prefill(
@@ -1199,16 +1194,18 @@ class TurboQuantOpsAdapter:
 
         The C launcher (``launch_turboquant_reshape_scatter_aiv``,
         op_kernel/turboquant_reshape_scatter.cpp) also takes ``block_dim``,
-        ``cu_seqlens``, ``launch_probe``, ``num_requests``, ``num_kv_heads``,
-        ``head_size``, ``block_size``, ``num_blocks``, ``item_begin`` and
-        ``item_count``. The schema takes none of them:
+        ``cu_seqlens``, ``num_requests``, ``num_kv_heads``, ``head_size``,
+        ``block_size``, ``num_blocks``, ``item_begin`` and ``item_count``. The
+        schema takes none of them:
         csrc/attention/turboquant/torch_bindings.cpp derives the geometry from
         the tensor shapes and the work split from the device
         (``total_items = num_requests * num_kv_heads``, ``item_begin = 0``,
         ``item_count = total_items``, ``block_dim = min(total_items,
-        aiv_core_num)``), and passes ``cu_seqlens`` and ``launch_probe`` as null
-        -- the first is the prefix sum a multi-token-per-request step would need,
-        the second the canary runner's probe.
+        aiv_core_num)``), and passes ``cu_seqlens`` as null -- the prefix sum a
+        multi-token-per-request step would need. The canary runner's
+        ``launch_probe`` is gone from the kernel: it was a synthetic buffer that
+        published the block-index registers back to a host runner, and nothing
+        here ever read it.
         """
         self._require_kernel(TURBOQUANT_OP_RESHAPE_SCATTER)(
             key,
@@ -1581,11 +1578,21 @@ class TurboQuantOpsAdapter:
         decode then reads; it is not ``query`` and the two are not
         interchangeable.
 
-        THIS OP CANNOT READ A CACHE EITHER WRITER WROTE. The writers produce the
-        strip layout at ``block_size`` 16; this reads the NZ-tiled layout at a
-        ``block_size`` that is a power-of-two multiple of 64. The binding
-        TORCH_CHECKs both, so the mismatch is a refused launch naming the
-        conflict rather than an attention over bytes in the wrong order.
+        THIS OP CANNOT READ A CACHE EITHER WRITER WROTE, not directly. The
+        writers produce the strip layout; this reads the NZ-tiled layout, and the
+        two disagree on four independent axes -- byte order, nibble pairing, the
+        value plane's token axis and the scale plane -- not just on
+        ``block_size``. The binding TORCH_CHECKs what it can, so the mismatch is
+        a refused launch naming the conflict rather than an attention over bytes
+        in the wrong order.
+
+        :func:`vllm_ascend.attention.turboquant_nz_ingress.turboquant_repack_strip_to_nz_tiled`
+        converts a writer-produced cache into the three planes this op reads, and
+        is what makes the decode reachable at all today. It is a reference
+        conversion for exercising and gating the decode -- a whole extra pass
+        over the pages it touches -- and deliberately not wired into this path:
+        the real fix is a write-time NZ ingress kernel in the harness. See that
+        module's header for the four axes and the evidence for each.
         """
         self._require_kernel(TURBOQUANT_OP_FUSED_DECODE)(
             query,

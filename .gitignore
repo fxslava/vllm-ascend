@@ -1,6 +1,7 @@
 ## vLLM Ascend Ignore
 # VSCode
 .vscode/
+.vs
 
 # MkDocs build output
 site/
@@ -36,6 +37,7 @@ __pycache__/
 .Python
 build/
 build_out/
+cann_aarch64/
 !csrc/cmake/third_party/build/
 !csrc/cmake/third_party/build/modules/
 !csrc/cmake/third_party/build/modules/patch/
@@ -238,3 +240,4 @@ csrc/third_party/
 
 # local build cache
 .vllm_ascend/
+/cann_aarch64/asc/impl/adv_api/detail/api_check/kernel_check/activation/softmax/softmax_flash

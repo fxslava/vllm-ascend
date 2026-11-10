@@ -35,13 +35,12 @@ void launch_turboquant_reshape_and_cache_bf16(
     int8_t* value_cache, float* scale_cache, const int32_t* slot_mapping,
     const float* pi_signs, const int32_t* tables, uint32_t num_tokens,
     uint32_t num_kv_heads, uint32_t head_size, uint32_t block_size,
-    uint32_t num_blocks, uint32_t tokens_per_core, float inv_sqrt_len,
-    bool reuse_mode4_flags);
+    uint32_t num_blocks, uint32_t tokens_per_core, float inv_sqrt_len);
 void launch_turboquant_reshape_scatter_aiv(
     void* stream, uint32_t block_dim, uint16_t* key, uint16_t* value,
     int8_t* key_cache, int8_t* value_cache, float* scale_cache,
     int32_t* slot_mapping, float* pi_signs, int32_t* cu_seqlens,
-    int32_t* launch_probe, uint32_t num_requests, uint32_t num_kv_heads,
+    uint32_t num_requests, uint32_t num_kv_heads,
     uint32_t head_size, uint32_t block_size, uint32_t num_blocks,
     uint32_t item_begin, uint32_t item_count, float inv_sqrt_len);
 }
