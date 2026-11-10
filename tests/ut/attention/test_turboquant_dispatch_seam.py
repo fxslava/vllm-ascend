@@ -40,6 +40,7 @@ from vllm_ascend.attention.turboquant_dry_run import (
     TURBOQUANT_STAGE_ROTATED_BASIS,
     TURBOQUANT_STAGE_UNROTATED,
     TURBOQUANT_STRIP_TOKENS,
+    TURBOQUANT_TABLE_DTYPE,
     AscendTurboQuantDryRunBackendImpl,
     TurboQuantEmulator,
     TurboQuantIngestionPhase,
@@ -229,7 +230,8 @@ def test_rotate_dispatches_both_directions_to_the_kernel(
     first, second = (call[0] for call in entry.calls)
     assert first[0] is x
     assert torch.equal(first[1], emulator.pi_signs)
-    assert first[2].dtype is torch.int8
+    # The same BF16 rotation operand the two writers take; see _codec_tables.
+    assert first[2].dtype is TURBOQUANT_TABLE_DTYPE
     assert first[3].shape == (16, 16)
     assert first[4] == TURBOQUANT_STAGE_ROTATED_BASIS
     assert first[5] == 1.0
@@ -375,8 +377,19 @@ def test_the_prefill_entry_point_takes_the_batch_writer_abi(
     assert (args[0], args[1]) == (key, value)
     assert (args[2], args[3], args[4], args[5]) == (*caches, slot_mapping)
     assert torch.equal(args[6], emulator.pi_signs)
-    assert args[7].dtype is torch.int8
+    # BF16, not int8: the batch writer stages this blob as the Cube's BF16 L1
+    # operand (stage_blocks_nz reads `Blocks * Dim * Dim` bfloat16_t elements),
+    # so an int8 tensor of the same element count is half the bytes the kernel
+    # reads AND the wrong arithmetic. This assertion said int8 and passed while
+    # the operand was wrong, so the byte count is asserted too -- that is the
+    # quantity the kernel's L1 reservation is sized in.
+    assert args[7].dtype is TURBOQUANT_TABLE_DTYPE
+    assert args[7].dtype is torch.bfloat16
     assert args[7].numel() == 2 * (HEAD_SIZE // 32) * 32 * 32
+    assert args[7].numel() * args[7].element_size() == 2 * 2 * (HEAD_SIZE // 32) * 32 * 32
+    # +-1 is exact in BF16, so the conversion is a representation change and not
+    # a rounding: every entry is still a unit sign.
+    assert torch.equal(args[7].abs().to(torch.float32), torch.ones_like(args[7], dtype=torch.float32))
     assert args[8] == pytest.approx(emulator.inv_sqrt_len)
     # The kernel owns the write, so the golden model must not have run.
     assert torch.equal(caches[0], torch.zeros_like(caches[0]))
@@ -872,7 +885,11 @@ def test_fused_decode_passes_the_schema_the_binding_declares(
     assert len(args) == 18
     assert args[0] is query
     assert torch.equal(args[1], emulator.pi_signs)
-    assert args[2].dtype is torch.int8  # rot_tables
+    assert args[2].dtype is TURBOQUANT_TABLE_DTYPE  # rot_tables: the same BF16 blob
+    # Unread under KV4_FP8 (ConstTableWords is 0 for an affine mode with the
+    # gather LUT off), so the decode would have accepted either dtype. Asserted
+    # anyway: a decode that runs is no evidence that this operand is right.
+    assert args[2].numel() == 2 * (HEAD_SIZE // 32) * 32 * 32
     assert args[3].shape == (16, 16) and args[3].dtype is torch.float16  # h16
     assert args[4] is None  # gate, read only at output_stage 2
     assert (args[5], args[6], args[7]) == caches
@@ -1064,3 +1081,155 @@ def test_every_reported_operator_is_one_the_bindings_declare() -> None:
         TURBOQUANT_OP_FUSED_DECODE,
     }
     assert set(TURBOQUANT_REGISTERED_OPS) <= set(ALL_OPS)
+
+
+# ---------------------------------------------------------------------------
+# What the staged kernels can actually run
+#
+# The binding TORCH_CHECKs every one of these, and that is the check that
+# matters -- a direct caller cannot skip it. These cover the earlier refusal:
+# the binding's arrives from inside an attention forward, one decode step into a
+# server that has already loaded weights and sized a KV cache, and names a
+# tensor shape; this one names the model and the stage at layer construction.
+#
+# The guard is a REFUSAL rather than a warn-and-fall-back, unlike a missing
+# registration. A kernel that is absent has a golden model behind it and the run
+# stays correct. A kernel that is present and mis-specialised writes one head's
+# rows into another head's page with every canary intact, and neither writer
+# checks its runtime head count against the count it was unrolled over.
+# ---------------------------------------------------------------------------
+
+
+def _geometry(
+    *stages: TurboQuantKernelStage,
+    head_size: int = turboquant_dry_run.TURBOQUANT_KERNEL_HEAD_SIZE,
+    num_kv_heads: int = turboquant_dry_run.TURBOQUANT_KERNEL_KV_HEADS,
+    num_heads: int | None = None,
+    model_dtype: torch.dtype = turboquant_dry_run.TURBOQUANT_KERNEL_DTYPE,
+) -> Any:
+    """The state :meth:`_check_kernel_geometry` reads, and nothing else.
+
+    Called unbound, like the ``_ingestion_phase`` test above: the real
+    ``__init__`` wants a vLLM attention layer and the method wants five
+    attributes.
+    """
+    return types.SimpleNamespace(
+        adapter=_adapter(*stages),
+        head_size=head_size,
+        num_kv_heads=num_kv_heads,
+        num_heads=num_heads if num_heads is not None else num_kv_heads * 4,
+        model_dtype=model_dtype,
+    )
+
+
+def _check(state: Any) -> None:
+    AscendTurboQuantDryRunBackendImpl._check_kernel_geometry(state)
+
+
+@pytest.mark.parametrize(
+    "stages",
+    [
+        (),
+        (TurboQuantKernelStage.ROTATE,),
+        (TurboQuantKernelStage.QUANTIZE, TurboQuantKernelStage.GATHER),
+    ],
+)
+def test_a_golden_run_is_not_constrained_by_the_kernels(stages: tuple[TurboQuantKernelStage, ...]) -> None:
+    """No writer and no decode staged: every shape the golden model admits is fine.
+
+    The four stages with no kernel behind them must not constrain anything
+    either -- they always fall back, so a run that names them is a golden run.
+    """
+    _check(_geometry(*stages, head_size=64, num_kv_heads=7, num_heads=7, model_dtype=torch.float16))
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        TurboQuantKernelStage.RESHAPE_AND_CACHE,
+        TurboQuantKernelStage.SCATTER,
+        TurboQuantKernelStage.DECODE,
+    ],
+)
+def test_every_kernel_pins_the_head_size(stage: TurboQuantKernelStage) -> None:
+    """``kHeadSize`` in both writers, ``dim != kHeadSize`` in ``valid_launch``."""
+    _check(_geometry(stage))  # the pinned size is admitted
+    with pytest.raises(ValueError, match=r"head_size 256"):
+        _check(_geometry(stage, head_size=128))
+
+
+@pytest.mark.parametrize("stage", [TurboQuantKernelStage.RESHAPE_AND_CACHE, TurboQuantKernelStage.SCATTER])
+@pytest.mark.parametrize("num_kv_heads", [1, 2, 8])
+def test_both_writers_need_exactly_four_kv_heads(stage: TurboQuantKernelStage, num_kv_heads: int) -> None:
+    """``kChunks = 2 * kHeads`` chunk phases are unrolled by template argument.
+
+    Fewer is refused as well as more: the schedule is not "up to four".
+    """
+    with pytest.raises(ValueError, match=r"specialised to exactly 4 KV heads"):
+        _check(_geometry(stage, num_kv_heads=num_kv_heads))
+
+
+@pytest.mark.parametrize("num_kv_heads", [1, 2, 3, 4])
+def test_the_decode_tolerates_fewer_kv_heads_than_the_writers_need(num_kv_heads: int) -> None:
+    """``valid_launch`` refuses more than four, not fewer."""
+    _check(_geometry(TurboQuantKernelStage.DECODE, num_kv_heads=num_kv_heads))
+
+
+@pytest.mark.parametrize("num_kv_heads", [5, 8, 16])
+def test_the_decode_refuses_the_kv_head_count_a_gqa_model_brings(num_kv_heads: int) -> None:
+    """The constraint a deployed model is most likely to hit: 8 KV heads is common."""
+    with pytest.raises(ValueError, match=r"num_kv_heads outside 1\.\.4"):
+        _check(_geometry(TurboQuantKernelStage.DECODE, num_kv_heads=num_kv_heads))
+
+
+def test_the_decode_needs_a_whole_gqa_group() -> None:
+    with pytest.raises(ValueError, match=r"multiple of num_kv_heads"):
+        _check(_geometry(TurboQuantKernelStage.DECODE, num_kv_heads=3, num_heads=16))
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        TurboQuantKernelStage.RESHAPE_AND_CACHE,
+        TurboQuantKernelStage.SCATTER,
+        TurboQuantKernelStage.DECODE,
+    ],
+)
+def test_fp16_is_refused_rather_than_dispatched(stage: TurboQuantKernelStage) -> None:
+    """There is no fp16 instance, and the decode's dispatch does not say so.
+
+    ``turboquant_mm_fused_decode_opt_raw_query_impl`` guards its launch with
+    ``if (type == AscendType::BF16)`` and returns without launching for anything
+    else, which would leave the attention output unwritten and report success.
+    That is the failure this refuses, so it is refused at construction and
+    again in the binding.
+    """
+    with pytest.raises(ValueError, match=r"torch.bfloat16 only"):
+        _check(_geometry(stage, model_dtype=torch.float16))
+
+
+def test_the_refusal_names_the_stage_that_cannot_run_the_model() -> None:
+    """A message that named only the shape would not say which switch to flip."""
+    with pytest.raises(ValueError, match=r"reshape_and_cache") as both:
+        _check(_geometry(TurboQuantKernelStage.RESHAPE_AND_CACHE, TurboQuantKernelStage.DECODE, head_size=64))
+    assert "decode" in str(both.value)
+    assert turboquant_dry_run.TURBOQUANT_STAGES_ENV in str(both.value)
+
+
+def test_the_rotation_operand_is_the_bf16_blob_the_cube_stages() -> None:
+    """``_codec_tables`` sizing, in the quantity the kernel's L1 reservation uses.
+
+    ``stage_blocks_nz<Blocks, Dim>`` reads ``Blocks * Dim * Dim`` bfloat16_t
+    elements, so the BYTE count is what has to match -- an int8 blob of the same
+    element count is half of it, which is the defect this pins down. Every entry
+    is a unit sign, exact in BF16, so the conversion is a representation change
+    and the operand stays bit-identical to the oracle's.
+    """
+    emulator = TurboQuantEmulator(head_size=turboquant_dry_run.TURBOQUANT_KERNEL_HEAD_SIZE, device=CPU)
+    tables = turboquant_dry_run._codec_tables(emulator)
+    groups = turboquant_dry_run.TURBOQUANT_KERNEL_HEAD_SIZE // 32
+    assert tables.dtype is TURBOQUANT_TABLE_DTYPE
+    assert tables.shape == (2 * groups, 32, 32)
+    assert tables.element_size() == 2
+    assert tables.numel() * tables.element_size() == 2 * 2 * groups * 32 * 32 == 32768
+    assert torch.equal(tables.abs().to(torch.float32), torch.ones(tables.shape, dtype=torch.float32))
