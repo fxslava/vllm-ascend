@@ -87,6 +87,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <optional>
 
 #include <torch/library.h>
@@ -157,6 +158,17 @@ constexpr std::uintptr_t kGmBurstBytes = 32;
 // against is bit-identical to the oracle's, element for element.
 constexpr std::int64_t kTableGroup = 32;
 constexpr std::int64_t kTablePlanes = 2;
+
+// The QUERY BASIS codec's GM constant pool, which is a different operand from both of the
+// above. TurboQuantCodec4::ConstTableWords (op_kernel/common/turboquant_codec_950.h) is
+// `7 * vecLen + 2 * vecLen * batchRows + kLevels`, and TurboQuantQueryBasis::Init calls it
+// with batchRows 1, so the pool is 9 * head_size + kLevels words. kEarlyStages of those are
+// the butterfly's (sign, XOR byte offset) pairs that ApplyPi's first three stages gather
+// through; see the pool's construction in npu_turboquant_fused_decode for why it is built
+// here and what reading the Cube blob into it did.
+constexpr std::int64_t kCodecEarlyStages = 3;
+constexpr std::int64_t kCodecLevels = 16;
+constexpr std::int64_t kCodecPoolWordsPerChannel = 9;
 
 inline std::int64_t ceil_div(const std::int64_t a, const std::int64_t b)
 {
@@ -243,12 +255,18 @@ inline void check_slot_mapping(const at::Tensor &slot_mapping, const std::int64_
 // `name` is the schema's own spelling -- `tables` on the batch writer,
 // `rot_tables` on the fused decode -- so a message names the argument the caller
 // passed rather than a shared alias. The two are the same blob and must agree on
-// dtype even though the decode never dereferences it: `ConstTableWords` returns 0
-// for an affine mode with the gather LUT off (op_kernel/common/turboquant_codec_mx.h),
-// so `TurboQuantModeCodec::Init` reads no words from it under KV4_FP8. A decode
-// that runs is therefore no evidence that this operand is right, which is
-// precisely how the wrong dtype survived; checking it identically in both places
-// is what stops the next one surviving.
+// dtype, and the decode's copy is checked even though the decode does not hand it
+// to the device at all: it builds the basis codec's own pool instead, for the
+// reason written out in npu_turboquant_fused_decode.
+//
+// THE `ConstTableWords` THAT RETURNS 0 IS THE MODE CODEC'S, not the basis codec's.
+// `TurboQuantModeCodec::ConstTableWords`
+// (op_kernel/common/turboquant_codec_mx.h) returns `kGatherLut ? kLevels : 0` for
+// an affine mode, so `mode_tables` really is unread under KV4_FP8. Reading that
+// onto this operand -- which goes to a `TurboQuantCodec4`, whose own
+// ConstTableWords is an unconditional 9 * head_size + kLevels -- is what put the
+// Cube's blob into the basis's gather-offset pool and AIV error 341 on the device.
+// A decode that runs is no evidence that either operand is right.
 inline void check_tables(const at::Tensor &tables, const std::int64_t head_size, const char *op,
                          const char *name)
 {
@@ -690,6 +708,73 @@ void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Te
     const at::Tensor query_rot =
         at::empty({num_tokens, num_heads, head_size}, query.options().dtype(at::kFloat));
 
+    // ---- the query basis codec's constant pool -------------------------------
+    //
+    // NOT `rot_tables`, and this is the ABI break that put AIV error 341 on the device from
+    // Python while every CAModel and NPU run of the C++ fixture passed on the identical
+    // geometry.
+    //
+    // TurboQuantQueryBasis::Init does `codec_.Init(pipe, headSize_, 1, invSqrtLen,
+    // rotTablesGm_)` on a TurboQuantCodec4, and THAT codec's ConstTableWords
+    // (op_kernel/common/turboquant_codec_950.h) is an unconditional
+    // `7 * vecLen + 2 * vecLen * batchRows + kLevels` -- 2320 words at head_size 256 -- which
+    // Init DataCopies out of whatever pointer this argument carries, before any vector op
+    // reads it. Words 0..1535 are three (sign vector, XOR byte-offset vector) pairs, and
+    // `ShuffleStage` hands the offsets straight to
+    // `AscendC::Gather(swap_, x, xorOffset_[stage], kGatherSrcBase, n)`: the first three
+    // butterfly stages of ApplyPi, which is rotate_q.
+    //
+    // THE CONSTTABLEWORDS THAT RETURNS 0 IS A DIFFERENT CODEC'S. The affine-mode-with-the-
+    // gather-LUT-off case belongs to the mode codec in
+    // op_kernel/common/turboquant_codec_mx.h, and it governs `mode_tables`, which really is
+    // unread under KV4_FP8. Reading that fact onto `rot_tables` is what shipped the Cube's
+    // +-1 BF16 rotation blocks into this slot, and a pair of packed bf16 words is a nonsense
+    // byte offset: +1.0f is 0x3F80, so one int32 of the blob is 0x3F803F80 == 1065369984, and
+    // the prologue's first Gather addressed a gigabyte past the 1 KB row it was shuffling.
+    // Every AIV of the launch raised 341 at one pc -- the offset is a constant of the DATA, so
+    // all of them faulted on the same instruction -- and the AIC halves were then left in
+    // CrossCoreWaitFlag until the watchdog reported them as "timeout or trap error", which is
+    // why the device log names the Cube first and the fault second. It is geometry
+    // independent, which is why single-tile probes and the full five-tile grid were both clean
+    // over this very geometry.
+    //
+    // Built here rather than asked of the caller because it is a pure function of head_size
+    // and because a wrong pool is not something any shape check can catch -- this one was the
+    // right ELEMENT COUNT and the right dtype. The tail past word 1536 belongs to
+    // Quantize4Bit / Dequantize4Bit, which the basis never calls, and stays zero: exactly what
+    // RawQueryBasis::tables() in the operator's own fixture uploads.
+    const std::int64_t basis_pool_words = kCodecPoolWordsPerChannel * head_size + kCodecLevels;
+    at::Tensor basis_pool_host =
+        at::zeros({basis_pool_words}, query.options().dtype(at::kInt).device(at::kCPU));
+    {
+        std::int32_t *words = basis_pool_host.data_ptr<std::int32_t>();
+        std::int64_t at_word = 0;
+        for (std::int64_t stage = 0; stage < kCodecEarlyStages; ++stage) {
+            const std::int64_t stride = std::int64_t{1} << stage;
+            // The butterfly's sign diagonal for this stage: +1 on the low index of each pair,
+            // -1 on the high one, so `x[i] = x[i ^ stride] + sign * x[i]` is a + b and a - b.
+            for (std::int64_t i = 0; i < head_size; ++i) {
+                const float sign = (i & stride) == 0 ? 1.0f : -1.0f;
+                std::memcpy(&words[at_word + i], &sign, sizeof(float));
+            }
+            at_word += head_size;
+            // The partner index as a BYTE offset, which is the unit Gather's srcOffset takes.
+            for (std::int64_t i = 0; i < head_size; ++i)
+                words[at_word + i] = static_cast<std::int32_t>((i ^ stride) * sizeof(float));
+            at_word += head_size;
+        }
+        TORCH_CHECK(at_word == 2 * kCodecEarlyStages * head_size, op,
+                    ": the basis pool's early-stage span is ", at_word, " words, expected ",
+                    2 * kCodecEarlyStages * head_size);
+    }
+    const at::Tensor basis_pool = basis_pool_host.to(query.device(), /*non_blocking=*/false);
+    // The device reads the pool as one DataCopy of whole 32-byte bursts.
+    TORCH_CHECK(basis_pool_words * 4 % static_cast<std::int64_t>(kGmBurstBytes) == 0, op,
+                ": the basis codec pool is ",
+                basis_pool_words * 4, " bytes, not a whole number of ", kGmBurstBytes,
+                "-byte bursts");
+    check_burst_aligned(basis_pool, op, "basis codec pool");
+
     // ---- the decode codec's constant pool ------------------------------------
     // A required positional argument of the launcher that this mode never
     // dereferences: TurboQuantModeCodec::ConstTableWords returns 0 for an affine
@@ -725,7 +810,7 @@ void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Te
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     turboquant_mm_fused_decode_opt_raw_query_impl(
         static_cast<std::int32_t>(layout::TurboQuantMode::KV4_FP8), element_type, stream,
-        static_cast<std::uint32_t>(grid), query.data_ptr(), pi_signs.data_ptr(), rot_tables.data_ptr(),
+        static_cast<std::uint32_t>(grid), query.data_ptr(), pi_signs.data_ptr(), basis_pool.data_ptr(),
         h16.data_ptr(), gate.has_value() ? gate->data_ptr() : nullptr, query_rot.data_ptr(),
         key_cache.data_ptr(), value_cache.data_ptr(), scale_cache.data_ptr(), block_tables.data_ptr(),
         context_lens_device.data_ptr(), mode_tables.data_ptr(), workspace.data_ptr(), output.data_ptr(),
@@ -833,8 +918,9 @@ TORCH_LIBRARY_FRAGMENT(turboquant_ops, ops)
     //              the error names the dtype rather than the schema, but the op
     //              refuses it: there is no fp16 kernel instance and the
     //              dispatch would return without launching.
-    // rot_tables   the BF16 blocks above, unread under KV4_FP8 but checked
-    //              identically; h16 the 16x16 fp16 +-1 matrix
+    // rot_tables   the BF16 blocks above, checked identically but NOT forwarded:
+    //              the device slot it used to fill is the basis codec's constant
+    //              pool, which this op builds itself; h16 the 16x16 fp16 +-1 matrix
     // gate         read only at output_stage 2
     // output_stage TurboQuantOutputStage: 0 rotated basis, 1 unrotated, 2 gated
     // The tiling descriptors, the Split-K workspace, the fp32 rotated query
