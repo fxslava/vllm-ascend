@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <stdexcept>
-#include "turboquant_fused_decode.hpp"
+#include "../op_host/turboquant_tiling.h"
 #include "../op_kernel/common/types.h"
 #include "../op_kernel/common/turboquant_layout.h"
 #include "../op_kernel/common/turboquant_mode.h"
@@ -162,7 +162,7 @@ struct Buffers {
 // says -- while `decode.query` is the fp32 rotated image the prologue WRITES and the decode then
 // reads, so a raw-query launch needs both and they are not interchangeable. `h16` is fp16 for BOTH
 // element types: its entries are +-1, it is a shared input, and the kernel converts it on ingest
-// where the Cube chunk operand is not fp16 (op_kernel/cube/turboquant_query_basis.h).
+// where the Cube chunk operand is not fp16 (src/decode/cube/turboquant_query_basis.h).
 struct RawQueryBuffers {
     void *raw_query, *pi_signs, *rot_tables, *h16, *gate;
     Buffers decode;

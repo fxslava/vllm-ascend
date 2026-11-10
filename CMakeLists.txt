@@ -192,9 +192,18 @@ endif()
 # both fails to compile. Adding the file only on the ascend950 branch is also
 # what keeps torch.ops.turboquant_ops absent -- rather than registered with
 # nothing behind it -- on every other SoC.
+#
+# op_host/turboquant_tiling.cpp joins it. The decode's host tiling used to be an
+# `inline` function in a device-side header, which meant every translation unit
+# that wanted the geometry also pulled in the kernel tree; it is an ordinary
+# host C++ definition now, so the binding, the kernel launcher and the
+# device-free gate in tests/ut/ops all link the SAME object instead of each
+# re-instantiating it. It compiles with the plain host compiler -- no CANN, no
+# ASC -- which is exactly why the gate can build it on a host with no toolkit.
 if(VLLM_ASCEND_BUILD_TURBOQUANT)
     list(APPEND VLLM_ASCEND_SRC
-        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/torch_bindings.cpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/torch_bindings.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/op_host/turboquant_tiling.cpp)
 endif()
 
 # Sparse KV cache offloading is currently supported on Atlas A3 only.

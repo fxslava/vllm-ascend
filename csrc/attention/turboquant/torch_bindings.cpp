@@ -95,7 +95,7 @@
 #include <acl/acl.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 
-#include "include/turboquant_fused_decode.hpp"
+#include "op_host/turboquant_tiling.h"
 #include "op_adapter/turboquant_torch_adpt.h"
 #include "op_kernel/common/turboquant_layout.h"
 
@@ -283,16 +283,24 @@ inline void check_strip_slots(const at::Tensor &slot_mapping, const std::int64_t
 // launch_turboquant_reshape_and_cache_bf16 (op_kernel/turboquant_reshape_batch.cpp).
 //
 // The launcher computes its own grid as num_tokens / tokens_per_core and
-// refuses a partial trailing strip, so the only host derivation left here is
-// tokens_per_core itself -- pinned to the kernel's compile-time 16-token strip,
-// which is why it is not a schema argument. The grid is therefore
-// num_tokens / 16 and spans as many execution waves as it needs; the kernel's
-// boundary guard and inter-wave epilogue drain are what make one monolithic
+// refuses both a partial trailing share and a share that is not a whole number
+// of strips, so the only host derivation left here is tokens_per_core itself --
+// one strip per block, which is why it is not a schema argument. The grid is
+// therefore num_tokens / 16 and spans as many execution waves as it needs; the
+// kernel's boundary guard and its epilogue drain are what make one monolithic
 // dispatch safe.
+//
+// The kernel's own pipeline is seamless across strip boundaries, so a share
+// wider than one strip is now a legal geometry rather than a refusal: a block
+// that owns `tokens_per_core / 16` strips runs them as one uninterrupted chunk
+// stream, with no extra prologue, drain or rendezvous per strip. Raising
+// kTokensPerStrip here is the knob for that, and it is deliberately not raised
+// yet -- nothing has measured which share width is fastest on the part, and a
+// one-strip share is the geometry the goldens were taken at.
 void npu_turboquant_reshape_and_cache_a8(at::Tensor &key, at::Tensor &value, at::Tensor &key_cache,
                                          at::Tensor &value_cache, at::Tensor &scale_cache,
                                          at::Tensor &slot_mapping, at::Tensor &pi_signs, at::Tensor &tables,
-                                         double inv_sqrt_len, bool reuse_mode4_flags)
+                                         double inv_sqrt_len)
 {
     constexpr const char *op = "npu_turboquant_reshape_and_cache_a8";
 
@@ -354,7 +362,7 @@ void npu_turboquant_reshape_and_cache_a8(at::Tensor &key, at::Tensor &value, at:
         static_cast<const std::int32_t *>(tables.data_ptr()), static_cast<std::uint32_t>(a.num_tokens),
         static_cast<std::uint32_t>(a.num_kv_heads), static_cast<std::uint32_t>(a.head_size),
         static_cast<std::uint32_t>(c.block_size), static_cast<std::uint32_t>(c.num_blocks),
-        static_cast<std::uint32_t>(kTokensPerStrip), static_cast<float>(inv_sqrt_len), reuse_mode4_flags);
+        static_cast<std::uint32_t>(kTokensPerStrip), static_cast<float>(inv_sqrt_len));
 }
 
 // ---------------------------------------------------------------------------
@@ -373,10 +381,12 @@ void npu_turboquant_reshape_and_cache_a8(at::Tensor &key, at::Tensor &value, at:
 //
 // Host derivation, as the brief pins it: total_items = num_requests *
 // num_kv_heads, item_begin = 0, item_count = total_items, block_dim =
-// min(total_items, aiv_core_num). `cu_seqlens` and `launch_probe` are null on a
-// standard decode step -- the first is the prefix sum a multi-token-per-request
-// (MTP) step needs to find a request's own token, the second the canary runner's
-// int32 probe.
+// min(total_items, aiv_core_num). `cu_seqlens` is null on a standard decode
+// step; it is the prefix sum a multi-token-per-request (MTP) step needs to find
+// a request's own token. The canary runner's int32 `launch_probe` is gone from
+// the kernel and from this call: it was a synthetic buffer that published
+// GetBlockIdx / GetBlockNum / GetSubBlockNum back to a host runner, and nothing
+// in this repo ever read it.
 void npu_turboquant_reshape_scatter_aiv(at::Tensor &key, at::Tensor &value, at::Tensor &key_cache,
                                         at::Tensor &value_cache, at::Tensor &scale_cache,
                                         at::Tensor &slot_mapping, at::Tensor &pi_signs, double inv_sqrt_len)
@@ -429,7 +439,7 @@ void npu_turboquant_reshape_scatter_aiv(at::Tensor &key, at::Tensor &value, at::
         static_cast<std::int32_t *>(slot_mapping.data_ptr()),
         // Cast away const: the launcher's parameter list is non-const here.
         const_cast<float *>(optional_pi_signs(pi_signs)),
-        /*cu_seqlens=*/nullptr, /*launch_probe=*/nullptr, static_cast<std::uint32_t>(num_requests),
+        /*cu_seqlens=*/nullptr, static_cast<std::uint32_t>(num_requests),
         static_cast<std::uint32_t>(a.num_kv_heads), static_cast<std::uint32_t>(a.head_size),
         static_cast<std::uint32_t>(c.block_size), static_cast<std::uint32_t>(c.num_blocks),
         /*item_begin=*/0u, static_cast<std::uint32_t>(total_items), static_cast<float>(inv_sqrt_len));
@@ -631,8 +641,18 @@ void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Te
     const at::Tensor query_rot =
         at::empty({num_tokens, num_heads, head_size}, query.options().dtype(at::kFloat));
 
-    const AscendType element_type =
-        query.scalar_type() == at::kBFloat16 ? AscendType::BF16 : AscendType::FP16;
+    // BF16 ONLY, checked rather than mapped. The audited fused decode carries a
+    // single pair of template instantiations -- `..._kv4fp8_bf16` and
+    // `..._raw_query_kv4fp8_bf16` -- and its dispatch RETURNS without launching
+    // anything for any other AscendType. Mapping a non-bf16 query to
+    // AscendType::FP16, as this did, would therefore leave `output` whatever
+    // at::empty gave it and report success: the worst available failure mode.
+    // The fp16 chain was already dead in the wheel, so this is a refusal rather
+    // than a regression.
+    TORCH_CHECK(query.scalar_type() == at::kBFloat16, op,
+                ": the fused decode is bf16 only, got ", query.scalar_type(),
+                "; there is no fp16 kernel instance to dispatch to");
+    const AscendType element_type = AscendType::BF16;
 
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     turboquant_mm_fused_decode_opt_raw_query_impl(
@@ -669,8 +689,7 @@ void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Te
 namespace meta {
 
 void npu_turboquant_reshape_and_cache_a8_meta(at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &,
-                                              at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, double,
-                                              bool)
+                                              at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, double)
 {
 }
 
@@ -719,7 +738,7 @@ TORCH_LIBRARY_FRAGMENT(turboquant_ops, ops)
     ops.def(
         "npu_turboquant_reshape_and_cache_a8(Tensor key, Tensor value, Tensor! key_cache, "
         "Tensor! value_cache, Tensor! scale_cache, Tensor slot_mapping, Tensor pi_signs, "
-        "Tensor tables, float inv_sqrt_len, bool reuse_mode4_flags) -> ()");
+        "Tensor tables, float inv_sqrt_len) -> ()");
     ops.impl("npu_turboquant_reshape_and_cache_a8", c10::kPrivateUse1,
              &vllm_ascend::turboquant_bindings::npu_turboquant_reshape_and_cache_a8);
     ops.impl("npu_turboquant_reshape_and_cache_a8", c10::kMeta,

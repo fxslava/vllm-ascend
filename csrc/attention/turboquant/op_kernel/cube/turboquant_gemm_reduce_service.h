@@ -17,7 +17,7 @@
  * reimplement nothing but the combine itself.
  *
  * The geometry, flag ids and budgets come from include/turboquant_gemm_reduce.hpp, which the
- * evidence about this code's arithmetic and not about a transcription of it (section 6.1).
+ * evidence about this code's arithmetic and not about a transcription of it.
  *
  * READ THE UB BUDGET IN THAT HEADER BEFORE ENABLING THE SWITCH. The batched form's panels do
  * not fit the operator's remaining UB headroom, and the static_assert there names the deficit.
@@ -54,7 +54,7 @@ using vllm_ascend::turboquant::WriteHeads;
 // the toolkit reserves 11..14, the attention ring already spends 0..9 and the task join is 10,
 // so there is no free id to take. Recycling is sound here only because SyncAll<false>() and
 // the attention phase's own epilogue stand between the phases and every attention place is
-// drained to zero first -- and it drags in Âsection 6.6's precondition, which is why every
+// drained to zero first -- and it drags in the fence precondition, which is why every
 // announcement below carries its x_S fence and why the trace audit checks tick order per id
 // rather than per-id counts.
 // One id per slot, per direction. Mode 2 is a block-wide notification and not a per-subcore
@@ -419,7 +419,7 @@ private:
 
         SyncVectorToMte3();
         AscendC::DataCopy(weightL1Buf_[slot].template Get<float>(), weight, kFp32PerBlock);
-        // Âsection 6.6's fence: the announcement must be preceded by the x_S pair on the pipe whose
+        // the fence: the announcement must be preceded by the x_S pair on the pipe whose
         // work it reports. On a recycled id this is the precondition, not a nicety -- an
         // unfenced announcement balances every count and still releases the Cube onto a
         // weight row MTE3 has not landed.
@@ -505,7 +505,7 @@ private:
                 static_cast<uint16_t>(headSize_), 1, static_cast<uint16_t>(kFractalRows),
                 headSize_));
         // Drains the Fixpipe before the announcement releases the vector unit onto its rows:
-        // the Âsection 6.6 fence for this id, on the pipe that did the work.
+        // the section 6.6 fence for this id, on the pipe that did the work.
         AscendC::PipeBarrier<PIPE_FIX>();
         SyncEvent<AscendC::HardEvent::FIX_S>();
         AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_FIX>(FlagProductReady(slot));

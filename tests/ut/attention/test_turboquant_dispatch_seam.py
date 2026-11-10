@@ -37,7 +37,6 @@ from vllm_ascend.attention.turboquant_dry_run import (
     TURBOQUANT_OP_ROTATE,
     TURBOQUANT_OP_UNPACK_DEQUANT,
     TURBOQUANT_REGISTERED_OPS,
-    TURBOQUANT_REUSE_MODE4_FLAGS,
     TURBOQUANT_STAGE_ROTATED_BASIS,
     TURBOQUANT_STAGE_UNROTATED,
     TURBOQUANT_STRIP_TOKENS,
@@ -368,17 +367,17 @@ def test_the_prefill_entry_point_takes_the_batch_writer_abi(
     )
 
     # The schema's order: key, value, the three planes, slot_mapping, pi_signs,
-    # tables, inv_sqrt_len, reuse_mode4_flags. Every scalar the C launcher also
-    # takes is derived in torch_bindings.cpp from these tensors.
+    # tables, inv_sqrt_len. Every scalar the C launcher also takes is derived in
+    # torch_bindings.cpp from these tensors. There is no mode-4 channel-policy
+    # argument: the audited writer is mode-2 only.
     args = entry.args
-    assert len(args) == 10
+    assert len(args) == 9
     assert (args[0], args[1]) == (key, value)
     assert (args[2], args[3], args[4], args[5]) == (*caches, slot_mapping)
     assert torch.equal(args[6], emulator.pi_signs)
     assert args[7].dtype is torch.int8
     assert args[7].numel() == 2 * (HEAD_SIZE // 32) * 32 * 32
     assert args[8] == pytest.approx(emulator.inv_sqrt_len)
-    assert args[9] is TURBOQUANT_REUSE_MODE4_FLAGS
     # The kernel owns the write, so the golden model must not have run.
     assert torch.equal(caches[0], torch.zeros_like(caches[0]))
 

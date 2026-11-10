@@ -1,18 +1,22 @@
 # TurboQuant kernels and Torch bindings
 
-Everything in this directory except `torch_bindings.cpp`,
-`op_kernel/common/turboquant_strip_layout.h` and the tail of
-`op_kernel/common/turboquant_layout.h` is a **verbatim mirror** of
+Everything in this directory except `torch_bindings.cpp` is a **mirror** of the
+`turboquant-core` repository — `include/turboquant/` and `src/` there, the
+audited production kernels extracted from
 `kernels/ops/turboquant/vllm_integration_layer` in the ascend-micro-harness.
-The mirror is byte-for-byte and needed **no include-path edits**: every include
-in the audited tree is either a CANN system header (`kernel_operator.h`,
-`tensor_api/tensor.h`) or relative within the subtree, so reproducing the
-directory names reproduces the include graph.
 
-Do not edit the mirrored files to fix something here. Fix it in the harness,
+The mirror is byte-for-byte in content but **not** in include paths. The
+standalone repo separates normative contracts (`include/turboquant/`) from
+implementation (`src/{prefill,scatter,decode,common,host}/`); this tree keeps the
+CANN operator layout (`include/`, `op_kernel/{common,cube,vector}/`, `op_host/`,
+`op_adapter/`). So every `#include` of a sibling contract is rewritten on the way
+in, and nothing else is. `tools`-free and reproducible: the rewrite is a fixed
+map from one layout to the other, recorded in the port commit.
+
+Do not edit the mirrored files to fix something here. Fix it in `turboquant-core`,
 re-run its own gates, and re-mirror — the Ascend C vector and cube logic, the
-pipeline depth, the mode-4 event pairings, the cross-core flag budget and the
-UB alignments are all load-bearing and audited there.
+pipeline depth, the mode-2 channel map, the cross-core flag budget and the UB
+alignments are all load-bearing and audited there.
 
 There is **one** standing exception, and it is build integration rather than
 kernel logic: in the three kernel translation units the `__global__` entry-point
@@ -28,62 +32,83 @@ symbol is undefined.
 
 | Path | What it is |
 | --- | --- |
-| `op_kernel/turboquant_reshape_batch.cpp` | prefill batch writer, MIX_AIC_1_2, four-stage ring over one 16-token strip |
+| `op_kernel/turboquant_reshape_batch.cpp` | prefill batch writer, MIX_AIC_1_2, **mode-2 only**, one seamless chunk stream over a block's whole share of strips |
 | `op_kernel/turboquant_reshape_scatter.cpp` | decode scatter writer, AIV only, per-token strip read-modify-write |
-| `op_kernel/turboquant_fused_decode.cpp` | fused decode, pre-rotated and raw-query entries, fp16 and bf16 |
+| `op_kernel/turboquant_fused_decode.cpp` | fused decode, pre-rotated and raw-query entries, **bf16 only** |
 | `op_kernel/common/`, `op_kernel/cube/`, `op_kernel/vector/` | codec, layout, wave protocol, the Cube and Vector services and their micro-routines |
-| `include/` | the fused decode's host tiling descriptors, its launch ABI, the GEMM-reduce and Split-K contracts |
-| `op_adapter/` | the C declaration surface (`launch_*`, `turboquant_mm_fused_decode_opt_raw_query_impl`) and the symbol inventory |
-| `op_host/turboquant_tiling.*` | the staged tiling descriptor alias and its default-constructibility gate |
-| `routines/` | the Cube H16 and ZN page-staging routines |
+| `include/` | the decode's launch ABI, the GEMM-reduce and Split-K contracts |
+| `op_adapter/` | the C declaration surface (`launch_*`, `turboquant_mm_fused_decode_opt_raw_query_impl`) |
+| `op_host/turboquant_tiling.{h,cpp}` | the decode's host tiling engine — a declaration and a real translation unit, not an `inline` in a device header |
+
+### What the current port changed
+
+Three things are gone from the kernels, and the seam follows them rather than
+papering over them.
+
+* **The prefill is mode-2 only.** There is no `template <bool Mode2>`, no
+  `..._mode4_single_shot` entry point and no `reuse_mode4_flags` launcher
+  argument. Mode 2 lowers to `ffts_cross_core_sync`: each id is a counter in
+  0..15 that banks unconsumed announcements, so recycling one across pipeline
+  generations is sound by construction and needs no single-shot allocation to
+  bisect against. The three channels are `kSync2PanelReady = 8`,
+  `kSync2PanelFree = 9`, `kSync2PageDrained = 10`, single-sourced in
+  `op_kernel/common/turboquant_wave_protocol.hpp`, each behind its
+  `HardEvent::x_S` drain. `bool reuse_mode4_flags` is therefore out of the
+  `npu_turboquant_reshape_and_cache_a8` schema.
+* **The prefill pipeline is seamless across strip boundaries.** The outer strip
+  loop is gone. A block owns `tokens_per_core` tokens = `tokens_per_core / 16`
+  strips and runs them as one chunk stream of `strips * kChunks` columns; column
+  *j* stages chunk *j* and multiplies chunk *j − kIngressLookahead*, and both
+  indices cross strip boundaries, so MTE2 does not drain at the end of a
+  16-token strip. The ring periods all divide `kChunks` (static_asserted), so a
+  boundary never shifts which slot a chunk owns. The binding still passes
+  `tokens_per_core = 16`; raising it is the knob for a wider share and is
+  deliberately not raised yet, because nothing has measured which width is
+  fastest on the part.
+* **The fused decode is bf16 only.** The fp16/`half` template instantiations are
+  gone, and the dispatch `return`s without launching for any other
+  `AscendType`. `torch_bindings.cpp` used to map any non-bf16 query to
+  `AscendType::FP16`, which over this kernel would leave `output` whatever
+  `at::empty` gave it and report success; it now `TORCH_CHECK`s bf16. The fp16
+  chain was already dead in the wheel, so this is a refusal rather than a
+  regression.
+* **The scatter writer's `launch_probe` is gone** — the parameter, its UB arena
+  slot and its publication block, from the kernel, the `__global__` entry and
+  the launcher. It was a synthetic buffer that published `GetBlockIdx` /
+  `GetBlockNum` / `GetSubBlockNum` back to a host runner, and nothing here ever
+  read it.
+* **The host tiling is a translation unit.** `build_decode_tiling` was an
+  `inline` function in a device-side header, so every consumer of the geometry
+  pulled in the kernel tree; it is ordinary host C++ in
+  `op_host/turboquant_tiling.cpp` now, and the binding, the kernel launcher and
+  the device-free gate all link the same object. `include/turboquant_fused_decode.hpp`
+  is gone, superseded by it.
 
 ## What is not mirrored
 
 * `torch_bindings.cpp` — this repo's own Torch registration, see below.
-* `op_kernel/common/turboquant_strip_layout.h` — this repo's host-side
-  restatement of the strip cache's addressing, kept because
-  `tests/ut/ops/test_turboquant_kernel_contracts.cpp` is a device-free gate that
-  checks it against the layout headers. Two documented edits from the version it
-  replaced: its include moved with the wave protocol, and `kCacheStripRows` is
-  now a literal 16 because the audited wave protocol no longer publishes
-  `kReshapeTokensPerStrip`.
-* `op_kernel/common/turboquant_layout.h` — mirrored except for the four
-  ingress helpers the harness added in its `00cf08c`: `NzTiledChannelByte`,
-  `NzTiledChannelNibble`, `NzScaleSlotFloats` and `NzTiledScaleIndex`. They are
-  **deliberately not here**, and re-mirroring them is a mistake rather than a
-  tidy-up, because each states a contract this repo's writers do not implement:
 
-    * they pair nibbles **woven**, channel `c` with channel `c + headSize/2` in
-      one byte. Both writers here pair **adjacent elements**, low nibble even —
-      the "Layout contracts" block of `op_kernel/turboquant_reshape_batch.cpp`
-      and the nibble-index comment in
-      `op_kernel/turboquant_reshape_scatter.cpp`. The harness file says so
-      itself: the woven pairing is "NOT the RFC 3.1 strip contract's two
-      adjacent channels per byte".
-    * `NzTiledScaleIndex` indexes scales per slot, `slot * NzScaleSlotFloats(H)
-      + kv * H + kvHead`. The scale plane here is plane-major over pages,
-      `((kv * numBlocks + block) * numKvHeads + head) * blockSize + key`.
+`op_kernel/common/turboquant_layout.h` is mirrored **in full** now, including the
+four ingress helpers `NzTiledChannelByte`, `NzTiledChannelNibble`,
+`NzScaleSlotFloats` and `NzTiledScaleIndex`. They used to be held out of it, and
+`op_kernel/common/turboquant_strip_layout.h` was this repo's own restatement of
+the writers' contract standing against them, because each helper states what the
+*decode* reads and a reader might take it for what the *writers* produce. Both
+files are gone in favour of a test: the writers' arithmetic is stated for a host
+reader as `key_nibble` / `value_nibble` / `scale_index` in
+`tests/ut/ops/turboquant/common/turboquant_test_common.hpp`, and
+`tests/ut/ops/turboquant/test_layout_bridge.cpp` is a device-free gate that
+states both contracts in C++ and checks, over four geometries, that the NZ
+writer and an independently re-derived decode reader name the same byte and the
+same nibble, that both maps are bijections onto their allocations, that both
+scale planes are bijections, and that the two contracts' co-byte pairings are
+**structurally incompatible**. A gate says it, so a comment no longer has to —
+and the mismatch below is now a measured property rather than a warning.
 
-  `NzTiledPackedByte`, which **is** mirrored and is used by
-  `op_kernel/vector/turboquant_vector_service.h` and `op_kernel/common/turboquant_mode.h`,
-  is a different thing: it addresses the tile a byte lives in, which kv4fp8 does
-  store NZ-tiled (`kStoresNzTiles`). Tile addressing and nibble pairing are
-  orthogonal; only the latter is in dispute.
-
-  The adjacent-element pairing is gated by
-  `tests/ut/attention/test_turboquant_strip_cache.py::test_strip_write_matches_the_kernel_nibble_formula`
-  (its `_nibble` helper, at `block_size` 16, 32 and 64), so adopting the woven
-  pairing fails there rather than silently writing a cache the decode misreads.
-  The harness's own NZ-ingress work — `TURBOQUANT_INGRESS_NZ`, the mode-2
-  rendezvous prefill and the `(c, c + 128)` weave — lives in its **standalone**
-  `kernels/ops/turboquant/turboquant_reshape_and_cache_bf16.cpp`, a different and
-  larger kernel over a different include graph (`baseline/common/`, the harness
-  `routines/` and `tests/common/`), with `block_size` meaning the 16-token strip
-  height rather than vLLM's page size. None of it has reached
-  `vllm_integration_layer`, so there is nothing to mirror yet and a hand-port is
-  a reviewed porting job, not a file copy.
-* The harness's `tests/`, `standalone/` and `sim_micro_testbed.hpp` consumers.
-  Their gates run in the harness checkout, not here.
+`routines/`, `include/sim_micro_testbed.hpp`, `op_kernel/common/turboquant_codec.h`
+(a one-line compatibility shim) and `op_kernel/common/turboquant_sampling.hpp`
+(the removed `ASCEND_MICRO_SPARSE_SAMPLING` probe) are gone: nothing reaches them
+after this port.
 
 ## The three ops
 
@@ -97,8 +122,8 @@ stage at runtime with no recompilation.
 | Op | Launcher | Host derivation |
 | --- | --- | --- |
 | `npu_turboquant_reshape_and_cache_a8` | `launch_turboquant_reshape_and_cache_bf16` | `tokens_per_core = 16`, `num_tokens % 16 == 0`, grid `num_tokens / 16` (the launcher's own) |
-| `npu_turboquant_reshape_scatter_aiv` | `launch_turboquant_reshape_scatter_aiv` | `total_items = num_requests * num_kv_heads`, `item_begin = 0`, `item_count = total_items`, `block_dim = min(total_items, aiv_core_num)`, `cu_seqlens`/`launch_probe` null |
-| `npu_turboquant_fused_decode` | `turboquant_mm_fused_decode_opt_raw_query_impl` | the host tiling descriptors, the Split-K workspace, the fp32 `query_rot` image, the task split, and the stream |
+| `npu_turboquant_reshape_scatter_aiv` | `launch_turboquant_reshape_scatter_aiv` | `total_items = num_requests * num_kv_heads`, `item_begin = 0`, `item_count = total_items`, `block_dim = min(total_items, aiv_core_num)`, `cu_seqlens` null |
+| `npu_turboquant_fused_decode` | `turboquant_mm_fused_decode_opt_raw_query_impl` | the host tiling descriptors, the Split-K workspace, the fp32 `query_rot` image, the task split, and the stream; bf16 query enforced by `TORCH_CHECK` |
 
 Each schema takes tensors and the few scalars that are not derivable from them.
 `num_tokens`, `num_kv_heads`, `head_size`, `block_size` and `num_blocks` come
@@ -139,7 +164,17 @@ occupy the same 8192 bytes per (tile, kv head) and zero of those bytes hold the
 same pair. Each op therefore `TORCH_CHECK`s its own addressing and the mismatch
 cannot be expressed as a shape check at all — switching on both ingestion and
 decode kernels over one cache would pass every check and attend over the wrong
-tokens. Merging the formats is kernel work in the harness.
+tokens. Merging the formats is kernel work in `turboquant-core`.
+
+This is no longer only an argument. `tests/ut/ops/turboquant/test_layout_bridge.cpp`
+runs both address functions over four geometries and reports the count: at
+`block_size` 64, 32758 of 32768 addresses differ and the byte groupings are
+incompatible. **Do not reconcile the two layouts by deleting the binding's
+`TORCH_CHECK`s** — they are what turns the mismatch into a refused launch
+instead of an attention over bytes in the wrong order.
+`vllm_ascend/attention/turboquant_nz_ingress.py` carries a reference
+strip-to-NZ repack for exercising the decode; it is a bridge, not a serving
+path.
 
 The Python side knows about the writers' layout: `TurboQuantValueLayout` and
 `TurboQuantOpsAdapter.value_layout()` derive it from which writer owns the page,
@@ -149,8 +184,37 @@ configuration — NPU writer, PyTorch reader — still reads back correctly.
 ## Gates that need no NPU
 
 ```bash
-pytest --noconftest tests/ut/ops/test_turboquant_kernel_contracts.py
+pytest --noconftest tests/ut/ops/test_turboquant_contract_gates.py
 ```
+
+Two gates, both toolkit-free — the layout contract, the host tiling and the
+kernels' host-visible geometry and nothing else, so a build plus a run is a
+couple of seconds with any C++17 compiler and needs no CANN and no NPU.
+
+* `tests/ut/ops/turboquant/test_contract_gates.cpp` — the fused decode's UB
+  arena `static_assert`s; the host tiling's dispatch odometer and descriptors
+  against the arithmetic they replace, over thirteen geometries plus five
+  refusals; seven launch-guard admissions and refusals; the mode-2 channel map;
+  the shared online-softmax phase order; and a **marked-graph token-balance
+  audit of the seamless chunk pipeline** over 1, 2, 3, 4, 8, 17 and 64 strips —
+  every ring stays inside its depth, every primed token reaches a terminal
+  sink, and a 64-strip share costs exactly 64x the chunk work of a 1-strip
+  share with no extra prologue, drain or rendezvous per strip, which is the
+  seamless property stated as a count. It `#include`s
+  `op_kernel/turboquant_reshape_batch.cpp` directly: the device body is behind
+  `#if defined(__CCE_AICORE__)`, so a host compiler sees the arena constants and
+  their `static_assert`s, which is the point.
+* `tests/ut/ops/turboquant/test_layout_bridge.cpp` — the NZ/strip layout bridge
+  described under "What is not mirrored".
+
+The token-balance audit is a **counting argument**, not a deadlock proof and not
+a liveness or overlap claim: source order and balanced events do not establish
+overlap, which needs a trace with intersecting MTE2/Cube intervals. The
+seamless pipeline has **no CAModel evidence** — the isolated head/middle/tail
+page canaries, the depth and wrap tests, and the trace audit and census are all
+unstarted. The NPU legs in
+`tests/e2e/pull_request/one_card/turboquant/` have never been linked against the
+kernel libraries.
 
 The three kernel translation units also build for `dav-3510` with no Torch and
 no driver, through a throwaway CMake project whose only target is
