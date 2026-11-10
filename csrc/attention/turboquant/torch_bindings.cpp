@@ -125,9 +125,36 @@ constexpr std::int64_t kDecodeMaxHeadsPerTask = 16;
 // worth naming at the seam.
 constexpr std::uintptr_t kGmBurstBytes = 32;
 
-// 2 * (head_size / 32) row-major 32x32 INT8 blocks: T[s][g] of the rotation,
-// with the sign diagonal pre-composed. 16384 bytes at head_size 256, which is
-// what `_codec_tables` in turboquant_dry_run.py builds.
+// 2 * (head_size / 32) row-major 32x32 BF16 blocks: T[s][g] of the rotation,
+// with the sign diagonal pre-composed. 16384 ELEMENTS and therefore 32768 BYTES
+// at head_size 256, which is what `_codec_tables` in turboquant_dry_run.py
+// builds.
+//
+// BF16, NOT INT8, and this was wrong here until it was checked against the
+// kernel. The batch writer stages the blob as the Cube's BF16 L1 operand:
+//
+//   // op_kernel/turboquant_reshape_batch.cpp
+//   ascend_micro::stage_blocks_nz<kTableBlocks, kGroup>(
+//       reinterpret_cast<__gm__ const bfloat16_t*>(tables), kL1Table);
+//
+// and `stage_blocks_nz<Blocks, Dim>` reads `Blocks * Dim * Dim` *bfloat16_t*
+// elements, which is the `kTableBytes = kTableElems * kElemBytes` it reserves in
+// L1 with `kElemBytes == 2`. An int8 tensor of the same element count is half
+// those bytes, so accepting one fed the Cube +-1 bytes reinterpreted as BF16 --
+// a wrong rotation, not a slightly wrong one -- and read 16 KB past the end of
+// the operand.
+//
+// Nothing in the signature could have caught it: the launcher's parameter is
+// declared `const std::int32_t*` and the kernel reinterpret_casts it, so the
+// declared pointer type says nothing about the element type and neither side of
+// the cast is checkable. The authority is the operator's own runner, which
+// converts the oracle's int8 blob on the way up -- tests/npu/test_live_write.cpp,
+// `tb[i] = to_bf16(table_blob[i])` into a buffer sized
+// `table_blob.size() * sizeof(std::uint16_t)`.
+//
+// Every entry is +-1, exact in BF16, so the conversion the Python side does is a
+// representation change rather than a rounding: the operand the Cube contracts
+// against is bit-identical to the oracle's, element for element.
 constexpr std::int64_t kTableGroup = 32;
 constexpr std::int64_t kTablePlanes = 2;
 
@@ -210,15 +237,30 @@ inline void check_slot_mapping(const at::Tensor &slot_mapping, const std::int64_
                 ": slot_mapping must be a contiguous int32 [", expected, "], got ", slot_mapping.sizes());
 }
 
-inline void check_tables(const at::Tensor &tables, const std::int64_t head_size, const char *op)
+// The Cube's resident rotation operand. See the kTableGroup block above for why
+// this is BF16 and what accepting int8 did.
+//
+// `name` is the schema's own spelling -- `tables` on the batch writer,
+// `rot_tables` on the fused decode -- so a message names the argument the caller
+// passed rather than a shared alias. The two are the same blob and must agree on
+// dtype even though the decode never dereferences it: `ConstTableWords` returns 0
+// for an affine mode with the gather LUT off (op_kernel/common/turboquant_codec_mx.h),
+// so `TurboQuantModeCodec::Init` reads no words from it under KV4_FP8. A decode
+// that runs is therefore no evidence that this operand is right, which is
+// precisely how the wrong dtype survived; checking it identically in both places
+// is what stops the next one surviving.
+inline void check_tables(const at::Tensor &tables, const std::int64_t head_size, const char *op,
+                         const char *name)
 {
     const std::int64_t groups = head_size / kTableGroup;
     const std::int64_t expected = kTablePlanes * groups * kTableGroup * kTableGroup;
-    TORCH_CHECK(tables.scalar_type() == at::kChar, op,
-                ": tables must be int8 (the Cube's resident INT8 operand), got ", tables.scalar_type());
-    TORCH_CHECK(tables.is_contiguous() && tables.numel() == expected, op, ": tables must be ", expected,
-                " contiguous int8 elements (", kTablePlanes * groups, " row-major 32x32 blocks), got ",
-                tables.numel());
+    TORCH_CHECK(tables.scalar_type() == at::kBFloat16, op, ": ", name,
+                " is the Cube's resident BF16 operand (stage_blocks_nz reads it as bfloat16_t), got ",
+                tables.scalar_type(),
+                ". An int8 blob is half the bytes the kernel reads and the wrong arithmetic.");
+    TORCH_CHECK(tables.is_contiguous() && tables.numel() == expected, op, ": ", name, " must be ", expected,
+                " contiguous bfloat16 elements (", kTablePlanes * groups, " row-major ", kTableGroup, "x",
+                kTableGroup, " blocks of +-1, ", expected * 2, " bytes), got ", tables.numel());
 }
 
 // `pi_signs` stays in every published signature and the device does not read it
@@ -307,7 +349,7 @@ void npu_turboquant_reshape_and_cache_a8(at::Tensor &key, at::Tensor &value, at:
     const Activations a = check_activations(key, value, op);
     const CachePlanes c = check_cache(key_cache, value_cache, scale_cache, a, op);
     check_slot_mapping(slot_mapping, a.num_tokens, op);
-    check_tables(tables, a.head_size, op);
+    check_tables(tables, a.head_size, op, "tables");
 
     // The kernel's compile-time specialisation (kTokens, kHeads, kHeadSize in
     // op_kernel/turboquant_reshape_batch.cpp). The scalar arguments drive the
@@ -357,8 +399,11 @@ void npu_turboquant_reshape_and_cache_a8(at::Tensor &key, at::Tensor &value, at:
         static_cast<std::int8_t *>(key_cache.data_ptr()),
         static_cast<std::int8_t *>(value_cache.data_ptr()), static_cast<float *>(scale_cache.data_ptr()),
         static_cast<const std::int32_t *>(slot_mapping.data_ptr()), optional_pi_signs(pi_signs),
-        // The launcher publishes `tables` as int32* and reinterprets it device
-        // side; the bytes are the INT8 blocks checked above.
+        // The launcher publishes `tables` as int32* and the kernel reinterprets
+        // it device side as bfloat16_t. The pointer type is meaningless here;
+        // the bytes are the BF16 blocks check_tables verified above, and that
+        // check is the only thing standing between a caller and a 16 KB
+        // over-read of a half-sized operand.
         static_cast<const std::int32_t *>(tables.data_ptr()), static_cast<std::uint32_t>(a.num_tokens),
         static_cast<std::uint32_t>(a.num_kv_heads), static_cast<std::uint32_t>(a.head_size),
         static_cast<std::uint32_t>(c.block_size), static_cast<std::uint32_t>(c.num_blocks),
@@ -452,20 +497,24 @@ void npu_turboquant_reshape_scatter_aiv(at::Tensor &key, at::Tensor &value, at::
 // The raw-query one-launch decode, over
 // vllm_ascend::turboquant_mm_fused_decode_opt_raw_query_impl.
 //
-// Three buffers the kernel needs are the caller's to build and are built here
+// Four buffers the kernel needs are the caller's to build and are built here
 // rather than exposed in the schema, because each one is derived from the
 // launch geometry and a caller that got one wrong would get a hang or a wrong
 // answer, not an error:
 //
-//   tiling     decode_tiling_bytes(tokens, splits, grid) of host-built
-//              descriptors, uploaded like any other input. The launcher throws
-//              without it: a decode that derived its own tiling on the SPU is
-//              the operator the harness removed.
-//   workspace  the Split-K partials, tokens * num_heads * splits *
-//              (head_size + kPartialTail) fp32, which TurboQuantPartialReducer
-//              addresses as ((token * heads + head) * splits + split) * stride.
-//   query_rot  the fp32 rotated image the prologue WRITES and the decode then
-//              reads. It is not `query` and the two are not interchangeable.
+//   tiling      decode_tiling_bytes(tokens, splits, grid) of host-built
+//               descriptors, uploaded like any other input. The launcher throws
+//               without it: a decode that derived its own tiling on the SPU is
+//               the operator the harness removed.
+//   workspace   the Split-K partials, tokens * num_heads * splits *
+//               (head_size + kPartialTail) fp32, which TurboQuantPartialReducer
+//               addresses as ((token * heads + head) * splits + split) * stride.
+//   query_rot   the fp32 rotated image the prologue WRITES and the decode then
+//               reads. It is not `query` and the two are not interchangeable.
+//   mode_tables the decode codec's constant pool. KV4_FP8 reads nothing from
+//               it, so this used to be a null pointer; see the allocation below
+//               for why "nothing reads it" is a property of the mode rather
+//               than of the ABI and so not something to pass null on.
 //
 // build_decode_tiling needs the context lengths HOST-visible, because a
 // worker's tile count is a function of its token's context length and that is
@@ -556,7 +605,7 @@ void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Te
     // ---- the basis operands --------------------------------------------------
     TORCH_CHECK(pi_signs.scalar_type() == at::kFloat && pi_signs.numel() == head_size, op,
                 ": pi_signs must be ", head_size, " fp32 entries, got ", pi_signs.numel());
-    check_tables(rot_tables, head_size, op);
+    check_tables(rot_tables, head_size, op, "rot_tables");
     TORCH_CHECK(h16.scalar_type() == at::kHalf &&
                     h16.numel() == static_cast<std::int64_t>(layout::kRotateQH16Elements),
                 op, ": h16 is the Cube's resident ", layout::kRotateQH16Elements,
@@ -641,6 +690,25 @@ void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Te
     const at::Tensor query_rot =
         at::empty({num_tokens, num_heads, head_size}, query.options().dtype(at::kFloat));
 
+    // ---- the decode codec's constant pool ------------------------------------
+    // A required positional argument of the launcher that this mode never
+    // dereferences: TurboQuantModeCodec::ConstTableWords returns 0 for an affine
+    // mode with the gather LUT off, so Init reads no words from it under
+    // KV4_FP8 (op_kernel/common/turboquant_codec_mx.h). A null pointer was
+    // therefore safe, and was what this passed.
+    //
+    // It is a real allocation now because "safe" there is a property of the MODE
+    // and not of the ABI. SetGlobalBuffer(nullptr) is only harmless while
+    // nothing reads it, so switching the mode -- or turning GATHER_LUT on, which
+    // is a template argument away -- would turn this into a null dereference on
+    // the device, which surfaces as an AIV fault with no line attached to it.
+    // kMinBurstBytes of zeros costs one small allocation per launch and removes
+    // that edge; the operator's own fixture does the same thing
+    // (`modes.Upload(std::vector<std::uint32_t>(8, 0))` in
+    // tests/npu/test_fused_decode_e2e.cpp).
+    const at::Tensor mode_tables =
+        at::zeros({static_cast<std::int64_t>(layout::kMinBurstBytes) / 4}, query.options().dtype(at::kInt));
+
     // BF16 ONLY, checked rather than mapped. The audited fused decode carries a
     // single pair of template instantiations -- `..._kv4fp8_bf16` and
     // `..._raw_query_kv4fp8_bf16` -- and its dispatch RETURNS without launching
@@ -660,7 +728,7 @@ void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Te
         static_cast<std::uint32_t>(grid), query.data_ptr(), pi_signs.data_ptr(), rot_tables.data_ptr(),
         h16.data_ptr(), gate.has_value() ? gate->data_ptr() : nullptr, query_rot.data_ptr(),
         key_cache.data_ptr(), value_cache.data_ptr(), scale_cache.data_ptr(), block_tables.data_ptr(),
-        context_lens_device.data_ptr(), /*mode_tables=*/nullptr, workspace.data_ptr(), output.data_ptr(),
+        context_lens_device.data_ptr(), mode_tables.data_ptr(), workspace.data_ptr(), output.data_ptr(),
         tiling_device.data_ptr(), static_cast<std::uint32_t>(num_tokens),
         static_cast<std::uint32_t>(num_heads), static_cast<std::uint32_t>(num_kv_heads),
         static_cast<std::uint32_t>(head_size), static_cast<std::uint32_t>(block_size),
@@ -727,14 +795,19 @@ void npu_turboquant_fused_decode_meta(at::Tensor &, at::Tensor &, at::Tensor &, 
 TORCH_LIBRARY_FRAGMENT(turboquant_ops, ops)
 {
     // key/value    [num_tokens, num_kv_heads, head_size] bf16, contiguous
-    // key_cache    [num_blocks, 16, num_kv_heads, head_size / 2] int8, key-major
-    //              within a (block, head) page: nibble = token * head_size + channel
-    // value_cache  the same extent, channel-major: nibble = channel * block_size + token
-    // scale_cache  [2, num_blocks, num_kv_heads, 16] fp32, kv 0 keys / 1 values
-    // slot_mapping [num_tokens] int32; strip i must be slot_mapping[0] + i with
-    //              slot_mapping[0] a multiple of block_size
+    // key_cache    [num_blocks, block_size, num_kv_heads, head_size / 2] int8,
+    //              token-major within a (block, head) page:
+    //              nibble = token * head_size + channel
+    // value_cache  the same extent, channel-major inside a 16-token strip:
+    //              nibble = (token / 16) * (16 * head_size) + channel * 16 + token % 16
+    // scale_cache  [2, num_blocks, num_kv_heads, block_size] fp32,
+    //              kv 0 keys / 1 values
+    // slot_mapping [num_tokens] int32. Each 16-token strip must be consecutive
+    //              from a 16-aligned first slot -- NOT page-aligned: the writer
+    //              carries an in-page strip index, so block_size is any multiple
+    //              of 16 and strips may jump between pages freely.
     // pi_signs     folded into `tables`; an empty tensor says so
-    // tables       2 * (head_size / 32) row-major 32x32 int8 blocks
+    // tables       2 * (head_size / 32) row-major 32x32 BF16 blocks of +-1
     ops.def(
         "npu_turboquant_reshape_and_cache_a8(Tensor key, Tensor value, Tensor! key_cache, "
         "Tensor! value_cache, Tensor! scale_cache, Tensor slot_mapping, Tensor pi_signs, "
@@ -756,13 +829,18 @@ TORCH_LIBRARY_FRAGMENT(turboquant_ops, ops)
     ops.impl("npu_turboquant_reshape_scatter_aiv", c10::kMeta,
              &vllm_ascend::turboquant_bindings::meta::npu_turboquant_reshape_scatter_aiv_meta);
 
-    // query/output [num_tokens, num_heads, 256] fp16 or bf16
-    // rot_tables   the int8 blocks above; h16 the 16x16 fp16 +-1 matrix
+    // query/output [num_tokens, num_heads, 256] bf16. The schema admits fp16 so
+    //              the error names the dtype rather than the schema, but the op
+    //              refuses it: there is no fp16 kernel instance and the
+    //              dispatch would return without launching.
+    // rot_tables   the BF16 blocks above, unread under KV4_FP8 but checked
+    //              identically; h16 the 16x16 fp16 +-1 matrix
     // gate         read only at output_stage 2
     // output_stage TurboQuantOutputStage: 0 rotated basis, 1 unrotated, 2 gated
-    // The tiling descriptors, the Split-K workspace and the fp32 rotated query
-    // image are built inside the op, not passed: each is derived from this
-    // geometry and a caller that got one wrong would hang rather than fail.
+    // The tiling descriptors, the Split-K workspace, the fp32 rotated query
+    // image and the codec's mode_tables are built inside the op, not passed:
+    // each is derived from this geometry and a caller that got one wrong would
+    // hang rather than fail.
     ops.def(
         "npu_turboquant_fused_decode(Tensor query, Tensor pi_signs, Tensor rot_tables, Tensor h16, "
         "Tensor? gate, Tensor key_cache, Tensor value_cache, Tensor scale_cache, Tensor block_tables, "

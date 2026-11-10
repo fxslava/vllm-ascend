@@ -85,11 +85,30 @@ What the dry run does *not* model
   The kernel instead rotates the query and contracts against the rotated cache
   (``Pi q . Pi k == D q . k``). The quantisation error is identical; the
   floating-point summation order is not.
-* The scale plane is modelled at the staged kernels' layout
-  (``(2, num_blocks, num_kv_heads, block_size)`` fp32), not the burst-padded
-  per-token slot the AIV scatter writer uses.
 * Nothing here is a performance model. A dry run is for routing, shapes,
   metadata and accuracy, never for latency.
+
+What the scale plane does *not* need reconciling
+------------------------------------------------
+An earlier revision of this note said the AIV scatter writer used a
+"burst-padded per-token slot" for its scales, unlike the
+``(2, num_blocks, num_kv_heads, block_size)`` fp32 plane modelled here. It does
+not, and has not since the audited revision: both writers index
+
+    ((kv * num_blocks + block) * num_kv_heads + head) * block_size + token
+
+-- ``CalculateStripAddr`` in op_kernel/turboquant_reshape_batch.cpp, and the
+``scale_base`` of ``WriteKeyPlane`` / ``WriteValuePlane`` in
+op_kernel/turboquant_reshape_scatter.cpp, which ``DataCopyPad``s one float per
+token into it because a single float is not a burst. That is exactly
+:func:`turboquant_scale_cache_shape`, so the plane agrees element for element.
+
+The burst-padded slot is real, but it belongs to the **fused decode's** NZ
+cache: ``NzTiledScaleIndex`` is ``slot * NzScaleSlotFloats(H) + kv * H + head``,
+slot-major and rounded up to a whole fp32 block
+(op_kernel/common/turboquant_layout.h). It is one of the five axes on which that
+cache differs from the writers', and nothing in the ingestion path has to
+reconcile it.
 """
 
 from __future__ import annotations
@@ -249,12 +268,32 @@ class TurboQuantValueLayout(str, Enum):
       bitwise masks and :meth:`TurboQuantOpsAdapter._write_slots` does it as a
       tensor read-modify-write of the touched strips.
 
-    ``block_size`` is a multiple of 16 in this layout, and the two writers do
-    not agree on which multiples: the scatter writer carries a strip index
-    inside the page and takes any of them, while the batch writer writes one
-    strip at the page base with no in-page offset and therefore needs
-    ``block_size == 16``. See the note in
-    csrc/attention/turboquant/torch_bindings.cpp.
+    ``block_size`` is a multiple of 16 in this layout, and **both** writers take
+    any such multiple. Each carries a strip index inside the page: the scatter
+    writer as ``item.strip`` in ``StripWordOffset`` and ``item.token_in_block``
+    in its key burst, the batch writer as
+
+        block_idx      = slot0 / block_size
+        strip_in_block = (slot0 % block_size) / 16
+
+    in ``CalculateStripAddr`` (op_kernel/turboquant_reshape_batch.cpp), which
+    offsets the packed base and both scale bases by it.
+
+    The batch writer *used* to need ``block_size == 16`` -- its only address was
+    a page base, so at block_size 64 all four strips of a page computed the same
+    base and overwrote each other -- and an earlier revision of this docstring
+    said so. It is worth stating what changed, because ``block_size == 16`` is
+    **incompatible with the fused decode**, whose closed-form tile cursor needs a
+    power-of-two multiple of 64 (``valid_launch``). Under the old constraint the
+    three operators had no common page size at all; under the current writers
+    ``block_size = 128`` -- an ordinary vLLM page, and what the decode's own
+    end-to-end fixture uses -- satisfies all three at once.
+
+    Caveat: no device test covers it. The writers' runner pins
+    ``kBlockSize = 16`` (tests/npu/test_live_write.cpp), so ``strip_in_block`` is
+    0 in every run that has ever been made and the batch writer's in-page offset
+    is code without evidence. See csrc/attention/turboquant/torch_bindings.cpp,
+    which checks the multiple rather than the equality.
     """
 
     TOKEN_MAJOR = "token_major"
@@ -553,6 +592,56 @@ TURBOQUANT_STAGE_GATED: Final[int] = 2
 # for both element types: its entries are +-1 and the kernel converts it on
 # ingest where the Cube chunk operand is not fp16.
 TURBOQUANT_H16_ORDER: Final[int] = 16
+
+# The element type of the Cube's resident rotation operand (``tables`` for the
+# batch writer, ``rot_tables`` for the fused decode). BF16, because
+# ``stage_blocks_nz`` reads it as ``bfloat16_t`` and L1 reserves two bytes an
+# entry; see :func:`_codec_tables` for why an INT8 blob is both the wrong
+# arithmetic and a 16 KB over-read, and for why the decode cannot detect it.
+TURBOQUANT_TABLE_DTYPE: Final[torch.dtype] = torch.bfloat16
+
+# ---------------------------------------------------------------------------
+# What the kernels are compile-time specialised to.
+#
+# These are not tuning knobs and not defaults: outside them a staged kernel is
+# not a slow path, it is a wrong answer with every canary intact. All three
+# operators pin the head size, and the two writers are additionally unrolled
+# over a fixed KV head count (``kHeads`` in
+# op_kernel/turboquant_reshape_batch.cpp drives ``kChunks = 2 * kHeads`` chunk
+# phases by template argument).
+#
+# The binding TORCH_CHECKs every one of these, so a violating launch raises
+# rather than corrupting -- but it raises from inside an attention forward, one
+# step into a server that has already loaded weights and allocated a cache.
+# :meth:`AscendTurboQuantDryRunBackendImpl.__init__` checks them again at layer
+# construction so an impossible model is refused at load instead.
+# ---------------------------------------------------------------------------
+
+# ``kHeadSize`` in both writers, and ``dim != kHeadSize`` in the decode's
+# ``valid_launch``. The golden path has no such constraint -- any multiple of
+# TURBOQUANT_GROUP whose group count is a power of two works -- so this applies
+# only to a kernel-backed stage.
+TURBOQUANT_KERNEL_HEAD_SIZE: Final[int] = 256
+
+# ``kHeads`` in op_kernel/turboquant_reshape_batch.cpp and the scatter writer's
+# panel geometry: the two ingestion kernels are specialised to exactly this many
+# KV heads.
+TURBOQUANT_KERNEL_KV_HEADS: Final[int] = 4
+
+# ``kv_heads > 4`` is refused by the decode's ``valid_launch``. The decode
+# tolerates fewer, unlike the writers, which need exactly
+# TURBOQUANT_KERNEL_KV_HEADS.
+TURBOQUANT_DECODE_MAX_KV_HEADS: Final[int] = 4
+
+# The query and output element type the kernels have instances for. The fused
+# decode carries one pair of template instantiations,
+# ``..._kv4fp8_bf16`` and ``..._raw_query_kv4fp8_bf16``, and its ``_impl``
+# dispatch RETURNS WITHOUT LAUNCHING for any other ``AscendType`` -- which would
+# leave ``output`` whatever the allocator gave it and report success. Both
+# writers likewise take ``bfloat16_t`` activations only. The binding refuses a
+# non-bf16 query outright for that reason; this constant is what the refusal at
+# layer construction names.
+TURBOQUANT_KERNEL_DTYPE: Final[torch.dtype] = torch.bfloat16
 
 # The kernel entry points, as op_adapter/turboquant_torch_adpt.h declares them.
 TURBOQUANT_OP_ROTATE: Final[str] = "npu_turboquant_rotate"
@@ -1094,10 +1183,20 @@ class TurboQuantOpsAdapter:
         """The batch writer: rotate, quantise, pack and write whole pages.
 
         ``key`` and ``value`` are ``[T, H, D]`` bf16; ``key_cache`` and
-        ``value_cache`` are ``(num_blocks, 16, H, D/2)`` INT8 in the strip
-        layout and ``scale_cache`` is ``(2, num_blocks, H, 16)`` fp32.
-        ``tables`` is the Cube's resident INT8 operand and ``pi_signs`` is
-        folded into it, so the device does not read it; an empty tensor says so.
+        ``value_cache`` are ``(num_blocks, block_size, H, D/2)`` INT8 in the
+        strip layout and ``scale_cache`` is ``(2, num_blocks, H, block_size)``
+        fp32, for any ``block_size`` that is a multiple of 16 -- see
+        :class:`TurboQuantValueLayout` for why this writer no longer needs
+        ``block_size == 16`` and why that matters.
+
+        ``tables`` is the Cube's resident **BF16** operand, ``2 * (D/32)``
+        row-major 32x32 blocks of ±1 (:func:`_codec_tables`, which is also where
+        the consequences of getting its dtype wrong are written down).
+        ``pi_signs`` is folded into it, so this kernel does not read it --
+        literally: its body is ``(void)piSigns``. An empty tensor is the honest
+        way to say so, and because nothing dereferences it, a wrongly shaped
+        ``pi_signs`` is invisible *here* while being fatal to the scatter writer,
+        which does read it.
 
         There is no mode-4 channel-policy argument any more. The audited writer
         is mode-2 only -- its three cross-core channels are counters that bank
@@ -1112,9 +1211,19 @@ class TurboQuantOpsAdapter:
         ``num_kv_heads``, ``head_size``, ``block_size``, ``num_blocks`` and
         ``tokens_per_core``. The schema does not: the first five come off the
         tensor shapes in csrc/attention/turboquant/torch_bindings.cpp, and
-        ``tokens_per_core`` is the kernel's own compile-time 16-token strip,
-        which the host derives rather than accepts -- a caller that could choose
-        it could contradict the schedule the kernel is specialised to.
+        ``tokens_per_core`` is derived there rather than accepted -- a caller
+        that could choose it could contradict the schedule.
+
+        ``tokens_per_core`` is **not** a compile-time constant of the kernel,
+        which an earlier revision of this docstring claimed. It is the width of
+        one grid block's share, and the kernel's seamless chunk pipeline runs
+        ``tokens_per_core / 16`` strips as one uninterrupted chunk stream so that
+        MTE2 does not drain at a strip boundary. The binding pins it to 16 today,
+        which is a legal geometry and the one the goldens were taken at, but it
+        is one strip per block -- the stream is one strip long and the refactor
+        buys nothing. Raising it is a measurement, not a correctness change, and
+        the constraint is only that ``num_tokens`` stay a whole multiple of it
+        (``WholeStrips``, which the launcher throws on).
         """
         self._require_kernel(TURBOQUANT_OP_RESHAPE_AND_CACHE)(
             key,
@@ -1567,16 +1676,41 @@ class TurboQuantOpsAdapter:
         golden fallback. The op itself returns nothing: like the two writers it
         writes through its ``Tensor!`` argument.
 
-        Four of the launcher's inputs are built inside the op rather than passed:
+        Six of the launcher's inputs are built inside the op rather than passed.
         ``mode`` is fixed to ``TurboQuantMode::KV4_FP8``, the only mode the fused
-        decode is validated in; ``element_type`` is read off the output dtype;
-        and the host tiling descriptors, the Split-K workspace and the fp32
-        rotated query image ``query_rot`` are allocated and filled in
+        decode is validated in. ``element_type`` is **not** read off the output
+        dtype as this docstring once said: the operator has one pair of bf16
+        instantiations and its ``_impl`` dispatch returns without launching for
+        any other ``AscendType``, so mapping an fp16 query would leave ``output``
+        whatever the allocator gave it and report success. The binding therefore
+        refuses a non-bf16 query outright and passes ``AscendType::BF16``
+        unconditionally (:data:`TURBOQUANT_KERNEL_DTYPE`).
+
+        The remaining four are allocated and filled in
         csrc/attention/turboquant/torch_bindings.cpp, because each is derived
         from the launch geometry and a caller that got one wrong would get a hang
-        rather than an error. ``query_rot`` is what the prologue writes and the
-        decode then reads; it is not ``query`` and the two are not
-        interchangeable.
+        rather than an error:
+
+        * the host tiling descriptors, from ``build_decode_tiling``;
+        * the Split-K workspace,
+          ``tokens * heads * splits * (D + kPartialTail)`` fp32;
+        * ``query_rot``, the fp32 rotated query image the prologue writes and the
+          decode then reads -- it is not ``query`` and the two are not
+          interchangeable;
+        * ``mode_tables``, the decode codec's own constant pool. It is a required
+          positional argument of the launcher, and for ``KV4_FP8`` it is never
+          dereferenced: ``ConstTableWords`` returns 0 for an affine mode with the
+          gather LUT off, so ``Init`` reads no words from it
+          (op_kernel/common/turboquant_codec_mx.h). That is a property of the
+          mode and not of the ABI, so the binding hands over a small zeroed
+          buffer rather than a null pointer -- the operator's own fixture does
+          the same (``modes.Upload(std::vector<std::uint32_t>(8, 0))``), and a
+          mode that did read it would otherwise fault.
+
+        ``rot_tables`` is passed, and is in the same position: the query basis
+        hands it to ``TurboQuantModeCodec::Init``, which reads nothing from it
+        under this mode. It is given the real operand anyway so the two sides
+        never disagree about its dtype -- see :func:`_codec_tables`.
 
         THIS OP CANNOT READ A CACHE EITHER WRITER WROTE, not directly. The
         writers produce the strip layout; this reads the NZ-tiled layout, and the
@@ -1842,13 +1976,48 @@ def _require_contiguous(cache: torch.Tensor, name: str) -> torch.Tensor:
 
 
 def _codec_tables(emulator: TurboQuantEmulator) -> torch.Tensor:
-    """The Cube's resident rotation operand, ``2 * (D/32)`` row-major 32x32 INT8 blocks.
+    """The Cube's resident rotation operand, ``2 * (D/32)`` row-major 32x32 BF16 blocks.
 
     ``tables[s * groups + g][c0][i] = (s ? -1 : +1) * pi_signs[g*32 + c0] * H32[c0][i]``:
     the sign diagonal and the inner Hadamard factor, pre-composed, with the
     outer factor supplied by which block the kernel picks
     (``parity(c1 & g) * groups + g``). Built here so the dry run hands the
     kernel-backed stages exactly the operand ``tq_oracle::build_tables`` audits.
+
+    **BF16, NOT INT8**, and the distinction is load-bearing rather than
+    cosmetic. The batch writer stages this blob as the Cube's BF16 L1 operand::
+
+        // op_kernel/turboquant_reshape_batch.cpp
+        ascend_micro::stage_blocks_nz<kTableBlocks, kGroup>(
+            reinterpret_cast<__gm__ const bfloat16_t*>(tables), kL1Table);
+
+    ``stage_blocks_nz<Blocks, Dim>`` reads ``Blocks * Dim * Dim`` *bfloat16_t*
+    elements -- 16384 of them at ``D`` 256, so 32768 bytes, which is what
+    ``kTableBytes = kTableElems * kElemBytes`` reserves in L1 with
+    ``kElemBytes == 2``. An INT8 tensor of the same element count is half those
+    bytes, so handing one over would both feed the Cube ±1 bytes reinterpreted
+    as BF16 -- a wrong rotation, not a slightly wrong one -- and read 16 KB past
+    the end of the operand.
+
+    The launcher's parameter is still declared ``const std::int32_t*`` and the
+    kernel still reinterprets it, which is exactly how this went wrong: the
+    declared pointer type says nothing about the element type, and neither side
+    of a ``reinterpret_cast`` is checkable. The authority on what the device
+    wants is the operator's own runner, which converts the oracle's int8 blob on
+    the way up -- ``tests/npu/test_live_write.cpp``,
+    ``tb[i] = to_bf16(table_blob[i])`` into a buffer sized
+    ``table_blob.size() * sizeof(std::uint16_t)``.
+
+    Every entry is ±1, exact in BF16, so this is a representation change and not
+    a rounding: the operand the Cube contracts against is bit-identical to the
+    oracle's, element for element.
+
+    ``npu_turboquant_fused_decode`` takes the same blob as ``rot_tables``, where
+    it reaches ``TurboQuantModeCodec::Init`` and is **not read at all** for
+    ``KV4_FP8`` -- ``ConstTableWords`` returns 0 for an affine mode with the
+    gather LUT off (op_kernel/common/turboquant_codec_mx.h). So the decode would
+    have accepted either dtype, and a decode that runs is no evidence that this
+    operand is right. The prefill is where it bites.
     """
     device = emulator.device
     h_inner = _sylvester_hadamard(emulator.group, device, torch.float32)
@@ -1856,7 +2025,9 @@ def _codec_tables(emulator: TurboQuantEmulator) -> torch.Tensor:
     # [groups, 32, 32]: signs broadcast over the inner factor's rows.
     positive = signs.unsqueeze(-1) * h_inner.unsqueeze(0)
     tables = torch.stack((positive, -positive), dim=0)
-    return tables.reshape(TURBOQUANT_PLANES * emulator.groups, emulator.group, emulator.group).to(torch.int8)
+    return tables.reshape(TURBOQUANT_PLANES * emulator.groups, emulator.group, emulator.group).to(
+        TURBOQUANT_TABLE_DTYPE
+    )
 
 
 def _h16_operand(device: torch.device) -> torch.Tensor:
@@ -2062,6 +2233,7 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
             )
 
         self.adapter: TurboQuantOpsAdapter = adapter if adapter is not None else TurboQuantOpsAdapter()
+        self._check_kernel_geometry()
         self.emulator: TurboQuantEmulator | None = None
         self.scale_cache: torch.Tensor | None = None
         self._use_fia_v2: bool | None = None
@@ -2074,6 +2246,101 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
             staged or "none (all golden)",
             self.adapter.config.ops_namespace,
         )
+
+    # -- what the staged kernels can actually run --------------------------
+
+    def _check_kernel_geometry(self) -> None:
+        """Refuse a model shape a staged kernel cannot run, at layer construction.
+
+        Only the stages that are switched on are checked, and only against their
+        own kernel's specialisation: the golden path has none of these limits,
+        so a dry run with no kernel stage is unaffected by any of it.
+
+        The binding TORCH_CHECKs every one of these too, and that is the check
+        that matters -- it is the one a direct caller cannot skip. This one
+        exists because of *when* it fires. The binding's refusal arrives from
+        inside an attention forward, one decode step into a server that has
+        already loaded weights, sized a KV cache from
+        :func:`turboquant_page_size_bytes` and warmed up; it names a tensor
+        shape rather than the model. Raising here instead means an impossible
+        combination is a startup error naming the stage that cannot run it.
+
+        Deliberately NOT a warn-and-fall-back, which is how a missing
+        registration is handled (:meth:`TurboQuantOpsAdapter._resolve_kernel`).
+        A kernel that is absent has a golden model to fall back to and the run
+        stays correct; a kernel that is present and mis-specialised writes one
+        head's rows into another head's page with every canary intact, and the
+        operand that would silently do it is exactly what this refuses.
+        """
+        config = self.adapter.config
+        writers = (
+            TurboQuantKernelStage.RESHAPE_AND_CACHE,
+            TurboQuantKernelStage.SCATTER,
+        )
+        staged_writers = [stage for stage in writers if config.enables(stage)]
+        decode_staged = config.enables(TurboQuantKernelStage.DECODE)
+        if not staged_writers and not decode_staged:
+            return
+
+        staged = list(staged_writers)
+        if decode_staged:
+            staged.append(TurboQuantKernelStage.DECODE)
+        named = ", ".join(sorted(stage.value for stage in staged))
+
+        # `block_size` is deliberately not checked here: it is a property of the
+        # cache the model runner allocates, not of the layer, and it is not
+        # known yet. The binding checks it per call -- a multiple of 16 for
+        # either writer, a power-of-two multiple of 64 for the decode -- and
+        # :class:`TurboQuantValueLayout` records why 128 is the value that
+        # satisfies all three.
+
+        # Every one of the three kernels pins the head size: `kHeadSize` in both
+        # writers (the scatter writer returns without writing anything when it
+        # disagrees, which is worse than a fault) and `dim != kHeadSize` in the
+        # decode's valid_launch.
+        if self.head_size != TURBOQUANT_KERNEL_HEAD_SIZE:
+            raise ValueError(
+                f"TurboQuant kernel stages {named} are switched on, but all three kernels are "
+                f"specialised to head_size {TURBOQUANT_KERNEL_HEAD_SIZE} and this model's is "
+                f"{self.head_size}. The golden model has no such constraint: unset "
+                f"{TURBOQUANT_STAGES_ENV} to run this shape."
+            )
+
+        # The two writers are unrolled over a fixed KV head count -- kChunks =
+        # 2 * kHeads chunk phases by template argument -- and nothing in the
+        # kernel checks the runtime argument against it.
+        if staged_writers and self.num_kv_heads != TURBOQUANT_KERNEL_KV_HEADS:
+            raise ValueError(
+                f"TurboQuant ingestion stages {named} are switched on, but both cache writers are "
+                f"specialised to exactly {TURBOQUANT_KERNEL_KV_HEADS} KV heads and this model has "
+                f"{self.num_kv_heads}. The kernel does not check this: outside it the writer reads "
+                f"one head's rows and writes another head's page, with every canary intact."
+            )
+
+        # The decode tolerates fewer heads than the writers need, but not more.
+        if decode_staged and not 0 < self.num_kv_heads <= TURBOQUANT_DECODE_MAX_KV_HEADS:
+            raise ValueError(
+                f"the TurboQuant fused decode refuses num_kv_heads outside 1.."
+                f"{TURBOQUANT_DECODE_MAX_KV_HEADS} (valid_launch), and this model has "
+                f"{self.num_kv_heads}. This is the constraint a GQA model is most likely to hit; "
+                f"unset {TURBOQUANT_STAGES_ENV} or drop the 'decode' stage to run golden."
+            )
+        if decode_staged and self.num_heads % max(self.num_kv_heads, 1):
+            raise ValueError(
+                f"the TurboQuant fused decode needs num_heads ({self.num_heads}) to be a multiple "
+                f"of num_kv_heads ({self.num_kv_heads})."
+            )
+
+        # One pair of bf16 instantiations, and the dispatch returns without
+        # launching for anything else -- see TURBOQUANT_KERNEL_DTYPE.
+        if self.model_dtype != TURBOQUANT_KERNEL_DTYPE:
+            raise ValueError(
+                f"TurboQuant kernel stages {named} are switched on, but every kernel is "
+                f"{TURBOQUANT_KERNEL_DTYPE} only and this model runs in {self.model_dtype}. The "
+                f"fused decode's dispatch returns WITHOUT LAUNCHING for any other element type, "
+                f"which would leave the attention output unwritten and report success, so this is "
+                f"refused rather than attempted."
+            )
 
     # -- static per-layer state -------------------------------------------
 
