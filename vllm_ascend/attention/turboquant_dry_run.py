@@ -743,6 +743,12 @@ TURBOQUANT_DECODE_MAX_SPLITS: Final[int] = 8
 # ``kPartialTail = 2 * kFp32PerBlock``: the running max and running sum lanes a
 # Split-K partial carries past its ``head_size`` accumulator.
 TURBOQUANT_PARTIAL_TAIL: Final[int] = 16
+# The depth of the builder's host staging ring. Two is the minimum that makes
+# overwriting a slot safe while its own upload is still in flight: by the time
+# the host returns to a slot, the whole of the following step has been enqueued
+# behind that slot's copy on an in-order stream. Named rather than inline so the
+# capture-contract gate reads the same number production uses.
+TURBOQUANT_STAGING_SLOTS: Final[int] = 2
 
 
 def turboquant_decode_heads_per_task(num_heads: int, num_kv_heads: int) -> int:
@@ -2246,6 +2252,22 @@ class AscendTurboQuantMetadata(AscendMetadata):
     # kernel scratch, never read or written by the host.
     turboquant_workspace: torch.Tensor = None  # type: ignore[assignment]
     turboquant_query_rot: torch.Tensor = None  # type: ignore[assignment]
+    # The token extent the builder filled the host-written buffers for.
+    #
+    # **This is the single authority for the launch extent**, and it exists
+    # because the fill side and the read side otherwise derive it from
+    # different quantities. The builder fills one descriptor row per row of
+    # ``seq_lens``; the operator derives its own ``tokens`` from
+    # ``query.size(0)`` and indexes the descriptor array by it -- and the
+    # dispatch records sit at ``decode_dispatch_word_base(tokens, splits)``,
+    # an offset that *moves with the token count*. So a launch whose
+    # ``tokens`` exceeds the extent the host filled does not read a short
+    # buffer and trip its size check; it reads descriptors out of the dispatch
+    # array, reads dispatch records out of words nobody wrote, and reports
+    # success. Publishing the number the host used, and slicing the launch
+    # with it, makes the two agree by construction instead of by the
+    # coincidence that a decode step has one token per request.
+    turboquant_num_tokens: int = 0
 
 
 class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
@@ -2326,9 +2348,32 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
             dtype=torch.float32,
             device=device,
         )
-        # A host staging buffer for the zero-padded lengths, so the per-step
-        # copy is one H2D of a contiguous int32 run rather than a scatter.
-        self._context_lens_host = torch.zeros(self._max_num_reqs, dtype=torch.int32, device="cpu")
+        # The host staging for the zero-padded lengths: one contiguous int32
+        # run, so the per-step upload is a single H2D rather than a scatter.
+        #
+        # **Pinned, and a ring of two.** The upload is ``non_blocking``, so the
+        # copy is enqueued on the step's stream and completes later, while the
+        # host races ahead to build the next step's metadata -- and with async
+        # scheduling that next build overlaps this step's execution by design.
+        # A single staging buffer would therefore be rewritten while its own
+        # copy was still in flight, which is a torn upload, not a stale one.
+        # Pinning is what makes the copy genuinely asynchronous (from pageable
+        # memory the runtime stages through its own bounce buffer), and depth
+        # two is what makes the overwrite safe: by the time the host returns to
+        # slot N again, the whole of step N+1 has been enqueued behind step N's
+        # copy on an in-order stream, so that copy has retired.
+        self._staging_slots = TURBOQUANT_STAGING_SLOTS
+        self._staging_step = 0
+        staging = [torch.zeros(self._max_num_reqs, dtype=torch.int32, device="cpu") for _ in range(self._staging_slots)]
+        try:
+            staging = [slot.pin_memory() for slot in staging]
+            self._staging_pinned = True
+        except (RuntimeError, NotImplementedError):
+            # No pinned allocator on this host. The ring is then pointless but
+            # harmless, and the copy below becomes blocking, which is correct
+            # for the same reason -- it just costs a host wait per step.
+            self._staging_pinned = False
+        self._context_lens_host_ring = staging
 
     # -- the per-step work -------------------------------------------------
 
@@ -2348,34 +2393,82 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
         nothing in ``AscendAttentionMetadataBuilder`` changes: a non-TurboQuant
         backend never reaches this method.
         """
-        context_lens = self._refresh_context_lens(common_attn_metadata, seq_lens)
-        self._refresh_tiling(context_lens.numel())
+        context_lens, host = self._refresh_context_lens(common_attn_metadata, seq_lens)
+        tokens = int(context_lens.numel())
+        self._reject_multi_token_steps(common_attn_metadata, tokens)
+        self._refresh_tiling(host, tokens)
         return {
             "turboquant_context_lens": context_lens,
             "turboquant_tiling": self._tiling,
             "turboquant_workspace": self._workspace,
             "turboquant_query_rot": self._query_rot,
+            "turboquant_num_tokens": tokens,
         }
 
-    def _refresh_context_lens(self, common_attn_metadata: Any, seq_lens: torch.Tensor) -> torch.Tensor:
-        """The step's KV lengths on the device, with the FIA padding rows zeroed.
+    def _reject_multi_token_steps(self, common_attn_metadata: Any, tokens: int) -> None:
+        """Refuse a step that carries more query rows than descriptor rows.
 
-        **This is the padded-row contract, and it is a fix for today rather than
-        only for capture.** When sequence-parallel or cudagraph padding adds a
-        dummy request, the shared builder extends ``seq_lens``/``seq_lens_list``
-        with a length of **1** and a zero block-table row
+        The tiling descriptor array is indexed *by token*, and this builder
+        fills one row per row of ``seq_lens`` -- that is, one per request. For
+        an ordinary decode step those are the same number. For a speculative or
+        MTP step they are not: the runner pads tokens to
+        ``num_reqs_padded * uniform_decode_query_len``
+        (``model_runner_v1.py:1095``), so the query carries
+        ``decode_token_per_req`` rows per request while ``seq_lens`` still
+        carries one length per request.
+
+        Tiling that step correctly means expanding each request's length into
+        one length per accepted token, which this builder does not do. The
+        alternative to refusing is mis-tiling: the extra query rows would read
+        descriptors the host never wrote. So this is a guard, not a limitation
+        being introduced -- the decode has never been able to serve such a step.
+        """
+        per_req = int(getattr(common_attn_metadata, "decode_token_per_req", 1) or 1)
+        if per_req > 1:
+            raise RuntimeError(
+                "the TurboQuant fused decode cannot tile a multi-token decode step: this step "
+                f"carries {per_req} query rows per request over {tokens} descriptor rows, and the "
+                "tiling descriptors are indexed by token while this builder fills one row per "
+                "request. Speculative decoding and MTP need the per-request context lengths "
+                "expanded per accepted token first."
+            )
+
+    def _refresh_context_lens(
+        self, common_attn_metadata: Any, seq_lens: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The step's KV lengths, on the device and on the host staging slot.
+
+        **This is the padded-row contract.** The row it saves is the FIA dummy
+        request. ``build()`` appends one when the TND layout needs the q-derived
+        batch size bumped, with a KV length of **1** and a zero block-table row
         (``attention_v1.py:387-390``), deliberately, because FIA validates
         ``actualSeqLengthsKv`` and refuses a zero. A length of 1 is not harmless
         to this decode: ``build_decode_tiling`` writes a *live* descriptor for
-        it -- one tile, page 0 -- so the padded row attends over whatever block 0
-        holds and writes a nonzero result. Downstream trimming is what has been
-        hiding it.
+        it -- one tile over logical page 0 -- so that row attends over whatever
+        block 0 holds and writes a nonzero result. Downstream trimming is what
+        hides it.
 
         The fused decode needs the opposite convention: a dead row must be the
         all-zero descriptor, which is what ``num_tiles == 0`` means and is the
         single predicate both the Cube and the Vector role branch on to skip a
         worker. So the two views differ by exactly this: FIA keeps its ones,
-        TurboQuant gets zeros past the real request count.
+        TurboQuant gets zeros past ``num_reqs``.
+
+        Note which rows this is *not* about. The cudagraph padding rows between
+        ``num_reqs`` and ``num_reqs_padded`` are already zero -- the runner
+        does ``self.seq_lens[num_reqs:].fill_(0)``
+        (``model_runner_v1.py:1616``) and zeroes their block-table rows at
+        ``:3594`` -- and ``common_attn_metadata.num_reqs`` is itself the
+        *padded* count (``:3680``). So ``live`` here is already the padded
+        count and this zeroing reaches exactly the FIA dummy beyond it, which
+        is the one row carrying a 1. Both facts matter: if the runner ever
+        stopped zeroing, a stale length from a longer previous batch would make
+        a padding row live, and over the split-K limit it would also flip that
+        row's fuse decision (``turboquant_tiling.cpp:93``).
+
+        Returns both views because the caller needs both: the device prefix is
+        what the launch reads, and the host slot is what ``build_decode_tiling``
+        reads to derive each worker's tile count.
         """
         num_reqs = int(common_attn_metadata.num_reqs)
         padded = int(seq_lens.shape[0])
@@ -2385,15 +2478,20 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
                 f"carries {padded}. max_num_seqs is what sizes the launch buffers."
             )
         live = min(num_reqs, padded)
-        host = self._context_lens_host
+        host = self._context_lens_host_ring[self._staging_step % self._staging_slots]
+        self._staging_step += 1
         host[:live] = seq_lens[:live].to(torch.int32)
         if padded > live:
             # The FIA dummy requests. Zero, not one: see the docstring.
             host[live:padded] = 0
-        self._context_lens[:padded].copy_(host[:padded], non_blocking=True)
-        return self._context_lens[:padded]
+        # Asynchronous only where the staging is pinned: a non-blocking copy out
+        # of pageable memory is the one combination that is neither fast nor
+        # safe, because the runtime bounces it through a buffer of its own while
+        # the host believes it may reuse the source.
+        self._context_lens[:padded].copy_(host[:padded], non_blocking=self._staging_pinned)
+        return self._context_lens[:padded], host
 
-    def _refresh_tiling(self, tokens: int) -> None:
+    def _refresh_tiling(self, host_context_lens: torch.Tensor, tokens: int) -> None:
         """Fill the tiling descriptors for this step, for every layer at once.
 
         A no-op when the operator is absent, which is every build that is not an
@@ -2411,7 +2509,7 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
         if entry is None:
             return
         entry(
-            self._context_lens_host[:tokens],
+            host_context_lens[:tokens],
             self._tiling,
             self._num_heads,
             self._num_kv_heads,
@@ -3050,10 +3148,18 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
         layer. The builder publishes ``turboquant_context_lens`` instead: the
         same lengths in a persistent device buffer, with the FIA padding rows
         zeroed rather than set to 1.
+
+        The extent comes from the builder too, for the reason on
+        :attr:`AscendTurboQuantMetadata.turboquant_num_tokens`: it has to be
+        the same number the host filled descriptors for, and
+        ``len(seq_lens_list)`` is a different quantity that merely happens to
+        agree. It is also a Python ``len`` on a host list, which no
+        ``TorchFunctionMode`` gate can see, so taking it out of the launch is
+        a G10 improvement the allowlist could never have caught.
         """
         emulator = self.emulator
         assert emulator is not None
-        batch_size = len(attn_metadata.seq_lens_list)
+        batch_size = self._decode_num_tokens(attn_metadata)
         if self.scale_cache is None:
             raise RuntimeError(
                 "the TurboQuant decode found no scale plane: nothing has been ingested into this layer yet."
@@ -3092,6 +3198,21 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
         )
         output[:batch_size] = attn_output.view(batch_size, self.num_heads, self.head_size)
         return output
+
+    @staticmethod
+    def _decode_num_tokens(attn_metadata: AscendMetadata) -> int:
+        """The launch extent: the token count the builder filled buffers for.
+
+        Falls back to ``len(seq_lens_list)`` only for a metadata object built by
+        the base builder, which should not happen because the backend names its
+        own. The two agree for a decode step -- ``build()`` pads the list and
+        the tensor together -- but they are not the same quantity, and only one
+        of them is the number the descriptors were written for.
+        """
+        tokens = int(getattr(attn_metadata, "turboquant_num_tokens", 0) or 0)
+        if tokens:
+            return tokens
+        return len(attn_metadata.seq_lens_list)
 
     @staticmethod
     def _decode_context_lens(attn_metadata: AscendMetadata, batch_size: int) -> torch.Tensor:
