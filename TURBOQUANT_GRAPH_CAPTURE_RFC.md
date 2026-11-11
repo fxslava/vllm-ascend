@@ -401,11 +401,27 @@ table.
 | Tier | Operands | Function of | Lifetime | Owner |
 | --- | --- | --- | --- | --- |
 | **0 — model-static** | `pi_signs`, `rot_tables`, `h16`, `basis_pool`, `mode_tables` | `head_size` only | process | `_ensure_statics` (Python) / function-local static (C++) |
-| **1 — capture-static** | `workspace`, `query_rot`, the tiling buffer | the capture size and the model geometry | one per capture size, for the graph's life | `get_capture_resource` |
-| **2 — per-step** | `context_lens`, `block_tables`, the tiling buffer's *contents* | the step | per step, written into Tier-1 storage | the metadata builder |
+| **1 — statically allocated** | the *storage* of `context_lens`, `tiling`, `workspace`, `query_rot` | `max_num_seqs` and the model geometry | one allocation, engine lifetime | `AscendTurboQuantMetadataBuilder.__init__` |
+| **2 — per-step** | the *contents* of `context_lens` and `tiling`; `block_tables` | the step | per step, written into Tier-1 storage | the metadata builder |
 
-Everything the launcher does today that is capture-illegal is a Tier-0 or Tier-1
-quantity being treated as Tier-2.
+**Read tier 1 as "statically allocated", never as "static".** The table says
+*storage* and *contents* on purpose, and this is the distinction the whole
+design turns on:
+
+> **Allocation is init-time work. The fill is per-step work.**
+
+The tiling buffer's size and address are a function of the model configuration
+alone, so one maximum-sized allocation at engine start serves every step and
+every capture size. Its *contents* are a function of the step's context
+lengths — see "Rung 5 is withdrawn" in §6 for the field-by-field citation — so
+they are refreshed before every launch, and a graph replay re-reads them from
+the same address precisely because nothing moved. An earlier draft of this table
+called tier 1 "capture-static", keyed per capture size and owned by
+`get_capture_resource`; all four of those were wrong and §4.2 records why.
+
+Everything the launcher did before rungs 1–4 that is capture-illegal is a
+Tier-0 or Tier-1 quantity being treated as Tier-2 — a constant rebuilt per
+launch, or storage allocated per launch.
 
 ### 3.1 Tier 0
 
@@ -422,9 +438,17 @@ After this tier the launcher performs **zero host→device copies of constants**
 
 ### 3.2 Tier 1
 
-`workspace` and `query_rot` move out of the op into the schema (§2.2(a)) and are
-obtained by the caller through `get_capture_resource` with a key that includes
-the capture size, the head count and the head size:
+> **Superseded by the implementation.** The `get_capture_resource` keying below
+> is not what shipped: the builder allocates one maximum-sized buffer per
+> operand in `__init__` and a step takes a `narrow` prefix, so there are no
+> capture-size keys at all. §4.2 records why `get_capture_resource` is the wrong
+> owner for a host-written buffer and unnecessary for the other two. The
+> zero-fill question further down is still open and still worth answering
+> (open question 3).
+
+`workspace` and `query_rot` move out of the op into the schema (§2.2(a)) and
+were originally to be obtained by the caller through `get_capture_resource`
+with a key that includes the capture size, the head count and the head size:
 
 ```python
 workspace = get_capture_resource(
@@ -515,10 +539,15 @@ The arithmetic is cheap enough to be divide-free, which is the crux:
 * The dispatch records are a function of launch geometry *only* — no context
   lengths at all
   ([`turboquant_tiling.cpp:142-173`](csrc/attention/turboquant/op_host/turboquant_tiling.cpp:142)).
-  They can be written by the same kernel, or stay host-built once per capture
-  size as a Tier-1 constant. **Recommended: Tier-1 constant.** Splitting the
-  buffer this way means the device kernel writes only the descriptor array and
-  the dispatch half never changes after warmup.
+  ~~**Recommended: a Tier-1 constant** built once per capture size, so the
+  dispatch half never changes after warmup.~~ **Withdrawn, and not what
+  shipped.** The records' *values* are context-independent, but they live at
+  `decode_dispatch_word_base(tokens, splits)`, an offset that moves with the
+  token count — so "the dispatch half" is not at a fixed place in the buffer
+  and cannot be a constant written once. Separating it would need a second C++
+  entry point to save at most 256 words of trivial arithmetic. The whole buffer
+  is filled in one call per step instead, which is already the reduction that
+  mattered: once per step rather than once per layer per step.
 
 Why a separate launch and not a prologue stage inside the decode: the
 descriptors are shared across grid blocks (different kv heads and head chunks of
@@ -724,7 +753,7 @@ landing under `PIECEWISE` on their own merits; full capture starts at rung 3.
 | **2** ✅ | `context_lens` becomes `seq_lens_gpu`; the op stops making the host copy; `build_decode_tiling` is fed from a caller-supplied host view | `turboquant_dry_run.py`, `torch_bindings.cpp` | Low–medium. Changes which tensor the op reads; a wrong one is a wrong answer, not an error. | G1, G2, G3, G5 |
 | **3** ✅ | Schema change: `tiling`, `workspace`, `query_rot` become inputs; new `npu_turboquant_build_decode_tiling` with the CPU implementation; `decode_launch_split()` in the tiling header | `torch_bindings.cpp`, `op_host/turboquant_tiling.{h,cpp}`, `turboquant_dry_run.py` | Medium. Three new sizing contracts the op must check. | G1, G2, G3, G4, G6 |
 | **4** ✅ | Builder ownership: `AscendTurboQuantMetadataBuilder` allocates the Tier-1 buffers itself (see §4.2) and fills the tiling once per step for all layers | `turboquant_dry_run.py` only -- the shared builder is untouched, via its own `_build_backend_metadata` hook | Medium. A new builder class and metadata dataclass. | G1, G3, G6, G7 |
-| **5** ❌ | ~~The AIV tiling builder kernel~~ **Withdrawn — see “Rung 5 is withdrawn” below.** Replaced by rung 5′: the capture contract for the host-owned buffer | `turboquant_dry_run.py` only | Low. No kernel, no schema, no device-side logic. | G1, G3, C1–C5 |
+| **5** ❌ | ~~The AIV tiling builder kernel~~ **Withdrawn — see “Rung 5 is withdrawn” below.** Replaced by rung 5′: the capture contract for the host-owned buffer (C1–C6, G8a, G9a, G11a) | `turboquant_dry_run.py` only | Low. No kernel, no schema, no device-side logic. | G1, G3, C1–C5 |
 | **6** | Lift the platform gate to conditional `FULL_DECODE_ONLY`; padded-row contract for `context_lens`; refuse capture when the golden path would be taken | `platform.py`, `turboquant_dry_run.py` | High. This is the rung that can corrupt a served model silently. | G1, G3, G10, G11 |
 | **7** | *(follow-up, not this work)* D3: remove the tiling buffer; re-measure the SPU argument; `at::empty` for the workspace if §3.2 resolves that way | kernel | — | G8, G9, plus a profile |
 
@@ -743,7 +772,11 @@ landing under `PIECEWISE` on their own merits; full capture starts at rung 3.
 | **G9** | The fused decode goldens are unchanged: cases (a), (e), (k), (l) under `kv4fp8` | CAModel, `S <= 256`, serial |
 | **G10** | **New**: a capture-illegality assertion — run a decode under a faked capture (patch both the forward-context flag and `torch.npu.is_current_stream_capturing`, as `_capture_in_progress()` already does) and assert no `.cpu()`, `.to("cpu")`, `.item()`, `.tolist()` or allocation occurs. A `__torch_function__` mode or a monkeypatched allocator is enough; no device needed | new UT, no device |
 | **G11** | End-to-end: `FULL_DECODE_ONLY` and `PIECEWISE` agree token-for-token on a greedy generation. This is the only gate that needs an NPU | 950PR hardware |
-| **C1–C5** | **New**: the capture contract for the static buffer — the extent, the address, where the fill runs, the step shapes that are refused, and the staging ring. See rung 5′ below | `tests/ut/attention/test_turboquant_capture_contract.py`, no device |
+| **C1–C5** | **New**: the capture contract for the host-owned buffer — the extent, the address, where the fill runs, the step shapes that are refused, and the staging ring. See rung 5′ below | `tests/ut/attention/test_turboquant_capture_contract.py`, no device |
+| **C6** | **New**: the launch reads no host-side metadata field. `TorchFunctionMode` cannot see a Python builtin on a list, which is what C1 turned out to be, so G10 cannot gate this class | same file, no device |
+| **G8a** | **New**: `build_decode_tiling` is the only producer of a descriptor, and the host tiling gate now covers *ragged* per-token lengths including zero-length rows | `tests/ut/ops/turboquant/common/decode_tiling_gate.hpp` (g++, no device) + UT |
+| **G9a** | **New**: the 21-argument launch ABI is frozen by provenance, so no argument can change position, type or source inside a Python-only change | UT, no device |
+| **G11a** | **New**: replay invariance — at one capture extent, steps differing in live content agree on every address, dtype, shape, stride and scalar, and differ only in buffer contents | UT, no device |
 
 G10 is the gate that would have caught every blocker in §1.2 and is the one most
 worth writing first — before rung 1, so it fails and then goes green.
@@ -919,12 +952,16 @@ Until then the refusal names the reason in full, and C4 gates it.
 1. **Silent wrongness at rung 6.** A captured decode that reads a stale buffer
    or the wrong extent produces plausible tokens. Nothing short of G11 catches
    it. Do not lift the gate on the strength of G1–G10.
-2. **The padded-row contract (§3.4).** `seq_lens` padded with 1 makes a dead row
-   live. Decide this explicitly.
-3. **Tier-1 ownership (§4.2).** If `FULL_DECODE_ONLY` capture does not go
-   through `UpdatableGraph`, `get_capture_resource` is a no-op and the buffers
-   are reallocated per step — which looks like it works and then corrupts when
-   the allocator reuses an address.
+2. ~~**The padded-row contract (§3.4).**~~ **Resolved.** The FIA dummy row's
+   length of 1 made a dead row live; `turboquant_context_lens` publishes zeros
+   past `num_reqs` while `seq_lens`/`seq_lens_list` keep their ones. Gated by
+   the builder's padded-row test, and the zero-length descriptor is now covered
+   in C++ by the host tiling gate's ragged grid.
+3. ~~**Tier-1 ownership (§4.2).**~~ **Resolved, and not via
+   `get_capture_resource`.** The buffers are allocated in the builder's
+   `__init__`, before any capture, so the question of whether capture reaches
+   `UpdatableGraph` stopped mattering for ownership. Address stability is gated
+   by C2 and replay invariance by G11a.
 4. **The workspace zero-fill (§3.2).** Only bites once Split-K is on, which is
    the roadmap.
 5. ~~**`num_splits` constrained to a power of two at rung 5.**~~ Moot: rung 5 is
