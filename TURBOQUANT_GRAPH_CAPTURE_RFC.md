@@ -1,0 +1,819 @@
+# RFC: Full ACL Graph capture for the TurboQuant decode
+
+Status: proposal. Branch of record: `feat/tq-cube-clean`.
+Scope: lifting `ENABLE_TURBOQUANT=1` out of the `PIECEWISE` / `NONE` graph modes
+decided in `NPUPlatform._apply_turboquant_graph_mode`.
+
+Nothing in this document has been run on an NPU. There is no `/dev/davinci` on
+the development host, so every claim below is either read off the source (cited
+by file and line) or named as a thing to measure. Where a claim rests on
+torch_npu runtime behaviour rather than on this repository's code, it is marked
+**VERIFY**.
+
+---
+
+## 0. Executive summary, and one correction to the premise
+
+The brief names four blockers. Three of them are real and one is already done.
+
+| Brief's blocker | Finding |
+| --- | --- |
+| 1. Custom op registration / fake-meta kernels | **Already in place and not on the critical path.** `torch.compile` never sees `npu_turboquant_fused_decode`. |
+| 2. Host-side synchronisations in the launcher | **Real.** Three capture-illegal transfers and two capture-unsound host reads per launch, per layer. |
+| 3. Host-side tiling generation | **Real, and the central design problem.** |
+| 4. Stream ordering / allocator lifetime | **Real.** Five device buffers are allocated inside the launch; two of them are ~9 MB each, per layer, per step. |
+
+The correction matters, so it is stated first.
+
+**`splitting_ops` is a piecewise-compilation concern, not the reason full
+capture fails.** Under `FULL` and `FULL_DECODE_ONLY` `vllm_ascend` sets
+`compilation_config.splitting_ops = []` outright
+([`platform.py:1478`](vllm_ascend/platform.py:1478)), so there is no graph break
+to remove at all. `FULL_AND_PIECEWISE` does keep the splitting ops, because it
+*also* compiles piecewise
+([`platform.py:1452-1470`](vllm_ascend/platform.py:1452)) — but that changes
+nothing here, because in every one of the three modes attention is reached
+through `vllm::unified_attention_with_output`, a vLLM custom op with its own
+fake implementation. Dynamo treats it as one opaque node and never traces into
+`AscendTurboQuantDryRunBackendImpl.forward_impl`. The TurboQuant op is therefore
+invisible to `torch.compile` in every mode, and its C++ `kMeta` kernels
+([`torch_bindings.cpp:829-866`](csrc/attention/turboquant/torch_bindings.cpp:829))
+exist for `torch.export` and nothing else — the bindings' own comment says so
+and it is accurate.
+
+What actually fails is **ACL stream capture**: under `FULL`,
+`FULL_DECODE_ONLY` or `FULL_AND_PIECEWISE`, the real C++ launcher runs on a
+capturing stream, and it performs host↔device copies, host allocations and host
+reads of per-step data on that stream. That is the whole problem. No
+`torch.library.custom_op` rewrite, no `register_fake`, and no Dynamo work is
+needed for it.
+
+**Second scoping fact, independent of graph capture.** The fused decode reads
+the NZ-tiled cache layout; both ingestion writers produce the strip layout; the
+two disagree on four independent axes and the only bridge today is
+`turboquant_repack_strip_to_nz_tiled`
+([`turboquant_nz_ingress.py`](vllm_ascend/attention/turboquant_nz_ingress.py)),
+which is deliberately not wired into the serving path. So the work in this RFC
+makes a *capturable* decode; it does not by itself make a captured decode that
+serves a real model. Those are two separate prerequisites for lifting the
+platform gate, and the ladder in §6 keeps them separate.
+
+**Third, and the reason to do this even if full capture never lands.** Every
+per-step quantity in the launcher is a function of the *batch*, not of the
+*layer*, and is rebuilt and re-uploaded once per layer. On a 60-layer model one
+decode step performs ~180 pageable host→device copies and ~300 device
+allocations that one copy and five allocations would cover. §4 removes them, and
+that change is worth landing on its own under `PIECEWISE`.
+
+---
+
+## 1. Root cause analysis
+
+### 1.1 Where the fallback is decided
+
+[`vllm_ascend/platform.py:1241-1304`](vllm_ascend/platform.py:1241),
+`_apply_turboquant_graph_mode`, called from `check_and_update_config`
+([`platform.py:547`](vllm_ascend/platform.py:547)):
+
+```python
+if not compilation_config.cudagraph_mode.has_full_cudagraphs():
+    return
+if compilation_config.mode == CompilationMode.VLLM_COMPILE:
+    downgraded = CUDAGraphMode.PIECEWISE
+else:
+    downgraded = CUDAGraphMode.NONE
+```
+
+The downgrade is unconditional whenever `ENABLE_TURBOQUANT=1`. It does not ask
+whether the kernels are registered, which is the first thing to change: the
+function's own docstring justifies the refusal by the *PyTorch golden model*
+("it is a PyTorch model of kernels that do not exist yet … the codec is ordinary
+torch ops, any one of which may have no NPU kernel and fall back to the CPU"),
+and that reasoning applies only when the ops are absent. On an `ascend950`
+build they are present — `CMakeLists.txt:204-207` adds
+`csrc/attention/turboquant/torch_bindings.cpp` and
+`op_host/turboquant_tiling.cpp` to the extension, and `CMakeLists.txt:111-114`
+builds all three kernel translation units.
+
+So the gate conflates two paths with different capture properties:
+
+* the **kernel path** (`npu_turboquant_reshape_scatter_aiv` +
+  `npu_turboquant_fused_decode`), which is capture-hostile for the five
+  mechanical reasons in §1.2 — all fixable;
+* the **golden path** (the PyTorch emulation), which is capture-hostile for
+  reasons that cannot be fixed (§1.3) and must stay refused.
+
+### 1.2 The kernel path: what breaks capture
+
+All line numbers in
+[`csrc/attention/turboquant/torch_bindings.cpp`](csrc/attention/turboquant/torch_bindings.cpp),
+inside `npu_turboquant_fused_decode`.
+
+**B1 — `context_lens` is copied across the PCIe boundary on every launch.**
+Lines 679-685:
+
+```cpp
+const at::Tensor context_lens_host =
+    context_lens.device().is_cpu() ? context_lens.contiguous() : context_lens.to(at::kCPU).contiguous();
+const at::Tensor context_lens_device = context_lens.device() == query.device()
+                                           ? context_lens.contiguous()
+                                           : context_lens.to(query.device()).contiguous();
+```
+
+Exactly one of the two copies always happens, and the comment says so. The
+caller is
+[`turboquant_dry_run.py:2665`](vllm_ascend/attention/turboquant_dry_run.py:2665),
+which passes `attn_metadata.seq_lens[:batch_size]`. That field is the **CPU
+mirror**: `_select_seq_lens`
+([`utils.py:594-628`](vllm_ascend/attention/utils.py:594)) prefers
+`common_attn_metadata._seq_lens_cpu`, and the builder stores it as both
+`seq_lens` and `seq_lens_cpu`
+([`attention_v1.py:415-416`](vllm_ascend/attention/attention_v1.py:415)) while
+keeping the device copy separately as `seq_lens_gpu`. So the serving case is a
+host tensor in, and the H2D on line 683 is the one that runs. On a capturing
+stream a synchronous `aclrtMemcpy` fails with 107030, "Stream during the capture
+stage is not supported".
+
+The device tensor the op wants already exists and is already a persistent
+runner-owned buffer: `attn_metadata.seq_lens_gpu`.
+
+**B2 — the tiling descriptors are built by a host CPU loop over that data.**
+Lines 696-699 call
+`build_decode_tiling(request, context_lens_host.data_ptr(), nullptr, tiling_host.data_ptr())`
+([`op_host/turboquant_tiling.cpp:64-173`](csrc/attention/turboquant/op_host/turboquant_tiling.cpp:64)).
+The loop is pure host code, so it is not itself illegal during capture — but its
+*result* has to reach the device, which is B3, and its *input* has to be host
+visible, which is B1.
+
+**B3 — the tiling buffer is uploaded on every launch.** Line 701:
+
+```cpp
+const at::Tensor tiling_device = tiling_host.to(query.device(), /*non_blocking=*/false);
+```
+
+`decode_tiling_bytes(tokens, splits, grid)` is `tokens*splits*64 + grid*32`
+bytes; at `tokens=256, splits=1, grid≤32` (`kDecodeMaxGrid = 32`,
+line 120) that is ~17 KB. Capture-illegal for the same reason as B1.
+
+**B4 — the query basis codec's constant pool is rebuilt on the CPU and uploaded
+on every launch.** Lines 747-770. The pool is
+`kCodecPoolWordsPerChannel * head_size + kCodecLevels` = 2320 int32 at
+`head_size` 256, and the first 1536 words are built by a `std::memcpy` loop over
+three butterfly stages. It is a **pure function of `head_size`** — the comment
+at line 745 says exactly that ("Built here rather than asked of the caller
+because it is a pure function of head_size"). Rebuilding and re-uploading ~9 KB
+per layer per step is both capture-illegal and pointless.
+
+**B5 — five device buffers are allocated inside the launch.** Lines 706-709,
+747, 794:
+
+| Buffer | Shape | Bytes at `tokens=256, heads=32, splits=1` |
+| --- | --- | --- |
+| `workspace` (`at::zeros`) | `tokens*heads*splits*(256+kPartialTail)` fp32 | 8.9 MB |
+| `query_rot` (`at::empty`) | `tokens*heads*256` fp32 | 8.4 MB |
+| `tiling_host` (`at::empty`, CPU) | `decode_tiling_bytes(...)` | 17 KB |
+| `basis_pool_host` (`at::zeros`, CPU) | 2320 int32 | 9 KB |
+| `mode_tables` (`at::zeros`) | `kMinBurstBytes/4` int32 | 128 B |
+
+`workspace` and `query_rot` are the ones that matter: ~17 MB of allocation plus
+an 8.9 MB device zero-fill, per layer, per step.
+
+Whether an allocation *during* capture is legal depends on torch_npu's
+`NPUCachingAllocator` supporting a capture-private pool the way CUDA's does.
+**VERIFY.** It does not matter much, because this repository already has the
+sanctioned answer and it is better regardless: `get_capture_resource`
+([`vllm_ascend/compilation/updatable_graph.py:189`](vllm_ascend/compilation/updatable_graph.py:189)),
+which outside capture just calls the factory and during capture returns one
+resource per key held by the active `UpdatableGraph`. `full_graph_fia` uses it
+for exactly this
+([`attention_v1.py:665`](vllm_ascend/attention/attention_v1.py:665)).
+
+Note on the user's `record_stream` question: `record_stream` is the wrong tool
+here. It governs cross-stream reuse by the caching allocator; a single-stream
+capture does not need it. The invariant that matters is **ownership for the
+graph's lifetime**: a buffer the graph references must either have been
+allocated from the graph's pool during capture (which `UpdatableGraph.capture_end`
+assumes — it weakens its resource dict with `weak_ref_tensors`, line 99) or be
+owned by something that outlives every replay. A buffer freed back to the
+caching allocator between replays and handed to another tensor is the silent
+corruption to design against.
+
+**B6 — a runtime capability query per launch.** `aclGetDeviceCapability(0,
+ACL_DEVICE_INFO_VECTOR_CORE_NUM, …)` at line 492, in the scatter writer. Not
+stream-touching, so probably capture-safe (**VERIFY**), but it is a per-launch
+ACL call that belongs in a function-local `static`.
+
+**B7 — two model-static operands are rebuilt in Python on every call.**
+[`turboquant_dry_run.py:1628-1629`](vllm_ascend/attention/turboquant_dry_run.py:1628):
+
+```python
+rot_tables=_codec_tables(emulator),
+h16=_h16_operand(emulator.device),
+```
+
+`_codec_tables`
+([`:1979`](vllm_ascend/attention/turboquant_dry_run.py:1979)) and
+`_h16_operand` ([`:2034`](vllm_ascend/attention/turboquant_dry_run.py:2034))
+both go through `_sylvester_hadamard`
+([`:392`](vllm_ascend/attention/turboquant_dry_run.py:392)), which builds its
+matrix with an `arange`, a bitwise `and`, a `bit_length()`-deep XOR loop, a
+`where` and a `to` — roughly eleven device kernels and two allocations, per
+layer, per step. `_ensure_statics` already caches `_codec_tables(emulator)` onto
+the layer as `layer._turboquant_codec_tables`
+([`:2415`](vllm_ascend/attention/turboquant_dry_run.py:2415)) and the decode path
+simply does not use it.
+
+**B8 — the batch size, and therefore every slice extent, is a host Python
+int.** [`:2653`](vllm_ascend/attention/turboquant_dry_run.py:2653):
+
+```python
+batch_size = len(attn_metadata.seq_lens_list)
+```
+
+and then `query[:batch_size]`, `block_tables[:batch_size]`,
+`seq_lens[:batch_size]`, `output[:batch_size]`. Under capture these extents are
+baked in. That is correct-by-accident today only because vLLM pads a captured
+batch to the capture size — but `seq_lens_list` carries the *unpadded* request
+count plus whatever padding the FIA fix-up added
+([`attention_v1.py:387-390`](vllm_ascend/attention/attention_v1.py:387)), so the
+captured extent is the first-captured step's, not the replayed step's. This is
+**capture-unsound**, not capture-illegal: the replay does not fail, it attends
+over the wrong number of rows.
+
+### 1.3 The golden path: what cannot be fixed
+
+These are the reasons `_apply_turboquant_graph_mode`'s refusal is correct *when
+the ops are absent*, and they are why the lifted gate must be conditional on the
+ops being present rather than unconditional.
+
+* `bool(valid.all())` — a device-to-host synchronisation
+  ([`:1375`](vllm_ascend/attention/turboquant_dry_run.py:1375)), followed by
+  boolean-mask indexing, whose output shape is data-dependent.
+* `torch.unique(pages, return_inverse=True)`
+  ([`:1445`](vllm_ascend/attention/turboquant_dry_run.py:1445)) — data-dependent
+  output shape, in the value plane's read-modify-write.
+* `slot_mapping.tolist()`
+  ([`:1126`](vllm_ascend/attention/turboquant_dry_run.py:1126)) — D2H, in the
+  prefill strip planner.
+* The FIA fallback passes `actual_seq_lengths_kv=attn_metadata.seq_lens_list`, a
+  Python list ([`:2682`](vllm_ascend/attention/turboquant_dry_run.py:2682)), so
+  the context lengths are baked into the captured launch. This is the specific
+  failure the earlier note recorded: *the replays do not fail, they attend over
+  a stale length.*
+* `_forward_mixed` reads `int(query_lens_cpu.max())` and `.tolist()`
+  ([`:2740-2778`](vllm_ascend/attention/turboquant_dry_run.py:2740)). Only
+  reachable outside `DecodeOnly`, so irrelevant to `FULL_DECODE_ONLY` and fatal
+  to `FULL`.
+
+**Consequence for the design: `FULL_DECODE_ONLY` is the only full mode worth
+targeting.** `FULL` captures prefill and mixed batches as well, and
+`_forward_mixed` is both host-bound and, by its own docstring, never run on
+device.
+
+---
+
+## 2. PyTorch schema and meta registration plan
+
+### 2.1 What is already right
+
+`TORCH_LIBRARY_FRAGMENT(turboquant_ops, ops)`
+([`torch_bindings.cpp:880-939`](csrc/attention/turboquant/torch_bindings.cpp:880))
+registers all three ops with:
+
+* a schema returning `()` and mutating through `Tensor!` arguments — the correct
+  shape for a kernel that writes a caller-provided output;
+* a `c10::kPrivateUse1` implementation;
+* a `c10::kMeta` implementation, no-op by construction (there is no shape to
+  compute), which is what lets a FakeTensor trace or `torch.export` walk the op.
+
+A `torch.library.register_fake` would be strictly redundant with the `kMeta`
+registration, and `torch.library.custom_op` cannot express a C++ kernel. **No
+change is recommended here.** The one thing the `kMeta` kernel must keep doing
+is *not* calling `build_decode_tiling`, since under FakeTensor there is no
+storage behind `context_lens` to read — the bindings already say so at line 837
+and the meta kernel already complies.
+
+`tests/ut/attention/test_turboquant_op_schemas.py` parses the schema strings out
+of the C++ with `torch._C.parse_schema` and checks the Python stubs' parameter
+order against them, on a host with no extension. Any schema change below is
+gated by that test for free.
+
+### 2.2 The schema changes this RFC needs
+
+Two changes, both additive.
+
+**(a) `tiling` becomes an input of the decode.** The buffer stops being
+allocated inside the op and becomes a caller-owned device tensor, so that it can
+live for a graph's lifetime at a fixed address.
+
+```
+npu_turboquant_fused_decode(
+    Tensor query, Tensor pi_signs, Tensor rot_tables, Tensor h16, Tensor? gate,
+    Tensor key_cache, Tensor value_cache, Tensor scale_cache,
+    Tensor block_tables, Tensor context_lens,
+    Tensor tiling,                 # NEW: int32 device, decode_tiling_words(...) elements
+    Tensor! workspace,             # NEW: fp32 device, the Split-K partials
+    Tensor! query_rot,             # NEW: fp32 device, the rotated query image
+    Tensor! output,
+    int num_heads, int num_kv_heads, int num_splits,
+    int heads_per_task, int output_stage, float scale, float inv_sqrt_len) -> ()
+```
+
+`tiling` is read-only to the decode (`Tensor`, not `Tensor!`); `workspace` and
+`query_rot` are scratch the kernel writes, so they take `Tensor!`. The op keeps
+building `mode_tables` and `basis_pool` itself — see (c) — because neither is a
+function of anything the caller knows that the op does not.
+
+The op must then re-check what it used to guarantee by construction: that
+`tiling.numel() == decode_tiling_words(tokens, splits, grid)` for the `grid` it
+derives, that `workspace.numel()` matches
+`tokens*heads*splits*(head_size+kPartialTail)`, and that all three are
+int32/fp32, contiguous and burst-aligned. A caller that sizes the tiling buffer
+for a different `grid` would otherwise read past it — that is the one new failure
+mode this change introduces, and it is a `TORCH_CHECK`, not a hang.
+
+**(b) A new op that fills the tiling buffer.**
+
+```
+npu_turboquant_build_decode_tiling(
+    Tensor context_lens, Tensor! tiling,
+    int num_heads, int num_kv_heads, int head_dim, int block_size,
+    int max_blocks, int num_splits, int heads_per_task) -> ()
+```
+
+Two implementations behind one schema, which is the point of making it an op:
+
+* **`CompositeExplicitAutograd` / CPU**: `context_lens` on CPU, `tiling` on
+  device, host `build_decode_tiling` then one H2D. This is rung 3 of the ladder.
+* **`PrivateUse1`**: `context_lens` on device, `tiling` on device, a tiny AIV
+  kernel. Rung 5.
+
+The caller does not change between the two. A `kMeta` no-op kernel as above.
+
+**(c) `basis_pool` memoised, not exposed.** Keep it inside the op and give it a
+function-local cache keyed by `(head_size, device_index)`:
+
+```cpp
+static std::map<std::pair<std::int64_t, c10::DeviceIndex>, at::Tensor> pool_cache;
+```
+
+No schema change, no Python change, and the per-launch CPU loop and 9 KB H2D
+both disappear. The cache holds device tensors for the process lifetime, which
+is the same lifetime the rotation constants already have on the Python side.
+
+### 2.3 Where `grid` comes from
+
+`grid`, `tasks_per_block`, `reduce_tasks_per_block`,
+`prologue_vectors_per_block` and `prologue_cube_chunk_vectors` are derived in the
+op today ([`torch_bindings.cpp:635-656`](csrc/attention/turboquant/torch_bindings.cpp:635)).
+The caller now needs `grid` too, to size the tiling buffer. Do **not**
+reimplement that arithmetic in Python — the two sides disagreeing is exactly the
+class of bug the host tiling header's own preamble warns about ("nothing in the
+toolchain diagnoses two sides disagreeing about which word is which").
+
+Add to `op_host/turboquant_tiling.h`, which is device-free and toolkit-free and
+already linked by the bindings, the kernel launcher and the device-free gate in
+`tests/ut/ops`:
+
+```cpp
+struct DecodeLaunchSplit {
+    std::uint32_t grid, tasks_per_block, reduce_tasks_per_block;
+    std::uint32_t prologue_vectors_per_block, prologue_cube_chunk_vectors;
+};
+DecodeLaunchSplit decode_launch_split(const DecodeTilingRequest &r, std::uint32_t max_grid);
+```
+
+and expose `decode_tiling_words` to Python through one more trivially-schema'd
+op, or — cheaper — have the *builder* op return nothing and have the metadata
+builder size its buffer from an upper bound: `max_num_reqs * max_splits * 16 +
+kDecodeMaxGrid * 8` words is 1 KB + `max_num_reqs * 64` bytes and is the same
+for every capture size. **Recommended**: the upper bound. It removes the
+host/device agreement problem entirely at a cost of a few kilobytes, and the op
+then checks `tiling.numel() >= decode_tiling_words(...)` rather than `==`.
+
+---
+
+## 3. Zero-host-sync launcher architecture
+
+Three tiers of operand, by what each is a function of. The whole design is this
+table.
+
+| Tier | Operands | Function of | Lifetime | Owner |
+| --- | --- | --- | --- | --- |
+| **0 — model-static** | `pi_signs`, `rot_tables`, `h16`, `basis_pool`, `mode_tables` | `head_size` only | process | `_ensure_statics` (Python) / function-local static (C++) |
+| **1 — capture-static** | `workspace`, `query_rot`, the tiling buffer | the capture size and the model geometry | one per capture size, for the graph's life | `get_capture_resource` |
+| **2 — per-step** | `context_lens`, `block_tables`, the tiling buffer's *contents* | the step | per step, written into Tier-1 storage | the metadata builder |
+
+Everything the launcher does today that is capture-illegal is a Tier-0 or Tier-1
+quantity being treated as Tier-2.
+
+### 3.1 Tier 0
+
+* **Python side**: `fused_decode` reads `layer._turboquant_codec_tables` (already
+  cached, [`:2415`](vllm_ascend/attention/turboquant_dry_run.py:2415)) instead of
+  calling `_codec_tables(emulator)`, and gains an `_h16` cache alongside it —
+  either on the emulator or in a module-level dict keyed by
+  `(order, device)`. Kills B7.
+* **C++ side**: `basis_pool` and `mode_tables` get function-local static caches
+  keyed by `(head_size, device_index)`. Kills B4. `aclGetDeviceCapability`
+  likewise. Kills B6.
+
+After this tier the launcher performs **zero host→device copies of constants**.
+
+### 3.2 Tier 1
+
+`workspace` and `query_rot` move out of the op into the schema (§2.2(a)) and are
+obtained by the caller through `get_capture_resource` with a key that includes
+the capture size, the head count and the head size:
+
+```python
+workspace = get_capture_resource(
+    (_TQ_WORKSPACE_KEY, num_tokens, self.num_heads, self.head_size, num_splits),
+    lambda: torch.zeros(workspace_floats, dtype=torch.float32, device=device),
+)
+```
+
+Outside capture this is today's behaviour exactly. During capture it is
+allocated once and the `UpdatableGraph` holds it (weakly — the graph pool owns
+the storage).
+
+One question has to be answered before `at::zeros` becomes a one-time
+allocation: **is the zero-fill load-bearing?** `StageTaskOutput` writes a
+partial before `TurboQuantPartialReducer` reads it
+([`turboquant_vector_service.h:1197`](csrc/attention/turboquant/op_kernel/vector/turboquant_vector_service.h:1197)
+and `:290`), so for a live split the buffer is write-before-read and
+`at::empty` would do. But a split past the end of a sequence has `num_tiles == 0`
+and skips the pipeline without writing its partial, and the reducer's skip
+condition for such a split has not been traced. At `num_splits == 1`
+(`TURBOQUANT_DECODE_SPLITS = 1`,
+[`:684`](vllm_ascend/attention/turboquant_dry_run.py:684)) `NeedsReduction()`
+returns false and the question is moot; it becomes live the moment Split-K is
+switched on. **Resolve before rung 6.** Conservative answer: keep the
+zero-fill, but issue it once per capture rather than once per launch.
+
+### 3.3 Tier 2 — the only per-step data
+
+After tiers 0 and 1, the launch takes exactly three per-step device tensors:
+`query`, `block_tables` and `context_lens`, plus the tiling buffer's contents.
+`block_tables` is already a device tensor from a persistent runner buffer
+(`common_attn_metadata.block_table_tensor`,
+[`attention_v1.py:341`](vllm_ascend/attention/attention_v1.py:341)).
+`context_lens` becomes `attn_metadata.seq_lens_gpu`
+([`attention_v1.py:414`](vllm_ascend/attention/attention_v1.py:414)) instead of
+the CPU mirror. Kills B1.
+
+That leaves the tiling buffer's contents, which is the real design question, and
+there are three answers.
+
+#### D1 — host-filled, once per step, in the metadata builder (recommended first)
+
+`build_decode_tiling` reads `context_lengths` and launch geometry and nothing
+else. For a given model, the geometry is identical for every full-attention
+layer, so **the tiling buffer is the same for all 60 layers of a step and is
+currently built 60 times.**
+
+Move it to the metadata builder. `AscendTurboQuantMetadataBuilder.build()`
+already runs once per step on the host, already holds `seq_lens` as a CPU
+tensor, and already performs an H2D for `query_start_loc`
+([`attention_v1.py:362`](vllm_ascend/attention/attention_v1.py:362)). It calls
+`npu_turboquant_build_decode_tiling` (CPU-dispatch flavour) into the Tier-1
+buffer and hands the buffer to every layer on the metadata.
+
+Under graph capture the fill happens **before** the replay, on the replay
+stream, writing into the address the graph captured. That is legal and is how
+`block_tables` and `seq_lens` already work: the graph reads whatever is at the
+pointer, and the step's host work stays outside the capture.
+
+Cost per step: one ~17 KB H2D and one CPU descriptor loop — a 60× reduction on
+today's cost, with no kernel change and no device-side arithmetic. This is the
+cheapest change that makes the decode capturable.
+
+#### D2 — device-side tiling builder kernel (recommended second)
+
+Replace the host loop with a tiny AIV kernel, one block, reading
+`context_lens` from GM and writing `tokens*splits` 64-byte descriptors plus
+`grid` 32-byte dispatch records. Then the launch has **no host-visible per-step
+input at all** and the H2D disappears.
+
+The arithmetic is cheap enough to be divide-free, which is the crux:
+
+* `num_tiles = (context + 63) >> 6`, `tail_rows = context & 63`,
+  `regular_tiles = num_tiles - (tail_rows != 0)` — `kDecodeTileRows` is 64 and
+  `kDecodeTileRowsShift` is 6, both already in the header.
+* `seq_blocks = (context + block_size - 1) >> log2(block_size)` —
+  `build_decode_tiling` already *rejects* a non-power-of-two `block_size`
+  (`DecodeTilingStatus::kPageSizeNotPow2`,
+  [`turboquant_tiling.cpp:73-74`](csrc/attention/turboquant/op_host/turboquant_tiling.cpp:73))
+  and already ships the shift to the device as
+  `kTilingWordTilesPerPageShift`.
+* `blocks_per_split = CeilDiv(seq_blocks, splits)` — the only genuine divide.
+  `splits` is a launch constant, 1 today and 4 or 8 in the roadmap, so
+  **constrain `num_splits` to a power of two** and this is a shift as well. If
+  that constraint is unacceptable, the host can pass a magic-number reciprocal;
+  it should not be a device divide, for the reason the tiling header's preamble
+  gives about SPU issue order.
+* The dispatch records are a function of launch geometry *only* — no context
+  lengths at all
+  ([`turboquant_tiling.cpp:142-173`](csrc/attention/turboquant/op_host/turboquant_tiling.cpp:142)).
+  They can be written by the same kernel, or stay host-built once per capture
+  size as a Tier-1 constant. **Recommended: Tier-1 constant.** Splitting the
+  buffer this way means the device kernel writes only the descriptor array and
+  the dispatch half never changes after warmup.
+
+Why a separate launch and not a prologue stage inside the decode: the
+descriptors are shared across grid blocks (different kv heads and head chunks of
+one token are different tasks, possibly on different blocks, all reading
+descriptor `token*splits+split`), so an in-launch prologue would need a
+cross-block barrier. `AscendC::SyncAll<false>()` is already reached by a split
+launch and already constrains the grid
+([`torch_bindings.cpp:642-645`](csrc/attention/turboquant/torch_bindings.cpp:642)),
+so it is available — but adding a barrier to the hot kernel to save one
+microsecond-scale launch is the wrong trade, and it would invalidate the fused
+goldens. A separate kernel keeps the audited decode byte-identical.
+
+The device kernel's oracle is free and exact: **`build_decode_tiling` itself.**
+Run both over the same context lengths and compare the buffers word for word.
+That is the right remaining use for the host builder, and it is why the builder
+should not be deleted when D2 lands.
+
+#### D3 — collapse the tiling buffer into launch scalars (not recommended now)
+
+At `splits == 1` every descriptor word is one scalar load of
+`contextLens[token]` plus shifts and masks — cheaper than the six
+`tilingGm_.GetValue` scalar loads it would replace
+([`turboquant_fused_decode.cpp:300-306`](csrc/attention/turboquant/op_kernel/turboquant_fused_decode.cpp:300)).
+`groupHeads_` and `chunksPerGroup_` are read from GM
+([`:119-120`](csrc/attention/turboquant/op_kernel/turboquant_fused_decode.cpp:119))
+although `numHeads` and `numKvHeads` are already launch scalars, so those two
+reads are gratuitous. And the dispatch record is one div/mod chain at block
+entry, before the pipeline starts, where the SPU-stall argument does not apply.
+
+So the buffer could go away entirely. **Defer it.** It touches the hot kernel,
+the measurement that motivated host tiling has not been repeated for this
+variant, and nothing about graph capture requires it. Record it as a
+perf follow-up with a named owner, not as part of this work.
+
+### 3.4 The remaining capture-unsoundness: batch size
+
+B8 survives all of the above, because it is in Python and is about extents, not
+transfers. Two parts:
+
+1. **The decode must run over the captured extent, not the live one.**
+   `_forward_decode` slices everything by `len(attn_metadata.seq_lens_list)`. A
+   captured graph must instead cover the full padded extent, and dead rows must
+   be harmless. The tiling descriptor already encodes "no work" exactly — the
+   all-zero descriptor with `num_tiles == 0`, which both the Cube and the Vector
+   role branch on
+   ([`turboquant_tiling.h:58-60`](csrc/attention/turboquant/op_host/turboquant_tiling.h:58)).
+   So the mechanism exists; what is needed is for a padded row to arrive with
+   `context_lens == 0`.
+
+2. **The builder pads `seq_lens` with 1, not 0.**
+   [`attention_v1.py:387-390`](vllm_ascend/attention/attention_v1.py:387) pads
+   the FIA dummy request with a length of 1 and a block-table row of zeros,
+   deliberately, because FIA validates `actualSeqLengthsKv`. A length of 1 makes
+   the TurboQuant descriptor *live* with one tile, so a padded row will attend
+   over block 0 and write a nonzero output. The comment argues that is harmless
+   because the padding tokens' output is trimmed downstream — **that argument has
+   to be re-checked for a captured decode, where the padded extent is the
+   capture size rather than one dummy request.** This is a decision, not a
+   detail, and it is listed in §7.
+
+---
+
+## 4. Pre-allocation strategy and `ModelRunner` warmup
+
+### 4.1 What gets allocated where
+
+> **Superseded by the implementation, and the correction matters.** This section
+> originally proposed owning all three Tier-1 buffers through
+> `get_capture_resource`. Implementing rungs 1–4 showed that is wrong for the
+> tiling buffer and unnecessary for the other two; §4.2 now records why, and the
+> layout below is what shipped.
+
+```
+engine start
+  └─ _ensure_statics(layer, device)            # Tier 0, once per (head_size, device)
+        pi_signs, rotation, codec_tables, h16
+     op-local statics (C++)                    # Tier 0, once per (head_size, device_index)
+        basis_pool, mode_tables, aiv_core_num
+     AscendTurboQuantMetadataBuilder.__init__   # Tier 1, once, from max_num_seqs
+        context_lens  int32[max_num_reqs]            (device, host-written)
+        tiling        int32[upper_bound_words]       (device, host-written)
+        workspace     fp32[max*H*S*(D+kPartialTail)] (device, kernel scratch)
+        query_rot     fp32[max*H*D]                  (device, kernel scratch)
+
+each step
+  └─ builder.build() → _build_backend_metadata  # Tier 2, once per step, all layers
+        _refresh_context_lens(...)   host stage + one H2D, FIA padding rows zeroed
+        npu_turboquant_build_decode_tiling(context_lens_host, tiling, ...)
+  └─ (once the gate lifts) graph.replay()        # no host work inside
+```
+
+One maximum-sized allocation serves every capture size, because every size is
+exactly computable from `max_num_seqs` and a step uses a prefix (`narrow`, which
+keeps the base address). So there are no capture-size keys to get wrong, and no
+need for `get_capture_resource`'s `use_max_workspace`
+([`updatable_graph.py:101-118`](vllm_ascend/compilation/updatable_graph.py:101))
+— which exists for sizes that are *not* exactly computable, and which
+`full_graph_fia` needs for that reason.
+
+### 4.2 Why `UpdatableGraph` is *not* needed
+
+Worth stating because it is the obvious thing to reach for. `UpdatableGraph`
+exists so an op whose **host scalar arguments** change per step can still be
+captured: `register_task` records a handle during capture
+([`updatable_graph.py:120-146`](vllm_ascend/compilation/updatable_graph.py:120))
+and `GraphUpdateTask.apply` re-issues the launch arguments into the captured node
+at replay via `graph_task_update_begin/end`
+([`:72-76`](vllm_ascend/compilation/updatable_graph.py:72)). FIA needs it because
+`actual_seq_lengths_kv` is a Python list.
+
+TurboQuant does not need it, because after §3 **every per-step quantity is the
+*content* of a device buffer at a fixed address, not a launch argument.** The
+launch arguments that remain (`num_heads`, `num_kv_heads`, `num_splits`,
+`heads_per_task`, `output_stage`, `scale`, `inv_sqrt_len`, and the geometry the
+op derives from tensor shapes) are all constant for a capture size.
+
+That is a strictly better position than FIA's and should be preserved
+deliberately: *no scalar argument of the fused decode may depend on the step.*
+Make it a comment in the binding and a test (§6, G4).
+
+**And `get_capture_resource` turns out not to be needed either.** Open question
+2 of §7 is now answered, from the source: `FULL_DECODE_ONLY` capture *does* go
+through `UpdatableGraph`
+([`model_runner_v1.py:4564-4572`](vllm_ascend/worker/model_runner_v1.py:4564)
+builds `ACLGraphWrapper(runtime_mode=CUDAGraphMode.FULL)` for any mode where
+`has_full_cudagraphs()`, and that wrapper constructs `UpdatableGraph()`
+unconditionally at
+[`acl_graph.py:188`](vllm_ascend/compilation/acl_graph.py:188), entering it with
+`torch.npu.graph(aclgraph, pool=...)` at
+[`:210`](vllm_ascend/compilation/acl_graph.py:210), which calls the override
+that sets `_ACTIVE_GRAPH`). So the mechanism is live — and it is still the wrong
+owner here, for two reasons the answer does not change:
+
+* **The tiling buffer is written by the host between replays.** A
+  `get_capture_resource` buffer is created *during* capture, so its storage
+  belongs to the graph's memory pool, and `capture_end` weakens the resource
+  dict with `weak_ref_tensors`
+  ([`updatable_graph.py:99`](vllm_ascend/compilation/updatable_graph.py:99)) —
+  whose own docstring says the point is to keep the *buffer pointer* for the
+  graph, not the tensor. That is the right shape for FIA's workspace, which only
+  the device touches. It is not a buffer to hand the host for refilling.
+* **Outside capture it allocates per call.**
+  [`updatable_graph.py:189-194`](vllm_ascend/compilation/updatable_graph.py:189)
+  falls through to `factory()` when no graph is capturing, so in PIECEWISE — the
+  only mode TurboQuant is served in today — it would keep doing exactly the
+  per-step allocation this work removes.
+
+A buffer allocated in the builder's `__init__`, before any capture, is strongly
+owned, host-writable, and has one address for the engine's life. That is the
+contract `block_tables` and `seq_lens` already have, and it is what shipped.
+
+---
+
+## 5. What the platform gate becomes
+
+Replace the unconditional downgrade in `_apply_turboquant_graph_mode`
+([`platform.py:1241`](vllm_ascend/platform.py:1241)) with a conditional one. The
+condition is three-part, and all three parts are checkable at
+`check_and_update_config` time:
+
+```python
+from vllm_ascend.attention.turboquant_dry_run import (
+    TURBOQUANT_OP_FUSED_DECODE, TURBOQUANT_OP_RESHAPE_SCATTER,
+    _is_op_registered, load_turboquant_extension,
+)
+
+load_turboquant_extension()
+kernels_present = all(
+    _is_op_registered(TURBOQUANT_DEFAULT_NAMESPACE, op)
+    for op in (TURBOQUANT_OP_FUSED_DECODE, TURBOQUANT_OP_RESHAPE_SCATTER)
+)
+```
+
+1. **Both kernels registered.** Without them the golden path runs, and §1.3 is
+   unfixable. `_is_op_registered`
+   ([`turboquant_dry_run.py:709`](vllm_ascend/attention/turboquant_dry_run.py:709))
+   is the existing predicate.
+2. **The cache the writers produce is the cache the decode reads.** Until the
+   write-time NZ ingress lands, it is not, and a captured decode would read
+   bytes in the wrong order. Gate on whatever flag that work introduces; until
+   then, hard-coded false.
+3. **The mode is `FULL_DECODE_ONLY`.** `FULL` and `FULL_AND_PIECEWISE` capture
+   mixed and prefill batches, which go through `_forward_mixed` /
+   `_forward_prefill_no_cache` and are host-bound by design. Downgrade those two
+   to `FULL_DECODE_ONLY` rather than to `PIECEWISE`, and keep the log line that
+   says which and why — it is the one thing in that function that has clearly
+   earned its keep.
+
+The declined-not-refused stance in the current docstring stays right: a
+configuration that cannot be captured gets a warning and a working mode, not an
+exception.
+
+---
+
+## 6. Implementation ladder
+
+Each rung is independently landable and independently gated. Rungs 1–2 are worth
+landing under `PIECEWISE` on their own merits; full capture starts at rung 3.
+
+| # | Change | Files | Risk | Gate |
+| --- | --- | --- | --- | --- |
+| **1** ✅ | Tier-0 statics: cache `basis_pool`, `mode_tables`, `aiv_core_num` in C++; use `layer._turboquant_codec_tables` and a cached `h16` in Python | `torch_bindings.cpp`, `turboquant_dry_run.py` | Low. No schema, no kernel, no layout. | G1, G2, G3 |
+| **2** ✅ | `context_lens` becomes `seq_lens_gpu`; the op stops making the host copy; `build_decode_tiling` is fed from a caller-supplied host view | `turboquant_dry_run.py`, `torch_bindings.cpp` | Low–medium. Changes which tensor the op reads; a wrong one is a wrong answer, not an error. | G1, G2, G3, G5 |
+| **3** ✅ | Schema change: `tiling`, `workspace`, `query_rot` become inputs; new `npu_turboquant_build_decode_tiling` with the CPU implementation; `decode_launch_split()` in the tiling header | `torch_bindings.cpp`, `op_host/turboquant_tiling.{h,cpp}`, `turboquant_dry_run.py` | Medium. Three new sizing contracts the op must check. | G1, G2, G3, G4, G6 |
+| **4** ✅ | Builder ownership: `AscendTurboQuantMetadataBuilder` allocates the Tier-1 buffers itself (see §4.2) and fills the tiling once per step for all layers | `turboquant_dry_run.py` only -- the shared builder is untouched, via its own `_build_backend_metadata` hook | Medium. A new builder class and metadata dataclass. | G1, G3, G6, G7 |
+| **5** | The AIV tiling builder kernel; `PrivateUse1` implementation of the builder op; `num_splits` constrained to a power of two | new `op_kernel/turboquant_build_tiling.cpp`, `CMakeLists.txt` | Medium–high. A new kernel in the MIX library; `ascendc_library` has no incremental rebuild, so every iteration is a clean build. | G1, G8, G9 |
+| **6** | Lift the platform gate to conditional `FULL_DECODE_ONLY`; padded-row contract for `context_lens`; refuse capture when the golden path would be taken | `platform.py`, `turboquant_dry_run.py` | High. This is the rung that can corrupt a served model silently. | G1, G3, G10, G11 |
+| **7** | *(follow-up, not this work)* D3: remove the tiling buffer; re-measure the SPU argument; `at::empty` for the workspace if §3.2 resolves that way | kernel | — | G8, G9, plus a profile |
+
+### Verification gates
+
+| Gate | What | Where it runs |
+| --- | --- | --- |
+| **G1** | The three `-Werror` compile tiers still build; the standalone ops build still links | WSL, `build_turboquant_ops.py` in the vendor image |
+| **G2** | Schema/stub agreement, parsed out of the C++ | `tests/ut/attention/test_turboquant_op_schemas.py`, no device |
+| **G3** | Dispatch-seam behaviour: argument order, the `None` fallback, warn-once | `tests/ut/attention/test_turboquant_dispatch_seam.py`, no device |
+| **G4** | **New**: no scalar argument of the fused decode depends on the step. Assert over the schema's `int`/`float` parameters that each is derived from config or geometry, not from `attn_metadata` | new UT, no device |
+| **G5** | **New**: the op reads the device `seq_lens`, not the CPU mirror — a recorder stub asserting `context_lens.device.type != "cpu"` | new UT, no device |
+| **G6** | **New**: `decode_launch_split()` and the Python-side upper bound agree; `tiling.numel()` checks fire on an undersized buffer | `tests/ut/ops` device-free gate + a UT |
+| **G7** | The builder change does not perturb the non-TurboQuant backends | existing `tests/ut/attention` |
+| **G8** | **New**: the AIV tiling builder's output is word-for-word identical to `build_decode_tiling` over a grid of context lengths, including zero, a 64-exact multiple, a tail, and a length past `kFusedContextLimit` | CAModel, `S <= 256` |
+| **G9** | The fused decode goldens are unchanged: cases (a), (e), (k), (l) under `kv4fp8` | CAModel, `S <= 256`, serial |
+| **G10** | **New**: a capture-illegality assertion — run a decode under a faked capture (patch both the forward-context flag and `torch.npu.is_current_stream_capturing`, as `_capture_in_progress()` already does) and assert no `.cpu()`, `.to("cpu")`, `.item()`, `.tolist()` or allocation occurs. A `__torch_function__` mode or a monkeypatched allocator is enough; no device needed | new UT, no device |
+| **G11** | End-to-end: `FULL_DECODE_ONLY` and `PIECEWISE` agree token-for-token on a greedy generation. This is the only gate that needs an NPU | 950PR hardware |
+
+G10 is the gate that would have caught every blocker in §1.2 and is the one most
+worth writing first — before rung 1, so it fails and then goes green.
+
+### Risks, ranked
+
+1. **Silent wrongness at rung 6.** A captured decode that reads a stale buffer
+   or the wrong extent produces plausible tokens. Nothing short of G11 catches
+   it. Do not lift the gate on the strength of G1–G10.
+2. **The padded-row contract (§3.4).** `seq_lens` padded with 1 makes a dead row
+   live. Decide this explicitly.
+3. **Tier-1 ownership (§4.2).** If `FULL_DECODE_ONLY` capture does not go
+   through `UpdatableGraph`, `get_capture_resource` is a no-op and the buffers
+   are reallocated per step — which looks like it works and then corrupts when
+   the allocator reuses an address.
+4. **The workspace zero-fill (§3.2).** Only bites once Split-K is on, which is
+   the roadmap.
+5. **`num_splits` constrained to a power of two at rung 5.** Acceptable today
+   (it is 1, and the roadmap is 4 and 8), but it is a new published constraint
+   and belongs in the op's `TORCH_CHECK` and in the docs.
+6. **`ascendc_library` has no incremental rebuild**, so rung 5 iterates at
+   clean-build speed. Budget for it.
+
+---
+
+## 7. Open questions
+
+These need an answer from outside the code.
+
+1. ~~**Padded rows.**~~ **Decided and implemented: zero.**
+   `AscendTurboQuantMetadataBuilder._refresh_context_lens` publishes
+   `turboquant_context_lens` with the FIA padding rows at 0 while
+   `seq_lens`/`seq_lens_list` keep their ones. A 1 makes
+   `build_decode_tiling` write a *live* descriptor, so the padded row attended
+   over page 0 and wrote a nonzero result -- which was happening under
+   PIECEWISE too, not only under capture. (§3.4)
+2. ~~**Does `FULL_DECODE_ONLY` capture in this repository go through
+   `UpdatableGraph`?**~~ **Answered: yes** (`model_runner_v1.py:4564` →
+   `acl_graph.py:188`). The buffers are owned by the metadata builder anyway;
+   §4.2 records why `get_capture_resource` is the wrong owner for a
+   host-written buffer and unnecessary for the other two.
+3. **Is the Split-K workspace's zero-init load-bearing for a split with
+   `num_tiles == 0`?** Trace `TurboQuantPartialReducer`'s skip condition. (§3.2)
+4. **Is `num_splits` ever not a power of two?** If it can be, rung 5 needs a
+   magic-number reciprocal instead of a shift. (§3.3 D2)
+5. **Does the write-time NZ ingress work have a flag yet?** Gate part 2 in §5
+   needs one. Until then the lifted gate stays closed for serving even when the
+   plumbing is done.
+6. **Is `aclGetDeviceCapability` legal on a capturing stream?** It should not
+   touch the stream at all, but it is an ACL call inside a launch. (§1.2 B6)
+
+---
+
+## 8. Appendix: the per-step, per-layer cost being removed
+
+Measured by reading the source, not by profiling — there is no msprof baseline
+for this path and that remains the gap. At `tokens=256`, `heads=32`,
+`num_kv_heads=4`, `head_size=256`, `splits=1`, 60 full-attention layers, one
+decode step:
+
+| Quantity | Today | After §3 |
+| --- | --- | --- |
+| pageable H2D copies | 180 (`context_lens`, `tiling`, `basis_pool`, ×60) | 1 (rung 4) → 0 (rung 5) |
+| host CPU descriptor loops | 60 | 1 → 0 |
+| CPU butterfly-table loops (1536 words) | 60 | 0 |
+| device allocations | 300 | 0 (Tier 1 pre-allocated) |
+| device bytes allocated | ~1.0 GB | 0 |
+| device zero-fill bytes | ~534 MB (`workspace`) | 0 per step |
+| incidental device kernels (`_sylvester_hadamard` ×2) | ~660 | 0 |
+| `aclGetDeviceCapability` calls | 60 | 1 per process |
+
+The 1.0 GB figure is allocation churn through the caching allocator, not
+footprint — but the zero-fill is real bandwidth, and ~534 MB of HBM writes per
+decode step is worth removing whether or not full capture ever lands.
