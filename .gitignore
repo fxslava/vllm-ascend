@@ -241,3 +241,6 @@ csrc/third_party/
 # local build cache
 .vllm_ascend/
 /cann_aarch64/asc/impl/adv_api/detail/api_check/kernel_check/activation/softmax/softmax_flash
+
+# TURBOQUANT_PROFILE=1 trace export (TURBOQUANT_PROFILE_TRACE_DIR)
+turboquant_traces/
