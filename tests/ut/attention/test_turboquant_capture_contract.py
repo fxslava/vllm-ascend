@@ -1476,3 +1476,81 @@ def test_g8_the_tiling_buffer_is_filled_by_the_operator_alone(monkeypatch: pytes
         "something other than the operator wrote the tiling buffer: "
         "the only writer may be build_decode_tiling, through the op."
     )
+
+
+# ---------------------------------------------------------------------------
+# C5 as a class, not a one-off
+#
+# The defect C5 fixed -- a persistent, *unpinned* host buffer copied
+# ``non_blocking=True`` and rewritten on the next step -- is a shape, and the
+# shape is everywhere. An AST sweep of ``vllm_ascend`` finds 179 explicit
+# ``non_blocking`` sites, 61 of which are a host buffer reached through an
+# attribute with no pinning anywhere in the source expression. Almost all are
+# the engine's own staging (``self.positions_cpu``, ``self.temperature_cpu``,
+# ``self.optimistic_seq_lens_cpu``, ...), so this is the house pattern rather
+# than a TurboQuant defect, and changing 61 of them is not something that can
+# be justified or verified from here.
+#
+# What this gate does is narrow and keepable: the TurboQuant surface may not
+# regress to a literal. Every ``non_blocking`` it passes must be derived from
+# whether the staging is actually pinned, so the two can never disagree.
+# ---------------------------------------------------------------------------
+
+
+def test_c5_the_turboquant_surface_passes_no_literal_non_blocking() -> None:
+    """``non_blocking`` follows the pinning, by construction, in this module.
+
+    A literal ``True`` is the defect: out of pageable memory the runtime bounces
+    the copy through a staging buffer of its own and returns before the source
+    is free, so the caller that rewrites it next step tears the upload. A
+    literal ``False`` is merely slow, but it is also a claim about the staging
+    that nothing checks. Both are refused here; the flag must be an expression.
+    """
+    import ast
+    import pathlib
+
+    from vllm_ascend.attention import turboquant_dry_run
+
+    tree = ast.parse(pathlib.Path(turboquant_dry_run.__file__).read_text(encoding="utf-8"))
+    literals = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg == "non_blocking" and isinstance(keyword.value, ast.Constant):
+                literals.append((node.lineno, keyword.value.value))
+
+    assert literals == [], (
+        f"turboquant_dry_run.py passes a literal non_blocking at {literals}. The flag has to be "
+        "derived from whether the staging is pinned -- a non-blocking copy out of pageable "
+        "memory is neither fast nor safe, and a blocking copy out of pinned memory is a claim "
+        "nothing checks."
+    )
+
+
+def test_c5_the_staging_ring_has_a_device_slot_per_host_slot() -> None:
+    """The invariant that makes the ring mean anything.
+
+    A ring of host buffers feeding one device buffer still serialises on that
+    device buffer, so the ring only helps because the *host* writes are what
+    race the in-flight copy -- the device side is a single persistent buffer the
+    stream orders for us. This records which of the two it is, because the
+    distinction is the whole argument for depth two:
+
+      - host staging: a ring, because the host writes it ahead of the stream;
+      - device buffer: one, because every write to it is stream-ordered behind
+        the previous step's reads of it.
+
+    If that ever stops holding -- a second stream, or out-of-order submission --
+    depth two stops being sufficient, and the fix is the pattern at
+    ``ops/triton/compressor/compressor_triton.py:394-406``: an ``npu.Event``
+    recorded per slot and synchronised before the slot is reused, which does not
+    rest on a stream-ordering argument at all. That is deliberately not what
+    this does, because it needs a device to exercise and cannot be checked here.
+    """
+    builder = _builder()
+    assert len(builder._context_lens_host_ring) == TURBOQUANT_STAGING_SLOTS
+    assert isinstance(builder._context_lens, torch.Tensor), "the device side is one buffer, not a ring"
+    assert all(slot.shape == builder._context_lens.shape for slot in builder._context_lens_host_ring), (
+        "every staging slot must cover the whole device buffer"
+    )

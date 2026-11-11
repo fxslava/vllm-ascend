@@ -811,6 +811,56 @@ Each landed with a revert probe: C1 red when the extent falls back to
 launch calls the builder op, C4 red when the refusal is removed, C5 red at ring
 depth 1 and red when the copy is unconditionally `non_blocking`.
 
+#### C5 is a class, and the repository is full of it
+
+An AST sweep of `vllm_ascend` finds **179** explicit `non_blocking` sites.
+Classified by the three C5 questions — is the source pinned, is it a persistent
+buffer a later step rewrites, does the flag follow the pinning:
+
+| Verdict | Sites | What it means |
+| --- | --- | --- |
+| `PERSISTENT?` | 61 | A host buffer reached through an attribute, `non_blocking=True`, no pinning anywhere in the source expression. The C5 shape. |
+| `LOCAL-TEMP` | 85 | A temporary built on the spot. Weaker risk: nothing rewrites it, though the copy is still effectively synchronous out of pageable memory. |
+| `PINNED-*` | 17 | `.pin_memory()` in the source expression, the common `query_start_loc_cpu.pin_memory().to(..., non_blocking=True)` idiom among them. |
+| flag-derived | 16 | The flag is an expression, not a literal. |
+
+The 61 are almost all the engine's own staging — `self.positions_cpu`,
+`self.temperature_cpu`, `self.optimistic_seq_lens_cpu`,
+`self.input_ids_cpu`, the `_310p` runners' equivalents. **This is the house
+pattern, not a TurboQuant defect**, and it is survivable for the same reason it
+is pointless: a pageable host-to-device copy is effectively synchronous, because
+the runtime stages it through a bounce buffer before returning. So those sites
+pay a host wait and gain no asynchrony. Changing 61 of them is neither
+justifiable nor verifiable from a host with no device, and it is not in scope
+here. They are recorded so that the next person does not read TurboQuant's
+pinned ring as gold-plating.
+
+Two sites already do it properly, and one of them is **better than what
+TurboQuant ships**:
+
+- `worker/utils.py:255-267` — `self._ids_pinned`, allocated with
+  `pin_memory=self.pin_memory`.
+- `ops/triton/compressor/compressor_triton.py:394-406` — a pinned staging
+  **ring** with a `torch.npu.Event` recorded per slot and `synchronize()`d
+  before that slot is reused. That is the rigorous version of C5: it does not
+  rest on any argument about stream ordering, where TurboQuant's depth-two ring
+  does.
+
+**The assumption TurboQuant's ring rests on, stated.** Depth two is sufficient
+only because the staging is written by the host ahead of a single in-order
+stream, so by the time the host returns to a slot the whole of the following
+step has been enqueued behind that slot's copy. If that stops holding — a
+second stream for metadata upload, or out-of-order submission — depth two stops
+being sufficient and the fix is the event-per-slot pattern above. That is
+deliberately **not** what ships today: it needs a device to exercise, an
+`npu.Event` per slot, and a conditional host wait, and an untestable
+device-dependent sync path is worse than a documented assumption. C5's gate
+records which side is a ring and why (`test_c5_the_staging_ring_has_a_device_slot_per_host_slot`).
+
+The narrow thing that *is* gated: the TurboQuant surface may not pass a literal
+`non_blocking` at all, in either direction, so the flag and the pinning can
+never disagree.
+
 ### Risks, ranked
 
 1. **Silent wrongness at rung 6.** A captured decode that reads a stale buffer
