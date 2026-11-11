@@ -335,6 +335,13 @@ def test_stages_scatter_writes_through_the_kernel_and_reads_back_golden(monkeypa
             num_kv_heads=NUM_KV_HEADS,
             scale=0.125,
             output=torch.zeros(1, 2, HEAD_SIZE),
+            # The stage gate is the first statement in fused_decode, so a
+            # decline happens before any of the three launch buffers is looked
+            # at. Empty tensors say that and pin it: if the gate ever moved
+            # below them, this call would raise instead of returning None.
+            tiling=torch.empty(0, dtype=torch.int32),
+            workspace=torch.empty(0, dtype=torch.float32),
+            query_rot=torch.empty(0, dtype=torch.float32),
         )
         is None
     )

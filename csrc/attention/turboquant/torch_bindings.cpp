@@ -88,7 +88,12 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <map>
+#include <mutex>
 #include <optional>
+#include <tuple>
+#include <utility>
 
 #include <torch/library.h>
 #include <torch/torch.h>
@@ -173,6 +178,35 @@ constexpr std::int64_t kCodecPoolWordsPerChannel = 9;
 inline std::int64_t ceil_div(const std::int64_t a, const std::int64_t b)
 {
     return b > 0 ? (a + b - 1) / b : 0;
+}
+
+// The tiling request, from the geometry both the decode and the tiling builder
+// are given. One definition because the two must describe the same launch: the
+// builder writes descriptors the decode reads by offset, and a request that
+// differed in any field would produce a buffer the decode walks wrongly without
+// any check being able to say so.
+//
+// `tasks_per_block`, `reduce_tasks_per_block` and `grid` are left at their
+// defaults here and filled by tiling::decode_launch_split, which is the
+// production derivation of them; `probe_page` / `probe_tile` stay at the
+// defaults that mean "every worker on its production span" -- the isolated
+// canary is a C++ fixture's, never a served launch's.
+inline ::ascend_micro::fused_decode::DecodeTilingRequest decode_request(
+    const std::int64_t num_tokens, const std::int64_t num_heads, const std::int64_t num_kv_heads,
+    const std::int64_t head_size, const std::int64_t block_size, const std::int64_t max_blocks,
+    const std::int64_t num_splits, const std::int64_t heads_per_task)
+{
+    ::ascend_micro::fused_decode::DecodeTilingRequest r;
+    r.tokens = static_cast<std::uint32_t>(num_tokens);
+    r.num_heads = static_cast<std::uint32_t>(num_heads);
+    r.num_kv_heads = static_cast<std::uint32_t>(num_kv_heads);
+    r.head_dim = static_cast<std::uint32_t>(head_size);
+    r.block_size = static_cast<std::uint32_t>(block_size);
+    r.max_blocks = static_cast<std::uint32_t>(max_blocks);
+    r.splits = static_cast<std::uint32_t>(num_splits);
+    r.heads_per_task = static_cast<std::uint32_t>(heads_per_task);
+    r.fused_context_limit = ::vllm_ascend::turboquant::kFusedContextLimit;
+    return r;
 }
 
 inline void check_burst_aligned(const at::Tensor &t, const char *op, const char *name)
@@ -279,6 +313,74 @@ inline void check_tables(const at::Tensor &tables, const std::int64_t head_size,
     TORCH_CHECK(tables.is_contiguous() && tables.numel() == expected, op, ": ", name, " must be ", expected,
                 " contiguous bfloat16 elements (", kTablePlanes * groups, " row-major ", kTableGroup, "x",
                 kTableGroup, " blocks of +-1, ", expected * 2, " bytes), got ", tables.numel());
+}
+
+// ---------------------------------------------------------------------------
+// Operands that are constants, cached for the process
+// ---------------------------------------------------------------------------
+//
+// WHY THESE ARE STATICS NOW. Both of the buffers below are pure functions of
+// `head_size`, and both used to be built and uploaded inside every launch of
+// every layer: a 1536-word host loop plus a ~9 KB host-to-device copy, sixty
+// times per decode step on a sixty-layer model. The copy is also illegal on a
+// capturing stream (107030, "Stream during the capture stage is not
+// supported"), so caching them is both the performance fix and one of the four
+// things that stood between this operator and an ACL graph.
+//
+// THE ONE CAVEAT, written down because nothing enforces it: the first call for
+// a given (head_size, device) is what builds and uploads the entry, and that
+// call must not itself be inside a capture. vLLM guarantees it --
+// `cudagraph_num_of_warmups` is 1 and `_dummy_run` executes the model eagerly
+// before `capture_model` captures anything -- but if that ever stopped being
+// true, the symptom would be a capture failure on the first graph rather than a
+// wrong answer.
+//
+// Which constant, so that two of them cannot collide on one key. The basis
+// pool depends on head_size and mode_tables does not, so mode_tables would
+// otherwise have to pick a head_size to stand in for "none" -- and every value
+// it could pick is one the basis pool may legitimately use.
+enum class CachedConstant : int {
+    kBasisPool = 0,
+    kModeTables = 1,
+};
+
+// Keyed by device index as well, because a hybrid model has two head sizes and
+// a multi-device process one entry per device.
+using ConstantKey = std::tuple<CachedConstant, std::int64_t, c10::DeviceIndex>;
+
+inline at::Tensor cached_constant(const CachedConstant which, const std::int64_t head_size,
+                                  const at::Device &device, const std::function<at::Tensor()> &build)
+{
+    static std::mutex guard;
+    static std::map<ConstantKey, at::Tensor> cache;
+    const ConstantKey key{which, head_size, device.index()};
+    const std::lock_guard<std::mutex> held(guard);
+    auto found = cache.find(key);
+    // The device is in the key by index only, so confirm the whole device
+    // matches before reusing an entry.
+    if (found != cache.end() && found->second.device() == device) {
+        return found->second;
+    }
+    at::Tensor built = build();
+    cache[key] = built;
+    return built;
+}
+
+// The device's vector core count, read once. aclGetDeviceCapability does not
+// touch a stream, so it was never a capture hazard -- it is simply a runtime
+// call that does not belong in a launch.
+inline std::int64_t aiv_core_num(const char *op)
+{
+    static std::int64_t cores = [] {
+        std::int64_t value = 0;
+        if (aclGetDeviceCapability(0, ACL_DEVICE_INFO_VECTOR_CORE_NUM, &value) != ACL_SUCCESS) {
+            return std::int64_t{0};
+        }
+        return value;
+    }();
+    TORCH_CHECK(cores > 0, op, ": the device reports ", cores,
+                " vector cores (aclGetDeviceCapability failed or answered zero)");
+    return cores;
 }
 
 // `pi_signs` stays in every published signature and the device does not read it
@@ -488,11 +590,7 @@ void npu_turboquant_reshape_scatter_aiv(at::Tensor &key, at::Tensor &value, at::
     const std::int64_t total_items = num_requests * a.num_kv_heads;
     TORCH_CHECK(total_items > 0, op, ": nothing to scatter");
 
-    std::int64_t aiv_num = 0;
-    TORCH_CHECK(aclGetDeviceCapability(0, ACL_DEVICE_INFO_VECTOR_CORE_NUM, &aiv_num) == ACL_SUCCESS, op,
-                ": could not read the device's vector core count");
-    TORCH_CHECK(aiv_num > 0, op, ": the device reports ", aiv_num, " vector cores");
-    const std::int64_t block_dim = std::min(total_items, aiv_num);
+    const std::int64_t block_dim = std::min(total_items, aiv_core_num(op));
 
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
     launch_turboquant_reshape_scatter_aiv(
@@ -550,7 +648,8 @@ void npu_turboquant_reshape_scatter_aiv(at::Tensor &key, at::Tensor &value, at::
 void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Tensor &rot_tables,
                                  at::Tensor &h16, const std::optional<at::Tensor> &gate,
                                  at::Tensor &key_cache, at::Tensor &value_cache, at::Tensor &scale_cache,
-                                 at::Tensor &block_tables, at::Tensor &context_lens, at::Tensor &output,
+                                 at::Tensor &block_tables, at::Tensor &context_lens, at::Tensor &tiling,
+                                 at::Tensor &workspace, at::Tensor &query_rot, at::Tensor &output,
                                  int64_t num_heads, int64_t num_kv_heads, int64_t num_splits,
                                  int64_t heads_per_task, int64_t output_stage, double scale,
                                  double inv_sqrt_len)
@@ -631,21 +730,23 @@ void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Te
                 " elements");
 
     // ---- the host work split -------------------------------------------------
-    // The odometer build_decode_tiling walks: chunk, split, kv head, token.
-    const std::int64_t group_heads = num_heads / num_kv_heads;
-    const std::int64_t chunk = std::min<std::int64_t>(heads_per_task, group_heads);
-    const std::int64_t chunks_per_group = ceil_div(group_heads, chunk);
-    const std::int64_t tasks = num_tokens * num_kv_heads * num_splits * chunks_per_group;
-    const std::int64_t reduce_total = num_tokens * num_heads;
-    TORCH_CHECK(tasks > 0, op, ": nothing to decode");
-
-    // A split launch reaches AscendC::SyncAll<false>(), which on dav-3510 only
-    // completes if every launched block is resident at the same time, so the
-    // grid is capped at the physical block count either way.
-    const std::int64_t grid = std::min<std::int64_t>(kDecodeMaxGrid, std::max<std::int64_t>(tasks, 1));
-    const std::int64_t tasks_per_block = ceil_div(tasks, grid);
-    const std::int64_t reduce_tasks_per_block = ceil_div(reduce_total, grid);
-    const std::int64_t prologue_vectors_per_block = ceil_div(reduce_total, grid);
+    //
+    // Derived by tiling::decode_launch_split, which the tiling builder calls
+    // with the same request. It used to be open-coded here, and the caller now
+    // needs `grid` too -- decode_tiling_words takes it -- so three places would
+    // otherwise have to agree about a number none of them publishes. The
+    // odometer build_decode_tiling walks is unchanged: chunk, split, kv head,
+    // token.
+    const tiling::DecodeTilingRequest request =
+        decode_request(num_tokens, num_heads, num_kv_heads, head_size, block_size, max_blocks_per_seq,
+                       num_splits, heads_per_task);
+    const tiling::DecodeLaunchSplit split =
+        tiling::decode_launch_split(request, static_cast<std::uint32_t>(kDecodeMaxGrid));
+    TORCH_CHECK(split.tasks > 0, op, ": nothing to decode");
+    const std::int64_t grid = split.grid;
+    const std::int64_t tasks_per_block = split.tasks_per_block;
+    const std::int64_t reduce_tasks_per_block = split.reduce_tasks_per_block;
+    const std::int64_t prologue_vectors_per_block = split.prologue_vectors_per_block;
     // 0 rotates the whole share with ApplyPi on the vector cores; 16 rotates
     // whole chunks on the Cube, which is only worth a launch when the block's
     // share actually holds that many query vectors.
@@ -654,59 +755,68 @@ void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Te
             ? static_cast<std::int64_t>(layout::kQueryBasisCubeVectors)
             : 0;
 
-    // ---- the host tiling descriptors ----------------------------------------
-    tiling::DecodeTilingRequest request;
-    request.tokens = static_cast<std::uint32_t>(num_tokens);
-    request.num_heads = static_cast<std::uint32_t>(num_heads);
-    request.num_kv_heads = static_cast<std::uint32_t>(num_kv_heads);
-    request.head_dim = static_cast<std::uint32_t>(head_size);
-    request.block_size = static_cast<std::uint32_t>(block_size);
-    request.max_blocks = static_cast<std::uint32_t>(max_blocks_per_seq);
-    request.splits = static_cast<std::uint32_t>(num_splits);
-    request.heads_per_task = static_cast<std::uint32_t>(heads_per_task);
-    request.tasks_per_block = static_cast<std::uint32_t>(tasks_per_block);
-    request.reduce_tasks_per_block = static_cast<std::uint32_t>(reduce_tasks_per_block);
-    request.grid = static_cast<std::uint32_t>(grid);
-    request.fused_context_limit = layout::kFusedContextLimit;
+    // ---- the caller's three launch buffers -----------------------------------
+    //
+    // `tiling`, `workspace` and `query_rot` were allocated here, inside the
+    // launch, which gave each of them a fresh address on every step. A captured
+    // ACL graph replays the address it recorded, so they are the caller's now:
+    // allocated once by AscendTurboQuantMetadataBuilder and refreshed in place.
+    // Building the tiling descriptors here also meant reading the context
+    // lengths on the HOST, and `aclrtMemcpy` on a capturing stream fails with
+    // 107030 -- so this operator no longer has a host-visible input at all.
+    //
+    // The sizes are still derived here rather than trusted, because the caller
+    // has to reproduce them and a wrong one is an out-of-bounds device read
+    // rather than a wrong answer. `tiling` is checked with >= because its exact
+    // extent depends on `grid`, which is the derivation just above: a caller
+    // that sized it from an upper bound is correct and a caller that guessed
+    // `grid` low is not.
+    TORCH_CHECK(context_lens.device() == query.device(), op, ": context_lens is on ",
+                context_lens.device(), " but the query is on ", query.device(),
+                ". The operator does not copy it: a host-to-device copy here would run once per "
+                "layer per step and is illegal on a capturing stream. Pass the metadata's "
+                "turboquant_context_lens.");
+    TORCH_CHECK(context_lens.is_contiguous(), op,
+                ": context_lens must be contiguous; the device reads it as a flat int32 run");
 
-    // The context lengths are needed on BOTH sides, and which copy exists
-    // depends on where the caller keeps them. vLLM's metadata keeps seq_lens on
-    // the host on purpose, so the common case is a host tensor here and the
-    // device copy below is the one that has to be made; a caller that hands
-    // over a device tensor pays the device-to-host copy instead. Either copy is
-    // illegal on a capturing stream, which is one of the reasons TurboQuant is
-    // served PIECEWISE-only.
-    const at::Tensor context_lens_host =
-        context_lens.device().is_cpu() ? context_lens.contiguous() : context_lens.to(at::kCPU).contiguous();
-    const at::Tensor context_lens_device = context_lens.device() == query.device()
-                                               ? context_lens.contiguous()
-                                               : context_lens.to(query.device()).contiguous();
-
-    const std::size_t tiling_bytes = tiling::decode_tiling_bytes(
-        request.tokens, request.splits, request.grid);
-    const at::Tensor tiling_host =
-        at::empty({static_cast<std::int64_t>(tiling_bytes)}, query.options().dtype(at::kByte).device(at::kCPU));
-    // build_decode_tiling reinterprets this buffer as 64-byte-aligned
-    // descriptors and writes them by offset, so a misaligned base would be
-    // undefined behaviour rather than a slow path. Torch's CPU allocator gives
-    // 64 bytes; the check is here because nothing else would say so.
-    TORCH_CHECK(reinterpret_cast<std::uintptr_t>(tiling_host.data_ptr()) % alignof(tiling::TurboQuantDecodeTilingData) ==
+    const std::int64_t tiling_words =
+        static_cast<std::int64_t>(tiling::decode_tiling_words(request.tokens, request.splits, split.grid));
+    TORCH_CHECK(tiling.scalar_type() == at::kInt && tiling.is_contiguous() && tiling.dim() == 1, op,
+                ": tiling must be a contiguous 1-D int32 buffer, got ", tiling.scalar_type(), " ",
+                tiling.sizes());
+    TORCH_CHECK(tiling.numel() >= tiling_words, op, ": tiling holds ", tiling.numel(),
+                " int32 words; this launch needs ", tiling_words, " (", request.tokens, " tokens x ",
+                request.splits, " splits of descriptors, then ", split.grid, " dispatch records)");
+    TORCH_CHECK(tiling.device() == query.device(), op, ": tiling is on ", tiling.device(),
+                " but the query is on ", query.device());
+    // The device reads the descriptors as 64-byte lines indexed from word zero.
+    TORCH_CHECK(reinterpret_cast<std::uintptr_t>(tiling.data_ptr()) %
+                        alignof(tiling::TurboQuantDecodeTilingData) ==
                     0,
-                op, ": the tiling buffer is not ", alignof(tiling::TurboQuantDecodeTilingData), "-byte aligned");
-    const tiling::DecodeTilingStatus status = tiling::build_decode_tiling(
-        request, static_cast<const std::int32_t *>(context_lens_host.data_ptr()),
-        /*block_table=*/nullptr, tiling_host.data_ptr());
-    TORCH_CHECK(status == tiling::DecodeTilingStatus::kOk, op, ": ",
-                tiling::decode_tiling_status_text(status));
-    const at::Tensor tiling_device = tiling_host.to(query.device(), /*non_blocking=*/false);
+                op, ": the tiling buffer is not ", alignof(tiling::TurboQuantDecodeTilingData),
+                "-byte aligned");
 
-    // ---- the Split-K workspace and the rotated query image -------------------
     const std::int64_t workspace_floats =
         num_tokens * num_heads * num_splits * (head_size + static_cast<std::int64_t>(layout::kPartialTail));
-    const at::Tensor workspace =
-        at::zeros({workspace_floats}, query.options().dtype(at::kFloat));
-    const at::Tensor query_rot =
-        at::empty({num_tokens, num_heads, head_size}, query.options().dtype(at::kFloat));
+    TORCH_CHECK(workspace.scalar_type() == at::kFloat && workspace.is_contiguous(), op,
+                ": workspace must be contiguous fp32, got ", workspace.scalar_type());
+    TORCH_CHECK(workspace.numel() == workspace_floats, op, ": workspace holds ", workspace.numel(),
+                " floats, this launch needs exactly ", workspace_floats, " (", num_tokens, " x ",
+                num_heads, " x ", num_splits, " x (", head_size, " + ", layout::kPartialTail, "))");
+    TORCH_CHECK(workspace.device() == query.device(), op, ": workspace is on ", workspace.device(),
+                " but the query is on ", query.device());
+
+    const std::int64_t query_rot_floats = num_tokens * num_heads * head_size;
+    TORCH_CHECK(query_rot.scalar_type() == at::kFloat && query_rot.is_contiguous(), op,
+                ": query_rot must be contiguous fp32, got ", query_rot.scalar_type());
+    TORCH_CHECK(query_rot.numel() == query_rot_floats, op, ": query_rot holds ", query_rot.numel(),
+                " floats, this launch needs exactly ", query_rot_floats);
+    TORCH_CHECK(query_rot.device() == query.device(), op, ": query_rot is on ", query_rot.device(),
+                " but the query is on ", query.device());
+
+    check_burst_aligned(tiling, op, "tiling");
+    check_burst_aligned(workspace, op, "workspace");
+    check_burst_aligned(query_rot, op, "query_rot");
 
     // ---- the query basis codec's constant pool -------------------------------
     //
@@ -743,36 +853,43 @@ void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Te
     // right ELEMENT COUNT and the right dtype. The tail past word 1536 belongs to
     // Quantize4Bit / Dequantize4Bit, which the basis never calls, and stays zero: exactly what
     // RawQueryBasis::tables() in the operator's own fixture uploads.
+    //
+    // CACHED, as of the capture work: being a pure function of head_size is exactly what makes
+    // it cacheable, and rebuilding it per launch meant a 1536-word host loop and a 9 KB
+    // host-to-device copy once per layer per step -- the copy being illegal on a capturing
+    // stream. The bytes are identical to what the loop below produced; nothing about the
+    // operand changed. See cached_constant for the first-call caveat.
     const std::int64_t basis_pool_words = kCodecPoolWordsPerChannel * head_size + kCodecLevels;
-    at::Tensor basis_pool_host =
-        at::zeros({basis_pool_words}, query.options().dtype(at::kInt).device(at::kCPU));
-    {
-        std::int32_t *words = basis_pool_host.data_ptr<std::int32_t>();
-        std::int64_t at_word = 0;
-        for (std::int64_t stage = 0; stage < kCodecEarlyStages; ++stage) {
-            const std::int64_t stride = std::int64_t{1} << stage;
-            // The butterfly's sign diagonal for this stage: +1 on the low index of each pair,
-            // -1 on the high one, so `x[i] = x[i ^ stride] + sign * x[i]` is a + b and a - b.
-            for (std::int64_t i = 0; i < head_size; ++i) {
-                const float sign = (i & stride) == 0 ? 1.0f : -1.0f;
-                std::memcpy(&words[at_word + i], &sign, sizeof(float));
-            }
-            at_word += head_size;
-            // The partner index as a BYTE offset, which is the unit Gather's srcOffset takes.
-            for (std::int64_t i = 0; i < head_size; ++i)
-                words[at_word + i] = static_cast<std::int32_t>((i ^ stride) * sizeof(float));
-            at_word += head_size;
-        }
-        TORCH_CHECK(at_word == 2 * kCodecEarlyStages * head_size, op,
-                    ": the basis pool's early-stage span is ", at_word, " words, expected ",
-                    2 * kCodecEarlyStages * head_size);
-    }
-    const at::Tensor basis_pool = basis_pool_host.to(query.device(), /*non_blocking=*/false);
     // The device reads the pool as one DataCopy of whole 32-byte bursts.
     TORCH_CHECK(basis_pool_words * 4 % static_cast<std::int64_t>(kGmBurstBytes) == 0, op,
                 ": the basis codec pool is ",
                 basis_pool_words * 4, " bytes, not a whole number of ", kGmBurstBytes,
                 "-byte bursts");
+    const at::Tensor basis_pool = cached_constant(
+        CachedConstant::kBasisPool, head_size, query.device(), [&] {
+            at::Tensor host = at::zeros({basis_pool_words}, at::TensorOptions().dtype(at::kInt));
+            std::int32_t *words = host.data_ptr<std::int32_t>();
+            std::int64_t at_word = 0;
+            for (std::int64_t stage = 0; stage < kCodecEarlyStages; ++stage) {
+                const std::int64_t stride = std::int64_t{1} << stage;
+                // The butterfly's sign diagonal for this stage: +1 on the low index of each
+                // pair, -1 on the high one, so `x[i] = x[i ^ stride] + sign * x[i]` is a + b
+                // and a - b.
+                for (std::int64_t i = 0; i < head_size; ++i) {
+                    const float sign = (i & stride) == 0 ? 1.0f : -1.0f;
+                    std::memcpy(&words[at_word + i], &sign, sizeof(float));
+                }
+                at_word += head_size;
+                // The partner index as a BYTE offset, the unit Gather's srcOffset takes.
+                for (std::int64_t i = 0; i < head_size; ++i)
+                    words[at_word + i] = static_cast<std::int32_t>((i ^ stride) * sizeof(float));
+                at_word += head_size;
+            }
+            TORCH_CHECK(at_word == 2 * kCodecEarlyStages * head_size, op,
+                        ": the basis pool's early-stage span is ", at_word, " words, expected ",
+                        2 * kCodecEarlyStages * head_size);
+            return host.to(query.device(), /*non_blocking=*/false);
+        });
     check_burst_aligned(basis_pool, op, "basis codec pool");
 
     // ---- the decode codec's constant pool ------------------------------------
@@ -787,12 +904,20 @@ void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Te
     // nothing reads it, so switching the mode -- or turning GATHER_LUT on, which
     // is a template argument away -- would turn this into a null dereference on
     // the device, which surfaces as an AIV fault with no line attached to it.
-    // kMinBurstBytes of zeros costs one small allocation per launch and removes
-    // that edge; the operator's own fixture does the same thing
-    // (`modes.Upload(std::vector<std::uint32_t>(8, 0))` in
+    // kMinBurstBytes of zeros removes that edge; the operator's own fixture does
+    // the same thing (`modes.Upload(std::vector<std::uint32_t>(8, 0))` in
     // tests/npu/test_fused_decode_e2e.cpp).
+    //
+    // Cached rather than allocated per launch, for the same reason the basis
+    // pool is: it is a constant, and a zero-fill allocation inside a region that
+    // has to be capturable is an allocation the graph's pool has to serve. Its
+    // head_size slot is 0 because the buffer does not depend on one; the enum
+    // tag is what keeps that from colliding with a basis pool.
     const at::Tensor mode_tables =
-        at::zeros({static_cast<std::int64_t>(layout::kMinBurstBytes) / 4}, query.options().dtype(at::kInt));
+        cached_constant(CachedConstant::kModeTables, /*head_size=*/0, query.device(), [&] {
+            return at::zeros({static_cast<std::int64_t>(layout::kMinBurstBytes) / 4},
+                             query.options().dtype(at::kInt));
+        });
 
     // BF16 ONLY, checked rather than mapped. The audited fused decode carries a
     // single pair of template instantiations -- `..._kv4fp8_bf16` and
@@ -813,8 +938,8 @@ void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Te
         static_cast<std::uint32_t>(grid), query.data_ptr(), pi_signs.data_ptr(), basis_pool.data_ptr(),
         h16.data_ptr(), gate.has_value() ? gate->data_ptr() : nullptr, query_rot.data_ptr(),
         key_cache.data_ptr(), value_cache.data_ptr(), scale_cache.data_ptr(), block_tables.data_ptr(),
-        context_lens_device.data_ptr(), mode_tables.data_ptr(), workspace.data_ptr(), output.data_ptr(),
-        tiling_device.data_ptr(), static_cast<std::uint32_t>(num_tokens),
+        context_lens.data_ptr(), mode_tables.data_ptr(), workspace.data_ptr(), output.data_ptr(),
+        tiling.data_ptr(), static_cast<std::uint32_t>(num_tokens),
         static_cast<std::uint32_t>(num_heads), static_cast<std::uint32_t>(num_kv_heads),
         static_cast<std::uint32_t>(head_size), static_cast<std::uint32_t>(block_size),
         static_cast<std::uint32_t>(max_blocks_per_seq), static_cast<std::uint32_t>(num_splits),
@@ -823,6 +948,105 @@ void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Te
         static_cast<std::uint32_t>(prologue_vectors_per_block),
         static_cast<std::uint32_t>(prologue_cube_chunk_vectors), static_cast<std::uint32_t>(output_stage),
         layout::kFusedContextLimit, static_cast<float>(scale), static_cast<float>(inv_sqrt_len));
+}
+
+// ---------------------------------------------------------------------------
+// 4. The decode tiling descriptors
+// ---------------------------------------------------------------------------
+
+// Fill the fused decode's tiling buffer for one step, for every layer at once.
+//
+// WHY THIS IS AN OPERATOR. The descriptors used to be built inside
+// npu_turboquant_fused_decode, which meant two things that had to end. They
+// were built once per LAYER although they are a function of the batch alone, so
+// a sixty-layer model did the same host loop and the same host-to-device copy
+// sixty times per decode step. And building them there required reading the
+// context lengths on the host from inside the launch, which is illegal on a
+// capturing stream (107030) -- the single hardest of the four blockers in
+// TURBOQUANT_GRAPH_CAPTURE_RFC.md §1.2.
+//
+// Making it an op rather than reimplementing build_decode_tiling in Python is
+// the whole point: `build_decode_tiling` stays the one authority on what a
+// descriptor word means. Python supplies the geometry and a buffer, and derives
+// no descriptor. The sizes it does derive are checked here.
+//
+// `context_lens` is HOST-VISIBLE on purpose and is the one host tensor left in
+// the TurboQuant path. It is read by `build_decode_tiling`, which is host C++,
+// and the metadata builder already has these lengths on the host -- vLLM's
+// metadata keeps the CPU mirror deliberately. This op runs once per step from
+// the metadata builder, OUTSIDE any capture, and the graph replays over the
+// buffer it fills; a captured launch never calls it. That is why a host tensor
+// here is not the thing the RFC removed: what it removed was the host read
+// *inside* the launch.
+//
+// A device-side builder kernel -- which would remove this host work and this
+// copy as well -- is rung 5 of the ladder and deliberately not here: it needs a
+// new kernel translation unit and a CAModel gate against this function as its
+// oracle.
+void npu_turboquant_build_decode_tiling(at::Tensor &context_lens, at::Tensor &tiling, int64_t num_heads,
+                                        int64_t num_kv_heads, int64_t head_size, int64_t block_size,
+                                        int64_t max_blocks, int64_t num_splits, int64_t heads_per_task)
+{
+    constexpr const char *op = "npu_turboquant_build_decode_tiling";
+
+    TORCH_CHECK(context_lens.scalar_type() == at::kInt && context_lens.dim() == 1 &&
+                    context_lens.is_contiguous(),
+                op, ": context_lens must be a contiguous 1-D int32 tensor, got ",
+                context_lens.scalar_type(), " ", context_lens.sizes());
+    TORCH_CHECK(context_lens.device().is_cpu(), op, ": context_lens must be on the host, got ",
+                context_lens.device(),
+                ". build_decode_tiling is host C++ and reads these values directly; a device "
+                "tensor here would mean a device-to-host copy, which is what this op exists to "
+                "stop happening inside the launch.");
+    TORCH_CHECK(tiling.scalar_type() == at::kInt && tiling.dim() == 1 && tiling.is_contiguous(), op,
+                ": tiling must be a contiguous 1-D int32 buffer, got ", tiling.scalar_type(), " ",
+                tiling.sizes());
+
+    const std::int64_t num_tokens = context_lens.size(0);
+    TORCH_CHECK(num_tokens > 0, op, ": nothing to describe");
+    TORCH_CHECK(num_kv_heads > 0 && num_heads > 0 && num_heads % num_kv_heads == 0, op,
+                ": num_heads (", num_heads, ") must be a positive multiple of num_kv_heads (",
+                num_kv_heads, ")");
+    TORCH_CHECK(num_splits > 0 && num_splits <= kDecodeMaxSplits, op, ": num_splits must be 1..",
+                kDecodeMaxSplits, ", got ", num_splits);
+
+    tiling::DecodeTilingRequest request = decode_request(num_tokens, num_heads, num_kv_heads, head_size,
+                                                         block_size, max_blocks, num_splits, heads_per_task);
+    const tiling::DecodeLaunchSplit split =
+        tiling::decode_launch_split(request, static_cast<std::uint32_t>(kDecodeMaxGrid));
+    TORCH_CHECK(split.tasks > 0, op, ": nothing to describe");
+    request.grid = split.grid;
+    request.tasks_per_block = split.tasks_per_block;
+    request.reduce_tasks_per_block = split.reduce_tasks_per_block;
+
+    const std::int64_t words =
+        static_cast<std::int64_t>(tiling::decode_tiling_words(request.tokens, request.splits, request.grid));
+    TORCH_CHECK(tiling.numel() >= words, op, ": tiling holds ", tiling.numel(),
+                " int32 words; ", num_tokens, " tokens x ", num_splits, " splits with grid ",
+                request.grid, " needs ", words);
+
+    // Staged on the host and copied once. `build_decode_tiling` writes 64-byte
+    // descriptors by offset and zeroes the whole buffer first, so it needs a
+    // 64-byte-aligned host base -- which is why this is not a write straight
+    // into a pinned view of the caller's buffer. Torch's CPU allocator gives
+    // 64 bytes; the check is here because nothing else would say so.
+    const at::Tensor host = at::empty({words}, at::TensorOptions().dtype(at::kInt));
+    TORCH_CHECK(reinterpret_cast<std::uintptr_t>(host.data_ptr()) %
+                        alignof(tiling::TurboQuantDecodeTilingData) ==
+                    0,
+                op, ": the host staging buffer is not ",
+                alignof(tiling::TurboQuantDecodeTilingData), "-byte aligned");
+
+    const tiling::DecodeTilingStatus status = tiling::build_decode_tiling(
+        request, static_cast<const std::int32_t *>(context_lens.data_ptr()),
+        /*block_table=*/nullptr, host.data_ptr());
+    TORCH_CHECK(status == tiling::DecodeTilingStatus::kOk, op, ": ",
+                tiling::decode_tiling_status_text(status));
+
+    // Only the prefix this launch describes. The tail of an upper-bound-sized
+    // buffer is never read: the device computes the dispatch records' base from
+    // `tokens * splits`, exactly as decode_dispatch_word_base does.
+    tiling.narrow(0, 0, words).copy_(host, /*non_blocking=*/false);
 }
 
 // ---------------------------------------------------------------------------
@@ -853,8 +1077,17 @@ void npu_turboquant_reshape_scatter_aiv_meta(at::Tensor &, at::Tensor &, at::Ten
 
 void npu_turboquant_fused_decode_meta(at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &,
                                       const std::optional<at::Tensor> &, at::Tensor &, at::Tensor &,
-                                      at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, int64_t,
-                                      int64_t, int64_t, int64_t, int64_t, double, double)
+                                      at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &,
+                                      at::Tensor &, at::Tensor &, int64_t, int64_t, int64_t, int64_t,
+                                      int64_t, double, double)
+{
+}
+
+// The tiling builder's meta kernel must NOT call build_decode_tiling either:
+// under FakeTensor there is no storage behind `context_lens` to read, and the
+// buffer it would write has no storage to write to.
+void npu_turboquant_build_decode_tiling_meta(at::Tensor &, at::Tensor &, int64_t, int64_t, int64_t,
+                                             int64_t, int64_t, int64_t, int64_t)
 {
 }
 
@@ -922,18 +1155,61 @@ TORCH_LIBRARY_FRAGMENT(turboquant_ops, ops)
     //              the device slot it used to fill is the basis codec's constant
     //              pool, which this op builds itself; h16 the 16x16 fp16 +-1 matrix
     // gate         read only at output_stage 2
+    // context_lens int32 ON THE QUERY'S DEVICE. Refused on the host: the op used
+    //              to copy whichever way the caller's tensor pointed, once per
+    //              layer per step, and that copy is illegal on a capturing
+    //              stream. Pass AscendTurboQuantMetadata.turboquant_context_lens.
+    // tiling       int32, >= decode_tiling_words(tokens, splits, grid) where grid
+    //              is tiling::decode_launch_split's. Filled by
+    //              npu_turboquant_build_decode_tiling once per step, for every
+    //              layer; read-only here.
+    // workspace    fp32[tokens * heads * splits * (head_size + kPartialTail)],
+    //              the Split-K partials. query_rot fp32[tokens * heads *
+    //              head_size], the rotated query image the prologue writes and
+    //              the decode reads -- it is not `query`.
     // output_stage TurboQuantOutputStage: 0 rotated basis, 1 unrotated, 2 gated
-    // The tiling descriptors, the Split-K workspace, the fp32 rotated query
-    // image and the codec's mode_tables are built inside the op, not passed:
-    // each is derived from this geometry and a caller that got one wrong would
-    // hang rather than fail.
+    //
+    // THE THREE BUFFERS ARE THE CALLER'S NOW. They were allocated inside the
+    // launch, which gave each a fresh address every step; a captured ACL graph
+    // replays the address it recorded. The op still derives every size and
+    // checks what it was handed, so a caller that got one wrong gets a named
+    // refusal rather than an out-of-bounds device read. What remains the op's
+    // own are the two codec constant pools, which are pure functions of
+    // head_size and are cached for the process.
     ops.def(
         "npu_turboquant_fused_decode(Tensor query, Tensor pi_signs, Tensor rot_tables, Tensor h16, "
         "Tensor? gate, Tensor key_cache, Tensor value_cache, Tensor scale_cache, Tensor block_tables, "
-        "Tensor context_lens, Tensor! output, int num_heads, int num_kv_heads, int num_splits, "
+        "Tensor context_lens, Tensor tiling, Tensor! workspace, Tensor! query_rot, Tensor! output, "
+        "int num_heads, int num_kv_heads, int num_splits, "
         "int heads_per_task, int output_stage, float scale, float inv_sqrt_len) -> ()");
     ops.impl("npu_turboquant_fused_decode", c10::kPrivateUse1,
              &vllm_ascend::turboquant_bindings::npu_turboquant_fused_decode);
     ops.impl("npu_turboquant_fused_decode", c10::kMeta,
              &vllm_ascend::turboquant_bindings::meta::npu_turboquant_fused_decode_meta);
+
+    // context_lens int32 ON THE HOST, [tokens]. The one host tensor left in the
+    //              TurboQuant path, and it is read by host C++
+    //              (build_decode_tiling) from outside any capture -- this op
+    //              runs once per step in the metadata builder, never inside a
+    //              captured launch.
+    // tiling       int32, >= decode_tiling_words(...). Sized by the caller from
+    //              turboquant_tiling_upper_bound_words, which is why the check
+    //              is >= and not ==.
+    //
+    // Registered for both device keys and with one implementation, because the
+    // dispatch key is not a property of the work: it is host arithmetic plus one
+    // copy, and the only device thing about it is where `tiling` lives. In
+    // service that is the NPU, so the key computed from the argument list is
+    // PrivateUse1; in a device-free test both tensors are on the host and it is
+    // CPU. Same function either way.
+    ops.def(
+        "npu_turboquant_build_decode_tiling(Tensor context_lens, Tensor! tiling, int num_heads, "
+        "int num_kv_heads, int head_size, int block_size, int max_blocks, int num_splits, "
+        "int heads_per_task) -> ()");
+    ops.impl("npu_turboquant_build_decode_tiling", c10::kPrivateUse1,
+             &vllm_ascend::turboquant_bindings::npu_turboquant_build_decode_tiling);
+    ops.impl("npu_turboquant_build_decode_tiling", c10::kCPU,
+             &vllm_ascend::turboquant_bindings::npu_turboquant_build_decode_tiling);
+    ops.impl("npu_turboquant_build_decode_tiling", c10::kMeta,
+             &vllm_ascend::turboquant_bindings::meta::npu_turboquant_build_decode_tiling_meta);
 }

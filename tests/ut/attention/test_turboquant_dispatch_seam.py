@@ -28,7 +28,10 @@ import torch
 
 from vllm_ascend.attention import turboquant_dry_run
 from vllm_ascend.attention.turboquant_dry_run import (
+    TURBOQUANT_DECODE_MAX_SPLITS,
     TURBOQUANT_DECODE_SPLITS,
+    TURBOQUANT_KERNEL_OPS,
+    TURBOQUANT_OP_BUILD_DECODE_TILING,
     TURBOQUANT_OP_FUSED_DECODE,
     TURBOQUANT_OP_GATHER_PAGES,
     TURBOQUANT_OP_QUANTIZE_PACK,
@@ -50,7 +53,10 @@ from vllm_ascend.attention.turboquant_dry_run import (
     TurboQuantValueLayout,
     _is_op_registered,
     load_turboquant_extension,
+    turboquant_decode_query_rot_floats,
+    turboquant_decode_workspace_floats,
     turboquant_plan_strip_ingestion,
+    turboquant_tiling_upper_bound_words,
 )
 from vllm_ascend.attention.turboquant_layout import (
     TURBOQUANT_KEY_PLANE,
@@ -794,6 +800,28 @@ def test_gather_dispatches_to_the_kernel(monkeypatch: pytest.MonkeyPatch) -> Non
 # ---------------------------------------------------------------------------
 
 
+def _launch_buffers(tokens: int, num_heads: int, head_size: int = HEAD_SIZE) -> dict[str, torch.Tensor]:
+    """The three buffers the fused decode takes as inputs.
+
+    They belong to AscendTurboQuantMetadataBuilder in service; a test supplies
+    its own. None of them has a default on the adapter, deliberately: an
+    unfilled tiling buffer is all zeros, which the kernel reads as "every worker
+    has no work" and returns from having written nothing.
+    """
+    splits = TURBOQUANT_DECODE_SPLITS
+    return {
+        "tiling": torch.zeros(
+            turboquant_tiling_upper_bound_words(tokens, TURBOQUANT_DECODE_MAX_SPLITS), dtype=torch.int32
+        ),
+        "workspace": torch.zeros(
+            turboquant_decode_workspace_floats(tokens, num_heads, head_size, splits), dtype=torch.float32
+        ),
+        "query_rot": torch.zeros(
+            turboquant_decode_query_rot_floats(tokens, num_heads, head_size), dtype=torch.float32
+        ),
+    }
+
+
 def _fused_decode(adapter: TurboQuantOpsAdapter, emulator: TurboQuantEmulator) -> torch.Tensor | None:
     caches = _caches()
     return adapter.fused_decode(
@@ -808,6 +836,7 @@ def _fused_decode(adapter: TurboQuantOpsAdapter, emulator: TurboQuantEmulator) -
         num_kv_heads=NUM_KV_HEADS,
         scale=0.125,
         output=torch.zeros(1, 2, HEAD_SIZE),
+        **_launch_buffers(1, 2),
     )
 
 
@@ -845,6 +874,7 @@ def test_fused_decode_launches_and_returns_its_output(
         num_kv_heads=NUM_KV_HEADS,
         scale=0.125,
         output=output,
+        **_launch_buffers(1, 2),
     )
     assert returned is output
     assert len(entry.calls) == 1
@@ -853,11 +883,13 @@ def test_fused_decode_launches_and_returns_its_output(
 def test_fused_decode_passes_the_schema_the_binding_declares(
     monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
 ) -> None:
-    """The 18 arguments of npu_turboquant_fused_decode, in the schema's order.
+    """The 21 arguments of npu_turboquant_fused_decode, in the schema's order.
 
-    The mode, the element type, the host tiling descriptors, the Split-K
-    workspace and the fp32 rotated query image are all the binding's: the schema
-    does not take them, so none of them appears here.
+    The mode, the element type and the two codec constant pools are the
+    binding's, so none of them appears here. The tiling descriptors, the Split-K
+    workspace and the fp32 rotated query image used to be as well and are
+    arguments now: a buffer the op allocates has a fresh address every step, and
+    a captured ACL graph replays the address it recorded.
     """
     entry = _Recorder()
     _register(monkeypatch, npu_turboquant_fused_decode=entry)
@@ -866,6 +898,7 @@ def test_fused_decode_passes_the_schema_the_binding_declares(
     output = torch.zeros_like(query)
     block_tables = torch.zeros(1, 3, dtype=torch.int32)
     context_lens = torch.ones(1, dtype=torch.int32)
+    buffers = _launch_buffers(1, 12)
 
     _adapter(TurboQuantKernelStage.DECODE).fused_decode(
         query=query,
@@ -879,10 +912,11 @@ def test_fused_decode_passes_the_schema_the_binding_declares(
         num_kv_heads=NUM_KV_HEADS,
         scale=0.125,
         output=output,
+        **buffers,
     )
 
     args = entry.args
-    assert len(args) == 18
+    assert len(args) == 21
     assert args[0] is query
     assert torch.equal(args[1], emulator.pi_signs)
     assert args[2].dtype is TURBOQUANT_TABLE_DTYPE  # rot_tables: the same BF16 blob
@@ -893,11 +927,13 @@ def test_fused_decode_passes_the_schema_the_binding_declares(
     assert args[3].shape == (16, 16) and args[3].dtype is torch.float16  # h16
     assert args[4] is None  # gate, read only at output_stage 2
     assert (args[5], args[6], args[7]) == caches
-    assert (args[8], args[9], args[10]) == (block_tables, context_lens, output)
+    assert (args[8], args[9]) == (block_tables, context_lens)
+    assert (args[10], args[11], args[12]) == (buffers["tiling"], buffers["workspace"], buffers["query_rot"])
+    assert args[13] is output
     # num_heads, num_kv_heads, num_splits, heads_per_task, output_stage
-    assert args[11:16] == (12, NUM_KV_HEADS, TURBOQUANT_DECODE_SPLITS, 6, TURBOQUANT_STAGE_UNROTATED)
-    assert args[16] == pytest.approx(0.125)
-    assert args[17] == pytest.approx(emulator.inv_sqrt_len)
+    assert args[14:19] == (12, NUM_KV_HEADS, TURBOQUANT_DECODE_SPLITS, 6, TURBOQUANT_STAGE_UNROTATED)
+    assert args[19] == pytest.approx(0.125)
+    assert args[20] == pytest.approx(emulator.inv_sqrt_len)
 
 
 # ---------------------------------------------------------------------------
@@ -1074,13 +1110,22 @@ def test_a_fully_registered_namespace_is_quiet(
 
 
 def test_every_reported_operator_is_one_the_bindings_declare() -> None:
-    """``TURBOQUANT_REGISTERED_OPS`` must not drift from the three real schemas."""
+    """``TURBOQUANT_REGISTERED_OPS`` must not drift from the real schemas.
+
+    Four, and only three of them are stage-gated.
+    ``npu_turboquant_build_decode_tiling`` is not an alternative to a golden
+    model -- it is the fused decode's own descriptor builder, registered with
+    the decode and absent with it -- so it has no entry in
+    ``TURBOQUANT_KERNEL_OPS`` and is not in ``ALL_OPS``.
+    """
     assert set(TURBOQUANT_REGISTERED_OPS) == {
         TURBOQUANT_OP_RESHAPE_AND_CACHE,
         TURBOQUANT_OP_RESHAPE_SCATTER,
         TURBOQUANT_OP_FUSED_DECODE,
+        TURBOQUANT_OP_BUILD_DECODE_TILING,
     }
-    assert set(TURBOQUANT_REGISTERED_OPS) <= set(ALL_OPS)
+    assert set(ALL_OPS) == set(TURBOQUANT_KERNEL_OPS)
+    assert set(TURBOQUANT_REGISTERED_OPS) - set(ALL_OPS) == {TURBOQUANT_OP_BUILD_DECODE_TILING}
 
 
 # ---------------------------------------------------------------------------

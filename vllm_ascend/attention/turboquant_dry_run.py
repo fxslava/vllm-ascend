@@ -452,6 +452,7 @@ class TurboQuantEmulator:
         if self.pi_signs.numel() != head_size:
             raise ValueError(f"pi_signs has {self.pi_signs.numel()} entries, expected {head_size}")
         self._rotation: torch.Tensor | None = None
+        self._codec_tables: torch.Tensor | None = None
 
     # -- the rotation ------------------------------------------------------
 
@@ -473,6 +474,32 @@ class TurboQuantEmulator:
             outer = torch.kron(h_outer, eye_group)  # H_{D/32} (x) I_32
             self._rotation = outer @ torch.diag(self.pi_signs) @ inner
         return self._rotation
+
+    # -- the Cube's resident operands --------------------------------------
+    #
+    # Both are pure functions of the head size, and both used to be rebuilt on
+    # every launch of every layer -- eleven device kernels and two allocations
+    # per layer per decode step, inside what has to become a capturable region.
+    # They are cached here rather than on the layer because the ops adapter has
+    # no layer to read: `_ensure_statics` publishes these same objects as
+    # `layer._turboquant_codec_tables` and `layer._turboquant_h16`, so a layer
+    # dump and a launch cannot disagree about what rotated the cache.
+
+    @property
+    def codec_tables(self) -> torch.Tensor:
+        """The Cube's resident BF16 rotation operand, built once per emulator."""
+        if self._codec_tables is None:
+            self._codec_tables = _build_codec_tables(self)
+        return self._codec_tables
+
+    @property
+    def h16(self) -> torch.Tensor:
+        """The Cube's resident ``[16, 16]`` fp16 sign matrix.
+
+        Held in the module-level cache rather than on the instance: it depends
+        on the device alone, so two head sizes of a hybrid model share one.
+        """
+        return _h16_operand(self.device)
 
     def rotate(self, x: torch.Tensor) -> torch.Tensor:
         """``y = Pi x`` over the last axis, unnormalised, in fp32.
@@ -652,6 +679,7 @@ TURBOQUANT_OP_RESHAPE_AND_CACHE: Final[str] = "npu_turboquant_reshape_and_cache_
 TURBOQUANT_OP_RESHAPE_SCATTER: Final[str] = "npu_turboquant_reshape_scatter_aiv"
 TURBOQUANT_OP_GATHER_PAGES: Final[str] = "npu_turboquant_gather_pages"
 TURBOQUANT_OP_FUSED_DECODE: Final[str] = "npu_turboquant_fused_decode"
+TURBOQUANT_OP_BUILD_DECODE_TILING: Final[str] = "npu_turboquant_build_decode_tiling"
 
 # Which stage switch gates each entry point. The two ingestion entries are
 # gated apart because they are two kernels: the batch writer owns whole
@@ -689,16 +717,93 @@ TURBOQUANT_DECODE_MAX_HEADS_PER_TASK: Final[int] = 16
 
 
 # ---------------------------------------------------------------------------
+# The decode's buffer geometry
+# ---------------------------------------------------------------------------
+#
+# Mirrors op_host/turboquant_tiling.h and op_kernel/common/turboquant_layout.h.
+# The authority is C++ -- the device reads the descriptor words by offset and
+# nothing in the toolchain diagnoses two sides disagreeing about which word is
+# which -- so none of this computes a descriptor. It computes *sizes*, which is
+# the one thing the caller has to know now that the buffers are its own, and the
+# op re-derives every size and ``TORCH_CHECK``s what it was handed. These
+# constants exist so a Python caller can size a buffer without a C++ call; the
+# op refusing an undersized buffer is what makes a drift here an error rather
+# than an out-of-bounds read.
+
+# ``sizeof(TurboQuantDecodeTilingData) / 4`` and
+# ``sizeof(TurboQuantDecodeDispatch) / 4``.
+TURBOQUANT_DECODE_TILING_WORDS: Final[int] = 16
+TURBOQUANT_DECODE_DISPATCH_WORDS: Final[int] = 8
+
+# ``kDecodeMaxGrid`` and ``kDecodeMaxSplits`` in
+# csrc/attention/turboquant/torch_bindings.cpp.
+TURBOQUANT_DECODE_MAX_GRID: Final[int] = 32
+TURBOQUANT_DECODE_MAX_SPLITS: Final[int] = 8
+
+# ``kPartialTail = 2 * kFp32PerBlock``: the running max and running sum lanes a
+# Split-K partial carries past its ``head_size`` accumulator.
+TURBOQUANT_PARTIAL_TAIL: Final[int] = 16
+
+
+def turboquant_decode_heads_per_task(num_heads: int, num_kv_heads: int) -> int:
+    """``heads_per_task`` for one launch, derived in exactly one place.
+
+    The op clamps this again and the tiling builder clamps it a third time
+    (``build_decode_tiling``), so the three agreeing is what makes the
+    descriptor's ``chunks_per_group`` describe the work the launch actually
+    splits into. Deriving it twice from the same formula is how they agree.
+    """
+    group_heads = num_heads // num_kv_heads if num_kv_heads else num_heads
+    return min(TURBOQUANT_DECODE_MAX_HEADS_PER_TASK, max(group_heads, 1))
+
+
+def turboquant_decode_tiling_words(tokens: int, num_splits: int, grid: int) -> int:
+    """``decode_tiling_words(tokens, splits, grid)``: descriptors then dispatch."""
+    return tokens * num_splits * TURBOQUANT_DECODE_TILING_WORDS + grid * TURBOQUANT_DECODE_DISPATCH_WORDS
+
+
+def turboquant_tiling_upper_bound_words(max_num_reqs: int, max_splits: int) -> int:
+    """The largest tiling buffer any launch of up to ``max_num_reqs`` can need.
+
+    The exact size depends on ``grid``, which is the op's own derivation from
+    the task count. Sizing to the bound instead removes the need for Python to
+    reproduce that derivation at all: ``grid`` is capped at
+    :data:`TURBOQUANT_DECODE_MAX_GRID`, so the dispatch half has a constant
+    bound and the descriptor half is linear in the request count. The cost is
+    ``kDecodeMaxGrid * 8`` words -- 1 KiB -- of slack, which buys one buffer for
+    every capture size instead of one per size.
+    """
+    return turboquant_decode_tiling_words(max_num_reqs, max_splits, TURBOQUANT_DECODE_MAX_GRID)
+
+
+def turboquant_decode_workspace_floats(tokens: int, num_heads: int, head_size: int, num_splits: int) -> int:
+    """The Split-K partial workspace, as ``TurboQuantPartialReducer`` addresses it."""
+    return tokens * num_heads * num_splits * (head_size + TURBOQUANT_PARTIAL_TAIL)
+
+
+def turboquant_decode_query_rot_floats(tokens: int, num_heads: int, head_size: int) -> int:
+    """The fp32 rotated query image the basis prologue writes."""
+    return tokens * num_heads * head_size
+
+
+# ---------------------------------------------------------------------------
 # Loading the translation unit that carries the registrations.
 # ---------------------------------------------------------------------------
 
-# The three the fragment in csrc/attention/turboquant/torch_bindings.cpp
+# The four the fragment in csrc/attention/turboquant/torch_bindings.cpp
 # registers. The other four entry points above have no kernel behind them yet,
 # so their absence is not worth reporting.
+#
+# BUILD_DECODE_TILING is not in TURBOQUANT_KERNEL_OPS and has no stage switch:
+# it is not an alternative to a golden model, it is the fused decode's own
+# descriptor builder. It is registered with the decode and absent with it, so
+# the metadata builder treats its absence as "there is no decode to describe"
+# rather than as a fallback.
 TURBOQUANT_REGISTERED_OPS: Final[tuple[str, ...]] = (
     TURBOQUANT_OP_RESHAPE_AND_CACHE,
     TURBOQUANT_OP_RESHAPE_SCATTER,
     TURBOQUANT_OP_FUSED_DECODE,
+    TURBOQUANT_OP_BUILD_DECODE_TILING,
 )
 
 # Tri-state so the import is attempted once per process: True it landed, False
@@ -1611,6 +1716,9 @@ class TurboQuantOpsAdapter:
         num_kv_heads: int,
         scale: float,
         output: torch.Tensor,
+        tiling: torch.Tensor,
+        workspace: torch.Tensor,
+        query_rot: torch.Tensor,
     ) -> torch.Tensor | None:
         """The one-launch decode, or ``None`` when it did not run.
 
@@ -1618,26 +1726,43 @@ class TurboQuantOpsAdapter:
         element type. ``None`` is the caller's signal to gather, dequantise and
         attend instead: that fallback is a whole attention rather than one
         operation, so it lives in the backend.
+
+        ``tiling``, ``workspace`` and ``query_rot`` are the three buffers the op
+        used to allocate inside its own launch and now takes as inputs. They
+        belong to the metadata builder
+        (:class:`AscendTurboQuantMetadataBuilder`), which sizes them once from
+        the maximum geometry and refills ``tiling`` once per step for every
+        layer.
+
+        **All three are required, and none has a default.** A default would have
+        to be a buffer allocated here, and for ``tiling`` that is the worst
+        available failure mode: an unfilled tiling buffer is all zeros, every
+        descriptor reads ``num_tiles == 0``, and the kernel skips every worker
+        and returns having written nothing. The decode would report success over
+        an untouched output. So a caller without them is a programming error and
+        says so.
         """
         if not self._has_kernel(TURBOQUANT_OP_FUSED_DECODE):
             return None
-        group_heads = num_heads // num_kv_heads if num_kv_heads else num_heads
         return self._kernel_fused_decode(
             query=query,
             pi_signs=emulator.pi_signs,
-            rot_tables=_codec_tables(emulator),
-            h16=_h16_operand(emulator.device),
+            rot_tables=emulator.codec_tables,
+            h16=emulator.h16,
             gate=None,
             key_cache=key_cache,
             value_cache=value_cache,
             scale_cache=scale_cache,
             block_tables=block_tables,
             context_lens=context_lens,
+            tiling=tiling,
+            workspace=workspace,
+            query_rot=query_rot,
             output=output,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             num_splits=TURBOQUANT_DECODE_SPLITS,
-            heads_per_task=min(TURBOQUANT_DECODE_MAX_HEADS_PER_TASK, max(group_heads, 1)),
+            heads_per_task=turboquant_decode_heads_per_task(num_heads, num_kv_heads),
             output_stage=TURBOQUANT_STAGE_UNROTATED,
             scale=scale,
             inv_sqrt_len=emulator.inv_sqrt_len,
@@ -1655,6 +1780,9 @@ class TurboQuantOpsAdapter:
         scale_cache: torch.Tensor,
         block_tables: torch.Tensor,
         context_lens: torch.Tensor,
+        tiling: torch.Tensor,
+        workspace: torch.Tensor,
+        query_rot: torch.Tensor,
         output: torch.Tensor,
         num_heads: int,
         num_kv_heads: int,
@@ -1687,17 +1815,32 @@ class TurboQuantOpsAdapter:
         refuses a non-bf16 query outright and passes ``AscendType::BF16``
         unconditionally (:data:`TURBOQUANT_KERNEL_DTYPE`).
 
-        The remaining four are allocated and filled in
-        csrc/attention/turboquant/torch_bindings.cpp, because each is derived
-        from the launch geometry and a caller that got one wrong would get a hang
-        rather than an error:
+        THREE OF THEM USED TO BE, and are arguments now, because a buffer the op
+        allocates has a fresh address on every launch and a captured ACL graph
+        replays the address it saw:
 
-        * the host tiling descriptors, from ``build_decode_tiling``;
-        * the Split-K workspace,
-          ``tokens * heads * splits * (D + kPartialTail)`` fp32;
+        * ``tiling``, ``decode_tiling_words(tokens, splits, grid)`` int32 of
+          descriptors. Built by ``build_decode_tiling`` as before, but once per
+          *step* for every layer rather than once per layer, through
+          ``npu_turboquant_build_decode_tiling``. The op reads it and checks its
+          size; it no longer reads the context lengths on the host at all.
+        * ``workspace``, the Split-K partials,
+          ``tokens * heads * splits * (D + kPartialTail)`` fp32.
         * ``query_rot``, the fp32 rotated query image the prologue writes and the
           decode then reads -- it is not ``query`` and the two are not
-          interchangeable;
+          interchangeable.
+
+        Each is sized from the launch geometry, so the op still owns the
+        arithmetic: it derives the sizes and ``TORCH_CHECK``s what it was given
+        rather than trusting the caller. An undersized ``tiling`` was previously
+        impossible and is now the one new failure mode, which is why it is a
+        named check and not a hang.
+
+        What remains the binding's, and is now a function-local static keyed by
+        ``(head_size, device_index)`` rather than a per-launch build:
+
+        * the query basis codec's constant pool, a pure function of
+          ``head_size``;
         * ``mode_tables``, the decode codec's own constant pool. It is a required
           positional argument of the launcher, and for ``KV4_FP8`` it is never
           dereferenced: ``ConstTableWords`` returns 0 for an affine mode with the
@@ -1740,6 +1883,9 @@ class TurboQuantOpsAdapter:
             scale_cache,
             block_tables,
             context_lens,
+            tiling,
+            workspace,
+            query_rot,
             output,
             num_heads,
             num_kv_heads,
@@ -1977,7 +2123,23 @@ def _require_contiguous(cache: torch.Tensor, name: str) -> torch.Tensor:
 
 
 def _codec_tables(emulator: TurboQuantEmulator) -> torch.Tensor:
-    """The Cube's resident rotation operand, ``2 * (D/32)`` row-major 32x32 BF16 blocks.
+    """The Cube's resident rotation operand for ``emulator``, built once.
+
+    A thin accessor over :attr:`TurboQuantEmulator.codec_tables`, kept as a free
+    function because that is how the fixtures and the rotate stubs reach it. The
+    operand it returns is documented on :func:`_build_codec_tables`.
+
+    **It is a cache, and that is load-bearing.** This used to build the operand
+    on every call, and ``fused_decode`` calls it once per layer per decode step:
+    eleven device kernels and two allocations inside the region an ACL graph has
+    to capture. ``emulator_for`` keys emulators by ``(head_size, device)``, so
+    one model has one of these however many layers read it.
+    """
+    return emulator.codec_tables
+
+
+def _build_codec_tables(emulator: TurboQuantEmulator) -> torch.Tensor:
+    """Build the Cube's resident rotation operand, ``2 * (D/32)`` row-major 32x32 BF16 blocks.
 
     ``tables[s * groups + g][c0][i] = (s ? -1 : +1) * pi_signs[g*32 + c0] * H32[c0][i]``:
     the sign diagonal and the inner Hadamard factor, pre-composed, with the
@@ -2031,6 +2193,12 @@ def _codec_tables(emulator: TurboQuantEmulator) -> torch.Tensor:
     )
 
 
+# One ``h16`` per device, for the process. Keyed by the device's string form
+# rather than by the object, because ``torch.device("npu")`` and
+# ``torch.device("npu", 0)`` are different objects naming one device.
+_H16_CACHE: dict[str, torch.Tensor] = {}
+
+
 def _h16_operand(device: torch.device) -> torch.Tensor:
     """The Cube's resident ``h16`` operand, a ``[16, 16]`` fp16 matrix of ``+-1``.
 
@@ -2039,8 +2207,220 @@ def _h16_operand(device: torch.device) -> torch.Tensor:
     the caller supplies the sign matrix, the AIC generates no coefficients).
     fp16 for both query element types -- the kernel converts it on ingest where
     the Cube chunk operand is not fp16.
+
+    Cached per device for the same reason :func:`_codec_tables` is: it is a
+    constant, and building it once per layer per step put ``arange``, three
+    bitwise ops, ``zeros_like`` and ``where`` inside the decode launch.
     """
-    return _sylvester_hadamard(TURBOQUANT_H16_ORDER, device, torch.float16)
+    key = str(device)
+    operand = _H16_CACHE.get(key)
+    if operand is None:
+        operand = _sylvester_hadamard(TURBOQUANT_H16_ORDER, device, torch.float16)
+        _H16_CACHE[key] = operand
+    return operand
+
+
+# ---------------------------------------------------------------------------
+# The metadata and its builder
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AscendTurboQuantMetadata(AscendMetadata):
+    """``AscendMetadata`` plus the fused decode's four per-step device operands.
+
+    All four are views into buffers :class:`AscendTurboQuantMetadataBuilder`
+    allocates once and refreshes in place, so their addresses are the same on
+    every step of a given engine. That is the property an ACL graph replay
+    needs: the replay re-executes only device work, so a Python-side refresh of
+    a *reallocated* buffer never runs again after capture.
+    """
+
+    # The step's KV lengths on the device, FIA padding rows zeroed. See
+    # :meth:`AscendTurboQuantMetadataBuilder._turboquant_context_lens` for why
+    # this is not ``seq_lens`` and not ``seq_lens_gpu``.
+    turboquant_context_lens: torch.Tensor = None  # type: ignore[assignment]
+    # The decode tiling descriptors, filled once per step for every layer.
+    turboquant_tiling: torch.Tensor = None  # type: ignore[assignment]
+    # The Split-K partial workspace and the fp32 rotated query image: pure
+    # kernel scratch, never read or written by the host.
+    turboquant_workspace: torch.Tensor = None  # type: ignore[assignment]
+    turboquant_query_rot: torch.Tensor = None  # type: ignore[assignment]
+
+
+class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
+    """The shared builder plus the fused decode's launch buffers.
+
+    **Why a builder at all.** Three of the fused decode's operands used to be
+    allocated inside its own launch, once per layer per step, and a fourth --
+    the tiling descriptors -- was *built on the host and uploaded* there too.
+    Both are per-batch quantities, not per-layer ones: on a 60-layer model one
+    decode step did the same host work and the same host-to-device copy sixty
+    times. This builder does each once, into a buffer it owns.
+
+    **Why the builder and not ``get_capture_resource``.**
+    ``vllm_ascend.compilation.updatable_graph.get_capture_resource`` is the
+    repository's mechanism for a capture-scoped buffer, and it is what
+    ``full_graph_fia`` uses for the FIA workspace. It is the right owner for a
+    buffer only the device touches, and the wrong one here, for two reasons.
+    The tiling buffer is written by the *host* before every replay, and a
+    ``get_capture_resource`` buffer is allocated during capture, owned by the
+    graph's memory pool and weak-ref'd at ``capture_end`` -- it exists so the
+    graph has a pointer, not so the host can refill it. And outside capture
+    ``get_capture_resource`` simply calls its factory
+    (``updatable_graph.py:189``), so it would keep allocating per step in the
+    mode TurboQuant is actually served in. A buffer allocated here, before any
+    capture, is strongly owned, host-writable and has one address for the
+    engine's life -- the same contract ``block_tables`` and ``seq_lens`` already
+    have.
+
+    **Why one buffer and not one per capture size.** Every size is exactly
+    computable from ``max_num_reqs``, and a step uses a prefix, so a single
+    maximum-sized allocation serves every capture size. The tiling buffer's
+    exact extent also depends on the ``grid`` the operator derives, which Python
+    deliberately does not reproduce; sizing to
+    :func:`turboquant_tiling_upper_bound_words` costs 1 KiB of slack and removes
+    that duplication.
+
+    **What is not done here.** Nothing is captured and no graph mode changes.
+    ``NPUPlatform._apply_turboquant_graph_mode`` still holds an
+    ``ENABLE_TURBOQUANT=1`` run to PIECEWISE or NONE, and still should: the
+    golden fallback paths this backend keeps are not capturable, and the cache
+    the ingestion writers produce is not the cache the fused decode reads.
+    """
+
+    metadata_cls: type[AscendMetadata] = AscendTurboQuantMetadata
+
+    def __init__(
+        self,
+        kv_cache_spec: Any,
+        layer_names: list[str],
+        vllm_config: Any,
+        device: torch.device,
+    ) -> None:
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self._max_num_reqs = int(vllm_config.scheduler_config.max_num_seqs)
+        self._num_kv_heads = int(kv_cache_spec.num_kv_heads)
+        self._head_size = int(kv_cache_spec.head_size)
+        self._block_size = int(kv_cache_spec.block_size)
+        self._num_heads = int(vllm_config.model_config.get_num_attention_heads(vllm_config.parallel_config))
+        self._num_splits = TURBOQUANT_DECODE_SPLITS
+        self._heads_per_task = turboquant_decode_heads_per_task(self._num_heads, self._num_kv_heads)
+
+        # Allocated once, at engine start, outside any capture. Every step
+        # writes a prefix of the first and the kernels write prefixes of the
+        # other two.
+        self._context_lens = torch.zeros(self._max_num_reqs, dtype=torch.int32, device=device)
+        self._tiling = torch.zeros(
+            turboquant_tiling_upper_bound_words(self._max_num_reqs, TURBOQUANT_DECODE_MAX_SPLITS),
+            dtype=torch.int32,
+            device=device,
+        )
+        self._workspace = torch.zeros(
+            turboquant_decode_workspace_floats(self._max_num_reqs, self._num_heads, self._head_size, self._num_splits),
+            dtype=torch.float32,
+            device=device,
+        )
+        self._query_rot = torch.zeros(
+            turboquant_decode_query_rot_floats(self._max_num_reqs, self._num_heads, self._head_size),
+            dtype=torch.float32,
+            device=device,
+        )
+        # A host staging buffer for the zero-padded lengths, so the per-step
+        # copy is one H2D of a contiguous int32 run rather than a scatter.
+        self._context_lens_host = torch.zeros(self._max_num_reqs, dtype=torch.int32, device="cpu")
+
+    # -- the per-step work -------------------------------------------------
+
+    def _build_backend_metadata(
+        self,
+        common_attn_metadata: Any,
+        *,
+        block_table: torch.Tensor,
+        query_lens: torch.Tensor,
+        seq_lens: torch.Tensor,
+        num_decodes: int,
+        num_prefills: int,
+    ) -> dict[str, Any]:
+        """The four extra metadata fields, once per step.
+
+        This is the shared builder's documented extension point, which is why
+        nothing in ``AscendAttentionMetadataBuilder`` changes: a non-TurboQuant
+        backend never reaches this method.
+        """
+        context_lens = self._refresh_context_lens(common_attn_metadata, seq_lens)
+        self._refresh_tiling(context_lens.numel())
+        return {
+            "turboquant_context_lens": context_lens,
+            "turboquant_tiling": self._tiling,
+            "turboquant_workspace": self._workspace,
+            "turboquant_query_rot": self._query_rot,
+        }
+
+    def _refresh_context_lens(self, common_attn_metadata: Any, seq_lens: torch.Tensor) -> torch.Tensor:
+        """The step's KV lengths on the device, with the FIA padding rows zeroed.
+
+        **This is the padded-row contract, and it is a fix for today rather than
+        only for capture.** When sequence-parallel or cudagraph padding adds a
+        dummy request, the shared builder extends ``seq_lens``/``seq_lens_list``
+        with a length of **1** and a zero block-table row
+        (``attention_v1.py:387-390``), deliberately, because FIA validates
+        ``actualSeqLengthsKv`` and refuses a zero. A length of 1 is not harmless
+        to this decode: ``build_decode_tiling`` writes a *live* descriptor for
+        it -- one tile, page 0 -- so the padded row attends over whatever block 0
+        holds and writes a nonzero result. Downstream trimming is what has been
+        hiding it.
+
+        The fused decode needs the opposite convention: a dead row must be the
+        all-zero descriptor, which is what ``num_tiles == 0`` means and is the
+        single predicate both the Cube and the Vector role branch on to skip a
+        worker. So the two views differ by exactly this: FIA keeps its ones,
+        TurboQuant gets zeros past the real request count.
+        """
+        num_reqs = int(common_attn_metadata.num_reqs)
+        padded = int(seq_lens.shape[0])
+        if padded > self._max_num_reqs:
+            raise RuntimeError(
+                f"the TurboQuant builder was sized for {self._max_num_reqs} requests but this step "
+                f"carries {padded}. max_num_seqs is what sizes the launch buffers."
+            )
+        live = min(num_reqs, padded)
+        host = self._context_lens_host
+        host[:live] = seq_lens[:live].to(torch.int32)
+        if padded > live:
+            # The FIA dummy requests. Zero, not one: see the docstring.
+            host[live:padded] = 0
+        self._context_lens[:padded].copy_(host[:padded], non_blocking=True)
+        return self._context_lens[:padded]
+
+    def _refresh_tiling(self, tokens: int) -> None:
+        """Fill the tiling descriptors for this step, for every layer at once.
+
+        A no-op when the operator is absent, which is every build that is not an
+        ``ascend950`` one: the decode then runs its golden fallback and reads no
+        descriptors. Filling a buffer nothing reads would only be a way to fail
+        on hosts the kernels do not exist on.
+
+        The host half of this is ``build_decode_tiling``, unchanged and still
+        the authority -- the operator is a thin wrapper that calls it on a host
+        staging buffer and copies the result into ``self._tiling``. Python does
+        not reproduce any of its arithmetic.
+        """
+        namespace = getattr(torch.ops, TURBOQUANT_DEFAULT_NAMESPACE, None)
+        entry = getattr(namespace, TURBOQUANT_OP_BUILD_DECODE_TILING, None) if namespace else None
+        if entry is None:
+            return
+        entry(
+            self._context_lens_host[:tokens],
+            self._tiling,
+            self._num_heads,
+            self._num_kv_heads,
+            self._head_size,
+            self._block_size,
+            self.max_num_blocks_per_req,
+            self._num_splits,
+            self._heads_per_task,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2079,7 +2459,14 @@ class AscendTurboQuantDryRunBackend(AscendAttentionBackend):
 
     @staticmethod
     def get_builder_cls() -> type[AscendAttentionMetadataBuilder]:
-        return AscendAttentionMetadataBuilder
+        """The TurboQuant builder, which owns the fused decode's launch buffers.
+
+        Not the shared builder any more: three of the decode's operands and its
+        tiling descriptors are per-batch quantities that used to be rebuilt per
+        layer inside the launch. See
+        :class:`AscendTurboQuantMetadataBuilder`.
+        """
+        return AscendTurboQuantMetadataBuilder
 
     @classmethod
     def supports_pcp(cls) -> bool:
@@ -2412,7 +2799,8 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
             self.emulator = emulator
             layer._turboquant_pi_signs = emulator.pi_signs
             layer._turboquant_rotation = emulator.rotation
-            layer._turboquant_codec_tables = _codec_tables(emulator)
+            layer._turboquant_codec_tables = emulator.codec_tables
+            layer._turboquant_h16 = emulator.h16
             layer._turboquant_inv_sqrt_len = emulator.inv_sqrt_len
         return emulator
 
@@ -2647,7 +3035,22 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
         attn_metadata: AscendMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        """DecodeOnly: gather the packed context, dequantise it, run FIA."""
+        """DecodeOnly: the fused kernel, or gather the packed context and run FIA.
+
+        Every tensor the fused launch takes is either a Tier-0 constant on the
+        emulator or a Tier-1 buffer the metadata builder owns, and every scalar
+        is configuration or geometry. Nothing here reads device memory on the
+        host and nothing here allocates, which is what makes the launch legal on
+        a capturing stream -- see ``TURBOQUANT_GRAPH_CAPTURE_RFC.md`` §3 and the
+        gate in ``tests/ut/attention/test_turboquant_capture_contract.py``.
+
+        ``context_lens`` is **not** ``attn_metadata.seq_lens``. That field is the
+        CPU mirror (``_select_seq_lens`` prefers ``_seq_lens_cpu``), so passing
+        it made the binding copy it to the device on every launch of every
+        layer. The builder publishes ``turboquant_context_lens`` instead: the
+        same lengths in a persistent device buffer, with the FIA padding rows
+        zeroed rather than set to 1.
+        """
         emulator = self.emulator
         assert emulator is not None
         batch_size = len(attn_metadata.seq_lens_list)
@@ -2656,18 +3059,22 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
                 "the TurboQuant decode found no scale plane: nothing has been ingested into this layer yet."
             )
 
+        tiling, workspace, query_rot = self._decode_buffers(attn_metadata, batch_size)
         fused = self.adapter.fused_decode(
             query=query[:batch_size],
             key_cache=self.key_cache,
             value_cache=self.value_cache,
             scale_cache=self.scale_cache,
             block_tables=attn_metadata.block_tables[:batch_size],
-            context_lens=attn_metadata.seq_lens[:batch_size],
+            context_lens=self._decode_context_lens(attn_metadata, batch_size),
             emulator=emulator,
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             scale=self.scale,
             output=output[:batch_size],
+            tiling=tiling,
+            workspace=workspace,
+            query_rot=query_rot,
         )
         if fused is not None:
             return output
@@ -2685,6 +3092,66 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
         )
         output[:batch_size] = attn_output.view(batch_size, self.num_heads, self.head_size)
         return output
+
+    @staticmethod
+    def _decode_context_lens(attn_metadata: AscendMetadata, batch_size: int) -> torch.Tensor:
+        """The device context lengths for this step, zero-padded.
+
+        Published by :class:`AscendTurboQuantMetadataBuilder`. The fallback to
+        ``seq_lens_gpu`` covers a metadata object built by the base builder --
+        which should not happen, since the backend names its own builder, but a
+        device tensor is the right answer either way and the alternative is an
+        ``AttributeError`` deep inside a launch. There is no fallback to
+        ``seq_lens``: that is the CPU mirror and is what this change removes.
+        """
+        context_lens = getattr(attn_metadata, "turboquant_context_lens", None)
+        if context_lens is None:
+            context_lens = attn_metadata.seq_lens_gpu
+        if context_lens is None:
+            raise RuntimeError(
+                "the TurboQuant decode has no device-side context lengths. "
+                "AscendTurboQuantMetadataBuilder publishes turboquant_context_lens; "
+                "a metadata object without it and without seq_lens_gpu cannot be decoded "
+                "without a host-to-device copy inside the launch."
+            )
+        return context_lens[:batch_size]
+
+    def _decode_buffers(
+        self, attn_metadata: AscendMetadata, batch_size: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``(tiling, workspace, query_rot)`` for this step, narrowed to its extent.
+
+        The builder sizes all three from ``max_num_reqs`` once, so a step uses a
+        prefix of each. ``narrow`` keeps the base address, which is the whole
+        point: the op's size checks want the exact extent while a captured graph
+        wants the address to be the one it recorded, and a prefix view gives
+        both.
+
+        ``tiling`` is passed whole. The op checks it with ``>=`` because its
+        exact size depends on the ``grid`` the op itself derives, and the
+        descriptor array starts at word zero either way.
+        """
+        splits = TURBOQUANT_DECODE_SPLITS
+        tiling = getattr(attn_metadata, "turboquant_tiling", None)
+        workspace = getattr(attn_metadata, "turboquant_workspace", None)
+        query_rot = getattr(attn_metadata, "turboquant_query_rot", None)
+        if tiling is None or workspace is None or query_rot is None:
+            raise RuntimeError(
+                "the TurboQuant decode found no builder-owned launch buffers on its metadata "
+                "(turboquant_tiling / turboquant_workspace / turboquant_query_rot). They are "
+                "published by AscendTurboQuantMetadataBuilder; the operator cannot allocate them "
+                "itself without giving every step a fresh address, which a captured graph cannot "
+                "follow."
+            )
+        need_workspace = turboquant_decode_workspace_floats(batch_size, self.num_heads, self.head_size, splits)
+        need_query_rot = turboquant_decode_query_rot_floats(batch_size, self.num_heads, self.head_size)
+        if workspace.numel() < need_workspace or query_rot.numel() < need_query_rot:
+            raise RuntimeError(
+                f"the TurboQuant launch buffers are too small for {batch_size} tokens: workspace holds "
+                f"{workspace.numel()} floats (needs {need_workspace}) and query_rot {query_rot.numel()} "
+                f"(needs {need_query_rot}). The builder sizes them from max_num_reqs."
+            )
+        return tiling, workspace.narrow(0, 0, need_workspace), query_rot.narrow(0, 0, need_query_rot)
 
     def _forward_prefill_no_cache(
         self,
