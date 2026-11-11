@@ -861,6 +861,59 @@ The narrow thing that *is* gated: the TurboQuant surface may not pass a literal
 `non_blocking` at all, in either direction, so the flag and the pinning can
 never disagree.
 
+#### C4: speculative decoding and MTP are refused, deliberately
+
+**Decision: not planned. The refusal is the supported behaviour, not a
+placeholder.** It is recorded here because the alternative to a refusal is
+silence, and the silence was wrong: nothing in this repository gates TurboQuant
+against speculative decoding, so before C4 a user could pass
+`--speculative-config` with `ENABLE_TURBOQUANT=1` and get mis-tiled descriptors
+with no diagnostic. `_apply_turboquant_graph_mode` (`platform.py:1241`) is the
+only TurboQuant-specific configuration check there is, and it is about graph
+mode.
+
+**What breaks.** `self.decode_token_per_req = 1 + spec_token_num`
+([`model_runner_v1.py:763`](vllm_ascend/worker/model_runner_v1.py:763)), and the
+runner pads tokens to `num_reqs_padded * uniform_decode_query_len`
+([`:1095`](vllm_ascend/worker/model_runner_v1.py:1095)). So such a step carries
+`decode_token_per_req` query rows per request, while `seq_lens` still carries
+one KV length per request. The tiling descriptor array is indexed **by token**,
+so the extra rows read descriptors the host never wrote.
+
+**Why it is not a Python-only change**, which is the actual reason this is not
+being done now:
+
+1. *Per-token context lengths.* `_refresh_context_lens` would expand each
+   request's length into one per accepted token — draft slot `i` of request `r`
+   attends `seq_lens[r] - (q - 1 - i)` keys for a uniform `q`. That part is
+   easy and is Python.
+2. *Per-token block tables, and this is the blocker.* `build_decode_tiling`
+   reads `block_table + token * max_blocks`
+   ([`turboquant_tiling.cpp:123`](csrc/attention/turboquant/op_host/turboquant_tiling.cpp:123)),
+   and the decode hands the operator `block_tables[:batch_size]` with
+   `batch_size` the token count. Per request and per token coincide only at one
+   token per request. With `q > 1` the operator needs either
+   - a kernel-visible token-to-request indirection — a new operand, a schema
+     change and a kernel change, i.e. exactly the `op_kernel/` work this strand
+     has stayed out of; or
+   - a host-materialised block table repeated `q` times per step, which is a
+     `num_tokens × max_blocks` int32 host-to-device copy **per step** — the
+     class of per-step copy rungs 1–4 existed to remove.
+3. *Buffer sizing.* The tiling, workspace and `query_rot` buffers are sized
+   from `max_num_seqs`; they would need `max_num_seqs * max_q`, which is fine
+   but is a real memory increase to justify.
+4. *Nothing to verify it against.* G9's goldens are one query row per
+   `(token, kv head)`. A spec step has no golden, on the CAModel or anywhere
+   else, so the design cannot be checked below hardware.
+
+**If it is wanted, the sign-off question is (2)**: a token-to-request operand on
+the op, or a per-step block-table expansion. The first is the right design and
+costs a kernel change; the second is Python-only and gives back the per-step
+copy. Nothing should be implemented until that is chosen, and neither variant
+can be validated without a 950PR.
+
+Until then the refusal names the reason in full, and C4 gates it.
+
 ### Risks, ranked
 
 1. **Silent wrongness at rung 6.** A captured decode that reads a stale buffer
