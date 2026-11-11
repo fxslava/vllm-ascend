@@ -46,6 +46,7 @@ from torch.overrides import TorchFunctionMode
 
 from vllm_ascend.attention.turboquant_dry_run import (
     TURBOQUANT_DECODE_SPLITS,
+    TURBOQUANT_STAGE_UNROTATED,
     TURBOQUANT_STAGING_SLOTS,
     AscendTurboQuantDryRunBackendImpl,
     TurboQuantEmulator,
@@ -1074,3 +1075,291 @@ def test_c6_the_launch_path_uses_no_stream_api() -> None:
                 f"{function.__qualname__} names {name!r}. Stream and device-module calls are "
                 "not dispatched through __torch_function__, so G10 cannot see them."
             )
+
+
+# ---------------------------------------------------------------------------
+# G9 and G11, device-free halves
+#
+# Both gates in the RFC need hardware: G9 runs the fused-decode goldens on the
+# CAModel, G11 compares FULL_DECODE_ONLY against PIECEWISE token-for-token on a
+# 950PR. Neither can run here. What *can* run here is the invariant each one
+# protects, checked one level down from the kernel:
+#
+#   G9  protects "this refactor did not change what the kernel computes". The
+#       kernel sees exactly one thing -- the operator's argument tuple -- so if
+#       every argument's provenance, type and value is what it was, the goldens
+#       cannot have moved for any reason inside this change set. G9a freezes
+#       that tuple as a literal table.
+#   G11 protects "a replay produces what an eager step would". A replay
+#       re-executes device work against the pointers, shapes and scalars
+#       recorded at capture, and re-reads nothing else. So the device-free half
+#       is: at a fixed capture extent, two steps that differ in their live
+#       content must agree on every one of those, and differ only in buffer
+#       *contents*. G11a checks exactly that.
+#
+# Neither replaces its hardware gate; each removes a class of reason for the
+# hardware gate to fail.
+# ---------------------------------------------------------------------------
+
+
+def _arg_shape(value: Any) -> Any:
+    """Everything an ACL graph bakes in about one argument, and nothing else.
+
+    For a tensor that is the address, the element type, the extent and the base
+    offset -- a replay re-executes against all four. Deliberately *not* the
+    contents: those are what the host refreshes between replays.
+    """
+    if isinstance(value, torch.Tensor):
+        return (
+            "tensor",
+            value.data_ptr(),
+            value.dtype,
+            tuple(value.shape),
+            value.stride(),
+            value.storage_offset(),
+            str(value.device),
+        )
+    return (type(value).__name__, value)
+
+
+def _launch_profile(entry: _Recorder) -> dict[str, Any]:
+    args = entry.calls[-1][0]
+    assert len(args) == len(_ARG), f"the op was called with {len(args)} arguments, not {len(_ARG)}"
+    return {name: _arg_shape(args[index]) for name, index in _ARG.items()}
+
+
+def _built_metadata(builder: Any, width: int, lengths: list[int], block_table: Any = None) -> Any:
+    """Metadata for one step, with the TurboQuant fields from the real builder.
+
+    The point of going through ``_build_backend_metadata`` rather than the
+    hand-rolled ``_metadata`` double is that the buffers, the extent and the
+    tiling fill then come from the code under test.
+
+    ``block_table`` is a parameter because the runner's is a *persistent* device
+    buffer -- ``self.input_batch.block_table[gid].get_device_tensor()`` sliced to
+    ``num_reqs_padded`` (``model_runner_v1.py:3590``) -- so its address does not
+    move between steps either, and a fixture that allocated a fresh one per step
+    would be testing the fixture.
+    """
+    assert len(lengths) == width
+    metadata = _metadata(width)
+    if block_table is None:
+        block_table = torch.zeros(width, MAX_BLOCKS, dtype=torch.int32)
+    extra = builder._build_backend_metadata(
+        types.SimpleNamespace(num_reqs=width),
+        block_table=block_table,
+        query_lens=torch.ones(width, dtype=torch.int32),
+        seq_lens=torch.tensor(lengths, dtype=torch.int32),
+        num_decodes=width,
+        num_prefills=0,
+    )
+    for name, value in extra.items():
+        setattr(metadata, name, value)
+    metadata.block_tables = block_table
+    # The quantity that genuinely varies between replays of one captured graph:
+    # the padded extent is fixed by the capture size while the live request
+    # count is whatever the scheduler sent. A launch that sliced by this instead
+    # of by the padded extent is the capture bug class G11a exists to catch, so
+    # the fixture has to carry it truthfully or the gate's scalar and shape arms
+    # are vacuous.
+    metadata.num_actual_tokens = sum(1 for length in lengths if length)
+    return metadata
+
+
+def test_g11a_a_replay_sees_one_address_one_shape_and_one_scalar_set(
+    monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
+) -> None:
+    """The device-free half of G11, at a fixed capture extent.
+
+    A captured graph records addresses, element types, extents, strides and the
+    scalar arguments, then replays them. Anything in that set which varies per
+    step is read stale on every replay after the first. Anything *outside* that
+    set may vary freely, and must: the tiling descriptors and the context
+    lengths are exactly the per-step state the host refreshes in place.
+
+    The extent is held fixed on purpose. Shapes do follow the batch width in
+    this decode -- ``query[:batch_size]`` -- and that is sound, because under
+    capture the width *is* the padded capture size and does not move between
+    replays of one graph. Asserting shape constancy across widths would be
+    asserting something false and unnecessary; asserting it across steps at one
+    width is the real invariant.
+    """
+    from vllm_ascend.attention.turboquant_dry_run import (
+        TURBOQUANT_OP_BUILD_DECODE_TILING,
+        TURBOQUANT_OP_FUSED_DECODE,
+    )
+
+    entry = _Recorder(result=None)
+    _register(
+        monkeypatch,
+        **{TURBOQUANT_OP_FUSED_DECODE: entry, TURBOQUANT_OP_BUILD_DECODE_TILING: _Recorder()},
+    )
+    adapter = TurboQuantOpsAdapter(
+        TurboQuantOpsConfig(
+            ops_namespace=NAMESPACE,
+            kernel_stages=frozenset({TurboQuantKernelStage.DECODE}),
+            value_layout=TurboQuantValueLayout.CHANNEL_MAJOR,
+        )
+    )
+    impl = _impl(adapter, emulator, _layer(emulator))
+    builder = _builder()
+    width = 4
+    query = torch.zeros(width, NUM_HEADS, HEAD_SIZE, dtype=torch.bfloat16)
+    output = torch.zeros(width, NUM_HEADS, HEAD_SIZE, dtype=torch.bfloat16)
+    # Persistent, like the runner's own three.
+    block_table = torch.zeros(width, MAX_BLOCKS, dtype=torch.int32)
+
+    profiles = []
+    contents = []
+    # Three steps at one capture extent: a short batch, a long one that crosses
+    # nothing, and one with a dead row -- the shapes a single captured graph
+    # would be replayed over.
+    for lengths in ([64, 64, 64, 64], [4096, 2048, 192, 1], [128, 0, 0, 7]):
+        metadata = _built_metadata(builder, width, lengths, block_table)
+        impl._forward_decode(query, metadata, output)
+        profiles.append(_launch_profile(entry))
+        contents.append(metadata.turboquant_context_lens.clone())
+
+    first = profiles[0]
+    for step, profile in enumerate(profiles[1:], start=1):
+        for name in _ARG:
+            assert profile[name] == first[name], (
+                f"step {step} changed {name!r} from {first[name]} to {profile[name]}. A replay "
+                "re-executes against what capture recorded, so anything in this set that moves "
+                "per step is read stale from the second replay onwards."
+            )
+
+    # And the gate must not be vacuously green: the live content really differed.
+    assert not torch.equal(contents[0], contents[1]), "the three steps were not actually different"
+    assert not torch.equal(contents[1], contents[2]), "the three steps were not actually different"
+
+
+def test_g11a_the_per_step_state_lives_only_in_buffer_contents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other side of G11a: the refresh is in place, so a replay sees it.
+
+    If the builder published a *new* tensor per step instead of refreshing the
+    one it owns, G11a above would still pass every address comparison on the
+    arguments the decode happens to narrow -- so this asserts the mechanism
+    directly: the published context-lens view is the same storage each step and
+    its contents change.
+    """
+    from vllm_ascend.attention.turboquant_dry_run import TURBOQUANT_OP_BUILD_DECODE_TILING
+
+    _register(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: _Recorder()})
+    builder = _builder()
+    first = _built_metadata(builder, 2, [64, 128]).turboquant_context_lens
+    before = first.clone()
+    second = _built_metadata(builder, 2, [4096, 7]).turboquant_context_lens
+
+    assert first.data_ptr() == second.data_ptr(), "the builder published a new tensor, not a refresh"
+    assert second.tolist() == [4096, 7]
+    assert not torch.equal(before, second), "the refresh did not reach the buffer"
+
+
+# The complete launch ABI, frozen. Each entry is (kind, provenance) where
+# provenance names where the value must come from -- a Tier-0 constant on the
+# layer, a cache plane, a builder-owned buffer, or a configuration scalar with
+# its value. The kernel sees nothing but this tuple, so if it is unchanged the
+# CAModel goldens cannot have moved for any reason inside this change set.
+_LAUNCH_ABI: tuple[tuple[str, str, Any], ...] = (
+    ("query", "tensor", "step"),
+    ("pi_signs", "tensor", "tier0"),
+    ("rot_tables", "tensor", "tier0"),
+    ("h16", "tensor", "tier0"),
+    ("gate", "none", None),
+    ("key_cache", "tensor", "cache"),
+    ("value_cache", "tensor", "cache"),
+    ("scale_cache", "tensor", "cache"),
+    ("block_tables", "tensor", "step"),
+    ("context_lens", "tensor", "tier1"),
+    ("tiling", "tensor", "tier1"),
+    ("workspace", "tensor", "tier1"),
+    ("query_rot", "tensor", "tier1"),
+    ("output", "tensor", "step"),
+    ("num_heads", "int", NUM_HEADS),
+    ("num_kv_heads", "int", NUM_KV_HEADS),
+    ("num_splits", "int", TURBOQUANT_DECODE_SPLITS),
+    ("heads_per_task", "int", NUM_HEADS // NUM_KV_HEADS),
+    ("output_stage", "int", TURBOQUANT_STAGE_UNROTATED),
+    ("scale", "float", 0.125),
+    ("inv_sqrt_len", "float", None),
+)
+
+
+def test_g9a_the_launch_abi_is_frozen(decode: dict[str, Any]) -> None:
+    """The device-free half of G9: nothing the kernel sees has moved.
+
+    G9 proper reruns the fused-decode goldens -- cases (a), (e), (k), (l) under
+    ``kv4fp8`` -- on the CAModel, and that is the only way to know the kernel
+    still computes the same thing. This gate removes the one class of reason it
+    could fail inside a pure-Python change set: an argument that silently
+    changed position, type or provenance.
+
+    It is not the dispatch-seam test. That one checks the *order* against the
+    C++ schema; this one checks each argument's **provenance** -- that
+    ``rot_tables`` is the layer's cached codec pool and not a freshly built one,
+    that the three scratch buffers come from the builder and not from the
+    launch, that every scalar is a configuration constant with the value the
+    kernel was tuned against.
+    """
+    _run_decode(decode)
+    args = decode["entry"].calls[-1][0]
+    metadata, impl, layer = decode["metadata"], decode["impl"], decode["impl"].layer
+    emulator = impl.emulator
+
+    tier0 = {
+        "pi_signs": emulator.pi_signs,
+        "rot_tables": layer._turboquant_codec_tables,
+        "h16": layer._turboquant_h16,
+    }
+    tier1 = {
+        "context_lens": metadata.turboquant_context_lens,
+        "tiling": metadata.turboquant_tiling,
+        "workspace": metadata.turboquant_workspace,
+        "query_rot": metadata.turboquant_query_rot,
+    }
+    cache = {
+        "key_cache": impl.key_cache,
+        "value_cache": impl.value_cache,
+        "scale_cache": impl.scale_cache,
+    }
+
+    assert len(args) == len(_LAUNCH_ABI)
+    for index, (name, kind, provenance) in enumerate(_LAUNCH_ABI):
+        assert _ARG[name] == index, f"{name} moved from position {index} to {_ARG[name]}"
+        value = args[index]
+        if kind == "none":
+            assert value is None, f"{name} is no longer unused"
+            continue
+        if kind == "int":
+            assert isinstance(value, int) and not isinstance(value, bool), f"{name} is not an int"
+            assert value == provenance, f"{name} is {value}, not the configured {provenance}"
+            continue
+        if kind == "float":
+            assert isinstance(value, float), f"{name} is not a float"
+            if provenance is not None:
+                assert value == provenance, f"{name} is {value}, not {provenance}"
+            continue
+        assert isinstance(value, torch.Tensor), f"{name} is not a tensor"
+        if provenance == "tier0":
+            assert value.data_ptr() == tier0[name].data_ptr(), (
+                f"{name} is not the Tier-0 constant on the layer. A launch that rebuilds it "
+                "allocates and recomputes once per layer per step."
+            )
+        elif provenance == "tier1":
+            assert value.data_ptr() == tier1[name].data_ptr(), (
+                f"{name} is not the builder-owned buffer the metadata published."
+            )
+        elif provenance == "cache":
+            assert value.data_ptr() == cache[name].data_ptr(), f"{name} is not the layer's cache plane"
+        else:
+            assert value.shape[0] == len(metadata.seq_lens_list), f"{name} is not the step's extent"
+
+
+def test_g9a_the_abi_table_covers_the_schema_exactly() -> None:
+    """The table and the schema parse cannot drift apart silently."""
+    assert tuple(name for name, _, _ in _LAUNCH_ABI) == tuple(_ARG), (
+        "the frozen ABI table and the schema argument order disagree"
+    )
