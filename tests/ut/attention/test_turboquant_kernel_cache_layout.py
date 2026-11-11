@@ -424,6 +424,10 @@ def test_stages_none_runs_the_whole_path_golden(monkeypatch: pytest.MonkeyPatch,
         num_kv_heads=NUM_KV_HEADS,
         scale=0.125,
         output=torch.zeros(1, 2, HEAD_SIZE),
+        # Empty: the stage gate declines before the launch buffers are read.
+        tiling=torch.empty(0, dtype=torch.int32),
+        workspace=torch.empty(0, dtype=torch.float32),
+        query_rot=torch.empty(0, dtype=torch.float32),
     )
 
     assert fused is None, "the decode must fall through to the golden attention"

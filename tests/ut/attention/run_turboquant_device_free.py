@@ -35,6 +35,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 # the live writer gate and needs real hardware.
 DEVICE_FREE_TESTS = (
     "test_turboquant_op_schemas.py",
+    "test_turboquant_capture_contract.py",
     "test_turboquant_dispatch_seam.py",
     "test_turboquant_strip_cache.py",
     "test_turboquant_dry_run_codec.py",

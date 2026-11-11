@@ -182,6 +182,54 @@ struct DecodeTilingRequest {
     std::uint32_t probe_tile = 0;
 };
 
+// The host work split of one decode launch: how many grid blocks, and how many attention,
+// reduction and prologue tasks each one owns.
+//
+// WHY THIS IS HERE AND NOT IN THE BINDING. Two callers need the same answer and neither can be
+// the authority. The operator derives it to size its own loops, and the caller derives it to
+// size the tiling buffer -- `decode_tiling_words` takes `grid`, so a caller that guessed `grid`
+// differently would size the dispatch array differently from the array the device indexes. One
+// inline definition both include is what makes that impossible. It is deliberately NOT a
+// member of DecodeTilingRequest's own arithmetic: the request carries these three as inputs
+// because a probe or a fixture may pin them, and this is the production derivation of them.
+//
+// Free of the device tree, like the rest of this header: `max_grid` is a parameter rather than
+// kDecodeMaxGrid, and the Cube-prologue chunk decision -- which needs
+// layout::kQueryBasisMinCubeVectors -- stays with the caller that has those constants.
+struct DecodeLaunchSplit {
+    std::uint32_t grid;                        // launched blocks
+    std::uint32_t tasks_per_block;             // attention tasks per block
+    std::uint32_t reduce_tasks_per_block;      // Split-K reduction tasks per block
+    std::uint32_t prologue_vectors_per_block;  // query vectors the basis prologue rotates
+    std::uint32_t chunks_per_group;            // ceil(group_heads / heads_per_task)
+    std::uint32_t tasks;                       // total attention tasks
+};
+
+inline DecodeLaunchSplit decode_launch_split(const DecodeTilingRequest &r, const std::uint32_t max_grid)
+{
+    const auto ceil_div = [](const std::uint32_t a, const std::uint32_t b) -> std::uint32_t {
+        return b ? (a + b - 1) / b : 0;
+    };
+    const std::uint32_t group_heads = r.num_kv_heads ? r.num_heads / r.num_kv_heads : r.num_heads;
+    // Clamped exactly as build_decode_tiling clamps it, including the zero guard, so the
+    // chunks_per_group the device reads out of the descriptor is the one the loops assume.
+    std::uint32_t heads_per_task = r.heads_per_task > group_heads ? group_heads : r.heads_per_task;
+    if (!heads_per_task) heads_per_task = 1;
+
+    DecodeLaunchSplit s{};
+    s.chunks_per_group = ceil_div(group_heads, heads_per_task);
+    s.tasks = r.tokens * r.num_kv_heads * r.splits * s.chunks_per_group;
+    const std::uint32_t reduce_total = r.tokens * r.num_heads;
+    // A split launch reaches AscendC::SyncAll<false>(), which on dav-3510 only completes if
+    // every launched block is resident at the same time, so the grid is capped either way.
+    const std::uint32_t live_tasks = s.tasks ? s.tasks : 1u;
+    s.grid = live_tasks < max_grid ? live_tasks : max_grid;
+    s.tasks_per_block = ceil_div(s.tasks, s.grid);
+    s.reduce_tasks_per_block = ceil_div(reduce_total, s.grid);
+    s.prologue_vectors_per_block = s.reduce_tasks_per_block;
+    return s;
+}
+
 // Fill `out` with decode_tiling_bytes(tokens, splits, grid) bytes of descriptors.
 //
 //   context_lengths  host-visible int32[tokens]. Required: a worker's tile count is a function
