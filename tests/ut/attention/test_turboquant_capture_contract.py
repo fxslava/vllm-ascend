@@ -1363,3 +1363,116 @@ def test_g9a_the_abi_table_covers_the_schema_exactly() -> None:
     assert tuple(name for name, _, _ in _LAUNCH_ABI) == tuple(_ARG), (
         "the frozen ABI table and the schema argument order disagree"
     )
+
+
+# ---------------------------------------------------------------------------
+# G8, restated
+#
+# G8 in the RFC compared the AIV tiling builder's output against
+# ``build_decode_tiling`` word for word. Rung 5 is withdrawn, so there is no
+# second producer to compare against -- which means G8's invariant is now the
+# stronger one it was always standing in for: **``build_decode_tiling`` is the
+# only thing that writes a descriptor.** Nothing else may reproduce any part of
+# its arithmetic, because a second implementation that agreed on the cases
+# anyone tested and disagreed elsewhere is exactly the failure G8 was built to
+# catch, and now there is no oracle to catch it with.
+#
+# The arithmetic itself is gated in C++, device-free, by
+# ``tests/ut/ops/turboquant/common/decode_tiling_gate.hpp`` -- the dispatch
+# odometer and the descriptors against an explicit page walk, over a uniform
+# grid and a ragged one including zero-length rows. This file holds the Python
+# half: that Python contributes nothing to it.
+# ---------------------------------------------------------------------------
+
+# Every field of TurboQuantDecodeTilingData whose value is a function of a
+# context length. If one of these names is computed in Python, there are two
+# producers.
+_DESCRIPTOR_FIELDS = (
+    "num_tiles",
+    "tail_rows",
+    "regular_tiles",
+    "block_start_idx",
+    "blocks_in_split",
+    "tile_origin",
+)
+
+
+def test_g8_python_reproduces_none_of_the_tiling_arithmetic() -> None:
+    """One producer of the descriptors, and it is not this module.
+
+    The Python side sizes the buffer and hands the operator a host view of the
+    context lengths. It must not compute a tile count, a tail, a page span or a
+    fuse decision: ``build_decode_tiling`` is the authority and a second
+    implementation of it could only ever drift.
+
+    Sizing is the deliberate exception and is kept honest a different way: the
+    Python upper bound is gated against the C++ ``decode_tiling_words`` by G6,
+    and the operator re-derives the exact extent itself and checks the buffer
+    with ``>=``.
+    """
+    import tokenize
+
+    from vllm_ascend.attention import turboquant_dry_run
+
+    # Identifiers only. Dropping STRING and COMMENT tokens is the whole point:
+    # this module *documents* these field names extensively and must keep doing
+    # so, while naming one in code is the defect.
+    with open(turboquant_dry_run.__file__, encoding="utf-8") as handle:
+        identifiers = {
+            token.string for token in tokenize.generate_tokens(handle.readline) if token.type == tokenize.NAME
+        }
+    for field in _DESCRIPTOR_FIELDS:
+        assert field not in identifiers, (
+            f"turboquant_dry_run.py names {field!r} in code. That is a descriptor field "
+            "build_decode_tiling owns; computing it here makes two producers of the tiling and "
+            "removes the only oracle there is."
+        )
+    # The fuse decision is the subtlest of them: it is per token, not per batch,
+    # and getting it wrong splits a token the kernel fused.
+    assert "fused_context_limit" not in identifiers, (
+        "the fused/split crossover is build_decode_tiling's decision (turboquant_tiling.cpp:93), "
+        "taken per token. Python must not take it."
+    )
+
+
+def test_g8_the_tiling_buffer_is_filled_by_the_operator_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The buffer the builder owns is written by exactly one call.
+
+    Not ``zero_``, not ``copy_``, not a scatter from Python: one call to
+    ``npu_turboquant_build_decode_tiling``, whose body is
+    ``build_decode_tiling`` plus a host-to-device copy. Anything else writing
+    the buffer is a second producer by another name.
+    """
+    from vllm_ascend.attention.turboquant_dry_run import TURBOQUANT_OP_BUILD_DECODE_TILING
+
+    entry = _Recorder()
+    _register(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: entry})
+    builder = _builder()
+    tiling = builder._tiling
+    # Dirtied first, and with a value the buffer never holds naturally. A fresh
+    # buffer is all zeros, so against a zero baseline a Python ``zero_()`` of it
+    # is invisible -- the first run of this gate let exactly that probe through.
+    tiling.fill_(0x5A5A)
+    before = tiling.clone()
+
+    builder._build_backend_metadata(
+        types.SimpleNamespace(num_reqs=2),
+        block_table=torch.zeros(2, MAX_BLOCKS, dtype=torch.int32),
+        query_lens=torch.ones(2, dtype=torch.int32),
+        seq_lens=torch.tensor([64, 4096], dtype=torch.int32),
+        num_decodes=2,
+        num_prefills=0,
+    )
+
+    assert len(entry.calls) == 1, f"the tiling was filled {len(entry.calls)} times, not once"
+    assert entry.args[1] is tiling, "the operator was handed something other than the owned buffer"
+    # The recorder does not write, so the buffer being untouched after a full
+    # metadata build is the proof: Python wrote nothing into it, and the only
+    # code that ever will is the operator body, which is build_decode_tiling
+    # plus one host-to-device copy. The context-lens buffer, by contrast, *is*
+    # written here -- the builder stages the zero-padded lengths and uploads
+    # them -- so a blanket "no in-place writes" assertion would be false.
+    assert torch.equal(tiling, before), (
+        "something other than the operator wrote the tiling buffer: "
+        "the only writer may be build_decode_tiling, through the op."
+    )
