@@ -1044,6 +1044,96 @@ ingested a model on the target host.
 Whether the gate reflects a platform limitation or a bug in our code. It needs
 the run. Until then `platform.py` is untouched and the gate stays closed.
 
+---
+
+## 5b. Blocked on hardware — exactly what to run
+
+Nothing in this list has been run. Each entry names the gate, the precondition,
+the command, and what its outcome decides.
+
+### 1. The capture probe — the H1/H2 criterion (§5a)
+
+Needs: a 950PR, a wheel built with `SOC_VERSION=ascend950` so
+`torch.ops.turboquant_ops.npu_turboquant_fused_decode` is registered, and
+`tools/tq_capture_fixture.py` supplying `build_decode_fixture` over an already
+written three-plane cache.
+
+```bash
+python tools/tq_capture_probe.py --tokens 4 --context 256
+# if stage 2 fails and the message is ambiguous about what 107030 names:
+ASCEND_GLOBAL_LOG_LEVEL=0 python tools/tq_capture_probe.py --tokens 4 --context 256
+```
+
+Decides: whether the `platform.py` gate is over-broad policy (H1) or a platform
+limitation (H2). The verdict table is in §5a. Exit 0 reads as H1; exit 1 means a
+verdict is needed from the error text; exit 2 means a precondition was missing
+and **nothing was measured**.
+
+### 2. G9 — the fused decode goldens on the CAModel
+
+Needs: the `csrc/tests/` CAModel tree, which **is not on this branch**. It lives
+on `feat/tq-v0.26-clean`, `feat/tq-sink-lse-fusion`,
+`feat/ascend-950pr-turbo-quant-scaffold` and `last-stable-point` as
+`csrc/tests/sim/test_sim_950pr_turboquant_fused.cpp`. So G9 is not runnable from
+`feat/tq-cube-clean` at all without merging or cherry-picking that tree first —
+state which, because the answer is part of the result.
+
+Then, inside the `ascend-c-dev` container at `/workspace`, serial and
+unbuffered, `S <= 256`, cases (a), (e), (k), (l) under `kv4fp8` only:
+
+```bash
+stdbuf -o0 -e0 ./test_sim_950pr_turboquant_fused --gtest_filter='*kv4fp8*'
+```
+
+Decides: whether this change set moved the kernel's answer. G9a already freezes
+the launch ABI device-free, so a G9 failure would mean something outside the
+argument tuple changed — which would be surprising and worth stopping for.
+
+### 3. G11 — `FULL_DECODE_ONLY` against `PIECEWISE`, token for token
+
+Needs: a 950PR, a served model, and the `platform.py` gate bypassed. There is
+**no** escape hatch for that today, by design, so this needs a local one-line
+change to `_apply_turboquant_graph_mode` — not a committed one, and not before
+the probe in (1) has reported.
+
+```bash
+# baseline, the mode that is served today
+ENABLE_TURBOQUANT=1 python -m vllm.entrypoints.openai.api_server \
+    --model <model> --max-num-seqs 8 --compilation-config '{"cudagraph_mode":"PIECEWISE"}' \
+    --seed 0 ...
+# then the same prompts under the mode under test, with the gate locally bypassed
+ENABLE_TURBOQUANT=1 python -m vllm.entrypoints.openai.api_server \
+    --model <model> --max-num-seqs 8 --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+    --seed 0 ...
+```
+
+Compare greedy generations token for token. Decides whether the gate may be
+lifted. **This is the only gate that may lift it**; G1–G10 and C1–C6 together do
+not, for the reason at the top of the risk list.
+
+### 4. G8 proper — retired
+
+There is no AIV tiling builder to compare against (rung 5 is withdrawn), so G8
+has no hardware leg left. Its invariant is now device-free and already runs:
+
+```bash
+python -m pytest -p no:xonsh --noconftest tests/ut/ops/test_turboquant_contract_gates.py -q
+```
+
+That builds `test_contract_gates.cpp` and `test_layout_bridge.cpp` with
+`-Wall -Wextra -Werror` and no CANN, and `test_contract_gates` drives the host
+tiling gate's uniform **and ragged** grids. Verified green, and verified red
+under both revert probes, through this driver.
+
+### 5. Not blocked but not run here either
+
+`G1`'s standalone-ops build needs the pinned vendor image
+(`quay.io/ascend/vllm-ascend:v0.26.0rc1-a5`); it builds there but cannot load
+without a driver, so it is a compile gate only. No C++ under `csrc/` changed in
+this strand, so there is nothing new for it to catch — the only C++ touched is
+`tests/ut/ops/turboquant/common/decode_tiling_gate.hpp`, which is header-only,
+needs no wheel or `ascendc_library` rebuild, and is covered by (4).
+
 ### Risks, ranked
 
 1. **Silent wrongness at rung 6.** A captured decode that reads a stale buffer
