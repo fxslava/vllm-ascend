@@ -113,12 +113,9 @@ reconcile it.
 
 from __future__ import annotations
 
-import atexit
 import math
 import os
-import re
-import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from enum import Enum
@@ -2160,239 +2157,40 @@ class AscendTurboQuantDryRunBackend(AscendAttentionBackend):
 # In-code profiling of the dry-run forward.
 #
 # Switched on by TURBOQUANT_PROFILE=1 and off otherwise, at the cost of one
-# bool test per forward. What it answers is the only question this dry run can
-# answer about performance: of the time a TurboQuant attention forward spends,
-# how much is in the three C++ kernels, how much in the dense PyTorch/ATen work
-# the dry run wraps them in, and how much never leaves the host at all.
+# bool test per forward.
 #
-# Nothing here writes a trace: no `tensorboard_trace_handler`, no
-# `on_trace_ready`, no `export_chrome_trace`. The summary is folded out of
-# `prof.key_averages()` in memory and logged. (torch_npu may still stage its own
-# raw profiler data under a directory of its own choosing while the context is
-# open; that is the library's doing, and no `.json` trace is produced from it.)
+# This *exports* a trace; it does not summarise one. torch_npu's profiler has
+# no in-memory aggregation -- `prof.key_averages()` does not exist on it, which
+# is where Kineto's in-process event tree would have been -- because the CANN
+# profiler stages its records on disk and parses them out of band. So the only
+# way to read a profiled forward is to give the profiler a trace handler and
+# open what it writes offline: Ascend Insight, or chrome://tracing on the
+# exported JSON.
 #
 # This is a measurement harness, not a serving configuration. A profiler
-# start/stop per layer per step costs far more than anything it measures, so the
-# absolute numbers are only meaningful against each other.
+# start/stop per layer per step costs far more than anything it measures, and
+# the artefacts accumulate under the trace directory for as long as the server
+# runs.
 # ---------------------------------------------------------------------------
 
 TURBOQUANT_PROFILE_ENV: Final[str] = "TURBOQUANT_PROFILE"
 
 _PROFILE_TRUTHY: Final[frozenset[str]] = frozenset({"1", "true", "yes", "on"})
 
-# Both cache writers and the fused decode are registered as `npu_turboquant_*`
-# (csrc/attention/turboquant/torch_bindings.cpp), and the device-side kernel
-# symbols the profiler reports keep the `turboquant` stem without the `npu_`
-# prefix. One case-folded substring therefore catches the op, its dispatch and
-# its kernel, and keeps catching them if the binding fragment is parked in
-# another namespace (TURBOQUANT_OPS_NAMESPACE).
-TURBOQUANT_PROFILE_KERNEL_MARKER: Final[str] = "turboquant"
+# Where ``tensorboard_trace_handler`` writes. Relative, so for a served model
+# it lands wherever the server process was started.
+TURBOQUANT_PROFILE_TRACE_DIR: Final[str] = "./turboquant_traces"
 
-# How many op names each bucket names in the log before it says "...".
-TURBOQUANT_PROFILE_TOP_OPS: Final[int] = 4
-
-# Device self-time, under the name the installed torch_npu/torch gives it.
-_PROFILE_DEVICE_FIELDS: Final[tuple[str, ...]] = ("self_npu_time_total", "self_device_time_total")
-
-_LAYER_INDEX_RE: Final[re.Pattern[str]] = re.compile(r"\d+")
+# Logged once, on the first forward that is actually profiled.
+TURBOQUANT_PROFILE_NOTICE: Final[str] = (
+    "TurboQuant profiling active. Ascend CANN does not support in-memory key_averages. "
+    "Traces are being dumped to %s for offline analysis in Ascend Insight or chrome://tracing."
+)
 
 
 def turboquant_profile_enabled() -> bool:
     """Whether ``TURBOQUANT_PROFILE`` asks for the in-code profiler."""
     return os.getenv(TURBOQUANT_PROFILE_ENV, "0").strip().lower() in _PROFILE_TRUTHY
-
-
-def _micros_as_ms(micros: float) -> str:
-    """Microseconds as milliseconds. Three decimals: a decode kernel is tens of
-    microseconds, and the whole point is to see it next to the host time."""
-    return f"{micros / 1000.0:.3f}ms"
-
-
-@dataclass(frozen=True)
-class TurboQuantProfileBucket:
-    """One row of the summary: a time total and the ops that dominate it."""
-
-    label: str
-    micros: float
-    top_ops: tuple[str, ...]
-    truncated: bool
-
-    def render(self, total_micros: float, stem: str) -> str:
-        share = 100.0 * self.micros / total_micros if total_micros > 0.0 else 0.0
-        named = ""
-        if self.top_ops:
-            listed = ", ".join(self.top_ops)
-            named = f" [{listed}, ...]" if self.truncated else f" [{listed}]"
-        return f" {stem} {self.label:<15}: {_micros_as_ms(self.micros)} ({share:.1f}%){named}"
-
-
-@dataclass(frozen=True)
-class TurboQuantLayerProfile:
-    """One layer's forward, folded into the three buckets."""
-
-    layer: str
-    phase: str
-    host_wall_micros: float
-    buckets: tuple[TurboQuantProfileBucket, ...]
-
-    @property
-    def tdot_micros(self) -> float:
-        """The total duration of time: the three buckets summed.
-
-        Deliberately *not* the forward's wall time, and normally larger than it.
-        Device work is asynchronous, so a kernel's device time overlaps the host
-        time that launched the next one, and the same microsecond can be counted
-        in two buckets. That is why :attr:`host_wall_micros` is logged beside it
-        rather than in place of it: TDOT apportions work, the wall bounds it.
-        """
-        return sum(bucket.micros for bucket in self.buckets)
-
-    def render(self) -> str:
-        total = self.tdot_micros
-        header = (
-            f"[TurboQuant Profile] Layer {self.layer} ({self.phase}) | "
-            f"TDOT: {_micros_as_ms(total)} (host wall {_micros_as_ms(self.host_wall_micros)})"
-        )
-        last = len(self.buckets) - 1
-        rows = [
-            bucket.render(total, "└─" if position == last else "├─") for position, bucket in enumerate(self.buckets)
-        ]
-        return "\n".join([header, *rows])
-
-
-def _event_name(event: Any) -> str:
-    """The op name of a ``key_averages()`` row.
-
-    ``FunctionEventAvg`` carries it as ``key``; the raw events carry ``name``.
-    Both spellings are accepted so the summariser can be fed either.
-    """
-    for attribute in ("key", "name"):
-        value = getattr(event, attribute, None)
-        if value:
-            return str(value)
-    return "<unnamed>"
-
-
-def _event_micros(event: Any, fields: Iterable[str]) -> float:
-    for attribute in fields:
-        value = getattr(event, attribute, None)
-        if value is not None:
-            with suppress(TypeError, ValueError):
-                return float(value)
-    return 0.0
-
-
-def _bucket(label: str, totals: dict[str, float], top_ops: int) -> TurboQuantProfileBucket:
-    ranked = sorted(totals.items(), key=lambda item: item[1], reverse=True)
-    return TurboQuantProfileBucket(
-        label=label,
-        micros=sum(totals.values()),
-        top_ops=tuple(name for name, _ in ranked[:top_ops]),
-        truncated=len(ranked) > top_ops,
-    )
-
-
-def summarise_turboquant_profile(
-    events: Iterable[Any],
-    *,
-    layer: str,
-    phase: str,
-    host_wall_micros: float,
-    marker: str = TURBOQUANT_PROFILE_KERNEL_MARKER,
-    top_ops: int = TURBOQUANT_PROFILE_TOP_OPS,
-) -> TurboQuantLayerProfile:
-    """Fold ``prof.key_averages()`` into custom kernels / native / host.
-
-    Only the ``self_*`` totals are read. ``key_averages`` reports each row's
-    *inclusive* time as well, and summing that over an op tree double-counts
-    every child: an ``aten::cat`` inside a custom op would be charged to both
-    device buckets and the percentages would mean nothing.
-
-    The split is by name, not by dispatch key, because that is all a profiler
-    row carries: a row whose name contains ``marker`` is one of ours (the
-    ``npu_turboquant_*`` ops, their dispatch and their kernels), and every other
-    row with device time is the dense PyTorch work the dry run surrounds them
-    with -- ``aten::index_select`` for the page gather,
-    ``npu_fused_infer_attention_score*`` for the attention itself.
-
-    Host time is summed over *every* row, ours included, so a custom kernel's
-    launch cost lands in the host bucket rather than in its own. That is the
-    intended reading: the device buckets are what the hardware did, the host
-    bucket is what it cost to ask.
-    """
-    custom: dict[str, float] = {}
-    native: dict[str, float] = {}
-    host: dict[str, float] = {}
-    folded = marker.casefold()
-    for event in events:
-        name = _event_name(event)
-        device_micros = _event_micros(event, _PROFILE_DEVICE_FIELDS)
-        host_micros = _event_micros(event, ("self_cpu_time_total",))
-        if device_micros:
-            into = custom if folded in name.casefold() else native
-            into[name] = into.get(name, 0.0) + device_micros
-        if host_micros:
-            host[name] = host.get(name, 0.0) + host_micros
-    return TurboQuantLayerProfile(
-        layer=layer,
-        phase=phase,
-        host_wall_micros=host_wall_micros,
-        buckets=(
-            _bucket("Custom Kernels", custom, top_ops),
-            _bucket("PyTorch Native", native, top_ops),
-            _bucket("CPU/Host", host, top_ops),
-        ),
-    )
-
-
-class TurboQuantProfileLog:
-    """Collect per-layer summaries and log one record per model step.
-
-    A log call per layer per forward is 60-odd records per decode step on a real
-    model, interleaved with everything else the server logs. The step boundary
-    is a layer label *repeating*: a model runs each of its attention layers once
-    per forward, in order, so the second time a label arrives the previous step
-    is complete and is logged as one multi-line record.
-
-    Nothing here is told the layer count, which is what keeps it model-agnostic
-    and gives it its two edge behaviours: a model with a single attention layer
-    logs every step, and a forward that interleaves two layer sets whose labels
-    collide (a draft model's layer 0 after the target's) flushes early. Both are
-    correct -- finer-grained, never wrong -- and neither drops a record.
-    """
-
-    def __init__(self) -> None:
-        self._pending: dict[str, TurboQuantLayerProfile] = {}
-
-    def record(self, profile: TurboQuantLayerProfile) -> None:
-        if profile.layer in self._pending:
-            self.flush()
-        self._pending[profile.layer] = profile
-
-    def flush(self) -> None:
-        if not self._pending:
-            return
-        pending = tuple(self._pending.values())
-        self._pending.clear()
-        total = sum(profile.tdot_micros for profile in pending)
-        wall = sum(profile.host_wall_micros for profile in pending)
-        header = (
-            f"[TurboQuant Profile] step: {len(pending)} layer(s), "
-            f"TDOT {_micros_as_ms(total)}, host wall {_micros_as_ms(wall)}"
-        )
-        logger.info("%s", "\n".join([header, *(profile.render() for profile in pending)]))
-
-
-# One per process. The profiled forward is the only writer.
-TURBOQUANT_PROFILE_LOG: Final[TurboQuantProfileLog] = TurboQuantProfileLog()
-
-
-@atexit.register
-def _flush_turboquant_profile_log() -> None:
-    """The last step's record, which no later forward would flush. Logging during
-    interpreter shutdown is allowed to fail; losing the summary is not a fault."""
-    with suppress(Exception):
-        TURBOQUANT_PROFILE_LOG.flush()
 
 
 def _stream_is_capturing() -> bool:
@@ -2504,14 +2302,6 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
             staged or "none (all golden)",
             self.adapter.config.ops_namespace,
         )
-        if self._profile:
-            logger.info_once(
-                "TurboQuant in-code profiling is on (%s): every attention forward runs under "
-                "torch_npu.profiler and is summarised in memory -- no trace file is written. The "
-                "per-forward start/stop costs more than anything it measures, so read the shares, "
-                "not the absolute times.",
-                TURBOQUANT_PROFILE_ENV,
-            )
 
     # -- what the staged kernels can actually run --------------------------
 
@@ -3028,8 +2818,8 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
         contract and the output buffer; only the two methods above change.
 
         With ``TURBOQUANT_PROFILE=1`` the stock forward runs inside
-        ``torch_npu.profiler`` and its ``key_averages()`` are folded into the
-        three buckets of :func:`summarise_turboquant_profile`. Not profiled:
+        ``torch_npu.profiler``, which exports its trace to
+        :data:`TURBOQUANT_PROFILE_TRACE_DIR` for offline analysis. Not profiled:
         a call with no ``attn_metadata`` (a dummy/warm-up forward, where there is
         no attention to measure) and a call made during an ACL graph capture,
         where starting a profiler would be measuring the capture and risking it.
@@ -3049,66 +2839,61 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
         }
         if not self._profile or attn_metadata is None or _stream_is_capturing():
             return super().forward(**call)
-        return self._profiled_forward(layer, attn_metadata, call)
+        return self._profiled_forward(call)
 
     # -- profiling ---------------------------------------------------------
 
-    def _profiled_forward(
-        self,
-        layer: AttentionLayer,
-        attn_metadata: AscendMetadata,
-        call: dict[str, Any],
-    ) -> torch.Tensor:
-        """Run the stock forward under the profiler and record one summary.
+    def _profiled_forward(self, call: dict[str, Any]) -> torch.Tensor:
+        """Run the stock forward under the profiler and let it export its trace.
 
-        The measurement is never allowed to take the forward down. The sentinel
-        is ``attn_output``: if the profiler machinery raises before the forward
-        produced a tensor the exception is the forward's own and propagates
-        unchanged, and if it raises afterwards -- on ``__exit__``, or because
-        this torch_npu has no in-memory ``key_averages()`` -- profiling switches
-        itself off for this layer and the step continues with its output.
+        Nothing is read back. The trace handler owns the records, and
+        ``prof.step()`` inside the context is what tells it a step is complete,
+        so it chunks and flushes one artefact set per profiled forward instead
+        of one for the whole run.
+
+        There is no fallback around this: with the handler doing the writing
+        there is no in-memory call left to fail on a torch_npu that lacks one,
+        and a profiler that cannot even be constructed has already switched
+        itself off in :meth:`_open_profiler`.
         """
         profiler = self._open_profiler()
         if profiler is None:
             return super().forward(**call)
-        attn_output: torch.Tensor | None = None
-        try:
-            with profiler as prof:
-                started = time.perf_counter()
-                attn_output = super().forward(**call)
-                host_wall_micros = (time.perf_counter() - started) * 1e6
-            TURBOQUANT_PROFILE_LOG.record(
-                summarise_turboquant_profile(
-                    prof.key_averages(),
-                    layer=self._profile_layer_label(layer),
-                    phase=self._profile_phase(attn_metadata),
-                    host_wall_micros=host_wall_micros,
-                )
-            )
-        except Exception as error:
-            if attn_output is None:
-                raise
-            self._disable_profiling(error)
+        logger.info_once(TURBOQUANT_PROFILE_NOTICE, TURBOQUANT_PROFILE_TRACE_DIR)
+        with profiler as prof:
+            attn_output = super().forward(**call)
+            prof.step()
         return attn_output
 
     def _open_profiler(self) -> Any | None:
-        """A CPU+NPU profiler with no trace handler, or ``None`` if unavailable.
+        """A CPU+NPU profiler that exports its trace, or ``None`` if unavailable.
 
-        No ``on_trace_ready``, no ``experimental_config``: the summary needs op
-        names and self times, which is the default profiler level, and every
-        knob left at its default is one fewer version-dependent keyword.
+        ``on_trace_ready`` is the whole of it: torch_npu has no in-memory
+        ``key_averages()``, so a profiler with no handler records a step and
+        then has nothing any caller can read. ``tensorboard_trace_handler`` is
+        what writes the CANN artefacts and the chrome-trace JSON, and its
+        absence counts as the profiler being unavailable -- a build without it
+        cannot be read at all.
+
+        Everything else is left at its default: op names and device times are
+        the default profiler level, and every knob left alone is one fewer
+        version-dependent keyword.
         """
         profiler_module = getattr(torch_npu, "profiler", None)
         activity = getattr(profiler_module, "ProfilerActivity", None)
-        if profiler_module is None or activity is None or not hasattr(profiler_module, "profile"):
+        trace_handler = getattr(profiler_module, "tensorboard_trace_handler", None)
+        if profiler_module is None or activity is None or trace_handler is None:
             self._disable_profiling("torch_npu.profiler is not available in this build")
+            return None
+        if not hasattr(profiler_module, "profile"):
+            self._disable_profiling("torch_npu.profiler has no profile()")
             return None
         try:
             return profiler_module.profile(
                 activities=[activity.CPU, activity.NPU],
+                on_trace_ready=trace_handler(TURBOQUANT_PROFILE_TRACE_DIR),
                 record_shapes=False,
                 with_stack=False,
-                profile_memory=False,
             )
         except Exception as error:
             self._disable_profiling(error)
@@ -3122,37 +2907,3 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
             TURBOQUANT_PROFILE_ENV,
             reason,
         )
-
-    @staticmethod
-    def _profile_layer_label(layer: AttentionLayer) -> str:
-        """The layer's index, for the log and for the step-boundary test.
-
-        vLLM's attention layer carries ``layer_name``
-        (``model.layers.7.self_attn.attn``), not an index, so the first integer
-        in it is the index; ``layer_idx`` is preferred where a layer has one.
-        """
-        index = getattr(layer, "layer_idx", None)
-        if isinstance(index, int):
-            return str(index)
-        name = str(getattr(layer, "layer_name", "") or "")
-        found = _LAYER_INDEX_RE.search(name)
-        if found is not None:
-            return found.group()
-        return name or "?"
-
-    @staticmethod
-    def _profile_phase(attn_metadata: AscendMetadata) -> str:
-        """Which of ``forward_impl``'s three routes ran, not the raw state: the
-        chunked-prefill and spec-decode states share the mixed route, so they are
-        named after it and after themselves."""
-        state = getattr(attn_metadata, "attn_state", None)
-        if state is None:
-            return "Mixed"
-        if state == AscendAttentionState.PrefillNoCache:
-            return "Prefill"
-        if state == AscendAttentionState.DecodeOnly:
-            return "Decode"
-        # ``name`` rather than the state itself: an Enum stringifies as
-        # "AscendAttentionState.ChunkedPrefill", which is the whole log line's
-        # width spent on the type.
-        return f"Mixed:{getattr(state, 'name', None) or state}"
