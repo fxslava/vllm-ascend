@@ -724,7 +724,7 @@ landing under `PIECEWISE` on their own merits; full capture starts at rung 3.
 | **2** ✅ | `context_lens` becomes `seq_lens_gpu`; the op stops making the host copy; `build_decode_tiling` is fed from a caller-supplied host view | `turboquant_dry_run.py`, `torch_bindings.cpp` | Low–medium. Changes which tensor the op reads; a wrong one is a wrong answer, not an error. | G1, G2, G3, G5 |
 | **3** ✅ | Schema change: `tiling`, `workspace`, `query_rot` become inputs; new `npu_turboquant_build_decode_tiling` with the CPU implementation; `decode_launch_split()` in the tiling header | `torch_bindings.cpp`, `op_host/turboquant_tiling.{h,cpp}`, `turboquant_dry_run.py` | Medium. Three new sizing contracts the op must check. | G1, G2, G3, G4, G6 |
 | **4** ✅ | Builder ownership: `AscendTurboQuantMetadataBuilder` allocates the Tier-1 buffers itself (see §4.2) and fills the tiling once per step for all layers | `turboquant_dry_run.py` only -- the shared builder is untouched, via its own `_build_backend_metadata` hook | Medium. A new builder class and metadata dataclass. | G1, G3, G6, G7 |
-| **5** | The AIV tiling builder kernel; `PrivateUse1` implementation of the builder op; `num_splits` constrained to a power of two | new `op_kernel/turboquant_build_tiling.cpp`, `CMakeLists.txt` | Medium–high. A new kernel in the MIX library; `ascendc_library` has no incremental rebuild, so every iteration is a clean build. | G1, G8, G9 |
+| **5** ❌ | ~~The AIV tiling builder kernel~~ **Withdrawn — see “Rung 5 is withdrawn” below.** Replaced by rung 5′: the capture contract for the host-owned buffer | `turboquant_dry_run.py` only | Low. No kernel, no schema, no device-side logic. | G1, G3, C1–C5 |
 | **6** | Lift the platform gate to conditional `FULL_DECODE_ONLY`; padded-row contract for `context_lens`; refuse capture when the golden path would be taken | `platform.py`, `turboquant_dry_run.py` | High. This is the rung that can corrupt a served model silently. | G1, G3, G10, G11 |
 | **7** | *(follow-up, not this work)* D3: remove the tiling buffer; re-measure the SPU argument; `at::empty` for the workspace if §3.2 resolves that way | kernel | — | G8, G9, plus a profile |
 
@@ -743,9 +743,73 @@ landing under `PIECEWISE` on their own merits; full capture starts at rung 3.
 | **G9** | The fused decode goldens are unchanged: cases (a), (e), (k), (l) under `kv4fp8` | CAModel, `S <= 256`, serial |
 | **G10** | **New**: a capture-illegality assertion — run a decode under a faked capture (patch both the forward-context flag and `torch.npu.is_current_stream_capturing`, as `_capture_in_progress()` already does) and assert no `.cpu()`, `.to("cpu")`, `.item()`, `.tolist()` or allocation occurs. A `__torch_function__` mode or a monkeypatched allocator is enough; no device needed | new UT, no device |
 | **G11** | End-to-end: `FULL_DECODE_ONLY` and `PIECEWISE` agree token-for-token on a greedy generation. This is the only gate that needs an NPU | 950PR hardware |
+| **C1–C5** | **New**: the capture contract for the static buffer — the extent, the address, where the fill runs, the step shapes that are refused, and the staging ring. See rung 5′ below | `tests/ut/attention/test_turboquant_capture_contract.py`, no device |
 
 G10 is the gate that would have caught every blocker in §1.2 and is the one most
 worth writing first — before rung 1, so it fails and then goes green.
+
+### Rung 5 is withdrawn
+
+The original rung 5 moved `build_decode_tiling` onto the AIV so the descriptors
+would be produced device-side. **Do not do this**, for three reasons, the first
+of which also corrects a tempting misreading of what the tiling buffer is.
+
+**1. The descriptors are not static.** The buffer's *size and address* are a
+function of the model configuration alone, which is why one maximum-sized
+allocation at engine start serves every step and every capture size (§4.2). Its
+*contents* are not. A descriptor's `num_tiles`, `tail_rows`, `regular_tiles`,
+`block_start_idx`, `blocks_in_split` and `flags` are all computed from that
+token's context length
+([`turboquant_tiling.cpp:90`](csrc/attention/turboquant/op_host/turboquant_tiling.cpp:90),
+`:94`, `:130`, `:133`), whether a split is live at all is `block_start >=
+seq_blocks` (`:118`), and past `kFusedContextLimit` the context length decides
+whether the token is split at all (`:93`). The header states it as the
+parameter's contract: a worker's tile count is a function of its token's context
+length
+([`turboquant_tiling.h:235`](csrc/attention/turboquant/op_host/turboquant_tiling.h:235)).
+
+So "build the descriptors once at init" is not an optimisation of this buffer; it
+would freeze every worker's span at whatever length init assumed. Left as the
+zeros the allocation starts with it is worse than wrong: every descriptor reads
+`num_tiles == 0`, both kernel roles skip every worker, and the launch reports
+success over an untouched output. Only the *allocation* is init-time work. The
+fill is per-step work, and it is already down from once per layer per step to
+once per step.
+
+**2. A device-side builder puts an inter-core barrier back on the critical
+path.** The descriptors are shared across the grid, so one core would compute
+them and the rest would wait — another `AscendC::SyncAll<false>()`, which on
+dav-3510 completes only if every launched block is resident at the same time
+([`turboquant_tiling.h:223`](csrc/attention/turboquant/op_host/turboquant_tiling.h:223)
+records why that caps the grid; the prologue's own barrier is
+[`turboquant_query_basis.h:177`](csrc/attention/turboquant/op_kernel/cube/turboquant_query_basis.h:177)).
+A second such barrier to save a few hundred bytes of host arithmetic is the
+wrong trade in both directions.
+
+**3. It walks back §4.2.** The tiling buffer is host-written *between replays*,
+which is why it has to live outside the graph's memory pool. Making it
+device-written does not remove the need for a host owner — a device-side builder
+still needs this step's context lengths put somewhere — it only adds a producer.
+
+### Rung 5′: the capture contract for the host-owned buffer (landed)
+
+What rung 5 was reaching for is the property that the buffer the host fills
+before a replay is the buffer the replayed kernel reads, at the same address and
+for the same extent. G10 covers the launch path; these cover the buffer it
+launches over.
+
+| Gate | What | Where |
+| --- | --- | --- |
+| **C1** | The launch extent is the extent the host filled. The builder publishes `turboquant_num_tokens` and the decode slices by it, because the fill side counts rows of `seq_lens` while the op derives `tokens` from `query.size(0)` — and the dispatch records sit at `decode_dispatch_word_base(tokens, splits)`, an offset that *moves with the token count*. A launch whose `tokens` exceeds the filled extent does not trip a size check on a maximum-sized buffer: it reads descriptors out of the dispatch array and dispatch records out of words nobody wrote, and reports success | UT, no device |
+| **C2** | All four builder-owned buffers keep one address across steps of different widths and context lengths, and every published view is a prefix at storage offset 0 | UT, no device |
+| **C3** | The launch path never calls the tiling builder op. That op takes a CPU tensor, does host arithmetic and ends in an H2D copy: legal in the metadata build, illegal in a capture | UT, no device |
+| **C4** | A multi-token decode step (speculative, MTP) is refused rather than mis-tiled. The runner pads tokens to `num_reqs_padded * uniform_decode_query_len` ([`model_runner_v1.py:1095`](vllm_ascend/worker/model_runner_v1.py:1095)), so such a step carries several query rows per request while `seq_lens` carries one length per request, and the descriptor array is indexed by token | UT, no device |
+| **C5** | The host staging is pinned and a ring of `TURBOQUANT_STAGING_SLOTS = 2`, and the upload is asynchronous only out of pinned memory. A single pageable buffer copied `non_blocking` is rewritten by the next step under its own in-flight copy — a torn upload, not a stale one | UT, no device |
+
+Each landed with a revert probe: C1 red when the extent falls back to
+`len(seq_lens_list)`, C2 red when a published view is cloned, C3 red when the
+launch calls the builder op, C4 red when the refusal is removed, C5 red at ring
+depth 1 and red when the copy is unconditionally `non_blocking`.
 
 ### Risks, ranked
 
@@ -760,11 +824,14 @@ worth writing first — before rung 1, so it fails and then goes green.
    the allocator reuses an address.
 4. **The workspace zero-fill (§3.2).** Only bites once Split-K is on, which is
    the roadmap.
-5. **`num_splits` constrained to a power of two at rung 5.** Acceptable today
-   (it is 1, and the roadmap is 4 and 8), but it is a new published constraint
-   and belongs in the op's `TORCH_CHECK` and in the docs.
-6. **`ascendc_library` has no incremental rebuild**, so rung 5 iterates at
-   clean-build speed. Budget for it.
+5. ~~**`num_splits` constrained to a power of two at rung 5.**~~ Moot: rung 5 is
+   withdrawn, so nothing needs a device-side shift.
+6. ~~**`ascendc_library` has no incremental rebuild**, so rung 5 iterates at
+   clean-build speed.~~ Moot for the same reason; it still applies to rung 7.
+7. **A multi-token decode step is refused, not served.** C4 makes that explicit
+   instead of silent, but it is a real limitation: speculative decoding and MTP
+   need the per-request context lengths expanded per accepted token before this
+   decode can tile such a step.
 
 ---
 

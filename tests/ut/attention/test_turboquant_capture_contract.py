@@ -18,6 +18,12 @@ Four gates live here, named after the RFC
   launch, so one that varied per step would replay a stale value.
 * **G6** -- the tiling buffer's Python-side upper bound covers every
   ``(tokens, splits, grid)`` the op can derive.
+* **C1-C5** -- the capture contract for the *static buffer* itself, which is
+  the half G10 cannot see: that the extent the host filled is the extent the
+  launch reads, that every buffer keeps one address across steps, that the
+  fill never migrates into the launch, that a step this builder cannot tile is
+  refused instead of mis-tiled, and that the host staging is safe to overwrite
+  on the next step.
 
 **What G10 does not cover.** Everything the C++ binding does between the op call
 and the launch is invisible from here. That half of the launcher is covered by
@@ -40,6 +46,7 @@ from torch.overrides import TorchFunctionMode
 
 from vllm_ascend.attention.turboquant_dry_run import (
     TURBOQUANT_DECODE_SPLITS,
+    TURBOQUANT_STAGING_SLOTS,
     AscendTurboQuantDryRunBackendImpl,
     TurboQuantEmulator,
     TurboQuantKernelStage,
@@ -205,6 +212,7 @@ def _metadata(tokens: int = BATCH) -> Any:
         "seq_lens_list": [64] * tokens,
         "block_tables": torch.zeros(tokens, MAX_BLOCKS, dtype=torch.int32),
         "turboquant_context_lens": seq_lens_cpu.clone(),
+        "turboquant_num_tokens": tokens,
         "slot_mapping": torch.arange(tokens, dtype=torch.int32),
     }
     fields.update(_tier1(tokens))
@@ -501,7 +509,14 @@ def _builder() -> Any:
     builder._heads_per_task = NUM_HEADS // NUM_KV_HEADS
     builder.max_num_blocks_per_req = MAX_BLOCKS
     builder._context_lens = torch.zeros(MAX_NUM_REQS, dtype=torch.int32)
-    builder._context_lens_host = torch.zeros(MAX_NUM_REQS, dtype=torch.int32)
+    # The production depth, not a literal: the ring gate below has to go red
+    # when the real builder drops to a single slot.
+    builder._staging_slots = TURBOQUANT_STAGING_SLOTS
+    builder._staging_step = 0
+    builder._staging_pinned = False
+    builder._context_lens_host_ring = [
+        torch.zeros(MAX_NUM_REQS, dtype=torch.int32) for _ in range(builder._staging_slots)
+    ]
     builder._tiling = torch.zeros(turboquant_tiling_upper_bound_words(MAX_NUM_REQS, 8), dtype=torch.int32)
     builder._workspace = torch.zeros(
         turboquant_decode_workspace_floats(MAX_NUM_REQS, NUM_HEADS, HEAD_SIZE, TURBOQUANT_DECODE_SPLITS),
@@ -531,18 +546,19 @@ def test_the_padded_rows_get_a_zero_context_not_a_one() -> None:
     seq_lens = torch.tensor([64, 128, 1, 1], dtype=torch.int32)
     common = types.SimpleNamespace(num_reqs=2)
 
-    context_lens = builder._refresh_context_lens(common, seq_lens)
+    context_lens, host = builder._refresh_context_lens(common, seq_lens)
 
     assert context_lens.tolist() == [64, 128, 0, 0]
     assert context_lens.numel() == 4, "the view covers the padded extent, not just the live requests"
+    assert host[:4].tolist() == [64, 128, 0, 0], "the host staging is what build_decode_tiling reads"
 
 
 def test_the_context_lens_view_is_always_the_same_buffer() -> None:
     """One address for the engine's life, which is what a captured graph needs."""
     builder = _builder()
     common = types.SimpleNamespace(num_reqs=2)
-    first = builder._refresh_context_lens(common, torch.tensor([64, 128], dtype=torch.int32))
-    second = builder._refresh_context_lens(common, torch.tensor([65, 129], dtype=torch.int32))
+    first, _ = builder._refresh_context_lens(common, torch.tensor([64, 128], dtype=torch.int32))
+    second, _ = builder._refresh_context_lens(common, torch.tensor([65, 129], dtype=torch.int32))
     assert first.data_ptr() == second.data_ptr()
     assert first.data_ptr() == builder._context_lens.data_ptr()
     assert second.tolist() == [65, 129], "the refresh is in place, so the view reads the new step"
@@ -566,12 +582,13 @@ def test_the_tiling_fill_is_one_call_for_every_layer(monkeypatch: pytest.MonkeyP
     entry = _Recorder()
     _register(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: entry})
     builder = _builder()
-    builder._refresh_tiling(4)
+    host = builder._context_lens_host_ring[0]
+    builder._refresh_tiling(host, 4)
 
     assert len(entry.calls) == 1
     args = entry.args
     assert len(args) == 9
-    assert args[0].data_ptr() == builder._context_lens_host.data_ptr()
+    assert args[0].data_ptr() == host.data_ptr()
     assert args[0].numel() == 4, "the host view is the step's extent"
     assert args[1] is builder._tiling
     assert args[2:] == (
@@ -592,10 +609,11 @@ def test_the_tiling_fill_is_skipped_when_the_operator_is_absent(monkeypatch: pyt
     kernels do not exist on.
     """
     monkeypatch.setattr(torch, "ops", types.SimpleNamespace())
-    _builder()._refresh_tiling(4)  # must not raise
+    builder = _builder()
+    builder._refresh_tiling(builder._context_lens_host_ring[0], 4)  # must not raise
 
 
-def test_the_builder_publishes_all_four_fields() -> None:
+def test_the_builder_publishes_every_field_the_launch_reads() -> None:
     """``_build_backend_metadata`` is the shared builder's extension point.
 
     Using it is what keeps ``AscendAttentionMetadataBuilder`` untouched, so no
@@ -618,10 +636,291 @@ def test_the_builder_publishes_all_four_fields() -> None:
         "turboquant_tiling",
         "turboquant_workspace",
         "turboquant_query_rot",
+        "turboquant_num_tokens",
     }
+    assert extra["turboquant_num_tokens"] == 2, "the extent the descriptors were filled for"
     # All of the new work is in the subclass, reached only through the hook, so
     # a non-TurboQuant backend cannot execute any of it.
     assert issubclass(AscendTurboQuantMetadataBuilder, AscendAttentionMetadataBuilder)
     assert "_build_backend_metadata" in vars(AscendTurboQuantMetadataBuilder)
     assert "_refresh_context_lens" in vars(AscendTurboQuantMetadataBuilder)
     assert "_refresh_tiling" in vars(AscendTurboQuantMetadataBuilder)
+
+
+# ---------------------------------------------------------------------------
+# C1-C5 -- the capture contract for the static buffer
+#
+# G10 proves the launch path is clean. These prove the thing it launches over is
+# correct: that the buffer the host fills before a replay and the buffer the
+# replayed kernel reads are the same buffer, at the same address, filled for the
+# same extent.
+# ---------------------------------------------------------------------------
+
+
+class _CopyWatcher(TorchFunctionMode):
+    """Records every ``copy_`` and whether it was asked to be asynchronous."""
+
+    def __init__(self) -> None:
+        self.copies: list[bool] = []
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):  # type: ignore[no-untyped-def]
+        kwargs = kwargs or {}
+        if getattr(func, "__name__", "") == "copy_":
+            non_blocking = kwargs.get("non_blocking")
+            if non_blocking is None and len(args) > 2:
+                non_blocking = args[2]
+            self.copies.append(bool(non_blocking))
+        return func(*args, **kwargs)
+
+
+def test_c1_the_launch_extent_is_the_one_the_host_filled(
+    monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
+) -> None:
+    """The op's extent follows ``turboquant_num_tokens``, not ``seq_lens_list``.
+
+    This is the gate for the hazard the field exists to close. The descriptor
+    array is indexed by token and the dispatch records sit at
+    ``decode_dispatch_word_base(tokens, splits)`` -- an offset that moves with
+    the token count -- so a launch whose ``tokens`` exceeds the extent the host
+    filled reads descriptors out of the dispatch array and dispatch records out
+    of words nobody wrote, and the buffer is large enough that no size check
+    fires. Here the two quantities are deliberately pulled apart: the builder
+    published 2 and a stale list says 5.
+    """
+    entry = _Recorder(result=None)
+    _register(monkeypatch, npu_turboquant_fused_decode=entry)
+    adapter = TurboQuantOpsAdapter(
+        TurboQuantOpsConfig(
+            ops_namespace=NAMESPACE,
+            kernel_stages=frozenset({TurboQuantKernelStage.DECODE}),
+            value_layout=TurboQuantValueLayout.CHANNEL_MAJOR,
+        )
+    )
+    impl = _impl(adapter, emulator, _layer(emulator))
+    metadata = _metadata(5)
+    metadata.turboquant_num_tokens = 2
+
+    impl._forward_decode(
+        torch.zeros(5, NUM_HEADS, HEAD_SIZE, dtype=torch.bfloat16),
+        metadata,
+        torch.zeros(5, NUM_HEADS, HEAD_SIZE, dtype=torch.bfloat16),
+    )
+
+    args = entry.args
+    assert len(metadata.seq_lens_list) == 5, "the stale quantity is still on the metadata"
+    for name in ("query", "block_tables", "context_lens", "output"):
+        rows = args[_ARG[name]].shape[0]
+        assert rows == 2, (
+            f"{name} was launched over {rows} rows, but the host filled descriptors for 2. "
+            "The two have to be the same number."
+        )
+
+
+def test_c1_the_extent_falls_back_only_when_it_was_not_published(
+    monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
+) -> None:
+    """A metadata object from the base builder still launches, over the list."""
+    entry = _Recorder(result=None)
+    _register(monkeypatch, npu_turboquant_fused_decode=entry)
+    adapter = TurboQuantOpsAdapter(
+        TurboQuantOpsConfig(
+            ops_namespace=NAMESPACE,
+            kernel_stages=frozenset({TurboQuantKernelStage.DECODE}),
+            value_layout=TurboQuantValueLayout.CHANNEL_MAJOR,
+        )
+    )
+    impl = _impl(adapter, emulator, _layer(emulator))
+    metadata = _metadata(BATCH)
+    del metadata.turboquant_num_tokens
+
+    impl._forward_decode(
+        torch.zeros(BATCH, NUM_HEADS, HEAD_SIZE, dtype=torch.bfloat16),
+        metadata,
+        torch.zeros(BATCH, NUM_HEADS, HEAD_SIZE, dtype=torch.bfloat16),
+    )
+    assert entry.args[_ARG["query"]].shape[0] == BATCH
+
+
+def test_c2_every_builder_owned_buffer_keeps_one_address(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Three steps of different widths and lengths, one address each.
+
+    This is the property that makes a captured graph replayable at all: the
+    replay re-executes device work against the pointers it recorded, so a buffer
+    that moved between steps would be read at its old address. The prefix views
+    must also start at word zero, because the op's extent checks are ``>=`` or
+    exact against ``numel`` and would not notice a shifted base.
+    """
+    from vllm_ascend.attention.turboquant_dry_run import TURBOQUANT_OP_BUILD_DECODE_TILING
+
+    _register(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: _Recorder()})
+    builder = _builder()
+    base = {
+        "turboquant_context_lens": builder._context_lens.data_ptr(),
+        "turboquant_tiling": builder._tiling.data_ptr(),
+        "turboquant_workspace": builder._workspace.data_ptr(),
+        "turboquant_query_rot": builder._query_rot.data_ptr(),
+    }
+
+    for width, length in ((2, 64), (5, 4096), (1, 128)):
+        extra = builder._build_backend_metadata(
+            types.SimpleNamespace(num_reqs=width),
+            block_table=torch.zeros(width, MAX_BLOCKS, dtype=torch.int32),
+            query_lens=torch.ones(width, dtype=torch.int32),
+            seq_lens=torch.full((width,), length, dtype=torch.int32),
+            num_decodes=width,
+            num_prefills=0,
+        )
+        assert extra["turboquant_num_tokens"] == width
+        for name, address in base.items():
+            view = extra[name]
+            assert view.data_ptr() == address, (
+                f"{name} moved on the step of width {width}. A captured replay reads the "
+                "address it recorded, so a buffer that moves is read at its old one."
+            )
+            assert view.storage_offset() == 0, f"{name} is not a prefix of its buffer"
+
+
+def test_c3_the_launch_path_never_fills_the_tiling_buffer(
+    decode: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fill stays in the builder, which runs outside any captured region.
+
+    The builder op takes a **CPU** ``context_lens``, does host arithmetic and
+    ends in a host-to-device copy. All three are legal where it runs -- the
+    metadata build, ahead of the graph -- and none is legal inside a capture. So
+    the one thing that must never happen is a launch that "helpfully" fills its
+    own descriptors when it finds them stale, which is why both ops are
+    registered here and only one of them may be called.
+    """
+    from vllm_ascend.attention.turboquant_dry_run import (
+        TURBOQUANT_KERNEL_OPS,
+        TURBOQUANT_OP_BUILD_DECODE_TILING,
+        TURBOQUANT_OP_FUSED_DECODE,
+    )
+
+    builder_entry = _Recorder()
+    _register(
+        monkeypatch,
+        **{
+            TURBOQUANT_OP_FUSED_DECODE: decode["entry"],
+            TURBOQUANT_OP_BUILD_DECODE_TILING: builder_entry,
+        },
+    )
+    decode["impl"]._forward_decode(decode["query"], decode["metadata"], decode["output"])
+
+    assert decode["entry"].calls, "the decode did not launch at all"
+    assert builder_entry.calls == [], (
+        "the decode launch called the tiling builder. That op takes a CPU tensor, does host "
+        "arithmetic and ends in an H2D copy -- it belongs in the metadata build, not in a "
+        "launch that has to be legal on a capturing stream."
+    )
+    assert TURBOQUANT_OP_BUILD_DECODE_TILING not in TURBOQUANT_KERNEL_OPS, (
+        "the tiling builder is not a kernel stage; listing it as one would put it behind the "
+        "same gate the launch is behind and invite exactly that call."
+    )
+
+
+def test_c4_a_multi_token_decode_step_is_refused() -> None:
+    """Speculative and MTP steps, which this builder cannot tile.
+
+    The runner pads tokens to ``num_reqs_padded * uniform_decode_query_len``
+    (``model_runner_v1.py:1095``), so such a step carries several query rows per
+    request while ``seq_lens`` still carries one length per request. Tiling it
+    needs the lengths expanded per accepted token. Refusing is the point: the
+    alternative is a launch whose extra rows read descriptors nobody wrote.
+    """
+    builder = _builder()
+    with pytest.raises(RuntimeError, match="multi-token decode step"):
+        builder._build_backend_metadata(
+            types.SimpleNamespace(num_reqs=2, decode_token_per_req=2),
+            block_table=torch.zeros(2, MAX_BLOCKS, dtype=torch.int32),
+            query_lens=torch.full((2,), 2, dtype=torch.int32),
+            seq_lens=torch.tensor([64, 128], dtype=torch.int32),
+            num_decodes=2,
+            num_prefills=0,
+        )
+
+
+@pytest.mark.parametrize("per_req", [None, 1])
+def test_c4_an_ordinary_decode_step_is_not_refused(per_req: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """One token per request, however the field is spelled."""
+    from vllm_ascend.attention.turboquant_dry_run import TURBOQUANT_OP_BUILD_DECODE_TILING
+
+    _register(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: _Recorder()})
+    common = types.SimpleNamespace(num_reqs=2)
+    if per_req is not None:
+        common.decode_token_per_req = per_req
+    extra = _builder()._build_backend_metadata(
+        common,
+        block_table=torch.zeros(2, MAX_BLOCKS, dtype=torch.int32),
+        query_lens=torch.ones(2, dtype=torch.int32),
+        seq_lens=torch.tensor([64, 128], dtype=torch.int32),
+        num_decodes=2,
+        num_prefills=0,
+    )
+    assert extra["turboquant_num_tokens"] == 2
+
+
+def test_c5_the_staging_is_a_ring_so_a_step_cannot_tear_the_previous_upload() -> None:
+    """Consecutive steps stage into different buffers; the third reuses the first.
+
+    The upload is asynchronous, so it completes after the builder has returned
+    and the host has moved on to the next step -- which, with async scheduling,
+    overlaps this step's execution by design. A single staging buffer would be
+    rewritten under its own in-flight copy. Depth two is sufficient because the
+    whole of step N+1 is enqueued behind step N's copy on an in-order stream.
+    """
+    builder = _builder()
+    common = types.SimpleNamespace(num_reqs=2)
+    assert TURBOQUANT_STAGING_SLOTS >= 2, (
+        "a single staging buffer is rewritten by the next step while its own asynchronous "
+        "upload is still in flight, which is a torn upload rather than a stale one."
+    )
+    slots = [
+        builder._refresh_context_lens(common, torch.tensor([64, 128], dtype=torch.int32))[1]
+        for _ in range(TURBOQUANT_STAGING_SLOTS + 1)
+    ]
+    assert len({slot.data_ptr() for slot in slots[:-1]}) == TURBOQUANT_STAGING_SLOTS, (
+        "two consecutive steps shared one staging buffer"
+    )
+    assert slots[0].data_ptr() == slots[-1].data_ptr(), "the ring is deeper than it claims to be"
+
+
+def test_c5_the_upload_is_asynchronous_only_out_of_pinned_staging() -> None:
+    """A non-blocking copy out of pageable memory is neither fast nor safe.
+
+    The runtime bounces it through a staging buffer of its own while the caller
+    believes the source is free to reuse, which is the one combination that
+    gives up both properties. So the flag follows the pinning, and a host with
+    no pinned allocator gets a blocking copy -- correct, just slower.
+    """
+    common = types.SimpleNamespace(num_reqs=2)
+    seq_lens = torch.tensor([64, 128], dtype=torch.int32)
+
+    for pinned in (True, False):
+        builder = _builder()
+        builder._staging_pinned = pinned
+        watcher = _CopyWatcher()
+        with watcher:
+            builder._refresh_context_lens(common, seq_lens)
+        assert watcher.copies, "no host-to-device copy was issued at all"
+        assert all(flag is pinned for flag in watcher.copies), (
+            f"staging pinned={pinned} but the copies were issued non_blocking={watcher.copies}"
+        )
+
+
+def test_c5_the_real_staging_is_pinned_when_the_host_can_pin() -> None:
+    """The allocation itself, which no device-free fixture can run.
+
+    ``__init__`` needs a ``VllmConfig`` and a device, so this reads the source
+    instead: it must pin, and it must record whether pinning succeeded, because
+    the copy's blocking-ness is derived from that rather than assumed.
+    """
+    import inspect
+
+    from vllm_ascend.attention.turboquant_dry_run import AscendTurboQuantMetadataBuilder
+
+    source = inspect.getsource(AscendTurboQuantMetadataBuilder.__init__)
+    assert "pin_memory()" in source
+    assert "_staging_pinned = True" in source
+    assert "_staging_pinned = False" in source, "a host with no pinned allocator must still work"
