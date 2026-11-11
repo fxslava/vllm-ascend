@@ -2421,7 +2421,20 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
         one length per accepted token, which this builder does not do. The
         alternative to refusing is mis-tiling: the extra query rows would read
         descriptors the host never wrote. So this is a guard, not a limitation
-        being introduced -- the decode has never been able to serve such a step.
+        being introduced -- the decode has never been able to serve such a step,
+        and nothing else in this repository gates TurboQuant against
+        speculative decoding, so without this it was silent.
+
+        **Not planned**, and the reason is not effort. Expanding the lengths is
+        Python, but ``build_decode_tiling`` reads
+        ``block_table + token * max_blocks``
+        (``turboquant_tiling.cpp:123``) while the engine's block table has one
+        row per *request*. At one token per request those coincide; past that
+        the operator needs either a token-to-request operand -- a schema and
+        kernel change -- or a block table the host repeats per token every
+        step, which is the per-step host-to-device copy this whole change set
+        removed. ``TURBOQUANT_GRAPH_CAPTURE_RFC.md`` records the decision and
+        the sign-off question.
         """
         per_req = int(getattr(common_attn_metadata, "decode_token_per_req", 1) or 1)
         if per_req > 1:
