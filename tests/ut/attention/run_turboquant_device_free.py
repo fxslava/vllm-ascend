@@ -9,8 +9,9 @@ works::
 
     python tests/ut/attention/run_turboquant_device_free.py -k schema -v
 
-Six test files check things that need only ``torch``: the three-plane cache
-layout arithmetic, the kernel/golden dispatch seam, and the ``ops.def`` schemas
+The files listed below check things that need only ``torch``: the three-plane
+cache layout arithmetic, the kernel/golden dispatch seam, the in-code profiler's
+bookkeeping, and the ``ops.def`` schemas
 in ``csrc/attention/turboquant/torch_bindings.cpp` against the Python stubs that
 call them. They are ordinary members of ``tests/ut/attention`` and run there in
 CI like everything else; this script only makes them reachable somewhere that
@@ -40,6 +41,7 @@ DEVICE_FREE_TESTS = (
     "test_turboquant_kernel_cache_layout.py",
     "test_turboquant_layout.py",
     "test_turboquant_nz_ingress.py",
+    "test_turboquant_profile.py",
 )
 
 

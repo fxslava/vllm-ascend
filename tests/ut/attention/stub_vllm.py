@@ -3,8 +3,9 @@
 """Stand up the narrowest vllm stubs that let the device-free TurboQuant tests run.
 
 ``test_turboquant_{op_schemas,dispatch_seam,strip_cache,dry_run_codec,
-kernel_cache_layout,layout}.py`` need nothing but ``torch``: they check layout
-arithmetic, the kernel/golden dispatch seam, and the ``ops.def`` schemas in
+kernel_cache_layout,layout,nz_ingress,profile}.py`` need nothing but ``torch``:
+they check layout arithmetic, the kernel/golden dispatch seam, the in-code
+profiler's bookkeeping, and the ``ops.def`` schemas in
 ``csrc/attention/turboquant/torch_bindings.cpp`` against the Python stubs that
 call them. The only reason they need a vllm install at all is
 ``turboquant_dry_run.py``'s own import block, and the only reason they need an
