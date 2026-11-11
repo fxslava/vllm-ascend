@@ -947,6 +947,103 @@ can be validated without a 950PR.
 
 Until then the refusal names the reason in full, and C4 gates it.
 
+---
+
+## 5a. The platform gate: diagnosis, no verdict
+
+**BLOCKED ON HARDWARE.** This section states what the gate checks, the two
+hypotheses, and the one observable that separates them. It deliberately reaches
+no conclusion, because the conclusion needs a run on a 950PR.
+
+### What the gate actually checks
+
+`_apply_turboquant_graph_mode` ([`platform.py:1241`](vllm_ascend/platform.py:1241)),
+in order:
+
+1. `turboquant_enabled()` — the `ENABLE_TURBOQUANT` flag. Not enabled, nothing
+   happens.
+2. `compilation_config.cudagraph_mode.has_full_cudagraphs()` — if the mode is
+   already PIECEWISE or NONE it returns untouched.
+3. Otherwise it overwrites `cudagraph_mode` with `PIECEWISE` when
+   `mode == CompilationMode.VLLM_COMPILE` and `NONE` when it is not.
+4. It logs the warning.
+
+**The first finding is about the log line itself.** The message a user sees —
+*"The TurboQuant dry run cannot be captured under FULL_AND_PIECEWISE … Falling
+back to PIECEWISE"* — is emitted by this function, at configuration time,
+before anything is captured. **No capture was attempted and no ACL call failed.**
+It is our own policy decision, not a platform refusal, and it probes nothing:
+not the part, not whether the kernels are registered, not the model. Any full
+mode plus `ENABLE_TURBOQUANT=1` produces it.
+
+So the question is not "why did capture fail" but "would it", and that has never
+been tested.
+
+### The two hypotheses
+
+**H1 — our code.** The fused decode launch is capture-legal after rungs 1–4 and
+the C1–C6 contract, and everything still uncapturable is ours:
+
+* the golden fallback paths the backend keeps (§1.3) — a device-to-host sync,
+  two data-dependent shapes, and an FIA call whose context lengths are a Python
+  list;
+* the ingestion's host-side reads of `seq_lens_list` to size its own work;
+* any codec op with no NPU kernel, which falls back to the CPU, which is a D2H,
+  which is 107030. The gate's docstring is explicit that this is a property a
+  PyTorch emulation cannot promise.
+
+Under H1 the gate is over-broad and the fix is to narrow it: refuse capture when
+a golden path would be taken (§5's three conditions), not whenever TurboQuant is
+on.
+
+**H2 — platform.** Even with every host operation removed, the fused launch
+itself cannot be captured: the MIX launch configuration, the in-launch
+`aclGetDeviceCapability` (B6, now a function-local static but still an ACL call
+inside a launch), or `AscendC::SyncAll<false>()` meeting a capturing stream.
+Under H2 the gate stays, and it should then say *that* rather than what it says
+now.
+
+Note which way the evidence currently leans and why it is not enough: the
+decode's Python half is measurably clean (G10: 8 torch calls, 3 distinct, no
+sync; C6: no host-metadata read), and the C++ half allocates nothing and copies
+nothing by schema. That makes H1 *plausible* for the decode launch in isolation,
+and says nothing at all about H2's three device-side candidates, none of which
+is observable from here.
+
+### The distinguishing criterion
+
+One run of `tools/tq_capture_probe.py`, which captures **only**
+`_forward_decode` — cache already written, kernels registered, no model around
+it, so a refusal is attributable to the launch rather than to any layer or
+fallback. Then:
+
+| Observation | Reads as | Why |
+| --- | --- | --- |
+| Capture succeeds, replay bit-identical to a fresh eager step | **H1** | The launch is capturable. The gate is policy; narrowing it is rung 6, and G11 proper is still what lifts it. |
+| ACL **107030** naming a **memory copy** | **H1** | A host-to-device copy survives on the path. The Python half is gated, so it is in the binding or the ingestion. |
+| ACL **107030** naming the **kernel launch** | **H2** | The launch configuration or a sync primitive is refused on a capturing stream. Re-run with `ASCEND_GLOBAL_LOG_LEVEL=0` to see which stream operation the runtime rejected. |
+| Any code **other than 107030** | **H2** | A different refusal entirely; the code verbatim is the evidence. |
+| Capture and replay both succeed, output **wrong** | **Neither — do not lift** | The worst outcome and the reason the gate is conservative. C2 covers addresses and G11a shapes and scalars, so a mismatch is a per-step quantity neither models, and it becomes a new case in them. |
+
+**The criterion in one line: the ACL error code, and the stream operation it
+names.** 107030 on a copy is ours. 107030 on the launch, or any other code, is
+the platform's.
+
+### What the probe needs that this host cannot provide
+
+The probe stops at stage 1 without `tools/tq_capture_fixture.py`, which must
+supply `build_decode_fixture(torch, tq, args) -> (impl, metadata, query, output)`
+over a **written** three-plane cache. That is on purpose: a probe over an
+unwritten cache captures the refusal path (`scale_cache is None`), not the
+launch, and would answer a different question while looking like it answered
+this one. The shortest route to that fixture is whichever harness has already
+ingested a model on the target host.
+
+### Explicitly not concluded
+
+Whether the gate reflects a platform limitation or a bug in our code. It needs
+the run. Until then `platform.py` is untouched and the gate stays closed.
+
 ### Risks, ranked
 
 1. **Silent wrongness at rung 6.** A captured decode that reads a stale buffer
