@@ -924,3 +924,153 @@ def test_c5_the_real_staging_is_pinned_when_the_host_can_pin() -> None:
     assert "pin_memory()" in source
     assert "_staging_pinned = True" in source
     assert "_staging_pinned = False" in source, "a host with no pinned allocator must still work"
+
+
+# ---------------------------------------------------------------------------
+# C6 -- the TorchFunctionMode blind spot
+#
+# G10 is a ``TorchFunctionMode`` allowlist, so it sees torch functions and
+# Tensor methods and nothing else. A Python builtin on a non-tensor container is
+# invisible to it *by construction*: ``len(attn_metadata.seq_lens_list)`` reads
+# host-side state the engine builds every step, and G10 recorded nothing,
+# because a list is not a tensor. C1 found that one by reasoning about the
+# descriptor layout rather than by any gate going red.
+#
+# So this is the gate for the whole class rather than for that instance. Every
+# host-side field of ``AscendMetadata`` is replaced with an object that records
+# any Python-level access to itself -- ``len``, subscript, iteration, truth,
+# attribute -- and the fused launch is run. The field names in the failure
+# message are the leak.
+#
+# Why these four fields. ``seq_lens`` and ``seq_lens_cpu`` are the CPU mirror
+# (``_select_seq_lens`` prefers ``_seq_lens_cpu``), ``seq_lens_list`` and
+# ``actual_seq_lengths_q`` are Python lists built per step with ``.tolist()``.
+# Reading any of them inside a launch means the launch depends on host state a
+# captured graph will not re-read. The device fields (``seq_lens_gpu``,
+# ``block_tables``, ``turboquant_*``) are deliberately NOT poisoned: reading
+# those is the whole point.
+# ---------------------------------------------------------------------------
+
+
+class _HostFieldPoison:
+    """An ``AscendMetadata`` field that records every Python-level access."""
+
+    def __init__(self, name: str, log: list[str]) -> None:
+        # Bypass __setattr__-free design: plain attributes are fine, but they
+        # must not be routed through __getattr__, so they are set directly.
+        object.__setattr__(self, "_poison_name", name)
+        object.__setattr__(self, "_poison_log", log)
+
+    def _hit(self, how: str) -> None:
+        object.__getattribute__(self, "_poison_log").append(f"{object.__getattribute__(self, '_poison_name')}.{how}")
+
+    def __len__(self) -> int:
+        self._hit("__len__")
+        return 2
+
+    def __getitem__(self, item: Any) -> int:
+        self._hit("__getitem__")
+        return 64
+
+    def __iter__(self) -> Any:
+        self._hit("__iter__")
+        return iter([64, 64])
+
+    def __bool__(self) -> bool:
+        self._hit("__bool__")
+        return True
+
+    def __getattr__(self, attr: str) -> Any:
+        # Everything real is reached through object.__getattribute__ above, so
+        # anything arriving here is the launch asking this field for something.
+        self._hit(attr)
+        raise AttributeError(attr)
+
+
+# The host-side fields of AscendMetadata, by name
+# (``attention_v1.py:189-192``). None of these may be read inside a launch.
+_HOST_FIELDS = ("seq_lens", "seq_lens_cpu", "seq_lens_list", "actual_seq_lengths_q")
+
+
+def test_c6_the_launch_reads_no_host_side_metadata_field(decode: dict[str, Any]) -> None:
+    """The class of leak ``TorchFunctionMode`` cannot see.
+
+    A revert of C1 -- ``batch_size = len(attn_metadata.seq_lens_list)`` -- turns
+    this red with ``seq_lens_list.__len__``, which is the name of the field and
+    the operation. G10 stays green through that same revert, which is why this
+    gate exists separately.
+    """
+    log: list[str] = []
+    metadata = decode["metadata"]
+    for field in _HOST_FIELDS:
+        setattr(metadata, field, _HostFieldPoison(field, log))
+
+    decode["impl"]._forward_decode(decode["query"], metadata, decode["output"])
+
+    assert decode["entry"].calls, "the decode did not launch, so this gate proved nothing"
+    assert log == [], (
+        f"the decode launch read host-side metadata: {log}. Every one of these is state the "
+        "engine rebuilds per step and a captured graph never re-reads, and none of them is "
+        "visible to the G10 allowlist because none is a tensor."
+    )
+
+
+def test_c6_the_poison_is_live(decode: dict[str, Any]) -> None:
+    """The gate's own instrument, so a silent no-op cannot pass for a clean run.
+
+    Without this, a poison that stopped recording -- or a fixture that stopped
+    installing it -- would read exactly like a clean launch path.
+    """
+    log: list[str] = []
+    poison = _HostFieldPoison("seq_lens_list", log)
+    assert len(poison) == 2
+    assert poison[0] == 64
+    # ``iter`` rather than ``list``, which also probes ``__len__`` as a size hint
+    # and would make the expected log depend on that implementation detail.
+    assert next(iter(poison)) == 64
+    probed = "tolist"  # via a name, so ruff does not rewrite it to attribute access
+    with pytest.raises(AttributeError):
+        getattr(poison, probed)
+    assert log == [
+        "seq_lens_list.__len__",
+        "seq_lens_list.__getitem__",
+        "seq_lens_list.__iter__",
+        "seq_lens_list.tolist",
+    ]
+
+
+def test_c6_the_launch_path_uses_no_stream_api() -> None:
+    """The other blind spot: ``torch.npu`` module functions are not dispatched.
+
+    ``torch.npu.synchronize()``, ``current_stream()`` and
+    ``is_current_stream_capturing()`` do not go through ``__torch_function__``,
+    so G10 would not see one either. The launch path must name none of them;
+    the profiler and the FIA fallback may, and do.
+    """
+    import inspect
+
+    from vllm_ascend.attention.turboquant_dry_run import (
+        AscendTurboQuantDryRunBackendImpl,
+        TurboQuantOpsAdapter,
+    )
+
+    launch_path = (
+        AscendTurboQuantDryRunBackendImpl._forward_decode,
+        AscendTurboQuantDryRunBackendImpl._decode_num_tokens,
+        AscendTurboQuantDryRunBackendImpl._decode_context_lens,
+        AscendTurboQuantDryRunBackendImpl._decode_buffers,
+        TurboQuantOpsAdapter.fused_decode,
+        TurboQuantOpsAdapter._kernel_fused_decode,
+        TurboQuantOpsAdapter._resolve_kernel,
+        TurboQuantOpsAdapter._has_kernel,
+    )
+    forbidden = ("torch.npu.", "torch_npu.", "synchronize(", "current_stream(", "record_stream(")
+    for function in launch_path:
+        source = inspect.getsource(function)
+        # The docstrings explain why these are absent, so only code lines count.
+        code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith(("#", '"', "'")))
+        for name in forbidden:
+            assert name not in code, (
+                f"{function.__qualname__} names {name!r}. Stream and device-module calls are "
+                "not dispatched through __torch_function__, so G10 cannot see them."
+            )
