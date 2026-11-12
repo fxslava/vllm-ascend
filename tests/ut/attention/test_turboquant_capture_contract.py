@@ -614,6 +614,25 @@ def test_the_tiling_fill_is_skipped_when_the_operator_is_absent(monkeypatch: pyt
     builder._refresh_tiling(builder._context_lens_host_ring[0], 4)  # must not raise
 
 
+def test_a_non_power_of_two_block_size_is_refused_before_the_fill(monkeypatch: pytest.MonkeyPatch) -> None:
+    """896 = 7x128: the value the hybrid Mamba/kpool page alignment used to hand over.
+
+    The binding TORCH_CHECKs the same predicate one call deeper, but from inside
+    serving and naming the check rather than the cause. The builder refuses
+    first, naming the KV cache spec's block size, and the entry must not be
+    called: a refused fill leaves the tiling buffer as it was.
+    """
+    from vllm_ascend.attention.turboquant_dry_run import TURBOQUANT_OP_BUILD_DECODE_TILING
+
+    entry = _Recorder()
+    _register(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: entry})
+    builder = _builder()
+    builder._block_size = 896
+    with pytest.raises(RuntimeError, match="power-of-two multiple of 64"):
+        builder._refresh_tiling(builder._context_lens_host_ring[0], 4)
+    assert entry.calls == []
+
+
 def test_the_builder_publishes_every_field_the_launch_reads() -> None:
     """``_build_backend_metadata`` is the shared builder's extension point.
 

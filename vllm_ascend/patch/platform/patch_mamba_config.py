@@ -74,6 +74,12 @@ def verify_and_update_config(cls, vllm_config) -> None:
 
     cache_config = vllm_config.cache_config
     model_config = vllm_config.model_config
+    from vllm_ascend.utils import turboquant_enabled
+
+    # Read once: the kpool block-size alignment below and the cache-mode
+    # decisions at the end of this function both key on it, and cache_dtype
+    # does not change in between.
+    turboquant_active = turboquant_enabled(vllm_config)
     index_kpool = _get_sparse_index_kpool(model_config)
     if index_kpool is not None:
         parallel_config = vllm_config.parallel_config
@@ -134,6 +140,35 @@ def verify_and_update_config(cls, vllm_config) -> None:
             # coarsen scheduling granularity without adding coverage.
             c8_block_size = alignment_tokens * cdiv(min_block_size, alignment_tokens)
             attn_block_size = min(attn_block_size, c8_block_size)
+        if turboquant_active and not model_config.use_mla:
+            # The TurboQuant fused decode walks the paged cache with a
+            # closed-form tile cursor that requires block_size to be a
+            # power-of-two multiple of 64 (valid_launch, and the same
+            # TORCH_CHECK in csrc/attention/turboquant/torch_bindings.cpp).
+            # The coverage-driven value above satisfies the cache writers
+            # (any multiple of 16) but usually not the cursor -- 896 = 7x128
+            # is the one a GLM-5-Next-class model lands on -- and the engine
+            # then dies inside npu_turboquant_build_decode_tiling on the first
+            # decode step. Round up to the next power of two instead: the
+            # pages still cover the mamba state page, the indexer alignment is
+            # kept because a power of two at or above alignment_tokens stays a
+            # multiple of it whenever alignment_tokens is itself a power of
+            # two, and only scheduling granularity coarsens. An odd factor in
+            # the kpool alignment (index_kpool not a power of two) makes the
+            # two constraints unsatisfiable together; refuse at config time
+            # rather than mid-serving. MLA models are exempt: TurboQuant only
+            # re-describes full-attention layers, and there are none of those
+            # in an MLA model.
+            decode_block_size = 1 << (attn_block_size - 1).bit_length()
+            if decode_block_size % alignment_tokens:
+                raise ValueError(
+                    f"ENABLE_TURBOQUANT=1 needs the attention block size to be a power-of-two "
+                    f"multiple of 64 for the fused decode's closed-form tile cursor, but the "
+                    f"sparse index-kpool geometry (index_kpool={index_kpool}) requires a multiple "
+                    f"of {alignment_tokens}, and no block size satisfies both. Run without "
+                    f"ENABLE_TURBOQUANT, or without the kpool indexer."
+                )
+            attn_block_size = decode_block_size
         if cache_config.block_size != attn_block_size:
             cache_config.block_size = attn_block_size
             logger.info(
@@ -197,9 +232,7 @@ def verify_and_update_config(cls, vllm_config) -> None:
     # yet when ModelConfig verification runs. turboquant_enabled() reads the
     # same env var and cache_dtype the spec and the allocator read, so the three
     # cannot drift apart.
-    from vllm_ascend.utils import turboquant_enabled
-
-    if turboquant_enabled(vllm_config) and cache_config.mamba_cache_mode == "align":
+    if turboquant_active and cache_config.mamba_cache_mode == "align":
         if using_kv_store_with_hybrid and not is_extract_hidden_states:
             raise ValueError(
                 "The TurboQuant KV cache cannot share a KVCacheTensor with the Mamba "
@@ -235,7 +268,7 @@ def verify_and_update_config(cls, vllm_config) -> None:
     # hashed against each other at all: the coordinator skips the assertion, and
     # nothing that could have hit is lost. A dense (non-hybrid) TurboQuant model
     # never reaches this hook and keeps prefix caching.
-    if turboquant_enabled(vllm_config) and cache_config.mamba_cache_mode != "align":
+    if turboquant_active and cache_config.mamba_cache_mode != "align":
         if cache_config.enable_prefix_caching is not False:
             logger.info(
                 "TurboQuant on a hybrid model: disabling prefix caching. The Mamba "
