@@ -379,3 +379,98 @@ def test_turboquant_still_refuses_the_hybrid_kv_store():
         pytest.raises(ValueError, match="cannot share a KVCacheTensor"),
     ):
         HybridAttentionMambaModelConfig.verify_and_update_config(config)
+
+
+def _kpool_full_attention_config(*, index_kpool=4, mamba_raw_page_size=3407872):
+    """A GLM-5-Next-class hybrid: GDN state, a kpool indexer, full GQA attention.
+
+    The mamba state page and the full-attention token page are chosen so the
+    mamba-coverage term drives the aligned block size to 896 = 7x128 without
+    TurboQuant -- a multiple of 16 and of 128, but not a power of two, which is
+    the value the fused decode's closed-form tile cursor rejects.
+    """
+    config = _config()
+    config.cache_config.cache_dtype = "auto"
+    config.cache_config.mamba_page_size_padded = None
+    config.parallel_config = SimpleNamespace(tensor_parallel_size=1)
+    config.model_config = SimpleNamespace(
+        architecture="DummyHybridModel",
+        use_mla=False,
+        dtype=torch.bfloat16,
+        max_model_len=4096,
+        hf_text_config=SimpleNamespace(index_topk=2048, index_kpool=index_kpool),
+        hf_config=SimpleNamespace(),
+        # 2 * 256 * 4 * 2 = 4096 bytes per attention token.
+        get_num_kv_heads=lambda _parallel_config: 4,
+        get_head_size=lambda: 256,
+    )
+    # A single fp32 state of the requested size: 3407872 bytes lands the
+    # coverage term at 832 tokens, and the alignment at 896.
+    elements = mamba_raw_page_size // 4
+    dummy_model_cls = SimpleNamespace(
+        get_mamba_state_shape_from_config=lambda _config: ((elements,),),
+        get_mamba_state_dtype_from_config=lambda _config: (torch.float32,),
+    )
+    return config, dummy_model_cls
+
+
+def test_turboquant_rounds_the_aligned_block_size_to_a_power_of_two():
+    """896 made the writers happy and killed the fused decode on the first step.
+
+    npu_turboquant_build_decode_tiling rejects any block size that is not a
+    power-of-two multiple of 64; under ENABLE_TURBOQUANT=1 the alignment must
+    round up to 1024 instead of landing on 896, at the cost of coarser
+    scheduling granularity only.
+    """
+    config, dummy_model_cls = _kpool_full_attention_config()
+
+    with (
+        _turboquant_on(),
+        patch(
+            "vllm_ascend.patch.platform.patch_mamba_config.ModelRegistry.resolve_model_cls",
+            return_value=(dummy_model_cls, None),
+        ),
+    ):
+        _run(config)
+
+    assert config.cache_config.block_size == 1024
+    assert config.cache_config.block_size & (config.cache_config.block_size - 1) == 0
+    assert config.cache_config.block_size % 128 == 0, "the indexer alignment is kept"
+    assert config.cache_config.mamba_page_size_padded == 1024 * 4096
+    assert config.cache_config.mamba_block_size == config.model_config.max_model_len
+
+
+def test_without_turboquant_the_aligned_block_size_keeps_the_coverage_value():
+    """The control for the test above: 896 is still correct without the decode."""
+    config, dummy_model_cls = _kpool_full_attention_config()
+
+    with (
+        _turboquant_off(),
+        patch(
+            "vllm_ascend.patch.platform.patch_mamba_config.ModelRegistry.resolve_model_cls",
+            return_value=(dummy_model_cls, None),
+        ),
+    ):
+        _run(config)
+
+    assert config.cache_config.block_size == 896
+
+
+def test_turboquant_refuses_an_odd_kpool_alignment_at_config_time():
+    """index_kpool=3 aligns to lcm(128, 48) = 384, which no power of two divides.
+
+    The two constraints -- a multiple of the kpool alignment for the indexer
+    kernel, a power of two for the decode's tile cursor -- cannot be satisfied
+    together, so the run is refused at config time rather than mid-serving.
+    """
+    config, dummy_model_cls = _kpool_full_attention_config(index_kpool=3, mamba_raw_page_size=4096)
+
+    with (
+        _turboquant_on(),
+        patch(
+            "vllm_ascend.patch.platform.patch_mamba_config.ModelRegistry.resolve_model_cls",
+            return_value=(dummy_model_cls, None),
+        ),
+        pytest.raises(ValueError, match="no block size satisfies both"),
+    ):
+        _run(config)

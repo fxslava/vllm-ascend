@@ -2521,6 +2521,22 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
         entry = getattr(namespace, TURBOQUANT_OP_BUILD_DECODE_TILING, None) if namespace else None
         if entry is None:
             return
+        if self._block_size % 64 or self._block_size & (self._block_size - 1):
+            # The binding TORCH_CHECKs this too, one call deeper, with a message
+            # that names the check but not the cause. The value here is the KV
+            # cache spec's block size, which is cache_config.block_size unless a
+            # hybrid model's Mamba/kpool page alignment rewrote it (see
+            # vllm_ascend/patch/platform/patch_mamba_config.py, which rounds to
+            # a power of two under ENABLE_TURBOQUANT=1) -- so the remaining ways
+            # to get here are an engine built before that rounding or an
+            # outright unservable --block-size.
+            raise RuntimeError(
+                f"the TurboQuant fused decode's closed-form tile cursor needs block_size to be a "
+                f"power-of-two multiple of 64, but this engine's KV cache spec carries "
+                f"block_size={self._block_size}. On a hybrid model that value comes from the "
+                f"Mamba/kpool page alignment in vllm_ascend.patch.platform.patch_mamba_config; "
+                f"otherwise it is the --block-size the engine was started with."
+            )
         entry(
             host_context_lens[:tokens],
             self._tiling,
@@ -2843,8 +2859,10 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
 
         # `block_size` is deliberately not checked here: it is a property of the
         # cache the model runner allocates, not of the layer, and it is not
-        # known yet. The binding checks it per call -- a multiple of 16 for
-        # either writer, a power-of-two multiple of 64 for the decode -- and
+        # known yet. The builder checks it once the tiling op is present
+        # (:meth:`AscendTurboQuantMetadataBuilder._refresh_tiling`), the binding
+        # checks it per call -- a multiple of 16 for either writer, a
+        # power-of-two multiple of 64 for the decode -- and
         # :class:`TurboQuantValueLayout` records why 128 is the value that
         # satisfies all three.
 
