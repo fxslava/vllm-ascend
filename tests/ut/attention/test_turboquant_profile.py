@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU tests for the TurboQuant dry run's in-code profiler.
+"""CPU tests for the TurboQuant backend's in-code profiler.
 
 The profiler exports a trace; it does not summarise one. torch_npu has no
 in-memory aggregation -- ``prof.key_averages()`` does not exist on it -- so
@@ -30,11 +30,11 @@ import types
 import pytest
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.turboquant_dry_run import (
+from vllm_ascend.attention.turboquant_v1 import (
     TURBOQUANT_PROFILE_ENV,
     TURBOQUANT_PROFILE_NOTICE,
     TURBOQUANT_PROFILE_TRACE_DIR,
-    AscendTurboQuantDryRunBackendImpl,
+    AscendTurboQuantBackendImpl,
     turboquant_profile_enabled,
 )
 
@@ -88,7 +88,7 @@ class FakeProf:
 @pytest.fixture
 def profiled(monkeypatch):
     """An impl with profiling on and a fake torch_npu.profiler behind it."""
-    import vllm_ascend.attention.turboquant_dry_run as module
+    import vllm_ascend.attention.turboquant_v1 as module
 
     state: dict[str, object] = {"calls": 0, "notices": [], "handlers": []}
 
@@ -122,7 +122,7 @@ def profiled(monkeypatch):
         ),
     )
 
-    impl = object.__new__(AscendTurboQuantDryRunBackendImpl)
+    impl = object.__new__(AscendTurboQuantBackendImpl)
     impl._profile = True
 
     def base_forward(self, **call):
@@ -212,7 +212,7 @@ def test_capture_and_a_metadataless_forward_are_never_profiled(monkeypatch, prof
     impl = profiled["impl"]
     opened: list[int] = []
     monkeypatch.setattr(
-        AscendTurboQuantDryRunBackendImpl,
+        AscendTurboQuantBackendImpl,
         "_open_profiler",
         lambda self: opened.append(1),  # type: ignore[arg-type,return-value]
     )
@@ -224,7 +224,7 @@ def test_capture_and_a_metadataless_forward_are_never_profiled(monkeypatch, prof
 
     def run(attn_metadata, capturing):
         monkeypatch.setattr(module, "_stream_is_capturing", lambda: capturing)
-        return AscendTurboQuantDryRunBackendImpl.forward(
+        return AscendTurboQuantBackendImpl.forward(
             impl,
             layer=layer,
             query=query,

@@ -259,7 +259,7 @@ def test_hybrid_reshape_views_the_three_planes():
     packed_shape = (NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE // TURBOQUANT_PACK_FACTOR)
     assert tuple(key.shape) == tuple(value.shape) == packed_shape
     assert (key.dtype, value.dtype, scale.dtype) == (torch.int8, torch.int8, torch.float32)
-    # Exactly what AscendTurboQuantDryRunBackendImpl._ensure_scale_cache demands
+    # Exactly what AscendTurboQuantBackendImpl._ensure_scale_cache demands
     # of the allocator's third plane.
     assert tuple(scale.shape) == turboquant_scale_cache_shape(key.shape[0], key.shape[1], key.shape[2])
 
@@ -301,7 +301,7 @@ def test_reshape_rejects_a_two_plane_allocation():
 
 
 def test_block_movers_move_the_scale_plane_with_the_codes():
-    from vllm_ascend.attention.turboquant_dry_run import AscendTurboQuantDryRunBackend
+    from vllm_ascend.attention.turboquant_v1 import AscendTurboQuantBackend
 
     def _layer():
         key = torch.zeros(NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE // 2, dtype=torch.int8)
@@ -318,7 +318,7 @@ def test_block_movers_move_the_scale_plane_with_the_codes():
     mapping = torch.tensor([[0, 2]])
 
     key, value, scale = _layer()
-    AscendTurboQuantDryRunBackend.copy_blocks([(key, value, scale)], mapping)
+    AscendTurboQuantBackend.copy_blocks([(key, value, scale)], mapping)
     assert int(key[2].min()) == 1
     assert int(value[2].min()) == 2
     # The scale plane is plane-major, so its block dimension is 1: both the K
@@ -328,7 +328,7 @@ def test_block_movers_move_the_scale_plane_with_the_codes():
 
     src = _layer()
     dst = tuple(torch.zeros_like(tensor) for tensor in src)
-    AscendTurboQuantDryRunBackend.swap_blocks(list(src), list(dst), mapping)
+    AscendTurboQuantBackend.swap_blocks(list(src), list(dst), mapping)
     assert int(dst[0][2].min()) == 1
     assert int(dst[1][2].min()) == 2
     assert float(dst[2][0, 2].min()) == 0.25

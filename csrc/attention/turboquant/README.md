@@ -113,7 +113,7 @@ after this port.
 ## The three ops
 
 `torch_bindings.cpp` registers into `torch.ops.turboquant_ops`, which is
-`TURBOQUANT_DEFAULT_NAMESPACE` in `vllm_ascend/attention/turboquant_dry_run.py`.
+`TURBOQUANT_DEFAULT_NAMESPACE` in `vllm_ascend/attention/turboquant_v1.py`.
 The Python adapter resolves each op by name, so an unregistered op — any build
 that is not ascend950 — makes it warn once and run its PyTorch golden model.
 That is the whole fallback contract, and `TURBOQUANT_KERNEL_STAGES` selects per
@@ -164,7 +164,7 @@ cursor, so 64, 128, 256, ... serve all three.
 
 The strip cache still exists in three places, none of them a serving path: the
 `TURBOQUANT_INGRESS_NZ=0` build variant (uncompiled here), the golden model's
-`CHANNEL_MAJOR` dry-run layout, and
+`CHANNEL_MAJOR` golden layout, and
 `vllm_ascend/attention/turboquant_nz_ingress.py`, the reference strip-to-NZ
 repack for caches written before the ingress existed. The record of *why* the
 two formats could never share a cache — a strip byte holds ONE channel at TWO

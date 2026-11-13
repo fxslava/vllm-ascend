@@ -381,7 +381,7 @@ class AscendTurboQuantAttentionSpec(FullAttentionSpec):
     and leaves the 4-bit cache with no capacity gain at all. It also has no
     concept of the fp32 scale plane, so the scales ended up in a side allocation
     that the block allocator could not see (the backend's own fallback, see
-    ``AscendTurboQuantDryRunBackendImpl._ensure_scale_cache``).
+    ``AscendTurboQuantBackendImpl._ensure_scale_cache``).
 
     A TurboQuant page holds three things, and this spec budgets all of them:
 

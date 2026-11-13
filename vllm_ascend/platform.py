@@ -333,8 +333,9 @@ class NPUPlatform(Platform):
         backend_key = (*key, use_compress)
 
         # TurboQuant 4-bit KV cache. Opt-in by environment because it is a
-        # bring-up path, not a served configuration: the dry-run backend models
-        # the Ascend C kernels in PyTorch while they are under development.
+        # bring-up path, not a served configuration: each kernel stage falls
+        # back to the backend's PyTorch golden model wherever its op is not
+        # registered.
         # The switch lives in the leaf layout module, so selecting a different
         # backend never imports the TurboQuant backend (and its rotation
         # constants) at all.
@@ -348,7 +349,7 @@ class NPUPlatform(Platform):
                 )
             if attn_selector_config.use_pcp:
                 raise NotImplementedError("ENABLE_TURBOQUANT=1 is incompatible with prefill context parallel.")
-            return "vllm_ascend.attention.turboquant_dry_run.AscendTurboQuantDryRunBackend"
+            return "vllm_ascend.attention.turboquant_v1.AscendTurboQuantBackend"
 
         if not attn_selector_config.use_pcp and _validate_fa3_backend(key, attn_selector_config):
             return "vllm_ascend.attention.fa3_v1.AscendFABackend"
@@ -614,7 +615,7 @@ class NPUPlatform(Platform):
         from vllm_ascend.quantization.methods.kv_cache.turboquant.config import validate_turboquant
 
         validate_turboquant(vllm_config)
-        _validate_turboquant_dry_run_config(vllm_config)
+        _validate_turboquant_config(vllm_config)
         if vllm_config.cache_config.cache_dtype == "fp8" or vllm_config.attention_config.indexer_kv_dtype == "fp8":
             assert get_current_hardware_profile().supports(HardwareCapability.FP8_ATTENTION)
 
@@ -630,8 +631,9 @@ class NPUPlatform(Platform):
         # 6.Update compilation / cudagraph modes (ascend_config -> vllm_config).
         _update_compilation_modes(vllm_config, ascend_config)
 
-        # The TurboQuant dry run cannot be captured into a full graph; hold it
-        # to the modes where its attention launches stay eager.
+        # The TurboQuant backend cannot be captured into a full graph while any
+        # stage runs the golden model; hold it to the modes where its attention
+        # launches stay eager.
         _apply_turboquant_graph_mode(vllm_config)
 
         # 7.Recompute cudagraph sizes and setup compile backend (vllm_config).
@@ -1262,7 +1264,7 @@ def _check_ascend_config(vllm_config: VllmConfig, ascend_config) -> None:
         )
 
 
-def _validate_turboquant_dry_run_config(vllm_config: VllmConfig) -> None:
+def _validate_turboquant_config(vllm_config: VllmConfig) -> None:
     """Constraints of the ``ENABLE_TURBOQUANT`` three-plane GQA KV cache.
 
     This is the packed 4-bit bring-up path selected by ``ENABLE_TURBOQUANT=1``
@@ -1335,16 +1337,16 @@ def _apply_turboquant_graph_mode(vllm_config: VllmConfig) -> None:
     TurboQuant path is launched eagerly between the pieces. That needs nothing
     from this function.
 
-    A *full* graph captures the attention layers themselves, and the dry run is
-    not capturable there -- by construction, not by accident. It is a PyTorch
-    model of kernels that do not exist yet: the ingestion reads host-side
-    ``seq_lens_list`` to size its own work, and the codec is ordinary torch ops,
-    any one of which may have no NPU kernel and fall back to the CPU. A fallback
-    is a device-to-host copy, and ``aclrtMemcpy`` on a capturing stream fails
-    with 107030 ("Stream during the capture stage is not supported"). The known
-    offenders in the codec are gone (see ``_exp2_fp32``), but "no op in this
-    emulator ever synchronises" is not a property a PyTorch model can promise,
-    so the mode stays out of reach until a real kernel replaces the emulation.
+    A *full* graph captures the attention layers themselves, and the golden
+    model is not capturable there -- by construction, not by accident. The
+    ingestion reads host-side ``seq_lens_list`` to size its own work, and the
+    codec is ordinary torch ops, any one of which may have no NPU kernel and
+    fall back to the CPU. A fallback is a device-to-host copy, and
+    ``aclrtMemcpy`` on a capturing stream fails with 107030 ("Stream during the
+    capture stage is not supported"). The known offenders in the codec are gone
+    (see ``_exp2_fp32``), but "no op in this emulator ever synchronises" is not
+    a property a PyTorch model can promise, so the mode stays out of reach
+    while any stage runs golden.
 
     Declined, not refused: ``FULL_DECODE_ONLY`` is the platform's own default
     for a decode-heavy run, so raising here would mean ``ENABLE_TURBOQUANT=1``
@@ -1370,7 +1372,7 @@ def _apply_turboquant_graph_mode(vllm_config: VllmConfig) -> None:
     else:
         downgraded = CUDAGraphMode.NONE
     logger.warning(
-        "The TurboQuant dry run cannot be captured under %s, where the attention launches are "
+        "The TurboQuant backend cannot be captured under %s, where the attention launches are "
         "captured rather than run between the captured pieces. Falling back to %s.%s",
         compilation_config.cudagraph_mode.name,
         downgraded.name,

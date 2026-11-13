@@ -16,7 +16,7 @@ describes all three so they cannot drift apart:
 Three consumers share it: the KV cache spec
 (:class:`vllm_ascend.core.kv_cache_interface.AscendTurboQuantAttentionSpec`)
 budgets a page from it, the model runner carves and views the planes with it,
-and the backend (:mod:`vllm_ascend.attention.turboquant_dry_run`) writes the
+and the backend (:mod:`vllm_ascend.attention.turboquant_v1`) writes the
 bytes it describes. A page budget that disagreed with the bytes written is
 silent corruption rather than an error, which is why the arithmetic lives here
 once.

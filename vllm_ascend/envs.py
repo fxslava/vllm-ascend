@@ -95,7 +95,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     # vllm_ascend/patch/platform/patch_mamba_config.py. The ingestion operators
     # (torch.ops.turboquant_ops.npu_turboquant_reshape_and_cache_a8 and
     # ..._reshape_scatter_aiv) exist only in an Ascend 950 build; this flag does
-    # not conjure them on other hardware, and the dry-run backend falls back to
+    # not conjure them on other hardware, and the backend falls back to
     # its PyTorch golden model when they are absent.
     "ENABLE_TURBOQUANT": lambda: bool(int(os.getenv("ENABLE_TURBOQUANT", "0"))),
     # Check every slot the TurboQuant writer is handed before the launch: that

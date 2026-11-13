@@ -25,11 +25,6 @@ import re
 import pytest
 import torch
 
-from vllm_ascend.attention.turboquant_dry_run import (
-    TURBOQUANT_PACK_FACTOR,
-    TURBOQUANT_STRIP_TOKENS,
-    TurboQuantEmulator,
-)
 from vllm_ascend.attention.turboquant_nz_ingress import (
     TURBOQUANT_FP32_PER_BLOCK,
     TURBOQUANT_NZ_OPERAND_C0,
@@ -42,6 +37,11 @@ from vllm_ascend.attention.turboquant_nz_ingress import (
     turboquant_repack_strip_to_nz_tiled,
     turboquant_scales_to_nz_tiled,
     turboquant_strip_cache_to_codes,
+)
+from vllm_ascend.attention.turboquant_v1 import (
+    TURBOQUANT_PACK_FACTOR,
+    TURBOQUANT_STRIP_TOKENS,
+    TurboQuantEmulator,
 )
 
 REPO = pathlib.Path(__file__).resolve().parents[3]
@@ -367,7 +367,7 @@ def test_repack_bridges_the_adapter_strip_writer() -> None:
     gates against the kernels' nibble formula, so going through it means the
     bridge starts from the layout the audited writers are held to.
     """
-    from vllm_ascend.attention.turboquant_dry_run import TurboQuantOpsAdapter
+    from vllm_ascend.attention.turboquant_v1 import TurboQuantOpsAdapter
 
     num_blocks, num_kv_heads, block_size, head_size = 2, 2, 64, 128
     packed_bytes = head_size // TURBOQUANT_PACK_FACTOR

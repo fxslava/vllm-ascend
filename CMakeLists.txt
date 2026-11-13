@@ -63,7 +63,7 @@ include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 # csrc/attention/turboquant/torch_bindings.cpp -- so torch.ops.turboquant_ops
 # does not exist there rather than existing with nothing behind it. That absence
 # is the Python side's fallback signal: the adapter in
-# vllm_ascend/attention/turboquant_dry_run.py warns once and runs its golden
+# vllm_ascend/attention/turboquant_v1.py warns once and runs its golden
 # model when a stage is switched on and its op is unregistered.
 #
 # CANN 9.2 drives these through the ASC language toolchain: asc-config.cmake

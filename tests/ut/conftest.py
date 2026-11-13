@@ -36,7 +36,7 @@ try:
     # Note: do not import torch here for cpu env, which will lead to circle import error.
     subprocess.run(["npu-smi", "info"], capture_output=True, check=True)
     _npu_available = True
-except (subprocess.CalledProcessError, FileNotFoundError):
+except (subprocess.CalledProcessError, OSError):
     _npu_available = False
 
 if not _npu_available:

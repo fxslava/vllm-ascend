@@ -30,7 +30,14 @@ from typing import Any
 import pytest
 import torch
 
-from vllm_ascend.attention.turboquant_dry_run import (
+from vllm_ascend.attention.turboquant_layout import (
+    TURBOQUANT_KEY_PLANE,
+    TURBOQUANT_PACK_FACTOR,
+    TURBOQUANT_VALUE_PLANE,
+    turboquant_packed_bytes,
+    turboquant_scale_cache_shape,
+)
+from vllm_ascend.attention.turboquant_v1 import (
     TURBOQUANT_NAMESPACE_ENV,
     TURBOQUANT_OP_FUSED_DECODE,
     TURBOQUANT_OP_RESHAPE_AND_CACHE,
@@ -42,13 +49,6 @@ from vllm_ascend.attention.turboquant_dry_run import (
     TurboQuantOpsAdapter,
     TurboQuantOpsConfig,
     TurboQuantValueLayout,
-)
-from vllm_ascend.attention.turboquant_layout import (
-    TURBOQUANT_KEY_PLANE,
-    TURBOQUANT_PACK_FACTOR,
-    TURBOQUANT_VALUE_PLANE,
-    turboquant_packed_bytes,
-    turboquant_scale_cache_shape,
 )
 
 # The strip cache's block_size is 16: it is kTokens in the batch writer, a
