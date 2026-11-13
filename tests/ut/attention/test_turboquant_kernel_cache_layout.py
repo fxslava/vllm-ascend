@@ -3,23 +3,23 @@
 """CPU tests for the cache layout the TurboQuant NPU writers leave behind.
 
 The two audited writers (``csrc/attention/turboquant/op_kernel/turboquant_reshape_batch.cpp``
-and ``..._scatter.cpp``) do not write the golden model's cache, and they no
-longer write the same cache as each other: the batch writer is built with
-``TURBOQUANT_INGRESS_NZ=1`` and produces the NZ-tiled layout the fused decode
-reads, while the scatter writer still produces the strip cache -- page axis
+and ``..._scatter.cpp``) do not write the golden model's cache. Both are built
+with ``TURBOQUANT_INGRESS_NZ=1`` and produce the NZ-tiled layout the fused
+decode reads; the strip cache -- page axis
 ``(num_blocks, num_kv_heads, block_size, head_size / 2)``, head before token,
-value nibble ``channel * block_size + token`` inside a 16-token strip.
+value nibble ``channel * block_size + token`` inside a 16-token strip -- is the
+pre-ingress format, kept readable for caches written before the writers crossed
+over.
 
 So three things have to hold, and all three are checked here without a device:
 
 * the layout is a property of whichever writer owns the page, not a global, so
-  switching an ingestion stage on is enough -- the reader follows. The batch
-  writer's stage means NZ_TILED; the scatter writer's alone means the strip
-  cache.
+  switching an ingestion stage on is enough -- the reader follows. Either NPU
+  writer's stage means NZ_TILED.
 * a mixed configuration (NPU writer, golden gather) reads back correctly. The
-  reference strip cache below is written in PyTorch to the writers' documented
-  nibble arithmetic, and gathering it must produce the same four panels as
-  gathering the golden model's own cache.
+  reference strip cache below is written in PyTorch to the pre-ingress writers'
+  documented nibble arithmetic, and gathering it must produce the same four
+  panels as gathering the golden model's own cache.
 * ``TURBOQUANT_KERNEL_STAGES=none`` falls all the way back: no registered op is
   called and the golden model writes and reads its own layout.
 """
@@ -202,7 +202,7 @@ def test_golden_writers_keep_the_configured_layout(monkeypatch: pytest.MonkeyPat
     ("stage", "op_name", "expected"),
     [
         (TurboQuantKernelStage.RESHAPE_AND_CACHE, TURBOQUANT_OP_RESHAPE_AND_CACHE, TurboQuantValueLayout.NZ_TILED),
-        (TurboQuantKernelStage.SCATTER, TURBOQUANT_OP_RESHAPE_SCATTER, TurboQuantValueLayout.CHANNEL_MAJOR),
+        (TurboQuantKernelStage.SCATTER, TURBOQUANT_OP_RESHAPE_SCATTER, TurboQuantValueLayout.NZ_TILED),
     ],
 )
 def test_an_engaged_writer_owns_the_cache_layout(
@@ -210,20 +210,20 @@ def test_an_engaged_writer_owns_the_cache_layout(
 ) -> None:
     """One ingestion stage is enough: the cache is that writer's layout from then on.
 
-    The batch writer is the NZ ingress now, so its stage puts the cache in
-    NZ_TILED; the scatter writer has no NZ variant and still means the strip
-    cache.
+    Both writers are the NZ ingress now, so either stage puts the cache in
+    NZ_TILED; the strip layout is reachable only as an explicit golden config,
+    for caches written before the ingress existed.
     """
     _register(monkeypatch, op_name)
     assert _adapter(stage).value_layout() is expected
 
 
-def test_the_batch_writers_nz_layout_wins_over_the_scatter_stage(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Both writers staged: the cache is NZ, and the strip scatter is kept off it.
+def test_the_nz_layout_survives_both_writers_staged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both writers staged: one cache, one layout -- NZ on both sides.
 
-    The two kernels cannot share a cache, so the adapter reports NZ_TILED --
-    the batch writer's layout -- and reshape_scatter_decode falls back to the
-    golden NZ writer rather than letting the strip kernel corrupt the fractal.
+    The two kernels write the same NZ-tiled cache the fused decode reads, so
+    there is no writer conflict left to arbitrate; this pins that the adapter
+    reports NZ_TILED and neither stage pulls it anywhere else.
     """
     _register(monkeypatch, TURBOQUANT_OP_RESHAPE_AND_CACHE, TURBOQUANT_OP_RESHAPE_SCATTER)
     adapter = _adapter(TurboQuantKernelStage.RESHAPE_AND_CACHE, TurboQuantKernelStage.SCATTER)
@@ -280,7 +280,7 @@ def test_the_golden_writer_now_does_the_channel_major_rmw(emulator: TurboQuantEm
             TurboQuantKernelStage.SCATTER,
             TURBOQUANT_OP_RESHAPE_SCATTER,
             "reshape_scatter_decode",
-            TurboQuantValueLayout.CHANNEL_MAJOR,
+            TurboQuantValueLayout.NZ_TILED,
         ),
     ],
 )
@@ -294,9 +294,9 @@ def test_an_engaged_writer_never_reaches_the_refusal(
 ) -> None:
     """The kernel owns the cache layout, so the layout must not refuse the call.
 
-    `value_layout()` reports the staged writer's layout -- NZ_TILED for the
-    batch writer, the strip layout for the scatter -- and that must not make
-    the entry point raise on its way to the kernel it is about to call.
+    `value_layout()` reports the staged writer's layout -- NZ_TILED for both
+    writers now -- and that must not make the entry point raise on its way to
+    the kernel it is about to call.
     """
     entries = _register(monkeypatch, op_name)
     adapter = _adapter(stage)
@@ -318,10 +318,11 @@ def test_the_golden_gather_reads_a_strip_cache_back(
     """Gathering a kernel-written cache must give the same panels as a golden one.
 
     Both sides ingest the same activations. One writes the golden token-major
-    cache and gathers it; the other writes the strip cache the NPU writers
-    produce and gathers it with the scatter stage engaged, which is what selects
-    the de-interleaving reader. The four panels must agree bit for bit -- the
-    codec is the same, only the byte order the reader undoes differs.
+    cache and gathers it; the other writes the strip cache the pre-ingress
+    writers produced and gathers it with the strip layout pinned in the config,
+    which is how a cache written before the NZ ingress existed is read. The four
+    panels must agree bit for bit -- the codec is the same, only the byte order
+    the reader undoes differs.
     """
     key, value = _activations(BLOCK_SIZE * 2)
     slot_mapping = torch.arange(BLOCK_SIZE * 2, dtype=torch.int32)
@@ -334,7 +335,9 @@ def test_the_golden_gather_reads_a_strip_cache_back(
     strip_caches = _caches()
     _write_strip_cache(key, value, *strip_caches, slot_mapping, emulator)
     entries = _register(monkeypatch, TURBOQUANT_OP_RESHAPE_SCATTER)
-    reader = _adapter(TurboQuantKernelStage.SCATTER)
+    # No stage: both NPU writers are NZ now, so staging one would report
+    # NZ_TILED. The strip layout is the config's to pin.
+    reader = _adapter(value_layout=TurboQuantValueLayout.CHANNEL_MAJOR)
     assert reader.value_layout() is TurboQuantValueLayout.CHANNEL_MAJOR
     actual = reader.gather(*strip_caches, block_tables)
 
@@ -355,7 +358,7 @@ def test_the_strip_reader_round_trips_to_the_activations(
     _write_strip_cache(key, value, *strip_caches, torch.arange(BLOCK_SIZE, dtype=torch.int32), emulator)
 
     _register(monkeypatch, TURBOQUANT_OP_RESHAPE_SCATTER)
-    reader = _adapter(TurboQuantKernelStage.SCATTER)
+    reader = _adapter(value_layout=TurboQuantValueLayout.CHANNEL_MAJOR)
     packed_key, key_scales, packed_value, value_scales = reader.gather(
         *strip_caches, torch.zeros(1, 1, dtype=torch.int32)
     )
