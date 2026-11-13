@@ -28,8 +28,14 @@ from typing import Any
 import pytest
 import torch
 
-from vllm_ascend.attention import turboquant_dry_run
-from vllm_ascend.attention.turboquant_dry_run import (
+from vllm_ascend.attention import turboquant_v1
+from vllm_ascend.attention.turboquant_layout import (
+    TURBOQUANT_KEY_PLANE,
+    TURBOQUANT_VALUE_PLANE,
+    turboquant_packed_bytes,
+    turboquant_scale_cache_shape,
+)
+from vllm_ascend.attention.turboquant_v1 import (
     TURBOQUANT_DECODE_MAX_SPLITS,
     TURBOQUANT_DECODE_SPLITS,
     TURBOQUANT_KERNEL_OPS,
@@ -46,7 +52,7 @@ from vllm_ascend.attention.turboquant_dry_run import (
     TURBOQUANT_STAGE_UNROTATED,
     TURBOQUANT_STRIP_TOKENS,
     TURBOQUANT_TABLE_DTYPE,
-    AscendTurboQuantDryRunBackendImpl,
+    AscendTurboQuantBackendImpl,
     TurboQuantEmulator,
     TurboQuantIngestionPhase,
     TurboQuantKernelStage,
@@ -59,12 +65,6 @@ from vllm_ascend.attention.turboquant_dry_run import (
     turboquant_decode_workspace_floats,
     turboquant_plan_strip_ingestion,
     turboquant_tiling_upper_bound_words,
-)
-from vllm_ascend.attention.turboquant_layout import (
-    TURBOQUANT_KEY_PLANE,
-    TURBOQUANT_VALUE_PLANE,
-    turboquant_packed_bytes,
-    turboquant_scale_cache_shape,
 )
 
 HEAD_SIZE = 64
@@ -844,9 +844,7 @@ def _launch_buffers(tokens: int, num_heads: int, head_size: int = HEAD_SIZE) -> 
         "workspace": torch.zeros(
             turboquant_decode_workspace_floats(tokens, num_heads, head_size, splits), dtype=torch.float32
         ),
-        "query_rot": torch.zeros(
-            turboquant_decode_query_rot_floats(tokens, num_heads, head_size), dtype=torch.float32
-        ),
+        "query_rot": torch.zeros(turboquant_decode_query_rot_floats(tokens, num_heads, head_size), dtype=torch.float32),
     }
 
 
@@ -983,7 +981,7 @@ class _PhaseRecordingAdapter(TurboQuantOpsAdapter):
         self.phases.append(TurboQuantIngestionPhase.DECODE)
 
 
-class _Impl(AscendTurboQuantDryRunBackendImpl):
+class _Impl(AscendTurboQuantBackendImpl):
     """The backend's ``reshape_and_cache`` over only the state it reads."""
 
     def __init__(self, emulator: TurboQuantEmulator) -> None:
@@ -1016,15 +1014,13 @@ def _metadata(num_actual_tokens: int, seq_lens_list: Any, with_field: bool = Tru
 def test_the_phase_comes_from_the_token_count(
     num_actual_tokens: int, seq_lens_list: list[int], expected: TurboQuantIngestionPhase
 ) -> None:
-    phase = AscendTurboQuantDryRunBackendImpl._ingestion_phase(
-        _metadata(num_actual_tokens, seq_lens_list), num_actual_tokens
-    )
+    phase = AscendTurboQuantBackendImpl._ingestion_phase(_metadata(num_actual_tokens, seq_lens_list), num_actual_tokens)
     assert phase is expected
 
 
 @pytest.mark.parametrize("metadata", [_metadata(2, None), _metadata(2, None, with_field=False)])
 def test_absent_or_none_seq_lens_list_reads_as_prefill(metadata: Any) -> None:
-    assert AscendTurboQuantDryRunBackendImpl._ingestion_phase(metadata, 2) is TurboQuantIngestionPhase.PREFILL
+    assert AscendTurboQuantBackendImpl._ingestion_phase(metadata, 2) is TurboQuantIngestionPhase.PREFILL
 
 
 @pytest.mark.parametrize(
@@ -1069,7 +1065,7 @@ def test_no_tokens_writes_nothing(emulator: TurboQuantEmulator) -> None:
 @pytest.fixture
 def unloaded(monkeypatch: pytest.MonkeyPatch) -> None:
     """Put the one-shot loader back to "not tried yet" for this test."""
-    monkeypatch.setattr(turboquant_dry_run, "_TURBOQUANT_EXTENSION_LOADED", None)
+    monkeypatch.setattr(turboquant_v1, "_TURBOQUANT_EXTENSION_LOADED", None)
 
 
 def test_a_phantom_namespace_is_not_mistaken_for_a_registration() -> None:
@@ -1095,19 +1091,19 @@ def test_a_real_operator_is_reported_as_registered() -> None:
 def test_no_stage_switched_on_does_not_touch_the_extension(unloaded: None) -> None:
     """A golden-only run must not pay for the import, nor warn about it."""
     _adapter()
-    assert turboquant_dry_run._TURBOQUANT_EXTENSION_LOADED is None
+    assert turboquant_v1._TURBOQUANT_EXTENSION_LOADED is None
 
 
 def test_a_stage_switched_on_attempts_the_import_once(unloaded: None) -> None:
     _adapter(*TurboQuantKernelStage)
-    first = turboquant_dry_run._TURBOQUANT_EXTENSION_LOADED
+    first = turboquant_v1._TURBOQUANT_EXTENSION_LOADED
     assert first is not None, "a stage-on adapter must have tried the import"
 
     calls: list[int] = []
     monkey = pytest.MonkeyPatch()
     try:
         # Anything the loader would do on a second attempt lands here instead.
-        monkey.setattr(turboquant_dry_run.torch.compiler, "is_compiling", lambda: calls.append(1) or False)
+        monkey.setattr(turboquant_v1.torch.compiler, "is_compiling", lambda: calls.append(1) or False)
         assert load_turboquant_extension() is first
     finally:
         monkey.undo()
@@ -1116,8 +1112,13 @@ def test_a_stage_switched_on_attempts_the_import_once(unloaded: None) -> None:
 
 def test_missing_operators_are_reported_with_the_stages_that_wanted_them(
     unloaded: None,
+    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    # Forced rather than observed: on an ascend950 box the ops really are
+    # registered and nothing would warn, so the warning path only exists to be
+    # tested if the probe answers "missing" here.
+    monkeypatch.setattr(turboquant_v1, "_is_op_registered", lambda namespace, op_name: False)
     with caplog.at_level(logging.WARNING):
         _adapter(TurboQuantKernelStage.SCATTER)
     assert any(
@@ -1131,7 +1132,7 @@ def test_a_fully_registered_namespace_is_quiet(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """With every registered op present, construction says nothing at WARNING."""
-    monkeypatch.setattr(turboquant_dry_run, "_is_op_registered", lambda namespace, op_name: True)
+    monkeypatch.setattr(turboquant_v1, "_is_op_registered", lambda namespace, op_name: True)
     with caplog.at_level(logging.WARNING):
         _adapter(*TurboQuantKernelStage)
     assert caplog.records == []
@@ -1175,10 +1176,10 @@ def test_every_reported_operator_is_one_the_bindings_declare() -> None:
 
 def _geometry(
     *stages: TurboQuantKernelStage,
-    head_size: int = turboquant_dry_run.TURBOQUANT_KERNEL_HEAD_SIZE,
-    num_kv_heads: int = turboquant_dry_run.TURBOQUANT_KERNEL_KV_HEADS,
+    head_size: int = turboquant_v1.TURBOQUANT_KERNEL_HEAD_SIZE,
+    num_kv_heads: int = turboquant_v1.TURBOQUANT_KERNEL_KV_HEADS,
     num_heads: int | None = None,
-    model_dtype: torch.dtype = turboquant_dry_run.TURBOQUANT_KERNEL_DTYPE,
+    model_dtype: torch.dtype = turboquant_v1.TURBOQUANT_KERNEL_DTYPE,
 ) -> Any:
     """The state :meth:`_check_kernel_geometry` reads, and nothing else.
 
@@ -1196,7 +1197,7 @@ def _geometry(
 
 
 def _check(state: Any) -> None:
-    AscendTurboQuantDryRunBackendImpl._check_kernel_geometry(state)
+    AscendTurboQuantBackendImpl._check_kernel_geometry(state)
 
 
 @pytest.mark.parametrize(
@@ -1286,7 +1287,7 @@ def test_the_refusal_names_the_stage_that_cannot_run_the_model() -> None:
     with pytest.raises(ValueError, match=r"reshape_and_cache") as both:
         _check(_geometry(TurboQuantKernelStage.RESHAPE_AND_CACHE, TurboQuantKernelStage.DECODE, head_size=64))
     assert "decode" in str(both.value)
-    assert turboquant_dry_run.TURBOQUANT_STAGES_ENV in str(both.value)
+    assert turboquant_v1.TURBOQUANT_STAGES_ENV in str(both.value)
 
 
 def test_the_rotation_operand_is_the_bf16_blob_the_cube_stages() -> None:
@@ -1298,9 +1299,9 @@ def test_the_rotation_operand_is_the_bf16_blob_the_cube_stages() -> None:
     is a unit sign, exact in BF16, so the conversion is a representation change
     and the operand stays bit-identical to the oracle's.
     """
-    emulator = TurboQuantEmulator(head_size=turboquant_dry_run.TURBOQUANT_KERNEL_HEAD_SIZE, device=CPU)
-    tables = turboquant_dry_run._codec_tables(emulator)
-    groups = turboquant_dry_run.TURBOQUANT_KERNEL_HEAD_SIZE // 32
+    emulator = TurboQuantEmulator(head_size=turboquant_v1.TURBOQUANT_KERNEL_HEAD_SIZE, device=CPU)
+    tables = turboquant_v1._codec_tables(emulator)
+    groups = turboquant_v1.TURBOQUANT_KERNEL_HEAD_SIZE // 32
     assert tables.dtype is TURBOQUANT_TABLE_DTYPE
     assert tables.shape == (2 * groups, 32, 32)
     assert tables.element_size() == 2

@@ -35,7 +35,7 @@ to remove at all. `FULL_AND_PIECEWISE` does keep the splitting ops, because it
 nothing here, because in every one of the three modes attention is reached
 through `vllm::unified_attention_with_output`, a vLLM custom op with its own
 fake implementation. Dynamo treats it as one opaque node and never traces into
-`AscendTurboQuantDryRunBackendImpl.forward_impl`. The TurboQuant op is therefore
+`AscendTurboQuantBackendImpl.forward_impl`. The TurboQuant op is therefore
 invisible to `torch.compile` in every mode, and its C++ `kMeta` kernels
 ([`torch_bindings.cpp:829-866`](csrc/attention/turboquant/torch_bindings.cpp:829))
 exist for `torch.export` and nothing else — the bindings' own comment says so
@@ -122,7 +122,7 @@ const at::Tensor context_lens_device = context_lens.device() == query.device()
 
 Exactly one of the two copies always happens, and the comment says so. The
 caller is
-[`turboquant_dry_run.py:2665`](vllm_ascend/attention/turboquant_dry_run.py:2665),
+[`turboquant_v1.py:2665`](vllm_ascend/attention/turboquant_v1.py:2665),
 which passes `attn_metadata.seq_lens[:batch_size]`. That field is the **CPU
 mirror**: `_select_seq_lens`
 ([`utils.py:594-628`](vllm_ascend/attention/utils.py:594)) prefers
@@ -204,7 +204,7 @@ stream-touching, so probably capture-safe (**VERIFY**), but it is a per-launch
 ACL call that belongs in a function-local `static`.
 
 **B7 — two model-static operands are rebuilt in Python on every call.**
-[`turboquant_dry_run.py:1628-1629`](vllm_ascend/attention/turboquant_dry_run.py:1628):
+[`turboquant_v1.py:1628-1629`](vllm_ascend/attention/turboquant_v1.py:1628):
 
 ```python
 rot_tables=_codec_tables(emulator),
@@ -212,19 +212,19 @@ h16=_h16_operand(emulator.device),
 ```
 
 `_codec_tables`
-([`:1979`](vllm_ascend/attention/turboquant_dry_run.py:1979)) and
-`_h16_operand` ([`:2034`](vllm_ascend/attention/turboquant_dry_run.py:2034))
+([`:1979`](vllm_ascend/attention/turboquant_v1.py:1979)) and
+`_h16_operand` ([`:2034`](vllm_ascend/attention/turboquant_v1.py:2034))
 both go through `_sylvester_hadamard`
-([`:392`](vllm_ascend/attention/turboquant_dry_run.py:392)), which builds its
+([`:392`](vllm_ascend/attention/turboquant_v1.py:392)), which builds its
 matrix with an `arange`, a bitwise `and`, a `bit_length()`-deep XOR loop, a
 `where` and a `to` — roughly eleven device kernels and two allocations, per
 layer, per step. `_ensure_statics` already caches `_codec_tables(emulator)` onto
 the layer as `layer._turboquant_codec_tables`
-([`:2415`](vllm_ascend/attention/turboquant_dry_run.py:2415)) and the decode path
+([`:2415`](vllm_ascend/attention/turboquant_v1.py:2415)) and the decode path
 simply does not use it.
 
 **B8 — the batch size, and therefore every slice extent, is a host Python
-int.** [`:2653`](vllm_ascend/attention/turboquant_dry_run.py:2653):
+int.** [`:2653`](vllm_ascend/attention/turboquant_v1.py:2653):
 
 ```python
 batch_size = len(attn_metadata.seq_lens_list)
@@ -247,21 +247,21 @@ the ops are absent*, and they are why the lifted gate must be conditional on the
 ops being present rather than unconditional.
 
 * `bool(valid.all())` — a device-to-host synchronisation
-  ([`:1375`](vllm_ascend/attention/turboquant_dry_run.py:1375)), followed by
+  ([`:1375`](vllm_ascend/attention/turboquant_v1.py:1375)), followed by
   boolean-mask indexing, whose output shape is data-dependent.
 * `torch.unique(pages, return_inverse=True)`
-  ([`:1445`](vllm_ascend/attention/turboquant_dry_run.py:1445)) — data-dependent
+  ([`:1445`](vllm_ascend/attention/turboquant_v1.py:1445)) — data-dependent
   output shape, in the value plane's read-modify-write.
 * `slot_mapping.tolist()`
-  ([`:1126`](vllm_ascend/attention/turboquant_dry_run.py:1126)) — D2H, in the
+  ([`:1126`](vllm_ascend/attention/turboquant_v1.py:1126)) — D2H, in the
   prefill strip planner.
 * The FIA fallback passes `actual_seq_lengths_kv=attn_metadata.seq_lens_list`, a
-  Python list ([`:2682`](vllm_ascend/attention/turboquant_dry_run.py:2682)), so
+  Python list ([`:2682`](vllm_ascend/attention/turboquant_v1.py:2682)), so
   the context lengths are baked into the captured launch. This is the specific
   failure the earlier note recorded: *the replays do not fail, they attend over
   a stale length.*
 * `_forward_mixed` reads `int(query_lens_cpu.max())` and `.tolist()`
-  ([`:2740-2778`](vllm_ascend/attention/turboquant_dry_run.py:2740)). Only
+  ([`:2740-2778`](vllm_ascend/attention/turboquant_v1.py:2740)). Only
   reachable outside `DecodeOnly`, so irrelevant to `FULL_DECODE_ONLY` and fatal
   to `FULL`.
 
@@ -426,7 +426,7 @@ launch, or storage allocated per launch.
 ### 3.1 Tier 0
 
 * **Python side**: `fused_decode` reads `layer._turboquant_codec_tables` (already
-  cached, [`:2415`](vllm_ascend/attention/turboquant_dry_run.py:2415)) instead of
+  cached, [`:2415`](vllm_ascend/attention/turboquant_v1.py:2415)) instead of
   calling `_codec_tables(emulator)`, and gains an `_h16` cache alongside it —
   either on the emulator or in a module-level dict keyed by
   `(order, device)`. Kills B7.
@@ -470,7 +470,7 @@ and `:290`), so for a live split the buffer is write-before-read and
 and skips the pipeline without writing its partial, and the reducer's skip
 condition for such a split has not been traced. At `num_splits == 1`
 (`TURBOQUANT_DECODE_SPLITS = 1`,
-[`:684`](vllm_ascend/attention/turboquant_dry_run.py:684)) `NeedsReduction()`
+[`:684`](vllm_ascend/attention/turboquant_v1.py:684)) `NeedsReduction()`
 returns false and the question is moot; it becomes live the moment Split-K is
 switched on. **Resolve before rung 6.** Conservative answer: keep the
 zero-fill, but issue it once per capture rather than once per launch.
@@ -709,7 +709,7 @@ condition is three-part, and all three parts are checkable at
 `check_and_update_config` time:
 
 ```python
-from vllm_ascend.attention.turboquant_dry_run import (
+from vllm_ascend.attention.turboquant_v1 import (
     TURBOQUANT_OP_FUSED_DECODE, TURBOQUANT_OP_RESHAPE_SCATTER,
     _is_op_registered, load_turboquant_extension,
 )
@@ -723,7 +723,7 @@ kernels_present = all(
 
 1. **Both kernels registered.** Without them the golden path runs, and §1.3 is
    unfixable. `_is_op_registered`
-   ([`turboquant_dry_run.py:709`](vllm_ascend/attention/turboquant_dry_run.py:709))
+   ([`turboquant_v1.py:709`](vllm_ascend/attention/turboquant_v1.py:709))
    is the existing predicate.
 2. **The cache the writers produce is the cache the decode reads.** Until the
    write-time NZ ingress lands, it is not, and a captured decode would read
@@ -749,12 +749,12 @@ landing under `PIECEWISE` on their own merits; full capture starts at rung 3.
 
 | # | Change | Files | Risk | Gate |
 | --- | --- | --- | --- | --- |
-| **1** ✅ | Tier-0 statics: cache `basis_pool`, `mode_tables`, `aiv_core_num` in C++; use `layer._turboquant_codec_tables` and a cached `h16` in Python | `torch_bindings.cpp`, `turboquant_dry_run.py` | Low. No schema, no kernel, no layout. | G1, G2, G3 |
-| **2** ✅ | `context_lens` becomes `seq_lens_gpu`; the op stops making the host copy; `build_decode_tiling` is fed from a caller-supplied host view | `turboquant_dry_run.py`, `torch_bindings.cpp` | Low–medium. Changes which tensor the op reads; a wrong one is a wrong answer, not an error. | G1, G2, G3, G5 |
-| **3** ✅ | Schema change: `tiling`, `workspace`, `query_rot` become inputs; new `npu_turboquant_build_decode_tiling` with the CPU implementation; `decode_launch_split()` in the tiling header | `torch_bindings.cpp`, `op_host/turboquant_tiling.{h,cpp}`, `turboquant_dry_run.py` | Medium. Three new sizing contracts the op must check. | G1, G2, G3, G4, G6 |
-| **4** ✅ | Builder ownership: `AscendTurboQuantMetadataBuilder` allocates the Tier-1 buffers itself (see §4.2) and fills the tiling once per step for all layers | `turboquant_dry_run.py` only -- the shared builder is untouched, via its own `_build_backend_metadata` hook | Medium. A new builder class and metadata dataclass. | G1, G3, G6, G7 |
-| **5** ❌ | ~~The AIV tiling builder kernel~~ **Withdrawn — see “Rung 5 is withdrawn” below.** Replaced by rung 5′: the capture contract for the host-owned buffer (C1–C6, G8a, G9a, G11a) | `turboquant_dry_run.py` only | Low. No kernel, no schema, no device-side logic. | G1, G3, C1–C5 |
-| **6** | Lift the platform gate to conditional `FULL_DECODE_ONLY`; padded-row contract for `context_lens`; refuse capture when the golden path would be taken | `platform.py`, `turboquant_dry_run.py` | High. This is the rung that can corrupt a served model silently. | G1, G3, G10, G11 |
+| **1** ✅ | Tier-0 statics: cache `basis_pool`, `mode_tables`, `aiv_core_num` in C++; use `layer._turboquant_codec_tables` and a cached `h16` in Python | `torch_bindings.cpp`, `turboquant_v1.py` | Low. No schema, no kernel, no layout. | G1, G2, G3 |
+| **2** ✅ | `context_lens` becomes `seq_lens_gpu`; the op stops making the host copy; `build_decode_tiling` is fed from a caller-supplied host view | `turboquant_v1.py`, `torch_bindings.cpp` | Low–medium. Changes which tensor the op reads; a wrong one is a wrong answer, not an error. | G1, G2, G3, G5 |
+| **3** ✅ | Schema change: `tiling`, `workspace`, `query_rot` become inputs; new `npu_turboquant_build_decode_tiling` with the CPU implementation; `decode_launch_split()` in the tiling header | `torch_bindings.cpp`, `op_host/turboquant_tiling.{h,cpp}`, `turboquant_v1.py` | Medium. Three new sizing contracts the op must check. | G1, G2, G3, G4, G6 |
+| **4** ✅ | Builder ownership: `AscendTurboQuantMetadataBuilder` allocates the Tier-1 buffers itself (see §4.2) and fills the tiling once per step for all layers | `turboquant_v1.py` only -- the shared builder is untouched, via its own `_build_backend_metadata` hook | Medium. A new builder class and metadata dataclass. | G1, G3, G6, G7 |
+| **5** ❌ | ~~The AIV tiling builder kernel~~ **Withdrawn — see “Rung 5 is withdrawn” below.** Replaced by rung 5′: the capture contract for the host-owned buffer (C1–C6, G8a, G9a, G11a) | `turboquant_v1.py` only | Low. No kernel, no schema, no device-side logic. | G1, G3, C1–C5 |
+| **6** | Lift the platform gate to conditional `FULL_DECODE_ONLY`; padded-row contract for `context_lens`; refuse capture when the golden path would be taken | `platform.py`, `turboquant_v1.py` | High. This is the rung that can corrupt a served model silently. | G1, G3, G10, G11 |
 | **7** | *(follow-up, not this work)* D3: remove the tiling buffer; re-measure the SPU argument; `at::empty` for the workspace if §3.2 resolves that way | kernel | — | G8, G9, plus a profile |
 
 ### Verification gates
@@ -969,7 +969,7 @@ in order:
 4. It logs the warning.
 
 **The first finding is about the log line itself.** The message a user sees —
-*"The TurboQuant dry run cannot be captured under FULL_AND_PIECEWISE … Falling
+*"The TurboQuant backend cannot be captured under FULL_AND_PIECEWISE … Falling
 back to PIECEWISE"* — is emitted by this function, at configuration time,
 before anything is captured. **No capture was attempted and no ACL call failed.**
 It is our own policy decision, not a platform refusal, and it probes nothing:

@@ -4,7 +4,7 @@
 
 The graph mode is the part worth a test: ``FULL_DECODE_ONLY`` is the platform's
 own default for a decode-heavy run, so without the fallback every TurboQuant
-run captures its attention layers, and the dry-run emulator cannot be captured
+run captures its attention layers, and the golden model cannot be captured
 (a torch op with no NPU kernel falls back to the host, and a host copy on a
 capturing stream fails with ``aclrtMemcpy`` 107030).
 """

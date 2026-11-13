@@ -14,26 +14,26 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
-"""TurboQuant dry-run attention backend: a PyTorch model of the Ascend C kernels.
+"""TurboQuant attention backend: staged Ascend C kernels over a PyTorch golden model.
 
 Why this file exists
 --------------------
-The TurboQuant operators (``kernels/ops/turboquant/vllm_integration_layer`` of
-the ascend-micro-harness) are still under development, so the vLLM-side
-routing, cache carve and metadata plumbing have nothing to run against. This
-backend is that something: every kernel in the ingestion and decode path has a
-native PyTorch stand-in that runs on ``device="npu"`` and reproduces the
-kernel's *arithmetic contract* -- the same rotation, the same power-of-two
-scale, the same nibble packing, the same cache byte layout -- so a dry run
-exercises the real quantisation error and the real cache geometry, just slowly.
+Every kernel in the ingestion and decode path has a native PyTorch stand-in
+that runs on ``device="npu"`` and reproduces the kernel's *arithmetic
+contract* -- the same rotation, the same power-of-two scale, the same nibble
+packing, the same cache byte layout -- so a run with no kernel stage switched
+on still exercises the real quantisation error and the real cache geometry,
+just slowly. That stand-in is the fallback for a stage whose op is
+unregistered (any non-ascend950 build) and the differential reference a newly
+landed kernel is diffed against.
 
 It is deliberately **not** a monolith. Every operation goes through
 :class:`TurboQuantOpsAdapter`, which dispatches it either to a ``_kernel_*``
-entry point -- whose parameter list is the staged C launcher's, and which is a
-stub until the ``TORCH_LIBRARY_FRAGMENT`` lands -- or to the ``_golden_*``
-PyTorch reference built on :class:`TurboQuantEmulator`. Progressive replacement
-is therefore one stage at a time, with the rest still golden, which is also how
-a newly landed kernel gets differentially diffed against its own model.
+entry point -- whose parameter list is the staged C launcher's, registered by
+the ``TORCH_LIBRARY_FRAGMENT`` in
+``csrc/attention/turboquant/torch_bindings.cpp`` -- or to the ``_golden_*``
+PyTorch reference built on :class:`TurboQuantEmulator`. Progressive
+replacement is therefore one stage at a time, with the rest still golden.
 
 Ingestion is two kernels, not one, and the phase decides which: a prefill step
 hands whole page strips to the batch writer, a decode step hands one token per
@@ -78,22 +78,20 @@ out of nothing. The clamp is from above only: ``|y * 2^(2-e)| <= 8`` and
 round-to-nearest-even can reach ``+8``, which INT4 cannot hold, while ``-8`` is
 representable and is a legitimate code.
 
-What the dry run does *not* model
+What the golden model does *not* model
 ---------------------------------
 * The decode runs in the **un-rotated** basis: K and V are gathered,
   dequantised, un-rotated and handed to ``npu_fused_infer_attention_score``.
   The kernel instead rotates the query and contracts against the rotated cache
   (``Pi q . Pi k == D q . k``). The quantisation error is identical; the
   floating-point summation order is not.
-* Nothing here is a performance model. A dry run is for routing, shapes,
+* Nothing here is a performance model. A golden run is for routing, shapes,
   metadata and accuracy, never for latency.
 
-What the scale plane does *not* need reconciling
-------------------------------------------------
-An earlier revision of this note said the AIV scatter writer used a
-"burst-padded per-token slot" for its scales, unlike the
-``(2, num_blocks, num_kv_heads, block_size)`` fp32 plane modelled here. It does
-not, and has not since the audited revision: both writers index
+The scale plane
+---------------
+Both ingestion writers index the ``(2, num_blocks, num_kv_heads, block_size)``
+fp32 plane as
 
     ((kv * num_blocks + block) * num_kv_heads + head) * block_size + token
 
@@ -103,8 +101,8 @@ op_kernel/turboquant_reshape_scatter.cpp, which ``DataCopyPad``s one float per
 token into it because a single float is not a burst. That is exactly
 :func:`turboquant_scale_cache_shape`, so the plane agrees element for element.
 
-The burst-padded slot is real, but it belongs to the **fused decode's** NZ
-cache: ``NzTiledScaleIndex`` is ``slot * NzScaleSlotFloats(H) + kv * H + head``,
+The **fused decode's** NZ cache lays scales out differently:
+``NzTiledScaleIndex`` is ``slot * NzScaleSlotFloats(H) + kv * H + head``,
 slot-major and rounded up to a whole fp32 block
 (op_kernel/common/turboquant_layout.h). It is one of the five axes on which that
 cache differs from the writers', and nothing in the ingestion path has to
@@ -198,7 +196,7 @@ TURBOQUANT_HEADROOM_BITS: Final[int] = 2
 
 # The IEEE-754 binary32 fields the quantiser reads and writes directly. Both
 # of its powers of two come out of the exponent field, which is how the
-# kernel does it (`bits & 0x7F800000`) and what keeps the dry run's nibbles
+# kernel does it (`bits & 0x7F800000`) and what keeps the golden model's nibbles
 # bit-comparable rather than tolerance-comparable.
 _FP32_MANTISSA_BITS: Final[int] = 23
 _FP32_EXPONENT_MASK: Final[int] = 0xFF
@@ -256,7 +254,7 @@ class TurboQuantValueLayout(str, Enum):
 
     ``CHANNEL_MAJOR`` -- the audited strip cache, which no NPU writer produces
     any more (both are NZ ingresses now); it survives as the golden model's
-    RMW-capable dry-run layout and as the format of caches written before the
+    RMW-capable golden layout and as the format of caches written before the
     ingress existed, which ``turboquant_nz_ingress`` repacks. It differs from
     ``TOKEN_MAJOR`` in two ways at once, and both matter to a reader:
 
@@ -442,9 +440,7 @@ class TurboQuantEmulator:
             raise ValueError(f"head_size {head_size} must be a multiple of the group width {group}")
         groups = head_size // group
         if groups & (groups - 1):
-            raise ValueError(
-                f"head_size / group = {groups} must be a power of two: the outer factor is H_{groups}"
-            )
+            raise ValueError(f"head_size / group = {groups} must be a power of two: the outer factor is H_{groups}")
         self.head_size: Final[int] = head_size
         self.group: Final[int] = group
         self.groups: Final[int] = groups
@@ -649,7 +645,7 @@ TURBOQUANT_TABLE_DTYPE: Final[torch.dtype] = torch.bfloat16
 # The binding TORCH_CHECKs every one of these, so a violating launch raises
 # rather than corrupting -- but it raises from inside an attention forward, one
 # step into a server that has already loaded weights and allocated a cache.
-# :meth:`AscendTurboQuantDryRunBackendImpl.__init__` checks them again at layer
+# :meth:`AscendTurboQuantBackendImpl.__init__` checks them again at layer
 # construction so an impossible model is refused at load instead.
 # ---------------------------------------------------------------------------
 
@@ -925,8 +921,8 @@ class TurboQuantOpsAdapter:
 
     Every operation is a two-branch method: :meth:`_has_kernel` decides, and the
     branches are a ``_kernel_*`` entry point whose parameter list is the staged
-    C launcher's, and a ``_golden_*`` PyTorch implementation that is the only
-    path a dry run takes today. Adopting a kernel is one stage flip in
+    C launcher's, and a ``_golden_*`` PyTorch implementation that runs wherever
+    the kernel is not registered. Adopting a kernel is one stage flip in
     :class:`TurboQuantOpsConfig`; bisecting a suspect one is the flip back.
 
     The entry points are the declaration surface of
@@ -1009,7 +1005,7 @@ class TurboQuantOpsAdapter:
         """The registered entry point for ``op_name``, or ``None`` to run golden.
 
         A stage switched on whose kernel is not registered is a configuration
-        error the caller can survive, so it warns once and falls back: a dry run
+        error the caller can survive, so it warns once and falls back: a run
         that dies on a missing kernel tells you nothing you did not know.
         """
         if not self.config.enables(TURBOQUANT_KERNEL_OPS[op_name]):
@@ -1053,7 +1049,7 @@ class TurboQuantOpsAdapter:
         golden NZ writer, so the cache stays NZ throughout.
 
         ``config.value_layout`` is consulted only when both writers are golden,
-        which is how a dry run can still ask the golden writer to refuse the
+        which is how a kernel-less run can still ask the golden writer to refuse the
         channel-major read-modify-write it cannot do.
         """
         if self._has_kernel(TURBOQUANT_OP_RESHAPE_AND_CACHE) or self._has_kernel(TURBOQUANT_OP_RESHAPE_SCATTER):
@@ -2342,7 +2338,7 @@ def _build_codec_tables(emulator: TurboQuantEmulator) -> torch.Tensor:
     ``tables[s * groups + g][c0][i] = (s ? -1 : +1) * pi_signs[g*32 + c0] * H32[c0][i]``:
     the sign diagonal and the inner Hadamard factor, pre-composed, with the
     outer factor supplied by which block the kernel picks
-    (``parity(c1 & g) * groups + g``). Built here so the dry run hands the
+    (``parity(c1 & g) * groups + g``). Built here so the golden model hands the
     kernel-backed stages exactly the operand ``tq_oracle::build_tables`` audits.
 
     **BF16, NOT INT8**, and the distinction is load-bearing rather than
@@ -2755,13 +2751,13 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
 # device, so passing "ASCEND" here would register the string "ASCEND" as this
 # backend's import path and skip the decoration entirely.
 @register_backend(AttentionBackendEnum.TURBOQUANT)
-class AscendTurboQuantDryRunBackend(AscendAttentionBackend):
-    """Backend descriptor for the TurboQuant dry run.
+class AscendTurboQuantBackend(AscendAttentionBackend):
+    """Backend descriptor for TurboQuant attention.
 
     Everything but the cache geometry and the implementation class is inherited:
     the metadata builder, the block-size contract and the block copy/swap
-    helpers are the stock ones, which is the point -- a dry run that needed its
-    own scheduler plumbing would not be testing the integration.
+    helpers are the stock ones, which is the point -- the TurboQuant cache is a
+    drop-in KV cache format, not a scheduling variant.
     """
 
     accept_output_buffer: bool = True
@@ -2773,8 +2769,8 @@ class AscendTurboQuantDryRunBackend(AscendAttentionBackend):
         return "TURBOQUANT"
 
     @staticmethod
-    def get_impl_cls() -> type[AscendTurboQuantDryRunBackendImpl]:
-        return AscendTurboQuantDryRunBackendImpl
+    def get_impl_cls() -> type[AscendTurboQuantBackendImpl]:
+        return AscendTurboQuantBackendImpl
 
     @staticmethod
     def get_builder_cls() -> type[AscendAttentionMetadataBuilder]:
@@ -2811,7 +2807,7 @@ class AscendTurboQuantDryRunBackend(AscendAttentionBackend):
         :meth:`NPUModelRunner._carve_turboquant_planes`) and shaped by
         :func:`turboquant_scale_cache_shape`. When it is absent the backend
         still falls back to a private scale plane, see
-        :meth:`AscendTurboQuantDryRunBackendImpl._ensure_scale_cache`.
+        :meth:`AscendTurboQuantBackendImpl._ensure_scale_cache`.
         """
         return turboquant_packed_cache_shape(num_blocks, block_size, num_kv_heads, head_size)
 
@@ -2860,7 +2856,7 @@ class AscendTurboQuantDryRunBackend(AscendAttentionBackend):
 
 
 # ---------------------------------------------------------------------------
-# In-code profiling of the dry-run forward.
+# In-code profiling of the forward.
 #
 # Switched on by TURBOQUANT_PROFILE=1 and off otherwise, at the cost of one
 # bool test per forward.
@@ -2923,8 +2919,8 @@ def _stream_is_capturing() -> bool:
 TURBOQUANT_FIA_VERSION_ENV: Final[str] = "TURBOQUANT_FIA_VERSION"
 
 
-class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
-    """PyTorch dry run of the TurboQuant attention path.
+class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
+    """TurboQuant attention: staged kernels where registered, golden PyTorch elsewhere.
 
     Ingestion (``reshape_and_cache``) is the kernels' contract exactly: rotate,
     quantise per token and head, pack to nibbles, scatter by slot. The attention
@@ -2974,9 +2970,7 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
         self.enable_c8_quant = False
 
         if head_size % TURBOQUANT_GROUP:
-            raise ValueError(
-                f"TurboQuant needs head_size to be a multiple of {TURBOQUANT_GROUP}, got {head_size}"
-            )
+            raise ValueError(f"TurboQuant needs head_size to be a multiple of {TURBOQUANT_GROUP}, got {head_size}")
         if alibi_slopes is not None:
             raise NotImplementedError("TurboQuant has no ALiBi path: the decode kernel takes no slope operand.")
         if sliding_window is not None:
@@ -2986,7 +2980,7 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
         if sinks is not None:
             raise NotImplementedError(
                 "learnable attention sinks need the kernel's softmax denominator as an out-tensor; "
-                "the dequantising dry run does not expose one."
+                "the dequantising golden path does not expose one."
             )
         if self.use_bnsd_kv_cache:
             raise NotImplementedError(
@@ -3004,7 +2998,7 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
         # hashable: a list of stage names raises TypeError before it is logged.
         staged = ", ".join(sorted(stage.value for stage in self.adapter.config.kernel_stages))
         logger.info_once(
-            "TurboQuant dry run active: packed INT4 KV cache, kernel stages=%s, ops namespace=%s",
+            "TurboQuant backend active: packed INT4 KV cache, kernel stages=%s, ops namespace=%s",
             staged or "none (all golden)",
             self.adapter.config.ops_namespace,
         )
@@ -3016,7 +3010,7 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
 
         Only the stages that are switched on are checked, and only against their
         own kernel's specialisation: the golden path has none of these limits,
-        so a dry run with no kernel stage is unaffected by any of it.
+        so a run with no kernel stage is unaffected by any of it.
 
         The binding TORCH_CHECKs every one of these too, and that is the check
         that matters -- it is the one a direct caller cannot skip. This one
@@ -3132,7 +3126,7 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
         as ``[key_cache, value_cache, scale_cache]`` and nothing is allocated
         here. Until the KV cache spec grows that plane -- and on the hybrid
         allocation path it cannot yet, because Qwen3.5's full-attention layers
-        share one flat buffer with its Gated DeltaNet layers -- the dry run
+        share one flat buffer with its Gated DeltaNet layers -- the backend
         allocates it itself, sized off the packed planes, and says so once.
         """
         if self.scale_cache is not None:
@@ -3155,7 +3149,7 @@ class AscendTurboQuantDryRunBackendImpl(AscendAttentionBackendImpl):
         if not self._warned_scale_carve:
             self._warned_scale_carve = True
             logger.warning(
-                "TurboQuant dry run is allocating its own fp32 scale plane %s (%.1f MiB per layer): the "
+                "TurboQuant backend is allocating its own fp32 scale plane %s (%.1f MiB per layer): the "
                 "KV cache spec carved only two planes. The production path carves three. "
                 "TODO: extend the Ascend KV cache spec so the allocator owns this plane.",
                 turboquant_scale_cache_shape(num_blocks, block_size, num_kv_heads),

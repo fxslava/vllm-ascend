@@ -75,9 +75,9 @@ def _preconditions() -> tuple[Any, Any] | int:
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         return _fail("no NPU is visible to torch (torch.npu.is_available() is False)")
     try:
-        from vllm_ascend.attention import turboquant_dry_run as tq
+        from vllm_ascend.attention import turboquant_v1 as tq
     except ImportError as exc:
-        return _fail(f"vllm_ascend.attention.turboquant_dry_run will not import: {exc}")
+        return _fail(f"vllm_ascend.attention.turboquant_v1 will not import: {exc}")
     namespace = getattr(torch.ops, tq.TURBOQUANT_DEFAULT_NAMESPACE, None)
     missing = [
         name

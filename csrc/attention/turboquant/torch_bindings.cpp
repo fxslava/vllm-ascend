@@ -6,7 +6,7 @@
 
 // The TurboQuant Torch bindings: the three audited kernel paths of
 // kernels/ops/turboquant/vllm_integration_layer, registered into
-// torch.ops.turboquant_ops so vllm_ascend/attention/turboquant_dry_run.py can
+// torch.ops.turboquant_ops so vllm_ascend/attention/turboquant_v1.py can
 // dispatch a stage to the NPU instead of its PyTorch golden model.
 //
 // WHY A TRANSLATION UNIT OF ITS OWN, and not another include of
@@ -21,7 +21,7 @@
 // set of #ifdef regions threaded through a 3700-line binding.
 //
 // THE NAMESPACE IS `turboquant_ops`, which is TURBOQUANT_DEFAULT_NAMESPACE in
-// vllm_ascend/attention/turboquant_dry_run.py. The adapter there reads
+// vllm_ascend/attention/turboquant_v1.py. The adapter there reads
 // `getattr(torch.ops, config.ops_namespace)` and then `getattr(ns, op_name)`,
 // so a missing registration is an AttributeError the adapter turns into a
 // warn-once and a golden fallback. That is the whole fallback contract: the
@@ -124,7 +124,7 @@ constexpr std::uintptr_t kGmBurstBytes = 32;
 
 // 2 * (head_size / 32) row-major 32x32 BF16 blocks: T[s][g] of the rotation,
 // with the sign diagonal pre-composed. 16384 ELEMENTS and therefore 32768 BYTES
-// at head_size 256, which is what `_codec_tables` in turboquant_dry_run.py
+// at head_size 256, which is what `_codec_tables` in turboquant_v1.py
 // builds.
 //
 // BF16, NOT INT8, and this was wrong here until it was checked against the
@@ -475,7 +475,7 @@ void npu_turboquant_reshape_and_cache_a8(at::Tensor &key, at::Tensor &value, at:
     // inside a strip -- so the caller plans the step across both writers rather
     // than handing an arbitrary count over here:
     // `turboquant_plan_strip_ingestion` in
-    // vllm_ascend/attention/turboquant_dry_run.py. This check stays a hard
+    // vllm_ascend/attention/turboquant_v1.py. This check stays a hard
     // refusal because what it refuses has no safe behaviour, only a silent one.
     TORCH_CHECK(a.num_tokens % kTokensPerStrip == 0, op, ": num_tokens (", a.num_tokens,
                 ") must be a whole number of ", kTokensPerStrip,
@@ -1108,7 +1108,7 @@ void npu_turboquant_build_decode_tiling_meta(at::Tensor &, at::Tensor &, int64_t
 // later without either file owning it.
 //
 // The scalars every schema does NOT take are derived from the tensors, which is
-// why the Python stubs in turboquant_dry_run.py pass fewer arguments than the C
+// why the Python stubs in turboquant_v1.py pass fewer arguments than the C
 // launcher's parameter list: num_tokens, num_kv_heads, head_size, block_size
 // and num_blocks all come off the activation and cache shapes, `tokens_per_core`
 // is the kernel's own compile-time strip height, and the scatter writer's

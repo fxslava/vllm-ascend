@@ -5,7 +5,7 @@
 The audited writers do not produce the golden model's cache, and since the NZ
 ingress they do not produce this one either: both are built with
 ``TURBOQUANT_INGRESS_NZ=1`` and write the NZ-tiled layout the fused decode
-reads. The strip layout survives as the golden model's RMW-capable dry-run
+reads. The strip layout survives as the golden model's RMW-capable
 format and as the format of caches written before the ingress existed -- which
 is what this file keeps honest. It puts the page axis in a different order and
 makes the value plane channel-major *inside a 16-token strip*, which the two
@@ -32,18 +32,18 @@ import types
 import pytest
 import torch
 
-from vllm_ascend.attention.turboquant_dry_run import (
-    TURBOQUANT_STRIP_TOKENS,
-    TurboQuantEmulator,
-    TurboQuantOpsAdapter,
-    TurboQuantOpsConfig,
-    TurboQuantValueLayout,
-)
 from vllm_ascend.attention.turboquant_layout import (
     TURBOQUANT_KEY_PLANE,
     TURBOQUANT_VALUE_PLANE,
     turboquant_packed_bytes,
     turboquant_scale_cache_shape,
+)
+from vllm_ascend.attention.turboquant_v1 import (
+    TURBOQUANT_STRIP_TOKENS,
+    TurboQuantEmulator,
+    TurboQuantOpsAdapter,
+    TurboQuantOpsConfig,
+    TurboQuantValueLayout,
 )
 
 HEAD_SIZE = 64

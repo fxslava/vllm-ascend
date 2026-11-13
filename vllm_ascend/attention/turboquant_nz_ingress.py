@@ -14,7 +14,7 @@ The two cache writers and the fused decode were built against two different
 cache contracts, and nothing converted between them, so
 ``torch.ops.turboquant_ops.fused_decode`` could not read a page either writer
 had written. The binding says so itself (``_kernel_fused_decode``'s docstring in
-:mod:`vllm_ascend.attention.turboquant_dry_run`) and refuses the launch rather
+:mod:`vllm_ascend.attention.turboquant_v1`) and refuses the launch rather
 than attending over bytes in the wrong order. They disagree on four independent
 axes, every one of them read off production code rather than inferred:
 
@@ -87,7 +87,7 @@ from __future__ import annotations
 
 import torch
 
-from vllm_ascend.attention.turboquant_dry_run import (
+from vllm_ascend.attention.turboquant_v1 import (
     TURBOQUANT_PACK_FACTOR,
     TURBOQUANT_STRIP_TOKENS,
     TurboQuantEmulator,

@@ -69,15 +69,31 @@ def _npu_device() -> torch.device | None:
     return torch.device("npu:0")
 
 
-def _op(name: str):
-    """The registered entry point, or ``None``.
+def _op_registered(name: str) -> bool:
+    """Whether the dispatcher has ``turboquant_ops::name``, loading the extension first.
 
-    Absence is the normal case on any SoC that is not ascend950: the whole
-    translation unit is left out of the build, which is also what makes the
-    Python side fall back to its golden model.
+    The registrations are static initialisers of ``vllm_ascend.vllm_ascend_C``,
+    and nothing imports that module until ``load_turboquant_extension()`` runs
+    -- the usual loader withholds it on this part (see the loader's docstring).
+    A skipif probe that only reads ``torch.ops`` at collection time therefore
+    reports every op as missing on exactly the ascend950 build this gate exists
+    for, and the whole file skips. The probe is ``_is_op_registered`` rather
+    than a ``getattr`` on ``torch.ops``: ``torch.ops.__getattr__`` manufactures
+    a namespace object for any name, registered or not.
+
+    Absence is still the normal answer on any SoC that is not ascend950: the
+    whole translation unit is left out of the build, which is also what makes
+    the Python side fall back to its golden model.
     """
-    namespace = getattr(torch.ops, NAMESPACE, None)
-    return getattr(namespace, name, None) if namespace is not None else None
+    try:
+        from vllm_ascend.attention.turboquant_v1 import _is_op_registered, load_turboquant_extension
+
+        load_turboquant_extension()
+        return _is_op_registered(NAMESPACE, name)
+    except Exception:
+        # A skip decision must never be a collection error: any failure here
+        # means the kernels cannot be reached from this host, which is a skip.
+        return False
 
 
 DEVICE = _npu_device()
@@ -86,7 +102,7 @@ requires_npu = pytest.mark.skipif(DEVICE is None, reason="no Ascend NPU on this 
 
 def _requires_op(name: str):
     return pytest.mark.skipif(
-        _op(name) is None,
+        not _op_registered(name),
         reason=f"torch.ops.{NAMESPACE}.{name} is not registered; this needs an ascend950 build",
     )
 
@@ -97,7 +113,7 @@ def _requires_op(name: str):
 
 
 def _import_backend():
-    from vllm_ascend.attention.turboquant_dry_run import (
+    from vllm_ascend.attention.turboquant_v1 import (
         TurboQuantEmulator,
         TurboQuantKernelStage,
         TurboQuantOpsAdapter,
@@ -139,14 +155,14 @@ def _activations(num_tokens: int, device: torch.device, seed: int) -> tuple[torc
     return key.to(device=device, dtype=torch.bfloat16), value.to(device=device, dtype=torch.bfloat16)
 
 
-def _adapters(stage, layout):
+def _adapters(stage):
     """``(kernel_adapter, golden_adapter)`` over the same configuration otherwise.
 
     The golden one is pinned to the staged writer's layout explicitly, because
     with no ingestion kernel engaged ``value_layout()`` would otherwise report
     the golden model's own TOKEN_MAJOR cache -- and the point here is to write
-    the same layout both ways: NZ_TILED for the batch writer (the NZ ingress),
-    CHANNEL_MAJOR for the scatter writer (still a strip kernel).
+    the same layout both ways: NZ_TILED, which either staged ingestion writer
+    reports (``TURBOQUANT_INGRESS_NZ=1`` builds both of them as NZ ingresses).
     """
     _, _, TurboQuantOpsAdapter, TurboQuantOpsConfig, TurboQuantValueLayout = _import_backend()
     kernel = TurboQuantOpsAdapter(TurboQuantOpsConfig(ops_namespace=NAMESPACE, kernel_stages=frozenset({stage})))
@@ -222,7 +238,7 @@ def test_the_batch_writer_fills_every_strip_of_one_page() -> None:
     """
     TurboQuantEmulator, TurboQuantKernelStage, _, _, _ = _import_backend()
     emulator = TurboQuantEmulator(head_size=HEAD_SIZE, device=DEVICE)
-    kernel_adapter, golden_adapter = _adapters(TurboQuantKernelStage.RESHAPE_AND_CACHE, None)
+    kernel_adapter, golden_adapter = _adapters(TurboQuantKernelStage.RESHAPE_AND_CACHE)
 
     strips_per_page = PREFILL_BLOCK_SIZE // STRIP
     key, value = _activations(PREFILL_BLOCK_SIZE, DEVICE, seed=1500)
@@ -255,7 +271,7 @@ def test_the_batch_writer_fills_every_strip_of_one_page() -> None:
 def test_the_batch_writer_matches_the_golden_model(num_strips: int) -> None:
     TurboQuantEmulator, TurboQuantKernelStage, _, _, _ = _import_backend()
     emulator = TurboQuantEmulator(head_size=HEAD_SIZE, device=DEVICE)
-    kernel_adapter, golden_adapter = _adapters(TurboQuantKernelStage.RESHAPE_AND_CACHE, None)
+    kernel_adapter, golden_adapter = _adapters(TurboQuantKernelStage.RESHAPE_AND_CACHE)
 
     key, value = _activations(num_strips * STRIP, DEVICE, seed=1000 + num_strips)
     slot_mapping = _slot_mapping_prefill(num_strips, torch.Generator().manual_seed(7)).to(DEVICE)
@@ -286,7 +302,7 @@ def test_the_scatter_writer_matches_the_golden_model(num_tokens: int) -> None:
     """
     TurboQuantEmulator, TurboQuantKernelStage, _, _, _ = _import_backend()
     emulator = TurboQuantEmulator(head_size=HEAD_SIZE, device=DEVICE)
-    kernel_adapter, golden_adapter = _adapters(TurboQuantKernelStage.SCATTER, None)
+    kernel_adapter, golden_adapter = _adapters(TurboQuantKernelStage.SCATTER)
 
     key, value = _activations(num_tokens, DEVICE, seed=2000 + num_tokens)
     slot_mapping = _slot_mapping_decode(num_tokens, torch.Generator().manual_seed(11)).to(DEVICE)
@@ -311,7 +327,7 @@ def test_the_scatter_writer_accumulates_over_steps() -> None:
     """
     TurboQuantEmulator, TurboQuantKernelStage, _, _, _ = _import_backend()
     emulator = TurboQuantEmulator(head_size=HEAD_SIZE, device=DEVICE)
-    kernel_adapter, golden_adapter = _adapters(TurboQuantKernelStage.SCATTER, None)
+    kernel_adapter, golden_adapter = _adapters(TurboQuantKernelStage.SCATTER)
 
     key, value = _activations(STRIP, DEVICE, seed=3000)
     slots = torch.arange(STRIP, dtype=torch.int32, device=DEVICE)
@@ -346,7 +362,7 @@ def test_the_golden_gather_reads_the_npu_written_cache() -> None:
     """
     TurboQuantEmulator, TurboQuantKernelStage, _, _, _ = _import_backend()
     emulator = TurboQuantEmulator(head_size=HEAD_SIZE, device=DEVICE)
-    kernel_adapter, _ = _adapters(TurboQuantKernelStage.SCATTER, None)
+    kernel_adapter, _ = _adapters(TurboQuantKernelStage.SCATTER)
 
     num_tokens = DECODE_BLOCK_SIZE
     key, value = _activations(num_tokens, DEVICE, seed=4000)
@@ -442,7 +458,7 @@ def main() -> int:
     if DEVICE is None:
         print("no Ascend NPU on this host: nothing to run")
         return 0
-    missing = [name for name in (PREFILL_OP, SCATTER_OP) if _op(name) is None]
+    missing = [name for name in (PREFILL_OP, SCATTER_OP) if not _op_registered(name)]
     if missing:
         print(f"these ops are not registered, so this build cannot be gated: {missing}")
         return 0

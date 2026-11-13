@@ -6,7 +6,7 @@ A ``TORCH_LIBRARY_FRAGMENT`` schema string is only checked when the library
 registers, which needs the compiled extension and an Ascend 950 build. Nothing
 on a development host would otherwise notice a malformed schema, a missing
 ``Tensor!`` on a cache plane, or -- the one that actually happens -- a
-``_kernel_*`` stub in ``turboquant_dry_run.py`` passing its arguments in an
+``_kernel_*`` stub in ``turboquant_v1.py`` passing its arguments in an
 order the C++ schema no longer declares.
 
 ``torch._C.parse_schema`` is the same parser the registration uses, so these
@@ -23,8 +23,8 @@ from typing import Any
 import pytest
 import torch
 
-from vllm_ascend.attention import turboquant_dry_run
-from vllm_ascend.attention.turboquant_dry_run import (
+from vllm_ascend.attention import turboquant_v1
+from vllm_ascend.attention.turboquant_v1 import (
     TURBOQUANT_OP_BUILD_DECODE_TILING,
     TURBOQUANT_OP_FUSED_DECODE,
     TURBOQUANT_OP_RESHAPE_AND_CACHE,
@@ -36,7 +36,7 @@ from vllm_ascend.attention.turboquant_dry_run import (
 # Anchored to the module under test, not to this file, so the checkout is found
 # whether pytest collects this from tests/ut/attention or from a copy beside a
 # stubbed-vllm conftest that loads the real module by path.
-_REPO = pathlib.Path(turboquant_dry_run.__file__).parents[2]
+_REPO = pathlib.Path(turboquant_v1.__file__).parents[2]
 BINDINGS = _REPO / "csrc" / "attention" / "turboquant" / "torch_bindings.cpp"
 
 # Which `_kernel_*` method of the adapter calls each op. The stub's parameters

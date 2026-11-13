@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU tests for the TurboQuant dry-run codec and its backend descriptor.
+"""CPU tests for the TurboQuant codec and its backend descriptor.
 
 Two properties are pinned here, both of which an innocent-looking edit can
 break without failing anything else:
@@ -20,11 +20,11 @@ import pytest
 import torch
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-from vllm_ascend.attention.turboquant_dry_run import (
+from vllm_ascend.attention.turboquant_v1 import (
     TURBOQUANT_HEADROOM_BITS,
     TURBOQUANT_NIBBLE_MAX,
     TURBOQUANT_NIBBLE_MIN,
-    AscendTurboQuantDryRunBackend,
+    AscendTurboQuantBackend,
     TurboQuantEmulator,
     _exp2_fp32,
 )
@@ -136,11 +136,11 @@ def test_round_trip_reconstructs_the_activation():
 
 
 def test_backend_name_is_the_enum_member_it_registers_as():
-    name = AscendTurboQuantDryRunBackend.get_name()
+    name = AscendTurboQuantBackend.get_name()
     assert name == "TURBOQUANT"
     # vLLM indexes the enum with whatever get_name returns; a name that is not a
     # member raises there, which is why this backend does not carry its own.
     assert AttentionBackendEnum[name] is AttentionBackendEnum.TURBOQUANT
     # ... and the member resolves back to this class rather than to vLLM's own
     # unrelated TurboQuant backend, because the module registered an override.
-    assert AttentionBackendEnum.TURBOQUANT.get_class() is AscendTurboQuantDryRunBackend
+    assert AttentionBackendEnum.TURBOQUANT.get_class() is AscendTurboQuantBackend

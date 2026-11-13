@@ -44,11 +44,12 @@ import pytest
 import torch
 from torch.overrides import TorchFunctionMode
 
-from vllm_ascend.attention.turboquant_dry_run import (
+from vllm_ascend.attention.turboquant_layout import turboquant_packed_bytes, turboquant_scale_cache_shape
+from vllm_ascend.attention.turboquant_v1 import (
     TURBOQUANT_DECODE_SPLITS,
     TURBOQUANT_STAGE_UNROTATED,
     TURBOQUANT_STAGING_SLOTS,
-    AscendTurboQuantDryRunBackendImpl,
+    AscendTurboQuantBackendImpl,
     TurboQuantEmulator,
     TurboQuantKernelStage,
     TurboQuantOpsAdapter,
@@ -57,7 +58,6 @@ from vllm_ascend.attention.turboquant_dry_run import (
     turboquant_decode_tiling_words,
     turboquant_tiling_upper_bound_words,
 )
-from vllm_ascend.attention.turboquant_layout import turboquant_packed_bytes, turboquant_scale_cache_shape
 
 NAMESPACE = "turboquant_ops"
 CPU = torch.device("cpu")
@@ -184,7 +184,7 @@ def _caches() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
 def _tier1(tokens: int) -> dict[str, torch.Tensor]:
     """The three buffers the metadata builder now owns, at this geometry."""
-    from vllm_ascend.attention.turboquant_dry_run import TURBOQUANT_PARTIAL_TAIL
+    from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_PARTIAL_TAIL
 
     return {
         "turboquant_tiling": torch.zeros(turboquant_tiling_upper_bound_words(tokens, 1), dtype=torch.int32),
@@ -221,7 +221,7 @@ def _metadata(tokens: int = BATCH) -> Any:
 
 
 def _impl(adapter: TurboQuantOpsAdapter, emulator: TurboQuantEmulator, layer: Any) -> Any:
-    impl = object.__new__(AscendTurboQuantDryRunBackendImpl)
+    impl = object.__new__(AscendTurboQuantBackendImpl)
     impl.key_cache, impl.value_cache, impl.scale_cache = _caches()
     impl.emulator = emulator
     impl.adapter = adapter
@@ -235,7 +235,7 @@ def _impl(adapter: TurboQuantOpsAdapter, emulator: TurboQuantEmulator, layer: An
 
 def _layer(emulator: TurboQuantEmulator) -> Any:
     """A layer carrying the Tier-0 constants ``_ensure_statics`` binds."""
-    from vllm_ascend.attention.turboquant_dry_run import _codec_tables, _h16_operand
+    from vllm_ascend.attention.turboquant_v1 import _codec_tables, _h16_operand
 
     return types.SimpleNamespace(
         _turboquant_pi_signs=emulator.pi_signs,
@@ -314,7 +314,7 @@ def test_g10_the_second_step_rebuilds_no_rotation_constant(
     It is how both ``_codec_tables`` and ``_h16_operand`` build their operands,
     and those are pure functions of the head size. A call here is B7 of the RFC.
     """
-    from vllm_ascend.attention import turboquant_dry_run as module
+    from vllm_ascend.attention import turboquant_v1 as module
 
     calls: list[int] = []
     real = module._sylvester_hadamard
@@ -464,7 +464,7 @@ def test_g6_the_upper_bound_covers_every_derivable_geometry(tokens: int, splits:
     step with fewer requests or fewer splits must fit inside it. ``grid`` is the
     op's own derivation and is capped at ``kDecodeMaxGrid``.
     """
-    from vllm_ascend.attention.turboquant_dry_run import TURBOQUANT_DECODE_MAX_GRID, TURBOQUANT_DECODE_MAX_SPLITS
+    from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_DECODE_MAX_GRID, TURBOQUANT_DECODE_MAX_SPLITS
 
     bound = turboquant_tiling_upper_bound_words(tokens, TURBOQUANT_DECODE_MAX_SPLITS)
     for grid in range(1, TURBOQUANT_DECODE_MAX_GRID + 1):
@@ -473,7 +473,7 @@ def test_g6_the_upper_bound_covers_every_derivable_geometry(tokens: int, splits:
 
 
 def test_g6_the_bound_is_monotone_in_the_request_count() -> None:
-    from vllm_ascend.attention.turboquant_dry_run import TURBOQUANT_DECODE_MAX_SPLITS
+    from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_DECODE_MAX_SPLITS
 
     bounds = [turboquant_tiling_upper_bound_words(n, TURBOQUANT_DECODE_MAX_SPLITS) for n in range(1, 33)]
     assert bounds == sorted(bounds)
@@ -494,7 +494,7 @@ def _builder() -> Any:
     which needs a ``VllmConfig``; everything below the allocation is what is
     under test.
     """
-    from vllm_ascend.attention.turboquant_dry_run import (
+    from vllm_ascend.attention.turboquant_v1 import (
         AscendTurboQuantMetadataBuilder,
         turboquant_decode_query_rot_floats,
         turboquant_decode_workspace_floats,
@@ -578,7 +578,7 @@ def test_the_tiling_fill_is_one_call_for_every_layer(monkeypatch: pytest.MonkeyP
     The point of the change: this used to happen inside the decode launch, so a
     sixty-layer model did it sixty times per step.
     """
-    from vllm_ascend.attention.turboquant_dry_run import TURBOQUANT_OP_BUILD_DECODE_TILING
+    from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_OP_BUILD_DECODE_TILING
 
     entry = _Recorder()
     _register(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: entry})
@@ -622,7 +622,7 @@ def test_a_non_power_of_two_block_size_is_refused_before_the_fill(monkeypatch: p
     first, naming the KV cache spec's block size, and the entry must not be
     called: a refused fill leaves the tiling buffer as it was.
     """
-    from vllm_ascend.attention.turboquant_dry_run import TURBOQUANT_OP_BUILD_DECODE_TILING
+    from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_OP_BUILD_DECODE_TILING
 
     entry = _Recorder()
     _register(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: entry})
@@ -640,7 +640,7 @@ def test_the_builder_publishes_every_field_the_launch_reads() -> None:
     other backend can be perturbed by any of this (G7).
     """
     from vllm_ascend.attention.attention_v1 import AscendAttentionMetadataBuilder
-    from vllm_ascend.attention.turboquant_dry_run import AscendTurboQuantMetadataBuilder
+    from vllm_ascend.attention.turboquant_v1 import AscendTurboQuantMetadataBuilder
 
     builder = _builder()
     extra = builder._build_backend_metadata(
@@ -770,7 +770,7 @@ def test_c2_every_builder_owned_buffer_keeps_one_address(monkeypatch: pytest.Mon
     must also start at word zero, because the op's extent checks are ``>=`` or
     exact against ``numel`` and would not notice a shifted base.
     """
-    from vllm_ascend.attention.turboquant_dry_run import TURBOQUANT_OP_BUILD_DECODE_TILING
+    from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_OP_BUILD_DECODE_TILING
 
     _register(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: _Recorder()})
     builder = _builder()
@@ -812,7 +812,7 @@ def test_c3_the_launch_path_never_fills_the_tiling_buffer(
     own descriptors when it finds them stale, which is why both ops are
     registered here and only one of them may be called.
     """
-    from vllm_ascend.attention.turboquant_dry_run import (
+    from vllm_ascend.attention.turboquant_v1 import (
         TURBOQUANT_KERNEL_OPS,
         TURBOQUANT_OP_BUILD_DECODE_TILING,
         TURBOQUANT_OP_FUSED_DECODE,
@@ -864,7 +864,7 @@ def test_c4_a_multi_token_decode_step_is_refused() -> None:
 @pytest.mark.parametrize("per_req", [None, 1])
 def test_c4_an_ordinary_decode_step_is_not_refused(per_req: Any, monkeypatch: pytest.MonkeyPatch) -> None:
     """One token per request, however the field is spelled."""
-    from vllm_ascend.attention.turboquant_dry_run import TURBOQUANT_OP_BUILD_DECODE_TILING
+    from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_OP_BUILD_DECODE_TILING
 
     _register(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: _Recorder()})
     common = types.SimpleNamespace(num_reqs=2)
@@ -938,7 +938,7 @@ def test_c5_the_real_staging_is_pinned_when_the_host_can_pin() -> None:
     """
     import inspect
 
-    from vllm_ascend.attention.turboquant_dry_run import AscendTurboQuantMetadataBuilder
+    from vllm_ascend.attention.turboquant_v1 import AscendTurboQuantMetadataBuilder
 
     source = inspect.getsource(AscendTurboQuantMetadataBuilder.__init__)
     assert "pin_memory()" in source
@@ -1069,16 +1069,16 @@ def test_c6_the_launch_path_uses_no_stream_api() -> None:
     """
     import inspect
 
-    from vllm_ascend.attention.turboquant_dry_run import (
-        AscendTurboQuantDryRunBackendImpl,
+    from vllm_ascend.attention.turboquant_v1 import (
+        AscendTurboQuantBackendImpl,
         TurboQuantOpsAdapter,
     )
 
     launch_path = (
-        AscendTurboQuantDryRunBackendImpl._forward_decode,
-        AscendTurboQuantDryRunBackendImpl._decode_num_tokens,
-        AscendTurboQuantDryRunBackendImpl._decode_context_lens,
-        AscendTurboQuantDryRunBackendImpl._decode_buffers,
+        AscendTurboQuantBackendImpl._forward_decode,
+        AscendTurboQuantBackendImpl._decode_num_tokens,
+        AscendTurboQuantBackendImpl._decode_context_lens,
+        AscendTurboQuantBackendImpl._decode_buffers,
         TurboQuantOpsAdapter.fused_decode,
         TurboQuantOpsAdapter._kernel_fused_decode,
         TurboQuantOpsAdapter._resolve_kernel,
@@ -1203,7 +1203,7 @@ def test_g11a_a_replay_sees_one_address_one_shape_and_one_scalar_set(
     asserting something false and unnecessary; asserting it across steps at one
     width is the real invariant.
     """
-    from vllm_ascend.attention.turboquant_dry_run import (
+    from vllm_ascend.attention.turboquant_v1 import (
         TURBOQUANT_OP_BUILD_DECODE_TILING,
         TURBOQUANT_OP_FUSED_DECODE,
     )
@@ -1264,7 +1264,7 @@ def test_g11a_the_per_step_state_lives_only_in_buffer_contents(
     directly: the published context-lens view is the same storage each step and
     its contents change.
     """
-    from vllm_ascend.attention.turboquant_dry_run import TURBOQUANT_OP_BUILD_DECODE_TILING
+    from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_OP_BUILD_DECODE_TILING
 
     _register(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: _Recorder()})
     builder = _builder()
@@ -1431,18 +1431,18 @@ def test_g8_python_reproduces_none_of_the_tiling_arithmetic() -> None:
     """
     import tokenize
 
-    from vllm_ascend.attention import turboquant_dry_run
+    from vllm_ascend.attention import turboquant_v1
 
     # Identifiers only. Dropping STRING and COMMENT tokens is the whole point:
     # this module *documents* these field names extensively and must keep doing
     # so, while naming one in code is the defect.
-    with open(turboquant_dry_run.__file__, encoding="utf-8") as handle:
+    with open(turboquant_v1.__file__, encoding="utf-8") as handle:
         identifiers = {
             token.string for token in tokenize.generate_tokens(handle.readline) if token.type == tokenize.NAME
         }
     for field in _DESCRIPTOR_FIELDS:
         assert field not in identifiers, (
-            f"turboquant_dry_run.py names {field!r} in code. That is a descriptor field "
+            f"turboquant_v1.py names {field!r} in code. That is a descriptor field "
             "build_decode_tiling owns; computing it here makes two producers of the tiling and "
             "removes the only oracle there is."
         )
@@ -1462,7 +1462,7 @@ def test_g8_the_tiling_buffer_is_filled_by_the_operator_alone(monkeypatch: pytes
     ``build_decode_tiling`` plus a host-to-device copy. Anything else writing
     the buffer is a second producer by another name.
     """
-    from vllm_ascend.attention.turboquant_dry_run import TURBOQUANT_OP_BUILD_DECODE_TILING
+    from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_OP_BUILD_DECODE_TILING
 
     entry = _Recorder()
     _register(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: entry})
@@ -1528,9 +1528,9 @@ def test_c5_the_turboquant_surface_passes_no_literal_non_blocking() -> None:
     import ast
     import pathlib
 
-    from vllm_ascend.attention import turboquant_dry_run
+    from vllm_ascend.attention import turboquant_v1
 
-    tree = ast.parse(pathlib.Path(turboquant_dry_run.__file__).read_text(encoding="utf-8"))
+    tree = ast.parse(pathlib.Path(turboquant_v1.__file__).read_text(encoding="utf-8"))
     literals = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -1540,7 +1540,7 @@ def test_c5_the_turboquant_surface_passes_no_literal_non_blocking() -> None:
                 literals.append((node.lineno, keyword.value.value))
 
     assert literals == [], (
-        f"turboquant_dry_run.py passes a literal non_blocking at {literals}. The flag has to be "
+        f"turboquant_v1.py passes a literal non_blocking at {literals}. The flag has to be "
         "derived from whether the staging is pinned -- a non-blocking copy out of pageable "
         "memory is neither fast nor safe, and a blocking copy out of pinned memory is a claim "
         "nothing checks."

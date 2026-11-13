@@ -29,18 +29,18 @@ import types
 import pytest
 import torch
 
-from vllm_ascend.attention.turboquant_dry_run import (
-    TurboQuantEmulator,
-    TurboQuantKernelStage,
-    TurboQuantOpsAdapter,
-    TurboQuantOpsConfig,
-    TurboQuantValueLayout,
-)
 from vllm_ascend.attention.turboquant_nz_ingress import (
     turboquant_codes_to_nz_tiled,
     turboquant_nz_packed_byte,
     turboquant_nz_scale_index,
     turboquant_scales_to_nz_tiled,
+)
+from vllm_ascend.attention.turboquant_v1 import (
+    TurboQuantEmulator,
+    TurboQuantKernelStage,
+    TurboQuantOpsAdapter,
+    TurboQuantOpsConfig,
+    TurboQuantValueLayout,
 )
 
 NUM_BLOCKS = 4

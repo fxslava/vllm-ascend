@@ -2,13 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Stand up the narrowest vllm stubs that let the device-free TurboQuant tests run.
 
-``test_turboquant_{op_schemas,dispatch_seam,strip_cache,dry_run_codec,
+``test_turboquant_{op_schemas,dispatch_seam,strip_cache,codec,
 kernel_cache_layout,layout,nz_ingress,profile}.py`` need nothing but ``torch``:
 they check layout arithmetic, the kernel/golden dispatch seam, the in-code
 profiler's bookkeeping, and the ``ops.def`` schemas in
 ``csrc/attention/turboquant/torch_bindings.cpp`` against the Python stubs that
 call them. The only reason they need a vllm install at all is
-``turboquant_dry_run.py``'s own import block, and the only reason they need an
+``turboquant_v1.py``'s own import block, and the only reason they need an
 Ascend host is ``tests/ut/conftest.py``.
 
 This module removes both reasons, so the seam can be checked on a developer
@@ -53,11 +53,11 @@ def _module(name: str, path: pathlib.Path | None = None) -> types.ModuleType:
     A package gets a ``__path__`` and a matching ``__spec__``, so the normal
     import machinery keeps working underneath it. That is the point of using a
     real directory here: ``vllm_ascend.attention.turboquant_layout`` and
-    ``...turboquant_dry_run`` are then found and imported from the checkout,
+    ``...turboquant_v1`` are then found and imported from the checkout,
     rather than loaded from somewhere else by hand. Keeping them at their true
     paths matters -- ``test_turboquant_op_schemas.py`` locates
     ``torch_bindings.cpp`` by walking up from
-    ``turboquant_dry_run.__file__``, and silently skips every one of its tests
+    ``turboquant_v1.__file__``, and silently skips every one of its tests
     if that walk does not land on the checkout.
     """
     module = types.ModuleType(name)
@@ -82,7 +82,7 @@ def install() -> None:
             "run the tests directly with pytest instead."
         )
 
-    # torch_npu is imported by turboquant_dry_run for its side effects; nothing
+    # torch_npu is imported by turboquant_v1 for its side effects; nothing
     # in these tests calls into it.
     _module("torch_npu")
 
@@ -135,7 +135,7 @@ def install() -> None:
     attention_v1 = _module("vllm_ascend.attention.attention_v1")
 
     class AscendAttentionBackend:
-        """Base of the dry-run backend; the tests only read its subclass."""
+        """Base of the TurboQuant backend; the tests only read its subclass."""
 
     class AscendAttentionBackendImpl:
         def __init__(self, *args: object, **kwargs: object) -> None:
