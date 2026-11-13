@@ -551,3 +551,119 @@ def test_turboquant_leaves_an_already_power_of_two_block_size_alone():
         HybridAttentionMambaModelConfig.verify_and_update_config(config)
 
     assert config.cache_config.block_size == 128
+
+
+# ---------------------------------------------------------------------------
+# The LATE pass: NPUPlatform.update_block_size_for_backend
+#
+# The config-time passes above run before weights load, when block_size is
+# still the user's value. Upstream raises it afterwards, in the EngineCore,
+# from Platform.update_block_size_for_backend ->
+# Platform._align_hybrid_block_size (vllm/platforms/interface.py, the
+# "Setting attention block size to %d tokens to ensure that attention page
+# size is >= mamba page size" log). The rounding therefore also lives at the
+# end of NPUPlatform.update_block_size_for_backend, the override upstream
+# calls in that same post-load moment.
+# ---------------------------------------------------------------------------
+
+
+def _upstream_platform_phase2(config):
+    """Stand-in for upstream Platform.update_block_size_for_backend.
+
+    Phase 2 (_align_hybrid_block_size) raises the attention block size so the
+    attention page covers the GDN state page and pads the mamba page to match.
+    """
+    config.cache_config.block_size = 896
+    config.cache_config.mamba_page_size_padded = 896 * 4096
+
+
+def test_update_block_size_for_backend_rounds_the_post_load_raise():
+    """The Qwen3.5 regression: 896 is written after weights load, past every
+    config-time pass; the platform-level pass rounds it before the engine
+    reports block_size back to the frontend (core_client syncs it)."""
+    config = _qwen35_hybrid_config()
+
+    with (
+        _turboquant_on(),
+        patch.object(
+            Platform,
+            "update_block_size_for_backend",
+            side_effect=_upstream_platform_phase2,
+        ),
+    ):
+        NPUPlatform.update_block_size_for_backend(config)
+
+    assert config.cache_config.block_size == 1024
+    assert config.cache_config.block_size & (config.cache_config.block_size - 1) == 0
+    assert config.cache_config.mamba_page_size_padded == 1024 * 4096
+
+
+def test_update_block_size_for_backend_keeps_the_raise_without_turboquant():
+    config = _qwen35_hybrid_config()
+
+    with (
+        _turboquant_off(),
+        patch.object(
+            Platform,
+            "update_block_size_for_backend",
+            side_effect=_upstream_platform_phase2,
+        ),
+    ):
+        NPUPlatform.update_block_size_for_backend(config)
+
+    assert config.cache_config.block_size == 896
+    assert config.cache_config.mamba_page_size_padded == 896 * 4096
+
+
+def test_update_block_size_for_backend_exempts_mla_models():
+    config = _qwen35_hybrid_config()
+    config.model_config.use_mla = True
+
+    with (
+        _turboquant_on(),
+        patch.object(
+            Platform,
+            "update_block_size_for_backend",
+            side_effect=_upstream_platform_phase2,
+        ),
+    ):
+        NPUPlatform.update_block_size_for_backend(config)
+
+    assert config.cache_config.block_size == 896
+
+
+def test_update_block_size_for_backend_refuses_an_odd_kpool_alignment():
+    """The same refusal as the config-time pass, at the platform level.
+
+    index_kpool=3 aligns to lcm(128, 48) = 384, which no power of two divides.
+    """
+    config = _qwen35_hybrid_config()
+    config.model_config.hf_text_config = SimpleNamespace(index_topk=2048, index_kpool=3)
+
+    def _upstream_phase2(config):
+        config.cache_config.block_size = 384
+        config.cache_config.mamba_page_size_padded = 384 * 4096
+
+    with (
+        _turboquant_on(),
+        patch.object(
+            Platform,
+            "update_block_size_for_backend",
+            side_effect=_upstream_phase2,
+        ),
+        pytest.raises(ValueError, match="no block size satisfies both"),
+    ):
+        NPUPlatform.update_block_size_for_backend(config)
+
+
+def test_update_block_size_for_backend_is_a_no_op_on_a_power_of_two():
+    config = _qwen35_hybrid_config()
+
+    with (
+        _turboquant_on(),
+        patch.object(Platform, "update_block_size_for_backend"),
+    ):
+        NPUPlatform.update_block_size_for_backend(config)
+
+    assert config.cache_config.block_size == 128
+    assert config.cache_config.mamba_page_size_padded == 8192

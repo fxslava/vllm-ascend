@@ -203,6 +203,28 @@ def model_uses_kpool_indexer(model_config: Any | None) -> bool:
     return any(hasattr(getattr(model_config, attr, None), "index_kpool") for attr in ("hf_text_config", "hf_config"))
 
 
+def get_sparse_index_kpool(model_config: Any | None) -> int | None:
+    """Return the active sparse index-kpool ratio, if configured.
+
+    Public twin of ``patch_mamba_config._get_sparse_index_kpool``: the
+    platform's TurboQuant block-size rounding
+    (:meth:`NPUPlatform.update_block_size_for_backend`) needs the ratio without
+    importing the patch module -- importing it registers the mamba-config
+    override as a side effect, which the 310P hardware profile must not see.
+    """
+    for config_name in ("hf_text_config", "hf_config"):
+        config = getattr(model_config, config_name, None)
+        if config is None or getattr(config, "index_topk", None) is None:
+            continue
+        if not hasattr(config, "index_kpool"):
+            continue
+        index_kpool = config.index_kpool
+        if not isinstance(index_kpool, int) or index_kpool <= 1:
+            raise ValueError("Sparse index-kpool models require index_kpool to be an integer greater than 1.")
+        return index_kpool
+    return None
+
+
 def model_uses_sfa_sparse(model_config: Any | None) -> bool:
     hf_text_config = getattr(model_config, "hf_text_config", None)
     hf_config = getattr(model_config, "hf_config", None)
