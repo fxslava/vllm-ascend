@@ -47,6 +47,7 @@ from vllm_ascend.utils import (
     FP8_METHOD,
     dsv4_skips_indexer_topk,
     get_dsv4_compress_ratio,
+    get_sparse_index_kpool,
     bootstrap_custom_op_env,
     check_kv_extra_config,
     enable_sfa_dcp_replicated_indexer,
@@ -54,6 +55,7 @@ from vllm_ascend.utils import (
     model_uses_kpool_indexer,
     model_uses_sfa_sparse,
     refresh_block_size,
+    turboquant_enabled,
     update_cudagraph_capture_sizes,
     enable_sp,
 )
@@ -84,6 +86,85 @@ _MINIMAX_M3_ARCHITECTURES = frozenset(
         "MiniMaxM3SparseForConditionalGeneration",
     }
 )
+
+
+def _round_block_size_for_turboquant_decode(vllm_config: VllmConfig) -> None:
+    """Round a non-power-of-two block size up for the TurboQuant fused decode.
+
+    This is the LATE, authoritative pass of the rounding
+    ``patch_mamba_config.py`` applies early. The early pass runs at
+    model-config verification, before weights load, when
+    ``cache_config.block_size`` is still the user's value. The value that kills
+    the engine is written later: upstream ``Platform._align_hybrid_block_size``
+    (vllm/platforms/interface.py) raises the block size so the attention page
+    covers the mamba state page -- 896 = 7x128 on a Qwen3.5-class GDN hybrid,
+    which has no sparse indexer and so never passed through the early pass's
+    kpool branch either. Upstream calls that from
+    ``update_block_size_for_backend`` in the EngineCore right after
+    ``load_model`` (vllm/v1/executor/uniproc_executor.py,
+    multiproc_executor.py), and the engine then reports the value in its ready
+    response: ``vllm/v1/engine/core_client.py`` syncs
+    ``cache_config.block_size`` back to the frontend. Running the rounding at
+    the end of this same override therefore intercepts exactly the post-load
+    write, at the engine level, with engine and server unable to disagree --
+    unlike a rewrite at the API-server layer.
+
+    Rounding UP keeps the mamba-page coverage (the page only grows, and
+    ``mamba_page_size_padded`` is re-derived below), keeps the kpool indexer
+    alignment whenever that alignment is itself a power of two, and only
+    coarsens scheduling granularity. An odd factor in the kpool alignment
+    (``index_kpool`` not a power of two) makes the two constraints
+    unsatisfiable together; refuse rather than crash mid-serving in
+    ``npu_turboquant_build_decode_tiling``. MLA models are exempt: TurboQuant
+    only re-describes full-attention layers, and an MLA model has none.
+    Non-TurboQuant runs return immediately.
+    """
+    if not turboquant_enabled(vllm_config):
+        return
+    model_config = vllm_config.model_config
+    if model_config is None or getattr(model_config, "use_mla", False):
+        return
+    cache_config = vllm_config.cache_config
+    block_size = cache_config.block_size
+    if block_size is None or (block_size >= 64 and not block_size & (block_size - 1)):
+        return
+    decode_block_size = max(64, 1 << (block_size - 1).bit_length())
+    index_kpool = get_sparse_index_kpool(model_config)
+    if index_kpool is not None:
+        alignment_tokens = math.lcm(128, index_kpool * 16)
+        if decode_block_size % alignment_tokens:
+            raise ValueError(
+                f"ENABLE_TURBOQUANT=1 needs the attention block size to be a power-of-two "
+                f"multiple of 64 for the fused decode's closed-form tile cursor, but the "
+                f"sparse index-kpool geometry (index_kpool={index_kpool}) requires a multiple "
+                f"of {alignment_tokens}, and no block size satisfies both. Run without "
+                f"ENABLE_TURBOQUANT, or without the kpool indexer."
+            )
+    logger.info(
+        "TurboQuant: rounding attention block size from %d to %d (a power-of-two multiple of 64) "
+        "for the fused decode's tile cursor, after the hybrid mamba-page alignment.",
+        block_size,
+        decode_block_size,
+    )
+    cache_config.block_size = decode_block_size
+    # The mamba page must stay covered: the attention page just grew, so
+    # re-derive the padded mamba page from the new block size. The existing
+    # padded value is max(old attention page, mamba raw), so max() with it is
+    # max() with the mamba raw page too.
+    from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size
+
+    kv_cache_dtype = (
+        model_config.dtype if cache_config.cache_dtype == "auto" else STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+    )
+    attn_page_size = (
+        2
+        * model_config.get_head_size()
+        * model_config.get_num_kv_heads(vllm_config.parallel_config)
+        * get_dtype_size(kv_cache_dtype)
+        * decode_block_size
+    )
+    if cache_config.mamba_page_size_padded is None or attn_page_size > cache_config.mamba_page_size_padded:
+        cache_config.mamba_page_size_padded = attn_page_size
 
 
 class NPUPlatform(Platform):
@@ -442,6 +523,13 @@ class NPUPlatform(Platform):
                 assert cache_config.mamba_block_size % cache_config.block_size == 0, (
                     f"mamba_block_size must be a multiple of block_size: {cache_config.block_size}"
                 )
+        # Last, after every upstream phase: upstream's _align_hybrid_block_size
+        # (phase 2 of the super() call) may have raised block_size to a
+        # non-power-of-two the TurboQuant fused decode cannot tile. Runs after
+        # the kv-transfer fixup too: a TurboQuant run never takes that branch
+        # (patch_mamba_config refuses kv-transfer with TurboQuant), so the two
+        # cannot disagree on the final value.
+        _round_block_size_for_turboquant_decode(vllm_config)
 
     @classmethod
     def _validate_indexer_pp_config(cls, vllm_config: VllmConfig) -> None:
