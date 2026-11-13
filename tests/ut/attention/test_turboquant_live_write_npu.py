@@ -23,11 +23,13 @@ or under pytest::
 
 The geometry is only partly negotiable. Both writers are specialised at compile
 time to ``head_size == 256`` and to a 16-token strip, and the batch writer
-additionally to 4 KV heads. Neither is pinned to a page size any more: the batch
-writer gained an in-page strip offset, so both now take any ``block_size`` that
-is a multiple of 16, and both are exercised here at ``block_size == 64`` -- four
-strips to a page, which is the arrangement that would have silently overwritten
-itself before that offset existed.
+additionally to 4 KV heads. The batch writer is built with
+``TURBOQUANT_INGRESS_NZ=1`` now, so it also needs ``block_size`` to be a
+multiple of 64 -- exercised here at ``block_size == 64``, one NZ tile to a
+page -- and writes the NZ-tiled cache the fused decode reads. The golden side
+of each differential below is pinned to the layout the staged writer owns:
+NZ_TILED for the batch writer, the strip cache for the scatter writer, which
+has no NZ variant.
 """
 
 from __future__ import annotations
@@ -139,10 +141,11 @@ def _activations(num_tokens: int, device: torch.device, seed: int) -> tuple[torc
 def _adapters(stage, layout):
     """``(kernel_adapter, golden_adapter)`` over the same configuration otherwise.
 
-    The golden one is pinned to CHANNEL_MAJOR explicitly, because with no
-    ingestion kernel engaged ``value_layout()`` would otherwise report the
-    golden model's own TOKEN_MAJOR cache -- and the point here is to write the
-    strip layout both ways.
+    The golden one is pinned to the staged writer's layout explicitly, because
+    with no ingestion kernel engaged ``value_layout()`` would otherwise report
+    the golden model's own TOKEN_MAJOR cache -- and the point here is to write
+    the same layout both ways: NZ_TILED for the batch writer (the NZ ingress),
+    CHANNEL_MAJOR for the scatter writer (still a strip kernel).
     """
     _, _, TurboQuantOpsAdapter, TurboQuantOpsConfig, TurboQuantValueLayout = _import_backend()
     kernel = TurboQuantOpsAdapter(TurboQuantOpsConfig(ops_namespace=NAMESPACE, kernel_stages=frozenset({stage})))
@@ -150,11 +153,10 @@ def _adapters(stage, layout):
         TurboQuantOpsConfig(
             ops_namespace=NAMESPACE,
             kernel_stages=frozenset(),
-            value_layout=TurboQuantValueLayout.CHANNEL_MAJOR,
+            value_layout=kernel.value_layout(),
         )
     )
-    assert kernel.value_layout() is TurboQuantValueLayout.CHANNEL_MAJOR
-    assert golden.value_layout() is TurboQuantValueLayout.CHANNEL_MAJOR
+    assert golden.value_layout() is kernel.value_layout()
     return kernel, golden
 
 
@@ -201,7 +203,7 @@ def _compare(kernel_caches, golden_caches) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 1. The prefill batch writer, block_size 16
+# 1. The prefill batch writer, block_size 64, NZ-tiled ingress
 # ---------------------------------------------------------------------------
 
 
@@ -213,7 +215,9 @@ def test_the_batch_writer_fills_every_strip_of_one_page() -> None:
     Before `run_vector_core` derived `strip_in_block`, every one of these four
     blocks computed the same page base and wrote over the previous one: the cache
     came out holding only the last strip, with every other byte of the page
-    still zero and no check anywhere failing.
+    still zero and no check anywhere failing. Under the NZ ingress each strip
+    owns 16 tile rows of every (kv head, column group) of the page's tile, so
+    "written" is asserted through the NZ address function, not a row slice.
     """
     TurboQuantEmulator, TurboQuantKernelStage, _, _, _ = _import_backend()
     emulator = TurboQuantEmulator(head_size=HEAD_SIZE, device=DEVICE)
@@ -231,11 +235,15 @@ def test_the_batch_writer_fills_every_strip_of_one_page() -> None:
     torch.npu.synchronize()
     _compare(on_npu, on_golden)
 
-    # And the whole page really was written, not just one strip of it.
-    page = on_npu[0][3].cpu()
+    # And the whole page really was written, not just one strip of it: gather
+    # each strip's bytes through the NZ address function and check they moved.
+    flat = on_npu[0].view(-1).cpu()
+    packed = HEAD_SIZE // 2
     for strip in range(strips_per_page):
-        rows = page[strip * STRIP : (strip + 1) * STRIP]
-        assert not torch.equal(rows, torch.zeros_like(rows)), (
+        slots = 3 * PREFILL_BLOCK_SIZE + strip * STRIP + torch.arange(STRIP, dtype=torch.int64)
+        offsets = kernel_adapter._nz_byte_offsets(slots, NUM_KV_HEADS, packed)
+        rows = flat[offsets.reshape(-1)]
+        assert int(rows.abs().sum()) > 0, (
             f"strip {strip} of the page is still zero: the in-page offset did not take effect"
         )
 

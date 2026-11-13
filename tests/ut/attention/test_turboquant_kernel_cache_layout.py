@@ -3,16 +3,19 @@
 """CPU tests for the cache layout the TurboQuant NPU writers leave behind.
 
 The two audited writers (``csrc/attention/turboquant/op_kernel/turboquant_reshape_batch.cpp``
-and ``..._scatter.cpp``) do not write the golden model's cache. Their strip
-cache differs twice over: the page axis order is
+and ``..._scatter.cpp``) do not write the golden model's cache, and they no
+longer write the same cache as each other: the batch writer is built with
+``TURBOQUANT_INGRESS_NZ=1`` and produces the NZ-tiled layout the fused decode
+reads, while the scatter writer still produces the strip cache -- page axis
 ``(num_blocks, num_kv_heads, block_size, head_size / 2)``, head before token,
-and the value plane's nibble index inside a page is
-``channel * block_size + token`` rather than ``token * head_size + channel``.
+value nibble ``channel * block_size + token`` inside a 16-token strip.
 
 So three things have to hold, and all three are checked here without a device:
 
 * the layout is a property of whichever writer owns the page, not a global, so
-  switching an ingestion stage on is enough -- the reader follows.
+  switching an ingestion stage on is enough -- the reader follows. The batch
+  writer's stage means NZ_TILED; the scatter writer's alone means the strip
+  cache.
 * a mixed configuration (NPU writer, golden gather) reads back correctly. The
   reference strip cache below is written in PyTorch to the writers' documented
   nibble arithmetic, and gathering it must produce the same four panels as
@@ -196,18 +199,35 @@ def test_golden_writers_keep_the_configured_layout(monkeypatch: pytest.MonkeyPat
 
 
 @pytest.mark.parametrize(
-    ("stage", "op_name"),
+    ("stage", "op_name", "expected"),
     [
-        (TurboQuantKernelStage.RESHAPE_AND_CACHE, TURBOQUANT_OP_RESHAPE_AND_CACHE),
-        (TurboQuantKernelStage.SCATTER, TURBOQUANT_OP_RESHAPE_SCATTER),
+        (TurboQuantKernelStage.RESHAPE_AND_CACHE, TURBOQUANT_OP_RESHAPE_AND_CACHE, TurboQuantValueLayout.NZ_TILED),
+        (TurboQuantKernelStage.SCATTER, TURBOQUANT_OP_RESHAPE_SCATTER, TurboQuantValueLayout.CHANNEL_MAJOR),
     ],
 )
-def test_either_npu_writer_puts_the_cache_in_the_strip_layout(
-    monkeypatch: pytest.MonkeyPatch, stage: TurboQuantKernelStage, op_name: str
+def test_an_engaged_writer_owns_the_cache_layout(
+    monkeypatch: pytest.MonkeyPatch, stage: TurboQuantKernelStage, op_name: str, expected: TurboQuantValueLayout
 ) -> None:
-    """One ingestion stage is enough: the cache is the strip cache from then on."""
+    """One ingestion stage is enough: the cache is that writer's layout from then on.
+
+    The batch writer is the NZ ingress now, so its stage puts the cache in
+    NZ_TILED; the scatter writer has no NZ variant and still means the strip
+    cache.
+    """
     _register(monkeypatch, op_name)
-    assert _adapter(stage).value_layout() is TurboQuantValueLayout.CHANNEL_MAJOR
+    assert _adapter(stage).value_layout() is expected
+
+
+def test_the_batch_writers_nz_layout_wins_over_the_scatter_stage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both writers staged: the cache is NZ, and the strip scatter is kept off it.
+
+    The two kernels cannot share a cache, so the adapter reports NZ_TILED --
+    the batch writer's layout -- and reshape_scatter_decode falls back to the
+    golden NZ writer rather than letting the strip kernel corrupt the fractal.
+    """
+    _register(monkeypatch, TURBOQUANT_OP_RESHAPE_AND_CACHE, TURBOQUANT_OP_RESHAPE_SCATTER)
+    adapter = _adapter(TurboQuantKernelStage.RESHAPE_AND_CACHE, TurboQuantKernelStage.SCATTER)
+    assert adapter.value_layout() is TurboQuantValueLayout.NZ_TILED
 
 
 def test_the_decode_stage_alone_does_not_change_the_layout(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -248,10 +268,20 @@ def test_the_golden_writer_now_does_the_channel_major_rmw(emulator: TurboQuantEm
 
 
 @pytest.mark.parametrize(
-    ("stage", "op_name", "entry"),
+    ("stage", "op_name", "entry", "expected"),
     [
-        (TurboQuantKernelStage.RESHAPE_AND_CACHE, TURBOQUANT_OP_RESHAPE_AND_CACHE, "reshape_and_cache_prefill"),
-        (TurboQuantKernelStage.SCATTER, TURBOQUANT_OP_RESHAPE_SCATTER, "reshape_scatter_decode"),
+        (
+            TurboQuantKernelStage.RESHAPE_AND_CACHE,
+            TURBOQUANT_OP_RESHAPE_AND_CACHE,
+            "reshape_and_cache_prefill",
+            TurboQuantValueLayout.NZ_TILED,
+        ),
+        (
+            TurboQuantKernelStage.SCATTER,
+            TURBOQUANT_OP_RESHAPE_SCATTER,
+            "reshape_scatter_decode",
+            TurboQuantValueLayout.CHANNEL_MAJOR,
+        ),
     ],
 )
 def test_an_engaged_writer_never_reaches_the_refusal(
@@ -260,16 +290,17 @@ def test_an_engaged_writer_never_reaches_the_refusal(
     stage: TurboQuantKernelStage,
     op_name: str,
     entry: str,
+    expected: TurboQuantValueLayout,
 ) -> None:
-    """The kernel owns the read-modify-write, so the layout must not refuse it.
+    """The kernel owns the cache layout, so the layout must not refuse the call.
 
-    `value_layout()` reports CHANNEL_MAJOR here -- the kernel put the cache in
-    the strip layout -- and that must not make the entry point raise on its way
-    to the kernel it is about to call.
+    `value_layout()` reports the staged writer's layout -- NZ_TILED for the
+    batch writer, the strip layout for the scatter -- and that must not make
+    the entry point raise on its way to the kernel it is about to call.
     """
     entries = _register(monkeypatch, op_name)
     adapter = _adapter(stage)
-    assert adapter.value_layout() is TurboQuantValueLayout.CHANNEL_MAJOR
+    assert adapter.value_layout() is expected
 
     key, value = _activations(BLOCK_SIZE)
     getattr(adapter, entry)(key, value, *_caches(), torch.arange(BLOCK_SIZE, dtype=torch.int32), emulator)
