@@ -67,12 +67,16 @@ What this module claims, and what it does not
 
 :func:`turboquant_repack_strip_to_nz_tiled` is a reference conversion. It makes
 the fused decode reachable from a cache the audited writers produced, and it is
-the executable specification that a write-time NZ ingress kernel has to match --
-that kernel is the real fix and it belongs in the harness, which already has one
-behind ``TURBOQUANT_INGRESS_NZ``. This is not a serving-path optimisation: it is
-a whole extra pass over the pages it touches, and the scatter writer's one token
-per launch would make a per-step repack absurd. Use it to exercise and gate the
-decode, not to serve.
+the executable specification that a write-time NZ ingress kernel has to match.
+That kernel has landed: the mirrored batch writer
+(``csrc/attention/turboquant/op_kernel/turboquant_reshape_batch.cpp``) is built
+with ``TURBOQUANT_INGRESS_NZ=1`` and its NZ addressing is tied to
+``turboquant_layout.h`` by ``static_assert``. This module remains the bridge
+for caches written before the ingress existed and the host-side oracle for the
+contract. This is not a serving-path optimisation: it is a whole extra pass
+over the pages it touches, and the scatter writer's one token per launch would
+make a per-step repack absurd. Use it to exercise and gate the decode, not to
+serve.
 
 ``block_size`` has to satisfy both sides at once: a multiple of 16 for the
 writers and a power-of-two multiple of 64 for the decode's closed-form tile

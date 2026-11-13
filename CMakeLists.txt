@@ -149,12 +149,27 @@ if(SOC_VERSION MATCHES "ascend950")
     # nothing and it is what makes this block work unchanged if a standalone gate
     # builds the same sources through the legacy ascendc_library, where the
     # host-forwarded copy IS the only one the host pass sees.
+    # TURBOQUANT_INGRESS_NZ=1 turns the prefill batch writer into the NZ-tiled
+    # ingress: it emits the [64-row tile][kv head][32-byte column group][tile
+    # row][byte] cache the fused decode reads (NzTiledPackedByte in
+    # op_kernel/common/turboquant_layout.h) instead of the RFC 3.1 strip cache,
+    # with the kv4fp8 nibble pairing and the slot-major scale plane. This is the
+    # fix for the writer/reader cache-format mismatch: the prefill writer and
+    # the decode now name the same byte. turboquant-core builds the same source
+    # twice (tq_prefill_npu / tq_prefill_nz_npu) so both variants ship; this
+    # repo wants only the NZ one, so the define is target-wide here. It is
+    # inert for the other two sources: turboquant_reshape_scatter.cpp and
+    # turboquant_fused_decode.cpp never reference it. The scatter writer has NO
+    # NZ variant in turboquant-core and still writes the strip cache -- see
+    # csrc/attention/turboquant/README.md, "The scatter writer still does not
+    # meet the decode".
     ascendc_compile_definitions(vllm_ascend_turboquant PRIVATE
-        ASCEND_MICRO_CANN_LAUNCH ASCEND_TQ_FUSED_DECODE_GEMM_REDUCE=1)
+        ASCEND_MICRO_CANN_LAUNCH ASCEND_TQ_FUSED_DECODE_GEMM_REDUCE=1 TURBOQUANT_INGRESS_NZ=1)
     ascendc_compile_options(vllm_ascend_turboquant PRIVATE
         -forward-options-to-host-compiler
         -DASCEND_MICRO_CANN_LAUNCH
-        -DASCEND_TQ_FUSED_DECODE_GEMM_REDUCE=1)
+        -DASCEND_TQ_FUSED_DECODE_GEMM_REDUCE=1
+        -DTURBOQUANT_INGRESS_NZ=1)
 endif()
 
 file(GLOB KERNEL_FILES

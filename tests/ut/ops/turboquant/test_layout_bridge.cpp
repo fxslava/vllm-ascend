@@ -19,9 +19,10 @@
 // There are two 4-bit KV cache layouts in this repository, and this is the gate that says which
 // one a writer is speaking.
 //
-//   (A) STRIP -- RFC 3.1, what turboquant_reshape_batch.cpp and turboquant_reshape_scatter.cpp
-//       write. Normative in turboquant_layout.h, mirrored as index maps in
-//       tests/common/turboquant_test_common.hpp, R = kStripHeight:
+//   (A) STRIP -- RFC 3.1, what turboquant_reshape_scatter.cpp still writes
+//       (turboquant_reshape_batch.cpp crossed over to (B) under
+//       TURBOQUANT_INGRESS_NZ=1). Normative in turboquant_layout.h, mirrored as
+//       index maps in tests/common/turboquant_test_common.hpp, R = kStripHeight:
 //         key   nibble = ((block*H + head)*S + token)*d + channel
 //         value nibble = ((block*H + head)*S)*d + (token/R)*(R*d) + channel*R + (token % R)
 //         scale index  = ((kv*P + block)*H + head)*S + token

@@ -11,10 +11,13 @@ Three properties are pinned here:
   goes to the batch writer; one token per request is decode and goes to the
   scatter writer. Metadata without ``seq_lens_list`` reads as prefill rather
   than crashing.
-* a prefill step of an arbitrary token count is planned across both writers
-  rather than refused, every token lands exactly once at the slot it was given,
-  and a step that already met the batch writer's strip contract is dispatched
-  exactly as it was before the planner existed.
+* a prefill step of an arbitrary token count is planned rather than refused:
+  whole strips go to the batch writer, and the leftovers go to the golden NZ
+  writer now that the batch writer's NZ ingress owns the cache layout (the
+  strip scatter kernel is kept off an NZ cache). Every token lands exactly
+  once at the slot it was given, and a step that already met the batch
+  writer's strip contract is dispatched exactly as it was before the planner
+  existed.
 * ``npu_turboquant_fused_decode`` returns ``None``, which is what routes a
   decode to the golden gather, dequantise and attend path.
 """
@@ -164,6 +167,37 @@ def _strip_caches() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         torch.zeros(
             turboquant_scale_cache_shape(STRIP_NUM_BLOCKS, STRIP_BLOCK_SIZE, NUM_KV_HEADS), dtype=torch.float32
         ),
+    )
+
+
+# The ingestion-split tests run in the NZ-tiled cache, because that is what the
+# staged batch writer writes now: TURBOQUANT_INGRESS_NZ=1 puts the page in
+# 64-row tiles, so the page is 64 slots, and the slot-major scale record is
+# padded to one fp32 block, which the (2, num_blocks, H, block_size) plane only
+# fits exactly when 2 * H is a multiple of 8 -- hence 4 KV heads here, the
+# geometry the kernel itself is compiled for.
+NZ_BLOCK_SIZE = 64
+NZ_NUM_KV_HEADS = 4
+NZ_NUM_BLOCKS = 8
+
+
+def _nz_caches() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    packed = (NZ_NUM_BLOCKS, NZ_BLOCK_SIZE, NZ_NUM_KV_HEADS, turboquant_packed_bytes(HEAD_SIZE))
+    return (
+        torch.zeros(packed, dtype=torch.int8),
+        torch.zeros(packed, dtype=torch.int8),
+        torch.zeros(
+            turboquant_scale_cache_shape(NZ_NUM_BLOCKS, NZ_BLOCK_SIZE, NZ_NUM_KV_HEADS), dtype=torch.float32
+        ),
+    )
+
+
+def _nz_activations(num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+    generator = torch.Generator().manual_seed(20261107)
+    shape = (num_tokens, NZ_NUM_KV_HEADS, HEAD_SIZE)
+    return (
+        torch.randn(shape, generator=generator, dtype=torch.float32),
+        torch.randn(shape, generator=generator, dtype=torch.float32),
     )
 
 
@@ -573,7 +607,7 @@ def test_the_pad_is_refused_when_it_would_cross_into_the_next_page() -> None:
 
 
 def _strip_layout_adapter() -> TurboQuantOpsAdapter:
-    """A golden adapter in the layout both NPU writers write.
+    """A golden adapter in the strip layout, which only the scatter writer writes now.
 
     ``value_layout()`` is derived from which ingestion stage is staged, so a
     reference write has to be configured into the channel-major strip cache
@@ -589,17 +623,35 @@ def _strip_layout_adapter() -> TurboQuantOpsAdapter:
     )
 
 
+def _nz_layout_adapter() -> TurboQuantOpsAdapter:
+    """A golden adapter in the NZ-tiled layout the staged batch writer writes.
+
+    Same derivation caveat as above, the other way around: with no stage
+    staged, ``value_layout()`` would report the golden model's own token-major
+    cache, so the NZ layout is pinned explicitly.
+    """
+    return TurboQuantOpsAdapter(
+        TurboQuantOpsConfig(
+            ops_namespace=NAMESPACE,
+            kernel_stages=frozenset(),
+            value_layout=TurboQuantValueLayout.NZ_TILED,
+        )
+    )
+
+
 def _staged_adapter() -> TurboQuantOpsAdapter:
     return _adapter(TurboQuantKernelStage.RESHAPE_AND_CACHE, TurboQuantKernelStage.SCATTER)
 
 
 class _GoldenWriter:
-    """A registered writer that performs the golden write and records its slots.
+    """A registered writer that performs the golden NZ write and records its slots.
 
-    Both C writers land the same nibbles and the same fp32 scales as the golden
-    model -- that is the premise of this whole file -- so standing them both up
-    as the golden write is what lets a host with no NPU check that the split
-    lands exactly what one unsplit call would have.
+    The batch-writer kernel and the golden model land the same nibbles and the
+    same fp32 scales -- that is the premise of this whole file, and the NZ
+    ingress keeps it: TURBOQUANT_INGRESS_NZ changes WHERE the bytes go, not
+    what they are. Standing the op up as the golden NZ write is what lets a
+    host with no NPU check that the split lands exactly what one unsplit call
+    would have.
     """
 
     def __init__(self, emulator: TurboQuantEmulator) -> None:
@@ -609,17 +661,25 @@ class _GoldenWriter:
     def __call__(self, key: torch.Tensor, value: torch.Tensor, *planes_and_rest: Any) -> None:
         key_cache, value_cache, scale_cache, slot_mapping = planes_and_rest[:4]
         self.slots.append(slot_mapping.tolist())
-        _strip_layout_adapter()._write_slots(
+        _nz_layout_adapter()._write_slots(
             key, value, key_cache, value_cache, scale_cache, slot_mapping, self._emulator
         )
 
 
 def _golden_writer(monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator) -> _GoldenWriter:
+    """Register the batch writer as the golden NZ write, and the scatter as never-called.
+
+    The strip scatter kernel is kept OFF an NZ cache by the adapter, so in the
+    configuration both stages staged it must not run at all: the split's waves
+    go to the golden NZ writer instead. The recorder standing in for it is what
+    proves that.
+    """
     writer = _GoldenWriter(emulator)
+    scatter = _Recorder()
     _register(
         monkeypatch,
         npu_turboquant_reshape_and_cache_a8=writer,
-        npu_turboquant_reshape_scatter_aiv=writer,
+        npu_turboquant_reshape_scatter_aiv=scatter,
     )
     return writer
 
@@ -641,19 +701,21 @@ def test_the_split_lands_what_one_unsplit_call_would_have(
 ) -> None:
     """Bit-exact for every token the step was given, at any token count.
 
-    The reference is one unsplit golden write of the step, and then the replicas
-    the plan asks for -- which land on slots the step does not write, so the
-    bytes of every real token in it came from that single unsplit call. The two
-    caches then have to agree everywhere, replicas included.
+    The reference is one unsplit golden NZ write of the step, and then the
+    replicas the plan asks for -- which land on slots the step does not write,
+    so the bytes of every real token in it came from that single unsplit call.
+    The two caches then have to agree everywhere, replicas included. The waves
+    go to the golden NZ writer inside the adapter, not to the strip scatter
+    kernel, which is exactly the interim state the NZ ingress leaves behind.
     """
-    key, value = _activations(num_tokens)
+    key, value = _nz_activations(num_tokens)
     slot_mapping = torch.arange(first_slot, first_slot + num_tokens, dtype=torch.int32)
-    plan = turboquant_plan_strip_ingestion(slot_mapping.tolist(), STRIP_BLOCK_SIZE)
+    plan = turboquant_plan_strip_ingestion(slot_mapping.tolist(), NZ_BLOCK_SIZE)
     rows, pad_slots = _replicas(slot_mapping, plan)
     assert set(pad_slots).isdisjoint(slot_mapping.tolist())
 
-    reference = _strip_layout_adapter()
-    expected = _strip_caches()
+    reference = _nz_layout_adapter()
+    expected = _nz_caches()
     reference._write_slots(key, value, *expected, slot_mapping, emulator)
     if rows:
         index = torch.tensor(rows, dtype=torch.long)
@@ -666,7 +728,7 @@ def test_the_split_lands_what_one_unsplit_call_would_have(
         )
 
     _golden_writer(monkeypatch, emulator)
-    written = _strip_caches()
+    written = _nz_caches()
     _staged_adapter().reshape_and_cache_prefill(key, value, *written, slot_mapping, emulator)
 
     for got, want in zip(written, expected):
@@ -684,20 +746,22 @@ def test_the_only_slots_touched_beyond_the_step_are_the_planned_pad(
     never move.
     """
     num_tokens = 220
-    key, value = _activations(num_tokens)
+    key, value = _nz_activations(num_tokens)
     slot_mapping = torch.arange(num_tokens, dtype=torch.int32)
 
     writer = _golden_writer(monkeypatch, emulator)
-    written = _strip_caches()
+    written = _nz_caches()
     _staged_adapter().reshape_and_cache_prefill(key, value, *written, slot_mapping, emulator)
 
     # Every slot the step was given, plus the four replicas, and not one more.
     assert sorted(slot for slots in writer.slots for slot in slots) == list(range(num_tokens + 4))
 
-    # Slots 0..223 are pages 0..6 of this geometry, so page 7 is untouched.
+    # Slots 0..223 are pages 0..3 of this geometry, so page 4 is untouched. A
+    # page IS one 64-row tile of the NZ fractal here, so the nominal page axis
+    # and the physical one coincide.
     key_plane = written[0]
-    assert torch.equal(key_plane[7], torch.zeros_like(key_plane[7]))
-    assert int(key_plane[6].abs().sum()) > 0
+    assert torch.equal(key_plane[4], torch.zeros_like(key_plane[4]))
+    assert int(key_plane[3].abs().sum()) > 0
 
 
 def test_a_conforming_step_still_reaches_the_batch_writer_in_one_launch(
@@ -709,10 +773,10 @@ def test_a_conforming_step_still_reaches_the_batch_writer_in_one_launch(
         npu_turboquant_reshape_and_cache_a8=batch,
         npu_turboquant_reshape_scatter_aiv=scatter,
     )
-    key, value = _activations(STRIP_BLOCK_SIZE)
-    slot_mapping = torch.arange(STRIP_BLOCK_SIZE, dtype=torch.int32)
+    key, value = _nz_activations(NZ_BLOCK_SIZE)
+    slot_mapping = torch.arange(NZ_BLOCK_SIZE, dtype=torch.int32)
 
-    _staged_adapter().reshape_and_cache_prefill(key, value, *_strip_caches(), slot_mapping, emulator)
+    _staged_adapter().reshape_and_cache_prefill(key, value, *_nz_caches(), slot_mapping, emulator)
 
     assert len(batch.calls) == 1
     assert scatter.calls == []
@@ -720,25 +784,44 @@ def test_a_conforming_step_still_reaches_the_batch_writer_in_one_launch(
     assert batch.args[5] is slot_mapping
 
 
-def test_a_head_misaligned_step_reaches_both_writers(
+def test_a_head_misaligned_step_reaches_the_batch_writer_and_golden_waves(
     monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
 ) -> None:
+    """The head tokens go to the golden NZ writer, NOT to the strip scatter kernel.
+
+    The batch launches are the plan's, unchanged by the ingress. What changed is
+    who owns a wave: with the batch writer staged the cache is NZ-tiled, and the
+    strip scatter kernel must not touch it, so the staged adapter falls back to
+    its golden NZ writer even though the scatter op is registered. Proven twice
+    over: the scatter recorder stays silent, and the head tokens' bytes are in
+    the cache anyway.
+    """
     batch, scatter = _Recorder(), _Recorder()
     _register(
         monkeypatch,
         npu_turboquant_reshape_and_cache_a8=batch,
         npu_turboquant_reshape_scatter_aiv=scatter,
     )
-    key, value = _activations(32)
+    key, value = _nz_activations(32)
     slot_mapping = torch.arange(20, 52, dtype=torch.int32)
 
-    _staged_adapter().reshape_and_cache_prefill(key, value, *_strip_caches(), slot_mapping, emulator)
+    written = _nz_caches()
+    _staged_adapter().reshape_and_cache_prefill(key, value, *written, slot_mapping, emulator)
 
-    # Two batch launches -- one whole strip, one padded -- and one per head token.
+    # Two batch launches -- one whole strip, one padded -- and no scatter call.
     assert len(batch.calls) == 2
     assert batch.calls[0][0][5].tolist() == list(range(32, 48))
     assert batch.calls[1][0][5].tolist() == list(range(48, 64))
-    assert [call[0][5].tolist() for call in scatter.calls] == [[slot] for slot in range(20, 32)]
+    assert scatter.calls == []
+
+    # The 12 head tokens landed regardless, through the golden NZ writer.
+    head = slice(0, 12)
+    reference_slots = torch.arange(20, 32, dtype=torch.int32)
+    head_only = _nz_caches()
+    _nz_layout_adapter()._write_slots(key[head], value[head], *head_only, reference_slots, emulator)
+    for got, want in zip(written, head_only):
+        mask = want != 0
+        assert torch.equal(got[mask], want[mask])
 
 
 def test_the_scatter_waves_fall_back_to_golden_without_the_scatter_kernel(
@@ -748,21 +831,22 @@ def test_the_scatter_waves_fall_back_to_golden_without_the_scatter_kernel(
 
     The leftover tokens go through the public decode entry, which picks the
     golden writer when the scatter kernel is not registered -- the same fallback
-    every other operation in this file takes.
+    every other operation in this file takes, in the NZ layout the staged batch
+    writer puts the cache in.
     """
     batch = _Recorder()
     _register(monkeypatch, npu_turboquant_reshape_and_cache_a8=batch)
-    key, value = _activations(4)
+    key, value = _nz_activations(4)
     slot_mapping = torch.arange(20, 24, dtype=torch.int32)
-    caches = _strip_caches()
+    caches = _nz_caches()
 
     _adapter(TurboQuantKernelStage.RESHAPE_AND_CACHE).reshape_and_cache_prefill(
         key, value, *caches, slot_mapping, emulator
     )
 
     assert batch.calls == []
-    expected = _strip_caches()
-    _strip_layout_adapter()._write_slots(key, value, *expected, slot_mapping, emulator)
+    expected = _nz_caches()
+    _nz_layout_adapter()._write_slots(key, value, *expected, slot_mapping, emulator)
     for got, want in zip(caches, expected):
         assert torch.equal(got, want)
 

@@ -181,6 +181,17 @@ TURBOQUANT_NIBBLE_LEVELS: Final[int] = 16
 # *inside*, and the granularity of its read-modify-write.
 TURBOQUANT_STRIP_TOKENS: Final[int] = 16
 
+# The NZ-tiled cache geometry: `kCubeTileRows`, `kOperandC0` and `kFp32PerBlock`
+# of op_kernel/common/turboquant_layout.h, restated for the same reason
+# turboquant_nz_ingress.py restates them -- that module imports this one, so
+# the constants cannot live there. tests/ut/attention/test_turboquant_nz_ingress.py
+# reads the header and fails if either side drifts from it. The batch writer is
+# built with TURBOQUANT_INGRESS_NZ=1 and writes this layout; the fused decode
+# reads it.
+TURBOQUANT_NZ_TILE_ROWS: Final[int] = 64
+TURBOQUANT_NZ_OPERAND_C0: Final[int] = 32
+TURBOQUANT_NZ_FP32_PER_BLOCK: Final[int] = 8
+
 # scale = 2^(e - TURBOQUANT_HEADROOM_BITS): three bits of INT4 magnitude plus
 # the sign, so the largest channel of a row lands on +-4.
 TURBOQUANT_HEADROOM_BITS: Final[int] = 2
@@ -243,10 +254,11 @@ class TurboQuantValueLayout(str, Enum):
     a per-token scatter writes them without touching another token's bytes,
     which is what lets PyTorch write this layout at all.
 
-    ``CHANNEL_MAJOR`` -- the audited strip cache that both NPU writers write
-    (``op_kernel/turboquant_reshape_batch.cpp``, ``..._scatter.cpp``). It
-    differs from ``TOKEN_MAJOR`` in two ways at once, and both matter to a
-    reader:
+    ``CHANNEL_MAJOR`` -- the audited strip cache, which of the NPU writers only
+    the scatter writer still produces (``op_kernel/turboquant_reshape_scatter.cpp``;
+    the batch writer crossed over to ``NZ_TILED`` with
+    ``TURBOQUANT_INGRESS_NZ=1``). It differs from ``TOKEN_MAJOR`` in two ways
+    at once, and both matter to a reader:
 
     * the page axis order is ``(num_blocks, num_kv_heads, block_size,
       head_size / 2)`` -- head before token -- because a ``(block, head)`` page
@@ -269,36 +281,38 @@ class TurboQuantValueLayout(str, Enum):
       bitwise masks and :meth:`TurboQuantOpsAdapter._write_slots` does it as a
       tensor read-modify-write of the touched strips.
 
-    ``block_size`` is a multiple of 16 in this layout, and **both** writers take
-    any such multiple. Each carries a strip index inside the page: the scatter
-    writer as ``item.strip`` in ``StripWordOffset`` and ``item.token_in_block``
-    in its key burst, the batch writer as
+    ``block_size`` is a multiple of 16 in this layout. The scatter writer takes
+    any such multiple; the batch writer took any multiple of 16 while it was
+    still a strip writer, and needs a multiple of 64 now that it writes NZ.
 
-        block_idx      = slot0 / block_size
-        strip_in_block = (slot0 % block_size) / 16
+    ``NZ_TILED`` -- the cache the fused decode reads, and the one the batch
+    writer produces when it is built with ``TURBOQUANT_INGRESS_NZ=1`` (this
+    repo's build; see the root CMakeLists). A physical block is
 
-    in ``CalculateStripAddr`` (op_kernel/turboquant_reshape_batch.cpp), which
-    offsets the packed base and both scale bases by it.
+        [64-row tile][kv head][32-byte column group][tile row][byte]
 
-    The batch writer *used* to need ``block_size == 16`` -- its only address was
-    a page base, so at block_size 64 all four strips of a page computed the same
-    base and overwrote each other -- and an earlier revision of this docstring
-    said so. It is worth stating what changed, because ``block_size == 16`` is
-    **incompatible with the fused decode**, whose closed-form tile cursor needs a
-    power-of-two multiple of 64 (``valid_launch``). Under the old constraint the
-    three operators had no common page size at all; under the current writers
-    ``block_size = 128`` -- an ordinary vLLM page, and what the decode's own
-    end-to-end fixture uses -- satisfies all three at once.
+    addressed by ``NzTiledPackedByte`` in
+    op_kernel/common/turboquant_layout.h, one byte carrying channels
+    ``(c, c + head_size / 2)`` of ONE token, low nibble first. The scale plane
+    is slot-major: ``slot * NzScaleSlotFloats(H) + kv * H + head``, with the
+    record padded to one fp32 block (8 floats at H = 4, exactly the extent of
+    the old plane-major buffer). Unlike the strip cache this pairing is
+    TOKEN-major, so a per-token write touches only bytes that token owns and
+    the golden writer can land it without a read-modify-write -- which is what
+    covers decode steps and prefill tails while the scatter kernel has no NZ
+    variant. ``block_size`` is a multiple of 64 for the writer and a
+    power-of-two multiple of 64 for the decode's closed-form tile cursor.
 
-    Caveat: no device test covers it. The writers' runner pins
-    ``kBlockSize = 16`` (tests/npu/test_live_write.cpp), so ``strip_in_block`` is
-    0 in every run that has ever been made and the batch writer's in-page offset
-    is code without evidence. See csrc/attention/turboquant/torch_bindings.cpp,
-    which checks the multiple rather than the equality.
+    The scatter writer has no NZ form in turboquant-core: staged alone it still
+    puts the cache in ``CHANNEL_MAJOR``, and the fused decode cannot read that.
+    Staged together with the batch writer it is kept OFF the cache entirely --
+    see :meth:`TurboQuantOpsAdapter.reshape_scatter_decode` -- because a strip
+    write into an NZ cache is silent corruption, not an error.
     """
 
     TOKEN_MAJOR = "token_major"
     CHANNEL_MAJOR = "channel_major"
+    NZ_TILED = "nz_tiled"
 
 
 class TurboQuantIngestionPhase(str, Enum):
@@ -940,6 +954,7 @@ class TurboQuantOpsAdapter:
         self.config: TurboQuantOpsConfig = config if config is not None else TurboQuantOpsConfig.from_env()
         self._emulators: dict[tuple[int, str], TurboQuantEmulator] = {}
         self._missing_kernels: set[str] = set()
+        self._warnings_issued: set[str] = set()
         if self.config.kernel_stages:
             # Only a run that asked for a kernel stage pays for the import, and
             # only such a run is entitled to complain that it is missing.
@@ -1035,17 +1050,24 @@ class TurboQuantOpsAdapter:
     def value_layout(self) -> TurboQuantValueLayout:
         """The layout the cache is in, which is whichever writer owns the page.
 
-        Either NPU writer puts the cache in the audited strip layout
-        (:class:`TurboQuantValueLayout`), so this is derived rather than
-        configured: a run that switches an ingestion stage on does not also have
-        to be told what that stage writes, and the golden reader follows without
-        a second switch to keep in step.
+        Derived rather than configured: a run that switches an ingestion stage
+        on does not also have to be told what that stage writes, and the golden
+        reader follows without a second switch to keep in step.
+
+        The batch-writer kernel is built with ``TURBOQUANT_INGRESS_NZ=1``, so
+        its presence puts the cache in ``NZ_TILED``. The strip scatter kernel
+        is never allowed to write an NZ cache -- :meth:`reshape_scatter_decode`
+        falls back to the golden NZ writer instead -- so the two kernels staged
+        together still mean NZ, not a mixture. The scatter kernel staged ALONE
+        means the strip cache, as it always did.
 
         ``config.value_layout`` is consulted only when both writers are golden,
         which is how a dry run can still ask the golden writer to refuse the
         channel-major read-modify-write it cannot do.
         """
-        if self._has_kernel(TURBOQUANT_OP_RESHAPE_AND_CACHE) or self._has_kernel(TURBOQUANT_OP_RESHAPE_SCATTER):
+        if self._has_kernel(TURBOQUANT_OP_RESHAPE_AND_CACHE):
+            return TurboQuantValueLayout.NZ_TILED
+        if self._has_kernel(TURBOQUANT_OP_RESHAPE_SCATTER):
             return TurboQuantValueLayout.CHANNEL_MAJOR
         return self.config.value_layout
 
@@ -1295,11 +1317,17 @@ class TurboQuantOpsAdapter:
         """The batch writer: rotate, quantise, pack and write whole pages.
 
         ``key`` and ``value`` are ``[T, H, D]`` bf16; ``key_cache`` and
-        ``value_cache`` are ``(num_blocks, block_size, H, D/2)`` INT8 in the
-        strip layout and ``scale_cache`` is ``(2, num_blocks, H, block_size)``
-        fp32, for any ``block_size`` that is a multiple of 16 -- see
-        :class:`TurboQuantValueLayout` for why this writer no longer needs
-        ``block_size == 16`` and why that matters.
+        ``value_cache`` are ``(num_blocks, block_size, H, D/2)`` INT8 and
+        ``scale_cache`` is ``(2, num_blocks, H, block_size)`` fp32, for any
+        ``block_size`` that is a multiple of 64. The shapes are the
+        allocation; what lands inside is the NZ-tiled layout of
+        :class:`TurboQuantValueLayout` ``NZ_TILED`` -- this kernel is built
+        with ``TURBOQUANT_INGRESS_NZ=1``, so its output is the cache the fused
+        decode reads, and its NZ addressing is tied to
+        ``op_kernel/common/turboquant_layout.h`` by static_assert. The scale
+        plane is written slot-major (``slot * 8 + kv * H + head`` at H = 4),
+        which is the same float extent as the plane-major shape suggests,
+        addressed differently.
 
         ``tables`` is the Cube's resident **BF16** operand, ``2 * (D/32)``
         row-major 32x32 blocks of ±1 (:func:`_codec_tables`, which is also where
@@ -1379,19 +1407,40 @@ class TurboQuantOpsAdapter:
         The decode phase. ``T`` is the batch size and ``slot_mapping`` is ``[T]``
         int32 with no contiguity of any kind. Negative slots are padding and are
         skipped, which is what a graph-capture dummy run feeds.
+
+        THE SCATTER KERNEL IS A STRIP WRITER, and it stays one: no NZ variant
+        exists in turboquant-core. On an NZ cache -- anything the batch-writer
+        kernel has touched -- its read-modify-write would land strip bytes in
+        an NZ fractal, which is silent corruption with every shape check green.
+        It is therefore kept OFF an NZ cache even when its stage is on, and the
+        golden NZ writer takes the write instead. The NZ pairing is
+        token-major, so the golden write needs no read-modify-write and loses
+        only speed, not correctness. That is the interim state until the
+        harness ships an NZ scatter kernel; staging ``SCATTER`` alongside
+        ``RESHAPE_AND_CACHE`` today buys a warning, nothing else.
         """
         if self._has_kernel(TURBOQUANT_OP_RESHAPE_SCATTER):
-            self._kernel_reshape_scatter_aiv(
-                key=key,
-                value=value,
-                key_cache=key_cache,
-                value_cache=value_cache,
-                scale_cache=scale_cache,
-                slot_mapping=slot_mapping,
-                pi_signs=emulator.pi_signs,
-                inv_sqrt_len=emulator.inv_sqrt_len,
-            )
-            return
+            if self.value_layout() is TurboQuantValueLayout.NZ_TILED:
+                if "scatter_on_nz" not in self._warnings_issued:
+                    self._warnings_issued.add("scatter_on_nz")
+                    logger.warning(
+                        "TurboQuant: the staged %s writes the strip cache, which an NZ-written cache "
+                        "cannot admit; per-token writes go to the PyTorch golden NZ writer until an "
+                        "NZ scatter kernel exists.",
+                        TURBOQUANT_OP_RESHAPE_SCATTER,
+                    )
+            else:
+                self._kernel_reshape_scatter_aiv(
+                    key=key,
+                    value=value,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    scale_cache=scale_cache,
+                    slot_mapping=slot_mapping,
+                    pi_signs=emulator.pi_signs,
+                    inv_sqrt_len=emulator.inv_sqrt_len,
+                )
+                return
         self._golden_reshape_scatter_decode(key, value, key_cache, value_cache, scale_cache, slot_mapping, emulator)
 
     def _kernel_reshape_scatter_aiv(
@@ -1407,11 +1456,13 @@ class TurboQuantOpsAdapter:
     ) -> None:
         """The AIV scatter writer: one token per request, rotated and packed in UB.
 
-        Same tensors and same strip cache as
-        :meth:`_kernel_reshape_and_cache_a8`, with no contiguity contract on
-        ``slot_mapping``: the value plane's write is a read-modify-write of one
-        2048-byte strip, spliced in by register bitwise masks, which is the whole
-        reason this kernel exists.
+        Same tensors as :meth:`_kernel_reshape_and_cache_a8` but NOT the same
+        cache: this kernel writes the strip layout, while the batch writer is
+        now the NZ ingress. :meth:`reshape_scatter_decode` therefore never
+        reaches this body on an NZ cache -- it exists for a strip-cache
+        configuration, where the value plane's write is a read-modify-write of
+        one 2048-byte strip, spliced in by register bitwise masks, which is the
+        whole reason this kernel exists.
 
         The C launcher (``launch_turboquant_reshape_scatter_aiv``,
         op_kernel/turboquant_reshape_scatter.cpp) also takes ``block_dim``,
@@ -1495,8 +1546,11 @@ class TurboQuantOpsAdapter:
         pages = torch.div(slots, block_size, rounding_mode="floor")
         offsets = slots - pages * block_size
 
-        if self.value_layout() is TurboQuantValueLayout.CHANNEL_MAJOR:
+        layout = self.value_layout()
+        if layout is TurboQuantValueLayout.CHANNEL_MAJOR:
             self._write_strip_planes(codes_key, codes_value, key_cache, value_cache, pages, offsets)
+        elif layout is TurboQuantValueLayout.NZ_TILED:
+            self._write_nz_planes(codes_key, codes_value, key_cache, value_cache, slots)
         else:
             for packed, cache in (
                 (emulator.pack(codes_key), key_cache),
@@ -1504,14 +1558,18 @@ class TurboQuantOpsAdapter:
             ):
                 _flat_slot_view(cache)[slots] = packed
 
-        # The scale plane is the one thing both layouts index identically:
-        # ((kv * num_blocks + page) * num_kv_heads + head) * block_size + token,
-        # which is scale_cache[plane][page, :, token].
-        for plane, scales in (
-            (TURBOQUANT_KEY_PLANE, key_scales),
-            (TURBOQUANT_VALUE_PLANE, value_scales),
-        ):
-            scale_cache[plane][pages, :, offsets] = scales.to(scale_cache.dtype)
+        if layout is TurboQuantValueLayout.NZ_TILED:
+            # Slot-major records: slot * NzScaleSlotFloats(H) + kv * H + head.
+            self._write_nz_scales(key_scales, value_scales, scale_cache, slots)
+        else:
+            # The scale plane is the one thing the two strip-era layouts index
+            # identically: ((kv * num_blocks + page) * num_kv_heads + head) *
+            # block_size + token, which is scale_cache[plane][page, :, token].
+            for plane, scales in (
+                (TURBOQUANT_KEY_PLANE, key_scales),
+                (TURBOQUANT_VALUE_PLANE, value_scales),
+            ):
+                scale_cache[plane][pages, :, offsets] = scales.to(scale_cache.dtype)
 
     def _write_strip_planes(
         self,
@@ -1560,6 +1618,118 @@ class TurboQuantOpsAdapter:
         panel[inverse, :, strips, :, lanes] = codes_value
         value_pages[touched] = TurboQuantEmulator.pack(panel)
 
+    @staticmethod
+    def _nz_byte_offsets(slots: torch.Tensor, num_kv_heads: int, packed_bytes: int) -> torch.Tensor:
+        """``NzTiledPackedByte`` for every byte of every (token, head), vectorised.
+
+        ``slots`` is int64 of the GLOBAL row (``page * block_size + token``),
+        which is what the address function is defined on: the tile term
+        ``slot - slot % 64`` already carries the page. It may be ``[T]`` (the
+        writer) or ``[B, S]`` (the gather); the (head, group, byte) axes
+        broadcast over either. Returns ``[..., H, groups, 32]`` int64 byte
+        offsets into the flat packed plane, where ``groups = packed_bytes /
+        32``. One token's bytes are its own -- the NZ pairing is token-major --
+        so writing through these offsets never touches another token's nibbles
+        and needs no read-modify-write, which is the whole difference from
+        :meth:`_write_strip_planes`.
+        """
+        tile_rows = TURBOQUANT_NZ_TILE_ROWS
+        c0 = TURBOQUANT_NZ_OPERAND_C0
+        groups = packed_bytes // c0
+        device = slots.device
+        tile_row = slots % tile_rows
+        base = (slots - tile_row) * (num_kv_heads * packed_bytes) + tile_row * c0
+        heads = torch.arange(num_kv_heads, device=device) * (tile_rows * packed_bytes)
+        group = torch.arange(groups, device=device) * (tile_rows * c0)
+        byte = torch.arange(c0, device=device)
+        # ``slots`` may be [T] or [B, S]; the trailing (head, group, byte) axes
+        # broadcast over either.
+        return base[..., None, None, None] + heads.view(-1, 1, 1) + group.view(-1, 1) + byte
+
+    def _write_nz_planes(
+        self,
+        codes_key: torch.Tensor,
+        codes_value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        slots: torch.Tensor,
+    ) -> None:
+        """Write both packed planes of the NZ-tiled cache, no read-modify-write.
+
+        ``codes_*`` are ``[T, H, D]`` INT8 in ``[-8, 7]`` and ``slots`` is the
+        ``[T]`` int64 global row. The weave pairs channel ``c`` with channel
+        ``c + D/2`` in one byte -- low nibble first -- which is the pairing the
+        decode's ``UnpackAffine`` DeInterleave expand is the inverse of, and
+        the same one :func:`turboquant_codes_to_nz_tiled` in
+        turboquant_nz_ingress.py produces for a whole cache at once. The GM
+        image a strip lands in is then
+
+            byte[(slot - slot % 64) * H * packed + head * 64 * packed
+                 + group * 64 * 32 + (slot % 64) * 32 + b]
+
+        which the batch-writer kernel stores as one strided ``DataCopyPad``
+        burst per (chunk, column group).
+        """
+        num_blocks, block_size, num_kv_heads, packed_bytes = key_cache.shape
+        head_size = packed_bytes * TURBOQUANT_PACK_FACTOR
+        if block_size % TURBOQUANT_NZ_TILE_ROWS:
+            raise ValueError(
+                f"the NZ-tiled cache is laid out in {TURBOQUANT_NZ_TILE_ROWS}-row tiles, so block_size "
+                f"{block_size} must be a multiple of {TURBOQUANT_NZ_TILE_ROWS}"
+            )
+        offsets = self._nz_byte_offsets(slots, num_kv_heads, packed_bytes)
+
+        def nz_bytes(codes: torch.Tensor) -> torch.Tensor:
+            low, high = codes[..., :packed_bytes], codes[..., packed_bytes:]
+            woven = torch.stack((low, high), dim=-1).reshape(*codes.shape[:-1], head_size)
+            return TurboQuantEmulator.pack(woven).reshape(*codes.shape[:-1], -1, TURBOQUANT_NZ_OPERAND_C0)
+
+        for codes, cache, name in (
+            (codes_key, key_cache, "key"),
+            (codes_value, value_cache, "value"),
+        ):
+            _require_contiguous(cache, name).view(-1)[offsets] = nz_bytes(codes).to(cache.dtype)
+
+    @staticmethod
+    def _nz_scale_slot_floats(num_kv_heads: int) -> int:
+        """``NzScaleSlotFloats`` of op_kernel/common/turboquant_layout.h."""
+        lanes = TURBOQUANT_PACK_FACTOR * num_kv_heads
+        return -(-lanes // TURBOQUANT_NZ_FP32_PER_BLOCK) * TURBOQUANT_NZ_FP32_PER_BLOCK
+
+    def _write_nz_scales(
+        self,
+        key_scales: torch.Tensor,
+        value_scales: torch.Tensor,
+        scale_cache: torch.Tensor,
+        slots: torch.Tensor,
+    ) -> None:
+        """Write the slot-major scale records of the NZ-tiled cache.
+
+        ``slot * NzScaleSlotFloats(H) + kv * H + head`` -- one contiguous fp32
+        record per slot holding both planes' lanes, which is what the decode's
+        ``ReadPlane`` bursts a whole 64-row tile out of. The allocated plane is
+        ``(2, num_blocks, H, block_size)``; its flat extent equals
+        ``num_blocks * block_size * NzScaleSlotFloats(H)`` exactly when
+        ``2 * H`` is a multiple of 8 (H = 4, the geometry the NZ ingress is
+        compiled for), and is too small otherwise, which is a refusal rather
+        than an overflow.
+        """
+        num_kv_heads = scale_cache.shape[2]
+        slot_floats = self._nz_scale_slot_floats(num_kv_heads)
+        flat = _require_contiguous(scale_cache, "scale").view(-1)
+        total_slots = scale_cache.shape[1] * scale_cache.shape[3]
+        if flat.numel() < total_slots * slot_floats:
+            raise ValueError(
+                f"the NZ scale plane needs a whole {slot_floats}-float record per slot "
+                f"(NzScaleSlotFloats({num_kv_heads})), {total_slots * slot_floats} floats over the cache; "
+                f"the allocated plane holds {flat.numel()}, which is exact only when 2 * num_kv_heads "
+                f"is a multiple of {TURBOQUANT_NZ_FP32_PER_BLOCK}"
+            )
+        lanes = torch.arange(num_kv_heads, device=slots.device)
+        records = slots[:, None] * slot_floats + lanes
+        flat[records] = key_scales.to(scale_cache.dtype)
+        flat[records + num_kv_heads] = value_scales.to(scale_cache.dtype)
+
     # -- the cache read ----------------------------------------------------
 
     def gather(
@@ -1589,8 +1759,11 @@ class TurboQuantOpsAdapter:
                 scale_cache=scale_cache,
                 block_tables=block_tables,
             )
-        if self.value_layout() is TurboQuantValueLayout.CHANNEL_MAJOR:
+        layout = self.value_layout()
+        if layout is TurboQuantValueLayout.CHANNEL_MAJOR:
             return self._golden_gather_pages_strip(key_cache, value_cache, scale_cache, block_tables)
+        if layout is TurboQuantValueLayout.NZ_TILED:
+            return self._golden_gather_pages_nz(key_cache, value_cache, scale_cache, block_tables)
         return self._golden_gather_pages(key_cache, value_cache, scale_cache, block_tables)
 
     def _kernel_gather_pages(
@@ -1694,6 +1867,57 @@ class TurboQuantOpsAdapter:
             gathered_scales(TURBOQUANT_KEY_PLANE),
             packed_value,
             gathered_scales(TURBOQUANT_VALUE_PLANE),
+        )
+
+    def _golden_gather_pages_nz(
+        self,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        scale_cache: torch.Tensor,
+        block_tables: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Read a cache the NZ ingress wrote, into the same four panels as above.
+
+        The exact inverse of :meth:`_write_nz_planes` and
+        :meth:`_write_nz_scales`: the packed bytes come back out through
+        ``NzTiledPackedByte``, the weave is undone on codes -- byte ``col``
+        carries channel ``col`` in its low nibble and channel ``col + D/2`` in
+        its high one, so unpacking and taking the even and odd lanes apart
+        restores channel order -- and the scales come out of the slot-major
+        records. Both planes are read through the SAME address function,
+        because the NZ cache is token-major for K and V alike; the strip
+        gather's value-plane transposition has no counterpart here.
+        """
+        num_blocks, block_size, num_kv_heads, packed_bytes = key_cache.shape
+        if block_size % TURBOQUANT_NZ_TILE_ROWS:
+            raise ValueError(
+                f"the NZ-tiled cache is laid out in {TURBOQUANT_NZ_TILE_ROWS}-row tiles, so block_size "
+                f"{block_size} must be a multiple of {TURBOQUANT_NZ_TILE_ROWS}"
+            )
+        pages = block_tables.to(torch.int64)
+        batch_size, max_blocks = pages.shape
+        within = torch.arange(block_size, device=pages.device, dtype=torch.int64)
+        slots = (pages.unsqueeze(-1) * block_size + within).reshape(batch_size, max_blocks * block_size)
+
+        offsets = self._nz_byte_offsets(slots, num_kv_heads, packed_bytes)
+
+        def read_plane(cache: torch.Tensor, name: str) -> torch.Tensor:
+            gathered = _require_contiguous(cache, name).view(-1)[offsets]
+            packed = gathered.reshape(batch_size, -1, num_kv_heads, packed_bytes)
+            woven = TurboQuantEmulator.unpack(packed)
+            codes = torch.cat((woven[..., 0::2], woven[..., 1::2]), dim=-1)
+            return TurboQuantEmulator.pack(codes.contiguous())
+
+        slot_floats = self._nz_scale_slot_floats(num_kv_heads)
+        flat_scales = _require_contiguous(scale_cache, "scale").view(-1)
+        lanes = torch.arange(num_kv_heads, device=slots.device)
+        records = slots[..., None] * slot_floats + lanes
+
+        return (
+            read_plane(key_cache, "key"),
+            flat_scales[records],
+            read_plane(value_cache, "value"),
+            flat_scales[records + num_kv_heads],
         )
 
     def dequantize_cache(
@@ -1862,20 +2086,22 @@ class TurboQuantOpsAdapter:
         under this mode. It is given the real operand anyway so the two sides
         never disagree about its dtype -- see :func:`_codec_tables`.
 
-        THIS OP CANNOT READ A CACHE EITHER WRITER WROTE, not directly. The
-        writers produce the strip layout; this reads the NZ-tiled layout, and the
-        two disagree on four independent axes -- byte order, nibble pairing, the
-        value plane's token axis and the scale plane -- not just on
-        ``block_size``. The binding TORCH_CHECKs what it can, so the mismatch is
-        a refused launch naming the conflict rather than an attention over bytes
-        in the wrong order.
+        THIS OP READS EXACTLY THE CACHE THE BATCH WRITER NOW PRODUCES. The two
+        used to disagree on four independent axes -- byte order, nibble
+        pairing, the value plane's token axis and the scale plane -- because
+        both writers emitted the strip layout while this reads the NZ-tiled
+        one. The batch writer is built with ``TURBOQUANT_INGRESS_NZ=1`` now,
+        which is the write-time NZ ingress this docstring used to call "the
+        real fix ... in the harness": its UB-side NZ stage emits the fractal
+        this decode's ``ReadPlane`` strides, with the pairing its
+        ``UnpackAffine`` expand inverts, and the slot-major scale records it
+        bursts. The one writer that still does NOT meet this op is the scatter
+        kernel; :meth:`reshape_scatter_decode` keeps it off the cache.
 
         :func:`vllm_ascend.attention.turboquant_nz_ingress.turboquant_repack_strip_to_nz_tiled`
-        converts a writer-produced cache into the three planes this op reads, and
-        is what makes the decode reachable at all today. It is a reference
-        conversion for exercising and gating the decode -- a whole extra pass
-        over the pages it touches -- and deliberately not wired into this path:
-        the real fix is a write-time NZ ingress kernel in the harness. See that
+        remains the reference conversion for caches written before the ingress
+        existed, and the executable specification the kernel's ``static_assert``s
+        are checked against. It is a bridge, not a serving path. See that
         module's header for the four axes and the evidence for each.
         """
         self._require_kernel(TURBOQUANT_OP_FUSED_DECODE)(
