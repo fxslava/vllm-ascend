@@ -98,7 +98,7 @@ def _config(
             enable_prefix_caching=prefix_caching,
             mamba_block_size=None,
         ),
-        model_config=SimpleNamespace(max_model_len=4096),
+        model_config=SimpleNamespace(max_model_len=4096, use_mla=False),
     )
 
 
@@ -144,10 +144,13 @@ def test_kpool_page_alignment_preserves_packed_and_regular_geometry(cache_dtype,
     packed_token_page_size = get_sfa_qsfa_packed_head_dim(512, 64)
     assert packed_token_page_size == 512 + 64 * 2 + (512 // 128) * 4
 
-    with patch(
-        "vllm_ascend.patch.platform.patch_mamba_config.ModelRegistry.resolve_model_cls",
-        return_value=(dummy_model_cls, None),
-    ) as resolve:
+    with (
+        _turboquant_off(),
+        patch(
+            "vllm_ascend.patch.platform.patch_mamba_config.ModelRegistry.resolve_model_cls",
+            return_value=(dummy_model_cls, None),
+        ) as resolve,
+    ):
         _run(config)
 
     resolve.assert_called_once_with(config.model_config.architecture, model_config=config.model_config)
@@ -415,13 +418,6 @@ def _kpool_full_attention_config(*, index_kpool=4, mamba_raw_page_size=3407872):
 
 
 def test_turboquant_rounds_the_aligned_block_size_to_a_power_of_two():
-    """896 made the writers happy and killed the fused decode on the first step.
-
-    npu_turboquant_build_decode_tiling rejects any block size that is not a
-    power-of-two multiple of 64; under ENABLE_TURBOQUANT=1 the alignment must
-    round up to 1024 instead of landing on 896, at the cost of coarser
-    scheduling granularity only.
-    """
     config, dummy_model_cls = _kpool_full_attention_config()
 
     with (
@@ -441,7 +437,6 @@ def test_turboquant_rounds_the_aligned_block_size_to_a_power_of_two():
 
 
 def test_without_turboquant_the_aligned_block_size_keeps_the_coverage_value():
-    """The control for the test above: 896 is still correct without the decode."""
     config, dummy_model_cls = _kpool_full_attention_config()
 
     with (
@@ -457,12 +452,6 @@ def test_without_turboquant_the_aligned_block_size_keeps_the_coverage_value():
 
 
 def test_turboquant_refuses_an_odd_kpool_alignment_at_config_time():
-    """index_kpool=3 aligns to lcm(128, 48) = 384, which no power of two divides.
-
-    The two constraints -- a multiple of the kpool alignment for the indexer
-    kernel, a power of two for the decode's tile cursor -- cannot be satisfied
-    together, so the run is refused at config time rather than mid-serving.
-    """
     config, dummy_model_cls = _kpool_full_attention_config(index_kpool=3, mamba_raw_page_size=4096)
 
     with (
@@ -474,3 +463,91 @@ def test_turboquant_refuses_an_odd_kpool_alignment_at_config_time():
         pytest.raises(ValueError, match="no block size satisfies both"),
     ):
         _run(config)
+
+
+def _qwen35_hybrid_config():
+    config = _config()
+    config.cache_config.cache_dtype = "auto"
+    config.parallel_config = SimpleNamespace(tensor_parallel_size=1)
+    config.model_config = SimpleNamespace(
+        architecture="DummyQwen35Hybrid",
+        use_mla=False,
+        dtype=torch.bfloat16,
+        max_model_len=65536,
+        hf_text_config=SimpleNamespace(),  # no index_topk: no kpool indexer
+        hf_config=SimpleNamespace(),
+        # 2 * 256 * 4 * 2 = 4096 bytes per attention token.
+        get_num_kv_heads=lambda _parallel_config: 4,
+        get_head_size=lambda: 256,
+    )
+    return config
+
+
+def _upstream_mamba_page_coverage_raise(config):
+    config.cache_config.block_size = 896
+    config.cache_config.mamba_page_size_padded = 896 * 4096
+
+
+def test_turboquant_rounds_the_upstream_coverage_block_size_without_kpool():
+    config = _qwen35_hybrid_config()
+
+    with (
+        _turboquant_on(),
+        patch.object(
+            MambaModelConfig,
+            "verify_and_update_config",
+            side_effect=_upstream_mamba_page_coverage_raise,
+        ),
+    ):
+        HybridAttentionMambaModelConfig.verify_and_update_config(config)
+
+    assert config.cache_config.block_size == 1024
+    assert config.cache_config.block_size & (config.cache_config.block_size - 1) == 0
+    assert config.cache_config.mamba_page_size_padded == 1024 * 4096
+    assert config.cache_config.mamba_block_size == config.model_config.max_model_len
+
+
+def test_without_turboquant_the_upstream_coverage_block_size_is_kept():
+    config = _qwen35_hybrid_config()
+
+    with (
+        _turboquant_off(),
+        patch.object(
+            MambaModelConfig,
+            "verify_and_update_config",
+            side_effect=_upstream_mamba_page_coverage_raise,
+        ),
+    ):
+        HybridAttentionMambaModelConfig.verify_and_update_config(config)
+
+    assert config.cache_config.block_size == 896
+    assert config.cache_config.mamba_page_size_padded == 896 * 4096
+
+
+def test_turboquant_does_not_round_mla_models():
+    config = _qwen35_hybrid_config()
+    config.model_config.use_mla = True
+
+    with (
+        _turboquant_on(),
+        patch.object(
+            MambaModelConfig,
+            "verify_and_update_config",
+            side_effect=_upstream_mamba_page_coverage_raise,
+        ),
+    ):
+        HybridAttentionMambaModelConfig.verify_and_update_config(config)
+
+    assert config.cache_config.block_size == 896
+
+
+def test_turboquant_leaves_an_already_power_of_two_block_size_alone():
+    config = _qwen35_hybrid_config()
+
+    with (
+        _turboquant_on(),
+        patch.object(MambaModelConfig, "verify_and_update_config"),
+    ):
+        HybridAttentionMambaModelConfig.verify_and_update_config(config)
+
+    assert config.cache_config.block_size == 128

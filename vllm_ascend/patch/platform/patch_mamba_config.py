@@ -140,35 +140,6 @@ def verify_and_update_config(cls, vllm_config) -> None:
             # coarsen scheduling granularity without adding coverage.
             c8_block_size = alignment_tokens * cdiv(min_block_size, alignment_tokens)
             attn_block_size = min(attn_block_size, c8_block_size)
-        if turboquant_active and not model_config.use_mla:
-            # The TurboQuant fused decode walks the paged cache with a
-            # closed-form tile cursor that requires block_size to be a
-            # power-of-two multiple of 64 (valid_launch, and the same
-            # TORCH_CHECK in csrc/attention/turboquant/torch_bindings.cpp).
-            # The coverage-driven value above satisfies the cache writers
-            # (any multiple of 16) but usually not the cursor -- 896 = 7x128
-            # is the one a GLM-5-Next-class model lands on -- and the engine
-            # then dies inside npu_turboquant_build_decode_tiling on the first
-            # decode step. Round up to the next power of two instead: the
-            # pages still cover the mamba state page, the indexer alignment is
-            # kept because a power of two at or above alignment_tokens stays a
-            # multiple of it whenever alignment_tokens is itself a power of
-            # two, and only scheduling granularity coarsens. An odd factor in
-            # the kpool alignment (index_kpool not a power of two) makes the
-            # two constraints unsatisfiable together; refuse at config time
-            # rather than mid-serving. MLA models are exempt: TurboQuant only
-            # re-describes full-attention layers, and there are none of those
-            # in an MLA model.
-            decode_block_size = 1 << (attn_block_size - 1).bit_length()
-            if decode_block_size % alignment_tokens:
-                raise ValueError(
-                    f"ENABLE_TURBOQUANT=1 needs the attention block size to be a power-of-two "
-                    f"multiple of 64 for the fused decode's closed-form tile cursor, but the "
-                    f"sparse index-kpool geometry (index_kpool={index_kpool}) requires a multiple "
-                    f"of {alignment_tokens}, and no block size satisfies both. Run without "
-                    f"ENABLE_TURBOQUANT, or without the kpool indexer."
-                )
-            attn_block_size = decode_block_size
         if cache_config.block_size != attn_block_size:
             cache_config.block_size = attn_block_size
             logger.info(
@@ -187,6 +158,47 @@ def verify_and_update_config(cls, vllm_config) -> None:
                 "Padding mamba page size by %.2f%% to align the sparse indexer and recurrent-state cache pages.",
                 mamba_padding_pct,
             )
+
+    if turboquant_active and not model_config.use_mla:
+        block_size = cache_config.block_size
+        if block_size is not None and (block_size < 64 or block_size & (block_size - 1)):
+            decode_block_size = max(64, 1 << (block_size - 1).bit_length())
+            if index_kpool is not None:
+                alignment_tokens = math.lcm(128, index_kpool * 16)
+                if decode_block_size % alignment_tokens:
+                    raise ValueError(
+                        f"ENABLE_TURBOQUANT=1 needs the attention block size to be a power-of-two "
+                        f"multiple of 64 for the fused decode's closed-form tile cursor, but the "
+                        f"sparse index-kpool geometry (index_kpool={index_kpool}) requires a multiple "
+                        f"of {alignment_tokens}, and no block size satisfies both. Run without "
+                        f"ENABLE_TURBOQUANT, or without the kpool indexer."
+                    )
+            logger.info(
+                "TurboQuant: rounding attention block size from %d to %d (a power-of-two "
+                "multiple of 64) for the fused decode's tile cursor.",
+                block_size,
+                decode_block_size,
+            )
+            cache_config.block_size = decode_block_size
+            # The mamba page must stay covered: the attention page just grew,
+            # so re-derive the padded mamba page from the new block size. The
+            # existing padded value is max(old attention page, mamba raw), so
+            # max() with it is max() with the mamba raw page too.
+            kv_cache_dtype = (
+                model_config.dtype
+                if cache_config.cache_dtype == "auto"
+                else STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+            )
+            attn_page_size = (
+                2
+                * model_config.get_head_size()
+                * model_config.get_num_kv_heads(vllm_config.parallel_config)
+                * get_dtype_size(kv_cache_dtype)
+                * decode_block_size
+            )
+            if cache_config.mamba_page_size_padded is None or attn_page_size > cache_config.mamba_page_size_padded:
+                cache_config.mamba_page_size_padded = attn_page_size
+
     # The extract_hidden_states connector (ExampleHiddenStatesConnector) only
     # manages the dedicated hidden-state cache-only layer; it does not migrate
     # mamba KV blocks across instances, so it does not require the block-aligned
@@ -206,32 +218,6 @@ def verify_and_update_config(cls, vllm_config) -> None:
                 "mamba_cache_mode only support 'align' when kv_transfer enabled now!"
             )
 
-    # TurboQuant hybrid isolation (Option A).
-    #
-    # "align" is what makes a hybrid model's full-attention and Mamba layers
-    # share one physical KVCacheTensor: it pins the attention page size to the
-    # recurrent-state page size so a single flat int8 buffer can back both, laid
-    # out [conv | ssm | padding | K | V]. A TurboQuant full-attention layer
-    # cannot live in that buffer. Its page is three planes -- packed keys,
-    # packed values and a burst-aligned fp32 scale plane
-    # (AscendTurboQuantAttentionSpec) -- and the hybrid carve knows one dtype
-    # and two planes, so the run reaches cache-init and dies there rather than
-    # failing validation.
-    #
-    # Option A keeps those layers out of the shared tensor instead of teaching
-    # the carve a third plane: leaving the mode un-aligned means the hybrid
-    # allocator groups the full-attention layers into their own attn-only
-    # KVCacheTensor, where the three-plane page is carved from a budget the
-    # block allocator sized for it. What the 16 full-attention layers give up is
-    # block sharing with the 48 GDN layers, which they never had meaningfully --
-    # the two run through different allocators and GDN indexes its state by
-    # block_table[:, 0] rather than by token slot.
-    #
-    # This is decided here, at config time, because "align" is decided here, and
-    # it is keyed on the run rather than on per-layer specs: specs do not exist
-    # yet when ModelConfig verification runs. turboquant_enabled() reads the
-    # same env var and cache_dtype the spec and the allocator read, so the three
-    # cannot drift apart.
     if turboquant_active and cache_config.mamba_cache_mode == "align":
         if using_kv_store_with_hybrid and not is_extract_hidden_states:
             raise ValueError(
@@ -247,27 +233,6 @@ def verify_and_update_config(cls, vllm_config) -> None:
         )
         cache_config.mamba_cache_mode = "none"
 
-    # An un-aligned Mamba group makes prefix caching unserviceable, and leaving
-    # it on does not merely waste work -- it aborts cache init.
-    #
-    # Unserviceable: outside "align" the recurrent state is not checkpointed at
-    # block boundaries, so there is no state to resume a matched prefix from.
-    # vLLM intersects the per-group hits, the Mamba group reports none, and the
-    # intersection is zero for every request.
-    #
-    # Fatal: with the mode un-aligned, mamba_block_size becomes max_model_len
-    # just below, so the two KV cache groups carry unrelated block sizes. vLLM's
-    # resolve_kv_cache_block_sizes sees a non-align Mamba spec and backs
-    # hash_block_size off to the *scheduler* block size, lcm(block_size,
-    # max_model_len) -- which the attention group's own block size does not
-    # divide. AscendHybridKVCacheCoordinator asserts exactly that
-    # ("block_size must be divisible by hash_block_size") and the engine dies
-    # before the first forward.
-    #
-    # Turning prefix caching off is what keeps those two block sizes from being
-    # hashed against each other at all: the coordinator skips the assertion, and
-    # nothing that could have hit is lost. A dense (non-hybrid) TurboQuant model
-    # never reaches this hook and keeps prefix caching.
     if turboquant_active and cache_config.mamba_cache_mode != "align":
         if cache_config.enable_prefix_caching is not False:
             logger.info(
