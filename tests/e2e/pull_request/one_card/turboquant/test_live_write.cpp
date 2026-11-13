@@ -22,6 +22,17 @@
 //                  value plane is a read-modify-write of one 2048-byte strip.
 //   --op both      (default) each in turn.
 //
+// STRIP-ERA GATE. This runner pins kBlockSize = 16 and the RFC 3.1 strip cache,
+// which the kernels refuse under the TURBOQUANT_INGRESS_NZ=1 build this repo
+// now produces: both launchers throw on a block size that is not a multiple of
+// 64. The NZ counterparts live in turboquant-core's own runner
+// (tests/npu/test_live_write.cpp, built twice -- strip and NZ, see its
+// scatter_nz_rig) and the Python-side device gate is
+// tests/ut/attention/test_turboquant_live_write_npu.py. This file stays as the
+// reference for the strip build until the NZ rig is ported over; do not read a
+// PASS from it as evidence about the NZ ingress, or a failure as a regression
+// in it.
+//
 // WHAT MAKES THIS A GATE AND NOT A SMOKE TEST
 //
 // 1. BIT EQUALITY, NOT A TOLERANCE. The fixtures are integer-valued in BF16, so every

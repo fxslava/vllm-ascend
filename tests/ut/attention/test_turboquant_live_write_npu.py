@@ -23,13 +23,14 @@ or under pytest::
 
 The geometry is only partly negotiable. Both writers are specialised at compile
 time to ``head_size == 256`` and to a 16-token strip, and the batch writer
-additionally to 4 KV heads. The batch writer is built with
-``TURBOQUANT_INGRESS_NZ=1`` now, so it also needs ``block_size`` to be a
-multiple of 64 -- exercised here at ``block_size == 64``, one NZ tile to a
-page -- and writes the NZ-tiled cache the fused decode reads. The golden side
-of each differential below is pinned to the layout the staged writer owns:
-NZ_TILED for the batch writer, the strip cache for the scatter writer, which
-has no NZ variant.
+additionally to 4 KV heads. Both are built with ``TURBOQUANT_INGRESS_NZ=1``
+now, so they need ``block_size`` to be a multiple of 64 -- exercised here at
+``block_size == 64``, one NZ tile to a page -- and write the NZ-tiled cache the
+fused decode reads. The scatter writer's NZ mode additionally drops the strip
+read-modify-write: the NZ pairing is token-major, so a per-token write is a
+few aligned bursts and nothing it does not own moves. The golden side of each
+differential below is pinned to the layout the staged writer owns -- NZ_TILED
+for both writers.
 """
 
 from __future__ import annotations
@@ -278,9 +279,10 @@ def test_the_batch_writer_matches_the_golden_model(num_strips: int) -> None:
 def test_the_scatter_writer_matches_the_golden_model(num_tokens: int) -> None:
     """Arbitrary slots at block_size 64, which is what 5984a47fa allowed.
 
-    This is the writer whose value plane is a read-modify-write, so the
-    interesting part is the lanes it must NOT disturb: both caches start zeroed
-    and every untouched nibble has to still be zero on both sides.
+    This writer used to be the one whose value plane was a read-modify-write;
+    under the NZ ingress both planes are pure writes, so the interesting part
+    is unchanged in kind: the bytes it must NOT disturb. Both caches start
+    zeroed and every untouched byte has to still be zero on both sides.
     """
     TurboQuantEmulator, TurboQuantKernelStage, _, _, _ = _import_backend()
     emulator = TurboQuantEmulator(head_size=HEAD_SIZE, device=DEVICE)
@@ -300,11 +302,12 @@ def test_the_scatter_writer_matches_the_golden_model(num_tokens: int) -> None:
 @requires_npu
 @_requires_op(SCATTER_OP)
 def test_the_scatter_writer_accumulates_over_steps() -> None:
-    """Token by token into one strip, which is what a real decode does.
+    """Token by token into one tile, which is what a real decode does.
 
-    The read-modify-write is the whole reason this kernel exists, and a
-    per-token write that clobbered its neighbours would still pass the
-    single-step test above.
+    The NZ pairing is token-major, so a token's bytes are wholly its own and a
+    later step's write cannot clobber an earlier one's -- the property the
+    strip cache needed the read-modify-write for. A per-token write that
+    addressed the wrong bytes would still pass the single-step test above.
     """
     TurboQuantEmulator, TurboQuantKernelStage, _, _, _ = _import_backend()
     emulator = TurboQuantEmulator(head_size=HEAD_SIZE, device=DEVICE)
@@ -331,7 +334,7 @@ def test_the_scatter_writer_accumulates_over_steps() -> None:
 @requires_npu
 @_requires_op(SCATTER_OP)
 def test_the_golden_gather_reads_the_npu_written_cache() -> None:
-    """Write with the kernel, read with ``_golden_gather_pages_strip``.
+    """Write with the kernel, read with ``_golden_gather_pages_nz``.
 
     Two assertions, and they are different in kind:
 
@@ -396,7 +399,7 @@ def test_the_scatter_stage_reads_back_without_the_decode_kernel() -> None:
     os.environ["TURBOQUANT_OPS_NAMESPACE"] = NAMESPACE
     try:
         adapter = TurboQuantOpsAdapter()
-        assert adapter.value_layout() is TurboQuantValueLayout.CHANNEL_MAJOR
+        assert adapter.value_layout() is TurboQuantValueLayout.NZ_TILED
         emulator = TurboQuantEmulator(head_size=HEAD_SIZE, device=DEVICE)
 
         num_tokens = STRIP

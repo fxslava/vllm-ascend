@@ -254,11 +254,11 @@ class TurboQuantValueLayout(str, Enum):
     a per-token scatter writes them without touching another token's bytes,
     which is what lets PyTorch write this layout at all.
 
-    ``CHANNEL_MAJOR`` -- the audited strip cache, which of the NPU writers only
-    the scatter writer still produces (``op_kernel/turboquant_reshape_scatter.cpp``;
-    the batch writer crossed over to ``NZ_TILED`` with
-    ``TURBOQUANT_INGRESS_NZ=1``). It differs from ``TOKEN_MAJOR`` in two ways
-    at once, and both matter to a reader:
+    ``CHANNEL_MAJOR`` -- the audited strip cache, which no NPU writer produces
+    any more (both are NZ ingresses now); it survives as the golden model's
+    RMW-capable dry-run layout and as the format of caches written before the
+    ingress existed, which ``turboquant_nz_ingress`` repacks. It differs from
+    ``TOKEN_MAJOR`` in two ways at once, and both matter to a reader:
 
     * the page axis order is ``(num_blocks, num_kv_heads, block_size,
       head_size / 2)`` -- head before token -- because a ``(block, head)`` page
@@ -285,8 +285,8 @@ class TurboQuantValueLayout(str, Enum):
     any such multiple; the batch writer took any multiple of 16 while it was
     still a strip writer, and needs a multiple of 64 now that it writes NZ.
 
-    ``NZ_TILED`` -- the cache the fused decode reads, and the one the batch
-    writer produces when it is built with ``TURBOQUANT_INGRESS_NZ=1`` (this
+    ``NZ_TILED`` -- the cache the fused decode reads, and the one BOTH NPU
+    writers produce when they are built with ``TURBOQUANT_INGRESS_NZ=1`` (this
     repo's build; see the root CMakeLists). A physical block is
 
         [64-row tile][kv head][32-byte column group][tile row][byte]
@@ -299,15 +299,9 @@ class TurboQuantValueLayout(str, Enum):
     the old plane-major buffer). Unlike the strip cache this pairing is
     TOKEN-major, so a per-token write touches only bytes that token owns and
     the golden writer can land it without a read-modify-write -- which is what
-    covers decode steps and prefill tails while the scatter kernel has no NZ
-    variant. ``block_size`` is a multiple of 64 for the writer and a
-    power-of-two multiple of 64 for the decode's closed-form tile cursor.
-
-    The scatter writer has no NZ form in turboquant-core: staged alone it still
-    puts the cache in ``CHANNEL_MAJOR``, and the fused decode cannot read that.
-    Staged together with the batch writer it is kept OFF the cache entirely --
-    see :meth:`TurboQuantOpsAdapter.reshape_scatter_decode` -- because a strip
-    write into an NZ cache is silent corruption, not an error.
+    covers decode steps and prefill tails when the scatter stage is off.
+    ``block_size`` is a multiple of 64 for the writers and a power-of-two
+    multiple of 64 for the decode's closed-form tile cursor.
     """
 
     TOKEN_MAJOR = "token_major"
@@ -954,7 +948,6 @@ class TurboQuantOpsAdapter:
         self.config: TurboQuantOpsConfig = config if config is not None else TurboQuantOpsConfig.from_env()
         self._emulators: dict[tuple[int, str], TurboQuantEmulator] = {}
         self._missing_kernels: set[str] = set()
-        self._warnings_issued: set[str] = set()
         if self.config.kernel_stages:
             # Only a run that asked for a kernel stage pays for the import, and
             # only such a run is entitled to complain that it is missing.
@@ -1054,21 +1047,17 @@ class TurboQuantOpsAdapter:
         on does not also have to be told what that stage writes, and the golden
         reader follows without a second switch to keep in step.
 
-        The batch-writer kernel is built with ``TURBOQUANT_INGRESS_NZ=1``, so
-        its presence puts the cache in ``NZ_TILED``. The strip scatter kernel
-        is never allowed to write an NZ cache -- :meth:`reshape_scatter_decode`
-        falls back to the golden NZ writer instead -- so the two kernels staged
-        together still mean NZ, not a mixture. The scatter kernel staged ALONE
-        means the strip cache, as it always did.
+        Both NPU writers are built with ``TURBOQUANT_INGRESS_NZ=1``, so either
+        one staged puts the cache in ``NZ_TILED``. When an ingestion kernel is
+        staged but its sibling is not, the missing sibling's writes go to the
+        golden NZ writer, so the cache stays NZ throughout.
 
         ``config.value_layout`` is consulted only when both writers are golden,
         which is how a dry run can still ask the golden writer to refuse the
         channel-major read-modify-write it cannot do.
         """
-        if self._has_kernel(TURBOQUANT_OP_RESHAPE_AND_CACHE):
+        if self._has_kernel(TURBOQUANT_OP_RESHAPE_AND_CACHE) or self._has_kernel(TURBOQUANT_OP_RESHAPE_SCATTER):
             return TurboQuantValueLayout.NZ_TILED
-        if self._has_kernel(TURBOQUANT_OP_RESHAPE_SCATTER):
-            return TurboQuantValueLayout.CHANNEL_MAJOR
         return self.config.value_layout
 
     # -- rotation ----------------------------------------------------------
@@ -1407,40 +1396,19 @@ class TurboQuantOpsAdapter:
         The decode phase. ``T`` is the batch size and ``slot_mapping`` is ``[T]``
         int32 with no contiguity of any kind. Negative slots are padding and are
         skipped, which is what a graph-capture dummy run feeds.
-
-        THE SCATTER KERNEL IS A STRIP WRITER, and it stays one: no NZ variant
-        exists in turboquant-core. On an NZ cache -- anything the batch-writer
-        kernel has touched -- its read-modify-write would land strip bytes in
-        an NZ fractal, which is silent corruption with every shape check green.
-        It is therefore kept OFF an NZ cache even when its stage is on, and the
-        golden NZ writer takes the write instead. The NZ pairing is
-        token-major, so the golden write needs no read-modify-write and loses
-        only speed, not correctness. That is the interim state until the
-        harness ships an NZ scatter kernel; staging ``SCATTER`` alongside
-        ``RESHAPE_AND_CACHE`` today buys a warning, nothing else.
         """
         if self._has_kernel(TURBOQUANT_OP_RESHAPE_SCATTER):
-            if self.value_layout() is TurboQuantValueLayout.NZ_TILED:
-                if "scatter_on_nz" not in self._warnings_issued:
-                    self._warnings_issued.add("scatter_on_nz")
-                    logger.warning(
-                        "TurboQuant: the staged %s writes the strip cache, which an NZ-written cache "
-                        "cannot admit; per-token writes go to the PyTorch golden NZ writer until an "
-                        "NZ scatter kernel exists.",
-                        TURBOQUANT_OP_RESHAPE_SCATTER,
-                    )
-            else:
-                self._kernel_reshape_scatter_aiv(
-                    key=key,
-                    value=value,
-                    key_cache=key_cache,
-                    value_cache=value_cache,
-                    scale_cache=scale_cache,
-                    slot_mapping=slot_mapping,
-                    pi_signs=emulator.pi_signs,
-                    inv_sqrt_len=emulator.inv_sqrt_len,
-                )
-                return
+            self._kernel_reshape_scatter_aiv(
+                key=key,
+                value=value,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                scale_cache=scale_cache,
+                slot_mapping=slot_mapping,
+                pi_signs=emulator.pi_signs,
+                inv_sqrt_len=emulator.inv_sqrt_len,
+            )
+            return
         self._golden_reshape_scatter_decode(key, value, key_cache, value_cache, scale_cache, slot_mapping, emulator)
 
     def _kernel_reshape_scatter_aiv(
@@ -1456,13 +1424,13 @@ class TurboQuantOpsAdapter:
     ) -> None:
         """The AIV scatter writer: one token per request, rotated and packed in UB.
 
-        Same tensors as :meth:`_kernel_reshape_and_cache_a8` but NOT the same
-        cache: this kernel writes the strip layout, while the batch writer is
-        now the NZ ingress. :meth:`reshape_scatter_decode` therefore never
-        reaches this body on an NZ cache -- it exists for a strip-cache
-        configuration, where the value plane's write is a read-modify-write of
-        one 2048-byte strip, spliced in by register bitwise masks, which is the
-        whole reason this kernel exists.
+        Same tensors and the same NZ-tiled cache as
+        :meth:`_kernel_reshape_and_cache_a8`, with no contiguity contract on
+        ``slot_mapping``. The NZ pairing is token-major -- a byte is wholly
+        owned by one (token, kv head) -- so the write is a few aligned bursts
+        per plane and the 2048-byte strip read-modify-write the strip build
+        existed for is gone. The quantiser weaves the kv4fp8 nibble pairs in
+        registers, so the packed image lands in the NZ order directly.
 
         The C launcher (``launch_turboquant_reshape_scatter_aiv``,
         op_kernel/turboquant_reshape_scatter.cpp) also takes ``block_dim``,
@@ -2086,21 +2054,19 @@ class TurboQuantOpsAdapter:
         under this mode. It is given the real operand anyway so the two sides
         never disagree about its dtype -- see :func:`_codec_tables`.
 
-        THIS OP READS EXACTLY THE CACHE THE BATCH WRITER NOW PRODUCES. The two
+        THIS OP READS EXACTLY THE CACHE BOTH WRITERS NOW PRODUCE. The two sides
         used to disagree on four independent axes -- byte order, nibble
         pairing, the value plane's token axis and the scale plane -- because
         both writers emitted the strip layout while this reads the NZ-tiled
-        one. The batch writer is built with ``TURBOQUANT_INGRESS_NZ=1`` now,
-        which is the write-time NZ ingress this docstring used to call "the
-        real fix ... in the harness": its UB-side NZ stage emits the fractal
-        this decode's ``ReadPlane`` strides, with the pairing its
-        ``UnpackAffine`` expand inverts, and the slot-major scale records it
-        bursts. The one writer that still does NOT meet this op is the scatter
-        kernel; :meth:`reshape_scatter_decode` keeps it off the cache.
+        one. Both writers are built with ``TURBOQUANT_INGRESS_NZ=1`` now, which
+        is the write-time NZ ingress this docstring used to call "the real fix
+        ... in the harness": each one's NZ addressing is tied to
+        ``op_kernel/common/turboquant_layout.h`` by ``static_assert``, and the
+        pairing it stores is the one this op's ``UnpackAffine`` expand inverts.
 
         :func:`vllm_ascend.attention.turboquant_nz_ingress.turboquant_repack_strip_to_nz_tiled`
         remains the reference conversion for caches written before the ingress
-        existed, and the executable specification the kernel's ``static_assert``s
+        existed, and the executable specification the kernels' ``static_assert``s
         are checked against. It is a bridge, not a serving path. See that
         module's header for the four axes and the evidence for each.
         """

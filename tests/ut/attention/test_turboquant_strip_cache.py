@@ -1,18 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The golden model's strip cache, against the two NPU writers' own formula.
+"""The golden model's strip cache, against the pre-ingress writers' formula.
 
-The audited writers do not produce the golden model's cache. Their strip layout
-puts the page axis in a different order and makes the value plane channel-major
-*inside a 16-token strip*, which the two kernels state as
+The audited writers do not produce the golden model's cache, and since the NZ
+ingress they do not produce this one either: both are built with
+``TURBOQUANT_INGRESS_NZ=1`` and write the NZ-tiled layout the fused decode
+reads. The strip layout survives as the golden model's RMW-capable dry-run
+format and as the format of caches written before the ingress existed -- which
+is what this file keeps honest. It puts the page axis in a different order and
+makes the value plane channel-major *inside a 16-token strip*, which the two
+kernels state as
 
     key   nibble = ((block * H + head) * S + token) * D + channel
     value nibble = ((block * H + head) * S) * D
                  + (token // 16) * (16 * D) + channel * 16 + (token % 16)
 
 (``turboquant_reshape_scatter.cpp``: the ``key_base`` burst, and
-``StripWordOffset`` plus the within-strip index). The oracle below computes that
-index element by element with no tensor tricks, so it shares nothing with the
+``StripWordOffset`` plus the within-strip index, in the uncompiled
+``TURBOQUANT_INGRESS_NZ=0`` variant). The oracle below computes that index
+element by element with no tensor tricks, so it shares nothing with the
 vectorised implementation it checks.
 
 What needs a device and is therefore NOT what these tests establish: that the
@@ -29,7 +35,6 @@ import torch
 from vllm_ascend.attention.turboquant_dry_run import (
     TURBOQUANT_STRIP_TOKENS,
     TurboQuantEmulator,
-    TurboQuantKernelStage,
     TurboQuantOpsAdapter,
     TurboQuantOpsConfig,
     TurboQuantValueLayout,
@@ -228,32 +233,23 @@ def _oracle_strip_cache(key, value, caches, slot_mapping, emulator):
 
 @pytest.mark.parametrize("block_size", [16, 64])
 def test_the_golden_gather_reads_a_kernel_written_cache(monkeypatch, block_size):
-    """Item 3: an NPU-written strip cache, read back with no numerical drift.
+    """Item 3: a strip cache, read back with no numerical drift.
 
     The cache is filled by the scalar oracle above -- the writers' formula, not
-    the adapter's code -- and then read with the scatter stage engaged, which is
-    what makes `value_layout()` report CHANNEL_MAJOR and select the strip
-    reader. The configuration is TURBOQUANT_KERNEL_STAGES=scatter with the
-    decode still in golden fallback.
+    the adapter's code -- and then read with the strip layout pinned in the
+    config, which is how a cache written before the NZ ingress existed is read.
+    No kernel stage is engaged: both NPU writers are NZ now, so staging one
+    would report NZ_TILED and select the NZ reader instead.
 
     NOT a differential against the compiled kernels: that needs an NPU. What it
     establishes is that the golden reader inverts the writers' documented
     formula exactly.
     """
-
-    class _Entry:
-        def __call__(self, *a, **k):
-            return None
-
-    monkeypatch.setattr(
-        torch,
-        "ops",
-        types.SimpleNamespace(turboquant_ops=types.SimpleNamespace(npu_turboquant_reshape_scatter_aiv=_Entry())),
-    )
     adapter = TurboQuantOpsAdapter(
         TurboQuantOpsConfig(
             ops_namespace="turboquant_ops",
-            kernel_stages=frozenset({TurboQuantKernelStage.SCATTER}),
+            kernel_stages=frozenset(),
+            value_layout=TurboQuantValueLayout.CHANNEL_MAJOR,
         )
     )
     assert adapter.value_layout() is TurboQuantValueLayout.CHANNEL_MAJOR
@@ -281,11 +277,10 @@ def test_stages_scatter_writes_through_the_kernel_and_reads_back_golden(monkeypa
     covered too, and it checks the four things that have to hold together:
 
     * the scatter op is really called -- the write is not silently golden;
-    * nothing raises on the way, which is what the old CHANNEL_MAJOR refusal
-      used to do;
+    * nothing raises on the way;
     * `fused_decode` declines, because the decode stage is off;
-    * the gather still reads the strip layout, so a cache the kernel wrote comes
-      back correctly.
+    * the gather reads the NZ layout the staged writer puts the cache in, so a
+      cache the kernel wrote comes back correctly.
 
     The device half -- that the kernel's bytes equal the golden model's -- is
     tests/ut/attention/test_turboquant_live_write_npu.py and needs an NPU.
@@ -306,7 +301,7 @@ def test_stages_scatter_writes_through_the_kernel_and_reads_back_golden(monkeypa
     )
 
     adapter = TurboQuantOpsAdapter()
-    assert adapter.value_layout() is TurboQuantValueLayout.CHANNEL_MAJOR
+    assert adapter.value_layout() is TurboQuantValueLayout.NZ_TILED
 
     emulator = TurboQuantEmulator(head_size=HEAD_SIZE, device=torch.device("cpu"))
     block_size = 64
@@ -346,9 +341,26 @@ def test_stages_scatter_writes_through_the_kernel_and_reads_back_golden(monkeypa
         is None
     )
 
-    # And the reader this configuration leans on still inverts the strip layout.
-    written = _caches(block_size)
-    _oracle_strip_cache(key, value, written, slots, emulator)
+    # And the reader this configuration leans on inverts the NZ layout the
+    # staged writer puts the cache in: a golden NZ write, read back exactly.
+    # The NZ scale record pads to a whole fp32 block, so this needs
+    # 2 * num_kv_heads to be one -- 4 heads here, not the suite's 2.
+    nz_heads = 4
+    nz_shape = (block_size, nz_heads, HEAD_SIZE)
+    generator = torch.Generator().manual_seed(31)
+    nz_key = torch.randn(nz_shape, generator=generator)
+    nz_value = torch.randn(nz_shape, generator=generator)
+    nz_packed = (NUM_BLOCKS, block_size, nz_heads, turboquant_packed_bytes(HEAD_SIZE))
+    written = (
+        torch.zeros(nz_packed, dtype=torch.int8),
+        torch.zeros(nz_packed, dtype=torch.int8),
+        torch.zeros(turboquant_scale_cache_shape(NUM_BLOCKS, block_size, nz_heads), dtype=torch.float32),
+    )
+    TurboQuantOpsAdapter(
+        TurboQuantOpsConfig(
+            ops_namespace="turboquant_ops", kernel_stages=frozenset(), value_layout=TurboQuantValueLayout.NZ_TILED
+        )
+    ).reshape_scatter_decode(nz_key, nz_value, *written, slots, emulator)
     packed_key, key_scales, _, _ = adapter.gather(*written, torch.zeros(1, 1, dtype=torch.int32))
     dense = adapter.dequantize_cache(packed_key, key_scales, emulator, torch.float32)
-    assert torch.equal(dense[0], emulator.decode(*emulator.encode(key)))
+    assert torch.equal(dense[0], emulator.decode(*emulator.encode(nz_key)))

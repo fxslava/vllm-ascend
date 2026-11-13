@@ -33,7 +33,7 @@ symbol is undefined.
 | Path | What it is |
 | --- | --- |
 | `op_kernel/turboquant_reshape_batch.cpp` | prefill batch writer, MIX_AIC_1_2, **mode-2 only**, one seamless chunk stream over a block's whole share of strips, built with **`TURBOQUANT_INGRESS_NZ=1`** (root `CMakeLists.txt`): writes the NZ-tiled cache the fused decode reads rather than the RFC 3.1 strip cache |
-| `op_kernel/turboquant_reshape_scatter.cpp` | decode scatter writer, AIV only, per-token strip read-modify-write |
+| `op_kernel/turboquant_reshape_scatter.cpp` | decode scatter writer, AIV only, per-token NZ write (built with `TURBOQUANT_INGRESS_NZ=1` like the batch writer; the strip read-modify-write exists only in the uncompiled `=0` variant) |
 | `op_kernel/turboquant_fused_decode.cpp` | fused decode, pre-rotated and raw-query entries, **bf16 only** |
 | `op_kernel/common/`, `op_kernel/cube/`, `op_kernel/vector/` | codec, layout, wave protocol, the Cube and Vector services and their micro-routines |
 | `include/` | the decode's launch ABI, the GEMM-reduce and Split-K contracts |
@@ -138,52 +138,47 @@ elsewhere for an unrelated and more serious reason (`NPUPlatform` clamps the
 graph mode), and the fused decode's binding copies the context lengths to the
 host to build its tiling, which is itself illegal on a capturing stream.
 
-## The scatter writer still does not meet the decode
+## The cache formats now meet
 
-This used to be "the two cache formats do not meet", and it was the most
-important thing to know before switching a stage on: **both** writers produced
-the RFC 3.1 strip cache while the fused decode reads the NZ-tiled cache of
-`NzTiledPackedByte()` in `op_kernel/common/turboquant_layout.h`. The batch
-writer has crossed over since — it is built with `TURBOQUANT_INGRESS_NZ=1` (the
-define lives in the root `CMakeLists.txt`, next to `ASCEND_MICRO_CANN_LAUNCH`),
-which is turboquant-core's write-time NZ ingress: the same rotation and
-quantisation pipeline, plus an in-UB NZ stage (`NzTokenMajor`,
-`NzGroupGather`, the weave and the strided `DataCopyPad` stores) that emits the
-`[64-row tile][kv head][32-byte column group][tile row][byte]` fractal with the
-kv4fp8 nibble pairing and slot-major scale records. Every address it computes
-is tied back to `turboquant_layout.h` by `static_assert`, so a writer that
-drifted from the reader cannot compile. **The prefill writer and the fused
-decode now name the same byte.** `block_size` must be a multiple of 64 for the
-writer and a power-of-two multiple of 64 for the decode's closed-form tile
-cursor, so 64, 128, 256, ... serve both.
+This section used to be "the two cache formats do not meet", and it was the
+most important thing to know before switching a stage on: **both** writers
+produced the RFC 3.1 strip cache while the fused decode reads the NZ-tiled
+cache of `NzTiledPackedByte()` in `op_kernel/common/turboquant_layout.h`. Both
+writers are built with `TURBOQUANT_INGRESS_NZ=1` now (the define lives in the
+root `CMakeLists.txt`, next to `ASCEND_MICRO_CANN_LAUNCH`):
 
-The **scatter writer** has no NZ variant in `turboquant-core`
-(`TURBOQUANT_INGRESS_NZ` appears in the prefill source, its cmake and one
-canary test — nowhere else) and still writes the strip cache: page axis
-`(num_blocks, num_kv_heads, block_size, head_size / 2)`, key nibble
-`token * head_size + channel`, value nibble channel-major inside a 16-token
-strip. It must not touch a cache the NZ pair shares. The mismatch is numerical,
-not dimensional — a strip byte holds ONE channel at TWO tokens, an NZ byte ONE
-token at channels `col` and `col + 128`, so no byte permutation reconciles
-them. `tests/ut/ops/turboquant/test_layout_bridge.cpp` states both contracts
-and counts the disagreement: at `block_size` 64, 32758 of 32768 addresses
-differ. The Python adapter
-(`vllm_ascend/attention/turboquant_dry_run.py`) therefore keeps the scatter
-kernel off an NZ-written cache and lands per-token writes with its golden NZ
-writer instead, until an NZ scatter kernel exists in the harness. An NZ
-scatter is *easier* than the strip one, not harder — the NZ pairing is
-token-major, so one token's 128 packed bytes per head are four aligned 32-byte
-bursts with no read-modify-write — but it is new kernel work either way.
+* the **batch writer**'s NZ mode adds an in-UB NZ stage (`NzTokenMajor`,
+  `NzGroupGather`, the weave, and the strided `DataCopyPad` stores) behind the
+  same rotation/quantisation pipeline;
+* the **scatter writer**'s NZ mode deletes more than it adds: the NZ pairing is
+  token-major, one byte wholly owned by one (token, kv head), so the value
+  plane's 2048-byte strip read-modify-write disappears and both planes become
+  `kNzGroups` bursts of 32 contiguous bytes per token plus one lane of the
+  slot-major scale record. The `MTE3_MTE2` strip-recycle edge goes with them.
 
-`vllm_ascend/attention/turboquant_nz_ingress.py` still carries the reference
-strip-to-NZ repack; it is a bridge for caches written before the ingress
-existed, not a serving path.
+Both writers' open-coded NZ addressing is tied back to `turboquant_layout.h` by
+`static_assert` (`NzStripAgrees` / `NzAgrees`), so a writer that drifted from
+the reader cannot compile. `block_size` must be a multiple of 64 for the
+writers and a power-of-two multiple of 64 for the decode's closed-form tile
+cursor, so 64, 128, 256, ... serve all three.
+
+The strip cache still exists in three places, none of them a serving path: the
+`TURBOQUANT_INGRESS_NZ=0` build variant (uncompiled here), the golden model's
+`CHANNEL_MAJOR` dry-run layout, and
+`vllm_ascend/attention/turboquant_nz_ingress.py`, the reference strip-to-NZ
+repack for caches written before the ingress existed. The record of *why* the
+two formats could never share a cache — a strip byte holds ONE channel at TWO
+tokens, an NZ byte ONE token at channels `col` and `col + 128`, and at
+`block_size` 64 exactly 10 of 32768 addresses agree — is kept in
+`tests/ut/ops/turboquant/test_layout_bridge.cpp`, which still gates that the NZ
+writer arithmetic and an independently re-derived decode reader name the same
+byte and the same nibble.
 
 The Python side knows about the writers' layout: `TurboQuantValueLayout` and
 `TurboQuantOpsAdapter.value_layout()` derive it from which writer owns the page
-(`NZ_TILED` once the batch-writer kernel is staged, `CHANNEL_MAJOR` for the
-strip scatter alone), and the golden gather reads an NZ cache back so that a
-mixed configuration — NPU writer, PyTorch reader — still reconciles.
+(`NZ_TILED` once either NPU writer is staged), and the golden gather reads an
+NZ cache back so that a mixed configuration — NPU writer, PyTorch reader —
+still reconciles.
 
 ## Gates that need no NPU
 

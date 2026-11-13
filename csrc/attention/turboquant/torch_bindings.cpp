@@ -27,48 +27,30 @@
 // warn-once and a golden fallback. That is the whole fallback contract: the
 // Python side never needs to know whether this file was compiled.
 //
-// THE BATCH WRITER AND THE FUSED DECODE NOW SHARE A CACHE FORMAT; THE SCATTER
-// WRITER STILL DOES NOT. This was the harness's Phase 1 position -- both
-// writers produced the RFC 3.1 strip cache while the decode reads the NZ-tiled
-// plane of op_kernel/common/turboquant_layout.h's NzTiledPackedByte(), and the
-// two formats disagree on the PAIRING OF NIBBLES INTO BYTES, which no
-// permutation of bytes can undo. The mismatch and its evidence are kept at the
-// bottom of this comment block; what changed is the writer side:
+// ALL THREE KERNELS SHARE A CACHE FORMAT NOW: the NZ-tiled plane of
+// op_kernel/common/turboquant_layout.h's NzTiledPackedByte(), laid out as
+// [64-row tile][kv head][32-byte column group][tile row][byte], one byte
+// holding channels (c, c + head_size / 2) of ONE token, with the scale plane
+// slot-major. Both writers are built with TURBOQUANT_INGRESS_NZ=1 (see the
+// root CMakeLists), and each writer's open-coded NZ addressing is tied back to
+// turboquant_layout.h by static_assert, so a writer that drifted from the
+// reader cannot compile. tests/ut/ops/turboquant/test_layout_bridge.cpp is the
+// same gate from the reader's side.
 //
-//   * the BATCH WRITER (op_kernel/turboquant_reshape_batch.cpp) is now built
-//     with TURBOQUANT_INGRESS_NZ=1 (see the root CMakeLists). It emits the
-//     NZ-tiled cache the decode reads -- same address function, same nibble
-//     pairing, same slot-major scale records -- and its UB-side NZ stage is
-//     tied back to turboquant_layout.h by static_assert, so a writer that
-//     drifted from the reader cannot compile. tests/ut/ops/turboquant/
-//     test_layout_bridge.cpp is the same gate from the reader's side.
-//   * the SCATTER WRITER (op_kernel/turboquant_reshape_scatter.cpp) has no NZ
-//     variant in turboquant-core and still writes the strip cache. It must not
-//     touch a cache the NZ pair shares: every byte it writes lands in the wrong
-//     place for the decode. The Python adapter
-//     (vllm_ascend/attention/turboquant_dry_run.py) keeps it off an NZ cache
-//     and covers per-token writes with its golden NZ writer until an NZ
-//     scatter kernel exists in the harness.
+// This was not always so, and the record of the mismatch is kept below because
+// it is why the ingress exists: the writers used to produce the RFC 3.1 strip
+// cache, which disagrees with the NZ plane on the PAIRING OF NIBBLES INTO
+// BYTES -- not a byte ordering, so no permutation could reconcile them:
 //
-// --- the original mismatch, kept as the record of why the ingress exists ---
-//
-// The difference was NOT a byte ordering that a reordering could fix. It was a
-// different PAIRING OF NIBBLES INTO BYTES, which no permutation of bytes can
-// undo:
-//
-//   * the two WRITERS: the key plane's nibble index inside a (block, head) page
-//     is `token * head_size + channel`; the value plane's is
-//     `(token / 16) * (16 * head_size) + channel * 16 + (token % 16)`
-//     (op_kernel/turboquant_reshape_scatter.cpp's StripWordOffset plus its
-//     within-strip index). Consecutive nibbles are the SAME CHANNEL at TWO
-//     TOKENS, so a byte holds one channel of tokens 2p and 2p+1.
-//   * the FUSED DECODE reads the NZ-tiled plane of
-//     op_kernel/common/turboquant_layout.h's NzTiledPackedByte(), laid out as
-//     [64-row tile][kv head][32-byte column group][tile row][byte]. A byte
-//     holds ONE TOKEN at channels `col` and `col + 128` -- the two halves of
-//     the channel axis. The harness's own reference writer for this plane is
-//     tests/common/fused_decode_opt_fixture.hpp, which fills it as
-//     `value[NzTiledPackedByte(row, head, col, h, 128)] =
+//   * the strip cache: the key plane's nibble index inside a (block, head)
+//     page is `token * head_size + channel`; the value plane's is
+//     `(token / 16) * (16 * head_size) + channel * 16 + (token % 16)`.
+//     Consecutive nibbles are the SAME CHANNEL at TWO TOKENS, so a byte holds
+//     one channel of tokens 2p and 2p+1.
+//   * the NZ cache: a byte holds ONE TOKEN at channels `col` and `col + 128`
+//     -- the two halves of the channel axis. The harness's own reference writer
+//     for this plane is tests/common/fused_decode_opt_fixture.hpp, which fills
+//     it as `value[NzTiledPackedByte(row, head, col, h, 128)] =
 //      level(col) | (level(col + 128) << 4)`.
 //
 // At block_size 64 both layouts occupy the same 8192 bytes per (tile, kv head)
@@ -77,7 +59,7 @@
 // block_size 16 the NZ plane does not even fit: its tile row stride is 64, so a
 // 16-token page would address 6656 bytes to store 2048.
 //
-// Why that is fatal rather than cosmetic: StageNzTileToL1 nibble-expands with
+// Why that was fatal rather than cosmetic: StageNzTileToL1 nibble-expands with
 // DeInterleave (op_kernel/common/turboquant_codec_mx.h, UnpackAffine), which
 // sends every byte's low nibble to one contiguous L1 plane and every high
 // nibble to another. Under the NZ plane the low plane is channels 0..127 of all
@@ -273,16 +255,14 @@ inline CachePlanes check_cache(const at::Tensor &key_cache, const at::Tensor &va
                 ": packed plane is [", num_blocks, ", ", block_size, ", ", key_cache.size(2), ", ",
                 key_cache.size(3), "], expected [..., ", a.num_kv_heads, ", ", a.head_size / 2, "]");
 
-    // The two writers index the scale plane differently -- the scatter writer
-    // plane-major, `((kv * num_blocks + block) * num_kv_heads + head) *
-    // block_size + token`; the NZ batch writer slot-major, `slot *
-    // NzScaleSlotFloats(num_kv_heads) + kv * num_kv_heads + head` -- but at
-    // num_kv_heads 4 both address exactly 8 floats per slot and the highest
-    // lane written is this bound minus one either way, so the check is exact
-    // for both. NzScaleSlotFloats pads the record past 2 * num_kv_heads, so a
-    // writer compiled for a head count with 2 * num_kv_heads % 8 != 0 would
-    // need a larger extent than this; the NZ ingress is compiled for 4 heads
-    // and refuses any other in its launcher.
+    // Both writers now index the scale plane slot-major -- `slot *
+    // NzScaleSlotFloats(num_kv_heads) + kv * num_kv_heads + head` -- and at
+    // num_kv_heads 4 a record is exactly 8 floats, the same extent the old
+    // plane-major ((kv * num_blocks + block) * num_kv_heads + head) *
+    // block_size + token indexing had, so the check is exact for both. The
+    // scatter op adds its own NzScaleSlotFloats extent check, because it is
+    // not specialised to 4 heads and a record wider than 2 * num_kv_heads
+    // would outgrow this allocation.
     const std::int64_t scale_floats = kTablePlanes * num_blocks * a.num_kv_heads * block_size;
     TORCH_CHECK(scale_cache.numel() >= scale_floats, op, ": scale plane holds ", scale_cache.numel(),
                 " floats, needs at least ", scale_floats);
@@ -547,15 +527,15 @@ void npu_turboquant_reshape_and_cache_a8(at::Tensor &key, at::Tensor &value, at:
 // 2. Decode scatter ingestion
 // ---------------------------------------------------------------------------
 
-// One token per request, rotated and packed in UB and spliced into the page,
-// over launch_turboquant_reshape_scatter_aiv (op_kernel/turboquant_reshape_scatter.cpp).
+// One token per request, rotated and packed in UB and written straight into the
+// NZ fractal, over launch_turboquant_reshape_scatter_aiv
+// (op_kernel/turboquant_reshape_scatter.cpp).
 //
-// The value plane is a read-modify-write: channel-major inside the strip pairs
-// tokens 2t and 2t+1 in one byte, so a per-token write has to read the strip,
-// splice its own nibbles in by register masks and write the strip back. That is
-// why this kernel exists. The PyTorch golden model does the same thing a strip
-// at a time (_write_strip_planes in turboquant_dry_run.py), so the two agree on
-// what lands; only this one does it without reading the strip back to host.
+// The NZ build has no read-modify-write at all: a byte of the NZ cache is
+// wholly owned by one (token, kv head), so one token's write is kNzGroups
+// bursts of 32 contiguous bytes per plane plus one lane of the slot-major
+// scale record -- the 2048-byte strip merge the strip build exists for is
+// simply gone.
 //
 // Host derivation, as the brief pins it: total_items = num_requests *
 // num_kv_heads, item_begin = 0, item_count = total_items, block_dim =
@@ -577,14 +557,23 @@ void npu_turboquant_reshape_scatter_aiv(at::Tensor &key, at::Tensor &value, at::
 
     TORCH_CHECK(a.head_size == kDecodeHeadSize, op, ": the scatter writer is specialised to head_size ",
                 kDecodeHeadSize, ", got ", a.head_size);
-    // Any whole number of strips per page. Unlike the batch writer this one
-    // carries an in-page strip index -- `item.strip` in `StripWordOffset` and
-    // `item.token_in_block` in the key burst
-    // (op_kernel/turboquant_reshape_scatter.cpp) -- so a page may hold as many
-    // 16-token strips as it likes.
-    TORCH_CHECK(c.block_size % kTokensPerStrip == 0, op, ": the strip cache is written ", kTokensPerStrip,
-                " tokens at a time, so block_size must be a multiple of ", kTokensPerStrip, ", got ",
-                c.block_size);
+    // The NZ build lays a page out as whole 64-row tiles; the kernel's own
+    // launcher refuses anything else. The fused decode's closed-form tile
+    // cursor is stricter still -- a power-of-two multiple of 64.
+    TORCH_CHECK(c.block_size % layout::kCubeTileRows == 0, op,
+                ": the NZ-tiled ingress writes ", layout::kCubeTileRows,
+                "-row tiles, so block_size must be a multiple of ", layout::kCubeTileRows, ", got ",
+                c.block_size, " (the fused decode additionally needs a power-of-two multiple)");
+    // The slot-major scale record is NzScaleSlotFloats(num_kv_heads) floats a
+    // slot. At num_kv_heads 4 that is exactly the 8 floats the plane-major
+    // extent holds per slot; with any head count whose doubled value is not a
+    // multiple of 8 the record outgrows the allocation, and the kernel would
+    // write past the plane rather than fail.
+    TORCH_CHECK(scale_cache.numel() >=
+                    static_cast<std::int64_t>(layout::NzScaleSlotFloats(a.num_kv_heads)) * c.num_blocks *
+                        c.block_size,
+                op, ": the NZ scale plane needs ", layout::NzScaleSlotFloats(a.num_kv_heads),
+                " floats per slot (NzScaleSlotFloats(", a.num_kv_heads, ")), got ", scale_cache.numel());
 
     check_burst_aligned(key, op, "key");
     check_burst_aligned(value, op, "value");
@@ -598,8 +587,10 @@ void npu_turboquant_reshape_scatter_aiv(at::Tensor &key, at::Tensor &value, at::
     // `cu_seqlens` prefix sum this op passes as null -- so MTP needs a caller
     // that builds it, not a different token count.
     const std::int64_t num_requests = a.num_tokens;
-    // One work item per (request, kv head): the writer folds the two into one
-    // index so that two heads of one request cannot collide on a strip.
+    // One work item per (request, kv head): the butterfly does not decompose
+    // across cores, and the fold coalesces an MTP step's 1 + k tokens of one
+    // request into one run's column-group bursts instead of 1 + k separate
+    // launches' worth of work items.
     const std::int64_t total_items = num_requests * a.num_kv_heads;
     TORCH_CHECK(total_items > 0, op, ": nothing to scatter");
 
@@ -1155,15 +1146,11 @@ TORCH_LIBRARY_FRAGMENT(turboquant_ops, ops)
     ops.impl("npu_turboquant_reshape_and_cache_a8", c10::kMeta,
              &vllm_ascend::turboquant_bindings::meta::npu_turboquant_reshape_and_cache_a8_meta);
 
-    // One token per request, arbitrary slots. The value plane's write is a
-    // read-modify-write of one 2048-byte strip, which is the reason this op
-    // exists: the PyTorch golden model cannot do it safely.
-    //
-    // STRIP CACHE ONLY. This writer has no NZ variant in turboquant-core: it
-    // produces the RFC 3.1 strip layout the fused decode cannot read, so it
-    // must not write a cache the NZ batch writer and the decode share. The
-    // Python adapter keeps it off an NZ cache; an NZ scatter kernel is harness
-    // work that has not landed.
+    // One token per request, arbitrary slots, into the same NZ-tiled cache the
+    // batch writer writes and the fused decode reads. The NZ pairing is
+    // token-major, so this writer's write is a handful of aligned bursts with
+    // no read-modify-write -- the strip cache's 2048-byte strip merge, which
+    // was the reason this op existed, is gone with the strip cache.
     ops.def(
         "npu_turboquant_reshape_scatter_aiv(Tensor key, Tensor value, Tensor! key_cache, "
         "Tensor! value_cache, Tensor! scale_cache, Tensor slot_mapping, Tensor pi_signs, "

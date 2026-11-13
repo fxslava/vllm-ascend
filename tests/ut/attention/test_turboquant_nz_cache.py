@@ -3,11 +3,10 @@
 """CPU tests for the golden NZ-tiled cache writer and reader.
 
 The batch-writer kernel is built with ``TURBOQUANT_INGRESS_NZ=1`` and writes
-the NZ-tiled cache the fused decode reads. Until an NZ scatter kernel exists
-in turboquant-core, every per-token write on that cache -- decode steps and
-prefill tails -- goes to the PyTorch golden NZ writer in
-``vllm_ascend/attention/turboquant_dry_run.py``. That writer and its gather
-are pinned here against two independent oracles, with no device:
+the NZ-tiled cache the fused decode reads, and so is the scatter kernel: the
+golden NZ writer below is the fallback for a stage that is switched off or
+unregistered, and the dispatch rule these tests pin is that a staged scatter
+kernel takes the NZ write itself.
 
 * the scalar address functions of
   ``vllm_ascend/attention/turboquant_nz_ingress.py`` -- byte for byte, scale
@@ -186,14 +185,14 @@ def test_repeated_decode_writes_accumulate_without_a_read_modify_write(emulator:
         assert torch.equal(got[token], codes_k[token])
 
 
-def test_the_strip_scatter_kernel_is_kept_off_an_nz_cache(
+def test_the_scatter_kernel_writes_the_nz_cache_it_is_staged_for(
     monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
 ) -> None:
-    """Both stages staged: the scatter recorder stays silent and the write lands NZ.
+    """Both stages staged: a decode step reaches the scatter kernel directly.
 
-    A strip read-modify-write into an NZ fractal is silent corruption with
-    every shape check green, so the staged adapter must fall back to the
-    golden NZ writer instead of calling the registered scatter op.
+    The scatter writer is the NZ ingress too, so there is no layout left to
+    arbitrate: the staged op is called, and the golden writer is only the
+    fallback for when the stage is off.
     """
     calls: list[tuple] = []
 
@@ -219,8 +218,7 @@ def test_the_strip_scatter_kernel_is_kept_off_an_nz_cache(
     caches = _caches()
     adapter.reshape_scatter_decode(key, value, *caches, torch.tensor([5, 70, 129], dtype=torch.int32), emulator)
 
-    assert calls == [], "the strip scatter kernel ran on an NZ cache"
-    assert any(int(plane.abs().sum()) > 0 for plane in caches), "the golden NZ write did not happen"
+    assert len(calls) == 1, "the staged NZ scatter kernel did not take the write"
 
 
 def test_the_nz_writer_refuses_a_page_that_is_not_whole_tiles(emulator: TurboQuantEmulator) -> None:
