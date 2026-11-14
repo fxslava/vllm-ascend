@@ -756,7 +756,18 @@ def test_the_fused_decode_matches_the_golden_attention_serving_geometry(context:
         f"same data_ptr={fused.data_ptr() == output.data_ptr()}, "
         f"query_rot absmax={query_rot.abs().max().item():.6g}, "
         f"fused absmax={fused.abs().max().item():.6g}, "
-        f"output absmax={output.abs().max().item():.6g}"
+        f"output absmax={output.abs().max().item():.6g}, "
+        f"workspace absmax={workspace.abs().max().item():.6g}"
+    )
+    # Prologue content probe: the rotated query must be the golden rotation,
+    # bit-exactly (the harness's NPU runner achieves 24576/24576 bytes). A
+    # mismatch here means the deployed binary's prologue is not the current
+    # source's, whatever the absmax looks like.
+    golden_rot = (emulator.rotate(query[0].float()) * emulator.inv_sqrt_len).cpu()
+    rot = query_rot.view(SERVING_NUM_HEADS, HEAD_SIZE).cpu()
+    print(
+        f"  prologue probe: query_rot bit-exact vs golden = {torch.equal(rot, golden_rot)}, "
+        f"max abs diff = {(rot - golden_rot).abs().max().item():.6g}"
     )
 
     expected = _golden_attention_fp32(golden_adapter, emulator, caches, block_tables, query, context, SERVING_SCALE)
