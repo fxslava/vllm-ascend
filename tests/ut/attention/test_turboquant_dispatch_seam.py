@@ -228,6 +228,42 @@ def test_a_missing_namespace_falls_back(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 # ---------------------------------------------------------------------------
+# Dispatch tracing
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_trace_reports_cpu_tensor_layout(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, emulator: TurboQuantEmulator
+) -> None:
+    monkeypatch.setattr(turboquant_v1, "_TURBOQUANT_TRACE_ENABLED", True)
+    caplog.set_level(logging.INFO)
+    x = torch.randn(3, HEAD_SIZE * 2)[:, ::2]
+
+    _adapter().rotate(x, emulator)
+
+    assert "op=npu_turboquant_rotate backend=CPU (PyTorch) devices=['cpu']" in caplog.text
+    assert "x(shape=(3, 64), stride=(128, 2)" in caplog.text
+    assert "device=cpu" in caplog.text
+    assert "contiguous=False" in caplog.text
+
+
+def test_dispatch_trace_reports_custom_operator(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, emulator: TurboQuantEmulator
+) -> None:
+    monkeypatch.setattr(turboquant_v1, "_TURBOQUANT_TRACE_ENABLED", True)
+    caplog.set_level(logging.INFO)
+    entry = _Recorder((torch.zeros(1, dtype=torch.int8), torch.ones(1)))
+    _register(monkeypatch, npu_turboquant_quantize_pack=entry)
+    rotated = torch.randn(3, HEAD_SIZE)
+
+    _adapter(TurboQuantKernelStage.QUANTIZE).quantize_and_pack(rotated, emulator)
+
+    assert "op=npu_turboquant_quantize_pack backend=custom torch op devices=['cpu']" in caplog.text
+    assert "rotated(shape=(3, 64)" in caplog.text
+    assert "contiguous=True" in caplog.text
+
+
+# ---------------------------------------------------------------------------
 # Rotation
 # ---------------------------------------------------------------------------
 

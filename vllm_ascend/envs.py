@@ -110,6 +110,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # discoverable with the rest of the environment. It guards the prefill batch
     # writer only -- the decode scatter writer takes arbitrary slots by design.
     "VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS": lambda: bool(int(os.getenv("VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS", "0"))),
+    # Log each TurboQuant dispatch with tensor shape, stride, dtype, device and
+    # contiguity. 0 (default): off. 1: on; diagnostic only, not for serving.
+    "VLLM_ASCEND_TURBOQUANT_TRACE": lambda: _strict_binary_env("VLLM_ASCEND_TURBOQUANT_TRACE"),
 }
 
 # end-env-vars-definition
