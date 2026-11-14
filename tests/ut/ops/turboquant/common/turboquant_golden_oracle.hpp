@@ -626,16 +626,15 @@ inline Audit audit_reference(const Reference& ref)
 // softmax(q k^T * score_scale) v over an NZ-tiled packed cache, in double.
 //
 // THE RECONSTRUCTION RULE, and where it comes from. The decode reads a byte as two SIGNED
-// nibbles (turboquant_dequant4_signed), DeInterleaves them into a low and a high plane, and adds
-// kSignedLevelOffset = kLevels/2 - kAffineBias to each before the operand cast
-// (ComputeNibbleOperands in src/common/turboquant_codec_mx.h). So a stored signed nibble n
+// nibbles (turboquant_dequant4_signed), DeInterleaves them into a low and a high plane, and casts
+// each straight to the Cube operand (ComputeNibbleOperands in src/common/turboquant_codec_mx.h):
+// the writers' convention, which the PyTorch golden shares, so a stored signed nibble n
 // reconstructs as
 //
-//   (n + kLevels/2 - kAffineBias) * stored_scale
+//   n * stored_scale
 //
-// which for KV4_FP8 (kLevels 16, kAffineBias 7.5) is (n + 0.5) * stored_scale. This is the one
-// place that rule is restated outside the codec, and `affine_offset()` below derives it from the
-// mode traits rather than hard-coding 0.5.
+// with the stored scale the whole per-row scale -- no centroid offset and no codebook gain. This
+// is the one place that rule is restated outside the codec.
 //
 // The byte and the nibble of a logical (slot, kv head, channel) come from the production address
 // functions in turboquant_layout.h, not from a copy: an oracle that restated the addressing
@@ -645,7 +644,7 @@ constexpr double affine_offset()
 {
     using Traits = vllm_ascend::turboquant::TurboQuantModeTraits<Mode>;
     static_assert(Traits::kIsAffine, "the affine reconstruction is only defined for a uniform mode");
-    return static_cast<double>(Traits::kLevels / 2) - static_cast<double>(Traits::kAffineBias);
+    return 0.0;
 }
 
 struct DecodeGeometry {

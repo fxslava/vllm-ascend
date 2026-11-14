@@ -165,11 +165,12 @@ struct TurboQuantModeTraits<TurboQuantMode::KV5_FP8> {
 //
 // The two differences from TurboQuantModeTraits are deliberate and paired:
 //
-//   * the centroids are rounded into fp8 e4m3, because here they ARE the Cube operand. The uniform grid
-//     can carry the exact code b - 7.5 (every one of those sixteen values is an e4m3 number) and leave
-//     the step to kGain, which the decode divides into the per-vector scale. A non-uniform codebook has
-//     no single step to factor out, so the reconstruction has to survive the operand cast intact -- and
-//     e4m3 keeps only 3 mantissa bits, so the table is the rounded grid or the grid is not what decodes.
+//   * the centroids are rounded into fp8 e4m3, because here they ARE the Cube operand. The shipping
+//     expand casts the signed code itself -- every nibble value in [-8, 7] is an exact e4m3 number --
+//     and the stored per-row scale is the whole scale, with nothing factored out. A non-uniform
+//     codebook likewise has no step to factor out, so its reconstruction has to survive the operand
+//     cast intact -- and e4m3 keeps only 3 mantissa bits, so the table is the rounded grid or the grid
+//     is not what decodes.
 //   * the thresholds are the exact midpoints of those ROUNDED centroids, not of the unrounded ones. The
 //     encoder's job is nearest-neighbour assignment on the codebook that actually reconstructs; using
 //     Lloyd-Max's own thresholds here would mis-assign every coordinate near a boundary the rounding moved.
@@ -205,19 +206,6 @@ struct TurboQuantLloydMaxTraits<TurboQuantMode::KV4_FP8> {
     };
 };
 
-// The gain the decode divides into the per-vector scale, for a codec instantiated with or without the
-// non-uniform codebook. A free template so the arm that is not taken is never instantiated, which is what
-// lets a mode with no TurboQuantLloydMaxTraits specialisation still name this.
-template <TurboQuantMode MODE, bool LLOYD_MAX>
-constexpr float TurboQuantCodebookGain()
-{
-    if constexpr (LLOYD_MAX) {
-        return TurboQuantLloydMaxTraits<MODE>::kGain;
-    } else {
-        return TurboQuantModeTraits<MODE>::kGain;
-    }
-}
-
 // Whether the codebook covers exactly the mode's levels, which it must: the packed nibble is an index
 // into it. Written as a function rather than inline in a static_assert because `||` does not stop a
 // static_assert's operand from being instantiated, and TurboQuantLloydMaxTraits has no definition for a
@@ -241,13 +229,15 @@ constexpr bool kStoresNzTiles = MODE == TurboQuantMode::KV4_FP8;
 // instruction sequence, never a stored format: every variant reads the same bytes at the same addresses
 // and moves the same GM traffic, which is what makes the benchmark legs comparable.
 //
-//   kNative     the shipping affine expand -- int4b_t Cast, DeInterleave, then one Adds per plane, because
-//               the operand carries the code b - 7.5 and the step folds into the score scale (kGain).
+//   kNative     the shipping affine expand -- int4b_t Cast, DeInterleave, then the operand cast,
+//               because the operand IS the signed code: the writers' contract is
+//               code * stored_scale, with no centroid offset and no gain to fold anywhere.
 //   kBypass     a timing instrument: no expand at all, the zeroed staging buffer goes to L1 instead. Its
 //               output is all-zero by construction and numerically meaningless.
-//   kGatherLut  Option C: the Adds replaced by a 16-entry UB Gather, the sequence a non-uniform codebook
-//               (Lloyd-Max) would need. The table it gathers is the uniform grid itself, so the result is
-//               bit-identical to kNative and the leg prices the instruction sequence alone, with the
+//   kGatherLut  Option C: the direct code cast replaced by a 16-entry UB Gather, the sequence a
+//               non-uniform codebook (Lloyd-Max) would need. The table it gathers holds the sixteen
+//               signed codes themselves, so the result is bit-identical to kNative and the leg prices
+//               the instruction sequence alone, with the
 //   kLloydMaxLut  kGatherLut's instruction sequence carrying the codebook it was built for: the same
 //               Gather over the same 16-entry table at the same UB cost, filled with
 //               TurboQuantLloydMaxTraits' e4m3-rounded Lloyd-Max levels instead of the uniform grid. It

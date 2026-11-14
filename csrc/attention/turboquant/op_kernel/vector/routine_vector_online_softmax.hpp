@@ -44,6 +44,18 @@ ASCEND_MICRO_ONLINE_INLINE void vector_online_softmax(Engine& engine)
     engine.update_accumulator();
 }
 
+// Split-K merge, phase for phase like the recurrence above. A token whose context exceeds the
+// fused limit leaves one [accumulator, run_max, run_sum] partial per split; merging two of them
+// is one online-softmax step with both sides weighted.
+template <class Engine>
+ASCEND_MICRO_ONLINE_INLINE void vector_merge_partials(Engine& engine)
+{
+    engine.update_max_and_weights();
+    engine.update_denominator();
+    engine.update_accumulator();
+    engine.commit_max();
+}
+
 #if defined(__CCE_AICORE__) || defined(ASCEND_MICRO_ENABLE_NATIVE)
 
 // Replicated-state invariant
@@ -183,6 +195,70 @@ struct NativeOnlineSoftmaxEngine {
         AscendC::Mul(acc_scaled, acc_prev, alpha_bc, kOnlineTile);
         AscendC::Add(acc_new, acc_scaled, weighted_sum, kOnlineTile);
     }
+};
+
+// A replicated 32-byte block out of one scalar lane. The load-distribute mode Brcb uses reads
+// exactly one block, so the source footprint matches the operand -- see the Brcb rationale above
+// for why this is never Duplicate.
+__aicore__ inline void vector_broadcast_block(
+    const AscendC::LocalTensor<float>& destination,
+    const AscendC::LocalTensor<float>& source)
+{
+    AscendC::Brcb(destination, source, 1, {1, static_cast<std::uint16_t>(kStateLanes)});
+}
+
+// destination = source * a replicated block, one whole repeat at a time with the ragged
+// remainder as a single-repeat tail. The block operand advances by nothing, so one 32-byte
+// block scales every lane it covers.
+__aicore__ inline void vector_broadcast_mul(
+    const AscendC::LocalTensor<float>& destination,
+    const AscendC::LocalTensor<float>& source,
+    const AscendC::LocalTensor<float>& block, std::uint32_t count)
+{
+    constexpr std::uint8_t whole_blocks = static_cast<std::uint8_t>(kBroadcastLanes / kStateLanes);
+    const std::uint32_t    repeats      = count / kBroadcastLanes;
+    const std::uint32_t    covered      = repeats * kBroadcastLanes;
+    const std::uint32_t    tail         = count - covered;
+    if (repeats > 0)
+        AscendC::Mul(destination, source, block, std::uint64_t{kBroadcastLanes}, static_cast<std::uint8_t>(repeats), {1, 1, 0, whole_blocks, whole_blocks, 0});
+    if (tail > 0)
+        AscendC::Mul(destination[covered], source[covered], block, std::uint64_t{tail}, 1, {1, 1, 0, 0, 0, 0});
+}
+
+// Unlike the tile recurrence, every state operand here is a SINGLE LANE and not a replicated
+// block: a merge advances one head at a time, and the two broadcast destinations are the only
+// wide operands. That is why the accumulator scaling goes through vector_broadcast_mul rather
+// than a block-strided repeat -- the weights arrive as lanes and are splatted here.
+struct NativeMergeEngine {
+    AscendC::LocalTensor<float> accumulator, partial_accumulator;
+    AscendC::LocalTensor<float> run_max, run_sum, partial_max, partial_sum;
+    AscendC::LocalTensor<float> new_max, alpha, beta;
+    AscendC::LocalTensor<float> alpha_block, beta_block;
+    std::uint32_t               channels;
+
+    __aicore__ inline void update_max_and_weights()
+    {
+        AscendC::Max(new_max, run_max, partial_max, 1);
+        AscendC::Sub(alpha, run_max, new_max, 1);
+        AscendC::Sub(beta, partial_max, new_max, 1);
+        AscendC::Exp(alpha, alpha, 1);
+        AscendC::Exp(beta, beta, 1);
+    }
+    __aicore__ inline void update_denominator()
+    {
+        AscendC::Mul(run_sum, run_sum, alpha, 1);
+        AscendC::Mul(partial_sum, partial_sum, beta, 1);
+        AscendC::Add(run_sum, run_sum, partial_sum, 1);
+    }
+    __aicore__ inline void update_accumulator()
+    {
+        vector_broadcast_block(alpha_block, alpha);
+        vector_broadcast_block(beta_block, beta);
+        vector_broadcast_mul(accumulator, accumulator, alpha_block, channels);
+        vector_broadcast_mul(partial_accumulator, partial_accumulator, beta_block, channels);
+        AscendC::Add(accumulator, accumulator, partial_accumulator, channels);
+    }
+    __aicore__ inline void commit_max() { AscendC::Adds(run_max, new_max, 0.0f, 1); }
 };
 
 #endif

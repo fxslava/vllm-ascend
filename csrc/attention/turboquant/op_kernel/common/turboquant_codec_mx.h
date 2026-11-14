@@ -54,24 +54,27 @@ struct TurboQuantPlanes<TurboQuantMode::KV5_FP8> {
 
 constexpr int32_t kMsbPerByte = 8;
 
-// GATHER_LUT swaps the affine expand's per-plane Adds for a 16-entry UB Gather -- the instruction
+// GATHER_LUT swaps the affine expand's direct code cast for a 16-entry UB Gather -- the instruction
 // sequence a non-uniform codebook would need (DecodeUnpack::kGatherLut). It is off by default, so the
 // shipping instantiation allocates no constant buffer and reads no table, exactly as before.
 //
 // LLOYD_MAX_LUT swaps the codebook the affine mode quantises on: the e4m3-rounded Lloyd-Max levels of
-// TurboQuantLloydMaxTraits in place of the uniform mid-rise grid. It changes three things and no others.
+// TurboQuantLloydMaxTraits in place of the uniform integer grid. It changes three things and no others.
 //
 //   encode   Threshold() returns the rounded grid's midpoints, so ComputeLevelBins assigns nearest
 //            neighbour on the codebook that will actually reconstruct. StageAffinePlane is untouched:
 //            bin b still stores as the signed nibble b - 8, which is why the cache layout does not move.
-//   decode   the gathered table holds the centroids instead of the grid, so the operand a nibble expands
-//            to is the reconstruction itself. This needs GATHER_LUT -- there is no Adds that produces a
+//   decode   the gathered table holds the centroids instead of the codes, so the operand a nibble expands
+//            to is the reconstruction itself. This needs GATHER_LUT -- no affine cast produces a
 //            non-uniform level -- and the decode asserts that below.
-//   gain     kGain is 1, because nothing is left factored out of the operand. The score scale and the
-//            value scale read it from here (turboquant_vector_service.h), never from the mode traits.
 //
 // The two are separable on purpose: a writer needs the codebook and no table, so it instantiates
 // <MODE, false, true> and allocates no constant buffer at all.
+//
+// THE DEQUANTISATION CONTRACT is the writers' and the PyTorch golden's: a packed signed nibble n
+// reconstructs as n * stored_scale, with the stored scale the whole per-row scale. There is no
+// centroid offset and no codebook gain anywhere in the read path -- the operand the expand produces
+// IS the code (an exact e4m3 value for every nibble), or, under LLOYD_MAX_LUT, the centroid itself.
 template <TurboQuantMode MODE, bool GATHER_LUT = false, bool LLOYD_MAX_LUT = false>
 class TurboQuantModeCodec {
 public:
@@ -85,13 +88,9 @@ public:
     static constexpr bool kIsFp4 = Traits::kOperand == TurboQuantOperand::kFp4E2m1;
     static constexpr int kBinLanes = TurboQuantCodec4::kBinLanes;
     static constexpr bool kIsAffine = Traits::kIsAffine;
-    static constexpr float kAffineBias = Traits::kAffineBias;
     static constexpr bool kGatherLut = GATHER_LUT;
     static constexpr bool kLloydMaxLut = LLOYD_MAX_LUT;
-    // What the decode divides into the per-vector scale: the mode's uniform step, or 1 when the
-    // centroids carry the reconstruction themselves.
-    static constexpr float kGain = TurboQuantCodebookGain<MODE, LLOYD_MAX_LUT>();
-    static_assert(!kGatherLut || kIsAffine, "the gather expand replaces the affine Adds; codebook modes already gather");
+    static_assert(!kGatherLut || kIsAffine, "the gather expand replaces the affine code cast; codebook modes already gather");
     static_assert(!kLloydMaxLut || kIsAffine, "the Lloyd-Max toggle replaces an affine mode's uniform grid");
     static_assert(!kLloydMaxLut || MODE == TurboQuantMode::KV4_FP8,
                   "kv4fp8 is the only mode with a TurboQuantLloydMaxTraits codebook");
@@ -311,16 +310,16 @@ public:
         ComputeNibbleOperands(dstHigh, planes[bytes], bytes);
     }
 
-    // UnpackAffine with the per-plane Adds replaced by a 16-entry UB Gather: the same nibble widen, the
+    // UnpackAffine with the code resolved through a table instead of directly: the same nibble widen, the
     // same two planes, the same fp8 operands, and the same GM traffic. What differs is only the arithmetic
     // between the DeInterleave and the operand cast, which is the quantity the benchmark leg exists to
     // price.
     //
-    // Which table is in UB decides what the same instructions compute. Without LLOYD_MAX_LUT it is the
-    // uniform grid and the operands are bit-identical to UnpackAffine's, which is what makes that leg a
-    // pure A/B on the instruction sequence. With it the table is the Lloyd-Max codebook and the operands
-    // are a different, better-conditioned reconstruction at the same cost -- the one case where this
-    // routine and UnpackAffine legitimately disagree.
+    // Which table is in UB decides what the same instructions compute. Without LLOYD_MAX_LUT it holds the
+    // sixteen signed codes themselves and the operands are bit-identical to UnpackAffine's, which is what
+    // makes that leg a pure A/B on the instruction sequence. With it the table is the Lloyd-Max codebook
+    // and the operands are a different, better-conditioned reconstruction at the same cost -- the one case
+    // where this routine and UnpackAffine legitimately disagree.
     template <typename OperandT>
     __aicore__ inline void UnpackAffineGather(const AscendC::LocalTensor<OperandT> &dstLow,
                                               const AscendC::LocalTensor<OperandT> &dstHigh,
@@ -369,7 +368,6 @@ private:
     static constexpr float kCentroidStride = static_cast<float>(sizeof(float));
     static constexpr uint32_t kSignBitShift = 31;
     static constexpr float kNibbleSignShift = static_cast<float>(Planes::kLowRadix / 2);
-    static constexpr float kSignedLevelOffset = kNibbleSignShift - kAffineBias;
     // Byte offset of bin 0 in the fp32 centroid table, so a signed nibble n lands on (n + 8) * 4.
     static constexpr float kCentroidOrigin = kNibbleSignShift * kCentroidStride;
 
@@ -431,12 +429,14 @@ private:
         AscendC::Add(low_, low_, scratch_, n);
     }
 
+    // The writers' convention end to end: the widened signed nibble IS the code, and the stored
+    // per-row scale is the whole scale. No offset, no gain -- every code in [-8, 7] is an exact
+    // e4m3 value, so the operand cast introduces no rounding of its own.
     template <typename OperandT>
     __aicore__ inline void ComputeNibbleOperands(const AscendC::LocalTensor<OperandT> &dst,
                                                  const AscendC::LocalTensor<half> &plane, const uint32_t bytes)
     {
         AscendC::Cast(msb_, plane, AscendC::RoundMode::CAST_NONE, bytes);
-        AscendC::Adds(msb_, msb_, kSignedLevelOffset, bytes);
         CastToOperand(dst, msb_, bytes);
     }
 
