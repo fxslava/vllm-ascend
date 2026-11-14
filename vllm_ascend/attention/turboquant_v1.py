@@ -3058,6 +3058,15 @@ def _stream_is_capturing() -> bool:
 # that from the first refusal instead of hardcoding a SoC test.
 TURBOQUANT_FIA_VERSION_ENV: Final[str] = "TURBOQUANT_FIA_VERSION"
 
+# 0 | 1. Debug switch for the gh=6 scale-fading investigation: with it on, the
+# fused decode is replayed on the golden path right after every kernel launch,
+# and a drift past fp16/bf16 tolerance dumps the kernel inputs to
+# tq_gh6_crash_dump/ and halts. Off by default, because the check does
+# everything the capture contract forbids on the launch path -- a dense gather,
+# an FIA call, a device-to-host max, and on failure disk writes -- which is why
+# it is an investigation tool and not a production gate.
+TURBOQUANT_DECODE_VALIDATE_ENV: Final[str] = "TURBOQUANT_DECODE_VALIDATE"
+
 
 class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
     """TurboQuant attention: staged kernels where registered, golden PyTorch elsewhere.
@@ -3540,6 +3549,8 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
             query_rot=query_rot,
         )
         if fused is not None:
+            if self._decode_validation_enabled():
+                self._validate_decode_against_golden(query, attn_metadata, output, batch_size, tiling)
             return output
 
         dense_key, dense_value = self._gather_dense_kv(attn_metadata, batch_size, query.dtype)
@@ -3555,6 +3566,85 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
         )
         output[:batch_size] = attn_output.view(batch_size, self.num_heads, self.head_size)
         return output
+
+    def _decode_validation_enabled(self) -> bool:
+        """Whether the decode/golden differential runs after each kernel launch.
+
+        Resolved once and cached, so the capture path pays one env read in the
+        lifetime of the layer. The attribute is read with ``getattr`` because
+        the capture-contract tests construct the impl with ``object.__new__``
+        and never run ``__init__``.
+        """
+        enabled = getattr(self, "_decode_validate_cached", None)
+        if enabled is None:
+            enabled = os.getenv(TURBOQUANT_DECODE_VALIDATE_ENV, "0").strip().lower() in ("1", "true", "on")
+            self._decode_validate_cached = enabled
+        return enabled
+
+    def _validate_decode_against_golden(
+        self,
+        query: torch.Tensor,
+        attn_metadata: AscendMetadata,
+        output: torch.Tensor,
+        batch_size: int,
+        tiling: torch.Tensor,
+    ) -> None:
+        """DEBUG (gh=6 scale-fading investigation): replay the decode on the golden
+        path right after the fused kernel returns, and halt with a binary dump of
+        the kernel inputs when the two drift apart past fp16/bf16 tolerance.
+
+        The dump lands in ``tq_gh6_crash_dump/`` as raw ``.bin`` files, in the
+        layout a CAModel C++ replay consumes them. The ``raise`` is deliberate:
+        it stops the engine before the next token can overwrite the evidence.
+        """
+        npu_out = output[:batch_size].clone().to(torch.float32)
+        dense_key, dense_value = self._gather_dense_kv(attn_metadata, batch_size, query.dtype)
+        golden = self._fused_infer_attention(
+            query=query[:batch_size].unsqueeze(1),
+            key=dense_key,
+            value=dense_value,
+            input_layout="BSND",
+            actual_seq_lengths=None,
+            actual_seq_lengths_kv=attn_metadata.seq_lens_list,
+            atten_mask=None,
+            sparse_mode=0,
+        )
+        golden_out = golden.view(batch_size, self.num_heads, self.head_size).to(torch.float32)
+
+        max_diff = (npu_out - golden_out).abs().max().item()
+        if max_diff <= 0.01:
+            return
+
+        logger.warning(
+            "TURBOQUANT FUSED DECODE MISMATCH: the kernel drifts from the PyTorch golden "
+            "by max abs %.6g (> 0.01) over %d token(s), %d heads x %d; dumping the kernel "
+            "inputs to tq_gh6_crash_dump/ and halting.",
+            max_diff,
+            batch_size,
+            self.num_heads,
+            self.head_size,
+        )
+        dump_dir = "tq_gh6_crash_dump"
+        os.makedirs(dump_dir, exist_ok=True)
+        tensors = {
+            "query": query[:batch_size],
+            "key_cache": self.key_cache,
+            "value_cache": self.value_cache,
+            "scale_cache": self.scale_cache,
+            "block_tables": attn_metadata.block_tables[:batch_size],
+            "context_lens": self._decode_context_lens(attn_metadata, batch_size),
+            "tiling": tiling,
+            "npu_out": npu_out,
+            "golden_out": golden_out,
+        }
+        for name, tensor in tensors.items():
+            path = os.path.join(dump_dir, f"{name}.bin")
+            tensor.detach().cpu().contiguous().numpy().tofile(path)
+            logger.warning("  dumped %s %s %s -> %s", name, tuple(tensor.shape), tensor.dtype, path)
+        raise RuntimeError(
+            f"TurboQuant fused decode diverged from the golden attention by {max_diff:.6g}; "
+            f"the kernel inputs are in {dump_dir}/ for the CAModel replay."
+        )
 
     @staticmethod
     def _decode_num_tokens(attn_metadata: AscendMetadata) -> int:
