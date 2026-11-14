@@ -128,6 +128,7 @@ from vllm.v1.attention.backends.registry import (  # type: ignore
     register_backend,
 )
 
+from vllm_ascend import envs
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionBackendImpl,
@@ -820,6 +821,41 @@ TURBOQUANT_REGISTERED_OPS: Final[tuple[str, ...]] = (
 # it did not, None not tried yet.
 _TURBOQUANT_EXTENSION_LOADED: bool | None = None
 
+# Resolve once so disabled tracing adds no environment lookup to dispatches.
+_TURBOQUANT_TRACE_ENABLED: Final[bool] = envs.VLLM_ASCEND_TURBOQUANT_TRACE
+
+
+def _trace_turboquant_dispatch(
+    op_name: str,
+    uses_npu_kernel: bool,
+    **tensors: torch.Tensor | None,
+) -> None:
+    if not _TURBOQUANT_TRACE_ENABLED:
+        return
+
+    tensor_items = [(name, tensor) for name, tensor in tensors.items() if isinstance(tensor, torch.Tensor)]
+    devices = sorted({str(tensor.device) for _, tensor in tensor_items})
+    device_types = {tensor.device.type for _, tensor in tensor_items}
+    if uses_npu_kernel:
+        backend = "NPU kernel" if "npu" in device_types else "custom torch op"
+    elif device_types == {"cpu"}:
+        backend = "CPU (PyTorch)"
+    else:
+        backend = "PyTorch"
+    tensor_layouts = "; ".join(
+        f"{name}(shape={tuple(tensor.shape)}, stride={tensor.stride()}, dtype={tensor.dtype}, "
+        f"device={tensor.device}, storage_offset={tensor.storage_offset()}, "
+        f"contiguous={tensor.is_contiguous()})"
+        for name, tensor in tensor_items
+    )
+    logger.info(
+        "TurboQuant dispatch: op=%s backend=%s devices=%s tensors=[%s]",
+        op_name,
+        backend,
+        devices or "none",
+        tensor_layouts,
+    )
+
 
 def _is_op_registered(namespace: str, op_name: str) -> bool:
     """Whether ``namespace::op_name`` has a kernel in the dispatcher.
@@ -1061,6 +1097,7 @@ class TurboQuantOpsAdapter:
     def rotate(self, x: torch.Tensor, emulator: TurboQuantEmulator) -> torch.Tensor:
         """Ingress rotation ``y = Pi x`` over the last axis: ``[..., D] -> [..., D]`` fp32."""
         if self._has_kernel(TURBOQUANT_OP_ROTATE):
+            _trace_turboquant_dispatch(TURBOQUANT_OP_ROTATE, True, x=x)
             return self._kernel_rotate(
                 x=x,
                 pi_signs=emulator.pi_signs,
@@ -1069,11 +1106,13 @@ class TurboQuantOpsAdapter:
                 output_stage=TURBOQUANT_STAGE_ROTATED_BASIS,
                 inv_sqrt_len=1.0,
             )
+        _trace_turboquant_dispatch(TURBOQUANT_OP_ROTATE, False, x=x)
         return self._golden_rotate(x, emulator)
 
     def inverse_rotate(self, y: torch.Tensor, emulator: TurboQuantEmulator) -> torch.Tensor:
         """Egress rotation ``x = Pi^T y / sqrt(D)``: ``[..., D] -> [..., D]`` fp32."""
         if self._has_kernel(TURBOQUANT_OP_ROTATE):
+            _trace_turboquant_dispatch(TURBOQUANT_OP_ROTATE, True, y=y)
             return self._kernel_rotate(
                 x=y,
                 pi_signs=emulator.pi_signs,
@@ -1082,6 +1121,7 @@ class TurboQuantOpsAdapter:
                 output_stage=TURBOQUANT_STAGE_UNROTATED,
                 inv_sqrt_len=emulator.inv_sqrt_len,
             )
+        _trace_turboquant_dispatch(TURBOQUANT_OP_ROTATE, False, y=y)
         return self._golden_inverse_rotate(y, emulator)
 
     def _kernel_rotate(
@@ -1120,7 +1160,9 @@ class TurboQuantOpsAdapter:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``[..., D]`` rotated fp32 -> (``[..., D/2]`` INT8 bytes, ``[...]`` fp32 scales)."""
         if self._has_kernel(TURBOQUANT_OP_QUANTIZE_PACK):
+            _trace_turboquant_dispatch(TURBOQUANT_OP_QUANTIZE_PACK, True, rotated=rotated)
             return self._kernel_quantize_pack(rotated=rotated, inv_sqrt_len=emulator.inv_sqrt_len)
+        _trace_turboquant_dispatch(TURBOQUANT_OP_QUANTIZE_PACK, False, rotated=rotated)
         return self._golden_quantize_pack(rotated, emulator)
 
     def unpack_and_dequantize(
@@ -1128,7 +1170,9 @@ class TurboQuantOpsAdapter:
     ) -> torch.Tensor:
         """(``[..., D/2]`` bytes, ``[...]`` fp32 scales) -> ``[..., D]`` fp32, still rotated."""
         if self._has_kernel(TURBOQUANT_OP_UNPACK_DEQUANT):
+            _trace_turboquant_dispatch(TURBOQUANT_OP_UNPACK_DEQUANT, True, packed=packed, scales=scales)
             return self._kernel_unpack_dequant(packed=packed, scales=scales)
+        _trace_turboquant_dispatch(TURBOQUANT_OP_UNPACK_DEQUANT, False, packed=packed, scales=scales)
         return self._golden_unpack_dequant(packed, scales, emulator)
 
     def _kernel_quantize_pack(self, rotated: torch.Tensor, inv_sqrt_len: float) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1196,6 +1240,16 @@ class TurboQuantOpsAdapter:
                 emulator=emulator,
             )
             return
+        _trace_turboquant_dispatch(
+            TURBOQUANT_OP_RESHAPE_AND_CACHE,
+            False,
+            key=key,
+            value=value,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            scale_cache=scale_cache,
+            slot_mapping=slot_mapping,
+        )
         self._golden_reshape_and_cache_prefill(key, value, key_cache, value_cache, scale_cache, slot_mapping, emulator)
 
     def _kernel_ingest_prefill(
@@ -1350,6 +1404,18 @@ class TurboQuantOpsAdapter:
         the constraint is only that ``num_tokens`` stay a whole multiple of it
         (``WholeStrips``, which the launcher throws on).
         """
+        _trace_turboquant_dispatch(
+            TURBOQUANT_OP_RESHAPE_AND_CACHE,
+            True,
+            key=key,
+            value=value,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            scale_cache=scale_cache,
+            slot_mapping=slot_mapping,
+            pi_signs=pi_signs,
+            tables=tables,
+        )
         self._require_kernel(TURBOQUANT_OP_RESHAPE_AND_CACHE)(
             key,
             value,
@@ -1394,6 +1460,17 @@ class TurboQuantOpsAdapter:
         skipped, which is what a graph-capture dummy run feeds.
         """
         if self._has_kernel(TURBOQUANT_OP_RESHAPE_SCATTER):
+            _trace_turboquant_dispatch(
+                TURBOQUANT_OP_RESHAPE_SCATTER,
+                True,
+                key=key,
+                value=value,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                scale_cache=scale_cache,
+                slot_mapping=slot_mapping,
+                pi_signs=emulator.pi_signs,
+            )
             self._kernel_reshape_scatter_aiv(
                 key=key,
                 value=value,
@@ -1405,6 +1482,16 @@ class TurboQuantOpsAdapter:
                 inv_sqrt_len=emulator.inv_sqrt_len,
             )
             return
+        _trace_turboquant_dispatch(
+            TURBOQUANT_OP_RESHAPE_SCATTER,
+            False,
+            key=key,
+            value=value,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            scale_cache=scale_cache,
+            slot_mapping=slot_mapping,
+        )
         self._golden_reshape_scatter_decode(key, value, key_cache, value_cache, scale_cache, slot_mapping, emulator)
 
     def _kernel_reshape_scatter_aiv(
@@ -1717,12 +1804,28 @@ class TurboQuantOpsAdapter:
         writer ran.
         """
         if self._has_kernel(TURBOQUANT_OP_GATHER_PAGES):
+            _trace_turboquant_dispatch(
+                TURBOQUANT_OP_GATHER_PAGES,
+                True,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                scale_cache=scale_cache,
+                block_tables=block_tables,
+            )
             return self._kernel_gather_pages(
                 key_cache=key_cache,
                 value_cache=value_cache,
                 scale_cache=scale_cache,
                 block_tables=block_tables,
             )
+        _trace_turboquant_dispatch(
+            TURBOQUANT_OP_GATHER_PAGES,
+            False,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            scale_cache=scale_cache,
+            block_tables=block_tables,
+        )
         layout = self.value_layout()
         if layout is TurboQuantValueLayout.CHANNEL_MAJOR:
             return self._golden_gather_pages_strip(key_cache, value_cache, scale_cache, block_tables)
@@ -1937,7 +2040,38 @@ class TurboQuantOpsAdapter:
         says so.
         """
         if not self._has_kernel(TURBOQUANT_OP_FUSED_DECODE):
+            _trace_turboquant_dispatch(
+                TURBOQUANT_OP_FUSED_DECODE,
+                False,
+                query=query,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                scale_cache=scale_cache,
+                block_tables=block_tables,
+                context_lens=context_lens,
+                output=output,
+                tiling=tiling,
+                workspace=workspace,
+                query_rot=query_rot,
+            )
             return None
+        _trace_turboquant_dispatch(
+            TURBOQUANT_OP_FUSED_DECODE,
+            True,
+            query=query,
+            pi_signs=emulator.pi_signs,
+            rot_tables=emulator.codec_tables,
+            h16=emulator.h16,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            scale_cache=scale_cache,
+            block_tables=block_tables,
+            context_lens=context_lens,
+            tiling=tiling,
+            workspace=workspace,
+            query_rot=query_rot,
+            output=output,
+        )
         return self._kernel_fused_decode(
             query=query,
             pi_signs=emulator.pi_signs,
@@ -2725,6 +2859,12 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
                 f"Mamba/kpool page alignment in vllm_ascend.patch.platform.patch_mamba_config; "
                 f"otherwise it is the --block-size the engine was started with."
             )
+        _trace_turboquant_dispatch(
+            TURBOQUANT_OP_BUILD_DECODE_TILING,
+            True,
+            context_lens=host_context_lens[:tokens],
+            tiling=self._tiling,
+        )
         entry(
             host_context_lens[:tokens],
             self._tiling,
