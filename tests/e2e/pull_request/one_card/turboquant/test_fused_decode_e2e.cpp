@@ -279,8 +279,6 @@ int run(bool camodel_smoke)
     std::set<int> splits_seen, kv_heads_seen;
 
     for (const Rung& rung : ladder) {
-        // One fixture per rung: the oracle is the expensive part and the split count changes
-        // only how the work is partitioned, never the answer.
         const Fixture f(rung.context, rung.requests, rung.kv_heads, rung.group_heads, kPageTokens,
                         fused_decode_fixture::Element::kBf16);
         CanaryPlan plan = plan_canaries(f);

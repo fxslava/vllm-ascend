@@ -59,7 +59,7 @@
 // block_size 16 the NZ plane does not even fit: its tile row stride is 64, so a
 // 16-token page would address 6656 bytes to store 2048.
 //
-// Why that was fatal rather than cosmetic: StageNzTileToL1 nibble-expands with
+// Why that was fatal rather than cosmetic: StageTileToL1 nibble-expands with
 // DeInterleave (op_kernel/common/turboquant_codec_mx.h, UnpackAffine), which
 // sends every byte's low nibble to one contiguous L1 plane and every high
 // nibble to another. Under the NZ plane the low plane is channels 0..127 of all

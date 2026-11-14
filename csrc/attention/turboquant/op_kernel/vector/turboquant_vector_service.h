@@ -14,9 +14,8 @@
  * limitations under the License.
  */
 
-// Vector-unit services of the TurboQuant decodes.
+// Vector-unit services of the TurboQuant decode.
 //
-//   TurboQuantTileBurst            DMA: one tile of a row-major packed cache in wide GM bursts (>= 128 B)
 //   NormalizeHeads / WriteHeads    online softmax close-out: 1 / (sum + eps), then cast and direct GM write;
 //                                  WriteNormalizedHeads is the two back to back
 //   TurboQuantRotatedOutput        the output stage of a decode that writes the rotated basis: nothing
@@ -24,10 +23,15 @@
 //   TurboQuantVectorDecodeService  the AIV half of the Cube decode: query and KV staging into L1,
 //                                  the online softmax over the Cube's score rows, the accumulation
 //
-// The first four are shared by the AIV-only and the Cube decodes. Nothing here names a Cube type,
-// so the AIV-only decode (which the wheel also builds for arch32) can include this header; the Cube
-// decode service takes its Cube and codec types as template parameters. The raw-query Cube decode's
-// query rotation and output stage are in cube/turboquant_query_basis.h.
+// EVERY PIECE OF ARITHMETIC HERE IS A CALL INTO ascend_micro. This file owns buffers, DMA, hard
+// events and the GM ABI; the routine_*.hpp leaf routines own the vector instructions and may not
+// touch an event or a flag. That split is what lets the recurrence be audited on the host
+// (tests/cpu/test_contract_gates.cpp drives the engines with a duck-typed phase recorder) while
+// the pipeline around it is only meaningful on a device.
+//
+// The pipeline ITSELF lives in turboquant_fused_decode.cpp, which schedules these calls as a
+// prologue, a modulo-scheduled steady state and a drain. The public surface below is grouped by
+// the stage it serves so the two files read against each other.
 
 #ifndef VLLM_ASCEND_ATTENTION_TURBOQUANT_VECTOR_SERVICE_H
 #define VLLM_ASCEND_ATTENTION_TURBOQUANT_VECTOR_SERVICE_H
@@ -44,126 +48,22 @@ namespace turboquant {
 constexpr float kVectorNegInf = -3.4028235e38f;
 
 // ----------------------------------------------------------------------------------------------------
-// DMA tile handling
-// ----------------------------------------------------------------------------------------------------
-
-// Reads one kv-head plane of a row-major tile in wide contiguous GM bursts and never below kMinBurstBytes
-// per descriptor. Three layouts:
-//   one kv head          one contiguous tileRows * packedBytes read
-//   packedBytes >= 128   one head's packedBytes per row, strided over the other heads
-//   packedBytes <  128   the whole row plane into a UB bank, then select the head in UB
-// ReadTileRows() is the MTE2 half and SelectKvHeadRows() the vector half of the last layout; the caller
-// owns the MTE2 -> V event between them.
-class TurboQuantTileBurst {
-public:
-    __aicore__ inline void Init(AscendC::TPipe *pipe, const uint32_t numKvHeads, const uint32_t packedBytes,
-                                const uint32_t tileRows, const uint32_t planes)
-    {
-        Init(pipe, numKvHeads, packedBytes, numKvHeads * packedBytes, tileRows, planes);
-    }
-
-    __aicore__ inline void Init(AscendC::TPipe *pipe, const uint32_t numKvHeads, const uint32_t packedBytes,
-                                const uint32_t packedPlane, const uint32_t tileRows, const uint32_t planes)
-    {
-        numKvHeads_ = numKvHeads;
-        packedBytes_ = packedBytes;
-        tileRows_ = tileRows;
-        planeBytes_ = tileRows * packedPlane;
-        gatherHeadRows_ = packedBytes % kOperandC0 != 0;
-        readsWholeRows_ = (gatherHeadRows_ || (numKvHeads > 1 && packedBytes < kMinBurstBytes)) ? 1u : 0u;
-        kvHeadRowParams_ =
-            AscendC::DataCopyParams{static_cast<uint16_t>(tileRows), static_cast<uint16_t>(packedBytes / kOperandC0),
-                                    static_cast<uint16_t>((numKvHeads - 1) * packedBytes / kOperandC0), 0};
-        if (readsWholeRows_ != 0) {
-            pipe->InitBuffer(rowBankBuf_, planes * planeBytes_ * sizeof(int8_t));
-        }
-        if (gatherHeadRows_) {
-            const uint32_t wordsPerHead = tileRows * packedBytes / sizeof(uint32_t);
-            pipe->InitBuffer(headGatherOffsetBuf_, numKvHeads * wordsPerHead * sizeof(uint32_t));
-            const AscendC::LocalTensor<uint32_t> offsets = headGatherOffsetBuf_.Get<uint32_t>();
-            for (uint32_t head = 0; head < numKvHeads; ++head) {
-                for (uint32_t row = 0; row < tileRows; ++row) {
-                    for (uint32_t word = 0; word < packedBytes / sizeof(uint32_t); ++word) {
-                        offsets.SetValue(head * wordsPerHead + row * packedBytes / sizeof(uint32_t) + word,
-                                         row * packedPlane + head * packedBytes + word * sizeof(uint32_t));
-                    }
-                }
-            }
-            SyncScalarToVector();
-        }
-    }
-
-    __aicore__ inline bool ReadsWholeRows() const { return readsWholeRows_ != 0; }
-
-    __aicore__ inline void ReadTileRows(const AscendC::LocalTensor<int8_t> &dst, AscendC::GlobalTensor<int8_t> &cacheGm,
-                                        const uint64_t rowOffset, const uint32_t kvHead, const uint32_t plane)
-    {
-        if (readsWholeRows_ != 0) {
-            AscendC::DataCopy(rowBankBuf_.Get<int8_t>()[plane * planeBytes_], cacheGm[rowOffset], planeBytes_);
-        } else if (numKvHeads_ == 1) {
-            AscendC::DataCopy(dst, cacheGm[rowOffset], tileRows_ * packedBytes_);
-        } else {
-            AscendC::DataCopy(dst, cacheGm[rowOffset + static_cast<uint64_t>(kvHead) * packedBytes_],
-                              kvHeadRowParams_);
-        }
-    }
-
-    __aicore__ inline void SelectKvHeadRows(const AscendC::LocalTensor<int8_t> &dst, const uint32_t kvHead,
-                                            const uint32_t plane)
-    {
-        if (readsWholeRows_ != 0) {
-            if (gatherHeadRows_) {
-                const uint32_t wordsPerHead = tileRows_ * packedBytes_ / sizeof(uint32_t);
-                AscendC::Gather(dst.ReinterpretCast<float>(),
-                                rowBankBuf_.Get<int8_t>()[plane * planeBytes_].ReinterpretCast<float>(),
-                                headGatherOffsetBuf_.Get<uint32_t>()[kvHead * wordsPerHead], kGatherSrcBase,
-                                wordsPerHead);
-                AscendC::PipeBarrier<PIPE_V>();
-            } else {
-                AscendC::DataCopy(dst, rowBankBuf_.Get<int8_t>()[plane * planeBytes_ + kvHead * packedBytes_],
-                                  kvHeadRowParams_);
-            }
-        }
-    }
-
-private:
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> rowBankBuf_;
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> headGatherOffsetBuf_;
-    AscendC::DataCopyParams kvHeadRowParams_;
-    uint32_t numKvHeads_ = 0;
-    uint32_t packedBytes_ = 0;
-    uint32_t tileRows_ = 0;
-    uint32_t planeBytes_ = 0;
-    uint32_t readsWholeRows_ = 0;
-    bool gatherHeadRows_ = false;
-};
-
-// ----------------------------------------------------------------------------------------------------
 // Online softmax close-out
 // ----------------------------------------------------------------------------------------------------
 
 // Normalises `heads` accumulators by 1 / (runSum + eps) in place. runSum holds one kFp32PerBlock lane per
 // head; sums and invs need heads * kFp32PerBlock floats each. Requires headSize to be a multiple of
 // kFp32PerRepeat.
+//
+// A shim over ascend_micro::vector_cube_normalize_heads, kept at this signature because
+// cube/turboquant_gemm_reduce_service.h re-exports the name and static_asserts the Brcb footprint
+// of the `sums` operand against its own UB lane map. The routine's own comment states that
+// footprint; do not narrow either broadcast operand on either side of this call.
 __aicore__ inline void NormalizeHeads(const AscendC::LocalTensor<float> &acc, const AscendC::LocalTensor<float> &runSum,
                                       const uint32_t heads, const uint32_t headSize,
                                       const AscendC::LocalTensor<float> &sums, const AscendC::LocalTensor<float> &invs)
 {
-    const uint8_t rowBlocks = static_cast<uint8_t>(headSize / kFp32PerBlock);
-    const AscendC::BinaryRepeatParams rowRepeat{1, 1, 0, rowBlocks, rowBlocks, 1};
-
-    for (uint32_t j = 0; j < heads; ++j) {
-        AscendC::Adds(runSum[j * kFp32PerBlock], runSum[j * kFp32PerBlock], TurboQuantCodec4::kEps, 1);
-    }
-    for (uint32_t j = 0; j < heads; ++j) {
-        AscendC::Brcb(sums[j * kFp32PerBlock], runSum[j * kFp32PerBlock], 1, {1, static_cast<uint16_t>(kFp32PerBlock)});
-    }
-    AscendC::Duplicate(invs, 1.0f, heads * kFp32PerBlock);
-    AscendC::Div(invs, invs, sums, heads * kFp32PerBlock);
-    for (uint32_t col = 0; col < headSize; col += kFp32PerRepeat) {
-        AscendC::Mul(acc[col], acc[col], invs, static_cast<uint64_t>(kFp32PerRepeat), static_cast<uint8_t>(heads),
-                     rowRepeat);
-    }
+    ascend_micro::vector_cube_normalize_heads(acc, runSum, sums, invs, heads, headSize, TurboQuantCodec4::kEps);
 }
 
 // Casts `heads` fp32 rows to the output type in UB and writes them to GM in one burst.
@@ -175,6 +75,9 @@ __aicore__ inline void NormalizeHeads(const AscendC::LocalTensor<float> &acc, co
 // both listed CAST_RINT pairs on 950PR (type_conversion/Cast.md), so the same call serves both
 // instances and the bf16 instance differs from the fp16 one by this rounding and nothing else.
 // bf16's 8 significand bits against fp16's 11 make the step coarser, not the arithmetic different.
+//
+// Not a leaf routine, and deliberately not one: it owns the V -> MTE3 and MTE3 -> V hand-offs
+// around its GM burst, which is exactly what a routine_*.hpp routine may not do.
 template <typename scalar_t>
 __aicore__ inline void WriteHeads(const AscendC::LocalTensor<float> &acc, const uint32_t heads, const uint32_t headSize,
                                   const AscendC::LocalTensor<scalar_t> &out, AscendC::GlobalTensor<scalar_t> &outputGm,
@@ -234,16 +137,16 @@ public:
     __aicore__ inline void Init(__gm__ void *workspace, __gm__ void *output, const uint32_t numHeads,
                                 const uint32_t headSize, const uint32_t numSplits)
     {
-        numHeads_ = numHeads;
-        headSize_ = headSize;
-        numSplits_ = numSplits;
+        numHeads_      = numHeads;
+        headSize_      = headSize;
+        numSplits_     = numSplits;
         partialStride_ = headSize + kPartialTail;
 
         workspaceGm_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(workspace));
         outputGm_.SetGlobalBuffer(reinterpret_cast<__gm__ scalar_t *>(output));
 
         pipe_->InitBuffer(accBuf_, (2 * headSize_ + kPartialTail) * sizeof(float));
-        pipe_->InitBuffer(stateBuf_, kStateLanes * kFp32PerBlock * sizeof(float));
+        pipe_->InitBuffer(stateBuf_, kMergeStateLanes * kFp32PerBlock * sizeof(float));
         pipe_->InitBuffer(blockBuf_, (2 * kBrcbDstLanes + 2 * kFp32PerBlock) * sizeof(float));
         pipe_->InitBuffer(outBuf_, headSize_ * sizeof(scalar_t));
         // Init boundary: drains every pipe before the reduction's first GM read of the split partials.
@@ -257,81 +160,78 @@ public:
     }
 
     // `finisher` sees the merged, normalised head before it is cast and written (TurboQuantRotatedOutput).
+    //
+    // The PipeBarrier<PIPE_V> below is an overlapping write and not a hand-off: the runMax lane lies
+    // inside the state block the Duplicate above it has just zeroed.
     template <typename Finisher>
     __aicore__ inline void Reduce(const uint32_t token, const uint32_t head, Finisher &finisher)
     {
-        const AscendC::LocalTensor<float> acc = accBuf_.Get<float>();
-        const AscendC::LocalTensor<float> partAcc = acc[headSize_];
+        const AscendC::LocalTensor<float> acc       = accBuf_.Get<float>();
+        const AscendC::LocalTensor<float> partAcc   = acc[headSize_];
         const AscendC::LocalTensor<float> partState = acc[2 * headSize_];
-        const AscendC::LocalTensor<float> partMax = partState[kPartialMaxLane];
-        const AscendC::LocalTensor<float> partSum = partState[kPartialSumLane];
+        const AscendC::LocalTensor<float> state     = stateBuf_.Get<float>();
+        const AscendC::LocalTensor<float> blocks    = blockBuf_.Get<float>();
 
-        const AscendC::LocalTensor<float> state = stateBuf_.Get<float>();
-        const AscendC::LocalTensor<float> runMax = state[kPartialMaxLane];
-        const AscendC::LocalTensor<float> runSum = state[kPartialSumLane];
-        const AscendC::LocalTensor<float> newMax = state[2 * kFp32PerBlock];
-        const AscendC::LocalTensor<float> alpha = state[3 * kFp32PerBlock];
-        const AscendC::LocalTensor<float> beta = state[4 * kFp32PerBlock];
-
-        const AscendC::LocalTensor<float> blocks = blockBuf_.Get<float>();
-        const AscendC::LocalTensor<float> alphaBlock = blocks;
-        const AscendC::LocalTensor<float> betaBlock = blocks[kBrcbDstLanes];
-        const AscendC::LocalTensor<float> sums = blocks[2 * kBrcbDstLanes];
-        const AscendC::LocalTensor<float> invs = blocks[2 * kBrcbDstLanes + kFp32PerBlock];
+        ascend_micro::NativeMergeEngine merge{acc,
+                                              partAcc,
+                                              state[kPartialMaxLane],
+                                              state[kPartialSumLane],
+                                              partState[kPartialMaxLane],
+                                              partState[kPartialSumLane],
+                                              state[kMergeNewMaxLane],
+                                              state[kMergeAlphaLane],
+                                              state[kMergeBetaLane],
+                                              blocks[kMergeAlphaBlock],
+                                              blocks[kMergeBetaBlock],
+                                              headSize_};
 
         AscendC::Duplicate(acc, 0.0f, headSize_);
-        AscendC::Duplicate(state, 0.0f, kStateLanes * kFp32PerBlock);
-        // Overlapping write: runMax lies inside the state the Duplicate above just zeroed.
+        AscendC::Duplicate(state, 0.0f, kMergeStateLanes * kFp32PerBlock);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Duplicate(runMax, kVectorNegInf, 1);
+        AscendC::Duplicate(merge.run_max, kVectorNegInf, 1);
 
         for (uint32_t split = 0; split < numSplits_; ++split) {
             SyncVectorToMte2();
             AscendC::DataCopy(partAcc, workspaceGm_[PartialOffset(token, head, split)], partialStride_);
             SyncMte2ToVector();
-
-            AscendC::Max(newMax, runMax, partMax, 1);
-            AscendC::Sub(alpha, runMax, newMax, 1);
-            AscendC::Sub(beta, partMax, newMax, 1);
-            AscendC::Exp(alpha, alpha, 1);
-            AscendC::Exp(beta, beta, 1);
-            AscendC::Mul(runSum, runSum, alpha, 1);
-            AscendC::Mul(partSum, partSum, beta, 1);
-            AscendC::Add(runSum, runSum, partSum, 1);
-
-            BroadcastScalar(alphaBlock, alpha);
-            BroadcastScalar(betaBlock, beta);
-            TurboQuantCodec4::BroadcastMul(acc, acc, alphaBlock, headSize_);
-            TurboQuantCodec4::BroadcastMul(partAcc, partAcc, betaBlock, headSize_);
-            AscendC::Add(acc, acc, partAcc, headSize_);
-            AscendC::Adds(runMax, newMax, 0.0f, 1);
+            ascend_micro::vector_merge_partials(merge);
         }
 
-        NormalizeHeads(acc, runSum, 1, headSize_, sums, invs);
+        NormalizeHeads(acc, merge.run_sum, 1, headSize_, blocks[kMergeSums], blocks[kMergeInvs]);
         finisher.FinishHeads(acc, token, head, 1);
         WriteHeads<scalar_t>(acc, 1, headSize_, outBuf_.Get<scalar_t>(), outputGm_,
                              (static_cast<uint64_t>(token) * numHeads_ + head) * headSize_);
     }
 
 private:
-    static constexpr uint32_t kStateLanes = 5;
+    // The merge's state block, one lane per field: the running pair the partials fold into, the
+    // new maximum, and the two exponential weights.
+    static constexpr uint32_t kMergeNewMaxLane = 2 * kFp32PerBlock;
+    static constexpr uint32_t kMergeAlphaLane  = 3 * kFp32PerBlock;
+    static constexpr uint32_t kMergeBetaLane   = 4 * kFp32PerBlock;
+    static constexpr uint32_t kMergeStateLanes = 5;
+    // The two Brcb destinations, then NormalizeHeads' own pair.
+    static constexpr uint32_t kMergeAlphaBlock = 0;
+    static constexpr uint32_t kMergeBetaBlock  = kBrcbDstLanes;
+    static constexpr uint32_t kMergeSums       = 2 * kBrcbDstLanes;
+    static constexpr uint32_t kMergeInvs       = 2 * kBrcbDstLanes + kFp32PerBlock;
 
     __aicore__ inline uint64_t PartialOffset(const uint32_t token, const uint32_t head, const uint32_t split) const
     {
         return ((static_cast<uint64_t>(token) * numHeads_ + head) * numSplits_ + split) * partialStride_;
     }
 
-    AscendC::TPipe *pipe_;
+    AscendC::TPipe                            *pipe_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> accBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> stateBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> blockBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> outBuf_;
-    AscendC::GlobalTensor<float> workspaceGm_;
-    AscendC::GlobalTensor<scalar_t> outputGm_;
-    uint32_t numHeads_ = 0;
-    uint32_t headSize_ = 0;
-    uint32_t numSplits_ = 1;
-    uint32_t partialStride_ = 0;
+    AscendC::GlobalTensor<float>                 workspaceGm_;
+    AscendC::GlobalTensor<scalar_t>              outputGm_;
+    uint32_t                                     numHeads_      = 0;
+    uint32_t                                     headSize_      = 0;
+    uint32_t                                     numSplits_     = 1;
+    uint32_t                                     partialStride_ = 0;
 };
 
 // ----------------------------------------------------------------------------------------------------
@@ -344,9 +244,9 @@ __aicore__ inline constexpr float OperandMax()
     return TurboQuantModeTraits<MODE>::kOperand == TurboQuantOperand::kFp4E2m1 ? 6.0f : 448.0f;
 }
 
-// The ring-buffered tile ingest and the head-batched softmax, validated on kv4fp8 only. The other modes
-// keep the lock-step ingest and the per-head softmax they were verified with. kv4fp8 batches even one
-// head per subcore: the per-head path's Level-2 reduces cost more than the row repeats
+// The ring-buffered tile ingest and the head-batched softmax, validated on kv4fp8 only. kv4fp8
+// batches even one head per subcore: a per-head path's Level-2 reduces cost more than the row
+// repeats. No other mode has a verified ingest here -- see the class static_asserts.
 template <TurboQuantMode MODE>
 constexpr bool kBatchedCubeDecode = MODE == TurboQuantMode::KV4_FP8;
 
@@ -354,38 +254,33 @@ constexpr bool kBatchedCubeDecode = MODE == TurboQuantMode::KV4_FP8;
 // Fixpipe splits M rows in half, so subcore 0 owns rows [0, ceil(M/2)) and subcore 1 the rest.
 struct TurboQuantTaskHeads {
     uint32_t first = 0;
-    uint32_t rows = 0;
-    uint32_t base = 0;
-    uint32_t mine = 0;
+    uint32_t rows  = 0;
+    uint32_t base  = 0;
+    uint32_t mine  = 0;
 };
 
 // Mm is the Cube BMM service (TurboQuantCubeMm<MODE>) that owns the L1 operand slots, and Codec the
-// mode's KV codec. Subcore 0 stages the K plane of every tile and subcore 1 the V plane. An NZ-tiled
-// cache (kv4fp8) is read one (tile, kv head) per burst and unpacked straight into NZ order; the
-// row-major modes read through TurboQuantTileBurst and unpack in bands.
+// mode's KV codec. Subcore 0 stages the K plane of every tile and subcore 1 the V plane. The cache is
+// NZ-tiled: one (tile, kv head) is read per burst and unpacked straight into NZ order.
 //
-// The batched decode keeps every per-head scalar of the softmax broadcast over its head's 8-lane block:
-// one wide op advances all heads, the same field is the block operand of a row op, and lane j * 8 still
-// holds head j's value for the per-task readers the two decodes share.
+// The decode keeps every per-head scalar of the softmax broadcast over its head's 8-lane block: one
+// wide op advances all heads, the same field is the block operand of a row op, and lane j * 8 still
+// holds head j's value for the per-task readers.
 //
-// UNPACK selects the expand. Two of the three non-default variants are measurement instruments and one
-// is a codec. DecodeUnpack::kGatherLut swaps the per-plane Adds for a 16-entry UB Gather at identical
-// traffic and identical output (its table is the uniform grid), which prices Option C of
-// e4m3-rounded Lloyd-Max table: same traffic, same instructions, a different and better reconstruction,
-// so it is the one variant whose output is meant to differ, and the one whose cache has to be written by
-// a writer on the same codebook. DecodeUnpack::kBypass is the ablation. It drops the
-// codec expand out of the ingest and stages the (zeroed, once, in Init) operand buffer into L1 instead.
-// Every other byte still moves: the MTE2 read of the packed plane, the MTE3 burst into L1, the Cube's
-// loads and MACs, and the whole softmax. What disappears is exactly the vector-pipe expand, so the delta
-// against the unablated leg is the unpack's cycle cost with its memory traffic held fixed. The output is
-// deterministic (all-zero scores) and numerically meaningless; nothing but a benchmark may instantiate it.
+// THIS SERVICE IS PINNED TO ONE SHAPE, and the static_asserts below say so rather than carrying
+// branches nothing instantiates. turboquant_fused_decode.cpp declares exactly two kernels, both
+// KV4_FP8 / bfloat16_t / DecodeUnpack::kNative, and both host launchers refuse any other mode
+// before the grid is sized. Every `if constexpr` that used to pick a row-major ingest, a per-head
+// softmax, a gather expand or the bypass ablation was therefore unreachable, and an unreachable
+// path on a kernel this hard to test is worse than no path: it reads as verified and is not. A
+// fifth mode or a second expand comes back as a routine plus a static_assert that admits it, not
+// as a branch nobody runs.
 //
-// RING_SLOTS, SCORE_WINDOWS and BANK_SKEW are the pipeline's shape, and their defaults are the lock-step
-// decode exactly as it shipped: a two-slot ingest ring, one score window, no skew. The modulo-scheduled
-// decode (turboquant_fused_decode_opt.cpp) deepens the ring to kCubePipelineSlots, takes kCubeScoreWindows
-// score windows so the Cube's next score GEMM does not wait on this tile's softmax, and asks for
-// kBankSkewBytes between the ingest buffers. Everything that is per-slot was already indexed by slot;
-// what the window count adds is a second Fixpipe destination for the scores.
+// RING_SLOTS, SCORE_WINDOWS and BANK_SKEW are the pipeline's shape. The modulo-scheduled decode
+// takes kCubePipelineSlots ingest slots, kCubeScoreWindows score windows so the Cube's next score
+// GEMM does not wait on this tile's softmax, and kBankSkewBytes between the ingest buffers.
+// Everything that is per-slot is indexed by slot; what the window count adds is a second Fixpipe
+// destination for the scores.
 template <TurboQuantMode MODE, typename scalar_t, typename Mm, typename Codec,
           DecodeUnpack UNPACK = DecodeUnpack::kNative, uint32_t RING_SLOTS = kCubeSlots,
           uint32_t SCORE_WINDOWS = 1, uint32_t BANK_SKEW = 0>
@@ -394,12 +289,16 @@ public:
     using OperandT = typename Mm::OperandT;
     static constexpr bool kBatched = kBatchedCubeDecode<MODE>;
     static constexpr bool kNzTiled = kStoresNzTiles<MODE>;
-    static constexpr bool kBypassUnpack = UNPACK == DecodeUnpack::kBypass;
-    static constexpr bool kGatherUnpack = DecodeUnpackGathers(UNPACK);
-    static constexpr bool kLloydMaxUnpack = DecodeUnpackIsLloydMax(UNPACK);
-    static_assert(kGatherUnpack == Codec::kGatherLut, "the service and its codec disagree on the expand");
-    static_assert(kLloydMaxUnpack == Codec::kLloydMaxLut, "the service and its codec disagree on the codebook");
+    static_assert(MODE == TurboQuantMode::KV4_FP8,
+                  "the only decode kernels declared are kv4fp8; another mode needs its ingest and "
+                  "softmax verified here before this service will carry it");
+    static_assert(UNPACK == DecodeUnpack::kNative,
+                  "the gather expands and the bypass ablation are not instantiated; add one back as "
+                  "a routine, not as a branch on the tile path");
+    static_assert(kBatched, "kv4fp8 batches its heads; the per-head softmax path is gone");
+    static_assert(kNzTiled, "kv4fp8 streams NZ-tiled planes; the row-major burst path is gone");
     static_assert(kNzTiled == Codec::kIsAffine, "only the byte-wise affine expand streams an NZ-tiled plane");
+    static_assert(!Codec::kGatherLut && !Codec::kLloydMaxLut, "the service and its codec disagree on the expand");
     // scalar_t is the OUTPUT element type only. The Cube operands are OperandT, which comes from MODE
     // (KV4/FP8) and not from scalar_t, so the ring ingest, the dequant expand, the score and context
     // GEMMs and every tile descriptor are identical in the half and bfloat16_t instances. The width,
@@ -407,10 +306,10 @@ public:
     static_assert(sizeof(scalar_t) == 2,
                   "turboquant_fused_decode_opt.hpp's UB map assumes a 16-bit output element");
     // Ring slots of the tile ingest. Tile t reads into slot t % kIngestSlots, the slot of its L1 operands.
-    static constexpr uint32_t kIngestSlots = kBatched ? RING_SLOTS : 1;
+    static constexpr uint32_t kIngestSlots = RING_SLOTS;
     // Fixpipe score windows. Tile t's scores land in window t % kScoreWindows.
-    static constexpr uint32_t kScoreWindows = kBatched ? SCORE_WINDOWS : 1;
-    static constexpr uint32_t kBankSkew = BANK_SKEW;
+    static constexpr uint32_t kScoreWindows = SCORE_WINDOWS;
+    static constexpr uint32_t kBankSkew     = BANK_SKEW;
     static_assert(RING_SLOTS >= kCubeSlots, "the ingest ring cannot be shallower than the L1 ring");
     static_assert(SCORE_WINDOWS >= 1, "the Cube needs somewhere to put the scores");
     static_assert(BANK_SKEW % (kFp32PerBlock * sizeof(float)) == 0,
@@ -425,12 +324,8 @@ public:
         ComputeLayout(numHeads, numKvHeads, headSize, blockSize, numSplits, scale);
         InitGlobalTensors(queryRot, keyCache, valueCache, scaleCache, modeTables, workspace, output);
         InitBuffers(pipe);
-        codec_.Init(pipe, headSize_, Codec::kIsAffine ? kUnpackChunkRows : kCubeUnpackRows, invSqrtLen,
-                    modeTablesGm_);
+        codec_.Init(pipe, headSize_, kUnpackChunkRows, invSqrtLen, modeTablesGm_);
         InitIngestEvents();
-        if constexpr (kBypassUnpack) {
-            ZeroStagingBuffer();
-        }
     }
 
     // The attention phase's transient UB, as a pool the reduction phase can alias onto. Handing
@@ -441,8 +336,7 @@ public:
     {
         return transientPool_;
     }
-    static constexpr uint32_t kTransientPoolBytes =
-        ascend_micro::fused_decode_opt::kTransientPoolBytes;
+    static constexpr uint32_t kTransientPoolBytes = ascend_micro::fused_decode_opt::kTransientPoolBytes;
 
     // The Cube's two Fixpipe destinations. The AIC names them by the offsets its own TPipe handed out, so
     // both halves of the launch have to allocate the same list in the same order -- see InitBuffers.
@@ -456,10 +350,10 @@ public:
     __aicore__ static inline TurboQuantTaskHeads Heads(const uint32_t first, const uint32_t rows)
     {
         TurboQuantTaskHeads heads;
-        heads.first = first;
-        heads.rows = rows;
-        const uint32_t firstHalf = CeilDiv(rows, kVectorSubcoresPerBlock);
-        heads.mine = firstHalf;
+        heads.first                = first;
+        heads.rows                 = rows;
+        const uint32_t firstHalf   = CeilDiv(rows, kVectorSubcoresPerBlock);
+        heads.mine                 = firstHalf;
         if ASCEND_IS_AIV {
             if (AscendC::GetSubBlockIdx() != 0) {
                 heads.base = firstHalf;
@@ -469,6 +363,14 @@ public:
         return heads;
     }
 
+    // ------------------------------------------------------------------------------------------------
+    // PROLOGUE. Per-task state, the query operand into L1, the tail mask, and the ring priming reads.
+    // turboquant_fused_decode.cpp issues BeginTask and StageQuery once, then kIngestSlots - 1 of
+    // ReadTileToSlot / StageSlotToL1 before the steady state opens.
+    // ------------------------------------------------------------------------------------------------
+
+    // The PipeBarrier<PIPE_V> is an overlapping write and not a hand-off: the runMax field lies inside
+    // the state the Duplicate above it has just zeroed.
     __aicore__ inline void BeginTask(const TurboQuantTaskHeads &heads)
     {
         if (heads.mine == 0) {
@@ -476,24 +378,8 @@ public:
         }
         AscendC::Duplicate(accBuf_.Get<float>(), 0.0f, heads.mine * headSize_);
         AscendC::Duplicate(stateBuf_.Get<float>(), 0.0f, kStateFields * kStateField);
-        // Overlapping write: the runMax field lies inside the state the Duplicate above just zeroed.
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Duplicate(StateField(kStateRunMax), kVectorNegInf, heads.mine * kFp32PerBlock);
-    }
-
-    // Synthetic Split-K network probe: publish a neutral partial for one split without
-    // entering the page/tile pipeline. This uses the same production partial packing and
-    // MTE3 publication as StageTaskOutput, so the Cube reducer reads the normal workspace ABI.
-    __aicore__ inline void WriteNeutralPartial(const uint32_t token, const uint32_t split,
-                                               const TurboQuantTaskHeads &heads)
-    {
-        if ASCEND_IS_AIV {
-            if (heads.mine == 0) return;
-            BeginTask(heads);
-            AscendC::Duplicate(StateField(kStateRunMax), -1.0e9f, heads.mine * kFp32PerBlock);
-            AscendC::Duplicate(StateField(kStateRunSum), 0.0f, heads.mine * kFp32PerBlock);
-            StagePartials(token, split, heads);
-        }
     }
 
     // Quantises this subcore's query heads onto the operand grid, stages them into the Cube's L1 query slot
@@ -504,9 +390,9 @@ public:
         if (heads.mine == 0) {
             return;
         }
-        const AscendC::LocalTensor<float> queryIn = queryInBuf_.Get<float>();
+        const AscendC::LocalTensor<float>    queryIn      = queryInBuf_.Get<float>();
         const AscendC::LocalTensor<OperandT> queryOperand = queryOperandBuf_.Get<OperandT>();
-        const AscendC::LocalTensor<OperandT> queryL1 = mm.L1Query();
+        const AscendC::LocalTensor<OperandT> queryL1      = mm.L1Query();
 
         AscendC::DataCopy(queryIn,
                           queryRotGm_[(static_cast<uint64_t>(token) * numHeads_ + heads.first + heads.base) *
@@ -514,55 +400,36 @@ public:
                           heads.mine * headSize_);
         SyncMte2ToVector();
 
-        if constexpr (kBatched) {
-            ComputeQueryOperandRows(heads.mine);
-        } else {
-            ComputeQueryOperandHeads(heads.mine);
-        }
+        ascend_micro::NativeCubeQueryEngine<Codec, OperandT> query{queryIn,
+                                                                   queryWorkBuf_.Get<float>(),
+                                                                   scratchBuf_.Get<float>(),
+                                                                   StateField(kStateRowReduce),
+                                                                   StateField(kStateAmax),
+                                                                   StateField(kStateQScale),
+                                                                   StateField(kStateQInv),
+                                                                   queryOperand,
+                                                                   codec_,
+                                                                   heads.mine,
+                                                                   headSize_,
+                                                                   OperandMax<MODE>(),
+                                                                   TurboQuantCodec4::kEps,
+                                                                   rowRepeatParams_};
+        ascend_micro::vector_cube_quantize_query(query);
 
         SyncVectorToMte3();
-        for (uint32_t j = 0; j < heads.mine; ++j) {
-            AscendC::DataCopy(queryL1[OperandIndex((heads.base + j) * kOperandC0)],
-                              queryOperand[OperandIndex(j * operandElems_)],
-                              queryRowToL1Params_);
+        for (uint32_t head = 0; head < heads.mine; ++head) {
+            AscendC::DataCopy(queryL1[OperandIndex((heads.base + head) * kOperandC0)],
+                              queryOperand[OperandIndex(head * operandElems_)], queryRowToL1Params_);
         }
-
-        // Byte offsets of the task's kv head in each tile row's scale slot: K lanes first, V lanes after.
-        const int32_t slotBytes = static_cast<int32_t>(scaleSlot_ * sizeof(float));
-        const AscendC::LocalTensor<int32_t> scaleIndex = scaleIndexBuf_.Get<int32_t>();
-        AscendC::ArithProgression(scaleIndex, static_cast<int32_t>(kvHead * sizeof(float)), slotBytes,
-                                  static_cast<int32_t>(kCubeTileRows));
-        AscendC::ArithProgression(scaleIndex[kCubeTileRows],
-                                  static_cast<int32_t>((numKvHeads_ + kvHead) * sizeof(float)), slotBytes,
-                                  static_cast<int32_t>(kCubeTileRows));
+        BuildScaleIndex(kvHead);
     }
 
     // The mask a partial last tile is Min-ed with: 0-crossing at `valid`, +huge before, -huge after.
     __aicore__ inline void ComputeTailMask(const uint32_t valid)
     {
         const AscendC::LocalTensor<float> mask = maskBuf_.Get<float>();
-        const AscendC::LocalTensor<int32_t> lanes = mask[kCubeTileRows].ReinterpretCast<int32_t>();
-        AscendC::ArithProgression(lanes, 0, 1, static_cast<int32_t>(kCubeTileRows));
-        AscendC::Cast(mask, lanes, AscendC::RoundMode::CAST_NONE, kCubeTileRows);
-        AscendC::Adds(mask, mask, kMaskMidpoint - static_cast<float>(valid), kCubeTileRows);
-        AscendC::Muls(mask, mask, kMaskGain, kCubeTileRows);
-    }
-
-    // Reads this subcore's plane of one tile in a wide burst, unpacks it in UB in NZ order and stages it into
-    // the tile's L1 slot in one MTE3 burst. The lock-step ingest of the unbatched modes.
-    __aicore__ inline void StageTile(Mm &mm, const uint32_t physical, const uint32_t rowBase, const uint32_t kvHead,
-                                     const uint32_t l1Slot, const bool afterSoftmax)
-    {
-        const AscendC::LocalTensor<OperandT> l1Dst = PlaneOperand(mm, l1Slot);
-        if (afterSoftmax) {
-            SyncVectorToMte2();
-        }
-
-        const AscendC::LocalTensor<int8_t> packed = kvBuf_[0].template Get<int8_t>();
-        ReadPlane(physical, rowBase, kvHead, 0);
-        SyncMte2ToVector();
-        SelectKvHeadRows(packed, kvHead, 0);
-        StageUnpackedToL1(packed, l1Dst);
+        ascend_micro::vector_cube_tail_mask(mask, mask[kCubeTileRows].ReinterpretCast<int32_t>(), valid,
+                                            kMaskMidpoint, kMaskGain);
     }
 
     // The MTE2 half of the ring ingest: one tile's plane and scale lanes into ring slot `slot`, posted to
@@ -576,75 +443,65 @@ public:
     }
 
     // The vector half: waits for slot `slot`'s read, unpacks it in UB in NZ order and stages it into the
-    // slot's L1 operand in one MTE3 burst.
+    // slot's L1 operand in one MTE3 burst. `kvHead` selected a head out of a row-major row plane; an
+    // NZ-tiled read already covers exactly one (tile, kv head), so the plane arrives selected.
     __aicore__ inline void StageSlotToL1(Mm &mm, const uint32_t kvHead, const uint32_t slot)
     {
+        static_cast<void>(kvHead);
         const AscendC::LocalTensor<OperandT> l1Dst = PlaneOperand(mm, slot);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(readEvents_[slot]);
-
-        const AscendC::LocalTensor<int8_t> packed = kvBuf_[slot].template Get<int8_t>();
-        SelectKvHeadRows(packed, kvHead, slot);
-        StageUnpackedToL1(packed, l1Dst);
+        StageTileToL1(kvBuf_[slot].template Get<int8_t>(), l1Dst);
     }
+
+    // ------------------------------------------------------------------------------------------------
+    // STEADY STATE. One phase is softmax, next tile's read, accumulator decay, next slot's stage,
+    // accumulate -- six phases closing the slot ring against the window ring. The ingest pair above is
+    // reused here; the cross-core flags that order a phase against the Cube live in the caller.
+    // ------------------------------------------------------------------------------------------------
 
     // Scores for this subcore's heads arrived from the Cube: finish the logits, advance the running
     // max / log-sum per head, and stage the probability rows (on the operand grid) into L1. `slot` is the
-    // ingest slot holding this tile's scale lanes. One body on purpose: split into helpers, the per-tile
-    // tensor views are re-derived in each and the AIV issues more scalar instructions per tile.
+    // ingest slot holding this tile's scale lanes.
+    //
+    // ONE BODY ON PURPOSE. Split into member helpers, the per-tile tensor views are re-derived in each
+    // and the AIV issues more scalar instructions per tile. The ascend_micro calls below are leaf
+    // routines taking already-derived views, so they inline without re-deriving anything.
     __aicore__ inline void ComputeSoftmaxAndStageProbs(Mm &mm, const uint32_t valid, const TurboQuantTaskHeads &heads,
                                                        const uint32_t slot, const uint32_t window = 0)
     {
         if (heads.mine == 0) {
             return;
         }
-        const AscendC::LocalTensor<float> scores = Scores(window);
-        const AscendC::LocalTensor<float> scaleTile = scaleTileBuf_[slot].template Get<float>();
-        const AscendC::LocalTensor<float> reduce = reduceBuf_.Get<float>();
-        const AscendC::LocalTensor<float> keyScale = reduce;
-        const AscendC::LocalTensor<float> valueScale = reduce[kCubeTileRows];
-        const AscendC::LocalTensor<OperandT> probOperand = probOperandBuf_.Get<OperandT>();
-        const uint32_t probElems = Mm::OperandElems(kCubeTileRows);
+        const AscendC::LocalTensor<float>    reduce       = reduceBuf_.Get<float>();
+        const AscendC::LocalTensor<float>    keyScale     = reduce[kReduceKeyScale];
+        const AscendC::LocalTensor<float>    valueScale   = reduce[kReduceValueScale];
+        const AscendC::LocalTensor<OperandT> probOperand  = probOperandBuf_.Get<OperandT>();
+        const AscendC::LocalTensor<OperandT> probsL1      = mm.L1Probs();
+        const uint32_t                       probElems    = Mm::OperandElems(kCubeTileRows);
 
-        const AscendC::LocalTensor<uint32_t> scaleIndex = scaleIndexBuf_.Get<int32_t>().ReinterpretCast<uint32_t>();
-        AscendC::Gather(keyScale, scaleTile, scaleIndex, kGatherSrcBase, kCubeTileRows);
-        AscendC::Gather(valueScale, scaleTile, scaleIndex[kCubeTileRows], kGatherSrcBase, kCubeTileRows);
-        AscendC::Muls(keyScale, keyScale, scoreScale_, kCubeTileRows);
-        AscendC::Muls(valueScale, valueScale, invGain_, kCubeTileRows);
+        ascend_micro::vector_cube_tile_scales(keyScale, valueScale, scaleTileBuf_[slot].template Get<float>(),
+                                              scaleIndexBuf_.Get<int32_t>().ReinterpretCast<uint32_t>(),
+                                              scoreScale_, invGain_);
+        RunTileSoftmax(Scores(window), valid, heads.mine, keyScale, valueScale);
 
-        if constexpr (kBatched) {
-            ComputeSoftmaxRows(scores, valid, heads.mine, keyScale, valueScale);
-        } else {
-            ComputeSoftmaxHeads(scores, valid, heads.mine, keyScale, valueScale);
-        }
-
-        const AscendC::LocalTensor<OperandT> probsL1 = mm.L1Probs();
         SyncVectorToMte3();
-        for (uint32_t j = 0; j < heads.mine; ++j) {
-            AscendC::DataCopy(probsL1[OperandIndex((heads.base + j) * kOperandC0)],
-                              probOperand[OperandIndex(j * probElems)], probRowToL1Params_);
+        for (uint32_t head = 0; head < heads.mine; ++head) {
+            AscendC::DataCopy(probsL1[OperandIndex((heads.base + head) * kOperandC0)],
+                              probOperand[OperandIndex(head * probElems)], probRowToL1Params_);
         }
         SyncMte3ToVector();
     }
 
-    // Decays the accumulators by alpha = exp(runMax - newMax) before this tile's context lands.
+    // Decays the accumulators by alpha = exp(runMax - newMax) before this tile's context lands, and
+    // commits the new running maximum in the same routine call.
     __aicore__ inline void ComputeAccumulatorDecay(const TurboQuantTaskHeads &heads)
     {
         if (heads.mine == 0) {
             return;
         }
-        const AscendC::LocalTensor<float> acc = accBuf_.Get<float>();
-        const AscendC::LocalTensor<float> alpha = StateField(kStateAlpha);
-        if constexpr (kBatched) {
-            ascend_micro::vector_cube_scale_rows(acc, alpha, heads.mine, headSize_, rowRepeatParams_);
-        } else {
-            const AscendC::LocalTensor<float> blocks = reduceBuf_.Get<float>()[kReduceBlocks];
-            for (uint32_t j = 0; j < heads.mine; ++j) {
-                AscendC::Brcb(blocks[j * kFp32PerBlock], alpha[j * kFp32PerBlock], 1,
-                              {1, static_cast<uint16_t>(kFp32PerBlock)});
-            }
-            MulHeadRows(acc, blocks, heads.mine);
-        }
-        AscendC::Adds(StateField(kStateRunMax), StateField(kStateNewMax), 0.0f, heads.mine * kFp32PerBlock);
+        ascend_micro::vector_cube_decay_accumulator(accBuf_.Get<float>(), StateField(kStateAlpha),
+                                                    StateField(kStateRunMax), StateField(kStateNewMax), heads.mine,
+                                                    headSize_, rowRepeatParams_);
     }
 
     // The Cube's context rows are probs * V on the operand grid: undo each head's prob scale and add.
@@ -653,27 +510,15 @@ public:
         if (heads.mine == 0) {
             return;
         }
-        const AscendC::LocalTensor<float> acc = accBuf_.Get<float>();
-        const AscendC::LocalTensor<float> context = contextBuf_.Get<float>();
-        const AscendC::LocalTensor<float> probScale = StateField(kStateProbScale);
-        if constexpr (kBatched) {
-            ascend_micro::vector_cube_accumulate(acc, context, probScale,
-                StateField(kStateAccInv), heads.mine, headSize_, rowRepeatParams_);
-            return;
-        } else {
-            const AscendC::LocalTensor<float> reduce = reduceBuf_.Get<float>();
-            const AscendC::LocalTensor<float> probScaleBlock = reduce[kReduceAccBlock];
-            const AscendC::LocalTensor<float> probScaleInv = reduce[kReduceAccInv];
-            for (uint32_t j = 0; j < heads.mine; ++j) {
-                BroadcastScalar(probScaleBlock, probScale[j * kFp32PerBlock]);
-                AscendC::Duplicate(probScaleInv, 1.0f, kFp32PerBlock);
-                AscendC::Div(probScaleInv, probScaleInv, probScaleBlock, kFp32PerBlock);
-                TurboQuantCodec4::BroadcastMul(context[j * headSize_], context[j * headSize_],
-                                                             probScaleInv, headSize_);
-            }
-        }
-        AscendC::Add(acc, acc, context, heads.mine * headSize_);
+        ascend_micro::vector_cube_accumulate(accBuf_.Get<float>(), contextBuf_.Get<float>(),
+                                             StateField(kStateProbScale), StateField(kStateAccInv), heads.mine,
+                                             headSize_, rowRepeatParams_);
     }
+
+    // ------------------------------------------------------------------------------------------------
+    // EPILOGUE. The drain's last three phases run the steady-state calls above with no further reads;
+    // this is what closes the task once they are done.
+    // ------------------------------------------------------------------------------------------------
 
     // A fused token writes its output straight to GM, after `finisher` has seen its normalised rows; a split
     // token leaves its partials for the in-launch reduction, which calls the finisher instead.
@@ -684,18 +529,33 @@ public:
         if (heads.mine == 0) {
             return;
         }
-        const AscendC::LocalTensor<float> reduce = reduceBuf_.Get<float>();
         if (fused) {
-            const AscendC::LocalTensor<float> acc = accBuf_.Get<float>();
-            const uint32_t firstHead = heads.first + heads.base;
-            NormalizeHeads(acc, StateField(kStateRunSum), heads.mine, headSize_, reduce[kReduceBlocks],
-                           reduce[kReduceInv]);
+            const AscendC::LocalTensor<float> acc       = accBuf_.Get<float>();
+            const AscendC::LocalTensor<float> reduce    = reduceBuf_.Get<float>();
+            const uint32_t                    firstHead = heads.first + heads.base;
+            NormalizeHeads(acc, StateField(kStateRunSum), heads.mine, headSize_, reduce[kReduceNormalSums],
+                           reduce[kReduceNormalInvs]);
             finisher.FinishHeads(acc, token, firstHead, heads.mine);
             WriteHeads<scalar_t>(acc, heads.mine, headSize_, outBuf_.Get<scalar_t>(), outputGm_,
                                  (static_cast<uint64_t>(token) * numHeads_ + firstHead) * headSize_);
             return;
         }
         StagePartials(token, split, heads);
+    }
+
+    // Synthetic Split-K network probe: publish a neutral partial for one split without
+    // entering the page/tile pipeline. This uses the same production partial packing and
+    // MTE3 publication as StageTaskOutput, so the Cube reducer reads the normal workspace ABI.
+    __aicore__ inline void WriteNeutralPartial(const uint32_t token, const uint32_t split,
+                                               const TurboQuantTaskHeads &heads)
+    {
+        if ASCEND_IS_AIV {
+            if (heads.mine == 0) return;
+            BeginTask(heads);
+            AscendC::Duplicate(StateField(kStateRunMax), kNeutralPartialMax, heads.mine * kFp32PerBlock);
+            AscendC::Duplicate(StateField(kStateRunSum), 0.0f, heads.mine * kFp32PerBlock);
+            StagePartials(token, split, heads);
+        }
     }
 
 private:
@@ -705,73 +565,76 @@ private:
     static constexpr uint32_t kScoreBytes = kHalfRows * kCubeTileRows * sizeof(float);
     static_assert(kScoreBytes % (kFp32PerBlock * sizeof(float)) == 0,
                   "the context buffer has to start on a UB block, or the Fixpipe window is misaligned");
-    static constexpr uint32_t kUnpackChunkRows = kCubeTileRows / 2;
-    static constexpr uint32_t kKeyPlane = 0;
-    static constexpr uint32_t kValuePlane = 1;
-    static constexpr float kMaskGain = -5.0e36f;
-    static constexpr float kMaskMidpoint = 0.5f;
+    static constexpr uint32_t kUnpackChunkRows   = kCubeTileRows / 2;
+    static constexpr uint32_t kKeyPlane          = 0;
+    static constexpr uint32_t kValuePlane        = 1;
+    static constexpr float    kMaskGain          = -5.0e36f;
+    static constexpr float    kMaskMidpoint      = 0.5f;
+    static constexpr float    kNeutralPartialMax = -1.0e9f;
 
-    static constexpr uint32_t kStateRunMax = 0;
-    static constexpr uint32_t kStateRunSum = 1;
-    static constexpr uint32_t kStateTileMax = 2;
-    static constexpr uint32_t kStateNewMax = 3;
-    static constexpr uint32_t kStateAlpha = 4;
+    static constexpr uint32_t kStateRunMax    = 0;
+    static constexpr uint32_t kStateRunSum    = 1;
+    static constexpr uint32_t kStateTileMax   = 2;
+    static constexpr uint32_t kStateNewMax    = 3;
+    static constexpr uint32_t kStateAlpha     = 4;
     static constexpr uint32_t kStateProbScale = 5;
-    static constexpr uint32_t kStateAmax = 6;
-    static constexpr uint32_t kStateQScale = 7;
-    // Batched only: the per-head reciprocals, the row-reduce outputs (one lane per head) and two blocks.
-    static constexpr uint32_t kStateQInv = 8;
+    static constexpr uint32_t kStateAmax      = 6;
+    static constexpr uint32_t kStateQScale    = 7;
+    // The per-head reciprocals, the row-reduce outputs (one lane per head) and two working blocks.
+    static constexpr uint32_t kStateQInv      = 8;
     static constexpr uint32_t kStateRowReduce = 9;
-    static constexpr uint32_t kStatePart = 10;
-    static constexpr uint32_t kStateAccInv = 11;
-    static constexpr uint32_t kStateFields = kBatched ? 12 : 8;
-    static constexpr uint32_t kStateField = kHalfRows * kFp32PerBlock;
-    static constexpr uint8_t kTileBlocks = static_cast<uint8_t>(kCubeTileRows / kFp32PerBlock);
+    static constexpr uint32_t kStatePart      = 10;
+    static constexpr uint32_t kStateAccInv    = 11;
+    static constexpr uint32_t kStateFields    = 12;
+    static constexpr uint32_t kStateField     = kHalfRows * kFp32PerBlock;
+    static constexpr uint8_t  kTileBlocks     = static_cast<uint8_t>(kCubeTileRows / kFp32PerBlock);
 
-    static constexpr uint32_t kReduceFloats = 512;
-    static constexpr uint32_t kReduceBlock = 2 * kCubeTileRows;
-    static constexpr uint32_t kReducePart = 3 * kCubeTileRows;
-    static constexpr uint32_t kReduceBlocks = kReducePart + kFp32PerBlock;
-    static constexpr uint32_t kReduceInv = kReduceBlocks + 2 * kCubeTileRows;
-    static constexpr uint32_t kReduceAccBlock = kReduceInv + kCubeTileRows;
-    static constexpr uint32_t kReduceAccInv = kReduceAccBlock + kCubeTileRows;
+    // reduceBuf_'s lanes. The two tile scales are per-tile and live only across one softmax; the
+    // normalisation pair is per-task and read once, at the epilogue. They are kept apart rather than
+    // overlaid because the epilogue's Brcb destination is 64 floats wide whatever the head count --
+    // see vector_cube_normalize_heads -- and these offsets are what the asserts below pin.
+    static constexpr uint32_t kReduceFloats     = 512;
+    static constexpr uint32_t kReduceKeyScale   = 0;
+    static constexpr uint32_t kReduceValueScale = kCubeTileRows;
+    static constexpr uint32_t kReduceNormalSums = 3 * kCubeTileRows + kFp32PerBlock;
+    static constexpr uint32_t kReduceNormalInvs = kReduceNormalSums + 2 * kCubeTileRows;
+    static_assert(kReduceValueScale + kCubeTileRows <= kReduceNormalSums,
+                  "the tile scales must not reach the normalisation broadcast");
+    static_assert(kReduceNormalSums + (kHalfRows - 1) * kFp32PerBlock + kBrcbDstLanes <= kReduceNormalInvs,
+                  "NormalizeHeads' broadcast must not reach its own reciprocals");
+    static_assert(kReduceNormalInvs + kHalfRows * kFp32PerBlock <= kReduceFloats,
+                  "the reciprocals must not run off the end of the buffer");
 
     __aicore__ inline void ComputeLayout(const uint32_t numHeads, const uint32_t numKvHeads, const uint32_t headSize,
                                          const uint32_t blockSize, const uint32_t numSplits, const float scale)
     {
-        numHeads_ = numHeads;
-        numKvHeads_ = numKvHeads;
-        headSize_ = headSize;
-        blockSize_ = blockSize;
-        numSplits_ = numSplits;
-        packedBytes_ = Codec::PackedBytes(headSize);
-        const uint32_t payload = numKvHeads_ * packedBytes_;
-        packedPlane_ = MODE == TurboQuantMode::KV3_FP4 ? (payload + kOperandC0 - 1) / kOperandC0 * kOperandC0
-                                                       : payload;
-        scaleSlot_ = ScaleSlotFloats(numKvHeads_);
-        partialStride_ = headSize + kPartialTail;
-        operandElems_ = Mm::OperandElems(headSize_);
-        tilePlaneBytes_ = kCubeTileRows * packedBytes_;
+        numHeads_         = numHeads;
+        numKvHeads_       = numKvHeads;
+        headSize_         = headSize;
+        blockSize_        = blockSize;
+        numSplits_        = numSplits;
+        packedBytes_      = Codec::PackedBytes(headSize);
+        scaleSlot_        = ScaleSlotFloats(numKvHeads_);
+        partialStride_    = headSize + kPartialTail;
+        operandElems_     = Mm::OperandElems(headSize_);
+        tilePlaneBytes_   = kCubeTileRows * packedBytes_;
         unpackChunkBytes_ = kUnpackChunkRows * packedBytes_;
         nzTileToL1Params_ =
             AscendC::DataCopyParams{1, static_cast<uint16_t>(kCubeTileRows * operandElems_ / kOperandC0), 0, 0};
-        bandToL1Params_ = AscendC::DataCopyParams{static_cast<uint16_t>(operandElems_ / kOperandC0),
-                                                  static_cast<uint16_t>(kCubeUnpackRows), 0,
-                                                  static_cast<uint16_t>(kCubeTileRows - kCubeUnpackRows)};
         queryRowToL1Params_ = AscendC::DataCopyParams{static_cast<uint16_t>(operandElems_ / kOperandC0), 1, 0,
                                                       static_cast<uint16_t>(kCubeTileM - 1)};
-        probRowToL1Params_ = AscendC::DataCopyParams{
+        probRowToL1Params_  = AscendC::DataCopyParams{
             static_cast<uint16_t>(Mm::OperandElems(kCubeTileRows) / kOperandC0), 1, 0,
             static_cast<uint16_t>(kCubeTileM - 1)};
         const uint8_t rowBlocks = static_cast<uint8_t>(headSize_ / kFp32PerBlock);
-        rowRepeatParams_ = AscendC::BinaryRepeatParams{1, 1, 0, rowBlocks, rowBlocks, 1};
-        tileByBlockParams_ = AscendC::BinaryRepeatParams{1, 1, 0, kTileBlocks, kTileBlocks, 1};
-        tileByVectorParams_ = AscendC::BinaryRepeatParams{1, 1, 1, kTileBlocks, kTileBlocks, 0};
-        // The codec's gain, not the mode's: a non-uniform codebook carries its reconstruction in the
-        // operand and leaves nothing to divide out, so Codec::kGain is 1 there and these two collapse to
-        // the bare attention scale and to unity.
-        scoreScale_ = scale / Codec::kGain;
-        invGain_ = 1.0f / Codec::kGain;
+        rowRepeatParams_        = AscendC::BinaryRepeatParams{1, 1, 0, rowBlocks, rowBlocks, 1};
+        tileByBlockParams_      = AscendC::BinaryRepeatParams{1, 1, 0, kTileBlocks, kTileBlocks, 1};
+        tileByVectorParams_     = AscendC::BinaryRepeatParams{1, 1, 1, kTileBlocks, kTileBlocks, 0};
+        // The writers' dequantisation contract (turboquant_codec_mx.h): a row reconstructs as
+        // code * stored_scale with no centroid offset and no codebook gain, so the score scale is
+        // the bare attention scale and the value scale is 1.
+        scoreScale_ = scale;
+        invGain_    = 1.0f;
     }
 
     // LocalTensor<fp4x2> indexes individual 4-bit values, while all operand sizes and DMA
@@ -816,23 +679,21 @@ private:
     // Fixpipe windows, never between them, so the dual-destination contract above is untouched.
     __aicore__ inline void InitBuffers(AscendC::TPipe *pipe)
     {
-        static_assert(MODE == TurboQuantMode::KV4_FP8 && RING_SLOTS == 3 && SCORE_WINDOWS == 2);
-        static_assert(BANK_SKEW == 32 && sizeof(scalar_t) == 2);
-        static_assert(kStateFields * kStateField * sizeof(float) ==
-            ascend_micro::fused_decode_opt::kUbSizes[21]);
+        static_assert(RING_SLOTS == 3 && SCORE_WINDOWS == 2 && BANK_SKEW == 32);
+        static_assert(kStateFields * kStateField * sizeof(float) == ascend_micro::fused_decode_opt::kUbSizes[21]);
         static_assert(kReduceFloats * sizeof(float) == ascend_micro::fused_decode_opt::kUbSizes[22]);
         // The exact allocation list is shared with the host/compile-time budget.
         // The launch ABI gates D=256 and scaleSlot=8 before reaching this body.
-        const auto* sizes = ascend_micro::fused_decode_opt::kUbSizes;
-        for (uint32_t w = 0; w < kScoreWindows; ++w) pipe->InitBuffer(scoreBuf_[w], sizes[w]);
+        const auto *sizes = ascend_micro::fused_decode_opt::kUbSizes;
+        for (uint32_t window = 0; window < kScoreWindows; ++window) pipe->InitBuffer(scoreBuf_[window], sizes[window]);
         pipe->InitBuffer(contextBuf_, sizes[2]);
-        for (uint32_t s = 0; s < kIngestSlots; ++s) {
-            pipe->InitBuffer(kvBuf_[s], sizes[3 + 2 * s]);
-            SkewBank(pipe, s);
+        for (uint32_t slot = 0; slot < kIngestSlots; ++slot) {
+            pipe->InitBuffer(kvBuf_[slot], sizes[3 + 2 * slot]);
+            SkewBank(pipe, slot);
         }
-        for (uint32_t s = 0; s < kIngestSlots; ++s) {
-            pipe->InitBuffer(scaleTileBuf_[s], sizes[9 + 2 * s]);
-            SkewBank(pipe, kIngestSlots + s);
+        for (uint32_t slot = 0; slot < kIngestSlots; ++slot) {
+            pipe->InitBuffer(scaleTileBuf_[slot], sizes[9 + 2 * slot]);
+            SkewBank(pipe, kIngestSlots + slot);
         }
         // THE TRANSIENT POOL, and the third rule of this list.
         //
@@ -891,11 +752,9 @@ private:
     // set/wait pair while a slot's read is in flight. kIngestSlots of the 8 the core has, and only on the AIV.
     __aicore__ inline void InitIngestEvents()
     {
-        if constexpr (kBatched) {
-            if ASCEND_IS_AIV {
-                for (uint32_t slot = 0; slot < kIngestSlots; ++slot) {
-                    readEvents_[slot] = GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE2_V>();
-                }
+        if ASCEND_IS_AIV {
+            for (uint32_t slot = 0; slot < kIngestSlots; ++slot) {
+                readEvents_[slot] = GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE2_V>();
             }
         }
     }
@@ -903,6 +762,18 @@ private:
     __aicore__ inline AscendC::LocalTensor<float> StateField(const uint32_t field)
     {
         return stateBuf_.Get<float>()[field * kStateField];
+    }
+
+    // Byte offsets of the task's kv head in each tile row's scale slot: K lanes first, V lanes after.
+    __aicore__ inline void BuildScaleIndex(const uint32_t kvHead)
+    {
+        const int32_t                       slotBytes  = static_cast<int32_t>(scaleSlot_ * sizeof(float));
+        const AscendC::LocalTensor<int32_t> scaleIndex = scaleIndexBuf_.Get<int32_t>();
+        AscendC::ArithProgression(scaleIndex, static_cast<int32_t>(kvHead * sizeof(float)), slotBytes,
+                                  static_cast<int32_t>(kCubeTileRows));
+        AscendC::ArithProgression(scaleIndex[kCubeTileRows],
+                                  static_cast<int32_t>((numKvHeads_ + kvHead) * sizeof(float)), slotBytes,
+                                  static_cast<int32_t>(kCubeTileRows));
     }
 
     // Subcore 0 stages the K plane and subcore 1 the V plane.
@@ -919,212 +790,59 @@ private:
     __aicore__ inline void ReadPlane(const uint32_t physical, const uint32_t rowBase, const uint32_t kvHead,
                                      const uint32_t slot)
     {
-        const uint64_t row = static_cast<uint64_t>(physical) * blockSize_ + rowBase;
+        const uint64_t                 row     = static_cast<uint64_t>(physical) * blockSize_ + rowBase;
+        const uint64_t                 tile    = (row * numKvHeads_ +
+                                                  static_cast<uint64_t>(kvHead) * kCubeTileRows) * packedBytes_;
         AscendC::GlobalTensor<int8_t> &cacheGm = Plane() == kKeyPlane ? keyCacheGm_ : valueCacheGm_;
-        if constexpr (kNzTiled) {
-            const uint64_t tile = (row * numKvHeads_ + static_cast<uint64_t>(kvHead) * kCubeTileRows) * packedBytes_;
-            AscendC::DataCopy(kvBuf_[slot].template Get<int8_t>(), cacheGm[tile], tilePlaneBytes_);
-        } else {
-            rowMajorBurst_.ReadTileRows(kvBuf_[slot].template Get<int8_t>(), cacheGm, row * packedPlane_, kvHead, slot);
-        }
+        AscendC::DataCopy(kvBuf_[slot].template Get<int8_t>(), cacheGm[tile], tilePlaneBytes_);
         AscendC::DataCopy(scaleTileBuf_[slot].template Get<float>(), scaleCacheGm_[row * scaleSlot_],
                           kCubeTileRows * scaleSlot_);
     }
 
-    // The vector half of a row-major read that had to take the whole row plane. An NZ-tiled tile never
-    // needs it.
-    __aicore__ inline void SelectKvHeadRows(const AscendC::LocalTensor<int8_t> &packed, const uint32_t kvHead,
-                                            const uint32_t slot)
+    // An NZ-tiled plane is already the NZ image of its bytes, and the expand is byte-wise, so a chunk's
+    // low nibbles land in place on NZ groups [0, groups) and its high nibbles on [groups, 2 * groups).
+    // The staging buffer is the L1 operand as unpacked, and one MTE3 burst stages it.
+    __aicore__ inline void StageTileToL1(const AscendC::LocalTensor<int8_t>   &packed,
+                                         const AscendC::LocalTensor<OperandT> &l1Dst)
     {
-        if constexpr (!kNzTiled) {
-            rowMajorBurst_.SelectKvHeadRows(packed, kvHead, slot);
+        const AscendC::LocalTensor<OperandT> nzLow  = nzOperandBuf_.Get<OperandT>();
+        const AscendC::LocalTensor<OperandT> nzHigh = nzLow[tilePlaneBytes_];
+        for (uint32_t base = 0; base < tilePlaneBytes_; base += unpackChunkBytes_) {
+            codec_.template UnpackAffine<OperandT>(nzLow[base], nzHigh[base], packed[base], unpackChunkBytes_);
         }
+        SyncVectorToMte3();
+        AscendC::DataCopy(l1Dst, nzLow, nzTileToL1Params_);
+        SyncMte3ToVector();
     }
 
-    __aicore__ inline void StageUnpackedToL1(const AscendC::LocalTensor<int8_t> &packed,
-                                             const AscendC::LocalTensor<OperandT> &l1Dst)
-    {
-        if constexpr (kNzTiled) {
-            StageNzTileToL1(packed, l1Dst);
-        } else {
-            StageBandsToL1(packed, l1Dst);
-        }
-    }
-
-    // The ablation's one-time cost: the staging buffer the bypassed expand would have written is zeroed
-    // here, before the first tile, so every ablated tile stages defined bytes and the scores are a clean
-    // zero rather than whatever the UB held. Off the per-tile path on purpose -- it must not show up in
-    // the delta the leg measures.
-    __aicore__ inline void ZeroStagingBuffer()
-    {
-        if ASCEND_IS_AIV {
-            // Only one of the two staging buffers is allocated, so the branch has to be a constant one.
-            if constexpr (kNzTiled) {
-                AscendC::Duplicate(nzOperandBuf_.template Get<half>(), static_cast<half>(0),
-                                   kCubeTileRows * operandElems_ / sizeof(half));
-            } else {
-                AscendC::Duplicate(bandOperandBuf_.template Get<half>(), static_cast<half>(0),
-                                   kCubeUnpackRows * operandElems_ / sizeof(half));
-            }
-            AscendC::PipeBarrier<PIPE_V>();
-        }
-    }
-
-    // rows[j * headSize_ ..] *= blocks[j * kFp32PerBlock] for `heads` rows, one 64-lane sweep per column.
-    __aicore__ inline void MulHeadRows(const AscendC::LocalTensor<float> &rows,
-                                       const AscendC::LocalTensor<float> &blocks, const uint32_t heads)
-    {
-        for (uint32_t col = 0; col < headSize_; col += kFp32PerRepeat) {
-            AscendC::Mul(rows[col], rows[col], blocks, static_cast<uint64_t>(kFp32PerRepeat),
-                         static_cast<uint8_t>(heads), rowRepeatParams_);
-        }
-    }
-
-    // One sum or max per row of `rows` (kCubeTileRows wide) into rowReduce lanes 0..heads-1, then
-    // broadcast over the heads' blocks of `blocks`.
-    template <AscendC::ReduceType REDUCE>
-    __aicore__ inline void ReduceTileRows(const AscendC::LocalTensor<float> &blocks,
-                                          const AscendC::LocalTensor<float> &rows, const uint32_t heads)
-    {
-        const AscendC::LocalTensor<float> rowReduce = StateField(kStateRowReduce);
-        if constexpr (REDUCE == AscendC::ReduceType::SUM) {
-            AscendC::ReduceRepeat<REDUCE>(rowReduce, rows, static_cast<int32_t>(kCubeTileRows),
-                                          static_cast<int32_t>(heads), 1, 1, kTileBlocks);
-        } else {
-            AscendC::ReduceRepeat<REDUCE>(rowReduce, rows, static_cast<int32_t>(kCubeTileRows),
-                                          static_cast<int32_t>(heads), 1, 1, kTileBlocks,
-                                          AscendC::ReduceOrder::ORDER_ONLY_VALUE);
-        }
-        AscendC::Brcb(blocks, rowReduce, 1, {1, static_cast<uint16_t>(kFp32PerBlock)});
-    }
-
-    // The unbatched modes: one head at a time, and a scalar readback of each 1 / qScale.
-    __aicore__ inline void ComputeQueryOperandHeads(const uint32_t heads)
-    {
-        const AscendC::LocalTensor<float> queryIn = queryInBuf_.Get<float>();
-        const AscendC::LocalTensor<float> queryAbs = queryWorkBuf_.Get<float>();
-        const AscendC::LocalTensor<OperandT> queryOperand = queryOperandBuf_.Get<OperandT>();
-        const AscendC::LocalTensor<float> amax = StateField(kStateAmax);
-        const AscendC::LocalTensor<float> qScale = StateField(kStateQScale);
-        const AscendC::LocalTensor<float> qScaleBlock = reduceBuf_.Get<float>()[kReduceBlock];
-        const AscendC::LocalTensor<float> scratch = scratchBuf_.Get<float>();
-
-        for (uint32_t j = 0; j < heads; ++j) {
-            const AscendC::LocalTensor<float> query = queryIn[j * headSize_];
-            const uint32_t lane = j * kFp32PerBlock;
-            AscendC::Abs(queryAbs, query, headSize_);
-            AscendC::ReduceMax<float>(amax[lane], queryAbs, scratch, headSize_, false);
-            AscendC::Adds(amax[lane], amax[lane], TurboQuantCodec4::kEps, 1);
-            AscendC::Duplicate(qScale[lane], OperandMax<MODE>(), 1);
-            AscendC::Div(qScale[lane], qScale[lane], amax[lane], 1);
-            BroadcastScalar(qScaleBlock, qScale[lane]);
-            TurboQuantCodec4::BroadcastMul(query, query, qScaleBlock, headSize_);
-            codec_.template CastToOperand<OperandT>(queryOperand[OperandIndex(j * operandElems_)], query, headSize_);
-        }
-        // Vector -> scalar hand-off: GetValue reads qScale lanes the vector pipe has just written.
-        AscendC::PipeBarrier<PIPE_V>();
-        for (uint32_t j = 0; j < heads; ++j) {
-            qScaleInv_[j] = 1.0f / qScale.GetValue(j * kFp32PerBlock);
-        }
-    }
-
-    // All of this subcore's query rows at once. The reciprocals stay in UB as head blocks, so nothing here
-    // waits on the vector unit.
-    __aicore__ inline void ComputeQueryOperandRows(const uint32_t heads)
-    {
-        const AscendC::LocalTensor<float> queryIn = queryInBuf_.Get<float>();
-        const AscendC::LocalTensor<float> queryAbs = queryWorkBuf_.Get<float>();
-        const AscendC::LocalTensor<OperandT> queryOperand = queryOperandBuf_.Get<OperandT>();
-        const AscendC::LocalTensor<float> rowMax = StateField(kStateRowReduce);
-        const AscendC::LocalTensor<float> amax = StateField(kStateAmax);
-        const AscendC::LocalTensor<float> qScale = StateField(kStateQScale);
-        const AscendC::LocalTensor<float> qInv = StateField(kStateQInv);
-        const AscendC::LocalTensor<float> scratch = scratchBuf_.Get<float>();
-        const uint32_t lanes = heads * kFp32PerBlock;
-
-        AscendC::Abs(queryAbs, queryIn, heads * headSize_);
-        // A row is wider than one register, so this reduce stays per head. It has no scalar readback.
-        for (uint32_t j = 0; j < heads; ++j) {
-            AscendC::ReduceMax<float>(rowMax[j], queryAbs[j * headSize_], scratch, headSize_, false);
-        }
-        AscendC::Brcb(amax, rowMax, 1, {1, static_cast<uint16_t>(kFp32PerBlock)});
-        AscendC::Adds(amax, amax, TurboQuantCodec4::kEps, lanes);
-        AscendC::Duplicate(qScale, OperandMax<MODE>(), lanes);
-        AscendC::Duplicate(qInv, 1.0f, lanes);
-        AscendC::Div(qScale, qScale, amax, lanes);
-        AscendC::Div(qInv, qInv, qScale, lanes);
-        MulHeadRows(queryIn, qScale, heads);
-        codec_.template CastToOperand<OperandT>(queryOperand, queryIn, heads * headSize_);
-    }
-
-    __aicore__ inline void ComputeSoftmaxHeads(const AscendC::LocalTensor<float> &scores, const uint32_t valid,
-                                               const uint32_t heads,
-                                               const AscendC::LocalTensor<float> &keyScale,
-                                               const AscendC::LocalTensor<float> &valueScale)
-    {
-        const AscendC::LocalTensor<float> runMax = StateField(kStateRunMax);
-        const AscendC::LocalTensor<float> runSum = StateField(kStateRunSum);
-        const AscendC::LocalTensor<float> tileMax = StateField(kStateTileMax);
-        const AscendC::LocalTensor<float> newMax = StateField(kStateNewMax);
-        const AscendC::LocalTensor<float> alpha = StateField(kStateAlpha);
-        const AscendC::LocalTensor<float> probScale = StateField(kStateProbScale);
-        const AscendC::LocalTensor<float> reduce = reduceBuf_.Get<float>();
-        const AscendC::LocalTensor<float> scalarBlock = reduce[kReduceBlock];
-        const AscendC::LocalTensor<float> part = reduce[kReducePart];
-        const AscendC::LocalTensor<float> scratch = scratchBuf_.Get<float>();
-        const AscendC::LocalTensor<float> mask = maskBuf_.Get<float>();
-        const AscendC::LocalTensor<OperandT> probOperand = probOperandBuf_.Get<OperandT>();
-        const uint32_t probElems = Mm::OperandElems(kCubeTileRows);
-
-        for (uint32_t j = 0; j < heads; ++j) {
-            const AscendC::LocalTensor<float> row = scores[j * kCubeTileRows];
-            const uint32_t lane = j * kFp32PerBlock;
-            AscendC::Mul(row, row, keyScale, kCubeTileRows);
-            AscendC::Muls(row, row, qScaleInv_[j], kCubeTileRows);
-            if (valid < kCubeTileRows) {
-                AscendC::Min(row, row, mask, static_cast<int32_t>(kCubeTileRows));
-            }
-
-            AscendC::ReduceMax<float>(tileMax[lane], row, scratch, kCubeTileRows, false);
-            AscendC::Max(newMax[lane], runMax[lane], tileMax[lane], 1);
-            AscendC::Sub(alpha[lane], runMax[lane], newMax[lane], 1);
-            AscendC::Exp(alpha[lane], alpha[lane], 1);
-
-            BroadcastScalar(scalarBlock, newMax[lane]);
-            BroadcastSub(row, row, scalarBlock, kCubeTileRows);
-            AscendC::Exp(row, row, kCubeTileRows);
-
-            AscendC::ReduceSum<float>(part, row, scratch, kCubeTileRows);
-            AscendC::Mul(runSum[lane], runSum[lane], alpha[lane], 1);
-            AscendC::Add(runSum[lane], runSum[lane], part, 1);
-
-            AscendC::Mul(row, row, valueScale, kCubeTileRows);
-            AscendC::ReduceMax<float>(part, row, scratch, kCubeTileRows, false);
-            AscendC::Adds(part, part, TurboQuantCodec4::kEps, 1);
-            AscendC::Duplicate(probScale[lane], OperandMax<MODE>(), 1);
-            AscendC::Div(probScale[lane], probScale[lane], part, 1);
-            BroadcastScalar(scalarBlock, probScale[lane]);
-            TurboQuantCodec4::BroadcastMul(row, row, scalarBlock, kCubeTileRows);
-
-            codec_.template CastToOperand<OperandT>(probOperand[OperandIndex(j * probElems)], row, kCubeTileRows);
-        }
-    }
-
-    // The same recurrence over every row at once: a row op repeats over the heads, a per-head scalar is a
-    // head block, and the row sums and maxima are whole-row reduces with no scalar readback. Logits, one
+    // The recurrence over every row at once: a row op repeats over the heads, a per-head scalar is a head
+    // block, and the row sums and maxima are whole-row reduces with no scalar readback. Logits, one
     // online-softmax step (newMax, alpha, runSum), then the probability rows on the operand grid.
-    __aicore__ inline void ComputeSoftmaxRows(const AscendC::LocalTensor<float> &scores, const uint32_t valid,
-                                              const uint32_t heads,
-                                              const AscendC::LocalTensor<float> &keyScale,
-                                              const AscendC::LocalTensor<float> &valueScale)
+    __aicore__ inline void RunTileSoftmax(const AscendC::LocalTensor<float> &scores, const uint32_t valid,
+                                          const uint32_t heads, const AscendC::LocalTensor<float> &keyScale,
+                                          const AscendC::LocalTensor<float> &valueScale)
     {
-        ascend_micro::NativeCubeSoftmaxEngine<Codec, OperandT> engine{
-            scores, keyScale, valueScale, StateField(kStateQInv), maskBuf_.Get<float>(),
-            StateField(kStateRunMax), StateField(kStateRunSum), StateField(kStateTileMax),
-            StateField(kStateNewMax), StateField(kStateAlpha), StateField(kStateProbScale),
-            StateField(kStatePart), StateField(kStateRowReduce),
-            probOperandBuf_.Get<OperandT>(), codec_, heads, valid,
-            OperandMax<MODE>(), TurboQuantCodec4::kEps, tileByVectorParams_, tileByBlockParams_};
+        ascend_micro::NativeCubeSoftmaxEngine<Codec, OperandT> engine{scores,
+                                                                     keyScale,
+                                                                     valueScale,
+                                                                     StateField(kStateQInv),
+                                                                     maskBuf_.Get<float>(),
+                                                                     StateField(kStateRunMax),
+                                                                     StateField(kStateRunSum),
+                                                                     StateField(kStateTileMax),
+                                                                     StateField(kStateNewMax),
+                                                                     StateField(kStateAlpha),
+                                                                     StateField(kStateProbScale),
+                                                                     StateField(kStatePart),
+                                                                     StateField(kStateRowReduce),
+                                                                     probOperandBuf_.Get<OperandT>(),
+                                                                     codec_,
+                                                                     heads,
+                                                                     valid,
+                                                                     OperandMax<MODE>(),
+                                                                     TurboQuantCodec4::kEps,
+                                                                     tileByVectorParams_,
+                                                                     tileByBlockParams_};
         ascend_micro::vector_online_softmax_probabilities(engine);
         engine.quantize_probabilities();
     }
@@ -1134,78 +852,27 @@ private:
         return ((static_cast<uint64_t>(token) * numHeads_ + head) * numSplits_ + split) * partialStride_;
     }
 
-    // An NZ-tiled plane is already the NZ image of its bytes, and the expand is byte-wise, so a chunk's
-    // low nibbles land in place on NZ groups [0, groups) and its high nibbles on [groups, 2 * groups).
-    // The staging buffer is the L1 operand as unpacked, and one MTE3 burst stages it.
-    __aicore__ inline void StageNzTileToL1(const AscendC::LocalTensor<int8_t> &packed,
-                                           const AscendC::LocalTensor<OperandT> &l1Dst)
-    {
-        const AscendC::LocalTensor<OperandT> nzLow = nzOperandBuf_.Get<OperandT>();
-        if constexpr (!kBypassUnpack) {
-            const AscendC::LocalTensor<OperandT> nzHigh = nzLow[tilePlaneBytes_];
-            for (uint32_t base = 0; base < tilePlaneBytes_; base += unpackChunkBytes_) {
-                if constexpr (kGatherUnpack) {
-                    codec_.template UnpackAffineGather<OperandT>(nzLow[base], nzHigh[base], packed[base],
-                                                                 unpackChunkBytes_);
-                } else {
-                    codec_.template UnpackAffine<OperandT>(nzLow[base], nzHigh[base], packed[base],
-                                                           unpackChunkBytes_);
-                }
-            }
-        } else {
-            (void)packed;
-        }
-        SyncVectorToMte3();
-        AscendC::DataCopy(l1Dst, nzLow, nzTileToL1Params_);
-        SyncMte3ToVector();
-    }
-
-    __aicore__ inline void StageBandsToL1(const AscendC::LocalTensor<int8_t> &packed,
-                                          const AscendC::LocalTensor<OperandT> &l1Dst)
-    {
-        static_assert(!kGatherUnpack, "the gather expand is affine-only, and an affine mode streams NZ tiles");
-        const AscendC::LocalTensor<OperandT> unpacked = bandOperandBuf_.Get<OperandT>();
-        const uint32_t bandElems = kCubeUnpackRows * kOperandC0;
-        for (uint32_t band = 0; band < kCubeTileRows / kCubeUnpackRows; ++band) {
-            if constexpr (!kBypassUnpack) {
-                codec_.Unpack(unpacked, packed[band * kCubeUnpackRows * packedBytes_], kCubeUnpackRows, headSize_);
-            } else {
-                (void)packed;
-            }
-            SyncVectorToMte3();
-            AscendC::DataCopy(l1Dst[OperandIndex(band * bandElems)], unpacked, bandToL1Params_);
-        }
-        SyncMte3ToVector();
-    }
-
+    // The partial tails borrow score window 0 as scratch. The task's tile loop is over, so every window's
+    // rows are dead; window 0 is the one that exists whatever kScoreWindows is.
     __aicore__ inline void StagePartials(const uint32_t token, const uint32_t split, const TurboQuantTaskHeads &heads)
     {
-        const AscendC::LocalTensor<float> acc = accBuf_.Get<float>();
-        const AscendC::LocalTensor<float> runMax = StateField(kStateRunMax);
-        const AscendC::LocalTensor<float> runSum = StateField(kStateRunSum);
-        // The partial tails borrow score window 0 as scratch. The task's tile loop is over, so every
-        // window's rows are dead; window 0 is the one that exists whatever kScoreWindows is.
+        const AscendC::LocalTensor<float> acc   = accBuf_.Get<float>();
         const AscendC::LocalTensor<float> tails = Scores(0);
-        AscendC::Duplicate(tails, 0.0f, heads.mine * kPartialTail);
-        for (uint32_t j = 0; j < heads.mine; ++j) {
-            AscendC::Adds(tails[j * kPartialTail + kPartialMaxLane], runMax[j * kFp32PerBlock], 0.0f, 1);
-            AscendC::Adds(tails[j * kPartialTail + kPartialSumLane], runSum[j * kFp32PerBlock], 0.0f, 1);
-        }
+        ascend_micro::vector_cube_pack_partial_tails(tails, StateField(kStateRunMax), StateField(kStateRunSum),
+                                                     heads.mine, kPartialTail, kPartialMaxLane, kPartialSumLane);
         SyncVectorToMte3();
-        for (uint32_t j = 0; j < heads.mine; ++j) {
-            const uint64_t offset = PartialOffset(token, heads.first + heads.base + j, split);
-            AscendC::DataCopy(workspaceGm_[offset], acc[j * headSize_], headSize_);
-            AscendC::DataCopy(workspaceGm_[offset + headSize_], tails[j * kPartialTail], kPartialTail);
+        for (uint32_t head = 0; head < heads.mine; ++head) {
+            const uint64_t offset = PartialOffset(token, heads.first + heads.base + head, split);
+            AscendC::DataCopy(workspaceGm_[offset], acc[head * headSize_], headSize_);
+            AscendC::DataCopy(workspaceGm_[offset + headSize_], tails[head * kPartialTail], kPartialTail);
         }
         SyncMte3ToVector();
     }
 
-    Codec codec_;
-    TurboQuantTileBurst rowMajorBurst_;
+    Codec                                        codec_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> kvBuf_[kIngestSlots];
     AscendC::TBuf<AscendC::QuePosition::VECCALC> scaleTileBuf_[kIngestSlots];
     AscendC::TBuf<AscendC::QuePosition::VECCALC> bankSkewBuf_[BANK_SKEW > 0 ? 2 * kIngestSlots : 1];
-    AscendC::TBuf<AscendC::QuePosition::VECCALC> bandOperandBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> nzOperandBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> accBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> queryWorkBuf_;
@@ -1223,36 +890,33 @@ private:
     AscendC::TBuf<AscendC::QuePosition::VECCALC> scratchBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> outBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> maskBuf_;
-    AscendC::GlobalTensor<float> queryRotGm_;
-    AscendC::GlobalTensor<int8_t> keyCacheGm_;
-    AscendC::GlobalTensor<int8_t> valueCacheGm_;
-    AscendC::GlobalTensor<float> scaleCacheGm_;
-    AscendC::GlobalTensor<int32_t> modeTablesGm_;
-    AscendC::GlobalTensor<float> workspaceGm_;
-    AscendC::GlobalTensor<scalar_t> outputGm_;
-    AscendC::DataCopyParams nzTileToL1Params_;
-    AscendC::DataCopyParams bandToL1Params_;
-    AscendC::DataCopyParams queryRowToL1Params_;
-    AscendC::DataCopyParams probRowToL1Params_;
-    AscendC::BinaryRepeatParams rowRepeatParams_;
-    AscendC::BinaryRepeatParams tileByBlockParams_;
-    AscendC::BinaryRepeatParams tileByVectorParams_;
-    AscendC::TEventID readEvents_[kIngestSlots] = {};
-    float qScaleInv_[kHalfRows] = {};
-    float scoreScale_ = 0.0f;
-    float invGain_ = 1.0f;
-    uint32_t numHeads_ = 0;
-    uint32_t numKvHeads_ = 0;
-    uint32_t headSize_ = 0;
-    uint32_t blockSize_ = 0;
-    uint32_t numSplits_ = 1;
-    uint32_t packedBytes_ = 0;
-    uint32_t packedPlane_ = 0;
-    uint32_t scaleSlot_ = 0;
-    uint32_t partialStride_ = 0;
-    uint32_t operandElems_ = 0;
-    uint32_t tilePlaneBytes_ = 0;
-    uint32_t unpackChunkBytes_ = 0;
+    AscendC::GlobalTensor<float>                 queryRotGm_;
+    AscendC::GlobalTensor<int8_t>                keyCacheGm_;
+    AscendC::GlobalTensor<int8_t>                valueCacheGm_;
+    AscendC::GlobalTensor<float>                 scaleCacheGm_;
+    AscendC::GlobalTensor<int32_t>               modeTablesGm_;
+    AscendC::GlobalTensor<float>                 workspaceGm_;
+    AscendC::GlobalTensor<scalar_t>              outputGm_;
+    AscendC::DataCopyParams                      nzTileToL1Params_;
+    AscendC::DataCopyParams                      queryRowToL1Params_;
+    AscendC::DataCopyParams                      probRowToL1Params_;
+    AscendC::BinaryRepeatParams                  rowRepeatParams_;
+    AscendC::BinaryRepeatParams                  tileByBlockParams_;
+    AscendC::BinaryRepeatParams                  tileByVectorParams_;
+    AscendC::TEventID                            readEvents_[kIngestSlots] = {};
+    float                                        scoreScale_       = 0.0f;
+    float                                        invGain_          = 1.0f;
+    uint32_t                                     numHeads_         = 0;
+    uint32_t                                     numKvHeads_       = 0;
+    uint32_t                                     headSize_         = 0;
+    uint32_t                                     blockSize_        = 0;
+    uint32_t                                     numSplits_        = 1;
+    uint32_t                                     packedBytes_      = 0;
+    uint32_t                                     scaleSlot_        = 0;
+    uint32_t                                     partialStride_    = 0;
+    uint32_t                                     operandElems_     = 0;
+    uint32_t                                     tilePlaneBytes_   = 0;
+    uint32_t                                     unpackChunkBytes_ = 0;
 };
 
 }

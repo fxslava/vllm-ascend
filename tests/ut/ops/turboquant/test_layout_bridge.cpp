@@ -44,7 +44,7 @@
 //      ((slot - tileRow) * numKvHeads + kvHead * kCubeTileRows) * packedBytes, so
 //      packed[i] = GM[tileBase + i].
 //   2. UnpackAffine DeInterleaves it: nzLow[i] = low nibble of packed[i], nzHigh[i] = high.
-//   3. StageNzTileToL1 stages nzLow at L1 offset 0 and nzHigh at + tilePlaneBytes, in ONE
+//   3. StageTileToL1 stages nzLow at L1 offset 0 and nzHigh at + tilePlaneBytes, in ONE
 //      contiguous burst, so L1[i] = nzLow[i] below tilePlaneBytes and nzHigh[i - tilePlaneBytes]
 //      above it.
 //   4. L1 is the kCubeTileRows x d NZ image, where element (row n, col e) sits at
@@ -90,7 +90,7 @@ Addr IngressNzByte(const Shape& s, int block, int head, int token, int channel)
 }
 
 // ----------------------------------------------- (B) the fused decode's reader, walked
-// Re-derived from ReadPlane -> UnpackAffine -> StageNzTileToL1 -> the L1 NZ image, per the file
+// Re-derived from ReadPlane -> UnpackAffine -> StageTileToL1 -> the L1 NZ image, per the file
 // header. Deliberately written in the decode's own terms and NOT by calling the writer's helper,
 // so that check 1 compares two independent derivations.
 Addr DecodeReadByte(const Shape& s, int block, int head, int token, int channel)

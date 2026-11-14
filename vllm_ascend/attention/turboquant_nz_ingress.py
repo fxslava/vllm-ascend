@@ -34,7 +34,7 @@ axes, every one of them read off production code rather than inferred:
    channel ``c`` with channel ``c + headSize / 2``: ``UnpackAffine``
    (``op_kernel/common/turboquant_codec_mx.h``) widens a tile's bytes and
    DeInterleaves them into a low plane and a high plane of equal length, and
-   ``StageNzTileToL1`` stages the low plane on NZ groups ``[0, groups)`` and the
+   ``StageTileToL1`` stages the low plane on NZ groups ``[0, groups)`` and the
    high plane on ``[groups, 2 * groups)``. So packed column ``col`` carries
    channel ``col`` low and channel ``col + 128`` high.
 
@@ -144,7 +144,7 @@ def turboquant_nz_packed_byte(slot: int, kv_head: int, column: int, num_kv_heads
 def turboquant_nz_channel_nibble(channel: int, head_size: int) -> tuple[int, int]:
     """``(column, nibble)`` holding ``channel``; 0 is the low nibble, 1 the high.
 
-    The woven pairing of ``UnpackAffine`` plus ``StageNzTileToL1``: channel
+    The woven pairing of ``UnpackAffine`` plus ``StageTileToL1``: channel
     ``c`` and channel ``c + head_size / 2`` share one byte.
     """
     packed_bytes = head_size // TURBOQUANT_PACK_FACTOR

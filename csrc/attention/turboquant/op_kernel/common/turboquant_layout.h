@@ -115,7 +115,7 @@ constexpr uint64_t NzTiledPackedByte(uint64_t slot, uint64_t kvHead, uint64_t co
 //
 // so one byte carries channels (c, c + headSize/2) of ONE token. That is forced by the decode's
 // own expand: UnpackAffine (src/common/turboquant_codec_mx.h) DeInterleaves a chunk into a low
-// plane and a high plane of equal length, and StageNzTileToL1
+// plane and a high plane of equal length, and StageTileToL1
 // (src/decode/vector/turboquant_vector_service.h) stages the low plane at L1 offset 0 and the
 // high plane at + tilePlaneBytes_. The L1 operand is the kCubeTileRows x headSize NZ image whose
 // groups span kOperandC0 channels each, so the low plane lands on channels [0, headSize/2) and

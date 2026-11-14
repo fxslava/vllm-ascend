@@ -306,7 +306,11 @@ struct Fixture {
         scales.assign(std::size_t(physical_pages) * block * 8, poison);
         table.assign(aligned(std::size_t(b) * pages * 4) / 4, -1);
         lengths.assign(aligned(b * 4) / 4, 0);
-        const float scale = tq::TurboQuantModeTraits<tq::TurboQuantMode::KV4_FP8>::kGain * 2;
+        // The dequantisation contract is the writers' and the PyTorch golden's: a stored signed
+        // nibble n reconstructs as n * stored_scale, with no centroid offset and no codebook gain.
+        // A stored scale of 2 makes the key row's dequantised level 2 * key_level and a value
+        // channel's 2 * value_level -- integers the fp32 recurrence reproduces exactly.
+        const float scale = 2.0f;
         for (int request = 0; request < b; ++request) {
             lengths[request] = n;
             for (int page = 0; page < pages; ++page) {
@@ -334,9 +338,9 @@ struct Fixture {
                     double numerator = 0, denominator = 0;
                     for (int tile = 0; tile < tiles(); ++tile) {
                         const int live = valid_rows(tile);
-                        const double score = (2 * key_level(request, head, tile) + 1) * coefficient / 16.0;
+                        const double score = 2 * key_level(request, head, tile) * coefficient / 16.0;
                         const double weight = live * std::exp(score);
-                        numerator += weight * (2 * value_level(request, head, tile, col) + 1);
+                        numerator += weight * (2 * value_level(request, head, tile, col));
                         denominator += weight;
                     }
                     expected[base + col] = static_cast<float>(numerator / denominator);
@@ -361,10 +365,13 @@ struct Fixture {
     }
     static unsigned key_level(int request, int head, int tile)
     { return (tile + 2 * request + 3 * head) % 8; }
+    // In [1, 7] rather than [0, 7]: the oracle's expected row is a weighted average of
+    // 2 * value_level over the tiles, and reference_bfloat16 admits only [1, 15]. A zero level
+    // would put a tile-dominated average under 1; [1, 7] keeps every expected value in [2, 14].
     static unsigned value_level(int request, int head, int tile, int channel)
     {
         const int col = channel < 128 ? channel : (channel - 128 + 3) % 128;
-        return (tile + 3 * request + 5 * head + col) % 8;
+        return 1u + (tile + 3 * request + 5 * head + col) % 7;
     }
     // The raw-query inputs. `raw_query` is the ORIGINAL-basis query whose rotation is the
     // pre-rotated `query` above: Pi is an involution, so that is simply Pi(query). It is encoded in
