@@ -759,15 +759,21 @@ def test_the_fused_decode_matches_the_golden_attention_serving_geometry(context:
         f"output absmax={output.abs().max().item():.6g}, "
         f"workspace absmax={workspace.abs().max().item():.6g}"
     )
-    # Prologue content probe: the rotated query must be the golden rotation,
-    # bit-exactly (the harness's NPU runner achieves 24576/24576 bytes). A
-    # mismatch here means the deployed binary's prologue is not the current
-    # source's, whatever the absmax looks like.
+    # Prologue content probe: the rotated query against the golden rotation.
+    # Bit-exactness is NOT expected here: the harness's "65536/65536 bytes
+    # bit-exact" holds because its fixture is integer-valued, so every
+    # butterfly intermediate is exact and no rounding exists to diverge. A
+    # random query makes the dense fp32 matmul and the kernel's butterfly two
+    # different summation orders of the same value, which is a few fp32 ULP of
+    # disagreement by construction -- a mismatch of ~1 ULP exonerates the
+    # prologue, it does not indict it.
     golden_rot = (emulator.rotate(query[0].float()) * emulator.inv_sqrt_len).cpu()
     rot = query_rot.view(SERVING_NUM_HEADS, HEAD_SIZE).cpu()
+    rot_diff = (rot - golden_rot).abs().max().item()
+    rot_ulp = rot_diff / max(float(golden_rot.abs().max().item()), 1e-30) * 2**23
     print(
-        f"  prologue probe: query_rot bit-exact vs golden = {torch.equal(rot, golden_rot)}, "
-        f"max abs diff = {(rot - golden_rot).abs().max().item():.6g}"
+        f"  prologue probe: query_rot max abs diff = {rot_diff:.6g} "
+        f"(~{rot_ulp:.1f} fp32 ULP of the row max; bit-exact {torch.equal(rot, golden_rot)})"
     )
 
     expected = _golden_attention_fp32(golden_adapter, emulator, caches, block_tables, query, context, SERVING_SCALE)
