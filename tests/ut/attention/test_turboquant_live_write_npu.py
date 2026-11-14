@@ -599,8 +599,8 @@ def _build_decode_tiling(
         int(descriptor[10]),
     )
     print(
-        f"  tiling probe: num_tiles={num_tiles} regular={regular_tiles} tail_rows={tail_rows} "
-        f"flags={flags:#x} words={descriptor.tolist()}"
+        f"  tiling probe: context_lens_host={context_lens_host.tolist()}, num_tiles={num_tiles} "
+        f"regular={regular_tiles} tail_rows={tail_rows} flags={flags:#x} words={descriptor.tolist()}"
     )
     assert num_tiles > 0 and flags & 1, (
         f"the builder op left a dead descriptor (num_tiles={num_tiles}, flags={flags:#x}); "
@@ -722,8 +722,10 @@ def test_the_fused_decode_matches_the_golden_attention_serving_geometry(context:
 
     splits = TURBOQUANT_DECODE_SPLITS
     heads_per_task = turboquant_decode_heads_per_task(SERVING_NUM_HEADS, SERVING_NUM_KV_HEADS)
+    # The builder is host C++; feed it the host constant, not a device readback,
+    # so "dead descriptor" can only mean the fill, never the copy source.
     tiling, workspace, query_rot = _build_decode_tiling(
-        context_lens.cpu(), SERVING_BLOCK_SIZE, pages, splits, heads_per_task, batch=1
+        torch.tensor([context], dtype=torch.int32), SERVING_BLOCK_SIZE, pages, splits, heads_per_task, batch=1
     )
     fused = decode_adapter.fused_decode(
         query=query,
@@ -747,9 +749,13 @@ def test_the_fused_decode_matches_the_golden_attention_serving_geometry(context:
     # Launch probe: the prologue must have written the rotated query and the
     # kernel the output. query_rot all zero means the kernel never executed;
     # query_rot live with output all zero means the decode skipped every worker
-    # (the descriptors it read were dead, whatever the host probe says).
+    # (the descriptors it read were dead, whatever the host probe says) -- but
+    # only after proving the comparison looks at the buffer the op wrote.
     print(
-        f"  launch probe: query_rot absmax={query_rot.abs().max().item():.6g}, "
+        f"  launch probe: fused is output={fused is output}, "
+        f"same data_ptr={fused.data_ptr() == output.data_ptr()}, "
+        f"query_rot absmax={query_rot.abs().max().item():.6g}, "
+        f"fused absmax={fused.abs().max().item():.6g}, "
         f"output absmax={output.abs().max().item():.6g}"
     )
 
@@ -795,8 +801,10 @@ def test_the_fused_decode_reads_the_kernel_written_cache_serving_geometry(contex
 
     splits = TURBOQUANT_DECODE_SPLITS
     heads_per_task = turboquant_decode_heads_per_task(SERVING_NUM_HEADS, SERVING_NUM_KV_HEADS)
+    # The builder is host C++; feed it the host constant, not a device readback,
+    # so "dead descriptor" can only mean the fill, never the copy source.
     tiling, workspace, query_rot = _build_decode_tiling(
-        context_lens.cpu(), SERVING_BLOCK_SIZE, pages, splits, heads_per_task, batch=1
+        torch.tensor([context], dtype=torch.int32), SERVING_BLOCK_SIZE, pages, splits, heads_per_task, batch=1
     )
     fused = decode_adapter.fused_decode(
         query=query,
@@ -863,7 +871,7 @@ def test_the_fused_decode_handles_two_requests_serving_geometry() -> None:
     splits = TURBOQUANT_DECODE_SPLITS
     heads_per_task = turboquant_decode_heads_per_task(SERVING_NUM_HEADS, SERVING_NUM_KV_HEADS)
     tiling, workspace, query_rot = _build_decode_tiling(
-        context_lens.cpu(), SERVING_BLOCK_SIZE, max_pages, splits, heads_per_task, batch=batch
+        torch.tensor(contexts, dtype=torch.int32), SERVING_BLOCK_SIZE, max_pages, splits, heads_per_task, batch=batch
     )
     fused = decode_adapter.fused_decode(
         query=query,
