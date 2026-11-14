@@ -587,6 +587,25 @@ def _build_decode_tiling(
         num_splits,
         heads_per_task,
     )
+    # Readback probe: the builder op must have left live descriptors in GM. A
+    # zero word zero here means the fill never happened (host side); a live
+    # descriptor here with an all-zero decode output means the kernel skipped
+    # every worker despite a valid descriptor (device side).
+    descriptor = tiling[:16].cpu()
+    num_tiles, regular_tiles, tail_rows, flags = (
+        int(descriptor[0]),
+        int(descriptor[1]),
+        int(descriptor[2]),
+        int(descriptor[10]),
+    )
+    print(
+        f"  tiling probe: num_tiles={num_tiles} regular={regular_tiles} tail_rows={tail_rows} "
+        f"flags={flags:#x} words={descriptor.tolist()}"
+    )
+    assert num_tiles > 0 and flags & 1, (
+        f"the builder op left a dead descriptor (num_tiles={num_tiles}, flags={flags:#x}); "
+        "the fused decode will skip every worker and report success over an untouched output"
+    )
     return tiling, workspace, query_rot
 
 
@@ -724,6 +743,15 @@ def test_the_fused_decode_matches_the_golden_attention_serving_geometry(context:
     )
     torch.npu.synchronize()
     assert fused is not None, "the decode stage is on and the op is registered, so it must run"
+
+    # Launch probe: the prologue must have written the rotated query and the
+    # kernel the output. query_rot all zero means the kernel never executed;
+    # query_rot live with output all zero means the decode skipped every worker
+    # (the descriptors it read were dead, whatever the host probe says).
+    print(
+        f"  launch probe: query_rot absmax={query_rot.abs().max().item():.6g}, "
+        f"output absmax={output.abs().max().item():.6g}"
+    )
 
     expected = _golden_attention_fp32(golden_adapter, emulator, caches, block_tables, query, context, SERVING_SCALE)
     _assert_attention_close("fused decode", output, expected, context)
