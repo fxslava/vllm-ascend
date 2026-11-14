@@ -3532,6 +3532,12 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
             )
 
         tiling, workspace, query_rot = self._decode_buffers(attn_metadata, batch_size)
+        validate = self._decode_validation_enabled()
+        if validate:
+            # Poison the output so the validation can tell "the kernel wrote a
+            # zero accumulator" (poison overwritten by zeros) apart from "the
+            # kernel never wrote" (poison survives the launch).
+            output[:batch_size].fill_(float("nan"))
         fused = self.adapter.fused_decode(
             query=query[:batch_size],
             key_cache=self.key_cache,
@@ -3549,7 +3555,7 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
             query_rot=query_rot,
         )
         if fused is not None:
-            if self._decode_validation_enabled():
+            if validate:
                 self._validate_decode_against_golden(query, attn_metadata, output, batch_size, tiling)
             return output
 
@@ -3598,6 +3604,14 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
         it stops the engine before the next token can overwrite the evidence.
         """
         npu_out = output[:batch_size].clone().to(torch.float32)
+        poison_survived = bool(torch.isnan(npu_out).all().item())
+        if poison_survived:
+            logger.warning(
+                "TURBOQUANT FUSED DECODE: the NaN poison pre-filled into output survived the "
+                "launch intact over %d token(s) -- the kernel NEVER WROTE output (no worker "
+                "committed), as opposed to writing a zero accumulator.",
+                batch_size,
+            )
         dense_key, dense_value = self._gather_dense_kv(attn_metadata, batch_size, query.dtype)
         golden = self._fused_infer_attention(
             query=query[:batch_size].unsqueeze(1),
