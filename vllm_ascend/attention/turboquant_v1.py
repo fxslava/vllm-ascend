@@ -755,6 +755,13 @@ TURBOQUANT_PARTIAL_TAIL: Final[int] = 16
 # capture-contract gate reads the same number production uses.
 TURBOQUANT_STAGING_SLOTS: Final[int] = 2
 
+# The KV length ``build()`` appends for its FIA dummy request when the TND
+# layout needs the q-derived batch size bumped (attention_v1.py:387-390). It is
+# the only non-zero value the padded tail beyond ``num_reqs`` may carry: this
+# builder overwrites those rows with 0 for the fused decode, so any other value
+# there is a stale length from a longer previous batch.
+TURBOQUANT_FIA_DUMMY_KV_LEN: Final[int] = 1
+
 
 def turboquant_decode_heads_per_task(num_heads: int, num_kv_heads: int) -> int:
     """``heads_per_task`` for one launch, derived in exactly one place.
@@ -1594,6 +1601,20 @@ class TurboQuantOpsAdapter:
         if slots.numel() == 0:
             return
 
+        # The lower bound is the filter above; the upper bound is what keeps a
+        # slot past the cache from wrapping into the flat view (or reading past
+        # it) instead of landing where the writer meant. Derived from the cache
+        # itself, so the page geometry and the bound cannot drift apart.
+        num_blocks = key_cache.shape[0]
+        upper = num_blocks * block_size
+        actual_max = int(slots.max())
+        if actual_max >= upper:
+            raise ValueError(
+                f"slot_mapping is out of range for the TurboQuant cache: expected slots in "
+                f"[0, {upper}) ({num_blocks} blocks x {block_size} tokens, from key_cache.shape="
+                f"{tuple(key_cache.shape)}), but the largest non-negative slot is {actual_max}."
+            )
+
         pages = torch.div(slots, block_size, rounding_mode="floor")
         offsets = slots - pages * block_size
 
@@ -1803,6 +1824,11 @@ class TurboQuantOpsAdapter:
         reconciled, so the un-packing and un-rotation above it never learn which
         writer ran.
         """
+        # Checked before either branch: a negative page or one past the cache
+        # lets the golden reader wrap or raise, and lets a page the allocator
+        # never wrote pass for a valid one. ``num_blocks`` is the cache's own
+        # leading extent, so there is no second source of truth to drift.
+        self._validate_block_tables(block_tables, int(key_cache.shape[0]))
         if self._has_kernel(TURBOQUANT_OP_GATHER_PAGES):
             _trace_turboquant_dispatch(
                 TURBOQUANT_OP_GATHER_PAGES,
@@ -1832,6 +1858,34 @@ class TurboQuantOpsAdapter:
         if layout is TurboQuantValueLayout.NZ_TILED:
             return self._golden_gather_pages_nz(key_cache, value_cache, scale_cache, block_tables)
         return self._golden_gather_pages(key_cache, value_cache, scale_cache, block_tables)
+
+    @staticmethod
+    def _validate_block_tables(block_tables: torch.Tensor, num_blocks: int) -> None:
+        """Refuse a page id the cache does not have, before any gather indexes it.
+
+        The golden readers index the page axis directly, so a negative id wraps
+        to the last page and an id past the end raises inside the read; the
+        kernel gather would instead read whatever address the id maps to. Either
+        way a dirty block table turns a validation run into a silent
+        out-of-bounds read or a false pass, so the range is checked here, at the
+        one entry that dispatches to either reader.
+
+        An empty table has no page to check and is skipped: ``min()``/``max()``
+        raise on an empty reduction, and the readers' own handling of an empty
+        batch is not this guard's business.
+        """
+        if block_tables.numel() == 0:
+            return
+        low = block_tables.min()
+        high = block_tables.max()
+        if bool(low < 0) or bool(high >= num_blocks):
+            raise ValueError(
+                f"block_tables must lie in [0, {num_blocks}) -- num_blocks is key_cache.shape[0], "
+                f"the cache's own page count -- but block_tables has min={int(low)} and "
+                f"max={int(high)} (shape {tuple(block_tables.shape)}). A negative page wraps onto "
+                "the last page in the golden reader, and a page past the end reads outside the "
+                "cache; both are refused before any gather happens."
+            )
 
     def _kernel_gather_pages(
         self,
@@ -2038,6 +2092,13 @@ class TurboQuantOpsAdapter:
         and returns having written nothing. The decode would report success over
         an untouched output. So a caller without them is a programming error and
         says so.
+
+        Once the stage gate clears, the geometry is checked before the launch:
+        both ``query`` and ``output`` must be
+        :data:`TURBOQUANT_KERNEL_DTYPE`, they must not share storage, and the
+        scale plane must cover one slot-major record per cache slot. None of
+        this runs on the ``None`` branch, so the golden fallback keeps serving
+        every dtype it always did.
         """
         if not self._has_kernel(TURBOQUANT_OP_FUSED_DECODE):
             _trace_turboquant_dispatch(
@@ -2055,6 +2116,10 @@ class TurboQuantOpsAdapter:
                 query_rot=query_rot,
             )
             return None
+        # Defense-in-depth at the adapter, checked only once the stage gate has
+        # cleared: the golden fallback above legally serves any dtype, so a
+        # check before the gate would reject the path it must not reject.
+        self._validate_fused_decode_geometry(query, key_cache, scale_cache, output, num_kv_heads)
         _trace_turboquant_dispatch(
             TURBOQUANT_OP_FUSED_DECODE,
             True,
@@ -2095,6 +2160,57 @@ class TurboQuantOpsAdapter:
             scale=scale,
             inv_sqrt_len=emulator.inv_sqrt_len,
         )
+
+    def _validate_fused_decode_geometry(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        scale_cache: torch.Tensor,
+        output: torch.Tensor,
+        num_kv_heads: int,
+    ) -> None:
+        """Refuse a launch the fused DECODE kernel cannot serve correctly.
+
+        Called only after :meth:`fused_decode` has decided the kernel will run,
+        so the golden fallback keeps accepting every floating dtype and does
+        not pay for these checks. The binding ``TORCH_CHECK``s the dtypes too
+        (``torch_bindings.cpp:934``); this is the same refusal one level earlier,
+        where the message can name the tensor instead of an ``at::Tensor``
+        argument, and it also covers the two Python-only failure modes the
+        binding cannot see: an aliased output and an undersized scale plane.
+        """
+        if query.dtype != TURBOQUANT_KERNEL_DTYPE:
+            raise TypeError(
+                f"the fused TurboQuant decode kernel only has {TURBOQUANT_KERNEL_DTYPE} "
+                f"instances, but query.dtype is {query.dtype} (query shape "
+                f"{tuple(query.shape)}). The golden fallback serves any floating dtype; "
+                "this is the kernel launch path."
+            )
+        if output.dtype != TURBOQUANT_KERNEL_DTYPE:
+            raise TypeError(
+                f"the fused TurboQuant decode kernel writes {TURBOQUANT_KERNEL_DTYPE} only, but "
+                f"output.dtype is {output.dtype} (output shape {tuple(output.shape)}). The "
+                "golden fallback serves any floating dtype; this is the kernel launch path."
+            )
+        if query.data_ptr() == output.data_ptr():
+            raise ValueError(
+                f"query and output must not alias: both are at data_ptr={query.data_ptr()}. "
+                "The fused decode reads the query through its whole prologue while writing "
+                "output, so an in-place call would overwrite the query it is still reading."
+            )
+
+        num_blocks = int(key_cache.shape[0])
+        block_size = int(key_cache.shape[1])
+        slot_floats = self._nz_scale_slot_floats(num_kv_heads)
+        need = num_blocks * block_size * slot_floats
+        if scale_cache.numel() < need:
+            raise ValueError(
+                f"scale_cache is too small for the fused TurboQuant decode: it holds "
+                f"{scale_cache.numel()} floats, but the kernel reads {slot_floats} floats per "
+                f"slot (NzScaleSlotFloats({num_kv_heads})) over {num_blocks} blocks x "
+                f"{block_size} tokens = {need} (key_cache.shape={tuple(key_cache.shape)}, "
+                f"scale_cache.shape={tuple(scale_cache.shape)})."
+            )
 
     def _kernel_fused_decode(
         self,
@@ -2799,12 +2915,21 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
         is the one row carrying a 1. Both facts matter: if the runner ever
         stopped zeroing, a stale length from a longer previous batch would make
         a padding row live, and over the split-K limit it would also flip that
-        row's fuse decision (``turboquant_tiling.cpp:93``).
+        row's fuse decision (``turboquant_tiling.cpp:93``). The tail is therefore
+        checked before it is masked: the only values it may carry are 0 (the
+        runner's padding) and :data:`TURBOQUANT_FIA_DUMMY_KV_LEN`; anything else
+        is refused instead of silently zeroed.
 
         Returns both views because the caller needs both: the device prefix is
         what the launch reads, and the host slot is what ``build_decode_tiling``
         reads to derive each worker's tile count.
         """
+        assert seq_lens.device.type == "cpu", (
+            f"_refresh_context_lens stages `seq_lens` into a host ring, but seq_lens is on "
+            f"device {seq_lens.device!r} (device type {seq_lens.device.type!r}). A device "
+            "tensor would force a per-step device-to-host synchronisation here and break "
+            "ACL graph capture; the CPU mirror is what this method exists to upload."
+        )
         num_reqs = int(common_attn_metadata.num_reqs)
         padded = int(seq_lens.shape[0])
         if padded > self._max_num_reqs:
@@ -2813,10 +2938,29 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
                 f"carries {padded}. max_num_seqs is what sizes the launch buffers."
             )
         live = min(num_reqs, padded)
-        host = self._context_lens_host_ring[self._staging_step % self._staging_slots]
+        host = self._staging_slot()
         self._staging_step += 1
         host[:live] = seq_lens[:live].to(torch.int32)
         if padded > live:
+            # Everything past num_reqs is either cudagraph padding the runner
+            # already zeroed or the FIA dummy build() appends with a length of
+            # 1. Refuse anything else before masking it: a stale length from a
+            # longer previous batch is an upstream bug this builder must not
+            # swallow, and over the split-K limit it would also flip that row's
+            # fuse decision (turboquant_tiling.cpp:93).
+            tail = seq_lens[num_reqs:]
+            if tail.numel():
+                dirty = (tail != 0) & (tail != TURBOQUANT_FIA_DUMMY_KV_LEN)
+                if bool(dirty.any()):
+                    offending = (num_reqs + torch.nonzero(dirty, as_tuple=False).flatten()).tolist()
+                    raise RuntimeError(
+                        f"seq_lens[{num_reqs}:] carries a dirty padded tail: expected all 0 "
+                        f"(cudagraph padding) or all {TURBOQUANT_FIA_DUMMY_KV_LEN} (the FIA dummy "
+                        f"build() appends), but seq_lens has max={int(tail.max())}, "
+                        f"min={int(tail.min())} at indices {offending} (shape "
+                        f"{tuple(seq_lens.shape)}, num_reqs={num_reqs}). Refusing rather than "
+                        "masking a stale length."
+                    )
             # The FIA dummy requests. Zero, not one: see the docstring.
             host[live:padded] = 0
         # Asynchronous only where the staging is pinned: a non-blocking copy out
@@ -2825,6 +2969,49 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
         # the host believes it may reuse the source.
         self._context_lens[:padded].copy_(host[:padded], non_blocking=self._staging_pinned)
         return self._context_lens[:padded], host
+
+    def _staging_slot(self) -> torch.Tensor:
+        """The host staging slot for this step, with the ring invariants checked.
+
+        The asynchronous-upload argument in ``__init__`` is a two-slot contract:
+        a host buffer rewritten while its own non-blocking copy is still in
+        flight is a torn upload, not a stale one, and depth two is the minimum
+        that makes reuse safe on an in-order stream. The checks are Python
+        attribute reads on two small CPU tensors -- no ``item()``, no D2H -- so
+        they are paid on every step rather than trusted from ``__init__``, which
+        the capture-contract tests bypass with ``object.__new__``.
+        """
+        slots = self._staging_slots
+        ring = self._context_lens_host_ring
+        assert slots == TURBOQUANT_STAGING_SLOTS, (
+            f"the TurboQuant host staging ring has {slots} slots, but the asynchronous upload "
+            f"contract needs exactly {TURBOQUANT_STAGING_SLOTS}: two is the minimum depth that "
+            "lets a step overwrite slot N while step N-1's non-blocking copy is still in flight."
+        )
+        assert len(ring) == slots, (
+            f"`_context_lens_host_ring` has {len(ring)} buffers but `_staging_slots` says "
+            f"{slots}; the ring and the modulo that indexes it must agree."
+        )
+        assert isinstance(self._staging_step, int) and self._staging_step >= 0, (
+            f"`_staging_step` must be a non-negative int, got {self._staging_step!r}; a negative "
+            "step would wrap the modulo onto an arbitrary slot."
+        )
+        index = self._staging_step % slots
+        assert 0 <= index < slots, f"staging index {index} is outside the {slots}-slot ring"
+        for position, slot in enumerate(ring):
+            assert slot.shape == (self._max_num_reqs,), (
+                f"staging slot {position} has shape {tuple(slot.shape)}, expected "
+                f"({self._max_num_reqs},): every slot must cover the whole device buffer."
+            )
+            assert slot.dtype == torch.int32, (
+                f"staging slot {position} has dtype {slot.dtype}, expected torch.int32: it is "
+                "uploaded into the int32 context-lens buffer."
+            )
+            assert slot.device.type == "cpu", (
+                f"staging slot {position} is on device {slot.device!r}, expected a CPU tensor: "
+                "a device staging slot defeats the single host-to-device upload."
+            )
+        return ring[index]
 
     def _refresh_tiling(self, host_context_lens: torch.Tensor, tokens: int) -> None:
         """Fill the tiling descriptors for this step, for every layer at once.
@@ -3057,15 +3244,6 @@ def _stream_is_capturing() -> bool:
 # (EZ9903) and only npu_fused_infer_attention_score_v2 exists; auto discovers
 # that from the first refusal instead of hardcoding a SoC test.
 TURBOQUANT_FIA_VERSION_ENV: Final[str] = "TURBOQUANT_FIA_VERSION"
-
-# 0 | 1. Debug switch for the gh=6 scale-fading investigation: with it on, the
-# fused decode is replayed on the golden path right after every kernel launch,
-# and a drift past fp16/bf16 tolerance dumps the kernel inputs to
-# tq_gh6_crash_dump/ and halts. Off by default, because the check does
-# everything the capture contract forbids on the launch path -- a dense gather,
-# an FIA call, a device-to-host max, and on failure disk writes -- which is why
-# it is an investigation tool and not a production gate.
-TURBOQUANT_DECODE_VALIDATE_ENV: Final[str] = "TURBOQUANT_DECODE_VALIDATE"
 
 
 class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
@@ -3532,12 +3710,6 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
             )
 
         tiling, workspace, query_rot = self._decode_buffers(attn_metadata, batch_size)
-        validate = self._decode_validation_enabled()
-        if validate:
-            # Poison the output so the validation can tell "the kernel wrote a
-            # zero accumulator" (poison overwritten by zeros) apart from "the
-            # kernel never wrote" (poison survives the launch).
-            output[:batch_size].fill_(float("nan"))
         fused = self.adapter.fused_decode(
             query=query[:batch_size],
             key_cache=self.key_cache,
@@ -3555,8 +3727,6 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
             query_rot=query_rot,
         )
         if fused is not None:
-            if validate:
-                self._validate_decode_against_golden(query, attn_metadata, output, batch_size, tiling)
             return output
 
         dense_key, dense_value = self._gather_dense_kv(attn_metadata, batch_size, query.dtype)
@@ -3572,93 +3742,6 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
         )
         output[:batch_size] = attn_output.view(batch_size, self.num_heads, self.head_size)
         return output
-
-    def _decode_validation_enabled(self) -> bool:
-        """Whether the decode/golden differential runs after each kernel launch.
-
-        Resolved once and cached, so the capture path pays one env read in the
-        lifetime of the layer. The attribute is read with ``getattr`` because
-        the capture-contract tests construct the impl with ``object.__new__``
-        and never run ``__init__``.
-        """
-        enabled = getattr(self, "_decode_validate_cached", None)
-        if enabled is None:
-            enabled = os.getenv(TURBOQUANT_DECODE_VALIDATE_ENV, "0").strip().lower() in ("1", "true", "on")
-            self._decode_validate_cached = enabled
-        return enabled
-
-    def _validate_decode_against_golden(
-        self,
-        query: torch.Tensor,
-        attn_metadata: AscendMetadata,
-        output: torch.Tensor,
-        batch_size: int,
-        tiling: torch.Tensor,
-    ) -> None:
-        """DEBUG (gh=6 scale-fading investigation): replay the decode on the golden
-        path right after the fused kernel returns, and halt with a binary dump of
-        the kernel inputs when the two drift apart past fp16/bf16 tolerance.
-
-        The dump lands in ``tq_gh6_crash_dump/`` as raw ``.bin`` files, in the
-        layout a CAModel C++ replay consumes them. The ``raise`` is deliberate:
-        it stops the engine before the next token can overwrite the evidence.
-        """
-        npu_out = output[:batch_size].clone().to(torch.float32)
-        poison_survived = bool(torch.isnan(npu_out).all().item())
-        if poison_survived:
-            logger.warning(
-                "TURBOQUANT FUSED DECODE: the NaN poison pre-filled into output survived the "
-                "launch intact over %d token(s) -- the kernel NEVER WROTE output (no worker "
-                "committed), as opposed to writing a zero accumulator.",
-                batch_size,
-            )
-        dense_key, dense_value = self._gather_dense_kv(attn_metadata, batch_size, query.dtype)
-        golden = self._fused_infer_attention(
-            query=query[:batch_size].unsqueeze(1),
-            key=dense_key,
-            value=dense_value,
-            input_layout="BSND",
-            actual_seq_lengths=None,
-            actual_seq_lengths_kv=attn_metadata.seq_lens_list,
-            atten_mask=None,
-            sparse_mode=0,
-        )
-        golden_out = golden.view(batch_size, self.num_heads, self.head_size).to(torch.float32)
-
-        max_diff = (npu_out - golden_out).abs().max().item()
-        if max_diff <= 0.01:
-            return
-
-        logger.warning(
-            "TURBOQUANT FUSED DECODE MISMATCH: the kernel drifts from the PyTorch golden "
-            "by max abs %.6g (> 0.01) over %d token(s), %d heads x %d; dumping the kernel "
-            "inputs to tq_gh6_crash_dump/ and halting.",
-            max_diff,
-            batch_size,
-            self.num_heads,
-            self.head_size,
-        )
-        dump_dir = "tq_gh6_crash_dump"
-        os.makedirs(dump_dir, exist_ok=True)
-        tensors = {
-            "query": query[:batch_size],
-            "key_cache": self.key_cache,
-            "value_cache": self.value_cache,
-            "scale_cache": self.scale_cache,
-            "block_tables": attn_metadata.block_tables[:batch_size],
-            "context_lens": self._decode_context_lens(attn_metadata, batch_size),
-            "tiling": tiling,
-            "npu_out": npu_out,
-            "golden_out": golden_out,
-        }
-        for name, tensor in tensors.items():
-            path = os.path.join(dump_dir, f"{name}.bin")
-            tensor.detach().cpu().contiguous().numpy().tofile(path)
-            logger.warning("  dumped %s %s %s -> %s", name, tuple(tensor.shape), tensor.dtype, path)
-        raise RuntimeError(
-            f"TurboQuant fused decode diverged from the golden attention by {max_diff:.6g}; "
-            f"the kernel inputs are in {dump_dir}/ for the CAModel replay."
-        )
 
     @staticmethod
     def _decode_num_tokens(attn_metadata: AscendMetadata) -> int:
@@ -3917,6 +4000,12 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
     def _open_profiler(self) -> Any | None:
         """A CPU+NPU profiler that exports its trace, or ``None`` if unavailable.
 
+        Gated here as well as in :meth:`forward`: the trace handler is the one
+        thing in this module that writes to disk, so it is constructed only on
+        an explicitly enabled, non-capturing call. A direct caller (or a future
+        refactor that forgets the gate in ``forward``) gets ``None`` instead of
+        a handler pointed at :data:`TURBOQUANT_PROFILE_TRACE_DIR`.
+
         ``on_trace_ready`` is the whole of it: torch_npu has no in-memory
         ``key_averages()``, so a profiler with no handler records a step and
         then has nothing any caller can read. ``tensorboard_trace_handler`` is
@@ -3928,6 +4017,8 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
         the default profiler level, and every knob left alone is one fewer
         version-dependent keyword.
         """
+        if not getattr(self, "_profile", False) or _stream_is_capturing():
+            return None
         profiler_module = getattr(torch_npu, "profiler", None)
         activity = getattr(profiler_module, "ProfilerActivity", None)
         trace_handler = getattr(profiler_module, "tensorboard_trace_handler", None)

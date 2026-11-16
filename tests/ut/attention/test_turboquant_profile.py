@@ -238,3 +238,88 @@ def test_capture_and_a_metadataless_forward_are_never_profiled(monkeypatch, prof
     assert run(metadata, True) == "attn_output"  # inside an ACL graph capture
     assert opened == []  # no profiler was ever opened
     assert profiled["calls"] == 2
+
+
+# -- the P0 cleanup: no debug validation, no crash dumps, no tracing by default
+
+
+def test_the_debug_decode_validation_and_its_disk_dumps_are_gone():
+    """The gh=6 investigation hook must not survive as a serving code path.
+
+    It replayed the decode on the golden path after every kernel launch, read a
+    device tensor back to the host and wrote raw ``.bin`` files. The symbols and
+    the dump writers are removed; the source scan is what proves nothing
+    reintroduces a dump under a different name.
+    """
+    import inspect
+
+    import vllm_ascend.attention.turboquant_v1 as module
+
+    assert not hasattr(module, "TURBOQUANT_DECODE_VALIDATE_ENV")
+    assert not hasattr(AscendTurboQuantBackendImpl, "_validate_decode_against_golden")
+    assert not hasattr(AscendTurboQuantBackendImpl, "_decode_validation_enabled")
+
+    source = inspect.getsource(module)
+    for removed in (
+        "TURBOQUANT_DECODE_VALIDATE",
+        "tq_gh6_crash_dump",
+        "tq_camodel_dump",
+        ".tofile(",
+    ):
+        assert removed not in source, f"{removed!r} is back in turboquant_v1.py"
+
+
+def test_profiling_is_off_by_default_and_constructs_no_trace_handler(monkeypatch, profiled):
+    """No env flag means no profiler, and therefore no handler and no files.
+
+    ``tensorboard_trace_handler`` is the only thing in this module that writes
+    to disk, so the disabled path is proved by the handler factory never being
+    called -- not merely by the profiler context never being entered.
+    """
+    monkeypatch.delenv(TURBOQUANT_PROFILE_ENV, raising=False)
+    impl = profiled["impl"]
+    assert turboquant_profile_enabled() is False
+    impl._profile = turboquant_profile_enabled()
+    monkeypatch.setattr(impl, "_ensure_statics", lambda layer, device: None, raising=False)
+
+    layer = type("Layer", (), {"layer_name": "model.layers.0.self_attn.attn"})()
+    metadata = type("Metadata", (), {"attn_state": AscendAttentionState.DecodeOnly})()
+    query = types.SimpleNamespace(device="cpu")
+
+    out = AscendTurboQuantBackendImpl.forward(
+        impl,
+        layer=layer,
+        query=query,
+        key=None,
+        value=None,
+        kv_cache=(),
+        attn_metadata=metadata,
+    )
+
+    assert out == "attn_output"
+    assert profiled["calls"] == 1
+    assert impl._profile is False
+    assert profiled["handlers"] == [], "a trace directory was configured while profiling was off"
+    assert "kwargs" not in profiled, "profile() was constructed while profiling was off"
+    assert profiled["notices"] == []
+
+
+def test_the_trace_handler_is_constructed_only_when_enabled_and_not_capturing(monkeypatch, profiled):
+    """The handler gate, proved at the one place the handler is built."""
+    module = profiled["module"]
+    impl = profiled["impl"]
+
+    impl._profile = False
+    assert impl._open_profiler() is None
+    assert profiled["handlers"] == []
+
+    impl._profile = True
+    monkeypatch.setattr(module, "_stream_is_capturing", lambda: True)
+    assert impl._open_profiler() is None
+    assert profiled["handlers"] == [], "a capture must never be handed a trace handler"
+
+    monkeypatch.setattr(module, "_stream_is_capturing", lambda: False)
+    opened = impl._open_profiler()
+    assert opened is profiled["prof"]
+    assert profiled["handlers"] == [TURBOQUANT_PROFILE_TRACE_DIR]
+    assert profiled["kwargs"]["on_trace_ready"] == f"handler({TURBOQUANT_PROFILE_TRACE_DIR})"

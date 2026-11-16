@@ -121,6 +121,7 @@ _ALLOWED = frozenset(
         "__getitem__",
         "__len__",
         "contiguous",  # a no-op on an already-contiguous tensor
+        "data_ptr",  # an address comparison, not a read of device memory
         "detach",
         "dim",
         "is_contiguous",
@@ -220,9 +221,22 @@ def _metadata(tokens: int = BATCH) -> Any:
     return types.SimpleNamespace(**fields)
 
 
+def _decode_scale_cache() -> torch.Tensor:
+    """A scale plane with one slot-major record per cache slot.
+
+    The fused decode reads ``NzScaleSlotFloats(H)`` floats per slot, which at
+    this fixture's H = 2 is twice the canonical ``2 * H`` token-major plane. The
+    launch-path geometry check needs a plane sized for the decode; only the byte
+    count matters here, because the op is a recorder.
+    """
+    slot_floats = TurboQuantOpsAdapter._nz_scale_slot_floats(NUM_KV_HEADS)
+    return torch.zeros(NUM_BLOCKS * BLOCK_SIZE * slot_floats, dtype=torch.float32)
+
+
 def _impl(adapter: TurboQuantOpsAdapter, emulator: TurboQuantEmulator, layer: Any) -> Any:
     impl = object.__new__(AscendTurboQuantBackendImpl)
-    impl.key_cache, impl.value_cache, impl.scale_cache = _caches()
+    impl.key_cache, impl.value_cache, _ = _caches()
+    impl.scale_cache = _decode_scale_cache()
     impl.emulator = emulator
     impl.adapter = adapter
     impl.num_heads = NUM_HEADS
@@ -944,6 +958,142 @@ def test_c5_the_real_staging_is_pinned_when_the_host_can_pin() -> None:
     assert "pin_memory()" in source
     assert "_staging_pinned = True" in source
     assert "_staging_pinned = False" in source, "a host with no pinned allocator must still work"
+
+
+# ---------------------------------------------------------------------------
+# P0 -- the debug decode/golden replay and its disk dumps are gone
+# ---------------------------------------------------------------------------
+
+
+def test_p0_the_validate_env_cannot_reintroduce_a_golden_replay_or_a_dump(
+    monkeypatch: pytest.MonkeyPatch, decode: dict[str, Any], tmp_path: Any
+) -> None:
+    """The old switch must be inert: one launch, no second golden pass, no files.
+
+    If the removed hook were restored, this call would replay the decode on the
+    golden path (and fail here, because the dense gather needs the canonical
+    scale plane), or write ``tq_gh6_crash_dump``. Both are refused by the test.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TURBOQUANT_DECODE_VALIDATE", "1")
+
+    _run_decode(decode)
+
+    assert len(decode["entry"].calls) == 1, "the decode must launch exactly once"
+    assert not (tmp_path / "tq_gh6_crash_dump").exists()
+    assert not (tmp_path / "tq_camodel_dump").exists()
+
+
+# ---------------------------------------------------------------------------
+# P1-P3 -- the metadata builder's input invariants
+# ---------------------------------------------------------------------------
+
+
+def test_p1_context_lens_must_arrive_on_the_host() -> None:
+    """A device ``seq_lens`` is a per-step D2H sync and a capture hazard.
+
+    A meta tensor is a real torch tensor on a non-CPU device and needs no NPU,
+    so the refusal can run here: the assertion has to fire before any slice or
+    copy touches the tensor.
+    """
+    builder = _builder()
+    device_tensor = torch.empty(2, dtype=torch.int32, device="meta")
+
+    with pytest.raises(AssertionError, match=r"seq_lens.*device type 'meta'"):
+        builder._refresh_context_lens(types.SimpleNamespace(num_reqs=2), device_tensor)
+
+
+def test_p1_a_cpu_context_lens_still_passes() -> None:
+    builder = _builder()
+    context_lens, host = builder._refresh_context_lens(
+        types.SimpleNamespace(num_reqs=2), torch.tensor([64, 128], dtype=torch.int32)
+    )
+    assert context_lens.tolist() == [64, 128]
+    assert host[:2].tolist() == [64, 128]
+
+
+def test_p2_the_staging_ring_invariants_are_enforced() -> None:
+    """Every way the two-slot ring can stop meaning what it claims.
+
+    Each mutation is applied to a fresh builder and must be refused by the
+    per-step check, which is the one the capture-contract fixtures (built with
+    ``object.__new__``) cannot get from ``__init__``.
+    """
+    common = types.SimpleNamespace(num_reqs=2)
+    seq_lens = torch.tensor([64, 128], dtype=torch.int32)
+
+    def refuse(mutate: Any, match: str) -> None:
+        builder = _builder()
+        mutate(builder)
+        with pytest.raises(AssertionError, match=match):
+            builder._refresh_context_lens(common, seq_lens)
+
+    refuse(lambda builder: setattr(builder, "_staging_slots", 1), "1 slots")
+    refuse(
+        lambda builder: setattr(builder, "_context_lens_host_ring", builder._context_lens_host_ring[:1]),
+        "1 buffers",
+    )
+    refuse(lambda builder: setattr(builder, "_staging_step", -1), "_staging_step")
+    refuse(
+        lambda builder: builder._context_lens_host_ring.__setitem__(
+            0, torch.zeros(MAX_NUM_REQS + 1, dtype=torch.int32)
+        ),
+        "slot 0 has shape",
+    )
+    refuse(
+        lambda builder: builder._context_lens_host_ring.__setitem__(0, torch.zeros(MAX_NUM_REQS, dtype=torch.int64)),
+        "slot 0 has dtype",
+    )
+    refuse(
+        lambda builder: builder._context_lens_host_ring.__setitem__(
+            0, torch.zeros(MAX_NUM_REQS, dtype=torch.int32, device="meta")
+        ),
+        "slot 0 is on device",
+    )
+
+
+def test_p2_a_clean_ring_passes_and_rotates_one_step_at_a_time() -> None:
+    builder = _builder()
+    common = types.SimpleNamespace(num_reqs=2)
+    first, host = builder._refresh_context_lens(common, torch.tensor([64, 128], dtype=torch.int32))
+    assert first.tolist() == [64, 128]
+    assert host.shape == (MAX_NUM_REQS,)
+    assert host.dtype == torch.int32
+    assert host.device.type == "cpu"
+    assert builder._staging_step == 1
+
+    second, next_host = builder._refresh_context_lens(common, torch.tensor([65, 129], dtype=torch.int32))
+    assert second.tolist() == [65, 129]
+    assert next_host.data_ptr() != host.data_ptr()
+    assert builder._staging_step == 2
+
+
+def test_p3_a_dirty_padded_tail_is_refused_with_its_indices() -> None:
+    """A stale length past ``num_reqs`` must not be silently masked to zero.
+
+    The documented FIA dummy is the only non-zero value that tail may carry
+    (``attention_v1.py:387-390``), so 7 is a stale length from a longer batch:
+    masking it hides an upstream bug that would otherwise make a padding row
+    live if this builder stopped zeroing it.
+    """
+    builder = _builder()
+    seq_lens = torch.tensor([64, 128, 7, 1], dtype=torch.int32)
+
+    with pytest.raises(RuntimeError, match=r"seq_lens\[2:\].*max=7.*indices \[2\]"):
+        builder._refresh_context_lens(types.SimpleNamespace(num_reqs=2), seq_lens)
+
+
+def test_p3_the_zero_padding_and_the_documented_fia_dummy_both_pass() -> None:
+    """Both legitimate tails are accepted, and both are staged as zeros."""
+    builder = _builder()
+    common = types.SimpleNamespace(num_reqs=2)
+    zeros, host_zeros = builder._refresh_context_lens(common, torch.tensor([64, 128, 0, 0], dtype=torch.int32))
+    assert zeros.tolist() == [64, 128, 0, 0]
+    assert host_zeros[:4].tolist() == [64, 128, 0, 0]
+
+    ones, host_ones = builder._refresh_context_lens(common, torch.tensor([64, 128, 1, 1], dtype=torch.int32))
+    assert ones.tolist() == [64, 128, 0, 0]
+    assert host_ones[:4].tolist() == [64, 128, 0, 0]
 
 
 # ---------------------------------------------------------------------------

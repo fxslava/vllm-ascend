@@ -128,6 +128,11 @@ struct Launch {
     // `RawQueryBuffers::raw_query` and `::gate` on the raw-query entry. Default 0, so a caller that
     // predates this field keeps the fp16 behaviour it had.
     std::uint32_t element_type = 0;
+    // DIRTY-DATA (D1/N3): the number of physical pages the cache planes actually hold
+    // (key_cache.size(0)). The device bound-checks every block-table page it reads against this,
+    // so a corrupt/negative entry past the 64-entry prefetch cache cannot become an unchecked GM
+    // read. 0 means "unknown" and the launcher refuses it rather than skipping the check.
+    std::uint32_t num_blocks = 0;
     // Diagnostic ABI only: production launcher never receives these fields.
     std::uint32_t probe_page = UINT32_MAX, probe_tile = 0;
 };
@@ -189,7 +194,7 @@ void turboquant_mm_fused_decode_opt_impl(int32_t mode, AscendType type, void *st
                                          uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,
                                          uint32_t numSplits, uint32_t headsPerTask, uint32_t tasksPerBlock,
                                          uint32_t reduceTasksPerBlock, uint32_t fusedContextLimit, float scale,
-                                         float invSqrtLen);
+                                         float invSqrtLen, uint32_t numBlocks);
 void turboquant_mm_fused_decode_opt_raw_query_impl(
     int32_t mode, AscendType type, void *stream, uint32_t blockDim, void *query, void *piSigns, void *rotTables,
     void *h16, void *gate, void *queryRot, void *keyCache, void *valueCache, void *scaleCache, void *blockTables,
@@ -198,5 +203,5 @@ void turboquant_mm_fused_decode_opt_raw_query_impl(
     uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits,
     uint32_t headsPerTask, uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock, uint32_t prologueVectorsPerBlock,
     uint32_t prologueCubeChunkVectors, uint32_t outputStage, uint32_t fusedContextLimit, float scale,
-    float invSqrtLen);
+    float invSqrtLen, uint32_t numBlocks);
 } // namespace vllm_ascend

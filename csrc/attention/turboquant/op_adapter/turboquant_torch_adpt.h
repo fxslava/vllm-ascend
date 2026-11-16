@@ -19,7 +19,10 @@ void turboquant_mm_fused_decode_opt_raw_query_impl(
     uint32_t num_splits, uint32_t heads_per_task, uint32_t tasks_per_block,
     uint32_t reduce_tasks_per_block, uint32_t prologue_vectors_per_block,
     uint32_t prologue_cube_chunk_vectors, uint32_t output_stage,
-    uint32_t fused_context_limit, float scale, float inv_sqrt_len);
+    uint32_t fused_context_limit, float scale, float inv_sqrt_len,
+    // DIRTY-DATA (D1/N3): physical page count of the cache planes; the device bounds every
+    // block-table page it reads against it. Kept in step with the include/ declaration.
+    uint32_t num_blocks);
 
 }  // namespace vllm_ascend
 

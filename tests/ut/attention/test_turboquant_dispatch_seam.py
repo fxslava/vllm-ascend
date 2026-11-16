@@ -140,6 +140,18 @@ def _caches() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     )
 
 
+def _decode_caches() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Caches with the scale plane a fused decode launch needs.
+
+    The decode reads one slot-major record per slot, which at this fixture's
+    H = 2 is twice the canonical token-major plane; the launch-path geometry
+    check refuses the token-major one before the op is called.
+    """
+    key, value, _ = _caches()
+    slot_floats = TurboQuantOpsAdapter._nz_scale_slot_floats(NUM_KV_HEADS)
+    return key, value, torch.zeros(NUM_BLOCKS * BLOCK_SIZE * slot_floats, dtype=torch.float32)
+
+
 def _activations(num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
     generator = torch.Generator().manual_seed(20261107)
     shape = (num_tokens, NUM_KV_HEADS, HEAD_SIZE)
@@ -885,9 +897,9 @@ def _launch_buffers(tokens: int, num_heads: int, head_size: int = HEAD_SIZE) -> 
 
 
 def _fused_decode(adapter: TurboQuantOpsAdapter, emulator: TurboQuantEmulator) -> torch.Tensor | None:
-    caches = _caches()
+    caches = _decode_caches()
     return adapter.fused_decode(
-        query=torch.randn(1, 2, HEAD_SIZE),
+        query=torch.randn(1, 2, HEAD_SIZE, dtype=torch.bfloat16),
         key_cache=caches[0],
         value_cache=caches[1],
         scale_cache=caches[2],
@@ -897,7 +909,7 @@ def _fused_decode(adapter: TurboQuantOpsAdapter, emulator: TurboQuantEmulator) -
         num_heads=2,
         num_kv_heads=NUM_KV_HEADS,
         scale=0.125,
-        output=torch.zeros(1, 2, HEAD_SIZE),
+        output=torch.zeros(1, 2, HEAD_SIZE, dtype=torch.bfloat16),
         **_launch_buffers(1, 2),
     )
 
@@ -920,12 +932,12 @@ def test_fused_decode_launches_and_returns_its_output(
     entry = _Recorder()
     _register(monkeypatch, npu_turboquant_fused_decode=entry)
     adapter = _adapter(TurboQuantKernelStage.DECODE)
-    caches = _caches()
-    output = torch.zeros(1, 2, HEAD_SIZE)
+    caches = _decode_caches()
+    output = torch.zeros(1, 2, HEAD_SIZE, dtype=torch.bfloat16)
 
     assert adapter._has_kernel(TURBOQUANT_OP_FUSED_DECODE) is True
     returned = adapter.fused_decode(
-        query=torch.randn(1, 2, HEAD_SIZE),
+        query=torch.randn(1, 2, HEAD_SIZE, dtype=torch.bfloat16),
         key_cache=caches[0],
         value_cache=caches[1],
         scale_cache=caches[2],
@@ -955,8 +967,8 @@ def test_fused_decode_passes_the_schema_the_binding_declares(
     """
     entry = _Recorder()
     _register(monkeypatch, npu_turboquant_fused_decode=entry)
-    caches = _caches()
-    query = torch.randn(1, 12, HEAD_SIZE)
+    caches = _decode_caches()
+    query = torch.randn(1, 12, HEAD_SIZE, dtype=torch.bfloat16)
     output = torch.zeros_like(query)
     block_tables = torch.zeros(1, 3, dtype=torch.int32)
     context_lens = torch.ones(1, dtype=torch.int32)
@@ -996,6 +1008,189 @@ def test_fused_decode_passes_the_schema_the_binding_declares(
     assert args[14:19] == (12, NUM_KV_HEADS, TURBOQUANT_DECODE_SPLITS, 6, TURBOQUANT_STAGE_UNROTATED)
     assert args[19] == pytest.approx(0.125)
     assert args[20] == pytest.approx(emulator.inv_sqrt_len)
+
+
+# ---------------------------------------------------------------------------
+# Input validation -- dirty block tables, dirty slots, decode geometry
+# ---------------------------------------------------------------------------
+
+
+def test_p4_gather_refuses_a_negative_page() -> None:
+    key, value, scale = _caches()
+    with pytest.raises(ValueError) as raised:
+        _adapter().gather(key, value, scale, torch.tensor([[-1]], dtype=torch.int32))
+
+    message = str(raised.value)
+    assert "block_tables" in message
+    assert f"[0, {NUM_BLOCKS})" in message
+    assert "min=-1" in message and "max=-1" in message
+
+
+def test_p4_gather_refuses_a_page_past_the_cache() -> None:
+    key, value, scale = _caches()
+    with pytest.raises(ValueError) as raised:
+        _adapter().gather(key, value, scale, torch.tensor([[NUM_BLOCKS]], dtype=torch.int32))
+
+    message = str(raised.value)
+    assert "block_tables" in message
+    assert f"[0, {NUM_BLOCKS})" in message
+    assert f"min={NUM_BLOCKS}" in message and f"max={NUM_BLOCKS}" in message
+
+
+def test_p4_gather_accepts_the_last_valid_page() -> None:
+    key, value, scale = _caches()
+    packed = _adapter().gather(key, value, scale, torch.tensor([[NUM_BLOCKS - 1]], dtype=torch.int32))
+    assert len(packed) == 4
+
+
+def test_p4_an_empty_block_table_is_not_range_checked() -> None:
+    """No pages to index means nothing to range-check.
+
+    The guard is tested on the validator itself: an empty table must not reach
+    ``min()``/``max()``, which raise on an empty reduction. The golden readers'
+    empty-gather reshape is a separate, pre-existing behaviour.
+    """
+    TurboQuantOpsAdapter._validate_block_tables(torch.empty(0, 0, dtype=torch.int32), NUM_BLOCKS)
+    TurboQuantOpsAdapter._validate_block_tables(torch.empty(0, dtype=torch.int32), NUM_BLOCKS)
+
+
+def test_p5_write_slots_refuses_a_slot_past_the_cache(emulator: TurboQuantEmulator) -> None:
+    key, value = _activations(1)
+    caches = _caches()
+    past_end = NUM_BLOCKS * BLOCK_SIZE
+
+    with pytest.raises(ValueError) as raised:
+        _adapter()._write_slots(key, value, *caches, torch.tensor([past_end], dtype=torch.int32), emulator)
+
+    message = str(raised.value)
+    assert "slot_mapping" in message
+    assert f"[0, {past_end})" in message
+    assert f"largest non-negative slot is {past_end}" in message
+
+
+def test_p5_write_slots_accepts_the_last_slot_and_filters_negatives(emulator: TurboQuantEmulator) -> None:
+    """The upper bound is exclusive, and padding slots stay filtered."""
+    key, value = _activations(1)
+    caches = _caches()
+    _adapter()._write_slots(
+        key, value, *caches, torch.tensor([NUM_BLOCKS * BLOCK_SIZE - 1], dtype=torch.int32), emulator
+    )
+    _adapter()._write_slots(key, value, *_caches(), torch.tensor([-1], dtype=torch.int32), emulator)
+
+
+def _launch_decode(
+    adapter: TurboQuantOpsAdapter,
+    emulator: TurboQuantEmulator,
+    caches: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    query: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor | None:
+    return adapter.fused_decode(
+        query=query,
+        key_cache=caches[0],
+        value_cache=caches[1],
+        scale_cache=caches[2],
+        block_tables=torch.zeros(query.shape[0], 1, dtype=torch.int32),
+        context_lens=torch.ones(query.shape[0], dtype=torch.int32),
+        emulator=emulator,
+        num_heads=query.shape[1],
+        num_kv_heads=NUM_KV_HEADS,
+        scale=0.125,
+        output=output,
+        **_launch_buffers(query.shape[0], query.shape[1]),
+    )
+
+
+def test_p6_a_non_bf16_query_is_refused_before_the_launch(
+    monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
+) -> None:
+    entry = _Recorder()
+    _register(monkeypatch, npu_turboquant_fused_decode=entry)
+    caches = _decode_caches()
+    query = torch.randn(1, 2, HEAD_SIZE, dtype=torch.float32)
+    output = torch.zeros(1, 2, HEAD_SIZE, dtype=torch.bfloat16)
+
+    with pytest.raises(TypeError) as raised:
+        _launch_decode(_adapter(TurboQuantKernelStage.DECODE), emulator, caches, query, output)
+
+    message = str(raised.value)
+    assert "query.dtype" in message
+    assert "torch.float32" in message and "torch.bfloat16" in message
+    assert entry.calls == [], "a refused launch must not reach the op"
+
+
+def test_p6_a_non_bf16_output_is_refused_before_the_launch(
+    monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
+) -> None:
+    entry = _Recorder()
+    _register(monkeypatch, npu_turboquant_fused_decode=entry)
+    caches = _decode_caches()
+    query = torch.randn(1, 2, HEAD_SIZE, dtype=torch.bfloat16)
+    output = torch.zeros(1, 2, HEAD_SIZE, dtype=torch.float32)
+
+    with pytest.raises(TypeError) as raised:
+        _launch_decode(_adapter(TurboQuantKernelStage.DECODE), emulator, caches, query, output)
+
+    message = str(raised.value)
+    assert "output.dtype" in message
+    assert "torch.float32" in message and "torch.bfloat16" in message
+    assert entry.calls == []
+
+
+def test_p6_an_aliased_query_and_output_are_refused(
+    monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
+) -> None:
+    entry = _Recorder()
+    _register(monkeypatch, npu_turboquant_fused_decode=entry)
+    caches = _decode_caches()
+    query = torch.zeros(1, 2, HEAD_SIZE, dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError) as raised:
+        _launch_decode(_adapter(TurboQuantKernelStage.DECODE), emulator, caches, query, query)
+
+    message = str(raised.value)
+    assert "alias" in message
+    assert f"data_ptr={query.data_ptr()}" in message
+    assert entry.calls == []
+
+
+def test_p6_an_undersized_scale_plane_is_refused(monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator) -> None:
+    entry = _Recorder()
+    _register(monkeypatch, npu_turboquant_fused_decode=entry)
+    # The canonical token-major plane is half the footprint the slot-major
+    # decode records need at this H = 2 geometry.
+    caches = _caches()
+    query = torch.randn(1, 2, HEAD_SIZE, dtype=torch.bfloat16)
+    output = torch.zeros(1, 2, HEAD_SIZE, dtype=torch.bfloat16)
+    slot_floats = TurboQuantOpsAdapter._nz_scale_slot_floats(NUM_KV_HEADS)
+    need = NUM_BLOCKS * BLOCK_SIZE * slot_floats
+
+    with pytest.raises(ValueError) as raised:
+        _launch_decode(_adapter(TurboQuantKernelStage.DECODE), emulator, caches, query, output)
+
+    message = str(raised.value)
+    assert "scale_cache" in message
+    assert f"holds {caches[2].numel()} floats" in message
+    assert f"= {need}" in message
+    assert entry.calls == []
+
+
+def test_p6_a_clean_launch_passes_and_the_golden_fallback_keeps_any_dtype(
+    monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
+) -> None:
+    """The positive half, plus proof the check never gates the fallback."""
+    entry = _Recorder()
+    _register(monkeypatch, npu_turboquant_fused_decode=entry)
+    query = torch.randn(1, 2, HEAD_SIZE, dtype=torch.bfloat16)
+    output = torch.zeros(1, 2, HEAD_SIZE, dtype=torch.bfloat16)
+    assert _launch_decode(_adapter(TurboQuantKernelStage.DECODE), emulator, _decode_caches(), query, output) is output
+    assert len(entry.calls) == 1
+
+    # No decode stage: fused_decode returns None before any geometry check, so
+    # the float32 golden gather path is untouched.
+    golden_query = torch.randn(1, 2, HEAD_SIZE, dtype=torch.float32)
+    golden_output = torch.zeros(1, 2, HEAD_SIZE, dtype=torch.float32)
+    assert _launch_decode(_adapter(), emulator, _caches(), golden_query, golden_output) is None
 
 
 # ---------------------------------------------------------------------------

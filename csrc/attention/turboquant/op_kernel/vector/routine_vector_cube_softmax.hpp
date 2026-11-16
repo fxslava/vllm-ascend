@@ -18,6 +18,12 @@ constexpr std::uint32_t kCubeRepeatLanes = 64;
 // The 32-byte blocks one tile row spans, which is a reduction's source repeat stride.
 constexpr std::uint32_t kCubeTileBlocks = kCubeTileKeys * sizeof(float) / 32;
 
+// DIRTY-DATA (D2): the finite sentinel written over a dead tail lane. It is FLT_MAX negative,
+// so exp(sentinel - max) underflows to zero, and -- unlike the old Min against a ramp -- a
+// SELECT writes it even when the lane's score is NaN, because it does not touch the score's
+// value at all.
+constexpr float kTailDeadLogit = -3.4028235e38f;
+
 template <class Codec, class Operand>
 struct NativeCubeSoftmaxEngine {
     AscendC::LocalTensor<float>   scores, key_scale, value_scale, q_inv, mask;
@@ -48,8 +54,24 @@ struct NativeCubeSoftmaxEngine {
     {
         AscendC::Mul(scores, scores, key_scale, std::uint64_t{kCubeTileKeys}, heads, by_vector);
         AscendC::Mul(scores, scores, q_inv, std::uint64_t{kCubeTileKeys}, heads, by_block);
-        if (valid < kCubeTileKeys)
-            AscendC::Min(scores, scores, mask, std::uint64_t{kCubeTileKeys}, heads, by_vector);
+        // DIRTY-DATA (D2): rows past `valid` in a partial last tile were read from the cache
+        // page (the tail of the page, not the live context). Their key codes and scales are
+        // dirty: 0xDEADBEEF bytes are finite garbage, but a poisoned fp32 scale is a NaN, and
+        // Min's NaN behaviour is not specified. Overwrite every dead lane with a finite sentinel
+        // through the lane predicate instead, so the MAX below and the online recurrence never
+        // see the neighbor slots' data. Live lanes are copied through unchanged. `scores` holds
+        // `heads` contiguous 64-lane rows and the 64-bit predicate is the same for each, so the
+        // Select is per row: the first-n form only consumes one row's mask bits.
+        if (valid < kCubeTileKeys) {
+            const AscendC::LocalTensor<std::uint8_t> predicate =
+                mask[kCubeTileKeys].template ReinterpretCast<std::uint8_t>();
+            for (std::uint32_t head = 0; head < heads; ++head) {
+                const std::uint32_t at = head * kCubeTileKeys;
+                AscendC::Select(scores[at], predicate, scores[at], kTailDeadLogit,
+                                AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE,
+                                std::uint32_t{kCubeTileKeys});
+            }
+        }
         reduce<AscendC::ReduceType::MAX>(tile_max);
         AscendC::Max(new_max, run_max, tile_max, heads * kStateLanes);
         AscendC::Sub(alpha, run_max, new_max, heads * kStateLanes);
@@ -74,6 +96,21 @@ struct NativeCubeSoftmaxEngine {
     __aicore__ inline void quantize_probabilities()
     {
         AscendC::Mul(scores, scores, value_scale, std::uint64_t{kCubeTileKeys}, heads, by_vector);
+        // DIRTY-DATA (D2): the value scale of a dead tail row can be NaN (the scale plane past
+        // `context_lens` is allocator garbage). exp(dead) is zero, but 0 * NaN is NaN, and the
+        // MAX reduction below would then hand a NaN probability scale to every LIVE row of the
+        // tile. SELECT the dead lanes to exactly zero after the multiply, so the reduction and
+        // the operand cast only ever see the live rows. Per row, for the same reason as above.
+        if (valid < kCubeTileKeys) {
+            const AscendC::LocalTensor<std::uint8_t> predicate =
+                mask[kCubeTileKeys].template ReinterpretCast<std::uint8_t>();
+            for (std::uint32_t head = 0; head < heads; ++head) {
+                const std::uint32_t at = head * kCubeTileKeys;
+                AscendC::Select(scores[at], predicate, scores[at], 0.0f,
+                                AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE,
+                                std::uint32_t{kCubeTileKeys});
+            }
+        }
         reduce<AscendC::ReduceType::MAX>(part);
         AscendC::Duplicate(prob_scale, operand_max, heads * kStateLanes);
         AscendC::Adds(part, part, epsilon, heads * kStateLanes);
@@ -121,9 +158,10 @@ __aicore__ inline void vector_cube_decay_accumulator(
     AscendC::Adds(run_max, new_max, 0.0f, heads * kStateLanes);
 }
 
-// Scores of a partial last tile are Min-ed with this mask: a ramp crossing zero at `valid`,
-// huge and positive before it and huge and negative after, so one Min leaves the live keys
-// untouched and drives the dead ones below any running maximum. `lanes` aliases the mask
+// Scores of a partial last tile are gated by this ramp: a ramp crossing zero at `valid`, huge
+// and positive before it and huge and negative after. The caller turns its sign into the bit
+// predicate the softmax SELECTs against; the ramp itself is kept because a lane index ramp is
+// what names the live rows, not the scores (a dirty score can be NaN). `lanes` aliases the mask
 // buffer's own tail as int32 scratch for the progression.
 __aicore__ inline void vector_cube_tail_mask(
     const AscendC::LocalTensor<float>&        mask,
