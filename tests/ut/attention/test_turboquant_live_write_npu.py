@@ -873,7 +873,11 @@ def test_the_fused_decode_handles_two_requests_serving_geometry() -> None:
         block_rows.append(torch.arange(next_block, next_block + pages, dtype=torch.int32))
         next_block += pages
     max_pages = max(row.numel() for row in block_rows)
-    block_tables = torch.full((batch, max_pages), -1, dtype=torch.int32, device=DEVICE)
+    # Pages past a request's context are never read: the kernel bounds its walk
+    # by context_lens and the golden slice below discards them. Fill with a
+    # valid page rather than -1, because TurboQuantOpsAdapter.gather now refuses
+    # an out-of-range page id before it indexes the cache.
+    block_tables = torch.zeros((batch, max_pages), dtype=torch.int32, device=DEVICE)
     for request, row in enumerate(block_rows):
         block_tables[request, : row.numel()] = row.to(DEVICE)
     context_lens = torch.tensor(contexts, dtype=torch.int32, device=DEVICE)

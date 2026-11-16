@@ -263,7 +263,23 @@ inline CachePlanes check_cache(const at::Tensor &key_cache, const at::Tensor &va
     // scatter op adds its own NzScaleSlotFloats extent check, because it is
     // not specialised to 4 heads and a record wider than 2 * num_kv_heads
     // would outgrow this allocation.
-    const std::int64_t scale_floats = kTablePlanes * num_blocks * a.num_kv_heads * block_size;
+    //
+    // DIRTY-DATA (N2): the old extent, 2 * num_blocks * num_kv_heads *
+    // block_size, is the NzScaleSlotFloats formula ONLY when 2 *
+    // num_kv_heads is a multiple of 8. At 1, 2 or 3 KV heads the slot-major
+    // record is padded to 8 floats while the allocation is 2 * H, so the
+    // kernel's per-slot burst runs past the plane and the check above would
+    // pass it. Enforce the precondition, then compare against the padded
+    // formula directly so there is one expression and no equivalence to
+    // re-derive.
+    TORCH_CHECK((2 * a.num_kv_heads) % 8 == 0, op, ": the slot-major scale plane needs ",
+                "2 * num_kv_heads to be a multiple of 8, got ", a.num_kv_heads,
+                " KV heads, whose NzScaleSlotFloats record is ",
+                layout::NzScaleSlotFloats(static_cast<std::uint32_t>(a.num_kv_heads)),
+                " floats while the physical plane holds only 2 * num_kv_heads");
+    const std::int64_t scale_floats =
+        static_cast<std::int64_t>(layout::NzScaleSlotFloats(static_cast<std::uint32_t>(a.num_kv_heads))) *
+        num_blocks * block_size;
     TORCH_CHECK(scale_cache.numel() >= scale_floats, op, ": scale plane holds ", scale_cache.numel(),
                 " floats, needs at least ", scale_floats);
     return CachePlanes{num_blocks, block_size};
@@ -670,6 +686,13 @@ void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Te
                 output.scalar_type());
     TORCH_CHECK(query.scalar_type() == at::kHalf || query.scalar_type() == at::kBFloat16, op,
                 ": the operator has kernel instances for fp16 and bf16 only, got ", query.scalar_type());
+    // DIRTY-DATA (N5): an in-place call reads the query through the prologue while the decode
+    // writes the output, so the last tiles consume bytes the first ones overwrote. Refuse the
+    // alias at the launcher; a CUDA/NPU graph replay cannot be asked to fix it later.
+    TORCH_CHECK(query.data_ptr() != output.data_ptr(), op, ": query and output alias at ",
+                query.data_ptr(),
+                "; the decode reads the query while it writes output, so an in-place call would "
+                "overwrite operands still in flight");
 
     const std::int64_t num_tokens = query.size(0);
     const std::int64_t head_size = query.size(2);
@@ -705,7 +728,39 @@ void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Te
     TORCH_CHECK(key_cache.scalar_type() == at::kChar && value_cache.scalar_type() == at::kChar, op,
                 ": the packed planes are int8 nibble pairs");
     TORCH_CHECK(scale_cache.scalar_type() == at::kFloat, op, ": the scale plane is fp32");
+    TORCH_CHECK(key_cache.is_contiguous() && value_cache.is_contiguous() && scale_cache.is_contiguous(),
+                op, ": every cache plane must be contiguous; the device addresses them as flat runs");
+    const std::int64_t num_blocks = key_cache.size(0);
     const std::int64_t block_size = key_cache.size(1);
+    // DIRTY-DATA (N1): the scalar num_kv_heads / head_size arguments drive every cache address
+    // the kernel forms, while size(2) / size(3) are what was actually allocated. Nothing else
+    // compares them on this entry point (check_cache is not on its path), so a scalar that
+    // disagreed with the tensor would read a head plane outside the page with every other check
+    // satisfied.
+    TORCH_CHECK(key_cache.size(2) == num_kv_heads && key_cache.size(3) == head_size / 2, op,
+                ": packed plane is [", num_blocks, ", ", block_size, ", ", key_cache.size(2), ", ",
+                key_cache.size(3), "], expected [..., ", num_kv_heads, ", ", head_size / 2,
+                "] from the scalar geometry");
+    TORCH_CHECK(num_blocks > 0 && num_blocks <= static_cast<std::int64_t>(UINT32_MAX), op,
+                ": the cache plane holds ", num_blocks, " pages, which the device's uint32 page "
+                "index cannot name");
+    // DIRTY-DATA (N2): the scale plane is read as slot-major records of
+    // NzScaleSlotFloats(num_kv_heads) floats. That record equals 2 * num_kv_heads only when
+    // 2 * num_kv_heads is a multiple of 8; at 1..3 heads the padded record is wider than the
+    // 2 * H allocation and the device's per-tile burst would run off the plane.
+    TORCH_CHECK((2 * num_kv_heads) % 8 == 0, op,
+                ": the slot-major scale plane needs 2 * num_kv_heads to be a multiple of 8, got ",
+                num_kv_heads, " KV heads, whose NzScaleSlotFloats record is ",
+                layout::NzScaleSlotFloats(static_cast<std::uint32_t>(num_kv_heads)),
+                " floats while the physical plane holds only 2 * num_kv_heads");
+    const std::int64_t scale_floats =
+        static_cast<std::int64_t>(layout::NzScaleSlotFloats(static_cast<std::uint32_t>(num_kv_heads))) *
+        num_blocks * block_size;
+    TORCH_CHECK(scale_cache.numel() >= scale_floats, op, ": the scale plane holds ",
+                scale_cache.numel(), " floats, needs at least ", scale_floats, " (", num_blocks,
+                " blocks x ", block_size, " tokens x ",
+                layout::NzScaleSlotFloats(static_cast<std::uint32_t>(num_kv_heads)),
+                " floats a slot)");
     TORCH_CHECK(block_size > 0 && block_size % layout::kCubeTileRows == 0 &&
                     (block_size & (block_size - 1)) == 0,
                 op, ": the closed-form tile cursor needs block_size to be a power-of-two multiple of ",
@@ -713,15 +768,35 @@ void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Te
                 ". The NZ-tiled plane this operator reads strides its tile rows by ", layout::kCubeTileRows,
                 ", so a smaller page cannot address it at all.");
 
+    // DIRTY-DATA (N3): block_tables is a DEVICE tensor here, so min()/max() on the host would
+    // be a device-to-host copy and a stream synchronisation -- illegal on a capturing stream,
+    // which is exactly why this operator keeps its inputs device-resident. The bounds are
+    // therefore enforced on the device, per live page, in PrefetchBlockTable: every entry the
+    // tile cursor can turn into a GM read is checked against [0, num_blocks) BEFORE the tile
+    // ring starts, and an out-of-range entry skips the worker (safe zero output). num_blocks is
+    // the physical page count passed to the launch below. The trade-off is that entries past a
+    // request's live span are never checked -- they are also never read -- and a long span pays
+    // one scalar load per page beyond the 64-entry prefetch cache.
     TORCH_CHECK(block_tables.dim() == 2 && block_tables.scalar_type() == at::kInt, op,
                 ": block_tables must be an int32 [num_tokens, max_blocks_per_seq]");
+    TORCH_CHECK(block_tables.is_contiguous(), op,
+                ": block_tables must be contiguous; the device indexes it as token * max_blocks");
     TORCH_CHECK(block_tables.size(0) >= num_tokens, op, ": block_tables has ", block_tables.size(0),
                 " rows for ", num_tokens, " tokens");
     const std::int64_t max_blocks_per_seq = block_tables.size(1);
+    TORCH_CHECK(max_blocks_per_seq > 0, op, ": block_tables has no columns");
     TORCH_CHECK(context_lens.scalar_type() == at::kInt && context_lens.dim() == 1 &&
                     context_lens.size(0) >= num_tokens,
                 op, ": context_lens must be an int32 [num_tokens], got ", context_lens.scalar_type(), " ",
                 context_lens.sizes());
+    // DIRTY-DATA (N4): the same host-sync caveat as N3. This copy is on the device, so its
+    // min()/max() cannot be read here without a synchronisation that the captured path forbids.
+    // The values that decide every tile count and page span ARE host-visible: the metadata
+    // builder hands the same lengths to npu_turboquant_build_decode_tiling, and that op plus
+    // build_decode_tiling itself now refuse a negative length or one past
+    // max_blocks * block_size (kContextOutOfRange). The device copy is read only for the
+    // fused/split predicate, which cannot form an address; a divergence between the two would
+    // be a wrong fused decision, not an out-of-bounds read.
 
     // ---- the basis operands --------------------------------------------------
     TORCH_CHECK(pi_signs.scalar_type() == at::kFloat && pi_signs.numel() == head_size, op,
@@ -951,7 +1026,10 @@ void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Te
         static_cast<std::uint32_t>(reduce_tasks_per_block),
         static_cast<std::uint32_t>(prologue_vectors_per_block),
         static_cast<std::uint32_t>(prologue_cube_chunk_vectors), static_cast<std::uint32_t>(output_stage),
-        layout::kFusedContextLimit, static_cast<float>(scale), static_cast<float>(inv_sqrt_len));
+        layout::kFusedContextLimit, static_cast<float>(scale), static_cast<float>(inv_sqrt_len),
+        // DIRTY-DATA (N1/N3): the physical page count the device bounds every block-table
+        // entry against; taken from the cache tensor, never from a scalar argument.
+        static_cast<std::uint32_t>(num_blocks));
 }
 
 // ---------------------------------------------------------------------------
@@ -1013,6 +1091,23 @@ void npu_turboquant_build_decode_tiling(at::Tensor &context_lens, at::Tensor &ti
                 num_kv_heads, ")");
     TORCH_CHECK(num_splits > 0 && num_splits <= kDecodeMaxSplits, op, ": num_splits must be 1..",
                 kDecodeMaxSplits, ", got ", num_splits);
+    // DIRTY-DATA (N4): this context_lens is the HOST copy, so the range is checkable here with
+    // no sync. It is the same data build_decode_tiling turns into tile counts and page spans;
+    // a negative length or one past max_blocks * block_size is corrupt input, not a geometry,
+    // and would otherwise be clamped or refused only deep inside the builder. build_decode_tiling
+    // carries the same check for every other caller.
+    TORCH_CHECK(block_size > 0 && max_blocks > 0, op, ": block_size and max_blocks must be positive, got ",
+                block_size, " and ", max_blocks);
+    TORCH_CHECK(max_blocks <= INT64_MAX / block_size, op,
+                ": max_blocks * block_size overflows int64: ", max_blocks, " x ", block_size);
+    const std::int64_t max_context = max_blocks * block_size;
+    const auto *host_lengths = static_cast<const std::int32_t *>(context_lens.data_ptr());
+    for (std::int64_t token = 0; token < num_tokens; ++token) {
+        TORCH_CHECK(host_lengths[token] >= 0 && host_lengths[token] <= max_context, op,
+                    ": context_lens[", token, "] is ", host_lengths[token],
+                    "; a decode length must be in [0, max_blocks * block_size] = [0, ",
+                    max_context, "]");
+    }
 
     tiling::DecodeTilingRequest request = decode_request(num_tokens, num_heads, num_kv_heads, head_size,
                                                          block_size, max_blocks, num_splits, heads_per_task);

@@ -55,6 +55,8 @@ const char *decode_tiling_status_text(const DecodeTilingStatus status)
         case DecodeTilingStatus::kUnmappedPage:
             return "a live split holds an unmapped logical page; the closed-form tile cursor "
                    "cannot skip pages";
+        case DecodeTilingStatus::kContextOutOfRange:
+            return "a context length is negative or exceeds max_blocks * block_size";
         case DecodeTilingStatus::kProbeOutOfRange:
             return "isolated-canary page/tile outside the block table, or naming a tile the "
                    "context does not reach";
@@ -89,7 +91,15 @@ DecodeTilingStatus build_decode_tiling(const DecodeTilingRequest &r,
 
     for (std::uint32_t token = 0; token < r.tokens; ++token) {
         const std::int32_t raw = context_lengths[token];
-        const std::uint32_t context = raw > 0 ? static_cast<std::uint32_t>(raw) : 0;
+        // DIRTY-DATA (N4): check the range the device acts on before it names a page. A negative
+        // length used to be silently clamped to zero and a length past the table's reach only
+        // failed later (or, with a stale device copy, not at all); refuse both here, where the
+        // values the tiling is actually built from are visible without a device sync.
+        const std::uint64_t max_context =
+            static_cast<std::uint64_t>(r.max_blocks) * static_cast<std::uint64_t>(r.block_size);
+        if (raw < 0 || static_cast<std::uint64_t>(raw) > max_context)
+            return DecodeTilingStatus::kContextOutOfRange;
+        const std::uint32_t context = static_cast<std::uint32_t>(raw);
         const bool fused =
             r.splits <= 1 || raw <= static_cast<std::int32_t>(r.fused_context_limit);
         const std::uint32_t seq_blocks = CeilDiv(context, r.block_size);

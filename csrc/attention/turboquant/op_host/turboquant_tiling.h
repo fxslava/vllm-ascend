@@ -156,6 +156,10 @@ enum class DecodeTilingStatus : std::uint32_t {
     kBadGeometry,      // zero/overflowing extent, or head_dim/group_heads inconsistent
     kPageSizeNotPow2,  // block_size is not a power-of-two multiple of 64
     kUnmappedPage,     // an interior logical page of a live split carries a negative entry
+    // DIRTY-DATA (N4): a context length outside [0, max_blocks * block_size]. A negative one
+    // would be clamped to "no work" and a too-large one would ask for pages the table cannot
+    // name; both are caller corruption, not a geometry to approximate.
+    kContextOutOfRange,
     kProbeOutOfRange,  // the isolated-canary descriptor names a page/tile outside the table
 };
 
