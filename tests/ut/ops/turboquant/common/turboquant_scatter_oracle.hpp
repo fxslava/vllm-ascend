@@ -142,6 +142,73 @@ inline RowRef quantise_row(const Shape& shape, const std::vector<float>& x,
 
 // ---------------------------------------------------------- packing helpers
 
+// ------------------------------------------------- the Lloyd-Max per-row reference
+// quant_mode 1 of the same writer: the row is quantised on the 16-level Lloyd-Max codebook of a
+// unit Gaussian (TurboQuantLloydMaxTraits<KV4_FP8>) at the row's own RMS, and a packed nibble n
+// is bin n + 8 of that codebook, reconstructing as centroid * stored_scale. The stored scale is
+// therefore sigma_e * invSqrtLen with sigma_e the row RMS -- not the absmax power of two.
+//
+// This replays the device float-for-float, in the device's own order, so the comparison stays a
+// bit comparison:
+//   sumsq   the VF's butterfly: ((v0^2 + v1^2) + v2^2) + v3^2 over the four 64-lane quarters,
+//           then six gather-and-add rounds at XOR strides 1, 2, 4, 8, 16, 32
+//   sigma_e = sqrt(sumsq + 1e-20f) * invSqrtLen    -- the eps guards the zero row off Sqrt's
+//   invn    = -1 / sigma_e                            non-positive-input contract
+//   u       = y * invn                               -- sign flipped, like the codec's bins
+//   bin     = -8 + #{i : bits(threshold_i + u) < 0}  -- an FP32 Adds and its sign bit
+//   scale   = sigma_e * invSqrtLen
+// Sqrt and Div on the device run their 0-ULP configs, which is IEEE correctly rounded -- the same
+// result sqrtf and `/` produce here. Every other step is an exactly rounded FP32 op.
+inline RowRef quantise_row_lloyd_max(const Shape& shape, const std::vector<float>& x,
+                                     const std::vector<float>& signs)
+{
+    using LmTraits = vllm_ascend::turboquant::TurboQuantLloydMaxTraits<
+        vllm_ascend::turboquant::TurboQuantMode::KV4_FP8>;
+    RowRef out;
+    out.rotated = rot_oracle::staged(rot_oracle::Direction::Ingress, x.data(), signs.data());
+    out.q.assign(static_cast<std::size_t>(shape.head_size), 0);
+
+    const auto* y = out.rotated.data();
+    float sq[64];
+    for (int l = 0; l < 64; ++l) {
+        float m = y[l] * y[l];
+        float t = y[64 + l] * y[64 + l];
+        m = m + t;
+        t = y[128 + l] * y[128 + l];
+        m = m + t;
+        t = y[192 + l] * y[192 + l];
+        m = m + t;
+        sq[l] = m;
+    }
+    for (const int stride : {1, 2, 4, 8, 16, 32}) {
+        float prev[64];
+        std::memcpy(prev, sq, sizeof(prev));
+        for (int l = 0; l < 64; ++l) sq[l] = prev[l] + prev[l ^ stride];
+    }
+    const float sumsq = sq[0];
+    out.zero_row = sumsq == 0.0f;
+    out.clamped = false;
+    out.absmax = 0.0f;
+    for (float value : out.rotated) out.absmax = std::fmax(out.absmax, std::fabs(value));
+
+    const float sigma_e = std::sqrt(sumsq + 1e-20f) * shape.inv_sqrt_len();
+    const float invn = -1.0f / sigma_e;
+    out.scale = sigma_e * shape.inv_sqrt_len();
+    for (int c = 0; c < shape.head_size; ++c) {
+        const float u = out.rotated[static_cast<std::size_t>(c)] * invn;
+        int bin = -8;
+        for (int i = 0; i < LmTraits::kThresholdCount; ++i) {
+            const float d = LmTraits::kThresholds[i] + u;
+            bin += static_cast<int>(tq_test::float_bits(d) >> 31);
+        }
+        out.q[static_cast<std::size_t>(c)] = bin;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------- packing helpers
+
+
 
 // -------------------------------------------------------------- the launch
 // One token of one request: where it goes and what it carries.
@@ -196,13 +263,14 @@ struct Reference {
 // `head_filter` is the one KV head the launch owns, or -1 for all of them. A
 // head the launch did not run must come back looking exactly like a head
 // nobody wrote, so the single-head canary protocol needs the reference to
-// agree about that rather than to be corrected afterwards.
+// agree about that rather than to be corrected afterwards. `lloyd_max` selects
+// the codebook the reference quantises on, matching the launch's quant_mode.
 inline Reference compute_reference(const Shape& shape, const std::vector<TokenPlan>& tokens,
                                    const std::vector<float>& signs, int zero_token,
                                    const std::vector<std::int8_t>& prior_key,
                                    const std::vector<std::int8_t>& prior_value,
                                    const std::vector<float>& prior_scale,
-                                   int head_filter = -1)
+                                   int head_filter = -1, bool lloyd_max = false)
 {
     Reference ref;
     ref.shape = shape;
@@ -227,7 +295,8 @@ inline Reference compute_reference(const Shape& shape, const std::vector<TokenPl
                     // device reads.
                     x[static_cast<std::size_t>(c)] = bf16_to_float(float_to_bf16_rne(raw));
                 }
-                RowRef row = quantise_row(shape, x, signs);
+                RowRef row = lloyd_max ? quantise_row_lloyd_max(shape, x, signs)
+                                       : quantise_row(shape, x, signs);
                 if (row.zero_row) ++ref.zero_rows;
                 if (row.clamped) ++ref.clamped_rows;
                 for (int c = 0; c < shape.head_size; ++c) {

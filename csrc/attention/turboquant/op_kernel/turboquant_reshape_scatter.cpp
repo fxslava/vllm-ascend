@@ -112,6 +112,7 @@
 // 2048-byte read-modify-write disappears and BOTH planes become pure writes.
 
 #include "common/turboquant_layout.h"
+#include "../../include/turboquant/turboquant_mode.h"
 
 #ifndef TURBOQUANT_INGRESS_NZ
 #define TURBOQUANT_INGRESS_NZ 0
@@ -193,6 +194,13 @@ static_assert(kNzTileRows == tq_contract::kCubeTileRows && kNzC0 == tq_contract:
 namespace turboquant_scatter {
 
 using ascend_micro::kRotChannels;
+// The non-uniform codebook quant_mode 1 quantises on: the 16 e4m3-rounded Lloyd-Max levels of a
+// unit Gaussian and the exact midpoints between them. The packed nibble stays a signed int4 bin
+// index, so the cache layout, the writers' addressing and the decode's expand are all unchanged;
+// what moves is the row scale's MEANING: it is the row's RMS (times invSqrtLen), not the absmax
+// power of two, because a nibble reconstructs as centroid[bin] * stored_scale.
+using LloydMaxKv4 =
+    vllm_ascend::turboquant::TurboQuantLloydMaxTraits<vllm_ascend::turboquant::TurboQuantMode::KV4_FP8>;
 
 // ---------------------------------------------------------------- geometry
 constexpr std::uint32_t kHeadSize = kRotChannels;  // 256, compile-time
@@ -329,11 +337,49 @@ __simd_callee__ inline void absmax_broadcast(AscendC::Reg::RegTensor<float>& m,
     AscendC::Reg::Max<float>(m, m, partner, mask);
 }
 
+// The Lloyd-Max half's reduction: the row's sum of squares in EVERY lane, the same butterfly
+// shape as absmax_broadcast with Add for Max -- squares of the four quarters folded in sequence,
+// then six gather-and-add rounds at XOR strides 1, 2, 4, 8, 16, 32. Every step is one FP32 add
+// in a fixed order, so the host oracle replays it lane for lane and the bins below stay
+// bit-comparable.
+__simd_callee__ inline void sumsq_broadcast(AscendC::Reg::RegTensor<float>& m,
+                                            ascend_micro::RotRegSet& v,
+                                            ascend_micro::RotGatherTables& t,
+                                            AscendC::Reg::MaskReg& mask)
+{
+    AscendC::Reg::RegTensor<float> sq, partner;
+    AscendC::Reg::Mul<float>(m, v.v0, v.v0, mask);
+    AscendC::Reg::Mul<float>(sq, v.v1, v.v1, mask);
+    AscendC::Reg::Add<float>(m, m, sq, mask);
+    AscendC::Reg::Mul<float>(sq, v.v2, v.v2, mask);
+    AscendC::Reg::Add<float>(m, m, sq, mask);
+    AscendC::Reg::Mul<float>(sq, v.v3, v.v3, mask);
+    AscendC::Reg::Add<float>(m, m, sq, mask);
+    AscendC::Reg::Gather<float, std::uint32_t>(partner, m, t.i0);
+    AscendC::Reg::Add<float>(m, m, partner, mask);
+    AscendC::Reg::Gather<float, std::uint32_t>(partner, m, t.i1);
+    AscendC::Reg::Add<float>(m, m, partner, mask);
+    AscendC::Reg::Gather<float, std::uint32_t>(partner, m, t.i2);
+    AscendC::Reg::Add<float>(m, m, partner, mask);
+    AscendC::Reg::Gather<float, std::uint32_t>(partner, m, t.i3);
+    AscendC::Reg::Add<float>(m, m, partner, mask);
+    AscendC::Reg::Gather<float, std::uint32_t>(partner, m, t.i4);
+    AscendC::Reg::Add<float>(m, m, partner, mask);
+    AscendC::Reg::Gather<float, std::uint32_t>(partner, m, t.i5);
+    AscendC::Reg::Add<float>(m, m, partner, mask);
+}
+
 // `qout` receives y * 2^(2-e) clamped from above at 7.0f -- NOT rounded. The
 // single rounding of the whole path is the level-2 Cast to INT32 the caller
 // performs next, on an exactly representable product, which is what lets the
 // host oracle reproduce it in integer arithmetic. `scaleOut` receives one
 // vector-register slot per row with the stored scale in lane 0.
+//
+// The LLOYD_MAX instantiation stores the RAW rotated row instead -- the binning is a UB pass
+// (LloydMaxQuantise) that needs the unscaled y -- and lane 0 of the scale slot carries the row's
+// sum of squares, which the UB pass turns into the RMS scale. Everything else -- the load, the
+// butterfly, the NZ weave, the store -- is shared with the uniform grid verbatim.
+template <bool LLOYD_MAX>
 __simd_vf__ inline void scatter_rotate_quantise_vf(__ubuf__ float* qout,
                                                    __ubuf__ float* scaleOut,
                                                    __ubuf__ float* src,
@@ -349,21 +395,33 @@ __simd_vf__ inline void scatter_rotate_quantise_vf(__ubuf__ float* qout,
     ascend_micro::RotSignRegs p;
     ascend_micro::rot_load_signs(p, sign);
 
-    // Power-of-two constants. A float 2^k carries exponent field k + 127, so
-    // with 2^e <= absmax < 2^(e+1):
+    // Power-of-two constants (the uniform grid only). A float 2^k carries exponent field k + 127,
+    // so with 2^e <= absmax < 2^(e+1):
     //   exp_bits = bits(absmax) & 0x7F800000   -> 2^e,     field e + 127
     //   pow_bits = exp_bits - (2 << 23)        -> 2^(e-2), field e + 125
     //   inv_bits = (254 << 23) - pow_bits      -> 2^(2-e), field 129 - e
     // The last line is the exact reciprocal of a power of two: the two fields
     // sum to 254. No division, no logarithm, no hardware reciprocal.
     AscendC::Reg::RegTensor<std::uint32_t> exp_mask, two_pow, inv_seed;
-    AscendC::Reg::Duplicate<std::uint32_t>(exp_mask, 0x7F800000u);
-    AscendC::Reg::Duplicate<std::uint32_t>(two_pow, 0x01000000u);   // 2 << 23
-    AscendC::Reg::Duplicate<std::uint32_t>(inv_seed, 0x7F000000u);  // 254 << 23
     AscendC::Reg::RegTensor<float> one, inv_sqrt, zero;
-    AscendC::Reg::Duplicate<float>(one, 1.0f);
-    AscendC::Reg::Duplicate<float>(inv_sqrt, inv_sqrt_len);
-    AscendC::Reg::Duplicate<float>(zero, 0.0f);
+    if constexpr (!LLOYD_MAX) {
+        AscendC::Reg::Duplicate<std::uint32_t>(exp_mask, 0x7F800000u);
+        AscendC::Reg::Duplicate<std::uint32_t>(two_pow, 0x01000000u);   // 2 << 23
+        AscendC::Reg::Duplicate<std::uint32_t>(inv_seed, 0x7F000000u);  // 254 << 23
+        AscendC::Reg::Duplicate<float>(one, 1.0f);
+        AscendC::Reg::Duplicate<float>(inv_sqrt, inv_sqrt_len);
+        AscendC::Reg::Duplicate<float>(zero, 0.0f);
+    } else {
+        // The Lloyd-Max instantiation keeps the declarations (one function body for both
+        // grids) but none of the constants.
+        static_cast<void>(exp_mask);
+        static_cast<void>(two_pow);
+        static_cast<void>(inv_seed);
+        static_cast<void>(one);
+        static_cast<void>(inv_sqrt);
+        static_cast<void>(zero);
+        static_cast<void>(inv_sqrt_len);
+    }
 
     for (std::uint16_t r = 0; r < rows; ++r) {
         const std::uint32_t row = static_cast<std::uint32_t>(r);
@@ -372,28 +430,33 @@ __simd_vf__ inline void scatter_rotate_quantise_vf(__ubuf__ float* qout,
         ascend_micro::rot_row_gather<ascend_micro::RotateDirection::Ingress>(v, t, p, mask);
 
         AscendC::Reg::RegTensor<float> absmax;
-        absmax_broadcast(absmax, v, t, mask);
-
-        auto& abs_bits = reinterpret_cast<AscendC::Reg::RegTensor<std::uint32_t>&>(absmax);
         AscendC::Reg::RegTensor<std::uint32_t> exp_bits, pow_bits, inv_bits;
-        AscendC::Reg::And<std::uint32_t>(exp_bits, abs_bits, exp_mask, mask);
-        AscendC::Reg::Sub<std::uint32_t>(pow_bits, exp_bits, two_pow, mask);
-        AscendC::Reg::Sub<std::uint32_t>(inv_bits, inv_seed, pow_bits, mask);
-        auto& inv = reinterpret_cast<AscendC::Reg::RegTensor<float>&>(inv_bits);
-        auto& pow_two = reinterpret_cast<AscendC::Reg::RegTensor<float>&>(pow_bits);
+        if constexpr (LLOYD_MAX) {
+            // Lane 0 of the scale slot carries the sum of squares; the bins and the RMS scale
+            // are the UB pass's job. The row itself goes to qout UNSCALED.
+            sumsq_broadcast(absmax, v, t, mask);
+        } else {
+            absmax_broadcast(absmax, v, t, mask);
 
-        // |y * 2^(2-e)| < 8 and round-to-nearest-even can reach +8, which
-        // INT4 cannot hold, so clamp from above only; -8 is in range. The
-        // clamp commutes with the rounding here because everything it touches
-        // -- [7, 8) -- maps to 7 either way.
-        AscendC::Reg::Mul<float>(v.v0, v.v0, inv, mask);
-        AscendC::Reg::Mul<float>(v.v1, v.v1, inv, mask);
-        AscendC::Reg::Mul<float>(v.v2, v.v2, inv, mask);
-        AscendC::Reg::Mul<float>(v.v3, v.v3, inv, mask);
-        AscendC::Reg::Mins<float, float>(v.v0, v.v0, 7.0f, mask);
-        AscendC::Reg::Mins<float, float>(v.v1, v.v1, 7.0f, mask);
-        AscendC::Reg::Mins<float, float>(v.v2, v.v2, 7.0f, mask);
-        AscendC::Reg::Mins<float, float>(v.v3, v.v3, 7.0f, mask);
+            auto& abs_bits = reinterpret_cast<AscendC::Reg::RegTensor<std::uint32_t>&>(absmax);
+            AscendC::Reg::And<std::uint32_t>(exp_bits, abs_bits, exp_mask, mask);
+            AscendC::Reg::Sub<std::uint32_t>(pow_bits, exp_bits, two_pow, mask);
+            AscendC::Reg::Sub<std::uint32_t>(inv_bits, inv_seed, pow_bits, mask);
+            auto& inv = reinterpret_cast<AscendC::Reg::RegTensor<float>&>(inv_bits);
+
+            // |y * 2^(2-e)| < 8 and round-to-nearest-even can reach +8, which
+            // INT4 cannot hold, so clamp from above only; -8 is in range. The
+            // clamp commutes with the rounding here because everything it touches
+            // -- [7, 8) -- maps to 7 either way.
+            AscendC::Reg::Mul<float>(v.v0, v.v0, inv, mask);
+            AscendC::Reg::Mul<float>(v.v1, v.v1, inv, mask);
+            AscendC::Reg::Mul<float>(v.v2, v.v2, inv, mask);
+            AscendC::Reg::Mul<float>(v.v3, v.v3, inv, mask);
+            AscendC::Reg::Mins<float, float>(v.v0, v.v0, 7.0f, mask);
+            AscendC::Reg::Mins<float, float>(v.v1, v.v1, 7.0f, mask);
+            AscendC::Reg::Mins<float, float>(v.v2, v.v2, 7.0f, mask);
+            AscendC::Reg::Mins<float, float>(v.v3, v.v3, 7.0f, mask);
+        }
 #if TURBOQUANT_INGRESS_NZ
         // The kv4fp8 weave, in registers: NZ byte j of this row's packed image carries channels
         // (j, j + d/2), so the pack order is c0, c128, c1, c129, ... and two register
@@ -419,14 +482,22 @@ __simd_vf__ inline void scatter_rotate_quantise_vf(__ubuf__ float* qout,
         // invSqrtLen folds into the STORED SCALE and never into the code: the
         // quantised panel is scale invariant, because scaling y and absmax
         // together leaves every code unchanged, and that is what keeps the
-        // quantiser bit-exact against an integer oracle.
-        AscendC::Reg::RegTensor<float> scaled, scale;
-        AscendC::Reg::Mul<float>(scaled, pow_two, inv_sqrt, mask);
-        AscendC::Reg::MaskReg zero_row;
-        AscendC::Reg::Compare<float, AscendC::CMPMODE::EQ>(zero_row, absmax, zero, mask);
-        AscendC::Reg::Select<float>(scale, one, scaled, zero_row);
-        AscendC::Reg::StoreAlign<float, AscendC::Reg::StoreDist::DIST_NORM_B32>(
-            scaleOut + row * kVecLanes, scale, lane0);
+        // quantiser bit-exact against an integer oracle. The Lloyd-Max slot
+        // carries the raw sum of squares; LloydMaxQuantise folds invSqrtLen in
+        // when it turns that into the RMS scale.
+        if constexpr (LLOYD_MAX) {
+            AscendC::Reg::StoreAlign<float, AscendC::Reg::StoreDist::DIST_NORM_B32>(
+                scaleOut + row * kVecLanes, absmax, lane0);
+        } else {
+            auto& pow_two = reinterpret_cast<AscendC::Reg::RegTensor<float>&>(pow_bits);
+            AscendC::Reg::RegTensor<float> scaled, scale;
+            AscendC::Reg::Mul<float>(scaled, pow_two, inv_sqrt, mask);
+            AscendC::Reg::MaskReg zero_row;
+            AscendC::Reg::Compare<float, AscendC::CMPMODE::EQ>(zero_row, absmax, zero, mask);
+            AscendC::Reg::Select<float>(scale, one, scaled, zero_row);
+            AscendC::Reg::StoreAlign<float, AscendC::Reg::StoreDist::DIST_NORM_B32>(
+                scaleOut + row * kVecLanes, scale, lane0);
+        }
     }
 }
 
@@ -510,6 +581,10 @@ struct Geometry {
     std::uint32_t head_size;
     std::uint32_t block_size;  // S
     std::uint32_t num_blocks;  // P
+    // The quantiser: 0 is the uniform mid-rise grid on the absmax power-of-two scale, 1 is the
+    // Lloyd-Max codebook on the per-row RMS scale (LloydMaxQuantise). Anything else is refused
+    // by the caller before the first work item.
+    std::uint32_t quant_mode;
     float inv_sqrt_len;
 };
 
@@ -573,6 +648,104 @@ __aicore__ inline void StageRows(const AscendC::GlobalTensor<bfloat16_t>& plane,
     AscendC::DataCopy(View<bfloat16_t>(kUbRaw, kMaxRun * kHeadSize), plane[base], rows);
 }
 
+// ===================================================== the Lloyd-Max UB pass
+// quant_mode 1: the VF has left the RAW rotated row in kUbQ (already woven for NZ) and the row's
+// sum of squares in lane 0 of its 256-byte scale slot. This pass turns that into the codebook
+// image:
+//
+//   sigma_e = sqrt(sumsq + eps) * invSqrtLen        -- the row's RMS, guarded off zero
+//   u       = y / sigma_e                            -- unit variance, via invn = -1/sigma_e
+//   bin     = #{i : LloydMaxKv4::kThresholds[i] < u} -- nearest neighbour on the codebook the
+//             decode reconstructs, counted as sign bits of (threshold - u) exactly like the
+//             codec's ComputeLevelBins
+//   nibble  = bin - 8                                -- the signed int4 the pack path expects
+//   stored scale = sigma_e * invSqrtLen              -- so centroid[bin] * scale ~= y * invSqrtLen
+//
+// eps sits UNDER the sqrt because Sqrt's contract leaves a non-positive operand undefined; for a
+// live row 1e-20 is five decades below any real sumsq, and for a zero row it makes sigma_e
+// positive, u == -0 and the bins all-negative-threshold (bin 7), with the stored scale ~4e-14 --
+// a zero row reconstructs to ~0, matching the uniform grid's explicit zero branch.
+//
+// Sqrt and Div are taken in their 0-ULP configs (PRECISION_0ULP_FTZ_FALSE / DIFF_COMPENSATION):
+// the default intrinsics are 1-ULP, which would make the bins uncomparable against the host
+// oracle's IEEE float division. Every other step is an exactly rounded FP32 op, so the whole
+// pass replays on the host float-for-float.
+__aicore__ inline void LloydMaxQuantise(const Run& item, const Geometry& geom)
+{
+    constexpr float kLmEps = 1e-20f;
+    static constexpr AscendC::SqrtConfig kSqrt0 = {AscendC::SqrtAlgo::PRECISION_0ULP_FTZ_FALSE};
+    static constexpr AscendC::DivConfig kDiv0 = {AscendC::DivAlgo::DIFF_COMPENSATION};
+    const std::uint32_t elems = item.run * kHeadSize;
+
+    // Scratch lives at the TOP of the scale arena (16 x 256-byte slots; the VF used lane 0 of the
+    // first `run` of them) and in the half staging, which the pack path reads only after us.
+    const auto scaleSlots = View<float>(kUbScale, kMaxRun * kVecLanes);
+    const auto sigma      = View<float>(kUbScale + 768u * 4u, 16u);   // row RMS, then the stored scale
+    const auto invn       = View<float>(kUbScale + 784u * 4u, 16u);   // -1 / sigma_e per row
+    const auto bcast      = View<float>(kUbScale + 800u * 4u, 128u);  // invn, one 8-lane block a row
+    const auto invRow     = View<float>(kUbScale + 928u * 4u, 64u);   // one row's invn, 64 lanes
+    const auto offsets    = View<std::int32_t>(kUbScale + 992u * 4u, 16u);
+    const auto tmp        = View<float>(kUbHalf, kPanelElems / 2u);   // 2048-float binning scratch
+    const auto codes      = View<float>(kUbQ, kPanelElems);
+    const auto bins       = View<std::int32_t>(kUbQuant, kPanelElems);
+
+    // Gather the strided sumsq lanes into one contiguous 16-float vector.
+    AscendC::ArithProgression(offsets, 0, static_cast<std::int32_t>(kVecLanes * 4u), 16);
+    AscendC::Gather(sigma, scaleSlots, offsets.ReinterpretCast<std::uint32_t>(), 0u, 16);
+    AscendC::Adds(sigma, sigma, kLmEps, 16);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Sqrt<float, kSqrt0>(sigma, sigma, 16);
+    AscendC::Muls(sigma, sigma, geom.inv_sqrt_len, 16);
+    AscendC::Duplicate(invn, -1.0f, 16);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Div<float, kDiv0>(invn, invn, sigma, 16);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Brcb(bcast, invn, 2, {1, 8});
+    AscendC::PipeBarrier<PIPE_V>();
+
+    // u = -y / sigma_e a row at a time, in place over kUbQ. The sign flip is deliberate: it turns
+    // each threshold compare into an Adds, whose sign bit the ShiftRight below reads -- the
+    // codec's ComputeLevelBins pattern.
+    AscendC::BinaryRepeatParams rowMul;
+    rowMul.dstBlkStride = 1; rowMul.src0BlkStride = 1; rowMul.src1BlkStride = 1;
+    rowMul.dstRepStride = 8; rowMul.src0RepStride = 8; rowMul.src1RepStride = 0;
+    for (std::uint32_t r = 0; r < item.run; ++r) {
+        AscendC::Brcb(invRow, bcast[r * 8u], 1, {1, 8});
+        AscendC::Mul(codes[r * kHeadSize], codes[r * kHeadSize], invRow, 64, 4, rowMul);
+    }
+    AscendC::PipeBarrier<PIPE_V>();
+
+    // bin - 8 directly: the accumulator starts at -8 and each of the 15 thresholds adds one where
+    // threshold - u is negative, i.e. where u exceeds it.
+    AscendC::Duplicate(bins, -8, elems);
+    AscendC::PipeBarrier<PIPE_V>();
+    for (std::uint32_t base = 0; base < elems; base += kPanelElems / 2u) {
+        const std::uint32_t count =
+            (elems - base) < (kPanelElems / 2u) ? (elems - base) : (kPanelElems / 2u);
+        for (int i = 0; i < LloydMaxKv4::kThresholdCount; ++i) {
+            AscendC::Adds(tmp, codes[base], LloydMaxKv4::kThresholds[i], count);
+            // Reinterpretation: tmp was just written as float and is shifted as uint32 next.
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::ShiftRight(tmp.ReinterpretCast<std::uint32_t>(),
+                                tmp.ReinterpretCast<std::uint32_t>(), 31u,
+                                static_cast<std::int32_t>(count));
+            // Reinterpretation: the sign words were just written as uint32 and are summed as int32.
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Add(bins[base], bins[base], tmp.ReinterpretCast<std::int32_t>(), count);
+            // Reinterpretation: bins was last read as int32 and the next pass writes tmp as float.
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+    }
+
+    // The stored scale, sigma_e * invSqrtLen, back into the 256-byte slots lane 0 of which the
+    // plane writers read: Brcb writes slot (8i + j) at block i * 64 + j * 8, i.e. float 64 per
+    // slot -- exactly the slots' pitch.
+    AscendC::Muls(sigma, sigma, geom.inv_sqrt_len, 16);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Brcb(scaleSlots, sigma, 2, {8, 64});
+    AscendC::PipeBarrier<PIPE_V>();
+}
+
 // The rotation and the quantiser, from the BF16 landing buffer to the INT32
 // codes and the scale slots. Shared by both planes.
 __aicore__ inline void RotateQuantise(const Run& item, const Geometry& geom)
@@ -581,17 +754,30 @@ __aicore__ inline void RotateQuantise(const Run& item, const Geometry& geom)
     AscendC::Cast(View<float>(kUbAct, kPanelElems), View<bfloat16_t>(kUbRaw, kPanelElems),
                   AscendC::RoundMode::CAST_NONE, static_cast<std::int32_t>(elems));
     AscendC::PipeBarrier<PIPE_V>();
-    scatter_rotate_quantise_vf(
-        reinterpret_cast<__ubuf__ float*>(View<float>(kUbQ, kPanelElems).GetPhyAddr()),
-        reinterpret_cast<__ubuf__ float*>(
-            View<float>(kUbScale, kMaxRun * kVecLanes).GetPhyAddr()),
-        reinterpret_cast<__ubuf__ float*>(View<float>(kUbAct, kPanelElems).GetPhyAddr()),
-        reinterpret_cast<__ubuf__ float*>(View<float>(kUbSign, kHeadSize).GetPhyAddr()),
-        geom.inv_sqrt_len, static_cast<std::uint16_t>(item.run));
-    AscendC::PipeBarrier<PIPE_V>();
-    // The single rounding of the whole path.
-    AscendC::Cast(View<std::int32_t>(kUbQuant, kPanelElems), View<float>(kUbQ, kPanelElems),
-                  AscendC::RoundMode::CAST_RINT, static_cast<std::int32_t>(elems));
+    if (geom.quant_mode == 0u) {
+        scatter_rotate_quantise_vf<false>(
+            reinterpret_cast<__ubuf__ float*>(View<float>(kUbQ, kPanelElems).GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(
+                View<float>(kUbScale, kMaxRun * kVecLanes).GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(View<float>(kUbAct, kPanelElems).GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(View<float>(kUbSign, kHeadSize).GetPhyAddr()),
+            geom.inv_sqrt_len, static_cast<std::uint16_t>(item.run));
+        AscendC::PipeBarrier<PIPE_V>();
+        // The single rounding of the whole path.
+        AscendC::Cast(View<std::int32_t>(kUbQuant, kPanelElems), View<float>(kUbQ, kPanelElems),
+                      AscendC::RoundMode::CAST_RINT, static_cast<std::int32_t>(elems));
+    } else {
+        scatter_rotate_quantise_vf<true>(
+            reinterpret_cast<__ubuf__ float*>(View<float>(kUbQ, kPanelElems).GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(
+                View<float>(kUbScale, kMaxRun * kVecLanes).GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(View<float>(kUbAct, kPanelElems).GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(View<float>(kUbSign, kHeadSize).GetPhyAddr()),
+            geom.inv_sqrt_len, static_cast<std::uint16_t>(item.run));
+        AscendC::PipeBarrier<PIPE_V>();
+        // The bins land in kUbQuant as int32 directly; there is no float rounding step at all.
+        LloydMaxQuantise(item, geom);
+    }
 }
 
 // ---------------------------------------------------------------- the planes
@@ -823,7 +1009,7 @@ __aicore__ inline void Run_(__gm__ bfloat16_t* key_gm, __gm__ bfloat16_t* value_
                             std::uint32_t num_kv_heads, std::uint32_t head_size,
                             std::uint32_t block_size,
                             std::uint32_t num_blocks, std::uint32_t item_begin,
-                            std::uint32_t item_count, float inv_sqrt_len)
+                            std::uint32_t item_count, float inv_sqrt_len, std::uint32_t quant_mode)
 {
     // `headSize` is a runtime operand and `kHeadSize` is the butterfly's compile-time width, so
     // the kernel is only defined where they agree: the leaf's four resident registers, the
@@ -837,12 +1023,15 @@ __aicore__ inline void Run_(__gm__ bfloat16_t* key_gm, __gm__ bfloat16_t* value_
 #else
     if (block_size % kStripHeight != 0u) return;
 #endif
+    // quant_mode 0 is the uniform grid, 1 the Lloyd-Max codebook; no third quantiser exists.
+    if (quant_mode > 1u) return;
 
     Geometry geom;
     geom.num_kv_heads = num_kv_heads;
     geom.head_size = head_size;
     geom.block_size = block_size;
     geom.num_blocks = num_blocks;
+    geom.quant_mode = quant_mode;
     geom.inv_sqrt_len = inv_sqrt_len;
 
     AscendC::GlobalTensor<bfloat16_t> key, value;
@@ -979,19 +1168,20 @@ extern "C" __global__ __aicore__ void turboquant_reshape_scatter_aiv(
     __gm__ float* __restrict__ scaleCache, __gm__ std::int32_t* __restrict__ slotMapping,
     __gm__ float* __restrict__ piSigns, __gm__ std::int32_t* __restrict__ cuSeqlens,
     uint32_t numRequests, uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize,
-    uint32_t numBlocks, uint32_t itemBegin, uint32_t itemCount, float invSqrtLen)
+    uint32_t numBlocks, uint32_t itemBegin, uint32_t itemCount, float invSqrtLen,
+    uint32_t quantMode)
 {
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     AscendC::InitSocState();
     turboquant_scatter::Run_(key, value, keyCache, valueCache, scaleCache, slotMapping,
                              piSigns, cuSeqlens, numRequests, numKvHeads, headSize, blockSize,
-                             numBlocks, itemBegin, itemCount, invSqrtLen);
+                             numBlocks, itemBegin, itemCount, invSqrtLen, quantMode);
 #else
     (void)key; (void)value; (void)keyCache; (void)valueCache; (void)scaleCache;
     (void)slotMapping; (void)piSigns; (void)cuSeqlens; (void)numRequests; (void)numKvHeads;
     (void)headSize; (void)blockSize; (void)numBlocks; (void)itemBegin; (void)itemCount;
-    (void)invSqrtLen;
+    (void)invSqrtLen; (void)quantMode;
 #endif
 }
 
@@ -1010,7 +1200,8 @@ extern "C" void launch_turboquant_reshape_scatter_aiv(
     std::int32_t* slot_mapping, float* pi_signs, std::int32_t* cu_seqlens,
     std::uint32_t num_requests, std::uint32_t num_kv_heads,
     std::uint32_t head_size, std::uint32_t block_size, std::uint32_t num_blocks,
-    std::uint32_t item_begin, std::uint32_t item_count, float inv_sqrt_len)
+    std::uint32_t item_begin, std::uint32_t item_count, float inv_sqrt_len,
+    std::uint32_t quant_mode)
 {
 #if TURBOQUANT_INGRESS_NZ
     // The NZ cache lays a physical block out as whole 64-row tiles; anything else is refused
@@ -1019,11 +1210,14 @@ extern "C" void launch_turboquant_reshape_scatter_aiv(
         throw std::invalid_argument("reshape_scatter_aiv: blockSize must be a multiple of 64 "
                                     "for the NZ-tiled ingress");
 #endif
+    if (quant_mode > 1u)
+        throw std::invalid_argument("reshape_scatter_aiv: quant_mode is 0 (uniform) or 1 "
+                                    "(Lloyd-Max)");
     turboquant_reshape_scatter_aiv<<<block_dim, nullptr, stream>>>(
         reinterpret_cast<bfloat16_t*>(key), reinterpret_cast<bfloat16_t*>(value), key_cache,
         value_cache, scale_cache, slot_mapping, pi_signs, cu_seqlens, num_requests,
         num_kv_heads, head_size, block_size, num_blocks, item_begin, item_count,
-        inv_sqrt_len);
+        inv_sqrt_len, quant_mode);
 }
 
 #endif

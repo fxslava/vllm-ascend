@@ -720,11 +720,11 @@ static_assert(!ascend_micro::fused_decode_opt::valid_launch(1, 1, 16, 1, 256, 12
 // The schedules, device-only. In the host pass these expand to nothing, so the entry
 // points below are the same function declarations with an empty body -- which is all
 // the host pass needs to emit their launch stubs.
-#define ASCEND_TQ_FUSED_DECODE_OPT_BODY(MODE, TYPE) \
+#define ASCEND_TQ_FUSED_DECODE_OPT_BODY(MODE, TYPE, UNPACK) \
         KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2); \
         AscendC::InitSocState(); \
         AscendC::TPipe pipe;                                                                                         \
-        TurboQuantFusedDecodeOpt<MODE, TYPE> op(&pipe);                                                               \
+        TurboQuantFusedDecodeOpt<MODE, TYPE, true, UNPACK> op(&pipe);                                                 \
         op.Init(queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,  \
                 tiling, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,             \
                 headsPerTask, fusedContextLimit, scale, invSqrtLen, numBlocks);                                       \
@@ -735,11 +735,11 @@ static_assert(!ascend_micro::fused_decode_opt::valid_launch(1, 1, 16, 1, 256, 12
         }                                                                                                             \
         DrainFusedDecodeTask();
 
-#define ASCEND_TQ_FUSED_DECODE_OPT_RAW_QUERY_BODY(MODE, TYPE) \
+#define ASCEND_TQ_FUSED_DECODE_OPT_RAW_QUERY_BODY(MODE, TYPE, UNPACK) \
         KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2); \
         AscendC::InitSocState(); \
         AscendC::TPipe pipe;                                                                                         \
-        TurboQuantFusedDecodeOpt<MODE, TYPE, false> op(&pipe);                                                        \
+        TurboQuantFusedDecodeOpt<MODE, TYPE, false, UNPACK> op(&pipe);                                                \
         op.Init(queryRot, keyCache, valueCache, scaleCache, blockTables, contextLens, modeTables, workspace, output,  \
                 tiling, numTokens, numHeads, numKvHeads, headSize, blockSize, maxBlocksPerSeq, numSplits,             \
                 headsPerTask, fusedContextLimit, scale, invSqrtLen, numBlocks);                                       \
@@ -755,12 +755,12 @@ static_assert(!ascend_micro::fused_decode_opt::valid_launch(1, 1, 16, 1, 256, 12
 
 #else   // the host pass: the launch stub needs the signature, not the schedule
 
-#define ASCEND_TQ_FUSED_DECODE_OPT_BODY(MODE, TYPE)
-#define ASCEND_TQ_FUSED_DECODE_OPT_RAW_QUERY_BODY(MODE, TYPE)
+#define ASCEND_TQ_FUSED_DECODE_OPT_BODY(MODE, TYPE, UNPACK)
+#define ASCEND_TQ_FUSED_DECODE_OPT_RAW_QUERY_BODY(MODE, TYPE, UNPACK)
 
 #endif  // __CCE_AICORE__
 
-#define ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT(NAME, MODE, TYPE)                                                      \
+#define ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT(NAME, MODE, TYPE, UNPACK)                                              \
     extern "C" __global__ __aicore__ void NAME(                                                                      \
         GM_ADDR queryRot, GM_ADDR keyCache, GM_ADDR valueCache, GM_ADDR scaleCache, GM_ADDR blockTables,             \
         GM_ADDR contextLens, GM_ADDR modeTables, GM_ADDR workspace, GM_ADDR output, GM_ADDR tiling,                  \
@@ -769,12 +769,12 @@ static_assert(!ascend_micro::fused_decode_opt::valid_launch(1, 1, 16, 1, 256, 12
         uint32_t numSplits, uint32_t headsPerTask, uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock,              \
         uint32_t fusedContextLimit, float scale, float invSqrtLen, uint32_t numBlocks)                               \
     {                                                                                                                \
-        ASCEND_TQ_FUSED_DECODE_OPT_BODY(MODE, TYPE)                                                                  \
+        ASCEND_TQ_FUSED_DECODE_OPT_BODY(MODE, TYPE, UNPACK)                                                          \
     }
 
 // The raw-query entry, argument for argument the same as the lock-step decode's, so a benchmark or an
 // msprof run can swap one launcher for the other without touching its tiling.
-#define ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT_RAW_QUERY(NAME, MODE, TYPE)                                            \
+#define ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT_RAW_QUERY(NAME, MODE, TYPE, UNPACK)                                    \
     extern "C" __global__ __aicore__ void NAME(                                                                      \
         GM_ADDR query, GM_ADDR piSigns, GM_ADDR rotTables, GM_ADDR h16, GM_ADDR gate, GM_ADDR queryRot,              \
         GM_ADDR keyCache, GM_ADDR valueCache, GM_ADDR scaleCache, GM_ADDR blockTables, GM_ADDR contextLens,          \
@@ -785,11 +785,17 @@ static_assert(!ascend_micro::fused_decode_opt::valid_launch(1, 1, 16, 1, 256, 12
         uint32_t prologueVectorsPerBlock, uint32_t prologueCubeChunkVectors, uint32_t outputStage,                   \
         uint32_t fusedContextLimit, float scale, float invSqrtLen, uint32_t numBlocks)                               \
     {                                                                                                                \
-        ASCEND_TQ_FUSED_DECODE_OPT_RAW_QUERY_BODY(MODE, TYPE)                                                        \
+        ASCEND_TQ_FUSED_DECODE_OPT_RAW_QUERY_BODY(MODE, TYPE, UNPACK)                                                \
     }
 
-ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT(turboquant_mm_fused_decode_opt_kv4fp8_bf16, TurboQuantMode::KV4_FP8, bfloat16_t)
-ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT_RAW_QUERY(turboquant_mm_fused_decode_opt_raw_query_kv4fp8_bf16, TurboQuantMode::KV4_FP8, bfloat16_t)
+ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT(turboquant_mm_fused_decode_opt_kv4fp8_bf16, TurboQuantMode::KV4_FP8, bfloat16_t, DecodeUnpack::kNative)
+ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT_RAW_QUERY(turboquant_mm_fused_decode_opt_raw_query_kv4fp8_bf16, TurboQuantMode::KV4_FP8, bfloat16_t, DecodeUnpack::kNative)
+// The Lloyd-Max pair: the same tile pipeline with the codec's 16-entry Gather expand resolving
+// every nibble through TurboQuantLloydMaxTraits' e4m3-rounded codebook, which the launcher reaches
+// when Launch::decode_unpack names DecodeUnpack::kLloydMaxLut. modeTables then carries the 16 fp32
+// centroids, and the writers that produced the cache must have encoded on the same codebook.
+ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT(turboquant_mm_fused_decode_opt_kv4fp8_bf16_lm, TurboQuantMode::KV4_FP8, bfloat16_t, DecodeUnpack::kLloydMaxLut)
+ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT_RAW_QUERY(turboquant_mm_fused_decode_opt_raw_query_kv4fp8_bf16_lm, TurboQuantMode::KV4_FP8, bfloat16_t, DecodeUnpack::kLloydMaxLut)
 
 #endif  // the entry points
 
@@ -816,7 +822,7 @@ void turboquant_mm_fused_decode_opt_impl(int32_t mode, AscendType type, void *st
                                          uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,
                                          uint32_t numSplits, uint32_t headsPerTask, uint32_t tasksPerBlock,
                                          uint32_t reduceTasksPerBlock, uint32_t fusedContextLimit, float scale,
-                                         float invSqrtLen, uint32_t numBlocks)
+                                         float invSqrtLen, uint32_t numBlocks, uint32_t decodeUnpack)
 {
     if (!tiling) throw std::invalid_argument("fused decode launch without host tiling descriptors");
     // DIRTY-DATA (D1/N3): without the physical page count the device could not bound a
@@ -829,14 +835,28 @@ void turboquant_mm_fused_decode_opt_impl(int32_t mode, AscendType type, void *st
     if (blockDim == 0 || static_cast<turboquant::TurboQuantMode>(mode) != turboquant::TurboQuantMode::KV4_FP8) {
         return;
     }
-    
+    // Only the two expands with declared kernels: kNative and the Lloyd-Max gather. A Lloyd-Max
+    // launch reads its 16 fp32 centroids from modeTables, so the buffer must actually carry them.
+    if (decodeUnpack != static_cast<uint32_t>(turboquant::DecodeUnpack::kNative) &&
+        decodeUnpack != static_cast<uint32_t>(turboquant::DecodeUnpack::kLloydMaxLut))
+        throw std::invalid_argument("fused decode launch with an unpack variant no kernel declares");
+
     if (type == AscendType::BF16) {
-        turboquant_mm_fused_decode_opt_kv4fp8_bf16<<<blockDim, nullptr, stream>>>(
-            AsGmAddr(queryRot), AsGmAddr(keyCache), AsGmAddr(valueCache), AsGmAddr(scaleCache),
-            AsGmAddr(blockTables), AsGmAddr(contextLens), AsGmAddr(modeTables), AsGmAddr(workspace),
-            AsGmAddr(output), AsGmAddr(tiling), numTokens, numHeads, numKvHeads, headSize, blockSize,
-            maxBlocksPerSeq, numSplits, headsPerTask, tasksPerBlock, reduceTasksPerBlock,
-            fusedContextLimit, scale, invSqrtLen, numBlocks);
+        if (decodeUnpack == static_cast<uint32_t>(turboquant::DecodeUnpack::kLloydMaxLut)) {
+            turboquant_mm_fused_decode_opt_kv4fp8_bf16_lm<<<blockDim, nullptr, stream>>>(
+                AsGmAddr(queryRot), AsGmAddr(keyCache), AsGmAddr(valueCache), AsGmAddr(scaleCache),
+                AsGmAddr(blockTables), AsGmAddr(contextLens), AsGmAddr(modeTables), AsGmAddr(workspace),
+                AsGmAddr(output), AsGmAddr(tiling), numTokens, numHeads, numKvHeads, headSize, blockSize,
+                maxBlocksPerSeq, numSplits, headsPerTask, tasksPerBlock, reduceTasksPerBlock,
+                fusedContextLimit, scale, invSqrtLen, numBlocks);
+        } else {
+            turboquant_mm_fused_decode_opt_kv4fp8_bf16<<<blockDim, nullptr, stream>>>(
+                AsGmAddr(queryRot), AsGmAddr(keyCache), AsGmAddr(valueCache), AsGmAddr(scaleCache),
+                AsGmAddr(blockTables), AsGmAddr(contextLens), AsGmAddr(modeTables), AsGmAddr(workspace),
+                AsGmAddr(output), AsGmAddr(tiling), numTokens, numHeads, numKvHeads, headSize, blockSize,
+                maxBlocksPerSeq, numSplits, headsPerTask, tasksPerBlock, reduceTasksPerBlock,
+                fusedContextLimit, scale, invSqrtLen, numBlocks);
+        }
     }
 }
 
@@ -848,7 +868,7 @@ void turboquant_mm_fused_decode_opt_raw_query_impl(
     uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits,
     uint32_t headsPerTask, uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock, uint32_t prologueVectorsPerBlock,
     uint32_t prologueCubeChunkVectors, uint32_t outputStage, uint32_t fusedContextLimit, float scale,
-    float invSqrtLen, uint32_t numBlocks)
+    float invSqrtLen, uint32_t numBlocks, uint32_t decodeUnpack)
 {
     if (!tiling) throw std::invalid_argument("fused decode launch without host tiling descriptors");
     // DIRTY-DATA (D1/N3): see the pre-rotated entry: a launch without the cache page count cannot
@@ -864,16 +884,31 @@ void turboquant_mm_fused_decode_opt_raw_query_impl(
     if (blockDim == 0 || static_cast<turboquant::TurboQuantMode>(mode) != turboquant::TurboQuantMode::KV4_FP8) {
         return;
     }
-    
+    // See the pre-rotated entry: kNative and kLloydMaxLut are the two declared expands.
+    if (decodeUnpack != static_cast<uint32_t>(turboquant::DecodeUnpack::kNative) &&
+        decodeUnpack != static_cast<uint32_t>(turboquant::DecodeUnpack::kLloydMaxLut))
+        throw std::invalid_argument("fused decode launch with an unpack variant no kernel declares");
+
     if (type == AscendType::BF16) {
-        turboquant_mm_fused_decode_opt_raw_query_kv4fp8_bf16<<<blockDim, nullptr, stream>>>(
-            AsGmAddr(query), AsGmAddr(piSigns), AsGmAddr(rotTables), AsGmAddr(h16), AsGmAddr(gate),
-            AsGmAddr(queryRot), AsGmAddr(keyCache), AsGmAddr(valueCache), AsGmAddr(scaleCache),
-            AsGmAddr(blockTables), AsGmAddr(contextLens), AsGmAddr(modeTables), AsGmAddr(workspace),
-            AsGmAddr(output), AsGmAddr(tiling), numTokens, numHeads, numKvHeads, headSize,
-            blockSize, maxBlocksPerSeq, numSplits, headsPerTask, tasksPerBlock, reduceTasksPerBlock,
-            prologueVectorsPerBlock, prologueCubeChunkVectors, outputStage, fusedContextLimit, scale,
-            invSqrtLen, numBlocks);
+        if (decodeUnpack == static_cast<uint32_t>(turboquant::DecodeUnpack::kLloydMaxLut)) {
+            turboquant_mm_fused_decode_opt_raw_query_kv4fp8_bf16_lm<<<blockDim, nullptr, stream>>>(
+                AsGmAddr(query), AsGmAddr(piSigns), AsGmAddr(rotTables), AsGmAddr(h16), AsGmAddr(gate),
+                AsGmAddr(queryRot), AsGmAddr(keyCache), AsGmAddr(valueCache), AsGmAddr(scaleCache),
+                AsGmAddr(blockTables), AsGmAddr(contextLens), AsGmAddr(modeTables), AsGmAddr(workspace),
+                AsGmAddr(output), AsGmAddr(tiling), numTokens, numHeads, numKvHeads, headSize,
+                blockSize, maxBlocksPerSeq, numSplits, headsPerTask, tasksPerBlock, reduceTasksPerBlock,
+                prologueVectorsPerBlock, prologueCubeChunkVectors, outputStage, fusedContextLimit, scale,
+                invSqrtLen, numBlocks);
+        } else {
+            turboquant_mm_fused_decode_opt_raw_query_kv4fp8_bf16<<<blockDim, nullptr, stream>>>(
+                AsGmAddr(query), AsGmAddr(piSigns), AsGmAddr(rotTables), AsGmAddr(h16), AsGmAddr(gate),
+                AsGmAddr(queryRot), AsGmAddr(keyCache), AsGmAddr(valueCache), AsGmAddr(scaleCache),
+                AsGmAddr(blockTables), AsGmAddr(contextLens), AsGmAddr(modeTables), AsGmAddr(workspace),
+                AsGmAddr(output), AsGmAddr(tiling), numTokens, numHeads, numKvHeads, headSize,
+                blockSize, maxBlocksPerSeq, numSplits, headsPerTask, tasksPerBlock, reduceTasksPerBlock,
+                prologueVectorsPerBlock, prologueCubeChunkVectors, outputStage, fusedContextLimit, scale,
+                invSqrtLen, numBlocks);
+        }
     }
 }
 
@@ -893,7 +928,7 @@ extern "C" void launch_fused_decode_opt_raw_query(void* stream,
         c->tokens, c->heads, c->kv_heads, c->head_size, c->block_size, c->max_blocks, c->splits,
         c->heads_per_task, c->tasks_per_block, c->reduce_tasks_per_block,
         c->prologue_vectors_per_block, c->prologue_cube_chunk_vectors, c->output_stage,
-        c->fused_context_limit, c->scale, c->inv_sqrt_len, c->num_blocks);
+        c->fused_context_limit, c->scale, c->inv_sqrt_len, c->num_blocks, c->decode_unpack);
 }
 
 extern "C" void launch_fused_decode_opt(void* stream,
@@ -907,7 +942,7 @@ extern "C" void launch_fused_decode_opt(void* stream,
         b->context_lengths, b->mode_tables, b->workspace, b->output, b->tiling, c->tokens,
         c->heads, c->kv_heads, c->head_size, c->block_size, c->max_blocks, c->splits,
         c->heads_per_task, c->tasks_per_block, c->reduce_tasks_per_block,
-        c->fused_context_limit, c->scale, c->inv_sqrt_len, c->num_blocks);
+        c->fused_context_limit, c->scale, c->inv_sqrt_len, c->num_blocks, c->decode_unpack);
 }
 
 #endif

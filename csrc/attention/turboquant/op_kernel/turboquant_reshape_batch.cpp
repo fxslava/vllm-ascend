@@ -5,6 +5,7 @@
 #include "tensor_api/tensor.h"
 #include "kernel_operator.h"
 #include "cube/routine_stage_page_zn_bf16.hpp"
+#include "../scatter/routine_vector_rotate_butterfly.hpp"
 
 #define TQ_AICORE __aicore__
 #else
@@ -13,6 +14,7 @@
 
 #include "common/turboquant_wave_protocol.hpp"
 #include "common/turboquant_layout.h"
+#include "../../include/turboquant/turboquant_mode.h"
 
 #ifndef TURBOQUANT_INGRESS_NZ
 #define TURBOQUANT_INGRESS_NZ 0
@@ -321,8 +323,19 @@ struct VectorState {
     std::uint32_t key_scale;
     std::uint32_t value_scale;
     std::uint32_t head_scale;
+    // The quantiser: 0 is the uniform mid-rise grid on the absmax power-of-two scale, 1 is the
+    // Lloyd-Max codebook on the per-row RMS scale (LloydMaxQuantisePanel).
+    std::uint32_t quant_mode;
     float inv_sqrt_len;
 };
+
+// The non-uniform codebook quant_mode 1 quantises on: the 16 e4m3-rounded Lloyd-Max levels of a
+// unit Gaussian and the exact midpoints between them. The packed nibble stays a signed int4 bin
+// index, so the cache layout and the whole NZ/strip write path below are unchanged; what moves
+// is the row scale's MEANING -- it is the row's RMS (times invSqrtLen), not the absmax power of
+// two, because a nibble reconstructs as centroid[bin] * stored_scale.
+using LloydMaxKv4 =
+    vllm_ascend::turboquant::TurboQuantLloydMaxTraits<vllm_ascend::turboquant::TurboQuantMode::KV4_FP8>;
 
 struct StripAddr {
     std::uint32_t page_bytes;
@@ -400,6 +413,62 @@ __aicore__ inline void KeyFold(const AscendC::LocalTensor<float>& dst, const Asc
 template <std::uint32_t... Steps>
 __aicore__ inline void ValueFoldEmit(const AscendC::LocalTensor<float>& buf, std::integer_sequence<std::uint32_t, Steps...>) {
     (AscendC::Max(buf, buf, buf[kPanel >> (Steps + 1u)], static_cast<std::int32_t>(kPanel >> (Steps + 1u))), ...);
+}
+
+// ------------------------------------------------- the Lloyd-Max sum-of-squares folds
+// quant_mode 1 reduces the SQUARES of the rotated panel, so every partial is one FP32 add in a
+// fixed order the host oracle replays sum for sum. The key plane's rows are contiguous, so its
+// reduction runs whole in registers (LloydMaxSumsqRowsVf below); the value plane's channel-major
+// panel folds in place exactly like ValueFoldEmit, with Add for Max.
+template <std::uint32_t... Steps>
+__aicore__ inline void ValueFoldSumEmit(const AscendC::LocalTensor<float>& buf,
+                                        std::integer_sequence<std::uint32_t, Steps...>) {
+    (AscendC::Add(buf, buf, buf[kPanel >> (Steps + 1u)], static_cast<std::int32_t>(kPanel >> (Steps + 1u))), ...);
+}
+
+// The key plane's per-token sum of squares, register-resident: one row's four quarters folded
+// in sequence, then six gather-and-add rounds at XOR strides 1, 2, 4, 8, 16, 32 -- exactly the
+// scatter writer's sumsq butterfly (routine_vector_rotate_butterfly.hpp's tables), so the host
+// oracle replays it lane for lane. Vector-register loads are 256-byte aligned by construction,
+// which is what the UB fold chain below the block width could not be.
+//
+// The `used` attribute is load-bearing: the AIC leg of this MIX kernel never instantiates the
+// caller (RotateAndQuantise is AIV work), and without it the toolchain drops the body and fails
+// on -Wunneeded-internal-declaration.
+__simd_vf__ inline void __attribute__((used))
+LloydMaxSumsqRowsVf(__ubuf__ float* sumsq_out, __ubuf__ float* squares, std::uint16_t rows)
+{
+    AscendC::Reg::MaskReg mask =
+        AscendC::Reg::CreateMask<float, AscendC::Reg::MaskPattern::ALL>();
+    AscendC::Reg::MaskReg lane0 =
+        AscendC::Reg::CreateMask<float, AscendC::Reg::MaskPattern::VL1>();
+    ascend_micro::RotGatherTables t;
+    ascend_micro::rot_build_gather_tables(t, mask);
+    for (std::uint16_t r = 0; r < rows; ++r) {
+        __ubuf__ float* row = squares + static_cast<std::uint32_t>(r) * kHeadSize;
+        AscendC::Reg::RegTensor<float> m, v, partner;
+        AscendC::Reg::LoadAlign<float, AscendC::Reg::LoadDist::DIST_NORM>(m, row);
+        AscendC::Reg::LoadAlign<float, AscendC::Reg::LoadDist::DIST_NORM>(v, row + 64u);
+        AscendC::Reg::Add<float>(m, m, v, mask);
+        AscendC::Reg::LoadAlign<float, AscendC::Reg::LoadDist::DIST_NORM>(v, row + 128u);
+        AscendC::Reg::Add<float>(m, m, v, mask);
+        AscendC::Reg::LoadAlign<float, AscendC::Reg::LoadDist::DIST_NORM>(v, row + 192u);
+        AscendC::Reg::Add<float>(m, m, v, mask);
+        AscendC::Reg::Gather<float, std::uint32_t>(partner, m, t.i0);
+        AscendC::Reg::Add<float>(m, m, partner, mask);
+        AscendC::Reg::Gather<float, std::uint32_t>(partner, m, t.i1);
+        AscendC::Reg::Add<float>(m, m, partner, mask);
+        AscendC::Reg::Gather<float, std::uint32_t>(partner, m, t.i2);
+        AscendC::Reg::Add<float>(m, m, partner, mask);
+        AscendC::Reg::Gather<float, std::uint32_t>(partner, m, t.i3);
+        AscendC::Reg::Add<float>(m, m, partner, mask);
+        AscendC::Reg::Gather<float, std::uint32_t>(partner, m, t.i4);
+        AscendC::Reg::Add<float>(m, m, partner, mask);
+        AscendC::Reg::Gather<float, std::uint32_t>(partner, m, t.i5);
+        AscendC::Reg::Add<float>(m, m, partner, mask);
+        AscendC::Reg::StoreAlign<float, AscendC::Reg::StoreDist::DIST_NORM_B32>(
+            sumsq_out + static_cast<std::uint32_t>(r) * 8u, m, lane0);
+    }
 }
 
 #if TURBOQUANT_INGRESS_NZ
@@ -483,10 +552,12 @@ public:
 
     __aicore__ inline void InitVector(__gm__ std::int8_t* key_cache, __gm__ std::int8_t* value_cache,
                                       __gm__ float* scale_cache, std::uint32_t block_size,
-                                      std::uint32_t head_size, float inv_sqrt_len) {
+                                      std::uint32_t head_size, float inv_sqrt_len,
+                                      std::uint32_t quant_mode) {
         vector_.key_cache.SetGlobalBuffer(key_cache);
         vector_.value_cache.SetGlobalBuffer(value_cache);
         vector_.scale_cache.SetGlobalBuffer(scale_cache);
+        vector_.quant_mode = quant_mode;
 #if TURBOQUANT_INGRESS_NZ
         // An NZ (tile, kv head) plane is kNzHeadBytes whatever the block size, and a kv head is
         // ONE float inside a slot's record rather than a whole block-size plane.
@@ -624,6 +695,126 @@ public:
         }
     }
 
+    // quant_mode 1: the panel quantised on the 16-level Lloyd-Max codebook of a unit Gaussian
+    // (LloydMaxKv4) at each row's own RMS, replacing everything between the rotation's Fixpipe
+    // landing and the shared pack stage:
+    //
+    //   sigma_e = sqrt(sumsq + eps) * invSqrtLen      -- the row's RMS, guarded off zero
+    //   u       = y / sigma_e                          -- via invn = -1/sigma_e, the codec's sign
+    //   bin     = -8 + #{i : kThresholds[i] + u < 0}   -- trick: an Adds whose sign bit the
+    //   nibble  = bin                                   ShiftRight reads, counted into the int32
+    //   stored scale = sigma_e * invSqrtLen            -- plane by Adds/ShiftRight/Add, so
+    //                                                    centroid[bin] * scale ~= y * invSqrtLen
+    //
+    // eps sits UNDER the sqrt because Sqrt's contract leaves a non-positive operand undefined;
+    // for a zero row sigma_e stays positive, u is -0 and every bin is the all-negative-threshold
+    // bin, with a ~1e-13 stored scale -- a zero row reconstructs to ~0, the uniform grid's
+    // explicit zero branch by other means.
+    //
+    // Sqrt and Div run their 0-ULP configs (PRECISION_0ULP_FTZ_FALSE / DIFF_COMPENSATION) --
+    // the default intrinsics are 1-ULP, which a host oracle could not reproduce. The sumsq
+    // folds are FP32 adds in a fixed order (the register butterfly for the key plane, the
+    // in-place halving fold for the value plane), so the whole panel replays on the host
+    // float-for-float.
+    //
+    // The result lands in the SAME frame as the uniform path: bins in `quant` (kUbCast, int32,
+    // exact integers in [-8, 7]) and sigma_e in kUbPow, so the shared stage below -- staged Cast,
+    // the NZ weave, and the scale emit's Muls by inv_sqrt_len -- is untouched.
+    template <std::uint32_t PHASE>
+    __aicore__ inline void LloydMaxQuantisePanel() {
+        constexpr float kLmEps = 1e-20f;
+        static constexpr AscendC::SqrtConfig kSqrt0 = {AscendC::SqrtAlgo::PRECISION_0ULP_FTZ_FALSE};
+        static constexpr AscendC::DivConfig kDiv0 = {AscendC::DivAlgo::DIFF_COMPENSATION};
+        constexpr std::int32_t all = static_cast<std::int32_t>(kPanel);
+        constexpr std::int32_t lanes = static_cast<std::int32_t>(kScaleFloats);
+        // The binning scratch is one panel of floats spanning the four fold/half buffers, which
+        // are all dead by then and contiguous by construction.
+        static_assert(kUbFold128 + kPanel * 4u <= kUbHalf + kPanel * 2u,
+                      "the Lloyd-Max binning scratch must fit the fold and half buffers");
+        auto cast = View<float>(kUbCast, kPanel);
+        auto work = View<float>(kUbWork, kPanel);
+        auto sumsq = View<float>(kUbAbsMax, kScaleFloats);
+        auto sigma = View<float>(kUbPow, kScaleFloats);
+        auto invn = View<float>(kUbInv, kScaleFloats);
+        auto quant = View<std::int32_t>(kUbCast, kPanel);
+
+        // The per-token sum of squares. Every partial is one FP32 add in a documented order.
+        AscendC::Mul(work, cast, cast, all);
+        if constexpr (kIsKey<PHASE>) {
+            // The key plane's rows are contiguous, so the whole reduction runs in registers:
+            // four quarters folded in sequence, then the six-round XOR butterfly, leaving each
+            // token's sumsq in lane 0 of its 8-float slot of the fold buffer.
+            auto f64 = View<float>(kUbFold64, kTokens * 64u);
+            LloydMaxSumsqRowsVf(reinterpret_cast<__ubuf__ float*>(f64.GetPhyAddr()),
+                                reinterpret_cast<__ubuf__ float*>(work.GetPhyAddr()),
+                                static_cast<std::uint16_t>(kTokens));
+            AscendC::PipeBarrier<PIPE_V>();
+            // Compact the strided lane-0 partials (float t * 8) into one contiguous vector.
+            auto gather_offsets = View<std::int32_t>(kUbExpBits, kScaleFloats);
+            AscendC::ArithProgression(gather_offsets, 0, 32, static_cast<std::int32_t>(kTokens));
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Gather(sumsq, f64, gather_offsets.ReinterpretCast<std::uint32_t>(), 0u,
+                            static_cast<std::int32_t>(kTokens));
+        } else {
+            ValueFoldSumEmit(work, std::make_integer_sequence<std::uint32_t, 8u>{});
+            AscendC::PipeBarrier<PIPE_V>();
+            // The value fold ends contiguous at work[0..kTokens); stage it with the key plane's.
+            AscendC::Muls(sumsq, work, 1.0f, lanes);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+
+        AscendC::Adds(sumsq, sumsq, kLmEps, lanes);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Sqrt<float, kSqrt0>(sigma, sumsq, lanes);
+        AscendC::Muls(sigma, sigma, vector_.inv_sqrt_len, lanes);
+        AscendC::Duplicate(invn, -1.0f, lanes);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Div<float, kDiv0>(invn, invn, sigma, lanes);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        // u = y * invn with the uniform path's own per-token broadcasts.
+        AscendC::BinaryRepeatParams bc;
+        bc.dstBlkStride = 1; bc.src0BlkStride = 1; bc.dstRepStride = 8; bc.src0RepStride = 8;
+        if constexpr (kIsKey<PHASE>) {
+            auto inv_bcast = View<float>(kUbInvBcast, kTokens * kLanesPerBlock);
+            AscendC::Brcb(inv_bcast, invn, 2, {1, 8});
+            AscendC::PipeBarrier<PIPE_V>();
+            bc.src1BlkStride = 0; bc.src1RepStride = 1;
+            bc.dstRepStride = static_cast<std::uint8_t>(kHeadSize / kLanesPerBlock);
+            bc.src0RepStride = bc.dstRepStride;
+            KeyQuantiseEmit(work, cast, inv_bcast, bc, std::make_integer_sequence<std::uint32_t, kHeadSize / 64u>{});
+        } else {
+            auto inv_rep = View<float>(kUbInvRep, 4u * kScaleFloats);
+            AscendC::Muls(inv_rep, invn, 1.0f, lanes);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Muls(inv_rep[kScaleFloats], inv_rep, 1.0f, lanes);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Muls(inv_rep[2u * kScaleFloats], inv_rep, 1.0f, static_cast<std::int32_t>(2u * kScaleFloats));
+            AscendC::PipeBarrier<PIPE_V>();
+            bc.src1BlkStride = 1; bc.src1RepStride = 0;
+            AscendC::Mul<float>(work, cast, inv_rep, 64, static_cast<std::uint8_t>(kPanel / 64u), bc);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+
+        // bin - 8 directly: the accumulator starts at -8 and each of the 15 thresholds adds one
+        // wherever threshold + u is negative, i.e. wherever u exceeds it.
+        auto tmp = View<float>(kUbFold128, kPanel);
+        AscendC::Duplicate(quant, -8, all);
+        AscendC::PipeBarrier<PIPE_V>();
+        for (int i = 0; i < LloydMaxKv4::kThresholdCount; ++i) {
+            AscendC::Adds(tmp, work, LloydMaxKv4::kThresholds[i], all);
+            // Reinterpretation: tmp was just written as float and is shifted as uint32 next.
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::ShiftRight(tmp.ReinterpretCast<std::uint32_t>(),
+                                tmp.ReinterpretCast<std::uint32_t>(), 31u, all);
+            // Reinterpretation: the sign words were just written as uint32 and are summed as int32.
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Add(quant, quant, tmp.ReinterpretCast<std::int32_t>(), all);
+            // Reinterpretation: quant was last read as int32 and the next pass writes tmp as float.
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+    }
+
     template <std::uint32_t PHASE>
     __aicore__ inline void RotateAndQuantise() {
         constexpr std::uint32_t land = kLandSlot<PHASE>;
@@ -642,72 +833,81 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::V_S>(pack_evt);
         AscendC::CrossCoreSetFlag<2, kSync2AivAnnounce>(kSync2PanelFree);
 
-        auto abs_max = View<float>(kUbAbsMax, kScaleFloats);
-        auto one = View<float>(kUbOne, kScaleFloats);
-        AscendC::Abs(work, cast, all);
-        if constexpr (kIsKey<PHASE>) {
-            auto f128 = View<float>(kUbFold128, kTokens * 128u);
-            auto f64 = View<float>(kUbFold64, kTokens * 64u);
-            auto f8 = View<float>(kUbFold8, kTokens * 8u);
-            KeyFold<256u, 256u, 128u>(f128, work);
-            KeyFold<128u, 128u, 64u>(f64, f128);
-            AscendC::BlockReduceMax<float>(f8, f64, static_cast<std::uint8_t>(kTokens), 64, 1, 1, 8);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::BlockReduceMax<float>(abs_max, f8, 2, 64, 1, 1, 8);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Max(abs_max, abs_max, one, static_cast<std::int32_t>(kScaleFloats));
-        } else {
-            ValueFoldEmit(work, std::make_integer_sequence<std::uint32_t, 8u>{});
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Max(abs_max, work, one, static_cast<std::int32_t>(kScaleFloats));
-        }
-
-        auto exp_bits = View<std::int32_t>(kUbExpBits, kScaleFloats);
-        auto exp_mask = View<std::int32_t>(kUbExpMask, kScaleFloats);
-        auto inv_seed = View<std::int32_t>(kUbInvSeed, kScaleFloats);
-        auto pow_bits = View<std::int32_t>(kUbPow, kScaleFloats);
-        auto pow_two = View<float>(kUbPow, kScaleFloats);
-        auto inv_bits = View<std::int32_t>(kUbInv, kScaleFloats);
-        auto inv = View<float>(kUbInv, kScaleFloats);
-        constexpr std::int32_t lanes = static_cast<std::int32_t>(kScaleFloats);
-
-        AscendC::And(exp_bits, abs_max.template ReinterpretCast<std::int32_t>(), exp_mask, lanes);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Adds(pow_bits, exp_bits, static_cast<std::int32_t>(-0x01000000), lanes);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Sub(inv_bits, inv_seed, pow_bits, lanes);
-
         auto quant = View<std::int32_t>(kUbCast, kPanel);
         auto staged = View<half>(kUbHalf, kPanel);
         auto packed = View<std::int8_t>(kPackBase<pack>, kPackedBytes);
-        AscendC::BinaryRepeatParams bc;
-        bc.dstBlkStride = 1; bc.src0BlkStride = 1; bc.dstRepStride = 8; bc.src0RepStride = 8;
-        if constexpr (kIsKey<PHASE>) {
-            auto inv_bcast = View<float>(kUbInvBcast, kTokens * kLanesPerBlock);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Brcb(inv_bcast, inv, 2, {1, 8});
-            AscendC::PipeBarrier<PIPE_V>();
-            bc.src1BlkStride = 0; bc.src1RepStride = 1;
-            bc.dstRepStride = static_cast<std::uint8_t>(kHeadSize / kLanesPerBlock);
-            bc.src0RepStride = bc.dstRepStride;
-            KeyQuantiseEmit(work, cast, inv_bcast, bc, std::make_integer_sequence<std::uint32_t, kHeadSize / 64u>{});
-        } else {
-            auto inv_rep = View<float>(kUbInvRep, 4u * kScaleFloats);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Muls(inv_rep, inv, 1.0f, lanes);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Muls(inv_rep[kScaleFloats], inv_rep, 1.0f, lanes);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Muls(inv_rep[2u * kScaleFloats], inv_rep, 1.0f, static_cast<std::int32_t>(2u * kScaleFloats));
-            AscendC::PipeBarrier<PIPE_V>();
-            bc.src1BlkStride = 1; bc.src1RepStride = 0;
-            AscendC::Mul<float>(work, cast, inv_rep, 64, static_cast<std::uint8_t>(kPanel / 64u), bc);
-        }
+        // The scale emit below reads kUbPow through this view whichever path filled it: the
+        // uniform grid's 2^(e-2) or Lloyd-Max's sigma_e -- both are multiplied by inv_sqrt_len
+        // there, which is what makes the two stores the same instruction.
+        auto pow_two = View<float>(kUbPow, kScaleFloats);
+        if (vector_.quant_mode == 0u) {
+            auto abs_max = View<float>(kUbAbsMax, kScaleFloats);
+            auto one = View<float>(kUbOne, kScaleFloats);
+            AscendC::Abs(work, cast, all);
+            if constexpr (kIsKey<PHASE>) {
+                auto f128 = View<float>(kUbFold128, kTokens * 128u);
+                auto f64 = View<float>(kUbFold64, kTokens * 64u);
+                auto f8 = View<float>(kUbFold8, kTokens * 8u);
+                KeyFold<256u, 256u, 128u>(f128, work);
+                KeyFold<128u, 128u, 64u>(f64, f128);
+                AscendC::BlockReduceMax<float>(f8, f64, static_cast<std::uint8_t>(kTokens), 64, 1, 1, 8);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::BlockReduceMax<float>(abs_max, f8, 2, 64, 1, 1, 8);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Max(abs_max, abs_max, one, static_cast<std::int32_t>(kScaleFloats));
+            } else {
+                ValueFoldEmit(work, std::make_integer_sequence<std::uint32_t, 8u>{});
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Max(abs_max, work, one, static_cast<std::int32_t>(kScaleFloats));
+            }
 
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Mins(work, work, 7.0f, all);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Cast(quant, work, AscendC::RoundMode::CAST_RINT, kPanel);
+            auto exp_bits = View<std::int32_t>(kUbExpBits, kScaleFloats);
+            auto exp_mask = View<std::int32_t>(kUbExpMask, kScaleFloats);
+            auto inv_seed = View<std::int32_t>(kUbInvSeed, kScaleFloats);
+            auto pow_bits = View<std::int32_t>(kUbPow, kScaleFloats);
+            auto inv_bits = View<std::int32_t>(kUbInv, kScaleFloats);
+            auto inv = View<float>(kUbInv, kScaleFloats);
+            constexpr std::int32_t lanes = static_cast<std::int32_t>(kScaleFloats);
+
+            AscendC::And(exp_bits, abs_max.template ReinterpretCast<std::int32_t>(), exp_mask, lanes);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Adds(pow_bits, exp_bits, static_cast<std::int32_t>(-0x01000000), lanes);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Sub(inv_bits, inv_seed, pow_bits, lanes);
+
+            AscendC::BinaryRepeatParams bc;
+            bc.dstBlkStride = 1; bc.src0BlkStride = 1; bc.dstRepStride = 8; bc.src0RepStride = 8;
+            if constexpr (kIsKey<PHASE>) {
+                auto inv_bcast = View<float>(kUbInvBcast, kTokens * kLanesPerBlock);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Brcb(inv_bcast, inv, 2, {1, 8});
+                AscendC::PipeBarrier<PIPE_V>();
+                bc.src1BlkStride = 0; bc.src1RepStride = 1;
+                bc.dstRepStride = static_cast<std::uint8_t>(kHeadSize / kLanesPerBlock);
+                bc.src0RepStride = bc.dstRepStride;
+                KeyQuantiseEmit(work, cast, inv_bcast, bc, std::make_integer_sequence<std::uint32_t, kHeadSize / 64u>{});
+            } else {
+                auto inv_rep = View<float>(kUbInvRep, 4u * kScaleFloats);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Muls(inv_rep, inv, 1.0f, lanes);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Muls(inv_rep[kScaleFloats], inv_rep, 1.0f, lanes);
+                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Muls(inv_rep[2u * kScaleFloats], inv_rep, 1.0f, static_cast<std::int32_t>(2u * kScaleFloats));
+                AscendC::PipeBarrier<PIPE_V>();
+                bc.src1BlkStride = 1; bc.src1RepStride = 0;
+                AscendC::Mul<float>(work, cast, inv_rep, 64, static_cast<std::uint8_t>(kPanel / 64u), bc);
+            }
+
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mins(work, work, 7.0f, all);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Cast(quant, work, AscendC::RoundMode::CAST_RINT, kPanel);
+        } else {
+            // The codebook path: bins in `quant` and sigma_e in kUbPow, the same frame the
+            // uniform grid leaves, so the NZ/strip stage below is shared verbatim.
+            LloydMaxQuantisePanel<PHASE>();
+        }
 #if TURBOQUANT_INGRESS_NZ
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Cast(staged, quant, AscendC::RoundMode::CAST_RINT, kPanel);
@@ -755,7 +955,8 @@ public:
         auto nibbles = packed.template ReinterpretCast<AscendC::int4b_t>();
         AscendC::Cast(nibbles, staged, AscendC::RoundMode::CAST_RINT, kPanel);
         auto scale = View<float>(kScaleBase<pack>, kScaleFloats);
-        AscendC::Muls(scale, pow_two, vector_.inv_sqrt_len, lanes);
+        AscendC::Muls(scale, pow_two, vector_.inv_sqrt_len,
+                      static_cast<std::int32_t>(kScaleFloats));
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(pack_evt);
 #endif
     }
@@ -981,13 +1182,15 @@ __aicore__ inline void KernelBody(
     __gm__ std::int32_t* __restrict__ tables,
     uint32_t numTokens, uint32_t numKvHeads, uint32_t headSize,
     uint32_t blockSize, uint32_t numBlocks, uint32_t tokensPerCore,
-    float invSqrtLen) {
+    float invSqrtLen, uint32_t quantMode) {
 
     const uint32_t block = static_cast<uint32_t>(AscendC::GetBlockIdx() / AscendC::GetSubBlockNum());
     const uint32_t total_blocks = turboquant_wave::TotalStrips(numTokens, tokensPerCore);
     if (turboquant_wave::BlockOutOfStrips(block, total_blocks)) return;
     const uint32_t strips = turboquant_wave::StripsPerBlock(tokensPerCore);
     if (strips == 0u) return;
+    // quant_mode 0 is the uniform grid, 1 the Lloyd-Max codebook; no third quantiser exists.
+    if (quantMode > 1u) return;
 
     AscendC::InitSocState();
 
@@ -1009,7 +1212,7 @@ __aicore__ inline void KernelBody(
         op.InitCube(key, value, numKvHeads, headSize);
         op.ExecuteCube(strips, tables);
     } else {
-        op.InitVector(keyCache, valueCache, scaleCache, blockSize, headSize, invSqrtLen);
+        op.InitVector(keyCache, valueCache, scaleCache, blockSize, headSize, invSqrtLen, quantMode);
         if (AscendC::GetSubBlockIdx() == 0) {
             op.ExecuteVector<0>(slotMapping, numKvHeads, blockSize, numBlocks, strips);
         } else {
@@ -1063,16 +1266,18 @@ extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_bf16(
     __gm__ float* __restrict__ scaleCache, __gm__ std::int32_t* __restrict__ slotMapping,
     __gm__ float* __restrict__ piSigns, __gm__ std::int32_t* __restrict__ tables,
     uint32_t numTokens, uint32_t numKvHeads, uint32_t headSize,
-    uint32_t blockSize, uint32_t numBlocks, uint32_t tokensPerCore, float invSqrtLen) {
+    uint32_t blockSize, uint32_t numBlocks, uint32_t tokensPerCore, float invSqrtLen,
+    uint32_t quantMode) {
 #if defined(__CCE_AICORE__)
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     turboquant_bf16::KernelBody(key, value, keyCache, valueCache, scaleCache, slotMapping,
                                 piSigns, tables, numTokens, numKvHeads, headSize, blockSize,
-                                numBlocks, tokensPerCore, invSqrtLen);
+                                numBlocks, tokensPerCore, invSqrtLen, quantMode);
 #else
     (void)key; (void)value; (void)keyCache; (void)valueCache; (void)scaleCache;
     (void)slotMapping; (void)piSigns; (void)tables; (void)numTokens; (void)numKvHeads;
     (void)headSize; (void)blockSize; (void)numBlocks; (void)tokensPerCore; (void)invSqrtLen;
+    (void)quantMode;
 #endif
 }
 
@@ -1088,7 +1293,8 @@ extern "C" void launch_turboquant_reshape_and_cache_bf16(
     std::int8_t* key_cache, std::int8_t* value_cache, float* scale_cache,
     const std::int32_t* slot_mapping, const float* pi_signs, const std::int32_t* tables,
     std::uint32_t num_tokens, std::uint32_t num_kv_heads, std::uint32_t head_size,
-    std::uint32_t block_size, std::uint32_t num_blocks, std::uint32_t tokens_per_core, float inv_sqrt_len) {
+    std::uint32_t block_size, std::uint32_t num_blocks, std::uint32_t tokens_per_core,
+    float inv_sqrt_len, std::uint32_t quant_mode) {
     if (!turboquant_wave::WholeStripShare(tokens_per_core))
         throw std::invalid_argument("reshape_and_cache_bf16: tokensPerCore error");
     if (!turboquant_wave::WholeStrips(num_tokens, tokens_per_core))
@@ -1104,12 +1310,15 @@ extern "C" void launch_turboquant_reshape_and_cache_bf16(
         throw std::invalid_argument("reshape_and_cache_bf16: the NZ-tiled ingress is compiled "
                                     "for 4 kv heads of 256 channels");
 #endif
+    if (quant_mode > 1u)
+        throw std::invalid_argument("reshape_and_cache_bf16: quant_mode is 0 (uniform) or 1 "
+                                    "(Lloyd-Max)");
     const std::uint32_t grid = turboquant_wave::TotalStrips(num_tokens, tokens_per_core);
     turboquant_reshape_and_cache_bf16<<<grid, nullptr, stream>>>(
         reinterpret_cast<bfloat16_t*>(const_cast<std::uint16_t*>(key)),
         reinterpret_cast<bfloat16_t*>(const_cast<std::uint16_t*>(value)), key_cache,
         value_cache, scale_cache, const_cast<std::int32_t*>(slot_mapping), const_cast<float*>(pi_signs),
         const_cast<std::int32_t*>(tables), num_tokens, num_kv_heads, head_size, block_size, num_blocks,
-        tokens_per_core, inv_sqrt_len);
+        tokens_per_core, inv_sqrt_len, quant_mode);
 }
 #endif
