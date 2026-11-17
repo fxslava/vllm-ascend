@@ -22,7 +22,11 @@ void turboquant_mm_fused_decode_opt_raw_query_impl(
     uint32_t fused_context_limit, float scale, float inv_sqrt_len,
     // DIRTY-DATA (D1/N3): physical page count of the cache planes; the device bounds every
     // block-table page it reads against it. Kept in step with the include/ declaration.
-    uint32_t num_blocks);
+    uint32_t num_blocks,
+    // Which expand the decode's vector half runs, as vllm_ascend::turboquant::DecodeUnpack:
+    // 0 = kNative, 3 = kLloydMaxLut (the 16-entry Gather over the Lloyd-Max codebook; mode_tables
+    // then carries the 16 fp32 centroids at its head).
+    uint32_t decode_unpack);
 
 }  // namespace vllm_ascend
 
@@ -38,12 +42,16 @@ void launch_turboquant_reshape_and_cache_bf16(
     int8_t* value_cache, float* scale_cache, const int32_t* slot_mapping,
     const float* pi_signs, const int32_t* tables, uint32_t num_tokens,
     uint32_t num_kv_heads, uint32_t head_size, uint32_t block_size,
-    uint32_t num_blocks, uint32_t tokens_per_core, float inv_sqrt_len);
+    uint32_t num_blocks, uint32_t tokens_per_core, float inv_sqrt_len,
+    // 0 = the uniform grid, 1 = the 16-level Lloyd-Max codebook at the row's own RMS.
+    uint32_t quant_mode);
 void launch_turboquant_reshape_scatter_aiv(
     void* stream, uint32_t block_dim, uint16_t* key, uint16_t* value,
     int8_t* key_cache, int8_t* value_cache, float* scale_cache,
     int32_t* slot_mapping, float* pi_signs, int32_t* cu_seqlens,
     uint32_t num_requests, uint32_t num_kv_heads,
     uint32_t head_size, uint32_t block_size, uint32_t num_blocks,
-    uint32_t item_begin, uint32_t item_count, float inv_sqrt_len);
+    uint32_t item_begin, uint32_t item_count, float inv_sqrt_len,
+    // 0 = the uniform grid, 1 = the 16-level Lloyd-Max codebook at the row's own RMS.
+    uint32_t quant_mode);
 }

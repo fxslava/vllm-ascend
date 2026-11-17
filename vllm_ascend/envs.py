@@ -110,6 +110,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     # discoverable with the rest of the environment. It guards the prefill batch
     # writer only -- the decode scatter writer takes arbitrary slots by design.
     "VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS": lambda: bool(int(os.getenv("VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS", "0"))),
+    # The codebook the TurboQuant writers quantise on and the fused decode
+    # reconstructs with. 0 (default): the uniform mid-rise grid. 1: the
+    # 16-level Lloyd-Max codebook of a unit Gaussian (each centroid rounded to
+    # fp8 e4m3), quantised at each row's own RMS -- the writers' quant_mode 1
+    # and the fused decode's DecodeUnpack::kLloydMaxLut. The two sides must
+    # agree: a cache written at one quant_mode and decoded at the other
+    # produces plausible-looking wrong numbers, not an error. No other value is
+    # valid; the launchers refuse it.
+    "VLLM_ASCEND_TURBOQUANT_QUANT_MODE": lambda: int(os.getenv("VLLM_ASCEND_TURBOQUANT_QUANT_MODE", "0")),
     # Log each TurboQuant dispatch with tensor shape, stride, dtype, device and
     # contiguity. 0 (default): off. 1: on; diagnostic only, not for serving.
     "VLLM_ASCEND_TURBOQUANT_TRACE": lambda: _strict_binary_env("VLLM_ASCEND_TURBOQUANT_TRACE"),

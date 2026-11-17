@@ -331,9 +331,80 @@ inline int nibble_index(const Shape& shape, int plane, int token, int channel)
                       : channel * shape.block_size + token;
 }
 
-// One panel of the rotation and the quantiser, from the activation block.
+// The Lloyd-Max per-token sum of squares of one rotated row, accumulated in the device's own
+// FP32 order so the scale and every bin downstream stay bit-comparable. `fold_key` selects the
+// key plane's register butterfly (the four 64-lane quarters of the squares folded in sequence,
+// then six gather-and-add rounds at XOR strides 1, 2, 4, 8, 16, 32 -- the scatter writer's
+// tree); !fold_key is the value plane's in-place halving fold over one token's column of the
+// channel-major panel (a fold stride never mixes tokens). The trees round differently, and a
+// panel written by one and checked against the other would flip an occasional bin near a
+// threshold.
+inline float lloyd_max_sumsq(const std::vector<long long>& y, int token, int head_size,
+                             bool fold_key)
+{
+    const std::size_t base = static_cast<std::size_t>(token) * head_size;
+    if (fold_key) {
+        float acc[64];
+        for (int l = 0; l < 64; ++l) {
+            const float y0 = static_cast<float>(y[base + l]);
+            float m = y0 * y0;
+            float t1 = static_cast<float>(y[base + 64 + l]);
+            t1 *= t1;
+            m = m + t1;
+            float t2 = static_cast<float>(y[base + 128 + l]);
+            t2 *= t2;
+            m = m + t2;
+            float t3 = static_cast<float>(y[base + 192 + l]);
+            t3 *= t3;
+            m = m + t3;
+            acc[l] = m;
+        }
+        for (const int stride : {1, 2, 4, 8, 16, 32}) {
+            float prev[64];
+            std::memcpy(prev, acc, sizeof(prev));
+            for (int l = 0; l < 64; ++l) acc[l] = prev[l] + prev[l ^ stride];
+        }
+        return acc[0];
+    }
+    std::vector<float> acc(static_cast<std::size_t>(head_size), 0.0f);
+    for (int c = 0; c < head_size; ++c) {
+        const float yf = static_cast<float>(y[base + c]);
+        acc[static_cast<std::size_t>(c)] = yf * yf;
+    }
+    for (int half = head_size / 2; half >= 1; half >>= 1)
+        for (int c = 0; c < half; ++c)
+            acc[static_cast<std::size_t>(c)] =
+                acc[static_cast<std::size_t>(c)] + acc[static_cast<std::size_t>(c + half)];
+    return acc[0];
+}
+
+// The scale and the bin of one coordinate, the rest of the codebook contract: sigma_e =
+// sqrt(sumsq + 1e-20f) * invSqrtLen and u = y * (-1 / sigma_e), with the device's Sqrt and Div
+// in their 0-ULP configs -- which is IEEE correctly rounded, what sqrtf and `/` do here. The eps
+// guards the zero row off Sqrt's non-positive-input contract, and a bin counts the codebook
+// thresholds u exceeds, as one FP32 Adds and its sign bit per threshold.
+inline float lloyd_max_sigma_e(float sumsq, float inv_sqrt_len)
+{
+    return std::sqrt(sumsq + 1e-20f) * inv_sqrt_len;
+}
+
+inline int lloyd_max_bin(float y, float sigma_e)
+{
+    using LmTraits = vllm_ascend::turboquant::TurboQuantLloydMaxTraits<
+        vllm_ascend::turboquant::TurboQuantMode::KV4_FP8>;
+    const float u = y * (-1.0f / sigma_e);
+    int bin = -8;
+    for (int i = 0; i < LmTraits::kThresholdCount; ++i) {
+        const float d = LmTraits::kThresholds[i] + u;
+        bin += static_cast<int>(tq_test::float_bits(d) >> 31);
+    }
+    return bin;
+}
+
+// One panel of the rotation and the quantiser, from the activation block. `lloyd_max` selects
+// the codebook the reference quantises on, matching the launch's quant_mode.
 inline void build_chunk(const Shape& shape, const std::int8_t* input, int strip, int plane,
-                        int head, int page, ChunkRef& out)
+                        int head, int page, ChunkRef& out, bool lloyd_max = false)
 {
     const int groups = group_count(shape);
     const int head_size = shape.head_size;
@@ -397,18 +468,35 @@ inline void build_chunk(const Shape& shape, const std::int8_t* input, int strip,
         out.abs_max[static_cast<std::size_t>(t)] = m;
         if (m > out.chunk_max) out.chunk_max = m;
         int e = 0;
-        while ((1LL << (e + 1)) <= m) ++e;
-        out.exponent[static_cast<std::size_t>(t)] = e;
-        out.scale[static_cast<std::size_t>(t)] =
-            std::ldexp(1.0f, e - 2) * shape.inv_sqrt_len();
+        float lm_sigma = 0.0f;
+        if (lloyd_max) {
+            // The codebook scale: the row's RMS in the device's fold order, times invSqrtLen.
+            // There is no exponent and no clamp on this path.
+            lm_sigma = lloyd_max_sigma_e(
+                lloyd_max_sumsq(out.y, t, head_size, /*fold_key=*/plane == 0),
+                shape.inv_sqrt_len());
+            out.exponent[static_cast<std::size_t>(t)] = 0;
+            out.scale[static_cast<std::size_t>(t)] = lm_sigma * shape.inv_sqrt_len();
+        } else {
+            while ((1LL << (e + 1)) <= m) ++e;
+            out.exponent[static_cast<std::size_t>(t)] = e;
+            out.scale[static_cast<std::size_t>(t)] =
+                std::ldexp(1.0f, e - 2) * shape.inv_sqrt_len();
+        }
         for (int ch = 0; ch < head_size; ++ch) {
             // |y * 2^(2-e)| < 8 and round-to-nearest-even can reach +8, which
             // INT4 cannot hold, so the kernel clamps from above only.
-            long long v = rint_even_shift(out.y[static_cast<std::size_t>(t) * head_size + ch],
-                                          e - 2);
-            if (v > kNibbleMax) {
-                v = kNibbleMax;
-                out.clamped = true;
+            long long v = 0;
+            if (lloyd_max) {
+                v = lloyd_max_bin(
+                    static_cast<float>(out.y[static_cast<std::size_t>(t) * head_size + ch]),
+                    lm_sigma);
+            } else {
+                v = rint_even_shift(out.y[static_cast<std::size_t>(t) * head_size + ch], e - 2);
+                if (v > kNibbleMax) {
+                    v = kNibbleMax;
+                    out.clamped = true;
+                }
             }
             const int qv = static_cast<int>(v);
             out.q[static_cast<std::size_t>(t) * head_size + ch] = qv;
@@ -444,6 +532,7 @@ inline void unpack_page(const Shape& shape, int plane, const std::uint8_t* page,
 // The whole reference: every strip's panels, and the physical cache images the
 // device must produce. `slot_mapping` is the caller's, so a harness can feed a
 // deliberately fragmented or out-of-range mapping and see it reflected here.
+// `lloyd_max` selects the codebook the reference quantises on, matching the launch's quant_mode.
 //
 // `strip_runs`, when given, is one flag per strip saying whether that strip's grid block
 // actually executes. A strip that does not run contributes no panels and leaves `page_written`
@@ -452,7 +541,7 @@ inline void unpack_page(const Shape& shape, int plane, const std::uint8_t* page,
 inline Reference compute_oracle_reference(const Shape& shape, const std::int8_t* key,
                                           const std::int8_t* value,
                                           const std::int32_t* slot_mapping,
-                                          const char* strip_runs = nullptr)
+                                          const char* strip_runs = nullptr, bool lloyd_max = false)
 {
     require(shape.valid(), "the prefill reference needs a valid cache geometry");
     require(shape.block_size == tq_test::kStripHeight,
@@ -480,7 +569,8 @@ inline Reference compute_oracle_reference(const Shape& shape, const std::int8_t*
             for (int head = 0; head < shape.num_kv_heads; ++head) {
                 ChunkRef& out = ref.chunks[((static_cast<std::size_t>(strip) * kPlanes) +
                                             plane) * shape.num_kv_heads + head];
-                build_chunk(shape, plane == 0 ? key : value, strip, plane, head, page, out);
+                build_chunk(shape, plane == 0 ? key : value, strip, plane, head, page, out,
+                            lloyd_max);
                 auto& cache = plane == 0 ? ref.key_cache : ref.value_cache;
                 std::memcpy(cache.data() + ref.head_offset(page, head), out.packed.data(),
                             out.packed.size());
@@ -497,7 +587,7 @@ inline Reference compute_oracle_reference(int num_tokens, int num_kv_heads, int 
                                           int block_size, int num_blocks,
                                           const std::int8_t* key, const std::int8_t* value,
                                           const std::int32_t* slot_mapping,
-                                          const char* strip_runs = nullptr)
+                                          const char* strip_runs = nullptr, bool lloyd_max = false)
 {
     Shape shape;
     shape.num_tokens = num_tokens;
@@ -505,7 +595,7 @@ inline Reference compute_oracle_reference(int num_tokens, int num_kv_heads, int 
     shape.head_size = head_size;
     shape.block_size = block_size;
     shape.num_blocks = num_blocks;
-    return compute_oracle_reference(shape, key, value, slot_mapping, strip_runs);
+    return compute_oracle_reference(shape, key, value, slot_mapping, strip_runs, lloyd_max);
 }
 
 // --------------------------------------------------------- oracle self-audit

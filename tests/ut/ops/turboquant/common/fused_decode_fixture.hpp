@@ -462,6 +462,10 @@ struct Fixture {
         c.element_type = static_cast<std::uint32_t>(element);
         c.tokens = requests; c.kv_heads = kv_heads; c.heads = kv_heads * group_heads;
         c.block_size = page_tokens; c.max_blocks = pages; c.splits = splits;
+        // DIRTY-DATA (D1/N3): the device bounds every block-table entry against this. The
+        // fixture's cache plane really does hold `physical_pages` pages, so a table naming one
+        // past it is refused on the device instead of read.
+        c.num_blocks = static_cast<std::uint32_t>(physical_pages);
         c.heads_per_task = group_heads; c.fused_context_limit = 0;
         const unsigned tasks = requests * kv_heads * splits;
         c.tasks_per_block = (tasks + 31) / 32;

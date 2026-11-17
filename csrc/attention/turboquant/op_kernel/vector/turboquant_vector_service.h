@@ -268,13 +268,15 @@ struct TurboQuantTaskHeads {
 // holds head j's value for the per-task readers.
 //
 // THIS SERVICE IS PINNED TO ONE SHAPE, and the static_asserts below say so rather than carrying
-// branches nothing instantiates. turboquant_fused_decode.cpp declares exactly two kernels, both
-// KV4_FP8 / bfloat16_t / DecodeUnpack::kNative, and both host launchers refuse any other mode
-// before the grid is sized. Every `if constexpr` that used to pick a row-major ingest, a per-head
-// softmax, a gather expand or the bypass ablation was therefore unreachable, and an unreachable
-// path on a kernel this hard to test is worse than no path: it reads as verified and is not. A
-// fifth mode or a second expand comes back as a routine plus a static_assert that admits it, not
-// as a branch nobody runs.
+// branches nothing instantiates. turboquant_fused_decode.cpp declares KV4_FP8 / bfloat16_t
+// kernels only, and both host launchers refuse any other mode before the grid is sized. Two
+// expands are admitted: kNative (the shipping affine code cast) and kLloydMaxLut (the same tile
+// path with the codec's 16-entry Gather expand, decoding the Lloyd-Max codebook the cache was
+// written on). They differ ONLY inside StageTileToL1, which dispatches on the codec's kGatherLut
+// -- an `if constexpr` on the codec, not a branch on the tile path. The kGatherLut pricing leg
+// and the bypass ablation stay uninstantiated: an unreachable path on a kernel this hard to test
+// reads as verified and is not. A fifth mode or another expand comes back the same way -- a
+// routine plus a static_assert that admits it, not a branch nobody runs.
 //
 // RING_SLOTS, SCORE_WINDOWS and BANK_SKEW are the pipeline's shape. The modulo-scheduled decode
 // takes kCubePipelineSlots ingest slots, kCubeScoreWindows score windows so the Cube's next score
@@ -292,13 +294,15 @@ public:
     static_assert(MODE == TurboQuantMode::KV4_FP8,
                   "the only decode kernels declared are kv4fp8; another mode needs its ingest and "
                   "softmax verified here before this service will carry it");
-    static_assert(UNPACK == DecodeUnpack::kNative,
-                  "the gather expands and the bypass ablation are not instantiated; add one back as "
-                  "a routine, not as a branch on the tile path");
+    static_assert(UNPACK == DecodeUnpack::kNative || UNPACK == DecodeUnpack::kLloydMaxLut,
+                  "the tile pipeline carries the native expand and the Lloyd-Max gather expand; "
+                  "another variant is added as a routine here, not as a branch nobody runs");
     static_assert(kBatched, "kv4fp8 batches its heads; the per-head softmax path is gone");
     static_assert(kNzTiled, "kv4fp8 streams NZ-tiled planes; the row-major burst path is gone");
     static_assert(kNzTiled == Codec::kIsAffine, "only the byte-wise affine expand streams an NZ-tiled plane");
-    static_assert(!Codec::kGatherLut && !Codec::kLloydMaxLut, "the service and its codec disagree on the expand");
+    static_assert(Codec::kGatherLut == DecodeUnpackGathers(UNPACK) &&
+                      Codec::kLloydMaxLut == DecodeUnpackIsLloydMax(UNPACK),
+                  "the service and its codec disagree on the expand");
     // scalar_t is the OUTPUT element type only. The Cube operands are OperandT, which comes from MODE
     // (KV4/FP8) and not from scalar_t, so the ring ingest, the dequant expand, the score and context
     // GEMMs and every tile descriptor are identical in the half and bfloat16_t instances. The width,
@@ -430,6 +434,13 @@ public:
         const AscendC::LocalTensor<float> mask = maskBuf_.Get<float>();
         ascend_micro::vector_cube_tail_mask(mask, mask[kCubeTileRows].ReinterpretCast<int32_t>(), valid,
                                             kMaskMidpoint, kMaskGain);
+        // DIRTY-DATA (D2): the ramp above is positive on the live lanes and negative on the dead
+        // ones. Turn that sign into a bit predicate ONCE here, at the head of the task, so the
+        // softmax can SELECT the dead rows away instead of relying on a Min whose NaN behaviour
+        // the documentation does not define. The predicate lives in the mask buffer's own tail,
+        // which is 32-byte aligned (256 bytes into the 512-byte buffer).
+        AscendC::Compares(mask[kCubeTileRows].ReinterpretCast<uint8_t>(), mask, 0.0f,
+                          AscendC::CMPMODE::GT, static_cast<uint32_t>(kCubeTileRows));
         // DIRTY-DATA (D2): the ramp above is positive on the live lanes and negative on the dead
         // ones. Turn that sign into a bit predicate ONCE here, at the head of the task, so the
         // softmax can SELECT the dead rows away instead of relying on a Min whose NaN behaviour
@@ -809,13 +820,23 @@ private:
     // An NZ-tiled plane is already the NZ image of its bytes, and the expand is byte-wise, so a chunk's
     // low nibbles land in place on NZ groups [0, groups) and its high nibbles on [groups, 2 * groups).
     // The staging buffer is the L1 operand as unpacked, and one MTE3 burst stages it.
+    //
+    // The two admitted expands differ only in how a widened nibble becomes an operand: kNative casts
+    // the signed code itself (the uniform grid), a gathering codec resolves it through the UB table
+    // its Init loaded from modeTables -- the Lloyd-Max centroids when UNPACK is kLloydMaxLut.
     __aicore__ inline void StageTileToL1(const AscendC::LocalTensor<int8_t>   &packed,
                                          const AscendC::LocalTensor<OperandT> &l1Dst)
     {
         const AscendC::LocalTensor<OperandT> nzLow  = nzOperandBuf_.Get<OperandT>();
         const AscendC::LocalTensor<OperandT> nzHigh = nzLow[tilePlaneBytes_];
         for (uint32_t base = 0; base < tilePlaneBytes_; base += unpackChunkBytes_) {
-            codec_.template UnpackAffine<OperandT>(nzLow[base], nzHigh[base], packed[base], unpackChunkBytes_);
+            if constexpr (Codec::kGatherLut) {
+                codec_.template UnpackAffineGather<OperandT>(nzLow[base], nzHigh[base], packed[base],
+                                                             unpackChunkBytes_);
+            } else {
+                codec_.template UnpackAffine<OperandT>(nzLow[base], nzHigh[base], packed[base],
+                                                       unpackChunkBytes_);
+            }
         }
         SyncVectorToMte3();
         AscendC::DataCopy(l1Dst, nzLow, nzTileToL1Params_);

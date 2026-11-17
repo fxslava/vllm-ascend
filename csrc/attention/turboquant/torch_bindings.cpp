@@ -472,7 +472,7 @@ inline void check_strip_slots(const at::Tensor &slot_mapping, const std::int64_t
 void npu_turboquant_reshape_and_cache_a8(at::Tensor &key, at::Tensor &value, at::Tensor &key_cache,
                                          at::Tensor &value_cache, at::Tensor &scale_cache,
                                          at::Tensor &slot_mapping, at::Tensor &pi_signs, at::Tensor &tables,
-                                         double inv_sqrt_len)
+                                         double inv_sqrt_len, int64_t quant_mode)
 {
     constexpr const char *op = "npu_turboquant_reshape_and_cache_a8";
 
@@ -480,6 +480,9 @@ void npu_turboquant_reshape_and_cache_a8(at::Tensor &key, at::Tensor &value, at:
     const CachePlanes c = check_cache(key_cache, value_cache, scale_cache, a, op);
     check_slot_mapping(slot_mapping, a.num_tokens, op);
     check_tables(tables, a.head_size, op, "tables");
+    // quant_mode 0 is the uniform grid, 1 the Lloyd-Max codebook; no third quantiser exists.
+    TORCH_CHECK(quant_mode == 0 || quant_mode == 1, op,
+                ": quant_mode is 0 (uniform) or 1 (Lloyd-Max), got ", quant_mode);
 
     // The kernel's compile-time specialisation (kTokens, kHeads, kHeadSize in
     // op_kernel/turboquant_reshape_batch.cpp). The scalar arguments drive the
@@ -536,7 +539,8 @@ void npu_turboquant_reshape_and_cache_a8(at::Tensor &key, at::Tensor &value, at:
         static_cast<const std::int32_t *>(tables.data_ptr()), static_cast<std::uint32_t>(a.num_tokens),
         static_cast<std::uint32_t>(a.num_kv_heads), static_cast<std::uint32_t>(a.head_size),
         static_cast<std::uint32_t>(c.block_size), static_cast<std::uint32_t>(c.num_blocks),
-        static_cast<std::uint32_t>(kTokensPerStrip), static_cast<float>(inv_sqrt_len));
+        static_cast<std::uint32_t>(kTokensPerStrip), static_cast<float>(inv_sqrt_len),
+        static_cast<std::uint32_t>(quant_mode));
 }
 
 // ---------------------------------------------------------------------------
@@ -563,13 +567,17 @@ void npu_turboquant_reshape_and_cache_a8(at::Tensor &key, at::Tensor &value, at:
 // in this repo ever read it.
 void npu_turboquant_reshape_scatter_aiv(at::Tensor &key, at::Tensor &value, at::Tensor &key_cache,
                                         at::Tensor &value_cache, at::Tensor &scale_cache,
-                                        at::Tensor &slot_mapping, at::Tensor &pi_signs, double inv_sqrt_len)
+                                        at::Tensor &slot_mapping, at::Tensor &pi_signs, double inv_sqrt_len,
+                                        int64_t quant_mode)
 {
     constexpr const char *op = "npu_turboquant_reshape_scatter_aiv";
 
     const Activations a = check_activations(key, value, op);
     const CachePlanes c = check_cache(key_cache, value_cache, scale_cache, a, op);
     check_slot_mapping(slot_mapping, a.num_tokens, op);
+    // quant_mode 0 is the uniform grid, 1 the Lloyd-Max codebook; no third quantiser exists.
+    TORCH_CHECK(quant_mode == 0 || quant_mode == 1, op,
+                ": quant_mode is 0 (uniform) or 1 (Lloyd-Max), got ", quant_mode);
 
     TORCH_CHECK(a.head_size == kDecodeHeadSize, op, ": the scatter writer is specialised to head_size ",
                 kDecodeHeadSize, ", got ", a.head_size);
@@ -623,7 +631,8 @@ void npu_turboquant_reshape_scatter_aiv(at::Tensor &key, at::Tensor &value, at::
         /*cu_seqlens=*/nullptr, static_cast<std::uint32_t>(num_requests),
         static_cast<std::uint32_t>(a.num_kv_heads), static_cast<std::uint32_t>(a.head_size),
         static_cast<std::uint32_t>(c.block_size), static_cast<std::uint32_t>(c.num_blocks),
-        /*item_begin=*/0u, static_cast<std::uint32_t>(total_items), static_cast<float>(inv_sqrt_len));
+        /*item_begin=*/0u, static_cast<std::uint32_t>(total_items), static_cast<float>(inv_sqrt_len),
+        static_cast<std::uint32_t>(quant_mode));
 }
 
 // ---------------------------------------------------------------------------
@@ -672,9 +681,17 @@ void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Te
                                  at::Tensor &workspace, at::Tensor &query_rot, at::Tensor &output,
                                  int64_t num_heads, int64_t num_kv_heads, int64_t num_splits,
                                  int64_t heads_per_task, int64_t output_stage, double scale,
-                                 double inv_sqrt_len)
+                                 double inv_sqrt_len, int64_t decode_unpack)
 {
     constexpr const char *op = "npu_turboquant_fused_decode";
+
+    // Which expand the decode's vector half runs, as DecodeUnpack: 0 = kNative (the uniform-grid
+    // code cast), 3 = kLloydMaxLut (the 16-entry Gather over the Lloyd-Max codebook). Only those
+    // two have declared kernels. kLloydMaxLut is only meaningful against a cache the writers
+    // encoded with quant_mode 1.
+    TORCH_CHECK(decode_unpack == static_cast<int64_t>(layout::DecodeUnpack::kNative) ||
+                    decode_unpack == static_cast<int64_t>(layout::DecodeUnpack::kLloydMaxLut),
+                op, ": decode_unpack is 0 (kNative) or 3 (kLloydMaxLut), got ", decode_unpack);
 
     // ---- query and output ---------------------------------------------------
     TORCH_CHECK(query.dim() == 3 && output.dim() == 3, op,
@@ -972,20 +989,29 @@ void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Te
     check_burst_aligned(basis_pool, op, "basis codec pool");
 
     // ---- the decode codec's constant pool ------------------------------------
-    // A required positional argument of the launcher that this mode never
-    // dereferences: TurboQuantModeCodec::ConstTableWords returns 0 for an affine
-    // mode with the gather LUT off, so Init reads no words from it under
-    // KV4_FP8 (op_kernel/common/turboquant_codec_mx.h). A null pointer was
-    // therefore safe, and was what this passed.
+    // A required positional argument of the launcher. Under kNative, the only
+    // expand KV4_FP8 shipped with, TurboQuantModeCodec::ConstTableWords returns 0
+    // for an affine mode with the gather LUT off, so Init reads no words from it
+    // (op_kernel/common/turboquant_codec_mx.h). A null pointer was therefore
+    // safe, and was what this passed.
     //
     // It is a real allocation now because "safe" there is a property of the MODE
     // and not of the ABI. SetGlobalBuffer(nullptr) is only harmless while
     // nothing reads it, so switching the mode -- or turning GATHER_LUT on, which
     // is a template argument away -- would turn this into a null dereference on
     // the device, which surfaces as an AIV fault with no line attached to it.
-    // kMinBurstBytes of zeros removes that edge; the operator's own fixture does
+    // kMinBurstBytes of buffer removes that edge; the operator's own fixture does
     // the same thing (`modes.Upload(std::vector<std::uint32_t>(8, 0))` in
     // tests/npu/test_fused_decode_e2e.cpp).
+    //
+    // Its head carries the 16 fp32 Lloyd-Max centroids of
+    // TurboQuantLloydMaxTraits<KV4_FP8> (op_kernel/common/turboquant_mode.h),
+    // zero-padded to the burst: the kLloydMaxLut expand's codec Init DataCopies
+    // ConstTableWords == kLevels words out of this buffer and gathers every
+    // nibble through them, so a launch at decode_unpack 3 decodes the codebook
+    // the quant_mode 1 writers encoded on. kNative reads nothing, so carrying
+    // the table unconditionally costs no instruction and cannot drift between
+    // the two call sites.
     //
     // Cached rather than allocated per launch, for the same reason the basis
     // pool is: it is a constant, and a zero-fill allocation inside a region that
@@ -994,8 +1020,13 @@ void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Te
     // tag is what keeps that from colliding with a basis pool.
     const at::Tensor mode_tables =
         cached_constant(CachedConstant::kModeTables, /*head_size=*/0, query.device(), [&] {
-            return at::zeros({static_cast<std::int64_t>(layout::kMinBurstBytes) / 4},
-                             query.options().dtype(at::kInt));
+            at::Tensor host = at::zeros({static_cast<std::int64_t>(layout::kMinBurstBytes) / 4},
+                                        at::TensorOptions().dtype(at::kInt));
+            std::int32_t *words = host.data_ptr<std::int32_t>();
+            using LloydMax = layout::TurboQuantLloydMaxTraits<layout::TurboQuantMode::KV4_FP8>;
+            for (std::int64_t i = 0; i < LloydMax::kLevels; ++i)
+                std::memcpy(&words[i], &LloydMax::kCentroids[i], sizeof(float));
+            return host.to(query.device(), /*non_blocking=*/false);
         });
 
     // BF16 ONLY, checked rather than mapped. The audited fused decode carries a
@@ -1029,7 +1060,7 @@ void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Te
         layout::kFusedContextLimit, static_cast<float>(scale), static_cast<float>(inv_sqrt_len),
         // DIRTY-DATA (N1/N3): the physical page count the device bounds every block-table
         // entry against; taken from the cache tensor, never from a scalar argument.
-        static_cast<std::uint32_t>(num_blocks));
+        static_cast<std::uint32_t>(num_blocks), static_cast<std::uint32_t>(decode_unpack));
 }
 
 // ---------------------------------------------------------------------------
@@ -1165,12 +1196,13 @@ void npu_turboquant_build_decode_tiling(at::Tensor &context_lens, at::Tensor &ti
 namespace meta {
 
 void npu_turboquant_reshape_and_cache_a8_meta(at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &,
-                                              at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, double)
+                                              at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, double,
+                                              int64_t)
 {
 }
 
 void npu_turboquant_reshape_scatter_aiv_meta(at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &,
-                                             at::Tensor &, at::Tensor &, at::Tensor &, double)
+                                             at::Tensor &, at::Tensor &, at::Tensor &, double, int64_t)
 {
 }
 
@@ -1178,7 +1210,7 @@ void npu_turboquant_fused_decode_meta(at::Tensor &, at::Tensor &, at::Tensor &, 
                                       const std::optional<at::Tensor> &, at::Tensor &, at::Tensor &,
                                       at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &,
                                       at::Tensor &, at::Tensor &, int64_t, int64_t, int64_t, int64_t,
-                                      int64_t, double, double)
+                                      int64_t, double, double, int64_t)
 {
 }
 
@@ -1232,10 +1264,13 @@ TORCH_LIBRARY_FRAGMENT(turboquant_ops, ops)
     //              64 (the decode wants a power-of-two multiple).
     // pi_signs     folded into `tables`; an empty tensor says so
     // tables       2 * (head_size / 32) row-major 32x32 BF16 blocks of +-1
+    // quant_mode   0 = the uniform grid, 1 = the 16-level Lloyd-Max codebook at
+    //              each row's own RMS; a cache must be written and decoded on
+    //              the same codebook
     ops.def(
         "npu_turboquant_reshape_and_cache_a8(Tensor key, Tensor value, Tensor! key_cache, "
         "Tensor! value_cache, Tensor! scale_cache, Tensor slot_mapping, Tensor pi_signs, "
-        "Tensor tables, float inv_sqrt_len) -> ()");
+        "Tensor tables, float inv_sqrt_len, int quant_mode) -> ()");
     ops.impl("npu_turboquant_reshape_and_cache_a8", c10::kPrivateUse1,
              &vllm_ascend::turboquant_bindings::npu_turboquant_reshape_and_cache_a8);
     ops.impl("npu_turboquant_reshape_and_cache_a8", c10::kMeta,
@@ -1249,7 +1284,7 @@ TORCH_LIBRARY_FRAGMENT(turboquant_ops, ops)
     ops.def(
         "npu_turboquant_reshape_scatter_aiv(Tensor key, Tensor value, Tensor! key_cache, "
         "Tensor! value_cache, Tensor! scale_cache, Tensor slot_mapping, Tensor pi_signs, "
-        "float inv_sqrt_len) -> ()");
+        "float inv_sqrt_len, int quant_mode) -> ()");
     ops.impl("npu_turboquant_reshape_scatter_aiv", c10::kPrivateUse1,
              &vllm_ascend::turboquant_bindings::npu_turboquant_reshape_scatter_aiv);
     ops.impl("npu_turboquant_reshape_scatter_aiv", c10::kMeta,
@@ -1276,6 +1311,11 @@ TORCH_LIBRARY_FRAGMENT(turboquant_ops, ops)
     //              head_size], the rotated query image the prologue writes and
     //              the decode reads -- it is not `query`.
     // output_stage TurboQuantOutputStage: 0 rotated basis, 1 unrotated, 2 gated
+    // decode_unpack DecodeUnpack: 0 = kNative (the uniform-grid code cast),
+    //               3 = kLloydMaxLut (the 16-entry Gather over the Lloyd-Max
+    //               codebook; only meaningful against a cache the writers
+    //               encoded with quant_mode 1, and the op carries that
+    //               codebook's 16 fp32 centroids at the head of mode_tables)
     //
     // THE THREE BUFFERS ARE THE CALLER'S NOW. They were allocated inside the
     // launch, which gave each a fresh address every step; a captured ACL graph
@@ -1289,7 +1329,8 @@ TORCH_LIBRARY_FRAGMENT(turboquant_ops, ops)
         "Tensor? gate, Tensor key_cache, Tensor value_cache, Tensor scale_cache, Tensor block_tables, "
         "Tensor context_lens, Tensor tiling, Tensor! workspace, Tensor! query_rot, Tensor! output, "
         "int num_heads, int num_kv_heads, int num_splits, "
-        "int heads_per_task, int output_stage, float scale, float inv_sqrt_len) -> ()");
+        "int heads_per_task, int output_stage, float scale, float inv_sqrt_len, "
+        "int decode_unpack) -> ()");
     ops.impl("npu_turboquant_fused_decode", c10::kPrivateUse1,
              &vllm_ascend::turboquant_bindings::npu_turboquant_fused_decode);
     ops.impl("npu_turboquant_fused_decode", c10::kMeta,

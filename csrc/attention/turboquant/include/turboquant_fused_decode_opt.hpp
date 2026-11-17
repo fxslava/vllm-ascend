@@ -128,6 +128,12 @@ struct Launch {
     // `RawQueryBuffers::raw_query` and `::gate` on the raw-query entry. Default 0, so a caller that
     // predates this field keeps the fp16 behaviour it had.
     std::uint32_t element_type = 0;
+    // Which expand the decode's vector half runs, as vllm_ascend::turboquant::DecodeUnpack:
+    // 0 = kNative (the uniform-grid code cast), 3 = kLloydMaxLut (the 16-entry Gather over the
+    // Lloyd-Max codebook). Only those two have declared kernels; the launcher refuses any other
+    // value. kLloydMaxLut reads its 16 fp32 centroids from the head of `Buffers::mode_tables` and
+    // is only meaningful against a cache the writers encoded on the same codebook.
+    std::uint32_t decode_unpack = 0;
     // DIRTY-DATA (D1/N3): the number of physical pages the cache planes actually hold
     // (key_cache.size(0)). The device bound-checks every block-table page it reads against this,
     // so a corrupt/negative entry past the 64-entry prefetch cache cannot become an unchecked GM
@@ -194,7 +200,7 @@ void turboquant_mm_fused_decode_opt_impl(int32_t mode, AscendType type, void *st
                                          uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq,
                                          uint32_t numSplits, uint32_t headsPerTask, uint32_t tasksPerBlock,
                                          uint32_t reduceTasksPerBlock, uint32_t fusedContextLimit, float scale,
-                                         float invSqrtLen, uint32_t numBlocks);
+                                         float invSqrtLen, uint32_t numBlocks, uint32_t decodeUnpack = 0);
 void turboquant_mm_fused_decode_opt_raw_query_impl(
     int32_t mode, AscendType type, void *stream, uint32_t blockDim, void *query, void *piSigns, void *rotTables,
     void *h16, void *gate, void *queryRot, void *keyCache, void *valueCache, void *scaleCache, void *blockTables,
@@ -203,5 +209,5 @@ void turboquant_mm_fused_decode_opt_raw_query_impl(
     uint32_t numKvHeads, uint32_t headSize, uint32_t blockSize, uint32_t maxBlocksPerSeq, uint32_t numSplits,
     uint32_t headsPerTask, uint32_t tasksPerBlock, uint32_t reduceTasksPerBlock, uint32_t prologueVectorsPerBlock,
     uint32_t prologueCubeChunkVectors, uint32_t outputStage, uint32_t fusedContextLimit, float scale,
-    float invSqrtLen, uint32_t numBlocks);
+    float invSqrtLen, uint32_t numBlocks, uint32_t decodeUnpack = 0);
 } // namespace vllm_ascend

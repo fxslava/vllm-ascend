@@ -51,6 +51,32 @@ TURBOQUANT_NZ_FP32_PER_BLOCK: Final[int] = 8
 
 TURBOQUANT_HEADROOM_BITS: Final[int] = 2
 
+# The KV4_FP8 Lloyd-Max codebook (TurboQuantLloydMaxTraits in
+# csrc/attention/turboquant/op_kernel/common/turboquant_mode.h): Max's 16
+# levels of a unit Gaussian, each rounded to nearest fp8 e4m3, and the exact
+# midpoints between the rounded centroids. On this codebook a packed nibble n
+# is bin n + 8 and reconstructs as centroid * stored_scale, with the stored
+# scale the row's RMS (times inv_sqrt_len) instead of the absmax power of two
+# -- the thresholds move with the levels, so the writers and the decode agree
+# on the same nearest-neighbour partition.
+TURBOQUANT_LM_CENTROIDS: Final[tuple[float, ...]] = (
+    -2.75, -2.0, -1.625, -1.25, -0.9375, -0.6875, -0.375, -0.125,
+    +0.125, +0.375, +0.6875, +0.9375, +1.25, +1.625, +2.0, +2.75,
+)
+TURBOQUANT_LM_THRESHOLDS: Final[tuple[float, ...]] = (
+    -2.375, -1.8125, -1.4375, -1.09375, -0.8125, -0.53125, -0.25, 0.0,
+    +0.25, +0.53125, +0.8125, +1.09375, +1.4375, +1.8125, +2.375,
+)
+# Guards Sqrt's non-positive-input contract on a zero row, as in the writers.
+TURBOQUANT_LM_EPS: Final[float] = 1e-20
+
+# The codebook the writers quantise on and the fused decode reconstructs with
+# (VLLM_ASCEND_TURBOQUANT_QUANT_MODE): 0 the uniform grid, 1 Lloyd-Max. The
+# decode names the same choice as a DecodeUnpack value: 0 kNative, 3
+# kLloydMaxLut.
+TURBOQUANT_QUANT_MODE: Final[int] = int(envs.VLLM_ASCEND_TURBOQUANT_QUANT_MODE)
+TURBOQUANT_DECODE_UNPACK: Final[int] = 3 if TURBOQUANT_QUANT_MODE == 1 else 0
+
 _FP32_MANTISSA_BITS: Final[int] = 23
 _FP32_EXPONENT_MASK: Final[int] = 0xFF
 _FP32_EXPONENT_BIAS: Final[int] = 127
@@ -213,6 +239,76 @@ class TurboQuantEmulator:
 
     def dequantize(self, codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
         return codes.to(torch.float32) * scales.to(torch.float32).unsqueeze(-1)
+
+    @staticmethod
+    def _lloyd_max_sumsq(row: torch.Tensor, fold: str) -> torch.Tensor:
+        """One rotated row's sum of squares, in a writer's own fp32 fold order.
+
+        ``fold="key"`` is the prefill key plane's register butterfly (the four
+        64-lane quarters folded in sequence, then six XOR rounds at strides
+        1, 2, 4, 8, 16, 32 -- the scatter writer's tree); ``fold="value"`` the
+        prefill value plane (pairwise halves throughout); ``fold="butterfly"``
+        is an alias of the key tree. The trees round differently, and a cache
+        written by one and checked against another would flip an occasional bin
+        near a threshold.
+        """
+        acc = (row * row).to(torch.float32).clone()
+        n = acc.numel()
+
+        def halves(acc: torch.Tensor, stop: int) -> torch.Tensor:
+            width = acc.numel()
+            while width > stop:
+                width //= 2
+                acc = acc[:width] + acc[width : 2 * width]
+            return acc
+
+        if fold == "value":
+            acc = halves(acc, 1)
+        elif fold in ("key", "butterfly"):
+            quarters = [acc[q * 64 : (q + 1) * 64] for q in range(n // 64)]
+            acc = ((quarters[0] + quarters[1]) + quarters[2]) + quarters[3]
+            for stride in (1, 2, 4, 8, 16, 32):
+                prev = acc.clone()
+                idx = torch.arange(64) ^ stride
+                acc = prev + prev[idx]
+        else:
+            raise ValueError(f"unknown Lloyd-Max fold {fold!r}")
+        return acc[0]
+
+    def quantize_lloyd_max(
+        self, rotated: torch.Tensor, fold: str = "key"
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Dynamic per-row Lloyd-Max quantisation of a rotated panel.
+
+        ``rotated`` is ``[..., D]``; returns ``(codes, scales)`` with codes INT8
+        bin indices in ``[-8, 7]`` and one fp32 scale per row:
+        ``sigma_e = sqrt(sumsq + eps) * inv_sqrt_len`` (the row's RMS),
+        ``u = y * (-1 / sigma_e)``, and a bin counts the codebook thresholds
+        ``u`` exceeds -- the writers' own fp32 sequence, so the result is
+        bit-comparable against them when ``fold`` names the writer's tree.
+        """
+        y = rotated.to(torch.float32)
+        thresholds = torch.tensor(TURBOQUANT_LM_THRESHOLDS, dtype=torch.float32, device=y.device)
+        flat = y.reshape(-1, y.shape[-1])
+        codes = torch.empty_like(flat, dtype=torch.int8)
+        scales = torch.empty(flat.shape[0], dtype=torch.float32, device=y.device)
+        for r in range(flat.shape[0]):
+            row = flat[r]
+            sumsq = self._lloyd_max_sumsq(row, fold)
+            sigma_e = torch.sqrt(sumsq + TURBOQUANT_LM_EPS) * self.inv_sqrt_len
+            u = row * (-1.0 / sigma_e)
+            # The writers count one FP32 Adds per threshold and its sign bit:
+            # bin += (threshold + u) < 0, initialised at -8.
+            margins = thresholds.unsqueeze(0) + u.unsqueeze(-1)
+            bins = (margins < 0).sum(dim=-1).to(torch.int32) - 8
+            codes[r] = bins.to(torch.int8)
+            scales[r] = sigma_e * self.inv_sqrt_len
+        return codes.reshape(y.shape), scales
+
+    def dequantize_lloyd_max(self, codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+        """``centroid[codes + 8] * scales`` in fp32: the codebook reconstruction."""
+        centroids = torch.tensor(TURBOQUANT_LM_CENTROIDS, dtype=torch.float32, device=codes.device)
+        return centroids[(codes.to(torch.int16) + 8).long()] * scales.to(torch.float32).unsqueeze(-1)
 
     @staticmethod
     def pack(codes: torch.Tensor) -> torch.Tensor:
@@ -537,6 +633,8 @@ class TurboQuantOpsAdapter:
     def _golden_unpack_dequant(
         self, packed: torch.Tensor, scales: torch.Tensor, emulator: TurboQuantEmulator
     ) -> torch.Tensor:
+        if TURBOQUANT_QUANT_MODE == 1:
+            return emulator.dequantize_lloyd_max(emulator.unpack(packed), scales)
         return emulator.dequantize(emulator.unpack(packed), scales)
 
     def reshape_and_cache_prefill(
@@ -658,6 +756,7 @@ class TurboQuantOpsAdapter:
             pi_signs,
             tables,
             inv_sqrt_len,
+            TURBOQUANT_QUANT_MODE,
         )
 
     def _golden_reshape_and_cache_prefill(
@@ -670,7 +769,13 @@ class TurboQuantOpsAdapter:
         slot_mapping: torch.Tensor,
         emulator: TurboQuantEmulator,
     ) -> None:
-        self._write_slots(key, value, key_cache, value_cache, scale_cache, slot_mapping, emulator)
+        # The batch writer folds the key plane's sum of squares in its register
+        # butterfly and the value plane's in pairwise halves; the Lloyd-Max bins
+        # a row lands in are a function of that tree's fp32 rounding.
+        self._write_slots(
+            key, value, key_cache, value_cache, scale_cache, slot_mapping, emulator,
+            lloyd_max_folds=("key", "value"),
+        )
 
     def reshape_scatter_decode(
         self,
@@ -737,6 +842,7 @@ class TurboQuantOpsAdapter:
             slot_mapping,
             pi_signs,
             inv_sqrt_len,
+            TURBOQUANT_QUANT_MODE,
         )
 
     def _golden_reshape_scatter_decode(
@@ -749,7 +855,12 @@ class TurboQuantOpsAdapter:
         slot_mapping: torch.Tensor,
         emulator: TurboQuantEmulator,
     ) -> None:
-        self._write_slots(key, value, key_cache, value_cache, scale_cache, slot_mapping, emulator)
+        # The scatter writer folds both planes' sums of squares in its register
+        # butterfly, so both rows take the "key" tree.
+        self._write_slots(
+            key, value, key_cache, value_cache, scale_cache, slot_mapping, emulator,
+            lloyd_max_folds=("key", "key"),
+        )
 
     def _write_slots(
         self,
@@ -760,9 +871,14 @@ class TurboQuantOpsAdapter:
         scale_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
         emulator: TurboQuantEmulator,
+        lloyd_max_folds: tuple[str, str] = ("key", "value"),
     ) -> None:
-        codes_key, key_scales = emulator.quantize(self.rotate(key, emulator))
-        codes_value, value_scales = emulator.quantize(self.rotate(value, emulator))
+        if TURBOQUANT_QUANT_MODE == 1:
+            codes_key, key_scales = emulator.quantize_lloyd_max(self.rotate(key, emulator), lloyd_max_folds[0])
+            codes_value, value_scales = emulator.quantize_lloyd_max(self.rotate(value, emulator), lloyd_max_folds[1])
+        else:
+            codes_key, key_scales = emulator.quantize(self.rotate(key, emulator))
+            codes_value, value_scales = emulator.quantize(self.rotate(value, emulator))
 
         block_size = key_cache.shape[1]
         slots = slot_mapping.to(torch.int64)
@@ -1248,6 +1364,7 @@ class TurboQuantOpsAdapter:
             output_stage,
             scale,
             inv_sqrt_len,
+            TURBOQUANT_DECODE_UNPACK,
         )
         return output
 
