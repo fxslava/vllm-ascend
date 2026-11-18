@@ -29,6 +29,7 @@ import types
 import pytest
 import torch
 
+from tests.helpers.turboquant import make_activations, make_adapter, make_cache
 from vllm_ascend.attention.turboquant_nz_ingress import (
     turboquant_codes_to_nz_tiled,
     turboquant_nz_packed_byte,
@@ -38,8 +39,6 @@ from vllm_ascend.attention.turboquant_nz_ingress import (
 from vllm_ascend.attention.turboquant_v1 import (
     TurboQuantEmulator,
     TurboQuantKernelStage,
-    TurboQuantOpsAdapter,
-    TurboQuantOpsConfig,
     TurboQuantValueLayout,
 )
 
@@ -52,13 +51,8 @@ NAMESPACE = "turboquant_ops"
 CPU = torch.device("cpu")
 
 
-def _adapter(
-    *stages: TurboQuantKernelStage,
-    value_layout: TurboQuantValueLayout = TurboQuantValueLayout.NZ_TILED,
-) -> TurboQuantOpsAdapter:
-    return TurboQuantOpsAdapter(
-        TurboQuantOpsConfig(ops_namespace=NAMESPACE, kernel_stages=frozenset(stages), value_layout=value_layout)
-    )
+def _adapter(*stages, value_layout=TurboQuantValueLayout.NZ_TILED):
+    return make_adapter(*stages, value_layout=value_layout)
 
 
 @pytest.fixture
@@ -67,21 +61,11 @@ def emulator() -> TurboQuantEmulator:
 
 
 def _caches() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    packed = (NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, PACKED)
-    return (
-        torch.zeros(packed, dtype=torch.int8),
-        torch.zeros(packed, dtype=torch.int8),
-        torch.zeros((2, NUM_BLOCKS, NUM_KV_HEADS, BLOCK_SIZE), dtype=torch.float32),
-    )
+    return make_cache(NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
 
 
 def _activations(num_tokens: int, seed: int = 20261113) -> tuple[torch.Tensor, torch.Tensor]:
-    generator = torch.Generator().manual_seed(seed)
-    shape = (num_tokens, NUM_KV_HEADS, HEAD_SIZE)
-    return (
-        torch.randn(shape, generator=generator, dtype=torch.float32),
-        torch.randn(shape, generator=generator, dtype=torch.float32),
-    )
+    return make_activations(num_tokens, NUM_KV_HEADS, HEAD_SIZE, seed=seed)
 
 
 @pytest.fixture

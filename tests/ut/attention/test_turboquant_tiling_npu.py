@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.helpers.turboquant import make_metadata_builder
+
 torch_npu = pytest.importorskip("torch_npu")
 
 
@@ -55,18 +57,7 @@ def test_invalid_lengths_do_not_modify_device_tiling(tiling_op):
 
 
 def test_context_upload_ring_preserves_queued_steps(tiling_op):
-    from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_STAGING_SLOTS, AscendTurboQuantMetadataBuilder
-
-    builder = object.__new__(AscendTurboQuantMetadataBuilder)
-    builder._max_num_reqs = 4
-    builder._staging_slots = TURBOQUANT_STAGING_SLOTS
-    builder._staging_step = 0
-    builder._staging_pinned = True
-    builder._context_lens = torch.zeros(4, dtype=torch.int32, device="npu")
-    builder._context_lens_host_ring = [
-        torch.empty(4, dtype=torch.int32, pin_memory=True) for _ in range(TURBOQUANT_STAGING_SLOTS)
-    ]
-    builder._context_lens_upload_events = [None] * TURBOQUANT_STAGING_SLOTS
+    builder = make_metadata_builder(4, 24, 4, 256, 128, 64, device="npu")
     expected = []
     snapshots = []
     for step in range(64):

@@ -24,18 +24,14 @@ So three things have to hold, and all three are checked here without a device:
   called and the golden model writes and reads its own layout.
 """
 
-import types
-from typing import Any
-
 import pytest
 import torch
 
+from tests.helpers.turboquant import OpRecorder, make_activations, make_adapter, make_cache, register_ops
 from vllm_ascend.attention.turboquant_layout import (
     TURBOQUANT_KEY_PLANE,
     TURBOQUANT_PACK_FACTOR,
     TURBOQUANT_VALUE_PLANE,
-    turboquant_packed_bytes,
-    turboquant_scale_cache_shape,
 )
 from vllm_ascend.attention.turboquant_v1 import (
     TURBOQUANT_NAMESPACE_ENV,
@@ -65,41 +61,10 @@ INGESTION_OPS = (TURBOQUANT_OP_RESHAPE_AND_CACHE, TURBOQUANT_OP_RESHAPE_SCATTER)
 ALL_OPS = (*INGESTION_OPS, TURBOQUANT_OP_FUSED_DECODE)
 
 
-class _Recorder:
-    """A registered entry point that records its call and writes nothing."""
-
-    def __init__(self) -> None:
-        self.calls = 0
-
-    def __call__(self, *args: Any, **kwargs: Any) -> None:
-        self.calls += 1
-        return None
-
-
-class _OpNamespace:
-    def __init__(self, entries: dict[str, _Recorder]) -> None:
-        self._entries = entries
-
-    def __getattr__(self, name: str) -> _Recorder:
-        try:
-            return self._entries[name]
-        except KeyError:
-            raise AttributeError(name) from None
-
-
-def _register(monkeypatch: pytest.MonkeyPatch, *op_names: str) -> dict[str, _Recorder]:
-    entries = {name: _Recorder() for name in op_names}
-    monkeypatch.setattr(torch, "ops", types.SimpleNamespace(**{NAMESPACE: _OpNamespace(entries)}))
+def _register(monkeypatch: pytest.MonkeyPatch, *op_names: str) -> dict[str, OpRecorder]:
+    entries = {name: OpRecorder() for name in op_names}
+    register_ops(monkeypatch, **entries)
     return entries
-
-
-def _adapter(
-    *stages: TurboQuantKernelStage,
-    value_layout: TurboQuantValueLayout = TurboQuantValueLayout.TOKEN_MAJOR,
-) -> TurboQuantOpsAdapter:
-    return TurboQuantOpsAdapter(
-        TurboQuantOpsConfig(ops_namespace=NAMESPACE, kernel_stages=frozenset(stages), value_layout=value_layout)
-    )
 
 
 @pytest.fixture
@@ -108,21 +73,11 @@ def emulator() -> TurboQuantEmulator:
 
 
 def _caches() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    packed = (NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, turboquant_packed_bytes(HEAD_SIZE))
-    return (
-        torch.zeros(packed, dtype=torch.int8),
-        torch.zeros(packed, dtype=torch.int8),
-        torch.zeros(turboquant_scale_cache_shape(NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS), dtype=torch.float32),
-    )
+    return make_cache(NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
 
 
 def _activations(num_tokens: int, seed: int = 20261107) -> tuple[torch.Tensor, torch.Tensor]:
-    generator = torch.Generator().manual_seed(seed)
-    shape = (num_tokens, NUM_KV_HEADS, HEAD_SIZE)
-    return (
-        torch.randn(shape, generator=generator, dtype=torch.float32),
-        torch.randn(shape, generator=generator, dtype=torch.float32),
-    )
+    return make_activations(num_tokens, NUM_KV_HEADS, HEAD_SIZE, seed=seed)
 
 
 # ---------------------------------------------------------------------------
@@ -192,9 +147,10 @@ def _write_strip_cache(
 
 def test_reference_writers_keep_the_configured_layout(monkeypatch: pytest.MonkeyPatch) -> None:
     _register(monkeypatch, *ALL_OPS)
-    assert _adapter().value_layout() is TurboQuantValueLayout.TOKEN_MAJOR
+    assert make_adapter().value_layout() is TurboQuantValueLayout.TOKEN_MAJOR
     assert (
-        _adapter(value_layout=TurboQuantValueLayout.CHANNEL_MAJOR).value_layout() is TurboQuantValueLayout.CHANNEL_MAJOR
+        make_adapter(value_layout=TurboQuantValueLayout.CHANNEL_MAJOR).value_layout()
+        is TurboQuantValueLayout.CHANNEL_MAJOR
     )
 
 
@@ -215,7 +171,7 @@ def test_an_engaged_writer_owns_the_cache_layout(
     for caches written before the ingress existed.
     """
     _register(monkeypatch, op_name)
-    assert _adapter(stage).value_layout() is expected
+    assert make_adapter(stage).value_layout() is expected
 
 
 def test_the_nz_layout_survives_both_writers_staged(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -226,14 +182,14 @@ def test_the_nz_layout_survives_both_writers_staged(monkeypatch: pytest.MonkeyPa
     reports NZ_TILED and neither stage pulls it anywhere else.
     """
     _register(monkeypatch, TURBOQUANT_OP_RESHAPE_AND_CACHE, TURBOQUANT_OP_RESHAPE_SCATTER)
-    adapter = _adapter(TurboQuantKernelStage.RESHAPE_AND_CACHE, TurboQuantKernelStage.SCATTER)
+    adapter = make_adapter(TurboQuantKernelStage.RESHAPE_AND_CACHE, TurboQuantKernelStage.SCATTER)
     assert adapter.value_layout() is TurboQuantValueLayout.NZ_TILED
 
 
 def test_the_decode_stage_alone_does_not_change_the_layout(monkeypatch: pytest.MonkeyPatch) -> None:
     """The fused decode reads; it never writes a page, so it owns no layout."""
     _register(monkeypatch, TURBOQUANT_OP_FUSED_DECODE)
-    assert _adapter(TurboQuantKernelStage.DECODE).value_layout() is TurboQuantValueLayout.TOKEN_MAJOR
+    assert make_adapter(TurboQuantKernelStage.DECODE).value_layout() is TurboQuantValueLayout.TOKEN_MAJOR
 
 
 def test_an_unregistered_writer_leaves_the_reference_layout(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -243,7 +199,7 @@ def test_an_unregistered_writer_leaves_the_reference_layout(monkeypatch: pytest.
     would have the golden reader de-interleave a cache the golden writer wrote.
     """
     _register(monkeypatch)
-    adapter = _adapter(*TurboQuantKernelStage)
+    adapter = make_adapter(*TurboQuantKernelStage)
     assert adapter.value_layout() is TurboQuantValueLayout.TOKEN_MAJOR
 
 
@@ -260,7 +216,7 @@ def test_the_reference_writer_now_does_the_channel_major_rmw(emulator: TurboQuan
     test_turboquant_strip_cache.py pins it against the kernels' nibble formula;
     this only checks that the refusal is gone and that one token lands.
     """
-    adapter = _adapter(value_layout=TurboQuantValueLayout.CHANNEL_MAJOR)
+    adapter = make_adapter(value_layout=TurboQuantValueLayout.CHANNEL_MAJOR)
     key, value = _activations(1)
     caches = _caches()
     adapter.reshape_scatter_decode(key, value, *caches, torch.zeros(1, dtype=torch.int32), emulator)
@@ -299,12 +255,12 @@ def test_an_engaged_writer_never_reaches_the_refusal(
     the kernel it is about to call.
     """
     entries = _register(monkeypatch, op_name)
-    adapter = _adapter(stage)
+    adapter = make_adapter(stage)
     assert adapter.value_layout() is expected
 
     key, value = _activations(BLOCK_SIZE)
     getattr(adapter, entry)(key, value, *_caches(), torch.arange(BLOCK_SIZE, dtype=torch.int32), emulator)
-    assert entries[op_name].calls == 1
+    assert len(entries[op_name].calls) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -329,15 +285,15 @@ def test_the_reference_gather_reads_a_strip_cache_back(
     block_tables = torch.tensor([[0, 1]], dtype=torch.int32)
 
     golden_caches = _caches()
-    _adapter().reshape_and_cache_prefill(key, value, *golden_caches, slot_mapping, emulator)
-    expected = _adapter().gather(*golden_caches, block_tables)
+    make_adapter().reshape_and_cache_prefill(key, value, *golden_caches, slot_mapping, emulator)
+    expected = make_adapter().gather(*golden_caches, block_tables)
 
     strip_caches = _caches()
     _write_strip_cache(key, value, *strip_caches, slot_mapping, emulator)
     entries = _register(monkeypatch, TURBOQUANT_OP_RESHAPE_SCATTER)
     # No stage: both NPU writers are NZ now, so staging one would report
     # NZ_TILED. The strip layout is the config's to pin.
-    reader = _adapter(value_layout=TurboQuantValueLayout.CHANNEL_MAJOR)
+    reader = make_adapter(value_layout=TurboQuantValueLayout.CHANNEL_MAJOR)
     assert reader.value_layout() is TurboQuantValueLayout.CHANNEL_MAJOR
     actual = reader.gather(*strip_caches, block_tables)
 
@@ -346,7 +302,7 @@ def test_the_reference_gather_reads_a_strip_cache_back(
         assert got.shape == want.shape, name
         assert torch.equal(got, want), name
     # The gather is a read: it must not have launched the writer.
-    assert entries[TURBOQUANT_OP_RESHAPE_SCATTER].calls == 0
+    assert not entries[TURBOQUANT_OP_RESHAPE_SCATTER].calls
 
 
 def test_the_strip_reader_round_trips_to_the_activations(
@@ -358,7 +314,7 @@ def test_the_strip_reader_round_trips_to_the_activations(
     _write_strip_cache(key, value, *strip_caches, torch.arange(BLOCK_SIZE, dtype=torch.int32), emulator)
 
     _register(monkeypatch, TURBOQUANT_OP_RESHAPE_SCATTER)
-    reader = _adapter(value_layout=TurboQuantValueLayout.CHANNEL_MAJOR)
+    reader = make_adapter(value_layout=TurboQuantValueLayout.CHANNEL_MAJOR)
     packed_key, key_scales, packed_value, value_scales = reader.gather(
         *strip_caches, torch.zeros(1, 1, dtype=torch.int32)
     )
@@ -383,7 +339,7 @@ def test_the_strip_reader_is_not_the_identity(monkeypatch: pytest.MonkeyPatch, e
     slot_mapping = torch.arange(BLOCK_SIZE, dtype=torch.int32)
 
     golden_caches = _caches()
-    _adapter().reshape_and_cache_prefill(key, value, *golden_caches, slot_mapping, emulator)
+    make_adapter().reshape_and_cache_prefill(key, value, *golden_caches, slot_mapping, emulator)
     strip_caches = _caches()
     _write_strip_cache(key, value, *strip_caches, slot_mapping, emulator)
 
@@ -466,5 +422,5 @@ def test_stages_none_runs_the_whole_path_golden(monkeypatch: pytest.MonkeyPatch,
 
     assert fused is None, "the decode must fall through to the golden attention"
     assert adapter.value_layout() is TurboQuantValueLayout.TOKEN_MAJOR
-    assert all(entry.calls == 0 for entry in entries.values()), "no op may launch with stages=none"
+    assert all(not entry.calls for entry in entries.values()), "no op may launch with stages=none"
     assert torch.equal(dense[0], emulator.decode(*emulator.encode(key)))

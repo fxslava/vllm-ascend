@@ -1,38 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The TurboQuant decode's ACL-graph capture contract, checked without a device.
+"""Device-free checks for TurboQuant decode capture safety.
 
-Four gates live here, named after the RFC
-(``TURBOQUANT_GRAPH_CAPTURE_RFC.md`` §6):
-
-* **G10** -- under a capture, the Python half of the decode launch path issues no
-  host synchronisation and allocates nothing. This is the gate the whole change
-  set exists to turn green, and it is written as an *allowlist* of the torch
-  functions the clean path is permitted to call: anything else fails the test by
-  name, so a regression says which operation reappeared rather than that a
-  counter moved.
-* **G5** -- the op is handed a *device* ``context_lens``, not the CPU mirror
-  ``AscendMetadata.seq_lens`` points at.
-* **G4** -- no ``int``/``float`` argument of ``npu_turboquant_fused_decode``
-  depends on the attention metadata. Those arguments are baked into a captured
-  launch, so one that varied per step would replay a stale value.
-* **G6** -- the tiling buffer's Python-side upper bound covers every
-  ``(tokens, splits, grid)`` the op can derive.
-* **C1-C5** -- the capture contract for the *static buffer* itself, which is
-  the half G10 cannot see: that the extent the host filled is the extent the
-  launch reads, that every buffer keeps one address across steps, that the
-  fill never migrates into the launch, that a step this builder cannot tile is
-  refused instead of mis-tiled, and that the host staging is safe to overwrite
-  on the next step.
-
-**What G10 does not cover.** Everything the C++ binding does between the op call
-and the launch is invisible from here. That half of the launcher is covered by
-the schema instead: ``tiling``, ``workspace`` and ``query_rot`` are *inputs* of
-the op (see ``test_turboquant_op_schemas.py``), so the binding cannot allocate
-them, and the remaining host builds -- the basis codec pool, ``mode_tables`` and
-the vector-core count -- are function-local statics keyed by
-``(head_size, device_index)``. There is no device-free way to assert a static
-local from Python; the evidence for those is the schema plus the source.
+Cover stable pointers, padded extents, host staging, kernel eligibility, and
+launches without host reads or allocations. Hardware capture/replay is tested
+in tests/e2e/pull_request/one_card/aclgraph/test_turboquant_aclgraph.py.
 """
 
 from __future__ import annotations
@@ -44,7 +16,14 @@ import pytest
 import torch
 from torch.overrides import TorchFunctionMode
 
-from vllm_ascend.attention.turboquant_layout import turboquant_packed_bytes, turboquant_scale_cache_shape
+from tests.helpers.turboquant import (
+    OpRecorder,
+    make_adapter,
+    make_cache,
+    make_decode_buffers,
+    make_metadata_builder,
+    register_ops,
+)
 from vllm_ascend.attention.turboquant_v1 import (
     TURBOQUANT_DECODE_SPLITS,
     TURBOQUANT_DECODE_UNPACK,
@@ -54,7 +33,6 @@ from vllm_ascend.attention.turboquant_v1 import (
     TurboQuantEmulator,
     TurboQuantKernelStage,
     TurboQuantOpsAdapter,
-    TurboQuantOpsConfig,
     TurboQuantValueLayout,
     turboquant_decode_tiling_words,
     turboquant_tiling_upper_bound_words,
@@ -75,38 +53,6 @@ MAX_BLOCKS = 2
 # ---------------------------------------------------------------------------
 # Test doubles
 # ---------------------------------------------------------------------------
-
-
-class _Recorder:
-    """A registered entry point that records its call and returns ``result``."""
-
-    def __init__(self, result: Any = None) -> None:
-        self.result = result
-        self.calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
-
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        self.calls.append((args, kwargs))
-        return self.result
-
-    @property
-    def args(self) -> tuple[Any, ...]:
-        assert len(self.calls) == 1, f"expected exactly one call, got {len(self.calls)}"
-        return self.calls[0][0]
-
-
-class _OpNamespace:
-    def __init__(self, entries: dict[str, _Recorder]) -> None:
-        self._entries = entries
-
-    def __getattr__(self, name: str) -> _Recorder:
-        try:
-            return self._entries[name]
-        except KeyError:
-            raise AttributeError(name) from None
-
-
-def _register(monkeypatch: pytest.MonkeyPatch, **entries: _Recorder) -> None:
-    monkeypatch.setattr(torch, "ops", types.SimpleNamespace(**{NAMESPACE: _OpNamespace(dict(entries))}))
 
 
 # ---------------------------------------------------------------------------
@@ -175,27 +121,8 @@ class _LaunchWatcher(TorchFunctionMode):
 # ---------------------------------------------------------------------------
 
 
-def _caches() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    packed = (NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, turboquant_packed_bytes(HEAD_SIZE))
-    return (
-        torch.zeros(packed, dtype=torch.int8),
-        torch.zeros(packed, dtype=torch.int8),
-        torch.zeros(turboquant_scale_cache_shape(NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS), dtype=torch.float32),
-    )
-
-
 def _tier1(tokens: int) -> dict[str, torch.Tensor]:
-    """The three buffers the metadata builder now owns, at this geometry."""
-    from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_PARTIAL_TAIL
-
-    return {
-        "turboquant_tiling": torch.zeros(turboquant_tiling_upper_bound_words(tokens, 1), dtype=torch.int32),
-        "turboquant_workspace": torch.zeros(
-            tokens * NUM_HEADS * TURBOQUANT_DECODE_SPLITS * (HEAD_SIZE + TURBOQUANT_PARTIAL_TAIL),
-            dtype=torch.float32,
-        ),
-        "turboquant_query_rot": torch.zeros(tokens * NUM_HEADS * HEAD_SIZE, dtype=torch.float32),
-    }
+    return {f"turboquant_{name}": tensor for name, tensor in make_decode_buffers(tokens, NUM_HEADS, HEAD_SIZE).items()}
 
 
 def _metadata(tokens: int = BATCH) -> Any:
@@ -222,22 +149,11 @@ def _metadata(tokens: int = BATCH) -> Any:
     return types.SimpleNamespace(**fields)
 
 
-def _decode_scale_cache() -> torch.Tensor:
-    """A scale plane with one slot-major record per cache slot.
-
-    The fused decode reads ``NzScaleSlotFloats(H)`` floats per slot, which at
-    this fixture's H = 2 is twice the canonical ``2 * H`` token-major plane. The
-    launch-path geometry check needs a plane sized for the decode; only the byte
-    count matters here, because the op is a recorder.
-    """
-    slot_floats = TurboQuantOpsAdapter._nz_scale_slot_floats(NUM_KV_HEADS)
-    return torch.zeros(NUM_BLOCKS * BLOCK_SIZE * slot_floats, dtype=torch.float32)
-
-
 def _impl(adapter: TurboQuantOpsAdapter, emulator: TurboQuantEmulator, layer: Any) -> Any:
     impl = object.__new__(AscendTurboQuantBackendImpl)
-    impl.key_cache, impl.value_cache, _ = _caches()
-    impl.scale_cache = _decode_scale_cache()
+    impl.key_cache, impl.value_cache, impl.scale_cache = make_cache(
+        NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE, decode=True
+    )
     impl.emulator = emulator
     impl.adapter = adapter
     impl.num_heads = NUM_HEADS
@@ -269,15 +185,9 @@ def emulator() -> TurboQuantEmulator:
 @pytest.fixture
 def decode(monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator) -> dict[str, Any]:
     """A decode launch with the fused op registered, ready to run under capture."""
-    entry = _Recorder(result=None)
-    _register(monkeypatch, npu_turboquant_fused_decode=entry)
-    adapter = TurboQuantOpsAdapter(
-        TurboQuantOpsConfig(
-            ops_namespace=NAMESPACE,
-            kernel_stages=frozenset({TurboQuantKernelStage.DECODE}),
-            value_layout=TurboQuantValueLayout.CHANNEL_MAJOR,
-        )
-    )
+    entry = OpRecorder(result=None)
+    register_ops(monkeypatch, npu_turboquant_fused_decode=entry)
+    adapter = make_adapter(TurboQuantKernelStage.DECODE, value_layout=TurboQuantValueLayout.CHANNEL_MAJOR)
     layer = _layer(emulator)
     impl = _impl(adapter, emulator, layer)
     metadata = _metadata()
@@ -526,8 +436,8 @@ def test_hybrid_tiling_uses_kernel_pages_instead_of_allocator_pages(
         parallel_config=types.SimpleNamespace(),
     )
     builder = AscendTurboQuantMetadataBuilder(spec, ["attention"], config, CPU)
-    entry = _Recorder()
-    _register(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: entry})
+    entry = OpRecorder()
+    register_ops(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: entry})
 
     # Allocator pages 2 and 5 expand into 128-token kernel pages. At allocator
     # size 1024, a descriptor using the allocator stride reads table[1] at
@@ -555,45 +465,7 @@ def test_hybrid_tiling_uses_kernel_pages_instead_of_allocator_pages(
 
 
 def _builder() -> Any:
-    """The TurboQuant builder over only the state its two per-step methods read.
-
-    ``object.__new__`` because the real ``__init__`` runs the shared builder's,
-    which needs a ``VllmConfig``; everything below the allocation is what is
-    under test.
-    """
-    from vllm_ascend.attention.turboquant_v1 import (
-        AscendTurboQuantMetadataBuilder,
-        turboquant_decode_query_rot_floats,
-        turboquant_decode_workspace_floats,
-    )
-
-    builder = object.__new__(AscendTurboQuantMetadataBuilder)
-    builder._max_num_reqs = MAX_NUM_REQS
-    builder._num_kv_heads = NUM_KV_HEADS
-    builder._head_size = HEAD_SIZE
-    builder._block_size = BLOCK_SIZE
-    builder._num_heads = NUM_HEADS
-    builder._num_splits = TURBOQUANT_DECODE_SPLITS
-    builder._heads_per_task = NUM_HEADS // NUM_KV_HEADS
-    builder.max_num_blocks_per_req = MAX_BLOCKS
-    builder._context_lens = torch.zeros(MAX_NUM_REQS, dtype=torch.int32)
-    # The production depth, not a literal: the ring gate below has to go red
-    # when the real builder drops to a single slot.
-    builder._staging_slots = TURBOQUANT_STAGING_SLOTS
-    builder._staging_step = 0
-    builder._staging_pinned = False
-    builder._context_lens_host_ring = [
-        torch.zeros(MAX_NUM_REQS, dtype=torch.int32) for _ in range(builder._staging_slots)
-    ]
-    builder._tiling = torch.zeros(turboquant_tiling_upper_bound_words(MAX_NUM_REQS, 8), dtype=torch.int32)
-    builder._workspace = torch.zeros(
-        turboquant_decode_workspace_floats(MAX_NUM_REQS, NUM_HEADS, HEAD_SIZE, TURBOQUANT_DECODE_SPLITS),
-        dtype=torch.float32,
-    )
-    builder._query_rot = torch.zeros(
-        turboquant_decode_query_rot_floats(MAX_NUM_REQS, NUM_HEADS, HEAD_SIZE), dtype=torch.float32
-    )
-    return builder
+    return make_metadata_builder(MAX_NUM_REQS, NUM_HEADS, NUM_KV_HEADS, HEAD_SIZE, BLOCK_SIZE, MAX_BLOCKS)
 
 
 def test_the_padded_rows_get_a_zero_context_not_a_one() -> None:
@@ -647,8 +519,8 @@ def test_the_tiling_fill_is_one_call_for_every_layer(monkeypatch: pytest.MonkeyP
     """
     from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_OP_BUILD_DECODE_TILING
 
-    entry = _Recorder()
-    _register(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: entry})
+    entry = OpRecorder()
+    register_ops(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: entry})
     builder = _builder()
     host = builder._context_lens_host_ring[0]
     builder._refresh_tiling(host, 4)
@@ -691,8 +563,8 @@ def test_a_non_power_of_two_block_size_is_refused_before_the_fill(monkeypatch: p
     """
     from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_OP_BUILD_DECODE_TILING
 
-    entry = _Recorder()
-    _register(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: entry})
+    entry = OpRecorder()
+    register_ops(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: entry})
     builder = _builder()
     builder._block_size = 896
     with pytest.raises(RuntimeError, match="power-of-two multiple of 64"):
@@ -724,6 +596,7 @@ def test_the_builder_publishes_every_field_the_launch_reads() -> None:
         "turboquant_workspace",
         "turboquant_query_rot",
         "turboquant_num_tokens",
+        "turboquant_slot_mapping",
     }
     assert extra["turboquant_num_tokens"] == 2, "the extent the descriptors were filled for"
     # All of the new work is in the subclass, reached only through the hook, so
@@ -774,15 +647,9 @@ def test_c1_the_launch_extent_is_the_one_the_host_filled(
     fires. Here the two quantities are deliberately pulled apart: the builder
     published 2 and a stale list says 5.
     """
-    entry = _Recorder(result=None)
-    _register(monkeypatch, npu_turboquant_fused_decode=entry)
-    adapter = TurboQuantOpsAdapter(
-        TurboQuantOpsConfig(
-            ops_namespace=NAMESPACE,
-            kernel_stages=frozenset({TurboQuantKernelStage.DECODE}),
-            value_layout=TurboQuantValueLayout.CHANNEL_MAJOR,
-        )
-    )
+    entry = OpRecorder(result=None)
+    register_ops(monkeypatch, npu_turboquant_fused_decode=entry)
+    adapter = make_adapter(TurboQuantKernelStage.DECODE, value_layout=TurboQuantValueLayout.CHANNEL_MAJOR)
     impl = _impl(adapter, emulator, _layer(emulator))
     metadata = _metadata(5)
     metadata.turboquant_num_tokens = 2
@@ -807,15 +674,9 @@ def test_c1_the_extent_falls_back_only_when_it_was_not_published(
     monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
 ) -> None:
     """A metadata object from the base builder still launches, over the list."""
-    entry = _Recorder(result=None)
-    _register(monkeypatch, npu_turboquant_fused_decode=entry)
-    adapter = TurboQuantOpsAdapter(
-        TurboQuantOpsConfig(
-            ops_namespace=NAMESPACE,
-            kernel_stages=frozenset({TurboQuantKernelStage.DECODE}),
-            value_layout=TurboQuantValueLayout.CHANNEL_MAJOR,
-        )
-    )
+    entry = OpRecorder(result=None)
+    register_ops(monkeypatch, npu_turboquant_fused_decode=entry)
+    adapter = make_adapter(TurboQuantKernelStage.DECODE, value_layout=TurboQuantValueLayout.CHANNEL_MAJOR)
     impl = _impl(adapter, emulator, _layer(emulator))
     metadata = _metadata(BATCH)
     del metadata.turboquant_num_tokens
@@ -839,7 +700,7 @@ def test_c2_every_builder_owned_buffer_keeps_one_address(monkeypatch: pytest.Mon
     """
     from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_OP_BUILD_DECODE_TILING
 
-    _register(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: _Recorder()})
+    register_ops(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: OpRecorder()})
     builder = _builder()
     base = {
         "turboquant_context_lens": builder._context_lens.data_ptr(),
@@ -885,8 +746,8 @@ def test_c3_the_launch_path_never_fills_the_tiling_buffer(
         TURBOQUANT_OP_FUSED_DECODE,
     )
 
-    builder_entry = _Recorder()
-    _register(
+    builder_entry = OpRecorder()
+    register_ops(
         monkeypatch,
         **{
             TURBOQUANT_OP_FUSED_DECODE: decode["entry"],
@@ -933,7 +794,7 @@ def test_c4_an_ordinary_decode_step_is_not_refused(per_req: Any, monkeypatch: py
     """One token per request, however the field is spelled."""
     from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_OP_BUILD_DECODE_TILING
 
-    _register(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: _Recorder()})
+    register_ops(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: OpRecorder()})
     common = types.SimpleNamespace(num_reqs=2)
     if per_req is not None:
         common.decode_token_per_req = per_req
@@ -1341,7 +1202,7 @@ def _arg_shape(value: Any) -> Any:
     return (type(value).__name__, value)
 
 
-def _launch_profile(entry: _Recorder) -> dict[str, Any]:
+def _launch_profile(entry: OpRecorder) -> dict[str, Any]:
     args = entry.calls[-1][0]
     assert len(args) == len(_ARG), f"the op was called with {len(args)} arguments, not {len(_ARG)}"
     return {name: _arg_shape(args[index]) for name, index in _ARG.items()}
@@ -1408,18 +1269,12 @@ def test_g11a_a_replay_sees_one_address_one_shape_and_one_scalar_set(
         TURBOQUANT_OP_FUSED_DECODE,
     )
 
-    entry = _Recorder(result=None)
-    _register(
+    entry = OpRecorder(result=None)
+    register_ops(
         monkeypatch,
-        **{TURBOQUANT_OP_FUSED_DECODE: entry, TURBOQUANT_OP_BUILD_DECODE_TILING: _Recorder()},
+        **{TURBOQUANT_OP_FUSED_DECODE: entry, TURBOQUANT_OP_BUILD_DECODE_TILING: OpRecorder()},
     )
-    adapter = TurboQuantOpsAdapter(
-        TurboQuantOpsConfig(
-            ops_namespace=NAMESPACE,
-            kernel_stages=frozenset({TurboQuantKernelStage.DECODE}),
-            value_layout=TurboQuantValueLayout.CHANNEL_MAJOR,
-        )
-    )
+    adapter = make_adapter(TurboQuantKernelStage.DECODE, value_layout=TurboQuantValueLayout.CHANNEL_MAJOR)
     impl = _impl(adapter, emulator, _layer(emulator))
     builder = _builder()
     width = 4
@@ -1466,7 +1321,7 @@ def test_g11a_the_per_step_state_lives_only_in_buffer_contents(
     """
     from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_OP_BUILD_DECODE_TILING
 
-    _register(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: _Recorder()})
+    register_ops(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: OpRecorder()})
     builder = _builder()
     first = _built_metadata(builder, 2, [64, 128]).turboquant_context_lens
     before = first.clone()
@@ -1665,8 +1520,8 @@ def test_g8_the_tiling_buffer_is_filled_by_the_operator_alone(monkeypatch: pytes
     """
     from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_OP_BUILD_DECODE_TILING
 
-    entry = _Recorder()
-    _register(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: entry})
+    entry = OpRecorder()
+    register_ops(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: entry})
     builder = _builder()
     tiling = builder._tiling
     # Dirtied first, and with a value the buffer never holds naturally. A fresh
@@ -1760,3 +1615,159 @@ def test_c5_the_staging_ring_has_a_device_slot_per_host_slot() -> None:
     assert all(slot.shape == builder._context_lens.shape for slot in builder._context_lens_host_ring), (
         "every staging slot must cover the whole device buffer"
     )
+
+
+@pytest.mark.parametrize("stages", ["none", "decode", "scatter", "decode,scatter", "all"])
+@pytest.mark.parametrize("missing", [None, "scatter", "decode", "tiling"])
+def test_full_decode_capture_requires_enabled_and_registered_kernels(monkeypatch, stages, missing):
+    from vllm.v1.attention.backend import AttentionCGSupport
+
+    from vllm_ascend.attention import turboquant_v1 as tq
+
+    operators = {
+        "scatter": tq.TURBOQUANT_OP_RESHAPE_SCATTER,
+        "decode": tq.TURBOQUANT_OP_FUSED_DECODE,
+        "tiling": tq.TURBOQUANT_OP_BUILD_DECODE_TILING,
+    }
+    monkeypatch.setenv(tq.TURBOQUANT_STAGES_ENV, stages)
+    monkeypatch.setenv(tq.TURBOQUANT_NAMESPACE_ENV, "capture_test_ops")
+    monkeypatch.setattr(tq, "load_turboquant_extension", lambda: True)
+    checked = []
+
+    def registered(namespace, name):
+        checked.append(namespace)
+        return name != operators.get(missing)
+
+    monkeypatch.setattr(tq, "_is_op_registered", registered)
+    supported = stages in ("decode,scatter", "all") and missing is None
+    assert tq.turboquant_decode_graph_supported() is supported
+    expected = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE if supported else AttentionCGSupport.NEVER
+    assert tq.AscendTurboQuantBackend.get_builder_cls().get_cudagraph_support(None, None) == expected
+    assert all(namespace == "capture_test_ops" for namespace in checked)
+
+
+def test_tiling_uses_the_selected_operator_namespace(monkeypatch):
+    from vllm_ascend.attention import turboquant_v1 as tq
+
+    builder = _builder()
+    builder._ops_namespace = "capture_test_ops"
+    tiling = OpRecorder()
+    monkeypatch.setattr(
+        torch,
+        "ops",
+        types.SimpleNamespace(capture_test_ops=types.SimpleNamespace(**{tq.TURBOQUANT_OP_BUILD_DECODE_TILING: tiling})),
+    )
+    builder._refresh_tiling(torch.tensor([64, 128], dtype=torch.int32), BATCH)
+    assert tiling.args[1] is builder._tiling
+
+
+@pytest.mark.parametrize("slots,live", [(BATCH - 1, BATCH), (BATCH, BATCH + 1), (BATCH, -1)])
+def test_decode_metadata_rejects_incomplete_slot_extents(slots, live):
+    from vllm_ascend.attention import turboquant_v1 as tq
+
+    with pytest.raises(RuntimeError, match="capture extent"):
+        _builder()._build_backend_metadata(
+            types.SimpleNamespace(
+                num_reqs=BATCH,
+                num_actual_tokens=live,
+                slot_mapping=torch.zeros(slots, dtype=torch.int64),
+                attn_state=tq.AscendAttentionState.DecodeOnly,
+            ),
+            block_table=torch.zeros(BATCH, MAX_BLOCKS, dtype=torch.int32),
+            query_lens=torch.ones(BATCH, dtype=torch.int32),
+            seq_lens=torch.tensor([64, 128], dtype=torch.int32),
+            num_decodes=BATCH,
+            num_prefills=0,
+        )
+
+
+def test_capture_ingress_and_decode_reuse_prepared_padded_buffers(monkeypatch, emulator):
+    from vllm.v1.attention.backend import AttentionType
+
+    from vllm_ascend.attention import turboquant_v1 as tq
+
+    scatter, decode, tiling = OpRecorder(), OpRecorder(), OpRecorder()
+    register_ops(
+        monkeypatch,
+        **{
+            tq.TURBOQUANT_OP_RESHAPE_SCATTER: scatter,
+            tq.TURBOQUANT_OP_FUSED_DECODE: decode,
+            tq.TURBOQUANT_OP_BUILD_DECODE_TILING: tiling,
+        },
+    )
+    monkeypatch.setattr(tq, "_stream_is_capturing", lambda: False)
+    adapter = make_adapter(TurboQuantKernelStage.SCATTER, TurboQuantKernelStage.DECODE)
+    impl = _impl(adapter, emulator, _layer(emulator))
+    impl.attn_type = AttentionType.DECODER
+    impl.kv_sharing_target_layer_name = None
+    builder = _builder()
+    query = torch.zeros(BATCH, NUM_HEADS, HEAD_SIZE, dtype=torch.bfloat16)
+    key = torch.zeros(BATCH, NUM_KV_HEADS, HEAD_SIZE, dtype=torch.bfloat16)
+    value = torch.zeros_like(key)
+    output = torch.zeros_like(query)
+    caches = (impl.key_cache, impl.value_cache, impl.scale_cache)
+    source_slots = torch.zeros(BATCH, dtype=torch.int64)
+    block_table = torch.zeros(BATCH, MAX_BLOCKS, dtype=torch.int32)
+    profiles = []
+    for live, lengths, slots in ((BATCH, [64, 128], [63, 127]), (1, [65, 0], [64, 7]), (BATCH, [66, 129], [65, 128])):
+        source_slots.copy_(torch.tensor(slots))
+        metadata = _metadata()
+        metadata.attn_state = tq.AscendAttentionState.DecodeOnly
+        metadata.num_actual_tokens = live
+        extra = builder._build_backend_metadata(
+            types.SimpleNamespace(
+                num_reqs=live,
+                num_actual_tokens=live,
+                slot_mapping=source_slots,
+                attn_state=metadata.attn_state,
+            ),
+            block_table=block_table,
+            query_lens=torch.ones(BATCH, dtype=torch.int32),
+            seq_lens=torch.tensor(lengths, dtype=torch.int32),
+            num_decodes=live,
+            num_prefills=0,
+        )
+        metadata.__dict__.update(extra)
+        metadata.block_tables = block_table
+        assert len(tiling.calls) == len(profiles) + 1
+        assert metadata.turboquant_slot_mapping.tolist() == slots[:live] + [-1] * (BATCH - live)
+        # Poison all host mirrors, including the one the old ingress phase
+        # selector read. Neither launch may rebuild metadata during capture.
+        log = []
+        for field in _HOST_FIELDS:
+            setattr(metadata, field, _HostFieldPoison(field, log))
+        watcher = _LaunchWatcher()
+        monkeypatch.setattr(tq, "_stream_is_capturing", lambda: True)
+        with watcher:
+            impl.reshape_and_cache(query, key, value, caches, metadata, output)
+            impl._forward_decode(query, metadata, output)
+        monkeypatch.setattr(tq, "_stream_is_capturing", lambda: False)
+        assert not log
+        assert not set(watcher.names) - _ALLOWED
+        assert len(tiling.calls) == len(profiles) + 1
+        assert scatter.calls[-1][0][0].shape[0] == BATCH
+        profiles.append((_launch_profile(decode), _arg_shape(scatter.calls[-1][0][5])))
+    assert profiles[0] == profiles[1] == profiles[2]
+
+
+@pytest.mark.parametrize(
+    "state,kernels,warmed,prepared",
+    [
+        ("ChunkedPrefill", True, True, True),
+        ("DecodeOnly", False, True, True),
+        ("DecodeOnly", True, False, True),
+        ("DecodeOnly", True, True, False),
+    ],
+)
+def test_full_capture_rejects_uncapturable_forward_before_launch(monkeypatch, state, kernels, warmed, prepared):
+    from vllm_ascend.attention import turboquant_v1 as tq
+
+    impl = object.__new__(AscendTurboQuantBackendImpl)
+    impl.adapter = types.SimpleNamespace(_has_kernel=lambda name: kernels)
+    impl.emulator = object() if warmed else None
+    metadata = types.SimpleNamespace(
+        attn_state=getattr(tq.AscendAttentionState, state), turboquant_slot_mapping=object() if prepared else None
+    )
+    monkeypatch.setattr(tq, "_stream_is_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="TurboQuant"):
+        impl.forward(None, None, None, None, (), metadata)

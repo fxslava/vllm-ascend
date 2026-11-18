@@ -28,6 +28,14 @@ from typing import Any
 import pytest
 import torch
 
+from tests.helpers.turboquant import (
+    OpRecorder,
+    make_activations,
+    make_adapter,
+    make_cache,
+    make_decode_buffers,
+    register_ops,
+)
 from vllm_ascend.attention import turboquant_v1
 from vllm_ascend.attention.turboquant_layout import (
     TURBOQUANT_KEY_PLANE,
@@ -36,7 +44,6 @@ from vllm_ascend.attention.turboquant_layout import (
     turboquant_scale_cache_shape,
 )
 from vllm_ascend.attention.turboquant_v1 import (
-    TURBOQUANT_DECODE_MAX_SPLITS,
     TURBOQUANT_DECODE_SPLITS,
     TURBOQUANT_DECODE_UNPACK,
     TURBOQUANT_KERNEL_OPS,
@@ -63,10 +70,7 @@ from vllm_ascend.attention.turboquant_v1 import (
     TurboQuantValueLayout,
     _is_op_registered,
     load_turboquant_extension,
-    turboquant_decode_query_rot_floats,
-    turboquant_decode_workspace_floats,
     turboquant_plan_strip_ingestion,
-    turboquant_tiling_upper_bound_words,
 )
 
 HEAD_SIZE = 64
@@ -82,85 +86,21 @@ CPU = torch.device("cpu")
 # ---------------------------------------------------------------------------
 
 
-class _Recorder:
-    """A registered entry point that records its call and returns ``result``."""
-
-    def __init__(self, result: Any = None) -> None:
-        self.result = result
-        self.calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
-
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        self.calls.append((args, kwargs))
-        return self.result
-
-    @property
-    def args(self) -> tuple[Any, ...]:
-        assert len(self.calls) == 1, f"expected exactly one call, got {len(self.calls)}"
-        return self.calls[0][0]
-
-
-class _OpNamespace:
-    """``torch.ops.<namespace>``: an attribute per registered entry point."""
-
-    def __init__(self, entries: dict[str, _Recorder]) -> None:
-        self._entries = entries
-
-    def __getattr__(self, name: str) -> _Recorder:
-        try:
-            return self._entries[name]
-        except KeyError:
-            raise AttributeError(name) from None
-
-
-def _register(monkeypatch: pytest.MonkeyPatch, **entries: _Recorder) -> None:
-    """Stand ``torch.ops`` up with ``entries`` registered under ``NAMESPACE``."""
-    monkeypatch.setattr(torch, "ops", types.SimpleNamespace(**{NAMESPACE: _OpNamespace(dict(entries))}))
-
-
-def _adapter(*stages: TurboQuantKernelStage) -> TurboQuantOpsAdapter:
-    return TurboQuantOpsAdapter(
-        TurboQuantOpsConfig(
-            ops_namespace=NAMESPACE,
-            kernel_stages=frozenset(stages),
-            value_layout=TurboQuantValueLayout.TOKEN_MAJOR,
-        )
-    )
-
-
 @pytest.fixture
 def emulator() -> TurboQuantEmulator:
     return TurboQuantEmulator(head_size=HEAD_SIZE, device=CPU)
 
 
 def _caches() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """An empty three-plane cache: two INT8 packed planes and the fp32 scales."""
-    packed = (NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, turboquant_packed_bytes(HEAD_SIZE))
-    return (
-        torch.zeros(packed, dtype=torch.int8),
-        torch.zeros(packed, dtype=torch.int8),
-        torch.zeros(turboquant_scale_cache_shape(NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS), dtype=torch.float32),
-    )
+    return make_cache(NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
 
 
 def _decode_caches() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Caches with the scale plane a fused decode launch needs.
-
-    The decode reads one slot-major record per slot, which at this fixture's
-    H = 2 is twice the canonical token-major plane; the launch-path geometry
-    check refuses the token-major one before the op is called.
-    """
-    key, value, _ = _caches()
-    slot_floats = TurboQuantOpsAdapter._nz_scale_slot_floats(NUM_KV_HEADS)
-    return key, value, torch.zeros(NUM_BLOCKS * BLOCK_SIZE * slot_floats, dtype=torch.float32)
+    return make_cache(NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE, decode=True)
 
 
-def _activations(num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
-    generator = torch.Generator().manual_seed(20261107)
-    shape = (num_tokens, NUM_KV_HEADS, HEAD_SIZE)
-    return (
-        torch.randn(shape, generator=generator, dtype=torch.float32),
-        torch.randn(shape, generator=generator, dtype=torch.float32),
-    )
+def _activations(num_tokens: int, seed: int = 20261107) -> tuple[torch.Tensor, torch.Tensor]:
+    return make_activations(num_tokens, NUM_KV_HEADS, HEAD_SIZE, seed=seed)
 
 
 # The suite's BLOCK_SIZE is 8, which no strip fits in: it is there to pin the
@@ -218,27 +158,27 @@ ALL_OPS = (
 
 @pytest.mark.parametrize("op_name", ALL_OPS)
 def test_no_stage_switched_on_means_no_kernel(monkeypatch: pytest.MonkeyPatch, op_name: str) -> None:
-    _register(monkeypatch, **{name: _Recorder() for name in ALL_OPS})
-    assert _adapter()._has_kernel(op_name) is False
+    register_ops(monkeypatch, **{name: OpRecorder() for name in ALL_OPS})
+    assert make_adapter()._has_kernel(op_name) is False
 
 
 @pytest.mark.parametrize("op_name", ALL_OPS)
 def test_stage_on_and_registered_means_kernel(monkeypatch: pytest.MonkeyPatch, op_name: str) -> None:
-    _register(monkeypatch, **{op_name: _Recorder()})
-    assert _adapter(*TurboQuantKernelStage)._has_kernel(op_name) is True
+    register_ops(monkeypatch, **{op_name: OpRecorder()})
+    assert make_adapter(*TurboQuantKernelStage)._has_kernel(op_name) is True
 
 
 @pytest.mark.parametrize("op_name", ALL_OPS)
 def test_stage_on_but_unregistered_falls_back(monkeypatch: pytest.MonkeyPatch, op_name: str) -> None:
-    _register(monkeypatch)
-    adapter = _adapter(*TurboQuantKernelStage)
+    register_ops(monkeypatch)
+    adapter = make_adapter(*TurboQuantKernelStage)
     assert adapter._has_kernel(op_name) is False
     assert op_name in adapter._missing_kernels
 
 
 def test_a_missing_namespace_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(torch, "ops", types.SimpleNamespace())
-    assert _adapter(*TurboQuantKernelStage)._has_kernel(TURBOQUANT_OP_ROTATE) is False
+    assert make_adapter(*TurboQuantKernelStage)._has_kernel(TURBOQUANT_OP_ROTATE) is False
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +193,7 @@ def test_dispatch_trace_reports_cpu_tensor_layout(
     caplog.set_level(logging.INFO)
     x = torch.randn(3, HEAD_SIZE * 2)[:, ::2]
 
-    _adapter().rotate(x, emulator)
+    make_adapter().rotate(x, emulator)
 
     assert "op=npu_turboquant_rotate backend=CPU (PyTorch) devices=['cpu']" in caplog.text
     assert "x(shape=(3, 64), stride=(128, 2)" in caplog.text
@@ -266,11 +206,11 @@ def test_dispatch_trace_reports_custom_operator(
 ) -> None:
     monkeypatch.setattr(turboquant_v1, "_TURBOQUANT_TRACE_ENABLED", True)
     caplog.set_level(logging.INFO)
-    entry = _Recorder((torch.zeros(1, dtype=torch.int8), torch.ones(1)))
-    _register(monkeypatch, npu_turboquant_quantize_pack=entry)
+    entry = OpRecorder((torch.zeros(1, dtype=torch.int8), torch.ones(1)))
+    register_ops(monkeypatch, npu_turboquant_quantize_pack=entry)
     rotated = torch.randn(3, HEAD_SIZE)
 
-    _adapter(TurboQuantKernelStage.QUANTIZE).quantize_and_pack(rotated, emulator)
+    make_adapter(TurboQuantKernelStage.QUANTIZE).quantize_and_pack(rotated, emulator)
 
     assert "op=npu_turboquant_quantize_pack backend=custom torch op devices=['cpu']" in caplog.text
     assert "rotated(shape=(3, 64)" in caplog.text
@@ -284,17 +224,17 @@ def test_dispatch_trace_reports_custom_operator(
 
 def test_rotate_reference_runs_when_the_stage_is_off(emulator: TurboQuantEmulator) -> None:
     x = torch.randn(3, HEAD_SIZE)
-    assert torch.equal(_adapter().rotate(x, emulator), emulator.rotate(x))
-    assert torch.equal(_adapter().inverse_rotate(x, emulator), emulator.inverse_rotate(x))
+    assert torch.equal(make_adapter().rotate(x, emulator), emulator.rotate(x))
+    assert torch.equal(make_adapter().inverse_rotate(x, emulator), emulator.inverse_rotate(x))
 
 
 def test_rotate_dispatches_both_directions_to_the_kernel(
     monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
 ) -> None:
     ingress, egress = torch.zeros(1), torch.ones(1)
-    entry = _Recorder()
-    _register(monkeypatch, npu_turboquant_rotate=entry)
-    adapter = _adapter(TurboQuantKernelStage.ROTATE)
+    entry = OpRecorder()
+    register_ops(monkeypatch, npu_turboquant_rotate=entry)
+    adapter = make_adapter(TurboQuantKernelStage.ROTATE)
     x = torch.randn(3, HEAD_SIZE)
 
     entry.result = ingress
@@ -322,35 +262,35 @@ def test_rotate_dispatches_both_directions_to_the_kernel(
 
 def test_quantize_pack_reference_runs_when_the_stage_is_off(emulator: TurboQuantEmulator) -> None:
     rotated = emulator.rotate(torch.randn(3, HEAD_SIZE))
-    packed, scales = _adapter().quantize_and_pack(rotated, emulator)
+    packed, scales = make_adapter().quantize_and_pack(rotated, emulator)
     codes, expected_scales = emulator.quantize(rotated)
     assert torch.equal(packed, emulator.pack(codes))
     assert torch.equal(scales, expected_scales)
     assert torch.equal(
-        _adapter().unpack_and_dequantize(packed, scales, emulator),
+        make_adapter().unpack_and_dequantize(packed, scales, emulator),
         emulator.dequantize(emulator.unpack(packed), scales),
     )
 
 
 def test_quantize_pack_dispatches_to_the_kernel(monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator) -> None:
     result = (torch.zeros(1, dtype=torch.int8), torch.ones(1))
-    entry = _Recorder(result)
-    _register(monkeypatch, npu_turboquant_quantize_pack=entry)
+    entry = OpRecorder(result)
+    register_ops(monkeypatch, npu_turboquant_quantize_pack=entry)
     rotated = torch.randn(3, HEAD_SIZE)
 
-    assert _adapter(TurboQuantKernelStage.QUANTIZE).quantize_and_pack(rotated, emulator) is result
+    assert make_adapter(TurboQuantKernelStage.QUANTIZE).quantize_and_pack(rotated, emulator) is result
     assert entry.args[0] is rotated
     assert entry.args[1] == pytest.approx(emulator.inv_sqrt_len)
 
 
 def test_unpack_dequant_dispatches_to_the_kernel(monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator) -> None:
     result = torch.ones(1)
-    entry = _Recorder(result)
-    _register(monkeypatch, npu_turboquant_unpack_dequant=entry)
+    entry = OpRecorder(result)
+    register_ops(monkeypatch, npu_turboquant_unpack_dequant=entry)
     packed = torch.zeros(3, turboquant_packed_bytes(HEAD_SIZE), dtype=torch.int8)
     scales = torch.ones(3)
 
-    assert _adapter(TurboQuantKernelStage.DEQUANTIZE).unpack_and_dequantize(packed, scales, emulator) is result
+    assert make_adapter(TurboQuantKernelStage.DEQUANTIZE).unpack_and_dequantize(packed, scales, emulator) is result
     assert entry.args == (packed, scales)
 
 
@@ -385,11 +325,11 @@ def test_both_reference_writers_land_the_codec_bytes(emulator: TurboQuantEmulato
     slot_mapping = torch.arange(BLOCK_SIZE, dtype=torch.int32)
 
     prefill = _caches()
-    _adapter().reshape_and_cache_prefill(key, value, *prefill, slot_mapping, emulator)
+    make_adapter().reshape_and_cache_prefill(key, value, *prefill, slot_mapping, emulator)
     _assert_cache_holds(*prefill, key, value, slot_mapping, emulator)
 
     decode = _caches()
-    _adapter().reshape_scatter_decode(key, value, *decode, slot_mapping, emulator)
+    make_adapter().reshape_scatter_decode(key, value, *decode, slot_mapping, emulator)
     for written, expected in zip(decode, prefill):
         assert torch.equal(written, expected)
 
@@ -398,7 +338,7 @@ def test_the_decode_writer_skips_padding_slots(emulator: TurboQuantEmulator) -> 
     key, value = _activations(3)
     slot_mapping = torch.tensor([5, -1, 11], dtype=torch.int32)
     caches = _caches()
-    _adapter().reshape_scatter_decode(key, value, *caches, slot_mapping, emulator)
+    make_adapter().reshape_scatter_decode(key, value, *caches, slot_mapping, emulator)
 
     key_cache, _, scale_cache = caches
     assert torch.equal(key_cache[0, 6], torch.zeros_like(key_cache[0, 6]))
@@ -431,8 +371,8 @@ def test_a_strip_layout_refuses_a_block_size_it_cannot_hold(emulator: TurboQuant
 def test_the_prefill_entry_point_takes_the_batch_writer_abi(
     monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
 ) -> None:
-    entry = _Recorder()
-    _register(monkeypatch, npu_turboquant_reshape_and_cache_a8=entry)
+    entry = OpRecorder()
+    register_ops(monkeypatch, npu_turboquant_reshape_and_cache_a8=entry)
     # One whole strip at a strip-aligned slot: the plan is a single unpadded run,
     # so the adapter hands its own tensors over rather than a slice of them and
     # the recorded arguments are the caller's own objects.
@@ -440,7 +380,7 @@ def test_the_prefill_entry_point_takes_the_batch_writer_abi(
     caches = _caches()
     slot_mapping = torch.arange(TURBOQUANT_STRIP_TOKENS, dtype=torch.int32)
 
-    _adapter(TurboQuantKernelStage.RESHAPE_AND_CACHE).reshape_and_cache_prefill(
+    make_adapter(TurboQuantKernelStage.RESHAPE_AND_CACHE).reshape_and_cache_prefill(
         key, value, *caches, slot_mapping, emulator
     )
 
@@ -477,13 +417,13 @@ def test_the_prefill_entry_point_takes_the_batch_writer_abi(
 def test_the_decode_entry_point_takes_the_scatter_writer_abi(
     monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
 ) -> None:
-    entry = _Recorder()
-    _register(monkeypatch, npu_turboquant_reshape_scatter_aiv=entry)
+    entry = OpRecorder()
+    register_ops(monkeypatch, npu_turboquant_reshape_scatter_aiv=entry)
     key, value = _activations(2)
     caches = _caches()
     slot_mapping = torch.tensor([0, 9], dtype=torch.int32)
 
-    _adapter(TurboQuantKernelStage.SCATTER).reshape_scatter_decode(key, value, *caches, slot_mapping, emulator)
+    make_adapter(TurboQuantKernelStage.SCATTER).reshape_scatter_decode(key, value, *caches, slot_mapping, emulator)
 
     # The work split (block_dim, item_begin, item_count), the canary probe and
     # the cu_seqlens prefix sum are all the binding's, so the schema is tensors
@@ -664,7 +604,7 @@ def _nz_layout_adapter() -> TurboQuantOpsAdapter:
 
 
 def _staged_adapter() -> TurboQuantOpsAdapter:
-    return _adapter(TurboQuantKernelStage.RESHAPE_AND_CACHE, TurboQuantKernelStage.SCATTER)
+    return make_adapter(TurboQuantKernelStage.RESHAPE_AND_CACHE, TurboQuantKernelStage.SCATTER)
 
 
 class _GoldenWriter:
@@ -689,7 +629,7 @@ class _GoldenWriter:
 
 def _reference_writer(monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator) -> _GoldenWriter:
     writer = _GoldenWriter(emulator)
-    _register(
+    register_ops(
         monkeypatch,
         npu_turboquant_reshape_and_cache_a8=writer,
         npu_turboquant_reshape_scatter_aiv=writer,
@@ -778,8 +718,8 @@ def test_the_only_slots_touched_beyond_the_step_are_the_planned_pad(
 def test_a_conforming_step_still_reaches_the_batch_writer_in_one_launch(
     monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
 ) -> None:
-    batch, scatter = _Recorder(), _Recorder()
-    _register(
+    batch, scatter = OpRecorder(), OpRecorder()
+    register_ops(
         monkeypatch,
         npu_turboquant_reshape_and_cache_a8=batch,
         npu_turboquant_reshape_scatter_aiv=scatter,
@@ -804,8 +744,8 @@ def test_a_head_misaligned_step_reaches_both_writers(
     did in the strip era -- what changed is the cache it writes into, which is
     the batch writer's NZ fractal rather than the strip cache.
     """
-    batch, scatter = _Recorder(), _Recorder()
-    _register(
+    batch, scatter = OpRecorder(), OpRecorder()
+    register_ops(
         monkeypatch,
         npu_turboquant_reshape_and_cache_a8=batch,
         npu_turboquant_reshape_scatter_aiv=scatter,
@@ -832,13 +772,13 @@ def test_the_scatter_waves_fall_back_to_reference_without_the_scatter_kernel(
     every other operation in this file takes, in the NZ layout the staged batch
     writer puts the cache in.
     """
-    batch = _Recorder()
-    _register(monkeypatch, npu_turboquant_reshape_and_cache_a8=batch)
+    batch = OpRecorder()
+    register_ops(monkeypatch, npu_turboquant_reshape_and_cache_a8=batch)
     key, value = _nz_activations(4)
     slot_mapping = torch.arange(20, 24, dtype=torch.int32)
     caches = _nz_caches()
 
-    _adapter(TurboQuantKernelStage.RESHAPE_AND_CACHE).reshape_and_cache_prefill(
+    make_adapter(TurboQuantKernelStage.RESHAPE_AND_CACHE).reshape_and_cache_prefill(
         key, value, *caches, slot_mapping, emulator
     )
 
@@ -857,9 +797,9 @@ def test_the_scatter_waves_fall_back_to_reference_without_the_scatter_kernel(
 def test_gather_round_trips_through_the_reference_path(emulator: TurboQuantEmulator) -> None:
     key, value = _activations(BLOCK_SIZE)
     caches = _caches()
-    _adapter().reshape_and_cache_prefill(key, value, *caches, torch.arange(BLOCK_SIZE, dtype=torch.int32), emulator)
+    make_adapter().reshape_and_cache_prefill(key, value, *caches, torch.arange(BLOCK_SIZE, dtype=torch.int32), emulator)
 
-    adapter = _adapter()
+    adapter = make_adapter()
     packed_key, key_scales, _, _ = adapter.gather(*caches, torch.zeros(1, 1, dtype=torch.int32))
     dense = adapter.dequantize_cache(packed_key, key_scales, emulator, torch.float32)
     assert dense.shape == (1, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
@@ -868,12 +808,12 @@ def test_gather_round_trips_through_the_reference_path(emulator: TurboQuantEmula
 
 def test_gather_dispatches_to_the_kernel(monkeypatch: pytest.MonkeyPatch) -> None:
     result = (torch.zeros(1), torch.zeros(1), torch.zeros(1), torch.zeros(1))
-    entry = _Recorder(result)
-    _register(monkeypatch, npu_turboquant_gather_pages=entry)
+    entry = OpRecorder(result)
+    register_ops(monkeypatch, npu_turboquant_gather_pages=entry)
     caches = _caches()
     block_tables = torch.zeros(1, 1, dtype=torch.int32)
 
-    assert _adapter(TurboQuantKernelStage.GATHER).gather(*caches, block_tables) is result
+    assert make_adapter(TurboQuantKernelStage.GATHER).gather(*caches, block_tables) is result
     assert entry.args == (*caches, block_tables)
 
 
@@ -883,23 +823,7 @@ def test_gather_dispatches_to_the_kernel(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def _launch_buffers(tokens: int, num_heads: int, head_size: int = HEAD_SIZE) -> dict[str, torch.Tensor]:
-    """The three buffers the fused decode takes as inputs.
-
-    They belong to AscendTurboQuantMetadataBuilder in service; a test supplies
-    its own. None of them has a default on the adapter, deliberately: an
-    unfilled tiling buffer is all zeros, which the kernel reads as "every worker
-    has no work" and returns from having written nothing.
-    """
-    splits = TURBOQUANT_DECODE_SPLITS
-    return {
-        "tiling": torch.zeros(
-            turboquant_tiling_upper_bound_words(tokens, TURBOQUANT_DECODE_MAX_SPLITS), dtype=torch.int32
-        ),
-        "workspace": torch.zeros(
-            turboquant_decode_workspace_floats(tokens, num_heads, head_size, splits), dtype=torch.float32
-        ),
-        "query_rot": torch.zeros(turboquant_decode_query_rot_floats(tokens, num_heads, head_size), dtype=torch.float32),
-    }
+    return make_decode_buffers(tokens, num_heads, head_size)
 
 
 def _fused_decode(adapter: TurboQuantOpsAdapter, emulator: TurboQuantEmulator) -> torch.Tensor | None:
@@ -923,8 +847,8 @@ def _fused_decode(adapter: TurboQuantOpsAdapter, emulator: TurboQuantEmulator) -
 def test_fused_decode_returns_none_without_a_kernel(
     monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
 ) -> None:
-    _register(monkeypatch, npu_turboquant_fused_decode=_Recorder())
-    assert _fused_decode(_adapter(), emulator) is None
+    register_ops(monkeypatch, npu_turboquant_fused_decode=OpRecorder())
+    assert _fused_decode(make_adapter(), emulator) is None
 
 
 def test_fused_decode_launches_and_returns_its_output(
@@ -935,9 +859,9 @@ def test_fused_decode_launches_and_returns_its_output(
     `None` is reserved for "the golden gather, dequantise and attend path has to
     run", so a launched decode must be distinguishable from it.
     """
-    entry = _Recorder()
-    _register(monkeypatch, npu_turboquant_fused_decode=entry)
-    adapter = _adapter(TurboQuantKernelStage.DECODE)
+    entry = OpRecorder()
+    register_ops(monkeypatch, npu_turboquant_fused_decode=entry)
+    adapter = make_adapter(TurboQuantKernelStage.DECODE)
     caches = _decode_caches()
     output = torch.zeros(1, 2, HEAD_SIZE, dtype=torch.bfloat16)
 
@@ -971,8 +895,8 @@ def test_fused_decode_passes_the_schema_the_binding_declares(
     arguments now: a buffer the op allocates has a fresh address every step, and
     a captured ACL graph replays the address it recorded.
     """
-    entry = _Recorder()
-    _register(monkeypatch, npu_turboquant_fused_decode=entry)
+    entry = OpRecorder()
+    register_ops(monkeypatch, npu_turboquant_fused_decode=entry)
     caches = _decode_caches()
     query = torch.randn(1, 12, HEAD_SIZE, dtype=torch.bfloat16)
     output = torch.zeros_like(query)
@@ -980,7 +904,7 @@ def test_fused_decode_passes_the_schema_the_binding_declares(
     context_lens = torch.ones(1, dtype=torch.int32)
     buffers = _launch_buffers(1, 12)
 
-    _adapter(TurboQuantKernelStage.DECODE).fused_decode(
+    make_adapter(TurboQuantKernelStage.DECODE).fused_decode(
         query=query,
         key_cache=caches[0],
         value_cache=caches[1],
@@ -1028,7 +952,7 @@ def test_fused_decode_passes_the_schema_the_binding_declares(
 def test_p4_gather_refuses_a_negative_page() -> None:
     key, value, scale = _caches()
     with pytest.raises(ValueError) as raised:
-        _adapter().gather(key, value, scale, torch.tensor([[-1]], dtype=torch.int32))
+        make_adapter().gather(key, value, scale, torch.tensor([[-1]], dtype=torch.int32))
 
     message = str(raised.value)
     assert "block_tables" in message
@@ -1039,7 +963,7 @@ def test_p4_gather_refuses_a_negative_page() -> None:
 def test_p4_gather_refuses_a_page_past_the_cache() -> None:
     key, value, scale = _caches()
     with pytest.raises(ValueError) as raised:
-        _adapter().gather(key, value, scale, torch.tensor([[NUM_BLOCKS]], dtype=torch.int32))
+        make_adapter().gather(key, value, scale, torch.tensor([[NUM_BLOCKS]], dtype=torch.int32))
 
     message = str(raised.value)
     assert "block_tables" in message
@@ -1049,7 +973,7 @@ def test_p4_gather_refuses_a_page_past_the_cache() -> None:
 
 def test_p4_gather_accepts_the_last_valid_page() -> None:
     key, value, scale = _caches()
-    packed = _adapter().gather(key, value, scale, torch.tensor([[NUM_BLOCKS - 1]], dtype=torch.int32))
+    packed = make_adapter().gather(key, value, scale, torch.tensor([[NUM_BLOCKS - 1]], dtype=torch.int32))
     assert len(packed) == 4
 
 
@@ -1070,7 +994,7 @@ def test_p5_write_slots_refuses_a_slot_past_the_cache(emulator: TurboQuantEmulat
     past_end = NUM_BLOCKS * BLOCK_SIZE
 
     with pytest.raises(ValueError) as raised:
-        _adapter()._write_slots(key, value, *caches, torch.tensor([past_end], dtype=torch.int32), emulator)
+        make_adapter()._write_slots(key, value, *caches, torch.tensor([past_end], dtype=torch.int32), emulator)
 
     message = str(raised.value)
     assert "slot_mapping" in message
@@ -1082,10 +1006,10 @@ def test_p5_write_slots_accepts_the_last_slot_and_filters_negatives(emulator: Tu
     """The upper bound is exclusive, and padding slots stay filtered."""
     key, value = _activations(1)
     caches = _caches()
-    _adapter()._write_slots(
+    make_adapter()._write_slots(
         key, value, *caches, torch.tensor([NUM_BLOCKS * BLOCK_SIZE - 1], dtype=torch.int32), emulator
     )
-    _adapter()._write_slots(key, value, *_caches(), torch.tensor([-1], dtype=torch.int32), emulator)
+    make_adapter()._write_slots(key, value, *_caches(), torch.tensor([-1], dtype=torch.int32), emulator)
 
 
 def _launch_decode(
@@ -1114,14 +1038,14 @@ def _launch_decode(
 def test_p6_a_non_bf16_query_is_refused_before_the_launch(
     monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
 ) -> None:
-    entry = _Recorder()
-    _register(monkeypatch, npu_turboquant_fused_decode=entry)
+    entry = OpRecorder()
+    register_ops(monkeypatch, npu_turboquant_fused_decode=entry)
     caches = _decode_caches()
     query = torch.randn(1, 2, HEAD_SIZE, dtype=torch.float32)
     output = torch.zeros(1, 2, HEAD_SIZE, dtype=torch.bfloat16)
 
     with pytest.raises(TypeError) as raised:
-        _launch_decode(_adapter(TurboQuantKernelStage.DECODE), emulator, caches, query, output)
+        _launch_decode(make_adapter(TurboQuantKernelStage.DECODE), emulator, caches, query, output)
 
     message = str(raised.value)
     assert "query.dtype" in message
@@ -1132,14 +1056,14 @@ def test_p6_a_non_bf16_query_is_refused_before_the_launch(
 def test_p6_a_non_bf16_output_is_refused_before_the_launch(
     monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
 ) -> None:
-    entry = _Recorder()
-    _register(monkeypatch, npu_turboquant_fused_decode=entry)
+    entry = OpRecorder()
+    register_ops(monkeypatch, npu_turboquant_fused_decode=entry)
     caches = _decode_caches()
     query = torch.randn(1, 2, HEAD_SIZE, dtype=torch.bfloat16)
     output = torch.zeros(1, 2, HEAD_SIZE, dtype=torch.float32)
 
     with pytest.raises(TypeError) as raised:
-        _launch_decode(_adapter(TurboQuantKernelStage.DECODE), emulator, caches, query, output)
+        _launch_decode(make_adapter(TurboQuantKernelStage.DECODE), emulator, caches, query, output)
 
     message = str(raised.value)
     assert "output.dtype" in message
@@ -1150,13 +1074,13 @@ def test_p6_a_non_bf16_output_is_refused_before_the_launch(
 def test_p6_an_aliased_query_and_output_are_refused(
     monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
 ) -> None:
-    entry = _Recorder()
-    _register(monkeypatch, npu_turboquant_fused_decode=entry)
+    entry = OpRecorder()
+    register_ops(monkeypatch, npu_turboquant_fused_decode=entry)
     caches = _decode_caches()
     query = torch.zeros(1, 2, HEAD_SIZE, dtype=torch.bfloat16)
 
     with pytest.raises(ValueError) as raised:
-        _launch_decode(_adapter(TurboQuantKernelStage.DECODE), emulator, caches, query, query)
+        _launch_decode(make_adapter(TurboQuantKernelStage.DECODE), emulator, caches, query, query)
 
     message = str(raised.value)
     assert "alias" in message
@@ -1165,8 +1089,8 @@ def test_p6_an_aliased_query_and_output_are_refused(
 
 
 def test_p6_an_undersized_scale_plane_is_refused(monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator) -> None:
-    entry = _Recorder()
-    _register(monkeypatch, npu_turboquant_fused_decode=entry)
+    entry = OpRecorder()
+    register_ops(monkeypatch, npu_turboquant_fused_decode=entry)
     # The canonical token-major plane is half the footprint the slot-major
     # decode records need at this H = 2 geometry.
     caches = _caches()
@@ -1176,7 +1100,7 @@ def test_p6_an_undersized_scale_plane_is_refused(monkeypatch: pytest.MonkeyPatch
     need = NUM_BLOCKS * BLOCK_SIZE * slot_floats
 
     with pytest.raises(ValueError) as raised:
-        _launch_decode(_adapter(TurboQuantKernelStage.DECODE), emulator, caches, query, output)
+        _launch_decode(make_adapter(TurboQuantKernelStage.DECODE), emulator, caches, query, output)
 
     message = str(raised.value)
     assert "scale_cache" in message
@@ -1189,18 +1113,20 @@ def test_p6_a_clean_launch_passes_and_the_reference_fallback_keeps_any_dtype(
     monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
 ) -> None:
     """The positive half, plus proof the check never gates the fallback."""
-    entry = _Recorder()
-    _register(monkeypatch, npu_turboquant_fused_decode=entry)
+    entry = OpRecorder()
+    register_ops(monkeypatch, npu_turboquant_fused_decode=entry)
     query = torch.randn(1, 2, HEAD_SIZE, dtype=torch.bfloat16)
     output = torch.zeros(1, 2, HEAD_SIZE, dtype=torch.bfloat16)
-    assert _launch_decode(_adapter(TurboQuantKernelStage.DECODE), emulator, _decode_caches(), query, output) is output
+    assert (
+        _launch_decode(make_adapter(TurboQuantKernelStage.DECODE), emulator, _decode_caches(), query, output) is output
+    )
     assert len(entry.calls) == 1
 
     # No decode stage: fused_decode returns None before any geometry check, so
     # the float32 golden gather path is untouched.
     golden_query = torch.randn(1, 2, HEAD_SIZE, dtype=torch.float32)
     golden_output = torch.zeros(1, 2, HEAD_SIZE, dtype=torch.float32)
-    assert _launch_decode(_adapter(), emulator, _caches(), golden_query, golden_output) is None
+    assert _launch_decode(make_adapter(), emulator, _caches(), golden_query, golden_output) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1331,12 +1257,12 @@ def test_a_real_operator_is_reported_as_registered() -> None:
 
 def test_no_stage_switched_on_does_not_touch_the_extension(unloaded: None) -> None:
     """A golden-only run must not pay for the import, nor warn about it."""
-    _adapter()
+    make_adapter()
     assert turboquant_v1._TURBOQUANT_EXTENSION_LOADED is None
 
 
 def test_a_stage_switched_on_attempts_the_import_once(unloaded: None) -> None:
-    _adapter(*TurboQuantKernelStage)
+    make_adapter(*TurboQuantKernelStage)
     first = turboquant_v1._TURBOQUANT_EXTENSION_LOADED
     assert first is not None, "a stage-on adapter must have tried the import"
 
@@ -1361,7 +1287,7 @@ def test_missing_operators_are_reported_with_the_stages_that_wanted_them(
     # tested if the probe answers "missing" here.
     monkeypatch.setattr(turboquant_v1, "_is_op_registered", lambda namespace, op_name: False)
     with caplog.at_level(logging.WARNING):
-        _adapter(TurboQuantKernelStage.SCATTER)
+        make_adapter(TurboQuantKernelStage.SCATTER)
     assert any(
         "are switched on but torch.ops" in record.message and "ascend950" in record.message for record in caplog.records
     ), f"expected one actionable warning, got {[r.message for r in caplog.records]}"
@@ -1375,7 +1301,7 @@ def test_a_fully_registered_namespace_is_quiet(
     """With every registered op present, construction says nothing at WARNING."""
     monkeypatch.setattr(turboquant_v1, "_is_op_registered", lambda namespace, op_name: True)
     with caplog.at_level(logging.WARNING):
-        _adapter(*TurboQuantKernelStage)
+        make_adapter(*TurboQuantKernelStage)
     assert caplog.records == []
 
 
@@ -1429,7 +1355,7 @@ def _geometry(
     attributes.
     """
     return types.SimpleNamespace(
-        adapter=_adapter(*stages),
+        adapter=make_adapter(*stages),
         head_size=head_size,
         num_kv_heads=num_kv_heads,
         num_heads=num_heads if num_heads is not None else num_kv_heads * 4,

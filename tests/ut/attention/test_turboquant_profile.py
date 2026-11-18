@@ -217,9 +217,11 @@ def test_capture_and_a_metadataless_forward_are_never_profiled(monkeypatch, prof
         lambda self: opened.append(1),  # type: ignore[arg-type,return-value]
     )
     monkeypatch.setattr(impl, "_ensure_statics", lambda layer, device: None, raising=False)
+    impl.adapter = types.SimpleNamespace(_has_kernel=lambda name: True)
+    impl.emulator = object()
 
     layer = type("Layer", (), {"layer_name": "model.layers.3.self_attn.attn"})()
-    metadata = type("Metadata", (), {"attn_state": AscendAttentionState.DecodeOnly})()
+    metadata = types.SimpleNamespace(attn_state=AscendAttentionState.DecodeOnly, turboquant_slot_mapping=object())
     query = types.SimpleNamespace(device="npu")
 
     def run(attn_metadata, capturing):

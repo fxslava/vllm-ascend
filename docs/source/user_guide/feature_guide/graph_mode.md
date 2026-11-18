@@ -95,6 +95,18 @@ For the detailed meaning of `NONE`, `PIECEWISE`, `FULL`, `FULL_DECODE_ONLY`, and
 
 ### Attention backend compatibility
 
+TurboQuant supports `FULL_AND_PIECEWISE` and `FULL_DECODE_ONLY` for single-token decode when `TURBOQUANT_KERNEL_STAGES` includes `scatter,decode` (or `all`) and the scatter, fused decode, and decode tiling operators are registered. These operators require an `ascend950` build. `FULL_AND_PIECEWISE` captures both the decode cache writer and attention launch; prefill and mixed attention run outside the full graph. A request for `FULL` is narrowed to full decode capture because TurboQuant's prefill and mixed paths use host metadata.
+
+For example, with TurboQuant enabled and its kernels installed:
+
+```bash
+ENABLE_TURBOQUANT=1 TURBOQUANT_KERNEL_STAGES=scatter,decode \
+  vllm serve /path/to/model \
+  --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}'
+```
+
+If the required kernel stages or operators are unavailable, TurboQuant falls back to `PIECEWISE` with `VLLM_COMPILE`, or `NONE` without piecewise compilation. Speculative and multi-token decode are not supported by the TurboQuant decode tiling contract.
+
 Not all attention backends support all graph modes. vLLM checks attention backend compatibility during compatibility checks and, when possible, automatically adjusts `cudagraph_mode` to a more compatible mode instead of failing immediately. In practice, this means a requested full-graph mode may be narrowed to a mixed or piecewise mode, and if the backend cannot support graph execution at all, graph mode may be disabled.
 
 On Ascend, the current attention backend support levels are:
@@ -102,6 +114,7 @@ On Ascend, the current attention backend support levels are:
 | Attention backend | Declared support | Practical meaning |
 |---|---|---|
 | `attention_v1` | `ALWAYS` | Supports graph execution for mixed prefill/decode batches |
+| `turboquant_v1` | `UNIFORM_SINGLE_TOKEN_DECODE` with decode kernels; otherwise `NEVER` | Full capture covers single-token decode; prefill and mixed attention stay outside the full graph |
 | `context_parallel/attention_cp` | `ALWAYS` | Supports graph execution for mixed prefill/decode batches |
 | `mla_v1` | `UNIFORM_BATCH` | Graph execution is limited to uniform batches; full graph is more restricted |
 | `context_parallel/mla_cp` | `UNIFORM_BATCH` | Graph execution is limited to uniform batches; full graph is more restricted |

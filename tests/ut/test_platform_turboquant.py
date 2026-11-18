@@ -1,13 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Platform-time handling of ``ENABLE_TURBOQUANT=1``.
-
-The graph mode is the part worth a test: ``FULL_DECODE_ONLY`` is the platform's
-own default for a decode-heavy run, so without the fallback every TurboQuant
-run captures its attention layers, and the golden model cannot be captured
-(a torch op with no NPU kernel falls back to the host, and a host copy on a
-capturing stream fails with ``aclrtMemcpy`` 107030).
-"""
+"""TurboQuant full decode capture and emulator fallback configuration."""
 
 import os
 from types import SimpleNamespace
@@ -17,6 +10,14 @@ import pytest
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 
 from vllm_ascend.platform import _apply_turboquant_graph_mode
+
+
+@pytest.fixture(autouse=True)
+def decode_graph_support():
+    with patch(
+        "vllm_ascend.attention.turboquant_v1.turboquant_decode_graph_supported", return_value=False
+    ) as supported:
+        yield supported
 
 
 def _config(cudagraph_mode: CUDAGraphMode, mode: CompilationMode = CompilationMode.VLLM_COMPILE):
@@ -75,3 +76,27 @@ def test_check_and_update_config_applies_it_after_the_compilation_modes():
     clamp = source.index("_apply_turboquant_graph_mode(vllm_config)")
     setup = source.index("_setup_compile_backend(")
     assert update < clamp < setup
+
+
+@pytest.mark.parametrize("graph_mode", [CUDAGraphMode.FULL_DECODE_ONLY, CUDAGraphMode.FULL_AND_PIECEWISE])
+def test_kernel_decode_keeps_full_capture(decode_graph_support, graph_mode):
+    decode_graph_support.return_value = True
+    vllm_config = _config(graph_mode)
+    with _enabled("1"):
+        _apply_turboquant_graph_mode(vllm_config)
+    assert vllm_config.compilation_config.cudagraph_mode == graph_mode
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        (CompilationMode.VLLM_COMPILE, CUDAGraphMode.FULL_AND_PIECEWISE),
+        (CompilationMode.NONE, CUDAGraphMode.FULL_DECODE_ONLY),
+    ],
+)
+def test_full_mixed_capture_is_restricted_to_decode(decode_graph_support, mode, expected):
+    decode_graph_support.return_value = True
+    vllm_config = _config(CUDAGraphMode.FULL, mode)
+    with _enabled("1"):
+        _apply_turboquant_graph_mode(vllm_config)
+    assert vllm_config.compilation_config.cudagraph_mode == expected

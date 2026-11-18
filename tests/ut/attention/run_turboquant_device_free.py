@@ -42,6 +42,7 @@ DEVICE_FREE_TESTS = (
     "test_turboquant_kernel_cache_layout.py",
     "test_turboquant_layout.py",
     "test_turboquant_nz_ingress.py",
+    "test_turboquant_nz_cache.py",
     "test_turboquant_profile.py",
     "test_turboquant_host_staging.py",
     "test_turboquant_block_moves.py",
@@ -49,6 +50,7 @@ DEVICE_FREE_TESTS = (
 
 
 def main(argv: list[str]) -> int:
+    sys.path.insert(0, str(HERE.parents[2]))
     sys.path.insert(0, str(HERE))
 
     import stub_vllm
