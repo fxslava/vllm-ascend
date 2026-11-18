@@ -76,7 +76,8 @@ extern "C" void launch_turboquant_reshape_and_cache_bf16(
     const std::int32_t* slot_mapping, const float* pi_signs,
     const std::int32_t* tables, std::uint32_t num_tokens,
     std::uint32_t num_kv_heads, std::uint32_t head_size, std::uint32_t block_size,
-    std::uint32_t num_blocks, std::uint32_t tokens_per_core, float inv_sqrt_len);
+    std::uint32_t num_blocks, std::uint32_t tokens_per_core, float inv_sqrt_len,
+    std::uint32_t quant_mode);
 
 namespace prefill_rig {
 
@@ -218,7 +219,8 @@ int run(int slices, int strips_per_block)
         static_cast<std::uint32_t>(shape.head_size),
         static_cast<std::uint32_t>(shape.block_size),
         static_cast<std::uint32_t>(shape.num_blocks),
-        static_cast<std::uint32_t>(shape.block_size * strips_per_block), shape.inv_sqrt_len());
+        static_cast<std::uint32_t>(shape.block_size * strips_per_block), shape.inv_sqrt_len(),
+        /*quant_mode=*/0u);
     camodel::check(aclrtSynchronizeStream(session.stream), "aclrtSynchronizeStream");
 
     key_cache.download();
@@ -395,7 +397,7 @@ int run_main(int argc, char** argv)
 extern "C" void launch_turboquant_reshape_scatter_aiv(
     void*, std::uint32_t, std::uint16_t*, std::uint16_t*, std::int8_t*, std::int8_t*, float*,
     std::int32_t*, float*, std::int32_t*, std::uint32_t, std::uint32_t, std::uint32_t,
-    std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, float);
+    std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, float, std::uint32_t);
 
 namespace scatter_rig {
 
@@ -571,7 +573,8 @@ Outcome run_launch(camodel::Session& session, const Shape& shape, std::uint32_t 
         static_cast<std::uint32_t>(shape.num_kv_heads),
         static_cast<std::uint32_t>(shape.head_size),
         static_cast<std::uint32_t>(shape.block_size),
-        static_cast<std::uint32_t>(shape.num_blocks), item, 1u, shape.inv_sqrt_len());
+        static_cast<std::uint32_t>(shape.num_blocks), item, 1u, shape.inv_sqrt_len(),
+        /*quant_mode=*/0u);
     camodel::check(aclrtSynchronizeStream(session.stream), "aclrtSynchronizeStream");
 
     d_key_cache.download();
