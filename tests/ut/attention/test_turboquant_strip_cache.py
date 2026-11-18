@@ -32,6 +32,7 @@ import types
 import pytest
 import torch
 
+from tests.helpers.turboquant import make_activations, make_adapter, make_cache
 from vllm_ascend.attention.turboquant_layout import (
     TURBOQUANT_KEY_PLANE,
     TURBOQUANT_VALUE_PLANE,
@@ -53,24 +54,15 @@ R = TURBOQUANT_STRIP_TOKENS
 
 
 def _adapter(layout):
-    return TurboQuantOpsAdapter(
-        TurboQuantOpsConfig(ops_namespace="turboquant_ops", kernel_stages=frozenset(), value_layout=layout)
-    )
+    return make_adapter(value_layout=layout)
 
 
 def _caches(block_size):
-    packed = (NUM_BLOCKS, block_size, NUM_KV_HEADS, turboquant_packed_bytes(HEAD_SIZE))
-    return (
-        torch.zeros(packed, dtype=torch.int8),
-        torch.zeros(packed, dtype=torch.int8),
-        torch.zeros(turboquant_scale_cache_shape(NUM_BLOCKS, block_size, NUM_KV_HEADS), dtype=torch.float32),
-    )
+    return make_cache(NUM_BLOCKS, block_size, NUM_KV_HEADS, HEAD_SIZE)
 
 
 def _acts(n, seed):
-    g = torch.Generator().manual_seed(seed)
-    shape = (n, NUM_KV_HEADS, HEAD_SIZE)
-    return torch.randn(shape, generator=g), torch.randn(shape, generator=g)
+    return make_activations(n, NUM_KV_HEADS, HEAD_SIZE, seed=seed)
 
 
 def _nibble(buf_bytes, idx):

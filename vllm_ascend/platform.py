@@ -632,9 +632,8 @@ class NPUPlatform(Platform):
         # 6.Update compilation / cudagraph modes (ascend_config -> vllm_config).
         _update_compilation_modes(vllm_config, ascend_config)
 
-        # The TurboQuant backend cannot be captured into a full graph while any
-        # stage runs the golden model; hold it to the modes where its attention
-        # launches stay eager.
+        # TurboQuant supports full decode capture with kernel ingress/decode;
+        # mixed and prefill attention must stay outside the full graph.
         _apply_turboquant_graph_mode(vllm_config)
 
         # 7.Recompute cudagraph sizes and setup compile backend (vllm_config).
@@ -1337,30 +1336,7 @@ def _validate_turboquant_config(vllm_config: VllmConfig) -> None:
 
 
 def _apply_turboquant_graph_mode(vllm_config: VllmConfig) -> None:
-    """Hold an ``ENABLE_TURBOQUANT=1`` run to a graph mode its attention survives.
-
-    Both of this backend's entry points go through
-    ``vllm::unified_attention_with_output``, a graph splitting op, so under
-    ``PIECEWISE`` the model around attention is captured and replayed while the
-    TurboQuant path is launched eagerly between the pieces. That needs nothing
-    from this function.
-
-    A *full* graph captures the attention layers themselves, and the golden
-    model is not capturable there -- by construction, not by accident. The
-    ingestion reads host-side ``seq_lens_list`` to size its own work, and the
-    codec is ordinary torch ops, any one of which may have no NPU kernel and
-    fall back to the CPU. A fallback is a device-to-host copy, and
-    ``aclrtMemcpy`` on a capturing stream fails with 107030 ("Stream during the
-    capture stage is not supported"). The known offenders in the codec are gone
-    (see ``_exp2_fp32``), but "no op in this emulator ever synchronises" is not
-    a property a PyTorch model can promise, so the mode stays out of reach
-    while any stage runs golden.
-
-    Declined, not refused: ``FULL_DECODE_ONLY`` is the platform's own default
-    for a decode-heavy run, so raising here would mean ``ENABLE_TURBOQUANT=1``
-    could not start without the user also naming a graph mode. Serving the mode
-    that does work, and saying so once, is the useful answer.
-    """
+    """Allow full decode graphs only when the TurboQuant kernel path is available."""
     from vllm_ascend.attention.turboquant_layout import turboquant_enabled
 
     if not turboquant_enabled():
@@ -1373,6 +1349,23 @@ def _apply_turboquant_graph_mode(vllm_config: VllmConfig) -> None:
     if not compilation_config.cudagraph_mode.has_full_cudagraphs():
         return
 
+    from vllm_ascend.attention.turboquant_v1 import turboquant_decode_graph_supported
+
+    if turboquant_decode_graph_supported():
+        if compilation_config.cudagraph_mode == CUDAGraphMode.FULL:
+            # FULL also captures prefill/mixed attention, whose host-side work
+            # is intentionally kept outside the graph in the hybrid mode.
+            compilation_config.cudagraph_mode = (
+                CUDAGraphMode.FULL_AND_PIECEWISE
+                if compilation_config.mode == CompilationMode.VLLM_COMPILE
+                else CUDAGraphMode.FULL_DECODE_ONLY
+            )
+            logger.warning(
+                "TurboQuant supports full graph capture for single-token decode only; using %s.",
+                compilation_config.cudagraph_mode.name,
+            )
+        return
+
     # PIECEWISE needs the piecewise compilation that only VLLM_COMPILE does;
     # without it there is nothing to split, so the honest fallback is no graph.
     if compilation_config.mode == CompilationMode.VLLM_COMPILE:
@@ -1380,8 +1373,8 @@ def _apply_turboquant_graph_mode(vllm_config: VllmConfig) -> None:
     else:
         downgraded = CUDAGraphMode.NONE
     logger.warning(
-        "The TurboQuant backend cannot be captured under %s, where the attention launches are "
-        "captured rather than run between the captured pieces. Falling back to %s.%s",
+        "TurboQuant full graph capture requires the scatter and decode kernel stages and registered "
+        "scatter, fused decode and decode tiling operators. Falling back from %s to %s.%s",
         compilation_config.cudagraph_mode.name,
         downgraded.name,
         " Attention is split out of the graph there; the rest of the model is still captured."

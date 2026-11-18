@@ -102,6 +102,9 @@ def install() -> None:
 
     backend.AttentionLayer = AttentionLayer
     backend.AttentionType = AttentionType
+    backend.AttentionCGSupport = enum.Enum(
+        "AttentionCGSupport", {"NEVER": 0, "UNIFORM_SINGLE_TOKEN_DECODE": 1, "UNIFORM_BATCH": 2, "ALWAYS": 3}
+    )
 
     _module("vllm.v1.attention.backends")
     registry = _module("vllm.v1.attention.backends.registry")

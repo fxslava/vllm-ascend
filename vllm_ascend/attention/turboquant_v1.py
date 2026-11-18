@@ -12,7 +12,7 @@ from typing import Any, Final
 import torch
 import torch_npu
 from vllm.logger import logger
-from vllm.v1.attention.backend import AttentionLayer, AttentionType
+from vllm.v1.attention.backend import AttentionCGSupport, AttentionLayer, AttentionType
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 
 from vllm_ascend import envs
@@ -522,6 +522,27 @@ def load_turboquant_extension() -> bool:
         _TURBOQUANT_EXTENSION_LOADED = False
         logger.debug("TurboQuant: vllm_ascend.vllm_ascend_C did not import (%s).", exc)
     return _TURBOQUANT_EXTENSION_LOADED
+
+
+def turboquant_decode_graph_supported() -> bool:
+    """Full decode capture requires kernel ingress, decode and host tiling.
+
+    Prefill and mixed batches still use host metadata and must remain outside
+    the full graph. Check registrations as well as stage selection: a missing
+    kernel otherwise silently selects the uncapturable emulator.
+    """
+    config = TurboQuantOpsConfig.from_env()
+    if not all(config.enables(stage) for stage in (TurboQuantKernelStage.SCATTER, TurboQuantKernelStage.DECODE)):
+        return False
+    load_turboquant_extension()
+    return all(
+        _is_op_registered(config.ops_namespace, name)
+        for name in (
+            TURBOQUANT_OP_RESHAPE_SCATTER,
+            TURBOQUANT_OP_FUSED_DECODE,
+            TURBOQUANT_OP_BUILD_DECODE_TILING,
+        )
+    )
 
 
 class TurboQuantOpsAdapter:
@@ -1610,6 +1631,7 @@ class AscendTurboQuantMetadata(AscendMetadata):
     turboquant_workspace: torch.Tensor = None
     turboquant_query_rot: torch.Tensor = None
     turboquant_num_tokens: int = 0
+    turboquant_slot_mapping: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -1624,6 +1646,12 @@ class TurboQuantQueryLayout:
 
 class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
     metadata_cls: type[AscendMetadata] = AscendTurboQuantMetadata
+
+    @classmethod
+    def get_cudagraph_support(cls, vllm_config: Any, kv_cache_spec: Any) -> AttentionCGSupport:
+        if turboquant_decode_graph_supported():
+            return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+        return AttentionCGSupport.NEVER
 
     def __init__(
         self,
@@ -1641,8 +1669,10 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
         self._num_heads = int(vllm_config.model_config.get_num_attention_heads(vllm_config.parallel_config))
         self._num_splits = TURBOQUANT_DECODE_SPLITS
         self._heads_per_task = turboquant_decode_heads_per_task(self._num_heads, self._num_kv_heads)
+        self._ops_namespace = TurboQuantOpsConfig.from_env().ops_namespace
 
         self._context_lens = torch.zeros(self._max_num_reqs, dtype=torch.int32, device=device)
+        self._decode_slot_mapping = torch.full((self._max_num_reqs,), -1, dtype=torch.int32, device=device)
         self._tiling = torch.zeros(
             turboquant_tiling_upper_bound_words(self._max_num_reqs, TURBOQUANT_DECODE_MAX_SPLITS),
             dtype=torch.int32,
@@ -1690,12 +1720,26 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
         tokens = int(context_lens.numel())
         self._reject_multi_token_steps(common_attn_metadata, tokens)
         self._refresh_tiling(host, tokens)
+        slot_mapping = None
+        if getattr(common_attn_metadata, "attn_state", None) == AscendAttentionState.DecodeOnly:
+            source = common_attn_metadata.slot_mapping
+            if source.numel() < tokens:
+                raise RuntimeError("TurboQuant decode slot mapping does not cover the padded capture extent")
+            live_tokens = int(common_attn_metadata.num_actual_tokens)
+            if not 0 <= live_tokens <= tokens:
+                raise RuntimeError("TurboQuant live decode token count exceeds the padded capture extent")
+            # Copy/cast before replay into storage shared by every layer and
+            # capture size. Padded rows must never write to the cache.
+            slot_mapping = self._decode_slot_mapping[:tokens]
+            slot_mapping.copy_(source[:tokens])
+            slot_mapping[live_tokens:].fill_(-1)
         return {
             "turboquant_context_lens": context_lens,
             "turboquant_tiling": self._tiling,
             "turboquant_workspace": self._workspace,
             "turboquant_query_rot": self._query_rot,
             "turboquant_num_tokens": tokens,
+            "turboquant_slot_mapping": slot_mapping,
         }
 
     def _validate_slot_mapping(
@@ -1850,7 +1894,7 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
         return ring[index]
 
     def _refresh_tiling(self, host_context_lens: torch.Tensor, tokens: int) -> None:
-        namespace = getattr(torch.ops, TURBOQUANT_DEFAULT_NAMESPACE, None)
+        namespace = getattr(torch.ops, self._ops_namespace, None)
         build_tiling = getattr(namespace, TURBOQUANT_OP_BUILD_DECODE_TILING, None) if namespace else None
         if build_tiling is None:
             return
@@ -2166,6 +2210,11 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
             return query, key, value, output
 
         num_actual_tokens = attn_metadata.num_actual_tokens
+        decode_slots = getattr(attn_metadata, "turboquant_slot_mapping", None)
+        if getattr(attn_metadata, "attn_state", None) == AscendAttentionState.DecodeOnly and decode_slots is not None:
+            # The captured writer, like attention, must cover the padded extent.
+            # Live request counts change between replays; -1 slots mask padding.
+            num_actual_tokens = self._decode_num_tokens(attn_metadata)
         if num_actual_tokens == 0:
             return query, key, value, output
 
@@ -2206,6 +2255,10 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
         num_actual_tokens: int,
         phase: TurboQuantIngestionPhase,
     ) -> tuple[torch.Tensor, TurboQuantStripPlan | None]:
+        if phase is TurboQuantIngestionPhase.DECODE:
+            decode_slots = getattr(attn_metadata, "turboquant_slot_mapping", None)
+            if decode_slots is not None:
+                return decode_slots[:num_actual_tokens], None
         cached = getattr(attn_metadata, "_turboquant_ingestion_cache", None)
         if cached is not None and cached[0] is attn_metadata.slot_mapping:
             return cached[1], cached[2]
@@ -2218,6 +2271,8 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
 
     @staticmethod
     def _ingestion_phase(attn_metadata: AscendMetadata, num_actual_tokens: int) -> TurboQuantIngestionPhase:
+        if getattr(attn_metadata, "attn_state", None) == AscendAttentionState.DecodeOnly:
+            return TurboQuantIngestionPhase.DECODE
         seq_lens_list = getattr(attn_metadata, "seq_lens_list", None)
         num_requests = len(seq_lens_list) if seq_lens_list is not None else 0
         if num_actual_tokens > num_requests:
@@ -2536,6 +2591,17 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if attn_metadata is not None:
+            if _stream_is_capturing():
+                if (
+                    attn_metadata.attn_state != AscendAttentionState.DecodeOnly
+                    or not self.adapter._has_kernel(TURBOQUANT_OP_RESHAPE_SCATTER)
+                    or not self.adapter._has_kernel(TURBOQUANT_OP_FUSED_DECODE)
+                ):
+                    raise RuntimeError("TurboQuant full graph capture requires kernel-only single-token decode")
+                if self.emulator is None:
+                    raise RuntimeError("TurboQuant constants must be warmed up before graph capture")
+                if getattr(attn_metadata, "turboquant_slot_mapping", None) is None:
+                    raise RuntimeError("TurboQuant decode slot mapping must be prepared before graph capture")
             self._ensure_statics(layer, query.device)
         call: dict[str, Any] = {
             "layer": layer,
