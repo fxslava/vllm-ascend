@@ -948,14 +948,11 @@ def test_c4_an_ordinary_decode_step_is_not_refused(per_req: Any, monkeypatch: py
     assert extra["turboquant_num_tokens"] == 2
 
 
-def test_c5_the_staging_is_a_ring_so_a_step_cannot_tear_the_previous_upload() -> None:
-    """Consecutive steps stage into different buffers; the third reuses the first.
+def test_context_staging_cycles_completed_slots() -> None:
+    """Completed CPU copies permit reuse when the staging ring wraps.
 
-    The upload is asynchronous, so it completes after the builder has returned
-    and the host has moved on to the next step -- which, with async scheduling,
-    overlaps this step's execution by design. A single staging buffer would be
-    rewritten under its own in-flight copy. Depth two is sufficient because the
-    whole of step N+1 is enqueued behind step N's copy on an in-order stream.
+    Live NPU uploads additionally require the slot's completion event. A busy
+    source is replaced rather than overwritten or waited on.
     """
     builder = _builder()
     common = types.SimpleNamespace(num_reqs=2)
@@ -1018,7 +1015,7 @@ def test_c5_the_real_staging_is_pinned_when_the_host_can_pin() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_p0_the_validate_env_cannot_reintroduce_a_golden_replay_or_a_dump(
+def test_p0_the_validate_env_cannot_reintroduce_a_reference_replay_or_a_dump(
     monkeypatch: pytest.MonkeyPatch, decode: dict[str, Any], tmp_path: Any
 ) -> None:
     """The old switch must be inert: one launch, no second golden pass, no files.
@@ -1752,24 +1749,10 @@ def test_c5_the_turboquant_surface_passes_no_literal_non_blocking() -> None:
 
 
 def test_c5_the_staging_ring_has_a_device_slot_per_host_slot() -> None:
-    """The invariant that makes the ring mean anything.
+    """Each host slot covers one persistent, stream-ordered device buffer.
 
-    A ring of host buffers feeding one device buffer still serialises on that
-    device buffer, so the ring only helps because the *host* writes are what
-    race the in-flight copy -- the device side is a single persistent buffer the
-    stream orders for us. This records which of the two it is, because the
-    distinction is the whole argument for depth two:
-
-      - host staging: a ring, because the host writes it ahead of the stream;
-      - device buffer: one, because every write to it is stream-ordered behind
-        the previous step's reads of it.
-
-    If that ever stops holding -- a second stream, or out-of-order submission --
-    depth two stops being sufficient, and the fix is the pattern at
-    ``ops/triton/compressor/compressor_triton.py:394-406``: an ``npu.Event``
-    recorded per slot and synchronised before the slot is reused, which does not
-    rest on a stream-ordering argument at all. That is deliberately not what
-    this does, because it needs a device to exercise and cannot be checked here.
+    Ring depth alone does not protect host writes. Completion events separately
+    govern whether a host slot can be reused for another asynchronous upload.
     """
     builder = _builder()
     assert len(builder._context_lens_host_ring) == TURBOQUANT_STAGING_SLOTS

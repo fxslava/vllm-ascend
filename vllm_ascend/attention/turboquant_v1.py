@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import math
 import os
 from collections.abc import Callable, Sequence
@@ -36,58 +37,88 @@ from vllm_ascend.attention.utils import notify_kv_cache_written
 TURBOQUANT_PI_SEED: Final[int] = 0x5F3759DF
 
 _LCG_MULTIPLIER: Final[int] = 1664525
+
 _LCG_INCREMENT: Final[int] = 1013904223
+
 _LCG_MODULUS_MASK: Final[int] = 0xFFFFFFFF
+
 _LCG_SIGN_BIT: Final[int] = 16
 
 TURBOQUANT_NIBBLE_MIN: Final[int] = -8
+
 TURBOQUANT_NIBBLE_MAX: Final[int] = 7
+
 TURBOQUANT_NIBBLE_MASK: Final[int] = 0xF
+
 TURBOQUANT_NIBBLE_LEVELS: Final[int] = 16
 
 TURBOQUANT_STRIP_TOKENS: Final[int] = 16
 
 TURBOQUANT_NZ_TILE_ROWS: Final[int] = 64
+
 TURBOQUANT_NZ_OPERAND_C0: Final[int] = 32
+
 TURBOQUANT_NZ_FP32_PER_BLOCK: Final[int] = 8
 
 TURBOQUANT_HEADROOM_BITS: Final[int] = 2
 
-# The KV4_FP8 Lloyd-Max codebook (TurboQuantLloydMaxTraits in
-# csrc/attention/turboquant/op_kernel/common/turboquant_mode.h): Max's 16
-# levels of a unit Gaussian, each rounded to nearest fp8 e4m3, and the exact
-# midpoints between the rounded centroids. On this codebook a packed nibble n
-# is bin n + 8 and reconstructs as centroid * stored_scale, with the stored
-# scale the row's RMS (times inv_sqrt_len) instead of the absmax power of two
-# -- the thresholds move with the levels, so the writers and the decode agree
-# on the same nearest-neighbour partition.
 TURBOQUANT_LM_CENTROIDS: Final[tuple[float, ...]] = (
-    -2.75, -2.0, -1.625, -1.25, -0.9375, -0.6875, -0.375, -0.125,
-    +0.125, +0.375, +0.6875, +0.9375, +1.25, +1.625, +2.0, +2.75,
+    -2.75,
+    -2.0,
+    -1.625,
+    -1.25,
+    -0.9375,
+    -0.6875,
+    -0.375,
+    -0.125,
+    +0.125,
+    +0.375,
+    +0.6875,
+    +0.9375,
+    +1.25,
+    +1.625,
+    +2.0,
+    +2.75,
 )
+
 TURBOQUANT_LM_THRESHOLDS: Final[tuple[float, ...]] = (
-    -2.375, -1.8125, -1.4375, -1.09375, -0.8125, -0.53125, -0.25, 0.0,
-    +0.25, +0.53125, +0.8125, +1.09375, +1.4375, +1.8125, +2.375,
+    -2.375,
+    -1.8125,
+    -1.4375,
+    -1.09375,
+    -0.8125,
+    -0.53125,
+    -0.25,
+    0.0,
+    +0.25,
+    +0.53125,
+    +0.8125,
+    +1.09375,
+    +1.4375,
+    +1.8125,
+    +2.375,
 )
-# Guards Sqrt's non-positive-input contract on a zero row, as in the writers.
+
 TURBOQUANT_LM_EPS: Final[float] = 1e-20
 
-# The codebook the writers quantise on and the fused decode reconstructs with
-# (VLLM_ASCEND_TURBOQUANT_QUANT_MODE): 0 the uniform grid, 1 Lloyd-Max. The
-# decode names the same choice as a DecodeUnpack value: 0 kNative, 3
-# kLloydMaxLut.
 TURBOQUANT_QUANT_MODE: Final[int] = int(envs.VLLM_ASCEND_TURBOQUANT_QUANT_MODE)
+
 TURBOQUANT_DECODE_UNPACK: Final[int] = 3 if TURBOQUANT_QUANT_MODE == 1 else 0
 
 _FP32_MANTISSA_BITS: Final[int] = 23
+
 _FP32_EXPONENT_MASK: Final[int] = 0xFF
+
 _FP32_EXPONENT_BIAS: Final[int] = 127
+
 _FP32_MAX_BIASED_EXPONENT: Final[int] = 254
 
 TURBOQUANT_STAGES_ENV: Final[str] = "TURBOQUANT_KERNEL_STAGES"
+
 TURBOQUANT_NAMESPACE_ENV: Final[str] = "TURBOQUANT_OPS_NAMESPACE"
 
 TURBOQUANT_DEFAULT_NAMESPACE: Final[str] = "turboquant_ops"
+
 
 class TurboQuantKernelStage(str, Enum):
     ROTATE = "rotate"
@@ -98,14 +129,17 @@ class TurboQuantKernelStage(str, Enum):
     RESHAPE_AND_CACHE = "reshape_and_cache"
     DECODE = "decode"
 
+
 class TurboQuantValueLayout(str, Enum):
     TOKEN_MAJOR = "token_major"
     CHANNEL_MAJOR = "channel_major"
     NZ_TILED = "nz_tiled"
 
+
 class TurboQuantIngestionPhase(str, Enum):
     PREFILL = "prefill"
     DECODE = "decode"
+
 
 @dataclass(frozen=True)
 class TurboQuantOpsConfig:
@@ -115,16 +149,16 @@ class TurboQuantOpsConfig:
 
     @classmethod
     def from_env(cls) -> TurboQuantOpsConfig:
-        raw = os.getenv(TURBOQUANT_STAGES_ENV, "none").strip().lower()
-        if raw in ("", "none", "0", "off"):
-            stages: frozenset[TurboQuantKernelStage] = frozenset()
-        elif raw in ("all", "1", "on"):
-            stages = frozenset(TurboQuantKernelStage)
+        stage_selection = os.getenv(TURBOQUANT_STAGES_ENV, "none").strip().lower()
+        if stage_selection in ("", "none", "0", "off"):
+            kernel_stages: frozenset[TurboQuantKernelStage] = frozenset()
+        elif stage_selection in ("all", "1", "on"):
+            kernel_stages = frozenset(TurboQuantKernelStage)
         else:
-            stages = cls._parse_stages(raw)
+            kernel_stages = cls._parse_stages(stage_selection)
         return cls(
             ops_namespace=os.getenv(TURBOQUANT_NAMESPACE_ENV, TURBOQUANT_DEFAULT_NAMESPACE),
-            kernel_stages=stages,
+            kernel_stages=kernel_stages,
         )
 
     @staticmethod
@@ -146,9 +180,11 @@ class TurboQuantOpsConfig:
     def enables(self, stage: TurboQuantKernelStage) -> bool:
         return stage in self.kernel_stages
 
+
 def _exp2_fp32(exponent: torch.Tensor) -> torch.Tensor:
     biased = torch.clamp(exponent.to(torch.int32) + _FP32_EXPONENT_BIAS, 1, _FP32_MAX_BIASED_EXPONENT)
     return (biased << _FP32_MANTISSA_BITS).contiguous().view(torch.float32)
+
 
 def _sylvester_hadamard(order: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     if order <= 0 or order & (order - 1):
@@ -160,6 +196,7 @@ def _sylvester_hadamard(order: int, device: torch.device, dtype: torch.dtype) ->
         parity = parity ^ ((common >> bit) & 1)
     return torch.where(parity.bool(), -1.0, 1.0).to(dtype)
 
+
 def turboquant_pi_signs(head_size: int, device: torch.device) -> torch.Tensor:
     state = (TURBOQUANT_PI_SEED + head_size) & _LCG_MODULUS_MASK
     bits: list[float] = []
@@ -167,6 +204,7 @@ def turboquant_pi_signs(head_size: int, device: torch.device) -> torch.Tensor:
         state = (state * _LCG_MULTIPLIER + _LCG_INCREMENT) & _LCG_MODULUS_MASK
         bits.append(1.0 if (state >> _LCG_SIGN_BIT) & 1 else -1.0)
     return torch.tensor(bits, dtype=torch.float32, device=device)
+
 
 class TurboQuantEmulator:
     def __init__(
@@ -244,68 +282,51 @@ class TurboQuantEmulator:
 
     @staticmethod
     def _lloyd_max_sumsq(row: torch.Tensor, fold: str) -> torch.Tensor:
-        """One rotated row's sum of squares, in a writer's own fp32 fold order.
+        """Match the key butterfly or value pairwise reduction's FP32 rounding."""
+        squared_values = (row * row).to(torch.float32).clone()
+        num_channels = squared_values.numel()
 
-        ``fold="key"`` is the prefill key plane's register butterfly (the four
-        64-lane quarters folded in sequence, then six XOR rounds at strides
-        1, 2, 4, 8, 16, 32 -- the scatter writer's tree); ``fold="value"`` the
-        prefill value plane (pairwise halves throughout); ``fold="butterfly"``
-        is an alias of the key tree. The trees round differently, and a cache
-        written by one and checked against another would flip an occasional bin
-        near a threshold.
-        """
-        acc = (row * row).to(torch.float32).clone()
-        n = acc.numel()
-
-        def halves(acc: torch.Tensor, stop: int) -> torch.Tensor:
-            width = acc.numel()
+        def sum_pairwise_halves(squared_values: torch.Tensor, stop: int) -> torch.Tensor:
+            width = squared_values.numel()
             while width > stop:
                 width //= 2
-                acc = acc[:width] + acc[width : 2 * width]
-            return acc
+                squared_values = squared_values[:width] + squared_values[width : 2 * width]
+            return squared_values
 
         if fold == "value":
-            acc = halves(acc, 1)
+            squared_values = sum_pairwise_halves(squared_values, 1)
         elif fold in ("key", "butterfly"):
-            quarters = [acc[q * 64 : (q + 1) * 64] for q in range(n // 64)]
-            acc = ((quarters[0] + quarters[1]) + quarters[2]) + quarters[3]
+            quarters = [
+                squared_values[quarter_index * 64 : (quarter_index + 1) * 64]
+                for quarter_index in range(num_channels // 64)
+            ]
+            squared_values = ((quarters[0] + quarters[1]) + quarters[2]) + quarters[3]
             for stride in (1, 2, 4, 8, 16, 32):
-                prev = acc.clone()
-                idx = torch.arange(64) ^ stride
-                acc = prev + prev[idx]
+                previous_values = squared_values.clone()
+                butterfly_indices = torch.arange(64) ^ stride
+                squared_values = previous_values + previous_values[butterfly_indices]
         else:
             raise ValueError(f"unknown Lloyd-Max fold {fold!r}")
-        return acc[0]
+        return squared_values[0]
 
-    def quantize_lloyd_max(
-        self, rotated: torch.Tensor, fold: str = "key"
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Dynamic per-row Lloyd-Max quantisation of a rotated panel.
-
-        ``rotated`` is ``[..., D]``; returns ``(codes, scales)`` with codes INT8
-        bin indices in ``[-8, 7]`` and one fp32 scale per row:
-        ``sigma_e = sqrt(sumsq + eps) * inv_sqrt_len`` (the row's RMS),
-        ``u = y * (-1 / sigma_e)``, and a bin counts the codebook thresholds
-        ``u`` exceeds -- the writers' own fp32 sequence, so the result is
-        bit-comparable against them when ``fold`` names the writer's tree.
-        """
-        y = rotated.to(torch.float32)
-        thresholds = torch.tensor(TURBOQUANT_LM_THRESHOLDS, dtype=torch.float32, device=y.device)
-        flat = y.reshape(-1, y.shape[-1])
+    def quantize_lloyd_max(self, rotated: torch.Tensor, fold: str = "key") -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize rotated rows with the selected writer's Lloyd-Max reduction."""
+        rotated_fp32 = rotated.to(torch.float32)
+        thresholds = torch.tensor(TURBOQUANT_LM_THRESHOLDS, dtype=torch.float32, device=rotated_fp32.device)
+        flat = rotated_fp32.reshape(-1, rotated_fp32.shape[-1])
         codes = torch.empty_like(flat, dtype=torch.int8)
-        scales = torch.empty(flat.shape[0], dtype=torch.float32, device=y.device)
-        for r in range(flat.shape[0]):
-            row = flat[r]
-            sumsq = self._lloyd_max_sumsq(row, fold)
-            sigma_e = torch.sqrt(sumsq + TURBOQUANT_LM_EPS) * self.inv_sqrt_len
-            u = row * (-1.0 / sigma_e)
-            # The writers count one FP32 Adds per threshold and its sign bit:
-            # bin += (threshold + u) < 0, initialised at -8.
-            margins = thresholds.unsqueeze(0) + u.unsqueeze(-1)
+        scales = torch.empty(flat.shape[0], dtype=torch.float32, device=rotated_fp32.device)
+        for row_index in range(flat.shape[0]):
+            row = flat[row_index]
+            sum_of_squares = self._lloyd_max_sumsq(row, fold)
+            row_rms = torch.sqrt(sum_of_squares + TURBOQUANT_LM_EPS) * self.inv_sqrt_len
+            negative_normalized_row = row * (-1.0 / row_rms)
+
+            margins = thresholds.unsqueeze(0) + negative_normalized_row.unsqueeze(-1)
             bins = (margins < 0).sum(dim=-1).to(torch.int32) - 8
-            codes[r] = bins.to(torch.int8)
-            scales[r] = sigma_e * self.inv_sqrt_len
-        return codes.reshape(y.shape), scales
+            codes[row_index] = bins.to(torch.int8)
+            scales[row_index] = row_rms * self.inv_sqrt_len
+        return codes.reshape(rotated_fp32.shape), scales
 
     def dequantize_lloyd_max(self, codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
         """``centroid[codes + 8] * scales`` in fp32: the codebook reconstruction."""
@@ -337,8 +358,11 @@ class TurboQuantEmulator:
     def decode(self, packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
         return self.inverse_rotate(self.dequantize(self.unpack(packed), scales))
 
+
 TURBOQUANT_STAGE_ROTATED_BASIS: Final[int] = 0
+
 TURBOQUANT_STAGE_UNROTATED: Final[int] = 1
+
 TURBOQUANT_STAGE_GATED: Final[int] = 2
 
 TURBOQUANT_H16_ORDER: Final[int] = 16
@@ -347,8 +371,6 @@ TURBOQUANT_TABLE_DTYPE: Final[torch.dtype] = torch.bfloat16
 
 TURBOQUANT_KERNEL_HEAD_SIZE: Final[int] = 256
 
-# The runner expands larger allocator pages into these kernel pages in both
-# the block table and the three cache-plane views.
 TURBOQUANT_KERNEL_BLOCK_SIZE: Final[int] = 128
 
 TURBOQUANT_KERNEL_KV_HEADS: Final[int] = 4
@@ -358,12 +380,19 @@ TURBOQUANT_DECODE_MAX_KV_HEADS: Final[int] = 4
 TURBOQUANT_KERNEL_DTYPE: Final[torch.dtype] = torch.bfloat16
 
 TURBOQUANT_OP_ROTATE: Final[str] = "npu_turboquant_rotate"
+
 TURBOQUANT_OP_QUANTIZE_PACK: Final[str] = "npu_turboquant_quantize_pack"
+
 TURBOQUANT_OP_UNPACK_DEQUANT: Final[str] = "npu_turboquant_unpack_dequant"
+
 TURBOQUANT_OP_RESHAPE_AND_CACHE: Final[str] = "npu_turboquant_reshape_and_cache_a8"
+
 TURBOQUANT_OP_RESHAPE_SCATTER: Final[str] = "npu_turboquant_reshape_scatter_aiv"
+
 TURBOQUANT_OP_GATHER_PAGES: Final[str] = "npu_turboquant_gather_pages"
+
 TURBOQUANT_OP_FUSED_DECODE: Final[str] = "npu_turboquant_fused_decode"
+
 TURBOQUANT_OP_BUILD_DECODE_TILING: Final[str] = "npu_turboquant_build_decode_tiling"
 
 TURBOQUANT_KERNEL_OPS: Final[dict[str, TurboQuantKernelStage]] = {
@@ -381,9 +410,11 @@ TURBOQUANT_DECODE_SPLITS: Final[int] = 8
 TURBOQUANT_DECODE_MAX_HEADS_PER_TASK: Final[int] = 16
 
 TURBOQUANT_DECODE_TILING_WORDS: Final[int] = 16
+
 TURBOQUANT_DECODE_DISPATCH_WORDS: Final[int] = 8
 
 TURBOQUANT_DECODE_MAX_GRID: Final[int] = 32
+
 TURBOQUANT_DECODE_MAX_SPLITS: Final[int] = 8
 
 TURBOQUANT_PARTIAL_TAIL: Final[int] = 16
@@ -397,17 +428,22 @@ def turboquant_decode_heads_per_task(num_heads: int, num_kv_heads: int) -> int:
     group_heads = num_heads // num_kv_heads if num_kv_heads else num_heads
     return min(TURBOQUANT_DECODE_MAX_HEADS_PER_TASK, max(group_heads, 1))
 
+
 def turboquant_decode_tiling_words(tokens: int, num_splits: int, grid: int) -> int:
     return tokens * num_splits * TURBOQUANT_DECODE_TILING_WORDS + grid * TURBOQUANT_DECODE_DISPATCH_WORDS
+
 
 def turboquant_tiling_upper_bound_words(max_num_reqs: int, max_splits: int) -> int:
     return turboquant_decode_tiling_words(max_num_reqs, max_splits, TURBOQUANT_DECODE_MAX_GRID)
 
+
 def turboquant_decode_workspace_floats(tokens: int, num_heads: int, head_size: int, num_splits: int) -> int:
     return tokens * num_heads * num_splits * (head_size + TURBOQUANT_PARTIAL_TAIL)
 
+
 def turboquant_decode_query_rot_floats(tokens: int, num_heads: int, head_size: int) -> int:
     return tokens * num_heads * head_size
+
 
 TURBOQUANT_REGISTERED_OPS: Final[tuple[str, ...]] = (
     TURBOQUANT_OP_RESHAPE_AND_CACHE,
@@ -419,6 +455,7 @@ TURBOQUANT_REGISTERED_OPS: Final[tuple[str, ...]] = (
 _TURBOQUANT_EXTENSION_LOADED: bool | None = None
 
 _TURBOQUANT_TRACE_ENABLED: Final[bool] = envs.VLLM_ASCEND_TURBOQUANT_TRACE
+
 
 def _trace_turboquant_dispatch(
     op_name: str,
@@ -451,6 +488,7 @@ def _trace_turboquant_dispatch(
         tensor_layouts,
     )
 
+
 def _is_op_registered(namespace: str, op_name: str) -> bool:
     try:
         return bool(torch._C._dispatch_has_kernel(f"{namespace}::{op_name}"))
@@ -460,6 +498,7 @@ def _is_op_registered(namespace: str, op_name: str) -> bool:
         except (AttributeError, RuntimeError):
             return False
         return True
+
 
 def load_turboquant_extension() -> bool:
     global _TURBOQUANT_EXTENSION_LOADED
@@ -475,13 +514,14 @@ def load_turboquant_extension() -> bool:
         logger.debug("TurboQuant: bootstrap_custom_op_env is unavailable (%s); importing anyway.", exc)
 
     try:
-        import vllm_ascend.vllm_ascend_C  # noqa: F401
+        importlib.import_module("vllm_ascend.vllm_ascend_C")
 
         _TURBOQUANT_EXTENSION_LOADED = True
     except (ImportError, OSError) as exc:
         _TURBOQUANT_EXTENSION_LOADED = False
         logger.debug("TurboQuant: vllm_ascend.vllm_ascend_C did not import (%s).", exc)
     return _TURBOQUANT_EXTENSION_LOADED
+
 
 class TurboQuantOpsAdapter:
     def __init__(
@@ -573,7 +613,7 @@ class TurboQuantOpsAdapter:
                 inv_sqrt_len=1.0,
             )
         _trace_turboquant_dispatch(TURBOQUANT_OP_ROTATE, False, x=x)
-        return self._golden_rotate(x, emulator)
+        return self._reference_rotate(x, emulator)
 
     def inverse_rotate(self, y: torch.Tensor, emulator: TurboQuantEmulator) -> torch.Tensor:
         if self._has_kernel(TURBOQUANT_OP_ROTATE):
@@ -587,7 +627,7 @@ class TurboQuantOpsAdapter:
                 inv_sqrt_len=emulator.inv_sqrt_len,
             )
         _trace_turboquant_dispatch(TURBOQUANT_OP_ROTATE, False, y=y)
-        return self._golden_inverse_rotate(y, emulator)
+        return self._reference_inverse_rotate(y, emulator)
 
     def _kernel_rotate(
         self,
@@ -600,10 +640,10 @@ class TurboQuantOpsAdapter:
     ) -> torch.Tensor:
         return self._require_kernel(TURBOQUANT_OP_ROTATE)(x, pi_signs, rot_tables, h16, output_stage, inv_sqrt_len)
 
-    def _golden_rotate(self, x: torch.Tensor, emulator: TurboQuantEmulator) -> torch.Tensor:
+    def _reference_rotate(self, x: torch.Tensor, emulator: TurboQuantEmulator) -> torch.Tensor:
         return emulator.rotate(x)
 
-    def _golden_inverse_rotate(self, y: torch.Tensor, emulator: TurboQuantEmulator) -> torch.Tensor:
+    def _reference_inverse_rotate(self, y: torch.Tensor, emulator: TurboQuantEmulator) -> torch.Tensor:
         return emulator.inverse_rotate(y)
 
     def quantize_and_pack(
@@ -611,32 +651,34 @@ class TurboQuantOpsAdapter:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self._has_kernel(TURBOQUANT_OP_QUANTIZE_PACK):
             _trace_turboquant_dispatch(TURBOQUANT_OP_QUANTIZE_PACK, True, rotated=rotated)
-            return self._kernel_quantize_pack(rotated=rotated, inv_sqrt_len=emulator.inv_sqrt_len)
+            return self._kernel_quantize_and_pack(rotated=rotated, inv_sqrt_len=emulator.inv_sqrt_len)
         _trace_turboquant_dispatch(TURBOQUANT_OP_QUANTIZE_PACK, False, rotated=rotated)
-        return self._golden_quantize_pack(rotated, emulator)
+        return self._reference_quantize_and_pack(rotated, emulator)
 
     def unpack_and_dequantize(
         self, packed: torch.Tensor, scales: torch.Tensor, emulator: TurboQuantEmulator
     ) -> torch.Tensor:
         if self._has_kernel(TURBOQUANT_OP_UNPACK_DEQUANT):
             _trace_turboquant_dispatch(TURBOQUANT_OP_UNPACK_DEQUANT, True, packed=packed, scales=scales)
-            return self._kernel_unpack_dequant(packed=packed, scales=scales)
+            return self._kernel_unpack_and_dequantize(packed=packed, scales=scales)
         _trace_turboquant_dispatch(TURBOQUANT_OP_UNPACK_DEQUANT, False, packed=packed, scales=scales)
-        return self._golden_unpack_dequant(packed, scales, emulator)
+        return self._reference_unpack_and_dequantize(packed, scales, emulator)
 
-    def _kernel_quantize_pack(self, rotated: torch.Tensor, inv_sqrt_len: float) -> tuple[torch.Tensor, torch.Tensor]:
+    def _kernel_quantize_and_pack(
+        self, rotated: torch.Tensor, inv_sqrt_len: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         return self._require_kernel(TURBOQUANT_OP_QUANTIZE_PACK)(rotated, inv_sqrt_len)
 
-    def _kernel_unpack_dequant(self, packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    def _kernel_unpack_and_dequantize(self, packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
         return self._require_kernel(TURBOQUANT_OP_UNPACK_DEQUANT)(packed, scales)
 
-    def _golden_quantize_pack(
+    def _reference_quantize_and_pack(
         self, rotated: torch.Tensor, emulator: TurboQuantEmulator
     ) -> tuple[torch.Tensor, torch.Tensor]:
         codes, scales = emulator.quantize(rotated)
         return emulator.pack(codes), scales
 
-    def _golden_unpack_dequant(
+    def _reference_unpack_and_dequantize(
         self, packed: torch.Tensor, scales: torch.Tensor, emulator: TurboQuantEmulator
     ) -> torch.Tensor:
         if TURBOQUANT_QUANT_MODE == 1:
@@ -676,7 +718,9 @@ class TurboQuantOpsAdapter:
             scale_cache=scale_cache,
             slot_mapping=slot_mapping,
         )
-        self._golden_reshape_and_cache_prefill(key, value, key_cache, value_cache, scale_cache, slot_mapping, emulator)
+        self._reference_reshape_and_cache_prefill(
+            key, value, key_cache, value_cache, scale_cache, slot_mapping, emulator
+        )
 
     def _kernel_ingest_prefill(
         self,
@@ -694,7 +738,7 @@ class TurboQuantOpsAdapter:
         tables = _codec_tables(emulator)
 
         if plan.is_whole_batch:
-            self._kernel_reshape_and_cache_a8(
+            self._kernel_cache_prefill(
                 key=key,
                 value=value,
                 key_cache=key_cache,
@@ -708,7 +752,7 @@ class TurboQuantOpsAdapter:
             return
 
         for run in plan.runs:
-            self._kernel_reshape_and_cache_a8(
+            self._kernel_cache_prefill(
                 key=_strip_run_rows(key, run),
                 value=_strip_run_rows(value, run),
                 key_cache=key_cache,
@@ -732,7 +776,7 @@ class TurboQuantOpsAdapter:
                 emulator=emulator,
             )
 
-    def _kernel_reshape_and_cache_a8(
+    def _kernel_cache_prefill(
         self,
         key: torch.Tensor,
         value: torch.Tensor,
@@ -770,7 +814,7 @@ class TurboQuantOpsAdapter:
             quant_mode,
         )
 
-    def _golden_reshape_and_cache_prefill(
+    def _reference_reshape_and_cache_prefill(
         self,
         key: torch.Tensor,
         value: torch.Tensor,
@@ -780,11 +824,14 @@ class TurboQuantOpsAdapter:
         slot_mapping: torch.Tensor,
         emulator: TurboQuantEmulator,
     ) -> None:
-        # The batch writer folds the key plane's sum of squares in its register
-        # butterfly and the value plane's in pairwise halves; the Lloyd-Max bins
-        # a row lands in are a function of that tree's fp32 rounding.
         self._write_slots(
-            key, value, key_cache, value_cache, scale_cache, slot_mapping, emulator,
+            key,
+            value,
+            key_cache,
+            value_cache,
+            scale_cache,
+            slot_mapping,
+            emulator,
             lloyd_max_folds=("key", "value"),
         )
 
@@ -810,7 +857,7 @@ class TurboQuantOpsAdapter:
                 slot_mapping=slot_mapping,
                 pi_signs=emulator.pi_signs,
             )
-            self._kernel_reshape_scatter_aiv(
+            self._kernel_cache_decode(
                 key=key,
                 value=value,
                 key_cache=key_cache,
@@ -831,9 +878,9 @@ class TurboQuantOpsAdapter:
             scale_cache=scale_cache,
             slot_mapping=slot_mapping,
         )
-        self._golden_reshape_scatter_decode(key, value, key_cache, value_cache, scale_cache, slot_mapping, emulator)
+        self._reference_reshape_scatter_decode(key, value, key_cache, value_cache, scale_cache, slot_mapping, emulator)
 
-    def _kernel_reshape_scatter_aiv(
+    def _kernel_cache_decode(
         self,
         key: torch.Tensor,
         value: torch.Tensor,
@@ -857,7 +904,7 @@ class TurboQuantOpsAdapter:
             quant_mode,
         )
 
-    def _golden_reshape_scatter_decode(
+    def _reference_reshape_scatter_decode(
         self,
         key: torch.Tensor,
         value: torch.Tensor,
@@ -867,10 +914,14 @@ class TurboQuantOpsAdapter:
         slot_mapping: torch.Tensor,
         emulator: TurboQuantEmulator,
     ) -> None:
-        # The scatter writer folds both planes' sums of squares in its register
-        # butterfly, so both rows take the "key" tree.
         self._write_slots(
-            key, value, key_cache, value_cache, scale_cache, slot_mapping, emulator,
+            key,
+            value,
+            key_cache,
+            value_cache,
+            scale_cache,
+            slot_mapping,
+            emulator,
             lloyd_max_folds=("key", "key"),
         )
 
@@ -905,13 +956,13 @@ class TurboQuantOpsAdapter:
             return
 
         num_blocks = key_cache.shape[0]
-        upper = num_blocks * block_size
-        actual_max = int(slots.max())
-        if actual_max >= upper:
+        slot_capacity = num_blocks * block_size
+        max_slot = int(slots.max())
+        if max_slot >= slot_capacity:
             raise ValueError(
                 f"slot_mapping is out of range for the TurboQuant cache: expected slots in "
-                f"[0, {upper}) ({num_blocks} blocks x {block_size} tokens, from key_cache.shape="
-                f"{tuple(key_cache.shape)}), but the largest non-negative slot is {actual_max}."
+                f"[0, {slot_capacity}) ({num_blocks} blocks x {block_size} tokens, from key_cache.shape="
+                f"{tuple(key_cache.shape)}), but the largest non-negative slot is {max_slot}."
             )
 
         pages = torch.div(slots, block_size, rounding_mode="floor")
@@ -1071,10 +1122,10 @@ class TurboQuantOpsAdapter:
         )
         layout = self.value_layout()
         if layout is TurboQuantValueLayout.CHANNEL_MAJOR:
-            return self._golden_gather_pages_strip(key_cache, value_cache, scale_cache, block_tables)
+            return self._reference_gather_pages_strip(key_cache, value_cache, scale_cache, block_tables)
         if layout is TurboQuantValueLayout.NZ_TILED:
-            return self._golden_gather_pages_nz(key_cache, value_cache, scale_cache, block_tables)
-        return self._golden_gather_pages(key_cache, value_cache, scale_cache, block_tables)
+            return self._reference_gather_pages_nz(key_cache, value_cache, scale_cache, block_tables)
+        return self._reference_gather_pages(key_cache, value_cache, scale_cache, block_tables)
 
     @staticmethod
     def _validate_block_tables(block_tables: torch.Tensor, num_blocks: int) -> None:
@@ -1100,7 +1151,7 @@ class TurboQuantOpsAdapter:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return self._require_kernel(TURBOQUANT_OP_GATHER_PAGES)(key_cache, value_cache, scale_cache, block_tables)
 
-    def _golden_gather_pages(
+    def _reference_gather_pages(
         self,
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
@@ -1127,7 +1178,7 @@ class TurboQuantOpsAdapter:
             gathered_scales(TURBOQUANT_VALUE_PLANE),
         )
 
-    def _golden_gather_pages_strip(
+    def _reference_gather_pages_strip(
         self,
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
@@ -1165,7 +1216,7 @@ class TurboQuantOpsAdapter:
             gathered_scales(TURBOQUANT_VALUE_PLANE),
         )
 
-    def _golden_gather_pages_nz(
+    def _reference_gather_pages_nz(
         self,
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
@@ -1381,16 +1432,18 @@ class TurboQuantOpsAdapter:
         )
         return output
 
+
 @dataclass(frozen=True)
 class TurboQuantStripRun:
     start: int
     stop: int
     pad: int
 
+
 @dataclass(frozen=True)
 class TurboQuantStripPlan:
-    runs: tuple
-    waves: tuple
+    runs: tuple[TurboQuantStripRun, ...]
+    waves: tuple[tuple[int, ...], ...]
     num_tokens: int
 
     @property
@@ -1400,6 +1453,7 @@ class TurboQuantStripPlan:
     @property
     def num_launches(self) -> int:
         return len(self.runs) + len(self.waves)
+
 
 def turboquant_plan_strip_ingestion(
     slots: Sequence[int], block_size: int, strip: int = TURBOQUANT_STRIP_TOKENS
@@ -1464,7 +1518,8 @@ def turboquant_plan_strip_ingestion(
         num_tokens=num_tokens,
     )
 
-def _strip_scatter_waves(slots: Sequence[int], tokens: Sequence[int], strip: int) -> tuple:
+
+def _strip_scatter_waves(slots: Sequence[int], tokens: Sequence[int], strip: int) -> tuple[tuple[int, ...], ...]:
     waves: list[list[int]] = []
     depth: dict[int, int] = {}
     for token in tokens:
@@ -1479,11 +1534,13 @@ def _strip_scatter_waves(slots: Sequence[int], tokens: Sequence[int], strip: int
         waves[wave].append(token)
     return tuple(tuple(wave) for wave in waves)
 
+
 def _strip_run_rows(activations: torch.Tensor, run: TurboQuantStripRun) -> torch.Tensor:
     window = activations[run.start : run.stop]
     if not run.pad:
         return window
     return torch.cat((window, window[-1:].expand(run.pad, *window.shape[1:]))).contiguous()
+
 
 def _strip_run_slots(slot_mapping: torch.Tensor, run: TurboQuantStripRun) -> torch.Tensor:
     window = slot_mapping[run.start : run.stop]
@@ -1491,6 +1548,7 @@ def _strip_run_slots(slot_mapping: torch.Tensor, run: TurboQuantStripRun) -> tor
         return window
     pad = torch.arange(1, run.pad + 1, dtype=window.dtype, device=window.device) + window[-1]
     return torch.cat((window, pad)).contiguous()
+
 
 def _flat_slot_view(cache: torch.Tensor) -> torch.Tensor:
     if not cache.is_contiguous():
@@ -1500,6 +1558,7 @@ def _flat_slot_view(cache: torch.Tensor) -> torch.Tensor:
         )
     return cache.view(cache.shape[0] * cache.shape[1], *cache.shape[2:])
 
+
 def _require_contiguous(cache: torch.Tensor, name: str) -> torch.Tensor:
     if not cache.is_contiguous():
         raise RuntimeError(
@@ -1508,8 +1567,10 @@ def _require_contiguous(cache: torch.Tensor, name: str) -> torch.Tensor:
         )
     return cache
 
+
 def _codec_tables(emulator: TurboQuantEmulator) -> torch.Tensor:
     return emulator.codec_tables
+
 
 def _build_codec_tables(emulator: TurboQuantEmulator) -> torch.Tensor:
     device = emulator.device
@@ -1521,7 +1582,9 @@ def _build_codec_tables(emulator: TurboQuantEmulator) -> torch.Tensor:
         TURBOQUANT_TABLE_DTYPE
     )
 
+
 _H16_CACHE: dict[str, torch.Tensor] = {}
+
 
 def _h16_operand(device: torch.device) -> torch.Tensor:
     key = str(device)
@@ -1531,6 +1594,7 @@ def _h16_operand(device: torch.device) -> torch.Tensor:
         _H16_CACHE[key] = operand
     return operand
 
+
 @dataclass
 class AscendTurboQuantMetadata(AscendMetadata):
     turboquant_context_lens: torch.Tensor = None
@@ -1538,6 +1602,17 @@ class AscendTurboQuantMetadata(AscendMetadata):
     turboquant_workspace: torch.Tensor = None
     turboquant_query_rot: torch.Tensor = None
     turboquant_num_tokens: int = 0
+
+
+@dataclass(frozen=True)
+class TurboQuantQueryLayout:
+    request_indices: torch.Tensor
+    positions_in_request: torch.Tensor
+    query_lengths: torch.Tensor
+    query_lengths_list: list[int]
+    max_query_len: int
+    num_tokens: int
+
 
 class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
     metadata_cls: type[AscendMetadata] = AscendTurboQuantMetadata
@@ -1553,10 +1628,7 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
         self._max_num_reqs = int(vllm_config.scheduler_config.max_num_seqs)
         self._num_kv_heads = int(kv_cache_spec.num_kv_heads)
         self._head_size = int(kv_cache_spec.head_size)
-        # kv_cache_spec.block_size is the allocator granularity (e.g. 1024 for
-        # Qwen3.5 hybrid alignment). The runner splits those pages according to
-        # get_supported_kernel_block_sizes(), so descriptors must use the same
-        # 128-token granularity as the block table and key_cache.shape[1].
+
         self._block_size = TURBOQUANT_KERNEL_BLOCK_SIZE
         self._num_heads = int(vllm_config.model_config.get_num_attention_heads(vllm_config.parallel_config))
         self._num_splits = TURBOQUANT_DECODE_SPLITS
@@ -1587,6 +1659,7 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
         except (RuntimeError, NotImplementedError):
             self._staging_pinned = False
         self._context_lens_host_ring = staging
+        self._context_lens_upload_events: list[Any | None] = [None] * self._staging_slots
 
     def _build_backend_metadata(
         self,
@@ -1657,6 +1730,13 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
                     )
             host[live:padded] = 0
         self._context_lens[:padded].copy_(host[:padded], non_blocking=self._staging_pinned)
+        if self._staging_pinned and self._context_lens.device.type != "cpu":
+            index = (self._staging_step - 1) % self._staging_slots
+            event = self._context_lens_upload_events[index]
+            if event is None:
+                event = torch.npu.Event()
+                self._context_lens_upload_events[index] = event
+            event.record()
         return self._context_lens[:padded], host
 
     def _staging_slot(self) -> torch.Tensor:
@@ -1664,8 +1744,7 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
         ring = self._context_lens_host_ring
         assert slots == TURBOQUANT_STAGING_SLOTS, (
             f"the TurboQuant host staging ring has {slots} slots, but the asynchronous upload "
-            f"contract needs exactly {TURBOQUANT_STAGING_SLOTS}: two is the minimum depth that "
-            "lets a step overwrite slot N while step N-1's non-blocking copy is still in flight."
+            f"contract needs exactly {TURBOQUANT_STAGING_SLOTS} slots."
         )
         assert len(ring) == slots, (
             f"`_context_lens_host_ring` has {len(ring)} buffers but `_staging_slots` says "
@@ -1690,12 +1769,16 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
                 f"staging slot {position} is on device {slot.device!r}, expected a CPU tensor: "
                 "a device staging slot defeats the single host-to-device upload."
             )
+        events = getattr(self, "_context_lens_upload_events", None)
+        event = events[index] if events is not None else None
+        if event is not None and not event.query():
+            ring[index] = torch.empty_like(ring[index], pin_memory=self._staging_pinned)
         return ring[index]
 
     def _refresh_tiling(self, host_context_lens: torch.Tensor, tokens: int) -> None:
         namespace = getattr(torch.ops, TURBOQUANT_DEFAULT_NAMESPACE, None)
-        entry = getattr(namespace, TURBOQUANT_OP_BUILD_DECODE_TILING, None) if namespace else None
-        if entry is None:
+        build_tiling = getattr(namespace, TURBOQUANT_OP_BUILD_DECODE_TILING, None) if namespace else None
+        if build_tiling is None:
             return
         if self._block_size % 64 or self._block_size & (self._block_size - 1):
             raise RuntimeError(
@@ -1711,7 +1794,7 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
             context_lens=host_context_lens[:tokens],
             tiling=self._tiling,
         )
-        entry(
+        build_tiling(
             host_context_lens[:tokens],
             self._tiling,
             self._num_heads,
@@ -1722,6 +1805,7 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
             self._num_splits,
             self._heads_per_task,
         )
+
 
 @register_backend(AttentionBackendEnum.TURBOQUANT)
 class AscendTurboQuantBackend(AscendAttentionBackend):
@@ -1793,6 +1877,7 @@ class AscendTurboQuantBackend(AscendAttentionBackend):
                 else:
                     cache[dst_indices] = cache[src_indices]
 
+
 TURBOQUANT_PROFILE_ENV: Final[str] = "TURBOQUANT_PROFILE"
 
 _PROFILE_TRUTHY: Final[frozenset[str]] = frozenset({"1", "true", "yes", "on"})
@@ -1804,15 +1889,19 @@ TURBOQUANT_PROFILE_NOTICE: Final[str] = (
     "Traces are being dumped to %s for offline analysis in Ascend Insight or chrome://tracing."
 )
 
+
 def turboquant_profile_enabled() -> bool:
     return os.getenv(TURBOQUANT_PROFILE_ENV, "0").strip().lower() in _PROFILE_TRUTHY
+
 
 def _stream_is_capturing() -> bool:
     with suppress(AttributeError, RuntimeError):
         return bool(torch.npu.is_current_stream_capturing())
     return False
 
+
 TURBOQUANT_FIA_VERSION_ENV: Final[str] = "TURBOQUANT_FIA_VERSION"
+
 
 class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
     def __init__(
@@ -1888,40 +1977,40 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
             TurboQuantKernelStage.RESHAPE_AND_CACHE,
             TurboQuantKernelStage.SCATTER,
         )
-        staged_writers = [stage for stage in writers if config.enables(stage)]
-        decode_staged = config.enables(TurboQuantKernelStage.DECODE)
-        if not staged_writers and not decode_staged:
+        enabled_writers = [stage for stage in writers if config.enables(stage)]
+        decode_enabled = config.enables(TurboQuantKernelStage.DECODE)
+        if not enabled_writers and not decode_enabled:
             return
 
-        staged = list(staged_writers)
-        if decode_staged:
-            staged.append(TurboQuantKernelStage.DECODE)
-        named = ", ".join(sorted(stage.value for stage in staged))
+        enabled_stages = list(enabled_writers)
+        if decode_enabled:
+            enabled_stages.append(TurboQuantKernelStage.DECODE)
+        stage_names = ", ".join(sorted(stage.value for stage in enabled_stages))
 
         if self.head_size != TURBOQUANT_KERNEL_HEAD_SIZE:
             raise ValueError(
-                f"TurboQuant kernel stages {named} are switched on, but all three kernels are "
+                f"TurboQuant kernel stages {stage_names} are switched on, but all three kernels are "
                 f"specialised to head_size {TURBOQUANT_KERNEL_HEAD_SIZE} and this model's is "
                 f"{self.head_size}. The golden model has no such constraint: unset "
                 f"{TURBOQUANT_STAGES_ENV} to run this shape."
             )
 
-        if staged_writers and self.num_kv_heads != TURBOQUANT_KERNEL_KV_HEADS:
+        if enabled_writers and self.num_kv_heads != TURBOQUANT_KERNEL_KV_HEADS:
             raise ValueError(
-                f"TurboQuant ingestion stages {named} are switched on, but both cache writers are "
+                f"TurboQuant ingestion stages {stage_names} are switched on, but both cache writers are "
                 f"specialised to exactly {TURBOQUANT_KERNEL_KV_HEADS} KV heads and this model has "
                 f"{self.num_kv_heads}. The kernel does not check this: outside it the writer reads "
                 f"one head's rows and writes another head's page, with every canary intact."
             )
 
-        if decode_staged and not 0 < self.num_kv_heads <= TURBOQUANT_DECODE_MAX_KV_HEADS:
+        if decode_enabled and not 0 < self.num_kv_heads <= TURBOQUANT_DECODE_MAX_KV_HEADS:
             raise ValueError(
                 f"the TurboQuant fused decode refuses num_kv_heads outside 1.."
                 f"{TURBOQUANT_DECODE_MAX_KV_HEADS} (valid_launch), and this model has "
                 f"{self.num_kv_heads}. This is the constraint a GQA model is most likely to hit; "
                 f"unset {TURBOQUANT_STAGES_ENV} or drop the 'decode' stage to run golden."
             )
-        if decode_staged and self.num_heads % max(self.num_kv_heads, 1):
+        if decode_enabled and self.num_heads % max(self.num_kv_heads, 1):
             raise ValueError(
                 f"the TurboQuant fused decode needs num_heads ({self.num_heads}) to be a multiple "
                 f"of num_kv_heads ({self.num_kv_heads})."
@@ -1929,7 +2018,7 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
 
         if self.model_dtype != TURBOQUANT_KERNEL_DTYPE:
             raise ValueError(
-                f"TurboQuant kernel stages {named} are switched on, but every kernel is "
+                f"TurboQuant kernel stages {stage_names} are switched on, but every kernel is "
                 f"{TURBOQUANT_KERNEL_DTYPE} only and this model runs in {self.model_dtype}. The "
                 f"fused decode's dispatch returns WITHOUT LAUNCHING for any other element type, "
                 f"which would leave the attention output unwritten and report success, so this is "
@@ -2043,10 +2132,6 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
         num_actual_tokens: int,
         phase: TurboQuantIngestionPhase,
     ) -> tuple[torch.Tensor, TurboQuantStripPlan | None]:
-        # The runner hands the same metadata object to every layer of the KV
-        # cache group for one step, so the int32 slot cast and the prefill
-        # strip plan (a device-to-host sync plus an O(tokens) host walk) are
-        # computed once per step here instead of once per layer.
         cached = getattr(attn_metadata, "_turboquant_ingestion_cache", None)
         if cached is not None and cached[0] is attn_metadata.slot_mapping:
             return cached[1], cached[2]
@@ -2169,7 +2254,7 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
             )
 
         tiling, workspace, query_rot = self._decode_buffers(attn_metadata, batch_size)
-        fused = self.adapter.fused_decode(
+        fused_output = self.adapter.fused_decode(
             query=query[:batch_size],
             key_cache=self.key_cache,
             value_cache=self.value_cache,
@@ -2185,7 +2270,7 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
             workspace=workspace,
             query_rot=query_rot,
         )
-        if fused is not None:
+        if fused_output is not None:
             return output
 
         dense_key, dense_value = self._gather_dense_kv(attn_metadata, batch_size, query.dtype)
@@ -2279,25 +2364,19 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
         emulator = self.emulator
         assert emulator is not None
 
-        query_lens_cpu = torch.tensor(attn_metadata.actual_seq_lengths_q, dtype=torch.int64)
-        query_lens_cpu = torch.diff(query_lens_cpu, prepend=torch.zeros(1, dtype=torch.int64))
-        batch_size = int(query_lens_cpu.numel())
-        total_tokens = int(attn_metadata.actual_seq_lengths_q[-1])
-        max_query_len = int(query_lens_cpu.max())
-
-        request_of_row = torch.repeat_interleave(torch.arange(batch_size), query_lens_cpu)
-        row_starts = torch.cumsum(query_lens_cpu, dim=0) - query_lens_cpu
-        position_in_request = torch.arange(total_tokens) - row_starts[request_of_row]
-        row_indices = torch.stack((request_of_row, position_in_request)).to(query.device)
-        request_of_row = row_indices[0]
-        position_in_request = row_indices[1]
+        layout = self._mixed_query_layout(attn_metadata, query.device)
+        batch_size = len(layout.query_lengths_list)
+        total_tokens = layout.num_tokens
+        max_query_len = layout.max_query_len
+        request_indices = layout.request_indices
+        positions_in_request = layout.positions_in_request
 
         padded_query = torch.zeros(
             (batch_size, max_query_len, self.num_heads, self.head_size),
             dtype=query.dtype,
             device=query.device,
         )
-        padded_query[request_of_row, position_in_request] = query[:total_tokens]
+        padded_query[request_indices, positions_in_request] = query[:total_tokens]
 
         dense_key, dense_value = self._gather_dense_kv(attn_metadata, batch_size, query.dtype)
         padded_kv_len = dense_key.shape[1]
@@ -2307,10 +2386,10 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
             seq_lens = attn_metadata.seq_lens[:batch_size].to(device=query.device, dtype=torch.int64)
         else:
             seq_lens = seq_lens_device[:batch_size]
-        query_lens = query_lens_cpu.to(query.device)
+        query_lengths = layout.query_lengths
         key_positions = torch.arange(padded_kv_len, device=query.device, dtype=torch.int64)
         query_positions = torch.arange(max_query_len, device=query.device, dtype=torch.int64)
-        horizon = (seq_lens - query_lens).unsqueeze(1) + query_positions.unsqueeze(0)
+        horizon = (seq_lens - query_lengths).unsqueeze(1) + query_positions.unsqueeze(0)
         atten_mask = (key_positions.view(1, 1, -1) > horizon.unsqueeze(-1)).unsqueeze(1)
 
         attn_output = self._fused_infer_attention(
@@ -2318,14 +2397,42 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
             key=dense_key,
             value=dense_value,
             input_layout="BSND",
-            actual_seq_lengths=query_lens_cpu.tolist(),
+            actual_seq_lengths=layout.query_lengths_list,
             actual_seq_lengths_kv=attn_metadata.seq_lens_list,
             atten_mask=atten_mask,
             sparse_mode=0,
         )
         attn_output = attn_output.view(batch_size, max_query_len, self.num_heads, self.head_size)
-        output[:total_tokens] = attn_output[request_of_row, position_in_request]
+        output[:total_tokens] = attn_output[request_indices, positions_in_request]
         return output
+
+    @staticmethod
+    def _mixed_query_layout(attn_metadata: AscendMetadata, device: torch.device) -> TurboQuantQueryLayout:
+        cumulative_lengths = tuple(attn_metadata.actual_seq_lengths_q)
+        cached = getattr(attn_metadata, "_turboquant_query_layout_cache", None)
+        if cached is not None and cached[:2] == (cumulative_lengths, device):
+            return cached[2]
+
+        query_lengths = torch.diff(torch.tensor((0, *cumulative_lengths), dtype=torch.int64))
+        query_lengths_list = query_lengths.tolist()
+        num_tokens = cumulative_lengths[-1]
+        request_indices = torch.repeat_interleave(torch.arange(len(query_lengths_list)), query_lengths)
+        row_starts = torch.cumsum(query_lengths, dim=0) - query_lengths
+        positions_in_request = torch.arange(num_tokens) - row_starts[request_indices]
+        host_layout = torch.cat((request_indices, positions_in_request, query_lengths))
+        if device.type != "cpu":
+            host_layout = host_layout.pin_memory()
+        device_layout = host_layout.to(device, non_blocking=host_layout.is_pinned())
+        layout = TurboQuantQueryLayout(
+            request_indices=device_layout[:num_tokens],
+            positions_in_request=device_layout[num_tokens : 2 * num_tokens],
+            query_lengths=device_layout[2 * num_tokens :],
+            query_lengths_list=query_lengths_list,
+            max_query_len=max(query_lengths_list),
+            num_tokens=num_tokens,
+        )
+        attn_metadata._turboquant_query_layout_cache = (cumulative_lengths, device, layout)
+        return layout
 
     def forward_impl(
         self,

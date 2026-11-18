@@ -43,8 +43,8 @@ BINDINGS = _REPO / "csrc" / "attention" / "turboquant" / "torch_bindings.cpp"
 # are the call it makes, so they must be the schema's arguments in the schema's
 # order.
 OP_STUBS = {
-    TURBOQUANT_OP_RESHAPE_AND_CACHE: "_kernel_reshape_and_cache_a8",
-    TURBOQUANT_OP_RESHAPE_SCATTER: "_kernel_reshape_scatter_aiv",
+    TURBOQUANT_OP_RESHAPE_AND_CACHE: "_kernel_cache_prefill",
+    TURBOQUANT_OP_RESHAPE_SCATTER: "_kernel_cache_decode",
     TURBOQUANT_OP_FUSED_DECODE: "_kernel_fused_decode",
 }
 
@@ -135,7 +135,7 @@ def test_the_tiling_builder_is_called_with_the_schema_in_order() -> None:
     is no signature to compare: the check is on the call it writes.
     """
     source = inspect.getsource(AscendTurboQuantMetadataBuilder._refresh_tiling)
-    call = source.split("entry(", 1)[1]
+    call = source.split("build_tiling(", 1)[1]
     passed = [line.strip().rstrip(",") for line in call.splitlines() if line.strip() not in ("", ")")]
     passed = [arg for arg in passed if not arg.startswith(")")]
     schema_args = [a.name for a in _schemas()[TURBOQUANT_OP_BUILD_DECODE_TILING].arguments]

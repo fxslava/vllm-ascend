@@ -288,7 +288,7 @@ def test_the_batch_writer_fills_every_strip_of_one_page() -> None:
 @requires_npu
 @_requires_op(PREFILL_OP)
 @pytest.mark.parametrize("num_strips", [1, 4])
-def test_the_batch_writer_matches_the_golden_model(num_strips: int) -> None:
+def test_the_batch_writer_matches_the_reference_model(num_strips: int) -> None:
     TurboQuantEmulator, TurboQuantKernelStage, _, _, _ = _import_backend()
     emulator = TurboQuantEmulator(head_size=HEAD_SIZE, device=DEVICE)
     kernel_adapter, golden_adapter = _adapters(TurboQuantKernelStage.RESHAPE_AND_CACHE)
@@ -312,7 +312,7 @@ def test_the_batch_writer_matches_the_golden_model(num_strips: int) -> None:
 @requires_npu
 @_requires_op(SCATTER_OP)
 @pytest.mark.parametrize("num_tokens", [1, 3, 17])
-def test_the_scatter_writer_matches_the_golden_model(num_tokens: int) -> None:
+def test_the_scatter_writer_matches_the_reference_model(num_tokens: int) -> None:
     """Arbitrary slots at block_size 64, which is what 5984a47fa allowed.
 
     This writer used to be the one whose value plane was a read-modify-write;
@@ -369,8 +369,8 @@ def test_the_scatter_writer_accumulates_over_steps() -> None:
 
 @requires_npu
 @_requires_op(SCATTER_OP)
-def test_the_golden_gather_reads_the_npu_written_cache() -> None:
-    """Write with the kernel, read with ``_golden_gather_pages_nz``.
+def test_the_reference_gather_reads_the_npu_written_cache() -> None:
+    """Write with the kernel, read with ``_reference_gather_pages_nz``.
 
     Two assertions, and they are different in kind:
 
@@ -496,7 +496,7 @@ DECODE_ROW_MAX_BUDGET = 0.10
 DECODE_COSINE_FLOOR = 0.999
 
 
-def _decode_and_golden_adapters():
+def _decode_and_reference_adapters():
     """The decode-stage adapter, and the golden adapter pinned to the NZ cache.
 
     Not ``_adapters(DECODE)``: with no ingestion stage engaged,
@@ -609,7 +609,7 @@ def _build_decode_tiling(
     return tiling, workspace, query_rot
 
 
-def _golden_attention_fp32(
+def _reference_attention_fp32(
     adapter,
     emulator,
     caches,
@@ -691,7 +691,7 @@ def _assert_attention_close(tag: str, got: torch.Tensor, expected: torch.Tensor,
         1055,  # nine pages, a 31-row tail
     ],
 )
-def test_the_fused_decode_matches_the_golden_attention_serving_geometry(context: int) -> None:
+def test_the_fused_decode_matches_the_reference_attention_serving_geometry(context: int) -> None:
     """Batch 1, 24 query heads over 4 KV heads, on a golden-written cache.
 
     The cache is written by the golden model pinned to the NZ layout, so its
@@ -703,7 +703,7 @@ def test_the_fused_decode_matches_the_golden_attention_serving_geometry(context:
 
     TurboQuantEmulator, _, _, _, _ = _import_backend()
     emulator = TurboQuantEmulator(head_size=HEAD_SIZE, device=DEVICE)
-    decode_adapter, golden_adapter = _decode_and_golden_adapters()
+    decode_adapter, golden_adapter = _decode_and_reference_adapters()
 
     pages = -(-context // SERVING_BLOCK_SIZE)
     key, value = _serving_activations(context, DEVICE, seed=6000 + context)
@@ -776,7 +776,7 @@ def test_the_fused_decode_matches_the_golden_attention_serving_geometry(context:
         f"(~{rot_ulp:.1f} fp32 ULP of the row max; bit-exact {torch.equal(rot, golden_rot)})"
     )
 
-    expected = _golden_attention_fp32(golden_adapter, emulator, caches, block_tables, query, context, SERVING_SCALE)
+    expected = _reference_attention_fp32(golden_adapter, emulator, caches, block_tables, query, context, SERVING_SCALE)
     _assert_attention_close("fused decode", output, expected, context)
 
 
@@ -796,7 +796,7 @@ def test_the_fused_decode_reads_the_kernel_written_cache_serving_geometry(contex
 
     TurboQuantEmulator, TurboQuantKernelStage, _, _, _ = _import_backend()
     emulator = TurboQuantEmulator(head_size=HEAD_SIZE, device=DEVICE)
-    decode_adapter, golden_adapter = _decode_and_golden_adapters()
+    decode_adapter, golden_adapter = _decode_and_reference_adapters()
     scatter_adapter, _ = _adapters(TurboQuantKernelStage.SCATTER)
 
     pages = -(-context // SERVING_BLOCK_SIZE)
@@ -842,7 +842,7 @@ def test_the_fused_decode_reads_the_kernel_written_cache_serving_geometry(contex
     torch.npu.synchronize()
     assert fused is not None, "the decode stage is on and the op is registered, so it must run"
 
-    expected = _golden_attention_fp32(golden_adapter, emulator, caches, block_tables, query, context, SERVING_SCALE)
+    expected = _reference_attention_fp32(golden_adapter, emulator, caches, block_tables, query, context, SERVING_SCALE)
     _assert_attention_close("kernel-written fused decode", output, expected, context)
 
 
@@ -858,7 +858,7 @@ def test_the_fused_decode_handles_two_requests_serving_geometry() -> None:
 
     TurboQuantEmulator, _, _, _, _ = _import_backend()
     emulator = TurboQuantEmulator(head_size=HEAD_SIZE, device=DEVICE)
-    decode_adapter, golden_adapter = _decode_and_golden_adapters()
+    decode_adapter, golden_adapter = _decode_and_reference_adapters()
 
     contexts = [SERVING_BLOCK_SIZE, 200]
     batch = len(contexts)
@@ -914,7 +914,7 @@ def test_the_fused_decode_handles_two_requests_serving_geometry() -> None:
     assert fused is not None, "the decode stage is on and the op is registered, so it must run"
 
     for request, context in enumerate(contexts):
-        expected = _golden_attention_fp32(
+        expected = _reference_attention_fp32(
             golden_adapter,
             emulator,
             caches,

@@ -134,9 +134,9 @@ All three have Meta registrations, so a `torch.export` or FakeTensor trace walks
 them instead of trying to run them. Nothing in the served path needs those:
 both TurboQuant entry points are graph splitting ops, so under PIECEWISE the
 kernels launch eagerly between captured pieces. A full graph is refused
-elsewhere for an unrelated and more serious reason (`NPUPlatform` clamps the
-graph mode), and the fused decode's binding copies the context lengths to the
-host to build its tiling, which is itself illegal on a capturing stream.
+elsewhere (`NPUPlatform` clamps the graph mode). Decode tiling is built from
+the CPU sequence-length mirror in the metadata builder, outside the per-layer
+decode launch; the launch does not read context lengths back from the device.
 
 ### Serving mode: eager execution is a debug tool, not a configuration
 
@@ -162,6 +162,55 @@ Also keep the diagnostic switches off when measuring:
 `VLLM_ASCEND_TURBOQUANT_TRACE=0` (dispatch logging walks every tensor's shape,
 stride and layout per call) and `TURBOQUANT_PROFILE=0` (a profiler context per
 layer per step). Both are off by default.
+
+### Host work and fallback paths
+
+The following is a source audit, not an NPU latency measurement. The fused
+decode custom op launches Ascend C directly; its registered path does not run
+the reference rotation, gather, or dequantization operators.
+
+| Path | Host work or synchronization |
+| --- | --- |
+| Decode metadata | Host C++ builds descriptors once per cache-group metadata build. Tiling uploads use a fresh pinned allocation and a nonblocking `copy_` on the current stream. The NPU host allocator retains the source until its copy completes. |
+| Context lengths | The CPU mirror is uploaded asynchronously when pinning succeeds. Before reusing a host ring slot, an event query checks completion; a busy slot gets a replacement allocation without waiting for the device. CPU-only/unpinned staging uses a blocking copy. |
+| Missing or disabled decode op | Decode falls through to PyTorch gather/dequantization, then NPU fused inference attention. Block-table min/max validation reads device scalars on the host. |
+| Prefill cache ingestion | The strip planner calls `slot_mapping.tolist()`: this is a blocking device-to-host readback, cached once per metadata object across layers. Partial-strip waves also construct device index tensors from host indices. |
+| Prefill without a cache hit | Attention uses the original K/V tensors and NPU fused inference attention; cache ingestion still has the planner cost above. |
+| Cache-hit or mixed prefill | The cache is gathered/dequantized with PyTorch operators on its device before NPU fused inference attention. Query row indices and query lengths share one pinned upload cached across layers. Dense cache reconstruction and its block-table validation still happen per layer. |
+| Reference cache writer | Boolean validity checks and conversion of the maximum slot to a Python integer read device scalars on the host. Boolean indexing can add dynamic-shape synchronization. |
+| Optional slot validation | `VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS=1` makes the C++ batch writer copy slots to CPU for validation. Leave it disabled for throughput measurements. |
+| First decode | The C++ basis pool and mode tables have blocking uploads on their first use, then are cached by device and geometry. Warm up before measuring. |
+
+`TURBOQUANT_KERNEL_STAGES` defaults to `none`. For a kernel measurement,
+enable `reshape_and_cache,scatter,decode` and check that all three ops are
+registered in the selected namespace. Missing ops log fallback warnings;
+`VLLM_ASCEND_TURBOQUANT_TRACE=1` logs the selected branch and tensor devices.
+PyTorch reference execution on NPU tensors is still NPU tensor computation,
+but the scalar checks above synchronize with the host.
+
+The previous tiling upload used pageable memory and `non_blocking=false`,
+which reaches a stream synchronization in
+[torch-npu's copy implementation](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/csrc/aten/ops/op_api/CopyKernelOpApi.cpp).
+The asynchronous upload removes that wait. It does not remove host descriptor
+construction or the remaining prefill readback, and no speedup is claimed
+without device measurements.
+
+Run the transfer benchmark on an ascend950 build, both idle and with queued
+compute, to separate host submission time from elapsed time including drain:
+
+```bash
+python benchmarks/scripts/benchmark_turboquant_tiling.py --batch-sizes 1 16 128
+python benchmarks/scripts/benchmark_turboquant_tiling.py --queued-matmuls 4
+pytest -sv tests/ut/attention/test_turboquant_tiling_npu.py
+```
+
+The benchmark compares the former CPU-build/blocking-upload sequence with the
+pinned asynchronous binding, after warmup. The NPU tests compare queued
+descriptor snapshots against the CPU builder, including non-default stream
+ordering, source lifetime under allocator churn, invalid lengths, and context
+staging reuse. Use an enclosing torch-npu profiler around several serving
+steps to rank the remaining prefill work and kernel execution; per-layer
+`TURBOQUANT_PROFILE=1` contexts perturb latency and should only diagnose paths.
 
 ## The cache formats now meet
 
@@ -269,25 +318,25 @@ one as if it applied to the other.
 
 Five things make the legacy gate work:
 
-- `ASCEND_MICRO_CANN_LAUNCH` and `ASCEND_TQ_FUSED_DECODE_GEMM_REDUCE=1` have to
+* `ASCEND_MICRO_CANN_LAUNCH` and `ASCEND_TQ_FUSED_DECODE_GEMM_REDUCE=1` have to
   be defined, through **both** `ascendc_compile_definitions` and a single
   `ascendc_compile_options -forward-options-to-host-compiler -D...` — see "The
   define you cannot omit" below. Only one `ascendc_compile_options` call per
   target: the device half appends its options while the host half assigns them,
   so a second call silently discards the first's host-forwarded defines.
-- `$ASCEND_HOME_PATH/tools/ccec_compiler/bin` has to be on `PATH`. The
+* `$ASCEND_HOME_PATH/tools/ccec_compiler/bin` has to be on `PATH`. The
   preprocess step shells out to `llvm-objdump` by bare name and dies late
   without it.
-- `CMAKE_BUILD_TYPE` has to be set. CANN's `merge_mix_obj.sh` runs under
+* `CMAKE_BUILD_TYPE` has to be set. CANN's `merge_mix_obj.sh` runs under
   `set -e` and the generated recipe interpolates `${CMAKE_BUILD_TYPE}` after a
   bare `--build-type`; with it empty the option has no argument, the script's
   last `shift 2` runs off the end and returns non-zero, and `set -e` kills it
   with no message. The build then dies at `<target>_merge_obj` with nothing but
   `Error 1`, at 95%, after every kernel compiled clean. This repo's root
   `CMakeLists.txt` defaults it, so only a throwaway project hits it.
-- The build directory must not contain a dot-component. CANN's object glob never
+* The build directory must not contain a dot-component. CANN's object glob never
   descends into one, and the failure names a missing file that exists.
-- It must be fresh every time. `ascendc_library` has no incremental rebuild,
+* It must be fresh every time. `ascendc_library` has no incremental rebuild,
   because its preprocess step feeds `ld.lld` its own previous output.
 
 Under the legacy path the target carries both kernel types: `device.o` holds the
@@ -347,7 +396,7 @@ With the definitions inside the device-only region the build still succeeds and
 every `launch_*` is present, so the failure is invisible until Python `dlopen()`s
 the extension:
 
-```
+```text
 undefined symbol: turboquant_reshape_and_cache_bf16
 ```
 

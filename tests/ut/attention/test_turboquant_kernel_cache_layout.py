@@ -190,7 +190,7 @@ def _write_strip_cache(
 # ---------------------------------------------------------------------------
 
 
-def test_golden_writers_keep_the_configured_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_reference_writers_keep_the_configured_layout(monkeypatch: pytest.MonkeyPatch) -> None:
     _register(monkeypatch, *ALL_OPS)
     assert _adapter().value_layout() is TurboQuantValueLayout.TOKEN_MAJOR
     assert (
@@ -236,7 +236,7 @@ def test_the_decode_stage_alone_does_not_change_the_layout(monkeypatch: pytest.M
     assert _adapter(TurboQuantKernelStage.DECODE).value_layout() is TurboQuantValueLayout.TOKEN_MAJOR
 
 
-def test_an_unregistered_writer_leaves_the_golden_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_an_unregistered_writer_leaves_the_reference_layout(monkeypatch: pytest.MonkeyPatch) -> None:
     """A stage switched on with no op behind it falls back, layout included.
 
     This is the case a build without the extension takes, and getting it wrong
@@ -252,7 +252,7 @@ def test_an_unregistered_writer_leaves_the_golden_layout(monkeypatch: pytest.Mon
 # ---------------------------------------------------------------------------
 
 
-def test_the_golden_writer_now_does_the_channel_major_rmw(emulator: TurboQuantEmulator) -> None:
+def test_the_reference_writer_now_does_the_channel_major_rmw(emulator: TurboQuantEmulator) -> None:
     """It used to refuse this layout; it writes it now, one token at a time.
 
     The read-modify-write is what makes a single-token decode write safe in a
@@ -312,7 +312,7 @@ def test_an_engaged_writer_never_reaches_the_refusal(
 # ---------------------------------------------------------------------------
 
 
-def test_the_golden_gather_reads_a_strip_cache_back(
+def test_the_reference_gather_reads_a_strip_cache_back(
     monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
 ) -> None:
     """Gathering a kernel-written cache must give the same panels as a golden one.
