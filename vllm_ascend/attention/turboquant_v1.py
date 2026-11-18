@@ -347,6 +347,10 @@ TURBOQUANT_TABLE_DTYPE: Final[torch.dtype] = torch.bfloat16
 
 TURBOQUANT_KERNEL_HEAD_SIZE: Final[int] = 256
 
+# The runner expands larger allocator pages into these kernel pages in both
+# the block table and the three cache-plane views.
+TURBOQUANT_KERNEL_BLOCK_SIZE: Final[int] = 128
+
 TURBOQUANT_KERNEL_KV_HEADS: Final[int] = 4
 
 TURBOQUANT_DECODE_MAX_KV_HEADS: Final[int] = 4
@@ -463,7 +467,7 @@ def load_turboquant_extension() -> bool:
         return _TURBOQUANT_EXTENSION_LOADED
 
     try:
-        from vllm_ascend.utils import bootstrap_custom_op_env 
+        from vllm_ascend.utils import bootstrap_custom_op_env
 
         if not torch.compiler.is_compiling():
             bootstrap_custom_op_env()
@@ -471,7 +475,7 @@ def load_turboquant_extension() -> bool:
         logger.debug("TurboQuant: bootstrap_custom_op_env is unavailable (%s); importing anyway.", exc)
 
     try:
-        import vllm_ascend.vllm_ascend_C 
+        import vllm_ascend.vllm_ascend_C  # noqa: F401
 
         _TURBOQUANT_EXTENSION_LOADED = True
     except (ImportError, OSError) as exc:
@@ -648,7 +652,7 @@ class TurboQuantOpsAdapter:
         scale_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
         emulator: TurboQuantEmulator,
-        plan: "TurboQuantStripPlan | None" = None,
+        plan: TurboQuantStripPlan | None = None,
     ) -> None:
         if self._has_kernel(TURBOQUANT_OP_RESHAPE_AND_CACHE):
             self._kernel_ingest_prefill(
@@ -683,7 +687,7 @@ class TurboQuantOpsAdapter:
         scale_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
         emulator: TurboQuantEmulator,
-        plan: "TurboQuantStripPlan | None" = None,
+        plan: TurboQuantStripPlan | None = None,
     ) -> None:
         if plan is None:
             plan = turboquant_plan_strip_ingestion(slot_mapping.tolist(), int(key_cache.shape[1]))
@@ -1549,7 +1553,11 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
         self._max_num_reqs = int(vllm_config.scheduler_config.max_num_seqs)
         self._num_kv_heads = int(kv_cache_spec.num_kv_heads)
         self._head_size = int(kv_cache_spec.head_size)
-        self._block_size = int(kv_cache_spec.block_size)
+        # kv_cache_spec.block_size is the allocator granularity (e.g. 1024 for
+        # Qwen3.5 hybrid alignment). The runner splits those pages according to
+        # get_supported_kernel_block_sizes(), so descriptors must use the same
+        # 128-token granularity as the block table and key_cache.shape[1].
+        self._block_size = TURBOQUANT_KERNEL_BLOCK_SIZE
         self._num_heads = int(vllm_config.model_config.get_num_attention_heads(vllm_config.parallel_config))
         self._num_splits = TURBOQUANT_DECODE_SPLITS
         self._heads_per_task = turboquant_decode_heads_per_task(self._num_heads, self._num_kv_heads)
@@ -1730,6 +1738,10 @@ class AscendTurboQuantBackend(AscendAttentionBackend):
     @staticmethod
     def get_builder_cls() -> type[AscendAttentionMetadataBuilder]:
         return AscendTurboQuantMetadataBuilder
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int]:
+        return [TURBOQUANT_KERNEL_BLOCK_SIZE]
 
     @classmethod
     def supports_pcp(cls) -> bool:
@@ -2030,7 +2042,7 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
         attn_metadata: AscendMetadata,
         num_actual_tokens: int,
         phase: TurboQuantIngestionPhase,
-    ) -> tuple[torch.Tensor, "TurboQuantStripPlan | None"]:
+    ) -> tuple[torch.Tensor, TurboQuantStripPlan | None]:
         # The runner hands the same metadata object to every layer of the KV
         # cache group for one step, so the int32 slot cast and the prefill
         # strip plan (a device-to-host sync plus an O(tokens) host walk) are
@@ -2039,7 +2051,7 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
         if cached is not None and cached[0] is attn_metadata.slot_mapping:
             return cached[1], cached[2]
         slot_mapping = attn_metadata.slot_mapping[:num_actual_tokens].to(torch.int32)
-        strip_plan: "TurboQuantStripPlan | None" = None
+        strip_plan: TurboQuantStripPlan | None = None
         if phase is TurboQuantIngestionPhase.PREFILL and self.adapter._has_kernel(TURBOQUANT_OP_RESHAPE_AND_CACHE):
             strip_plan = turboquant_plan_strip_ingestion(slot_mapping.tolist(), int(self.key_cache.shape[1]))
         attn_metadata._turboquant_ingestion_cache = (attn_metadata.slot_mapping, slot_mapping, strip_plan)

@@ -257,8 +257,6 @@ inline void run()
     r.max_blocks = 16; r.block_size = 128;
     require(fdt::build_decode_tiling(r, &length, nullptr, image.data()) ==
             fdt::DecodeTilingStatus::kOk);
-    // A 192-row page would need an integer division per tile on the SPU.
-    r.block_size = 192;
     // DIRTY-DATA (N4): a context length outside [0, max_blocks * block_size] is refused, not
     // clamped; the device would otherwise build a tile count from a value the block table cannot
     // cover. 16 pages x 128 rows is this request's hard ceiling.
@@ -269,6 +267,8 @@ inline void run()
     require(fdt::build_decode_tiling(r, &length, nullptr, image.data()) ==
             fdt::DecodeTilingStatus::kContextOutOfRange);
     length = 1024;
+    // A 192-row page would need an integer division per tile on the SPU.
+    r.block_size = 192;
     require(fdt::build_decode_tiling(r, &length, nullptr, image.data()) ==
             fdt::DecodeTilingStatus::kPageSizeNotPow2);
     r.block_size = 128;

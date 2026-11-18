@@ -503,6 +503,57 @@ def test_g6_the_bound_is_monotone_in_the_request_count() -> None:
 MAX_NUM_REQS = 8
 
 
+@pytest.mark.parametrize("allocator_block_size", [128, 1024, 2048])
+def test_hybrid_tiling_uses_kernel_pages_instead_of_allocator_pages(
+    monkeypatch: pytest.MonkeyPatch, allocator_block_size: int
+) -> None:
+    from vllm_ascend.attention.attention_v1 import AscendAttentionMetadataBuilder
+    from vllm_ascend.attention.turboquant_v1 import (
+        TURBOQUANT_OP_BUILD_DECODE_TILING,
+        AscendTurboQuantMetadataBuilder,
+    )
+
+    # The shared builder needs an engine config. Replace only its setup so the
+    # real TurboQuant constructor and per-step tiling arguments run on the CPU.
+    def init_base(self, *args, **kwargs):
+        self.max_num_blocks_per_req = 32
+
+    monkeypatch.setattr(AscendAttentionMetadataBuilder, "__init__", init_base)
+    spec = types.SimpleNamespace(block_size=allocator_block_size, num_kv_heads=4, head_size=HEAD_SIZE)
+    config = types.SimpleNamespace(
+        scheduler_config=types.SimpleNamespace(max_num_seqs=1),
+        model_config=types.SimpleNamespace(get_num_attention_heads=lambda _: 24),
+        parallel_config=types.SimpleNamespace(),
+    )
+    builder = AscendTurboQuantMetadataBuilder(spec, ["attention"], config, CPU)
+    entry = _Recorder()
+    _register(monkeypatch, **{TURBOQUANT_OP_BUILD_DECODE_TILING: entry})
+
+    # Allocator pages 2 and 5 expand into 128-token kernel pages. At allocator
+    # size 1024, a descriptor using the allocator stride reads table[1] at
+    # context position 1024 instead of the required table[8].
+    kernel_block_size = 128
+    pages_per_allocation = spec.block_size // kernel_block_size
+    block_table = torch.tensor(
+        [[page * pages_per_allocation + subpage for page in (2, 5) for subpage in range(pages_per_allocation)]],
+        dtype=torch.int32,
+    )
+    builder._build_backend_metadata(
+        types.SimpleNamespace(num_reqs=1),
+        block_table=block_table,
+        query_lens=torch.ones(1, dtype=torch.int32),
+        seq_lens=torch.tensor([spec.block_size + 8], dtype=torch.int32),
+        num_decodes=1,
+        num_prefills=0,
+    )
+    descriptor_block_size = entry.args[5]
+    assert descriptor_block_size == kernel_block_size
+    position = spec.block_size
+    physical_slot = int(block_table[0, position // descriptor_block_size]) * kernel_block_size
+    physical_slot += position % descriptor_block_size
+    assert physical_slot == 5 * spec.block_size
+
+
 def _builder() -> Any:
     """The TurboQuant builder over only the state its two per-step methods read.
 
