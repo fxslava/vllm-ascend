@@ -24,6 +24,9 @@ See ``.github/workflows/scripts/select_tests.py`` and
 All UTs run on CPU: mock ``torch_npu``/``torch.npu`` are installed when no
 NPU is available. 310P-specific tests live in ``tests/ut/_310p/`` but also
 run on CPU via mocks.
+
+Pass ``-p tests.force_npu`` to bypass the availability probe and use the real
+NPU runtime, including when ``npu-smi`` is broken in the container.
 """
 
 import importlib.util
@@ -32,12 +35,19 @@ import sys
 import types
 from unittest.mock import MagicMock
 
-try:
-    # Note: do not import torch here for cpu env, which will lead to circle import error.
-    subprocess.run(["npu-smi", "info"], capture_output=True, check=True)
+import pytest
+
+# Explicit pytest plugins load before conftest initialization. Do not probe or
+# silently select CPU mocks when the caller has forced the NPU runtime.
+if "tests.force_npu" in sys.modules:
     _npu_available = True
-except (subprocess.CalledProcessError, OSError):
-    _npu_available = False
+else:
+    try:
+        # Do not import torch here: CPU bootstrap can hit circular imports.
+        subprocess.run(["npu-smi", "info"], capture_output=True, check=True)
+        _npu_available = True
+    except (subprocess.CalledProcessError, OSError):
+        _npu_available = False
 
 if not _npu_available:
     triton_runtime = MagicMock()
@@ -203,8 +213,6 @@ if not _npu_available:
 
     _vllm_torch_utils.PIN_MEMORY = False
     _vllm_v1_utils.PIN_MEMORY = False
-
-import pytest
 
 mooncake_engine = types.ModuleType("mooncake.engine")
 mooncake_engine.__spec__ = importlib.util.spec_from_loader("mooncake.engine", loader=None)
