@@ -104,11 +104,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # first slot alone. 0 (default): off. 1: on. The values live on the device,
     # so the check costs a device-to-host copy and a synchronisation on every
     # cache write of every layer -- diagnostic only, never a serving default.
-    # Read in C++ by validate_slots() in
-    # csrc/attention/turboquant/torch_bindings.cpp, so it takes effect in the
-    # worker process without any Python plumbing; it is listed here to keep it
-    # discoverable with the rest of the environment. It guards the prefill batch
-    # writer only -- the decode scatter writer takes arbitrary slots by design.
+    # Also checks live write slots against request positions and block tables
+    # in the TurboQuant metadata builder, before length/tiling uploads. A
+    # mismatch reports its request, position and expected/actual physical slot.
+    # C++ validate_slots() additionally checks the batch writer's strip layout.
     "VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS": lambda: bool(int(os.getenv("VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS", "0"))),
     # The codebook the TurboQuant writers quantise on and the fused decode
     # reconstructs with. 0 (default): the uniform mid-rise grid. 1: the

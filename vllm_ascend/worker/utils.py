@@ -189,15 +189,15 @@ class AscendKVBlockZeroer(KVBlockZeroer):
                     # capture. Clearing a recycled block must preserve them.
                     kv_tuple = kv_tuple[:3]
                 elif isinstance(spec, AscendTurboQuantAttentionSpec):
-                    # (packed K, packed V, scales), and the scale plane is
-                    # plane-major: its block dimension is 1, not 0. Split it
-                    # into its two block-major planes so the loop below sees
-                    # only block-major tensors. A recycled block must lose its
-                    # scales along with its codes -- a stale scale over zeroed
-                    # codes is still zero, but a page half-cleared is not a
-                    # state worth keeping.
+                    # NZ scales are slot-major despite their nominal planar
+                    # shape. Clear physical records belonging to this page,
+                    # using the same layout as the ingestion/decode adapter.
                     assert len(kv_tuple) == 3, "TurboQuant stores packed K, packed V and the scale plane"
-                    kv_tuple = (kv_tuple[0], kv_tuple[1], *kv_tuple[2])
+                    layer = static_forward_context[layer_name]
+                    block_views = getattr(getattr(layer, "impl", None), "get_kv_cache_block_views", None)
+                    kv_tuple = (
+                        block_views(kv_tuple) if block_views is not None else (kv_tuple[0], kv_tuple[1], *kv_tuple[2])
+                    )
                 else:
                     assert len(kv_tuple) == 2, "K and V are not stored separately"
                 for kv in kv_tuple:

@@ -382,9 +382,9 @@ class NPUModelRunner(GPUModelRunner):
         self.use_compress = (
             hf_config is not None and hasattr(hf_config, "compress_ratios")
         )
-        # TurboQuant's plane-major fp32 scale planes, by data pointer. Set here
-        # for the same reason: the parent init may reshape the KV cache.
-        self._turboquant_scale_planes: dict[int, torch.Tensor] = {}
+        # TurboQuant's layout-aware scale block views, by storage data pointer.
+        # The parent init may reshape the KV cache, so initialize this first.
+        self._turboquant_scale_planes: dict[int, tuple[torch.Tensor, ...]] = {}
 
         with _torch_cuda_wrapper():
             super().__init__(vllm_config, device)
@@ -4773,14 +4773,12 @@ class NPUModelRunner(GPUModelRunner):
         return converted
 
     def _block_major_kv_caches(self) -> list[Any]:
-        """``self.kv_caches`` with TurboQuant's scale plane split by plane.
+        """``self.kv_caches`` with TurboQuant scales viewed as physical pages.
 
         ``copy_kv_cache_blocks_inplace`` indexes dimension 0 of every cache
-        tensor as blocks. TurboQuant's fp32 scale plane is plane-major --
-        ``(2, num_blocks, num_kv_heads, block_size)``, the staged kernels'
-        layout -- so its two planes are handed over as separate block-major
-        views. They are recognized by identity (the tensors the reshape
-        created), not by shape, so no other cache can be mistaken for one.
+        tensor as blocks. The adapter supplies either the two planar scale
+        views or one slot-major NZ view. They are recognized by identity so
+        no other cache can be mistaken for one.
         """
         scale_planes = getattr(self, "_turboquant_scale_planes", None)
         if not scale_planes:
@@ -4793,7 +4791,7 @@ class NPUModelRunner(GPUModelRunner):
                 planes: list[Any] = []
                 for tensor in entry:
                     if isinstance(tensor, torch.Tensor) and tensor.data_ptr() in scale_planes:
-                        planes.extend(tensor.unbind(0))
+                        planes.extend(scale_planes[tensor.data_ptr()])
                     else:
                         planes.append(tensor)
                 normalized.append(tuple(planes))
@@ -5609,14 +5607,17 @@ class NPUModelRunner(GPUModelRunner):
                     except ValueError as error:
                         raise ValueError(f"{layer_name}: {error}") from error
                     kv_caches[layer_name] = views
-                    # The scale plane is the one cache tensor on this lane whose
-                    # dimension 0 is not blocks; remember it by identity so the
-                    # generic block copier can be handed its two block-major
-                    # planes instead (_block_major_kv_caches).
+                    # The nominal scale shape is not the NZ storage layout.
+                    # Ask this layer's implementation for the physical page
+                    # views before handing scales to the generic block copier.
                     scale_planes = getattr(self, "_turboquant_scale_planes", None)
                     if scale_planes is None:
                         scale_planes = self._turboquant_scale_planes = {}
-                    scale_planes[views[-1].data_ptr()] = views[-1]
+                    layer = self.compilation_config.static_forward_context.get(layer_name)
+                    block_views = getattr(getattr(layer, "impl", None), "get_kv_cache_block_views", None)
+                    scale_planes[views[-1].data_ptr()] = (
+                        block_views(views)[2:] if block_views is not None else views[-1].unbind(0)
+                    )
                     continue
 
                 if layer_name in layer_tuple_strides:
