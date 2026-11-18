@@ -1,4 +1,4 @@
-#include "../include/turboquant_fused_decode_opt.hpp"
+#include "common/turboquant_mode.h"
 #include "common/types.h"
 
 #if defined(__CCE_AICORE__)

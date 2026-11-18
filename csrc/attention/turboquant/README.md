@@ -138,6 +138,31 @@ elsewhere for an unrelated and more serious reason (`NPUPlatform` clamps the
 graph mode), and the fused decode's binding copies the context lengths to the
 host to build its tiling, which is itself illegal on a capturing stream.
 
+### Serving mode: eager execution is a debug tool, not a configuration
+
+Run TurboQuant with **eager mode disabled** (the default): do not pass
+`--enforce-eager` / do not set `enforce_eager=True`, and leave
+`compilation_config` at its default so the engine runs `VLLM_COMPILE` with
+`CUDAGraphMode.PIECEWISE`. The TurboQuant entry ops are graph-splitting, so the
+attention pieces around them are captured and replayed while the kernels
+themselves launch eagerly between pieces.
+
+This matters because the fused-decode fast path carries per-step host work
+that only graph capture can amortise: the metadata builder's context-lens
+staging ring, the host C++ `npu_turboquant_build_decode_tiling` walk plus its
+host-to-device upload, and the per-layer Python dispatch in
+`vllm_ascend/attention/turboquant_v1.py`. Under `--enforce-eager` every decode
+step pays all of that on the critical path — plus eager-mode Python overhead
+around every operator — and the result looks like a regression even when all
+of `TURBOQUANT_KERNEL_STAGES` are enabled and registered. A captured decode
+replays the whole launch sequence; only the metadata build and the tiling
+upload stay on the host, once per step for the whole model.
+
+Also keep the diagnostic switches off when measuring:
+`VLLM_ASCEND_TURBOQUANT_TRACE=0` (dispatch logging walks every tensor's shape,
+stride and layout per call) and `TURBOQUANT_PROFILE=0` (a profiler context per
+layer per step). Both are off by default.
+
 ## The cache formats now meet
 
 This section used to be "the two cache formats do not meet", and it was the

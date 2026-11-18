@@ -5,7 +5,7 @@
 #include "tensor_api/tensor.h"
 #include "kernel_operator.h"
 #include "cube/routine_stage_page_zn_bf16.hpp"
-#include "../scatter/routine_vector_rotate_butterfly.hpp"
+#include "vector/routine_vector_rotate_butterfly.hpp"
 
 #define TQ_AICORE __aicore__
 #else
@@ -14,7 +14,7 @@
 
 #include "common/turboquant_wave_protocol.hpp"
 #include "common/turboquant_layout.h"
-#include "../../include/turboquant/turboquant_mode.h"
+#include "common/turboquant_mode.h"
 
 #ifndef TURBOQUANT_INGRESS_NZ
 #define TURBOQUANT_INGRESS_NZ 0

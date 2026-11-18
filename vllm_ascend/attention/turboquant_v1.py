@@ -1,3 +1,5 @@
+from __future___ import annotations
+
 import math
 import os
 from collections.abc import Callable, Sequence
@@ -646,6 +648,7 @@ class TurboQuantOpsAdapter:
         scale_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
         emulator: TurboQuantEmulator,
+        plan: "TurboQuantStripPlan | None" = None,
     ) -> None:
         if self._has_kernel(TURBOQUANT_OP_RESHAPE_AND_CACHE):
             self._kernel_ingest_prefill(
@@ -656,6 +659,7 @@ class TurboQuantOpsAdapter:
                 scale_cache=scale_cache,
                 slot_mapping=slot_mapping,
                 emulator=emulator,
+                plan=plan,
             )
             return
         _trace_turboquant_dispatch(
@@ -679,8 +683,10 @@ class TurboQuantOpsAdapter:
         scale_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
         emulator: TurboQuantEmulator,
+        plan: "TurboQuantStripPlan | None" = None,
     ) -> None:
-        plan = turboquant_plan_strip_ingestion(slot_mapping.tolist(), int(key_cache.shape[1]))
+        if plan is None:
+            plan = turboquant_plan_strip_ingestion(slot_mapping.tolist(), int(key_cache.shape[1]))
         tables = _codec_tables(emulator)
 
         if plan.is_whole_batch:
@@ -1365,6 +1371,7 @@ class TurboQuantOpsAdapter:
             scale,
             inv_sqrt_len,
             TURBOQUANT_DECODE_UNPACK,
+            TURBOQUANT_QUANT_MODE,
         )
         return output
 
@@ -1990,22 +1997,51 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
             raise RuntimeError("TurboQuant statics were never bound; forward() must run _ensure_statics first.")
         scale_cache = self._ensure_scale_cache(kv_cache)
 
-        ingest = (
-            self.adapter.reshape_and_cache_prefill
-            if self._ingestion_phase(attn_metadata, num_actual_tokens) is TurboQuantIngestionPhase.PREFILL
-            else self.adapter.reshape_scatter_decode
-        )
-        ingest(
-            key=key[:num_actual_tokens].contiguous(),
-            value=value[:num_actual_tokens].contiguous(),
-            key_cache=self.key_cache,
-            value_cache=self.value_cache,
-            scale_cache=scale_cache,
-            slot_mapping=attn_metadata.slot_mapping[:num_actual_tokens].to(torch.int32),
-            emulator=emulator,
-        )
+        phase = self._ingestion_phase(attn_metadata, num_actual_tokens)
+        slot_mapping, strip_plan = self._ingestion_inputs(attn_metadata, num_actual_tokens, phase)
+        if phase is TurboQuantIngestionPhase.PREFILL:
+            self.adapter.reshape_and_cache_prefill(
+                key=key[:num_actual_tokens].contiguous(),
+                value=value[:num_actual_tokens].contiguous(),
+                key_cache=self.key_cache,
+                value_cache=self.value_cache,
+                scale_cache=scale_cache,
+                slot_mapping=slot_mapping,
+                emulator=emulator,
+                plan=strip_plan,
+            )
+        else:
+            self.adapter.reshape_scatter_decode(
+                key=key[:num_actual_tokens].contiguous(),
+                value=value[:num_actual_tokens].contiguous(),
+                key_cache=self.key_cache,
+                value_cache=self.value_cache,
+                scale_cache=scale_cache,
+                slot_mapping=slot_mapping,
+                emulator=emulator,
+            )
         notify_kv_cache_written()
         return query, key, value, output
+
+    def _ingestion_inputs(
+        self,
+        attn_metadata: AscendMetadata,
+        num_actual_tokens: int,
+        phase: TurboQuantIngestionPhase,
+    ) -> tuple[torch.Tensor, "TurboQuantStripPlan | None"]:
+        # The runner hands the same metadata object to every layer of the KV
+        # cache group for one step, so the int32 slot cast and the prefill
+        # strip plan (a device-to-host sync plus an O(tokens) host walk) are
+        # computed once per step here instead of once per layer.
+        cached = getattr(attn_metadata, "_turboquant_ingestion_cache", None)
+        if cached is not None and cached[0] is attn_metadata.slot_mapping:
+            return cached[1], cached[2]
+        slot_mapping = attn_metadata.slot_mapping[:num_actual_tokens].to(torch.int32)
+        strip_plan: "TurboQuantStripPlan | None" = None
+        if phase is TurboQuantIngestionPhase.PREFILL and self.adapter._has_kernel(TURBOQUANT_OP_RESHAPE_AND_CACHE):
+            strip_plan = turboquant_plan_strip_ingestion(slot_mapping.tolist(), int(self.key_cache.shape[1]))
+        attn_metadata._turboquant_ingestion_cache = (attn_metadata.slot_mapping, slot_mapping, strip_plan)
+        return slot_mapping, strip_plan
 
     @staticmethod
     def _ingestion_phase(attn_metadata: AscendMetadata, num_actual_tokens: int) -> TurboQuantIngestionPhase:
@@ -2037,7 +2073,11 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
 
         padded_len = dense_key.shape[1]
         positions = torch.arange(padded_len, device=dense_key.device, dtype=torch.int32)
-        seq_lens = attn_metadata.seq_lens[:batch_size].to(device=dense_key.device, dtype=torch.int32)
+        seq_lens = getattr(attn_metadata, "turboquant_context_lens", None)
+        if seq_lens is None:
+            seq_lens = attn_metadata.seq_lens[:batch_size].to(device=dense_key.device, dtype=torch.int32)
+        else:
+            seq_lens = seq_lens[:batch_size]
         live = (positions.unsqueeze(0) < seq_lens.unsqueeze(1)).unsqueeze(-1).unsqueeze(-1)
         zero = torch.zeros((), dtype=dtype, device=dense_key.device)
         return torch.where(live, dense_key, zero), torch.where(live, dense_value, zero)
@@ -2234,8 +2274,9 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
         request_of_row = torch.repeat_interleave(torch.arange(batch_size), query_lens_cpu)
         row_starts = torch.cumsum(query_lens_cpu, dim=0) - query_lens_cpu
         position_in_request = torch.arange(total_tokens) - row_starts[request_of_row]
-        request_of_row = request_of_row.to(query.device)
-        position_in_request = position_in_request.to(query.device)
+        row_indices = torch.stack((request_of_row, position_in_request)).to(query.device)
+        request_of_row = row_indices[0]
+        position_in_request = row_indices[1]
 
         padded_query = torch.zeros(
             (batch_size, max_query_len, self.num_heads, self.head_size),
@@ -2247,7 +2288,11 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
         dense_key, dense_value = self._gather_dense_kv(attn_metadata, batch_size, query.dtype)
         padded_kv_len = dense_key.shape[1]
 
-        seq_lens = attn_metadata.seq_lens[:batch_size].to(device=query.device, dtype=torch.int64)
+        seq_lens_device = getattr(attn_metadata, "turboquant_context_lens", None)
+        if seq_lens_device is None:
+            seq_lens = attn_metadata.seq_lens[:batch_size].to(device=query.device, dtype=torch.int64)
+        else:
+            seq_lens = seq_lens_device[:batch_size]
         query_lens = query_lens_cpu.to(query.device)
         key_positions = torch.arange(padded_kv_len, device=query.device, dtype=torch.int64)
         query_positions = torch.arange(max_query_len, device=query.device, dtype=torch.int64)

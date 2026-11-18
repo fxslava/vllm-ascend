@@ -112,7 +112,7 @@
 // 2048-byte read-modify-write disappears and BOTH planes become pure writes.
 
 #include "common/turboquant_layout.h"
-#include "../../include/turboquant/turboquant_mode.h"
+#include "common/turboquant_mode.h"
 
 #ifndef TURBOQUANT_INGRESS_NZ
 #define TURBOQUANT_INGRESS_NZ 0
