@@ -287,15 +287,15 @@ class AscendKVBlockZeroer(KVBlockZeroer):
                 elif isinstance(kv_cache, torch.Tensor):
                     kv_tensors = (kv_cache,)
                 elif isinstance(spec, AscendTurboQuantAttentionSpec):
-                    # (packed K, packed V, scales), and the scale plane is
-                    # plane-major: its block dimension is 1, not 0. Split it
-                    # into its two block-major planes so the loop below sees
-                    # only block-major tensors. A recycled block must lose its
-                    # scales along with its codes -- a stale scale over zeroed
-                    # codes is still zero, but a page half-cleared is not a
-                    # state worth keeping.
+                    # NZ scales are slot-major despite their nominal planar
+                    # shape. Clear physical records belonging to this page,
+                    # using the same layout as the ingestion/decode adapter.
                     assert len(kv_cache) == 3, "TurboQuant stores packed K, packed V and the scale plane"
-                    kv_tensors = (kv_cache[0], kv_cache[1], *kv_cache[2])
+                    layer = static_forward_context[layer_name]
+                    block_views = getattr(getattr(layer, "impl", None), "get_kv_cache_block_views", None)
+                    kv_tensors = (
+                        block_views(kv_cache) if block_views is not None else (kv_cache[0], kv_cache[1], *kv_cache[2])
+                    )
                 else:
                     kv_tensors = kv_cache
                     if cache_dtype == "mxfp8" and len(kv_tensors) == 4:

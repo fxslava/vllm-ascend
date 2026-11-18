@@ -20,6 +20,13 @@ import pytest
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
+from vllm_ascend.attention.turboquant_v1 import (
+    AscendTurboQuantBackendImpl,
+    TurboQuantOpsAdapter,
+    TurboQuantOpsConfig,
+    TurboQuantValueLayout,
+)
+from vllm_ascend.core.kv_cache_interface import turboquant_cache_spec
 from vllm_ascend.worker import utils as worker_utils
 from vllm_ascend.worker.utils import AscendKVBlockZeroer
 
@@ -38,6 +45,31 @@ class _FakeKernel:
             self.kwargs = kwargs
 
         return launch
+
+
+def test_nz_zeroer_targets_one_physical_hybrid_scale_page():
+    physical_block_size = 1024
+    kernel_block_size = 128
+    num_kernel_blocks = 32
+    num_heads = 4
+    spec = turboquant_cache_spec(
+        FullAttentionSpec(block_size=physical_block_size, num_kv_heads=num_heads, head_size=256, dtype=torch.bfloat16)
+    )
+    key = torch.zeros((num_kernel_blocks, kernel_block_size, num_heads, 128), dtype=torch.int8)
+    scales = torch.zeros((2, num_kernel_blocks, num_heads, kernel_block_size), dtype=torch.float32)
+    impl = object.__new__(AscendTurboQuantBackendImpl)
+    impl.adapter = TurboQuantOpsAdapter(TurboQuantOpsConfig(value_layout=TurboQuantValueLayout.NZ_TILED))
+    layer = SimpleNamespace(kv_cache=(key, torch.zeros_like(key), scales), impl=impl)
+    group = SimpleNamespace(kv_cache_spec=spec, kv_cache_group_id=0, layer_names=["attention"])
+    zeroer = AscendKVBlockZeroer(torch.device("cpu"), pin_memory=False)
+    zeroer.init_meta([group], [kernel_block_size], "auto", set(), {"attention": layer})
+
+    addresses, page_sizes, _, _, segments = zeroer._meta
+    assert segments == 3
+    assert int(addresses[2]) == scales.data_ptr()
+    scale_page_words = physical_block_size * 2 * num_heads
+    assert int(page_sizes[2]) == scale_page_words
+    assert int(zeroer._seg_page_strides[2]) == scale_page_words
 
 
 def test_init_meta_supports_non_uniform_page_sizes() -> None:

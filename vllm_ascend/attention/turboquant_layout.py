@@ -10,8 +10,8 @@ describes all three so they cannot drift apart:
 * the packed key plane, ``block_size * num_kv_heads * head_size/2`` INT8,
 * the packed value plane, the same again,
 * the fp32 scale plane, ``2 * num_kv_heads * block_size`` floats --- one scale
-  per (plane, head, token), plane-major, the layout the staged kernels'
-  reference uses (``tq_oracle::Reference::scale_offset``).
+  per (plane, head, token). The reference layout is plane-major; NZ ingress
+  stores slot-major K/V head records in the same nominal allocation shape.
 
 Three consumers share it: the KV cache spec
 (:class:`vllm_ascend.core.kv_cache_interface.AscendTurboQuantAttentionSpec`)
@@ -111,13 +111,30 @@ def turboquant_packed_cache_shape(
 def turboquant_scale_cache_shape(num_blocks: int, block_size: int, num_kv_heads: int) -> tuple[int, ...]:
     """Shape of the fp32 scale plane: ``(2, num_blocks, num_kv_heads, block_size)``.
 
-    Plane-major, then page, then head, then token -- the staged kernels' layout
-    (``tq_oracle::Reference::scale_offset``). A token's scales for one head are
-    therefore *not* contiguous; the AIV scatter writer uses a burst-padded
-    per-token slot instead, and that difference is one of the things a kernel
-    bring-up has to reconcile.
+    This is the allocation shape and the reference's plane-major layout
+    (``tq_oracle::Reference::scale_offset``). NZ ingress instead addresses its
+    flat storage as per-token K/V head records. Block movers must use
+    :func:`turboquant_scale_block_views` with the adapter's physical layout.
     """
     return (TURBOQUANT_PLANES, num_blocks, num_kv_heads, block_size)
+
+
+def turboquant_scale_block_views(scale_cache: torch.Tensor, *, slot_major: bool) -> tuple[torch.Tensor, ...]:
+    """Expose physical scale pages to block copy and zeroing operations.
+
+    The allocated shape is nominal for NZ ingress: its flat storage holds
+    [page, token, K/V head lane] records, rather than two separate K/V planes.
+    Reinterpreting those bytes as plane-major pages can overwrite another
+    request's scales while leaving stale records in the destination page.
+    """
+    if slot_major:
+        _, num_blocks, num_kv_heads, block_size = scale_cache.shape
+        lanes = TURBOQUANT_PLANES * num_kv_heads
+        lanes_per_burst = TURBOQUANT_GM_BURST_BYTES // TURBOQUANT_SCALE_DTYPE_SIZE
+        if lanes % lanes_per_burst:
+            raise ValueError("NZ scale records need a whole number of aligned bursts per token")
+        return (scale_cache.view(num_blocks, block_size, lanes),)
+    return scale_cache.unbind(0)
 
 
 def turboquant_carve_planes(

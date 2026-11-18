@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -30,8 +31,15 @@ from vllm_ascend.attention.turboquant_layout import (
     turboquant_scale_cache_shape,
     turboquant_scale_plane_bytes,
 )
+from vllm_ascend.attention.turboquant_v1 import (
+    AscendTurboQuantBackendImpl,
+    TurboQuantOpsAdapter,
+    TurboQuantOpsConfig,
+    TurboQuantValueLayout,
+)
 from vllm_ascend.core.kv_cache_interface import AscendTurboQuantAttentionSpec, turboquant_cache_spec
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.utils import copy_kv_cache_blocks_inplace
 
 ATTN = "model.layers.1.self_attn.attn"
 MAMBA = "model.layers.0.linear_attn"
@@ -287,6 +295,37 @@ def test_block_major_views_split_the_scale_plane_for_the_block_copier():
     # And they are views, not copies.
     key_scale[1, 0, 0] = 1.5
     assert float(kv_caches[ATTN][2][0, 1, 0, 0]) == 1.5
+
+
+def test_nz_block_copier_moves_all_scale_records_of_a_hybrid_page():
+    num_physical_blocks = 4
+    kernel_blocks_per_page = 8
+    num_kernel_blocks = num_physical_blocks * kernel_blocks_per_page
+    kernel_block_size = 128
+    num_heads = 4
+    packed_shape = (num_kernel_blocks, kernel_block_size, num_heads, 128)
+    key = torch.arange(num_kernel_blocks, dtype=torch.int8).view(-1, 1, 1, 1).expand(packed_shape).clone()
+    value = key + 17
+    scale = torch.arange(2 * num_kernel_blocks * num_heads * kernel_block_size, dtype=torch.float32)
+    scale = scale.view(2, num_kernel_blocks, num_heads, kernel_block_size)
+    cache = (key, value, scale)
+    impl = object.__new__(AscendTurboQuantBackendImpl)
+    impl.adapter = TurboQuantOpsAdapter(TurboQuantOpsConfig(value_layout=TurboQuantValueLayout.NZ_TILED))
+    runner = object.__new__(NPUModelRunner)
+    runner.kv_caches = [cache]
+    runner._turboquant_scale_planes = {scale.data_ptr(): impl.get_kv_cache_block_views(cache)[2:]}
+    before = tuple(plane.view(num_physical_blocks, -1).clone() for plane in cache)
+
+    normalized = runner._block_major_kv_caches()
+    assert len(normalized[0]) == 3
+    copy_kv_cache_blocks_inplace(
+        normalized,
+        num_physical_blocks,
+        [KVCacheBlockCopy(src_block_id=1, dst_block_id=3)],
+    )
+    for plane, expected in zip(cache, before):
+        expected[3] = expected[1]
+        assert torch.equal(plane.view(num_physical_blocks, -1), expected)
 
 
 def test_reshape_rejects_a_two_plane_allocation():

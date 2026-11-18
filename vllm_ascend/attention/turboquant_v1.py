@@ -30,6 +30,7 @@ from vllm_ascend.attention.turboquant_layout import (
     TURBOQUANT_PLANES,
     TURBOQUANT_VALUE_PLANE,
     turboquant_packed_cache_shape,
+    turboquant_scale_block_views,
     turboquant_scale_cache_shape,
 )
 from vllm_ascend.attention.utils import notify_kv_cache_written
@@ -600,6 +601,13 @@ class TurboQuantOpsAdapter:
         if self._has_kernel(TURBOQUANT_OP_RESHAPE_AND_CACHE) or self._has_kernel(TURBOQUANT_OP_RESHAPE_SCATTER):
             return TurboQuantValueLayout.NZ_TILED
         return self.config.value_layout
+
+    def block_major_cache_views(self, kv_cache: Sequence[torch.Tensor]) -> tuple[torch.Tensor, ...]:
+        key_cache, value_cache, scale_cache = kv_cache
+        scales = turboquant_scale_block_views(
+            scale_cache, slot_major=self.value_layout() is TurboQuantValueLayout.NZ_TILED
+        )
+        return key_cache, value_cache, *scales
 
     def rotate(self, x: torch.Tensor, emulator: TurboQuantEmulator) -> torch.Tensor:
         if self._has_kernel(TURBOQUANT_OP_ROTATE):
@@ -1671,6 +1679,13 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
         num_decodes: int,
         num_prefills: int,
     ) -> dict[str, Any]:
+        if getattr(common_attn_metadata, "offload_dummy", False):
+            # Dummy/capture runs bypass scheduler allocation. Invalidate the
+            # shared source before deriving a cast or strip plan: a stale live
+            # slot here would overwrite a previous request's cache during capture.
+            common_attn_metadata.slot_mapping.fill_(-1)
+        elif envs.VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS:
+            self._validate_slot_mapping(common_attn_metadata, block_table, query_lens, seq_lens)
         context_lens, host = self._refresh_context_lens(common_attn_metadata, seq_lens)
         tokens = int(context_lens.numel())
         self._reject_multi_token_steps(common_attn_metadata, tokens)
@@ -1682,6 +1697,65 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
             "turboquant_query_rot": self._query_rot,
             "turboquant_num_tokens": tokens,
         }
+
+    def _validate_slot_mapping(
+        self,
+        common_attn_metadata: Any,
+        block_table: torch.Tensor,
+        query_lens: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> None:
+        """Diagnostic only: check live writes before uploading lengths or tiling."""
+        if _stream_is_capturing():
+            raise RuntimeError("TurboQuant slot validation requires metadata construction outside graph capture")
+        num_reqs = int(common_attn_metadata.num_reqs)
+        num_tokens = int(common_attn_metadata.num_actual_tokens)
+        lengths = []
+        remaining = num_tokens
+        for length in query_lens[:num_reqs].tolist():
+            if remaining == 0:
+                break  # FIA/graph padding requests do not own live write slots.
+            if length < 0 or length > remaining:
+                raise ValueError("TurboQuant live query lengths do not cover the current request/token count")
+            lengths.append(length)
+            remaining -= length
+        num_live_reqs = len(lengths)
+        contexts = seq_lens[:num_live_reqs].tolist()
+        if remaining or len(contexts) != num_live_reqs:
+            raise ValueError("TurboQuant live query lengths do not cover the current request/token count")
+        if block_table.shape[0] < num_live_reqs or common_attn_metadata.slot_mapping.numel() < num_tokens:
+            raise ValueError("TurboQuant block table or slot mapping is shorter than the current batch")
+        slots = common_attn_metadata.slot_mapping[:num_tokens].to(device="cpu", dtype=torch.int64)
+        pages = block_table[:num_live_reqs].to(device="cpu", dtype=torch.int64)
+        start = 0
+        for request, (length, context) in enumerate(zip(lengths, contexts)):
+            if length < 0 or context < length:
+                raise ValueError(f"TurboQuant request {request} has query_len={length}, context_len={context}")
+            positions = torch.arange(context - length, context, dtype=torch.int64)
+            logical_pages = positions // self._block_size
+            if length and int(logical_pages[-1]) >= pages.shape[1]:
+                raise ValueError(f"TurboQuant request {request} exceeds its block-table row")
+            physical_pages = pages[request, logical_pages]
+            if bool((physical_pages < 0).any()):
+                raise ValueError(f"TurboQuant request {request} has an unmapped live block-table entry")
+            expected = physical_pages * self._block_size + positions % self._block_size
+            actual = slots[start : start + length]
+            mismatch = torch.nonzero(actual != expected, as_tuple=False).flatten()
+            if mismatch.numel():
+                row = int(mismatch[0])
+                raise ValueError(
+                    f"TurboQuant slot_mapping mismatch: request={request}, token_row={start + row}, "
+                    f"position={int(positions[row])}, actual_slot={int(actual[row])}, "
+                    f"expected_slot={int(expected[row])}, physical_page={int(physical_pages[row])}, "
+                    f"kernel_block_size={self._block_size}"
+                )
+            start += length
+        unique_slots, counts = torch.unique(slots, return_counts=True)
+        duplicate_slots = unique_slots[counts > 1]
+        if duplicate_slots.numel():
+            slot = int(duplicate_slots[0])
+            rows = torch.nonzero(slots == slot, as_tuple=False).flatten().tolist()
+            raise ValueError(f"TurboQuant live writes alias physical slot {slot} at token rows {rows}")
 
     def _reject_multi_token_steps(self, common_attn_metadata: Any, tokens: int) -> None:
         per_req = int(getattr(common_attn_metadata, "decode_token_per_req", 1) or 1)
@@ -1845,8 +1919,6 @@ class AscendTurboQuantBackend(AscendAttentionBackend):
     def get_scale_cache_shape(num_blocks: int, block_size: int, num_kv_heads: int) -> tuple[int, ...]:
         return turboquant_scale_cache_shape(num_blocks, block_size, num_kv_heads)
 
-    _SCALE_PLANE_INDEX: int = 2
-
     @classmethod
     def swap_blocks(
         cls,
@@ -1856,11 +1928,11 @@ class AscendTurboQuantBackend(AscendAttentionBackend):
     ) -> None:
         src_indices = src_to_dst[:, 0]
         dst_indices = src_to_dst[:, 1]
-        for index, (src_cache, dst_cache) in enumerate(zip(src_kv_cache, dst_kv_cache)):
-            if index == cls._SCALE_PLANE_INDEX:
-                dst_cache[:, dst_indices] = src_cache[:, src_indices].to(dst_cache.device)
-            else:
-                dst_cache[dst_indices] = src_cache[src_indices].to(dst_cache.device)
+        adapter = TurboQuantOpsAdapter()
+        src_views = adapter.block_major_cache_views(src_kv_cache)
+        dst_views = adapter.block_major_cache_views(dst_kv_cache)
+        for src_cache, dst_cache in zip(src_views, dst_views):
+            dst_cache[dst_indices] = src_cache[src_indices].to(dst_cache.device)
 
     @classmethod
     def copy_blocks(
@@ -1870,12 +1942,10 @@ class AscendTurboQuantBackend(AscendAttentionBackend):
     ) -> None:
         src_indices = src_to_dists[:, 0]
         dst_indices = src_to_dists[:, 1]
+        adapter = TurboQuantOpsAdapter()
         for kv_cache in kv_caches:
-            for index, cache in enumerate(kv_cache):
-                if index == cls._SCALE_PLANE_INDEX:
-                    cache[:, dst_indices] = cache[:, src_indices]
-                else:
-                    cache[dst_indices] = cache[src_indices]
+            for cache in adapter.block_major_cache_views(kv_cache):
+                cache[dst_indices] = cache[src_indices]
 
 
 TURBOQUANT_PROFILE_ENV: Final[str] = "TURBOQUANT_PROFILE"
@@ -2069,6 +2139,10 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
             device=self.key_cache.device,
         )
         return self.scale_cache
+
+    def get_kv_cache_block_views(self, kv_cache: Sequence[torch.Tensor]) -> tuple[torch.Tensor, ...]:
+        """Physical page views for the runner's cache copy and zeroing paths."""
+        return self.adapter.block_major_cache_views(kv_cache)
 
     def reshape_and_cache(
         self,
