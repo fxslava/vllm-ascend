@@ -47,6 +47,7 @@ from torch.overrides import TorchFunctionMode
 from vllm_ascend.attention.turboquant_layout import turboquant_packed_bytes, turboquant_scale_cache_shape
 from vllm_ascend.attention.turboquant_v1 import (
     TURBOQUANT_DECODE_SPLITS,
+    TURBOQUANT_DECODE_UNPACK,
     TURBOQUANT_STAGE_UNROTATED,
     TURBOQUANT_STAGING_SLOTS,
     AscendTurboQuantBackendImpl,
@@ -375,6 +376,7 @@ _ARG = {
             "output_stage",
             "scale",
             "inv_sqrt_len",
+            "decode_unpack",
         )
     )
 }
@@ -1454,6 +1456,7 @@ _LAUNCH_ABI: tuple[tuple[str, str, Any], ...] = (
     ("output_stage", "int", TURBOQUANT_STAGE_UNROTATED),
     ("scale", "float", 0.125),
     ("inv_sqrt_len", "float", None),
+    ("decode_unpack", "int", TURBOQUANT_DECODE_UNPACK),
 )
 
 

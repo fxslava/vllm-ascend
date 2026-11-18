@@ -739,6 +739,7 @@ class TurboQuantOpsAdapter:
         pi_signs: torch.Tensor,
         tables: torch.Tensor,
         inv_sqrt_len: float,
+        quant_mode: int = TURBOQUANT_QUANT_MODE,
     ) -> None:
         _trace_turboquant_dispatch(
             TURBOQUANT_OP_RESHAPE_AND_CACHE,
@@ -762,7 +763,7 @@ class TurboQuantOpsAdapter:
             pi_signs,
             tables,
             inv_sqrt_len,
-            TURBOQUANT_QUANT_MODE,
+            quant_mode,
         )
 
     def _golden_reshape_and_cache_prefill(
@@ -838,6 +839,7 @@ class TurboQuantOpsAdapter:
         slot_mapping: torch.Tensor,
         pi_signs: torch.Tensor,
         inv_sqrt_len: float,
+        quant_mode: int = TURBOQUANT_QUANT_MODE,
     ) -> None:
         self._require_kernel(TURBOQUANT_OP_RESHAPE_SCATTER)(
             key,
@@ -848,7 +850,7 @@ class TurboQuantOpsAdapter:
             slot_mapping,
             pi_signs,
             inv_sqrt_len,
-            TURBOQUANT_QUANT_MODE,
+            quant_mode,
         )
 
     def _golden_reshape_scatter_decode(
@@ -1347,6 +1349,7 @@ class TurboQuantOpsAdapter:
         output_stage: int,
         scale: float,
         inv_sqrt_len: float,
+        decode_unpack: int = TURBOQUANT_DECODE_UNPACK,
     ) -> torch.Tensor:
         self._require_kernel(TURBOQUANT_OP_FUSED_DECODE)(
             query,
@@ -1370,8 +1373,7 @@ class TurboQuantOpsAdapter:
             output_stage,
             scale,
             inv_sqrt_len,
-            TURBOQUANT_DECODE_UNPACK,
-            TURBOQUANT_QUANT_MODE,
+            decode_unpack,
         )
         return output
 

@@ -38,6 +38,7 @@ from vllm_ascend.attention.turboquant_layout import (
 from vllm_ascend.attention.turboquant_v1 import (
     TURBOQUANT_DECODE_MAX_SPLITS,
     TURBOQUANT_DECODE_SPLITS,
+    TURBOQUANT_DECODE_UNPACK,
     TURBOQUANT_KERNEL_OPS,
     TURBOQUANT_OP_BUILD_DECODE_TILING,
     TURBOQUANT_OP_FUSED_DECODE,
@@ -47,6 +48,7 @@ from vllm_ascend.attention.turboquant_v1 import (
     TURBOQUANT_OP_RESHAPE_SCATTER,
     TURBOQUANT_OP_ROTATE,
     TURBOQUANT_OP_UNPACK_DEQUANT,
+    TURBOQUANT_QUANT_MODE,
     TURBOQUANT_REGISTERED_OPS,
     TURBOQUANT_STAGE_ROTATED_BASIS,
     TURBOQUANT_STAGE_UNROTATED,
@@ -443,11 +445,13 @@ def test_the_prefill_entry_point_takes_the_batch_writer_abi(
     )
 
     # The schema's order: key, value, the three planes, slot_mapping, pi_signs,
-    # tables, inv_sqrt_len. Every scalar the C launcher also takes is derived in
-    # torch_bindings.cpp from these tensors. There is no mode-4 channel-policy
-    # argument: the audited writer is mode-2 only.
+    # tables, inv_sqrt_len, quant_mode. Every scalar the C launcher also takes
+    # is derived in torch_bindings.cpp from these tensors. There is no mode-4
+    # channel-policy argument: the audited writer is mode-2 only. quant_mode is
+    # 0 (the uniform grid) unless VLLM_ASCEND_TURBOQUANT_QUANT_MODE=1 selects
+    # the Lloyd-Max codebook.
     args = entry.args
-    assert len(args) == 9
+    assert len(args) == 10
     assert (args[0], args[1]) == (key, value)
     assert (args[2], args[3], args[4], args[5]) == (*caches, slot_mapping)
     assert torch.equal(args[6], emulator.pi_signs)
@@ -465,6 +469,7 @@ def test_the_prefill_entry_point_takes_the_batch_writer_abi(
     # a rounding: every entry is still a unit sign.
     assert torch.equal(args[7].abs().to(torch.float32), torch.ones_like(args[7], dtype=torch.float32))
     assert args[8] == pytest.approx(emulator.inv_sqrt_len)
+    assert args[9] == TURBOQUANT_QUANT_MODE
     # The kernel owns the write, so the golden model must not have run.
     assert torch.equal(caches[0], torch.zeros_like(caches[0]))
 
@@ -482,13 +487,14 @@ def test_the_decode_entry_point_takes_the_scatter_writer_abi(
 
     # The work split (block_dim, item_begin, item_count), the canary probe and
     # the cu_seqlens prefix sum are all the binding's, so the schema is tensors
-    # plus the scale fold.
+    # plus the scale fold and the codebook selector.
     args = entry.args
-    assert len(args) == 8
+    assert len(args) == 9
     assert (args[0], args[1]) == (key, value)
     assert (args[2], args[3], args[4], args[5]) == (*caches, slot_mapping)
     assert torch.equal(args[6], emulator.pi_signs)
     assert args[7] == pytest.approx(emulator.inv_sqrt_len)
+    assert args[8] == TURBOQUANT_QUANT_MODE
     assert torch.equal(caches[0], torch.zeros_like(caches[0]))
 
 
@@ -957,7 +963,7 @@ def test_fused_decode_launches_and_returns_its_output(
 def test_fused_decode_passes_the_schema_the_binding_declares(
     monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
 ) -> None:
-    """The 21 arguments of npu_turboquant_fused_decode, in the schema's order.
+    """The 22 arguments of npu_turboquant_fused_decode, in the schema's order.
 
     The mode, the element type and the two codec constant pools are the
     binding's, so none of them appears here. The tiling descriptors, the Split-K
@@ -990,7 +996,7 @@ def test_fused_decode_passes_the_schema_the_binding_declares(
     )
 
     args = entry.args
-    assert len(args) == 21
+    assert len(args) == 22
     assert args[0] is query
     assert torch.equal(args[1], emulator.pi_signs)
     assert args[2].dtype is TURBOQUANT_TABLE_DTYPE  # rot_tables: the same BF16 blob
@@ -1008,6 +1014,10 @@ def test_fused_decode_passes_the_schema_the_binding_declares(
     assert args[14:19] == (12, NUM_KV_HEADS, TURBOQUANT_DECODE_SPLITS, 6, TURBOQUANT_STAGE_UNROTATED)
     assert args[19] == pytest.approx(0.125)
     assert args[20] == pytest.approx(emulator.inv_sqrt_len)
+    # decode_unpack: 0 (kNative), or 3 (kLloydMaxLut) when
+    # VLLM_ASCEND_TURBOQUANT_QUANT_MODE=1 wrote the cache on the Lloyd-Max
+    # codebook.
+    assert args[21] == TURBOQUANT_DECODE_UNPACK
 
 
 # ---------------------------------------------------------------------------
