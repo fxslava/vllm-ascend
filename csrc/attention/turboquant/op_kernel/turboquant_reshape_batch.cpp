@@ -83,9 +83,10 @@ constexpr std::uint32_t kNzBurstBytes = kTokens * kNzC0;
 // from it is kNzHeadBytes, the per-group step kNzGroupBytes and the per-tile-row step kNzC0 --
 // which is the whole address arithmetic this writer needs, because a strip's slice of one
 // column group is 16 CONTIGUOUS tile rows of 32 bytes.
-TQ_AICORE constexpr std::uint32_t NzStripBase(std::uint32_t slot, std::uint32_t heads)
+TQ_AICORE constexpr std::uint64_t NzStripBase(std::uint32_t slot, std::uint32_t heads)
 {
-    return (slot - slot % kNzTileRows) * heads * kNzRowBytes + (slot % kNzTileRows) * kNzC0;
+    return static_cast<std::uint64_t>(slot - slot % kNzTileRows) * heads * kNzRowBytes +
+           (slot % kNzTileRows) * kNzC0;
 }
 
 // The open-coded base, head step, group step and row step against NzTiledPackedByte itself,
@@ -110,7 +111,7 @@ TQ_AICORE constexpr bool NzStripAgrees(std::uint32_t slot)
     for (std::uint32_t kv = 0; kv < 2u; ++kv)
         for (std::uint32_t head = 0; head < kHeads; ++head)
             for (std::uint32_t row = 0; row < kTokens; ++row)
-                if (slot * kNzScaleSlot + kv * kHeads + head + row * kNzScaleSlot !=
+                if (static_cast<std::uint64_t>(slot) * kNzScaleSlot + kv * kHeads + head + row * kNzScaleSlot !=
                     tq_contract::NzTiledScaleIndex(slot + row, head, kv, kHeads))
                     return false;
     return true;
@@ -129,6 +130,33 @@ static_assert(kNzScaleSlot == tq_contract::NzScaleSlotFloats(kHeads),
 static_assert(kNzScaleSlabFloats == kTokens * tq_contract::kFp32PerBlock,
               "the scale lane image is one FP32 DataBlock a token");
 #endif
+
+// These offsets address entire cache planes, which can exceed 4 GiB even
+// though individual slot IDs fit int32. Keep them wide through StoreChunk.
+struct StripAddr {
+    std::uint64_t page_bytes;
+    std::uint64_t key_scale;
+    std::uint64_t value_scale;
+};
+
+TQ_AICORE constexpr StripAddr CalculateStripOffsets(std::uint32_t slot0, std::uint32_t num_kv_heads,
+                                                   std::uint64_t head_bytes, std::uint32_t block_size,
+                                                   std::uint32_t num_blocks) {
+#if TURBOQUANT_INGRESS_NZ
+    (void)head_bytes;
+    (void)block_size;
+    (void)num_blocks;
+    const std::uint64_t key_scale = static_cast<std::uint64_t>(slot0) * kNzScaleSlot;
+    return {NzStripBase(slot0, num_kv_heads), key_scale, key_scale + num_kv_heads};
+#else
+    const std::uint64_t block_idx = slot0 / block_size;
+    const std::uint32_t strip_in_block = (slot0 % block_size) / kTokens;
+    const std::uint32_t strip_bytes = strip_in_block * kPackedBytes;
+    return {block_idx * num_kv_heads * head_bytes + strip_bytes,
+            block_idx * num_kv_heads * block_size + strip_in_block * kTokens,
+            (num_blocks + block_idx) * num_kv_heads * block_size + strip_in_block * kTokens};
+#endif
+}
 
 }
 
@@ -318,10 +346,10 @@ struct VectorState {
     AscendC::GlobalTensor<std::int8_t> key_cache;
     AscendC::GlobalTensor<std::int8_t> value_cache;
     AscendC::GlobalTensor<float> scale_cache;
-    std::uint32_t page_bytes;
-    std::uint32_t head_bytes;
-    std::uint32_t key_scale;
-    std::uint32_t value_scale;
+    std::uint64_t page_bytes;
+    std::uint64_t head_bytes;
+    std::uint64_t key_scale;
+    std::uint64_t value_scale;
     std::uint32_t head_scale;
     // The quantiser: 0 is the uniform mid-rise grid on the absmax power-of-two scale, 1 is the
     // Lloyd-Max codebook on the per-row RMS scale (LloydMaxQuantisePanel).
@@ -337,51 +365,15 @@ struct VectorState {
 using LloydMaxKv4 =
     vllm_ascend::turboquant::TurboQuantLloydMaxTraits<vllm_ascend::turboquant::TurboQuantMode::KV4_FP8>;
 
-struct StripAddr {
-    std::uint32_t page_bytes;
-    std::uint32_t key_scale;
-    std::uint32_t value_scale;
-};
-
-#if TURBOQUANT_INGRESS_NZ
-// The NZ form of the same three bases. `slot0` is the GLOBAL row of the strip's first token,
-// which is what NzTiledPackedByte and NzTiledScaleIndex are defined on: no separate page base is
-// added, because (slot0 - slot0 % 64) already carries it. StoreChunk adds this chunk's head and
-// plane steps (kNzHeadBytes, and one float a head above the plane's lane base).
-//
-// The strip writer's `head_bytes`, `block_size` and `num_blocks` have no NZ counterpart: a tile
-// is addressed by its own first row, so the page stride and the plane-major scale split both
-// disappear. The signature is kept so ExecuteVector reads the same for both layouts.
+// slot0 is a global row. Derive wide offsets before any products, then retain
+// them in VectorState and StoreChunk rather than narrowing the DMA address.
 __aicore__ inline StripAddr CalculateStripAddr(__gm__ const std::int32_t* slot_mapping,
                                                std::uint32_t strip, std::uint32_t num_kv_heads,
-                                               std::uint32_t head_bytes, std::uint32_t block_size,
-                                               std::uint32_t num_blocks) {
-    (void)head_bytes;
-    (void)block_size;
-    (void)num_blocks;
-    const std::uint32_t slot0 = static_cast<std::uint32_t>(slot_mapping[strip * kTokens]);
-    StripAddr a;
-    a.page_bytes = NzStripBase(slot0, num_kv_heads);
-    a.key_scale = slot0 * kNzScaleSlot;
-    a.value_scale = a.key_scale + num_kv_heads;
-    return a;
-}
-#else
-__aicore__ inline StripAddr CalculateStripAddr(__gm__ const std::int32_t* slot_mapping,
-                                               std::uint32_t strip, std::uint32_t num_kv_heads,
-                                               std::uint32_t head_bytes, std::uint32_t block_size,
+                                               std::uint64_t head_bytes, std::uint32_t block_size,
                                                std::uint32_t num_blocks) {
     const std::uint32_t slot0 = static_cast<std::uint32_t>(slot_mapping[strip * kTokens]);
-    const std::uint32_t block_idx = slot0 / block_size;
-    const std::uint32_t strip_in_block = (slot0 % block_size) / kTokens;
-    const std::uint32_t strip_bytes = strip_in_block * kPackedBytes;
-    StripAddr a;
-    a.page_bytes = block_idx * num_kv_heads * head_bytes + strip_bytes;
-    a.key_scale = block_idx * num_kv_heads * block_size + strip_in_block * kTokens;
-    a.value_scale = (num_blocks + block_idx) * num_kv_heads * block_size + strip_in_block * kTokens;
-    return a;
+    return CalculateStripOffsets(slot0, num_kv_heads, head_bytes, block_size, num_blocks);
 }
-#endif
 
 constexpr auto kUb = AscendC::TPosition::VECCALC;
 
@@ -566,7 +558,7 @@ public:
         vector_.head_bytes = kNzHeadBytes;
         vector_.head_scale = 1u;
 #else
-        vector_.head_bytes = block_size * head_size / 2u;
+        vector_.head_bytes = static_cast<std::uint64_t>(block_size) * head_size / 2u;
         vector_.head_scale = block_size;
 #endif
         vector_.inv_sqrt_len = inv_sqrt_len;
@@ -970,8 +962,8 @@ public:
         auto slab = View<float>(kScaleBase<pack>, kNzScaleSlabFloats);
 
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(pack_evt);
-        const std::uint32_t page = vector_.page_bytes + kChunkHead<PHASE> * kNzHeadBytes;
-        const std::uint32_t slice = (kIsKey<PHASE> ? vector_.key_scale : vector_.value_scale) + kChunkHead<PHASE> * vector_.head_scale;
+        const std::uint64_t page = vector_.page_bytes + kChunkHead<PHASE> * kNzHeadBytes;
+        const std::uint64_t slice = (kIsKey<PHASE> ? vector_.key_scale : vector_.value_scale) + kChunkHead<PHASE> * vector_.head_scale;
 
         // kNzGroups bursts, one a column group: kNzBurstBytes of contiguous UB into
         // kNzBurstBytes of contiguous GM, kNzGroupBytes apart. A strip's 16 tile rows of a group
@@ -1000,8 +992,8 @@ public:
         auto scale = View<float>(kScaleBase<pack>, kScaleFloats);
 
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(pack_evt);
-        const std::uint32_t page = vector_.page_bytes + kChunkHead<PHASE> * vector_.head_bytes;
-        const std::uint32_t slice = (kIsKey<PHASE> ? vector_.key_scale : vector_.value_scale) + kChunkHead<PHASE> * vector_.head_scale;
+        const std::uint64_t page = vector_.page_bytes + kChunkHead<PHASE> * vector_.head_bytes;
+        const std::uint64_t slice = (kIsKey<PHASE> ? vector_.key_scale : vector_.value_scale) + kChunkHead<PHASE> * vector_.head_scale;
         if constexpr (kIsKey<PHASE>) {
             AscendC::DataCopy(vector_.key_cache[page], packed, kPackedBytes);
         } else {

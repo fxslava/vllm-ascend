@@ -3,7 +3,7 @@
 """Host-only gates for the TurboQuant layout and synchronization contracts.
 
 These replace the single ``test_turboquant_kernel_contracts`` gate. They are the
-two device-free legs of the audited kernel tree, and they are toolkit-free on
+device-free legs of the audited kernel tree, and they are toolkit-free on
 purpose: the layout contract, the host tiling and the kernels' host-visible
 geometry and nothing else, so a build plus a run is a couple of seconds with any
 C++17 compiler and needs no CANN and no NPU.
@@ -20,6 +20,10 @@ every logical element, that both the NZ and the RFC 3.1 strip maps are bijection
 onto their allocations, that the two contracts' co-byte pairings are structurally
 incompatible, and that both scale planes are bijections.
 
+``test_cache_addresses`` checks the production prefill writer's offsets against
+the decode layout at and above the 4 GiB boundary, including scale offsets and
+the largest non-negative int32 slot.
+
 Run without the NPU unit-test fixtures::
 
     pytest --noconftest tests/ut/ops/test_turboquant_contract_gates.py
@@ -31,7 +35,7 @@ from pathlib import Path
 
 import pytest
 
-GATES = ("test_contract_gates", "test_layout_bridge")
+GATES = ("test_contract_gates", "test_layout_bridge", "test_cache_addresses")
 
 # `turboquant_reshape_batch.cpp` is included by test_contract_gates.cpp: its
 # device body sits behind `#if defined(__CCE_AICORE__)`, so a host compiler sees
