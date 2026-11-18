@@ -282,7 +282,7 @@ def test_dispatch_trace_reports_custom_operator(
 # ---------------------------------------------------------------------------
 
 
-def test_rotate_golden_runs_when_the_stage_is_off(emulator: TurboQuantEmulator) -> None:
+def test_rotate_reference_runs_when_the_stage_is_off(emulator: TurboQuantEmulator) -> None:
     x = torch.randn(3, HEAD_SIZE)
     assert torch.equal(_adapter().rotate(x, emulator), emulator.rotate(x))
     assert torch.equal(_adapter().inverse_rotate(x, emulator), emulator.inverse_rotate(x))
@@ -320,7 +320,7 @@ def test_rotate_dispatches_both_directions_to_the_kernel(
 # ---------------------------------------------------------------------------
 
 
-def test_quantize_pack_golden_runs_when_the_stage_is_off(emulator: TurboQuantEmulator) -> None:
+def test_quantize_pack_reference_runs_when_the_stage_is_off(emulator: TurboQuantEmulator) -> None:
     rotated = emulator.rotate(torch.randn(3, HEAD_SIZE))
     packed, scales = _adapter().quantize_and_pack(rotated, emulator)
     codes, expected_scales = emulator.quantize(rotated)
@@ -380,7 +380,7 @@ def _assert_cache_holds(
             assert torch.equal(scale_cache[plane, page, :, offset], scales)
 
 
-def test_both_golden_writers_land_the_codec_bytes(emulator: TurboQuantEmulator) -> None:
+def test_both_reference_writers_land_the_codec_bytes(emulator: TurboQuantEmulator) -> None:
     key, value = _activations(BLOCK_SIZE)
     slot_mapping = torch.arange(BLOCK_SIZE, dtype=torch.int32)
 
@@ -687,7 +687,7 @@ class _GoldenWriter:
         _nz_layout_adapter()._write_slots(key, value, key_cache, value_cache, scale_cache, slot_mapping, self._emulator)
 
 
-def _golden_writer(monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator) -> _GoldenWriter:
+def _reference_writer(monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator) -> _GoldenWriter:
     writer = _GoldenWriter(emulator)
     _register(
         monkeypatch,
@@ -738,7 +738,7 @@ def test_the_split_lands_what_one_unsplit_call_would_have(
             emulator,
         )
 
-    _golden_writer(monkeypatch, emulator)
+    _reference_writer(monkeypatch, emulator)
     written = _nz_caches()
     _staged_adapter().reshape_and_cache_prefill(key, value, *written, slot_mapping, emulator)
 
@@ -760,7 +760,7 @@ def test_the_only_slots_touched_beyond_the_step_are_the_planned_pad(
     key, value = _nz_activations(num_tokens)
     slot_mapping = torch.arange(num_tokens, dtype=torch.int32)
 
-    writer = _golden_writer(monkeypatch, emulator)
+    writer = _reference_writer(monkeypatch, emulator)
     written = _nz_caches()
     _staged_adapter().reshape_and_cache_prefill(key, value, *written, slot_mapping, emulator)
 
@@ -822,7 +822,7 @@ def test_a_head_misaligned_step_reaches_both_writers(
     assert [call[0][5].tolist() for call in scatter.calls] == [[slot] for slot in range(20, 32)]
 
 
-def test_the_scatter_waves_fall_back_to_golden_without_the_scatter_kernel(
+def test_the_scatter_waves_fall_back_to_reference_without_the_scatter_kernel(
     monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
 ) -> None:
     """Staging the batch writer on alone must still land every token.
@@ -854,7 +854,7 @@ def test_the_scatter_waves_fall_back_to_golden_without_the_scatter_kernel(
 # ---------------------------------------------------------------------------
 
 
-def test_gather_round_trips_through_the_golden_path(emulator: TurboQuantEmulator) -> None:
+def test_gather_round_trips_through_the_reference_path(emulator: TurboQuantEmulator) -> None:
     key, value = _activations(BLOCK_SIZE)
     caches = _caches()
     _adapter().reshape_and_cache_prefill(key, value, *caches, torch.arange(BLOCK_SIZE, dtype=torch.int32), emulator)
@@ -1185,7 +1185,7 @@ def test_p6_an_undersized_scale_plane_is_refused(monkeypatch: pytest.MonkeyPatch
     assert entry.calls == []
 
 
-def test_p6_a_clean_launch_passes_and_the_golden_fallback_keeps_any_dtype(
+def test_p6_a_clean_launch_passes_and_the_reference_fallback_keeps_any_dtype(
     monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
 ) -> None:
     """The positive half, plus proof the check never gates the fallback."""
@@ -1449,7 +1449,7 @@ def _check(state: Any) -> None:
         (TurboQuantKernelStage.QUANTIZE, TurboQuantKernelStage.GATHER),
     ],
 )
-def test_a_golden_run_is_not_constrained_by_the_kernels(stages: tuple[TurboQuantKernelStage, ...]) -> None:
+def test_a_reference_run_is_not_constrained_by_the_kernels(stages: tuple[TurboQuantKernelStage, ...]) -> None:
     """No writer and no decode staged: every shape the golden model admits is fine.
 
     The four stages with no kernel behind them must not constrain anything

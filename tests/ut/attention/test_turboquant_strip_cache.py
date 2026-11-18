@@ -232,7 +232,7 @@ def _oracle_strip_cache(key, value, caches, slot_mapping, emulator):
 
 
 @pytest.mark.parametrize("block_size", [16, 64])
-def test_the_golden_gather_reads_a_kernel_written_cache(monkeypatch, block_size):
+def test_the_reference_gather_reads_a_kernel_written_cache(monkeypatch, block_size):
     """Item 3: a strip cache, read back with no numerical drift.
 
     The cache is filled by the scalar oracle above -- the writers' formula, not

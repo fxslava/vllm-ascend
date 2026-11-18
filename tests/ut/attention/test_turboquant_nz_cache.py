@@ -96,7 +96,7 @@ def written() -> tuple:
     return caches, slots, key, value, emulator
 
 
-def test_the_golden_nz_write_matches_the_scalar_oracle(written) -> None:
+def test_the_reference_nz_write_matches_the_scalar_oracle(written) -> None:
     """Every byte and every scale lane, against NzTiledPackedByte/NzTiledScaleIndex."""
     (key_cache, value_cache, scale_cache), slots, key, value, emulator = written
     codes_k, scales_k = emulator.quantize(emulator.rotate(key))
@@ -116,7 +116,7 @@ def test_the_golden_nz_write_matches_the_scalar_oracle(written) -> None:
             assert float(scale_flat[turboquant_nz_scale_index(slot, head, 1, NUM_KV_HEADS)]) == float(scales_v[t, head])
 
 
-def test_the_golden_nz_write_matches_the_whole_cache_conversion(written) -> None:
+def test_the_reference_nz_write_matches_the_whole_cache_conversion(written) -> None:
     """The per-token writes reproduce turboquant_codes_to_nz_tiled over the cache."""
     (key_cache, value_cache, scale_cache), slots, key, value, emulator = written
     codes_k, scales_k = emulator.quantize(emulator.rotate(key))
@@ -142,7 +142,7 @@ def test_the_golden_nz_write_matches_the_whole_cache_conversion(written) -> None
     assert torch.equal(scale_cache.view(-1)[: want_scales.numel()], want_scales)
 
 
-def test_the_golden_nz_gather_round_trips(written) -> None:
+def test_the_reference_nz_gather_round_trips(written) -> None:
     """Gathering the NZ cache returns the codec's own codes and scales, token-major."""
     (key_cache, value_cache, scale_cache), slots, key, value, emulator = written
     codes_k, scales_k = emulator.quantize(emulator.rotate(key))

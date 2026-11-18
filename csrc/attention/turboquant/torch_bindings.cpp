@@ -641,7 +641,9 @@ void npu_turboquant_build_decode_tiling(at::Tensor &context_lens, at::Tensor &ti
                 " int32 words; ", num_tokens, " tokens x ", num_splits, " splits with grid ",
                 request.grid, " needs ", words);
 
-    const at::Tensor host = at::empty({words}, at::TensorOptions().dtype(at::kInt));
+    const bool upload_to_device = !tiling.device().is_cpu();
+    const at::Tensor host = at::empty(
+        {words}, at::TensorOptions().device(at::kCPU).dtype(at::kInt).pinned_memory(upload_to_device));
     TORCH_CHECK(reinterpret_cast<std::uintptr_t>(host.data_ptr()) %
                         alignof(tiling::TurboQuantDecodeTilingData) ==
                     0,
@@ -654,7 +656,10 @@ void npu_turboquant_build_decode_tiling(at::Tensor &context_lens, at::Tensor &ti
     TORCH_CHECK(status == tiling::DecodeTilingStatus::kOk, op, ": ",
                 tiling::decode_tiling_status_text(status));
 
-    tiling.narrow(0, 0, words).copy_(host, /*non_blocking=*/false);
+    // A fresh pinned allocation lets the NPU host allocator defer recycling until the
+    // stream's copy completes. Reusing a host buffer here would race queued uploads.
+    // copy_ enqueues on the same current stream as the fused decode consumers.
+    tiling.narrow(0, 0, words).copy_(host, /*non_blocking=*/upload_to_device);
 }
 
 // ---------------------------------------------------------------------------

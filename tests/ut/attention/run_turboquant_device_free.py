@@ -43,6 +43,7 @@ DEVICE_FREE_TESTS = (
     "test_turboquant_layout.py",
     "test_turboquant_nz_ingress.py",
     "test_turboquant_profile.py",
+    "test_turboquant_host_staging.py",
 )
 
 
