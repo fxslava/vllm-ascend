@@ -28,13 +28,19 @@ import pytest
 import torch
 
 from tests.helpers.turboquant import (
+    CACHE_POISON_SCALE,
     OpRecorder,
     assert_cache_equal,
+    assert_poison_scales_preserved,
     make_activations,
     make_adapter,
     make_cache,
+    make_finite_spike_cache,
+    make_recycled_page_table,
     register_ops,
+    slots_from_page_table,
 )
+from vllm_ascend.attention import turboquant_v1
 from vllm_ascend.attention.turboquant_layout import (
     TURBOQUANT_KEY_PLANE,
     TURBOQUANT_PACK_FACTOR,
@@ -52,6 +58,7 @@ from vllm_ascend.attention.turboquant_v1 import (
     TurboQuantOpsAdapter,
     TurboQuantOpsConfig,
     TurboQuantValueLayout,
+    turboquant_plan_strip_ingestion,
 )
 
 # The strip cache's block_size is 16: it is kTokens in the batch writer, a
@@ -438,6 +445,7 @@ def test_stages_none_runs_the_whole_path_golden(monkeypatch: pytest.MonkeyPatch,
     [
         pytest.param(2, 0x3F791A87, 0x3F791A88, 1, True, id="reported-scale-plus-one-ulp"),
         pytest.param(2, 0x3F826D29, 0x3F826D28, 1, True, id="reported-scale-minus-one-ulp"),
+        pytest.param(2, 0x71800000, 0x71800001, 1, False, id="large-finite-poison-stays-exact"),
         pytest.param(2, 0x3F7FFFFF, 0x3F800000, 1, True, id="scale-exponent-boundary"),
         pytest.param(2, 0x3F791A87, 0x3F791A89, 1, False, id="two-ulps-rejected"),
         pytest.param(2, 0x3F791A87, 0x3F791A88, 0, False, id="snapshot-stays-exact"),
@@ -475,3 +483,138 @@ def test_cache_comparison_limits_rounding_to_live_scales(plane, before, after, b
             assert_cache_equal(actual, expected, scale_max_ulps=budget)
         if plane == 2:
             assert "max finite absolute error nan" not in str(error.value)
+
+
+@pytest.mark.parametrize("block_size", [128, 256, 1024])
+@pytest.mark.parametrize("tail", [1, 8, 31, 127])
+def test_recycled_batch_prefill_fixture_preserves_poison_and_reserves_decode_slots(monkeypatch, block_size, tail):
+    """Exercise the real Python batch-padding route; stand in only for C++."""
+    contexts = (block_size + 8, 2 * block_size + tail)
+    tables, num_blocks = make_recycled_page_table(contexts, block_size)
+    slots = slots_from_page_table(tables, contexts, block_size)
+    assert (tables[:, 0] > num_blocks // 2).all()
+    mapped = tables[tables != 0]
+    assert mapped.unique().numel() == mapped.numel()
+    assert (mapped % 2 == 1).all()  # a physical gap between every mapped page
+    assert ((tables >= 0) & (tables < num_blocks)).all()
+    actual = make_cache(num_blocks, block_size, 4, 256, poison=True)
+    expected = tuple(plane.clone() for plane in actual)
+    original = tuple(plane.clone() for plane in actual)
+    assert (actual[0] != 0).all() and (actual[1] != 0).all()
+    assert torch.isnan(actual[2]).any() and torch.isinf(actual[2]).any()
+    assert (actual[2] == CACHE_POISON_SCALE).any()
+    emulator = TurboQuantEmulator(head_size=256, device=CPU)
+    golden = make_adapter(value_layout=TurboQuantValueLayout.NZ_TILED)
+    launches = []
+
+    def batch_kernel(key, value, key_cache, value_cache, scales, mapping, *_):
+        launches.append(mapping.clone())
+        assert key.shape[0] % TURBOQUANT_STRIP_TOKENS == 0
+        golden.reshape_and_cache_prefill(key, value, key_cache, value_cache, scales, mapping, emulator)
+
+    register_ops(monkeypatch, **{TURBOQUANT_OP_RESHAPE_AND_CACHE: batch_kernel})
+    kernel = make_adapter(TurboQuantKernelStage.RESHAPE_AND_CACHE)
+    key, value = make_activations(sum(contexts), 4, 256, seed=17, dtype=torch.bfloat16)
+    plan = turboquant_plan_strip_ingestion(slots.tolist(), block_size)
+    assert not plan.waves, "the batch fixture must not silently fall back to scatter"
+    kernel.reshape_and_cache_prefill(key, value, *actual, slots, emulator, plan=plan)
+    assert launches
+    start = 0
+    for request, context in enumerate(contexts):
+        written = -(-context // TURBOQUANT_STRIP_TOKENS) * TURBOQUANT_STRIP_TOKENS
+        pad = written - context
+        padded_key = torch.cat(
+            (key[start : start + context], key[start + context - 1 : start + context].expand(pad, -1, -1))
+        )
+        padded_value = torch.cat(
+            (value[start : start + context], value[start + context - 1 : start + context].expand(pad, -1, -1))
+        )
+        padded_slots = slots_from_page_table(tables[request : request + 1], [written], block_size)
+        golden.reshape_and_cache_prefill(padded_key, padded_value, *expected, padded_slots, emulator)
+        page_index = (context - 1) // block_size
+        last_page = tables[request : request + 1, page_index : page_index + 1]
+        got = golden.gather(*actual, last_page)
+        poison = golden.gather(*original, last_page)
+        offset = written - page_index * block_size
+        for plane in (0, 2):
+            assert torch.equal(got[plane][:, offset:], poison[plane][:, offset:])
+        for plane in (1, 3):
+            assert torch.isfinite(got[plane][:, :offset]).all()
+            assert torch.equal(got[plane][:, offset:].view(torch.int32), poison[plane][:, offset:].view(torch.int32))
+        # The two generated-token slots are valid, distinct, and either replace
+        # intentional strip padding or occupy still-poisoned rows on a new page.
+        extended = slots_from_page_table(tables[request : request + 1], [context + 2], block_size)
+        assert extended[-2:].unique().numel() == 2
+        assert (extended[-2:] >= 0).all() and (extended[-2:] < num_blocks * block_size).all()
+        if tail == 127 and request == 1 and block_size == 128:
+            assert extended[-2] // block_size != extended[-1] // block_size
+        start += context
+    assert_cache_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "before_bits,after_bits,error",
+    [
+        pytest.param(0x7FC0BEEF, 0, "neutralized", id="nan-to-zero"),
+        pytest.param(0x7FC0BEEF, 0x00800000, "neutralized", id="nan-to-small-positive"),
+        pytest.param(0x7FC0BEEF, 0x3F800000, "neutralized", id="nan-to-finite"),
+        pytest.param(0x7FC0BEEF, 0x7FC0BEF0, "changed bits", id="nan-payload-mutated"),
+        pytest.param(0x3F800000, 0x3F800001, "changed bits", id="positive-poison-one-ulp"),
+    ],
+)
+def test_poison_mask_rejects_neutralization_before_live_scale_tolerance(before_bits, after_bits, error):
+    initial = (
+        torch.zeros(1, dtype=torch.int8),
+        torch.zeros(1, dtype=torch.int8),
+        torch.tensor([before_bits], dtype=torch.int32).view(torch.float32),
+    )
+    actual = (*initial[:2], torch.tensor([after_bits], dtype=torch.int32).view(torch.float32))
+    mask = torch.ones_like(initial[2], dtype=torch.bool)
+    with pytest.raises(AssertionError, match=error):
+        assert_poison_scales_preserved(actual, initial, mask)
+    with pytest.raises(AssertionError, match="scale_cache"):
+        assert_cache_equal(actual, initial, scale_max_ulps=1, poison_mask=mask)
+    if before_bits == 0x3F800000:
+        # This would be admissible for a live scale, proving the mask rather
+        # than the finite/positive predicate is what rejects it as poison.
+        assert_cache_equal(actual, initial, scale_max_ulps=1)
+
+
+def test_reported_scale_index_60254_is_a_batch_owned_value_scale():
+    """Reconstruct the ragged-1024 fixture at commit 942755966 from its report."""
+    block_size, index = 1024, 60254
+    contexts = (block_size + 8, 8 * block_size + 31)
+    tables = torch.tensor([[21, 19, 0, 0, 0, 0, 0, 0, 0], [17, 15, 13, 11, 9, 7, 5, 3, 1]], dtype=torch.int32)
+    slot, lane = divmod(index, 2 * 4)
+    page, offset = divmod(slot, block_size)
+    assert (page, offset, lane) == (7, 363, 6)
+    request = 1
+    logical_page = tables[request].tolist().index(page)
+    logical_token = logical_page * block_size + offset
+    prefill_count = ((contexts[request] - TURBOQUANT_STRIP_TOKENS) // TURBOQUANT_STRIP_TOKENS) * TURBOQUANT_STRIP_TOKENS
+    assert logical_token == 5483 < prefill_count == 8192 < contexts[request]
+    assert lane // 4 == 1 and lane % 4 == 2  # V plane, KV head 2
+    mapped_slot = slots_from_page_table(tables[request : request + 1], [contexts[request]], block_size)[logical_token]
+    assert int(mapped_slot) * 8 + lane == index
+
+
+@pytest.mark.parametrize("mode", [0, 1])
+def test_finite_spike_fixture_is_query_aligned_and_zero_live_is_exact(monkeypatch, mode):
+    monkeypatch.setattr(turboquant_v1, "TURBOQUANT_QUANT_MODE", mode)
+    emulator = TurboQuantEmulator(head_size=256, device=CPU)
+    golden = make_adapter(value_layout=TurboQuantValueLayout.NZ_TILED)
+    cache = make_finite_spike_cache(2, 128, 4, 256, emulator=emulator)
+    packed_k, scales_k, packed_v, scales_v = golden.gather(*cache, torch.tensor([[1]], dtype=torch.int32))
+    key = golden.dequantize_cache(packed_k, scales_k, emulator, torch.float32)[0, 0]
+    value = golden.dequantize_cache(packed_v, scales_v, emulator, torch.float32)[0, 0]
+    # With 8192 live zero keys, a single finite aligned spike must dominate
+    # the softmax; poisoning all nibbles with +7 would not establish alignment
+    # with the query in the rotated cache basis.
+    score = key.sum(dim=-1) / 16
+    probability = torch.sigmoid(score - torch.log(torch.tensor(8192.0)))
+    assert torch.isfinite(key).all() and torch.isfinite(value).all()
+    assert (probability > 0.99).all()
+    assert ((probability[:, None] * value).abs().amax(dim=-1) > 1).all()
+    zeros = torch.zeros_like(scales_v)
+    live = golden.dequantize_cache(packed_v, zeros, emulator, torch.float32)
+    assert (live == 0).all(), "zero live scales must give exact zero in both codebooks"
