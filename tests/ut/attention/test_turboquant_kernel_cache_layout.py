@@ -27,7 +27,14 @@ So three things have to hold, and all three are checked here without a device:
 import pytest
 import torch
 
-from tests.helpers.turboquant import OpRecorder, make_activations, make_adapter, make_cache, register_ops
+from tests.helpers.turboquant import (
+    OpRecorder,
+    assert_cache_equal,
+    make_activations,
+    make_adapter,
+    make_cache,
+    register_ops,
+)
 from vllm_ascend.attention.turboquant_layout import (
     TURBOQUANT_KEY_PLANE,
     TURBOQUANT_PACK_FACTOR,
@@ -424,3 +431,47 @@ def test_stages_none_runs_the_whole_path_golden(monkeypatch: pytest.MonkeyPatch,
     assert adapter.value_layout() is TurboQuantValueLayout.TOKEN_MAJOR
     assert all(not entry.calls for entry in entries.values()), "no op may launch with stages=none"
     assert torch.equal(dense[0], emulator.decode(*emulator.encode(key)))
+
+
+@pytest.mark.parametrize(
+    "plane,before,after,budget,passes",
+    [
+        pytest.param(2, 0x3F791A87, 0x3F791A88, 1, True, id="reported-scale-plus-one-ulp"),
+        pytest.param(2, 0x3F826D29, 0x3F826D28, 1, True, id="reported-scale-minus-one-ulp"),
+        pytest.param(2, 0x3F7FFFFF, 0x3F800000, 1, True, id="scale-exponent-boundary"),
+        pytest.param(2, 0x3F791A87, 0x3F791A89, 1, False, id="two-ulps-rejected"),
+        pytest.param(2, 0x3F791A87, 0x3F791A88, 0, False, id="snapshot-stays-exact"),
+        pytest.param(0, 0, 1, 1, False, id="key-byte-stays-exact"),
+        pytest.param(1, 0, 1, 1, False, id="value-byte-stays-exact"),
+        pytest.param(2, 0x7FC00000, 0x7FC00000, 0, True, id="identical-nan-canary"),
+        pytest.param(2, 0x7FC00000, 0x7FC00001, 1, False, id="nan-payload-stays-exact"),
+        pytest.param(2, 0x7FC00000, 0x3F800000, 1, False, id="poison-overwritten"),
+        pytest.param(2, 0x3F800000, 0x7FC00000, 1, False, id="live-scale-underfilled"),
+        pytest.param(2, 0x00000000, 0x00000001, 1, False, id="zero-canary-overwritten"),
+        pytest.param(2, 0x00000000, 0x80000000, 1, False, id="zero-sign-stays-exact"),
+        pytest.param(2, 0x7F7FFFFF, 0x7F800000, 1, False, id="overflow-not-rounding"),
+        pytest.param(2, 0xBF800000, 0xBF800001, 1, False, id="negative-scale-not-rounding"),
+        pytest.param(2, 0x3F800000, 0xBF800000, 1, False, id="sign-flip-no-integer-overflow"),
+    ],
+)
+def test_cache_comparison_limits_rounding_to_live_scales(plane, before, after, budget, passes):
+    # Identical poison in another lane must neither fail comparison nor hide
+    # the finite diagnostic when a live scale exceeds its budget.
+    scale_bits = torch.tensor([0x7FC00000, 0, 0, before if plane == 2 else 0], dtype=torch.int64)
+    expected = (
+        torch.zeros(4, dtype=torch.int8),
+        torch.zeros(4, dtype=torch.int8),
+        scale_bits.int().view(torch.float32),
+    )
+    actual = tuple(tensor.clone() for tensor in expected)
+    if plane == 2:
+        actual[plane].view(torch.int32)[-1] = torch.tensor(after, dtype=torch.int64).int()
+    else:
+        actual[plane][-1] = after
+    if passes:
+        assert_cache_equal(actual, expected, scale_max_ulps=budget)
+    else:
+        with pytest.raises(AssertionError, match=("key_cache", "value_cache", "scale_cache")[plane]) as error:
+            assert_cache_equal(actual, expected, scale_max_ulps=budget)
+        if plane == 2:
+            assert "max finite absolute error nan" not in str(error.value)
