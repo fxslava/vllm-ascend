@@ -1,0 +1,490 @@
+diff --git a/tests/e2e/pull_request/one_card/aclgraph/test_turboquant_aclgraph.py b/tests/e2e/pull_request/one_card/aclgraph/test_turboquant_aclgraph.py
+index 35a51c97d..bb1a8d32d 100644
+--- a/tests/e2e/pull_request/one_card/aclgraph/test_turboquant_aclgraph.py
++++ b/tests/e2e/pull_request/one_card/aclgraph/test_turboquant_aclgraph.py
+@@ -30,7 +30,7 @@ def decode_fixture():
+         pytest.skip("requires an Ascend NPU")
+     tq.load_turboquant_extension()
+     if not all(
+-        tq._is_op_registered(tq.TURBOQUANT_DEFAULT_NAMESPACE, name)
++        hasattr(getattr(torch.ops, tq.TURBOQUANT_DEFAULT_NAMESPACE, None), name)
+         for name in (
+             tq.TURBOQUANT_OP_RESHAPE_SCATTER,
+             tq.TURBOQUANT_OP_FUSED_DECODE,
+@@ -47,7 +47,7 @@ def decode_fixture():
+     impl.attn_type = AttentionType.DECODER
+     impl.kv_sharing_target_layer_name = None
+     impl.pcp_enabled = False
+-    impl._profile = False
++    impl.telemetry = tq.InferenceTelemetry(enabled=False)
+     impl.emulator = None
+     layer = SimpleNamespace(layer_name="turboquant_capture_test", _k_scale_float=1.0, _v_scale_float=1.0)
+     emulator = impl._bind_codec_constants(layer, device)
+@@ -77,6 +77,7 @@ def test_capture_and_replay_ingress_and_attention(decode_fixture):
+     value = torch.zeros_like(key)
+     output = torch.zeros_like(query)
+     block_table = torch.arange(NUM_BLOCKS, dtype=torch.int32, device=device).view(BATCH, MAX_BLOCKS)
++    host_block_table = torch.arange(NUM_BLOCKS, dtype=torch.int32).view(BATCH, MAX_BLOCKS)
+     slots = torch.full((BATCH,), -1, dtype=torch.int64, device=device)
+     metadata = SimpleNamespace()
+ 
+@@ -88,8 +89,12 @@ def test_capture_and_replay_ingress_and_attention(decode_fixture):
+             slot_mapping=slots[:width],
+             attn_state=tq.AscendAttentionState.DecodeOnly,
+         )
++        block_table.copy_(host_block_table.to(device))
+         host_slots = [
+-            row * MAX_BLOCKS * BLOCK_SIZE + length - 1 if length else -1 for row, length in enumerate(lengths)
++            int(host_block_table[row, (length - 1) // BLOCK_SIZE]) * BLOCK_SIZE + (length - 1) % BLOCK_SIZE
++            if length
++            else -1
++            for row, length in enumerate(lengths)
+         ]
+         slots[:width].copy_(torch.tensor(host_slots, dtype=torch.int64, device=device))
+         extra = builder._build_backend_metadata(
+@@ -127,7 +132,20 @@ def test_capture_and_replay_ingress_and_attention(decode_fixture):
+             forward(width)
+         graphs[width] = graph
+ 
+-    for width, lengths in ((BATCH, [65, 129]), (1, [257]), (BATCH, [130, 0]), (BATCH, [4097, 258]), (BATCH, [66, 129])):
++    for width, lengths in (
++        (BATCH, [65, 129]),
++        (1, [257]),
++        (BATCH, [130, 0]),
++        (1, [2047]),
++        (1, [2048]),
++        (1, [2049]),
++        (BATCH, [2050, 2177]),
++        (BATCH, [4097, 258]),
++        (BATCH, [66, 129]),
++    ):
++        # Change page IDs without changing captured table storage. Replay must
++        # consume both the refreshed descriptors and the current page mapping.
++        host_block_table = host_block_table.roll(1, dims=1)
+         for tensor in (query, key, value):
+             tensor.copy_(torch.randn(tensor.shape, generator=generator).to(device=device, dtype=tensor.dtype))
+         prepare(width, lengths)
+diff --git a/tests/ut/attention/run_turboquant_device_free.py b/tests/ut/attention/run_turboquant_device_free.py
+index 02fbe28fd..242b334bf 100644
+--- a/tests/ut/attention/run_turboquant_device_free.py
++++ b/tests/ut/attention/run_turboquant_device_free.py
+@@ -39,6 +39,7 @@ DEVICE_FREE_TESTS = (
+     "test_turboquant_dispatch_seam.py",
+     "test_turboquant_strip_cache.py",
+     "test_turboquant_codec.py",
++    "test_turboquant_completion_probe.py",
+     "test_turboquant_kernel_cache_layout.py",
+     "test_turboquant_layout.py",
+     "test_turboquant_nz_ingress.py",
+diff --git a/tests/ut/attention/test_turboquant_host_staging.py b/tests/ut/attention/test_turboquant_host_staging.py
+index cfb3a8053..d76ce7107 100644
+--- a/tests/ut/attention/test_turboquant_host_staging.py
++++ b/tests/ut/attention/test_turboquant_host_staging.py
+@@ -6,6 +6,8 @@ from types import SimpleNamespace
+ import pytest
+ import torch
+ 
++from tests.helpers.turboquant import make_metadata_builder, register_ops
++from vllm_ascend.attention.attention_v1 import AscendAttentionState
+ from vllm_ascend.attention.turboquant_config import TURBOQUANT_STAGING_SLOTS
+ from vllm_ascend.attention.turboquant_metadata import AscendTurboQuantMetadataBuilder
+ from vllm_ascend.attention.turboquant_v1 import AscendTurboQuantBackendImpl
+@@ -106,3 +108,47 @@ def test_mixed_forward_preserves_query_order_and_causal_mask():
+         assert impl._forward_mixed(query, metadata, output) is output
+         torch.testing.assert_close(output, query + 100)
+     assert len(calls) == 2
++
++
++def test_decode_metadata_refreshes_at_the_third_physical_page(monkeypatch):
++    """A single captured width must see new lengths, slots and third-page IDs."""
++    contexts = (2047, 2048, 2049, 2177)
++    seen = []
++
++    def build_tiling(lengths, tiling, *args):
++        seen.append(lengths.tolist())
++        tiling[0] = lengths[0]
++
++    register_ops(monkeypatch, npu_turboquant_build_decode_tiling=build_tiling)
++    builder = make_metadata_builder(1, 24, 4, 256, 128, 24)
++    slots = torch.full((1,), -1, dtype=torch.int64)
++    table = torch.zeros((1, 24), dtype=torch.int32)
++    names = ("_context_lens", "_tiling", "_workspace", "_query_rot", "_decode_slot_mapping")
++    addresses = {name: getattr(builder, name).data_ptr() for name in names}
++    impl = object.__new__(AscendTurboQuantBackendImpl)
++    for context in contexts:
++        physical_pages = torch.tensor([3, 1, 2], dtype=torch.int32)
++        if context > 2048:
++            physical_pages[2] = 7  # Reassigned page ID, same table storage.
++        table.copy_((physical_pages[:, None] * 8 + torch.arange(8)).reshape(1, -1))
++        position = context - 1
++        expected_slot = int(physical_pages[position // 1024]) * 1024 + position % 1024
++        slots.fill_(expected_slot)
++        common = SimpleNamespace(
++            num_reqs=1, num_actual_tokens=1, attn_state=AscendAttentionState.DecodeOnly, slot_mapping=slots
++        )
++        extra = builder._build_backend_metadata(
++            common,
++            block_table=table,
++            query_lens=torch.ones(1, dtype=torch.int32),
++            seq_lens=torch.tensor([context], dtype=torch.int32),
++            num_decodes=1,
++            num_prefills=0,
++        )
++        metadata = SimpleNamespace(attn_state=common.attn_state, slot_mapping=slots, **extra)
++        decode_slots, plan = impl._ingestion_inputs(metadata, 1, impl._ingestion_phase(metadata, 1))
++        assert decode_slots.tolist() == [expected_slot] and plan is None
++        assert extra["turboquant_context_lens"].tolist() == [context]
++        assert int(extra["turboquant_tiling"][0]) == context
++        assert {name: getattr(builder, name).data_ptr() for name in names} == addresses
++    assert seen == [[context] for context in contexts]
+diff --git a/tests/ut/attention/test_turboquant_hybrid_ownership.py b/tests/ut/attention/test_turboquant_hybrid_ownership.py
+index 137e72760..3c7348bab 100644
+--- a/tests/ut/attention/test_turboquant_hybrid_ownership.py
++++ b/tests/ut/attention/test_turboquant_hybrid_ownership.py
+@@ -16,10 +16,15 @@ import logging
+ from pathlib import Path
+ from types import SimpleNamespace
+ 
++import numpy as np
+ import pytest
+ import torch
+ 
++from vllm_ascend.attention.turboquant_codec import TurboQuantEmulator
++from vllm_ascend.attention.turboquant_config import TurboQuantOpsConfig, TurboQuantValueLayout
+ from vllm_ascend.attention.turboquant_layout import turboquant_carve_planes, turboquant_plane_views
++from vllm_ascend.attention.turboquant_metadata import AscendTurboQuantMetadataBuilder
++from vllm_ascend.attention.turboquant_ops import TurboQuantOpsAdapter
+ 
+ NUM_BLOCKS = 4
+ NUM_KV_HEADS = 4
+@@ -52,6 +57,16 @@ class _UniformTypeSpecs(SimpleNamespace):
+     pass
+ 
+ 
++class _CpuGpuBuffer:
++    def __init__(self, *shape, dtype, device, pin_memory):
++        self.cpu = torch.zeros(shape, dtype=dtype)
++        self.np = self.cpu.numpy()
++        self.gpu = torch.zeros(shape, dtype=dtype)
++
++    def copy_to_gpu(self, count):
++        self.gpu[:count].copy_(self.cpu[:count])
++
++
+ def _load_class(filename, class_name, method_names, namespace):
+     """Avoid importing engine/device dependencies unrelated to these methods."""
+     source = REPO / filename
+@@ -250,3 +265,71 @@ def test_dense_hybrid_retains_shared_pool_capacity(hybrid_pool):
+     pool.groups[0].kv_cache_spec = dense_spec
+     available = NUM_BLOCKS * dense_spec.page_size_bytes
+     assert pool.worker._scale_kv_cache_memory_for_multi_group(available) == available
++
++
++def test_private_pages_expand_and_write_across_the_third_page(hybrid_pool):
++    """Run the real table constructor/expansion/draft slots against private KV."""
++    pool = hybrid_pool
++    block_size = pool.specs[ATTENTION_LAYER].block_size
++    namespace = {
++        "torch": torch,
++        "np": np,
++        "get_dcp_group": lambda: SimpleNamespace(world_size=1, rank_in_group=0),
++        "CpuGpuBuffer": _CpuGpuBuffer,
++    }
++    table_cls = _load_class(
++        "vllm_ascend/worker/block_table.py",
++        "BlockTable",
++        (
++            "__init__",
++            "_make_buffer",
++            "_convert_physical_to_logical_blocks",
++            "append_row",
++            "add_row",
++            "compute_slot_mapping_draft",
++        ),
++        namespace,
++    )
++    table = table_cls(block_size, 1, 3, 8, False, torch.device("cpu"), kernel_sizes=[KERNEL_BLOCK_SIZE])
++    page_order = [3, 1, 2]
++    table.add_row(page_order, 0)
++    table.block_table.copy_to_gpu(1)
++    ratio = block_size // KERNEL_BLOCK_SIZE
++    assert table.blocks_per_phys_block == ratio
++    assert table.block_table.gpu[0].tolist() == [page * ratio + sub for page in page_order for sub in range(ratio)]
++    positions = np.array([block_size - 1, block_size, 2 * block_size - 1, 2 * block_size, 2 * block_size + 1])
++    table.compute_slot_mapping_draft(np.zeros_like(positions), positions)
++    expected_slots = torch.tensor(
++        [page_order[position // block_size] * block_size + position % block_size for position in positions],
++        dtype=torch.int32,
++    )
++    assert torch.equal(table.slot_mapping.gpu[: len(positions)], expected_slots)
++
++    raw = pool.runner._allocate_kv_cache_tensors(pool.config)
++    physical = turboquant_plane_views(raw[ATTENTION_LAYER], block_size, NUM_KV_HEADS, HEAD_SIZE)
++    kernel = turboquant_plane_views(raw[ATTENTION_LAYER], KERNEL_BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
++    expected_cache = tuple(torch.zeros_like(plane) for plane in physical)
++    emulator = TurboQuantEmulator(HEAD_SIZE, torch.device("cpu"))
++    adapter = TurboQuantOpsAdapter(TurboQuantOpsConfig(value_layout=TurboQuantValueLayout.NZ_TILED))
++    generator = torch.Generator().manual_seed(2049)
++    key, value = [torch.randn(len(positions), NUM_KV_HEADS, HEAD_SIZE, generator=generator) for _ in range(2)]
++    adapter.reshape_scatter_decode(key, value, *kernel, table.slot_mapping.gpu[: len(positions)], emulator)
++    adapter.reshape_scatter_decode(key, value, *expected_cache, expected_slots, emulator)
++    for actual, expected in zip(physical, expected_cache):
++        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
++    dense_physical = adapter.gather(*expected_cache, torch.tensor([page_order], dtype=torch.int32))
++    dense_kernel = adapter.gather(*kernel, table.block_table.gpu)
++    for actual, expected in zip(dense_kernel, dense_physical):
++        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
++    validator = object.__new__(AscendTurboQuantMetadataBuilder)
++    validator._block_size = KERNEL_BLOCK_SIZE
++    for position in (2 * block_size - 1, 2 * block_size, 2 * block_size + 1):
++        table.compute_slot_mapping_draft(np.array([0]), np.array([position]))
++        validator._validate_slot_mapping(
++            SimpleNamespace(num_reqs=1, num_actual_tokens=1, slot_mapping=table.slot_mapping.gpu[:1]),
++            table.block_table.gpu,
++            torch.ones(1, dtype=torch.int32),
++            torch.tensor([position + 1], dtype=torch.int32),
++        )
++    for name in RECURRENT_LAYERS:
++        assert not torch.count_nonzero(raw[name])
+diff --git a/tests/ut/attention/test_turboquant_live_write_contract.py b/tests/ut/attention/test_turboquant_live_write_contract.py
+index 0c2581422..c5e136505 100644
+--- a/tests/ut/attention/test_turboquant_live_write_contract.py
++++ b/tests/ut/attention/test_turboquant_live_write_contract.py
+@@ -62,14 +62,16 @@ def test_launch_repoisons_scratch_and_shares_builder_threshold(monkeypatch, thre
+     adapter = SimpleNamespace(fused_decode=decode)
+     # The second call verifies stale finite scratch is poisoned again, not only allocated as NaN.
+     for _ in range(2):
+-        output = live._launch_serving_decode(adapter, None, (None,) * 3, None, contexts, query, buffers, threshold)
++        output = live._launch_serving_decode(
++            adapter, None, (None,) * 3, None, contexts, query, buffers, threshold, splits=3
++        )
+         assert (output == 0).all()
+ 
+ 
+ @pytest.mark.parametrize("batch", [1, 2, 3, 9])
+ @pytest.mark.parametrize("splits", [1, 2, 3, 8])
+ def test_live_tiling_and_adapter_launch_use_the_same_split_geometry(monkeypatch, batch, splits):
+-    """Exercise the real adapter: re-export patches used to leave it at S=8."""
++    """Explicit split counts must reach the real adapter and the operator."""
+     monkeypatch.setattr(live, "DEVICE", torch.device("cpu"))
+     backend = live._backend()
+     # Independent statement of decode_launch_split and its descriptor ABI for
+@@ -114,14 +116,13 @@ def test_live_tiling_and_adapter_launch_use_the_same_split_geometry(monkeypatch,
+ 
+     register_ops(monkeypatch, **{live.BUILD_TILING_OP: build_tiling, live.FUSED_DECODE_OP: fused_decode})
+     live._require_ops(live.BUILD_TILING_OP, live.FUSED_DECODE_OP)
+-    live._set_decode_splits(monkeypatch, splits)
+     buffers = live._build_decode_tiling(contexts, 128, 1, splits)
+     adapter = live._adapter(backend.TurboQuantKernelStage.DECODE)
+     emulator = backend.TurboQuantEmulator(head_size=live.HEAD_SIZE, device=live.DEVICE)
+     cache = live._caches(128, num_blocks=1)
+     query = torch.ones(batch, live.NUM_HEADS, live.HEAD_SIZE, dtype=torch.bfloat16)
+     tables = torch.zeros(batch, 1, dtype=torch.int32)
+-    output = live._launch_serving_decode(adapter, emulator, cache, tables, contexts, query, buffers)
++    output = live._launch_serving_decode(adapter, emulator, cache, tables, contexts, query, buffers, splits=splits)
+     assert (output == 0).all()
+     assert calls == ["build", "decode"]
+ 
+@@ -160,3 +161,29 @@ def test_live_adapter_calls_match_current_python_signatures():
+         arguments = [None for argument in node.args for _ in range(3 if isinstance(argument, ast.Starred) else 1)]
+         keywords = {keyword.arg: None for keyword in node.keywords}
+         inspect.signature(getattr(adapter_cls, node.func.attr)).bind(None, *arguments, **keywords)
++
++
++@pytest.mark.parametrize("context", [2047, 2048, 2049, 2177])
++def test_third_physical_page_matches_expanded_kernel_gather(monkeypatch, context):
++    monkeypatch.setattr(live, "DEVICE", torch.device("cpu"))
++    cache = live._caches(1024, num_blocks=3)
++    for page in range(3):
++        for index, plane in enumerate(cache[:2]):
++            plane[page].fill_(page + index + 1)
++        cache[2].view(3, -1)[page].fill_(page + 1.25)
++    tables = torch.tensor([[2, 0, 1]], dtype=torch.int32)
++    kernel_cache, kernel_tables = live._kernel_decode_inputs(cache, tables, 128)
++    assert kernel_tables.tolist() == [[*range(16, 24), *range(8), *range(8, 16)]]
++    assert kernel_cache[0].shape[:2] == (24, 128)
++    for original, view in zip(cache, kernel_cache):
++        assert original.data_ptr() == view.data_ptr()
++    adapter = live._adapter()
++    physical = adapter.gather(*cache, tables)
++    expanded = adapter.gather(*kernel_cache, kernel_tables)
++    for actual, expected in zip(expanded, physical):
++        torch.testing.assert_close(actual[:, :context], expected[:, :context], rtol=0, atol=0)
++    # The third logical scheduler page is physical page 1, at kernel page 8.
++    position = context - 1
++    expected_slot = int(tables[0, position // 1024]) * 1024 + position % 1024
++    actual_slot = int(kernel_tables[0, position // 128]) * 128 + position % 128
++    assert actual_slot == expected_slot
+diff --git a/tests/ut/attention/test_turboquant_live_write_npu.py b/tests/ut/attention/test_turboquant_live_write_npu.py
+index d12d83551..74a0ba4d9 100644
+--- a/tests/ut/attention/test_turboquant_live_write_npu.py
++++ b/tests/ut/attention/test_turboquant_live_write_npu.py
+@@ -78,14 +78,6 @@ def _helpers():
+     return turboquant
+ 
+ 
+-def _set_decode_splits(monkeypatch, splits):
+-    # The adapter reads its defining module's constant, not the entry point's
+-    # re-export. Patching turboquant_v1 leaves the launch at eight splits.
+-    from vllm_ascend.attention import turboquant_ops
+-
+-    monkeypatch.setattr(turboquant_ops, "TURBOQUANT_DECODE_SPLITS", splits)
+-
+-
+ def _require_ops(*names):
+     backend = _backend()
+     backend.load_turboquant_extension()
+@@ -125,6 +117,22 @@ def _clone_cache(cache):
+     return tuple(plane.clone() for plane in cache)
+ 
+ 
++def _kernel_decode_inputs(cache, tables, kernel_block_size):
++    """View scheduler pages as the expanded kernel pages used by the runner."""
++    num_blocks, block_size, heads, packed_bytes = cache[0].shape
++    assert block_size % kernel_block_size == 0
++    ratio = block_size // kernel_block_size
++    packed_shape = (num_blocks * ratio, kernel_block_size, heads, packed_bytes)
++    views = (
++        cache[0].view(packed_shape),
++        cache[1].view(packed_shape),
++        cache[2].view(cache[2].shape[0], num_blocks * ratio, heads, kernel_block_size),
++    )
++    offsets = torch.arange(ratio, dtype=tables.dtype, device=tables.device)
++    expanded = (tables.unsqueeze(-1) * ratio + offsets).flatten(1).contiguous()
++    return views, expanded
++
++
+ @requires_npu
+ class TestCacheWriters:
+     @pytest.mark.parametrize(
+@@ -352,7 +360,16 @@ def _assert_attention_close(tag, got, expected, context):
+ 
+ 
+ def _launch_serving_decode(
+-    adapter, emulator, caches, block_tables, contexts, query, buffers, fused_context_limit=FUSED_CONTEXT_LIMIT
++    adapter,
++    emulator,
++    caches,
++    block_tables,
++    contexts,
++    query,
++    buffers,
++    fused_context_limit=FUSED_CONTEXT_LIMIT,
++    *,
++    splits,
+ ):
+     output = torch.full_like(query, float("nan"))
+     for buffer in buffers[1:]:
+@@ -373,6 +390,7 @@ def _launch_serving_decode(
+         workspace=buffers[1],
+         query_rot=buffers[2],
+         fused_context_limit=fused_context_limit,
++        num_splits=splits,
+     )
+     assert fused is not None, "the registered decode kernel must run, not fall back"
+     return output.cpu()
+@@ -469,6 +487,9 @@ class TestPrefillDecode:
+             pytest.param("batch", "random", 128, (136, 383), id="batch-random-mixed"),
+             pytest.param("batch", "random", 256, (257, 511), id="batch-random-page-tail"),
+             pytest.param("batch", "random", 1024, (257,), id="batch-random-large-page"),
++            pytest.param("batch", "random-expanded", 1024, (2047,), id="batch-cross-third-physical-page"),
++            pytest.param("batch", "random-expanded", 1024, (2049, 2177), id="batch-third-physical-page-B2"),
++            pytest.param("batch", "random", 1024, (2049,), id="batch-third-direct-page"),
+             pytest.param("scatter", "random", 128, (136, 383), id="scatter-random-mixed"),
+             pytest.param("batch", "zero-live-spike", 128, (63,), id="zero-live-spike-fused"),
+             pytest.param("batch", "zero-live-spike", 128, (136, 257), id="zero-live-spike-split"),
+@@ -476,9 +497,7 @@ class TestPrefillDecode:
+             pytest.param("batch", "constant-live-spike", 128, (136, 257), id="constant-live-spike-split"),
+         ],
+     )
+-    def test_recycled_pages_mask_prefill_tail_through_first_decode_steps(
+-        self, writer, payload, block_size, contexts, monkeypatch
+-    ):
++    def test_recycled_pages_mask_prefill_tail_through_first_decode_steps(self, writer, payload, block_size, contexts):
+         """Ragged prefill -> immediate attention -> two KV appends and decode.
+ 
+         Separate writer/tail assertions precede the mask check. A sanitized
+@@ -491,6 +510,8 @@ class TestPrefillDecode:
+         """
+         _require_ops(PREFILL_OP if writer == "batch" else SCATTER_OP, SCATTER_OP, FUSED_DECODE_OP, BUILD_TILING_OP)
+         backend, helpers = _backend(), _helpers()
++        decode_block_size = backend.TURBOQUANT_KERNEL_BLOCK_SIZE if payload == "random-expanded" else block_size
++        kernel_blocks_per_page = block_size // decode_block_size
+         finite_spikes = payload.endswith("-spike")
+         tables_host, num_blocks = helpers.make_recycled_page_table(contexts, block_size)
+         tables = tables_host.to(DEVICE)
+@@ -594,8 +615,9 @@ class TestPrefillDecode:
+                 )
+             snapshots = (_clone_cache(cache), _clone_cache(golden_cache))
+             for splits in PREFILL_SPLITS if step == 0 else APPEND_SPLITS:
+-                _set_decode_splits(monkeypatch, splits)
+-                buffers = _build_decode_tiling(contexts, block_size, tables.shape[1], splits)
++                buffers = _build_decode_tiling(
++                    contexts, decode_block_size, tables.shape[1] * kernel_blocks_per_page, splits
++                )
+                 variants = [("poisoned-tail", cache, tables, contexts, False)]
+                 if step == 0 and splits in (1, 3):
+                     variants.insert(0, ("sanitized-tail", sanitized, tables, contexts, False))
+@@ -610,12 +632,16 @@ class TestPrefillDecode:
+                         ]
+                     )
+                 for name, source, table, lengths, fault in variants:
++                    if kernel_blocks_per_page > 1:
++                        source, table = _kernel_decode_inputs(source, table, decode_block_size)
+                     launch_buffers = (
+                         buffers
+                         if lengths == contexts
+-                        else _build_decode_tiling(lengths, block_size, tables.shape[1], splits)
++                        else _build_decode_tiling(lengths, decode_block_size, table.shape[1], splits)
++                    )
++                    output = _launch_serving_decode(
++                        decode, emulator, source, table, lengths, query, launch_buffers, splits=splits
+                     )
+-                    output = _launch_serving_decode(decode, emulator, source, table, lengths, query, launch_buffers)
+                     for request, context in enumerate(contexts):
+                         tag = f"{writer}/{payload}/{phase}/{name}: block={block_size} S={splits} request={request}"
+                         if fault:
+@@ -651,7 +677,7 @@ class TestPrefillDecode:
+         pytest.param((65, 257, 513), 0, "live-spike", id="B3-fused-live-spike"),
+     ],
+ )
+-def test_cross_request_poison_cannot_change_clean_siblings(contexts, poison_request, profile, monkeypatch):
++def test_cross_request_poison_cannot_change_clean_siblings(contexts, poison_request, profile):
+     """One hostile request, clean random/zero siblings, and NaN launch scratch.
+ 
+     Poisoned requests have no defined non-finite output contract: FP8 casts can
+@@ -726,9 +752,8 @@ def test_cross_request_poison_cannot_change_clean_siblings(contexts, poison_requ
+     snapshot = _clone_cache(cache)
+     decode = _adapter(backend.TurboQuantKernelStage.DECODE)
+     for splits in PREFILL_SPLITS:
+-        _set_decode_splits(monkeypatch, splits)
+         buffers = _build_decode_tiling(contexts, block_size, tables.shape[1], splits)
+-        output = _launch_serving_decode(decode, emulator, cache, tables, contexts, query, buffers)
++        output = _launch_serving_decode(decode, emulator, cache, tables, contexts, query, buffers, splits=splits)
+         for request in clean_requests:
+             tag = f"cross-request/{profile}: B={len(contexts)} S={splits} poison={poison_request} request={request}"
+             _assert_attention_close(tag, output[request : request + 1], expected[request], contexts[request])
+diff --git a/vllm_ascend/attention/turboquant_ops.py b/vllm_ascend/attention/turboquant_ops.py
+index deb7ba8b9..590e39cdd 100644
+--- a/vllm_ascend/attention/turboquant_ops.py
++++ b/vllm_ascend/attention/turboquant_ops.py
+@@ -891,8 +891,9 @@ class TurboQuantOpsAdapter:
+         workspace: torch.Tensor,
+         query_rot: torch.Tensor,
+         fused_context_limit: int = TURBOQUANT_FUSED_CONTEXT_LIMIT,
++        num_splits: int | None = None,
+     ) -> torch.Tensor | None:
+-        """Launch decode; threshold overrides must also reach the tiling builder."""
++        """Launch decode; split/threshold overrides must match the tiling builder."""
+         if not self.has_kernel(TURBOQUANT_OP_FUSED_DECODE):
+             self.dispatch_observer.record(
+                 TURBOQUANT_OP_FUSED_DECODE,
+@@ -944,7 +945,7 @@ class TurboQuantOpsAdapter:
+             output=output,
+             num_heads=num_heads,
+             num_kv_heads=num_kv_heads,
+-            num_splits=TURBOQUANT_DECODE_SPLITS,
++            num_splits=TURBOQUANT_DECODE_SPLITS if num_splits is None else num_splits,
+             heads_per_task=turboquant_decode_heads_per_task(num_heads, num_kv_heads),
+             output_stage=TURBOQUANT_STAGE_UNROTATED,
+             scale=scale,
