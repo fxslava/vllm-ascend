@@ -6,15 +6,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_ascend.attention.turboquant_codec import TurboQuantEmulator
+from vllm_ascend.attention.turboquant_config import TurboQuantValueLayout
 from vllm_ascend.attention.turboquant_layout import turboquant_scale_block_views
-from vllm_ascend.attention.turboquant_v1 import (
-    AscendTurboQuantBackend,
-    AscendTurboQuantBackendImpl,
-    AscendTurboQuantMetadataBuilder,
-    TurboQuantEmulator,
-    TurboQuantOpsAdapter,
-    TurboQuantValueLayout,
-)
+from vllm_ascend.attention.turboquant_metadata import AscendTurboQuantMetadataBuilder
+from vllm_ascend.attention.turboquant_ops import TurboQuantOpsAdapter
+from vllm_ascend.attention.turboquant_v1 import AscendTurboQuantBackend, AscendTurboQuantBackendImpl
 
 NUM_BLOCKS = 4
 BLOCK_SIZE = 128

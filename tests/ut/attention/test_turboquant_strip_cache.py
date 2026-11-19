@@ -33,19 +33,15 @@ import pytest
 import torch
 
 from tests.helpers.turboquant import make_activations, make_adapter, make_cache
+from vllm_ascend.attention.turboquant_codec import TurboQuantEmulator
+from vllm_ascend.attention.turboquant_config import TURBOQUANT_STRIP_TOKENS, TurboQuantOpsConfig, TurboQuantValueLayout
 from vllm_ascend.attention.turboquant_layout import (
     TURBOQUANT_KEY_PLANE,
     TURBOQUANT_VALUE_PLANE,
     turboquant_packed_bytes,
     turboquant_scale_cache_shape,
 )
-from vllm_ascend.attention.turboquant_v1 import (
-    TURBOQUANT_STRIP_TOKENS,
-    TurboQuantEmulator,
-    TurboQuantOpsAdapter,
-    TurboQuantOpsConfig,
-    TurboQuantValueLayout,
-)
+from vllm_ascend.attention.turboquant_ops import TurboQuantOpsAdapter
 
 HEAD_SIZE = 64
 NUM_KV_HEADS = 2

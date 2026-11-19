@@ -21,18 +21,27 @@ import pytest
 import torch
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-from vllm_ascend.attention import turboquant_v1
-from vllm_ascend.attention.turboquant_v1 import (
+from vllm_ascend.attention import turboquant_codec
+from vllm_ascend.attention.turboquant_codec import TurboQuantEmulator, _exp2_fp32
+from vllm_ascend.attention.turboquant_config import (
     TURBOQUANT_HEADROOM_BITS,
     TURBOQUANT_NIBBLE_MAX,
     TURBOQUANT_NIBBLE_MIN,
-    AscendTurboQuantBackend,
-    TurboQuantEmulator,
-    _exp2_fp32,
 )
+from vllm_ascend.attention.turboquant_v1 import AscendTurboQuantBackend
 
 HEAD_SIZE = 64
 CPU = torch.device("cpu")
+
+
+def test_rotation_operands_are_cached_on_the_codec_instance():
+    emulator = TurboQuantEmulator(head_size=64, device=CPU)
+    assert emulator.h16 is emulator.h16
+    assert emulator.codec_tables is emulator.codec_tables
+    assert emulator.rotation is emulator.rotation
+    other = TurboQuantEmulator(head_size=64, device=CPU)
+    assert emulator.h16 is not other.h16
+    assert torch.equal(emulator.h16, other.h16)
 
 
 @pytest.fixture
@@ -147,7 +156,7 @@ def test_lloyd_max_preserves_all_leading_scale_dimensions(head_size, fold):
     assert scales.shape == rotated.shape[:-1]
     assert codes.dtype == torch.int8
     assert scales.dtype == torch.float32
-    expected = torch.sqrt(torch.tensor(float(head_size)) + turboquant_v1.TURBOQUANT_LM_EPS)
+    expected = torch.sqrt(torch.tensor(float(head_size)) + turboquant_codec.TURBOQUANT_LM_EPS)
     expected = (expected * emulator.inv_sqrt_len) * emulator.inv_sqrt_len
     assert torch.equal(scales, expected.expand_as(scales))
 
@@ -184,7 +193,7 @@ def test_lloyd_max_refuses_invalid_reduction_widths(width):
 @pytest.mark.parametrize("mode", [0, 1])
 @pytest.mark.parametrize("fold", ["key", "value"])
 def test_codec_helpers_select_the_active_writer_codebook(monkeypatch, mode, fold):
-    monkeypatch.setattr(turboquant_v1, "TURBOQUANT_QUANT_MODE", mode)
+    monkeypatch.setattr(turboquant_codec, "TURBOQUANT_QUANT_MODE", mode)
     emulator = TurboQuantEmulator(head_size=256, device=CPU)
     x = torch.randn(3, 4, 256, generator=torch.Generator().manual_seed(18))
     rotated = emulator.rotate(x)

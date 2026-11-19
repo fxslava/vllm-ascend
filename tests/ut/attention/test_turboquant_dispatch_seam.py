@@ -4,7 +4,7 @@
 
 Three properties are pinned here:
 
-* every operation picks its branch from ``_has_kernel(op_name)`` alone, and the
+* every operation picks its branch from ``has_kernel(op_name)`` alone, and the
   kernel branch passes the staged C launcher's parameters in the launcher's own
   order. A stage switched on whose entry point is unregistered falls back.
 * ingestion is bifurcated by phase. More tokens than requests is prefill and
@@ -24,6 +24,7 @@ Three properties are pinned here:
 import logging
 import types
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -36,14 +37,9 @@ from tests.helpers.turboquant import (
     make_decode_buffers,
     register_ops,
 )
-from vllm_ascend.attention import turboquant_v1
-from vllm_ascend.attention.turboquant_layout import (
-    TURBOQUANT_KEY_PLANE,
-    TURBOQUANT_VALUE_PLANE,
-    turboquant_packed_bytes,
-    turboquant_scale_cache_shape,
-)
-from vllm_ascend.attention.turboquant_v1 import (
+from vllm_ascend.attention import turboquant_ops, turboquant_v1
+from vllm_ascend.attention.turboquant_codec import TurboQuantEmulator
+from vllm_ascend.attention.turboquant_config import (
     TURBOQUANT_DECODE_SPLITS,
     TURBOQUANT_DECODE_UNPACK,
     TURBOQUANT_KERNEL_OPS,
@@ -61,17 +57,25 @@ from vllm_ascend.attention.turboquant_v1 import (
     TURBOQUANT_STAGE_UNROTATED,
     TURBOQUANT_STRIP_TOKENS,
     TURBOQUANT_TABLE_DTYPE,
-    AscendTurboQuantBackendImpl,
-    TurboQuantEmulator,
     TurboQuantIngestionPhase,
     TurboQuantKernelStage,
-    TurboQuantOpsAdapter,
     TurboQuantOpsConfig,
     TurboQuantValueLayout,
-    _is_op_registered,
-    load_turboquant_extension,
-    turboquant_plan_strip_ingestion,
 )
+from vllm_ascend.attention.turboquant_ingestion import turboquant_plan_strip_ingestion
+from vllm_ascend.attention.turboquant_layout import (
+    TURBOQUANT_KEY_PLANE,
+    TURBOQUANT_VALUE_PLANE,
+    turboquant_packed_bytes,
+    turboquant_scale_cache_shape,
+)
+from vllm_ascend.attention.turboquant_ops import TurboQuantOpsAdapter, _is_op_registered, load_turboquant_extension
+from vllm_ascend.attention.turboquant_telemetry import (
+    DispatchImplementation,
+    NullDispatchObserver,
+    create_dispatch_observer,
+)
+from vllm_ascend.attention.turboquant_v1 import AscendTurboQuantBackendImpl
 
 HEAD_SIZE = 64
 NUM_KV_HEADS = 2
@@ -142,7 +146,7 @@ def _nz_activations(num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 # ---------------------------------------------------------------------------
-# _has_kernel
+# has_kernel
 # ---------------------------------------------------------------------------
 
 ALL_OPS = (
@@ -159,26 +163,26 @@ ALL_OPS = (
 @pytest.mark.parametrize("op_name", ALL_OPS)
 def test_no_stage_switched_on_means_no_kernel(monkeypatch: pytest.MonkeyPatch, op_name: str) -> None:
     register_ops(monkeypatch, **{name: OpRecorder() for name in ALL_OPS})
-    assert make_adapter()._has_kernel(op_name) is False
+    assert make_adapter().has_kernel(op_name) is False
 
 
 @pytest.mark.parametrize("op_name", ALL_OPS)
 def test_stage_on_and_registered_means_kernel(monkeypatch: pytest.MonkeyPatch, op_name: str) -> None:
     register_ops(monkeypatch, **{op_name: OpRecorder()})
-    assert make_adapter(*TurboQuantKernelStage)._has_kernel(op_name) is True
+    assert make_adapter(*TurboQuantKernelStage).has_kernel(op_name) is True
 
 
 @pytest.mark.parametrize("op_name", ALL_OPS)
 def test_stage_on_but_unregistered_falls_back(monkeypatch: pytest.MonkeyPatch, op_name: str) -> None:
     register_ops(monkeypatch)
     adapter = make_adapter(*TurboQuantKernelStage)
-    assert adapter._has_kernel(op_name) is False
+    assert adapter.has_kernel(op_name) is False
     assert op_name in adapter._missing_kernels
 
 
 def test_a_missing_namespace_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(torch, "ops", types.SimpleNamespace())
-    assert make_adapter(*TurboQuantKernelStage)._has_kernel(TURBOQUANT_OP_ROTATE) is False
+    assert make_adapter(*TurboQuantKernelStage).has_kernel(TURBOQUANT_OP_ROTATE) is False
 
 
 # ---------------------------------------------------------------------------
@@ -206,14 +210,14 @@ def test_dispatch_trace_reports_cpu_tensor_layout(
     monkeypatch: pytest.MonkeyPatch, turboquant_caplog: pytest.LogCaptureFixture, emulator: TurboQuantEmulator
 ) -> None:
     caplog = turboquant_caplog
-    monkeypatch.setattr(turboquant_v1, "_TURBOQUANT_TRACE_ENABLED", True)
+    monkeypatch.setenv("VLLM_ASCEND_TURBOQUANT_TRACE", "1")
     caplog.set_level(logging.INFO)
     x = torch.randn(3, HEAD_SIZE * 2)[:, ::2]
 
     make_adapter().rotate(x, emulator)
 
-    assert "op=npu_turboquant_rotate backend=CPU (PyTorch) devices=['cpu']" in caplog.text
-    assert "x(shape=(3, 64), stride=(128, 2)" in caplog.text
+    assert "op=npu_turboquant_rotate implementation=pytorch devices=['cpu']" in caplog.text
+    assert "activations(shape=(3, 64), stride=(128, 2)" in caplog.text
     assert "device=cpu" in caplog.text
     assert "contiguous=False" in caplog.text
 
@@ -222,7 +226,7 @@ def test_dispatch_trace_reports_custom_operator(
     monkeypatch: pytest.MonkeyPatch, turboquant_caplog: pytest.LogCaptureFixture, emulator: TurboQuantEmulator
 ) -> None:
     caplog = turboquant_caplog
-    monkeypatch.setattr(turboquant_v1, "_TURBOQUANT_TRACE_ENABLED", True)
+    monkeypatch.setenv("VLLM_ASCEND_TURBOQUANT_TRACE", "1")
     caplog.set_level(logging.INFO)
     entry = OpRecorder((torch.zeros(1, dtype=torch.int8), torch.ones(1)))
     register_ops(monkeypatch, npu_turboquant_quantize_pack=entry)
@@ -230,9 +234,27 @@ def test_dispatch_trace_reports_custom_operator(
 
     make_adapter(TurboQuantKernelStage.QUANTIZE).quantize_and_pack(rotated, emulator)
 
-    assert "op=npu_turboquant_quantize_pack backend=custom torch op devices=['cpu']" in caplog.text
+    assert "op=npu_turboquant_quantize_pack implementation=custom_op devices=['cpu']" in caplog.text
     assert "rotated(shape=(3, 64)" in caplog.text
     assert "contiguous=True" in caplog.text
+
+
+def test_dispatch_observer_can_be_injected_without_enabling_logging(emulator):
+    observer = Mock()
+    adapter = TurboQuantOpsAdapter(TurboQuantOpsConfig(), dispatch_observer=observer)
+    activations = torch.randn(2, HEAD_SIZE)
+    assert torch.equal(adapter.rotate(activations, emulator), emulator.rotate(activations))
+    observer.record.assert_called_once_with(
+        TURBOQUANT_OP_ROTATE, DispatchImplementation.PYTORCH, activations=activations
+    )
+
+
+def test_disabled_dispatch_observer_does_not_inspect_tensors(monkeypatch):
+    monkeypatch.delenv("VLLM_ASCEND_TURBOQUANT_TRACE", raising=False)
+    observer = create_dispatch_observer()
+    assert isinstance(observer, NullDispatchObserver)
+    # This object has no tensor properties; disabled telemetry must not ask.
+    observer.record("probe", DispatchImplementation.PYTORCH, activations=object())
 
 
 # ---------------------------------------------------------------------------
@@ -885,7 +907,7 @@ def test_fused_decode_launches_and_returns_its_output(
     caches = _decode_caches()
     output = torch.zeros(1, 2, HEAD_SIZE, dtype=torch.bfloat16)
 
-    assert adapter._has_kernel(TURBOQUANT_OP_FUSED_DECODE) is True
+    assert adapter.has_kernel(TURBOQUANT_OP_FUSED_DECODE) is True
     returned = adapter.fused_decode(
         query=torch.randn(1, 2, HEAD_SIZE, dtype=torch.bfloat16),
         key_cache=caches[0],
@@ -1252,7 +1274,7 @@ def test_no_tokens_writes_nothing(emulator: TurboQuantEmulator) -> None:
 @pytest.fixture
 def unloaded(monkeypatch: pytest.MonkeyPatch) -> None:
     """Put the one-shot loader back to "not tried yet" for this test."""
-    monkeypatch.setattr(turboquant_v1, "_TURBOQUANT_EXTENSION_LOADED", None)
+    monkeypatch.setattr(turboquant_ops, "_TURBOQUANT_EXTENSION_LOADED", None)
 
 
 def test_a_phantom_namespace_is_not_mistaken_for_a_registration() -> None:
@@ -1278,12 +1300,12 @@ def test_a_real_operator_is_reported_as_registered() -> None:
 def test_no_stage_switched_on_does_not_touch_the_extension(unloaded: None) -> None:
     """A golden-only run must not pay for the import, nor warn about it."""
     make_adapter()
-    assert turboquant_v1._TURBOQUANT_EXTENSION_LOADED is None
+    assert turboquant_ops._TURBOQUANT_EXTENSION_LOADED is None
 
 
 def test_a_stage_switched_on_attempts_the_import_once(unloaded: None) -> None:
     make_adapter(*TurboQuantKernelStage)
-    first = turboquant_v1._TURBOQUANT_EXTENSION_LOADED
+    first = turboquant_ops._TURBOQUANT_EXTENSION_LOADED
     assert first is not None, "a stage-on adapter must have tried the import"
 
     calls: list[int] = []
@@ -1306,7 +1328,7 @@ def test_missing_operators_are_reported_with_the_stages_that_wanted_them(
     # Forced rather than observed: on an ascend950 box the ops really are
     # registered and nothing would warn, so the warning path only exists to be
     # tested if the probe answers "missing" here.
-    monkeypatch.setattr(turboquant_v1, "_is_op_registered", lambda namespace, op_name: False)
+    monkeypatch.setattr(turboquant_ops, "_is_op_registered", lambda namespace, op_name: False)
     with caplog.at_level(logging.WARNING):
         make_adapter(TurboQuantKernelStage.SCATTER)
     assert any(
@@ -1320,7 +1342,7 @@ def test_a_fully_registered_namespace_is_quiet(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """With every registered op present, construction says nothing at WARNING."""
-    monkeypatch.setattr(turboquant_v1, "_is_op_registered", lambda namespace, op_name: True)
+    monkeypatch.setattr(turboquant_ops, "_is_op_registered", lambda namespace, op_name: True)
     with caplog.at_level(logging.WARNING):
         make_adapter(*TurboQuantKernelStage)
     assert caplog.records == []
@@ -1369,7 +1391,7 @@ def _geometry(
     num_heads: int | None = None,
     model_dtype: torch.dtype = turboquant_v1.TURBOQUANT_KERNEL_DTYPE,
 ) -> Any:
-    """The state :meth:`_check_kernel_geometry` reads, and nothing else.
+    """The state :meth:`_validate_kernel_geometry` reads, and nothing else.
 
     Called unbound, like the ``_ingestion_phase`` test above: the real
     ``__init__`` wants a vLLM attention layer and the method wants five
@@ -1385,7 +1407,7 @@ def _geometry(
 
 
 def _check(state: Any) -> None:
-    AscendTurboQuantBackendImpl._check_kernel_geometry(state)
+    AscendTurboQuantBackendImpl._validate_kernel_geometry(state)
 
 
 @pytest.mark.parametrize(
@@ -1488,7 +1510,7 @@ def test_the_rotation_operand_is_the_bf16_blob_the_cube_stages() -> None:
     and the operand stays bit-identical to the oracle's.
     """
     emulator = TurboQuantEmulator(head_size=turboquant_v1.TURBOQUANT_KERNEL_HEAD_SIZE, device=CPU)
-    tables = turboquant_v1._codec_tables(emulator)
+    tables = emulator.codec_tables
     groups = turboquant_v1.TURBOQUANT_KERNEL_HEAD_SIZE // 32
     assert tables.dtype is TURBOQUANT_TABLE_DTYPE
     assert tables.shape == (2 * groups, 32, 32)

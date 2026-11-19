@@ -50,7 +50,7 @@ def decode_fixture():
     impl._profile = False
     impl.emulator = None
     layer = SimpleNamespace(layer_name="turboquant_capture_test", _k_scale_float=1.0, _v_scale_float=1.0)
-    emulator = impl._ensure_statics(layer, device)
+    emulator = impl._bind_codec_constants(layer, device)
     caches = make_cache(NUM_BLOCKS, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE, device=device)
     impl.key_cache, impl.value_cache, impl.scale_cache = caches
     # Populate all history with the real scatter writer, before capture.

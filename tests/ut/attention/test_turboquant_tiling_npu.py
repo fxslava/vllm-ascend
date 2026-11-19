@@ -15,7 +15,7 @@ torch_npu = pytest.importorskip("torch_npu")
 def tiling_op():
     if not torch.npu.is_available():
         pytest.skip("requires an Ascend NPU")
-    from vllm_ascend.attention.turboquant_v1 import load_turboquant_extension
+    from vllm_ascend.attention.turboquant_ops import load_turboquant_extension
 
     load_turboquant_extension()
     namespace = torch.ops.turboquant_ops
@@ -26,7 +26,7 @@ def tiling_op():
 
 @pytest.mark.parametrize("batch_size", [1, 17])
 def test_queued_tiling_uploads_preserve_sources_and_stream_order(tiling_op, batch_size):
-    from vllm_ascend.attention.turboquant_v1 import turboquant_tiling_upper_bound_words
+    from vllm_ascend.attention.turboquant_config import turboquant_tiling_upper_bound_words
 
     words = turboquant_tiling_upper_bound_words(batch_size, 8)
     device_tiling = torch.full((words,), -1, dtype=torch.int32, device="npu")

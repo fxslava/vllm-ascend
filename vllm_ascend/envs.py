@@ -121,6 +121,21 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Log each TurboQuant dispatch with tensor shape, stride, dtype, device and
     # contiguity. 0 (default): off. 1: on; diagnostic only, not for serving.
     "VLLM_ASCEND_TURBOQUANT_TRACE": lambda: _strict_binary_env("VLLM_ASCEND_TURBOQUANT_TRACE"),
+    # Legacy TurboQuant settings: preserve the existing names for callers.
+    # Kernel stages: none (default), all, on/off, 1/0, or comma-separated
+    # rotate, quantize, scatter, gather, dequantize, reshape_and_cache, decode.
+    # Not sensitive; selects custom operators in the attention dispatch path.
+    "TURBOQUANT_KERNEL_STAGES": lambda: os.getenv("TURBOQUANT_KERNEL_STAGES", "none"),
+    # Custom operator namespace. Default: turboquant_ops; any registered torch
+    # operator namespace is valid. Not sensitive.
+    "TURBOQUANT_OPS_NAMESPACE": lambda: os.getenv("TURBOQUANT_OPS_NAMESPACE", "turboquant_ops"),
+    # Inference trace export. Default: 0 (disabled). 1/true/yes/on enable it
+    # (case insensitive); other values disable it. Not sensitive. Diagnostic
+    # only: selects the profiler for the execution device, outside capture.
+    "TURBOQUANT_PROFILE": lambda: os.getenv("TURBOQUANT_PROFILE", "0").strip().lower() in {"1", "true", "yes", "on"},
+    # Dense NPU attention API: auto (default), v1 or v2. Other values retain
+    # automatic detection for compatibility. Not sensitive.
+    "TURBOQUANT_FIA_VERSION": lambda: os.getenv("TURBOQUANT_FIA_VERSION", "auto"),
 }
 
 # end-env-vars-definition

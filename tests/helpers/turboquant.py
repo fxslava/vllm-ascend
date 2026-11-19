@@ -9,21 +9,21 @@ from unittest.mock import patch
 import torch
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionMetadataBuilder
-from vllm_ascend.attention.turboquant_layout import turboquant_packed_bytes, turboquant_scale_cache_shape
-from vllm_ascend.attention.turboquant_v1 import (
+from vllm_ascend.attention.turboquant_config import (
     TURBOQUANT_DECODE_MAX_SPLITS,
     TURBOQUANT_DECODE_SPLITS,
     TURBOQUANT_DEFAULT_NAMESPACE,
     TURBOQUANT_NZ_TILE_ROWS,
-    AscendTurboQuantMetadataBuilder,
     TurboQuantKernelStage,
-    TurboQuantOpsAdapter,
     TurboQuantOpsConfig,
     TurboQuantValueLayout,
     turboquant_decode_query_rot_floats,
     turboquant_decode_workspace_floats,
     turboquant_tiling_upper_bound_words,
 )
+from vllm_ascend.attention.turboquant_layout import turboquant_packed_bytes, turboquant_scale_cache_shape
+from vllm_ascend.attention.turboquant_metadata import AscendTurboQuantMetadataBuilder
+from vllm_ascend.attention.turboquant_ops import TurboQuantOpsAdapter
 
 CACHE_POISON_SCALE = 2.0**100
 

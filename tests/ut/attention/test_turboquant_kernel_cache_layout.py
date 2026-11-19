@@ -40,26 +40,26 @@ from tests.helpers.turboquant import (
     register_ops,
     slots_from_page_table,
 )
-from vllm_ascend.attention import turboquant_v1
-from vllm_ascend.attention.turboquant_layout import (
-    TURBOQUANT_KEY_PLANE,
-    TURBOQUANT_PACK_FACTOR,
-    TURBOQUANT_VALUE_PLANE,
-)
-from vllm_ascend.attention.turboquant_v1 import (
+from vllm_ascend.attention import turboquant_codec
+from vllm_ascend.attention.turboquant_codec import TurboQuantEmulator
+from vllm_ascend.attention.turboquant_config import (
     TURBOQUANT_NAMESPACE_ENV,
     TURBOQUANT_OP_FUSED_DECODE,
     TURBOQUANT_OP_RESHAPE_AND_CACHE,
     TURBOQUANT_OP_RESHAPE_SCATTER,
     TURBOQUANT_STAGES_ENV,
     TURBOQUANT_STRIP_TOKENS,
-    TurboQuantEmulator,
     TurboQuantKernelStage,
-    TurboQuantOpsAdapter,
     TurboQuantOpsConfig,
     TurboQuantValueLayout,
-    turboquant_plan_strip_ingestion,
 )
+from vllm_ascend.attention.turboquant_ingestion import turboquant_plan_strip_ingestion
+from vllm_ascend.attention.turboquant_layout import (
+    TURBOQUANT_KEY_PLANE,
+    TURBOQUANT_PACK_FACTOR,
+    TURBOQUANT_VALUE_PLANE,
+)
+from vllm_ascend.attention.turboquant_ops import TurboQuantOpsAdapter
 
 # The strip cache's block_size is 16: it is kTokens in the batch writer, a
 # compile-time constant of its four-stage schedule, and a prefill strip fills
@@ -387,7 +387,7 @@ def test_the_stage_env_selects_exactly_those_ops(
     _register(monkeypatch, *ALL_OPS)
     adapter = TurboQuantOpsAdapter()
     for op_name in ALL_OPS:
-        assert adapter._has_kernel(op_name) is (op_name in expected), op_name
+        assert adapter.has_kernel(op_name) is (op_name in expected), op_name
 
 
 def test_an_unknown_stage_name_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -600,7 +600,7 @@ def test_reported_scale_index_60254_is_a_batch_owned_value_scale():
 
 @pytest.mark.parametrize("mode", [0, 1])
 def test_finite_spike_fixture_is_query_aligned_and_zero_live_is_exact(monkeypatch, mode):
-    monkeypatch.setattr(turboquant_v1, "TURBOQUANT_QUANT_MODE", mode)
+    monkeypatch.setattr(turboquant_codec, "TURBOQUANT_QUANT_MODE", mode)
     emulator = TurboQuantEmulator(head_size=256, device=CPU)
     golden = make_adapter(value_layout=TurboQuantValueLayout.NZ_TILED)
     cache = make_finite_spike_cache(2, 128, 4, 256, emulator=emulator)
