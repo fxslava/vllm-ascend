@@ -110,7 +110,7 @@ def _write_strip_cache(
     head_size = packed_bytes * TURBOQUANT_PACK_FACTOR
 
     key_codes, key_scales = emulator.quantize(emulator.rotate(key))
-    value_codes, value_scales = emulator.quantize(emulator.rotate(value))
+    value_codes, value_scales = emulator.quantize(emulator.rotate(value), fold="value")
 
     # The key plane: token-major rows, so one token's packed bytes go straight in.
     key_pages = key_cache.view(num_blocks, num_kv_heads, block_size, packed_bytes)
@@ -325,7 +325,7 @@ def test_the_strip_reader_round_trips_to_the_activations(
     )
     assert torch.equal(
         reader.dequantize_cache(packed_value, value_scales, emulator, torch.float32)[0],
-        emulator.decode(*emulator.encode(value)),
+        emulator.decode(*emulator.encode(value, fold="value")),
     )
 
 

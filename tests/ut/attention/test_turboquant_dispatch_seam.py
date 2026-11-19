@@ -186,9 +186,26 @@ def test_a_missing_namespace_falls_back(monkeypatch: pytest.MonkeyPatch) -> None
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def turboquant_caplog(caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch):
+    """Capture vLLM's own handler path, including its nonpropagating configuration."""
+    logger = turboquant_v1.logger
+    monkeypatch.setattr(logger, "propagate", False)
+    caplog.set_level(logging.INFO, logger=logger.name)
+    added = caplog.handler not in logger.handlers
+    if added:
+        logger.addHandler(caplog.handler)
+    try:
+        yield caplog
+    finally:
+        if added:
+            logger.removeHandler(caplog.handler)
+
+
 def test_dispatch_trace_reports_cpu_tensor_layout(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, emulator: TurboQuantEmulator
+    monkeypatch: pytest.MonkeyPatch, turboquant_caplog: pytest.LogCaptureFixture, emulator: TurboQuantEmulator
 ) -> None:
+    caplog = turboquant_caplog
     monkeypatch.setattr(turboquant_v1, "_TURBOQUANT_TRACE_ENABLED", True)
     caplog.set_level(logging.INFO)
     x = torch.randn(3, HEAD_SIZE * 2)[:, ::2]
@@ -202,8 +219,9 @@ def test_dispatch_trace_reports_cpu_tensor_layout(
 
 
 def test_dispatch_trace_reports_custom_operator(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, emulator: TurboQuantEmulator
+    monkeypatch: pytest.MonkeyPatch, turboquant_caplog: pytest.LogCaptureFixture, emulator: TurboQuantEmulator
 ) -> None:
+    caplog = turboquant_caplog
     monkeypatch.setattr(turboquant_v1, "_TURBOQUANT_TRACE_ENABLED", True)
     caplog.set_level(logging.INFO)
     entry = OpRecorder((torch.zeros(1, dtype=torch.int8), torch.ones(1)))
@@ -307,6 +325,7 @@ def _assert_cache_holds(
     value: torch.Tensor,
     slot_mapping: torch.Tensor,
     emulator: TurboQuantEmulator,
+    folds: tuple[str, str] = ("key", "value"),
 ) -> None:
     """Every written slot carries exactly ``emulator.encode``'s bytes and scales."""
     for token, slot in enumerate(slot_mapping.tolist()):
@@ -315,7 +334,7 @@ def _assert_cache_holds(
             (TURBOQUANT_KEY_PLANE, key, key_cache),
             (TURBOQUANT_VALUE_PLANE, value, value_cache),
         ):
-            packed, scales = emulator.encode(activation[token])
+            packed, scales = emulator.encode(activation[token], fold=folds[plane])
             assert torch.equal(cache[page, offset], packed)
             assert torch.equal(scale_cache[plane, page, :, offset], scales)
 
@@ -330,8 +349,9 @@ def test_both_reference_writers_land_the_codec_bytes(emulator: TurboQuantEmulato
 
     decode = _caches()
     make_adapter().reshape_scatter_decode(key, value, *decode, slot_mapping, emulator)
-    for written, expected in zip(decode, prefill):
-        assert torch.equal(written, expected)
+    # The batch V reduction folds halves; scatter uses the K butterfly for both
+    # planes. Their FP32 scales need not be bit-identical in Lloyd-Max mode.
+    _assert_cache_holds(*decode, key, value, slot_mapping, emulator, folds=("key", "key"))
 
 
 def test_the_decode_writer_skips_padding_slots(emulator: TurboQuantEmulator) -> None:
@@ -784,7 +804,7 @@ def test_the_scatter_waves_fall_back_to_reference_without_the_scatter_kernel(
 
     assert batch.calls == []
     expected = _nz_caches()
-    _nz_layout_adapter()._write_slots(key, value, *expected, slot_mapping, emulator)
+    _nz_layout_adapter()._write_slots(key, value, *expected, slot_mapping, emulator, lloyd_max_folds=("key", "key"))
     for got, want in zip(caches, expected):
         assert torch.equal(got, want)
 
@@ -1280,8 +1300,9 @@ def test_a_stage_switched_on_attempts_the_import_once(unloaded: None) -> None:
 def test_missing_operators_are_reported_with_the_stages_that_wanted_them(
     unloaded: None,
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
+    turboquant_caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog = turboquant_caplog
     # Forced rather than observed: on an ascend950 box the ops really are
     # registered and nothing would warn, so the warning path only exists to be
     # tested if the probe answers "missing" here.

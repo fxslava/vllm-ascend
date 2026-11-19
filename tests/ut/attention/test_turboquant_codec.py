@@ -14,12 +14,14 @@ break without failing anything else:
   resolves back to this class. vLLM looks a backend up both ways.
 """
 
+import struct
 from unittest.mock import patch
 
 import pytest
 import torch
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+from vllm_ascend.attention import turboquant_v1
 from vllm_ascend.attention.turboquant_v1 import (
     TURBOQUANT_HEADROOM_BITS,
     TURBOQUANT_NIBBLE_MAX,
@@ -72,7 +74,7 @@ def _panels() -> dict[str, torch.Tensor]:
 @pytest.mark.parametrize("name", sorted(_panels()))
 def test_quantize_is_bit_identical_to_the_frexp_spelling(emulator, name):
     rotated = emulator.rotate(_panels()[name])
-    codes, scales = emulator.quantize(rotated)
+    codes, scales = emulator.quantize_uniform(rotated)
     expected_codes, expected_scales = _reference_quantize(emulator, rotated)
     assert torch.equal(codes, expected_codes)
     assert torch.equal(scales, expected_scales)
@@ -87,7 +89,7 @@ def test_quantize_calls_neither_frexp_nor_ldexp(emulator):
 
     rotated = emulator.rotate(torch.randn(32, HEAD_SIZE))
     with patch.object(torch, "frexp", refuse), patch.object(torch, "ldexp", refuse):
-        codes, scales = emulator.quantize(rotated)
+        codes, scales = emulator.quantize_uniform(rotated)
     assert codes.dtype == torch.int8
     assert scales.dtype == torch.float32
 
@@ -96,14 +98,14 @@ def test_quantize_survives_a_rotation_that_overflows_fp32(emulator):
     """Garbage in: the scale plane must still hold finite numbers."""
     overflowed = emulator.rotate(torch.full((2, HEAD_SIZE), float(2.0**125)))
     assert not torch.isfinite(overflowed).all(), "this case is about the overflow"
-    codes, scales = emulator.quantize(overflowed)
+    codes, scales = emulator.quantize_uniform(overflowed)
     assert torch.isfinite(scales).all()
     assert bool((codes.to(torch.int32).abs() <= -TURBOQUANT_NIBBLE_MIN).all())
 
 
 def test_quantize_of_a_denormal_row_saturates_instead_of_underflowing(emulator):
     """A row that small quantises to zero codes; its scale must stay normal."""
-    codes, scales = emulator.quantize(torch.full((2, HEAD_SIZE), float(2.0**-140)))
+    codes, scales = emulator.quantize_uniform(torch.full((2, HEAD_SIZE), float(2.0**-140)))
     assert int(codes.abs().sum()) == 0
     assert torch.isfinite(scales).all()
     assert bool((scales > 0).all())
@@ -133,6 +135,88 @@ def test_round_trip_reconstructs_the_activation():
     x_hat = emulator.decode(*emulator.encode(x))
     cosine = torch.nn.functional.cosine_similarity(x.reshape(1, -1), x_hat.reshape(1, -1))
     assert float(cosine) > 0.98
+
+
+@pytest.mark.parametrize("head_size", [32, 64, 128, 256, 512])
+@pytest.mark.parametrize("fold", ["key", "butterfly", "value"])
+def test_lloyd_max_preserves_all_leading_scale_dimensions(head_size, fold):
+    emulator = TurboQuantEmulator(head_size=head_size, device=CPU)
+    rotated = torch.ones(2, 3, 4, head_size)
+    codes, scales = emulator.quantize_lloyd_max(rotated, fold)
+    assert codes.shape == rotated.shape
+    assert scales.shape == rotated.shape[:-1]
+    assert codes.dtype == torch.int8
+    assert scales.dtype == torch.float32
+    expected = torch.sqrt(torch.tensor(float(head_size)) + turboquant_v1.TURBOQUANT_LM_EPS)
+    expected = (expected * emulator.inv_sqrt_len) * emulator.inv_sqrt_len
+    assert torch.equal(scales, expected.expand_as(scales))
+
+
+@pytest.mark.parametrize("fold", ["key", "butterfly", "value"])
+def test_lloyd_max_keeps_the_production_256_channel_fp32_reduction_order(fold):
+    """Scalar FP32 oracle for the two kernels' distinct reduction trees."""
+    row = torch.randn(256, generator=torch.Generator().manual_seed(17))
+    row *= torch.logspace(-3, 3, 256)
+
+    def fp32(value):
+        return struct.unpack("f", struct.pack("f", value))[0]
+
+    squares = [fp32(float(value) ** 2) for value in row]
+    if fold == "value":
+        while len(squares) > 1:
+            half = len(squares) // 2
+            squares = [fp32(squares[i] + squares[i + half]) for i in range(half)]
+    else:
+        squares = [
+            fp32(fp32(fp32(squares[i] + squares[i + 64]) + squares[i + 128]) + squares[i + 192]) for i in range(64)
+        ]
+        for stride in (1, 2, 4, 8, 16, 32):
+            squares = [fp32(squares[i] + squares[i ^ stride]) for i in range(64)]
+    assert float(TurboQuantEmulator._lloyd_max_sumsq(row, fold)) == squares[0]
+
+
+@pytest.mark.parametrize("width", [0, 3, 63, 192])
+def test_lloyd_max_refuses_invalid_reduction_widths(width):
+    with pytest.raises(ValueError, match="nonempty power-of-two"):
+        TurboQuantEmulator._lloyd_max_sumsq(torch.ones(width), "key")
+
+
+@pytest.mark.parametrize("mode", [0, 1])
+@pytest.mark.parametrize("fold", ["key", "value"])
+def test_codec_helpers_select_the_active_writer_codebook(monkeypatch, mode, fold):
+    monkeypatch.setattr(turboquant_v1, "TURBOQUANT_QUANT_MODE", mode)
+    emulator = TurboQuantEmulator(head_size=256, device=CPU)
+    x = torch.randn(3, 4, 256, generator=torch.Generator().manual_seed(18))
+    rotated = emulator.rotate(x)
+    if mode == 1:
+        codes, scales = emulator.quantize_lloyd_max(rotated, fold)
+        reconstructed = emulator.dequantize_lloyd_max(codes, scales)
+    else:
+        codes, scales = emulator.quantize_uniform(rotated)
+        reconstructed = emulator.dequantize_uniform(codes, scales)
+    packed, actual_scales = emulator.encode(x, fold=fold)
+    assert torch.equal(packed, emulator.pack(codes))
+    assert torch.equal(actual_scales, scales)
+    assert torch.equal(emulator.dequantize(codes, scales), reconstructed)
+    assert torch.equal(emulator.decode(packed, actual_scales), emulator.inverse_rotate(reconstructed))
+
+
+@pytest.mark.parametrize("head_size", [32, 64, 128, 256, 512])
+def test_rotation_matches_its_matrix_and_is_independent_of_ingestion_batch(head_size):
+    emulator = TurboQuantEmulator(head_size=head_size, device=CPU)
+    x = torch.randn(17, 4, head_size, generator=torch.Generator().manual_seed(19))
+    rotated = emulator.rotate(x)
+    torch.testing.assert_close(rotated, x @ emulator.rotation.T, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(
+        emulator.inverse_rotate(rotated),
+        rotated @ emulator.rotation * emulator.inv_sqrt_len,
+        atol=1e-4,
+        rtol=1e-4,
+    )
+    split = torch.cat([emulator.rotate(x[:1]), emulator.rotate(x[1:16]), emulator.rotate(x[16:])])
+    padded = emulator.rotate(torch.cat([x, x[-1:].expand(15, -1, -1)]))
+    assert torch.equal(rotated, split)
+    assert torch.equal(rotated, padded[: len(x)])
 
 
 def test_backend_name_is_the_enum_member_it_registers_as():
