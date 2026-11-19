@@ -164,6 +164,7 @@ inline void check_descriptors(const Geometry& g, const std::vector<std::int32_t>
         const unsigned seq_blocks = (context + g.block_size - 1) / g.block_size;
         const bool fused = g.splits <= 1 || raw <= static_cast<std::int32_t>(g.fused_limit);
         const unsigned per_split = fused ? seq_blocks : (seq_blocks + g.splits - 1) / g.splits;
+        std::vector<unsigned> visits(context, 0);
         live_rows += (context + 63) / 64;
         for (unsigned split = 0; split < g.splits; ++split) {
             const auto& e = d[token * g.splits + split];
@@ -188,8 +189,25 @@ inline void check_descriptors(const Geometry& g, const std::vector<std::int32_t>
             require((1u << e.tiles_per_page_shift) * 64u == g.block_size);
             require(((e.flags & fdt::kDecodeSplitLive) != 0) == (expect != 0));
             require(((e.flags & fdt::kDecodeSplitCarriesTail) != 0) == (tail != 0));
+            // Replay ReadPipelineTile/TilePhysical and VectorSoftmax using the actual
+            // descriptor. Check row ownership, not only aggregate tile counts: an
+            // overlap and a hole could otherwise cancel, especially at a split boundary.
+            const unsigned page_mask = (1u << e.tiles_per_page_shift) - 1u;
+            for (unsigned tile = 0; tile < e.num_tiles; ++tile) {
+                const unsigned absolute = e.tile_origin + tile;
+                const unsigned page = absolute >> e.tiles_per_page_shift;
+                require(page < e.blocks_in_split);
+                const unsigned first = (e.block_start_idx + page) * g.block_size +
+                                       (absolute & page_mask) * fdt::kDecodeTileRows;
+                const unsigned valid = tile + 1 == e.num_tiles && e.tail_rows ?
+                                           e.tail_rows : fdt::kDecodeTileRows;
+                require(first < context && valid <= context - first);
+                for (unsigned row = first; row < first + valid; ++row)
+                    require(++visits[row] == 1);
+            }
             total += e.num_tiles;
         }
+        for (const unsigned count : visits) require(count == 1);
     }
     // Every live row of every token is covered exactly once, whatever the split count -- and a
     // zero-length token contributes nothing, which is what makes a padded row safe to launch.
@@ -246,6 +264,26 @@ inline void run()
     for (const auto& r : ragged) {
         check_dispatch(r.g, r.lengths);
         check_descriptors(r.g, r.lengths);
+    }
+
+    // Match the 950PR live-write regression, including the two appended decode
+    // rows and the one-extra-row exposed-spike control at each step. Preserve
+    // the request grouping, including the mixed fused/Split-K length pair.
+    for (const unsigned block_size : {128u, 256u, 1024u}) {
+        for (unsigned splits = 1; splits <= 8; ++splits) {
+            for (unsigned appended = 0; appended <= 3; ++appended) {
+                for (std::vector<std::int32_t> lengths :
+                     {std::vector<std::int32_t>{64, static_cast<std::int32_t>(block_size)},
+                      {8193}, {static_cast<std::int32_t>(block_size + 8), 8223}, {8319}}) {
+                    for (auto& context : lengths) context += appended;
+                    const Geometry g{static_cast<unsigned>(lengths.size()), 24, 4, splits, 6,
+                                     block_size, (8319u + 3u + block_size - 1) / block_size,
+                                     0, 4096};
+                    check_dispatch(g, lengths);
+                    check_descriptors(g, lengths);
+                }
+            }
+        }
     }
 
     // THE REFUSALS. Each of these is a geometry the device's closed-form cursor cannot express,

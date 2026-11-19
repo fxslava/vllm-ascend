@@ -24,6 +24,10 @@ incompatible, and that both scale planes are bijections.
 the decode layout at and above the 4 GiB boundary, including scale offsets and
 the largest non-negative int32 slot.
 
+``test_decode_reduce`` checks mixed fused/Split-K launch coverage and the dense
+GEMM's padding ranges with NaN/Inf operands for every live batch size and split
+count. It models dense arithmetic; it does not execute the device kernel.
+
 Run without the NPU unit-test fixtures::
 
     pytest --noconftest tests/ut/ops/test_turboquant_contract_gates.py
@@ -35,7 +39,7 @@ from pathlib import Path
 
 import pytest
 
-GATES = ("test_contract_gates", "test_layout_bridge", "test_cache_addresses")
+GATES = ("test_contract_gates", "test_layout_bridge", "test_cache_addresses", "test_decode_reduce")
 
 # `turboquant_reshape_batch.cpp` is included by test_contract_gates.cpp: its
 # device body sits behind `#if defined(__CCE_AICORE__)`, so a host compiler sees
@@ -49,7 +53,7 @@ COMPILE_FLAGS = ("-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror")
 # That is the point of the move: the host tiling is ordinary host C++ and the
 # gate compiles the very same object the launcher does.
 TILING_TU = "csrc/attention/turboquant/op_host/turboquant_tiling.cpp"
-EXTRA_SOURCES = {"test_contract_gates": (TILING_TU,)}
+EXTRA_SOURCES = {"test_contract_gates": (TILING_TU,), "test_decode_reduce": (TILING_TU,)}
 
 
 @pytest.fixture(scope="module")
