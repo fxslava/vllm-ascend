@@ -5287,6 +5287,10 @@ class NPUModelRunner(GPUModelRunner):
         if (
             not is_dsv4_main
             and not uses_padded_page_layout
+            # TurboQuant's contiguous K/V/scale planes do not preserve the
+            # scheduler page stride of an overlaid Mamba region. Keep all
+            # layers private; the worker scales the planner budget for this.
+            and not any(isinstance(spec, AscendTurboQuantAttentionSpec) for spec in layer_kv_cache_spec.values())
             and (self.hybrid_with_attn_and_mamba
                  or is_step_model)
             and not self.use_sparse
@@ -5315,19 +5319,7 @@ class NPUModelRunner(GPUModelRunner):
                         alignment,
                     )
                     for layer_name, start, layer_size in regions:
-                        region = backing[start : start + layer_size]
-                        region_spec = layer_kv_cache_spec[layer_name]
-                        if isinstance(region_spec, AscendTurboQuantAttentionSpec):
-                            # A TurboQuant layer owns its region of the shared
-                            # backing and carves it into three planes. It is
-                            # never handed a Mamba layer's page, so a packed
-                            # plane and a recurrent state are never interleaved
-                            # and the Mamba allocation is untouched.
-                            kv_cache_raw_tensors[layer_name] = self._carve_turboquant_planes(
-                                layer_name, region_spec, region, kv_cache_config.num_blocks
-                            )
-                        else:
-                            kv_cache_raw_tensors[layer_name] = region
+                        kv_cache_raw_tensors[layer_name] = backing[start : start + layer_size]
 
         layerwise_reuse = get_layerwise_reuse_config(self.vllm_config.kv_transfer_config) is not None
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
@@ -5394,11 +5386,9 @@ class NPUModelRunner(GPUModelRunner):
                             tensor = self._align_memory(tensor, alignment)[: layer_size]
                         inner_spec = layer_kv_cache_spec[layer_name_inner]
                         if isinstance(inner_spec, AscendTurboQuantAttentionSpec):
-                            # Same isolation as the shared-backing path above:
-                            # the hybrid flat layout (conv | ssm | padding |
-                            # K | V) has no room for a scale plane, so a
-                            # TurboQuant layer takes its own page budget as
-                            # three planes instead.
+                            # These planes must stay in this layer's private
+                            # allocation: a plane-major carve changes physical
+                            # page addresses and cannot overlay Mamba storage.
                             kv_cache_raw_tensors[layer_name_inner] = self._carve_turboquant_planes(
                                 layer_name_inner, inner_spec, tensor, kv_cache_config.num_blocks
                             )

@@ -147,6 +147,10 @@ def _round_block_size_for_turboquant_decode(vllm_config: VllmConfig) -> None:
         decode_block_size,
     )
     cache_config.block_size = decode_block_size
+    if cache_config.mamba_cache_mode == "align":
+        # Upstream aligned Mamba checkpoints to the pre-rounded block size.
+        # Update both token geometries before cache specs and tables are built.
+        cache_config.mamba_block_size = decode_block_size
     # The mamba page must stay covered: the attention page just grew, so
     # re-derive the padded mamba page from the new block size. The existing
     # padded value is max(old attention page, mamba raw), so max() with it is
@@ -1330,8 +1334,8 @@ def _validate_turboquant_config(vllm_config: VllmConfig) -> None:
         logger.info(
             "TurboQuant on a hybrid model: full-attention layers are allocated as their own "
             "three planes (packed K, packed V, fp32 scales) and are kept out of the Mamba "
-            "pages. Their page stays padded to the hybrid common page size, so the 4-bit "
-            "cache changes the layout but not the capacity of this model."
+            "pages. Pages stay padded to the hybrid common page size. Private layer buffers "
+            "require a reduced block-pool capacity to stay within the KV memory budget."
         )
 
 

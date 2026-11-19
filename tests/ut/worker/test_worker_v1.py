@@ -14,6 +14,7 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from tests.ut.base import TestBase
+from vllm_ascend.core.kv_cache_interface import turboquant_cache_spec
 from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_hardware_profile
 from vllm_ascend.distributed.eplb.eplb_state import AscendEplbState
@@ -352,6 +353,49 @@ class TestNPUWorker(TestBase):
                 )
                 with patch("vllm_ascend.worker.worker.get_kv_cache_groups", return_value=groups):
                     self.assertEqual(worker._scale_kv_cache_memory_for_multi_group(12345), expected_budget)
+
+    def test_turboquant_hybrid_budget_accounts_for_private_allocations(self):
+        from vllm_ascend.worker.worker import NPUWorker
+
+        dense_spec = FullAttentionSpec(
+            block_size=128,
+            num_kv_heads=4,
+            head_size=64,
+            dtype=torch.bfloat16,
+        )
+        attn_spec = turboquant_cache_spec(dense_spec, page_size_padded=dense_spec.page_size_bytes)
+        mamba_spec = MambaSpec(
+            block_size=1024,
+            shapes=((8,),),
+            dtypes=(torch.float32,),
+            page_size_padded=dense_spec.page_size_bytes,
+        )
+        worker = NPUWorker.__new__(NPUWorker)
+        worker.vllm_config = SimpleNamespace(
+            cache_config=SimpleNamespace(
+                get_resolved_kv_cache_layout=lambda: SimpleNamespace(is_layer_compact=True, is_block_compact=True),
+            ),
+        )
+        worker.model_config = SimpleNamespace(hf_text_config=SimpleNamespace(model_type="qwen3_5"))
+        worker.model_runner = SimpleNamespace(
+            supports_standardized_shared_kv_backing=True,
+            use_sparse=False,
+            use_compress=False,
+        )
+        worker.get_kv_cache_spec = MagicMock(return_value={"attn": attn_spec, "linear_attn": mamba_spec})
+        wrapped_spec = UniformTypeKVCacheSpecs.from_specs({"attn": attn_spec})
+        assert wrapped_spec is not None
+        for group_spec in (attn_spec, wrapped_spec):
+            with self.subTest(group_spec=type(group_spec).__name__):
+                groups = [
+                    KVCacheGroupSpec(layer_names=["attn"], kv_cache_spec=group_spec),
+                    KVCacheGroupSpec(layer_names=["linear_attn"], kv_cache_spec=mamba_spec),
+                ]
+                with patch("vllm_ascend.worker.worker.get_kv_cache_groups", return_value=groups):
+                    # The planner overlays two equal pages, while the runner
+                    # needs two private pages. Halve capacity, preserving the
+                    # actual device memory budget.
+                    self.assertEqual(worker._scale_kv_cache_memory_for_multi_group(8192), 4096)
 
     def test_pure_attention_multi_group_budget_scales_for_private_layout(self):
         from vllm_ascend.worker.worker import NPUWorker
@@ -1113,7 +1157,7 @@ class TestNPUWorker(TestBase):
 
         worker.get_kv_cache_spec.assert_called_once_with()
 
-    def test_explicit_kv_cache_memory_applies_sparse_offload_constraints(self):
+    def test_explicit_kv_cache_memory_applies_private_layout_and_offload_constraints(self):
         from vllm_ascend.worker.worker import NPUWorker
 
         worker = NPUWorker.__new__(NPUWorker)
@@ -1121,13 +1165,15 @@ class TestNPUWorker(TestBase):
         worker.cache_config = SimpleNamespace(kv_cache_memory_bytes=8192)
         worker.model_runner = MagicMock()
         worker.init_snapshot = SimpleNamespace(free_memory=16384)
-        worker._apply_kv_offload_decode_memory_constraints = MagicMock(return_value=4096)
+        worker._scale_kv_cache_memory_for_multi_group = MagicMock(return_value=4096)
+        worker._apply_kv_offload_decode_memory_constraints = MagicMock(return_value=2048)
 
         result = worker.determine_available_memory()
 
-        self.assertEqual(result, 4096)
+        self.assertEqual(result, 2048)
         worker.model_runner.profile_run.assert_called_once_with()
-        worker._apply_kv_offload_decode_memory_constraints.assert_called_once_with(8192)
+        worker._scale_kv_cache_memory_for_multi_group.assert_called_once_with(8192)
+        worker._apply_kv_offload_decode_memory_constraints.assert_called_once_with(4096)
 
     @patch("vllm_ascend.worker.worker.get_ascend_config")
     @patch("vllm_ascend.worker.worker.memory_profiling")
