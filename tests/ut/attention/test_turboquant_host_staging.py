@@ -6,11 +6,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from vllm_ascend.attention.turboquant_v1 import (
-    TURBOQUANT_STAGING_SLOTS,
-    AscendTurboQuantBackendImpl,
-    AscendTurboQuantMetadataBuilder,
-)
+from vllm_ascend.attention.turboquant_config import TURBOQUANT_STAGING_SLOTS
+from vllm_ascend.attention.turboquant_metadata import AscendTurboQuantMetadataBuilder
+from vllm_ascend.attention.turboquant_v1 import AscendTurboQuantBackendImpl
 
 
 @pytest.mark.parametrize("upload_complete", [False, True])
@@ -102,7 +100,7 @@ def test_mixed_forward_preserves_query_order_and_causal_mask():
         assert kwargs["actual_seq_lengths"] == [1, 3, 2]
         return padded + 100
 
-    impl._fused_infer_attention = attend
+    impl._run_dense_attention = attend
     for _ in range(2):
         output = torch.empty_like(query)
         assert impl._forward_mixed(query, metadata, output) is output

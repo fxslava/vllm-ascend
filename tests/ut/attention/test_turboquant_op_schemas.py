@@ -24,14 +24,14 @@ import pytest
 import torch
 
 from vllm_ascend.attention import turboquant_v1
-from vllm_ascend.attention.turboquant_v1 import (
+from vllm_ascend.attention.turboquant_config import (
     TURBOQUANT_OP_BUILD_DECODE_TILING,
     TURBOQUANT_OP_FUSED_DECODE,
     TURBOQUANT_OP_RESHAPE_AND_CACHE,
     TURBOQUANT_OP_RESHAPE_SCATTER,
-    AscendTurboQuantMetadataBuilder,
-    TurboQuantOpsAdapter,
 )
+from vllm_ascend.attention.turboquant_metadata import AscendTurboQuantMetadataBuilder
+from vllm_ascend.attention.turboquant_ops import TurboQuantOpsAdapter
 
 # Anchored to the module under test, not to this file, so the checkout is found
 # whether pytest collects this from tests/ut/attention or from a copy beside a

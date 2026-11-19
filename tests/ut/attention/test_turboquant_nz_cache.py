@@ -30,16 +30,13 @@ import pytest
 import torch
 
 from tests.helpers.turboquant import make_activations, make_adapter, make_cache
+from vllm_ascend.attention.turboquant_codec import TurboQuantEmulator
+from vllm_ascend.attention.turboquant_config import TurboQuantKernelStage, TurboQuantValueLayout
 from vllm_ascend.attention.turboquant_nz_ingress import (
     turboquant_codes_to_nz_tiled,
     turboquant_nz_packed_byte,
     turboquant_nz_scale_index,
     turboquant_scales_to_nz_tiled,
-)
-from vllm_ascend.attention.turboquant_v1 import (
-    TurboQuantEmulator,
-    TurboQuantKernelStage,
-    TurboQuantValueLayout,
 )
 
 NUM_BLOCKS = 4

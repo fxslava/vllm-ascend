@@ -87,11 +87,9 @@ from __future__ import annotations
 
 import torch
 
-from vllm_ascend.attention.turboquant_v1 import (
-    TURBOQUANT_PACK_FACTOR,
-    TURBOQUANT_STRIP_TOKENS,
-    TurboQuantEmulator,
-)
+from vllm_ascend.attention.turboquant_codec import TurboQuantEmulator
+from vllm_ascend.attention.turboquant_config import TURBOQUANT_STRIP_TOKENS
+from vllm_ascend.attention.turboquant_layout import TURBOQUANT_PACK_FACTOR
 
 __all__ = [
     "TURBOQUANT_NZ_OPERAND_C0",

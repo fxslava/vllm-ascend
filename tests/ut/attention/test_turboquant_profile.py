@@ -1,327 +1,272 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU tests for the TurboQuant backend's in-code profiler.
-
-The profiler exports a trace; it does not summarise one. torch_npu has no
-in-memory aggregation -- ``prof.key_averages()`` does not exist on it -- so
-everything readable comes out of the handler's files, and what is left to test
-on a host with no NPU, no CANN and no profiler is the plumbing: that a profiled
-forward is configured to write, that it runs exactly once, and that the
-measurement cannot change what the forward returns or raises.
-
-What is pinned:
-
-* the profiler is opened with ``on_trace_ready``, pointed at
-  :data:`TURBOQUANT_PROFILE_TRACE_DIR`, and with both activities. A profiler
-  without a handler would record a step that nothing can ever read.
-* ``prof.step()`` is called inside the context, which is what makes the handler
-  chunk and flush per step rather than once at the end of the run.
-* the notice naming the trace directory is logged through ``info_once``, on the
-  first profiled forward.
-* a build whose ``torch_npu.profiler`` is missing, or missing the trace
-  handler, leaves the forward alone and switches profiling off.
-* the env gate is off unless asked.
-"""
+"""Device-free contracts for profiler selection and inference isolation."""
 
 from __future__ import annotations
 
-import types
+import inspect
+import json
+import sys
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
+import torch
 
+from vllm_ascend import envs
+from vllm_ascend.attention import turboquant_ops, turboquant_v1
+from vllm_ascend.attention import turboquant_telemetry as telemetry_module
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.turboquant_v1 import (
-    TURBOQUANT_PROFILE_ENV,
-    TURBOQUANT_PROFILE_NOTICE,
+from vllm_ascend.attention.turboquant_telemetry import (
     TURBOQUANT_PROFILE_TRACE_DIR,
-    AscendTurboQuantBackendImpl,
-    turboquant_profile_enabled,
+    InferenceTelemetry,
+    NpuProfilerBackend,
+    TorchProfilerBackend,
+    create_profiler_backend,
 )
 
 
 @pytest.mark.parametrize(
     ("value", "expected"),
-    [(None, False), ("0", False), ("", False), ("1", True), ("true", True), ("ON", True), ("2", False)],
+    [
+        (None, False),
+        ("0", False),
+        ("", False),
+        ("1", True),
+        ("true", True),
+        (" ON ", True),
+        ("yes", True),
+        ("2", False),
+    ],
 )
-def test_the_env_gate_is_off_unless_asked(monkeypatch, value, expected):
+def test_profile_environment_gate(monkeypatch, value, expected):
     if value is None:
-        monkeypatch.delenv(TURBOQUANT_PROFILE_ENV, raising=False)
+        monkeypatch.delenv("TURBOQUANT_PROFILE", raising=False)
     else:
-        monkeypatch.setenv(TURBOQUANT_PROFILE_ENV, value)
-    assert turboquant_profile_enabled() is expected
+        monkeypatch.setenv("TURBOQUANT_PROFILE", value)
+    assert envs.TURBOQUANT_PROFILE is expected
 
 
-def test_the_notice_names_the_trace_directory_and_takes_it_as_an_argument():
-    """``info_once`` caches on its arguments, so the directory is a ``%s``."""
-    assert TURBOQUANT_PROFILE_NOTICE.count("%s") == 1
-    assert "key_averages" in TURBOQUANT_PROFILE_NOTICE
-    assert (TURBOQUANT_PROFILE_NOTICE % TURBOQUANT_PROFILE_TRACE_DIR).find("./turboquant_traces") > 0
-
-
-# -- the plumbing around the profiler ----------------------------------------
-#
-# A fake torch_npu.profiler stands in for the real one, which needs a device.
-
-
-class FakeProf:
-    """As much of ``torch_npu.profiler.profile``'s context as is used."""
-
-    def __init__(self):
+class FakeSession:
+    def __init__(self, failure=None, suppress=False):
+        self.failure = failure
+        self.suppress = suppress
         self.entered = False
         self.exited = False
-        self.steps_inside_context = 0
+        self.steps = 0
+        self.exception = None
 
     def __enter__(self):
+        if self.failure == "enter":
+            raise RuntimeError("enter failed")
         self.entered = True
+        self.exited = False
         return self
 
-    def __exit__(self, *exc_info):
-        self.exited = True
-        return False
-
     def step(self):
-        # A handler chunks on step(); stepping a stopped profiler would not.
-        assert self.entered and not self.exited, "step() outside the context"
-        self.steps_inside_context += 1
+        assert self.entered and not self.exited
+        self.steps += 1
+        if self.failure == "step":
+            raise RuntimeError("step failed")
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.exited = True
+        self.exception = exc_value
+        if self.failure == "exit":
+            raise RuntimeError("exit failed")
+        return self.suppress
 
 
 @pytest.fixture
-def profiled(monkeypatch):
-    """An impl with profiling on and a fake torch_npu.profiler behind it."""
-    import vllm_ascend.attention.turboquant_v1 as module
+def measurement(monkeypatch):
+    session = FakeSession()
+    backend = Mock()
+    backend.is_capturing.return_value = False
+    backend.open_session.return_value = session
+    factory = Mock(return_value=backend)
+    logger = Mock()
+    monkeypatch.setattr(telemetry_module, "logger", logger)
+    telemetry = InferenceTelemetry(True, backend_factory=factory)
+    return SimpleNamespace(session=session, backend=backend, factory=factory, logger=logger, telemetry=telemetry)
 
-    state: dict[str, object] = {"calls": 0, "notices": [], "handlers": []}
 
-    def tensorboard_trace_handler(directory):
-        state["handlers"] = [*state["handlers"], directory]  # type: ignore[misc]
-        return f"handler({directory})"
-
-    def profile(**kwargs):
-        state["kwargs"] = kwargs
-        state["prof"] = FakeProf()
-        return state["prof"]
-
-    monkeypatch.setattr(
-        module,
-        "torch_npu",
-        types.SimpleNamespace(
-            profiler=types.SimpleNamespace(
-                ProfilerActivity=types.SimpleNamespace(CPU="cpu", NPU="npu"),
-                profile=profile,
-                tensorboard_trace_handler=tensorboard_trace_handler,
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        module,
-        "logger",
-        types.SimpleNamespace(
-            info_once=lambda template, *args: state["notices"].append(template % args),  # type: ignore[union-attr]
-            info=lambda *args: None,
-            warning=lambda *args: None,
-        ),
+def test_measurement_preserves_result_and_steps_inside_context(measurement):
+    result = object()
+    forward = Mock(return_value=result)
+    assert measurement.telemetry.run(forward, "cpu", query="query") is result
+    forward.assert_called_once_with(query="query")
+    measurement.factory.assert_called_once_with("cpu")
+    measurement.backend.open_session.assert_called_once_with(TURBOQUANT_PROFILE_TRACE_DIR)
+    assert measurement.session.entered and measurement.session.exited
+    assert measurement.session.steps == 1
+    measurement.logger.info_once.assert_called_once_with(
+        telemetry_module.TURBOQUANT_PROFILE_NOTICE, "cpu", TURBOQUANT_PROFILE_TRACE_DIR
     )
 
-    impl = object.__new__(AscendTurboQuantBackendImpl)
-    impl._profile = True
 
-    def base_forward(self, **call):
-        state["calls"] = int(state["calls"]) + 1
-        if state.get("raises"):
-            raise ValueError("the forward's own failure")
-        return "attn_output"
-
-    monkeypatch.setattr(module.AscendAttentionBackendImpl, "forward", base_forward, raising=False)
-    state["impl"] = impl
-    state["module"] = module
-    return state
+def test_disabled_telemetry_does_not_construct_backend(measurement):
+    measurement.telemetry.enabled = False
+    forward = Mock(return_value="output")
+    assert measurement.telemetry.run(forward, "npu") == "output"
+    measurement.factory.assert_not_called()
+    measurement.logger.info_once.assert_not_called()
 
 
-def _run(profiled, **call):
-    return profiled["impl"]._profiled_forward(dict(call))
-
-
-def test_a_profiled_forward_runs_once_and_is_configured_to_export(profiled):
-    assert _run(profiled) == "attn_output"
-    assert profiled["calls"] == 1
-
-    kwargs = profiled["kwargs"]
-    assert kwargs["activities"] == ["cpu", "npu"]
-    # The handler is the whole point: without it the step is unreadable.
-    assert kwargs["on_trace_ready"] == f"handler({TURBOQUANT_PROFILE_TRACE_DIR})"
-    assert profiled["handlers"] == [TURBOQUANT_PROFILE_TRACE_DIR]
-    # Nothing is read back, so neither of the costly record levels is asked for.
-    assert kwargs["record_shapes"] is False
-    assert kwargs["with_stack"] is False
-
-    prof = profiled["prof"]
-    assert prof.entered and prof.exited
-    assert prof.steps_inside_context == 1
-
-
-def test_the_notice_is_logged_once_however_many_forwards_are_profiled(profiled):
-    for _ in range(3):
-        assert _run(profiled) == "attn_output"
-
-    # The impl calls info_once; the real logger dedupes on the arguments, and
-    # the fake records every call, so what is pinned here is the single
-    # template and its single argument.
-    assert profiled["notices"] == [TURBOQUANT_PROFILE_NOTICE % TURBOQUANT_PROFILE_TRACE_DIR] * 3
-    assert "./turboquant_traces" in profiled["notices"][0]
-    assert profiled["calls"] == 3
-
-
-def test_a_profiler_that_cannot_be_constructed_leaves_the_forward_alone(profiled):
-    def refuse(**kwargs):
-        raise TypeError("profile() got an unexpected keyword argument 'on_trace_ready'")
-
-    profiled["module"].torch_npu.profiler.profile = refuse
-
-    assert _run(profiled) == "attn_output"
-    assert profiled["calls"] == 1
-    assert profiled["impl"]._profile is False
-    assert profiled["notices"] == []  # nothing is being written, so nothing is announced
-
-
-@pytest.mark.parametrize("missing", ["profiler", "ProfilerActivity", "tensorboard_trace_handler"])
-def test_an_unavailable_profiler_leaves_the_forward_alone(profiled, missing):
-    module = profiled["module"]
-    if missing == "profiler":
-        module.torch_npu = types.SimpleNamespace(profiler=None)
+@pytest.mark.parametrize("inference_fails", [False, True])
+def test_capture_never_opens_profiler_or_repeats_inference(measurement, inference_fails):
+    measurement.backend.is_capturing.return_value = True
+    failure = ValueError("inference failed")
+    forward = Mock(side_effect=failure) if inference_fails else Mock(return_value="output")
+    if inference_fails:
+        with pytest.raises(ValueError) as caught:
+            measurement.telemetry.run(forward, "npu")
+        assert caught.value is failure
     else:
-        setattr(module.torch_npu.profiler, missing, None)
-
-    assert _run(profiled) == "attn_output"
-    assert profiled["calls"] == 1
-    assert profiled["impl"]._profile is False
-    assert profiled["notices"] == []
+        assert measurement.telemetry.run(forward, "npu") == "output"
+    forward.assert_called_once_with()
+    measurement.backend.open_session.assert_not_called()
+    assert measurement.telemetry.enabled
 
 
-def test_the_forwards_own_failure_is_not_reported_as_a_profiler_failure(profiled):
-    profiled["raises"] = True
+@pytest.mark.parametrize("failure", ["factory", "capture", "open", "enter", "step", "exit"])
+def test_profiler_failures_disable_measurement_without_repeating_inference(measurement, failure):
+    if failure == "factory":
+        measurement.factory.side_effect = RuntimeError("factory failed")
+    elif failure == "capture":
+        measurement.backend.is_capturing.side_effect = RuntimeError("capture failed")
+    elif failure == "open":
+        measurement.backend.open_session.side_effect = RuntimeError("open failed")
+    else:
+        measurement.session.failure = failure
+    forward = Mock(return_value="output")
+    assert measurement.telemetry.run(forward, "npu") == "output"
+    forward.assert_called_once_with()
+    assert not measurement.telemetry.enabled
+    assert measurement.telemetry.run(forward, "npu") == "output"
+    assert forward.call_count == 2
+    assert measurement.factory.call_count == 1
+    measurement.logger.warning.assert_called()
+    if failure == "step":
+        assert measurement.session.exited
 
-    with pytest.raises(ValueError, match="the forward's own failure"):
-        _run(profiled)
-    # Still on: nothing about the profiler went wrong.
-    assert profiled["impl"]._profile is True
+
+@pytest.mark.parametrize("exit_failure", [False, True])
+@pytest.mark.parametrize("suppress", [False, True])
+def test_inference_exception_is_preserved_even_if_profiler_suppresses_or_raises(measurement, exit_failure, suppress):
+    measurement.session.failure = "exit" if exit_failure else None
+    measurement.session.suppress = suppress
+    failure = ValueError("the inference failure")
+    forward = Mock(side_effect=failure)
+    with pytest.raises(ValueError) as caught:
+        measurement.telemetry.run(forward, "cpu")
+    assert caught.value is failure
+    assert measurement.session.exception is failure
+    assert measurement.session.steps == 0
+    forward.assert_called_once_with()
+    assert measurement.telemetry.enabled is not exit_failure
 
 
-def test_capture_and_a_metadataless_forward_are_never_profiled(monkeypatch, profiled):
-    """The two cases ``forward`` keeps away from the profiler, by its own gate."""
-    module = profiled["module"]
-    impl = profiled["impl"]
-    opened: list[int] = []
-    monkeypatch.setattr(
-        AscendTurboQuantBackendImpl,
-        "_open_profiler",
-        lambda self: opened.append(1),  # type: ignore[arg-type,return-value]
+def test_backend_factory_is_cached_per_device_and_extensible(measurement):
+    for device in ("cpu", "npu", "future_device", "cpu"):
+        measurement.telemetry.run(lambda: None, device)
+    assert [call.args for call in measurement.factory.call_args_list] == [("cpu",), ("npu",), ("future_device",)]
+
+
+def test_default_backend_selection():
+    assert isinstance(create_profiler_backend("cpu"), TorchProfilerBackend)
+    assert isinstance(create_profiler_backend("npu"), NpuProfilerBackend)
+    with pytest.raises(ValueError, match="does not support device"):
+        create_profiler_backend("unsupported")
+
+
+@pytest.mark.parametrize("device", ["cpu", "npu"])
+def test_backend_configures_only_its_supported_activities(monkeypatch, device):
+    profiler = Mock()
+    profiler.ProfilerActivity = SimpleNamespace(CPU="cpu", NPU="npu")
+    if device == "cpu":
+        monkeypatch.setattr(torch, "profiler", profiler)
+        # CPU profiling must work even when torch_npu cannot be imported.
+        monkeypatch.setitem(sys.modules, "torch_npu", None)
+    else:
+        monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(profiler=profiler))
+    backend = create_profiler_backend(device)
+    assert backend.open_session("traces") is profiler.profile.return_value
+    profiler.tensorboard_trace_handler.assert_called_once_with("traces")
+    profiler.profile.assert_called_once_with(
+        activities=["cpu"] if device == "cpu" else ["cpu", "npu"],
+        on_trace_ready=profiler.tensorboard_trace_handler.return_value,
+        record_shapes=False,
+        with_stack=False,
     )
-    monkeypatch.setattr(impl, "_ensure_statics", lambda layer, device: None, raising=False)
-    impl.adapter = types.SimpleNamespace(_has_kernel=lambda name: True)
+
+
+@pytest.mark.parametrize("missing", ["profiler", "ProfilerActivity", "tensorboard_trace_handler", "profile", "NPU"])
+def test_unavailable_npu_profiler_leaves_inference_running(monkeypatch, measurement, missing):
+    profiler = SimpleNamespace(
+        ProfilerActivity=SimpleNamespace(CPU="cpu", NPU="npu"),
+        tensorboard_trace_handler=Mock(),
+        profile=Mock(),
+    )
+    if missing == "profiler":
+        module = SimpleNamespace()
+    else:
+        module = SimpleNamespace(profiler=profiler)
+        delattr(profiler.ProfilerActivity if missing == "NPU" else profiler, missing)
+    monkeypatch.setitem(sys.modules, "torch_npu", module)
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(is_current_stream_capturing=lambda: False), raising=False)
+    telemetry = InferenceTelemetry(True)
+    forward = Mock(return_value="output")
+    assert telemetry.run(forward, "npu") == "output"
+    forward.assert_called_once_with()
+    assert not telemetry.enabled
+
+
+def test_npu_capture_query_uses_device_stream(monkeypatch):
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(is_current_stream_capturing=lambda: True), raising=False)
+    assert NpuProfilerBackend().is_capturing()
+    assert not TorchProfilerBackend().is_capturing()
+
+
+@pytest.mark.parametrize(
+    ("has_metadata", "capturing", "expected_calls"), [(False, False, 0), (True, True, 0), (True, False, 1)]
+)
+def test_attention_only_delegates_eligible_forwards_to_telemetry(monkeypatch, has_metadata, capturing, expected_calls):
+    impl = object.__new__(turboquant_v1.AscendTurboQuantBackendImpl)
+    impl.telemetry = Mock()
+    impl.telemetry.run.side_effect = lambda forward, device, **arguments: forward(**arguments)
+    impl._bind_codec_constants = Mock()
+    impl.adapter = SimpleNamespace(has_kernel=lambda name: True)
     impl.emulator = object()
-
-    layer = type("Layer", (), {"layer_name": "model.layers.3.self_attn.attn"})()
-    metadata = types.SimpleNamespace(attn_state=AscendAttentionState.DecodeOnly, turboquant_slot_mapping=object())
-    query = types.SimpleNamespace(device="npu")
-
-    def run(attn_metadata, capturing):
-        monkeypatch.setattr(module, "_stream_is_capturing", lambda: capturing)
-        return AscendTurboQuantBackendImpl.forward(
-            impl,
-            layer=layer,
-            query=query,
-            key=None,
-            value=None,
-            kv_cache=(),
-            attn_metadata=attn_metadata,
-        )
-
-    assert run(None, False) == "attn_output"  # a warm-up forward
-    assert run(metadata, True) == "attn_output"  # inside an ACL graph capture
-    assert opened == []  # no profiler was ever opened
-    assert profiled["calls"] == 2
+    monkeypatch.setattr(turboquant_v1, "_stream_is_capturing", lambda: capturing)
+    base_forward = Mock(return_value="output")
+    monkeypatch.setattr(turboquant_v1.AscendAttentionBackendImpl, "forward", base_forward, raising=False)
+    metadata = SimpleNamespace(attn_state=AscendAttentionState.DecodeOnly, turboquant_slot_mapping=object())
+    query = SimpleNamespace(device=SimpleNamespace(type="npu"))
+    assert impl.forward(None, query, None, None, (), metadata if has_metadata else None) == "output"
+    assert impl.telemetry.run.call_count == expected_calls
+    base_forward.assert_called_once()
 
 
-# -- the P0 cleanup: no debug validation, no crash dumps, no tracing by default
+def test_debug_dump_paths_remain_absent():
+    for module in (turboquant_v1, turboquant_ops, telemetry_module):
+        source = inspect.getsource(module)
+        for removed in ("TURBOQUANT_DECODE_VALIDATE", "tq_gh6_crash_dump", "tq_camodel_dump", ".tofile("):
+            assert removed not in source
 
 
-def test_the_debug_decode_validation_and_its_disk_dumps_are_gone():
-    """The gh=6 investigation hook must not survive as a serving code path.
-
-    It replayed the decode on the golden path after every kernel launch, read a
-    device tensor back to the host and wrote raw ``.bin`` files. The symbols and
-    the dump writers are removed; the source scan is what proves nothing
-    reintroduces a dump under a different name.
-    """
-    import inspect
-
-    import vllm_ascend.attention.turboquant_v1 as module
-
-    assert not hasattr(module, "TURBOQUANT_DECODE_VALIDATE_ENV")
-    assert not hasattr(AscendTurboQuantBackendImpl, "_validate_decode_against_golden")
-    assert not hasattr(AscendTurboQuantBackendImpl, "_decode_validation_enabled")
-
-    source = inspect.getsource(module)
-    for removed in (
-        "TURBOQUANT_DECODE_VALIDATE",
-        "tq_gh6_crash_dump",
-        "tq_camodel_dump",
-        ".tofile(",
-    ):
-        assert removed not in source, f"{removed!r} is back in turboquant_v1.py"
+def test_public_profile_imports_remain_compatible():
+    assert turboquant_v1.turboquant_profile_enabled is telemetry_module.turboquant_profile_enabled
+    assert turboquant_v1.TURBOQUANT_PROFILE_ENV == "TURBOQUANT_PROFILE"
+    assert turboquant_v1.TURBOQUANT_PROFILE_TRACE_DIR == TURBOQUANT_PROFILE_TRACE_DIR
 
 
-def test_profiling_is_off_by_default_and_constructs_no_trace_handler(monkeypatch, profiled):
-    """No env flag means no profiler, and therefore no handler and no files.
-
-    ``tensorboard_trace_handler`` is the only thing in this module that writes
-    to disk, so the disabled path is proved by the handler factory never being
-    called -- not merely by the profiler context never being entered.
-    """
-    monkeypatch.delenv(TURBOQUANT_PROFILE_ENV, raising=False)
-    impl = profiled["impl"]
-    assert turboquant_profile_enabled() is False
-    impl._profile = turboquant_profile_enabled()
-    monkeypatch.setattr(impl, "_ensure_statics", lambda layer, device: None, raising=False)
-
-    layer = type("Layer", (), {"layer_name": "model.layers.0.self_attn.attn"})()
-    metadata = type("Metadata", (), {"attn_state": AscendAttentionState.DecodeOnly})()
-    query = types.SimpleNamespace(device="cpu")
-
-    out = AscendTurboQuantBackendImpl.forward(
-        impl,
-        layer=layer,
-        query=query,
-        key=None,
-        value=None,
-        kv_cache=(),
-        attn_metadata=metadata,
-    )
-
-    assert out == "attn_output"
-    assert profiled["calls"] == 1
-    assert impl._profile is False
-    assert profiled["handlers"] == [], "a trace directory was configured while profiling was off"
-    assert "kwargs" not in profiled, "profile() was constructed while profiling was off"
-    assert profiled["notices"] == []
-
-
-def test_the_trace_handler_is_constructed_only_when_enabled_and_not_capturing(monkeypatch, profiled):
-    """The handler gate, proved at the one place the handler is built."""
-    module = profiled["module"]
-    impl = profiled["impl"]
-
-    impl._profile = False
-    assert impl._open_profiler() is None
-    assert profiled["handlers"] == []
-
-    impl._profile = True
-    monkeypatch.setattr(module, "_stream_is_capturing", lambda: True)
-    assert impl._open_profiler() is None
-    assert profiled["handlers"] == [], "a capture must never be handed a trace handler"
-
-    monkeypatch.setattr(module, "_stream_is_capturing", lambda: False)
-    opened = impl._open_profiler()
-    assert opened is profiled["prof"]
-    assert profiled["handlers"] == [TURBOQUANT_PROFILE_TRACE_DIR]
-    assert profiled["kwargs"]["on_trace_ready"] == f"handler({TURBOQUANT_PROFILE_TRACE_DIR})"
+def test_cpu_profiler_exports_a_readable_trace_without_npu(monkeypatch, tmp_path, measurement):
+    monkeypatch.setitem(sys.modules, "torch_npu", None)
+    telemetry = InferenceTelemetry(True, trace_directory=str(tmp_path))
+    inputs = torch.ones(8)
+    result = telemetry.run(lambda: inputs + 2, "cpu")
+    assert torch.equal(result, torch.full_like(inputs, 3))
+    traces = list(tmp_path.glob("*.pt.trace.json"))
+    assert traces, "CPU profiling completed without exporting a trace"
+    events = json.loads(traces[0].read_text(encoding="utf-8"))["traceEvents"]
+    assert any(event.get("name") == "aten::add" for event in events)

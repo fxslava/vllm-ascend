@@ -23,6 +23,45 @@ Two performance collection solutions are provided below: Ascend PyTorch Profiler
 - [**Model Operator Performance** → Use Ascend PyTorch Profiler](#ascend-pytorch-profiler)
 - [**Service Framework Workflow** → Use MS Service Profiler](#ms-service-profiler)
 
+## TurboQuant Attention Diagnostics
+
+For the `turboquant_v1` attention backend, `TURBOQUANT_PROFILE=1` enables
+per-forward trace export to `./turboquant_traces`. Profiling is disabled by
+default and skips warm-up calls without attention metadata and graph capture.
+NPU execution uses `torch_npu.profiler` with CPU and NPU activities. CPU
+execution uses `torch.profiler` with CPU activity; this supports reference
+operations and tests without requiring an NPU profiler. This does not add a
+CPU attention backend. Profiler setup, stepping, or export failures disable
+measurement for that layer while preserving the inference result or exception.
+
+`VLLM_ASCEND_TURBOQUANT_TRACE=1` independently enables dispatch logging. Each
+record reports `implementation=pytorch` or `implementation=custom_op` alongside
+tensor devices, shapes, strides, dtypes, storage offsets, and contiguity.
+Implementation and device are separate: PyTorch operations can run on an NPU,
+and a custom operator can receive CPU tensors. Logging reads tensor metadata
+without copying tensor contents to the host. Both diagnostics add overhead
+and are intended for investigation.
+
+The Python components have separate responsibilities:
+
+| Module in `vllm_ascend/attention/` | Responsibility |
+|:---|:---|
+| `turboquant_config.py` | Configuration, codec constants, and launch geometry |
+| `turboquant_codec.py` | PyTorch reference codec and cached rotation operands |
+| `turboquant_ingestion.py` | Host strip and scatter planning |
+| `turboquant_ops.py` | Custom operator dispatch and reference fallback |
+| `turboquant_metadata.py` | Persistent launch buffers and scheduler metadata |
+| `turboquant_telemetry.py` | Dispatch observers, profiler backends, and measurement lifecycle |
+| `turboquant_v1.py` | vLLM attention integration and existing public imports |
+
+To support another profiler, implement `ProfilerBackend.is_capturing()` and
+`open_session(trace_directory)` and inject a backend factory into
+`InferenceTelemetry`. Sessions implement the context manager methods and
+`step()`. Dispatch observers implement `record()` and can be injected into the
+operation adapter and metadata builder independently of profiling. Environment
+settings are read through `vllm_ascend.envs`; existing TurboQuant variable names
+and defaults are retained.
+
 ---
 
 ## Ascend PyTorch Profiler  
