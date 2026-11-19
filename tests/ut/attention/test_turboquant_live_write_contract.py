@@ -2,11 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU checks for the compact live NPU suite's reference and launch preconditions."""
 
+import ast
+import inspect
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from tests.helpers.turboquant import register_ops
 from tests.ut.attention import test_turboquant_live_write_npu as live
 
 
@@ -61,3 +64,99 @@ def test_launch_repoisons_scratch_and_shares_builder_threshold(monkeypatch, thre
     for _ in range(2):
         output = live._launch_serving_decode(adapter, None, (None,) * 3, None, contexts, query, buffers, threshold)
         assert (output == 0).all()
+
+
+@pytest.mark.parametrize("batch", [1, 2, 3, 9])
+@pytest.mark.parametrize("splits", [1, 2, 3, 8])
+def test_live_tiling_and_adapter_launch_use_the_same_split_geometry(monkeypatch, batch, splits):
+    """Exercise the real adapter: re-export patches used to leave it at S=8."""
+    monkeypatch.setattr(live, "DEVICE", torch.device("cpu"))
+    backend = live._backend()
+    # Independent statement of decode_launch_split and its descriptor ABI for
+    # this fixture: one head chunk, four KV heads, at most 32 resident blocks.
+    grid = min(32, batch * live.NUM_KV_HEADS * splits)
+    expected_words = batch * splits * 16 + grid * 8
+    contexts = tuple(65 + request for request in range(batch))
+    calls = []
+
+    def build_tiling(
+        context_lens,
+        tiling,
+        num_heads,
+        num_kv_heads,
+        head_size,
+        block_size,
+        max_blocks,
+        num_splits,
+        heads_per_task,
+        fused_context_limit,
+    ):
+        assert context_lens.tolist() == list(contexts)
+        assert num_splits == splits
+        assert (num_heads, num_kv_heads, head_size) == (live.NUM_HEADS, live.NUM_KV_HEADS, live.HEAD_SIZE)
+        assert (block_size, max_blocks, heads_per_task) == (128, 1, live.GROUP_HEADS)
+        assert fused_context_limit == live.FUSED_CONTEXT_LIMIT
+        assert tiling.numel() == expected_words
+        tiling[0], tiling[10] = 1, 1
+        calls.append("build")
+
+    def fused_decode(*args):
+        names = tuple(inspect.signature(backend.TurboQuantOpsAdapter._kernel_fused_decode).parameters)[1:]
+        passed = dict(zip(names, args, strict=True))
+        assert passed["num_splits"] == splits
+        assert passed["tiling"].numel() == expected_words
+        assert passed["workspace"].numel() == batch * live.NUM_HEADS * splits * (live.HEAD_SIZE + 16)
+        assert passed["query_rot"].numel() == batch * live.NUM_HEADS * live.HEAD_SIZE
+        assert passed["context_lens"].tolist() == list(contexts)
+        assert passed["fused_context_limit"] == live.FUSED_CONTEXT_LIMIT
+        passed["output"].zero_()
+        calls.append("decode")
+
+    register_ops(monkeypatch, **{live.BUILD_TILING_OP: build_tiling, live.FUSED_DECODE_OP: fused_decode})
+    live._require_ops(live.BUILD_TILING_OP, live.FUSED_DECODE_OP)
+    live._set_decode_splits(monkeypatch, splits)
+    buffers = live._build_decode_tiling(contexts, 128, 1, splits)
+    adapter = live._adapter(backend.TurboQuantKernelStage.DECODE)
+    emulator = backend.TurboQuantEmulator(head_size=live.HEAD_SIZE, device=live.DEVICE)
+    cache = live._caches(128, num_blocks=1)
+    query = torch.ones(batch, live.NUM_HEADS, live.HEAD_SIZE, dtype=torch.bfloat16)
+    tables = torch.zeros(batch, 1, dtype=torch.int32)
+    output = live._launch_serving_decode(adapter, emulator, cache, tables, contexts, query, buffers)
+    assert (output == 0).all()
+    assert calls == ["build", "decode"]
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_live_require_ops_uses_the_current_registry(monkeypatch, missing):
+    backend = live._backend()
+    monkeypatch.setattr(backend, "load_turboquant_extension", lambda: True)
+    namespace = SimpleNamespace() if missing else SimpleNamespace(**{live.SCATTER_OP: lambda: None})
+    monkeypatch.setattr(torch, "ops", SimpleNamespace(**{live.NAMESPACE: namespace}))
+    if missing:
+        with pytest.raises(pytest.skip.Exception, match="requires an ascend950 TurboQuant build"):
+            live._require_ops(live.SCATTER_OP)
+    else:
+        live._require_ops(live.SCATTER_OP)
+
+
+def test_live_backend_references_are_current_exports():
+    backend = live._backend()
+    tree = ast.parse(inspect.getsource(live))
+    referenced = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "backend"
+    }
+    assert not {name for name in referenced if not hasattr(backend, name)}
+
+
+def test_live_adapter_calls_match_current_python_signatures():
+    adapter_cls = live._backend().TurboQuantOpsAdapter
+    methods = {"reshape_and_cache_prefill", "reshape_scatter_decode", "gather", "dequantize_cache", "fused_decode"}
+    for node in ast.walk(ast.parse(inspect.getsource(live))):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute) or node.func.attr not in methods:
+            continue
+        # Every starred adapter argument in this suite is a three-plane cache.
+        arguments = [None for argument in node.args for _ in range(3 if isinstance(argument, ast.Starred) else 1)]
+        keywords = {keyword.arg: None for keyword in node.keywords}
+        inspect.signature(getattr(adapter_cls, node.func.attr)).bind(None, *arguments, **keywords)
