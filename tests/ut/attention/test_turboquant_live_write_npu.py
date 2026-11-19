@@ -81,7 +81,7 @@ def _helpers():
 def _require_ops(*names):
     backend = _backend()
     backend.load_turboquant_extension()
-    missing = [name for name in names if not backend._is_op_registered(NAMESPACE, name)]
+    missing = [name for name in names if not hasattr(getattr(torch.ops, NAMESPACE, None), name)]
     if missing:
         pytest.skip(f"requires an ascend950 TurboQuant build with {missing}")
 

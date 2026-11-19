@@ -72,6 +72,7 @@ from vllm.v1.worker.workspace import init_workspace_manager
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
+from vllm_ascend.core.kv_cache_interface import AscendTurboQuantAttentionSpec
 from vllm_ascend.core.kv_cache_placement import (
     KVPPPhysicalCachePlan,
     create_kvpp_cache_allocation_plan,
@@ -583,7 +584,9 @@ class NPUWorker(WorkerBase):
                 GiB(kv_cache_memory_bytes),
             )
             return self._apply_kvpp_memory_budget(
-                self._apply_kv_offload_decode_memory_constraints(kv_cache_memory_bytes)
+                self._apply_kv_offload_decode_memory_constraints(
+                    self._scale_kv_cache_memory_for_multi_group(kv_cache_memory_bytes)
+                )
             )
 
         # Execute a forward pass with dummy inputs to profile the memory usage
@@ -708,6 +711,9 @@ class NPUWorker(WorkerBase):
         if (
             has_attention
             and (has_mamba or is_step_model)
+            # Match the runner's private-allocation fallback: the packed
+            # planes cannot share physical page IDs with a Mamba page view.
+            and not any(isinstance(spec, AscendTurboQuantAttentionSpec) for spec in per_layer_specs)
             and layout.is_layer_compact
             and layout.is_block_compact
             and getattr(model_runner, "supports_standardized_shared_kv_backing", False)
@@ -739,7 +745,7 @@ class NPUWorker(WorkerBase):
                 bytes_per_block,
                 sum_pages,
             )
-            return int(available_memory * scale)
+            return available_memory * bytes_per_block // sum_pages
         return available_memory
 
     def log_memory_stats(self) -> None:

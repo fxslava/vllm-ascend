@@ -598,6 +598,40 @@ def test_update_block_size_for_backend_rounds_the_post_load_raise():
     assert config.cache_config.mamba_page_size_padded == 1024 * 4096
 
 
+def test_late_rounding_updates_mamba_checkpoint_block_size():
+    config = _qwen35_hybrid_config()
+    config.cache_config.mamba_cache_mode = "align"
+    config.cache_config.enable_prefix_caching = True
+
+    def align_before_rounding(config):
+        _upstream_platform_phase2(config)
+        config.cache_config.mamba_block_size = config.cache_config.block_size
+
+    with (
+        _turboquant_on(),
+        patch.object(Platform, "update_block_size_for_backend", side_effect=align_before_rounding),
+    ):
+        NPUPlatform.update_block_size_for_backend(config)
+
+    assert config.cache_config.block_size == 1024
+    assert config.cache_config.mamba_block_size == 1024
+    assert config.cache_config.mamba_page_size_padded == 1024 * 4096
+
+
+def test_late_rounding_preserves_unaligned_mamba_token_geometry():
+    config = _qwen35_hybrid_config()
+    config.cache_config.mamba_block_size = config.model_config.max_model_len
+
+    with (
+        _turboquant_on(),
+        patch.object(Platform, "update_block_size_for_backend", side_effect=_upstream_platform_phase2),
+    ):
+        NPUPlatform.update_block_size_for_backend(config)
+
+    assert config.cache_config.block_size == 1024
+    assert config.cache_config.mamba_block_size == config.model_config.max_model_len
+
+
 def test_update_block_size_for_backend_keeps_the_raise_without_turboquant():
     config = _qwen35_hybrid_config()
 

@@ -47,6 +47,7 @@ BLOCK_SIZE = 16
 NUM_KV_HEADS = 2
 HEAD_SIZE = 64
 NUM_BLOCKS = 3
+MAMBA_BLOCK_SIZE = 65536
 
 
 def _dense_spec(**overrides) -> FullAttentionSpec:
@@ -242,17 +243,60 @@ def test_hybrid_allocation_isolates_turboquant_from_the_mamba_page():
     assert isinstance(mamba_cache, torch.Tensor)
     assert mamba_cache.numel() == NUM_BLOCKS * specs[MAMBA].page_size_bytes
 
-    # Nothing overlaps: the planes live in the attention layer's own region of
-    # the shared backing, and the padded tail of that region stays unused.
-    layer_stride = NUM_BLOCKS * specs[ATTN].page_size_bytes
-    region_start = planes[0].data_ptr()
-    assert mamba_cache.data_ptr() == region_start + layer_stride
-    assert planes[-1].data_ptr() + planes[-1].numel() <= region_start + layer_stride
+    # Packed planes require a private allocation even when descriptors happen
+    # to be disjoint. Other planner layouts overlay attention and Mamba regions.
+    assert mamba_cache.untyped_storage().data_ptr() != planes[0].untyped_storage().data_ptr()
     assert sum(plane.numel() for plane in planes) == NUM_BLOCKS * specs[ATTN].real_page_size_bytes
 
     for plane in planes:
         plane.fill_(7)
     assert int(mamba_cache.abs().sum()) == 0
+
+
+@pytest.mark.parametrize("block_size", [896, 1024, 2048])
+def test_recycled_mamba_page_preserves_overlaid_turboquant_cache(block_size):
+    dense = FullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=4,
+        head_size=256,
+        dtype=torch.bfloat16,
+    )
+    attn_spec = turboquant_cache_spec(dense, page_size_padded=dense.page_size_bytes)
+    mamba_spec = MambaSpec(
+        block_size=MAMBA_BLOCK_SIZE,
+        shapes=((8,),),
+        dtypes=(torch.float32,),
+        page_size_padded=dense.page_size_bytes,
+    )
+    specs = {ATTN: attn_spec, MAMBA: mamba_spec}
+    config = _make_config(specs)
+    num_blocks = 4
+    config.num_blocks = num_blocks
+    for descriptor in config.kv_cache_tensors:
+        descriptor.size = num_blocks * dense.page_size_bytes
+        descriptor.layer_stride = num_blocks * dense.page_size_bytes
+    # Real standardized descriptors for different groups may overlay the same
+    # layer region. Distinct block IDs must still mean disjoint live bytes.
+    config.kv_cache_tensors[1].offset = config.kv_cache_tensors[0].offset
+    runner = _make_runner(specs)
+    raw = runner._allocate_kv_cache_tensors(config)
+    for index, plane in enumerate(raw[ATTN]):
+        plane.fill_(index + 1)
+    before = tuple(plane.clone() for plane in raw[ATTN])
+    state = runner._adjust_kv_layout(raw[MAMBA], [(num_blocks, 8)], [torch.float32], mamba_spec.page_size_bytes)[0]
+
+    # Reassign recurrent page 1 while attention page 0 remains live. With a
+    # plane-major carve into the shared backing, this write hits scales/codes
+    # of other attention pages despite using a different scheduler block ID.
+    state[1].fill_(3.25)
+    for actual, expected in zip(raw[ATTN], before):
+        assert torch.equal(actual, expected)
+
+    # The converse must hold when a fresh attention page is initialized.
+    state_before = state.clone()
+    for plane in raw[ATTN]:
+        plane.zero_()
+    assert torch.equal(state, state_before)
 
 
 def test_hybrid_reshape_views_the_three_planes():
