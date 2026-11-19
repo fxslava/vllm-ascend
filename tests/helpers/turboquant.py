@@ -14,6 +14,7 @@ from vllm_ascend.attention.turboquant_v1 import (
     TURBOQUANT_DECODE_MAX_SPLITS,
     TURBOQUANT_DECODE_SPLITS,
     TURBOQUANT_DEFAULT_NAMESPACE,
+    TURBOQUANT_NZ_TILE_ROWS,
     AscendTurboQuantMetadataBuilder,
     TurboQuantKernelStage,
     TurboQuantOpsAdapter,
@@ -23,6 +24,8 @@ from vllm_ascend.attention.turboquant_v1 import (
     turboquant_decode_workspace_floats,
     turboquant_tiling_upper_bound_words,
 )
+
+CACHE_POISON_SCALE = 2.0**100
 
 
 class OpRecorder:
@@ -52,7 +55,14 @@ def make_adapter(
 
 
 def make_cache(
-    num_blocks: int, block_size: int, num_kv_heads: int, head_size: int, *, device="cpu", decode: bool = False
+    num_blocks: int,
+    block_size: int,
+    num_kv_heads: int,
+    head_size: int,
+    *,
+    device="cpu",
+    decode: bool = False,
+    poison: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     packed = (num_blocks, block_size, num_kv_heads, turboquant_packed_bytes(head_size))
     scales = (
@@ -60,11 +70,15 @@ def make_cache(
         if decode
         else turboquant_scale_cache_shape(num_blocks, block_size, num_kv_heads)
     )
-    return (
-        torch.zeros(packed, dtype=torch.int8, device=device),
-        torch.zeros(packed, dtype=torch.int8, device=device),
+    cache = (
+        torch.full(packed, 127 if poison else 0, dtype=torch.int8, device=device),
+        torch.full(packed, -128 if poison else 0, dtype=torch.int8, device=device),
         torch.zeros(scales, dtype=torch.float32, device=device),
     )
+    if poison:
+        pattern = torch.tensor([float("nan"), float("inf"), CACHE_POISON_SCALE], dtype=torch.float32, device=device)
+        cache[2].view(-1).copy_(pattern.repeat(-(-cache[2].numel() // len(pattern)))[: cache[2].numel()])
+    return cache
 
 
 def make_activations(
@@ -118,11 +132,13 @@ def make_metadata_builder(
     return builder
 
 
-def assert_cache_equal(kernel_caches, golden_caches, *, scale_max_ulps: int = 0) -> None:
+def assert_cache_equal(kernel_caches, golden_caches, *, scale_max_ulps: int = 0, poison_mask=None) -> None:
     """Compare packed bytes and scale bits, with an explicit live-scale budget.
 
     Only positive, finite FP32 scales can use the ULP allowance. Zero lanes,
-    infinities and NaN poison payloads must retain their exact original bits.
+    infinities, NaN payloads and the large finite poison retain exact bits.
+    The optional ownership-based poison_mask excludes unwritten scales from
+    all tolerance, even if both their values have become positive and finite.
     Keep the default strict for read-only cache snapshots and uniform scales.
     """
     names = ("key_cache", "value_cache", "scale_cache")
@@ -134,7 +150,10 @@ def assert_cache_equal(kernel_caches, golden_caches, *, scale_max_ulps: int = 0)
             bits_a = a.view(torch.int32).to(torch.int64)
             bits_b = b.view(torch.int32).to(torch.int64)
             ulps = (bits_a - bits_b).abs()
-            live = torch.isfinite(a) & torch.isfinite(b) & (a > 0) & (b > 0)
+            live = torch.isfinite(a) & torch.isfinite(b) & (a > 0) & (b > 0) & (b != CACHE_POISON_SCALE)
+            if poison_mask is not None:
+                assert poison_mask.shape == b.shape and poison_mask.dtype == torch.bool
+                live &= ~poison_mask.cpu()
             equal = (bits_a == bits_b) | (live & (ulps <= scale_max_ulps))
         else:
             equal = a == b
@@ -163,3 +182,58 @@ def assert_cache_equal(kernel_caches, golden_caches, *, scale_max_ulps: int = 0)
             f"{precision} Packed bytes and non-live scale bits must match exactly; "
             "check codec arithmetic and cache addressing."
         )
+
+
+def make_recycled_page_table(contexts, block_size, *, reserve_tokens=2, seed=7):
+    """Shuffled, nonadjacent pages in the upper half of a larger cache.
+
+    Reserve slots for the first decode steps; table padding names poisoned page
+    zero. Returning the allocation extent keeps page IDs independent of block 0.
+    """
+    page_counts = [-(-(context + reserve_tokens) // block_size) for context in contexts]
+    total_pages = sum(page_counts)
+    num_blocks = 4 * total_pages + 1
+    pages = 2 * torch.randperm(total_pages, generator=torch.Generator().manual_seed(seed)) + 2 * total_pages + 1
+    tables = torch.zeros((len(contexts), max(page_counts)), dtype=torch.int32)
+    start = 0
+    for row, count in zip(tables, page_counts):
+        row[:count] = pages[start : start + count]
+        start += count
+    return tables, num_blocks
+
+
+def slots_from_page_table(tables, contexts, block_size):
+    """Physical slots for each request's logical token order, on the host."""
+    slots = []
+    for row, context in zip(tables, contexts):
+        logical = torch.arange(context, dtype=torch.int64)
+        slots.append(row[logical // block_size].long() * block_size + logical % block_size)
+    return torch.cat(slots).to(torch.int32)
+
+
+def assert_poison_scales_preserved(cache, initial, poison_mask):
+    """Check surviving NaNs first, then every unwritten scale's exact bits."""
+    actual, expected = cache[2].cpu(), initial[2].cpu()
+    mask = poison_mask.cpu()
+    nan_slots = mask & torch.isnan(expected)
+    assert torch.isnan(actual[nan_slots]).all(), "NaN poison was neutralized in an unowned scale slot"
+    unchanged = actual.view(torch.int32)[mask] == expected.view(torch.int32)[mask]
+    assert unchanged.all(), "unowned scale poison changed bits (including NaN payloads)"
+
+
+def make_finite_spike_cache(num_blocks, block_size, num_kv_heads, head_size, *, emulator, device="cpu"):
+    """Valid finite codebook rows aligned with a model-basis all-ones query."""
+    cache = make_cache(num_blocks, block_size, num_kv_heads, head_size, device=device)
+    golden = make_adapter(value_layout=TurboQuantValueLayout.NZ_TILED)
+    ones = torch.ones(TURBOQUANT_NZ_TILE_ROWS, num_kv_heads, head_size, dtype=torch.bfloat16, device=device)
+    slots = torch.arange(TURBOQUANT_NZ_TILE_ROWS, dtype=torch.int32, device=device)
+    golden.reshape_scatter_decode(ones * 10, ones * 100, *cache, slots, emulator)
+    tile_bytes = TURBOQUANT_NZ_TILE_ROWS * num_kv_heads * turboquant_packed_bytes(head_size)
+    for plane in cache[:2]:
+        tile = plane.view(-1)[:tile_bytes].clone()
+        plane.view(-1, tile_bytes).copy_(tile.unsqueeze(0).expand(plane.numel() // tile_bytes, -1))
+    scale_floats = TURBOQUANT_NZ_TILE_ROWS * TurboQuantOpsAdapter._nz_scale_slot_floats(num_kv_heads)
+    tile_scales = cache[2].view(-1)[:scale_floats].clone()
+    cache[2].view(-1, scale_floats).copy_(tile_scales.unsqueeze(0).expand(cache[2].numel() // scale_floats, -1))
+    assert torch.isfinite(cache[2]).all() and (cache[2] > 0).all(), "spike fixture must contain finite positive scales"
+    return cache
