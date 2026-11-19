@@ -358,9 +358,11 @@ void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Te
                                  at::Tensor &workspace, at::Tensor &query_rot, at::Tensor &output,
                                  int64_t num_heads, int64_t num_kv_heads, int64_t num_splits,
                                  int64_t heads_per_task, int64_t output_stage, double scale,
-                                 double inv_sqrt_len, int64_t decode_unpack)
+                                 double inv_sqrt_len, int64_t decode_unpack, int64_t fused_context_limit)
 {
     constexpr const char *op = "npu_turboquant_fused_decode";
+    TORCH_CHECK(fused_context_limit >= 0 && fused_context_limit <= INT32_MAX, op,
+                ": fused_context_limit must be in [0, INT32_MAX], got ", fused_context_limit);
 
     TORCH_CHECK(decode_unpack == static_cast<int64_t>(layout::DecodeUnpack::kNative) ||
                     decode_unpack == static_cast<int64_t>(layout::DecodeUnpack::kLloydMaxLut),
@@ -579,7 +581,7 @@ void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Te
         static_cast<std::uint32_t>(reduce_tasks_per_block),
         static_cast<std::uint32_t>(prologue_vectors_per_block),
         static_cast<std::uint32_t>(prologue_cube_chunk_vectors), static_cast<std::uint32_t>(output_stage),
-        layout::kFusedContextLimit, static_cast<float>(scale), static_cast<float>(inv_sqrt_len),
+        static_cast<std::uint32_t>(fused_context_limit), static_cast<float>(scale), static_cast<float>(inv_sqrt_len),
         static_cast<std::uint32_t>(num_blocks), static_cast<std::uint32_t>(decode_unpack));
 }
 
@@ -589,9 +591,12 @@ void npu_turboquant_fused_decode(at::Tensor &query, at::Tensor &pi_signs, at::Te
 
 void npu_turboquant_build_decode_tiling(at::Tensor &context_lens, at::Tensor &tiling, int64_t num_heads,
                                         int64_t num_kv_heads, int64_t head_size, int64_t block_size,
-                                        int64_t max_blocks, int64_t num_splits, int64_t heads_per_task)
+                                        int64_t max_blocks, int64_t num_splits, int64_t heads_per_task,
+                                        int64_t fused_context_limit)
 {
     constexpr const char *op = "npu_turboquant_build_decode_tiling";
+    TORCH_CHECK(fused_context_limit >= 0 && fused_context_limit <= INT32_MAX, op,
+                ": fused_context_limit must be in [0, INT32_MAX], got ", fused_context_limit);
 
     TORCH_CHECK(context_lens.scalar_type() == at::kInt && context_lens.dim() == 1 &&
                     context_lens.is_contiguous(),
@@ -628,6 +633,7 @@ void npu_turboquant_build_decode_tiling(at::Tensor &context_lens, at::Tensor &ti
 
     tiling::DecodeTilingRequest request = decode_request(num_tokens, num_heads, num_kv_heads, head_size,
                                                          block_size, max_blocks, num_splits, heads_per_task);
+    request.fused_context_limit = static_cast<std::uint32_t>(fused_context_limit);
     const tiling::DecodeLaunchSplit split =
         tiling::decode_launch_split(request, static_cast<std::uint32_t>(kDecodeMaxGrid));
     TORCH_CHECK(split.tasks > 0, op, ": nothing to describe");
@@ -683,12 +689,12 @@ void npu_turboquant_fused_decode_meta(at::Tensor &, at::Tensor &, at::Tensor &, 
                                       const std::optional<at::Tensor> &, at::Tensor &, at::Tensor &,
                                       at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &, at::Tensor &,
                                       at::Tensor &, at::Tensor &, int64_t, int64_t, int64_t, int64_t,
-                                      int64_t, double, double, int64_t)
+                                      int64_t, double, double, int64_t, int64_t)
 {
 }
 
 void npu_turboquant_build_decode_tiling_meta(at::Tensor &, at::Tensor &, int64_t, int64_t, int64_t,
-                                             int64_t, int64_t, int64_t, int64_t)
+                                             int64_t, int64_t, int64_t, int64_t, int64_t)
 {
 }
 
@@ -726,7 +732,7 @@ TORCH_LIBRARY_FRAGMENT(turboquant_ops, ops)
         "Tensor context_lens, Tensor tiling, Tensor! workspace, Tensor! query_rot, Tensor! output, "
         "int num_heads, int num_kv_heads, int num_splits, "
         "int heads_per_task, int output_stage, float scale, float inv_sqrt_len, "
-        "int decode_unpack) -> ()");
+        "int decode_unpack, int fused_context_limit=4096) -> ()");
     ops.impl("npu_turboquant_fused_decode", c10::kPrivateUse1,
              &vllm_ascend::turboquant_bindings::npu_turboquant_fused_decode);
     ops.impl("npu_turboquant_fused_decode", c10::kMeta,
@@ -735,7 +741,7 @@ TORCH_LIBRARY_FRAGMENT(turboquant_ops, ops)
     ops.def(
         "npu_turboquant_build_decode_tiling(Tensor context_lens, Tensor! tiling, int num_heads, "
         "int num_kv_heads, int head_size, int block_size, int max_blocks, int num_splits, "
-        "int heads_per_task) -> ()");
+        "int heads_per_task, int fused_context_limit=4096) -> ()");
     ops.impl("npu_turboquant_build_decode_tiling", c10::kPrivateUse1,
              &vllm_ascend::turboquant_bindings::npu_turboquant_build_decode_tiling);
     ops.impl("npu_turboquant_build_decode_tiling", c10::kCPU,

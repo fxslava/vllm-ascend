@@ -11,8 +11,10 @@ nonzero packed bytes and NaN/Inf/large scales. Batch prefill deliberately pads
 the final 16-token strip. The rest of its last page must retain the original
 poison, including dead rows in the final 64-token decode tile. Attention must
 ignore both the strip padding and that poison immediately after prefill and
-on the first two decode steps. Scattered writes, page crossings, all Split-K
-counts 1..8 and block sizes 128/256/1024 share this one contract test.
+on the first two decode steps. Short contexts use a shared builder/launch
+threshold of 192 to exercise real Split-K without long Python references.
+Representative grids cover page crossings, splits 1/2/3/8, and block sizes
+128/256/1024. Cross-request cases poison one request and check clean siblings.
 Finite-spike profiles use zero live keys, an all-ones query, and either exact
 zero live values (contribution leaks) or constant live values (denominator
 leaks). A single exposed spike must produce finite, nontrivial attention.
@@ -33,7 +35,9 @@ NUM_HEADS = 24
 GROUP_HEADS = NUM_HEADS // NUM_KV_HEADS
 STRIP = 16
 TILE_ROWS = 64
-LONG_PREFILL_TOKENS = 8192
+FUSED_CONTEXT_LIMIT = 192
+PREFILL_SPLITS = (1, 2, 3, 8)
+APPEND_SPLITS = (1, 3, 8)
 WRITER_BLOCK_SIZE = 64
 NUM_BLOCKS = 8
 ATTENTION_SCALE = HEAD_SIZE**-0.5
@@ -254,11 +258,11 @@ class TestCacheWriters:
         assert float(cosine) > 0.98
 
 
-def _build_decode_tiling(contexts, block_size, max_pages, splits):
+def _build_decode_tiling(contexts, block_size, max_pages, splits, fused_context_limit=FUSED_CONTEXT_LIMIT):
     backend = _backend()
     batch = len(contexts)
     buffers = (
-        torch.zeros(backend.turboquant_tiling_upper_bound_words(batch, splits), dtype=torch.int32, device=DEVICE),
+        torch.zeros(backend.turboquant_tiling_upper_bound_words(batch, splits), dtype=torch.int32),
         torch.empty(
             backend.turboquant_decode_workspace_floats(batch, NUM_HEADS, HEAD_SIZE, splits),
             dtype=torch.float32,
@@ -278,10 +282,11 @@ def _build_decode_tiling(contexts, block_size, max_pages, splits):
         max_pages,
         splits,
         GROUP_HEADS,
+        fused_context_limit,
     )
-    descriptor = buffers[0][:16].cpu()
+    descriptor = buffers[0][:16]
     assert int(descriptor[0]) > 0 and int(descriptor[10]) & 1, "builder left a dead decode descriptor"
-    return buffers
+    return (buffers[0].to(DEVICE), *buffers[1:])
 
 
 def _reference_attention_fp32(
@@ -306,14 +311,10 @@ def _reference_attention_fp32(
     key_dense = key_dense[0, :context].float()  # [S, kv, D]
     value_dense = value_dense[0, :context].float()
 
-    q = query[0].float()  # [N, D]
-    outs = []
-    for head in range(NUM_HEADS):
-        kv = head // GROUP_HEADS
-        s = (key_dense[:, kv, :] @ q[head]) * scale  # [S]
-        p = torch.softmax(s, dim=-1)
-        outs.append(p @ value_dense[:, kv, :])  # [D]
-    return torch.stack(outs).unsqueeze(0)  # [1, N, D]
+    q = query[0].float().reshape(NUM_KV_HEADS, GROUP_HEADS, HEAD_SIZE)
+    scores = torch.matmul(q, key_dense.permute(1, 2, 0)) * scale
+    output = torch.matmul(torch.softmax(scores, dim=-1), value_dense.permute(1, 0, 2))
+    return output.reshape(1, NUM_HEADS, HEAD_SIZE).cpu()
 
 
 def _assert_attention_close(tag, got, expected, context):
@@ -336,8 +337,12 @@ def _assert_attention_close(tag, got, expected, context):
     assert float(cosine) >= DECODE_COSINE_FLOOR, f"{tag}: attention cosine={float(cosine):.6g}"
 
 
-def _launch_serving_decode(adapter, emulator, caches, block_tables, contexts, query, buffers):
+def _launch_serving_decode(
+    adapter, emulator, caches, block_tables, contexts, query, buffers, fused_context_limit=FUSED_CONTEXT_LIMIT
+):
     output = torch.full_like(query, float("nan"))
+    for buffer in buffers[1:]:
+        buffer.fill_(float("nan"))
     fused = adapter.fused_decode(
         query=query,
         key_cache=caches[0],
@@ -353,10 +358,10 @@ def _launch_serving_decode(adapter, emulator, caches, block_tables, contexts, qu
         tiling=buffers[0],
         workspace=buffers[1],
         query_rot=buffers[2],
+        fused_context_limit=fused_context_limit,
     )
-    torch.npu.synchronize()
     assert fused is not None, "the registered decode kernel must run, not fall back"
-    return output
+    return output.cpu()
 
 
 def _scale_rows(cache, slots, value):
@@ -444,14 +449,21 @@ def _write_prefill(writer, key, value, cache, golden_cache, tables_host, context
 @requires_npu
 class TestPrefillDecode:
     @pytest.mark.parametrize(
-        "writer,payload",
-        [("batch", "random"), ("scatter", "random"), ("batch", "zero-live-spike"), ("batch", "constant-live-spike")],
-        ids=["batch-random", "scatter-random", "batch-zero-live-spike", "batch-constant-live-spike"],
+        "writer,payload,block_size,contexts",
+        [
+            pytest.param("batch", "random", 128, (64, 128), id="batch-random-aligned"),
+            pytest.param("batch", "random", 128, (136, 383), id="batch-random-mixed"),
+            pytest.param("batch", "random", 256, (257, 511), id="batch-random-page-tail"),
+            pytest.param("batch", "random", 1024, (257,), id="batch-random-large-page"),
+            pytest.param("scatter", "random", 128, (136, 383), id="scatter-random-mixed"),
+            pytest.param("batch", "zero-live-spike", 128, (63,), id="zero-live-spike-fused"),
+            pytest.param("batch", "zero-live-spike", 128, (136, 257), id="zero-live-spike-split"),
+            pytest.param("batch", "constant-live-spike", 128, (63,), id="constant-live-spike-fused"),
+            pytest.param("batch", "constant-live-spike", 128, (136, 257), id="constant-live-spike-split"),
+        ],
     )
-    @pytest.mark.parametrize("block_size", [128, 256, 1024])
-    @pytest.mark.parametrize("context_kind", ["aligned", "long-tail-1", "long-tail-8-31", "long-cross-128"])
     def test_recycled_pages_mask_prefill_tail_through_first_decode_steps(
-        self, writer, payload, block_size, context_kind, monkeypatch
+        self, writer, payload, block_size, contexts, monkeypatch
     ):
         """Ragged prefill -> immediate attention -> two KV appends and decode.
 
@@ -466,12 +478,6 @@ class TestPrefillDecode:
         _require_ops(PREFILL_OP if writer == "batch" else SCATTER_OP, SCATTER_OP, FUSED_DECODE_OP, BUILD_TILING_OP)
         backend, helpers = _backend(), _helpers()
         finite_spikes = payload.endswith("-spike")
-        contexts = {
-            "aligned": (TILE_ROWS, block_size),
-            "long-tail-1": (LONG_PREFILL_TOKENS + 1,),
-            "long-tail-8-31": (block_size + 8, LONG_PREFILL_TOKENS + 31),
-            "long-cross-128": (LONG_PREFILL_TOKENS + 127,),
-        }[context_kind]
         tables_host, num_blocks = helpers.make_recycled_page_table(contexts, block_size)
         tables = tables_host.to(DEVICE)
         emulator = backend.TurboQuantEmulator(head_size=HEAD_SIZE, device=DEVICE)
@@ -548,17 +554,17 @@ class TestPrefillDecode:
                 # Expose just ONE previously masked spike, rather than an
                 # entire tile, to prove a single-row leak is observable.
                 exposed_contexts = tuple(context + 1 for context in contexts)
-            sanitized, underfilled = _clone_cache(cache), _clone_cache(cache)
-            _scale_rows(sanitized, tail_slots, 0.0)
-            last_slots = helpers.slots_from_page_table(tables_host, contexts, block_size)
-            last_indices = torch.tensor(contexts).cumsum(0) - 1
-            if finite_spikes:
+            sanitized = _clone_cache(cache) if step == 0 else None
+            if sanitized is not None:
+                _scale_rows(sanitized, tail_slots, 0.0)
+            if finite_spikes and step == 0:
+                underfilled = _clone_cache(cache)
+                last_slots = helpers.slots_from_page_table(tables_host, contexts, block_size)
+                last_indices = torch.tensor(contexts).cumsum(0) - 1
                 _copy_cache_rows(underfilled, poison, last_slots[last_indices])
-            else:
-                _scale_rows(underfilled, last_slots[last_indices], float("nan"))
-            wrong_tables = tables.clone()
-            for request, context in enumerate(contexts):
-                wrong_tables[request, (context - 1) // block_size] = 0
+                wrong_tables = tables.clone()
+                for request, context in enumerate(contexts):
+                    wrong_tables[request, (context - 1) // block_size] = 0
             query = torch.randn(len(contexts), NUM_HEADS, HEAD_SIZE, generator=generator).to(DEVICE, torch.bfloat16)
             if finite_spikes:
                 query.fill_(1.0)
@@ -573,26 +579,28 @@ class TestPrefillDecode:
                     "zero-live reference must be exactly zero"
                 )
             snapshots = (_clone_cache(cache), _clone_cache(golden_cache))
-            variants = [
-                ("sanitized-tail", sanitized, tables, contexts, False),
-                ("poisoned-tail", cache, tables, contexts, False),
-                ("golden-written", golden_cache, tables, contexts, False),
-                ("underfilled-live-row", underfilled, tables, contexts, True),
-                ("wrong-page", cache, wrong_tables, contexts, True),
-            ]
-            if all(exposed > context for exposed, context in zip(exposed_contexts, contexts)):
-                variants.append(("tail-exposed-as-live", cache, tables, exposed_contexts, True))
-            for splits in range(1, 9):
+            for splits in PREFILL_SPLITS if step == 0 else APPEND_SPLITS:
                 monkeypatch.setattr(backend, "TURBOQUANT_DECODE_SPLITS", splits)
                 buffers = _build_decode_tiling(contexts, block_size, tables.shape[1], splits)
+                variants = [("poisoned-tail", cache, tables, contexts, False)]
+                if step == 0 and splits in (1, 3):
+                    variants.insert(0, ("sanitized-tail", sanitized, tables, contexts, False))
+                # Sensitivity controls need one representative split count, not
+                # another Cartesian sweep of the identical fault mechanisms.
+                if finite_spikes and step == 0 and splits == 3:
+                    variants.extend(
+                        [
+                            ("underfilled-live-row", underfilled, tables, contexts, True),
+                            ("wrong-page", cache, wrong_tables, contexts, True),
+                            ("tail-exposed-as-live", cache, tables, exposed_contexts, True),
+                        ]
+                    )
                 for name, source, table, lengths, fault in variants:
                     launch_buffers = (
                         buffers
                         if lengths == contexts
                         else _build_decode_tiling(lengths, block_size, tables.shape[1], splits)
                     )
-                    for buffer in launch_buffers[1:]:
-                        buffer.fill_(float("nan"))
                     output = _launch_serving_decode(decode, emulator, source, table, lengths, query, launch_buffers)
                     for request, context in enumerate(contexts):
                         tag = f"{writer}/{payload}/{phase}/{name}: block={block_size} S={splits} request={request}"
@@ -610,11 +618,109 @@ class TestPrefillDecode:
                                 _assert_attention_close(tag, output[request : request + 1], expected[request], context)
                         else:
                             _assert_attention_close(tag, output[request : request + 1], expected[request], context)
-                _compare(cache, snapshots[0])
-                _compare(golden_cache, snapshots[1])
+            _compare(cache, snapshots[0])
+            _compare(golden_cache, snapshots[1])
         assert not writer_scale_errors, "Writer scale contract failed after decode checks:\n" + "\n".join(
             writer_scale_errors
         )
+
+
+@requires_npu
+@pytest.mark.parametrize(
+    "contexts,poison_request,profile",
+    [
+        pytest.param((129, 385), 0, "query-nan", id="B2-fused-query-nan"),
+        pytest.param((65, 257, 513), 2, "query-inf", id="B3-split-query-inf"),
+        pytest.param((65, 257, 513), 1, "kv-nan", id="B3-middle-kv-nan"),
+        pytest.param((257, 385), 1, "kv-inf", id="B2-all-split-kv-inf"),
+        pytest.param((129, 385), 1, "tail-spike", id="B2-masked-tail-spike"),
+        pytest.param((65, 257, 513), 0, "live-spike", id="B3-fused-live-spike"),
+    ],
+)
+def test_cross_request_poison_cannot_change_clean_siblings(contexts, poison_request, profile, monkeypatch):
+    """One hostile request, clean random/zero siblings, and NaN launch scratch.
+
+    Poisoned requests have no defined non-finite output contract: FP8 casts can
+    neutralize their NaNs/Infs. Only clean siblings are required to match the
+    independent reference. Finite live spikes additionally stay observable.
+    """
+    _require_ops(PREFILL_OP, FUSED_DECODE_OP, BUILD_TILING_OP)
+    backend, helpers = _backend(), _helpers()
+    block_size = 128
+    tables_host, num_blocks = helpers.make_recycled_page_table(contexts, block_size)
+    tables = tables_host.to(DEVICE)
+    emulator = backend.TurboQuantEmulator(head_size=HEAD_SIZE, device=DEVICE)
+    cache = _caches(block_size, num_blocks)
+    golden_cache = _clone_cache(cache)
+    key, value = _activations(sum(contexts), seed=9200 + len(contexts))
+    _write_prefill("batch", key, value, cache, golden_cache, tables_host, contexts, block_size, emulator)
+    golden = _adapter()
+    query = torch.randn(len(contexts), NUM_HEADS, HEAD_SIZE, generator=torch.Generator().manual_seed(9400)).to(
+        DEVICE, torch.bfloat16
+    )
+    clean_requests = [request for request in range(len(contexts)) if request != poison_request]
+    if len(contexts) == 3:
+        # Keep a bit-exact zero sibling as well as a random one in every B=3 case.
+        request = clean_requests[-1]
+        zero_slots = helpers.slots_from_page_table(tables_host[request : request + 1], [contexts[request]], block_size)
+        for target in (cache, golden_cache):
+            _scale_rows(target, zero_slots, 0.0)
+    expected = {
+        request: _reference_attention_fp32(
+            golden,
+            emulator,
+            golden_cache,
+            tables[request : request + 1],
+            query[request : request + 1],
+            contexts[request],
+            ATTENTION_SCALE,
+        )
+        for request in clean_requests
+    }
+    row = tables_host[poison_request : poison_request + 1]
+    live_slots = helpers.slots_from_page_table(row, [contexts[poison_request]], block_size)
+    if profile.startswith("query-"):
+        query[poison_request].fill_(float(profile.split("-")[1]))
+        assert not torch.isfinite(query[poison_request]).all(), "query poison was not planted"
+    elif profile.startswith("kv-"):
+        _scale_rows(cache, live_slots, float(profile.split("-")[1]))
+        assert not torch.isfinite(cache[2].view(-1, 2 * NUM_KV_HEADS)[live_slots.to(DEVICE).long()]).all()
+    else:
+        spikes = helpers.make_finite_spike_cache(
+            num_blocks, block_size, NUM_KV_HEADS, HEAD_SIZE, emulator=emulator, device=DEVICE
+        )
+        if profile == "live-spike":
+            _copy_cache_rows(cache, spikes, live_slots)
+            query[poison_request].fill_(1.0)
+        else:
+            context = contexts[poison_request]
+            logical = torch.arange(context, -(-context // TILE_ROWS) * TILE_ROWS)
+            tail_slots = row[0, logical // block_size] * block_size + logical % block_size
+            assert tail_slots.numel(), "masked finite-spike control needs a partial tile"
+            _copy_cache_rows(cache, spikes, tail_slots)
+            # The poisoned request must also ignore its OWN masked finite tail.
+            clean_requests.append(poison_request)
+            expected[poison_request] = _reference_attention_fp32(
+                golden,
+                emulator,
+                golden_cache,
+                tables[poison_request : poison_request + 1],
+                query[poison_request : poison_request + 1],
+                contexts[poison_request],
+                ATTENTION_SCALE,
+            )
+    snapshot = _clone_cache(cache)
+    decode = _adapter(backend.TurboQuantKernelStage.DECODE)
+    for splits in PREFILL_SPLITS:
+        monkeypatch.setattr(backend, "TURBOQUANT_DECODE_SPLITS", splits)
+        buffers = _build_decode_tiling(contexts, block_size, tables.shape[1], splits)
+        output = _launch_serving_decode(decode, emulator, cache, tables, contexts, query, buffers)
+        for request in clean_requests:
+            tag = f"cross-request/{profile}: B={len(contexts)} S={splits} poison={poison_request} request={request}"
+            _assert_attention_close(tag, output[request : request + 1], expected[request], contexts[request])
+        if profile == "live-spike":
+            assert torch.isfinite(output[poison_request]).all() and output[poison_request].abs().max() > 1.0
+    _compare(cache, snapshot)
 
 
 def main():

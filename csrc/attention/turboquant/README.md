@@ -138,6 +138,13 @@ elsewhere (`NPUPlatform` clamps the graph mode). Decode tiling is built from
 the CPU sequence-length mirror in the metadata builder, outside the per-layer
 decode launch; the launch does not read context lengths back from the device.
 
+The decode and tiling-builder schemas both accept an optional trailing
+`fused_context_limit` scalar (default `4096`, valid range `0..INT32_MAX`). An
+explicit override must be identical in the builder and launch. The compact
+live-write NPU tests use `192` with contexts up to 513 tokens to enter the real
+Split-K reduction path; production metadata keeps the default. Rebuild the
+extension when updating Python callers to this schema.
+
 ### Serving mode: eager execution is a debug tool, not a configuration
 
 Run TurboQuant with **eager mode disabled** (the default): do not pass

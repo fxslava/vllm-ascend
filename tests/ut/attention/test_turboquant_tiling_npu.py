@@ -56,6 +56,24 @@ def test_invalid_lengths_do_not_modify_device_tiling(tiling_op):
     assert torch.all(device_tiling == -1)
 
 
+def test_short_mixed_batch_can_enter_real_split_k(tiling_op):
+    lengths = torch.tensor([136, 383], dtype=torch.int32)
+    tiling = torch.zeros(512, dtype=torch.int32)
+    tiling_op(lengths, tiling, 24, 4, 256, 128, 4, 3, 6, 192)
+    descriptors = tiling[: 2 * 3 * 16].reshape(2, 3, 16)
+    assert descriptors[:, :, 0].tolist() == [[3, 0, 0], [2, 2, 2]]
+    assert descriptors[1, :, 3].tolist() == [0, 1, 2]
+    assert descriptors[1, :, 2].tolist() == [0, 0, 63]
+
+
+@pytest.mark.parametrize("threshold", [-1, 2**31])
+def test_invalid_split_threshold_does_not_modify_tiling(tiling_op, threshold):
+    tiling = torch.full((512,), -1, dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="fused_context_limit"):
+        tiling_op(torch.tensor([257], dtype=torch.int32), tiling, 24, 4, 256, 128, 4, 3, 6, threshold)
+    assert torch.all(tiling == -1)
+
+
 def test_context_upload_ring_preserves_queued_steps(tiling_op):
     builder = make_metadata_builder(4, 24, 4, 256, 128, 64, device="npu")
     expected = []

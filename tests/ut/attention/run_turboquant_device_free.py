@@ -46,6 +46,7 @@ DEVICE_FREE_TESTS = (
     "test_turboquant_profile.py",
     "test_turboquant_host_staging.py",
     "test_turboquant_block_moves.py",
+    "test_turboquant_live_write_contract.py",
 )
 
 

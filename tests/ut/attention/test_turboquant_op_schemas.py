@@ -139,10 +139,20 @@ def test_the_tiling_builder_is_called_with_the_schema_in_order() -> None:
     passed = [line.strip().rstrip(",") for line in call.splitlines() if line.strip() not in ("", ")")]
     passed = [arg for arg in passed if not arg.startswith(")")]
     schema_args = [a.name for a in _schemas()[TURBOQUANT_OP_BUILD_DECODE_TILING].arguments]
-    assert len(passed) == len(schema_args), (
+    required = [a for a in _schemas()[TURBOQUANT_OP_BUILD_DECODE_TILING].arguments if not a.has_default_value()]
+    assert len(required) <= len(passed) <= len(schema_args), (
         f"_refresh_tiling passes {len(passed)} arguments, the schema declares {len(schema_args)}: "
         f"{passed} vs {schema_args}"
     )
+
+
+@pytest.mark.parametrize("op_name", [TURBOQUANT_OP_BUILD_DECODE_TILING, TURBOQUANT_OP_FUSED_DECODE])
+def test_decode_threshold_defaults_match_production(op_name):
+    from vllm_ascend.attention.turboquant_config import TURBOQUANT_FUSED_CONTEXT_LIMIT
+
+    threshold = _schemas()[op_name].arguments[-1]
+    assert threshold.name == "fused_context_limit"
+    assert threshold.default_value == TURBOQUANT_FUSED_CONTEXT_LIMIT == 4096
 
 
 def test_the_fused_decode_takes_an_optional_gate() -> None:
