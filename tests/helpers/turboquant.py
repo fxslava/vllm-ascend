@@ -116,3 +116,50 @@ def make_metadata_builder(
         builder = AscendTurboQuantMetadataBuilder(spec, ["attention"], config, torch.device(device))
     builder._block_size = block_size
     return builder
+
+
+def assert_cache_equal(kernel_caches, golden_caches, *, scale_max_ulps: int = 0) -> None:
+    """Compare packed bytes and scale bits, with an explicit live-scale budget.
+
+    Only positive, finite FP32 scales can use the ULP allowance. Zero lanes,
+    infinities and NaN poison payloads must retain their exact original bits.
+    Keep the default strict for read-only cache snapshots and uniform scales.
+    """
+    names = ("key_cache", "value_cache", "scale_cache")
+    for name, written, expected in zip(names, kernel_caches, golden_caches):
+        a = written.cpu()
+        b = expected.cpu()
+        assert a.shape == b.shape and a.dtype == b.dtype, f"{name}: cache shape or dtype differs"
+        if a.dtype == torch.float32:
+            bits_a = a.view(torch.int32).to(torch.int64)
+            bits_b = b.view(torch.int32).to(torch.int64)
+            ulps = (bits_a - bits_b).abs()
+            live = torch.isfinite(a) & torch.isfinite(b) & (a > 0) & (b > 0)
+            equal = (bits_a == bits_b) | (live & (ulps <= scale_max_ulps))
+        else:
+            equal = a == b
+        if bool(equal.all()):
+            continue
+        differing = (~equal).sum().item()
+        first = int((~equal).reshape(-1).nonzero()[0].item())
+        precision = ""
+        if a.dtype == b.dtype == torch.float32:
+            first_a = a.reshape(-1)[first]
+            first_b = b.reshape(-1)[first]
+            bits_a = int(first_a.view(torch.int32)) & 0xFFFFFFFF
+            bits_b = int(first_b.view(torch.int32)) & 0xFFFFFFFF
+            finite = torch.isfinite(a) & torch.isfinite(b)
+            max_error = float((a[finite] - b[finite]).abs().max()) if bool(finite.any()) else float("nan")
+            max_ulps = int(ulps[live].max()) if bool(live.any()) else 0
+            precision = (
+                f" First FP32 bits: 0x{bits_a:08x} vs 0x{bits_b:08x}; "
+                f"max finite absolute error {max_error:.9g}; "
+                f"max live scale error {max_ulps} ULP (budget {scale_max_ulps})."
+            )
+        raise AssertionError(
+            f"{name}: the kernel and the golden model disagree in {differing} of {a.numel()} "
+            f"elements, first at flat index {first} "
+            f"(kernel {a.reshape(-1)[first]!r} vs golden {b.reshape(-1)[first]!r}). "
+            f"{precision} Packed bytes and non-live scale bits must match exactly; "
+            "check codec arithmetic and cache addressing."
+        )
