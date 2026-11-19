@@ -348,6 +348,8 @@ int main()
         run(2, 4, 64);
         run(3, 2, 128);
         run(1, 4, 128);
+        run(16, 1, 128);
+        run(2, 1, 1024);
     } catch (const std::exception& error) {
         std::printf("FAIL test_layout_bridge: %s\n", error.what());
         return 1;
