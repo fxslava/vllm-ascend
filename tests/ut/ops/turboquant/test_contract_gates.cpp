@@ -412,7 +412,8 @@ int main()
         std::printf("test_contract_gates\n");
         check_strip_geometry();
         tiling_gate::run();
-        std::printf("  host tiling: 13 geometries, dispatch odometer and descriptors, 5 refusals\n");
+        std::printf("  host tiling: baseline/ragged geometries and 384 live-write grids; "
+                    "dispatch, descriptors and exact row coverage; refusal checks\n");
         check_launch_guards();
         check_mode2_channels();
         check_marked_graph();

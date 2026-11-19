@@ -441,13 +441,6 @@ public:
         // which is 32-byte aligned (256 bytes into the 512-byte buffer).
         AscendC::Compares(mask[kCubeTileRows].ReinterpretCast<uint8_t>(), mask, 0.0f,
                           AscendC::CMPMODE::GT, static_cast<uint32_t>(kCubeTileRows));
-        // DIRTY-DATA (D2): the ramp above is positive on the live lanes and negative on the dead
-        // ones. Turn that sign into a bit predicate ONCE here, at the head of the task, so the
-        // softmax can SELECT the dead rows away instead of relying on a Min whose NaN behaviour
-        // the documentation does not define. The predicate lives in the mask buffer's own tail,
-        // which is 32-byte aligned (256 bytes into the 512-byte buffer).
-        AscendC::Compares(mask[kCubeTileRows].ReinterpretCast<uint8_t>(), mask, 0.0f,
-                          AscendC::CMPMODE::GT, static_cast<uint32_t>(kCubeTileRows));
     }
 
     // The MTE2 half of the ring ingest: one tile's plane and scale lanes into ring slot `slot`, posted to
