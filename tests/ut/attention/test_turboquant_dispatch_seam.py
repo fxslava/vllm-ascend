@@ -926,10 +926,11 @@ def test_fused_decode_launches_and_returns_its_output(
     assert len(entry.calls) == 1
 
 
+@pytest.mark.parametrize("fused_context_limit", [0, 192, 4096])
 def test_fused_decode_passes_the_schema_the_binding_declares(
-    monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator
+    monkeypatch: pytest.MonkeyPatch, emulator: TurboQuantEmulator, fused_context_limit: int
 ) -> None:
-    """The 22 arguments of npu_turboquant_fused_decode, in the schema's order.
+    """The arguments of npu_turboquant_fused_decode, in the schema's order.
 
     The mode, the element type and the two codec constant pools are the
     binding's, so none of them appears here. The tiling descriptors, the Split-K
@@ -958,11 +959,12 @@ def test_fused_decode_passes_the_schema_the_binding_declares(
         num_kv_heads=NUM_KV_HEADS,
         scale=0.125,
         output=output,
+        fused_context_limit=fused_context_limit,
         **buffers,
     )
 
     args = entry.args
-    assert len(args) == 22
+    assert len(args) == 23
     assert args[0] is query
     assert torch.equal(args[1], emulator.pi_signs)
     assert args[2].dtype is TURBOQUANT_TABLE_DTYPE  # rot_tables: the same BF16 blob
@@ -984,6 +986,7 @@ def test_fused_decode_passes_the_schema_the_binding_declares(
     # VLLM_ASCEND_TURBOQUANT_QUANT_MODE=1 wrote the cache on the Lloyd-Max
     # codebook.
     assert args[21] == TURBOQUANT_DECODE_UNPACK
+    assert args[22] == fused_context_limit
 
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,7 @@ from vllm_ascend.attention.turboquant_codec import (
 from vllm_ascend.attention.turboquant_config import (
     TURBOQUANT_DECODE_SPLITS,
     TURBOQUANT_DECODE_UNPACK,
+    TURBOQUANT_FUSED_CONTEXT_LIMIT,
     TURBOQUANT_KERNEL_DTYPE,
     TURBOQUANT_KERNEL_OPS,
     TURBOQUANT_NZ_FP32_PER_BLOCK,
@@ -889,7 +890,9 @@ class TurboQuantOpsAdapter:
         tiling: torch.Tensor,
         workspace: torch.Tensor,
         query_rot: torch.Tensor,
+        fused_context_limit: int = TURBOQUANT_FUSED_CONTEXT_LIMIT,
     ) -> torch.Tensor | None:
+        """Launch decode; threshold overrides must also reach the tiling builder."""
         if not self.has_kernel(TURBOQUANT_OP_FUSED_DECODE):
             self.dispatch_observer.record(
                 TURBOQUANT_OP_FUSED_DECODE,
@@ -946,6 +949,7 @@ class TurboQuantOpsAdapter:
             output_stage=TURBOQUANT_STAGE_UNROTATED,
             scale=scale,
             inv_sqrt_len=emulator.inv_sqrt_len,
+            fused_context_limit=fused_context_limit,
         )
 
     def _validate_fused_decode_geometry(
@@ -1013,6 +1017,7 @@ class TurboQuantOpsAdapter:
         scale: float,
         inv_sqrt_len: float,
         decode_unpack: int = TURBOQUANT_DECODE_UNPACK,
+        fused_context_limit: int = TURBOQUANT_FUSED_CONTEXT_LIMIT,
     ) -> torch.Tensor:
         self._require_kernel(TURBOQUANT_OP_FUSED_DECODE)(
             query,
@@ -1037,6 +1042,7 @@ class TurboQuantOpsAdapter:
             scale,
             inv_sqrt_len,
             decode_unpack,
+            fused_context_limit,
         )
         return output
 

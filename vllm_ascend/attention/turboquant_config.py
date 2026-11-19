@@ -34,6 +34,10 @@ TURBOQUANT_STRIP_TOKENS: Final[int] = 16
 
 TURBOQUANT_NZ_TILE_ROWS: Final[int] = 64
 
+# Must match the C++ decode schema default. Explicit overrides must be passed
+# to both the descriptor builder and launch; a descriptor alone cannot change it.
+TURBOQUANT_FUSED_CONTEXT_LIMIT: Final[int] = 4096
+
 TURBOQUANT_NZ_OPERAND_C0: Final[int] = 32
 
 TURBOQUANT_NZ_FP32_PER_BLOCK: Final[int] = 8

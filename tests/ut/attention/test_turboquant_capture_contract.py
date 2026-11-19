@@ -9,6 +9,7 @@ in tests/e2e/pull_request/one_card/aclgraph/test_turboquant_aclgraph.py.
 
 from __future__ import annotations
 
+import ast
 import types
 from typing import Any
 
@@ -28,6 +29,7 @@ from vllm_ascend.attention.turboquant_codec import TurboQuantEmulator
 from vllm_ascend.attention.turboquant_config import (
     TURBOQUANT_DECODE_SPLITS,
     TURBOQUANT_DECODE_UNPACK,
+    TURBOQUANT_FUSED_CONTEXT_LIMIT,
     TURBOQUANT_STAGE_UNROTATED,
     TURBOQUANT_STAGING_SLOTS,
     TurboQuantKernelStage,
@@ -286,6 +288,7 @@ _ARG = {
             "scale",
             "inv_sqrt_len",
             "decode_unpack",
+            "fused_context_limit",
         )
     )
 }
@@ -1352,6 +1355,7 @@ _LAUNCH_ABI: tuple[tuple[str, str, Any], ...] = (
     ("scale", "float", 0.125),
     ("inv_sqrt_len", "float", None),
     ("decode_unpack", "int", TURBOQUANT_DECODE_UNPACK),
+    ("fused_context_limit", "int", TURBOQUANT_FUSED_CONTEXT_LIMIT),
 )
 
 
@@ -1496,12 +1500,18 @@ def test_g8_python_reproduces_none_of_the_tiling_arithmetic() -> None:
             "build_decode_tiling owns; computing it here makes two producers of the tiling and "
             "removes the only oracle there is."
         )
-    # The fuse decision is the subtlest of them: it is per token, not per batch,
-    # and getting it wrong splits a token the kernel fused.
-    assert "fused_context_limit" not in identifiers, (
-        "the fused/split crossover is build_decode_tiling's decision (turboquant_tiling.cpp:93), "
-        "taken per token. Python must not take it."
-    )
+    # The explicit threshold may be forwarded to the builder/launch. Python
+    # must still leave every per-token fuse decision to C++ and the device.
+    for module in (turboquant_v1, turboquant_ops, turboquant_metadata):
+        with open(module.__file__, encoding="utf-8") as handle:
+            tree = ast.parse(handle.read())
+        parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id == "fused_context_limit":
+                parent = parents[node]
+                assert isinstance(parent, (ast.Call, ast.keyword)), (
+                    "Python may only forward fused_context_limit; the per-token fuse decision belongs to C++"
+                )
 
 
 def test_g8_the_tiling_buffer_is_filled_by_the_operator_alone(monkeypatch: pytest.MonkeyPatch) -> None:
