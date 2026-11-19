@@ -102,6 +102,8 @@ TURBOQUANT_LM_THRESHOLDS: Final[tuple[float, ...]] = (
 
 TURBOQUANT_LM_EPS: Final[float] = 1e-20
 
+TURBOQUANT_LM_REDUCTION_LANES: Final[int] = 64
+
 TURBOQUANT_QUANT_MODE: Final[int] = int(envs.VLLM_ASCEND_TURBOQUANT_QUANT_MODE)
 
 TURBOQUANT_DECODE_UNPACK: Final[int] = 3 if TURBOQUANT_QUANT_MODE == 1 else 0
@@ -208,6 +210,8 @@ def turboquant_pi_signs(head_size: int, device: torch.device) -> torch.Tensor:
 
 
 class TurboQuantEmulator:
+    """Reference codec for the configured uniform or Lloyd-Max cache codebook."""
+
     def __init__(
         self,
         head_size: int,
@@ -257,13 +261,32 @@ class TurboQuantEmulator:
     def h16(self) -> torch.Tensor:
         return _h16_operand(self.device)
 
+    @staticmethod
+    def _hadamard_last_dim(values: torch.Tensor) -> torch.Tensor:
+        """Use a fixed FP32 butterfly order, independent of batch/GEMM shape."""
+        shape = values.shape
+        stride = 1
+        while stride < shape[-1]:
+            pairs = values.reshape(*shape[:-1], -1, 2, stride)
+            low, high = pairs.unbind(-2)
+            values = torch.cat((low + high, low - high), dim=-1).reshape(shape)
+            stride *= 2
+        return values
+
     def rotate(self, x: torch.Tensor) -> torch.Tensor:
-        return x.to(torch.float32) @ self.rotation.transpose(0, 1)
+        # Factor Pi as outer Hadamard @ signs @ inner Hadamard. A dense GEMM
+        # can change FP32 accumulation order when a writer splits/pads a batch.
+        panel = x.to(torch.float32).reshape(*x.shape[:-1], self.groups, self.group)
+        panel = self._hadamard_last_dim(panel) * self.pi_signs.reshape(self.groups, self.group)
+        return self._hadamard_last_dim(panel.transpose(-1, -2)).transpose(-1, -2).reshape(x.shape)
 
     def inverse_rotate(self, y: torch.Tensor) -> torch.Tensor:
-        return (y.to(torch.float32) @ self.rotation) * self.inv_sqrt_len
+        panel = y.to(torch.float32).reshape(*y.shape[:-1], self.groups, self.group)
+        panel = self._hadamard_last_dim(panel.transpose(-1, -2)).transpose(-1, -2)
+        panel = self._hadamard_last_dim(panel * self.pi_signs.reshape(self.groups, self.group))
+        return panel.reshape(y.shape) * self.inv_sqrt_len
 
-    def quantize(self, rotated: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def quantize_uniform(self, rotated: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         rotated_fp32 = rotated.to(torch.float32)
         absmax = rotated_fp32.abs().amax(dim=-1, keepdim=True).contiguous()
         zero_row = absmax == 0.0
@@ -278,14 +301,17 @@ class TurboQuantEmulator:
         scales = torch.where(zero_row, ones, pow_scale * self.inv_sqrt_len)
         return codes.to(torch.int8), scales.squeeze(-1)
 
-    def dequantize(self, codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    def dequantize_uniform(self, codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
         return codes.to(torch.float32) * scales.to(torch.float32).unsqueeze(-1)
 
     @staticmethod
     def _lloyd_max_sumsq(row: torch.Tensor, fold: str) -> torch.Tensor:
         """Match the key butterfly or value pairwise reduction's FP32 rounding."""
-        squared_values = (row * row).to(torch.float32).clone()
+        row_fp32 = row.to(torch.float32)
+        squared_values = row_fp32 * row_fp32
         num_channels = squared_values.numel()
+        if num_channels == 0 or num_channels & (num_channels - 1):
+            raise ValueError("Lloyd-Max reduction needs a nonempty power-of-two channel count")
 
         def sum_pairwise_halves(squared_values: torch.Tensor, stop: int) -> torch.Tensor:
             width = squared_values.numel()
@@ -297,15 +323,17 @@ class TurboQuantEmulator:
         if fold == "value":
             squared_values = sum_pairwise_halves(squared_values, 1)
         elif fold in ("key", "butterfly"):
-            quarters = [
-                squared_values[quarter_index * 64 : (quarter_index + 1) * 64]
-                for quarter_index in range(num_channels // 64)
-            ]
-            squared_values = ((quarters[0] + quarters[1]) + quarters[2]) + quarters[3]
-            for stride in (1, 2, 4, 8, 16, 32):
-                previous_values = squared_values.clone()
-                butterfly_indices = torch.arange(64) ^ stride
-                squared_values = previous_values + previous_values[butterfly_indices]
+            lanes = min(num_channels, TURBOQUANT_LM_REDUCTION_LANES)
+            chunks = squared_values.reshape(-1, lanes).unbind(0)
+            squared_values = chunks[0]
+            # Keep the production D=256 left-to-right quarter fold unchanged.
+            for chunk in chunks[1:]:
+                squared_values = squared_values + chunk
+            indices = torch.arange(lanes, device=row.device)
+            stride = 1
+            while stride < lanes:
+                squared_values = squared_values + squared_values[indices ^ stride]
+                stride *= 2
         else:
             raise ValueError(f"unknown Lloyd-Max fold {fold!r}")
         return squared_values[0]
@@ -327,12 +355,24 @@ class TurboQuantEmulator:
             bins = (margins < 0).sum(dim=-1).to(torch.int32) - 8
             codes[row_index] = bins.to(torch.int8)
             scales[row_index] = row_rms * self.inv_sqrt_len
-        return codes.reshape(rotated_fp32.shape), scales
+        return codes.reshape(rotated_fp32.shape), scales.reshape(rotated_fp32.shape[:-1])
 
     def dequantize_lloyd_max(self, codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
         """``centroid[codes + 8] * scales`` in fp32: the codebook reconstruction."""
         centroids = torch.tensor(TURBOQUANT_LM_CENTROIDS, dtype=torch.float32, device=codes.device)
         return centroids[(codes.to(torch.int16) + 8).long()] * scales.to(torch.float32).unsqueeze(-1)
+
+    def quantize(self, rotated: torch.Tensor, fold: str = "key") -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode cache rows using the same quantizer as the active writers."""
+        if TURBOQUANT_QUANT_MODE == 1:
+            return self.quantize_lloyd_max(rotated, fold)
+        return self.quantize_uniform(rotated)
+
+    def dequantize(self, codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+        """Reconstruct the active cache codebook in fp32."""
+        if TURBOQUANT_QUANT_MODE == 1:
+            return self.dequantize_lloyd_max(codes, scales)
+        return self.dequantize_uniform(codes, scales)
 
     @staticmethod
     def pack(codes: torch.Tensor) -> torch.Tensor:
@@ -352,8 +392,9 @@ class TurboQuantEmulator:
         signed = torch.where(pair >= 8, pair - TURBOQUANT_NIBBLE_LEVELS, pair)
         return signed.reshape(*packed.shape[:-1], packed.shape[-1] * TURBOQUANT_PACK_FACTOR).to(torch.int8)
 
-    def encode(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        codes, scales = self.quantize(self.rotate(x))
+    def encode(self, x: torch.Tensor, *, fold: str = "key") -> tuple[torch.Tensor, torch.Tensor]:
+        """Pack rows; batch V uses ``value``, scatter K/V both use ``key``."""
+        codes, scales = self.quantize(self.rotate(x), fold)
         return self.pack(codes), scales
 
     def decode(self, packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
@@ -710,8 +751,6 @@ class TurboQuantOpsAdapter:
     def _reference_unpack_and_dequantize(
         self, packed: torch.Tensor, scales: torch.Tensor, emulator: TurboQuantEmulator
     ) -> torch.Tensor:
-        if TURBOQUANT_QUANT_MODE == 1:
-            return emulator.dequantize_lloyd_max(emulator.unpack(packed), scales)
         return emulator.dequantize(emulator.unpack(packed), scales)
 
     def reshape_and_cache_prefill(
@@ -965,12 +1004,8 @@ class TurboQuantOpsAdapter:
         emulator: TurboQuantEmulator,
         lloyd_max_folds: tuple[str, str] = ("key", "value"),
     ) -> None:
-        if TURBOQUANT_QUANT_MODE == 1:
-            codes_key, key_scales = emulator.quantize_lloyd_max(self.rotate(key, emulator), lloyd_max_folds[0])
-            codes_value, value_scales = emulator.quantize_lloyd_max(self.rotate(value, emulator), lloyd_max_folds[1])
-        else:
-            codes_key, key_scales = emulator.quantize(self.rotate(key, emulator))
-            codes_value, value_scales = emulator.quantize(self.rotate(value, emulator))
+        codes_key, key_scales = emulator.quantize(self.rotate(key, emulator), lloyd_max_folds[0])
+        codes_value, value_scales = emulator.quantize(self.rotate(value, emulator), lloyd_max_folds[1])
 
         block_size = key_cache.shape[1]
         slots = slot_mapping.to(torch.int64)

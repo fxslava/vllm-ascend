@@ -91,7 +91,7 @@ def test_strip_write_matches_the_kernel_nibble_formula(block_size):
     key_bytes = caches[0].reshape(-1)
     value_bytes = caches[1].reshape(-1)
     codes_key, _ = emulator.quantize(emulator.rotate(key))
-    codes_value, _ = emulator.quantize(emulator.rotate(value))
+    codes_value, _ = emulator.quantize(emulator.rotate(value), fold="value")
 
     D = HEAD_SIZE
     H = NUM_KV_HEADS
@@ -126,7 +126,8 @@ def test_the_strip_reader_inverts_the_strip_writer(block_size):
         adapter.dequantize_cache(pk, ks, emulator, torch.float32)[0], emulator.decode(*emulator.encode(key))
     )
     assert torch.equal(
-        adapter.dequantize_cache(pv, vs, emulator, torch.float32)[0], emulator.decode(*emulator.encode(value))
+        adapter.dequantize_cache(pv, vs, emulator, torch.float32)[0],
+        emulator.decode(*emulator.encode(value, fold="value")),
     )
 
 
@@ -139,7 +140,7 @@ def test_a_per_token_write_preserves_the_rest_of_the_strip(block_size):
     key, value = _acts(num_tokens, 13)
 
     whole = _caches(block_size)
-    adapter.reshape_and_cache_prefill(key, value, *whole, torch.arange(num_tokens, dtype=torch.int32), emulator)
+    adapter.reshape_scatter_decode(key, value, *whole, torch.arange(num_tokens, dtype=torch.int32), emulator)
 
     # The same content, written one token at a time in a scrambled order.
     piecemeal = _caches(block_size)
@@ -173,7 +174,7 @@ def test_token_major_is_untouched_by_all_this():
         (TURBOQUANT_KEY_PLANE, key, caches[0]),
         (TURBOQUANT_VALUE_PLANE, value, caches[1]),
     ):
-        packed, scales = emulator.encode(acts)
+        packed, scales = emulator.encode(acts, fold="key" if plane == TURBOQUANT_KEY_PLANE else "value")
         for t in range(16):
             assert torch.equal(cache[0, t], packed[t]), (plane, t)
             assert torch.equal(caches[2][plane, 0, :, t], scales[t])

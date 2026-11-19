@@ -14,11 +14,12 @@ decode gate exercises -- head_size 256, block_size 128) with ragged tails at
 8 and 31 rows. Its budget is a fraction of each row's max, not bit-exactness:
 the decode rounds two operands to fp8 e4m3 by design.
 
-What it establishes that no host-side test can: that the compiled kernels and
-the PyTorch golden model put the *same bytes* in the cache. The codec is
-designed so that this is bit-exact rather than approximate -- every scale is a
-power of two taken from the fp32 exponent field and the single rounding is
-round-half-to-even -- so a mismatch here is a real defect, not tolerance.
+What it establishes that no host-side test can: whether the compiled kernels
+and the PyTorch golden model put the *same bytes* in the cache. Uniform mode
+uses power-of-two scales and round-half-to-even codes. Lloyd-Max mode instead
+uses an RMS scale and a centroid codebook, with a prescribed FP32 reduction
+order. These gates keep exact comparisons in both modes; a mismatch can expose
+arithmetic drift as well as a cache-addressing defect.
 
 Run it standalone::
 
@@ -231,11 +232,22 @@ def _compare(kernel_caches, golden_caches) -> None:
             continue
         differing = (a != b).sum().item()
         first = int((a != b).reshape(-1).nonzero()[0].item())
+        precision = ""
+        if a.dtype == b.dtype == torch.float32:
+            first_a = a.reshape(-1)[first]
+            first_b = b.reshape(-1)[first]
+            bits_a = int(first_a.view(torch.int32)) & 0xFFFFFFFF
+            bits_b = int(first_b.view(torch.int32)) & 0xFFFFFFFF
+            precision = (
+                f" First FP32 bits: 0x{bits_a:08x} vs 0x{bits_b:08x}; "
+                f"max absolute error {float((a - b).abs().max()):.9g}."
+            )
         raise AssertionError(
             f"{name}: the kernel and the golden model disagree in {differing} of {a.numel()} "
             f"elements, first at flat index {first} "
             f"(kernel {a.reshape(-1)[first]!r} vs golden {b.reshape(-1)[first]!r}). "
-            "The codec is bit-exact by construction, so this is a defect rather than tolerance."
+            f"{precision} Exact comparison retained: check the codec's reduction/rounding "
+            "order as well as cache addressing."
         )
 
 
