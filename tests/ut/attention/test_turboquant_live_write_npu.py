@@ -78,6 +78,14 @@ def _helpers():
     return turboquant
 
 
+def _set_decode_splits(monkeypatch, splits):
+    # The adapter reads its defining module's constant, not the entry point's
+    # re-export. Patching turboquant_v1 leaves the launch at eight splits.
+    from vllm_ascend.attention import turboquant_ops
+
+    monkeypatch.setattr(turboquant_ops, "TURBOQUANT_DECODE_SPLITS", splits)
+
+
 def _require_ops(*names):
     backend = _backend()
     backend.load_turboquant_extension()
@@ -261,8 +269,14 @@ class TestCacheWriters:
 def _build_decode_tiling(contexts, block_size, max_pages, splits, fused_context_limit=FUSED_CONTEXT_LIMIT):
     backend = _backend()
     batch = len(contexts)
+    heads_per_task = backend.turboquant_decode_heads_per_task(NUM_HEADS, NUM_KV_HEADS)
+    chunks_per_group = -(-GROUP_HEADS // heads_per_task)
+    # Match decode_launch_split in op_host/turboquant_tiling.h: descriptors
+    # cover every (token, split), followed by one dispatch record per block.
+    grid = min(backend.TURBOQUANT_DECODE_MAX_GRID, batch * NUM_KV_HEADS * splits * chunks_per_group)
+    tiling_words = backend.turboquant_decode_tiling_words(batch, splits, grid)
     buffers = (
-        torch.zeros(backend.turboquant_tiling_upper_bound_words(batch, splits), dtype=torch.int32),
+        torch.zeros(tiling_words, dtype=torch.int32),
         torch.empty(
             backend.turboquant_decode_workspace_floats(batch, NUM_HEADS, HEAD_SIZE, splits),
             dtype=torch.float32,
@@ -281,10 +295,10 @@ def _build_decode_tiling(contexts, block_size, max_pages, splits, fused_context_
         block_size,
         max_pages,
         splits,
-        GROUP_HEADS,
+        heads_per_task,
         fused_context_limit,
     )
-    descriptor = buffers[0][:16]
+    descriptor = buffers[0][: backend.TURBOQUANT_DECODE_TILING_WORDS]
     assert int(descriptor[0]) > 0 and int(descriptor[10]) & 1, "builder left a dead decode descriptor"
     return (buffers[0].to(DEVICE), *buffers[1:])
 
@@ -580,7 +594,7 @@ class TestPrefillDecode:
                 )
             snapshots = (_clone_cache(cache), _clone_cache(golden_cache))
             for splits in PREFILL_SPLITS if step == 0 else APPEND_SPLITS:
-                monkeypatch.setattr(backend, "TURBOQUANT_DECODE_SPLITS", splits)
+                _set_decode_splits(monkeypatch, splits)
                 buffers = _build_decode_tiling(contexts, block_size, tables.shape[1], splits)
                 variants = [("poisoned-tail", cache, tables, contexts, False)]
                 if step == 0 and splits in (1, 3):
@@ -712,7 +726,7 @@ def test_cross_request_poison_cannot_change_clean_siblings(contexts, poison_requ
     snapshot = _clone_cache(cache)
     decode = _adapter(backend.TurboQuantKernelStage.DECODE)
     for splits in PREFILL_SPLITS:
-        monkeypatch.setattr(backend, "TURBOQUANT_DECODE_SPLITS", splits)
+        _set_decode_splits(monkeypatch, splits)
         buffers = _build_decode_tiling(contexts, block_size, tables.shape[1], splits)
         output = _launch_serving_decode(decode, emulator, cache, tables, contexts, query, buffers)
         for request in clean_requests:
