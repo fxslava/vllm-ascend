@@ -7,11 +7,17 @@ below skips otherwise, so collecting it on a host without one is harmless. It
 was written on a host with no device and has therefore never executed; it is
 the gate to run on the device box, not evidence that anything passed.
 
-Section 5 is the fused decode's half of the gate: the kernel's one-launch
-decode against the golden gather attended in fp32, at the serving geometry
-(batch 1, 24 query heads over 4 KV heads -- group_heads 6, which no other
-decode gate exercises -- head_size 256, block_size 128) with ragged tails at
-8 and 31 rows. Its budget is a fraction of each row's max, not bit-exactness:
+Section 5 covers the full-attention geometry of Qwen3.5-27B-a8w8-mtp
+(``--quantization ascend``): 24 query heads over 4 KV heads, head size 256.
+It combines both compiled writers, scattered physical pages, exact cache
+comparisons, and fused decode at every Split-K count 1 through 8 for block
+sizes 128, 256 and 1024. Aligned contexts and tails of 1, 8 and 31 rows include
+single- and multi-request launches. NaN scales poison unwritten slots, unused
+pages and page tails. Deliberately withheld writes and misdirected reads must
+fail the same attention check as the healthy path.
+
+This is a kernel contract test, not a model-loading or MTP acceptance test.
+The attention budget is a fraction of each row's max, not bit-exactness:
 the decode rounds two operands to fp8 e4m3 by design.
 
 What it establishes that no host-side test can: whether the compiled kernels
@@ -63,15 +69,11 @@ SCATTER_OP = "npu_turboquant_reshape_scatter_aiv"
 FUSED_DECODE_OP = "npu_turboquant_fused_decode"
 BUILD_TILING_OP = "npu_turboquant_build_decode_tiling"
 
-# The serving geometry the fused decode differential below reproduces: batch 1,
-# 24 query heads = 4 KV heads x 6 (group_heads 6), head_size 256, block_size 128.
-# This is the shape the deployed engine runs, and group_heads 6 sits outside the
-# geometry every other decode gate exercises (they are all group_heads 16).
+# Full-attention geometry, independent of the model's A8W8 weight quantization.
+# Six query heads share each KV head; the other decode gates use groups of 16.
 SERVING_NUM_HEADS = 24
 SERVING_NUM_KV_HEADS = 4
 SERVING_GROUP_HEADS = SERVING_NUM_HEADS // SERVING_NUM_KV_HEADS
-SERVING_BLOCK_SIZE = 128
-SERVING_NUM_BLOCKS = 16
 SERVING_SCALE = 1.0 / (HEAD_SIZE**0.5)
 
 
@@ -151,19 +153,20 @@ def _import_backend():
     )
 
 
-def _caches(block_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One three-plane cache, zeroed.
+def _caches(
+    block_size: int, device: torch.device, num_blocks: int = NUM_BLOCKS, *, poison: bool = False
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Identical initial bytes for differential writes, including untouched lanes.
 
-    Zeroed rather than poisoned on purpose: both writers leave the lanes they do
-    not own alone, so an untouched lane reading zero on both sides is part of
-    what the comparison checks.
+    NaN scales make any missing write or unintended read poison attention.
+    Packed planes use a finite byte canary because int8 has no NaN encoding.
     """
-    packed = (NUM_BLOCKS, block_size, NUM_KV_HEADS, HEAD_SIZE // 2)
-    scales = (2, NUM_BLOCKS, NUM_KV_HEADS, block_size)
+    packed = (num_blocks, block_size, NUM_KV_HEADS, HEAD_SIZE // 2)
+    scales = (2, num_blocks, NUM_KV_HEADS, block_size)
     return (
-        torch.zeros(packed, dtype=torch.int8, device=device),
-        torch.zeros(packed, dtype=torch.int8, device=device),
-        torch.zeros(scales, dtype=torch.float32, device=device),
+        torch.full(packed, 0x5A if poison else 0, dtype=torch.int8, device=device),
+        torch.full(packed, 0x5A if poison else 0, dtype=torch.int8, device=device),
+        torch.full(scales, float("nan") if poison else 0, dtype=torch.float32, device=device),
     )
 
 
@@ -228,10 +231,13 @@ def _compare(kernel_caches, golden_caches) -> None:
     for name, written, expected in zip(names, kernel_caches, golden_caches):
         a = written.cpu()
         b = expected.cpu()
-        if torch.equal(a, b):
+        # Compare scale bits too: identical NaN canaries must compare equal,
+        # while arithmetic drift in live scales must still fail exactly.
+        equal = a.view(torch.int32) == b.view(torch.int32) if a.dtype == torch.float32 else a == b
+        if bool(equal.all()):
             continue
-        differing = (a != b).sum().item()
-        first = int((a != b).reshape(-1).nonzero()[0].item())
+        differing = (~equal).sum().item()
+        first = int((~equal).reshape(-1).nonzero()[0].item())
         precision = ""
         if a.dtype == b.dtype == torch.float32:
             first_a = a.reshape(-1)[first]
@@ -492,11 +498,9 @@ def test_the_scatter_stage_reads_back_without_the_decode_kernel() -> None:
 # 5. The fused decode against the golden attention, at the serving geometry
 # ---------------------------------------------------------------------------
 #
-# group_heads 6 (24 query heads over 4 KV heads) is the geometry the deployed
-# engine runs; every other decode gate exercises group_heads 16. The reference
-# is the same cache read back through the golden gather, dequantised and
-# attended in fp32 -- the fallback path the backend takes with the decode stage
-# off -- so a disagreement is the decode kernel, not the cache.
+# The reference uses independently golden-written NZ pages. Reading the same
+# kernel-written cache on both sides could hide a writer under-fill or a wrong
+# address shared by the writer and decoder.
 #
 # The budget is not bit-exactness: the decode rounds two operands to fp8 e4m3
 # (the query and the softmax probabilities), which an fp32 reference does not
@@ -506,50 +510,6 @@ def test_the_scatter_stage_reads_back_without_the_decode_kernel() -> None:
 # printed either way so a failure names its coordinates.
 DECODE_ROW_MAX_BUDGET = 0.10
 DECODE_COSINE_FLOOR = 0.999
-
-
-def _decode_and_reference_adapters():
-    """The decode-stage adapter, and the golden adapter pinned to the NZ cache.
-
-    Not ``_adapters(DECODE)``: with no ingestion stage engaged,
-    ``value_layout()`` falls back to the config default ``TOKEN_MAJOR``, which
-    would pin the golden side to a cache layout the fused decode does not read.
-    The serving cache is NZ (both writers are ``TURBOQUANT_INGRESS_NZ=1``
-    builds), so the golden side is pinned to NZ_TILED explicitly.
-    """
-    _, TurboQuantKernelStage, TurboQuantOpsAdapter, TurboQuantOpsConfig, TurboQuantValueLayout = _import_backend()
-    decode = TurboQuantOpsAdapter(
-        TurboQuantOpsConfig(ops_namespace=NAMESPACE, kernel_stages=frozenset({TurboQuantKernelStage.DECODE}))
-    )
-    golden = TurboQuantOpsAdapter(
-        TurboQuantOpsConfig(
-            ops_namespace=NAMESPACE,
-            kernel_stages=frozenset(),
-            value_layout=TurboQuantValueLayout.NZ_TILED,
-        )
-    )
-    assert golden.value_layout() is TurboQuantValueLayout.NZ_TILED
-    return decode, golden
-
-
-def _serving_caches(num_blocks: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One three-plane cache at the serving geometry, zeroed (see ``_caches``)."""
-    packed = (num_blocks, SERVING_BLOCK_SIZE, SERVING_NUM_KV_HEADS, HEAD_SIZE // 2)
-    scales = (2, num_blocks, SERVING_NUM_KV_HEADS, SERVING_BLOCK_SIZE)
-    return (
-        torch.zeros(packed, dtype=torch.int8, device=device),
-        torch.zeros(packed, dtype=torch.int8, device=device),
-        torch.zeros(scales, dtype=torch.float32, device=device),
-    )
-
-
-def _serving_activations(context: int, device: torch.device, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """``[context, 4, 256]`` bf16 K and V at the serving KV head count."""
-    generator = torch.Generator().manual_seed(seed)
-    shape = (context, SERVING_NUM_KV_HEADS, HEAD_SIZE)
-    key = torch.randn(shape, generator=generator, dtype=torch.float32)
-    value = torch.randn(shape, generator=generator, dtype=torch.float32)
-    return key.to(device=device, dtype=torch.bfloat16), value.to(device=device, dtype=torch.bfloat16)
 
 
 def _build_decode_tiling(
@@ -664,6 +624,8 @@ def _assert_attention_close(tag: str, got: torch.Tensor, expected: torch.Tensor,
     """
     got32 = got[0].float().cpu()
     exp32 = expected[0].float().cpu()
+    assert torch.isfinite(exp32).all(), f"{tag}: non-finite reference attention"
+    assert torch.isfinite(got32).all(), f"{tag}: non-finite attention (unwritten or wrong cache slot)"
     diff = (got32 - exp32).abs()
     row_max = exp32.abs().amax(dim=-1)  # [N]
     worst_row = int((diff.amax(dim=-1) / row_max.clamp(min=1e-30)).argmax().item())
@@ -692,250 +654,153 @@ def _assert_attention_close(tag: str, got: torch.Tensor, expected: torch.Tensor,
     assert cosine >= DECODE_COSINE_FLOOR, f"{tag}: cosine {cosine:.6f} against the golden attention"
 
 
-@requires_npu
-@_requires_op(FUSED_DECODE_OP)
-@pytest.mark.parametrize(
-    "context",
-    [
-        64,  # one full NZ tile, nothing ragged
-        SERVING_BLOCK_SIZE,  # one whole page, aligned
-        200,  # two pages, an 8-row tail -- the CAModel worst case
-        1055,  # nine pages, a 31-row tail
-    ],
-)
-def test_the_fused_decode_matches_the_reference_attention_serving_geometry(context: int) -> None:
-    """Batch 1, 24 query heads over 4 KV heads, on a golden-written cache.
-
-    The cache is written by the golden model pinned to the NZ layout, so its
-    content is canonical by construction and only the decode kernel is under
-    test. The query is the serving dtype (bf16); the reference is the golden
-    gather attended in fp32.
-    """
-    from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_DECODE_SPLITS, turboquant_decode_heads_per_task
-
-    TurboQuantEmulator, _, _, _, _ = _import_backend()
-    emulator = TurboQuantEmulator(head_size=HEAD_SIZE, device=DEVICE)
-    decode_adapter, golden_adapter = _decode_and_reference_adapters()
-
-    pages = -(-context // SERVING_BLOCK_SIZE)
-    key, value = _serving_activations(context, DEVICE, seed=6000 + context)
-    slots = torch.arange(context, dtype=torch.int32, device=DEVICE)
-    caches = _serving_caches(SERVING_NUM_BLOCKS, DEVICE)
-    golden_adapter.reshape_scatter_decode(key, value, *caches, slots, emulator)
-    torch.npu.synchronize()
-
-    block_tables = torch.arange(pages, dtype=torch.int32, device=DEVICE).unsqueeze(0)
-    context_lens = torch.full((1,), context, dtype=torch.int32, device=DEVICE)
-    generator = torch.Generator().manual_seed(7000 + context)
-    query = torch.randn(1, SERVING_NUM_HEADS, HEAD_SIZE, generator=generator, dtype=torch.float32).to(
-        device=DEVICE, dtype=torch.bfloat16
-    )
-    output = torch.zeros(1, SERVING_NUM_HEADS, HEAD_SIZE, device=DEVICE, dtype=torch.bfloat16)
-
-    splits = TURBOQUANT_DECODE_SPLITS
-    heads_per_task = turboquant_decode_heads_per_task(SERVING_NUM_HEADS, SERVING_NUM_KV_HEADS)
-    # The builder is host C++; feed it the host constant, not a device readback,
-    # so "dead descriptor" can only mean the fill, never the copy source.
-    tiling, workspace, query_rot = _build_decode_tiling(
-        torch.tensor([context], dtype=torch.int32), SERVING_BLOCK_SIZE, pages, splits, heads_per_task, batch=1
-    )
-    fused = decode_adapter.fused_decode(
+def _launch_serving_decode(adapter, emulator, caches, block_tables, contexts, query, buffers):
+    output = torch.full_like(query, float("nan"))
+    fused = adapter.fused_decode(
         query=query,
         key_cache=caches[0],
         value_cache=caches[1],
         scale_cache=caches[2],
         block_tables=block_tables,
-        context_lens=context_lens,
+        context_lens=torch.tensor(contexts, dtype=torch.int32, device=query.device),
         emulator=emulator,
         num_heads=SERVING_NUM_HEADS,
         num_kv_heads=SERVING_NUM_KV_HEADS,
         scale=SERVING_SCALE,
         output=output,
-        tiling=tiling,
-        workspace=workspace,
-        query_rot=query_rot,
+        tiling=buffers[0],
+        workspace=buffers[1],
+        query_rot=buffers[2],
     )
     torch.npu.synchronize()
-    assert fused is not None, "the decode stage is on and the op is registered, so it must run"
-
-    # Launch probe: the prologue must have written the rotated query and the
-    # kernel the output. query_rot all zero means the kernel never executed;
-    # query_rot live with output all zero means the decode skipped every worker
-    # (the descriptors it read were dead, whatever the host probe says) -- but
-    # only after proving the comparison looks at the buffer the op wrote.
-    print(
-        f"  launch probe: fused is output={fused is output}, "
-        f"same data_ptr={fused.data_ptr() == output.data_ptr()}, "
-        f"query_rot absmax={query_rot.abs().max().item():.6g}, "
-        f"fused absmax={fused.abs().max().item():.6g}, "
-        f"output absmax={output.abs().max().item():.6g}, "
-        f"workspace absmax={workspace.abs().max().item():.6g}"
-    )
-    # Prologue content probe: the rotated query against the golden rotation.
-    # Bit-exactness is NOT expected here: the harness's "65536/65536 bytes
-    # bit-exact" holds because its fixture is integer-valued, so every
-    # butterfly intermediate is exact and no rounding exists to diverge. A
-    # random query makes the dense fp32 matmul and the kernel's butterfly two
-    # different summation orders of the same value, which is a few fp32 ULP of
-    # disagreement by construction -- a mismatch of ~1 ULP exonerates the
-    # prologue, it does not indict it.
-    golden_rot = (emulator.rotate(query[0].float()) * emulator.inv_sqrt_len).cpu()
-    rot = query_rot.view(SERVING_NUM_HEADS, HEAD_SIZE).cpu()
-    rot_diff = (rot - golden_rot).abs().max().item()
-    rot_ulp = rot_diff / max(float(golden_rot.abs().max().item()), 1e-30) * 2**23
-    print(
-        f"  prologue probe: query_rot max abs diff = {rot_diff:.6g} "
-        f"(~{rot_ulp:.1f} fp32 ULP of the row max; bit-exact {torch.equal(rot, golden_rot)})"
-    )
-
-    expected = _reference_attention_fp32(golden_adapter, emulator, caches, block_tables, query, context, SERVING_SCALE)
-    _assert_attention_close("fused decode", output, expected, context)
+    assert fused is not None, "the registered decode kernel must run, not fall back"
+    return output
 
 
 @requires_npu
-@_requires_op(FUSED_DECODE_OP)
+@_requires_op(PREFILL_OP)
 @_requires_op(SCATTER_OP)
-@pytest.mark.parametrize("context", [SERVING_BLOCK_SIZE, 200, 1055])
-def test_the_fused_decode_reads_the_kernel_written_cache_serving_geometry(context: int) -> None:
-    """The whole serving chain: the NPU scatter writer's cache, decoded by the kernel.
-
-    The writer differential above already pins the kernel writer bit for bit to
-    the golden model, so the reference is still the golden gather over the same
-    bytes. What this adds over the golden-written variant is the write path a
-    live decode actually produces, token by token through the scatter writer.
-    """
-    from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_DECODE_SPLITS, turboquant_decode_heads_per_task
-
-    TurboQuantEmulator, TurboQuantKernelStage, _, _, _ = _import_backend()
-    emulator = TurboQuantEmulator(head_size=HEAD_SIZE, device=DEVICE)
-    decode_adapter, golden_adapter = _decode_and_reference_adapters()
-    scatter_adapter, _ = _adapters(TurboQuantKernelStage.SCATTER)
-
-    pages = -(-context // SERVING_BLOCK_SIZE)
-    key, value = _serving_activations(context, DEVICE, seed=8000 + context)
-    caches = _serving_caches(SERVING_NUM_BLOCKS, DEVICE)
-    for token in range(context):
-        one = slice(token, token + 1)
-        slot = torch.tensor([token], dtype=torch.int32, device=DEVICE)
-        scatter_adapter.reshape_scatter_decode(key[one], value[one], *caches, slot, emulator)
-    torch.npu.synchronize()
-
-    block_tables = torch.arange(pages, dtype=torch.int32, device=DEVICE).unsqueeze(0)
-    context_lens = torch.full((1,), context, dtype=torch.int32, device=DEVICE)
-    generator = torch.Generator().manual_seed(9000 + context)
-    query = torch.randn(1, SERVING_NUM_HEADS, HEAD_SIZE, generator=generator, dtype=torch.float32).to(
-        device=DEVICE, dtype=torch.bfloat16
-    )
-    output = torch.zeros(1, SERVING_NUM_HEADS, HEAD_SIZE, device=DEVICE, dtype=torch.bfloat16)
-
-    splits = TURBOQUANT_DECODE_SPLITS
-    heads_per_task = turboquant_decode_heads_per_task(SERVING_NUM_HEADS, SERVING_NUM_KV_HEADS)
-    # The builder is host C++; feed it the host constant, not a device readback,
-    # so "dead descriptor" can only mean the fill, never the copy source.
-    tiling, workspace, query_rot = _build_decode_tiling(
-        torch.tensor([context], dtype=torch.int32), SERVING_BLOCK_SIZE, pages, splits, heads_per_task, batch=1
-    )
-    fused = decode_adapter.fused_decode(
-        query=query,
-        key_cache=caches[0],
-        value_cache=caches[1],
-        scale_cache=caches[2],
-        block_tables=block_tables,
-        context_lens=context_lens,
-        emulator=emulator,
-        num_heads=SERVING_NUM_HEADS,
-        num_kv_heads=SERVING_NUM_KV_HEADS,
-        scale=SERVING_SCALE,
-        output=output,
-        tiling=tiling,
-        workspace=workspace,
-        query_rot=query_rot,
-    )
-    torch.npu.synchronize()
-    assert fused is not None, "the decode stage is on and the op is registered, so it must run"
-
-    expected = _reference_attention_fp32(golden_adapter, emulator, caches, block_tables, query, context, SERVING_SCALE)
-    _assert_attention_close("kernel-written fused decode", output, expected, context)
-
-
-@requires_npu
 @_requires_op(FUSED_DECODE_OP)
-def test_the_fused_decode_handles_two_requests_serving_geometry() -> None:
-    """Batch 2 with unequal contexts, [128, 200]: the descriptor's token dimension.
+@_requires_op(BUILD_TILING_OP)
+@pytest.mark.parametrize("block_size", [128, 256, 1024])
+@pytest.mark.parametrize("context_kind", ["aligned", "ragged", "single_row"])
+def test_scattered_gqa_write_and_decode_with_canaries(block_size: int, context_kind: str, monkeypatch) -> None:
+    """Both writers -> independent golden cache -> GQA decode, with live poisons.
 
-    The per-token descriptors are independent, so this is the cheapest rung that
-    proves a second request neither shifts the first nor inherits its tail.
+    Replaces the separate golden-written, kernel-written and batch-two decode
+    tests. Each case sweeps all eight split counts without rewriting the cache.
+    Page zero, all even pages, padded table entries and live-page tails remain
+    poisoned. The two fault injections prove that the canaries affect attention;
+    merely checking that unused memory was not modified cannot detect bad reads.
     """
-    from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_DECODE_SPLITS, turboquant_decode_heads_per_task
+    from vllm_ascend.attention import turboquant_v1
 
-    TurboQuantEmulator, _, _, _, _ = _import_backend()
-    emulator = TurboQuantEmulator(head_size=HEAD_SIZE, device=DEVICE)
-    decode_adapter, golden_adapter = _decode_and_reference_adapters()
-
-    contexts = [SERVING_BLOCK_SIZE, 200]
+    contexts = {
+        "aligned": (64, block_size),
+        "ragged": (block_size + 8, 8 * block_size + 31),
+        "single_row": (block_size + 1,),
+    }[context_kind]
     batch = len(contexts)
-    caches = _serving_caches(SERVING_NUM_BLOCKS, DEVICE)
-    block_rows = []
-    next_block = 0
-    for request, context in enumerate(contexts):
-        pages = -(-context // SERVING_BLOCK_SIZE)
-        key, value = _serving_activations(context, DEVICE, seed=10000 + context)
-        slots = next_block * SERVING_BLOCK_SIZE + torch.arange(context, dtype=torch.int32, device=DEVICE)
-        golden_adapter.reshape_scatter_decode(key, value, *caches, slots, emulator)
-        block_rows.append(torch.arange(next_block, next_block + pages, dtype=torch.int32))
-        next_block += pages
-    max_pages = max(row.numel() for row in block_rows)
-    # Pages past a request's context are never read: the kernel bounds its walk
-    # by context_lens and the golden slice below discards them. Fill with a
-    # valid page rather than -1, because TurboQuantOpsAdapter.gather now refuses
-    # an out-of-range page id before it indexes the cache.
-    block_tables = torch.zeros((batch, max_pages), dtype=torch.int32, device=DEVICE)
-    for request, row in enumerate(block_rows):
-        block_tables[request, : row.numel()] = row.to(DEVICE)
-    context_lens = torch.tensor(contexts, dtype=torch.int32, device=DEVICE)
-    torch.npu.synchronize()
+    page_counts = [-(-context // block_size) for context in contexts]
+    max_pages = max(page_counts)
+    total_pages = sum(page_counts)
+    # Descending odd pages guarantee gaps and non-monotonic addresses, rather
+    # than hoping a random permutation happens to be non-contiguous.
+    physical_pages = 2 * torch.arange(total_pages - 1, -1, -1, dtype=torch.int32) + 1
+    tables_host = torch.zeros((batch, max_pages), dtype=torch.int32)
+    slots, prefill_rows, scatter_rows = [], [], []
+    page_start = token_start = 0
+    for request, (context, pages) in enumerate(zip(contexts, page_counts)):
+        row = physical_pages[page_start : page_start + pages]
+        tables_host[request, :pages] = row
+        logical = torch.arange(context, dtype=torch.int64)
+        slots.append(row[logical // block_size] * block_size + logical % block_size)
+        # Keep 16..31 tokens for several scatter steps in the same NZ tile,
+        # even on aligned contexts. The batch writer fills every earlier strip.
+        prefill_count = ((context - STRIP) // STRIP) * STRIP
+        prefill_rows.append(torch.arange(token_start, token_start + prefill_count))
+        scatter_rows.append(torch.arange(token_start + prefill_count, token_start + context))
+        page_start += pages
+        token_start += context
+    slots = torch.cat(slots).to(device=DEVICE, dtype=torch.int32)
+    block_tables = tables_host.to(DEVICE)
+    num_blocks = 2 * total_pages + 1
+    caches = _caches(block_size, DEVICE, num_blocks, poison=True)
+    reference_caches = _caches(block_size, DEVICE, num_blocks, poison=True)
+    emulator_type, stages, _, _, _ = _import_backend()
+    emulator = emulator_type(head_size=HEAD_SIZE, device=DEVICE)
+    prefill, golden = _adapters(stages.RESHAPE_AND_CACHE)
+    scatter, _ = _adapters(stages.SCATTER)
+    decode, _ = _adapters(stages.DECODE)
+    key, value = _activations(sum(contexts), DEVICE, seed=6000 + block_size)
+    generator = torch.Generator().manual_seed(7000 + block_size)
 
-    generator = torch.Generator().manual_seed(11000)
-    query = torch.randn(batch, SERVING_NUM_HEADS, HEAD_SIZE, generator=generator, dtype=torch.float32).to(
+    # Shuffle whole strips: a batch-writer strip is contiguous internally, but
+    # successive strips target different physical pages and in-page offsets.
+    strips = torch.cat(prefill_rows).reshape(-1, STRIP)
+    indices = strips[torch.randperm(len(strips), generator=generator)].reshape(-1).to(DEVICE)
+    for adapter, cache in ((prefill, caches), (golden, reference_caches)):
+        adapter.reshape_and_cache_prefill(key[indices], value[indices], *cache, slots[indices], emulator)
+    # An actual under-fill: these copies never receive the scatter writes.
+    underfilled = tuple(plane.clone() for plane in caches)
+    indices = torch.cat(scatter_rows)
+    indices = indices[torch.randperm(len(indices), generator=generator)].to(DEVICE)
+    start = 0
+    for count in (1, 3, 17, len(indices)):
+        rows = indices[start : start + count]
+        if rows.numel() == 0:
+            break
+        for adapter, cache in ((scatter, caches), (golden, reference_caches)):
+            adapter.reshape_scatter_decode(key[rows], value[rows], *cache, slots[rows], emulator)
+        start += count
+    torch.npu.synchronize()
+    _compare(caches, reference_caches)  # live bytes AND untouched page/tail canaries
+
+    query = torch.randn(batch, SERVING_NUM_HEADS, HEAD_SIZE, generator=generator).to(
         device=DEVICE, dtype=torch.bfloat16
     )
-    output = torch.zeros(batch, SERVING_NUM_HEADS, HEAD_SIZE, device=DEVICE, dtype=torch.bfloat16)
-
-    splits = TURBOQUANT_DECODE_SPLITS
-    heads_per_task = turboquant_decode_heads_per_task(SERVING_NUM_HEADS, SERVING_NUM_KV_HEADS)
-    tiling, workspace, query_rot = _build_decode_tiling(
-        torch.tensor(contexts, dtype=torch.int32), SERVING_BLOCK_SIZE, max_pages, splits, heads_per_task, batch=batch
-    )
-    fused = decode_adapter.fused_decode(
-        query=query,
-        key_cache=caches[0],
-        value_cache=caches[1],
-        scale_cache=caches[2],
-        block_tables=block_tables,
-        context_lens=context_lens,
-        emulator=emulator,
-        num_heads=SERVING_NUM_HEADS,
-        num_kv_heads=SERVING_NUM_KV_HEADS,
-        scale=SERVING_SCALE,
-        output=output,
-        tiling=tiling,
-        workspace=workspace,
-        query_rot=query_rot,
-    )
-    torch.npu.synchronize()
-    assert fused is not None, "the decode stage is on and the op is registered, so it must run"
-
-    for request, context in enumerate(contexts):
-        expected = _reference_attention_fp32(
-            golden_adapter,
-            emulator,
-            caches,
-            block_tables[request : request + 1],
-            query[request : request + 1],
-            context,
-            SERVING_SCALE,
+    expected = [
+        _reference_attention_fp32(
+            golden, emulator, reference_caches, block_tables[r : r + 1], query[r : r + 1], context, SERVING_SCALE
         )
-        _assert_attention_close(f"fused decode request {request}", output[request : request + 1], expected, context)
+        for r, context in enumerate(contexts)
+    ]
+    cache_snapshot = tuple(plane.clone() for plane in reference_caches)
+    wrong_tables = block_tables.clone()
+    # Redirect each request's final live page to an allocated, poisoned page.
+    # This stays in bounds: the failure must be numerical, not an indexing error.
+    for request, pages in enumerate(page_counts):
+        wrong_tables[request, pages - 1] = 0
+    heads_per_task = turboquant_v1.turboquant_decode_heads_per_task(SERVING_NUM_HEADS, SERVING_NUM_KV_HEADS)
+    for splits in range(1, 9):
+        # fused_decode's public API fixes the serving split count at module
+        # scope. Override it together with the builder's input, so the kernel
+        # really launches with S=1..8 rather than just receiving resized buffers.
+        monkeypatch.setattr(turboquant_v1, "TURBOQUANT_DECODE_SPLITS", splits)
+        buffers = _build_decode_tiling(
+            torch.tensor(contexts, dtype=torch.int32), block_size, max_pages, splits, heads_per_task, batch
+        )
+        for name, cache, table, fault in (
+            ("golden-written", reference_caches, block_tables, False),
+            ("kernel-written", caches, block_tables, False),
+            ("underfilled", underfilled, block_tables, True),
+            ("wrong-page", caches, wrong_tables, True),
+        ):
+            # No output/prologue/partial may inherit a healthy preceding launch.
+            for buffer in buffers[1:]:
+                buffer.fill_(float("nan"))
+            output = _launch_serving_decode(decode, emulator, cache, table, contexts, query, buffers)
+            for request, context in enumerate(contexts):
+                tag = f"{name}, block={block_size}, S={splits}, request={request}"
+                if fault:
+                    with pytest.raises(AssertionError, match="non-finite attention"):
+                        _assert_attention_close(tag, output[request : request + 1], expected[request], context)
+                else:
+                    _assert_attention_close(tag, output[request : request + 1], expected[request], context)
+        # Compare both inputs with a frozen snapshot: identical corruption of
+        # the kernel and golden allocations must not pass by cancelling out.
+        _compare(caches, cache_snapshot)
+        _compare(reference_caches, cache_snapshot)
 
 
 # ---------------------------------------------------------------------------
