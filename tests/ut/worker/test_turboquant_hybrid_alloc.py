@@ -9,6 +9,7 @@ the Mamba allocator untouched.
 """
 
 import os
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -26,6 +27,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm_ascend.attention.turboquant_layout import (
     TURBOQUANT_PACK_FACTOR,
     TURBOQUANT_PLANES,
+    TURBOQUANT_SCALE_DTYPE,
     turboquant_packed_plane_bytes,
     turboquant_page_size_bytes,
     turboquant_scale_cache_shape,
@@ -192,6 +194,52 @@ def test_spec_merge_keeps_the_packing():
     assert isinstance(merged, AscendTurboQuantAttentionSpec)
     assert (merged.pack_factor, merged.num_planes) == (attn.pack_factor, attn.num_planes)
     assert merged.page_size_bytes == attn.page_size_bytes
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("pack_factor", 4),
+        ("pack_factor", 2.0),
+        ("num_planes", 3),
+        ("num_planes", 2.0),
+        ("scale_dtype", torch.float16),
+    ],
+)
+def test_spec_rejects_unsupported_fixed_format(field, value):
+    with pytest.raises(ValueError, match=field):
+        AscendTurboQuantAttentionSpec(
+            block_size=BLOCK_SIZE,
+            num_kv_heads=NUM_KV_HEADS,
+            head_size=HEAD_SIZE,
+            dtype=torch.bfloat16,
+            **{field: value},
+        )
+
+    with pytest.raises(ValueError, match=field):
+        replace(turboquant_cache_spec(_dense_spec()), **{field: value})
+
+
+def test_spec_preserves_explicit_fixed_format():
+    dense = _dense_spec()
+    spec = AscendTurboQuantAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        dtype=dense.dtype,
+        page_size_padded=dense.page_size_bytes,
+        non_causal=True,
+        pack_factor=TURBOQUANT_PACK_FACTOR,
+        num_planes=TURBOQUANT_PLANES,
+        scale_dtype=TURBOQUANT_SCALE_DTYPE,
+    )
+
+    assert spec.head_size_v == HEAD_SIZE
+    assert spec.scale_plane_floats == TURBOQUANT_PLANES * BLOCK_SIZE * NUM_KV_HEADS
+    assert spec.payload_bytes + spec.scale_plane_bytes == spec.real_page_size_bytes
+    assert spec.page_size_bytes == dense.page_size_bytes
+    assert AscendTurboQuantAttentionSpec.merge([spec, replace(spec, non_causal=False)]) == spec
+    assert replace(turboquant_cache_spec(dense, page_size_padded=dense.page_size_bytes), non_causal=True) == spec
 
 
 @patch.dict(os.environ, {"ENABLE_TURBOQUANT": "1"})

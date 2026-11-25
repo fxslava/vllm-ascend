@@ -450,6 +450,15 @@ class AscendTurboQuantAttentionSpec(FullAttentionSpec):
     num_planes: int = TURBOQUANT_PLANES
     scale_dtype: torch.dtype = TURBOQUANT_SCALE_DTYPE
 
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if not isinstance(self.pack_factor, int) or self.pack_factor != TURBOQUANT_PACK_FACTOR:
+            raise ValueError(f"TurboQuant requires pack_factor={TURBOQUANT_PACK_FACTOR}, got {self.pack_factor!r}")
+        if not isinstance(self.num_planes, int) or self.num_planes != TURBOQUANT_PLANES:
+            raise ValueError(f"TurboQuant requires num_planes={TURBOQUANT_PLANES}, got {self.num_planes!r}")
+        if self.scale_dtype is not TURBOQUANT_SCALE_DTYPE:
+            raise ValueError(f"TurboQuant requires scale_dtype={TURBOQUANT_SCALE_DTYPE}, got {self.scale_dtype!r}")
+
     @property
     def packed_bytes(self) -> int:
         """Bytes one (token, head) of one packed plane occupies."""
@@ -469,6 +478,11 @@ class AscendTurboQuantAttentionSpec(FullAttentionSpec):
     def scale_plane_bytes(self) -> int:
         """Bytes of fp32 scale plane in one page."""
         return turboquant_scale_plane_bytes(self.block_size, self.num_kv_heads)
+
+    @property
+    def scale_plane_floats(self) -> int:
+        """FP32 scale values in one page, including both K and V."""
+        return self.scale_plane_bytes // get_dtype_size(TURBOQUANT_SCALE_DTYPE)
 
     @property
     def real_page_size_bytes(self) -> int:
@@ -541,104 +555,6 @@ class AscendCircularBufferSpec(CircularBufferSpec):
         return all(isinstance(spec, AscendCircularBufferSpec) for spec in kv_cache_specs.values())
 
 
-@dataclass(frozen=True, kw_only=True)
-class AscendTurboQuantAttentionSpec(FullAttentionSpec):
-    """Full-attention cache spec for the TurboQuant 4-bit KV cache.
-
-    The stock :class:`FullAttentionSpec` sizes a page from the *unpacked* head
-    size and the model dtype, which over-allocates this layout roughly fourfold
-    and leaves the 4-bit cache with no capacity gain at all. It also has no
-    concept of the fp32 scale plane, so the scales would need a side allocation
-    the block allocator cannot see.
-
-    A TurboQuant page holds three things and this spec budgets all of them:
-
-    * the packed key plane, ``[block_size, num_kv_heads, head_size // 2]`` int8
-    * the packed value plane, the same again
-    * the scale plane, ``[2, num_kv_heads, block_size]`` fp32
-
-    The scale plane is **planar, not token-interleaved**, and that is a kernel
-    constraint rather than a preference. The writer emits one scale per token
-    for one (kv, head) chunk, so a chunk's ``block_size``-strided run of
-    ``block_size`` fp32 lanes leaves as a single aligned burst -- 64 bytes for a
-    16-token strip. Interleaving a token's lanes instead, as
-    ``[block_size, 2 * num_kv_heads]``, would put all ``2 * num_kv_heads``
-    chunks of one token inside one 32-byte word: eight separate 4-byte writes
-    from chunks that run on different Vector cores at different times, tearing
-    each other, and each a sub-burst scatter on a 32-byte stride. That is the
-    same hazard the value payload plane avoids by strip blocking.
-
-    The flat index the kernel writes, and therefore the only ordering a reader
-    may assume, is::
-
-        ((kv * num_blocks + block) * num_kv_heads + head) * block_size + token
-
-    with ``kv`` 0 for key scales and 1 for value scales -- so the two halves are
-    separate planes over the whole cache, not two fields of a page. The page
-    budget below counts ``2 * num_kv_heads * block_size`` lanes, which is what
-    that index space needs and is exact for every head count. No burst rounding
-    is applied or needed: a head's run is ``4 * block_size`` bytes and the C++
-    adapter already requires ``block_size % 16 == 0``, so every run starts and
-    ends on a 32-byte boundary.
-
-    This is the type :file:`vllm_ascend/patch/platform/patch_mamba_config.py`
-    keeps out of the Mamba shared ``KVCacheTensor``: a three-plane page cannot
-    be carved from the single flat buffer a hybrid group shares.
-    """
-
-    # Two 4-bit codes share a byte.
-    pack_factor: int = 2
-
-    @property
-    def packed_bytes(self) -> int:
-        """Packed bytes one (token, head) occupies in either payload plane."""
-        return self.head_size // self.pack_factor
-
-    @property
-    def payload_bytes(self) -> int:
-        """Bytes of packed key and value in one page."""
-        return 2 * self.block_size * self.num_kv_heads * self.packed_bytes
-
-    @property
-    def scale_plane_floats(self) -> int:
-        """fp32 lanes one page contributes to the scale plane.
-
-        ``2 * num_kv_heads`` runs of ``block_size``: see the planar index in the
-        class docstring. Mirrored by ``scale_floats_needed`` in
-        csrc/attention/turboquant/bindings/torch_bindings.cpp.
-        """
-        return 2 * self.num_kv_heads * self.block_size
-
-    @property
-    def scale_plane_bytes(self) -> int:
-        """Bytes of fp32 scale plane in one page."""
-        return self.scale_plane_floats * get_dtype_size(torch.float32)
-
-    @property
-    def real_page_size_bytes(self) -> int:
-        return self.payload_bytes + self.scale_plane_bytes
-
-    @property
-    def unpadded_page_size_bytes(self) -> int:
-        # FullAttentionSpec would add a second scale budget here for any
-        # per-token-head quant mode. This spec has already counted the scale
-        # plane in the planar geometry the kernel writes, so the page is taken
-        # as computed.
-        if self.page_size_padded is not None:
-            assert self.page_size_padded >= self.real_page_size_bytes
-            return self.page_size_padded
-        return self.real_page_size_bytes
-
-    @classmethod
-    def merge(cls, specs: list[Self]) -> Self:
-        merged = super().merge(specs)
-        first = specs[0]
-        assert all(spec.pack_factor == first.pack_factor for spec in specs), (
-            "All TurboQuant layers in the same KV cache group must use the same packing."
-        )
-        return replace(merged, pack_factor=first.pack_factor)
-
-
 def register_ascend_kv_cache_specs() -> None:
     from vllm_ascend.core.single_type_kv_cache_manager import AscendCircularBufferManager
     from vllm_ascend.models.glm5next.kv_cache import KpoolTailManager
@@ -663,12 +579,6 @@ def register_ascend_kv_cache_specs() -> None:
         kvcache_spec_cls=AscendSlidingWindowMLASpec,
         manager_class=SlidingWindowManager,
         uniform_type_base_spec=SlidingWindowMLASpec,
-    )
-
-    KVCacheSpecRegistry.register(
-        kvcache_spec_cls=AscendTurboQuantAttentionSpec,
-        manager_class=FullAttentionManager,
-        uniform_type_base_spec=FullAttentionSpec,
     )
 
     KVCacheSpecRegistry.register(
