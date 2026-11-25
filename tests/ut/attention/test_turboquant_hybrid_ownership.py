@@ -16,10 +16,15 @@ import logging
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
+from vllm_ascend.attention.turboquant_codec import TurboQuantEmulator
+from vllm_ascend.attention.turboquant_config import TurboQuantOpsConfig, TurboQuantValueLayout
 from vllm_ascend.attention.turboquant_layout import turboquant_carve_planes, turboquant_plane_views
+from vllm_ascend.attention.turboquant_metadata import AscendTurboQuantMetadataBuilder
+from vllm_ascend.attention.turboquant_ops import TurboQuantOpsAdapter
 
 NUM_BLOCKS = 4
 NUM_KV_HEADS = 4
@@ -50,6 +55,16 @@ class _MambaSpec(SimpleNamespace):
 
 class _UniformTypeSpecs(SimpleNamespace):
     pass
+
+
+class _CpuGpuBuffer:
+    def __init__(self, *shape, dtype, device, pin_memory):
+        self.cpu = torch.zeros(shape, dtype=dtype)
+        self.np = self.cpu.numpy()
+        self.gpu = torch.zeros(shape, dtype=dtype)
+
+    def copy_to_gpu(self, count):
+        self.gpu[:count].copy_(self.cpu[:count])
 
 
 def _load_class(filename, class_name, method_names, namespace):
@@ -250,3 +265,71 @@ def test_dense_hybrid_retains_shared_pool_capacity(hybrid_pool):
     pool.groups[0].kv_cache_spec = dense_spec
     available = NUM_BLOCKS * dense_spec.page_size_bytes
     assert pool.worker._scale_kv_cache_memory_for_multi_group(available) == available
+
+
+def test_private_pages_expand_and_write_across_the_third_page(hybrid_pool):
+    """Run the real table constructor/expansion/draft slots against private KV."""
+    pool = hybrid_pool
+    block_size = pool.specs[ATTENTION_LAYER].block_size
+    namespace = {
+        "torch": torch,
+        "np": np,
+        "get_dcp_group": lambda: SimpleNamespace(world_size=1, rank_in_group=0),
+        "CpuGpuBuffer": _CpuGpuBuffer,
+    }
+    table_cls = _load_class(
+        "vllm_ascend/worker/block_table.py",
+        "BlockTable",
+        (
+            "__init__",
+            "_make_buffer",
+            "_convert_physical_to_logical_blocks",
+            "append_row",
+            "add_row",
+            "compute_slot_mapping_draft",
+        ),
+        namespace,
+    )
+    table = table_cls(block_size, 1, 3, 8, False, torch.device("cpu"), kernel_sizes=[KERNEL_BLOCK_SIZE])
+    page_order = [3, 1, 2]
+    table.add_row(page_order, 0)
+    table.block_table.copy_to_gpu(1)
+    ratio = block_size // KERNEL_BLOCK_SIZE
+    assert table.blocks_per_phys_block == ratio
+    assert table.block_table.gpu[0].tolist() == [page * ratio + sub for page in page_order for sub in range(ratio)]
+    positions = np.array([block_size - 1, block_size, 2 * block_size - 1, 2 * block_size, 2 * block_size + 1])
+    table.compute_slot_mapping_draft(np.zeros_like(positions), positions)
+    expected_slots = torch.tensor(
+        [page_order[position // block_size] * block_size + position % block_size for position in positions],
+        dtype=torch.int32,
+    )
+    assert torch.equal(table.slot_mapping.gpu[: len(positions)], expected_slots)
+
+    raw = pool.runner._allocate_kv_cache_tensors(pool.config)
+    physical = turboquant_plane_views(raw[ATTENTION_LAYER], block_size, NUM_KV_HEADS, HEAD_SIZE)
+    kernel = turboquant_plane_views(raw[ATTENTION_LAYER], KERNEL_BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
+    expected_cache = tuple(torch.zeros_like(plane) for plane in physical)
+    emulator = TurboQuantEmulator(HEAD_SIZE, torch.device("cpu"))
+    adapter = TurboQuantOpsAdapter(TurboQuantOpsConfig(value_layout=TurboQuantValueLayout.NZ_TILED))
+    generator = torch.Generator().manual_seed(2049)
+    key, value = [torch.randn(len(positions), NUM_KV_HEADS, HEAD_SIZE, generator=generator) for _ in range(2)]
+    adapter.reshape_scatter_decode(key, value, *kernel, table.slot_mapping.gpu[: len(positions)], emulator)
+    adapter.reshape_scatter_decode(key, value, *expected_cache, expected_slots, emulator)
+    for actual, expected in zip(physical, expected_cache):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    dense_physical = adapter.gather(*expected_cache, torch.tensor([page_order], dtype=torch.int32))
+    dense_kernel = adapter.gather(*kernel, table.block_table.gpu)
+    for actual, expected in zip(dense_kernel, dense_physical):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    validator = object.__new__(AscendTurboQuantMetadataBuilder)
+    validator._block_size = KERNEL_BLOCK_SIZE
+    for position in (2 * block_size - 1, 2 * block_size, 2 * block_size + 1):
+        table.compute_slot_mapping_draft(np.array([0]), np.array([position]))
+        validator._validate_slot_mapping(
+            SimpleNamespace(num_reqs=1, num_actual_tokens=1, slot_mapping=table.slot_mapping.gpu[:1]),
+            table.block_table.gpu,
+            torch.ones(1, dtype=torch.int32),
+            torch.tensor([position + 1], dtype=torch.int32),
+        )
+    for name in RECURRENT_LAYERS:
+        assert not torch.count_nonzero(raw[name])

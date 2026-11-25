@@ -891,8 +891,9 @@ class TurboQuantOpsAdapter:
         workspace: torch.Tensor,
         query_rot: torch.Tensor,
         fused_context_limit: int = TURBOQUANT_FUSED_CONTEXT_LIMIT,
+        num_splits: int | None = None,
     ) -> torch.Tensor | None:
-        """Launch decode; threshold overrides must also reach the tiling builder."""
+        """Launch decode; split/threshold overrides must match the tiling builder."""
         if not self.has_kernel(TURBOQUANT_OP_FUSED_DECODE):
             self.dispatch_observer.record(
                 TURBOQUANT_OP_FUSED_DECODE,
@@ -944,7 +945,7 @@ class TurboQuantOpsAdapter:
             output=output,
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
-            num_splits=TURBOQUANT_DECODE_SPLITS,
+            num_splits=TURBOQUANT_DECODE_SPLITS if num_splits is None else num_splits,
             heads_per_task=turboquant_decode_heads_per_task(num_heads, num_kv_heads),
             output_stage=TURBOQUANT_STAGE_UNROTATED,
             scale=scale,

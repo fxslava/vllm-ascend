@@ -30,7 +30,7 @@ def decode_fixture():
         pytest.skip("requires an Ascend NPU")
     tq.load_turboquant_extension()
     if not all(
-        tq._is_op_registered(tq.TURBOQUANT_DEFAULT_NAMESPACE, name)
+        hasattr(getattr(torch.ops, tq.TURBOQUANT_DEFAULT_NAMESPACE, None), name)
         for name in (
             tq.TURBOQUANT_OP_RESHAPE_SCATTER,
             tq.TURBOQUANT_OP_FUSED_DECODE,
@@ -47,7 +47,7 @@ def decode_fixture():
     impl.attn_type = AttentionType.DECODER
     impl.kv_sharing_target_layer_name = None
     impl.pcp_enabled = False
-    impl._profile = False
+    impl.telemetry = tq.InferenceTelemetry(enabled=False)
     impl.emulator = None
     layer = SimpleNamespace(layer_name="turboquant_capture_test", _k_scale_float=1.0, _v_scale_float=1.0)
     emulator = impl._bind_codec_constants(layer, device)
@@ -77,6 +77,7 @@ def test_capture_and_replay_ingress_and_attention(decode_fixture):
     value = torch.zeros_like(key)
     output = torch.zeros_like(query)
     block_table = torch.arange(NUM_BLOCKS, dtype=torch.int32, device=device).view(BATCH, MAX_BLOCKS)
+    host_block_table = torch.arange(NUM_BLOCKS, dtype=torch.int32).view(BATCH, MAX_BLOCKS)
     slots = torch.full((BATCH,), -1, dtype=torch.int64, device=device)
     metadata = SimpleNamespace()
 
@@ -88,8 +89,12 @@ def test_capture_and_replay_ingress_and_attention(decode_fixture):
             slot_mapping=slots[:width],
             attn_state=tq.AscendAttentionState.DecodeOnly,
         )
+        block_table.copy_(host_block_table.to(device))
         host_slots = [
-            row * MAX_BLOCKS * BLOCK_SIZE + length - 1 if length else -1 for row, length in enumerate(lengths)
+            int(host_block_table[row, (length - 1) // BLOCK_SIZE]) * BLOCK_SIZE + (length - 1) % BLOCK_SIZE
+            if length
+            else -1
+            for row, length in enumerate(lengths)
         ]
         slots[:width].copy_(torch.tensor(host_slots, dtype=torch.int64, device=device))
         extra = builder._build_backend_metadata(
@@ -127,7 +132,20 @@ def test_capture_and_replay_ingress_and_attention(decode_fixture):
             forward(width)
         graphs[width] = graph
 
-    for width, lengths in ((BATCH, [65, 129]), (1, [257]), (BATCH, [130, 0]), (BATCH, [4097, 258]), (BATCH, [66, 129])):
+    for width, lengths in (
+        (BATCH, [65, 129]),
+        (1, [257]),
+        (BATCH, [130, 0]),
+        (1, [2047]),
+        (1, [2048]),
+        (1, [2049]),
+        (BATCH, [2050, 2177]),
+        (BATCH, [4097, 258]),
+        (BATCH, [66, 129]),
+    ):
+        # Change page IDs without changing captured table storage. Replay must
+        # consume both the refreshed descriptors and the current page mapping.
+        host_block_table = host_block_table.roll(1, dims=1)
         for tensor in (query, key, value):
             tensor.copy_(torch.randn(tensor.shape, generator=generator).to(device=device, dtype=tensor.dtype))
         prepare(width, lengths)
