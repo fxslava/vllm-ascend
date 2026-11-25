@@ -1,0 +1,262 @@
+{
+  "vllm": [
+    {
+      "path": "CMakeLists.txt",
+      "sha256_lf": "568fd159d96458060b59f1f721d3de42e1609a92932bac15dd439df937304176"
+    },
+    {
+      "path": "csrc/attention/turboquant/README.md",
+      "sha256_lf": "3d32bf8d58a6e143fa9bb08208291964d7f4b7e46746c9b59c1d17b0bc932360"
+    },
+    {
+      "path": "csrc/attention/turboquant/e8/.gitattributes",
+      "sha256_lf": "acd58c39b230d09cb32d594383146909b9170717b32e1ac851da6b1afd2a84a3"
+    },
+    {
+      "path": "csrc/attention/turboquant/e8/asc_component.cpp",
+      "sha256_lf": "157b84eaef449f102ac92412d9583689c63cc9ed25aa9666408111aa3375bad5"
+    },
+    {
+      "path": "csrc/attention/turboquant/e8/asc_reader.cpp",
+      "sha256_lf": "87df2a673bcc296512c47d5022b8b2fa75f159d1c81cd12aa27f93bb041f9d20"
+    },
+    {
+      "path": "csrc/attention/turboquant/e8/decode_cpu_check.cpp",
+      "sha256_lf": "e5f8a28e9ec6c721d3d28aa256bf4058860060fe7143734d0fec9605cc0ae3d0"
+    },
+    {
+      "path": "csrc/attention/turboquant/e8/e8_component.hpp",
+      "sha256_lf": "f2d1e46537456719391990fe2941849a9e2985279aa32ea48eb5ecfdf4d0ba04"
+    },
+    {
+      "path": "csrc/attention/turboquant/e8/e8_decode.hpp",
+      "sha256_lf": "5e890555adcb5e64a962519bbfd749bfbeb3ee5208a044060887f3f2df95c1ac"
+    },
+    {
+      "path": "csrc/attention/turboquant/e8/e8_fused_decode.cpp",
+      "sha256_lf": "e5fdf887471664c8930079fb891303094b91486adc8334b050a5648a3b407a38"
+    },
+    {
+      "path": "csrc/attention/turboquant/e8/e8_packet_layout.hpp",
+      "sha256_lf": "a6548cb90e576c15498317ad0b90c90f805e08917350cc53ab86893e4562743b"
+    },
+    {
+      "path": "csrc/attention/turboquant/e8/e8_parallel_decode.hpp",
+      "sha256_lf": "f0a5b191b50d8d02a8d7a327a53ede5a3c869252b30b916f814d0497be37a2f4"
+    },
+    {
+      "path": "csrc/attention/turboquant/e8/frozen/routine_e8_bf16_dequant_simt.hpp",
+      "sha256_lf": "28f13039c8fec29ef91919a69a8314a60c9cb9aec3f5f3fc75b270f8e524cda2"
+    },
+    {
+      "path": "csrc/attention/turboquant/e8/frozen/routine_e8_int8_dequant_simt.hpp",
+      "sha256_lf": "e366ddb4b6697ede5a16bcb41c5ab3857f1ee98bcc2ce95f1c5b8efefe9f2d45"
+    },
+    {
+      "path": "csrc/attention/turboquant/e8/layout_check.cpp",
+      "sha256_lf": "ea1c7257b15da108959f5f324d49e39b4b70c647ebb41b9eb785aeaa9bf0629f"
+    },
+    {
+      "path": "csrc/attention/turboquant/e8/parallel_component.cpp",
+      "sha256_lf": "47ff8c5c19bb5f532a7f86484cc9826837511edf7e2a459bcdaa08341d7dc789"
+    },
+    {
+      "path": "csrc/attention/turboquant/e8/routines/routine_e8_bf16_dequant_simt.hpp",
+      "sha256_lf": "38fd578c1753cd37552553400db30689904a34210410e14eddf2e2c0444319e9"
+    },
+    {
+      "path": "csrc/attention/turboquant/e8/routines/routine_e8_int8_dequant_simt.hpp",
+      "sha256_lf": "55b848c85991aad6be28fcee8e01bb0ebcc9f37abf2ceb50d764f920b0732950"
+    },
+    {
+      "path": "csrc/attention/turboquant/e8_torch_bindings.cpp",
+      "sha256_lf": "b89912a92fc90505b0779035208d9312f825ed079aa4b8ad4349350096d8406e"
+    },
+    {
+      "path": "csrc/attention/turboquant/include/turboquant_fused_decode_opt.hpp",
+      "sha256_lf": "23f3625d44b9625f5c6942e271044c6ac662e574b2e0e50c830ddfd864347c62"
+    },
+    {
+      "path": "csrc/attention/turboquant/include/turboquant_gemm_reduce.hpp",
+      "sha256_lf": "59a2a225e7761cf368ea83a0e015c7c38b37a08eb8ff08f897c4ae9c2575153b"
+    },
+    {
+      "path": "csrc/attention/turboquant/op_adapter/turboquant_torch_ops.h",
+      "sha256_lf": "9c06151a64fedaa61659e3aeccfcd24043e23a50013386028d0ebe6b8cadefe6"
+    },
+    {
+      "path": "csrc/attention/turboquant/op_kernel/common/turboquant_layout.h",
+      "sha256_lf": "850d5860e664986de486de41265b826f66f8344ac6790f317eea25f5e51af3cd"
+    },
+    {
+      "path": "csrc/attention/turboquant/op_kernel/cube/routine_stage_page_zn_bf16.hpp",
+      "sha256_lf": "cc512b820297662d2ef50f7477a0f324c033840ed6f4542895452b0e2ffa53b7"
+    },
+    {
+      "path": "csrc/attention/turboquant/op_kernel/turboquant_fused_decode.cpp",
+      "sha256_lf": "7ba242608ba757924cd88cf4afa3ebcb154a6b220819d6a363ce6385a96988ee"
+    },
+    {
+      "path": "csrc/attention/turboquant/op_kernel/turboquant_reshape_batch.cpp",
+      "sha256_lf": "ec40b0db3d94c2ad5f311557ad82c944263b0b810c6ea68caf5c74b28e49c4cb"
+    },
+    {
+      "path": "csrc/attention/turboquant/op_kernel/turboquant_reshape_scatter.cpp",
+      "sha256_lf": "c46dc0e2d54eb4890f890ec6ee19ae9883a0597a51786a49b70eb29aab150f2a"
+    },
+    {
+      "path": "csrc/attention/turboquant/op_kernel/vector/routine_vector_cube_softmax.hpp",
+      "sha256_lf": "728e0cfc6314c808c07aa9e74308557ef6cb8aaabeff5c05338926aadabd9baf"
+    },
+    {
+      "path": "csrc/attention/turboquant/op_kernel/vector/routine_vector_online_softmax.hpp",
+      "sha256_lf": "3a511b65794a5224f48d845c93f10b46d424387512bda735ed492d6217385ccb"
+    },
+    {
+      "path": "csrc/attention/turboquant/op_kernel/vector/turboquant_vector_service.h",
+      "sha256_lf": "c50dddcfe30380cd040f67f209170673d00fa9f824b4c23aa5515ff8ea1eabae"
+    },
+    {
+      "path": "csrc/attention/turboquant/torch_bindings.cpp",
+      "sha256_lf": "8fdcdc41e7b101d8253c952e1257f01da584d3b8329390e793c60dcd47357122"
+    },
+    {
+      "path": "tests/host/turboquant/abi.cpp",
+      "sha256_lf": "4e210822f09eba3f45e0f8727836425cb3eb0eabccbe961e6b2015122fcc6561"
+    },
+    {
+      "path": "tests/host/turboquant/check_analyzer.py",
+      "sha256_lf": "c1d4e2c8155bb631399ba3b2c5258b060621ce5cb025fb620a598486649cbaba"
+    },
+    {
+      "path": "tests/host/turboquant/check_bindings.py",
+      "sha256_lf": "8a68a371eec7b8a1267ffa4d23c1352d08ff541aba4909086554804e61e903c4"
+    },
+    {
+      "path": "tests/host/turboquant/check_kernels.py",
+      "sha256_lf": "6b5cb592b4f80555ed9d5bf6127ae2e0e17c6d1201109c9a25b79d81bcbbb631"
+    },
+    {
+      "path": "tests/host/turboquant/stubs/acl/acl.h",
+      "sha256_lf": "bb7e6fe2420a29967f5e855cf564a2fd8cdea5b12b7ac2fa51984f17c4f233f7"
+    },
+    {
+      "path": "tests/host/turboquant/stubs/torch_npu/csrc/core/npu/NPUStream.h",
+      "sha256_lf": "8709672ffae11f5d870ce664156b7b4237fc4f63e12a92c6ac9ec9ec6e8bdbbf"
+    },
+    {
+      "path": "tests/ut/attention/run_turboquant_device_free.py",
+      "sha256_lf": "b8b7afad5d662a1453a0ec1b3da9252846b579a49ffa6baafce266c733e5200b"
+    },
+    {
+      "path": "tests/ut/attention/test_turboquant_e8.py",
+      "sha256_lf": "6f4c7389112e5a162272c82027e33551e164d8de72dd097bb358dbb3a7fcadf7"
+    },
+    {
+      "path": "tests/ut/ops/test_turboquant_contract_gates.py",
+      "sha256_lf": "cdcff82e83d4b06129a316f536a50bbe3f61cfd652b9717e3406bbd7e917d622"
+    },
+    {
+      "path": "vllm_ascend/attention/turboquant_e8.py",
+      "sha256_lf": "bae19b31b3e14dd0daa782cd4d3a6fd407b61158a7a0e7324307246a71c856c0"
+    }
+  ],
+  "core": [
+    {
+      "path": "CMakeLists.txt",
+      "sha256_lf": "0bcc62d3180495868c3ea6e83747cbbfddf83352d841161d8cbdbfbb7a22e590"
+    },
+    {
+      "path": "components/e8_parallel_decode/.gitattributes",
+      "sha256_lf": "acd58c39b230d09cb32d594383146909b9170717b32e1ac851da6b1afd2a84a3"
+    },
+    {
+      "path": "components/e8_parallel_decode/CMakeLists.txt",
+      "sha256_lf": "ca8a064a953980e72fdbe54fe7a08f344323d46cb12fd0b5f86cfda3fd871288"
+    },
+    {
+      "path": "components/e8_parallel_decode/README.md",
+      "sha256_lf": "4c3e995aa472edff67232aad4aefcb6e93d8375855900b27138e0becb04f500a"
+    },
+    {
+      "path": "components/e8_parallel_decode/decode_cpu_check.cpp",
+      "sha256_lf": "e5f8a28e9ec6c721d3d28aa256bf4058860060fe7143734d0fec9605cc0ae3d0"
+    },
+    {
+      "path": "components/e8_parallel_decode/e8_component.hpp",
+      "sha256_lf": "f2d1e46537456719391990fe2941849a9e2985279aa32ea48eb5ecfdf4d0ba04"
+    },
+    {
+      "path": "components/e8_parallel_decode/e8_decode.hpp",
+      "sha256_lf": "5e890555adcb5e64a962519bbfd749bfbeb3ee5208a044060887f3f2df95c1ac"
+    },
+    {
+      "path": "components/e8_parallel_decode/e8_fused_decode.cpp",
+      "sha256_lf": "e5fdf887471664c8930079fb891303094b91486adc8334b050a5648a3b407a38"
+    },
+    {
+      "path": "components/e8_parallel_decode/e8_packet_layout.hpp",
+      "sha256_lf": "a6548cb90e576c15498317ad0b90c90f805e08917350cc53ab86893e4562743b"
+    },
+    {
+      "path": "components/e8_parallel_decode/e8_parallel_decode.hpp",
+      "sha256_lf": "f0a5b191b50d8d02a8d7a327a53ede5a3c869252b30b916f814d0497be37a2f4"
+    },
+    {
+      "path": "components/e8_parallel_decode/frozen/routine_e8_bf16_dequant_simt.hpp",
+      "sha256_lf": "28f13039c8fec29ef91919a69a8314a60c9cb9aec3f5f3fc75b270f8e524cda2"
+    },
+    {
+      "path": "components/e8_parallel_decode/frozen/routine_e8_int8_dequant_simt.hpp",
+      "sha256_lf": "e366ddb4b6697ede5a16bcb41c5ab3857f1ee98bcc2ce95f1c5b8efefe9f2d45"
+    },
+    {
+      "path": "components/e8_parallel_decode/layout_check.cpp",
+      "sha256_lf": "ea1c7257b15da108959f5f324d49e39b4b70c647ebb41b9eb785aeaa9bf0629f"
+    },
+    {
+      "path": "components/e8_parallel_decode/parallel_component.cpp",
+      "sha256_lf": "47ff8c5c19bb5f532a7f86484cc9826837511edf7e2a459bcdaa08341d7dc789"
+    },
+    {
+      "path": "components/e8_parallel_decode/routines/routine_e8_bf16_dequant_simt.hpp",
+      "sha256_lf": "38fd578c1753cd37552553400db30689904a34210410e14eddf2e2c0444319e9"
+    },
+    {
+      "path": "components/e8_parallel_decode/routines/routine_e8_int8_dequant_simt.hpp",
+      "sha256_lf": "55b848c85991aad6be28fcee8e01bb0ebcc9f37abf2ceb50d764f920b0732950"
+    },
+    {
+      "path": "include/turboquant/turboquant_fused_decode_opt.hpp",
+      "sha256_lf": "7f9cf9bcb71ed81bf2c84d6abac27ad7b240de734808af5fb1b4cb90d8127685"
+    },
+    {
+      "path": "include/turboquant/turboquant_gemm_reduce.hpp",
+      "sha256_lf": "b319da769df5a805c77e77d28d92a8b1dda75ae6af2ee97ad689db40dd628eb9"
+    },
+    {
+      "path": "include/turboquant/turboquant_launch.h",
+      "sha256_lf": "fea97b5c2df101d93a425ee35120a2e14ba4d466e1dd87d3e2d6406ea25cc496"
+    },
+    {
+      "path": "src/decode/turboquant_fused_decode.cpp",
+      "sha256_lf": "955d73a5f6ee157bf11bcff2d05863343aa06ee1cf0b04da053ec92cbf8e915d"
+    },
+    {
+      "path": "src/decode/vector/routine_vector_cube_softmax.hpp",
+      "sha256_lf": "728e0cfc6314c808c07aa9e74308557ef6cb8aaabeff5c05338926aadabd9baf"
+    },
+    {
+      "path": "src/decode/vector/turboquant_vector_service.h",
+      "sha256_lf": "69768195f747dbd785561986397e3164b75019fcb59fcc0bb88401ae4a0e1e88"
+    },
+    {
+      "path": "src/prefill/turboquant_reshape_batch.cpp",
+      "sha256_lf": "bcbdcc866230bc72bf47ba3ec4fd025e5a063cd9333a58ee558f37e2924e89ad"
+    },
+    {
+      "path": "tests/cpu/test_telemetry_dump.cpp",
+      "sha256_lf": "6927d20f0a689456f46bcdb3f8f0f7e29d9ec58c14f147c36a4bf6e221dc4c99"
+    }
+  ]
+}

@@ -1,5 +1,6 @@
+#include <cstdint>
+
 #include "../include/turboquant_fused_decode_opt.hpp"
-#include "common/turboquant_mode.h"
 #include "common/types.h"
 
 #if defined(__CCE_AICORE__)
@@ -114,6 +115,12 @@ public:
         maxBlocksPerSeq_ = maxBlocksPerSeq;
         numSplits_ = numSplits;
         fusedContextLimit_ = fusedContextLimit;
+        // log2(blockSize): the probe's tile-to-context arithmetic is shift-only, like the
+        // cursor's; valid_launch has already refused a non-power-of-two page.
+        blockSizeShift_ = 0;
+        while ((1u << blockSizeShift_) < blockSize) {
+            ++blockSizeShift_;
+        }
         // DIRTY-DATA (D1/N3): the physical page count of the cache planes. Every block-table
         // entry the tile cursor turns into a GM read is bound-checked against it; see
         // PrefetchBlockTable. 0 is refused by the launcher, never treated as "unbounded".
@@ -273,6 +280,10 @@ private:
         uint32_t tileOrigin = 0;
         uint32_t pageShift = 0;
         uint32_t pageMask = 0;
+        // The split's first logical page in the token's block-table row. The telemetry probe
+        // turns a tile's (page, row base) back into a context position and a logical page
+        // index with it -- the same arithmetic the host dump mirrors.
+        uint32_t blockStart = 0;
         uint32_t tile = 0;
     };
 
@@ -298,11 +309,6 @@ private:
         const uint32_t rows = groupHeads_ - offset < headsPerTask_ ? groupHeads_ - offset : headsPerTask_;
         const TurboQuantTaskHeads heads = Vector::Heads(kvHead * groupHeads_ + offset, rows);
 
-        if ASCEND_IS_AIV {
-            SyncVectorToMte2();
-            vector_.BeginTask(heads);
-        }
-
         const uint32_t descriptor = (token * numSplits_ + split) * fd::kDecodeTilingWords;
         const uint32_t numTiles = tilingGm_.GetValue(descriptor + fd::kTilingWordNumTiles);
         const uint32_t tailRows = tilingGm_.GetValue(descriptor + fd::kTilingWordTailRows);
@@ -310,10 +316,34 @@ private:
         const uint32_t blocksInSplit = tilingGm_.GetValue(descriptor + fd::kTilingWordBlocksInSplit);
         const uint32_t tileOrigin = tilingGm_.GetValue(descriptor + fd::kTilingWordTileOrigin);
         const uint32_t pageShift = tilingGm_.GetValue(descriptor + fd::kTilingWordTilesPerPageShift);
+        const uint64_t endTile = static_cast<uint64_t>(tileOrigin) + numTiles;
+        const bool live = numTiles != 0 && tailRows < kCubeTileRows && pageShift < 32 &&
+            (1u << pageShift) == (blockSize_ >> fd::kDecodeTileRowsShift) &&
+            blockStart < maxBlocksPerSeq_ && blocksInSplit <= maxBlocksPerSeq_ - blockStart &&
+            endTile - 1 <= UINT32_MAX && ((endTile - 1) >> pageShift) < blocksInSplit;
+        const uint32_t firstPage = live ? tileOrigin >> pageShift : 0;
+        const uint32_t pageMask = live ? (1u << pageShift) - 1u : 0;
+        int32_t firstPhysical = -1;
+        event_t queryReady{};
+        if ASCEND_IS_AIV {
+            SyncVectorToMte2();
+            if (live) {
+                const uint64_t row = static_cast<uint64_t>(token) * maxBlocksPerSeq_;
+                const int32_t entry = blockTableGm_.GetValue(row + blockStart + firstPage);
+                if (PageIndexValid(entry)) {
+                    firstPhysical = entry;
+                    queryReady = vector_.PostQueryRead(token, heads);
+                    vector_.ReadTileToSlot(static_cast<uint32_t>(entry),
+                        (tileOrigin & pageMask) << fd::kDecodeTileRowsShift, kvHead, 0);
+                }
+            }
+            vector_.BeginTask(heads);
+        }
+        if (live) {
+            PrefetchBlockTable(token, blockStart, blocksInSplit, firstPage, firstPhysical);
+        }
 
-        PrefetchBlockTable(token, blockStart, blocksInSplit);
-
-        if (numTiles > 0 && pagesMapped_) {
+        if (live && pagesMapped_) {
             PipelineTask task;
             task.token = token;
             task.kvHead = kvHead;
@@ -322,19 +352,48 @@ private:
             task.lastValid = tailRows != 0 ? tailRows : kCubeTileRows;
             task.tileOrigin = tileOrigin;
             task.pageShift = pageShift;
-            task.pageMask = (1u << pageShift) - 1u;
+            task.pageMask = pageMask;
+            task.blockStart = blockStart;
 
             if ASCEND_IS_AIV {
-                vector_.StageQuery(mm_, token, kvHead, heads);
+                task.readTile = 1;
+                if (numTiles > 1) {
+                    ReadPipelineTile<1>(task);
+                }
+                vector_.StageQuery(mm_, kvHead, heads, queryReady);
                 if (heads.mine > 0 && tailRows != 0) {
                     vector_.ComputeTailMask(tailRows);
                 }
+                // Arm the probe AFTER StageQuery: the arena is carved from the buffer
+                // StageQuery stages the query through, so arming earlier would be clobbered.
+                vector_.BeginArgmaxProbe(heads);
             }
+            constexpr uint32_t pairRows = ascend_micro::kRegisterSoftmaxHeads * kVectorSubcoresPerBlock;
+            const bool paired = MODE == TurboQuantMode::KV4_FP8 && UNPACK == DecodeUnpack::kNative &&
+                heads.rows == pairRows && task.numTiles >= 2;
             if ASCEND_IS_AIV {
-                RunVectorPipeline(task, heads);
+                if (paired) {
+                    RunVectorPaired(task, heads);
+                } else {
+                    RunVectorPipeline(task, heads);
+                }
             }
             if ASCEND_IS_AIC {
-                RunCubePipeline(task, heads.rows);
+                if (paired) {
+                    RunCubePaired(task, heads.rows);
+                } else {
+                    RunCubePipeline(task, heads.rows);
+                }
+            }
+        } else {
+            if ASCEND_IS_AIV {
+                if (firstPhysical >= 0) {
+                    vector_.DiscardPrologueIngress(heads, queryReady);
+                }
+                // A worker with no live tiles never enters the pipeline, but its
+                // StageTaskOutput still publishes the probe record: arm the sentinels so the
+                // host reads "no record" rather than a stale arena.
+                vector_.BeginArgmaxProbe(heads);
             }
         }
 
@@ -355,7 +414,8 @@ private:
     }
 
     __aicore__ inline void PrefetchBlockTable(const uint32_t token, const uint32_t blockStart,
-                                              const uint32_t blocksInSplit)
+                                              const uint32_t blocksInSplit, const uint32_t firstPage,
+                                              const int32_t firstPhysical)
     {
         blockCacheBase_ = blockStart;
         blockCacheCount_ = blocksInSplit < kBlockCacheEntries ? blocksInSplit : kBlockCacheEntries;
@@ -373,7 +433,8 @@ private:
         }
         const uint64_t row = static_cast<uint64_t>(token) * maxBlocksPerSeq_;
         for (uint32_t i = 0; i < blockCacheCount_; ++i) {
-            const int32_t entry = blockTableGm_.GetValue(row + blockStart + i);
+            const int32_t entry = i == firstPage && firstPhysical >= 0 ? firstPhysical :
+                blockTableGm_.GetValue(row + blockStart + i);
             blockCache_[i] = entry;
             if (!PageIndexValid(entry)) {
                 pagesMapped_ = false;
@@ -388,7 +449,8 @@ private:
         // task for spans over 64 pages; the alternative -- validating lazily at TilePhysical --
         // cannot skip a tile whose operands are already in flight.
         for (uint32_t i = blockCacheCount_; i < blocksInSplit; ++i) {
-            const int32_t entry = blockTableGm_.GetValue(row + blockStart + i);
+            const int32_t entry = i == firstPage && firstPhysical >= 0 ? firstPhysical :
+                blockTableGm_.GetValue(row + blockStart + i);
             if (!PageIndexValid(entry)) {
                 pagesMapped_ = false;
                 return;
@@ -413,6 +475,105 @@ private:
             static_cast<uint64_t>(task.token) * maxBlocksPerSeq_ + blockCacheBase_ + page));
     }
 
+    __aicore__ inline void RunCubePaired(const PipelineTask &task, const uint32_t rows)
+    {
+        CubeScores<0, 2>(rows);
+        CubeScores<1, 2>(rows);
+        uint32_t first = 0;
+        for (; task.numTiles - first >= 2; first += 2) {
+            const uint32_t remaining = task.numTiles - first;
+            CubeContext<0, 2>(rows);
+            if (remaining > 2) {
+                ReleaseCubeSlot<0, 2>();
+                CubeScores<0, 2>(rows);
+            }
+            CubeContext<1, 2>(rows);
+            if (remaining > 3) {
+                ReleaseCubeSlot<1, 2>();
+                CubeScores<1, 2>(rows);
+            }
+        }
+        if (first < task.numTiles) {
+            CubeContext<0, 2>(rows);
+        }
+    }
+
+    __aicore__ inline void PrepareDepthTwoScorePair(PipelineTask &task)
+    {
+        const uint32_t first = task.consumeTile;
+        const uint32_t second = first + 1;
+        const uint32_t firstAbsolute = task.tileOrigin + first;
+        const uint32_t secondAbsolute = task.tileOrigin + second;
+        const uint32_t firstPage = task.blockStart + (firstAbsolute >> task.pageShift);
+        const uint32_t secondPage = task.blockStart + (secondAbsolute >> task.pageShift);
+        const uint32_t firstContext = (firstPage << blockSizeShift_) +
+            ((firstAbsolute & task.pageMask) << fd::kDecodeTileRowsShift);
+        const uint32_t secondContext = (secondPage << blockSizeShift_) +
+            ((secondAbsolute & task.pageMask) << fd::kDecodeTileRowsShift);
+        AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kOptFlagScoresReady));
+        vector_.template PreparePairLogits<0>();
+        AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kOptFlagScoresReady + 1));
+        vector_.template PreparePairLogits<1>();
+        const uint32_t secondValid = second == task.lastTile ? task.lastValid : kCubeTileRows;
+        vector_.ComputePreparedSoftmaxPair(firstContext, firstPage, secondContext, secondPage, secondValid);
+    }
+
+    template <uint32_t SLOT>
+    __aicore__ inline void ReadDepthTwoPacked(const PipelineTask &task)
+    {
+        static_assert(SLOT < 2);
+        const uint32_t absolute = task.tileOrigin + task.readTile + SLOT;
+        vector_.template ReadTileToSlot<true, false>(TilePhysical(task, absolute),
+            (absolute & task.pageMask) << fd::kDecodeTileRowsShift, task.kvHead, SLOT);
+    }
+
+    template <uint32_t SLOT>
+    __aicore__ inline void ReplayDepthTwoSlot(PipelineTask &task, const TurboQuantTaskHeads &heads,
+                                               const bool refill)
+    {
+        VectorSoftmax<SLOT, 2, true>(task, heads);
+        vector_.ComputePreparedAccumulatorDecay(heads, SLOT);
+        VectorAccumulate<SLOT>(heads);
+        if (refill) {
+            AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kOptFlagSlotFree + SLOT));
+            StageToL1(task, SLOT);
+        }
+    }
+
+    __aicore__ inline void RunVectorPaired(PipelineTask &task, const TurboQuantTaskHeads &heads)
+    {
+        StageToL1(task, 0);
+        StageToL1(task, 1);
+        while (task.numTiles - task.consumeTile >= 2) {
+            const uint32_t remaining = task.numTiles - task.consumeTile;
+            const bool refillFirst = remaining > 2;
+            const bool refillSecond = remaining > 3;
+            // The preceding NZ stages retired packed readers. The next L1 writers still wait for PV releases.
+            if (refillFirst) {
+                ReadDepthTwoPacked<0>(task);
+            }
+            if (refillSecond) {
+                ReadDepthTwoPacked<1>(task);
+            }
+            PrepareDepthTwoScorePair(task);
+            if (refillFirst) {
+                SyncVectorToMte2();
+                ReadPipelineTile<0, 2, false, true>(task);
+                if (refillSecond) {
+                    ReadPipelineTile<1, 2, false, true>(task);
+                }
+            }
+            ReplayDepthTwoSlot<0>(task, heads, refillFirst);
+            ReplayDepthTwoSlot<1>(task, heads, refillSecond);
+        }
+        if (task.consumeTile < task.numTiles) {
+            // Both prior prepared probability states have been consumed. Reuse the ordinary single-strip path.
+            VectorSoftmax<0, 2>(task, heads);
+            vector_.ComputeAccumulatorDecay(heads);
+            VectorAccumulate(heads);
+        }
+    }
+
     __aicore__ inline void RunCubeShortPipeline(PipelineTask &, const uint32_t rows,
                                                const uint32_t count)
     {
@@ -426,8 +587,6 @@ private:
 
     __aicore__ inline void RunVectorShortPipeline(PipelineTask &task, const TurboQuantTaskHeads &heads)
     {
-        ReadPipelineTile<0>(task);
-        if (task.numTiles > 1) ReadPipelineTile<1>(task);
         StageToL1(task, 0);
         if (task.numTiles > 2) ReadPipelineTile<2>(task);
         if (task.numTiles > 1) StageToL1(task, 1);
@@ -474,8 +633,7 @@ private:
             RunVectorShortPipeline(task, heads);
             return;
         }
-        ReadPipelineTile<0>(task);
-        ReadPipelineTile<1>(task); StageToL1(task, 0);
+        StageToL1(task, 0);
         ReadPipelineTile<2>(task); StageToL1(task, 1);
         const uint32_t steady_limit = task.numTiles - kSlots;
         while (task.tile + kPhases <= steady_limit) {
@@ -490,10 +648,10 @@ private:
         RunVectorSteadyTail<0>(task, heads, steady_limit - task.tile);
     }
 
-    template <uint32_t PHASE>
+    template <uint32_t PHASE, uint32_t RING = kSlots>
     __aicore__ inline void CubeScores(const uint32_t rows)
     {
-        constexpr uint32_t kSlot = PHASE % kSlots;
+        constexpr uint32_t kSlot = PHASE % RING;
         constexpr uint32_t kWindow = PHASE % kWindows;
         AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kOptFlagSlotReady + kSlot));
         mm_.template GemmScores<true>(vector_.Scores(kWindow), mm_.L1Key(kSlot), rows, headSize_, kCubeTileRows);
@@ -502,53 +660,68 @@ private:
             static_cast<uint16_t>(kOptFlagScoresReady + kWindow));
     }
 
-    template <uint32_t PHASE>
+    template <uint32_t PHASE, uint32_t RING = kSlots>
     __aicore__ inline void CubeContext(const uint32_t rows)
     {
-        constexpr uint32_t kSlot = PHASE % kSlots;
+        constexpr uint32_t kSlot = PHASE % RING;
         AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kOptFlagProbsReady));
         mm_.template GemmContext<true>(vector_.Context(), mm_.L1Value(kSlot), rows, kCubeTileRows, headSize_);
         vllm_ascend::turboquant::SyncEvent<AscendC::HardEvent::FIX_S>();
         AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_FIX>(static_cast<uint16_t>(kOptFlagContextReady));
     }
 
-    template <uint32_t PHASE>
+    template <uint32_t PHASE, uint32_t RING = kSlots>
     __aicore__ inline void ReleaseCubeSlot()
     {
-        constexpr uint32_t kSlot = PHASE % kSlots;
+        constexpr uint32_t kSlot = PHASE % RING;
         vllm_ascend::turboquant::SyncEvent<AscendC::HardEvent::FIX_S>();
         AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_FIX>(
             static_cast<uint16_t>(kOptFlagSlotFree + kSlot));
     }
 
-    template <uint32_t PHASE>
+    template <uint32_t PHASE, uint32_t RING = kSlots, bool PACKED = true, bool SCALES = true>
     __aicore__ inline void ReadPipelineTile(PipelineTask &task)
     {
-        constexpr uint32_t kSlot = PHASE % kSlots;
+        constexpr uint32_t kSlot = PHASE % RING;
         const uint32_t absolute = task.tileOrigin + task.readTile;
+        static_assert(SCALES);
         ++task.readTile;
-        vector_.ReadTileToSlot(TilePhysical(task, absolute),
-                               (absolute & task.pageMask) << fd::kDecodeTileRowsShift, task.kvHead, kSlot);
+        vector_.template ReadTileToSlot<PACKED, SCALES>(
+            TilePhysical(task, absolute), (absolute & task.pageMask) << fd::kDecodeTileRowsShift,
+            task.kvHead, kSlot);
     }
 
-    template <uint32_t PHASE>
+    template <uint32_t PHASE, uint32_t RING = kSlots, bool PREPARED = false>
     __aicore__ inline void VectorSoftmax(PipelineTask &task, const TurboQuantTaskHeads &heads)
     {
-        constexpr uint32_t kSlot = PHASE % kSlots;
+        constexpr uint32_t kSlot = PHASE % RING;
         constexpr uint32_t kWindow = PHASE % kWindows;
         const uint32_t tile = task.consumeTile;
         ++task.consumeTile;
         const uint32_t valid = tile == task.lastTile ? task.lastValid : kCubeTileRows;
-        AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kOptFlagScoresReady + kWindow));
-        vector_.ComputeSoftmaxAndStageProbs(mm_, valid, heads, kSlot, kWindow);
+        // The tile's place in the token's context: its absolute index inside the split span,
+        // decomposed the way ReadPipelineTile decomposes it. contextBase is the context index
+        // of the tile's first row; logicalPage is its logical page in the token's block-table
+        // row (the host maps that to the physical page the row was read from).
+        const uint32_t absolute = task.tileOrigin + tile;
+        const uint32_t contextBase =
+            ((task.blockStart + (absolute >> task.pageShift)) << blockSizeShift_) +
+            ((absolute & task.pageMask) << fd::kDecodeTileRowsShift);
+        const uint32_t logicalPage = task.blockStart + (absolute >> task.pageShift);
+        if constexpr (!PREPARED) {
+            AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kOptFlagScoresReady + kWindow));
+        }
+        vector_.template ComputeSoftmaxAndStageProbs<kWindow, PREPARED>(
+            mm_, valid, heads, kSlot, contextBase, logicalPage);
         vllm_ascend::turboquant::SyncEvent<AscendC::HardEvent::MTE3_S>();
         AscendC::CrossCoreSetFlag<kSubBlockSyncMode, PIPE_MTE3>(static_cast<uint16_t>(kOptFlagProbsReady));
     }
 
+    template <uint32_t PROBABILITY_WINDOW = 0>
     __aicore__ inline void VectorAccumulate(const TurboQuantTaskHeads &heads)
     {
         AscendC::CrossCoreWaitFlag(static_cast<uint16_t>(kOptFlagContextReady));
-        vector_.ComputeAccumulate(heads);
+        vector_.template ComputeAccumulate<PROBABILITY_WINDOW>(heads);
     }
 
     template <uint32_t PHASE>
@@ -655,6 +828,7 @@ private:
     uint32_t chunksPerGroup_ = 1;
     uint32_t headSize_ = 0;
     uint32_t blockSize_ = 0;
+    uint32_t blockSizeShift_ = 0;
     uint32_t maxBlocksPerSeq_ = 0;
     uint32_t numSplits_ = 1;
     uint32_t fusedContextLimit_ = 0;
@@ -761,6 +935,12 @@ static_assert(!ascend_micro::fused_decode_opt::valid_launch(1, 1, 16, 1, 256, 12
 
 #endif  // __CCE_AICORE__
 
+#if !defined(__CCE_AICORE__)
+// CANN's generated ASC host entry replaces this body and adds unused launch
+// parameters. Limit the diagnostic exception to these generated entry stubs.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-parameter"
+#endif
 #define ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT(NAME, MODE, TYPE, UNPACK)                                              \
     extern "C" __global__ __aicore__ void NAME(                                                                      \
         GM_ADDR queryRot, GM_ADDR keyCache, GM_ADDR valueCache, GM_ADDR scaleCache, GM_ADDR blockTables,             \
@@ -798,6 +978,9 @@ ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT_RAW_QUERY(turboquant_mm_fused_decode_opt_r
 ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT(turboquant_mm_fused_decode_opt_kv4fp8_bf16_lm, TurboQuantMode::KV4_FP8, bfloat16_t, DecodeUnpack::kLloydMaxLut)
 ASCEND_TQ_DECLARE_MM_FUSED_DECODE_OPT_RAW_QUERY(turboquant_mm_fused_decode_opt_raw_query_kv4fp8_bf16_lm, TurboQuantMode::KV4_FP8, bfloat16_t, DecodeUnpack::kLloydMaxLut)
 
+#if !defined(__CCE_AICORE__)
+#pragma clang diagnostic pop
+#endif
 #endif  // the entry points
 
 #if defined(ASCEND_MICRO_CANN_LAUNCH) && !defined(__CCE_AICORE__)

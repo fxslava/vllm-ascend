@@ -1162,6 +1162,12 @@ __aicore__ inline void Run_(__gm__ bfloat16_t* key_gm, __gm__ bfloat16_t* value_
 // static_asserts -- defines neither, and so never sees `__global__`,
 // `__aicore__`, `__gm__` or `bfloat16_t`, none of which a plain compiler has.
 #if defined(__CCE_AICORE__) || defined(ASCEND_MICRO_CANN_LAUNCH)
+#if !defined(__CCE_AICORE__)
+// CANN's generated ASC host entry replaces this body and adds unused launch
+// parameters. Limit the diagnostic exception to these generated entry stubs.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-parameter"
+#endif
 extern "C" __global__ __aicore__ void turboquant_reshape_scatter_aiv(
     __gm__ bfloat16_t* __restrict__ key, __gm__ bfloat16_t* __restrict__ value,
     __gm__ std::int8_t* __restrict__ keyCache, __gm__ std::int8_t* __restrict__ valueCache,
@@ -1185,6 +1191,9 @@ extern "C" __global__ __aicore__ void turboquant_reshape_scatter_aiv(
 #endif
 }
 
+#if !defined(__CCE_AICORE__)
+#pragma clang diagnostic pop
+#endif
 #endif  // the entry point
 
 #if defined(ASCEND_MICRO_CANN_LAUNCH) && !defined(__CCE_AICORE__)

@@ -22,32 +22,32 @@
 
 namespace turboquant_bf16 {
 
-constexpr std::uint32_t kTokens = 16;
-constexpr std::uint32_t kHeads = 4;
-constexpr std::uint32_t kHeadSize = 256;
-constexpr std::uint32_t kGroup = 32;
-constexpr std::uint32_t kGroups = kHeadSize / kGroup;
-constexpr std::uint32_t kChunks = 2u * kHeads;
-constexpr std::uint32_t kPanel = kTokens * kHeadSize;
-constexpr std::uint32_t kPackedBytes = kPanel / 2u;
-constexpr std::uint32_t kScaleFloats = kTokens;
+[[maybe_unused]] constexpr std::uint32_t kTokens = 16;
+[[maybe_unused]] constexpr std::uint32_t kHeads = 4;
+[[maybe_unused]] constexpr std::uint32_t kHeadSize = 256;
+[[maybe_unused]] constexpr std::uint32_t kGroup = 32;
+[[maybe_unused]] constexpr std::uint32_t kGroups = kHeadSize / kGroup;
+[[maybe_unused]] constexpr std::uint32_t kChunks = 2u * kHeads;
+[[maybe_unused]] constexpr std::uint32_t kPanel = kTokens * kHeadSize;
+[[maybe_unused]] constexpr std::uint32_t kPackedBytes = kPanel / 2u;
+[[maybe_unused]] constexpr std::uint32_t kScaleFloats = kTokens;
 
-constexpr std::uint32_t kElemBytes = 2u;
-constexpr std::uint32_t kFractalK = 32u / kElemBytes;
-constexpr std::uint32_t kFractalsPerGroup = kGroup / kFractalK;
+[[maybe_unused]] constexpr std::uint32_t kElemBytes = 2u;
+[[maybe_unused]] constexpr std::uint32_t kFractalK = 32u / kElemBytes;
+[[maybe_unused]] constexpr std::uint32_t kFractalsPerGroup = kGroup / kFractalK;
 
-constexpr std::uint32_t kBlockElems = kGroup * kGroup;
-constexpr std::uint32_t kTableBlocks = 2u * kGroups;
-constexpr std::uint32_t kTableElems = kTableBlocks * kBlockElems;
-constexpr std::uint32_t kTableBytes = kTableElems * kElemBytes;
-constexpr std::uint32_t kTableRows = kTableBlocks * kGroup;
+[[maybe_unused]] constexpr std::uint32_t kBlockElems = kGroup * kGroup;
+[[maybe_unused]] constexpr std::uint32_t kTableBlocks = 2u * kGroups;
+[[maybe_unused]] constexpr std::uint32_t kTableElems = kTableBlocks * kBlockElems;
+[[maybe_unused]] constexpr std::uint32_t kTableBytes = kTableElems * kElemBytes;
+[[maybe_unused]] constexpr std::uint32_t kTableRows = kTableBlocks * kGroup;
 
-constexpr std::uint32_t kStageDepth = 4;
-constexpr std::uint32_t kLandDepth = 2;
-constexpr std::uint32_t kPackDepth = 2;
+[[maybe_unused]] constexpr std::uint32_t kStageDepth = 4;
+[[maybe_unused]] constexpr std::uint32_t kLandDepth = 2;
+[[maybe_unused]] constexpr std::uint32_t kPackDepth = 2;
 
-constexpr std::uint32_t kPhases = kChunks;
-constexpr std::uint32_t kIngressLookahead = kStageDepth - 1u;
+[[maybe_unused]] constexpr std::uint32_t kPhases = kChunks;
+[[maybe_unused]] constexpr std::uint32_t kIngressLookahead = kStageDepth - 1u;
 
 #if TURBOQUANT_INGRESS_NZ
 // ----------------------------------------------- write-time NZ-tiled ingress (the geometry)
@@ -66,18 +66,18 @@ constexpr std::uint32_t kIngressLookahead = kStageDepth - 1u;
 // quarters are independent: each writes its own 16 tile rows of each column group, so no two
 // strips -- and no two grid blocks -- ever touch the same byte. That is why this layout change
 // needs no cross-block protocol and no read-modify-write.
-constexpr std::uint32_t kNzTileRows = 64u;
-constexpr std::uint32_t kNzC0 = 32u;
-constexpr std::uint32_t kNzRowBytes = kHeadSize / 2u;              // packedBytes of one row
-constexpr std::uint32_t kNzGroups = kNzRowBytes / kNzC0;           // column groups in a row
-constexpr std::uint32_t kNzHeadBytes = kNzTileRows * kNzRowBytes;  // one (tile, kv head) plane
-constexpr std::uint32_t kNzGroupBytes = kNzTileRows * kNzC0;       // one column group of a tile
-constexpr std::uint32_t kNzScaleSlot = ((2u * kHeads + 7u) / 8u) * 8u;  // NzScaleSlotFloats(H)
-constexpr std::uint32_t kNzScaleSlabFloats = kTokens * 8u;         // the 16 x 32-byte lane image
+[[maybe_unused]] constexpr std::uint32_t kNzTileRows = 64u;
+[[maybe_unused]] constexpr std::uint32_t kNzC0 = 32u;
+[[maybe_unused]] constexpr std::uint32_t kNzRowBytes = kHeadSize / 2u;              // packedBytes of one row
+[[maybe_unused]] constexpr std::uint32_t kNzGroups = kNzRowBytes / kNzC0;           // column groups in a row
+[[maybe_unused]] constexpr std::uint32_t kNzHeadBytes = kNzTileRows * kNzRowBytes;  // one (tile, kv head) plane
+[[maybe_unused]] constexpr std::uint32_t kNzGroupBytes = kNzTileRows * kNzC0;       // one column group of a tile
+[[maybe_unused]] constexpr std::uint32_t kNzScaleSlot = ((2u * kHeads + 7u) / 8u) * 8u;  // NzScaleSlotFloats(H)
+[[maybe_unused]] constexpr std::uint32_t kNzScaleSlabFloats = kTokens * 8u;         // the 16 x 32-byte lane image
 
 namespace tq_contract = vllm_ascend::turboquant;
 
-constexpr std::uint32_t kNzBurstBytes = kTokens * kNzC0;
+[[maybe_unused]] constexpr std::uint32_t kNzBurstBytes = kTokens * kNzC0;
 
 // The NZ byte a strip starts at, given the GLOBAL row of its first token. The per-head step
 // from it is kNzHeadBytes, the per-group step kNzGroupBytes and the per-tile-row step kNzC0 --
@@ -171,13 +171,13 @@ template <std::uint32_t C> constexpr std::uint32_t kL1Slot = C % kStageDepth;
 template <std::uint32_t C> constexpr std::uint32_t kLandSlot = (C / 2u) % kLandDepth;
 template <std::uint32_t C> constexpr std::uint32_t kPackSlot = (C / 2u) % kPackDepth;
 
-constexpr std::uint32_t ParityOf(std::uint32_t v) {
+[[maybe_unused]] constexpr std::uint32_t ParityOf(std::uint32_t v) {
     std::uint32_t parity = 0;
     while (v != 0u) { parity ^= (v & 1u); v >>= 1; }
     return parity;
 }
 template <std::uint32_t C1, std::uint32_t G>
-constexpr std::uint32_t kSignBlock = ParityOf(C1 & G) * kGroups + G;
+[[maybe_unused]] constexpr std::uint32_t kSignBlock = ParityOf(C1 & G) * kGroups + G;
 
 using turboquant_wave::kBankSkewBytes;
 using turboquant_wave::kBlock;
@@ -185,37 +185,37 @@ using turboquant_wave::kReadPadBytes;
 using turboquant_wave::kUbWindow;
 using turboquant_wave::NextSlot;
 using turboquant_wave::RoundUpBlock;
-constexpr std::uint32_t kLanesPerBlock = kBlock / sizeof(float);
+[[maybe_unused]] constexpr std::uint32_t kLanesPerBlock = kBlock / sizeof(float);
 
-constexpr std::uint32_t kPanelBytes = kPanel * 4u;
-constexpr std::uint32_t kLandSlotBytes = kPanelBytes + kBankSkewBytes;
+[[maybe_unused]] constexpr std::uint32_t kPanelBytes = kPanel * 4u;
+[[maybe_unused]] constexpr std::uint32_t kLandSlotBytes = kPanelBytes + kBankSkewBytes;
 #if TURBOQUANT_INGRESS_NZ
 // A pack slot carries the NZ-ordered 2048 bytes plus the slot-major scale image: the 16 scale
 // floats at a 32-byte pitch, which is the source frame the strided MTE3 descriptor reads lane 0
 // of. The strip writer's slot carries the same bytes and 16 CONTIGUOUS floats instead.
-constexpr std::uint32_t kPackSlotPayload = kPackedBytes + kNzScaleSlabFloats * 4u;
+[[maybe_unused]] constexpr std::uint32_t kPackSlotPayload = kPackedBytes + kNzScaleSlabFloats * 4u;
 #else
-constexpr std::uint32_t kPackSlotPayload = kPackedBytes + kScaleFloats * 4u;
+[[maybe_unused]] constexpr std::uint32_t kPackSlotPayload = kPackedBytes + kScaleFloats * 4u;
 #endif
-constexpr std::uint32_t kPackSlotBytes = RoundUpBlock(kPackSlotPayload) + kBankSkewBytes;
+[[maybe_unused]] constexpr std::uint32_t kPackSlotBytes = RoundUpBlock(kPackSlotPayload) + kBankSkewBytes;
 
-constexpr std::uint32_t kUbLandRing = 0u;
-constexpr std::uint32_t kUbLandBytes = kLandDepth * kLandSlotBytes;
-constexpr std::uint32_t kUbCast = NextSlot(kUbLandRing, kUbLandBytes);
-constexpr std::uint32_t kUbWork = NextSlot(kUbCast, kPanelBytes);
-constexpr std::uint32_t kUbFold128 = NextSlot(kUbWork, kPanelBytes);
-constexpr std::uint32_t kUbFold64 = NextSlot(kUbFold128, kTokens * 128u * 4u);
-constexpr std::uint32_t kUbFold8 = NextSlot(kUbFold64, kTokens * 64u * 4u);
-constexpr std::uint32_t kUbHalf = NextSlot(kUbFold8, kTokens * 8u * 4u);
-constexpr std::uint32_t kUbAbsMax = NextSlot(kUbHalf, kPanel * 2u);
-constexpr std::uint32_t kUbExpBits = NextSlot(kUbAbsMax, kScaleFloats * 4u);
-constexpr std::uint32_t kUbPow = NextSlot(kUbExpBits, kScaleFloats * 4u);
-constexpr std::uint32_t kUbInv = NextSlot(kUbPow, kScaleFloats * 4u);
-constexpr std::uint32_t kUbInvRep = NextSlot(kUbInv, kScaleFloats * 4u);
-constexpr std::uint32_t kUbInvBcast = NextSlot(kUbInvRep, 4u * kScaleFloats * 4u);
-constexpr std::uint32_t kUbOne = NextSlot(kUbInvBcast, kTokens * kLanesPerBlock * 4u);
-constexpr std::uint32_t kUbExpMask = NextSlot(kUbOne, kScaleFloats * 4u);
-constexpr std::uint32_t kUbInvSeed = NextSlot(kUbExpMask, kScaleFloats * 4u);
+[[maybe_unused]] constexpr std::uint32_t kUbLandRing = 0u;
+[[maybe_unused]] constexpr std::uint32_t kUbLandBytes = kLandDepth * kLandSlotBytes;
+[[maybe_unused]] constexpr std::uint32_t kUbCast = NextSlot(kUbLandRing, kUbLandBytes);
+[[maybe_unused]] constexpr std::uint32_t kUbWork = NextSlot(kUbCast, kPanelBytes);
+[[maybe_unused]] constexpr std::uint32_t kUbFold128 = NextSlot(kUbWork, kPanelBytes);
+[[maybe_unused]] constexpr std::uint32_t kUbFold64 = NextSlot(kUbFold128, kTokens * 128u * 4u);
+[[maybe_unused]] constexpr std::uint32_t kUbFold8 = NextSlot(kUbFold64, kTokens * 64u * 4u);
+[[maybe_unused]] constexpr std::uint32_t kUbHalf = NextSlot(kUbFold8, kTokens * 8u * 4u);
+[[maybe_unused]] constexpr std::uint32_t kUbAbsMax = NextSlot(kUbHalf, kPanel * 2u);
+[[maybe_unused]] constexpr std::uint32_t kUbExpBits = NextSlot(kUbAbsMax, kScaleFloats * 4u);
+[[maybe_unused]] constexpr std::uint32_t kUbPow = NextSlot(kUbExpBits, kScaleFloats * 4u);
+[[maybe_unused]] constexpr std::uint32_t kUbInv = NextSlot(kUbPow, kScaleFloats * 4u);
+[[maybe_unused]] constexpr std::uint32_t kUbInvRep = NextSlot(kUbInv, kScaleFloats * 4u);
+[[maybe_unused]] constexpr std::uint32_t kUbInvBcast = NextSlot(kUbInvRep, 4u * kScaleFloats * 4u);
+[[maybe_unused]] constexpr std::uint32_t kUbOne = NextSlot(kUbInvBcast, kTokens * kLanesPerBlock * 4u);
+[[maybe_unused]] constexpr std::uint32_t kUbExpMask = NextSlot(kUbOne, kScaleFloats * 4u);
+[[maybe_unused]] constexpr std::uint32_t kUbInvSeed = NextSlot(kUbExpMask, kScaleFloats * 4u);
 #if TURBOQUANT_INGRESS_NZ
 // The three NZ staging panels, each 4096 half elements. kUbNzTmp is the ping-pong partner of
 // kUbHalf for the value plane's four DeInterleave passes; kUbNzSrc holds the two nibble planes
@@ -225,34 +225,34 @@ constexpr std::uint32_t kUbInvSeed = NextSlot(kUbExpMask, kScaleFloats * 4u);
 // None of the three is ringed. Each is written and consumed inside ONE RotateAndQuantise, and
 // the only buffer that has to outlive it -- because MTE3 drains it while the next chunk's
 // vector work runs -- is the pack slot, which keeps its depth-2 ring unchanged.
-constexpr std::uint32_t kUbNzTmp = NextSlot(kUbInvSeed, kScaleFloats * 4u);
-constexpr std::uint32_t kUbNzSrc = NextSlot(kUbNzTmp, kPanel * 2u);
-constexpr std::uint32_t kUbWoven = NextSlot(kUbNzSrc, kPanel * 2u);
-constexpr std::uint32_t kUbPackRing = NextSlot(kUbWoven, kPanel * 2u);
+[[maybe_unused]] constexpr std::uint32_t kUbNzTmp = NextSlot(kUbInvSeed, kScaleFloats * 4u);
+[[maybe_unused]] constexpr std::uint32_t kUbNzSrc = NextSlot(kUbNzTmp, kPanel * 2u);
+[[maybe_unused]] constexpr std::uint32_t kUbWoven = NextSlot(kUbNzSrc, kPanel * 2u);
+[[maybe_unused]] constexpr std::uint32_t kUbPackRing = NextSlot(kUbWoven, kPanel * 2u);
 #else
-constexpr std::uint32_t kUbPackRing = NextSlot(kUbInvSeed, kScaleFloats * 4u);
+[[maybe_unused]] constexpr std::uint32_t kUbPackRing = NextSlot(kUbInvSeed, kScaleFloats * 4u);
 #endif
-constexpr std::uint32_t kArenaEnd = kUbPackRing + kPackDepth * kPackSlotBytes;
+[[maybe_unused]] constexpr std::uint32_t kArenaEnd = kUbPackRing + kPackDepth * kPackSlotBytes;
 
 template <std::uint32_t Slot> constexpr std::uint32_t kLandBase = kUbLandRing + Slot * kLandSlotBytes;
 template <std::uint32_t Slot> constexpr std::uint32_t kPackBase = kUbPackRing + Slot * kPackSlotBytes;
 template <std::uint32_t Slot> constexpr std::uint32_t kScaleBase = kPackBase<Slot> + kPackedBytes;
 
-constexpr std::uint32_t kL1Table = 0u;
-constexpr std::uint32_t kL1PageElems = kTokens * kHeadSize;
-constexpr std::uint32_t kL1PageBytes = kL1PageElems * kElemBytes;
-constexpr std::uint32_t kL1Ring = NextSlot(kL1Table, kTableBytes);
-constexpr std::uint32_t kL1SlotBytes = kL1PageBytes + kBankSkewBytes;
-constexpr std::uint32_t kL1End = kL1Ring + kStageDepth * kL1SlotBytes;
-constexpr std::uint32_t kFractalElems = kTokens * kGroup;
-constexpr std::uint32_t kFractalBytes = kFractalElems * kElemBytes;
+[[maybe_unused]] constexpr std::uint32_t kL1Table = 0u;
+[[maybe_unused]] constexpr std::uint32_t kL1PageElems = kTokens * kHeadSize;
+[[maybe_unused]] constexpr std::uint32_t kL1PageBytes = kL1PageElems * kElemBytes;
+[[maybe_unused]] constexpr std::uint32_t kL1Ring = NextSlot(kL1Table, kTableBytes);
+[[maybe_unused]] constexpr std::uint32_t kL1SlotBytes = kL1PageBytes + kBankSkewBytes;
+[[maybe_unused]] constexpr std::uint32_t kL1End = kL1Ring + kStageDepth * kL1SlotBytes;
+[[maybe_unused]] constexpr std::uint32_t kFractalElems = kTokens * kGroup;
+[[maybe_unused]] constexpr std::uint32_t kFractalBytes = kFractalElems * kElemBytes;
 
 template <std::uint32_t Slot> constexpr std::uint32_t kL1PageBase = kL1Ring + Slot * kL1SlotBytes;
 
-constexpr std::uint32_t kL0TableElems = kTableElems;
-constexpr std::uint32_t kL0PageElems = kGroups * kFractalElems;
-constexpr std::uint32_t kL0Elems = kL0TableElems + kL0PageElems;
-constexpr std::uint32_t kL0CElems = kGroups * kTokens * kGroup;
+[[maybe_unused]] constexpr std::uint32_t kL0TableElems = kTableElems;
+[[maybe_unused]] constexpr std::uint32_t kL0PageElems = kGroups * kFractalElems;
+[[maybe_unused]] constexpr std::uint32_t kL0Elems = kL0TableElems + kL0PageElems;
+[[maybe_unused]] constexpr std::uint32_t kL0CElems = kGroups * kTokens * kGroup;
 
 using turboquant_wave::kSync2AicAnnounce;
 using turboquant_wave::kSync2AicWait;
@@ -263,7 +263,7 @@ using turboquant_wave::kSync2PanelFree;
 using turboquant_wave::kSync2PanelFreePrime;
 using turboquant_wave::kSync2PanelReady;
 
-constexpr std::uint32_t kGenerations = kChunks / 2u;
+[[maybe_unused]] constexpr std::uint32_t kGenerations = kChunks / 2u;
 template <std::uint32_t C> constexpr bool kOpensGeneration = (C % 2u) == 0u;
 template <std::uint32_t C> constexpr bool kClosesGeneration = (C % 2u) == 1u;
 
@@ -321,8 +321,8 @@ static_assert(kIngressLookahead < kChunks);
 #if TURBOQUANT_INGRESS_NZ
 // The NZ stage works in half, which is what the int4b_t Cast consumes and what halves the UB
 // traffic of every rearrangement below relative to the fp32 panel.
-constexpr std::uint32_t kHalfPerBlock = kBlock / 2u;        // 16 halves to a DataBlock
-constexpr std::uint32_t kNzPlaneElems = kPanel / 2u;        // 2048, one nibble plane of a strip
+[[maybe_unused]] constexpr std::uint32_t kHalfPerBlock = kBlock / 2u;        // 16 halves to a DataBlock
+[[maybe_unused]] constexpr std::uint32_t kNzPlaneElems = kPanel / 2u;        // 2048, one nibble plane of a strip
 static_assert(kNzPlaneElems == kTokens * kNzRowBytes);
 static_assert(kNzPlaneElems % kHalfPerBlock == 0u, "both nibble planes must start 32B aligned");
 static_assert(kHeadSize % kHalfPerBlock == 0u && kNzC0 % kHalfPerBlock == 0u);
@@ -375,7 +375,7 @@ __aicore__ inline StripAddr CalculateStripAddr(__gm__ const std::int32_t* slot_m
     return CalculateStripOffsets(slot0, num_kv_heads, head_bytes, block_size, num_blocks);
 }
 
-constexpr auto kUb = AscendC::TPosition::VECCALC;
+[[maybe_unused]] constexpr auto kUb = AscendC::TPosition::VECCALC;
 
 template <class T>
 __aicore__ inline AscendC::LocalTensor<T> View(std::uint32_t base, std::uint32_t count) {
@@ -566,7 +566,7 @@ public:
 
     template <std::uint32_t PHASE>
     __aicore__ inline void StagePage(bool stage_next) {
-        using namespace AscendC::Te;
+        using namespace asc::te;
         constexpr std::uint32_t slot = kL1Slot<PHASE>;
         constexpr std::int32_t evt = static_cast<std::int32_t>(slot);
         std::uint32_t offset = cube_.strip_elems;
@@ -576,70 +576,70 @@ public:
         auto* src_ptr = const_cast<__gm__ bfloat16_t*>(base) + offset + kChunkHead<PHASE> * cube_.head_size;
         auto* dst_ptr = reinterpret_cast<__cbuf__ bfloat16_t*>(kL1PageBase<slot>);
 
-        auto shape = MakeShape(MakeShape(_1{}, kTokens), MakeShape(_1{}, kHeadSize));
-        auto stride = MakeStride(MakeStride(_0{}, cube_.row_pitch), MakeStride(_0{}, _1{}));
-        auto src = MakeTensor(MakeMemPtr(src_ptr), MakePatternLayout<NDExtLayoutPtn, LayoutTrait<AscendC::Std::ignore_t, _1>>(shape, stride));
-        auto dst = MakeTensor(MakeMemPtr(dst_ptr), MakeFrameLayout<NZLayoutPtn, bfloat16_t>(kTokens, kHeadSize));
+        auto shape = make_shape(make_shape(_1{}, kTokens), make_shape(_1{}, kHeadSize));
+        auto stride = make_stride(make_stride(_0{}, cube_.row_pitch), make_stride(_0{}, _1{}));
+        auto src = make_tensor(make_mem_ptr(src_ptr), make_pattern_layout<nd_ext_layout_ptn, layout_trait<AscendC::Std::ignore_t, _1>>(shape, stride));
+        auto dst = make_tensor(make_mem_ptr(dst_ptr), make_frame_layout<nz_layout_ptn, bfloat16_t>(kTokens, kHeadSize));
 
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(evt);
-        Copy(MakeCopy(CopyGM2L1{}), dst, src);
+        copy(make_copy(copy_gm_to_l1{}), dst, src);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(evt);
     }
 
     template <std::uint32_t PHASE, std::uint32_t G>
     __aicore__ inline void GemmGroupLoad(__ca__ bfloat16_t* l0a, __cb__ bfloat16_t* l0b) {
-        using namespace AscendC::Te;
+        using namespace asc::te;
         constexpr std::uint32_t slot = kL1Slot<PHASE>;
         auto* page = reinterpret_cast<__cbuf__ bfloat16_t*>(kL1PageBase<slot> + G * kFractalBytes);
         if constexpr (kIsKey<PHASE>) {
-            auto src = MakeTensor(MakeMemPtr(page), MakeFrameLayout<NZLayoutPtn, bfloat16_t>(kTokens, kGroup));
-            auto dst = MakeTensor(MakeMemPtr(l0a + kL0TableElems + G * kFractalElems), MakeFrameLayout<NZLayoutPtn, bfloat16_t>(kTokens, kGroup));
-            Copy(MakeCopy(CopyL12L0A{}), dst, src);
+            auto src = make_tensor(make_mem_ptr(page), make_frame_layout<nz_layout_ptn, bfloat16_t>(kTokens, kGroup));
+            auto dst = make_tensor(make_mem_ptr(l0a + kL0TableElems + G * kFractalElems), make_frame_layout<nz_layout_ptn, bfloat16_t>(kTokens, kGroup));
+            copy(make_copy(copy_l1_to_l0a{}), dst, src);
         } else {
-            auto src = MakeTensor(MakeMemPtr(page), MakeFrameLayout<ZNLayoutPtn, bfloat16_t>(kGroup, kTokens));
-            auto dst = MakeTensor(MakeMemPtr(l0b + kL0TableElems + G * kFractalElems), MakeFrameLayout<ZNLayoutPtn, bfloat16_t>(kGroup, kTokens));
-            Copy(MakeCopy(CopyL12L0B{}), dst, src);
+            auto src = make_tensor(make_mem_ptr(page), make_frame_layout<zn_layout_ptn, bfloat16_t>(kGroup, kTokens));
+            auto dst = make_tensor(make_mem_ptr(l0b + kL0TableElems + G * kFractalElems), make_frame_layout<zn_layout_ptn, bfloat16_t>(kGroup, kTokens));
+            copy(make_copy(copy_l1_to_l0b{}), dst, src);
         }
     }
 
     template <std::uint32_t PHASE, std::uint32_t C1, std::uint32_t G>
     __aicore__ inline void GemmBlock(__ca__ bfloat16_t* l0a, __cb__ bfloat16_t* l0b, __cc__ float* l0c) {
-        using namespace AscendC::Te;
+        using namespace asc::te;
         constexpr std::uint32_t block = kSignBlock<C1, G> * kBlockElems;
         constexpr bool init = (G == 0u);
         auto* c_ptr = l0c + C1 * kTokens * kGroup;
 
         if constexpr (kIsKey<PHASE>) {
-            auto a = MakeTensor(MakeMemPtr(l0a + kL0TableElems + G * kFractalElems), MakeFrameLayout<NZLayoutPtn, bfloat16_t>(kTokens, kGroup));
-            auto b = MakeTensor(MakeMemPtr(l0b + block), MakeFrameLayout<ZNLayoutPtn, bfloat16_t>(kGroup, kGroup));
-            auto c = MakeTensor(MakeMemPtr(c_ptr), MakeFrameLayout<NZLayoutPtn, 16>(kTokens, kGroup));
-            MmadParams mp(static_cast<std::uint16_t>(kTokens), static_cast<std::uint16_t>(kGroup), static_cast<std::uint16_t>(kGroup), 0, init);
-            Mmad(MakeMmad(MmadOperation{}, MmadTraitDefault{}).with(mp), c, a, b);
+            auto a = make_tensor(make_mem_ptr(l0a + kL0TableElems + G * kFractalElems), make_frame_layout<nz_layout_ptn, bfloat16_t>(kTokens, kGroup));
+            auto b = make_tensor(make_mem_ptr(l0b + block), make_frame_layout<zn_layout_ptn, bfloat16_t>(kGroup, kGroup));
+            auto c = make_tensor(make_mem_ptr(c_ptr), make_frame_layout<nz_layout_ptn, 16>(kTokens, kGroup));
+            mmad_params mp(static_cast<std::uint16_t>(kTokens), static_cast<std::uint16_t>(kGroup), static_cast<std::uint16_t>(kGroup), unit_flag_mode::disable, init);
+            mmad(make_mmad(mmad_operation{}, mmad_trait_default{}).with(mp), c, a, b);
         } else {
-            auto a = MakeTensor(MakeMemPtr(l0a + block), MakeFrameLayout<NZLayoutPtn, bfloat16_t>(kGroup, kGroup));
-            auto b = MakeTensor(MakeMemPtr(l0b + kL0TableElems + G * kFractalElems), MakeFrameLayout<ZNLayoutPtn, bfloat16_t>(kGroup, kTokens));
-            auto c = MakeTensor(MakeMemPtr(c_ptr), MakeFrameLayout<NZLayoutPtn, 16>(kGroup, kTokens));
-            MmadParams mp(static_cast<std::uint16_t>(kGroup), static_cast<std::uint16_t>(kTokens), static_cast<std::uint16_t>(kGroup), 0, init);
-            Mmad(MakeMmad(MmadOperation{}, MmadTraitDefault{}).with(mp), c, a, b);
+            auto a = make_tensor(make_mem_ptr(l0a + block), make_frame_layout<nz_layout_ptn, bfloat16_t>(kGroup, kGroup));
+            auto b = make_tensor(make_mem_ptr(l0b + kL0TableElems + G * kFractalElems), make_frame_layout<zn_layout_ptn, bfloat16_t>(kGroup, kTokens));
+            auto c = make_tensor(make_mem_ptr(c_ptr), make_frame_layout<nz_layout_ptn, 16>(kGroup, kTokens));
+            mmad_params mp(static_cast<std::uint16_t>(kGroup), static_cast<std::uint16_t>(kTokens), static_cast<std::uint16_t>(kGroup), unit_flag_mode::disable, init);
+            mmad(make_mmad(mmad_operation{}, mmad_trait_default{}).with(mp), c, a, b);
         }
     }
 
     template <std::uint32_t PHASE>
     __aicore__ inline void FixpipeChunk(__cc__ float* l0c) {
-        using namespace AscendC::Te;
+        using namespace asc::te;
         constexpr std::uint32_t land = kLandSlot<PHASE>;
         auto* ub = reinterpret_cast<__ubuf__ float*>(kLandBase<land>);
-        FixpipeParams fp;
-        fp.unitFlag = 0;
-        fp.subBlockId = (kOwner<PHASE> == 1u);
+        l0c_to_ub_params fp;
+        fp.unit_flag = unit_flag_mode::disable;
+        fp.sub_block_id = (kOwner<PHASE> == 1u);
         if constexpr (kIsKey<PHASE>) {
-            auto c = MakeTensor(MakeMemPtr(l0c), MakeFrameLayout<NZLayoutPtn, 16>(kTokens, kHeadSize));
-            auto y = MakeTensor(MakeMemPtr(ub), MakeFrameLayout<NDExtLayoutPtn>(kTokens, kHeadSize));
-            Copy(MakeCopy(CopyL0C2UB{}).with(fp), y, c);
+            auto c = make_tensor(make_mem_ptr(l0c), make_frame_layout<nz_layout_ptn, 16>(kTokens, kHeadSize));
+            auto y = make_tensor(make_mem_ptr(ub), make_frame_layout<nd_ext_layout_ptn>(kTokens, kHeadSize));
+            copy(make_copy(copy_l0c_to_ub{}).with(fp), y, c);
         } else {
-            auto c = MakeTensor(MakeMemPtr(l0c), MakeFrameLayout<NZLayoutPtn, 16>(kHeadSize, kTokens));
-            auto y = MakeTensor(MakeMemPtr(ub), MakeFrameLayout<NDExtLayoutPtn>(kHeadSize, kTokens));
-            Copy(MakeCopy(CopyL0C2UB{}).with(fp), y, c);
+            auto c = make_tensor(make_mem_ptr(l0c), make_frame_layout<nz_layout_ptn, 16>(kHeadSize, kTokens));
+            auto y = make_tensor(make_mem_ptr(ub), make_frame_layout<nd_ext_layout_ptn>(kHeadSize, kTokens));
+            copy(make_copy(copy_l0c_to_ub{}).with(fp), y, c);
         }
     }
 
@@ -1034,13 +1034,13 @@ public:
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(kEvtEpilogue);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(kEvtEpilogue);
 
-        using namespace AscendC::Te;
-        auto ta_src = MakeTensor(MakeMemPtr(l1_table), MakeFrameLayout<NZLayoutPtn, bfloat16_t>(kTableRows, kGroup));
-        auto ta_dst = MakeTensor(MakeMemPtr(cube_.l0_a), MakeFrameLayout<NZLayoutPtn, bfloat16_t>(kTableRows, kGroup));
-        Copy(MakeCopy(CopyL12L0A{}), ta_dst, ta_src);
-        auto tb_src = MakeTensor(MakeMemPtr(l1_table), MakeFrameLayout<ZNLayoutPtn, bfloat16_t>(kGroup, kTableRows));
-        auto tb_dst = MakeTensor(MakeMemPtr(cube_.l0_b), MakeFrameLayout<ZNLayoutPtn, bfloat16_t>(kGroup, kTableRows));
-        Copy(MakeCopy(CopyL12L0B{}), tb_dst, tb_src);
+        using namespace asc::te;
+        auto ta_src = make_tensor(make_mem_ptr(l1_table), make_frame_layout<nz_layout_ptn, bfloat16_t>(kTableRows, kGroup));
+        auto ta_dst = make_tensor(make_mem_ptr(cube_.l0_a), make_frame_layout<nz_layout_ptn, bfloat16_t>(kTableRows, kGroup));
+        copy(make_copy(copy_l1_to_l0a{}), ta_dst, ta_src);
+        auto tb_src = make_tensor(make_mem_ptr(l1_table), make_frame_layout<zn_layout_ptn, bfloat16_t>(kGroup, kTableRows));
+        auto tb_dst = make_tensor(make_mem_ptr(cube_.l0_b), make_frame_layout<zn_layout_ptn, bfloat16_t>(kGroup, kTableRows));
+        copy(make_copy(copy_l1_to_l0b{}), tb_dst, tb_src);
         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(kEvtEpilogue);
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(kEvtEpilogue);
 
@@ -1107,27 +1107,34 @@ public:
         AscendC::CrossCoreSetFlag<2, kSync2AivAnnounce>(kSync2PanelFreePrime);
         AscendC::CrossCoreSetFlag<2, kSync2AivAnnounce>(kSync2PanelFreePrime);
 
+        // First metadata load/address chain is issued during producer startup,
+        // before the first long Vector quantization rendezvous.
+        StripAddr current = CalculateStripAddr(slot_mapping, 0u, num_kv_heads,
+            vector_.head_bytes, block_size, num_blocks);
         if constexpr (kOwner<0> == Core) RotateAndQuantise<0>();
 
         for (std::uint32_t strip = 0u; strip + 1u < strips; ++strip) {
-            const StripAddr a = CalculateStripAddr(slot_mapping, strip, num_kv_heads, vector_.head_bytes, block_size, num_blocks);
-            vector_.page_bytes = a.page_bytes;
-            vector_.key_scale = a.key_scale;
-            vector_.value_scale = a.value_scale;
+            vector_.page_bytes = current.page_bytes;
+            vector_.key_scale = current.key_scale;
+            vector_.value_scale = current.value_scale;
             RunVectorSteadyPhase<0, Core>(true);
             RunVectorSteadyPhase<1, Core>(true);
             RunVectorSteadyPhase<2, Core>(true);
             RunVectorSteadyPhase<3, Core>(true);
             RunVectorSteadyPhase<4, Core>(true);
+            // Hold the successor addresses in scalar registers while the rest
+            // of this strip runs. Exactly one mapping load per strip remains.
+            const StripAddr next = CalculateStripAddr(slot_mapping, strip + 1u,
+                num_kv_heads, vector_.head_bytes, block_size, num_blocks);
             RunVectorSteadyPhase<5, Core>(true);
             RunVectorSteadyPhase<6, Core>(true);
             RunVectorSteadyPhase<7, Core>(true);
+            current = next;
         }
         {
-            const StripAddr a = CalculateStripAddr(slot_mapping, strips - 1u, num_kv_heads, vector_.head_bytes, block_size, num_blocks);
-            vector_.page_bytes = a.page_bytes;
-            vector_.key_scale = a.key_scale;
-            vector_.value_scale = a.value_scale;
+            vector_.page_bytes = current.page_bytes;
+            vector_.key_scale = current.key_scale;
+            vector_.value_scale = current.value_scale;
             RunVectorSteadyPhase<0, Core>(false);
             RunVectorSteadyPhase<1, Core>(false);
             RunVectorSteadyPhase<2, Core>(false);
@@ -1249,6 +1256,12 @@ __aicore__ inline void KernelBody(
 // static_asserts -- defines neither, and so never sees `__global__`,
 // `__aicore__`, `__gm__` or `bfloat16_t`, none of which a plain compiler has.
 #if defined(__CCE_AICORE__) || defined(ASCEND_MICRO_CANN_LAUNCH)
+#if !defined(__CCE_AICORE__)
+// CANN's generated ASC host entry replaces this body and adds unused launch
+// parameters. Limit the diagnostic exception to these generated entry stubs.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-parameter"
+#endif
 extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_bf16(
     // The activations are bfloat16_t; the caches stay INT8, because they hold
     // packed INT4 nibbles and the output contract does not move with the input
@@ -1273,6 +1286,9 @@ extern "C" __global__ __aicore__ void turboquant_reshape_and_cache_bf16(
 #endif
 }
 
+#if !defined(__CCE_AICORE__)
+#pragma clang diagnostic pop
+#endif
 #endif  // the entry point
 
 #if defined(ASCEND_MICRO_CANN_LAUNCH) && !defined(__CCE_AICORE__)

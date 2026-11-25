@@ -369,8 +369,8 @@ public:
 
     // ------------------------------------------------------------------------------------------------
     // PROLOGUE. Per-task state, the query operand into L1, the tail mask, and the ring priming reads.
-    // turboquant_fused_decode.cpp issues BeginTask and StageQuery once, then kIngestSlots - 1 of
-    // ReadTileToSlot / StageSlotToL1 before the steady state opens.
+    // The task queues query and the first packed read before preparing recurrence state. It joins
+    // the query before staging its operand and arming telemetry in the same UB storage.
     // ------------------------------------------------------------------------------------------------
 
     // The PipeBarrier<PIPE_V> is an overlapping write and not a hand-off: the runMax field lies inside
@@ -388,8 +388,31 @@ public:
 
     // Quantises this subcore's query heads onto the operand grid, stages them into the Cube's L1 query slot
     // in NZ order, one row per head, and indexes the task's kv head in the tile scale lanes.
-    __aicore__ inline void StageQuery(Mm &mm, const uint32_t token, const uint32_t kvHead,
-                                      const TurboQuantTaskHeads &heads)
+    __aicore__ inline event_t PostQueryRead(const uint32_t token, const TurboQuantTaskHeads &heads)
+    {
+        if (heads.mine == 0) {
+            return {};
+        }
+        AscendC::DataCopy(queryInBuf_.Get<float>(),
+                          queryRotGm_[(static_cast<uint64_t>(token) * numHeads_ + heads.first + heads.base) *
+                                      headSize_],
+                          heads.mine * headSize_);
+        // Slot reads use reserved IDs until StageQuery or cancellation joins this transient ID.
+        const auto ready = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE2_V));
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(ready);
+        return ready;
+    }
+
+    __aicore__ inline void DiscardPrologueIngress(const TurboQuantTaskHeads &heads, const event_t queryReady)
+    {
+        if (heads.mine > 0) {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(queryReady);
+        }
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(readEvents_[0]);
+    }
+
+    __aicore__ inline void StageQuery(Mm &mm, const uint32_t kvHead, const TurboQuantTaskHeads &heads,
+                                      const event_t queryReady)
     {
         if (heads.mine == 0) {
             return;
@@ -397,12 +420,7 @@ public:
         const AscendC::LocalTensor<float>    queryIn      = queryInBuf_.Get<float>();
         const AscendC::LocalTensor<OperandT> queryOperand = queryOperandBuf_.Get<OperandT>();
         const AscendC::LocalTensor<OperandT> queryL1      = mm.L1Query();
-
-        AscendC::DataCopy(queryIn,
-                          queryRotGm_[(static_cast<uint64_t>(token) * numHeads_ + heads.first + heads.base) *
-                                      headSize_],
-                          heads.mine * headSize_);
-        SyncMte2ToVector();
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(queryReady);
 
         ascend_micro::NativeCubeQueryEngine<Codec, OperandT> query{queryIn,
                                                                    queryWorkBuf_.Get<float>(),
@@ -443,14 +461,51 @@ public:
                           AscendC::CMPMODE::GT, static_cast<uint32_t>(kCubeTileRows));
     }
 
+    // Arm the attention telemetry probe for one task (ASCEND_TQ_DECODE_TELEMETRY). MUST be
+    // called after StageQuery: the arena is carved out of queryInBuf_, whose last use in a task
+    // is StageQuery's query staging, so the buffer is dead for the whole tile loop -- and is
+    // overwritten by the NEXT task's StageQuery, which is why the arena is re-armed per task
+    // rather than once at Init. Arms the running (position, page) pair with the sentinel, the
+    // 0..63 lane index ramp the per-tile fold selects against, and the two single-lane
+    // predicates that place the record into the statistics tail's dead lanes 1 and 2 (those
+    // lanes are 4-byte aligned, so a vector write reaches them only through a Select; see
+    // StagePartials). Also called for a task that will never enter the pipeline (zero context,
+    // unmapped pages), so its StageTaskOutput still publishes the sentinel record.
+    __aicore__ inline void BeginArgmaxProbe(const TurboQuantTaskHeads &heads)
+    {
+#if defined(ASCEND_TQ_DECODE_TELEMETRY) && ASCEND_TQ_DECODE_TELEMETRY
+        if (heads.mine == 0) {
+            return;
+        }
+        const AscendC::LocalTensor<float> arena = queryInBuf_.Get<float>();
+        AscendC::Duplicate(arena[kProbePos], kTelemetryInvalid, heads.mine * kFp32PerBlock);
+        AscendC::Duplicate(arena[kProbePage], kTelemetryInvalid, heads.mine * kFp32PerBlock);
+        AscendC::ArithProgression(arena[kProbeSel].ReinterpretCast<int32_t>(), 0, 1,
+                                  static_cast<int32_t>(kCubeTileRows));
+        AscendC::Cast(arena[kProbeRamp], arena[kProbeSel].ReinterpretCast<int32_t>(),
+                      AscendC::RoundMode::CAST_NONE, static_cast<uint32_t>(kCubeTileRows));
+        AscendC::Compares(arena[kProbePred].ReinterpretCast<uint8_t>(), arena[kProbeRamp], 1.0f,
+                          AscendC::CMPMODE::EQ, static_cast<uint32_t>(kPartialTail));
+        AscendC::Compares(arena[kProbePred2].ReinterpretCast<uint8_t>(), arena[kProbeRamp], 2.0f,
+                          AscendC::CMPMODE::EQ, static_cast<uint32_t>(kPartialTail));
+#else
+        static_cast<void>(heads);
+#endif
+    }
+
     // The MTE2 half of the ring ingest: one tile's plane and scale lanes into ring slot `slot`, posted to
     // the vector unit on the slot's own event id so the stage can wait for exactly this read. The caller
     // orders it after the vector unit's last read of the slot's previous tile.
+    template <bool PACKED = true, bool SCALES = true>
     __aicore__ inline void ReadTileToSlot(const uint32_t physical, const uint32_t rowBase, const uint32_t kvHead,
                                           const uint32_t slot)
     {
-        ReadPlane(physical, rowBase, kvHead, slot);
-        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(readEvents_[slot]);
+        static_assert(PACKED || SCALES);
+        ReadPlane<PACKED, SCALES>(physical, rowBase, kvHead, slot);
+        if constexpr (SCALES) {
+            // The same MTE2 queue completes both halves before this event.
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(readEvents_[slot]);
+        }
     }
 
     // The vector half: waits for slot `slot`'s read, unpacks it in UB in NZ order and stages it into the
@@ -477,30 +532,98 @@ public:
     // ONE BODY ON PURPOSE. Split into member helpers, the per-tile tensor views are re-derived in each
     // and the AIV issues more scalar instructions per tile. The ascend_micro calls below are leaf
     // routines taking already-derived views, so they inline without re-deriving anything.
-    __aicore__ inline void ComputeSoftmaxAndStageProbs(Mm &mm, const uint32_t valid, const TurboQuantTaskHeads &heads,
-                                                       const uint32_t slot, const uint32_t window = 0)
+    template <uint32_t WINDOW, bool PREPARED>
+    __aicore__ inline void ComputeSoftmaxAndStageProbs(Mm &mm, const uint32_t valid,
+                                                       const TurboQuantTaskHeads &heads, const uint32_t slot,
+                                                       const uint32_t contextBase, const uint32_t logicalPage)
     {
         if (heads.mine == 0) {
             return;
         }
-        const AscendC::LocalTensor<float>    reduce       = reduceBuf_.Get<float>();
-        const AscendC::LocalTensor<float>    keyScale     = reduce[kReduceKeyScale];
-        const AscendC::LocalTensor<float>    valueScale   = reduce[kReduceValueScale];
-        const AscendC::LocalTensor<OperandT> probOperand  = probOperandBuf_.Get<OperandT>();
-        const AscendC::LocalTensor<OperandT> probsL1      = mm.L1Probs();
-        const uint32_t                       probElems    = Mm::OperandElems(kCubeTileRows);
-
-        ascend_micro::vector_cube_tile_scales(keyScale, valueScale, scaleTileBuf_[slot].template Get<float>(),
-                                              scaleIndexBuf_.Get<int32_t>().ReinterpretCast<uint32_t>(),
-                                              scoreScale_, invGain_);
-        RunTileSoftmax(Scores(window), valid, heads.mine, keyScale, valueScale);
-
+        static_assert(!PREPARED || (!Mm::kIsFp4 && WINDOW < 2));
+        constexpr uint32_t panel = PREPARED ? WINDOW * kPairProbabilityPanelStride : 0;
+        const auto probOperand = probOperandBuf_.Get<OperandT>()[panel];
+        const auto probsL1 = mm.L1Probs();
+        const uint32_t probElems = Mm::OperandElems(kCubeTileRows);
+        if constexpr (!PREPARED) {
+            const auto reduce = reduceBuf_.Get<float>();
+            const auto keyScale = reduce[kReduceKeyScale];
+            const auto valueScale = reduce[kReduceValueScale];
+            ascend_micro::vector_cube_tile_scales(keyScale, valueScale,
+                scaleTileBuf_[slot].template Get<float>(),
+                scaleIndexBuf_.Get<int32_t>().ReinterpretCast<uint32_t>(), scoreScale_, invGain_);
+            RunTileSoftmax(Scores(WINDOW), valid, heads.mine, keyScale, valueScale, contextBase, logicalPage);
+        }
         SyncVectorToMte3();
         for (uint32_t head = 0; head < heads.mine; ++head) {
             AscendC::DataCopy(probsL1[OperandIndex((heads.base + head) * kOperandC0)],
                               probOperand[OperandIndex(head * probElems)], probRowToL1Params_);
         }
-        SyncMte3ToVector();
+        if constexpr (!PREPARED) {
+            SyncMte3ToVector();
+        }
+    }
+
+    template <uint32_t WINDOW>
+    __aicore__ inline void PreparePairLogits()
+    {
+        static_assert(WINDOW < 2);
+        const auto keyScale = PairKeyScale<WINDOW>();
+        const auto scaleTile = scaleTileBuf_[WINDOW].template Get<float>();
+        const auto offsets = scaleIndexBuf_.Get<int32_t>().ReinterpretCast<uint32_t>();
+        AscendC::Gather(keyScale, scaleTile, offsets, 0, kCubeTileRows);
+        AscendC::Muls(keyScale, keyScale, scoreScale_, kCubeTileRows);
+    }
+
+    __aicore__ inline void ComputePreparedSoftmaxPair(const uint32_t firstContext, const uint32_t firstPage,
+                                                     const uint32_t secondContext, const uint32_t secondPage,
+                                                     const uint32_t secondValid)
+    {
+        static_assert(kScoreWindows == 2);
+        const AscendC::LocalTensor<float> arena = queryInBuf_.Get<float>();
+        const AscendC::LocalTensor<float> reduce = reduceBuf_.Get<float>();
+        const auto firstValueScale = reduce[kReducePairFirstValueScale];
+        const auto secondValueScale = reduce[kReducePairSecondValueScale];
+        const auto valueOffsets = scaleIndexBuf_.Get<int32_t>().ReinterpretCast<uint32_t>()[kCubeTileRows];
+        AscendC::Gather(firstValueScale, scaleTileBuf_[0].template Get<float>(), valueOffsets, 0, kCubeTileRows);
+        AscendC::Gather(secondValueScale, scaleTileBuf_[1].template Get<float>(), valueOffsets, 0, kCubeTileRows);
+        AscendC::Muls(firstValueScale, firstValueScale, invGain_, kCubeTileRows);
+        AscendC::Muls(secondValueScale, secondValueScale, invGain_, kCubeTileRows);
+        // Both FP8 panels and their scales must survive until their respective PV replays.
+        const auto packed = probOperandBuf_.Get<fp8_e4m3fn_t>();
+        ascend_micro::native_cube_softmax_pair_vf(
+            reinterpret_cast<__ubuf__ float*>(Scores(0).GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(Scores(1).GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(firstValueScale.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(secondValueScale.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(StateField(kStateRunMax).GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(StateField(kStateRunSum).GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(PairState(0, kPairMaximum).GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(PairState(0, kPairAlpha).GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(PairState(1, kPairMaximum).GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(PairState(1, kPairAlpha).GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(arena[kProbePos].GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(arena[kProbePage].GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(arena[kProbeRamp].GetPhyAddr()),
+            firstContext, firstPage, secondContext, secondPage,
+            reinterpret_cast<__ubuf__ float*>(PairKeyScale<0>().GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(PairKeyScale<1>().GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(StateField(kStateQInv).GetPhyAddr()),
+            secondValid,
+            reinterpret_cast<__ubuf__ float*>(StateField(kStateProbScale).GetPhyAddr()),
+            reinterpret_cast<__ubuf__ float*>(StateField(kStatePart).GetPhyAddr()),
+            reinterpret_cast<__ubuf__ fp8_e4m3fn_t*>(packed.GetPhyAddr()),
+            reinterpret_cast<__ubuf__ fp8_e4m3fn_t*>(packed[kPairProbabilityPanelStride].GetPhyAddr()),
+            OperandMax<MODE>(), TurboQuantCodec4::kEps);
+    }
+
+
+    __aicore__ inline void ComputePreparedAccumulatorDecay(const TurboQuantTaskHeads &heads,
+                                                            const uint32_t window)
+    {
+        ascend_micro::vector_cube_decay_accumulator(accBuf_.Get<float>(), PairState(window, kPairAlpha),
+                                                    StateField(kStateRunMax), PairState(window, kPairMaximum),
+                                                    heads.mine, headSize_, rowRepeatParams_);
     }
 
     // Decays the accumulators by alpha = exp(runMax - newMax) before this tile's context lands, and
@@ -516,13 +639,16 @@ public:
     }
 
     // The Cube's context rows are probs * V on the operand grid: undo each head's prob scale and add.
+    template <uint32_t PROBABILITY_WINDOW = 0>
     __aicore__ inline void ComputeAccumulate(const TurboQuantTaskHeads &heads)
     {
         if (heads.mine == 0) {
             return;
         }
+        static_assert(PROBABILITY_WINDOW < 2);
+        constexpr uint32_t probabilityScale = PROBABILITY_WINDOW == 1 ? kStatePart : kStateProbScale;
         ascend_micro::vector_cube_accumulate(accBuf_.Get<float>(), contextBuf_.Get<float>(),
-                                             StateField(kStateProbScale), StateField(kStateAccInv), heads.mine,
+                                             StateField(probabilityScale), StateField(kStateAccInv), heads.mine,
                                              headSize_, rowRepeatParams_);
     }
 
@@ -549,6 +675,7 @@ public:
             finisher.FinishHeads(acc, token, firstHead, heads.mine);
             WriteHeads<scalar_t>(acc, heads.mine, headSize_, outBuf_.Get<scalar_t>(), outputGm_,
                                  (static_cast<uint64_t>(token) * numHeads_ + firstHead) * headSize_);
+            WriteProbeRecords(token, firstHead, heads.mine);
             return;
         }
         StagePartials(token, split, heads);
@@ -598,6 +725,19 @@ private:
     static constexpr uint32_t kStateAccInv    = 11;
     static constexpr uint32_t kStateFields    = 12;
     static constexpr uint32_t kStateField     = kHalfRows * kFp32PerBlock;
+    // Two prepared generations share the existing padded FP8 probability allocation.
+    static constexpr uint32_t kPairProbabilityPanelStride = 4 * kCubeTileRows;
+    static constexpr uint32_t kPairProbabilityPanelBytes = ascend_micro::kRegisterSoftmaxHeads * kCubeTileRows;
+    static_assert(sizeof(fp8_e4m3fn_t) == 1);
+    static_assert(kPairProbabilityPanelStride % 32 == 0);
+    static_assert(kPairProbabilityPanelBytes <= kPairProbabilityPanelStride);
+    static_assert(kPairProbabilityPanelStride + kPairProbabilityPanelBytes <=
+                  ascend_micro::fused_decode_opt::kUbSizes[20]);
+    // kStatePart is not produced by the prepared FP8 replay. Its separate
+    // eight-lane blocks hold strip 1's scales until that strip accumulates.
+    static_assert(ascend_micro::kRegisterSoftmaxHeads * kFp32PerBlock <= kStateField);
+    static_assert(kStateProbScale < kStatePart && kStatePart < kStateAccInv);
+
     static constexpr uint8_t  kTileBlocks     = static_cast<uint8_t>(kCubeTileRows / kFp32PerBlock);
 
     // reduceBuf_'s lanes. The two tile scales are per-tile and live only across one softmax; the
@@ -607,14 +747,69 @@ private:
     static constexpr uint32_t kReduceFloats     = 512;
     static constexpr uint32_t kReduceKeyScale   = 0;
     static constexpr uint32_t kReduceValueScale = kCubeTileRows;
+    static constexpr uint32_t kReducePairFirstValueScale = 2 * kCubeTileRows;
+    static constexpr uint32_t kReducePairSecondValueScale = 7 * kCubeTileRows;
     static constexpr uint32_t kReduceNormalSums = 3 * kCubeTileRows + kFp32PerBlock;
     static constexpr uint32_t kReduceNormalInvs = kReduceNormalSums + 2 * kCubeTileRows;
+    // The generic per-tile V-scale row is dead before the paired VF.
+    static constexpr uint32_t kPairSecondKeyScale = kReduceValueScale;
+    static_assert(kReduceKeyScale + kCubeTileRows <= kPairSecondKeyScale);
+    static_assert(kPairSecondKeyScale + kCubeTileRows <= kReduceNormalSums);
+    static_assert(kPairSecondKeyScale + kCubeTileRows <= kReducePairFirstValueScale);
+
+
+    template <uint32_t WINDOW>
+    __aicore__ inline AscendC::LocalTensor<float> PairKeyScale()
+    {
+        static_assert(WINDOW < 2);
+        constexpr uint32_t offset = WINDOW == 0 ? kReduceKeyScale : kPairSecondKeyScale;
+        return reduceBuf_.Get<float>()[offset];
+    }
+
     static_assert(kReduceValueScale + kCubeTileRows <= kReduceNormalSums,
                   "the tile scales must not reach the normalisation broadcast");
+    static_assert(kReduceValueScale + kCubeTileRows == kReducePairFirstValueScale);
+    static_assert(kReducePairFirstValueScale + kCubeTileRows <= kReduceNormalSums);
+    static_assert(kReduceNormalInvs + kHalfRows * kFp32PerBlock <= kReducePairSecondValueScale);
+    static_assert(kReducePairSecondValueScale + kCubeTileRows == kReduceFloats);
     static_assert(kReduceNormalSums + (kHalfRows - 1) * kFp32PerBlock + kBrcbDstLanes <= kReduceNormalInvs,
                   "NormalizeHeads' broadcast must not reach its own reciprocals");
     static_assert(kReduceNormalInvs + kHalfRows * kFp32PerBlock <= kReduceFloats,
                   "the reciprocals must not run off the end of the buffer");
+
+    // The telemetry probe arena, in floats of queryInBuf_. StageQuery is that buffer's only
+    // other user and it runs before the tile loop, so the arena is dead exactly over the span
+    // BeginArgmaxProbe .. StageTaskOutput of one task. Every operand is a whole number of
+    // 32-byte blocks: vector reads and writes on this part are block-aligned, which is also why
+    // the record's lanes 1 and 2 are written with a Select against a precomputed predicate
+    // rather than addressed directly. Offsets are part of the kernel's UB contract the same way
+    // the reduce lanes above are; kUbSizes[18] pins the capacity.
+    static constexpr uint32_t kProbePos      = 0;    // 64 floats: running argmax position
+    static constexpr uint32_t kProbePage     = 64;   // 64 floats: running logical page
+    static constexpr uint32_t kProbeRamp     = 128;  // 64 floats: the 0..63 lane index ramp
+    static constexpr uint32_t kProbeBc       = 192;  // 64 floats: per-head broadcast scratch
+    static constexpr uint32_t kProbeDiff     = 256;  // 64 floats: row diff / improvement test
+    static constexpr uint32_t kProbeSel      = 320;  // 64 floats: selected indices
+    static constexpr uint32_t kProbeStage    = 384;  // 8 floats: MIN-reduce landing
+    static constexpr uint32_t kProbePred = TelemetryPredicateLayout::kPosition;
+    static constexpr uint32_t kProbePred2 = TelemetryPredicateLayout::kPage;
+    static constexpr uint32_t kProbeCandPos  = 408;  // 64 floats: candidate position blocks
+    static constexpr uint32_t kProbeCandPage = 472;  // 64 floats: candidate page blocks
+    static constexpr uint32_t kProbeArgmaxPred = TelemetryPredicateLayout::kArgmax;
+    static constexpr uint32_t kProbeArenaFloats = TelemetryPredicateLayout::kArenaFloats;
+    static_assert(kProbeCandPage + kHalfRows * kFp32PerBlock <= kProbeArgmaxPred);
+
+    static constexpr uint32_t kPairMaximum = 0;
+    static constexpr uint32_t kPairAlpha = ascend_micro::kRegisterSoftmaxHeads * kFp32PerBlock;
+    static constexpr uint32_t kPairStride = 2 * kPairAlpha;
+    static_assert(kProbeRamp + kCubeTileRows <= kProbeBc);
+    static_assert(kProbeBc + 2 * kPairStride <= kProbeSel);
+
+    __aicore__ inline AscendC::LocalTensor<float> PairState(uint32_t window, uint32_t field)
+    {
+        return queryInBuf_.Get<float>()[kProbeBc + window * kPairStride + field];
+    }
+
 
     __aicore__ inline void ComputeLayout(const uint32_t numHeads, const uint32_t numKvHeads, const uint32_t headSize,
                                          const uint32_t blockSize, const uint32_t numSplits, const float scale)
@@ -693,6 +888,10 @@ private:
         static_assert(RING_SLOTS == 3 && SCORE_WINDOWS == 2 && BANK_SKEW == 32);
         static_assert(kStateFields * kStateField * sizeof(float) == ascend_micro::fused_decode_opt::kUbSizes[21]);
         static_assert(kReduceFloats * sizeof(float) == ascend_micro::fused_decode_opt::kUbSizes[22]);
+        static_assert(kProbeArenaFloats * sizeof(float) <= ascend_micro::fused_decode_opt::kUbSizes[18],
+                      "the telemetry probe arena must fit queryInBuf_, the dead buffer it is "
+                      "carved from; a larger arena moves the UB map and must go to "
+                      "turboquant_fused_decode_opt.hpp first");
         // The exact allocation list is shared with the host/compile-time budget.
         // The launch ABI gates D=256 and scaleSlot=8 before reaching this body.
         const auto *sizes = ascend_micro::fused_decode_opt::kUbSizes;
@@ -737,6 +936,8 @@ private:
         transientPool_.InitBuffer(queryWorkBuf_, sizes[17]);
         pipe->InitBuffer(queryInBuf_, sizes[18]);
         pipe->InitBuffer(queryOperandBuf_, sizes[19]);
+        // Shift probability and following buffers by one UB bank.
+        pipe->InitBuffer(probabilitySkewBuf_, 32);
         pipe->InitBuffer(probOperandBuf_, sizes[20]);
         pipe->InitBuffer(stateBuf_, sizes[21]);
         pipe->InitBuffer(reduceBuf_, sizes[22]);
@@ -798,16 +999,21 @@ private:
     // This subcore's plane of one tile and the tile's scale lanes, into ingest slot `slot`. rowBase is a
     // whole number of tiles into the block, so an NZ-tiled (tile, kv head) starts at
     // (row * kv heads + kvHead * kCubeTileRows) * packedBytes (turboquant_layout.h, NzTiledPackedByte).
+    template <bool PACKED, bool SCALES>
     __aicore__ inline void ReadPlane(const uint32_t physical, const uint32_t rowBase, const uint32_t kvHead,
                                      const uint32_t slot)
     {
         const uint64_t                 row     = static_cast<uint64_t>(physical) * blockSize_ + rowBase;
-        const uint64_t                 tile    = (row * numKvHeads_ +
-                                                  static_cast<uint64_t>(kvHead) * kCubeTileRows) * packedBytes_;
-        AscendC::GlobalTensor<int8_t> &cacheGm = Plane() == kKeyPlane ? keyCacheGm_ : valueCacheGm_;
-        AscendC::DataCopy(kvBuf_[slot].template Get<int8_t>(), cacheGm[tile], tilePlaneBytes_);
-        AscendC::DataCopy(scaleTileBuf_[slot].template Get<float>(), scaleCacheGm_[row * scaleSlot_],
-                          kCubeTileRows * scaleSlot_);
+        if constexpr (PACKED) {
+            const uint64_t tile = (row * numKvHeads_ +
+                                   static_cast<uint64_t>(kvHead) * kCubeTileRows) * packedBytes_;
+            AscendC::GlobalTensor<int8_t> &cacheGm = Plane() == kKeyPlane ? keyCacheGm_ : valueCacheGm_;
+            AscendC::DataCopy(kvBuf_[slot].template Get<int8_t>(), cacheGm[tile], tilePlaneBytes_);
+        }
+        if constexpr (SCALES) {
+            AscendC::DataCopy(scaleTileBuf_[slot].template Get<float>(), scaleCacheGm_[row * scaleSlot_],
+                              kCubeTileRows * scaleSlot_);
+        }
     }
 
     // An NZ-tiled plane is already the NZ image of its bytes, and the expand is byte-wise, so a chunk's
@@ -839,10 +1045,17 @@ private:
     // The recurrence over every row at once: a row op repeats over the heads, a per-head scalar is a head
     // block, and the row sums and maxima are whole-row reduces with no scalar readback. Logits, one
     // online-softmax step (newMax, alpha, runSum), then the probability rows on the operand grid.
+    //
+    // `contextBase` is the context index of this tile's first row and `logicalPage` the logical
+    // page index of that row in the token's block table row; the telemetry probe folds them into
+    // the running argmax record (turboquant_layout.h). They cost the unprobed path nothing: the
+    // engine only reads them inside the probe phase.
     __aicore__ inline void RunTileSoftmax(const AscendC::LocalTensor<float> &scores, const uint32_t valid,
                                           const uint32_t heads, const AscendC::LocalTensor<float> &keyScale,
-                                          const AscendC::LocalTensor<float> &valueScale)
+                                          const AscendC::LocalTensor<float> &valueScale,
+                                          const uint32_t contextBase, const uint32_t logicalPage)
     {
+        const AscendC::LocalTensor<float> arena = queryInBuf_.Get<float>();
         ascend_micro::NativeCubeSoftmaxEngine<Codec, OperandT> engine{scores,
                                                                      keyScale,
                                                                      valueScale,
@@ -863,8 +1076,20 @@ private:
                                                                      OperandMax<MODE>(),
                                                                      TurboQuantCodec4::kEps,
                                                                      tileByVectorParams_,
-                                                                     tileByBlockParams_};
-        ascend_micro::vector_online_softmax_probabilities(engine);
+                                                                     tileByBlockParams_,
+                                                                     arena[kProbePos],
+                                                                     arena[kProbePage],
+                                                                     arena[kProbeRamp],
+                                                                     arena[kProbeBc],
+                                                                     arena[kProbeDiff],
+                                                                     arena[kProbeSel],
+                                                                     arena[kProbeStage],
+                                                                     arena[kProbeCandPos],
+                                                                     arena[kProbeCandPage],
+                                                                     arena[kProbeArgmaxPred],
+                                                                     contextBase,
+                                                                     logicalPage};
+        ascend_micro::vector_online_softmax_probabilities_probed(engine);
         engine.quantize_probabilities();
     }
 
@@ -881,6 +1106,25 @@ private:
         const AscendC::LocalTensor<float> tails = Scores(0);
         ascend_micro::vector_cube_pack_partial_tails(tails, StateField(kStateRunMax), StateField(kStateRunSum),
                                                      heads.mine, kPartialTail, kPartialMaxLane, kPartialSumLane);
+#if defined(ASCEND_TQ_DECODE_TELEMETRY) && ASCEND_TQ_DECODE_TELEMETRY
+        // The probe record rides the tail's dead lanes 1 and 2 (turboquant_layout.h). Both are
+        // 4-byte-aligned lanes inside a 64-byte record, so they are written with a Select
+        // against the single-lane predicates BeginArgmaxProbe precomputed -- a direct Adds to
+        // an unaligned lane would be a misaligned vector store.
+        const AscendC::LocalTensor<float>   arena = queryInBuf_.Get<float>();
+        const AscendC::LocalTensor<uint8_t> lane1 = arena[kProbePred].ReinterpretCast<uint8_t>();
+        const AscendC::LocalTensor<uint8_t> lane2 = arena[kProbePred2].ReinterpretCast<uint8_t>();
+        for (uint32_t head = 0; head < heads.mine; ++head) {
+            AscendC::Brcb(arena[kProbeBc], arena[kProbePos + head * kFp32PerBlock], 1, {1, 8});
+            AscendC::Select(tails[head * kPartialTail], lane1, arena[kProbeBc],
+                            tails[head * kPartialTail], AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE,
+                            static_cast<uint32_t>(kPartialTail));
+            AscendC::Brcb(arena[kProbeBc], arena[kProbePage + head * kFp32PerBlock], 1, {1, 8});
+            AscendC::Select(tails[head * kPartialTail], lane2, arena[kProbeBc],
+                            tails[head * kPartialTail], AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE,
+                            static_cast<uint32_t>(kPartialTail));
+        }
+#endif
         SyncVectorToMte3();
         for (uint32_t head = 0; head < heads.mine; ++head) {
             const uint64_t offset = PartialOffset(token, heads.first + heads.base + head, split);
@@ -888,6 +1132,48 @@ private:
             AscendC::DataCopy(workspaceGm_[offset + headSize_], tails[head * kPartialTail], kPartialTail);
         }
         SyncMte3ToVector();
+    }
+
+    // The fused path's telemetry record (ASCEND_TQ_DECODE_TELEMETRY): the same 16-lane
+    // statistics tail a split partial carries, published at the (token, head, split 0) slot
+    // whose whole slab is dead on this path -- a fused token never stages a partial. Lane
+    // kTelemetryMaxLane is the running maximum logit, lanes kTelemetryPosLane and
+    // kTelemetryPageLane the probe pair, and every other lane zero -- the run_sum lane
+    // included, which is how the host tells a fused record from a split one. Scores(0) is the
+    // staging window for the same reason as in StagePartials.
+    __aicore__ inline void WriteProbeRecords(const uint32_t token, const uint32_t firstHead,
+                                             const uint32_t heads)
+    {
+#if defined(ASCEND_TQ_DECODE_TELEMETRY) && ASCEND_TQ_DECODE_TELEMETRY
+        const AscendC::LocalTensor<float>   arena  = queryInBuf_.Get<float>();
+        const AscendC::LocalTensor<float>   record = Scores(0);
+        const AscendC::LocalTensor<float>   runMax = StateField(kStateRunMax);
+        const AscendC::LocalTensor<uint8_t> lane1  = arena[kProbePred].ReinterpretCast<uint8_t>();
+        const AscendC::LocalTensor<uint8_t> lane2  = arena[kProbePred2].ReinterpretCast<uint8_t>();
+        for (uint32_t head = 0; head < heads; ++head) {
+            const uint32_t at = head * kPartialTail;
+            AscendC::Duplicate(record[at], 0.0f, static_cast<uint32_t>(kPartialTail));
+            AscendC::Adds(record[at + kTelemetryMaxLane], runMax[head * kFp32PerBlock], 0.0f, 1);
+            AscendC::Brcb(arena[kProbeBc], arena[kProbePos + head * kFp32PerBlock], 1, {1, 8});
+            AscendC::Select(record[at], lane1, arena[kProbeBc], record[at],
+                            AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE,
+                            static_cast<uint32_t>(kPartialTail));
+            AscendC::Brcb(arena[kProbeBc], arena[kProbePage + head * kFp32PerBlock], 1, {1, 8});
+            AscendC::Select(record[at], lane2, arena[kProbeBc], record[at],
+                            AscendC::SELMODE::VSEL_TENSOR_TENSOR_MODE,
+                            static_cast<uint32_t>(kPartialTail));
+        }
+        SyncVectorToMte3();
+        for (uint32_t head = 0; head < heads; ++head) {
+            AscendC::DataCopy(workspaceGm_[PartialOffset(token, firstHead + head, 0) + headSize_],
+                              record[head * kPartialTail], static_cast<uint32_t>(kPartialTail));
+        }
+        SyncMte3ToVector();
+#else
+        static_cast<void>(token);
+        static_cast<void>(firstHead);
+        static_cast<void>(heads);
+#endif
     }
 
     Codec                                        codec_;
@@ -903,6 +1189,7 @@ private:
     AscendC::TBuf<AscendC::QuePosition::VECCALC> queryInBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> queryOperandBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> scoreBuf_[kScoreWindows];
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> probabilitySkewBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> probOperandBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> contextBuf_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> stateBuf_;

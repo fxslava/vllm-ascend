@@ -60,6 +60,50 @@ constexpr uint32_t kPartialMaxLane = 0;
 constexpr uint32_t kPartialSumLane = kFp32PerBlock;
 constexpr uint32_t kMinBurstBytes = 128;
 
+// ------------------------------------------------------- the attention telemetry probe
+// ASCEND_TQ_DECODE_TELEMETRY: the fused decode records, per (token, head), WHICH context token
+// won the maximum attention logit and the physical cache page that token lives on, so attention
+// drift during long-context generation can be pinned to an exact token index and page from the
+// host. The record piggybacks the Split-K workspace: no kernel argument and no allocation
+// changes, because it rides bytes the reduction contract already owns.
+//
+//   * A SPLIT token's record sits in the statistics tail of each live split's partial, in the
+//     lanes that are dead padding to both reducers: lane kTelemetryPosLane holds the argmax
+//     context position and lane kTelemetryPageLane the physical page, both as fp32. Lane
+//     kPartialMaxLane keeps the partial's own run_max and lane kPartialSumLane its run_sum; the
+//     vector reducer (NativeMergeEngine) and both Cube GEMM reducers read exactly those two
+//     lanes, so the probe changes nothing they compute. The host merges the per-split records
+//     by max logit, earliest split on ties -- the same earliest-wins rule the device fold
+//     applies within and across tiles.
+//   * A FUSED token writes no partial, so its whole (head, split) slab of the workspace is
+//     dead. Its record is the 16-float tail of the (token, head, split 0) slot: same lanes,
+//     with the run_sum lane left zero.
+//
+// A task that never entered the pipeline (zero context, unmapped pages) reports
+// kTelemetryInvalid in both probe lanes; the host treats a negative position as "no record".
+constexpr uint32_t kTelemetryMaxLane = kPartialMaxLane;
+constexpr uint32_t kTelemetryPosLane = 1;
+constexpr uint32_t kTelemetryPageLane = 2;
+constexpr float kTelemetryInvalid = -1.0f;
+struct TelemetryPredicateLayout {
+    static constexpr uint32_t kPosition = 392;
+    static constexpr uint32_t kPage = 400;
+    static constexpr uint32_t kArgmax = 536;
+    static constexpr uint32_t kWidth = 8;
+    static constexpr uint32_t kArenaFloats = kArgmax + kWidth;
+};
+static_assert(TelemetryPredicateLayout::kPosition + TelemetryPredicateLayout::kWidth <=
+    TelemetryPredicateLayout::kPage);
+static_assert(TelemetryPredicateLayout::kPage + TelemetryPredicateLayout::kWidth <=
+    TelemetryPredicateLayout::kArgmax);
+static_assert(kTelemetryPosLane > kPartialMaxLane && kTelemetryPageLane < kPartialSumLane,
+              "the probe lanes must sit in the first tail block's dead padding");
+// Positions and pages travel as fp32: exact for every geometry the launch gate admits
+// (contexts and page counts far below 2^24).
+#ifndef ASCEND_TQ_DECODE_TELEMETRY
+#define ASCEND_TQ_DECODE_TELEMETRY 1
+#endif
+
 // Cube decode.
 constexpr uint32_t kCubeTileRows = 64;
 constexpr uint32_t kCubeUnpackRows = 8;

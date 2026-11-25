@@ -24,7 +24,7 @@
 #include <utility>
 
 #include <torch/library.h>
-#include <torch/torch.h>
+#include <ATen/ATen.h>
 
 #include <acl/acl.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
@@ -40,6 +40,7 @@ namespace layout = ::vllm_ascend::turboquant;
 namespace tiling = ::ascend_micro::fused_decode;
 
 constexpr std::int64_t kTokensPerStrip = 16;
+constexpr std::int64_t kChampionTokensPerCore = 6 * kTokensPerStrip;
 
 constexpr std::int64_t kDecodeHeadSize = 256;
 constexpr std::int64_t kDecodeMaxKvHeads = 4;
@@ -279,6 +280,8 @@ void npu_turboquant_reshape_and_cache_a8(at::Tensor &key, at::Tensor &value, at:
     check_strip_slots(slot_mapping, a.num_tokens, op);
 
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    const auto tokens_per_core = a.num_tokens % kChampionTokensPerCore == 0
+        ? kChampionTokensPerCore : kTokensPerStrip;
     launch_turboquant_reshape_and_cache_bf16(
         stream, static_cast<const std::uint16_t *>(key.data_ptr()),
         static_cast<const std::uint16_t *>(value.data_ptr()),
@@ -288,7 +291,7 @@ void npu_turboquant_reshape_and_cache_a8(at::Tensor &key, at::Tensor &value, at:
         static_cast<const std::int32_t *>(tables.data_ptr()), static_cast<std::uint32_t>(a.num_tokens),
         static_cast<std::uint32_t>(a.num_kv_heads), static_cast<std::uint32_t>(a.head_size),
         static_cast<std::uint32_t>(c.block_size), static_cast<std::uint32_t>(c.num_blocks),
-        static_cast<std::uint32_t>(kTokensPerStrip), static_cast<float>(inv_sqrt_len),
+        static_cast<std::uint32_t>(tokens_per_core), static_cast<float>(inv_sqrt_len),
         static_cast<std::uint32_t>(quant_mode));
 }
 

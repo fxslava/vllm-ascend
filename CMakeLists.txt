@@ -169,6 +169,17 @@ if(SOC_VERSION MATCHES "ascend950")
         -DASCEND_MICRO_CANN_LAUNCH
         -DASCEND_TQ_FUSED_DECODE_GEMM_REDUCE=1
         -DTURBOQUANT_INGRESS_NZ=1)
+    # E8 has its own packet ABI and cache-basis query contract. Keep its exact
+    # floating-point flags independent of the native signed-nibble kernels.
+    ascendc_library(vllm_ascend_turboquant_e8 SHARED
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/e8/asc_reader.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/e8/asc_component.cpp)
+    ascendc_compile_definitions(vllm_ascend_turboquant_e8 PRIVATE
+        ASCEND_MICRO_CANN_LAUNCH ENABLE_CV_COMM_VIA_SSBUF=1)
+    ascendc_compile_options(vllm_ascend_turboquant_e8 PRIVATE
+        -std=c++17 -Wall -Wextra -Werror -fno-fast-math -ffp-contract=off
+        -forward-options-to-host-compiler -DASCEND_MICRO_CANN_LAUNCH
+        -DENABLE_CV_COMM_VIA_SSBUF=1)
 endif()
 
 file(GLOB KERNEL_FILES
@@ -217,6 +228,7 @@ endif()
 if(VLLM_ASCEND_BUILD_TURBOQUANT)
     list(APPEND VLLM_ASCEND_SRC
         ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/torch_bindings.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/e8_torch_bindings.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/op_host/turboquant_tiling.cpp)
 endif()
 
@@ -355,7 +367,7 @@ else()
 endif()
 
 if(VLLM_ASCEND_BUILD_TURBOQUANT)
-  target_link_libraries(vllm_ascend_C PUBLIC vllm_ascend_turboquant)
+  target_link_libraries(vllm_ascend_C PUBLIC vllm_ascend_turboquant vllm_ascend_turboquant_e8)
 endif()
 
 target_link_options(vllm_ascend_C PRIVATE "-Wl,-rpath,$ORIGIN:$ORIGIN/lib:$ORIGIN/_cann_ops_custom/vendors/custom_transformer/op_api/lib")
@@ -367,5 +379,5 @@ else()
 endif()
 
 if(VLLM_ASCEND_BUILD_TURBOQUANT)
-  install(TARGETS vllm_ascend_turboquant DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
+  install(TARGETS vllm_ascend_turboquant vllm_ascend_turboquant_e8 DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
 endif()

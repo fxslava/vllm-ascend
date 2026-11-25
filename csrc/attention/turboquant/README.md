@@ -62,9 +62,9 @@ papering over them.
   indices cross strip boundaries, so MTE2 does not drain at the end of a
   16-token strip. The ring periods all divide `kChunks` (static_asserted), so a
   boundary never shifts which slot a chunk owns. The binding still passes
-  `tokens_per_core = 16`; raising it is the knob for a wider share and is
-  deliberately not raised yet, because nothing has measured which width is
-  fastest on the part.
+  six-strip `tokens_per_core = 96` when the batch is a multiple of 96 tokens,
+  and `16` otherwise. This admits the frozen Slot03 metadata-hoist schedule
+  without dropping a partial share or allocating staging buffers.
 * **The fused decode is bf16 only.** The fp16/`half` template instantiations are
   gone, and the dispatch `return`s without launching for any other
   `AscendType`. `torch_bindings.cpp` used to map any non-bf16 query to
@@ -87,6 +87,45 @@ papering over them.
 ## What is not mirrored
 
 * `torch_bindings.cpp` — this repo's own Torch registration, see below.
+
+## Wave-1 / Wave-3 integration (2026-11-25)
+
+The native decoder uses the verified Wave-v11 paired schedule and register
+softmax. Its telemetry closure is restored together with the shared UB and
+GEMM-reducer budgets; it reuses dead query/workspace storage. The batch writer
+uses only frozen Slot03's scalar metadata hoist. Existing wide cache offsets
+are preserved. Tensor API names match the nondeprecated CANN 9.2.1 API.
+
+`e8/` contains the sealed Wave-3 decoder source and independent frozen CPU
+oracles. `asc_reader.cpp` and `asc_component.cpp` provide ASC host entry
+definitions while including the sealed device sources unchanged. Diagnostic
+exceptions cover only CANN-generated unused parameters in host entry stubs.
+
+The separate `turboquant_e8_ops.reader` and `.dequant` registrations use
+caller-owned buffers. `vllm_ascend.attention.turboquant_e8` supplies matching
+Python calls and CPU packet/offset preparation helpers. Load the extension
+before replay using the existing `load_turboquant_extension()` bootstrap.
+Output/witness buffers must be disjoint. Runtime wrappers allocate no tensors.
+
+E8 planes are UINT8 `[packets, 4352]`: bytes 0..4095 hold 2048 little-endian
+UINT16 labels (16 bits per eight coordinates); bytes 4096..4351 hold 64 FP32
+scales. The K stride of 1056 bytes is internal UB padding. Offset tables use
+INT64 byte offsets prepared from validated packet IDs, padded to four entries
+for each 32-byte DMA burst. They are distinct from native INT32 block tables
+and slot mappings, signed-nibble INT8 planes and separate FP32 scale planes.
+
+The reader supports one KV task, six FP32 query heads in cache basis padded
+to `[16, 256]` with rows 6..15 zero, an even 4..256 tiles, and a 1..64-row
+tail. BF16 output remains in cache basis. K/V BF16 witnesses and raw FP32 score
+witnesses remain mandatory, preallocated parts of the verified ABI. Raw-query
+composition and automatic E8 selection in the native attention backend remain
+gated by the unverified encoder. No Wave-2/Wave-3 reshape mutant or encoder is
+promoted. The measured ticks are historical CAModel results, not new hardware
+measurements or a speedup guarantee for this integration.
+
+See `reports/wave_champions_20261125/REPORT.md` at the repository root for source
+seals, ABI verification, exact host commands and the remaining dependency and
+hardware gates. No full device plugin build or device execution was attempted.
 
 `op_kernel/common/turboquant_layout.h` is mirrored **in full** now, including the
 four ingress helpers `NzTiledChannelByte`, `NzTiledChannelNibble`,

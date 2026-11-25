@@ -39,7 +39,15 @@ from pathlib import Path
 
 import pytest
 
-GATES = ("test_contract_gates", "test_layout_bridge", "test_cache_addresses", "test_decode_reduce")
+GATES = (
+    "test_contract_gates",
+    "test_layout_bridge",
+    "test_cache_addresses",
+    "test_decode_reduce",
+    "e8_decode_cpu_check",
+    "e8_layout_check",
+    "test_launch_abi",
+)
 
 # `turboquant_reshape_batch.cpp` is included by test_contract_gates.cpp: its
 # device body sits behind `#if defined(__CCE_AICORE__)`, so a host compiler sees
@@ -66,10 +74,27 @@ def gate_binaries(tmp_path_factory):
     binaries = {}
     for gate in GATES:
         source = root / "tests" / "ut" / "ops" / "turboquant" / f"{gate}.cpp"
+        if gate.startswith("e8_"):
+            source = root / "csrc/attention/turboquant/e8" / f"{gate.removeprefix('e8_')}.cpp"
+        elif gate == "test_launch_abi":
+            source = root / "tests/host/turboquant/abi.cpp"
         extra = [str(root / name) for name in EXTRA_SOURCES.get(gate, ())]
         binary = out / gate
         result = subprocess.run(
-            [compiler, *COMPILE_FLAGS, "-I", str(root), str(source), *extra, "-o", str(binary)],
+            [
+                compiler,
+                *COMPILE_FLAGS,
+                "-fno-fast-math",
+                "-ffp-contract=off",
+                "-I",
+                str(root),
+                "-isystem",
+                str(root / "csrc/attention/turboquant/e8/frozen"),
+                str(source),
+                *extra,
+                "-o",
+                str(binary),
+            ],
             capture_output=True,
             text=True,
         )

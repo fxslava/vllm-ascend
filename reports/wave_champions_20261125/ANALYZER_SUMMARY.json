@@ -1,0 +1,272 @@
+{
+  "decode": {
+    "verified_summary": {
+      "fatal": 2898,
+      "warning": 124,
+      "info": 0,
+      "total": 3022,
+      "by_code": {
+        "AKA1004": 2843,
+        "AKA1009": 54,
+        "AKA2010": 3,
+        "AKA3001": 5,
+        "AKA3002": 36,
+        "AKA3010": 24,
+        "AKA3504": 55,
+        "AKA9001": 2
+      }
+    },
+    "integrated_summary": {
+      "fatal": 2896,
+      "warning": 123,
+      "info": 0,
+      "total": 3019,
+      "by_code": {
+        "AKA1004": 2841,
+        "AKA1009": 54,
+        "AKA2010": 3,
+        "AKA3001": 5,
+        "AKA3002": 35,
+        "AKA3010": 24,
+        "AKA3504": 55,
+        "AKA9001": 2
+      }
+    },
+    "new": [],
+    "resolved_occurrences": 3,
+    "source_sha256": [
+      "955d73a5f6ee157bf11bcff2d05863343aa06ee1cf0b04da053ec92cbf8e915d",
+      "d39d78ded98770fde660a69a142f9adce1c0e4a5a6dc0d286c71872f7dc70439"
+    ],
+    "normalization": "location and embedded '(line N)' only; no categories suppressed"
+  },
+  "vector": {
+    "verified_summary": {
+      "fatal": 1359,
+      "warning": 54,
+      "info": 0,
+      "total": 1413,
+      "by_code": {
+        "AKA1004": 1335,
+        "AKA1009": 16,
+        "AKA2010": 2,
+        "AKA3001": 2,
+        "AKA3002": 26,
+        "AKA3010": 6,
+        "AKA3504": 24,
+        "AKA9001": 2
+      }
+    },
+    "integrated_summary": {
+      "fatal": 1359,
+      "warning": 54,
+      "info": 0,
+      "total": 1413,
+      "by_code": {
+        "AKA1004": 1335,
+        "AKA1009": 16,
+        "AKA2010": 2,
+        "AKA3001": 2,
+        "AKA3002": 26,
+        "AKA3010": 6,
+        "AKA3504": 24,
+        "AKA9001": 2
+      }
+    },
+    "new": [],
+    "resolved_occurrences": 0,
+    "source_sha256": [
+      "69768195f747dbd785561986397e3164b75019fcb59fcc0bb88401ae4a0e1e88",
+      "e6f6f62b070ff1e8180b4c6f8b706384a740d890549fc69f9c3aa8f03f73fb13"
+    ],
+    "normalization": "location and embedded '(line N)' only; no categories suppressed"
+  },
+  "softmax": {
+    "verified_summary": {
+      "fatal": 85,
+      "warning": 3,
+      "info": 0,
+      "total": 88,
+      "by_code": {
+        "AKA1004": 85,
+        "AKA1009": 3
+      }
+    },
+    "integrated_summary": {
+      "fatal": 85,
+      "warning": 3,
+      "info": 0,
+      "total": 88,
+      "by_code": {
+        "AKA1004": 85,
+        "AKA1009": 3
+      }
+    },
+    "new": [],
+    "resolved_occurrences": 0,
+    "source_sha256": [
+      "728e0cfc6314c808c07aa9e74308557ef6cb8aaabeff5c05338926aadabd9baf",
+      "9eef504a57ffe3cb8dcb78d7c03c5ad2a25324320dbc1747d16c5ae9d938a66c"
+    ],
+    "normalization": "location and embedded '(line N)' only; no categories suppressed"
+  },
+  "reshape": {
+    "verified_summary": {
+      "fatal": 43,
+      "warning": 20,
+      "info": 1,
+      "total": 64,
+      "by_code": {
+        "AKA1004": 41,
+        "AKA2005": 2,
+        "AKA3002": 10,
+        "AKA3010": 10,
+        "AKA3012": 1
+      }
+    },
+    "integrated_summary": {
+      "fatal": 43,
+      "warning": 20,
+      "info": 1,
+      "total": 64,
+      "by_code": {
+        "AKA1004": 41,
+        "AKA2005": 2,
+        "AKA3002": 10,
+        "AKA3010": 10,
+        "AKA3012": 1
+      }
+    },
+    "new": [],
+    "resolved_occurrences": 0,
+    "source_sha256": [
+      "bcbdcc866230bc72bf47ba3ec4fd025e5a063cd9333a58ee558f37e2924e89ad",
+      "d6e33389b69bc93462dc25c0e3a79db6d82706e4fcdae1c01121ce8eaa4a29e2"
+    ],
+    "normalization": "location and embedded '(line N)' only; no categories suppressed"
+  },
+  "scatter": {
+    "verified_summary": {
+      "fatal": 173,
+      "warning": 6,
+      "info": 0,
+      "total": 179,
+      "by_code": {
+        "AKA1004": 168,
+        "AKA2005": 5,
+        "AKA3002": 6
+      }
+    },
+    "integrated_summary": {
+      "fatal": 173,
+      "warning": 6,
+      "info": 0,
+      "total": 179,
+      "by_code": {
+        "AKA1004": 168,
+        "AKA2005": 5,
+        "AKA3002": 6
+      }
+    },
+    "new": [],
+    "resolved_occurrences": 0,
+    "source_sha256": [
+      "e00991d4f8b94b373ce3e571bb05f9d557a3c1573fb5deeb5ac7733b94d27dda",
+      "cd458c0898c0a56065fc248633f016bd1f73810f2e7f39e7973c31c2158f8c65"
+    ],
+    "normalization": "location and embedded '(line N)' only; no categories suppressed"
+  },
+  "e8_reader": {
+    "verified_summary": {
+      "fatal": 34,
+      "warning": 3,
+      "info": 3,
+      "total": 40,
+      "by_code": {
+        "AKA1004": 34,
+        "AKA2010": 1,
+        "AKA3002": 2,
+        "AKA3009": 1,
+        "AKA9001": 2
+      }
+    },
+    "integrated_summary": {
+      "fatal": 34,
+      "warning": 3,
+      "info": 3,
+      "total": 40,
+      "by_code": {
+        "AKA1004": 34,
+        "AKA2010": 1,
+        "AKA3002": 2,
+        "AKA3009": 1,
+        "AKA9001": 2
+      }
+    },
+    "new": [],
+    "resolved_occurrences": 0,
+    "source_sha256": [
+      "e5fdf887471664c8930079fb891303094b91486adc8334b050a5648a3b407a38",
+      "e5fdf887471664c8930079fb891303094b91486adc8334b050a5648a3b407a38"
+    ],
+    "normalization": "location and embedded '(line N)' only; no categories suppressed"
+  },
+  "e8_component": {
+    "verified_summary": {
+      "fatal": 0,
+      "warning": 0,
+      "info": 0,
+      "total": 0,
+      "by_code": {}
+    },
+    "integrated_summary": {
+      "fatal": 0,
+      "warning": 0,
+      "info": 0,
+      "total": 0,
+      "by_code": {}
+    },
+    "new": [],
+    "resolved_occurrences": 0,
+    "source_sha256": [
+      "47ff8c5c19bb5f532a7f86484cc9826837511edf7e2a459bcdaa08341d7dc789",
+      "47ff8c5c19bb5f532a7f86484cc9826837511edf7e2a459bcdaa08341d7dc789"
+    ],
+    "normalization": "location and embedded '(line N)' only; no categories suppressed"
+  },
+  "reshape_nz": {
+    "verified_summary": {
+      "fatal": 33,
+      "warning": 20,
+      "info": 3,
+      "total": 56,
+      "by_code": {
+        "AKA1004": 31,
+        "AKA2005": 2,
+        "AKA3002": 10,
+        "AKA3010": 10,
+        "AKA3012": 3
+      }
+    },
+    "integrated_summary": {
+      "fatal": 33,
+      "warning": 20,
+      "info": 3,
+      "total": 56,
+      "by_code": {
+        "AKA1004": 31,
+        "AKA2005": 2,
+        "AKA3002": 10,
+        "AKA3010": 10,
+        "AKA3012": 3
+      }
+    },
+    "new": [],
+    "resolved_occurrences": 0,
+    "source_sha256": [
+      "df9673e8ad78739817ca1fea7a7751643c40d8614aba0344c8e213ccba089440",
+      "b6f9aa5aeabbf3d3788de940111f07d7eaf25004c142875d7233a96e2ac43b58"
+    ],
+    "normalization": "location and embedded '(line N)' only; no categories suppressed"
+  }
+}

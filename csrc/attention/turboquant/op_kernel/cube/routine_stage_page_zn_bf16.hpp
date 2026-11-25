@@ -81,7 +81,7 @@ constexpr std::uint32_t Bf16NzBlockIndex(std::uint32_t dim, std::uint32_t r,
 // GM -> L1, ND -> Nz, one strided burst. `row_pitch` is the activation block's
 // full channel count, so the copy reads the headSize-wide window of one head
 // out of a token-major row; that window is not the whole row, which is why the
-// source is a pattern layout and not MakeFrameLayout's NDExt, whose row pitch
+// source is a pattern layout and not make_frame_layout's NDExt, whose row pitch
 // is pinned to the column count.
 //
 // Unchanged from the 8-bit kernel on purpose: the page's Nz image is already
@@ -93,20 +93,20 @@ __aicore__ inline void stage_page_nz(__gm__ const bfloat16_t* src,
                                      std::uint32_t l1_byte_base,
                                      std::uint32_t row_pitch)
 {
-    using namespace AscendC::Te;
+    using namespace asc::te;
     static_assert(Tokens % kBf16C0 == 0u, "a page must be a whole number of Nz rows");
     static_assert(Channels % kBf16C0 == 0u, "a page must be a whole number of fractals");
 
     auto* dst_ptr = reinterpret_cast<__cbuf__ bfloat16_t*>(l1_byte_base);
-    auto shape = MakeShape(MakeShape(_1{}, Tokens), MakeShape(_1{}, Channels));
-    auto stride = MakeStride(MakeStride(_0{}, row_pitch), MakeStride(_0{}, _1{}));
-    auto s = MakeTensor(
-        MakeMemPtr(const_cast<__gm__ bfloat16_t*>(src)),
-        MakePatternLayout<NDExtLayoutPtn,
-                          LayoutTrait<AscendC::Std::ignore_t, _1>>(shape, stride));
-    auto d = MakeTensor(MakeMemPtr(dst_ptr),
-                        MakeFrameLayout<NZLayoutPtn, bfloat16_t>(Tokens, Channels));
-    Copy(MakeCopy(CopyGM2L1{}), d, s);
+    auto shape = make_shape(make_shape(_1{}, Tokens), make_shape(_1{}, Channels));
+    auto stride = make_stride(make_stride(_0{}, row_pitch), make_stride(_0{}, _1{}));
+    auto s = make_tensor(
+        make_mem_ptr(const_cast<__gm__ bfloat16_t*>(src)),
+        make_pattern_layout<nd_ext_layout_ptn,
+                          layout_trait<AscendC::Std::ignore_t, _1>>(shape, stride));
+    auto d = make_tensor(make_mem_ptr(dst_ptr),
+                        make_frame_layout<nz_layout_ptn, bfloat16_t>(Tokens, Channels));
+    copy(make_copy(copy_gm_to_l1{}), d, s);
 }
 
 // -------------------------------------------------- the resident block blob
@@ -115,7 +115,7 @@ __aicore__ inline void stage_page_nz(__gm__ const bfloat16_t* src,
 // it, so only the bytes inside a block move and every downstream base address
 // is unchanged.
 //
-// One Copy per block rather than one batched Copy over all of them. The
+// One copy per block rather than one batched copy over all of them. The
 // batched form describes the blob as (B, (Dim, Dim)) and derives the
 // destination spacing as "one cube after alignment", which happens to equal
 // Dim*Dim*2 here but is a derived quantity rather than a stated one. The
@@ -125,15 +125,15 @@ template <std::uint32_t Dim, std::uint32_t B>
 __aicore__ inline void StageBlockNz(__gm__ const bfloat16_t* src,
                                     std::uint32_t l1_byte_base)
 {
-    using namespace AscendC::Te;
+    using namespace asc::te;
     constexpr std::uint32_t elems = Dim * Dim;
     auto* d_ptr = reinterpret_cast<__cbuf__ bfloat16_t*>(
         l1_byte_base + B * elems * kBf16ElemBytes);
-    auto s = MakeTensor(MakeMemPtr(const_cast<__gm__ bfloat16_t*>(src) + B * elems),
-                        MakeFrameLayout<NDExtLayoutPtn>(Dim, Dim));
-    auto d = MakeTensor(MakeMemPtr(d_ptr),
-                        MakeFrameLayout<NZLayoutPtn, bfloat16_t>(Dim, Dim));
-    Copy(MakeCopy(CopyGM2L1{}), d, s);
+    auto s = make_tensor(make_mem_ptr(const_cast<__gm__ bfloat16_t*>(src) + B * elems),
+                        make_frame_layout<nd_ext_layout_ptn>(Dim, Dim));
+    auto d = make_tensor(make_mem_ptr(d_ptr),
+                        make_frame_layout<nz_layout_ptn, bfloat16_t>(Dim, Dim));
+    copy(make_copy(copy_gm_to_l1{}), d, s);
 }
 
 template <std::uint32_t Dim, std::uint32_t... Bs>
@@ -162,13 +162,13 @@ template <std::uint32_t Blocks, std::uint32_t Dim>
 __aicore__ inline void stage_blocks_flat(__gm__ const bfloat16_t* src,
                                          std::uint32_t l1_byte_base)
 {
-    using namespace AscendC::Te;
+    using namespace asc::te;
     constexpr std::uint32_t rows = Blocks * Dim;
     auto* d_ptr = reinterpret_cast<__cbuf__ bfloat16_t*>(l1_byte_base);
-    auto s = MakeTensor(MakeMemPtr(const_cast<__gm__ bfloat16_t*>(src)),
-                        MakeFrameLayout<NDExtLayoutPtn>(rows, Dim));
-    auto d = MakeTensor(MakeMemPtr(d_ptr), MakeFrameLayout<NDExtLayoutPtn>(rows, Dim));
-    Copy(MakeCopy(CopyGM2L1{}), d, s);
+    auto s = make_tensor(make_mem_ptr(const_cast<__gm__ bfloat16_t*>(src)),
+                        make_frame_layout<nd_ext_layout_ptn>(rows, Dim));
+    auto d = make_tensor(make_mem_ptr(d_ptr), make_frame_layout<nd_ext_layout_ptn>(rows, Dim));
+    copy(make_copy(copy_gm_to_l1{}), d, s);
 }
 
 #endif  // __CCE_AICORE__

@@ -39,7 +39,7 @@ constexpr bool aligned_allocations()
 static_assert(aligned_allocations());
 static_assert((8192 + 32) / 32 % 16 != 0, "packed slots must use different banks");
 static_assert((2048 + 32) / 32 % 16 != 0, "scale slots must use different banks");
-constexpr std::uint32_t kUbEnd = ub_end();
+constexpr std::uint32_t kUbEnd = ub_end() + 32;
 
 // The attention phase's transient pool: kUbSizes[15..17], which are the tile ingest's NZ
 // staging operand, the per-task online-softmax accumulator and the query staging. The vector
@@ -74,7 +74,7 @@ static_assert(kUbEnd + kBasisUbBytes + kReducerUbBytes + 256 <= 192 * 1024,
 // the host gate that compiles it must not see production's -Wextra warnings. Pin the
 // restatement here so a change on either side is a compile error rather than a silent drift in
 // the number that decides whether that reduction can be enabled.
-static_assert(kUbEnd == 142304 && kBasisUbBytes == 46432 && kReducerUbBytes == 3360,
+static_assert(kUbEnd == 142336 && kBasisUbBytes == 46432 && kReducerUbBytes == 3360,
     "turboquant_gemm_reduce.hpp restates these; update kOperatorUbEndBytes, "
     "kOperatorBasisUbBytes and kVectorReducerUbBytes there to match");
 static_assert(16 * 256 + 16 * 64 + 2 * kSlots * 64 * 256 <= 512 * 1024);

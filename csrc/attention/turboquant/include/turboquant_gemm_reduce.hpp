@@ -553,7 +553,7 @@ static_assert(kGemmReducerUbBytes == 27264, "the batched reducer's UB claim, pin
 // header static_asserts the restatement against its own constants, so a change on either side
 // is a compile error and not a drift.
 constexpr std::uint32_t kUbWindowBytes = 192 * 1024;              // 196608
-constexpr std::uint32_t kOperatorUbEndBytes = 142304;             // kUbEnd
+constexpr std::uint32_t kOperatorUbEndBytes = 142336;             // kUbEnd
 constexpr std::uint32_t kOperatorBasisUbBytes = 46432;            // kBasisUbBytes
 constexpr std::uint32_t kVectorReducerUbBytes = 3360;             // kReducerUbBytes
 constexpr std::uint32_t kUbReadPadBytes = 256;                    // never payload
@@ -562,16 +562,16 @@ constexpr std::uint32_t kOperatorUbClaimBytes =
 static_assert(kOperatorUbClaimBytes <= kUbWindowBytes, "the operator's own UB assert, restated");
 // What is left once the attention phase, the basis and the read pad are paid for.
 constexpr std::uint32_t kOperatorUbHeadroomBytes = kUbWindowBytes - kOperatorUbClaimBytes;
-static_assert(kOperatorUbHeadroomBytes == 4256, "headroom, pinned so a change is visible");
+static_assert(kOperatorUbHeadroomBytes == 4224, "headroom, pinned so a change is visible");
 // The batched reducer REPLACES the vector reducer, so the net cost is the difference.
 constexpr std::uint32_t kGemmReducerNetUbBytes =
     kGemmReducerUbBytes - kVectorReducerUbBytes;  // 23904
 constexpr std::uint32_t kGemmReducerUbDeficitBytes =
-    kGemmReducerNetUbBytes - kOperatorUbHeadroomBytes;  // 19648
+    kGemmReducerNetUbBytes - kOperatorUbHeadroomBytes;  // 19680
 static_assert(kGemmReducerNetUbBytes > kOperatorUbHeadroomBytes,
               "the deficit is what the overlay below exists for; if this ever fails the "
               "reducer fits the leftover headroom and the overlay can be dropped");
-static_assert(kGemmReducerUbDeficitBytes == 19648, "the deficit, pinned");
+static_assert(kGemmReducerUbDeficitBytes == 19680, "the deficit, pinned");
 
 // THE OVERLAY, which is the way out that was taken.
 //
@@ -614,7 +614,7 @@ static_assert(kGemmSharedPoolSpareBytes == 5504, "spare in the pool, pinned");
 //      net, inside even the leftover headroom -- but a single slot removes the Cube/AIV panel
 //      overlap, which is most of what the form buys.
 //   2. A smaller kGemmBatchRows. This does NOT work as a way to fit the leftover headroom: at
-//      8 rows the net cost is still 11616 bytes and at 4 rows 5472, both over 4256, and M = 4
+//      8 rows the net cost is still 11616 bytes and at 4 rows 5472, both over 4224, and M = 4
 //      gives up the dense line. It would shrink the pool requirement, though.
 constexpr std::uint32_t kGemmUbBytes = kGemmReducerUbBytes;
 static_assert(kGemmUbBytes + kUbReadPadBytes <= kUbWindowBytes,

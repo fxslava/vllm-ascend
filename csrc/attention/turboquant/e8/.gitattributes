@@ -1,0 +1,12 @@
+# Preserve the sealed packet's byte identities across Windows/Linux checkouts.
+decode_cpu_check.cpp -text
+e8_decode.hpp -text
+e8_fused_decode.cpp -text whitespace=-blank-at-eof
+e8_packet_layout.hpp -text whitespace=cr-at-eol
+e8_parallel_decode.hpp -text
+frozen/routine_e8_bf16_dequant_simt.hpp -text
+frozen/routine_e8_int8_dequant_simt.hpp -text
+layout_check.cpp -text whitespace=cr-at-eol
+parallel_component.cpp -text
+routines/routine_e8_bf16_dequant_simt.hpp -text
+routines/routine_e8_int8_dequant_simt.hpp -text

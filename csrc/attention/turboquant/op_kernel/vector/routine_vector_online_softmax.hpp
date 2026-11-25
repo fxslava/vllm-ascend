@@ -44,6 +44,22 @@ ASCEND_MICRO_ONLINE_INLINE void vector_online_softmax(Engine& engine)
     engine.update_accumulator();
 }
 
+// The telemetry-probed form of the Cube-backed recurrence: the argmax probe runs against the
+// tile's finished logits -- after update_max_and_alpha, while tile_max and the PRE-commit
+// run_max are both live -- and before exponentiate_scores overwrites them. It adds no GM
+// traffic and no events, so it keeps leaf-routine purity; with ASCEND_TQ_DECODE_TELEMETRY
+// compiled out the phase is an empty call and this routine collapses back to the three-phase
+// one. The phase ORDER is the contract, and tests/cpu/test_contract_gates.cpp audits it with a
+// duck-typed recorder exactly like the unprobed orders above.
+template <class Engine>
+ASCEND_MICRO_ONLINE_INLINE void vector_online_softmax_probabilities_probed(Engine& engine)
+{
+    engine.update_max_and_alpha();
+    engine.argmax_probe();
+    engine.exponentiate_scores();
+    engine.update_denominator();
+}
+
 // Split-K merge, phase for phase like the recurrence above. A token whose context exceeds the
 // fused limit leaves one [accumulator, run_max, run_sum] partial per split; merging two of them
 // is one online-softmax step with both sides weighted.
