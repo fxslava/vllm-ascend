@@ -82,6 +82,19 @@ def _load_class(filename, class_name, method_names, namespace):
     return type(class_name, (), {name: namespace[name] for name in method_names})
 
 
+def _load_functions(filename, function_names, namespace):
+    """Load production layout helpers without importing device dependencies."""
+    source = REPO / filename
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in function_names]
+    assert {function.name for function in functions} == set(function_names)
+    module = ast.Module(
+        body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *functions],
+        type_ignores=[],
+    )
+    exec(compile(ast.fix_missing_locations(module), str(source), "exec"), namespace)
+
+
 @pytest.fixture(params=[896, 1024, 2048])
 def hybrid_pool(request):
     block_size = request.param
@@ -135,6 +148,7 @@ def hybrid_pool(request):
         "maybe_apply_startup_plan": lambda _: None,
         "GiB_bytes": 1024**3,
     }
+    _load_functions("vllm_ascend/worker/utils.py", ("row_major_strides", "make_page_strided_cache_view"), namespace)
     runner_cls = _load_class(
         "vllm_ascend/worker/model_runner_v1.py",
         "NPUModelRunner",
