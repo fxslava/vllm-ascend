@@ -78,14 +78,6 @@ def _helpers():
     return turboquant
 
 
-def _set_decode_splits(monkeypatch, splits):
-    # The adapter reads its defining module's constant, not the entry point's
-    # re-export. Patching turboquant_v1 leaves the launch at eight splits.
-    from vllm_ascend.attention import turboquant_ops
-
-    monkeypatch.setattr(turboquant_ops, "TURBOQUANT_DECODE_SPLITS", splits)
-
-
 def _require_ops(*names):
     backend = _backend()
     backend.load_turboquant_extension()
@@ -123,6 +115,22 @@ def _compare(actual, expected, *, writer_reference=False, poison_mask=None):
 
 def _clone_cache(cache):
     return tuple(plane.clone() for plane in cache)
+
+
+def _kernel_decode_inputs(cache, tables, kernel_block_size):
+    """View scheduler pages as the expanded kernel pages used by the runner."""
+    num_blocks, block_size, heads, packed_bytes = cache[0].shape
+    assert block_size % kernel_block_size == 0
+    ratio = block_size // kernel_block_size
+    packed_shape = (num_blocks * ratio, kernel_block_size, heads, packed_bytes)
+    views = (
+        cache[0].view(packed_shape),
+        cache[1].view(packed_shape),
+        cache[2].view(cache[2].shape[0], num_blocks * ratio, heads, kernel_block_size),
+    )
+    offsets = torch.arange(ratio, dtype=tables.dtype, device=tables.device)
+    expanded = (tables.unsqueeze(-1) * ratio + offsets).flatten(1).contiguous()
+    return views, expanded
 
 
 @requires_npu
@@ -352,7 +360,16 @@ def _assert_attention_close(tag, got, expected, context):
 
 
 def _launch_serving_decode(
-    adapter, emulator, caches, block_tables, contexts, query, buffers, fused_context_limit=FUSED_CONTEXT_LIMIT
+    adapter,
+    emulator,
+    caches,
+    block_tables,
+    contexts,
+    query,
+    buffers,
+    fused_context_limit=FUSED_CONTEXT_LIMIT,
+    *,
+    splits,
 ):
     output = torch.full_like(query, float("nan"))
     for buffer in buffers[1:]:
@@ -373,6 +390,7 @@ def _launch_serving_decode(
         workspace=buffers[1],
         query_rot=buffers[2],
         fused_context_limit=fused_context_limit,
+        num_splits=splits,
     )
     assert fused is not None, "the registered decode kernel must run, not fall back"
     return output.cpu()
@@ -469,6 +487,9 @@ class TestPrefillDecode:
             pytest.param("batch", "random", 128, (136, 383), id="batch-random-mixed"),
             pytest.param("batch", "random", 256, (257, 511), id="batch-random-page-tail"),
             pytest.param("batch", "random", 1024, (257,), id="batch-random-large-page"),
+            pytest.param("batch", "random-expanded", 1024, (2047,), id="batch-cross-third-physical-page"),
+            pytest.param("batch", "random-expanded", 1024, (2049, 2177), id="batch-third-physical-page-B2"),
+            pytest.param("batch", "random", 1024, (2049,), id="batch-third-direct-page"),
             pytest.param("scatter", "random", 128, (136, 383), id="scatter-random-mixed"),
             pytest.param("batch", "zero-live-spike", 128, (63,), id="zero-live-spike-fused"),
             pytest.param("batch", "zero-live-spike", 128, (136, 257), id="zero-live-spike-split"),
@@ -476,9 +497,7 @@ class TestPrefillDecode:
             pytest.param("batch", "constant-live-spike", 128, (136, 257), id="constant-live-spike-split"),
         ],
     )
-    def test_recycled_pages_mask_prefill_tail_through_first_decode_steps(
-        self, writer, payload, block_size, contexts, monkeypatch
-    ):
+    def test_recycled_pages_mask_prefill_tail_through_first_decode_steps(self, writer, payload, block_size, contexts):
         """Ragged prefill -> immediate attention -> two KV appends and decode.
 
         Separate writer/tail assertions precede the mask check. A sanitized
@@ -491,6 +510,8 @@ class TestPrefillDecode:
         """
         _require_ops(PREFILL_OP if writer == "batch" else SCATTER_OP, SCATTER_OP, FUSED_DECODE_OP, BUILD_TILING_OP)
         backend, helpers = _backend(), _helpers()
+        decode_block_size = backend.TURBOQUANT_KERNEL_BLOCK_SIZE if payload == "random-expanded" else block_size
+        kernel_blocks_per_page = block_size // decode_block_size
         finite_spikes = payload.endswith("-spike")
         tables_host, num_blocks = helpers.make_recycled_page_table(contexts, block_size)
         tables = tables_host.to(DEVICE)
@@ -594,8 +615,9 @@ class TestPrefillDecode:
                 )
             snapshots = (_clone_cache(cache), _clone_cache(golden_cache))
             for splits in PREFILL_SPLITS if step == 0 else APPEND_SPLITS:
-                _set_decode_splits(monkeypatch, splits)
-                buffers = _build_decode_tiling(contexts, block_size, tables.shape[1], splits)
+                buffers = _build_decode_tiling(
+                    contexts, decode_block_size, tables.shape[1] * kernel_blocks_per_page, splits
+                )
                 variants = [("poisoned-tail", cache, tables, contexts, False)]
                 if step == 0 and splits in (1, 3):
                     variants.insert(0, ("sanitized-tail", sanitized, tables, contexts, False))
@@ -610,12 +632,16 @@ class TestPrefillDecode:
                         ]
                     )
                 for name, source, table, lengths, fault in variants:
+                    if kernel_blocks_per_page > 1:
+                        source, table = _kernel_decode_inputs(source, table, decode_block_size)
                     launch_buffers = (
                         buffers
                         if lengths == contexts
-                        else _build_decode_tiling(lengths, block_size, tables.shape[1], splits)
+                        else _build_decode_tiling(lengths, decode_block_size, table.shape[1], splits)
                     )
-                    output = _launch_serving_decode(decode, emulator, source, table, lengths, query, launch_buffers)
+                    output = _launch_serving_decode(
+                        decode, emulator, source, table, lengths, query, launch_buffers, splits=splits
+                    )
                     for request, context in enumerate(contexts):
                         tag = f"{writer}/{payload}/{phase}/{name}: block={block_size} S={splits} request={request}"
                         if fault:
@@ -651,7 +677,7 @@ class TestPrefillDecode:
         pytest.param((65, 257, 513), 0, "live-spike", id="B3-fused-live-spike"),
     ],
 )
-def test_cross_request_poison_cannot_change_clean_siblings(contexts, poison_request, profile, monkeypatch):
+def test_cross_request_poison_cannot_change_clean_siblings(contexts, poison_request, profile):
     """One hostile request, clean random/zero siblings, and NaN launch scratch.
 
     Poisoned requests have no defined non-finite output contract: FP8 casts can
@@ -726,9 +752,8 @@ def test_cross_request_poison_cannot_change_clean_siblings(contexts, poison_requ
     snapshot = _clone_cache(cache)
     decode = _adapter(backend.TurboQuantKernelStage.DECODE)
     for splits in PREFILL_SPLITS:
-        _set_decode_splits(monkeypatch, splits)
         buffers = _build_decode_tiling(contexts, block_size, tables.shape[1], splits)
-        output = _launch_serving_decode(decode, emulator, cache, tables, contexts, query, buffers)
+        output = _launch_serving_decode(decode, emulator, cache, tables, contexts, query, buffers, splits=splits)
         for request in clean_requests:
             tag = f"cross-request/{profile}: B={len(contexts)} S={splits} poison={poison_request} request={request}"
             _assert_attention_close(tag, output[request : request + 1], expected[request], contexts[request])

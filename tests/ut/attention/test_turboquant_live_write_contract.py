@@ -62,14 +62,16 @@ def test_launch_repoisons_scratch_and_shares_builder_threshold(monkeypatch, thre
     adapter = SimpleNamespace(fused_decode=decode)
     # The second call verifies stale finite scratch is poisoned again, not only allocated as NaN.
     for _ in range(2):
-        output = live._launch_serving_decode(adapter, None, (None,) * 3, None, contexts, query, buffers, threshold)
+        output = live._launch_serving_decode(
+            adapter, None, (None,) * 3, None, contexts, query, buffers, threshold, splits=3
+        )
         assert (output == 0).all()
 
 
 @pytest.mark.parametrize("batch", [1, 2, 3, 9])
 @pytest.mark.parametrize("splits", [1, 2, 3, 8])
 def test_live_tiling_and_adapter_launch_use_the_same_split_geometry(monkeypatch, batch, splits):
-    """Exercise the real adapter: re-export patches used to leave it at S=8."""
+    """Explicit split counts must reach the real adapter and the operator."""
     monkeypatch.setattr(live, "DEVICE", torch.device("cpu"))
     backend = live._backend()
     # Independent statement of decode_launch_split and its descriptor ABI for
@@ -114,14 +116,13 @@ def test_live_tiling_and_adapter_launch_use_the_same_split_geometry(monkeypatch,
 
     register_ops(monkeypatch, **{live.BUILD_TILING_OP: build_tiling, live.FUSED_DECODE_OP: fused_decode})
     live._require_ops(live.BUILD_TILING_OP, live.FUSED_DECODE_OP)
-    live._set_decode_splits(monkeypatch, splits)
     buffers = live._build_decode_tiling(contexts, 128, 1, splits)
     adapter = live._adapter(backend.TurboQuantKernelStage.DECODE)
     emulator = backend.TurboQuantEmulator(head_size=live.HEAD_SIZE, device=live.DEVICE)
     cache = live._caches(128, num_blocks=1)
     query = torch.ones(batch, live.NUM_HEADS, live.HEAD_SIZE, dtype=torch.bfloat16)
     tables = torch.zeros(batch, 1, dtype=torch.int32)
-    output = live._launch_serving_decode(adapter, emulator, cache, tables, contexts, query, buffers)
+    output = live._launch_serving_decode(adapter, emulator, cache, tables, contexts, query, buffers, splits=splits)
     assert (output == 0).all()
     assert calls == ["build", "decode"]
 
@@ -160,3 +161,29 @@ def test_live_adapter_calls_match_current_python_signatures():
         arguments = [None for argument in node.args for _ in range(3 if isinstance(argument, ast.Starred) else 1)]
         keywords = {keyword.arg: None for keyword in node.keywords}
         inspect.signature(getattr(adapter_cls, node.func.attr)).bind(None, *arguments, **keywords)
+
+
+@pytest.mark.parametrize("context", [2047, 2048, 2049, 2177])
+def test_third_physical_page_matches_expanded_kernel_gather(monkeypatch, context):
+    monkeypatch.setattr(live, "DEVICE", torch.device("cpu"))
+    cache = live._caches(1024, num_blocks=3)
+    for page in range(3):
+        for index, plane in enumerate(cache[:2]):
+            plane[page].fill_(page + index + 1)
+        cache[2].view(3, -1)[page].fill_(page + 1.25)
+    tables = torch.tensor([[2, 0, 1]], dtype=torch.int32)
+    kernel_cache, kernel_tables = live._kernel_decode_inputs(cache, tables, 128)
+    assert kernel_tables.tolist() == [[*range(16, 24), *range(8), *range(8, 16)]]
+    assert kernel_cache[0].shape[:2] == (24, 128)
+    for original, view in zip(cache, kernel_cache):
+        assert original.data_ptr() == view.data_ptr()
+    adapter = live._adapter()
+    physical = adapter.gather(*cache, tables)
+    expanded = adapter.gather(*kernel_cache, kernel_tables)
+    for actual, expected in zip(expanded, physical):
+        torch.testing.assert_close(actual[:, :context], expected[:, :context], rtol=0, atol=0)
+    # The third logical scheduler page is physical page 1, at kernel page 8.
+    position = context - 1
+    expected_slot = int(tables[0, position // 1024]) * 1024 + position % 1024
+    actual_slot = int(kernel_tables[0, position // 128]) * 128 + position % 128
+    assert actual_slot == expected_slot

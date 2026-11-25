@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.helpers.turboquant import make_metadata_builder, register_ops
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.turboquant_config import TURBOQUANT_STAGING_SLOTS
 from vllm_ascend.attention.turboquant_metadata import AscendTurboQuantMetadataBuilder
 from vllm_ascend.attention.turboquant_v1 import AscendTurboQuantBackendImpl
@@ -106,3 +108,47 @@ def test_mixed_forward_preserves_query_order_and_causal_mask():
         assert impl._forward_mixed(query, metadata, output) is output
         torch.testing.assert_close(output, query + 100)
     assert len(calls) == 2
+
+
+def test_decode_metadata_refreshes_at_the_third_physical_page(monkeypatch):
+    """A single captured width must see new lengths, slots and third-page IDs."""
+    contexts = (2047, 2048, 2049, 2177)
+    seen = []
+
+    def build_tiling(lengths, tiling, *args):
+        seen.append(lengths.tolist())
+        tiling[0] = lengths[0]
+
+    register_ops(monkeypatch, npu_turboquant_build_decode_tiling=build_tiling)
+    builder = make_metadata_builder(1, 24, 4, 256, 128, 24)
+    slots = torch.full((1,), -1, dtype=torch.int64)
+    table = torch.zeros((1, 24), dtype=torch.int32)
+    names = ("_context_lens", "_tiling", "_workspace", "_query_rot", "_decode_slot_mapping")
+    addresses = {name: getattr(builder, name).data_ptr() for name in names}
+    impl = object.__new__(AscendTurboQuantBackendImpl)
+    for context in contexts:
+        physical_pages = torch.tensor([3, 1, 2], dtype=torch.int32)
+        if context > 2048:
+            physical_pages[2] = 7  # Reassigned page ID, same table storage.
+        table.copy_((physical_pages[:, None] * 8 + torch.arange(8)).reshape(1, -1))
+        position = context - 1
+        expected_slot = int(physical_pages[position // 1024]) * 1024 + position % 1024
+        slots.fill_(expected_slot)
+        common = SimpleNamespace(
+            num_reqs=1, num_actual_tokens=1, attn_state=AscendAttentionState.DecodeOnly, slot_mapping=slots
+        )
+        extra = builder._build_backend_metadata(
+            common,
+            block_table=table,
+            query_lens=torch.ones(1, dtype=torch.int32),
+            seq_lens=torch.tensor([context], dtype=torch.int32),
+            num_decodes=1,
+            num_prefills=0,
+        )
+        metadata = SimpleNamespace(attn_state=common.attn_state, slot_mapping=slots, **extra)
+        decode_slots, plan = impl._ingestion_inputs(metadata, 1, impl._ingestion_phase(metadata, 1))
+        assert decode_slots.tolist() == [expected_slot] and plan is None
+        assert extra["turboquant_context_lens"].tolist() == [context]
+        assert int(extra["turboquant_tiling"][0]) == context
+        assert {name: getattr(builder, name).data_ptr() for name in names} == addresses
+    assert seen == [[context] for context in contexts]
