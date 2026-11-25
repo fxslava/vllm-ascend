@@ -246,9 +246,13 @@ private:
 
         SyncMte1ToMatrix();
 
-        AscendC::Mmad(product, leftL0a, rightL0b,
-                      AscendC::MmadParams(static_cast<uint16_t>(m), static_cast<uint16_t>(n),
-                                          static_cast<uint16_t>(k), 0, false, true));
+        AscendC::MmadParams params(static_cast<uint16_t>(m), static_cast<uint16_t>(n),
+                                    static_cast<uint16_t>(k), 0, false, true);
+#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510)
+
+        params.disableGemv = true;
+#endif
+        AscendC::Mmad(product, leftL0a, rightL0b, params);
 
         SyncMatrixToFixpipe();
 

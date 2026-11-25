@@ -71,7 +71,7 @@
       }
     },
     "common/turboquant_fused_decode_opt.hpp": {
-      "sha256": "908991e6c7f50f933ba09428e77a2da9fdb4a378e78c4c1c34753cb9c1f36c2c",
+      "sha256": "3e168758eca35140ecfce89b9b3da65f8b21d5d03eb9b76e991517dc04d61a3d",
       "plugin_baseline": {
         "path": "csrc/attention/turboquant/include/turboquant_fused_decode_opt.hpp",
         "sha256": "23f3625d44b9625f5c6942e271044c6ac662e574b2e0e50c830ddfd864347c62"
@@ -247,7 +247,7 @@
       }
     },
     "decode/native/cube/turboquant_cube_service.h": {
-      "sha256": "699194fec8f963976ab7b258bc968f92053e172a3337a3e4da0205a21e3152a9",
+      "sha256": "c6738f0e63bc772cfc213db395db78825a3055bdc31ff8a64e6df7c6aa9f9307",
       "plugin_baseline": {
         "path": "csrc/attention/turboquant/op_kernel/cube/turboquant_cube_service.h",
         "sha256": "45627dd0dc05505908bc8eeb40f53b6ec2f8c12a804b2ca86d4deac607074c3b"

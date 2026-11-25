@@ -96,7 +96,7 @@ struct Launch {
     std::uint32_t probe_page = UINT32_MAX, probe_tile = 0;
 };
 
-inline vllm_ascend::AscendType ascend_type_of(std::uint32_t element_type)
+inline vllm_ascend::AscendType ascend_type_of([[maybe_unused]] std::uint32_t element_type)
 {
     switch (element_type) {
     case 0: return vllm_ascend::AscendType::FP16;
