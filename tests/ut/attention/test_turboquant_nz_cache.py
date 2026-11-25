@@ -11,7 +11,7 @@ kernel takes the NZ write itself.
 * the scalar address functions of
   ``vllm_ascend/attention/turboquant_nz_ingress.py`` -- byte for byte, scale
   for scale. Those functions are themselves pinned against
-  ``op_kernel/common/turboquant_layout.h`` by
+  ``common/turboquant_layout.h`` by
   tests/ut/attention/test_turboquant_nz_ingress.py, so this closes the loop
   between the golden writer and the normative contract the kernel's
   ``static_assert``s are checked against.

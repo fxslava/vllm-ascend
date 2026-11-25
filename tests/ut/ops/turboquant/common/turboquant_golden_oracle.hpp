@@ -40,7 +40,7 @@
 #define TURBOQUANT_GOLDEN_ORACLE_HPP
 
 #include "turboquant_test_common.hpp"
-#include "csrc/attention/turboquant/op_kernel/common/turboquant_mode.h"
+#include "csrc/attention/turboquant/common/turboquant_mode.h"
 
 #include <algorithm>
 #include <cmath>

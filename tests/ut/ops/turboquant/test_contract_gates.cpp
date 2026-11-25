@@ -51,10 +51,10 @@
 // a toolkit-free translation unit can include the file and audit them, instead of a test keeping
 // its own copy of the numbers that would then agree with nothing.
 
-#include "csrc/attention/turboquant/include/turboquant_fused_decode_opt.hpp"
-#include "csrc/attention/turboquant/op_kernel/common/turboquant_wave_protocol.hpp"
-#include "csrc/attention/turboquant/op_kernel/vector/routine_vector_online_softmax.hpp"
-#include "csrc/attention/turboquant/op_kernel/turboquant_reshape_batch.cpp"
+#include "csrc/attention/turboquant/common/turboquant_fused_decode_opt.hpp"
+#include "csrc/attention/turboquant/common/turboquant_wave_protocol.hpp"
+#include "csrc/attention/turboquant/decode/native/vector/routine_vector_online_softmax.hpp"
+#include "csrc/attention/turboquant/ingress/native/turboquant_reshape_batch.cpp"
 #include "common/decode_tiling_gate.hpp"
 #include "common/turboquant_test_common.hpp"
 

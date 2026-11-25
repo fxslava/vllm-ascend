@@ -1,0 +1,84 @@
+{
+  "status": "complete_for_source_and_guarded_cpu_scope",
+  "date": "2026-11-25",
+  "repositories": ["C:/vllm-ascend", "C:/Ascend/turboquant-core"],
+  "vllm_ascend_baseline": "335d426e897c5b729150979afe648677c4fc3365",
+  "constraints": {
+    "npu_execution": false,
+    "live_torch_npu_import": false,
+    "cpp_build_or_link": false,
+    "cpp_verification": "syntax-only plus static analyzer",
+    "commits_created": false
+  },
+  "reviewed_artifacts": {
+    "r1_packet": {
+      "path": "r1/packet.json",
+      "sha256": "76de0ed439571d01496a9d3dc4b1a5de15418347f52daf71f394cc39b76c76e2"
+    },
+    "r2_packet": {
+      "path": "r2/SOURCE_PACKET.json",
+      "sha256": "25951f67b418f387a74eae777008f95151c592e03a23851db5fd7f8e60c2342b"
+    },
+    "r2_validation": {
+      "path": "r2/VALIDATION.json",
+      "sha256": "f57ce7903f37c65e7403c359b0610facab0fedfab1374639667d47b5b019db36"
+    }
+  },
+  "verification": {
+    "guarded_attention_pytest": {"passed": 606, "failed": 0},
+    "sync_and_build_selection_pytest": {"passed": 14, "failed": 0},
+    "shared_inventory": {"cpp_files": 34, "analyzer_metadata_files": 1, "byte_identical": true},
+    "cann_syntax_only_checks": {"passed": 24, "failed": 0},
+    "torch_binding_syntax_only_checks": {"passed": 5, "failed": 0},
+    "linux_cpu_golden_fixture_files": {"matched": 57, "torch": "2.10 CPU"},
+    "e8_cpu_oracle": "Exhaustive label and scale checks; see R2 validation manifest for exact loops and environment",
+    "analyzer": {
+      "full_independent_baseline_pairs": 10,
+      "focused_freshness_pairs": 3,
+      "new_diagnostic_fingerprints": 0,
+      "native_decode_inherited_fatals": 2896,
+      "native_decode_inherited_warnings": 123,
+      "annotation_replay_and_raw_comparisons_reported_separately": true,
+      "e8_component_opaque_calls": 2,
+      "opaque_routine_bodies_compared_to_baseline_source": true
+    },
+    "cross_review": {
+      "model": "gpt-6.2-sol",
+      "fresh_context": true,
+      "r1_passes": ["review_r1_a", "review_r1_b", "review_final_r1_r2"],
+      "r2_passes": ["review_r2_a", "review_r2_b", "review_final_r1_r2"],
+      "initial_rejections_repaired": true,
+      "final_r1": "PASS for source and guarded CPU scope",
+      "final_r2": "PASS for source and guarded CPU scope"
+    }
+  },
+  "prefill_evidence_correction": "The original normal v1 path already cached its plan lazily once per shared metadata object. R1 moves preparation out of forward and snapshots reusable slots; it does not demonstrate a per-layer readback reduction on that original path.",
+  "p4_ranked_next_wave": [
+    {
+      "rank": 1,
+      "target": "Mixed/chunked and prefix-cache prefill",
+      "evidence": "Per-layer device scalar validation, full-capacity cache gathering, repeated NZ unpack/repack/dequantization and padded attention inputs",
+      "proposal": "Validate live pages from host metadata and crop to live context; investigate fused NZ read/dequantization/inverse rotation into packed TND",
+      "required_proof": "Quantized suffix parity, cache bounds, masks and attention parity before performance claims"
+    },
+    {
+      "rank": 2,
+      "target": "Remaining ingestion slot readback",
+      "proposal": "Derive slots per KV group from current CPU logical tables and async-corrected scheduled positions",
+      "required_proof": "Exact parity for row order, padding, cache groups and asynchronous sequence-length corrections; retain device fallback for unproven transforms"
+    },
+    {
+      "rank": 3,
+      "target": "Cold-prefill submission and copies",
+      "proposal": "Hoist fragmented-wave indices and padding, inspect duplicate contiguous copies, record selected FIA API, and compare 16-token versus 96-token shares",
+      "required_proof": "Preserve duplicate-slot wave ordering and measure on authorized hardware in a later wave"
+    }
+  ],
+  "limitations": [
+    "No NPU throughput, CAModel, emitted ISA, wheel linking or ACLGraph replay validation",
+    "Historical champion tick results do not certify the refactored derivative",
+    "Windows Torch 2.14 differs from pinned Linux goldens by 16 and 8 bytes in two stage-1 fixture files",
+    "Generated ACLNN vendor-tree omission from strict editable link trees is inherited; ordinary wheel and checkout paths are preserved",
+    "The censored E8 encoder remains held"
+  ]
+}

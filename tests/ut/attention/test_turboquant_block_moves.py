@@ -104,6 +104,7 @@ def test_dummy_metadata_invalidates_previous_request_slots_before_upload(monkeyp
     builder, metadata, table, queries, contexts = _slot_validation_inputs()
     metadata.offload_dummy = True
     previous_slots = metadata.slot_mapping
+    builder._prefill_kernel_enabled = False
     monkeypatch.setattr(turboquant_v1.envs, "VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS", validate_slots)
 
     def upload(*args):
@@ -114,7 +115,7 @@ def test_dummy_metadata_invalidates_previous_request_slots_before_upload(monkeyp
     builder._refresh_tiling = upload
     builder._tiling = builder._workspace = builder._query_rot = object()
     builder._validate_slot_mapping = lambda *args: pytest.fail("dummy requests do not own physical slots")
-    builder._build_backend_metadata(
+    extra = builder._build_backend_metadata(
         metadata,
         block_table=table,
         query_lens=queries,
@@ -123,6 +124,8 @@ def test_dummy_metadata_invalidates_previous_request_slots_before_upload(monkeyp
         num_prefills=2,
     )
     assert metadata.slot_mapping is previous_slots
+    assert extra["turboquant_ingestion_slot_mapping"].tolist() == [-1] * metadata.num_actual_tokens
+    assert extra["turboquant_strip_plan"] is None
 
     cache = _cache()
     before = tuple(plane.clone() for plane in cache)

@@ -1,49 +1,27 @@
 # TurboQuant kernels and Torch bindings
 
-Everything in this directory except `torch_bindings.cpp` is a **mirror** of the
-`turboquant-core` repository — `include/turboquant/` and `src/` there, the
-audited production kernels extracted from
-`kernels/ops/turboquant/vllm_integration_layer` in the ascend-micro-harness.
+The standalone tree at `turboquant-core/src/turboquant` shares the layout and
+source bytes below. `SOURCE_SYNC.json` records both baseline revisions and the
+current hashes. The standalone telemetry parser and the plugin bindings are
+listed as repository-specific sources.
 
-The mirror is byte-for-byte in content but **not** in include paths. The
-standalone repo separates normative contracts (`include/turboquant/`) from
-implementation (`src/{prefill,scatter,decode,common,host}/`); this tree keeps the
-CANN operator layout (`include/`, `op_kernel/{common,cube,vector}/`, `op_host/`,
-`op_adapter/`). So every `#include` of a sibling contract is rewritten on the way
-in, and nothing else is. `tools`-free and reproducible: the rewrite is a fixed
-map from one layout to the other, recorded in the port commit.
-
-Do not edit the mirrored files to fix something here. Fix it in `turboquant-core`,
-re-run its own gates, and re-mirror — the Ascend C vector and cube logic, the
-pipeline depth, the mode-2 channel map, the cross-core flag budget and the UB
-alignments are all load-bearing and audited there.
-
-There is **one** standing exception, and it is build integration rather than
-kernel logic: in the three kernel translation units the `__global__` entry-point
-*definitions* sit outside `#if defined(__CCE_AICORE__)`, with only their bodies
-inside it. The harness builds them with CANN's legacy `ascendc_library`, which
-generates the host launch stubs itself; this repo builds them with the ASC
-language toolchain, which does not. See "Why the entry points are outside the
-device guard" below, and do not let a re-mirror undo it — it is the difference
-between a loadable `libvllm_ascend_turboquant.so` and one whose every kernel
-symbol is undefined.
-
-## What is mirrored
-
-| Path | What it is |
+| Path | Contents |
 | --- | --- |
-| `op_kernel/turboquant_reshape_batch.cpp` | prefill batch writer, MIX_AIC_1_2, **mode-2 only**, one seamless chunk stream over a block's whole share of strips, built with **`TURBOQUANT_INGRESS_NZ=1`** (root `CMakeLists.txt`): writes the NZ-tiled cache the fused decode reads rather than the RFC 3.1 strip cache |
-| `op_kernel/turboquant_reshape_scatter.cpp` | decode scatter writer, AIV only, per-token NZ write (built with `TURBOQUANT_INGRESS_NZ=1` like the batch writer; the strip read-modify-write exists only in the uncompiled `=0` variant) |
-| `op_kernel/turboquant_fused_decode.cpp` | fused decode, pre-rotated and raw-query entries, **bf16 only** |
-| `op_kernel/common/`, `op_kernel/cube/`, `op_kernel/vector/` | codec, layout, wave protocol, the Cube and Vector services and their micro-routines |
-| `include/` | the decode's launch ABI, the GEMM-reduce and Split-K contracts |
-| `op_adapter/` | the C declaration surface (`launch_*`, `turboquant_mm_fused_decode_opt_raw_query_impl`) |
-| `op_host/turboquant_tiling.{h,cpp}` | the decode's host tiling engine — a declaration and a real translation unit, not an `inline` in a device header |
+| `common/` | Launch and packet ABIs, tiling, workspace contracts, cache addressing and codec constants |
+| `ingress/native/` | BF16 prefill batch and per-token scatter writers for the native packed cache |
+| `decode/native/` | Wave-v11 native BF16 pre-rotated and raw-query decode, with Cube, Vector and reduction routines |
+| `decode/e8/` | Prepared-packet E8 reader and parallel BF16/INT8 dequantization |
+| `bindings/` | Direct ASC E8 entry adapters and Torch ingress, decode and registration translation units |
+
+Run `python scripts/check_turboquant_sync.py --core <turboquant-core path>`
+from the plugin repository to check inventories, exact source bytes and
+comment removal. The standalone build declares legacy launcher prototypes by
+defining `TURBOQUANT_LEGACY_CANN_LAUNCH`. The plugin's ASC build uses
+host-visible entry definitions. Both keep the same public launcher signatures.
 
 ### What the current port changed
 
-Three things are gone from the kernels, and the seam follows them rather than
-papering over them.
+The Wave-1 integration established these launch and layout contracts.
 
 * **The prefill is mode-2 only.** There is no `template <bool Mode2>`, no
   `..._mode4_single_shot` entry point and no `reuse_mode4_flags` launcher
@@ -52,7 +30,7 @@ papering over them.
   generations is sound by construction and needs no single-shot allocation to
   bisect against. The three channels are `kSync2PanelReady = 8`,
   `kSync2PanelFree = 9`, `kSync2PageDrained = 10`, single-sourced in
-  `op_kernel/common/turboquant_wave_protocol.hpp`, each behind its
+  `common/turboquant_wave_protocol.hpp`, each behind its
   `HardEvent::x_S` drain. `bool reuse_mode4_flags` is therefore out of the
   `npu_turboquant_reshape_and_cache_a8` schema.
 * **The prefill pipeline is seamless across strip boundaries.** The outer strip
@@ -80,13 +58,9 @@ papering over them.
 * **The host tiling is a translation unit.** `build_decode_tiling` was an
   `inline` function in a device-side header, so every consumer of the geometry
   pulled in the kernel tree; it is ordinary host C++ in
-  `op_host/turboquant_tiling.cpp` now, and the binding, the kernel launcher and
+  `common/turboquant_tiling.cpp` now, and the binding, the kernel launcher and
   the device-free gate all link the same object. `include/turboquant_fused_decode.hpp`
   is gone, superseded by it.
-
-## What is not mirrored
-
-* `torch_bindings.cpp` — this repo's own Torch registration, see below.
 
 ## Wave-1 / Wave-3 integration (2026-11-25)
 
@@ -96,10 +70,10 @@ GEMM-reducer budgets; it reuses dead query/workspace storage. The batch writer
 uses only frozen Slot03's scalar metadata hoist. Existing wide cache offsets
 are preserved. Tensor API names match the nondeprecated CANN 9.2.1 API.
 
-`e8/` contains the sealed Wave-3 decoder source and independent frozen CPU
-oracles. `asc_reader.cpp` and `asc_component.cpp` provide ASC host entry
-definitions while including the sealed device sources unchanged. Diagnostic
-exceptions cover only CANN-generated unused parameters in host entry stubs.
+The E8 sources under `decode/e8/` derive from the sealed Wave-3 decoder.
+The plugin's `bindings/asc_e8_reader.cpp` and
+`bindings/asc_e8_component.cpp` provide host-visible ASC entry definitions.
+Independent frozen CPU reference fixtures live under `tests/host/turboquant/e8/`.
 
 The separate `turboquant_e8_ops.reader` and `.dequant` registrations use
 caller-owned buffers. `vllm_ascend.attention.turboquant_e8` supplies matching
@@ -127,7 +101,7 @@ See `reports/wave_champions_20261125/REPORT.md` at the repository root for sourc
 seals, ABI verification, exact host commands and the remaining dependency and
 hardware gates. No full device plugin build or device execution was attempted.
 
-`op_kernel/common/turboquant_layout.h` is mirrored **in full** now, including the
+`common/turboquant_layout.h` is mirrored **in full** now, including the
 four ingress helpers `NzTiledChannelByte`, `NzTiledChannelNibble`,
 `NzScaleSlotFloats` and `NzTiledScaleIndex`. They used to be held out of it, and
 `op_kernel/common/turboquant_strip_layout.h` was this repo's own restatement of
@@ -151,7 +125,7 @@ after this port.
 
 ## The three ops
 
-`torch_bindings.cpp` registers into `torch.ops.turboquant_ops`, which is
+`bindings/torch_bindings.cpp` registers into `torch.ops.turboquant_ops`, which is
 `TURBOQUANT_DEFAULT_NAMESPACE` in `vllm_ascend/attention/turboquant_v1.py`.
 The Python adapter resolves each op by name, so an unregistered op — any build
 that is not ascend950 — makes it warn once and run its PyTorch golden model.
@@ -263,7 +237,7 @@ steps to rank the remaining prefill work and kernel execution; per-layer
 This section used to be "the two cache formats do not meet", and it was the
 most important thing to know before switching a stage on: **both** writers
 produced the RFC 3.1 strip cache while the fused decode reads the NZ-tiled
-cache of `NzTiledPackedByte()` in `op_kernel/common/turboquant_layout.h`. Both
+cache of `NzTiledPackedByte()` in `common/turboquant_layout.h`. Both
 writers are built with `TURBOQUANT_INGRESS_NZ=1` now (the define lives in the
 root `CMakeLists.txt`, next to `ASCEND_MICRO_CANN_LAUNCH`):
 
@@ -320,7 +294,7 @@ couple of seconds with any C++17 compiler and needs no CANN and no NPU.
   sink, and a 64-strip share costs exactly 64x the chunk work of a 1-strip
   share with no extra prologue, drain or rendezvous per strip, which is the
   seamless property stated as a count. It `#include`s
-  `op_kernel/turboquant_reshape_batch.cpp` directly: the device body is behind
+  `ingress/native/turboquant_reshape_batch.cpp` directly: the device body is behind
   `#if defined(__CCE_AICORE__)`, so a host compiler sees the arena constants and
   their `static_assert`s, which is the point.
 * `tests/ut/ops/turboquant/test_layout_bridge.cpp` — the NZ/strip layout bridge
@@ -339,7 +313,7 @@ The three kernel translation units also build for `dav-3510` with no Torch and
 no driver, through a throwaway CMake project whose only target is
 
 ```cmake
-ascendc_library(tq_gate SHARED op_kernel/turboquant_reshape_batch.cpp op_kernel/turboquant_reshape_scatter.cpp op_kernel/turboquant_fused_decode.cpp)
+ascendc_library(tq_gate SHARED ingress/native/turboquant_reshape_batch.cpp ingress/native/turboquant_reshape_scatter.cpp decode/native/turboquant_fused_decode.cpp)
 ```
 
 configured with `-DSOC_VERSION=Ascend950PR_9599`, the `Unix Makefiles`
@@ -405,7 +379,7 @@ extern "C" __global__ __aicore__ void kernel(...)  // the entry points
 Every `ascendc_library` compiles each translation unit several times, and the
 **host** pass is the one with `__CCE_AICORE__` undefined. Without
 `ASCEND_MICRO_CANN_LAUNCH` that pass compiles to nothing past the entry points,
-and the three entry points `torch_bindings.cpp` calls —
+and the three native entry points the Torch wrappers call —
 `launch_turboquant_reshape_and_cache_bf16`,
 `launch_turboquant_reshape_scatter_aiv` and
 `vllm_ascend::turboquant_mm_fused_decode_opt_raw_query_impl` — are simply absent.

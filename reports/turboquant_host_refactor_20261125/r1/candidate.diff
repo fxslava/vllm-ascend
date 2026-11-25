@@ -1,0 +1,1463 @@
+diff --git a/docs/source/user_guide/feature_guide/graph_mode.md b/docs/source/user_guide/feature_guide/graph_mode.md
+index edb1e35dc..b223718be 100644
+--- a/docs/source/user_guide/feature_guide/graph_mode.md
++++ b/docs/source/user_guide/feature_guide/graph_mode.md
+@@ -107,6 +107,8 @@ ENABLE_TURBOQUANT=1 TURBOQUANT_KERNEL_STAGES=scatter,decode \
+ 
+ If the required kernel stages or operators are unavailable, TurboQuant falls back to `PIECEWISE` with `VLLM_COMPILE`, or `NONE` without piecewise compilation. Speculative and multi-token decode are not supported by the TurboQuant decode tiling contract.
+ 
++Add `reshape_and_cache` to `TURBOQUANT_KERNEL_STAGES` to opt in to the batched TurboQuant prefill cache writer. The metadata builder reads the live slot mapping to the host once per prepared metadata object for strip planning, and the attention layers share the plan. Setting `VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS=1` enables additional diagnostic reads. For an aligned run, the kernel uses the 96-token-per-core schedule when the launch size is divisible by 96 and the 16-token-per-core fallback for other strip-aligned launch sizes. Fragmented slots can require additional scatter launches. Prefill and mixed attention remain outside full ACLGraph capture.
++
+ Not all attention backends support all graph modes. vLLM checks attention backend compatibility during compatibility checks and, when possible, automatically adjusts `cudagraph_mode` to a more compatible mode instead of failing immediately. In practice, this means a requested full-graph mode may be narrowed to a mixed or piecewise mode, and if the backend cannot support graph execution at all, graph mode may be disabled.
+ 
+ On Ascend, the current attention backend support levels are:
+diff --git a/tests/ut/attention/run_turboquant_device_free.py b/tests/ut/attention/run_turboquant_device_free.py
+index 71fe1d30d..6d33bff23 100644
+--- a/tests/ut/attention/run_turboquant_device_free.py
++++ b/tests/ut/attention/run_turboquant_device_free.py
+@@ -12,7 +12,7 @@ works::
+ The files listed below check things that need only ``torch``: the three-plane
+ cache layout arithmetic, the kernel/golden dispatch seam, the in-code profiler's
+ bookkeeping, and the ``ops.def`` schemas
+-in ``csrc/attention/turboquant/torch_bindings.cpp` against the Python stubs that
++in ``csrc/attention/turboquant/bindings/torch_bindings.cpp` against the Python stubs that
+ call them. They are ordinary members of ``tests/ut/attention`` and run there in
+ CI like everything else; this script only makes them reachable somewhere that
+ cannot host the real suite, by installing :mod:`stub_vllm` first and skipping
+@@ -37,6 +37,7 @@ DEVICE_FREE_TESTS = (
+     "test_turboquant_e8.py",
+     "test_turboquant_op_schemas.py",
+     "test_turboquant_capture_contract.py",
++    "test_turboquant_host_graph.py",
+     "test_turboquant_dispatch_seam.py",
+     "test_turboquant_strip_cache.py",
+     "test_turboquant_codec.py",
+diff --git a/tests/ut/attention/stub_vllm.py b/tests/ut/attention/stub_vllm.py
+index 2855f197b..a3aae78a8 100644
+--- a/tests/ut/attention/stub_vllm.py
++++ b/tests/ut/attention/stub_vllm.py
+@@ -6,7 +6,7 @@
+ kernel_cache_layout,layout,nz_ingress,profile}.py`` need nothing but ``torch``:
+ they check layout arithmetic, the kernel/golden dispatch seam, the in-code
+ profiler's bookkeeping, and the ``ops.def`` schemas in
+-``csrc/attention/turboquant/torch_bindings.cpp`` against the Python stubs that
++``csrc/attention/turboquant/bindings/torch_bindings.cpp`` against the Python stubs that
+ call them. The only reason they need a vllm install at all is
+ ``turboquant_v1.py``'s own import block, and the only reason they need an
+ Ascend host is ``tests/ut/conftest.py``.
+@@ -37,6 +37,18 @@ import types
+ 
+ # tests/ut/attention/stub_vllm.py -> the checkout root.
+ REPO = pathlib.Path(__file__).resolve().parents[3]
++_BLOCKED_MODULES = ("torch_npu", "vllm_ascend.vllm_ascend_C")
++
++
++def _is_blocked_module(name: str) -> bool:
++    return any(name == module or name.startswith(f"{module}.") for module in _BLOCKED_MODULES)
++
++
++class _BlockDeviceImports:
++    def find_spec(self, fullname: str, path=None, target=None):
++        if _is_blocked_module(fullname):
++            raise ImportError(f"Device-free TurboQuant tests block importing {fullname}")
++        return None
+ 
+ 
+ def vllm_is_importable() -> bool:
+@@ -57,8 +69,7 @@ def _module(name: str, path: pathlib.Path | None = None) -> types.ModuleType:
+     rather than loaded from somewhere else by hand. Keeping them at their true
+     paths matters -- ``test_turboquant_op_schemas.py`` locates
+     ``torch_bindings.cpp`` by walking up from
+-    ``turboquant_v1.__file__``, and silently skips every one of its tests
+-    if that walk does not land on the checkout.
++    ``turboquant_v1.__file__``.
+     """
+     module = types.ModuleType(name)
+     if path is not None:
+@@ -82,9 +93,12 @@ def install() -> None:
+             "run the tests directly with pytest instead."
+         )
+ 
+-    # torch_npu is imported by turboquant_v1 for its side effects; nothing
+-    # in these tests calls into it.
+-    _module("torch_npu")
++    if any(_is_blocked_module(name) for name in sys.modules):
++        raise RuntimeError("Device-free TurboQuant tests require a process with no device modules loaded")
++    sys.meta_path.insert(0, _BlockDeviceImports())
++    # TurboQuant imports the name and Dynamo inspects its module spec.
++    # The stub has no device functions or package path.
++    _module("torch_npu").__spec__ = importlib.machinery.ModuleSpec("torch_npu", loader=None)
+ 
+     _module("vllm")
+     _module("vllm.logger").logger = logging.getLogger("vllm")
+diff --git a/tests/ut/attention/test_turboquant_block_moves.py b/tests/ut/attention/test_turboquant_block_moves.py
+index 818b5770e..8baceffd5 100644
+--- a/tests/ut/attention/test_turboquant_block_moves.py
++++ b/tests/ut/attention/test_turboquant_block_moves.py
+@@ -104,6 +104,7 @@ def test_dummy_metadata_invalidates_previous_request_slots_before_upload(monkeyp
+     builder, metadata, table, queries, contexts = _slot_validation_inputs()
+     metadata.offload_dummy = True
+     previous_slots = metadata.slot_mapping
++    builder._prefill_kernel_enabled = False
+     monkeypatch.setattr(turboquant_v1.envs, "VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS", validate_slots)
+ 
+     def upload(*args):
+@@ -114,7 +115,7 @@ def test_dummy_metadata_invalidates_previous_request_slots_before_upload(monkeyp
+     builder._refresh_tiling = upload
+     builder._tiling = builder._workspace = builder._query_rot = object()
+     builder._validate_slot_mapping = lambda *args: pytest.fail("dummy requests do not own physical slots")
+-    builder._build_backend_metadata(
++    extra = builder._build_backend_metadata(
+         metadata,
+         block_table=table,
+         query_lens=queries,
+@@ -123,6 +124,8 @@ def test_dummy_metadata_invalidates_previous_request_slots_before_upload(monkeyp
+         num_prefills=2,
+     )
+     assert metadata.slot_mapping is previous_slots
++    assert extra["turboquant_ingestion_slot_mapping"].tolist() == [-1] * metadata.num_actual_tokens
++    assert extra["turboquant_strip_plan"] is None
+ 
+     cache = _cache()
+     before = tuple(plane.clone() for plane in cache)
+diff --git a/tests/ut/attention/test_turboquant_capture_contract.py b/tests/ut/attention/test_turboquant_capture_contract.py
+index c7237d528..facd15fca 100644
+--- a/tests/ut/attention/test_turboquant_capture_contract.py
++++ b/tests/ut/attention/test_turboquant_capture_contract.py
+@@ -597,6 +597,8 @@ def test_the_builder_publishes_every_field_the_launch_reads() -> None:
+         "turboquant_query_rot",
+         "turboquant_num_tokens",
+         "turboquant_slot_mapping",
++        "turboquant_ingestion_slot_mapping",
++        "turboquant_strip_plan",
+     }
+     assert extra["turboquant_num_tokens"] == 2, "the extent the descriptors were filled for"
+     # All of the new work is in the subclass, reached only through the hook, so
+diff --git a/tests/ut/attention/test_turboquant_e8.py b/tests/ut/attention/test_turboquant_e8.py
+index 4c2afb274..b308f7591 100644
+--- a/tests/ut/attention/test_turboquant_e8.py
++++ b/tests/ut/attention/test_turboquant_e8.py
+@@ -2,12 +2,12 @@
+ import inspect
+ import re
+ import struct
+-from pathlib import Path
+ from unittest.mock import Mock, patch
+ 
+ import pytest
+ import torch
+ 
++from tests.ut.attention.test_turboquant_op_schemas import _schemas, _source
+ from vllm_ascend.attention import turboquant_e8 as e8
+ 
+ 
+@@ -57,13 +57,8 @@ def test_e8_refuses_native_nibble_buffers(fn, args):
+ 
+ 
+ def test_e8_schema_call_order_mutation_and_meta_registration():
+-    root = Path(e8.__file__).resolve().parents[2]
+-    text = (root / "csrc/attention/turboquant/e8_torch_bindings.cpp").read_text()
+-    literals = r'"(?:[^"\\]|\\.)*"'
+-    schemas = {}
+-    for match in re.finditer(r"ops\.def\(\s*((?:" + literals + r"\s*)+)\)\s*;", text):
+-        schema = torch._C.parse_schema("".join(s[1:-1] for s in re.findall(literals, match[1])))
+-        schemas[schema.name] = schema
++    text = _source("turboquant_e8_ops")
++    schemas = _schemas("turboquant_e8_ops")
+     assert set(schemas) == {"reader", "dequant"}
+     for name, schema in schemas.items():
+         fn = getattr(e8, name)
+diff --git a/tests/ut/attention/test_turboquant_kernel_cache_layout.py b/tests/ut/attention/test_turboquant_kernel_cache_layout.py
+index d7ba90e07..edc366f00 100644
+--- a/tests/ut/attention/test_turboquant_kernel_cache_layout.py
++++ b/tests/ut/attention/test_turboquant_kernel_cache_layout.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """CPU tests for the cache layout the TurboQuant NPU writers leave behind.
+ 
+-The two audited writers (``csrc/attention/turboquant/op_kernel/turboquant_reshape_batch.cpp``
++The two audited writers (``csrc/attention/turboquant/ingress/native/turboquant_reshape_batch.cpp``
+ and ``..._scatter.cpp``) do not write the golden model's cache. Both are built
+ with ``TURBOQUANT_INGRESS_NZ=1`` and produce the NZ-tiled layout the fused
+ decode reads; the strip cache -- page axis
+diff --git a/tests/ut/attention/test_turboquant_live_write_npu.py b/tests/ut/attention/test_turboquant_live_write_npu.py
+index 74a0ba4d9..a22450e1b 100644
+--- a/tests/ut/attention/test_turboquant_live_write_npu.py
++++ b/tests/ut/attention/test_turboquant_live_write_npu.py
+@@ -279,7 +279,7 @@ def _build_decode_tiling(contexts, block_size, max_pages, splits, fused_context_
+     batch = len(contexts)
+     heads_per_task = backend.turboquant_decode_heads_per_task(NUM_HEADS, NUM_KV_HEADS)
+     chunks_per_group = -(-GROUP_HEADS // heads_per_task)
+-    # Match decode_launch_split in op_host/turboquant_tiling.h: descriptors
++    # Match decode_launch_split in common/turboquant_tiling.h: descriptors
+     # cover every (token, split), followed by one dispatch record per block.
+     grid = min(backend.TURBOQUANT_DECODE_MAX_GRID, batch * NUM_KV_HEADS * splits * chunks_per_group)
+     tiling_words = backend.turboquant_decode_tiling_words(batch, splits, grid)
+diff --git a/tests/ut/attention/test_turboquant_nz_cache.py b/tests/ut/attention/test_turboquant_nz_cache.py
+index 9bc15d2c4..fa0e8827c 100644
+--- a/tests/ut/attention/test_turboquant_nz_cache.py
++++ b/tests/ut/attention/test_turboquant_nz_cache.py
+@@ -11,7 +11,7 @@ kernel takes the NZ write itself.
+ * the scalar address functions of
+   ``vllm_ascend/attention/turboquant_nz_ingress.py`` -- byte for byte, scale
+   for scale. Those functions are themselves pinned against
+-  ``op_kernel/common/turboquant_layout.h`` by
++  ``common/turboquant_layout.h`` by
+   tests/ut/attention/test_turboquant_nz_ingress.py, so this closes the loop
+   between the golden writer and the normative contract the kernel's
+   ``static_assert``s are checked against.
+diff --git a/tests/ut/attention/test_turboquant_nz_ingress.py b/tests/ut/attention/test_turboquant_nz_ingress.py
+index 2d78479e2..6daefdf70 100644
+--- a/tests/ut/attention/test_turboquant_nz_ingress.py
++++ b/tests/ut/attention/test_turboquant_nz_ingress.py
+@@ -9,9 +9,9 @@ The thing under test is the vectorised repack in
+ :mod:`vllm_ascend.attention.turboquant_nz_ingress`. The oracle is a pair of
+ scalar writers/readers in this file, transcribed from the two C++ headers that
+ state the contracts -- the ``Layout contracts`` block of
+-``op_kernel/turboquant_reshape_batch.cpp`` for what the audited writers produce
+-and ``op_kernel/common/turboquant_layout.h`` plus
+-``op_kernel/vector/turboquant_vector_service.h`` for what the fused decode
++``ingress/native/turboquant_reshape_batch.cpp`` for what the audited writers produce
++and ``common/turboquant_layout.h`` plus
++``decode/native/vector/turboquant_vector_service.h`` for what the fused decode
+ reads. ``tests/ut/ops/turboquant/test_layout_bridge.cpp`` is the C++ gate over
+ the same two contracts. The repack and the oracle share no code, so agreement between them is a
+ real cross-check rather than a restatement.
+@@ -43,7 +43,7 @@ from vllm_ascend.attention.turboquant_nz_ingress import (
+ from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_PACK_FACTOR
+ 
+ REPO = pathlib.Path(__file__).resolve().parents[3]
+-KERNEL_COMMON = REPO / "csrc" / "attention" / "turboquant" / "op_kernel" / "common"
++KERNEL_COMMON = REPO / "csrc" / "attention" / "turboquant" / "common"
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -413,11 +413,11 @@ def test_packed_bytes_survive_a_round_trip_through_codes() -> None:
+ def test_repack_output_satisfies_the_fused_decode_binding() -> None:
+     """The three planes must pass the binding's own cache TORCH_CHECKs.
+ 
+-    Read off csrc/attention/turboquant/torch_bindings.cpp rather than restated,
++    Read off csrc/attention/turboquant/bindings/torch_decode.cpp rather than restated,
+     so that tightening a check there without updating the bridge fails here
+     instead of at a launch on hardware nobody has.
+     """
+-    bindings = (REPO / "csrc" / "attention" / "turboquant" / "torch_bindings.cpp").read_text(encoding="utf-8")
++    bindings = (REPO / "csrc/attention/turboquant/bindings/torch_decode.cpp").read_text(encoding="utf-8")
+     assert "key_cache.dim() == 4 && key_cache.sizes() == value_cache.sizes()" in bindings
+     assert "const std::int64_t block_size = key_cache.size(1);" in bindings
+     assert "block_size % layout::kCubeTileRows == 0" in bindings
+diff --git a/tests/ut/attention/test_turboquant_op_schemas.py b/tests/ut/attention/test_turboquant_op_schemas.py
+index 1b977ba13..bd81f3d54 100644
+--- a/tests/ut/attention/test_turboquant_op_schemas.py
++++ b/tests/ut/attention/test_turboquant_op_schemas.py
+@@ -11,7 +11,7 @@ order the C++ schema no longer declares.
+ 
+ ``torch._C.parse_schema`` is the same parser the registration uses, so these
+ tests read the schemas straight out of
+-``csrc/attention/turboquant/torch_bindings.cpp`` and check all of that with no
++``csrc/attention/turboquant/bindings/torch_bindings.cpp`` and check all of that with no
+ extension, no vllm and no device.
+ """
+ 
+@@ -37,7 +37,7 @@ from vllm_ascend.attention.turboquant_ops import TurboQuantOpsAdapter
+ # whether pytest collects this from tests/ut/attention or from a copy beside a
+ # stubbed-vllm conftest that loads the real module by path.
+ _REPO = pathlib.Path(turboquant_v1.__file__).parents[2]
+-BINDINGS = _REPO / "csrc" / "attention" / "turboquant" / "torch_bindings.cpp"
++BINDINGS = _REPO / "csrc" / "attention" / "turboquant" / "bindings" / "torch_bindings.cpp"
+ 
+ # Which `_kernel_*` method of the adapter calls each op. The stub's parameters
+ # are the call it makes, so they must be the schema's arguments in the schema's
+@@ -58,20 +58,28 @@ BINDING_OPS = frozenset(OP_STUBS) | {TURBOQUANT_OP_BUILD_DECODE_TILING}
+ _LITERAL = r'"(?:[^"\\]|\\.)*"'
+ 
+ 
+-def _source() -> str:
+-    if not BINDINGS.is_file():
+-        pytest.skip(f"{BINDINGS} is not in this checkout")
+-    return BINDINGS.read_text(encoding="utf-8")
++def _source(namespace: str = "turboquant_ops") -> str:
++    source = BINDINGS.read_text(encoding="utf-8")
++    fragment = re.search(
++        rf"TORCH_LIBRARY_FRAGMENT\(\s*{re.escape(namespace)}\s*,\s*ops\s*\)\s*\{{(.*?)^\}}",
++        source,
++        flags=re.DOTALL | re.MULTILINE,
++    )
++    assert fragment is not None, f"{namespace} registration missing in {BINDINGS}"
++    return fragment[1]
+ 
+ 
+-def _schemas() -> dict[str, Any]:
+-    """Every ``ops.def`` schema in the bindings, parsed, keyed by op name."""
+-    parsed = {}
+-    for match in re.finditer(r"ops\.def\(\s*((?:" + _LITERAL + r"\s*)+)\)\s*;", _source()):
++def _schema_strings(namespace: str = "turboquant_ops") -> dict[str, str]:
++    """Every raw ``ops.def`` schema in the fragment, keyed by op name."""
++    schemas = {}
++    for match in re.finditer(r"ops\.def\(\s*((?:" + _LITERAL + r"\s*)+)\)\s*;", _source(namespace)):
+         text = "".join(part[1:-1] for part in re.findall(_LITERAL, match.group(1)))
+-        schema = torch._C.parse_schema(text)
+-        parsed[schema.name.split("::")[-1]] = schema
+-    return parsed
++        schemas[text.partition("(")[0]] = text
++    return schemas
++
++
++def _schemas(namespace: str = "turboquant_ops") -> dict[str, Any]:
++    return {name: torch._C.parse_schema(schema) for name, schema in _schema_strings(namespace).items()}
+ 
+ 
+ def _impl_keys() -> dict[str, set[str]]:
+diff --git a/vllm_ascend/attention/turboquant_metadata.py b/vllm_ascend/attention/turboquant_metadata.py
+index a5e57268a..dc1aaaeb0 100644
+--- a/vllm_ascend/attention/turboquant_metadata.py
++++ b/vllm_ascend/attention/turboquant_metadata.py
+@@ -22,15 +22,20 @@ from vllm_ascend.attention.turboquant_config import (
+     TURBOQUANT_FIA_DUMMY_KV_LEN,
+     TURBOQUANT_KERNEL_BLOCK_SIZE,
+     TURBOQUANT_OP_BUILD_DECODE_TILING,
++    TURBOQUANT_OP_RESHAPE_AND_CACHE,
+     TURBOQUANT_STAGING_SLOTS,
++    TurboQuantKernelStage,
+     TurboQuantOpsConfig,
+     turboquant_decode_heads_per_task,
+     turboquant_decode_query_rot_floats,
+     turboquant_decode_workspace_floats,
+     turboquant_tiling_upper_bound_words,
+ )
++from vllm_ascend.attention.turboquant_ingestion import TurboQuantStripPlan, turboquant_plan_strip_ingestion
+ from vllm_ascend.attention.turboquant_ops import (
++    _is_op_registered,
+     _stream_is_capturing,
++    load_turboquant_extension,
+     turboquant_decode_graph_supported,
+ )
+ from vllm_ascend.attention.turboquant_telemetry import (
+@@ -48,6 +53,8 @@ class AscendTurboQuantMetadata(AscendMetadata):
+     turboquant_query_rot: torch.Tensor = None
+     turboquant_num_tokens: int = 0
+     turboquant_slot_mapping: torch.Tensor | None = None
++    turboquant_ingestion_slot_mapping: torch.Tensor | None = None
++    turboquant_strip_plan: TurboQuantStripPlan | None = None
+ 
+ 
+ @dataclass(frozen=True)
+@@ -88,7 +95,9 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
+         self._num_heads = int(vllm_config.model_config.get_num_attention_heads(vllm_config.parallel_config))
+         self._num_splits = TURBOQUANT_DECODE_SPLITS
+         self._heads_per_task = turboquant_decode_heads_per_task(self._num_heads, self._num_kv_heads)
+-        self._ops_namespace = TurboQuantOpsConfig.from_env().ops_namespace
++        ops_config = TurboQuantOpsConfig.from_env()
++        self._ops_namespace = ops_config.ops_namespace
++        self._prefill_kernel_enabled = ops_config.enables(TurboQuantKernelStage.RESHAPE_AND_CACHE)
+ 
+         self._context_lens = torch.zeros(self._max_num_reqs, dtype=torch.int32, device=device)
+         self._decode_slot_mapping = torch.full((self._max_num_reqs,), -1, dtype=torch.int32, device=device)
+@@ -140,6 +149,8 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
+         self._reject_multi_token_steps(common_attn_metadata, tokens)
+         self._refresh_tiling(host_context_lens, tokens)
+         slot_mapping = None
++        ingestion_slot_mapping = None
++        strip_plan = None
+         if getattr(common_attn_metadata, "attn_state", None) == AscendAttentionState.DecodeOnly:
+             source = common_attn_metadata.slot_mapping
+             if source.numel() < tokens:
+@@ -152,6 +163,21 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
+             slot_mapping = self._decode_slot_mapping[:tokens]
+             slot_mapping.copy_(source[:tokens])
+             slot_mapping[live_tokens:].fill_(-1)
++        elif (live_tokens := getattr(common_attn_metadata, "num_actual_tokens", 0)) > 0:
++            # Match the backend's phase selection, which counts the padded
++            # seq_lens_list entries when it distinguishes mixed from decode.
++            prepare_strip_plan = False
++            if live_tokens > tokens and self._prefill_kernel_enabled:
++                load_turboquant_extension()
++                prepare_strip_plan = _is_op_registered(self._ops_namespace, TURBOQUANT_OP_RESHAPE_AND_CACHE)
++            if prepare_strip_plan and _stream_is_capturing():
++                raise RuntimeError("TurboQuant prefill ingestion planning requires metadata outside graph capture")
++            source = common_attn_metadata.slot_mapping[:live_tokens]
++            # Snapshot planned slots even for an int32 source. The runner can
++            # reuse its slot buffer and the plan must describe the launch's slots.
++            ingestion_slot_mapping = source.to(torch.int32, copy=prepare_strip_plan)
++            if prepare_strip_plan:
++                strip_plan = turboquant_plan_strip_ingestion(ingestion_slot_mapping.tolist(), self._block_size)
+         return {
+             "turboquant_context_lens": context_lens,
+             "turboquant_tiling": self._tiling,
+@@ -159,6 +185,8 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
+             "turboquant_query_rot": self._query_rot,
+             "turboquant_num_tokens": tokens,
+             "turboquant_slot_mapping": slot_mapping,
++            "turboquant_ingestion_slot_mapping": ingestion_slot_mapping,
++            "turboquant_strip_plan": strip_plan,
+         }
+ 
+     def _validate_slot_mapping(
+diff --git a/vllm_ascend/attention/turboquant_ops.py b/vllm_ascend/attention/turboquant_ops.py
+index 590e39cdd..86dda0a2a 100644
+--- a/vllm_ascend/attention/turboquant_ops.py
++++ b/vllm_ascend/attention/turboquant_ops.py
+@@ -12,6 +12,7 @@ from typing import Any
+ import torch
+ from vllm.logger import logger
+ 
++from vllm_ascend.attention import turboquant_reference_cache
+ from vllm_ascend.attention.turboquant_codec import (
+     TurboQuantEmulator,
+ )
+@@ -21,9 +22,6 @@ from vllm_ascend.attention.turboquant_config import (
+     TURBOQUANT_FUSED_CONTEXT_LIMIT,
+     TURBOQUANT_KERNEL_DTYPE,
+     TURBOQUANT_KERNEL_OPS,
+-    TURBOQUANT_NZ_FP32_PER_BLOCK,
+-    TURBOQUANT_NZ_OPERAND_C0,
+-    TURBOQUANT_NZ_TILE_ROWS,
+     TURBOQUANT_OP_BUILD_DECODE_TILING,
+     TURBOQUANT_OP_FUSED_DECODE,
+     TURBOQUANT_OP_GATHER_PAGES,
+@@ -36,7 +34,6 @@ from vllm_ascend.attention.turboquant_config import (
+     TURBOQUANT_REGISTERED_OPS,
+     TURBOQUANT_STAGE_ROTATED_BASIS,
+     TURBOQUANT_STAGE_UNROTATED,
+-    TURBOQUANT_STRIP_TOKENS,
+     TurboQuantKernelStage,
+     TurboQuantOpsConfig,
+     TurboQuantValueLayout,
+@@ -49,9 +46,6 @@ from vllm_ascend.attention.turboquant_ingestion import (
+     turboquant_plan_strip_ingestion,
+ )
+ from vllm_ascend.attention.turboquant_layout import (
+-    TURBOQUANT_KEY_PLANE,
+-    TURBOQUANT_PACK_FACTOR,
+-    TURBOQUANT_VALUE_PLANE,
+     turboquant_scale_block_views,
+ )
+ from vllm_ascend.attention.turboquant_telemetry import (
+@@ -149,7 +143,7 @@ class TurboQuantOpsAdapter:
+             "TurboQuant stages %s are switched on but torch.ops.%s is missing %s, which will "
+             "run the PyTorch golden model instead. These registrations are static initialisers "
+             "of vllm_ascend.vllm_ascend_C (import of it %s here), and CMakeLists.txt compiles "
+-            "csrc/attention/turboquant/torch_bindings.cpp only when SOC_VERSION matches "
++            "csrc/attention/turboquant/bindings/torch_bindings.cpp only when SOC_VERSION matches "
+             "ascend950 -- so on any other part they are absent by construction. Operators the "
+             "dispatcher does have under this namespace: %s",
+             stages,
+@@ -549,54 +543,18 @@ class TurboQuantOpsAdapter:
+         emulator: TurboQuantEmulator,
+         lloyd_max_folds: tuple[str, str] = ("key", "value"),
+     ) -> None:
+-        codes_key, key_scales = emulator.quantize(self.rotate(key, emulator), lloyd_max_folds[0])
+-        codes_value, value_scales = emulator.quantize(self.rotate(value, emulator), lloyd_max_folds[1])
+-
+-        block_size = key_cache.shape[1]
+-        slots = slot_mapping.to(torch.int64)
+-        valid = slots >= 0
+-        if not bool(valid.all()):
+-            slots = slots[valid]
+-            codes_key = codes_key[valid]
+-            codes_value = codes_value[valid]
+-            key_scales = key_scales[valid]
+-            value_scales = value_scales[valid]
+-        if slots.numel() == 0:
+-            return
+-
+-        num_blocks = key_cache.shape[0]
+-        slot_capacity = num_blocks * block_size
+-        max_slot = int(slots.max())
+-        if max_slot >= slot_capacity:
+-            raise ValueError(
+-                f"slot_mapping is out of range for the TurboQuant cache: expected slots in "
+-                f"[0, {slot_capacity}) ({num_blocks} blocks activations {block_size} tokens, from key_cache.shape="
+-                f"{tuple(key_cache.shape)}), but the largest non-negative slot is {max_slot}."
+-            )
+-
+-        pages = torch.div(slots, block_size, rounding_mode="floor")
+-        offsets = slots - pages * block_size
+-
+-        layout = self.value_layout()
+-        if layout is TurboQuantValueLayout.CHANNEL_MAJOR:
+-            self._write_strip_planes(codes_key, codes_value, key_cache, value_cache, pages, offsets)
+-        elif layout is TurboQuantValueLayout.NZ_TILED:
+-            self._write_nz_planes(codes_key, codes_value, key_cache, value_cache, slots)
+-        else:
+-            for packed, cache in (
+-                (emulator.pack(codes_key), key_cache),
+-                (emulator.pack(codes_value), value_cache),
+-            ):
+-                _flat_slot_view(cache)[slots] = packed
+-
+-        if layout is TurboQuantValueLayout.NZ_TILED:
+-            self._write_nz_scales(key_scales, value_scales, scale_cache, slots)
+-        else:
+-            for plane, scales in (
+-                (TURBOQUANT_KEY_PLANE, key_scales),
+-                (TURBOQUANT_VALUE_PLANE, value_scales),
+-            ):
+-                scale_cache[plane][pages, :, offsets] = scales.to(scale_cache.dtype)
++        turboquant_reference_cache.write_slots(
++            key,
++            value,
++            key_cache,
++            value_cache,
++            scale_cache,
++            slot_mapping,
++            emulator,
++            rotate=self.rotate,
++            layout=self.value_layout(),
++            lloyd_max_folds=lloyd_max_folds,
++        )
+ 
+     def _write_strip_planes(
+         self,
+@@ -607,96 +565,10 @@ class TurboQuantOpsAdapter:
+         pages: torch.Tensor,
+         offsets: torch.Tensor,
+     ) -> None:
+-        num_blocks, block_size, num_kv_heads, packed_bytes = key_cache.shape
+-        head_size = packed_bytes * TURBOQUANT_PACK_FACTOR
+-        if block_size % TURBOQUANT_STRIP_TOKENS:
+-            raise ValueError(
+-                f"the strip cache is written 16 tokens at a time, so block_size {block_size} must be a "
+-                f"multiple of {TURBOQUANT_STRIP_TOKENS}"
+-            )
+-        strips_per_page = block_size // TURBOQUANT_STRIP_TOKENS
+-
+-        key_pages = _require_contiguous(key_cache, "key").view(num_blocks, num_kv_heads, block_size, packed_bytes)
+-        key_pages[pages, :, offsets] = TurboQuantEmulator.pack(codes_key)
+-
+-        strips = torch.div(offsets, TURBOQUANT_STRIP_TOKENS, rounding_mode="floor")
+-        lanes = offsets - strips * TURBOQUANT_STRIP_TOKENS
+-        value_pages = _require_contiguous(value_cache, "value").view(
+-            num_blocks, num_kv_heads, strips_per_page, head_size, TURBOQUANT_STRIP_TOKENS // TURBOQUANT_PACK_FACTOR
+-        )
+-        touched, inverse = torch.unique(pages, return_inverse=True)
+-        panel = TurboQuantEmulator.unpack(value_pages[touched])
+-        panel[inverse, :, strips, :, lanes] = codes_value
+-        value_pages[touched] = TurboQuantEmulator.pack(panel)
+-
+-    @staticmethod
+-    def _nz_byte_offsets(slots: torch.Tensor, num_kv_heads: int, packed_bytes: int) -> torch.Tensor:
+-        tile_rows = TURBOQUANT_NZ_TILE_ROWS
+-        c0 = TURBOQUANT_NZ_OPERAND_C0
+-        groups = packed_bytes // c0
+-        device = slots.device
+-        tile_row = slots % tile_rows
+-        base = (slots - tile_row) * (num_kv_heads * packed_bytes) + tile_row * c0
+-        heads = torch.arange(num_kv_heads, device=device) * (tile_rows * packed_bytes)
+-        group = torch.arange(groups, device=device) * (tile_rows * c0)
+-        byte = torch.arange(c0, device=device)
+-        return base[..., None, None, None] + heads.view(-1, 1, 1) + group.view(-1, 1) + byte
+-
+-    def _write_nz_planes(
+-        self,
+-        codes_key: torch.Tensor,
+-        codes_value: torch.Tensor,
+-        key_cache: torch.Tensor,
+-        value_cache: torch.Tensor,
+-        slots: torch.Tensor,
+-    ) -> None:
+-        num_blocks, block_size, num_kv_heads, packed_bytes = key_cache.shape
+-        head_size = packed_bytes * TURBOQUANT_PACK_FACTOR
+-        if block_size % TURBOQUANT_NZ_TILE_ROWS:
+-            raise ValueError(
+-                f"the NZ-tiled cache is laid out in {TURBOQUANT_NZ_TILE_ROWS}-row tiles, so block_size "
+-                f"{block_size} must be a multiple of {TURBOQUANT_NZ_TILE_ROWS}"
+-            )
+-        offsets = self._nz_byte_offsets(slots, num_kv_heads, packed_bytes)
++        turboquant_reference_cache.write_strip_planes(codes_key, codes_value, key_cache, value_cache, pages, offsets)
+ 
+-        def nz_bytes(codes: torch.Tensor) -> torch.Tensor:
+-            low, high = codes[..., :packed_bytes], codes[..., packed_bytes:]
+-            woven = torch.stack((low, high), dim=-1).reshape(*codes.shape[:-1], head_size)
+-            return TurboQuantEmulator.pack(woven).reshape(*codes.shape[:-1], -1, TURBOQUANT_NZ_OPERAND_C0)
+-
+-        for codes, cache, name in (
+-            (codes_key, key_cache, "key"),
+-            (codes_value, value_cache, "value"),
+-        ):
+-            _require_contiguous(cache, name).view(-1)[offsets] = nz_bytes(codes).to(cache.dtype)
+-
+-    @staticmethod
+-    def _nz_scale_slot_floats(num_kv_heads: int) -> int:
+-        lanes = TURBOQUANT_PACK_FACTOR * num_kv_heads
+-        return -(-lanes // TURBOQUANT_NZ_FP32_PER_BLOCK) * TURBOQUANT_NZ_FP32_PER_BLOCK
+-
+-    def _write_nz_scales(
+-        self,
+-        key_scales: torch.Tensor,
+-        value_scales: torch.Tensor,
+-        scale_cache: torch.Tensor,
+-        slots: torch.Tensor,
+-    ) -> None:
+-        num_kv_heads = scale_cache.shape[2]
+-        slot_floats = self._nz_scale_slot_floats(num_kv_heads)
+-        flat = _require_contiguous(scale_cache, "scale").view(-1)
+-        total_slots = scale_cache.shape[1] * scale_cache.shape[3]
+-        if flat.numel() < total_slots * slot_floats:
+-            raise ValueError(
+-                f"the NZ scale plane needs a whole {slot_floats}-float record per slot "
+-                f"(NzScaleSlotFloats({num_kv_heads})), {total_slots * slot_floats} floats over the cache; "
+-                f"the allocated plane holds {flat.numel()}, which is exact only when 2 * num_kv_heads "
+-                f"is a multiple of {TURBOQUANT_NZ_FP32_PER_BLOCK}"
+-            )
+-        lanes = torch.arange(num_kv_heads, device=slots.device)
+-        records = slots[:, None] * slot_floats + lanes
+-        flat[records] = key_scales.to(scale_cache.dtype)
+-        flat[records + num_kv_heads] = value_scales.to(scale_cache.dtype)
++    _nz_byte_offsets = staticmethod(turboquant_reference_cache.nz_byte_offsets)
++    _nz_scale_slot_floats = staticmethod(turboquant_reference_cache.nz_scale_slot_floats)
+ 
+     def gather(
+         self,
+@@ -760,109 +632,9 @@ class TurboQuantOpsAdapter:
+     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+         return self._require_kernel(TURBOQUANT_OP_GATHER_PAGES)(key_cache, value_cache, scale_cache, block_tables)
+ 
+-    def _reference_gather_pages(
+-        self,
+-        key_cache: torch.Tensor,
+-        value_cache: torch.Tensor,
+-        scale_cache: torch.Tensor,
+-        block_tables: torch.Tensor,
+-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+-        block_size = key_cache.shape[1]
+-        pages = block_tables.to(torch.int64)
+-        batch_size, max_blocks = pages.shape
+-        within = torch.arange(block_size, device=pages.device, dtype=torch.int64)
+-        slots = (pages.unsqueeze(-1) * block_size + within).reshape(batch_size, max_blocks * block_size)
+-
+-        packed_key = _flat_slot_view(key_cache)[slots]
+-        packed_value = _flat_slot_view(value_cache)[slots]
+-        num_kv_heads = scale_cache.shape[2]
+-
+-        def gathered_scales(plane: int) -> torch.Tensor:
+-            return scale_cache[plane][pages].transpose(-1, -2).reshape(batch_size, -1, num_kv_heads)
+-
+-        return (
+-            packed_key,
+-            gathered_scales(TURBOQUANT_KEY_PLANE),
+-            packed_value,
+-            gathered_scales(TURBOQUANT_VALUE_PLANE),
+-        )
+-
+-    def _reference_gather_pages_strip(
+-        self,
+-        key_cache: torch.Tensor,
+-        value_cache: torch.Tensor,
+-        scale_cache: torch.Tensor,
+-        block_tables: torch.Tensor,
+-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+-        num_blocks, block_size, num_kv_heads, packed_bytes = key_cache.shape
+-        head_size = packed_bytes * TURBOQUANT_PACK_FACTOR
+-        if block_size % TURBOQUANT_STRIP_TOKENS:
+-            raise ValueError(
+-                f"the strip cache is laid out 16 tokens at a time, so block_size {block_size} must be a "
+-                f"multiple of {TURBOQUANT_STRIP_TOKENS}"
+-            )
+-        strips_per_page = block_size // TURBOQUANT_STRIP_TOKENS
+-        pages = block_tables.to(torch.int64)
+-        batch_size = pages.shape[0]
+-
+-        key_pages = _require_contiguous(key_cache, "key").view(num_blocks, num_kv_heads, block_size, packed_bytes)
+-        packed_key = key_pages[pages].permute(0, 1, 3, 2, 4).reshape(batch_size, -1, num_kv_heads, packed_bytes)
+-
+-        value_pages = _require_contiguous(value_cache, "value").view(
+-            num_blocks, num_kv_heads, strips_per_page, head_size, TURBOQUANT_STRIP_TOKENS // TURBOQUANT_PACK_FACTOR
+-        )
+-        codes = TurboQuantEmulator.unpack(value_pages[pages])
+-        token_major = codes.permute(0, 1, 3, 5, 2, 4).reshape(batch_size, -1, num_kv_heads, head_size)
+-        packed_value = TurboQuantEmulator.pack(token_major.contiguous())
+-
+-        def gathered_scales(plane: int) -> torch.Tensor:
+-            return scale_cache[plane][pages].transpose(-1, -2).reshape(batch_size, -1, num_kv_heads)
+-
+-        return (
+-            packed_key,
+-            gathered_scales(TURBOQUANT_KEY_PLANE),
+-            packed_value,
+-            gathered_scales(TURBOQUANT_VALUE_PLANE),
+-        )
+-
+-    def _reference_gather_pages_nz(
+-        self,
+-        key_cache: torch.Tensor,
+-        value_cache: torch.Tensor,
+-        scale_cache: torch.Tensor,
+-        block_tables: torch.Tensor,
+-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+-        num_blocks, block_size, num_kv_heads, packed_bytes = key_cache.shape
+-        if block_size % TURBOQUANT_NZ_TILE_ROWS:
+-            raise ValueError(
+-                f"the NZ-tiled cache is laid out in {TURBOQUANT_NZ_TILE_ROWS}-row tiles, so block_size "
+-                f"{block_size} must be a multiple of {TURBOQUANT_NZ_TILE_ROWS}"
+-            )
+-        pages = block_tables.to(torch.int64)
+-        batch_size, max_blocks = pages.shape
+-        within = torch.arange(block_size, device=pages.device, dtype=torch.int64)
+-        slots = (pages.unsqueeze(-1) * block_size + within).reshape(batch_size, max_blocks * block_size)
+-
+-        offsets = self._nz_byte_offsets(slots, num_kv_heads, packed_bytes)
+-
+-        def read_plane(cache: torch.Tensor, name: str) -> torch.Tensor:
+-            gathered = _require_contiguous(cache, name).view(-1)[offsets]
+-            packed = gathered.reshape(batch_size, -1, num_kv_heads, packed_bytes)
+-            woven = TurboQuantEmulator.unpack(packed)
+-            codes = torch.cat((woven[..., 0::2], woven[..., 1::2]), dim=-1)
+-            return TurboQuantEmulator.pack(codes.contiguous())
+-
+-        slot_floats = self._nz_scale_slot_floats(num_kv_heads)
+-        flat_scales = _require_contiguous(scale_cache, "scale").view(-1)
+-        lanes = torch.arange(num_kv_heads, device=slots.device)
+-        records = slots[..., None] * slot_floats + lanes
+-
+-        return (
+-            read_plane(key_cache, "key"),
+-            flat_scales[records],
+-            read_plane(value_cache, "value"),
+-            flat_scales[records + num_kv_heads],
+-        )
++    _reference_gather_pages = staticmethod(turboquant_reference_cache.gather_pages)
++    _reference_gather_pages_strip = staticmethod(turboquant_reference_cache.gather_pages_strip)
++    _reference_gather_pages_nz = staticmethod(turboquant_reference_cache.gather_pages_nz)
+ 
+     def dequantize_cache(
+         self,
+@@ -974,7 +746,9 @@ class TurboQuantOpsAdapter:
+                 f"output.dtype is {output.dtype} (output shape {tuple(output.shape)}). The "
+                 "golden fallback serves any floating dtype; this is the kernel launch path."
+             )
+-        if query.data_ptr() == output.data_ptr():
++        # The binding also rejects this alias at runtime. Dynamo's fake
++        # tensors have no physical addresses to compare during the trace.
++        if not torch.compiler.is_compiling() and query.data_ptr() == output.data_ptr():
+             raise ValueError(
+                 f"query and output must not alias: both are at data_ptr={query.data_ptr()}. "
+                 "The fused decode reads the query through its whole prologue while writing "
+@@ -1048,24 +822,6 @@ class TurboQuantOpsAdapter:
+         return output
+ 
+ 
+-def _flat_slot_view(cache: torch.Tensor) -> torch.Tensor:
+-    if not cache.is_contiguous():
+-        raise RuntimeError(
+-            "the TurboQuant packed cache plane must be contiguous to be addressed by slot; "
+-            f"got strides {tuple(cache.stride())} for shape {tuple(cache.shape)}"
+-        )
+-    return cache.view(cache.shape[0] * cache.shape[1], *cache.shape[2:])
+-
+-
+-def _require_contiguous(cache: torch.Tensor, name: str) -> torch.Tensor:
+-    if not cache.is_contiguous():
+-        raise RuntimeError(
+-            f"the TurboQuant {name} plane must be contiguous to be addressed by page; "
+-            f"got strides {tuple(cache.stride())} for shape {tuple(cache.shape)}"
+-        )
+-    return cache
+-
+-
+ def _stream_is_capturing() -> bool:
+     with suppress(AttributeError, RuntimeError):
+         return bool(torch.npu.is_current_stream_capturing())
+diff --git a/vllm_ascend/attention/turboquant_v1.py b/vllm_ascend/attention/turboquant_v1.py
+index 9b606b5b8..295396035 100644
+--- a/vllm_ascend/attention/turboquant_v1.py
++++ b/vllm_ascend/attention/turboquant_v1.py
+@@ -466,12 +466,13 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
+                 attn_metadata.reshape_cache_event.record()
+             return query, key, value, output
+ 
+-        num_actual_tokens = attn_metadata.num_actual_tokens
+-        decode_slots = getattr(attn_metadata, "turboquant_slot_mapping", None)
+-        if getattr(attn_metadata, "attn_state", None) == AscendAttentionState.DecodeOnly and decode_slots is not None:
++        prepared_slots = getattr(attn_metadata, "turboquant_slot_mapping", None)
++        if getattr(attn_metadata, "attn_state", None) == AscendAttentionState.DecodeOnly and prepared_slots is not None:
+             # The captured writer, like attention, must cover the padded extent.
+             # Live request counts change between replays; -1 slots mask padding.
+             num_actual_tokens = self._decode_num_tokens(attn_metadata)
++        else:
++            num_actual_tokens = attn_metadata.num_actual_tokens
+         if num_actual_tokens == 0:
+             return query, key, value, output
+ 
+@@ -516,15 +517,12 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
+             decode_slots = getattr(attn_metadata, "turboquant_slot_mapping", None)
+             if decode_slots is not None:
+                 return decode_slots[:num_actual_tokens], None
+-        cached = getattr(attn_metadata, "_turboquant_ingestion_cache", None)
+-        if cached is not None and cached[0] is attn_metadata.slot_mapping:
+-            return cached[1], cached[2]
+-        slot_mapping = attn_metadata.slot_mapping[:num_actual_tokens].to(torch.int32)
+-        strip_plan: TurboQuantStripPlan | None = None
+-        if phase is TurboQuantIngestionPhase.PREFILL and self.adapter.has_kernel(TURBOQUANT_OP_RESHAPE_AND_CACHE):
+-            strip_plan = turboquant_plan_strip_ingestion(slot_mapping.tolist(), int(self.key_cache.shape[1]))
+-        attn_metadata._turboquant_ingestion_cache = (attn_metadata.slot_mapping, slot_mapping, strip_plan)
+-        return slot_mapping, strip_plan
++        slot_mapping = getattr(attn_metadata, "turboquant_ingestion_slot_mapping", None)
++        if slot_mapping is None:
++            # Standalone callers may supply metadata without the builder's
++            # fields. In that case the prefill adapter plans on demand.
++            return attn_metadata.slot_mapping[:num_actual_tokens].to(torch.int32), None
++        return slot_mapping, getattr(attn_metadata, "turboquant_strip_plan", None)
+ 
+     @staticmethod
+     def _ingestion_phase(attn_metadata: AscendMetadata, num_actual_tokens: int) -> TurboQuantIngestionPhase:
+diff --git a/tests/ut/attention/test_turboquant_host_graph.py b/tests/ut/attention/test_turboquant_host_graph.py
+new file mode 100644
+index 000000000..fa4a1a8f4
+--- /dev/null
++++ b/tests/ut/attention/test_turboquant_host_graph.py
+@@ -0,0 +1,341 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CPU contracts for prepared TurboQuant cache writes and Dynamo graph capture."""
++
++from types import SimpleNamespace
++from uuid import uuid4
++
++import pytest
++import torch
++from vllm.v1.attention.backend import AttentionType
++
++from tests.helpers.turboquant import make_cache, make_metadata_builder
++from tests.ut.attention.test_turboquant_op_schemas import _schema_strings
++from vllm_ascend.attention import turboquant_metadata, turboquant_ops, turboquant_v1
++from vllm_ascend.attention.attention_v1 import AscendAttentionState
++from vllm_ascend.attention.turboquant_config import (
++    TURBOQUANT_KERNEL_BLOCK_SIZE as BLOCK_SIZE,
++)
++from vllm_ascend.attention.turboquant_config import (
++    TURBOQUANT_KERNEL_HEAD_SIZE as HEAD_SIZE,
++)
++from vllm_ascend.attention.turboquant_config import (
++    TURBOQUANT_KERNEL_KV_HEADS as KV_HEADS,
++)
++from vllm_ascend.attention.turboquant_config import (
++    TURBOQUANT_NAMESPACE_ENV,
++    TURBOQUANT_OP_BUILD_DECODE_TILING,
++    TURBOQUANT_OP_FUSED_DECODE,
++    TURBOQUANT_OP_RESHAPE_AND_CACHE,
++    TURBOQUANT_OP_RESHAPE_SCATTER,
++    TURBOQUANT_STAGES_ENV,
++    TURBOQUANT_STRIP_TOKENS,
++)
++from vllm_ascend.attention.turboquant_metadata import AscendTurboQuantMetadata
++from vllm_ascend.attention.turboquant_telemetry import NullDispatchObserver
++
++NUM_BLOCKS = 3
++NUM_HEADS = 2 * KV_HEADS
++CHAMPION_TOKENS = 6 * TURBOQUANT_STRIP_TOKENS
++
++
++@pytest.fixture
++def kernels(monkeypatch):
++    # Use a private namespace, including on CI hosts where the real extension
++    # is already registered. Copy the raw mutating schemas from the binding.
++    namespace = f"turboquant_host_{uuid4().hex}"
++    monkeypatch.setenv(TURBOQUANT_NAMESPACE_ENV, namespace)
++    monkeypatch.setenv(TURBOQUANT_STAGES_ENV, "reshape_and_cache,scatter,decode")
++    monkeypatch.setenv("VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS", "0")
++    monkeypatch.setattr(turboquant_metadata, "load_turboquant_extension", lambda: False)
++    monkeypatch.setattr(turboquant_ops, "load_turboquant_extension", lambda: False)
++    monkeypatch.setattr(turboquant_metadata, "_stream_is_capturing", lambda: False)
++    monkeypatch.setattr(turboquant_v1, "notify_kv_cache_written", lambda: None)
++    calls = []
++    schemas = _schema_strings()
++
++    def run(op_name):
++        names = tuple(arg.name for arg in torch._C.parse_schema(schemas[op_name]).arguments)
++
++        def cpu(*args):
++            # The dispatcher can omit arguments equal to their schema defaults.
++            call = dict(zip(names, args))
++            if op_name == TURBOQUANT_OP_BUILD_DECODE_TILING:
++                call["tiling"][: call["context_lens"].numel()].copy_(call["context_lens"])
++                return
++            if op_name == TURBOQUANT_OP_FUSED_DECODE:
++                query, output = call["query"], call["output"]
++                if query.data_ptr() == output.data_ptr():
++                    raise ValueError("query and output must not alias")
++                lengths = call["context_lens"]
++                assert torch.equal(call["tiling"][: lengths.numel()], lengths)
++                last = (lengths.long() - 1).clamp_min(0)
++                page = call["block_tables"][torch.arange(last.numel()), last // BLOCK_SIZE]
++                slots = page * BLOCK_SIZE + last % BLOCK_SIZE
++                cache_planes = ("key_cache", "value_cache", "scale_cache")
++                marker = sum(call[plane].flatten()[slots].float() for plane in cache_planes)
++                output.copy_(torch.where(lengths[:, None, None] > 0, query + marker[:, None, None], 0))
++                call["workspace"].fill_(19)
++                call["query_rot"].fill_(23)
++                calls.append((op_name, lengths.tolist(), call["tiling"].data_ptr()))
++                return
++
++            # Store row markers instead of emulating the numerical kernel.
++            # Each fake writer mutates the three planes declared in its schema.
++            slots = call["slot_mapping"]
++            calls.append((op_name, slots.numpy().tolist(), slots.data_ptr()))
++            keep = slots >= 0
++            dst = slots[keep].long()
++            key, value = call["key"][keep, 0, 0], call["value"][keep, 0, 0]
++            call["key_cache"].view(-1)[dst] = key.to(torch.int8)
++            call["value_cache"].view(-1)[dst] = value.to(torch.int8)
++            call["scale_cache"].view(-1)[dst] = (key + value).float()
++
++        return cpu
++
++    lib = torch.library.Library(namespace, "FRAGMENT")
++    for name, schema in schemas.items():
++        lib.define(schema)
++        lib.impl(name, run(name), "CPU")
++        lib.impl(name, lambda *args: None, "Meta")
++    yield SimpleNamespace(namespace=namespace, calls=calls)
++
++
++class _Backend(turboquant_v1.AscendTurboQuantBackendImpl):
++    def __init__(self):
++        self.attn_type = AttentionType.DECODER
++        self.kv_sharing_target_layer_name = None
++        self.num_heads, self.num_kv_heads, self.head_size = NUM_HEADS, KV_HEADS, HEAD_SIZE
++        self.scale = HEAD_SIZE**-0.5
++        self.adapter = turboquant_ops.TurboQuantOpsAdapter(dispatch_observer=NullDispatchObserver())
++        self.emulator = None
++        self._bind_codec_constants(SimpleNamespace(), torch.device("cpu"))
++        self.key_cache, self.value_cache, self.scale_cache = make_cache(
++            NUM_BLOCKS, BLOCK_SIZE, KV_HEADS, HEAD_SIZE, poison=True
++        )
++
++    @property
++    def caches(self):
++        return self.key_cache, self.value_cache, self.scale_cache
++
++    def _run_dense_attention(self, query, key, value, *args, **kwargs):
++        # The real prefill attention call is a vendor operator.
++        return query + value.mean(dim=1, keepdim=True)
++
++
++def _metadata(builder, slots, context_lens, query_lens, *, decode=False):
++    state = AscendAttentionState.DecodeOnly if decode else AscendAttentionState.PrefillNoCache
++    num_tokens = sum(query_lens)
++    num_reqs = len(query_lens)
++    block_table = torch.zeros((len(context_lens), NUM_BLOCKS), dtype=torch.int32)
++    block_table[:, 0] = torch.arange(len(context_lens))
++    common = SimpleNamespace(slot_mapping=slots, num_reqs=num_reqs, attn_state=state, num_actual_tokens=num_tokens)
++    fields = builder._build_backend_metadata(
++        common,
++        block_table=block_table,
++        query_lens=torch.tensor(query_lens),
++        seq_lens=torch.tensor(context_lens),
++        num_decodes=num_reqs if decode else 0,
++        num_prefills=0 if decode else num_reqs,
++    )
++    metadata = AscendTurboQuantMetadata(**fields)
++    metadata.attn_state = state
++    metadata.slot_mapping = slots
++    metadata.seq_lens_list = context_lens
++    metadata.num_actual_tokens = num_tokens
++    metadata.block_tables = block_table
++    metadata.actual_seq_lengths_q = torch.tensor(query_lens).cumsum(0).tolist()
++    metadata.attn_mask = None
++    metadata.causal = True
++    return metadata
++
++
++def _builder():
++    return make_metadata_builder(4, NUM_HEADS, KV_HEADS, HEAD_SIZE, BLOCK_SIZE, NUM_BLOCKS)
++
++
++def _inputs(tokens):
++    query = torch.ones((tokens, NUM_HEADS, HEAD_SIZE), dtype=torch.bfloat16)
++    row = torch.arange(1, tokens + 1, dtype=torch.bfloat16).view(-1, 1, 1)
++    key = row.expand(-1, KV_HEADS, HEAD_SIZE).contiguous()
++    return query, key, -key, torch.empty_like(query)
++
++
++def test_aligned_96_token_prefill_plans_once_for_all_layers_and_rebuilds_next_batch(monkeypatch, kernels):
++    calls = []
++    tolist = torch.Tensor.tolist
++    plan_ingestion = turboquant_metadata.turboquant_plan_strip_ingestion
++
++    def track_slot_reads(tensor):
++        if tensor.dtype == torch.int32 and tensor.shape == (CHAMPION_TOKENS,):
++            calls.append("tolist")
++        return tolist(tensor)
++
++    def plan(slots, page_size):
++        calls.append(("plan", tuple(slots)))
++        return plan_ingestion(slots, page_size)
++
++    def cold_plan(*args):
++        pytest.fail("a layer planned on demand despite builder-prepared metadata")
++
++    monkeypatch.setattr(torch.Tensor, "tolist", track_slot_reads)
++    monkeypatch.setattr(turboquant_metadata, "turboquant_plan_strip_ingestion", plan)
++    monkeypatch.setattr(turboquant_ops, "turboquant_plan_strip_ingestion", cold_plan)
++    builder = _builder()
++    source = torch.arange(CHAMPION_TOKENS + 2, dtype=torch.int32)
++    source[-2:] = 777  # Poison padding beyond the live extent.
++    layers = [_Backend(), _Backend()]
++    query, key, value, output = _inputs(CHAMPION_TOKENS)
++    for offset in (0, BLOCK_SIZE):
++        live = list(range(offset, offset + CHAMPION_TOKENS))
++        source[:CHAMPION_TOKENS].copy_(torch.tensor(live))
++        before = len(calls)
++        metadata = _metadata(builder, source, [CHAMPION_TOKENS], [CHAMPION_TOKENS])
++        assert calls[before:] == ["tolist", ("plan", tuple(live))]
++        assert metadata.turboquant_strip_plan.is_whole_batch
++        prepared = metadata.turboquant_ingestion_slot_mapping
++        assert prepared.data_ptr() != source.data_ptr()
++        # A new write to the runner's int32 slot buffer must not change the
++        # prepared targets or invalidate their whole-batch plan.
++        source[0] = offset + CHAMPION_TOKENS + 5
++        for layer in layers:
++            layer.reshape_and_cache(query, key, value, layer.caches, metadata, output)
++        assert calls[before:] == ["tolist", ("plan", tuple(live))]
++        writer_call = (TURBOQUANT_OP_RESHAPE_AND_CACHE, live, prepared.data_ptr())
++        assert kernels.calls[-2:] == [writer_call] * 2
++        for layer in layers:
++            torch.testing.assert_close(layer.key_cache.flatten()[live], key[:, 0, 0].to(torch.int8))
++
++
++def test_fragmented_prefill_preserves_wave_order_duplicate_slots_and_poison(kernels):
++    slots = [1, -1, 2, 1, 33, *range(64, 80), 96, 97, 101]
++    builder = _builder()
++    metadata = _metadata(builder, torch.tensor(slots), [len(slots)], [len(slots)])
++    query, key, value, output = _inputs(len(slots))
++    layer = _Backend()
++    before = [cache.clone() for cache in layer.caches]
++    layer.reshape_and_cache(query, key, value, layer.caches, metadata, output)
++    launches = [(name, rows) for name, rows, _ in kernels.calls]
++    assert launches == [
++        (TURBOQUANT_OP_RESHAPE_AND_CACHE, list(range(64, 80))),
++        (TURBOQUANT_OP_RESHAPE_SCATTER, [1, -1, 33, 96]),
++        (TURBOQUANT_OP_RESHAPE_SCATTER, [2, 97]),
++        (TURBOQUANT_OP_RESHAPE_SCATTER, [1, 101]),
++    ]
++    for row, slot in enumerate(slots):
++        if slot >= 0:
++            before[0].view(-1)[slot] = key[row, 0, 0].to(torch.int8)
++            before[1].view(-1)[slot] = value[row, 0, 0].to(torch.int8)
++            before[2].view(-1)[slot] = 0
++    for observed, expected in zip(layer.caches, before):
++        if observed.is_floating_point():
++            observed, expected = observed.view(torch.int32), expected.view(torch.int32)
++        torch.testing.assert_close(observed, expected, rtol=0, atol=0)
++
++
++def test_default_stages_skip_strip_planning(monkeypatch, kernels):
++    monkeypatch.delenv(TURBOQUANT_STAGES_ENV)
++    slots = torch.arange(TURBOQUANT_STRIP_TOKENS, dtype=torch.int64)
++    metadata = _metadata(_builder(), slots, [slots.numel()], [slots.numel()])
++    assert metadata.turboquant_ingestion_slot_mapping.dtype == torch.int32
++    assert metadata.turboquant_strip_plan is None
++    assert not kernels.calls
++
++
++def test_prefill_slots_do_not_satisfy_the_decode_capture_guard(monkeypatch, kernels):
++    tokens = TURBOQUANT_STRIP_TOKENS
++    metadata = _metadata(_builder(), torch.arange(tokens), [tokens], [tokens])
++    assert metadata.turboquant_ingestion_slot_mapping is not None
++    assert metadata.turboquant_slot_mapping is None
++    # The base builder can apply the requested capture state after building.
++    metadata.attn_state = AscendAttentionState.DecodeOnly
++    query, key, value, output = _inputs(tokens)
++    layer = _Backend()
++    monkeypatch.setattr(turboquant_v1, "_stream_is_capturing", lambda: True)
++    with pytest.raises(RuntimeError, match="decode slot mapping must be prepared"):
++        layer.forward(None, query, key, value, layer.caches, metadata, output)
++    assert not kernels.calls
++
++
++def _record_graphs():
++    graphs = []
++
++    def backend(graph, example_inputs):
++        graphs.append(graph)
++        return graph.forward
++
++    return graphs, backend
++
++
++def _run_layer(layer, metadata, query, key, value, output):
++    # These are the two TurboQuant hooks called by the shared attention
++    # forward. The device-free runner stubs that base class.
++    _, _, _, output = layer.reshape_and_cache(query, key, value, layer.caches, metadata, output)
++    return layer.forward_impl(query, key, value, layer.caches, metadata, output)
++
++
++def _check_graph(graphs, kernels, *names):
++    assert len(graphs) == 1
++    targets = [str(node.target) for node in graphs[0].graph.nodes if node.op in ("call_function", "call_method")]
++    assert [target for target in targets if kernels.namespace in target] == [
++        f"{kernels.namespace}.{name}" for name in names
++    ]
++    assert not any("tolist" in target or "data_ptr" in target or "_local_scalar_dense" in target for target in targets)
++
++
++def test_prepared_prefill_traces_as_one_graph(kernels):
++    metadata = _metadata(_builder(), torch.arange(CHAMPION_TOKENS), [CHAMPION_TOKENS], [CHAMPION_TOKENS])
++    layer = _Backend()
++    query, key, value, output = _inputs(CHAMPION_TOKENS)
++    graphs, backend = _record_graphs()
++    compiled = torch.compile(_run_layer, backend=backend, fullgraph=True, dynamic=False)
++    assert compiled(layer, metadata, query, key, value, output) is output
++    _check_graph(graphs, kernels, TURBOQUANT_OP_RESHAPE_AND_CACHE)
++    torch.testing.assert_close(output, query + value[:, :1])
++    assert [name for name, _, _ in kernels.calls] == [TURBOQUANT_OP_RESHAPE_AND_CACHE]
++
++
++def test_standalone_adapter_plans_eagerly_and_needs_preparation_for_a_full_graph(kernels):
++    layer = _Backend()
++    _, key, value, _ = _inputs(CHAMPION_TOKENS)
++    slots = torch.arange(CHAMPION_TOKENS, dtype=torch.int32)
++
++    def ingest(key, value, slots):
++        layer.adapter.reshape_and_cache_prefill(key, value, *layer.caches, slots, layer.emulator)
++
++    graphs, backend = _record_graphs()
++    compiled = torch.compile(ingest, backend=backend, fullgraph=True, dynamic=False)
++    with pytest.raises(
++        (torch._dynamo.exc.Unsupported, torch._dynamo.exc.UserError), match="(?i)tolist|data-dependent|could not guard"
++    ):
++        compiled(key, value, slots)
++    assert not graphs
++    assert not kernels.calls
++
++    ingest(key, value, slots)
++    assert kernels.calls == [(TURBOQUANT_OP_RESHAPE_AND_CACHE, slots.tolist(), slots.data_ptr())]
++
++
++def test_fixed_decode_traces_once_and_uses_refreshed_padded_metadata(kernels):
++    builder, layer = _builder(), _Backend()
++    query, key, value, output = _inputs(2)
++    value.copy_(key)
++    graphs, backend = _record_graphs()
++    compiled = torch.compile(_run_layer, backend=backend, fullgraph=True, dynamic=False)
++    # The builder refreshes the backing buffers before the second call and
++    # masks the dirty padded slot, while the launch extent stays fixed.
++    metadata = _metadata(builder, torch.tensor([0, BLOCK_SIZE + 1]), [1, 2], [1, 1], decode=True)
++    assert compiled(layer, metadata, query, key, value, output) is output
++    torch.testing.assert_close(output[:, 0, 0], torch.tensor([5, 9], dtype=output.dtype))
++    _, workspace, query_rot = layer._get_decode_launch_buffers(metadata, 2)
++    assert torch.all(workspace == 19)
++    assert torch.all(query_rot == 23)
++    refreshed = _metadata(builder, torch.tensor([2, 127]), [3, 0], [1], decode=True)
++    assert refreshed.turboquant_slot_mapping.data_ptr() == metadata.turboquant_slot_mapping.data_ptr()
++    assert refreshed.turboquant_context_lens.data_ptr() == metadata.turboquant_context_lens.data_ptr()
++    assert compiled(layer, refreshed, query, key, value, output) is output
++    _check_graph(graphs, kernels, TURBOQUANT_OP_RESHAPE_SCATTER, TURBOQUANT_OP_FUSED_DECODE)
++    torch.testing.assert_close(output[:, 0, 0], torch.tensor([5, 0], dtype=output.dtype))
++    assert kernels.calls[-2][1] == [2, -1]
++    assert kernels.calls[-1][1] == [3, 0]
++    assert layer.key_cache.view(-1)[127] == 127
+diff --git a/vllm_ascend/attention/turboquant_reference_cache.py b/vllm_ascend/attention/turboquant_reference_cache.py
+new file mode 100644
+index 000000000..7d05f0fdb
+--- /dev/null
++++ b/vllm_ascend/attention/turboquant_reference_cache.py
+@@ -0,0 +1,307 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""PyTorch reference writes, gathers and indexing for TurboQuant cache layouts."""
++
++from __future__ import annotations
++
++from collections.abc import Callable
++
++import torch
++
++from vllm_ascend.attention.turboquant_codec import TurboQuantEmulator
++from vllm_ascend.attention.turboquant_config import (
++    TURBOQUANT_NZ_FP32_PER_BLOCK,
++    TURBOQUANT_NZ_OPERAND_C0,
++    TURBOQUANT_NZ_TILE_ROWS,
++    TURBOQUANT_STRIP_TOKENS,
++    TurboQuantValueLayout,
++)
++from vllm_ascend.attention.turboquant_layout import (
++    TURBOQUANT_KEY_PLANE,
++    TURBOQUANT_PACK_FACTOR,
++    TURBOQUANT_VALUE_PLANE,
++)
++
++
++def write_slots(
++    key: torch.Tensor,
++    value: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    scale_cache: torch.Tensor,
++    slot_mapping: torch.Tensor,
++    emulator: TurboQuantEmulator,
++    *,
++    rotate: Callable[[torch.Tensor, TurboQuantEmulator], torch.Tensor],
++    layout: TurboQuantValueLayout,
++    lloyd_max_folds: tuple[str, str] = ("key", "value"),
++) -> None:
++    codes_key, key_scales = emulator.quantize(rotate(key, emulator), lloyd_max_folds[0])
++    codes_value, value_scales = emulator.quantize(rotate(value, emulator), lloyd_max_folds[1])
++
++    block_size = key_cache.shape[1]
++    slots = slot_mapping.to(torch.int64)
++    valid = slots >= 0
++    if not bool(valid.all()):
++        slots = slots[valid]
++        codes_key = codes_key[valid]
++        codes_value = codes_value[valid]
++        key_scales = key_scales[valid]
++        value_scales = value_scales[valid]
++    if slots.numel() == 0:
++        return
++
++    num_blocks = key_cache.shape[0]
++    slot_capacity = num_blocks * block_size
++    max_slot = int(slots.max())
++    if max_slot >= slot_capacity:
++        raise ValueError(
++            f"slot_mapping is out of range for the TurboQuant cache: expected slots in "
++            f"[0, {slot_capacity}) ({num_blocks} blocks activations {block_size} tokens, from key_cache.shape="
++            f"{tuple(key_cache.shape)}), but the largest non-negative slot is {max_slot}."
++        )
++
++    pages = torch.div(slots, block_size, rounding_mode="floor")
++    offsets = slots - pages * block_size
++
++    if layout is TurboQuantValueLayout.CHANNEL_MAJOR:
++        write_strip_planes(codes_key, codes_value, key_cache, value_cache, pages, offsets)
++    elif layout is TurboQuantValueLayout.NZ_TILED:
++        _write_nz_planes(codes_key, codes_value, key_cache, value_cache, slots)
++    else:
++        for packed, cache in (
++            (emulator.pack(codes_key), key_cache),
++            (emulator.pack(codes_value), value_cache),
++        ):
++            _flat_slot_view(cache)[slots] = packed
++
++    if layout is TurboQuantValueLayout.NZ_TILED:
++        _write_nz_scales(key_scales, value_scales, scale_cache, slots)
++    else:
++        for plane, scales in (
++            (TURBOQUANT_KEY_PLANE, key_scales),
++            (TURBOQUANT_VALUE_PLANE, value_scales),
++        ):
++            scale_cache[plane][pages, :, offsets] = scales.to(scale_cache.dtype)
++
++
++def write_strip_planes(
++    codes_key: torch.Tensor,
++    codes_value: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    pages: torch.Tensor,
++    offsets: torch.Tensor,
++) -> None:
++    num_blocks, block_size, num_kv_heads, packed_bytes = key_cache.shape
++    head_size = packed_bytes * TURBOQUANT_PACK_FACTOR
++    if block_size % TURBOQUANT_STRIP_TOKENS:
++        raise ValueError(
++            f"the strip cache is written 16 tokens at a time, so block_size {block_size} must be a "
++            f"multiple of {TURBOQUANT_STRIP_TOKENS}"
++        )
++    strips_per_page = block_size // TURBOQUANT_STRIP_TOKENS
++
++    key_pages = _require_contiguous(key_cache, "key").view(num_blocks, num_kv_heads, block_size, packed_bytes)
++    key_pages[pages, :, offsets] = TurboQuantEmulator.pack(codes_key)
++
++    strips = torch.div(offsets, TURBOQUANT_STRIP_TOKENS, rounding_mode="floor")
++    lanes = offsets - strips * TURBOQUANT_STRIP_TOKENS
++    value_pages = _require_contiguous(value_cache, "value").view(
++        num_blocks, num_kv_heads, strips_per_page, head_size, TURBOQUANT_STRIP_TOKENS // TURBOQUANT_PACK_FACTOR
++    )
++    touched, inverse = torch.unique(pages, return_inverse=True)
++    panel = TurboQuantEmulator.unpack(value_pages[touched])
++    panel[inverse, :, strips, :, lanes] = codes_value
++    value_pages[touched] = TurboQuantEmulator.pack(panel)
++
++
++def nz_byte_offsets(slots: torch.Tensor, num_kv_heads: int, packed_bytes: int) -> torch.Tensor:
++    tile_rows = TURBOQUANT_NZ_TILE_ROWS
++    c0 = TURBOQUANT_NZ_OPERAND_C0
++    groups = packed_bytes // c0
++    device = slots.device
++    tile_row = slots % tile_rows
++    base = (slots - tile_row) * (num_kv_heads * packed_bytes) + tile_row * c0
++    heads = torch.arange(num_kv_heads, device=device) * (tile_rows * packed_bytes)
++    group = torch.arange(groups, device=device) * (tile_rows * c0)
++    byte = torch.arange(c0, device=device)
++    return base[..., None, None, None] + heads.view(-1, 1, 1) + group.view(-1, 1) + byte
++
++
++def _write_nz_planes(
++    codes_key: torch.Tensor,
++    codes_value: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    slots: torch.Tensor,
++) -> None:
++    _, block_size, num_kv_heads, packed_bytes = key_cache.shape
++    head_size = packed_bytes * TURBOQUANT_PACK_FACTOR
++    if block_size % TURBOQUANT_NZ_TILE_ROWS:
++        raise ValueError(
++            f"the NZ-tiled cache is laid out in {TURBOQUANT_NZ_TILE_ROWS}-row tiles, so block_size "
++            f"{block_size} must be a multiple of {TURBOQUANT_NZ_TILE_ROWS}"
++        )
++    offsets = nz_byte_offsets(slots, num_kv_heads, packed_bytes)
++
++    def nz_bytes(codes: torch.Tensor) -> torch.Tensor:
++        low, high = codes[..., :packed_bytes], codes[..., packed_bytes:]
++        woven = torch.stack((low, high), dim=-1).reshape(*codes.shape[:-1], head_size)
++        return TurboQuantEmulator.pack(woven).reshape(*codes.shape[:-1], -1, TURBOQUANT_NZ_OPERAND_C0)
++
++    for codes, cache, name in (
++        (codes_key, key_cache, "key"),
++        (codes_value, value_cache, "value"),
++    ):
++        _require_contiguous(cache, name).view(-1)[offsets] = nz_bytes(codes).to(cache.dtype)
++
++
++def nz_scale_slot_floats(num_kv_heads: int) -> int:
++    lanes = TURBOQUANT_PACK_FACTOR * num_kv_heads
++    return -(-lanes // TURBOQUANT_NZ_FP32_PER_BLOCK) * TURBOQUANT_NZ_FP32_PER_BLOCK
++
++
++def _write_nz_scales(
++    key_scales: torch.Tensor,
++    value_scales: torch.Tensor,
++    scale_cache: torch.Tensor,
++    slots: torch.Tensor,
++) -> None:
++    num_kv_heads = scale_cache.shape[2]
++    slot_floats = nz_scale_slot_floats(num_kv_heads)
++    flat = _require_contiguous(scale_cache, "scale").view(-1)
++    total_slots = scale_cache.shape[1] * scale_cache.shape[3]
++    if flat.numel() < total_slots * slot_floats:
++        raise ValueError(
++            f"the NZ scale plane needs a whole {slot_floats}-float record per slot "
++            f"(NzScaleSlotFloats({num_kv_heads})), {total_slots * slot_floats} floats over the cache; "
++            f"the allocated plane holds {flat.numel()}, which is exact only when 2 * num_kv_heads "
++            f"is a multiple of {TURBOQUANT_NZ_FP32_PER_BLOCK}"
++        )
++    lanes = torch.arange(num_kv_heads, device=slots.device)
++    records = slots[:, None] * slot_floats + lanes
++    flat[records] = key_scales.to(scale_cache.dtype)
++    flat[records + num_kv_heads] = value_scales.to(scale_cache.dtype)
++
++
++def gather_pages(
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    scale_cache: torch.Tensor,
++    block_tables: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    block_size = key_cache.shape[1]
++    pages = block_tables.to(torch.int64)
++    batch_size, max_blocks = pages.shape
++    within = torch.arange(block_size, device=pages.device, dtype=torch.int64)
++    slots = (pages.unsqueeze(-1) * block_size + within).reshape(batch_size, max_blocks * block_size)
++
++    packed_key = _flat_slot_view(key_cache)[slots]
++    packed_value = _flat_slot_view(value_cache)[slots]
++    num_kv_heads = scale_cache.shape[2]
++
++    def gathered_scales(plane: int) -> torch.Tensor:
++        return scale_cache[plane][pages].transpose(-1, -2).reshape(batch_size, -1, num_kv_heads)
++
++    return (
++        packed_key,
++        gathered_scales(TURBOQUANT_KEY_PLANE),
++        packed_value,
++        gathered_scales(TURBOQUANT_VALUE_PLANE),
++    )
++
++
++def gather_pages_strip(
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    scale_cache: torch.Tensor,
++    block_tables: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    num_blocks, block_size, num_kv_heads, packed_bytes = key_cache.shape
++    head_size = packed_bytes * TURBOQUANT_PACK_FACTOR
++    if block_size % TURBOQUANT_STRIP_TOKENS:
++        raise ValueError(
++            f"the strip cache is laid out 16 tokens at a time, so block_size {block_size} must be a "
++            f"multiple of {TURBOQUANT_STRIP_TOKENS}"
++        )
++    strips_per_page = block_size // TURBOQUANT_STRIP_TOKENS
++    pages = block_tables.to(torch.int64)
++    batch_size = pages.shape[0]
++
++    key_pages = _require_contiguous(key_cache, "key").view(num_blocks, num_kv_heads, block_size, packed_bytes)
++    packed_key = key_pages[pages].permute(0, 1, 3, 2, 4).reshape(batch_size, -1, num_kv_heads, packed_bytes)
++
++    value_pages = _require_contiguous(value_cache, "value").view(
++        num_blocks, num_kv_heads, strips_per_page, head_size, TURBOQUANT_STRIP_TOKENS // TURBOQUANT_PACK_FACTOR
++    )
++    codes = TurboQuantEmulator.unpack(value_pages[pages])
++    token_major = codes.permute(0, 1, 3, 5, 2, 4).reshape(batch_size, -1, num_kv_heads, head_size)
++    packed_value = TurboQuantEmulator.pack(token_major.contiguous())
++
++    def gathered_scales(plane: int) -> torch.Tensor:
++        return scale_cache[plane][pages].transpose(-1, -2).reshape(batch_size, -1, num_kv_heads)
++
++    return (
++        packed_key,
++        gathered_scales(TURBOQUANT_KEY_PLANE),
++        packed_value,
++        gathered_scales(TURBOQUANT_VALUE_PLANE),
++    )
++
++
++def gather_pages_nz(
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    scale_cache: torch.Tensor,
++    block_tables: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    _, block_size, num_kv_heads, packed_bytes = key_cache.shape
++    if block_size % TURBOQUANT_NZ_TILE_ROWS:
++        raise ValueError(
++            f"the NZ-tiled cache is laid out in {TURBOQUANT_NZ_TILE_ROWS}-row tiles, so block_size "
++            f"{block_size} must be a multiple of {TURBOQUANT_NZ_TILE_ROWS}"
++        )
++    pages = block_tables.to(torch.int64)
++    batch_size, max_blocks = pages.shape
++    within = torch.arange(block_size, device=pages.device, dtype=torch.int64)
++    slots = (pages.unsqueeze(-1) * block_size + within).reshape(batch_size, max_blocks * block_size)
++
++    offsets = nz_byte_offsets(slots, num_kv_heads, packed_bytes)
++
++    def read_plane(cache: torch.Tensor, name: str) -> torch.Tensor:
++        gathered = _require_contiguous(cache, name).view(-1)[offsets]
++        packed = gathered.reshape(batch_size, -1, num_kv_heads, packed_bytes)
++        woven = TurboQuantEmulator.unpack(packed)
++        codes = torch.cat((woven[..., 0::2], woven[..., 1::2]), dim=-1)
++        return TurboQuantEmulator.pack(codes.contiguous())
++
++    slot_floats = nz_scale_slot_floats(num_kv_heads)
++    flat_scales = _require_contiguous(scale_cache, "scale").view(-1)
++    lanes = torch.arange(num_kv_heads, device=slots.device)
++    records = slots[..., None] * slot_floats + lanes
++
++    return (
++        read_plane(key_cache, "key"),
++        flat_scales[records],
++        read_plane(value_cache, "value"),
++        flat_scales[records + num_kv_heads],
++    )
++
++
++def _flat_slot_view(cache: torch.Tensor) -> torch.Tensor:
++    if not cache.is_contiguous():
++        raise RuntimeError(
++            "the TurboQuant packed cache plane must be contiguous to be addressed by slot; "
++            f"got strides {tuple(cache.stride())} for shape {tuple(cache.shape)}"
++        )
++    return cache.view(cache.shape[0] * cache.shape[1], *cache.shape[2:])
++
++
++def _require_contiguous(cache: torch.Tensor, name: str) -> torch.Tensor:
++    if not cache.is_contiguous():
++        raise RuntimeError(
++            f"the TurboQuant {name} plane must be contiguous to be addressed by page; "
++            f"got strides {tuple(cache.stride())} for shape {tuple(cache.shape)}"
++        )
++    return cache

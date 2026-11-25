@@ -1,0 +1,26 @@
+R1 final candidate: final integrated CPU-only suite, scoped diff check and Python lint.
+
+Python 3.14.7, PyTorch 2.14.0+cpu. No real torch_npu import, NPU work, or native builds.
+
+$env:PYTEST_DISABLE_PLUGIN_AUTOLOAD='1'; py -B tests/ut/attention/run_turboquant_device_free.py -q --tb=short
+........................................................................ [ 11%]
+........................................................................ [ 23%]
+........................................................................ [ 35%]
+........................................................................ [ 47%]
+........................................................................ [ 59%]
+........................................................................ [ 71%]
+........................................................................ [ 83%]
+........................................................................ [ 95%]
+..............................                                           [100%]
+606 passed in 22.93s
+
+git diff --check HEAD -- vllm_ascend/attention tests/ut/attention docs/source/user_guide/feature_guide/graph_mode.md
+warning: in the working copy of 'tests/ut/attention/test_turboquant_e8.py', LF will be replaced by CRLF the next time Git touches it
+
+C:\Users\Admin\AppData\Local\Python\pythoncore-3.14-64\python.exe -B -m ruff check --no-cache tests/ut/attention/run_turboquant_device_free.py tests/ut/attention/stub_vllm.py tests/ut/attention/test_turboquant_block_moves.py tests/ut/attention/test_turboquant_capture_contract.py tests/ut/attention/test_turboquant_e8.py tests/ut/attention/test_turboquant_host_graph.py tests/ut/attention/test_turboquant_kernel_cache_layout.py tests/ut/attention/test_turboquant_live_write_npu.py tests/ut/attention/test_turboquant_nz_cache.py tests/ut/attention/test_turboquant_nz_ingress.py tests/ut/attention/test_turboquant_op_schemas.py vllm_ascend/attention/turboquant_metadata.py vllm_ascend/attention/turboquant_ops.py vllm_ascend/attention/turboquant_reference_cache.py vllm_ascend/attention/turboquant_v1.py
+All checks passed!
+
+C:\Users\Admin\AppData\Local\Python\pythoncore-3.14-64\python.exe -B -m ruff format --check --no-cache tests/ut/attention/run_turboquant_device_free.py tests/ut/attention/stub_vllm.py tests/ut/attention/test_turboquant_block_moves.py tests/ut/attention/test_turboquant_capture_contract.py tests/ut/attention/test_turboquant_e8.py tests/ut/attention/test_turboquant_host_graph.py tests/ut/attention/test_turboquant_kernel_cache_layout.py tests/ut/attention/test_turboquant_live_write_npu.py tests/ut/attention/test_turboquant_nz_cache.py tests/ut/attention/test_turboquant_nz_ingress.py tests/ut/attention/test_turboquant_op_schemas.py vllm_ascend/attention/turboquant_metadata.py vllm_ascend/attention/turboquant_ops.py vllm_ascend/attention/turboquant_reference_cache.py vllm_ascend/attention/turboquant_v1.py
+15 files already formatted
+
+The unchanged v2 stub guard was also checked in a fresh process: valid nonpackage ModuleSpec, blocked torch_npu.profiler, blocked native extension import, and blocked real torch_npu import after removing the stub.

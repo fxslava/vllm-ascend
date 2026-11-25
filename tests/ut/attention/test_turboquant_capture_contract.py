@@ -597,6 +597,8 @@ def test_the_builder_publishes_every_field_the_launch_reads() -> None:
         "turboquant_query_rot",
         "turboquant_num_tokens",
         "turboquant_slot_mapping",
+        "turboquant_ingestion_slot_mapping",
+        "turboquant_strip_plan",
     }
     assert extra["turboquant_num_tokens"] == 2, "the extent the descriptors were filled for"
     # All of the new work is in the subclass, reached only through the hook, so

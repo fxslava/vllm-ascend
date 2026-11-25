@@ -1,0 +1,139 @@
+{
+  "e8_reader": {
+    "verified_summary": {
+      "fatal": 34,
+      "warning": 3,
+      "info": 3,
+      "total": 40,
+      "by_code": {
+        "AKA1004": 34,
+        "AKA2010": 1,
+        "AKA3002": 2,
+        "AKA3009": 1,
+        "AKA9001": 2
+      }
+    },
+    "integrated_summary": {
+      "fatal": 33,
+      "warning": 3,
+      "info": 3,
+      "total": 39,
+      "by_code": {
+        "AKA1004": 33,
+        "AKA2010": 1,
+        "AKA3002": 2,
+        "AKA3009": 1,
+        "AKA9001": 2
+      }
+    },
+    "new": [],
+    "resolved_occurrences": 1,
+    "source_sha256": [
+      "e5fdf887471664c8930079fb891303094b91486adc8334b050a5648a3b407a38",
+      "fb9d13ddb745ed76cb7c449f4904b7ed5ee9ea1cd45b9ea1a3b98260b3a34942"
+    ],
+    "normalization": "code, severity, hardware domain, message (embedded line numbers normalized), multiplicity",
+    "frontend": [
+      {
+        "functions": 39,
+        "parse_errors": []
+      },
+      {
+        "functions": 39,
+        "parse_errors": []
+      }
+    ],
+    "reader_source_sha256": "1354868b479d3c2972f219a7012718e210c085ffcb38c6310056fcebb7f390ef",
+    "layout_sidecar_sha256": "d470c1b6d8c0be5de95a00d4f81d887c901cc911f04524d3c18ef973c91fd6d3"
+  },
+  "e8_reader_unannotated": {
+    "verified_summary": {
+      "fatal": 23,
+      "warning": 11,
+      "info": 3,
+      "total": 37,
+      "by_code": {
+        "AKA1004": 23,
+        "AKA1009": 3,
+        "AKA2010": 1,
+        "AKA3002": 7,
+        "AKA3009": 1,
+        "AKA9001": 2
+      }
+    },
+    "integrated_summary": {
+      "fatal": 23,
+      "warning": 11,
+      "info": 3,
+      "total": 37,
+      "by_code": {
+        "AKA1004": 23,
+        "AKA1009": 3,
+        "AKA2010": 1,
+        "AKA3002": 7,
+        "AKA3009": 1,
+        "AKA9001": 2
+      }
+    },
+    "new": [],
+    "resolved_occurrences": 0,
+    "source_sha256": [
+      "e2177b5f80779b0db98e6fcc8c5651e6692978f01ab862363fe92d835197ddf2",
+      "1354868b479d3c2972f219a7012718e210c085ffcb38c6310056fcebb7f390ef"
+    ],
+    "normalization": "code, severity, hardware domain, message (embedded line numbers normalized), multiplicity",
+    "frontend": [
+      {
+        "functions": 39,
+        "parse_errors": []
+      },
+      {
+        "functions": 39,
+        "parse_errors": []
+      }
+    ],
+    "reader_source_sha256": "1354868b479d3c2972f219a7012718e210c085ffcb38c6310056fcebb7f390ef",
+    "layout_sidecar_sha256": "d470c1b6d8c0be5de95a00d4f81d887c901cc911f04524d3c18ef973c91fd6d3"
+  },
+  "scatter_nz": {
+    "verified_summary": {
+      "fatal": 68,
+      "warning": 2,
+      "info": 0,
+      "total": 70,
+      "by_code": {
+        "AKA1004": 66,
+        "AKA2005": 2,
+        "AKA3002": 2
+      }
+    },
+    "integrated_summary": {
+      "fatal": 68,
+      "warning": 2,
+      "info": 0,
+      "total": 70,
+      "by_code": {
+        "AKA1004": 66,
+        "AKA2005": 2,
+        "AKA3002": 2
+      }
+    },
+    "new": [],
+    "resolved_occurrences": 0,
+    "source_sha256": [
+      "b48de10100bc5afa4e235e0c4b7b76acfef690045735cd8021830759d103b4fe",
+      "e679e75a387a8d6c5f8ee5e9f2f432220e920bf30c549dbe5c32665cbbaf05ad"
+    ],
+    "normalization": "code, severity, hardware domain, message (embedded line numbers normalized), multiplicity",
+    "frontend": [
+      {
+        "functions": 60,
+        "parse_errors": []
+      },
+      {
+        "functions": 71,
+        "parse_errors": []
+      }
+    ]
+  }
+}

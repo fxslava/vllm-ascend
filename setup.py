@@ -20,8 +20,10 @@
 import importlib.util
 import logging
 import os
+import shutil
 import subprocess
 import sys
+from pathlib import Path
 from sysconfig import get_paths
 
 from setuptools import Command, Extension, find_packages, setup
@@ -138,6 +140,17 @@ hardware = load_module_from_path(
     os.path.join(ROOT_DIR, "vllm_ascend", "device", "hardware.py"),
 )
 
+def normalize_soc_version(soc_version: str) -> str:
+    normalized = soc_version.strip().lower()
+    return {
+        "910b": "ascend910b1",
+        "910c": "ascend910_9392",
+        "310p": "ascend310p1",
+        "ascend950pr_9599": "Ascend950PR_9599",
+        "dav-3510": "Ascend950PR_9599",
+    }.get(normalized, normalized)
+
+
 if not envs.SOC_VERSION:
     soc_version = get_chip_type()
     if not soc_version:
@@ -152,6 +165,8 @@ if not envs.SOC_VERSION:
             "You can also refer to the SOC_VERSION defaults in Dockerfile*."
         )
     envs.SOC_VERSION = soc_version
+
+envs.SOC_VERSION = normalize_soc_version(envs.SOC_VERSION)
 
 
 def gen_build_info():
@@ -206,6 +221,11 @@ class build_and_install_aclnn(Command):
 class cmake_build_ext(build_ext):
     # A dict of extension directories that have been configured.
     did_config: dict[str, bool] = {}
+
+    def initialize_options(self):
+        super().initialize_options()
+        self._native_outputs: list[str] = []
+        self._native_output_mapping: dict[str, str] = {}
 
     #
     # Determine number of compilation jobs
@@ -279,21 +299,10 @@ class cmake_build_ext(build_ext):
             # else specify pybind11 path installed from source code on CI container
             raise RuntimeError(f"CMake configuration failed: {e}")
 
-        install_path = os.path.join(ROOT_DIR, self.build_lib)
-        if isinstance(self.distribution.get_command_obj("develop"), develop):
-            install_path = os.path.join(ROOT_DIR, "vllm_ascend")
-        # add CMAKE_INSTALL_PATH
+        install_path = os.path.abspath(os.path.join(self.build_lib, "vllm_ascend"))
         cmake_args += [f"-DCMAKE_INSTALL_PREFIX={install_path}"]
-
         cmake_args += [f"-DCMAKE_PREFIX_PATH={pybind11_cmake_path}"]
-
-        soc_version_map = {
-            "910b": "ascend910b1",
-            "910c": "ascend910_9392",
-            "310p": "ascend310p1",
-        }
-        CANN_SOC_VERSION = soc_version_map.get(envs.SOC_VERSION, envs.SOC_VERSION)
-        cmake_args += [f"-DSOC_VERSION={CANN_SOC_VERSION}"]
+        cmake_args += [f"-DSOC_VERSION={envs.SOC_VERSION}"]
 
         # Override the base directory for FetchContent downloads to $ROOT/.deps
         # This allows sharing dependencies between profiles,
@@ -362,39 +371,42 @@ class cmake_build_ext(build_ext):
             subprocess.check_call(["cmake", *build_args], cwd=self.build_temp)
         except OSError as e:
             raise RuntimeError(f"Build library failed: {e}")
-        # Install the libraries
-        install_args = [
-            "cmake",
-            "--install",
-            ".",
-        ]
-        try:
-            subprocess.check_call(install_args, cwd=self.build_temp)
-        except OSError as e:
-            raise RuntimeError(f"Install library failed: {e}")
-
-        # copy back to build folder for editable build
-        if isinstance(self.distribution.get_command_obj("develop"), develop):
-            import shutil
-
-            for root, _, files in os.walk(self.build_temp):
-                for file in files:
-                    if file.endswith(".so"):
-                        src_path = os.path.join(root, file)
-                        dst_path = os.path.join(self.build_lib, "vllm_ascend", file)
-                        shutil.copy(src_path, dst_path)
-                        print(f"Copy: {src_path} -> {dst_path}")
+        self._native_outputs = self.install_native_targets(os.path.join(self.build_lib, "vllm_ascend"))
 
         # copy back _cann_ops_custom directory
         src_cann_ops_custom = os.path.join(ROOT_DIR, "vllm_ascend", "_cann_ops_custom")
         dst_cann_ops_custom = os.path.join(self.build_lib, "vllm_ascend", "_cann_ops_custom")
-        if os.path.exists(src_cann_ops_custom):
-            import shutil
-
+        if os.path.exists(src_cann_ops_custom) and os.path.abspath(src_cann_ops_custom) != os.path.abspath(
+            dst_cann_ops_custom
+        ):
             if os.path.exists(dst_cann_ops_custom):
                 shutil.rmtree(dst_cann_ops_custom)
             shutil.copytree(src_cann_ops_custom, dst_cann_ops_custom)
             print(f"Copy: {src_cann_ops_custom} -> {dst_cann_ops_custom}")
+
+    def install_native_targets(self, prefix: str) -> list[str]:
+        subprocess.check_call(
+            ["cmake", "--install", ".", "--prefix", os.path.abspath(prefix), "--component", "vllm_ascend_native"],
+            cwd=self.build_temp,
+        )
+        manifest = Path(self.build_temp) / "install_manifest_vllm_ascend_native.txt"
+        return manifest.read_text(encoding="utf-8").splitlines()
+
+    def copy_extensions_to_source(self) -> None:
+        if envs.COMPILE_CUSTOM_KERNELS:
+            build_py = self.get_finalized_command("build_py")
+            package = build_py.get_package_dir("vllm_ascend")
+            installed = self.install_native_targets(package)
+            build_package = Path(self.build_lib) / "vllm_ascend"
+            self._native_output_mapping = {
+                str(build_package / os.path.relpath(path, package)): path for path in installed
+            }
+
+    def get_outputs(self) -> list[str]:
+        return self._native_outputs
+
+    def get_output_mapping(self) -> dict[str, str]:
+        return self._native_output_mapping
 
     def run(self):
         if envs.COMPILE_CUSTOM_KERNELS:

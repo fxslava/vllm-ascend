@@ -23,7 +23,7 @@
 #ifndef TURBOQUANT_TEST_COMMON_HPP
 #define TURBOQUANT_TEST_COMMON_HPP
 
-#include "csrc/attention/turboquant/op_kernel/common/turboquant_layout.h"
+#include "csrc/attention/turboquant/common/turboquant_layout.h"
 
 #include <cmath>
 #include <cstddef>

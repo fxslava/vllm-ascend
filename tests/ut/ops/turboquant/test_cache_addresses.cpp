@@ -6,7 +6,7 @@
 // Compile the production NZ ingress geometry without CANN or a device. Small
 // cache fixtures cannot detect offsets wrapping into another physical page.
 #define TURBOQUANT_INGRESS_NZ 1
-#include "csrc/attention/turboquant/op_kernel/turboquant_reshape_batch.cpp"
+#include "csrc/attention/turboquant/ingress/native/turboquant_reshape_batch.cpp"
 
 #include <cstdio>
 #include <limits>

@@ -107,6 +107,8 @@ ENABLE_TURBOQUANT=1 TURBOQUANT_KERNEL_STAGES=scatter,decode \
 
 If the required kernel stages or operators are unavailable, TurboQuant falls back to `PIECEWISE` with `VLLM_COMPILE`, or `NONE` without piecewise compilation. Speculative and multi-token decode are not supported by the TurboQuant decode tiling contract.
 
+Add `reshape_and_cache` to `TURBOQUANT_KERNEL_STAGES` to opt in to the batched TurboQuant prefill cache writer. The metadata builder reads the live slot mapping to the host once per prepared metadata object for strip planning, and the attention layers share the plan. Setting `VLLM_ASCEND_TURBOQUANT_VALIDATE_SLOTS=1` enables additional diagnostic reads. For an aligned run, the kernel uses the 96-token-per-core schedule when the launch size is divisible by 96 and the 16-token-per-core fallback for other strip-aligned launch sizes. Fragmented slots can require additional scatter launches. Prefill and mixed attention remain outside full ACLGraph capture.
+
 Not all attention backends support all graph modes. vLLM checks attention backend compatibility during compatibility checks and, when possible, automatically adjusts `cudagraph_mode` to a more compatible mode instead of failing immediately. In practice, this means a requested full-graph mode may be narrowed to a mixed or piecewise mode, and if the backend cannot support graph execution at all, graph mode may be disabled.
 
 On Ascend, the current attention backend support levels are:

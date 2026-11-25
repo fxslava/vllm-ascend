@@ -15,7 +15,6 @@ set(PYTHON_SUPPORTED_VERSIONS "3.9" "3.10" "3.11" "3.12")
 find_package(pybind11 REQUIRED)
 
 append_cmake_prefix_path("torch" "torch.utils.cmake_prefix_path")
-set(VLLM_ASCEND_INSTALL_PATH "${CMAKE_INSTALL_PREFIX}")
 
 find_package(Torch REQUIRED)
 
@@ -27,7 +26,11 @@ if(NOT ${TORCH_VERSION} VERSION_EQUAL "2.10.0")
 endif()
 
 set(RUN_MODE "npu" CACHE STRING "cpu/sim/npu")
-set(SOC_VERSION ${SOC_VERSION})
+string(TOLOWER "${SOC_VERSION}" VLLM_ASCEND_SOC_FAMILY)
+if(VLLM_ASCEND_SOC_FAMILY STREQUAL "ascend950pr_9599" OR VLLM_ASCEND_SOC_FAMILY STREQUAL "dav-3510")
+    set(SOC_VERSION "Ascend950PR_9599")
+    set(VLLM_ASCEND_SOC_FAMILY "ascend950pr_9599")
+endif()
 message(STATUS "Detected SOC version: ${SOC_VERSION}")
 
 if (NOT CMAKE_BUILD_TYPE)
@@ -51,28 +54,10 @@ endif()
 
 include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
 
-# -----------------------------------------------------------------------------
-# TurboQuant BF16 ingestion and fused decode: Ascend 950PR / arch35 / dav-3510 only.
-#
-# The kernel is a MIX_AIC_1_2 launch that puts one Cube core and BOTH Vector
-# cores of a block in one four-stage pipeline, and it depends on facilities only
-# dav-3510 has: a Fixpipe that picks a sub-block's Unified Buffer as its
-# destination, mode-4 intra-block flags between the Cube and each Vector core,
-# and a 16-bit Cube fractal with C0 = 16. There is no 910B form of it, so the
-# library is simply absent from every other build, and so is
-# csrc/attention/turboquant/torch_bindings.cpp -- so torch.ops.turboquant_ops
-# does not exist there rather than existing with nothing behind it. That absence
-# is the Python side's fallback signal: the adapter in
-# vllm_ascend/attention/turboquant_v1.py warns once and runs its golden
-# model when a stage is switched on and its op is unregistered.
-#
-# CANN 9.2 drives these through the ASC language toolchain: asc-config.cmake
-# registers ASC as a CMake language whose compiler is bisheng, and
-# CMAKE_ASC_ARCHITECTURES becomes --npu-arch=. FindASC.cmake re-reads that
-# variable on every configure while CMake would otherwise set it on the first
-# only, so it is pinned in the cache here.
+# TurboQuant uses the dav-3510 ASC toolchain independently of the ACLNN package.
 set(VLLM_ASCEND_BUILD_TURBOQUANT OFF)
-if(SOC_VERSION MATCHES "ascend950")
+set(VLLM_ASCEND_TURBOQUANT_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant")
+if(VLLM_ASCEND_SOC_FAMILY MATCHES "^ascend950")
     if(NOT EXISTS ${ASCENDC_CMAKE_DIR}/asc-config.cmake)
         message(FATAL_ERROR
             "ASC language toolchain not found at ${ASCENDC_CMAKE_DIR}/asc-config.cmake. "
@@ -84,84 +69,10 @@ if(SOC_VERSION MATCHES "ascend950")
     message(STATUS "ASC language toolchain enabled: --npu-arch=${CMAKE_ASC_ARCHITECTURES}")
 
     set(VLLM_ASCEND_BUILD_TURBOQUANT ON)
-    # The three audited kernel translation units, mirrored from
-    # kernels/ops/turboquant/vllm_integration_layer of the ascend-micro-harness.
-    # The ASC toolchain compiles each source's device kernels and its host
-    # launcher together -- one bisheng invocation per source runs a host pass and
-    # two device passes over the same text -- so this one library carries both
-    # halves of all three paths: the prefill batch writer, the decode scatter
-    # writer and the fused raw-query decode. torch_bindings.cpp below links
-    # against these launchers.
-    #
-    # Single-source is also why the sources keep their `__global__` entry-point
-    # *definitions* outside `#if defined(__CCE_AICORE__)`, with only the bodies
-    # inside it: the host-side launch stub of a `__global__` function is emitted
-    # by the host pass from the definition, and the legacy ascendc_library's
-    # generated host_stub.cpp -- which is what supplies those stubs in the
-    # harness's own build -- does not exist on this path. With the definitions
-    # hidden from the host pass this library still links, with every launch_*
-    # entry present and every kernel it calls undefined. See
-    # csrc/attention/turboquant/README.md, "Why the entry points are outside the
-    # device guard".
-    #
-    # One library, not three: the fused decode's Split-K reducer and the two
-    # writers share op_kernel/common, and ascendc_library has no incremental
-    # rebuild (its preprocess step feeds ld.lld its own previous output), so a
-    # source change means one clean rebuild either way.
     ascendc_library(vllm_ascend_turboquant SHARED
-        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/op_kernel/turboquant_reshape_batch.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/op_kernel/turboquant_reshape_scatter.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/op_kernel/turboquant_fused_decode.cpp
-    )
-    # ASCEND_MICRO_CANN_LAUNCH is NOT optional. Each of the three sources is
-    #
-    #     #if defined(__CCE_AICORE__)      ... the device kernels ...
-    #     #elif defined(ASCEND_MICRO_CANN_LAUNCH)   ... the host launchers ...
-    #     #endif
-    #
-    # so the host compilation of the TU, which is the one that defines
-    # launch_turboquant_reshape_and_cache_bf16,
-    # launch_turboquant_reshape_scatter_aiv and
-    # turboquant_mm_fused_decode_opt_raw_query_impl, compiles to NOTHING past the
-    # entry points without it. The library then still looks complete -- every
-    # device kernel is there, and under the legacy module set so is every
-    # generated aclrtlaunch_* stub, whose names contain the launcher names as
-    # substrings -- and torch_bindings.cpp fails to link with an undefined
-    # reference. Taken from the harness's own standalone/CMakeLists.txt, which is
-    # the authority on these flags.
-    #
-    # ASCEND_TQ_FUSED_DECODE_GEMM_REDUCE drives the decode's reduction with the
-    # Cube GEMM reducer (op_kernel/cube/turboquant_gemm_reduce_service.h) rather
-    # than TurboQuantPartialReducer. ON in the harness build and in its
-    # standalone project alike, so a wheel build compiles the same operator the
-    # harness verifies under that file name. The other two sources never
-    # reference it.
-    #
-    # TWO calls, and only ONE of them may be ascendc_compile_options: in CANN's
-    # legacy module set the device half APPENDS its options while the host half
-    # ASSIGNS them, so a second ascendc_compile_options on this target would
-    # silently discard the first call's -forward-options-to-host-compiler
-    # defines. Both defines therefore go in this one call.
-    #
-    # On the ASC path the second call is redundant rather than required:
-    # ascendc_compile_definitions is a plain target_compile_definitions there, so
-    # its -D reaches every pass including the host one. It stays because it costs
-    # nothing and it is what makes this block work unchanged if a standalone gate
-    # builds the same sources through the legacy ascendc_library, where the
-    # host-forwarded copy IS the only one the host pass sees.
-    # TURBOQUANT_INGRESS_NZ=1 turns BOTH writers into NZ-tiled ingresses: they
-    # emit the [64-row tile][kv head][32-byte column group][tile row][byte]
-    # cache the fused decode reads (NzTiledPackedByte in
-    # op_kernel/common/turboquant_layout.h) instead of the RFC 3.1 strip cache,
-    # with the kv4fp8 nibble pairing and the slot-major scale plane. This is the
-    # fix for the writer/reader cache-format mismatch: both writers and the
-    # decode now name the same byte, and each writer's open-coded NZ addressing
-    # is tied back to turboquant_layout.h by static_assert. The scatter
-    # writer's NZ mode is additionally RMW-free -- the NZ pairing is
-    # token-major, so its strip read-modify-write disappears entirely.
-    # turboquant-core builds each writer twice (strip and NZ variants); this
-    # repo wants only the NZ ones, so the define is target-wide here. It is
-    # inert for turboquant_fused_decode.cpp, which never references it.
+        ${VLLM_ASCEND_TURBOQUANT_SOURCE_DIR}/ingress/native/turboquant_reshape_batch.cpp
+        ${VLLM_ASCEND_TURBOQUANT_SOURCE_DIR}/ingress/native/turboquant_reshape_scatter.cpp
+        ${VLLM_ASCEND_TURBOQUANT_SOURCE_DIR}/decode/native/turboquant_fused_decode.cpp)
     ascendc_compile_definitions(vllm_ascend_turboquant PRIVATE
         ASCEND_MICRO_CANN_LAUNCH ASCEND_TQ_FUSED_DECODE_GEMM_REDUCE=1 TURBOQUANT_INGRESS_NZ=1)
     ascendc_compile_options(vllm_ascend_turboquant PRIVATE
@@ -172,8 +83,8 @@ if(SOC_VERSION MATCHES "ascend950")
     # E8 has its own packet ABI and cache-basis query contract. Keep its exact
     # floating-point flags independent of the native signed-nibble kernels.
     ascendc_library(vllm_ascend_turboquant_e8 SHARED
-        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/e8/asc_reader.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/e8/asc_component.cpp)
+        ${VLLM_ASCEND_TURBOQUANT_SOURCE_DIR}/bindings/asc_e8_reader.cpp
+        ${VLLM_ASCEND_TURBOQUANT_SOURCE_DIR}/bindings/asc_e8_component.cpp)
     ascendc_compile_definitions(vllm_ascend_turboquant_e8 PRIVATE
         ASCEND_MICRO_CANN_LAUNCH ENABLE_CV_COMM_VIA_SSBUF=1)
     ascendc_compile_options(vllm_ascend_turboquant_e8 PRIVATE
@@ -189,7 +100,7 @@ set(VLLM_ASCEND_CUSTOM_OP
     ${KERNEL_FILES}
 )
 
-if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
+if(VLLM_ASCEND_SOC_FAMILY MATCHES "^ascend310p|^ascend950")
     message(STATUS "Hardware ${SOC_VERSION} detected: skip vllm_ascend_kernels compile")
 else()
     ascendc_library(vllm_ascend_kernels SHARED
@@ -199,7 +110,7 @@ endif()
 
 message("TORCH_NPU_PATH is ${TORCH_NPU_PATH}")
 
-if(SOC_VERSION MATCHES "ascend310p.*")
+if(VLLM_ASCEND_SOC_FAMILY MATCHES "^ascend310p")
     file(GLOB VLLM_ASCEND_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/*.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/aclnn_torch_adapter/*.cpp)
@@ -209,31 +120,16 @@ else()
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/aclnn_torch_adapter/*.cpp)
 endif()
 
-# The TurboQuant Torch bindings are a translation unit of their own and the glob
-# above only reaches csrc/*.cpp, so they are named here. They must NOT be folded
-# into csrc/torch_binding.cpp: the audited
-# op_kernel/common/types.h and csrc/kernels/types.h both declare
-# vllm_ascend::AscendType behind their own #pragma once, so a TU that reaches
-# both fails to compile. Adding the file only on the ascend950 branch is also
-# what keeps torch.ops.turboquant_ops absent -- rather than registered with
-# nothing behind it -- on every other SoC.
-#
-# op_host/turboquant_tiling.cpp joins it. The decode's host tiling used to be an
-# `inline` function in a device-side header, which meant every translation unit
-# that wanted the geometry also pulled in the kernel tree; it is an ordinary
-# host C++ definition now, so the binding, the kernel launcher and the
-# device-free gate in tests/ut/ops all link the SAME object instead of each
-# re-instantiating it. It compiles with the plain host compiler -- no CANN, no
-# ASC -- which is exactly why the gate can build it on a host with no toolkit.
 if(VLLM_ASCEND_BUILD_TURBOQUANT)
     list(APPEND VLLM_ASCEND_SRC
-        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/torch_bindings.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/e8_torch_bindings.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/turboquant/op_host/turboquant_tiling.cpp)
+        ${VLLM_ASCEND_TURBOQUANT_SOURCE_DIR}/bindings/torch_bindings.cpp
+        ${VLLM_ASCEND_TURBOQUANT_SOURCE_DIR}/bindings/torch_ingress.cpp
+        ${VLLM_ASCEND_TURBOQUANT_SOURCE_DIR}/bindings/torch_decode.cpp
+        ${VLLM_ASCEND_TURBOQUANT_SOURCE_DIR}/common/turboquant_tiling.cpp)
 endif()
 
 # Sparse KV cache offloading is currently supported on Atlas A3 only.
-if(SOC_VERSION MATCHES "ascend910_93.*")
+if(VLLM_ASCEND_SOC_FAMILY MATCHES "^ascend910_93")
   find_package(OpenMP REQUIRED)
 endif()
 
@@ -255,7 +151,7 @@ set(
 )
 
 pybind11_add_module(vllm_ascend_C ${VLLM_ASCEND_SRC})
-if(SOC_VERSION MATCHES "ascend910_93.*")
+if(VLLM_ASCEND_SOC_FAMILY MATCHES "^ascend910_93")
   target_compile_definitions(vllm_ascend_C PRIVATE VLLM_ASCEND_ENABLE_SPARSE_KV_OFFLOAD)
   target_link_libraries(vllm_ascend_C PRIVATE OpenMP::OpenMP_CXX)
 endif()
@@ -315,11 +211,11 @@ else()
   endif()
 endif()
 
-if(SOC_VERSION MATCHES "ascend310p.*")
+if(VLLM_ASCEND_SOC_FAMILY MATCHES "^ascend310p")
     target_compile_definitions(vllm_ascend_C PRIVATE -DASCEND_PLATFORM_310P)
 endif()
 
-if(NOT (SOC_VERSION MATCHES "ascend310p.*|ascend950"))
+if(NOT (VLLM_ASCEND_SOC_FAMILY MATCHES "^ascend310p|^ascend950"))
     target_compile_definitions(vllm_ascend_C PRIVATE -DVLLM_ENABLE_ATB_AND_DIRECT_KERNELS)
 endif()
 
@@ -351,7 +247,7 @@ set(VLLM_ASCEND_C_COMMON_LIBS
   opapi
 )
 
-if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
+if(VLLM_ASCEND_SOC_FAMILY MATCHES "^ascend310p|^ascend950")
   target_link_libraries(
     vllm_ascend_C
     PUBLIC
@@ -372,12 +268,12 @@ endif()
 
 target_link_options(vllm_ascend_C PRIVATE "-Wl,-rpath,$ORIGIN:$ORIGIN/lib:$ORIGIN/_cann_ops_custom/vendors/custom_transformer/op_api/lib")
 
-if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
-  install(TARGETS vllm_ascend_C DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
-else()
-  install(TARGETS vllm_ascend_C vllm_ascend_kernels DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
+set(VLLM_ASCEND_NATIVE_TARGETS vllm_ascend_C)
+if(TARGET vllm_ascend_kernels)
+  list(APPEND VLLM_ASCEND_NATIVE_TARGETS vllm_ascend_kernels)
 endif()
-
 if(VLLM_ASCEND_BUILD_TURBOQUANT)
-  install(TARGETS vllm_ascend_turboquant vllm_ascend_turboquant_e8 DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
+  list(APPEND VLLM_ASCEND_NATIVE_TARGETS vllm_ascend_turboquant vllm_ascend_turboquant_e8)
 endif()
+install(TARGETS ${VLLM_ASCEND_NATIVE_TARGETS}
+        LIBRARY DESTINATION . COMPONENT vllm_ascend_native)

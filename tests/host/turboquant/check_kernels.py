@@ -18,25 +18,25 @@ def main() -> None:
     parser.add_argument("--sdk", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--source", help="Recheck one source stem and retain other recorded results")
-    parser.add_argument("--core", type=Path, help="Also usable against the standalone core's legacy source layout")
+    parser.add_argument("--core", type=Path, help="Also verify the standalone core and its legacy launch declarations")
+    parser.add_argument("--strip", action="store_true", help="Check the standalone strip writer pair")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     compiler = args.sdk / "tools/bisheng_compiler/bin/bisheng"
-    root = ROOT / "csrc/attention/turboquant"
+    root = args.core / "src/turboquant" if args.core else ROOT / "csrc/attention/turboquant"
     sources = [
-        root / "op_kernel" / f"turboquant_{name}.cpp" for name in ("reshape_batch", "reshape_scatter", "fused_decode")
+        root / "ingress/native/turboquant_reshape_batch.cpp",
+        root / "ingress/native/turboquant_reshape_scatter.cpp",
+        root / "decode/native/turboquant_fused_decode.cpp",
     ]
-    sources += [root / "e8/asc_reader.cpp", root / "e8/asc_component.cpp"]
     if args.core:
-        root = args.core
-        sources = [
-            root / f"src/{part}/turboquant_{name}.cpp"
-            for part, name in (("prefill", "reshape_batch"), ("scatter", "reshape_scatter"), ("decode", "fused_decode"))
-        ]
-        sources += [
-            root / "components/e8_parallel_decode/e8_fused_decode.cpp",
-            root / "components/e8_parallel_decode/parallel_component.cpp",
-        ]
+        sources += [root / "decode/e8/e8_fused_decode.cpp", root / "decode/e8/parallel_component.cpp"]
+    else:
+        sources += [root / "bindings/asc_e8_reader.cpp", root / "bindings/asc_e8_component.cpp"]
+    if args.strip:
+        if not args.core:
+            parser.error("--strip requires --core")
+        sources = sources[:2]
     result_path = args.out / "syntax.json"
     results = json.loads(result_path.read_text()) if args.source and result_path.exists() else []
     if args.source:
@@ -59,29 +59,21 @@ def main() -> None:
                 "-Wextra",
                 "-Werror",
                 "-DASCEND_MICRO_CANN_LAUNCH",
-                "-DENABLE_CV_COMM_VIA_SSBUF=1",
-                "-DTURBOQUANT_INGRESS_NZ=1",
                 "-DASCEND_TQ_FUSED_DECODE_GEMM_REDUCE=1",
             ]
+            if not args.strip:
+                command += ["-DTURBOQUANT_INGRESS_NZ=1"]
             # System SDK headers cannot spend the project's diagnostic budget.
             for directory in (args.sdk / "x86_64-linux/asc").rglob("*"):
                 if directory.is_dir():
                     command += ["-isystem", str(directory)]
             command += ["-isystem", str(args.sdk / "include")]
             if source.stem.startswith("turboquant_"):
-                header = root / "op_adapter/turboquant_torch_adpt.h"
                 if args.core:
-                    header = root / "include/turboquant/turboquant_launch.h"
-                command += ["-include", str(header)]
+                    command += ["-DTURBOQUANT_LEGACY_CANN_LAUNCH=1"]
             else:
-                e8_root = root / ("components/e8_parallel_decode" if args.core else "e8")
                 command += [
-                    "-include",
-                    str(e8_root / "e8_decode.hpp"),
-                    "-include",
-                    str(e8_root / "e8_component.hpp"),
-                    "-include",
-                    "kernel_operator.h",
+                    "-DENABLE_CV_COMM_VIA_SSBUF=1",
                     "-fno-fast-math",
                     "-ffp-contract=off",
                 ]

@@ -22,15 +22,20 @@ from vllm_ascend.attention.turboquant_config import (
     TURBOQUANT_FIA_DUMMY_KV_LEN,
     TURBOQUANT_KERNEL_BLOCK_SIZE,
     TURBOQUANT_OP_BUILD_DECODE_TILING,
+    TURBOQUANT_OP_RESHAPE_AND_CACHE,
     TURBOQUANT_STAGING_SLOTS,
+    TurboQuantKernelStage,
     TurboQuantOpsConfig,
     turboquant_decode_heads_per_task,
     turboquant_decode_query_rot_floats,
     turboquant_decode_workspace_floats,
     turboquant_tiling_upper_bound_words,
 )
+from vllm_ascend.attention.turboquant_ingestion import TurboQuantStripPlan, turboquant_plan_strip_ingestion
 from vllm_ascend.attention.turboquant_ops import (
+    _is_op_registered,
     _stream_is_capturing,
+    load_turboquant_extension,
     turboquant_decode_graph_supported,
 )
 from vllm_ascend.attention.turboquant_telemetry import (
@@ -48,6 +53,8 @@ class AscendTurboQuantMetadata(AscendMetadata):
     turboquant_query_rot: torch.Tensor = None
     turboquant_num_tokens: int = 0
     turboquant_slot_mapping: torch.Tensor | None = None
+    turboquant_ingestion_slot_mapping: torch.Tensor | None = None
+    turboquant_strip_plan: TurboQuantStripPlan | None = None
 
 
 @dataclass(frozen=True)
@@ -88,7 +95,9 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
         self._num_heads = int(vllm_config.model_config.get_num_attention_heads(vllm_config.parallel_config))
         self._num_splits = TURBOQUANT_DECODE_SPLITS
         self._heads_per_task = turboquant_decode_heads_per_task(self._num_heads, self._num_kv_heads)
-        self._ops_namespace = TurboQuantOpsConfig.from_env().ops_namespace
+        ops_config = TurboQuantOpsConfig.from_env()
+        self._ops_namespace = ops_config.ops_namespace
+        self._prefill_kernel_enabled = ops_config.enables(TurboQuantKernelStage.RESHAPE_AND_CACHE)
 
         self._context_lens = torch.zeros(self._max_num_reqs, dtype=torch.int32, device=device)
         self._decode_slot_mapping = torch.full((self._max_num_reqs,), -1, dtype=torch.int32, device=device)
@@ -140,6 +149,8 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
         self._reject_multi_token_steps(common_attn_metadata, tokens)
         self._refresh_tiling(host_context_lens, tokens)
         slot_mapping = None
+        ingestion_slot_mapping = None
+        strip_plan = None
         if getattr(common_attn_metadata, "attn_state", None) == AscendAttentionState.DecodeOnly:
             source = common_attn_metadata.slot_mapping
             if source.numel() < tokens:
@@ -152,6 +163,21 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
             slot_mapping = self._decode_slot_mapping[:tokens]
             slot_mapping.copy_(source[:tokens])
             slot_mapping[live_tokens:].fill_(-1)
+        elif (live_tokens := getattr(common_attn_metadata, "num_actual_tokens", 0)) > 0:
+            # Match the backend's phase selection, which counts the padded
+            # seq_lens_list entries when it distinguishes mixed from decode.
+            prepare_strip_plan = False
+            if live_tokens > tokens and self._prefill_kernel_enabled:
+                load_turboquant_extension()
+                prepare_strip_plan = _is_op_registered(self._ops_namespace, TURBOQUANT_OP_RESHAPE_AND_CACHE)
+            if prepare_strip_plan and _stream_is_capturing():
+                raise RuntimeError("TurboQuant prefill ingestion planning requires metadata outside graph capture")
+            source = common_attn_metadata.slot_mapping[:live_tokens]
+            # Snapshot planned slots even for an int32 source. The runner can
+            # reuse its slot buffer and the plan must describe the launch's slots.
+            ingestion_slot_mapping = source.to(torch.int32, copy=prepare_strip_plan)
+            if prepare_strip_plan:
+                strip_plan = turboquant_plan_strip_ingestion(ingestion_slot_mapping.tolist(), self._block_size)
         return {
             "turboquant_context_lens": context_lens,
             "turboquant_tiling": self._tiling,
@@ -159,6 +185,8 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
             "turboquant_query_rot": self._query_rot,
             "turboquant_num_tokens": tokens,
             "turboquant_slot_mapping": slot_mapping,
+            "turboquant_ingestion_slot_mapping": ingestion_slot_mapping,
+            "turboquant_strip_plan": strip_plan,
         }
 
     def _validate_slot_mapping(

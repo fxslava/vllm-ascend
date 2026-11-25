@@ -279,7 +279,7 @@ def _build_decode_tiling(contexts, block_size, max_pages, splits, fused_context_
     batch = len(contexts)
     heads_per_task = backend.turboquant_decode_heads_per_task(NUM_HEADS, NUM_KV_HEADS)
     chunks_per_group = -(-GROUP_HEADS // heads_per_task)
-    # Match decode_launch_split in op_host/turboquant_tiling.h: descriptors
+    # Match decode_launch_split in common/turboquant_tiling.h: descriptors
     # cover every (token, split), followed by one dispatch record per block.
     grid = min(backend.TURBOQUANT_DECODE_MAX_GRID, batch * NUM_KV_HEADS * splits * chunks_per_group)
     tiling_words = backend.turboquant_decode_tiling_words(batch, splits, grid)

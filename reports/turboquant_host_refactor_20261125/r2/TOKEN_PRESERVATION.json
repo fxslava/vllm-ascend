@@ -1,0 +1,481 @@
+{
+  "common/e8_component.hpp": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "common/e8_decode.hpp": {
+    "plugin_equal_except_comments_whitespace_and_includes": false,
+    "core_equal_except_comments_whitespace_and_includes": false,
+    "different_token_count": {
+      "plugin": 3,
+      "core": 3
+    },
+    "plugin_changes": [
+      {
+        "baseline": "4352",
+        "derivative": "e8_packet_abi :: kPacketBytes"
+      }
+    ],
+    "core_changes": [
+      {
+        "baseline": "4352",
+        "derivative": "e8_packet_abi :: kPacketBytes"
+      }
+    ]
+  },
+  "common/e8_packet_layout.hpp": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "common/turboquant_codec_950.h": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "common/turboquant_codec_mx.h": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "common/turboquant_common.h": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "common/turboquant_fused_decode_opt.hpp": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": false,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 9
+    },
+    "core_changes": [
+      {
+        "baseline": "# if ! defined ( __CCE_AICORE__ )",
+        "derivative": ""
+      },
+      {
+        "baseline": "# endif",
+        "derivative": ""
+      }
+    ]
+  },
+  "common/turboquant_gemm_reduce.hpp": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "common/turboquant_launch.h": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "common/turboquant_layout.h": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "common/turboquant_mode.h": {
+    "plugin_equal_except_comments_whitespace_and_includes": false,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 9,
+      "core": 0
+    },
+    "plugin_changes": [
+      {
+        "baseline": "",
+        "derivative": "# if ! defined ( __CCE_AICORE__ )"
+      },
+      {
+        "baseline": "",
+        "derivative": "# endif"
+      }
+    ]
+  },
+  "common/turboquant_splitk_contract.hpp": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "common/turboquant_tiling.cpp": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "common/turboquant_tiling.h": {
+    "plugin_equal_except_comments_whitespace_and_includes": false,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 63,
+      "core": 0
+    },
+    "plugin_changes": [
+      {
+        "baseline": "",
+        "derivative": "DecodeTilingStatus build_decode_tiling ( const DecodeTilingRequest & r , const std :: int32_t * context_lengths , const std :: int32_t * block_table , void * out ) ; # if ! defined ( __CCE_AICORE__ )"
+      },
+      {
+        "baseline": "DecodeTilingStatus build_decode_tiling ( const DecodeTilingRequest & r , const std :: int32_t * context_lengths , const std :: int32_t * block_table , void * out ) ;",
+        "derivative": ""
+      },
+      {
+        "baseline": "",
+        "derivative": "# endif"
+      }
+    ]
+  },
+  "common/turboquant_types.h": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "common/turboquant_wave_protocol.hpp": {
+    "plugin_equal_except_comments_whitespace_and_includes": false,
+    "core_equal_except_comments_whitespace_and_includes": false,
+    "different_token_count": {
+      "plugin": 87,
+      "core": 87
+    },
+    "plugin_changes": [
+      {
+        "baseline": "",
+        "derivative": "TQ_WAVE_FN constexpr std :: uint64_t ActivationOffset ( std :: uint32_t token , std :: uint32_t num_kv_heads , std :: uint32_t head_size ) { return static_cast < std :: uint64_t > ( token ) * num_kv_heads * head_size ; } static_assert ( ActivationOffset ( 1u << 22u , 4u , 256u ) == ( 1ull << 32u ) ) ; constexpr bool FitsLaunchU32 ( std :: int64_t value ) { return value >= 0 && static_cast < std :: uint64_t > ( value ) <= UINT32_MAX ; }"
+      }
+    ],
+    "core_changes": [
+      {
+        "baseline": "",
+        "derivative": "TQ_WAVE_FN constexpr std :: uint64_t ActivationOffset ( std :: uint32_t token , std :: uint32_t num_kv_heads , std :: uint32_t head_size ) { return static_cast < std :: uint64_t > ( token ) * num_kv_heads * head_size ; } static_assert ( ActivationOffset ( 1u << 22u , 4u , 256u ) == ( 1ull << 32u ) ) ; constexpr bool FitsLaunchU32 ( std :: int64_t value ) { return value >= 0 && static_cast < std :: uint64_t > ( value ) <= UINT32_MAX ; }"
+      }
+    ]
+  },
+  "decode/e8/e8_fused_decode.cpp": {
+    "plugin_equal_except_comments_whitespace_and_includes": false,
+    "core_equal_except_comments_whitespace_and_includes": false,
+    "different_token_count": {
+      "plugin": 6,
+      "core": 6
+    },
+    "plugin_changes": [
+      {
+        "baseline": "",
+        "derivative": "\\"
+      },
+      {
+        "baseline": "",
+        "derivative": "\\"
+      },
+      {
+        "baseline": "",
+        "derivative": "\\"
+      },
+      {
+        "baseline": "",
+        "derivative": "\\"
+      },
+      {
+        "baseline": "",
+        "derivative": "\\"
+      },
+      {
+        "baseline": "",
+        "derivative": "\\"
+      }
+    ],
+    "core_changes": [
+      {
+        "baseline": "",
+        "derivative": "\\"
+      },
+      {
+        "baseline": "",
+        "derivative": "\\"
+      },
+      {
+        "baseline": "",
+        "derivative": "\\"
+      },
+      {
+        "baseline": "",
+        "derivative": "\\"
+      },
+      {
+        "baseline": "",
+        "derivative": "\\"
+      },
+      {
+        "baseline": "",
+        "derivative": "\\"
+      }
+    ]
+  },
+  "decode/e8/e8_parallel_decode.hpp": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "decode/e8/parallel_component.cpp": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "decode/e8/routines/routine_e8_bf16_dequant_simt.hpp": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "decode/e8/routines/routine_e8_int8_dequant_simt.hpp": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "decode/native/cube/routine_vector_rotate_butterfly.hpp": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "decode/native/cube/turboquant_cube_service.h": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "decode/native/cube/turboquant_gemm_reduce_service.h": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "decode/native/cube/turboquant_query_basis.h": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "decode/native/routine/routine_turboquant_dequant4.hpp": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "decode/native/turboquant_fused_decode.cpp": {
+    "plugin_equal_except_comments_whitespace_and_includes": false,
+    "core_equal_except_comments_whitespace_and_includes": false,
+    "different_token_count": {
+      "plugin": null,
+      "core": null
+    },
+    "plugin_device_prefix_delta": [
+      {
+        "baseline": "",
+        "derivative": "\\ ("
+      },
+      {
+        "baseline": "",
+        "derivative": ") && ! defined ( TURBOQUANT_LEGACY_CANN_LAUNCH )"
+      }
+    ],
+    "legacy_branch": "Additional host-only declaration branches preserve the standalone launcher ABI"
+  },
+  "decode/native/vector/routine_vector_cube_softmax.hpp": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "decode/native/vector/routine_vector_online_softmax.hpp": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "decode/native/vector/turboquant_vector_service.h": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "ingress/native/routine_stage_page_zn_bf16.hpp": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "ingress/native/routine_vector_rotate_butterfly.hpp": {
+    "plugin_equal_except_comments_whitespace_and_includes": true,
+    "core_equal_except_comments_whitespace_and_includes": true,
+    "different_token_count": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "ingress/native/turboquant_reshape_batch.cpp": {
+    "plugin_equal_except_comments_whitespace_and_includes": false,
+    "core_equal_except_comments_whitespace_and_includes": false,
+    "different_token_count": {
+      "plugin": null,
+      "core": null
+    },
+    "plugin_device_prefix_delta": [
+      {
+        "baseline": "",
+        "derivative": "const std :: uint64_t first_activation = turboquant_wave :: ActivationOffset ( first_token , numKvHeads , headSize ) ;"
+      },
+      {
+        "baseline": "first_token * numKvHeads * headSize",
+        "derivative": "first_activation"
+      },
+      {
+        "baseline": "first_token * numKvHeads * headSize",
+        "derivative": "first_activation"
+      },
+      {
+        "baseline": "",
+        "derivative": "\\ ("
+      },
+      {
+        "baseline": "",
+        "derivative": ") && ! defined ( TURBOQUANT_LEGACY_CANN_LAUNCH )"
+      }
+    ],
+    "legacy_branch": "Additional host-only declaration branches preserve the standalone launcher ABI"
+  },
+  "ingress/native/turboquant_reshape_scatter.cpp": {
+    "plugin_equal_except_comments_whitespace_and_includes": false,
+    "core_equal_except_comments_whitespace_and_includes": false,
+    "different_token_count": {
+      "plugin": null,
+      "core": null
+    },
+    "plugin_device_prefix_delta": [
+      {
+        "baseline": "uint32_t",
+        "derivative": "uint64_t"
+      },
+      {
+        "baseline": "",
+        "derivative": "static_cast < std :: uint64_t > ("
+      },
+      {
+        "baseline": "",
+        "derivative": ")"
+      },
+      {
+        "baseline": "uint32_t",
+        "derivative": "uint64_t"
+      },
+      {
+        "baseline": "",
+        "derivative": "static_cast < std :: uint64_t > ("
+      },
+      {
+        "baseline": "",
+        "derivative": ")"
+      },
+      {
+        "baseline": "",
+        "derivative": "auto index = static_cast < std :: uint32_t > ( item ) ; const"
+      },
+      {
+        "baseline": "item",
+        "derivative": "index"
+      },
+      {
+        "baseline": "item",
+        "derivative": "index"
+      },
+      {
+        "baseline": "slot0 +",
+        "derivative": ""
+      },
+      {
+        "baseline": "int32_t",
+        "derivative": "int64_t"
+      },
+      {
+        "baseline": "",
+        "derivative": "slot0 ) +"
+      },
+      {
+        "baseline": ")",
+        "derivative": ""
+      },
+      {
+        "baseline": "",
+        "derivative": "\\ ("
+      },
+      {
+        "baseline": "",
+        "derivative": ") && ! defined ( TURBOQUANT_LEGACY_CANN_LAUNCH )"
+      }
+    ],
+    "legacy_branch": "Additional host-only declaration branches preserve the standalone launcher ABI"
+  }
+}

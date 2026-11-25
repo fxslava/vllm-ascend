@@ -11,7 +11,7 @@ order the C++ schema no longer declares.
 
 ``torch._C.parse_schema`` is the same parser the registration uses, so these
 tests read the schemas straight out of
-``csrc/attention/turboquant/torch_bindings.cpp`` and check all of that with no
+``csrc/attention/turboquant/bindings/torch_bindings.cpp`` and check all of that with no
 extension, no vllm and no device.
 """
 
@@ -37,7 +37,7 @@ from vllm_ascend.attention.turboquant_ops import TurboQuantOpsAdapter
 # whether pytest collects this from tests/ut/attention or from a copy beside a
 # stubbed-vllm conftest that loads the real module by path.
 _REPO = pathlib.Path(turboquant_v1.__file__).parents[2]
-BINDINGS = _REPO / "csrc" / "attention" / "turboquant" / "torch_bindings.cpp"
+BINDINGS = _REPO / "csrc" / "attention" / "turboquant" / "bindings" / "torch_bindings.cpp"
 
 # Which `_kernel_*` method of the adapter calls each op. The stub's parameters
 # are the call it makes, so they must be the schema's arguments in the schema's
@@ -58,20 +58,28 @@ BINDING_OPS = frozenset(OP_STUBS) | {TURBOQUANT_OP_BUILD_DECODE_TILING}
 _LITERAL = r'"(?:[^"\\]|\\.)*"'
 
 
-def _source() -> str:
-    if not BINDINGS.is_file():
-        pytest.skip(f"{BINDINGS} is not in this checkout")
-    return BINDINGS.read_text(encoding="utf-8")
+def _source(namespace: str = "turboquant_ops") -> str:
+    source = BINDINGS.read_text(encoding="utf-8")
+    fragment = re.search(
+        rf"TORCH_LIBRARY_FRAGMENT\(\s*{re.escape(namespace)}\s*,\s*ops\s*\)\s*\{{(.*?)^\}}",
+        source,
+        flags=re.DOTALL | re.MULTILINE,
+    )
+    assert fragment is not None, f"{namespace} registration missing in {BINDINGS}"
+    return fragment[1]
 
 
-def _schemas() -> dict[str, Any]:
-    """Every ``ops.def`` schema in the bindings, parsed, keyed by op name."""
-    parsed = {}
-    for match in re.finditer(r"ops\.def\(\s*((?:" + _LITERAL + r"\s*)+)\)\s*;", _source()):
+def _schema_strings(namespace: str = "turboquant_ops") -> dict[str, str]:
+    """Every raw ``ops.def`` schema in the fragment, keyed by op name."""
+    schemas = {}
+    for match in re.finditer(r"ops\.def\(\s*((?:" + _LITERAL + r"\s*)+)\)\s*;", _source(namespace)):
         text = "".join(part[1:-1] for part in re.findall(_LITERAL, match.group(1)))
-        schema = torch._C.parse_schema(text)
-        parsed[schema.name.split("::")[-1]] = schema
-    return parsed
+        schemas[text.partition("(")[0]] = text
+    return schemas
+
+
+def _schemas(namespace: str = "turboquant_ops") -> dict[str, Any]:
+    return {name: torch._C.parse_schema(schema) for name, schema in _schema_strings(namespace).items()}
 
 
 def _impl_keys() -> dict[str, set[str]]:

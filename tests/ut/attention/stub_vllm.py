@@ -6,7 +6,7 @@
 kernel_cache_layout,layout,nz_ingress,profile}.py`` need nothing but ``torch``:
 they check layout arithmetic, the kernel/golden dispatch seam, the in-code
 profiler's bookkeeping, and the ``ops.def`` schemas in
-``csrc/attention/turboquant/torch_bindings.cpp`` against the Python stubs that
+``csrc/attention/turboquant/bindings/torch_bindings.cpp`` against the Python stubs that
 call them. The only reason they need a vllm install at all is
 ``turboquant_v1.py``'s own import block, and the only reason they need an
 Ascend host is ``tests/ut/conftest.py``.
@@ -37,6 +37,18 @@ import types
 
 # tests/ut/attention/stub_vllm.py -> the checkout root.
 REPO = pathlib.Path(__file__).resolve().parents[3]
+_BLOCKED_MODULES = ("torch_npu", "vllm_ascend.vllm_ascend_C")
+
+
+def _is_blocked_module(name: str) -> bool:
+    return any(name == module or name.startswith(f"{module}.") for module in _BLOCKED_MODULES)
+
+
+class _BlockDeviceImports:
+    def find_spec(self, fullname: str, path=None, target=None):
+        if _is_blocked_module(fullname):
+            raise ImportError(f"Device-free TurboQuant tests block importing {fullname}")
+        return None
 
 
 def vllm_is_importable() -> bool:
@@ -57,8 +69,7 @@ def _module(name: str, path: pathlib.Path | None = None) -> types.ModuleType:
     rather than loaded from somewhere else by hand. Keeping them at their true
     paths matters -- ``test_turboquant_op_schemas.py`` locates
     ``torch_bindings.cpp`` by walking up from
-    ``turboquant_v1.__file__``, and silently skips every one of its tests
-    if that walk does not land on the checkout.
+    ``turboquant_v1.__file__``.
     """
     module = types.ModuleType(name)
     if path is not None:
@@ -82,9 +93,12 @@ def install() -> None:
             "run the tests directly with pytest instead."
         )
 
-    # torch_npu is imported by turboquant_v1 for its side effects; nothing
-    # in these tests calls into it.
-    _module("torch_npu")
+    if any(_is_blocked_module(name) for name in sys.modules):
+        raise RuntimeError("Device-free TurboQuant tests require a process with no device modules loaded")
+    sys.meta_path.insert(0, _BlockDeviceImports())
+    # TurboQuant imports the name and Dynamo inspects its module spec.
+    # The stub has no device functions or package path.
+    _module("torch_npu").__spec__ = importlib.machinery.ModuleSpec("torch_npu", loader=None)
 
     _module("vllm")
     _module("vllm.logger").logger = logging.getLogger("vllm")

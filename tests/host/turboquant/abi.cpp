@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <cstddef>
 #include <type_traits>
-#include "csrc/attention/turboquant/op_adapter/turboquant_torch_adpt.h"
-#include "csrc/attention/turboquant/op_host/turboquant_tiling.h"
-#include "csrc/attention/turboquant/e8/e8_decode.hpp"
-#include "csrc/attention/turboquant/e8/e8_packet_layout.hpp"
-#include "csrc/attention/turboquant/e8/e8_component.hpp"
+#include "csrc/attention/turboquant/common/turboquant_launch.h"
+#include "csrc/attention/turboquant/common/turboquant_tiling.h"
+#include "csrc/attention/turboquant/common/turboquant_wave_protocol.hpp"
+#include "csrc/attention/turboquant/common/e8_decode.hpp"
+#include "csrc/attention/turboquant/common/e8_packet_layout.hpp"
+#include "csrc/attention/turboquant/common/e8_component.hpp"
 
 namespace fd = ascend_micro::fused_decode;
 static_assert(sizeof(fd::TurboQuantDecodeTilingData) == 64);
@@ -31,6 +32,11 @@ static_assert(sizeof(e8_decode::Buffers) == 8 * sizeof(void*));
 static_assert(e8_packet_abi::kPacketBytes == 4352);
 static_assert(e8_packet_abi::kScaleOffset == 4096);
 static_assert(e8_decode::kKeyGroupStrideBytes == 1056);
+static_assert(turboquant_wave::FitsLaunchU32(UINT32_MAX));
+static_assert(!turboquant_wave::FitsLaunchU32(std::int64_t{UINT32_MAX} + 1));
+static_assert(!turboquant_wave::FitsLaunchU32(-1));
+static_assert(turboquant_wave::ActivationOffset((1u << 22) - 1, 4, 256) == (1ull << 32) - 1024);
+static_assert(turboquant_wave::ActivationOffset((1u << 22) + 1, 4, 256) == (1ull << 32) + 1024);
 using Reader = void (*)(void*, const e8_decode::Launch*, const e8_decode::Buffers*);
 static_assert(std::is_same_v<decltype(&launch_e8_fused_decode_fp32), Reader>);
 using Component = void (*)(void*, std::uint16_t*, float*, std::uint16_t*, std::int8_t*);

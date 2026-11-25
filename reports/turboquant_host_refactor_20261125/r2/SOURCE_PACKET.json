@@ -1,0 +1,50 @@
+{
+  "scope": "R2 source-only review. No generated code, ISA, cost, linker, simulator or device admission evidence.",
+  "plugin_root": "C:/vllm-ascend/csrc/attention/turboquant",
+  "core_root": "C:/Ascend/turboquant-core/src/turboquant",
+  "baseline": {
+    "plugin": "335d426e897c5b729150979afe648677c4fc3365",
+    "core": "7880e9443da85f9ba9c7773dad1bf8df16465e55"
+  },
+  "shared_inventory": "C:/vllm-ascend/csrc/attention/turboquant/SOURCE_SYNC.json",
+  "shared_inventory_sha256": "5043b5429d51f669f2d7840f1a86f195f88a6843073161ddcaea88d42c4e4eaa",
+  "token_comparison": "C:/Ascend/turboquant-integration-work/r2-review/token-preservation-v3.json",
+  "token_comparison_sha256": "744865ac09b266932c57d92ae51c9d02f8600c5a06edf97c63853487cc51d7ac",
+  "plugin_adapter_build_and_test_files": {
+    "CMakeLists.txt": "77b2a50d348a022ad518593d41ddca5d9193f6dd94bd5955839301a86988b25b",
+    "setup.py": "27032a2cae757dba5b2a473cc26285004f0abc91ab0154c44b3f7f641edae75a",
+    "csrc/build_aclnn.sh": "d0301bfcfdecd373019865e4b7ee386d2cd15ac32276a763fefcc01698f20eff",
+    "scripts/check_turboquant_sync.py": "3f415fc20c20c0d8b654a591d0e1b9b2873d88f9d8e9dcadff54e0f5962b7e99",
+    "tests/host/turboquant/check_bindings.py": "3c2b1d0a757e78f4b133176bb883a1f62d433e50a340b08785a58cc275195789",
+    "tests/host/turboquant/check_kernels.py": "188f395d951cd0cbf3ee3e522589c28508c7cfd2673e53216a1884736ce56e6c",
+    "tests/host/turboquant/check_analyzer.py": "1a470cc73167111bb9881dd805737f0d634b0d51bd10f29ef483b17c723e7df5",
+    "tests/host/turboquant/test_source_sync.py": "ed28676fa6cd64de43f5f70e36508fcec1096ebb8d4236418692831d5152b484",
+    "tests/host/turboquant/abi.cpp": "cc806183cb9ec69e1e421fc24005bbf860cd38c07032900d4bd27e71bae98ac7",
+    "tests/ut/ops/test_turboquant_contract_gates.py": "f4ad5482b3357608ad4f1e004486422caf67543784e1bae2a2bb2ba8e505ded9",
+    "tests/host/turboquant/test_build_selection.py": "d28559a8f0e14a685efcbbe9e24d23cefaa096bc552e599f534e7baebbdc753d"
+  },
+  "core_adapter_build_and_test_files": {
+    "CMakeLists.txt": "a6c2b7bb549a235744dc8065e2bc33488bd7949140eb20c1c0c90fc01c83b344",
+    "cmake/CannToolchain.cmake": "cd9017fae3b1d983c8905733580ec8a2a435c51030820e381bb0ed848b80e20c",
+    "cmake/SimTargets.cmake": "73df560d0f577867f4e9fb32f1d82c200cb4ba158155247c780c8d4c5c07e0e8",
+    "cmake/NpuTargets.cmake": "7c5bc9c000d3e2100ab476a5f0dfd7688f3c1e194a60fa47de85e47d9fdab688",
+    "tests/cpu/e8/CMakeLists.txt": "5c92e37d693aa947acf83a46e1f6e406510f9a3c3398bb040819611491b130fd",
+    "tests/cpu/check_semantic_goldens.py": "8971efec0be818a3fe9ba88fce7daa503f842c449c1146a06601dc83ab0d856c"
+  },
+  "pending_validation_outputs": {
+    "plugin_bisheng": "C:\\Ascend\\turboquant-integration-work\\r2-syntax-v3-vllm\\syntax.json",
+    "core_bisheng": "C:\\Ascend\\turboquant-integration-work\\r2-syntax-v3-core\\syntax.json",
+    "core_strip_bisheng": "C:\\Ascend\\turboquant-integration-work\\r2-syntax-v3-core-strip\\syntax.json",
+    "analyzer_against_independent_originals": "C:\\Ascend\\turboquant-integration-work\\r2-analyzer-v3\\summary.json"
+  },
+  "previous_packet": {
+    "path": "C:/Ascend/turboquant-integration-work/r2-review/source-v3.json",
+    "sha256": "a2957dde967c8e4f64c397cf570493779aadd33255133874b5ea498faf39fabc"
+  },
+  "checker_revision": {
+    "v3_full_comparison_sha256": "6c7996b0467f541a7f7b02de220345126b27ae1da19fffb2373fe37b3be2137a",
+    "v4_fresh_comparison_sha256": "1a470cc73167111bb9881dd805737f0d634b0d51bd10f29ef483b17c723e7df5",
+    "change": "Remove cached reports, generate unique raw results and fail on missing output or incomplete parse. AST comparison and source inputs are unchanged.",
+    "selected_freshness": "C:/Ascend/turboquant-integration-work/r2-analyzer-v4-focused/summary.json"
+  }
+}

@@ -43,7 +43,7 @@
 
 #include "tests/ut/ops/turboquant/common/camodel_session.hpp"
 #include "tests/ut/ops/turboquant/common/fused_decode_fixture.hpp"
-#include "csrc/attention/turboquant/include/turboquant_splitk_contract.hpp"
+#include "csrc/attention/turboquant/common/turboquant_splitk_contract.hpp"
 
 #include <algorithm>
 #include <cmath>

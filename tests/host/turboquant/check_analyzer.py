@@ -9,15 +9,48 @@ from __future__ import annotations
 
 import argparse
 import collections
-import datetime
 import hashlib
 import json
 import os
 import re
 import subprocess
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 ROOT = Path(__file__).resolve().parents[3]
+E8_LAYOUT = re.compile(r"^// (@ascend-(?:layout|reuse-group):[^\n]+)\n", re.MULTILINE)
+
+
+def write_input(path: Path, text: str) -> Path:
+    if not path.exists() or path.read_text() != text:
+        path.write_text(text)
+    return path
+
+
+def e8_source_pairs(original: Path, candidate: Path, out: Path) -> dict[str, tuple[Path, Path]]:
+    original_text = original.read_text()
+    metadata = candidate.with_name("reader_layout.aka").read_text()
+    annotations = E8_LAYOUT.findall(original_text)
+    if not annotations or metadata != "\n".join(annotations) + "\n":
+        raise ValueError("E8 layout sidecar differs from the independently verified reader")
+    prefix = "".join(f"// {line}\n" for line in metadata.splitlines())
+    annotated = write_input(out / "reader-layout-integrated.cpp", prefix + f'#include "{candidate}"\n')
+
+    def relocate_include(match: re.Match[str]) -> str:
+        include = original.parent / match[2]
+        return f'{match[1]}"{include.resolve()}"' if include.is_file() else match[0]
+
+    unannotated = re.sub(
+        r'^(\s*#\s*include\s+)"([^"]+)"',
+        relocate_include,
+        E8_LAYOUT.sub("", original_text),
+        flags=re.MULTILINE,
+    )
+    baseline_without_metadata = write_input(out / "reader-layout-verified-raw.cpp", unannotated)
+    return {
+        "e8_reader": (original, annotated),
+        "e8_reader_unannotated": (baseline_without_metadata, candidate),
+    }
 
 
 def main() -> None:
@@ -27,41 +60,50 @@ def main() -> None:
     parser.add_argument("--reshape", type=Path, required=True)
     parser.add_argument("--e8", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--reuse", action="store_true", help="Reuse reports newer than their input files")
+    parser.add_argument("--case", action="append", help="Run only the named case in a fresh comparison")
     args = parser.parse_args()
+    for option in ("analyzer", "native", "reshape", "e8", "out"):
+        setattr(args, option, getattr(args, option).resolve())
     args.out.mkdir(parents=True, exist_ok=True)
     tq = ROOT / "csrc/attention/turboquant"
     cases = {
         "decode": (
             args.native / "src/decode/turboquant_fused_decode.cpp",
-            tq / "op_kernel/turboquant_fused_decode.cpp",
+            tq / "decode/native/turboquant_fused_decode.cpp",
         ),
         "vector": (
             args.native / "src/decode/vector/turboquant_vector_service.h",
-            tq / "op_kernel/vector/turboquant_vector_service.h",
+            tq / "decode/native/vector/turboquant_vector_service.h",
         ),
         "softmax": (
             args.native / "src/decode/vector/routine_vector_cube_softmax.hpp",
-            tq / "op_kernel/vector/routine_vector_cube_softmax.hpp",
+            tq / "decode/native/vector/routine_vector_cube_softmax.hpp",
         ),
         "reshape": (
             args.reshape / "src/prefill/turboquant_reshape_batch.cpp",
-            tq / "op_kernel/turboquant_reshape_batch.cpp",
+            tq / "ingress/native/turboquant_reshape_batch.cpp",
         ),
         "scatter": (
             args.native / "src/scatter/turboquant_reshape_scatter.cpp",
-            tq / "op_kernel/turboquant_reshape_scatter.cpp",
+            tq / "ingress/native/turboquant_reshape_scatter.cpp",
         ),
-        "e8_reader": (args.e8 / "e8_fused_decode.cpp", tq / "e8/e8_fused_decode.cpp"),
-        "e8_component": (args.e8 / "parallel_component.cpp", tq / "e8/parallel_component.cpp"),
+        "e8_component": (args.e8 / "parallel_component.cpp", tq / "decode/e8/parallel_component.cpp"),
     }
-    nz_sources = []
-    for kind, source in zip(("verified", "integrated"), cases["reshape"]):
-        wrapper = args.out / f"reshape-nz-{kind}.cpp"
-        wrapper.write_text(f'#define TURBOQUANT_INGRESS_NZ 1\n#include "{source}"\n')
-        nz_sources.append(wrapper)
-    cases["reshape_nz"] = tuple(nz_sources)
+    cases.update(e8_source_pairs(args.e8 / "e8_fused_decode.cpp", tq / "decode/e8/e8_fused_decode.cpp", args.out))
+    for stage in ("reshape", "scatter"):
+        nz_sources = []
+        for kind, source in zip(("verified", "integrated"), cases[stage]):
+            wrapper = args.out / f"{stage}-nz-{kind}.cpp"
+            nz_sources.append(write_input(wrapper, f'#define TURBOQUANT_INGRESS_NZ 1\n#include "{source}"\n'))
+        cases[f"{stage}_nz"] = tuple(nz_sources)
+    result_path = args.out / "summary.json"
     reports = {}
+    if args.case:
+        unknown = set(args.case) - cases.keys()
+        if unknown:
+            parser.error("unknown analyzer case: " + ", ".join(sorted(unknown)))
+        cases = {name: cases[name] for name in args.case}
+    result_path.unlink(missing_ok=True)
     for name, pair in cases.items():
         parsed = []
         for kind, source in zip(("verified", "integrated"), pair):
@@ -76,34 +118,37 @@ def main() -> None:
                 "--solver",
                 "interval",
                 "--all-functions",
+                "--ignore-inline-pragmas",
                 "--format",
                 "json",
-                "-o",
-                str(path),
             ]
-            reuse = False
-            if args.reuse and path.exists():
-                previous = json.loads(path.read_text())
-                generated = datetime.datetime.fromisoformat(previous["tool"]["generated_at"]).timestamp()
-                reuse = previous["source"]["path"] == str(source) and source.stat().st_mtime < generated
-            if not reuse:
+            with TemporaryDirectory(dir=args.out, prefix=".aka-") as directory:
+                current = Path(directory) / path.name
                 result = subprocess.run(
-                    command,
+                    [*command, "-o", str(current)],
                     cwd=args.analyzer,
                     env={**os.environ, "PYTHONPATH": str(args.analyzer)},
                     capture_output=True,
                     text=True,
                 )
-                if result.returncode not in (0, 1):
-                    raise RuntimeError(result.stdout + result.stderr)
-            data = json.loads(path.read_text())
+                if result.returncode not in (0, 1) or not current.is_file():
+                    raise RuntimeError(f"Analyzer did not produce a fresh report for {source}\n{result.stdout}{result.stderr}")
+                data = json.loads(current.read_bytes())
+                current.replace(path)
+                if data["source"]["had_parse_errors"] or not data["kernels"]:
+                    raise RuntimeError(f"Analyzer produced an incomplete parse for {source}")
             parsed.append(data)
 
         def fingerprints(data):
             # AKA2005 also embeds changing source locations inside its prose.
             # Preserve every other message byte and diagnostic multiplicity.
             return collections.Counter(
-                (d["code"], d["severity"], re.sub(r"\(line \d+\)", "(line SOURCE)", d["message"]))
+                (
+                    d["code"],
+                    d["severity"],
+                    d["hardware_domain"],
+                    re.sub(r"\(line \d+\)", "(line SOURCE)", d["message"]),
+                )
                 for d in data["diagnostics"]
             )
 
@@ -112,14 +157,24 @@ def main() -> None:
         record = {
             "verified_summary": parsed[0]["summary"],
             "integrated_summary": parsed[1]["summary"],
-            "new": [{"code": k[0], "severity": k[1], "message": k[2], "count": n} for k, n in sorted(added.items())],
+            "new": [
+                {"code": k[0], "severity": k[1], "hardware_domain": k[2], "message": k[3], "count": n}
+                for k, n in sorted(added.items())
+            ],
             "resolved_occurrences": sum((before - after).values()),
             "source_sha256": [hashlib.sha256(source.read_bytes()).hexdigest() for source in pair],
-            "normalization": "location and embedded '(line N)' only; no categories suppressed",
+            "normalization": "code, severity, hardware domain, message (embedded line numbers normalized), multiplicity",
+            "frontend": [
+                {"functions": len(data["kernels"]), "parse_errors": data["source"]["parse_error_locations"]}
+                for data in parsed
+            ],
         }
+        if name.startswith("e8_reader"):
+            record["reader_source_sha256"] = hashlib.sha256((tq / "decode/e8/e8_fused_decode.cpp").read_bytes()).hexdigest()
+            record["layout_sidecar_sha256"] = hashlib.sha256((tq / "decode/e8/reader_layout.aka").read_bytes()).hexdigest()
         reports[name] = record
         print(json.dumps({"case": name, "new": sum(added.values()), "raw": parsed[1]["summary"]}), flush=True)
-    (args.out / "summary.json").write_text(json.dumps(reports, indent=2))
+    result_path.write_text(json.dumps(reports, indent=2))
     if any(r["new"] for r in reports.values()):
         raise SystemExit(1)
 

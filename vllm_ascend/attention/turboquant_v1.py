@@ -466,12 +466,13 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
                 attn_metadata.reshape_cache_event.record()
             return query, key, value, output
 
-        num_actual_tokens = attn_metadata.num_actual_tokens
-        decode_slots = getattr(attn_metadata, "turboquant_slot_mapping", None)
-        if getattr(attn_metadata, "attn_state", None) == AscendAttentionState.DecodeOnly and decode_slots is not None:
+        prepared_slots = getattr(attn_metadata, "turboquant_slot_mapping", None)
+        if getattr(attn_metadata, "attn_state", None) == AscendAttentionState.DecodeOnly and prepared_slots is not None:
             # The captured writer, like attention, must cover the padded extent.
             # Live request counts change between replays; -1 slots mask padding.
             num_actual_tokens = self._decode_num_tokens(attn_metadata)
+        else:
+            num_actual_tokens = attn_metadata.num_actual_tokens
         if num_actual_tokens == 0:
             return query, key, value, output
 
@@ -516,15 +517,12 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
             decode_slots = getattr(attn_metadata, "turboquant_slot_mapping", None)
             if decode_slots is not None:
                 return decode_slots[:num_actual_tokens], None
-        cached = getattr(attn_metadata, "_turboquant_ingestion_cache", None)
-        if cached is not None and cached[0] is attn_metadata.slot_mapping:
-            return cached[1], cached[2]
-        slot_mapping = attn_metadata.slot_mapping[:num_actual_tokens].to(torch.int32)
-        strip_plan: TurboQuantStripPlan | None = None
-        if phase is TurboQuantIngestionPhase.PREFILL and self.adapter.has_kernel(TURBOQUANT_OP_RESHAPE_AND_CACHE):
-            strip_plan = turboquant_plan_strip_ingestion(slot_mapping.tolist(), int(self.key_cache.shape[1]))
-        attn_metadata._turboquant_ingestion_cache = (attn_metadata.slot_mapping, slot_mapping, strip_plan)
-        return slot_mapping, strip_plan
+        slot_mapping = getattr(attn_metadata, "turboquant_ingestion_slot_mapping", None)
+        if slot_mapping is None:
+            # Standalone callers may supply metadata without the builder's
+            # fields. In that case the prefill adapter plans on demand.
+            return attn_metadata.slot_mapping[:num_actual_tokens].to(torch.int32), None
+        return slot_mapping, getattr(attn_metadata, "turboquant_strip_plan", None)
 
     @staticmethod
     def _ingestion_phase(attn_metadata: AscendMetadata, num_actual_tokens: int) -> TurboQuantIngestionPhase:

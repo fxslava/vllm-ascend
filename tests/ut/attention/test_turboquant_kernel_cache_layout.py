@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU tests for the cache layout the TurboQuant NPU writers leave behind.
 
-The two audited writers (``csrc/attention/turboquant/op_kernel/turboquant_reshape_batch.cpp``
+The two audited writers (``csrc/attention/turboquant/ingress/native/turboquant_reshape_batch.cpp``
 and ``..._scatter.cpp``) do not write the golden model's cache. Both are built
 with ``TURBOQUANT_INGRESS_NZ=1`` and produce the NZ-tiled layout the fused
 decode reads; the strip cache -- page axis

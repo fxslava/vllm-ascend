@@ -12,7 +12,7 @@ works::
 The files listed below check things that need only ``torch``: the three-plane
 cache layout arithmetic, the kernel/golden dispatch seam, the in-code profiler's
 bookkeeping, and the ``ops.def`` schemas
-in ``csrc/attention/turboquant/torch_bindings.cpp` against the Python stubs that
+in ``csrc/attention/turboquant/bindings/torch_bindings.cpp` against the Python stubs that
 call them. They are ordinary members of ``tests/ut/attention`` and run there in
 CI like everything else; this script only makes them reachable somewhere that
 cannot host the real suite, by installing :mod:`stub_vllm` first and skipping
@@ -37,6 +37,7 @@ DEVICE_FREE_TESTS = (
     "test_turboquant_e8.py",
     "test_turboquant_op_schemas.py",
     "test_turboquant_capture_contract.py",
+    "test_turboquant_host_graph.py",
     "test_turboquant_dispatch_seam.py",
     "test_turboquant_strip_cache.py",
     "test_turboquant_codec.py",

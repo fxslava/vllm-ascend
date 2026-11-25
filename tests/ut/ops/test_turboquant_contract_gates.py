@@ -60,7 +60,7 @@ COMPILE_FLAGS = ("-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror")
 # in a device-side header, so the gate that exercises it has to link that unit.
 # That is the point of the move: the host tiling is ordinary host C++ and the
 # gate compiles the very same object the launcher does.
-TILING_TU = "csrc/attention/turboquant/op_host/turboquant_tiling.cpp"
+TILING_TU = "csrc/attention/turboquant/common/turboquant_tiling.cpp"
 EXTRA_SOURCES = {"test_contract_gates": (TILING_TU,), "test_decode_reduce": (TILING_TU,)}
 
 
@@ -75,7 +75,7 @@ def gate_binaries(tmp_path_factory):
     for gate in GATES:
         source = root / "tests" / "ut" / "ops" / "turboquant" / f"{gate}.cpp"
         if gate.startswith("e8_"):
-            source = root / "csrc/attention/turboquant/e8" / f"{gate.removeprefix('e8_')}.cpp"
+            source = root / "tests/host/turboquant/e8" / f"{gate.removeprefix('e8_')}.cpp"
         elif gate == "test_launch_abi":
             source = root / "tests/host/turboquant/abi.cpp"
         extra = [str(root / name) for name in EXTRA_SOURCES.get(gate, ())]
@@ -89,7 +89,7 @@ def gate_binaries(tmp_path_factory):
                 "-I",
                 str(root),
                 "-isystem",
-                str(root / "csrc/attention/turboquant/e8/frozen"),
+                str(root / "tests/host/turboquant/e8/frozen"),
                 str(source),
                 *extra,
                 "-o",

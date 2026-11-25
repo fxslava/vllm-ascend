@@ -58,7 +58,7 @@
 #include "tests/ut/ops/turboquant/common/camodel_session.hpp"
 #include "tests/ut/ops/turboquant/common/turboquant_golden_oracle.hpp"
 #include "tests/ut/ops/turboquant/common/turboquant_scatter_oracle.hpp"
-#include "csrc/attention/turboquant/op_kernel/common/turboquant_wave_protocol.hpp"
+#include "csrc/attention/turboquant/common/turboquant_wave_protocol.hpp"
 
 #include <algorithm>
 #include <charconv>

@@ -9,9 +9,9 @@ The thing under test is the vectorised repack in
 :mod:`vllm_ascend.attention.turboquant_nz_ingress`. The oracle is a pair of
 scalar writers/readers in this file, transcribed from the two C++ headers that
 state the contracts -- the ``Layout contracts`` block of
-``op_kernel/turboquant_reshape_batch.cpp`` for what the audited writers produce
-and ``op_kernel/common/turboquant_layout.h`` plus
-``op_kernel/vector/turboquant_vector_service.h`` for what the fused decode
+``ingress/native/turboquant_reshape_batch.cpp`` for what the audited writers produce
+and ``common/turboquant_layout.h`` plus
+``decode/native/vector/turboquant_vector_service.h`` for what the fused decode
 reads. ``tests/ut/ops/turboquant/test_layout_bridge.cpp`` is the C++ gate over
 the same two contracts. The repack and the oracle share no code, so agreement between them is a
 real cross-check rather than a restatement.
@@ -43,7 +43,7 @@ from vllm_ascend.attention.turboquant_nz_ingress import (
 from vllm_ascend.attention.turboquant_v1 import TURBOQUANT_PACK_FACTOR
 
 REPO = pathlib.Path(__file__).resolve().parents[3]
-KERNEL_COMMON = REPO / "csrc" / "attention" / "turboquant" / "op_kernel" / "common"
+KERNEL_COMMON = REPO / "csrc" / "attention" / "turboquant" / "common"
 
 
 # ---------------------------------------------------------------------------
@@ -413,11 +413,11 @@ def test_packed_bytes_survive_a_round_trip_through_codes() -> None:
 def test_repack_output_satisfies_the_fused_decode_binding() -> None:
     """The three planes must pass the binding's own cache TORCH_CHECKs.
 
-    Read off csrc/attention/turboquant/torch_bindings.cpp rather than restated,
+    Read off csrc/attention/turboquant/bindings/torch_decode.cpp rather than restated,
     so that tightening a check there without updating the bridge fails here
     instead of at a launch on hardware nobody has.
     """
-    bindings = (REPO / "csrc" / "attention" / "turboquant" / "torch_bindings.cpp").read_text(encoding="utf-8")
+    bindings = (REPO / "csrc/attention/turboquant/bindings/torch_decode.cpp").read_text(encoding="utf-8")
     assert "key_cache.dim() == 4 && key_cache.sizes() == value_cache.sizes()" in bindings
     assert "const std::int64_t block_size = key_cache.size(1);" in bindings
     assert "block_size % layout::kCubeTileRows == 0" in bindings

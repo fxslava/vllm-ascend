@@ -2,12 +2,12 @@
 import inspect
 import re
 import struct
-from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
+from tests.ut.attention.test_turboquant_op_schemas import _schemas, _source
 from vllm_ascend.attention import turboquant_e8 as e8
 
 
@@ -57,13 +57,8 @@ def test_e8_refuses_native_nibble_buffers(fn, args):
 
 
 def test_e8_schema_call_order_mutation_and_meta_registration():
-    root = Path(e8.__file__).resolve().parents[2]
-    text = (root / "csrc/attention/turboquant/e8_torch_bindings.cpp").read_text()
-    literals = r'"(?:[^"\\]|\\.)*"'
-    schemas = {}
-    for match in re.finditer(r"ops\.def\(\s*((?:" + literals + r"\s*)+)\)\s*;", text):
-        schema = torch._C.parse_schema("".join(s[1:-1] for s in re.findall(literals, match[1])))
-        schemas[schema.name] = schema
+    text = _source("turboquant_e8_ops")
+    schemas = _schemas("turboquant_e8_ops")
     assert set(schemas) == {"reader", "dequant"}
     for name, schema in schemas.items():
         fn = getattr(e8, name)

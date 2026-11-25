@@ -1,0 +1,510 @@
+{
+  "baseline": {
+    "plugin": "335d426e897c5b729150979afe648677c4fc3365",
+    "core": "7880e9443da85f9ba9c7773dad1bf8df16465e55"
+  },
+  "source_packet": {
+    "path": "C:/vllm-ascend/reports/turboquant_host_refactor_20261125/r2/SOURCE_PACKET.json",
+    "sha256": "25951f67b418f387a74eae777008f95151c592e03a23851db5fd7f8e60c2342b"
+  },
+  "source_inventory": {
+    "path": "C:/vllm-ascend/csrc/attention/turboquant/SOURCE_SYNC.json",
+    "sha256": "5043b5429d51f669f2d7840f1a86f195f88a6843073161ddcaea88d42c4e4eaa"
+  },
+  "literal_shared_paths": 35,
+  "comment_free_cpp_paths": 42,
+  "syntax": {
+    "r2-syntax-v3-vllm": {
+      "command": "python3 /mnt/c/vllm-ascend/tests/host/turboquant/check_kernels.py --sdk /home/dmin/Ascend-9.2.1/cann-9.2.1 --out /mnt/c/Ascend/turboquant-integration-work/r2-syntax-v3-vllm",
+      "passed": 10,
+      "full_commands_and_logs": {
+        "path": "C:/Ascend/turboquant-integration-work/r2-syntax-v3-vllm/syntax.json",
+        "sha256": "a5b44f0be3e41577d1280b945d32b71160317d7547a80b90aca0d05f72e54a49"
+      },
+      "translation_units": [
+        {
+          "file": "csrc/attention/turboquant/ingress/native/turboquant_reshape_batch.cpp",
+          "role": "host",
+          "source_sha256": "f0de459602caca0da6d67bbefe8368f6f44d0b0c32cd04cd01ccb187f7d312c3",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "file": "csrc/attention/turboquant/ingress/native/turboquant_reshape_batch.cpp",
+          "role": "device",
+          "source_sha256": "f0de459602caca0da6d67bbefe8368f6f44d0b0c32cd04cd01ccb187f7d312c3",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "file": "csrc/attention/turboquant/ingress/native/turboquant_reshape_scatter.cpp",
+          "role": "host",
+          "source_sha256": "6701601056dfe2e003f58e6a6133258b5a73d2a2cd6c827a1aaa65b92282b63d",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "file": "csrc/attention/turboquant/ingress/native/turboquant_reshape_scatter.cpp",
+          "role": "device",
+          "source_sha256": "6701601056dfe2e003f58e6a6133258b5a73d2a2cd6c827a1aaa65b92282b63d",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "file": "csrc/attention/turboquant/decode/native/turboquant_fused_decode.cpp",
+          "role": "host",
+          "source_sha256": "7024e81fa1fca81330dc4e425145efdd2e76b90fe5a83be35fc9683ef8f60e0e",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "file": "csrc/attention/turboquant/decode/native/turboquant_fused_decode.cpp",
+          "role": "device",
+          "source_sha256": "7024e81fa1fca81330dc4e425145efdd2e76b90fe5a83be35fc9683ef8f60e0e",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "file": "csrc/attention/turboquant/bindings/asc_e8_reader.cpp",
+          "role": "host",
+          "source_sha256": "f291d4246c50b943dd54ecc8b6bf134473a69ba121ac72eb9055411d589f54d9",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "file": "csrc/attention/turboquant/bindings/asc_e8_reader.cpp",
+          "role": "device",
+          "source_sha256": "f291d4246c50b943dd54ecc8b6bf134473a69ba121ac72eb9055411d589f54d9",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "file": "csrc/attention/turboquant/bindings/asc_e8_component.cpp",
+          "role": "host",
+          "source_sha256": "98d868ab5885c71f82573553e444adb704673ff6dd96b353e6471bb541b4396c",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "file": "csrc/attention/turboquant/bindings/asc_e8_component.cpp",
+          "role": "device",
+          "source_sha256": "98d868ab5885c71f82573553e444adb704673ff6dd96b353e6471bb541b4396c",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ]
+    },
+    "r2-syntax-v3-core": {
+      "command": "python3 /mnt/c/vllm-ascend/tests/host/turboquant/check_kernels.py --sdk /home/dmin/Ascend-9.2.1/cann-9.2.1 --out /mnt/c/Ascend/turboquant-integration-work/r2-syntax-v3-core --core /mnt/c/Ascend/turboquant-core",
+      "passed": 10,
+      "full_commands_and_logs": {
+        "path": "C:/Ascend/turboquant-integration-work/r2-syntax-v3-core/syntax.json",
+        "sha256": "70acfb99d1722408a5fa309e5306677f8dfd7564ac0cd6cf93faf86ba62b9061"
+      },
+      "translation_units": [
+        {
+          "file": "src/turboquant/ingress/native/turboquant_reshape_batch.cpp",
+          "role": "host",
+          "source_sha256": "f0de459602caca0da6d67bbefe8368f6f44d0b0c32cd04cd01ccb187f7d312c3",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "file": "src/turboquant/ingress/native/turboquant_reshape_batch.cpp",
+          "role": "device",
+          "source_sha256": "f0de459602caca0da6d67bbefe8368f6f44d0b0c32cd04cd01ccb187f7d312c3",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "file": "src/turboquant/ingress/native/turboquant_reshape_scatter.cpp",
+          "role": "host",
+          "source_sha256": "6701601056dfe2e003f58e6a6133258b5a73d2a2cd6c827a1aaa65b92282b63d",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "file": "src/turboquant/ingress/native/turboquant_reshape_scatter.cpp",
+          "role": "device",
+          "source_sha256": "6701601056dfe2e003f58e6a6133258b5a73d2a2cd6c827a1aaa65b92282b63d",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "file": "src/turboquant/decode/native/turboquant_fused_decode.cpp",
+          "role": "host",
+          "source_sha256": "7024e81fa1fca81330dc4e425145efdd2e76b90fe5a83be35fc9683ef8f60e0e",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "file": "src/turboquant/decode/native/turboquant_fused_decode.cpp",
+          "role": "device",
+          "source_sha256": "7024e81fa1fca81330dc4e425145efdd2e76b90fe5a83be35fc9683ef8f60e0e",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "file": "src/turboquant/decode/e8/e8_fused_decode.cpp",
+          "role": "host",
+          "source_sha256": "1354868b479d3c2972f219a7012718e210c085ffcb38c6310056fcebb7f390ef",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "file": "src/turboquant/decode/e8/e8_fused_decode.cpp",
+          "role": "device",
+          "source_sha256": "1354868b479d3c2972f219a7012718e210c085ffcb38c6310056fcebb7f390ef",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "file": "src/turboquant/decode/e8/parallel_component.cpp",
+          "role": "host",
+          "source_sha256": "0fd04fcc15b476096eadcd2537b1365356d9bb29c8591c29f9a6db998b3ff017",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "file": "src/turboquant/decode/e8/parallel_component.cpp",
+          "role": "device",
+          "source_sha256": "0fd04fcc15b476096eadcd2537b1365356d9bb29c8591c29f9a6db998b3ff017",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ]
+    },
+    "r2-syntax-v3-core-strip": {
+      "command": "python3 /mnt/c/vllm-ascend/tests/host/turboquant/check_kernels.py --sdk /home/dmin/Ascend-9.2.1/cann-9.2.1 --out /mnt/c/Ascend/turboquant-integration-work/r2-syntax-v3-core-strip --core /mnt/c/Ascend/turboquant-core --strip",
+      "passed": 4,
+      "full_commands_and_logs": {
+        "path": "C:/Ascend/turboquant-integration-work/r2-syntax-v3-core-strip/syntax.json",
+        "sha256": "5563be69efc481afac8497dc4a28557b2de97188ca9963fe7966bf1f6e2dbe18"
+      },
+      "translation_units": [
+        {
+          "file": "src/turboquant/ingress/native/turboquant_reshape_batch.cpp",
+          "role": "host",
+          "source_sha256": "f0de459602caca0da6d67bbefe8368f6f44d0b0c32cd04cd01ccb187f7d312c3",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "file": "src/turboquant/ingress/native/turboquant_reshape_batch.cpp",
+          "role": "device",
+          "source_sha256": "f0de459602caca0da6d67bbefe8368f6f44d0b0c32cd04cd01ccb187f7d312c3",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "file": "src/turboquant/ingress/native/turboquant_reshape_scatter.cpp",
+          "role": "host",
+          "source_sha256": "6701601056dfe2e003f58e6a6133258b5a73d2a2cd6c827a1aaa65b92282b63d",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "file": "src/turboquant/ingress/native/turboquant_reshape_scatter.cpp",
+          "role": "device",
+          "source_sha256": "6701601056dfe2e003f58e6a6133258b5a73d2a2cd6c827a1aaa65b92282b63d",
+          "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ]
+    }
+  },
+  "host_cpp_syntax": {
+    "host": "WSL Ubuntu 22.04",
+    "compiler": "GCC 11.4.0",
+    "plugin_command": "g++ -I. -isystem tests/host/turboquant/e8/frozen -std=c++17 -Wall -Wextra -Werror -fno-fast-math -ffp-contract=off -fsyntax-only tests/host/turboquant/abi.cpp tests/host/turboquant/e8/*.cpp tests/ut/ops/turboquant/*.cpp csrc/attention/turboquant/common/turboquant_tiling.cpp",
+    "core_command": "find tests/cpu src/turboquant/common -name '*.cpp' -print0 | xargs -0 g++ -I. -isystem tests/cpu/e8/frozen -std=c++17 -Wall -Wextra -Werror -fno-fast-math -ffp-contract=off -fsyntax-only",
+    "exit_status": {
+      "plugin": 0,
+      "core": 0
+    }
+  },
+  "torch_binding_syntax": {
+    "command": "docker run --rm --network none -e TORCH_DEVICE_BACKEND_AUTOLOAD=0 -v /mnt/c/vllm-ascend:/workspace/vllm-ascend:ro --entrypoint python quay.io/ascend/vllm-ascend@sha256:bbd643260f6c27e371e4df556813e9365980361194f06b0e9cdeda697378784c /workspace/vllm-ascend/tests/host/turboquant/check_bindings.py",
+    "result": {
+      "torch": "2.10.0+cpu",
+      "syntax_translation_units": 5
+    },
+    "log": {
+      "path": "C:/Ascend/turboquant-integration-work/r2-bindings-v3.log",
+      "sha256": "1d83fb285c0f1d7c09ec24d700d683f0439b62dcceb97a895ff8e77b3edf6533"
+    }
+  },
+  "python_tests": {
+    "command": "python -m pytest -q --confcutdir=tests/host/turboquant tests/host/turboquant/test_source_sync.py tests/host/turboquant/test_build_selection.py",
+    "passed": 14
+  },
+  "cpu_golden_semantics": {
+    "command": "docker run --rm --network none -e TORCH_DEVICE_BACKEND_AUTOLOAD=0 -v /mnt/c/Ascend/turboquant-core:/workspace/turboquant-core:ro --entrypoint python quay.io/ascend/vllm-ascend@sha256:bbd643260f6c27e371e4df556813e9365980361194f06b0e9cdeda697378784c /workspace/turboquant-core/tests/cpu/check_semantic_goldens.py",
+    "result": {
+      "e8_python_model": {
+        "labels": 65536,
+        "scales": 16,
+        "coordinate_scale_pairs": 8388608,
+        "key_addresses": 16384
+      },
+      "native_python_fixtures": {
+        "prefill/expected_key_nz.bin": "17ab6a0da9149b4734d712ec18e0683b693826ab0871f609b95fa434babd7db4",
+        "prefill/expected_key_strip.bin": "29cc46aedc3dc2df8a65c2fcdce5c02e8f6541853db1e8f3f53b4421dcdb69a0",
+        "prefill/expected_scale_nz.bin": "47af95795023552bd12010732201ece2e333939397bf7c88fa05cb5abcedb8b5",
+        "prefill/expected_scale_strip.bin": "202f348453bd4bf536b46702c3ca51a979547d5e8429f2e8c611f73b87a6cdd4",
+        "prefill/expected_value_nz.bin": "dca60e014b8be436063b64b1820984384f4e074e5b2467398843a0db4c3a4b2d",
+        "prefill/expected_value_strip.bin": "8fc234e0aa5d211d3e4f782f5931e7e1fdf3546737bdfb7108cff49b1adc4e86",
+        "prefill/key.bin": "db24bb7f9b44d3fcc51a9eefbd825e8962d901c2c8042bf777613946b2598178",
+        "prefill/pi_signs.bin": "60a8154f2c042cb2d7272a7c6dd2f591432ea776903b5b3a8dcc538e7f73c9a4",
+        "prefill/slot_mapping.bin": "6e857cbcc758dd68a276caaf2cae43ae5914d2359f0f56661d1ec4ba1f69682b",
+        "prefill/tables.bin": "fbc357cb7d8a27c9eef111719ab9c4ecdb04370cdd8286575a82c591a3bf2443",
+        "prefill/value.bin": "fc67d857012b2b8c0dca1624133506d33bd3c172e255b849a28ac70542e3611a",
+        "scatter/expected_key_step1.bin": "b065de8b5a4194621dda78b0c93b49569a487e8d9554b7d984867a4879b59181",
+        "scatter/expected_key_step2.bin": "d01631b632938da9879c88f41daa9ee4265f9dc8c226d715768e7ca7393ae44e",
+        "scatter/expected_scale_step1.bin": "b2750944d29a2a0bb50d6f0683e565f92068725c86149984b078d9a89c964763",
+        "scatter/expected_scale_step2.bin": "3ec9310ecd082dadad8ad386fd66ee95144c81116fe1d67434e6b049049b38fb",
+        "scatter/expected_value_step1.bin": "5505e1a79f036657c23d6435e64a5084e5021d1bed19b284a9a5652c2d40793b",
+        "scatter/expected_value_step2.bin": "9eafee10422bb79bf0f7bd34de8a288789679ba9101ac89785ad88b1d244938d",
+        "scatter/init_key.bin": "cb7864320e78d2519a8f81a0fcc184de1f441f320e2c8e1822a8db4d8ebb2b92",
+        "scatter/init_scale.bin": "36a3a8058f85d946c216205317ad09ba90a0fb9e1c65f020e87da72c4532c60f",
+        "scatter/init_value.bin": "cb7864320e78d2519a8f81a0fcc184de1f441f320e2c8e1822a8db4d8ebb2b92",
+        "scatter/key_a.bin": "a13050b9ed8b1899c8dac737b44f6f5e25f10a4ce06ef8e29236a83d5b497c31",
+        "scatter/key_b.bin": "4de9beb4c8af6a2d1109c19935d6fdf737bae37c9ae401acd88b4dbba066f15f",
+        "scatter/pi_signs.bin": "60a8154f2c042cb2d7272a7c6dd2f591432ea776903b5b3a8dcc538e7f73c9a4",
+        "scatter/slots_a.bin": "795039a24b4bce93b6d512c761b3d1e19eff96ed0e6e5adc744002feb2e571d3",
+        "scatter/slots_b.bin": "6bd2f0f0fe12e192e5f335d8d57d113313811cc16f1813d4ff6e4ccbb89bc470",
+        "scatter/value_a.bin": "66fa758ae726fc8a35555afc9ea468a0faeed2f7cc05acd8b5a36f891f699e30",
+        "scatter/value_b.bin": "fcf78fa257d47e53c53bb418e00dc6cd58de45a94d5dc9c9e97eced15992862c",
+        "decode_ctx128/block_table.bin": "c79eee14f4d2e7a7cdf2411c9fc7841ae32c778a486a12c461b6316db8df93ba",
+        "decode_ctx128/context_lens.bin": "50c8ba3a6170f0a2fb6736ece8a603576ef6309a35e810911599bc6211b554a9",
+        "decode_ctx128/expected_stage0.bin": "5f62baef8d48f7854b922d3b1f53aeb1061e46b0da81ec3bac2dbdc7cb43dbb3",
+        "decode_ctx128/expected_stage1.bin": "52a0c8dda02c6a41c5d49730c6e606c5c9d7fb56344a53eca0a9e339782df589",
+        "decode_ctx128/h16.bin": "186cb9e8c6a34e0e384ff9b8146e62d927f3d0690615a8cbc979b3b6c43d87fd",
+        "decode_ctx128/kernel_stage0.bin": "d11f56d7bb765dc6bb32ab98eab382fa15301c870e83d3c3d44c7448e9f6a3e2",
+        "decode_ctx128/kernel_stage1.bin": "cf251c529059945419de18b8b4eb42da3fb7b7a80fdfcb9aadb7dbb80df954f5",
+        "decode_ctx128/key_cache.bin": "93b2f8c17303d1b37249b500ad198836e3dc0fbb3598eddd76de618ab1acdb2d",
+        "decode_ctx128/mode_tables.bin": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
+        "decode_ctx128/pi_signs.bin": "60a8154f2c042cb2d7272a7c6dd2f591432ea776903b5b3a8dcc538e7f73c9a4",
+        "decode_ctx128/query_rot.bin": "95ed718479407e1c8b7623b4e8164b69f0868a9159f9af37dacb818d59c4a028",
+        "decode_ctx128/raw_query.bin": "7262b9bf711065b6dfda52dd1771081005922604992dd3132ea1fc83a51e0354",
+        "decode_ctx128/rot_tables.bin": "fbc357cb7d8a27c9eef111719ab9c4ecdb04370cdd8286575a82c591a3bf2443",
+        "decode_ctx128/scale_cache.bin": "faaee65952fe0e4c77be248043f695c727597c482bcf8804f03115e8cea8e734",
+        "decode_ctx128/value_cache.bin": "49e9d03a3aec53606ca369400bd9ba95c523bf87e228d26031c801541fdc4f24",
+        "decode_ctx200/block_table.bin": "c9fb1af5448b4c1617110984db88708ab631c11941ec029e2d2b8fbd0202c93e",
+        "decode_ctx200/context_lens.bin": "a77802d8305178be2db1ab04fdd5ca3b8c03ad5d45ca35132ff6a04c7faec115",
+        "decode_ctx200/expected_stage0.bin": "c84574570c7e7976f9e9d5608e578c144cc208eb120469e36933fee7da35e7d8",
+        "decode_ctx200/expected_stage1.bin": "0afa8b9ef15b8425d67260f8c4ca065e12e0ac5d9177ea7afa5840093d6b177a",
+        "decode_ctx200/h16.bin": "186cb9e8c6a34e0e384ff9b8146e62d927f3d0690615a8cbc979b3b6c43d87fd",
+        "decode_ctx200/kernel_stage0.bin": "b02e56dd30d4fdfc27e76b6b23cdc85e9e5fde85d158b4cb9165e622c0da862f",
+        "decode_ctx200/kernel_stage1.bin": "b05851bcedf17b7ced0412dd09419e7ec70a22ccafb635047bcb7218ac11f2d0",
+        "decode_ctx200/key_cache.bin": "1e9428583b84031bd3b2d3a67e5841f8b617aacf2a12bcdc555a7b8dd59eefbc",
+        "decode_ctx200/mode_tables.bin": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925",
+        "decode_ctx200/pi_signs.bin": "60a8154f2c042cb2d7272a7c6dd2f591432ea776903b5b3a8dcc538e7f73c9a4",
+        "decode_ctx200/query_rot.bin": "2f60066588e25d2769e266ec2d13c9c088b78cc28313bb8e177bb34883ad8787",
+        "decode_ctx200/raw_query.bin": "5e4faeab319e99a4863a557baca8ff4cda536e9454ee5e7aec5dc906b1379ea8",
+        "decode_ctx200/rot_tables.bin": "fbc357cb7d8a27c9eef111719ab9c4ecdb04370cdd8286575a82c591a3bf2443",
+        "decode_ctx200/scale_cache.bin": "3dfc54f772c8193dd1b0acfa4cea9e69703ac8d1874de58f746101445d9bea0e",
+        "decode_ctx200/value_cache.bin": "15fe066210da2b38c2e8bc13600c35295f763910a5038eead761065dc415eadd"
+      },
+      "torch": "2.10.0+cpu",
+      "numpy": "1.26.4",
+      "cpp_builds": 0,
+      "device_launches": 0
+    },
+    "log": {
+      "path": "C:/Ascend/turboquant-integration-work/r2-cpu-goldens-v3.log",
+      "sha256": "55b2bd60e5e53f6ff4a7b037bc9da2f60fcae7b2601c2a8a097859ee3972e880"
+    },
+    "alternate_environment": "Windows 11 / Python 3.14.7 / Torch 2.14.0+cpu / NumPy 2.5.2. Two stage-1 files differed by 16 and 8 bytes; all other recorded binary files matched."
+  },
+  "analyzer": {
+    "revision": "46f16829ee37b4a31961832595e96b280d7f053e",
+    "command": "python3 /mnt/c/vllm-ascend/tests/host/turboquant/check_analyzer.py --analyzer /mnt/c/ascend-kernel-analyzer --native /mnt/c/Users/Admin/.codex/worktrees/wave-v11-integration/turboquant-core --reshape /mnt/c/Users/Admin/.codex/worktrees/reshape-wave1-selected/turboquant-core --e8 /mnt/c/ascend-micro-harness/reports/checkpoint2_20261123/wave3/w3_e8_dec/review_packet_v5/candidate/source --out /mnt/c/Ascend/turboquant-integration-work/r2-analyzer-v3",
+    "raw_reports": [
+      {
+        "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v3/decode-integrated.json",
+        "sha256": "cf72935e89d9571c7b10ffafb7229630237c6f97fecb3276fb6f72f1841c9b6f"
+      },
+      {
+        "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v3/decode-verified.json",
+        "sha256": "b94f6467240545aea34dbddee516fae9554b67ed92ebf8f54084c0c8e99846cf"
+      },
+      {
+        "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v3/e8_component-integrated.json",
+        "sha256": "cbe4f0453a9ac3b41c5c43c25759af70b7d3e8f32544770c342e9581fb0abcb9"
+      },
+      {
+        "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v3/e8_component-verified.json",
+        "sha256": "b89843384fef3dd9e7ff7788a237be1ce07cd47d4630313101303f2a65bd1830"
+      },
+      {
+        "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v3/e8_reader-integrated.json",
+        "sha256": "1d4dc5de356a2bb7d4ffbb90657b8ca418ed7033f468d14eedfb8c65726b3820"
+      },
+      {
+        "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v3/e8_reader-verified.json",
+        "sha256": "1e0a1cda2be82c0dbe4675b160de3cba7a3813ffc67565a9dc1322f768969dfd"
+      },
+      {
+        "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v3/e8_reader_unannotated-integrated.json",
+        "sha256": "11fb58ec8d73ba22c603ab9735dcc8eae20147d22c130abfe556c6dc3f1b99d5"
+      },
+      {
+        "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v3/e8_reader_unannotated-verified.json",
+        "sha256": "476f7393d8c069377498d79154c7ac6841cba94b88f30385f8753dd78cb555eb"
+      },
+      {
+        "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v3/reshape-integrated.json",
+        "sha256": "a329a2f9235127888b8e362a7e89eaf08879595547b762ee69c502817b356354"
+      },
+      {
+        "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v3/reshape-verified.json",
+        "sha256": "9eda9ab085acead2679054b88c457611566691efb60c0f24ed87b63f0aba02af"
+      },
+      {
+        "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v3/reshape_nz-integrated.json",
+        "sha256": "74fe166462ffa44d750bfead8635d44e851ffeeb456466057ad5388ff28920cc"
+      },
+      {
+        "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v3/reshape_nz-verified.json",
+        "sha256": "a8e574e7c02171e55f20118d1750f1e015e4bc7230cd7a238fbb6797af2772dc"
+      },
+      {
+        "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v3/scatter-integrated.json",
+        "sha256": "aec9782b4028ae2f97de9486a0c1fd7c4c5ad03a1cc3aa544e9d6e64629d87b3"
+      },
+      {
+        "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v3/scatter-verified.json",
+        "sha256": "3489222fb49fcdd50bd850e67f38728d1a22f9290a6602958fab6170920d8403"
+      },
+      {
+        "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v3/scatter_nz-integrated.json",
+        "sha256": "b6ca568369d528c56c9e915b73c6ada9b3d2bcfaf01292409efdb5d6c37da8ca"
+      },
+      {
+        "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v3/scatter_nz-verified.json",
+        "sha256": "059502b969cc73b11acc5756cfdd2b0f9c775c1fc1ae4637b8cdee89c9ddb9da"
+      },
+      {
+        "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v3/softmax-integrated.json",
+        "sha256": "dad92143e56d19d6fb9ddb4dab8dacc634638a328c388d1ac32bf47b0385c4e7"
+      },
+      {
+        "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v3/softmax-verified.json",
+        "sha256": "571b83f79d605bbf87e5aaedde4b56dcb8f98d3ff8078b4d19c7592742989e2c"
+      },
+      {
+        "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v3/vector-integrated.json",
+        "sha256": "1d1ffee437b56eecc334e9f8b0c3b718e4b22d9fa4385fa0578dd813e90a786f"
+      },
+      {
+        "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v3/vector-verified.json",
+        "sha256": "c74c2a892eecb01d87eef07141e8634b19506f107e39208a1598ddb1596d7ef3"
+      }
+    ],
+    "paired_scopes": 10,
+    "added_diagnostic_fingerprints": 0,
+    "coverage_limit": "E8 component entry does not inline two Dequant template calls; raw reports retain all findings.",
+    "e8_component_entry": {
+      "op_count": 10,
+      "inlined_calls": []
+    },
+    "checker_hashes": {
+      "v3_full_comparison_sha256": "6c7996b0467f541a7f7b02de220345126b27ae1da19fffb2373fe37b3be2137a",
+      "v4_fresh_comparison_sha256": "1a470cc73167111bb9881dd805737f0d634b0d51bd10f29ef483b17c723e7df5",
+      "change": "Remove cached reports, generate unique raw results and fail on missing output or incomplete parse. AST comparison and source inputs are unchanged.",
+      "selected_freshness": "C:/Ascend/turboquant-integration-work/r2-analyzer-v4-focused/summary.json"
+    },
+    "freshness": {
+      "focused_scopes": [
+        "e8_reader",
+        "e8_reader_unannotated",
+        "scatter_nz"
+      ],
+      "commands": {
+        "path": "C:/Ascend/turboquant-integration-work/r2-review/test-checker-freshness.sh",
+        "sha256": "8e452dc782f5b4aecd22563d6cb3803a07bc64f4d59ff264fad55a8904b654f1"
+      },
+      "raw_reports": [
+        {
+          "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v4-focused/e8_reader-integrated.json",
+          "sha256": "336205fe9c6e9d87394d32843c875122c048d55f523539b2f5e44ec4ea11adcf"
+        },
+        {
+          "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v4-focused/e8_reader-verified.json",
+          "sha256": "c98e038e1a169fe67fb2fcda666aa88bc53c7a52d6b7d307d8f0cb2855d9c94f"
+        },
+        {
+          "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v4-focused/e8_reader_unannotated-integrated.json",
+          "sha256": "f955eeb396897b18cfe39a5abc8f5fee07d6321b5f4a3c4d88a5a497ba93a63a"
+        },
+        {
+          "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v4-focused/e8_reader_unannotated-verified.json",
+          "sha256": "17c257b1f22f3acb74f9a14fa874216c6a1dd180a74b2a247ccb1624aa669560"
+        },
+        {
+          "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v4-focused/scatter_nz-integrated.json",
+          "sha256": "6ab7f8980deb073ed23bb6fe7c2dfa9657714e7ce378b350ff2ca50cc255bde1"
+        },
+        {
+          "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v4-focused/scatter_nz-verified.json",
+          "sha256": "5290f08cfa4cc70961b7171b55e6005c8caa7b7c6ba8c879a2d6f2058dd3126e"
+        }
+      ],
+      "stale_tool_output_rejection": {
+        "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v4-negative/out/../rejection.log",
+        "sha256": "eebf0487c1cf662466fb3937d607767378c8f83049035c2c84d0c30f3611f2d1"
+      },
+      "reuse_flag_rejection": {
+        "path": "C:/Ascend/turboquant-integration-work/r2-analyzer-v4-negative/out/../reuse-rejection.log",
+        "sha256": "346ed4eab2cc10b9a277f80ebbd1f165bee25dd218208ab07d389f8d60922237"
+      }
+    }
+  },
+  "e8_reader_line_splicing": {
+    "matching_tokens": 5220,
+    "command": {
+      "path": "C:/Ascend/turboquant-integration-work/r2-review/check-reader-tokens.py",
+      "sha256": "0bbc733c9a1393cc2faf8cf64dd86ff6f5f334cc231d711fa21d628b436f25d3"
+    }
+  },
+  "plugin_supporting_files": {
+    ".gitattributes": "3da6ad44d4da9dc847d32c8b93692319bb61e3c0246c8171bf112c9346677243",
+    "CMakeLists.txt": "77b2a50d348a022ad518593d41ddca5d9193f6dd94bd5955839301a86988b25b",
+    "csrc/build_aclnn.sh": "d0301bfcfdecd373019865e4b7ee386d2cd15ac32276a763fefcc01698f20eff",
+    "scripts/check_turboquant_sync.py": "3f415fc20c20c0d8b654a591d0e1b9b2873d88f9d8e9dcadff54e0f5962b7e99",
+    "setup.py": "27032a2cae757dba5b2a473cc26285004f0abc91ab0154c44b3f7f641edae75a",
+    "tests/e2e/pull_request/one_card/turboquant/test_fused_decode_e2e.cpp": "a38d0a3bc795589d4487d2d4b66c1c0829b0ecb412383b865c4df0c007f3d6f0",
+    "tests/e2e/pull_request/one_card/turboquant/test_live_write.cpp": "b0956f27597d9037f749cfe243fd18eab68bd983366eac39ecc0c6311e3466ec",
+    "tests/host/turboquant/abi.cpp": "cc806183cb9ec69e1e421fc24005bbf860cd38c07032900d4bd27e71bae98ac7",
+    "tests/host/turboquant/check_analyzer.py": "1a470cc73167111bb9881dd805737f0d634b0d51bd10f29ef483b17c723e7df5",
+    "tests/host/turboquant/check_bindings.py": "3c2b1d0a757e78f4b133176bb883a1f62d433e50a340b08785a58cc275195789",
+    "tests/host/turboquant/check_kernels.py": "188f395d951cd0cbf3ee3e522589c28508c7cfd2673e53216a1884736ce56e6c",
+    "tests/host/turboquant/e8/decode_cpu_check.cpp": "2ce5e81c7c45d071b8a9596a707a538ffd93e2494b0da77ac20aedf405798cab",
+    "tests/host/turboquant/e8/frozen/routine_e8_bf16_dequant_simt.hpp": "28f13039c8fec29ef91919a69a8314a60c9cb9aec3f5f3fc75b270f8e524cda2",
+    "tests/host/turboquant/e8/frozen/routine_e8_int8_dequant_simt.hpp": "e366ddb4b6697ede5a16bcb41c5ab3857f1ee98bcc2ce95f1c5b8efefe9f2d45",
+    "tests/host/turboquant/e8/layout_check.cpp": "239a4a3d9fd067636de72d8eec92b30d791b090c4490405063ec19a6d0a793f4",
+    "tests/host/turboquant/test_build_selection.py": "d28559a8f0e14a685efcbbe9e24d23cefaa096bc552e599f534e7baebbdc753d",
+    "tests/host/turboquant/test_source_sync.py": "ed28676fa6cd64de43f5f70e36508fcec1096ebb8d4236418692831d5152b484",
+    "tests/ut/ops/test_turboquant_contract_gates.py": "f4ad5482b3357608ad4f1e004486422caf67543784e1bae2a2bb2ba8e505ded9",
+    "tests/ut/ops/turboquant/common/decode_tiling_gate.hpp": "43695405b6f88ff866ea0087906ffdcbed32c284e5929bc0c42b13db2f45ffcd",
+    "tests/ut/ops/turboquant/common/fused_decode_fixture.hpp": "a1631ea361bb1388c64ee4b93acb14469dcb5120334eefd9f683d8dff1caa966",
+    "tests/ut/ops/turboquant/common/turboquant_golden_oracle.hpp": "b8ad2f63385ba794e975f04b5c28d16bec0d3b6e31893839d5776f8d097e5e91",
+    "tests/ut/ops/turboquant/common/turboquant_test_common.hpp": "f36967316c547eaabcb433652780d2f662ae643d01bdcec5f7aaa015d81ad29e",
+    "tests/ut/ops/turboquant/test_cache_addresses.cpp": "e807ad049fb3b8b62daf962b132421d57c46eb1ba43130afd7e1a04039a94169",
+    "tests/ut/ops/turboquant/test_contract_gates.cpp": "f0f1ac525c34820b768a177ed82c21ed6062949d028279c3e0ae76e879695c06",
+    "tests/ut/ops/turboquant/test_decode_reduce.cpp": "c9ed8ed1d3b88999e8c5d9cf2d95acf28ffb672c1bba0af95f9343d9c874da35",
+    "vllm_ascend/core/kv_cache_interface.py": "e9ee09be34e8c233780d2e9714b54f99458369dbf6838fb5f2812ed3f7af4386"
+  },
+  "core_supporting_files": {
+    "CMakeLists.txt": "a6c2b7bb549a235744dc8065e2bc33488bd7949140eb20c1c0c90fc01c83b344",
+    "README.md": "3c12b6d10b002b247c463bc34e9f9f6f757297c33317c8870fb50861ea5239ee",
+    "cmake/CannToolchain.cmake": "cd9017fae3b1d983c8905733580ec8a2a435c51030820e381bb0ed848b80e20c",
+    "cmake/NpuTargets.cmake": "7c5bc9c000d3e2100ab476a5f0dfd7688f3c1e194a60fa47de85e47d9fdab688",
+    "cmake/SimTargets.cmake": "73df560d0f577867f4e9fb32f1d82c200cb4ba158155247c780c8d4c5c07e0e8",
+    "cmake/VendoredDecodeProbe.cmake": "cd76078c4f6ef5317535bc5bba4c876abbc02855d9bc222f50c268e1acd46b5c",
+    "golden/turboquant_golden.py": "2da628117f302ad446707460f53b1ed215ec475edd56e454d93ac095a3d2a120",
+    "tests/common/decode_tiling_gate.hpp": "f52d919a33edcc18c506eea9d12bb82ce27ef84d182895e5b7322b2ee7c01c2b",
+    "tests/common/fused_decode_fixture.hpp": "813267427d718672459044826dacfafc892efb61eaa366affd43c234ec2b9e80",
+    "tests/common/qwen35_decode_benchmark.hpp": "62f95eb1b5af671f3c4b36d39208ab2ba7ffbafc971888637778182d9a52d5eb",
+    "tests/common/rotate_butterfly_oracle.hpp": "a81c11acfb0eabed8843f63aab2737bb870aa32efc24900b30460b1e71be2945",
+    "tests/common/turboquant_golden_oracle.hpp": "c712801131e1cd3a42756fc3ce638e5b8d1f1eef079849830aa6a441e0dfc9de",
+    "tests/common/turboquant_test_common.hpp": "7ea94552f006267431e201e3b4e64143614a1440cf531b7b5e07ebf365e823a1",
+    "tests/cpu/check_semantic_goldens.py": "8971efec0be818a3fe9ba88fce7daa503f842c449c1146a06601dc83ab0d856c",
+    "tests/cpu/e8/CMakeLists.txt": "5c92e37d693aa947acf83a46e1f6e406510f9a3c3398bb040819611491b130fd",
+    "tests/cpu/e8/README.md": "4c3e995aa472edff67232aad4aefcb6e93d8375855900b27138e0becb04f500a",
+    "tests/cpu/e8/decode_cpu_check.cpp": "e3348936cb93b5d7f8d8d49605b6d7a2284821c8c7186822fbc214c7fbf5d054",
+    "tests/cpu/e8/frozen/routine_e8_bf16_dequant_simt.hpp": "28f13039c8fec29ef91919a69a8314a60c9cb9aec3f5f3fc75b270f8e524cda2",
+    "tests/cpu/e8/frozen/routine_e8_int8_dequant_simt.hpp": "e366ddb4b6697ede5a16bcb41c5ab3857f1ee98bcc2ce95f1c5b8efefe9f2d45",
+    "tests/cpu/e8/layout_check.cpp": "298a84d1e757beb7dac6f15fb537a850cc4c774ffc757eb4e8a39253fc90f867",
+    "tests/cpu/test_contract_gates.cpp": "227fece2eab6bfd39703b22bf056440a1c55da85553f256fd3f9b704e5ac9a2d",
+    "tests/cpu/test_decode_reduce.cpp": "1714c366f697c01f61e1ea9d16fbba0fe5f92535cdba3021c03ef26d0c021e4b",
+    "tests/cpu/test_telemetry_dump.cpp": "801256f0c18f06310a3f6fbbda2a9c549b2fdb5b277faa260e9be7dec897c9e5",
+    "tests/npu/qwen35_reduce_canary.cpp": "fd5131e9c23df7a8f188fa8e80aec141dc3d317ec12bf00b67a83736315e8936",
+    "tests/npu/qwen35_tail_canary.cpp": "cb44422f18a7f9572b5631149c6e712c9335101f80351784aace29abbfc155d8",
+    "tests/npu/test_dirty_data_canary.cpp": "2d2b7533559f09e4be1c2cac4ab7b90a4ff1a20b7a4edfa7a4bc631aa5ad6150",
+    "tests/npu/test_fused_decode_e2e.cpp": "c1ab081ed3d2c2ca159055037ce7228ceabed92546db3201cd44e0646836e81e",
+    "tests/npu/test_golden_dump.cpp": "c0501002e93908f66eadc724ff1628ba5257bc9c6625ea6e32cee7a015f74830",
+    "tests/npu/test_live_write.cpp": "8ea1c937fb70f91f21ee0ffa550b57e297d610612dca4e45b429c8c60776816c",
+    "tests/npu/test_nz_ingress_canary.cpp": "223e33b7106e68b9e533fb50b615e56134de33a87da01d85e199b6b759f1f2c5"
+  },
+  "full_plugin_or_shim_builds": 0,
+  "npu_launches": 0,
+  "camodel_runs": 0
+}

@@ -1,0 +1,11 @@
+@ascend-layout: name=sa pos=A1 offset=262272 count=5136 dtype=float
+@ascend-layout: name=sb pos=A1 offset=0 count=65568 dtype=float
+@ascend-layout: name=l0a pos=A2 offset=0 count=4096 dtype=float
+@ascend-layout: name=at pos=A2 offset=0 count=4096 dtype=float
+@ascend-reuse-group: group=e8_l0a names=l0a,at
+@ascend-layout: name=l0b pos=B2 offset=0 count=16384 dtype=float
+@ascend-layout: name=bt pos=B2 offset=0 count=16384 dtype=float
+@ascend-reuse-group: group=e8_l0b names=l0b,bt
+@ascend-layout: name=l0c pos=CO1 offset=0 count=4096 dtype=float
+@ascend-layout: name=ct pos=CO1 offset=0 count=4096 dtype=float
+@ascend-reuse-group: group=e8_l0c names=l0c,ct

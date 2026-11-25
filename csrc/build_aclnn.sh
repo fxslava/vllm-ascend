@@ -2,6 +2,7 @@
 
 ROOT_DIR=$1
 SOC_VERSION=$2
+SOC_FAMILY=${SOC_VERSION,,}
 : "${ROOT_DIR:?ROOT_DIR is not set}"
 
 log() {
@@ -75,7 +76,7 @@ log_selected_ops() {
 log "start: ROOT_DIR=${ROOT_DIR:-<unset>} SOC_VERSION=${SOC_VERSION:-<unset>} cwd=$(pwd)"
 log "env: ASCEND_HOME_PATH=${ASCEND_HOME_PATH:-<unset>} ASCEND_TOOLKIT_HOME=${ASCEND_TOOLKIT_HOME:-<unset>}"
 
-if [[ "$SOC_VERSION" =~ ^ascend310 ]]; then
+if [[ "$SOC_FAMILY" =~ ^ascend310 ]]; then
     log "matched SOC branch: ascend310"
     # ASCEND310P series
     # dependency: catlass
@@ -89,7 +90,7 @@ if [[ "$SOC_VERSION" =~ ^ascend310 ]]; then
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
     SOC_ARG="ascend310p"
-elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
+elif [[ "$SOC_FAMILY" =~ ^ascend910b ]]; then
     log "matched SOC branch: ascend910b"
     # ASCEND910B (A2) series
     # dependency: catlass
@@ -139,7 +140,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
     SOC_ARG="ascend910b"
-elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
+elif [[ "$SOC_FAMILY" =~ ^ascend910_93 ]]; then
     log "matched SOC branch: ascend910_93"
     # ASCEND910C (A3) series
     # dependency: catlass
@@ -192,7 +193,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
     SOC_ARG="ascend910_93"
-elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
+elif [[ "$SOC_FAMILY" =~ ^ascend950 || "$SOC_FAMILY" == dav-3510 ]]; then
     log "matched SOC branch: ascend950"
     # ASCEND950 (A5) series
     # dependency: catlass

@@ -1,0 +1,51 @@
+{
+  "baseline": "335d426e897c5b729150979afe648677c4fc3365",
+  "candidate_files_sha256": {
+    "docs/source/user_guide/feature_guide/graph_mode.md": "8114029905d98ee0b5816cbf8ace96d6040b758edcffe3862cc24a781f8abf90",
+    "tests/ut/attention/run_turboquant_device_free.py": "3f02fc4950df0c667c74a979a410cb8ceb883e6cf6e252a2033db34c8412a1c1",
+    "tests/ut/attention/stub_vllm.py": "2fbb05bc1a9072f79070d6b3ea67f06907f7d07a057333693bc631b8db550442",
+    "tests/ut/attention/test_turboquant_block_moves.py": "ccb93ab7f1d9021117f6ccc345f240fe06d366fe0eefd89a0adec9a3ae39578a",
+    "tests/ut/attention/test_turboquant_capture_contract.py": "2abb6486dc9ebf7a8bc4be32f477bc109dc7780594e5cf963f22023397237ca9",
+    "tests/ut/attention/test_turboquant_e8.py": "c9c5e392f2df92d3072aef2ec379cd51e4f31138c1806e919338eec0fb2dfb25",
+    "tests/ut/attention/test_turboquant_host_graph.py": "56912b7bdf67df3072d67a195a16ca361b9db44edb2f892490a6180f771a880a",
+    "tests/ut/attention/test_turboquant_kernel_cache_layout.py": "22cdcd59bd4dae3165df5c0654ab7a8d54070a9f3523f0262fc1cfec2e7f6d92",
+    "tests/ut/attention/test_turboquant_live_write_npu.py": "2f4939f471eee6fb0723b272efe1b3ccfc308bf9b0e6e2d11e6107f832df47b9",
+    "tests/ut/attention/test_turboquant_nz_cache.py": "67bc6d29a79fba640adf112b26b35407a6adc3ebedbd001b55d5b1d673cdfd62",
+    "tests/ut/attention/test_turboquant_nz_ingress.py": "09bef93aa28ed0bc0b640245b8ac5a94e051e8c9949b8953513417e794e3aab6",
+    "tests/ut/attention/test_turboquant_op_schemas.py": "f30cb117fe6e747ed5032a0e048a50e4bc7aec85c6e83b422236357889b91121",
+    "vllm_ascend/attention/turboquant_metadata.py": "14c255d6653f5b96bd4e6e853b0b5ec0e7eca4d8d608dfacdb1060d54e3ccdcb",
+    "vllm_ascend/attention/turboquant_ops.py": "15684c10d79db38160e8aded6470b295319a740505571e00db98d7a32f5366b3",
+    "vllm_ascend/attention/turboquant_reference_cache.py": "b7e15851654b259e4936ed428630ed72d96fa6cb5bce39f65467cf06fff862b9",
+    "vllm_ascend/attention/turboquant_v1.py": "207b98311b5bccd9c3589442d003d1a5253430ca5dfae310c73b5bf40531749d"
+  },
+  "schema_runtime_dependencies_sha256_at_seal": {
+    "csrc/attention/turboquant/bindings/torch_bindings.cpp": "2f16b02696fad3a8df38038ed58aa6606c76bb269b2405fb65ee9401f1d267bd",
+    "csrc/attention/turboquant/bindings/torch_decode.cpp": "613562da87d137461c89f50889c8e7b506332b76b2ba7bfe1e099fd06fb603b3",
+    "csrc/attention/turboquant/bindings/torch_ingress.cpp": "5766bef0d8316288ffaf65550534c95f9df3b470dc41b30e26d8760ab41472c0",
+    "csrc/attention/turboquant/common/turboquant_layout.h": "c0403ad5ffbda5b5fbf59ff6bb01f86c7a176257bdba17c2366a621d2c7f5e02",
+    "csrc/attention/turboquant/common/turboquant_common.h": "93c3d0a1df371bdc6234629a38285a0ebdfeed8dc1d562b7d101a76fe4428e4a"
+  },
+  "diff": "C:\\vllm-ascend\\reports\\turboquant_host_refactor_20261125\\r1\\candidate.diff",
+  "validation_log": "C:\\vllm-ascend\\reports\\turboquant_host_refactor_20261125\\r1\\validation.txt",
+  "entry_points": [
+    "AscendTurboQuantMetadataBuilder._build_backend_metadata",
+    "AscendTurboQuantBackendImpl.reshape_and_cache",
+    "TurboQuantOpsAdapter"
+  ],
+  "resolved_initial_findings": [
+    "Separate prepared decode and eager fields so eager slot mapping never passes the full capture guard.",
+    "Copy live int32 planned prefill slots to couple their lifetime to the matching plan.",
+    "Restore the adapter strip writer seam and initialize the dummy-only test builder's stage field."
+  ],
+  "limits": [
+    "CPU host-only",
+    "torch.library CPU/Meta implementations exercise raw production schemas",
+    "Portable TurboQuant backend hooks with fake dense prefill attention",
+    "Strip planning reads live slots once per prepared kernel prefill metadata object. Opt-in slot diagnostics add reads.",
+    "Full prefill capture remains unsupported."
+  ],
+  "diff_sha256": "1e6f12d70e2dc281526e5dbae1cd2b4ec5eb3f72a31f7a9db3298a39799c1536",
+  "validation_log_sha256": "da6f2afe89db3f92183d348cc8cd4788b534ccd6286626bb0d1e1a48e90804e9",
+  "previous_review_packet_sha256": "087654f08aab3da8c9db00f1d21c134d4b0851f9b4aeb6027ab9cea634577c49",
+  "revision_note": "Only graph_mode.md changed after R1 v2. It now identifies additional diagnostic reads with opt-in slot validation."
+}

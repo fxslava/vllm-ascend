@@ -1,0 +1,414 @@
+{
+  "baseline": {
+    "plugin": "335d426e897c5b729150979afe648677c4fc3365",
+    "core": "7880e9443da85f9ba9c7773dad1bf8df16465e55"
+  },
+  "shared": {
+    "common/e8_component.hpp": {
+      "sha256": "f57ee6cc867ac998bbd2a70b0d2b8136df9dfa13e1887262805266e78ba2dc45",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/e8/e8_component.hpp",
+        "sha256": "f2d1e46537456719391990fe2941849a9e2985279aa32ea48eb5ecfdf4d0ba04"
+      },
+      "core_baseline": {
+        "path": "components/e8_parallel_decode/e8_component.hpp",
+        "sha256": "f2d1e46537456719391990fe2941849a9e2985279aa32ea48eb5ecfdf4d0ba04"
+      }
+    },
+    "common/e8_decode.hpp": {
+      "sha256": "4cfbecd3da6854c433c3a9caf0aaede572748f74fc60aad3c21519e00e3bb050",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/e8/e8_decode.hpp",
+        "sha256": "5e890555adcb5e64a962519bbfd749bfbeb3ee5208a044060887f3f2df95c1ac"
+      },
+      "core_baseline": {
+        "path": "components/e8_parallel_decode/e8_decode.hpp",
+        "sha256": "5e890555adcb5e64a962519bbfd749bfbeb3ee5208a044060887f3f2df95c1ac"
+      }
+    },
+    "common/e8_packet_layout.hpp": {
+      "sha256": "eec52cf40c4e0f8c559e348f8816847e81be6086d3e0d8e987335caf0c13b24e",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/e8/e8_packet_layout.hpp",
+        "sha256": "53c18584ae352e9f00677493450504ec013c5fbe970b9e2549251436ea8f5b71"
+      },
+      "core_baseline": {
+        "path": "components/e8_parallel_decode/e8_packet_layout.hpp",
+        "sha256": "53c18584ae352e9f00677493450504ec013c5fbe970b9e2549251436ea8f5b71"
+      }
+    },
+    "common/turboquant_codec_950.h": {
+      "sha256": "499b5718ad89b22827adb73d3d69f299783b3e9954208dc7e854a2301e383993",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/op_kernel/common/turboquant_codec_950.h",
+        "sha256": "c2668615eb66b70a708b9461e2444976ced885323737ad63a80d9dc593f6875b"
+      },
+      "core_baseline": {
+        "path": "src/common/turboquant_codec_950.h",
+        "sha256": "ab2fa03ce61b7f6b0869f50dc858dbd842df0b17967f3e34670b57ce79aef391"
+      }
+    },
+    "common/turboquant_codec_mx.h": {
+      "sha256": "85b6dbc54432dd9ee6c725229f3448a7adb17781752258a2039e3c1ef726e62b",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/op_kernel/common/turboquant_codec_mx.h",
+        "sha256": "481cbe3551a9f3eefc41d7aaaf1f22e4b82833d65a71ad19705334d73bba42fc"
+      },
+      "core_baseline": {
+        "path": "src/common/turboquant_codec_mx.h",
+        "sha256": "200e493dba5da92e3b439b26bf0b6bc6395a03285f21600f4714b882b24206e4"
+      }
+    },
+    "common/turboquant_common.h": {
+      "sha256": "93c3d0a1df371bdc6234629a38285a0ebdfeed8dc1d562b7d101a76fe4428e4a",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/op_kernel/common/turboquant_common.h",
+        "sha256": "46a433c45f4068ee49abe14620b5c601f3fd3c1bf45e1fc04ee9d999815a044e"
+      },
+      "core_baseline": {
+        "path": "include/turboquant/turboquant_common.h",
+        "sha256": "46a433c45f4068ee49abe14620b5c601f3fd3c1bf45e1fc04ee9d999815a044e"
+      }
+    },
+    "common/turboquant_fused_decode_opt.hpp": {
+      "sha256": "908991e6c7f50f933ba09428e77a2da9fdb4a378e78c4c1c34753cb9c1f36c2c",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/include/turboquant_fused_decode_opt.hpp",
+        "sha256": "23f3625d44b9625f5c6942e271044c6ac662e574b2e0e50c830ddfd864347c62"
+      },
+      "core_baseline": {
+        "path": "include/turboquant/turboquant_fused_decode_opt.hpp",
+        "sha256": "7f9cf9bcb71ed81bf2c84d6abac27ad7b240de734808af5fb1b4cb90d8127685"
+      }
+    },
+    "common/turboquant_gemm_reduce.hpp": {
+      "sha256": "406d06baf0a8ed54ce495e28024bf2ea8ba173110cd0e7c359f2fc8f9ae0d7f9",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/include/turboquant_gemm_reduce.hpp",
+        "sha256": "59a2a225e7761cf368ea83a0e015c7c38b37a08eb8ff08f897c4ae9c2575153b"
+      },
+      "core_baseline": {
+        "path": "include/turboquant/turboquant_gemm_reduce.hpp",
+        "sha256": "b319da769df5a805c77e77d28d92a8b1dda75ae6af2ee97ad689db40dd628eb9"
+      }
+    },
+    "common/turboquant_launch.h": {
+      "sha256": "53eea2aec1326fe327767807b28b74776e763e1de78e8686e88d121ef9a46332",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/op_adapter/turboquant_torch_adpt.h",
+        "sha256": "792dee83412410701bedc09ca7f068e1149da42eeb765fea661b10ec8814804f"
+      },
+      "core_baseline": {
+        "path": "include/turboquant/turboquant_launch.h",
+        "sha256": "fea97b5c2df101d93a425ee35120a2e14ba4d466e1dd87d3e2d6406ea25cc496"
+      }
+    },
+    "common/turboquant_layout.h": {
+      "sha256": "c0403ad5ffbda5b5fbf59ff6bb01f86c7a176257bdba17c2366a621d2c7f5e02",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/op_kernel/common/turboquant_layout.h",
+        "sha256": "850d5860e664986de486de41265b826f66f8344ac6790f317eea25f5e51af3cd"
+      },
+      "core_baseline": {
+        "path": "include/turboquant/turboquant_layout.h",
+        "sha256": "850d5860e664986de486de41265b826f66f8344ac6790f317eea25f5e51af3cd"
+      }
+    },
+    "common/turboquant_mode.h": {
+      "sha256": "64e9b5afac0e4b69fc2dcb23d2b809d84a10ed0689a1f6204326ef4cb4421c32",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/op_kernel/common/turboquant_mode.h",
+        "sha256": "4fc0008b849dca3288cd4ad31303035f4cee39a8c48da68b29c6539ae9cd2409"
+      },
+      "core_baseline": {
+        "path": "include/turboquant/turboquant_mode.h",
+        "sha256": "c50c8c02a97b74315ed9358a50567c4ff7a2605f3b34cc7a3fb6c28c781d39a2"
+      }
+    },
+    "common/turboquant_splitk_contract.hpp": {
+      "sha256": "82c3697045e818f43196faeb5aae5867bdd41e9042c50b678ccde0a74acdbb30",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/include/turboquant_splitk_contract.hpp",
+        "sha256": "8bf5adde12a7a06cfa999d3c88ee83567533fa9ea6a5093b8948b760913f5a9f"
+      },
+      "core_baseline": {
+        "path": "include/turboquant/turboquant_splitk_contract.hpp",
+        "sha256": "8bf5adde12a7a06cfa999d3c88ee83567533fa9ea6a5093b8948b760913f5a9f"
+      }
+    },
+    "common/turboquant_tiling.cpp": {
+      "sha256": "a2d9c0c5b846fb3bbbb341994177d8be762d5034a06a492de0b04106fbc6f2ce",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/op_host/turboquant_tiling.cpp",
+        "sha256": "940e7121479d19499854b813375e8638e30ba678520b9452b917d701cf12e2f4"
+      },
+      "core_baseline": {
+        "path": "src/host/turboquant_tiling.cpp",
+        "sha256": "940e7121479d19499854b813375e8638e30ba678520b9452b917d701cf12e2f4"
+      }
+    },
+    "common/turboquant_tiling.h": {
+      "sha256": "5e538d8d5ed7c2dd576f54562eee44879857e55af2d5c98bba07373294c14837",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/op_host/turboquant_tiling.h",
+        "sha256": "7401c5ef50fbbde0c9518274229cf932ac705786a53849195e67769d745af957"
+      },
+      "core_baseline": {
+        "path": "src/host/turboquant_tiling.h",
+        "sha256": "84f0191fdfbf058abc3db961f43f3928f39b6e3905bc58daef37d30664241e8b"
+      }
+    },
+    "common/turboquant_types.h": {
+      "sha256": "cb2e4abeecec6ffe85711648487e9e668c29b9306a16913820ca6024d66eb597",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/op_kernel/common/types.h",
+        "sha256": "f6592568b467b0db895e1c8ab5041544008da8ed280775b368e9afe1eaf05e2f"
+      },
+      "core_baseline": {
+        "path": "include/turboquant/turboquant_types.h",
+        "sha256": "f6592568b467b0db895e1c8ab5041544008da8ed280775b368e9afe1eaf05e2f"
+      }
+    },
+    "common/turboquant_wave_protocol.hpp": {
+      "sha256": "f91b9f092d8f4b04e54ec1b0031fd94717feb4d6dffac57fb4627b41c22ceaa4",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/op_kernel/common/turboquant_wave_protocol.hpp",
+        "sha256": "6e2ff719bbd1d62a9b7ca556f120cc0313b871506a2bdf02a7a267175030f8b7"
+      },
+      "core_baseline": {
+        "path": "include/turboquant/turboquant_wave_protocol.hpp",
+        "sha256": "6e2ff719bbd1d62a9b7ca556f120cc0313b871506a2bdf02a7a267175030f8b7"
+      }
+    },
+    "decode/e8/e8_fused_decode.cpp": {
+      "sha256": "1354868b479d3c2972f219a7012718e210c085ffcb38c6310056fcebb7f390ef",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/e8/e8_fused_decode.cpp",
+        "sha256": "e5fdf887471664c8930079fb891303094b91486adc8334b050a5648a3b407a38"
+      },
+      "core_baseline": {
+        "path": "components/e8_parallel_decode/e8_fused_decode.cpp",
+        "sha256": "e5fdf887471664c8930079fb891303094b91486adc8334b050a5648a3b407a38"
+      }
+    },
+    "decode/e8/e8_parallel_decode.hpp": {
+      "sha256": "78ad1016f9abaa38672107dcc971485ecca4985fd02ee8acb1df671fcd0da9d1",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/e8/e8_parallel_decode.hpp",
+        "sha256": "f0a5b191b50d8d02a8d7a327a53ede5a3c869252b30b916f814d0497be37a2f4"
+      },
+      "core_baseline": {
+        "path": "components/e8_parallel_decode/e8_parallel_decode.hpp",
+        "sha256": "f0a5b191b50d8d02a8d7a327a53ede5a3c869252b30b916f814d0497be37a2f4"
+      }
+    },
+    "decode/e8/parallel_component.cpp": {
+      "sha256": "0fd04fcc15b476096eadcd2537b1365356d9bb29c8591c29f9a6db998b3ff017",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/e8/parallel_component.cpp",
+        "sha256": "47ff8c5c19bb5f532a7f86484cc9826837511edf7e2a459bcdaa08341d7dc789"
+      },
+      "core_baseline": {
+        "path": "components/e8_parallel_decode/parallel_component.cpp",
+        "sha256": "47ff8c5c19bb5f532a7f86484cc9826837511edf7e2a459bcdaa08341d7dc789"
+      }
+    },
+    "decode/e8/routines/routine_e8_bf16_dequant_simt.hpp": {
+      "sha256": "d6d5eb2014b24fe503e78e0824742b5833193737846bf02d61df84e3ae52f313",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/e8/routines/routine_e8_bf16_dequant_simt.hpp",
+        "sha256": "38fd578c1753cd37552553400db30689904a34210410e14eddf2e2c0444319e9"
+      },
+      "core_baseline": {
+        "path": "components/e8_parallel_decode/routines/routine_e8_bf16_dequant_simt.hpp",
+        "sha256": "38fd578c1753cd37552553400db30689904a34210410e14eddf2e2c0444319e9"
+      }
+    },
+    "decode/e8/routines/routine_e8_int8_dequant_simt.hpp": {
+      "sha256": "c673a4fd5bf235b29f28d3cf1bbf763d258aa18b99849a27da5dbe59685a704d",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/e8/routines/routine_e8_int8_dequant_simt.hpp",
+        "sha256": "55b848c85991aad6be28fcee8e01bb0ebcc9f37abf2ceb50d764f920b0732950"
+      },
+      "core_baseline": {
+        "path": "components/e8_parallel_decode/routines/routine_e8_int8_dequant_simt.hpp",
+        "sha256": "55b848c85991aad6be28fcee8e01bb0ebcc9f37abf2ceb50d764f920b0732950"
+      }
+    },
+    "decode/native/cube/routine_vector_rotate_butterfly.hpp": {
+      "sha256": "b9c395ad2a374072560eb66a5f9980833146e2732447607481b77a09b01c3fe2",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/op_kernel/cube/routine_vector_rotate_butterfly.hpp",
+        "sha256": "3be976ce358f07e37dec790a9fdf8d8c41ea605173e693ee9fc139a10e241518"
+      },
+      "core_baseline": {
+        "path": "src/decode/cube/routine_vector_rotate_butterfly.hpp",
+        "sha256": "3be976ce358f07e37dec790a9fdf8d8c41ea605173e693ee9fc139a10e241518"
+      }
+    },
+    "decode/native/cube/turboquant_cube_service.h": {
+      "sha256": "699194fec8f963976ab7b258bc968f92053e172a3337a3e4da0205a21e3152a9",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/op_kernel/cube/turboquant_cube_service.h",
+        "sha256": "45627dd0dc05505908bc8eeb40f53b6ec2f8c12a804b2ca86d4deac607074c3b"
+      },
+      "core_baseline": {
+        "path": "src/decode/cube/turboquant_cube_service.h",
+        "sha256": "abbea0967d94d45ff15214a696ecd2e364c3b44d510109de77ca0cd9d5c44820"
+      }
+    },
+    "decode/native/cube/turboquant_gemm_reduce_service.h": {
+      "sha256": "d4003c309b6ec4763ef483a0c47970b921706e99f3f702ba9c189f13467aad5c",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/op_kernel/cube/turboquant_gemm_reduce_service.h",
+        "sha256": "b770ceb4f5a2a2f50604580afd2d1943632127ce4009cce19a18b3358690087a"
+      },
+      "core_baseline": {
+        "path": "src/decode/cube/turboquant_gemm_reduce_service.h",
+        "sha256": "287553cbc09afa7c61b6f6ab3bcf719456d72e8e0f14484caf186ba6ddfe0079"
+      }
+    },
+    "decode/native/cube/turboquant_query_basis.h": {
+      "sha256": "f1495de2d19e52e072b88bd69a35f991838ceb88763e20d61953aea79acbc8c9",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/op_kernel/cube/turboquant_query_basis.h",
+        "sha256": "f03fa33f88bea87a29a2917b52a2c5f330f0339382b0d5f428c02e204ca05dd7"
+      },
+      "core_baseline": {
+        "path": "src/decode/cube/turboquant_query_basis.h",
+        "sha256": "e81df4ea0591ce06e6be4d75cbd2d90cb126157aca26231f4ba25548034e2ba7"
+      }
+    },
+    "decode/native/routine/routine_turboquant_dequant4.hpp": {
+      "sha256": "f41dd0cdf11d3da1060dbd423746d957f240cbbcfd134e1bb523448c32da9d0e",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/op_kernel/common/routine_turboquant_dequant4.hpp",
+        "sha256": "0eb43ddb51bc814412c48b36d6b38cf33e9550560135f5ab18267f6c46357abf"
+      },
+      "core_baseline": {
+        "path": "src/common/routine_turboquant_dequant4.hpp",
+        "sha256": "0eb43ddb51bc814412c48b36d6b38cf33e9550560135f5ab18267f6c46357abf"
+      }
+    },
+    "decode/native/turboquant_fused_decode.cpp": {
+      "sha256": "7024e81fa1fca81330dc4e425145efdd2e76b90fe5a83be35fc9683ef8f60e0e",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/op_kernel/turboquant_fused_decode.cpp",
+        "sha256": "7ba242608ba757924cd88cf4afa3ebcb154a6b220819d6a363ce6385a96988ee"
+      },
+      "core_baseline": {
+        "path": "src/decode/turboquant_fused_decode.cpp",
+        "sha256": "955d73a5f6ee157bf11bcff2d05863343aa06ee1cf0b04da053ec92cbf8e915d"
+      }
+    },
+    "decode/native/vector/routine_vector_cube_softmax.hpp": {
+      "sha256": "0628ea40897555b2b830f00c26c88e988f8d849bbb7e6bc7ccf2a497c053b573",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/op_kernel/vector/routine_vector_cube_softmax.hpp",
+        "sha256": "728e0cfc6314c808c07aa9e74308557ef6cb8aaabeff5c05338926aadabd9baf"
+      },
+      "core_baseline": {
+        "path": "src/decode/vector/routine_vector_cube_softmax.hpp",
+        "sha256": "728e0cfc6314c808c07aa9e74308557ef6cb8aaabeff5c05338926aadabd9baf"
+      }
+    },
+    "decode/native/vector/routine_vector_online_softmax.hpp": {
+      "sha256": "49d13afabff882e3718e7c0f7ed9709ea79f0e1c8904ab7e0d4860bb4a8bca6f",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/op_kernel/vector/routine_vector_online_softmax.hpp",
+        "sha256": "3a511b65794a5224f48d845c93f10b46d424387512bda735ed492d6217385ccb"
+      },
+      "core_baseline": {
+        "path": "src/decode/vector/routine_vector_online_softmax.hpp",
+        "sha256": "3a511b65794a5224f48d845c93f10b46d424387512bda735ed492d6217385ccb"
+      }
+    },
+    "decode/native/vector/turboquant_vector_service.h": {
+      "sha256": "1dc455966e81fddf27462e8ad8144de1d9e607cb466255f7c927646b74b3606e",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/op_kernel/vector/turboquant_vector_service.h",
+        "sha256": "c50dddcfe30380cd040f67f209170673d00fa9f824b4c23aa5515ff8ea1eabae"
+      },
+      "core_baseline": {
+        "path": "src/decode/vector/turboquant_vector_service.h",
+        "sha256": "69768195f747dbd785561986397e3164b75019fcb59fcc0bb88401ae4a0e1e88"
+      }
+    },
+    "ingress/native/routine_stage_page_zn_bf16.hpp": {
+      "sha256": "b9ff832b30446a91de963745638ece32e4754499dc6d3cefe3496b9e745ffec7",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/op_kernel/cube/routine_stage_page_zn_bf16.hpp",
+        "sha256": "cc512b820297662d2ef50f7477a0f324c033840ed6f4542895452b0e2ffa53b7"
+      },
+      "core_baseline": {
+        "path": "src/prefill/routine_stage_page_zn_bf16.hpp",
+        "sha256": "9c27ba60e689be57b96a58a1120026ad2e15e5c62172cc43d1d4d935c3bde883"
+      }
+    },
+    "ingress/native/routine_vector_rotate_butterfly.hpp": {
+      "sha256": "b9c395ad2a374072560eb66a5f9980833146e2732447607481b77a09b01c3fe2",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/op_kernel/vector/routine_vector_rotate_butterfly.hpp",
+        "sha256": "582bf2ad9b0c737dfcc7f8d133d04fad62f94cd443890a5948747f18afc8eb85"
+      },
+      "core_baseline": {
+        "path": "src/scatter/routine_vector_rotate_butterfly.hpp",
+        "sha256": "582bf2ad9b0c737dfcc7f8d133d04fad62f94cd443890a5948747f18afc8eb85"
+      }
+    },
+    "ingress/native/turboquant_reshape_batch.cpp": {
+      "sha256": "f0de459602caca0da6d67bbefe8368f6f44d0b0c32cd04cd01ccb187f7d312c3",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/op_kernel/turboquant_reshape_batch.cpp",
+        "sha256": "ec40b0db3d94c2ad5f311557ad82c944263b0b810c6ea68caf5c74b28e49c4cb"
+      },
+      "core_baseline": {
+        "path": "src/prefill/turboquant_reshape_batch.cpp",
+        "sha256": "bcbdcc866230bc72bf47ba3ec4fd025e5a063cd9333a58ee558f37e2924e89ad"
+      }
+    },
+    "ingress/native/turboquant_reshape_scatter.cpp": {
+      "sha256": "6701601056dfe2e003f58e6a6133258b5a73d2a2cd6c827a1aaa65b92282b63d",
+      "plugin_baseline": {
+        "path": "csrc/attention/turboquant/op_kernel/turboquant_reshape_scatter.cpp",
+        "sha256": "c46dc0e2d54eb4890f890ec6ee19ae9883a0597a51786a49b70eb29aab150f2a"
+      },
+      "core_baseline": {
+        "path": "src/scatter/turboquant_reshape_scatter.cpp",
+        "sha256": "e00991d4f8b94b373ce3e571bb05f9d557a3c1573fb5deeb5ac7733b94d27dda"
+      }
+    },
+    "decode/e8/reader_layout.aka": {
+      "sha256": "d470c1b6d8c0be5de95a00d4f81d887c901cc911f04524d3c18ef973c91fd6d3",
+      "origin": "Exact layout and reuse annotations from both baseline E8 reader sources"
+    }
+  },
+  "plugin_only": {
+    "bindings/asc_e8_component.cpp": {
+      "sha256": "98d868ab5885c71f82573553e444adb704673ff6dd96b353e6471bb541b4396c"
+    },
+    "bindings/asc_e8_reader.cpp": {
+      "sha256": "f291d4246c50b943dd54ecc8b6bf134473a69ba121ac72eb9055411d589f54d9"
+    },
+    "bindings/torch_bindings.cpp": {
+      "sha256": "2f16b02696fad3a8df38038ed58aa6606c76bb269b2405fb65ee9401f1d267bd"
+    },
+    "bindings/torch_bindings_internal.h": {
+      "sha256": "31ea805b634a6af60116786310e1760badb13029775e36f3b419bb1c9c619110"
+    },
+    "bindings/torch_decode.cpp": {
+      "sha256": "613562da87d137461c89f50889c8e7b506332b76b2ba7bfe1e099fd06fb603b3"
+    },
+    "bindings/torch_ingress.cpp": {
+      "sha256": "5766bef0d8316288ffaf65550534c95f9df3b470dc41b30e26d8760ab41472c0"
+    }
+  },
+  "core_only": {
+    "common/turboquant_telemetry.cpp": {
+      "sha256": "410d9b682c623cd61a84c7285b4d8c4b8195f9e9422945e4b5c9dadd37fa94c8"
+    },
+    "common/turboquant_telemetry.h": {
+      "sha256": "11877fd32d0147580b06fc2f5f4b55f0baf0e371a92431f136320c416c7868ec"
+    }
+  }
+}
