@@ -1,0 +1,21 @@
+{
+  "status": "R1_R2_BASELINE_VERIFIED_BEFORE_KERNEL_EDITS",
+  "core_commit": "47abf6526259047bdfbb17bab25de7bd7a893661",
+  "vllm_commit": "74a459ccc9fd0298e20c2d75e8e6a67ac5ef406a",
+  "shared_cpp_files": 34,
+  "shared_metadata_files": 1,
+  "source_sync_sha256": "5043b5429d51f669f2d7840f1a86f195f88a6843073161ddcaea88d42c4e4eaa",
+  "sync_command": "python scripts/check_turboquant_sync.py --core C:/Ascend/turboquant-core",
+  "sync_exit": 0,
+  "tracked_workspaces_clean": true,
+  "preserved_untracked": [
+    "core reports/checkpoint1_20261123_i1/",
+    "vllm U+F07C-prefixed vllm file"
+  ],
+  "runtime_policy": {
+    "max_tiles": 6,
+    "watchdog_seconds": 900,
+    "do_not_kill_advancing_runs_below_seconds": 600,
+    "core_only_before_promotion": true
+  }
+}
