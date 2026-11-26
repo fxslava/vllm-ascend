@@ -309,11 +309,15 @@ unstarted. The NPU legs in
 `tests/e2e/pull_request/one_card/turboquant/` have never been linked against the
 kernel libraries.
 
-The three kernel translation units also build for `dav-3510` with no Torch and
+The four kernel translation units also build for `dav-3510` with no Torch and
 no driver, through a throwaway CMake project whose only target is
 
 ```cmake
-ascendc_library(tq_gate SHARED ingress/native/turboquant_reshape_batch.cpp ingress/native/turboquant_reshape_scatter.cpp decode/native/turboquant_fused_decode.cpp)
+ascendc_library(tq_gate SHARED
+    ingress/native/turboquant_reshape_batch.cpp
+    ingress/native/turboquant_reshape_batch_wide.cpp
+    ingress/native/turboquant_reshape_scatter.cpp
+    decode/native/turboquant_fused_decode.cpp)
 ```
 
 configured with `-DSOC_VERSION=Ascend950PR_9599`, the `Unix Makefiles`

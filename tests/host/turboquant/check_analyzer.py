@@ -53,6 +53,17 @@ def e8_source_pairs(original: Path, candidate: Path, out: Path) -> dict[str, tup
     }
 
 
+def primary_source_report(document, inputs):
+    units = [document] if len(inputs) == 1 else document.get("files", [])
+    by_path = {Path(unit["source"]["path"]): unit for unit in units}
+    if len(units) != len(inputs) or set(by_path) != set(inputs):
+        raise RuntimeError(f"Analyzer report sources differ from the requested input set: {inputs}")
+    for path, unit in by_path.items():
+        if unit["source"]["had_parse_errors"] or not unit["kernels"]:
+            raise RuntimeError(f"Analyzer produced an incomplete parse for {path}")
+    return by_path[inputs[0]]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--analyzer", type=Path, required=True)
@@ -83,6 +94,10 @@ def main() -> None:
             args.reshape / "src/prefill/turboquant_reshape_batch.cpp",
             tq / "ingress/native/turboquant_reshape_batch.cpp",
         ),
+        "reshape_wide": (
+            args.reshape / "src/prefill/turboquant_reshape_batch.cpp",
+            tq / "ingress/native/turboquant_reshape_batch_wide.cpp",
+        ),
         "scatter": (
             args.native / "src/scatter/turboquant_reshape_scatter.cpp",
             tq / "ingress/native/turboquant_reshape_scatter.cpp",
@@ -90,12 +105,13 @@ def main() -> None:
         "e8_component": (args.e8 / "parallel_component.cpp", tq / "decode/e8/parallel_component.cpp"),
     }
     cases.update(e8_source_pairs(args.e8 / "e8_fused_decode.cpp", tq / "decode/e8/e8_fused_decode.cpp", args.out))
-    for stage in ("reshape", "scatter"):
+    for stage in ("reshape", "reshape_wide", "scatter"):
         nz_sources = []
         for kind, source in zip(("verified", "integrated"), cases[stage]):
             wrapper = args.out / f"{stage}-nz-{kind}.cpp"
             nz_sources.append(write_input(wrapper, f'#define TURBOQUANT_INGRESS_NZ 1\n#include "{source}"\n'))
         cases[f"{stage}_nz"] = tuple(nz_sources)
+    launch_companions = {"reshape": cases["reshape_wide"][1], "reshape_nz": cases["reshape_wide_nz"][1]}
     result_path = args.out / "summary.json"
     reports = {}
     if args.case:
@@ -108,11 +124,14 @@ def main() -> None:
         parsed = []
         for kind, source in zip(("verified", "integrated"), pair):
             path = args.out / f"{name}-{kind}.json"
+            inputs = [source]
+            if kind == "integrated" and name in launch_companions:
+                inputs.append(launch_companions[name])
             command = [
                 "python3",
                 "-m",
                 "ascend_analyzer.cli",
-                str(source),
+                *map(str, inputs),
                 "--chip",
                 "ascend950pr",
                 "--solver",
@@ -135,9 +154,7 @@ def main() -> None:
                     raise RuntimeError(f"Analyzer did not produce a fresh report for {source}\n{result.stdout}{result.stderr}")
                 data = json.loads(current.read_bytes())
                 current.replace(path)
-                if data["source"]["had_parse_errors"] or not data["kernels"]:
-                    raise RuntimeError(f"Analyzer produced an incomplete parse for {source}")
-            parsed.append(data)
+            parsed.append(primary_source_report(data, inputs))
 
         def fingerprints(data):
             # AKA2005 also embeds changing source locations inside its prose.
@@ -169,6 +186,8 @@ def main() -> None:
                 for data in parsed
             ],
         }
+        if name in launch_companions:
+            record["launch_companion_sha256"] = hashlib.sha256(launch_companions[name].read_bytes()).hexdigest()
         if name.startswith("e8_reader"):
             record["reader_source_sha256"] = hashlib.sha256((tq / "decode/e8/e8_fused_decode.cpp").read_bytes()).hexdigest()
             record["layout_sidecar_sha256"] = hashlib.sha256((tq / "decode/e8/reader_layout.aka").read_bytes()).hexdigest()

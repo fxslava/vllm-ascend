@@ -71,6 +71,7 @@ if(VLLM_ASCEND_SOC_FAMILY MATCHES "^ascend950")
     set(VLLM_ASCEND_BUILD_TURBOQUANT ON)
     ascendc_library(vllm_ascend_turboquant SHARED
         ${VLLM_ASCEND_TURBOQUANT_SOURCE_DIR}/ingress/native/turboquant_reshape_batch.cpp
+        ${VLLM_ASCEND_TURBOQUANT_SOURCE_DIR}/ingress/native/turboquant_reshape_batch_wide.cpp
         ${VLLM_ASCEND_TURBOQUANT_SOURCE_DIR}/ingress/native/turboquant_reshape_scatter.cpp
         ${VLLM_ASCEND_TURBOQUANT_SOURCE_DIR}/decode/native/turboquant_fused_decode.cpp)
     ascendc_compile_definitions(vllm_ascend_turboquant PRIVATE

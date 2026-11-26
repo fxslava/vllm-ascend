@@ -334,6 +334,10 @@
         "sha256": "69768195f747dbd785561986397e3164b75019fcb59fcc0bb88401ae4a0e1e88"
       }
     },
+    "ingress/native/routine_reshape_batch_pipeline.hpp": {
+      "sha256": "d388a2a53e9501c7405d3d3726005cc3673fada1895586afb61ef044df9bd5ba",
+      "origin": "Shared Frozen03 and wide batch implementation extracted from the synchronized ingress translation unit."
+    },
     "ingress/native/routine_stage_page_zn_bf16.hpp": {
       "sha256": "b9ff832b30446a91de963745638ece32e4754499dc6d3cefe3496b9e745ffec7",
       "plugin_baseline": {
@@ -357,7 +361,7 @@
       }
     },
     "ingress/native/turboquant_reshape_batch.cpp": {
-      "sha256": "f0de459602caca0da6d67bbefe8368f6f44d0b0c32cd04cd01ccb187f7d312c3",
+      "sha256": "af1434688466b22b55ea83e659f6934d633de65bd330d905dfbfa639b425f82a",
       "plugin_baseline": {
         "path": "csrc/attention/turboquant/op_kernel/turboquant_reshape_batch.cpp",
         "sha256": "ec40b0db3d94c2ad5f311557ad82c944263b0b810c6ea68caf5c74b28e49c4cb"
@@ -366,6 +370,10 @@
         "path": "src/prefill/turboquant_reshape_batch.cpp",
         "sha256": "bcbdcc866230bc72bf47ba3ec4fd025e5a063cd9333a58ee558f37e2924e89ad"
       }
+    },
+    "ingress/native/turboquant_reshape_batch_wide.cpp": {
+      "sha256": "21aa02edb2a91c7353bb5b82bf57c7af7dee414dd83f96ad1b3a2b2248b8e7ae",
+      "origin": "Existing wide batch entry in its own CANN source group so generated task metadata follows its function key."
     },
     "ingress/native/turboquant_reshape_scatter.cpp": {
       "sha256": "6701601056dfe2e003f58e6a6133258b5a73d2a2cd6c827a1aaa65b92282b63d",

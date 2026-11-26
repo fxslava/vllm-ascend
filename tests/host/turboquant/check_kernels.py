@@ -26,6 +26,7 @@ def main() -> None:
     root = args.core / "src/turboquant" if args.core else ROOT / "csrc/attention/turboquant"
     sources = [
         root / "ingress/native/turboquant_reshape_batch.cpp",
+        root / "ingress/native/turboquant_reshape_batch_wide.cpp",
         root / "ingress/native/turboquant_reshape_scatter.cpp",
         root / "decode/native/turboquant_fused_decode.cpp",
     ]
@@ -36,7 +37,7 @@ def main() -> None:
     if args.strip:
         if not args.core:
             parser.error("--strip requires --core")
-        sources = sources[:2]
+        sources = sources[:3]
     result_path = args.out / "syntax.json"
     results = json.loads(result_path.read_text()) if args.source and result_path.exists() else []
     if args.source:
