@@ -23,13 +23,16 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
 from vllm_ascend.attention.turboquant_layout import (
+    E8_LABEL_ROW_BYTES,
+    E8_PACK_FACTOR,
+    TURBOQUANT_E8_QUANT_MODE,
     TURBOQUANT_GM_BURST_BYTES,
     TURBOQUANT_PACK_FACTOR,
     TURBOQUANT_PLANES,
     TURBOQUANT_SCALE_DTYPE,
+    e8_packed_plane_bytes,
     turboquant_packed_bytes,
     turboquant_packed_plane_bytes,
-    turboquant_page_size_bytes,
     turboquant_scale_plane_bytes,
 )
 
@@ -418,7 +421,7 @@ class AscendIndexerKPoolTailSpec(SlidingWindowSpec):
 
 @dataclass(frozen=True, kw_only=True)
 class AscendTurboQuantAttentionSpec(FullAttentionSpec):
-    """Full-attention cache spec for the TurboQuant three-plane KV cache.
+    """Full-attention cache spec for the TurboQuant KV cache.
 
     The stock :class:`FullAttentionSpec` sizes a page from the *unpacked* head
     size and the model dtype, which over-allocates this layout roughly fourfold
@@ -427,17 +430,20 @@ class AscendTurboQuantAttentionSpec(FullAttentionSpec):
     that the block allocator could not see (the backend's own fallback, see
     ``AscendTurboQuantBackendImpl._ensure_scale_cache``).
 
-    A TurboQuant page holds three things, and this spec budgets all of them:
+    A native INT4 page holds three things:
 
     * the packed key plane, ``block_size * num_kv_heads * head_size/2`` INT8,
     * the packed value plane, the same again,
     * the fp32 scale plane, ``2 * num_kv_heads * block_size`` floats.
 
+    An E8 page holds two planes of 4,352-byte packets per KV head and 64-token
+    tile. Each packet contains its own FP32 row scales.
+
     The arithmetic itself lives in
     :mod:`vllm_ascend.attention.turboquant_layout` so the page this spec asks
     the allocator for and the bytes the backend writes into it are the same
     numbers. The type is what the runner recognizes: a layer described by this
-    spec gets the three-plane carve
+    spec gets the packet or three-plane carve
     (:meth:`NPUModelRunner._carve_turboquant_planes`) rather than the dense
     K/V split or the hybrid flat buffer, which is how a TurboQuant layer stays
     out of a Gated DeltaNet model's shared layout.
@@ -449,24 +455,38 @@ class AscendTurboQuantAttentionSpec(FullAttentionSpec):
     pack_factor: int = TURBOQUANT_PACK_FACTOR
     num_planes: int = TURBOQUANT_PLANES
     scale_dtype: torch.dtype = TURBOQUANT_SCALE_DTYPE
+    quant_mode: int = 0
+
+    @property
+    def uses_e8(self) -> bool:
+        return self.quant_mode == TURBOQUANT_E8_QUANT_MODE
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if not isinstance(self.pack_factor, int) or self.pack_factor != TURBOQUANT_PACK_FACTOR:
-            raise ValueError(f"TurboQuant requires pack_factor={TURBOQUANT_PACK_FACTOR}, got {self.pack_factor!r}")
+        if self.quant_mode not in (0, 1, TURBOQUANT_E8_QUANT_MODE):
+            raise ValueError(f"Invalid TurboQuant quant_mode={self.quant_mode!r}")
+        pack_factor = E8_PACK_FACTOR if self.uses_e8 else TURBOQUANT_PACK_FACTOR
+        if not isinstance(self.pack_factor, int) or self.pack_factor != pack_factor:
+            raise ValueError(f"TurboQuant requires pack_factor={pack_factor}, got {self.pack_factor!r}")
         if not isinstance(self.num_planes, int) or self.num_planes != TURBOQUANT_PLANES:
             raise ValueError(f"TurboQuant requires num_planes={TURBOQUANT_PLANES}, got {self.num_planes!r}")
         if self.scale_dtype is not TURBOQUANT_SCALE_DTYPE:
             raise ValueError(f"TurboQuant requires scale_dtype={TURBOQUANT_SCALE_DTYPE}, got {self.scale_dtype!r}")
+        if self.uses_e8:
+            e8_packed_plane_bytes(self.block_size, self.num_kv_heads, self.head_size)
+            if self.head_size_v != self.head_size:
+                raise ValueError("TurboQuant E8 needs matching K/V head sizes")
 
     @property
     def packed_bytes(self) -> int:
         """Bytes one (token, head) of one packed plane occupies."""
-        return turboquant_packed_bytes(self.head_size)
+        return E8_LABEL_ROW_BYTES if self.uses_e8 else turboquant_packed_bytes(self.head_size)
 
     @property
     def packed_plane_bytes(self) -> int:
         """Bytes one page of one packed plane occupies."""
+        if self.uses_e8:
+            return e8_packed_plane_bytes(self.block_size, self.num_kv_heads, self.head_size)
         return turboquant_packed_plane_bytes(self.block_size, self.num_kv_heads, self.head_size)
 
     @property
@@ -477,7 +497,7 @@ class AscendTurboQuantAttentionSpec(FullAttentionSpec):
     @property
     def scale_plane_bytes(self) -> int:
         """Bytes of fp32 scale plane in one page."""
-        return turboquant_scale_plane_bytes(self.block_size, self.num_kv_heads)
+        return 0 if self.uses_e8 else turboquant_scale_plane_bytes(self.block_size, self.num_kv_heads)
 
     @property
     def scale_plane_floats(self) -> int:
@@ -486,7 +506,7 @@ class AscendTurboQuantAttentionSpec(FullAttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
-        return turboquant_page_size_bytes(self.block_size, self.num_kv_heads, self.head_size)
+        return self.payload_bytes + self.scale_plane_bytes
 
     @property
     def unpadded_page_size_bytes(self) -> int:
@@ -503,8 +523,8 @@ class AscendTurboQuantAttentionSpec(FullAttentionSpec):
         )
         first = specs[0]
         assert all(
-            (spec.pack_factor, spec.num_planes, spec.scale_dtype)
-            == (first.pack_factor, first.num_planes, first.scale_dtype)
+            (spec.pack_factor, spec.num_planes, spec.scale_dtype, spec.quant_mode)
+            == (first.pack_factor, first.num_planes, first.scale_dtype, first.quant_mode)
             for spec in specs
         ), "All TurboQuant layers in the same KV cache group must use the same packing."
         merged = super().merge(specs)
@@ -513,6 +533,7 @@ class AscendTurboQuantAttentionSpec(FullAttentionSpec):
             pack_factor=first.pack_factor,
             num_planes=first.num_planes,
             scale_dtype=first.scale_dtype,
+            quant_mode=first.quant_mode,
         )
 
 
@@ -520,8 +541,9 @@ def turboquant_cache_spec(
     spec: FullAttentionSpec,
     *,
     page_size_padded: int | None = None,
+    quant_mode: int = 0,
 ) -> AscendTurboQuantAttentionSpec:
-    """Re-describe a dense full-attention layer for the packed three-plane cache.
+    """Re-describe a dense full-attention layer for the configured TurboQuant cache.
 
     Every field of the source spec is carried over, so the layer keeps its block
     size, head counts, dtype and scheduler-visible attributes and only its page
@@ -529,14 +551,15 @@ def turboquant_cache_spec(
     size, which a hybrid model needs: see
     :meth:`NPUModelRunner._as_turboquant_spec` for why.
     """
-    converted = AscendTurboQuantAttentionSpec(
-        **{field.name: getattr(spec, field.name) for field in fields(spec) if field.init}
-    )
+    spec_fields = {field.name: getattr(spec, field.name) for field in fields(spec) if field.init}
+    spec_fields["quant_mode"] = quant_mode
+    spec_fields["pack_factor"] = E8_PACK_FACTOR if quant_mode == TURBOQUANT_E8_QUANT_MODE else TURBOQUANT_PACK_FACTOR
+    converted = AscendTurboQuantAttentionSpec(**spec_fields)
     if page_size_padded is not None:
         if page_size_padded < converted.real_page_size_bytes:
             raise ValueError(
                 f"a TurboQuant page padded to {page_size_padded} bytes is smaller than its "
-                f"{converted.real_page_size_bytes}-byte three-plane payload"
+                f"{converted.real_page_size_bytes}-byte payload"
             )
         if page_size_padded % TURBOQUANT_GM_BURST_BYTES:
             raise ValueError(

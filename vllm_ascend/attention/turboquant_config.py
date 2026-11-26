@@ -11,6 +11,7 @@ from typing import Final
 import torch
 
 from vllm_ascend import envs
+from vllm_ascend.attention.turboquant_layout import TURBOQUANT_E8_QUANT_MODE as TURBOQUANT_E8_QUANT_MODE
 
 TURBOQUANT_PI_SEED: Final[int] = 0x5F3759DF
 
@@ -130,6 +131,11 @@ class TurboQuantOpsConfig:
     ops_namespace: str = TURBOQUANT_DEFAULT_NAMESPACE
     kernel_stages: frozenset[TurboQuantKernelStage] = frozenset()
     value_layout: TurboQuantValueLayout = TurboQuantValueLayout.TOKEN_MAJOR
+    quant_mode: int = TURBOQUANT_QUANT_MODE
+
+    @property
+    def uses_e8(self) -> bool:
+        return self.quant_mode == TURBOQUANT_E8_QUANT_MODE
 
     @classmethod
     def from_env(cls) -> TurboQuantOpsConfig:
@@ -143,6 +149,7 @@ class TurboQuantOpsConfig:
         return cls(
             ops_namespace=envs.TURBOQUANT_OPS_NAMESPACE,
             kernel_stages=kernel_stages,
+            quant_mode=turboquant_quant_mode(),
         )
 
     @staticmethod
@@ -163,6 +170,13 @@ class TurboQuantOpsConfig:
 
     def enables(self, stage: TurboQuantKernelStage) -> bool:
         return stage in self.kernel_stages
+
+
+def turboquant_quant_mode() -> int:
+    mode = envs.VLLM_ASCEND_TURBOQUANT_QUANT_MODE
+    if mode not in (0, 1, TURBOQUANT_E8_QUANT_MODE):
+        raise ValueError("VLLM_ASCEND_TURBOQUANT_QUANT_MODE must be 0 (uniform), 1 (Lloyd-Max), or 2 (E8)")
+    return mode
 
 
 TURBOQUANT_STAGE_ROTATED_BASIS: Final[int] = 0

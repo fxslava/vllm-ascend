@@ -114,8 +114,13 @@ def install() -> None:
         ENCODER_ONLY = "encoder_only"
         DECODER = "decoder"
 
+    class MultipleOf:
+        def __init__(self, base: int):
+            self.base = base
+
     backend.AttentionLayer = AttentionLayer
     backend.AttentionType = AttentionType
+    backend.MultipleOf = MultipleOf
     backend.AttentionCGSupport = enum.Enum(
         "AttentionCGSupport", {"NEVER": 0, "UNIFORM_SINGLE_TOKEN_DECODE": 1, "UNIFORM_BATCH": 2, "ALWAYS": 3}
     )

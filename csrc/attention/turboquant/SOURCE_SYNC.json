@@ -335,7 +335,7 @@
       }
     },
     "ingress/native/routine_reshape_batch_pipeline.hpp": {
-      "sha256": "d388a2a53e9501c7405d3d3726005cc3673fada1895586afb61ef044df9bd5ba",
+      "sha256": "ab3f3f1ed26c87a8d84cf6b4896d1527d6a1495225433b3fa008400c0dea7153",
       "origin": "Shared Frozen03 and wide batch implementation extracted from the synchronized ingress translation unit."
     },
     "ingress/native/routine_stage_page_zn_bf16.hpp": {
@@ -376,7 +376,7 @@
       "origin": "Existing wide batch entry in its own CANN source group so generated task metadata follows its function key."
     },
     "ingress/native/turboquant_reshape_scatter.cpp": {
-      "sha256": "6701601056dfe2e003f58e6a6133258b5a73d2a2cd6c827a1aaa65b92282b63d",
+      "sha256": "dc6c03bb1cf4226c80bcb53328653bf387dfe7f60f6e4ebee944ffb0bb9b1a4f",
       "plugin_baseline": {
         "path": "csrc/attention/turboquant/op_kernel/turboquant_reshape_scatter.cpp",
         "sha256": "c46dc0e2d54eb4890f890ec6ee19ae9883a0597a51786a49b70eb29aab150f2a"
@@ -399,16 +399,16 @@
       "sha256": "f291d4246c50b943dd54ecc8b6bf134473a69ba121ac72eb9055411d589f54d9"
     },
     "bindings/torch_bindings.cpp": {
-      "sha256": "2f16b02696fad3a8df38038ed58aa6606c76bb269b2405fb65ee9401f1d267bd"
+      "sha256": "437f89c4481a7236b6e515385b9775690453b668e0dc8e352b234ef8aa4fcb80"
     },
     "bindings/torch_bindings_internal.h": {
-      "sha256": "31ea805b634a6af60116786310e1760badb13029775e36f3b419bb1c9c619110"
+      "sha256": "c5bea11220519d9ae1106ae65cd31426cb746f570cd9bbf1df672b183c79098d"
     },
     "bindings/torch_decode.cpp": {
-      "sha256": "613562da87d137461c89f50889c8e7b506332b76b2ba7bfe1e099fd06fb603b3"
+      "sha256": "6ae1a4a03a08ce698fbac562785d723c050a66eedd6f07a387621a0ff236e885"
     },
     "bindings/torch_ingress.cpp": {
-      "sha256": "5766bef0d8316288ffaf65550534c95f9df3b470dc41b30e26d8760ab41472c0"
+      "sha256": "12643a46f4b0f9ed678c1cf7021dfffa6f7d7ad58c898f408a3f938920d2b565"
     }
   },
   "core_only": {

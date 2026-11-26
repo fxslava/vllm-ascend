@@ -390,11 +390,9 @@ struct Run {
 
 __aicore__ inline std::uint64_t NzPlaneBase(const Run& item, const Geometry& geom)
 {
-    const std::uint32_t slot =
-        item.block * geom.block_size + item.token_in_block;
-    return static_cast<std::uint64_t>(slot - slot % kNzTileRows) * geom.num_kv_heads *
-               kNzRowBytes +
-           item.head * kNzHeadBytes + (slot % kNzTileRows) * kNzC0;
+    const std::uint64_t slot = static_cast<std::uint64_t>(item.block) * geom.block_size + item.token_in_block;
+    return (slot - slot % kNzTileRows) * geom.num_kv_heads * kNzRowBytes +
+           static_cast<std::uint64_t>(item.head) * kNzHeadBytes + (slot % kNzTileRows) * kNzC0;
 }
 #else
 
@@ -550,9 +548,9 @@ __aicore__ inline void WriteNzPlane(const AscendC::GlobalTensor<std::int8_t>& ca
         AscendC::DataCopyPad(cache[page + g * kNzGroupBytes], packed[g * kNzC0], groups);
 
     const std::uint32_t pitch = NzScaleSlot(geom.num_kv_heads);
+    const std::uint64_t slot = static_cast<std::uint64_t>(item.block) * geom.block_size + item.token_in_block;
     const std::uint64_t scale_base =
-        static_cast<std::uint64_t>(item.block * geom.block_size + item.token_in_block) * pitch +
-        kv * geom.num_kv_heads + item.head;
+        slot * pitch + static_cast<std::uint64_t>(kv) * geom.num_kv_heads + item.head;
     AscendC::DataCopyExtParams lanes;
     lanes.blockCount = static_cast<std::uint16_t>(item.run);
     lanes.blockLen = 4u;

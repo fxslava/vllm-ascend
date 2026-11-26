@@ -115,8 +115,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # fp8 e4m3), quantised at each row's own RMS -- the writers' quant_mode 1
     # and the fused decode's DecodeUnpack::kLloydMaxLut. The two sides must
     # agree: a cache written at one quant_mode and decoded at the other
-    # produces plausible-looking wrong numbers, not an error. No other value is
-    # valid; the launchers refuse it.
+    # produces plausible-looking wrong numbers. 2: E8 with 64-row packets
+    # containing UINT16 labels and embedded FP32 scales. E8 device writes
+    # require a verified encoder; E8 readers accept host-packed packets.
     "VLLM_ASCEND_TURBOQUANT_QUANT_MODE": lambda: int(os.getenv("VLLM_ASCEND_TURBOQUANT_QUANT_MODE", "0")),
     # Log each TurboQuant dispatch with tensor shape, stride, dtype, device and
     # contiguity. 0 (default): off. 1: on; diagnostic only, not for serving.

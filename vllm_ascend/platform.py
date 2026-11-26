@@ -336,13 +336,8 @@ class NPUPlatform(Platform):
         key = (use_mla, use_sparse)
         backend_key = (*key, use_compress)
 
-        # TurboQuant 4-bit KV cache. Opt-in by environment because it is a
-        # bring-up path, not a served configuration: each kernel stage falls
-        # back to the backend's PyTorch golden model wherever its op is not
-        # registered.
-        # The switch lives in the leaf layout module, so selecting a different
-        # backend never imports the TurboQuant backend (and its rotation
-        # constants) at all.
+        # The TurboQuant GQA backend selects its cache layout through the
+        # existing quantization mode; keep the backend import lazy.
         from vllm_ascend.attention.turboquant_layout import turboquant_enabled
 
         if turboquant_enabled():
@@ -1294,6 +1289,8 @@ def _validate_turboquant_config(vllm_config: VllmConfig) -> None:
     untouched. Nothing is interleaved, so nothing has to be rejected.
     """
     from vllm_ascend.attention.turboquant_layout import (
+        E8_HEAD_SIZE,
+        E8_PACKET_ROWS,
         TURBOQUANT_GROUP,
         TURBOQUANT_PACK_FACTOR,
         turboquant_enabled,
@@ -1302,8 +1299,18 @@ def _validate_turboquant_config(vllm_config: VllmConfig) -> None:
     if not turboquant_enabled():
         return
 
+    from vllm_ascend.attention.turboquant_config import TURBOQUANT_E8_QUANT_MODE, turboquant_quant_mode
+
+    uses_e8 = turboquant_quant_mode() == TURBOQUANT_E8_QUANT_MODE
+    if uses_e8 and getattr(vllm_config, "use_v2_model_runner", False):
+        raise ValueError("TurboQuant E8 requires the v1 model runner for prepared packet caches")
+
     model_config = vllm_config.model_config
     head_size = model_config.get_head_size()
+    if uses_e8 and (head_size != E8_HEAD_SIZE or model_config.dtype != torch.bfloat16):
+        raise ValueError(f"TurboQuant E8 requires D={E8_HEAD_SIZE} and a BF16 model")
+    if uses_e8 and vllm_config.parallel_config.decode_context_parallel_size != 1:
+        raise ValueError("TurboQuant E8 requires an unsharded context")
     if head_size <= 0 or head_size % TURBOQUANT_GROUP:
         raise ValueError(
             f"ENABLE_TURBOQUANT=1 needs head_size to be a positive multiple of {TURBOQUANT_GROUP} "
@@ -1313,6 +1320,8 @@ def _validate_turboquant_config(vllm_config: VllmConfig) -> None:
     # block_size is still None here when vLLM derives it later (hybrid models
     # take it from the Mamba page); the carve re-checks what it gets.
     block_size = vllm_config.cache_config.block_size
+    if uses_e8 and block_size is not None and (block_size <= 0 or block_size % E8_PACKET_ROWS):
+        raise ValueError(f"TurboQuant E8 requires a block size divisible by {E8_PACKET_ROWS}, got {block_size}.")
     if block_size is not None and block_size % TURBOQUANT_PACK_FACTOR:
         raise ValueError(
             f"ENABLE_TURBOQUANT=1 packs {TURBOQUANT_PACK_FACTOR} INT4 codes per byte, so block_size "

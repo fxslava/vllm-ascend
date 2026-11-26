@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from setuptools import Extension
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -18,8 +19,12 @@ class BuildExt:
 def setup_helpers(**overrides):
     # Loading setup.py directly would run dependency detection and setup().
     tree = ast.parse((ROOT / "setup.py").read_text(encoding="utf-8"))
-    nodes = [node for node in tree.body if getattr(node, "name", None) in {"normalize_soc_version", "cmake_build_ext"}]
-    namespace = {"build_ext": BuildExt, "os": os, "Path": Path, **overrides}
+    nodes = [
+        node
+        for node in tree.body
+        if getattr(node, "name", None) in {"normalize_soc_version", "CMakeExtension", "cmake_build_ext"}
+    ]
+    namespace = {"Extension": Extension, "build_ext": BuildExt, "os": os, "Path": Path, **overrides}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "setup.py", "exec"), namespace)
     return namespace
 

@@ -56,6 +56,28 @@ TURBOQUANT_ENABLE_ENV: Final[str] = "ENABLE_TURBOQUANT"
 # One fp32 scale per (plane, head, token).
 TURBOQUANT_SCALE_DTYPE: Final[torch.dtype] = torch.float32
 TURBOQUANT_SCALE_DTYPE_SIZE: Final[int] = 4
+TURBOQUANT_E8_QUANT_MODE: Final[int] = 2
+E8_HEAD_SIZE: Final[int] = 256
+E8_PACKET_ROWS: Final[int] = 64
+E8_PACK_FACTOR: Final[int] = 4
+E8_LABELS_PER_ROW: Final[int] = E8_HEAD_SIZE // 8
+E8_LABEL_ROW_BYTES: Final[int] = E8_LABELS_PER_ROW * 2
+E8_SCALE_OFFSET: Final[int] = E8_PACKET_ROWS * E8_LABEL_ROW_BYTES
+E8_PACKET_BYTES: Final[int] = E8_SCALE_OFFSET + E8_PACKET_ROWS * TURBOQUANT_SCALE_DTYPE_SIZE
+
+
+def e8_cache_shape(num_blocks: int, block_size: int, num_kv_heads: int, head_size: int) -> tuple[int, ...]:
+    """One E8 plane in physical block, 64-token tile, KV head, byte order."""
+    if head_size != E8_HEAD_SIZE or block_size <= 0 or block_size % E8_PACKET_ROWS or num_kv_heads <= 0:
+        raise ValueError(
+            f"TurboQuant E8 requires D={E8_HEAD_SIZE}, a multiple of {E8_PACKET_ROWS} tokens, and KV heads"
+        )
+    return (num_blocks, block_size // E8_PACKET_ROWS, num_kv_heads, E8_PACKET_BYTES)
+
+
+def e8_packed_plane_bytes(block_size: int, num_kv_heads: int, head_size: int) -> int:
+    _, tiles, heads, packet_bytes = e8_cache_shape(1, block_size, num_kv_heads, head_size)
+    return tiles * heads * packet_bytes
 
 
 def turboquant_enabled() -> bool:
@@ -143,7 +165,9 @@ def turboquant_carve_planes(
     block_size: int,
     num_kv_heads: int,
     head_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    *,
+    uses_e8: bool = False,
+) -> tuple[torch.Tensor, ...]:
     """Carve one layer's raw INT8 allocation into the three planes.
 
     ``buffer`` is the layer's own contiguous byte region, as the allocator hands
@@ -163,20 +187,23 @@ def turboquant_carve_planes(
     if num_blocks <= 0:
         raise ValueError(f"the TurboQuant cache needs at least one block, got {num_blocks}")
 
-    packed_bytes = num_blocks * turboquant_packed_plane_bytes(block_size, num_kv_heads, head_size)
-    scale_bytes = num_blocks * turboquant_scale_plane_bytes(block_size, num_kv_heads)
+    if uses_e8:
+        packed_bytes = num_blocks * e8_packed_plane_bytes(block_size, num_kv_heads, head_size)
+        scale_bytes = 0
+    else:
+        packed_bytes = num_blocks * turboquant_packed_plane_bytes(block_size, num_kv_heads, head_size)
+        scale_bytes = num_blocks * turboquant_scale_plane_bytes(block_size, num_kv_heads)
     needed = TURBOQUANT_PLANES * packed_bytes + scale_bytes
     if buffer.numel() < needed:
+        layout = "E8 packet" if uses_e8 else "three-plane"
         raise ValueError(
-            f"the TurboQuant three-plane carve needs {needed} bytes for {num_blocks} blocks, "
+            f"the TurboQuant {layout} carve needs {needed} bytes for {num_blocks} blocks, "
             f"but the allocation is {buffer.numel()} bytes"
         )
 
-    planes = (
-        buffer[:packed_bytes],
-        buffer[packed_bytes : 2 * packed_bytes],
-        buffer[2 * packed_bytes : 2 * packed_bytes + scale_bytes],
-    )
+    planes = (buffer[:packed_bytes], buffer[packed_bytes : 2 * packed_bytes])
+    if not uses_e8:
+        planes = (*planes, buffer[2 * packed_bytes : needed])
     for name, plane in zip(("key", "value", "scale"), planes):
         if plane.data_ptr() % TURBOQUANT_GM_BURST_BYTES:
             raise ValueError(
@@ -191,7 +218,9 @@ def turboquant_plane_views(
     block_size: int,
     num_kv_heads: int,
     head_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    *,
+    uses_e8: bool = False,
+) -> tuple[torch.Tensor, ...]:
     """View the three carved planes as the backend reads them.
 
     ``(key, value)`` are ``(num_blocks, block_size, num_kv_heads, head_size/2)``
@@ -200,6 +229,12 @@ def turboquant_plane_views(
     passed in, so a padded page budget cannot silently produce a view over the
     padding.
     """
+    if uses_e8:
+        page_bytes = e8_packed_plane_bytes(block_size, num_kv_heads, head_size)
+        if len(planes) != TURBOQUANT_PLANES or planes[0].numel() != planes[1].numel() or planes[0].numel() % page_bytes:
+            raise ValueError("E8 needs two equal packet planes with a whole number of blocks")
+        shape = e8_cache_shape(planes[0].numel() // page_bytes, block_size, num_kv_heads, head_size)
+        return tuple(plane.view(torch.uint8).view(shape) for plane in planes)
     if len(planes) != TURBOQUANT_PLANES + 1:
         raise ValueError(f"TurboQuant expects three planes, got {len(planes)}")
     raw_k, raw_v, raw_scale = planes

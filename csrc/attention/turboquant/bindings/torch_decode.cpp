@@ -383,6 +383,9 @@ void npu_turboquant_build_decode_tiling_meta(at::Tensor&, at::Tensor&, int64_t, 
 
 namespace vllm_ascend::turboquant_e8 {
 
+constexpr std::uint64_t kComponentRows = 16;
+static_assert(e8_packet_abi::kRows % kComponentRows == 0);
+
 template <std::size_t N>
 static void disjoint_outputs(const at::Tensor* const (&tensors)[N], std::size_t first_output) {
     if (tensors[0]->is_meta()) return;
@@ -463,7 +466,7 @@ void reader_meta(at::Tensor& query, at::Tensor& key_packets, at::Tensor& value_p
 static void validate_dequant(const at::Tensor& labels, const at::Tensor& scales, const at::Tensor& bf16,
                              const at::Tensor& int8) {
     tensor(labels, at::kUInt16, 512, labels, "labels");
-    tensor(scales, at::kFloat, 16, labels, "scales");
+    tensor(scales, at::kFloat, kComponentRows, labels, "scales");
     tensor(bf16, at::kBFloat16, 4096, labels, "bf16");
     tensor(int8, at::kChar, 4096, labels, "int8");
     const at::Tensor* const buffers[] = {&labels, &scales, &bf16, &int8};
@@ -480,5 +483,40 @@ void dequant(at::Tensor& labels, at::Tensor& scales, at::Tensor& bf16, at::Tenso
 
 void dequant_meta(at::Tensor& labels, at::Tensor& scales, at::Tensor& bf16, at::Tensor& int8) {
     validate_dequant(labels, scales, bf16, int8);
+}
+
+static void validate_dequant_packet(const at::Tensor& packets, const at::Tensor& bf16, const at::Tensor& int8) {
+    TORCH_CHECK(packets.dim() == 2 && packets.size(0) > 0 && packets.size(1) == e8_packet_abi::kPacketBytes,
+                "E8 packets must be UINT8 [packets, 4352], with embedded FP32 scales");
+    TORCH_CHECK(bf16.dim() == 3 && bf16.size(0) == packets.size(0) && bf16.size(1) == e8_packet_abi::kRows &&
+                    bf16.size(2) == e8_packet_abi::kChannels && int8.sizes() == bf16.sizes(),
+                "E8 packet dequantization outputs must both have shape [packets, 64, 256]");
+    tensor(packets, at::kByte, packets.numel(), packets, "packets");
+    tensor(bf16, at::kBFloat16, bf16.numel(), packets, "bf16");
+    tensor(int8, at::kChar, bf16.numel(), packets, "int8");
+    const at::Tensor* const buffers[] = {&packets, &bf16, &int8};
+    disjoint_outputs(buffers, 1);
+}
+
+void dequant_packet(at::Tensor& packets, at::Tensor& bf16, at::Tensor& int8) {
+    validate_dequant_packet(packets, bf16, int8);
+    auto* stream = c10_npu::getCurrentNPUStream().stream();
+    auto* packet_bytes = static_cast<std::uint8_t*>(packets.data_ptr());
+    auto* bf16_rows = static_cast<std::uint16_t*>(bf16.data_ptr());
+    auto* int8_rows = static_cast<std::int8_t*>(int8.data_ptr());
+    const auto packet_count = static_cast<std::uint64_t>(packets.size(0));
+    for (std::uint64_t i = 0; i < packet_count; ++i) {
+        auto* packet = packet_bytes + i * e8_packet_abi::kPacketBytes;
+        for (std::uint64_t row = 0; row < e8_packet_abi::kRows; row += kComponentRows) {
+            auto* labels = reinterpret_cast<std::uint16_t*>(packet + row * e8_packet_abi::kLabelRowBytes);
+            auto* scales = reinterpret_cast<float*>(packet + e8_packet_abi::kScaleOffset + row * sizeof(float));
+            const std::uint64_t output = (i * e8_packet_abi::kRows + row) * e8_packet_abi::kChannels;
+            launch_e8_parallel_component(stream, labels, scales, bf16_rows + output, int8_rows + output);
+        }
+    }
+}
+
+void dequant_packet_meta(at::Tensor& packets, at::Tensor& bf16, at::Tensor& int8) {
+    validate_dequant_packet(packets, bf16, int8);
 }
 }

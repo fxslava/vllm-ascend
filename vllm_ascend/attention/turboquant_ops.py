@@ -12,7 +12,7 @@ from typing import Any
 import torch
 from vllm.logger import logger
 
-from vllm_ascend.attention import turboquant_reference_cache
+from vllm_ascend.attention import turboquant_e8, turboquant_reference_cache
 from vllm_ascend.attention.turboquant_codec import (
     TurboQuantEmulator,
 )
@@ -46,6 +46,9 @@ from vllm_ascend.attention.turboquant_ingestion import (
     turboquant_plan_strip_ingestion,
 )
 from vllm_ascend.attention.turboquant_layout import (
+    E8_HEAD_SIZE,
+    E8_PACKET_BYTES,
+    E8_PACKET_ROWS,
     turboquant_scale_block_views,
 )
 from vllm_ascend.attention.turboquant_telemetry import (
@@ -99,6 +102,8 @@ def turboquant_decode_graph_supported() -> bool:
     kernel otherwise silently selects the uncapturable emulator.
     """
     config = TurboQuantOpsConfig.from_env()
+    if config.uses_e8:
+        return False
     if not all(config.enables(stage) for stage in (TurboQuantKernelStage.SCATTER, TurboQuantKernelStage.DECODE)):
         return False
     load_turboquant_extension()
@@ -125,7 +130,8 @@ class TurboQuantOpsAdapter:
         self._missing_kernels: set[str] = set()
         if self.config.kernel_stages:
             load_turboquant_extension()
-            self._report_namespace()
+            if not self.config.uses_e8:
+                self._report_namespace()
 
     def _report_namespace(self) -> None:
         stages = sorted(stage.value for stage in self.config.kernel_stages)
@@ -162,7 +168,7 @@ class TurboQuantOpsAdapter:
         return emulator
 
     def _resolve_kernel(self, op_name: str) -> Callable[..., Any] | None:
-        if not self.config.enables(TURBOQUANT_KERNEL_OPS[op_name]):
+        if self.config.uses_e8 or not self.config.enables(TURBOQUANT_KERNEL_OPS[op_name]):
             return None
         namespace = getattr(torch.ops, self.config.ops_namespace, None)
         kernel = getattr(namespace, op_name, None) if namespace is not None else None
@@ -194,11 +200,73 @@ class TurboQuantOpsAdapter:
         return self.config.value_layout
 
     def block_major_cache_views(self, kv_cache: Sequence[torch.Tensor]) -> tuple[torch.Tensor, ...]:
+        if len(kv_cache) == 2:
+            return tuple(kv_cache)
         key_cache, value_cache, scale_cache = kv_cache
         scales = turboquant_scale_block_views(
             scale_cache, slot_major=self.value_layout() is TurboQuantValueLayout.NZ_TILED
         )
         return key_cache, value_cache, *scales
+
+    @staticmethod
+    def load_e8_packets(
+        kv_cache: Sequence[torch.Tensor], packet_ids: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> None:
+        """Install whole host-packed packets using physical block/tile/head packet IDs."""
+        key_cache, value_cache = kv_cache
+        if (
+            key_cache.shape != value_cache.shape
+            or key_cache.device != value_cache.device
+            or key_cache.dtype != torch.uint8
+            or value_cache.dtype != torch.uint8
+            or key_cache.ndim != 4
+            or key_cache.size(-1) != E8_PACKET_BYTES
+        ):
+            raise ValueError("E8 cache requires two matching UINT8 packet planes")
+        planes = (key_cache.view(-1, E8_PACKET_BYTES), value_cache.view(-1, E8_PACKET_BYTES))
+        if packet_ids.device.type != "cpu" or packet_ids.dtype != torch.int64 or packet_ids.ndim != 1:
+            raise ValueError("E8 packet IDs must be flat CPU INT64")
+        for packets in (key, value):
+            if packets.device.type != "cpu" or packets.shape != (packet_ids.numel(), E8_PACKET_BYTES):
+                raise ValueError("E8 source packets must be CPU [count, 4352]")
+            turboquant_e8.unpack_packets(packets)
+        if bool(((packet_ids < 0) | (packet_ids >= planes[0].size(0))).any()) or (
+            packet_ids.unique().numel() != packet_ids.numel()
+        ):
+            raise ValueError("E8 packet IDs must be unique and within the cache")
+        device = key_cache.device
+        ids = packet_ids.to(device, non_blocking=packet_ids.is_pinned())
+        sources = tuple(source.to(device, non_blocking=source.is_pinned()) for source in (key, value))
+        for plane, source in zip(planes, sources):
+            plane.index_copy_(0, ids, source)
+
+    def read_e8_packets(self, cache: torch.Tensor, plan: turboquant_e8.E8RequestPlan) -> torch.Tensor:
+        """Gather and decode one request, with a context bound independent of batch size."""
+        packet_ids = plan.packet_ids
+        tiles, heads = packet_ids.shape
+        flat_cache = cache.view(-1, E8_PACKET_BYTES)
+        # Bound temporary tensors for the portable integer decoder by splitting packet batches.
+        tiles_per_chunk = max(1, 32 // heads)
+        dense = torch.empty((tiles, E8_PACKET_ROWS, heads, E8_HEAD_SIZE), dtype=torch.bfloat16, device=cache.device)
+        use_kernel = (
+            cache.device.type != "cpu"
+            and self.config.enables(TurboQuantKernelStage.DEQUANTIZE)
+            and _is_op_registered(turboquant_e8.E8_OPS_NAMESPACE, "dequant_packet")
+        )
+        for start in range(0, tiles, tiles_per_chunk):
+            batch_ids = packet_ids[start : start + tiles_per_chunk]
+            packets = flat_cache.index_select(0, batch_ids.flatten())
+            if use_kernel:
+                shape = (packets.size(0), E8_PACKET_ROWS, E8_HEAD_SIZE)
+                decoded = torch.empty(shape, dtype=torch.bfloat16, device=cache.device)
+                int8 = torch.empty(shape, dtype=torch.int8, device=cache.device)
+                turboquant_e8.dequant_packet(packets, decoded, int8)
+            else:
+                labels, scales = turboquant_e8.unpack_packets(packets)
+                decoded = turboquant_reference_cache.decode_e8_labels(labels, scales)
+            decoded = decoded.view(-1, heads, E8_PACKET_ROWS, E8_HEAD_SIZE).transpose(1, 2)
+            dense[start : start + batch_ids.size(0)].copy_(decoded)
+        return dense.flatten(0, 1)[: plan.context_length]
 
     def rotate(self, activations: torch.Tensor, emulator: TurboQuantEmulator) -> torch.Tensor:
         if self.has_kernel(TURBOQUANT_OP_ROTATE):

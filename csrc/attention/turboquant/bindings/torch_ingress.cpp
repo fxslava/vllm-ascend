@@ -13,6 +13,14 @@ namespace vllm_ascend::turboquant_bindings {
 namespace {
 constexpr std::int64_t kTokensPerStrip = 16;
 constexpr std::int64_t kChampionTokensPerCore = 6 * kTokensPerStrip;
+constexpr std::int64_t kE8QuantMode = 2;
+
+void check_ingress_quant_mode(std::int64_t quant_mode, const char* op) {
+    TORCH_CHECK(quant_mode != kE8QuantMode, op,
+                ": device E8 encoding is gated by the r3/revision2 canary. Supply packed 4352-byte E8 K/V planes.");
+    TORCH_CHECK(quant_mode == 0 || quant_mode == 1, op, ": quant_mode is 0 (uniform) or 1 (Lloyd-Max), got ",
+                quant_mode);
+}
 
 void check_launch_u32(std::int64_t value, const char* op, const char* name) {
     TORCH_CHECK(turboquant_wave::FitsLaunchU32(value), op, ": ", name, " exceeds the uint32 launch ABI");
@@ -140,13 +148,11 @@ void npu_turboquant_reshape_and_cache_a8(at::Tensor& key, at::Tensor& value, at:
                                          double inv_sqrt_len, int64_t quant_mode) {
     constexpr const char* op = "npu_turboquant_reshape_and_cache_a8";
 
+    check_ingress_quant_mode(quant_mode, op);
     const Activations a = check_activations(key, value, op);
     const CachePlanes c = check_cache(key_cache, value_cache, scale_cache, a, op);
     check_slot_mapping(slot_mapping, a.num_tokens, op);
     check_tables(tables, a.head_size, op, "tables");
-    TORCH_CHECK(quant_mode == 0 || quant_mode == 1, op, ": quant_mode is 0 (uniform) or 1 (Lloyd-Max), got ",
-                quant_mode);
-
     TORCH_CHECK(a.num_tokens % kTokensPerStrip == 0, op, ": num_tokens (", a.num_tokens,
                 ") must be a whole number of ", kTokensPerStrip,
                 "-token strips; the launcher drops a partial trailing strip rather than writing it");
@@ -192,12 +198,10 @@ void npu_turboquant_reshape_scatter_aiv(at::Tensor& key, at::Tensor& value, at::
                                         int64_t quant_mode) {
     constexpr const char* op = "npu_turboquant_reshape_scatter_aiv";
 
+    check_ingress_quant_mode(quant_mode, op);
     const Activations a = check_activations(key, value, op);
     const CachePlanes c = check_cache(key_cache, value_cache, scale_cache, a, op);
     check_slot_mapping(slot_mapping, a.num_tokens, op);
-    TORCH_CHECK(quant_mode == 0 || quant_mode == 1, op, ": quant_mode is 0 (uniform) or 1 (Lloyd-Max), got ",
-                quant_mode);
-
     TORCH_CHECK(a.head_size == kDecodeHeadSize, op, ": the scatter writer is specialised to head_size ",
                 kDecodeHeadSize, ", got ", a.head_size);
     TORCH_CHECK(c.block_size % layout::kCubeTileRows == 0, op, ": the NZ-tiled ingress writes ",
@@ -236,9 +240,13 @@ void npu_turboquant_reshape_scatter_aiv(at::Tensor& key, at::Tensor& value, at::
 
 namespace meta {
 void npu_turboquant_reshape_and_cache_a8_meta(at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&,
-                                              at::Tensor&, at::Tensor&, at::Tensor&, double, int64_t) {}
+                                              at::Tensor&, at::Tensor&, at::Tensor&, double, int64_t quant_mode) {
+    check_ingress_quant_mode(quant_mode, "npu_turboquant_reshape_and_cache_a8");
+}
 
 void npu_turboquant_reshape_scatter_aiv_meta(at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&,
-                                             at::Tensor&, at::Tensor&, double, int64_t) {}
+                                             at::Tensor&, at::Tensor&, double, int64_t quant_mode) {
+    check_ingress_quant_mode(quant_mode, "npu_turboquant_reshape_scatter_aiv");
+}
 }
 }

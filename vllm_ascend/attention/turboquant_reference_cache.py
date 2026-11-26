@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+import numpy as np
 import torch
 
 from vllm_ascend.attention.turboquant_codec import TurboQuantEmulator
@@ -17,10 +18,140 @@ from vllm_ascend.attention.turboquant_config import (
     TurboQuantValueLayout,
 )
 from vllm_ascend.attention.turboquant_layout import (
+    E8_HEAD_SIZE,
+    E8_LABEL_ROW_BYTES,
+    E8_LABELS_PER_ROW,
+    E8_PACKET_BYTES,
+    E8_PACKET_ROWS,
+    E8_SCALE_OFFSET,
     TURBOQUANT_KEY_PLANE,
     TURBOQUANT_PACK_FACTOR,
+    TURBOQUANT_SCALE_DTYPE_SIZE,
     TURBOQUANT_VALUE_PLANE,
 )
+
+E8_LATTICE_DIMENSIONS = 8
+E8_CODEBOOK_SIZE = 1 << 16
+_E8_GOLDEN_QUERY_CHUNK = 16
+
+
+def e8_label_coordinates(labels: torch.Tensor) -> torch.Tensor:
+    """Decode each UINT16 label into eight doubled lattice coordinates."""
+    labels = labels.to(torch.int32)
+    a = 2 * ((labels >> 14) & 1) + ((labels >> 15) & 1) - 2
+    b, c, d, e, f, g, h = (((labels >> bit) & 3) - 2 for bit in range(0, 14, 2))
+    projected = torch.stack(
+        (
+            a,
+            a + 2 * b,
+            a - 2 * b + 2 * c,
+            a - 2 * c + 2 * d,
+            a - 2 * d + 2 * e,
+            a - 2 * e + 2 * f,
+            a - 2 * f + 2 * g + 2 * h,
+            a - 2 * g + 2 * h,
+        ),
+        dim=-1,
+    )
+    shifted = projected + 4
+    integer = (shifted & 7) - 4
+    half = torch.where(integer < 0, integer + 4, integer - 4)
+    parity = torch.sum((shifted >> 3) & 1, dim=-1, keepdim=True, dtype=torch.int32) & 1
+    half_parity = parity ^ (torch.sum(integer < 0, dim=-1, keepdim=True, dtype=torch.int32) & 1)
+    coords = torch.arange(E8_LATTICE_DIMENSIONS, device=labels.device, dtype=torch.int32)
+
+    def repair(candidate: torch.Tensor, parity: torch.Tensor) -> torch.Tensor:
+        positive = candidate >= 0
+        # The last negative tie or first nonnegative tie wins, with nonnegative preferred.
+        priority = (candidate.abs() << 8) | torch.where(positive, 128 + (7 - coords), coords)
+        winner = priority.argmax(dim=-1, keepdim=True)
+        return candidate + (coords == winner) * parity * torch.where(positive, -8, 8)
+
+    integer = repair(integer, parity)
+    half = repair(half, half_parity)
+    int_dist = (integer * integer).sum(dim=-1, dtype=torch.int32)
+    half_dist = (half * half).sum(dim=-1, dtype=torch.int32)
+    use_half = (half_dist < int_dist) | ((half_dist == int_dist) & (half[..., 0] < integer[..., 0]))
+    return torch.where(use_half.unsqueeze(-1), half, integer)
+
+
+def decode_e8_labels(
+    labels: torch.Tensor, scales: torch.Tensor, *, dtype: torch.dtype = torch.bfloat16
+) -> torch.Tensor:
+    """Decode packet rows in cache basis using the SIMT component's rounding."""
+    labels = labels.view(torch.int16) if labels.dtype == torch.uint16 else labels
+    coordinates = e8_label_coordinates(labels).flatten(-2)
+    values = (coordinates.to(torch.float32) * 0.5) * scales.unsqueeze(-1)
+    if dtype == torch.int8:
+        return values.clamp(-128, 127).round().to(torch.int8)
+    return values.to(dtype)
+
+
+def encode_e8_rotated(rotated: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """CPU golden for r3/revision2's unnormalized rotated FP32 input rows."""
+    if rotated.device.type != "cpu" or rotated.shape[-1:] != (E8_HEAD_SIZE,):
+        raise ValueError(f"E8 golden encoding needs CPU D={E8_HEAD_SIZE} rotated rows")
+    values = rotated.detach().to(torch.float32).reshape(-1, E8_HEAD_SIZE).numpy() * np.float32(1 / 16)
+    if not np.isfinite(values).all():
+        raise ValueError("E8 golden encoding requires finite rows")
+    squares = np.square(values).reshape(-1, 2, 16, E8_LATTICE_DIMENSIONS)
+    sums = np.zeros_like(squares[:, :, 0])
+    for group in range(squares.shape[2]):
+        sums += squares[:, :, group]
+    sums = sums.reshape(-1, 2 * E8_LATTICE_DIMENSIONS)
+    while sums.shape[-1] > 1:
+        sums = sums[:, 0::2] + sums[:, 1::2]
+    scales = np.sqrt(sums[:, 0] * np.float32(1 / E8_HEAD_SIZE))
+    scales[scales == 0] = 1
+    if not np.isfinite(scales).all():
+        raise ValueError("E8 golden encoding requires finite FP32 scales")
+    queries = (values / scales[:, None]).reshape(-1, E8_LATTICE_DIMENSIONS)
+    points = e8_label_coordinates(torch.arange(E8_CODEBOOK_SIZE, dtype=torch.int32, device="cpu"))
+    points = points.numpy().astype(np.float64) * 0.5
+    labels = np.empty(len(queries), dtype=np.uint16)
+    for begin in range(0, len(queries), _E8_GOLDEN_QUERY_CHUNK):
+        end = begin + _E8_GOLDEN_QUERY_CHUNK
+        distance = np.square(queries[begin:end, None, :] - points[None, :, :])
+        # Adjacent-pair FP64 summation and the smallest label on ties are part of the golden.
+        while distance.shape[-1] > 1:
+            distance = distance[..., 0::2] + distance[..., 1::2]
+        labels[begin:end] = distance[..., 0].argmin(axis=1)
+    return (
+        torch.from_numpy(labels).reshape(*rotated.shape[:-1], E8_LABELS_PER_ROW),
+        torch.from_numpy(scales).reshape(rotated.shape[:-1]),
+    )
+
+
+def write_e8_slots(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    emulator: TurboQuantEmulator,
+) -> None:
+    """Encode CPU K/V rows into their packet offsets, preserving untouched rows."""
+    if any(t.device.type != "cpu" for t in (key, value, key_cache, value_cache, slot_mapping)):
+        raise RuntimeError("TurboQuant E8 device ingress is gated; load host-packed E8 packets to use the reader")
+    blocks, tiles, heads, _ = key_cache.shape
+    if key.shape != value.shape or key.shape != (slot_mapping.numel(), heads, E8_HEAD_SIZE):
+        raise ValueError("E8 K/V rows and slot mapping must agree with the cache geometry")
+    keep = slot_mapping >= 0
+    slots = slot_mapping[keep].to(torch.int64)
+    if slots.numel() == 0:
+        return
+    if int(slots.max()) >= blocks * tiles * E8_PACKET_ROWS or slots.unique().numel() != slots.numel():
+        raise ValueError("E8 slots must be unique and within cache capacity")
+    packet = ((slots // E8_PACKET_ROWS) * heads)[:, None] + torch.arange(heads, dtype=torch.int64, device="cpu")
+    row = (slots % E8_PACKET_ROWS)[:, None, None]
+    label_pos = row * E8_LABEL_ROW_BYTES + torch.arange(E8_LABEL_ROW_BYTES, device="cpu")
+    scale_pos = E8_SCALE_OFFSET + row * TURBOQUANT_SCALE_DTYPE_SIZE
+    scale_pos = scale_pos + torch.arange(TURBOQUANT_SCALE_DTYPE_SIZE, device="cpu")
+    labels, scales = encode_e8_rotated(emulator.rotate(torch.stack((key[keep], value[keep]))))
+    for cache, plane_labels, plane_scales in zip((key_cache, value_cache), labels, scales):
+        packets = cache.view(-1, E8_PACKET_BYTES)
+        packets[packet.unsqueeze(-1), label_pos] = plane_labels.contiguous().view(torch.uint8)
+        packets[packet.unsqueeze(-1), scale_pos] = plane_scales.unsqueeze(-1).view(torch.uint8)
 
 
 def write_slots(

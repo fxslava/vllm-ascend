@@ -55,4 +55,7 @@ TORCH_LIBRARY_FRAGMENT(turboquant_e8_ops, ops) {
     ops.def("dequant(Tensor labels, Tensor scales, Tensor! bf16, Tensor! int8) -> ()");
     ops.impl("dequant", c10::kPrivateUse1, &vllm_ascend::turboquant_e8::dequant);
     ops.impl("dequant", c10::kMeta, &vllm_ascend::turboquant_e8::dequant_meta);
+    ops.def("dequant_packet(Tensor packets, Tensor! bf16, Tensor! int8) -> ()");
+    ops.impl("dequant_packet", c10::kPrivateUse1, &vllm_ascend::turboquant_e8::dequant_packet);
+    ops.impl("dequant_packet", c10::kMeta, &vllm_ascend::turboquant_e8::dequant_packet_meta);
 }

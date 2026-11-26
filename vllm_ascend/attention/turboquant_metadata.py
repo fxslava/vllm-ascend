@@ -31,6 +31,7 @@ from vllm_ascend.attention.turboquant_config import (
     turboquant_decode_workspace_floats,
     turboquant_tiling_upper_bound_words,
 )
+from vllm_ascend.attention.turboquant_e8 import E8_OPS_NAMESPACE, E8BatchPlan, prepare_batch
 from vllm_ascend.attention.turboquant_ingestion import TurboQuantStripPlan, turboquant_plan_strip_ingestion
 from vllm_ascend.attention.turboquant_ops import (
     _is_op_registered,
@@ -55,6 +56,7 @@ class AscendTurboQuantMetadata(AscendMetadata):
     turboquant_slot_mapping: torch.Tensor | None = None
     turboquant_ingestion_slot_mapping: torch.Tensor | None = None
     turboquant_strip_plan: TurboQuantStripPlan | None = None
+    turboquant_e8_batch: E8BatchPlan | None = None
 
 
 @dataclass(frozen=True)
@@ -72,7 +74,7 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
 
     @classmethod
     def get_cudagraph_support(cls, vllm_config: Any, kv_cache_spec: Any) -> AttentionCGSupport:
-        if turboquant_decode_graph_supported():
+        if not getattr(kv_cache_spec, "uses_e8", False) and turboquant_decode_graph_supported():
             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
         return AttentionCGSupport.NEVER
 
@@ -98,6 +100,12 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
         ops_config = TurboQuantOpsConfig.from_env()
         self._ops_namespace = ops_config.ops_namespace
         self._prefill_kernel_enabled = ops_config.enables(TurboQuantKernelStage.RESHAPE_AND_CACHE)
+        self._uses_e8 = getattr(kv_cache_spec, "uses_e8", ops_config.uses_e8)
+        if self._uses_e8:
+            self._block_size = kv_cache_spec.block_size
+            self._e8_device = device
+            self._e8_reader_enabled = ops_config.enables(TurboQuantKernelStage.DECODE)
+            return
 
         self._context_lens = torch.zeros(self._max_num_reqs, dtype=torch.int32, device=device)
         self._decode_slot_mapping = torch.full((self._max_num_reqs,), -1, dtype=torch.int32, device=device)
@@ -127,6 +135,19 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
         self._context_lens_host_ring = staging
         self._context_lens_upload_events: list[Any | None] = [None] * self._staging_slots
 
+    def build(self, common_prefix_len: int, common_attn_metadata: Any, fast_build: bool = False) -> AscendMetadata:
+        if self._uses_e8:
+            host_lengths = common_attn_metadata._seq_lens_cpu
+            if host_lengths is None:
+                host_lengths = common_attn_metadata.seq_lens_cpu
+            if (
+                host_lengths is None
+                or host_lengths.device.type != "cpu"
+                or getattr(self.speculative_config, "parallel_drafting", False)
+            ):
+                raise RuntimeError("TurboQuant E8 requires authoritative CPU sequence lengths")
+        return super().build(common_prefix_len, common_attn_metadata, fast_build)
+
     def _build_backend_metadata(
         self,
         common_attn_metadata: Any,
@@ -137,6 +158,8 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
         num_decodes: int,
         num_prefills: int,
     ) -> dict[str, Any]:
+        if getattr(self, "_uses_e8", False):
+            return {"turboquant_e8_batch": self._build_e8_batch(common_attn_metadata, seq_lens, query_lens)}
         if getattr(common_attn_metadata, "offload_dummy", False):
             # Dummy/capture runs bypass scheduler allocation. Invalidate the
             # shared source before deriving a cast or strip plan: a stale live
@@ -188,6 +211,27 @@ class AscendTurboQuantMetadataBuilder(AscendAttentionMetadataBuilder):
             "turboquant_ingestion_slot_mapping": ingestion_slot_mapping,
             "turboquant_strip_plan": strip_plan,
         }
+
+    def _build_e8_batch(self, common: Any, seq_lens: torch.Tensor, query_lens: torch.Tensor) -> E8BatchPlan:
+        if getattr(common, "offload_dummy", False):
+            return E8BatchPlan((), 0, self._block_size, None)
+        host_blocks = common.turboquant_block_table_cpu
+        if host_blocks is None:
+            raise RuntimeError("TurboQuant E8 requires the scheduler's CPU block-table mirror")
+        use_reader = (
+            self._e8_reader_enabled and load_turboquant_extension() and _is_op_registered(E8_OPS_NAMESPACE, "reader")
+        )
+        return prepare_batch(
+            host_blocks,
+            seq_lens,
+            query_lens,
+            num_tokens=common.num_actual_tokens,
+            num_blocks=common.turboquant_num_blocks,
+            block_size=self._block_size,
+            num_kv_heads=self._num_kv_heads,
+            device=self._e8_device,
+            use_reader=use_reader,
+        )
 
     def _validate_slot_mapping(
         self,

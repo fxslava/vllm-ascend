@@ -12,11 +12,13 @@ from typing import Any
 
 import torch
 import torch_npu
+from torch.nn import functional as F
 from vllm.logger import logger
-from vllm.v1.attention.backend import AttentionLayer, AttentionType
+from vllm.v1.attention.backend import AttentionLayer, AttentionType, MultipleOf
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 
 from vllm_ascend import envs
+from vllm_ascend.attention import turboquant_e8, turboquant_reference_cache
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionBackendImpl,
@@ -38,6 +40,7 @@ from vllm_ascend.attention.turboquant_config import (
     TURBOQUANT_DECODE_TILING_WORDS,
     TURBOQUANT_DECODE_UNPACK,
     TURBOQUANT_DEFAULT_NAMESPACE,
+    TURBOQUANT_E8_QUANT_MODE,
     TURBOQUANT_FIA_DUMMY_KV_LEN,
     TURBOQUANT_FIA_VERSION_ENV,
     TURBOQUANT_H16_ORDER,
@@ -86,6 +89,7 @@ from vllm_ascend.attention.turboquant_config import (
     turboquant_decode_query_rot_floats,
     turboquant_decode_tiling_words,
     turboquant_decode_workspace_floats,
+    turboquant_quant_mode,
     turboquant_tiling_upper_bound_words,
 )
 from vllm_ascend.attention.turboquant_ingestion import (
@@ -94,11 +98,15 @@ from vllm_ascend.attention.turboquant_ingestion import (
     turboquant_plan_strip_ingestion,
 )
 from vllm_ascend.attention.turboquant_layout import (
+    E8_HEAD_SIZE,
+    E8_PACKET_BYTES,
+    E8_PACKET_ROWS,
     TURBOQUANT_GROUP,
     TURBOQUANT_KEY_PLANE,
     TURBOQUANT_PACK_FACTOR,
     TURBOQUANT_PLANES,
     TURBOQUANT_VALUE_PLANE,
+    e8_cache_shape,
     turboquant_packed_cache_shape,
     turboquant_scale_cache_shape,
 )
@@ -221,7 +229,9 @@ class AscendTurboQuantBackend(AscendAttentionBackend):
         return AscendTurboQuantMetadataBuilder
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int]:
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        if turboquant_quant_mode() == TURBOQUANT_E8_QUANT_MODE:
+            return [MultipleOf(E8_PACKET_ROWS)]
         return [TURBOQUANT_KERNEL_BLOCK_SIZE]
 
     @classmethod
@@ -236,6 +246,8 @@ class AscendTurboQuantBackend(AscendAttentionBackend):
         head_size: int,
         cache_dtype_str: str = "",
     ) -> tuple[int, ...]:
+        if turboquant_quant_mode() == TURBOQUANT_E8_QUANT_MODE:
+            return (TURBOQUANT_PLANES, *e8_cache_shape(num_blocks, block_size, num_kv_heads, head_size))
         return turboquant_packed_cache_shape(num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod
@@ -272,6 +284,8 @@ class AscendTurboQuantBackend(AscendAttentionBackend):
 
 
 class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
+    _uses_e8: bool = False
+
     def __init__(
         self,
         num_heads: int,
@@ -327,6 +341,9 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
             )
 
         self.adapter: TurboQuantOpsAdapter = adapter if adapter is not None else TurboQuantOpsAdapter()
+        self._uses_e8 = self.adapter.config.uses_e8
+        if self._uses_e8:
+            self.kv_cache_dtype = torch.uint8
         self._validate_kernel_geometry()
         self.emulator: TurboQuantEmulator | None = None
         self.scale_cache: torch.Tensor | None = None
@@ -337,13 +354,18 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
         )
         staged = ", ".join(sorted(stage.value for stage in self.adapter.config.kernel_stages))
         logger.info_once(
-            "TurboQuant backend active: packed INT4 KV cache, kernel stages=%s, ops namespace=%s",
+            "TurboQuant backend active: %s KV cache, kernel stages=%s, ops namespace=%s",
+            "E8 packets" if self._uses_e8 else "packed INT4",
             staged or "none (all golden)",
-            self.adapter.config.ops_namespace,
+            turboquant_e8.E8_OPS_NAMESPACE if self._uses_e8 else self.adapter.config.ops_namespace,
         )
 
     def _validate_kernel_geometry(self) -> None:
         config = self.adapter.config
+        if config.uses_e8:
+            if self.head_size != E8_HEAD_SIZE or self.model_dtype != TURBOQUANT_KERNEL_DTYPE:
+                raise ValueError(f"TurboQuant E8 requires D={E8_HEAD_SIZE} and a BF16 model")
+            return
         writers = (
             TurboQuantKernelStage.RESHAPE_AND_CACHE,
             TurboQuantKernelStage.SCATTER,
@@ -401,10 +423,11 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
         if self.emulator is not emulator:
             self.emulator = emulator
             layer._turboquant_pi_signs = emulator.pi_signs
-            layer._turboquant_rotation = emulator.rotation
-            layer._turboquant_codec_tables = emulator.codec_tables
-            layer._turboquant_h16 = emulator.h16
             layer._turboquant_inv_sqrt_len = emulator.inv_sqrt_len
+            if not self._uses_e8:
+                layer._turboquant_rotation = emulator.rotation
+                layer._turboquant_codec_tables = emulator.codec_tables
+                layer._turboquant_h16 = emulator.h16
         return emulator
 
     def _ensure_scale_cache(self, kv_cache: tuple[torch.Tensor, ...] | list[torch.Tensor]) -> torch.Tensor:
@@ -444,6 +467,121 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
     def get_kv_cache_block_views(self, kv_cache: Sequence[torch.Tensor]) -> tuple[torch.Tensor, ...]:
         """Physical page views for the runner's cache copy and zeroing paths."""
         return self.adapter.block_major_cache_views(kv_cache)
+
+    def _forward_e8(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        value: torch.Tensor | None,
+        kv_cache: tuple[torch.Tensor, ...],
+        attn_metadata: AscendTurboQuantMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        plan = attn_metadata.turboquant_e8_batch
+        if plan is None:
+            raise RuntimeError("TurboQuant E8 needs batch metadata prepared before attention")
+        if not plan.requests:
+            return output.zero_()
+        expected = e8_cache_shape(plan.num_blocks, plan.block_size, self.num_kv_heads, self.head_size)
+        if len(kv_cache) != 2 or any(
+            plane.shape != expected or plane.dtype != torch.uint8 or plane.device != query.device for plane in kv_cache
+        ):
+            raise ValueError("TurboQuant E8 needs two UINT8 packet planes with the prepared layout")
+        if (key is None) != (value is None):
+            raise ValueError("TurboQuant E8 needs both K/V inputs or both prepacked cache planes")
+        live_queries = plan.requests[-1].query_end
+        if query.shape[0] < live_queries or output.shape[0] < live_queries:
+            raise ValueError("TurboQuant E8 query and output must cover the prepared batch")
+        emulator = self.emulator
+        assert emulator is not None
+        if key is not None and self.kv_sharing_target_layer_name is None:
+            num_tokens = attn_metadata.num_actual_tokens
+            turboquant_reference_cache.write_e8_slots(
+                key[:num_tokens], value[:num_tokens], *kv_cache, attn_metadata.slot_mapping[:num_tokens], emulator
+            )
+            notify_kv_cache_written()
+        rotated_query = emulator.rotate(query[:live_queries]) * emulator.inv_sqrt_len
+        for request in plan.requests:
+            rows = slice(request.query_start, request.query_end)
+            request_query = rotated_query[rows]
+            if request.reader_offsets is not None and plan.reader_buffers is not None:
+                self._e8_fused_attention(request_query, kv_cache, request, plan.reader_buffers, output[rows])
+            else:
+                output[rows].copy_(self._e8_dense_attention(request_query, kv_cache, request, attn_metadata.causal))
+        output[:live_queries].copy_(emulator.inverse_rotate(output[:live_queries]))
+        output[live_queries:].zero_()
+        return output
+
+    def _e8_fused_attention(
+        self,
+        query: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...],
+        request: turboquant_e8.E8RequestPlan,
+        buffers: turboquant_e8.E8ReaderBuffers,
+        output: torch.Tensor,
+    ) -> None:
+        key, value = (plane.view(-1, E8_PACKET_BYTES) for plane in kv_cache)
+        tiles, heads = request.packet_ids.shape
+        last_rows = request.context_length - (tiles - 1) * E8_PACKET_ROWS
+        group_size = self.num_heads // heads
+        group_step = turboquant_e8.E8_READER_HEADS
+        for head in range(heads):
+            for group_start in range(0, group_size, group_step):
+                count = min(group_step, group_size - group_start)
+                start = head * group_size + group_start
+                buffers.query.zero_()
+                buffers.query[:count].copy_(query[0, start : start + count])
+                turboquant_e8.reader(
+                    buffers.query,
+                    key,
+                    value,
+                    request.reader_offsets[head],
+                    buffers.output,
+                    buffers.key_witness[:tiles],
+                    buffers.value_witness[:tiles],
+                    buffers.score_witness[:tiles],
+                    tiles,
+                    last_rows,
+                    self.scale,
+                )
+                output[0, start : start + count].copy_(buffers.output[:count])
+
+    def _e8_dense_attention(
+        self,
+        query: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, ...],
+        request: turboquant_e8.E8RequestPlan,
+        causal: bool,
+    ) -> torch.Tensor:
+        key, value = (self.adapter.read_e8_packets(plane, request) for plane in kv_cache)
+        queries = query.shape[0]
+        keys = request.context_length
+        causal_mask = None
+        if causal and queries > 1:
+            key_positions = torch.arange(keys, dtype=torch.int32, device=query.device)
+            query_positions = torch.arange(keys - queries, keys, dtype=torch.int32, device=query.device)
+            causal_mask = key_positions[None, :] <= query_positions[:, None]
+        if query.device.type == "cpu":
+            result = F.scaled_dot_product_attention(
+                query.transpose(0, 1),
+                key.transpose(0, 1).float(),
+                value.transpose(0, 1).float(),
+                attn_mask=causal_mask,
+                enable_gqa=True,
+                scale=self.scale,
+            ).transpose(0, 1)
+        else:
+            result = self._run_dense_attention(
+                query.to(torch.bfloat16).unsqueeze(0),
+                key.unsqueeze(0),
+                value.unsqueeze(0),
+                input_layout="BSND",
+                actual_seq_lengths=[queries],
+                actual_seq_lengths_kv=[keys],
+                atten_mask=None if causal_mask is None else (~causal_mask)[None, None],
+                sparse_mode=0,
+            ).squeeze(0)
+        return result
 
     def reshape_and_cache(
         self,
@@ -851,6 +989,16 @@ class AscendTurboQuantBackendImpl(AscendAttentionBackendImpl):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self._uses_e8:
+            assert output is not None
+            if output_scale is not None or output_block_scale is not None:
+                raise NotImplementedError("TurboQuant E8 does not support fused output quantization")
+            if attn_metadata is None:
+                return output.zero_()
+            if _stream_is_capturing():
+                raise RuntimeError("TurboQuant E8 launch planning requires eager attention")
+            self._bind_codec_constants(layer, query.device)
+            return self._forward_e8(query, key, value, kv_cache, attn_metadata, output)
         if attn_metadata is not None:
             if _stream_is_capturing():
                 if (

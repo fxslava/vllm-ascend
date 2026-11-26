@@ -81,4 +81,6 @@ void reader_meta(at::Tensor& query, at::Tensor& key_packets, at::Tensor& value_p
                  std::int64_t last_rows, double scale);
 void dequant(at::Tensor& labels, at::Tensor& scales, at::Tensor& bf16, at::Tensor& int8);
 void dequant_meta(at::Tensor& labels, at::Tensor& scales, at::Tensor& bf16, at::Tensor& int8);
+void dequant_packet(at::Tensor& packets, at::Tensor& bf16, at::Tensor& int8);
+void dequant_packet_meta(at::Tensor& packets, at::Tensor& bf16, at::Tensor& int8);
 }

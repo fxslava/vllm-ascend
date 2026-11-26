@@ -286,7 +286,7 @@ class AscendKVBlockZeroer(KVBlockZeroer):
                     kv_tensors = (kv_cache[0],)
                 elif isinstance(kv_cache, torch.Tensor):
                     kv_tensors = (kv_cache,)
-                elif isinstance(spec, AscendTurboQuantAttentionSpec):
+                elif isinstance(spec, AscendTurboQuantAttentionSpec) and not spec.uses_e8:
                     # NZ scales are slot-major despite their nominal planar
                     # shape. Clear physical records belonging to this page,
                     # using the same layout as the ingestion/decode adapter.

@@ -67,10 +67,9 @@ namespace tq_contract = vllm_ascend::turboquant;
 
 [[maybe_unused]] constexpr std::uint32_t kNzBurstBytes = kTokens * kNzC0;
 
-TQ_AICORE constexpr std::uint64_t NzStripBaseWide(std::uint32_t slot, std::uint32_t heads)
+TQ_AICORE constexpr std::uint64_t NzStripBaseWide(std::uint64_t slot, std::uint32_t heads)
 {
-    return static_cast<std::uint64_t>(slot - slot % kNzTileRows) * heads * kNzRowBytes +
-           (slot % kNzTileRows) * kNzC0;
+    return (slot - slot % kNzTileRows) * heads * kNzRowBytes + (slot % kNzTileRows) * kNzC0;
 }
 
 TQ_AICORE constexpr bool NzByteAgrees(std::uint32_t slot, std::uint32_t head, std::uint32_t group,
@@ -132,8 +131,8 @@ TQ_AICORE constexpr StripAddr CalculateStripOffsets(std::uint32_t slot0, std::ui
     return {NzStripBaseWide(slot0, num_kv_heads), key_scale, key_scale + num_kv_heads};
 #else
     const std::uint64_t block_idx = slot0 / block_size;
-    const std::uint32_t strip_in_block = (slot0 % block_size) / kTokens;
-    const std::uint32_t strip_bytes = strip_in_block * kPackedBytes;
+    const std::uint64_t strip_in_block = (slot0 % block_size) / kTokens;
+    const std::uint64_t strip_bytes = strip_in_block * kPackedBytes;
     return {block_idx * num_kv_heads * head_bytes + strip_bytes,
             block_idx * num_kv_heads * block_size + strip_in_block * kTokens,
             (num_blocks + block_idx) * num_kv_heads * block_size + strip_in_block * kTokens};
@@ -339,7 +338,7 @@ struct CubeState {
     __gm__ const bfloat16_t* value;
     std::uint32_t row_pitch;
     std::uint32_t head_size;
-    std::uint32_t strip_elems;
+    std::uint64_t strip_elems;
     __ca__ bfloat16_t* l0_a;
     __cb__ bfloat16_t* l0_b;
     __cc__ float* l0_c;
@@ -365,46 +364,23 @@ using LloydMaxKv4 =
 
 using FrozenStripAddr = StripAddress<std::uint32_t>;
 
-#if TURBOQUANT_INGRESS_NZ
-TQ_AICORE constexpr std::uint32_t NzStripBase(std::uint32_t slot, std::uint32_t heads)
-{
-    return (slot - slot % kNzTileRows) * heads * kNzRowBytes + (slot % kNzTileRows) * kNzC0;
+__aicore__ inline StripAddr CalculateStripAddr(__gm__ const std::int32_t* slot_mapping,
+                                                std::uint32_t strip, std::uint32_t num_kv_heads,
+                                                std::uint64_t head_bytes, std::uint32_t block_size,
+                                                std::uint32_t num_blocks) {
+    const std::uint64_t token = static_cast<std::uint64_t>(strip) * kTokens;
+    const std::uint32_t slot0 = static_cast<std::uint32_t>(slot_mapping[token]);
+    return CalculateStripOffsets(slot0, num_kv_heads, head_bytes, block_size, num_blocks);
 }
-#endif
 
 __aicore__ inline FrozenStripAddr CalculateStripAddr(__gm__ const std::int32_t* slot_mapping,
                                                       std::uint32_t strip, std::uint32_t num_kv_heads,
                                                       std::uint32_t head_bytes, std::uint32_t block_size,
                                                       std::uint32_t num_blocks) {
-#if TURBOQUANT_INGRESS_NZ
-    (void)head_bytes;
-    (void)block_size;
-    (void)num_blocks;
-    const std::uint32_t slot0 = static_cast<std::uint32_t>(slot_mapping[strip * kTokens]);
-    FrozenStripAddr a;
-    a.page_bytes = NzStripBase(slot0, num_kv_heads);
-    a.key_scale = slot0 * kNzScaleSlot;
-    a.value_scale = a.key_scale + num_kv_heads;
-    return a;
-#else
-    const std::uint32_t slot0 = static_cast<std::uint32_t>(slot_mapping[strip * kTokens]);
-    const std::uint32_t block_idx = slot0 / block_size;
-    const std::uint32_t strip_in_block = (slot0 % block_size) / kTokens;
-    const std::uint32_t strip_bytes = strip_in_block * kPackedBytes;
-    FrozenStripAddr a;
-    a.page_bytes = block_idx * num_kv_heads * head_bytes + strip_bytes;
-    a.key_scale = block_idx * num_kv_heads * block_size + strip_in_block * kTokens;
-    a.value_scale = (num_blocks + block_idx) * num_kv_heads * block_size + strip_in_block * kTokens;
-    return a;
-#endif
-}
-
-__aicore__ inline StripAddr CalculateStripAddr(__gm__ const std::int32_t* slot_mapping,
-                                               std::uint32_t strip, std::uint32_t num_kv_heads,
-                                               std::uint64_t head_bytes, std::uint32_t block_size,
-                                               std::uint32_t num_blocks) {
-    const std::uint32_t slot0 = static_cast<std::uint32_t>(slot_mapping[strip * kTokens]);
-    return CalculateStripOffsets(slot0, num_kv_heads, head_bytes, block_size, num_blocks);
+    const auto address = CalculateStripAddr(slot_mapping, strip, num_kv_heads,
+                                            static_cast<std::uint64_t>(head_bytes), block_size, num_blocks);
+    return {static_cast<std::uint32_t>(address.page_bytes), static_cast<std::uint32_t>(address.key_scale),
+            static_cast<std::uint32_t>(address.value_scale)};
 }
 
 [[maybe_unused]] constexpr auto kUb = AscendC::TPosition::VECCALC;
@@ -533,7 +509,7 @@ public:
                                     std::uint32_t num_kv_heads, std::uint32_t head_size) {
         cube_.key = key;
         cube_.value = value;
-        cube_.row_pitch = num_kv_heads * head_size;
+        cube_.row_pitch = static_cast<std::uint32_t>(static_cast<std::uint64_t>(num_kv_heads) * head_size);
         cube_.head_size = head_size;
         cube_.strip_elems = 0;
     }
@@ -553,11 +529,7 @@ public:
         vector_.head_bytes = kNzHeadBytes;
         vector_.head_scale = 1u;
 #else
-        if constexpr (std::is_same_v<Offset, std::uint32_t>) {
-            vector_.head_bytes = block_size * head_size / 2u;
-        } else {
-            vector_.head_bytes = static_cast<std::uint64_t>(block_size) * head_size / 2u;
-        }
+        vector_.head_bytes = static_cast<Offset>(static_cast<std::uint64_t>(block_size) * head_size / 2u);
         vector_.head_scale = block_size;
 #endif
         vector_.inv_sqrt_len = inv_sqrt_len;
@@ -568,11 +540,12 @@ public:
         using namespace asc::te;
         constexpr std::uint32_t slot = kL1Slot<PHASE>;
         constexpr std::int32_t evt = static_cast<std::int32_t>(slot);
-        std::uint32_t offset = cube_.strip_elems;
-        if (stage_next) offset += kTokens * cube_.row_pitch;
+        std::uint64_t offset = cube_.strip_elems;
+        if (stage_next) offset += static_cast<std::uint64_t>(kTokens) * cube_.row_pitch;
 
         __gm__ const bfloat16_t* base = kIsKey<PHASE> ? cube_.key : cube_.value;
-        auto* src_ptr = const_cast<__gm__ bfloat16_t*>(base) + offset + kChunkHead<PHASE> * cube_.head_size;
+        const std::uint64_t head = kChunkHead<PHASE>;
+        auto* src_ptr = const_cast<__gm__ bfloat16_t*>(base) + offset + head * cube_.head_size;
         auto* dst_ptr = reinterpret_cast<__cbuf__ bfloat16_t*>(kL1PageBase<slot>);
 
         auto shape = make_shape(make_shape(_1{}, kTokens), make_shape(_1{}, kHeadSize));
@@ -910,13 +883,14 @@ public:
     __aicore__ inline void StoreChunk() {
         constexpr std::uint32_t pack = kPackSlot<PHASE>;
         constexpr std::int32_t pack_evt = static_cast<std::int32_t>(pack);
+        constexpr std::uint64_t head = kChunkHead<PHASE>;
         auto packed = View<std::int8_t>(kPackBase<pack>, kPackedBytes);
 #if TURBOQUANT_INGRESS_NZ
         auto slab = View<float>(kScaleBase<pack>, kNzScaleSlabFloats);
 
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(pack_evt);
-        const Offset page = vector_.page_bytes + kChunkHead<PHASE> * kNzHeadBytes;
-        const Offset slice = (kIsKey<PHASE> ? vector_.key_scale : vector_.value_scale) + kChunkHead<PHASE> * vector_.head_scale;
+        const std::uint64_t page = vector_.page_bytes + head * kNzHeadBytes;
+        const std::uint64_t slice = (kIsKey<PHASE> ? vector_.key_scale : vector_.value_scale) + head * vector_.head_scale;
 
         AscendC::DataCopyExtParams plane{static_cast<std::uint16_t>(kNzGroups), kNzBurstBytes, 0,
                                          kNzGroupBytes - kNzBurstBytes, 0};
@@ -935,8 +909,8 @@ public:
         auto scale = View<float>(kScaleBase<pack>, kScaleFloats);
 
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(pack_evt);
-        const Offset page = vector_.page_bytes + kChunkHead<PHASE> * vector_.head_bytes;
-        const Offset slice = (kIsKey<PHASE> ? vector_.key_scale : vector_.value_scale) + kChunkHead<PHASE> * vector_.head_scale;
+        const std::uint64_t page = vector_.page_bytes + head * vector_.head_bytes;
+        const std::uint64_t slice = (kIsKey<PHASE> ? vector_.key_scale : vector_.value_scale) + head * vector_.head_scale;
         if constexpr (kIsKey<PHASE>) {
             AscendC::DataCopy(vector_.key_cache[page], packed, kPackedBytes);
         } else {
@@ -1007,7 +981,7 @@ public:
             RunCubeSteadyPhase<5>(true);
             RunCubeSteadyPhase<6>(true);
             RunCubeSteadyPhase<7>(true);
-            cube_.strip_elems += kTokens * cube_.row_pitch;
+            cube_.strip_elems += static_cast<std::uint64_t>(kTokens) * cube_.row_pitch;
         }
         RunCubeSteadyPhase<0>(false);
         RunCubeSteadyPhase<1>(false);
@@ -1134,15 +1108,10 @@ __aicore__ inline void KernelBody(
 
     AscendC::InitSocState();
 
-    const uint32_t first_token = block * tokensPerCore;
-    if constexpr (std::is_same_v<Offset, std::uint32_t>) {
-        key += first_token * numKvHeads * headSize;
-        value += first_token * numKvHeads * headSize;
-    } else {
-        const std::uint64_t first_activation = turboquant_wave::ActivationOffset(first_token, numKvHeads, headSize);
-        key += first_activation;
-        value += first_activation;
-    }
+    const std::uint64_t first_token = static_cast<std::uint64_t>(block) * tokensPerCore;
+    const std::uint64_t first_activation = first_token * numKvHeads * headSize;
+    key += first_activation;
+    value += first_activation;
     slotMapping += first_token;
     (void)piSigns;
 

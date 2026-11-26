@@ -132,6 +132,7 @@ from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBui
 from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadataBuilder
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
+from vllm_ascend.attention.turboquant_config import turboquant_quant_mode
 from vllm_ascend.attention.turboquant_layout import (
     turboquant_carve_planes,
     turboquant_enabled,
@@ -3732,6 +3733,10 @@ class NPUModelRunner(GPUModelRunner):
         ) -> None:
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
             builder = attn_group.get_metadata_builder(ubid or 0)
+            if isinstance(attn_group.kv_cache_spec, AscendTurboQuantAttentionSpec) and attn_group.kv_cache_spec.uses_e8:
+                block_table = self.input_batch.block_table[kv_cache_gid]
+                common_attn_metadata.turboquant_block_table_cpu = block_table.get_cpu_tensor()
+                common_attn_metadata.turboquant_num_blocks = self.kv_cache_config.num_blocks
             is_gdn_noop = skip_gdn_state_update and isinstance(
                 builder,
                 GDNAttentionMetadataBuilder,
@@ -4752,6 +4757,7 @@ class NPUModelRunner(GPUModelRunner):
         converted = turboquant_cache_spec(
             spec,
             page_size_padded=dense_page_size_bytes if self.model_config.is_hybrid else None,
+            quant_mode=turboquant_quant_mode(),
         )
         logger.debug(
             "[vllm-ascend/turboquant] %s: page %d B -> %d B (%d B payload + %d B scale plane%s)",
@@ -4797,8 +4803,8 @@ class NPUModelRunner(GPUModelRunner):
         spec: AscendTurboQuantAttentionSpec,
         buffer: torch.Tensor,
         num_blocks: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Three planes out of one layer's page budget.
+    ) -> tuple[torch.Tensor, ...]:
+        """Carve packed K/V and scales out of one layer's page budget.
 
         The packed keys, the packed values and the fp32 scales come out of the
         allocation the cache manager already sized for this layer, so the scale
@@ -4815,6 +4821,7 @@ class NPUModelRunner(GPUModelRunner):
                 spec.block_size,
                 spec.num_kv_heads,
                 spec.head_size,
+                uses_e8=getattr(spec, "uses_e8", False),
             )
         except ValueError as error:
             raise ValueError(f"{layer_name}: {error}") from error
@@ -5660,17 +5667,14 @@ class NPUModelRunner(GPUModelRunner):
                     continue
 
                 if isinstance(current_kv_cache_spec, AscendTurboQuantAttentionSpec):
-                    # The three planes carved in _allocate_kv_cache_tensors,
-                    # viewed as the backend reads them: two packed int8 planes
-                    # and the fp32 scale plane, all in kernel blocks like every
-                    # other attention cache on this lane. This is the branch
-                    # that replaces both the dense K/V split and the hybrid
-                    # tail carve for a TurboQuant layer, so neither of those
-                    # has to learn about a third plane.
+                    # This layer owns its packed planes; the view follows the
+                    # backend's physical packet and kernel-block layout.
                     raw_planes = kv_cache_raw_tensors[layer_name]
-                    if not isinstance(raw_planes, tuple) or len(raw_planes) != 3:
+                    plane_count = 2 if current_kv_cache_spec.uses_e8 else 3
+                    if not isinstance(raw_planes, tuple) or len(raw_planes) != plane_count:
+                        expected = "two" if current_kv_cache_spec.uses_e8 else "three"
                         raise ValueError(
-                            f"{layer_name}: TurboQuant expects three raw planes, got "
+                            f"{layer_name}: TurboQuant expects {expected} raw planes, got "
                             f"{type(raw_planes).__name__} of length "
                             f"{len(raw_planes) if isinstance(raw_planes, (tuple, list)) else 1}"
                         )
@@ -5680,10 +5684,13 @@ class NPUModelRunner(GPUModelRunner):
                             kernel_block_size,
                             current_kv_cache_spec.num_kv_heads,
                             current_kv_cache_spec.head_size,
+                            uses_e8=current_kv_cache_spec.uses_e8,
                         )
                     except ValueError as error:
                         raise ValueError(f"{layer_name}: {error}") from error
                     kv_caches[layer_name] = views
+                    if current_kv_cache_spec.uses_e8:
+                        continue
                     # The nominal scale shape is not the NZ storage layout.
                     # Ask this layer's implementation for the physical page
                     # views before handing scales to the generic block copier.

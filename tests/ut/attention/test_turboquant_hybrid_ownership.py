@@ -22,7 +22,12 @@ import torch
 
 from vllm_ascend.attention.turboquant_codec import TurboQuantEmulator
 from vllm_ascend.attention.turboquant_config import TurboQuantOpsConfig, TurboQuantValueLayout
-from vllm_ascend.attention.turboquant_layout import turboquant_carve_planes, turboquant_plane_views
+from vllm_ascend.attention.turboquant_layout import (
+    e8_cache_shape,
+    e8_packed_plane_bytes,
+    turboquant_carve_planes,
+    turboquant_plane_views,
+)
 from vllm_ascend.attention.turboquant_metadata import AscendTurboQuantMetadataBuilder
 from vllm_ascend.attention.turboquant_ops import TurboQuantOpsAdapter
 
@@ -138,7 +143,9 @@ def hybrid_pool(request):
         "AttentionLayerBase": object,
         "UniformTypeKVCacheSpecs": _UniformTypeSpecs,
         "turboquant_carve_planes": turboquant_carve_planes,
+        "turboquant_plane_views": turboquant_plane_views,
         "is_deepseek_v41_cache": lambda _: False,
+        "is_glm5_next_cache_spec": lambda _: False,
         "requires_padded_page_layout": lambda _: False,
         "get_layers_from_vllm_config": lambda *_: {},
         "get_layerwise_reuse_config": lambda _: None,
@@ -152,7 +159,7 @@ def hybrid_pool(request):
     runner_cls = _load_class(
         "vllm_ascend/worker/model_runner_v1.py",
         "NPUModelRunner",
-        ("_allocate_kv_cache_tensors", "_carve_turboquant_planes", "_adjust_kv_layout"),
+        ("_allocate_kv_cache_tensors", "_carve_turboquant_planes", "_reshape_kv_cache_tensors", "_adjust_kv_layout"),
         namespace,
     )
     runner = runner_cls()
@@ -228,6 +235,56 @@ def test_recurrent_writes_and_attention_zeroing_preserve_other_groups(hybrid_poo
     for state, expected in zip(states, states_before):
         assert torch.equal(state, expected), "initializing attention blocks overwrote recurrent state"
     assert len(_storage_bytes(raw)) == len(pool.specs)
+
+
+def test_e8_platform_and_runner_allocate_private_packet_planes(hybrid_pool, monkeypatch):
+    monkeypatch.setenv("ENABLE_TURBOQUANT", "1")
+    monkeypatch.setenv("VLLM_ASCEND_TURBOQUANT_QUANT_MODE", "2")
+    platform = _load_class("vllm_ascend/platform.py", "NPUPlatform", ("get_attn_backend_cls",), {})
+    selector = SimpleNamespace(use_mla=False, use_sparse=False, use_pcp=False)
+    assert (
+        platform.get_attn_backend_cls(None, selector) == "vllm_ascend.attention.turboquant_v1.AscendTurboQuantBackend"
+    )
+
+    pool = hybrid_pool
+    spec = pool.specs[ATTENTION_LAYER]
+    spec.uses_e8 = True
+    pool.runner._is_c8_mxfp_kv_cache = lambda _: False
+    pool.runner._kv_cache_spec_attn_group_iterator = lambda: iter(
+        [SimpleNamespace(backend=None, kv_cache_spec=spec, kv_cache_group_id=0, layer_names=[ATTENTION_LAYER])]
+    )
+    raw = pool.runner._allocate_kv_cache_tensors(pool.config)
+    kv_caches = pool.runner._reshape_kv_cache_tensors(pool.config, raw, [spec.block_size])
+    key, value = kv_caches[ATTENTION_LAYER]
+    assert key.shape == value.shape == e8_cache_shape(NUM_BLOCKS, spec.block_size, NUM_KV_HEADS, HEAD_SIZE)
+    assert key.dtype == value.dtype == torch.uint8
+    expected_plane_bytes = NUM_BLOCKS * e8_packed_plane_bytes(spec.block_size, NUM_KV_HEADS, HEAD_SIZE)
+    assert value.data_ptr() - key.data_ptr() == expected_plane_bytes
+    assert not hasattr(pool.runner, "_turboquant_scale_planes")
+    key.fill_(7)
+    value.fill_(11)
+    assert all(not torch.count_nonzero(raw[name]) for name in RECURRENT_LAYERS)
+
+
+def test_e8_platform_requires_v1_prepared_packet_cache(monkeypatch):
+    monkeypatch.setenv("ENABLE_TURBOQUANT", "1")
+    monkeypatch.setenv("VLLM_ASCEND_TURBOQUANT_QUANT_MODE", "2")
+    namespace = {"torch": torch}
+    _load_functions("vllm_ascend/platform.py", ("_validate_turboquant_config",), namespace)
+    validate = namespace["_validate_turboquant_config"]
+    config = SimpleNamespace(
+        use_v2_model_runner=False,
+        model_config=SimpleNamespace(get_head_size=lambda: 256, dtype=torch.bfloat16),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        cache_config=SimpleNamespace(block_size=128),
+        kv_transfer_config=None,
+    )
+    validate(config)
+    config.use_v2_model_runner = True
+    with pytest.raises(ValueError, match="E8 requires the v1 model runner for prepared packet caches"):
+        validate(config)
+    monkeypatch.setenv("VLLM_ASCEND_TURBOQUANT_QUANT_MODE", "1")
+    validate(config)
 
 
 @pytest.mark.parametrize("uniform_wrapper", [False, True])
